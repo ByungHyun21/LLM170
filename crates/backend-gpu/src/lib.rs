@@ -261,6 +261,67 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(d)
     }
 
+    /// W4A8 GPU GEMM — x를 q8로 양자화해 전송, gemm_q6 + reduce. [t][n_out] 플랫.
+    pub fn matmul_w4a8_gpu(&self, x: &[f32], w: &Weight) -> Result<Vec<f32>, String> {
+        let y = llm170_core::quant::quantize_row_q8_ref(x);
+        let t = 1usize; // 단일 벡터(디코드) 변형
+        let d = self.dev_weight(w)?;
+        let n_in = d.n_in;
+        let n_out = d.n_out;
+        // qs → 평탄 i8 → u32 워드, d → f32 배열
+        let mut flat_q = Vec::with_capacity(y.len() * 32);
+        for b in &y {
+            for q in b.qs {
+                flat_q.push(q);
+            }
+        }
+        flat_q.resize(x.len(), 0);
+        let mut qs_words = Vec::with_capacity(flat_q.len().div_ceil(4));
+        for c in flat_q.chunks(4) {
+            let mut word = 0u32;
+            for (i, b) in c.iter().enumerate() {
+                word |= (*b as u8 as u32) << (8 * i);
+            }
+            qs_words.push(word);
+        }
+        let ds: Vec<f32> = y.iter().map(|b| b.d).collect();
+        let xq = self.client.create_from_slice(bytemuck::cast_slice(&qs_words));
+        let xd = self.client.create_from_slice(bytemuck::cast_slice(&ds));
+        let og = self.acquire_buf(t * n_out * 4)?;
+        let pg = self.acquire_buf(t * n_out * 64 * 4)?;
+        // SAFETY: 그리드 (n_out,1)·(n_out,t), 시작부 가드 — 상한 내.
+        unsafe {
+            gemm2::gemm_q6::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_out as u32, 1, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(xq, [1].into(), [flat_q.len().div_ceil(4)].into()),
+                TensorArg::from_raw_parts(xd, [1].into(), [ds.len()].into()),
+                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                n_in,
+                n_out,
+                t,
+                d.ty as u32 as usize,
+            );
+            gemm2::reduce_parts::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_out as u32, t as u32, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
+                n_out,
+                t,
+                64,
+            );
+        }
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        self.release_bufs(&[(og, t * n_out * 4), (pg, t * n_out * 64 * 4)]);
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
     /// 디버그: 텐서 블록 0 요소별 디양자화 값 (gpu-de).
     pub fn debug_dequant_block(&self, w: &Weight) -> Result<Vec<f32>, String> {
         let d = self.dev_weight(w)?;

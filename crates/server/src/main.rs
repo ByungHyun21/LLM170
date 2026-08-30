@@ -59,6 +59,8 @@ fn main() -> ExitCode {
             }
         }
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
+        Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
+        Some("w4a8-gpu") => cmd_w4a8_gpu(&args[1..]),
         Some("gpu-de") => cmd_gpu_de(&args[1..]),
         Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
         Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
@@ -289,6 +291,140 @@ fn cmd_gpu_q3dbg(args: &[String]) -> ExitCode {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
+    }
+}
+
+/// llm170 w4a8-check <file> <tensor> [t] [rows] — W4A8 변형 ↔ f32 기준 상호검증.
+fn cmd_w4a8_check(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: llm170 w4a8-check <file> <tensor> [t] [rows]");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found: {}", args[1]);
+            return ExitCode::FAILURE;
+        }
+    };
+    let t: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let rows: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(256);
+    let rows = rows.min(w.n_out as usize);
+    let n_in = w.n_in as usize;
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    let wsub = llm170_core::matmul::Weight {
+        data: &w.data[..rows * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize],
+        ty: w.ty,
+        n_in: w.n_in,
+        n_out: rows as u64,
+    };
+    let mut couts = vec![vec![0.0f32; rows]; t];
+    llm170_core::matmul::matmul_batch(&xs, &wsub, &mut couts);
+    let mut wouts = vec![vec![0.0f32; rows]; t];
+    for (xi, wo) in xs.iter().zip(wouts.iter_mut()) {
+        llm170_core::matmul::matmul_w4a8(xi, &wsub, wo);
+    }
+    let (mut max_abs, mut max_mag) = (0.0f64, 0.0f64);
+    for ti in 0..t {
+        for o in 0..rows {
+            let (g, c) = (wouts[ti][o], couts[ti][o]);
+            max_abs = max_abs.max((g - c).abs() as f64);
+            max_mag = max_mag.max(c.abs() as f64);
+        }
+    }
+    let rel = max_abs / max_mag;
+    println!(
+        "[{}] {} t={t} rows={rows}: max_abs={max_abs:.3e} rel(vs max|y|)={rel:.3e}",
+        w.ty.name(),
+        args[1]
+    );
+    if rel > 2e-2 {
+        eprintln!("MISMATCH (rel > 2e-2)");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// llm170 w4a8-gpu <file> <tensor> [rows] — GPU W4A8 커널 ↔ f32 CPU 기준 상호검증.
+fn cmd_w4a8_gpu(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: llm170 w4a8-gpu <file> <tensor> [rows]");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found: {}", args[1]);
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(256);
+    let rows = rows.min(w.n_out as usize);
+    let n_in = w.n_in as usize;
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let gpu = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let g = match gpu.matmul_w4a8_gpu(&x, &w) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("gpu error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wsub = llm170_core::matmul::Weight {
+        data: &w.data[..rows * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize],
+        ty: w.ty,
+        n_in: w.n_in,
+        n_out: rows as u64,
+    };
+    let mut c = vec![0.0f32; rows];
+    llm170_core::matmul::matmul(&x, &wsub, &mut c);
+    let (mut max_abs, mut max_mag) = (0.0f64, 0.0f64);
+    for o in 0..rows {
+        max_abs = max_abs.max((g[o] - c[o]).abs() as f64);
+        max_mag = max_mag.max(c[o].abs() as f64);
+    }
+    let rel = max_abs / max_mag;
+    println!(
+        "[{}] {} rows={rows}: max_abs={max_abs:.3e} rel(vs max|y|)={rel:.3e}",
+        w.ty.name(),
+        args[1]
+    );
+    if rel > 2e-2 {
+        eprintln!("MISMATCH (rel > 2e-2)");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

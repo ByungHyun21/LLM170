@@ -450,6 +450,78 @@ pub fn gemm_q3(
     }
 }
 
+/// W4A8 변형 디코드 GEMM — x를 q8로 사전 양자화해 전송(qs u32 워드 + 블록 d).
+/// q3 구조(토큰 상각·k-레인)에서 x[k] 대신 q8[k]·d[k/32] 재구성.
+/// CMP 정수 누산 버전(dp4a류)은 하드웨어 도착 후 변형으로 추가 예정.
+#[cube(launch_unchecked)]
+pub fn gemm_q6(
+    xq: &Tensor<u32>,   // i8 4개/워드
+    xd: &Tensor<f32>,   // q8 블록 스케일 [tlen·n_in/32]
+    w: &Tensor<u32>,
+    part: &mut Tensor<f32>,
+    ktab: &Tensor<f32>,
+    grid3: &Tensor<u32>,
+    n_in: usize,
+    n_out: usize,
+    #[comptime] tlen: usize,
+    #[comptime] qtype: usize,
+) {
+    let o = CUBE_POS_X as usize;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let blck = if qtype == 8 {
+        32
+    } else if qtype == 20 {
+        32
+    } else {
+        256
+    };
+    let bsize = if qtype == 8 {
+        34
+    } else if qtype == 20 {
+        18
+    } else if qtype == 12 {
+        144
+    } else if qtype == 13 {
+        176
+    } else if qtype == 14 {
+        210
+    } else if qtype == 11 {
+        110
+    } else if qtype == 23 {
+        136
+    } else {
+        110 // iq3_s (21)
+    };
+    let blocks = n_in / blck;
+    let row_base = o * blocks * bsize;
+    let mut acc = Array::<f32>::new(tlen);
+    #[unroll]
+    for ti in 0..tlen {
+        acc[ti] = 0.0;
+    }
+    for k in range_stepped(l, n_in, 64) {
+        let b = k / blck;
+        let j = k % blck;
+        let v = de_elem(w, row_base + b * bsize, j, ktab, grid3, qtype);
+        // x 재구성: q8 정수 × 블록 d
+        let word = xq[k >> 2];
+        let shift = ((k & 3) * 8) as u32;
+        let qi = byte_signed((word >> shift) & 0xFF);
+        let xrec = qi * xd[k / 32];
+        #[unroll]
+        for ti in 0..tlen {
+            acc[ti] += xrec * v;
+        }
+    }
+    #[unroll]
+    for ti in 0..tlen {
+        part[(ti * n_out + o) * 64 + l] = acc[ti];
+    }
+}
+
 /// 부분합 결정적 축소: out[t·n_out+o] = Σ_s part[...s] (s 순차).
 #[cube(launch_unchecked)]
 pub fn reduce_parts(

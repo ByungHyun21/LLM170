@@ -210,3 +210,37 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
         }
     }
 }
+
+/// W4A8 변형 단일 벡터 matmul — x를 q8로 양자화해 타입별 정수 내적.
+/// 성능 경로: 기준(f32) 대비 활성 양자화 오차 허용 전제.
+pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
+    profile_span!("cpu::matmul_w4a8");
+    use crate::quant::{dot_row_w4a8, quantize_row_q8_ref};
+    let n_in = w.n_in as usize;
+    let y = quantize_row_q8_ref(x);
+    let nt = n_threads().max(1).min(out.len());
+    let rows_per = out.len().div_ceil(nt);
+    let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (lo, ch) in chunks.iter_mut().enumerate() {
+            let row0 = lo * rows_per;
+            let y = &y;
+            handles.push(scope.spawn(move || {
+                for (r, o) in ch.iter_mut().enumerate() {
+                    let row = row0 + r;
+                    let base = row * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize;
+                    *o = dot_row_w4a8(w.ty, &w.data[base..], w.n_in, y);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+}
+
+/// w4a8 폴백용: 블록 1개 f32 디양자화 (미지원 타입).
+fn dequant_row_f32(ty: GgmlType, blk: &[u8], out: &mut [f32], n: u64) {
+    crate::quant::dequant_row(ty, blk, 0, n, out);
+}
