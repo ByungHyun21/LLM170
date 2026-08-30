@@ -33,7 +33,7 @@ pub fn half_to_f32(h: u16) -> f32 {
             }
         }
         0x1f => (sign << 31) | (0xff << 23) | (frac << 13),
-        _ => (sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13),
+        _ => (sign << 31) | ((exp + 112) << 23) | (frac << 13),
     };
     f32::from_bits(bits)
 }

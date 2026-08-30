@@ -415,6 +415,12 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulB");
+        // prefill(t > 8) — q2 커널이 토큰 상각 없어 ALU 병목. 공유메모리 타일
+        // 커널 전까지 CPU 폴백 (수치 동일: 같은 dequant·순차 누산).
+        if xs.len() > 8 {
+            llm170_core::matmul::matmul_batch(xs, w, outs);
+            return Ok(());
+        }
         let t = xs.len();
         let n_in = w.n_in as usize;
         if xs.iter().any(|r| r.len() != n_in) {
@@ -450,6 +456,13 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulG");
+        // prefill(t > 8) — 위와 동일 사유로 CPU 폴백.
+        if xs.len() > 8 {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                llm170_core::matmul::matmul_batch(xs, w, out);
+            }
+            return Ok(());
+        }
         let t = xs.len();
         if ws.is_empty() || ws.len() != outs.len() {
             return Err(format!("matmul_group: 잘못된 구성 ws={} outs={}", ws.len(), outs.len()));

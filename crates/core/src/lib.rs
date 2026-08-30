@@ -3,6 +3,7 @@
 pub mod gdn;
 pub mod matmul;
 pub mod model;
+pub mod qwen4exp;
 pub mod ops;
 pub mod quant;
 mod tables;
