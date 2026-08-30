@@ -287,7 +287,7 @@ fn cmd_gpu_q3dbg(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: {e}");
-            return ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
     }
 }
@@ -366,13 +366,20 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
     }
 
     // 마이크로벤치: 동일 matmul N회 반복 (가중치 캐시 후) — op당 비용
-    if let Some(n) = std::env::var("LLM170_GPU_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(n) = std::env::var("LLM170_GPU_BENCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            let _ = llm170_core::matmul::Accelerator::matmul_batch(gpu.as_ref(), &xs, &w, &mut gouts);
+            let _ =
+                llm170_core::matmul::Accelerator::matmul_batch(gpu.as_ref(), &xs, &w, &mut gouts);
         }
         let dt = t0.elapsed();
-        eprintln!("# bench: {n}회 × {dt:.2?} = {:.3}ms/op", dt.as_secs_f64() * 1000.0 / n as f64);
+        eprintln!(
+            "# bench: {n}회 × {dt:.2?} = {:.3}ms/op",
+            dt.as_secs_f64() * 1000.0 / n as f64
+        );
     }
 
     // CPU (동일 텐서 슬라이스 — 검증 대상 행만)
@@ -479,6 +486,13 @@ fn cmd_infer(args: &[String]) -> ExitCode {
 
     llm170_profiler::reset();
     let t_start = std::time::Instant::now();
+    // 아키텍처 판별 → qwen4exp 전용 엔진 분기
+    let arch = llm170_gguf::GgufFile::open(&model_path)
+        .ok()
+        .and_then(|g| g.arch().map(|s| s.to_string()));
+    if arch.as_deref() == Some("qwen4exp") {
+        return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend);
+    }
     let engine_res = llm170_core::model::Model::load(&model_path)
         .map_err(|e| e.to_string())
         .and_then(|m| {
@@ -570,6 +584,71 @@ fn cmd_infer(args: &[String]) -> ExitCode {
     llm170_backend_gpu::timing_report();
     if let Some(rep) = llm170_profiler::report() {
         eprint!("\n{rep}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// qwen4exp 추론 — Engine4 (시퀀스별 prefill/decode1).
+fn run_q4_infer(
+    model_path: &PathBuf,
+    prompts: &[Vec<u32>],
+    n_predict: usize,
+    ctx: usize,
+    backend: &str,
+) -> ExitCode {
+    let t_start = std::time::Instant::now();
+    let res = llm170_core::qwen4exp::Model4::load(model_path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| {
+            let n = prompts.len();
+            let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
+            if backend == "gpu" {
+                let acc = llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?;
+                eng = eng.with_acc(std::sync::Arc::new(acc));
+                eprintln!("# backend: gpu (cubecl) — qwen4exp");
+            }
+            let eos = eng.model.eos;
+            let mut finished = vec![false; n];
+            let mut next: Vec<u32> = Vec::with_capacity(n);
+            for (s, p) in prompts.iter().enumerate() {
+                let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
+                let t = llm170_core::model::greedy(&l);
+                println!(
+                    "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
+                    p.len(),
+                    json_escape(&eng.piece(t))
+                );
+                next.push(t);
+                finished[s] = t == eos;
+            }
+            let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            for _step in 0..n_predict {
+                let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
+                if active.is_empty() {
+                    break;
+                }
+                for &s in &active {
+                    let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
+                    let t = llm170_core::model::greedy(&l);
+                    next[s] = t;
+                    pos[s] += 1;
+                    println!(
+                        "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
+                        pos[s],
+                        json_escape(&eng.piece(t))
+                    );
+                    finished[s] = t == eos;
+                }
+            }
+            eprintln!(
+                "# done(q4): {n} seqs, gen per seq: {n_predict} (elapsed {:.1?})",
+                t_start.elapsed()
+            );
+            Ok(())
+        });
+    if let Err(e) = res {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
