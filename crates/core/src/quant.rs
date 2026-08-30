@@ -761,8 +761,6 @@ mod w4a8_tests {
             let y = quantize_row_q8_ref(&x);
             let mut wf = vec![0.0f32; n];
             for b in 0..n / blck {
-                dequant_row(ty, &bytes, 0, blck as u64, &mut wf[b * blck..]);
-                // dequant_row(row=0)은 data 시작 기준 — 행 단위 호출
                 dequant_row(ty, &bytes[b * bsize..], 0, blck as u64, &mut wf[b * blck..]);
             }
             let f32_dot: f32 = x.iter().zip(wf.iter()).map(|(a, b)| a * b).sum();
