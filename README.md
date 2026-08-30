@@ -15,9 +15,9 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 | Lightweight profiler (debug-instrumented, zero-cost in release) | ✅ |
 | Dequantization — q4_K / q5_K / q6_K / q8_0 / q3_K / q5_1 / iq4_xs / iq4_nl / iq3_s | ✅ cross-checked against an independent reference implementation |
 | Gated DeltaNet — chunked & autoregressive (CPU) | ✅ two paths agree to 1e-7; cross-validated against llama.cpp |
-| qwen35 CPU inference engine | 🔧 graph-equivalence verification in progress (random-model harness) |
+| qwen35 CPU inference engine | ✅ greedy tokens match llama.cpp on real 27B (short prompts) |
 | qwen4exp (QSA / hyper-connections / PLE / MoE) | ⏳ planned |
-| GPU backend (universal ROCm → CUDA / sm_80) | ⏳ after the CPU reference is complete |
+| GPU backend — cubecl + HIP (gfx1151 → sm_80) | 🔧 probe + GEMV pass; quantized kernels next |
 
 **Modes.** The engine runs in three profiles: `universal` (any device — the development baseline), `cmp-stock` (8 GB, eFUSE-throttled; FMA-free, tensor-core-free kernels), and `cmp-unlocked` (40–64 GB unlocked silicon). Engine core is mode-agnostic; modes select kernel variants and memory budgets.
 
@@ -41,6 +41,8 @@ cargo run --release -- infer \
 ```
 
 Debug builds are fully instrumented — every stage is timed by the built-in profiler, by design. Nsight doesn't support this card; the engine is its own profiler.
+
+GPU kernels are written in Rust via [CubeCL](https://github.com/tracel-ai/cubecl) macros and JIT-compiled for the target architecture (gfx1151 on the dev machine, sm_80 for the CMP 170HX). The same Rust kernel source compiles to both backends.
 
 ## Repository layout
 
