@@ -1,0 +1,112 @@
+//! f32 행렬-벡터/배치 곱 — 무게는 양자화 바이트에서 타일 단위로 디양자화.
+//!
+//! ggml 텐서 레이아웃: W [ne0=n_in, ne1=n_out] 행 우선 — out[o] = Σ_i x[i]·W[o,i].
+//! ADR-0005: GPU 커널이 아닌 CPU 참조 경로. FMA 없는 mul+add (x86-64 기본 타깃은
+//! auto-FMA가 없어 자동으로 성립; target-feature 변경 시 재검토 필요 — 주석 유지).
+
+use llm170_gguf::GgmlType;
+use llm170_profiler::profile_span;
+
+/// mmap 상의 무게 텐서 참조.
+#[derive(Clone, Copy)]
+pub struct Weight<'a> {
+    pub data: &'a [u8],
+    pub ty: GgmlType,
+    pub n_in: u64,
+    pub n_out: u64,
+}
+
+impl<'a> Weight<'a> {
+    /// 텐서 전체를 f32 벡터로 펼침 (ne0-빠른 행 우선: 요소 (i, j) @ j*n_in+i).
+    pub fn dequant_f32_vec(&self) -> Vec<f32> {
+        let n = self.n_in * self.n_out;
+        let (blck, bsize) = self.ty.block_info();
+        let rows = self.n_out;
+        let mut v = vec![0.0f32; n as usize];
+        for r in 0..rows {
+            crate::quant::dequant_row(self.ty, self.data, r, self.n_in, &mut v[r as usize * self.n_in as usize..]);
+        }
+        let _ = (blck, bsize);
+        v
+    }
+}
+
+pub fn n_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(32)
+}
+
+/// out[o] = Σ_i x[i]·W[o,i] (단일 토큰). 스레드별 행 슬라이스 소유.
+pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
+    profile_span!("cpu::matmul1");
+    let n_in = w.n_in as usize;
+    let nt = n_threads().max(1).min(out.len());
+    let rows_per = out.len().div_ceil(nt);
+    let mut chunks: Vec<&mut [f32]> = out.chunks_mut(rows_per).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (lo, ch) in chunks.iter_mut().enumerate() {
+            let row0 = lo * rows_per;
+            handles.push(scope.spawn(move || {
+                let mut scratch = vec![0.0f32; n_in];
+                for (r, o) in ch.iter_mut().enumerate() {
+                    crate::quant::dequant_row(w.ty, w.data, (row0 + r) as u64, w.n_in, &mut scratch);
+                    let mut acc = 0.0f32;
+                    for i in 0..n_in {
+                        acc += x[i] * scratch[i];
+                    }
+                    *o = acc;
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+}
+
+/// 배치: outs[t][o] = Σ_i xs[t][i]·W[o,i].
+/// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
+/// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
+pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
+    profile_span!("cpu::matmulB");
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let t = xs.len();
+    assert_eq!(outs.len(), t);
+    let nt = n_threads().max(1).min(n_out);
+    let rows_per = n_out.div_ceil(nt);
+
+    let mut locals: Vec<Vec<f32>> = vec![vec![0.0f32; t * rows_per]; nt];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (g, local) in locals.iter_mut().enumerate() {
+            let row0 = g * rows_per;
+            handles.push(scope.spawn(move || {
+                let mut scratch = vec![0.0f32; n_in];
+let rows = n_out.saturating_sub(row0).min(rows_per);
+                for r in 0..rows {
+                    crate::quant::dequant_row(w.ty, w.data, (row0 + r) as u64, w.n_in, &mut scratch);
+                    for (ti, x) in xs.iter().enumerate() {
+                        let mut acc = 0.0f32;
+                        for i in 0..n_in {
+                            acc += x[i] * scratch[i];
+                        }
+                        local[ti * rows_per + r] = acc;
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+    for (g, local) in locals.iter().enumerate() {
+        let row0 = g * rows_per;
+let rows = n_out.saturating_sub(row0).min(rows_per);
+        for ti in 0..t {
+            for r in 0..rows {
+                outs[ti][row0 + r] = local[ti * rows_per + r];
+            }
+        }
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "llm170-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+llm170-gguf = { path = "../gguf" }
+llm170-profiler = { path = "../profiler" }
+memmap2 = "0.9"

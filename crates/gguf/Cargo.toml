@@ -1,0 +1,7 @@
+[package]
+name = "llm170-gguf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+llm170-profiler = { path = "../profiler" }

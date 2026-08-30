@@ -1,0 +1,284 @@
+//! llm170 CLI.
+//!
+//! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
+//! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+const USAGE: &str = r#"
+llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
+
+사용법:
+  llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
+      GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
+  llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
+              [--n-predict N] [--ctx N] [--seed-eos]
+      greedy 추론. --prompt-tokens 반복 = 병렬 시퀀스(np), 콤마 구분 토큰 id.
+      출력: JSONL {"seq","pos","token","text"}
+  llm170 help
+"#;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
+        Some("infer") => cmd_infer(&args[1..]),
+        Some("dequant") => cmd_dequant(&args[1..]),
+        Some("help") | Some("--help") | Some("-h") | None => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("unknown command: {other}\n\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_gguf_dump(args: &[String]) -> ExitCode {
+    let mut meta_only = false;
+    let mut limit = None;
+    let mut path: Option<PathBuf> = None;
+
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--meta-only" => meta_only = true,
+            "--limit" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) => limit = Some(n),
+                None => {
+                    eprintln!("--limit requires a number");
+                    return ExitCode::from(2);
+                }
+            },
+            other if !other.starts_with("--") => {
+                if path.is_some() {
+                    eprintln!("multiple input files given");
+                    return ExitCode::from(2);
+                }
+                path = Some(PathBuf::from(other));
+            }
+            other => {
+                eprintln!("unknown flag: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(path) = path else {
+        eprintln!("gguf-dump: input file required\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+
+    llm170_profiler::reset();
+    let f = {
+        llm170_profiler::profile_span!("cli::gguf-dump::total");
+        let f = match llm170_gguf::GgufFile::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        llm170_gguf::write_dump(&f, limit, meta_only, &mut std::io::stdout()).ok();
+        f
+    };
+    drop(f);
+
+    if let Some(rep) = llm170_profiler::report() {
+        eprint!("\n{rep}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// llm170 dequant <file> <tensor> <row> <n> — 디양자화 값 프로브 (검증용)
+fn cmd_dequant(args: &[String]) -> ExitCode {
+    if args.len() != 4 {
+        eprintln!("usage: llm170 dequant <file> <tensor> <row> <n>");
+        return ExitCode::from(2);
+    }
+    let f = match llm170_gguf::GgufFile::open(std::path::Path::new(&args[0])) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let t = match f.find_tensor(&args[1]) {
+        Some(t) => t,
+        None => {
+            eprintln!("tensor not found: {}", args[1]);
+            return ExitCode::FAILURE;
+        }
+    };
+    let row: u64 = args[2].parse().unwrap();
+    let n: usize = args[3].parse().unwrap();
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(&args[0]).unwrap();
+    let k = t.ne[0];
+    let (blck, bsize) = t.ty.block_info();
+    let row_bytes = (k / blck * bsize) as usize;
+    let (start, _) = t.file_range(f.data_offset).unwrap();
+    let mut buf = vec![0u8; row_bytes];
+    file.read_exact_at(&mut buf, start + row * row_bytes as u64).unwrap();
+    let mut out = vec![0.0f32; k as usize];
+    llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
+    let vals: Vec<String> = out[..n].iter().map(|v| format!("{v:.6}")).collect();
+    println!("[{}] row {row}: {}", t.ty.name(), vals.join(", "));
+    ExitCode::SUCCESS
+}
+
+fn cmd_infer(args: &[String]) -> ExitCode {
+    let mut model: Option<PathBuf> = None;
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    let mut n_predict = 32usize;
+    let mut ctx = 4096usize;
+
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--model" => match it.next() {
+                Some(v) => model = Some(PathBuf::from(v)),
+                None => return usage_err("--model requires a path"),
+            },
+            "--prompt-tokens" => match it.next() {
+                Some(v) => match parse_ids(v) {
+                    Ok(ids) if !ids.is_empty() => prompts.push(ids),
+                    Ok(_) => return usage_err("empty prompt"),
+                    Err(e) => return usage_err(&format!("bad tokens: {e}")),
+                },
+                None => return usage_err("--prompt-tokens requires ids"),
+            },
+            "--n-predict" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) => n_predict = n,
+                None => return usage_err("--n-predict requires a number"),
+            },
+            "--ctx" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) => ctx = n,
+                None => return usage_err("--ctx requires a number"),
+            },
+            other => return usage_err(&format!("unknown flag: {other}")),
+        }
+    }
+
+    let Some(model_path) = model else { return usage_err("--model required") };
+    if prompts.is_empty() {
+        return usage_err("at least one --prompt-tokens required");
+    }
+    let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
+    if max_prompt + n_predict + 8 >= ctx {
+        return usage_err(&format!("ctx({ctx}) too small for prompt({max_prompt})+n_predict({n_predict})"));
+    }
+
+    llm170_profiler::reset();
+    let t_start = std::time::Instant::now();
+    let engine_res = llm170_core::model::Model::load(&model_path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| {
+            let n = prompts.len();
+            let mut eng = llm170_core::model::Engine::new(m, n, ctx);
+            let eos = 248044u32;
+            // prefill (시퀀스별 — GDN chunked 경로)
+            let mut last_logits = Vec::with_capacity(n);
+            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK").ok().and_then(|v| v.parse::<usize>().ok());
+            for (s, p) in prompts.iter().enumerate() {
+                let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
+                if let Some(k) = dbg_topk {
+                    let mut idx: Vec<usize> = (0..l.len()).collect();
+                    idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
+                    let top: Vec<String> = idx[..k.min(l.len())]
+                        .iter()
+                        .map(|&i| format!("{}:{:.4}", i, l[i]))
+                        .collect();
+                    eprintln!("topk seq{s}: {}", top.join(" "));
+                }
+                last_logits.push(l);
+            }
+            let mut finished = vec![false; n];
+            let mut gen_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
+            let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::model::greedy(l)).collect();
+            for s in 0..n {
+                emit(s, prompts[s].len() as u32, next[s], &eng);
+                gen_tokens[s].push(next[s]);
+                if next[s] == eos {
+                    finished[s] = true;
+                }
+            }
+            // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
+            let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            for _step in 0..n_predict {
+                let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
+                if active.is_empty() {
+                    break;
+                }
+                let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
+                let seq_ids: Vec<usize> = active.clone();
+                let logits = eng.decode(&seq_ids, &toks).map_err(|e| e.to_string())?;
+                for (i, &s) in active.iter().enumerate() {
+                    let t = llm170_core::model::greedy(&logits[i]);
+                    next[s] = t;
+                    pos[s] += 1;
+                    emit(s, pos[s], t, &eng);
+                    gen_tokens[s].push(t);
+                    if t == eos {
+                        finished[s] = true;
+                    }
+                }
+            }
+            let dt = t_start.elapsed();
+            eprintln!(
+                "# done: {} seqs, prompt max {}, gen per seq: {} (elapsed {dt:.1?})",
+                n,
+                max_prompt,
+                gen_tokens.iter().map(|g| g.len()).min().unwrap_or(0)
+            );
+            Ok(())
+        });
+    if let Err(e) = engine_res {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(rep) = llm170_profiler::report() {
+        eprint!("\n{rep}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::model::Engine) {
+    // 이 시점 eng는 &Engine 차입 — piece는 model 접근
+    println!(
+        "{{\"seq\":{},\"pos\":{},\"token\":{},\"text\":{}}}",
+        seq,
+        pos,
+        token,
+        json_escape(&eng.piece(token))
+    );
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
+    s.split(',').map(|t| t.trim().parse::<u32>()).collect()
+}
+
+fn usage_err(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}\n\n{USAGE}");
+    ExitCode::from(2)
+}

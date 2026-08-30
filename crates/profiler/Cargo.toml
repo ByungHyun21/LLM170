@@ -1,0 +1,8 @@
+[package]
+name = "llm170-profiler"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# release에서도 프로파일링이 필요할 때 활성화
+profile = []

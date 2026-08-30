@@ -1,0 +1,13 @@
+[package]
+name = "llm170-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "llm170"
+path = "src/main.rs"
+
+[dependencies]
+llm170-gguf = { path = "../gguf" }
+llm170-profiler = { path = "../profiler" }
+llm170-core = { path = "../core" }
