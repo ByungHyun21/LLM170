@@ -4,33 +4,31 @@
 //! release에서는 zero-cost. `profile` feature로 release 계측도 가능.
 //!
 //! v0: 이름 기반 span 누적(횟수/합/평균/최대) + 리포트 출력.
-//! 중첩 구조·스레드별 분리·토크나이저·커널 단위 확장은 엔진 코어가 자리잡은 뒤 추가.
+//! 중첩 구조·스레드별 분리·커널 단위 확장은 엔진 코어가 자리잡은 뒤 추가.
 //!
 //! 사용 규칙: `profile_span!`은 **스코프당 1개**. 같은 함수에서 순차 구간을 잴 때는
 //! 블록 `{ ... }`으로 스코프를 분리한다 (가드가 스코프 끝에 Drop되므로).
 
-use std::sync::Mutex;
-use std::time::Instant;
-
-const MAX_EVENTS: usize = 1 << 22; // 4M span — 초과 시 무음 누락 (OOM 방지)
-
-#[derive(Debug)]
-struct Aggregate {
-    count: u64,
-    total_ns: u128,
-    max_ns: u128,
-}
-
-fn registry() -> &'static Mutex<Vec<(&'static str, u128)>> {
-    static REG: std::sync::LazyLock<Mutex<Vec<(&'static str, u128)>>> =
-        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
-    &REG
-}
-
 /// 계측 활성 조건: debug 빌드 또는 `profile` feature.
 #[cfg(any(debug_assertions, feature = "profile"))]
 mod imp {
-    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const MAX_EVENTS: usize = 1 << 22; // 4M span — 초과 시 무음 누락 (OOM 방지)
+
+    #[derive(Debug)]
+    struct Aggregate {
+        count: u64,
+        total_ns: u128,
+        max_ns: u128,
+    }
+
+    fn registry() -> &'static Mutex<Vec<(&'static str, u128)>> {
+        static REG: std::sync::LazyLock<Mutex<Vec<(&'static str, u128)>>> =
+            std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+        &REG
+    }
 
     pub struct SpanGuard {
         name: &'static str,

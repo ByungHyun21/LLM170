@@ -50,6 +50,7 @@ def baseline_generate(ids, n_predict):
 
 
 def ours_generate(prompts, n_predict, ctx):
+    # 우리 엔진은 prefill 토큰 + n_predict 디코드 = n_predict+1 출력 → 슬라이스
     args = [BIN, "infer", "--model",
             "/home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf",
             "--n-predict", str(n_predict), "--ctx", str(ctx)]
@@ -65,7 +66,7 @@ def ours_generate(prompts, n_predict, ctx):
         seqs.setdefault(j["seq"], []).append((j["pos"], j["token"]))
     for s in seqs:
         seqs[s] = [t for _, t in sorted(seqs[s])]
-    return [seqs.get(i, []) for i in range(len(prompts))]
+    return [seqs.get(i, [])[:n_predict] for i in range(len(prompts))]
 
 
 def compare(name, base, ours):

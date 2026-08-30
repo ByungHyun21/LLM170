@@ -1,0 +1,339 @@
+//! qwen35 (Qwen3.8-27B 계열) CPU 참조 엔진.
+//!
+//! 그래프 배선: `~/local_llm/llama.cpp/src/models/qwen35.cpp` (2026-08-30 판).
+//! - 잔차: h += attn(rms(h)); h += ffn(rms_post(h))
+//! - GDN층(interval≠3): qkv → depthwise conv+SiLU → L2 norm(q,k) → GDN → rms_norm·silu(z) → ssm_out
+//! - Full-attn층(interval==3): q‖gate fused → per-head rms norm(q,k) → RoPE(n_rot, base, 인접 페어)
+//!   → GQA(scale 1/√head_dim) → ⊙sigmoid(gate) → wo
+//! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
+//! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
+
+pub mod hparams;
+mod layers;
+
+use hparams::Hparams;
+use llm170_gguf::GgufFile;
+use llm170_profiler::profile_span;
+use memmap2::Mmap;
+
+use crate::matmul::{matmul, matmul_batch, Weight};
+use crate::ops::{l2_norm, rms_norm, rope_head, silu, sigmoid, softplus};
+use crate::quant::dequant_row;
+#[derive(Debug)]
+pub enum ModelError {
+    MissingTensor(String),
+    UnsupportedLayout { name: String, why: &'static str },
+    BadHparam(&'static str),
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            ModelError::MissingTensor(n) => write!(f, "missing tensor: {n}"),
+            ModelError::UnsupportedLayout { name, why } => write!(f, "unsupported layout {name}: {why}"),
+            ModelError::BadHparam(w) => write!(f, "bad hyperparameter: {w}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
+pub struct Model {
+    pub gguf: GgufFile,
+    pub hp: Hparams,
+    mmap: Mmap,
+    pub token_pieces: Vec<String>,
+}
+
+macro_rules! span_block {
+    ($name:literal, $body:block) => {{
+        llm170_profiler::profile_span!($name);
+        $body
+    }};
+}
+pub(crate) use span_block;
+
+impl Model {
+    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        profile_span!("model::load");
+        let gguf = GgufFile::open(path)?;
+        let file = std::fs::File::open(path)?;
+        // SAFETY: 읽기 전용 무게 매핑 — 수정하지 않는다
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        let u = |k: &str| gguf.arch_kv_u64(k);
+        let n_embd = u("embedding_length").ok_or(ModelError::BadHparam("embedding_length"))? as usize;
+        let block_count = u("block_count").unwrap_or(64) as usize;
+        let head_count = u("attention.head_count").ok_or(ModelError::BadHparam("head_count"))? as usize;
+        let head_dim = u("attention.key_length").ok_or(ModelError::BadHparam("key_length"))? as usize;
+        let d_state = u("ssm.state_size").ok_or(ModelError::BadHparam("ssm.state_size"))? as usize;
+        let n_group = u("ssm.group_count").ok_or(ModelError::BadHparam("ssm.group_count"))? as usize;
+        let dt_rank = u("ssm.time_step_rank").ok_or(ModelError::BadHparam("ssm.time_step_rank"))? as usize;
+        let d_inner = u("ssm.inner_size").ok_or(ModelError::BadHparam("ssm.inner_size"))? as usize;
+
+        let hp = Hparams {
+            n_layer: block_count.min(64), // block_count=65 → 64본체 + MTP(그래프 외)
+            n_embd,
+            n_ff: u("feed_forward_length").ok_or(ModelError::BadHparam("feed_forward_length"))? as usize,
+            n_head: head_count,
+            n_kv: u("attention.head_count_kv").unwrap_or(head_count as u64) as usize,
+            head_dim,
+            n_rot: u("rope.dimension_count").unwrap_or(head_dim as u64) as usize,
+            rope_base: gguf.arch_kv("rope.freq_base").and_then(llm170_gguf::Value::as_f64).unwrap_or(1e7) as f32,
+            eps: gguf.arch_kv("attention.layer_norm_rms_epsilon").and_then(llm170_gguf::Value::as_f64).unwrap_or(1e-6) as f32,
+            full_attn_interval: u("full_attention_interval").unwrap_or(4).max(1) as usize,
+            d_inner,
+            n_group,
+            dt_rank,
+            d_state,
+            conv_k: u("ssm.conv_kernel").unwrap_or(4) as usize,
+            vocab: 0, // 아래에서 embd 텐서로 확정
+        };
+
+        // 정합성: d_inner = dt_rank × head_v_dim, head_v_dim == d_state (delta-net-base assert)
+        if d_inner % dt_rank != 0 || d_inner / dt_rank != d_state {
+            return Err(ModelError::BadHparam("d_inner/dt_rank != d_state").into());
+        }
+        if hp.n_head % hp.n_kv != 0 {
+            return Err(ModelError::BadHparam("n_head % n_kv != 0").into());
+        }
+
+        let mut token_pieces = Vec::new();
+        if let Some((_, toks)) = gguf.kv("tokenizer.ggml.tokens").and_then(|v| v.as_array()) {
+            for t in toks {
+                token_pieces.push(t.as_str().unwrap_or("").to_string());
+            }
+        }
+
+        let vocab = gguf.find_tensor("token_embd.weight").map(|t| t.ne[1]).unwrap_or(0) as usize;
+        let hp = Hparams { vocab, ..hp };
+
+        let m = Model { gguf, mmap, hp, token_pieces };
+        for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
+            m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
+        }
+        Ok(m)
+    }
+
+    /// 무게 뷰.
+    pub fn w(&self, name: &str) -> Option<Weight<'_>> {
+        let t = self.gguf.find_tensor(name)?;
+        let (start, end) = t.file_range(self.gguf.data_offset)?;
+        Some(Weight {
+            data: &self.mmap[start as usize..end as usize],
+            ty: t.ty,
+            n_in: t.ne[0],
+            n_out: t.ne[1] * t.ne[2] * t.ne[3],
+        })
+    }
+
+    fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
+        self.w(name).ok_or_else(|| ModelError::MissingTensor(name.into()))
+    }
+
+    fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+        Ok(self.wchk(name)?.dequant_f32_vec())
+    }
+
+    pub fn is_recr(&self, il: usize) -> bool {
+        il % self.hp.full_attn_interval != self.hp.full_attn_interval - 1
+    }
+}
+
+/// 시퀀스 상태
+pub struct SeqState {
+    pub pos: u32,
+    kv_k: Vec<Vec<f32>>,
+    kv_v: Vec<Vec<f32>>,
+    gdn_s: Vec<Vec<f32>>,
+    conv: Vec<Vec<f32>>,
+}
+
+impl SeqState {
+    pub fn new(model: &Model, ctx: usize) -> Self {
+        let n_full = (0..model.hp.n_layer).filter(|&il| !model.is_recr(il)).count();
+        let n_recr = model.hp.n_layer - n_full;
+        let (n_kv, hd) = (model.hp.n_kv, model.hp.head_dim);
+        let state_size = model.hp.dt_rank * model.hp.d_state * model.hp.d_state;
+        let conv_len = (model.hp.conv_k - 1) * model.hp.conv_ch();
+        SeqState {
+            pos: 0,
+            kv_k: vec![vec![0.0; ctx * n_kv * hd]; n_full],
+            kv_v: vec![vec![0.0; ctx * n_kv * hd]; n_full],
+            gdn_s: vec![vec![0.0; state_size]; n_recr],
+            conv: vec![vec![0.0; conv_len]; n_recr],
+        }
+    }
+}
+
+pub struct Engine {
+    pub model: Model,
+    pub seqs: Vec<SeqState>,
+}
+
+impl Engine {
+    pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
+        let seqs = (0..n_seqs).map(|_| SeqState::new(&model, ctx)).collect();
+        Engine { model, seqs }
+    }
+
+    /// 배치 포워드: batch[i] = 시퀀스 i 토큰(모든 시퀀스 동일 길이).
+    fn forward(&mut self, batch: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, ModelError> {
+        profile_span!("engine::forward");
+        let n_seqs = batch.len();
+        let t_len = batch.first().map(|v| v.len()).unwrap_or(0);
+        assert!(n_seqs > 0 && t_len > 0);
+        assert!(batch.iter().all(|v| v.len() == t_len), "배치 내 동일 길이 필수 (equal_seqs)");
+
+        let hp = self.model.hp.clone();
+        let n_embd = hp.n_embd;
+        let n_tok = n_seqs * t_len;
+        let embd = self.model.wchk("token_embd.weight")?;
+
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
+        for seq_tokens in batch {
+            for &tok in seq_tokens {
+                let mut row = vec![0.0f32; n_embd];
+                dequant_row(embd.ty, embd.data, tok as u64, n_embd as u64, &mut row);
+                xs.push(row);
+            }
+        }
+
+        let mut full_idx = 0usize;
+        let mut recr_idx = 0usize;
+        for il in 0..hp.n_layer {
+            let norm_w = self.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?;
+            // 잔차: pre-norm 원본 보존 (qwen35.cpp:162-184 — inpSA)
+            let residual: Vec<Vec<f32>> = xs.clone();
+            for x in xs.iter_mut() {
+                *x = rms_norm(x, &norm_w, hp.eps);
+            }
+
+            let attn_out = if self.model.is_recr(il) {
+                let o = self.gdn_layer(il, &xs, n_seqs, t_len, recr_idx)?;
+                recr_idx += 1;
+                o
+            } else {
+                let o = self.attn_layer(il, &xs, n_seqs, t_len, full_idx)?;
+                full_idx += 1;
+                o
+            };
+
+            for (t, a) in attn_out.iter().enumerate() {
+                for i in 0..n_embd {
+                    xs[t][i] = residual[t][i] + a[i];
+                }
+            }
+            let ffn_residual = xs.clone();
+            let dbg_layer = il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
+            if dbg_layer {
+                let m = xs.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+                eprintln!("  rs stage post-attn-residual max={m:.5}");
+            }
+
+            let post_w = self.model.f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
+            let gate_w = self.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
+            let up_w = self.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
+            let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
+            let n_ff = hp.n_ff;
+
+            let mut normed: Vec<Vec<f32>> = xs.iter().map(|x| rms_norm(x, &post_w, hp.eps)).collect();
+            let mut gate_y = vec![vec![0.0f32; n_ff]; n_tok];
+            let mut up_y = vec![vec![0.0f32; n_ff]; n_tok];
+            {
+                span_block!("cpu::ffn_gate", {
+                    matmul_batch(&normed, &gate_w, &mut gate_y);
+                });
+            }
+            {
+                span_block!("cpu::ffn_up", {
+                    matmul_batch(&normed, &up_w, &mut up_y);
+                });
+            }
+            for t in 0..n_tok {
+                for i in 0..n_ff {
+                    gate_y[t][i] = silu(gate_y[t][i]) * up_y[t][i];
+                }
+            }
+            {
+                span_block!("cpu::ffn_down", {
+                    matmul_batch(&gate_y, &down_w, &mut xs);
+                });
+            }
+            if dbg_layer {
+                let m = gate_y.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+                eprintln!("  rs stage ffn_siluup max={m:.5}");
+            }
+            for t in 0..n_tok {
+                for i in 0..n_embd {
+                    xs[t][i] += ffn_residual[t][i];
+                }
+            }
+            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                let m = xs[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = xs[0].iter().any(|v| v.is_nan());
+                let v4: Vec<String> = xs[0][..4].iter().map(|v| format!("{v:.5}")).collect();
+                eprintln!("layer {il:>2} recr={} max|x|={m:.4} nan={nan} head={}", self.model.is_recr(il), v4.join(","));
+            }
+        }
+
+        // output_norm + logits (시퀀스별 마지막 토큰만)
+        let out_norm = self.model.f32_vec("output_norm.weight")?;
+        let head = self.model.wchk("output.weight")?;
+        let mut result = Vec::with_capacity(n_seqs);
+        for s in 0..n_seqs {
+            let last = &xs[(s + 1) * t_len - 1];
+            let h = rms_norm(last, &out_norm, hp.eps);
+            let mut logits = vec![0.0f32; head.n_out as usize];
+            matmul(&h, &head, &mut logits);
+            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = logits.iter().any(|v| v.is_nan());
+                eprintln!("logits: max={m:.4} nan={nan} argmax={}", greedy(&logits));
+            }
+            result.push(logits);
+        }
+        Ok(result)
+    }
+
+    /// GDN층. xs: [n_tok][n_embd], seq-major.
+    pub fn decode(&mut self, seq_ids: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, ModelError> {
+        let batch: Vec<Vec<u32>> = tokens.iter().map(|t| vec![*t]).collect();
+        let logits = self.forward(&batch)?;
+        for s in seq_ids {
+            self.seqs[*s].pos += 1;
+        }
+        Ok(logits)
+    }
+
+    /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
+    pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let logits = self.forward(&[tokens.to_vec()])?;
+        self.seqs[seq].pos += tokens.len() as u32;
+        Ok(logits.into_iter().next().unwrap())
+    }
+
+    /// 표면형 근사 디토크 (표시용 — 정식 BPE 디토크나이저는 후속)
+    pub fn piece(&self, tok: u32) -> String {
+        self.model
+            .token_pieces
+            .get(tok as usize)
+            .map(String::as_str)
+            .unwrap_or("")
+            .replace('Ġ', " ")
+            .replace('Ċ', "\n")
+    }
+}
+
+pub fn greedy(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+

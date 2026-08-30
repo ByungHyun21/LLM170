@@ -14,7 +14,8 @@ SRC = "/home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 DST = sys.argv[1] if len(sys.argv) > 1 else "/tmp/qwen35-mid.gguf"
 
 N_EMBD = 5120
-N_LAYER = 4
+N_LAYER = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+FULL_ATTN_INTERVAL = int(sys.argv[3]) if len(sys.argv) > 3 else 4
 N_FF = 17408
 N_HEAD = 24
 N_KV = 4
@@ -144,11 +145,12 @@ def build():
     add("qwen35.attention.head_count", N_HEAD)
     add("qwen35.attention.head_count_kv", N_KV)
     add("qwen35.attention.key_length", HEAD_DIM)
+    add("qwen35.attention.value_length", HEAD_DIM)
     add("qwen35.attention.layer_norm_rms_epsilon", 1e-6)
     add("qwen35.rope.freq_base", 1e7)
     add("qwen35.rope.dimension_count", N_ROT)
     kv.append(("qwen35.rope.dimension_sections", TYPE_IDS["arr"], (TYPE_IDS["i32"], [11, 11, 10, 0])))
-    add("qwen35.full_attention_interval", 4)
+    add("qwen35.full_attention_interval", FULL_ATTN_INTERVAL)
     add("qwen35.ssm.conv_kernel", CONV_K)
     add("qwen35.ssm.state_size", D_STATE)
     add("qwen35.ssm.group_count", N_GROUP)
@@ -172,7 +174,7 @@ def build():
         t(p + "ffn_gate.weight", [N_EMBD, N_FF], q8_0(N_EMBD * N_FF), 8)
         t(p + "ffn_up.weight", [N_EMBD, N_FF], q8_0(N_EMBD * N_FF), 8)
         t(p + "ffn_down.weight", [N_FF, N_EMBD], q8_0(N_FF * N_EMBD), 8)
-        if il % 4 == 3:
+        if il % FULL_ATTN_INTERVAL == FULL_ATTN_INTERVAL - 1:
             t(p + "attn_q.weight", [N_EMBD, N_HEAD * HEAD_DIM * 2], q8_0(N_EMBD * N_HEAD * HEAD_DIM * 2), 8)
             t(p + "attn_k.weight", [N_EMBD, N_KV * HEAD_DIM], q8_0(N_EMBD * N_KV * HEAD_DIM), 8)
             t(p + "attn_v.weight", [N_EMBD, N_KV * HEAD_DIM], q8_0(N_EMBD * N_KV * HEAD_DIM), 8)

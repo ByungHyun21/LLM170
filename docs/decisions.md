@@ -46,3 +46,15 @@
 **배경**: 사용자 지시. 개발기가 ROCm 표준 환경. Backend trait이 HIP/CUDA 유사 API 양측을 수용하면 이관 비용 최소화.
 **요구사항**: debug 빌드는 개발자가 **전 요소를 파악**할 수 있어야 함 — 계측(자체 프로파일러) + 구조 덤프가 기본 탑재.
 **상태(2026-08-30)**: 워크스페이스 + GGUF v3 파서 + `gguf-dump` + 프로파일러 v0 완료. 테스트 6/6(합성 4 + 실측 27B/Flash split1 2). 실측으로 리서치 미확정 항목 해소 — [models/qwen4exp.md](models/qwen4exp.md) §미확정 해소.
+
+## ADR-0009 — GPU 백엔드: cubecl + HIP (2026-08-30)
+
+**결정**: GPU 커널을 cubecl(Rust 매크로)로 작성, hanzo-cubecl-hip(로컬 HIP 7.2.53211 정합 포크)로 gfx1151 JIT 컴파일. 같은 커널이 CUDA/PTX(sm_80)로 컴파일되어 CMP 170HX에 직결.
+**배경**: 사용자 지시 — CPU 검증이 아닌 GPU 실행 우선. cubecl은 커널 소스가 Rust(매크로)로 순수 Rust 정책 유지. 순수 Rust 대안 대비 성숙도/성능.
+**파급**: `crates/backend-gpu`. 커널: GEMV(f32) 검증 → quantized GEMV(q4_K/q5_K/q6_K/q8_0) → GDN AR/attention → prefill.
+
+## ADR-0010 — iq3_s 블록 레이아웃 정정 (2026-08-30)
+
+**결정**: iq3_s 구조체는 `d(2) qs(64) qh(8) signs(32) scales(4)` — **d가 맨 앞** (ggml-common.h 확인).
+**배경**: 기존 구현이 d를 맨 뒤(108)로 읽어 L14 ffn_down(iq3_s 유일 텐서)에서 NaN 폭발. gguf-py 권위 구현과 대조해 발견.
+**교훈**: 블록 레이아웃은 반드시 ggml-common.h 구조체 선언을 직접 확인 — 리서치 요약에 의존 금지.

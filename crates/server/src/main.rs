@@ -24,6 +24,31 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => cmd_infer(&args[1..]),
+        Some("gpu-probe") => {
+            match llm170_backend_gpu::probe() {
+                Ok(msg) => {
+                    println!("{msg}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("gpu-smoke") => {
+            let t = std::time::Instant::now();
+            match llm170_backend_gpu::smoke_gemv(5120, 1024) {
+                Ok(_) => {
+                    println!("GPU GEMV 5120x1024 OK ({:.1?})", t.elapsed());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");

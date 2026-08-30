@@ -11,3 +11,4 @@ path = "src/main.rs"
 llm170-gguf = { path = "../gguf" }
 llm170-profiler = { path = "../profiler" }
 llm170-core = { path = "../core" }
+llm170-backend-gpu = { path = "../backend-gpu" }

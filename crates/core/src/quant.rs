@@ -239,13 +239,13 @@ fn grid4(idx: usize) -> [f32; 4] {
     ]
 }
 
-/// iq3_s 블록: qs(64) qh(8) signs(32) scales(4) d(2)
+/// iq3_s 블록: d(2) qs(64) qh(8) signs(32) scales(4) — d가 맨 앞 (ggml-common.h 구조체)
 fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
-    let d = f16(blk, 108);
-    let qs = &blk[0..64];
-    let qh = &blk[64..72];
-    let signs = &blk[72..104];
-    let scales = &blk[104..108];
+    let d = f16(blk, 0);
+    let qs = &blk[2..66];
+    let qh = &blk[66..74];
+    let signs = &blk[74..106];
+    let scales = &blk[106..110];
     let mut yi = 0;
     let mut qsi = 0;
     let mut qhi = 0;

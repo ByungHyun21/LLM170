@@ -1,0 +1,10 @@
+[package]
+name = "llm170-backend-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+llm170-profiler = { path = "../profiler" }
+cubecl = "0.10.0"
+hanzo-cubecl-hip = "0.10.0"
+bytemuck = "1"

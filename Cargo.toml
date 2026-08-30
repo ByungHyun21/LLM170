@@ -4,6 +4,7 @@ members = [
     "crates/gguf",
     "crates/profiler",
     "crates/server",
+    "crates/backend-gpu",
 ]
 
 [workspace.package]
