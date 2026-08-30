@@ -24,12 +24,13 @@ impl<'a> Weight<'a> {
         let rows = self.n_out;
         let mut v = vec![0.0f32; n as usize];
         for r in 0..rows {
+            let s = r as usize * self.n_in as usize;
             crate::quant::dequant_row(
                 self.ty,
                 self.data,
                 r,
                 self.n_in,
-                &mut v[r as usize * self.n_in as usize..],
+                &mut v[s..s + self.n_in as usize],
             );
         }
         let _ = (blck, bsize);
