@@ -11,4 +11,3 @@ cubecl-runtime = "0.10.0"
 cubecl = { version = "0.10.0", features = ["wgpu"] }
 hanzo-cubecl-hip = "0.10.0"
 bytemuck = "1"
-half = "2"

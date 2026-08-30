@@ -59,6 +59,9 @@ fn main() -> ExitCode {
             }
         }
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
+        Some("gpu-de") => cmd_gpu_de(&args[1..]),
+        Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
+        Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
@@ -167,6 +170,128 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
 
 /// llm170 gpu-mm <file> <tensor> [t] [rows] — CPU matmul 대비 GPU GEMM 상호검증.
 /// 결정적 LCG 입력(seed 0x1234_5678)으로 양쪽 누산, 최대 상대오차 보고.
+/// llm170 gpu-de <file> <tensor> — 블록 0 디양자화 값 GPU 덤프 (검증용).
+fn cmd_gpu_de(args: &[String]) -> ExitCode {
+    if args.len() != 2 {
+        eprintln!("usage: llm170 gpu-de <file> <tensor>");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gpu = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let vals = gpu.debug_dequant_block(&w);
+    match vals {
+        Ok(v) => {
+            let strs: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+            println!("{}", strs.join(","));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// llm170 gpu-de-bytes <file> <tensor> — 블록 0 원시 바이트 덤프.
+fn cmd_gpu_de_bytes(args: &[String]) -> ExitCode {
+    if args.len() != 2 {
+        eprintln!("usage: llm170 gpu-de-bytes <file> <tensor>");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gpu = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match gpu.debug_block_bytes(&w) {
+        Ok(v) => {
+            let strs: Vec<String> = v.iter().map(|x| format!("{}", *x as u32)).collect();
+            println!("{}", strs.join(","));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// llm170 gpu-q3dbg <file> <tensor> <mode 0-3> — q3_K 중간값 덤프.
+fn cmd_gpu_q3dbg(args: &[String]) -> ExitCode {
+    if args.len() != 3 {
+        eprintln!("usage: llm170 gpu-q3dbg <file> <tensor> <mode>");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mode: usize = args[2].parse().unwrap();
+    let gpu = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match gpu.debug_q3(&w, mode) {
+        Ok(v) => {
+            let strs: Vec<String> = v.iter().map(|x| format!("{}", *x as i64)).collect();
+            println!("{}", strs.join(","));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_gpu_mm(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         eprintln!("usage: llm170 gpu-mm <file> <tensor> [t] [rows]");
@@ -238,6 +363,16 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
     {
         eprintln!("gpu error: {e}");
         return ExitCode::FAILURE;
+    }
+
+    // 마이크로벤치: 동일 matmul N회 반복 (가중치 캐시 후) — op당 비용
+    if let Some(n) = std::env::var("LLM170_GPU_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = llm170_core::matmul::Accelerator::matmul_batch(gpu.as_ref(), &xs, &w, &mut gouts);
+        }
+        let dt = t0.elapsed();
+        eprintln!("# bench: {n}회 × {dt:.2?} = {:.3}ms/op", dt.as_secs_f64() * 1000.0 / n as f64);
     }
 
     // CPU (동일 텐서 슬라이스 — 검증 대상 행만)
@@ -432,6 +567,7 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
+    llm170_backend_gpu::timing_report();
     if let Some(rep) = llm170_profiler::report() {
         eprint!("\n{rep}");
     }

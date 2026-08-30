@@ -49,6 +49,40 @@ pub trait Accelerator: Send + Sync {
     ) -> Result<(), String>;
     /// out[o] = Σ_i x[i]·W[o,i]
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
+    /// 같은 입력 xs를 먹는 프로젝션 그룹: outs[i][t][o] = Σ xs[t]·W_i[o]. 기본 = 개별 실행.
+    /// GPU 구현은 x 업로드 1회 + 런치 배치 + 단일 동기화로 파이프라이닝.
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        if ws.len() != outs.len() {
+            return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
+        }
+        for (w, out) in ws.iter().zip(outs.iter_mut()) {
+            self.matmul_batch(xs, w, out)?;
+        }
+        Ok(())
+    }
+}
+
+/// matmul_group 디스패치 — 가속기 없으면 CPU 개별 배치.
+pub fn mm_group(
+    acc: &Acc,
+    xs: &[Vec<f32>],
+    ws: &[Weight],
+    outs: &mut [Vec<Vec<f32>>],
+) -> Result<(), crate::model::ModelError> {
+    match acc.as_deref() {
+        Some(a) => a.matmul_group(xs, ws, outs).map_err(crate::model::ModelError::Accel),
+        None => {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                matmul_batch(xs, w, out);
+            }
+            Ok(())
+        }
+    }
 }
 
 pub type Acc = Option<std::sync::Arc<dyn Accelerator>>;

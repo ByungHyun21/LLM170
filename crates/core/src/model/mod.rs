@@ -16,7 +16,7 @@ use llm170_gguf::GgufFile;
 use llm170_profiler::profile_span;
 use memmap2::Mmap;
 
-use crate::matmul::{Weight, mm, mm_batch};
+use crate::matmul::{Weight, mm, mm_batch, mm_group};
 use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
 use crate::quant::dequant_row;
 #[derive(Debug)]
@@ -292,18 +292,14 @@ impl Engine {
 
             let mut normed: Vec<Vec<f32>> =
                 xs.iter().map(|x| rms_norm(x, &post_w, hp.eps)).collect();
-            let mut gate_y = vec![vec![0.0f32; n_ff]; n_tok];
-            let mut up_y = vec![vec![0.0f32; n_ff]; n_tok];
+            let mut ffn_group: [Vec<Vec<f32>>; 2] =
+                [vec![vec![0.0f32; n_ff]; n_tok], vec![vec![0.0f32; n_ff]; n_tok]];
             {
-                span_block!("cpu::ffn_gate", {
-                    mm_batch(&acc, &normed, &gate_w, &mut gate_y)?;
+                span_block!("cpu::ffn_gate_up", {
+                    mm_group(&acc, &normed, &[gate_w, up_w], &mut ffn_group)?;
                 });
             }
-            {
-                span_block!("cpu::ffn_up", {
-                    mm_batch(&acc, &normed, &up_w, &mut up_y)?;
-                });
-            }
+            let [mut gate_y, up_y] = ffn_group;
             for t in 0..n_tok {
                 for i in 0..n_ff {
                     gate_y[t][i] = silu(gate_y[t][i]) * up_y[t][i];

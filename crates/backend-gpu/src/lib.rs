@@ -8,329 +8,58 @@
 //! 동일한 누산 순서를 유지해 수치 일치 확률을 최대화한다 (ADR-0005 strict FP).
 
 use cubecl::prelude::*;
+
+mod gemm2;
 use cubecl::zspace::{Shape, Strides};
 use cubecl_runtime::server::Handle;
-use half::f16;
 use llm170_core::matmul::{Accelerator, Weight};
 use llm170_gguf::GgmlType;
 use llm170_profiler::profile_span;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+// 위상별 누적 시간(µs) — LLM170_GPU_TIME=1일 때 infer 종료 시 보고.
+pub static T_UP: AtomicU64 = AtomicU64::new(0);
+pub static T_LAUNCH: AtomicU64 = AtomicU64::new(0);
+pub static T_READ: AtomicU64 = AtomicU64::new(0);
+pub static N_OP: AtomicU64 = AtomicU64::new(0);
+
+/// 계측 요약 출력 (server가 infer 완료 후 호출).
+pub fn timing_report() {
+    if T_UP.load(Ordering::Relaxed) == 0 && T_READ.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (u, l, r, n) = (
+        T_UP.load(Ordering::Relaxed),
+        T_LAUNCH.load(Ordering::Relaxed),
+        T_READ.load(Ordering::Relaxed),
+        N_OP.load(Ordering::Relaxed),
+    );
+    eprintln!("# gpu-timing: up={:.1}s launch={:.1}s read={:.1}s ops={n}", u as f64 / 1e6, l as f64 / 1e6, r as f64 / 1e6);
+}
+
+#[inline]
+fn acc(a: &AtomicU64, d: std::time::Duration) {
+    if std::env::var_os("LLM170_GPU_TIME").is_some() {
+        a.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// x를 tlen(≤8의 2의 거듭제곱)행으로 패딩 — 디코드 q3 커널의 토큰 상각용.
+fn pad_x(xs: &[Vec<f32>], n_in: usize, t: usize) -> (Vec<f32>, usize) {
+    let tlen = if t <= 8 { t.max(1).next_power_of_two().min(8) } else { t };
+    let mut xf = Vec::with_capacity(tlen * n_in);
+    for r in xs {
+        xf.extend_from_slice(r);
+    }
+    for _ in t..tlen {
+        xf.resize(xf.len() + n_in, 0.0);
+    }
+    (xf, tlen)
+}
+
 // ---------------------------------------------------------------------------
-// 커널 — 양자화 블록을 즉석 디양자화하며 GEMM.
-// 그리드: x = n_out/64 (행), y = t_len/4 (토큰). 유닛 = (행, 토큰) 1:1.
-// 누산: 행별 블록 순차 + 블록 내 j 순차 — CPU matmul과 동일 순서.
-// ---------------------------------------------------------------------------
-
-/// 바이트 값 → 부호 있는 f32 (ggml i8 재해석).
-#[cube]
-fn byte_signed(v: u32) -> f32 {
-    let x = v as i32;
-    if x > 127 { (x - 256) as f32 } else { x as f32 }
-}
-
-/// u32 워드에서 i바이트 추출 (리틀 엔디안) — WGSL에 u8이 없어 양자화 바이트는
-/// u32 텐서로 운반하고 커널에서 언팩한다 (llama.cpp CUDA 관례와 동일).
-#[cube]
-fn byte(w: &Tensor<u32>, i: usize) -> u32 {
-    (w[i >> 2] >> (((i & 3) * 8) as u32)) & 0xFF
-}
-
-/// f16 바이트 2개 → f32 (리틀 엔디안). WGSL에 u16/f16이 없어 u32 비트 산술로 전개 —
-/// quant.rs half_to_f32와 동일 값 (부동소수 f16 → f32는 항상 정확).
-#[cube]
-fn f16_at(w: &Tensor<u32>, off: usize) -> f32 {
-    let h = byte(w, off) | (byte(w, off + 1) << 8);
-    let sign = (h & 0x8000) << 16;
-    let exp = (h >> 10) & 0x1F;
-    let frac = h & 0x3FF;
-    if exp == 0 {
-        if frac == 0 {
-            f32::from_bits(sign)
-        } else {
-            let v = (frac as f32) * (1.0 / 16777216.0);
-            if sign != 0 { -v } else { v }
-        }
-    } else if exp == 31 {
-        f32::from_bits(sign | 0x7F800000 | (frac << 13))
-    } else {
-        f32::from_bits(sign | ((exp + 112) << 23) | (frac << 13))
-    }
-}
-
-/// q4_K/q5_K 공용 6비트 스케일+min 추출 (get_scale_min_k4, ggml-quants.c:880).
-#[cube]
-fn scale_min_k4(j: usize, w: &Tensor<u32>, base: usize) -> (u32, u32) {
-    if j < 4 {
-        (byte(w, base + j) & 63, byte(w, base + j + 4) & 63)
-    } else {
-        (
-            (byte(w, base + j + 4) & 0xF) | ((byte(w, base + j - 4) >> 6) << 4),
-            (byte(w, base + j + 4) >> 4) | ((byte(w, base + j) >> 6) << 4),
-        )
-    }
-}
-
-/// 양자화 GEMM: out[t·n_out+o] = Σ_i x[t·n_in+i]·W[o,i] — W는 원시 블록 바이트.
-/// qtype 값은 GgmlType 판별자 그대로 (comptime 특수화 → 타입별 1회 JIT).
-#[cube(launch_unchecked)]
-fn gemm_q(
-    x: &Tensor<f32>,
-    w: &Tensor<u32>,
-    out: &mut Tensor<f32>,
-    ktab: &Tensor<f32>,
-    grid3: &Tensor<u32>,
-    n_in: usize,
-    n_out: usize,
-    t_len: usize,
-    #[comptime] qtype: usize,
-) {
-    let o = ABSOLUTE_POS_X as usize; // 행 (CubeDim::x = 64)
-    let t = ABSOLUTE_POS_Y as usize; // 토큰 (CubeDim::y = 4)
-    if o >= n_out || t >= t_len {
-        terminate!();
-    }
-    let blck = if qtype == 0 {
-        1
-    } else if qtype == 1 {
-        1
-    } else if qtype == 30 {
-        1
-    } else if qtype == 8 {
-        32
-    } else if qtype == 20 {
-        32
-    } else {
-        256
-    };
-    let bsize = if qtype == 0 {
-        4
-    } else if qtype == 1 {
-        2
-    } else if qtype == 30 {
-        2
-    } else if qtype == 8 {
-        34
-    } else if qtype == 20 {
-        18
-    } else if qtype == 12 {
-        144
-    } else if qtype == 13 {
-        176
-    } else if qtype == 14 {
-        210
-    } else if qtype == 11 {
-        110
-    } else if qtype == 23 {
-        136
-    } else {
-        110 // iq3_s (21)
-    };
-
-    let blocks = n_in / blck;
-    let row_base = o * blocks * bsize;
-    let xb = t * n_in;
-    let mut acc = 0.0f32;
-    for b in 0..blocks {
-        let wb = row_base + b * bsize;
-        let xo = xb + b * blck;
-
-        if qtype == 0 {
-            // F32: 요소당 4바이트
-            let bits = (byte(w, wb) as u32)
-                | ((byte(w, wb + 1) as u32) << 8)
-                | ((byte(w, wb + 2) as u32) << 16)
-                | ((byte(w, wb + 3) as u32) << 24);
-            acc += x[xo] * f32::from_bits(bits);
-        } else if qtype == 1 {
-            // F16
-            acc += x[xo] * f16_at(w, wb);
-        } else if qtype == 30 {
-            // Bf16
-            let h = (byte(w, wb) as u32) | ((byte(w, wb + 1) as u32) << 8);
-            acc += x[xo] * f32::from_bits(h << 16);
-        } else if qtype == 8 {
-            // Q8_0: d(2) qs(32, i8)
-            let d = f16_at(w, wb);
-            for j in 0..32 {
-                acc += x[xo + j] * (byte_signed(byte(w, wb + 2 + j)) * d);
-            }
-        } else if qtype == 12 {
-            // Q4_K: d(2) dmin(2) scales(12) qs(128)
-            let d = f16_at(w, wb);
-            let min = f16_at(w, wb + 2);
-            for sb in 0..8 {
-                let (sc, m) = scale_min_k4(sb, w, wb + 4);
-                let d1 = d * sc as f32;
-                let mm = min * m as f32;
-                for j in 0..32 {
-                    let q = byte(w, wb + 16 + (sb / 2) * 32 + j);
-                    let nib = if sb % 2 == 0 { q & 0xF } else { q >> 4 };
-                    acc += x[xo + sb * 32 + j] * (d1 * nib as f32 - mm);
-                }
-            }
-        } else if qtype == 13 {
-            // Q5_K: d(2) dmin(2) scales(12) qh(32) qs(128)
-            let d = f16_at(w, wb);
-            let min = f16_at(w, wb + 2);
-            for sb in 0..8 {
-                let (sc, m) = scale_min_k4(sb, w, wb + 4);
-                let d1 = d * sc as f32;
-                let mm = min * m as f32;
-                let sh = (2 * (sb / 2)) as u32;
-                for j in 0..32 {
-                    let qh_b = byte(w, wb + 16 + j) as u32;
-                    let ql = byte(w, wb + 48 + (sb / 2) * 32 + j);
-                    let bit = if sb % 2 == 0 {
-                        (qh_b >> sh) & 1
-                    } else {
-                        (qh_b >> (sh + 1)) & 1
-                    };
-                    let nib = if sb % 2 == 0 { ql & 0xF } else { ql >> 4 };
-                    let v = nib + bit * 16;
-                    acc += x[xo + sb * 32 + j] * (d1 * v as f32 - mm);
-                }
-            }
-        } else if qtype == 14 {
-            // Q6_K: ql(128) qh(64) scales(16, i8) d(2)
-            let d = f16_at(w, wb + 208);
-            for h in 0..2 {
-                for l in 0..32 {
-                    let is = h * 8 + l / 16;
-                    let qlo = byte(w, wb + h * 64 + l);
-                    let qlo2 = byte(w, wb + h * 64 + 32 + l);
-                    let qhb = byte(w, wb + 128 + h * 32 + l);
-                    let q1 = (((qlo & 0xF) | ((qhb & 3) << 4)) as i32) - 32;
-                    acc +=
-                        x[xo + h * 128 + l] * (d * byte_signed(byte(w, wb + 192 + is)) * q1 as f32);
-                    let q2 = (((qlo2 & 0xF) | (((qhb >> 2) & 3) << 4)) as i32) - 32;
-                    acc += x[xo + h * 128 + 32 + l]
-                        * (d * byte_signed(byte(w, wb + 192 + is + 2)) * q2 as f32);
-                    let q3 = (((qlo >> 4) | (((qhb >> 4) & 3) << 4)) as i32) - 32;
-                    acc += x[xo + h * 128 + 64 + l]
-                        * (d * byte_signed(byte(w, wb + 192 + is + 4)) * q3 as f32);
-                    let q4 = (((qlo2 >> 4) | (((qhb >> 6) & 3) << 4)) as i32) - 32;
-                    acc += x[xo + h * 128 + 96 + l]
-                        * (d * byte_signed(byte(w, wb + 192 + is + 6)) * q4 as f32);
-                }
-            }
-        } else if qtype == 11 {
-            // Q3_K: hmask(32) qs(64) scales(12) d(2)
-            let d_all = f16_at(w, wb + 108);
-            let a0 = (byte(w, wb + 96) as u32)
-                | ((byte(w, wb + 97) as u32) << 8)
-                | ((byte(w, wb + 98) as u32) << 16)
-                | ((byte(w, wb + 99) as u32) << 24);
-            let a1 = (byte(w, wb + 100) as u32)
-                | ((byte(w, wb + 101) as u32) << 8)
-                | ((byte(w, wb + 102) as u32) << 16)
-                | ((byte(w, wb + 103) as u32) << 24);
-            let tmp = (byte(w, wb + 104) as u32)
-                | ((byte(w, wb + 105) as u32) << 8)
-                | ((byte(w, wb + 106) as u32) << 16)
-                | ((byte(w, wb + 107) as u32) << 24);
-            let k1 = 0x03030303u32;
-            let k2 = 0x0f0f0f0fu32;
-            let aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
-            let aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
-            let aux0 = (a0 & k2) | ((tmp & k1) << 4);
-            let aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
-            for n in 0..2 {
-                for si in 0..4 {
-                    let shift = si * 2;
-                    let bit = si as u32;
-                    for half in 0..2 {
-                        let ai = n * 8 + si * 2 + half;
-                        let aux_v = if ai < 4 {
-                            aux0
-                        } else if ai < 8 {
-                            aux1
-                        } else if ai < 12 {
-                            aux2
-                        } else {
-                            aux3
-                        };
-                        let scb = (aux_v >> (((ai % 4) * 8) as u32)) & 0xFF;
-                        let dl = d_all * (byte_signed(scb) - 32.0);
-                        for l in 0..16 {
-                            let qv = ((byte(w, wb + 32 + n * 32 + half * 16 + l) as u32
-                                >> (shift as u32))
-                                & 3) as i32;
-                            let sub =
-                                4 - (((byte(w, wb + half * 16 + l) as u32 >> bit) & 1) as i32) * 4;
-                            acc += x[xo + n * 128 + si * 32 + half * 16 + l]
-                                * (dl * (qv - sub) as f32);
-                        }
-                    }
-                }
-            }
-        } else if qtype == 23 {
-            // IQ4_XS: d(2) scales_h(2) scales_l(4) qs(128)
-            let d = f16_at(w, wb);
-            let scales_h = byte(w, wb + 2) | (byte(w, wb + 3) << 8);
-            for ib in 0..8 {
-                let ls = ((byte(w, wb + 4 + ib / 2) >> ((4 * (ib % 2)) as u32)) & 0xF)
-                    | (((scales_h >> ((2 * ib) as u32)) & 3) << 4);
-                let dl = d * (ls as i32 - 32) as f32;
-                for j in 0..16 {
-                    let q = byte(w, wb + 8 + ib * 16 + j);
-                    acc += x[xo + ib * 32 + j] * (dl * ktab[(q & 0xF) as usize]);
-                    acc += x[xo + ib * 32 + 16 + j] * (dl * ktab[(q >> 4) as usize]);
-                }
-            }
-        } else if qtype == 20 {
-            // IQ4_NL: d(2) qs(16)
-            let d = f16_at(w, wb);
-            for j in 0..16 {
-                let q = byte(w, wb + 2 + j);
-                acc += x[xo + j] * (d * ktab[(q & 0xF) as usize]);
-                acc += x[xo + 16 + j] * (d * ktab[(q >> 4) as usize]);
-            }
-        } else {
-            // IQ3_S (21): d(2) qs(64) qh(8) signs(32) scales(4)
-            let d = f16_at(w, wb);
-            for ib in 0..4 {
-                let db1 = d * (1 + 2 * (byte(w, wb + 106 + ib) & 0xF)) as f32;
-                let db2 = d * (1 + 2 * (byte(w, wb + 106 + ib) >> 4)) as f32;
-                let qh0 = byte(w, wb + 66 + 2 * ib) as usize;
-                let qh1 = byte(w, wb + 66 + 2 * ib + 1) as usize;
-                for l in 0..4 {
-                    let i1 =
-                        (byte(w, wb + 2 + ib * 16 + 2 * l) as usize) | ((qh0 << (8 - 2 * l)) & 256);
-                    let i2 = (byte(w, wb + 2 + ib * 16 + 2 * l + 1) as usize)
-                        | ((qh0 << (7 - 2 * l)) & 256);
-                    for j in 0..4 {
-                        let g1 = byte_signed((grid3[i1] >> ((8 * j) as u32)) & 0xFF);
-                        let g2 = byte_signed((grid3[i2] >> ((8 * j) as u32)) & 0xFF);
-                        let sg = byte(w, wb + 74 + ib * 8 + l);
-                        let s1 = 1.0 - 2.0 * (((sg as u32 >> (j as u32)) & 1) as f32);
-                        let s2 = 1.0 - 2.0 * (((sg as u32 >> ((4 + j) as u32)) & 1) as f32);
-                        acc += x[xo + ib * 64 + l * 8 + j] * (db1 * g1 * s1);
-                        acc += x[xo + ib * 64 + l * 8 + 4 + j] * (db1 * g2 * s2);
-                    }
-                }
-                for l in 0..4 {
-                    let i1 = (byte(w, wb + 2 + ib * 16 + 8 + 2 * l) as usize)
-                        | ((qh1 << (8 - 2 * l)) & 256);
-                    let i2 = (byte(w, wb + 2 + ib * 16 + 8 + 2 * l + 1) as usize)
-                        | ((qh1 << (7 - 2 * l)) & 256);
-                    for j in 0..4 {
-                        let g1 = byte_signed((grid3[i1] >> ((8 * j) as u32)) & 0xFF);
-                        let g2 = byte_signed((grid3[i2] >> ((8 * j) as u32)) & 0xFF);
-                        let sg = byte(w, wb + 74 + ib * 8 + 4 + l);
-                        let s1 = 1.0 - 2.0 * (((sg as u32 >> (j as u32)) & 1) as f32);
-                        let s2 = 1.0 - 2.0 * (((sg as u32 >> ((4 + j) as u32)) & 1) as f32);
-                        acc += x[xo + ib * 64 + 32 + l * 8 + j] * (db2 * g1 * s1);
-                        acc += x[xo + ib * 64 + 32 + l * 8 + 4 + j] * (db2 * g2 * s2);
-                    }
-                }
-            }
-        }
-    }
-    out[t * n_out + o] = acc;
-}
-
 // ---------------------------------------------------------------------------
 // f32 스모크 커널 (원형 유지 — gpu-smoke 서브커맨드)
 // ---------------------------------------------------------------------------
@@ -439,6 +168,9 @@ struct DevWeight {
 pub struct GpuMatmul<R: Runtime> {
     client: ComputeClient<R>,
     weights: Mutex<HashMap<usize, DevWeight>>,
+    /// 크기별 재사용 스크래치/아웃 버퍼 풀(스택) — hipMalloc churn 방지.
+    /// 인플라이트 중 재할당 방지: 획득은 pop(비면 alloc), read 동기화 후 반납.
+    bufs: Mutex<HashMap<usize, Vec<Handle>>>,
     ktab: Handle,  // iq4_nl 룩업 (f32×16)
     grid3: Handle, // iq3_s 그리드 (u32×512)
 }
@@ -480,9 +212,28 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(GpuMatmul {
             client,
             weights: Mutex::new(HashMap::new()),
+            bufs: Mutex::new(HashMap::new()),
             ktab,
             grid3,
         })
+    }
+
+    /// 풀에서 버퍼 획득 (같은 크기 연속 획득 시 서로 다른 핸들).
+    fn acquire_buf(&self, bytes: usize) -> Result<Handle, String> {
+        let mut pool = self.bufs.lock().map_err(|_| "buf pool lock poisoned")?;
+        if let Some(h) = pool.get_mut(&bytes).and_then(|v| v.pop()) {
+            return Ok(h);
+        }
+        Ok(self.client.empty(bytes))
+    }
+
+    /// read 동기화 후 반납 (크기 명시 — Handle은 크기 비공개).
+    fn release_bufs(&self, hs: &[(Handle, usize)]) {
+        if let Ok(mut pool) = self.bufs.lock() {
+            for (h, bytes) in hs {
+                pool.entry(*bytes).or_default().push(h.clone());
+            }
+        }
     }
 
     fn dev_weight(&self, w: &Weight) -> Result<DevWeight, String> {
@@ -510,35 +261,148 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(d)
     }
 
-    /// GEMM 실행 → [t][n_out] 플랫 결과.
-    fn run_gemm(&self, d: &DevWeight, xf: &[f32], t: usize) -> Result<Vec<f32>, String> {
-        let (n_in, n_out) = (d.n_in, d.n_out);
-        let xg = self.client.create_from_slice(bytemuck::cast_slice(xf));
-        let og = self.client.empty(t * n_out * 4);
+    /// 디버그: 텐서 블록 0 요소별 디양자화 값 (gpu-de).
+    pub fn debug_dequant_block(&self, w: &Weight) -> Result<Vec<f32>, String> {
+        let d = self.dev_weight(w)?;
         let (blck, _) = d.ty.block_info();
-        let _ = blck;
-        let bytes = d.bytes;
-        let gx = n_out.div_ceil(64) as u32;
-        let gy = t.div_ceil(4) as u32;
-        // SAFETY: 그리드가 (n_out, t_len)을 덮고 커널 시작부에서 범위 가드(terminate!) —
-        // 모든 인덱스는 x[t·n_in+i]·w[바이트]·out[t·n_out+o] 상한 내. 무한루프 없음.
+        let n = blck as usize;
+        let og = self.client.empty(n * 4);
+        // SAFETY: 그리드가 정확히 요소 수만큼 — 범위 가드 내.
         unsafe {
-            gemm_q::launch_unchecked(
+            gemm2::debug_de::launch_unchecked(
                 &self.client,
-                CubeCount::Static(gx, gy, 1),
-                CubeDim::new_2d(64, 4),
-                TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
-                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
                 TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
                 TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
-                n_in,
-                n_out,
-                t,
                 d.ty as u32 as usize,
+                n,
             );
         }
         let raw = self.client.read_one(og).map_err(|e| e.to_string())?;
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
+    /// 디버그: 블록 0 원시 바이트 (gpu-de-bytes).
+    pub fn debug_block_bytes(&self, w: &Weight) -> Result<Vec<f32>, String> {
+        let d = self.dev_weight(w)?;
+        let n = 110.min(d.bytes * 4);
+        let og = self.client.empty(n * 4);
+        // SAFETY: 그리드 = 요소 수, 가드 내.
+        unsafe {
+            gemm2::debug_bytes::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
+                n,
+            );
+        }
+        let raw = self.client.read_one(og).map_err(|e| e.to_string())?;
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
+    /// 디버그: q3_K 중간값 (mode).
+    pub fn debug_q3(&self, w: &Weight, mode: usize) -> Result<Vec<f32>, String> {
+        let d = self.dev_weight(w)?;
+        let n = 256;
+        let og = self.client.empty(n * 4);
+        // SAFETY: 그리드 = 요소 수, 가드 내.
+        unsafe {
+            gemm2::debug_q3::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n as u32, 1, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
+                n,
+                mode,
+            );
+        }
+        let raw = self.client.read_one(og).map_err(|e| e.to_string())?;
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
+    /// GEMM 런치 (비동기, v2 k-레인) — x는 외부에서 업로드해 전달. 반환: out 핸들.
+    fn launch_gemm(&self, d: &DevWeight, xg: Handle, t: usize) -> Result<(Handle, Handle, usize, usize), String> {
+        let (n_in, n_out) = (d.n_in, d.n_out);
+        // 스크래치 예산 512MiB 내에서 최대 슬라이스 — comptime 특수화 {64,16,4}
+        let slices: usize = if t * n_out * 64 * 4 <= 512 << 20 {
+            64
+        } else if t * n_out * 16 * 4 <= 512 << 20 {
+            16
+        } else {
+            4
+        };
+        // 디코드(t ≤ 8, t = tlen 패딩됨) — 토큰 상각 q3, 아니면 q2
+        let decode = t <= 8 && slices == 64;
+        let og = self.acquire_buf(t * n_out * 4)?;
+        let pg = self.acquire_buf(t * n_out * slices * 4)?;
+        // SAFETY: 두 경로 모두 그리드가 (n_out, t)를 덮고 시작부 범위 가드 —
+        // 인덱스 상한 내, 무한루프 없음.
+        unsafe {
+            if decode {
+                gemm2::gemm_q3::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n_out as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    t,
+                    d.ty as u32 as usize,
+                );
+            } else {
+                let gy = t.div_ceil(4) as u32;
+                gemm2::gemm_q2::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n_out as u32, gy, 1),
+                    CubeDim::new_2d(64, 4),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    t,
+                    d.ty as u32 as usize,
+                    slices,
+                );
+            }
+            gemm2::reduce_parts::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_out as u32, t as u32, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
+                n_out,
+                t,
+                slices,
+            );
+        }
+        Ok((og, pg, t * n_out * 4, t * n_out * slices * 4))
+    }
+
+    /// GEMM 실행 → [t][n_out] 플랫 결과 (tlen 패딩은 호출부 책임).
+    fn run_gemm(&self, d: &DevWeight, xf: &[f32], t: usize) -> Result<Vec<f32>, String> {
+        let t0 = std::time::Instant::now();
+        let xg = self.client.create_from_slice(bytemuck::cast_slice(xf));
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        let (og, pg, ob, pb) = self.launch_gemm(d, xg, t)?;
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        self.release_bufs(&[(og, ob), (pg, pb)]);
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
 }
@@ -576,6 +440,59 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         }
         let res = self.run_gemm(&d, x, 1)?;
         out.copy_from_slice(&res[..d.n_out]);
+        Ok(())
+    }
+
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        profile_span!("gpu::matmulG");
+        let t = xs.len();
+        if ws.is_empty() || ws.len() != outs.len() {
+            return Err(format!("matmul_group: 잘못된 구성 ws={} outs={}", ws.len(), outs.len()));
+        }
+        let n_in = ws[0].n_in as usize;
+        if xs.iter().any(|r| r.len() != n_in) {
+            return Err(format!("matmul_group: x 행 길이 != n_in ({n_in})"));
+        }
+        if ws.iter().any(|w| w.n_in as usize != n_in) {
+            return Err("matmul_group: 그룹 내 n_in 불일치".into());
+        }
+        let devs: Vec<DevWeight> =
+            ws.iter().map(|w| self.dev_weight(w)).collect::<Result<_, _>>()?;
+        for (d, out) in devs.iter().zip(outs.iter()) {
+            if out.len() != t || out.iter().any(|r| r.len() != d.n_out) {
+                return Err("matmul_group: outs 형상 불일치".into());
+            }
+        }
+        // x 1회 업로드 → K개 런치(비동기 FIFO) → 순차 read(첫 read가 스트림 동기화,
+        // 이후 read는 이미 완료 상태라 즉시 반환) — 동기화 지점 1회로 파이프라이닝.
+        let (xf, tlen) = pad_x(xs, n_in, t);
+        let t0 = std::time::Instant::now();
+        let xg = self.client.create_from_slice(bytemuck::cast_slice(&xf));
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        let pairs: Vec<_> =
+            devs.iter().map(|d| self.launch_gemm(d, xg.clone(), tlen)).collect::<Result<Vec<_>, _>>()?;
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let mut to_release: Vec<(Handle, usize)> = Vec::with_capacity(pairs.len() * 2);
+        for (((og, pg, ob, pb), d), out_rows) in pairs.iter().zip(devs.iter()).zip(outs.iter_mut()) {
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let res: &[f32] = bytemuck::cast_slice(&raw);
+            for (ti, out) in out_rows.iter_mut().enumerate() {
+                out.copy_from_slice(&res[ti * d.n_out..(ti + 1) * d.n_out]);
+            }
+            to_release.push((og.clone(), *ob));
+            to_release.push((pg.clone(), *pb));
+        }
+        acc(&T_READ, t2.elapsed());
+        self.release_bufs(&to_release);
+        let _ = tlen;
+        N_OP.fetch_add(devs.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 }

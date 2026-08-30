@@ -2,7 +2,7 @@
 //! 그래프 배선: ~/local_llm/llama.cpp/src/models/qwen35.cpp (2026-08-30 판).
 
 use super::{Engine, ModelError, span_block};
-use crate::matmul::{mm, mm_batch};
+use crate::matmul::{mm_batch, mm_group};
 use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
 use llm170_profiler::profile_span;
 impl Engine {
@@ -38,18 +38,19 @@ impl Engine {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0)
             && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
-        let mut qkv = vec![vec![0.0f32; conv_ch]; n_tok];
+        // qkv·z·beta·alpha는 전부 동일 입력 xs — 1그룹 배치 (GPU: 업로드 1회+동기 1회)
+        let mut group: [Vec<Vec<f32>>; 4] = [
+            vec![vec![0.0f32; conv_ch]; n_tok],
+            vec![vec![0.0f32; d_inner]; n_tok],
+            vec![vec![0.0f32; dt_rank]; n_tok],
+            vec![vec![0.0f32; dt_rank]; n_tok],
+        ];
         {
-            span_block!("cpu::gdn_qkv", {
-                mm_batch(&acc, xs, &wqkv, &mut qkv)?;
+            span_block!("cpu::gdn_qkvzba", {
+                mm_group(&acc, xs, &[wqkv, wgate, wbeta, walpha], &mut group)?;
             });
         }
-        let mut z = vec![vec![0.0f32; d_inner]; n_tok];
-        {
-            span_block!("cpu::gdn_z", {
-                mm_batch(&acc, xs, &wgate, &mut z)?;
-            });
-        }
+        let [qkv, z, b, a] = group;
 
         if dbg0 {
             let mz = z
@@ -70,10 +71,6 @@ impl Engine {
         let mut g_all = vec![0.0f32; n_tok * dt_rank];
         {
             span_block!("cpu::gdn_bg", {
-                let mut b = vec![vec![0.0f32; dt_rank]; n_tok];
-                let mut a = vec![vec![0.0f32; dt_rank]; n_tok];
-                mm_batch(&acc, xs, &wbeta, &mut b)?;
-                mm_batch(&acc, xs, &walpha, &mut a)?;
                 for t in 0..n_tok {
                     for h in 0..dt_rank {
                         beta_all[t * dt_rank + h] = sigmoid(b[t][h]);
@@ -275,19 +272,22 @@ impl Engine {
             .model
             .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
-        let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
-        let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
-        let mut vv = vec![vec![0.0f32; wv.n_out as usize]; n_tok];
+        // q·k·v 동일 입력 xs — 1그룹 배치
+        let mut group: [Vec<Vec<f32>>; 3] = [
+            vec![vec![0.0f32; wq.n_out as usize]; n_tok],
+            vec![vec![0.0f32; wk.n_out as usize]; n_tok],
+            vec![vec![0.0f32; wv.n_out as usize]; n_tok],
+        ];
         {
             span_block!("cpu::attn_qkv", {
-                mm_batch(&acc, xs, &wq, &mut qg)?;
-                mm_batch(&acc, xs, &wk, &mut kk)?;
-                mm_batch(&acc, xs, &wv, &mut vv)?;
+                mm_group(&acc, xs, &[wq, wk, wv], &mut group)?;
             });
         }
+        let [qg, kk, vv] = group;
 
         let kq_scale = hp.kq_scale();
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
+        let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
         for s in 0..n_seqs {
             let pos0 = self.seqs[seq_ids[s]].pos;
             let seq = &mut self.seqs[seq_ids[s]];
@@ -307,7 +307,7 @@ impl Engine {
                     cache_k[b..b + hd].copy_from_slice(&head);
                     cache_v[b..b + hd].copy_from_slice(&vv[row][h * hd..h * hd + hd]);
                 }
-                let mut attn_out = vec![0.0f32; n_head * hd];
+                let mut attn_out = std::mem::take(&mut attn_all[row]);
                 for h in 0..n_head {
                     let src = qg[row][h * 2 * hd..h * 2 * hd + hd].to_vec();
                     let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
@@ -350,8 +350,14 @@ impl Engine {
                         attn_out[ob + i] *= sigmoid(qg[row][gb + i]);
                     }
                 }
-                mm(&acc, &attn_out, &wo, &mut out[row])?;
+                attn_all[row] = attn_out;
             }
+        }
+        // wo 프로젝션 — 전 토큰 배치 1회
+        {
+            span_block!("cpu::attn_wo", {
+                mm_batch(&acc, &attn_all, &wo, &mut out)?;
+            });
         }
         Ok(out)
     }
