@@ -58,3 +58,23 @@
 **결정**: iq3_s 구조체는 `d(2) qs(64) qh(8) signs(32) scales(4)` — **d가 맨 앞** (ggml-common.h 확인).
 **배경**: 기존 구현이 d를 맨 뒤(108)로 읽어 L14 ffn_down(iq3_s 유일 텐서)에서 NaN 폭발. gguf-py 권위 구현과 대조해 발견.
 **교훈**: 블록 레이아웃은 반드시 ggml-common.h 구조체 선언을 직접 확인 — 리서치 요약에 의존 금지.
+
+## ADR-0011 — GPU matmul offload via `Accelerator` + dual HIP/Vulkan runtime (2026-08-30)
+
+**Decision**: `crates/core` defines a runtime-injectable `Accelerator` trait
+(`matmul`/`matmul_batch`); `crates/backend-gpu` implements it with cubecl
+quantized-GEMM kernels. `llm170 infer --backend gpu [--gpu-runtime hip|vulkan]`
+selects the backend at runtime (no build features). The same kernel source
+compiles under hanzo-cubecl-hip (gfx1151) and cubecl-wgpu (Vulkan/WGSL), and
+both runtimes reproduce the CPU greedy stream token-for-token.
+**Background**: user directive — GPU-first development, and both ROCm and
+Vulkan must work on the dev machine.
+**Constraints found**: WGSL has no u8 tensor element, so quant bytes are
+transported as u32 words and unpacked in-kernel. The HIP dialect miscompiles
+`as i8` casts and value-yielding `if` expressions on the RHS of binary
+operators — kernels use pure u32 arithmetic instead. Per-matmul host round
+trips dominate decode latency in this first cut; pipelining/keeping
+activations resident is follow-up work.
+**Numerics**: GPU accumulation order mirrors the CPU reference (row-sequential
+blocks, element-sequential within a block); measured max relative error vs CPU
+is < 1e-3 across all eight quant types in the 27B Q4_K_XL mix.

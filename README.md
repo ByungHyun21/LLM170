@@ -15,9 +15,9 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 | Lightweight profiler (debug-instrumented, zero-cost in release) | ✅ |
 | Dequantization — q4_K / q5_K / q6_K / q8_0 / q3_K / q5_1 / iq4_xs / iq4_nl / iq3_s | ✅ cross-checked against an independent reference implementation |
 | Gated DeltaNet — chunked & autoregressive (CPU) | ✅ two paths agree to 1e-7; cross-validated against llama.cpp |
-| qwen35 CPU inference engine | ✅ greedy tokens match llama.cpp on real 27B (short prompts) |
+| qwen35 CPU inference engine | ✅ greedy tokens match llama.cpp on real 27B (short/long/np4/long+np matrix) |
 | qwen4exp (QSA / hyper-connections / PLE / MoE) | ⏳ planned |
-| GPU backend — cubecl + HIP (gfx1151 → sm_80) | 🔧 probe + GEMV pass; quantized kernels next |
+| GPU backend — cubecl, quantized GEMM (HIP/ROCm + Vulkan) | ✅ all 8 quant types; GPU greedy stream == CPU stream token-for-token |
 
 **Modes.** The engine runs in three profiles: `universal` (any device — the development baseline), `cmp-stock` (8 GB, eFUSE-throttled; FMA-free, tensor-core-free kernels), and `cmp-unlocked` (40–64 GB unlocked silicon). Engine core is mode-agnostic; modes select kernel variants and memory budgets.
 
@@ -38,6 +38,14 @@ cargo run --release -- infer \
     --model <model.gguf> \
     --prompt-tokens 760,6511,314,9338,369 \
     --n-predict 16
+
+# Same inference with all weight projections on the GPU (cubecl).
+# --gpu-runtime hip (default, ROCm) or vulkan (wgpu); weights upload once and stay resident.
+cargo run --release -- infer \
+    --model <model.gguf> \
+    --prompt-tokens 760,6511,314,9338,369 \
+    --n-predict 16 \
+    --backend gpu --gpu-runtime vulkan
 ```
 
 Debug builds are fully instrumented — every stage is timed by the built-in profiler, by design. Nsight doesn't support this card; the engine is its own profiler.

@@ -1804,7 +1804,11 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cubecl",
+ "cubecl-runtime",
+ "half",
  "hanzo-cubecl-hip",
+ "llm170-core",
+ "llm170-gguf",
  "llm170-profiler",
 ]
 

@@ -25,8 +25,19 @@ impl ValueType {
     pub fn from_u32(id: u32) -> Option<Self> {
         use ValueType::*;
         Some(match id {
-            0 => U8, 1 => I8, 2 => U16, 3 => I16, 4 => U32, 5 => I32, 6 => F32,
-            7 => Bool, 8 => Str, 9 => Array, 10 => U64, 11 => I64, 12 => F64,
+            0 => U8,
+            1 => I8,
+            2 => U16,
+            3 => I16,
+            4 => U32,
+            5 => I32,
+            6 => F32,
+            7 => Bool,
+            8 => Str,
+            9 => Array,
+            10 => U64,
+            11 => I64,
+            12 => F64,
             _ => return None,
         })
     }
@@ -34,9 +45,19 @@ impl ValueType {
     pub fn name(self) -> &'static str {
         use ValueType::*;
         match self {
-            U8 => "u8", I8 => "i8", U16 => "u16", I16 => "i16", U32 => "u32",
-            I32 => "i32", F32 => "f32", Bool => "bool", Str => "str",
-            Array => "arr", U64 => "u64", I64 => "i64", F64 => "f64",
+            U8 => "u8",
+            I8 => "i8",
+            U16 => "u16",
+            I16 => "i16",
+            U32 => "u32",
+            I32 => "i32",
+            F32 => "f32",
+            Bool => "bool",
+            Str => "str",
+            Array => "arr",
+            U64 => "u64",
+            I64 => "i64",
+            F64 => "f64",
         }
     }
 }
@@ -63,11 +84,19 @@ impl Value {
     pub fn type_tag(&self) -> ValueType {
         use ValueType::*;
         match self {
-            Value::U8(_) => U8, Value::I8(_) => I8, Value::U16(_) => U16,
-            Value::I16(_) => I16, Value::U32(_) => U32, Value::I32(_) => I32,
-            Value::F32(_) => F32, Value::Bool(_) => Bool, Value::Str(_) => Str,
-            Value::Array(_, _) => Array, Value::U64(_) => U64,
-            Value::I64(_) => I64, Value::F64(_) => F64,
+            Value::U8(_) => U8,
+            Value::I8(_) => I8,
+            Value::U16(_) => U16,
+            Value::I16(_) => I16,
+            Value::U32(_) => U32,
+            Value::I32(_) => I32,
+            Value::F32(_) => F32,
+            Value::Bool(_) => Bool,
+            Value::Str(_) => Str,
+            Value::Array(_, _) => Array,
+            Value::U64(_) => U64,
+            Value::I64(_) => I64,
+            Value::F64(_) => F64,
         }
     }
 
@@ -121,7 +150,9 @@ impl fmt::Display for Value {
                 const PREVIEW: usize = 4;
                 write!(f, "[{}; {}] ", t.name(), items.len())?;
                 for (i, v) in items.iter().take(PREVIEW).enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{v}")?;
                 }
                 if items.len() > PREVIEW {
@@ -129,9 +160,14 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
-            other => write!(f, "{}", other.as_u64().map_or_else(
-                || other.as_f64().map_or_else(|| "?".into(), |v| v.to_string()),
-                |v| v.to_string())),
+            other => write!(
+                f,
+                "{}",
+                other.as_u64().map_or_else(
+                    || other.as_f64().map_or_else(|| "?".into(), |v| v.to_string()),
+                    |v| v.to_string()
+                )
+            ),
         }
     }
 }

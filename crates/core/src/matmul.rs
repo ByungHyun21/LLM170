@@ -24,15 +24,68 @@ impl<'a> Weight<'a> {
         let rows = self.n_out;
         let mut v = vec![0.0f32; n as usize];
         for r in 0..rows {
-            crate::quant::dequant_row(self.ty, self.data, r, self.n_in, &mut v[r as usize * self.n_in as usize..]);
+            crate::quant::dequant_row(
+                self.ty,
+                self.data,
+                r,
+                self.n_in,
+                &mut v[r as usize * self.n_in as usize..],
+            );
         }
         let _ = (blck, bsize);
         v
     }
 }
 
+/// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
+/// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
+pub trait Accelerator: Send + Sync {
+    /// outs[t][o] = Σ_i xs[t][i]·W[o,i]
+    fn matmul_batch(
+        &self,
+        xs: &[Vec<f32>],
+        w: &Weight,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String>;
+    /// out[o] = Σ_i x[i]·W[o,i]
+    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
+}
+
+pub type Acc = Option<std::sync::Arc<dyn Accelerator>>;
+
+/// matmul_batch 디스패치 — 가속기 없으면 CPU 스레드 경로.
+pub fn mm_batch(
+    acc: &Acc,
+    xs: &[Vec<f32>],
+    w: &Weight,
+    outs: &mut [Vec<f32>],
+) -> Result<(), crate::model::ModelError> {
+    match acc.as_deref() {
+        Some(a) => a
+            .matmul_batch(xs, w, outs)
+            .map_err(crate::model::ModelError::Accel),
+        None => Ok(matmul_batch(xs, w, outs)),
+    }
+}
+
+/// matmul 디스패치.
+pub fn mm(
+    acc: &Acc,
+    x: &[f32],
+    w: &Weight,
+    out: &mut [f32],
+) -> Result<(), crate::model::ModelError> {
+    match acc.as_deref() {
+        Some(a) => a.matmul(x, w, out).map_err(crate::model::ModelError::Accel),
+        None => Ok(matmul(x, w, out)),
+    }
+}
+
 pub fn n_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(32)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32)
 }
 
 /// out[o] = Σ_i x[i]·W[o,i] (단일 토큰). 스레드별 행 슬라이스 소유.
@@ -49,7 +102,13 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
             handles.push(scope.spawn(move || {
                 let mut scratch = vec![0.0f32; n_in];
                 for (r, o) in ch.iter_mut().enumerate() {
-                    crate::quant::dequant_row(w.ty, w.data, (row0 + r) as u64, w.n_in, &mut scratch);
+                    crate::quant::dequant_row(
+                        w.ty,
+                        w.data,
+                        (row0 + r) as u64,
+                        w.n_in,
+                        &mut scratch,
+                    );
                     let mut acc = 0.0f32;
                     for i in 0..n_in {
                         acc += x[i] * scratch[i];
@@ -83,9 +142,15 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
             let row0 = g * rows_per;
             handles.push(scope.spawn(move || {
                 let mut scratch = vec![0.0f32; n_in];
-let rows = n_out.saturating_sub(row0).min(rows_per);
+                let rows = n_out.saturating_sub(row0).min(rows_per);
                 for r in 0..rows {
-                    crate::quant::dequant_row(w.ty, w.data, (row0 + r) as u64, w.n_in, &mut scratch);
+                    crate::quant::dequant_row(
+                        w.ty,
+                        w.data,
+                        (row0 + r) as u64,
+                        w.n_in,
+                        &mut scratch,
+                    );
                     for (ti, x) in xs.iter().enumerate() {
                         let mut acc = 0.0f32;
                         for i in 0..n_in {
@@ -102,7 +167,7 @@ let rows = n_out.saturating_sub(row0).min(rows_per);
     });
     for (g, local) in locals.iter().enumerate() {
         let row0 = g * rows_per;
-let rows = n_out.saturating_sub(row0).min(rows_per);
+        let rows = n_out.saturating_sub(row0).min(rows_per);
         for ti in 0..t {
             for r in 0..rows {
                 outs[ti][row0 + r] = local[ti * rows_per + r];

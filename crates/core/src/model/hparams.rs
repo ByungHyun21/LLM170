@@ -2,7 +2,7 @@
 
 #[derive(Debug, Clone)]
 pub struct Hparams {
-    pub n_layer: usize,      // 본체 층수 (MTP 제외)
+    pub n_layer: usize, // 본체 층수 (MTP 제외)
     pub n_embd: usize,
     pub n_ff: usize,
     pub n_head: usize,
@@ -13,8 +13,8 @@ pub struct Hparams {
     pub eps: f32,
     pub full_attn_interval: usize,
     pub d_inner: usize,
-    pub n_group: usize,   // GDN K heads
-    pub dt_rank: usize,   // GDN V heads
+    pub n_group: usize, // GDN K heads
+    pub dt_rank: usize, // GDN V heads
     pub d_state: usize,
     pub conv_k: usize,
     pub vocab: usize,

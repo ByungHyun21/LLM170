@@ -19,7 +19,11 @@ pub enum GgufError {
     BadDims(u32),
     DimTooLarge(u64),
     /// 문자열/배열 길이가 상한 초과 — 파일 손상 가능성
-    LengthOverflow { what: &'static str, len: u64, max: u64 },
+    LengthOverflow {
+        what: &'static str,
+        len: u64,
+        max: u64,
+    },
     TensorCountTooLarge(u64),
 }
 
@@ -29,7 +33,9 @@ impl fmt::Display for GgufError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::NotGguf(m) => write!(f, "not a GGUF file (magic {:02x?})", m),
             Self::UnsupportedVersion(v) => write!(f, "unsupported GGUF version {v} (지원: v3)"),
-            Self::EndiannessSuspect(v) => write!(f, "version {v} 비정상 — 호스트/파일 엔디언 불일치 의심"),
+            Self::EndiannessSuspect(v) => {
+                write!(f, "version {v} 비정상 — 호스트/파일 엔디언 불일치 의심")
+            }
             Self::BadMetadataType(t) => write!(f, "invalid metadata value type {t}"),
             Self::BadArrayType(t) => write!(f, "array element type {t} invalid"),
             Self::BadUtf8(e) => write!(f, "invalid utf-8 string: {e}"),

@@ -3,7 +3,7 @@
 //! 블록 레이아웃은 `ggml-common.h` 구조체 선언 순서 그대로 바이트 오프셋로 해석한다.
 //! 모든 함수는 한 "행"(row, ne[0] 축)의 연속 블록을 f32 로 펼친다.
 
-use crate::tables::{KVALUES_IQ4NL, IQ3S_GRID};
+use crate::tables::{IQ3S_GRID, KVALUES_IQ4NL};
 use llm170_gguf::GgmlType;
 
 #[inline]
@@ -48,7 +48,10 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
-        ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -93,8 +96,10 @@ fn deq_q5_k(blk: &[u8], y: &mut [f32]) {
         let (d1, mm1) = (d * sc1 as f32, min * m1 as f32);
         let (d2, mm2) = (d * sc2 as f32, min * m2 as f32);
         for l in 0..32 {
-            y[yi + l] = d1 * ((ql[qi + l] & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 }) as f32 - mm1;
-            y[yi + 32 + l] = d2 * ((ql[qi + l] >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 }) as f32 - mm2;
+            y[yi + l] =
+                d1 * ((ql[qi + l] & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 }) as f32 - mm1;
+            y[yi + 32 + l] =
+                d2 * ((ql[qi + l] >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 }) as f32 - mm2;
         }
         qi += 32;
         yi += 64;
@@ -149,7 +154,11 @@ fn deq_q3_k(blk: &[u8], y: &mut [f32]) {
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
     aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    let scales: Vec<i8> = aux.iter().flat_map(|w| w.to_le_bytes()).map(|b| b as i8).collect();
+    let scales: Vec<i8> = aux
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .map(|b| b as i8)
+        .collect();
 
     // n(2회) × shift(4) × half(2) × 16 값; q는 n마다 32바이트, hm은 비트팩(값 index = n*128 + j*32 + half*16 + l → hm 바이트 (qi+half+l), 비트 m=1<<j)
     let mut yi = 0;
@@ -255,21 +264,49 @@ fn deq_iq3_s(blk: &[u8], y: &mut [f32]) {
         let db2 = d * (1 + 2 * (scales[ib32_pair] >> 4)) as f32;
         for l in 0..4 {
             let g1 = grid4(qs[qsi + 2 * l] as usize | (((qh[qhi] as usize) << (8 - 2 * l)) & 256));
-            let g2 = grid4(qs[qsi + 2 * l + 1] as usize | (((qh[qhi] as usize) << (7 - 2 * l)) & 256));
+            let g2 =
+                grid4(qs[qsi + 2 * l + 1] as usize | (((qh[qhi] as usize) << (7 - 2 * l)) & 256));
             for j in 0..4 {
-                y[yi + j] = db1 * g1[j] * if signs[sgi + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                y[yi + 4 + j] = db1 * g2[j] * if signs[sgi + l] & KMASK_IQ2XS[4 + j] != 0 { -1.0 } else { 1.0 };
+                y[yi + j] = db1
+                    * g1[j]
+                    * if signs[sgi + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                y[yi + 4 + j] = db1
+                    * g2[j]
+                    * if signs[sgi + l] & KMASK_IQ2XS[4 + j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
             }
             yi += 8;
         }
         qsi += 8;
         sgi += 4;
         for l in 0..4 {
-            let g1 = grid4(qs[qsi + 2 * l] as usize | (((qh[qhi + 1] as usize) << (8 - 2 * l)) & 256));
-            let g2 = grid4(qs[qsi + 2 * l + 1] as usize | (((qh[qhi + 1] as usize) << (7 - 2 * l)) & 256));
+            let g1 =
+                grid4(qs[qsi + 2 * l] as usize | (((qh[qhi + 1] as usize) << (8 - 2 * l)) & 256));
+            let g2 = grid4(
+                qs[qsi + 2 * l + 1] as usize | (((qh[qhi + 1] as usize) << (7 - 2 * l)) & 256),
+            );
             for j in 0..4 {
-                y[yi + j] = db2 * g1[j] * if signs[sgi + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                y[yi + 4 + j] = db2 * g2[j] * if signs[sgi + l] & KMASK_IQ2XS[4 + j] != 0 { -1.0 } else { 1.0 };
+                y[yi + j] = db2
+                    * g1[j]
+                    * if signs[sgi + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                y[yi + 4 + j] = db2
+                    * g2[j]
+                    * if signs[sgi + l] & KMASK_IQ2XS[4 + j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
             }
             yi += 8;
         }
@@ -297,52 +334,83 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
         GgmlType::F16 | GgmlType::Bf16 => {
             for j in 0..k as usize {
                 let h = u16::from_le_bytes([data[base + j * 2], data[base + j * 2 + 1]]);
-                out[j] = if ty == GgmlType::F16 { half_to_f32(h) } else { bf16_to_f32(h) };
+                out[j] = if ty == GgmlType::F16 {
+                    half_to_f32(h)
+                } else {
+                    bf16_to_f32(h)
+                };
             }
         }
         GgmlType::Q4K => {
             for b in 0..blocks {
-                deq_q4_k(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_q4_k(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         GgmlType::Q5K => {
             for b in 0..blocks {
-                deq_q5_k(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_q5_k(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         GgmlType::Q6K => {
             for b in 0..blocks {
-                deq_q6_k(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_q6_k(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         GgmlType::Q3K => {
             for b in 0..blocks {
-                deq_q3_k(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_q3_k(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         GgmlType::Q8_0 => {
             for b in 0..blocks {
-                deq_q8_0(&data[base + b * bsize..][..bsize], &mut out[b * 32..b * 32 + 32]);
+                deq_q8_0(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 32..b * 32 + 32],
+                );
             }
         }
         GgmlType::Q5_1 => {
             for b in 0..blocks {
-                deq_q5_1(&data[base + b * bsize..][..bsize], &mut out[b * 32..b * 32 + 32]);
+                deq_q5_1(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 32..b * 32 + 32],
+                );
             }
         }
         GgmlType::Iq4Xs => {
             for b in 0..blocks {
-                deq_iq4_xs(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_iq4_xs(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         GgmlType::Iq4Nl => {
             for b in 0..blocks {
-                deq_iq4_nl(&data[base + b * bsize..][..bsize], &mut out[b * 32..b * 32 + 32]);
+                deq_iq4_nl(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 32..b * 32 + 32],
+                );
             }
         }
         GgmlType::Iq3S => {
             for b in 0..blocks {
-                deq_iq3_s(&data[base + b * bsize..][..bsize], &mut out[b * 256..b * 256 + 256]);
+                deq_iq3_s(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 256..b * 256 + 256],
+                );
             }
         }
         other => unimplemented!("dequant for {other:?}"),

@@ -48,7 +48,10 @@ mod imp {
 
     /// span 시작. 반환값을 스코프 끝까지 유지할 것.
     pub fn span(name: &'static str) -> SpanGuard {
-        SpanGuard { name, start: Instant::now() }
+        SpanGuard {
+            name,
+            start: Instant::now(),
+        }
     }
 
     /// 누적 리포트: 총 소요 기준 내림차순. 계측된 게 없으면 None.
@@ -60,7 +63,11 @@ mod imp {
         let mut agg: std::collections::HashMap<&'static str, Aggregate> =
             std::collections::HashMap::new();
         for (name, ns) in reg.iter() {
-            let a = agg.entry(name).or_insert(Aggregate { count: 0, total_ns: 0, max_ns: 0 });
+            let a = agg.entry(name).or_insert(Aggregate {
+                count: 0,
+                total_ns: 0,
+                max_ns: 0,
+            });
             a.count += 1;
             a.total_ns += ns;
             a.max_ns = a.max_ns.max(*ns);
@@ -69,11 +76,19 @@ mod imp {
         rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns));
 
         let mut out = String::from("=== llm170 profile ===\n");
-        out.push_str(&format!("{:<44} {:>9} {:>12} {:>12} {:>12}\n",
-            "span", "count", "total", "mean", "max"));
+        out.push_str(&format!(
+            "{:<44} {:>9} {:>12} {:>12} {:>12}\n",
+            "span", "count", "total", "mean", "max"
+        ));
         for (name, a) in rows {
-            out.push_str(&format!("{:<44} {:>9} {:>12} {:>12} {:>12}\n",
-                name, a.count, fmt_ns(a.total_ns), fmt_ns(a.total_ns / a.count as u128), fmt_ns(a.max_ns)));
+            out.push_str(&format!(
+                "{:<44} {:>9} {:>12} {:>12} {:>12}\n",
+                name,
+                a.count,
+                fmt_ns(a.total_ns),
+                fmt_ns(a.total_ns / a.count as u128),
+                fmt_ns(a.max_ns)
+            ));
         }
         out.push_str(&format!("events: {}\n", reg.len()));
         Some(out)
@@ -102,8 +117,12 @@ mod imp {
 #[cfg(not(any(debug_assertions, feature = "profile")))]
 mod imp {
     pub struct SpanGuard;
-    pub fn span(_name: &'static str) -> SpanGuard { SpanGuard }
-    pub fn report() -> Option<String> { None }
+    pub fn span(_name: &'static str) -> SpanGuard {
+        SpanGuard
+    }
+    pub fn report() -> Option<String> {
+        None
+    }
     pub fn reset() {}
 }
 

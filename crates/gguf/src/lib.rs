@@ -20,7 +20,7 @@ use std::path::Path;
 
 // 손상 파일 방어 상한 — 정상 GGUF 범위보다 넉넉하게.
 const MAX_STRING_BYTES: u64 = 1 << 26; // 64 MiB (개별 문자열)
-const MAX_ARRAY_LEN: u64 = 1 << 26;    // 토크나이저 ~25만 보다 훨씬 큼
+const MAX_ARRAY_LEN: u64 = 1 << 26; // 토크나이저 ~25만 보다 훨씬 큼
 const MAX_TENSORS: u64 = 1 << 20;
 const MAX_TENSOR_NAME: u64 = 1 << 12;
 const MAX_DIM: u64 = 1 << 40;
@@ -101,7 +101,9 @@ impl<'a> Reader<'a> {
     }
     fn u64(&mut self) -> Result<u64> {
         let b = self.bytes(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
     fn i64(&mut self) -> Result<i64> {
         Ok(self.u64()? as i64)
@@ -156,7 +158,11 @@ impl<'a> Reader<'a> {
         }
         let n = self.u64()?;
         if n > MAX_ARRAY_LEN {
-            return Err(GgufError::LengthOverflow { what: "array", len: n, max: MAX_ARRAY_LEN });
+            return Err(GgufError::LengthOverflow {
+                what: "array",
+                len: n,
+                max: MAX_ARRAY_LEN,
+            });
         }
         let mut items = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -245,7 +251,13 @@ impl GgufFile {
             let tag = rd.u32()?;
             let ty = GgmlType::from_u32(tag).ok_or(GgufError::UnknownTensorType(tag))?;
             let offset = rd.u64()?;
-            tensors.push(TensorInfo { name, n_dims, ne, ty, offset });
+            tensors.push(TensorInfo {
+                name,
+                n_dims,
+                ne,
+                ty,
+                offset,
+            });
         }
 
         let data_offset = align_up(rd.pos, alignment as u64);
@@ -304,7 +316,10 @@ impl GgufFile {
     /// 무게 데이터 총 바이트 (data_offset 이후 예상 크기).
     /// nbytes 계산 불가(손상) 텐서가 있으면 None.
     pub fn tensor_bytes_total(&self) -> Option<u64> {
-        self.tensors.iter().map(|t| t.nbytes()).collect::<Option<Vec<_>>>()
+        self.tensors
+            .iter()
+            .map(|t| t.nbytes())
+            .collect::<Option<Vec<_>>>()
             .map(|v| v.iter().sum())
     }
 }

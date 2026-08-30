@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """llm170 CPU 엔진 정확도 검증 하니스 (기준: llama-server greedy).
 
-케이스:
-  1. single_short / single_ko — 단일 스트림 짧은 프롬프트
-  3. np4 — 4개 프롬프트 병렬 배치 디코드 (상태 격리 검증)
-  4. long_prompt — 긴 컨텍스트 prefill (GDN chunked 경로)
-  5. long_gen — 장기 생성 (누적 상태 오차)
+케이스 (검증 매트릭스: 짧은/장문 × 단일/np — 4종 + 장기 생성):
+  1. single_short / single_ko / single_code — 단일 스트림 짧은 프롬프트
+  2. np4 — 4개 프롬프트 병렬 배치 디코드 (상태 격리 검증)
+  3. long_prompt — 장문(~2400토큰) 단일 prefill (GDN chunked 경로 장문)
+  4. long_np2 — 장문 프롬프트 2종 병렬 (장문 prefill + np 조합)
+  5. long_gen96 — 장기 생성 (누적 상태 오차)
 
 토큰 id는 기준 서버 /tokenize로 통일 — 토크나이저 표면은 비교 범위 밖.
 greedy(temp 0) 토큰열이 정확히 일치해야 통과 (기준/자체 모두 f32 KV).
+LLM170_EXTRA_ARGS 환경변수로 자체 엔진 인자 추가 가능 (예: --backend gpu).
+
+기준 서버 (재현 인자):
+  llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf --port 10090 -ngl 0 -c 8192 \
+      -ctk f32 -ctv f32 -fa off --temp 0   # (-fa on/off 모두 동일 결과)
+
+알려진 근접 마진 발산 (2026-08-31): 본 엔진은 가중치를 f32로 디양자화해 내적하는
+반면 llama.cpp CPU는 활성을 q8_0으로 재양자화해 정수 내적한다. 두 경로의 양자화
+노이스 차이가 로짓 갭 ~0.3 이하의 근접 토큰에서 스트림을 갈라놓는다
+(single_short/single_ko/long_gen96이 이 범주 — top-k 갭 실측 0.27).
+GPU(HIP/Vulkan)는 CPU와 동일 누산 순서라 발산 지점도 동일하다.
+근본 해소는 ggml q8-내적 산술 재현이 필요 — 별도 과제.
 """
 import json
+import os
 import subprocess
 import sys
 import urllib.request
@@ -18,6 +32,7 @@ import urllib.request
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 10090
 N_PREDICT_DEFAULT = 24
 BIN = "target/release/llm170"
+MODEL_PATH = "/home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 
 
 def post(path, payload):
@@ -52,20 +67,19 @@ def baseline_generate(ids, n_predict):
 def ours_generate(prompts, n_predict, ctx):
     # 우리 엔진은 prefill 토큰 + n_predict 디코드 = n_predict+1 출력 → 슬라이스
     args = [BIN, "infer", "--model",
-            "/home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf",
-            "--n-predict", str(n_predict), "--ctx", str(ctx)]
+            os.environ.get("LLM170_MODEL", MODEL_PATH)]
+    args += os.environ.get("LLM170_EXTRA_ARGS", "").split()
+    args += ["--n-predict", str(n_predict), "--ctx", str(ctx)]
     for p in prompts:
         args += ["--prompt-tokens", ",".join(map(str, p))]
     r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
     if r.returncode != 0:
-        print(r.stderr[-2000:])
-        raise SystemExit("llm170 infer 실패")
+        sys.stderr.write(r.stderr[-4000:])
+        raise RuntimeError(f"llm170 infer rc={r.returncode}")
     seqs = {}
     for line in r.stdout.splitlines():
         j = json.loads(line)
-        seqs.setdefault(j["seq"], []).append((j["pos"], j["token"]))
-    for s in seqs:
-        seqs[s] = [t for _, t in sorted(seqs[s])]
+        seqs.setdefault(j["seq"], []).append(j["token"])
     return [seqs.get(i, [])[:n_predict] for i in range(len(prompts))]
 
 
@@ -112,6 +126,37 @@ def main():
     ours = ours_generate(prompts, N_PREDICT_DEFAULT, 2048)
     for i in range(4):
         results.append(compare(f"np4_seq{i}", bases[i], ours[i]))
+    # --- 장문 프롬프트 (GDN chunked prefill 장문) ---
+    para = ("The quick brown fox jumps over the lazy dog. Pack my box with "
+            "five dozen liquor jugs. How vexingly quick daft zebras jump! "
+            "Sphinx of black quartz, judge my vow. ")
+    long_ids = None
+    for k in range(2, 120):
+        ids = tokenize(para * k)
+        if len(ids) >= 2300:
+            long_ids = ids
+            break
+    assert long_ids, "장문 프롬프트 생성 실패"
+    base = baseline_generate(long_ids, N_PREDICT_DEFAULT)
+    ours = ours_generate([long_ids], N_PREDICT_DEFAULT, 4096)[0]
+    results.append(compare("long_prompt", base, ours))
+
+    # --- 장문 + np 복수 (검증 매트릭스 4종 완성) ---
+    para2 = ("서울은 대한민국의 수도이며 한강이 도시를 가로지른다. 부산은 "
+             "대한민국 제2의 도시로 항구 도시로 발전했다. 대전은 과학 도시로서 "
+             "대덕연구단지를 품고 있다. 광주는 예술의 도시로 알려져 있다. ")
+    long_ids2 = None
+    for k in range(2, 160):
+        ids = tokenize(para2 * k)
+        if len(ids) >= 1900:
+            long_ids2 = ids
+            break
+    assert long_ids2, "장문 프롬프트2 생성 실패"
+    base1 = baseline_generate(long_ids, N_PREDICT_DEFAULT)
+    base2 = baseline_generate(long_ids2, N_PREDICT_DEFAULT)
+    ours = ours_generate([long_ids, long_ids2], N_PREDICT_DEFAULT, 4096)
+    results.append(compare("long_np2_seq0", base1, ours[0]))
+    results.append(compare("long_np2_seq1", base2, ours[1]))
 
     # --- 장기 생성 ---
     ids = tokenize(p1)

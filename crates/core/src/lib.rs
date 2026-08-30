@@ -6,3 +6,4 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 mod tables;
+pub use tables::{IQ3S_GRID, KVALUES_IQ4NL};

@@ -40,7 +40,11 @@ pub fn gdn_chunk_seq(
         let state_chunks: Vec<&mut [f32]> = state.chunks_mut(d * d).collect();
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (h, (st, lo)) in state_chunks.into_iter().zip(local_outs.iter_mut()).enumerate() {
+            for (h, (st, lo)) in state_chunks
+                .into_iter()
+                .zip(local_outs.iter_mut())
+                .enumerate()
+            {
                 handles.push(scope.spawn(move || {
                     gdn_chunk_head(q, k, v, beta, g, st, lo, t_len, h % h_k, h, h_k, h_v, d);
                 }));
@@ -96,9 +100,12 @@ fn gdn_chunk_head(
         // 제로 패딩 복사 (delta-net-base.cpp:63-70)
         for t in 0..n {
             let src = t0 + t;
-            qp[t * d..t * d + d].copy_from_slice(&q[src * k_stride + kh * d..src * k_stride + kh * d + d]);
-            kp[t * d..t * d + d].copy_from_slice(&k[src * k_stride + kh * d..src * k_stride + kh * d + d]);
-            vp[t * d..t * d + d].copy_from_slice(&v[src * v_stride + h * d..src * v_stride + h * d + d]);
+            qp[t * d..t * d + d]
+                .copy_from_slice(&q[src * k_stride + kh * d..src * k_stride + kh * d + d]);
+            kp[t * d..t * d + d]
+                .copy_from_slice(&k[src * k_stride + kh * d..src * k_stride + kh * d + d]);
+            vp[t * d..t * d + d]
+                .copy_from_slice(&v[src * v_stride + h * d..src * v_stride + h * d + d]);
             bp[t] = beta[src * h_v + h];
             gp[t] = g[src * h_v + h];
         }
@@ -235,7 +242,11 @@ pub fn gdn_ar_batch(
         let state_chunks: Vec<&mut [f32]> = states.chunks_mut(d * d).collect();
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for (pair, (st, lo)) in state_chunks.into_iter().zip(local_outs.iter_mut()).enumerate() {
+            for (pair, (st, lo)) in state_chunks
+                .into_iter()
+                .zip(local_outs.iter_mut())
+                .enumerate()
+            {
                 handles.push(scope.spawn(move || {
                     let (b, h) = (pair / h_v, pair % h_v);
                     let kh = h % h_k;
@@ -296,7 +307,9 @@ mod tests {
         let t = 100;
         let mut rng = 0x1234_5678u64;
         let mut rnd = || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
 
@@ -352,7 +365,18 @@ mod tests {
 
         let mut state_ch = vec![0.0f32; h_v * d * d];
         let mut out_ch = vec![0.0f32; t * h_v * d];
-        gdn_chunk_seq(&q, &k, &v, &beta, &g, &mut state_ch, &mut out_ch, t, h_k, h_v);
+        gdn_chunk_seq(
+            &q,
+            &k,
+            &v,
+            &beta,
+            &g,
+            &mut state_ch,
+            &mut out_ch,
+            t,
+            h_k,
+            h_v,
+        );
 
         let mut max_diff = 0.0f32;
         for i in 0..out_ar.len() {
@@ -363,7 +387,10 @@ mod tests {
             max_state_diff = max_state_diff.max((state_ar[i] - state_ch[i]).abs());
         }
         let scale_ref = out_ch.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1.0);
-        assert!(max_diff / scale_ref < 2e-3, "출력 불일치: max_diff={max_diff}");
+        assert!(
+            max_diff / scale_ref < 2e-3,
+            "출력 불일치: max_diff={max_diff}"
+        );
         assert!(max_state_diff < 5e-2, "상태 불일치: {max_state_diff}");
     }
 }

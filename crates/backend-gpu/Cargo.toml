@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 llm170-profiler = { path = "../profiler" }
-cubecl = "0.10.0"
+llm170-core = { path = "../core" }
+llm170-gguf = { path = "../gguf" }
+cubecl-runtime = "0.10.0"
+cubecl = { version = "0.10.0", features = ["wgpu"] }
 hanzo-cubecl-hip = "0.10.0"
 bytemuck = "1"
+half = "2"

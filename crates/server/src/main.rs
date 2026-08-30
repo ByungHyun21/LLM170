@@ -13,8 +13,9 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
   llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
       GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
   llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--seed-eos]
+              [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan]
       greedy 추론. --prompt-tokens 반복 = 병렬 시퀀스(np), 콤마 구분 토큰 id.
+      --backend gpu: matmul을 GPU(cubecl)로 오프로드. --gpu-runtime 기본 hip.
       출력: JSONL {"seq","pos","token","text"}
   llm170 help
 "#;
@@ -24,18 +25,26 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => cmd_infer(&args[1..]),
-        Some("gpu-probe") => {
-            match llm170_backend_gpu::probe() {
-                Ok(msg) => {
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
+        Some("gpu-probe-vk") => match llm170_backend_gpu::probe_vulkan() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("gpu-probe") => match llm170_backend_gpu::probe() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("gpu-smoke") => {
             let t = std::time::Instant::now();
             match llm170_backend_gpu::smoke_gemv(5120, 1024) {
@@ -49,6 +58,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
@@ -146,7 +156,8 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
     let row_bytes = (k / blck * bsize) as usize;
     let (start, _) = t.file_range(f.data_offset).unwrap();
     let mut buf = vec![0u8; row_bytes];
-    file.read_exact_at(&mut buf, start + row * row_bytes as u64).unwrap();
+    file.read_exact_at(&mut buf, start + row * row_bytes as u64)
+        .unwrap();
     let mut out = vec![0.0f32; k as usize];
     llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
     let vals: Vec<String> = out[..n].iter().map(|v| format!("{v:.6}")).collect();
@@ -154,11 +165,132 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// llm170 gpu-mm <file> <tensor> [t] [rows] — CPU matmul 대비 GPU GEMM 상호검증.
+/// 결정적 LCG 입력(seed 0x1234_5678)으로 양쪽 누산, 최대 상대오차 보고.
+fn cmd_gpu_mm(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: llm170 gpu-mm <file> <tensor> [t] [rows]");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found: {}", args[1]);
+            return ExitCode::FAILURE;
+        }
+    };
+    let t: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let rows: usize = args
+        .get(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(w.n_out as usize);
+    let rows = rows.min(w.n_out as usize);
+    let n_in = w.n_in as usize;
+
+    // 결정적 입력
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let mut xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    // LLM170_UNIT=<i>: 단위 벡터 e_i → out[o] = W[o,i] 디양자화 값 프로브
+    if let Ok(u) = std::env::var("LLM170_UNIT") {
+        let u: usize = u.parse().unwrap();
+        for (ti, row) in xs.iter_mut().enumerate() {
+            for r in row.iter_mut() {
+                *r = 0.0;
+            }
+            row[u + ti] = 1.0;
+        }
+    }
+
+    // GPU
+    let gpu: std::sync::Arc<dyn llm170_core::matmul::Accelerator> =
+        match std::env::var("LLM170_GPU_RUNTIME").as_deref() {
+            Ok("vulkan") => match llm170_backend_gpu::GpuMatmul::new_vulkan() {
+                Ok(g) => std::sync::Arc::new(g),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => match llm170_backend_gpu::GpuMatmul::new_hip() {
+                Ok(g) => std::sync::Arc::new(g),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+    let mut gouts = vec![vec![0.0f32; w.n_out as usize]; t];
+    if let Err(e) =
+        llm170_core::matmul::Accelerator::matmul_batch(gpu.as_ref(), &xs, &w, &mut gouts)
+    {
+        eprintln!("gpu error: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // CPU (동일 텐서 슬라이스 — 검증 대상 행만)
+    let wsub = llm170_core::matmul::Weight {
+        data: &w.data[..rows * (n_in / w.ty.blck_size() as usize) * w.ty.type_size() as usize],
+        ty: w.ty,
+        n_in: w.n_in,
+        n_out: rows as u64,
+    };
+    let mut couts = vec![vec![0.0f32; rows]; t];
+    llm170_core::matmul::matmul_batch(&xs, &wsub, &mut couts);
+
+    let mut max_rel = 0.0f64;
+    let mut max_abs = 0.0f64;
+    for ti in 0..t {
+        for o in 0..rows {
+            let (g, c) = (gouts[ti][o], couts[ti][o]);
+            let abs = (g - c).abs();
+            let rel = abs / c.abs().max(1e-3);
+            max_abs = max_abs.max(abs as f64);
+            max_rel = max_rel.max(rel as f64);
+        }
+    }
+    println!(
+        "[{}] {} t={t} rows={rows}: max_abs={max_abs:.3e} max_rel={max_rel:.3e}",
+        w.ty.name(),
+        args[1]
+    );
+    if max_rel > 1e-3 {
+        eprintln!("MISMATCH");
+        let mut shown = 0;
+        for ti in 0..t {
+            for o in 0..rows {
+                let (g, c) = (gouts[ti][o], couts[ti][o]);
+                if (g - c).abs() / c.abs().max(1e-3) > 1e-3 && shown < 8 {
+                    eprintln!("  [{ti}][{o}] gpu={g:.6} cpu={c:.6}");
+                    shown += 1;
+                }
+            }
+        }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn cmd_infer(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
+    let mut backend = "cpu".to_string();
+    let mut gpu_runtime = "hip".to_string();
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -183,17 +315,31 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                 Some(n) => ctx = n,
                 None => return usage_err("--ctx requires a number"),
             },
+            "--backend" => match it.next() {
+                Some(v) if v == "cpu" || v == "gpu" => backend = v.clone(),
+                Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
+                None => return usage_err("--backend requires cpu|gpu"),
+            },
+            "--gpu-runtime" => match it.next() {
+                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.clone(),
+                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
+                None => return usage_err("--gpu-runtime requires hip|vulkan"),
+            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
 
-    let Some(model_path) = model else { return usage_err("--model required") };
+    let Some(model_path) = model else {
+        return usage_err("--model required");
+    };
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
     let max_prompt = prompts.iter().map(|p| p.len()).max().unwrap();
     if max_prompt + n_predict + 8 >= ctx {
-        return usage_err(&format!("ctx({ctx}) too small for prompt({max_prompt})+n_predict({n_predict})"));
+        return usage_err(&format!(
+            "ctx({ctx}) too small for prompt({max_prompt})+n_predict({n_predict})"
+        ));
     }
 
     llm170_profiler::reset();
@@ -203,10 +349,29 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
+            if backend == "gpu" {
+                let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> = match gpu_runtime
+                    .as_str()
+                {
+                    "hip" => std::sync::Arc::new(
+                        llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?,
+                    ),
+                    "vulkan" => std::sync::Arc::new(
+                        llm170_backend_gpu::GpuMatmul::new_vulkan().map_err(|e| e.to_string())?,
+                    ),
+                    other => {
+                        return Err(format!("--gpu-runtime: hip|vulkan (got {other})"));
+                    }
+                };
+                eng = eng.with_acc(acc);
+                eprintln!("# backend: gpu ({gpu_runtime})");
+            }
             let eos = 248044u32;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
-            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK").ok().and_then(|v| v.parse::<usize>().ok());
+            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
                 if let Some(k) = dbg_topk {
@@ -222,7 +387,10 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             }
             let mut finished = vec![false; n];
             let mut gen_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
-            let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::model::greedy(l)).collect();
+            let mut next: Vec<u32> = last_logits
+                .iter()
+                .map(|l| llm170_core::model::greedy(l))
+                .collect();
             for s in 0..n {
                 emit(s, prompts[s].len() as u32, next[s], &eng);
                 gen_tokens[s].push(next[s]);

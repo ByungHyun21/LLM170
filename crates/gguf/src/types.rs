@@ -49,13 +49,41 @@ impl GgmlType {
     pub fn from_u32(id: u32) -> Option<Self> {
         use GgmlType::*;
         Some(match id {
-            0 => F32, 1 => F16, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1,
-            8 => Q8_0, 9 => Q8_1, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K,
-            14 => Q6K, 15 => Q8K, 16 => Iq2Xxs, 17 => Iq2Xs, 18 => Iq3Xxs,
-            19 => Iq1S, 20 => Iq4Nl, 21 => Iq3S, 22 => Iq2S, 23 => Iq4Xs,
-            24 => I8, 25 => I16, 26 => I32, 27 => I64, 28 => F64, 29 => Iq1M,
-            30 => Bf16, 34 => Tq1_0, 35 => Tq2_0, 39 => Mxfp4, 40 => Nvfp4,
-            41 => Q1_0, 42 => Q2_0,
+            0 => F32,
+            1 => F16,
+            2 => Q4_0,
+            3 => Q4_1,
+            6 => Q5_0,
+            7 => Q5_1,
+            8 => Q8_0,
+            9 => Q8_1,
+            10 => Q2K,
+            11 => Q3K,
+            12 => Q4K,
+            13 => Q5K,
+            14 => Q6K,
+            15 => Q8K,
+            16 => Iq2Xxs,
+            17 => Iq2Xs,
+            18 => Iq3Xxs,
+            19 => Iq1S,
+            20 => Iq4Nl,
+            21 => Iq3S,
+            22 => Iq2S,
+            23 => Iq4Xs,
+            24 => I8,
+            25 => I16,
+            26 => I32,
+            27 => I64,
+            28 => F64,
+            29 => Iq1M,
+            30 => Bf16,
+            34 => Tq1_0,
+            35 => Tq2_0,
+            39 => Mxfp4,
+            40 => Nvfp4,
+            41 => Q1_0,
+            42 => Q2_0,
             _ => return None,
         })
     }
@@ -64,15 +92,41 @@ impl GgmlType {
     pub fn name(self) -> &'static str {
         use GgmlType::*;
         match self {
-            F32 => "f32", F16 => "f16", Q4_0 => "q4_0", Q4_1 => "q4_1",
-            Q5_0 => "q5_0", Q5_1 => "q5_1", Q8_0 => "q8_0", Q8_1 => "q8_1",
-            Q2K => "q2_K", Q3K => "q3_K", Q4K => "q4_K", Q5K => "q5_K",
-            Q6K => "q6_K", Q8K => "q8_K", Iq2Xxs => "iq2_xxs", Iq2Xs => "iq2_xs",
-            Iq3Xxs => "iq3_xxs", Iq1S => "iq1_s", Iq4Nl => "iq4_nl",
-            Iq3S => "iq3_s", Iq2S => "iq2_s", Iq4Xs => "iq4_xs", I8 => "i8",
-            I16 => "i16", I32 => "i32", I64 => "i64", F64 => "f64",
-            Iq1M => "iq1_m", Bf16 => "bf16", Tq1_0 => "tq1_0", Tq2_0 => "tq2_0",
-            Mxfp4 => "mxfp4", Nvfp4 => "nvfp4", Q1_0 => "q1_0", Q2_0 => "q2_0",
+            F32 => "f32",
+            F16 => "f16",
+            Q4_0 => "q4_0",
+            Q4_1 => "q4_1",
+            Q5_0 => "q5_0",
+            Q5_1 => "q5_1",
+            Q8_0 => "q8_0",
+            Q8_1 => "q8_1",
+            Q2K => "q2_K",
+            Q3K => "q3_K",
+            Q4K => "q4_K",
+            Q5K => "q5_K",
+            Q6K => "q6_K",
+            Q8K => "q8_K",
+            Iq2Xxs => "iq2_xxs",
+            Iq2Xs => "iq2_xs",
+            Iq3Xxs => "iq3_xxs",
+            Iq1S => "iq1_s",
+            Iq4Nl => "iq4_nl",
+            Iq3S => "iq3_s",
+            Iq2S => "iq2_s",
+            Iq4Xs => "iq4_xs",
+            I8 => "i8",
+            I16 => "i16",
+            I32 => "i32",
+            I64 => "i64",
+            F64 => "f64",
+            Iq1M => "iq1_m",
+            Bf16 => "bf16",
+            Tq1_0 => "tq1_0",
+            Tq2_0 => "tq2_0",
+            Mxfp4 => "mxfp4",
+            Nvfp4 => "nvfp4",
+            Q1_0 => "q1_0",
+            Q2_0 => "q2_0",
         }
     }
 
@@ -146,7 +200,12 @@ impl GgmlType {
             return None;
         }
         let blocks0 = ne[0] / blck;
-        Some(blocks0.checked_mul(size)?.checked_mul(ne[1])?
-            .checked_mul(ne[2])?.checked_mul(ne[3])?)
+        Some(
+            blocks0
+                .checked_mul(size)?
+                .checked_mul(ne[1])?
+                .checked_mul(ne[2])?
+                .checked_mul(ne[3])?,
+        )
     }
 }

@@ -1,23 +1,24 @@
 //! qwen35 층 구현 — GDN층(gdn_layer)과 full-attention층(attn_layer).
 //! 그래프 배선: ~/local_llm/llama.cpp/src/models/qwen35.cpp (2026-08-30 판).
 
-use super::{Engine, ModelError};
-use crate::matmul::{matmul, matmul_batch};
-use crate::ops::{l2_norm, rms_norm, rope_head, silu, sigmoid, softplus};
+use super::{Engine, ModelError, span_block};
+use crate::matmul::{mm, mm_batch};
+use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
 use llm170_profiler::profile_span;
-use super::span_block;
-
 impl Engine {
+    /// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.
     pub(super) fn gdn_layer(
         &mut self,
         il: usize,
         xs: &[Vec<f32>],
-        n_seqs: usize,
+        seq_ids: &[usize],
         t_len: usize,
         recr_idx: usize,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         profile_span!("cpu::layer_gdn");
+        let acc = self.acc.clone();
         let hp = &self.model.hp;
+        let n_seqs = seq_ids.len();
         let n_tok = n_seqs * t_len;
         let (d_state, dt_rank, n_group, d_inner) = (hp.d_state, hp.dt_rank, hp.n_group, hp.d_inner);
         let (conv_k, conv_ch) = (hp.conv_k, hp.conv_ch());
@@ -31,24 +32,38 @@ impl Engine {
         let ssm_norm_w = self.model.f32_vec(&format!("blk.{il}.ssm_norm.weight"))?;
         let wout = self.model.wchk(&format!("blk.{il}.ssm_out.weight"))?;
 
-        let dbg0 = il == std::env::var("LLM170_DEBUG_LAYER").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
+        let dbg0 = il
+            == std::env::var("LLM170_DEBUG_LAYER")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+            && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
         let mut qkv = vec![vec![0.0f32; conv_ch]; n_tok];
         {
             span_block!("cpu::gdn_qkv", {
-                matmul_batch(xs, &wqkv, &mut qkv);
+                mm_batch(&acc, xs, &wqkv, &mut qkv)?;
             });
         }
         let mut z = vec![vec![0.0f32; d_inner]; n_tok];
         {
             span_block!("cpu::gdn_z", {
-                matmul_batch(xs, &wgate, &mut z);
+                mm_batch(&acc, xs, &wgate, &mut z)?;
             });
         }
 
         if dbg0 {
-            let mz = z.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
-            let mq = qkv.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
-            let mc = xs.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+            let mz = z
+                .iter()
+                .flat_map(|r| r.iter())
+                .fold(0.0f32, |a, v| a.max(v.abs()));
+            let mq = qkv
+                .iter()
+                .flat_map(|r| r.iter())
+                .fold(0.0f32, |a, v| a.max(v.abs()));
+            let mc = xs
+                .iter()
+                .flat_map(|r| r.iter())
+                .fold(0.0f32, |a, v| a.max(v.abs()));
             eprintln!("  rs stage cur max={mc:.5} qkv max={mq:.5} z max={mz:.5}");
         }
         let mut beta_all = vec![0.0f32; n_tok * dt_rank];
@@ -57,8 +72,8 @@ impl Engine {
             span_block!("cpu::gdn_bg", {
                 let mut b = vec![vec![0.0f32; dt_rank]; n_tok];
                 let mut a = vec![vec![0.0f32; dt_rank]; n_tok];
-                matmul_batch(xs, &wbeta, &mut b);
-                matmul_batch(xs, &walpha, &mut a);
+                mm_batch(&acc, xs, &wbeta, &mut b)?;
+                mm_batch(&acc, xs, &walpha, &mut a)?;
                 for t in 0..n_tok {
                     for h in 0..dt_rank {
                         beta_all[t * dt_rank + h] = sigmoid(b[t][h]);
@@ -78,7 +93,7 @@ impl Engine {
         {
             profile_span!("cpu::gdn_conv");
             for s in 0..n_seqs {
-                let conv_state = &mut self.seqs[s].conv[recr_idx];
+                let conv_state = &mut self.seqs[seq_ids[s]].conv[recr_idx];
                 for t in 0..t_len {
                     let row = s * t_len + t;
                     for c in 0..conv_ch {
@@ -123,7 +138,7 @@ impl Engine {
             for s in 0..n_seqs {
                 let r0 = s * t_len;
                 let r1 = r0 + t_len;
-                let st = &mut self.seqs[s].gdn_s[recr_idx];
+                let st = &mut self.seqs[seq_ids[s]].gdn_s[recr_idx];
                 if t_len == 1 {
                     crate::gdn::gdn_ar_batch(
                         &q_all[r0 * k_len..r1 * k_len],
@@ -180,27 +195,56 @@ impl Engine {
             }
         }
         if dbg0 {
-            let mg = gated.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
-            let fmt = |o: usize| -> String { gated[0][o..o + 4].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",") };
-            eprintln!("  rs gated h0={} h1={} h2={} h3={} (max={mg:.5})", fmt(0), fmt(16), fmt(32), fmt(48));
+            let mg = gated
+                .iter()
+                .flat_map(|r| r.iter())
+                .fold(0.0f32, |a, v| a.max(v.abs()));
+            let fmt = |o: usize| -> String {
+                gated[0][o..o + 4]
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            eprintln!(
+                "  rs gated h0={} h1={} h2={} h3={} (max={mg:.5})",
+                fmt(0),
+                fmt(16),
+                fmt(32),
+                fmt(48)
+            );
         }
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         {
             span_block!("cpu::gdn_out", {
-                matmul_batch(&gated, &wout, &mut out);
+                mm_batch(&acc, &gated, &wout, &mut out)?;
             });
         }
         if dbg0 {
-            let m = out.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, v| a.max(v.abs()));
+            let m = out
+                .iter()
+                .flat_map(|r| r.iter())
+                .fold(0.0f32, |a, v| a.max(v.abs()));
             let (mut mi, mut mv) = (0usize, f32::NEG_INFINITY);
             for (r, row) in out.iter().enumerate() {
                 for (c, v) in row.iter().enumerate() {
-                    if v.abs() > mv { mv = v.abs(); mi = r; }
+                    if v.abs() > mv {
+                        mv = v.abs();
+                        mi = r;
+                    }
                 }
             }
-            eprintln!("  rs stage ssm_out max={m:.5} @row{mi} out[:4]={:?} out[{mi}][:3]={:?}", 
-                out[0][..4].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>(),
-                out[mi][..3].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>());
+            eprintln!(
+                "  rs stage ssm_out max={m:.5} @row{mi} out[:4]={:?} out[{mi}][:3]={:?}",
+                out[0][..4]
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>(),
+                out[mi][..3]
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>()
+            );
         }
         Ok(out)
     }
@@ -210,39 +254,47 @@ impl Engine {
         &mut self,
         il: usize,
         xs: &[Vec<f32>],
-        n_seqs: usize,
+        seq_ids: &[usize],
         t_len: usize,
         full_idx: usize,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         profile_span!("cpu::layer_attn");
+        let acc = self.acc.clone();
         let hp = &self.model.hp;
+        let n_seqs = seq_ids.len();
         let n_tok = n_seqs * t_len;
         let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
         let wq = self.model.wchk(&format!("blk.{il}.attn_q.weight"))?;
         let wk = self.model.wchk(&format!("blk.{il}.attn_k.weight"))?;
         let wv = self.model.wchk(&format!("blk.{il}.attn_v.weight"))?;
         let wo = self.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
-        let q_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
-        let k_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let q_norm_w = self
+            .model
+            .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
+        let k_norm_w = self
+            .model
+            .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
         let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
         let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
         let mut vv = vec![vec![0.0f32; wv.n_out as usize]; n_tok];
         {
             span_block!("cpu::attn_qkv", {
-                matmul_batch(xs, &wq, &mut qg);
-                matmul_batch(xs, &wk, &mut kk);
-                matmul_batch(xs, &wv, &mut vv);
+                mm_batch(&acc, xs, &wq, &mut qg)?;
+                mm_batch(&acc, xs, &wk, &mut kk)?;
+                mm_batch(&acc, xs, &wv, &mut vv)?;
             });
         }
 
         let kq_scale = hp.kq_scale();
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         for s in 0..n_seqs {
-            let pos0 = self.seqs[s].pos;
-            let seq = &mut self.seqs[s];
-            let (cache_k, cache_v) =
-                (seq.kv_k[full_idx].as_mut_slice(), seq.kv_v[full_idx].as_mut_slice());
+            let pos0 = self.seqs[seq_ids[s]].pos;
+            let seq = &mut self.seqs[seq_ids[s]];
+            let (cache_k, cache_v) = (
+                seq.kv_k[full_idx].as_mut_slice(),
+                seq.kv_v[full_idx].as_mut_slice(),
+            );
 
             for t in 0..t_len {
                 let row = s * t_len + t;
@@ -298,7 +350,7 @@ impl Engine {
                         attn_out[ob + i] *= sigmoid(qg[row][gb + i]);
                     }
                 }
-                matmul(&attn_out, &wo, &mut out[row]);
+                mm(&acc, &attn_out, &wo, &mut out[row])?;
             }
         }
         Ok(out)

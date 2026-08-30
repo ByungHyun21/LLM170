@@ -2,3 +2,4 @@ plans/
 source/*
 !source/research/
 target/
+__pycache__/
