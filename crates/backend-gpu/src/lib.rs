@@ -436,11 +436,10 @@ impl<R: Runtime> GpuMatmul<R> {
         } else {
             4
         };
-        // 디코드(t ≤ 8) — q3 토큰 상각. prefill — 기본 q2(안정).
-        // q4 타일 커널은 실측 2건의 불안정(콜드 런 비결정 오염·모듈 로드 STATUS 700
-        // 간헐)으로 LLM170_Q4_ON=1일 때만 활성 — 후속 디버그 과제.
+        // 디코드(t ≤ 8) — q3 토큰 상각. prefill — q2(안정) + 엔진 층위 1024토큰
+        // 청킹이 정답으로 확정(2026-08-31). 타일 커널 q4는 두 형상 모두 불안정
+        // (콜드 런 비결정 / 모듈 로드 STATUS 700)해 제거됨.
         let decode = t <= 8 && slices == 64;
-        let prefill_q4 = t > 8 && std::env::var_os("LLM170_Q4_ON").is_some();
         let og = self.acquire_buf(t * n_out * 4)?;
         let pg = self.acquire_buf(t * n_out * slices * 4)?;
         // SAFETY: 두 경로 모두 그리드가 (n_out, t)를 덮고 시작부 범위 가드 —
@@ -459,26 +458,6 @@ impl<R: Runtime> GpuMatmul<R> {
                     n_in,
                     n_out,
                     t,
-                    d.ty as u32 as usize,
-                );
-            } else if prefill_q4 {
-                const TLEN: usize = 16;
-                const SL: usize = 64;
-                let tiles = t.div_ceil(TLEN) as u32;
-                gemm2::gemm_q4::launch_unchecked(
-                    &self.client,
-                    CubeCount::Static(n_out as u32, tiles, 1),
-                    CubeDim::new_1d(SL as u32),
-                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
-                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
-                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * SL].into()),
-                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
-                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
-                    n_in,
-                    n_out,
-                    t,
-                    TLEN,
-                    SL,
                     d.ty as u32 as usize,
                 );
             } else {
