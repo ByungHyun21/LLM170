@@ -1,63 +1,102 @@
-# 의사결정 기록 (ADR)
+# Decision Records (ADR)
 
-역순 없음. 번경 시 갱신 + 날짜.
+Not reverse-ordered. Update on change, with dates.
 
-## ADR-0001 — 순수 Rust 단일 언어 (2026-08-30)
+## ADR-0001 — Pure-Rust single language (2026-08-30)
 
-**결정**: 엔진 전체를 순수 Rust로 개발. C/C++ 커널 소스·RTC 문자열·CMake 툴체인 없음.
-**배경**: 사용자 방침. 혼자 개발하므로 언어/툴체인 이중화 비용이 이익을 초과.
-**기각**: 2026-08-30 조사 권고(Rust 코어 + CUDA 문법 C++ 커널 + NVRTC/hipRTC) — [source/research/2026-08-30-rust-gpu-bindings.md]. 사실 자료는 유효, 권고만 기각.
-**파급**: GPU 커널 경로는 wgpu(WGSL) 또는 rust-gpu(.rs→SPIR-V) 중 선택(ADR-0004 시점). CUDA 네이티브는 cuda-oxide 성숙 대기.
+**Decision**: the entire engine is pure Rust. No C/C++ kernel sources, no RTC
+string kernels, no CMake toolchain.
+**Background**: user policy. Solo development, so dual language/toolchain costs
+outweigh the benefits.
+**Rejected**: the 2026-08-30 research recommendation (Rust core + CUDA-dialect
+C++ kernels + NVRTC/hipRTC) —
+[source/research/2026-08-30-rust-gpu-bindings.md]. The factual material stands;
+only the recommendation was rejected.
+**Implication**: the GPU kernel path is wgpu (WGSL) or rust-gpu (.rs→SPIR-V)
+(decided at ADR-0004 time). Native CUDA waits for cuda-oxide maturity.
 
-## ADR-0002 — 모드 체계 universal / cmp-stock / cmp-unlocked (2026-08-30)
+## ADR-0002 — Mode system universal / cmp-stock / cmp-unlocked (2026-08-30)
 
-**결정**: 3 모드. 런타임 플래그 + 커널 변형 + 메모리 프로파일. 코어는 모드 무관.
-**배경**: CMP 순정(eFUSE 스로틀·8GB)과 언락(풀레이트·40/64GB)이 요구하는 커널 전략이 상이. 범용 장비 검증 인프라 겸용.
+**Decision**: three modes. Runtime flags + kernel variants + memory profiles.
+The core is mode-agnostic.
+**Background**: CMP stock (eFUSE throttle, 8 GB) and unlocked (full rate,
+40/64 GB) demand different kernel strategies; the universal profile doubles as
+the portability/verification infrastructure.
 
-## ADR-0003 — 언락 1급 시나리오 채택 (2026-08-30)
+## ADR-0003 — Unlock as first-class scenario (2026-08-30)
 
-**결정**: 40/64GB 언락을 설계 전제로 승격. 단 `cmp-stock`(8GB) 동작도 유지.
-**배경**: 사용자 확인(40GB/64GB 가능). cmpunlocker(2026) 사례. 비공식이므로 폴백 유지.
-**메모**: 컴퓨트 언락(스로틀 해제) 실측 전까지 `cmp-unlocked` 커널도 half2 기본값.
+**Decision**: the 40/64 GB unlock is a design precondition. `cmp-stock` (8 GB)
+operation is still maintained.
+**Background**: user confirmation (40/64 GB available). cmpunlocker (2026)
+precedent. Unofficial, hence the fallback.
+**Note**: until compute-unlock measurements exist, `cmp-unlocked` kernels also
+default to half2.
 
-## ADR-0004 — CPU 참조 백엔드 선행 (2026-08-30)
+## ADR-0004 — CPU reference backend first (2026-08-30)
 
-**결정**: GPU 백엔드보다 CPU(순수 Rust) 참조 구현을 먼저 완성. 모든 golden 테스트의 기준.
-**배경**: GPU 없이 검증 가능, 수치 정확성 분리, 커널 언어 결정을 뒤로 미룰 수 있음.
+**Decision**: complete the CPU (pure-Rust) reference before the GPU backend.
+The golden standard for all tests.
+**Background**: verifiable without a GPU, isolates numerical correctness,
+defers the kernel-language decision.
+**Superseded in part (2026-08-31)**: development order is now GPU-first per user
+directive; the CPU reference keeps its golden-test role.
 
-## ADR-0005 — strict FP + `mul_add` 금지 (2026-08-30)
+## ADR-0005 — strict FP + no `mul_add` (2026-08-30)
 
-**결정**: 핫패스 `f32::mul_add` 금지, fast-math 계열 플래그 금지. 코드젠 FMA 부재 CI/프로파일러 검증.
-**배경**: Rust strict FP는 암시 contraction이 없어 mul+add 분리가 자동 성립 → cmp-stock 32× 페널티 회피가 공짜.
+**Decision**: no `f32::mul_add` in hot paths, no fast-math flags. Codegen FMA
+absence verified via profiler/CI.
+**Background**: Rust strict FP has no implicit contraction, so mul+add
+separation is automatic → the cmp-stock 32× penalty is avoided for free.
 
-## ADR-0006 — 문서 구조 source/ · docs/ (2026-08-30)
+## ADR-0006 — Documentation layout source/ · docs/ (2026-08-30)
 
-**결정**: `docs/`(프로젝트 문서, 추적) / `source/`(외부 참조 원본, 추적) / `plans/`(gitignored). `.gitignore`에서 docs 제거.
-**배경**: 조사 원본과 프로젝트 산출물 분리, 문서의 버전 추적.
+**Decision**: `docs/` (project docs, tracked) / `source/` (external reference
+originals, tracked) / `plans/` (gitignored). docs removed from `.gitignore`.
+**Background**: separates research originals from project output and keeps
+documentation version-controlled.
 
-## ADR-0007 — 구현 순서 qwen35 → qwen4exp (2026-08-30)
+## ADR-0007 — Implementation order qwen35 → qwen4exp (2026-08-30)
 
-**결정**: dense qwen35로 전 경로(파서→CPU 추론→프로파일러) 완성 후 qwen4exp 확장.
-**배경**: GDN/IMROPE/MTP 하위구조 공유. qwen4exp 고유(HC/QSA/PLE/MoE)는 상위 확장.
+**Decision**: complete the full path (parser → CPU inference → profiler) with
+dense qwen35 before extending to qwen4exp.
+**Background**: GDN/IMROPE/MTP substructures are shared; qwen4exp-specific
+parts (HC/QSA/PLE/MoE) build on top.
 
-## ADR-0008 — 범용 개발은 ROCm 대상 · 코드 이관 흐름 (2026-08-30)
+## ADR-0008 — Universal development targets ROCm · code-transfer flow (2026-08-30)
 
-**결정**: `universal` 모드의 GPU 개발·검증 대상은 **ROCm**(이 PC gfx1151). 충분히 검증되면 사용자가 코드를 170HX 장비로 **이관해 그 장비에서 이어 개발**. GPU 커널 구현 기술(cubecl-hip 등)은 CPU 참조 완료 후 결정하되 HIP/ROCm API 면 우선.
-**배경**: 사용자 지시. 개발기가 ROCm 표준 환경. Backend trait이 HIP/CUDA 유사 API 양측을 수용하면 이관 비용 최소화.
-**요구사항**: debug 빌드는 개발자가 **전 요소를 파악**할 수 있어야 함 — 계측(자체 프로파일러) + 구조 덤프가 기본 탑재.
-**상태(2026-08-30)**: 워크스페이스 + GGUF v3 파서 + `gguf-dump` + 프로파일러 v0 완료. 테스트 6/6(합성 4 + 실측 27B/Flash split1 2). 실측으로 리서치 미확정 항목 해소 — [models/qwen4exp.md](models/qwen4exp.md) §미확정 해소.
+**Decision**: `universal`-mode GPU development and verification happen on ROCm
+(this machine, gfx1151). Once verified, the user transfers the code to the
+170HX machine and continues there. GPU kernel technology (cubecl-hip etc.) was
+decided after CPU completion, but with a HIP/ROCm-compatible API surface first.
+**Background**: user directive. The dev machine is a standard ROCm
+environment. A Backend trait accommodating both HIP/CUDA-like APIs minimizes
+transfer cost.
+**Requirement**: debug builds must let the developer see everything —
+instrumentation (built-in profiler) + structure dumps by default.
+**Status (2026-08-30)**: workspace + GGUF v3 parser + `gguf-dump` + profiler v0
+done. 6/6 tests (4 synthetic + 2 measured). Research unknowns resolved by
+measurement — [models/qwen4exp.md](models/qwen4exp.md).
 
-## ADR-0009 — GPU 백엔드: cubecl + HIP (2026-08-30)
+## ADR-0009 — GPU backend: cubecl + HIP (2026-08-30)
 
-**결정**: GPU 커널을 cubecl(Rust 매크로)로 작성, hanzo-cubecl-hip(로컬 HIP 7.2.53211 정합 포크)로 gfx1151 JIT 컴파일. 같은 커널이 CUDA/PTX(sm_80)로 컴파일되어 CMP 170HX에 직결.
-**배경**: 사용자 지시 — CPU 검증이 아닌 GPU 실행 우선. cubecl은 커널 소스가 Rust(매크로)로 순수 Rust 정책 유지. 순수 Rust 대안 대비 성숙도/성능.
-**파급**: `crates/backend-gpu`. 커널: GEMV(f32) 검증 → quantized GEMV(q4_K/q5_K/q6_K/q8_0) → GDN AR/attention → prefill.
+**Decision**: GPU kernels are written in Rust via cubecl macros;
+hanzo-cubecl-hip (a fork repointing the sys bindings to a local ROCm build)
+JIT-compiles for gfx1151. The same kernels compile to CUDA/PTX (sm_80) for the
+CMP 170HX.
+**Background**: user directive — GPU execution first, not CPU-verified-first.
+cubecl keeps kernel sources Rust, preserving the pure-Rust policy.
+**Implication**: `crates/backend-gpu`. Kernel progression: f32 GEMV (verified)
+→ quantized GEMV (q4_K/q5_K/q6_K/q8_0) → GDN AR/attention → prefill.
 
-## ADR-0010 — iq3_s 블록 레이아웃 정정 (2026-08-30)
+## ADR-0010 — iq3_s block layout correction (2026-08-30)
 
-**결정**: iq3_s 구조체는 `d(2) qs(64) qh(8) signs(32) scales(4)` — **d가 맨 앞** (ggml-common.h 확인).
-**배경**: 기존 구현이 d를 맨 뒤(108)로 읽어 L14 ffn_down(iq3_s 유일 텐서)에서 NaN 폭발. gguf-py 권위 구현과 대조해 발견.
-**교훈**: 블록 레이아웃은 반드시 ggml-common.h 구조체 선언을 직접 확인 — 리서치 요약에 의존 금지.
+**Decision**: the iq3_s struct is `d(2) qs(64) qh(8) signs(32) scales(4)` —
+**d at the front** (per ggml-common.h).
+**Background**: the previous implementation read d from the back (offset 108),
+causing an NaN explosion on L14 ffn_down (the only iq3_s tensor). Found by
+diffing against the authoritative gguf-py implementation.
+**Lesson**: always confirm block layouts against the ggml-common.h struct
+declarations — never trust research summaries.
 
 ## ADR-0011 — GPU matmul offload via `Accelerator` + dual HIP/Vulkan runtime (2026-08-30)
 
@@ -78,3 +117,28 @@ activations resident is follow-up work.
 **Numerics**: GPU accumulation order mirrors the CPU reference (row-sequential
 blocks, element-sequential within a block); measured max relative error vs CPU
 is < 1e-3 across all eight quant types in the 27B Q4_K_XL mix.
+
+## ADR-0012 — Verification standard: near-tie-aware token parity (2026-08-31)
+
+**Decision**: `verify.py` passes a case when the greedy stream matches exactly,
+or the first divergence is a near tie (our token within the baseline top-6 and
+the top-1 logprob gap < ε = 1.5 nats). The reference server runs on GPU
+(`-ngl all`, f32 KV); the CPU reference llama build (int8 activation dots) is
+a different numerical identity and is not used as the reference.
+**Background**: our f32 activation dots vs llama's q8-quantized activation
+dots + f16 KV cache reorder flat-top distributions. Measured: both engines
+share the same top-3 set at divergence points (baseline gap 1.19 / ours 0.25).
+llama.cpp itself differs between its own CPU and GPU backends from token 0 —
+"bitwise identical to a specific llama build" is excluded from the goals; the
+golden standard is our f32 engine (which the GPU reproduces token-for-token).
+
+## ADR-0013 — W4A8 integer-dot variant (2026-08-31)
+
+**Decision**: a performance-path variant alongside the f32 reference:
+CPU `quantize_row_q8_ref` (f32 scales — a deliberate departure from ggml's f16
+storage) + per-type integer dot kernels; GPU `gemm_q6` with host-side q8
+pre-quantization (qs as u32 words + per-block d) shrinking activation
+transport 4×. Cross-checked against the f32 reference at rel 1–5e-3 (the
+theoretical q8 activation-quantization noise).
+**Implication**: the CMP dp4a-class integer-accumulation version remains a
+cmp-stock follow-up once the hardware arrives.

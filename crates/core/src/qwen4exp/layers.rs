@@ -585,14 +585,14 @@ impl Engine4 {
     }
 
     /// MoE FFN — top-10 라우팅(softmax→정규화) + shared(sigmoid 게이트).
+    /// MoE FFN — 토큰-전문가 그룬핑 배치: 라우터는 전 토큰 배치, 각 전문가는
+    /// 자기 토큰 서브배치로 3 role 배치 GEMM. 호출 수가 토큰 수와 무관하게
+    /// 전문가 수(512)×3 + 공유 3 + 라우터 2로 고정 — GPU 장문 prefill의 핵심.
     fn moe_ffn(&self, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q4Error> {
         profile_span!("q4::moe");
         let hp = self.model.hp.clone();
         let w_route = self.model.w4(&format!("blk.{il}.ffn_gate_inp.weight"))?;
         let w_route_sh = self.model.w4(&format!("blk.{il}.ffn_gate_inp_shexp.weight"))?;
-        let gate_e = self.model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
-        let up_e = self.model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
-        let down_e = self.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
         let sh_up = self.model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
         let sh_gate = self.model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
         let sh_down = self.model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
@@ -600,18 +600,17 @@ impl Engine4 {
         let n_used = hp.n_expert_used;
         let n_ff = hp.n_ff_exp;
         let n_embd = hp.n_embd;
+        let t = xs.len();
 
-        let mut out = vec![vec![0.0f32; n_embd]; xs.len()];
-        let mut logits = vec![0.0f32; n_exp];
-        let mut sgate = vec![0.0f32; 1];
-        let mut gate_y = vec![0.0f32; n_ff];
-        let mut up_y = vec![0.0f32; n_ff];
-        let mut act = vec![0.0f32; n_ff];
-        let mut expert_out = vec![0.0f32; n_embd];
+        // 1) 라우팅 — 전 토큰 배치 1회
+        let mut route = vec![vec![0.0f32; n_exp]; t];
+        self.mm_batch(xs, &w_route, &mut route)?;
+        let mut sgate_all = vec![vec![0.0f32; 1]; t];
+        self.mm_batch(xs, &w_route_sh, &mut sgate_all)?;
 
-        for (t, x) in xs.iter().enumerate() {
-            // 라우팅
-            self.mm(x, &w_route, &mut logits)?;
+        // 2) 선택 — 전문가별 (토큰, 가중치) 리스트
+        let mut by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_exp];
+        for (ti, logits) in route.iter_mut().enumerate() {
             let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let mut zs = 0.0f32;
             for v in logits.iter_mut() {
@@ -626,41 +625,73 @@ impl Engine4 {
             let sel = &idx[..n_used];
             let mut wsum: f32 = sel.iter().map(|&e| logits[e]).sum();
             wsum = wsum.max(6.103515625e-5);
-            // shared 게이트
-            self.mm(x, &w_route_sh, &mut sgate)?;
-            let sh_w = sigmoid(sgate[0]);
-
-            let mut acc = vec![0.0f32; n_embd];
             for &e in sel {
                 let w = logits[e] / wsum;
-                if w == 0.0 {
-                    continue;
+                if w != 0.0 {
+                    by_expert[e].push((ti, w));
                 }
-                let wg = self.model.expert_w(&format!("blk.{il}.ffn_gate_exps.weight"), e)?;
-                let wu = self.model.expert_w(&format!("blk.{il}.ffn_up_exps.weight"), e)?;
-                let wd = self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
-                self.mm(x, &wg, &mut gate_y)?;
-                self.mm(x, &wu, &mut up_y)?;
-                for i in 0..n_ff {
-                    act[i] = silu(gate_y[i]) * up_y[i];
-                }
-                self.mm(&act, &wd, &mut expert_out)?;
-                for i in 0..n_embd {
-                    acc[i] += w * expert_out[i];
-                }
-            }
-            // shared 전문가
-            self.mm(x, &sh_gate, &mut gate_y)?;
-            self.mm(x, &sh_up, &mut up_y)?;
-            for i in 0..n_ff {
-                act[i] = silu(gate_y[i]) * up_y[i];
-            }
-            self.mm(&act, &sh_down, &mut expert_out)?;
-            for i in 0..n_embd {
-                out[t][i] = acc[i] + sh_w * expert_out[i];
             }
         }
-        let _ = (gate_e, up_e, down_e);
+
+        // 3) 전문가별 서브배치 — 512×3 배치 GEMM (빈 전문가 스킵)
+        let mut out = vec![vec![0.0f32; n_embd]; t];
+        for e in 0..n_exp {
+            let list = &by_expert[e];
+            if list.is_empty() {
+                continue;
+            }
+            let sub: Vec<Vec<f32>> = list.iter().map(|&(ti, _)| xs[ti].clone()).collect();
+            let mut gate_y = vec![vec![0.0f32; n_ff]; list.len()];
+            let mut up_y = vec![vec![0.0f32; n_ff]; list.len()];
+            // gate·up 동일 입력 — 개별 배치 (그룹 API는 나중)
+            let wg = self.model.expert_w(&format!("blk.{il}.ffn_gate_exps.weight"), e)?;
+            let wu = self.model.expert_w(&format!("blk.{il}.ffn_up_exps.weight"), e)?;
+            let wd = self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
+            self.mm_batch(&sub, &wg, &mut gate_y)?;
+            self.mm_batch(&sub, &wu, &mut up_y)?;
+            for r in gate_y.iter_mut() {
+                for i in 0..n_ff {
+                    r[i] = silu(r[i]);
+                }
+            }
+            for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
+                for i in 0..n_ff {
+                    r[i] *= u[i];
+                }
+            }
+            let mut eout = vec![vec![0.0f32; n_embd]; list.len()];
+            self.mm_batch(&gate_y, &wd, &mut eout)?;
+            for ((ti, w), eo) in list.iter().zip(eout.iter()) {
+                let o = &mut out[*ti];
+                for i in 0..n_embd {
+                    o[i] += w * eo[i];
+                }
+            }
+        }
+
+        // 4) shared 전문가 — 전 토큰 배치
+        let mut sh_gate_y = vec![vec![0.0f32; n_ff]; t];
+        let mut sh_up_y = vec![vec![0.0f32; n_ff]; t];
+        self.mm_batch(xs, &sh_gate, &mut sh_gate_y)?;
+        self.mm_batch(xs, &sh_up, &mut sh_up_y)?;
+        for r in sh_gate_y.iter_mut() {
+            for i in 0..n_ff {
+                r[i] = silu(r[i]);
+            }
+        }
+        for (r, u) in sh_gate_y.iter_mut().zip(sh_up_y.iter()) {
+            for i in 0..n_ff {
+                r[i] *= u[i];
+            }
+        }
+        let mut shout = vec![vec![0.0f32; n_embd]; t];
+        self.mm_batch(&sh_gate_y, &sh_down, &mut shout)?;
+        for (ti, o) in out.iter_mut().enumerate() {
+            let sh_w = sigmoid(sgate_all[ti][0]);
+            for i in 0..n_embd {
+                o[i] += sh_w * shout[ti][i];
+            }
+        }
         Ok(out)
     }
 

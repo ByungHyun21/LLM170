@@ -1,44 +1,92 @@
-# qwen4exp — Qwen3.8-Flash-Next (125B-A6B) 구현 스펙
+# qwen4exp — Qwen3.8-Flash-Next (125B-A6B) Implementation Spec
 
-MoE 하이브리드. 원본 상세: [source/research/2026-08-30-qwen35-qwen4exp-arch.md](../source/research/2026-08-30-qwen35-qwen4exp-arch.md) §2. 코드: `~/local_llm-runtimes/qwen4exp/src/models/qwen4exp.cpp`.
+MoE hybrid. Original detail:
+[source/research/2026-08-30-qwen35-qwen4exp-arch.md](../source/research/2026-08-30-qwen35-qwen4exp-arch.md) §2.
+Reference implementation (read-only during development): the upstream
+`qwen4exp` runtime sources.
 
-## 하이퍼파라미터
+## Hyperparameters
 
-- 48층: `12×(3×(GDN→MoE) + 1×(QSA→MoE))` — QSA il∈{3,7,…,47}(12층), GDN 36층.
-- n_embd 2560, vocab 248320, ctx 262144. 파라미터: 본체 125B(A6B) + PLE 51B + MTP 4B(**UD GGUF에서 drop**).
+- 48 layers: `12×(3×(GDN→MoE) + 1×(QSA→MoE))` — QSA layers il∈{3,7,…,47} (12
+  layers), GDN 36 layers.
+- n_embd 2560, vocab 248320, ctx 262144. Parameters: 125 B body (A6B) + PLE
+  51 B + MTP 4 B (**dropped from the UD GGUF**).
 - hyper_connection: count=4, low_rank=320.
 
-## qwen35 대비 차이 요약
+## Differences from qwen35
 
-1. **GDN**: 동일 모듈, 단 z-gate가 **sigmoid**.
-2. **QSA** (Qwen Sparse Attention, 12층): gated attention(24 Q / 2 KV, 256 dim, IMROPE 64) + 희소화:
-   - per-token **indexer**(MQA 4q+1k, 128 dim)가 raw key를 어텐션 캐시와 cell-for-cell 미러되는 제3의 캐시에 적립.
-   - 캐시 key를 `compress_ratio`(=4) 블록별 mean-pool → RMS-norm + rope → indexer Q와 스코어(ReLU, 헤드 합) → 블록당 스코어 → `top_k`(**실측 메타 = 2048**; 선택 폭 = min(n_kv, top_k + ratio − 1)) → 마스크 → **마스크 밀집 GQA 어텐션**.
-   - KV: 12층 × 2 KV head → f16 **24 KiB/tok** (+indexer 3 KiB/tok).
-3. **Hyper-connection 잔차** (모든 norm 대체): 상태 = **4 평행 스트림** [2560×4, T]. read = grouped RMSNorm(γ, w+1 저장) + low-rank 게이트 + 스트림 평균. write = `s += out·(2·sigmoid(inject))`. 층당 HC 2개 + 최종 `output_hc_*` — **output_norm 텐서 없음**. 초기 상태 = 임베딩×4.
-4. **MoE 매층**: 512전문가 중 10 routed + 1 shared(sigmoid 게이트). 라우팅 = softmax → argsort_top_k 10 → 가중치 gather·정규화 → `mul_mat_id`. n_ff_exp 640 · shared 640 (실측 확정: `expert_{,shared_}feed_forward_length`).
-5. **PLE n-gram 해시 임베딩** (blk.1 단일층):
-   - `per_layer_token_embd.weight` — **실측 `[160, 320,001,536]` iq4_nl, 26.82 GiB (4.5bpw ≈ 51.2B 파라미터)**. 행 dim 160, 총 3.2억 행 = Σ `ple.head_vocab_sizes`(16 heads × ~2000만). per-token gather 16행 × 160 = 2560 flatten. (구 리서치의 `[2560, 20M]` 표기 정정) — **오프로드 전제 설계**(랜덤 GET_ROWS, hot row page cache).
-   - 해시는 **호스트 u64 연산**(mul^xor, mod vocab+offset), bigram+trigram, EOS 윈도 리셋.
-   - key/value 프로젝션 → `sigmoid(sgn(s)·√|s|)` 게이트 → 4스트림 방송 → ngram-dilated depthwise conv → 잔차 가산.
+1. **GDN**: identical module except the z-gate is **sigmoid**.
+2. **QSA** (Qwen Sparse Attention, 12 layers): gated attention (24 Q / 2 KV,
+   head_dim 256, IMROPE 64) + sparsification:
+   - Per-token **indexer** (MQA 4q+1k, 128-dim) accumulates raw keys into a
+     third cache that mirrors the attention cache cell-for-cell.
+   - Cached keys are mean-pooled per `compress_ratio` (=4) block → RMS-norm +
+     rope → dot with indexer Q → scores (ReLU, head-summed) → one score per
+     block → `top_k` (**measured meta = 2048**; selection width =
+     min(n_kv, top_k + ratio − 1)) → mask → **masked dense GQA attention**.
+   - KV: 12 layers × 2 KV heads → f16 **24 KiB/token** (+ indexer 3 KiB/token).
+3. **Hyper-connection residual** (replaces every norm): state = **4 parallel
+   streams** [2560×4, T]. read = grouped RMSNorm (γ stored as w+1) + low-rank
+   gate + stream mean. write = `s += out·(2·sigmoid(inject))`. Two HC mixes per
+   layer + final `output_hc_*` — **no output_norm tensor**. Initial state =
+   embedding ×4.
+4. **MoE every layer**: 10 routed of 512 experts + 1 shared (sigmoid gate).
+   Routing = softmax → top-10 → gathered weights ·normalized → per-expert GEMM.
+   n_ff_exp 640 · shared 640 (measured: `expert_{,shared_}feed_forward_length`).
+5. **PLE n-gram hash embedding** (single layer, blk.1):
+   - `per_layer_token_embd.weight` — measured `[160, 320,001,536]` iq4_nl,
+     26.82 GiB (4.5 bpw ≈ 51.2 B parameters). Row dim 160, 320 M total rows =
+     Σ `ple.head_vocab_sizes` (16 heads × ~20 M). Per token: gather 16 rows ×
+     160 = 2560 flattened. **Designed for offloading** (random GET_ROWS, hot
+     rows in page cache).
+   - Hashing is **host-side u64** (mul^xor, mod vocab+offset), bigram+trigram,
+     EOS window reset.
+   - key/value projections → `sigmoid(sgn(s)·√|s|)` gate → broadcast to the 4
+     streams → ngram-dilated depthwise conv → two-path residual add.
 
-## GGUF 계약 (qwen35 공통 제외분)
+## GGUF Contract (additions beyond the qwen35 common block)
 
-- 추가 메타: `hyper_connection.{count,low_rank}`, `attention.indexer.{head_count=4,key_length=128,top_k=2048}`, `attention.compress_ratios[48]`(QSA층 4, else 0), `ple.{layers=[1], ngram_size=3, heads_per_ngram=8, conv_kernel=4, layer_multipliers[u64], head_offsets[16,u64], head_vocab_sizes[16,u64], eos_token_id, image_token_id}`, `embedding_length_per_layer_input=160`, `expert_count=512`, `expert_used_count=10`.
-- 텐서: `hc_{attn,ffn}_{norm,down,up,inject}`, `output_hc_{norm,down,up}`, `indexer.{q_proj,k_proj,q_norm,k_norm}`, `ple_{key,value,norm_key,norm_query,norm_conv,conv1d}`, `per_layer_token_embd.weight`, `ffn_gate_inp{,_shexp}`, `ffn_{gate,up,down}_exps`(또는 merged `ffn_gate_up_exps`), `ffn_{gate,up,down}_shexp`.
-- 4-split GGUF(`split.no/count`, 파일명 패턴 보존 필수). mmproj 미포함(VL 필요 시 별도).
+- Extra metadata: `hyper_connection.{count,low_rank}`,
+  `attention.indexer.{head_count=4,key_length=128,top_k=2048}`,
+  `attention.compress_ratios[48]` (4 on QSA layers, else 0),
+  `ple.{layers=[1], ngram_size=3, heads_per_ngram=8, conv_kernel=4,
+  layer_multipliers[u64], head_offsets[16,u64], head_vocab_sizes[16,u64],
+  eos_token_id, image_token_id}`, `embedding_length_per_layer_input=160`,
+  `expert_count=512`, `expert_used_count=10`.
+- Tensors: `hc_{attn,ffn}_{norm,down,up,inject}`, `output_hc_{norm,down,up}`,
+  `indexer.{q,k}_proj`, `indexer.{q,k}_norm`, `ple_{key,value,norm_key,
+  norm_query,norm_conv,conv1d}`, `per_layer_token_embd.weight`,
+  `ffn_gate_inp{,_shexp}`, `ffn_{gate,up,down}_exps` (3D expert stacks),
+  `ffn_{gate,up,down}_shexp`.
+- 4-split GGUF (`split.no/count`, filename pattern must be preserved). Part 1
+  (no=0) is metadata-only; `split.tensors.count`=1224 spread across parts 2–4.
+- Expert stacks are 3D `[ff, n_embd, 512]` with per-role type mixing (measured
+  example: down `q5_1`, gate/up `q4_K`, router `f32`).
+- Type mix (parts 2–4, approximate): iq4_nl 26.82 GiB (the PLE table alone) ·
+  q4_K ~41.3 GiB · q5_1 ~25.2 GiB · q8_0 ~9.0 GiB · q5_K 1.1 GiB · trace
+  f32/bf16.
 
-## 미확정 해소 (2026-08-30 실측, `llm170 gguf-dump` — UD-Q4_K_XL 4-split)
+## Implementation Notes
 
-- `rope.freq_base` = **1e7 확정**(f32 저장).
-- shared expert FFN = **640 확정**, `ple.conv_kernel` = 4(메타 존재).
-- `attention.indexer.top_k` = **2048** (research의 512 정정).
-- split 구조: **part 1(no=0)은 메타 전용(텐서 0)**, `split.tensors.count`=1224는 전체 모델 텐서 수(parts 2–4에 분산).
-- expert 스택 3D `[640, 2560, 512]` — 역할별 타입 혼합(실측 예: down `q5_1`, gate/up `q4_K`, router `f32`).
-- 타입 믹스(parts 2–4 합산 근사): iq4_nl 26.82 GiB(PLE 단일) · q4_K ~41.3 GiB · q5_1 ~25.2 GiB · q8_0 ~9.0 GiB · q5_K 1.1 GiB · f32/bf16 소량.
+- State: GDN S 108 MiB/seq + conv 4.2 MiB + PLE conv history. KV
+  24 KiB/token (f16 fixed upstream — a PR bug prevents KV quantization there;
+  this engine is free to choose).
+- The PLE table lookup is the defining memory-hierarchy bottleneck: NVMe mmap +
+  `MADV_RANDOM` + page-cache-friendly hot rows is the validated pattern.
+- Local operating baseline (HIP 7.2.2): pp 178–237 t/s (per slot), tg
+  11.6–15.1 t/s; ROCm 10+master: pp 272–468, tg 11.9–19.6 (np2×262K,
+  2026-08-27/29).
 
-## 구현 메모
+## Verification Status (2026-08-31)
 
-- 상태: GDN S 108 MiB/seq + conv 4.2 MiB + PLE row. KV 24 KiB/tok(f16 고정 — PR 버그로 KV 양자화 불가, 우리 엔진은 자유).
-- PLE 테이블 조회는 메모리 계층 설계의 핵심 병목(NVMe mmap + `MADV_RANDOM` + page cache 패턴이 검증된 원형).
-- 로컬 운영 기준선(HIP 7.2.2): pp 178–237 t/s(슬롯당), tg 11.6–15.1 t/s, ROCm 10+master: pp 272–468, tg 11.9–19.6 (np2×262K, 2026-08-27/29).
+- Reference: the upstream qwen4exp runtime (PR #27742 build) with
+  `-ot per_layer_token_embd=CPU --load-mode mmap -fa on` (f16 KV), temp 0.
+- Matrix (non-coexisting pattern — see AGENTS): single_ko 24/24 exact ·
+  single_short / long_gen48 near-tie (gap 0.01) · single_code near-tie
+  (gap 0.12) · np2 state isolation 16/16 ×2 · first prompt 8/8 exact.
+- Long-prompt prefill cases: see AGENTS.md for current status.
+- CPU decode profile (LLM170_Q4_TIME): moe 1.3 ms · gdn 0.45 ms · hc 0.22 ms ·
+  qsa 0.1 ms per token — MoE per-token expert matmuls dominate; token-expert
+  grouping is the known optimization headroom.
+- GPU path: identical pass/fail pattern to CPU (single_ko exact, short/code
+  near-tie) with q2 prefill + q3 decode kernels.

@@ -135,3 +135,36 @@ macro_rules! profile_span {
         let _llm170_span = $crate::span($name);
     };
 }
+
+#[cfg(all(test, any(debug_assertions, feature = "profile")))]
+mod tests {
+    use super::*;
+
+    /// 계측 계약: span 누적 → 리포트 집계(정렬·카운트) → reset 청소.
+    #[test]
+    fn span_report_reset_contract() {
+        reset();
+        assert!(report().is_none(), "빈 상태 리포트 None");
+        {
+            let _g = span("test::alpha");
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+        {
+            let _g1 = span("test::beta");
+            let _g2 = span("test::alpha"); // 스코프당 1개 규칙 위반 예시지만 집계 검증용
+        }
+        let rep = report().expect("span 후 리포트 존재");
+        assert!(rep.contains("test::alpha"), "이름 포함: {rep}");
+        let alpha_count = rep
+            .lines()
+            .find(|l| l.contains("test::alpha"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u64>().ok())
+            .expect("카운트 파싱");
+        assert_eq!(alpha_count, 2, "동일 이름 2회 누적");
+        // 내림차순 정렬 계약: alpha(수면 포함)가 첫 행
+        assert!(rep.lines().nth(2).unwrap().contains("test::alpha"), "총 소요 정렬"); // 0=제목 1=열헤더 2=첫 데이터행
+        reset();
+        assert!(report().is_none(), "reset 후 빈 상태");
+    }
+}

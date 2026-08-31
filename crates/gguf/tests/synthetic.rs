@@ -111,7 +111,7 @@ fn bad_magic_rejected() {
 }
 
 #[test]
-fn truncated_rejected() {
+fn truncation_detected_on_read() {
     let path = tmp("trunc");
     write_sample(&path, 1152);
     let full = std::fs::read(&path).unwrap();
