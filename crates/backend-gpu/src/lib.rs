@@ -8,8 +8,6 @@
 //! 동일한 누산 순서를 유지해 수치 일치 확률을 최대화한다 (ADR-0005 strict FP).
 
 use cubecl::prelude::*;
-/// 풀에 할당된 누적 바이트 (해제 없이 재사용만 — VRAM 고갈 추적).
-static POOL_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 mod gemm2;
 mod attn;
@@ -161,29 +159,17 @@ pub fn smoke_gemv(n_in: usize, n_out: usize) -> Result<Vec<f32>, String> {
 // Accelerator 구현 — core::matmul::Accelerator (server --backend gpu)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct DevWeight {
-    h: Handle,
-    ty: GgmlType,
-    n_in: usize,
-    n_out: usize,
-    bytes: usize,
-    /// 업로드 예산 초과로 호스트 연산 폴백 (핸들 무효).
-    host: bool,
-}
+mod buffers;
+use buffers::{ScratchPool, WeightStore, WRef};
 
 /// GPU matmul 가속기 — 런타임 제네릭(HIP 또는 wgpu/Vulkan).
 /// 가중치는 데이터 포인터 키로 1회 업로드 후 상주. 커널 소스는 런타임 공유 (ADR-0009).
 pub struct GpuMatmul<R: Runtime> {
     client: ComputeClient<R>,
-    weights: Mutex<HashMap<usize, DevWeight>>,
-    /// 호스트 폴백용 공유 더미 핸들 (전문가 수만 개의 4B 할당 방지).
-    dummy: Handle,
-    /// 업로드된 가중치 총 바이트 (예산 추적).
-    dev_bytes: std::sync::atomic::AtomicUsize,
-    /// 크기별 재사용 스크래치/아웃 버퍼 풀(스택) — hipMalloc churn 방지.
-    /// 인플라이트 중 재할당 방지: 획득은 pop(비면 alloc), read 동기화 후 반납.
-    bufs: Mutex<HashMap<usize, Vec<Handle>>>,
+    /// 가중치 상주 저장소 (P0 아레나 — dummy 핸들 부류 원천 제거).
+    weights: WeightStore,
+    /// 크기별 재사용 스크래치/휘발업로드 풀 — 해제 없는 영속 보관.
+    bufs: ScratchPool,
     ktab: Handle,  // iq4_nl 룩업 (f32×16)
     grid3: Handle, // iq3_s 그리드 (u32×512)
 }
@@ -223,6 +209,13 @@ impl<R: Runtime> GpuMatmul<R> {
             // SAFETY: 모든 스레드 시작 전 초기화 경로에서 1회 — 경합 없음
             unsafe { std::env::set_var("HIP_LAUNCH_BLOCKING", "1") };
         }
+        // 모든 할당을 영속 모드로 — cubecl 지연 해제가 큐 잔여 참조와 경합해
+        // "Memory page 0 doesn't exist"(GPF)·가비지 판독(NaN)을 유발한다
+        // (2026-09-01 실측). 해제를 전면 금지하고 재사용은 ScratchPool이
+        // 담당 — VRAM 상한은 풀 계측(POOL_TOTAL)·가중치 예산(W_CAP)으로 관리.
+        // SAFETY: 클라이언트 생성 직후 단일 스레드 — 이후 다른 allocation_mode
+        // 호출 없음. "누수"는 의도적(전량 재사용).
+        unsafe { client.allocation_mode(cubecl::MemoryAllocationMode::Persistent) };
         let ktab: Vec<f32> = llm170_core::KVALUES_IQ4NL
             .iter()
             .map(|&v| v as f32)
@@ -230,13 +223,10 @@ impl<R: Runtime> GpuMatmul<R> {
         let grid3 = llm170_core::IQ3S_GRID;
         let ktab = client.create_from_slice(bytemuck::cast_slice(&ktab));
         let grid3 = client.create_from_slice(bytemuck::cast_slice(&grid3));
-        let dummy = client.empty(4);
         Ok(GpuMatmul {
             client,
-            weights: Mutex::new(HashMap::new()),
-            bufs: Mutex::new(HashMap::new()),
-            dummy,
-            dev_bytes: std::sync::atomic::AtomicUsize::new(0),
+            weights: WeightStore::new(),
+            bufs: ScratchPool::new(),
             ktab,
             grid3,
         })
@@ -248,22 +238,9 @@ impl<R: Runtime> GpuMatmul<R> {
     pub fn barrier(&self) {
         let _ = cubecl_common::future::block_on(self.client.sync());
     }
-    /// 풀에서 버퍼 획득 (같은 크기 연속 획득 시 서로 다른 핸들).
+    /// 풀 획득 위임.
     fn acquire_buf(&self, bytes: usize) -> Result<Handle, String> {
-        let mut pool = self.bufs.lock().map_err(|_| "buf pool lock poisoned")?;
-        if let Some(h) = pool.get_mut(&bytes).and_then(|v| v.pop()) {
-            return Ok(h);
-        }
-        let h = self.client.empty(bytes);
-        POOL_TOTAL.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        if std::env::var_os("LLM170_GPU_TIME").is_some() {
-            eprintln!(
-                "# pool 신규 {bytes}B 풀누적 {:.2}GiB 상주가중치 {:.2}GiB",
-                POOL_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 30) as f64,
-                self.dev_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 30) as f64
-            );
-        }
-        Ok(h)
+        self.bufs.acquire(&self.client, bytes)
     }
 
     /// read 동기화 후 반납 (크기 명시 — Handle은 크기 비공개).
@@ -271,65 +248,15 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 연산과 경합해 가비지 판독(NaN, 2026-09-01 실측)하므로 해제 자체를
     /// 하지 않는다 (해제 경합 원인 제거 후 barrier 불필요).
     fn release_bufs(&self, hs: &[(Handle, usize)]) {
-        if let Ok(mut pool) = self.bufs.lock() {
-            for (h, bytes) in hs {
-                pool.entry(*bytes).or_default().push(h.clone());
-            }
-        }
+        self.bufs.release(hs);
     }
 
     /// 가중치 상주 예산 — 초과분은 호스트 연산. PLE(26.8GB)은 애초에 matmul
     /// 대상이 아니고 본체+전문가 ~83GB는 96GB VRAM에 들어감(llama.cpp와 동일
     /// 배치). GPF 원인은 청킹 부재였고 해소됨 — 2026-08-31 실측 재조정.
-    /// 기본 72GiB — LLM170_W_CAP_GB(바이트 아님, GiB)로 재정의.
-    /// 장문 prefill 실히측: 80GiB면 가중치 83GiB+스크래치가 96GiB를 넘어
-    /// 커널 execution error(2026-09-01). 72+풀 8+스크래치数GiB로 안정 여유.
-    fn w_cap() -> usize {
-        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            std::env::var("LLM170_W_CAP_GB")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(72)
-                .min(88)
-                << 30
-        })
-    }
-
-    fn dev_weight(&self, w: &Weight) -> Result<DevWeight, String> {
-        let key = w.data.as_ptr() as usize;
-        let mut map = self
-            .weights
-            .lock()
-            .map_err(|_| "weights cache lock poisoned")?;
-        if let Some(d) = map.get(&key) {
-            return Ok(d.clone());
-        }
-        // 업로드 총량은 락 아래 누적 카운터로 O(1)
-        let total = self.dev_bytes.load(Ordering::Relaxed);
-        let host = total + w.data.len() > Self::w_cap();
-        let h = if host {
-            self.dummy.clone()
-        } else {
-            // WGSL에 u8이 없어 u32 워드로 운반 (byte() 헬퍼가 언팩). 4바이트 정렬 필수.
-            if w.data.len() % 4 != 0 {
-                return Err(format!("tensor bytes {} not 4-byte aligned", w.data.len()));
-            }
-            self.client.create_from_slice(w.data)
-        };
-        let d = DevWeight {
-            h,
-            ty: w.ty,
-            n_in: w.n_in as usize,
-            n_out: w.n_out as usize,
-            bytes: w.data.len() / 4,
-            host,
-        };
-        if !host {
-            self.dev_bytes.fetch_add(w.data.len(), Ordering::Relaxed);
-        }
-        map.insert(key, d.clone());
-        Ok(d)
+    /// 가중치 조회 위임 — P0 아레나. WRef::Host는 gpu()가 Err.
+    fn dev_weight(&self, w: &Weight) -> Result<WRef, String> {
+        self.weights.get(&self.client, w)
     }
 
     /// W4A8 GPU GEMM — x를 q8로 양자화해 전송, gemm_q6 + reduce. [t][n_out] 플랫.
@@ -337,8 +264,7 @@ impl<R: Runtime> GpuMatmul<R> {
         let y = llm170_core::quant::quantize_row_q8_ref(x);
         let t = 1usize; // 단일 벡터(디코드) 변형
         let d = self.dev_weight(w)?;
-        let n_in = d.n_in;
-        let n_out = d.n_out;
+        let (n_in, n_out) = d.shape();
         // qs → 평탄 i8 → u32 워드, d → f32 배열
         let mut flat_q = Vec::with_capacity(y.len() * 32);
         for b in &y {
@@ -368,14 +294,14 @@ impl<R: Runtime> GpuMatmul<R> {
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(xq, [1].into(), [flat_q.len().div_ceil(4)].into()),
                 TensorArg::from_raw_parts(xd, [1].into(), [ds.len()].into()),
-                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                 TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
                 TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
                 TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
                 n_in,
                 n_out,
                 t,
-                d.ty as u32 as usize,
+                d.ty() as u32 as usize,
             );
             gemm2::reduce_parts::launch_unchecked(
                 &self.client,
@@ -474,7 +400,7 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 디버그: 텐서 블록 0 요소별 디양자화 값 (gpu-de).
     pub fn debug_dequant_block(&self, w: &Weight) -> Result<Vec<f32>, String> {
         let d = self.dev_weight(w)?;
-        let (blck, _) = d.ty.block_info();
+        let (blck, _) = d.ty().block_info();
         let n = blck as usize;
         let og = self.client.empty(n * 4);
         // SAFETY: 그리드가 정확히 요소 수만큼 — 범위 가드 내.
@@ -483,11 +409,11 @@ impl<R: Runtime> GpuMatmul<R> {
                 &self.client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_1d(64),
-                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
                 TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
                 TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
-                d.ty as u32 as usize,
+                d.ty() as u32 as usize,
                 n,
             );
         }
@@ -498,7 +424,7 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 디버그: 블록 0 원시 바이트 (gpu-de-bytes).
     pub fn debug_block_bytes(&self, w: &Weight) -> Result<Vec<f32>, String> {
         let d = self.dev_weight(w)?;
-        let n = 110.min(d.bytes * 4);
+        let n = 110.min(d.words() * 4);
         let og = self.client.empty(n * 4);
         // SAFETY: 그리드 = 요소 수, 가드 내.
         unsafe {
@@ -506,7 +432,7 @@ impl<R: Runtime> GpuMatmul<R> {
                 &self.client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_1d(64),
-                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
                 n,
             );
@@ -526,7 +452,7 @@ impl<R: Runtime> GpuMatmul<R> {
                 &self.client,
                 CubeCount::Static(n as u32, 1, 1),
                 CubeDim::new_1d(64),
-                TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
                 n,
                 mode,
@@ -537,8 +463,17 @@ impl<R: Runtime> GpuMatmul<R> {
     }
 
     /// GEMM 런치 (비동기, v2 k-레인) — x는 외부에서 업로드해 전달. 반환: out 핸들.
-    fn launch_gemm(&self, d: &DevWeight, xg: Handle, t: usize) -> Result<(Handle, Handle, usize, usize), String> {
-        let (n_in, n_out) = (d.n_in, d.n_out);
+    /// d는 GPU 상주분만(WRef::Host면 Err — dummy GEMM 원천 차단).
+    fn launch_gemm(
+        &self,
+        d: &WRef,
+        xg: Handle,
+        t: usize,
+    ) -> Result<(Handle, Handle, usize, usize), String> {
+        let WRef::Gpu { h: wh, ty: wty, n_in, n_out, bytes } = d else {
+            return Err("launch_gemm: 호스트 폴백 가중치 (아레나 위반)".into());
+        };
+        let (wh, wty, n_in, n_out, wbytes) = (wh.clone(), *wty, *n_in, *n_out, *bytes);
         // 스크래치 예산 3GiB(q4 prefill) — decode는 512MiB {64,16,4}
         // part 스크래치 예산 512MiB — q2/q4 공용. 대형 t에서 slices=64는
         // 텐서당 수 GB를 잡아 VRAM 초과 fault 유도(2026-08-31 실측).
@@ -564,14 +499,14 @@ impl<R: Runtime> GpuMatmul<R> {
                     CubeCount::Static(n_out as u32, 1, 1),
                     CubeDim::new_1d(64),
                     TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
-                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                     TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
                     TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
                     TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
                     n_in,
                     n_out,
                     t,
-                    d.ty as u32 as usize,
+                    d.ty() as u32 as usize,
                 );
             } else {
                 let gy = t.div_ceil(4) as u32;
@@ -580,14 +515,14 @@ impl<R: Runtime> GpuMatmul<R> {
                     CubeCount::Static(n_out as u32, gy, 1),
                     CubeDim::new_2d(64, 4),
                     TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
-                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
                     TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
                     TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
                     TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
                     n_in,
                     n_out,
                     t,
-                    d.ty as u32 as usize,
+                    d.ty() as u32 as usize,
                     slices,
                 );
             }
@@ -606,7 +541,7 @@ impl<R: Runtime> GpuMatmul<R> {
     }
 
     /// GEMM 실행 → [t][n_out] 플랫 결과 (tlen 패딩은 호출부 책임).
-    fn run_gemm(&self, d: &DevWeight, xf: &[f32], t: usize) -> Result<Vec<f32>, String> {
+    fn run_gemm(&self, d: &WRef, xf: &[f32], t: usize) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
         let xg = self.client.create_from_slice(bytemuck::cast_slice(xf));
         acc(&T_UP, t0.elapsed());
@@ -653,7 +588,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             return Err(format!("matmul_batch: x 행 길이 != n_in ({n_in})"));
         }
         let d = self.dev_weight(w)?;
-        if d.host {
+        if d.is_host() {
             llm170_core::matmul::matmul_batch(xs, w, outs);
             return Ok(());
         }
@@ -663,7 +598,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         }
         let res = self.run_gemm(&d, &xf, t)?;
         for (ti, out) in outs.iter_mut().enumerate() {
-            out.copy_from_slice(&res[ti * d.n_out..(ti + 1) * d.n_out]);
+            out.copy_from_slice(&res[ti * d.shape().1..(ti + 1) * d.shape().1]);
         }
         Ok(())
     }
@@ -671,15 +606,15 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
         profile_span!("gpu::matmul1");
         let d = self.dev_weight(w)?;
-        if d.host {
+        if d.is_host() {
             llm170_core::matmul::matmul(x, w, out);
             return Ok(());
         }
-        if x.len() != d.n_in {
-            return Err(format!("matmul: x 길이 {} != n_in {}", x.len(), d.n_in));
+        if x.len() != d.shape().0 {
+            return Err(format!("matmul: x 길이 {} != n_in {}", x.len(), d.shape().0));
         }
         let res = self.run_gemm(&d, x, 1)?;
-        out.copy_from_slice(&res[..d.n_out]);
+        out.copy_from_slice(&res[..d.shape().1]);
         Ok(())
     }
 
@@ -710,7 +645,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let mut idx_gpu: Vec<usize> = Vec::new();
         for (i, w) in ws.iter().enumerate() {
             let d = self.dev_weight(w)?;
-            if d.host {
+            if d.is_host() {
                 llm170_core::matmul::matmul(&xs[i], w, &mut outs[i]);
             } else {
                 idx_gpu.push(i);
@@ -719,12 +654,12 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         if idx_gpu.is_empty() {
             return Ok(());
         }
-        let devs: Vec<DevWeight> = idx_gpu
+        let devs: Vec<WRef> = idx_gpu
             .iter()
             .map(|&i| self.dev_weight(&ws[i]))
             .collect::<Result<_, _>>()?;
         for (d, &i) in devs.iter().zip(idx_gpu.iter()) {
-            if outs[i].len() != d.n_out as usize {
+            if outs[i].len() != d.shape().1 {
                 return Err("matmul_paired: outs 형상 불일치".into());
             }
         }
@@ -752,7 +687,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         for (((og, pg, ob, pb), d), &i) in pairs.iter().zip(devs.iter()).zip(idx_gpu.iter()) {
             let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
             let res: &[f32] = bytemuck::cast_slice(&raw);
-            outs[i].copy_from_slice(&res[..d.n_out]);
+            outs[i].copy_from_slice(&res[..d.shape().1]);
             to_release.push((og.clone(), *ob));
             to_release.push((pg.clone(), *pb));
         }
@@ -784,7 +719,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let mut idx_gpu: Vec<usize> = Vec::new();
         for (i, w) in ws.iter().enumerate() {
             let d = self.dev_weight(w)?;
-            if d.host {
+            if d.is_host() {
                 llm170_core::matmul::matmul_batch(xs, w, &mut outs[i]);
             } else {
                 idx_gpu.push(i);
@@ -793,13 +728,13 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         if idx_gpu.is_empty() {
             return Ok(());
         }
-        let devs: Vec<DevWeight> = idx_gpu
+        let devs: Vec<WRef> = idx_gpu
             .iter()
             .map(|&i| self.dev_weight(&ws[i]))
             .collect::<Result<_, _>>()?;
         for (d, &i) in devs.iter().zip(idx_gpu.iter()) {
             let out = &outs[i];
-            if out.len() != t || out.iter().any(|r| r.len() != d.n_out) {
+            if out.len() != t || out.iter().any(|r| r.len() != d.shape().1) {
                 return Err("matmul_group: outs 형상 불일치".into());
             }
         }
@@ -822,7 +757,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
             let res: &[f32] = bytemuck::cast_slice(&raw);
             for (ti, out) in outs[i].iter_mut().enumerate() {
-                out.copy_from_slice(&res[ti * d.n_out..(ti + 1) * d.n_out]);
+                out.copy_from_slice(&res[ti * d.shape().1..(ti + 1) * d.shape().1]);
             }
             to_release.push((og.clone(), *ob));
             to_release.push((pg.clone(), *pb));

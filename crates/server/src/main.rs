@@ -24,7 +24,33 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
   llm170 help
 "#;
 
+/// HIP 동기 런치 워크어라운드를 초기화 이전에 적용하기 위한 자기 재실행.
+/// env는 HIP 런타임 init 시 1회 판독 — with_client에서 set_var해도
+/// 무효였다(2026-09-01 실측: libamdhip64 할당·런치 경합 GPF 재발).
+/// 성공 시 exec가 프로세스를 치환해 이 함수로 돌아오지 않는다.
+#[cfg(target_os = "linux")]
+fn reexec_hip_blocking() {
+    if std::env::var_os("LLM170_NO_REEXEC").is_some()
+        || std::env::var_os("HIP_LAUNCH_BLOCKING").is_some()
+        || std::env::var_os("LLM170_HIP_ASYNC").is_some()
+    {
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.is_empty() {
+        return;
+    }
+    let err = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("HIP_LAUNCH_BLOCKING", "1")
+        .env("LLM170_NO_REEXEC", "1")
+        .exec();
+    eprintln!("# re-exec 실패({err}) — HIP_LAUNCH_BLOCKING 미적용으로 계속");
+}
+
 fn main() -> ExitCode {
+    reexec_hip_blocking();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
