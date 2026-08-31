@@ -57,6 +57,31 @@ pub struct Engine4 {
     pub acc: Option<std::sync::Arc<dyn Accelerator>>,
 }
 
+/// 스테이지별 누적(µs) — LLM170_Q4_TIME=1일 때 prefill/decode 완료 후 보고.
+#[derive(Default)]
+pub struct Q4Timings {
+    pub hc: u64,
+    pub gdn: u64,
+    pub qsa: u64,
+    pub moe: u64,
+    pub ple: u64,
+    pub head: u64,
+}
+
+impl Q4Timings {
+    fn report(&self, tag: &str) {
+        eprintln!(
+            "# q4-timing {tag}: hc={:.0}µs gdn={:.0}µs qsa={:.0}µs moe={:.0}µs ple={:.0}µs head={:.0}µs",
+            self.hc as f64 / 1e3,
+            self.gdn as f64 / 1e3,
+            self.qsa as f64 / 1e3,
+            self.moe as f64 / 1e3,
+            self.ple as f64 / 1e3,
+            self.head as f64 / 1e3
+        );
+    }
+}
+
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
@@ -80,12 +105,31 @@ impl Engine4 {
 
     /// 단일 시퀀스 배치 forward → 마지막 토큰 logits. (qwen4exp는 시퀀스별 prefill만
     /// 지원 — np 디코드도 seq별 1토큰씩 처리, 상태 격리 자명)
-    fn forward(
+    fn forward(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
+        self.forward_timed(seq, tokens, None)
+    }
+
+    fn forward_timed(
         &mut self,
         seq: usize,
         tokens: &[u32],
+        mut tm: Option<&mut Q4Timings>,
     ) -> Result<Vec<f32>, Q4Error> {
         profile_span!("q4::forward");
+        macro_rules! stage {
+            ($field:ident, $body:expr) => {
+                match &mut tm {
+                    Some(t) => {
+                        let t0 = std::time::Instant::now();
+                        let r = $body;
+                        t.$field += t0.elapsed().as_micros() as u64;
+                        r
+                    }
+                    None => $body,
+                }
+            };
+        }
+
         let hp = self.model.hp.clone();
         let (n_embd, hc) = (hp.n_embd, hp.hc);
         let hc_dim = hc * n_embd;
@@ -123,31 +167,31 @@ impl Engine4 {
         let mut recr_idx = 0usize;
         for il in 0..hp.n_layer {
             if hp.is_ple(il) {
-                self.ple_block(seq, il, &mut res_hc, &ple_rows)?;
+                stage!(ple, self.ple_block(seq, il, &mut res_hc, &ple_rows)?);
             }
-            let (mix, inject) = self.hc_mix(il, "attn", &res_hc)?;
+            let (mix, inject) = stage!(hc, self.hc_mix(il, "attn", &res_hc)?);
             let attn_out = if hp.is_recr(il) {
-                let o = self.gdn_layer(seq, il, &mix, t_len, recr_idx)?;
+                let o = stage!(gdn, self.gdn_layer(seq, il, &mix, t_len, recr_idx)?);
                 recr_idx += 1;
                 o
             } else {
-                let o = self.qsa_layer(seq, il, &mix, t_len, full_idx)?;
+                let o = stage!(qsa, self.qsa_layer(seq, il, &mix, t_len, full_idx)?);
                 full_idx += 1;
                 o
             };
             hc_combine(&mut res_hc, &attn_out, &inject, hc);
 
-            let (mix2, inject2) = self.hc_mix(il, "ffn", &res_hc)?;
-            let ffn_out = self.moe_ffn(il, &mix2)?;
+            let (mix2, inject2) = stage!(hc, self.hc_mix(il, "ffn", &res_hc)?);
+            let ffn_out = stage!(moe, self.moe_ffn(il, &mix2)?);
             hc_combine(&mut res_hc, &ffn_out, &inject2, hc);
         }
 
         // output HC mix → logits (inject 없음)
-        let head_in = self.hc_mix_head(&res_hc)?;
+        let head_in = stage!(head, self.hc_mix_head(&res_hc)?);
         let last = head_in.last().ok_or(Q4Error::BadMeta("빈 배치"))?.clone();
         let wout = self.model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         let mut logits = vec![0.0f32; wout.n_out as usize];
-        self.mm(&last, &wout, &mut logits)?;
+        stage!(head, self.mm(&last, &wout, &mut logits)?);
         let _ = hc_dim;
         Ok(logits)
     }
@@ -806,14 +850,22 @@ impl Engine4 {
 
     /// prefill: 전체 토큰 적립 + 마지막 logits.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
-        let logits = self.forward(seq, tokens)?;
+        let mut tm = init_timings();
+        let logits = self.forward_timed(seq, tokens, tm.as_mut())?;
+        if let Some(t) = &tm {
+            t.report(&format!("prefill {}tok", tokens.len()));
+        }
         self.seqs[seq].pos += tokens.len() as u32;
         Ok(logits)
     }
 
     /// 디코드 1토큰.
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
-        let logits = self.forward(seq, &[token])?;
+        let mut tm = init_timings();
+        let logits = self.forward_timed(seq, &[token], tm.as_mut())?;
+        if let Some(t) = &tm {
+            t.report("decode1");
+        }
         self.seqs[seq].pos += 1;
         Ok(logits)
     }
@@ -838,6 +890,14 @@ fn hc_combine(res_hc: &mut [Vec<f32>], out: &[Vec<f32>], inject: &[Vec<f32>], hc
 
 fn n_embd_dim(hp: &Hparams4) -> usize {
     hp.n_embd
+}
+
+fn init_timings() -> Option<Q4Timings> {
+    if std::env::var_os("LLM170_Q4_TIME").is_some() {
+        Some(Q4Timings::default())
+    } else {
+        None
+    }
 }
 
 fn dequant_row_into(

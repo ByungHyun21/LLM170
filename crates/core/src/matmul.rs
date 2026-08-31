@@ -244,3 +244,80 @@ pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
 fn dequant_row_f32(ty: GgmlType, blk: &[u8], out: &mut [f32], n: u64) {
     crate::quant::dequant_row(ty, blk, 0, n, out);
 }
+
+/// 단일 벡터 x에 대한 복수 가중치 내적 — thread::scope 1회로 스폰 오버헤드 제거.
+/// qwen4exp 디코드: MoE 전문가(10×2+1)·HC(3)마다 개별 matmul 대신 사용.
+/// outs[i][o] = Σ_j x[j]·W_i[o,j].
+pub fn matmul_multi(x: &[f32], ws: &[Weight], outs: &mut [Vec<f32>]) {
+    profile_span!("cpu::matmul_multi");
+    debug_assert_eq!(ws.len(), outs.len());
+    let offsets: Vec<usize> = ws
+        .iter()
+        .scan(0usize, |acc, w| {
+            let o = *acc;
+            *acc += w.n_out as usize;
+            Some(o)
+        })
+        .collect();
+    let total: usize = ws.iter().map(|w| w.n_out as usize).sum();
+    let nt = n_threads().max(1).min(total.max(1));
+    // 행 단위 워크 스틸링: AtomicU64 클레임 — 스레드 간 정적 분할 불필요,
+    // 쓰기 경쟁 없음(각 행은 한 스레드만). outs 행 소유권은 unsafe 없이
+    // split_at_mut 트리 대신 포인터 유사 안전 패턴: 각 (wi,row)는 유일.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let next = AtomicU64::new(0);
+    let results: std::sync::Mutex<Vec<(usize, usize, f32)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _t in 0..nt {
+            let next_ref = &next;
+            let offsets_ref = offsets.as_slice();
+            // 각 스레드가 서로 다른 (wi,row)만 씀 — 쓰기 안전성은 클레임 유일성으로 보장.
+            // 안전하게 만들기 위해 outs를 스레드 수로 열 우선 분할하는 대신,
+            // 전역 행 인덱스 클레임 → 쓰기 대상 슬라이스를 unsafe 없이 얻기 위해
+            // std::cell::UnsafeCell 회피: 쓰기는 메인 스레드가 결과 버퍼에 모아두고
+            // 조인 후 분산. 간단·안전: 계산만 병렬, 기록은 직렬.
+            let results_ref = &results;
+            handles.push(scope.spawn(move || {
+                let mut scratch: Vec<f32> = Vec::new();
+                let mut local: Vec<(usize, usize, f32)> = Vec::new();
+                loop {
+                    let idx = next_ref.fetch_add(1, Ordering::Relaxed) as usize;
+                    if idx >= total {
+                        break;
+                    }
+                    let mut wi = 0usize;
+                    while wi < ws.len() && idx >= offsets_ref[wi] + ws[wi].n_out as usize {
+                        wi += 1;
+                    }
+                    if wi >= ws.len() {
+                        break;
+                    }
+                    let row = idx - offsets_ref[wi];
+                    let w = &ws[wi];
+                    let n_in = w.n_in as usize;
+                    if scratch.len() != n_in {
+                        scratch = vec![0.0f32; n_in];
+                    }
+                    let blocks = n_in / w.ty.blck_size() as usize;
+                    let base = row * blocks * w.ty.type_size() as usize;
+                    crate::quant::dequant_row(w.ty, &w.data[base..], 0, w.n_in, &mut scratch);
+                    let mut acc = 0.0f32;
+                    for i in 0..n_in {
+                        acc += x[i] * scratch[i];
+                    }
+                    local.push((wi, row, acc));
+                }
+                results_ref.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+    // 조인 후 기록 (클레임 유일성으로 중복 없음)
+    let results = results.into_inner().unwrap();
+    for (wi, row, v) in results {
+        outs[wi][row] = v;
+    }
+}

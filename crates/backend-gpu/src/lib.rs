@@ -48,7 +48,11 @@ fn acc(a: &AtomicU64, d: std::time::Duration) {
 
 /// x를 tlen(≤8의 2의 거듭제곱)행으로 패딩 — 디코드 q3 커널의 토큰 상각용.
 fn pad_x(xs: &[Vec<f32>], n_in: usize, t: usize) -> (Vec<f32>, usize) {
-    let tlen = if t <= 8 { t.max(1).next_power_of_two().min(8) } else { t };
+    let tlen = if t <= 8 {
+        t.max(1).next_power_of_two().min(8)
+    } else {
+        t.div_ceil(16) * 16 // q4 타일 정렬
+    };
     let mut xf = Vec::with_capacity(tlen * n_in);
     for r in xs {
         xf.extend_from_slice(r);
@@ -390,16 +394,22 @@ impl<R: Runtime> GpuMatmul<R> {
     /// GEMM 런치 (비동기, v2 k-레인) — x는 외부에서 업로드해 전달. 반환: out 핸들.
     fn launch_gemm(&self, d: &DevWeight, xg: Handle, t: usize) -> Result<(Handle, Handle, usize, usize), String> {
         let (n_in, n_out) = (d.n_in, d.n_out);
-        // 스크래치 예산 512MiB 내에서 최대 슬라이스 — comptime 특수화 {64,16,4}
-        let slices: usize = if t * n_out * 64 * 4 <= 512 << 20 {
-            64
-        } else if t * n_out * 16 * 4 <= 512 << 20 {
-            16
+        // 스크래치 예산 3GiB(q4 prefill) — decode는 512MiB {64,16,4}
+        let slices: usize = if t <= 8 {
+            if t * n_out * 64 * 4 <= 512 << 20 {
+                64
+            } else if t * n_out * 16 * 4 <= 512 << 20 {
+                16
+            } else {
+                4
+            }
         } else {
-            4
+            16 // q4 고정
         };
-        // 디코드(t ≤ 8, t = tlen 패딩됨) — 토큰 상각 q3, 아니면 q2
+        // 디코드(t ≤ 8) — q3 토큰 상각. prefill — q4 타일(가중치 1패스).
+        // LLM170_Q4_OFF=1이면 prefill도 q4 비활성(폴백 비교용).
         let decode = t <= 8 && slices == 64;
+        let prefill_q4 = t > 8 && std::env::var_os("LLM170_Q4_OFF").is_none();
         let og = self.acquire_buf(t * n_out * 4)?;
         let pg = self.acquire_buf(t * n_out * slices * 4)?;
         // SAFETY: 두 경로 모두 그리드가 (n_out, t)를 덮고 시작부 범위 가드 —
@@ -418,6 +428,26 @@ impl<R: Runtime> GpuMatmul<R> {
                     n_in,
                     n_out,
                     t,
+                    d.ty as u32 as usize,
+                );
+            } else if prefill_q4 {
+                const TLEN: usize = 16;
+                const SL: usize = 16;
+                let tiles = t.div_ceil(TLEN) as u32;
+                gemm2::gemm_q4::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n_out as u32, 1, tiles),
+                    CubeDim::new_1d(SL as u32),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.h.clone(), [1].into(), [d.bytes].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * SL].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    t,
+                    TLEN,
+                    SL,
                     d.ty as u32 as usize,
                 );
             } else {
@@ -476,12 +506,6 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulB");
-        // prefill(t > 8) — q2 커널이 토큰 상각 없어 ALU 병목. 공유메모리 타일
-        // 커널 전까지 CPU 폴백 (수치 동일: 같은 dequant·순차 누산).
-        if xs.len() > 8 {
-            llm170_core::matmul::matmul_batch(xs, w, outs);
-            return Ok(());
-        }
         let t = xs.len();
         let n_in = w.n_in as usize;
         if xs.iter().any(|r| r.len() != n_in) {
@@ -517,13 +541,6 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulG");
-        // prefill(t > 8) — 위와 동일 사유로 CPU 폴백.
-        if xs.len() > 8 {
-            for (w, out) in ws.iter().zip(outs.iter_mut()) {
-                llm170_core::matmul::matmul_batch(xs, w, out);
-            }
-            return Ok(());
-        }
         let t = xs.len();
         if ws.is_empty() || ws.len() != outs.len() {
             return Err(format!("matmul_group: 잘못된 구성 ws={} outs={}", ws.len(), outs.len()));
