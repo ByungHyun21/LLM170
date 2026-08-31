@@ -13,10 +13,11 @@
 //! - 4-split GGUF: part1=메타 전용, parts2-4가 텐서 1224개 분산 보관.
 
 pub mod layers;
+pub mod stages;
 
 use crate::matmul::Weight;
 use crate::quant::dequant_row;
-use llm170_gguf::{GgmlType, GgufFile, Value};
+use llm170_gguf::{GgufFile, Value};
 use memmap2::{Advice, Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -319,7 +320,7 @@ impl Model4 {
         let t = &part.tensors[ti];
         let (blck, bsize) = t.ty.block_info();
         let per_expert_bytes = (t.ne[0] / blck * bsize) as usize * t.ne[1] as usize;
-        let (start, end) = t.file_range(part.data_offset).ok_or(Q4Error::BadMeta("expert range"))?;
+        let (start, _end) = t.file_range(part.data_offset).ok_or(Q4Error::BadMeta("expert range"))?;
         let s = start as usize + e * per_expert_bytes;
         Ok(Weight {
             data: &part.mmap[s..s + per_expert_bytes],

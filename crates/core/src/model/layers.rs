@@ -167,10 +167,10 @@ impl Engine {
         }
 
         if dbg0 {
-            let mq = q_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            let mk = k_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            let mv = v_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            let mo = o_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let _mq = q_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let _mk = k_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let _mv = v_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let _mo = o_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
             let c4: Vec<String> = o_all[..4].iter().map(|v| format!("{v:.6}")).collect();
             let z4: Vec<String> = z[0][..4].iter().map(|v| format!("{v:.6}")).collect();
             eprintln!("  rs stage core[:4]={c4:?} z[:4]={z4:?}");
@@ -224,7 +224,7 @@ impl Engine {
                 .fold(0.0f32, |a, v| a.max(v.abs()));
             let (mut mi, mut mv) = (0usize, f32::NEG_INFINITY);
             for (r, row) in out.iter().enumerate() {
-                for (c, v) in row.iter().enumerate() {
+                for (_c, v) in row.iter().enumerate() {
                     if v.abs() > mv {
                         mv = v.abs();
                         mi = r;

@@ -17,7 +17,7 @@ use llm170_profiler::profile_span;
 use memmap2::Mmap;
 
 use crate::matmul::{Weight, mm, mm_batch, mm_group};
-use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
+use crate::ops::{rms_norm, silu};
 use crate::quant::dequant_row;
 #[derive(Debug)]
 pub enum ModelError {
@@ -305,7 +305,7 @@ impl Engine {
             let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
             let n_ff = hp.n_ff;
 
-            let mut normed: Vec<Vec<f32>> =
+            let normed: Vec<Vec<f32>> =
                 xs.iter().map(|x| rms_norm(x, &post_w, hp.eps)).collect();
             let mut ffn_group: [Vec<Vec<f32>>; 2] =
                 [vec![vec![0.0f32; n_ff]; n_tok], vec![vec![0.0f32; n_ff]; n_tok]];
