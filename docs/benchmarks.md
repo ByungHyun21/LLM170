@@ -17,31 +17,32 @@ op. LLM170 conditions: matmul projections on GPU (all quant types), GDN
 recurrence + attention + norms still on CPU per layer, host round-trip per
 matmul group.
 
-Gap analysis (measured, `LLM170_GPU_TIME`):
-- Sync round trips: eliminated for grouped projections (up/launch ≈ 0);
-  remain per group (≈5 groups × 64 layers).
-- Kernel throughput: element-wise dequant ALU is the residual in-kernel
-  bottleneck (~10× from the bandwidth floor); token-amortized decode kernel
-  (q3) closed 1.5× already.
-- CPU-side GDN/attention per layer dominates decode step time today.
-
 ## qwen4exp (Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split)
 
 | Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU backend) |
 |---|---|---|
-| Prefill pp, np2×262K ctx | 178–237 t/s per slot (HIP 7.2.2; 2026-08-27) | long-prompt case pending (see below) |
-| Decode tg, np2 | 11.6–15.1 t/s | ~1.4 ms/forward compute (2.2 ms stages + overhead, hot cache) — MoE grouped batching landed 2026-08-31 |
+| Prefill pp, 2311 tok (single) | 178–237 t/s per slot (HIP 7.2.2; 2026-08-27) | **~3.3 t/s** (~699 s incl. load+decode; Vulkan, 2026-09-01 — token-exact 24/24) |
+| Decode tg, t=1 | 11.6–15.1 t/s (np2) | **~2.0–2.2 t/s** (0.46–0.51 s/step, 2026-09-01) |
 | PLE table | NVMe mmap + `-ot ...=CPU` (identical pattern) | NVMe mmap + `MADV_RANDOM` (same) |
 
-Known remaining CPU-serial sections in the LLM170 GPU path: QSA masked dense
-GQA (O(p²) over context), GDN chunked recurrence, HC residual math — these
-dominate long-prefill wall time today (single core during prefill).
+Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
+projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
+call, down as paired batch), GDN ~126 ms (CPU recurrence — GPU kernel is the
+next item), HC ~55 ms, QSA ~18 ms. Round-trip inventory dropped from
+~1,680/step to ~600/step; eliminating per-call sync entirely (persistent
+device activations + single end-of-forward sync) is the structural next step.
 
-## Method
+Known remaining CPU-serial sections in the GPU path: GDN recurrence (chunked
+prefill + AR decode), QSA indexer scores (O(p²) over context), HC residual
+math. Long prefill currently measured on the Vulkan runtime; the HIP runtime
+hits a cubecl-HIP memory-manager fault on multi-chunk (≥2,048-token) prefill
+on this machine (single-chunk and decode are fine, engine code verified
+identical across runtimes).
 
-- llama.cpp numbers: `llama-server` slot timings (`print_timing`) and
-  `bench-*.txt` artifacts, quoted with np/ctx/date.
-- LLM170 numbers: end-to-end `llm170 infer` wall clock (incl. model load
-  unless noted), or `LLM170_Q4_TIME`/`LLM170_GPU_TIME` stage instrumentation
-  for compute-only figures. Server-based streaming measurement is the
-  standard once a server mode exists.
+## Verification status (same binaries as the numbers above)
+
+- qwen4exp matrix (Vulkan): single_ko exact 24/24; single_short/code near-tie
+  (gap 0.01/0.12 nat); long 2311-tok and long2 1904-tok **exact 24/24 each**.
+- qwen35: GPU server↔CLI self-consistent matrix 7/7 exact (2026-08-31 binary);
+  full matrix re-run pending local filesystem recovery (transient ENOENT
+  windows on the model volume, unrelated to the engine).
