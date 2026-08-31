@@ -433,19 +433,39 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
         eprintln!("usage: llm170 gpu-mm <file> <tensor> [t] [rows]");
         return ExitCode::from(2);
     }
-    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+    // 아키텍처 자동: 모델 소유 홀더가 mmap 수명 유지 — Weight는 여기서 차입.
+    enum Holder {
+        Q35(Box<llm170_core::model::Model>),
+        Q4(Box<llm170_core::qwen4exp::Model4>),
+    }
+    let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(&args[0]))
+        .ok()
+        .and_then(|g| g.arch().map(|s| s == "qwen4exp"))
+        .unwrap_or(false);
+    let holder = if is_q4 {
+        match llm170_core::qwen4exp::Model4::load(std::path::Path::new(&args[0])) {
+            Ok(m) => Holder::Q4(Box::new(m)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+            Ok(m) => Holder::Q35(Box::new(m)),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
-    let w = match model.w(&args[1]) {
-        Some(w) => w,
-        None => {
-            eprintln!("tensor not found: {}", args[1]);
-            return ExitCode::FAILURE;
-        }
+    let w = match &holder {
+        Holder::Q35(m) => m.w(&args[1]),
+        Holder::Q4(m) => m.w(&args[1]),
+    };
+    let Some(w) = w else {
+        eprintln!("tensor not found: {}", args[1]);
+        return ExitCode::FAILURE;
     };
     let t: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
     let rows: usize = args

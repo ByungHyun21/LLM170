@@ -142,6 +142,24 @@ fn de_elem_q3_k(w: &Tensor<u32>, wb: usize, j: usize) -> f32 {
     dl * (qv - sub) as f32
 }
 
+/// q5_1 요소: d(2) m(2) qh(4) qs(16) — x0|xh·16 형태 + m 가산.
+#[cube]
+fn de_elem_q5_1(w: &Tensor<u32>, wb: usize, j: usize) -> f32 {
+    let d = f16_at(w, wb);
+    let m = f16_at(w, wb + 2);
+    let qh = byte(w, wb + 4) | (byte(w, wb + 5) << 8) | (byte(w, wb + 6) << 16) | (byte(w, wb + 7) << 24);
+    let q = byte(w, wb + 8 + (j % 16));
+    // ggml: xh0 = ((qh >> j) << 4) & 0x10; xh1 = (qh >> (j+12)) & 0x10
+    let xh: u32 = if j < 16 {
+        ((qh >> (j as u32)) << 4) & 0x10
+    } else {
+        (qh >> ((j as u32) - 16 + 12)) & 0x10
+    };
+    let nib: u32 = if j < 16 { q & 0xF } else { q >> 4 };
+    let v = nib | xh;
+    v as f32 * d + m
+}
+
 #[cube]
 fn de_elem_iq4_xs(w: &Tensor<u32>, wb: usize, j: usize, ktab: &Tensor<f32>) -> f32 {
     let ib = j / 32;
@@ -214,6 +232,8 @@ fn de_elem(
         f32::from_bits((byte(w, wb) | (byte(w, wb + 1) << 8)) << 16)
     } else if qtype == 8 {
         de_elem_q8_0(w, wb, j)
+    } else if qtype == 7 {
+        de_elem_q5_1(w, wb, j)
     } else if qtype == 12 {
         de_elem_q4_k(w, wb, j)
     } else if qtype == 13 {
@@ -266,6 +286,8 @@ pub fn gemm_q2(
         32
     } else if qtype == 20 {
         32
+    } else if qtype == 7 {
+        32
     } else {
         256
     };
@@ -279,6 +301,8 @@ pub fn gemm_q2(
         34
     } else if qtype == 20 {
         18
+    } else if qtype == 7 {
+        24
     } else if qtype == 12 {
         144
     } else if qtype == 13 {
@@ -402,6 +426,8 @@ pub fn gemm_q3(
         32
     } else if qtype == 20 {
         32
+    } else if qtype == 7 {
+        32
     } else {
         256
     };
@@ -415,6 +441,8 @@ pub fn gemm_q3(
         34
     } else if qtype == 20 {
         18
+    } else if qtype == 7 {
+        24
     } else if qtype == 12 {
         144
     } else if qtype == 13 {
@@ -471,17 +499,33 @@ pub fn gemm_q6(
     if o >= n_out || l >= 64 {
         terminate!();
     }
-    let blck = if qtype == 8 {
+    let blck = if qtype == 0 {
+        1
+    } else if qtype == 1 {
+        1
+    } else if qtype == 30 {
+        1
+    } else if qtype == 8 {
         32
     } else if qtype == 20 {
+        32
+    } else if qtype == 7 {
         32
     } else {
         256
     };
-    let bsize = if qtype == 8 {
+    let bsize = if qtype == 0 {
+        4
+    } else if qtype == 1 {
+        2
+    } else if qtype == 30 {
+        2
+    } else if qtype == 8 {
         34
     } else if qtype == 20 {
         18
+    } else if qtype == 7 {
+        24
     } else if qtype == 12 {
         144
     } else if qtype == 13 {
@@ -522,9 +566,11 @@ pub fn gemm_q6(
     }
 }
 
-/// prefill용 토큰-타일 GEMM — q3의 토큰 상각을 tlen타일×grid-z로 일반화.
-/// 유닛 = (행 o, k-레인 l<slices). 타일 z가 tlen토큰을 레지스터 누산 —
-/// 가중치 디양자화는 행당 1회(전 토큰 상각), part 충돌 없음(ti 전역).
+/// prefill용 토큰-타일 GEMM — q3의 토큰 상각을 tlen타일×grid-y로 일반화.
+/// 유닛 = (행 o, k-레인 l<64). 타일 y가 tlen토큰을 레지스터 누산 —
+/// 가중치 디양자화는 행당 1회(전 토큰 상각), part[t][o][l] 타일별 전역 슬롯.
+/// 검증된 형상만 사용: CubeDim 1d 64(q3 동일)·y축 타일(q2 동일) — 16유닛/z축
+/// 조합은 콜드 런 비결정 오염 실측(2026-08-31).
 #[cube(launch_unchecked)]
 pub fn gemm_q4(
     x: &Tensor<f32>,
@@ -540,22 +586,38 @@ pub fn gemm_q4(
     #[comptime] qtype: usize,
 ) {
     let o = CUBE_POS_X as usize;
-    let z = CUBE_POS_Z as usize; // 토큰 타일
+    let z = CUBE_POS_Y as usize; // 토큰 타일 — y축 (q2와 동일 축)
     let l = UNIT_POS_X as usize;
     if o >= n_out || l >= slices || z * tlen >= t_len {
         terminate!();
     }
-    let blck = if qtype == 8 {
+    let blck = if qtype == 0 {
+        1
+    } else if qtype == 1 {
+        1
+    } else if qtype == 30 {
+        1
+    } else if qtype == 8 {
         32
     } else if qtype == 20 {
+        32
+    } else if qtype == 7 {
         32
     } else {
         256
     };
-    let bsize = if qtype == 8 {
+    let bsize = if qtype == 0 {
+        4
+    } else if qtype == 1 {
+        2
+    } else if qtype == 30 {
+        2
+    } else if qtype == 8 {
         34
     } else if qtype == 20 {
         18
+    } else if qtype == 7 {
+        24
     } else if qtype == 12 {
         144
     } else if qtype == 13 {

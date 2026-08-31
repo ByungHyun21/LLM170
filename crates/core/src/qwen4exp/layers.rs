@@ -103,6 +103,22 @@ impl Engine4 {
         }
     }
 
+    /// 배치 디스패치 — 가속기 없으면 CPU thread::scope 경로.
+    fn mm_batch(
+        &self,
+        xs: &[Vec<f32>],
+        w: &crate::matmul::Weight,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), Q4Error> {
+        match self.acc.as_deref() {
+            Some(a) => a.matmul_batch(xs, w, outs).map_err(Q4Error::Io),
+            None => {
+                matmul_batch(xs, w, outs);
+                Ok(())
+            }
+        }
+    }
+
     /// 단일 시퀀스 배치 forward → 마지막 토큰 logits. (qwen4exp는 시퀀스별 prefill만
     /// 지원 — np 디코드도 seq별 1토큰씩 처리, 상태 격리 자명)
     fn forward(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
@@ -316,13 +332,13 @@ impl Engine4 {
         let wout = self.model.w4(&format!("blk.{il}.ssm_out.weight"))?;
 
         let mut qkv = vec![vec![0.0f32; conv_ch]; n_tok];
-        matmul_batch(xs, &wqkv, &mut qkv);
+        self.mm_batch(xs, &wqkv, &mut qkv)?;
         let mut z = vec![vec![0.0f32; d_inner]; n_tok];
-        matmul_batch(xs, &wgate, &mut z);
+        self.mm_batch(xs, &wgate, &mut z)?;
         let mut b = vec![vec![0.0f32; dt_rank]; n_tok];
-        matmul_batch(xs, &wbeta, &mut b);
+        self.mm_batch(xs, &wbeta, &mut b)?;
         let mut a = vec![vec![0.0f32; dt_rank]; n_tok];
-        matmul_batch(xs, &walpha, &mut a);
+        self.mm_batch(xs, &walpha, &mut a)?;
 
         let mut beta_all = vec![0.0f32; n_tok * dt_rank];
         let mut g_all = vec![0.0f32; n_tok * dt_rank];
@@ -396,7 +412,7 @@ impl Engine4 {
             }
         }
         let mut out = vec![vec![0.0f32; n_embd_dim(&hp)]; n_tok];
-        matmul_batch(&gated, &wout, &mut out);
+        self.mm_batch(&gated, &wout, &mut out)?;
         Ok(out)
     }
 
@@ -425,15 +441,15 @@ impl Engine4 {
 
         let n_tok = t_len;
         let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
-        matmul_batch(xs, &wq, &mut qg);
+        self.mm_batch(xs, &wq, &mut qg)?;
         let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
-        matmul_batch(xs, &wk, &mut kk);
+        self.mm_batch(xs, &wk, &mut kk)?;
         let mut vv = vec![vec![0.0f32; wv.n_out as usize]; n_tok];
-        matmul_batch(xs, &wv, &mut vv);
+        self.mm_batch(xs, &wv, &mut vv)?;
         let mut iq = vec![vec![0.0f32; w_iq.n_out as usize]; n_tok];
-        matmul_batch(xs, &w_iq, &mut iq);
+        self.mm_batch(xs, &w_iq, &mut iq)?;
         let mut ik = vec![vec![0.0f32; w_ik.n_out as usize]; n_tok];
-        matmul_batch(xs, &w_ik, &mut ik);
+        self.mm_batch(xs, &w_ik, &mut ik)?;
 
         let kq_scale = hp.kq_scale();
         let pos0 = self.seqs[seq].pos;
@@ -564,7 +580,7 @@ impl Engine4 {
             }
             attn_all[t] = attn_out;
         }
-        matmul_batch(&attn_all, &wo, &mut out);
+        self.mm_batch(&attn_all, &wo, &mut out)?;
         Ok(out)
     }
 
@@ -679,9 +695,9 @@ impl Engine4 {
         }
         // key/value 프로젝션
         let mut key = vec![vec![0.0f32; w_key.n_out as usize]; t];
-        matmul_batch(&emb, &w_key, &mut key);
+        self.mm_batch(&emb, &w_key, &mut key)?;
         let mut value = vec![vec![0.0f32; w_value.n_out as usize]; t];
-        matmul_batch(&emb, &w_value, &mut value);
+        self.mm_batch(&emb, &w_value, &mut value)?;
 
         let mut gated_hist: Vec<Vec<f32>> = Vec::with_capacity(t);
         for ti in 0..t {
