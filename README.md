@@ -15,7 +15,8 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 | Lightweight profiler (debug-instrumented, zero-cost in release) | ✅ |
 | Dequantization — q4_K / q5_K / q6_K / q8_0 / q3_K / q5_1 / iq4_xs / iq4_nl / iq3_s | ✅ cross-checked against an independent reference implementation |
 | Gated DeltaNet — chunked & autoregressive (CPU) | ✅ two paths agree to 1e-7; cross-validated against llama.cpp |
-| qwen35 CPU inference engine | ✅ greedy tokens match llama.cpp on real 27B (short/long/np4/long+np matrix) |
+| qwen35 inference engine (CPU + GPU matmul) | ✅ greedy tokens match llama.cpp — 11/11 matrix (6 exact + 5 near-tie) |
+| qwen4exp engine (CPU + GPU matmul) | ✅ hyper-connections, QSA indexer, MoE (512 experts, token-expert grouped batching), PLE NVMe offload — llama.cpp parity on the reduced matrix |
 | qwen4exp (QSA / hyper-connections / PLE / MoE) | ⏳ planned |
 | GPU backend — cubecl, quantized GEMM (HIP/ROCm + Vulkan) | ✅ all 8 quant types; GPU greedy stream == CPU stream token-for-token |
 
@@ -72,7 +73,8 @@ scripts/         verification harness (synthetic-model generators, llama.cpp cro
 
 ## Documentation
 
-- [Project overview](docs/overview.md) — goals, modes, reference models *(Korean)*
+- [Project overview](docs/overview.md) — goals, modes, reference models
+- [Benchmarks vs llama.cpp](docs/benchmarks.md) — pp/tg comparison with conditions
 - [Architecture](docs/architecture.md) — backend strategy, FP discipline, kernel surface
 - [CMP 170HX hardware spec](docs/hardware/cmp170hx.md) — throttle matrix, unlock, memory budgets
 - [Dev machine (ROCm)](docs/hardware/dev-8060s.md)
@@ -80,4 +82,4 @@ scripts/         verification harness (synthetic-model generators, llama.cpp cro
 - [Decision records](docs/decisions.md) — ADRs
 - [AGENTS.md](AGENTS.md) — contribution & engineering rules
 
-Internal engineering docs are written in Korean; code comments are mixed Korean/English. This will be rationalized as the project matures.
+Historical ADRs and internal engineering notes are Korean; all docs under `docs/` are English going forward.
