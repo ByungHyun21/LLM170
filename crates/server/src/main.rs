@@ -169,12 +169,24 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             None
         }
     };
-    match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
-        Ok(t) => {
-            let _ = engine::TOKENIZER.set(t);
+    // 간헐 ENOPT(transient ENOENT) 재시도 — 2026-09-01 실측 회복 패턴.
+    let mut tok = None;
+    for i in 0..5 {
+        match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
+            Ok(t) => {
+                tok = Some(t);
+                break;
+            }
+            Err(e) => {
+                eprintln!("# tokenizer load 재시도 {}/5: {e}", i + 1);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         }
-        Err(e) => eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작): {e}"),
     }
+    if tok.is_none() {
+        eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작)");
+    }
+    let _ = engine::TOKENIZER.set(tok.unwrap_or_else(|| tokenize::Tokenizer::empty()));
     let req = engine::InferRequest { model: model_path, ctx };
     let sel = if backend == "gpu" { engine::BackendSel::Gpu } else { engine::BackendSel::Cpu };
     match http::serve(&format!("127.0.0.1:{port}"), req, sel) {

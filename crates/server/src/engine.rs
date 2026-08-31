@@ -22,12 +22,53 @@ pub enum Engine {
     Q4(llm170_core::qwen4exp::layers::Engine4),
 }
 
+/// qwen4exp 로드 재시도 — transient ENOENT 회복 (최대 5회×1s).
+fn load_q4_retry(p: &std::path::Path) -> llm170_core::qwen4exp::Model4 {
+    for i in 0..5 {
+        match llm170_core::qwen4exp::Model4::load(p) {
+            Ok(m) => return m,
+            Err(e) => {
+                eprintln!("# qwen4exp 로드 재시도 {}/5: {e}", i + 1);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    panic!("qwen4exp 로드 최종 실패: {}", p.display())
+}
+
+/// qwen35 로드 재시도 — 동일.
+fn load_q35_retry(p: &std::path::Path) -> llm170_core::model::Model {
+    for i in 0..5 {
+        match llm170_core::model::Model::load(p) {
+            Ok(m) => return m,
+            Err(e) => {
+                eprintln!("# qwen35 로드 재시도 {}/5: {e}", i + 1);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    panic!("qwen35 로드 최종 실패: {}", p.display())
+}
+
+/// GGUF 오픈 재시도 (최대 5회×1s) — transient ENOENT 회복.
+fn open_with_retry(p: &std::path::Path) -> Option<llm170_gguf::GgufFile> {
+    for i in 0..5 {
+        if let Ok(g) = llm170_gguf::GgufFile::open(p) {
+            return Some(g);
+        }
+        eprintln!("# gguf 오픈 재시도 {}/5: {}", i + 1, p.display());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    None
+}
+
 pub fn build(req: InferRequest, backend: BackendSel) -> Engine {
-    let arch = llm170_gguf::GgufFile::open(&req.model)
-        .ok()
+    // 간헐적 파일시스템 ENOENT(디렉터리 목록엔 보이는 transient 결함,
+    // 2026-09-01 실측) — 재시도로 회복. mmap 대상 전 파트에 적용.
+    let arch = open_with_retry(&req.model)
         .and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
-        let m = llm170_core::qwen4exp::Model4::load(&req.model).expect("qwen4exp 로드");
+        let m = load_q4_retry(&req.model);
         let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, req.ctx);
         if let BackendSel::Gpu = backend {
             if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
@@ -36,7 +77,7 @@ pub fn build(req: InferRequest, backend: BackendSel) -> Engine {
         }
         Engine::Q4(eng)
     } else {
-        let m = llm170_core::model::Model::load(&req.model).expect("qwen35 로드");
+        let m = load_q35_retry(&req.model);
         let mut eng = llm170_core::model::Engine::new(m, 1, req.ctx);
         if let BackendSel::Gpu = backend {
             if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {

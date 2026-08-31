@@ -13,6 +13,11 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// 빈 토크나이저 (로드 최종 실패시 — 토큰 id 모드만 동작).
+    pub fn empty() -> Self {
+        Tokenizer { vocab: Vec::new(), index: HashMap::new() }
+    }
+
     pub fn load(path: &Path, part2: Option<&Path>) -> Result<Self, String> {
         let g = GgufFile::open(path).map_err(|e| e.to_string())?;
         let mut vocab = Vec::new();
