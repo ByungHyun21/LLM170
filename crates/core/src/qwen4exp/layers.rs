@@ -954,6 +954,14 @@ impl Engine4 {
         rows
     }
 
+    /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용).
+    pub fn reset_states(&mut self) {
+        let ctx = self.seqs.first().map(|s| s.kv_k.first().map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim)).unwrap_or(4096)).unwrap_or(4096);
+        for i in 0..self.seqs.len() {
+            self.seqs[i] = SeqState4::new(&self.model.hp, ctx);
+        }
+    }
+
     /// prefill: 전체 토큰 적립 + 마지막 logits.
     /// 1024토큰 청크로 분할 — 단일 초대형 forward는 libamdhip64 GPF 트리거
     /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).

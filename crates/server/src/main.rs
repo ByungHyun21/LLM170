@@ -3,6 +3,10 @@
 //! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
+mod engine;
+mod http;
+mod tokenize;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -25,6 +29,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => cmd_infer(&args[1..]),
+        Some("serve") => return cmd_serve(&args[1..]),
         Some("gpu-probe-vk") => match llm170_backend_gpu::probe_vulkan() {
             Ok(msg) => {
                 println!("{msg}");
@@ -72,6 +77,62 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu]
+fn cmd_serve(args: &[String]) -> ExitCode {
+    let mut model: Option<PathBuf> = None;
+    let mut port = 8080u16;
+    let mut ctx = 4096usize;
+    let mut backend = "cpu".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--model" => match it.next() {
+                Some(v) => model = Some(PathBuf::from(v)),
+                None => return usage_err("--model requires a path"),
+            },
+            "--port" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(p) => port = p,
+                None => return usage_err("--port requires a number"),
+            },
+            "--ctx" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(c) => ctx = c,
+                None => return usage_err("--ctx requires a number"),
+            },
+            "--backend" => match it.next() {
+                Some(v) if v == "cpu" || v == "gpu" => backend = v.clone(),
+                Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
+                None => return usage_err("--backend requires cpu|gpu"),
+            },
+            other => return usage_err(&format!("unknown flag: {other}")),
+        }
+    }
+    let Some(model_path) = model else { return usage_err("--model required") };
+    // 토크나이저 적재 (part1 메타 → 실패시 part2)
+    let part2 = {
+        let stem = model_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.contains("-00001-of-") {
+            Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
+        } else {
+            None
+        }
+    };
+    match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
+        Ok(t) => {
+            let _ = engine::TOKENIZER.set(t);
+        }
+        Err(e) => eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작): {e}"),
+    }
+    let req = engine::InferRequest { model: model_path, ctx };
+    let sel = if backend == "gpu" { engine::BackendSel::Gpu } else { engine::BackendSel::Cpu };
+    match http::serve(&format!("127.0.0.1:{port}"), req, sel) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }

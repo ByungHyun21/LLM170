@@ -209,6 +209,21 @@ impl Engine {
         }
     }
 
+    /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용) — mmap은 유지.
+    /// ctx는 기존 KV 용량에서 역산 (첫 kv_k 길이).
+    pub fn reset_states(&mut self) {
+        let n_kv = self.model.hp.n_kv;
+        let hd = self.model.hp.head_dim;
+        let ctx = self
+            .seqs
+            .first()
+            .and_then(|s| s.kv_k.first().map(|k| k.len() / (n_kv * hd)))
+            .unwrap_or(4096);
+        for i in 0..self.seqs.len() {
+            self.seqs[i] = SeqState::new(&self.model, ctx);
+        }
+    }
+
     /// 가속기 주입 (server --backend gpu).
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn crate::matmul::Accelerator>) -> Self {
         self.acc = Some(acc);
