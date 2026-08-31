@@ -8,6 +8,8 @@
 //! 동일한 누산 순서를 유지해 수치 일치 확률을 최대화한다 (ADR-0005 strict FP).
 
 use cubecl::prelude::*;
+/// 풀에 할당된 누적 바이트 (해제 없이 재사용만 — VRAM 고갈 추적).
+static POOL_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 mod gemm2;
 mod attn;
@@ -240,16 +242,34 @@ impl<R: Runtime> GpuMatmul<R> {
         })
     }
 
+    /// 큐 완결 동기화 — 풀 재사용 안전성의 증명 지점. read_one이 커널
+    /// 완결까지 보장하지 않는 결함(2026-09-01 NaN 실측) 대응: 스테이지
+    /// 경계에서 호출해 모든 비행 중 연산 종료를 확정한다.
+    pub fn barrier(&self) {
+        let _ = cubecl_common::future::block_on(self.client.sync());
+    }
     /// 풀에서 버퍼 획득 (같은 크기 연속 획득 시 서로 다른 핸들).
     fn acquire_buf(&self, bytes: usize) -> Result<Handle, String> {
         let mut pool = self.bufs.lock().map_err(|_| "buf pool lock poisoned")?;
         if let Some(h) = pool.get_mut(&bytes).and_then(|v| v.pop()) {
             return Ok(h);
         }
-        Ok(self.client.empty(bytes))
+        let h = self.client.empty(bytes);
+        POOL_TOTAL.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("LLM170_GPU_TIME").is_some() {
+            eprintln!(
+                "# pool 신규 {bytes}B 풀누적 {:.2}GiB 상주가중치 {:.2}GiB",
+                POOL_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 30) as f64,
+                self.dev_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 30) as f64
+            );
+        }
+        Ok(h)
     }
 
     /// read 동기화 후 반납 (크기 명시 — Handle은 크기 비공개).
+    /// 휘발 업로드 포함 전부 풀에 영속 보관 — drop·지연 해제가 큐 잔여
+    /// 연산과 경합해 가비지 판독(NaN, 2026-09-01 실측)하므로 해제 자체를
+    /// 하지 않는다 (해제 경합 원인 제거 후 barrier 불필요).
     fn release_bufs(&self, hs: &[(Handle, usize)]) {
         if let Ok(mut pool) = self.bufs.lock() {
             for (h, bytes) in hs {
@@ -261,7 +281,20 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 가중치 상주 예산 — 초과분은 호스트 연산. PLE(26.8GB)은 애초에 matmul
     /// 대상이 아니고 본체+전문가 ~83GB는 96GB VRAM에 들어감(llama.cpp와 동일
     /// 배치). GPF 원인은 청킹 부재였고 해소됨 — 2026-08-31 실측 재조정.
-    const DEV_W_CAP: usize = 80 << 30;
+    /// 기본 72GiB — LLM170_W_CAP_GB(바이트 아님, GiB)로 재정의.
+    /// 장문 prefill 실히측: 80GiB면 가중치 83GiB+스크래치가 96GiB를 넘어
+    /// 커널 execution error(2026-09-01). 72+풀 8+스크래치数GiB로 안정 여유.
+    fn w_cap() -> usize {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("LLM170_W_CAP_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(72)
+                .min(88)
+                << 30
+        })
+    }
 
     fn dev_weight(&self, w: &Weight) -> Result<DevWeight, String> {
         let key = w.data.as_ptr() as usize;
@@ -274,7 +307,7 @@ impl<R: Runtime> GpuMatmul<R> {
         }
         // 업로드 총량은 락 아래 누적 카운터로 O(1)
         let total = self.dev_bytes.load(Ordering::Relaxed);
-        let host = total + w.data.len() > Self::DEV_W_CAP;
+        let host = total + w.data.len() > Self::w_cap();
         let h = if host {
             self.dummy.clone()
         } else {
@@ -384,6 +417,12 @@ impl<R: Runtime> GpuMatmul<R> {
         let ckg = self.client.create_from_slice(bytemuck::cast_slice(&cks));
         let cvg = self.client.create_from_slice(bytemuck::cast_slice(cv));
         let mg = self.client.create_from_slice(bytemuck::cast_slice(mask));
+        let up_bytes = (
+            q.len() * 4,
+            cks.len() * 4,
+            cv.len() * 4,
+            mask.len() * 4,
+        );
         let sg = self.acquire_buf(t * n_head * n_past * 4)?;
         let og = self.acquire_buf(t * n_head * hd * 4)?;
         // SAFETY: 두 커널 모두 그리드가 (n_past|hd, n_head, t)를 정확히 덮고
@@ -394,8 +433,8 @@ impl<R: Runtime> GpuMatmul<R> {
                 CubeCount::Static(n_past as u32, n_head as u32, t as u32),
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(qg.clone(), [1].into(), [q.len()].into()),
-                TensorArg::from_raw_parts(ckg, [1].into(), [ck.len()].into()),
-                TensorArg::from_raw_parts(mg, [1].into(), [mask.len()].into()),
+                TensorArg::from_raw_parts(ckg.clone(), [1].into(), [ck.len()].into()),
+                TensorArg::from_raw_parts(mg.clone(), [1].into(), [mask.len()].into()),
                 TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
                 n_past,
                 n_head,
@@ -409,7 +448,7 @@ impl<R: Runtime> GpuMatmul<R> {
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(qg.clone(), [1].into(), [q.len()].into()),
                 TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
-                TensorArg::from_raw_parts(cvg, [1].into(), [cv.len()].into()),
+                TensorArg::from_raw_parts(cvg.clone(), [1].into(), [cv.len()].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_head * hd].into()),
                 n_past,
                 n_head,
@@ -419,7 +458,16 @@ impl<R: Runtime> GpuMatmul<R> {
             );
         }
         let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
-        self.release_bufs(&[(og, t * n_head * hd * 4), (sg, t * n_head * n_past * 4)]);
+        // 휘발 업로드(q/ck/cv/mask)도 drop 대신 풀 반납 — 지연 해제 경합 제거.
+        let (qb, ckb, cvb, mb) = up_bytes;
+        self.release_bufs(&[
+            (qg, qb),
+            (ckg, ckb),
+            (cvg, cvb),
+            (mg, mb),
+            (og, t * n_head * hd * 4),
+            (sg, t * n_head * n_past * 4),
+        ]);
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
 
@@ -563,12 +611,14 @@ impl<R: Runtime> GpuMatmul<R> {
         let xg = self.client.create_from_slice(bytemuck::cast_slice(xf));
         acc(&T_UP, t0.elapsed());
         let t1 = std::time::Instant::now();
-        let (og, pg, ob, pb) = self.launch_gemm(d, xg, t)?;
+        let (og, pg, ob, pb) = self.launch_gemm(d, xg.clone(), t)?;
         acc(&T_LAUNCH, t1.elapsed());
         let t2 = std::time::Instant::now();
         let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
         acc(&T_READ, t2.elapsed());
-        self.release_bufs(&[(og, ob), (pg, pb)]);
+        // xg는 drop 금지 — cubecl 지연 해제가 큐 잔여 연산과 경합해 가비지
+        // 판독(NaN)을 유발(2026-09-01 실측). 풀 반납으로 해제 자체를 제거.
+        self.release_bufs(&[(xg, xf.len() * 4), (og, ob), (pg, pb)]);
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
 }
@@ -633,6 +683,85 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         Ok(())
     }
 
+    /// 짝 GEMM — 가중치마다 다른 1행 x (MoE down). 런치 배치 + 단일 동기화.
+    fn matmul_paired(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        profile_span!("gpu::matmulP");
+        if ws.is_empty() || ws.len() != xs.len() || ws.len() != outs.len() {
+            return Err(format!(
+                "matmul_paired: 형상 불일치 ws={} xs={} outs={}",
+                ws.len(),
+                xs.len(),
+                outs.len()
+            ));
+        }
+        let n_in = ws[0].n_in as usize;
+        if xs.iter().any(|r| r.len() != n_in) {
+            return Err(format!("matmul_paired: x 행 길이 != n_in ({n_in})"));
+        }
+        if ws.iter().any(|w| w.n_in as usize != n_in) {
+            return Err("matmul_paired: 그룹 내 n_in 불일치".into());
+        }
+        // host 폴백은 CPU — dummy 핸들 방지.
+        let mut idx_gpu: Vec<usize> = Vec::new();
+        for (i, w) in ws.iter().enumerate() {
+            let d = self.dev_weight(w)?;
+            if d.host {
+                llm170_core::matmul::matmul(&xs[i], w, &mut outs[i]);
+            } else {
+                idx_gpu.push(i);
+            }
+        }
+        if idx_gpu.is_empty() {
+            return Ok(());
+        }
+        let devs: Vec<DevWeight> = idx_gpu
+            .iter()
+            .map(|&i| self.dev_weight(&ws[i]))
+            .collect::<Result<_, _>>()?;
+        for (d, &i) in devs.iter().zip(idx_gpu.iter()) {
+            if outs[i].len() != d.n_out as usize {
+                return Err("matmul_paired: outs 형상 불일치".into());
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let xgs: Vec<(Handle, usize)> = idx_gpu
+            .iter()
+            .map(|&i| {
+                let (xf, _tlen) = pad_x(std::slice::from_ref(&xs[i]), n_in, 1);
+                let bytes = xf.len() * 4;
+                let h = self.client.create_from_slice(bytemuck::cast_slice(&xf));
+                Ok::<(Handle, usize), String>((h, bytes))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        let pairs: Vec<_> = devs
+            .iter()
+            .zip(xgs.iter().map(|(g, _)| g.clone()))
+            .map(|(d, xg)| self.launch_gemm(d, xg, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let mut to_release: Vec<(Handle, usize)> = Vec::with_capacity(pairs.len() * 3);
+        to_release.extend(xgs.iter().cloned());
+        for (((og, pg, ob, pb), d), &i) in pairs.iter().zip(devs.iter()).zip(idx_gpu.iter()) {
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let res: &[f32] = bytemuck::cast_slice(&raw);
+            outs[i].copy_from_slice(&res[..d.n_out]);
+            to_release.push((og.clone(), *ob));
+            to_release.push((pg.clone(), *pb));
+        }
+        acc(&T_READ, t2.elapsed());
+        self.release_bufs(&to_release);
+        N_OP.fetch_add(devs.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn matmul_group(
         &self,
         xs: &[Vec<f32>],
@@ -651,9 +780,25 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         if ws.iter().any(|w| w.n_in as usize != n_in) {
             return Err("matmul_group: 그룹 내 n_in 불일치".into());
         }
-        let devs: Vec<DevWeight> =
-            ws.iter().map(|w| self.dev_weight(w)).collect::<Result<_, _>>()?;
-        for (d, out) in devs.iter().zip(outs.iter()) {
+        // host 폴백 가중치는 CPU로 — dev_weight가 dummy(4B) 핸들을 주기 때문.
+        let mut idx_gpu: Vec<usize> = Vec::new();
+        for (i, w) in ws.iter().enumerate() {
+            let d = self.dev_weight(w)?;
+            if d.host {
+                llm170_core::matmul::matmul_batch(xs, w, &mut outs[i]);
+            } else {
+                idx_gpu.push(i);
+            }
+        }
+        if idx_gpu.is_empty() {
+            return Ok(());
+        }
+        let devs: Vec<DevWeight> = idx_gpu
+            .iter()
+            .map(|&i| self.dev_weight(&ws[i]))
+            .collect::<Result<_, _>>()?;
+        for (d, &i) in devs.iter().zip(idx_gpu.iter()) {
+            let out = &outs[i];
             if out.len() != t || out.iter().any(|r| r.len() != d.n_out) {
                 return Err("matmul_group: outs 형상 불일치".into());
             }
@@ -665,15 +810,18 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let xg = self.client.create_from_slice(bytemuck::cast_slice(&xf));
         acc(&T_UP, t0.elapsed());
         let t1 = std::time::Instant::now();
-        let pairs: Vec<_> =
-            devs.iter().map(|d| self.launch_gemm(d, xg.clone(), tlen)).collect::<Result<Vec<_>, _>>()?;
+        let pairs: Vec<_> = devs
+            .iter()
+            .map(|d| self.launch_gemm(d, xg.clone(), tlen))
+            .collect::<Result<Vec<_>, _>>()?;
         acc(&T_LAUNCH, t1.elapsed());
         let t2 = std::time::Instant::now();
-        let mut to_release: Vec<(Handle, usize)> = Vec::with_capacity(pairs.len() * 2);
-        for (((og, pg, ob, pb), d), out_rows) in pairs.iter().zip(devs.iter()).zip(outs.iter_mut()) {
+        let mut to_release: Vec<(Handle, usize)> = Vec::with_capacity(pairs.len() * 2 + 1);
+        to_release.push((xg, xf.len() * 4));
+        for (((og, pg, ob, pb), d), &i) in pairs.iter().zip(devs.iter()).zip(idx_gpu.iter()) {
             let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
             let res: &[f32] = bytemuck::cast_slice(&raw);
-            for (ti, out) in out_rows.iter_mut().enumerate() {
+            for (ti, out) in outs[i].iter_mut().enumerate() {
                 out.copy_from_slice(&res[ti * d.n_out..(ti + 1) * d.n_out]);
             }
             to_release.push((og.clone(), *ob));

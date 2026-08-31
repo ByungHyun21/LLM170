@@ -104,6 +104,9 @@ pub struct Model4 {
     pub parts: Vec<PartMap>,
     /// 텐서 이름 → 파트 인덱스·텐서 정보 인덱스
     index: HashMap<String, (usize, usize)>,
+    /// f32 소형 벡터(norm·a·dt_bias·conv 등) 디양자화 캐시 — 호출마다
+    /// 전량 재디양자화하던 것을 1회로 (Send, 단일 엔진 스레드에서만 접근).
+    f32_cache: std::cell::RefCell<HashMap<String, Vec<f32>>>,
     pub token_pieces: Vec<String>,
     pub eos: u32,
 }
@@ -179,7 +182,14 @@ impl Model4 {
             .unwrap_or(0);
         let hp = Hparams4 { vocab, ..hp };
         let eos = hp.ple_eos;
-        let m = Model4 { hp, parts, index, token_pieces, eos };
+        let m = Model4 {
+            hp,
+            parts,
+            index,
+            f32_cache: std::cell::RefCell::new(HashMap::new()),
+            token_pieces,
+            eos,
+        };
         for name in ["token_embd.weight", "output.weight"] {
             m.w(name).ok_or(Q4Error::MissingTensor(name.into()))?;
         }
@@ -289,9 +299,15 @@ impl Model4 {
         self.w(name).ok_or_else(|| Q4Error::MissingTensor(name.into()))
     }
 
-    /// f32 벡터 텐서 디양자화.
+    /// f32 벡터 텐서 디양자화 — 캐시. 대상(norm 가중치 등)은 결정적이라
+    /// 첫 호출 1회 디양자화 후 재사용 (수치 불변).
     pub fn f32_vec4(&self, name: &str) -> Result<Vec<f32>, Q4Error> {
-        Ok(self.w4(name)?.dequant_f32_vec())
+        if let Some(v) = self.f32_cache.borrow().get(name) {
+            return Ok(v.clone());
+        }
+        let v = self.w4(name)?.dequant_f32_vec();
+        self.f32_cache.borrow_mut().insert(name.to_string(), v.clone());
+        Ok(v)
     }
 
     /// 전문가 스택 3D 텐서 [ff, n_embd, n_expert]의 전문가 e 슬라이스 뷰.

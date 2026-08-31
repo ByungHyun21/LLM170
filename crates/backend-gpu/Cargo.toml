@@ -10,4 +10,5 @@ llm170-gguf = { path = "../gguf" }
 cubecl-runtime = "0.10.0"
 cubecl = { version = "0.10.0", features = ["wgpu"] }
 hanzo-cubecl-hip = "0.10.0"
+cubecl-common = "0.10"
 bytemuck = "1"

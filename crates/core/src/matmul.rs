@@ -41,6 +41,10 @@ impl<'a> Weight<'a> {
 /// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
 /// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
 pub trait Accelerator: Send + Sync {
+    /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
+    /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
+    fn barrier(&self) {}
+
     /// outs[t][o] = Σ_i xs[t][i]·W[o,i]
     fn matmul_batch(
         &self,
@@ -66,6 +70,25 @@ pub trait Accelerator: Send + Sync {
         _t: usize,
     ) -> Result<Vec<f32>, String> {
         Err("qsa_attention: 이 가속기는 미지원".into())
+    }
+
+    /// 전문가 down처럼 입력이 가중치마다 다른 1행 짝: outs[i][o] = xs[i]·W_i[o].
+    /// 기본 = 개별 실행. GPU 구현은 런치 배치 + 단일 동기화로 파이프라이닝.
+    fn matmul_paired(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        if ws.len() != xs.len() || ws.len() != outs.len() {
+            return Err(format!("matmul_paired: 형상 불일치 ws={} xs={} outs={}", ws.len(), xs.len(), outs.len()));
+        }
+        for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
+            let mut tmp = vec![vec![0.0f32; w.n_out as usize]; 1];
+            self.matmul_batch(std::slice::from_ref(x), w, &mut tmp)?;
+            o.copy_from_slice(&tmp[0]);
+        }
+        Ok(())
     }
 
     /// 같은 입력 xs를 먹는 프로젝션 그룹: outs[i][t][o] = Σ xs[t]·W_i[o]. 기본 = 개별 실행.

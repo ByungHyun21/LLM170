@@ -498,17 +498,45 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
     enum Holder {
         Q35(Box<llm170_core::model::Model>),
         Q4(Box<llm170_core::qwen4exp::Model4>),
+        /// split 파트 등 hparams 없는 GGUF — mmap만 유지 (raw 텐서 뷰).
+        Raw(memmap2::Mmap, u64),
     }
     let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(&args[0]))
         .ok()
-        .and_then(|g| g.arch().map(|s| s == "qwen4exp"))
+        .map(|g| {
+            g.arch().map(|s| s == "qwen4exp").unwrap_or(false)
+                // split 파트는 general.architecture 없음 — qwen4exp 전용 텐서명으로 판별
+                || g.tensors.iter().any(|t| t.name.contains("shexp") || t.name.contains("indexer"))
+        })
         .unwrap_or(false);
     let holder = if is_q4 {
         match llm170_core::qwen4exp::Model4::load(std::path::Path::new(&args[0])) {
             Ok(m) => Holder::Q4(Box::new(m)),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
+            Err(_) => {
+                // 파트 파일 폴백 — 데이터 영역만 mmap
+                let g = match llm170_gguf::GgufFile::open(std::path::Path::new(&args[0])) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let file = match std::fs::File::open(&args[0]) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // SAFETY: 읽기 전용 매핑 — 수정하지 않는다
+                let mmap = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("error: mmap: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                Holder::Raw(mmap, g.data_offset)
             }
         }
     } else {
@@ -520,9 +548,27 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
             }
         }
     };
+    let raw_w = match &holder {
+        Holder::Raw(mmap, off) => {
+            let g = llm170_gguf::GgufFile::open(std::path::Path::new(&args[0])).ok();
+            let ti = g.as_ref().and_then(|g| g.tensors.iter().position(|t| t.name == args[1]));
+            ti.map(|ti| {
+                let t = &g.as_ref().unwrap().tensors[ti];
+                let (start, end) = t.file_range(*off).unwrap();
+                llm170_core::matmul::Weight {
+                    data: &mmap[start as usize..end as usize],
+                    ty: t.ty,
+                    n_in: t.ne[0],
+                    n_out: t.ne[1] * t.ne[2] * t.ne[3],
+                }
+            })
+        }
+        _ => None,
+    };
     let w = match &holder {
         Holder::Q35(m) => m.w(&args[1]),
         Holder::Q4(m) => m.w(&args[1]),
+        Holder::Raw(..) => raw_w,
     };
     let Some(w) = w else {
         eprintln!("tensor not found: {}", args[1]);
@@ -545,6 +591,25 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
     };
     let mut xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    // LLM170_X_FILE: 엔진 실패 지점에서 덤프한 실제 활성값으로 재생 (비트 단위 재현)
+    if let Ok(xf) = std::env::var("LLM170_X_FILE") {
+        let raw = std::fs::read(&xf).unwrap_or_default();
+        if raw.len() >= 16 {
+            let tt = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+            let nn = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
+            eprintln!("# x 재생: t={tt} n_in={nn} (요청 t={t} n_in={n_in})");
+            xs = (0..tt)
+                .map(|ti| {
+                    let b = 16 + ti * nn * 4;
+                    (0..nn)
+                        .map(|i| {
+                            f32::from_le_bytes(raw[b + i * 4..b + i * 4 + 4].try_into().unwrap())
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+    }
     // LLM170_UNIT=<i>: 단위 벡터 e_i → out[o] = W[o,i] 디양자화 값 프로브
     if let Ok(u) = std::env::var("LLM170_UNIT") {
         let u: usize = u.parse().unwrap();

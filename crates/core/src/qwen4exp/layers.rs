@@ -103,6 +103,24 @@ impl Engine4 {
         }
     }
 
+    /// 짝 디스패치 — 가중치마다 다른 1행 입력 (MoE down). 가속기 없으면 CPU 개별.
+    fn mm_paired(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[crate::matmul::Weight],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), Q4Error> {
+        match self.acc.as_deref() {
+            Some(a) => a.matmul_paired(xs, ws, outs).map_err(Q4Error::Io),
+            None => {
+                for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
+                    matmul(x, w, o);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// 그룹 디스패치 — 동일 입력 복수 가중치. 가속기 없으면 CPU 개별.
     fn mm_group(
         &self,
@@ -200,6 +218,15 @@ impl Engine4 {
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
         let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+        // NaN 조기 국소화 — 발산 층·스테이지를 즉시 보고 (LLM170_Q4_TRACE).
+        let nan_guard = |v: &[Vec<f32>], tag: &str, il: usize| {
+            for (ti, row) in v.iter().enumerate() {
+                if row.iter().any(|x| !x.is_finite()) {
+                    eprintln!("# NaN발견 layer={il} {tag} token={ti} t={}", row.len());
+                    std::process::exit(101);
+                }
+            }
+        };
         for il in 0..hp.n_layer {
             if trace {
                 eprintln!("q4 layer {il} t={t_len}");
@@ -217,10 +244,25 @@ impl Engine4 {
                 full_idx += 1;
                 o
             };
+            if trace {
+                nan_guard(&attn_out, if hp.is_recr(il) { "gdn_out" } else { "qsa_out" }, il);
+            }
             hc_combine(&mut res_hc, &attn_out, &inject, hc);
 
             let (mix2, inject2) = stage!(hc, self.hc_mix(il, "ffn", &res_hc)?);
+            if trace {
+                nan_guard(&mix2, "hc_ffn_mix", il);
+                // 값 폭발 추적 — max|x| (Inf 직전 값도 is_finite 통과)
+                let mx = mix2
+                    .iter()
+                    .flat_map(|r| r.iter())
+                    .fold(0.0f32, |a, &v| if v.abs() > a { v.abs() } else { a });
+                eprintln!("# layer {il} hc_ffn_mix max|x|={mx:.3e} t={t_len}");
+            }
             let ffn_out = stage!(moe, self.moe_ffn(il, &mix2)?);
+            if trace {
+                nan_guard(&ffn_out, "moe_out", il);
+            }
             hc_combine(&mut res_hc, &ffn_out, &inject2, hc);
         }
 
@@ -265,9 +307,19 @@ impl Engine4 {
             }
             xn_all.push(xn);
         }
-        // 2) 저랭크 down → silu(lo/hc) → up → 게이트 — 배치 1회씩
+        // 2) 저랭크 down → silu(lo/hc) → up → 게이트.
+        // down·inject는 동일 입력 xn_all — 그룹 1호출 (왕복 3→2).
         let mut lo_all = vec![vec![0.0f32; w_down.n_out as usize]; t];
-        self.mm_batch(&xn_all, &w_down, &mut lo_all)?;
+        let mut inject_all = vec![vec![0.0f32; hc]; t];
+        {
+            let mut gi = vec![
+                std::mem::take(&mut lo_all),
+                std::mem::take(&mut inject_all),
+            ];
+            self.mm_group(&xn_all, &[w_down, w_inject], &mut gi)?;
+            lo_all = std::mem::take(&mut gi[0]);
+            inject_all = std::mem::take(&mut gi[1]);
+        }
         for lo in lo_all.iter_mut() {
             for v in lo.iter_mut() {
                 *v = silu(*v / hc as f32);
@@ -275,8 +327,6 @@ impl Engine4 {
         }
         let mut gate_all = vec![vec![0.0f32; hc_dim]; t];
         self.mm_batch(&lo_all, &w_up, &mut gate_all)?;
-        let mut inject_all = vec![vec![0.0f32; hc]; t];
-        self.mm_batch(&xn_all, &w_inject, &mut inject_all)?;
         // 3) 게이트 적용 + 스트림 평균
         let mut mixed: Vec<Vec<f32>> = Vec::with_capacity(t);
         for (gate, xn) in gate_all.iter_mut().zip(xn_all.iter()) {
@@ -369,14 +419,24 @@ impl Engine4 {
         let ssm_norm_w = self.model.f32_vec4(&format!("blk.{il}.ssm_norm.weight"))?;
         let wout = self.model.w4(&format!("blk.{il}.ssm_out.weight"))?;
 
+        // qkv/gate/beta/alpha는 동일 입력 xs — 그룹 1호출 (왕복 4→1).
         let mut qkv = vec![vec![0.0f32; conv_ch]; n_tok];
-        self.mm_batch(xs, &wqkv, &mut qkv)?;
         let mut z = vec![vec![0.0f32; d_inner]; n_tok];
-        self.mm_batch(xs, &wgate, &mut z)?;
         let mut b = vec![vec![0.0f32; dt_rank]; n_tok];
-        self.mm_batch(xs, &wbeta, &mut b)?;
         let mut a = vec![vec![0.0f32; dt_rank]; n_tok];
-        self.mm_batch(xs, &walpha, &mut a)?;
+        {
+            let mut gi = vec![
+                std::mem::take(&mut qkv),
+                std::mem::take(&mut z),
+                std::mem::take(&mut b),
+                std::mem::take(&mut a),
+            ];
+            self.mm_group(xs, &[wqkv, wgate, wbeta, walpha], &mut gi)?;
+            qkv = std::mem::take(&mut gi[0]);
+            z = std::mem::take(&mut gi[1]);
+            b = std::mem::take(&mut gi[2]);
+            a = std::mem::take(&mut gi[3]);
+        }
 
         let mut beta_all = vec![0.0f32; n_tok * dt_rank];
         let mut g_all = vec![0.0f32; n_tok * dt_rank];
@@ -478,16 +538,27 @@ impl Engine4 {
         let w_ik = self.model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
 
         let n_tok = t_len;
+        // q/k/v/iq/ik는 동일 입력 xs — 그룹 1호출 (왕복 5→1).
         let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
-        self.mm_batch(xs, &wq, &mut qg)?;
         let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
-        self.mm_batch(xs, &wk, &mut kk)?;
         let mut vv = vec![vec![0.0f32; wv.n_out as usize]; n_tok];
-        self.mm_batch(xs, &wv, &mut vv)?;
         let mut iq = vec![vec![0.0f32; w_iq.n_out as usize]; n_tok];
-        self.mm_batch(xs, &w_iq, &mut iq)?;
         let mut ik = vec![vec![0.0f32; w_ik.n_out as usize]; n_tok];
-        self.mm_batch(xs, &w_ik, &mut ik)?;
+        {
+            let mut gi = vec![
+                std::mem::take(&mut qg),
+                std::mem::take(&mut kk),
+                std::mem::take(&mut vv),
+                std::mem::take(&mut iq),
+                std::mem::take(&mut ik),
+            ];
+            self.mm_group(xs, &[wq, wk, wv, w_iq, w_ik], &mut gi)?;
+            qg = std::mem::take(&mut gi[0]);
+            kk = std::mem::take(&mut gi[1]);
+            vv = std::mem::take(&mut gi[2]);
+            iq = std::mem::take(&mut gi[3]);
+            ik = std::mem::take(&mut gi[4]);
+        }
 
         let kq_scale = hp.kq_scale();
         let pos0 = self.seqs[seq].pos;
@@ -644,8 +715,10 @@ impl Engine4 {
                         masku32.push((p < n_past && mask_all[t][p]) as u32);
                     }
                 }
-                let ck = self.seqs[seq].kv_k[full_idx].clone();
-                let cv = self.seqs[seq].kv_v[full_idx].clone();
+                // 전체 ctx clone은 디코드 스텝당 ~800MB 복사 — 사용 prefix만.
+                let kn = n_past_max * n_kv * hd;
+                let ck = self.seqs[seq].kv_k[full_idx][..kn].to_vec();
+                let cv = self.seqs[seq].kv_v[full_idx][..kn].to_vec();
                 let res = acc
                     .qsa_attention(
                         &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
@@ -712,9 +785,15 @@ impl Engine4 {
 
         // 3) 전문가별 서브배치 — 512×3 배치 GEMM (빈 전문가 스킵)
         let mut out = vec![vec![0.0f32; n_embd]; t];
+        let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+        if trace && route.iter().flatten().any(|x| !x.is_finite()) {
+            eprintln!("# NaN route logits (입력은 finite여야 함)");
+            std::process::exit(101);
+        }
         // 디코드 t=1 빠른 경로: 선택 전문가들의 gate·up가 동일 입력 — 그룹 1호출로
         // 2×n_used회 왕복을 1회로 (실측 병목: 전문가당 GPU 왕복 1,440회/스텝).
-        if t == 1 {
+        let nofast = std::env::var_os("LLM170_Q4_NOFAST").is_some();
+        if t == 1 && !nofast {
             let sel: Vec<usize> = (0..n_exp).filter(|&e| !by_expert[e].is_empty()).collect();
             let n_sel = sel.len();
             let mut gate_y = vec![vec![0.0f32; n_ff]; n_sel];
@@ -742,21 +821,33 @@ impl Engine4 {
                     r[i] *= u[i];
                 }
             }
-            for (k, &e) in sel.iter().enumerate() {
-                let wd = self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
-                let (ti, w) = by_expert[e][0];
-                let mut eo = vec![0.0f32; n_embd];
-                self.mm(&gate_y[k], &wd, &mut eo)?;
-                let o = &mut out[ti];
-                for i in 0..n_embd {
-                    o[i] += w * eo[i];
+            {
+                let mut wds = Vec::with_capacity(n_sel);
+                for &e in &sel {
+                    wds.push(self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?);
+                }
+                let mut eos = vec![vec![0.0f32; n_embd]; n_sel];
+                self.mm_paired(&gate_y[..n_sel], &wds, &mut eos)?;
+                for (k, &e) in sel.iter().enumerate() {
+                    let (ti, w) = by_expert[e][0];
+                    let o = &mut out[ti];
+                    for i in 0..n_embd {
+                        o[i] += w * eos[k][i];
+                    }
                 }
             }
-            // shared 전문가 배치 (기존 경로 공유) — 아래 일반 경로 shared 블록으로
+            // shared 전문가 — gate·up 동일 입력 xs 그룹 1호출
             let mut sh_gate_y = vec![vec![0.0f32; n_ff]; t];
             let mut sh_up_y = vec![vec![0.0f32; n_ff]; t];
-            self.mm_batch(xs, &sh_gate, &mut sh_gate_y)?;
-            self.mm_batch(xs, &sh_up, &mut sh_up_y)?;
+            {
+                let mut gi = vec![
+                    std::mem::take(&mut sh_gate_y),
+                    std::mem::take(&mut sh_up_y),
+                ];
+                self.mm_group(xs, &[sh_gate, sh_up], &mut gi)?;
+                sh_gate_y = std::mem::take(&mut gi[0]);
+                sh_up_y = std::mem::take(&mut gi[1]);
+            }
             for r in sh_gate_y.iter_mut() {
                 for i in 0..n_ff {
                     r[i] = silu(r[i]);
@@ -802,6 +893,16 @@ impl Engine4 {
             }
             let mut eout = vec![vec![0.0f32; n_embd]; list.len()];
             self.mm_batch(&gate_y, &wd, &mut eout)?;
+            if trace {
+                if gate_y.iter().flatten().any(|x| !x.is_finite()) {
+                    eprintln!("# NaN expert e={e} gate_y (t={})", gate_y.len());
+                    std::process::exit(101);
+                }
+                if eout.iter().flatten().any(|x| !x.is_finite()) {
+                    eprintln!("# NaN expert e={e} eout");
+                    std::process::exit(101);
+                }
+            }
             for ((ti, w), eo) in list.iter().zip(eout.iter()) {
                 let o = &mut out[*ti];
                 for i in 0..n_embd {
@@ -810,11 +911,18 @@ impl Engine4 {
             }
         }
 
-        // 4) shared 전문가 — 전 토큰 배치
+        // 4) shared 전문가 — 전 토큰 배치, gate·up 동일 입력 그룹 1호출
         let mut sh_gate_y = vec![vec![0.0f32; n_ff]; t];
         let mut sh_up_y = vec![vec![0.0f32; n_ff]; t];
-        self.mm_batch(xs, &sh_gate, &mut sh_gate_y)?;
-        self.mm_batch(xs, &sh_up, &mut sh_up_y)?;
+        {
+            let mut gi = vec![
+                std::mem::take(&mut sh_gate_y),
+                std::mem::take(&mut sh_up_y),
+            ];
+            self.mm_group(xs, &[sh_gate, sh_up], &mut gi)?;
+            sh_gate_y = std::mem::take(&mut gi[0]);
+            sh_up_y = std::mem::take(&mut gi[1]);
+        }
         for r in sh_gate_y.iter_mut() {
             for i in 0..n_ff {
                 r[i] = silu(r[i]);
@@ -827,6 +935,27 @@ impl Engine4 {
         }
         let mut shout = vec![vec![0.0f32; n_embd]; t];
         self.mm_batch(&sh_gate_y, &sh_down, &mut shout)?;
+        if trace {
+            if sh_gate_y.iter().flatten().any(|x| !x.is_finite()) {
+                eprintln!("# NaN shared sh_gate_y t={t}");
+                // 재현 덤프: 입력 xs 비트 + 층 정보
+                let mut buf: Vec<u8> = Vec::with_capacity(8 + t * n_embd * 4);
+                buf.extend_from_slice(&(t as u64).to_le_bytes());
+                buf.extend_from_slice(&(n_embd as u64).to_le_bytes());
+                for row in xs {
+                    for v in row {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                let _ = std::fs::write("/tmp/q4_nan_dump.bin", buf);
+                eprintln!("# xs 덤프 → /tmp/q4_nan_dump.bin (layer {il})");
+                std::process::exit(101);
+            }
+            if shout.iter().flatten().any(|x| !x.is_finite()) {
+                eprintln!("# NaN shared shout t={t}");
+                std::process::exit(101);
+            }
+        }
         for (ti, o) in out.iter_mut().enumerate() {
             let sh_w = sigmoid(sgate_all[ti][0]);
             for i in 0..n_embd {
@@ -1048,9 +1177,14 @@ impl Engine4 {
     /// 1024토큰 청크로 분할 — 단일 초대형 forward는 libamdhip64 GPF 트리거
     /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
-        const CHUNK: usize = 1024;
+        // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024).
+        let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024)
+            .clamp(16, 1024);
         let mut last = None;
-        for ch in tokens.chunks(CHUNK) {
+        for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
             let logits = self.forward_timed(seq, ch, tm.as_mut())?;
             if let Some(t) = &tm {

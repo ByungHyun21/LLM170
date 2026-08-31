@@ -1804,6 +1804,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cubecl",
+ "cubecl-common",
  "cubecl-runtime",
  "hanzo-cubecl-hip",
  "llm170-core",
@@ -1839,6 +1840,7 @@ dependencies = [
  "llm170-core",
  "llm170-gguf",
  "llm170-profiler",
+ "memmap2",
 ]
 
 [[package]]
