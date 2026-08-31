@@ -475,6 +475,9 @@ impl Engine4 {
         let pos0 = self.seqs[seq].pos;
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
+        let n_past_max = (pos0 as usize) + t_len;
+        let gpu_attn = self.acc.is_some();
+        let mut mask_all: Vec<Vec<bool>> = vec![vec![false; n_past_max]; n_tok];
 
         let seq_state = &mut self.seqs[seq];
         for t in 0..t_len {
@@ -555,24 +558,35 @@ impl Engine4 {
                 }
             }
 
-            // 마스크 밀집 GQA + 게이트
-            let mut attn_out = std::mem::take(&mut attn_all[t]);
+            // q norm·rope를 qg에 즉시 적용 (attention은 루프 후 일괄)
             for h in 0..n_head {
                 let src = qg[t][h * 2 * hd..h * 2 * hd + hd].to_vec();
                 let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
                 rope_head(&mut qh, pos, n_rot, hp.rope_base);
+                for (a, b) in qh.iter().zip(qg[t][h * 2 * hd..h * 2 * hd + hd].iter_mut()) {
+                    *b = *a;
+                }
+            }
+            mask_all[t] = mask;
+
+            // 마스크 밀집 GQA + 게이트 — acc 있으면 루프 후 GPU 일괄, 없으면 즉시 CPU
+            if gpu_attn {
+                continue;
+            }
+            let mut attn_out = std::mem::take(&mut attn_all[t]);
+            for h in 0..n_head {
                 let kvh = h / (n_head / n_kv);
                 let mut maxv = f32::NEG_INFINITY;
                 let mut scores = vec![0.0f32; n_past];
                 for (p, sc) in scores.iter_mut().enumerate() {
-                    if !mask[p] {
+                    if !mask_all[t][p] {
                         *sc = f32::NEG_INFINITY;
                         continue;
                     }
                     let b = p * n_kv * hd + kvh * hd;
                     let mut d = 0.0f32;
                     for i in 0..hd {
-                        d += qh[i] * cache_k[b + i];
+                        d += qg[t][h * 2 * hd + i] * cache_k[b + i];
                     }
                     *sc = d * kq_scale;
                     maxv = maxv.max(*sc);
@@ -599,6 +613,31 @@ impl Engine4 {
                 }
             }
             attn_all[t] = attn_out;
+        }
+        // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
+        // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
+        if gpu_attn {
+            if let Some(acc) = self.acc.as_deref() {
+                let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
+                let mut masku32: Vec<u32> = Vec::with_capacity(n_tok * n_past_max);
+                for t in 0..t_len {
+                    let n_past = (pos0 as usize) + t + 1;
+                    for p in 0..n_past_max {
+                        masku32.push((p < n_past && mask_all[t][p]) as u32);
+                    }
+                }
+                let ck = self.seqs[seq].kv_k[full_idx].clone();
+                let cv = self.seqs[seq].kv_v[full_idx].clone();
+                let res = acc
+                    .qsa_attention(
+                        &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
+                        &masku32, kq_scale, n_past_max, n_head, n_kv, hd, n_tok,
+                    )
+                    .map_err(Q4Error::Io)?;
+                for (t, row) in attn_all.iter_mut().enumerate() {
+                    row.copy_from_slice(&res[t * n_head * hd..(t + 1) * n_head * hd]);
+                }
+            }
         }
         self.mm_batch(&attn_all, &wo, &mut out)?;
         Ok(out)

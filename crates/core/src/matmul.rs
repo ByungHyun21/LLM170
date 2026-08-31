@@ -50,6 +50,24 @@ pub trait Accelerator: Send + Sync {
     ) -> Result<(), String>;
     /// out[o] = Σ_i x[i]·W[o,i]
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
+    /// QSA 마스크드 밀집 GQA (GPU 전용 — 기본 미지원).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention(
+        &self,
+        _q: &[f32],
+        _ck: &[f32],
+        _cv: &[f32],
+        _mask: &[u32],
+        _kq_scale: f32,
+        _n_past: usize,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+    ) -> Result<Vec<f32>, String> {
+        Err("qsa_attention: 이 가속기는 미지원".into())
+    }
+
     /// 같은 입력 xs를 먹는 프로젝션 그룹: outs[i][t][o] = Σ xs[t]·W_i[o]. 기본 = 개별 실행.
     /// GPU 구현은 x 업로드 1회 + 런치 배치 + 단일 동기화로 파이프라이닝.
     fn matmul_group(

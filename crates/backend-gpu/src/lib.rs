@@ -10,6 +10,7 @@
 use cubecl::prelude::*;
 
 mod gemm2;
+mod attn;
 use cubecl::zspace::{Shape, Strides};
 use cubecl_runtime::server::Handle;
 use llm170_core::matmul::{Accelerator, Weight};
@@ -358,6 +359,69 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
 
+    /// QSA 마스크드 밀집 GQA — GPU 상주 (attn::qsa_score + qsa_mix).
+    /// q: [t][n_head*2*hd] (norm·rope 완료, q‖gate 인터리브),
+    /// ck/cv: 캐시 [n_past*n_kv*hd], mask: [t*n_past] u32 0/1,
+    /// 반환 out: [t][n_head*hd] 게이트 적용 완료.
+    fn qsa_attention_inner(
+        &self,
+        q: &[f32],
+        ck: &[f32],
+        cv: &[f32],
+        mask: &[u32],
+        kq_scale: f32,
+        n_past: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        // kq_scale을 ck에 사전 곱 (커널 f32 스칼라 인수 미지원) — q에 곱하면
+        // q‖gate 인터리브에서 게이트까지 오염됨 (실측 2026-08-31)
+        let cks: Vec<f32> = ck.iter().map(|v| v * kq_scale).collect();
+        let qg = self.client.create_from_slice(bytemuck::cast_slice(q));
+        let ckg = self.client.create_from_slice(bytemuck::cast_slice(&cks));
+        let cvg = self.client.create_from_slice(bytemuck::cast_slice(cv));
+        let mg = self.client.create_from_slice(bytemuck::cast_slice(mask));
+        let sg = self.acquire_buf(t * n_head * n_past * 4)?;
+        let og = self.acquire_buf(t * n_head * hd * 4)?;
+        // SAFETY: 두 커널 모두 그리드가 (n_past|hd, n_head, t)를 정확히 덮고
+        // 시작부 범위 가드 — 인덱스 상한 내, 무한루프 없음.
+        unsafe {
+            attn::qsa_score::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_past as u32, n_head as u32, t as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [q.len()].into()),
+                TensorArg::from_raw_parts(ckg, [1].into(), [ck.len()].into()),
+                TensorArg::from_raw_parts(mg, [1].into(), [mask.len()].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
+                n_past,
+                n_head,
+                n_kv,
+                hd,
+                t,
+            );
+            attn::qsa_mix::launch_unchecked(
+                &self.client,
+                CubeCount::Static(hd as u32, n_head as u32, t as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [q.len()].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
+                TensorArg::from_raw_parts(cvg, [1].into(), [cv.len()].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_head * hd].into()),
+                n_past,
+                n_head,
+                n_kv,
+                hd,
+                t,
+            );
+        }
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        self.release_bufs(&[(og, t * n_head * hd * 4), (sg, t * n_head * n_past * 4)]);
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
     /// 디버그: 텐서 블록 0 요소별 디양자화 값 (gpu-de).
     pub fn debug_dequant_block(&self, w: &Weight) -> Result<Vec<f32>, String> {
         let d = self.dev_weight(w)?;
@@ -509,6 +573,22 @@ impl<R: Runtime> GpuMatmul<R> {
 }
 
 impl<R: Runtime> Accelerator for GpuMatmul<R> {
+    fn qsa_attention(
+        &self,
+        q: &[f32],
+        ck: &[f32],
+        cv: &[f32],
+        mask: &[u32],
+        kq_scale: f32,
+        n_past: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.qsa_attention_inner(q, ck, cv, mask, kq_scale, n_past, n_head, n_kv, hd, t)
+    }
+
     fn matmul_batch(
         &self,
         xs: &[Vec<f32>],
