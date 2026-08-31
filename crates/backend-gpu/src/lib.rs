@@ -258,9 +258,10 @@ impl<R: Runtime> GpuMatmul<R> {
         }
     }
 
-    /// 가중치 상주 예산 — 초과분은 호스트 연산(qwen4exp 전문가 스택 84GB가
-    /// VRAM 96GB를 초과, page fault 실측 2026-08-31).
-    const DEV_W_CAP: usize = 16 << 30;
+    /// 가중치 상주 예산 — 초과분은 호스트 연산. PLE(26.8GB)은 애초에 matmul
+    /// 대상이 아니고 본체+전문가 ~83GB는 96GB VRAM에 들어감(llama.cpp와 동일
+    /// 배치). GPF 원인은 청킹 부재였고 해소됨 — 2026-08-31 실측 재조정.
+    const DEV_W_CAP: usize = 80 << 30;
 
     fn dev_weight(&self, w: &Weight) -> Result<DevWeight, String> {
         let key = w.data.as_ptr() as usize;

@@ -71,7 +71,7 @@ pub struct Q4Timings {
 impl Q4Timings {
     fn report(&self, tag: &str) {
         eprintln!(
-            "# q4-timing {tag}: hc={:.0}µs gdn={:.0}µs qsa={:.0}µs moe={:.0}µs ple={:.0}µs head={:.0}µs",
+            "# q4-timing {tag}: hc={:.0}ms gdn={:.0}ms qsa={:.0}ms moe={:.0}ms ple={:.0}ms head={:.0}ms",
             self.hc as f64 / 1e3,
             self.gdn as f64 / 1e3,
             self.qsa as f64 / 1e3,
@@ -98,6 +98,24 @@ impl Engine4 {
             Some(a) => a.matmul(x, w, out).map_err(Q4Error::Io),
             None => {
                 matmul(x, w, out);
+                Ok(())
+            }
+        }
+    }
+
+    /// 그룹 디스패치 — 동일 입력 복수 가중치. 가속기 없으면 CPU 개별.
+    fn mm_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[crate::matmul::Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), Q4Error> {
+        match self.acc.as_deref() {
+            Some(a) => a.matmul_group(xs, ws, outs).map_err(Q4Error::Io),
+            None => {
+                for (w, o) in ws.iter().zip(outs.iter_mut()) {
+                    matmul_batch(xs, w, o);
+                }
                 Ok(())
             }
         }
@@ -694,6 +712,71 @@ impl Engine4 {
 
         // 3) 전문가별 서브배치 — 512×3 배치 GEMM (빈 전문가 스킵)
         let mut out = vec![vec![0.0f32; n_embd]; t];
+        // 디코드 t=1 빠른 경로: 선택 전문가들의 gate·up가 동일 입력 — 그룹 1호출로
+        // 2×n_used회 왕복을 1회로 (실측 병목: 전문가당 GPU 왕복 1,440회/스텝).
+        if t == 1 {
+            let sel: Vec<usize> = (0..n_exp).filter(|&e| !by_expert[e].is_empty()).collect();
+            let n_sel = sel.len();
+            let mut gate_y = vec![vec![0.0f32; n_ff]; n_sel];
+            let mut up_y = vec![vec![0.0f32; n_ff]; n_sel];
+            {
+                let mut ws: Vec<crate::matmul::Weight> = Vec::with_capacity(2 * n_sel);
+                for &e in &sel {
+                    ws.push(self.model.expert_w(&format!("blk.{il}.ffn_gate_exps.weight"), e)?);
+                    ws.push(self.model.expert_w(&format!("blk.{il}.ffn_up_exps.weight"), e)?);
+                }
+                let mut gu: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0f32; n_ff]; 1]; 2 * n_sel];
+                self.mm_group(xs, &ws, &mut gu)?;
+                for i in 0..n_sel {
+                    gate_y[i] = gu[2 * i][0].clone();
+                    up_y[i] = gu[2 * i + 1][0].clone();
+                }
+            }
+            for r in gate_y.iter_mut() {
+                for i in 0..n_ff {
+                    r[i] = silu(r[i]);
+                }
+            }
+            for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
+                for i in 0..n_ff {
+                    r[i] *= u[i];
+                }
+            }
+            for (k, &e) in sel.iter().enumerate() {
+                let wd = self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
+                let (ti, w) = by_expert[e][0];
+                let mut eo = vec![0.0f32; n_embd];
+                self.mm(&gate_y[k], &wd, &mut eo)?;
+                let o = &mut out[ti];
+                for i in 0..n_embd {
+                    o[i] += w * eo[i];
+                }
+            }
+            // shared 전문가 배치 (기존 경로 공유) — 아래 일반 경로 shared 블록으로
+            let mut sh_gate_y = vec![vec![0.0f32; n_ff]; t];
+            let mut sh_up_y = vec![vec![0.0f32; n_ff]; t];
+            self.mm_batch(xs, &sh_gate, &mut sh_gate_y)?;
+            self.mm_batch(xs, &sh_up, &mut sh_up_y)?;
+            for r in sh_gate_y.iter_mut() {
+                for i in 0..n_ff {
+                    r[i] = silu(r[i]);
+                }
+            }
+            for (r, u) in sh_gate_y.iter_mut().zip(sh_up_y.iter()) {
+                for i in 0..n_ff {
+                    r[i] *= u[i];
+                }
+            }
+            let mut shout = vec![vec![0.0f32; n_embd]; t];
+            self.mm_batch(&sh_gate_y, &sh_down, &mut shout)?;
+            for (ti, o) in out.iter_mut().enumerate() {
+                let sh_w = sigmoid(sgate_all[ti][0]);
+                for i in 0..n_embd {
+                    o[i] += sh_w * shout[ti][i];
+                }
+            }
+            return Ok(out);
+        }
         for e in 0..n_exp {
             let list = &by_expert[e];
             if list.is_empty() {
@@ -702,7 +785,6 @@ impl Engine4 {
             let sub: Vec<Vec<f32>> = list.iter().map(|&(ti, _)| xs[ti].clone()).collect();
             let mut gate_y = vec![vec![0.0f32; n_ff]; list.len()];
             let mut up_y = vec![vec![0.0f32; n_ff]; list.len()];
-            // gate·up 동일 입력 — 개별 배치 (그룹 API는 나중)
             let wg = self.model.expert_w(&format!("blk.{il}.ffn_gate_exps.weight"), e)?;
             let wu = self.model.expert_w(&format!("blk.{il}.ffn_up_exps.weight"), e)?;
             let wd = self.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
