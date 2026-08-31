@@ -165,6 +165,8 @@ struct DevWeight {
     n_in: usize,
     n_out: usize,
     bytes: usize,
+    /// 업로드 예산 초과로 호스트 연산 폴백 (핸들 무효).
+    host: bool,
 }
 
 /// GPU matmul 가속기 — 런타임 제네릭(HIP 또는 wgpu/Vulkan).
@@ -172,6 +174,10 @@ struct DevWeight {
 pub struct GpuMatmul<R: Runtime> {
     client: ComputeClient<R>,
     weights: Mutex<HashMap<usize, DevWeight>>,
+    /// 호스트 폴백용 공유 더미 핸들 (전문가 수만 개의 4B 할당 방지).
+    dummy: Handle,
+    /// 업로드된 가중치 총 바이트 (예산 추적).
+    dev_bytes: std::sync::atomic::AtomicUsize,
     /// 크기별 재사용 스크래치/아웃 버퍼 풀(스택) — hipMalloc churn 방지.
     /// 인플라이트 중 재할당 방지: 획득은 pop(비면 alloc), read 동기화 후 반납.
     bufs: Mutex<HashMap<usize, Vec<Handle>>>,
@@ -206,6 +212,14 @@ impl GpuMatmul<cubecl::wgpu::WgpuRuntime> {
 
 impl<R: Runtime> GpuMatmul<R> {
     fn with_client(client: ComputeClient<R>) -> Result<Self, String> {
+        // 워크어라운드(2026-08-31): 장문 혼합 워크로드에서 DSD 스레드의
+        // hipHccModuleLaunchKernel이 GPF(고정 IP, libamdhip64 7.2.2) — 런치와
+        // 병행 할당의 경합 의심. 동기 런치로 소멸 실측(런치당 ~0.1ms).
+        // LLM170_HIP_ASYNC=1이면 비활성(재현·재검증용).
+        if std::env::var_os("LLM170_HIP_ASYNC").is_none() {
+            // SAFETY: 모든 스레드 시작 전 초기화 경로에서 1회 — 경합 없음
+            unsafe { std::env::set_var("HIP_LAUNCH_BLOCKING", "1") };
+        }
         let ktab: Vec<f32> = llm170_core::KVALUES_IQ4NL
             .iter()
             .map(|&v| v as f32)
@@ -213,10 +227,13 @@ impl<R: Runtime> GpuMatmul<R> {
         let grid3 = llm170_core::IQ3S_GRID;
         let ktab = client.create_from_slice(bytemuck::cast_slice(&ktab));
         let grid3 = client.create_from_slice(bytemuck::cast_slice(&grid3));
+        let dummy = client.empty(4);
         Ok(GpuMatmul {
             client,
             weights: Mutex::new(HashMap::new()),
             bufs: Mutex::new(HashMap::new()),
+            dummy,
+            dev_bytes: std::sync::atomic::AtomicUsize::new(0),
             ktab,
             grid3,
         })
@@ -240,6 +257,10 @@ impl<R: Runtime> GpuMatmul<R> {
         }
     }
 
+    /// 가중치 상주 예산 — 초과분은 호스트 연산(qwen4exp 전문가 스택 84GB가
+    /// VRAM 96GB를 초과, page fault 실측 2026-08-31).
+    const DEV_W_CAP: usize = 16 << 30;
+
     fn dev_weight(&self, w: &Weight) -> Result<DevWeight, String> {
         let key = w.data.as_ptr() as usize;
         let mut map = self
@@ -249,18 +270,29 @@ impl<R: Runtime> GpuMatmul<R> {
         if let Some(d) = map.get(&key) {
             return Ok(d.clone());
         }
-        // WGSL에 u8이 없어 u32 워드로 운반 (byte() 헬퍼가 언팩). 4바이트 정렬 필수.
-        if w.data.len() % 4 != 0 {
-            return Err(format!("tensor bytes {} not 4-byte aligned", w.data.len()));
-        }
-        let h = self.client.create_from_slice(w.data);
+        // 업로드 총량은 락 아래 누적 카운터로 O(1)
+        let total = self.dev_bytes.load(Ordering::Relaxed);
+        let host = total + w.data.len() > Self::DEV_W_CAP;
+        let h = if host {
+            self.dummy.clone()
+        } else {
+            // WGSL에 u8이 없어 u32 워드로 운반 (byte() 헬퍼가 언팩). 4바이트 정렬 필수.
+            if w.data.len() % 4 != 0 {
+                return Err(format!("tensor bytes {} not 4-byte aligned", w.data.len()));
+            }
+            self.client.create_from_slice(w.data)
+        };
         let d = DevWeight {
             h,
             ty: w.ty,
             n_in: w.n_in as usize,
             n_out: w.n_out as usize,
             bytes: w.data.len() / 4,
+            host,
         };
+        if !host {
+            self.dev_bytes.fetch_add(w.data.len(), Ordering::Relaxed);
+        }
         map.insert(key, d.clone());
         Ok(d)
     }
@@ -395,16 +427,14 @@ impl<R: Runtime> GpuMatmul<R> {
     fn launch_gemm(&self, d: &DevWeight, xg: Handle, t: usize) -> Result<(Handle, Handle, usize, usize), String> {
         let (n_in, n_out) = (d.n_in, d.n_out);
         // 스크래치 예산 3GiB(q4 prefill) — decode는 512MiB {64,16,4}
-        let slices: usize = if t <= 8 {
-            if t * n_out * 64 * 4 <= 512 << 20 {
-                64
-            } else if t * n_out * 16 * 4 <= 512 << 20 {
-                16
-            } else {
-                4
-            }
+        // part 스크래치 예산 512MiB — q2/q4 공용. 대형 t에서 slices=64는
+        // 텐서당 수 GB를 잡아 VRAM 초과 fault 유도(2026-08-31 실측).
+        let slices: usize = if t * n_out * 64 * 4 <= 512 << 20 {
+            64
+        } else if t * n_out * 16 * 4 <= 512 << 20 {
+            16
         } else {
-            64 // q4 — 64레인(q3 동일 형상)
+            4
         };
         // 디코드(t ≤ 8) — q3 토큰 상각. prefill — 기본 q2(안정).
         // q4 타일 커널은 실측 2건의 불안정(콜드 런 비결정 오염·모듈 로드 STATUS 700
@@ -513,6 +543,10 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             return Err(format!("matmul_batch: x 행 길이 != n_in ({n_in})"));
         }
         let d = self.dev_weight(w)?;
+        if d.host {
+            llm170_core::matmul::matmul_batch(xs, w, outs);
+            return Ok(());
+        }
         let mut xf = Vec::with_capacity(t * n_in);
         for r in xs {
             xf.extend_from_slice(r);
@@ -527,6 +561,10 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
         profile_span!("gpu::matmul1");
         let d = self.dev_weight(w)?;
+        if d.host {
+            llm170_core::matmul::matmul(x, w, out);
+            return Ok(());
+        }
         if x.len() != d.n_in {
             return Err(format!("matmul: x 길이 {} != n_in {}", x.len(), d.n_in));
         }

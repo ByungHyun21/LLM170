@@ -181,7 +181,11 @@ impl Engine4 {
 
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
+        let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
         for il in 0..hp.n_layer {
+            if trace {
+                eprintln!("q4 layer {il} t={t_len}");
+            }
             if hp.is_ple(il) {
                 stage!(ple, self.ple_block(seq, il, &mut res_hc, &ple_rows)?);
             }
@@ -214,6 +218,8 @@ impl Engine4 {
 
     /// grouped RMSNorm + 저랭크 게이트 + 스트림 평균 + inject.
     /// kind = "attn"|"ffn" → blk.{il}.hc_{kind}_{norm,down,up,inject}.weight
+    /// 토큰 축 배치: down/up/inject 각 전 토큰 1회 — GPU 왕복을 층당 6회로 고정
+    /// (토큰당 288회 왕복이 장문 prefill 병목이었음 — 2026-08-31 실측).
     fn hc_mix(
         &self,
         il: usize,
@@ -230,27 +236,35 @@ impl Engine4 {
         let w_up = self.model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
         let w_inject = self.model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
 
-        let mut mixed: Vec<Vec<f32>> = Vec::with_capacity(t);
-        let mut inject: Vec<Vec<f32>> = Vec::with_capacity(t);
-        let mut lo = vec![0.0f32; w_down.n_out as usize];
-        let mut gate = vec![0.0f32; hc_dim];
-        let mut inj = vec![0.0f32; hc];
+        // 1) grouped RMSNorm — 전 토큰 (감마는 (1+w) 폴딩, 스트림별 축소)
+        let mut xn_all: Vec<Vec<f32>> = Vec::with_capacity(t);
         for x in res_hc {
-            // grouped rms: 스트림별 축소, 감마는 hc_dim 전체 (컨버터가 (1+w)로 폴딩)
             let mut xn = vec![0.0f32; hc_dim];
             for s in 0..hc {
                 let head = x[s * n_embd..(s + 1) * n_embd].to_vec();
-                xn[s * n_embd..(s + 1) * n_embd].copy_from_slice(&rms_norm(&head, &w_norm[s * n_embd..(s + 1) * n_embd], hp.eps));
+                xn[s * n_embd..(s + 1) * n_embd]
+                    .copy_from_slice(&rms_norm(&head, &w_norm[s * n_embd..(s + 1) * n_embd], hp.eps));
             }
-            self.mm(&xn, &w_down, &mut lo)?;
+            xn_all.push(xn);
+        }
+        // 2) 저랭크 down → silu(lo/hc) → up → 게이트 — 배치 1회씩
+        let mut lo_all = vec![vec![0.0f32; w_down.n_out as usize]; t];
+        self.mm_batch(&xn_all, &w_down, &mut lo_all)?;
+        for lo in lo_all.iter_mut() {
             for v in lo.iter_mut() {
                 *v = silu(*v / hc as f32);
             }
-            self.mm(&lo, &w_up, &mut gate)?;
+        }
+        let mut gate_all = vec![vec![0.0f32; hc_dim]; t];
+        self.mm_batch(&lo_all, &w_up, &mut gate_all)?;
+        let mut inject_all = vec![vec![0.0f32; hc]; t];
+        self.mm_batch(&xn_all, &w_inject, &mut inject_all)?;
+        // 3) 게이트 적용 + 스트림 평균
+        let mut mixed: Vec<Vec<f32>> = Vec::with_capacity(t);
+        for (gate, xn) in gate_all.iter_mut().zip(xn_all.iter()) {
             for (g, gi) in gate.iter_mut().zip(xn.iter()) {
                 *g = *gi * sigmoid(*g);
             }
-            // 스트림 평균
             let mut m = vec![0.0f32; n_embd];
             for s in 0..hc {
                 for i in 0..n_embd {
@@ -260,36 +274,42 @@ impl Engine4 {
             for v in m.iter_mut() {
                 *v /= hc as f32;
             }
-            self.mm(&xn, &w_inject, &mut inj)?;
-            inject.push(inj.clone());
             mixed.push(m);
         }
-        Ok((mixed, inject))
+        Ok((mixed, inject_all))
     }
 
-    /// 출력 헤드용 HC mix (inject 없음) — output_hc_{norm,down,up}.
+    /// 출력 헤드용 HC mix (inject 없음) — output_hc_{norm,down,up}. 동일 배치 구조.
     fn hc_mix_head(&self, res_hc: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q4Error> {
         profile_span!("q4::hc_mix_head");
         let hp = &self.model.hp;
         let (n_embd, hc) = (hp.n_embd, hp.hc);
         let hc_dim = hc * n_embd;
+        let t = res_hc.len();
         let w_norm = self.model.f32_vec4("output_hc_norm.weight")?;
         let w_down = self.model.w4("output_hc_down.weight")?;
         let w_up = self.model.w4("output_hc_up.weight")?;
-        let mut out = Vec::with_capacity(res_hc.len());
-        let mut lo = vec![0.0f32; w_down.n_out as usize];
-        let mut gate = vec![0.0f32; hc_dim];
+        let mut xn_all: Vec<Vec<f32>> = Vec::with_capacity(t);
         for x in res_hc {
             let mut xn = vec![0.0f32; hc_dim];
             for s in 0..hc {
                 let head = x[s * n_embd..(s + 1) * n_embd].to_vec();
-                xn[s * n_embd..(s + 1) * n_embd].copy_from_slice(&rms_norm(&head, &w_norm[s * n_embd..(s + 1) * n_embd], hp.eps));
+                xn[s * n_embd..(s + 1) * n_embd]
+                    .copy_from_slice(&rms_norm(&head, &w_norm[s * n_embd..(s + 1) * n_embd], hp.eps));
             }
-            self.mm(&xn, &w_down, &mut lo)?;
+            xn_all.push(xn);
+        }
+        let mut lo_all = vec![vec![0.0f32; w_down.n_out as usize]; t];
+        self.mm_batch(&xn_all, &w_down, &mut lo_all)?;
+        for lo in lo_all.iter_mut() {
             for v in lo.iter_mut() {
                 *v = silu(*v / hc as f32);
             }
-            self.mm(&lo, &w_up, &mut gate)?;
+        }
+        let mut gate_all = vec![vec![0.0f32; hc_dim]; t];
+        self.mm_batch(&lo_all, &w_up, &mut gate_all)?;
+        let mut out = Vec::with_capacity(t);
+        for (gate, xn) in gate_all.iter_mut().zip(xn_all.iter()) {
             for (g, gi) in gate.iter_mut().zip(xn.iter()) {
                 *g = *gi * sigmoid(*g);
             }
@@ -896,14 +916,21 @@ impl Engine4 {
     }
 
     /// prefill: 전체 토큰 적립 + 마지막 logits.
+    /// 1024토큰 청크로 분할 — 단일 초대형 forward는 libamdhip64 GPF 트리거
+    /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
-        let mut tm = init_timings();
-        let logits = self.forward_timed(seq, tokens, tm.as_mut())?;
-        if let Some(t) = &tm {
-            t.report(&format!("prefill {}tok", tokens.len()));
+        const CHUNK: usize = 1024;
+        let mut last = None;
+        for ch in tokens.chunks(CHUNK) {
+            let mut tm = init_timings();
+            let logits = self.forward_timed(seq, ch, tm.as_mut())?;
+            if let Some(t) = &tm {
+                t.report(&format!("prefill {}tok", ch.len()));
+            }
+            self.seqs[seq].pos += ch.len() as u32;
+            last = Some(logits);
         }
-        self.seqs[seq].pos += tokens.len() as u32;
-        Ok(logits)
+        Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
     /// 디코드 1토큰.
