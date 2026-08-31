@@ -108,12 +108,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu]
+/// --mode 파싱·적용 — env 기본값으로 반영 (기존 env 관례의 단일 소스 유지).
+/// LLM170_W_CAP_GB·LLM170_Q4_CHUNK가 이미 있으면 사용자 명시로 존중.
+fn apply_mode(m: llm170_core::mode::Mode) {
+    if std::env::var_os("LLM170_W_CAP_GB").is_none() {
+        // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
+        unsafe { std::env::set_var("LLM170_W_CAP_GB", m.w_cap_gb().to_string()) };
+    }
+    if std::env::var_os("LLM170_Q4_CHUNK").is_none() {
+        // SAFETY: 위와 동일
+        unsafe { std::env::set_var("LLM170_Q4_CHUNK", m.prefill_chunk().to_string()) };
+    }
+    eprintln!("# mode: {m:?} (w_cap={}GiB chunk={})", m.w_cap_gb(), m.prefill_chunk());
+}
+
+/// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
 fn cmd_serve(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;
     let mut port = 8080u16;
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
+    let mut mode: Option<llm170_core::mode::Mode> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -134,10 +149,17 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
                 None => return usage_err("--backend requires cpu|gpu"),
             },
+            "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
+                Some(m) => mode = Some(m),
+                None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
+            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
     let Some(model_path) = model else { return usage_err("--model required") };
+    if let Some(m) = mode {
+        apply_mode(m);
+    }
     // 토크나이저 적재 (part1 메타 → 실패시 part2)
     let part2 = {
         let stem = model_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -898,6 +920,7 @@ fn cmd_infer(args: &[String]) -> ExitCode {
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
     let mut gpu_runtime = "hip".to_string();
+    let mut mode: Option<llm170_core::mode::Mode> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -932,6 +955,10 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                 Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
                 None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
+            "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
+                Some(m) => mode = Some(m),
+                None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
+            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
@@ -939,6 +966,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
     let Some(model_path) = model else {
         return usage_err("--model required");
     };
+    if let Some(m) = mode {
+        apply_mode(m);
+    }
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }

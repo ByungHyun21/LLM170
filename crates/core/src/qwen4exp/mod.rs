@@ -71,16 +71,18 @@ pub struct Hparams4 {
     pub idx_heads: usize,
     pub idx_dim: usize,
     pub idx_top_k: usize,
-    pub compress: Vec<i32>, // [n_layer]
+    /// Arc 슬라이스 — hp.clone()이 스택 복사(핫패스 스테이지당 1회씩 복제
+    /// 중이라 할당 제거, 2026-09-01).
+    pub compress: std::sync::Arc<[i32]>, // [n_layer]
     // PLE
-    pub ple_layers: Vec<usize>,
+    pub ple_layers: std::sync::Arc<[usize]>,
     pub ple_ngram: usize,
     pub ple_heads_per_ngram: usize,
     pub ple_conv_k: usize,
     pub ple_head_dim: usize, // embedding_length_per_layer_input
-    pub ple_multipliers: Vec<u64>,
-    pub ple_head_offsets: Vec<u64>,
-    pub ple_head_vocab_sizes: Vec<u64>,
+    pub ple_multipliers: std::sync::Arc<[u64]>,
+    pub ple_head_offsets: std::sync::Arc<[u64]>,
+    pub ple_head_vocab_sizes: std::sync::Arc<[u64]>,
     pub ple_eos: u32,
     pub ple_image: u32,
 }
@@ -267,15 +269,15 @@ impl Model4 {
             idx_heads: u("attention.indexer.head_count").ok_or(Q4Error::BadMeta("idx.heads"))? as usize,
             idx_dim: u("attention.indexer.key_length").ok_or(Q4Error::BadMeta("idx.dim"))? as usize,
             idx_top_k: u("attention.indexer.top_k").ok_or(Q4Error::BadMeta("idx.top_k"))? as usize,
-            compress,
-            ple_layers: ple_layers.iter().map(|&v| v as usize).collect(),
+            compress: compress.into(),
+            ple_layers: ple_layers.iter().map(|&v| v as usize).collect::<Vec<_>>().into(),
             ple_ngram: u("ple.ngram_size").ok_or(Q4Error::BadMeta("ngram_size"))? as usize,
             ple_heads_per_ngram: u("ple.heads_per_ngram").ok_or(Q4Error::BadMeta("heads_per_ngram"))? as usize,
             ple_conv_k: u("ple.conv_kernel").ok_or(Q4Error::BadMeta("ple.conv"))? as usize,
             ple_head_dim: u("embedding_length_per_layer_input").ok_or(Q4Error::BadMeta("per_layer_input"))? as usize,
-            ple_multipliers,
-            ple_head_offsets,
-            ple_head_vocab_sizes,
+            ple_multipliers: ple_multipliers.into(),
+            ple_head_offsets: ple_head_offsets.into(),
+            ple_head_vocab_sizes: ple_head_vocab_sizes.into(),
             ple_eos: u("ple.eos_token_id").ok_or(Q4Error::BadMeta("ple.eos"))? as u32,
             ple_image: u("ple.image_token_id").unwrap_or(0) as u32,
         })
