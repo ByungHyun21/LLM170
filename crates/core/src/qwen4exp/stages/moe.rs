@@ -169,6 +169,57 @@ use llm170_profiler::profile_span;
             }
             return Ok(out);
         }
+        // 프리필 그룹 경로 (03 §3.3): 토큰-메이저 (ti,e,w) 페어로 gate·up·down
+        // 스택 GEMM 3런치 — 전문가별 서브배치(≤n_exp×3회 왕복) 대신.
+        // LLM170_MOE_BATCH=1(스택 상주 예산 확보)에서만 — 페어 정렬은
+        // 토큰 메이저·전문가 오름차순(전문가별 경로의 토큰별 누산 순서와 동일).
+        let mut grouped_done = false;
+        let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
+            && std::env::var_os("LLM170_MOE_CPU").is_none();
+        if t > 1 && batch_on {
+            if let Some(acc) = ctx.acc {
+                let mut pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(t * n_used);
+                for e in 0..n_exp {
+                    for &(ti, w) in &by_expert[e] {
+                        pairs.push((ti, e, w));
+                    }
+                }
+                pairs.sort_by(|&a, &b| (a.0, a.1).cmp(&(b.0, b.1)));
+                let np_ = pairs.len();
+                let ids: Vec<u32> = pairs.iter().map(|&(_, e, _)| e as u32).collect();
+                let xp: Vec<Vec<f32>> = pairs.iter().map(|&(ti, _, _)| xs[ti].clone()).collect();
+                let wg_stack = ctx.model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
+                let wu_stack = ctx.model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
+                let wd_stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
+                let mut gate_y = vec![vec![0.0f32; n_ff]; np_];
+                let mut up_y = vec![vec![0.0f32; n_ff]; np_];
+                if acc.moe_down(&xp, &wg_stack, &ids, n_exp, &mut gate_y).is_ok()
+                    && acc.moe_down(&xp, &wu_stack, &ids, n_exp, &mut up_y).is_ok()
+                {
+                    for r in gate_y.iter_mut() {
+                        for i in 0..n_ff {
+                            r[i] = silu(r[i]);
+                        }
+                    }
+                    for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
+                        for i in 0..n_ff {
+                            r[i] *= u[i];
+                        }
+                    }
+                    let mut y = vec![vec![0.0f32; n_embd]; np_];
+                    if acc.moe_down(&gate_y, &wd_stack, &ids, n_exp, &mut y).is_ok() {
+                        for ((ti, _, w), yo) in pairs.iter().zip(y.iter()) {
+                            let o = &mut out[*ti];
+                            for i in 0..n_embd {
+                                o[i] += w * yo[i];
+                            }
+                        }
+                        grouped_done = true;
+                    }
+                }
+            }
+        }
+        if !grouped_done {
         for e in 0..n_exp {
             let list = &by_expert[e];
             if list.is_empty() {
@@ -210,6 +261,7 @@ use llm170_profiler::profile_span;
                     o[i] += w * eo[i];
                 }
             }
+        }
         }
 
         let t_gemm = t_gemm0.elapsed();
