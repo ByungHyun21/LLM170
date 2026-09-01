@@ -160,6 +160,7 @@ pub fn smoke_gemv(n_in: usize, n_out: usize) -> Result<Vec<f32>, String> {
 // ---------------------------------------------------------------------------
 
 mod buffers;
+mod gemm5;
 mod gdn_kernel;
 use buffers::{ScratchPool, WeightStore, WRef};
 
@@ -231,6 +232,94 @@ impl<R: Runtime> GpuMatmul<R> {
             ktab,
             grid3,
         })
+    }
+
+    /// MoE 전문가 배치 down — K전문가 1런치 (P2-2). x는 [K·n_in] 평탄,
+    /// ws는 전문가 스택 전체 뷰, outs [K][n_out].
+    pub fn moe_down_gpu(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &Weight,
+        expert_ids: &[u32],
+        n_expert_stack: usize,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let k = xs.len();
+        if k == 0 || outs.len() != k || expert_ids.len() != k {
+            return Err(format!(
+                "moe_down: 형상 불일치 k={k} outs={} ids={}",
+                outs.len(),
+                expert_ids.len()
+            ));
+        }
+        let d = self.dev_weight(ws)?;
+        if d.is_host() {
+            return Err("moe_down: 스택 가중치 호스트 폴백 (예산 초과)".into());
+        }
+        let (n_in, n_out_full) = d.shape();
+        // 스택 [ne0=n_in][ne1=rows][ne2=experts] — w4 뷰는 n_out=rows·experts.
+        let n_out = n_out_full / n_expert_stack;
+        let wtype = d.ty() as u32 as usize;
+        let wwords = d.words();
+        let exp_bytes = wwords * 4 / n_expert_stack;
+        // x 평탄 업로드 (t=1행 × K)
+        let mut xf = Vec::with_capacity(k * n_in);
+        for row in xs {
+            if row.len() != n_in {
+                return Err("moe_down: x 행 길이 불일치".into());
+            }
+            xf.extend_from_slice(row);
+        }
+        let t0 = std::time::Instant::now();
+        let xg = self.client.create_from_slice(bytemuck::cast_slice(&xf));
+        let eg = self.client.create_from_slice(bytemuck::cast_slice(expert_ids));
+        let og = self.acquire_buf(k * n_out * 4)?;
+        let pg = self.acquire_buf(k * n_out * 64 * 4)?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: 그리드 (n_out, K)·64레인 — 상한 내, part 전 기록 후 reduce.
+        unsafe {
+            gemm5::gemm_q5::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_out as u32, k as u32, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(xg.clone(), [1].into(), [xf.len()].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [wwords].into()),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [k * n_out * 64].into()),
+                TensorArg::from_raw_parts(eg, [1].into(), [expert_ids.len()].into()),
+                TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                n_in,
+                n_out,
+                exp_bytes,
+                wtype,
+            );
+            gemm2::reduce_parts::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_out as u32, k as u32, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [k * n_out * 64].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [k * n_out].into()),
+                n_out,
+                k,
+                64,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        let res: &[f32] = bytemuck::cast_slice(&raw);
+        for (e, out) in outs.iter_mut().enumerate() {
+            out.copy_from_slice(&res[e * n_out..(e + 1) * n_out]);
+        }
+        self.release_bufs(&[
+            (xg, xf.len() * 4),
+            (og, k * n_out * 4),
+            (pg, k * n_out * 64 * 4),
+        ]);
+        let _ = n_out_full;
+        Ok(())
     }
 
     /// GDN AR 단일 토큰 상태 갱신 — S 업로드→커널→S·o 판독.
@@ -682,6 +771,18 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let res = self.run_gemm(&d, x, 1)?;
         out.copy_from_slice(&res[..d.shape().1]);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_down(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &Weight,
+        expert_ids: &[u32],
+        n_expert_stack: usize,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        self.moe_down_gpu(xs, ws, expert_ids, n_expert_stack, outs)
     }
 
     fn gdn_ar(

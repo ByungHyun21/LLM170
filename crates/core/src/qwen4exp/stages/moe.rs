@@ -101,12 +101,23 @@ use llm170_profiler::profile_span;
                 }
             }
             {
-                let mut wds = Vec::with_capacity(n_sel);
-                for &e in &sel {
-                    wds.push(ctx.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?);
-                }
                 let mut eos = vec![vec![0.0f32; n_embd]; n_sel];
-                ctx.mm_paired(&gate_y[..n_sel], &wds, &mut eos)?;
+                // P2-2: K전문가 down 1런치 (스택 뷰). 미지원/호스트 폴백은 짝으로.
+                let mut batched = false;
+                if let Some(acc) = ctx.acc {
+                    let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
+                    let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();
+                    if acc.moe_down(&gate_y[..n_sel], &stack, &ids, n_exp, &mut eos).is_ok() {
+                        batched = true;
+                    }
+                }
+                if !batched {
+                    let mut wds = Vec::with_capacity(n_sel);
+                    for &e in &sel {
+                        wds.push(ctx.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?);
+                    }
+                    ctx.mm_paired(&gate_y[..n_sel], &wds, &mut eos)?;
+                }
                 for (k, &e) in sel.iter().enumerate() {
                     let (ti, w) = by_expert[e][0];
                     let o = &mut out[ti];

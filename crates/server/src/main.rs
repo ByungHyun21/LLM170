@@ -95,6 +95,7 @@ fn main() -> ExitCode {
         Some("w4a8-gpu") => cmd_w4a8_gpu(&args[1..]),
         Some("gpu-de") => cmd_gpu_de(&args[1..]),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
+        Some("moe-down-check") => cmd_moe_down_check(),
         Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
         Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -780,6 +781,94 @@ fn cmd_gdn_ar_check() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!("gdn-ar MISMATCH");
+        ExitCode::FAILURE
+    }
+}
+
+/// moe-down-check — 배치 down 커널 GPU↔CPU 상호검증 (합성).
+/// 합성 q8_0 전문가 스택 [K=13][rows=32][n_in=256] + 무작위 x, 짝(개별) 대비.
+fn cmd_moe_down_check() -> ExitCode {
+    use llm170_core::matmul::{Accelerator, Weight};
+    let (k_stack, n_out, n_in) = (13usize, 32usize, 256usize);
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    // q8_0 스택 합성: 블록당 f16 d + 32 i8
+    let n_blocks = n_in / 32;
+    let per_expert_bytes = n_out * n_blocks * 34;
+    let mut data = vec![0u8; k_stack * per_expert_bytes];
+    for b in data.chunks_exact_mut(34) {
+        let dh = half::f16::from_f32(lcg() * 0.01 + 0.005);
+        b[..2].copy_from_slice(&dh.to_le_bytes());
+        for q in &mut b[2..] {
+            *q = (lcg() * 120.0) as i8 as u8;
+        }
+    }
+    // 선택 전문가 (비순차) + 행 x
+    let ids: [u32; 5] = [7, 0, 12, 3, 9];
+    let ks = ids.len();
+    let xs: Vec<Vec<f32>> = (0..ks).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+
+    // CPU 기준 — 전문가별 뷰로 matmul
+    let mut couts = vec![vec![0.0f32; n_out]; ks];
+    for (ri, &e) in ids.iter().enumerate() {
+        let off = e as usize * per_expert_bytes;
+        let w = Weight {
+            data: &data[off..off + per_expert_bytes],
+            ty: llm170_gguf::GgmlType::Q8_0,
+            n_in: n_in as u64,
+            n_out: n_out as u64,
+        };
+        llm170_core::matmul::matmul(&xs[ri], &w, &mut couts[ri]);
+    }
+
+    // GPU — 스택 전체 뷰
+    let gpu: std::sync::Arc<dyn Accelerator> = match std::env::var("LLM170_GPU_RUNTIME").as_deref() {
+        Ok("vulkan") => match llm170_backend_gpu::GpuMatmul::new_vulkan() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => match llm170_backend_gpu::GpuMatmul::new_hip() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let stack = Weight {
+        data: &data,
+        ty: llm170_gguf::GgmlType::Q8_0,
+        n_in: n_in as u64,
+        n_out: (n_out * k_stack) as u64,
+    };
+    let mut gouts = vec![vec![0.0f32; n_out]; ks];
+    if let Err(e) = gpu.moe_down(&xs, &stack, &ids, k_stack, &mut gouts) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut max_rel = 0.0f64;
+    for (g, c) in gouts.iter().zip(couts.iter()) {
+        for (a, b) in g.iter().zip(c.iter()) {
+            let rel = (a - b).abs() as f64 / b.abs().max(1e-2) as f64;
+            max_rel = max_rel.max(rel);
+        }
+    }
+    println!(
+        "[moe_down] stack={k_stack} sel={ks} n_out={n_out} n_in={n_in}: max_rel={max_rel:.3e}"
+    );
+    if max_rel < 5e-3 {
+        println!("moe-down PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("moe-down MISMATCH");
         ExitCode::FAILURE
     }
 }

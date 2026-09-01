@@ -1836,6 +1836,7 @@ version = "0.1.0"
 name = "llm170-server"
 version = "0.1.0"
 dependencies = [
+ "half",
  "llm170-backend-gpu",
  "llm170-core",
  "llm170-gguf",

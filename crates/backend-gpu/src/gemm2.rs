@@ -214,7 +214,7 @@ fn de_elem_iq3_s(
 
 /// 요소 값 산출 — qtype comptime 분기.
 #[cube]
-fn de_elem(
+pub(crate) fn de_elem(
     w: &Tensor<u32>,
     wb: usize,
     j: usize,
