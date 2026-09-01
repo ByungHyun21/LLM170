@@ -172,6 +172,11 @@ pub struct SeqState {
     kv_v: Vec<Vec<f32>>,
     gdn_s: Vec<Vec<f32>>,
     conv: Vec<Vec<f32>>,
+    /// MTP draft층 KV (blk.64 full-attn 1층분) — nextn 미탑재 모델은 빈 벡터.
+    mtp_kv_k: Vec<f32>,
+    mtp_kv_v: Vec<f32>,
+    /// MTP draft h 입력 — 직전 확정 토큰 t의 본체 hidden (h_t).
+    pub mtp_h: Vec<f32>,
 }
 
 impl SeqState {
@@ -183,12 +188,16 @@ impl SeqState {
         let (n_kv, hd) = (model.hp.n_kv, model.hp.head_dim);
         let state_size = model.hp.dt_rank * model.hp.d_state * model.hp.d_state;
         let conv_len = (model.hp.conv_k - 1) * model.hp.conv_ch();
+        let has_mtp = model.gguf.find_tensor("blk.64.nextn.eh_proj.weight").is_some();
         SeqState {
             pos: 0,
             kv_k: vec![vec![0.0; ctx * n_kv * hd]; n_full],
             kv_v: vec![vec![0.0; ctx * n_kv * hd]; n_full],
             gdn_s: vec![vec![0.0; state_size]; n_recr],
             conv: vec![vec![0.0; conv_len]; n_recr],
+            mtp_kv_k: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
+            mtp_kv_v: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
+            mtp_h: vec![0.0; if has_mtp { model.hp.n_embd } else { 0 }],
         }
     }
 }
@@ -200,6 +209,11 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// MTP(nextn) 텐서 탑재 여부 — --spec 사용 가능 판정.
+    pub fn has_mtp(&self) -> bool {
+        !self.seqs.first().map(|s| s.mtp_h.is_empty()).unwrap_or(true)
+    }
+
     pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState::new(&model, ctx)).collect();
         Engine {
@@ -364,6 +378,10 @@ impl Engine {
         let mut result = Vec::with_capacity(n_seqs);
         for s in 0..n_seqs {
             let last = &xs[(s + 1) * t_len - 1];
+            // MTP draft용 h_t 스냅샷 (06) — 본체 hidden을 시퀀스 상태에 보관.
+            if !self.seqs[seq_ids[s]].mtp_h.is_empty() {
+                self.seqs[seq_ids[s]].mtp_h.copy_from_slice(last);
+            }
             let h = rms_norm(last, &out_norm, hp.eps);
             let mut logits = vec![0.0f32; head.n_out as usize];
             mm(&acc, &h, &head, &mut logits)?;
@@ -389,6 +407,162 @@ impl Engine {
             self.seqs[*s].pos += 1;
         }
         Ok(logits)
+    }
+
+    /// MTP draft층 1 forward (06) — eh_proj([enorm(embd(tok)); hnorm(h_t)]) →
+    /// 게이티드 어텐션(자체 KV) → FFN → shared head 로짓. 체인 draft용:
+    /// 반환 (logits, h_{t+1}) — h는 다음 draft 스텝의 hnorm 입력.
+    pub fn mtp_forward(
+        &mut self,
+        seq: usize,
+        token: u32,
+        h_in: &[f32],
+        pos: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        profile_span!("cpu::mtp_forward");
+        let hp = self.model.hp.clone();
+        let n_embd = hp.n_embd;
+        let il = 64; // blk.64 — MTP층
+        let w_eh = self.model.wchk(&format!("blk.{il}.nextn.eh_proj.weight"))?;
+        let enorm = self.model.f32_vec(&format!("blk.{il}.nextn.enorm.weight"))?;
+        let hnorm = self.model.f32_vec(&format!("blk.{il}.nextn.hnorm.weight"))?;
+
+        // 1) embd(tok) 디양자화 → enorm / h_t → hnorm, concat → eh_proj
+        let embd = self.model.wchk("token_embd.weight")?;
+        let mut tok_row = vec![0.0f32; n_embd];
+        crate::quant::dequant_row(embd.ty, embd.data, token as u64, n_embd as u64, &mut tok_row);
+        let e_n = crate::ops::rms_norm(&tok_row, &enorm, hp.eps);
+        let h_n = crate::ops::rms_norm(h_in, &hnorm, hp.eps);
+        let mut cat = vec![0.0f32; 2 * n_embd];
+        cat[..n_embd].copy_from_slice(&e_n);
+        cat[n_embd..].copy_from_slice(&h_n);
+        let acc = self.acc.clone();
+        let mut cur = vec![0.0f32; n_embd];
+        crate::matmul::mm(&acc, &cat, &w_eh, &mut cur)?;
+
+        // 2) 게이티드 어텐션 — attn_layer와 동일 구조, 자체 KV(mtp_kv_*) 사용
+        let attn_out = self.mtp_attn(seq, il, &cur, pos)?;
+
+        // 3) 잔차 + post_attention_norm + FFN
+        for i in 0..n_embd {
+            cur[i] += attn_out[i];
+        }
+        let ffn_res = cur.clone();
+        let post_w = self.model.f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
+        let gate_w = self.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
+        let up_w = self.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
+        let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
+        let normed = rms_norm(&cur, &post_w, hp.eps);
+        let mut gu: [Vec<Vec<f32>>; 2] =
+            [vec![vec![0.0f32; hp.n_ff]; 1], vec![vec![0.0f32; hp.n_ff]; 1]];
+        crate::matmul::mm_group(&acc, &[normed], &[gate_w, up_w], &mut gu)?;
+        let [mut g, u] = gu;
+        for i in 0..hp.n_ff {
+            g[0][i] = crate::ops::silu(g[0][i]) * u[0][i];
+        }
+        let mut ffn_out = vec![vec![0.0f32; n_embd]; 1];
+        crate::matmul::mm_batch(&acc, &g, &down_w, &mut ffn_out)?;
+        for i in 0..n_embd {
+            cur[i] = ffn_out[0][i] + ffn_res[i];
+        }
+
+        // 4) shared head — shared_head_norm + output.weight (mtp_use_dedicated_embeddings=false)
+        let sh_norm = self.model.f32_vec(&format!("blk.{il}.nextn.shared_head_norm.weight"))?;
+        let head = self.model.wchk("output.weight")?;
+        let h = rms_norm(&cur, &sh_norm, hp.eps);
+        let mut logits = vec![0.0f32; head.n_out as usize];
+        crate::matmul::mm(&acc, &h, &head, &mut logits)?;
+        Ok((logits, cur))
+    }
+
+    fn mtp_attn(
+        &mut self,
+        seq: usize,
+        il: usize,
+        x: &[f32],
+        pos: u32,
+    ) -> Result<Vec<f32>, ModelError> {
+        let hp = self.model.hp.clone();
+        let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
+        let wq = self.model.wchk(&format!("blk.{il}.attn_q.weight"))?;
+        let wk = self.model.wchk(&format!("blk.{il}.attn_k.weight"))?;
+        let wv = self.model.wchk(&format!("blk.{il}.attn_v.weight"))?;
+        let wo = self.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
+        let q_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
+        let k_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let kq_scale = hp.kq_scale();
+        let acc = self.acc.clone();
+
+        let mut group: [Vec<Vec<f32>>; 3] = [
+            vec![vec![0.0f32; wq.n_out as usize]; 1],
+            vec![vec![0.0f32; wk.n_out as usize]; 1],
+            vec![vec![0.0f32; wv.n_out as usize]; 1],
+        ];
+        {
+            let xs = vec![x.to_vec()];
+            crate::matmul::mm_group(&acc, &xs, &[wq, wk, wv], &mut group)?;
+        }
+        let [qg, kk, vv] = group;
+
+        // k norm+rope → 자체 KV 캐시 적립
+        {
+            let st = &mut self.seqs[seq];
+            for h in 0..n_kv {
+                let src = kk[0][h * hd..h * hd + hd].to_vec();
+                let mut head = crate::ops::rms_norm(&src, &k_norm_w, hp.eps);
+                crate::ops::rope_head(&mut head, pos, n_rot, hp.rope_base);
+                let b = pos as usize * n_kv * hd + h * hd;
+                st.mtp_kv_k[b..b + hd].copy_from_slice(&head);
+                st.mtp_kv_v[b..b + hd].copy_from_slice(&vv[0][h * hd..h * hd + hd]);
+            }
+        }
+        let st = &self.seqs[seq];
+        let cache_k = &st.mtp_kv_k;
+        let cache_v = &st.mtp_kv_v;
+
+        let mut attn_out = vec![0.0f32; n_head * hd];
+        for h in 0..n_head {
+            let src = qg[0][h * 2 * hd..h * 2 * hd + hd].to_vec();
+            let mut qh = crate::ops::rms_norm(&src, &q_norm_w, hp.eps);
+            crate::ops::rope_head(&mut qh, pos, n_rot, hp.rope_base);
+            let kvh = h / (n_head / n_kv);
+            let n_past = pos as usize + 1;
+            let mut scores = vec![0.0f32; n_past];
+            let mut maxv = f32::NEG_INFINITY;
+            for (p, sc) in scores.iter_mut().enumerate() {
+                let b = p * n_kv * hd + kvh * hd;
+                let mut d = 0.0f32;
+                for i in 0..hd {
+                    d += qh[i] * cache_k[b + i];
+                }
+                *sc = d * kq_scale;
+                maxv = maxv.max(*sc);
+            }
+            let mut sum = 0.0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - maxv).exp();
+                sum += *sc;
+            }
+            let ob = h * hd;
+            for p in 0..n_past {
+                let w = scores[p] / sum;
+                if w == 0.0 {
+                    continue;
+                }
+                let b = p * n_kv * hd + kvh * hd;
+                for i in 0..hd {
+                    attn_out[ob + i] += w * cache_v[b + i];
+                }
+            }
+            let gb = h * 2 * hd + hd;
+            for i in 0..hd {
+                attn_out[ob + i] *= crate::ops::sigmoid(qg[0][gb + i]);
+            }
+        }
+        // wo 프로젝션
+        let mut out = vec![vec![0.0f32; wo.n_out as usize]; 1];
+        crate::matmul::mm_batch(&acc, &[attn_out], &wo, &mut out)?;
+        Ok(out.into_iter().next().unwrap())
     }
 
     /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
@@ -419,6 +593,60 @@ impl Engine {
             .unwrap_or("")
             .replace('Ġ', " ")
             .replace('Ċ', "\n")
+    }
+
+    /// 스펙 디코드 1사이클 (06) — k draft 생성 → 타깃 forward 연쇄 검증.
+    /// v1 단순화: 검증은 타깃 t=1 순차 forward (정확성 동일 — 06 §4.3
+    /// "1차는 슬롯별 순차도 허용"). 반환: (수용 토큰들, 타깃 forward 수).
+    #[allow(clippy::type_complexity)]
+    pub fn spec_step(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<(Vec<u32>, usize), ModelError> {
+        let eos = 248044u32;
+        // ── draft: 체인 k개 — mtp_forward는 자체 KV에 순차 적립
+        let mut h = self.seqs[seq].mtp_h.clone();
+        let mut drafts: Vec<u32> = Vec::with_capacity(k);
+        let mut tok = last_token;
+        let base_pos = self.seqs[seq].pos;
+        for _ in 0..k {
+            let dpos = base_pos + drafts.len() as u32;
+            let (logits, nh) = self.mtp_forward(seq, tok, &h, dpos)?;
+            let d = greedy(&logits);
+            drafts.push(d);
+            tok = d;
+            h = nh;
+            if d == eos {
+                break;
+            }
+        }
+        // ── verify: 타깃 t=1 순차 forward — draft와 순서 비교 연쇄 수용
+        let mut accepted: Vec<u32> = Vec::new();
+        let mut cur_tok = last_token;
+        let mut total = 0usize;
+        for (i, &d) in drafts.iter().enumerate() {
+            let logits = self.decode(&[seq], &[cur_tok])?;
+            total += 1;
+            let t = greedy(&logits[0]);
+            if t == d {
+                accepted.push(t);
+                cur_tok = t;
+                if i + 1 == drafts.len() {
+                    let l2 = self.decode(&[seq], &[cur_tok])?;
+                    total += 1;
+                    accepted.push(greedy(&l2[0]));
+                }
+            } else {
+                accepted.push(t); // 첫 불일치 위치의 타깃 argmax = 보너스
+                break;
+            }
+            if t == eos {
+                break;
+            }
+        }
+        Ok((accepted, total))
     }
 }
 

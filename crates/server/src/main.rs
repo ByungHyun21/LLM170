@@ -1307,10 +1307,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
-    // env 기본값 — LLM170_GPU_RUNTIME (플래그가 우선). 종전 infer는 env를 무시해
-    // "Vulkan 실행"이 전부 HIP이던 결함 (2026-09-01 재확인).
     let mut gpu_runtime = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
     let mut mode: Option<llm170_core::mode::Mode> = None;
+    let mut spec_k: Option<usize> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1348,6 +1347,10 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
                 Some(m) => mode = Some(m),
                 None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
+            },
+            "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(k) if k >= 1 && k <= 8 => spec_k = Some(k),
+                _ => return usage_err("--spec requires k in 1..=8"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
@@ -1447,8 +1450,42 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                     finished[s] = true;
                 }
             }
-            // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
+            // 스펙 디코드 (06) — --spec k 지정 시 MTP 체인 draft·연쇄 수용.
+            let spec_k: usize = spec_k.unwrap_or(0);
+            let has_mtp = eng.has_mtp();
             let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            if spec_k > 0 && has_mtp && n == 1 {
+                let s = 0usize;
+                let mut accepted_total = 0usize;
+                let mut target_forwards = 0usize;
+                let mut cycles = 0usize;
+                while gen_tokens[s].len() <= n_predict && !finished[s] {
+                    let (acc_toks, tf) = eng.spec_step(s, next[s], spec_k).map_err(|e| e.to_string())?;
+                    cycles += 1;
+                    target_forwards += tf;
+                    for &t in &acc_toks {
+                        if gen_tokens[s].len() > n_predict {
+                            break;
+                        }
+                        pos[s] += 1;
+                        emit(s, pos[s], t, &eng);
+                        gen_tokens[s].push(t);
+                        next[s] = t;
+                        accepted_total += 1;
+                        if t == eos {
+                            finished[s] = true;
+                        }
+                    }
+                }
+                eprintln!(
+                    "# spec(k={spec_k}): {cycles}사이클, 수용 {accepted_total}토큰, 타깃 forward {target_forwards}회 — 수용률/forward {:.2}",
+                    accepted_total as f64 / target_forwards.max(1) as f64
+                );
+            } else {
+                if spec_k > 0 && !has_mtp {
+                    eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
+                }
+            // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
             for _step in 0..n_predict {
                 let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
                 if active.is_empty() {
@@ -1467,6 +1504,7 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                         finished[s] = true;
                     }
                 }
+            }
             }
             let dt = t_start.elapsed();
             eprintln!(
