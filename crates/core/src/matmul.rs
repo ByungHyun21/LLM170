@@ -41,6 +41,24 @@ impl<'a> Weight<'a> {
 /// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
 /// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
 pub trait Accelerator: Send + Sync {
+    /// GDN AR 단일 토큰 상태 갱신 — 미구현 백엔드는 Err (호출부 CPU 폴백).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_ar(
+        &self,
+        _q_scaled: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _beta_ge: &[f32],
+        _states: &mut [f32],
+        _out: &mut [f32],
+        _n_seqs: usize,
+        _h_k: usize,
+        _h_v: usize,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("gdn_ar: 미지원".into())
+    }
+
     /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
     /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
     fn barrier(&self) {}

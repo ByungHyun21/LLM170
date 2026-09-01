@@ -94,6 +94,7 @@ fn main() -> ExitCode {
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("w4a8-gpu") => cmd_w4a8_gpu(&args[1..]),
         Some("gpu-de") => cmd_gpu_de(&args[1..]),
+        Some("gdn-ar-check") => cmd_gdn_ar_check(),
         Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
         Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -704,6 +705,83 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
     eprintln!("# check 전체 통과");
     ExitCode::SUCCESS
+}
+
+/// gdn-ar-check — GDN AR 커널 GPU↔CPU 상호검증 (합성 텐서, 수제 LCG).
+fn cmd_gdn_ar_check() -> ExitCode {
+    use llm170_core::matmul::Accelerator;
+    let (n_group, dt_rank, d) = (8usize, 48usize, 128usize);
+    let k_len = n_group * d;
+    let v_len = dt_rank * d;
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let q: Vec<f32> = (0..k_len).map(|_| lcg()).collect();
+    let k: Vec<f32> = (0..k_len).map(|_| lcg()).collect();
+    let v: Vec<f32> = (0..v_len).map(|_| lcg()).collect();
+    let beta: Vec<f32> = (0..dt_rank).map(|_| lcg() + 0.5).collect();
+    let g: Vec<f32> = (0..dt_rank).map(|_| lcg() * 4.0).collect();
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    // CPU 기준
+    let mut st_c: Vec<f32> = (0..dt_rank * d * d).map(|_| lcg()).collect();
+    let st_orig = st_c.clone();
+    let mut out_c = vec![0.0f32; v_len];
+    llm170_core::gdn::gdn_ar_batch(&q, &k, &v, &beta, &g, &mut st_c, &mut out_c, 1, n_group, dt_rank);
+
+    if std::env::var_os("LLM170_GDN_CPU").is_some() {
+        println!("[skip] LLM170_GDN_CPU");
+        return ExitCode::SUCCESS;
+    }
+    let gpu: std::sync::Arc<dyn Accelerator> = match std::env::var("LLM170_GPU_RUNTIME").as_deref() {
+        Ok("vulkan") => match llm170_backend_gpu::GpuMatmul::new_vulkan() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => match llm170_backend_gpu::GpuMatmul::new_hip() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let mut st_g = st_orig.clone();
+    let mut out_g = vec![0.0f32; v_len];
+    let qs: Vec<f32> = q.iter().map(|x| x * scale).collect();
+    let mut beta_ge = vec![0.0f32; dt_rank * 2];
+    for h in 0..dt_rank {
+        beta_ge[h * 2] = beta[h];
+        beta_ge[h * 2 + 1] = g[h].exp();
+    }
+    if let Err(e) = gpu.gdn_ar(&qs, &k, &v, &beta_ge, &mut st_g, &mut out_g, 1, n_group, dt_rank, d) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let rel = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter().zip(b).fold(0.0f64, |m, (x, y)| {
+            let dd = (x - y).abs() as f64;
+            m.max(dd / y.abs().max(1e-3) as f64)
+        })
+    };
+    let (ro, rs) = (rel(&out_g, &out_c), rel(&st_g, &st_c));
+    println!(
+        "[gdn_ar] n_group={n_group} dt_rank={dt_rank} d={d}: out max_rel={ro:.3e} state max_rel={rs:.3e}"
+    );
+    if ro < 2e-3 && rs < 2e-3 {
+        println!("gdn-ar PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("gdn-ar MISMATCH");
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_gpu_mm(args: &[String]) -> ExitCode {

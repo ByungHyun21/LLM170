@@ -99,14 +99,42 @@ use llm170_profiler::profile_span;
         }
         {
             let st = &mut seq.gdn_s[recr_idx];
+            // t=1 GPU 우선 (P2-1) — 미지원 백엔드는 CPU. q·scale·e^g 사전 계산:
+            // 커널 f32 스칼라·exp 미지원. 수치는 CPU 경로와 동일 순서(열 단위
+            // 누산이므로 f32 반올림 수준만 차이).
+            let mut gpu_done = false;
             if t_len == 1 {
-                crate::gdn::gdn_ar_batch(
-                    &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, 1, n_group, dt_rank,
-                );
-            } else {
-                crate::gdn::gdn_chunk_seq(
-                    &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, t_len, n_group, dt_rank,
-                );
+                if let Some(acc) = ctx.acc {
+                    let d = d_state;
+                    let k_stride = n_group * d;
+                    let v_stride = dt_rank * d;
+                    let scale = 1.0f32 / (d as f32).sqrt();
+                    let qs: Vec<f32> =
+                        q_all.iter().map(|x| x * scale).collect();
+                    let mut beta_ge = vec![0.0f32; dt_rank * 2];
+                    for h in 0..dt_rank {
+                        beta_ge[h * 2] = beta_all[h];
+                        beta_ge[h * 2 + 1] = g_all[h].exp();
+                    }
+                    let flat_st: &mut [f32] = st;
+                    if acc
+                        .gdn_ar(&qs, &k_all, &v_all, &beta_ge, flat_st, &mut o_all, 1, n_group, dt_rank, d)
+                        .is_ok()
+                    {
+                        gpu_done = true;
+                    }
+                }
+            }
+            if !gpu_done {
+                if t_len == 1 {
+                    crate::gdn::gdn_ar_batch(
+                        &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, 1, n_group, dt_rank,
+                    );
+                } else {
+                    crate::gdn::gdn_chunk_seq(
+                        &q_all, &k_all, &v_all, &beta_all, &g_all, st, &mut o_all, t_len, n_group, dt_rank,
+                    );
+                }
             }
         }
         // norm_gated: rms·sigmoid(z) — qwen35(silu)와의 유일 차이

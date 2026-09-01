@@ -160,6 +160,7 @@ pub fn smoke_gemv(n_in: usize, n_out: usize) -> Result<Vec<f32>, String> {
 // ---------------------------------------------------------------------------
 
 mod buffers;
+mod gdn_kernel;
 use buffers::{ScratchPool, WeightStore, WRef};
 
 /// GPU matmul 가속기 — 런타임 제네릭(HIP 또는 wgpu/Vulkan).
@@ -230,6 +231,71 @@ impl<R: Runtime> GpuMatmul<R> {
             ktab,
             grid3,
         })
+    }
+
+    /// GDN AR 단일 토큰 상태 갱신 — S 업로드→커널→S·o 판독.
+    /// e^g·β는 호스트 사전 계산(beta_ge), q는 scale 사전 곱.
+    pub fn gdn_ar_gpu(
+        &self,
+        q_scaled: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta_ge: &[f32],
+        states: &mut [f32],
+        out: &mut [f32],
+        n_seqs: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        let k_stride = h_k * d;
+        let v_stride = h_v * d;
+        let n_pairs = n_seqs * h_v;
+        let t0 = std::time::Instant::now();
+        let sg = self.client.create_from_slice(bytemuck::cast_slice(states));
+        let qg = self.client.create_from_slice(bytemuck::cast_slice(q_scaled));
+        let kg = self.client.create_from_slice(bytemuck::cast_slice(k));
+        let vg = self.client.create_from_slice(bytemuck::cast_slice(v));
+        let bg = self.client.create_from_slice(bytemuck::cast_slice(beta_ge));
+        let og = self.acquire_buf(out.len() * 4)?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: 그리드가 (n_pairs·d)를 정확히 덮고 유닛당 열 1개 —
+        // 상한 내 인덱싱, 무한루프 없음.
+        unsafe {
+            gdn_kernel::gdn_ar::launch_unchecked(
+                &self.client,
+                CubeCount::Static((n_pairs * d) as u32, 1, 1),
+                CubeDim::new_1d(d as u32),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [states.len()].into()),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [q_scaled.len()].into()),
+                TensorArg::from_raw_parts(kg.clone(), [1].into(), [k.len()].into()),
+                TensorArg::from_raw_parts(vg.clone(), [1].into(), [v.len()].into()),
+                TensorArg::from_raw_parts(bg, [1].into(), [beta_ge.len()].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [out.len()].into()),
+                d,
+                k_stride,
+                v_stride,
+                h_v,
+                h_k,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw_s = self.client.read_one(sg.clone()).map_err(|e| e.to_string())?;
+        let raw_o = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        states.copy_from_slice(bytemuck::cast_slice(&raw_s));
+        out.copy_from_slice(bytemuck::cast_slice(&raw_o));
+        // 휘발 업로드 풀 반납 — 해제 금지 (ADR-0014).
+        self.release_bufs(&[
+            (sg, states.len() * 4),
+            (qg, q_scaled.len() * 4),
+            (kg, k.len() * 4),
+            (vg, v.len() * 4),
+            (og, out.len() * 4),
+        ]);
+        Ok(())
     }
 
     /// 큐 완결 동기화 — 풀 재사용 안전성의 증명 지점. read_one이 커널
@@ -616,6 +682,22 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let res = self.run_gemm(&d, x, 1)?;
         out.copy_from_slice(&res[..d.shape().1]);
         Ok(())
+    }
+
+    fn gdn_ar(
+        &self,
+        q_scaled: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta_ge: &[f32],
+        states: &mut [f32],
+        out: &mut [f32],
+        n_seqs: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        self.gdn_ar_gpu(q_scaled, k, v, beta_ge, states, out, n_seqs, h_k, h_v, d)
     }
 
     /// 짝 GEMM — 가중치마다 다른 1행 x (MoE down). 런치 배치 + 단일 동기화.
