@@ -34,10 +34,10 @@ device activations + single end-of-forward sync) is the structural next step.
 
 Known remaining CPU-serial sections in the GPU path: GDN recurrence (chunked
 prefill + AR decode), QSA indexer scores (O(p²) over context), HC residual
-math. Long prefill currently measured on the Vulkan runtime; the HIP runtime
-hits a cubecl-HIP memory-manager fault on multi-chunk (≥2,048-token) prefill
-on this machine (single-chunk and decode are fine, engine code verified
-identical across runtimes).
+math. Note (corrected 2026-09-01): the qwen4exp infer path previously
+hardcoded the HIP runtime, so earlier "Vulkan" attributions were wrong; the
+intermittent "Memory page 0 doesn't exist" fault is runtime-attribution
+pending, with true-Vulkan long runs queued after the fix.
 
 ## Verification status (same binaries as the numbers above)
 

@@ -998,7 +998,7 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
-        return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend);
+        return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend, &gpu_runtime);
     }
     let engine_res = llm170_core::model::Model::load(&model_path)
         .map_err(|e| e.to_string())
@@ -1102,6 +1102,7 @@ fn run_q4_infer(
     n_predict: usize,
     ctx: usize,
     backend: &str,
+    gpu_runtime: &str,
 ) -> ExitCode {
     let t_start = std::time::Instant::now();
     let res = llm170_core::qwen4exp::Model4::load(model_path)
@@ -1110,9 +1111,20 @@ fn run_q4_infer(
             let n = prompts.len();
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
             if backend == "gpu" {
-                let acc = llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?;
-                eng = eng.with_acc(std::sync::Arc::new(acc));
-                eprintln!("# backend: gpu (cubecl) — qwen4exp");
+                // gpu_runtime 플래그/env 존중 — 종전 new_hip() 하드코딩은
+                // qwen4exp에서 Vulkan 선택이 무시되는 결함 (2026-09-01 발견).
+                let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> =
+                    if gpu_runtime == "vulkan" {
+                        std::sync::Arc::new(
+                            llm170_backend_gpu::GpuMatmul::new_vulkan().map_err(|e| e.to_string())?,
+                        )
+                    } else {
+                        std::sync::Arc::new(
+                            llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?,
+                        )
+                    };
+                eng = eng.with_acc(acc);
+                eprintln!("# backend: gpu ({gpu_runtime}) — qwen4exp");
             }
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
