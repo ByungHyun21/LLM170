@@ -103,25 +103,47 @@ use llm170_profiler::profile_span;
             // 커널 f32 스칼라·exp 미지원. 수치는 CPU 경로와 동일 순서(열 단위
             // 누산이므로 f32 반올림 수준만 차이).
             let mut gpu_done = false;
-            if t_len == 1 && std::env::var_os("LLM170_GDN_CPU").is_none() {
+            if std::env::var_os("LLM170_GDN_CPU").is_none() {
                 if let Some(acc) = ctx.acc {
-                    let d = d_state;
-                    let k_stride = n_group * d;
-                    let v_stride = dt_rank * d;
-                    let scale = 1.0f32 / (d as f32).sqrt();
-                    let qs: Vec<f32> =
-                        q_all.iter().map(|x| x * scale).collect();
-                    let mut beta_ge = vec![0.0f32; dt_rank * 2];
-                    for h in 0..dt_rank {
-                        beta_ge[h * 2] = beta_all[h];
-                        beta_ge[h * 2 + 1] = g_all[h].exp();
-                    }
-                    let flat_st: &mut [f32] = st;
-                    if acc
-                        .gdn_ar(&qs, &k_all, &v_all, &beta_ge, flat_st, &mut o_all, 1, n_group, dt_rank, d)
-                        .is_ok()
-                    {
-                        gpu_done = true;
+                    if t_len == 1 {
+                        // t=1 GPU AR (P2-1) — q·scale·e^g 사전 계산 (커널 f32
+                        // 스칼라·exp 미지원). 수치는 CPU와 동일 순서.
+                        let d = d_state;
+                        let scale = 1.0f32 / (d as f32).sqrt();
+                        let qs: Vec<f32> = q_all.iter().map(|x| x * scale).collect();
+                        let mut beta_ge = vec![0.0f32; dt_rank * 2];
+                        for h in 0..dt_rank {
+                            beta_ge[h * 2] = beta_all[h];
+                            beta_ge[h * 2 + 1] = g_all[h].exp();
+                        }
+                        let flat_st: &mut [f32] = st;
+                        if acc
+                            .gdn_ar(&qs, &k_all, &v_all, &beta_ge, flat_st, &mut o_all, 1, n_group, dt_rank, d)
+                            .is_ok()
+                        {
+                            gpu_done = true;
+                        }
+                    } else {
+                        // t>1 GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
+                        let flat_st: &mut [f32] = st;
+                        if acc
+                            .gdn_chunk(
+                                &q_all,
+                                &k_all,
+                                &v_all,
+                                &beta_all,
+                                &g_all,
+                                flat_st,
+                                &mut o_all,
+                                t_len,
+                                n_group,
+                                dt_rank,
+                                d_state,
+                            )
+                            .is_ok()
+                        {
+                            gpu_done = true;
+                        }
                     }
                 }
             }

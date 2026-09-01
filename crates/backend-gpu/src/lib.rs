@@ -547,6 +547,78 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(())
     }
 
+    /// GDN 청크 프리필(t>1) — 값 스타일 (03 §3.1). q/k는 l2 완료·무스케일.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_gpu(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        g: &[f32],
+        states: &mut [f32],
+        out: &mut [f32],
+        t_len: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        if d > 128 {
+            return Err("gdn_chunk: d>128 미지원".into());
+        }
+        // 제로 패딩 — 커널은 n_chunks·CS 행을 무조건 판독 (패딩 기여 0).
+        let t_pad = t_len.div_ceil(gdn_kernel::CS_K) * gdn_kernel::CS_K;
+        let mut qp = q.to_vec();
+        let mut kp = k.to_vec();
+        let mut vp = v.to_vec();
+        let mut bp = beta.to_vec();
+        let mut gp = g.to_vec();
+        qp.resize(t_pad * h_k * d, 0.0);
+        kp.resize(t_pad * h_k * d, 0.0);
+        vp.resize(t_pad * h_v * d, 0.0);
+        bp.resize(t_pad * h_v, 0.0);
+        gp.resize(t_pad * h_v, 0.0);
+        let mut outp = vec![0.0f32; t_pad * h_v * d];
+        let t0 = std::time::Instant::now();
+        let qg = self.client.create_from_slice(bytemuck::cast_slice(&qp));
+        let kg = self.client.create_from_slice(bytemuck::cast_slice(&kp));
+        let vg = self.client.create_from_slice(bytemuck::cast_slice(&vp));
+        let bg = self.client.create_from_slice(bytemuck::cast_slice(&bp));
+        let gg = self.client.create_from_slice(bytemuck::cast_slice(&gp));
+        let sg = self.client.create_from_slice(bytemuck::cast_slice(states));
+        let og = self.acquire_buf(outp.len() * 4)?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: 그리드 (h_v,1,1) — 큐브당 헤드, 유닛 64가 dv 분담·가드.
+        unsafe {
+            gdn_kernel::gdn_chunk::launch_unchecked(
+                &self.client,
+                CubeCount::Static(h_v as u32, 1, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg, [1].into(), [qp.len()].into()),
+                TensorArg::from_raw_parts(kg, [1].into(), [kp.len()].into()),
+                TensorArg::from_raw_parts(vg, [1].into(), [vp.len()].into()),
+                TensorArg::from_raw_parts(bg, [1].into(), [bp.len()].into()),
+                TensorArg::from_raw_parts(gg, [1].into(), [gp.len()].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [states.len()].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [outp.len()].into()),
+                t_len,
+                h_k,
+                h_v,
+                d,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw_s = self.client.read_one(sg.clone()).map_err(|e| e.to_string())?;
+        let raw_o = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        states.copy_from_slice(bytemuck::cast_slice(&raw_s));
+        out.copy_from_slice(bytemuck::cast_slice(&raw_o[..out.len() * 4]));
+        self.release_bufs(&[(og, outp.len() * 4)]);
+        Ok(())
+    }
+
     /// GDN β/e^g 사전 계산 — 값 스타일. 출력 [h·2] 인터리브.
     pub fn gdn_beta_g_gpu(
         &self,
@@ -1547,6 +1619,23 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         d: usize,
     ) -> Result<(), String> {
         self.gdn_norm_gated_silu_gpu(o, z, w, out, eps, d)
+    }
+
+    fn gdn_chunk(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        g: &[f32],
+        states: &mut [f32],
+        out: &mut [f32],
+        t_len: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        self.gdn_chunk_gpu(q, k, v, beta, g, states, out, t_len, h_k, h_v, d)
     }
 
     /// 짝 GEMM — 가중치마다 다른 1행 x (MoE down). 런치 배치 + 단일 동기화.

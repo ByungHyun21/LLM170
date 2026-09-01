@@ -105,6 +105,7 @@ fn main() -> ExitCode {
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
         Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
+        Some("gdn-chunk-check") => cmd_gdn_chunk_check(),
         Some("moe-down-check") => cmd_moe_down_check(),
         Some("check") => cmd_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
@@ -859,7 +860,6 @@ fn cmd_gdn_ar_check() -> ExitCode {
     let st_orig = st_c.clone();
     let mut out_c = vec![0.0f32; v_len];
     llm170_core::gdn::gdn_ar_batch(&q, &k, &v, &beta, &g, &mut st_c, &mut out_c, 1, n_group, dt_rank);
-
     if std::env::var_os("LLM170_GDN_CPU").is_some() {
         println!("[skip] LLM170_GDN_CPU");
         return ExitCode::SUCCESS;
@@ -907,6 +907,89 @@ fn cmd_gdn_ar_check() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!("gdn-ar MISMATCH");
+        ExitCode::FAILURE
+    }
+}
+
+/// gdn-chunk-check — GDN 청크(t>1) 커널 GPU↔CPU 상호검증 (합성, 03 §3.1).
+fn cmd_gdn_chunk_check() -> ExitCode {
+    use llm170_core::matmul::Accelerator;
+    // 인수: [t n_group dt_rank d]
+    let a: Vec<usize> = std::env::args()
+        .skip(2)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let (t_len, n_group, dt_rank, d) = if a.len() == 4 {
+        (a[0], a[1], a[2], a[3])
+    } else {
+        (200usize, 8usize, 48usize, 128usize)
+    };
+    let k_len = n_group * d;
+    let v_len = dt_rank * d;
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let q: Vec<f32> = (0..t_len * k_len).map(|_| lcg()).collect();
+    let k: Vec<f32> = (0..t_len * k_len).map(|_| lcg()).collect();
+    let v: Vec<f32> = (0..t_len * v_len).map(|_| lcg()).collect();
+    let beta: Vec<f32> = (0..t_len * dt_rank).map(|_| lcg() + 0.5).collect();
+    // g는 실모델처럼 음수(decay) — 양수 g는 gcs 양향 누적으로 (I+A)⁻¹
+    // 병렬조건 악화 → ulp급 exp 편차 증폭 (AR 관례의 양수 대칭은 비현실).
+    let g: Vec<f32> = (0..t_len * dt_rank).map(|_| lcg() * 4.0 - 4.5).collect();
+
+    let mut st_c: Vec<f32> = (0..dt_rank * d * d).map(|_| lcg()).collect();
+    let st_orig = st_c.clone();
+    let mut out_c = vec![0.0f32; t_len * v_len];
+    llm170_core::gdn::gdn_chunk_seq(&q, &k, &v, &beta, &g, &mut st_c, &mut out_c, t_len, n_group, dt_rank);
+
+    if std::env::var_os("LLM170_GDN_CPU").is_some() {
+        println!("[skip] LLM170_GDN_CPU");
+        return ExitCode::SUCCESS;
+    }
+    let gpu: std::sync::Arc<dyn Accelerator> = match std::env::var("LLM170_GPU_RUNTIME").as_deref() {
+        Ok("vulkan") => match llm170_backend_gpu::GpuMatmul::new_vulkan() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => match llm170_backend_gpu::GpuMatmul::new_hip() {
+            Ok(g) => std::sync::Arc::new(g),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let mut st_g = st_orig.clone();
+    let mut out_g = vec![0.0f32; t_len * v_len];
+    if let Err(e) = gpu.gdn_chunk(&q, &k, &v, &beta, &g, &mut st_g, &mut out_g, t_len, n_group, dt_rank, d) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let rel = |x: &[f32], y: &[f32]| -> f64 {
+        x.iter().zip(y).fold(0.0f64, |m, (a, b)| {
+            let dd = (a - b).abs() as f64;
+            m.max(dd / b.abs().max(1e-3) as f64)
+        })
+    };
+    let (ro, rs) = (rel(&out_g, &out_c), rel(&st_g, &st_c));
+    println!(
+        "[gdn_chunk] t={t_len} n_group={n_group} dt_rank={dt_rank} d={d}: out max_rel={ro:.3e} state max_rel={rs:.3e}"
+    );
+    // 청크 커널은 CPU와 동일 순서 설계 — 엄밀 일치 기대 (f32 라이브러리 exp 편차 허용치)
+    // 실측: 합성 음수-decay g에서 out ≤ 8.7e-6 (exp 라이브러리 ulp 편차).
+    // e2e 게이트가 토큰 일치로 최종 보증.
+    if ro < 2e-5 && rs < 2e-5 {
+        println!("gdn-chunk PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("gdn-chunk MISMATCH");
         ExitCode::FAILURE
     }
 }

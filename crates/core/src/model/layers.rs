@@ -206,18 +206,45 @@ impl Engine {
                         dt_rank,
                     );
                 } else {
-                    crate::gdn::gdn_chunk_seq(
-                        &q_all[r0 * k_len..r1 * k_len],
-                        &k_all[r0 * k_len..r1 * k_len],
-                        &v_all[r0 * v_len..r1 * v_len],
-                        &beta_all[r0 * dt_rank..r1 * dt_rank],
-                        &g_all[r0 * dt_rank..r1 * dt_rank],
-                        st,
-                        &mut o_all[r0 * v_len..r1 * v_len],
-                        t_len,
-                        n_group,
-                        dt_rank,
-                    );
+                    // GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
+                    let mut done = false;
+                    if std::env::var_os("LLM170_GDN_CPU").is_none() {
+                        if let Some(acc_ref) = acc.as_deref() {
+                            let flat_st: &mut [f32] = st;
+                            if acc_ref
+                                .gdn_chunk(
+                                    &q_all[r0 * k_len..r1 * k_len],
+                                    &k_all[r0 * k_len..r1 * k_len],
+                                    &v_all[r0 * v_len..r1 * v_len],
+                                    &beta_all[r0 * dt_rank..r1 * dt_rank],
+                                    &g_all[r0 * dt_rank..r1 * dt_rank],
+                                    flat_st,
+                                    &mut o_all[r0 * v_len..r1 * v_len],
+                                    t_len,
+                                    n_group,
+                                    dt_rank,
+                                    d_state,
+                                )
+                                .is_ok()
+                            {
+                                done = true;
+                            }
+                        }
+                    }
+                    if !done {
+                        crate::gdn::gdn_chunk_seq(
+                            &q_all[r0 * k_len..r1 * k_len],
+                            &k_all[r0 * k_len..r1 * k_len],
+                            &v_all[r0 * v_len..r1 * v_len],
+                            &beta_all[r0 * dt_rank..r1 * dt_rank],
+                            &g_all[r0 * dt_rank..r1 * dt_rank],
+                            st,
+                            &mut o_all[r0 * v_len..r1 * v_len],
+                            t_len,
+                            n_group,
+                            dt_rank,
+                        );
+                    }
                 }
             }
         }

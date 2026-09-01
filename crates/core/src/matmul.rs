@@ -111,6 +111,25 @@ pub trait Accelerator: FrameState + Send + Sync {
     ) -> Result<(), String> {
         Err("gdn_norm_gated_silu: 미지원".into())
     }
+
+    /// GDN 청크 프리필(t>1) — 값 스타일. q/k는 l2 완료·무스케일.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_chunk(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _beta: &[f32],
+        _g: &[f32],
+        _states: &mut [f32],
+        _out: &mut [f32],
+        _t_len: usize,
+        _h_k: usize,
+        _h_v: usize,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("gdn_chunk: 미지원".into())
+    }
     /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
     /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
     fn barrier(&self) {}

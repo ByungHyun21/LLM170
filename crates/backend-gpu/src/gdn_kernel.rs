@@ -63,3 +63,138 @@ pub fn gdn_ar(
     }
     out[v0 + u] = o;
 }
+
+/// gdn_chunk — GDN 청크 프리필 (t>1) GPU 커널 (03 §3.1).
+///
+/// 큐브 = v헤드, 유닛 64개가 dv 열 분담 (dv = u, u+64, …, d≤128 → ≤2열).
+/// 청크 순차(CS=64) · 청크 내 i 순차(전진 대입) — 유닛은 자기 dv열의 d_j를
+/// 로컬 Array로 유지, CPU gdn_chunk_head(gdn.rs:96-216)와 동일 누산 순서
+/// (내적 s2 오름차순·j 오름차순·0-스킵·동일 곱셈 그룹핑).
+/// 호스트가 q/k/v/β/g를 n_chunks·CS로 제로 패딩 — 패딩 기여는 0 (CPU 동일).
+pub const CS_K: usize = 64;
+
+#[cube(launch_unchecked)]
+pub fn gdn_chunk(
+    q: &Tensor<f32>,          // [t_pad][k_stride] — l2 완료, 무스케일, 제로패딩
+    k: &Tensor<f32>,          // [t_pad][k_stride]
+    v: &Tensor<f32>,          // [t_pad][v_stride]
+    beta: &Tensor<f32>,       // [t_pad][h_v]
+    g: &Tensor<f32>,          // [t_pad][h_v]
+    states: &mut Tensor<f32>, // [h_v][d*d] in-place
+    out: &mut Tensor<f32>,    // [t_pad][v_stride] (i<n 행만 유효 기록)
+    t_len: usize,
+    h_k: usize,
+    h_v: usize,
+    d: usize,
+) {
+    let h = CUBE_POS_X as usize;
+    if h >= h_v {
+        terminate!();
+    }
+    let u = UNIT_POS_X as usize;
+    let scale = 1.0f32 / f32::cast_from(d as u32).sqrt();
+    let kh = h % h_k;
+    let k_stride = h_k * d;
+    let n_chunks = (t_len + CS_K - 1) / CS_K;
+    let v_stride = h_v * d;
+    let st_base = h * d * d;
+    let dv0 = u;
+    let dv1 = u + 64;
+
+    for c in 0..n_chunks {
+        let t0 = c * CS_K;
+        let n = (t0 + CS_K).min(t_len) - t0;
+        // gcs 순차 누적 (유닛 로컬 — CPU 순서)
+        let mut gcs = Array::<f32>::new(CS_K);
+        let mut acc = 0.0f32;
+        for t in 0..CS_K {
+            acc += g[(t0 + t) * h_v + h];
+            gcs[t] = acc;
+        }
+        let g_last = gcs[CS_K - 1];
+
+        let mut d_all = Array::<f32>::new(2 * CS_K);
+        for t in 0..(2 * CS_K) {
+            d_all[t] = 0.0;
+        }
+
+        for i in 0..CS_K {
+            let bi = beta[(t0 + i) * h_v + h];
+            let gcs_i = gcs[i];
+            for col in 0..2usize {
+                let dv = dv0 + col * 64;
+                let dc = col * CS_K;
+                if dv < d {
+                    // rhs_i[dv]
+                    let mut oi = bi * v[(t0 + i) * v_stride + h * d + dv];
+                    if bi != 0.0 {
+                        let w0 = bi * gcs_i.exp();
+                        for s2 in 0..d {
+                            let ks = k[(t0 + i) * k_stride + kh * d + s2];
+                            if ks != 0.0 {
+                                oi -= w0 * ks * states[st_base + s2 * d + dv];
+                            }
+                        }
+                    }
+                    // 전진 대입 −Σ_{j<i} A[i,j]·d_j[dv]
+                    for j in 0..i {
+                        let mut dot = 0.0f32;
+                        for s2 in 0..d {
+                            dot += k[(t0 + i) * k_stride + kh * d + s2]
+                                * k[(t0 + j) * k_stride + kh * d + s2];
+                        }
+                        let aij = dot * bi * (gcs_i - gcs[j]).exp();
+                        if aij != 0.0 {
+                            oi -= aij * d_all[dc + j];
+                        }
+                    }
+                    d_all[dc + i] = oi;
+                    // o_i[dv] = e^{gcs_i}·Σ q_i·S + Σ_{j≤i} kq_ij·d_j[dv]
+                    if i < n {
+                        let mut o = 0.0f32;
+                        let qi_exp = gcs_i.exp();
+                        for s2 in 0..d {
+                            let qv = q[(t0 + i) * k_stride + kh * d + s2] * scale;
+                            if qv != 0.0 {
+                                o += qi_exp * qv * states[st_base + s2 * d + dv];
+                            }
+                        }
+                        let i1 = i + 1;
+                        for j in 0..i1 {
+                            let mut dot = 0.0f32;
+                            for s2 in 0..d {
+                                dot += q[(t0 + i) * k_stride + kh * d + s2] * scale
+                                    * k[(t0 + j) * k_stride + kh * d + s2];
+                            }
+                            let kqij = dot * (gcs_i - gcs[j]).exp();
+                            if kqij != 0.0 {
+                                o += kqij * d_all[dc + j];
+                            }
+                        }
+                        out[(t0 + i) * v_stride + h * d + dv] = o;
+                    }
+                }
+            }
+        }
+        // 상태 갱신: S[s2][dv] ← S·e^{g_last} + Σ_{j<n} k_j[s2]·e^{g_last−gcs_j}·d_j[dv]
+        let gl_exp = g_last.exp();
+        for col in 0..2usize {
+            let dv = dv0 + col * 64;
+            let dc = col * CS_K;
+            if dv < d {
+                for s2 in 0..d {
+                    let sb = st_base + s2 * d + dv;
+                    let mut s = states[sb] * gl_exp;
+                    for j in 0..n {
+                        let kj = k[(t0 + j) * k_stride + kh * d + s2];
+                        if kj != 0.0 {
+                            let w = (g_last - gcs[j]).exp();
+                            s += kj * w * d_all[dc + j];
+                        }
+                    }
+                    states[sb] = s;
+                }
+            }
+        }
+    }
+}
