@@ -27,6 +27,19 @@ Element-wise ops (norms, conv, GDN scan, attention scores) still run on CPU —
 GPU-resident forward is the next milestone. `--gpu-runtime vulkan` selects a
 wgpu/Vulkan client; the same kernel source compiles for both runtimes.
 
+qwen4exp is structured as stage modules (`core/src/qwen4exp/stages/`):
+`hc`, `gdn`, `qsa`, `moe`, `ple` are free functions over
+`Ctx { model, acc }` (+ `&mut SeqState4` for stateful stages), with dispatch
+variants for same-input projection groups and per-expert paired rows.
+`Engine4` retains forward/prefill chunking/decode timing only. GPU memory is
+owned exclusively by the buffer arena (`backend-gpu/src/buffers.rs`,
+ADR-0014): weights live in `WeightStore` behind a `WRef` enum that makes
+host-fallback misuse unrepresentable, and `ScratchPool` retains every
+transient upload — nothing is ever freed (VRAM bounded by accounting, not
+by frees). `llm170 check` runs the three-stage verification path
+(tensor scan, GPU-vs-CPU GEMM at t in {1, 64, 1024}, long-chunk smoke)
+in debug or release builds.
+
 ## Mode System
 
 `universal` / `cmp-stock` / `cmp-unlocked` — see [overview.md](overview.md).
@@ -34,6 +47,11 @@ wgpu/Vulkan client; the same kernel source compiles for both runtimes.
   full-rate FMA) + memory budget profile.
 - The engine core (loader, graph, scheduler, sampler) is mode-agnostic.
   Mode-dependent code is confined to kernel selection and the memory planner.
+- Implemented (2026-09-01): `core/src/mode.rs` + `infer|serve --mode` sets
+  the weight-residency and prefill-chunk defaults (`LLM170_W_CAP_GB`,
+  `LLM170_Q4_CHUNK`); explicit env values win. Kernel variants are the
+  remaining half — `Mode` is the branch key when the cmp-stock kernel set
+  lands.
 
 ## Backend Strategy
 
