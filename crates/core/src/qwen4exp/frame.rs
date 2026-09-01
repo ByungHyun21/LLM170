@@ -241,7 +241,7 @@ pub fn decode_frame(
             let mut r = vec![0.0f32; hc * n];
             acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
             let mut rows = vec![r];
-            stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows)?;
+            stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
             acc.frame_write(f.res_hc, &rows[0]).map_err(Q4Error::Io)?;
         }
 

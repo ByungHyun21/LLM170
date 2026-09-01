@@ -356,29 +356,15 @@ impl Model4 {
     /// head들이 0..320M 행을 오프셋으로 분할 — 변환 스크립트 flatten 축).
     pub fn ple_gather(&self, rows: &[u32], out: &mut [f32]) -> Result<(), Q4Error> {
         let table = self.w4("per_layer_token_embd.weight")?;
-        let hd = self.hp.ple_head_dim;
-        debug_assert_eq!(out.len(), rows.len() * hd);
-        let (blck, bsize) = table.ty.block_info();
-        for (hi, &row) in rows.iter().enumerate() {
-            let base = row as u64 * hd as u64;
-            let byte_off = base / blck * bsize;
-            let k = base % blck;
-            // 행 시작이 블록 경계(32원소 iq4_nl)에 정렬 — hd=160, blck=32 → 항상 정렬.
-            let mut tmp = [0.0f32; 512];
-            let n_blocks = (hd as u64).div_ceil(blck) as usize;
-            for b in 0..n_blocks {
-                dequant_row(
-                    table.ty,
-                    &table.data[byte_off as usize + b * bsize as usize..],
-                    0,
-                    blck,
-                    &mut tmp[b * blck as usize..(b + 1) * blck as usize],
-                );
-            }
-            out[hi * hd..(hi + 1) * hd].copy_from_slice(&tmp[..hd]);
-            let _ = k;
-        }
+        ple_gather_parts(table.data, table.ty, self.hp.ple_head_dim, rows, out);
         Ok(())
+    }
+
+    /// 프리페치용 테이블 뷰 — 사이드 스레드가 mmap 읽기+디양자화에 필요한 최소부.
+    /// mmap은 엔진 수명과 일치 (스레드 조인을 decode1 시작부에서 보장).
+    pub fn ple_table_view(&self) -> Result<(usize, usize, llm170_gguf::GgmlType, usize), Q4Error> {
+        let table = self.w4("per_layer_token_embd.weight")?;
+        Ok((table.data.as_ptr() as usize, table.data.len(), table.ty, self.hp.ple_head_dim))
     }
 
     /// 표면형 근사 디토크.
@@ -435,5 +421,33 @@ mod tests {
         assert_eq!((e0.n_in, e0.n_out), (2560, 640));
         let e511 = m.expert_w("blk.0.ffn_up_exps.weight", 511).expect("expert 511");
         assert_eq!((e511.n_in, e511.n_out), (2560, 640));
+    }
+}
+
+/// 순수 PLE 행 gather — 테이블 바이트·타입만 받는 standalone (프리페치
+/// 스레드가 Model4 없이 재사용). 본체와 동일 디양자화 순서.
+pub fn ple_gather_parts(
+    data: &[u8],
+    ty: llm170_gguf::GgmlType,
+    hd: usize,
+    rows: &[u32],
+    out: &mut [f32],
+) {
+    let (blck, bsize) = ty.block_info();
+    for (hi, &row) in rows.iter().enumerate() {
+        let base = row as u64 * hd as u64;
+        let byte_off = base / blck * bsize;
+        let mut tmp = [0.0f32; 512];
+        let n_blocks = (hd as u64).div_ceil(blck) as usize;
+        for b in 0..n_blocks {
+            dequant_row(
+                ty,
+                &data[byte_off as usize + b * bsize as usize..],
+                0,
+                blck,
+                &mut tmp[b * blck as usize..(b + 1) * blck as usize],
+            );
+        }
+        out[hi * hd..(hi + 1) * hd].copy_from_slice(&tmp[..hd]);
     }
 }

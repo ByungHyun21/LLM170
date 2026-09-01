@@ -14,6 +14,7 @@ use llm170_profiler::profile_span;
         il: usize,
         res_hc: &mut Vec<Vec<f32>>,
         rows: &[u32],
+        prefetched: Option<Vec<f32>>,
     ) -> Result<(), Q4Error> {
         profile_span!("q4::ple");
         let hp = ctx.model.hp.clone();
@@ -32,11 +33,21 @@ use llm170_profiler::profile_span;
         let tm_on = std::env::var_os("LLM170_Q4_TIME").is_some();
         let t_g0 = std::time::Instant::now();
 
-        // emb gather [t][2560]
+        // emb gather [t][heads·ple_head_dim]
         let heads = hp.ple_heads_per_ngram * 2; // bigram+trigram = 16
         let emb_w = heads * hp.ple_head_dim; // 16×160 = 2560
         let mut emb = vec![vec![0.0f32; emb_w]; t];
+        let mut used_prefetch = false;
         for (ti, r) in rows.chunks(heads).enumerate() {
+            if ti == 0 && !used_prefetch {
+                if let Some(p) = &prefetched {
+                    if p.len() == emb_w {
+                        emb[0] = p.clone();
+                        used_prefetch = true;
+                        continue;
+                    }
+                }
+            }
             let mut flat = vec![0.0f32; emb_w];
             ctx.model.ple_gather(r, &mut flat)?;
             emb[ti] = flat;
@@ -220,4 +231,5 @@ use llm170_profiler::profile_span;
         seq.ple_next_pos = seq.pos + tokens.len() as u32;
         rows
     }
+
 

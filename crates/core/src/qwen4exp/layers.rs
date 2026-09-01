@@ -62,6 +62,19 @@ pub struct Engine4 {
     pub acc: Option<std::sync::Arc<dyn Accelerator>>,
     /// 프레임(활성화 상주) 상태 — LLM170_FRAME=1 첫 디코드에서 생성.
     pub frame: Option<super::frame::Frame4>,
+    /// PLE 프리페치 (05-2) — 토큰 t 확정 직후 t+1분 16행×ple_head_dim을
+    /// 사이드 스레드에서 mmap 읽기+디양자화. 다음 decode의 ple_block이 소비.
+    pub ple_next: Option<std::sync::Arc<std::sync::Mutex<PlePrefetched>>>,
+    /// 소비 대기 emb (prefetch 히트분) — decode1이 채우고 forward가 take.
+    ple_consume: Option<Vec<f32>>,
+    /// 프리페치 사이드 스레드 핸들 — 다음 스텝 시작부 조인 (mmap 수명 보장).
+    ple_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// 사이드 스레드가 채운 프리페치 결과 — token이 다음 입력과 일치할 때만 사용.
+pub struct PlePrefetched {
+    pub token: u32,
+    pub emb: Vec<f32>,
 }
 
 /// 스테이지별 누적(µs) — LLM170_Q4_TIME=1일 때 prefill/decode 완료 후 보고.
@@ -92,7 +105,7 @@ impl Q4Timings {
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
-        Engine4 { model, seqs, acc: None, frame: None }
+        Engine4 { model, seqs, acc: None, frame: None, ple_next: None, ple_consume: None, ple_worker: None }
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
@@ -179,7 +192,9 @@ impl Engine4 {
                 eprintln!("q4 layer {il} t={t_len}");
             }
             if hp.is_ple(il) {
-                stage!(ple, stages::ple_block(&ctx, seq_st, il, &mut res_hc, &ple_rows)?);
+                // 05-2 프리페치 소비 — decode1이 예측 토큰분 emb를 stash.
+                let pre = if t_len == 1 { self.ple_consume.take() } else { None };
+                stage!(ple, stages::ple_block(&ctx, seq_st, il, &mut res_hc, &ple_rows, pre)?);
             }
             let (mix, inject) = stage!(hc, stages::hc_mix(&ctx, il, "attn", &res_hc)?);
             let attn_out = if hp.is_recr(il) {
@@ -289,11 +304,23 @@ impl Engine4 {
     }
 
     /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
-    /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 (활성화 버퍼는 스텝마다 재사용).
+    /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 + PLE 프리페치 조인·소비.
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
+        // 05-2: 직전 스텝이 예측한 토큰의 프리페치 완료 대기 (조인)
+        if let Some(h) = self.ple_worker.take() {
+            let _ = h.join();
+        }
+        // 예측 토큰 == 실제 입력 토큰이면 소비 대기로 스태시
+        if let Some(slot) = self.ple_next.take() {
+            if let Ok(mut g) = slot.lock() {
+                if g.token == token && !g.emb.is_empty() {
+                    self.ple_consume = Some(std::mem::take(&mut g.emb));
+                }
+            }
+        }
         let frame_on = self.acc.is_some()
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0");
-        if frame_on {
+        let logits = if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {
                 self.frame = Some(super::frame::Frame4::new(acc, &self.model, &self.seqs)?);
@@ -303,24 +330,124 @@ impl Engine4 {
                 f.sync_states(acc, seq, &self.seqs[seq])?;
             }
             let ctx = Ctx { model: &self.model, acc: Some(acc) };
-            let logits = super::frame::decode_frame(
+            super::frame::decode_frame(
                 acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
-            )?;
-            self.seqs[seq].pos += 1;
-            return Ok(logits);
-        }
-        let mut tm = init_timings();
-        let logits = self.forward_timed(seq, &[token], tm.as_mut())?;
-        if let Some(t) = &tm {
-            t.report("decode1");
-        }
+            )?
+        } else {
+            let mut tm = init_timings();
+            let l = self.forward_timed(seq, &[token], tm.as_mut())?;
+            if let Some(t) = &tm {
+                t.report("decode1");
+            }
+            l
+        };
         self.seqs[seq].pos += 1;
+        self.spawn_ple_prefetch(seq, &logits);
         Ok(logits)
+    }
+
+    /// 토큰 t의 로짓이 확정된 순간 t+1(=argmax)의 PLE 행을 사이드 스레드로
+    /// 선적재 — 해시는 과거 토큰만의 함수라 오차 없는 선(先)적재 (05 §3).
+    /// LLM170_PLE_PREFETCH=1 게이트. np 디코드: 마지막 활성 시퀀스만.
+    fn spawn_ple_prefetch(&mut self, seq: usize, logits: &[f32]) {
+        if std::env::var_os("LLM170_PLE_PREFETCH").is_none()
+            || !self.model.hp.is_ple(1)
+            || logits.is_empty()
+        {
+            return;
+        }
+        let (ptr, len, ty, hd) = match self.model.ple_table_view() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let next_tok = crate::model::greedy(logits);
+        let hp_ngram = self.model.hp.ple_ngram;
+        let hist = self.seqs[seq].ple_hist.clone();
+        let hist_valid = self.seqs[seq].ple_next_pos == self.seqs[seq].pos;
+        let mult: Vec<u64> = self.model.hp.ple_multipliers.iter().copied().collect();
+        let offs: Vec<u64> = self.model.hp.ple_head_offsets.iter().copied().collect();
+        let vs: Vec<u64> = self.model.hp.ple_head_vocab_sizes.iter().copied().collect();
+        let hpng = self.model.hp.ple_heads_per_ngram;
+        let eos = self.model.hp.ple_eos;
+        let heads = hpng * 2;
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(PlePrefetched {
+            token: next_tok,
+            emb: Vec::new(),
+        }));
+        self.ple_next = Some(slot.clone());
+        // SAFETY: mmap 데이터 포인터는 Engine4(나아가 프로세스 수명)와 함께
+        // 살고, worker는 다음 decode1 시작부에서 반드시 조인한다 — 조인 전
+        // 엔진 drop 경로 없음 (서버 슬롯 루프도 decode1 직렬 호출).
+        self.ple_worker = Some(std::thread::spawn(move || {
+            let rows = pure_hash(&hist, hist_valid, &[next_tok], hp_ngram, hpng, &mult, &offs, &vs, eos);
+            let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            let mut emb = vec![0.0f32; heads * hd];
+            super::ple_gather_parts(data, ty, hd, &rows, &mut emb);
+            if let Ok(mut g) = slot.lock() {
+                g.emb = emb;
+            }
+        }));
     }
 
     pub fn piece(&self, tok: u32) -> String {
         self.model.piece(tok)
     }
+}
+
+/// 프리페치 워커용 순수 n-gram 해시 — ple_hash와 동일 수식 (파라미터만 전달).
+fn pure_hash(
+    hist: &[u32],
+    hist_valid: bool,
+    tokens: &[u32],
+    ngram: usize,
+    hpng: usize,
+    mult: &[u64],
+    offs: &[u64],
+    vs: &[u64],
+    eos: u32,
+) -> Vec<u32> {
+    let heads = hpng * 2;
+    let mut hist: Vec<u32> = if hist_valid { hist.to_vec() } else { vec![eos; ngram - 1] };
+    let mut rows = Vec::with_capacity(tokens.len() * heads);
+    for (i, &tok) in tokens.iter().enumerate() {
+        let mut ctx = vec![tok as u64; ngram];
+        let mut cut = false;
+        for s in 1..ngram {
+            let j = i as i64 - s as i64;
+            let prev: u64 = if j >= 0 {
+                tokens[j as usize] as u64
+            } else {
+                let back = s as i64 - i as i64;
+                let k = hist.len() as i64 - back;
+                if k >= 0 && (k as usize) < hist.len() {
+                    hist[k as usize] as u64
+                } else {
+                    eos as u64
+                }
+            };
+            ctx[s] = if cut { eos as u64 } else { prev };
+            if ctx[s] == eos as u64 {
+                cut = true;
+            }
+        }
+        for n in 2..=ngram {
+            let mut mixed = ctx[0].wrapping_mul(mult[0]);
+            for j in 1..n {
+                mixed ^= ctx[j].wrapping_mul(mult[j]);
+            }
+            let base = (n - 2) * hpng;
+            for g in 0..hpng {
+                let h = base + g;
+                rows.push((mixed % vs[h] + offs[h]) as u32);
+            }
+        }
+        hist.push(tok);
+        if hist.len() > ngram - 1 {
+            let cutn = hist.len() - (ngram - 1);
+            hist.drain(..cutn);
+        }
+    }
+    rows
 }
 
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).
