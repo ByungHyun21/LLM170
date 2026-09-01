@@ -62,12 +62,12 @@ pub struct Frame4 {
     pub lo_len: usize,
     pub hlo_len: usize,
     // ── 시퀀스별 상주 상태 (순환 idx / full idx 순) ──
-    pub st_gdn: Vec<u64>,  // [n_recr][dt_rank·d·d]
-    pub st_conv: Vec<u64>, // [n_recr][(k-1)·conv_ch]
+    pub st_gdn: Vec<Vec<u64>>,  // [n_seqs][n_recr][dt_rank·d·d]
+    pub st_conv: Vec<Vec<u64>>, // [n_seqs][n_recr][(k-1)·conv_ch]
     // ── 상수 (이름 → 핸들) — f32 norm류 등 스텝 프레임에 미리 상주 ──
     pub consts: HashMap<String, u64>,
-    /// 값 경로 prefill 이후 상태 재동기 필요 플래그.
-    pub dirty: bool,
+    /// 시퀀스별 값 경로 prefill 이후 상태 재동기 필요 플래그.
+    pub dirty: Vec<bool>,
 }
 
 fn alloc(acc: &dyn Accelerator, len: usize) -> Result<u64, Q4Error> {
@@ -135,18 +135,22 @@ impl Frame4 {
             logits: a(hp.vocab)?,
             lo_len: lo_n,
             hlo_len: hlo_n,
-            st_gdn: Vec::with_capacity(n_recr),
-            st_conv: Vec::with_capacity(n_recr),
+            st_gdn: Vec::with_capacity(seqs.len()),
+            st_conv: Vec::with_capacity(seqs.len()),
             consts: HashMap::new(),
-            dirty: true,
+            dirty: vec![true; seqs.len()],
         };
-        // 시퀀스별 GDN 상태 — 시퀀스 0 기준 할당, 이후 시퀀스는 별도 풀.
-        // v1: 디코드 단일 시퀀스 가정 (np 디코드는 seq별 순차 처리 —
-        // 스테이트 스왑은 v2에서 st_gdn을 [n_seqs][n_recr]로 확장).
-        for ri in 0..n_recr {
-            f.st_gdn.push(a(hp.dt_rank * hp.d_state * hp.d_state)?);
-            f.st_conv.push(a((hp.conv_k - 1) * conv_ch)?);
-            let _ = ri;
+        // 시퀀스별 GDN 상태 핸들 세트 — np 디코드 지원 (스테이트 스왑 없이
+        // 시퀀스 고유 핸들 세트를 소유; 활성화 버퍼는 스텝마다 재사용).
+        for _ in 0..seqs.len() {
+            let mut gdn = Vec::with_capacity(n_recr);
+            let mut conv = Vec::with_capacity(n_recr);
+            for _ in 0..n_recr {
+                gdn.push(a(hp.dt_rank * hp.d_state * hp.d_state)?);
+                conv.push(a((hp.conv_k - 1) * conv_ch)?);
+            }
+            f.st_gdn.push(gdn);
+            f.st_conv.push(conv);
         }
         // 상수 가중치 업로드 — 층별 norm류 + GDN 스칼라 계수.
         let mut put = |name: &str, v: &[f32]| -> Result<(), Q4Error> {
@@ -171,20 +175,22 @@ impl Frame4 {
             }
         }
         put("output_hc_norm", &model.f32_vec4("output_hc_norm.weight")?)?;
-        // 시퀀스 0의 현재 CPU 상태를 초기값으로 (dirty 해소)
-        f.sync_states(acc, &seqs[0])?;
+        // 전 시퀀스의 현재 CPU 상태를 초기값으로 (dirty 해소)
+        for (si, st) in seqs.iter().enumerate() {
+            f.sync_states(acc, si, st)?;
+        }
         Ok(f)
     }
 
-    /// CPU SeqState4의 GDN 상태를 GPU로 재동기 (prefill 직후).
-    pub fn sync_states(&mut self, acc: &dyn Accelerator, st: &SeqState4) -> Result<(), Q4Error> {
-        for (ri, h) in self.st_gdn.iter().enumerate() {
+    /// CPU SeqState4의 GDN 상태를 GPU로 재동기 (prefill 직후) — 시퀀스 지정.
+    pub fn sync_states(&mut self, acc: &dyn Accelerator, seq: usize, st: &SeqState4) -> Result<(), Q4Error> {
+        for (ri, h) in self.st_gdn[seq].iter().enumerate() {
             acc.frame_write(*h, &st.gdn_s[ri]).map_err(Q4Error::Io)?;
         }
-        for (ri, h) in self.st_conv.iter().enumerate() {
+        for (ri, h) in self.st_conv[seq].iter().enumerate() {
             acc.frame_write(*h, &st.conv[ri]).map_err(Q4Error::Io)?;
         }
-        self.dirty = false;
+        self.dirty[seq] = false;
         Ok(())
     }
 }
@@ -194,6 +200,7 @@ pub fn decode_frame(
     acc: &dyn Accelerator,
     model: &Model4,
     ctx: &Ctx,
+    seq: usize,
     seq_st: &mut SeqState4,
     f: &mut Frame4,
     token: u32,
@@ -243,7 +250,7 @@ pub fn decode_frame(
 
         // 3) attention — GDN 프레임 / QSA 값 브리지
         if hp.is_recr(il) {
-            gdn_frame(acc, model, f, il, recr_idx, conv_ch, k_len, v_len, eps)?;
+            gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps)?;
             recr_idx += 1;
             let o = f.ffn_out;
             let inj = f.inj;
@@ -326,6 +333,7 @@ fn gdn_frame(
     model: &Model4,
     f: &mut Frame4,
     il: usize,
+    seq: usize,
     ri: usize,
     conv_ch: usize,
     k_len: usize,
@@ -346,7 +354,7 @@ fn gdn_frame(
     op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank })?;
     // conv + ring
     let cw = f.consts[&format!("blk.{il}.conv_w")];
-    op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
+    op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
     // q/k/v 분할 + l2 + q·scale
     op(acc, FrameOp::CopyRows { src: f.gconv, dst: f.gq, src_off: 0, dst_off: 0, n: k_len })?;
     op(acc, FrameOp::CopyRows { src: f.gconv, dst: f.gk, src_off: k_len, dst_off: 0, n: k_len })?;
@@ -357,7 +365,7 @@ fn gdn_frame(
     op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len })?;
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
-    fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
+    fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
         .map_err(Q4Error::Io)?;
     // norm_gated + out proj
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];

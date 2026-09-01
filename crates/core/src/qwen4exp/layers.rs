@@ -228,7 +228,9 @@ impl Engine4 {
         // CPU 상태를 영점화했다 — 프레임 GPU 상태는 stale이므로 pull 금지
         // (dirty=true → 다음 prefill 후 decode에서 재동기).
         if let Some(f) = &mut self.frame {
-            f.dirty = true;
+            for d in f.dirty.iter_mut() {
+                *d = true;
+            }
         }
         let ctx = self.seqs.first().map(|s| s.kv_k.first().map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim)).unwrap_or(4096)).unwrap_or(4096);
         for i in 0..self.seqs.len() {
@@ -249,13 +251,13 @@ impl Engine4 {
         // 프레임 상태가 권위적이면(직전 디코드) CPU 사본을 GPU에서 갱신 —
         // 이후 값 경로 prefill이 정합 상태에서 시작한다.
         if let Some(f) = &self.frame {
-            if !f.dirty {
+            if !f.dirty[seq] {
                 if let Some(acc) = self.acc.as_deref() {
                     let st = &mut self.seqs[seq];
-                    for (ri, h) in f.st_gdn.iter().enumerate() {
+                    for (ri, h) in f.st_gdn[seq].iter().enumerate() {
                         acc.frame_read(*h, &mut st.gdn_s[ri]).map_err(Q4Error::Io)?;
                     }
-                    for (ri, h) in f.st_conv.iter().enumerate() {
+                    for (ri, h) in f.st_conv[seq].iter().enumerate() {
                         acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
                     }
                 }
@@ -270,7 +272,7 @@ impl Engine4 {
             }
             self.seqs[seq].pos += ch.len() as u32;
             if let Some(f) = &mut self.frame {
-                f.dirty = true; // 값 경로가 상태를 갱신 — 프레임 재동기 필요
+                f.dirty[seq] = true; // 값 경로가 상태를 갱신 — 프레임 재동기 필요
             }
             last = Some(logits);
         }
@@ -278,10 +280,9 @@ impl Engine4 {
     }
 
     /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
-    /// 단일 시퀀스에서만 프레임 (다중 시퀀스는 상태 스왑 미구현 — 값 경로).
+    /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 (활성화 버퍼는 스텝마다 재사용).
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
         let frame_on = self.acc.is_some()
-            && self.seqs.len() == 1
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0");
         if frame_on {
             let acc = self.acc.as_deref().unwrap();
@@ -289,12 +290,12 @@ impl Engine4 {
                 self.frame = Some(super::frame::Frame4::new(acc, &self.model, &self.seqs)?);
             }
             let f = self.frame.as_mut().unwrap();
-            if f.dirty {
-                f.sync_states(acc, &self.seqs[seq])?;
+            if f.dirty[seq] {
+                f.sync_states(acc, seq, &self.seqs[seq])?;
             }
             let ctx = Ctx { model: &self.model, acc: Some(acc) };
             let logits = super::frame::decode_frame(
-                acc, &self.model, &ctx, &mut self.seqs[seq], f, token,
+                acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
             )?;
             self.seqs[seq].pos += 1;
             return Ok(logits);
