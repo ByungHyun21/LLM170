@@ -14,7 +14,7 @@ use llm170_profiler::profile_span;
         il: usize,
         res_hc: &mut Vec<Vec<f32>>,
         rows: &[u32],
-        prefetched: Option<Vec<f32>>,
+        prefetched: Option<Vec<Vec<f32>>>,
     ) -> Result<(), Q4Error> {
         profile_span!("q4::ple");
         let hp = ctx.model.hp.clone();
@@ -37,20 +37,33 @@ use llm170_profiler::profile_span;
         let heads = hp.ple_heads_per_ngram * 2; // bigram+trigram = 16
         let emb_w = heads * hp.ple_head_dim; // 16×160 = 2560
         let mut emb = vec![vec![0.0f32; emb_w]; t];
-        let mut used_prefetch = false;
-        for (ti, r) in rows.chunks(heads).enumerate() {
-            if ti == 0 && !used_prefetch {
-                if let Some(p) = &prefetched {
-                    if p.len() == emb_w {
-                        emb[0] = p.clone();
-                        used_prefetch = true;
-                        continue;
+        let hit = prefetched
+            .as_ref()
+            .is_some_and(|p| p.len() == t && p.iter().all(|r| r.len() == emb_w));
+        if !hit {
+            for (ti, r) in rows.chunks(heads).enumerate() {
+                let mut flat = vec![0.0f32; emb_w];
+                ctx.model.ple_gather(r, &mut flat)?;
+                emb[ti] = flat;
+            }
+        } else {
+            emb = prefetched.unwrap();
+            if std::env::var_os("LLM170_PLE_VERIFY").is_some() {
+                for (ti, r) in rows.chunks(heads).enumerate() {
+                    let mut chk = vec![0.0f32; emb_w];
+                    ctx.model.ple_gather(r, &mut chk)?;
+                    for i in 0..emb_w {
+                        if (chk[i] - emb[ti][i]).abs() > 1e-6 {
+                            eprintln!("# PLE VERIFY FAIL t={t} ti={ti} i={i} pre={} chk={}", emb[ti][i], chk[i]);
+                            break;
+                        }
                     }
                 }
+                eprintln!("# PLE VERIFY t={t} done");
             }
-            let mut flat = vec![0.0f32; emb_w];
-            ctx.model.ple_gather(r, &mut flat)?;
-            emb[ti] = flat;
+            if std::env::var_os("LLM170_Q4_TIME").is_some() {
+                eprintln!("# ple-stage t={t}: prefetch HIT (gather 스킵)");
+            }
         }
         let t_gather = t_g0.elapsed();
         let t_m0 = std::time::Instant::now();

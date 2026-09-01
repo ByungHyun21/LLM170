@@ -65,8 +65,8 @@ pub struct Engine4 {
     /// PLE 프리페치 (05-2) — 토큰 t 확정 직후 t+1분 16행×ple_head_dim을
     /// 사이드 스레드에서 mmap 읽기+디양자화. 다음 decode의 ple_block이 소비.
     pub ple_next: Option<std::sync::Arc<std::sync::Mutex<PlePrefetched>>>,
-    /// 소비 대기 emb (prefetch 히트분) — decode1이 채우고 forward가 take.
-    ple_consume: Option<Vec<f32>>,
+    /// 소비 대기 emb (prefetch 히트분) — decode1/prefill이 채우고 forward가 take.
+    ple_consume: Option<Vec<Vec<f32>>>,
     /// 프리페치 사이드 스레드 핸들 — 다음 스텝 시작부 조인 (mmap 수명 보장).
     ple_worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -192,7 +192,8 @@ impl Engine4 {
                 eprintln!("q4 layer {il} t={t_len}");
             }
             if hp.is_ple(il) {
-                // 05-2 프리페치 소비 — decode1이 예측 토큰분 emb를 stash.
+                // 05-2 프리페치 소비 — decode1이 stash한 emb (t=1 전용.
+                // 프리필 전량 선적재(05-3)는 chunk 경계 행 불일치로 보류 — 주석 참조).
                 let pre = if t_len == 1 { self.ple_consume.take() } else { None };
                 stage!(ple, stages::ple_block(&ctx, seq_st, il, &mut res_hc, &ple_rows, pre)?);
             }
@@ -314,7 +315,7 @@ impl Engine4 {
         if let Some(slot) = self.ple_next.take() {
             if let Ok(mut g) = slot.lock() {
                 if g.token == token && !g.emb.is_empty() {
-                    self.ple_consume = Some(std::mem::take(&mut g.emb));
+                    self.ple_consume = Some(vec![std::mem::take(&mut g.emb)]);
                 }
             }
         }
