@@ -36,7 +36,6 @@ pub struct SlotJob {
     /// 최종 결과 송신.
     pub out: std::sync::mpsc::Sender<InferResult>,
 }
-
 struct Slot {
     job: Option<SlotJob>,
     prefilled: usize,
@@ -44,13 +43,16 @@ struct Slot {
     generated: u32,
     tokens: Vec<u32>,
     touch: u64,
+    /// 클라이언트 절단 — progress 채널 송신 실패로 감지 (SSE flush 실패).
+    cancelled: bool,
 }
 
 impl Slot {
     fn free() -> Self {
-        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0 }
+        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0, cancelled: false }
     }
 }
+
 
 /// qwen4exp 로드 재시도 — transient ENOENT 회복 (최대 5회×1s).
 fn load_q4_retry(p: &std::path::Path) -> llm170_core::qwen4exp::Model4 {
@@ -118,6 +120,7 @@ pub fn slot_loop(
                 generated: 0,
                 tokens: Vec::new(),
                 touch: tick,
+                cancelled: false,
             };
         }
         tick += 1;
@@ -196,6 +199,7 @@ pub fn slot_loop(
                         generated: 0,
                         tokens: Vec::new(),
                         touch: tick,
+                        cancelled: false,
                     };
                 }
                 Err(_) => break,
@@ -209,14 +213,16 @@ fn slot_step(s: &mut Slot, logits: &[f32]) {
     let t = llm170_core::model::greedy(logits);
     slot_emit(s, t);
 }
-
 fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;
     if let Some(j) = &s.job {
         if let Some(p) = &j.progress {
-            let _ = p.send(t);
+            if p.send(t).is_err() {
+                // SSE 수신자 소멸(클라이언트 절단) — 즉시 취소 표시
+                s.cancelled = true;
+            }
         }
     }
 }
@@ -224,7 +230,8 @@ fn slot_emit(s: &mut Slot, t: u32) {
 /// 완료 조건 검사 — EOS/예산 소진 → 결과 전송·슬롯 반환.
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
     let done = s.job.as_ref().is_some_and(|j| {
-        s.prefilled == j.tokens.len() && (s.next == eos || s.generated as usize >= j.n_predict.max(1))
+        s.prefilled == j.tokens.len()
+            && (s.cancelled || s.next == eos || s.generated as usize >= j.n_predict.max(1))
     });
     if done {
         if let Some(j) = s.job.take() {

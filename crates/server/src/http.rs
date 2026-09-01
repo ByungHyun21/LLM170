@@ -265,6 +265,18 @@ fn run_and_emit(
     stream_mode: bool,
     chat: bool,
 ) {
+    // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
+    // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
+    let ctx = std::env::var("LLM170_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096);
+    if ids.len() + n_predict + 8 >= ctx {
+        resp(stream, 400, "application/json", &format!(
+            "{{\"error\":\"context too small: prompt {} + n_predict {} >= ctx {}\"}}",
+            ids.len(), n_predict, ctx));
+        return;
+    }
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
     let (ptx, prx) = std::sync::mpsc::channel::<u32>();
     let job = SlotJob {
@@ -273,7 +285,7 @@ fn run_and_emit(
         progress: stream_mode.then_some(ptx),
         out: otx,
     };
-    if tx.send(job).is_err() {
+    if tx.try_send(job).is_err() {
         resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
         return;
     }
@@ -324,7 +336,7 @@ fn run_and_emit_anthropic(
         progress: stream_mode.then_some(ptx),
         out: otx,
     };
-    if tx.send(job).is_err() {
+    if tx.try_send(job).is_err() {
         resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
         return;
     }
