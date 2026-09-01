@@ -30,7 +30,12 @@ pub fn serve(addr: &str, req: InferRequest, backend: BackendSel) -> Result<(), S
             if job.fresh {
                 eng.reset();
             }
-            let r = eng.run(job.tokens, job.n_predict);
+            let r = match job.progress {
+                Some(ptx) => eng.run_with_progress(job.tokens, job.n_predict, |t| {
+                    let _ = ptx.send(t);
+                }),
+                None => eng.run(job.tokens, job.n_predict),
+            };
             let _ = out.send(r);
         }
     });
@@ -49,6 +54,8 @@ pub struct Job {
     pub n_predict: usize,
     /// true면 상태 리셋 후 prefill (무상태 HTTP 요청의 기본).
     pub fresh: bool,
+    /// 토큰별 진행 채널 — 스트리밍 모드에서 생성 즉시 SSE 전송 (2026-09-01).
+    pub progress: Option<std::sync::mpsc::Sender<u32>>,
 }
 
 pub type TokOut = InferResult;
@@ -263,7 +270,14 @@ fn run_and_emit(
     chat: bool,
 ) {
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
-    if tx.send((Job { tokens: ids, n_predict, fresh: true }, otx)).is_err() {
+    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
+    let job = Job {
+        tokens: ids,
+        n_predict,
+        fresh: true,
+        progress: stream_mode.then_some(ptx),
+    };
+    if tx.send((job, otx)).is_err() {
         resp(stream, 500, "application/json", "{\"error\":\"engine unavailable\"}");
         return;
     }
@@ -282,22 +296,20 @@ fn run_and_emit(
         return;
     }
     resp_sse_open(stream);
-    let mut pos = 0u32;
-    while let Ok(r) = orx.recv() {
-        for t in r.tokens {
-            pos += 1;
-            let piece = crate::engine::piece_escaped(t);
-            if chat {
-                sse(
-                    stream,
-                    "message",
-                    &format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{piece}\"}}}}]}}"),
-                );
-            } else {
-                sse(stream, "message", &format!("{{\"text\":\"{piece}\"}}"));
-            }
+    // 토큰 생성 즉시 SSE — 장문 요청이 완료까지 굳지 않게 (2026-09-01).
+    for t in prx {
+        let piece = crate::engine::piece_escaped(t);
+        if chat {
+            sse(
+                stream,
+                "message",
+                &format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{piece}\"}}}}]}}"),
+            );
+        } else {
+            sse(stream, "message", &format!("{{\"text\":\"{piece}\"}}"));
         }
     }
+    let _ = orx.recv(); // 최종 결과 수령 (종료 정리)
     sse(stream, "done", "[DONE]");
 }
 
@@ -309,8 +321,32 @@ fn run_and_emit_anthropic(
     stream_mode: bool,
 ) {
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
-    if tx.send((Job { tokens: ids, n_predict, fresh: true }, otx)).is_err() {
+    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
+    let job = Job {
+        tokens: ids,
+        n_predict,
+        fresh: true,
+        progress: stream_mode.then_some(ptx),
+    };
+    if tx.send((job, otx)).is_err() {
         resp(stream, 500, "application/json", "{\"error\":\"engine unavailable\"}");
+        return;
+    }
+    if stream_mode {
+        resp_sse_open(stream);
+        sse(stream, "message_start", "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}");
+        for t in prx {
+            let p = crate::engine::piece_plain(t);
+            let esc = p.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            sse(
+                stream,
+                "content_block_delta",
+                &format!("{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"),
+            );
+        }
+        let _ = orx.recv();
+        sse(stream, "message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}");
+        sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         return;
     }
     let mut all = Vec::new();

@@ -384,9 +384,21 @@ impl Engine {
 
     /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
-        let logits = self.forward(&[seq], &[tokens.to_vec()])?;
-        self.seqs[seq].pos += tokens.len() as u32;
-        Ok(logits.into_iter().next().unwrap())
+        // 1024토큰 청크 — qwen4exp와 동일 근거: 단일 초대형 forward는 GPU
+        // 스크래치·상태 크기를 폭주시킨다 (qwen4exp GPF 실측, 2026-08-31).
+        // 청킹은 수치 불변 (GDN chunked·attention 캐시는 순차 적립).
+        let chunk: usize = std::env::var("LLM170_Q35_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024)
+            .clamp(16, 1024);
+        let mut last = None;
+        for ch in tokens.chunks(chunk) {
+            let logits = self.forward(&[seq], &[ch.to_vec()])?;
+            self.seqs[seq].pos += ch.len() as u32;
+            last = Some(logits.into_iter().next().unwrap());
+        }
+        Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
     /// 표면형 근사 디토크 (표시용 — 정식 BPE 디토크나이저는 후속)

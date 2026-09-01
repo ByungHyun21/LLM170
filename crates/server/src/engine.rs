@@ -110,6 +110,69 @@ impl Engine {
         InferResult { tokens: toks }
     }
 
+    /// run_inner + 토큰별 진행 콜백 — SSE가 생성 즉시 전송 (장문 요청이
+    /// 완료까지 굳는 것 방지, 2026-09-01).
+    pub fn run_with_progress(
+        &mut self,
+        tokens: Vec<u32>,
+        n_predict: usize,
+        mut on_token: impl FnMut(u32),
+    ) -> InferResult {
+        let r = self.run_inner_progress(tokens, n_predict, &mut on_token);
+        let mut toks = r.tokens;
+        while toks.last() == Some(&248044) {
+            toks.pop();
+        }
+        toks.truncate(n_predict);
+        InferResult { tokens: toks }
+    }
+
+    fn run_inner_progress(
+        &mut self,
+        tokens: Vec<u32>,
+        n_predict: usize,
+        on_token: &mut dyn FnMut(u32),
+    ) -> InferResult {
+        match self {
+            Engine::Q35(e) => {
+                let eos = 248044u32;
+                let mut out = Vec::new();
+                let l = e.prefill(0, &tokens).expect("prefill");
+                let mut next = llm170_core::model::greedy(&l);
+                out.push(next);
+                on_token(next);
+                for _ in 0..n_predict {
+                    if next == eos {
+                        break;
+                    }
+                    let logits = e.decode(&[0], &[next]).expect("decode");
+                    next = llm170_core::model::greedy(&logits[0]);
+                    out.push(next);
+                    on_token(next);
+                }
+                InferResult { tokens: out }
+            }
+            Engine::Q4(e) => {
+                let eos = 248044u32;
+                let mut out = Vec::new();
+                let l = e.prefill(0, &tokens).expect("prefill");
+                let mut next = llm170_core::model::greedy(&l);
+                out.push(next);
+                on_token(next);
+                for _ in 0..n_predict {
+                    if next == eos {
+                        break;
+                    }
+                    let logits = e.decode1(0, next).expect("decode");
+                    next = llm170_core::model::greedy(&logits);
+                    out.push(next);
+                    on_token(next);
+                }
+                InferResult { tokens: out }
+            }
+        }
+    }
+
     fn run_inner(&mut self, tokens: Vec<u32>, n_predict: usize) -> InferResult {
         match self {
             Engine::Q35(e) => {
