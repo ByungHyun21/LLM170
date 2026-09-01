@@ -75,26 +75,56 @@ impl WRef {
     }
 }
 
-/// 가중치 상주 저장소 — 데이터 포인터 키, 1회 업로드 후 영속.
-/// 예산(`LLM170_W_CAP_GB`, 기본 72GiB·상한 88GiB) 초과분은 `WRef::Host`.
+/// Weight residency store — pointer-keyed, uploaded once, persistent.
+/// Budget: when `LLM170_W_CAP_GB` is not set, 40% of the memory total
+/// measured at runtime for the active backend (device-agnostic).
+/// Rationale (measured 2026-09-01 on a 96 GiB carve-out): long-prefill
+/// scratch pool demand is ~46 GiB ≈ 48% of total, so a 40% weight budget
+/// leaves room for the pool plus margin. A fixed 48 GiB budget exhausted
+/// VRAM (allocation "execution error" at ~6 min).
 pub struct WeightStore {
-    /// 키 = (데이터 포인터, 바이트 길이) — 같은 기준을 공유하는 뷰(스택 전체 vs
-    /// expert-0 슬라이스)의 충돌을 길이로 분별 (2026-09-01 실측 결함).
+    /// Key = (data pointer, byte length) — distinguishes views sharing a
+    /// base pointer (full expert stack vs expert-0 slice, 2026-09-01 bug).
     map: Mutex<HashMap<(usize, usize), WRef>>,
     dev_bytes: std::sync::atomic::AtomicUsize,
+    /// Upload cap in bytes, derived from the measured memory total.
+    cap_bytes: usize,
 }
 
 #[allow(clippy::new_without_default)]
 impl WeightStore {
-    pub fn new() -> Self {
+    /// `mem_total`: total bytes of the placement region for this runtime
+    /// (HIP = VRAM carve-out, Vulkan/wgpu = GTT). Constructors read it from
+    /// amdgpu sysfs; unknown devices fall back to a conservative default.
+    pub fn new(mem_total: usize) -> Self {
         WeightStore {
             map: Mutex::new(HashMap::new()),
             dev_bytes: std::sync::atomic::AtomicUsize::new(0),
+            cap_bytes: Self::derive_cap(mem_total),
         }
     }
 
-    /// 가중치 조회 — 첫 호출 시 업로드(예산 내) 또는 호스트 폴백. 이후 캐시.
-    /// WGSL에 u8이 없어 u32 워드로 운반(4바이트 정렬 필수).
+    /// Cap derivation: explicit env override wins; otherwise 40% of the
+    /// measured total, GiB-aligned, with a 1 GiB floor so small test models
+    /// (tiny4) are never locked out.
+    fn derive_cap(mem_total: usize) -> usize {
+        if let Some(v) = std::env::var("LLM170_W_CAP_GB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return v << 30;
+        }
+        ((mem_total / 5 * 2) >> 30 << 30).max(1 << 30)
+    }
+
+    /// Upload cap in bytes.
+    pub fn cap(&self) -> usize {
+        self.cap_bytes
+    }
+
+    /// Weight lookup — uploads on first call (within budget) or falls back
+    /// to host residency. Cached afterwards. Weights travel as u32 words
+    /// (WGSL has no u8; 4-byte alignment required).
     pub fn get<R: Runtime>(
         &self,
         client: &ComputeClient<R>,
@@ -106,16 +136,17 @@ impl WeightStore {
             return Ok(d.clone());
         }
         let total = self.dev_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        let host = total + w.data.len() > Self::cap();
+        let host = total + w.data.len() > self.cap_bytes;
         let d = if host {
             WRef::Host { ty: w.ty, n_in: w.n_in as usize, n_out: w.n_out as usize }
         } else {
             if w.data.len() % 4 != 0 {
                 return Err(format!("tensor bytes {} not 4-byte aligned", w.data.len()));
             }
-            // 신규 업로드(할당+복사)는 큐가 빈 상태에서만 — 할당과 잔여 런치의
-            // libamdhip64 내부 경합이 GPF(0x43251c/0x3fc4e5, 2026-09-01)를
-            // 일으킨다. 업로드는 가중치당 1회라 sync 비용은 무시 가능.
+            // New uploads (alloc + copy) only on a drained queue — allocating
+            // while launches are in flight races inside libamdhip64 (GPF at
+            // fixed IPs 0x43251c/0x3fc4e5, measured 2026-09-01). Uploads are
+            // once-per-weight, so the sync cost is negligible.
             drain(client);
             let h = client.create_from_slice(w.data);
             self.dev_bytes
@@ -132,31 +163,27 @@ impl WeightStore {
         Ok(d)
     }
 
-    /// 업로드 상한(바이트). PLE(26.8GiB)은 matmul 대상이 아니고 본체+전문가
-    /// ~83GiB는 96GiB VRAM에 들어간다(llama.cpp와 동일 배치). 80GiB에서
-    /// 스크래치 합산 초과 execution error 실측(2026-09-01).
-    pub fn cap() -> usize {
-        static CAP: OnceLock<usize> = OnceLock::new();
-        *CAP.get_or_init(|| {
-            std::env::var("LLM170_W_CAP_GB")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(72)
-                .min(88)
-                << 30
-        })
-    }
-
-    /// 상주 바이트 (계측용).
+    /// Resident bytes (instrumentation).
     pub fn resident(&self) -> usize {
         self.dev_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-impl Default for WeightStore {
-    fn default() -> Self {
-        Self::new()
+/// Read a memory total from amdgpu sysfs. `kind` selects the region file
+/// (`vram` or `gtt`). Generic across devices — no per-machine constants.
+pub fn sysfs_mem_total(kind: &str) -> Option<usize> {
+    let dir = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in dir.flatten() {
+        let p = entry.path().join("device").join(format!("mem_info_{kind}_total"));
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = s.trim().parse::<usize>() {
+                if v > 0 {
+                    return Some(v);
+                }
+            }
+        }
     }
+    None
 }
 
 /// 크기등급 스크래치/휘발업로드 풀 — 인플라이트 중 재할당 방지(획득은 pop,

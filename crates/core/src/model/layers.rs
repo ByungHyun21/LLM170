@@ -86,51 +86,107 @@ impl Engine {
         let mut k_all = vec![0.0f32; n_tok * k_len];
         let mut v_all = vec![0.0f32; n_tok * v_len];
         let mut o_all = vec![0.0f32; n_tok * v_len];
-
-        {
-            profile_span!("cpu::gdn_conv");
-            for s in 0..n_seqs {
-                let conv_state = &mut self.seqs[seq_ids[s]].conv[recr_idx];
-                for t in 0..t_len {
-                    let row = s * t_len + t;
+        // ── GPU 연결 (02-2): t=1 디코드를 conv·β/g·AR·norm_gated 커널로.
+        // 값 스타일(업/다운로드). LLM170_GDN_CPU=1 또는 어느 단계 실패 시 CPU 전체 폴백.
+        let mut gated = vec![vec![0.0f32; d_inner]; n_tok];
+        let mut gpu_done = false;
+        if t_len == 1 && n_seqs == 1 && std::env::var_os("LLM170_GDN_CPU").is_none() {
+            if let Some(acc_ref) = acc.as_deref() {
+                let mut conv_out = vec![0.0f32; conv_ch];
+                let st = &mut self.seqs[seq_ids[0]].conv[recr_idx];
+                if acc_ref
+                    .gdn_conv(&qkv[0], &conv_w, st, &mut conv_out, conv_ch, conv_k)
+                    .is_ok()
+                {
                     for c in 0..conv_ch {
-                        // ggml ssm_conv: weight {d_conv, d_inner} 행 우선 → w[c*conv_k + j]
-                        let mut sum = conv_w[c * conv_k + (conv_k - 1)] * qkv[row][c];
-                        for j in 0..conv_k - 1 {
-                            sum += conv_w[c * conv_k + j] * conv_state[j * conv_ch + c];
-                        }
-                        let out_c = silu(sum);
-                        for j in 0..conv_k - 2 {
-                            conv_state[j * conv_ch + c] = conv_state[(j + 1) * conv_ch + c];
-                        }
-                        conv_state[(conv_k - 2) * conv_ch + c] = qkv[row][c];
-                        // 레이아웃: q [k heads] | k [k heads] | v [v heads]
                         if c < k_len {
-                            q_all[row * k_len + c] = out_c;
+                            q_all[c] = conv_out[c];
                         } else if c < 2 * k_len {
-                            k_all[row * k_len + c - k_len] = out_c;
+                            k_all[c - k_len] = conv_out[c];
                         } else {
-                            v_all[row * v_len + c - 2 * k_len] = out_c;
+                            v_all[c - 2 * k_len] = conv_out[c];
+                        }
+                    }
+                    for h in 0..n_group {
+                        let b0 = h * d_state;
+                        let head: Vec<f32> = q_all[b0..b0 + d_state].to_vec();
+                        q_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&head, hp.eps));
+                        let headk: Vec<f32> = k_all[b0..b0 + d_state].to_vec();
+                        k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, hp.eps));
+                    }
+                    let mut beta_ge = vec![0.0f32; dt_rank * 2];
+                    if acc_ref
+                        .gdn_beta_g(&b[0], &a[0], &dt_bias, &ssm_a, &mut beta_ge)
+                        .is_ok()
+                    {
+                        let scale = 1.0f32 / (d_state as f32).sqrt();
+                        let qs: Vec<f32> = q_all.iter().map(|x| x * scale).collect();
+                        let st = &mut self.seqs[seq_ids[0]].gdn_s[recr_idx];
+                        if acc_ref
+                            .gdn_ar(&qs, &k_all, &v_all, &beta_ge, st, &mut o_all, 1, n_group, dt_rank, d_state)
+                            .is_ok()
+                        {
+                            let w_tiled: Vec<f32> = ssm_norm_w
+                                .iter()
+                                .copied()
+                                .cycle()
+                                .take(ssm_norm_w.len() * dt_rank)
+                                .collect();
+                            let mut grow = vec![0.0f32; d_inner];
+                            if acc_ref
+                                .gdn_norm_gated_silu(&o_all, &z[0], &w_tiled, &mut grow, hp.eps, d_state)
+                                .is_ok()
+                            {
+                                gated[0].copy_from_slice(&grow);
+                                gpu_done = true;
+                            }
                         }
                     }
                 }
             }
         }
-
-        {
-            profile_span!("cpu::gdn_l2norm");
-            for row in 0..n_tok {
-                for h in 0..n_group {
-                    let b0 = row * k_len + h * d_state;
-                    let head: Vec<f32> = q_all[b0..b0 + d_state].to_vec();
-                    q_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&head, hp.eps));
-                    let headk: Vec<f32> = k_all[b0..b0 + d_state].to_vec();
-                    k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, hp.eps));
+        if !gpu_done {
+            {
+                profile_span!("cpu::gdn_conv");
+                for s in 0..n_seqs {
+                    let conv_state = &mut self.seqs[seq_ids[s]].conv[recr_idx];
+                    for t in 0..t_len {
+                        let row = s * t_len + t;
+                        for c in 0..conv_ch {
+                            // ggml ssm_conv: weight {d_conv, d_inner} 행 우선 → w[c*conv_k + j]
+                            let mut sum = conv_w[c * conv_k + (conv_k - 1)] * qkv[row][c];
+                            for j in 0..conv_k - 1 {
+                                sum += conv_w[c * conv_k + j] * conv_state[j * conv_ch + c];
+                            }
+                            let out_c = silu(sum);
+                            for j in 0..conv_k - 2 {
+                                conv_state[j * conv_ch + c] = conv_state[(j + 1) * conv_ch + c];
+                            }
+                            conv_state[(conv_k - 2) * conv_ch + c] = qkv[row][c];
+                            // 레이아웃: q [k heads] | k [k heads] | v [v heads]
+                            if c < k_len {
+                                q_all[row * k_len + c] = out_c;
+                            } else if c < 2 * k_len {
+                                k_all[row * k_len + c - k_len] = out_c;
+                            } else {
+                                v_all[row * v_len + c - 2 * k_len] = out_c;
+                            }
+                        }
+                    }
                 }
             }
-        }
-
-        {
+            {
+                profile_span!("cpu::gdn_l2norm");
+                for row in 0..n_tok {
+                    for h in 0..n_group {
+                        let b0 = row * k_len + h * d_state;
+                        let head: Vec<f32> = q_all[b0..b0 + d_state].to_vec();
+                        q_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&head, hp.eps));
+                        let headk: Vec<f32> = k_all[b0..b0 + d_state].to_vec();
+                        k_all[b0..b0 + d_state].copy_from_slice(&l2_norm(&headk, hp.eps));
+                    }
+                }
+            }
             profile_span!("cpu::gdn_core");
             for s in 0..n_seqs {
                 let r0 = s * t_len;
@@ -175,9 +231,8 @@ impl Engine {
             let z4: Vec<String> = z[0][..4].iter().map(|v| format!("{v:.6}")).collect();
             eprintln!("  rs stage core[:4]={c4:?} z[:4]={z4:?}");
         }
-        // norm_gated: rms_norm(core)·silu(z) per head → ssm_out
-        let mut gated = vec![vec![0.0f32; d_inner]; n_tok];
-        {
+        // norm_gated: rms_norm(core)·silu(z) per head → ssm_out (GPU 경로가 이미 채움)
+        if !gpu_done {
             profile_span!("cpu::gdn_normgated");
             for t in 0..n_tok {
                 for h in 0..dt_rank {

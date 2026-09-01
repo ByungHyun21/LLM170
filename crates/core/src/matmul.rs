@@ -73,6 +73,44 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("gdn_ar: 미지원".into())
     }
 
+    /// GDN depthwise conv + ring (t토큰, 시퀀스 1) — 값 스타일 업/다운로드.
+    /// qwen35 디코드 연결용 (02-2). 미지원 백엔드는 Err → 호출부 CPU 폴백.
+    fn gdn_conv(
+        &self,
+        _qkv: &[f32],
+        _conv_w: &[f32],
+        _state: &mut [f32],
+        _out: &mut [f32],
+        _ch: usize,
+        _k: usize,
+    ) -> Result<(), String> {
+        Err("gdn_conv: 미지원".into())
+    }
+
+    /// GDN β/e^g 사전 계산 → [h·2] 인터리브. 미지원은 Err.
+    fn gdn_beta_g(
+        &self,
+        _b: &[f32],
+        _a: &[f32],
+        _dtb: &[f32],
+        _sa: &[f32],
+        _bg: &mut [f32],
+    ) -> Result<(), String> {
+        Err("gdn_beta_g: 미지원".into())
+    }
+
+    /// GDN norm_gated silu 게이트 (qwen35): rms(o)·silu(z)·w. w는 [n_h·d] 타일.
+    fn gdn_norm_gated_silu(
+        &self,
+        _o: &[f32],
+        _z: &[f32],
+        _w: &[f32],
+        _out: &mut [f32],
+        _eps: f32,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("gdn_norm_gated_silu: 미지원".into())
+    }
     /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
     /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
     fn barrier(&self) {}

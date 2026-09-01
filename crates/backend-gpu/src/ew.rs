@@ -125,6 +125,41 @@ pub fn norm_gated_rows(
     }
 }
 
+/// norm_gated silu 게이트 변형 (qwen35): out[row·d..] = rms(o[row·d..])·silu(z[row·d..]).
+/// qwen4exp(σ)과의 유일 차이 — CPU model/layers.rs 178-193 순서 동일.
+#[cube(launch_unchecked)]
+pub fn norm_gated_rows_silu(
+    o: &Tensor<f32>,
+    z: &Tensor<f32>,
+    w: &Tensor<f32>,
+    out: &mut Tensor<f32>,
+    params: &Tensor<f32>, // [eps]
+    d: usize,
+    n_h: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u != 0 {
+        terminate!();
+    }
+    let xb = row * d;
+    let wb = (row % n_h) * d;
+    let eps = f64::cast_from(params[0]);
+    let mut sum = 0.0f64;
+    for i in 0..d {
+        let dv = f64::cast_from(o[xb + i]);
+        sum += dv * dv;
+    }
+    let len = f64::cast_from(d as u32);
+    let scale32 = f32::cast_from((sum / len + eps).sqrt());
+    let inv = 1.0f32 / scale32;
+    for i in 0..d {
+        let nrm = o[xb + i] * inv * w[wb + i];
+        let zz = z[xb + i];
+        out[xb + i] = nrm * (zz / (1.0 + (-zz).exp()));
+    }
+}
+
 /// 행별 in-place L2 norm (GDN q/k 헤드): x[row·d..] 정규화.
 /// CPU ops::l2_norm: Σx² f64 → sqrt → f32 cast → .max(eps) → 1/x.
 #[cube(launch_unchecked)]

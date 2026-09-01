@@ -269,32 +269,37 @@ impl<R: Runtime> GpuMatmul<R> {
 }
 
 impl GpuMatmul<hanzo_cubecl_hip::HipRuntime> {
-    /// ROCm/HIP 런타임 (기본).
+    /// ROCm/HIP runtime (default). Weight budget derives from the measured
+    /// VRAM carve-out total (sysfs), not a per-machine constant.
     pub fn new_hip() -> Result<Self, String> {
         let device = hanzo_cubecl_hip::AmdDevice::new(0);
         let client = hanzo_cubecl_hip::HipRuntime::client(&device);
-        Self::with_client(client)
+        let mem = buffers::sysfs_mem_total("vram").unwrap_or(32 << 30);
+        Self::with_client_mem(client, mem)
     }
 }
 
 impl GpuMatmul<cubecl::wgpu::WgpuRuntime> {
-    /// wgpu/Vulkan 런타임 — 같은 커널을 WGSL/SPIR-V로 컴파일.
+    /// wgpu/Vulkan runtime — the same kernels compile to WGSL/SPIR-V.
+    /// Weights land in GTT (host-visible), so the budget keys off GTT total.
     pub fn new_vulkan() -> Result<Self, String> {
         use cubecl::wgpu::{
             RuntimeOptions, Vulkan, WgpuDevice, WgpuRuntime, init_device, init_setup,
         };
-        // DefaultDevice = 고성능 우선 선택 — 개발기 iGPU(8060S)·CMP dGPU 모두 대응
-        // (DiscreteGpu 필터는 APU에서 설계상 페닉)
+        // DefaultDevice picks the high-performance adapter — works on both
+        // the dev iGPU (8060S) and the CMP dGPU (DiscreteGpu filters would
+        // panic by design on APUs).
         let device = WgpuDevice::DefaultDevice;
         let setup = init_setup::<Vulkan>(&device, RuntimeOptions::default());
         let dev = init_device(setup, RuntimeOptions::default());
         let client = WgpuRuntime::client(&dev);
-        Self::with_client(client)
+        let mem = buffers::sysfs_mem_total("gtt").unwrap_or(32 << 30);
+        Self::with_client_mem(client, mem)
     }
 }
 
 impl<R: Runtime> GpuMatmul<R> {
-    fn with_client(client: ComputeClient<R>) -> Result<Self, String> {
+    fn with_client_mem(client: ComputeClient<R>, mem_total: usize) -> Result<Self, String> {
         // 워크어라운드(2026-08-31): 장문 혼합 워크로드에서 DSD 스레드의
         // hipHccModuleLaunchKernel이 GPF(고정 IP, libamdhip64 7.2.2) — 런치와
         // 병행 할당의 경합 의심. 동기 런치로 소멸 실측(런치당 ~0.1ms).
@@ -323,7 +328,7 @@ impl<R: Runtime> GpuMatmul<R> {
         let grid3 = client.create_from_slice(bytemuck::cast_slice(&grid3));
         Ok(GpuMatmul {
             client,
-            weights: WeightStore::new(),
+            weights: WeightStore::new(mem_total),
             bufs: ScratchPool::new(),
             ktab,
             grid3,
@@ -496,6 +501,136 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 경계에서 호출해 모든 비행 중 연산 종료를 확정한다.
     pub fn barrier(&self) {
         let _ = cubecl_common::future::block_on(self.client.sync());
+    }
+
+    /// GDN depthwise conv + ring — 값 스타일 (qwen35 디코드, 02-2).
+    pub fn gdn_conv_gpu(
+        &self,
+        qkv: &[f32],
+        conv_w: &[f32],
+        state: &mut [f32],
+        out: &mut [f32],
+        ch: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let t_len = qkv.len() / ch;
+        let t0 = std::time::Instant::now();
+        let qg = self.client.create_from_slice(bytemuck::cast_slice(qkv));
+        let wg = self.client.create_from_slice(bytemuck::cast_slice(conv_w));
+        let sg = self.client.create_from_slice(bytemuck::cast_slice(state));
+        let og = self.acquire_buf(out.len() * 4)?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: 큐브당 1채널, 유닛 0만 실행 — ew.rs gdn_conv 가드.
+        unsafe {
+            ew::gdn_conv::launch_unchecked(
+                &self.client,
+                CubeCount::Static(ch as u32, 1, 1),
+                CubeDim::new_1d(32),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [qkv.len()].into()),
+                TensorArg::from_raw_parts(wg, [1].into(), [conv_w.len()].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [state.len()].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [out.len()].into()),
+                ch,
+                k,
+                t_len,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw_s = self.client.read_one(sg.clone()).map_err(|e| e.to_string())?;
+        let raw_o = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        state.copy_from_slice(bytemuck::cast_slice(&raw_s));
+        out.copy_from_slice(bytemuck::cast_slice(&raw_o));
+        self.release_bufs(&[(qg, qkv.len() * 4), (og, out.len() * 4)]);
+        Ok(())
+    }
+
+    /// GDN β/e^g 사전 계산 — 값 스타일. 출력 [h·2] 인터리브.
+    pub fn gdn_beta_g_gpu(
+        &self,
+        b: &[f32],
+        a: &[f32],
+        dtb: &[f32],
+        sa: &[f32],
+        bg: &mut [f32],
+    ) -> Result<(), String> {
+        let n_h = b.len();
+        let bg_size = n_h * 2;
+        let t0 = std::time::Instant::now();
+        let bh = self.client.create_from_slice(bytemuck::cast_slice(b));
+        let ah = self.client.create_from_slice(bytemuck::cast_slice(a));
+        let dh = self.client.create_from_slice(bytemuck::cast_slice(dtb));
+        let sh = self.client.create_from_slice(bytemuck::cast_slice(sa));
+        let gh = self.acquire_buf(bg_size * 4)?;
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: ABSOLUTE_POS 가드 h<n_h.
+        unsafe {
+            ew::gdn_beta_g::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_h.div_ceil(64) as u32, 1, 1),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(bh, [1].into(), [n_h].into()),
+                TensorArg::from_raw_parts(ah, [1].into(), [n_h].into()),
+                TensorArg::from_raw_parts(dh, [1].into(), [n_h].into()),
+                TensorArg::from_raw_parts(sh, [1].into(), [n_h].into()),
+                TensorArg::from_raw_parts(gh.clone(), [1].into(), [bg_size].into()),
+                n_h,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw = self.client.read_one(gh.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        bg.copy_from_slice(bytemuck::cast_slice(&raw));
+        self.release_bufs(&[(gh, bg_size * 4)]);
+        Ok(())
+    }
+
+    /// GDN norm_gated silu 게이트 (qwen35) — 값 스타일. w는 [n_h·d] 타일.
+    pub fn gdn_norm_gated_silu_gpu(
+        &self,
+        o: &[f32],
+        z: &[f32],
+        w: &[f32],
+        out: &mut [f32],
+        eps: f32,
+        d: usize,
+    ) -> Result<(), String> {
+        let rows = o.len() / d;
+        let n_h = w.len() / d;
+        let t0 = std::time::Instant::now();
+        let oh = self.client.create_from_slice(bytemuck::cast_slice(o));
+        let zh = self.client.create_from_slice(bytemuck::cast_slice(z));
+        let wh = self.client.create_from_slice(bytemuck::cast_slice(w));
+        let og = self.acquire_buf(out.len() * 4)?;
+        let pg = self.client.create_from_slice(bytemuck::cast_slice(&[eps]));
+        acc(&T_UP, t0.elapsed());
+        let t1 = std::time::Instant::now();
+        // SAFETY: 큐브당 1행, 유닛 0만 실행.
+        unsafe {
+            ew::norm_gated_rows_silu::launch_unchecked(
+                &self.client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(32),
+                TensorArg::from_raw_parts(oh, [1].into(), [o.len()].into()),
+                TensorArg::from_raw_parts(zh, [1].into(), [z.len()].into()),
+                TensorArg::from_raw_parts(wh, [1].into(), [w.len()].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [out.len()].into()),
+                TensorArg::from_raw_parts(pg, [1].into(), [1].into()),
+                d,
+                n_h,
+            );
+        }
+        acc(&T_LAUNCH, t1.elapsed());
+        let t2 = std::time::Instant::now();
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        acc(&T_READ, t2.elapsed());
+        out.copy_from_slice(bytemuck::cast_slice(&raw));
+        self.release_bufs(&[(og, out.len() * 4)]);
+        Ok(())
     }
     /// 풀 획득 위임.
     fn acquire_buf(&self, bytes: usize) -> Result<Handle, String> {
@@ -1379,6 +1514,40 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     ) -> Result<(), String> {
         self.gdn_ar_gpu(q_scaled, k, v, beta_ge, states, out, n_seqs, h_k, h_v, d)
     }
+    fn gdn_conv(
+        &self,
+        qkv: &[f32],
+        conv_w: &[f32],
+        state: &mut [f32],
+        out: &mut [f32],
+        ch: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        self.gdn_conv_gpu(qkv, conv_w, state, out, ch, k)
+    }
+
+    fn gdn_beta_g(
+        &self,
+        b: &[f32],
+        a: &[f32],
+        dtb: &[f32],
+        sa: &[f32],
+        bg: &mut [f32],
+    ) -> Result<(), String> {
+        self.gdn_beta_g_gpu(b, a, dtb, sa, bg)
+    }
+
+    fn gdn_norm_gated_silu(
+        &self,
+        o: &[f32],
+        z: &[f32],
+        w: &[f32],
+        out: &mut [f32],
+        eps: f32,
+        d: usize,
+    ) -> Result<(), String> {
+        self.gdn_norm_gated_silu_gpu(o, z, w, out, eps, d)
+    }
 
     /// 짝 GEMM — 가중치마다 다른 1행 x (MoE down). 런치 배치 + 단일 동기화.
     fn matmul_paired(
@@ -1587,6 +1756,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     }
 
     fn frame_mm(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
+
         let d = self.dev_weight(w)?;
         if d.is_host() {
             return Err("frame_mm: 호스트 폴백 가중치 (W_CAP 초과)".into());
@@ -1609,6 +1779,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     }
 
     fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+
         if ws.len() != outs.len() {
             return Err(format!("frame_mm_group: ws({}) != outs({})", ws.len(), outs.len()));
         }
@@ -1620,6 +1791,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
 
     fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
         use llm170_core::matmul::FrameOp;
+
         let one = |h: u64| self.frame_get(h).map(|v| v.0);
         let aux = |v: &[f32]| -> Result<Handle, String> { Ok(self.client.create_from_slice(bytemuck::cast_slice(v))) };
         match op {
