@@ -10,7 +10,7 @@ unset LLM170_GPU_RUNTIME LLM170_W_CAP_GB LLM170_Q4_CHUNK
 ./target/release/llm170 gdn-ar-check && ./target/release/llm170 moe-down-check
 
 # 1) qwen35 서버 매트릭스 (HIP=VRAM, 11케이스 전체)
-./target/release/llm170 serve --model /tmp/q35parts/m.gguf --port 18080 --ctx 4096 \
+./target/release/llm170 serve --model /home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf --port 18080 --ctx 4096 \
   --backend gpu --gpu-runtime hip > /tmp/srv35_hip.log 2>&1 &
 sleep 14
 LLM170_EXTRA_ARGS="--backend gpu --gpu-runtime hip" timeout 5400 python3 scripts/verify.py 18080 > /tmp/v35_final.txt 2>&1
@@ -18,7 +18,15 @@ grep -E "PASS|FAIL" /tmp/v35_final.txt
 pkill -f "llm170 serve"; sleep 2
 
 # 2) qwen4exp 장문 단일·장문+np2 (HIP, VRAM 48GB — llama와 동일 배치)
-M=/tmp/q4parts/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+M=/home/yoon/local_llm/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+# 장문 프롬프트 재생성 (/tmp는 재부팅 소멸)
+python3 - <<'PYGEN'
+ids = []
+para = [760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 13, 561, 6511, 314, 9338, 369, 13399, 821, 38042, 13]
+while len(ids) < 2311: ids += para
+open("/tmp/long_ids.txt","w").write(",".join(map(str,ids[:2311])))
+open("/tmp/long2_ids.txt","w").write(",".join(str((i*9973+11) % 240000) for i in range(1904)))
+PYGEN
 L1=$(cat /tmp/long_ids.txt); L2=$(cat /tmp/long2_ids.txt)
 LLM170_W_CAP_GB=48 ./target/release/llm170 infer --backend gpu --gpu-runtime hip \
   --model "$M" --prompt-tokens "$L1" --n-predict 24 --ctx 4096 2>/tmp/ls_hip.err >/tmp/ls_hip.jsonl
