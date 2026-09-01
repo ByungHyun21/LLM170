@@ -225,6 +225,11 @@ impl Engine4 {
 
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용).
     pub fn reset_states(&mut self) {
+        // CPU 상태를 영점화했다 — 프레임 GPU 상태는 stale이므로 pull 금지
+        // (dirty=true → 다음 prefill 후 decode에서 재동기).
+        if let Some(f) = &mut self.frame {
+            f.dirty = true;
+        }
         let ctx = self.seqs.first().map(|s| s.kv_k.first().map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim)).unwrap_or(4096)).unwrap_or(4096);
         for i in 0..self.seqs.len() {
             self.seqs[i] = SeqState4::new(&self.model.hp, ctx);
