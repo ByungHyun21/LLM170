@@ -104,7 +104,13 @@ use llm170_profiler::profile_span;
                 let mut eos = vec![vec![0.0f32; n_embd]; n_sel];
                 // P2-2: K전문가 down 1런치 (스택 뷰). 미지원/호스트 폴백은 짝으로.
                 let mut batched = false;
-                if std::env::var_os("LLM170_MOE_CPU").is_none() {
+                // 배치 down은 스택 전체(345MB/층) 상주를 요구해 예산을 악화시킴
+                // (실측: moe 190→720ms, 터치 슬라이스 합계 ~1.2GB인데 스택은
+                // 16.5GB). 기본 끔 — LLM170_MOE_BATCH=1 (전체 상주 가능한
+                // CMP 40GB+ 또는 LRU 스트리밍 도입시).
+                let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
+                    && std::env::var_os("LLM170_MOE_CPU").is_none();
+                if batch_on {
                 if let Some(acc) = ctx.acc {
                     let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
                     let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();

@@ -51,6 +51,13 @@ fn reexec_hip_blocking() {
 
 fn main() -> ExitCode {
     reexec_hip_blocking();
+    // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
+    // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
+    // 런만 희생되게 한다 (무권한으로는 보호 불가 — 우선순위 이동만 가능).
+    // LLM170_NO_OOM_ADJ=1이면 해제.
+    if std::env::var_os("LLM170_NO_OOM_ADJ").is_none() {
+        let _ = std::fs::write("/proc/self/oom_score_adj", b"1000");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
@@ -130,6 +137,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut port = 8080u16;
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
+    let mut gpu_runtime = String::new();
     let mut mode: Option<llm170_core::mode::Mode> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -154,6 +162,11 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
                 Some(m) => mode = Some(m),
                 None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
+            },
+            "--gpu-runtime" => match it.next().map(String::as_str) {
+                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.to_string(),
+                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
+                None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
@@ -190,7 +203,15 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     }
     let _ = engine::TOKENIZER.set(tok.unwrap_or_else(|| tokenize::Tokenizer::empty()));
     let req = engine::InferRequest { model: model_path, ctx };
-    let sel = if backend == "gpu" { engine::BackendSel::Gpu } else { engine::BackendSel::Cpu };
+    let sel = if backend == "gpu" {
+        if gpu_runtime.is_empty() {
+            engine::BackendSel::Gpu
+        } else {
+            engine::BackendSel::GpuRuntime(gpu_runtime)
+        }
+    } else {
+        engine::BackendSel::Cpu
+    };
     match http::serve(&format!("127.0.0.1:{port}"), req, sel) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1148,6 +1169,11 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
                 Some(m) => mode = Some(m),
                 None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
+            },
+            "--gpu-runtime" => match it.next().map(String::as_str) {
+                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.to_string(),
+                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
+                None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }

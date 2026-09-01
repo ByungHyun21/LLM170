@@ -6,6 +6,9 @@ use std::sync::Arc;
 pub enum BackendSel {
     Cpu,
     Gpu,
+    /// Gpu + 런타임 지정 ("hip"|"vulkan") — serve --gpu-runtime (2026-09-01:
+    /// HIP가 폴트로 웨지된 경우 Vulkan 회피).
+    GpuRuntime(String),
 }
 
 pub struct InferRequest {
@@ -70,19 +73,51 @@ pub fn build(req: InferRequest, backend: BackendSel) -> Engine {
     if arch.as_deref() == Some("qwen4exp") {
         let m = load_q4_retry(&req.model);
         let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, req.ctx);
-        if let BackendSel::Gpu = backend {
-            if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
-                eng = eng.with_acc(Arc::new(acc));
+        match &backend {
+            BackendSel::GpuRuntime(rt) => {
+                let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
+                    if rt == "vulkan" {
+                        llm170_backend_gpu::GpuMatmul::new_vulkan()
+                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
+                    } else {
+                        llm170_backend_gpu::GpuMatmul::new_hip()
+                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
+                    };
+                if let Ok(acc) = acc {
+                    eng = eng.with_acc(acc);
+                }
             }
+            BackendSel::Gpu => {
+                if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
+                    eng = eng.with_acc(Arc::new(acc));
+                }
+            }
+            BackendSel::Cpu => {}
         }
         Engine::Q4(eng)
     } else {
         let m = load_q35_retry(&req.model);
         let mut eng = llm170_core::model::Engine::new(m, 1, req.ctx);
-        if let BackendSel::Gpu = backend {
-            if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
-                eng = eng.with_acc(Arc::new(acc));
+        match &backend {
+            BackendSel::GpuRuntime(rt) => {
+                let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
+                    if rt == "vulkan" {
+                        llm170_backend_gpu::GpuMatmul::new_vulkan()
+                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
+                    } else {
+                        llm170_backend_gpu::GpuMatmul::new_hip()
+                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
+                    };
+                if let Ok(acc) = acc {
+                    eng = eng.with_acc(acc);
+                }
             }
+            BackendSel::Gpu => {
+                if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
+                    eng = eng.with_acc(Arc::new(acc));
+                }
+            }
+            BackendSel::Cpu => {}
         }
         Engine::Q35(eng)
     }
