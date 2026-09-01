@@ -711,7 +711,16 @@ fn cmd_check(args: &[String]) -> ExitCode {
 /// gdn-ar-check — GDN AR 커널 GPU↔CPU 상호검증 (합성 텐서, 수제 LCG).
 fn cmd_gdn_ar_check() -> ExitCode {
     use llm170_core::matmul::Accelerator;
-    let (n_group, dt_rank, d) = (8usize, 48usize, 128usize);
+    // 인수: [n_group dt_rank d] — 소형 차원 회귀 검증 (2026-09-01 실측)
+    let a: Vec<usize> = std::env::args()
+        .skip(2)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let (n_group, dt_rank, d) = if a.len() == 3 {
+        (a[0], a[1], a[2])
+    } else {
+        (8usize, 48usize, 128usize)
+    };
     let k_len = n_group * d;
     let v_len = dt_rank * d;
     let mut seed = 0x1234_5678u64;

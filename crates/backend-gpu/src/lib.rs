@@ -257,6 +257,9 @@ impl<R: Runtime> GpuMatmul<R> {
             return Err("moe_down: 스택 가중치 호스트 폴백 (예산 초과)".into());
         }
         let (n_in, n_out_full) = d.shape();
+        if std::env::var_os("LLM170_DEBUG_MOE").is_some() {
+            eprintln!("# moe_down: k={k} ids={expert_ids:?} stack={n_expert_stack} n_in={n_in} n_out_full={n_out_full}");
+        }
         // 스택 [ne0=n_in][ne1=rows][ne2=experts] — w4 뷰는 n_out=rows·experts.
         let n_out = n_out_full / n_expert_stack;
         let wtype = d.ty() as u32 as usize;
@@ -349,13 +352,12 @@ impl<R: Runtime> GpuMatmul<R> {
         let og = self.acquire_buf(out.len() * 4)?;
         acc(&T_UP, t0.elapsed());
         let t1 = std::time::Instant::now();
-        // SAFETY: 그리드가 (n_pairs·d)를 정확히 덮고 유닛당 열 1개 —
-        // 상한 내 인덱싱, 무한루프 없음.
+        // SAFETY: 그리드 (n_pairs,1,1) — 큐브당 pair 1개, 128레인 중 u≥d 종료.
         unsafe {
             gdn_kernel::gdn_ar::launch_unchecked(
                 &self.client,
-                CubeCount::Static((n_pairs * d) as u32, 1, 1),
-                CubeDim::new_1d(d as u32),
+                CubeCount::Static(n_pairs as u32, 1, 1),
+                CubeDim::new_1d(128),
                 TensorArg::from_raw_parts(sg.clone(), [1].into(), [states.len()].into()),
                 TensorArg::from_raw_parts(qg.clone(), [1].into(), [q_scaled.len()].into()),
                 TensorArg::from_raw_parts(kg.clone(), [1].into(), [k.len()].into()),

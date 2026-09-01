@@ -104,6 +104,7 @@ use llm170_profiler::profile_span;
                 let mut eos = vec![vec![0.0f32; n_embd]; n_sel];
                 // P2-2: K전문가 down 1런치 (스택 뷰). 미지원/호스트 폴백은 짝으로.
                 let mut batched = false;
+                if std::env::var_os("LLM170_MOE_CPU").is_none() {
                 if let Some(acc) = ctx.acc {
                     let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
                     let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();
@@ -117,6 +118,7 @@ use llm170_profiler::profile_span;
                         wds.push(ctx.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?);
                     }
                     ctx.mm_paired(&gate_y[..n_sel], &wds, &mut eos)?;
+                }
                 }
                 for (k, &e) in sel.iter().enumerate() {
                     let (ti, w) = by_expert[e][0];

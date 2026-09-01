@@ -27,8 +27,13 @@ pub fn gdn_ar(
     h_v: usize,
     h_k: usize,
 ) {
-    let u = ABSOLUTE_POS_X as usize % d; // dv 열
-    let pair = ABSOLUTE_POS_X as usize / d; // b*h_v + h
+    // 큐브 = (b,h) pair 1개, 유닛 = dv 열. CUBE_DIM 128 고정 — d≤128 커버,
+    // 초과 유닛 terminate (CubeDim(d<32) 비정상 실측, 2026-09-01).
+    let pair = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u >= d {
+        terminate!();
+    }
     let b = pair / h_v;
     let h = pair % h_v;
     let kh = h % h_k;

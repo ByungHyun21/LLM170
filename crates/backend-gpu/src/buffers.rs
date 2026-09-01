@@ -74,7 +74,9 @@ impl WRef {
 /// 가중치 상주 저장소 — 데이터 포인터 키, 1회 업로드 후 영속.
 /// 예산(`LLM170_W_CAP_GB`, 기본 72GiB·상한 88GiB) 초과분은 `WRef::Host`.
 pub struct WeightStore {
-    map: Mutex<HashMap<usize, WRef>>,
+    /// 키 = (데이터 포인터, 바이트 길이) — 같은 기준을 공유하는 뷰(스택 전체 vs
+    /// expert-0 슬라이스)의 충돌을 길이로 분별 (2026-09-01 실측 결함).
+    map: Mutex<HashMap<(usize, usize), WRef>>,
     dev_bytes: std::sync::atomic::AtomicUsize,
 }
 
@@ -94,7 +96,7 @@ impl WeightStore {
         client: &ComputeClient<R>,
         w: &Weight,
     ) -> Result<WRef, String> {
-        let key = w.data.as_ptr() as usize;
+        let key = (w.data.as_ptr() as usize, w.data.len());
         let mut map = self.map.lock().map_err(|_| "weights lock poisoned")?;
         if let Some(d) = map.get(&key) {
             return Ok(d.clone());
