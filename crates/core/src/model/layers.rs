@@ -341,8 +341,15 @@ impl Engine {
         let [qg, kk, vv] = group;
 
         let kq_scale = hp.kq_scale();
+        // GPU 연결 (02-3): t=1 디코드 score/softmax/V-mix를 qsa_attention 커널
+        // 재사용(마스크=prefix 전체). norm·rope·캐시 기록은 CPU 유지(저렴).
+        // LLM170_ATTN_CPU=1 또는 실패 시 CPU 루프.
+        let attn_gpu = acc.is_some() && t_len == 1 && n_seqs == 1
+            && std::env::var_os("LLM170_ATTN_CPU").is_none();
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
+        let mut gpu_qrow: Option<Vec<f32>> = None;
+        let mut gpu_done = false;
         for s in 0..n_seqs {
             let pos0 = self.seqs[seq_ids[s]].pos;
             let seq = &mut self.seqs[seq_ids[s]];
@@ -361,6 +368,23 @@ impl Engine {
                     let b = (pos as usize) * n_kv * hd + h * hd;
                     cache_k[b..b + hd].copy_from_slice(&head);
                     cache_v[b..b + hd].copy_from_slice(&vv[row][h * hd..h * hd + hd]);
+                }
+                if attn_gpu {
+                    // q norm+rope → q‖gate 인터리브 플랫 [n_head·2·hd]
+                    // (qsa_score/mix 커널 계약 — 게이트는 커널이 sigmoid 적용)
+                    let mut qrow = vec![0.0f32; n_head * 2 * hd];
+                    for h in 0..n_head {
+                        let src = qg[row][h * 2 * hd..h * 2 * hd + hd].to_vec();
+                        let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
+                        rope_head(&mut qh, pos, n_rot, hp.rope_base);
+                        qrow[h * 2 * hd..h * 2 * hd + hd].copy_from_slice(&qh);
+                        let gb = h * 2 * hd + hd;
+                        for i in 0..hd {
+                            qrow[gb + i] = qg[row][gb + i];
+                        }
+                    }
+                    gpu_qrow = Some(qrow);
+                    continue;
                 }
                 let mut attn_out = std::mem::take(&mut attn_all[row]);
                 for h in 0..n_head {
@@ -407,6 +431,74 @@ impl Engine {
                 }
                 attn_all[row] = attn_out;
             }
+        }
+        if let Some(qrow) = gpu_qrow.as_ref() {
+            if let Some(acc_ref) = acc.as_deref() {
+                let seq = &self.seqs[seq_ids[0]];
+                let n_past = seq.pos as usize + 1;
+                let ck = &seq.kv_k[full_idx][..n_past * n_kv * hd];
+                let cv = &seq.kv_v[full_idx][..n_past * n_kv * hd];
+                let mask: Vec<u32> = (0..n_past).map(|p| (p < n_past) as u32).collect();
+                if let Ok(res) = acc_ref.qsa_attention(
+                    qrow, ck, cv, &mask, kq_scale, n_past, n_head, n_kv, hd, 1,
+                ) {
+                    // 커널 출력에 게이트 이미 적용 (qsa_mix)
+                    attn_all[0].copy_from_slice(&res[..n_head * hd]);
+                    gpu_done = true;
+                }
+            }
+        }
+        if gpu_qrow.is_some() && !gpu_done {
+            // GPU 시도 실패 → CPU 재계산 (row 0, t=1)
+            let pos = self.seqs[seq_ids[0]].pos;
+            let seq = &self.seqs[seq_ids[0]];
+            let (cache_k, cache_v) = (
+                seq.kv_k[full_idx].as_slice(),
+                seq.kv_v[full_idx].as_slice(),
+            );
+            let mut attn_out = std::mem::take(&mut attn_all[0]);
+            for h in 0..n_head {
+                let src = qg[0][h * 2 * hd..h * 2 * hd + hd].to_vec();
+                let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
+                rope_head(&mut qh, pos, n_rot, hp.rope_base);
+                let kvh = h / (n_head / n_kv);
+                let n_past = pos as usize + 1;
+                let mut scores = vec![0.0f32; n_past];
+                let mut maxv = f32::NEG_INFINITY;
+                for (p, sc) in scores.iter_mut().enumerate() {
+                    let b = p * n_kv * hd + kvh * hd;
+                    let mut d = 0.0f32;
+                    for i in 0..hd {
+                        d += qh[i] * cache_k[b + i];
+                    }
+                    *sc = d * kq_scale;
+                    maxv = maxv.max(*sc);
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - maxv).exp();
+                    sum += *sc;
+                }
+                for sc in scores.iter_mut() {
+                    *sc /= sum;
+                }
+                let ob = h * hd;
+                for p in 0..n_past {
+                    let w = scores[p];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let b = p * n_kv * hd + kvh * hd;
+                    for i in 0..hd {
+                        attn_out[ob + i] += w * cache_v[b + i];
+                    }
+                }
+                let gb = h * 2 * hd + hd;
+                for i in 0..hd {
+                    attn_out[ob + i] *= sigmoid(qg[0][gb + i]);
+                }
+            }
+            attn_all[0] = attn_out;
         }
         // wo 프로젝션 — 전 토큰 배치 1회
         {
