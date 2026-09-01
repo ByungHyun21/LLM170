@@ -650,8 +650,6 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68491bf5b3e997ae36bdc4e63b4ccd6d2f0e86b3b596a5d7a48d2b9e92622a0"
 dependencies = [
  "ahash",
  "async-channel",

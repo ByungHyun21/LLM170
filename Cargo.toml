@@ -14,3 +14,11 @@ edition = "2024"
 [profile.release]
 # 배포 빌드. 프로파일러 계측은 debug_assertions 기반이라 release에서 zero-cost.
 # (성능 튜닝 단계에서 lto/codegen-units 조정 여부 재검토)
+
+# 로컬 벤더 패치 — cubecl-runtime 메모리 스윕 비활성 (2026-09-01 GPF RCA).
+# exclusive-pool cleanup의 페이지 재인덱싱(update_page)이 보유 핸들·비행
+# 바인딩을 무효화해 "Memory page N doesn't exist"·libamdhip64 GPF(0x3fc4f2)를
+# 유발. llm170은 해제 경로가 없어(ADR-0014) 스윕 이득 0 — no-op 패치.
+# 상류 수정 후 제거 예정. 상세: vendor/cubecl-runtime/.../memory_manage.rs.
+[patch.crates-io]
+cubecl-runtime = { path = "vendor/cubecl-runtime" }

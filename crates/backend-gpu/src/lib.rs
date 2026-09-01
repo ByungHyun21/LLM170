@@ -11,6 +11,7 @@ use cubecl::prelude::*;
 
 mod gemm2;
 mod attn;
+mod ew;
 use cubecl::zspace::{Shape, Strides};
 use cubecl_runtime::server::Handle;
 use llm170_core::matmul::{Accelerator, Weight};
@@ -174,6 +175,97 @@ pub struct GpuMatmul<R: Runtime> {
     bufs: ScratchPool,
     ktab: Handle,  // iq4_nl 룩업 (f32×16)
     grid3: Handle, // iq3_s 그리드 (u32×512)
+    /// 프레임(활성화 상주) 레지스트리 — u64 토큰 → (핸들, 길이).
+    frames: Mutex<std::collections::HashMap<u64, (Handle, usize)>>,
+    frame_next: AtomicU64,
+}
+
+impl<R: Runtime> GpuMatmul<R> {
+    /// 프레임 레지스트리 조회.
+    fn frame_get(&self, h: u64) -> Result<(Handle, usize), String> {
+        self.frames
+            .lock()
+            .map_err(|_| "frame lock poisoned")?
+            .get(&h)
+            .cloned()
+            .ok_or_else(|| format!("frame_get: 알 수 없는 핸들 {h}"))
+    }
+
+    /// launch_gemm + 프레임 출력 핸들 주입 (og 신규 획득 회피).
+    fn launch_gemm_into(
+        &self,
+        d: &WRef,
+        xg: Handle,
+        t: usize,
+        og: Handle,
+    ) -> Result<(Handle, usize), String> {
+        let WRef::Gpu { h: wh, ty: wty, n_in, n_out, bytes: _ } = d else {
+            return Err("launch_gemm_into: 호스트 폴백 가중치 (아레나 위반)".into());
+        };
+        let (wh, wty, n_in, n_out) = (wh.clone(), *wty, *n_in, *n_out);
+        let slices: usize = if t * n_out * 64 * 4 <= 512 << 20 {
+            64
+        } else if t * n_out * 16 * 4 <= 512 << 20 {
+            16
+        } else {
+            4
+        };
+        let decode = t <= 8 && slices == 64;
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
+        let pg = self.acquire_buf(t * n_out * slices * 4)?;
+        // SAFETY: launch_gemm과 동일 그리드/가드 — og만 호출부 제공.
+        unsafe {
+            if decode {
+                crate::gemm2::gemm_q3::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(gx as u32, 1, gz as u32),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    gx,
+                    t,
+                    d.ty() as u32 as usize,
+                );
+            } else {
+                let gy = t.div_ceil(4) as u32;
+                crate::gemm2::gemm_q2::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(gx as u32, gy, gz as u32),
+                    CubeDim::new_2d(64, 4),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    t,
+                    gx,
+                    d.ty() as u32 as usize,
+                    slices,
+                );
+            }
+            crate::gemm2::reduce_parts::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx as u32, t as u32, gz as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
+                n_out,
+                t,
+                gx,
+                slices,
+            );
+        }
+        self.release_bufs(&[(pg, t * n_out * slices * 4)]);
+        Ok((og, t * n_out * 4))
+    }
 }
 
 impl GpuMatmul<hanzo_cubecl_hip::HipRuntime> {
@@ -235,6 +327,8 @@ impl<R: Runtime> GpuMatmul<R> {
             bufs: ScratchPool::new(),
             ktab,
             grid3,
+            frames: Mutex::new(std::collections::HashMap::new()),
+            frame_next: AtomicU64::new(1),
         })
     }
 
@@ -730,6 +824,472 @@ impl<R: Runtime> GpuMatmul<R> {
         self.release_bufs(&[(xg, xf.len() * 4), (og, ob), (pg, pb)]);
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
+
+    /// gpu-ew-check — ew 커널 전종 GPU↔CPU 상호검증 (합성, LCG 고정).
+    /// 반환: (커널명, max_rel, 비트일치율) — norm류는 비트일치 기대(f64 경로),
+    /// 활성화류는 libm 차이 수준(≤1e-6) 허용. 판정은 서버측.
+    pub fn ew_check(&self) -> Result<Vec<(&'static str, f64, f64, f64)>, String> {
+        use llm170_core::ops::{l2_norm, rms_norm, sigmoid, silu};
+        let mut seed = 0x1234_5678u64;
+        let mut lcg = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+        };
+        let up = |v: &[f32]| self.client.create_from_slice(bytemuck::cast_slice(v));
+        let mut rels: Vec<(&'static str, f64, f64, f64)> = Vec::new();
+        let mut trash: Vec<(Handle, usize)> = Vec::new();
+        // 비교기: max_rel + max_abs + 비트일치율 — abs는 소폭 출력에서의
+        // rel 증폭(libm σ 편차 ~1e-7이 분모 1e-3에서 1e-4로 보이는 것) 판별용.
+        let cmp = |name: &'static str, g: &[f32], c: &[f32], rels: &mut Vec<(&'static str, f64, f64, f64)>| {
+            let (mut mr, mut ma, mut eq) = (0.0f64, 0.0f64, 0usize);
+            for (a, b) in g.iter().zip(c) {
+                let d = (*a - *b).abs() as f64;
+                ma = ma.max(d);
+                mr = mr.max(d / b.abs().max(1e-3) as f64);
+                eq += (a.to_bits() == b.to_bits()) as usize;
+            }
+            rels.push((name, mr, ma, eq as f64 / c.len() as f64));
+        };
+
+        // ── 요소별 활성화 ──
+        let n = 256usize;
+        let src: Vec<f32> = (0..n).map(|_| lcg() * 3.0).collect();
+        // silu — in-place: 업로드 핸들을 커널이 직접 변형
+        {
+            let tg = up(&src);
+            unsafe {
+                ew::ew_silu::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(tg.clone(), [1].into(), [n].into()),
+                    n,
+                );
+            }
+            let raw = self.client.read_one(tg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((tg, n * 4));
+            let cv: Vec<f32> = src.iter().map(|v| silu(*v)).collect();
+            cmp("ew_silu", &gv, &cv, &mut rels);
+        }
+        // sigmoid
+        {
+            let tg = up(&src);
+            unsafe {
+                ew::ew_sigmoid::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(tg.clone(), [1].into(), [n].into()),
+                    n,
+                );
+            }
+            let raw = self.client.read_one(tg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((tg, n * 4));
+            let cv: Vec<f32> = src.iter().map(|v| sigmoid(*v)).collect();
+            cmp("ew_sigmoid", &gv, &cv, &mut rels);
+        }
+        // silu_div (hc=4)
+        {
+            let hc = 4.0f32;
+            let pg = up(&[hc]);
+            let tg = up(&src);
+            unsafe {
+                ew::ew_silu_div::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(tg.clone(), [1].into(), [n].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    n,
+                );
+            }
+            let raw = self.client.read_one(tg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((tg, n * 4));
+            trash.push((pg, 4));
+            let cv: Vec<f32> = src.iter().map(|v| silu(*v / hc)).collect();
+            cmp("ew_silu_div", &gv, &cv, &mut rels);
+        }
+        // silu_mul (GLU)
+        {
+            let g_in: Vec<f32> = (0..n).map(|_| lcg() * 2.0).collect();
+            let u_in: Vec<f32> = (0..n).map(|_| lcg() * 2.0).collect();
+            let gg = up(&g_in);
+            let ug = up(&u_in);
+            let og = self.acquire_buf(n * 4)?;
+            unsafe {
+                ew::ew_silu_mul::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(gg.clone(), [1].into(), [n].into()),
+                    TensorArg::from_raw_parts(ug.clone(), [1].into(), [n].into()),
+                    TensorArg::from_raw_parts(og.clone(), [1].into(), [n].into()),
+                    n,
+                );
+            }
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((og, n * 4));
+            trash.push((gg, n * 4));
+            trash.push((ug, n * 4));
+            let cv: Vec<f32> = g_in.iter().zip(&u_in).map(|(g, u)| silu(*g) * u).collect();
+            cmp("ew_silu_mul", &gv, &cv, &mut rels);
+        }
+
+        // ── norm류 (비트일치 기대) ──
+        let (nn, w_reps, rows) = (256usize, 4usize, 8usize);
+        let x_in: Vec<f32> = (0..rows * nn).map(|_| lcg()).collect();
+        let w_in: Vec<f32> = (0..w_reps * nn).map(|_| lcg() + 1.0).collect();
+        let eps = 1e-5f32;
+        {
+            let xg = up(&x_in);
+            let wg = up(&w_in);
+            let og = self.acquire_buf(rows * nn * 4)?;
+            let pg = up(&[eps]);
+            unsafe {
+                ew::rms_rows::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(rows as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(xg.clone(), [1].into(), [rows * nn].into()),
+                    TensorArg::from_raw_parts(wg.clone(), [1].into(), [w_reps * nn].into()),
+                    TensorArg::from_raw_parts(og.clone(), [1].into(), [rows * nn].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    nn,
+                    w_reps,
+                );
+            }
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((og, rows * nn * 4));
+            trash.push((xg, rows * nn * 4));
+            trash.push((wg, w_reps * nn * 4));
+            trash.push((pg, 4));
+            let cv: Vec<f32> = (0..rows)
+                .flat_map(|r| {
+                    rms_norm(
+                        &x_in[r * nn..(r + 1) * nn],
+                        &w_in[(r % w_reps) * nn..(r % w_reps + 1) * nn],
+                        eps,
+                    )
+                })
+                .collect();
+            cmp("rms_rows", &gv, &cv, &mut rels);
+        }
+        // norm_gated
+        {
+            let (d, n_h) = (64usize, 6usize);
+            let o_in: Vec<f32> = (0..rows * d).map(|_| lcg()).collect();
+            let z_in: Vec<f32> = (0..rows * d).map(|_| lcg() * 2.0).collect();
+            let og_ = self.acquire_buf(rows * d * 4)?;
+            let ogt = up(&o_in);
+            let zgt = up(&z_in);
+            let wgt = up(&w_in[..n_h * d]);
+            let pg = up(&[eps]);
+            unsafe {
+                ew::norm_gated_rows::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(rows as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(ogt.clone(), [1].into(), [rows * d].into()),
+                    TensorArg::from_raw_parts(zgt.clone(), [1].into(), [rows * d].into()),
+                    TensorArg::from_raw_parts(wgt.clone(), [1].into(), [n_h * d].into()),
+                    TensorArg::from_raw_parts(og_.clone(), [1].into(), [rows * d].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    d,
+                    n_h,
+                );
+            }
+            let raw = self.client.read_one(og_.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((og_, rows * d * 4));
+            trash.push((ogt, rows * d * 4));
+            trash.push((zgt, rows * d * 4));
+            trash.push((wgt, n_h * d * 4));
+            trash.push((pg, 4));
+            let cv: Vec<f32> = (0..rows)
+                .flat_map(|r| {
+                    let nr = rms_norm(&o_in[r * d..(r + 1) * d], &w_in[(r % n_h) * d..(r % n_h + 1) * d], eps);
+                    nr.iter()
+                        .zip(&z_in[r * d..(r + 1) * d])
+                        .map(|(v, zz)| v * sigmoid(*zz))
+                        .collect::<Vec<f32>>()
+                })
+                .collect();
+            cmp("norm_gated_rows", &gv, &cv, &mut rels);
+        }
+        // l2_rows
+        {
+            let d = 64usize;
+            let mut x_l2: Vec<f32> = (0..rows * d).map(|_| lcg()).collect();
+            let cv: Vec<f32> = (0..rows)
+                .flat_map(|r| l2_norm(&x_l2[r * d..(r + 1) * d].to_vec(), eps))
+                .collect();
+            let xg = up(&x_l2);
+            let pg = up(&[eps]);
+            unsafe {
+                ew::l2_rows::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(rows as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(xg.clone(), [1].into(), [rows * d].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    d,
+                );
+            }
+            let raw = self.client.read_one(xg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((xg, rows * d * 4));
+            trash.push((pg, 4));
+            let _ = &mut x_l2;
+            cmp("l2_rows", &gv, &cv, &mut rels);
+        }
+
+        // ── hyper-connection ──
+        let (t_n, hc, ne) = (3usize, 4usize, 256usize);
+        {
+            let xn: Vec<f32> = (0..t_n * hc * ne).map(|_| lcg()).collect();
+            let gate: Vec<f32> = (0..t_n * hc * ne).map(|_| lcg() * 2.0).collect();
+            let xg = up(&xn);
+            let gg = up(&gate);
+            let og = self.acquire_buf(t_n * ne * 4)?;
+            let pg = up(&[hc as f32]);
+            unsafe {
+                ew::hc_gate_mean::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(ne.div_ceil(64) as u32, t_n as u32, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(xg.clone(), [1].into(), [xn.len()].into()),
+                    TensorArg::from_raw_parts(gg.clone(), [1].into(), [gate.len()].into()),
+                    TensorArg::from_raw_parts(og.clone(), [1].into(), [t_n * ne].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    ne,
+                    hc,
+                );
+            }
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((og, t_n * ne * 4));
+            trash.push((xg, xn.len() * 4));
+            trash.push((gg, gate.len() * 4));
+            trash.push((pg, 4));
+            let cv: Vec<f32> = (0..t_n)
+                .flat_map(|t| {
+                    (0..ne)
+                        .map(|i| {
+                            let mut acc = 0.0f32;
+                            for s in 0..hc {
+                                let g = gate[t * hc * ne + s * ne + i];
+                                acc += xn[t * hc * ne + s * ne + i] * sigmoid(g);
+                            }
+                            acc / hc as f32
+                        })
+                        .collect::<Vec<f32>>()
+                })
+                .collect();
+            cmp("hc_gate_mean", &gv, &cv, &mut rels);
+        }
+        // hc_combine
+        {
+            let mut res: Vec<f32> = (0..t_n * hc * ne).map(|_| lcg()).collect();
+            let outv: Vec<f32> = (0..t_n * ne).map(|_| lcg()).collect();
+            let inj: Vec<f32> = (0..t_n * hc).map(|_| lcg() * 2.0).collect();
+            let rg = up(&res);
+            let ogt = up(&outv);
+            let ig = up(&inj);
+            let pg = up(&[hc as f32]);
+            let total = t_n * hc * ne;
+            unsafe {
+                ew::hc_combine::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(total.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(rg.clone(), [1].into(), [total].into()),
+                    TensorArg::from_raw_parts(ogt.clone(), [1].into(), [t_n * ne].into()),
+                    TensorArg::from_raw_parts(ig.clone(), [1].into(), [t_n * hc].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                    ne,
+                    hc,
+                    total,
+                );
+            }
+            let raw = self.client.read_one(rg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((rg, total * 4));
+            trash.push((ogt, t_n * ne * 4));
+            trash.push((ig, t_n * hc * 4));
+            trash.push((pg, 4));
+            for t in 0..t_n {
+                for s in 0..hc {
+                    let w = 2.0 * sigmoid(inj[t * hc + s] / hc as f32);
+                    for (i, ov) in outv[t * ne..(t + 1) * ne].iter().enumerate() {
+                        res[t * hc * ne + s * ne + i] += ov * w;
+                    }
+                }
+            }
+            cmp("hc_combine", &gv, &res, &mut rels);
+        }
+
+        // ── GDN ──
+        {
+            let (n_h,) = (48usize,);
+            let b_in: Vec<f32> = (0..n_h).map(|_| lcg() * 2.0).collect();
+            let a_in: Vec<f32> = (0..n_h).map(|_| lcg() * 3.0).collect();
+            let dtb: Vec<f32> = (0..n_h).map(|_| lcg()).collect();
+            let sa: Vec<f32> = (0..n_h).map(|_| -lcg().abs() - 0.01).collect();
+            let bgg = self.acquire_buf(n_h * 2 * 4)?;
+            let bgt = up(&b_in);
+            let agt = up(&a_in);
+            let dtg = up(&dtb);
+            let sag = up(&sa);
+            unsafe {
+                ew::gdn_beta_g::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(n_h.div_ceil(64) as u32, 1, 1),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(bgt.clone(), [1].into(), [n_h].into()),
+                    TensorArg::from_raw_parts(agt.clone(), [1].into(), [n_h].into()),
+                    TensorArg::from_raw_parts(dtg.clone(), [1].into(), [n_h].into()),
+                    TensorArg::from_raw_parts(sag.clone(), [1].into(), [n_h].into()),
+                    TensorArg::from_raw_parts(bgg.clone(), [1].into(), [n_h * 2].into()),
+                    n_h,
+                );
+            }
+            let raw = self.client.read_one(bgg.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((bgg, n_h * 2 * 4));
+            trash.push((bgt, n_h * 4));
+            trash.push((agt, n_h * 4));
+            trash.push((dtg, n_h * 4));
+            trash.push((sag, n_h * 4));
+            let cv: Vec<f32> = (0..n_h * 2)
+                .map(|i| {
+                    let h = i / 2;
+                    if i % 2 == 0 {
+                        sigmoid(b_in[h])
+                    } else {
+                        let x = a_in[h] + dtb[h];
+                        let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+                        (sp * sa[h]).exp()
+                    }
+                })
+                .collect();
+            cmp("gdn_beta_g", &gv, &cv, &mut rels);
+        }
+        // gdn_conv
+        {
+            let (ch, k, t_len) = (96usize, 4usize, 5usize);
+            let qkv: Vec<f32> = (0..t_len * ch).map(|_| lcg()).collect();
+            let cwv: Vec<f32> = (0..ch * k).map(|_| lcg()).collect();
+            let mut st: Vec<f32> = (0..(k - 1) * ch).map(|_| lcg()).collect();
+            let st_orig = st.clone();
+            let qg = up(&qkv);
+            let cwg = up(&cwv);
+            let sgt = up(&st_orig);
+            let og = self.acquire_buf(t_len * ch * 4)?;
+            unsafe {
+                ew::gdn_conv::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(ch as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(qg.clone(), [1].into(), [t_len * ch].into()),
+                    TensorArg::from_raw_parts(cwg.clone(), [1].into(), [ch * k].into()),
+                    TensorArg::from_raw_parts(sgt.clone(), [1].into(), [(k - 1) * ch].into()),
+                    TensorArg::from_raw_parts(og.clone(), [1].into(), [t_len * ch].into()),
+                    ch,
+                    k,
+                    t_len,
+                );
+            }
+            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+            let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
+            trash.push((og, t_len * ch * 4));
+            trash.push((qg, t_len * ch * 4));
+            trash.push((cwg, ch * k * 4));
+            trash.push((sgt, (k - 1) * ch * 4));
+            let mut cv = vec![0.0f32; t_len * ch];
+            for t in 0..t_len {
+                for c in 0..ch {
+                    let mut sum = cwv[c * k + (k - 1)] * qkv[t * ch + c];
+                    for j in 0..k - 1 {
+                        sum += cwv[c * k + j] * st[j * ch + c];
+                    }
+                    let oc = silu(sum);
+                    for j in 0..k - 2 {
+                        st[j * ch + c] = st[(j + 1) * ch + c];
+                    }
+                    st[(k - 2) * ch + c] = qkv[t * ch + c];
+                    cv[t * ch + c] = oc;
+                }
+            }
+            cmp("gdn_conv", &gv, &cv, &mut rels);
+        }
+
+        // ── MoE top10 ──
+        {
+            let (n_exp, k_sel, t_len) = (64usize, 10usize, 3usize);
+            let mut route: Vec<f32> = (0..t_len * n_exp).map(|_| lcg() * 4.0).collect();
+            let rg = up(&route);
+            let idg = self.acquire_buf(t_len * k_sel * 4)?;
+            let wtg = self.acquire_buf(t_len * k_sel * 4)?;
+            unsafe {
+                ew::moe_top10::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(t_len as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(rg.clone(), [1].into(), [t_len * n_exp].into()),
+                    TensorArg::from_raw_parts(idg.clone(), [1].into(), [t_len * k_sel].into()),
+                    TensorArg::from_raw_parts(wtg.clone(), [1].into(), [t_len * k_sel].into()),
+                    n_exp,
+                    k_sel,
+                );
+            }
+            let raw_i = self.client.read_one(idg.clone()).map_err(|e| e.to_string())?;
+            let raw_w = self.client.read_one(wtg.clone()).map_err(|e| e.to_string())?;
+            let gids: Vec<u32> = bytemuck::cast_slice(&raw_i).to_vec();
+            let gws: Vec<f32> = bytemuck::cast_slice(&raw_w).to_vec();
+            trash.push((rg, t_len * n_exp * 4));
+            trash.push((idg, t_len * k_sel * 4));
+            trash.push((wtg, t_len * k_sel * 4));
+            // CPU 기준 — moe.rs 40-61
+            let (mut ids_ok, mut wmr) = (true, 0.0f64);
+            for t in 0..t_len {
+                let logits = &mut route[t * n_exp..(t + 1) * n_exp];
+                let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let mut zs = 0.0f32;
+                for v in logits.iter_mut() {
+                    *v = (*v - mx).exp();
+                    zs += *v;
+                }
+                for v in logits.iter_mut() {
+                    *v /= zs;
+                }
+                let mut idx: Vec<usize> = (0..n_exp).collect();
+                idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+                let sel = &idx[..k_sel];
+                let mut wsum: f32 = sel.iter().map(|&e| logits[e]).sum();
+                wsum = wsum.max(6.103515625e-5);
+                for (s, &e) in sel.iter().enumerate() {
+                    let w = logits[e] / wsum;
+                    if gids[t * k_sel + s] != e as u32 {
+                        ids_ok = false;
+                    }
+                    let d = (gws[t * k_sel + s] - w).abs() as f64;
+                    wmr = wmr.max(d / w.abs().max(1e-3) as f64);
+                }
+            }
+            rels.push(("moe_top10_ids", if ids_ok { 0.0 } else { 1.0 }, 0.0, 1.0));
+            rels.push(("moe_top10_w", wmr, 0.0, 1.0));
+        }
+
+        self.release_bufs(&trash);
+        Ok(rels)
+    }
 }
 
 impl<R: Runtime> Accelerator for GpuMatmul<R> {
@@ -968,6 +1528,592 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         self.release_bufs(&to_release);
         let _ = tlen;
         N_OP.fetch_add(devs.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    // ─── 프레임(활성화 GPU 상주) — P2-4. 값 경로와 병행, readback 없음. ───
+
+    fn frame_alloc(&self, len: usize) -> Result<u64, String> {
+        if len == 0 {
+            return Err("frame_alloc: 길이 0".into());
+        }
+        let h = self.acquire_buf(len * 4)?;
+        let id = self.frame_next.fetch_add(1, Ordering::Relaxed);
+        self.frames
+            .lock()
+            .map_err(|_| "frame lock poisoned")?
+            .insert(id, (h, len));
+        Ok(id)
+    }
+
+    fn frame_free(&self, h: u64) -> Result<(), String> {
+        let (handle, len) = self
+            .frames
+            .lock()
+            .map_err(|_| "frame lock poisoned")?
+            .remove(&h)
+            .ok_or_else(|| format!("frame_free: 알 수 없는 핸들 {h}"))?;
+        self.release_bufs(&[(handle, len * 4)]);
+        Ok(())
+    }
+
+    /// 기록 = 신규 업로드 + 레지스트리 교체 (cubecl에 기존 핸들 write API 없음).
+    /// 구 핸들은 풀 반납 — 해제 경로 없음 (ADR-0014).
+    fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
+        let (old, old_len) = self.frame_get(h)?;
+        if old_len != data.len() {
+            return Err(format!(
+                "frame_write: 길이 불일치 핸들={old_len} 데이터={}",
+                data.len()
+            ));
+        }
+        let new = self.client.create_from_slice(bytemuck::cast_slice(data));
+        self.frames
+            .lock()
+            .map_err(|_| "frame lock poisoned")?
+            .insert(h, (new, data.len()));
+        self.release_bufs(&[(old, old_len * 4)]);
+        Ok(())
+    }
+
+    fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
+        let (handle, len) = self.frame_get(h)?;
+        if len != out.len() {
+            return Err(format!("frame_read: 길이 불일치 핸들={len} out={}", out.len()));
+        }
+        let raw = self.client.read_one(handle).map_err(|e| e.to_string())?;
+        out.copy_from_slice(bytemuck::cast_slice(&raw));
+        Ok(())
+    }
+
+    fn frame_mm(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
+        let d = self.dev_weight(w)?;
+        if d.is_host() {
+            return Err("frame_mm: 호스트 폴백 가중치 (W_CAP 초과)".into());
+        }
+        let (xh, xlen) = self.frame_get(x)?;
+        let (oh, olen) = self.frame_get(out)?;
+        let n_in = d.shape().0;
+        let n_out = d.shape().1;
+        if xlen != t * n_in || olen != t * n_out {
+            return Err(format!(
+                "frame_mm: 형상 불일치 x={xlen} (t·n_in={}) out={olen} (t·n_out={})",
+                t * n_in,
+                t * n_out
+            ));
+        }
+        // SAFETY: launch_gemm과 동일 그리드/가드 — 입출력 핸들은 프레임 소유.
+        unsafe { self.launch_gemm_into(&d, xh, t, oh)? };
+        N_OP.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+        if ws.len() != outs.len() {
+            return Err(format!("frame_mm_group: ws({}) != outs({})", ws.len(), outs.len()));
+        }
+        for (w, &o) in ws.iter().zip(outs.iter()) {
+            self.frame_mm(x, w, o, t)?;
+        }
+        Ok(())
+    }
+
+    fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
+        use llm170_core::matmul::FrameOp;
+        let one = |h: u64| self.frame_get(h).map(|v| v.0);
+        let aux = |v: &[f32]| -> Result<Handle, String> { Ok(self.client.create_from_slice(bytemuck::cast_slice(v))) };
+        match op {
+            FrameOp::SiluDiv { t, div, n } => {
+                let (th, tl) = self.frame_get(*t)?;
+                if tl != *n {
+                    return Err("SiluDiv: 길이 불일치".into());
+                }
+                let pg = aux(&[*div])?;
+                // SAFETY: ABSOLUTE_POS 가드 — 범위 내.
+                unsafe {
+                    ew::ew_silu_div::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(th, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *n,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::SiluMul { g, u, out, n } => {
+                let gh = one(*g)?;
+                let uh = one(*u)?;
+                let oh = one(*out)?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::ew_silu_mul::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(gh, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(uh, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [*n].into()),
+                        *n,
+                    );
+                }
+            }
+            FrameOp::Sigmoid { t, n } => {
+                let th = one(*t)?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::ew_sigmoid::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(th, [1].into(), [*n].into()),
+                        *n,
+                    );
+                }
+            }
+            FrameOp::RmsRows { x, w, out, eps, n, w_reps } => {
+                let xh = one(*x)?;
+                let wh = one(*w)?;
+                let oh = one(*out)?;
+                let rows = self.frame_get(*x)?.1 / n;
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1행, 유닛 0만 실행.
+                unsafe {
+                    ew::rms_rows::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(xh, [1].into(), [rows * n].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [w_reps * n].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [rows * n].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *n,
+                        *w_reps,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::NormGated { o, z, w, out, eps, d, n_h } => {
+                let ohh = one(*o)?;
+                let zh = one(*z)?;
+                let wh = one(*w)?;
+                let outh = one(*out)?;
+                let rows = self.frame_get(*o)?.1 / d;
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1행, 유닛 0만 실행.
+                unsafe {
+                    ew::norm_gated_rows::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(ohh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(zh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [n_h * d].into()),
+                        TensorArg::from_raw_parts(outh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *d,
+                        *n_h,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::L2Rows { x, eps, d } => {
+                let xh = one(*x)?;
+                let rows = self.frame_get(*x)?.1 / d;
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1행, 유닛 0만 실행.
+                unsafe {
+                    ew::l2_rows::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(xh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *d,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::HcGateMean { xn, gate, out, hc, n } => {
+                let xh = one(*xn)?;
+                let gh = one(*gate)?;
+                let oh = one(*out)?;
+                let t = self.frame_get(*xn)?.1 / (hc * n);
+                let pg = aux(&[*hc as f32])?;
+                // SAFETY: 그리드 (n블록, t), 유닛 가드 i<n.
+                unsafe {
+                    ew::hc_gate_mean::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, t as u32, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(xh, [1].into(), [t * hc * n].into()),
+                        TensorArg::from_raw_parts(gh, [1].into(), [t * hc * n].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [t * n].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *n,
+                        *hc,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::HcCombine { res, out, inj, hc, n, total } => {
+                let rh = one(*res)?;
+                let oh = one(*out)?;
+                let ih = one(*inj)?;
+                let pg = aux(&[*hc as f32])?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::hc_combine::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(total.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(rh, [1].into(), [*total].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [total / hc].into()),
+                        TensorArg::from_raw_parts(ih, [1].into(), [total / (hc * n)].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *n,
+                        *hc,
+                        *total,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
+                let bh = one(*b)?;
+                let ah = one(*a)?;
+                let dh = one(*dtb)?;
+                let sh = one(*sa)?;
+                let gh = one(*bg)?;
+                // SAFETY: ABSOLUTE_POS 가드 h<n_h.
+                unsafe {
+                    ew::gdn_beta_g::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n_h.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(bh, [1].into(), [*n_h].into()),
+                        TensorArg::from_raw_parts(ah, [1].into(), [*n_h].into()),
+                        TensorArg::from_raw_parts(dh, [1].into(), [*n_h].into()),
+                        TensorArg::from_raw_parts(sh, [1].into(), [*n_h].into()),
+                        TensorArg::from_raw_parts(gh, [1].into(), [n_h * 2].into()),
+                        *n_h,
+                    );
+                }
+            }
+            FrameOp::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
+                let qh = one(*qkv)?;
+                let chh = one(*cw)?;
+                let sh = one(*state)?;
+                let oh = one(*out)?;
+                // SAFETY: 큐브당 1채널, 유닛 0만 실행 — t 순차 갱신.
+                unsafe {
+                    ew::gdn_conv::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(*ch as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(qh, [1].into(), [t_len * ch].into()),
+                        TensorArg::from_raw_parts(chh, [1].into(), [ch * k].into()),
+                        TensorArg::from_raw_parts(sh, [1].into(), [(k - 1) * ch].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [t_len * ch].into()),
+                        *ch,
+                        *k,
+                        *t_len,
+                    );
+                }
+            }
+            FrameOp::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+                let rh = one(*route)?;
+                let ih = one(*ids)?;
+                let wh = one(*wt)?;
+                let t = self.frame_get(*route)?.1 / n_exp;
+                // SAFETY: 큐브당 1토큰, 유닛 0만 실행.
+                unsafe {
+                    ew::moe_top10::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(t as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(rh, [1].into(), [t * n_exp].into()),
+                        TensorArg::from_raw_parts(ih, [1].into(), [t * k_sel].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [t * k_sel].into()),
+                        *n_exp,
+                        *k_sel,
+                    );
+                }
+            }
+            FrameOp::RopeApply { x, cs, pos_base, rows_per_tok, pos_mul, stride, half } => {
+                let xh = one(*x)?;
+                let csh = one(*cs)?;
+                let rows = self.frame_get(*x)?.1 / stride;
+                // SAFETY: 그리드 (half블록, rows), 유닛 가드 p<half.
+                unsafe {
+                    ew::rope_apply::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(half.div_ceil(64) as u32, rows as u32, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(xh, [1].into(), [rows * stride].into()),
+                        TensorArg::from_raw_parts(csh, [1].into(), [usize::MAX].into()),
+                        *pos_base,
+                        *rows_per_tok,
+                        *pos_mul,
+                        *stride,
+                        *half,
+                    );
+                }
+            }
+            FrameOp::IdxPool { cache, out, first_block, dim, r } => {
+                let chh = one(*cache)?;
+                let oh = one(*out)?;
+                let n_new = self.frame_get(*out)?.1 / dim;
+                // SAFETY: 큐브당 1블록, 유닛 가드 i<dim.
+                unsafe {
+                    ew::idx_pool::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n_new as u32, 1, 1),
+                        CubeDim::new_1d(128),
+                        TensorArg::from_raw_parts(chh, [1].into(), [usize::MAX].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [n_new * dim].into()),
+                        *first_block,
+                        *dim,
+                        *r,
+                    );
+                }
+            }
+            FrameOp::IdxScores { qr, bk, scores, idx_heads, dim } => {
+                let qh = one(*qr)?;
+                let bh = one(*bk)?;
+                let sh = one(*scores)?;
+                let n_blocks = self.frame_get(*scores)?.1;
+                // SAFETY: 큐브당 1블록, 유닛 0만 실행.
+                unsafe {
+                    ew::idx_scores::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n_blocks as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(qh, [1].into(), [idx_heads * dim].into()),
+                        TensorArg::from_raw_parts(bh, [1].into(), [n_blocks * dim].into()),
+                        TensorArg::from_raw_parts(sh, [1].into(), [n_blocks].into()),
+                        *idx_heads,
+                        *dim,
+                    );
+                }
+            }
+            FrameOp::Scale { t, s, n } => {
+                let th = one(*t)?;
+                let pg = aux(&[*s])?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::ew_scale::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(th, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *n,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::CopyRows { src, dst, src_off, dst_off, n } => {
+                let sh = one(*src)?;
+                let dh = one(*dst)?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::copy_rows::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(sh, [1].into(), [usize::MAX].into()),
+                        TensorArg::from_raw_parts(dh, [1].into(), [usize::MAX].into()),
+                        *src_off,
+                        *dst_off,
+                        *n,
+                    );
+                }
+            }
+            FrameOp::MoeWeightedSum { ys, wt, out, k, n } => {
+                let yh = one(*ys)?;
+                let wh = one(*wt)?;
+                let oh = one(*out)?;
+                // SAFETY: 그리드 (n블록), 유닛 가드 i<n.
+                unsafe {
+                    ew::moe_weighted_sum::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(yh, [1].into(), [k * n].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [*k].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [*n].into()),
+                        *k,
+                        *n,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Runtime> llm170_core::matmul::FrameState for GpuMatmul<R> {
+    fn frame_gdn_ar(
+        &self,
+        q_scaled: u64,
+        k: u64,
+        v: u64,
+        beta_ge: u64,
+        states: u64,
+        out: u64,
+        n_seqs: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        let sg = self.frame_get(states)?.0;
+        let qg = self.frame_get(q_scaled)?.0;
+        let kg = self.frame_get(k)?.0;
+        let vg = self.frame_get(v)?.0;
+        let bg = self.frame_get(beta_ge)?.0;
+        let og = self.frame_get(out)?.0;
+        let n_pairs = n_seqs * h_v;
+        // SAFETY: 그리드 (n_pairs,1,1) — gdn_ar_gpu와 동일, 입출력 프레임 소유.
+        unsafe {
+            gdn_kernel::gdn_ar::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_pairs as u32, 1, 1),
+                CubeDim::new_1d(128),
+                TensorArg::from_raw_parts(sg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(qg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(kg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(vg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(bg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(og, [1].into(), [usize::MAX].into()),
+                d,
+                h_k * d,
+                h_v * d,
+                h_v,
+                h_k,
+            );
+        }
+        N_OP.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// ck는 호출부가 kq_scale 사전곱 상태로 유지 (append 시점 스케일 —
+    /// 값 경로의 사용 시점 곱과 동일 수치).
+    fn frame_qsa_attention(
+        &self,
+        q: u64,
+        ck: u64,
+        cv: u64,
+        mask: u64,
+        out: u64,
+        _kq_scale: f32,
+        n_past: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let qg = self.frame_get(q)?.0;
+        let ckg = self.frame_get(ck)?.0;
+        let cvg = self.frame_get(cv)?.0;
+        let mg = self.frame_get(mask)?.0;
+        let og = self.frame_get(out)?.0;
+        let sg = self.acquire_buf(t * n_head * n_past * 4)?;
+        // SAFETY: qsa_attention_inner와 동일 그리드/가드.
+        unsafe {
+            attn::qsa_score::launch_unchecked(
+                &self.client,
+                CubeCount::Static(n_past as u32, n_head as u32, t as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(ckg.clone(), [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(mg.clone(), [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
+                n_past,
+                n_head,
+                n_kv,
+                hd,
+                t,
+            );
+            attn::qsa_mix::launch_unchecked(
+                &self.client,
+                CubeCount::Static(hd as u32, n_head as u32, t as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(sg.clone(), [1].into(), [t * n_head * n_past].into()),
+                TensorArg::from_raw_parts(cvg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(og, [1].into(), [t * n_head * hd].into()),
+                n_past,
+                n_head,
+                n_kv,
+                hd,
+                t,
+            );
+        }
+        self.release_bufs(&[(sg, t * n_head * n_past * 4)]);
+        N_OP.fetch_add(2, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn frame_moe_gemm(
+        &self,
+        x: u64,
+        ws: &Weight,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+    ) -> Result<(), String> {
+        let d = self.dev_weight(ws)?;
+        if d.is_host() {
+            return Err("frame_moe_gemm: 스택 가중치 호스트 폴백 (예산 초과)".into());
+        }
+        let (n_in, n_out_full) = d.shape();
+        let n_out = n_out_full / n_expert_stack;
+        let wtype = d.ty() as u32 as usize;
+        let wwords = d.words();
+        let exp_bytes = wwords * 4 / n_expert_stack;
+        let xh = self.frame_get(x)?.0;
+        let eg = self.frame_get(ids)?.0;
+        let oh = self.frame_get(out)?.0;
+        let k = self.frame_get(x)?.1 / n_in;
+        if self.frame_get(out)?.1 != k * n_out {
+            return Err("frame_moe_gemm: out 형상 불일치".into());
+        }
+        let pg = self.acquire_buf(k * n_out * 64 * 4)?;
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
+        // SAFETY: moe_down_gpu와 동일 그리드/가드 — ids를 GPU 핸들에서 직독.
+        unsafe {
+            gemm5::gemm_q5::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx as u32, k as u32, gz as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(xh, [1].into(), [k * n_in].into()),
+                TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [wwords].into()),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [k * n_out * 64].into()),
+                TensorArg::from_raw_parts(eg, [1].into(), [usize::MAX].into()),
+                TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                n_in,
+                n_out,
+                exp_bytes,
+                gx,
+                wtype,
+            );
+            gemm2::reduce_parts::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx as u32, k as u32, gz as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [k * n_out * 64].into()),
+                TensorArg::from_raw_parts(oh, [1].into(), [k * n_out].into()),
+                n_out,
+                k,
+                gx,
+                64,
+            );
+        }
+        self.release_bufs(&[(pg, k * n_out * 64 * 4)]);
+        N_OP.fetch_add(2, Ordering::Relaxed);
         Ok(())
     }
 }

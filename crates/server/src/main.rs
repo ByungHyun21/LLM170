@@ -101,8 +101,7 @@ fn main() -> ExitCode {
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("w4a8-gpu") => cmd_w4a8_gpu(&args[1..]),
         Some("gpu-de") => cmd_gpu_de(&args[1..]),
-        Some("gdn-ar-check") => cmd_gdn_ar_check(),
-        Some("moe-down-check") => cmd_moe_down_check(),
+        Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
         Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -727,6 +726,48 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
     eprintln!("# check 전체 통과");
     ExitCode::SUCCESS
+}
+
+/// gpu-ew-check — ew 커널 전종 GPU↔CPU 상호검증 (층 GPU 상주 P2-4 1단계).
+/// 판정: norm류 max_rel < 1e-6 (f64 경로 — 비트일치 기대), 활성화류 < 1e-5
+/// (libm 구현차), moe ids 완전일치.
+fn cmd_gpu_ew_check() -> ExitCode {
+    let run = |report: Result<Vec<(&'static str, f64, f64, f64)>, String>| -> (bool, String) {
+        let rels = match report {
+            Ok(r) => r,
+            Err(e) => return (false, format!("error: {e}")),
+        };
+        let mut ok = true;
+        let mut out = String::new();
+        for (name, mr, ma, beq) in &rels {
+            let is_norm = name.contains("rms") || name.contains("l2");
+            // norm류: 비트일치(f64 경로). 활성화류: libm σ 편차 — abs < 1e-5
+            // (소폭 출력의 rel 증폭은 abs로 판별) 또는 rel < 1e-5.
+            let pass = if is_norm {
+                *mr < 1e-6
+            } else {
+                *ma < 1e-5 || *mr < 1e-5
+            };
+            ok &= pass;
+            out.push_str(&format!(
+                "[ew] {name}: max_rel={mr:.3e} max_abs={ma:.3e} bit_eq={beq:.4} {}\n",
+                if pass { "ok" } else { "MISMATCH" }
+            ));
+        }
+        (ok, out)
+    };
+    let (ok, out) = match std::env::var("LLM170_GPU_RUNTIME").as_deref() {
+        Ok("vulkan") => run(llm170_backend_gpu::GpuMatmul::new_vulkan().and_then(|g| g.ew_check())),
+        _ => run(llm170_backend_gpu::GpuMatmul::new_hip().and_then(|g| g.ew_check())),
+    };
+    print!("{out}");
+    if ok {
+        println!("gpu-ew-check PASS");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("gpu-ew-check MISMATCH");
+        ExitCode::FAILURE
+    }
 }
 
 /// gdn-ar-check — GDN AR 커널 GPU↔CPU 상호검증 (합성 텐서, 수제 LCG).

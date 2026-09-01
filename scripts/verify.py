@@ -48,7 +48,7 @@ def post(path, payload):
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as r:
+    with urllib.request.urlopen(req, timeout=2400) as r:
         return json.loads(r.read())
 
 

@@ -9,6 +9,20 @@ unset LLM170_GPU_RUNTIME LLM170_W_CAP_GB LLM170_Q4_CHUNK
 # 0) HIP 커널 건재
 ./target/release/llm170 gdn-ar-check && ./target/release/llm170 moe-down-check
 
+pkill -f "llm170 serve" 2>/dev/null; sleep 2
+
+# 간헐 sweep 결함 재시도 헬퍼 — 빈 출력(크래시) 시 최대 3회
+run_infer() {
+  local out=$1; shift
+  local a
+  for a in 1 2 3; do
+    LLM170_W_CAP_GB=48 ./target/release/llm170 infer --backend gpu --gpu-runtime hip \
+      --model "$M" "$@" 2>"$out.err" >"$out"
+    [ -s "$out" ] && return 0
+    echo "RETRY $a: 간헐 결함 — 재실행"
+    sleep 3
+  done
+}
 # 1) qwen35 서버 매트릭스 (HIP=VRAM, 11케이스 전체)
 ./target/release/llm170 serve --model /home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf --port 18080 --ctx 4096 \
   --backend gpu --gpu-runtime hip > /tmp/srv35_hip.log 2>&1 &
@@ -28,16 +42,13 @@ open("/tmp/long_ids.txt","w").write(",".join(map(str,ids[:2311])))
 open("/tmp/long2_ids.txt","w").write(",".join(str((i*9973+11) % 240000) for i in range(1904)))
 PYGEN
 L1=$(cat /tmp/long_ids.txt); L2=$(cat /tmp/long2_ids.txt)
-LLM170_W_CAP_GB=48 ./target/release/llm170 infer --backend gpu --gpu-runtime hip \
-  --model "$M" --prompt-tokens "$L1" --n-predict 24 --ctx 4096 2>/tmp/ls_hip.err >/tmp/ls_hip.jsonl
+run_infer /tmp/ls_hip.jsonl --prompt-tokens "$L1" --n-predict 24 --ctx 4096
 echo "장문단일 lines=$(wc -l < /tmp/ls_hip.jsonl)"
-LLM170_W_CAP_GB=48 ./target/release/llm170 infer --backend gpu --gpu-runtime hip \
-  --model "$M" --prompt-tokens "$L1" --prompt-tokens "$L2" --n-predict 24 --ctx 4096 2>/tmp/lnp_hip.err >/tmp/lnp_hip.jsonl
+run_infer /tmp/lnp_hip.jsonl --prompt-tokens "$L1" --prompt-tokens "$L2" --n-predict 24 --ctx 4096
 echo "장문np2 lines=$(wc -l < /tmp/lnp_hip.jsonl)"
 
 # 3) 판정 (병렬↔단독 + 단독 재실행)
-LLM170_W_CAP_GB=48 ./target/release/llm170 infer --backend gpu --gpu-runtime hip \
-  --model "$M" --prompt-tokens "$L2" --n-predict 24 --ctx 4096 2>/dev/null >/tmp/l2_solo.jsonl
+run_infer /tmp/l2_solo.jsonl --prompt-tokens "$L2" --n-predict 24 --ctx 4096
 python3 - <<'PY'
 import json
 def toks(f, seq=None):

@@ -139,6 +139,130 @@ pub trait Accelerator: Send + Sync {
         }
         Ok(())
     }
+    // ─── 프레임(활성화 GPU 상주) — 층 전체 상주 P2-4 (plans/gpu-frame.md) ───
+    /// 기본 미지원(Err) — 프레임 경로는 구현 가속기에서만 사용하며, 값 반환
+    /// 경로(위 matmul 계열)와 병행해 CPU golden 대조가 가능하다.
+
+    /// 프레임 버퍼 할당 — u64는 가속기 레지스트리 토큰 (해제는 frame_free).
+    fn frame_alloc(&self, _len: usize) -> Result<u64, String> {
+        Err("frame_alloc: 미지원".into())
+    }
+    /// 프레임 버퍼 반납 (풀 재사용 — 해제 아님, ADR-0014).
+    fn frame_free(&self, _h: u64) -> Result<(), String> {
+        Err("frame_free: 미지원".into())
+    }
+    /// 호스트 → 프레임 버퍼 기록.
+    fn frame_write(&self, _h: u64, _data: &[f32]) -> Result<(), String> {
+        Err("frame_write: 미지원".into())
+    }
+    /// 프레임 버퍼 → 호스트 판독 (동기 — forward 종료 1회가 설계상 목표).
+    fn frame_read(&self, _h: u64, _out: &mut [f32]) -> Result<(), String> {
+        Err("frame_read: 미지원".into())
+    }
+    /// 상주 GEMM: out[t·n_out..] = x[t·n_in..]·W — 업/다운로드 없음.
+    fn frame_mm(&self, _x: u64, _w: &Weight, _out: u64, _t: usize) -> Result<(), String> {
+        Err("frame_mm: 미지원".into())
+    }
+    /// 상주 GEMM 그룹 — 동일 입력 x, 가중치별 out.
+    fn frame_mm_group(&self, _x: u64, _ws: &[Weight], _outs: &[u64], _t: usize) -> Result<(), String> {
+        Err("frame_mm_group: 미지원".into())
+    }
+    /// 상주 elementwise/RoPE/인덱서 연산 — 커널 선택은 FrameOp 변형.
+    fn frame_op(&self, _op: &FrameOp) -> Result<(), String> {
+        Err("frame_op: 미지원".into())
+    }
+}
+
+/// 프레임 연산 식별 — 백엔드 커널 세트(backend-gpu/src/ew.rs)와 1:1.
+/// u64는 전부 프레임 핸들. 수치 계약: CPU 참조(ops.rs·stages)와 동일 순서.
+#[derive(Debug, Clone, Copy)]
+pub enum FrameOp {
+    /// in-place: v ← silu(v/div) — hc 저랭크 lo.
+    SiluDiv { t: u64, div: f32, n: usize },
+    /// GLU: out = silu(g)·u.
+    SiluMul { g: u64, u: u64, out: u64, n: usize },
+    /// in-place sigmoid.
+    Sigmoid { t: u64, n: usize },
+    /// 행별 RMSNorm (w는 w_reps 반복 — hc 그룹/헤드별).
+    RmsRows { x: u64, w: u64, out: u64, eps: f32, n: usize, w_reps: usize },
+    /// GDN norm_gated: out = rms(o)·σ(z), w 반복 = 헤드.
+    NormGated { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
+    /// GDN q/k 헤드별 in-place L2 norm.
+    L2Rows { x: u64, eps: f32, d: usize },
+    /// hc 게이트 적용 + 스트림 평균 (hc는 나눗셈 피수로 사용).
+    HcGateMean { xn: u64, gate: u64, out: u64, hc: usize, n: usize },
+    /// hc combine: res += out·(2·σ(inj/hc)).
+    HcCombine { res: u64, out: u64, inj: u64, hc: usize, n: usize, total: usize },
+    /// GDN β/e^g 사전계산: bg[h·2]=σ(b), bg[h·2+1]=e^(softplus(a+dtb)·sa).
+    GdnBetaG { b: u64, a: u64, dtb: u64, sa: u64, bg: u64, n_h: usize },
+    /// GDN conv1d + ring shift + silu (state in-place).
+    GdnConv { qkv: u64, cw: u64, state: u64, out: u64, ch: usize, k: usize, t_len: usize },
+    /// MoE route top-k: ids/wt GPU 잔류.
+    MoeTop10 { route: u64, ids: u64, wt: u64, n_exp: usize, k_sel: usize },
+    /// NEOX RoPE (cs = [pos_max][half][2] cos,sin 인터리브 테이블).
+    RopeApply { x: u64, cs: u64, pos_base: usize, rows_per_tok: usize, pos_mul: usize, stride: usize, half: usize },
+    /// 인덱서 블록키 풀링 (mean of r rows).
+    IdxPool { cache: u64, out: u64, first_block: usize, dim: usize, r: usize },
+    /// 인덱서 스코어: Σ_h ReLU(qr·bk).
+    IdxScores { qr: u64, bk: u64, scores: u64, idx_heads: usize, dim: usize },
+    /// in-place: v ← v·s (GDN q 사전 스케일).
+    Scale { t: u64, s: f32, n: usize },
+    /// 행 복사: dst[dst_off..+n] = src[src_off..+n] — 캐시 append 부품.
+    CopyRows { src: u64, dst: u64, src_off: usize, dst_off: usize, n: usize },
+    /// MoE 전문가 가중 합: out = Σ_e wt[e]·ys[e].
+    MoeWeightedSum { ys: u64, wt: u64, out: u64, k: usize, n: usize },
+}
+
+/// 프레임 상태 연산 — 상주 상태(kv/gdn/conv/blk)를 갱신하는 가속기 전용
+/// 메서드. 값 경로 Accelerator 메서드와 대응하되 입출력이 전부 핸들.
+pub trait FrameState {
+    /// GDN AR 상태 갱신 (gdn_ar의 프레임 변형) — states·out 상주, 판독 없음.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar(
+        &self,
+        _q_scaled: u64,
+        _k: u64,
+        _v: u64,
+        _beta_ge: u64,
+        _states: u64,
+        _out: u64,
+        _n_seqs: usize,
+        _h_k: usize,
+        _h_v: usize,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("frame_gdn_ar: 미지원".into())
+    }
+    /// QSA 마스크드 밀집 GQA (qsa_attention 프레임 변형) — 캐시 상주.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_qsa_attention(
+        &self,
+        _q: u64,
+        _ck: u64,
+        _cv: u64,
+        _mask: u64,
+        _out: u64,
+        _kq_scale: f32,
+        _n_past: usize,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        Err("frame_qsa_attention: 미지원".into())
+    }
+    /// MoE ids 구동 배치 GEMM — x 상주, ids 상주(GPU top10 출력 직결).
+    /// stack은 전문가 스택 전체 뷰. outs는 [k_sel·n_out] 단일 프레임.
+    fn frame_moe_gemm(
+        &self,
+        _x: u64,
+        _ws: &Weight,
+        _ids: u64,
+        _out: u64,
+        _n_expert_stack: usize,
+    ) -> Result<(), String> {
+        Err("frame_moe_gemm: 미지원".into())
+    }
 }
 
 /// matmul_group 디스패치 — 가속기 없으면 CPU 개별 배치.
