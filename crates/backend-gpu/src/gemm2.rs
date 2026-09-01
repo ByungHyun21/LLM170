@@ -267,10 +267,12 @@ pub fn gemm_q2(
     n_in: usize,
     n_out: usize,
     t_len: usize,
+    gx: usize,
     #[comptime] qtype: usize,
     #[comptime] slices: usize,
 ) {
-    let o = CUBE_POS_X as usize;
+    // o-차원 접힘: wgpu 그리드 X 상한 65,535 — 초과분 Z로 (2026-09-01).
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let t = (CUBE_POS_Y * 4 + UNIT_POS_Y) as usize;
     let l = UNIT_POS_X as usize;
     if o >= n_out || t >= t_len || l >= slices {
@@ -408,10 +410,12 @@ pub fn gemm_q3(
     grid3: &Tensor<u32>,
     n_in: usize,
     n_out: usize,
+    gx: usize,
     #[comptime] tlen: usize,
     #[comptime] qtype: usize,
 ) {
-    let o = CUBE_POS_X as usize;
+    // o-차원 접힘 (wgpu 65,535 상한).
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
     if o >= n_out || l >= 64 {
         terminate!();
@@ -573,9 +577,11 @@ pub fn reduce_parts(
     out: &mut Tensor<f32>,
     n_out: usize,
     t_len: usize,
+    gx: usize,
     #[comptime] slices: usize,
 ) {
-    let o = ABSOLUTE_POS_X as usize;
+    // o = 유닛 절대 인덱스(큐브×64+유닛) + Z레이어 오프셋 — wgpu 65,535 접힘.
+    let o = ABSOLUTE_POS_X as usize + CUBE_POS_Z as usize * gx * 64;
     let t = ABSOLUTE_POS_Y as usize;
     if o >= n_out || t >= t_len {
         terminate!();

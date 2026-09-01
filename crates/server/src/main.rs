@@ -1107,7 +1107,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
-    let mut gpu_runtime = "hip".to_string();
+    // env 기본값 — LLM170_GPU_RUNTIME (플래그가 우선). 종전 infer는 env를 무시해
+    // "Vulkan 실행"이 전부 HIP이던 결함 (2026-09-01 재확인).
+    let mut gpu_runtime = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
     let mut mode: Option<llm170_core::mode::Mode> = None;
 
     let mut it = args.iter();
@@ -1169,10 +1171,25 @@ fn cmd_infer(args: &[String]) -> ExitCode {
 
     llm170_profiler::reset();
     let t_start = std::time::Instant::now();
-    // 아키텍처 판별 → qwen4exp 전용 엔진 분기
-    let arch = llm170_gguf::GgufFile::open(&model_path)
+    // 아키텍처 판별 → qwen4exp 전용 엔진 분기.
+    // ENOENT 윈도우 대기 (LLM170_OPEN_WAIT_SECS) — 판별 실패시 재시도.
+    let wait_secs: u64 = std::env::var("LLM170_OPEN_WAIT_SECS")
         .ok()
-        .and_then(|g| g.arch().map(|s| s.to_string()));
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut arch: Option<String> = None;
+    for _ in 0..=wait_secs {
+        arch = llm170_gguf::GgufFile::open(&model_path)
+            .ok()
+            .and_then(|g| g.arch().map(|s| s.to_string()));
+        if arch.is_some() {
+            break;
+        }
+        if wait_secs == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     if arch.as_deref() == Some("qwen4exp") {
         return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend, &gpu_runtime);
     }

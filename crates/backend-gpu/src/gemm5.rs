@@ -23,9 +23,11 @@ pub fn gemm_q5(
     n_in: usize,
     n_out: usize,
     exp_bytes: usize,          // 전문가 1개의 바이트 수 (row_base는 바이트 단위)
+    gx: usize,
     #[comptime] qtype: usize,
 ) {
-    let o = CUBE_POS_X as usize;
+    // o-차원 접힘 (wgpu 65,535 상한).
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let gy = CUBE_POS_Y as usize;
     let e = exps[gy] as usize; // 실제 전문가 id — 행 순서와 독립
     let l = UNIT_POS_X as usize;

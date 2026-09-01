@@ -280,11 +280,13 @@ impl<R: Runtime> GpuMatmul<R> {
         let pg = self.acquire_buf(k * n_out * 64 * 4)?;
         acc(&T_UP, t0.elapsed());
         let t1 = std::time::Instant::now();
-        // SAFETY: 그리드 (n_out, K)·64레인 — 상한 내, part 전 기록 후 reduce.
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
+        // SAFETY: 그리드 (gx, K, gz)·64레인 — o 접힘 포함 상한 내.
         unsafe {
             gemm5::gemm_q5::launch_unchecked(
                 &self.client,
-                CubeCount::Static(n_out as u32, k as u32, 1),
+                CubeCount::Static(gx as u32, k as u32, gz as u32),
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(xg.clone(), [1].into(), [xf.len()].into()),
                 TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [wwords].into()),
@@ -295,16 +297,18 @@ impl<R: Runtime> GpuMatmul<R> {
                 n_in,
                 n_out,
                 exp_bytes,
+                gx,
                 wtype,
             );
             gemm2::reduce_parts::launch_unchecked(
                 &self.client,
-                CubeCount::Static(n_out as u32, k as u32, 1),
+                CubeCount::Static(gx as u32, k as u32, gz as u32),
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(pg.clone(), [1].into(), [k * n_out * 64].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [k * n_out].into()),
                 n_out,
                 k,
+                gx,
                 64,
             );
         }
@@ -460,14 +464,17 @@ impl<R: Runtime> GpuMatmul<R> {
                 t,
                 d.ty() as u32 as usize,
             );
+            let r_gx = n_out.min(65535);
+            let r_gz = n_out.div_ceil(r_gx);
             gemm2::reduce_parts::launch_unchecked(
                 &self.client,
-                CubeCount::Static(n_out as u32, t as u32, 1),
+                CubeCount::Static(r_gx as u32, t as u32, r_gz as u32),
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
                 n_out,
                 t,
+                r_gx,
                 64,
             );
         }
@@ -645,6 +652,9 @@ impl<R: Runtime> GpuMatmul<R> {
         // 청킹이 정답으로 확정(2026-08-31). 타일 커널 q4는 두 형상 모두 불안정
         // (콜드 런 비결정 / 모듈 로드 STATUS 700)해 제거됨.
         let decode = t <= 8 && slices == 64;
+        // wgpu 그리드 X 상한 65,535 — o 차원을 Z로 접는다 (Vulkan 이식성).
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
         let og = self.acquire_buf(t * n_out * 4)?;
         let pg = self.acquire_buf(t * n_out * slices * 4)?;
         // SAFETY: 두 경로 모두 그리드가 (n_out, t)를 덮고 시작부 범위 가드 —
@@ -653,7 +663,7 @@ impl<R: Runtime> GpuMatmul<R> {
             if decode {
                 gemm2::gemm_q3::launch_unchecked(
                     &self.client,
-                    CubeCount::Static(n_out as u32, 1, 1),
+                    CubeCount::Static(gx as u32, 1, gz as u32),
                     CubeDim::new_1d(64),
                     TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
                     TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
@@ -662,6 +672,7 @@ impl<R: Runtime> GpuMatmul<R> {
                     TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
                     n_in,
                     n_out,
+                    gx,
                     t,
                     d.ty() as u32 as usize,
                 );
@@ -669,7 +680,7 @@ impl<R: Runtime> GpuMatmul<R> {
                 let gy = t.div_ceil(4) as u32;
                 gemm2::gemm_q2::launch_unchecked(
                     &self.client,
-                    CubeCount::Static(n_out as u32, gy, 1),
+                    CubeCount::Static(gx as u32, gy, gz as u32),
                     CubeDim::new_2d(64, 4),
                     TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
                     TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
@@ -679,18 +690,20 @@ impl<R: Runtime> GpuMatmul<R> {
                     n_in,
                     n_out,
                     t,
+                    gx,
                     d.ty() as u32 as usize,
                     slices,
                 );
             }
             gemm2::reduce_parts::launch_unchecked(
                 &self.client,
-                CubeCount::Static(n_out as u32, t as u32, 1),
+                CubeCount::Static(gx as u32, t as u32, gz as u32),
                 CubeDim::new_1d(64),
                 TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
                 n_out,
                 t,
+                gx,
                 slices,
             );
         }
