@@ -24,12 +24,17 @@ use llm170_profiler::profile_span;
         let n_embd = hp.n_embd;
         let t = xs.len();
 
+        // 서브스테이지 계량 (LLM170_Q4_TIME) — 190ms의 내부 분해용 (2026-09-01).
+        let tm = std::env::var_os("LLM170_Q4_TIME").is_some();
+        let t_route0 = std::time::Instant::now();
         // 1) 라우팅 — 전 토큰 배치 1회
         let mut route = vec![vec![0.0f32; n_exp]; t];
         ctx.mm_batch(xs, &w_route, &mut route)?;
         let mut sgate_all = vec![vec![0.0f32; 1]; t];
         ctx.mm_batch(xs, &w_route_sh, &mut sgate_all)?;
 
+        let t_route = t_route0.elapsed();
+        let t_sel0 = std::time::Instant::now();
         // 2) 선택 — 전문가별 (토큰, 가중치) 리스트
         let mut by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_exp];
         for (ti, logits) in route.iter_mut().enumerate() {
@@ -55,6 +60,8 @@ use llm170_profiler::profile_span;
             }
         }
 
+        let t_sel = t_sel0.elapsed();
+        let t_gemm0 = std::time::Instant::now();
         // 3) 전문가별 서브배치 — 512×3 배치 GEMM (빈 전문가 스킵)
         let mut out = vec![vec![0.0f32; n_embd]; t];
         let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
@@ -183,6 +190,8 @@ use llm170_profiler::profile_span;
             }
         }
 
+        let t_gemm = t_gemm0.elapsed();
+        let t_sh0 = std::time::Instant::now();
         // 4) shared 전문가 — 전 토큰 배치, gate·up 동일 입력 그룹 1호출
         let mut sh_gate_y = vec![vec![0.0f32; n_ff]; t];
         let mut sh_up_y = vec![vec![0.0f32; n_ff]; t];
@@ -228,11 +237,21 @@ use llm170_profiler::profile_span;
                 std::process::exit(101);
             }
         }
+        let t_sh = t_sh0.elapsed();
         for (ti, o) in out.iter_mut().enumerate() {
             let sh_w = sigmoid(sgate_all[ti][0]);
             for i in 0..n_embd {
                 o[i] += sh_w * shout[ti][i];
             }
+        }
+        if tm {
+            eprintln!(
+                "# moe-sub: route {:.0}µs sel {:.0}µs experts {:.0}µs shared {:.0}µs (t={t})",
+                t_route.as_micros(),
+                t_sel.as_micros(),
+                t_gemm.as_micros(),
+                t_sh.as_micros()
+            );
         }
         Ok(out)
     }
