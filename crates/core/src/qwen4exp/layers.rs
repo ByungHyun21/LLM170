@@ -23,6 +23,9 @@ pub struct SeqState4 {
     pub kv_v: Vec<Vec<f32>>,
     /// QSA 인덱서 raw k 캐시 [ctx][idx_dim]
     pub idx_k: Vec<Vec<f32>>,
+    /// QSA 인덱서 블록 키 캐시 [QSA층][n_blocks·idx_dim] — pooled+norm+rope
+    /// 된 블록 키를 1회 계산해 전 토큰 재사용 (O(T²)→O(T), 2026-09-01).
+    pub idx_bk: Vec<Vec<f32>>,
     /// PLE dilated conv 히스토리 [(kern-1)*dil][hc_dim]
     pub ple_conv: Vec<f32>,
     /// PLE n-gram 직전 토큰 히스토리 (최대 ngram-1개, 오래된 것이 앞)
@@ -45,6 +48,7 @@ impl SeqState4 {
             kv_k: vec![vec![0.0; ctx * hp.n_kv * hp.head_dim]; n_full],
             kv_v: vec![vec![0.0; ctx * hp.n_kv * hp.head_dim]; n_full],
             idx_k: vec![vec![0.0; ctx * hp.idx_dim]; n_full],
+            idx_bk: vec![Vec::new(); n_full],
             ple_conv: vec![0.0; if has_ple { ple_hist_len * hp.hc * hp.n_embd } else { 0 }],
             ple_hist: Vec::new(),
             ple_next_pos: 0,

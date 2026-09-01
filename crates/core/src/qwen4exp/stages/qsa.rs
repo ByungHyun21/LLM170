@@ -90,6 +90,29 @@ use llm170_profiler::profile_span;
             let r = hp.compress[il] as usize;
             let n_blocks = n_past / r;
             let tail_start = n_blocks * r;
+            // 블록 키 캐시 — 이 토큰 시점까지의 완전 블록만 유효 (증분).
+            // 이전 청크가 계산한 키는 재사용, 신규 블록만 계산 (수치 동일).
+            let cached = seq_state.idx_bk[full_idx].clone();
+            if cached.len() < n_blocks * hp.idx_dim {
+                let mut ext = cached.clone();
+                for b in (cached.len() / hp.idx_dim)..n_blocks {
+                    let mut pooled = vec![0.0f32; hp.idx_dim];
+                    for j in 0..r {
+                        let base = (b * r + j) * hp.idx_dim;
+                        for i in 0..hp.idx_dim {
+                            pooled[i] += idx_cache[base + i];
+                        }
+                    }
+                    for v in pooled.iter_mut() {
+                        *v /= r as f32;
+                    }
+                    let mut pk = rms_norm(&pooled, &ik_w, hp.eps);
+                    rope_head(&mut pk, (b * r) as u32, hp.idx_dim, hp.rope_base);
+                    ext.extend_from_slice(&pk);
+                }
+                seq_state.idx_bk[full_idx] = ext;
+            }
+            let bk_cache = seq_state.idx_bk[full_idx].clone();
             let mut q_rope: Vec<Vec<f32>> = Vec::with_capacity(hp.idx_heads);
             for h in 0..hp.idx_heads {
                 let mut qh = rms_norm(
@@ -102,18 +125,7 @@ use llm170_profiler::profile_span;
             }
             let mut block_score = vec![0.0f32; n_blocks];
             for b in 0..n_blocks {
-                let mut pooled = vec![0.0f32; hp.idx_dim];
-                for j in 0..r {
-                    let base = (b * r + j) * hp.idx_dim;
-                    for i in 0..hp.idx_dim {
-                        pooled[i] += idx_cache[base + i];
-                    }
-                }
-                for v in pooled.iter_mut() {
-                    *v /= r as f32;
-                }
-                let mut pk = rms_norm(&pooled, &ik_w, hp.eps);
-                rope_head(&mut pk, (b * r) as u32, hp.idx_dim, hp.rope_base);
+                let pk = &bk_cache[b * hp.idx_dim..(b + 1) * hp.idx_dim];
                 for qh in &q_rope {
                     let mut dot = 0.0f32;
                     for i in 0..hp.idx_dim {
