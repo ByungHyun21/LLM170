@@ -6,6 +6,7 @@
 PLE 없음(ple.layers 빈 배열), hc=2, 인덱서 2head·top_k 8·compress 4.
 가중치는 q8_0 (GPU 배치 커널 경로 포함) — 시드 고정.
 """
+import os
 import random
 import struct
 import sys
@@ -32,6 +33,11 @@ DT_RANK = 6
 D_INNER = DT_RANK * D_STATE
 CONV_K = 4
 VOCAB = 248320
+PLE_HEAD_DIM = 512          # embedding_length_per_layer_input (iq4_nl 32 블록 정렬)
+PLE_ROWS = 4096             # Σ head_vocab_sizes — 합성 축소 (실모델 320M)
+PLE_HPNG = 2                # heads_per_ngram → heads = 2*(ngram-1) = 4
+PLE_NGRAM = 3
+PLE_CONV_K = 4
 PLE_EOS = 248043
 
 rng = random.Random(170)
@@ -43,6 +49,16 @@ def rand_f32(n, scale=0.05):
 
 def near1(n):
     return b"".join(F32.pack(1.0 + rng.uniform(-0.02, 0.02)) for _ in range(n))
+
+def rand_iq4_nl(n_rows, n_cols):
+    """iq4_nl 행렬: 블록당 f16 d + 16바이트 니블(하위닢 먼저)."""
+    assert n_cols % 32 == 0
+    out = []
+    for _ in range(n_rows * n_cols // 32):
+        dh = rng.uniform(0.004, 0.006)
+        out.append(struct.pack("<e", dh))
+        out.append(bytes(rng.randrange(256) for _ in range(16)))
+    return b"".join(out)
 
 def rand_q8_0(n_rows, n_cols):
     """q8_0 행렬: 블록당 f16 d + 32 i8."""
@@ -94,10 +110,12 @@ kv("qwen4exp.attention.indexer.head_count", T_U32, IDX_HEADS)
 kv("qwen4exp.attention.indexer.key_length", T_U32, IDX_DIM)
 kv("qwen4exp.attention.indexer.top_k", T_U32, IDX_TOP_K)
 kv_arr_compress = ([0] * 3 + [4])
-kv_arr_ple_layers = []
-ple_mult = [2654435761, 40503]
-ple_off = [0, 160]
-ple_vs = [160, 160]
+kv_arr_ple_layers = [1]  # blk.1 — 실모델과 동일 위치(ple.layers)
+if os.environ.get("TINY4_NO_PLE") == "1":
+    kv_arr_ple_layers = []  # PLE 경로 격리 디버그용 (프레임 발산 특정)
+ple_mult = [2654435761, 40503, 974634551]  # ngram=3 → 인덱스 0..2
+ple_off = [0, 1024, 2048, 3072]
+ple_vs = [1024, 1024, 1024, 1024]
 
 tensors = []  # (name, raw bytes, ne)
 def t(name, data, ne):
@@ -151,6 +169,16 @@ t("output.weight", rand_q8_0(VOCAB, N_EMBD), [N_EMBD, VOCAB])
 t("output_hc_norm.weight", near1(hc_dim), [hc_dim])
 t("output_hc_down.weight", rand_f32(hc_dim * HC_LR), [hc_dim, HC_LR])
 t("output_hc_up.weight", rand_f32(hc_dim * HC_LR), [HC_LR, hc_dim])
+
+# PLE (blk.1) — ple.rs 소비 텐서 전부 (key/value는 q8_0, norm/conv는 f32)
+ple_emb_w = PLE_HPNG * 2 * PLE_HEAD_DIM  # heads×head_dim = 4×512 = 2048
+t("blk.1.ple_key.weight", rand_q8_0(hc_dim, ple_emb_w), [ple_emb_w, hc_dim])
+t("blk.1.ple_value.weight", rand_q8_0(hc_dim, ple_emb_w), [ple_emb_w, hc_dim])
+t("blk.1.ple_norm_key.weight", near1(hc_dim), [hc_dim])
+t("blk.1.ple_norm_query.weight", near1(hc_dim), [hc_dim])
+t("blk.1.ple_norm_conv.weight", near1(hc_dim), [hc_dim])
+t("blk.1.ple_conv1d.weight", rand_f32(hc_dim * PLE_CONV_K), [PLE_CONV_K, hc_dim])
+t("per_layer_token_embd.weight", rand_iq4_nl(PLE_ROWS, PLE_HEAD_DIM), [PLE_HEAD_DIM, PLE_ROWS])
 
 # ---------- 토크나이저 kv (기존 tiny에서 복사 시도) ----------
 try:
@@ -206,16 +234,22 @@ kv("qwen4exp.ple.layers", 9, (T_I32, kv_arr_ple_layers))
 kv("qwen4exp.ple.layer_multipliers", 9, (T_U64, ple_mult))
 kv("qwen4exp.ple.head_offsets", 9, (T_U64, ple_off))
 kv("qwen4exp.ple.head_vocab_sizes", 9, (T_U64, ple_vs))
-kv("qwen4exp.ple.ngram_size", T_U32, 3)
-kv("qwen4exp.ple.heads_per_ngram", T_U32, 8)
-kv("qwen4exp.ple.conv_kernel", T_U32, 4)
-kv("qwen4exp.embedding_length_per_layer_input", T_U32, 160)
+kv("qwen4exp.ple.ngram_size", T_U32, PLE_NGRAM)
+kv("qwen4exp.ple.heads_per_ngram", T_U32, PLE_HPNG)
+kv("qwen4exp.ple.conv_kernel", T_U32, PLE_CONV_K)
+kv("qwen4exp.embedding_length_per_layer_input", T_U32, PLE_HEAD_DIM)
 kv("qwen4exp.ple.eos_token_id", T_U32, PLE_EOS)
 kv("qwen4exp.ple.image_token_id", T_U32, 0)
 
 # ---------- 직렬화 ----------
 Q8_0 = 8
 F32_T = 0
+IQ4_NL = 20
+
+def tensor_ty(name):
+    if name == "per_layer_token_embd.weight":
+        return IQ4_NL
+    return F32_T if is_f32_tensor(name) else Q8_0
 
 def wstr(x):
     b = x.encode() if isinstance(x, str) else x
@@ -261,7 +295,7 @@ def is_f32_tensor(name):
 
 infos = bytearray()
 for name, data, ne in tensors:
-    ty = F32_T if is_f32_tensor(name) else Q8_0
+    ty = tensor_ty(name)
     infos += wstr(name)
     infos += struct.pack("<I", len(ne))  # n_dims는 u32 (gguf.cpp 스펙)
     for d in ne:  # ne는 이미 ggml 순서 (ne0 최우선) — 반전 금지
@@ -273,7 +307,7 @@ data_start = (len(head) + len(infos) + 31) // 32 * 32
 off = 0  # GGUF 텐서 offset은 data_offset 상대 (절대 아님)
 entries = []
 for name, data, ne in tensors:
-    ty = F32_T if is_f32_tensor(name) else Q8_0
+    ty = tensor_ty(name)
     entries.append((name, ty, ne, off, data))
     off += len(data)
     off = (off + 31) // 32 * 32

@@ -91,6 +91,66 @@ def ours_generate(prompts, n_predict, ctx):
     return [seqs.get(i, [])[:n_predict] for i in range(len(prompts))]
 
 
+def ours_serve(prompts, n_predict, ctx):
+    """우리 서버(llm170 serve) 기동 → 2요청 동시 발사 → 토큰 리스트 반환.
+    서버는 mpsc 직렬 큐(현 구조) — 동시 발사 시 상태격리가 게이트.
+    LLM170_EXTRA_ARGS는 CLI 경로와 동일하게 serve에 전달(백엔드 패리티)."""
+    import signal
+    import threading
+    import time
+    extra = os.environ.get("LLM170_EXTRA_ARGS", "").split()
+    proc = subprocess.Popen(
+        [BIN, "serve", "--model", MODEL_PATH, "--port", str(port),
+         "--ctx", str(ctx), *extra],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.time() + 2400
+    try:
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base_url}/health", timeout=5) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                if proc.poll() is not None:
+                    raise RuntimeError("llm170 serve 조기 종료")
+                time.sleep(2)
+        else:
+            raise RuntimeError("llm170 serve 헬스 대기 타임아웃")
+        outs = [None] * len(prompts)
+
+        def worker(i, ids):
+            req = urllib.request.Request(
+                f"{base_url}/completion",
+                data=json.dumps({"prompt": ids, "n_predict": n_predict}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=2400) as r:
+                outs[i] = json.loads(r.read())["tokens"]
+
+        ths = [threading.Thread(target=worker, args=(i, ids))
+               for i, ids in enumerate(prompts)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        return [o or [] for o in outs]
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def compare_exact(name, ours, ref):
+    """서버 케이스 판정 — 완전일치만 (같은 엔진·같은 수치 계열; tie 허용 없음)."""
+    ok = ours == ref
+    k = next((i for i, (a, b) in enumerate(zip(ref, ours)) if a != b), None)
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: server {len(ours)} tok, cli-np2 "
+          f"{len(ref)} tok" + ("" if ok else f" — 첫 불일치 @gen[{k}]"))
+    return ok
+
+
 def compare(name, base, ours, probs=None):
     """판정: 완전일치 PASS, 또는 첫 발산 지점이 근접티(우리 토큰이 기준 top-k 안 &
     top-1과의 로그확률 갭 < TIE_EPS)면 PASS(tie). 이후 토큰은 맥락이 갈라져 판정 불가."""
@@ -196,6 +256,22 @@ def main():
     base, bprobs = baseline_generate(ids, n)
     ours = ours_generate([ids], n, 2048)[0]
     results.append(compare("long_gen96", base, ours, bprobs))
+
+    # --- 서버 배칭 케이스 (04 슬롯 엔진 게이트 — 등록 먼저, 실행은 04 완료 후) ---
+    # 판정: 서버 2동시 요청 ↔ CLI np2 단독 = 완전일치만 (불변식: 배치 구성이
+    # 스트림을 바꾸지 않는다). 활성: LLM170_SERVE_CHECK=1.
+    if os.environ.get("LLM170_SERVE_CHECK") == "1":
+        ref = ours_generate([tokenize(p1), tokenize(p2)], N_PREDICT_DEFAULT, 2048)
+        srv = ours_serve([tokenize(p1), tokenize(p2)], N_PREDICT_DEFAULT, 2048)
+        results.append(compare_exact("server_np_seq0", srv[0], ref[0]))
+        results.append(compare_exact("server_np_seq1", srv[1], ref[1]))
+        ref = ours_generate([long_ids, long_ids2], N_PREDICT_DEFAULT, 4096)
+        srv = ours_serve([long_ids, long_ids2], N_PREDICT_DEFAULT, 4096)
+        results.append(compare_exact("server_long_np_seq0", srv[0], ref[0]))
+        results.append(compare_exact("server_long_np_seq1", srv[1], ref[1]))
+    else:
+        print("[skip] server_np·server_long_np — LLM170_SERVE_CHECK=1로 활성 "
+              "(슬롯 엔진 04 완료 후 실행 게이트)")
 
     print(f"\n=== 결과: {sum(results)}/{len(results)} PASS ===")
     raise SystemExit(0 if all(results) else 1)

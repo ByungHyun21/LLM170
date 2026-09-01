@@ -111,20 +111,23 @@ use llm170_profiler::profile_span;
                 let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
                     && std::env::var_os("LLM170_MOE_CPU").is_none();
                 if batch_on {
-                if let Some(acc) = ctx.acc {
-                    let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
-                    let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();
-                    if acc.moe_down(&gate_y[..n_sel], &stack, &ids, n_exp, &mut eos).is_ok() {
-                        batched = true;
+                    if let Some(acc) = ctx.acc {
+                        let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
+                        let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();
+                        if acc.moe_down(&gate_y[..n_sel], &stack, &ids, n_exp, &mut eos).is_ok() {
+                            batched = true;
+                        }
                     }
                 }
+                // mm_paired 폴백은 batch_on과 무관하게 항상 대기 — ed89e84가
+                // 이 블록을 if batch_on 내부로 잘못 중첩해 기본(t=1 fast) 경로의
+                // 라우팅 전문가 기여가 0이던 회귀 (2026-09-01 프레임 대조로 발견).
                 if !batched {
                     let mut wds = Vec::with_capacity(n_sel);
                     for &e in &sel {
                         wds.push(ctx.model.expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?);
                     }
                     ctx.mm_paired(&gate_y[..n_sel], &wds, &mut eos)?;
-                }
                 }
                 for (k, &e) in sel.iter().enumerate() {
                     let (ti, w) = by_expert[e][0];

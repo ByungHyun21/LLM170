@@ -21,6 +21,12 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
       greedy 추론. --prompt-tokens 반복 = 병렬 시퀀스(np), 콤마 구분 토큰 id.
       --backend gpu: matmul을 GPU(cubecl)로 오프로드. --gpu-runtime 기본 hip.
       출력: JSONL {"seq","pos","token","text"}
+  llm170 gpu-ew-check
+      ew 커널 전종 GPU↔CPU 상호검증 (norm 비트일치·활성화 abs<1e-5)
+  llm170 gdn-ar-check [n_group dt_rank d]
+      GDN AR 커널 GPU↔CPU 상호검증. 기본 8/48/128 (16·32·64·128 회귀 권장)
+  llm170 moe-down-check
+      MoE 배치 down 커널(gemm_q5) GPU↔CPU 상호검증
   llm170 help
 "#;
 
@@ -97,11 +103,14 @@ fn main() -> ExitCode {
             }
         }
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
+        Some("gpu-ew-check") => cmd_gpu_ew_check(),
+        Some("gdn-ar-check") => cmd_gdn_ar_check(),
+        Some("moe-down-check") => cmd_moe_down_check(),
         Some("check") => cmd_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("w4a8-gpu") => cmd_w4a8_gpu(&args[1..]),
         Some("gpu-de") => cmd_gpu_de(&args[1..]),
-        Some("gpu-ew-check") => cmd_gpu_ew_check(),
+        Some("mem-profile") => cmd_mem_profile(),
         Some("gpu-de-bytes") => cmd_gpu_de_bytes(&args[1..]),
         Some("gpu-q3dbg") => cmd_gpu_q3dbg(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -731,6 +740,52 @@ fn cmd_check(args: &[String]) -> ExitCode {
 /// gpu-ew-check — ew 커널 전종 GPU↔CPU 상호검증 (층 GPU 상주 P2-4 1단계).
 /// 판정: norm류 max_rel < 1e-6 (f64 경로 — 비트일치 기대), 활성화류 < 1e-5
 /// (libm 구현차), moe ids 완전일치.
+
+/// mem-profile — device memory measurement report. Prints what the adaptive
+/// weight budget derives from (per backend placement region), so machine
+/// tuning stays data-driven instead of hardcoded. Later this grows into a
+/// calibration tool that emits a profile file for injection.
+fn cmd_mem_profile() -> ExitCode {
+    let read = |kind: &str, field: &str| -> Option<usize> {
+        let dir = std::fs::read_dir("/sys/class/drm").ok()?;
+        for entry in dir.flatten() {
+            let p = entry
+                .path()
+                .join("device")
+                .join(format!("mem_info_{kind}_{field}"));
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    if v > 0 {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    };
+    let gib = |v: usize| v as f64 / (1u64 << 30) as f64;
+    for (kind, backend) in [("vram", "hip"), ("gtt", "vulkan")] {
+        let total = read(kind, "total");
+        let used = read(kind, "used");
+        match (total, used) {
+            (Some(t), Some(u)) => {
+                let budget = if std::env::var("LLM170_W_CAP_GB").is_ok() {
+                    "env override".to_string()
+                } else {
+                    format!("{:.0} GiB (40% adaptive)", gib(t / 5 * 2))
+                };
+                println!(
+                    "[{backend}] {kind}: total {:.0} GiB, used {:.0} GiB, free {:.0} GiB — weight budget: {budget}",
+                    gib(t),
+                    gib(u),
+                    gib(t.saturating_sub(u)),
+                );
+            }
+            _ => println!("[{backend}] {kind}: not available (non-amdgpu?)"),
+        }
+    }
+    ExitCode::SUCCESS
+}
 fn cmd_gpu_ew_check() -> ExitCode {
     let run = |report: Result<Vec<(&'static str, f64, f64, f64)>, String>| -> (bool, String) {
         let rels = match report {
@@ -1210,11 +1265,6 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
                 Some(m) => mode = Some(m),
                 None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
-            },
-            "--gpu-runtime" => match it.next().map(String::as_str) {
-                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.to_string(),
-                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
-                None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),
         }

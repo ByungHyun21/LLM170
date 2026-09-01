@@ -159,7 +159,12 @@ impl Frame4 {
             put(&format!("blk.{il}.hc_attn_norm"), &model.f32_vec4(&format!("blk.{il}.hc_attn_norm.weight"))?)?;
             put(&format!("blk.{il}.hc_ffn_norm"), &model.f32_vec4(&format!("blk.{il}.hc_ffn_norm.weight"))?)?;
             if hp.is_recr(il) {
-                put(&format!("blk.{il}.ssm_norm"), &model.f32_vec4(&format!("blk.{il}.ssm_norm.weight"))?)?;
+                // ssm_norm.weight는 [d_state] 전헤드 공유 — norm_gated_rows 커널이
+                // 헤드별 슬라이스 인덱싱(w[(row%n_h)·d+i])하므로 dt_rank 타일로
+                // 업로드. 미타일 업로드는 OOB 읽기로 v1 발산의 근원 (2026-09-01).
+                let sn = model.f32_vec4(&format!("blk.{il}.ssm_norm.weight"))?;
+                let sn_tiled: Vec<f32> = sn.iter().copied().cycle().take(sn.len() * hp.dt_rank).collect();
+                put(&format!("blk.{il}.ssm_norm"), &sn_tiled)?;
                 put(&format!("blk.{il}.dt_bias"), &model.f32_vec4(&format!("blk.{il}.ssm_dt.bias"))?)?;
                 put(&format!("blk.{il}.ssm_a"), &model.f32_vec4(&format!("blk.{il}.ssm_a"))?)?;
                 put(&format!("blk.{il}.conv_w"), &model.f32_vec4(&format!("blk.{il}.ssm_conv1d.weight"))?)?;
