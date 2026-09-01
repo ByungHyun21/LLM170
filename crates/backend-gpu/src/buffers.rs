@@ -16,7 +16,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// 큐 완결 — 신규 할당 직전 호출해 할당·런치 경합을 원천 차단.
+/// LLM170_NO_DRAIN=1이면 생략 (격리용 — DSD 스레드와의 교차 sync 상호작용).
 fn drain<R: Runtime>(client: &ComputeClient<R>) {
+    if std::env::var_os("LLM170_NO_DRAIN").is_some() {
+        return;
+    }
     let _ = cubecl_common::future::block_on(client.sync());
 }
 

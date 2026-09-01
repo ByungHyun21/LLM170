@@ -217,7 +217,11 @@ impl<R: Runtime> GpuMatmul<R> {
         // 담당 — VRAM 상한은 풀 계측(POOL_TOTAL)·가중치 예산(W_CAP)으로 관리.
         // SAFETY: 클라이언트 생성 직후 단일 스레드 — 이후 다른 allocation_mode
         // 호출 없음. "누수"는 의도적(전량 재사용).
-        unsafe { client.allocation_mode(cubecl::MemoryAllocationMode::Persistent) };
+        // LLM170_NO_PERSISTENT=1이면 생략 — PersistentPool 경로가 HIP에서
+        // "Memory page 0 doesn't exist"를 유발하는지 격리용 (2026-09-01).
+        if std::env::var_os("LLM170_NO_PERSISTENT").is_none() {
+            unsafe { client.allocation_mode(cubecl::MemoryAllocationMode::Persistent) };
+        }
         let ktab: Vec<f32> = llm170_core::KVALUES_IQ4NL
             .iter()
             .map(|&v| v as f32)
