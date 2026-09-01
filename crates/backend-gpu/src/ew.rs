@@ -439,3 +439,18 @@ pub fn moe_weighted_sum(
         out[i] = acc;
     }
 }
+
+/// y[i] += x[i]·s (s는 1원소 버퍼 — MoE shared 가산: σ(sgate)·shout).
+/// CPU moe.rs 260-265 순서 동일.
+#[cube(launch_unchecked)]
+pub fn axpy_scaled(
+    y: &mut Tensor<f32>,
+    x: &Tensor<f32>,
+    s: &Tensor<f32>,
+    n: usize,
+) {
+    let j = ABSOLUTE_POS_X as usize;
+    if j < n {
+        y[j] += x[j] * s[0];
+    }
+}

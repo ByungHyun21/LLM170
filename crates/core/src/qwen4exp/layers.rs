@@ -60,6 +60,8 @@ pub struct Engine4 {
     pub model: Model4,
     pub seqs: Vec<SeqState4>,
     pub acc: Option<std::sync::Arc<dyn Accelerator>>,
+    /// 프레임(활성화 상주) 상태 — LLM170_FRAME=1 첫 디코드에서 생성.
+    pub frame: Option<super::frame::Frame4>,
 }
 
 /// 스테이지별 누적(µs) — LLM170_Q4_TIME=1일 때 prefill/decode 완료 후 보고.
@@ -90,7 +92,7 @@ impl Q4Timings {
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
-        Engine4 { model, seqs, acc: None }
+        Engine4 { model, seqs, acc: None, frame: None }
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
@@ -239,6 +241,21 @@ impl Engine4 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024)
             .clamp(16, 1024);
+        // 프레임 상태가 권위적이면(직전 디코드) CPU 사본을 GPU에서 갱신 —
+        // 이후 값 경로 prefill이 정합 상태에서 시작한다.
+        if let Some(f) = &self.frame {
+            if !f.dirty {
+                if let Some(acc) = self.acc.as_deref() {
+                    let st = &mut self.seqs[seq];
+                    for (ri, h) in f.st_gdn.iter().enumerate() {
+                        acc.frame_read(*h, &mut st.gdn_s[ri]).map_err(Q4Error::Io)?;
+                    }
+                    for (ri, h) in f.st_conv.iter().enumerate() {
+                        acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
+                    }
+                }
+            }
+        }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
@@ -247,13 +264,36 @@ impl Engine4 {
                 t.report(&format!("prefill {}tok", ch.len()));
             }
             self.seqs[seq].pos += ch.len() as u32;
+            if let Some(f) = &mut self.frame {
+                f.dirty = true; // 값 경로가 상태를 갱신 — 프레임 재동기 필요
+            }
             last = Some(logits);
         }
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
-    /// 디코드 1토큰.
+    /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
+    /// 단일 시퀀스에서만 프레임 (다중 시퀀스는 상태 스왑 미구현 — 값 경로).
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
+        let frame_on = self.acc.is_some()
+            && self.seqs.len() == 1
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0");
+        if frame_on {
+            let acc = self.acc.as_deref().unwrap();
+            if self.frame.is_none() {
+                self.frame = Some(super::frame::Frame4::new(acc, &self.model, &self.seqs)?);
+            }
+            let f = self.frame.as_mut().unwrap();
+            if f.dirty {
+                f.sync_states(acc, &self.seqs[seq])?;
+            }
+            let ctx = Ctx { model: &self.model, acc: Some(acc) };
+            let logits = super::frame::decode_frame(
+                acc, &self.model, &ctx, &mut self.seqs[seq], f, token,
+            )?;
+            self.seqs[seq].pos += 1;
+            return Ok(logits);
+        }
         let mut tm = init_timings();
         let logits = self.forward_timed(seq, &[token], tm.as_mut())?;
         if let Some(t) = &tm {

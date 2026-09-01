@@ -1948,6 +1948,23 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
                     );
                 }
             }
+            FrameOp::AxpyScaled { y, x, s, n } => {
+                let yh = one(*y)?;
+                let xh = one(*x)?;
+                let sh = one(*s)?;
+                // SAFETY: ABSOLUTE_POS 가드.
+                unsafe {
+                    ew::axpy_scaled::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(yh, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(xh, [1].into(), [*n].into()),
+                        TensorArg::from_raw_parts(sh, [1].into(), [1].into()),
+                        *n,
+                    );
+                }
+            }
         }
         Ok(())
     }

@@ -12,6 +12,7 @@
 //!   → 4스트림 방송 → dilated(3) depthwise conv(4) → 잔차 2경로. 테이블 26.8GiB mmap 오프로드.
 //! - 4-split GGUF: part1=메타 전용, parts2-4가 텐서 1224개 분산 보관.
 
+pub mod frame;
 pub mod layers;
 pub mod stages;
 
