@@ -224,6 +224,15 @@ impl Engine {
         }
     }
 
+    /// 슬롯 단위 상태 초기화 (연속 배칭 서버 — 04). 해당 시퀀스의
+    /// KV/GDN/conv 상태만 영점화, 다른 슬롯은 간섭 없음.
+    pub fn reset_seq(&mut self, seq: usize) {
+        let n_kv = self.model.hp.n_kv;
+        let hd = self.model.hp.head_dim;
+        let ctx = self.seqs[seq].kv_k.first().map(|k| k.len() / (n_kv * hd)).unwrap_or(4096);
+        self.seqs[seq] = SeqState::new(&self.model, ctx);
+    }
+
     /// 가속기 주입 (server --backend gpu).
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn crate::matmul::Accelerator>) -> Self {
         self.acc = Some(acc);

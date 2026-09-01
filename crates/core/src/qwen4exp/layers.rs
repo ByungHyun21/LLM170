@@ -238,6 +238,15 @@ impl Engine4 {
         }
     }
 
+    /// 슬롯 단위 상태 초기화 (연속 배칭 서버 — 04). dirty[seq]만 표시.
+    pub fn reset_seq(&mut self, seq: usize) {
+        if let Some(f) = &mut self.frame {
+            f.dirty[seq] = true;
+        }
+        let ctx = self.seqs[seq].kv_k.first().map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim)).unwrap_or(4096);
+        self.seqs[seq] = SeqState4::new(&self.model.hp, ctx);
+    }
+
     /// prefill: 전체 토큰 적립 + 마지막 logits.
     /// 1024토큰 청크로 분할 — 단일 초대형 forward는 libamdhip64 GPF 트리거
     /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).

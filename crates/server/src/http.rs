@@ -16,29 +16,25 @@
 //! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
 
 
-use crate::engine::{BackendSel, InferRequest, InferResult};
+use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 pub fn serve(addr: &str, req: InferRequest, backend: BackendSel) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
     eprintln!("# llm170-server listening on http://{addr}");
-    let (tx, rx) = std::sync::mpsc::channel::<(Job, std::sync::mpsc::Sender<TokOut>)>();
-    let _eng = std::thread::spawn(move || {
-        let mut eng = crate::engine::build(req, backend);
-        while let Ok((job, out)) = rx.recv() {
-            if job.fresh {
-                eng.reset();
-            }
-            let r = match job.progress {
-                Some(ptx) => eng.run_with_progress(job.tokens, job.n_predict, |t| {
-                    let _ = ptx.send(t);
-                }),
-                None => eng.run(job.tokens, job.n_predict),
-            };
-            let _ = out.send(r);
-        }
-    });
+    let slots = std::env::var("LLM170_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    let qcap = std::env::var("LLM170_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
+    let eng = crate::engine::build_slots(req.clone(), backend, slots);
+    std::thread::spawn(move || crate::engine::slot_loop(eng, rx, slots));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let tx = tx.clone();
@@ -204,7 +200,7 @@ fn jmessages_content(body: &str) -> String {
     out
 }
 
-fn handle(mut stream: TcpStream, tx: std::sync::mpsc::Sender<(Job, std::sync::mpsc::Sender<TokOut>)>) -> Result<(), String> {
+fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Result<(), String> {
     loop {
         let req = match read_request(&mut stream) {
             Ok(r) => r,
@@ -263,7 +259,7 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::Sender<(Job, std::sync::mp
 
 fn run_and_emit(
     stream: &mut TcpStream,
-    tx: std::sync::mpsc::Sender<(Job, std::sync::mpsc::Sender<TokOut>)>,
+    tx: std::sync::mpsc::SyncSender<SlotJob>,
     ids: Vec<u32>,
     n_predict: usize,
     stream_mode: bool,
@@ -271,14 +267,14 @@ fn run_and_emit(
 ) {
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
     let (ptx, prx) = std::sync::mpsc::channel::<u32>();
-    let job = Job {
+    let job = SlotJob {
         tokens: ids,
         n_predict,
-        fresh: true,
         progress: stream_mode.then_some(ptx),
+        out: otx,
     };
-    if tx.send((job, otx)).is_err() {
-        resp(stream, 500, "application/json", "{\"error\":\"engine unavailable\"}");
+    if tx.send(job).is_err() {
+        resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
         return;
     }
     if !stream_mode {
@@ -315,21 +311,21 @@ fn run_and_emit(
 
 fn run_and_emit_anthropic(
     stream: &mut TcpStream,
-    tx: std::sync::mpsc::Sender<(Job, std::sync::mpsc::Sender<TokOut>)>,
+    tx: std::sync::mpsc::SyncSender<SlotJob>,
     ids: Vec<u32>,
     n_predict: usize,
     stream_mode: bool,
 ) {
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
     let (ptx, prx) = std::sync::mpsc::channel::<u32>();
-    let job = Job {
+    let job = SlotJob {
         tokens: ids,
         n_predict,
-        fresh: true,
         progress: stream_mode.then_some(ptx),
+        out: otx,
     };
-    if tx.send((job, otx)).is_err() {
-        resp(stream, 500, "application/json", "{\"error\":\"engine unavailable\"}");
+    if tx.send(job).is_err() {
+        resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
         return;
     }
     if stream_mode {

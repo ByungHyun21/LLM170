@@ -11,6 +11,7 @@ pub enum BackendSel {
     GpuRuntime(String),
 }
 
+#[derive(Clone)]
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
@@ -23,6 +24,32 @@ pub struct InferResult {
 pub enum Engine {
     Q35(llm170_core::model::Engine),
     Q4(llm170_core::qwen4exp::layers::Engine4),
+}
+
+/// 슬롯 스케줄러 (04) — llama.cpp 규칙 1:1: 디코드 우선, 잔여 예산만
+/// 프리필 청크. 슬롯 = 엔진 시퀀스 id. 요청 종료 → 슬롯 반환(reset_seq).
+pub struct SlotJob {
+    pub tokens: Vec<u32>,
+    pub n_predict: usize,
+    /// 토큰별 SSE 스트림 채널.
+    pub progress: Option<std::sync::mpsc::Sender<u32>>,
+    /// 최종 결과 송신.
+    pub out: std::sync::mpsc::Sender<InferResult>,
+}
+
+struct Slot {
+    job: Option<SlotJob>,
+    prefilled: usize,
+    next: u32,
+    generated: u32,
+    tokens: Vec<u32>,
+    touch: u64,
+}
+
+impl Slot {
+    fn free() -> Self {
+        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0 }
+    }
 }
 
 /// qwen4exp 로드 재시도 — transient ENOENT 회복 (최대 5회×1s).
@@ -65,14 +92,170 @@ fn open_with_retry(p: &std::path::Path) -> Option<llm170_gguf::GgufFile> {
     None
 }
 
+/// 연속 배칭 루프 (04-2). 매 반복: ① 큐 drain → LRU 가용 슬롯 배정
+/// ② 디코드 우선(활성 전 슬롯 — q35는 1배치 호출, q4는 슬롯별 decode1)
+/// ③ 디코드한 스텝이 없으면 프리필 1청크. 완료/EOS → 슬롯 반환(reset_seq).
+pub fn slot_loop(
+    mut eng: Engine,
+    rx: std::sync::mpsc::Receiver<SlotJob>,
+    n_slots: usize,
+) {
+    const EOS: u32 = 248044;
+    let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
+    let mut tick: u64 = 0;
+    loop {
+        // ① 새 작업 drain — 전 슬롯 점유 시 큐에 잔류 (bounded: http측 503)
+        while let Ok(j) = rx.try_recv() {
+            let free = (0..n_slots)
+                .filter(|&i| slots[i].job.is_none())
+                .min_by_key(|&i| slots[i].touch);
+            let Some(i) = free else { break };
+            eng.reset_seq(i);
+            slots[i] = Slot {
+                job: Some(j),
+                prefilled: 0,
+                next: 0,
+                generated: 0,
+                tokens: Vec::new(),
+                touch: tick,
+            };
+        }
+        tick += 1;
+
+        // ② 디코드 우선 — prefill 완료 슬롯 전부
+        let active: Vec<usize> = (0..n_slots)
+            .filter(|&i| slots[i].job.is_some() && slots[i].prefilled == slots[i].job.as_ref().unwrap().tokens.len())
+            .collect();
+        let mut decoded = false;
+        if !active.is_empty() {
+            decoded = true;
+            match &mut eng {
+                Engine::Q35(e) => {
+                    let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+                    let seqs: Vec<usize> = active.clone();
+                    if let Ok(logits) = e.decode(&seqs, &toks) {
+                        for (row, &i) in active.iter().enumerate() {
+                            slot_step(&mut slots[i], &logits[row]);
+                        }
+                    }
+                }
+                Engine::Q4(e) => {
+                    for &i in &active {
+                        if let Ok(logits) = e.decode1(i, slots[i].next) {
+                            slot_step(&mut slots[i], &logits);
+                        }
+                    }
+                }
+            }
+            // 완료 슬롯 정리 — 결과 전송·반환
+            for &i in &active {
+                finish_slot(&mut slots[i], &mut eng, i, EOS);
+            }
+        }
+
+        // ③ 디코드 스텝이 없었으면 프리필 1청크 (대기 쇼트가 디코드를 굶기지 않음)
+        if !decoded {
+            let pf = (0..n_slots)
+                .filter(|&i| {
+                    slots[i].job.is_some()
+                        && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
+                })
+                .min_by_key(|&i| slots[i].touch);
+            if let Some(i) = pf {
+                let chunk = 512usize;
+                let (start, logits) = {
+                    let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
+                    let part: Vec<u32> = slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
+                    let r: Result<Vec<f32>, String> = match &mut eng {
+                        Engine::Q35(e) => e.prefill(i, &part).map_err(|e| e.to_string()),
+                        Engine::Q4(e) => e.prefill(i, &part).map_err(|e| e.to_string()),
+                    };
+                    (end, r)
+                };
+                if let Ok(l) = logits {
+                    slots[i].prefilled = start;
+                    if start == slots[i].job.as_ref().unwrap().tokens.len() {
+                        let t = llm170_core::model::greedy(&l);
+                        slot_emit(&mut slots[i], t);
+                    }
+                }
+                finish_slot(&mut slots[i], &mut eng, i, EOS);
+            }
+        }
+
+        // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출
+        let busy = slots.iter().any(|s| s.job.is_some());
+        if !busy {
+            match rx.recv() {
+                Ok(j) => {
+                    eng.reset_seq(0);
+                    slots[0] = Slot {
+                        job: Some(j),
+                        prefilled: 0,
+                        next: 0,
+                        generated: 0,
+                        tokens: Vec::new(),
+                        touch: tick,
+                    };
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// 슬롯 1스텝 — 샘플·스트림·카운트 (finish는 호출부).
+fn slot_step(s: &mut Slot, logits: &[f32]) {
+    let t = llm170_core::model::greedy(logits);
+    slot_emit(s, t);
+}
+
+fn slot_emit(s: &mut Slot, t: u32) {
+    s.next = t;
+    s.tokens.push(t);
+    s.generated += 1;
+    if let Some(j) = &s.job {
+        if let Some(p) = &j.progress {
+            let _ = p.send(t);
+        }
+    }
+}
+
+/// 완료 조건 검사 — EOS/예산 소진 → 결과 전송·슬롯 반환.
+fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
+    let done = s.job.as_ref().is_some_and(|j| {
+        s.prefilled == j.tokens.len() && (s.next == eos || s.generated as usize >= j.n_predict.max(1))
+    });
+    if done {
+        if let Some(j) = s.job.take() {
+            let mut toks = s.tokens.clone();
+            while toks.last() == Some(&eos) {
+                toks.pop();
+            }
+            toks.truncate(j.n_predict);
+            let _ = j.out.send(InferResult { tokens: toks });
+        }
+        eng.reset_seq(i);
+        *s = Slot::free();
+    }
+}
+
 pub fn build(req: InferRequest, backend: BackendSel) -> Engine {
-    // 간헐적 파일시스템 ENOENT(디렉터리 목록엔 보이는 transient 결함,
-    // 2026-09-01 실측) — 재시도로 회복. mmap 대상 전 파트에 적용.
+    let slots = std::env::var("LLM170_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    build_slots(req, backend, slots)
+}
+
+/// n_slots 시퀀스로 엔진 구성 (연속 배칭 — 04).
+pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
     let arch = open_with_retry(&req.model)
         .and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
         let m = load_q4_retry(&req.model);
-        let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, req.ctx);
+        let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
         match &backend {
             BackendSel::GpuRuntime(rt) => {
                 let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
@@ -97,7 +280,7 @@ pub fn build(req: InferRequest, backend: BackendSel) -> Engine {
         Engine::Q4(eng)
     } else {
         let m = load_q35_retry(&req.model);
-        let mut eng = llm170_core::model::Engine::new(m, 1, req.ctx);
+        let mut eng = llm170_core::model::Engine::new(m, n_slots, req.ctx);
         match &backend {
             BackendSel::GpuRuntime(rt) => {
                 let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
@@ -129,6 +312,14 @@ impl Engine {
         match self {
             Engine::Q35(e) => e.reset_states(),
             Engine::Q4(e) => e.reset_states(),
+        }
+    }
+
+    /// 슬롯 단위 리셋 위임.
+    pub fn reset_seq(&mut self, seq: usize) {
+        match self {
+            Engine::Q35(e) => e.reset_seq(seq),
+            Engine::Q4(e) => e.reset_seq(seq),
         }
     }
 
