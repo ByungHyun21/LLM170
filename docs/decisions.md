@@ -142,3 +142,55 @@ transport 4×. Cross-checked against the f32 reference at rel 1–5e-3 (the
 theoretical q8 activation-quantization noise).
 **Implication**: the CMP dp4a-class integer-accumulation version remains a
 cmp-stock follow-up once the hardware arrives.
+
+## ADR-0014 — GPU buffer arena: allocation is permanent (2026-09-01)
+
+**Context**: Long-prompt prefill produced NaN outputs, then
+`Memory page 0 doesn't exist` faults, on both HIP and Vulkan with identical
+failure points. Root cause (measured, 2026-09-01): `create_from_slice`
+handles dropped at scope exit are reclaimed by the cubecl memory manager's
+delayed dealloc; queued kernels still referencing that memory read garbage.
+A second defect compounded it: `dev_weight` returned a shared 4-byte dummy
+handle for over-budget weights, and `matmul_group`/`matmul_paired` lacked a
+host-fallback check, launching GEMMs against the dummy.
+
+**Decision**: GPU memory has a single owner, the buffer arena
+(`backend-gpu/src/buffers.rs`): `WeightStore` returns a `WRef` enum where
+`gpu()` errors on host fallback (the dummy-handle class of bug becomes
+unrepresentable), and `ScratchPool` retains every transient upload
+(x, q, ck, cv, mask) plus scratch permanently — no buffer is ever freed.
+Fresh allocations drain the queue first (`client.sync()`), the client runs
+`MemoryAllocationMode::Persistent`, and `main` re-execs itself so
+`HIP_LAUNCH_BLOCKING=1` applies before HIP initialization (setting it after
+init is a no-op — measured).
+
+**Consequences**: VRAM is bounded by pool accounting (`POOL_TOTAL`) plus the
+weight budget (`LLM170_W_CAP_GB`) instead of by frees; on a 96 GiB dev
+machine the long-prompt working set measured 45.7 GiB. Verification:
+2,311- and 1,904-token prefills reproduce token-exact 24/24 on Vulkan.
+Known open issue: the HIP runtime still faults on multi-chunk (>=2,048-token)
+prefill through the cubecl-HIP memory manager — the engine code is identical
+across runtimes, so this is tracked as a runtime-layer defect (dev-machine
+long verification runs on Vulkan).
+
+## ADR-0015 — Engine stage modules over a shared context (2026-09-01)
+
+**Context**: `qwen4exp/layers.rs` had grown to 1,283 lines holding every
+stage (hyper-connection mix, GDN, QSA, MoE, PLE) inside one `Engine4` impl,
+with no injection point for CMP kernel variants and per-call allocation
+churn (`Hparams4::clone` allocating five vectors per stage call).
+
+**Decision**: stages live in `qwen4exp/stages/{hc,gdn,qsa,moe,ple}.rs` as
+free functions taking `Ctx { model: &Model4, acc: Option<&dyn Accelerator> }`
+plus, for stateful stages, `&mut SeqState4`. Dispatch helpers
+(mm/mm_batch/mm_group/mm_paired) moved onto `Ctx`; the matrix-dispatch
+variants (grouped same-input projections, paired per-expert rows) are part
+of the context contract. `Engine4` keeps forward/prefill/decode and timing
+only. The runtime `--mode` flag (`core::mode`, ADR-0002 made concrete)
+selects memory budgets today and is the branch key for future cmp-stock
+kernel variants.
+
+**Consequences**: `layers.rs` is 335 lines; stages are backend-independent
+and independently testable. Numerics unchanged (pure code motion):
+GPU↔CPU 25/25 token-exact, 1,024-token chunk smoke clean, single_ko
+reference-exact 24/24, cargo suite 10/10.
