@@ -56,6 +56,14 @@ tg gap is ~280 ms/token of host glue (per-op readback + buffer
 acquire + launch marshalling) — next lever is a device-resident
 decode frame for qwen35 (the qwen4exp frame.rs pattern).
 
+qwen4exp frame follow-up (LLM170_FRAME=1, bit-exact on tiny4 — GPU
+frame == GPU non-frame == CPU): real model tg16 **0.43 -> 2.87 t/s
+(6.7x)**, pp32 5.23 -> 6.01. Host-glue-elimination thesis confirmed
+empirically: same kernels, chained handles. Remaining qwen4exp gap:
+PLE/QSA value bridges (not yet framed). qwen35 has no frame yet —
+same pattern extends (all layer kernels already on GPU per rocprof
+trace: gdn_ar, conv, beta_g, norm_gated, qsa_mix/score).
+
 Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
 projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
 call, down as paired batch), GDN ~126 ms (CPU recurrence — GPU kernel is the
