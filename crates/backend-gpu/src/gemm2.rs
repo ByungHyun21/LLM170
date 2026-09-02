@@ -1650,17 +1650,58 @@ pub fn gemm_q8i_q6k(
         let h = kloc >> 3;
         let src = (kloc - h * 8) >> 1;
         let p = kloc & 1;
+        // 워드 직접 로드 — ql 16B·qh 16B (블록 내 오프셋은 4정렬, wb%4가
+        // 2면 5워드 슬라이딩). d·sc는 소량이라 byte() 유지.
         let d = f16_bits(byte(w, wb + 208) | (byte(w, wb + 209) << 8));
         let sc = sext8(byte(w, wb + 192 + kloc));
         let xw = (g * 16) >> 2;
         let (y0, y1, y2, y3) = (xq[xw], xq[xw + 1], xq[xw + 2], xq[xw + 3]);
-        // ★리터럴 분기 산술 오컴파일 회피 — src 홀수 → +32
-        let qlb = wb + h * 64 + p * 16 + ((src & 1) << 5);
-        let qhb = wb + 128 + h * 32 + p * 16; // qh 베이스 +128
+        let ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
+        let qh_rel = 128 + h * 32 + p * 16;
+        let al = (wb & 3) == 0; // 블록 공통 정렬
+        let qlw = (wb + ql_rel) >> 2;
+        let qhw = (wb + qh_rel) >> 2;
+        let (qa0, qa1, qa2, qa3) = if al {
+            (w[qlw], w[qlw + 1], w[qlw + 2], w[qlw + 3])
+        } else {
+            (
+                (w[qlw] >> 16) | (w[qlw + 1] << 16),
+                (w[qlw + 1] >> 16) | (w[qlw + 2] << 16),
+                (w[qlw + 2] >> 16) | (w[qlw + 3] << 16),
+                (w[qlw + 3] >> 16) | (w[qlw + 4] << 16),
+            )
+        };
+        let (ha0, ha1, ha2, ha3) = if al {
+            (w[qhw], w[qhw + 1], w[qhw + 2], w[qhw + 3])
+        } else {
+            (
+                (w[qhw] >> 16) | (w[qhw + 1] << 16),
+                (w[qhw + 1] >> 16) | (w[qhw + 2] << 16),
+                (w[qhw + 2] >> 16) | (w[qhw + 3] << 16),
+                (w[qhw + 3] >> 16) | (w[qhw + 4] << 16),
+            )
+        };
+        // qa0..3·ha0..3은 이미 영역 16바이트를 담는 가상 워드 — j 직접 색인
         let mut isum = 0i32;
         for jj in 0..16 {
-            let qv = byte(w, qlb + jj);
-            let qhbv = byte(w, qhb + jj);
+            let qv = if jj < 4 {
+                (qa0 >> ((jj * 8) as u32)) & 0xFF
+            } else if jj < 8 {
+                (qa1 >> (((jj - 4) * 8) as u32)) & 0xFF
+            } else if jj < 12 {
+                (qa2 >> (((jj - 8) * 8) as u32)) & 0xFF
+            } else {
+                (qa3 >> (((jj - 12) * 8) as u32)) & 0xFF
+            };
+            let qhbv = if jj < 4 {
+                (ha0 >> ((jj * 8) as u32)) & 0xFF
+            } else if jj < 8 {
+                (ha1 >> (((jj - 4) * 8) as u32)) & 0xFF
+            } else if jj < 12 {
+                (ha2 >> (((jj - 8) * 8) as u32)) & 0xFF
+            } else {
+                (ha3 >> (((jj - 12) * 8) as u32)) & 0xFF
+            };
             let nib = if src == 0 || src == 1 { qv & 0xF } else { qv >> 4 };
             let hi2 = if src == 0 {
                 (qhbv & 3) as i32
