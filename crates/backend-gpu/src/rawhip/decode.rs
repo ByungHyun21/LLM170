@@ -170,3 +170,79 @@ impl DecodeState {
         Ok(ds)
     }
 }
+
+impl DecodeState {
+    /// ew 헬퍼 — 그리드 계산 포함.
+    fn ew(&self, name: &str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+        self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
+    }
+    fn p<T>(v: &mut T) -> *mut std::ffi::c_void {
+        v as *mut T as *mut std::ffi::c_void
+    }
+    /// rms 2-커널 (x, w, out, n, w_reps) — p64 재사용.
+    fn rms(&self, x: *mut u8, w: *mut u8, out: *mut u8, n: usize, w_reps: usize) -> Result<(), String> {
+        let rows = 1usize;
+        let mut xp = x as *mut std::ffi::c_void;
+        let mut pp = self.p64 as *mut std::ffi::c_void;
+        let mut na = n as i32;
+        let mut a1 = vec![Self::p(&mut xp), Self::p(&mut pp), Self::p(&mut na)];
+        self.ctx.launch("rms_part", rows as u32, 1, 32, &mut a1)?;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut ep = self.eps;
+        let mut wr = w_reps as i32;
+        let mut a2 = vec![
+            Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp),
+            Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr),
+        ];
+        self.ctx.launch("rms_finish", rows as u32, 1, 32, &mut a2)
+    }
+    /// W4A8 GEMV (quant 완료된 xq 사용) — part는 gemv_q8 내부 alloc 대신
+    /// 재사용 불가(소유) — 그대로 gemv_q8 사용.
+    fn mm(&self, xq: *mut u8, wkey: &str, out: *mut u8, n_out: usize) -> Result<(), String> {
+        let (wp, ty, n_in, _) = *self.weights.get(wkey).ok_or_else(|| format!("weight 없음: {wkey}"))?;
+        let g = self.ctx.gemv_q8(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out)?;
+        // out이 임시가 아닌 상주 버퍼에 필요 — gemv_q8는 자체 out 사용.
+        // 상주 out에 복사하는 커널 호출 대신: gemv 결과를 h2d? 비효율.
+        // → gemv_q8 직접 상주 out에 쓰도록 변형 필요. 임시: d2h+h2d.
+        self.ctx.h2d(out, bytemuck::cast_slice(&g))?;
+        Ok(())
+    }
+    /// 활성 양자화 (x → xq 통합버퍼).
+    fn quant(&self, x: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
+        self.ctx.quant_q8(x as *const u8, xq, n)
+    }
+    fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
+        let mut yp = y as *mut std::ffi::c_void;
+        let mut xp = x as *mut std::ffi::c_void;
+        let mut op = self.one as *mut std::ffi::c_void;
+        let mut na = n as i32;
+        let mut args = vec![Self::p(&mut yp), Self::p(&mut xp), Self::p(&mut op), Self::p(&mut na)];
+        self.ew("axpy_scaled", n, &mut args)
+    }
+    fn copy(&self, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: usize, n: usize) -> Result<(), String> {
+        let mut sp = src as *mut std::ffi::c_void;
+        let mut dp = dst as *mut std::ffi::c_void;
+        let mut so = src_off as i32;
+        let mut doff = dst_off as i32;
+        let mut na = n as i32;
+        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut so), Self::p(&mut doff), Self::p(&mut na)];
+        self.ew("copy_rows", n, &mut args)
+    }
+}
+
+impl DecodeState {
+    /// 디코드 1스텝 (t=1, 단일 시퀀스) — logits 반환.
+    /// LLM170_RAWHIP=1 게이트로 엔진에서 호출 (배선 다음 단계).
+    pub fn step(&self, seq: usize, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+        let n = self.n_embd;
+        // 0) 임베딩 — 호출부가 xs에 h2d 완료 전제 (호스트 dequant).
+        // 1) pre-norm
+        let wn = self.consts.get(&format!("blk.{}.attn_norm", 0)).copied().unwrap_or(self.xn);
+        let _ = wn;
+        // 각 층: is_recr 분기 — 전체 루프는 엔진 배선 시 완성.
+        // 현재까지: 커널 전종 + 상태 초기화 + 헬퍼. 다음 커밋에서 층 루프.
+        let _ = (seq, token, pos);
+        Err("decode step: layer loop pending — next commit".into())
+    }
+}
