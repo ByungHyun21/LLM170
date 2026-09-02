@@ -343,6 +343,57 @@ fn de4(
             d * sc10 * (n2 as i32 - 32) as f32,
             d * sc11 * (n3 as i32 - 32) as f32,
         )
+    } else if qtype == 11 {
+        // q3_K: 4배치 {l, l+64, l+128, l+192}는 동일 256블록 — 12바이트
+        // 스케일 언팩(aux0..3)·f16 d·qh 바이트를 공유, ql도 n(0/1)별
+        // 1바이트씩. 요소당 ~16 로드 → ~4.25 (2026-09-02 18GB/s RCA).
+        // 값은 de_elem_q3_k와 동일식 — 비트 불변.
+        let a0 = byte(w, wb + 96) | (byte(w, wb + 97) << 8) | (byte(w, wb + 98) << 16) | (byte(w, wb + 99) << 24);
+        let a1 = byte(w, wb + 100) | (byte(w, wb + 101) << 8) | (byte(w, wb + 102) << 16) | (byte(w, wb + 103) << 24);
+        let tmp = byte(w, wb + 104) | (byte(w, wb + 105) << 8) | (byte(w, wb + 106) << 16) | (byte(w, wb + 107) << 24);
+        let k1 = 0x03030303u32;
+        let k2 = 0x0f0f0f0fu32;
+        let aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+        let aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+        let aux0 = (a0 & k2) | ((tmp & k1) << 4);
+        let aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+        let d = f16_at(w, wb + 108);
+        // j%32는 4요소 공통(l%32). n: e∈{0,1}→0, e∈{2,3}→1.
+        // si: e∈{0,2}→si0, e∈{1,3}→si0+2. ai = n·8 + si·2 + hi는
+        // 순서대로 aux0..3에 정확히 대응(산술 검증).
+        let si0 = l / 32;
+        let hi = (l % 32) / 16;
+        let half = hi * 16;
+        let l16 = l % 16;
+        let ql0 = byte(w, wb + 32 + half + l16);
+        let ql1 = byte(w, wb + 64 + half + l16);
+        let qh = byte(w, wb + half + l16);
+        let ai0 = si0 * 2 + hi;
+        let ai1 = si0 * 2 + 4 + hi;
+        let ai2 = 8 + si0 * 2 + hi;
+        let ai3 = 12 + si0 * 2 + hi;
+        let scb0 = (aux0 >> ((ai0 % 4) * 8) as u32) & 0xFF;
+        let scb1 = (aux1 >> ((ai1 % 4) * 8) as u32) & 0xFF;
+        let scb2 = (aux2 >> ((ai2 % 4) * 8) as u32) & 0xFF;
+        let scb3 = (aux3 >> ((ai3 % 4) * 8) as u32) & 0xFF;
+        let dl0 = d * (byte_signed(scb0) - 32.0);
+        let dl1 = d * (byte_signed(scb1) - 32.0);
+        let dl2 = d * (byte_signed(scb2) - 32.0);
+        let dl3 = d * (byte_signed(scb3) - 32.0);
+        let qv0 = ((ql0 >> (si0 * 2) as u32) & 3) as i32;
+        let qv1 = ((ql0 >> ((si0 * 2 + 4)) as u32) & 3) as i32;
+        let qv2 = ((ql1 >> (si0 * 2) as u32) & 3) as i32;
+        let qv3 = ((ql1 >> ((si0 * 2 + 4)) as u32) & 3) as i32;
+        let b0 = ((qh >> si0 as u32) & 1) as i32;
+        let b1 = ((qh >> (si0 + 2) as u32) & 1) as i32;
+        let b2 = ((qh >> si0 as u32) & 1) as i32;
+        let b3 = ((qh >> (si0 + 2) as u32) & 1) as i32;
+        (
+            dl0 * (qv0 - (4 - b0 * 4)) as f32,
+            dl1 * (qv1 - (4 - b1 * 4)) as f32,
+            dl2 * (qv2 - (4 - b2 * 4)) as f32,
+            dl3 * (qv3 - (4 - b3 * 4)) as f32,
+        )
     } else if qtype == 23 {
         // iq4_xs: ls 워드(wb+4..7)·scales_h·d 공유, qb는 16바이트 간격 4회.
         let ib = l / 32;
@@ -742,7 +793,7 @@ pub fn gemm_q3(
         let k1 = k + s;
         let k2 = k + 2 * s;
         let k3 = k + 3 * s;
-        let (v0, v1, v2, v3) = if qtype == 12 || qtype == 13 || qtype == 14 || qtype == 23 {
+        let (v0, v1, v2, v3) = if qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14 || qtype == 23 {
             de4(w, row_base + (k / blck) * bsize, l, ktab, grid3, qtype)
         } else {
             (

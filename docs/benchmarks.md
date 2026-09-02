@@ -25,7 +25,7 @@ Current standing (GPU backend, single-tenant `llm170 bench`, 2026-09-02):
 
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **2.63 t/s** | 0.25x |
+| Decode tg24, t=1 | 10.4 t/s | **3.86 t/s** | 0.37x |
 | Prefill pp64 | 142.8 t/s (418-tok case) | **13.04 t/s** | 0.09x |
 
 Session progression (same binary lineage, gfx1151):
@@ -52,6 +52,11 @@ Session progression (same binary lineage, gfx1151):
   **Decode priority: GEMV kernel bandwidth per quant type** — q3_K
   (`ffn_up`, 35% of wall) first. Concurrent-stream GEMV was measured and
   rejected: aggregate saturates at the single-stream rate (1.00-1.13x).
+- `q3_K de4` (block-invariant scale hoisting for q3_K, previously only
+  K-quants/iq4_xs — element cost ~16 loads -> ~4.25, value-identical):
+  `ffn_up` 18 -> **50 GB/s** isolated; decode tg24 **3.56 -> 3.86 t/s**
+  (2026-09-02, minimal-prefill measurement; a preceding 22-min pp512 run
+  measurably throttles the APU and masks gains — measure tg with --pp 8).
 
 Measurement caution: a co-resident run (llama-server holding VRAM) measured
 tg 0.58 t/s — invalid per the non-coexistence rule (see Verification below),
