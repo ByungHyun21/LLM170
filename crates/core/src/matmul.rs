@@ -261,6 +261,12 @@ pub enum FrameOp {
     NormGatedSilu { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
     /// GDN q/k 헤드별 in-place L2 norm.
     L2Rows { x: u64, eps: f32, d: usize },
+    /// 어텐션 q/k 헤드 rms+rope in-place (f64 중간 — 브리지 제거).
+    QKNormRope {
+        q: u64, k: u64, qw: u64, kw: u64, cs: u64,
+        eps: f32, kqs: f32, pos: usize, n_head: usize, n_kv: usize,
+        hd: usize, n_rot: usize,
+    },
     /// hc 게이트 적용 + 스트림 평균 (hc는 나눗셈 피수로 사용).
     HcGateMean { xn: u64, gate: u64, out: u64, hc: usize, n: usize },
     /// hc combine: res += out·(2·σ(inj/hc)).

@@ -57,14 +57,18 @@ pub fn softplus(x: f32) -> f32 {
 /// qwen35 = IMROPE → **NEOX 페어링**: 페어 p = (p, p + n_rot/2),
 /// θ_p = base^(−2p/n_rot). 텍스트 전용에서는 모든 위치 성분이 같아 표준 NEOX와 동일.
 /// (ggml.h: GGML_ROPE_TYPE_IMROPE 40 — "still NEOX ordering")
+/// RoPE 단일 헤드 — f64 중간연산: f32×f32 곱·차는 f64에서 전부 정확(
+/// FMA 수축 무영향), 최종 1회 f32 반올림. GPU ew::qk_norm_rope와 동일
+/// 연산열 (2026-09-02 브리지 제거 — P1 수축 RCA의 해법).
 pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
     let half = n_rot / 2;
     for p in 0..half {
         let theta = base.powf(-(2.0 * p as f32) / n_rot as f32);
         let angle = pos as f32 * theta;
         let (c, s) = (angle.cos(), angle.sin());
-        let (x0, x1) = (head[p], head[p + half]);
-        head[p] = x0 * c - x1 * s;
-        head[p + half] = x0 * s + x1 * c;
+        let (x0, x1) = (head[p] as f64, head[p + half] as f64);
+        let (cf, sf) = (c as f64, s as f64);
+        head[p] = (x0 * cf - x1 * sf) as f32;
+        head[p + half] = (x0 * sf + x1 * cf) as f32;
     }
 }

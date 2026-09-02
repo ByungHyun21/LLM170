@@ -2551,6 +2551,34 @@ impl<R: Runtime> GpuMatmul<R> {
                 }
                 self.release_bufs(&[(pg, 4)]);
             }
+            FrameOp::QKNormRope { q, k, qw, kw, cs, eps, kqs, pos, n_head, n_kv, hd, n_rot } => {
+                let qh = one(*q)?;
+                let kh = one(*k)?;
+                let qwh = one(*qw)?;
+                let kwh = one(*kw)?;
+                let csh = one(*cs)?;
+                let rows = n_head + n_kv;
+                // SAFETY: 큐브당 1행, 유닛 0만 실행 — 범위 내.
+                unsafe {
+                    ew::qk_norm_rope::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(qh, [1].into(), [n_head * 2 * hd].into()),
+                        TensorArg::from_raw_parts(kh, [1].into(), [n_kv * hd].into()),
+                        TensorArg::from_raw_parts(qwh, [1].into(), [n_head * hd].into()),
+                        TensorArg::from_raw_parts(kwh, [1].into(), [n_kv * hd].into()),
+                        TensorArg::from_raw_parts(csh, [1].into(), [2048 * (n_rot / 2) * 2].into()),
+                        *eps,
+                        *kqs,
+                        *pos,
+                        *n_head,
+                        *n_kv,
+                        *hd,
+                        *n_rot,
+                    );
+                }
+            }
             FrameOp::HcGateMean { xn, gate, out, hc, n } => {
                 let xh = one(*xn)?;
                 let gh = one(*gate)?;

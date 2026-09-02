@@ -345,46 +345,20 @@ impl Engine {
                     acc.frame_mm_group(f.xn, &[wq, wk, wv], &[f.aq, f.ak, f.av], 1)
                         .map_err(ModelError::Accel)?;
                 }
-                // rms·rope는 CPU — GPU 코드젠의 FMA 수축이 CPU strict FP와
-                // 1-ulp 어긋나 토큰을 갈라놓음 (2026-09-02 P1 RCA).
-                // q/k/v mm·attention·wo만 GPU: 층당 왕복 4회.
-                let mut aqv = vec![0.0f32; n_head * 2 * hd];
-                acc.frame_read(f.aq, &mut aqv).map_err(ModelError::Accel)?;
-                let mut akv = vec![0.0f32; n_kv * hd];
-                acc.frame_read(f.ak, &mut akv).map_err(ModelError::Accel)?;
-                let qn = eng.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
-                let kn = eng.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
-                let mut qrow = vec![0.0f32; n_head * 2 * hd];
-                for h in 0..n_head {
-                    let src = aqv[h * 2 * hd..h * 2 * hd + hd].to_vec();
-                    let mut qh = crate::ops::rms_norm(&src, &qn, eps);
-                    crate::ops::rope_head(&mut qh, pos as u32, n_rot, hp.rope_base);
-                    qrow[h * 2 * hd..h * 2 * hd + hd].copy_from_slice(&qh);
-                    for i in 0..hd {
-                        qrow[h * 2 * hd + hd + i] = aqv[h * 2 * hd + hd + i];
-                    }
-                }
-                let mut krow = vec![0.0f32; n_kv * hd];
-                for h in 0..n_kv {
-                    let src = akv[h * hd..(h + 1) * hd].to_vec();
-                    let mut kh = crate::ops::rms_norm(&src, &kn, eps);
-                    crate::ops::rope_head(&mut kh, pos as u32, n_rot, hp.rope_base);
-                    krow[h * hd..(h + 1) * hd].copy_from_slice(&kh);
-                }
-                // kq_scale 사전 곱 — 값 경로 qsa_attention_inner가 ck에
-                // 곱하는 것과 동일 연산(비트 동일). frame_qsa_attention은
-                // 스케일 인수를 무시(qwen4exp는 1.0).
-                let kqs = eng.model.hp.kq_scale();
-                let mut krow_scaled = krow;
-                for v in krow_scaled.iter_mut() {
-                    *v *= kqs;
-                }
-                acc.frame_write(f.aqrow, &qrow).map_err(ModelError::Accel)?;
-                acc.frame_write(f.akstg, &krow_scaled).map_err(ModelError::Accel)?;
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.akstg, dst: f.kv_k[seq][full_idx], src_off: 0, dst_off: pos * n_kv * hd, n: n_kv * hd })?;
+                // q/k norm+rope GPU 상주 (브리지 제거, 2026-09-02):
+                // f64 중간연산으로 FMA 수축 면역 — ops::rope_head와 동일
+                // 연산열. k는 kq_scale 사전 곱(기존 브리지와 동일 의미).
+                let qn_h = f.consts[&format!("blk.{il}.attn_q_norm")];
+                let kn_h = f.consts[&format!("blk.{il}.attn_k_norm")];
+                op(acc.as_ref(), FrameOp::QKNormRope {
+                    q: f.aq, k: f.ak, qw: qn_h, kw: kn_h, cs: f.cs,
+                    eps, kqs: eng.model.hp.kq_scale(), pos,
+                    n_head, n_kv, hd, n_rot,
+                })?;
+                op(acc.as_ref(), FrameOp::CopyRows { src: f.ak, dst: f.kv_k[seq][full_idx], src_off: 0, dst_off: pos * n_kv * hd, n: n_kv * hd })?;
                 op(acc.as_ref(), FrameOp::CopyRows { src: f.av, dst: f.kv_v[seq][full_idx], src_off: 0, dst_off: pos * n_kv * hd, n: n_kv * hd })?;
                 let fs2: &dyn FrameState = acc.as_ref();
-                fs2.frame_qsa_attention(f.aqrow, f.kv_k[seq][full_idx], f.kv_v[seq][full_idx], f.mask, f.aout, eng.model.hp.kq_scale(), pos + 1, n_head, n_kv, hd, 1)
+                fs2.frame_qsa_attention(f.aq, f.kv_k[seq][full_idx], f.kv_v[seq][full_idx], f.mask, f.aout, eng.model.hp.kq_scale(), pos + 1, n_head, n_kv, hd, 1)
                     .map_err(ModelError::Accel)?;
                 let wo = eng.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
                 if q8n && crate::matmul::w4a8_ty(wo.ty) {

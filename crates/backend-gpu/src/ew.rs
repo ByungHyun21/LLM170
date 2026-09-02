@@ -668,3 +668,105 @@ pub fn attn_k_prep(
         cache[cb + pp + half] = x0 * si + x1 * c;
     }
 }
+
+/// 어텐션 q/k 헤드 norm+rope (in-place) — 유닛 0이 행 1개 담당.
+/// rms: ops::sq_sum의 32-세그먼트 f64 순서를 단일 유닛이 순차 재현(P0
+/// 계약). norm v·scale·w (f32 곱 2). rope: f64 중간연산 — cs 테이블
+/// [pos·half·2] (CPU theta·cos/sin 사전계산). k행은 ·kqs 후 기록.
+/// q행: x = q + r·2·hd (q 절반만, gate 불변) · k행: x = k + (r−nh)·hd.
+#[cube(launch_unchecked)]
+pub fn qk_norm_rope(
+    xq: &mut Tensor<f32>, // [n_head·2·hd] q‖gate 인터리브 (q절반만 갱신)
+    xk: &mut Tensor<f32>, // [n_kv·hd]
+    qw: &Tensor<f32>,     // [n_head·hd]
+    kw: &Tensor<f32>,     // [n_kv·hd]
+    cs: &Tensor<f32>,    // [ctx·half·2]
+    eps: f32,
+    kqs: f32,
+    pos: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    n_rot: usize,
+) {
+    let r = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    let rows = n_head + n_kv;
+    if r >= rows || u != 0 {
+        terminate!();
+    }
+    let is_q = r < n_head;
+    let half = n_rot / 2;
+    let seg = 32usize;
+    let csbase = pos * half * 2;
+    // 행 오프셋: q행 r → xq의 r·2·hd (q절반), k행 → xk의 (r−nh)·hd
+    let row_base = if is_q { r * 2 * hd } else { (r - n_head) * hd };
+    // rms 32-세그먼트 f64 — ops::sq_sum 순서 재현 (단일 유닛 순차)
+    let chunk = hd.div_ceil(seg);
+    let mut parts: Array<f64> = Array::new(seg);
+    if is_q {
+        for uu in 0..seg {
+            let lo = uu * chunk;
+            let hi = (lo + chunk).min(hd);
+            let mut acc = 0.0f64;
+            let mut i = lo;
+            while i < hi {
+                let d = f64::cast_from(xq[row_base + i]);
+                acc += d * d;
+                i += 1;
+            }
+            parts[uu] = acc;
+        }
+    } else {
+        for uu in 0..seg {
+            let lo = uu * chunk;
+            let hi = (lo + chunk).min(hd);
+            let mut acc = 0.0f64;
+            let mut i = lo;
+            while i < hi {
+                let d = f64::cast_from(xk[row_base + i]);
+                acc += d * d;
+                i += 1;
+            }
+            parts[uu] = acc;
+        }
+    }
+    let mut sum = 0.0f64;
+    for uu in 0..seg {
+        sum += parts[uu];
+    }
+    let scale = 1.0f32 / (((sum / hd as f64) + eps as f64).sqrt() as f32);
+    // norm (+k행은 ·kqs) — f32 곱 2, rope f64 중간
+    if is_q {
+        for i in 0..hd {
+            let v = xq[row_base + i] * scale * qw[r * hd + i];
+            xq[row_base + i] = v;
+        }
+        for p in 0..half {
+            let c = f64::cast_from(cs[csbase + p * 2]);
+            let sf = f64::cast_from(cs[csbase + p * 2 + 1]);
+            let a = row_base + p;
+            let b = a + half;
+            let x0 = f64::cast_from(xq[a]);
+            let x1 = f64::cast_from(xq[b]);
+            xq[a] = (x0 * c - x1 * sf) as f32;
+            xq[b] = (x0 * sf + x1 * c) as f32;
+        }
+    } else {
+        for i in 0..hd {
+            let v = xk[row_base + i] * scale * kw[row_base + i];
+            xk[row_base + i] = v * kqs;
+        }
+        for p in 0..half {
+            let c = f64::cast_from(cs[csbase + p * 2]);
+            let sf = f64::cast_from(cs[csbase + p * 2 + 1]);
+            let a = row_base + p;
+            let b = a + half;
+            let x0 = f64::cast_from(xk[a]);
+            let x1 = f64::cast_from(xk[b]);
+            xk[a] = (x0 * c - x1 * sf) as f32;
+            xk[b] = (x0 * sf + x1 * c) as f32;
+        }
+    }
+}
+
