@@ -1091,3 +1091,60 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     }
     lane
 }
+
+/// W4A8 레인 미러(iq3_s) — 32원소 서브블록, grid4×부호 정수 가중,
+/// (yd·db·isum) f32 → f64 레인 누산 (GPU gemm_iq3s와 동일 연산열).
+pub fn dot_row_w4a8_iq3s_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_iq3s_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sub = l + m * 64;
+            let blk = sub / 8;
+            let h = sub % 8;
+            let wb = &data[blk * 110..blk * 110 + 110];
+            let d_all = f16(wb, 0);
+            let scb = wb[106 + (h >> 1)];
+            let nib = if h & 1 != 0 { scb >> 4 } else { scb & 0xF };
+            let db = d_all * (1 + 2 * nib as i32) as f32;
+            let qhb = wb[66 + h] as u32;
+            let qs_base = 2 + h * 8;
+            let sg_base = 74 + h * 4;
+            let mut isum = 0i64;
+            for ll in 0..4usize {
+                let i1 = (wb[qs_base + 2 * ll] as u32) | ((qhb << (8 - 2 * ll)) & 256);
+                let i2 = (wb[qs_base + 2 * ll + 1] as u32) | ((qhb << (7 - 2 * ll)) & 256);
+                let g1 = IQ3S_GRID[i1 as usize];
+                let g2 = IQ3S_GRID[i2 as usize];
+                let sgb = wb[sg_base + ll];
+                let e0 = 8 * ll;
+                for j in 0..4usize {
+                    let w1 = ((g1 >> (8 * j)) & 0xFF) as i8 as i32
+                        * if sgb & KMASK_IQ2XS[j] != 0 { -1 } else { 1 };
+                    let w2 = ((g2 >> (8 * j)) & 0xFF) as i8 as i32
+                        * if sgb & KMASK_IQ2XS[4 + j] != 0 { -1 } else { 1 };
+                    let e1 = e0 + j;
+                    let e2 = e0 + 4 + j;
+                    isum += (w1 as i64) * y_el(y, sub * 32 + e1)
+                        + (w2 as i64) * y_el(y, sub * 32 + e2);
+                }
+            }
+            let yd = y[sub].d;
+            acc += (yd * db * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+

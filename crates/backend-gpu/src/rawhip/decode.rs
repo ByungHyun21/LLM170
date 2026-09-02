@@ -229,11 +229,15 @@ impl DecodeState {
     /// 디코드 1스텝 (t=1, 단일 시퀀스) — logits 반환. xs에 임베딩 h2d 완료 전제.
     #[allow(clippy::too_many_lines)]
     pub fn step(&self, seq: usize, pos: usize) -> Result<Vec<f32>, String> {
+        self.ctx.scratch_rewind();
         let n = self.n_embd;
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
         let mut full_idx = 0usize;
         for il in 0..self.n_layer {
+            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+                eprintln!("# rawhip: layer {il} (recr={})", self.is_recr[il]);
+            }
             // pre-norm + quant
             let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
             self.rms(self.xs, wn, self.xn, n)?;
@@ -336,10 +340,13 @@ impl DecodeState {
                 // q/k/v mm
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.aq)?;
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  aq ok"); }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.ak)?;
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  ak ok"); }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.av)?;
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  av ok"); }
                 // q/k norm+rope (in-place)
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
@@ -360,6 +367,7 @@ impl DecodeState {
                     let rows = n_head + n_kv;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
                     self.ctx.launch("qk_norm_rope", rows as u32, 1, 32, &mut args)?;
+                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  qk_norm ok"); }
                 }
                 // KV append
                 self.copy(self.ak, self.kv_k[seq], 0, pos * n_kv * hd, n_kv * hd)?;
@@ -380,6 +388,7 @@ impl DecodeState {
                     let gx = n_past.div_ceil(64) as u32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
                     self.ctx.launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
+                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  score ok"); }
                 }
                 // mix
                 {
@@ -396,6 +405,7 @@ impl DecodeState {
                     let gx = hd.div_ceil(64) as u32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
                     self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
+                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
                 }
                 // wo
                 self.quant(self.aout, self.xq_g, n_head * hd)?;

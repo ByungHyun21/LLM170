@@ -124,6 +124,20 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("iq3s-probe") => match llm170_backend_gpu::rawhip::iq3s_probe() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
+        Some("qk-check") => match llm170_backend_gpu::rawhip::qk_check() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("gpu-smoke") => {
             let t = std::time::Instant::now();
             match llm170_backend_gpu::smoke_gemv(5120, 1024) {
@@ -720,6 +734,9 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
                     llm170_gguf::GgmlType::Iq4Nl => {
                         llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y1)
                     }
+                    llm170_gguf::GgmlType::Iq3S => {
+                        llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &y1)
+                    }
                     _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y1),
                 };
                 if c.to_bits() != g[ti * n_out + o].to_bits() {
@@ -843,6 +860,8 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
             llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y)
         } else if w.ty == llm170_gguf::GgmlType::Q6K {
             llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Iq3S {
+            llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &y)
         } else {
             llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y)
         };
@@ -2117,7 +2136,8 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         Some(w) => w,
         None => { eprintln!("tensor not found: {}", args[1]); return ExitCode::FAILURE; }
     };
-    if !llm170_core::matmul::w4a8_ty(w.ty) {
+    let raw_ok = llm170_core::matmul::w4a8_ty(w.ty) || w.ty == llm170_gguf::GgmlType::Iq3S;
+    if !raw_ok {
         eprintln!("rawhip-check: 미지원 타입");
         return ExitCode::FAILURE;
     }
@@ -2226,6 +2246,61 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
     let rb = (n_in / blck) * bsize;
     let mut mism = 0usize;
     let mut first: Option<(usize, f32, f32)> = None;
+    if std::env::var_os("LLM170_IQ3S_LANES").is_some() && w.ty == llm170_gguf::GgmlType::Iq3S {
+        let row0 = &w.data[..rb];
+        let lane = llm170_core::quant::dot_row_w4a8_iq3s_lane_parts(row0, n_in as u64, &y);
+        if let Ok(gp) = ctx.gemv_q8_parts(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in) {
+            let mut bad = 0;
+            for l in 0..64 {
+                if gp[l].to_bits() != lane[l].to_bits() {
+                    bad += 1;
+                    if bad <= 3 {
+                        println!("  lane {l}: gpu={:.9e} cpu={:.9e}", gp[l], lane[l]);
+                    }
+                }
+            }
+            println!("  레인 불일치 {bad}/64");
+            // sub별 이진 국소화 — 미러의 sub 기여와 GPU sub 기여 비교
+            let mut subbad = 0usize;
+            for sub in 0..(n_in / 32).min(16) {
+                let (blk, h) = (sub / 8, sub % 8);
+                let wb = &w.data[blk * bsize..blk * bsize + bsize];
+                let d_all = llm170_core::quant::half_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+                let scb = wb[106 + (h >> 1)];
+                let nib = if h & 1 != 0 { scb >> 4 } else { scb & 0xF };
+                let db = d_all * (1 + 2 * nib as i32) as f32;
+                let yd = y[sub].d;
+                let mut isum = 0i64;
+                let qhb = wb[66 + h] as u32;
+                for ll in 0..4usize {
+                    let i1 = (wb[2 + h * 8 + 2 * ll] as u32) | ((qhb << (8 - 2 * ll)) & 256);
+                    let i2 = (wb[2 + h * 8 + 2 * ll + 1] as u32) | ((qhb << (7 - 2 * ll)) & 256);
+                    let g1 = llm170_core::IQ3S_GRID[i1 as usize];
+                    let g2 = llm170_core::IQ3S_GRID[i2 as usize];
+                    let sgb = wb[74 + h * 4 + ll];
+                    for j in 0..4usize {
+                        let w1 = ((g1 >> (8 * j)) & 0xFF) as i8 as i32
+                            * if sgb & (1 << j) != 0 { -1 } else { 1 };
+                        let w2 = ((g2 >> (8 * j)) & 0xFF) as i8 as i32
+                            * if sgb & (1 << (4 + j)) != 0 { -1 } else { 1 };
+                        let p1 = sub * 32 + 8 * ll + j;
+                        let p2 = sub * 32 + 8 * ll + 4 + j;
+                        isum += (w1 as i64) * (y[p1 / 32].qs[p1 % 32] as i64)
+                            + (w2 as i64) * (y[p2 / 32].qs[p2 % 32] as i64);
+                    }
+                }
+                let cpu_v = (yd * db * isum as f32) as f64;
+                let g4 = ctx.gemv_iq3s_sub4(xq_d as *const u8, w_d as *const u8, n_in, sub).unwrap_or([f64::NAN; 8]);
+                if cpu_v.to_bits() != g4[0].to_bits() {
+                    subbad += 1;
+                    println!("  sub {sub}: gpu={:.9e} cpu={:.9e} (isum c={isum} g={} yd_g={:.9e} yd_c={:.9e} yddb_g={:.9e} yddb_c={:.9e} fin_g={:.9e})", g4[0], cpu_v, g4[1] as i64, g4[4], yd, g4[5], yd * db, g4[6]);
+                }
+            }
+            println!("  sub 불일치 {subbad}/{}", (n_in / 32).min(16));
+        }
+    }
+    let mut mism = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
     for o in 0..n_out {
         let row = &w.data[o * rb..];
         let c = match w.ty {
@@ -2235,6 +2310,7 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
             llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y),
             llm170_gguf::GgmlType::Iq4Nl => llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y),
             llm170_gguf::GgmlType::Q3K => llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Iq3S => llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &y),
             _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
         };
         if c.to_bits() != g[o].to_bits() {
@@ -2311,9 +2387,37 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
                     Some(vec![1.0f32; ctx_n])
                 }
             } else if k.ends_with("conv_w") {
-                eng.model.f32_vec(k).ok().map(|v| v)
+                eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()
             } else {
-                eng.model.f32_vec(&format!("{k}.weight")).ok()
+                let il = k.split('.').nth(1).unwrap_or("0").to_string();
+                let (tn, tiled) = if k.ends_with("dt_bias") {
+                    (format!("blk.{il}.ssm_dt.bias"), 1)
+                } else if k.ends_with("ssm_a") {
+                    (k.clone(), 1)
+                } else if k.ends_with("ssm_norm") {
+                    // frame35: [d_state] 전헤드 공유 → dt_rank 타일
+                    (format!("blk.{il}.ssm_norm.weight"), hp.dt_rank)
+                } else if k.ends_with("attn_norm") {
+                    (format!("blk.{il}.attn_norm.weight"), 1)
+                } else if k.ends_with("post_norm") {
+                    (format!("blk.{il}.post_attention_norm.weight"), 1)
+                } else if k == "output_norm" {
+                    ("output_norm.weight".to_string(), 1)
+                } else if k.ends_with("attn_q_norm") {
+                    // CPU 값 경로 zip(w): [hd] 전 헤드 공유 → n_head 타일
+                    (format!("blk.{il}.attn_q_norm.weight"), hp.n_head)
+                } else if k.ends_with("attn_k_norm") {
+                    (format!("blk.{il}.attn_k_norm.weight"), hp.n_kv)
+                } else {
+                    (format!("{k}.weight"), 1)
+                };
+                eng.model.f32_vec(&tn).ok().map(|v| {
+                    if tiled > 1 && (v.len() == hp.d_state || v.len() == hp.head_dim) {
+                        v.iter().copied().cycle().take(v.len() * tiled).collect()
+                    } else {
+                        v
+                    }
+                })
             };
             v.map(|v| (k.clone(), v))
         })
