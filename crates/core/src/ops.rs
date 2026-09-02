@@ -5,20 +5,35 @@
 //! - rope: 인접 페어 (2i, 2i+1), θ_p = base^(−p/n_pairs). IMROPE의 텍스트 전용 퇴화형
 //!   (모든 위치 성분이 동일하면 표준 RoPE와 동일 — ggml mrope_cache_init 참조).
 
-pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+/// 제곱합 표준 순서 (2026-09-02, P0): 32세그먼트 병렬 친화적 구조 —
+/// 각 세그먼트 f64 순차 누산 후 세그먼트 합을 순차 결합.
+/// GPU rms_rows_part/finish 커널과 동일 순서 → 병렬화해도 비트 일치.
+pub fn sq_sum(x: &[f32]) -> f64 {
+    const SEG: usize = 32;
+    let n = x.len();
+    let chunk = n.div_ceil(SEG);
     let mut sum = 0.0f64;
-    for &v in x {
-        sum += (v as f64) * (v as f64);
+    for u in 0..SEG {
+        let lo = u * chunk;
+        if lo >= n { break; }
+        let hi = (lo + chunk).min(n);
+        let mut part = 0.0f64;
+        for &v in &x[lo..hi] {
+            part += (v as f64) * (v as f64);
+        }
+        sum += part;
     }
+    sum
+}
+
+pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let sum = sq_sum(x);
     let scale = 1.0 / ((sum / x.len() as f64 + eps as f64).sqrt() as f32);
     x.iter().zip(w).map(|(&v, &g)| v * scale * g).collect()
 }
 
 pub fn l2_norm(x: &[f32], eps: f32) -> Vec<f32> {
-    let mut sum = 0.0f64;
-    for &v in x {
-        sum += (v as f64) * (v as f64);
-    }
+    let sum = sq_sum(x);
     let scale = 1.0 / (sum.sqrt() as f32).max(eps);
     x.iter().map(|&v| v * scale).collect()
 }

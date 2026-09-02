@@ -1206,19 +1206,32 @@ impl<R: Runtime> GpuMatmul<R> {
             let wg = up(&w_in);
             let og = self.acquire_buf(rows * nn * 4)?;
             let pg = up(&[eps]);
+            let p64 = self.acquire_buf(rows * 32 * 8)?;
             unsafe {
-                ew::rms_rows::launch_unchecked(
+                ew::rms_rows_part::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(rows as u32, 1, 1),
+                    CubeDim::new_1d(32),
+                    TensorArg::from_raw_parts(xg.clone(), [1].into(), [rows * nn].into()),
+                    TensorArg::from_raw_parts(p64.clone(), [1].into(), [rows * 32].into()),
+                    nn,
+                    32,
+                );
+                ew::rms_rows_finish::launch_unchecked(
                     &self.client,
                     CubeCount::Static(rows as u32, 1, 1),
                     CubeDim::new_1d(32),
                     TensorArg::from_raw_parts(xg.clone(), [1].into(), [rows * nn].into()),
                     TensorArg::from_raw_parts(wg.clone(), [1].into(), [w_reps * nn].into()),
+                    TensorArg::from_raw_parts(p64.clone(), [1].into(), [rows * 32].into()),
                     TensorArg::from_raw_parts(og.clone(), [1].into(), [rows * nn].into()),
                     TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
                     nn,
                     w_reps,
+                    32,
                 );
             }
+            trash.push((p64, rows * 32 * 8));
             let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
             let gv: Vec<f32> = bytemuck::cast_slice(&raw).to_vec();
             trash.push((og, rows * nn * 4));
@@ -1995,21 +2008,38 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
                 let oh = one(*out)?;
                 let rows = self.frame_get(*x)?.1 / n;
                 let pg = aux(&[*eps])?;
-                // SAFETY: 큐브당 1행, 유닛 0만 실행.
+                // 2-커널 세그먼트 구조 (2026-09-02 P0): 32유닛 병렬 부분합
+                // (f64) → 순차 결합. 단일 유닛 순차 체인이 447µs/행이던
+                // 근원 해소 — CPU ops.rs sq_sum과 동일 순서(비트 계약).
+                const SEG: usize = 32;
+                let p64 = self.acquire_buf(rows * SEG * 8)?;
+                let p64b = p64.clone();
+                // SAFETY: part는 유닛별 세그먼트(경계 가드), finish는 유닛 0만.
                 unsafe {
-                    ew::rms_rows::launch_unchecked(
+                    ew::rms_rows_part::launch_unchecked(
                         &self.client,
                         CubeCount::Static(rows as u32, 1, 1),
-                        CubeDim::new_1d(32),
+                        CubeDim::new_1d(SEG as u32),
+                        TensorArg::from_raw_parts(xh.clone(), [1].into(), [rows * n].into()),
+                        TensorArg::from_raw_parts(p64.clone(), [1].into(), [rows * SEG].into()),
+                        *n,
+                        SEG,
+                    );
+                    ew::rms_rows_finish::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(SEG as u32),
                         TensorArg::from_raw_parts(xh, [1].into(), [rows * n].into()),
                         TensorArg::from_raw_parts(wh, [1].into(), [w_reps * n].into()),
+                        TensorArg::from_raw_parts(p64, [1].into(), [rows * SEG].into()),
                         TensorArg::from_raw_parts(oh, [1].into(), [rows * n].into()),
                         TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
                         *n,
                         *w_reps,
+                        SEG,
                     );
                 }
-                self.release_bufs(&[(pg, 4)]);
+                self.release_bufs(&[(pg, 4), (p64b, rows * SEG * 8)]);
             }
             FrameOp::NormGated { o, z, w, out, eps, d, n_h } => {
                 let ohh = one(*o)?;

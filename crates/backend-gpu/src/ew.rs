@@ -61,55 +61,76 @@ pub fn ew_silu_mul(g: &Tensor<f32>, u: &Tensor<f32>, out: &mut Tensor<f32>, n: u
 /// CPU ops::rms_norm 순서: f64 순차 누산 → mean+eps → sqrt(f64) → f32 cast →
 /// 1/x → (v·scale)·γ.
 #[cube(launch_unchecked)]
-pub fn rms_rows(
+pub fn rms_rows_part(
+    x: &Tensor<f32>,
+    part: &mut Tensor<f64>,
+    n: usize,
+    #[comptime] seg: usize,
+) {
+    // 32유닛 세그먼트 합 — 유닛 u가 [u·chunk, (u+1)·chunk) f64 순차 누산.
+    // CPU ops.rs sq_sum과 동일 순서 (비트 계약, 2026-09-02 P0).
+    let row = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u >= seg {
+        terminate!();
+    }
+    let chunk = n.div_ceil(seg);
+    let lo = u * chunk;
+    if lo >= n {
+        part[row * seg + u] = 0.0;
+        terminate!();
+    }
+    let hi = (lo + chunk).min(n);
+    let xb = row * n;
+    let mut acc = 0.0f64;
+    let mut i = lo;
+    while i < hi {
+        let d = f64::cast_from(x[xb + i]);
+        acc += d * d;
+        i += 1;
+    }
+    part[row * seg + u] = acc;
+}
+
+/// rms 마무리: 32 세그먼트 f64 부분합을 순차 결합 → 스케일 적용.
+/// 유닛 0만 실행 — 결합 체인 32항(짧음) + 스케일 루프는 반복 독립.
+#[cube(launch_unchecked)]
+pub fn rms_rows_finish(
     x: &Tensor<f32>,
     w: &Tensor<f32>,
+    part: &Tensor<f64>,
     out: &mut Tensor<f32>,
     params: &Tensor<f32>, // [eps]
     n: usize,
     w_reps: usize,
+    #[comptime] seg: usize,
 ) {
     let row = CUBE_POS_X as usize;
     let u = UNIT_POS_X as usize;
     if u != 0 {
         terminate!();
     }
-    let xb = row * n;
-    let wb = (row % w_reps) * n;
     let eps = f64::cast_from(params[0]);
-    // 8-선발행: 로드 독립 발행으로 지연 은닉 — 누산은 i 오름차순(비트 불변).
-    // 단일 유닛 순차 체인이 460µs/행이던 근원 (2026-09-02 frame35 rocprof).
     let mut sum = 0.0f64;
-    let mut i0 = 0usize;
-    while i0 + 8 <= n {
-        let d0 = f64::cast_from(x[xb + i0]);
-        let d1 = f64::cast_from(x[xb + i0 + 1]);
-        let d2 = f64::cast_from(x[xb + i0 + 2]);
-        let d3 = f64::cast_from(x[xb + i0 + 3]);
-        let d4 = f64::cast_from(x[xb + i0 + 4]);
-        let d5 = f64::cast_from(x[xb + i0 + 5]);
-        let d6 = f64::cast_from(x[xb + i0 + 6]);
-        let d7 = f64::cast_from(x[xb + i0 + 7]);
-        sum += d0 * d0;
-        sum += d1 * d1;
-        sum += d2 * d2;
-        sum += d3 * d3;
-        sum += d4 * d4;
-        sum += d5 * d5;
-        sum += d6 * d6;
-        sum += d7 * d7;
-        i0 += 8;
-    }
-    while i0 < n {
-        let d = f64::cast_from(x[xb + i0]);
-        sum += d * d;
-        i0 += 1;
+    // 세그먼트 순차 결합 — CPU sq_sum과 동일 순서. 세그먼트 경계가 n을
+    // 넘으면 CPU가 break한 지점과 같이 0 기여(로드하지 않고 건너뜀).
+    let chunk = n.div_ceil(seg);
+    let mut u2 = 0usize;
+    while u2 < seg {
+        if u2 * chunk < n {
+            sum += part[row * seg + u2];
+        }
+        u2 += 1;
     }
     let len = f64::cast_from(n as u32);
     let scale32 = f32::cast_from((sum / len + eps).sqrt());
     let inv = 1.0f32 / scale32;
-    for i in 0..n {
+    let xb = row * n;
+    let wb = (row % w_reps) * n;
+    let mut i = 0usize;
+    while i < n {
         out[xb + i] = x[xb + i] * inv * w[wb + i];
+        i += 1;
     }
 }
 
