@@ -299,6 +299,68 @@ impl RawCtx {
         Ok(res)
     }
 
+    /// W4A8 GEMV — reduce 결과를 상주 out에 직접 기록 (왕복 제거).
+    /// 수치는 gemv_q8과 동일열 (동일 커널·reduce).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_out(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
+        let part = self.scratch(n_out * 64 * 8)?;
+        let gx = n_out.min(65535) as u32;
+        let kern = match ty {
+            23 => "gemm_xs",
+            13 => "gemm_q5k",
+            8 => "gemm_q8_0",
+            12 => "gemm_q4k",
+            14 => "gemm_q6k",
+            20 => "gemm_nl",
+            11 => "gemm_q3k",
+            21 => "gemm_iq3s",
+            _ => return Err(format!("미지원 타입 {ty}")),
+        };
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w_p = w as *mut std::ffi::c_void;
+        let mut part_p = part as *mut std::ffi::c_void;
+        let mut kt_p = ktab2 as *mut std::ffi::c_void;
+        let mut n_in_a = n_in as i32;
+        let mut n_out_a = n_out as i32;
+        let mut args_v: Vec<*mut std::ffi::c_void> = match ty {
+            23 | 20 => vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut kt_p as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+            ],
+            _ => vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+            ],
+        };
+        self.launch(kern, gx, 1, 64, &mut args_v)?;
+        let mut part_p2 = part as *mut std::ffi::c_void;
+        let mut out_p = out as *mut std::ffi::c_void;
+        let mut n_out_b = n_out as i32;
+        let mut rargs = vec![
+            &mut part_p2 as *mut _ as *mut std::ffi::c_void,
+            &mut out_p as *mut _ as *mut std::ffi::c_void,
+            &mut n_out_b as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.launch("reduce64", n_out.div_ceil(64) as u32, 1, 64, &mut rargs)?;
+        Ok(())
+    }
+
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
     pub fn fill_f32(&self, dst: *mut u8, n: usize, v: f32) -> Result<(), String> {
         let vs = vec![v; n];

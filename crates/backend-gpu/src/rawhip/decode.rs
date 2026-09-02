@@ -191,8 +191,7 @@ impl DecodeState {
     /// GEMV를 상주 out에 직접 기록 (gemv_q8의 내부 out을 복사 없이 쓰기 위해
     /// out 포인터를 받는 변형이 필요 — 현재는 gemv 후 d2h→h2d. 최적화 후술.)
     fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
-        let g = self.ctx.gemv_q8(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out)?;
-        self.ctx.h2d(out, bytemuck::cast_slice(&g))
+        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out)
     }
     fn ew_l(&self, name: &str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
         self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
