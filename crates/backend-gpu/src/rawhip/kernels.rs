@@ -158,6 +158,10 @@ extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
 // iq4_xs (ty16)
 extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
                                    double* part, const unsigned* ktab2, float* out, int n_in, int n_out, int xq_w) {
+    __shared__ unsigned kt_s[256];
+    for (int i = threadIdx.x; i < 256; i += 64) kt_s[i] = ktab2[i];
+    __syncthreads();
+
     int o = blockIdx.y + blockIdx.z * gridDim.y;  // 토큰=x축 — L2 행 재사용
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -197,10 +201,10 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
             unsigned lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
             #pragma unroll
             for (int b = 3; b >= 0; b--) {
-                unsigned t0 = ktab2[(qv0 >> (8 * b)) & 0xFFu];
+                unsigned t0 = kt_s[(qv0 >> (8 * b)) & 0xFFu];
                 lo0 = (lo0 << 8) | (t0 & 0xFFu);
                 hi0 = (hi0 << 8) | (t0 >> 8);
-                unsigned t1 = ktab2[(qv1 >> (8 * b)) & 0xFFu];
+                unsigned t1 = kt_s[(qv1 >> (8 * b)) & 0xFFu];
                 lo1 = (lo1 << 8) | (t1 & 0xFFu);
                 hi1 = (hi1 << 8) | (t1 >> 8);
             }
@@ -234,7 +238,7 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
             unsigned lo = 0, hi = 0;
             #pragma unroll
             for (int b2 = 3; b2 >= 0; b2--) {
-                unsigned t = ktab2[(qv >> (8 * b2)) & 0xFFu];
+                unsigned t = kt_s[(qv >> (8 * b2)) & 0xFFu];
                 lo = (lo << 8) | (t & 0xFFu);
                 hi = (hi << 8) | (t >> 8);
             }
@@ -643,6 +647,10 @@ extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
 extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
                                       float* out, const unsigned* ktab2, int n_in, int n_out,
                                       int xq_w, int t) {
+    __shared__ unsigned kt_s[256];
+    for (int i = threadIdx.x; i < 256; i += 64) kt_s[i] = ktab2[i];
+    __syncthreads();
+
     int o = blockIdx.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -673,7 +681,7 @@ extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
             unsigned lov = 0, hiv = 0;
             #pragma unroll
             for (int b2 = 3; b2 >= 0; b2--) {
-                unsigned tt2 = ktab2[(qv >> (8 * b2)) & 0xFFu];
+                unsigned tt2 = kt_s[(qv >> (8 * b2)) & 0xFFu];
                 lov = (lov << 8) | (tt2 & 0xFFu);
                 hiv = (hiv << 8) | (tt2 >> 8);
             }
@@ -856,6 +864,10 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
 // iq4_nl (ty20) — ktab2 룩업, 블록 32원소
 extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
                                    double* part, const unsigned* ktab2, float* out, int n_in, int n_out, int xq_w) {
+    __shared__ unsigned kt_s[256];
+    for (int i = threadIdx.x; i < 256; i += 64) kt_s[i] = ktab2[i];
+    __syncthreads();
+
     int o = blockIdx.y + blockIdx.z * gridDim.y;  // 토큰=x축 — L2 행 재사용
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -884,7 +896,7 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
             unsigned lo = 0, hi = 0;
             #pragma unroll
             for (int b = 3; b >= 0; b--) {
-                unsigned t = ktab2[(qvw >> (8 * b)) & 0xFFu];
+                unsigned t = kt_s[(qvw >> (8 * b)) & 0xFFu];
                 lo = (lo << 8) | (t & 0xFFu);
                 hi = (hi << 8) | (t >> 8);
             }
