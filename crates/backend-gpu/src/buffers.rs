@@ -114,6 +114,14 @@ impl WeightStore {
         {
             return v << 30;
         }
+        // 프레임(활성 상주 디코드)은 전문가 스택 상주가 성립 조건 —
+        // 큰 배치 영역(≥64GiB ≈ HIP carve-out)에서는 95%까지 상향.
+        // 작은 영역(Vulkan GTT 등)은 기존 40% 유지: 스택이 못 들어가면
+        // decode1이 value 경로로 폴백한다 (2026-09-02 기본 ON 전환).
+        let frame_on = std::env::var("LLM170_FRAME").is_ok_and(|v| v != "0");
+        if frame_on && mem_total >= 64 << 30 {
+            return ((mem_total / 20 * 19) >> 30 << 30).max(1 << 30);
+        }
         ((mem_total / 5 * 2) >> 30 << 30).max(1 << 30)
     }
 

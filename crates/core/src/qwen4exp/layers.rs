@@ -62,6 +62,8 @@ pub struct Engine4 {
     pub acc: Option<std::sync::Arc<dyn Accelerator>>,
     /// 프레임(활성화 상주) 상태 — LLM170_FRAME=1 첫 디코드에서 생성.
     pub frame: Option<super::frame::Frame4>,
+    /// 프레임 폴백 확정 — 상주 불가 등 오류 시 value 경로로 영구 전환.
+    frame_broken: bool,
     /// PLE 프리페치 (05-2) — 토큰 t 확정 직후 t+1분 16행×ple_head_dim을
     /// 사이드 스레드에서 mmap 읽기+디양자화. 다음 decode의 ple_block이 소비.
     pub ple_next: Option<std::sync::Arc<std::sync::Mutex<PlePrefetched>>>,
@@ -105,7 +107,7 @@ impl Q4Timings {
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
-        Engine4 { model, seqs, acc: None, frame: None, ple_next: None, ple_consume: None, ple_worker: None }
+        Engine4 { model, seqs, acc: None, frame: None, frame_broken: false, ple_next: None, ple_consume: None, ple_worker: None }
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
@@ -319,21 +321,54 @@ impl Engine4 {
                 }
             }
         }
+        // 프레임 기본 ON(2026-09-02) — 상주 불가 시 1회 재시도 후 value 경로로
+        // 영구 폴백. 게이트 실패는 mm 오류(호스트 폴백 가중치)로 첫 스텝 초반에
+        // 발생해 상태 오염 전에 중단된다.
         let frame_on = self.acc.is_some()
+            && !self.frame_broken
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0");
-        let logits = if frame_on {
+        let frame_try = if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {
-                self.frame = Some(super::frame::Frame4::new(acc, &self.model, &self.seqs)?);
+                match super::frame::Frame4::new(acc, &self.model, &self.seqs) {
+                    Ok(f) => {
+                        self.frame = Some(f);
+                        Some(())
+                    }
+                    Err(e) => {
+                        self.frame_broken = true;
+                        eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                        None
+                    }
+                }
+            } else {
+                Some(())
             }
+        } else {
+            None
+        };
+        let logits = if let (true, Some(())) = (frame_on, frame_try.as_ref().filter(|_| self.frame.is_some()).map(|_| ())) {
+            let acc = self.acc.as_deref().unwrap();
             let f = self.frame.as_mut().unwrap();
-            if f.dirty[seq] {
-                f.sync_states(acc, seq, &self.seqs[seq])?;
+            let r = (|| {
+                if f.dirty[seq] {
+                    f.sync_states(acc, seq, &self.seqs[seq])?;
+                }
+                let ctx = Ctx { model: &self.model, acc: Some(acc) };
+                super::frame::decode_frame(
+                    acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
+                )
+            })();
+            match r {
+                Ok(l) => l,
+                Err(e) => {
+                    self.frame = None;
+                    self.frame_broken = true;
+                    eprintln!("# frame: 디코드 실패 — value 경로 폴백 ({e})");
+                    let mut tm = init_timings();
+                    self.forward_timed(seq, &[token], tm.as_mut())?
+                }
             }
-            let ctx = Ctx { model: &self.model, acc: Some(acc) };
-            super::frame::decode_frame(
-                acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
-            )?
         } else {
             let mut tm = init_timings();
             let l = self.forward_timed(seq, &[token], tm.as_mut())?;

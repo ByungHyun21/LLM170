@@ -67,6 +67,13 @@ fn main() -> ExitCode {
     if std::env::var_os("LLM170_NO_OOM_ADJ").is_none() {
         let _ = std::fs::write("/proc/self/oom_score_adj", b"1000");
     }
+    // 프레임(활성 상주 디코드) 기본 ON — 게이트는 qwen4exp layers에 있어
+    // qwen35·CPU는 무영향. 상주 불가(작은 GTT 등)면 decode1이 value 경로로
+    // 자동 폴백. LLM170_FRAME=0으로 명시적 해제.
+    if std::env::var_os("LLM170_FRAME").is_none() {
+        // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
+        unsafe { std::env::set_var("LLM170_FRAME", "1") };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
@@ -133,7 +140,12 @@ fn main() -> ExitCode {
 /// --mode 파싱·적용 — env 기본값으로 반영 (기존 env 관례의 단일 소스 유지).
 /// LLM170_W_CAP_GB·LLM170_Q4_CHUNK가 이미 있으면 사용자 명시로 존중.
 fn apply_mode(m: llm170_core::mode::Mode) {
-    if std::env::var_os("LLM170_W_CAP_GB").is_none() {
+    // 프레임 기본 ON(2026-09-02): 전문가 스택 상주(~88GiB)가 성립 조건이라
+    // 모드 프리셋 W_CAP(72GiB)를 세우면 프레임이 원천 불능이 된다. 프레임이
+    // 켜져 있으면 프리셋을 생략해 WeightStore가 실측 총량의 95%로 유도하게
+    // 한다(작은 기기는 상주 실패 → value 폴백). 사용자 명시는 존중.
+    let frame_on = std::env::var("LLM170_FRAME").is_ok_and(|v| v != "0");
+    if std::env::var_os("LLM170_W_CAP_GB").is_none() && !frame_on {
         // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
         unsafe { std::env::set_var("LLM170_W_CAP_GB", m.w_cap_gb().to_string()) };
     }

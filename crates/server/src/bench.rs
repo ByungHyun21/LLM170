@@ -117,7 +117,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
                 let _ = llm170_core::model::greedy(&l);
             }
-            let frame_on = std::env::var_os("LLM170_FRAME").is_some();
+            let frame_on = std::env::var("LLM170_FRAME").is_ok_and(|v| v != "0");
             for r in 0..reps {
                 eng.reset_states();
                 let t0 = Instant::now();
