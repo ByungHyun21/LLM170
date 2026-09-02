@@ -500,10 +500,10 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];    // [k청크 내 sb][행][워드] — 언팩 완료
     __shared__ float dsc[8][64][2];       // d·sc, dm·m
-    __shared__ unsigned ytile[16][8][8];  // [토큰][sb][워드]
-    __shared__ float ydt[16][8];          // [토큰][sb] yd
-    __shared__ int qst[16][8];            // [토큰][sb] qsum16 합
-    __shared__ float psum[4][64][16];     // [파편][행][토큰] f32 부분합
+    __shared__ unsigned ytile[32][8][8];  // [토큰][sb][워드]
+    __shared__ float ydt[32][8];          // [토큰][sb] yd
+    __shared__ int qst[32][8];            // [토큰][sb] qsum16 합
+    __shared__ float psum[4][64][32];     // [파편][행][토큰] f32 부분합
 
     int i = blockIdx.x * 64;              // 행 타일 기저
     int tid = threadIdx.x;                // 0..255
@@ -518,7 +518,7 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
     for (int a = 0; a < 4; a++) {
         if (row < nrow)
             #pragma unroll
-            for (int j = 0; j < 16; j++) psum[a][row][j] = 0.0f;
+            for (int j = 0; j < 32; j++) psum[a][row][j] = 0.0f;
     }
     __syncthreads();
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
@@ -562,11 +562,11 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
                 }
             }
         }
-        // y 스테이징: 16토큰×8sb = 128유닛 × (8워드+d+q) — 256스레드 1패스
+        // y 스테이징: 32토큰×8sb = 256유닛 — tid 1패스 정확 커버
         {
-            int u = tid;                          // 0..255 (128 유닛×2부)
-            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
-                int ti = u >> 3;                  // 토큰
+            int u = tid;                          // 0..255 = 32토큰×8sb
+            {
+                int ti = u >> 3;                  // 0..31
                 int sbl = u & 7;                  // sb
                 int sb = k0 + sbl;
                 if (ti < t && sb < n_sub) {
@@ -626,10 +626,10 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];
     __shared__ float dsc[8][64][2];
-    __shared__ unsigned ytile[16][8][8];
-    __shared__ float ydt[16][8];
-    __shared__ int qst[16][8];
-    __shared__ float psum[4][64][16];
+    __shared__ unsigned ytile[32][8][8];
+    __shared__ float ydt[32][8];
+    __shared__ int qst[32][8];
+    __shared__ float psum[4][64][32];
     int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
@@ -641,7 +641,7 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
     int qsb = (n_in >> 2) + (n_in >> 5);
     if (row < nrow)
         #pragma unroll
-        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
     __syncthreads();
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
@@ -678,8 +678,8 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
         }
         {
             int u = tid;
-            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
-                int ti = u >> 3;
+            {
+                int ti = u >> 3;   // 0..31
                 int sbl = u & 7;
                 int sb = k0 + sbl;
                 if (ti < t && sb < n_sub) {
@@ -810,10 +810,10 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[16][64][4];
     __shared__ float dsc[16][64];          // d·sc 사전곱
-    __shared__ unsigned ytile[16][16][4];  // [토큰][그룹][워드]
-    __shared__ float ydt[16][16];
-    __shared__ int qst[16][16];
-    __shared__ float psum[4][64][16];
+    __shared__ unsigned ytile[32][16][4];  // [토큰][그룹][워드]
+    __shared__ float ydt[32][16];
+    __shared__ int qst[32][16];
+    __shared__ float psum[4][64][32];
     int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
@@ -825,7 +825,7 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     int qsb = (n_in >> 2) + (n_in >> 5);
     if (row < nrow)
         #pragma unroll
-        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
     __syncthreads();
     for (int k0 = 0; k0 < n_g; k0 += 16) {
         for (int pass = 0; pass < 2; pass++) {
@@ -881,18 +881,20 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
             }
         }
         {
-            // y: 16토큰×16그룹 = 256유닛 — 정확히 1패스 (tid 0..255)
-            int u = tid;
-            int ti = u >> 4;
-            int gl = u & 15;
-            int g = k0 + gl;
-            if (ti < t && gl < 16 && g < n_g) {
-                const unsigned* xt = xq + ti * xq_w;
-                int xw = (g << 4) >> 2;
-                #pragma unroll
-                for (int kk = 0; kk < 4; kk++) ytile[ti][gl][kk] = xt[xw + kk];
-                ydt[ti][gl] = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
-                qst[ti][gl] = (int)xt[qsb + g];  // q16[g] — 16그룹 인덱스
+            // y: 32토큰×16그룹 = 512유닛 — 2패스×256
+            for (int pass = 0; pass < 2; pass++) {
+                int u = pass * 256 + tid;
+                int ti = u >> 4;
+                int gl = u & 15;
+                int g = k0 + gl;
+                if (ti < t && g < n_g) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (g << 4) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 4; kk++) ytile[ti][gl][kk] = xt[xw + kk];
+                    ydt[ti][gl] = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
+                    qst[ti][gl] = (int)xt[qsb + g];  // q16[g] — 16그룹 인덱스
+                }
             }
         }
         __syncthreads();
@@ -1008,9 +1010,9 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
                                       int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];
     __shared__ float dsc[8][64];
-    __shared__ unsigned ytile[16][8][8];
-    __shared__ float ydt[16][8];
-    __shared__ float psum[4][64][16];
+    __shared__ unsigned ytile[32][8][8];
+    __shared__ float ydt[32][8];
+    __shared__ float psum[4][64][32];
     __shared__ unsigned kt_s[256];
     for (int a = threadIdx.x; a < 256; a += 256) kt_s[a] = ktab2[a];
     int i = blockIdx.x * 64;
@@ -1023,7 +1025,7 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
     int blocks = n_in >> 8;
     if (row < nrow)
         #pragma unroll
-        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
     __syncthreads();
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
@@ -1059,8 +1061,8 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
         }
         {
             int u = tid;
-            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
-                int ti = u >> 3;
+            {
+                int ti = u >> 3;   // 0..31
                 int sbl = u & 7;
                 int sb = k0 + sbl;
                 if (ti < t && sb < n_sub) {

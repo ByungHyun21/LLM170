@@ -664,8 +664,8 @@ impl Engine {
                     );
                     cache.push(row);
                 }
-                // 청크 ≤ TT(16): 타일 커널 accs 슬롯 수 제약 (비트계약)
-                for ch in cache.chunks(16) {
+                // 청크 ≤ 32: MMQ 공유 psum 확장 (shared 60KB 이내)
+                for ch in cache.chunks(32) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?;
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
