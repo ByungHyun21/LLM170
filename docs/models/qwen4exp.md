@@ -1,7 +1,7 @@
 # qwen4exp — Qwen3.8-Flash-Next (125B-A6B) Implementation Spec
 
-MoE hybrid. Original detail:
-[source/research/2026-08-30-qwen35-qwen4exp-arch.md](../source/research/2026-08-30-qwen35-qwen4exp-arch.md) §2.
+MoE hybrid. Architectural detail was captured during development in local
+research notes (`source/research/`, untracked).
 Reference implementation (read-only during development): the upstream
 `qwen4exp` runtime sources.
 

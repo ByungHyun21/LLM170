@@ -119,7 +119,7 @@ GEMM (Q4_K/Q5_K/Q6_K/Q3_K/Q8_0/IQ4_XS/IQ4_NL/IQ3_S — implemented in
 token-block batched prefill), `get_rows` (PLE 20M-row table, offloaded).
 PLE hashing (host u64) ports directly to CPU Rust.
 The rest are standard element-wise ops (mul/silu/rms_norm/softmax/...).
-Details: [source/research §3](../source/research/2026-08-30-qwen35-qwen4exp-arch.md).
+Details live in local research notes (`source/research/`, untracked).
 
 ## Memory / Scheduler Design
 

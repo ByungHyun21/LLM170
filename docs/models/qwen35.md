@@ -1,7 +1,7 @@
 # qwen35 — Qwen3.8-27B Implementation Spec
 
-Dense hybrid. Full detail with line references:
-[source/research/2026-08-30-qwen35-qwen4exp-arch.md](../source/research/2026-08-30-qwen35-qwen4exp-arch.md) §1.
+Dense hybrid. Architectural detail was captured during development in local
+research notes (`source/research/`, untracked) with source line references.
 Ground truth: the upstream `config.json` and `llama.cpp/src/models/qwen35.cpp`
 (referenced read-only during development).
 
