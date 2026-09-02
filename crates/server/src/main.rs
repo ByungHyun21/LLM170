@@ -2129,8 +2129,42 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
     };
-    // CPU 양자화 + 패킹 (GPU quant 검증은 다음 단계)
     let y = llm170_core::quant::quantize_row_q8_ref(&x);
+    // GPU 양자화 비트 미러 검증 (quant_q8 커널)
+    let mut xq_gpu: Option<*mut u8> = None;
+    let mut xd_gpu: Option<*mut u8> = None;
+    {
+        let mut inner = || -> Result<(), String> {
+            let xd_buf = ctx.alloc(n_in * 4)?;
+            let xq_buf = ctx.alloc((n_in / 4 + n_in / 32) * 4)?; // 워드 + d 비트
+            xq_gpu = Some(xq_buf);
+            ctx.h2d(xd_buf, bytemuck::cast_slice(&x))?;
+            ctx.quant_q8(xd_buf as *const u8, xq_buf, n_in)?;
+            let mut gq = vec![0u8; (n_in / 4 + n_in / 32) * 4];
+            ctx.d2h(&mut gq, xq_buf)?;
+            let gw: Vec<u32> = bytemuck::cast_slice(&gq[..n_in / 4 * 4]).to_vec();
+            let mut qm = 0usize;
+            let cpu_w: Vec<u32> = {
+                let mut v = Vec::new();
+                for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
+                    let mut word = 0u32;
+                    for (i, b) in c.iter().enumerate() { word |= (**b as u8 as u32) << (8 * i); }
+                    v.push(word);
+                }
+                v
+            };
+            for (i, (a, b)) in gw.iter().zip(cpu_w.iter()).enumerate() {
+                if a != b { qm += 1; if qm == 1 { println!("  ✗ quant 워드[{i}] gpu={a:#x} cpu={b:#x}"); } }
+            }
+            let gdbits: Vec<u32> = bytemuck::cast_slice(&gq[n_in / 4 * 4..]).to_vec();
+            for (i, (a, b)) in gdbits.iter().zip(y.iter().map(|b| b.d.to_bits())).enumerate() {
+                if *a != b { qm += 1; if qm <= 3 { println!("  ✗ quant d[{i}] gpu_bits={a:#x} cpu_bits={b:#x}"); } }
+            }
+            if qm == 0 { println!("  ★ quant_q8 원시 ≡ CPU 비트 일치"); }
+            Ok(())
+        };
+        if let Err(e) = inner() { eprintln!("quant 검증: {e}"); }
+    }
     let mut qs_words = Vec::with_capacity(n_in / 4);
     for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
         let mut word = 0u32;
@@ -2148,17 +2182,28 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
             lo | (hi << 8)
         })
         .collect();
-    let xq_d = match ctx.alloc(n_in) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
-    let xd_d = match ctx.alloc(n_in / 32 * 4) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    // GPU quant 사용 시: xq 버퍼 = 워드+d 통합 (gemv가 직접 판독)
+    let xq_d = match xq_gpu {
+        Some(p) => p,
+        None => {
+            // CPU 경로: 워드 + d 비트 통합 패킹
+            let buf = ctx.alloc((n_in / 4 + n_in / 32) * 4).expect("alloc");
+            let mut packed = qs_words.clone();
+            packed.extend(y.iter().map(|b| b.d.to_bits()));
+            ctx.h2d(buf, bytemuck::cast_slice(&packed)).expect("pack upload");
+            buf
+        }
+    };
     let w_d = match ctx.alloc(w.data.len()) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
     let kt_d = match ctx.alloc(1024) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
-    if let Err(e) = ctx.h2d(xq_d, bytemuck::cast_slice(&qs_words)).and_then(|_| ctx.h2d(xd_d, bytemuck::cast_slice(&ds)))
-        .and_then(|_| ctx.h2d(w_d, w.data)).and_then(|_| ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))) {
+    // GPU quant 출력 재사용 시 xq/xd 업로드 생략 (종단 검증 — d가 GPU 생산값)
+    let up = ctx.h2d(w_d, w.data).and_then(|_| ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2)));
+    if let Err(e) = up {
         eprintln!("upload: {e}"); return ExitCode::FAILURE;
     }
     // 워밍 + 측정
     let ty = w.ty as u32;
-    let _ = match ctx.gemv_q8(xq_d as *const u8, xd_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
+    let _ = match ctx.gemv_q8(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
         Ok(v) => v,
         Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
     };
@@ -2166,7 +2211,7 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
     let t0 = std::time::Instant::now();
     let mut g = Vec::new();
     for _ in 0..reps {
-        g = match ctx.gemv_q8(xq_d as *const u8, xd_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
+        g = match ctx.gemv_q8(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
             Ok(v) => v,
             Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
         };

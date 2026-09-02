@@ -122,7 +122,6 @@ impl RawCtx {
     pub fn gemv_q8(
         &self,
         xq: *const u8,
-        xd: *const u8,
         w: *const u8,
         ktab2: *const u8,
         ty: u32,
@@ -143,7 +142,6 @@ impl RawCtx {
             _ => return Err(format!("미지원 타입 {ty}")),
         };
         let mut xq_p = xq as *mut std::ffi::c_void;
-        let mut xd_p = xd as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut part_p = part as *mut std::ffi::c_void;
         let mut kt_p = ktab2 as *mut std::ffi::c_void;
@@ -153,7 +151,6 @@ impl RawCtx {
         let mut args_v: Vec<*mut std::ffi::c_void> = match ty {
             23 | 20 => vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
-                &mut xd_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
                 &mut part_p as *mut _ as *mut std::ffi::c_void,
                 &mut kt_p as *mut _ as *mut std::ffi::c_void,
@@ -162,7 +159,6 @@ impl RawCtx {
             ],
             _ => vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
-                &mut xd_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
                 &mut part_p as *mut _ as *mut std::ffi::c_void,
                 &mut n_in_a as *mut _ as *mut std::ffi::c_void,
@@ -187,17 +183,23 @@ impl RawCtx {
         Ok(res)
     }
 
-    /// 활성 양자화 — quantize_row_q8_ref 비트 미러.
-    pub fn quant_q8(&self, x: *const u8, xq: *mut u8, xd: *mut u8, n: usize) -> Result<(), String> {
+    /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
+    pub fn fill_f32(&self, dst: *mut u8, n: usize, v: f32) -> Result<(), String> {
+        let vs = vec![v; n];
+        self.h2d(dst, bytemuck::cast_slice(&vs))
+    }
+
+    /// 활성 양자화 — quantize_row_q8_ref 비트 미러. 출력은 xq 하나:
+    /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
+    /// 버퍼 크기 (n/4 + n/32)·4 바이트 필요.
+    pub fn quant_q8(&self, x: *const u8, xq: *mut u8, n: usize) -> Result<(), String> {
         let nblk = n / 32;
         let mut x_p = x as *mut std::ffi::c_void;
         let mut xq_p = xq as *mut std::ffi::c_void;
-        let mut xd_p = xd as *mut std::ffi::c_void;
         let mut n_a = n as i32;
         let mut args = vec![
             &mut x_p as *mut _ as *mut std::ffi::c_void,
             &mut xq_p as *mut _ as *mut std::ffi::c_void,
-            &mut xd_p as *mut _ as *mut std::ffi::c_void,
             &mut n_a as *mut _ as *mut std::ffi::c_void,
         ];
         self.launch("quant_q8", nblk.div_ceil(64) as u32, 1, 64, &mut args)

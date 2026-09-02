@@ -26,17 +26,18 @@ DEV unsigned byte(const unsigned* w, int i) {
 }
 
 // 활성 양자화 — rust quantize_row_q8_ref 미러 (round half away 산술 구현)
-extern "C" __global__ void quant_q8(const float* x, unsigned* xq, float* xd, int n) {
+// d는 별도 float 저장이 간헐 유실되는 코드젠 결함(2026-09-03 RCA) 회피차
+// xq 워드 스트림 뒤 영역(xq[nwords + b])에 u32 비트로 편승 — 저장 경로
+// 단일화. GEMV는 xd[sb] = __uint_as_float(xq[nwords + sb])로 읽음.
+extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     int nblk = n >> 5;
     if (b >= nblk) return;
+    int nwords = n >> 2;
     int base = b << 5;
     float amax = 0.0f;
-    #pragma unroll
     for (int i = 0; i < 32; i++) {
-        float v = x[base + i];
-        float a = v < 0.0f ? -v : v;
-        amax = a > amax ? a : amax;
+        amax = fmaxf(amax, fabsf(x[base + i]));
     }
     float d = amax / 127.0f;
     float id = d != 0.0f ? 1.0f / d : 0.0f;
@@ -53,7 +54,7 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, float* xd, int
         }
         xq[b * 8 + wi] = word;
     }
-    xd[b] = d;
+    xq[nwords + b] = __float_as_uint(d); // d 비트 편승 (u32 저장 경로)
 }
 
 // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
@@ -68,7 +69,7 @@ extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
 
 // ─── W4A8 GEMV t=1 — 스트라이드 레인, f64 부분합 ───
 // iq4_xs (ty16)
-extern "C" __global__ void gemm_xs(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
                                    double* part, const unsigned* ktab2, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -111,14 +112,14 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const float* xd, const un
             isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
             isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
         }
-        float yd = xd[sb];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * dl * (float)isum);
     }
     part[o * 64 + l] = acc;
 }
 
 // q5_K (ty13) — 분할 형태(곱 체인 2개), qh 비트, 스케일 scale_min_k4
-extern "C" __global__ void gemm_q5k(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
                                     double* part, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -182,7 +183,7 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const float* xd, const u
             isum += ((int)nib + hi) * y8;
             qsum += y8;
         }
-        float yd = xd[sb];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
     }
@@ -190,7 +191,7 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const float* xd, const u
 }
 
 // q8_0 (ty8)
-extern "C" __global__ void gemm_q8_0(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
                                      double* part, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -219,14 +220,14 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const float* xd, const 
             }
             isum += qv * sext8((yv >> sk) & 0xFFu);
         }
-        float yd = xd[sb];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
     }
     part[o * 64 + l] = acc;
 }
 
 // q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
-extern "C" __global__ void gemm_q4k(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
                                     double* part, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -279,7 +280,7 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const float* xd, const u
             isum += (int)nib * y8;
             qsum += y8;
         }
-        float yd = xd[sb];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
     }
@@ -287,7 +288,7 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const float* xd, const u
 }
 
 // q6_K (ty14) — 16원소 그룹, 가상워드 ql/qh (비정렬 5워드 슬라이딩)
-extern "C" __global__ void gemm_q6k(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
                                     double* part, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -347,14 +348,14 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const float* xd, const u
             int y8 = sext8((yv >> sk) & 0xFFu);
             isum += (((int)nib | (hi2 << 4)) - 32) * y8;
         }
-        float yd = xd[(g >> 1)];
+        float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
         acc += (double)(yd * d * (float)sc * (float)isum);
     }
     part[o * 64 + l] = acc;
 }
 
 // iq4_nl (ty20) — ktab2 룩업, 블록 32원소
-extern "C" __global__ void gemm_nl(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
                                    double* part, const unsigned* ktab2, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -386,14 +387,14 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const float* xd, const un
             isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
             isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
         }
-        float yd = xd[sb];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
     }
     part[o * 64 + l] = acc;
 }
 
 // q3_K (ty11) — 16원소 하프블록, ql/hm byte() 로드(비정렬)
-extern "C" __global__ void gemm_q3k(const unsigned* xq, const float* xd, const unsigned* w,
+extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
                                     double* part, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
@@ -446,7 +447,7 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const float* xd, const u
             int sub = 4 - bit * 4;
             isum += (qv - sub) * sext8((yv >> sk) & 0xFFu);
         }
-        float yd = xd[h >> 1];
+        float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
         acc += (double)(yd * dl * (float)isum);
     }
     part[o * 64 + l] = acc;
@@ -465,3 +466,4 @@ pub const NAMES: &[&str] = &[
     "gemm_nl",
     "gemm_q3k",
 ];
+// ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
