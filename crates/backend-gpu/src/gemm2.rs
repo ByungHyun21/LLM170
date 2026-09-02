@@ -1739,14 +1739,15 @@ pub fn gemm_q8i_b_xs(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
-    if o >= n_out || l >= 64 {
+    if o >= n_out || l >= lanes {
         terminate!();
     }
     let n_sub = n_in / 32;
-    let cnt = (n_sub + 63 - l) >> 6;
+    let cnt = (n_sub + lanes - 1 - l) / lanes;
     let blocks = n_in / 256;
     let row_base = o * blocks * 136;
     let mut acc = Array::<f64>::new(tlen);
@@ -1823,7 +1824,7 @@ pub fn gemm_q8i_b_xs(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }
 
@@ -1835,15 +1836,16 @@ pub fn reduce_parts_f64_batch(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = ABSOLUTE_POS_X as usize + CUBE_POS_Z as usize * gx * 64;
     let t = ABSOLUTE_POS_Y as usize;
     if o >= n_out || t >= tlen {
         terminate!();
     }
-    let base = (t * n_out + o) * 64;
+    let base = (t * n_out + o) * lanes;
     let mut acc = 0.0f64;
-    for l in 0..64 {
+    for l in 0..lanes {
         acc += part[base + l];
     }
     out[t * n_out + o] = acc as f32;
@@ -1861,14 +1863,15 @@ pub fn gemm_q8i_b_q5k(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
-    if o >= n_out || l >= 64 {
+    if o >= n_out || l >= lanes {
         terminate!();
     }
     let n_sub = n_in / 32;
-    let cnt = (n_sub + 63 - l) >> 6;
+    let cnt = (n_sub + lanes - 1 - l) / lanes;
     let blocks = n_in / 256;
     let row_base = o * blocks * 176;
     let mut acc = Array::<f64>::new(tlen);
@@ -1996,7 +1999,7 @@ pub fn gemm_q8i_b_q5k(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }
 
@@ -2011,14 +2014,15 @@ pub fn gemm_q8i_b_q4k(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
-    if o >= n_out || l >= 64 {
+    if o >= n_out || l >= lanes {
         terminate!();
     }
     let n_sub = n_in / 32;
-    let cnt = (n_sub + 63 - l) >> 6;
+    let cnt = (n_sub + lanes - 1 - l) / lanes;
     let blocks = n_in / 256;
     let row_base = o * blocks * 144;
     let mut acc = Array::<f64>::new(tlen);
@@ -2117,7 +2121,7 @@ pub fn gemm_q8i_b_q4k(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }
 
@@ -2132,14 +2136,15 @@ pub fn gemm_q8i_b_q8_0(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
-    if o >= n_out || l >= 64 {
+    if o >= n_out || l >= lanes {
         terminate!();
     }
     let n_sub = n_in / 32;
-    let cnt = (n_sub + 63 - l) >> 6;
+    let cnt = (n_sub + lanes - 1 - l) / lanes;
     let row_base = o * n_sub * 34;
     let mut acc = Array::<f64>::new(tlen);
     #[unroll]
@@ -2187,7 +2192,7 @@ pub fn gemm_q8i_b_q8_0(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }
 
@@ -2202,6 +2207,7 @@ pub fn gemm_q8i_b_q6k(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
@@ -2209,7 +2215,7 @@ pub fn gemm_q8i_b_q6k(
         terminate!();
     }
     let n_g = n_in / 16;
-    let cnt = (n_g + 63 - l) >> 6;
+    let cnt = (n_g + lanes - 1 - l) / lanes;
     let blocks = n_in / 256;
     let row_base = o * blocks * 210;
     let mut acc = Array::<f64>::new(tlen);
@@ -2304,7 +2310,7 @@ pub fn gemm_q8i_b_q6k(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }
 
@@ -2320,14 +2326,15 @@ pub fn gemm_q8i_b_iq4nl(
     n_out: usize,
     gx: usize,
     #[comptime] tlen: usize,
+    #[comptime] lanes: usize,
 ) {
     let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
     let l = UNIT_POS_X as usize;
-    if o >= n_out || l >= 64 {
+    if o >= n_out || l >= lanes {
         terminate!();
     }
     let n_sub = n_in / 32;
-    let cnt = (n_sub + 63 - l) >> 6;
+    let cnt = (n_sub + lanes - 1 - l) / lanes;
     let row_base = o * n_sub * 18;
     let mut acc = Array::<f64>::new(tlen);
     #[unroll]
@@ -2378,6 +2385,6 @@ pub fn gemm_q8i_b_iq4nl(
         }
     }
     for ti in 0..tlen {
-        part[(ti * n_out + o) * 64 + l] = acc[ti];
+        part[(ti * n_out + o) * lanes + l] = acc[ti];
     }
 }

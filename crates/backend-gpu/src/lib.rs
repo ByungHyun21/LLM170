@@ -946,6 +946,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else if w.ty == GgmlType::Q4K {
                         gemm2::gemm_q8i_b_q4k::launch_unchecked(
@@ -960,6 +961,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else if w.ty == GgmlType::Q8_0 {
                         gemm2::gemm_q8i_b_q8_0::launch_unchecked(
@@ -974,6 +976,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else if w.ty == GgmlType::Q6K {
                         gemm2::gemm_q8i_b_q6k::launch_unchecked(
@@ -988,6 +991,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else if w.ty == GgmlType::Iq4Nl {
                         gemm2::gemm_q8i_b_iq4nl::launch_unchecked(
@@ -1003,6 +1007,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else if w.ty == GgmlType::Iq4Xs {
                         gemm2::gemm_q8i_b_xs::launch_unchecked(
@@ -1018,6 +1023,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     } else {
                         gemm2::gemm_q8i_b_q5k::launch_unchecked(
@@ -1032,6 +1038,7 @@ impl<R: Runtime> GpuMatmul<R> {
                             n_out,
                             gx,
                             $tl,
+                            64usize,
                         );
                     }
                 }
@@ -1050,12 +1057,13 @@ impl<R: Runtime> GpuMatmul<R> {
             gemm2::reduce_parts_f64_batch::launch_unchecked(
                 &self.client,
                 CubeCount::Static(gx as u32, t as u32, gz as u32),
-                CubeDim::new_1d(64),
+                CubeDim::new_1d(8),
                 TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
                 n_out,
                 gx,
                 t,
+                64usize,
             );
         }
         let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
@@ -1975,8 +1983,8 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulB");
-        // W4A8 — CPU matmul_batch(전 타입 int)와 동일 비트.
-        // iq4_xs: 배치 커널. 타 나머지: 행루프 t=1 (배치 커널 확장 전 임시).
+        // W4A8 (전 타입) — CPU matmul_batch와 동일 비트 (프리필 정합 우선:
+        // f32 프리필은 CPU 디양자화·GPU q7이 근접일치라 스트림 분기 위험)
         if llm170_core::matmul::w4a8_enabled() && llm170_core::matmul::w4a8_ty(w.ty) {
             let batchable = w.ty != llm170_gguf::GgmlType::Q3K;
             if batchable {
@@ -1993,6 +2001,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             }
             return Ok(());
         }
+
         let t = xs.len();
         let n_in = w.n_in as usize;
         if xs.iter().any(|r| r.len() != n_in) {
@@ -2221,8 +2230,7 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             } else if llm170_core::matmul::w4a8_enabled()
                 && llm170_core::matmul::w4a8_ty(w.ty)
             {
-                let batchable = w.ty != llm170_gguf::GgmlType::Q3K;
-                if batchable {
+                if w.ty != llm170_gguf::GgmlType::Q3K {
                     let g = self.matmul_w4a8_b_gpu(xs, w)?;
                     for (ti, out) in outs[i].iter_mut().enumerate() {
                         let base = ti * w.n_out as usize;
