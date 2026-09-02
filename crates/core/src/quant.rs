@@ -815,3 +815,55 @@ mod w4a8_tests {
         }
     }
 }
+
+/// W4A8 레인 미러(q3_K) — GPU gemm_q8i_q3k와 동일 구조. 16요소 하프블록
+/// (n,si,half)별 c = yd·dl·isum (f32 곱 2), 스트라이드 레인(레인 l:
+/// 하프블록 l, l+64, …) f64 누산 → 레인 순서 합 → f32 1회 캐스트.
+pub fn dot_row_w4a8_q3k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q3k_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_h = (k / 16) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_h + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let h = l + m * 64;
+            let local = h % 16;
+            let (n, si, half) = (local / 8, (local % 8) / 2, local % 2);
+            let wb = &data[(h / 16) * 110..(h / 16) * 110 + 110];
+            let d_all = f16(wb, 108);
+            let (a0, a1, tmp) = (
+                u32::from_le_bytes([wb[96], wb[97], wb[98], wb[99]]),
+                u32::from_le_bytes([wb[100], wb[101], wb[102], wb[103]]),
+                u32::from_le_bytes([wb[104], wb[105], wb[106], wb[107]]),
+            );
+            let (k1, k2) = (0x03030303u32, 0x0f0f0f0fu32);
+            let aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+            let aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+            let aux0 = (a0 & k2) | ((tmp & k1) << 4);
+            let aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+            let ai = n * 8 + si * 2 + half;
+            let aux = [aux0, aux1, aux2, aux3][ai / 4];
+            let scb = (aux >> (8 * (ai % 4))) & 0xFF;
+            let dl = d_all * (scb as i8 as f32 - 32.0);
+            let mut isum = 0i64;
+            for j in 0..16 {
+                let qv = ((wb[32 + n * 32 + half * 16 + j] >> (2 * si)) & 3) as i64;
+                let sub = if wb[half * 16 + j] & (1 << si) != 0 { 0i64 } else { 4i64 };
+                isum += (qv - sub) * y_el(y, h * 16 + j);
+            }
+            let yd = y[h / 2].d;
+            acc += (yd * dl * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}

@@ -1078,3 +1078,167 @@ pub fn reduce_parts_f64(
     }
     out[o] = acc as f32;
 }
+
+/// 활성 f32 → q8 양자화 (블록 32, rust quantize_row_q8_ref 비트 미러):
+/// amax(절댓값 max) → d=amax/127, id=1/d, qs=round_half_away(v·id) 클램프.
+/// round는 as i32 트렁크 산술로 구현 (floor/ceil 내장 미사용 — 코드젠 독립).
+/// 유닛 1개가 블록 1개 순차 스캔 — 결정적.
+#[cube(launch_unchecked)]
+pub fn quant_q8(
+    src: &Tensor<f32>,
+    xq: &mut Tensor<u32>, // [n/8] i8 4개/워드
+    xd: &mut Tensor<f32>, // [n/32] 블록 d
+    n: usize,
+    c127: f32, // 127.0 — 상수 폴딩 회피용 런타임 소스
+) {
+    let b = ABSOLUTE_POS_X as usize;
+    let nblk = n / 32;
+    if b >= nblk {
+        terminate!();
+    }
+    let base = b * 32;
+    let mut amax = 0.0f32;
+    #[unroll]
+    for i in 0..32 {
+        let v = src[base + i];
+        let a = if v < 0.0 { -v } else { v };
+        amax = if a > amax { a } else { amax };
+    }
+    let d = amax / c127;
+    let zero = c127 - c127;
+    let one = c127 / c127;
+    let id = if d != zero { one / d } else { zero };
+    for w_i in 0..8 {
+        let mut word = 0u32;
+        for kk in 0..4 {
+            let x = src[base + w_i * 4 + kk] * id;
+            // round half away: x≥0 → floor(x+0.5), x<0 → ceil(x−0.5)
+            let half = one / (one + one);
+            let r = if x >= zero {
+                let t = x + half;
+                (t as i32) as f32
+            } else {
+                let t = half - x;
+                -((t as i32) as f32)
+            };
+            let hi = c127;
+            let lo = -c127;
+            let c = if r > hi {
+                hi
+            } else if r < lo {
+                lo
+            } else {
+                r
+            };
+            word |= (((c as i32) as u32) & 0xFF) << ((kk * 8) as u32);
+        }
+        xq[b * 8 + w_i] = word;
+    }
+    xd[b] = d;
+}
+
+/// W4A8 정수 디코드 GEMM (q3_K, t=1) — 16요소 하프블록 단위.
+/// 레인 l: 하프블록 h = l, l+64, … (스트라이드 — ql/hm/xq 전부 4정렬
+/// 16바이트 = 워드 4). 스케일 12바이트는 256블록 불변(L1). c = yd·dl·isum
+/// (f32 곱 2) → 레인 f64 누산. CPU dot_row_w4a8_q3k_lane과 동일 연산열.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_q3k(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_h = n_in / 16;
+    let cnt = (n_h + 63 - l) >> 6;
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 110;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let h = l + _m * 64;
+        let local = h - (h >> 4) * 16; // 블록 내 하프 인덱스
+        let n = local >> 3;
+        let si = (local - n * 8) >> 1;
+        let half = local & 1;
+        let wb = row_base + (h >> 4) * 110;
+        // 스케일 12바이트(wb+96..107) — wb%4 ∈ {0,2}: 워드 경계 산술 처리
+        let sw = (wb + 96) >> 2;
+        let off = (wb + 96) & 3;
+        let a0 = if off == 0 {
+            w[sw]
+        } else {
+            (w[sw] >> 16) | (w[sw + 1] << 16)
+        };
+        let a1 = if off == 0 {
+            w[sw + 1]
+        } else {
+            (w[sw + 1] >> 16) | (w[sw + 2] << 16)
+        };
+        let tmp = if off == 0 {
+            w[sw + 2]
+        } else {
+            (w[sw + 2] >> 16) | (w[sw + 3] << 16)
+        };
+        let k1 = 0x03030303u32;
+        let k2 = 0x0f0f0f0fu32;
+        let aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+        let aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+        let aux0 = (a0 & k2) | ((tmp & k1) << 4);
+        let aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+        let ai = n * 8 + si * 2 + half;
+        let aux = if ai < 4 {
+            aux0
+        } else if ai < 8 {
+            aux1
+        } else if ai < 12 {
+            aux2
+        } else {
+            aux3
+        };
+        let scb = (aux >> (((ai - ai / 4 * 4) * 8) as u32)) & 0xFF;
+        let dl = f16_bits(byte(w, wb + 108) | (byte(w, wb + 109) << 8)) * (sext8(scb) as f32 - 32.0);
+        // ql·hm은 홀수 블록(wb%4=2)에서 워드 정렬 아님 — byte() 로드
+        // (L1). xq는 h·16로 항상 정렬 — 워드 4개.
+        let qbase2 = wb + 32 + n * 32 + half * 16;
+        let hbase2 = wb + half * 16;
+        let xw = (h * 16) >> 2;
+        let y0 = xq[xw];
+        let y1 = xq[xw + 1];
+        let y2 = xq[xw + 2];
+        let y3 = xq[xw + 3];
+        let sh2 = (si * 2) as u32;
+        let mut isum = 0i32;
+        for j in 0..16 {
+            // 튜플 분해는 cube 매크로 오컴파일(RCA 2026-09-02, isum 7→2699
+            // 관측) — 요소별 if체인으로 전개.
+            let qb = byte(w, qbase2 + j);
+            let hb = byte(w, hbase2 + j);
+            let yb = if j < 4 {
+                (y0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (y1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (y2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else {
+                (y3 >> (((j - 12) * 8) as u32)) & 0xFF
+            };
+            let qv = ((qb >> sh2) & 3) as i32;
+            let bit = (hb >> (si as u32)) & 1;
+            // ★리터럴 분기 if는 cube 매크로 오컴파일(RCA 2건) — de_elem
+            // 검증 산술로: bit=1→sub 0, bit=0→sub 4.
+            let sub = 4 - ((bit * 4) as i32);
+            isum += (qv - sub) * sext8(yb);
+        }
+        let yd = xd[h >> 1];
+        let c = yd * dl * isum as f32;
+        acc += c as f64;
+    }
+    part[o * 64 + l] = acc;
+}

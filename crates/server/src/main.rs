@@ -674,17 +674,74 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
     let y = llm170_core::quant::quantize_row_q8_ref(&x);
     let blck = w.ty.blck_size() as usize;
     let bsize = w.ty.type_size() as usize;
-    let lane0 = llm170_core::quant::dot_row_w4a8_iq4xs_lane_parts(
-        &w.data[..(n_in / blck) * bsize],
-        n_in as u64,
-        &y,
-    );
+    let is_q3k = w.ty == llm170_gguf::GgmlType::Q3K;
+    let lane0 = if is_q3k {
+        llm170_core::quant::dot_row_w4a8_q3k_lane_parts(
+            &w.data[..(n_in / blck) * bsize],
+            n_in as u64,
+            &y,
+        )
+    } else {
+        llm170_core::quant::dot_row_w4a8_iq4xs_lane_parts(
+            &w.data[..(n_in / blck) * bsize],
+            n_in as u64,
+            &y,
+        )
+    };
     println!("  cpu lane0[0..4] = {:?}", &lane0[..4]);
+    {
+        let row0 = &w.data[..(n_in / blck) * bsize];
+        let old_dot = llm170_core::quant::dot_row_w4a8(w.ty, row0, n_in as u64, &y);
+        println!("  y[0].d={:e} qs[0..8]={:?}", y[0].d, &y[0].qs[..8]);
+        println!("  row0: 기존 dot={old_dot:e} 미러합={:e}", {
+            let mut s = 0.0f64;
+            for l in 0..64 {
+                s += lane0[l];
+            }
+            s as f32
+        });
+    }
+    // GPU 양자화 커널 비트 검증 (rust quantize_row_q8_ref 대비)
+    let (gq, gd) = gpu.quant_q8_gpu(&x).expect("quant_q8_gpu");
+    let mut qm = 0usize;
+    {
+        let mut cpu_words = Vec::with_capacity(n_in / 4);
+        for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
+            let mut word = 0u32;
+            for (i, b) in c.iter().enumerate() {
+                word |= (**b as u8 as u32) << (8 * i);
+            }
+            cpu_words.push(word);
+        }
+        for (i, (a, b)) in gq.iter().zip(cpu_words.iter()).enumerate() {
+            if a != b {
+                qm += 1;
+                if qm == 1 {
+                    println!("  ✗ quant 워드 불일치 [{i}]: gpu={a:#x} cpu={b:#x}");
+                }
+            }
+        }
+        for (i, (a, b)) in gd.iter().zip(y.iter().map(|b| b.d)).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                qm += 1;
+                if qm == 1 {
+                    println!("  ✗ quant d 불일치 [{i}]: gpu={a:e} cpu={b:e}");
+                }
+            }
+        }
+        if qm == 0 {
+            println!("  ★ quant_q8 GPU≡CPU 비트 일치 (워드 {} + d {})", n_in / 4, n_in / 32);
+        }
+    }
     let mut first: Option<(usize, f32, f32)> = None;
     let mut mismatch = 0usize;
     for o in 0..n_out {
         let row = &w.data[o * (n_in / blck) * bsize..];
-        let c = llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y);
+        let c = if is_q3k {
+            llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y)
+        } else {
+            llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y)
+        };
         if c.to_bits() != g[o].to_bits() {
             mismatch += 1;
             if first.is_none() {

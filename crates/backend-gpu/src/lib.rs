@@ -838,6 +838,35 @@ impl<R: Runtime> GpuMatmul<R> {
     }
 
 
+    /// 활성 f32 → q8 양자화 (GPU) — rust quantize_row_q8_ref 비트 미러.
+    /// 반환: (qs 워드 [n/8], 블록 d [n/32]).
+    pub fn quant_q8_gpu(&self, x: &[f32]) -> Result<(Vec<u32>, Vec<f32>), String> {
+        let n = x.len();
+        if n % 32 != 0 {
+            return Err("quant_q8_gpu: n%32 != 0".into());
+        }
+        let xs = self.client.create_from_slice(bytemuck::cast_slice(x));
+        let qg = self.acquire_buf(n / 4)?;
+        let dg = self.acquire_buf(n / 32 * 4)?;
+        // SAFETY: 그리드가 n/32 블록을 덮음, 유닛당 1블록 순차 — 상한 내.
+        unsafe {
+            gemm2::quant_q8::launch_unchecked(
+                &self.client,
+                CubeCount::Static((n / 32).div_ceil(32) as u32, 1, 1),
+                CubeDim::new_1d(32),
+                TensorArg::from_raw_parts(xs, [1].into(), [n].into()),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [n / 4].into()),
+                TensorArg::from_raw_parts(dg.clone(), [1].into(), [n / 32].into()),
+                n,
+                127.0f32,
+            );
+        }
+        let qraw = self.client.read_one(qg.clone()).map_err(|e| e.to_string())?;
+        let draw = self.client.read_one(dg.clone()).map_err(|e| e.to_string())?;
+        self.release_bufs(&[(qg, n / 4), (dg, n / 32 * 4)]);
+        Ok((bytemuck::cast_slice(&qraw).to_vec(), bytemuck::cast_slice(&draw).to_vec()))
+    }
+
     /// W4A8 정수 GEMM (iq4_xs 전용, t=1) — gemm_q8i + reduce_parts_f64.
     /// CPU dot_row_w4a8_iq4xs_lane과 비트 일치. iters>1이면 런치만 반복
     /// (업로드·판독 1회)해 순수 커널 시간 측정을 겸한다. (f64, Vec<f64)> 반환.
@@ -848,8 +877,8 @@ impl<R: Runtime> GpuMatmul<R> {
         iters: usize,
     ) -> Result<(Vec<f32>, std::time::Duration), String> {
         use llm170_core::quant::quantize_row_q8_ref;
-        if w.ty != llm170_gguf::GgmlType::Iq4Xs {
-            return Err("matmul_w4a8_int_gpu: iq4_xs 전용 (프로토타입)".into());
+        if w.ty != llm170_gguf::GgmlType::Iq4Xs && w.ty != llm170_gguf::GgmlType::Q3K {
+            return Err("matmul_w4a8_int_gpu: iq4_xs/q3_K 전용".into());
         }
         let y = quantize_row_q8_ref(x);
         let d = self.dev_weight(w)?;
@@ -873,19 +902,34 @@ impl<R: Runtime> GpuMatmul<R> {
         for _ in 0..iters.max(1) {
             // SAFETY: 그리드 (n_out,1,gz)·시작부 가드 — 상한 내.
             unsafe {
-                gemm2::gemm_q8i::launch_unchecked(
-                    &self.client,
-                    CubeCount::Static(gx as u32, 1, gz as u32),
-                    CubeDim::new_1d(64),
-                    TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
-                    TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
-                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
-                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [n_out * 64].into()),
-                    TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
-                    n_in,
-                    n_out,
-                    gx,
-                );
+                if w.ty == llm170_gguf::GgmlType::Q3K {
+                    gemm2::gemm_q8i_q3k::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(gx as u32, 1, gz as u32),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                        TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                        TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [n_out * 64].into()),
+                        n_in,
+                        n_out,
+                        gx,
+                    );
+                } else {
+                    gemm2::gemm_q8i::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(gx as u32, 1, gz as u32),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                        TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                        TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [n_out * 64].into()),
+                        TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
+                        n_in,
+                        n_out,
+                        gx,
+                    );
+                }
                 gemm2::reduce_parts_f64::launch_unchecked(
                     &self.client,
                     CubeCount::Static(gx as u32, 1, gz as u32),
