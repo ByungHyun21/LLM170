@@ -453,17 +453,122 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
     part[o * 64 + l] = acc;
 }
 
+
+// ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
+extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float v = g[j];
+    out[j] = (v / (1.0f + __expf(-v))) * u[j];
+}
+extern "C" __global__ void axpy_scaled(float* y, const float* x, const float* s, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    y[j] = y[j] + x[j] * s[0];
+}
+extern "C" __global__ void copy_rows(const float* src, float* dst, int src_off, int dst_off, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    dst[dst_off + j] = src[src_off + j];
+}
+// rms 2-커널 (part: 32유닛 세그 f64, finish: 순차 결합+스케일)
+extern "C" __global__ void rms_part(const float* x, double* part, int n) {
+    int row = blockIdx.x;
+    int u = threadIdx.x;
+    if (u >= 32) return;
+    int chunk = (n + 31) >> 5;
+    int lo = u * chunk;
+    if (lo >= n) { part[row * 32 + u] = 0.0; return; }
+    int hi = min(lo + chunk, n);
+    int xb = row * n;
+    double acc = 0.0;
+    for (int i = lo; i < hi; i++) {
+        double dv = (double)x[xb + i];
+        acc += dv * dv;
+    }
+    part[row * 32 + u] = acc;
+}
+extern "C" __global__ void rms_finish(const float* x, const float* w, const double* part,
+                                      float* out, float eps, int n, int w_reps) {
+    int row = blockIdx.x;
+    int u = threadIdx.x;
+    if (u >= 32) return;
+    double sum = 0.0;
+    #pragma unroll
+    for (int u2 = 0; u2 < 32; u2++) {
+        if (u2 * ((n + 31) >> 5) < n) sum += part[row * 32 + u2];
+    }
+    float scale32 = (float)sqrt(sum / (double)n + (double)eps);
+    float inv = 1.0f / scale32;
+    int xb = row * n;
+    int wb = (row % w_reps) * n;
+    int schunk = (n + 31) >> 5;
+    int lo = u * schunk;
+    if (lo < n) {
+        int hi = min(lo + schunk, n);
+        for (int i = lo; i < hi; i++) out[xb + i] = x[xb + i] * inv * w[wb + i];
+    }
+}
+// q/k norm+rope (f64 중간 — FMA 수축 면역, qk_norm_rope 이식)
+extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, const float* kw,
+                                        const float* cs, float eps, float kqs, int pos,
+                                        int n_head, int n_kv, int hd, int n_rot) {
+    int r = blockIdx.x;
+    int u = threadIdx.x;
+    int rows = n_head + n_kv;
+    if (r >= rows || u != 0) return;
+    bool is_q = r < n_head;
+    int half = n_rot >> 1;
+    int xq_len = n_head * 2 * hd;
+    int csbase = pos * half * 2;
+    int row_base = is_q ? r * 2 * hd : (r - n_head) * hd;
+    // rms 32세그 순차 재현 (ops::sq_sum 순서)
+    double parts[32];
+    int chunk = (hd + 31) >> 5;
+    for (int uu = 0; uu < 32; uu++) {
+        int lo = uu * chunk;
+        int hi = min(lo + chunk, hd);
+        double acc = 0.0;
+        for (int i = lo; i < hi; i++) {
+            double dv = (double)(is_q ? xq[row_base + i] : xk[row_base + i]);
+            acc += dv * dv;
+        }
+        parts[uu] = acc;
+    }
+    double sum = 0.0;
+    for (int uu = 0; uu < 32; uu++) sum += parts[uu];
+    float scale = 1.0f / (float)sqrt(sum / (double)hd + (double)eps);
+    if (is_q) {
+        for (int i = 0; i < hd; i++)
+            xq[row_base + i] = xq[row_base + i] * scale * qw[r * hd + i];
+        for (int p = 0; p < half; p++) {
+            double c = (double)cs[csbase + p * 2];
+            double sf = (double)cs[csbase + p * 2 + 1];
+            int a = row_base + p, b = a + half;
+            double x0 = (double)xq[a], x1 = (double)xq[b];
+            xq[a] = (float)(x0 * c - x1 * sf);
+            xq[b] = (float)(x0 * sf + x1 * c);
+        }
+    } else {
+        for (int i = 0; i < hd; i++)
+            xk[row_base + i] = xk[row_base + i] * scale * kw[row_base + i] * kqs;
+        for (int p = 0; p < half; p++) {
+            double c = (double)cs[csbase + p * 2];
+            double sf = (double)cs[csbase + p * 2 + 1];
+            int a = row_base + p, b = a + half;
+            double x0 = (double)xk[a], x1 = (double)xk[b];
+            xk[a] = (float)(x0 * c - x1 * sf);
+            xk[b] = (float)(x0 * sf + x1 * c);
+        }
+    }
+}
+
 "#;
 
 pub const NAMES: &[&str] = &[
-    "quant_q8",
-    "reduce64",
-    "gemm_xs",
-    "gemm_q5k",
-    "gemm_q8_0",
-    "gemm_q4k",
-    "gemm_q6k",
-    "gemm_nl",
-    "gemm_q3k",
+    "quant_q8", "reduce64",
+    "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
+    "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
+

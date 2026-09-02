@@ -215,17 +215,13 @@ pub fn raw_probe(iters: usize) -> Result<String, String> {
     ctx.h2d(x, bytemuck::cast_slice(&xh))?;
     let nblk = n / 32;
     let gx = nblk.div_ceil(64) as u32;
-    let mut xq = ctx.alloc(n / 4)?;
-    let mut xd = ctx.alloc(n / 32 * 4)?;
-    let _ = (&mut xq, &mut xd);
+    let mut xq = ctx.alloc((n / 4 + n / 32) * 4)?;
     let mut xp = x as *mut std::ffi::c_void;
     let mut xqp = xq as *mut std::ffi::c_void;
-    let mut xdp = xd as *mut std::ffi::c_void;
     let mut na = n as i32;
     let mut args = vec![
         &mut xp as *mut _ as *mut std::ffi::c_void,
         &mut xqp as *mut _ as *mut std::ffi::c_void,
-        &mut xdp as *mut _ as *mut std::ffi::c_void,
         &mut na as *mut _ as *mut std::ffi::c_void,
     ];
     // 워밍
