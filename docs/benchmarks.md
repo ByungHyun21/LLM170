@@ -29,8 +29,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **57.4 t/s** | 0.40x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **42.1 t/s** | ~0.18x |
+| Prefill pp64 | 142.8 t/s | **59.2 t/s** | 0.41x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **43.3 t/s** | ~0.19x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -46,7 +46,7 @@ arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
   each thread exclusively owns one row x 8 tokens, accumulates in f32
   registers across all k-chunks (no shared partial-sum round-trip), and
   hoists its weight words/scales to registers per sub-block, reusing
-  them across every owned token. Covers up to 32 tokens per launch.
+  them across every owned token. Covers up to 64 tokens per launch.
 - GPU-resident logits with deterministic on-device argmax
   (lowest-index tie-break, identical semantics to the CPU greedy): 8-byte
   readback per token instead of a full vocabulary transfer.
