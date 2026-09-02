@@ -309,6 +309,30 @@ impl RawCtx {
         Ok(())
     }
 
+    /// 타일 배치 GEMV (q5_K) — out [t][n_out].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_tile_q5k(&self, xq: *const u8, w: *const u8, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut no) as *mut _ as *mut std::ffi::c_void,
+            (&mut xw) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let gx = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
+        self.launch3("gemm_q5k_bt", gx, 1, gz, 64, &mut args)
+    }
+
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
     pub fn fill_f32(&self, dst: *mut u8, n: usize, v: f32) -> Result<(), String> {
         let vs = vec![v; n];
@@ -799,8 +823,8 @@ pub fn mm_tile_bench() -> Result<String, String> {
                 let base = c * 4;
                 xq_h.push((blk.qs[base] as u32 & 0xFF) | ((blk.qs[base+1] as u32 & 0xFF) << 8) | ((blk.qs[base+2] as u32 & 0xFF) << 16) | ((blk.qs[base+3] as u32 & 0xFF) << 24));
             }
-            xq_h.push(blk.d.to_bits());
         }
+        for blk in tok { xq_h.push(blk.d.to_bits()); }
     }
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
@@ -830,13 +854,20 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let bsize = w.ty.type_size() as usize;
     let rb = (n_in / blck) * bsize;
     let mut mism = 0;
+    let mut first_dbg = String::new();
     for ti in 0..t {
         for oo in 0..n_out.min(256) {
             let row = &w.data[oo * rb..];
             let c = llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &q8s[ti]);
-            if c.to_bits() != o[ti * n_out + oo].to_bits() { mism += 1; }
+            if c.to_bits() != o[ti * n_out + oo].to_bits() {
+                mism += 1;
+                if mism == 1 {
+                    first_dbg = format!("ti={ti} o={oo}: cpu={c:.7e} gpu={:.7e}", o[ti * n_out + oo]);
+                }
+            }
         }
     }
+    eprintln!("dbg: {first_dbg}");
     // 타이밍
     let reps = 10;
     let t0 = std::time::Instant::now();

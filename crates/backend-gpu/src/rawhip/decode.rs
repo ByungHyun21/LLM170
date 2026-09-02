@@ -951,6 +951,10 @@ impl DecodeState {
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
     #[allow(clippy::too_many_arguments)]
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        if ty == 13 && t > 1 {
+            // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
+            return self.ctx.gemm_tile_q5k(xq as *const u8, wp as *const u8, n_in, n_out, xq_w, t, out);
+        }
         self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, xq_w, t)
     }
 }
