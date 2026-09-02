@@ -314,7 +314,14 @@ impl RawCtx {
             13 => "gemm_q5k_mm",
             12 => "gemm_q4k_mm",
             14 => "gemm_q6k_mm",
-            23 => "gemm_xs_mm",
+            // iq4_xs: MMQ 스테이징 룩업 부담 > 이득 (44 vs 39µs 실측) — bt 유지
+            23 => {
+                if t > 16 {
+                    "gemm_xs_mm" // 32토큰 청크에서는 MMQ 상각이 이김
+                } else {
+                    "gemm_xs_bt"
+                }
+            }
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -338,11 +345,12 @@ impl RawCtx {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let rows_per_block: usize = 64; // mm 타일
+        let mm = kern.ends_with("_mm");
+        let rows_per_block: usize = if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
         let gx = nblocks.min(65535) as u32;
         let gz = nblocks.div_ceil(65535) as u32;
-        let block: u32 = 256;
+        let block: u32 = if mm { 256 } else { 64 };
         self.launch3(kern, gx, 1, gz, block, &mut args)
     }
 
