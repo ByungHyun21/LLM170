@@ -666,6 +666,10 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
     // 배치 커널 검증: LLM170_W4A8_T=t — xs=t행(동일 x) 배치 결과를
     // 행별 t=1 미러와 to_bits 비교.
     if let Ok(tt) = std::env::var("LLM170_W4A8_T") {
+        if w.ty == llm170_gguf::GgmlType::Q3K {
+            println!("  배치: q3_K은 행루프 경로 — 스킵");
+            return ExitCode::SUCCESS;
+        }
         let tt: usize = tt.parse().unwrap_or(8);
         // 행별로 서로 다른 x — 토큰 인덱싱 버그 가려지지 않게.
         let xs: Vec<Vec<f32>> = (0..tt)
@@ -686,7 +690,24 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
             let y1 = llm170_core::quant::quantize_row_q8_ref(&xs[ti]);
             for o in 0..n_out {
                 let row = &w.data[o * rb..];
-                let c = llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y1);
+                let c = match w.ty {
+                    llm170_gguf::GgmlType::Q5K => {
+                        llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y1)
+                    }
+                    llm170_gguf::GgmlType::Q4K => {
+                        llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &y1)
+                    }
+                    llm170_gguf::GgmlType::Q8_0 => {
+                        llm170_core::quant::dot_row_w4a8_q8_0_lane(row, n_in as u64, &y1)
+                    }
+                    llm170_gguf::GgmlType::Q6K => {
+                        llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y1)
+                    }
+                    llm170_gguf::GgmlType::Iq4Nl => {
+                        llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y1)
+                    }
+                    _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y1),
+                };
                 if c.to_bits() != g[ti * n_out + o].to_bits() {
                     mism += 1;
                     if mism == 1 {

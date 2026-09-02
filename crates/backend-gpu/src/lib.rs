@@ -871,17 +871,25 @@ impl<R: Runtime> GpuMatmul<R> {
     /// 프리필용: 가중치 로드를 t 토큰이 공유.
     pub fn matmul_w4a8_b_gpu(&self, xs: &[Vec<f32>], w: &Weight) -> Result<Vec<f32>, String> {
         use llm170_gguf::GgmlType;
-        if w.ty != GgmlType::Iq4Xs {
-            return Err("matmul_w4a8_b_gpu: iq4_xs 전용 (현 단계)".into());
+        if !llm170_core::matmul::w4a8_ty(w.ty) {
+            return Err("matmul_w4a8_b_gpu: 미지원 타입".into());
         }
         let t = xs.len();
         if t == 0 {
             return Err("matmul_w4a8_b_gpu: t=0".into());
         }
-        // 임의 t: 32행 서브배치로 절단 — 행 독립이라 비트 동일.
-        if t > 32 || t & (t - 1) != 0 {
+        // 부분합 스크래치 예산 256MB — n_out 큰 텐서(head 등)는 t' 축소.
+        // 행 독립이라 서브배치 분할은 비트 불변.
+        let budget = 256usize << 20;
+        let per_tok = w.n_out as usize * 64 * 8;
+        let mut t_cap = 32usize;
+        while t_cap > 1 && t_cap * per_tok > budget {
+            t_cap >>= 1;
+        }
+        // 임의 t: 서브배치로 절단 — 행 독립이라 비트 동일.
+        if t > t_cap || t & (t - 1) != 0 {
             let mut out: Vec<f32> = Vec::with_capacity(t * w.n_out as usize);
-            for ch in xs.chunks(32) {
+            for ch in xs.chunks(t_cap) {
                 let mut sub = ch.to_vec();
                 while sub.len() & (sub.len() - 1) != 0 {
                     sub.pop(); // 2의 거듭제곱으로 — 마지막 조각은 개별 처리
@@ -925,20 +933,107 @@ impl<R: Runtime> GpuMatmul<R> {
             ($tl:expr) => {{
                 // SAFETY: 그리드 (n_out,1,gz)·가드 — 상한 내.
                 unsafe {
-                    gemm2::gemm_q8i_b_xs::launch_unchecked(
-                        &self.client,
-                        CubeCount::Static(gx as u32, 1, gz as u32),
-                        CubeDim::new_1d(64),
-                        TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
-                        TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
-                        TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
-                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
-                        TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
-                        n_in,
-                        n_out,
-                        gx,
-                        $tl,
-                    );
+                    if w.ty == GgmlType::Q5K {
+                        gemm2::gemm_q8i_b_q5k::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else if w.ty == GgmlType::Q4K {
+                        gemm2::gemm_q8i_b_q4k::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else if w.ty == GgmlType::Q8_0 {
+                        gemm2::gemm_q8i_b_q8_0::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else if w.ty == GgmlType::Q6K {
+                        gemm2::gemm_q8i_b_q6k::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else if w.ty == GgmlType::Iq4Nl {
+                        gemm2::gemm_q8i_b_iq4nl::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else if w.ty == GgmlType::Iq4Xs {
+                        gemm2::gemm_q8i_b_xs::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    } else {
+                        gemm2::gemm_q8i_b_q5k::launch_unchecked(
+                            &self.client,
+                            CubeCount::Static(gx as u32, 1, gz as u32),
+                            CubeDim::new_1d(64),
+                            TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                            TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                            TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                            TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                            n_in,
+                            n_out,
+                            gx,
+                            $tl,
+                        );
+                    }
                 }
             }};
         }
@@ -1883,7 +1978,8 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         // W4A8 — CPU matmul_batch(전 타입 int)와 동일 비트.
         // iq4_xs: 배치 커널. 타 나머지: 행루프 t=1 (배치 커널 확장 전 임시).
         if llm170_core::matmul::w4a8_enabled() && llm170_core::matmul::w4a8_ty(w.ty) {
-            if w.ty == llm170_gguf::GgmlType::Iq4Xs {
+            let batchable = w.ty != llm170_gguf::GgmlType::Q3K;
+            if batchable {
                 let g = self.matmul_w4a8_b_gpu(xs, w)?;
                 for (ti, out) in outs.iter_mut().enumerate() {
                     let base = ti * w.n_out as usize;
@@ -2125,7 +2221,8 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             } else if llm170_core::matmul::w4a8_enabled()
                 && llm170_core::matmul::w4a8_ty(w.ty)
             {
-                if w.ty == llm170_gguf::GgmlType::Iq4Xs {
+                let batchable = w.ty != llm170_gguf::GgmlType::Q3K;
+                if batchable {
                     let g = self.matmul_w4a8_b_gpu(xs, w)?;
                     for (ti, out) in outs[i].iter_mut().enumerate() {
                         let base = ti * w.n_out as usize;
