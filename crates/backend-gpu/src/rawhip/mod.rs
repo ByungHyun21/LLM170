@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 pub mod kernels;
+pub mod decode;
 
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
