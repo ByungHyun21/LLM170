@@ -1343,6 +1343,36 @@ extern "C" __global__ void dot_roof(const unsigned* xq, const unsigned* w,
     out[1] = (double)acc;
 }
 
+// 결정적 argmax — 최저 인덱스 동률 (CPU greedy: v > bv 엄격 대소와 동일).
+// 2단계: 블록별 (최대·최저인덱스) → 단일 블록 결합.
+typedef struct { float v; int i; } AM;
+extern "C" __global__ void argmax64(const float* x, int n, int2* out) {
+    // grid n개 블록? 아니 — 단일 커널: 64레인 × 스트라이드 스캔 후 트리.
+    // vocab 248320: 64레인 × 3880 요소. f32 최대 비교는 결정적 (NaN 없음 전제).
+    int l = threadIdx.x;
+    float bv = -3.0e38f;
+    int bi = 0x7fffffff;
+    for (int i = l; i < n; i += 64) {
+        float v = x[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    // shared 교환: 하위 절반과 상위 절분 최저인덱스 병합
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    if (l >= 32) { sv[l - 32] = bv; si[l - 32] = bi; }
+    __syncthreads();
+    if (l < 32) {
+        if (sv[l] > bv || (sv[l] == bv && si[l] < bi)) { bv = sv[l]; bi = si[l]; }
+        // 셔플 트리 (32레인) — 최대·최저인덱스 병합
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off);
+            int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (l == 0) { out->x = bv; out->y = bi; }
+    }
+}
+
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
 extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1682,7 +1712,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

@@ -64,6 +64,8 @@ pub struct DecodeState {
     pub st_gdn: Vec<Vec<*mut u8>>,
     // 하이퍼파라미터
     pub n_embd: usize,
+    pub n_vocab: usize,
+    pub n_vocab_set: bool,
     pub n_ff: usize,
     pub n_layer: usize,
     pub n_head: usize,
@@ -216,7 +218,7 @@ impl DecodeState {
             logits: b_logits, xq_n: b_xqn, xq_f: b_xqf, xq_g: b_xqg,
             aq: b_aq, ak: b_ak, av: b_av, aout: b_aout,
             scores: b_scores, p64: b_p64,
-            one, consts: c, weights: wmap, ktab2: kt,
+            one, consts: c, weights: wmap, ktab2: kt, n_vocab: hp.vocab as usize, n_vocab_set: true,
             b_t_max: t_max,
             xs_t: b_xs_t, xn_t: b_xn_t, xq_n_t: b_xq_n_t,
             gqkv_t: b_gqkv_t, gz_t: b_gz_t, gb_t: b_gb_t, ga_t: b_ga_t, gbg_t: b_gbg_t,
@@ -608,13 +610,10 @@ impl DecodeState {
         self.quant(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
-        let t_pre_d2h = std::time::Instant::now();
-        let mut out = vec![0f32; noh];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), self.logits)?;
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
-            eprintln!("launch-side={:.2}ms gpu-wait={:.2}ms", t0.elapsed().as_secs_f64() * 1e3 - t_pre_d2h.elapsed().as_secs_f64() * 1e3, t_pre_d2h.elapsed().as_secs_f64() * 1e3);
+            eprintln!("step gpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
-        Ok(out)
+        Ok(Vec::new()) // logits 상주
     }
 }
 
@@ -650,7 +649,8 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        let r = ds.step_batch(seq, pos0, emb);
+        ds.step_batch(seq, pos0, emb)?;
+        let r = ds.read_logits();
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("batch({} tok) wall={:.1}ms", emb.len() / ds.n_embd, t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -662,7 +662,8 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
-        let r = ds.step(seq, pos);
+        ds.step(seq, pos)?;
+        let r = ds.read_logits();
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("step cpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -940,9 +941,34 @@ impl DecodeState {
         self.ctx.quant_q8(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
+        Ok(Vec::new()) // logits 상주 — d2h는 호출부 선택
+    }
+
+    /// logits 전체 d2h (비-greedy 샘플링용).
+    pub fn read_logits(&self) -> Result<Vec<f32>, String> {
+        let noh = self.n_vocab;
         let mut out = vec![0f32; noh];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), self.logits)?;
         Ok(out)
+    }
+
+    /// GPU argmax — 최저 인덱스 동률 (CPU greedy와 동일 의미). 토큰만 회수.
+    pub fn argmax_token(&self) -> Result<u32, String> {
+        let out = self.ctx.scratch(16)?;
+        let mut xp = self.logits as *mut std::ffi::c_void;
+        let mut n = self.n_vocab as i32;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut args = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut n) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch("argmax64", 1, 1, 64, &mut args)?;
+        self.ctx.sync()?;
+        let mut r = [0u8; 8];
+        self.ctx.d2h(&mut r, out)?;
+        let idx = i32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+        Ok(idx as u32)
     }
 
     /// 배치 rms — rows=t.

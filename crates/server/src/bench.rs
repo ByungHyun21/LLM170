@@ -181,8 +181,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     }
                 } else {
                     while n_gen < tg {
-                        let l = eng.decode(&[0], &[next]).map_err(|e| e.to_string())?;
-                        next = llm170_core::model::greedy(&l[0]);
+                        next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
                         n_gen += 1;
                         fwd += 1;
                         if next == 248044 {

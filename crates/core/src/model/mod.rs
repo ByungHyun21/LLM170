@@ -454,6 +454,23 @@ impl Engine {
         Ok(logits)
     }
 
+    /// greedy 디코드 — GPU argmax 경로 (logits 전사 없음). raw 활성 시 유효.
+    pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, ModelError> {
+        let Some(rd) = self.raw_decode.as_ref() else {
+            // 폴백: 일반 decode + greedy
+            let logits = self.decode(&[seq], &[token])?;
+            return Ok(crate::model::greedy(&logits[0]));
+        };
+        let n = self.model.hp.n_embd;
+        let embd = self.model.wchk("token_embd.weight")?;
+        let mut row = vec![0.0f32; n];
+        crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
+        let pos = self.seqs[seq].pos as usize;
+        let tok = rd.raw_step_greedy(seq, pos, &row).map_err(ModelError::Accel)?;
+        self.seqs[seq].pos += 1;
+        Ok(tok)
+    }
+
     /// MTP draft층 1 forward (06) — eh_proj([enorm(embd(tok)); hnorm(h_t)]) →
     /// 게이티드 어텐션(자체 KV) → FFN → shared head 로짓. 체인 draft용:
     /// 반환 (logits, h_{t+1}) — h는 다음 draft 스텝의 hnorm 입력.
