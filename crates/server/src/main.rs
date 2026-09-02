@@ -35,30 +35,6 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
   llm170 help
 "#;
 
-/// HIP 동기 런치 워크어라운드를 초기화 이전에 적용하기 위한 자기 재실행.
-/// env는 HIP 런타임 init 시 1회 판독 — with_client에서 set_var해도
-/// 무효였다(2026-09-01 실측: libamdhip64 할당·런치 경합 GPF 재발).
-/// 성공 시 exec가 프로세스를 치환해 이 함수로 돌아오지 않는다.
-#[cfg(target_os = "linux")]
-fn reexec_hip_blocking() {
-    if std::env::var_os("LLM170_NO_REEXEC").is_some()
-        || std::env::var_os("HIP_LAUNCH_BLOCKING").is_some()
-        || std::env::var_os("LLM170_HIP_ASYNC").is_some()
-    {
-        return;
-    }
-    use std::os::unix::process::CommandExt;
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if argv.is_empty() {
-        return;
-    }
-    let err = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .env("HIP_LAUNCH_BLOCKING", "1")
-        .env("LLM170_NO_REEXEC", "1")
-        .exec();
-    eprintln!("# re-exec 실패({err}) — HIP_LAUNCH_BLOCKING 미적용으로 계속");
-}
 
 fn main() -> ExitCode {
     // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
@@ -70,7 +46,6 @@ fn main() -> ExitCode {
     }
     let _ = log::set_logger(&EL);
     log::set_max_level(log::LevelFilter::Error);
-    reexec_hip_blocking();
     // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
     // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
     // 런만 희생되게 한다 (무권한으로는 보호 불가 — 우선순위 이동만 가능).
