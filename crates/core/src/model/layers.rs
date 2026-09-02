@@ -205,6 +205,23 @@ impl Engine {
                         n_group,
                         dt_rank,
                     );
+                    if il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                        let sumo: f64 = o_all[r0 * v_len..r1 * v_len].iter().map(|&v| v as f64).sum();
+                        let sumq: f64 = q_all[r0 * k_len..r1 * k_len].iter().map(|&v| v as f64).sum();
+                        let mut xco: u64 = 0; let mut xcq: u64 = 0;
+                        for &v in &o_all[r0 * v_len..r1 * v_len] { xco ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        for &v in &q_all[r0 * k_len..r1 * k_len] { xcq ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        eprintln!("  G0dbg o_all sum={sumo:.6} xor={xco:016x} q_all xor={xcq:016x}");
+                        let mut xck: u64 = 0; let mut xcv: u64 = 0; let mut xcb: u64 = 0; let mut xcg: u64 = 0;
+                        for &v in &k_all[r0 * k_len..r1 * k_len] { xck ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        for &v in &v_all[r0 * v_len..r1 * v_len] { xcv ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        for &v in &beta_all[r0 * dt_rank..r1 * dt_rank] { xcb ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        for &v in &g_all[r0 * dt_rank..r1 * dt_rank] { xcg ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        eprintln!("  G0dbg k_all xor={xck:016x} v_all xor={xcv:016x} beta xor={xcb:016x} g_all xor={xcg:016x}");
+                        let mut xce: u64 = 0;
+                        for &v in &g_all[r0 * dt_rank..r1 * dt_rank] { xce ^= (crate::ops::exp_cr(v).to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        eprintln!("  G0dbg exp_cr(g) xor={xce:016x}");
+                    }
                 } else {
                     // GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
                     let mut done = false;
@@ -354,6 +371,18 @@ impl Engine {
             .model
             .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
+        if il == 3 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+            eprintln!("  A3dbg normed[0..6]={:?}", &xs[0][0..6]);
+            if let Some(qb) = crate::quant::quantize_row_q8_ref(&xs[0]).first() {
+                let w0 = qb.qs.iter().take(4).fold(0u32, |a, &v| a | ((v as u8 as u32) << (8 * (a.count_ones() as usize % 4))));
+                let mut word = 0u32;
+                for (i, b) in qb.qs.iter().take(4).enumerate() {
+                    word |= (*b as u8 as u32) << (8 * i);
+                }
+                eprintln!("  A3dbg cpu q word0={word:#010x} d={:e} q[0..6]={:?}", qb.d, qb.qs.iter().take(6).collect::<Vec<_>>());
+                let _ = w0;
+            }
+        }
         // q·k·v 동일 입력 xs — 1그룹 배치
         let mut group: [Vec<Vec<f32>>; 3] = [
             vec![vec![0.0f32; wq.n_out as usize]; n_tok],
@@ -414,6 +443,14 @@ impl Engine {
                     continue;
                 }
                 let mut attn_out = std::mem::take(&mut attn_all[row]);
+                let dbg3 = il == 3 && t == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
+                if dbg3 {
+                    let b0 = (pos as usize) * n_kv * hd;
+                    eprintln!("  A3dbg pos{pos} cache_k[b0..4]={:?} cache_k[0..4]={:?}", &cache_k[b0..b0 + 4], &cache_k[0..4]);
+                    eprintln!("  A3dbg cache_v[0..4]={:?}", &cache_v[b0..b0 + 4]);
+                    eprintln!("  A3dbg gate h0 [0..4]={:?}", &qg[row][hd..hd + 4]);
+                    eprintln!("  A3dbg sigmoid(g)={:?}", (0..4).map(|i| sigmoid(qg[row][hd + i])).collect::<Vec<_>>());
+                }
                 for h in 0..n_head {
                     let src = qg[row][h * 2 * hd..h * 2 * hd + hd].to_vec();
                     let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
@@ -433,7 +470,7 @@ impl Engine {
                     }
                     let mut sum = 0.0f32;
                     for sc in scores.iter_mut() {
-                        *sc = (*sc - maxv).exp();
+                        *sc = crate::ops::exp_cr(*sc - maxv);
                         sum += *sc;
                     }
                     for sc in scores.iter_mut() {
@@ -454,6 +491,10 @@ impl Engine {
                     let gb = h * 2 * hd + hd;
                     for i in 0..hd {
                         attn_out[ob + i] *= sigmoid(qg[row][gb + i]);
+                    }
+                    if dbg3 && h == 0 {
+                        let sumsc: f64 = scores.iter().map(|&v| v as f64).sum();
+                        eprintln!("  A3dbg h0 scores_sum={sumsc:.6} n_past={} attn_out[0..4]={:?}", n_past, &attn_out[0..4]);
                     }
                 }
                 attn_all[row] = attn_out;
@@ -503,7 +544,7 @@ impl Engine {
                 }
                 let mut sum = 0.0f32;
                 for sc in scores.iter_mut() {
-                    *sc = (*sc - maxv).exp();
+                    *sc = crate::ops::exp_cr(*sc - maxv);
                     sum += *sc;
                 }
                 for sc in scores.iter_mut() {

@@ -124,6 +124,10 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("exp-ab") => match llm170_backend_gpu::rawhip::exp_ab() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("iq3s-probe") => match llm170_backend_gpu::rawhip::iq3s_probe() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

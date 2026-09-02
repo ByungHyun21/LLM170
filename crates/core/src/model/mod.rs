@@ -332,13 +332,9 @@ impl Engine {
                 }
             }
             let ffn_residual = xs.clone();
-            let dbg_layer = il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
-            if dbg_layer {
-                let m = xs
-                    .iter()
-                    .flat_map(|r| r.iter())
-                    .fold(0.0f32, |a, v| a.max(v.abs()));
-                eprintln!("  rs stage post-attn-residual max={m:.5}");
+            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                let sum: f64 = xs[0].iter().map(|&v| v as f64).sum();
+                eprintln!("  A{il} xs sum={sum:.6}");
             }
 
             let post_w = self
@@ -369,13 +365,7 @@ impl Engine {
                     mm_batch(&acc, &gate_y, &down_w, &mut xs)?;
                 });
             }
-            if dbg_layer {
-                let m = gate_y
-                    .iter()
-                    .flat_map(|r| r.iter())
-                    .fold(0.0f32, |a, v| a.max(v.abs()));
-                eprintln!("  rs stage ffn_siluup max={m:.5}");
-            }
+            let _ = &gate_y;
             for t in 0..n_tok {
                 for i in 0..n_embd {
                     xs[t][i] += ffn_residual[t][i];
@@ -385,10 +375,11 @@ impl Engine {
                 let m = xs[0].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let nan = xs[0].iter().any(|v| v.is_nan());
                 let v4: Vec<String> = xs[0][..4].iter().map(|v| format!("{v:.5}")).collect();
+                let sum: f64 = xs[0].iter().map(|&v| v as f64).sum();
                 eprintln!(
-                    "layer {il:>2} recr={} max|x|={m:.4} nan={nan} head={}",
+                    "layer {il:>2} recr={} max|x|={m:.4} nan={nan} head={} sum={sum:.6}",
                     self.model.is_recr(il),
-                    v4.join(",")
+                    v4.join(","),
                 );
             }
         }
@@ -437,6 +428,11 @@ impl Engine {
             let rd = self.raw_decode.as_ref().unwrap();
             let pos = self.seqs[seq].pos as usize;
             let logits = rd.raw_step(seq, pos, &row).map_err(ModelError::Accel)?;
+            if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let nan = logits.iter().any(|v| v.is_nan());
+                eprintln!("logits: max={m:.4} nan={nan} argmax={}", greedy(&logits));
+            }
             self.seqs[seq].pos += 1;
             return Ok(vec![logits]);
         }
@@ -589,7 +585,7 @@ impl Engine {
             }
             let mut sum = 0.0f32;
             for sc in scores.iter_mut() {
-                *sc = (*sc - maxv).exp();
+                *sc = crate::ops::exp_cr(*sc - maxv);
                 sum += *sc;
             }
             let ob = h * hd;
@@ -625,6 +621,18 @@ impl Engine {
             .unwrap_or(1024)
             .clamp(16, 1024);
         let mut last = None;
+        // 원시 HIP 활성 시 프리필도 t=1 raw 스텝으로 — 상태 동기화 불필요
+        // (KV/GDN/conv 링이 raw 디코더에 직접 적립).
+        if std::env::var("LLM170_T1_PREFILL").is_ok()
+            || (self.raw_decode.is_some()
+                && std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0"))
+        {
+            for &t in tokens {
+                let logits = self.decode(&[seq], &[t])?;
+                last = Some(logits.into_iter().next().unwrap());
+            }
+            return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
+        }
         for ch in tokens.chunks(chunk) {
             let logits = self.forward(&[seq], &[ch.to_vec()])?;
             self.seqs[seq].pos += ch.len() as u32;

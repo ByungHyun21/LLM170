@@ -47,7 +47,10 @@ impl RawCtx {
             let o1 = CString::new(format!("-I{inc}")).unwrap();
             let o2 = CString::new("--std=c++17").unwrap();
             let o3 = CString::new("-O3").unwrap();
-            let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr()];
+            // FMA 수축 차단 — CPU 비트계약 (a+=b*c 축약이 비트 불일치,
+            // 2026-09-03 AR xor RCA)
+            let o4 = CString::new("-ffp-contract=off").unwrap();
+            let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr()];
             let rs = hip::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_mut_ptr());
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 let mut sz = 0usize;
@@ -476,4 +479,39 @@ pub fn iq3s_probe() -> Result<String, String> {
         }
     }
     Ok(format!("iq3s_probe: {bad}/64 lanes differ\n{msg}"))
+}
+
+
+/// 디버그: expf vs Rust exp 비트 비교.
+pub fn exp_ab() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let n = 4096usize;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 - 2048.0) / 97.0).collect();
+    let xd = ctx.alloc(n * 4)?;
+    let bits = ctx.alloc(n * 4)?;
+    ctx.h2d(xd, bytemuck::cast_slice(&x))?;
+    let mut xp = xd as *mut std::ffi::c_void;
+    let mut bp = bits as *mut std::ffi::c_void;
+    let mut na = n as i32;
+    let mut args = vec![
+        (&mut xp) as *mut _ as *mut std::ffi::c_void,
+        (&mut bp) as *mut _ as *mut std::ffi::c_void,
+        (&mut na) as *mut _ as *mut std::ffi::c_void,
+    ];
+    ctx.launch("exp_probe", n.div_ceil(64) as u32, 1, 64, &mut args)?;
+    ctx.sync()?;
+    let mut gbits = vec![0u32; n];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut gbits).as_mut(), bits)?;
+    let mut bad = 0;
+    let mut msg = String::new();
+    for i in 0..n {
+        let host = x[i].exp().to_bits();
+        if host != gbits[i] {
+            bad += 1;
+            if bad <= 3 {
+                msg += &format!("x={:.6e} dev={:#010x} host={:#010x}\n", x[i], gbits[i], host);
+            }
+        }
+    }
+    Ok(format!("exp_ab: {bad}/{n} differ\n{msg}"))
 }

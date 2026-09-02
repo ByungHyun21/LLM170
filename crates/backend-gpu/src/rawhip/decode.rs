@@ -50,10 +50,10 @@ pub struct DecodeState {
     pub weights: std::collections::HashMap<String, (*mut u8, u32, usize, usize)>, // (ptr, ty, n_in, n_out)
     pub ktab2: *mut u8,
     // KV/GDN 상태 [seq][...]
-    pub kv_k: Vec<*mut u8>,
-    pub kv_v: Vec<*mut u8>,
-    pub st_conv: Vec<*mut u8>,
-    pub st_gdn: Vec<*mut u8>,
+    pub kv_k: Vec<Vec<*mut u8>>,  // [full층][seq]
+    pub kv_v: Vec<Vec<*mut u8>>,
+    pub st_conv: Vec<Vec<*mut u8>>,  // [recr층][seq]
+    pub st_gdn: Vec<Vec<*mut u8>>,
     // 하이퍼파라미터
     pub n_embd: usize,
     pub n_ff: usize,
@@ -123,24 +123,38 @@ impl DecodeState {
         let kv_len = ctx_len * hp.n_kv * hp.head_dim;
         let conv_len = (hp.conv_k - 1) * conv_ch;
         let gdn_len = hp.dt_rank * hp.d_state * hp.d_state;
-        let mut kv_k = Vec::with_capacity(n_seqs);
-        let mut kv_v = Vec::with_capacity(n_seqs);
-        let mut st_conv = Vec::with_capacity(n_seqs);
-        let mut st_gdn = Vec::with_capacity(n_seqs);
-        for _ in 0..n_seqs {
-            kv_k.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
-            kv_v.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
-            st_conv.push(ctx.alloc(conv_len * 4).map_err(|e| e.to_string())?);
-            st_gdn.push(ctx.alloc(gdn_len * 4).map_err(|e| e.to_string())?);
-        }
+        let n_recr = is_recr.iter().filter(|&&r| r).count();
+        let n_full = is_recr.iter().filter(|&&r| !r).count();
+        let mut st_conv = Vec::with_capacity(n_recr);
+        let mut st_gdn = Vec::with_capacity(n_recr);
         let zero_k = vec![0f32; kv_len];
+        let mut kv_k = Vec::with_capacity(n_full);
+        let mut kv_v = Vec::with_capacity(n_full);
+        for _ in 0..n_full {
+            let mut ck = Vec::with_capacity(n_seqs);
+            let mut cv2 = Vec::with_capacity(n_seqs);
+            for s in 0..n_seqs {
+                ck.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                cv2.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                ctx.h2d(ck[s], bytemuck::cast_slice(&zero_k))?;
+                ctx.h2d(cv2[s], bytemuck::cast_slice(&zero_k))?;
+            }
+            kv_k.push(ck);
+            kv_v.push(cv2);
+        }
         let zero_conv = vec![0f32; conv_len];
         let zero_gdn = vec![0f32; gdn_len];
-        for s in 0..n_seqs {
-            ctx.h2d(kv_k[s], bytemuck::cast_slice(&zero_k))?;
-            ctx.h2d(kv_v[s], bytemuck::cast_slice(&zero_k))?;
-            ctx.h2d(st_conv[s], bytemuck::cast_slice(&zero_conv))?;
-            ctx.h2d(st_gdn[s], bytemuck::cast_slice(&zero_gdn))?;
+        for _ in 0..n_recr {
+            let mut cv = Vec::with_capacity(n_seqs);
+            let mut gd = Vec::with_capacity(n_seqs);
+            for s in 0..n_seqs {
+                cv.push(ctx.alloc(conv_len * 4).map_err(|e| e.to_string())?);
+                gd.push(ctx.alloc(gdn_len * 4).map_err(|e| e.to_string())?);
+                ctx.h2d(cv[s], bytemuck::cast_slice(&zero_conv))?;
+                ctx.h2d(gd[s], bytemuck::cast_slice(&zero_gdn))?;
+            }
+            st_conv.push(cv);
+            st_gdn.push(gd);
         }
         let max_rows = (n / 32).max(n_ff.max(g6)).max(hp.n_head + hp.n_kv).max(1);
         let bs = |nb: usize| Self::a(&ctx, nb).unwrap();
@@ -234,6 +248,7 @@ impl DecodeState {
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
         let mut full_idx = 0usize;
+        let mut recr_idx = 0usize;
         for il in 0..self.n_layer {
             if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
                 eprintln!("# rawhip: layer {il} (recr={})", self.is_recr[il]);
@@ -257,7 +272,7 @@ impl DecodeState {
                 {
                     let mut qp = self.gqkv as *mut std::ffi::c_void;
                     let mut cp = cw as *mut std::ffi::c_void;
-                    let mut sp = self.st_conv[seq] as *mut std::ffi::c_void;
+                    let mut sp = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
                     let mut op = self.gconv as *mut std::ffi::c_void;
                     let mut ch = conv_ch as i32;
                     let mut kk = self.conv_k as i32;
@@ -305,7 +320,7 @@ impl DecodeState {
                 // AR
                 {
                     let n_pairs = self.dt_rank;
-                    let mut sp3 = self.st_gdn[seq] as *mut std::ffi::c_void;
+                    let mut sp3 = self.st_gdn[recr_idx][seq] as *mut std::ffi::c_void;
                     let mut qp = self.gq as *mut std::ffi::c_void;
                     let mut kp = self.gk as *mut std::ffi::c_void;
                     let mut vp = self.gv as *mut std::ffi::c_void;
@@ -316,8 +331,38 @@ impl DecodeState {
                     let mut vs = v_len as i32;
                     let mut hv = self.dt_rank as i32;
                     let mut hk = self.n_group as i32;
-                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk)];
+                    let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc)];
                     self.ctx.launch("gdn_ar", n_pairs as u32, 1, 128, &mut args)?;
+                }
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                    self.ctx.sync()?;
+                    let mut ho = vec![0f32; v_len];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.go)?;
+                    let sumo: f64 = ho.iter().map(|&v| v as f64).sum();
+                    let mut hq = vec![0f32; k_len];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq)?;
+                    let sumq: f64 = hq.iter().map(|&v| v as f64).sum();
+                    let mut xco: u64 = 0; let mut xcq: u64 = 0;
+                    for &v in &ho { xco ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    for &v in &hq { xcq ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    eprintln!("#  G0dbg go sum={sumo:.6} xor={xco:016x} gq xor={xcq:016x}");
+                    let mut hk2 = vec![0f32; k_len];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hk2).as_mut(), self.gk)?;
+                    let mut xck: u64 = 0;
+                    for &v in &hk2 { xck ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    let mut hv2 = vec![0f32; v_len];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv2).as_mut(), self.gv)?;
+                    let mut xcv: u64 = 0;
+                    for &v in &hv2 { xcv ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    let mut hbg = vec![0f32; self.dt_rank * 2];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hbg).as_mut(), self.gbg)?;
+                    let mut xcb: u64 = 0; let mut xcg: u64 = 0;
+                    for (i, &v) in hbg.iter().enumerate() {
+                        if i % 2 == 0 { xcb ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                        else { xcg ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    }
+                    eprintln!("#  G0dbg gk xor={xck:016x} gv xor={xcv:016x} beta xor={xcb:016x} eg xor={xcg:016x}");
                 }
                 // norm_gated silu (rows = dt_rank, w = ssm_norm 반복)
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
@@ -336,7 +381,39 @@ impl DecodeState {
                 self.quant(self.ggated, self.xq_g, self.d_inner)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
                 self.mm_into(self.xq_g, wp, ty, ni, no, self.gout)?;
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                    self.ctx.sync()?;
+                    let mut ho = vec![0f32; n];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.gout)?;
+                    let sumo: f64 = ho.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  G0dbg gout sum={sumo:.6} gout[0..4]={:?}", &ho[0..4]);
+                }
+                recr_idx += 1;
             } else {
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                    self.ctx.sync()?;
+                    let mut hn = vec![0f32; n];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hn).as_mut(), self.xn)?;
+                    eprintln!("#  A3dbg xn[0..6]={:?}", &hn[0..6]);
+                    // 결정적 A/B: 이 xn으로 호스트 미러 av[0] 계산
+                    if il == 3 && std::env::var_os("LLM170_RAWHIP_HOSTAB").is_some() {
+                        let (wp, ty, _ni, _no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
+                        let mut wrow = vec![0u8; (5120 / 256) * 176];
+                        self.ctx.d2h(&mut wrow, wp)?;
+                        let y = llm170_core::quant::quantize_row_q8_ref(&hn);
+                        let mv = match ty {
+                            13 => llm170_core::quant::dot_row_w4a8_q5k_lane(&wrow, 5120, &y),
+                            14 => llm170_core::quant::dot_row_w4a8_q6k_lane(&wrow, 5120, &y),
+                            12 => llm170_core::quant::dot_row_w4a8_q4k_lane(&wrow, 5120, &y),
+                            _ => f32::NAN,
+                        };
+                        eprintln!("#  A3dbg host-mirror av[0]={mv:e} d={:e} d_bits={:#x}", y[0].d, y[0].d.to_bits());
+                    }
+                    let mut hq8 = vec![0u8; (n / 4 + n / 32) * 4];
+                    self.ctx.d2h(&mut hq8, self.xq_n)?;
+                    let w0 = u32::from_le_bytes([hq8[0], hq8[1], hq8[2], hq8[3]]);
+                    eprintln!("#  A3dbg xq_n word0={w0:#010x} d0={:e}", f32::from_bits(u32::from_le_bytes([hq8[n], hq8[n+1], hq8[n+2], hq8[n+3]])));
+                }
                 // q/k/v mm
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.aq)?;
@@ -370,14 +447,30 @@ impl DecodeState {
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  qk_norm ok"); }
                 }
                 // KV append
-                self.copy(self.ak, self.kv_k[seq], 0, pos * n_kv * hd, n_kv * hd)?;
-                self.copy(self.av, self.kv_v[seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                    self.ctx.sync()?;
+                    let mut hk = vec![0f32; n_kv * hd];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hk).as_mut(), self.ak)?;
+                    eprintln!("#  A3dbg pos{pos} ak[0..4]={:?}", &hk[0..4]);
+                    let mut hck = vec![0f32; (pos + 1) * n_kv * hd];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hck).as_mut(), self.kv_k[full_idx][seq])?;
+                    let b0 = pos * n_kv * hd;
+                    eprintln!("#  A3dbg pos{pos} cache_k[b0..4]={:?} cache_k[0..4]={:?}", &hck[b0..b0 + 4], &hck[0..4]);
+                    let mut hv = vec![0f32; n_kv * hd];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.av)?;
+                    eprintln!("#  A3dbg av[0..4]={:?}", &hv[0..4]);
+                    let mut hq = vec![0f32; n_head * 2 * hd];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.aq)?;
+                    eprintln!("#  A3dbg gate h0 [0..4]={:?}", &hq[hd..hd + 4]);
+                }
+                self.copy(self.ak, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
                 {
                     let n_past = pos + 1;
                     let mut qp = self.aq as *mut std::ffi::c_void;
-                    let mut ckp = self.kv_k[seq] as *mut std::ffi::c_void;
+                    let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
                     let mut mp = mask as *mut std::ffi::c_void;
                     let mut scp = self.scores as *mut std::ffi::c_void;
                     let mut np_ = n_past as i32;
@@ -395,7 +488,7 @@ impl DecodeState {
                     let n_past = pos + 1;
                     let mut qp = self.aq as *mut std::ffi::c_void;
                     let mut scp = self.scores as *mut std::ffi::c_void;
-                    let mut cvp = self.kv_v[seq] as *mut std::ffi::c_void;
+                    let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
                     let mut op = self.aout as *mut std::ffi::c_void;
                     let mut np_ = n_past as i32;
                     let mut nh = n_head as i32;
@@ -407,6 +500,15 @@ impl DecodeState {
                     self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
                 }
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                    self.ctx.sync()?;
+                    let mut ho = vec![0f32; n_head * hd];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.aout)?;
+                    let mut hs = vec![0f32; n_head * (pos + 1)];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hs).as_mut(), self.scores)?;
+                    let sumsc: f64 = hs.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  A3dbg h0 scores_sum={sumsc:.6} n_past={} aout[0..4]={:?}", pos + 1, &ho[0..4]);
+                }
                 // wo
                 self.quant(self.aout, self.xq_g, n_head * hd)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
@@ -415,6 +517,13 @@ impl DecodeState {
             }
             // 잔차
             self.axpy(self.xs, self.gout, n)?;
+            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+                self.ctx.sync()?;
+                let mut hv = vec![0f32; n];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs)?;
+                let sum: f64 = hv.iter().map(|&v| v as f64).sum();
+                eprintln!("#  L{il} xs: sum={sum:.6} x0={:.5} x1={:.5}", hv[0], hv[1]);
+            }
             // FFN
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms(self.xs, pw, self.xn, n)?;
@@ -436,6 +545,13 @@ impl DecodeState {
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
             self.axpy(self.xs, self.fdown, n)?;
+            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+                self.ctx.sync()?;
+                let mut hv = vec![0f32; n];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs)?;
+                let sum: f64 = hv.iter().map(|&v| v as f64).sum();
+                eprintln!("#  E{il} xs: sum={sum:.6} x0={:.5} x1={:.5}", hv[0], hv[1]);
+            }
         }
         // head
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;

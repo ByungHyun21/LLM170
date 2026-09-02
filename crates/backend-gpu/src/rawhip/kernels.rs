@@ -25,6 +25,77 @@ DEV unsigned byte(const unsigned* w, int i) {
     return (w[i >> 2] >> ((i & 3) * 8)) & 0xFFu;
 }
 
+// 올림-정확 exp(f32→f32) — f64 fma 호너 다항. glibc/Rust expf는 올림-정확
+// (ARM routines) → 결과 비트 일치 (경계 2^-28 확률 제외). 디바이스
+// expf는 1ulp 빗나감(244/4096 실측, 2026-09-03) — W4A8 비트계약 위반.
+DEV float exp_cr(float xf) {
+    double x = (double)xf;
+    if (x > 88.72) return __int_as_float(0x7f800000u);
+    if (x < -103.97) return 0.0f;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double INV_LN2 = 1.44269504088896338700e+00;
+    double kd = rint(x * INV_LN2);
+    int k = (int)kd;
+    double r = fma(-kd, LN2_HI, x);
+    r = fma(-kd, LN2_LO, r);
+    double p = 1.0 / 1307674368000.0;
+    p = fma(p, r, 1.0 / 479001600.0);
+    p = fma(p, r, 1.0 / 39916800.0);
+    p = fma(p, r, 1.0 / 3628800.0);
+    p = fma(p, r, 1.0 / 362880.0);
+    p = fma(p, r, 1.0 / 40320.0);
+    p = fma(p, r, 1.0 / 5040.0);
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    if (k > 127) return __int_as_float(0x7f800000u);
+    // 2^k 스케일 — f64 지수 비트 직접 구성 (k ≥ -1022 보장: x ≥ -103.97)
+    long long eb = (long long)(k + 1023) << 52;
+    double scale = __longlong_as_double(eb);
+    return (float)(p * scale);
+}
+
+// f64 자연로그 — atanh 급수 fma 호너 (Rust ops::ln_cr과 동일 연산열).
+DEV double ln_cr(double v) {
+    long long bits = __double_as_longlong(v);
+    long long e = (bits >> 52) & 0x7ff;
+    double k = (double)(e - 1023);
+    double m = __longlong_as_double((bits & ~(0x7ffLL << 52)) | (1023LL << 52));
+    double t = (m - 1.0) / (m + 1.0);
+    double t2 = t * t;
+    double q = 1.0 / 25.0;
+    q = fma(q, t2, 1.0 / 23.0);
+    q = fma(q, t2, 1.0 / 21.0);
+    q = fma(q, t2, 1.0 / 19.0);
+    q = fma(q, t2, 1.0 / 17.0);
+    q = fma(q, t2, 1.0 / 15.0);
+    q = fma(q, t2, 1.0 / 13.0);
+    q = fma(q, t2, 1.0 / 11.0);
+    q = fma(q, t2, 1.0 / 9.0);
+    q = fma(q, t2, 1.0 / 7.0);
+    q = fma(q, t2, 1.0 / 5.0);
+    q = fma(q, t2, 1.0 / 3.0);
+    q = fma(q, t2, 1.0);
+    double lnm = 2.0 * t * q;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    double kh = k * LN2_HI;
+    double kl = k * LN2_LO;
+    double s1 = lnm + kh;
+    double s2 = (lnm - s1) + kh;
+    return s1 + (s2 + kl);
+}
+
+// log1p — ln_cr 급수 경유 (Rust ops::log1p_cr과 동일 연산열).
+DEV float log1p_cr(float y) {
+    return (float)ln_cr((double)y + 1.0);
+}
+
 // 활성 양자화 — rust quantize_row_q8_ref 미러 (round half away 산술 구현)
 // d는 별도 float 저장이 간헐 유실되는 코드젠 결함(2026-09-03 RCA) 회피차
 // xq 워드 스트림 뒤 영역(xq[nwords + b])에 u32 비트로 편승 — 저장 경로
@@ -612,12 +683,19 @@ extern "C" __global__ void gemm_iq3s_sub(const unsigned* xq, const unsigned* w,
 }
 
 
+// 디버그: expf 비트 동일성 프로브 — host Rust exp와 비교.
+extern "C" __global__ void exp_probe(const float* x, unsigned* bits, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    bits[i] = __float_as_uint((float)exp((double)x[i]));
+}
+
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
 extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
     float v = g[j];
-    out[j] = (v / (1.0f + __expf(-v))) * u[j];
+    out[j] = (v / (1.0f + exp_cr(-v))) * u[j];
 }
 extern "C" __global__ void axpy_scaled(float* y, const float* x, const float* s, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -731,7 +809,7 @@ extern "C" __global__ void gdn_conv(const float* qkv, const float* cw, float* st
     int xb = c; // t=0
     float sum = cw[c * k + (k - 1)] * qkv[xb];
     for (int j = 0; j < k - 1; j++) sum += cw[c * k + j] * state[j * ch + c];
-    float oc = sum / (1.0f + __expf(-sum));
+    float oc = sum / (1.0f + exp_cr(-sum));
     for (int j = 0; j < k - 2; j++) state[j * ch + c] = state[(j + 1) * ch + c];
     state[(k - 2) * ch + c] = qkv[xb];
     out[xb] = oc;
@@ -742,10 +820,10 @@ extern "C" __global__ void gdn_beta_g(const float* b, const float* a, const floa
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= n_h) return;
     float bv = b[h];
-    bg[h * 2] = 1.0f / (1.0f + __expf(-bv));
+    bg[h * 2] = 1.0f / (1.0f + exp_cr(-bv));
     float x = fminf(a[h] + dtb[h], 80.0f);
-    float sp = log1pf(__expf(x));
-    bg[h * 2 + 1] = __expf(sp * sa[h]);
+    float sp = log1p_cr(exp_cr(x));
+    bg[h * 2 + 1] = exp_cr(sp * sa[h]);
 }
 // norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
 extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
@@ -773,13 +851,13 @@ extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const
     for (int i = 0; i < d; i++) {
         float nrm = o[xb + i] * inv * w[wb + i];
         float zz = z[xb + i];
-        out[xb + i] = nrm * (zz / (1.0f + __expf(-zz)));
+        out[xb + i] = nrm * (zz / (1.0f + exp_cr(-zz)));
     }
 }
 // GDN AR state update (cube = (b,h) pair, unit = dv column)
-extern "C" __global__ void gdn_ar(float* s, const float* q_scaled, const float* k, const float* v,
+extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, const float* v,
                                   const float* beta_ge, float* out, int d, int k_stride,
-                                  int v_stride, int h_v, int h_k) {
+                                  int v_stride, int h_v, int h_k, float scale) {
     int pair = blockIdx.x;
     int u = threadIdx.x;
     if (u >= d) return;
@@ -803,7 +881,7 @@ extern "C" __global__ void gdn_ar(float* s, const float* q_scaled, const float* 
     }
     float o = 0.0f;
     for (int kdim = 0; kdim < d; kdim++)
-        o += s[base_s + kdim * d + u] * q_scaled[qk0 + kdim];
+        o += (s[base_s + kdim * d + u] * q[qk0 + kdim]) * scale;
     out[v0 + u] = o;
 }
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
@@ -823,7 +901,7 @@ extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float
     float scale32 = (float)sqrt(sum);
     float inv = 1.0f / fmaxf(scale32, eps);
     if (is_q) {
-        for (int i = 0; i < d; i++) gq[xb + i] = gq[xb + i] * inv * scale;
+        for (int i = 0; i < d; i++) gq[xb + i] = gq[xb + i] * inv;
     } else {
         for (int i = 0; i < d; i++) gk[xb + i] = gk[xb + i] * inv;
     }
@@ -873,19 +951,19 @@ extern "C" __global__ void qsa_mix(const float* q, const float* scores, const fl
         float sv = scores[sbase + p];
         if (sv > maxv) maxv = sv;
     }
-    float sum = __expf(scores[sbase] - maxv);
-    for (int p = 1; p < n_past; p++) sum += __expf(scores[sbase + p] - maxv);
+    float sum = exp_cr(scores[sbase] - maxv);
+    for (int p = 1; p < n_past; p++) sum += exp_cr(scores[sbase + p] - maxv);
     int kvh = h / (n_head / n_kv);
     float a = 0.0f;
     for (int p = 0; p < n_past; p++) {
-        float w = __expf(scores[sbase + p] - maxv) / sum;
+        float w = exp_cr(scores[sbase + p] - maxv) / sum;
         if (w != 0.0f) {
             int kb = p * n_kv * hd + kvh * hd;
             a += w * cv[kb + d_i];
         }
     }
     int gb = t * n_head * 2 * hd + h * 2 * hd + hd;
-    float g = 1.0f / (1.0f + __expf(-q[gb + d_i]));
+    float g = 1.0f / (1.0f + exp_cr(-q[gb + d_i]));
     out[t * n_head * hd + h * hd + d_i] = a * g;
 }
 
@@ -896,7 +974,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

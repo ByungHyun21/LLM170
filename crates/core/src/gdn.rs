@@ -254,7 +254,7 @@ pub fn gdn_ar_batch(
                     let ks = &k[b * k_stride + kh * d..b * k_stride + kh * d + d];
                     let vs = &v[b * v_stride + h * d..b * v_stride + h * d + d];
                     let beta_h = beta[b * h_v + h];
-                    let g_exp = g[b * h_v + h].exp();
+                    let g_exp = crate::ops::exp_cr(g[b * h_v + h]);
 
                     // S ← S·e^g;  sk[dv] = Σ_kdim S[kdim,dv]·k[kdim]
                     let mut sk = vec![0.0f32; d];

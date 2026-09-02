@@ -439,6 +439,7 @@ pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
     matches!(
         ty,
         llm170_gguf::GgmlType::Iq4Xs
+            | llm170_gguf::GgmlType::Iq3S
             | llm170_gguf::GgmlType::Q3K
             | llm170_gguf::GgmlType::Q4K
             | llm170_gguf::GgmlType::Q5K
@@ -461,6 +462,9 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
             *out_o = match w.ty {
                 llm170_gguf::GgmlType::Q3K => {
                     crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Iq3S => {
+                    crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, &y)
                 }
                 llm170_gguf::GgmlType::Q4K => {
                     crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y)
@@ -531,6 +535,9 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
                 *out_o = match w.ty {
                     llm170_gguf::GgmlType::Q3K => {
                         crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Iq3S => {
+                        crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, y)
                     }
                     llm170_gguf::GgmlType::Q4K => {
                         crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, y)
