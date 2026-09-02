@@ -646,7 +646,7 @@ pub fn dot_row_w4a8_iq4xs_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64; // 스트라이드 매핑 — gemm_q8i 미러
         let start = l;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sb = start + m * 64;
             let (b, ib) = (sb / 8, sb % 8);
@@ -662,9 +662,9 @@ pub fn dot_row_w4a8_iq4xs_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64
                 isum += KVALUES_IQ4NL[(q & 0xF) as usize] as i64 * y_el(y, sb * 32 + j);
                 isum += KVALUES_IQ4NL[(q >> 4) as usize] as i64 * y_el(y, sb * 32 + 16 + j);
             }
-            acc += (y[sb].d * dl * isum as f32) as f64;
+            acc += y[sb].d * dl * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -825,7 +825,7 @@ pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_h + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let h = l + m * 64;
             let local = h % 16;
@@ -853,9 +853,9 @@ pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
                 isum += (qv - sub) * y_el(y, h * 16 + j);
             }
             let yd = y[h / 2].d;
-            acc += (yd * dl * isum as f32) as f64;
+            acc += yd * dl * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -873,7 +873,9 @@ pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        // f32 레인 누산 — GPU f64가 1/16 레이트라 병목 (2026-09-04 RCA).
+        // 커널과 동일 열: f32 가산 후 f64 트리 (tree64)로 결합.
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sb = l + m * 64;
             let js = sb % 8;
@@ -897,10 +899,10 @@ pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
             }
             let yd = y[sb].d;
             // 분할: c1 = yd·(d·sc)·isum, c2 = yd·(dm·m)·qsum — 곱 체인만
-            acc += (yd * (d * sc as f32) * isum as f32) as f64;
-            acc -= (yd * (dm * m_ as f32) * qsum as f32) as f64;
+            acc += yd * (d * sc as f32) * isum as f32;
+            acc -= yd * (dm * m_ as f32) * qsum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -930,7 +932,7 @@ pub fn dot_row_w4a8_q4k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sb = l + m * 64;
             let js = sb % 8;
@@ -951,10 +953,10 @@ pub fn dot_row_w4a8_q4k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
                 qsum += yv;
             }
             let yd = y[sb].d;
-            acc += (yd * (d * sc as f32) * isum as f32) as f64;
-            acc -= (yd * (dm * m_ as f32) * qsum as f32) as f64;
+            acc += yd * (d * sc as f32) * isum as f32;
+            acc -= yd * (dm * m_ as f32) * qsum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -970,7 +972,7 @@ pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sb = l + m * 64;
             let wb = &data[sb * 34..sb * 34 + 34];
@@ -980,9 +982,9 @@ pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
                 isum += (wb[2 + j] as i8) as i64 * y_el(y, sb * 32 + j);
             }
             let yd = y[sb].d;
-            acc += (yd * d * isum as f32) as f64;
+            acc += yd * d * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -998,7 +1000,7 @@ pub fn dot_row_w4a8_iq4nl_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sb = l + m * 64;
             let wb = &data[sb * 18..sb * 18 + 18];
@@ -1010,9 +1012,9 @@ pub fn dot_row_w4a8_iq4nl_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64
                 isum += KVALUES_IQ4NL[(q >> 4) as usize] as i64 * y_el(y, sb * 32 + 16 + j);
             }
             let yd = y[sb].d;
-            acc += (yd * d * isum as f32) as f64;
+            acc += yd * d * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -1030,7 +1032,7 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_g + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let g = l + m * 64;
             let blk = g / 16;
@@ -1057,9 +1059,9 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
             }
             let pos = src;
             let yd = y[(blk * 8 + h * 4 + pos) as usize].d;
-            acc += (yd * d * sc as f32 * isum as f32) as f64;
+            acc += yd * d * sc as f32 * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }
@@ -1093,7 +1095,7 @@ pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
         let cnt = (n_sub + 63 - l) / 64;
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for m in 0..cnt {
             let sub = l + m * 64;
             let blk = sub / 8;
@@ -1126,9 +1128,9 @@ pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
                 }
             }
             let yd = y[sub].d;
-            acc += (yd * db * isum as f32) as f64;
+            acc += yd * db * isum as f32;
         }
-        lane[l] = acc;
+        lane[l] = acc as f64;
     }
     lane
 }

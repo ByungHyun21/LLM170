@@ -171,7 +171,7 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 136;
-    double acc = 0.0;
+    float acc = 0.0f;
     int m = 0;
     // 2-서브블록 ILP — isum 독립 체인, acc 가산은 m 순서 유지 (비트계약)
     for (; m + 1 < cnt; m += 2) {
@@ -215,8 +215,8 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
         }
         float yd0 = __uint_as_float(xq[(n_in >> 2) + sb0]);
         float yd1 = __uint_as_float(xq[(n_in >> 2) + sb1]);
-        acc += (double)(yd0 * dl0 * (float)is0);
-        acc += (double)(yd1 * dl1 * (float)is1);
+        acc += yd0 * dl0 * (float)is0;
+        acc += yd1 * dl1 * (float)is1;
     }
     for (; m < cnt; m++) {
         int sb = l + (m << 6);
@@ -246,19 +246,20 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
             isum = dot4(hi, xq[xw + 4 + k], isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
-        acc += (double)(yd * dl * (float)isum);
+        acc += yd * dl * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -274,7 +275,7 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 176;
-    double acc = 0.0;
+    float acc = 0.0f;  // f32 레인 누산 (f64 1/16 레이트 RCA)
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int js = sb & 7;
@@ -322,20 +323,21 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
         int qsb = (n_in >> 2) + (n_in >> 5);
         int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
-        acc += (double)(yd * (d * (float)sc_v) * (float)isum);
-        acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+        acc += yd * (d * (float)sc_v) * (float)isum;
+        acc -= yd * (dm * (float)m_v) * (float)qsum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;  // f64 트리 — 미러 tree64와 동일 순서
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -350,7 +352,7 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 34;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int wb = row_base + sb * 34;
@@ -374,19 +376,20 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
             isum = dot4(qv, yv, isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
-        acc += (double)(yd * d * (float)isum);
+        acc += yd * d * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -402,9 +405,9 @@ extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 176;
-    double accs[TT];
+    float accs[TT];  // f32 레인 누산 — f64 1/16 레이트가 병목 (RCA 2026-09-04)
     #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int js = sb & 7;
@@ -464,14 +467,14 @@ extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
             int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
             float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
             int q = ti & (TT - 1);
-            accs[q] += (double)(yd * (d * (float)sc_v) * (float)isum);
-            accs[q] -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+            accs[q] += yd * (d * (float)sc_v) * (float)isum;
+            accs[q] -= yd * (dm * (float)m_v) * (float)qsum;
         }
     }
     // 토큰별 트리 환원 — accs[TT] 중 ti 카운트
     __shared__ double sh32[32];
     for (int ti = 0; ti < t; ti++) {
-        double acc = accs[ti & (TT - 1)];
+        double acc = (double)accs[ti & (TT - 1)];
         if (l >= 32) sh32[l - 32] = acc;
         __syncthreads();
         if (l < 32) {
@@ -498,9 +501,9 @@ extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 144;
-    double accs[TT];
+    float accs[TT];
     #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int js = sb & 7;
@@ -546,13 +549,13 @@ extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
             int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
             float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
             int q = ti & (TT - 1);
-            accs[q] += (double)(yd * (d * (float)sc_v) * (float)isum);
-            accs[q] -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+            accs[q] += yd * (d * (float)sc_v) * (float)isum;
+            accs[q] -= yd * (dm * (float)m_v) * (float)qsum;
         }
     }
     __shared__ double sh32[32];
     for (int ti = 0; ti < t; ti++) {
-        double acc = accs[ti & (TT - 1)];
+        double acc = (double)accs[ti & (TT - 1)];
         if (l >= 32) sh32[l - 32] = acc;
         __syncthreads();
         if (l < 32) {
@@ -576,9 +579,9 @@ extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
     int cnt = (n_g + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 210;
-    double accs[TT];
+    float accs[TT];
     #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int g = l + (m << 6);
         int blk = g >> 4;
@@ -624,12 +627,12 @@ extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
             isum -= 32 * (int)xt[(n_in >> 2) + (n_in >> 5) + g];
             float yd = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
             int q = ti & (TT - 1);
-            accs[q] += (double)(yd * d * (float)sc * (float)isum);
+            accs[q] += yd * d * (float)sc * (float)isum;
         }
     }
     __shared__ double sh32[32];
     for (int ti = 0; ti < t; ti++) {
-        double acc = accs[ti & (TT - 1)];
+        double acc = (double)accs[ti & (TT - 1)];
         if (l >= 32) sh32[l - 32] = acc;
         __syncthreads();
         if (l < 32) {
@@ -658,9 +661,9 @@ extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 136;
-    double accs[TT];
+    float accs[TT];
     #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int b = sb >> 3;
@@ -697,12 +700,12 @@ extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
             isum = dot4(hi[2], xt[xw+6], isum); isum = dot4(hi[3], xt[xw+7], isum);
             float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
             int q = ti & (TT - 1);
-            accs[q] += (double)(yd * dl * (float)isum);
+            accs[q] += yd * dl * (float)isum;
         }
     }
     __shared__ double sh32[32];
     for (int ti = 0; ti < t; ti++) {
-        double acc = accs[ti & (TT - 1)];
+        double acc = (double)accs[ti & (TT - 1)];
         if (l >= 32) sh32[l - 32] = acc;
         __syncthreads();
         if (l < 32) {
@@ -728,7 +731,7 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 144;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int js = sb & 7;
@@ -768,20 +771,21 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
         int qsb = (n_in >> 2) + (n_in >> 5);
         int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
-        acc += (double)(yd * (d * (float)sc_v) * (float)isum);
-        acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+        acc += yd * (d * (float)sc_v) * (float)isum;
+        acc -= yd * (dm * (float)m_v) * (float)qsum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -797,7 +801,7 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
     int cnt = (n_g + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 210;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int g = l + (m << 6);
         int blk = g >> 4;
@@ -845,19 +849,20 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
         }
         isum -= 32 * (int)xq[(n_in >> 2) + (n_in >> 5) + g]; // q16[g]=Σy, 체인은 32×Σy
         float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
-        acc += (double)(yd * d * (float)sc * (float)isum);
+        acc += yd * d * (float)sc * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -876,7 +881,7 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 18;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
         int wb = row_base + sb * 18;
@@ -906,19 +911,20 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
             isum = dot4(hi, yhv, isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
-        acc += (double)(yd * d * (float)isum);
+        acc += yd * d * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -934,7 +940,7 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
     int cnt = (n_h + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 110;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int h = l + (m << 6);
         int blk = h >> 4;
@@ -982,19 +988,20 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         }
         isum += bsum - qsum;
         float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
-        acc += (double)(yd * dl * (float)isum);
+        acc += yd * dl * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
@@ -1078,7 +1085,7 @@ extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
     int row_base = o * blocks * 110;
-    double acc = 0.0;
+    float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sub = l + (m << 6);
         int blk = sub >> 3;
@@ -1111,19 +1118,20 @@ extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
             }
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sub]);
-        acc += (double)(yd * db * (float)isum);
+        acc += yd * db * (float)isum;
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
     __shared__ double sh32[32];
-    if (l >= 32) sh32[l - 32] = acc;
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
     __syncthreads();
     if (l < 32) {
-        acc += sh32[l];
+        accd += sh32[l];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-        if (l == 0) out[o] = (float)acc;
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
     }
 }
 
