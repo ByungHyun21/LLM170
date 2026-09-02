@@ -1307,6 +1307,34 @@ extern "C" __global__ void tree_probe(double* out) {
     if (l == 0) { out[0] = a; out[1] = b; out[2] = c; out[3] = d; out[4] = e; }
 }
 
+// dot4 루프-오버헤드 프로브 — 순수 레지스터 체인 vs L1/L2 로드 혼합.
+extern "C" __global__ void dot_roof(const unsigned* xq, const unsigned* w,
+                                    double* out, int mode, int iters, int n_in) {
+    int l = threadIdx.x;
+    unsigned a = xq[l], b = w[l];
+    int acc = 0;
+    if (mode == 0) {
+        // 순수 레지스터 dot 체인 (루프 카운트만)
+        for (int i = 0; i < iters; i++) acc = dot4(a, b, acc);
+    } else if (mode == 1) {
+        // L1/글로벌 로드 동반 (같은 주소 — 캐시 히트)
+        for (int i = 0; i < iters; i++) {
+            unsigned yv = xq[l];
+            unsigned wv = w[l];
+            acc = dot4(wv, yv, acc);
+        }
+    } else {
+        // 스트라이드 로드 (실제 커널 유사 — 캐시라인 분산)
+        for (int i = 0; i < iters; i++) {
+            unsigned yv = xq[(l + i * 64) % (n_in >> 2)];
+            unsigned wv = w[(l + i * 64) % (n_in >> 2)];
+            acc = dot4(wv, yv, acc);
+        }
+    }
+    if (acc == 0x7fffffff) out[0] = 1.0;
+    out[1] = (double)acc;
+}
+
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
 extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1646,7 +1674,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

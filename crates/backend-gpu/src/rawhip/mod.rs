@@ -896,3 +896,48 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let dt = t0.elapsed().as_secs_f64() / reps as f64;
     Ok(format!("tile t={t}: 불일치 {mism}/{} (첫 256행×t) — {:.3}ms → {:.0} GB/s-equiv, 토큰당 {:.1}µs", n_out.min(256) * t, dt * 1e3, w.data.len() as f64 / dt / 1e9, dt * 1e6 / t as f64))
 }
+
+/// dot4 루프-오버헤드 루프 프로브 — 모드별 유효 TIOPS.
+pub fn roof_test() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let n_in = 5120usize;
+    let xq = ctx.alloc(n_in * 4)?;
+    let w = ctx.alloc(n_in * 4)?;
+    let out = ctx.alloc(16)?;
+    let data: Vec<u32> = (0..n_in).map(|i| (i as u32).wrapping_mul(2654435761)).collect();
+    ctx.h2d(xq, bytemuck::cast_slice(&data))?;
+    ctx.h2d(w, bytemuck::cast_slice(&data))?;
+    let mut msg = String::new();
+    for &mode in &[0usize, 1, 2] {
+        let iters = 20000usize;
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut m = mode as i32;
+        let mut it = iters as i32;
+        let mut ni = n_in as i32;
+        let mut args = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+            (&mut m) as *mut _ as *mut std::ffi::c_void,
+            (&mut it) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+        ];
+        // grid: 40CU 채우도록 640블록×64스레드
+        ctx.launch3("dot_roof", 640, 1, 1, 64, &mut args)?;
+        ctx.sync()?;
+        let reps = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            ctx.launch3("dot_roof", 640, 1, 1, 64, &mut args)?;
+        }
+        ctx.sync()?;
+        let dt = t0.elapsed().as_secs_f64() / reps as f64;
+        let total_dots = iters as f64 * 640.0 * 64.0;
+        let tips = total_dots * 4.0 / dt / 1e12; // MAC 4개/dot
+        msg += &format!("mode{mode} ({}): {:.2}ms → {:.2} TIOPS MAC\n",
+            ["reg-chain", "same-addr load", "stride load"][mode], dt * 1e3, tips);
+    }
+    Ok(msg)
+}
