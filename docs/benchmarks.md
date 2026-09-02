@@ -45,7 +45,16 @@ Microbench matrix (ffn_gate, 512 rows): GFLOPS is FLAT ~4 across t in
 (q2) kernel re-reads weights per token with zero batch amortization.
 Fix: token-block accumulation with weights held in registers/L1
 (extend the q3 token-tile design to prefill).
-(tiling/split-K note superseded by the amortization finding.)
+
+Landed same day: gemm_q7 (16-token blocks, unrolled register
+accumulators) + de4 (block-invariant hoisting: one dequant of
+d/dmin/scales per 4-element batch instead of per element). Real-model
+results: **pp64 2.25 -> 13.04 t/s (5.8x), tg24 1.33 -> 2.63 t/s
+(2.0x)** vs llama 143/10.4 targets. Engine-trace (rocprof) analysis:
+decode GEMV already streams at 141 GB/s (llama-level); the remaining
+tg gap is ~280 ms/token of host glue (per-op readback + buffer
+acquire + launch marshalling) — next lever is a device-resident
+decode frame for qwen35 (the qwen4exp frame.rs pattern).
 
 Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
 projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
