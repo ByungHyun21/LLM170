@@ -29,8 +29,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **44.3 t/s** (peak; 43.1 sustained w/ 32-token chunks + xs hybrid) | 0.31x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **34.6 t/s** | ~0.15x |
+| Prefill pp64 | 142.8 t/s | **57.4 t/s** | 0.40x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **42.1 t/s** | ~0.18x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -42,9 +42,11 @@ arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 - MMQ tile kernels (llama.cpp mul_mat_q structure): 64-row x 16-token
   blocks with cooperatively staged unpacked weights and activations in
   shared memory, thread fragments owning sb%4 sub-blocks — bit-exact via
-  paired CPU mirrors (p0+p1+p2+p3 chain). Kernels cover up to 32 tokens
-  per launch; iq4_xs uses a measured hybrid (per-row kernel for <=16
-  tokens where its staging lookup cost exceeds the gain).
+  paired CPU mirrors. Ownership layout follows llama.cpp's MMQ vec_dot:
+  each thread exclusively owns one row x 8 tokens, accumulates in f32
+  registers across all k-chunks (no shared partial-sum round-trip), and
+  hoists its weight words/scales to registers per sub-block, reusing
+  them across every owned token. Covers up to 32 tokens per launch.
 - GPU-resident logits with deterministic on-device argmax
   (lowest-index tie-break, identical semantics to the CPU greedy): 8-byte
   readback per token instead of a full vocabulary transfer.
