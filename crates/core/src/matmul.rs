@@ -409,6 +409,23 @@ pub fn n_threads() -> usize {
 }
 
 /// out[o] = Σ_i x[i]·W[o,i] (단일 토큰). 스레드별 행 슬라이스 소유.
+/// 원시 HIP 디코드 (LLM170_RAWHIP=1) — 백엔드가 상주 DecodeState로
+/// 토큰 1스텝 전체를 수행. 엔진은 임베딩 dequant·pos만 제공.
+pub trait RawDecode: Send + Sync {
+    /// 상태 초기화 (가중치·상수 업로드 1회) — wnames는 필요 텐서명.
+    fn raw_init(
+        &self,
+        hp: &crate::model::hparams::Hparams,
+        weights: &[(String, Weight<'_>)],
+        consts: &[(String, Vec<f32>)],
+        n_seqs: usize,
+        ctx_len: usize,
+        is_recr: Vec<bool>,
+    ) -> Result<(), String>;
+    /// 디코드 1스텝 — emb(임베딩 행) 기록 후 전체 층 수행, logits 반환.
+    fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String>;
+}
+
 /// W4A8 정수 GEMV 경로 활성 (LLM170_W4A8=1) — iq4_xs·q3_K 디코드
 /// matmul을 레인 f64 미러 정수 내적으로 전환. GPU frame/value 경로와
 /// 동일 비트 (그룹핑 무관 설계). 프리필(t>1)은 무관.

@@ -7,6 +7,7 @@ use super::RawCtx;
 use llm170_core::matmul::Weight;
 
 /// 디코드 상주 상태 — 스텝마다 재사용, 해제 없음.
+/// 원시 포인터는 단일 GPU 컨텍스트 소유 — Mutex 직렬화 하 Send 안전.
 pub struct DecodeState {
     pub ctx: RawCtx,
     // 활성/중간 버퍼 (f32 바이트)
@@ -437,3 +438,41 @@ impl DecodeState {
         Ok(out)
     }
 }
+
+
+/// Engine 주입용 RawDecode 구현 — DecodeState를 Mutex로 보관.
+pub struct RawDecoder {
+    st: std::sync::Mutex<Option<DecodeState>>,
+}
+
+impl RawDecoder {
+    pub fn new() -> Self {
+        RawDecoder { st: std::sync::Mutex::new(None) }
+    }
+}
+
+impl llm170_core::matmul::RawDecode for RawDecoder {
+    fn raw_init(
+        &self,
+        hp: &llm170_core::model::hparams::Hparams,
+        weights: &[(String, llm170_core::matmul::Weight<'_>)],
+        consts: &[(String, Vec<f32>)],
+        n_seqs: usize,
+        ctx_len: usize,
+        is_recr: Vec<bool>,
+    ) -> Result<(), String> {
+        let ctx = RawCtx::new()?;
+        let ds = DecodeState::new(ctx, hp, weights, consts, n_seqs, ctx_len, is_recr)?;
+        *self.st.lock().map_err(|e| e.to_string())? = Some(ds);
+        Ok(())
+    }
+
+    fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
+        ds.step(seq, pos)
+    }
+}
+
+unsafe impl Send for DecodeState {}

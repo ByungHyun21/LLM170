@@ -288,6 +288,9 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     } else {
         let m = load_q35_retry(&req.model);
         let mut eng = llm170_core::model::Engine::new(m, n_slots, req.ctx);
+        if std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0") {
+            crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+        }
         match &backend {
             BackendSel::GpuRuntime(rt) => {
                 let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =

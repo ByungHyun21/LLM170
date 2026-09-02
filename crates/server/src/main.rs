@@ -1858,6 +1858,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
+            if std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0") {
+                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+            }
             if backend == "gpu" {
                 let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> = match gpu_runtime
                     .as_str()
@@ -2244,4 +2247,82 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         println!("  첫 불일치 [{o}]: cpu={c:.7e} gpu={gv:.7e}");
     }
     if mism > 0 { ExitCode::FAILURE } else { println!("  ★ 원시 HIP ≡ CPU 비트 일치"); ExitCode::SUCCESS }
+}
+
+/// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
+fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    let hp = eng.model.hp.clone();
+    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
+    let mut wnames: Vec<String> = Vec::new();
+    let mut cnames: Vec<String> = Vec::new();
+    for il in 0..hp.n_layer {
+        cnames.push(format!("blk.{il}.attn_norm"));
+        cnames.push(format!("blk.{il}.post_norm"));
+        if is_recr[il] {
+            for w in ["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_out"] {
+                wnames.push(format!("blk.{il}.{w}.weight"));
+            }
+            cnames.push(format!("blk.{il}.conv_w"));
+            cnames.push(format!("blk.{il}.dt_bias"));
+            cnames.push(format!("blk.{il}.ssm_a"));
+            cnames.push(format!("blk.{il}.ssm_norm"));
+        } else {
+            for w in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+                wnames.push(format!("blk.{il}.{w}.weight"));
+            }
+            cnames.push(format!("blk.{il}.attn_q_norm"));
+            cnames.push(format!("blk.{il}.attn_k_norm"));
+        }
+        for w in ["ffn_gate", "ffn_up", "ffn_down"] {
+            wnames.push(format!("blk.{il}.{w}.weight"));
+        }
+    }
+    wnames.push("output.weight".into());
+    cnames.push("output_norm".into());
+    cnames.push("cs".into());
+    cnames.push("mask".into());
+    let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
+        .iter()
+        .filter_map(|k| eng.model.wchk(k).ok().map(|w| (k.clone(), w)))
+        .collect();
+    if weights.len() != wnames.len() {
+        return Err(format!("rawhip: 가중치 누락 {}/{}", weights.len(), wnames.len()));
+    }
+    let consts: Vec<(String, Vec<f32>)> = cnames
+        .iter()
+        .filter_map(|k| {
+            let v = if k == "cs" || k == "mask" {
+                // frame35 초기화 로직 재현 (ctx 상한 2048)
+                let (n_rot, base) = (hp.n_rot, hp.rope_base);
+                let half = n_rot / 2;
+                let ctx_n = 2048usize;
+                if k == "cs" {
+                    let mut cs = vec![0.0f32; ctx_n * half * 2];
+                    for pos in 0..ctx_n {
+                        for pp in 0..half {
+                            let theta = base.powf(-(2.0 * pp as f32) / n_rot as f32);
+                            let angle = pos as f32 * theta;
+                            cs[pos * half * 2 + pp * 2] = angle.cos();
+                            cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
+                        }
+                    }
+                    Some(cs)
+                } else {
+                    Some(vec![1.0f32; ctx_n])
+                }
+            } else if k.ends_with("conv_w") {
+                eng.model.f32_vec(k).ok().map(|v| v)
+            } else {
+                eng.model.f32_vec(&format!("{k}.weight")).ok()
+            };
+            v.map(|v| (k.clone(), v))
+        })
+        .collect();
+    let rd: std::sync::Arc<llm170_backend_gpu::rawhip::decode::RawDecoder> =
+        std::sync::Arc::new(llm170_backend_gpu::rawhip::decode::RawDecoder::new());
+    use llm170_core::matmul::RawDecode;
+    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), 2048, is_recr)
+        .map_err(|e| format!("raw_init: {e}"))?;
+    eng.raw_decode = Some(rd);
+    Ok(())
 }

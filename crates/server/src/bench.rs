@@ -152,6 +152,9 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             let m = llm170_core::model::Model::load(&model_path)
                 .map_err(|e| e.to_string())?;
             let mut eng = llm170_core::model::Engine::new(m, 1, ctx);
+            if std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0") {
+                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+            }
             if backend == "gpu" {
                 let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> =
                     if gpu_runtime == "vulkan" {

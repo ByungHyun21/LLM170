@@ -153,12 +153,12 @@ impl Model {
         })
     }
 
-    pub(crate) fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
+    pub fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
         self.w(name)
             .ok_or_else(|| ModelError::MissingTensor(name.into()))
     }
 
-    pub(crate) fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+    pub fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
         Ok(self.wchk(name)?.dequant_f32_vec())
     }
 
@@ -216,6 +216,7 @@ pub struct Engine {
     /// 런타임 주입 가속기 (None = CPU 참조 경로). 구현은 backend-gpu.
     pub acc: crate::matmul::Acc,
     /// qwen35 디코드 프레임 (t=1) — LLM170_FRAME35=1 첫 디코드에서 생성.
+    pub raw_decode: Option<std::sync::Arc<dyn crate::matmul::RawDecode>>,
     pub frame35: Option<Frame35>,
     /// 시퀀스별 프레임 상태 유효 플래그 — 값 경로 실행(prefill 등)마다 무효화.
     pub(crate) frame35_clean: Vec<bool>,
@@ -230,6 +231,7 @@ impl Engine {
     pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState::new(&model, ctx)).collect();
         Engine {
+            raw_decode: None,
             frame35: None,
             frame35_clean: vec![false; n_seqs],
             model,
@@ -420,6 +422,24 @@ impl Engine {
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>, ModelError> {
+        // 원시 HIP 디코드 (t=1 단일) — LLM170_RAWHIP=1, 최우선 게이트.
+        if tokens.len() == 1
+            && seq_ids.len() == 1
+            && self.raw_decode.is_some()
+            && std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0")
+        {
+            let seq = seq_ids[0];
+            let token = tokens[0];
+            let n = self.model.hp.n_embd;
+            let embd = self.model.wchk("token_embd.weight")?;
+            let mut row = vec![0.0f32; n];
+            crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
+            let rd = self.raw_decode.as_ref().unwrap();
+            let pos = self.seqs[seq].pos as usize;
+            let logits = rd.raw_step(seq, pos, &row).map_err(ModelError::Accel)?;
+            self.seqs[seq].pos += 1;
+            return Ok(vec![logits]);
+        }
         // qwen35 프레임 (t=1 단일) — LLM170_FRAME35=1 게이트, 실패는 Err 전파.
         if tokens.len() == 1
             && seq_ids.len() == 1
