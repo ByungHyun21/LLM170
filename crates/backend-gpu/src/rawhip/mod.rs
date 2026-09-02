@@ -235,7 +235,7 @@ impl RawCtx {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
             _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
         }
-        let mut xw_a = (n_in / 4 + n_in / 32) as i32;
+        let mut xw_a = (n_in / 4 + n_in / 32 + n_in / 16) as i32;
         args_v.push(&mut xw_a as *mut _ as *mut std::ffi::c_void);
         self.launch3(kern, 1, gy, gz, 64, &mut args_v)?;
         let mut res = vec![0f32; n_out];
@@ -354,7 +354,7 @@ impl RawCtx {
     /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
     /// 버퍼 크기 (n/4 + n/32)·4 바이트 필요.
     pub fn quant_q8(&self, x: *const u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        self.quant_q8_b(x, xq, n, n / 4 + n / 32, 1)
+        self.quant_q8_b(x, xq, n, n / 4 + n / 32 + n / 16, 1)
     }
 
     /// 배치 양자화 — t토큰 [t][n] → [t][xq_w 워드].
@@ -383,7 +383,7 @@ pub fn raw_probe(iters: usize) -> Result<String, String> {
     ctx.h2d(x, bytemuck::cast_slice(&xh))?;
     let nblk = n / 32;
     let gx = nblk.div_ceil(64) as u32;
-    let mut xq = ctx.alloc((n / 4 + n / 32) * 4)?;
+    let mut xq = ctx.alloc((n / 4 + n / 32 + n / 16) * 4)?;
     let mut xp = x as *mut std::ffi::c_void;
     let mut xqp = xq as *mut std::ffi::c_void;
     let mut na = n as i32;
@@ -720,10 +720,10 @@ pub fn batch_ab_test() -> Result<String, String> {
     for xr in [&x0, &x1] {
         let xd = ctx.alloc(n_in * 4)?;
         ctx.h2d(xd, bytemuck::cast_slice(xr))?;
-        let xq = ctx.alloc((n_in / 4 + n_in / 32) * 4)?;
+        let xq = ctx.alloc((n_in / 4 + n_in / 32 + n_in / 16) * 4)?;
         ctx.quant_q8(xd, xq, n_in)?;
         let out = ctx.alloc(n_out * 4)?;
-        ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, n_in / 4 + n_in / 32, 1)?;
+        ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)?;
         let mut o = vec![0f32; n_out];
         ctx.sync()?;
         ctx.d2h(bytemuck::cast_slice_mut(&mut o).as_mut(), out)?;
@@ -734,7 +734,7 @@ pub fn batch_ab_test() -> Result<String, String> {
     xall.extend_from_slice(&x1);
     let xd = ctx.alloc(n_in * 2 * 4)?;
     ctx.h2d(xd, bytemuck::cast_slice(&xall))?;
-    let xq_w = n_in / 4 + n_in / 32;
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
     let xq = ctx.alloc(xq_w * 4 * 2)?;
     ctx.quant_q8_b(xd, xq, n_in, xq_w, 2)?;
     let out = ctx.alloc(n_out * 4 * 2)?;
@@ -779,7 +779,7 @@ pub fn mm_batch_bench() -> Result<String, String> {
     }).collect();
     let kt_d = ctx.alloc(1024)?;
     ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
-    let xq_w = n_in / 4 + n_in / 32;
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
     let mut seed = 0x9e3779b9u64;
     let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
     let x: Vec<f32> = (0..n_in * 64).map(|_| lcg()).collect();
@@ -823,7 +823,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     }).collect();
     let kt_d = ctx.alloc(1024)?;
     ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
-    let xq_w = n_in / 4 + n_in / 32;
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
     let mut seed = 0x9e3779b9u64;
     let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
     let t = 16usize;
@@ -843,6 +843,12 @@ pub fn mm_tile_bench() -> Result<String, String> {
             }
         }
         for blk in tok { xq_h.push(blk.d.to_bits()); }
+        for blk in tok {
+            let s0: i32 = blk.qs[..16].iter().map(|&v| v as i32).sum();
+            let s1: i32 = blk.qs[16..].iter().map(|&v| v as i32).sum();
+            xq_h.push(s0 as u32);
+            xq_h.push(s1 as u32);
+        }
     }
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;

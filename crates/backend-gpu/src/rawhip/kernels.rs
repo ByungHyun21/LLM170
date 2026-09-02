@@ -116,6 +116,7 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_
     x += (size_t)blockIdx.y * n;
     xq += (size_t)blockIdx.y * xq_w;
     int nwords = n >> 2;
+    int qs0 = 0, qs1 = 0;
     int base = lb << 5;
     float amax = 0.0f;
     for (int i = 0; i < 32; i++) {
@@ -135,8 +136,12 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_
             word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
         }
         xq[lb * 8 + wi] = word;
+        if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
+        else qs1 = dot4(0x01010101u, word, qs1);
     }
     xq[nwords + lb] = __float_as_uint(d); // d 비트 편승 (u32 저장 경로)
+    xq[nwords + nblk + 2 * lb] = (unsigned)qs0;      // q16 테이블 (하위 16원소합)
+    xq[nwords + nblk + 2 * lb + 1] = (unsigned)qs1;
 }
 
 // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
@@ -300,7 +305,7 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
         // dot4 재작성 — 워드 단위 SIMD-in-register (llama.cpp MMVQ 패턴)
         int nsh = half << 2;
         unsigned hbit = 1u << sh;
-        int isum = 0, qsum = 0;
+        int isum = 0;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
             unsigned qv = k < 4 ? (k==0?q0:k==1?q1:k==2?q2:q3) : (k==4?q4:k==5?q5:k==6?q6:q7);
@@ -309,8 +314,9 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
             unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
             unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4; // 레인 0x00/0x10
             isum = dot4(nibw | bitw, yv, isum);
-            qsum = dot4(0x01010101u, yv, qsum);
         }
+        int qsb = (n_in >> 2) + (n_in >> 5);
+        int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
@@ -443,17 +449,15 @@ extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
         // 토큰 타일 — isum/토큰, 가중 워드는 루프 외 1회
         for (int ti = 0; ti < t; ti++) {
             const unsigned* xt = xq + ti * xq_w;
-            int isum = 0, qsum = 0;
+            int isum = 0;
             unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
             unsigned y4v = xt[xw+4], y5v = xt[xw+5], y6v = xt[xw+6], y7v = xt[xw+7];
             isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
             isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
             isum = dot4(wv4, y4v, isum); isum = dot4(wv5, y5v, isum);
             isum = dot4(wv6, y6v, isum); isum = dot4(wv7, y7v, isum);
-            qsum = dot4(0x01010101u, y0v, qsum); qsum = dot4(0x01010101u, y1v, qsum);
-            qsum = dot4(0x01010101u, y2v, qsum); qsum = dot4(0x01010101u, y3v, qsum);
-            qsum = dot4(0x01010101u, y4v, qsum); qsum = dot4(0x01010101u, y5v, qsum);
-            qsum = dot4(0x01010101u, y6v, qsum); qsum = dot4(0x01010101u, y7v, qsum);
+            int qsb = (n_in >> 2) + (n_in >> 5);
+            int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
             float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
             int q = ti & (TT - 1);
             accs[q] += (double)(yd * (d * (float)sc_v) * (float)isum);
@@ -527,17 +531,15 @@ extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
         int xw = (sb << 5) >> 2;
         for (int ti = 0; ti < t; ti++) {
             const unsigned* xt = xq + ti * xq_w;
-            int isum = 0, qsum = 0;
+            int isum = 0;
             unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
             unsigned y4v = xt[xw+4], y5v = xt[xw+5], y6v = xt[xw+6], y7v = xt[xw+7];
             isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
             isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
             isum = dot4(wv4, y4v, isum); isum = dot4(wv5, y5v, isum);
             isum = dot4(wv6, y6v, isum); isum = dot4(wv7, y7v, isum);
-            qsum = dot4(0x01010101u, y0v, qsum); qsum = dot4(0x01010101u, y1v, qsum);
-            qsum = dot4(0x01010101u, y2v, qsum); qsum = dot4(0x01010101u, y3v, qsum);
-            qsum = dot4(0x01010101u, y4v, qsum); qsum = dot4(0x01010101u, y5v, qsum);
-            qsum = dot4(0x01010101u, y6v, qsum); qsum = dot4(0x01010101u, y7v, qsum);
+            int qsb = (n_in >> 2) + (n_in >> 5);
+            int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
             float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
             int q = ti & (TT - 1);
             accs[q] += (double)(yd * (d * (float)sc_v) * (float)isum);
@@ -611,13 +613,11 @@ extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
         int xw = (g << 4) >> 2;
         for (int ti = 0; ti < t; ti++) {
             const unsigned* xt = xq + ti * xq_w;
-            int isum = 0, qsum = 0;
+            int isum = 0;
             unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
             isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
             isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
-            qsum = dot4(0x20202020u, y0v, qsum); qsum = dot4(0x20202020u, y1v, qsum);
-            qsum = dot4(0x20202020u, y2v, qsum); qsum = dot4(0x20202020u, y3v, qsum);
-            isum -= qsum;
+            isum -= 32 * (int)xt[(n_in >> 2) + (n_in >> 5) + g];
             float yd = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
             int q = ti & (TT - 1);
             accs[q] += (double)(yd * d * (float)sc * (float)isum);
@@ -749,15 +749,16 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
         int nsh = half << 2;
-        int isum = 0, qsum = 0;
+        int isum = 0;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
             unsigned qv = k < 4 ? (k==0?q0:k==1?q1:k==2?q2:q3) : (k==4?q4:k==5?q5:k==6?q6:q7);
             unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
             unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
             isum = dot4(nibw, yv, isum);
-            qsum = dot4(0x01010101u, yv, qsum);
         }
+        int qsb = (n_in >> 2) + (n_in >> 5);
+        int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
@@ -824,7 +825,7 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
         //   Σw·y = Σ(nib + 16·hi2)·y − 32·Σy  (레인 내 덧셈 ≤ 63 — 캐리 없음)
         int nsh = (src == 0 || src == 1) ? 0 : 4;
         int hsh = 2 * src;
-        int isum = 0, qsum = 0;
+        int isum = 0;
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             unsigned qv = k==0?qa0:k==1?qa1:k==2?qa2:qa3;
@@ -833,9 +834,8 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
             unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
             unsigned hi16w = (hv >> hsh) & 0x03030303u;
             isum = dot4(nibw + (hi16w << 4), yv, isum);
-            qsum = dot4(0x20202020u, yv, qsum);
         }
-        isum -= qsum;
+        isum -= 32 * (int)xq[(n_in >> 2) + (n_in >> 5) + g]; // q16[g]=Σy, 체인은 32×Σy
         float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
         acc += (double)(yd * d * (float)sc * (float)isum);
     }

@@ -33,7 +33,7 @@ pub struct DecodeState {
     // q8 통합 버퍼 (워드+d비트)
     pub xq_n: *mut u8,    // (n_embd/4 + n_embd/32)*4
     pub xq_f: *mut u8,    // (n_ff/4 + n_ff/32)*4
-    pub xq_g: *mut u8,    // (6144/4 + 6144/32)*4
+    pub xq_g: *mut u8,    // (6144/4 + 6144/32 + 6144/16)*4
     // 어텐션
     pub aq: *mut u8,      // [n_head*2*hd]
     pub ak: *mut u8,      // [n_kv*hd]
@@ -169,9 +169,9 @@ impl DecodeState {
         // 배치 아레나 (t_max=64)
         let t_max = 64usize;
         let (n_kv, hd) = (hp.n_kv, hp.head_dim);
-        let xq_sn = n / 4 + n / 32;
-        let xq_sf = n_ff / 4 + n_ff / 32;
-        let xq_sg = d_inner / 4 + d_inner / 32;
+        let xq_sn = n / 4 + n / 32 + n / 16;
+        let xq_sf = n_ff / 4 + n_ff / 32 + n_ff / 16;
+        let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
         let b_xs_t = bs(t_max * n * 4);
         let b_xn_t = bs(t_max * n * 4);
         let b_xq_n_t = bs(t_max * xq_sn * 4);
@@ -204,7 +204,7 @@ impl DecodeState {
         let (b_ggated, b_gout) = (bs(d_inner * 4), bs(n * 4));
         let (b_fgate, b_fup, b_fglu, b_fdown) = (bs(n_ff * 4), bs(n_ff * 4), bs(n_ff * 4), bs(n * 4));
         let b_logits = bs(hp.vocab * 4);
-        let (b_xqn, b_xqf, b_xqg) = (bs((n / 4 + n / 32) * 4), bs((n_ff / 4 + n_ff / 32) * 4), bs((g6 / 4 + g6 / 32) * 4));
+        let (b_xqn, b_xqf, b_xqg) = (bs((n / 4 + n / 32 + n / 16) * 4), bs((n_ff / 4 + n_ff / 32 + n_ff / 16) * 4), bs((g6 / 4 + g6 / 32 + g6 / 16) * 4));
         let (b_aq, b_ak, b_av) = (bs(hp.n_head * 2 * hp.head_dim * 4), bs(hp.n_kv * hp.head_dim * 4), bs(hp.n_kv * hp.head_dim * 4));
         let (b_aout, b_scores, b_p64) = (bs(hp.n_head * hp.head_dim * 4), bs(hp.n_head * ctx_len * 4), bs(max_rows * 32 * 8));
         let ds = DecodeState {
@@ -238,7 +238,7 @@ impl DecodeState {
     /// GEMV를 상주 out에 직접 기록 (gemv_q8의 내부 out을 복사 없이 쓰기 위해
     /// out 포인터를 받는 변형이 필요 — 현재는 gemv 후 d2h→h2d. 최적화 후술.)
     fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
-        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32, 1)
+        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
     }
     fn ew_l(&self, name: &str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
         self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
@@ -458,7 +458,7 @@ impl DecodeState {
                         };
                         eprintln!("#  A3dbg host-mirror av[0]={mv:e} d={:e} d_bits={:#x}", y[0].d, y[0].d.to_bits());
                     }
-                    let mut hq8 = vec![0u8; (n / 4 + n / 32) * 4];
+                    let mut hq8 = vec![0u8; (n / 4 + n / 32 + n / 16) * 4];
                     self.ctx.d2h(&mut hq8, self.xq_n)?;
                     let w0 = u32::from_le_bytes([hq8[0], hq8[1], hq8[2], hq8[3]]);
                     eprintln!("#  A3dbg xq_n word0={w0:#010x} d0={:e}", f32::from_bits(u32::from_le_bytes([hq8[n], hq8[n+1], hq8[n+2], hq8[n+3]])));
@@ -684,9 +684,9 @@ impl DecodeState {
         let n = self.n_embd;
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
-        let xq_sn = n / 4 + n / 32;
-        let xq_sf = self.n_ff / 4 + self.n_ff / 32;
-        let xq_sg = self.d_inner / 4 + self.d_inner / 32;
+        let xq_sn = n / 4 + n / 32 + n / 16;
+        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
+        let xq_sg = self.d_inner / 4 + self.d_inner / 32 + self.d_inner / 16;
         self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
         let cs = *self.consts.get("cs").ok_or("cs")?;
         let mask = *self.consts.get("mask").ok_or("mask")?;
@@ -775,6 +775,18 @@ impl DecodeState {
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
                     self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, 1, 1, 128, &mut args)?;
+                }
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                    self.ctx.sync()?;
+                    let mut hq = vec![0f32; k_len * t];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq_t)?;
+                    let mut xq_: u64 = 0;
+                    for &v in &hq { xq_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    let mut ho = vec![0f32; v_len * t];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.go_t)?;
+                    let mut xo_: u64 = 0;
+                    for &v in &ho { xo_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    eprintln!("#  G0dbg batch gq xor={xq_:016x} go xor={xo_:016x}");
                 }
                 // norm_gated 전체 배치 (gy=t)
                 {
@@ -951,7 +963,7 @@ impl DecodeState {
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
     #[allow(clippy::too_many_arguments)]
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        if matches!(ty, 12 | 13 | 14 | 23) && t > 1 {
+        if matches!(ty, 12 | 13 | 14 | 23) && t > 1 && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
         }
