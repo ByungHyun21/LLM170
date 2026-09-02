@@ -1,6 +1,5 @@
 plans/
-source/*
-!source/research/
+source/
 target/
 __pycache__/
 AGENTS.md
