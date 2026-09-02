@@ -1,0 +1,235 @@
+//! 원시 HIP 커널 소스 — core 미러(dot_row_w4a8_*_lane)와 동일 연산열.
+//! 스트라이드 레인(레인 l: 서브블록 l, l+64, …), f64 부분합, 레인 순서
+//! 합 후 1회 f32 캐스트. 그룹핑 무관 비트 일치 설계 (2026-09-02 k2).
+
+pub const SRC: &str = r#"
+#define DEV __device__ __forceinline__
+
+DEV int sext8(unsigned v) { int x = (int)(v & 0xFFu); return x - ((x & 0x80) ? 256 : 0); }
+DEV float bits_f16(unsigned h) {
+    unsigned sign = (h & 0x8000u) << 16;
+    unsigned exp = (h >> 10) & 0x1Fu;
+    unsigned frac = h & 0x3FFu;
+    if (exp == 0) {
+        if (frac == 0) return __int_as_float(sign);
+        float v = (float)frac * (1.0f / 16777216.0f);
+        return sign ? -v : v;
+    }
+    if (exp == 31) return __int_as_float(sign | 0x7F800000u | (frac << 13));
+    return __int_as_float(sign | ((exp + 112) << 23) | (frac << 13));
+}
+DEV float f16w(const unsigned* w, int wb) {
+    return bits_f16((w[wb >> 2] >> ((wb & 3) * 8)) & 0xFFFFu);
+}
+DEV unsigned byte(const unsigned* w, int i) {
+    return (w[i >> 2] >> ((i & 3) * 8)) & 0xFFu;
+}
+
+// 활성 양자화 — rust quantize_row_q8_ref 미러 (round half away 산술 구현)
+extern "C" __global__ void quant_q8(const float* x, unsigned* xq, float* xd, int n) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int nblk = n >> 5;
+    if (b >= nblk) return;
+    int base = b << 5;
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = x[base + i];
+        float a = v < 0.0f ? -v : v;
+        amax = a > amax ? a : amax;
+    }
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    #pragma unroll
+    for (int wi = 0; wi < 8; wi++) {
+        unsigned word = 0u;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float xv = x[base + wi * 4 + k] * id;
+            float r = xv >= 0.0f ? (float)(int)(xv + 0.5f)
+                                : -((float)(int)(0.5f - xv));
+            float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+            word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
+        }
+        xq[b * 8 + wi] = word;
+    }
+    xd[b] = d;
+}
+
+// reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
+extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+    double acc = 0.0;
+    #pragma unroll
+    for (int l = 0; l < 64; l++) acc += part[o * 64 + l];
+    out[o] = (float)acc;
+}
+
+// ─── W4A8 GEMV t=1 — 스트라이드 레인, f64 부분합 ───
+// iq4_xs (ty16)
+extern "C" __global__ void gemm_xs(const unsigned* xq, const float* xd, const unsigned* w,
+                                   double* part, const unsigned* ktab2, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 136;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int b = sb >> 3;
+        int ib = sb - (b << 3);
+        int wb = row_base + b * 136;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        unsigned w1 = w[wq + 1];
+        float d = bits_f16(w0 & 0xFFFFu);
+        unsigned scales_h = w0 >> 16;
+        int qw = (wb + 8 + ib * 16) >> 2;
+        unsigned q0 = w[qw], q1 = w[qw+1], q2 = w[qw+2], q3 = w[qw+3];
+        unsigned nib = (w1 >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu;
+        int ls = (int)nib | (int)(((scales_h >> (2 * ib)) & 3u) << 4);
+        float dl = d * (float)(ls - 32);
+        int isum = 0;
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned qv, ylv, yhv;
+            int wi = j >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: qv = q0; ylv = y0; yhv = y4; break;
+                case 1: qv = q1; ylv = y1; yhv = y5; break;
+                case 2: qv = q2; ylv = y2; yhv = y6; break;
+                default: qv = q3; ylv = y3; yhv = y7; break;
+            }
+            unsigned t = ktab2[(qv >> sk) & 0xFFu];
+            isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
+            isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
+        }
+        float yd = xd[sb];
+        acc += (double)(yd * dl * (float)isum);
+    }
+    part[o * 64 + l] = acc;
+}
+
+// q5_K (ty13) — 분할 형태(곱 체인 2개), qh 비트, 스케일 scale_min_k4
+extern "C" __global__ void gemm_q5k(const unsigned* xq, const float* xd, const unsigned* w,
+                                    double* part, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 176;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int js = sb & 7;
+        int it = js >> 1;
+        int half = js & 1;
+        int wb = row_base + (sb >> 3) * 176;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        float dm = bits_f16(w0 >> 16);
+        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+        unsigned r = (js & 3) * 8;
+        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+        unsigned sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        int qhw = wq + 4;
+        unsigned h0 = w[qhw], h1 = w[qhw+1], h2 = w[qhw+2], h3 = w[qhw+3];
+        unsigned h4 = w[qhw+4], h5 = w[qhw+5], h6 = w[qhw+6], h7 = w[qhw+7];
+        int qlb = wq + 12 + it * 8;
+        unsigned q0 = w[qlb], q1 = w[qlb+1], q2 = w[qlb+2], q3 = w[qlb+3];
+        unsigned q4 = w[qlb+4], q5 = w[qlb+5], q6 = w[qlb+6], q7 = w[qlb+7];
+        int sh = 2 * it + half;
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int isum = 0, qsum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            unsigned qv, hv, yv;
+            int wi = j >> 2, k = j & 3;
+            switch (wi) {
+                case 0: qv = q0; hv = h0; yv = y0; break;
+                case 1: qv = q1; hv = h1; yv = y1; break;
+                case 2: qv = q2; hv = h2; yv = y2; break;
+                case 3: qv = q3; hv = h3; yv = y3; break;
+                case 4: qv = q4; hv = h4; yv = y4; break;
+                case 5: qv = q5; hv = h5; yv = y5; break;
+                case 6: qv = q6; hv = h6; yv = y6; break;
+                default: qv = q7; hv = h7; yv = y7; break;
+            }
+            int sk = k * 8;
+            unsigned nib = half == 0 ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
+            unsigned t = (hv >> (sk + sh)) & 1u;
+            int hi = (int)t * 16;
+            int y8 = sext8((yv >> sk) & 0xFFu);
+            isum += ((int)nib + hi) * y8;
+            qsum += y8;
+        }
+        float yd = xd[sb];
+        acc += (double)(yd * (d * (float)sc_v) * (float)isum);
+        acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+    }
+    part[o * 64 + l] = acc;
+}
+
+// q8_0 (ty8)
+extern "C" __global__ void gemm_q8_0(const unsigned* xq, const float* xd, const unsigned* w,
+                                     double* part, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int row_base = o * n_sub * 34;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + sb * 34;
+        float d = f16w(w, wb);
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            int qv = sext8(byte(w, wb + 2 + j));
+            unsigned yv; int wi = j >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: yv = y0; break; case 1: yv = y1; break;
+                case 2: yv = y2; break; case 3: yv = y3; break;
+                case 4: yv = y4; break; case 5: yv = y5; break;
+                case 6: yv = y6; break; default: yv = y7; break;
+            }
+            isum += qv * sext8((yv >> sk) & 0xFFu);
+        }
+        float yd = xd[sb];
+        acc += (double)(yd * d * (float)isum);
+    }
+    part[o * 64 + l] = acc;
+}
+"#;
+
+pub const NAMES: &[&str] = &[
+    "quant_q8",
+    "reduce64",
+    "gemm_xs",
+    "gemm_q5k",
+    "gemm_q8_0",
+];

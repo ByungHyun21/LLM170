@@ -110,6 +110,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("rawhip-check") => cmd_rawhip_check(&args[1..]),
         Some("gpu-raw-probe") => {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             match llm170_backend_gpu::rawhip::raw_probe(iters) {
@@ -2095,4 +2096,105 @@ fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
+}
+
+/// llm170 rawhip-check <file> <tensor> — 원시 HIP GEMV(quant·gemm·reduce)
+/// 대 CPU 레인 미러 to_bits 전행 검증 + 속도.
+fn cmd_rawhip_check(args: &[String]) -> ExitCode {
+    use llm170_backend_gpu::rawhip::RawCtx;
+    if args.len() < 2 {
+        eprintln!("usage: llm170 rawhip-check <file> <tensor>");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => { eprintln!("tensor not found: {}", args[1]); return ExitCode::FAILURE; }
+    };
+    if !llm170_core::matmul::w4a8_ty(w.ty) || w.ty == llm170_gguf::GgmlType::Q3K
+        || w.ty == llm170_gguf::GgmlType::Q4K || w.ty == llm170_gguf::GgmlType::Q6K
+        || w.ty == llm170_gguf::GgmlType::Iq4Nl {
+        eprintln!("rawhip-check: 현 단계 iq4_xs·q5_K·q8_0 전용");
+        return ExitCode::FAILURE;
+    }
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let ctx = match RawCtx::new() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    // CPU 양자화 + 패킹 (GPU quant 검증은 다음 단계)
+    let y = llm170_core::quant::quantize_row_q8_ref(&x);
+    let mut qs_words = Vec::with_capacity(n_in / 4);
+    for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
+        let mut word = 0u32;
+        for (i, b) in c.iter().enumerate() {
+            word |= (**b as u8 as u32) << (8 * i);
+        }
+        qs_words.push(word);
+    }
+    let ds: Vec<f32> = y.iter().map(|b| b.d).collect();
+    // ktab2
+    let ktab2: Vec<u32> = (0..256u32)
+        .map(|b| {
+            let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+            let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+            lo | (hi << 8)
+        })
+        .collect();
+    let xq_d = match ctx.alloc(n_in) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    let xd_d = match ctx.alloc(n_in / 32 * 4) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    let w_d = match ctx.alloc(w.data.len()) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    let kt_d = match ctx.alloc(1024) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
+    if let Err(e) = ctx.h2d(xq_d, bytemuck::cast_slice(&qs_words)).and_then(|_| ctx.h2d(xd_d, bytemuck::cast_slice(&ds)))
+        .and_then(|_| ctx.h2d(w_d, w.data)).and_then(|_| ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))) {
+        eprintln!("upload: {e}"); return ExitCode::FAILURE;
+    }
+    // 워밍 + 측정
+    let ty = w.ty as u32;
+    let _ = match ctx.gemv_q8(xq_d as *const u8, xd_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
+    };
+    let reps = 30;
+    let t0 = std::time::Instant::now();
+    let mut g = Vec::new();
+    for _ in 0..reps {
+        g = match ctx.gemv_q8(xq_d as *const u8, xd_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
+        };
+    }
+    let dt = t0.elapsed().as_secs_f64() / reps as f64;
+    // to_bits 전행 비교
+    let blck = w.ty.blck_size() as usize;
+    let bsize = w.ty.type_size() as usize;
+    let rb = (n_in / blck) * bsize;
+    let mut mism = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for o in 0..n_out {
+        let row = &w.data[o * rb..];
+        let c = match w.ty {
+            llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Q8_0 => llm170_core::quant::dot_row_w4a8_q8_0_lane(row, n_in as u64, &y),
+            _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
+        };
+        if c.to_bits() != g[o].to_bits() {
+            mism += 1;
+            if first.is_none() { first = Some((o, c, g[o])); }
+        }
+    }
+    println!("[{}] {}: 원시 GEMV 불일치 {mism}/{n_out} — {:.0}µs/op {:.0}GB/s", w.ty.name(), args[1], dt * 1e6, w.data.len() as f64 / dt / 1e9);
+    if let Some((o, c, gv)) = first {
+        println!("  첫 불일치 [{o}]: cpu={c:.7e} gpu={gv:.7e}");
+    }
+    if mism > 0 { ExitCode::FAILURE } else { println!("  ★ 원시 HIP ≡ CPU 비트 일치"); ExitCode::SUCCESS }
 }
