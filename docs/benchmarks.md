@@ -28,9 +28,9 @@ cross-verification against per-token):
 
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **9.6 t/s** (peak; thermal floor ~8.4 sustained) | 0.92x |
-| Prefill pp64 | 142.8 t/s | **24.7 t/s** | 0.17x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **21.0 t/s** | ~0.09x |
+| Decode tg24, t=1 | 10.4 t/s | **9.6 t/s** (peak; ~8.6 sustained at the 85W/1000MHz power cap) | 0.92x |
+| Prefill pp64 | 142.8 t/s | **33.7 t/s** | 0.24x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **27.3 t/s** | ~0.12x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -39,6 +39,10 @@ streams** — zero quantization-induced divergence on this benchmark.
 Key techniques (kernels are HIP C++ strings JIT-compiled via hipRTC,
 arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 
+- f32 lane accumulation: consumer-RDNA f64 runs at 1/16 rate and was
+  ~80% of GEMV issue bandwidth; all lane partials accumulate in f32
+  (mirrors redefined in lockstep — the bit contract is kernel==mirror),
+  combined through an f64 tree reduction.
 - `__ockl_sdot4` integer dot (i8x4 lanes) for all K-quant GEMV
   (llama.cpp MMVQ analog). Lane-wise u32 subtraction is forbidden
   (borrow crosses lanes) — decompose into separate dot chains instead.
