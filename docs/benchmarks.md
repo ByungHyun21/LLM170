@@ -25,8 +25,8 @@ Current standing (GPU backend, single-tenant `llm170 bench`, 2026-09-02):
 
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **3.86 t/s** | 0.37x |
-| Prefill pp64 | 142.8 t/s (418-tok case) | **13.04 t/s** | 0.09x |
+| Decode tg24, t=1 | 10.4 t/s | **6.96 t/s** | 0.67x |
+| Prefill pp64 | 142.8 t/s (418-tok case) | **10.26 t/s** (W4A8; f32 path 13.8 but CPU-inconsistent) | 0.07x |
 
 Session progression (same binary lineage, gfx1151):
 
@@ -57,6 +57,16 @@ Session progression (same binary lineage, gfx1151):
   `ffn_up` 18 -> **50 GB/s** isolated; decode tg24 **3.56 -> 3.86 t/s**
   (2026-09-02, minimal-prefill measurement; a preceding 22-min pp512 run
   measurably throttles the APU and masks gains — measure tg with --pp 8).
+- W4A8 full rollout (2026-09-02, `LLM170_W4A8=1`): all 7 quant types on the
+  integer path (iq4_xs/q3_K/q4_K/q5_K/q6_K/q8_0/iq4_nl), the attention
+  CPU bridge removed via an f64-intermediate rms+rope kernel (FMA-contraction
+  immune — the technique that unlocked what P1 deemed impossible), and
+  prefill GEMMs on weight-amortized batch kernels. Decode **tg24 3.86 ->
+  6.96 t/s**; every step verified GPU==CPU greedy-stream identical.
+  Prefill W4A8 = 10.26 t/s vs the f32 path's 13.8 — the f32 path is
+  faster but CPU/GPU numerically inconsistent (near-tie divergence), so
+  W4A8 is kept for correctness; structural prefill work (host round-trips,
+  GDN chunk) is the remaining path to 143.
 - W4A8 integer-MAC prototype (`gemm_q8i`, 2026-09-02): activations
   quantized to q8 (per-32-block scales), integer accumulation, per-block
   float contributions accumulated in **f64 lane partials** — grouping-
