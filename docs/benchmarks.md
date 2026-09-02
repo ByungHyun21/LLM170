@@ -28,9 +28,9 @@ cross-verification against per-token):
 
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **10.0 t/s** | 0.97x |
-| Prefill pp64 | 142.8 t/s | **34.5 t/s** | 0.24x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **28.3 t/s** | ~0.12x |
+| Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
+| Prefill pp64 | 142.8 t/s | **34.0 t/s** | 0.24x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **28.2 t/s** | ~0.12x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -39,6 +39,9 @@ streams** — zero quantization-induced divergence on this benchmark.
 Key techniques (kernels are HIP C++ strings JIT-compiled via hipRTC,
 arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 
+- GPU-resident logits with deterministic on-device argmax
+  (lowest-index tie-break, identical semantics to the CPU greedy): 8-byte
+  readback per token instead of a full vocabulary transfer.
 - f32 lane accumulation: consumer-RDNA f64 runs at 1/16 rate and was
   ~80% of GEMV issue bandwidth; all lane partials accumulate in f32
   (mirrors redefined in lockstep — the bit contract is kernel==mirror),
