@@ -64,6 +64,12 @@ PLE/QSA value bridges (not yet framed). qwen35 has no frame yet —
 same pattern extends (all layer kernels already on GPU per rocprof
 trace: gdn_ar, conv, beta_g, norm_gated, qsa_mix/score).
 
+ROCm 10 runtime comparison (same kernels, isolated target dir):
+qwen35 pp64 13.18 / tg24 2.52; qwen4exp (frame) pp32 5.93 / tg16
+2.32 — all within run-to-run noise of the ROCm 7.2.2 numbers above.
+The runtime version is not a factor in the current gap; remaining
+levers are architectural (frame coverage, kernel throughput).
+
 Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
 projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
 call, down as paired batch), GDN ~126 ms (CPU recurrence — GPU kernel is the
