@@ -77,10 +77,33 @@ pub fn rms_rows(
     let xb = row * n;
     let wb = (row % w_reps) * n;
     let eps = f64::cast_from(params[0]);
+    // 8-선발행: 로드 독립 발행으로 지연 은닉 — 누산은 i 오름차순(비트 불변).
+    // 단일 유닛 순차 체인이 460µs/행이던 근원 (2026-09-02 frame35 rocprof).
     let mut sum = 0.0f64;
-    for i in 0..n {
-        let d = f64::cast_from(x[xb + i]);
+    let mut i0 = 0usize;
+    while i0 + 8 <= n {
+        let d0 = f64::cast_from(x[xb + i0]);
+        let d1 = f64::cast_from(x[xb + i0 + 1]);
+        let d2 = f64::cast_from(x[xb + i0 + 2]);
+        let d3 = f64::cast_from(x[xb + i0 + 3]);
+        let d4 = f64::cast_from(x[xb + i0 + 4]);
+        let d5 = f64::cast_from(x[xb + i0 + 5]);
+        let d6 = f64::cast_from(x[xb + i0 + 6]);
+        let d7 = f64::cast_from(x[xb + i0 + 7]);
+        sum += d0 * d0;
+        sum += d1 * d1;
+        sum += d2 * d2;
+        sum += d3 * d3;
+        sum += d4 * d4;
+        sum += d5 * d5;
+        sum += d6 * d6;
+        sum += d7 * d7;
+        i0 += 8;
+    }
+    while i0 < n {
+        let d = f64::cast_from(x[xb + i0]);
         sum += d * d;
+        i0 += 1;
     }
     let len = f64::cast_from(n as u32);
     let scale32 = f32::cast_from((sum / len + eps).sqrt());

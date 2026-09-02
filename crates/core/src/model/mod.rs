@@ -10,6 +10,8 @@
 
 pub mod hparams;
 mod layers;
+pub(crate) mod frame35;
+pub use frame35::Frame35;
 
 use hparams::Hparams;
 use llm170_gguf::GgufFile;
@@ -151,12 +153,12 @@ impl Model {
         })
     }
 
-    fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
+    pub(crate) fn wchk(&self, name: &str) -> Result<Weight<'_>, ModelError> {
         self.w(name)
             .ok_or_else(|| ModelError::MissingTensor(name.into()))
     }
 
-    fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+    pub(crate) fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
         Ok(self.wchk(name)?.dequant_f32_vec())
     }
 
@@ -170,8 +172,8 @@ pub struct SeqState {
     pub pos: u32,
     kv_k: Vec<Vec<f32>>,
     kv_v: Vec<Vec<f32>>,
-    gdn_s: Vec<Vec<f32>>,
-    conv: Vec<Vec<f32>>,
+    pub(crate) gdn_s: Vec<Vec<f32>>,
+    pub(crate) conv: Vec<Vec<f32>>,
     /// MTP draft층 KV (blk.64 full-attn 1층분) — nextn 미탑재 모델은 빈 벡터.
     mtp_kv_k: Vec<f32>,
     mtp_kv_v: Vec<f32>,
@@ -206,6 +208,10 @@ pub struct Engine {
     pub seqs: Vec<SeqState>,
     /// 런타임 주입 가속기 (None = CPU 참조 경로). 구현은 backend-gpu.
     pub acc: crate::matmul::Acc,
+    /// qwen35 디코드 프레임 (t=1) — LLM170_FRAME35=1 첫 디코드에서 생성.
+    pub frame35: Option<Frame35>,
+    /// 시퀀스별 프레임 상태 유효 플래그 — 값 경로 실행(prefill 등)마다 무효화.
+    pub(crate) frame35_clean: Vec<bool>,
 }
 
 impl Engine {
@@ -217,6 +223,8 @@ impl Engine {
     pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState::new(&model, ctx)).collect();
         Engine {
+            frame35: None,
+            frame35_clean: vec![false; n_seqs],
             model,
             seqs,
             acc: None,
@@ -285,6 +293,10 @@ impl Engine {
 
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
+        // 값 경로 실행 — 프레임 GPU 상태는 CPU 상태와 어긋나 무효화.
+        for s in seq_ids {
+            self.frame35_clean[*s] = false;
+        }
         // 가속기 아크 복제 — self 차입 충돌 없이 층 내부까지 전달
         let acc = self.acc.clone();
         for il in 0..hp.n_layer {
@@ -401,6 +413,16 @@ impl Engine {
         seq_ids: &[usize],
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>, ModelError> {
+        // qwen35 프레임 (t=1 단일) — LLM170_FRAME35=1 게이트, 실패는 Err 전파.
+        if tokens.len() == 1
+            && seq_ids.len() == 1
+            && self.acc.is_some()
+            && std::env::var("LLM170_FRAME35").is_ok_and(|v| v != "0")
+        {
+            let logits = self.decode1_frame35(seq_ids[0], tokens[0])?;
+            self.seqs[seq_ids[0]].pos += 1;
+            return Ok(vec![logits]);
+        }
         let batch: Vec<Vec<u32>> = tokens.iter().map(|t| vec![*t]).collect();
         let logits = self.forward(seq_ids, &batch)?;
         for s in seq_ids {

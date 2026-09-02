@@ -2035,6 +2035,30 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
                 }
                 self.release_bufs(&[(pg, 4)]);
             }
+            FrameOp::NormGatedSilu { o, z, w, out, eps, d, n_h } => {
+                let ohh = one(*o)?;
+                let zh = one(*z)?;
+                let wh = one(*w)?;
+                let outh = one(*out)?;
+                let rows = self.frame_get(*o)?.1 / d;
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1행, 유닛 0만 실행.
+                unsafe {
+                    ew::norm_gated_rows_silu::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(rows as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(ohh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(zh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [n_h * d].into()),
+                        TensorArg::from_raw_parts(outh, [1].into(), [rows * d].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *d,
+                        *n_h,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
             FrameOp::L2Rows { x, eps, d } => {
                 let xh = one(*x)?;
                 let rows = self.frame_get(*x)?.1 / d;

@@ -244,6 +244,8 @@ pub enum FrameOp {
     RmsRows { x: u64, w: u64, out: u64, eps: f32, n: usize, w_reps: usize },
     /// GDN norm_gated: out = rms(o)·σ(z), w 반복 = 헤드.
     NormGated { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
+    /// GDN norm_gated silu 변형 (qwen35): out = rms(o)·silu(z)·w.
+    NormGatedSilu { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
     /// GDN q/k 헤드별 in-place L2 norm.
     L2Rows { x: u64, eps: f32, d: usize },
     /// hc 게이트 적용 + 스트림 평균 (hc는 나눗셈 피수로 사용).
