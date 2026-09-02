@@ -770,3 +770,73 @@ pub fn qk_norm_rope(
     }
 }
 
+
+/// GDN conv 출력 3분할 (q/k/v) — 카피 3런치 → 1런치.
+#[cube(launch_unchecked)]
+pub fn split3(
+    src: &Tensor<f32>,
+    d0: &mut Tensor<f32>,
+    d1: &mut Tensor<f32>,
+    d2: &mut Tensor<f32>,
+    n0: usize,
+    n1: usize,
+    n2: usize,
+) {
+    let i = ABSOLUTE_POS_X as usize;
+    let total = n0 + n1 + n2;
+    if i >= total {
+        terminate!();
+    }
+    if i < n0 {
+        d0[i] = src[i];
+    } else if i < n0 + n1 {
+        d1[i - n0] = src[i];
+    } else {
+        d2[i - n0 - n1] = src[i];
+    }
+}
+
+/// L2 이중 행 + q 스케일 — l2_rows 2런치 + scale 1런치 → 1런치.
+/// 산술은 기존 l2_rows와 동일 (순차 f64 제곱합 → sqrt → max → 1/x,
+/// v*=inv 후 q행만 *scale — FP 연산 순서 불변).
+#[cube(launch_unchecked)]
+pub fn l2_rows2_scale(
+    gq: &mut Tensor<f32>,
+    gk: &mut Tensor<f32>,
+    params: &Tensor<f32>, // [eps, scale]
+    d: usize,
+    n_group: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u != 0 || row >= 2 * n_group {
+        terminate!();
+    }
+    let is_q = row < n_group;
+    let r = if is_q { row } else { row - n_group };
+    let xb = r * d;
+    let mut sum = 0.0f64;
+    if is_q {
+        for i in 0..d {
+            let v = f64::cast_from(gq[xb + i]);
+            sum += v * v;
+        }
+    } else {
+        for i in 0..d {
+            let v = f64::cast_from(gk[xb + i]);
+            sum += v * v;
+        }
+    }
+    let scale32 = f32::cast_from(sum.sqrt());
+    let inv = 1.0f32 / scale32.max(params[0]);
+    if is_q {
+        let sc = params[1];
+        for i in 0..d {
+            gq[xb + i] = gq[xb + i] * inv * sc;
+        }
+    } else {
+        for i in 0..d {
+            gk[xb + i] = gk[xb + i] * inv;
+        }
+    }
+}

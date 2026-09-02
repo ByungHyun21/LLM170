@@ -2789,6 +2789,47 @@ impl<R: Runtime> GpuMatmul<R> {
                 }
                 self.release_bufs(&[(pg, 4)]);
             }
+            FrameOp::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
+                let sh = one(*src)?;
+                let h0 = one(*d0)?;
+                let h1 = one(*d1)?;
+                let h2 = one(*d2)?;
+                let total = n0 + n1 + n2;
+                // SAFETY: ABSOLUTE_POS 가드 — 범위 내.
+                unsafe {
+                    ew::split3::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(total.div_ceil(64) as u32, 1, 1),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(sh, [1].into(), [total].into()),
+                        TensorArg::from_raw_parts(h0, [1].into(), [*n0].into()),
+                        TensorArg::from_raw_parts(h1, [1].into(), [*n1].into()),
+                        TensorArg::from_raw_parts(h2, [1].into(), [*n2].into()),
+                        *n0,
+                        *n1,
+                        *n2,
+                    );
+                }
+            }
+            FrameOp::L2Rows2Scale { q, k, eps, scale, d, n_group } => {
+                let qh = one(*q)?;
+                let kh = one(*k)?;
+                let pg = aux(&[*eps, *scale])?;
+                // SAFETY: 큐브당 1행, 유닛 0만 — 범위 내.
+                unsafe {
+                    ew::l2_rows2_scale::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static((2 * n_group) as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(qh, [1].into(), [n_group * d].into()),
+                        TensorArg::from_raw_parts(kh, [1].into(), [n_group * d].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [2].into()),
+                        *d,
+                        *n_group,
+                    );
+                }
+                self.release_bufs(&[(pg, 8)]);
+            }
             FrameOp::QKNormRope { q, k, qw, kw, cs, eps, kqs, pos, n_head, n_kv, hd, n_rot } => {
                 let qh = one(*q)?;
                 let kh = one(*k)?;

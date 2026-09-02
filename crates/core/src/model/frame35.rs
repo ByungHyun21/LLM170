@@ -292,13 +292,10 @@ impl Engine {
                 let cw = f.consts[&format!("blk.{il}.conv_w")];
                 op(acc.as_ref(), FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][recr_idx], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
                 // q/k/v 분할 + l2 + q·scale
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.gconv, dst: f.gq, src_off: 0, dst_off: 0, n: k_len })?;
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.gconv, dst: f.gk, src_off: k_len, dst_off: 0, n: k_len })?;
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.gconv, dst: f.gv, src_off: 2 * k_len, dst_off: 0, n: v_len })?;
-                op(acc.as_ref(), FrameOp::L2Rows { x: f.gq, eps, d: hp.d_state })?;
-                op(acc.as_ref(), FrameOp::L2Rows { x: f.gk, eps, d: hp.d_state })?;
+                // 6런치 → 2런치 (split3 + l2²·scale) — 산술 동일
+                op(acc.as_ref(), FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
                 let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-                op(acc.as_ref(), FrameOp::Scale { t: f.gq, s: scale, n: k_len })?;
+                op(acc.as_ref(), FrameOp::L2Rows2Scale { q: f.gq, k: f.gk, eps, scale, d: hp.d_state, n_group: hp.n_group })?;
                 // β/e^g
                 let dtb = f.consts[&format!("blk.{il}.dt_bias")];
                 let ssa = f.consts[&format!("blk.{il}.ssm_a")];

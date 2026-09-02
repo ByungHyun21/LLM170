@@ -261,6 +261,10 @@ pub enum FrameOp {
     NormGatedSilu { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
     /// GDN q/k 헤드별 in-place L2 norm.
     L2Rows { x: u64, eps: f32, d: usize },
+    /// conv 출력 3분할 (q/k/v) — 카피 3런치 융합.
+    Split3 { src: u64, d0: u64, d1: u64, d2: u64, n0: usize, n1: usize, n2: usize },
+    /// L2 이중 행 + q 스케일 융합 (산술 l2_rows+scale 과 동일).
+    L2Rows2Scale { q: u64, k: u64, eps: f32, scale: f32, d: usize, n_group: usize },
     /// 어텐션 q/k 헤드 rms+rope in-place (f64 중간 — 브리지 제거).
     QKNormRope {
         q: u64, k: u64, qw: u64, kw: u64, cs: u64,
