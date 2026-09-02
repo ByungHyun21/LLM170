@@ -867,6 +867,107 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok((bytemuck::cast_slice(&qraw).to_vec(), bytemuck::cast_slice(&draw).to_vec()))
     }
 
+    /// W4A8 배치 GEMM (iq4_xs, 1≤t≤32) — xs [t][n_in], 반환 [t][n_out] 평탄.
+    /// 프리필용: 가중치 로드를 t 토큰이 공유.
+    pub fn matmul_w4a8_b_gpu(&self, xs: &[Vec<f32>], w: &Weight) -> Result<Vec<f32>, String> {
+        use llm170_gguf::GgmlType;
+        if w.ty != GgmlType::Iq4Xs {
+            return Err("matmul_w4a8_b_gpu: iq4_xs 전용 (현 단계)".into());
+        }
+        let t = xs.len();
+        if t == 0 {
+            return Err("matmul_w4a8_b_gpu: t=0".into());
+        }
+        // 임의 t: 32행 서브배치로 절단 — 행 독립이라 비트 동일.
+        if t > 32 || t & (t - 1) != 0 {
+            let mut out: Vec<f32> = Vec::with_capacity(t * w.n_out as usize);
+            for ch in xs.chunks(32) {
+                let mut sub = ch.to_vec();
+                while sub.len() & (sub.len() - 1) != 0 {
+                    sub.pop(); // 2의 거듭제곱으로 — 마지막 조각은 개별 처리
+                }
+                if sub.is_empty() {
+                    sub.push(ch[0].clone());
+                }
+                let r = self.matmul_w4a8_b_gpu(&sub, w)?;
+                out.extend_from_slice(&r);
+                for extra in &ch[sub.len()..] {
+                    let r1 = self.matmul_w4a8_b_gpu(std::slice::from_ref(extra), w)?;
+                    out.extend_from_slice(&r1);
+                }
+            }
+            out.truncate(t * w.n_out as usize);
+            return Ok(out);
+        }
+        let d = self.dev_weight(w)?;
+        let (n_in, n_out) = d.shape();
+        let mut qs_words = Vec::with_capacity(t * n_in / 4);
+        let mut ds: Vec<f32> = Vec::with_capacity(t * n_in / 32);
+        for row in xs {
+            let y = llm170_core::quant::quantize_row_q8_ref(row);
+            for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
+                let mut word = 0u32;
+                for (i, b) in c.iter().enumerate() {
+                    word |= (**b as u8 as u32) << (8 * i);
+                }
+                qs_words.push(word);
+            }
+            ds.extend(y.iter().map(|b| b.d));
+        }
+        let xq = self.client.create_from_slice(bytemuck::cast_slice(&qs_words));
+        let xd = self.client.create_from_slice(bytemuck::cast_slice(&ds));
+        let og = self.acquire_buf(t * n_out * 4)?;
+        let pg = self.acquire_buf(t * n_out * 64 * 8)?;
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
+        let wh = d.gpu()?.clone();
+        macro_rules! launch_b {
+            ($tl:expr) => {{
+                // SAFETY: 그리드 (n_out,1,gz)·가드 — 상한 내.
+                unsafe {
+                    gemm2::gemm_q8i_b_xs::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(gx as u32, 1, gz as u32),
+                        CubeDim::new_1d(64),
+                        TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                        TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                        TensorArg::from_raw_parts(wh.clone(), [1].into(), [d.words()].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                        TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
+                        n_in,
+                        n_out,
+                        gx,
+                        $tl,
+                    );
+                }
+            }};
+        }
+        match t {
+            1 => launch_b!(1usize),
+            2 => launch_b!(2usize),
+            4 => launch_b!(4usize),
+            8 => launch_b!(8usize),
+            16 => launch_b!(16usize),
+            _ => launch_b!(32usize),
+        }
+        // SAFETY: (gx, t, gz)가 [t·n_out]을 덮음.
+        unsafe {
+            gemm2::reduce_parts_f64_batch::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx as u32, t as u32, gz as u32),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * 64].into()),
+                TensorArg::from_raw_parts(og.clone(), [1].into(), [t * n_out].into()),
+                n_out,
+                gx,
+                t,
+            );
+        }
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        self.release_bufs(&[(og, t * n_out * 4), (pg, t * n_out * 64 * 8)]);
+        Ok(bytemuck::cast_slice(&raw).to_vec())
+    }
+
     /// W4A8 정수 GEMM (iq4_xs 전용, t=1) — gemm_q8i + reduce_parts_f64.
     /// CPU dot_row_w4a8_iq4xs_lane과 비트 일치. iters>1이면 런치만 반복
     /// (업로드·판독 1회)해 순수 커널 시간 측정을 겸한다. (f64, Vec<f64)> 반환.
@@ -1779,6 +1880,23 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         profile_span!("gpu::matmulB");
+        // W4A8 — CPU matmul_batch(전 타입 int)와 동일 비트.
+        // iq4_xs: 배치 커널. 타 나머지: 행루프 t=1 (배치 커널 확장 전 임시).
+        if llm170_core::matmul::w4a8_enabled() && llm170_core::matmul::w4a8_ty(w.ty) {
+            if w.ty == llm170_gguf::GgmlType::Iq4Xs {
+                let g = self.matmul_w4a8_b_gpu(xs, w)?;
+                for (ti, out) in outs.iter_mut().enumerate() {
+                    let base = ti * w.n_out as usize;
+                    out.copy_from_slice(&g[base..base + w.n_out as usize]);
+                }
+            } else {
+                for (ti, out) in outs.iter_mut().enumerate() {
+                    let (g, _) = self.matmul_w4a8_int_gpu(&xs[ti], w, 1)?;
+                    out.copy_from_slice(&g);
+                }
+            }
+            return Ok(());
+        }
         let t = xs.len();
         let n_in = w.n_in as usize;
         if xs.iter().any(|r| r.len() != n_in) {
@@ -2004,6 +2122,21 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
             let d = self.dev_weight(w)?;
             if d.is_host() {
                 llm170_core::matmul::matmul_batch(xs, w, &mut outs[i]);
+            } else if llm170_core::matmul::w4a8_enabled()
+                && llm170_core::matmul::w4a8_ty(w.ty)
+            {
+                if w.ty == llm170_gguf::GgmlType::Iq4Xs {
+                    let g = self.matmul_w4a8_b_gpu(xs, w)?;
+                    for (ti, out) in outs[i].iter_mut().enumerate() {
+                        let base = ti * w.n_out as usize;
+                        out.copy_from_slice(&g[base..base + w.n_out as usize]);
+                    }
+                } else {
+                    for (ti, out) in outs[i].iter_mut().enumerate() {
+                        let (g, _) = self.matmul_w4a8_int_gpu(&xs[ti], w, 1)?;
+                        out.copy_from_slice(&g);
+                    }
+                }
             } else {
                 idx_gpu.push(i);
             }

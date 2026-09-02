@@ -1729,3 +1729,129 @@ pub fn gemm_q8i_q6k(
     }
     part[o * 64 + l] = acc;
 }
+
+/// W4A8 배치 GEMM (iq4_xs, t≤32) — 프리필. 큐브 = 1행 × 64레인, 서브
+/// 블록 스트라이드, 내부 t-루프(tlen comptime) — 가중치 로드를 t 토큰이
+/// 공유. 부분합 [t·n_out·64] f64 → reduce_parts_f64_batch.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_b_xs(
+    xq: &Tensor<u32>,  // [t][n_in/8]
+    xd: &Tensor<f32>,  // [t][n_in/32]
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>, // [t·n_out·64]
+    ktab2: &Tensor<u32>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+    #[comptime] tlen: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let cnt = (n_sub + 63 - l) >> 6;
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 136;
+    let mut acc = Array::<f64>::new(tlen);
+    #[unroll]
+    for ti in 0..tlen {
+        acc[ti] = 0.0;
+    }
+    for _m in 0..cnt {
+        let sb = l + _m * 64;
+        let b = sb >> 3;
+        let ib = sb - b * 8;
+        let wb = row_base + b * 136;
+        let wq = wb >> 2;
+        let w0 = w[wq];
+        let w1 = w[wq + 1];
+        let d = f16_bits(w0 & 0xFFFF);
+        let scales_h = w0 >> 16;
+        let lsw = w1;
+        let q = wb + 8 + ib * 16;
+        let qw = q >> 2;
+        let q0 = w[qw];
+        let q1 = w[qw + 1];
+        let q2 = w[qw + 2];
+        let q3 = w[qw + 3];
+        // ls — 6비트 스케일
+        let nib = (lsw >> (((ib / 2) * 8 + (ib % 2) * 4) as u32)) & 0xF;
+        let ls = (nib | (((scales_h >> ((2 * ib) as u32)) & 3) << 4)) as i32;
+        let dl = d * (ls - 32) as f32;
+        #[unroll]
+        for ti in 0..tlen {
+            let xw = (ti * n_in + sb * 32) >> 2;
+            let y0 = xq[xw];
+            let y1 = xq[xw + 1];
+            let y2 = xq[xw + 2];
+            let y3 = xq[xw + 3];
+            let y4 = xq[xw + 4];
+            let y5 = xq[xw + 5];
+            let y6 = xq[xw + 6];
+            let y7 = xq[xw + 7];
+            let mut isum = 0i32;
+            for j in 0..16 {
+                let qb = if j < 4 {
+                    (q0 >> ((j * 8) as u32)) & 0xFF
+                } else if j < 8 {
+                    (q1 >> (((j - 4) * 8) as u32)) & 0xFF
+                } else if j < 12 {
+                    (q2 >> (((j - 8) * 8) as u32)) & 0xFF
+                } else {
+                    (q3 >> (((j - 12) * 8) as u32)) & 0xFF
+                };
+                let t = ktab2[qb as usize];
+                let ylo = if j < 4 {
+                    sext8((y0 >> ((j * 8) as u32)) & 0xFF)
+                } else if j < 8 {
+                    sext8((y1 >> (((j - 4) * 8) as u32)) & 0xFF)
+                } else if j < 12 {
+                    sext8((y2 >> (((j - 8) * 8) as u32)) & 0xFF)
+                } else {
+                    sext8((y3 >> (((j - 12) * 8) as u32)) & 0xFF)
+                };
+                let yhi = if j < 4 {
+                    sext8((y4 >> ((j * 8) as u32)) & 0xFF)
+                } else if j < 8 {
+                    sext8((y5 >> (((j - 4) * 8) as u32)) & 0xFF)
+                } else if j < 12 {
+                    sext8((y6 >> (((j - 8) * 8) as u32)) & 0xFF)
+                } else {
+                    sext8((y7 >> (((j - 12) * 8) as u32)) & 0xFF)
+                };
+                isum += sext8(t & 0xFF) * ylo;
+                isum += sext8((t >> 8) & 0xFF) * yhi;
+            }
+            let yd = xd[ti * n_sub + sb];
+            acc[ti] += (yd * dl * isum as f32) as f64;
+        }
+    }
+    #[unroll]
+    for ti in 0..tlen {
+        part[(ti * n_out + o) * 64 + l] = acc[ti];
+    }
+}
+
+/// 배치 reduce — [t·n_out·64] f64 부분합 → [t·n_out] f32.
+#[cube(launch_unchecked)]
+pub fn reduce_parts_f64_batch(
+    part: &Tensor<f64>,
+    out: &mut Tensor<f32>,
+    n_out: usize,
+    gx: usize,
+    #[comptime] tlen: usize,
+) {
+    let o = ABSOLUTE_POS_X as usize + CUBE_POS_Z as usize * gx * 64;
+    let t = ABSOLUTE_POS_Y as usize;
+    if o >= n_out || t >= tlen {
+        terminate!();
+    }
+    let base = (t * n_out + o) * 64;
+    let mut acc = 0.0f64;
+    for l in 0..64 {
+        acc += part[base + l];
+    }
+    out[t * n_out + o] = acc as f32;
+}

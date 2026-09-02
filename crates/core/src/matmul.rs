@@ -497,6 +497,42 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 /// 행(o)별로 한 번 디양자화해 B 토큰과 내적 — prefill에서 디양자화 비용 상각.
 /// 스레드별 로컬 결과 [T][rows_per] → 조인 후 스캐터 (행 슬라이스 교차 차입 회피).
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
+    // W4A8 (지원 타입) — 행별 레인 미러 정수 내적 (GPU 배치 경로와 동일 비트)
+    if w4a8_enabled() && w4a8_ty(w.ty) {
+        let y_all: Vec<_> = xs.iter().map(|r| crate::quant::quantize_row_q8_ref(r)).collect();
+        let blck = w.ty.blck_size() as usize;
+        let bsize = w.ty.type_size() as usize;
+        let row_bytes = (w.n_in as usize / blck) * bsize;
+        for (ti, out) in outs.iter_mut().enumerate() {
+            let y = &y_all[ti];
+            for (o, out_o) in out.iter_mut().enumerate() {
+                let row = &w.data[o * row_bytes..];
+                *out_o = match w.ty {
+                    llm170_gguf::GgmlType::Q3K => {
+                        crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Q4K => {
+                        crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Q5K => {
+                        crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Q8_0 => {
+                        crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Iq4Nl => {
+                        crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Q6K => {
+                        crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, y)
+                    }
+                    _ => crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y),
+                };
+            }
+        }
+        return;
+    }
+
     profile_span!("cpu::matmulB");
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;

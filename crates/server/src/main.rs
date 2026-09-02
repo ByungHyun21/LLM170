@@ -663,6 +663,44 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
         }
     };
     let _ = gpu.matmul_w4a8_int_gpu(&x, &w, 1); // 웜업 (hipRTC JIT 제거)
+    // 배치 커널 검증: LLM170_W4A8_T=t — xs=t행(동일 x) 배치 결과를
+    // 행별 t=1 미러와 to_bits 비교.
+    if let Ok(tt) = std::env::var("LLM170_W4A8_T") {
+        let tt: usize = tt.parse().unwrap_or(8);
+        // 행별로 서로 다른 x — 토큰 인덱싱 버그 가려지지 않게.
+        let xs: Vec<Vec<f32>> = (0..tt)
+            .map(|ti| {
+                let mut r = x.clone();
+                for (j, v) in r.iter_mut().enumerate() {
+                    *v += (ti * 7 + j % 13) as f32 * 0.001;
+                }
+                r
+            })
+            .collect();
+        let g = gpu.matmul_w4a8_b_gpu(&xs, &w).expect("batch");
+        let blck2 = w.ty.blck_size() as usize;
+        let bsize2 = w.ty.type_size() as usize;
+        let rb = (n_in / blck2) * bsize2;
+        let mut mism = 0usize;
+        for ti in 0..tt {
+            let y1 = llm170_core::quant::quantize_row_q8_ref(&xs[ti]);
+            for o in 0..n_out {
+                let row = &w.data[o * rb..];
+                let c = llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y1);
+                if c.to_bits() != g[ti * n_out + o].to_bits() {
+                    mism += 1;
+                    if mism == 1 {
+                        println!("  ✗ 배치[{ti}][{o}] cpu={c:e} gpu={:e}", g[ti * n_out + o]);
+                    }
+                }
+            }
+        }
+        println!("  배치 t={tt}: 불일치 {mism}/{}", tt * n_out);
+        if mism == 0 {
+            println!("  ★ 배치 GPU≡CPU 비트 일치");
+        }
+        return ExitCode::SUCCESS;
+    }
     let (g, dt) = match gpu.matmul_w4a8_int_gpu(&x, &w, iters) {
         Ok(v) => v,
         Err(e) => {
