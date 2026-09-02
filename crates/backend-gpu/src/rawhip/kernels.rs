@@ -1370,12 +1370,12 @@ extern "C" __global__ void rms_part(const float* x, double* part, int n) {
     if (lo >= n) { part[row * 32 + u] = 0.0; return; }
     int hi = min(lo + chunk, n);
     int xb = row * n;
-    double acc = 0.0;
+    float acc = 0.0f;  // f32 세그먼트 (f64 1/16 레이트) — 미러 sq_sum과 쌍
     for (int i = lo; i < hi; i++) {
-        double dv = (double)x[xb + i];
+        float dv = x[xb + i];
         acc += dv * dv;
     }
-    part[row * 32 + u] = acc;
+    part[row * 32 + u] = (double)acc;
 }
 extern "C" __global__ void rms_finish(const float* x, const float* w, const double* part,
                                       float* out, float eps, int n, int w_reps) {
@@ -1414,14 +1414,14 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
                         : y * (n_kv * hd) + (r0 - n_head) * hd;
     float* xv = is_q ? xq : xk;
     const float* wv = is_q ? qw + r0 * hd : kw + (r0 - n_head) * hd;
-    double parts[32];
+    float parts[32];  // f32 세그먼트 — 미러 sq_sum과 쌍
     int chunk = (hd + 31) >> 5;
     for (int uu = 0; uu < 32; uu++) {
         int lo = uu * chunk;
         int hi = min(lo + chunk, hd);
-        double acc = 0.0;
+        float acc = 0.0f;
         for (int i = lo; i < hi; i++) {
-            double dv = (double)xv[row_base + i];
+            float dv = xv[row_base + i];
             acc += dv * dv;
         }
         parts[uu] = acc;
@@ -1500,12 +1500,12 @@ extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const
         int lo = sg * chunk;
         if (lo >= d) break;
         int hi = min(lo + chunk, d);
-        double part = 0.0;
+        float part = 0.0f;  // f32 세그먼트 — 미러와 쌍
         for (int i = lo; i < hi; i++) {
-            double dv = (double)o[xb + i];
+            float dv = o[xb + i];
             part += dv * dv;
         }
-        sum += part;
+        sum += (double)part;
     }
     float scale32 = (float)sqrt(sum / (double)d + (double)eps);
     float inv = 1.0f / scale32;
@@ -1590,12 +1590,12 @@ extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float
     int tb = y * n_group * d;
     int xb = is_q ? tb + x * d : tb + (x - n_group) * d;
     float* g = is_q ? gq : gk;
-    double sum = 0.0;
+    float sum = 0.0f;  // 순차 f32 — 미러 l2_norm과 쌍
     for (int i = 0; i < d; i++) {
-        double dv = (double)g[xb + i];
+        float dv = g[xb + i];
         sum += dv * dv;
     }
-    float scale32 = (float)sqrt(sum);
+    float scale32 = sqrtf(sum);
     float inv = 1.0f / fmaxf(scale32, eps);
     if (is_q) {
         for (int i = 0; i < d; i++) g[xb + i] = g[xb + i] * inv;

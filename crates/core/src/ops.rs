@@ -17,11 +17,13 @@ pub fn sq_sum(x: &[f32]) -> f64 {
         let lo = u * chunk;
         if lo >= n { break; }
         let hi = (lo + chunk).min(n);
-        let mut part = 0.0f64;
+        // f32 세그먼트 누산 (GPU f64 1/16 레이트 병목 동일 적용) —
+        // 세그먼트 결합만 f64 (GPU rms_part/finish와 쌍).
+        let mut part = 0.0f32;
         for &v in &x[lo..hi] {
-            part += (v as f64) * (v as f64);
+            part += v * v;
         }
-        sum += part;
+        sum += part as f64;
     }
     sum
 }
@@ -33,8 +35,12 @@ pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 }
 
 pub fn l2_norm(x: &[f32], eps: f32) -> Vec<f32> {
-    let sum = sq_sum(x);
-    let scale = 1.0 / (sum.sqrt() as f32).max(eps);
+    // 순차 f32 (GPU l2_rows2_scale와 쌍 — 32세그먼트 아님)
+    let mut sum = 0.0f32;
+    for &v in x {
+        sum += v * v;
+    }
+    let scale = 1.0 / sum.sqrt().max(eps);
     x.iter().map(|&v| v * scale).collect()
 }
 
