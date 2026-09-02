@@ -118,6 +118,24 @@ impl RawCtx {
         Ok(())
     }
 
+    /// 3차원 그리드 런치 (qsa용 — gy 추가).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch3(
+        &self,
+        name: &str,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        block: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
+        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        unsafe {
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3")?;
+        }
+        Ok(())
+    }
+
     /// W4A8 t=1 GEMV — 타입별 커널 선택, 부분합 reduce까지 수행.
     /// 반환 [n_out] f32. 수치: dot_row_w4a8_*_lane 미러와 동일열.
     pub fn gemv_q8(
