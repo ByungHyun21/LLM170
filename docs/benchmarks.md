@@ -17,6 +17,15 @@ op. LLM170 conditions: matmul projections on GPU (all quant types), GDN
 recurrence + attention + norms still on CPU per layer, host round-trip per
 matmul group.
 
+2026-09-02 update (`llm170 bench`, single-tenant, ROCm 7.2.2-linked
+binary): pp64 **2.12 t/s**, tg24 **1.32 t/s**. Co-resident measurement
+(llama-server holding VRAM) gave tg 0.58 t/s — invalid per the
+non-coexistence rule, quoted only as a caution. PP bottleneck: GDN chunk
+path (sequential per-head forward substitution at real dims — first
+real-dim run took >12 min for pp512 before being killed). TG bottleneck:
+value-path host roundtrips. First performance target: the ROCm 10 llama
+table in AGENTS.md (pp 142.8–315.4 t/s, tg 10.4–11.6 t/s).
+
 ## qwen4exp (Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split)
 
 | Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU backend) |
