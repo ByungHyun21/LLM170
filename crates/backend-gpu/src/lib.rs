@@ -185,8 +185,8 @@ pub struct GpuMatmul<R: Runtime> {
     /// 크기별 재사용 스크래치/휘발업로드 풀 — 해제 없는 영속 보관.
     bufs: ScratchPool,
     ktab: Handle,  // iq4_nl 룩업 (f32×16)
+    ktab2: Handle, // iq4_nl 바이트쌍 룩업 (u32×256) — W4A8 정수 경로
     grid3: Handle, // iq3_s 그리드 (u32×512)
-    /// 프레임(활성화 상주) 레지스트리 — u64 토큰 → (핸들, 길이).
     frames: Mutex<std::collections::HashMap<u64, (Handle, usize)>>,
     frame_next: AtomicU64,
 }
@@ -334,6 +334,14 @@ impl<R: Runtime> GpuMatmul<R> {
             .iter()
             .map(|&v| v as f32)
             .collect();
+        let ktab2: Vec<u32> = (0..256u32)
+            .map(|b| {
+                let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+                let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+                lo | (hi << 8)
+            })
+            .collect();
+        let ktab2 = client.create_from_slice(bytemuck::cast_slice(&ktab2));
         let grid3 = llm170_core::IQ3S_GRID;
         let ktab = client.create_from_slice(bytemuck::cast_slice(&ktab));
         let grid3 = client.create_from_slice(bytemuck::cast_slice(&grid3));
@@ -342,6 +350,7 @@ impl<R: Runtime> GpuMatmul<R> {
             weights: WeightStore::new(mem_total),
             bufs: ScratchPool::new(),
             ktab,
+            ktab2,
             grid3,
             frames: Mutex::new(std::collections::HashMap::new()),
             frame_next: AtomicU64::new(1),
@@ -828,6 +837,71 @@ impl<R: Runtime> GpuMatmul<R> {
         Ok(bytemuck::cast_slice(&raw).to_vec())
     }
 
+
+    /// W4A8 정수 GEMM (iq4_xs 전용, t=1) — gemm_q8i + reduce_parts_f64.
+    /// CPU dot_row_w4a8_iq4xs_lane과 비트 일치. iters>1이면 런치만 반복
+    /// (업로드·판독 1회)해 순수 커널 시간 측정을 겸한다. (f64, Vec<f64)> 반환.
+    pub fn matmul_w4a8_int_gpu(
+        &self,
+        x: &[f32],
+        w: &Weight,
+        iters: usize,
+    ) -> Result<(Vec<f32>, std::time::Duration), String> {
+        use llm170_core::quant::quantize_row_q8_ref;
+        if w.ty != llm170_gguf::GgmlType::Iq4Xs {
+            return Err("matmul_w4a8_int_gpu: iq4_xs 전용 (프로토타입)".into());
+        }
+        let y = quantize_row_q8_ref(x);
+        let d = self.dev_weight(w)?;
+        let (n_in, n_out) = d.shape();
+        let mut qs_words = Vec::with_capacity(n_in.div_ceil(4));
+        for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
+            let mut word = 0u32;
+            for (i, b) in c.iter().enumerate() {
+                word |= (**b as u8 as u32) << (8 * i);
+            }
+            qs_words.push(word);
+        }
+        let ds: Vec<f32> = y.iter().map(|b| b.d).collect();
+        let xq = self.client.create_from_slice(bytemuck::cast_slice(&qs_words));
+        let xd = self.client.create_from_slice(bytemuck::cast_slice(&ds));
+        let og = self.acquire_buf(n_out * 4)?;
+        let pg = self.acquire_buf(n_out * 64 * 8)?;
+        let gx = n_out.min(65535);
+        let gz = n_out.div_ceil(gx);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters.max(1) {
+            // SAFETY: 그리드 (n_out,1,gz)·시작부 가드 — 상한 내.
+            unsafe {
+                gemm2::gemm_q8i::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(gx as u32, 1, gz as u32),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(xq.clone(), [1].into(), [qs_words.len()].into()),
+                    TensorArg::from_raw_parts(xd.clone(), [1].into(), [ds.len()].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [n_out * 64].into()),
+                    TensorArg::from_raw_parts(self.ktab2.clone(), [1].into(), [256].into()),
+                    n_in,
+                    n_out,
+                    gx,
+                );
+                gemm2::reduce_parts_f64::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(gx as u32, 1, gz as u32),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [n_out * 64].into()),
+                    TensorArg::from_raw_parts(og.clone(), [1].into(), [n_out].into()),
+                    n_out,
+                    gx,
+                );
+            }
+        }
+        let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
+        let dt = t0.elapsed();
+        self.release_bufs(&[(og, n_out * 4), (pg, n_out * 64 * 8)]);
+        Ok((bytemuck::cast_slice(&raw).to_vec(), dt))
+    }
     /// QSA 마스크드 밀집 GQA — GPU 상주 (attn::qsa_score + qsa_mix).
     /// q: [t][n_head*2*hd] (norm·rope 완료, q‖gate 인터리브),
     /// ck/cv: 캐시 [n_past*n_kv*hd], mask: [t*n_past] u32 0/1,

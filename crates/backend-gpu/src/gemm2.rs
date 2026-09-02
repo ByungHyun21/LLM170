@@ -22,6 +22,12 @@ pub(crate) fn byte(w: &Tensor<u32>, i: usize) -> u32 {
 #[cube]
 pub(crate) fn f16_at(w: &Tensor<u32>, off: usize) -> f32 {
     let h = byte(w, off) | (byte(w, off + 1) << 8);
+    f16_bits(h)
+}
+
+/// f16 비트(u16) → f32 — f16_at과 동일 변환(비트 불변).
+#[cube]
+pub(crate) fn f16_bits(h: u32) -> f32 {
     let sign = (h & 0x8000) << 16;
     let exp = (h >> 10) & 0x1F;
     let frac = h & 0x3FF;
@@ -398,9 +404,14 @@ fn de4(
         // iq4_xs: ls 워드(wb+4..7)·scales_h·d 공유, qb는 16바이트 간격 4회.
         let ib = l / 32;
         let h = l % 32;
-        let d = f16_at(w, wb);
-        let scales_h = byte(w, wb + 2) | (byte(w, wb + 3) << 8);
-        let lsw = byte(w, wb + 4) | (byte(w, wb + 5) << 8) | (byte(w, wb + 6) << 16) | (byte(w, wb + 7) << 24);
+        // 워드 직접 로드 — bsize=136이라 wb는 4정렬: W0 = d|scales_h<<16,
+        // W1 = lsw. 스케일 6바이트 = 바이트 로드 8회 → 워드 2회 (k2).
+        let wq = wb >> 2;
+        let w0 = w[wq];
+        let w1 = w[wq + 1];
+        let d = f16_bits(w0 & 0xFFFF);
+        let scales_h = w0 >> 16;
+        let lsw = w1;
         let q = wb + 8 + h % 16;
         let qb0 = byte(w, q + ib * 16);
         let qb1 = byte(w, q + (ib + 2) * 16);
@@ -938,4 +949,133 @@ pub fn reduce_parts(
         acc += part[base + s];
     }
     out[t * n_out + o] = acc;
+}
+
+/// 부호 확장 u8 → i32 — 산술 시프트 대신 분기 산술 (cubecl i32 시프트
+/// 시맨틱 독립, 2026-09-02 w4a8i RCA).
+#[cube]
+pub(crate) fn sext8(v: u32) -> i32 {
+    let x = (v & 0x7F) as i32;
+    if (v & 0x80) == 0 { x } else { x - 128 }
+}
+
+/// W4A8 정수 디코드 GEMM (iq4_xs, t=1) — llama식 정수 누산 구조.
+/// 큐브 = 1행 × 64레인; 레인 l은 서브블록(32원소) 연속 구간 담당
+/// (base/rem 분할 — CPU dot_row_w4a8_iq4xs_lane과 동일 그룹핑).
+/// 수치: 서브블록 c = yd·dl·(isum as f32) (f32 곱 2, 좌결합), 레인 f64
+/// 누산 → f64 부분합 → 레인 순서 f64 합 → 1회 f32 캐스트. 정수부는
+/// 정확하고 f32 곱 체인에 덧셈 없음(수축 불가) — GPU≡CPU 비트 일치.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i(
+    xq: &Tensor<u32>,   // i8 4개/워드 [n_in/8]
+    xd: &Tensor<f32>,   // q8 블록 d [n_in/32]
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>, // [n_out*64]
+    ktab2: &Tensor<u32>,    // 256 엔트리: 바이트→(lo_i8 | hi_i8<<8)
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let base = n_sub / 64;
+    let rem = n_sub % 64;
+    // RCA(2026-09-02): `base + if .. {1} else {0}` 리터럴 분기가 base와
+    // 결합돼 오컴파일 (cnt=2 관측) — 산술 판정으로 우회.
+    let lt = (((((l as i64) - (rem as i64)) >> 63) as usize) & 1); // 1 if l<rem else 0
+    let cnt = base + lt;
+    let start = l * base + if lt == 1 { l } else { rem };
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 136;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let sb = start + _m;
+        let b = sb / 8;
+        let ib = sb - b * 8;
+        let wb = row_base + b * 136;
+        let wq = wb >> 2;
+        let w0 = w[wq];
+        let d = f16_bits(w0 & 0xFFFF);
+        let scales_h = w0 >> 16;
+        let sl = byte(w, wb + 4 + ib / 2);
+        let nib = if ib % 2 == 0 { sl & 0xF } else { sl >> 4 };
+        let ls = (nib | (((scales_h >> ((2 * ib) as u32)) & 3) << 4)) as i32;
+        let dl = d * (ls - 32) as f32;
+        let qbase = wb + 8 + ib * 16;
+        let qw = qbase >> 2; // qbase는 4정렬 — 16바이트 = 워드 4개
+        let q0 = w[qw];
+        let q1 = w[qw + 1];
+        let q2 = w[qw + 2];
+        let q3 = w[qw + 3];
+        let xw = (sb * 32) >> 2; // xq 8워드 = sb 블록 전체
+        let a0 = xq[xw];
+        let a1 = xq[xw + 1];
+        let a2 = xq[xw + 2];
+        let a3 = xq[xw + 3];
+        let a4 = xq[xw + 4];
+        let a5 = xq[xw + 5];
+        let a6 = xq[xw + 6];
+        let a7 = xq[xw + 7];
+        let mut isum = 0i32;
+        for j in 0..16 {
+            let qb = if j < 4 {
+                (q0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (q1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (q2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else {
+                (q3 >> (((j - 12) * 8) as u32)) & 0xFF
+            };
+            let t = ktab2[qb as usize];
+            let y0 = sext8(if j < 4 {
+                (a0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (a1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (a2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else {
+                (a3 >> (((j - 12) * 8) as u32)) & 0xFF
+            });
+            let y1 = sext8(if j < 4 {
+                (a4 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (a5 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (a6 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else {
+                (a7 >> (((j - 12) * 8) as u32)) & 0xFF
+            });
+            isum += sext8(t & 0xFF) * y0;
+            isum += sext8((t >> 8) & 0xFF) * y1;
+        }
+        let c = xd[sb] * dl * isum as f32;
+        acc += c as f64;
+    }
+    part[o * 64 + l] = acc;
+}
+
+/// f64 부분합 64레인 결정적 축소 → f32 1회 캐스트 (gemm_q8i 짝.
+/// CPU 미러의 레인 순서 합과 동일).
+#[cube(launch_unchecked)]
+pub fn reduce_parts_f64(
+    part: &Tensor<f64>,
+    out: &mut Tensor<f32>,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = ABSOLUTE_POS_X as usize + CUBE_POS_Z as usize * gx * 64;
+    if o >= n_out {
+        terminate!();
+    }
+    let base = o * 64;
+    let mut acc = 0.0f64;
+    for l in 0..64 {
+        acc += part[base + l];
+    }
+    out[o] = acc as f32;
 }

@@ -61,6 +61,15 @@ fn reexec_hip_blocking() {
 }
 
 fn main() -> ExitCode {
+    // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
+    struct EL;
+    impl log::Log for EL {
+        fn enabled(&self, _: &log::Metadata) -> bool { true }
+        fn log(&self, r: &log::Record) { eprintln!("[{}] {}", r.level(), r.args()); }
+        fn flush(&self) {}
+    }
+    let _ = log::set_logger(&EL);
+    log::set_max_level(log::LevelFilter::Error);
     reexec_hip_blocking();
     // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
     // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
@@ -116,6 +125,7 @@ fn main() -> ExitCode {
         }
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
         Some("bench-streams") => cmd_bench_streams(&args[1..]),
+        Some("w4a8i-check") => cmd_w4a8i_check(&args[1..]),
         Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
         Some("gdn-chunk-check") => cmd_gdn_chunk_check(),
@@ -597,6 +607,92 @@ fn cmd_w4a8_gpu(args: &[String]) -> ExitCode {
         eprintln!("MISMATCH (rel > 2e-2)");
         ExitCode::FAILURE
     } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// llm170 w4a8i-check <file> <tensor> [iters] — W4A8 정수 커널(gemm_q8i)
+/// 비트 일치 검증(전 행, CPU 레인 미러 대비 to_bits) + 순수 속도 측정.
+fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: llm170 w4a8i-check <file> <tensor> [iters]");
+        return ExitCode::from(2);
+    }
+    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let w = match model.w(&args[1]) {
+        Some(w) => w,
+        None => {
+            eprintln!("tensor not found: {}", args[1]);
+            return ExitCode::FAILURE;
+        }
+    };
+    let iters: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(50);
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let gpu = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _ = gpu.matmul_w4a8_int_gpu(&x, &w, 1); // 웜업 (hipRTC JIT 제거)
+    let (g, dt) = match gpu.matmul_w4a8_int_gpu(&x, &w, iters) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("gpu error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // CPU 레인 미러 — 전 행 비트 비교 + 0행 레인 부분합 대조
+    let y = llm170_core::quant::quantize_row_q8_ref(&x);
+    let blck = w.ty.blck_size() as usize;
+    let bsize = w.ty.type_size() as usize;
+    let lane0 = llm170_core::quant::dot_row_w4a8_iq4xs_lane_parts(
+        &w.data[..(n_in / blck) * bsize],
+        n_in as u64,
+        &y,
+    );
+    println!("  cpu lane0[0..4] = {:?}", &lane0[..4]);
+    let mut first: Option<(usize, f32, f32)> = None;
+    let mut mismatch = 0usize;
+    for o in 0..n_out {
+        let row = &w.data[o * (n_in / blck) * bsize..];
+        let c = llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y);
+        if c.to_bits() != g[o].to_bits() {
+            mismatch += 1;
+            if first.is_none() {
+                println!("  첫 불일치 [{o}]: cpu={c:.7e} gpu={:.7e}", g[o]);
+                first = Some((o, c, g[o]));
+            }
+        }
+    }
+    let ms = dt.as_secs_f64() * 1000.0 / iters as f64;
+    let gbps = w.data.len() as f64 / (dt.as_secs_f64() / iters as f64) / 1e9;
+    println!(
+        "[{}] {} n={n_in}x{n_out}: 비트 불일치 {mismatch}/{n_out} — {ms:.3}ms/op, {gbps:.0}GB/s (iters={iters})",
+        w.ty.name(),
+        args[1]
+    );
+    if let Some((o, c, gv)) = first {
+        println!("  첫 불일치 [{o}]: cpu={c:.7e} gpu={gv:.7e}");
+    }
+    if mismatch > 0 {
+        ExitCode::FAILURE
+    } else {
+        println!("  ★ GPU≡CPU 비트 일치 (레인 f64 미러)");
         ExitCode::SUCCESS
     }
 }

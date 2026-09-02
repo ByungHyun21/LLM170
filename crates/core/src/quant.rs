@@ -631,6 +631,50 @@ pub fn dot_iq4xs_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     sum
 }
 
+/// W4A8 레인 미러(iq4_xs) — GPU gemm_q8i와 동일 64레인 연속 분할·f64
+/// 부분합으로 행 전체를 비트 일치 재현. 그룹핑: n_sub=⌈k/32⌉개 서브블록
+/// base/rem 연속 분할, 레인 내 오름차순 f64 누산, 레인 순서 f64 합 후
+pub fn dot_row_w4a8_iq4xs_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_iq4xs_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+/// 레인별 f64 부분합 (디버그·GPU 대조용) — gemm_q8i 그룹핑 미러.
+pub fn dot_row_w4a8_iq4xs_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let base = n_sub / 64;
+    let rem = n_sub % 64;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = base + usize::from(l < rem);
+        let start = l * base + l.min(rem);
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sb = start + m;
+            let (b, ib) = (sb / 8, sb % 8);
+            let wb = &data[b * 136..b * 136 + 136];
+            let d = f16(wb, 0);
+            let scales_h = u16::from_le_bytes([wb[2], wb[3]]);
+            let ls = ((wb[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+            let dl = d * (ls - 32) as f32;
+            let mut isum = 0i64;
+            for j in 0..16 {
+                let q = wb[8 + ib * 16 + j];
+                isum += KVALUES_IQ4NL[(q & 0xF) as usize] as i64 * y_el(y, sb * 32 + j);
+                isum += KVALUES_IQ4NL[(q >> 4) as usize] as i64 * y_el(y, sb * 32 + 16 + j);
+            }
+            acc += (y[sb].d * dl * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+
 /// iq4_nl(32) × q8.
 pub fn dot_iq4nl_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     let d = f16(w, 0);

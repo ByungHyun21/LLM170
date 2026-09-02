@@ -1839,6 +1839,7 @@ dependencies = [
  "llm170-core",
  "llm170-gguf",
  "llm170-profiler",
+ "log",
  "memmap2",
 ]
 

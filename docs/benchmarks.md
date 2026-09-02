@@ -57,6 +57,15 @@ Session progression (same binary lineage, gfx1151):
   `ffn_up` 18 -> **50 GB/s** isolated; decode tg24 **3.56 -> 3.86 t/s**
   (2026-09-02, minimal-prefill measurement; a preceding 22-min pp512 run
   measurably throttles the APU and masks gains — measure tg with --pp 8).
+- W4A8 integer-MAC prototype (`gemm_q8i`, 2026-09-02): activations
+  quantized to q8 (per-32-block scales), integer accumulation, per-block
+  float contributions accumulated in **f64 lane partials** — grouping-
+  independent bit-exactness vs a CPU mirror of the same op sequence.
+  iq4_xs `ffn_gate`: **146 GB/s, bit-exact on all rows** (2.18x the f32
+  path's 67, 91% of llama.cpp's effective rate). Known open issue: the
+  `ffn_down` shape (n_in=17408) regresses to 40-61 GB/s — under
+  investigation. Engine wiring (on-GPU q8 quantize kernel, q3_K variant,
+  frame integration) is the follow-up.
 
 Measurement caution: a co-resident run (llama-server holding VRAM) measured
 tg 0.58 t/s — invalid per the non-coexistence rule (see Verification below),
