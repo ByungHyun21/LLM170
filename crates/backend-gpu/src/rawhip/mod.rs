@@ -314,14 +314,7 @@ impl RawCtx {
             13 => "gemm_q5k_mm",
             12 => "gemm_q4k_mm",
             14 => "gemm_q6k_mm",
-            // iq4_xs: MMQ 스테이징 룩업 부담 > 이득 (44 vs 39µs 실측) — bt 유지
-            23 => {
-                if t > 16 {
-                    "gemm_xs_mm" // 32토큰 청크에서는 MMQ 상각이 이김
-                } else {
-                    "gemm_xs_bt"
-                }
-            }
+            23 => "gemm_xs_mm",
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 

@@ -508,19 +508,15 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
     int i = blockIdx.x * 64;              // 행 타일 기저
     int tid = threadIdx.x;                // 0..255
     int row = tid & 63;                   // 행 (스레드-행 고정)
-    int q4 = tid >> 6;                    // 파편 0..3 (토큰 4개 담당)
+    int wid = tid >> 6;                    // 파편 0..3 (토큰 4개 담당)
     if (i >= n_out) return;
     int nrow = min(64, n_out - i);
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    // init
-    for (int a = 0; a < 4; a++) {
-        if (row < nrow)
-            #pragma unroll
-            for (int j = 0; j < 32; j++) psum[a][row][j] = 0.0f;
-    }
-    __syncthreads();
+    float acc[8];
+    #pragma unroll
+    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         // ── 협력 스테이징: 256스레드 × (1 언팩 유닛 + 0.5 y 유닛) ──
         // 언팩: tid → (sb_local = tid>>5? ...) 256유닛 = 8sb×64행의 절반? 8*64=512 — 2패스
@@ -580,43 +576,52 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
             }
         }
         __syncthreads();
-        // ── 계산: 스레드 = (행 고정, 파편 q4 = 서브블록 {q4, q4+4?} …) ──
-        // 파편 분할: 스레드 q4가 sbl ∈ {q4, q4+4} (8sb → 4파편×2)
+        // ── 계산: 소유형 (행 lane, 토큰 wid+4q), 순차 sb, wvs 레지스터 ──
         if (row < nrow) {
             #pragma unroll
-            for (int jj = 0; jj < 2; jj++) {
-                int sbl = q4 + jj * 4;            // {q4, q4+4}
+            for (int sbl = 0; sbl < 8; sbl++) {
                 int sb = k0 + sbl;
-                if (sb < n_sub) {
-                    // 모든 16토큰 계산 (파편=행×sb, 토큰 전담)
-                    #pragma unroll 4
-                    for (int ti = 0; ti < t; ti++) {
-                        int isum = 0;
-                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
-                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][1], isum);
-                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][2], isum);
-                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][3], isum);
-                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][4], isum);
-                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][5], isum);
-                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][6], isum);
-                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
-                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row][0] * (float)isum;
-                        psum[q4][row][ti] -= ydt[ti][sbl] * dsc[sbl][row][1] * (float)qst[ti][sbl];
-                    }
+                if (sb >= n_sub) break;
+                unsigned w0r = wvs[sbl][row][0];
+                unsigned w1r = wvs[sbl][row][1];
+                unsigned w2r = wvs[sbl][row][2];
+                unsigned w3r = wvs[sbl][row][3];
+                unsigned w4r = wvs[sbl][row][4];
+                unsigned w5r = wvs[sbl][row][5];
+                unsigned w6r = wvs[sbl][row][6];
+                unsigned w7r = wvs[sbl][row][7];
+                float d0 = dsc[sbl][row][0];
+                float d1 = dsc[sbl][row][1];
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    int ti = wid + 4 * q;
+                    if (ti >= t) break;
+                    int isum = 0;
+                    isum = dot4(w0r, ytile[ti][sbl][0], isum);
+                    isum = dot4(w1r, ytile[ti][sbl][1], isum);
+                    isum = dot4(w2r, ytile[ti][sbl][2], isum);
+                    isum = dot4(w3r, ytile[ti][sbl][3], isum);
+                    isum = dot4(w4r, ytile[ti][sbl][4], isum);
+                    isum = dot4(w5r, ytile[ti][sbl][5], isum);
+                    isum = dot4(w6r, ytile[ti][sbl][6], isum);
+                    isum = dot4(w7r, ytile[ti][sbl][7], isum);
+                    acc[q] += ydt[ti][sbl] * d0 * (float)isum;
+                    acc[q] -= ydt[ti][sbl] * d1 * (float)qst[ti][sbl];
                 }
             }
         }
         __syncthreads();
     }
-    // ── 4파편 결합 (q4 순서) + 기록 ──
-    if (row < nrow && q4 == 0) {
-        #pragma unroll 4
-        for (int ti = 0; ti < t; ti++) {
-            float a = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
-            out[(size_t)ti * n_out + i + row] = a;
+    if (row < nrow) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            int ti = wid + 4 * q;
+            if (ti >= t) break;
+            out[(size_t)ti * n_out + i + row] = acc[q];
         }
     }
 }
+
 
 // ─── MMQ 포트 (llama.cpp 타일: 64행×16토큰×256스레드, 파편 sb%4) ───
 // 미러(q*_mm)와 쌍: 파편 f32 누산 + p0+p1+p2+p3.
@@ -629,20 +634,18 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
     __shared__ unsigned ytile[32][8][8];
     __shared__ float ydt[32][8];
     __shared__ int qst[32][8];
-    __shared__ float psum[4][64][32];
-    int i = blockIdx.x * 64;
+        int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
-    int q4 = tid >> 6;
+    int wid = tid >> 6;
     if (i >= n_out) return;
     int nrow = min(64, n_out - i);
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    if (row < nrow)
-        #pragma unroll
-        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
-    __syncthreads();
+    float acc[8];
+    #pragma unroll
+    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -695,33 +698,46 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
         __syncthreads();
         if (row < nrow) {
             #pragma unroll
-            for (int jj = 0; jj < 2; jj++) {
-                int sbl = q4 + jj * 4;
+            for (int sbl = 0; sbl < 8; sbl++) {
                 int sb = k0 + sbl;
-                if (sb < n_sub) {
-                    #pragma unroll 4
-                    for (int ti = 0; ti < t; ti++) {
-                        int isum = 0;
-                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
-                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][1], isum);
-                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][2], isum);
-                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][3], isum);
-                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][4], isum);
-                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][5], isum);
-                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][6], isum);
-                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
-                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row][0] * (float)isum;
-                        psum[q4][row][ti] -= ydt[ti][sbl] * dsc[sbl][row][1] * (float)qst[ti][sbl];
-                    }
+                if (sb >= n_sub) break;
+                unsigned w0r = wvs[sbl][row][0];
+                unsigned w1r = wvs[sbl][row][1];
+                unsigned w2r = wvs[sbl][row][2];
+                unsigned w3r = wvs[sbl][row][3];
+                unsigned w4r = wvs[sbl][row][4];
+                unsigned w5r = wvs[sbl][row][5];
+                unsigned w6r = wvs[sbl][row][6];
+                unsigned w7r = wvs[sbl][row][7];
+                float d0 = dsc[sbl][row][0];
+                float d1 = dsc[sbl][row][1];
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    int ti = wid + 4 * q;
+                    if (ti >= t) break;
+                    int isum = 0;
+                    isum = dot4(w0r, ytile[ti][sbl][0], isum);
+                    isum = dot4(w1r, ytile[ti][sbl][1], isum);
+                    isum = dot4(w2r, ytile[ti][sbl][2], isum);
+                    isum = dot4(w3r, ytile[ti][sbl][3], isum);
+                    isum = dot4(w4r, ytile[ti][sbl][4], isum);
+                    isum = dot4(w5r, ytile[ti][sbl][5], isum);
+                    isum = dot4(w6r, ytile[ti][sbl][6], isum);
+                    isum = dot4(w7r, ytile[ti][sbl][7], isum);
+                    acc[q] += ydt[ti][sbl] * d0 * (float)isum;
+                    acc[q] -= ydt[ti][sbl] * d1 * (float)qst[ti][sbl];
                 }
             }
         }
         __syncthreads();
     }
-    if (row < nrow && q4 == 0) {
-        #pragma unroll 4
-        for (int ti = 0; ti < t; ti++)
-            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+    if (row < nrow) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            int ti = wid + 4 * q;
+            if (ti >= t) break;
+            out[(size_t)ti * n_out + i + row] = acc[q];
+        }
     }
 }
 
@@ -813,20 +829,18 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     __shared__ unsigned ytile[32][16][4];  // [토큰][그룹][워드]
     __shared__ float ydt[32][16];
     __shared__ int qst[32][16];
-    __shared__ float psum[4][64][32];
-    int i = blockIdx.x * 64;
+        int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
-    int q4 = tid >> 6;
+    int wid = tid >> 6;
     if (i >= n_out) return;
     int nrow = min(64, n_out - i);
     int n_g = n_in >> 4;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    if (row < nrow)
-        #pragma unroll
-        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
-    __syncthreads();
+    float acc[8];
+    #pragma unroll
+    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_g; k0 += 16) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -899,31 +913,39 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
         }
         __syncthreads();
         if (row < nrow) {
-            // 파편: q4가 gl ∈ {q4, q4+4, q4+8, q4+12} (16그룹 → 4파편×4)
+            // 소유형: 순차 gl, wvs 4워드+dsc 레지스터, 토큰 wid+4q
             #pragma unroll
-            for (int jj = 0; jj < 4; jj++) {
-                int gl = q4 + jj * 4;
+            for (int gl = 0; gl < 16; gl++) {
                 int g = k0 + gl;
-                if (g < n_g) {
-                    #pragma unroll 4
-                    for (int ti = 0; ti < t; ti++) {
-                        int isum = 0;
-                        isum = dot4(wvs[gl][row][0], ytile[ti][gl][0], isum);
-                        isum = dot4(wvs[gl][row][1], ytile[ti][gl][1], isum);
-                        isum = dot4(wvs[gl][row][2], ytile[ti][gl][2], isum);
-                        isum = dot4(wvs[gl][row][3], ytile[ti][gl][3], isum);
-                        isum -= 32 * qst[ti][gl];
-                        psum[q4][row][ti] += ydt[ti][gl] * dsc[gl][row] * (float)isum;
-                    }
+                if (g >= n_g) break;
+                unsigned w0r = wvs[gl][row][0];
+                unsigned w1r = wvs[gl][row][1];
+                unsigned w2r = wvs[gl][row][2];
+                unsigned w3r = wvs[gl][row][3];
+                float d0 = dsc[gl][row];
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    int ti = wid + 4 * q;
+                    if (ti >= t) break;
+                    int isum = 0;
+                    isum = dot4(w0r, ytile[ti][gl][0], isum);
+                    isum = dot4(w1r, ytile[ti][gl][1], isum);
+                    isum = dot4(w2r, ytile[ti][gl][2], isum);
+                    isum = dot4(w3r, ytile[ti][gl][3], isum);
+                    isum -= 32 * qst[ti][gl];
+                    acc[q] += ydt[ti][gl] * d0 * (float)isum;
                 }
             }
         }
         __syncthreads();
     }
-    if (row < nrow && q4 == 0) {
-        #pragma unroll 4
-        for (int ti = 0; ti < t; ti++)
-            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+    if (row < nrow) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            int ti = wid + 4 * q;
+            if (ti >= t) break;
+            out[(size_t)ti * n_out + i + row] = acc[q];
+        }
     }
 }
 
@@ -1012,21 +1034,19 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
     __shared__ float dsc[8][64];
     __shared__ unsigned ytile[32][8][8];
     __shared__ float ydt[32][8];
-    __shared__ float psum[4][64][32];
-    __shared__ unsigned kt_s[256];
+        __shared__ unsigned kt_s[256];
     for (int a = threadIdx.x; a < 256; a += 256) kt_s[a] = ktab2[a];
     int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
-    int q4 = tid >> 6;
+    int wid = tid >> 6;
     if (i >= n_out) return;
     int nrow = min(64, n_out - i);
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
-    if (row < nrow)
-        #pragma unroll
-        for (int j = 0; j < 32; j++) psum[q4][row][j] = 0.0f;
-    __syncthreads();
+    float acc[8];
+    #pragma unroll
+    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -1076,35 +1096,46 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
         }
         __syncthreads();
         if (row < nrow) {
+            // 소유형: 순차 sb, wvs 8워드+dsc 레지스터, hi는 y워드 k+4와 페어
             #pragma unroll
-            for (int jj = 0; jj < 2; jj++) {
-                int sbl = q4 + jj * 4;
+            for (int sbl = 0; sbl < 8; sbl++) {
                 int sb = k0 + sbl;
-                if (sb < n_sub) {
-                    #pragma unroll 4
-                    for (int ti = 0; ti < t; ti++) {
-                        int isum = 0;
-                        // wvs[2k]=lo(원소 k·4+j), wvs[2k+1]=hi(원소 16+k·4+j) —
-                        // hi는 y 워드 k+4와 페어
-                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
-                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][1], isum);
-                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][2], isum);
-                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][3], isum);
-                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][4], isum);
-                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][5], isum);
-                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][6], isum);
-                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
-                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row] * (float)isum;
-                    }
+                if (sb >= n_sub) break;
+                unsigned w0r = wvs[sbl][row][0];
+                unsigned w1r = wvs[sbl][row][1];
+                unsigned w2r = wvs[sbl][row][2];
+                unsigned w3r = wvs[sbl][row][3];
+                unsigned w4r = wvs[sbl][row][4];
+                unsigned w5r = wvs[sbl][row][5];
+                unsigned w6r = wvs[sbl][row][6];
+                unsigned w7r = wvs[sbl][row][7];
+                float d0 = dsc[sbl][row];
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    int ti = wid + 4 * q;
+                    if (ti >= t) break;
+                    int isum = 0;
+                    isum = dot4(w0r, ytile[ti][sbl][0], isum);
+                    isum = dot4(w2r, ytile[ti][sbl][1], isum);
+                    isum = dot4(w4r, ytile[ti][sbl][2], isum);
+                    isum = dot4(w6r, ytile[ti][sbl][3], isum);
+                    isum = dot4(w1r, ytile[ti][sbl][4], isum);
+                    isum = dot4(w3r, ytile[ti][sbl][5], isum);
+                    isum = dot4(w5r, ytile[ti][sbl][6], isum);
+                    isum = dot4(w7r, ytile[ti][sbl][7], isum);
+                    acc[q] += ydt[ti][sbl] * d0 * (float)isum;
                 }
             }
         }
         __syncthreads();
     }
-    if (row < nrow && q4 == 0) {
-        #pragma unroll 4
-        for (int ti = 0; ti < t; ti++)
-            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+    if (row < nrow) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            int ti = wid + 4 * q;
+            if (ti >= t) break;
+            out[(size_t)ti * n_out + i + row] = acc[q];
+        }
     }
 }
 

@@ -1140,8 +1140,9 @@ pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
 /// MMQ 포트 미러(q5_K) — 파편 q가 서브블록 {sb : sb%4==q} (오름차순) f32
 /// 누산, 4파편 순차 결합 p0+p1+p2+p3 (gemm_q5k_mm와 쌍).
 pub fn dot_row_w4a8_q5k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    // mm2 쌍: 순차 sb f32 누산 (wvs 레지스터 적재형 커널과 동일 순서)
     let n_sub = (k / 32) as usize;
-    let mut p = [0.0f32; 4];
+    let mut acc = 0.0f32;
     for sb in 0..n_sub {
         let js = sb % 8;
         let (it, half) = (js / 2, js % 2);
@@ -1160,16 +1161,17 @@ pub fn dot_row_w4a8_q5k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
             qsum += yv;
         }
         let yd = y[sb].d;
-        p[sb % 4] += yd * (d * sc as f32) * isum as f32;
-        p[sb % 4] -= yd * (dm * m_ as f32) * qsum as f32;
+        acc += yd * (d * sc as f32) * isum as f32;
+        acc -= yd * (dm * m_ as f32) * qsum as f32;
     }
-    ((p[0] + p[1]) + p[2]) + p[3]
+    acc
 }
 
 /// MMQ 포트 미러(q4_K) — 파편 sb%4 오름차순 f32, p0+p1+p2+p3.
 pub fn dot_row_w4a8_q4k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    // mm2 쌍: 순차 sb f32 누산
     let n_sub = (k / 32) as usize;
-    let mut p = [0.0f32; 4];
+    let mut acc = 0.0f32;
     for sb in 0..n_sub {
         let js = sb % 8;
         let (it, half) = (js / 2, js % 2);
@@ -1186,16 +1188,16 @@ pub fn dot_row_w4a8_q4k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
             qsum += yv;
         }
         let yd = y[sb].d;
-        p[sb % 4] += yd * (d * sc as f32) * isum as f32;
-        p[sb % 4] -= yd * (dm * m_ as f32) * qsum as f32;
+        acc += yd * (d * sc as f32) * isum as f32;
+        acc -= yd * (dm * m_ as f32) * qsum as f32;
     }
-    ((p[0] + p[1]) + p[2]) + p[3]
+    acc
 }
 
 /// MMQ 포트 미러(q6_K) — 파편 그룹 g%4 (16원소), 단일 체인.
 pub fn dot_row_w4a8_q6k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let n_g = (k / 16) as usize;
-    let mut p = [0.0f32; 4];
+    let mut acc = 0.0f32;
     for g in 0..n_g {
         let blk = g / 16;
         let klocal = g % 16;
@@ -1221,15 +1223,15 @@ pub fn dot_row_w4a8_q6k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         let qsum: i64 = (0..16).map(|jj| y_el(y, blk * 256 + h * 128 + src * 32 + p2 * 16 + jj)).sum();
         isum -= 32 * qsum;
         let yd = y[(blk * 8 + h * 4 + src) as usize].d;
-        p[g % 4] += yd * (d * sc as f32) * isum as f32;
+        acc += yd * (d * sc as f32) * isum as f32;
     }
-    ((p[0] + p[1]) + p[2]) + p[3]
+    acc
 }
 
 /// MMQ 포트 미러(iq4_xs) — kvalues 룩업, 단일 체인.
 pub fn dot_row_w4a8_iq4xs_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let n_sub = (k / 32) as usize;
-    let mut p = [0.0f32; 4];
+    let mut acc = 0.0f32;
     for sb in 0..n_sub {
         let ib = sb % 8;
         let wb = &data[(sb / 8) * 136..(sb / 8) * 136 + 136];
@@ -1248,9 +1250,9 @@ pub fn dot_row_w4a8_iq4xs_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
             isum += hi * y_el(y, sb * 32 + 16 + j);
         }
         let yd = y[sb].d;
-        p[sb % 4] += yd * dl * isum as f32;
+        acc += yd * dl * isum as f32;
     }
-    ((p[0] + p[1]) + p[2]) + p[3]
+    acc
 }
 
 #[inline]
