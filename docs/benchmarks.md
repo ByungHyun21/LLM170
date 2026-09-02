@@ -26,6 +26,14 @@ real-dim run took >12 min for pp512 before being killed). TG bottleneck:
 value-path host roundtrips. First performance target: the ROCm 10 llama
 table in AGENTS.md (pp 142.8–315.4 t/s, tg 10.4–11.6 t/s).
 
+Follow-up (same day, kkt kernel landed): GDN chunk GPU vs CPU
+(`LLM170_GDN_CPU=1`) measure identically on pp64 — the chunk is NOT
+the prefill bottleneck. `gpu-mm` on ffn_gate (t=64) measures ~4.8
+GFLOPS on that shape vs llama's ~1400 GFLOPS estimate (~300x on the
+microbenchmark, ~15x engine-wide at ~97 GFLOPS average). **Prefill
+optimization priority moves to quantized-GEMM batch throughput**
+(tiling/split-K/vectorization for t=64 shapes).
+
 ## qwen4exp (Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split)
 
 | Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU backend) |
