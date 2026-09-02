@@ -25,6 +25,15 @@ DEV unsigned byte(const unsigned* w, int i) {
     return (w[i >> 2] >> ((i & 3) * 8)) & 0xFFu;
 }
 
+// i8×4 레인 정수 dot (v_dot4_i32_i8) — llama.cpp dp4a 상당.
+// 비트계약: 정수라 내부 순서 무관, 미러와 동일 isum 보장.
+typedef char __attribute__((ext_vector_type(4))) c4v;
+DEV int dot4(unsigned a, unsigned b, int c) {
+    c4v va = __builtin_bit_cast(c4v, a);
+    c4v vb = __builtin_bit_cast(c4v, b);
+    return __ockl_sdot4(va, vb, c, false);
+}
+
 // 올림-정확 exp(f32→f32) — f64 fma 호너 다항. glibc/Rust expf는 올림-정확
 // (ARM routines) → 결과 비트 일치 (경계 2^-28 확률 제외). 디바이스
 // expf는 1ulp 빗나감(244/4096 실측, 2026-09-03) — W4A8 비트계약 위반.
@@ -165,23 +174,26 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
         unsigned nib = (w1 >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu;
         int ls = (int)nib | (int)(((scales_h >> (2 * ib)) & 3u) << 4);
         float dl = d * (float)(ls - 32);
+        // dot4 — kvalues 룩업 후 i8×4 패킹 (lo=el 0..15, hi=el 16..31)
         int isum = 0;
         int xw = (sb << 5) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        unsigned qws[4] = {q0, q1, q2, q3};
+        unsigned yls[4] = {y0, y1, y2, y3};
+        unsigned yhs[4] = {y4, y5, y6, y7};
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            unsigned qv, ylv, yhv;
-            int wi = j >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: qv = q0; ylv = y0; yhv = y4; break;
-                case 1: qv = q1; ylv = y1; yhv = y5; break;
-                case 2: qv = q2; ylv = y2; yhv = y6; break;
-                default: qv = q3; ylv = y3; yhv = y7; break;
+        for (int k = 0; k < 4; k++) {
+            unsigned qv = qws[k];
+            unsigned lo = 0, hi = 0;
+            #pragma unroll
+            for (int b = 3; b >= 0; b--) {
+                unsigned t = ktab2[(qv >> (8 * b)) & 0xFFu];
+                lo = (lo << 8) | (t & 0xFFu);
+                hi = (hi << 8) | (t >> 8);
             }
-            unsigned t = ktab2[(qv >> sk) & 0xFFu];
-            isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
-            isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
+            isum = dot4(lo, yls[k], isum);
+            isum = dot4(hi, yhs[k], isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * dl * (float)isum);
@@ -231,28 +243,19 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
         int xw = (sb << 5) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        // dot4 재작성 — 워드 단위 SIMD-in-register (llama.cpp MMVQ 패턴)
+        int nsh = half << 2;
+        unsigned hbit = 1u << sh;
         int isum = 0, qsum = 0;
         #pragma unroll
-        for (int j = 0; j < 32; j++) {
-            unsigned qv, hv, yv;
-            int wi = j >> 2, k = j & 3;
-            switch (wi) {
-                case 0: qv = q0; hv = h0; yv = y0; break;
-                case 1: qv = q1; hv = h1; yv = y1; break;
-                case 2: qv = q2; hv = h2; yv = y2; break;
-                case 3: qv = q3; hv = h3; yv = y3; break;
-                case 4: qv = q4; hv = h4; yv = y4; break;
-                case 5: qv = q5; hv = h5; yv = y5; break;
-                case 6: qv = q6; hv = h6; yv = y6; break;
-                default: qv = q7; hv = h7; yv = y7; break;
-            }
-            int sk = k * 8;
-            unsigned nib = half == 0 ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
-            unsigned t = (hv >> (sk + sh)) & 1u;
-            int hi = (int)t * 16;
-            int y8 = sext8((yv >> sk) & 0xFFu);
-            isum += ((int)nib + hi) * y8;
-            qsum += y8;
+        for (int k = 0; k < 8; k++) {
+            unsigned qv = k < 4 ? (k==0?q0:k==1?q1:k==2?q2:q3) : (k==4?q4:k==5?q5:k==6?q6:q7);
+            unsigned hv = k < 4 ? (k==0?h0:k==1?h1:k==2?h2:h3) : (k==4?h4:k==5?h5:k==6?h6:h7);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+            unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4; // 레인 0x00/0x10
+            isum = dot4(nibw | bitw, yv, isum);
+            qsum = dot4(0x01010101u, yv, qsum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
@@ -278,18 +281,20 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
         int xw = (sb << 5) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        // dot4 — 가중 워드 (wb+2, 34B 블록 → 짝수블록 정렬/홀수 +2 슬라이딩)
+        int wq = wb >> 2;
+        bool al = (wb & 3) == 2; // wb+2가 워드 정렬인 경우
         int isum = 0;
         #pragma unroll
-        for (int j = 0; j < 32; j++) {
-            int qv = sext8(byte(w, wb + 2 + j));
-            unsigned yv; int wi = j >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: yv = y0; break; case 1: yv = y1; break;
-                case 2: yv = y2; break; case 3: yv = y3; break;
-                case 4: yv = y4; break; case 5: yv = y5; break;
-                case 6: yv = y6; break; default: yv = y7; break;
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) {
+                qv = w[wq + 1 + k];                    // wb+2+4k 워드 정렬
+            } else {
+                qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16); // +2 슬라이딩
             }
-            isum += qv * sext8((yv >> sk) & 0xFFu);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            isum = dot4(qv, yv, isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
@@ -335,21 +340,15 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
         int xw = (sb << 5) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int nsh = half << 2;
         int isum = 0, qsum = 0;
         #pragma unroll
-        for (int j = 0; j < 32; j++) {
-            unsigned qv, yv;
-            int wi = j >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: qv = q0; yv = y0; break; case 1: qv = q1; yv = y1; break;
-                case 2: qv = q2; yv = y2; break; case 3: qv = q3; yv = y3; break;
-                case 4: qv = q4; yv = y4; break; case 5: qv = q5; yv = y5; break;
-                case 6: qv = q6; yv = y6; break; default: qv = q7; yv = y7; break;
-            }
-            unsigned nib = half == 0 ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
-            int y8 = sext8((yv >> sk) & 0xFFu);
-            isum += (int)nib * y8;
-            qsum += y8;
+        for (int k = 0; k < 8; k++) {
+            unsigned qv = k < 4 ? (k==0?q0:k==1?q1:k==2?q2:q3) : (k==4?q4:k==5?q5:k==6?q6:q7);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+            isum = dot4(nibw, yv, isum);
+            qsum = dot4(0x01010101u, yv, qsum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
@@ -400,25 +399,22 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
         }
         int xw = (g << 4) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
-        int isum = 0;
+        // dot4 — 레인 간 빌림 방지 분해: w = nib + 16·hi2 − 32
+        //   Σw·y = Σ(nib + 16·hi2)·y − 32·Σy  (레인 내 덧셈 ≤ 63 — 캐리 없음)
+        int nsh = (src == 0 || src == 1) ? 0 : 4;
+        int hsh = 2 * src;
+        int isum = 0, qsum = 0;
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            unsigned qv, hv, yv;
-            int wi = j >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: qv = qa0; hv = ha0; yv = y0; break;
-                case 1: qv = qa1; hv = ha1; yv = y1; break;
-                case 2: qv = qa2; hv = ha2; yv = y2; break;
-                default: qv = qa3; hv = ha3; yv = y3; break;
-            }
-            unsigned nib = (src == 0 || src == 1) ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
-            int hi2 = (src == 0) ? (int)((hv >> sk) & 3u)
-                    : (src == 1) ? (int)(((hv >> sk) >> 2) & 3u)
-                    : (src == 2) ? (int)(((hv >> sk) >> 4) & 3u)
-                    : (int)(((hv >> sk) >> 6) & 3u);
-            int y8 = sext8((yv >> sk) & 0xFFu);
-            isum += (((int)nib | (hi2 << 4)) - 32) * y8;
+        for (int k = 0; k < 4; k++) {
+            unsigned qv = k==0?qa0:k==1?qa1:k==2?qa2:qa3;
+            unsigned hv = k==0?ha0:k==1?ha1:k==2?ha2:ha3;
+            unsigned yv = k==0?y0:k==1?y1:k==2?y2:y3;
+            unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+            unsigned hi16w = (hv >> hsh) & 0x03030303u;
+            isum = dot4(nibw + (hi16w << 4), yv, isum);
+            qsum = dot4(0x20202020u, yv, qsum);
         }
+        isum -= qsum;
         float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
         acc += (double)(yd * d * (float)sc * (float)isum);
     }
@@ -442,21 +438,26 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
         int xw = (sb << 5) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        // dot4 — kvalues 룩업 후 i8×4 패킹 (하프 워드 lo=elements 0..15, hi=16..31)
+        bool al = (wb & 3) == 2;
+        int wq2 = wb >> 2;
         int isum = 0;
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            unsigned qb = byte(w, wb + 2 + j);
-            unsigned t = ktab2[qb];
-            unsigned ylv, yhv;
-            int wi = (j) >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: ylv = y0; yhv = y4; break;
-                case 1: ylv = y1; yhv = y5; break;
-                case 2: ylv = y2; yhv = y6; break;
-                default: ylv = y3; yhv = y7; break;
+        for (int k = 0; k < 4; k++) {
+            unsigned qvw; // 4 weight byte
+            if (al) qvw = w[wq2 + 1 + k];
+            else qvw = (w[wq2 + k] >> 16) | (w[wq2 + k + 1] << 16);
+            unsigned lo = 0, hi = 0;
+            #pragma unroll
+            for (int b = 3; b >= 0; b--) {
+                unsigned t = ktab2[(qvw >> (8 * b)) & 0xFFu];
+                lo = (lo << 8) | (t & 0xFFu);
+                hi = (hi << 8) | (t >> 8);
             }
-            isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
-            isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
+            unsigned ylv = k==0?y0:k==1?y1:k==2?y2:y3;
+            unsigned yhv = k==0?y4:k==1?y5:k==2?y6:y7;
+            isum = dot4(lo, ylv, isum);
+            isum = dot4(hi, yhv, isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
@@ -502,22 +503,25 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         int hbase2 = wb + p * 16;
         int xw = (h << 4) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
-        int isum = 0;
+        // dot4 — Σ(qv − 4 + 4bit)·y = Σ qv·y − 4Σy + 4Σ bit·y
+        int qsh = src * 2;
+        bool alq = (qlb2 & 3) == 0;
+        bool alh = (hbase2 & 3) == 0;
+        int qlw2 = qlb2 >> 2;
+        int qhw2 = hbase2 >> 2;
+        int isum = 0, qsum = 0, bsum = 0;
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            unsigned qb = byte(w, qlb2 + j);
-            unsigned hb = byte(w, hbase2 + j);
-            unsigned yv;
-            int wi = j >> 2, sk = (j & 3) * 8;
-            switch (wi) {
-                case 0: yv = y0; break; case 1: yv = y1; break;
-                case 2: yv = y2; break; default: yv = y3; break;
-            }
-            int qv = (int)((qb >> (src * 2)) & 3u);
-            int bit = (int)((hb >> src) & 1u);
-            int sub = 4 - bit * 4;
-            isum += (qv - sub) * sext8((yv >> sk) & 0xFFu);
+        for (int k = 0; k < 4; k++) {
+            unsigned qvw, hvw;
+            if (alq) qvw = w[qlw2 + k]; else qvw = (w[qlw2 + k] >> 16) | (w[qlw2 + k + 1] << 16);
+            if (alh) hvw = w[qhw2 + k]; else hvw = (w[qhw2 + k] >> 16) | (w[qhw2 + k + 1] << 16);
+            unsigned yv = k==0?y0:k==1?y1:k==2?y2:y3;
+            isum = dot4((qvw >> qsh) & 0x03030303u, yv, isum);
+            qsum = dot4(0x04040404u, yv, qsum);
+            unsigned bitw = ((hvw >> src) & 0x01010101u) << 2;
+            bsum = dot4(bitw, yv, bsum);
         }
+        isum += bsum - qsum;
         float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
         acc += (double)(yd * dl * (float)isum);
     }
@@ -688,6 +692,113 @@ extern "C" __global__ void exp_probe(const float* x, unsigned* bits, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     bits[i] = __float_as_uint((float)exp((double)x[i]));
+}
+
+// dot intrinsic 프로브 — sdot8(i4x8) 확정 + ext_vector_type sdot2/4 시도
+typedef short __attribute__((ext_vector_type(2))) s2v;
+extern "C" __global__ void dp4a_probe(const unsigned* x, int* out) {
+    out[0] = __ockl_sdot8((int)x[0], (int)x[1], 0, false);   // i4x8: 3
+    out[1] = (int)__ockl_udot8(x[2], x[3], 0u, false);       // 5
+    s2v a2 = {12, 0}, b2 = {17, 0};
+    out[2] = __ockl_sdot2(a2, b2, 0, false);                 // 204
+    c4v a4 = {12, 0, 0, 0}, b4 = {17, 0, 0, 0};
+    out[3] = __ockl_sdot4(a4, b4, 0, false);                 // 204
+    // 음수 레인: {1,1,1,1}·{-1,-1,-1,-1} = -4
+    c4v o4 = {1, 1, 1, 1}, m4 = {-1, -1, -1, -1};
+    out[4] = __ockl_sdot4(o4, m4, 0, false);
+    // {-32,2,0,0}·{17,3,5,7} = -544+6 = -538
+    c4v n4 = {-32, 2, 0, 0}, q4 = {17, 3, 5, 7};
+    out[5] = __ockl_sdot4(n4, q4, 0, false);
+    // bitcast 경로: {0,-32,0,2}·{7,17,5,3} = 0 - 544 + 0 + 6 = -538
+    out[6] = dot4(0x02E00000u, 0x03110705u, 0);
+    out[7] = dot4(0x02E00000u, 0x03110705u, 1000);           // 누적 확인 462
+}
+
+// 순수 대역폭 프로브 — gemm과 동일 그리드/레인/서브블록 접근, 읽기+XOR만.
+extern "C" __global__ void bw_probe(const unsigned* w, double* part, int n_in, int n_out, int bsize) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * bsize;
+    unsigned acc = 0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + (sb >> 3) * bsize;
+        int qw = wb >> 2;
+        acc ^= w[qw] ^ w[qw+1] ^ w[qw+2] ^ w[qw+3];
+    }
+    part[o * 64 + l] = (double)acc + (double)l + (double)o;
+}
+
+// 디버그: q6_K 단일 그룹 old/new isum 동시 계산
+extern "C" __global__ void q6k_ab(const unsigned* w, const unsigned* xq, double* part,
+                                  int row, int g) {
+    int blocks = 0; // 계산 재사용
+    (void)blocks;
+    int wb = row * (16) * 210 + (g >> 4) * 210; // n_in=256 가정 (호출부가 조정)
+    int klocal = g & 15;
+    int h = klocal >> 3;
+    int src = (klocal & 7) >> 1;
+    int p = klocal & 1;
+    // 워드 로드 (al)
+    int ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
+    int qh_rel = 128 + h * 32 + p * 16;
+    bool al = (wb & 3) == 0;
+    int qlw = (wb + ql_rel) >> 2;
+    int qhw = (wb + qh_rel) >> 2;
+    unsigned qa[4], ha[4];
+    if (al) {
+        for (int k = 0; k < 4; k++) { qa[k] = w[qlw+k]; ha[k] = w[qhw+k]; }
+    } else {
+        for (int k = 0; k < 4; k++) {
+            qa[k] = (w[qlw+k] >> 16) | (w[qlw+k+1] << 16);
+            ha[k] = (w[qhw+k] >> 16) | (w[qhw+k+1] << 16);
+        }
+    }
+    int xw = (g << 4) >> 2;
+    unsigned yv[4];
+    for (int k = 0; k < 4; k++) yv[k] = xq[xw + k];
+    // old 스칼라
+    int isum_old = 0;
+    for (int j = 0; j < 16; j++) {
+        unsigned qv = qa[j >> 2], hv = ha[j >> 2];
+        int sk = (j & 3) * 8;
+        unsigned nib = (src == 0 || src == 1) ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
+        int hi2 = (src == 0) ? (int)((hv >> sk) & 3u)
+                : (src == 1) ? (int)(((hv >> sk) >> 2) & 3u)
+                : (src == 2) ? (int)(((hv >> sk) >> 4) & 3u)
+                : (int)(((hv >> sk) >> 6) & 3u);
+        int y8 = sext8((yv[j >> 2] >> sk) & 0xFFu);
+        isum_old += (((int)nib | (hi2 << 4)) - 32) * y8;
+    }
+    // new dot4
+    int nsh = (src == 0 || src == 1) ? 0 : 4;
+    int hsh = 2 * src;
+    int isum_new = 0;
+    for (int k = 0; k < 4; k++) {
+        unsigned nibw = (qa[k] >> nsh) & 0x0F0F0F0Fu;
+        unsigned hi2w = (ha[k] >> hsh) & 0x03030303u;
+        unsigned wv = (nibw | (hi2w << 4)) - 0x20202020u;
+        isum_new = dot4(wv, yv[k], isum_new);
+    }
+    // v3: 패킹 후 스칼라 (dot4 없이)
+    int isum_v3 = 0;
+    for (int k = 0; k < 4; k++) {
+        for (int b = 0; b < 4; b++) {
+            unsigned nib = (qa[k] >> (8 * b + nsh)) & 0xFu;
+            unsigned hi2 = (ha[k] >> (8 * b + hsh)) & 3u;
+            int w = ((int)nib | ((int)hi2 << 4)) - 32;
+            int y8 = sext8((yv[k] >> (8 * b)) & 0xFFu);
+            isum_v3 += w * y8;
+        }
+    }
+    part[0] = (double)isum_old;
+    part[1] = (double)isum_new;
+    part[2] = (double)isum_v3;
+    part[3] = (double)(wb & 3);
 }
 
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
@@ -974,7 +1085,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

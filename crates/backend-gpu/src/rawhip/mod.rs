@@ -246,6 +246,7 @@ impl RawCtx {
         let part = self.scratch(n_out * 64 * 8)?;
         let out = self.scratch(n_out * 4)?;
         let gx = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
         let kern = match ty {
             23 => "gemm_xs",   // iq4_xs
             13 => "gemm_q5k",  // q5_K
@@ -282,8 +283,7 @@ impl RawCtx {
             ],
         };
         let _ = &mut gx_a;
-        self.launch(kern, gx, 1, 64, &mut args_v)?;
-        // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
+        self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
         let mut part_p2 = part as *mut std::ffi::c_void;
         let mut out_p = out as *mut std::ffi::c_void;
         let mut n_out_b = n_out as i32;
@@ -576,4 +576,112 @@ pub fn exp_ab() -> Result<String, String> {
         }
     }
     Ok(format!("exp_ab: {bad}/{n} differ\n{msg}"))
+}
+
+/// dp4a 가용성 테스트.
+pub fn dp4a_test() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let x: Vec<u32> = vec![0x12, 0x11, 0x00010000, 0x00050000];
+    let xd = ctx.alloc(16)?;
+    let od = ctx.alloc(32)?;
+    ctx.h2d(xd, bytemuck::cast_slice(&x))?;
+    let mut xp = xd as *mut std::ffi::c_void;
+    let mut op = od as *mut std::ffi::c_void;
+    let mut args = vec![
+        (&mut xp) as *mut _ as *mut std::ffi::c_void,
+        (&mut op) as *mut _ as *mut std::ffi::c_void,
+    ];
+    ctx.launch("dp4a_probe", 1, 1, 1, &mut args)?;
+    ctx.sync()?;
+    let mut r = [0i32; 8];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), od)?;
+    Ok(format!("sdot8={} (3) udot8={} (5) sdot2={} (204) sdot4={} (204) neg={} (-4) lit_mix={} (-538) bc_mix={} (-538) bc_acc={} (462)", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]))
+}
+
+/// 대역폭 상한 프로브 — q5_K ffn_gate 형상 [5120→17408, 176B] 재현.
+pub fn bw_test() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let (n_in, n_out, bsize) = (5120usize, 17408usize, 176usize);
+    let bytes = n_out * (n_in / 256) * bsize;
+    let w = ctx.alloc(bytes)?;
+    let part = ctx.scratch(n_out * 64 * 8)?;
+    let mut wp = w as *mut std::ffi::c_void;
+    let mut pp = part as *mut std::ffi::c_void;
+    let mut ni = n_in as i32;
+    let mut no = n_out as i32;
+    let mut bs = bsize as i32;
+    let mut args = vec![
+        (&mut wp) as *mut _ as *mut std::ffi::c_void,
+        (&mut pp) as *mut _ as *mut std::ffi::c_void,
+        (&mut ni) as *mut _ as *mut std::ffi::c_void,
+        (&mut no) as *mut _ as *mut std::ffi::c_void,
+        (&mut bs) as *mut _ as *mut std::ffi::c_void,
+    ];
+    // 워밍
+    ctx.launch("bw_probe", 17408, 1, 64, &mut args)?;
+    ctx.sync()?;
+    let reps = 30;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        ctx.launch("bw_probe", 17408, 1, 64, &mut args)?;
+    }
+    ctx.sync()?;
+    let dt = t0.elapsed().as_secs_f64() / reps as f64;
+    let mut r = vec![0f64; 64];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
+    let _ = r[0];
+    Ok(format!("bw_probe: {:.1}us -> {:.0} GB/s (checksum={})", dt * 1e6, bytes as f64 / dt / 1e9, r[63] as u32))
+}
+
+/// q6_K old/new isum A/B — blk.11.attn_k (q6_K) 실데이터.
+pub fn q6k_ab_test() -> Result<String, String> {
+    use std::io::Read;
+    // gguf 직접 파싱 대신 llm170_core로 로드
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.11.attn_k.weight".into());
+    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let w = model.w(&tname).ok_or("tensor 없음")?;
+    let ctx = RawCtx::new()?;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let n_in = w.n_in as usize;
+    // 임의 x: q8 양자화
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let blocks_q = llm170_core::quant::quantize_row_q8_ref(&x);
+    let mut xq_h: Vec<u32> = Vec::new();
+    for b in &blocks_q {
+        for c in 0..8 {
+            xq_h.push((b.qs[c*4] as u32 & 0xFF) | ((b.qs[c*4+1] as u32 & 0xFF) << 8) | ((b.qs[c*4+2] as u32 & 0xFF) << 16) | ((b.qs[c*4+3] as u32 & 0xFF) << 24));
+        }
+    }
+    for b in &blocks_q { xq_h.push(b.d.to_bits()); }
+    let xqd = ctx.alloc(xq_h.len() * 4)?;
+    ctx.h2d(xqd, bytemuck::cast_slice(&xq_h))?;
+    let part = ctx.alloc(32)?;
+    let mut msg = String::new();
+    // row 0, 여러 그룹 시험
+    for g in [0usize, 1, 5, 8, 17, 40, 100, 200] {
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut xp = xqd as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut r0 = 0i32;
+        let mut gi = g as i32;
+        // 커널 wb 계산이 n_in=256 가정이므로 row_base를 0으로 — g>>4 블록 인덱스는 행 내 오프셋으로 유효
+        let mut args = vec![
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut r0) as *mut _ as *mut std::ffi::c_void,
+            (&mut gi) as *mut _ as *mut std::ffi::c_void,
+        ];
+        ctx.launch("q6k_ab", 1, 1, 1, &mut args)?;
+        ctx.sync()?;
+        let mut r = [0f64; 4];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
+        msg += &format!("g={}: old={} dot4={} packed={} src={} al={} old==dot4:{} old==packed:{}\n", g, r[0] as i64, r[1] as i64, r[2] as i64, r[2] as i64, r[3] as i64, r[0]==r[1], r[0]==r[2]);
+    }
+    Ok(msg)
 }

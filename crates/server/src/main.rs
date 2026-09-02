@@ -124,6 +124,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("q6k-abtest") => match llm170_backend_gpu::rawhip::q6k_ab_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
+        Some("bw-test") => match llm170_backend_gpu::rawhip::bw_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
+        Some("dp4a-test") => match llm170_backend_gpu::rawhip::dp4a_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("exp-ab") => match llm170_backend_gpu::rawhip::exp_ab() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
