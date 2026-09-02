@@ -107,13 +107,13 @@ pub fn rms_rows_finish(
 ) {
     let row = CUBE_POS_X as usize;
     let u = UNIT_POS_X as usize;
-    if u != 0 {
+    if u >= seg {
         terminate!();
     }
+    // 결합(유닛 0) 후 스케일은 전 유닛 분담 — 원소별이라 순서 무관
+    // (280µs 직렬 루프가 병목, 2026-09-02 P2 rocprof).
     let eps = f64::cast_from(params[0]);
     let mut sum = 0.0f64;
-    // 세그먼트 순차 결합 — CPU sq_sum과 동일 순서. 세그먼트 경계가 n을
-    // 넘으면 CPU가 break한 지점과 같이 0 기여(로드하지 않고 건너뜀).
     let chunk = n.div_ceil(seg);
     let mut u2 = 0usize;
     while u2 < seg {
@@ -127,10 +127,16 @@ pub fn rms_rows_finish(
     let inv = 1.0f32 / scale32;
     let xb = row * n;
     let wb = (row % w_reps) * n;
-    let mut i = 0usize;
-    while i < n {
-        out[xb + i] = x[xb + i] * inv * w[wb + i];
-        i += 1;
+    // 스케일 세그먼트: 유닛 u가 [u·schunk, (u+1)·schunk) 분담.
+    let schunk = n.div_ceil(seg);
+    let lo = u * schunk;
+    if lo < n {
+        let hi = (lo + schunk).min(n);
+        let mut i = lo;
+        while i < hi {
+            out[xb + i] = x[xb + i] * inv * w[wb + i];
+            i += 1;
+        }
     }
 }
 

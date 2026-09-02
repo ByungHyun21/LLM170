@@ -26,6 +26,9 @@ pub static T_UP: AtomicU64 = AtomicU64::new(0);
 pub static T_LAUNCH: AtomicU64 = AtomicU64::new(0);
 pub static T_READ: AtomicU64 = AtomicU64::new(0);
 pub static N_OP: AtomicU64 = AtomicU64::new(0);
+/// 프레임 op/mm 호스트 구간(마샬링+암시 대기 포함) — P2 계측.
+pub static T_FOP: AtomicU64 = AtomicU64::new(0);
+pub static N_FOP: AtomicU64 = AtomicU64::new(0);
 
 /// 계측 요약 출력 (server가 infer 완료 후 호출).
 pub fn timing_report() {
@@ -38,7 +41,7 @@ pub fn timing_report() {
         T_READ.load(Ordering::Relaxed),
         N_OP.load(Ordering::Relaxed),
     );
-    eprintln!("# gpu-timing: up={:.1}s launch={:.1}s read={:.1}s ops={n}", u as f64 / 1e6, l as f64 / 1e6, r as f64 / 1e6);
+    eprintln!("# gpu-timing: up={:.1}s launch={:.1}s read={:.1}s ops={n} fop={:.1}s fn={}", u as f64 / 1e6, l as f64 / 1e6, r as f64 / 1e6, T_FOP.load(Ordering::Relaxed) as f64 / 1e6, N_FOP.load(Ordering::Relaxed));
 }
 
 #[inline]
@@ -1964,6 +1967,17 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
     }
 
     fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
+        use llm170_core::matmul::FrameOp;
+        let t_op0 = std::time::Instant::now();
+        let r = self.frame_op_inner(op);
+        acc(&T_FOP, t_op0.elapsed());
+        N_FOP.fetch_add(1, Ordering::Relaxed);
+        r
+    }
+}
+
+impl<R: Runtime> GpuMatmul<R> {
+    fn frame_op_inner(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
         use llm170_core::matmul::FrameOp;
 
         let one = |h: u64| self.frame_get(h).map(|v| v.0);
