@@ -3,6 +3,7 @@
 //! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
 
+mod bench;
 mod engine;
 mod http;
 mod tokenize;
@@ -26,7 +27,9 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
   llm170 gdn-ar-check [n_group dt_rank d]
       GDN AR 커널 GPU↔CPU 상호검증. 기본 8/48/128 (16·32·64·128 회귀 권장)
   llm170 moe-down-check
-      MoE 배치 down 커널(gemm_q5) GPU↔CPU 상호검증
+  llm170 bench --model <file.gguf> [--pp N] [--tg N] [--reps N] [--ctx N]
+              [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+      llama-bench 규격 PP/TG 측정 (t/s). --spec: MTP 스펙 디코드 유효 t/s.
   llm170 help
 "#;
 
@@ -105,7 +108,7 @@ fn main() -> ExitCode {
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
         Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
-        Some("gdn-chunk-check") => cmd_gdn_chunk_check(),
+        Some("bench") => return bench::cmd_bench(&args[1..]),
         Some("moe-down-check") => cmd_moe_down_check(),
         Some("check") => cmd_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
