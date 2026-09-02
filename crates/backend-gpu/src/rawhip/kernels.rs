@@ -224,6 +224,234 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const float* xd, const 
     }
     part[o * 64 + l] = acc;
 }
+
+// q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
+extern "C" __global__ void gemm_q4k(const unsigned* xq, const float* xd, const unsigned* w,
+                                    double* part, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 144;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int js = sb & 7;
+        int it = js >> 1;
+        int half = js & 1;
+        int wb = row_base + (sb >> 3) * 144;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        float dm = bits_f16(w0 >> 16);
+        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+        unsigned r = (js & 3) * 8;
+        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+        unsigned sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        int qlb = wq + 4 + it * 8;
+        unsigned q0 = w[qlb], q1 = w[qlb+1], q2 = w[qlb+2], q3 = w[qlb+3];
+        unsigned q4 = w[qlb+4], q5 = w[qlb+5], q6 = w[qlb+6], q7 = w[qlb+7];
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int isum = 0, qsum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            unsigned qv, yv;
+            int wi = j >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: qv = q0; yv = y0; break; case 1: qv = q1; yv = y1; break;
+                case 2: qv = q2; yv = y2; break; case 3: qv = q3; yv = y3; break;
+                case 4: qv = q4; yv = y4; break; case 5: qv = q5; yv = y5; break;
+                case 6: qv = q6; yv = y6; break; default: qv = q7; yv = y7; break;
+            }
+            unsigned nib = half == 0 ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
+            int y8 = sext8((yv >> sk) & 0xFFu);
+            isum += (int)nib * y8;
+            qsum += y8;
+        }
+        float yd = xd[sb];
+        acc += (double)(yd * (d * (float)sc_v) * (float)isum);
+        acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+    }
+    part[o * 64 + l] = acc;
+}
+
+// q6_K (ty14) — 16원소 그룹, 가상워드 ql/qh (비정렬 5워드 슬라이딩)
+extern "C" __global__ void gemm_q6k(const unsigned* xq, const float* xd, const unsigned* w,
+                                    double* part, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_g = n_in >> 4;
+    int cnt = (n_g + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 210;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int g = l + (m << 6);
+        int blk = g >> 4;
+        int kloc = g - (blk << 4);
+        int wb = row_base + blk * 210;
+        int h = kloc >> 3;
+        int src = (kloc - (h << 3)) >> 1;
+        int p = kloc & 1;
+        float d = f16w(w, wb + 208);
+        int sc = sext8(byte(w, wb + 192 + kloc));
+        int ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
+        int qh_rel = 128 + h * 32 + p * 16;
+        bool al = (wb & 3) == 0;
+        int qlw = (wb + ql_rel) >> 2;
+        int qhw = (wb + qh_rel) >> 2;
+        unsigned qa0, qa1, qa2, qa3, ha0, ha1, ha2, ha3;
+        if (al) {
+            qa0 = w[qlw]; qa1 = w[qlw+1]; qa2 = w[qlw+2]; qa3 = w[qlw+3];
+            ha0 = w[qhw]; ha1 = w[qhw+1]; ha2 = w[qhw+2]; ha3 = w[qhw+3];
+        } else {
+            qa0 = (w[qlw] >> 16) | (w[qlw+1] << 16);
+            qa1 = (w[qlw+1] >> 16) | (w[qlw+2] << 16);
+            qa2 = (w[qlw+2] >> 16) | (w[qlw+3] << 16);
+            qa3 = (w[qlw+3] >> 16) | (w[qlw+4] << 16);
+            ha0 = (w[qhw] >> 16) | (w[qhw+1] << 16);
+            ha1 = (w[qhw+1] >> 16) | (w[qhw+2] << 16);
+            ha2 = (w[qhw+2] >> 16) | (w[qhw+3] << 16);
+            ha3 = (w[qhw+3] >> 16) | (w[qhw+4] << 16);
+        }
+        int xw = (g << 4) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned qv, hv, yv;
+            int wi = j >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: qv = qa0; hv = ha0; yv = y0; break;
+                case 1: qv = qa1; hv = ha1; yv = y1; break;
+                case 2: qv = qa2; hv = ha2; yv = y2; break;
+                default: qv = qa3; hv = ha3; yv = y3; break;
+            }
+            unsigned nib = (src == 0 || src == 1) ? (qv >> sk) & 0xFu : ((qv >> sk) >> 4) & 0xFu;
+            int hi2 = (src == 0) ? (int)((hv >> sk) & 3u)
+                    : (src == 1) ? (int)(((hv >> sk) >> 2) & 3u)
+                    : (src == 2) ? (int)(((hv >> sk) >> 4) & 3u)
+                    : (int)(((hv >> sk) >> 6) & 3u);
+            int y8 = sext8((yv >> sk) & 0xFFu);
+            isum += (((int)nib | (hi2 << 4)) - 32) * y8;
+        }
+        float yd = xd[(g >> 1)];
+        acc += (double)(yd * d * (float)sc * (float)isum);
+    }
+    part[o * 64 + l] = acc;
+}
+
+// iq4_nl (ty20) — ktab2 룩업, 블록 32원소
+extern "C" __global__ void gemm_nl(const unsigned* xq, const float* xd, const unsigned* w,
+                                   double* part, const unsigned* ktab2, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int row_base = o * n_sub * 18;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + sb * 18;
+        float d = f16w(w, wb);
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned qb = byte(w, wb + 2 + j);
+            unsigned t = ktab2[qb];
+            unsigned ylv, yhv;
+            int wi = (j) >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: ylv = y0; yhv = y4; break;
+                case 1: ylv = y1; yhv = y5; break;
+                case 2: ylv = y2; yhv = y6; break;
+                default: ylv = y3; yhv = y7; break;
+            }
+            isum += sext8(t & 0xFFu) * sext8((ylv >> sk) & 0xFFu);
+            isum += sext8((t >> 8) & 0xFFu) * sext8((yhv >> sk) & 0xFFu);
+        }
+        float yd = xd[sb];
+        acc += (double)(yd * d * (float)isum);
+    }
+    part[o * 64 + l] = acc;
+}
+
+// q3_K (ty11) — 16원소 하프블록, ql/hm byte() 로드(비정렬)
+extern "C" __global__ void gemm_q3k(const unsigned* xq, const float* xd, const unsigned* w,
+                                    double* part, int n_in, int n_out) {
+    int o = blockIdx.x + blockIdx.z * gridDim.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_h = n_in >> 4;
+    int cnt = (n_h + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 110;
+    double acc = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int h = l + (m << 6);
+        int blk = h >> 4;
+        int kloc = h - (blk << 4);
+        int hh = kloc >> 3;
+        int src = (kloc - (hh << 3)) >> 1;
+        int p = kloc & 1;
+        int wb = row_base + blk * 110;
+        // 스케일 12바이트(wb+96..107) — wb%4 ∈ {0,2} 워드 경계 산술
+        int sw = (wb + 96) >> 2;
+        int off = (wb + 96) & 3;
+        unsigned a0, a1, tmp;
+        if (off == 0) { a0 = w[sw]; a1 = w[sw+1]; tmp = w[sw+2]; }
+        else { a0 = (w[sw] >> 16) | (w[sw+1] << 16); a1 = (w[sw+1] >> 16) | (w[sw+2] << 16); tmp = (w[sw+2] >> 16) | (w[sw+3] << 16); }
+        unsigned k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+        unsigned aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+        unsigned aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+        unsigned aux0 = (a0 & k2) | ((tmp & k1) << 4);
+        unsigned aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+        int ai = hh * 8 + src * 2 + p;
+        unsigned aux = ai < 4 ? aux0 : (ai < 8 ? aux1 : (ai < 12 ? aux2 : aux3));
+        unsigned scb = (aux >> ((ai % 4) * 8)) & 0xFFu;
+        float dl = f16w(w, wb + 108) * (float)(sext8(scb) - 32);
+        int qlb2 = wb + 32 + hh * 32 + p * 16;
+        int hbase2 = wb + p * 16;
+        int xw = (h << 4) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned qb = byte(w, qlb2 + j);
+            unsigned hb = byte(w, hbase2 + j);
+            unsigned yv;
+            int wi = j >> 2, sk = (j & 3) * 8;
+            switch (wi) {
+                case 0: yv = y0; break; case 1: yv = y1; break;
+                case 2: yv = y2; break; default: yv = y3; break;
+            }
+            int qv = (int)((qb >> (src * 2)) & 3u);
+            int bit = (int)((hb >> src) & 1u);
+            int sub = 4 - bit * 4;
+            isum += (qv - sub) * sext8((yv >> sk) & 0xFFu);
+        }
+        float yd = xd[h >> 1];
+        acc += (double)(yd * dl * (float)isum);
+    }
+    part[o * 64 + l] = acc;
+}
+
 "#;
 
 pub const NAMES: &[&str] = &[
@@ -232,4 +460,8 @@ pub const NAMES: &[&str] = &[
     "gemm_xs",
     "gemm_q5k",
     "gemm_q8_0",
+    "gemm_q4k",
+    "gemm_q6k",
+    "gemm_nl",
+    "gemm_q3k",
 ];

@@ -136,7 +136,11 @@ impl RawCtx {
             23 => "gemm_xs",   // iq4_xs
             13 => "gemm_q5k",  // q5_K
             8 => "gemm_q8_0",  // q8_0
-            _ => return Err(format!("미지원 타입 {ty} (현: iq4_xs·q5_K·q8_0)")),
+            12 => "gemm_q4k",  // q4_K
+            14 => "gemm_q6k",  // q6_K
+            20 => "gemm_nl",   // iq4_nl
+            11 => "gemm_q3k",  // q3_K
+            _ => return Err(format!("미지원 타입 {ty}")),
         };
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut xd_p = xd as *mut std::ffi::c_void;
@@ -147,7 +151,7 @@ impl RawCtx {
         let mut n_out_a = n_out as i32;
         let mut gx_a = gx as i32;
         let mut args_v: Vec<*mut std::ffi::c_void> = match ty {
-            23 => vec![
+            23 | 20 => vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut xd_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,

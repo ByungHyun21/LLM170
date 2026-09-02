@@ -2114,10 +2114,8 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         Some(w) => w,
         None => { eprintln!("tensor not found: {}", args[1]); return ExitCode::FAILURE; }
     };
-    if !llm170_core::matmul::w4a8_ty(w.ty) || w.ty == llm170_gguf::GgmlType::Q3K
-        || w.ty == llm170_gguf::GgmlType::Q4K || w.ty == llm170_gguf::GgmlType::Q6K
-        || w.ty == llm170_gguf::GgmlType::Iq4Nl {
-        eprintln!("rawhip-check: 현 단계 iq4_xs·q5_K·q8_0 전용");
+    if !llm170_core::matmul::w4a8_ty(w.ty) {
+        eprintln!("rawhip-check: 미지원 타입");
         return ExitCode::FAILURE;
     }
     let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
@@ -2184,7 +2182,11 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         let row = &w.data[o * rb..];
         let c = match w.ty {
             llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &y),
             llm170_gguf::GgmlType::Q8_0 => llm170_core::quant::dot_row_w4a8_q8_0_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Iq4Nl => llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Q3K => llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y),
             _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
         };
         if c.to_bits() != g[o].to_bits() {
