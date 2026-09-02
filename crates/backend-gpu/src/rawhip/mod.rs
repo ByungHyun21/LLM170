@@ -309,28 +309,39 @@ impl RawCtx {
         Ok(())
     }
 
-    /// 타일 배치 GEMV (q5_K) — out [t][n_out].
+    /// 타일 배치 GEMV (q5_K/q4_K/q6_K/iq4_xs) — out [t][n_out].
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_tile_q5k(&self, xq: *const u8, w: *const u8, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let kern = match ty {
+            13 => "gemm_q5k_bt",
+            12 => "gemm_q4k_bt",
+            14 => "gemm_q6k_bt",
+            23 => "gemm_xs_bt",
+            _ => return Err(format!("타일 미지원 타입 {ty}")),
+        };
         let mut xp = xq as *mut std::ffi::c_void;
         let mut wp = w as *mut std::ffi::c_void;
         let mut op = out as *mut std::ffi::c_void;
+        let mut ktp = ktab2 as *mut std::ffi::c_void;
         let mut ni = n_in as i32;
         let mut no = n_out as i32;
         let mut xw = xq_w as i32;
         let mut tt = t as i32;
-        let mut args = vec![
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&mut xp) as *mut _ as *mut std::ffi::c_void,
             (&mut wp) as *mut _ as *mut std::ffi::c_void,
             (&mut op) as *mut _ as *mut std::ffi::c_void,
-            (&mut ni) as *mut _ as *mut std::ffi::c_void,
-            (&mut no) as *mut _ as *mut std::ffi::c_void,
-            (&mut xw) as *mut _ as *mut std::ffi::c_void,
-            (&mut tt) as *mut _ as *mut std::ffi::c_void,
         ];
+        if ty == 23 {
+            args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
+        }
+        args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
         let gx = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
-        self.launch3("gemm_q5k_bt", gx, 1, gz, 64, &mut args)
+        self.launch3(kern, gx, 1, gz, 64, &mut args)
     }
 
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
@@ -805,6 +816,13 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let n_out = w.n_out as usize;
     let wd = ctx.alloc(w.data.len())?;
     ctx.h2d(wd, w.data)?;
+    let ktab2: Vec<u32> = (0..256u32).map(|b| {
+        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+        lo | (hi << 8)
+    }).collect();
+    let kt_d = ctx.alloc(1024)?;
+    ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
     let xq_w = n_in / 4 + n_in / 32;
     let mut seed = 0x9e3779b9u64;
     let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
@@ -836,16 +854,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let mut no = n_out as i32;
     let mut xw = xq_w as i32;
     let mut tt = t as i32;
-    let mut args_v = vec![
-        (&mut xp) as *mut _ as *mut std::ffi::c_void,
-        (&mut wp) as *mut _ as *mut std::ffi::c_void,
-        (&mut op) as *mut _ as *mut std::ffi::c_void,
-        (&mut ni) as *mut _ as *mut std::ffi::c_void,
-        (&mut no) as *mut _ as *mut std::ffi::c_void,
-        (&mut xw) as *mut _ as *mut std::ffi::c_void,
-        (&mut tt) as *mut _ as *mut std::ffi::c_void,
-    ];
-    ctx.launch3("gemm_q5k_bt", n_out.min(65535) as u32, 1, n_out.div_ceil(65535) as u32, 64, &mut args_v)?;
+    ctx.gemm_tile(xq, wd, kt_d, w.ty as u32, n_in, n_out, xq_w, t, out)?;
     ctx.sync()?;
     let mut o = vec![0f32; n_out * t];
     ctx.d2h(bytemuck::cast_slice_mut(&mut o).as_mut(), out)?;
@@ -858,7 +867,12 @@ pub fn mm_tile_bench() -> Result<String, String> {
     for ti in 0..t {
         for oo in 0..n_out.min(256) {
             let row = &w.data[oo * rb..];
-            let c = llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &q8s[ti]);
+            let c = match w.ty {
+                llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &q8s[ti]),
+                _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &q8s[ti]),
+            };
             if c.to_bits() != o[ti * n_out + oo].to_bits() {
                 mism += 1;
                 if mism == 1 {
@@ -872,7 +886,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let reps = 10;
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
-        ctx.launch3("gemm_q5k_bt", n_out.min(65535) as u32, 1, n_out.div_ceil(65535) as u32, 64, &mut args_v)?;
+        ctx.gemm_tile(xq, wd, kt_d, w.ty as u32, n_in, n_out, xq_w, t, out)?;
     }
     ctx.sync()?;
     let dt = t0.elapsed().as_secs_f64() / reps as f64;

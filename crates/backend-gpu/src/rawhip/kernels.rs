@@ -477,6 +477,237 @@ extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
     }
 }
 
+// ─── 타일 배치 GEMM (블록=1행, TT 토큰 레지스터, 가중 1회 독서) ───
+// gemm_q5k_bt 참조. 미러와 토큰당 동일 연산열.
+
+// q4_K 타일 (ty12)
+extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
+                                       float* out, int n_in, int n_out, int xq_w, int t) {
+    int o = blockIdx.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 144;
+    double accs[TT];
+    #pragma unroll
+    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int js = sb & 7;
+        int it = js >> 1;
+        int half = js & 1;
+        int wb = row_base + (sb >> 3) * 144;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        float dm = bits_f16(w0 >> 16);
+        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+        unsigned r = (js & 3) * 8;
+        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+        unsigned sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        int qlb = wq + 4 + it * 8;
+        unsigned nsh = half << 2;
+        unsigned wv0 = (w[qlb]   >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv1 = (w[qlb+1] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv2 = (w[qlb+2] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv3 = (w[qlb+3] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv4 = (w[qlb+4] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv5 = (w[qlb+5] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv6 = (w[qlb+6] >> nsh) & 0x0F0F0F0Fu;
+        unsigned wv7 = (w[qlb+7] >> nsh) & 0x0F0F0F0Fu;
+        int xw = (sb << 5) >> 2;
+        for (int ti = 0; ti < t; ti++) {
+            const unsigned* xt = xq + ti * xq_w;
+            int isum = 0, qsum = 0;
+            unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
+            unsigned y4v = xt[xw+4], y5v = xt[xw+5], y6v = xt[xw+6], y7v = xt[xw+7];
+            isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
+            isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
+            isum = dot4(wv4, y4v, isum); isum = dot4(wv5, y5v, isum);
+            isum = dot4(wv6, y6v, isum); isum = dot4(wv7, y7v, isum);
+            qsum = dot4(0x01010101u, y0v, qsum); qsum = dot4(0x01010101u, y1v, qsum);
+            qsum = dot4(0x01010101u, y2v, qsum); qsum = dot4(0x01010101u, y3v, qsum);
+            qsum = dot4(0x01010101u, y4v, qsum); qsum = dot4(0x01010101u, y5v, qsum);
+            qsum = dot4(0x01010101u, y6v, qsum); qsum = dot4(0x01010101u, y7v, qsum);
+            float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
+            int q = ti & (TT - 1);
+            accs[q] += (double)(yd * (d * (float)sc_v) * (float)isum);
+            accs[q] -= (double)(yd * (dm * (float)m_v) * (float)qsum);
+        }
+    }
+    __shared__ double sh32[32];
+    for (int ti = 0; ti < t; ti++) {
+        double acc = accs[ti & (TT - 1)];
+        if (l >= 32) sh32[l - 32] = acc;
+        __syncthreads();
+        if (l < 32) {
+            acc += sh32[l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
+        }
+        __syncthreads();
+    }
+}
+
+// q6_K 타일 (ty14) — 16원소 그룹, w = nib + 16·hi2 − 32 분해
+extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
+                                       float* out, int n_in, int n_out, int xq_w, int t) {
+    int o = blockIdx.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_g = n_in >> 4;
+    int cnt = (n_g + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 210;
+    double accs[TT];
+    #pragma unroll
+    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int g = l + (m << 6);
+        int blk = g >> 4;
+        int kloc = g - (blk << 4);
+        int wb = row_base + blk * 210;
+        int h = kloc >> 3;
+        int src = (kloc - (h << 3)) >> 1;
+        int p = kloc & 1;
+        float d = f16w(w, wb + 208);
+        int sc = sext8(byte(w, wb + 192 + kloc));
+        int ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
+        int qh_rel = 128 + h * 32 + p * 16;
+        bool al = (wb & 3) == 0;
+        int qlw = (wb + ql_rel) >> 2;
+        int qhw = (wb + qh_rel) >> 2;
+        unsigned qa0, qa1, qa2, qa3, ha0, ha1, ha2, ha3;
+        if (al) {
+            qa0 = w[qlw]; qa1 = w[qlw+1]; qa2 = w[qlw+2]; qa3 = w[qlw+3];
+            ha0 = w[qhw]; ha1 = w[qhw+1]; ha2 = w[qhw+2]; ha3 = w[qhw+3];
+        } else {
+            qa0 = (w[qlw] >> 16) | (w[qlw+1] << 16);
+            qa1 = (w[qlw+1] >> 16) | (w[qlw+2] << 16);
+            qa2 = (w[qlw+2] >> 16) | (w[qlw+3] << 16);
+            qa3 = (w[qlw+3] >> 16) | (w[qlw+4] << 16);
+            ha0 = (w[qhw] >> 16) | (w[qhw+1] << 16);
+            ha1 = (w[qhw+1] >> 16) | (w[qhw+2] << 16);
+            ha2 = (w[qhw+2] >> 16) | (w[qhw+3] << 16);
+            ha3 = (w[qhw+3] >> 16) | (w[qhw+4] << 16);
+        }
+        int nsh = (src == 0 || src == 1) ? 0 : 4;
+        int hsh = 2 * src;
+        unsigned wv0 = ((qa0 >> nsh) & 0x0F0F0F0Fu) + ((((ha0 >> hsh) & 0x03030303u)) << 4);
+        unsigned wv1 = ((qa1 >> nsh) & 0x0F0F0F0Fu) + ((((ha1 >> hsh) & 0x03030303u)) << 4);
+        unsigned wv2 = ((qa2 >> nsh) & 0x0F0F0F0Fu) + ((((ha2 >> hsh) & 0x03030303u)) << 4);
+        unsigned wv3 = ((qa3 >> nsh) & 0x0F0F0F0Fu) + ((((ha3 >> hsh) & 0x03030303u)) << 4);
+        int xw = (g << 4) >> 2;
+        for (int ti = 0; ti < t; ti++) {
+            const unsigned* xt = xq + ti * xq_w;
+            int isum = 0, qsum = 0;
+            unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
+            isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
+            isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
+            qsum = dot4(0x20202020u, y0v, qsum); qsum = dot4(0x20202020u, y1v, qsum);
+            qsum = dot4(0x20202020u, y2v, qsum); qsum = dot4(0x20202020u, y3v, qsum);
+            isum -= qsum;
+            float yd = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
+            int q = ti & (TT - 1);
+            accs[q] += (double)(yd * d * (float)sc * (float)isum);
+        }
+    }
+    __shared__ double sh32[32];
+    for (int ti = 0; ti < t; ti++) {
+        double acc = accs[ti & (TT - 1)];
+        if (l >= 32) sh32[l - 32] = acc;
+        __syncthreads();
+        if (l < 32) {
+            acc += sh32[l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
+        }
+        __syncthreads();
+    }
+}
+
+// iq4_xs 타일 (ty23) — kvalues 룩업을 m 루프로 호이스트(토큰 불변)
+extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
+                                      float* out, const unsigned* ktab2, int n_in, int n_out,
+                                      int xq_w, int t) {
+    int o = blockIdx.x;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 136;
+    double accs[TT];
+    #pragma unroll
+    for (int q = 0; q < TT; q++) accs[q] = 0.0;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int b = sb >> 3;
+        int ib = sb & 7;
+        int wb = row_base + b * 136;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        int qw = (wb + 8 + ib * 16) >> 2;
+        int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
+              | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
+        float dl = d * (float)(ls - 32);
+        // 룩업+패킹 — 토큰 불변, 1회
+        unsigned lo[4], hi[4];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            unsigned qv = w[qw + k];
+            unsigned lov = 0, hiv = 0;
+            #pragma unroll
+            for (int b2 = 3; b2 >= 0; b2--) {
+                unsigned tt2 = ktab2[(qv >> (8 * b2)) & 0xFFu];
+                lov = (lov << 8) | (tt2 & 0xFFu);
+                hiv = (hiv << 8) | (tt2 >> 8);
+            }
+            lo[k] = lov; hi[k] = hiv;
+        }
+        int xw = (sb << 5) >> 2;
+        for (int ti = 0; ti < t; ti++) {
+            const unsigned* xt = xq + ti * xq_w;
+            int isum = 0;
+            isum = dot4(lo[0], xt[xw], isum); isum = dot4(lo[1], xt[xw+1], isum);
+            isum = dot4(lo[2], xt[xw+2], isum); isum = dot4(lo[3], xt[xw+3], isum);
+            isum = dot4(hi[0], xt[xw+4], isum); isum = dot4(hi[1], xt[xw+5], isum);
+            isum = dot4(hi[2], xt[xw+6], isum); isum = dot4(hi[3], xt[xw+7], isum);
+            float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
+            int q = ti & (TT - 1);
+            accs[q] += (double)(yd * dl * (float)isum);
+        }
+    }
+    __shared__ double sh32[32];
+    for (int ti = 0; ti < t; ti++) {
+        double acc = accs[ti & (TT - 1)];
+        if (l >= 32) sh32[l - 32] = acc;
+        __syncthreads();
+        if (l < 32) {
+            acc += sh32[l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
+        }
+        __syncthreads();
+    }
+}
+
 // q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
 extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
                                     double* part, float* out, int n_in, int n_out, int xq_w) {
@@ -1403,7 +1634,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

@@ -647,7 +647,8 @@ impl Engine {
                     );
                     cache.push(row);
                 }
-                for ch in cache.chunks(64) {
+                // 청크 ≤ TT(16): 타일 커널 accs 슬롯 수 제약 (비트계약)
+                for ch in cache.chunks(16) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?;
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
