@@ -251,6 +251,145 @@ pub(crate) fn de_elem(
     }
 }
 
+/// 4-요소 배치 디양자화 — j ≡ l, l+64, l+128, l+192 (stride 64 → blck=256 블록 내).
+/// 블록 불변량(d·dmin·scales_h·qh·qlb 등)을 1회 로드해 요소별 재판독 제거
+/// (GEMV 유효대역 30GB/s RCA — 2026-09-02). blck=256 계열 전용,
+/// 그 외는 de_elem 4회 폴백. 값은 de_elem과 비트 동일(같은 곱셈 순서).
+#[cube]
+fn de4(
+    w: &Tensor<u32>,
+    wb: usize,
+    l: usize,
+    ktab: &Tensor<f32>,
+    grid3: &Tensor<u32>,
+    #[comptime] qtype: usize,
+) -> (f32, f32, f32, f32) {
+    if qtype == 12 {
+        // q4_K: h=l%32·s0=l/32. sb=s0+{0,2,4,6} — 패리티 공유, ql 오프셋 32 간격.
+        let h = l % 32;
+        let s0 = l / 32;
+        let q = wb + 16 + (s0 / 2) * 32 + h;
+        let ql0 = byte(w, q);
+        let ql1 = byte(w, q + 32);
+        let ql2 = byte(w, q + 64);
+        let ql3 = byte(w, q + 96);
+        let (sc0, m0) = scale_min_k4(s0, w, wb + 4);
+        let (sc1, m1) = scale_min_k4(s0 + 2, w, wb + 4);
+        let (sc2, m2) = scale_min_k4(s0 + 4, w, wb + 4);
+        let (sc3, m3) = scale_min_k4(s0 + 6, w, wb + 4);
+        let nib0 = if s0 % 2 == 0 { ql0 & 0xF } else { ql0 >> 4 };
+        let nib1 = if s0 % 2 == 0 { ql1 & 0xF } else { ql1 >> 4 };
+        let nib2 = if s0 % 2 == 0 { ql2 & 0xF } else { ql2 >> 4 };
+        let nib3 = if s0 % 2 == 0 { ql3 & 0xF } else { ql3 >> 4 };
+        let d = f16_at(w, wb);
+        let dm = f16_at(w, wb + 2);
+        (
+            d * sc0 as f32 * nib0 as f32 - dm * m0 as f32,
+            d * sc1 as f32 * nib1 as f32 - dm * m1 as f32,
+            d * sc2 as f32 * nib2 as f32 - dm * m2 as f32,
+            d * sc3 as f32 * nib3 as f32 - dm * m3 as f32,
+        )
+    } else if qtype == 13 {
+        // q5_K: qh 바이트 1회(비트 시프트만 상이), ql 32 간격.
+        let h = l % 32;
+        let s0 = l / 32;
+        let qh = byte(w, wb + 16 + h);
+        let q = wb + 48 + (s0 / 2) * 32 + h;
+        let ql0 = byte(w, q);
+        let ql1 = byte(w, q + 32);
+        let ql2 = byte(w, q + 64);
+        let ql3 = byte(w, q + 96);
+        let (sc0, m0) = scale_min_k4(s0, w, wb + 4);
+        let (sc1, m1) = scale_min_k4(s0 + 2, w, wb + 4);
+        let (sc2, m2) = scale_min_k4(s0 + 4, w, wb + 4);
+        let (sc3, m3) = scale_min_k4(s0 + 6, w, wb + 4);
+        let d = f16_at(w, wb);
+        let dm = f16_at(w, wb + 2);
+        let v0 = (if s0 % 2 == 0 { ql0 & 0xF } else { ql0 >> 4 })
+            + ((qh >> (s0 as u32)) & 1) * 16;
+        let v1 = (if s0 % 2 == 0 { ql1 & 0xF } else { ql1 >> 4 })
+            + ((qh >> ((s0 + 2) as u32)) & 1) * 16;
+        let v2 = (if s0 % 2 == 0 { ql2 & 0xF } else { ql2 >> 4 })
+            + ((qh >> ((s0 + 4) as u32)) & 1) * 16;
+        let v3 = (if s0 % 2 == 0 { ql3 & 0xF } else { ql3 >> 4 })
+            + ((qh >> ((s0 + 6) as u32)) & 1) * 16;
+        (
+            d * sc0 as f32 * v0 as f32 - dm * m0 as f32,
+            d * sc1 as f32 * v1 as f32 - dm * m1 as f32,
+            d * sc2 as f32 * v2 as f32 - dm * m2 as f32,
+            d * sc3 as f32 * v3 as f32 - dm * m3 as f32,
+        )
+    } else if qtype == 14 {
+        // q6_K: j=l(h0,pos p0), l+64(h0,p0+2), l+128(h1,p0), l+192(h1,p0+2).
+        // qlb·qhb는 h별로, sc는 (h,pos)별로 — d·pos 패리티 공유.
+        let lr = l % 32;
+        let p0 = l / 32;
+        let qlb0 = byte(w, wb + lr + (p0 % 2) * 32);
+        let qlb1 = byte(w, wb + 64 + lr + (p0 % 2) * 32);
+        let qhb0 = byte(w, wb + 128 + lr);
+        let qhb1 = byte(w, wb + 160 + lr);
+        let sc00 = byte_signed(byte(w, wb + 192 + lr / 16 + p0 * 2));
+        let sc01 = byte_signed(byte(w, wb + 192 + lr / 16 + p0 * 2 + 4));
+        let sc10 = byte_signed(byte(w, wb + 200 + lr / 16 + p0 * 2));
+        let sc11 = byte_signed(byte(w, wb + 200 + lr / 16 + p0 * 2 + 4));
+        let d = f16_at(w, wb + 208);
+        let n0 = (qlb0 & 0xF) | (((qhb0 >> ((2 * p0) as u32)) & 3) << 4);
+        let n1 = (qlb0 >> 4) | (((qhb0 >> ((2 * p0 + 4) as u32)) & 3) << 4);
+        let n2 = (qlb1 & 0xF) | (((qhb1 >> ((2 * p0) as u32)) & 3) << 4);
+        let n3 = (qlb1 >> 4) | (((qhb1 >> ((2 * p0 + 4) as u32)) & 3) << 4);
+        (
+            d * sc00 * (n0 as i32 - 32) as f32,
+            d * sc01 * (n1 as i32 - 32) as f32,
+            d * sc10 * (n2 as i32 - 32) as f32,
+            d * sc11 * (n3 as i32 - 32) as f32,
+        )
+    } else if qtype == 23 {
+        // iq4_xs: ls 워드(wb+4..7)·scales_h·d 공유, qb는 16바이트 간격 4회.
+        let ib = l / 32;
+        let h = l % 32;
+        let d = f16_at(w, wb);
+        let scales_h = byte(w, wb + 2) | (byte(w, wb + 3) << 8);
+        let lsw = byte(w, wb + 4) | (byte(w, wb + 5) << 8) | (byte(w, wb + 6) << 16) | (byte(w, wb + 7) << 24);
+        let q = wb + 8 + h % 16;
+        let qb0 = byte(w, q + ib * 16);
+        let qb1 = byte(w, q + (ib + 2) * 16);
+        let qb2 = byte(w, q + (ib + 4) * 16);
+        let qb3 = byte(w, q + (ib + 6) * 16);
+        // 클로저 미지원(cube 매크로) — 수동 전개. lo = h<16, ls(i) = 6비트 스케일-32.
+        // lsw = bytes wb+4..7 패킹 — nibble 위치 = 바이트(ib/2)*8 + (ib%2)*4.
+        let ls0 = (((lsw >> (((ib / 2) * 8 + (ib % 2) * 4) as u32)) & 0xF) | (((scales_h >> ((2 * ib) as u32)) & 3) << 4)) as i32 - 32;
+        let ls1 = (((lsw >> (((ib / 2) * 8 + 8 + ((ib + 2) % 2) * 4) as u32)) & 0xF) | (((scales_h >> ((2 * (ib + 2)) as u32)) & 3) << 4)) as i32 - 32;
+        let ls2 = (((lsw >> (((ib / 2) * 8 + 16 + ((ib + 4) % 2) * 4) as u32)) & 0xF) | (((scales_h >> ((2 * (ib + 4)) as u32)) & 3) << 4)) as i32 - 32;
+        let ls3 = (((lsw >> (((ib / 2) * 8 + 24 + ((ib + 6) % 2) * 4) as u32)) & 0xF) | (((scales_h >> ((2 * (ib + 6)) as u32)) & 3) << 4)) as i32 - 32;
+        if h < 16 {
+            (
+                d * ls0 as f32 * ktab[(qb0 & 0xF) as usize],
+                d * ls1 as f32 * ktab[(qb1 & 0xF) as usize],
+                d * ls2 as f32 * ktab[(qb2 & 0xF) as usize],
+                d * ls3 as f32 * ktab[(qb3 & 0xF) as usize],
+            )
+        } else {
+            (
+                d * ls0 as f32 * ktab[(qb0 >> 4) as usize],
+                d * ls1 as f32 * ktab[(qb1 >> 4) as usize],
+                d * ls2 as f32 * ktab[(qb2 >> 4) as usize],
+                d * ls3 as f32 * ktab[(qb3 >> 4) as usize],
+            )
+        }
+    } else {
+        // blck=32 계열 등 — 블록 공유 없음: 요소별 디양자화.
+        let j1 = l + 64;
+        let j2 = l + 128;
+        let j3 = l + 192;
+        (
+            de_elem(w, wb, l, ktab, grid3, qtype),
+            de_elem(w, wb, j1, ktab, grid3, qtype),
+            de_elem(w, wb, j2, ktab, grid3, qtype),
+            de_elem(w, wb, j3, ktab, grid3, qtype),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 커널
 // ---------------------------------------------------------------------------
@@ -394,16 +533,62 @@ pub fn gemm_q7(
     for ti in 0..BT {
         acc[ti] = 0.0;
     }
-    for k in range_stepped(l, n_in, slices) {
+    // 4-배치 k-루프: 디양자화 로드 병렬 발행 — FMA k 오름차순 유지(비트 불변).
+    let s = slices;
+    let mut k = l;
+    while k + 3 * s < n_in {
+        let k1 = k + s;
+        let k2 = k + 2 * s;
+        let k3 = k + 3 * s;
+        let (v0, v1, v2, v3) = if qtype == 12 || qtype == 13 || qtype == 14 || qtype == 23 {
+            de4(w, row_base + (k / blck) * bsize, l, ktab, grid3, qtype)
+        } else {
+            (
+                de_elem(w, row_base + (k / blck) * bsize, k % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k1 / blck) * bsize, k1 % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k2 / blck) * bsize, k2 % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k3 / blck) * bsize, k3 % blck, ktab, grid3, qtype),
+            )
+        };
+        let xk = tb * n_in + k;
+        if tb + BT <= t_len {
+            #[unroll]
+            for ti in 0..BT {
+                acc[ti] += x[xk + ti * n_in] * v0;
+                acc[ti] += x[xk + s + ti * n_in] * v1;
+                acc[ti] += x[xk + 2 * s + ti * n_in] * v2;
+                acc[ti] += x[xk + 3 * s + ti * n_in] * v3;
+            }
+        } else {
+            for ti in 0..BT {
+                if tb + ti < t_len {
+                    acc[ti] += x[xk + ti * n_in] * v0;
+                    acc[ti] += x[xk + s + ti * n_in] * v1;
+                    acc[ti] += x[xk + 2 * s + ti * n_in] * v2;
+                    acc[ti] += x[xk + 3 * s + ti * n_in] * v3;
+                }
+            }
+        }
+        k += 4 * s;
+    }
+    while k < n_in {
         let b = k / blck;
         let j = k % blck;
         let v = de_elem(w, row_base + b * bsize, j, ktab, grid3, qtype);
-        for ti in 0..BT {
-            let tt = tb + ti;
-            if tt < t_len {
-                acc[ti] += x[tt * n_in + k] * v;
+        let xk = tb * n_in + k;
+        if tb + BT <= t_len {
+            #[unroll]
+            for ti in 0..BT {
+                acc[ti] += x[xk + ti * n_in] * v;
+            }
+        } else {
+            for ti in 0..BT {
+                if tb + ti < t_len {
+                    acc[ti] += x[xk + ti * n_in] * v;
+                }
             }
         }
+        k += s;
     }
     for ti in 0..BT {
         let tt = tb + ti;
@@ -549,7 +734,34 @@ pub fn gemm_q3(
     for ti in 0..tlen {
         acc[ti] = 0.0;
     }
-    for k in range_stepped(l, n_in, 64) {
+    // 4-배치 k-루프: 디양자화 로드를 병렬 발행해 지연 은닉.
+    // FMA 순서는 k 오름차순 유지 — 비트 불변 (2026-09-02, GEMV 30GB/s RCA).
+    let s = 64usize;
+    let mut k = l;
+    while k + 3 * s < n_in {
+        let k1 = k + s;
+        let k2 = k + 2 * s;
+        let k3 = k + 3 * s;
+        let (v0, v1, v2, v3) = if qtype == 12 || qtype == 13 || qtype == 14 || qtype == 23 {
+            de4(w, row_base + (k / blck) * bsize, l, ktab, grid3, qtype)
+        } else {
+            (
+                de_elem(w, row_base + (k / blck) * bsize, k % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k1 / blck) * bsize, k1 % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k2 / blck) * bsize, k2 % blck, ktab, grid3, qtype),
+                de_elem(w, row_base + (k3 / blck) * bsize, k3 % blck, ktab, grid3, qtype),
+            )
+        };
+        #[unroll]
+        for ti in 0..tlen {
+            acc[ti] += x[ti * n_in + k] * v0;
+            acc[ti] += x[ti * n_in + k1] * v1;
+            acc[ti] += x[ti * n_in + k2] * v2;
+            acc[ti] += x[ti * n_in + k3] * v3;
+        }
+        k += 4 * s;
+    }
+    while k < n_in {
         let b = k / blck;
         let j = k % blck;
         let v = de_elem(w, row_base + b * bsize, j, ktab, grid3, qtype);
@@ -557,6 +769,7 @@ pub fn gemm_q3(
         for ti in 0..tlen {
             acc[ti] += x[ti * n_in + k] * v;
         }
+        k += s;
     }
     #[unroll]
     for ti in 0..tlen {
