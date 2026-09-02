@@ -1909,7 +1909,7 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
-            if std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0") {
+            if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
             if backend == "gpu" {

@@ -417,7 +417,7 @@ impl Engine {
         if tokens.len() == 1
             && seq_ids.len() == 1
             && self.raw_decode.is_some()
-            && std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0")
+            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
         {
             let seq = seq_ids[0];
             let token = tokens[0];
@@ -625,7 +625,7 @@ impl Engine {
         // (KV/GDN/conv 링이 raw 디코더에 직접 적립).
         if std::env::var("LLM170_T1_PREFILL").is_ok()
             || (self.raw_decode.is_some()
-                && std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0"))
+                && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true))
         {
             let use_batch = std::env::var_os("LLM170_RAWHIP").is_some()
                 && std::env::var_os("LLM170_T1_PREFILL").is_none()
