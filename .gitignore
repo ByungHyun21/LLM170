@@ -3,3 +3,4 @@ source/*
 !source/research/
 target/
 __pycache__/
+AGENTS.md
