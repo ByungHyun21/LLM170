@@ -1242,3 +1242,449 @@ pub fn gemm_q8i_q3k(
     }
     part[o * 64 + l] = acc;
 }
+
+/// W4A8 정수 디코드 GEMM (q5_K, t=1) — 분할 형태(곱 체인 2개, FMA 수축
+/// 면역). bsize=176(4정렬) — 스케일·qh·ql 전부 워드 로드. 서브블록 32원소
+/// 스트라이드 레인. CPU dot_row_w4a8_q5k_lane과 동일 연산열.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_q5k(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let cnt = (n_sub + 63 - l) >> 6;
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 176;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let sb = l + _m * 64;
+        let js = sb - ((sb >> 3) << 3);
+        let it = js >> 1;
+        let half = js & 1;
+        let wb = row_base + (sb >> 3) * 176;
+        let wq = wb >> 2;
+        // d(0..2) dm(2..4) — 워드 0 하나에서
+        let w0 = w[wq];
+        let d = f16_bits(w0 & 0xFFFF);
+        let dm = f16_bits(w0 >> 16);
+        // 스케일 j=sb (scale_min_k4): sc[j], sc[j+4], (j≥4) sc[j−4] 바이트
+        let sc0 = w[wq + 1]; // 바이트 4..7 = sc[0..4]
+        let sc1 = w[wq + 2]; // 8..11 = sc[4..8]
+        let sc2 = w[wq + 3]; // 12..15 = sc[8..12]
+        let js = sb - ((sb >> 3) << 3); // 블록 내 스케일 인덱스 (sb%8)
+        let r = (js & 3) * 8;
+        let b_j = if js < 4 {
+            (sc0 >> (r as u32)) & 0xFF
+        } else {
+            (sc1 >> (r as u32)) & 0xFF
+        };
+        let b_j4 = if js < 4 {
+            (sc1 >> (r as u32)) & 0xFF
+        } else {
+            (sc2 >> (r as u32)) & 0xFF
+        };
+        let b_jm4 = (sc0 >> (r as u32)) & 0xFF;
+        let (sc_v, m_v) = if js < 4 {
+            (b_j & 63, b_j4 & 63)
+        } else {
+            (
+                (b_j4 & 0xF) | ((b_jm4 >> 6) << 4),
+                (b_j4 >> 4) | ((b_j >> 6) << 4),
+            )
+        };
+        // qh 32바이트 = 워드 8 (16..47)
+        let qh0 = w[wq + 4];
+        let qh1 = w[wq + 5];
+        let qh2 = w[wq + 6];
+        let qh3 = w[wq + 7];
+        let qh4 = w[wq + 8];
+        let qh5 = w[wq + 9];
+        let qh6 = w[wq + 10];
+        let qh7 = w[wq + 11];
+        // ql 32바이트 (48 + it*32) = 워드 8
+        let qlb = wq + 12 + it * 8;
+        let ql0 = w[qlb];
+        let ql1 = w[qlb + 1];
+        let ql2 = w[qlb + 2];
+        let ql3 = w[qlb + 3];
+        let ql4 = w[qlb + 4];
+        let ql5 = w[qlb + 5];
+        let ql6 = w[qlb + 6];
+        let ql7 = w[qlb + 7];
+        // xq 8워드
+        let xw = (sb * 32) >> 2;
+        let y0 = xq[xw];
+        let y1 = xq[xw + 1];
+        let y2 = xq[xw + 2];
+        let y3 = xq[xw + 3];
+        let y4 = xq[xw + 4];
+        let y5 = xq[xw + 5];
+        let y6 = xq[xw + 6];
+        let y7 = xq[xw + 7];
+        // u = half==0 ? 1<<(2it) : 2<<(2it) — 산술 (리터럴 분기 금지)
+        let base_u = (half + 1) << (2 * it); // half0→1, half1→2 ✓
+        let mut isum = 0i32;
+        let mut qsum = 0i32;
+        for j in 0..32 {
+            let qlb_v = if j < 4 {
+                (ql0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (ql1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (ql2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else if j < 16 {
+                (ql3 >> (((j - 12) * 8) as u32)) & 0xFF
+            } else if j < 20 {
+                (ql4 >> (((j - 16) * 8) as u32)) & 0xFF
+            } else if j < 24 {
+                (ql5 >> (((j - 20) * 8) as u32)) & 0xFF
+            } else if j < 28 {
+                (ql6 >> (((j - 24) * 8) as u32)) & 0xFF
+            } else {
+                (ql7 >> (((j - 28) * 8) as u32)) & 0xFF
+            };
+            let qhb = if j < 4 {
+                (qh0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (qh1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (qh2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else if j < 16 {
+                (qh3 >> (((j - 12) * 8) as u32)) & 0xFF
+            } else if j < 20 {
+                (qh4 >> (((j - 16) * 8) as u32)) & 0xFF
+            } else if j < 24 {
+                (qh5 >> (((j - 20) * 8) as u32)) & 0xFF
+            } else if j < 28 {
+                (qh6 >> (((j - 24) * 8) as u32)) & 0xFF
+            } else {
+                (qh7 >> (((j - 28) * 8) as u32)) & 0xFF
+            };
+            let yb = if j < 4 {
+                (y0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (y1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (y2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else if j < 16 {
+                (y3 >> (((j - 12) * 8) as u32)) & 0xFF
+            } else if j < 20 {
+                (y4 >> (((j - 16) * 8) as u32)) & 0xFF
+            } else if j < 24 {
+                (y5 >> (((j - 20) * 8) as u32)) & 0xFF
+            } else if j < 28 {
+                (y6 >> (((j - 24) * 8) as u32)) & 0xFF
+            } else {
+                (y7 >> (((j - 28) * 8) as u32)) & 0xFF
+            };
+            let nib = if half == 0 { qlb_v & 0xF } else { qlb_v >> 4 };
+            let sh = (2 * it + half) as u32; // u = 2^sh
+            let t = (qhb >> sh) & 1; // 0/1 — 산술
+            let hi = (t as i32) * 16;
+            let yv = sext8(yb);
+            isum += (nib as i32 + hi) * yv;
+            qsum += yv;
+        }
+        let yd = xd[sb];
+        acc += (yd * (d * sc_v as f32) * isum as f32) as f64;
+        acc -= (yd * (dm * m_v as f32) * qsum as f32) as f64;
+    }
+    part[o * 64 + l] = acc;
+}
+
+/// W4A8 정수 디코드 GEMM (q4_K, t=1) — 분할 형태. bsize=144(4정렬).
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_q4k(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let cnt = (n_sub + 63 - l) >> 6;
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 144;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let sb = l + _m * 64;
+        let js = sb - ((sb >> 3) << 3);
+        let it = js >> 1;
+        let half = js & 1;
+        let wb = row_base + (sb >> 3) * 144;
+        let wq = wb >> 2;
+        let w0 = w[wq];
+        let d = f16_bits(w0 & 0xFFFF);
+        let dm = f16_bits(w0 >> 16);
+        let sc0 = w[wq + 1];
+        let sc1 = w[wq + 2];
+        let sc2 = w[wq + 3];
+        let r = ((js & 3) * 8) as u32;
+        let b_j = if js < 4 { (sc0 >> r) & 0xFF } else { (sc1 >> r) & 0xFF };
+        let b_j4 = if js < 4 { (sc1 >> r) & 0xFF } else { (sc2 >> r) & 0xFF };
+        let b_jm4 = (sc0 >> r) & 0xFF;
+        let (sc_v, m_v) = if js < 4 {
+            (b_j & 63, b_j4 & 63)
+        } else {
+            (
+                (b_j4 & 0xF) | ((b_jm4 >> 6) << 4),
+                (b_j4 >> 4) | ((b_j >> 6) << 4),
+            )
+        };
+        let qlb = wq + 4 + it * 8; // qs 16+it*32 — 워드 8
+        let (qa0, qa1, qa2, qa3) = (w[qlb], w[qlb + 1], w[qlb + 2], w[qlb + 3]);
+        let (qa4, qa5, qa6, qa7) = (w[qlb + 4], w[qlb + 5], w[qlb + 6], w[qlb + 7]);
+        let xw = (sb * 32) >> 2;
+        let (y0, y1, y2, y3) = (xq[xw], xq[xw + 1], xq[xw + 2], xq[xw + 3]);
+        let (y4, y5, y6, y7) = (xq[xw + 4], xq[xw + 5], xq[xw + 6], xq[xw + 7]);
+        let mut isum = 0i32;
+        let mut qsum = 0i32;
+        for j in 0..32 {
+            let qv = if j < 4 {
+                (qa0 >> ((j * 8) as u32)) & 0xFF
+            } else if j < 8 {
+                (qa1 >> (((j - 4) * 8) as u32)) & 0xFF
+            } else if j < 12 {
+                (qa2 >> (((j - 8) * 8) as u32)) & 0xFF
+            } else if j < 16 {
+                (qa3 >> (((j - 12) * 8) as u32)) & 0xFF
+            } else if j < 20 {
+                (qa4 >> (((j - 16) * 8) as u32)) & 0xFF
+            } else if j < 24 {
+                (qa5 >> (((j - 20) * 8) as u32)) & 0xFF
+            } else if j < 28 {
+                (qa6 >> (((j - 24) * 8) as u32)) & 0xFF
+            } else {
+                (qa7 >> (((j - 28) * 8) as u32)) & 0xFF
+            };
+            let yv = if j < 4 {
+                sext8((y0 >> ((j * 8) as u32)) & 0xFF)
+            } else if j < 8 {
+                sext8((y1 >> (((j - 4) * 8) as u32)) & 0xFF)
+            } else if j < 12 {
+                sext8((y2 >> (((j - 8) * 8) as u32)) & 0xFF)
+            } else if j < 16 {
+                sext8((y3 >> (((j - 12) * 8) as u32)) & 0xFF)
+            } else if j < 20 {
+                sext8((y4 >> (((j - 16) * 8) as u32)) & 0xFF)
+            } else if j < 24 {
+                sext8((y5 >> (((j - 20) * 8) as u32)) & 0xFF)
+            } else if j < 28 {
+                sext8((y6 >> (((j - 24) * 8) as u32)) & 0xFF)
+            } else {
+                sext8((y7 >> (((j - 28) * 8) as u32)) & 0xFF)
+            };
+            let nib = if half == 0 { qv & 0xF } else { qv >> 4 };
+            isum += (nib as i32) * yv;
+            qsum += yv;
+        }
+        let yd = xd[sb];
+        acc += (yd * (d * sc_v as f32) * isum as f32) as f64;
+        acc -= (yd * (dm * m_v as f32) * qsum as f32) as f64;
+    }
+    part[o * 64 + l] = acc;
+}
+
+/// W4A8 정수 디코드 GEMM (q8_0, t=1) — 블록=32원소, bsize=34 (2 mod 4
+/// 정렬 — d·qs byte() 로드).
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_q8_0(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let cnt = (n_sub + 63 - l) >> 6;
+    let row_base = o * (n_in / 32) * 34;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let sb = l + _m * 64;
+        let wb = row_base + sb * 34;
+        let d = f16_bits(byte(w, wb) | (byte(w, wb + 1) << 8));
+        let xw = (sb * 32) >> 2;
+        let (y0, y1, y2, y3) = (xq[xw], xq[xw + 1], xq[xw + 2], xq[xw + 3]);
+        let (y4, y5, y6, y7) = (xq[xw + 4], xq[xw + 5], xq[xw + 6], xq[xw + 7]);
+        let mut isum = 0i32;
+        for j in 0..32 {
+            let qv = sext8(byte(w, wb + 2 + j));
+            let yv = if j < 4 {
+                sext8((y0 >> ((j * 8) as u32)) & 0xFF)
+            } else if j < 8 {
+                sext8((y1 >> (((j - 4) * 8) as u32)) & 0xFF)
+            } else if j < 12 {
+                sext8((y2 >> (((j - 8) * 8) as u32)) & 0xFF)
+            } else if j < 16 {
+                sext8((y3 >> (((j - 12) * 8) as u32)) & 0xFF)
+            } else if j < 20 {
+                sext8((y4 >> (((j - 16) * 8) as u32)) & 0xFF)
+            } else if j < 24 {
+                sext8((y5 >> (((j - 20) * 8) as u32)) & 0xFF)
+            } else if j < 28 {
+                sext8((y6 >> (((j - 24) * 8) as u32)) & 0xFF)
+            } else {
+                sext8((y7 >> (((j - 28) * 8) as u32)) & 0xFF)
+            };
+            isum += qv * yv;
+        }
+        let yd = xd[sb];
+        acc += (yd * d * isum as f32) as f64;
+    }
+    part[o * 64 + l] = acc;
+}
+
+/// W4A8 정수 디코드 GEMM (iq4_nl, t=1) — 블록=32원소, bsize=18 (2 mod 4
+/// — byte() 로드), ktab2 정수 룩업.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_iq4nl(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    ktab2: &Tensor<u32>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_sub = n_in / 32;
+    let cnt = (n_sub + 63 - l) >> 6;
+    let row_base = o * (n_in / 32) * 18;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let sb = l + _m * 64;
+        let wb = row_base + sb * 18;
+        let d = f16_bits(byte(w, wb) | (byte(w, wb + 1) << 8));
+        let xw = (sb * 32) >> 2;
+        let (y0, y1, y2, y3) = (xq[xw], xq[xw + 1], xq[xw + 2], xq[xw + 3]);
+        let (y4, y5, y6, y7) = (xq[xw + 4], xq[xw + 5], xq[xw + 6], xq[xw + 7]);
+        let mut isum = 0i32;
+        for j in 0..16 {
+            let qb = byte(w, wb + 2 + j);
+            let t = ktab2[qb as usize];
+            let p0 = sb * 32 + j;
+            let p1 = p0 + 16;
+            let ylo = if j < 4 {
+                sext8((y0 >> ((j * 8) as u32)) & 0xFF)
+            } else if j < 8 {
+                sext8((y1 >> (((j - 4) * 8) as u32)) & 0xFF)
+            } else if j < 12 {
+                sext8((y2 >> (((j - 8) * 8) as u32)) & 0xFF)
+            } else {
+                sext8((y3 >> (((j - 12) * 8) as u32)) & 0xFF)
+            };
+            let yhi = if j < 4 {
+                sext8((y4 >> ((j * 8) as u32)) & 0xFF)
+            } else if j < 8 {
+                sext8((y5 >> (((j - 4) * 8) as u32)) & 0xFF)
+            } else if j < 12 {
+                sext8((y6 >> (((j - 8) * 8) as u32)) & 0xFF)
+            } else {
+                sext8((y7 >> (((j - 12) * 8) as u32)) & 0xFF)
+            };
+            isum += sext8(t & 0xFF) * ylo;
+            isum += sext8((t >> 8) & 0xFF) * yhi;
+        }
+        let yd = xd[sb];
+        acc += (yd * d * isum as f32) as f64;
+    }
+    part[o * 64 + l] = acc;
+}
+
+/// W4A8 정수 디코드 GEMM (q6_K, t=1) — 16원소 그룹 스트라이드 레인.
+/// bsize=210 (2 mod 4) — 전 byte() 로드. c = ((yd·d)·sc)·isum.
+#[cube(launch_unchecked)]
+pub fn gemm_q8i_q6k(
+    xq: &Tensor<u32>,
+    xd: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f64>,
+    n_in: usize,
+    n_out: usize,
+    gx: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= 64 {
+        terminate!();
+    }
+    let n_g = n_in / 16;
+    let cnt = (n_g + 63 - l) >> 6;
+    let blocks = n_in / 256;
+    let row_base = o * blocks * 210;
+    let mut acc = 0.0f64;
+    for _m in 0..cnt {
+        let g = l + _m * 64;
+        let blk = g >> 4;
+        let kloc = g - blk * 16;
+        let wb = row_base + blk * 210;
+        let h = kloc >> 3;
+        let src = (kloc - h * 8) >> 1;
+        let p = kloc & 1;
+        let d = f16_bits(byte(w, wb + 208) | (byte(w, wb + 209) << 8));
+        let sc = sext8(byte(w, wb + 192 + kloc));
+        let xw = (g * 16) >> 2;
+        let (y0, y1, y2, y3) = (xq[xw], xq[xw + 1], xq[xw + 2], xq[xw + 3]);
+        // ★리터럴 분기 산술 오컴파일 회피 — src 홀수 → +32
+        let qlb = wb + h * 64 + p * 16 + ((src & 1) << 5);
+        let qhb = wb + 128 + h * 32 + p * 16; // qh 베이스 +128
+        let mut isum = 0i32;
+        for jj in 0..16 {
+            let qv = byte(w, qlb + jj);
+            let qhbv = byte(w, qhb + jj);
+            let nib = if src == 0 || src == 1 { qv & 0xF } else { qv >> 4 };
+            let hi2 = if src == 0 {
+                (qhbv & 3) as i32
+            } else if src == 1 {
+                ((qhbv >> 2) & 3) as i32
+            } else if src == 2 {
+                ((qhbv >> 4) & 3) as i32
+            } else {
+                ((qhbv >> 6) & 3) as i32
+            };
+            let yv = if jj < 4 {
+                sext8((y0 >> ((jj * 8) as u32)) & 0xFF)
+            } else if jj < 8 {
+                sext8((y1 >> (((jj - 4) * 8) as u32)) & 0xFF)
+            } else if jj < 12 {
+                sext8((y2 >> (((jj - 8) * 8) as u32)) & 0xFF)
+            } else {
+                sext8((y3 >> (((jj - 12) * 8) as u32)) & 0xFF)
+            };
+            let q6 = ((nib as i32) | (hi2 << 4)) - 32;
+            isum += q6 * yv;
+        }
+        let yd = xd[(blk * 8 + h * 4 + src) as usize];
+        acc += (yd * d * sc as f32 * isum as f32) as f64;
+    }
+    part[o * 64 + l] = acc;
+}

@@ -31,6 +31,11 @@ pub struct Frame35 {
     fup: u64,
     fglu: u64,
     fdown: u64,
+    // W4A8 정수 GEMV용 q8 활성 (u32 워드는 f32 길이로 할당 — 4B 동일)
+    xq_n: u64,
+    xd_n: u64,
+    xq_f: u64,
+    xd_f: u64,
     logits: u64,
     one: u64, // AxpyScaled용 1.0 스케일 버퍼
     // 어텐션 프레임 (P1) — q/k 프리페어·인터리브·KV 캐시·마스크
@@ -85,6 +90,10 @@ impl Frame35 {
             fup: a(n_ff)?,
             fglu: a(n_ff)?,
             fdown: a(n)?,
+            xq_n: a(n / 4)?,
+            xd_n: a(n / 32)?,
+            xq_f: a(n_ff / 4)?,
+            xd_f: a(n_ff / 32)?,
             logits: a(eng.model.wchk("output.weight")?.n_out as usize)?,
             one: a(1)?,
             aq: a(hp.n_head * 2 * hp.head_dim)?,
@@ -369,11 +378,26 @@ impl Engine {
             op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: pw, out: f.xn, eps, n, w_reps: 1 })?;
             let gate_w = eng.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
             let up_w = eng.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
-            acc.frame_mm_group(f.xn, &[gate_w, up_w], &[f.fgate, f.fup], 1)
-                .map_err(ModelError::Accel)?;
-            op(acc.as_ref(), FrameOp::SiluMul { g: f.fgate, u: f.fup, out: f.fglu, n: hp.n_ff })?;
             let down_w = eng.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
-            acc.frame_mm(f.fglu, &down_w, f.fdown, 1).map_err(ModelError::Accel)?;
+            // W4A8 — iq4_xs·q3_K 디코드 GEMV를 정수 경로로 (비트 계약:
+            // CPU matmul·GPU 값경로와 동일 레인 f64 미러).
+            let w4a8 = crate::matmul::w4a8_enabled()
+                && crate::matmul::w4a8_ty(gate_w.ty)
+                && crate::matmul::w4a8_ty(up_w.ty)
+                && crate::matmul::w4a8_ty(down_w.ty);
+            if w4a8 {
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &gate_w, f.fgate, n).map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &up_w, f.fup, n).map_err(ModelError::Accel)?;
+                op(acc.as_ref(), FrameOp::SiluMul { g: f.fgate, u: f.fup, out: f.fglu, n: hp.n_ff })?;
+                acc.frame_quant_q8(f.fglu, f.xq_f, f.xd_f, hp.n_ff).map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_f, f.xd_f, &down_w, f.fdown, hp.n_ff).map_err(ModelError::Accel)?;
+            } else {
+                acc.frame_mm_group(f.xn, &[gate_w, up_w], &[f.fgate, f.fup], 1)
+                    .map_err(ModelError::Accel)?;
+                op(acc.as_ref(), FrameOp::SiluMul { g: f.fgate, u: f.fup, out: f.fglu, n: hp.n_ff })?;
+                acc.frame_mm(f.fglu, &down_w, f.fdown, 1).map_err(ModelError::Accel)?;
+            }
             op(acc.as_ref(), FrameOp::AxpyScaled { y: f.xs, x: f.fdown, s: f.one, n })?;
         }
 
@@ -382,7 +406,12 @@ impl Engine {
             let wn = f.consts["output_norm"];
             op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: wn, out: f.xn, eps, n, w_reps: 1 })?;
             let head = eng.model.wchk("output.weight")?;
-            acc.frame_mm(f.xn, &head, f.logits, 1).map_err(ModelError::Accel)?;
+            if crate::matmul::w4a8_enabled() && crate::matmul::w4a8_ty(head.ty) {
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &head, f.logits, n).map_err(ModelError::Accel)?;
+            } else {
+                acc.frame_mm(f.xn, &head, f.logits, 1).map_err(ModelError::Accel)?;
+            }
             let mut logits = vec![0.0f32; head.n_out as usize];
             acc.frame_read(f.logits, &mut logits).map_err(ModelError::Accel)?;
             // MTP draft용 h_t 스냅샷 — 사용 중일 때만 추가 판독.

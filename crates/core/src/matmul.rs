@@ -232,6 +232,15 @@ pub trait Accelerator: FrameState + Send + Sync {
     fn frame_op(&self, _op: &FrameOp) -> Result<(), String> {
         Err("frame_op: 미지원".into())
     }
+    /// 상주 q8 양자화: src(f32) → xq(u32 워드 n/8) + xd(f32 n/32) —
+    /// quantize_row_q8_ref 비트 미러.
+    fn frame_quant_q8(&self, _src: u64, _xq: u64, _xd: u64, _n: usize) -> Result<(), String> {
+        Err("frame_quant_q8: 미지원".into())
+    }
+    /// 상주 W4A8 정수 GEMV (iq4_xs·q3_K, t=1) — (xq, xd) 소비.
+    fn frame_mm_q8(&self, _xq: u64, _xd: u64, _w: &Weight, _out: u64, _n: usize) -> Result<(), String> {
+        Err("frame_mm_q8: 미지원".into())
+    }
 }
 
 /// 프레임 연산 식별 — 백엔드 커널 세트(backend-gpu/src/ew.rs)와 1:1.
@@ -390,8 +399,62 @@ pub fn n_threads() -> usize {
 }
 
 /// out[o] = Σ_i x[i]·W[o,i] (단일 토큰). 스레드별 행 슬라이스 소유.
+/// W4A8 정수 GEMV 경로 활성 (LLM170_W4A8=1) — iq4_xs·q3_K 디코드
+/// matmul을 레인 f64 미러 정수 내적으로 전환. GPU frame/value 경로와
+/// 동일 비트 (그룹핑 무관 설계). 프리필(t>1)은 무관.
+pub fn w4a8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LLM170_W4A8").is_some())
+}
+
+/// W4A8 대상 타입 (정수 커널·미러 구현 완료분).
+pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
+    matches!(
+        ty,
+        llm170_gguf::GgmlType::Iq4Xs
+            | llm170_gguf::GgmlType::Q3K
+            | llm170_gguf::GgmlType::Q4K
+            | llm170_gguf::GgmlType::Q5K
+            | llm170_gguf::GgmlType::Q8_0
+            | llm170_gguf::GgmlType::Iq4Nl
+            | llm170_gguf::GgmlType::Q6K
+    )
+}
+
 pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
     profile_span!("cpu::matmul1");
+    // W4A8 디코드 전환 — 활성 시 전 경로 동일 비트
+    if w4a8_enabled() && w4a8_ty(w.ty) && x.len() == w.n_in as usize {
+        let y = crate::quant::quantize_row_q8_ref(x);
+        let blck = w.ty.blck_size() as usize;
+        let bsize = w.ty.type_size() as usize;
+        let row_bytes = (w.n_in as usize / blck) * bsize;
+        for (o, out_o) in out.iter_mut().enumerate() {
+            let row = &w.data[o * row_bytes..];
+            *out_o = match w.ty {
+                llm170_gguf::GgmlType::Q3K => {
+                    crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Q4K => {
+                    crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Q5K => {
+                    crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Q8_0 => {
+                    crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Iq4Nl => {
+                    crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Q6K => {
+                    crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y)
+                }
+                _ => crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, &y),
+            };
+        }
+        return;
+    }
     let n_in = w.n_in as usize;
     let nt = n_threads().max(1).min(out.len());
     let rows_per = out.len().div_ceil(nt);

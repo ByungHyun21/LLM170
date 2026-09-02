@@ -675,31 +675,52 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
     let blck = w.ty.blck_size() as usize;
     let bsize = w.ty.type_size() as usize;
     let is_q3k = w.ty == llm170_gguf::GgmlType::Q3K;
+    let row0d = &w.data[..(n_in / blck) * bsize];
     let lane0 = if is_q3k {
-        llm170_core::quant::dot_row_w4a8_q3k_lane_parts(
-            &w.data[..(n_in / blck) * bsize],
-            n_in as u64,
-            &y,
-        )
+        llm170_core::quant::dot_row_w4a8_q3k_lane_parts(row0d, n_in as u64, &y)
+            .to_vec()
+    } else if w.ty == llm170_gguf::GgmlType::Q5K {
+        llm170_core::quant::dot_row_w4a8_q5k_lane_parts(row0d, n_in as u64, &y)
+            .to_vec()
+    } else if w.ty == llm170_gguf::GgmlType::Q4K {
+        llm170_core::quant::dot_row_w4a8_q4k_lane_parts(row0d, n_in as u64, &y).to_vec()
+    } else if w.ty == llm170_gguf::GgmlType::Q8_0 {
+        llm170_core::quant::dot_row_w4a8_q8_0_lane_parts(row0d, n_in as u64, &y).to_vec()
+    } else if w.ty == llm170_gguf::GgmlType::Iq4Nl {
+        llm170_core::quant::dot_row_w4a8_iq4nl_lane_parts(row0d, n_in as u64, &y).to_vec()
+    } else if w.ty == llm170_gguf::GgmlType::Q6K {
+        llm170_core::quant::dot_row_w4a8_q6k_lane_parts(row0d, n_in as u64, &y).to_vec()
     } else {
-        llm170_core::quant::dot_row_w4a8_iq4xs_lane_parts(
-            &w.data[..(n_in / blck) * bsize],
-            n_in as u64,
-            &y,
-        )
+        llm170_core::quant::dot_row_w4a8_iq4xs_lane_parts(row0d, n_in as u64, &y).to_vec()
     };
-    println!("  cpu lane0[0..4] = {:?}", &lane0[..4]);
+    if lane0.len() >= 4 {
+        println!("  cpu lane0[0..4] = {:?}", &lane0[..4]);
+    }
     {
         let row0 = &w.data[..(n_in / blck) * bsize];
         let old_dot = llm170_core::quant::dot_row_w4a8(w.ty, row0, n_in as u64, &y);
         println!("  y[0].d={:e} qs[0..8]={:?}", y[0].d, &y[0].qs[..8]);
-        println!("  row0: 기존 dot={old_dot:e} 미러합={:e}", {
+        // f32 디양자화 기준 (진짜 정확성 게이트) — q8 양자화 오차 ~1e-2
+        let mut f32row = vec![0.0f32; n_in];
+        llm170_core::quant::dequant_row(w.ty, row0, 0, w.n_in, &mut f32row);
+        let mut fsum = 0.0f32;
+        for (i, wv) in f32row.iter().enumerate() {
+            fsum += wv * x[i];
+        }
+        let mirror_row = {
             let mut s = 0.0f64;
             for l in 0..64 {
                 s += lane0[l];
             }
             s as f32
-        });
+        };
+        let rel = ((mirror_row - fsum) / fsum.abs().max(1e-3)).abs();
+        println!(
+            "  row0: f32={fsum:e} 미러={mirror_row:e} rel={rel:.3e} (구 dot={old_dot:e})"
+        );
+        if rel > 2e-2 {
+            println!("  ✗ 미러·f32 상대오차 과대");
+        }
     }
     // GPU 양자화 커널 비트 검증 (rust quantize_row_q8_ref 대비)
     let (gq, gd) = gpu.quant_q8_gpu(&x).expect("quant_q8_gpu");
@@ -739,6 +760,16 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
         let row = &w.data[o * (n_in / blck) * bsize..];
         let c = if is_q3k {
             llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Q5K {
+            llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Q4K {
+            llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Q8_0 {
+            llm170_core::quant::dot_row_w4a8_q8_0_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Iq4Nl {
+            llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y)
+        } else if w.ty == llm170_gguf::GgmlType::Q6K {
+            llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y)
         } else {
             llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y)
         };

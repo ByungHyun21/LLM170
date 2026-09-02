@@ -867,3 +867,227 @@ pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     }
     lane
 }
+
+/// W4A8 레인 미러(q5_K) — 분할 형태: 뺄셈(d·isum − m·qsum)을 순수 곱
+/// 체인 2개로 분리해 FMA 수축 면역 (GPU gemm_q8i_q5k와 동일 연산열).
+/// 서브블록 32원소, 스트라이드 레인, f64 누산.
+pub fn dot_row_w4a8_q5k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q5k_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sb = l + m * 64;
+            let js = sb % 8;
+            let (it, half) = (js / 2, js % 2);
+            let wb = &data[(sb / 8) * 176..(sb / 8) * 176 + 176];
+            let d = f16(wb, 0);
+            let dm = f16(wb, 2);
+            let (sc, m_) = scale_min_k4_local(wb, sb % 8);
+            let (mut isum, mut qsum) = (0i64, 0i64);
+            let u = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
+            for j in 0..32 {
+                let nib = if half == 0 {
+                    wb[48 + it * 32 + j] & 0xF
+                } else {
+                    wb[48 + it * 32 + j] >> 4
+                };
+                let hi = if wb[16 + j] & u != 0 { 16i64 } else { 0i64 };
+                let yv = y_el(y, sb * 32 + j);
+                isum += (nib as i64 + hi) * yv;
+                qsum += yv;
+            }
+            let yd = y[sb].d;
+            // 분할: c1 = yd·(d·sc)·isum, c2 = yd·(dm·m)·qsum — 곱 체인만
+            acc += (yd * (d * sc as f32) * isum as f32) as f64;
+            acc -= (yd * (dm * m_ as f32) * qsum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+
+/// q4_K/q5_K 6비트 scale/min (스토어 내부, 블록 절대 오프셋 버전).
+fn scale_min_k4_local(wb: &[u8], sb: usize) -> (u32, u32) {
+    let sc = &wb[4..16];
+    let j = sb; // 서브블록 = scale 인덱스 (0..7)
+    if j < 4 {
+        ((sc[j] & 63) as u32, (sc[j + 4] & 63) as u32)
+    } else {
+        (
+            ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4)) as u32,
+            ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as u32,
+        )
+    }
+}
+
+/// W4A8 레인 미러(q4_K) — q5_K과 동일 분할 형태, qh 없음 (qs 128B).
+pub fn dot_row_w4a8_q4k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q4k_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_q4k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sb = l + m * 64;
+            let js = sb % 8;
+            let (it, half) = (js / 2, js % 2);
+            let wb = &data[(sb / 8) * 144..(sb / 8) * 144 + 144];
+            let d = f16(wb, 0);
+            let dm = f16(wb, 2);
+            let (sc, m_) = scale_min_k4_local(wb, js);
+            let (mut isum, mut qsum) = (0i64, 0i64);
+            for j in 0..32 {
+                let nib = if half == 0 {
+                    wb[16 + it * 32 + j] & 0xF
+                } else {
+                    wb[16 + it * 32 + j] >> 4
+                };
+                let yv = y_el(y, sb * 32 + j);
+                isum += nib as i64 * yv;
+                qsum += yv;
+            }
+            let yd = y[sb].d;
+            acc += (yd * (d * sc as f32) * isum as f32) as f64;
+            acc -= (yd * (dm * m_ as f32) * qsum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+
+/// W4A8 레인 미러(q8_0) — 32원소 블록 = 서브블록 (블록 상위 구조 없음).
+pub fn dot_row_w4a8_q8_0_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q8_0_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sb = l + m * 64;
+            let wb = &data[sb * 34..sb * 34 + 34];
+            let d = f16(wb, 0);
+            let mut isum = 0i64;
+            for j in 0..32 {
+                isum += (wb[2 + j] as i8) as i64 * y_el(y, sb * 32 + j);
+            }
+            let yd = y[sb].d;
+            acc += (yd * d * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+
+/// W4A8 레인 미러(iq4_nl) — 32원소 블록, ktab 정수 룩업.
+pub fn dot_row_w4a8_iq4nl_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_iq4nl_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_iq4nl_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let sb = l + m * 64;
+            let wb = &data[sb * 18..sb * 18 + 18];
+            let d = f16(wb, 0);
+            let mut isum = 0i64;
+            for j in 0..16 {
+                let q = wb[2 + j];
+                isum += KVALUES_IQ4NL[(q & 0xF) as usize] as i64 * y_el(y, sb * 32 + j);
+                isum += KVALUES_IQ4NL[(q >> 4) as usize] as i64 * y_el(y, sb * 32 + 16 + j);
+            }
+            let yd = y[sb].d;
+            acc += (yd * d * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
+
+/// W4A8 레인 미러(q6_K) — 16원소 그룹(16개/256블록), 그룹 g = h*8 + src*2 + p
+/// (src∈0..3: ql lo/hi × 오프셋0/32, p∈{0,1}). c = ((yd·d)·sc)·isum (순수
+/// 곱 체인). 스트라이드 레인, f64 누산 — GPU gemm_q8i_q6k 미러.
+pub fn dot_row_w4a8_q6k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q6k_lane_parts(data, k, y);
+    let mut s = 0.0f64;
+    for l in 0..64 {
+        s += lane[l];
+    }
+    s as f32
+}
+
+pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_g = (k / 16) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_g + 63 - l) / 64;
+        let mut acc = 0.0f64;
+        for m in 0..cnt {
+            let g = l + m * 64;
+            let blk = g / 16;
+            let klocal = g % 16;
+            let wb = &data[blk * 210..blk * 210 + 210];
+            let h = klocal / 8;
+            let src = (klocal % 8) / 2; // 0..3
+            let p = klocal % 2;
+            let d = f16(wb, 208);
+            let sc = wb[192 + klocal] as i8;
+            let mut isum = 0i64;
+            for jj in 0..16 {
+                let ll = p * 16 + jj;
+                // qh는 블록 오프셋 128부터 (ql은 0부터) — RCA: +128 누락이
+                // 미러·f32 7× 발산 원인이었음.
+                let (nib, hi2) = match src {
+                    0 => (wb[h * 64 + ll] & 0xF, (wb[128 + h * 32 + ll] & 3) as i64),
+                    1 => (wb[h * 64 + ll + 32] & 0xF, ((wb[128 + h * 32 + ll] >> 2) & 3) as i64),
+                    2 => (wb[h * 64 + ll] >> 4, ((wb[128 + h * 32 + ll] >> 4) & 3) as i64),
+                    _ => (wb[h * 64 + ll + 32] >> 4, ((wb[128 + h * 32 + ll] >> 6) & 3) as i64),
+                };
+                let elem = blk * 256 + h * 128 + src * 32 + p * 16 + jj;
+                isum += (((nib as i64) | (hi2 << 4)) - 32) * y_el(y, elem);
+            }
+            let pos = src;
+            let yd = y[(blk * 8 + h * 4 + pos) as usize].d;
+            acc += (yd * d * sc as f32 * isum as f32) as f64;
+        }
+        lane[l] = acc;
+    }
+    lane
+}
