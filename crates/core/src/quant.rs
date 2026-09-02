@@ -636,11 +636,7 @@ pub fn dot_iq4xs_q8(w: &[u8], y: &[Q8Block]) -> f32 {
 /// base/rem 연속 분할, 레인 내 오름차순 f64 누산, 레인 순서 f64 합 후
 pub fn dot_row_w4a8_iq4xs_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_iq4xs_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 /// 레인별 f64 부분합 (디버그·GPU 대조용) — gemm_q8i 그룹핑 미러.
@@ -821,11 +817,7 @@ mod w4a8_tests {
 /// 하프블록 l, l+64, …) f64 누산 → 레인 순서 합 → f32 1회 캐스트.
 pub fn dot_row_w4a8_q3k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_q3k_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -873,11 +865,7 @@ pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
 /// 서브블록 32원소, 스트라이드 레인, f64 누산.
 pub fn dot_row_w4a8_q5k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_q5k_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -934,11 +922,7 @@ fn scale_min_k4_local(wb: &[u8], sb: usize) -> (u32, u32) {
 /// W4A8 레인 미러(q4_K) — q5_K과 동일 분할 형태, qh 없음 (qs 128B).
 pub fn dot_row_w4a8_q4k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_q4k_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_q4k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -978,11 +962,7 @@ pub fn dot_row_w4a8_q4k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
 /// W4A8 레인 미러(q8_0) — 32원소 블록 = 서브블록 (블록 상위 구조 없음).
 pub fn dot_row_w4a8_q8_0_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_q8_0_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -1010,11 +990,7 @@ pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
 /// W4A8 레인 미러(iq4_nl) — 32원소 블록, ktab 정수 룩업.
 pub fn dot_row_w4a8_iq4nl_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_iq4nl_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_iq4nl_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -1046,11 +1022,7 @@ pub fn dot_row_w4a8_iq4nl_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64
 /// 곱 체인). 스트라이드 레인, f64 누산 — GPU gemm_q8i_q6k 미러.
 pub fn dot_row_w4a8_q6k_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_q6k_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
@@ -1092,15 +1064,28 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     lane
 }
 
+
+/// 64레인 환원 — warp 트리 순서 (GPU __shfl_down 16,8,4,2,1 ×2 + 상위 가산).
+/// 비트계약: 커널 환원과 동일 순서.
+pub fn tree64(v: &[f64; 64]) -> f64 {
+    let mut a = *v;
+    // 상/하 절반 쌍 가산 후 32레인 트리 (GPU 커널 환원과 동일 순서)
+    for i in 0..32 {
+        a[i] += a[i + 32];
+    }
+    for &off in &[16usize, 8, 4, 2, 1] {
+        for i in 0..off {
+            a[i] += a[i + off];
+        }
+    }
+    a[0]
+}
+
 /// W4A8 레인 미러(iq3_s) — 32원소 서브블록, grid4×부호 정수 가중,
 /// (yd·db·isum) f32 → f64 레인 누산 (GPU gemm_iq3s와 동일 연산열).
 pub fn dot_row_w4a8_iq3s_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
     let lane = dot_row_w4a8_iq3s_lane_parts(data, k, y);
-    let mut s = 0.0f64;
-    for l in 0..64 {
-        s += lane[l];
-    }
-    s as f32
+    tree64(&lane) as f32
 }
 
 pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {

@@ -140,59 +140,6 @@ impl RawCtx {
         Ok(())
     }
 
-    /// 디버그: 첫 행 part[64] 반환 (gemv_q8과 동일 경로).
-    pub fn gemv_q8_parts(
-        &self,
-        xq: *const u8,
-        w: *const u8,
-        ktab2: *const u8,
-        ty: u32,
-        n_in: usize,
-    ) -> Result<Vec<f64>, String> {
-        let n_out = 1usize;
-        let kern = match ty {
-            21 => "gemm_iq3s",
-            _ => return Err("gemv_q8_parts: iq3s 전용".into()),
-        };
-        let part = self.scratch(n_out * 64 * 8)?;
-        let out = self.scratch(n_out * 4)?;
-        let mut xq_p = xq as *mut std::ffi::c_void;
-        let mut w_p = w as *mut std::ffi::c_void;
-        let mut part_p = part as *mut std::ffi::c_void;
-        let mut kt_p = ktab2 as *mut std::ffi::c_void;
-        let mut n_in_a = n_in as i32;
-        let mut n_out_a = n_out as i32;
-        let mut args_v: Vec<*mut std::ffi::c_void> = vec![
-            &mut xq_p as *mut _ as *mut std::ffi::c_void,
-            &mut w_p as *mut _ as *mut std::ffi::c_void,
-            &mut part_p as *mut _ as *mut std::ffi::c_void,
-            &mut n_in_a as *mut _ as *mut std::ffi::c_void,
-            &mut n_out_a as *mut _ as *mut std::ffi::c_void,
-        ];
-        let gx = 1u32;
-        unsafe {
-            ck(hip::hipModuleLaunchKernel(
-                *self.fns.get(kern).ok_or("커널 없음")?,
-                gx, 1, 1, 64, 1, 1, 0, self.stream, args_v.as_mut_ptr(), std::ptr::null_mut(),
-            ), "gemm")?;
-        }
-        let mut part_p2 = part as *mut std::ffi::c_void;
-        let mut out_p = out as *mut std::ffi::c_void;
-        let mut n_out_b = n_out as i32;
-        let mut rargs = vec![
-            &mut part_p2 as *mut _ as *mut std::ffi::c_void,
-            &mut out_p as *mut _ as *mut std::ffi::c_void,
-            &mut n_out_b as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.launch("reduce64", n_out.div_ceil(64) as u32, 1, 64, &mut rargs)?;
-        self.sync()?;
-        let mut r = vec![0f64; 64];
-        self.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
-        Ok(r)
-    }
-
-
-    /// 디버그: row0 특정 sub의 기여값.
     pub fn gemv_iq3s_sub4(&self, xq: *const u8, w: *const u8, n_in: usize, sub: usize) -> Result<[f64; 8], String> {
         let part = self.scratch(64)?;
         let mut xq_p = xq as *mut std::ffi::c_void;
@@ -283,16 +230,13 @@ impl RawCtx {
             ],
         };
         let _ = &mut gx_a;
+        let mut out_p0 = out as *mut std::ffi::c_void;
+        // out은 part(와 kt) 뒤, n_in 앞 — 시그니처 순서
+        match ty {
+            23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+            _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+        }
         self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
-        let mut part_p2 = part as *mut std::ffi::c_void;
-        let mut out_p = out as *mut std::ffi::c_void;
-        let mut n_out_b = n_out as i32;
-        let mut rargs = vec![
-            &mut part_p2 as *mut _ as *mut std::ffi::c_void,
-            &mut out_p as *mut _ as *mut std::ffi::c_void,
-            &mut n_out_b as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.launch("reduce64", n_out.div_ceil(64) as u32, 1, 64, &mut rargs)?;
         let mut res = vec![0f32; n_out];
         self.sync()?;
         self.d2h(bytemuck::cast_slice_mut(&mut res).as_mut(), out as *const u8)?;
@@ -348,16 +292,13 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
             ],
         };
-        self.launch(kern, gx, 1, 64, &mut args_v)?;
-        let mut part_p2 = part as *mut std::ffi::c_void;
-        let mut out_p = out as *mut std::ffi::c_void;
-        let mut n_out_b = n_out as i32;
-        let mut rargs = vec![
-            &mut part_p2 as *mut _ as *mut std::ffi::c_void,
-            &mut out_p as *mut _ as *mut std::ffi::c_void,
-            &mut n_out_b as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.launch("reduce64", n_out.div_ceil(64) as u32, 1, 64, &mut rargs)?;
+        let gz = n_out.div_ceil(65535) as u32;
+        let mut out_p0 = out as *mut std::ffi::c_void;
+        match ty {
+            23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+            _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+        }
+        self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
         Ok(())
     }
 
@@ -684,4 +625,17 @@ pub fn q6k_ab_test() -> Result<String, String> {
         msg += &format!("g={}: old={} dot4={} packed={} src={} al={} old==dot4:{} old==packed:{}\n", g, r[0] as i64, r[1] as i64, r[2] as i64, r[2] as i64, r[3] as i64, r[0]==r[1], r[0]==r[2]);
     }
     Ok(msg)
+}
+
+/// 트리 환원 순서 A/B — GPU 셔플 vs Rust tree64.
+pub fn tree_test() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let od = ctx.alloc(64)?;
+    let mut op = od as *mut std::ffi::c_void;
+    let mut args = vec![(&mut op) as *mut _ as *mut std::ffi::c_void];
+    ctx.launch("tree_probe", 1, 1, 64, &mut args)?;
+    ctx.sync()?;
+    let mut r = [0f64; 5];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), od)?;
+    Ok(format!("off32={} (32) off1={} (1) tree={} (2016) w64_off32={} (32) w64_tree={} (2016)", r[0], r[1], r[2], r[3], r[4]))
 }

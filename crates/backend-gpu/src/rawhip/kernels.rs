@@ -150,7 +150,7 @@ extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
 // ─── W4A8 GEMV t=1 — 스트라이드 레인, f64 부분합 ───
 // iq4_xs (ty16)
 extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
-                                   double* part, const unsigned* ktab2, int n_in, int n_out) {
+                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -159,51 +159,99 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
     int blocks = n_in >> 8;
     int row_base = o * blocks * 136;
     double acc = 0.0;
-    for (int m = 0; m < cnt; m++) {
+    int m = 0;
+    // 2-서브블록 ILP — isum 독립 체인, acc 가산은 m 순서 유지 (비트계약)
+    for (; m + 1 < cnt; m += 2) {
+        int sb0 = l + (m << 6);
+        int sb1 = sb0 + 64;
+        int b0 = sb0 >> 3, ib0 = sb0 & 7;
+        int b1 = sb1 >> 3, ib1 = sb1 & 7;
+        int wb0 = row_base + b0 * 136;
+        int wb1 = row_base + b1 * 136;
+        unsigned w00 = w[wb0 >> 2], w10 = w[wb1 >> 2];
+        float d0 = bits_f16(w00 & 0xFFFFu), d1 = bits_f16(w10 & 0xFFFFu);
+        int qw0 = (wb0 + 8 + ib0 * 16) >> 2;
+        int qw1 = (wb1 + 8 + ib1 * 16) >> 2;
+        unsigned ls0 = (int)((w[(wb0 >> 2) + 1] >> (((ib0 >> 1) * 8 + (ib0 & 1) * 4))) & 0xFu)
+                     | (int)((((w00 >> 16) >> (2 * ib0)) & 3u) << 4);
+        unsigned ls1 = (int)((w[(wb1 >> 2) + 1] >> (((ib1 >> 1) * 8 + (ib1 & 1) * 4))) & 0xFu)
+                     | (int)((((w10 >> 16) >> (2 * ib1)) & 3u) << 4);
+        float dl0 = d0 * (float)((int)ls0 - 32);
+        float dl1 = d1 * (float)((int)ls1 - 32);
+        int is0 = 0, is1 = 0;
+        int xw0 = (sb0 << 5) >> 2;
+        int xw1 = (sb1 << 5) >> 2;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            unsigned qv0 = w[qw0 + k];
+            unsigned qv1 = w[qw1 + k];
+            unsigned lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
+            #pragma unroll
+            for (int b = 3; b >= 0; b--) {
+                unsigned t0 = ktab2[(qv0 >> (8 * b)) & 0xFFu];
+                lo0 = (lo0 << 8) | (t0 & 0xFFu);
+                hi0 = (hi0 << 8) | (t0 >> 8);
+                unsigned t1 = ktab2[(qv1 >> (8 * b)) & 0xFFu];
+                lo1 = (lo1 << 8) | (t1 & 0xFFu);
+                hi1 = (hi1 << 8) | (t1 >> 8);
+            }
+            is0 = dot4(lo0, xq[xw0 + k], is0);
+            is0 = dot4(hi0, xq[xw0 + 4 + k], is0);
+            is1 = dot4(lo1, xq[xw1 + k], is1);
+            is1 = dot4(hi1, xq[xw1 + 4 + k], is1);
+        }
+        float yd0 = __uint_as_float(xq[(n_in >> 2) + sb0]);
+        float yd1 = __uint_as_float(xq[(n_in >> 2) + sb1]);
+        acc += (double)(yd0 * dl0 * (float)is0);
+        acc += (double)(yd1 * dl1 * (float)is1);
+    }
+    for (; m < cnt; m++) {
         int sb = l + (m << 6);
         int b = sb >> 3;
-        int ib = sb - (b << 3);
+        int ib = sb & 7;
         int wb = row_base + b * 136;
         int wq = wb >> 2;
         unsigned w0 = w[wq];
-        unsigned w1 = w[wq + 1];
         float d = bits_f16(w0 & 0xFFFFu);
-        unsigned scales_h = w0 >> 16;
         int qw = (wb + 8 + ib * 16) >> 2;
-        unsigned q0 = w[qw], q1 = w[qw+1], q2 = w[qw+2], q3 = w[qw+3];
-        unsigned nib = (w1 >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu;
-        int ls = (int)nib | (int)(((scales_h >> (2 * ib)) & 3u) << 4);
+        int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
+              | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
         float dl = d * (float)(ls - 32);
-        // dot4 — kvalues 룩업 후 i8×4 패킹 (lo=el 0..15, hi=el 16..31)
         int isum = 0;
         int xw = (sb << 5) >> 2;
-        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
-        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
-        unsigned qws[4] = {q0, q1, q2, q3};
-        unsigned yls[4] = {y0, y1, y2, y3};
-        unsigned yhs[4] = {y4, y5, y6, y7};
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            unsigned qv = qws[k];
+            unsigned qv = w[qw + k];
             unsigned lo = 0, hi = 0;
             #pragma unroll
-            for (int b = 3; b >= 0; b--) {
-                unsigned t = ktab2[(qv >> (8 * b)) & 0xFFu];
+            for (int b2 = 3; b2 >= 0; b2--) {
+                unsigned t = ktab2[(qv >> (8 * b2)) & 0xFFu];
                 lo = (lo << 8) | (t & 0xFFu);
                 hi = (hi << 8) | (t >> 8);
             }
-            isum = dot4(lo, yls[k], isum);
-            isum = dot4(hi, yhs[k], isum);
+            isum = dot4(lo, xq[xw + k], isum);
+            isum = dot4(hi, xq[xw + 4 + k], isum);
         }
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * dl * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // q5_K (ty13) — 분할 형태(곱 체인 2개), qh 비트, 스케일 scale_min_k4
 extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
-                                    double* part, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -261,12 +309,23 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // q8_0 (ty8)
 extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
-                                     double* part, int n_in, int n_out) {
+                                     double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -299,12 +358,23 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
 extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
-                                    double* part, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -354,12 +424,23 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
         acc += (double)(yd * (d * (float)sc_v) * (float)isum);
         acc -= (double)(yd * (dm * (float)m_v) * (float)qsum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // q6_K (ty14) — 16원소 그룹, 가상워드 ql/qh (비정렬 5워드 슬라이딩)
 extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
-                                    double* part, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -418,12 +499,23 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
         float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
         acc += (double)(yd * d * (float)sc * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // iq4_nl (ty20) — ktab2 룩업, 블록 32원소
 extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
-                                   double* part, const unsigned* ktab2, int n_in, int n_out) {
+                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -462,12 +554,23 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         acc += (double)(yd * d * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // q3_K (ty11) — 16원소 하프블록, ql/hm byte() 로드(비정렬)
 extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
-                                    double* part, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -525,7 +628,18 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
         acc += (double)(yd * dl * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 
@@ -598,7 +712,7 @@ __device__ const unsigned IQ3S_GRID[512] = {
 };
 
 extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
-                                     double* part, int n_in, int n_out) {
+                                     double* part, float* out, int n_in, int n_out) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
@@ -641,7 +755,18 @@ extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
         float yd = __uint_as_float(xq[(n_in >> 2) + sub]);
         acc += (double)(yd * db * (float)isum);
     }
-    part[o * 64 + l] = acc;
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    if (l >= 32) sh32[l - 32] = acc;
+    __syncthreads();
+    if (l < 32) {
+        acc += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
+        if (l == 0) out[o] = (float)acc;
+    }
 }
 
 // 디버그: row0의 특정 sub 하나만 계산해 part[0]에 기록.
@@ -799,6 +924,29 @@ extern "C" __global__ void q6k_ab(const unsigned* w, const unsigned* xq, double*
     part[1] = (double)isum_new;
     part[2] = (double)isum_v3;
     part[3] = (double)(wb & 3);
+}
+
+// 트리 환원 순서 프로브 — 변형별 검증
+extern "C" __global__ void tree_probe(double* out) {
+    int l = threadIdx.x;
+    double v = (double)l; // lane 인덱스 — 정수값
+    // a) 1스텝 off=32: lane0 = 0+32
+    double a = v + __shfl_down_sync(0xffffffffffffffffull, v, 32);
+    // b) 1스텝 off=1: lane0 = 0+1
+    double b = v + __shfl_down_sync(0xffffffffffffffffull, v, 1);
+    // c) 전체 트리: 0+1+...+63 = 2016
+    double c = v;
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1)
+        c += __shfl_down_sync(0xffffffffffffffffull, c, off);
+    // d) width=64 명시
+    double d = v + __shfl_down_sync(0xffffffffffffffffull, v, 32, 64);
+    // e) width 명시 전체 트리
+    double e = v;
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1)
+        e += __shfl_down_sync(0xffffffffffffffffull, e, off, 64);
+    if (l == 0) { out[0] = a; out[1] = b; out[2] = c; out[3] = d; out[4] = e; }
 }
 
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
@@ -1085,7 +1233,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

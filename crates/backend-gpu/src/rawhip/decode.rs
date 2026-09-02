@@ -242,6 +242,8 @@ impl DecodeState {
     /// 디코드 1스텝 (t=1, 단일 시퀀스) — logits 반환. xs에 임베딩 h2d 완료 전제.
     #[allow(clippy::too_many_lines)]
     pub fn step(&self, seq: usize, pos: usize) -> Result<Vec<f32>, String> {
+        let t0 = std::time::Instant::now();
+        let _ = &t0;
         self.ctx.scratch_rewind();
         let n = self.n_embd;
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
@@ -558,8 +560,12 @@ impl DecodeState {
         self.quant(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
+        let t_pre_d2h = std::time::Instant::now();
         let mut out = vec![0f32; noh];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), self.logits)?;
+        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+            eprintln!("launch-side={:.2}ms gpu-wait={:.2}ms", t0.elapsed().as_secs_f64() * 1e3 - t_pre_d2h.elapsed().as_secs_f64() * 1e3, t_pre_d2h.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(out)
     }
 }
@@ -593,10 +599,15 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     }
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
-        ds.step(seq, pos)
+        let r = ds.step(seq, pos);
+        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+            eprintln!("step cpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        r
     }
 }
 

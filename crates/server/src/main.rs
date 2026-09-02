@@ -124,6 +124,10 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("tree-test") => match llm170_backend_gpu::rawhip::tree_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("q6k-abtest") => match llm170_backend_gpu::rawhip::q6k_ab_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
@@ -2262,62 +2266,7 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
     let rb = (n_in / blck) * bsize;
     let mut mism = 0usize;
     let mut first: Option<(usize, f32, f32)> = None;
-    if std::env::var_os("LLM170_IQ3S_LANES").is_some() && w.ty == llm170_gguf::GgmlType::Iq3S {
-        let row0 = &w.data[..rb];
-        let lane = llm170_core::quant::dot_row_w4a8_iq3s_lane_parts(row0, n_in as u64, &y);
-        if let Ok(gp) = ctx.gemv_q8_parts(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in) {
-            let mut bad = 0;
-            for l in 0..64 {
-                if gp[l].to_bits() != lane[l].to_bits() {
-                    bad += 1;
-                    if bad <= 3 {
-                        println!("  lane {l}: gpu={:.9e} cpu={:.9e}", gp[l], lane[l]);
-                    }
-                }
-            }
-            println!("  레인 불일치 {bad}/64");
-            // sub별 이진 국소화 — 미러의 sub 기여와 GPU sub 기여 비교
-            let mut subbad = 0usize;
-            for sub in 0..(n_in / 32).min(16) {
-                let (blk, h) = (sub / 8, sub % 8);
-                let wb = &w.data[blk * bsize..blk * bsize + bsize];
-                let d_all = llm170_core::quant::half_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
-                let scb = wb[106 + (h >> 1)];
-                let nib = if h & 1 != 0 { scb >> 4 } else { scb & 0xF };
-                let db = d_all * (1 + 2 * nib as i32) as f32;
-                let yd = y[sub].d;
-                let mut isum = 0i64;
-                let qhb = wb[66 + h] as u32;
-                for ll in 0..4usize {
-                    let i1 = (wb[2 + h * 8 + 2 * ll] as u32) | ((qhb << (8 - 2 * ll)) & 256);
-                    let i2 = (wb[2 + h * 8 + 2 * ll + 1] as u32) | ((qhb << (7 - 2 * ll)) & 256);
-                    let g1 = llm170_core::IQ3S_GRID[i1 as usize];
-                    let g2 = llm170_core::IQ3S_GRID[i2 as usize];
-                    let sgb = wb[74 + h * 4 + ll];
-                    for j in 0..4usize {
-                        let w1 = ((g1 >> (8 * j)) & 0xFF) as i8 as i32
-                            * if sgb & (1 << j) != 0 { -1 } else { 1 };
-                        let w2 = ((g2 >> (8 * j)) & 0xFF) as i8 as i32
-                            * if sgb & (1 << (4 + j)) != 0 { -1 } else { 1 };
-                        let p1 = sub * 32 + 8 * ll + j;
-                        let p2 = sub * 32 + 8 * ll + 4 + j;
-                        isum += (w1 as i64) * (y[p1 / 32].qs[p1 % 32] as i64)
-                            + (w2 as i64) * (y[p2 / 32].qs[p2 % 32] as i64);
-                    }
-                }
-                let cpu_v = (yd * db * isum as f32) as f64;
-                let g4 = ctx.gemv_iq3s_sub4(xq_d as *const u8, w_d as *const u8, n_in, sub).unwrap_or([f64::NAN; 8]);
-                if cpu_v.to_bits() != g4[0].to_bits() {
-                    subbad += 1;
-                    println!("  sub {sub}: gpu={:.9e} cpu={:.9e} (isum c={isum} g={} yd_g={:.9e} yd_c={:.9e} yddb_g={:.9e} yddb_c={:.9e} fin_g={:.9e})", g4[0], cpu_v, g4[1] as i64, g4[4], yd, g4[5], yd * db, g4[6]);
-                }
-            }
-            println!("  sub 불일치 {subbad}/{}", (n_in / 32).min(16));
-        }
-    }
-    let mut mism = 0usize;
-    let mut first: Option<(usize, f32, f32)> = None;
-    for o in 0..n_out {
+        for o in 0..n_out {
         let row = &w.data[o * rb..];
         let c = match w.ty {
             llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y),
