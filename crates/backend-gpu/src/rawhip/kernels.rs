@@ -563,12 +563,131 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
     }
 }
 
+
+// GDN conv1d + ring shift + silu (t=1)
+extern "C" __global__ void gdn_conv(const float* qkv, const float* cw, float* state,
+                                    float* out, int ch, int k) {
+    int c = blockIdx.x;
+    int u = threadIdx.x;
+    if (u != 0) return;
+    int xb = c; // t=0
+    float sum = cw[c * k + (k - 1)] * qkv[xb];
+    for (int j = 0; j < k - 1; j++) sum += cw[c * k + j] * state[j * ch + c];
+    float oc = sum / (1.0f + __expf(-sum));
+    for (int j = 0; j < k - 2; j++) state[j * ch + c] = state[(j + 1) * ch + c];
+    state[(k - 2) * ch + c] = qkv[xb];
+    out[xb] = oc;
+}
+// beta / e^g precompute
+extern "C" __global__ void gdn_beta_g(const float* b, const float* a, const float* dtb,
+                                      const float* sa, float* bg, int n_h) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= n_h) return;
+    float bv = b[h];
+    bg[h * 2] = 1.0f / (1.0f + __expf(-bv));
+    float x = fminf(a[h] + dtb[h], 80.0f);
+    float sp = log1pf(__expf(x));
+    bg[h * 2 + 1] = __expf(sp * sa[h]);
+}
+// norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
+extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
+                                           float* out, float eps, int d, int n_h) {
+    int row = blockIdx.x;
+    int u = threadIdx.x;
+    if (u != 0) return;
+    int xb = row * d;
+    int wb = (row % n_h) * d;
+    double sum = 0.0;
+    int chunk = (d + 31) >> 5;
+    for (int sg = 0; sg < 32; sg++) {
+        int lo = sg * chunk;
+        if (lo >= d) break;
+        int hi = min(lo + chunk, d);
+        double part = 0.0;
+        for (int i = lo; i < hi; i++) {
+            double dv = (double)o[xb + i];
+            part += dv * dv;
+        }
+        sum += part;
+    }
+    float scale32 = (float)sqrt(sum / (double)d + (double)eps);
+    float inv = 1.0f / scale32;
+    for (int i = 0; i < d; i++) {
+        float nrm = o[xb + i] * inv * w[wb + i];
+        float zz = z[xb + i];
+        out[xb + i] = nrm * (zz / (1.0f + __expf(-zz)));
+    }
+}
+// GDN AR state update (cube = (b,h) pair, unit = dv column)
+extern "C" __global__ void gdn_ar(float* s, const float* q_scaled, const float* k, const float* v,
+                                  const float* beta_ge, float* out, int d, int k_stride,
+                                  int v_stride, int h_v, int h_k) {
+    int pair = blockIdx.x;
+    int u = threadIdx.x;
+    if (u >= d) return;
+    int b = pair / h_v;
+    int h = pair % h_v;
+    int kh = h % h_k;
+    int base_s = pair * d * d;
+    int qk0 = b * k_stride + kh * d;
+    int v0 = b * v_stride + h * d;
+    float beta = beta_ge[pair * 2];
+    float g_exp = beta_ge[pair * 2 + 1];
+    float sk = 0.0f;
+    for (int kdim = 0; kdim < d; kdim++) {
+        float sv = s[base_s + kdim * d + u] * g_exp;
+        s[base_s + kdim * d + u] = sv;
+        sk += sv * k[qk0 + kdim];
+    }
+    float delta = (v[v0 + u] - sk) * beta;
+    for (int kdim = 0; kdim < d; kdim++) {
+        s[base_s + kdim * d + u] += k[qk0 + kdim] * delta;
+    }
+    float o = 0.0f;
+    for (int kdim = 0; kdim < d; kdim++)
+        o += s[base_s + kdim * d + u] * q_scaled[qk0 + kdim];
+    out[v0 + u] = o;
+}
+// L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
+extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float scale,
+                                          int d, int n_group) {
+    int row = blockIdx.x;
+    int u = threadIdx.x;
+    if (u != 0 || row >= 2 * n_group) return;
+    bool is_q = row < n_group;
+    int r = is_q ? row : row - n_group;
+    int xb = r * d;
+    double sum = 0.0;
+    for (int i = 0; i < d; i++) {
+        double dv = (double)(is_q ? gq[xb + i] : gk[xb + i]);
+        sum += dv * dv;
+    }
+    float scale32 = (float)sqrt(sum);
+    float inv = 1.0f / fmaxf(scale32, eps);
+    if (is_q) {
+        for (int i = 0; i < d; i++) gq[xb + i] = gq[xb + i] * inv * scale;
+    } else {
+        for (int i = 0; i < d; i++) gk[xb + i] = gk[xb + i] * inv;
+    }
+}
+// 3-way split (q/k/v)
+extern "C" __global__ void split3(const float* src, float* d0, float* d1, float* d2,
+                                  int n0, int n1, int n2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n0 + n1 + n2;
+    if (i >= total) return;
+    if (i < n0) d0[i] = src[i];
+    else if (i < n0 + n1) d1[i - n0] = src[i];
+    else d2[i - n0 - n1] = src[i];
+}
+
 "#;
 
 pub const NAMES: &[&str] = &[
     "quant_q8", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
+    "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
