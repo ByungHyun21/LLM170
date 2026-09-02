@@ -826,7 +826,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
     let mut seed = 0x9e3779b9u64;
     let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
-    let t = 16usize;
+    let t = std::env::var("LLM170_TILE_T").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
     let mut xs = Vec::new();
     let mut q8s = Vec::new();
     for _ in 0..t {
