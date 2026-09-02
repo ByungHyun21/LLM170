@@ -424,6 +424,18 @@ pub trait RawDecode: Send + Sync {
     ) -> Result<(), String>;
     /// 디코드 1스텝 — emb(임베딩 행) 기록 후 전체 층 수행, logits 반환.
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String>;
+    /// 프리필 배치 — emb [t][n], 마지막 토큰 logits.
+    fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let n = emb.len();
+        let mut last = None;
+        for ti in 0..(n / 512) {
+            let _ = ti;
+        }
+        for ch in emb.chunks(512) {
+            last = Some(self.raw_step(seq, pos0, ch)?);
+        }
+        Ok(last.unwrap_or_default())
+    }
 }
 
 /// W4A8 정수 GEMV 경로 활성 (LLM170_W4A8=1) — iq4_xs·q3_K 디코드

@@ -124,6 +124,10 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("batch-abtest") => match llm170_backend_gpu::rawhip::batch_ab_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("tree-test") => match llm170_backend_gpu::rawhip::tree_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

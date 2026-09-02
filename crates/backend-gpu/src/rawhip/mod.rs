@@ -231,11 +231,12 @@ impl RawCtx {
         };
         let _ = &mut gx_a;
         let mut out_p0 = out as *mut std::ffi::c_void;
-        // out은 part(와 kt) 뒤, n_in 앞 — 시그니처 순서
         match ty {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
             _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
         }
+        let mut xw_a = (n_in / 4 + n_in / 32) as i32;
+        args_v.push(&mut xw_a as *mut _ as *mut std::ffi::c_void);
         self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
         let mut res = vec![0f32; n_out];
         self.sync()?;
@@ -255,6 +256,8 @@ impl RawCtx {
         n_in: usize,
         n_out: usize,
         out: *mut u8,
+        xq_w: usize,
+        t: usize,
     ) -> Result<(), String> {
         let part = self.scratch(n_out * 64 * 8)?;
         let gx = n_out.min(65535) as u32;
@@ -298,7 +301,10 @@ impl RawCtx {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
             _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
         }
-        self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
+        let mut xw_a = xq_w as i32;
+        let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
+        args_v.push(xw_ptr);
+        self.launch3(kern, gx, t as u32, gz, 64, &mut args_v)?;
         Ok(())
     }
 
@@ -312,16 +318,23 @@ impl RawCtx {
     /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
     /// 버퍼 크기 (n/4 + n/32)·4 바이트 필요.
     pub fn quant_q8(&self, x: *const u8, xq: *mut u8, n: usize) -> Result<(), String> {
+        self.quant_q8_b(x, xq, n, n / 4 + n / 32, 1)
+    }
+
+    /// 배치 양자화 — t토큰 [t][n] → [t][xq_w 워드].
+    pub fn quant_q8_b(&self, x: *const u8, xq: *mut u8, n: usize, xq_w: usize, t: usize) -> Result<(), String> {
         let nblk = n / 32;
         let mut x_p = x as *mut std::ffi::c_void;
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut n_a = n as i32;
+        let mut xw = xq_w as i32;
         let mut args = vec![
             &mut x_p as *mut _ as *mut std::ffi::c_void,
             &mut xq_p as *mut _ as *mut std::ffi::c_void,
             &mut n_a as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
         ];
-        self.launch("quant_q8", nblk.div_ceil(64) as u32, 1, 64, &mut args)
+        self.launch3("quant_q8", nblk.div_ceil(64) as u32, t as u32, 1, 64, &mut args)
     }
 }
 
@@ -638,4 +651,75 @@ pub fn tree_test() -> Result<String, String> {
     let mut r = [0f64; 5];
     ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), od)?;
     Ok(format!("off32={} (32) off1={} (1) tree={} (2016) w64_off32={} (32) w64_tree={} (2016)", r[0], r[1], r[2], r[3], r[4]))
+}
+
+/// 배치 A/B — t=2 quant+gemv가 행별 단일 결과와 동일한지.
+pub fn batch_ab_test() -> Result<String, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let w = model.w(&tname).ok_or("tensor 없음")?;
+    let ctx = RawCtx::new()?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let ktab2: Vec<u32> = (0..256u32)
+        .map(|b| {
+            let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+            let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+            lo | (hi << 8)
+        })
+        .collect();
+    let kt_d = ctx.alloc(1024)?;
+    ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
+    // 서로 다른 x 2행
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let x0: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let x1: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    // 단일 경로 결과 (기준)
+    let mut base = Vec::new();
+    for xr in [&x0, &x1] {
+        let xd = ctx.alloc(n_in * 4)?;
+        ctx.h2d(xd, bytemuck::cast_slice(xr))?;
+        let xq = ctx.alloc((n_in / 4 + n_in / 32) * 4)?;
+        ctx.quant_q8(xd, xq, n_in)?;
+        let out = ctx.alloc(n_out * 4)?;
+        ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, n_in / 4 + n_in / 32, 1)?;
+        let mut o = vec![0f32; n_out];
+        ctx.sync()?;
+        ctx.d2h(bytemuck::cast_slice_mut(&mut o).as_mut(), out)?;
+        base.push(o);
+    }
+    // 배치 경로
+    let mut xall: Vec<f32> = x0.clone();
+    xall.extend_from_slice(&x1);
+    let xd = ctx.alloc(n_in * 2 * 4)?;
+    ctx.h2d(xd, bytemuck::cast_slice(&xall))?;
+    let xq_w = n_in / 4 + n_in / 32;
+    let xq = ctx.alloc(xq_w * 4 * 2)?;
+    ctx.quant_q8_b(xd, xq, n_in, xq_w, 2)?;
+    let out = ctx.alloc(n_out * 4 * 2)?;
+    ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, xq_w, 2)?;
+    ctx.sync()?;
+    let mut o2 = vec![0f32; n_out * 2];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut o2).as_mut(), out)?;
+    // quant y=1 영역 검사
+    let mut xqh = vec![0u32; xq_w * 2];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut xqh).as_mut(), xq)?;
+    let nzq1 = xqh[xq_w..].iter().filter(|v| **v != 0).count();
+    let mut xq1 = vec![0u32; xq_w];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut xq1).as_mut(), unsafe { xq.add(xq_w * 4) } as *const u8)?;
+    eprintln!("diag: quant y1 nonzero {nzq1}/{xq_w}");
+    // 진단: xq_w=0 — y=1이 row0 값을 복사하면 블록 실행·아웃오프셋 정상
+    let out3 = ctx.alloc(n_out * 4)?;
+    ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out3, 0, 2)?;
+    ctx.sync()?;
+    let mut o3 = vec![0f32; n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut o3).as_mut(), out3)?;
+    let nz1 = o2[n_out..].iter().filter(|v| **v != 0.0).count();
+    let cp = o3.iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+    Ok(format!("batch t=2: row0 {} row1 {} 일치 | xqw0=단일 out≠0: {} / o2row1 비영: {}", base[0].iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), base[1].iter().zip(&o2[n_out..]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), n_out - cp, nz1))
 }

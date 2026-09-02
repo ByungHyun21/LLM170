@@ -627,6 +627,39 @@ impl Engine {
             || (self.raw_decode.is_some()
                 && std::env::var("LLM170_RAWHIP").is_ok_and(|v| v != "0"))
         {
+            let use_batch = std::env::var_os("LLM170_RAWHIP").is_some()
+                && std::env::var_os("LLM170_T1_PREFILL").is_none()
+                && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
+            if use_batch {
+                let rd = self.raw_decode.as_ref().unwrap();
+                let n = self.model.hp.n_embd as usize;
+                let embd = self.model.wchk("token_embd.weight")?;
+                let mut pos = self.seqs[seq].pos as usize;
+                let mut cache: Vec<Vec<f32>> = Vec::new();
+                for &tok in tokens {
+                    let mut row = vec![0.0f32; n];
+                    crate::quant::dequant_row(
+                        embd.ty,
+                        embd.data,
+                        tok as u64,
+                        n as u64,
+                        &mut row,
+                    );
+                    cache.push(row);
+                }
+                for ch in cache.chunks(64) {
+                    let flat: Vec<f32> = ch.iter().flatten().copied().collect();
+                    let logits = rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?;
+                    if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
+                        let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        eprintln!("logits(batch): max={m:.4} argmax={}", greedy(&logits));
+                    }
+                    pos += ch.len();
+                    last = Some(logits);
+                }
+                self.seqs[seq].pos = pos as u32;
+                return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
+            }
             for &t in tokens {
                 let logits = self.decode(&[seq], &[t])?;
                 last = Some(logits.into_iter().next().unwrap());

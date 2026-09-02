@@ -109,12 +109,14 @@ DEV float log1p_cr(float y) {
 // d는 별도 float 저장이 간헐 유실되는 코드젠 결함(2026-09-03 RCA) 회피차
 // xq 워드 스트림 뒤 영역(xq[nwords + b])에 u32 비트로 편승 — 저장 경로
 // 단일화. GEMV는 xd[sb] = __uint_as_float(xq[nwords + sb])로 읽음.
-extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_w) {
     int nblk = n >> 5;
-    if (b >= nblk) return;
+    int lb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lb >= nblk) return; // 토큰 내 가드
+    x += (size_t)blockIdx.y * n;
+    xq += (size_t)blockIdx.y * xq_w;
     int nwords = n >> 2;
-    int base = b << 5;
+    int base = lb << 5;
     float amax = 0.0f;
     for (int i = 0; i < 32; i++) {
         amax = fmaxf(amax, fabsf(x[base + i]));
@@ -132,9 +134,9 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n) {
             float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
             word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
         }
-        xq[b * 8 + wi] = word;
+        xq[lb * 8 + wi] = word;
     }
-    xq[nwords + b] = __float_as_uint(d); // d 비트 편승 (u32 저장 경로)
+    xq[nwords + lb] = __float_as_uint(d); // d 비트 편승 (u32 저장 경로)
 }
 
 // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
@@ -150,10 +152,12 @@ extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
 // ─── W4A8 GEMV t=1 — 스트라이드 레인, f64 부분합 ───
 // iq4_xs (ty16)
 extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
-                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out) {
+                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -251,10 +255,12 @@ extern "C" __global__ void gemm_xs(const unsigned* xq, const unsigned* w,
 
 // q5_K (ty13) — 분할 형태(곱 체인 2개), qh 비트, 스케일 scale_min_k4
 extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
-                                    double* part, float* out, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -325,10 +331,12 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
 
 // q8_0 (ty8)
 extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
-                                     double* part, float* out, int n_in, int n_out) {
+                                     double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 34;
@@ -374,10 +382,12 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
 
 // q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
 extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
-                                    double* part, float* out, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -440,10 +450,12 @@ extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
 
 // q6_K (ty14) — 16원소 그룹, 가상워드 ql/qh (비정렬 5워드 슬라이딩)
 extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
-                                    double* part, float* out, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_g = n_in >> 4;
     int cnt = (n_g + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -515,10 +527,12 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
 
 // iq4_nl (ty20) — ktab2 룩업, 블록 32원소
 extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
-                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out) {
+                                   double* part, const unsigned* ktab2, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 18;
@@ -570,10 +584,12 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
 
 // q3_K (ty11) — 16원소 하프블록, ql/hm byte() 로드(비정렬)
 extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
-                                    double* part, float* out, int n_in, int n_out) {
+                                    double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_h = n_in >> 4;
     int cnt = (n_h + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -712,10 +728,12 @@ __device__ const unsigned IQ3S_GRID[512] = {
 };
 
 extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
-                                     double* part, float* out, int n_in, int n_out) {
+                                     double* part, float* out, int n_in, int n_out, int xq_w) {
     int o = blockIdx.x + blockIdx.z * gridDim.x;
     int l = threadIdx.x;
     if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.y * xq_w;
+    out += (int)blockIdx.y * n_out;
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int blocks = n_in >> 8;
@@ -1008,16 +1026,18 @@ extern "C" __global__ void rms_finish(const float* x, const float* w, const doub
 extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, const float* kw,
                                         const float* cs, float eps, float kqs, int pos,
                                         int n_head, int n_kv, int hd, int n_rot) {
-    int r = blockIdx.x;
+    // gy=t 배치 — aq [t][n_head·2hd] (q‖gate 인터리브), ak [t][n_kv·hd].
+    int r0 = blockIdx.x;
     int u = threadIdx.x;
-    int rows = n_head + n_kv;
-    if (r >= rows || u != 0) return;
-    bool is_q = r < n_head;
+    int y = blockIdx.y;
+    if (r0 >= n_head + n_kv || u != 0) return;
+    bool is_q = r0 < n_head;
     int half = n_rot >> 1;
-    int xq_len = n_head * 2 * hd;
-    int csbase = pos * half * 2;
-    int row_base = is_q ? r * 2 * hd : (r - n_head) * hd;
-    // rms 32세그 순차 재현 (ops::sq_sum 순서)
+    int csbase = (pos + y) * half * 2;
+    int row_base = is_q ? y * (n_head * 2 * hd) + r0 * 2 * hd
+                        : y * (n_kv * hd) + (r0 - n_head) * hd;
+    float* xv = is_q ? xq : xk;
+    const float* wv = is_q ? qw + r0 * hd : kw + (r0 - n_head) * hd;
     double parts[32];
     int chunk = (hd + 31) >> 5;
     for (int uu = 0; uu < 32; uu++) {
@@ -1025,7 +1045,7 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
         int hi = min(lo + chunk, hd);
         double acc = 0.0;
         for (int i = lo; i < hi; i++) {
-            double dv = (double)(is_q ? xq[row_base + i] : xk[row_base + i]);
+            double dv = (double)xv[row_base + i];
             acc += dv * dv;
         }
         parts[uu] = acc;
@@ -1033,28 +1053,15 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
     double sum = 0.0;
     for (int uu = 0; uu < 32; uu++) sum += parts[uu];
     float scale = 1.0f / (float)sqrt(sum / (double)hd + (double)eps);
-    if (is_q) {
-        for (int i = 0; i < hd; i++)
-            xq[row_base + i] = xq[row_base + i] * scale * qw[r * hd + i];
-        for (int p = 0; p < half; p++) {
-            double c = (double)cs[csbase + p * 2];
-            double sf = (double)cs[csbase + p * 2 + 1];
-            int a = row_base + p, b = a + half;
-            double x0 = (double)xq[a], x1 = (double)xq[b];
-            xq[a] = (float)(x0 * c - x1 * sf);
-            xq[b] = (float)(x0 * sf + x1 * c);
-        }
-    } else {
-        for (int i = 0; i < hd; i++)
-            xk[row_base + i] = xk[row_base + i] * scale * kw[row_base + i] * kqs;
-        for (int p = 0; p < half; p++) {
-            double c = (double)cs[csbase + p * 2];
-            double sf = (double)cs[csbase + p * 2 + 1];
-            int a = row_base + p, b = a + half;
-            double x0 = (double)xk[a], x1 = (double)xk[b];
-            xk[a] = (float)(x0 * c - x1 * sf);
-            xk[b] = (float)(x0 * sf + x1 * c);
-        }
+    for (int i = 0; i < hd; i++)
+        xv[row_base + i] = xv[row_base + i] * scale * wv[i] * (is_q ? 1.0f : kqs);
+    for (int p = 0; p < half; p++) {
+        double c = (double)cs[csbase + p * 2];
+        double sf = (double)cs[csbase + p * 2 + 1];
+        int a = row_base + p, b = a + half;
+        double x0 = (double)xv[a], x1 = (double)xv[b];
+        xv[a] = (float)(x0 * c - x1 * sf);
+        xv[b] = (float)(x0 * sf + x1 * c);
     }
 }
 
@@ -1075,23 +1082,25 @@ extern "C" __global__ void gdn_conv(const float* qkv, const float* cw, float* st
 }
 // beta / e^g precompute
 extern "C" __global__ void gdn_beta_g(const float* b, const float* a, const float* dtb,
-                                      const float* sa, float* bg, int n_h) {
+                                      const float* sa, float* bg, int n_h, int dt_rank) {
+    // n_h = t·dt_rank (배치) — dtb/sa는 토큰 공유 [dt_rank].
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= n_h) return;
+    int h0 = h % dt_rank;
     float bv = b[h];
     bg[h * 2] = 1.0f / (1.0f + exp_cr(-bv));
-    float x = fminf(a[h] + dtb[h], 80.0f);
+    float x = fminf(a[h] + dtb[h0], 80.0f);
     float sp = log1p_cr(exp_cr(x));
-    bg[h * 2 + 1] = exp_cr(sp * sa[h]);
+    bg[h * 2 + 1] = exp_cr(sp * sa[h0]);
 }
 // norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
 extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
                                            float* out, float eps, int d, int n_h) {
-    int row = blockIdx.x;
+    int row = blockIdx.y * n_h + blockIdx.x;
     int u = threadIdx.x;
-    if (u != 0) return;
+    if (u != 0 || blockIdx.x >= n_h) return;
     int xb = row * d;
-    int wb = (row % n_h) * d;
+    int wb = blockIdx.x * d;
     double sum = 0.0;
     int chunk = (d + 31) >> 5;
     for (int sg = 0; sg < 32; sg++) {
@@ -1146,34 +1155,40 @@ extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, cons
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
 extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float scale,
                                           int d, int n_group) {
-    int row = blockIdx.x;
+    // gy=t 배치 — gq/gk 각각 [t][n_group·d] 분리 버퍼.
+    int y = blockIdx.y;
+    int x = blockIdx.x;
     int u = threadIdx.x;
-    if (u != 0 || row >= 2 * n_group) return;
-    bool is_q = row < n_group;
-    int r = is_q ? row : row - n_group;
-    int xb = r * d;
+    if (u != 0 || x >= 2 * n_group) return;
+    bool is_q = x < n_group;
+    int tb = y * n_group * d;
+    int xb = is_q ? tb + x * d : tb + (x - n_group) * d;
+    float* g = is_q ? gq : gk;
     double sum = 0.0;
     for (int i = 0; i < d; i++) {
-        double dv = (double)(is_q ? gq[xb + i] : gk[xb + i]);
+        double dv = (double)g[xb + i];
         sum += dv * dv;
     }
     float scale32 = (float)sqrt(sum);
     float inv = 1.0f / fmaxf(scale32, eps);
     if (is_q) {
-        for (int i = 0; i < d; i++) gq[xb + i] = gq[xb + i] * inv;
+        for (int i = 0; i < d; i++) g[xb + i] = g[xb + i] * inv;
     } else {
-        for (int i = 0; i < d; i++) gk[xb + i] = gk[xb + i] * inv;
+        for (int i = 0; i < d; i++) g[xb + i] = g[xb + i] * inv;
     }
 }
 // 3-way split (q/k/v)
 extern "C" __global__ void split3(const float* src, float* d0, float* d1, float* d2,
-                                  int n0, int n1, int n2) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+                                   int n0, int n1, int n2) {
+    // 배치 — j는 [t][n0+n1+n2] 전역: 토큰 내 위치로 분해.
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n0 + n1 + n2;
-    if (i >= total) return;
-    if (i < n0) d0[i] = src[i];
-    else if (i < n0 + n1) d1[i - n0] = src[i];
-    else d2[i - n0 - n1] = src[i];
+    // ew_l는 gx 전체 범위 런치 — 그리드 초과분 없음 (과잉 스레드는 아래 분기 밖)
+    int tok = j / total;
+    int jl = j - tok * total;
+    if (jl < n0) d0[tok * n0 + jl] = src[j];
+    else if (jl < n0 + n1) d1[tok * n1 + jl - n0] = src[j];
+    else d2[tok * n2 + jl - n0 - n1] = src[j];
 }
 
 

@@ -44,6 +44,14 @@ pub struct DecodeState {
     pub p64: *mut u8,     // [rows*32*8] — 최대 행수로
     // 스케일 1.0 상수
     pub one: *mut u8,
+    /// 프리필 배치 아레나 (t_max 고정) — 접미사 _t.
+    pub b_t_max: usize,
+    pub xs_t: *mut u8, xn_t: *mut u8, xq_n_t: *mut u8,
+    pub gqkv_t: *mut u8, gz_t: *mut u8, gb_t: *mut u8, ga_t: *mut u8, gbg_t: *mut u8,
+    pub gconv_t: *mut u8, gq_t: *mut u8, gk_t: *mut u8, gv_t: *mut u8, go_t: *mut u8,
+    pub ggated_t: *mut u8, gout_t: *mut u8, xq_g_t: *mut u8,
+    pub fgate_t: *mut u8, fup_t: *mut u8, fglu_t: *mut u8, fdown_t: *mut u8, xq_f_t: *mut u8,
+    pub aq_t: *mut u8, ak_t: *mut u8, av_t: *mut u8, aout_t: *mut u8, scores_t: *mut u8,
     // 상수 (norm 가중치·conv·cs 테이블·마스크)
     pub consts: std::collections::HashMap<String, *mut u8>,
     // 가중치 (dev 상주 — 업로드 1회)
@@ -158,6 +166,38 @@ impl DecodeState {
         }
         let max_rows = (n / 32).max(n_ff.max(g6)).max(hp.n_head + hp.n_kv).max(1);
         let bs = |nb: usize| Self::a(&ctx, nb).unwrap();
+        // 배치 아레나 (t_max=64)
+        let t_max = 64usize;
+        let (n_kv, hd) = (hp.n_kv, hp.head_dim);
+        let xq_sn = n / 4 + n / 32;
+        let xq_sf = n_ff / 4 + n_ff / 32;
+        let xq_sg = d_inner / 4 + d_inner / 32;
+        let b_xs_t = bs(t_max * n * 4);
+        let b_xn_t = bs(t_max * n * 4);
+        let b_xq_n_t = bs(t_max * xq_sn * 4);
+        let b_gqkv_t = bs(t_max * conv_ch * 4);
+        let b_gz_t = bs(t_max * d_inner * 4);
+        let b_gb_t = bs(t_max * hp.dt_rank * 4);
+        let b_ga_t = bs(t_max * hp.dt_rank * 4);
+        let b_gbg_t = bs(t_max * hp.dt_rank * 2 * 4);
+        let b_gconv_t = bs(t_max * conv_ch * 4);
+        let b_gq_t = bs(t_max * k_len * 4);
+        let b_gk_t = bs(t_max * k_len * 4);
+        let b_gv_t = bs(t_max * v_len * 4);
+        let b_go_t = bs(t_max * v_len * 4);
+        let b_ggated_t = bs(t_max * d_inner * 4);
+        let b_gout_t = bs(t_max * n * 4);
+        let b_xq_g_t = bs(t_max * xq_sg * 4);
+        let b_fgate_t = bs(t_max * n_ff * 4);
+        let b_fup_t = bs(t_max * n_ff * 4);
+        let b_fglu_t = bs(t_max * n_ff * 4);
+        let b_fdown_t = bs(t_max * n * 4);
+        let b_xq_f_t = bs(t_max * xq_sf * 4);
+        let b_aq_t = bs(t_max * hp.n_head * 2 * hp.head_dim * 4);
+        let b_ak_t = bs(t_max * n_kv * hd * 4);
+        let b_av_t = bs(t_max * n_kv * hd * 4);
+        let b_aout_t = bs(t_max * hp.n_head * hp.head_dim * 4);
+        let b_scores_t = bs(t_max * hp.n_head * ctx_len * 4);
         let (b_xs, b_xn, b_gqkv, b_gconv) = (bs(n * 4), bs(n * 4), bs(conv_ch * 4), bs(conv_ch * 4));
         let (b_gz, b_gb, b_ga, b_gbg) = (bs(d_inner * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 2 * 4));
         let (b_gq, b_gk, b_gv, b_go) = (bs(k_len * 4), bs(k_len * 4), bs(v_len * 4), bs(v_len * 4));
@@ -177,6 +217,13 @@ impl DecodeState {
             aq: b_aq, ak: b_ak, av: b_av, aout: b_aout,
             scores: b_scores, p64: b_p64,
             one, consts: c, weights: wmap, ktab2: kt,
+            b_t_max: t_max,
+            xs_t: b_xs_t, xn_t: b_xn_t, xq_n_t: b_xq_n_t,
+            gqkv_t: b_gqkv_t, gz_t: b_gz_t, gb_t: b_gb_t, ga_t: b_ga_t, gbg_t: b_gbg_t,
+            gconv_t: b_gconv_t, gq_t: b_gq_t, gk_t: b_gk_t, gv_t: b_gv_t, go_t: b_go_t,
+            ggated_t: b_ggated_t, gout_t: b_gout_t, xq_g_t: b_xq_g_t,
+            fgate_t: b_fgate_t, fup_t: b_fup_t, fglu_t: b_fglu_t, fdown_t: b_fdown_t, xq_f_t: b_xq_f_t,
+            aq_t: b_aq_t, ak_t: b_ak_t, av_t: b_av_t, aout_t: b_aout_t, scores_t: b_scores_t,
             kv_k, kv_v, st_conv, st_gdn,
             n_embd: n, n_ff, n_layer: hp.n_layer, n_head: hp.n_head, n_kv: hp.n_kv,
             hd: hp.head_dim, n_rot: hp.n_rot, eps: hp.eps, d_inner, n_group: hp.n_group,
@@ -191,7 +238,7 @@ impl DecodeState {
     /// GEMV를 상주 out에 직접 기록 (gemv_q8의 내부 out을 복사 없이 쓰기 위해
     /// out 포인터를 받는 변형이 필요 — 현재는 gemv 후 d2h→h2d. 최적화 후술.)
     fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
-        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out)
+        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32, 1)
     }
     fn ew_l(&self, name: &str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
         self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
@@ -315,7 +362,8 @@ impl DecodeState {
                     let mut sp2 = ssa as *mut std::ffi::c_void;
                     let mut bgp = self.gbg as *mut std::ffi::c_void;
                     let mut nh = self.dt_rank as i32;
-                    let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh)];
+                    let mut dr = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
                     self.ew_l("gdn_beta_g", self.dt_rank, &mut args)?;
                 }
                 // AR
@@ -598,6 +646,12 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         Ok(())
     }
 
+    fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.step_batch(seq, pos0, emb)
+    }
+
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
@@ -612,3 +666,292 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 }
 
 unsafe impl Send for DecodeState {}
+
+
+impl DecodeState {
+    /// 프리필 배치 스텝 — t 토큰 (emb: [t][n_embd], pos0..pos0+t-1), 마지막 logits.
+    /// mm/quant/rms/silu/l2/split3/beta_g/norm_gated/qk_norm_rope 배치,
+    /// conv/AR/KV/qsa 순차·토큰 의존 — 토큰 루프. 산술은 step()과 토큰당 동일열.
+    #[allow(clippy::too_many_lines)]
+    pub fn step_batch(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let t = emb.len() / self.n_embd;
+        debug_assert!(t >= 1 && t <= self.b_t_max);
+        let n = self.n_embd;
+        let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
+        let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
+        let xq_sn = n / 4 + n / 32;
+        let xq_sf = self.n_ff / 4 + self.n_ff / 32;
+        let xq_sg = self.d_inner / 4 + self.d_inner / 32;
+        self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
+        let cs = *self.consts.get("cs").ok_or("cs")?;
+        let mask = *self.consts.get("mask").ok_or("mask")?;
+        let mut recr_idx = 0usize;
+        let mut full_idx = 0usize;
+        for il in 0..self.n_layer {
+            let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
+            self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            if self.is_recr[il] {
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gz_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gb_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ga_t, t)?;
+                let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
+                let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
+                let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
+                let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
+                // conv+ring 순차 (토큰 루프)
+                for ti in 0..t {
+                    let mut qp = unsafe { self.gqkv_t.offset((ti * conv_ch * 4) as isize) } as *mut std::ffi::c_void;
+                    let mut cp = cw as *mut std::ffi::c_void;
+                    let mut sp = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
+                    let mut op = unsafe { self.gconv_t.offset((ti * conv_ch * 4) as isize) } as *mut std::ffi::c_void;
+                    let mut ch = conv_ch as i32;
+                    let mut kk = self.conv_k as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk)];
+                    self.ctx.launch("gdn_conv", conv_ch as u32, 1, 32, &mut args)?;
+                }
+                // split3 전체 배치 (요소별)
+                {
+                    let mut sp = self.gconv_t as *mut std::ffi::c_void;
+                    let mut q0 = self.gq_t as *mut std::ffi::c_void;
+                    let mut q1 = self.gk_t as *mut std::ffi::c_void;
+                    let mut q2 = self.gv_t as *mut std::ffi::c_void;
+                    let mut n0 = k_len as i32;
+                    let mut n1 = k_len as i32;
+                    let mut n2 = v_len as i32;
+                    let total = (2 * k_len + v_len) * t;
+                    let mut args = vec![Self::p(&mut sp), Self::p(&mut q0), Self::p(&mut q1), Self::p(&mut q2), Self::p(&mut n0), Self::p(&mut n1), Self::p(&mut n2)];
+                    self.ew_l("split3", total, &mut args)?;
+                }
+                // l2 전체 배치 (gy=t)
+                {
+                    let scale = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut qp = self.gq_t as *mut std::ffi::c_void;
+                    let mut kp = self.gk_t as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut sc = scale;
+                    let mut d = self.d_state as i32;
+                    let mut ng = self.n_group as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut ep), Self::p(&mut sc), Self::p(&mut d), Self::p(&mut ng)];
+                    self.ctx.launch3("l2_rows2_scale", (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
+                }
+                // beta/e^g 전체 배치 (요소별)
+                {
+                    let mut bp = self.gb_t as *mut std::ffi::c_void;
+                    let mut ap = self.ga_t as *mut std::ffi::c_void;
+                    let mut dp = dtb as *mut std::ffi::c_void;
+                    let mut sp2 = ssa as *mut std::ffi::c_void;
+                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
+                    let mut nh = (self.dt_rank * t) as i32;
+                    let mut dr = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
+                    self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
+                }
+                // AR 순차 (토큰 루프)
+                for ti in 0..t {
+                    let (go4, gq4, gk4, gv4, gbg4) = (
+                        (ti * v_len * 4) as isize,
+                        (ti * k_len * 4) as isize,
+                        (ti * k_len * 4) as isize,
+                        (ti * v_len * 4) as isize,
+                        (ti * self.dt_rank * 2 * 4) as isize,
+                    );
+                    let mut sp3 = self.st_gdn[recr_idx][seq] as *mut std::ffi::c_void;
+                    let mut qp = unsafe { self.gq_t.offset(gq4) } as *mut std::ffi::c_void;
+                    let mut kp = unsafe { self.gk_t.offset(gk4) } as *mut std::ffi::c_void;
+                    let mut vp = unsafe { self.gv_t.offset(gv4) } as *mut std::ffi::c_void;
+                    let mut bgp = unsafe { self.gbg_t.offset(gbg4) } as *mut std::ffi::c_void;
+                    let mut op = unsafe { self.go_t.offset(go4) } as *mut std::ffi::c_void;
+                    let mut d = self.d_state as i32;
+                    let mut ks = k_len as i32;
+                    let mut vs = v_len as i32;
+                    let mut hv = self.dt_rank as i32;
+                    let mut hk = self.n_group as i32;
+                    let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc)];
+                    self.ctx.launch("gdn_ar", self.dt_rank as u32, 1, 128, &mut args)?;
+                }
+                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                    self.ctx.sync()?;
+                    let mut hq = vec![0f32; k_len * t];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq_t)?;
+                    let mut xq_: u64 = 0;
+                    for &v in &hq { xq_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    let mut ho = vec![0f32; v_len * t];
+                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.go_t)?;
+                    let mut xo_: u64 = 0;
+                    for &v in &ho { xo_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
+                    eprintln!("#  G0dbg batch gq xor={xq_:016x} go xor={xo_:016x}");
+                }
+                // norm_gated 전체 배치 (gy=t)
+                {
+                    let mut op = self.go_t as *mut std::ffi::c_void;
+                    let mut zp = self.gz_t as *mut std::ffi::c_void;
+                    let mut wp = snorm as *mut std::ffi::c_void;
+                    let mut outp = self.ggated_t as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut d = self.d_state as i32;
+                    let mut nh = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
+                    self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                }
+                // out proj 배치
+                self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
+                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                recr_idx += 1;
+            } else {
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
+                let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
+                let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
+                // q/k norm+rope 전체 배치 (gy=t — 커널 pos+y)
+                {
+                    let mut qp = self.aq_t as *mut std::ffi::c_void;
+                    let mut kp = self.ak_t as *mut std::ffi::c_void;
+                    let mut qwp = qn as *mut std::ffi::c_void;
+                    let mut kwp = kn as *mut std::ffi::c_void;
+                    let mut csp = cs as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut kq = self.kq_scale;
+                    let mut pp = pos0 as i32;
+                    let mut nh = n_head as i32;
+                    let mut nk = n_kv as i32;
+                    let mut h = hd as i32;
+                    let mut nr = n_rot as i32;
+                    let rows = n_head + n_kv;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
+                    self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)?;
+                }
+                // KV append + qsa per-token (pos/n_past 의존)
+                for ti in 0..t {
+                    let pos = pos0 + ti;
+                    let (k4, v4, ao4) = (
+                        (ti * n_kv * hd * 4) as isize,
+                        (ti * n_kv * hd * 4) as isize,
+                        (ti * n_head * hd * 4) as isize,
+                    );
+                    self.copy(unsafe { self.ak_t.offset(k4) as *mut u8 }, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                    self.copy(unsafe { self.av_t.offset(v4) as *mut u8 }, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                    let n_past = pos + 1;
+                    let scp4 = (ti * n_head * self.ctx_len * 4) as isize;
+                    let aqp4 = (ti * n_head * 2 * hd * 4) as isize;
+                    {
+                        let mut qp = unsafe { self.aq_t.offset(aqp4) } as *mut std::ffi::c_void;
+                        let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut mp = mask as *mut std::ffi::c_void;
+                        let mut scp = unsafe { self.scores_t.offset(scp4) } as *mut std::ffi::c_void;
+                        let mut np_ = n_past as i32;
+                        let mut nh = n_head as i32;
+                        let mut nk = n_kv as i32;
+                        let mut h = hd as i32;
+                        let mut tl = 1i32;
+                        let gx = n_past.div_ceil(64) as u32;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
+                        self.ctx.launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
+                    }
+                    {
+                        let mut qp = unsafe { self.aq_t.offset(aqp4) } as *mut std::ffi::c_void;
+                        let mut scp = unsafe { self.scores_t.offset(scp4) } as *mut std::ffi::c_void;
+                        let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut op = unsafe { self.aout_t.offset(ao4) } as *mut std::ffi::c_void;
+                        let mut np_ = n_past as i32;
+                        let mut nh = n_head as i32;
+                        let mut nk = n_kv as i32;
+                        let mut h = hd as i32;
+                        let mut tl = 1i32;
+                        let gx = hd.div_ceil(64) as u32;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
+                        self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
+                    }
+                }
+                // wo 배치
+                self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
+                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                full_idx += 1;
+            }
+            self.axpy(self.xs_t, self.gout_t, n * t)?;
+            // FFN 배치
+            let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
+            self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
+            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
+            self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+            let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
+            self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            {
+                let mut gp = self.fgate_t as *mut std::ffi::c_void;
+                let mut up = self.fup_t as *mut std::ffi::c_void;
+                let mut op = self.fglu_t as *mut std::ffi::c_void;
+                let mut na = (self.n_ff * t) as i32;
+                let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
+                self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
+            }
+            self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
+            self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            self.axpy(self.xs_t, self.fdown_t, n * t)?;
+            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+                self.ctx.sync()?;
+                let mut hv = vec![0f32; n * t];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs_t)?;
+                let sum0: f64 = hv[..n].iter().map(|&v| v as f64).sum();
+                let suml: f64 = hv[n * (t - 1)..].iter().map(|&v| v as f64).sum();
+                eprintln!("#  E{il} t={t} xs0={sum0:.6} xs_last={suml:.6}");
+            }
+        }
+        // head — 마지막 토큰만
+        let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
+        let last = unsafe { self.xs_t.offset(((t - 1) * n * 4) as isize) } as *mut u8;
+        {
+            let mut xp = last as *mut std::ffi::c_void;
+            let mut pp = self.p64 as *mut std::ffi::c_void;
+            let mut na = n as i32;
+            let mut a1 = vec![Self::p(&mut xp), Self::p(&mut pp), Self::p(&mut na)];
+            self.ctx.launch("rms_part", 1, 1, 32, &mut a1)?;
+            let mut wp = wn as *mut std::ffi::c_void;
+            let mut op = self.xn as *mut std::ffi::c_void;
+            let mut ep = self.eps;
+            let mut wr = 1i32;
+            let mut a2 = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp), Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr)];
+            self.ctx.launch("rms_finish", 1, 1, 32, &mut a2)?;
+        }
+        self.ctx.quant_q8(self.xn, self.xq_n, n)?;
+        let (wh, th, nih, noh) = self.w("output.weight")?;
+        self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
+        let mut out = vec![0f32; noh];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), self.logits)?;
+        Ok(out)
+    }
+
+    /// 배치 rms — rows=t.
+    fn rms_rows(&self, x: *mut u8, w: *mut u8, out: *mut u8, n: usize, t: usize) -> Result<(), String> {
+        let mut xp = x as *mut std::ffi::c_void;
+        let mut pp = self.p64 as *mut std::ffi::c_void;
+        let mut na = n as i32;
+        let mut a1 = vec![Self::p(&mut xp), Self::p(&mut pp), Self::p(&mut na)];
+        self.ctx.launch("rms_part", t as u32, 1, 32, &mut a1)?;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut ep = self.eps;
+        let mut wr = 1i32;
+        let mut a2 = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp), Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr)];
+        self.ctx.launch("rms_finish", t as u32, 1, 32, &mut a2)
+    }
+
+    /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
+    #[allow(clippy::too_many_arguments)]
+    fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, xq_w, t)
+    }
+}
