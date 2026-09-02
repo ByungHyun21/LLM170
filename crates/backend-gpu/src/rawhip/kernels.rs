@@ -491,6 +491,240 @@ extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
 // ─── 타일 배치 GEMM (블록=1행, TT 토큰 레지스터, 가중 1회 독서) ───
 // gemm_q5k_bt 참조. 미러와 토큰당 동일 연산열.
 
+// q5_K MMQ 포트 (ty13) — llama.cpp mul_mat_q 구조: I=64행×J=16토큰 타일,
+// 256스레드(4×wave64), 스레드당 4토큰 파편. 언팩 가중·y 전부 shared,
+// 가중 언팩이 16토큰에 상각. k-청크 256원소(8서브블록)/반복.
+// 미러(q5k_mm)와 쌍: 스레드 q가 서브블록 {q, q+4, ...} 순서 f32 누산,
+// 4-파편 tree 결합.
+extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
+                                       float* out, int n_in, int n_out, int xq_w, int t) {
+    __shared__ unsigned wvs[8][64][8];    // [k청크 내 sb][행][워드] — 언팩 완료
+    __shared__ float dsc[8][64][2];       // d·sc, dm·m
+    __shared__ unsigned ytile[16][8][8];  // [토큰][sb][워드]
+    __shared__ float ydt[16][8];          // [토큰][sb] yd
+    __shared__ int qst[16][8];            // [토큰][sb] qsum16 합
+    __shared__ float psum[4][64][16];     // [파편][행][토큰] f32 부분합
+
+    int i = blockIdx.x * 64;              // 행 타일 기저
+    int tid = threadIdx.x;                // 0..255
+    int row = tid & 63;                   // 행 (스레드-행 고정)
+    int q4 = tid >> 6;                    // 파편 0..3 (토큰 4개 담당)
+    if (i >= n_out) return;
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    // init
+    for (int a = 0; a < 4; a++) {
+        if (row < nrow)
+            #pragma unroll
+            for (int j = 0; j < 16; j++) psum[a][row][j] = 0.0f;
+    }
+    __syncthreads();
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        // ── 협력 스테이징: 256스레드 × (1 언팩 유닛 + 0.5 y 유닛) ──
+        // 언팩: tid → (sb_local = tid>>5? ...) 256유닛 = 8sb×64행의 절반? 8*64=512 — 2패스
+        for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;             // 0..511
+            int sbl = u >> 6;                     // 0..7
+            int r  = u & 63;                      // 0..63
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int js = sb & 7;
+                int it = js >> 1;
+                int half = js & 1;
+                int wb = o * blocks * 176 + (sb >> 3) * 176;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                float dm = bits_f16(w0 >> 16);
+                unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+                unsigned rr = (js & 3) * 8;
+                unsigned b1 = js < 4 ? (sc0 >> rr) & 0xFFu : (sc1 >> rr) & 0xFFu;
+                unsigned b4 = js < 4 ? (sc1 >> rr) & 0xFFu : (sc2 >> rr) & 0xFFu;
+                unsigned bm = (sc0 >> rr) & 0xFFu;
+                unsigned sc_v, m_v;
+                if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+                else { sc_v = (b4 & 0xFu) | ((bm >> 6) << 4); m_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+                dsc[sbl][r][0] = d * (float)sc_v;
+                dsc[sbl][r][1] = dm * (float)m_v;
+                int qhw = wq + 4;
+                unsigned nsh = half << 2;
+                int sh = 2 * it + half;
+                unsigned hb = (1u << sh) * 0x01010101u;
+                int qlb = wq + 12 + it * 8;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++) {
+                    unsigned nib = (w[qlb + kk] >> nsh) & 0x0F0F0F0Fu;
+                    unsigned bit = ((w[qhw + kk] & hb) >> sh) << 4;
+                    wvs[sbl][r][kk] = nib | bit;
+                }
+            }
+        }
+        // y 스테이징: 16토큰×8sb = 128유닛 × (8워드+d+q) — 256스레드 1패스
+        {
+            int u = tid;                          // 0..255 (128 유닛×2부)
+            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
+                int ti = u >> 3;                  // 토큰
+                int sbl = u & 7;                  // sb
+                int sb = k0 + sbl;
+                if (ti < t && sb < n_sub) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ytile[ti][sbl][kk] = xt[xw + kk];
+                    ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    qst[ti][sbl] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
+                }
+            }
+        }
+        __syncthreads();
+        // ── 계산: 스레드 = (행 고정, 파편 q4 = 서브블록 {q4, q4+4?} …) ──
+        // 파편 분할: 스레드 q4가 sbl ∈ {q4, q4+4} (8sb → 4파편×2)
+        if (row < nrow) {
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {
+                int sbl = q4 + jj * 4;            // {q4, q4+4}
+                int sb = k0 + sbl;
+                if (sb < n_sub) {
+                    // 모든 16토큰 계산 (파편=행×sb, 토큰 전담)
+                    #pragma unroll 4
+                    for (int ti = 0; ti < t; ti++) {
+                        int isum = 0;
+                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
+                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][1], isum);
+                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][2], isum);
+                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][3], isum);
+                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][4], isum);
+                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][5], isum);
+                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][6], isum);
+                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
+                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row][0] * (float)isum;
+                        psum[q4][row][ti] -= ydt[ti][sbl] * dsc[sbl][row][1] * (float)qst[ti][sbl];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // ── 4파편 결합 (q4 순서) + 기록 ──
+    if (row < nrow && q4 == 0) {
+        #pragma unroll 4
+        for (int ti = 0; ti < t; ti++) {
+            float a = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+            out[(size_t)ti * n_out + i + row] = a;
+        }
+    }
+}
+
+// ─── MMQ 포트 (llama.cpp 타일: 64행×16토큰×256스레드, 파편 sb%4) ───
+// 미러(q*_mm)와 쌍: 파편 f32 누산 + p0+p1+p2+p3.
+
+// q4_K MMQ (ty12) — 니블만, qs wq+4+it*8
+extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
+                                       float* out, int n_in, int n_out, int xq_w, int t) {
+    __shared__ unsigned wvs[8][64][8];
+    __shared__ float dsc[8][64][2];
+    __shared__ unsigned ytile[16][8][8];
+    __shared__ float ydt[16][8];
+    __shared__ int qst[16][8];
+    __shared__ float psum[4][64][16];
+    int i = blockIdx.x * 64;
+    int tid = threadIdx.x;
+    int row = tid & 63;
+    int q4 = tid >> 6;
+    if (i >= n_out) return;
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    if (row < nrow)
+        #pragma unroll
+        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+    __syncthreads();
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;
+            int sbl = u >> 6;
+            int r = u & 63;
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int js = sb & 7;
+                int it = js >> 1;
+                int half = js & 1;
+                int wb = o * blocks * 144 + (sb >> 3) * 144;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                float dm = bits_f16(w0 >> 16);
+                unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+                unsigned rr = (js & 3) * 8;
+                unsigned b1 = js < 4 ? (sc0 >> rr) & 0xFFu : (sc1 >> rr) & 0xFFu;
+                unsigned b4 = js < 4 ? (sc1 >> rr) & 0xFFu : (sc2 >> rr) & 0xFFu;
+                unsigned bm = (sc0 >> rr) & 0xFFu;
+                unsigned sc_v, m_v;
+                if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+                else { sc_v = (b4 & 0xFu) | ((bm >> 6) << 4); m_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+                dsc[sbl][r][0] = d * (float)sc_v;
+                dsc[sbl][r][1] = dm * (float)m_v;
+                unsigned nsh = half << 2;
+                int qlb = wq + 4 + it * 8;
+                #pragma unroll
+                for (int kk = 0; kk < 8; kk++)
+                    wvs[sbl][r][kk] = (w[qlb + kk] >> nsh) & 0x0F0F0F0Fu;
+            }
+        }
+        {
+            int u = tid;
+            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
+                int ti = u >> 3;
+                int sbl = u & 7;
+                int sb = k0 + sbl;
+                if (ti < t && sb < n_sub) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ytile[ti][sbl][kk] = xt[xw + kk];
+                    ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    qst[ti][sbl] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
+                }
+            }
+        }
+        __syncthreads();
+        if (row < nrow) {
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {
+                int sbl = q4 + jj * 4;
+                int sb = k0 + sbl;
+                if (sb < n_sub) {
+                    #pragma unroll 4
+                    for (int ti = 0; ti < t; ti++) {
+                        int isum = 0;
+                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
+                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][1], isum);
+                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][2], isum);
+                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][3], isum);
+                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][4], isum);
+                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][5], isum);
+                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][6], isum);
+                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
+                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row][0] * (float)isum;
+                        psum[q4][row][ti] -= ydt[ti][sbl] * dsc[sbl][row][1] * (float)qst[ti][sbl];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row < nrow && q4 == 0) {
+        #pragma unroll 4
+        for (int ti = 0; ti < t; ti++)
+            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+    }
+}
+
 // q4_K 타일 (ty12)
 extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
@@ -569,6 +803,128 @@ extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
     }
 }
 
+// q6_K MMQ (ty14) — 16원소 그룹: w = nib + 16·hi2 − 32 (qsum 테이블 분해).
+// 그룹 2개/서브블록? 아님 — q6_K 그룹=16원소, 서브블록 32원소=2그룹.
+// 여기선 k청크를 16원소 그룹 16개(256원소)로: wvs[16그룹][64행][4워드].
+extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
+                                       float* out, int n_in, int n_out, int xq_w, int t) {
+    __shared__ unsigned wvs[16][64][4];
+    __shared__ float dsc[16][64];          // d·sc 사전곱
+    __shared__ unsigned ytile[16][16][4];  // [토큰][그룹][워드]
+    __shared__ float ydt[16][16];
+    __shared__ int qst[16][16];
+    __shared__ float psum[4][64][16];
+    int i = blockIdx.x * 64;
+    int tid = threadIdx.x;
+    int row = tid & 63;
+    int q4 = tid >> 6;
+    if (i >= n_out) return;
+    int nrow = min(64, n_out - i);
+    int n_g = n_in >> 4;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    if (row < nrow)
+        #pragma unroll
+        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+    __syncthreads();
+    for (int k0 = 0; k0 < n_g; k0 += 16) {
+        for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;
+            int gl = u >> 4;               // 그룹 0..15
+            int r = (u >> 0) & 15;         // 하위 4비트 — 잘못… u&15
+            r = u & 63;                    // 행 재정의: u = gl*64 + r → gl = u>>6 (0..7?) 
+            // 재설계: 16그룹×64행 = 1024유닛 — 4패스
+            (void)r; (void)gl;
+        }
+        // 간단화: 1024 유닛 = 4패스 × 256
+        for (int pass = 0; pass < 4; pass++) {
+            int u = pass * 256 + tid;      // 0..1023
+            int gl = u >> 6;               // 0..15
+            int r = u & 63;
+            int g = k0 + gl;
+            if (r < nrow && g < n_g) {
+                int o = i + r;
+                int blk = g >> 4;
+                int kloc = g & 15;
+                int h = kloc >> 3;
+                int src = (kloc & 7) >> 1;
+                int p2 = kloc & 1;
+                int wb = o * blocks * 210 + blk * 210;
+                float d = f16w(w, wb + 208);
+                int sc = sext8(byte(w, wb + 192 + kloc));
+                dsc[gl][r] = d * (float)sc;
+                int ql_rel = h * 64 + p2 * 16 + ((src & 1) << 5);
+                int qh_rel = 128 + h * 32 + p2 * 16;
+                bool al = (wb & 3) == 0;
+                int qlw = (wb + ql_rel) >> 2;
+                int qhw = (wb + qh_rel) >> 2;
+                unsigned qa[4], ha[4];
+                if (al) {
+                    qa[0]=w[qlw]; qa[1]=w[qlw+1]; qa[2]=w[qlw+2]; qa[3]=w[qlw+3];
+                    ha[0]=w[qhw]; ha[1]=w[qhw+1]; ha[2]=w[qhw+2]; ha[3]=w[qhw+3];
+                } else {
+                    qa[0]=(w[qlw]>>16)|(w[qlw+1]<<16); qa[1]=(w[qlw+1]>>16)|(w[qlw+2]<<16);
+                    qa[2]=(w[qlw+2]>>16)|(w[qlw+3]<<16); qa[3]=(w[qlw+3]>>16)|(w[qlw+4]<<16);
+                    ha[0]=(w[qhw]>>16)|(w[qhw+1]<<16); ha[1]=(w[qhw+1]>>16)|(w[qhw+2]<<16);
+                    ha[2]=(w[qhw+2]>>16)|(w[qhw+3]<<16); ha[3]=(w[qhw+3]>>16)|(w[qhw+4]<<16);
+                }
+                unsigned nibm = ((src == 0 || src == 1) ? 0x0F0F0F0Fu : 0xF0F0F0F0u);
+                int nsh = (src == 0 || src == 1) ? 0 : 4;
+                int hsh = 2 * src;
+                #pragma unroll
+                for (int kk = 0; kk < 4; kk++) {
+                    unsigned nib = (qa[kk] >> nsh) & 0x0F0F0F0Fu;
+                    unsigned hi2 = (ha[kk] >> hsh) & 0x03030303u;
+                    wvs[gl][r][kk] = nib + (hi2 << 4);
+                }
+                (void)nibm;
+            }
+        }
+        {
+            // y: 16토큰×16그룹 = 256유닛 — 정확히 1패스 (tid 0..255)
+            int u = tid;
+            int ti = u >> 4;
+            int gl = u & 15;
+            int g = k0 + gl;
+            if (ti < t && gl < 16 && g < n_g) {
+                const unsigned* xt = xq + ti * xq_w;
+                int xw = (g << 4) >> 2;
+                #pragma unroll
+                for (int kk = 0; kk < 4; kk++) ytile[ti][gl][kk] = xt[xw + kk];
+                ydt[ti][gl] = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
+                qst[ti][gl] = (int)xt[qsb + g];  // q16[g] — 16그룹 인덱스
+            }
+        }
+        __syncthreads();
+        if (row < nrow) {
+            // 파편: q4가 gl ∈ {q4, q4+4, q4+8, q4+12} (16그룹 → 4파편×4)
+            #pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+                int gl = q4 + jj * 4;
+                int g = k0 + gl;
+                if (g < n_g) {
+                    #pragma unroll 4
+                    for (int ti = 0; ti < t; ti++) {
+                        int isum = 0;
+                        isum = dot4(wvs[gl][row][0], ytile[ti][gl][0], isum);
+                        isum = dot4(wvs[gl][row][1], ytile[ti][gl][1], isum);
+                        isum = dot4(wvs[gl][row][2], ytile[ti][gl][2], isum);
+                        isum = dot4(wvs[gl][row][3], ytile[ti][gl][3], isum);
+                        isum -= 32 * qst[ti][gl];
+                        psum[q4][row][ti] += ydt[ti][gl] * dsc[gl][row] * (float)isum;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row < nrow && q4 == 0) {
+        #pragma unroll 4
+        for (int ti = 0; ti < t; ti++)
+            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
+    }
+}
+
 // q6_K 타일 (ty14) — 16원소 그룹, w = nib + 16·hi2 − 32 분해
 extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
@@ -643,6 +999,110 @@ extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
             if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
         }
         __syncthreads();
+    }
+}
+
+// iq4_xs MMQ (ty23) — ktab2 룩업 언팩, 공유 LUT.
+extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
+                                      float* out, const unsigned* ktab2, int n_in, int n_out,
+                                      int xq_w, int t) {
+    __shared__ unsigned wvs[8][64][8];
+    __shared__ float dsc[8][64];
+    __shared__ unsigned ytile[16][8][8];
+    __shared__ float ydt[16][8];
+    __shared__ float psum[4][64][16];
+    __shared__ unsigned kt_s[256];
+    for (int a = threadIdx.x; a < 256; a += 256) kt_s[a] = ktab2[a];
+    int i = blockIdx.x * 64;
+    int tid = threadIdx.x;
+    int row = tid & 63;
+    int q4 = tid >> 6;
+    if (i >= n_out) return;
+    int nrow = min(64, n_out - i);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    if (row < nrow)
+        #pragma unroll
+        for (int j = 0; j < 16; j++) psum[q4][row][j] = 0.0f;
+    __syncthreads();
+    for (int k0 = 0; k0 < n_sub; k0 += 8) {
+        for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;
+            int sbl = u >> 6;
+            int r = u & 63;
+            int sb = k0 + sbl;
+            if (r < nrow && sb < n_sub) {
+                int o = i + r;
+                int ib = sb & 7;
+                int wb = o * blocks * 136 + (sb >> 3) * 136;
+                int wq = wb >> 2;
+                unsigned w0 = w[wq];
+                float d = bits_f16(w0 & 0xFFFFu);
+                int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
+                      | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
+                dsc[sbl][r] = d * (float)(ls - 32);
+                int qw = (wb + 8 + ib * 16) >> 2;
+                #pragma unroll
+                for (int kk = 0; kk < 4; kk++) {
+                    unsigned qv = w[qw + kk];
+                    unsigned lov = 0, hiv = 0;
+                    #pragma unroll
+                    for (int b2 = 3; b2 >= 0; b2--) {
+                        unsigned tt2 = kt_s[(qv >> (8 * b2)) & 0xFFu];
+                        lov = (lov << 8) | (tt2 & 0xFFu);
+                        hiv = (hiv << 8) | (tt2 >> 8);
+                    }
+                    wvs[sbl][r][kk * 2] = lov;
+                    wvs[sbl][r][kk * 2 + 1] = hiv;
+                }
+            }
+        }
+        {
+            int u = tid;
+            for (int rep = 0; rep < 2 && u < 16*8; rep++, u += 256) {
+                int ti = u >> 3;
+                int sbl = u & 7;
+                int sb = k0 + sbl;
+                if (ti < t && sb < n_sub) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    #pragma unroll
+                    for (int kk = 0; kk < 8; kk++) ytile[ti][sbl][kk] = xt[xw + kk];
+                    ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
+                }
+            }
+        }
+        __syncthreads();
+        if (row < nrow) {
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {
+                int sbl = q4 + jj * 4;
+                int sb = k0 + sbl;
+                if (sb < n_sub) {
+                    #pragma unroll 4
+                    for (int ti = 0; ti < t; ti++) {
+                        int isum = 0;
+                        // wvs[2k]=lo(원소 k·4+j), wvs[2k+1]=hi(원소 16+k·4+j) —
+                        // hi는 y 워드 k+4와 페어
+                        isum = dot4(wvs[sbl][row][0], ytile[ti][sbl][0], isum);
+                        isum = dot4(wvs[sbl][row][2], ytile[ti][sbl][1], isum);
+                        isum = dot4(wvs[sbl][row][4], ytile[ti][sbl][2], isum);
+                        isum = dot4(wvs[sbl][row][6], ytile[ti][sbl][3], isum);
+                        isum = dot4(wvs[sbl][row][1], ytile[ti][sbl][4], isum);
+                        isum = dot4(wvs[sbl][row][3], ytile[ti][sbl][5], isum);
+                        isum = dot4(wvs[sbl][row][5], ytile[ti][sbl][6], isum);
+                        isum = dot4(wvs[sbl][row][7], ytile[ti][sbl][7], isum);
+                        psum[q4][row][ti] += ydt[ti][sbl] * dsc[sbl][row] * (float)isum;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row < nrow && q4 == 0) {
+        #pragma unroll 4
+        for (int ti = 0; ti < t; ti++)
+            out[(size_t)ti * n_out + i + row] = psum[0][row][ti] + psum[1][row][ti] + psum[2][row][ti] + psum[3][row][ti];
     }
 }
 
@@ -1712,7 +2172,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

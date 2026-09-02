@@ -311,12 +311,13 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let kern = match ty {
-            13 => "gemm_q5k_bt",
-            12 => "gemm_q4k_bt",
-            14 => "gemm_q6k_bt",
-            23 => "gemm_xs_bt",
+            13 => "gemm_q5k_mm",
+            12 => "gemm_q4k_mm",
+            14 => "gemm_q6k_mm",
+            23 => "gemm_xs_mm",
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
+
         let mut xp = xq as *mut std::ffi::c_void;
         let mut wp = w as *mut std::ffi::c_void;
         let mut op = out as *mut std::ffi::c_void;
@@ -337,9 +338,12 @@ impl RawCtx {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let gx = n_out.min(65535) as u32;
-        let gz = n_out.div_ceil(65535) as u32;
-        self.launch3(kern, gx, 1, gz, 64, &mut args)
+        let rows_per_block: usize = 64; // mm 타일
+        let nblocks = n_out.div_ceil(rows_per_block);
+        let gx = nblocks.min(65535) as u32;
+        let gz = nblocks.div_ceil(65535) as u32;
+        let block: u32 = 256;
+        self.launch3(kern, gx, 1, gz, block, &mut args)
     }
 
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
@@ -943,3 +947,108 @@ pub fn roof_test() -> Result<String, String> {
 }
 
 
+
+/// MMQ 포트 A/B — bt vs mm (각 미러).
+pub fn mm_bench() -> Result<String, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let w = model.w(&tname).ok_or("tensor 없음")?;
+    let ctx = RawCtx::new()?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let ktab2: Vec<u32> = (0..256u32).map(|b| {
+        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+        lo | (hi << 8)
+    }).collect();
+    let kt_d = ctx.alloc(1024)?;
+    ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let t = 16usize;
+    let mut q8s = Vec::new();
+    let mut xq_h: Vec<u32> = Vec::new();
+    for _ in 0..t {
+        let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+        let blocks = llm170_core::quant::quantize_row_q8_ref(&x);
+        for blk in &blocks {
+            for c in 0..8 {
+                let b = c * 4;
+                xq_h.push((blk.qs[b] as u32 & 0xFF) | ((blk.qs[b+1] as u32 & 0xFF) << 8) | ((blk.qs[b+2] as u32 & 0xFF) << 16) | ((blk.qs[b+3] as u32 & 0xFF) << 24));
+            }
+        }
+        for blk in &blocks { xq_h.push(blk.d.to_bits()); }
+        for blk in &blocks {
+            let s0: i32 = blk.qs[..16].iter().map(|&v| v as i32).sum();
+            let s1: i32 = blk.qs[16..].iter().map(|&v| v as i32).sum();
+            xq_h.push(s0 as u32);
+            xq_h.push(s1 as u32);
+        }
+        q8s.push(blocks);
+    }
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+    let xq = ctx.alloc(xq_h.len() * 4)?;
+    ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
+    let out = ctx.alloc(n_out * 4 * t)?;
+    let kern_name = match w.ty {
+        llm170_gguf::GgmlType::Q5K => "gemm_q5k_mm",
+        llm170_gguf::GgmlType::Q4K => "gemm_q4k_mm",
+        llm170_gguf::GgmlType::Q6K => "gemm_q6k_mm",
+        _ => "gemm_xs_mm",
+    };
+    let launch = |ctx: &RawCtx| -> Result<(), String> {
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut ktp = kt_d as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+        ];
+        if kern_name == "gemm_xs_mm" {
+            args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
+        }
+        args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
+        let gx = n_out.div_ceil(64).min(65535) as u32;
+        let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
+        ctx.launch3(kern_name, gx, 1, gz, 256, &mut args)
+    };
+    launch(&ctx)?;
+    ctx.sync()?;
+    let mut o2 = vec![0f32; n_out * t];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut o2).as_mut(), out)?;
+    let reps = 20;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps { launch(&ctx)?; }
+    ctx.sync()?;
+    let dt2 = t0.elapsed().as_secs_f64() / reps as f64;
+    let blck = w.ty.blck_size() as usize;
+    let bsize = w.ty.type_size() as usize;
+    let rb = (n_in / blck) * bsize;
+    let mut m2 = 0usize;
+    for ti in 0..t {
+        for oo in 0..n_out.min(256) {
+            let row = &w.data[oo * rb..];
+            let c2 = match w.ty {
+                llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_mm(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_mm(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
+                _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
+            };
+            if c2.to_bits() != o2[ti * n_out + oo].to_bits() { m2 += 1; }
+        }
+    }
+    Ok(format!("mm({kern_name}): {:.3}ms ({:.1}us/tok) mism {m2}", dt2 * 1e3, dt2 * 1e6 / t as f64))
+}

@@ -79,6 +79,10 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("mm-bench2") => match llm170_backend_gpu::rawhip::mm_bench() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("roof-test") => match llm170_backend_gpu::rawhip::roof_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
