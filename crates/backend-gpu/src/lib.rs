@@ -11,6 +11,7 @@ use cubecl::prelude::*;
 
 mod gemm2;
 mod attn;
+pub mod rawhip;
 mod ew;
 use cubecl::zspace::{Shape, Strides};
 use cubecl_runtime::server::Handle;

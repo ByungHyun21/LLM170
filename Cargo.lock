@@ -1805,6 +1805,7 @@ dependencies = [
  "cubecl-common",
  "cubecl-runtime",
  "hanzo-cubecl-hip",
+ "hanzo-cubecl-hip-sys",
  "llm170-core",
  "llm170-gguf",
  "llm170-profiler",

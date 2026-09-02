@@ -110,6 +110,19 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("gpu-raw-probe") => {
+            let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
+            match llm170_backend_gpu::rawhip::raw_probe(iters) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("gpu-smoke") => {
             let t = std::time::Instant::now();
             match llm170_backend_gpu::smoke_gemv(5120, 1024) {
