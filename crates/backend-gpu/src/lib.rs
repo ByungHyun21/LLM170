@@ -96,6 +96,14 @@ pub fn probe() -> Result<String, String> {
     Ok("hip device 0 ready".to_string())
 }
 
+/// 지정 스트림에서 클로저 실행 — 그 안의 커널 런치가 별도 hipStream로
+/// 향한다 (cubecl 0.10 멀티스트림, 스트림별 독립 메모리 풀). value는
+/// 스트림 식별자: 기본 스레드가 0, 충돌 회피 권장값 100+. 스트림 간
+/// 데이터 의존은 자동 추적되지 않는다(할당 커서만) — 호출자 책임.
+pub fn on_stream<T>(value: u64, f: impl FnOnce() -> T) -> T {
+    cubecl_common::stream_id::StreamId { value }.executes(f)
+}
+
 /// wgpu/Vulkan 디바이스 프로브.
 pub fn probe_vulkan() -> Result<String, String> {
     use cubecl::wgpu::{RuntimeOptions, Vulkan, WgpuDevice, WgpuRuntime, init_device, init_setup};

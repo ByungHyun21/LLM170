@@ -30,6 +30,8 @@ llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
   llm170 bench --model <file.gguf> [--pp N] [--tg N] [--reps N] [--ctx N]
               [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       llama-bench 규격 PP/TG 측정 (t/s). --spec: MTP 스펙 디코드 유효 t/s.
+  llm170 bench-streams <file.gguf> <tensor> [t] [max_n] [iters]
+      동시 스트림 GEMV 집계 대역폭 (n=1..max_n 스윕) — P2-a 관문 측정.
   llm170 help
 "#;
 
@@ -113,6 +115,7 @@ fn main() -> ExitCode {
             }
         }
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
+        Some("bench-streams") => cmd_bench_streams(&args[1..]),
         Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
         Some("gdn-chunk-check") => cmd_gdn_chunk_check(),
@@ -1317,6 +1320,171 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// llm170 bench-streams <file> <tensor> [t] [max_n] [iters] — 동시 스트림
+/// GEMV 집계 대역폭 (P2-a S0 관문). 스트림 i(값 100+i)에서 동일 GEMV를
+/// 독립 x/out 버퍼로 실행: 스트림 간 의존이 없어(가중치 읽기 공유 — 첫
+/// 접근 자동 동기화 후 무写) 배리어 없이 정확하다. n=1..max_n 스윕으로
+/// 배율 보고. 출력 일치(동일 입력 → 비트 동일)로 기계 정합도 검증.
+fn cmd_bench_streams(args: &[String]) -> ExitCode {
+    use llm170_core::matmul::Accelerator;
+    use std::sync::Arc;
+    if args.len() < 2 {
+        eprintln!("usage: llm170 bench-streams <file> <tensor> [t] [max_n] [iters]");
+        return ExitCode::from(2);
+    }
+    enum H {
+        Q35(Box<llm170_core::model::Model>),
+        Q4(Box<llm170_core::qwen4exp::Model4>),
+    }
+    let holder = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+        Ok(m) => H::Q35(Box::new(m)),
+        Err(e1) => match llm170_core::qwen4exp::Model4::load(std::path::Path::new(&args[0])) {
+            Ok(m) => H::Q4(Box::new(m)),
+            Err(e2) => {
+                eprintln!("error: q35 {e1} / q4 {e2}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let w = match &holder {
+        H::Q35(m) => m.w(&args[1]),
+        H::Q4(m) => m.w(&args[1]),
+    };
+    let Some(w) = w else {
+        eprintln!("tensor not found: {}", args[1]);
+        return ExitCode::FAILURE;
+    };
+    let t: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let max_n: usize = args
+        .get(3)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let iters: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(20);
+
+    let gpu: Arc<dyn Accelerator> = match llm170_backend_gpu::GpuMatmul::new_hip() {
+        Ok(g) => Arc::new(g),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let wbytes = w.data.len() as f64;
+    // 결정적 동일 입력 — 전 스트림 동일값 → 출력 비트 일치 검증 가능.
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+    };
+    let xrow: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let xdata: Vec<f32> = (0..t).flat_map(|_| xrow.iter().copied()).collect();
+
+    eprintln!(
+        "# bench-streams: {} [{}] n_in={n_in} n_out={n_out} 가중치 {:.1}MB t={t} iters={iters}",
+        args[1],
+        w.ty.name(),
+        wbytes / 1e6
+    );
+    // LLM170_ALT_TENSOR=<tensor>: 스트림 1+가 다른 가중치를 사용 — 동일
+    // 텐서 읽기 경합(같은 페이지/L2 라인)과 진짜 메모리 상한을 구분.
+    // 게이트+업 동시 실행(실제 FFN 포크 형상) 재현.
+    let alt = std::env::var("LLM170_ALT_TENSOR")
+        .ok()
+        .and_then(|name| match &holder {
+            H::Q35(m) => m.w(&name).map(|w| (w.data.len() as f64, w)),
+            H::Q4(m) => m.w(&name).map(|w| (w.data.len() as f64, w)),
+        });
+    if let Some((abytes, _)) = &alt {
+        eprintln!("# alt tensor: {:.1}MB (스트림 1+ 적용)", abytes / 1e6);
+    }
+    let wfor = |i: usize| -> (f64, llm170_core::matmul::Weight<'_>) {
+        match (&alt, i) {
+            (Some((abytes, aw)), 1..) => (*abytes, *aw),
+            _ => (wbytes, w),
+        }
+    };
+    let mut base_gbps = 0.0f64;
+    for n in 1..=max_n {
+        let mut bufs = Vec::with_capacity(n);
+        let total_bytes = |i: usize| iters as f64 * wfor(i).0;
+        for i in 0..n {
+            let (wb, wi) = wfor(i);
+            let n_out_i = wi.n_out as usize;
+            let x = gpu.frame_alloc(t * n_in).expect("frame_alloc");
+            gpu.frame_write(x, &xdata).expect("frame_write");
+            let o = gpu.frame_alloc(t * n_out_i).expect("frame_alloc");
+            bufs.push((x, o, wb, n_out_i));
+        }
+        // 웜업: 스트림별 1회 (가중치 업로드 + 첫 접근 자동 동기화) + 판독.
+        for (i, (x, o, _, n_out_i)) in bufs.iter().enumerate() {
+            llm170_backend_gpu::on_stream(100 + i as u64, || {
+                let (_, wi) = wfor(i);
+                let _ = gpu.frame_mm(*x, &wi, *o, t).expect("warmup mm");
+                let mut buf = vec![0.0f32; t * n_out_i];
+                let _ = gpu.frame_read(*o, &mut buf).expect("warmup read");
+            });
+        }
+        // 측정: 전 스트림 인큐(비동기) → 각 스트림 fence로 합류.
+        let t0 = std::time::Instant::now();
+        for (i, (x, o, _, _)) in bufs.iter().enumerate() {
+            llm170_backend_gpu::on_stream(100 + i as u64, || {
+                let (_, wi) = wfor(i);
+                for _ in 0..iters {
+                    let _ = gpu.frame_mm(*x, &wi, *o, t).expect("mm");
+                }
+            });
+        }
+        for i in 0..n {
+            let (_, o, _, n_out_i) = &bufs[i];
+            let mut last = vec![0.0f32; t * n_out_i];
+            llm170_backend_gpu::on_stream(100 + i as u64, || {
+                let _ = gpu.frame_read(*o, &mut last).expect("join read");
+            });
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        // 정합도: 동일 입력·가중치 → 스트림 0과 alt가 다른 가중치면 스킵.
+        let mut mismatch = false;
+        if alt.is_none() {
+            let mut refbits: Option<Vec<u32>> = None;
+            for (i, (_, o, _, n_out_i)) in bufs.iter().enumerate() {
+                let mut buf = vec![0.0f32; t * n_out_i];
+                llm170_backend_gpu::on_stream(100 + i as u64, || {
+                    let _ = gpu.frame_read(*o, &mut buf).expect("verify read");
+                });
+                let bits = buf.iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+                match &refbits {
+                    None => refbits = Some(bits),
+                    Some(r) if r == &bits => {}
+                    _ => mismatch = true,
+                }
+            }
+        }
+        let agg: f64 = (0..n).map(total_bytes).sum::<f64>() / dt;
+        if n == 1 {
+            base_gbps = agg;
+        }
+        eprintln!(
+            "n={n}: {:.1}ms → 집계 {:.0}GB/s (배율 {:.2}, 스트림당 {:.0}GB/s){}",
+            dt * 1000.0,
+            agg / 1e9,
+            agg / base_gbps.max(1.0),
+            agg / n as f64 / 1e9,
+            if mismatch { " ✗ 스트림 간 출력 불일치!" } else { "" }
+        );
+        for (x, o, _, _) in &bufs {
+            let _ = gpu.frame_free(*o);
+            let _ = gpu.frame_free(*x);
+        }
+    }
+    if max_n >= 1 {
+        eprintln!("# 판정: 배율 ≥1.2 → P2-a 진행 (S1 stream_barrier). ≈1.0 → 버스 상한, P4 전환.");
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_infer(args: &[String]) -> ExitCode {
