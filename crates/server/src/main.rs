@@ -108,6 +108,7 @@ fn main() -> ExitCode {
         Some("gpu-mm") => cmd_gpu_mm(&args[1..]),
         Some("gpu-ew-check") => cmd_gpu_ew_check(),
         Some("gdn-ar-check") => cmd_gdn_ar_check(),
+        Some("gdn-chunk-check") => cmd_gdn_chunk_check(),
         Some("bench") => return bench::cmd_bench(&args[1..]),
         Some("moe-down-check") => cmd_moe_down_check(),
         Some("check") => cmd_check(&args[1..]),

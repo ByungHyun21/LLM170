@@ -589,17 +589,45 @@ impl<R: Runtime> GpuMatmul<R> {
         let og = self.acquire_buf(outp.len() * 4)?;
         acc(&T_UP, t0.elapsed());
         let t1 = std::time::Instant::now();
+        let n_chunks = t_pad / gdn_kernel::CS_K;
+        let mat_len = h_v * n_chunks * gdn_kernel::CS_K * gdn_kernel::CS_K;
+        let ag = self.acquire_buf(mat_len * 4)?;
+        let kqg = self.acquire_buf(mat_len * 4)?;
+        // SAFETY: kkt 그리드 (CS²/64 큐브, h_v, n_chunks) — pair 가드 j≤i.
+        unsafe {
+            gdn_kernel::gdn_chunk_kkt::launch_unchecked(
+                &self.client,
+                CubeCount::Static(
+                    (gdn_kernel::CS_K * gdn_kernel::CS_K).div_ceil(64) as u32,
+                    h_v as u32,
+                    n_chunks as u32,
+                ),
+                CubeDim::new_1d(64),
+                TensorArg::from_raw_parts(qg.clone(), [1].into(), [qp.len()].into()),
+                TensorArg::from_raw_parts(kg.clone(), [1].into(), [kp.len()].into()),
+                TensorArg::from_raw_parts(bg.clone(), [1].into(), [bp.len()].into()),
+                TensorArg::from_raw_parts(gg.clone(), [1].into(), [gp.len()].into()),
+                TensorArg::from_raw_parts(ag.clone(), [1].into(), [mat_len].into()),
+                TensorArg::from_raw_parts(kqg.clone(), [1].into(), [mat_len].into()),
+                t_len,
+                h_k,
+                h_v,
+                d,
+            );
+        }
         // SAFETY: 그리드 (h_v,1,1) — 큐브당 헤드, 유닛 64가 dv 분담·가드.
         unsafe {
             gdn_kernel::gdn_chunk::launch_unchecked(
                 &self.client,
                 CubeCount::Static(h_v as u32, 1, 1),
                 CubeDim::new_1d(64),
-                TensorArg::from_raw_parts(qg, [1].into(), [qp.len()].into()),
-                TensorArg::from_raw_parts(kg, [1].into(), [kp.len()].into()),
                 TensorArg::from_raw_parts(vg, [1].into(), [vp.len()].into()),
+                TensorArg::from_raw_parts(kg, [1].into(), [kp.len()].into()),
+                TensorArg::from_raw_parts(qg, [1].into(), [qp.len()].into()),
                 TensorArg::from_raw_parts(bg, [1].into(), [bp.len()].into()),
                 TensorArg::from_raw_parts(gg, [1].into(), [gp.len()].into()),
+                TensorArg::from_raw_parts(ag.clone(), [1].into(), [mat_len].into()),
+                TensorArg::from_raw_parts(kqg.clone(), [1].into(), [mat_len].into()),
                 TensorArg::from_raw_parts(sg.clone(), [1].into(), [states.len()].into()),
                 TensorArg::from_raw_parts(og.clone(), [1].into(), [outp.len()].into()),
                 t_len,
@@ -608,6 +636,7 @@ impl<R: Runtime> GpuMatmul<R> {
                 d,
             );
         }
+        self.release_bufs(&[(ag, mat_len * 4), (kqg, mat_len * 4)]);
         acc(&T_LAUNCH, t1.elapsed());
         let t2 = std::time::Instant::now();
         let raw_s = self.client.read_one(sg.clone()).map_err(|e| e.to_string())?;
