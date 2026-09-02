@@ -627,7 +627,7 @@ impl Engine {
             || (self.raw_decode.is_some()
                 && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true))
         {
-            let use_batch = std::env::var_os("LLM170_RAWHIP").is_some()
+            let use_batch = std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
                 && std::env::var_os("LLM170_T1_PREFILL").is_none()
                 && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
             if use_batch {

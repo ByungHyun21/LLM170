@@ -34,8 +34,6 @@ impl RawCtx {
         unsafe {
             ck(hip::hipSetDevice(0), "hipSetDevice")?;
             let _ = hip::hipSetDeviceFlags(hip::hipDeviceScheduleSpin);
-            // 컨텍스트 유지 — AmdDevice는 hanzo의 경로와 공유
-            let _dev = hanzo_cubecl_hip::AmdDevice::new(0);
 
             let src = CString::new(kernels::SRC).unwrap();
             let mut prog: hip::hiprtcProgram = std::ptr::null_mut();

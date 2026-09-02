@@ -7,9 +7,5 @@ edition.workspace = true
 llm170-profiler = { path = "../profiler" }
 llm170-core = { path = "../core" }
 llm170-gguf = { path = "../gguf" }
-cubecl-runtime = "0.10.0"
-cubecl = { version = "0.10.0", features = ["wgpu"] }
-hanzo-cubecl-hip = "0.10.0"
 cubecl-hip-sys = { package = "hanzo-cubecl-hip-sys", version = "7.2" }
-cubecl-common = "0.10"
 bytemuck = "1"

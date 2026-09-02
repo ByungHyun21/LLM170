@@ -263,27 +263,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     if arch.as_deref() == Some("qwen4exp") {
         let m = load_q4_retry(&req.model);
         let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
-        match &backend {
-            BackendSel::GpuRuntime(rt) => {
-                let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
-                    if rt == "vulkan" {
-                        llm170_backend_gpu::GpuMatmul::new_vulkan()
-                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
-                    } else {
-                        llm170_backend_gpu::GpuMatmul::new_hip()
-                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
-                    };
-                if let Ok(acc) = acc {
-                    eng = eng.with_acc(acc);
-                }
-            }
-            BackendSel::Gpu => {
-                if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
-                    eng = eng.with_acc(Arc::new(acc));
-                }
-            }
-            BackendSel::Cpu => {}
-        }
+        let _ = &backend;
         Engine::Q4(eng)
     } else {
         let m = load_q35_retry(&req.model);
@@ -291,27 +271,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
             crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
         }
-        match &backend {
-            BackendSel::GpuRuntime(rt) => {
-                let acc: Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> =
-                    if rt == "vulkan" {
-                        llm170_backend_gpu::GpuMatmul::new_vulkan()
-                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
-                    } else {
-                        llm170_backend_gpu::GpuMatmul::new_hip()
-                            .map(|g| Arc::new(g) as std::sync::Arc<dyn llm170_core::matmul::Accelerator>)
-                    };
-                if let Ok(acc) = acc {
-                    eng = eng.with_acc(acc);
-                }
-            }
-            BackendSel::Gpu => {
-                if let Ok(acc) = llm170_backend_gpu::GpuMatmul::new_hip() {
-                    eng = eng.with_acc(Arc::new(acc));
-                }
-            }
-            BackendSel::Cpu => {}
-        }
+        let _ = &backend;
         Engine::Q35(eng)
     }
 }

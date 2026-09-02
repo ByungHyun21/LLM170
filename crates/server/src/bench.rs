@@ -97,19 +97,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             let m = llm170_core::qwen4exp::Model4::load(&model_path)
                 .map_err(|e| e.to_string())?;
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
-            if backend == "gpu" {
-                let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> =
-                    if gpu_runtime == "vulkan" {
-                        std::sync::Arc::new(
-                            llm170_backend_gpu::GpuMatmul::new_vulkan().map_err(|e| e.to_string())?,
-                        )
-                    } else {
-                        std::sync::Arc::new(
-                            llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?,
-                        )
-                    };
-                eng = eng.with_acc(acc);
-            }
+            let _ = (&backend, &gpu_runtime);
             let eos = eng.model.eos;
             // 워밍업 1회 (스크래치 풀·가속기 warm)
             {
@@ -155,19 +143,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
-            if backend == "gpu" {
-                let acc: std::sync::Arc<dyn llm170_core::matmul::Accelerator> =
-                    if gpu_runtime == "vulkan" {
-                        std::sync::Arc::new(
-                            llm170_backend_gpu::GpuMatmul::new_vulkan().map_err(|e| e.to_string())?,
-                        )
-                    } else {
-                        std::sync::Arc::new(
-                            llm170_backend_gpu::GpuMatmul::new_hip().map_err(|e| e.to_string())?,
-                        )
-                    };
-                eng = eng.with_acc(acc);
-            }
+            let _ = (&backend, &gpu_runtime);
             let has_mtp = eng.has_mtp();
             let spec_desc = if spec_k > 0 && has_mtp {
                 format!(" spec{spec_k}")

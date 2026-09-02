@@ -20,5 +20,3 @@ edition = "2024"
 # 바인딩을 무효화해 "Memory page N doesn't exist"·libamdhip64 GPF(0x3fc4f2)를
 # 유발. llm170은 해제 경로가 없어(ADR-0014) 스윕 이득 0 — no-op 패치.
 # 상류 수정 후 제거 예정. 상세: vendor/cubecl-runtime/.../memory_manage.rs.
-[patch.crates-io]
-cubecl-runtime = { path = "vendor/cubecl-runtime" }
