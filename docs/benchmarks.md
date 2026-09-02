@@ -39,8 +39,13 @@ optimization priority moves to quantized-GEMM batch throughput**
 | Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU backend) |
 |---|---|---|
 | Prefill pp, 2311 tok (single) | 178–237 t/s per slot (HIP 7.2.2; 2026-08-27) | **~3.3 t/s** (~699 s incl. load+decode; Vulkan, 2026-09-01 — token-exact 24/24) |
-| Decode tg, t=1 | 11.6–15.1 t/s (np2) | **~2.0–2.2 t/s** (0.46–0.51 s/step, 2026-09-01) |
-| PLE table | NVMe mmap + `-ot ...=CPU` (identical pattern) | NVMe mmap + `MADV_RANDOM` (same) |
+optimization priority moves to quantized-GEMM batch throughput**.
+Microbench matrix (ffn_gate, 512 rows): GFLOPS is FLAT ~4 across t in
+{1,16,64,256} — per-op time scales linearly with t, i.e. the k-lane
+(q2) kernel re-reads weights per token with zero batch amortization.
+Fix: token-block accumulation with weights held in registers/L1
+(extend the q3 token-tile design to prefill).
+(tiling/split-K note superseded by the amortization finding.)
 
 Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
 projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
