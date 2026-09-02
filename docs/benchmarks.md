@@ -43,12 +43,15 @@ Session progression (same binary lineage, gfx1151):
 - `de4` (block-invariant hoisting: one dequant of d/dmin/scales per
   4-element batch instead of per element): pp64 -> **13.04 t/s (5.8x
   cumulative)**, tg24 1.33 -> **2.63 t/s (2.0x)**.
-- rocprof engine trace: decode GEMV already streams at ~141 GB/s
-  (llama-level); the remaining tg gap is ~280 ms/token of host glue
-  (per-op readback + buffer acquire + launch marshalling). Next lever: a
-  device-resident decode frame for qwen35 — the qwen4exp frame pattern
-  ([decisions.md](decisions.md) ADR-0017); all qwen35 layer kernels already
-  exist on GPU (gdn_ar, conv, beta_g, norm_gated, qsa_mix/score per trace).
+- Per-type GEMV bandwidth (dedicated harness, t=1, 2026-09-02): q3_K
+  **18 GB/s**, iq4_xs **67**, q5_K **97**, q8_0 **94 — vs ~161 GB/s
+  effective for llama.cpp on the same APU. The earlier "141 GB/s,
+  llama-level" rocprof-derived figure was measurement error (queue-wait
+  inclusion); the per-type kernel bandwidth above reconciles exactly with
+  the 281 ms/token wall (GEMV ~207 ms by type mix + bridges + glue).
+  **Decode priority: GEMV kernel bandwidth per quant type** — q3_K
+  (`ffn_up`, 35% of wall) first. Concurrent-stream GEMV was measured and
+  rejected: aggregate saturates at the single-stream rate (1.00-1.13x).
 
 Measurement caution: a co-resident run (llama-server holding VRAM) measured
 tg 0.58 t/s — invalid per the non-coexistence rule (see Verification below),
