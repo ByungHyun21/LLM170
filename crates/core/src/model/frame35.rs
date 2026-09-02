@@ -36,6 +36,8 @@ pub struct Frame35 {
     xd_n: u64,
     xq_f: u64,
     xd_f: u64,
+    xq_g: u64, // n_in=6144 계열 (ggated·aout)
+    xd_g: u64,
     logits: u64,
     one: u64, // AxpyScaled용 1.0 스케일 버퍼
     // 어텐션 프레임 (P1) — q/k 프리페어·인터리브·KV 캐시·마스크
@@ -94,6 +96,8 @@ impl Frame35 {
             xd_n: a(n / 32)?,
             xq_f: a(n_ff / 4)?,
             xd_f: a(n_ff / 32)?,
+            xq_g: a(6144 / 4)?,
+            xd_g: a(6144 / 32)?,
             logits: a(eng.model.wchk("output.weight")?.n_out as usize)?,
             one: a(1)?,
             aq: a(hp.n_head * 2 * hp.head_dim)?,
@@ -261,9 +265,13 @@ impl Engine {
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         for il in 0..hp.n_layer {
-            // 1) pre-norm
+            // 1) pre-norm (+ W4A8 활성 양자화 — in_proj·FFN 공용)
             let w_norm = f.consts[&format!("blk.{il}.attn_norm")];
             op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: w_norm, out: f.xn, eps, n, w_reps: 1 })?;
+            let q8n = crate::matmul::w4a8_enabled();
+            if q8n {
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
+            }
 
             // 2) 층 본체 — GDN 프레임 / 어텐션 값 브리지
             if eng.model.is_recr(il) {
@@ -271,8 +279,15 @@ impl Engine {
                 let wgate = eng.model.wchk(&format!("blk.{il}.attn_gate.weight"))?;
                 let wb = eng.model.wchk(&format!("blk.{il}.ssm_beta.weight"))?;
                 let wa = eng.model.wchk(&format!("blk.{il}.ssm_alpha.weight"))?;
-                acc.frame_mm_group(f.xn, &[wqkv, wgate, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], 1)
-                    .map_err(ModelError::Accel)?;
+                if q8n && crate::matmul::w4a8_ty(wqkv.ty) && crate::matmul::w4a8_ty(wgate.ty) && crate::matmul::w4a8_ty(wb.ty) && crate::matmul::w4a8_ty(wa.ty) {
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wqkv, f.gqkv, n).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wgate, f.gz, n).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wb, f.gb, n).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wa, f.ga, n).map_err(ModelError::Accel)?;
+                } else {
+                    acc.frame_mm_group(f.xn, &[wqkv, wgate, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], 1)
+                        .map_err(ModelError::Accel)?;
+                }
                 // conv + ring
                 let cw = f.consts[&format!("blk.{il}.conv_w")];
                 op(acc.as_ref(), FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][recr_idx], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
@@ -296,7 +311,13 @@ impl Engine {
                 let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
                 op(acc.as_ref(), FrameOp::NormGatedSilu { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
                 let wout = eng.model.wchk(&format!("blk.{il}.ssm_out.weight"))?;
-                acc.frame_mm(f.ggated, &wout, f.gout, 1).map_err(ModelError::Accel)?;
+                let d_inner = hp.dt_rank * hp.d_state;
+                if q8n && crate::matmul::w4a8_ty(wout.ty) {
+                    acc.frame_quant_q8(f.ggated, f.xq_g, f.xd_g, d_inner).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wout, f.gout, d_inner).map_err(ModelError::Accel)?;
+                } else {
+                    acc.frame_mm(f.ggated, &wout, f.gout, 1).map_err(ModelError::Accel)?;
+                }
                 recr_idx += 1;
             } else {
                 // 어텐션 프레임 (P1): q/k/v mm → 프리페어(rms·rope·인터리브·
@@ -316,8 +337,14 @@ impl Engine {
                 let wq = eng.model.wchk(&format!("blk.{il}.attn_q.weight"))?;
                 let wk = eng.model.wchk(&format!("blk.{il}.attn_k.weight"))?;
                 let wv = eng.model.wchk(&format!("blk.{il}.attn_v.weight"))?;
-                acc.frame_mm_group(f.xn, &[wq, wk, wv], &[f.aq, f.ak, f.av], 1)
-                    .map_err(ModelError::Accel)?;
+                if q8n && crate::matmul::w4a8_ty(wq.ty) && crate::matmul::w4a8_ty(wk.ty) && crate::matmul::w4a8_ty(wv.ty) {
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wq, f.aq, n).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wk, f.ak, n).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wv, f.av, n).map_err(ModelError::Accel)?;
+                } else {
+                    acc.frame_mm_group(f.xn, &[wq, wk, wv], &[f.aq, f.ak, f.av], 1)
+                        .map_err(ModelError::Accel)?;
+                }
                 // rms·rope는 CPU — GPU 코드젠의 FMA 수축이 CPU strict FP와
                 // 1-ulp 어긋나 토큰을 갈라놓음 (2026-09-02 P1 RCA).
                 // q/k/v mm·attention·wo만 GPU: 층당 왕복 4회.
@@ -360,7 +387,13 @@ impl Engine {
                 fs2.frame_qsa_attention(f.aqrow, f.kv_k[seq][full_idx], f.kv_v[seq][full_idx], f.mask, f.aout, eng.model.hp.kq_scale(), pos + 1, n_head, n_kv, hd, 1)
                     .map_err(ModelError::Accel)?;
                 let wo = eng.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
-                acc.frame_mm(f.aout, &wo, f.gout, 1).map_err(ModelError::Accel)?;
+                if q8n && crate::matmul::w4a8_ty(wo.ty) {
+                    let alen = hp.n_head * hp.head_dim;
+                    acc.frame_quant_q8(f.aout, f.xq_g, f.xd_g, alen).map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wo, f.gout, alen).map_err(ModelError::Accel)?;
+                } else {
+                    acc.frame_mm(f.aout, &wo, f.gout, 1).map_err(ModelError::Accel)?;
+                }
                 full_idx += 1;
             }
             // 3) 잔차 가산: xs += gout·1.0
