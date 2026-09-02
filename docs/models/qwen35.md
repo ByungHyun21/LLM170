@@ -62,10 +62,15 @@ acceptance 0.47–0.85.
 - GDN fused single op (snapshot packing) + chunked path
   (solve_tri/cumsum/tri) in parallel — see the kernel list in
   [architecture.md](../architecture.md).
+- **MTP chain speculative decoding implemented** (`llm170 infer --spec k`,
+  k <= 8; `bench --spec k` reports effective t/s): target forward + k-draft
+  chain with greedy acceptance. Ignored (with a notice) when the GGUF has
+  no nextn tensors.
 - KV exists for only 16 layers — the reference case for hybrid per-layer cache
   typing.
 - Local operating baseline: Q4+MTP tg 15.5–24.4 t/s, pp 283–556 t/s (llama.cpp,
-  np4×262K, 2026-08-18) — for relative comparison.
+  np4×262K, 2026-08-18) — for relative comparison; the designated primary
+  target is the ROCm 10 table in [benchmarks.md](../benchmarks.md).
 
 ## Measured (2026-08-30, `llm170 gguf-dump` — UD-Q4_K_XL)
 

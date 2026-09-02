@@ -1,93 +1,106 @@
 # Performance Comparison vs llama.cpp
 
 Conditions always quoted (context / batch / quantization / backend). All
-numbers on the dev machine (Radeon 8060S, ROCm 7.2.2, 32-thread CPU) unless
+numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
-## qwen35 (Qwen3.8-27B, UD-Q4_K_XL)
+## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
-| Metric | llama.cpp | LLM170 (GPU backend) | Ratio |
+llama.cpp, Q4_K_XL (27B), non-MTP, flash attention on, f16 KV, temp 0,
+streaming-server bench (median), ROCm 10.0.0 userspace:
+
+| Prompt | pp (t/s) | tg (t/s) |
+|---|---|---|
+| 418 tok | 142.8 | 10.4 |
+| 3314 tok | 229.9 | 11.6 |
+| 6337 tok | 315.4 | 11.1 |
+| 13569 tok | 297.7 | 10.6 |
+
+Both PP and TG against this table are the first performance goal.
+
+## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
+
+Current standing (GPU backend, single-tenant `llm170 bench`, 2026-09-02):
+
+| Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg, t=1 | 10.7–11.8 t/s (server bench, 2026-08-18) | **~1.3 t/s** (0.77 s/step; 2026-08-31) | 0.11× |
-| Prefill pp, ~2400 tok | 310–345 t/s | **~5.3 t/s** (437 s wall incl. load; q2 kernel + CPU GDN/attn) | 0.017× |
+| Decode tg24, t=1 | 10.4 t/s | **2.63 t/s** | 0.25x |
+| Prefill pp64 | 142.8 t/s (418-tok case) | **13.04 t/s** | 0.09x |
 
-llama.cpp conditions: `llama-server -ngl all`, f32 KV, GPU kernels for every
-op. LLM170 conditions: matmul projections on GPU (all quant types), GDN
-recurrence + attention + norms still on CPU per layer, host round-trip per
-matmul group.
+Session progression (same binary lineage, gfx1151):
 
-2026-09-02 update (`llm170 bench`, single-tenant, ROCm 7.2.2-linked
-binary): pp64 **2.12 t/s**, tg24 **1.32 t/s**. Co-resident measurement
-(llama-server holding VRAM) gave tg 0.58 t/s — invalid per the
-non-coexistence rule, quoted only as a caution. PP bottleneck: GDN chunk
-path (sequential per-head forward substitution at real dims — first
-real-dim run took >12 min for pp512 before being killed). TG bottleneck:
-value-path host roundtrips. First performance target: the ROCm 10 llama
-table in AGENTS.md (pp 142.8–315.4 t/s, tg 10.4–11.6 t/s).
+- First cut: pp64 **2.12 t/s**, tg24 **1.32 t/s**.
+- GDN chunk `kkt` precompute kernel (2-stage solve): GDN-chunk-on-GPU
+  measures identical to GDN-chunk-on-CPU at pp64 — chunked GDN is **not**
+  the prefill bottleneck.
+- `gpu-mm` microbench on `ffn_gate` (t=64): ~4.8 GFLOPS vs ~1400 GFLOPS
+  llama estimate; GFLOPS is flat ~4 across t in {1,16,64,256} — the k-lane
+  kernel re-reads weights per token with zero batch amortization.
+  **Prefill priority moved to quantized-GEMM batch throughput.**
+- `gemm_q7` (16-token blocks, unrolled register accumulators):
+  pp64 2.25 -> **6.49 t/s (2.9x)**.
+- `de4` (block-invariant hoisting: one dequant of d/dmin/scales per
+  4-element batch instead of per element): pp64 -> **13.04 t/s (5.8x
+  cumulative)**, tg24 1.33 -> **2.63 t/s (2.0x)**.
+- rocprof engine trace: decode GEMV already streams at ~141 GB/s
+  (llama-level); the remaining tg gap is ~280 ms/token of host glue
+  (per-op readback + buffer acquire + launch marshalling). Next lever: a
+  device-resident decode frame for qwen35 — the qwen4exp frame pattern
+  ([decisions.md](decisions.md) ADR-0017); all qwen35 layer kernels already
+  exist on GPU (gdn_ar, conv, beta_g, norm_gated, qsa_mix/score per trace).
 
-Follow-up (same day, kkt kernel landed): GDN chunk GPU vs CPU
-(`LLM170_GDN_CPU=1`) measure identically on pp64 — the chunk is NOT
-the prefill bottleneck. `gpu-mm` on ffn_gate (t=64) measures ~4.8
-GFLOPS on that shape vs llama's ~1400 GFLOPS estimate (~300x on the
-microbenchmark, ~15x engine-wide at ~97 GFLOPS average). **Prefill
-optimization priority moves to quantized-GEMM batch throughput**
-(tiling/split-K/vectorization for t=64 shapes).
+Measurement caution: a co-resident run (llama-server holding VRAM) measured
+tg 0.58 t/s — invalid per the non-coexistence rule (see Verification below),
+quoted only as a warning.
 
-## qwen4exp (Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split)
+## qwen4exp — Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split
 
-| Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU backend) |
+| Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU) |
 |---|---|---|
 | Prefill pp, 2311 tok (single) | 178–237 t/s per slot (HIP 7.2.2; 2026-08-27) | **~3.3 t/s** (~699 s incl. load+decode; Vulkan, 2026-09-01 — token-exact 24/24) |
-optimization priority moves to quantized-GEMM batch throughput**.
-Microbench matrix (ffn_gate, 512 rows): GFLOPS is FLAT ~4 across t in
-{1,16,64,256} — per-op time scales linearly with t, i.e. the k-lane
-(q2) kernel re-reads weights per token with zero batch amortization.
-Fix: token-block accumulation with weights held in registers/L1
-(extend the q3 token-tile design to prefill).
+| Decode tg16, real model | 11.6–15.1 t/s per slot (HIP 7.2.2) | value path **0.43 t/s** -> frame **2.87 t/s** (2026-09-02, 6.7x) |
 
-Landed same day: gemm_q7 (16-token blocks, unrolled register
-accumulators) + de4 (block-invariant hoisting: one dequant of
-d/dmin/scales per 4-element batch instead of per element). Real-model
-results: **pp64 2.25 -> 13.04 t/s (5.8x), tg24 1.33 -> 2.63 t/s
-(2.0x)** vs llama 143/10.4 targets. Engine-trace (rocprof) analysis:
-decode GEMV already streams at 141 GB/s (llama-level); the remaining
-tg gap is ~280 ms/token of host glue (per-op readback + buffer
-acquire + launch marshalling) — next lever is a device-resident
-decode frame for qwen35 (the qwen4exp frame.rs pattern).
+Decode-frame follow-up (2026-09-02): with the GPU-resident frame verified
+bit-exact on the synthetic e2e (frame == non-frame == CPU), the real model
+went tg16 0.43 -> 2.87 t/s and pp32 5.23 -> 6.01. The frame is now
+**default on** (`LLM170_FRAME=0` disables): the default path, no env vars,
+re-measured tg16 2.85 t/s / pp32 6.37. Same kernels as the value path,
+chained by handle — the host-glue-elimination thesis confirmed empirically.
+Remaining qwen4exp gap: the PLE gather and QSA dense attention still cross
+to values each step (not yet framed).
 
-qwen4exp frame follow-up (LLM170_FRAME=1, bit-exact on tiny4 — GPU
-frame == GPU non-frame == CPU): real model tg16 **0.43 -> 2.87 t/s
-(6.7x)**, pp32 5.23 -> 6.01. Host-glue-elimination thesis confirmed
-empirically: same kernels, chained handles. Remaining qwen4exp gap:
-PLE/QSA value bridges (not yet framed). qwen35 has no frame yet —
-same pattern extends (all layer kernels already on GPU per rocprof
-trace: gdn_ar, conv, beta_g, norm_gated, qsa_mix/score).
+Per-step decode breakdown before the frame (value path, `LLM170_Q4_TIME`,
+2026-09-01, after same-input projection grouping): MoE ~190 ms (was ~690 —
+expert gate/up grouped into one call, down as a paired batch), GDN ~126 ms
+(CPU recurrence; the GPU AR kernel landed after), HC ~55 ms, QSA ~18 ms.
+Host round-trips dropped from ~1,680/step to ~600/step; the frame takes
+that to ~14.
 
-ROCm 10 runtime comparison (same kernels, isolated target dir):
-qwen35 pp64 13.18 / tg24 2.52; qwen4exp (frame) pp32 5.93 / tg16
-2.32 — all within run-to-run noise of the ROCm 7.2.2 numbers above.
-The runtime version is not a factor in the current gap; remaining
-levers are architectural (frame coverage, kernel throughput).
+Runtime attribution note (corrected 2026-09-01): the qwen4exp infer path
+previously hardcoded the HIP runtime, so earlier "Vulkan" attributions were
+wrong; measurements after the fix are runtime-correct. The intermittent
+`Memory page N doesn't exist` fault was root-caused to a cubecl-runtime
+memory-sweep defect (page reindexing invalidating live handles) and patched
+locally — [decisions.md](decisions.md) ADR-0016.
 
-Decode step breakdown (`LLM170_Q4_TIME`, 2026-09-01, after same-input
-projection grouping): MoE ~190 ms (was ~690 — expert gate·up grouped to one
-call, down as paired batch), GDN ~126 ms (CPU recurrence — GPU kernel is the
-next item), HC ~55 ms, QSA ~18 ms. Round-trip inventory dropped from
-~1,680/step to ~600/step; eliminating per-call sync entirely (persistent
-device activations + single end-of-forward sync) is the structural next step.
+## Verification status
 
-Known remaining CPU-serial sections in the GPU path: GDN recurrence (chunked
-prefill + AR decode), QSA indexer scores (O(p²) over context), HC residual
-math. Note (corrected 2026-09-01): the qwen4exp infer path previously
-hardcoded the HIP runtime, so earlier "Vulkan" attributions were wrong; the
-intermittent "Memory page 0 doesn't exist" fault is runtime-attribution
-pending, with true-Vulkan long runs queued after the fix.
+Method: greedy token-stream comparison against llama.cpp under the
+near-tie standard (ADR-0012), run **non-coexisting** — the reference server
+collects the stream first, then stops, then this engine runs alone (both
+servers resident would contend for the same VRAM on this UMA machine).
 
-## Verification status (same binaries as the numbers above)
-
-- qwen4exp matrix (Vulkan): single_ko exact 24/24; single_short/code near-tie
-  (gap 0.01/0.12 nat); long 2311-tok and long2 1904-tok **exact 24/24 each**.
-- qwen35: GPU server↔CLI self-consistent matrix 7/7 exact (2026-08-31 binary);
-  full matrix re-run pending local filesystem recovery (transient ENOENT
-  windows on the model volume, unrelated to the engine).
+- qwen35: 11/11 matrix (6 exact + 5 near-tie) on the CPU reference engine
+  (2026-09-02). GPU server <-> CLI self-consistency 7/7 exact (2026-08-31
+  binary). Two-phase GPU-backend verification (baseline collect, then
+  offline judge) is queued; the qwen35 GPU numbers above are `llm170 bench`
+  measurements, not verify.py.
+- qwen4exp (Vulkan, real model): single_ko exact 24/24; single_short /
+  long_gen48 near-tie (gap 0.01 nat); single_code near-tie (0.12); np2
+  state isolation 25/25 x2. Long single (2,311 tok) and long2 (1,904 tok)
+  exact 24/24 each (immediately preceding binary); long+np2 pending
+  device-memory headroom (Vulkan places weights in host GTT on this iGPU).
+- Synthetic tiny4 (`scripts/make_tiny4.py`) — model-volume-independent e2e:
+  CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2
+  (every combination; the frame path is hash-identical to the value path).

@@ -1,8 +1,9 @@
 # Architecture
 
-Design under the **pure Rust** principle. Status: policies fixed; GPU matmul path
-implemented and verified on both HIP/ROCm and Vulkan (see [decisions.md](decisions.md)
-ADR-0009/0011).
+Design under the **pure Rust** principle. Status: policies fixed; GPU backend
+implemented and verified on both HIP/ROCm and Vulkan — quantized GEMM, GDN
+AR/chunked, grouped MoE, element-wise kernels, and a GPU-resident decode
+frame for qwen4exp (see [decisions.md](decisions.md) ADR-0009/0011/0017).
 
 ## Data Flow
 
@@ -18,14 +19,19 @@ flowchart LR
     P[profiler] -.->|debug instrumentation| C
 ```
 
-Current implementation: the engine core (`crates/core`) runs the qwen35 graph on
-CPU with a runtime-injectable `Accelerator`. `llm170 infer --backend gpu`
+Current implementation: the engine core (`crates/core`) runs both model
+graphs with a runtime-injectable `Accelerator`. `llm170 infer --backend gpu`
 offloads every weight projection (GDN qkv/gate/beta/alpha/out, attention
 q/k/v/wo, FFN gate/up/down, output head) to quantized GEMM kernels in
-`crates/backend-gpu`; weights are uploaded once and stay resident on the device.
-Element-wise ops (norms, conv, GDN scan, attention scores) still run on CPU —
-GPU-resident forward is the next milestone. `--gpu-runtime vulkan` selects a
-wgpu/Vulkan client; the same kernel source compiles for both runtimes.
+`crates/backend-gpu`; weights are uploaded once and stay resident on the
+device. The element-wise kernel set (`backend-gpu/src/ew.rs` — norms with
+f64 sequential accumulation, activations, RoPE, top-k routing, GDN
+conv/beta/softplus), the GDN AR decode kernel and the single-launch chunked
+GDN prefill kernel, grouped MoE GEMM (prefill and batched down-projection),
+and attention score/softmax/mix now also run on GPU. `--gpu-runtime vulkan`
+selects a wgpu/Vulkan client; the same kernel source compiles for both
+runtimes. Remaining per-step host crossings in the frame: the PLE gather
+(host-side hash) and QSA attention (value bridge — cache upload + readback).
 
 qwen4exp is structured as stage modules (`core/src/qwen4exp/stages/`):
 `hc`, `gdn`, `qsa`, `moe`, `ple` are free functions over
@@ -40,6 +46,19 @@ by frees). `llm170 check` runs the three-stage verification path
 (tensor scan, GPU-vs-CPU GEMM at t in {1, 64, 1024}, long-chunk smoke)
 in debug or release builds.
 
+Decode residency: qwen4exp decodes through a GPU-resident **frame**
+(`core/src/qwen4exp/frame.rs`, default on — ADR-0017): activations live in
+device buffers for the whole step, kernels chain by handle (hc → GDN → MoE →
+head), per-sequence handle sets support parallel decode, and the PLE hash
+(host) plus QSA attention (value bridge) are the only per-step crossings
+(~14 syncs/step, down from ~600). If residency cannot be established (small
+device regions), the engine permanently falls back to the per-op value path.
+
+The HTTP server (`llm170 serve`) runs a llama.cpp-style slot scheduler:
+decode-first budgeting, prefill in 1,024-token chunks in the remaining
+budget, slots returned on completion, and client disconnects (SSE flush
+failure) cancel the job.
+
 ## Mode System
 
 `universal` / `cmp-stock` / `cmp-unlocked` — see [overview.md](overview.md).
@@ -49,9 +68,12 @@ in debug or release builds.
   Mode-dependent code is confined to kernel selection and the memory planner.
 - Implemented (2026-09-01): `core/src/mode.rs` + `infer|serve --mode` sets
   the weight-residency and prefill-chunk defaults (`LLM170_W_CAP_GB`,
-  `LLM170_Q4_CHUNK`); explicit env values win. Kernel variants are the
-  remaining half — `Mode` is the branch key when the cmp-stock kernel set
-  lands.
+  `LLM170_Q4_CHUNK`); explicit env values win. Update (2026-09-02): when the
+  qwen4exp decode frame is active (its default), the mode's W_CAP preset is
+  skipped so the weight store derives its budget from the measured device
+  region (the frame needs the full expert stacks resident). Kernel variants
+  are the remaining half — `Mode` is the branch key when the cmp-stock
+  kernel set lands.
 
 ## Backend Strategy
 
@@ -89,13 +111,13 @@ Rust is strict FP by default (no implicit FMA contraction). Therefore:
   CPU and GPU greedy streams agree token-for-token.
 
 ## Required Kernel Surface (both models)
-
 `gated_delta_net` (fused AR + chunked), `ssm_conv`, `solve_tri`/`cumsum`/`tri`
 (chunked GDN), `l2_norm`, `top_k` (QSA/MoE), `argsort_top_k` (MoE routing),
-`mul_mat_id` (expert GEMM), IMROPE (sections [11,11,10,0]), K-quant dequant GEMM
-(Q4_K/Q5_K/Q6_K/Q3_K/Q8_0/IQ4_XS/IQ4_NL/IQ3_S — implemented in
-`crates/backend-gpu` for decode-shaped batches), `get_rows` (PLE 20M-row table,
-offloaded). PLE hashing (host u64) ports directly to CPU Rust.
+`mul_mat_id` (expert GEMM), IMROPE (sections [11,11,10,0]), K-quant dequant
+GEMM (Q4_K/Q5_K/Q6_K/Q3_K/Q8_0/IQ4_XS/IQ4_NL/IQ3_S — implemented in
+`crates/backend-gpu`: decode-shaped k-lane/token-tile variants plus
+token-block batched prefill), `get_rows` (PLE 20M-row table, offloaded).
+PLE hashing (host u64) ports directly to CPU Rust.
 The rest are standard element-wise ops (mul/silu/rms_norm/softmax/...).
 Details: [source/research §3](../source/research/2026-08-30-qwen35-qwen4exp-arch.md).
 
@@ -113,8 +135,12 @@ Details: [source/research §3](../source/research/2026-08-30-qwen35-qwen4exp-arc
 2. ~~CPU backend + full qwen35 inference (incl. quantized dequant) — token
    parity with llama.cpp~~ done (verification matrix in `scripts/verify.py`).
 3. ~~Profiler v1~~ done.
-4. qwen4exp (HC/QSA/PLE/MoE) CPU path — PLE NVMe offload mandatory.
-5. GPU backend: quantized GEMM resident (done, HIP + Vulkan) → GDN AR/chunked +
-   attention kernels → full GPU-resident forward → prefill throughput.
+4. ~~qwen4exp (HC/QSA/PLE/MoE) CPU path — PLE NVMe offload mandatory~~ done
+   (long-prompt matrix token-exact, incl. parallel sequences).
+5. GPU backend: ~~quantized GEMM resident (HIP + Vulkan)~~ done → ~~GDN
+   AR/chunked + attention + MoE + element-wise kernels~~ done → full
+   GPU-resident forward (qwen4exp decode frame done and default-on; qwen35
+   frame + PLE/QSA frame bridges remain) → prefill throughput (batched GEMM
+   landed 2026-09-02; see [benchmarks.md](benchmarks.md)).
 6. On CMP arrival: unlock/throttle measurements → `cmp-unlocked` kernel
    variants.

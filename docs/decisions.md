@@ -171,7 +171,8 @@ machine the long-prompt working set measured 45.7 GiB. Verification:
 Known open issue: the HIP runtime still faults on multi-chunk (>=2,048-token)
 prefill through the cubecl-HIP memory manager — the engine code is identical
 across runtimes, so this is tracked as a runtime-layer defect (dev-machine
-long verification runs on Vulkan).
+long verification runs on Vulkan). **Update (2026-09-01)**: root cause found
+and patched locally — ADR-0016.
 
 ## ADR-0015 — Engine stage modules over a shared context (2026-09-01)
 
@@ -194,3 +195,45 @@ kernel variants.
 and independently testable. Numerics unchanged (pure code motion):
 GPU↔CPU 25/25 token-exact, 1,024-token chunk smoke clean, single_ko
 reference-exact 24/24, cargo suite 10/10.
+
+## ADR-0016 — Local cubecl-runtime vendor patch: memory sweep disabled (2026-09-01)
+
+**Context**: even after ADR-0014 removed every free path, intermittent
+`Memory page N doesn't exist` faults and libamdhip64 access violations at
+fixed instruction pointers kept firing on allocation-heavy runs. Root cause
+(measured): cubecl-runtime's exclusive-pool `cleanup` drains its free pages,
+deallocates them, and rewrites the surviving page indices (`update_page`).
+A single dealloc shifts every later page, invalidating (a) descriptors still
+held by live handles, (b) bindings of in-flight launches — which kills the
+HIP runtime. The runtime's own error flush then calls `cleanup` again,
+compounding the damage.
+
+**Decision**: a vendored copy of cubecl-runtime under `vendor/` wired in via
+`[patch.crates-io]` turns `MemoryManagement::cleanup` into a no-op. The
+engine never frees GPU memory (ADR-0014), so the sweep can only lose.
+
+**Consequences**: page indices stay stable for the process lifetime; the
+fault class disappeared. The patch is temporary — remove it once upstream
+fixes the page reindexing. No engine code depends on it.
+
+## ADR-0017 — GPU-resident decode frame, default on for qwen4exp (2026-09-02)
+
+**Context**: per-token decode spent ~600 host round-trips per step (per-op
+readback, buffer acquire, launch marshalling). rocprof showed the GEMV
+kernels already streaming at llama-level bandwidth (~141 GB/s) while
+~280 ms/token was host glue.
+
+**Decision**: `Frame4` (`core/src/qwen4exp/frame.rs`) keeps activations
+device-resident for a whole decode step and chains kernels by handle —
+hc, GDN AR, MoE, and the output head run framed; PLE stays a host-hash
+bridge and QSA a value bridge (~14 syncs/step total). Per-sequence handle
+sets support parallel decode. `main` defaults `LLM170_FRAME=1`
+(`LLM170_FRAME=0` disables); with framing active the mode W_CAP preset is
+skipped so the weight store can place the full expert stacks (~88 GiB) on
+large carve-outs; on smaller regions the first frame error permanently
+falls back to the value path (one-shot retry, notice on stderr).
+
+**Verification**: synthetic tiny4 e2e GPU == CPU, hash-identical to the
+non-frame path; real model tg16 0.43 -> 2.87 t/s (6.7x) — see
+[benchmarks.md](benchmarks.md). qwen35 has no frame yet; the same pattern
+extends (all its layer kernels already exist on GPU).

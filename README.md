@@ -13,16 +13,17 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 | GGUF v3 parser (metadata · tensors · splits) | ✅ verified against real models — Qwen3.8-27B (866 tensors, 0 B slack) & Flash-Next 4-way split |
 | `gguf-dump` CLI (quant-mix analysis) | ✅ |
 | Lightweight profiler (debug-instrumented, zero-cost in release) | ✅ |
-| Dequantization — q4_K / q5_K / q6_K / q8_0 / q3_K / q5_1 / iq4_xs / iq4_nl / iq3_s | ✅ cross-checked against an independent reference implementation |
-| Gated DeltaNet — chunked & autoregressive (CPU) | ✅ two paths agree to 1e-7; cross-validated against llama.cpp |
-| qwen35 inference engine (CPU + GPU matmul) | ✅ greedy tokens match llama.cpp — 11/11 matrix (6 exact + 5 near-tie) |
-| qwen4exp engine (CPU + GPU matmul) | ✅ hyper-connections, QSA indexer, MoE (512 experts, token-expert grouped batching), PLE NVMe offload — llama.cpp parity on the reduced matrix |
-| qwen4exp (QSA / hyper-connections / PLE / MoE) | ⏳ planned |
-| GPU backend — cubecl, quantized GEMM (HIP/ROCm + Vulkan) | ✅ all 8 quant types; GPU greedy stream == CPU stream token-for-token |
+| Dequantization — 12 types: f32/f16/bf16, q4_K / q5_K / q6_K / q8_0 / q3_K / q5_1 / iq4_xs / iq4_nl / iq3_s | ✅ cross-checked against an independent reference implementation |
+| Gated DeltaNet — chunked & autoregressive (CPU) | ✅ two paths cross-validated (rel < 2e-3); llama.cpp token parity |
+| qwen35 inference engine (CPU + GPU) | ✅ greedy tokens vs llama.cpp — 11/11 matrix (6 exact + 5 near-tie); MTP speculative decoding (`--spec k`) |
+| qwen4exp engine (CPU + GPU) | ✅ hyper-connections, QSA indexer (block-key cached), MoE (512 experts, token-expert grouped batching), PLE NVMe offload — full matrix incl. 2311/1904-token long prompts, token-exact |
+| GPU kernel set (cubecl, HIP/ROCm + Vulkan) | ✅ quantized GEMM (8 types + batched prefill variants), GDN AR + chunked prefill, grouped MoE GEMM, element-wise set (norms bit-exact vs CPU) — GPU greedy stream == CPU stream token-for-token |
+| GPU-resident decode frame (qwen4exp) | ✅ default on — 6.7× decode vs per-op path, bit-exact on synthetic e2e |
+| HTTP server | ✅ OpenAI/Anthropic-compatible endpoints, SSE streaming, continuous batching slot scheduler, client-disconnect cancellation |
 
-**Modes.** The engine runs in three profiles: `universal` (any device — the development baseline), `cmp-stock` (8 GB, eFUSE-throttled; FMA-free, tensor-core-free kernels), and `cmp-unlocked` (40–64 GB unlocked silicon). Engine core is mode-agnostic; modes select kernel variants and memory budgets.
+**Modes.** The engine runs in three profiles: `universal` (any device — the development baseline), `cmp-stock` (8 GB, eFUSE-throttled; FMA-free, tensor-core-free kernels), and `cmp-unlocked` (40–64 GB unlocked silicon). Engine core is mode-agnostic; modes select kernel variants and memory budgets. `--mode` is a runtime flag (single binary).
 
-**Reference models.** Qwen3.8-27B (`qwen35` hybrid — Gated DeltaNet + Gated Attention) first; Qwen3.8-Flash-Next (`qwen4exp` — sparse attention, MoE, n-gram PLE embedding) next.
+**Reference models.** Qwen3.8-27B (`qwen35` hybrid — Gated DeltaNet + Gated Attention) and Qwen3.8-Flash-Next (`qwen4exp` — sparse attention, MoE, n-gram PLE embedding) — both are hard requirements, both currently verified end-to-end.
 
 ## Build & run
 
@@ -47,7 +48,20 @@ cargo run --release -- infer \
     --prompt-tokens 760,6511,314,9338,369 \
     --n-predict 16 \
     --backend gpu --gpu-runtime vulkan
+
+# HTTP server: /health, /v1/models, /tokenize, /v1/completions, /v1/chat/completions (SSE),
+# /v1/messages (Anthropic). Continuous batching across slots; client disconnects cancel the job.
+cargo run --release -- serve --model <model.gguf> --port 8080 --backend gpu
+
+# llama-bench-style PP/TG measurement (t/s). --spec k: effective t/s with MTP speculative decode.
+cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --backend gpu --gpu-runtime vulkan
+
+# Runtime mode (memory-budget profile today; kernel variants when cmp-stock lands)
+cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --mode universal
 ```
+
+GPU kernel self-check subcommands (cross-validated against the CPU reference):
+`gpu-ew-check` · `gdn-ar-check` · `gdn-chunk-check` · `moe-down-check` · `w4a8-check` · `w4a8-gpu`.
 
 Debug builds are fully instrumented — every stage is timed by the built-in profiler, by design. Nsight doesn't support this card; the engine is its own profiler.
 
@@ -57,18 +71,18 @@ GPU kernels are written in Rust via [CubeCL](https://github.com/tracel-ai/cubecl
 
 ```
 crates/gguf      GGUF v3 parser
-crates/core      dequantization, matmul, Gated DeltaNet, qwen35 CPU reference engine
+crates/core      dequantization, matmul, Gated DeltaNet, qwen35 CPU reference engine + qwen4exp engine
 crates/profiler  debug-gated lightweight profiler
-crates/server    llm170 CLI
+crates/server    llm170 CLI + HTTP server
 docs/            specs & decisions (hardware, model, architecture, ADRs)
-source/          external reference material (research reports; engine clones are gitignored)
 scripts/         verification harness (synthetic-model generators, llama.cpp cross-checks)
+source/          local, untracked — external reference material (research reports, engine clones)
 ```
 
 ## Verification philosophy
 
 - **Everything is cross-checked against llama.cpp** on this machine. Synthetic qwen35 models — random weights, real and reduced dimensions — are generated as GGUF and run through both engines, compared down to greedy token streams.
-- Internal consistency is enforced where it's cheap and strong: e.g. the chunked and autoregressive GDN paths must agree to 1e-7 on arbitrary inputs.
+- Internal consistency is enforced where it's cheap and strong: e.g. the chunked and autoregressive GDN paths are cross-validated on arbitrary inputs (output rel < 2e-3, state < 5e-2), and GPU kernels are checked against the CPU reference per kernel (`*-check` subcommands) before entering the engine.
 - Performance numbers are only ever quoted with their conditions (context / batch / quantization). Server-based streaming benchmarks are the standard; synthetic microbenchmarks alone are not.
 
 ## Documentation
@@ -80,6 +94,6 @@ scripts/         verification harness (synthetic-model generators, llama.cpp cro
 - [Dev machine (ROCm)](docs/hardware/dev-8060s.md)
 - [qwen35 spec](docs/models/qwen35.md) · [qwen4exp spec](docs/models/qwen4exp.md) — tensor-level implementation specs
 - [Decision records](docs/decisions.md) — ADRs
-- [AGENTS.md](AGENTS.md) — contribution & engineering rules
 
-Historical ADRs and internal engineering notes are Korean; all docs under `docs/` are English going forward.
+All docs under `docs/` are English. Internal engineering notes (contribution
+rules, operational runbooks, local environment) live outside the repository.

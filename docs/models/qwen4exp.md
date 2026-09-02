@@ -73,20 +73,44 @@ Reference implementation (read-only during development): the upstream
   this engine is free to choose).
 - The PLE table lookup is the defining memory-hierarchy bottleneck: NVMe mmap +
   `MADV_RANDOM` + page-cache-friendly hot rows is the validated pattern.
+- QSA indexer: pooled + normed + roped **block keys are computed once per
+  block** and reused by every token in it (indexer cost O(T^2) -> O(T)).
+- PLE decode prefetch: a side thread issues the gather for the predicted
+  next token during the current step; the following step joins it. (A
+  prefill-wide prefetch was tried and reverted — row-set mismatch.)
+- Decode frame (default on, ADR-0017): activations device-resident, kernels
+  chained by handle (hc/GDN/MoE/head framed; PLE host-hash bridge + QSA
+  value bridge remain, ~14 syncs/step). Per-sequence handle sets support
+  parallel decode; on residency failure the engine falls back to the
+  per-op value path permanently.
+- Value-path decode profile (hot cache, 2026-08-31): moe 1.3 ms · gdn
+  0.45 ms · hc 0.22 ms · qsa 0.1 ms per token.
 - Local operating baseline (HIP 7.2.2): pp 178–237 t/s (per slot), tg
   11.6–15.1 t/s; ROCm 10+master: pp 272–468, tg 11.9–19.6 (np2×262K,
   2026-08-27/29).
 
-## Verification Status (2026-08-31)
+## Verification Status (2026-09-02)
 
 - Reference: the upstream qwen4exp runtime (PR #27742 build) with
-  `-ot per_layer_token_embd=CPU --load-mode mmap -fa on` (f16 KV), temp 0.
-- Matrix (non-coexisting pattern — see AGENTS): single_ko 24/24 exact ·
-  single_short / long_gen48 near-tie (gap 0.01) · single_code near-tie
-  (gap 0.12) · np2 state isolation 16/16 ×2 · first prompt 8/8 exact.
-- Long-prompt prefill cases: see AGENTS.md for current status.
-- CPU decode profile (LLM170_Q4_TIME): moe 1.3 ms · gdn 0.45 ms · hc 0.22 ms ·
-  qsa 0.1 ms per token — MoE per-token expert matmuls dominate; token-expert
-  grouping is the known optimization headroom.
-- GPU path: identical pass/fail pattern to CPU (single_ko exact, short/code
-  near-tie) with q2 prefill + q3 decode kernels.
+  `-ot per_layer_token_embd=CPU --load-mode mmap -fa on` (f16 KV), temp 0 —
+  run non-coexisting (reference server collects first, then stops; both
+  engines resident would contend for the same VRAM).
+- Real-model matrix (Vulkan): single_ko 24/24 exact · single_short /
+  long_gen48 near-tie (gap 0.01 nat) · single_code near-tie (0.12) · np2
+  state isolation 25/25 ×2. Long single (2,311 tok) and long2 (1,904 tok)
+  24/24 exact each (measured on the immediately preceding binary; re-run on
+  the final binary queued with long+np2, pending device-memory headroom —
+  Vulkan places weights in host GTT on the dev iGPU).
+- Synthetic tiny4 generator (`scripts/make_tiny4.py`) — model-volume
+  independent e2e covering every combination: CPU == GPU 26/26, np2
+  26/26 ×2, long 2000+ 25/25, long+np2 25/25 ×2. The decode frame is
+  hash-identical to the value path on this harness.
+- GPU-only paths, each cross-validated against the CPU reference before
+  entering the engine: GDN AR kernel (all dims 16–128), single-launch
+  chunked GDN prefill kernel, batched MoE down (one launch, K experts),
+  token-expert grouped prefill GEMM, element-wise set (norm kernels
+  bit-exact), QSA block-key cache, decode frame.
+- History note: a t=1 MoE fast-path regression (routed-expert contribution
+  zero on the default decode path) was found 2026-09-01 by diffing against
+  the frame path; both CPU and GPU value paths shared it, so self-consistent
+  checks had passed. All numbers above are post-fix.

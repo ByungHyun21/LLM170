@@ -48,18 +48,28 @@ Both models are GDN (Gated DeltaNet) linear-attention hybrids — qwen35 first
 
 ## Documentation Layout
 
-- `docs/` — project documentation (tracked)
-- `source/` — external reference material: research reports, excerpts (tracked,
-  not project output)
+- `docs/` — project documentation (tracked, English)
+- `source/` — external reference material, **local and untracked** (research
+  reports, engine clones used read-only during development)
 - `plans/` — work plans (gitignored)
-- Operational issues live at the bottom of each model/topic document or in
-  separate ISSUES-style files (date header + symptom/cause/verification)
+- Operational issues live at the bottom of each model/topic document
+  (date header + symptom/cause/verification)
 
-## Current Stage (2026-08-31)
+## Current Stage (2026-09-02)
 
 Both reference models run end-to-end and are verified against llama.cpp greedy
-streams. GPU backend (cubecl) executes all weight projections on
-HIP/ROCm and Vulkan with token-exact parity to the CPU reference. Remaining
-before the CMP arrives: GPU-resident GDN/QSA compute (decode latency), long
-prefill throughput, and the cmp-stock kernel variants. See
-[architecture.md](architecture.md) §Staged Plan.
+streams — including long-prompt (2,311 / 1,904 tokens) and parallel-sequence
+cases, under the near-tie-aware standard (ADR-0012 in
+[decisions.md](decisions.md)). On the GPU (cubecl, HIP/ROCm and Vulkan) the
+engine now runs: all quantized GEMM projections (8 types, batched prefill
+variants), the GDN AR + chunked-prefill kernels, grouped MoE GEMM, and an
+element-wise set whose norm kernels are bit-exact vs CPU. qwen4exp decodes
+through a GPU-resident frame by default (ADR-0017) — kernels chained by
+handle, ~600 per-step host syncs down to ~14. The HTTP server schedules
+continuous batching across slots; qwen35 has MTP speculative decoding
+(`--spec k`).
+
+Remaining before the CMP arrives: the qwen35 decode frame, PLE/QSA frame
+bridges for qwen4exp, prefill/decode throughput toward the llama.cpp target
+([benchmarks.md](benchmarks.md)), and the cmp-stock kernel variants. The
+staged plan lives in [architecture.md](architecture.md).
