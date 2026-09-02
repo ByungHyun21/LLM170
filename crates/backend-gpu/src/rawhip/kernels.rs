@@ -500,9 +500,9 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];    // [k청크 내 sb][행][워드] — 언팩 완료
     __shared__ float dsc[8][64][2];       // d·sc, dm·m
-    __shared__ unsigned ytile[32][8][8];  // [토큰][sb][워드]
-    __shared__ float ydt[32][8];          // [토큰][sb] yd
-    __shared__ int qst[32][8];            // [토큰][sb] qsum16 합
+    __shared__ unsigned ytile[64][8][8];  // [토큰][sb][워드]
+    __shared__ float ydt[64][8];          // [토큰][sb] yd
+    __shared__ int qst[64][8];            // [토큰][sb] qsum16 합
     __shared__ float psum[4][64][32];     // [파편][행][토큰] f32 부분합
 
     int i = blockIdx.x * 64;              // 행 타일 기저
@@ -514,9 +514,9 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    float acc[8];
+    float acc[16];
     #pragma unroll
-    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
+    for (int q = 0; q < 16; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         // ── 협력 스테이징: 256스레드 × (1 언팩 유닛 + 0.5 y 유닛) ──
         // 언팩: tid → (sb_local = tid>>5? ...) 256유닛 = 8sb×64행의 절반? 8*64=512 — 2패스
@@ -560,7 +560,8 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
         }
         // y 스테이징: 32토큰×8sb = 256유닛 — tid 1패스 정확 커버
         {
-            int u = tid;                          // 0..255 = 32토큰×8sb
+            for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;                          // 0..255 = 32토큰×8sb
             {
                 int ti = u >> 3;                  // 0..31
                 int sbl = u & 7;                  // sb
@@ -573,6 +574,7 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
                     ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
                     qst[ti][sbl] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
                 }
+            }
             }
         }
         __syncthreads();
@@ -593,7 +595,7 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
                 float d0 = dsc[sbl][row][0];
                 float d1 = dsc[sbl][row][1];
                 #pragma unroll
-                for (int q = 0; q < 8; q++) {
+                for (int q = 0; q < 16; q++) {
                     int ti = wid + 4 * q;
                     if (ti >= t) break;
                     int isum = 0;
@@ -614,7 +616,7 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
     }
     if (row < nrow) {
         #pragma unroll
-        for (int q = 0; q < 8; q++) {
+        for (int q = 0; q < 16; q++) {
             int ti = wid + 4 * q;
             if (ti >= t) break;
             out[(size_t)ti * n_out + i + row] = acc[q];
@@ -631,9 +633,9 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];
     __shared__ float dsc[8][64][2];
-    __shared__ unsigned ytile[32][8][8];
-    __shared__ float ydt[32][8];
-    __shared__ int qst[32][8];
+    __shared__ unsigned ytile[64][8][8];
+    __shared__ float ydt[64][8];
+    __shared__ int qst[64][8];
         int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
@@ -643,9 +645,9 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    float acc[8];
+    float acc[16];
     #pragma unroll
-    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
+    for (int q = 0; q < 16; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -680,7 +682,8 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
             }
         }
         {
-            int u = tid;
+            for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;
             {
                 int ti = u >> 3;   // 0..31
                 int sbl = u & 7;
@@ -693,6 +696,7 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
                     ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
                     qst[ti][sbl] = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
                 }
+            }
             }
         }
         __syncthreads();
@@ -712,7 +716,7 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
                 float d0 = dsc[sbl][row][0];
                 float d1 = dsc[sbl][row][1];
                 #pragma unroll
-                for (int q = 0; q < 8; q++) {
+                for (int q = 0; q < 16; q++) {
                     int ti = wid + 4 * q;
                     if (ti >= t) break;
                     int isum = 0;
@@ -733,7 +737,7 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
     }
     if (row < nrow) {
         #pragma unroll
-        for (int q = 0; q < 8; q++) {
+        for (int q = 0; q < 16; q++) {
             int ti = wid + 4 * q;
             if (ti >= t) break;
             out[(size_t)ti * n_out + i + row] = acc[q];
@@ -826,9 +830,9 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
                                        float* out, int n_in, int n_out, int xq_w, int t) {
     __shared__ unsigned wvs[16][64][4];
     __shared__ float dsc[16][64];          // d·sc 사전곱
-    __shared__ unsigned ytile[32][16][4];  // [토큰][그룹][워드]
-    __shared__ float ydt[32][16];
-    __shared__ int qst[32][16];
+    __shared__ unsigned ytile[64][16][4];  // [토큰][그룹][워드]
+    __shared__ float ydt[64][16];
+    __shared__ int qst[64][16];
         int i = blockIdx.x * 64;
     int tid = threadIdx.x;
     int row = tid & 63;
@@ -838,9 +842,9 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     int n_g = n_in >> 4;
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
-    float acc[8];
+    float acc[16];
     #pragma unroll
-    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
+    for (int q = 0; q < 16; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_g; k0 += 16) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -895,8 +899,8 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
             }
         }
         {
-            // y: 32토큰×16그룹 = 512유닛 — 2패스×256
-            for (int pass = 0; pass < 2; pass++) {
+            // y: 64토큰×16그룹 = 1024유닛 — 4패스×256
+            for (int pass = 0; pass < 4; pass++) {
                 int u = pass * 256 + tid;
                 int ti = u >> 4;
                 int gl = u & 15;
@@ -924,7 +928,7 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
                 unsigned w3r = wvs[gl][row][3];
                 float d0 = dsc[gl][row];
                 #pragma unroll
-                for (int q = 0; q < 8; q++) {
+                for (int q = 0; q < 16; q++) {
                     int ti = wid + 4 * q;
                     if (ti >= t) break;
                     int isum = 0;
@@ -941,7 +945,7 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     }
     if (row < nrow) {
         #pragma unroll
-        for (int q = 0; q < 8; q++) {
+        for (int q = 0; q < 16; q++) {
             int ti = wid + 4 * q;
             if (ti >= t) break;
             out[(size_t)ti * n_out + i + row] = acc[q];
@@ -1032,8 +1036,8 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
                                       int xq_w, int t) {
     __shared__ unsigned wvs[8][64][8];
     __shared__ float dsc[8][64];
-    __shared__ unsigned ytile[32][8][8];
-    __shared__ float ydt[32][8];
+    __shared__ unsigned ytile[64][8][8];
+    __shared__ float ydt[64][8];
         __shared__ unsigned kt_s[256];
     for (int a = threadIdx.x; a < 256; a += 256) kt_s[a] = ktab2[a];
     int i = blockIdx.x * 64;
@@ -1044,9 +1048,9 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
     int nrow = min(64, n_out - i);
     int n_sub = n_in >> 5;
     int blocks = n_in >> 8;
-    float acc[8];
+    float acc[16];
     #pragma unroll
-    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
+    for (int q = 0; q < 16; q++) acc[q] = 0.0f;
     for (int k0 = 0; k0 < n_sub; k0 += 8) {
         for (int pass = 0; pass < 2; pass++) {
             int u = pass * 256 + tid;
@@ -1080,7 +1084,8 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
             }
         }
         {
-            int u = tid;
+            for (int pass = 0; pass < 2; pass++) {
+            int u = pass * 256 + tid;
             {
                 int ti = u >> 3;   // 0..31
                 int sbl = u & 7;
@@ -1092,6 +1097,7 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
                     for (int kk = 0; kk < 8; kk++) ytile[ti][sbl][kk] = xt[xw + kk];
                     ydt[ti][sbl] = __uint_as_float(xt[(n_in >> 2) + sb]);
                 }
+            }
             }
         }
         __syncthreads();
@@ -1111,7 +1117,7 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
                 unsigned w7r = wvs[sbl][row][7];
                 float d0 = dsc[sbl][row];
                 #pragma unroll
-                for (int q = 0; q < 8; q++) {
+                for (int q = 0; q < 16; q++) {
                     int ti = wid + 4 * q;
                     if (ti >= t) break;
                     int isum = 0;
@@ -1131,7 +1137,7 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
     }
     if (row < nrow) {
         #pragma unroll
-        for (int q = 0; q < 8; q++) {
+        for (int q = 0; q < 16; q++) {
             int ti = wid + 4 * q;
             if (ti >= t) break;
             out[(size_t)ti * n_out + i + row] = acc[q];
