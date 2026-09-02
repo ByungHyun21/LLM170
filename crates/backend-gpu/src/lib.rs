@@ -1886,6 +1886,22 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
 
     /// 기록 = 신규 업로드 + 레지스트리 교체 (cubecl에 기존 핸들 write API 없음).
     /// 구 핸들은 풀 반납 — 해제 경로 없음 (ADR-0014).
+    fn frame_write_u32(&self, h: u64, data: &[u32]) -> Result<(), String> {
+        let (old, old_len) = self.frame_get(h)?;
+        if old_len != data.len() {
+            return Err(format!(
+                "frame_write_u32: 길이 불일치 핸들={old_len} 데이터={}",
+                data.len()
+            ));
+        }
+        let new = self.client.create_from_slice(bytemuck::cast_slice(data));
+        self.frames
+            .lock()
+            .map_err(|_| "frame lock poisoned")?
+            .insert(h, (new, data.len()));
+        self.release_bufs(&[(old, old_len * 4)]);
+        Ok(())
+    }
     fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
         let (old, old_len) = self.frame_get(h)?;
         if old_len != data.len() {
@@ -2085,6 +2101,56 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
                         TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
                         *d,
                         *n_h,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::AttnQPrep { q, w, cs, out, eps, hd, pos, half } => {
+                let qh = one(*q)?;
+                let wh = one(*w)?;
+                let ch = one(*cs)?;
+                let oh = one(*out)?;
+                let n_head = self.frame_get(*q)?.1 / (2 * hd);
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1헤드, 유닛 0만 실행 — 경계는 hd 내부 산술.
+                unsafe {
+                    ew::attn_q_prep::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(n_head as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(qh, [1].into(), [n_head * 2 * hd].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [hd].into()),
+                        TensorArg::from_raw_parts(ch, [1].into(), [usize::MAX].into()),
+                        TensorArg::from_raw_parts(oh, [1].into(), [n_head * 2 * hd].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *hd,
+                        *pos,
+                        *half,
+                    );
+                }
+                self.release_bufs(&[(pg, 4)]);
+            }
+            FrameOp::AttnKPrep { k, w, cs, cache, eps, hd, pos, n_kv, half } => {
+                let kh = one(*k)?;
+                let wh = one(*w)?;
+                let ch = one(*cs)?;
+                let cah = one(*cache)?;
+                let pg = aux(&[*eps])?;
+                // SAFETY: 큐브당 1 kv-헤드, 유닛 0만 — 캐시 오프셋 산술 경계.
+                unsafe {
+                    ew::attn_k_prep::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(*n_kv as u32, 1, 1),
+                        CubeDim::new_1d(32),
+                        TensorArg::from_raw_parts(kh, [1].into(), [n_kv * hd].into()),
+                        TensorArg::from_raw_parts(wh, [1].into(), [hd].into()),
+                        TensorArg::from_raw_parts(ch, [1].into(), [usize::MAX].into()),
+                        TensorArg::from_raw_parts(cah, [1].into(), [usize::MAX].into()),
+                        TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
+                        *hd,
+                        *pos,
+                        *n_kv,
+                        *half,
                     );
                 }
                 self.release_bufs(&[(pg, 4)]);

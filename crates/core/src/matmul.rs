@@ -209,6 +209,10 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("frame_free: 미지원".into())
     }
     /// 호스트 → 프레임 버퍼 기록.
+    /// u32 버퍼 기록 (qsa mask 등 — f32 프레임과 별도 원시 경로).
+    fn frame_write_u32(&self, _h: u64, _data: &[u32]) -> Result<(), String> {
+        Err("frame_write_u32: 미지원".into())
+    }
     fn frame_write(&self, _h: u64, _data: &[f32]) -> Result<(), String> {
         Err("frame_write: 미지원".into())
     }
@@ -264,6 +268,10 @@ pub enum FrameOp {
     IdxPool { cache: u64, out: u64, first_block: usize, dim: usize, r: usize },
     /// 인덱서 스코어: Σ_h ReLU(qr·bk).
     IdxScores { qr: u64, bk: u64, scores: u64, idx_heads: usize, dim: usize },
+    /// qwen35 어텐션 q 프리페어: 헤드 rms·rope·q‖gate 인터리브.
+    AttnQPrep { q: u64, w: u64, cs: u64, out: u64, eps: f32, hd: usize, pos: usize, half: usize },
+    /// qwen35 어텐션 k 프리페어: kv-헤드 rms·rope → 캐시 pos append.
+    AttnKPrep { k: u64, w: u64, cs: u64, cache: u64, eps: f32, hd: usize, pos: usize, n_kv: usize, half: usize },
     /// in-place: v ← v·s (GDN q 사전 스케일).
     Scale { t: u64, s: f32, n: usize },
     /// 행 복사: dst[dst_off..+n] = src[src_off..+n] — 캐시 append 부품.

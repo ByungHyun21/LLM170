@@ -155,9 +155,21 @@ pub fn norm_gated_rows(
     let wb = (row % n_h) * d;
     let eps = f64::cast_from(params[0]);
     let mut sum = 0.0f64;
-    for i in 0..d {
-        let dv = f64::cast_from(o[xb + i]);
-        sum += dv * dv;
+    {
+        let chunk = d.div_ceil(32);
+        for sg in 0..32 {
+            let lo = sg * chunk;
+            if lo >= d {
+                break;
+            }
+            let hi = (lo + chunk).min(d);
+            let mut part = 0.0f64;
+            for i in lo..hi {
+                let dv = f64::cast_from(o[xb + i]);
+                part += dv * dv;
+            }
+            sum += part;
+        }
     }
     let len = f64::cast_from(d as u32);
     let scale32 = f32::cast_from((sum / len + eps).sqrt());
@@ -190,9 +202,21 @@ pub fn norm_gated_rows_silu(
     let wb = (row % n_h) * d;
     let eps = f64::cast_from(params[0]);
     let mut sum = 0.0f64;
-    for i in 0..d {
-        let dv = f64::cast_from(o[xb + i]);
-        sum += dv * dv;
+    {
+        let chunk = d.div_ceil(32);
+        for sg in 0..32 {
+            let lo = sg * chunk;
+            if lo >= d {
+                break;
+            }
+            let hi = (lo + chunk).min(d);
+            let mut part = 0.0f64;
+            for i in lo..hi {
+                let dv = f64::cast_from(o[xb + i]);
+                part += dv * dv;
+            }
+            sum += part;
+        }
     }
     let len = f64::cast_from(d as u32);
     let scale32 = f32::cast_from((sum / len + eps).sqrt());
@@ -531,5 +555,110 @@ pub fn axpy_scaled(
     let j = ABSOLUTE_POS_X as usize;
     if j < n {
         y[j] += x[j] * s[0];
+    }
+}
+
+/// qwen35 어텐션 q 프리페어: 헤드별 rms(정준 32-세그)·rope(cs 테이블)·
+/// q‖gate 인터리브 기록 — CPU layers.rs norm+rope 순서 동일 (비트 계약).
+#[cube(launch_unchecked)]
+pub fn attn_q_prep(
+    q: &Tensor<f32>,
+    w: &Tensor<f32>,
+    cs: &Tensor<f32>,
+    out: &mut Tensor<f32>,
+    params: &Tensor<f32>, // [eps]
+    hd: usize,
+    pos: usize,
+    half: usize,
+) {
+    let h = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u != 0 {
+        terminate!();
+    }
+    let eps = f64::cast_from(params[0]);
+    let qb = h * 2 * hd;
+    let mut sum = 0.0f64;
+    let chunk = hd.div_ceil(32);
+    for sg in 0..32 {
+        let lo = sg * chunk;
+        if lo >= hd {
+            break;
+        }
+        let hi = (lo + chunk).min(hd);
+        let mut part = 0.0f64;
+        for i in lo..hi {
+            let d = f64::cast_from(q[qb + i]);
+            part += d * d;
+        }
+        sum += part;
+    }
+    let scale32 = f32::cast_from((sum / f64::cast_from(hd as u32) + eps).sqrt());
+    let inv = 1.0f32 / scale32;
+    for i in 0..hd {
+        out[qb + i] = q[qb + i] * inv * w[i];
+    }
+    for pp in 0..half {
+        let c = cs[pos * half * 2 + pp * 2];
+        let si = cs[pos * half * 2 + pp * 2 + 1];
+        let x0 = out[qb + pp];
+        let x1 = out[qb + pp + half];
+        out[qb + pp] = x0 * c - x1 * si;
+        out[qb + pp + half] = x0 * si + x1 * c;
+    }
+    for i in 0..hd {
+        out[qb + hd + i] = q[qb + hd + i];
+    }
+}
+
+
+/// qwen35 어텐션 k 프리페어: kv-헤드별 rms·rope → 캐시 append(pos 위치).
+#[cube(launch_unchecked)]
+pub fn attn_k_prep(
+    k: &Tensor<f32>,
+    w: &Tensor<f32>,
+    cs: &Tensor<f32>,
+    cache: &mut Tensor<f32>,
+    params: &Tensor<f32>, // [eps]
+    hd: usize,
+    pos: usize,
+    n_kv: usize,
+    half: usize,
+) {
+    let h = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u != 0 {
+        terminate!();
+    }
+    let eps = f64::cast_from(params[0]);
+    let kb = h * hd;
+    let cb = pos * n_kv * hd + h * hd;
+    let mut sum = 0.0f64;
+    let chunk = hd.div_ceil(32);
+    for sg in 0..32 {
+        let lo = sg * chunk;
+        if lo >= hd {
+            break;
+        }
+        let hi = (lo + chunk).min(hd);
+        let mut part = 0.0f64;
+        for i in lo..hi {
+            let d = f64::cast_from(k[kb + i]);
+            part += d * d;
+        }
+        sum += part;
+    }
+    let scale32 = f32::cast_from((sum / f64::cast_from(hd as u32) + eps).sqrt());
+    let inv = 1.0f32 / scale32;
+    for i in 0..hd {
+        cache[cb + i] = k[kb + i] * inv * w[i];
+    }
+    for pp in 0..half {
+        let c = cs[pos * half * 2 + pp * 2];
+        let si = cs[pos * half * 2 + pp * 2 + 1];
+        let x0 = cache[cb + pp];
+        let x1 = cache[cb + pp + half];
+        cache[cb + pp] = x0 * c - x1 * si;
+        cache[cb + pp + half] = x0 * si + x1 * c;
     }
 }

@@ -170,10 +170,10 @@ impl Model {
 /// 시퀀스 상태
 pub struct SeqState {
     pub pos: u32,
-    kv_k: Vec<Vec<f32>>,
-    kv_v: Vec<Vec<f32>>,
     pub(crate) gdn_s: Vec<Vec<f32>>,
     pub(crate) conv: Vec<Vec<f32>>,
+    kv_k: Vec<Vec<f32>>,
+    kv_v: Vec<Vec<f32>>,
     /// MTP draft층 KV (blk.64 full-attn 1층분) — nextn 미탑재 모델은 빈 벡터.
     mtp_kv_k: Vec<f32>,
     mtp_kv_v: Vec<f32>,
@@ -182,6 +182,13 @@ pub struct SeqState {
 }
 
 impl SeqState {
+    /// 프레임 KV 동기용 읽기 접근 (2026-09-02 P1).
+    pub(crate) fn kv_k_ref(&self) -> &[Vec<f32>] {
+        &self.kv_k
+    }
+    pub(crate) fn kv_v_ref(&self) -> &[Vec<f32>] {
+        &self.kv_v
+    }
     pub fn new(model: &Model, ctx: usize) -> Self {
         let n_full = (0..model.hp.n_layer)
             .filter(|&il| !model.is_recr(il))
