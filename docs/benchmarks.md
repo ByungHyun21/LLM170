@@ -21,12 +21,37 @@ Both PP and TG against this table are the first performance goal.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
-Current standing (GPU backend, single-tenant `llm170 bench`, 2026-09-02):
+Current standing (raw-HIP backend — pure Rust executor, cubecl removed,
+single-tenant `llm170 bench`, 2026-09-03). All paths bit-exact against the
+CPU W4A8 reference engine (greedy streams identical, incl. 64-token batch
+cross-verification against per-token):
 
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **6.96 t/s** | 0.67x |
-| Prefill pp64 | 142.8 t/s (418-tok case) | **10.26 t/s** (W4A8; f32 path 13.8 but CPU-inconsistent) | 0.07x |
+| Decode tg24, t=1 | 10.4 t/s | **9.6 t/s** (peak; thermal floor ~8.4 sustained) | 0.92x |
+| Prefill pp64 | 142.8 t/s | **24.7 t/s** | 0.17x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **21.0 t/s** | ~0.09x |
+
+Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
+quantized path, and raw-HIP GPU path produce **identical 16-token greedy
+streams** — zero quantization-induced divergence on this benchmark.
+
+Key techniques (kernels are HIP C++ strings JIT-compiled via hipRTC,
+arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
+
+- `__ockl_sdot4` integer dot (i8x4 lanes) for all K-quant GEMV
+  (llama.cpp MMVQ analog). Lane-wise u32 subtraction is forbidden
+  (borrow crosses lanes) — decompose into separate dot chains instead.
+- In-kernel tree reduction (shared half-exchange + 32-wide shuffle tree,
+  HIP shuffles cannot cross lane 32) eliminates the partials roundtrip;
+  CPU mirror sums lanes in the identical tree order.
+- Bit-exact transcendentals: `exp_cr`/`ln_cr` f64-fma polynomials shared
+  verbatim between Rust and HIP (glibc `expf` is 0.5-ulp — device `expf`
+  differs on ~6% of inputs); `-ffp-contract=off` blocks FMA contraction.
+- Batch prefill: gy-dimension kernels for quant/rms/elementwise,
+  sequential-state kernels with internal t-loops for conv/AR, tiled GEMM
+  (one block per output row, TT=16 token registers, weights read once)
+  for the four dominant quant types.
 
 Session progression (same binary lineage, gfx1151):
 
