@@ -681,6 +681,56 @@ extern "C" __global__ void split3(const float* src, float* d0, float* d1, float*
     else d2[i - n0 - n1] = src[i];
 }
 
+
+// QSA attention score: dot(q_head, ck[p]) — grid (n_past, n_head, t)
+extern "C" __global__ void qsa_score(const float* q, const float* ck, const unsigned* mask,
+                                     float* scores, int n_past, int n_head, int n_kv,
+                                     int hd, int t_len) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int t = blockIdx.z;
+    if (p >= n_past || h >= n_head || t >= t_len) return;
+    if (mask[t * n_past + p] == 0u) {
+        scores[(t * n_head + h) * n_past + p] = -3.0e38f;
+        return;
+    }
+    int kvh = h / (n_head / n_kv);
+    int qb = t * n_head * 2 * hd + h * 2 * hd;
+    int kb = p * n_kv * hd + kvh * hd;
+    float d = 0.0f;
+    for (int i = 0; i < hd; i++) d += q[qb + i] * ck[kb + i];
+    scores[(t * n_head + h) * n_past + p] = d;
+}
+// QSA attention mix: softmax-weighted V sum + gate — sequential deterministic order
+extern "C" __global__ void qsa_mix(const float* q, const float* scores, const float* cv,
+                                   float* out, int n_past, int n_head, int n_kv,
+                                   int hd, int t_len) {
+    int d_i = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int t = blockIdx.z;
+    if (d_i >= hd || h >= n_head || t >= t_len) return;
+    int sbase = (t * n_head + h) * n_past;
+    float maxv = scores[sbase];
+    for (int p = 0; p < n_past; p++) {
+        float sv = scores[sbase + p];
+        if (sv > maxv) maxv = sv;
+    }
+    float sum = __expf(scores[sbase] - maxv);
+    for (int p = 1; p < n_past; p++) sum += __expf(scores[sbase + p] - maxv);
+    int kvh = h / (n_head / n_kv);
+    float a = 0.0f;
+    for (int p = 0; p < n_past; p++) {
+        float w = __expf(scores[sbase + p] - maxv) / sum;
+        if (w != 0.0f) {
+            int kb = p * n_kv * hd + kvh * hd;
+            a += w * cv[kb + d_i];
+        }
+    }
+    int gb = t * n_head * 2 * hd + h * 2 * hd + hd;
+    float g = 1.0f / (1.0f + __expf(-q[gb + d_i]));
+    out[t * n_head * hd + h * hd + d_i] = a * g;
+}
+
 "#;
 
 pub const NAMES: &[&str] = &[
@@ -688,6 +738,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
+    "qsa_score", "qsa_mix",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
