@@ -124,6 +124,14 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("mm-tile") => match llm170_backend_gpu::rawhip::mm_tile_bench() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
+        Some("mm-bench") => match llm170_backend_gpu::rawhip::mm_batch_bench() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("batch-abtest") => match llm170_backend_gpu::rawhip::batch_ab_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

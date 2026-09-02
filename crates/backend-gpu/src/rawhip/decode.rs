@@ -647,9 +647,14 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     }
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        ds.step_batch(seq, pos0, emb)
+        let r = ds.step_batch(seq, pos0, emb);
+        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+            eprintln!("batch({} tok) wall={:.1}ms", emb.len() / ds.n_embd, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        r
     }
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
@@ -704,16 +709,17 @@ impl DecodeState {
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
-                // conv+ring 순차 (토큰 루프)
-                for ti in 0..t {
-                    let mut qp = unsafe { self.gqkv_t.offset((ti * conv_ch * 4) as isize) } as *mut std::ffi::c_void;
+                // conv+ring 배치 (채널 블록 × t 내부 순차)
+                {
+                    let mut qp = self.gqkv_t as *mut std::ffi::c_void;
                     let mut cp = cw as *mut std::ffi::c_void;
                     let mut sp = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
-                    let mut op = unsafe { self.gconv_t.offset((ti * conv_ch * 4) as isize) } as *mut std::ffi::c_void;
+                    let mut op = self.gconv_t as *mut std::ffi::c_void;
                     let mut ch = conv_ch as i32;
                     let mut kk = self.conv_k as i32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk)];
-                    self.ctx.launch("gdn_conv", conv_ch as u32, 1, 32, &mut args)?;
+                    let mut tt = t as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
+                    self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
                 }
                 // split3 전체 배치 (요소별)
                 {
@@ -752,41 +758,23 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
                     self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
                 }
-                // AR 순차 (토큰 루프)
-                for ti in 0..t {
-                    let (go4, gq4, gk4, gv4, gbg4) = (
-                        (ti * v_len * 4) as isize,
-                        (ti * k_len * 4) as isize,
-                        (ti * k_len * 4) as isize,
-                        (ti * v_len * 4) as isize,
-                        (ti * self.dt_rank * 2 * 4) as isize,
-                    );
+                // AR 배치 (pair 블록 × t 내부 순차)
+                {
                     let mut sp3 = self.st_gdn[recr_idx][seq] as *mut std::ffi::c_void;
-                    let mut qp = unsafe { self.gq_t.offset(gq4) } as *mut std::ffi::c_void;
-                    let mut kp = unsafe { self.gk_t.offset(gk4) } as *mut std::ffi::c_void;
-                    let mut vp = unsafe { self.gv_t.offset(gv4) } as *mut std::ffi::c_void;
-                    let mut bgp = unsafe { self.gbg_t.offset(gbg4) } as *mut std::ffi::c_void;
-                    let mut op = unsafe { self.go_t.offset(go4) } as *mut std::ffi::c_void;
+                    let mut qp = self.gq_t as *mut std::ffi::c_void;
+                    let mut kp = self.gk_t as *mut std::ffi::c_void;
+                    let mut vp = self.gv_t as *mut std::ffi::c_void;
+                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
+                    let mut op = self.go_t as *mut std::ffi::c_void;
                     let mut d = self.d_state as i32;
                     let mut ks = k_len as i32;
                     let mut vs = v_len as i32;
                     let mut hv = self.dt_rank as i32;
                     let mut hk = self.n_group as i32;
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
-                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc)];
-                    self.ctx.launch("gdn_ar", self.dt_rank as u32, 1, 128, &mut args)?;
-                }
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
-                    self.ctx.sync()?;
-                    let mut hq = vec![0f32; k_len * t];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq_t)?;
-                    let mut xq_: u64 = 0;
-                    for &v in &hq { xq_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                    let mut ho = vec![0f32; v_len * t];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.go_t)?;
-                    let mut xo_: u64 = 0;
-                    for &v in &ho { xo_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                    eprintln!("#  G0dbg batch gq xor={xq_:016x} go xor={xo_:016x}");
+                    let mut tt = t as i32;
+                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
+                    self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, 1, 1, 128, &mut args)?;
                 }
                 // norm_gated 전체 배치 (gy=t)
                 {
@@ -832,16 +820,27 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
                     self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)?;
                 }
-                // KV append + qsa per-token (pos/n_past 의존)
+                // KV append 배치 (gy=t)
+                {
+                    let mut sp = self.ak_t as *mut std::ffi::c_void;
+                    let mut dp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut na = (n_kv * hd) as i32;
+                    let mut p0 = pos0 as i32;
+                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                    self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                }
+                {
+                    let mut sp = self.av_t as *mut std::ffi::c_void;
+                    let mut dp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut na = (n_kv * hd) as i32;
+                    let mut p0 = pos0 as i32;
+                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                    self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                }
+                // qsa per-token (n_past 의존)
                 for ti in 0..t {
                     let pos = pos0 + ti;
-                    let (k4, v4, ao4) = (
-                        (ti * n_kv * hd * 4) as isize,
-                        (ti * n_kv * hd * 4) as isize,
-                        (ti * n_head * hd * 4) as isize,
-                    );
-                    self.copy(unsafe { self.ak_t.offset(k4) as *mut u8 }, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
-                    self.copy(unsafe { self.av_t.offset(v4) as *mut u8 }, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                    let (ao4) = (ti * n_head * hd * 4) as isize;
                     let n_past = pos + 1;
                     let scp4 = (ti * n_head * self.ctx_len * 4) as isize;
                     let aqp4 = (ti * n_head * 2 * hd * 4) as isize;

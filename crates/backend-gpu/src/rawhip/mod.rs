@@ -192,7 +192,7 @@ impl RawCtx {
     ) -> Result<Vec<f32>, String> {
         let part = self.scratch(n_out * 64 * 8)?;
         let out = self.scratch(n_out * 4)?;
-        let gx = n_out.min(65535) as u32;
+        let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
         let kern = match ty {
             23 => "gemm_xs",   // iq4_xs
@@ -211,7 +211,7 @@ impl RawCtx {
         let mut kt_p = ktab2 as *mut std::ffi::c_void;
         let mut n_in_a = n_in as i32;
         let mut n_out_a = n_out as i32;
-        let mut gx_a = gx as i32;
+        let mut gx_a = 1i32;
         let mut args_v: Vec<*mut std::ffi::c_void> = match ty {
             23 | 20 => vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -237,7 +237,7 @@ impl RawCtx {
         }
         let mut xw_a = (n_in / 4 + n_in / 32) as i32;
         args_v.push(&mut xw_a as *mut _ as *mut std::ffi::c_void);
-        self.launch3(kern, gx, 1, gz, 64, &mut args_v)?;
+        self.launch3(kern, 1, gy, gz, 64, &mut args_v)?;
         let mut res = vec![0f32; n_out];
         self.sync()?;
         self.d2h(bytemuck::cast_slice_mut(&mut res).as_mut(), out as *const u8)?;
@@ -260,7 +260,8 @@ impl RawCtx {
         t: usize,
     ) -> Result<(), String> {
         let part = self.scratch(n_out * 64 * 8)?;
-        let gx = n_out.min(65535) as u32;
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
         let kern = match ty {
             23 => "gemm_xs",
             13 => "gemm_q5k",
@@ -304,7 +305,7 @@ impl RawCtx {
         let mut xw_a = xq_w as i32;
         let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
         args_v.push(xw_ptr);
-        self.launch3(kern, gx, t as u32, gz, 64, &mut args_v)?;
+        self.launch3(kern, t as u32, gy, gz, 64, &mut args_v)?;
         Ok(())
     }
 
@@ -722,4 +723,127 @@ pub fn batch_ab_test() -> Result<String, String> {
     let nz1 = o2[n_out..].iter().filter(|v| **v != 0.0).count();
     let cp = o3.iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
     Ok(format!("batch t=2: row0 {} row1 {} 일치 | xqw0=단일 out≠0: {} / o2row1 비영: {}", base[0].iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), base[1].iter().zip(&o2[n_out..]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), n_out - cp, nz1))
+}
+
+/// 배치 mm 타이밍 — gy=1 대비 gy=t 배율.
+pub fn mm_batch_bench() -> Result<String, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let w = model.w(&tname).ok_or("tensor 없음")?;
+    let ctx = RawCtx::new()?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let ktab2: Vec<u32> = (0..256u32).map(|b| {
+        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+        lo | (hi << 8)
+    }).collect();
+    let kt_d = ctx.alloc(1024)?;
+    ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
+    let xq_w = n_in / 4 + n_in / 32;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let x: Vec<f32> = (0..n_in * 64).map(|_| lcg()).collect();
+    let xd = ctx.alloc(n_in * 64 * 4)?;
+    ctx.h2d(xd, bytemuck::cast_slice(&x))?;
+    let xq = ctx.alloc(xq_w * 4 * 64)?;
+    ctx.quant_q8_b(xd, xq, n_in, xq_w, 64)?;
+    let out = ctx.alloc(n_out * 4 * 64)?;
+    let mut msg = String::new();
+    for &t in &[1usize, 8, 64] {
+        ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, xq_w, t)?;
+        ctx.sync()?;
+        let reps = 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, xq_w, t)?;
+        }
+        ctx.sync()?;
+        let dt = t0.elapsed().as_secs_f64() / reps as f64;
+        msg += &format!("t={}: {:.3}ms ({:.0} GB/s-equiv)\n", t, dt * 1e3, w.data.len() as f64 / dt / 1e9);
+    }
+    Ok(msg)
+}
+
+/// 타일 커널 검증+타이밍 — gemm_q5k_bt vs 미러.
+pub fn mm_tile_bench() -> Result<String, String> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let w = model.w(&tname).ok_or("tensor 없음")?;
+    let ctx = RawCtx::new()?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let xq_w = n_in / 4 + n_in / 32;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let t = 16usize;
+    let mut xs = Vec::new();
+    let mut q8s = Vec::new();
+    for _ in 0..t {
+        let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+        q8s.push(llm170_core::quant::quantize_row_q8_ref(&x));
+        xs.push(x);
+    }
+    let mut xq_h: Vec<u32> = Vec::new();
+    for tok in &q8s {
+        for blk in tok {
+            for c in 0..8 {
+                let base = c * 4;
+                xq_h.push((blk.qs[base] as u32 & 0xFF) | ((blk.qs[base+1] as u32 & 0xFF) << 8) | ((blk.qs[base+2] as u32 & 0xFF) << 16) | ((blk.qs[base+3] as u32 & 0xFF) << 24));
+            }
+            xq_h.push(blk.d.to_bits());
+        }
+    }
+    let xq = ctx.alloc(xq_h.len() * 4)?;
+    ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
+    let out = ctx.alloc(n_out * 4 * t)?;
+    let mut wp = wd as *mut std::ffi::c_void;
+    let mut op = out as *mut std::ffi::c_void;
+    let mut xp = xq as *mut std::ffi::c_void;
+    let mut ni = n_in as i32;
+    let mut no = n_out as i32;
+    let mut xw = xq_w as i32;
+    let mut tt = t as i32;
+    let mut args_v = vec![
+        (&mut xp) as *mut _ as *mut std::ffi::c_void,
+        (&mut wp) as *mut _ as *mut std::ffi::c_void,
+        (&mut op) as *mut _ as *mut std::ffi::c_void,
+        (&mut ni) as *mut _ as *mut std::ffi::c_void,
+        (&mut no) as *mut _ as *mut std::ffi::c_void,
+        (&mut xw) as *mut _ as *mut std::ffi::c_void,
+        (&mut tt) as *mut _ as *mut std::ffi::c_void,
+    ];
+    ctx.launch3("gemm_q5k_bt", n_out.min(65535) as u32, 1, n_out.div_ceil(65535) as u32, 64, &mut args_v)?;
+    ctx.sync()?;
+    let mut o = vec![0f32; n_out * t];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut o).as_mut(), out)?;
+    // 미러 검증
+    let blck = w.ty.blck_size() as usize;
+    let bsize = w.ty.type_size() as usize;
+    let rb = (n_in / blck) * bsize;
+    let mut mism = 0;
+    for ti in 0..t {
+        for oo in 0..n_out.min(256) {
+            let row = &w.data[oo * rb..];
+            let c = llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &q8s[ti]);
+            if c.to_bits() != o[ti * n_out + oo].to_bits() { mism += 1; }
+        }
+    }
+    // 타이밍
+    let reps = 10;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        ctx.launch3("gemm_q5k_bt", n_out.min(65535) as u32, 1, n_out.div_ceil(65535) as u32, 64, &mut args_v)?;
+    }
+    ctx.sync()?;
+    let dt = t0.elapsed().as_secs_f64() / reps as f64;
+    Ok(format!("tile t={t}: 불일치 {mism}/{} (첫 256행×t) — {:.3}ms → {:.0} GB/s-equiv, 토큰당 {:.1}µs", n_out.min(256) * t, dt * 1e3, w.data.len() as f64 / dt / 1e9, dt * 1e6 / t as f64))
 }
