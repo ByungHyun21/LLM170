@@ -2645,26 +2645,16 @@ impl<R: Runtime> GpuMatmul<R> {
                 // (f64) → 순차 결합. 단일 유닛 순차 체인이 447µs/행이던
                 // 근원 해소 — CPU ops.rs sq_sum과 동일 순서(비트 계약).
                 const SEG: usize = 32;
-                let p64 = self.acquire_buf(rows * SEG * 8)?;
-                let p64b = p64.clone();
-                // SAFETY: part는 유닛별 세그먼트(경계 가드), finish는 유닛 0만.
+                // 단일 커널(융합): 유닛 0이 32세그 순차 재현 — 산술 동일,
+                // 런치 2→1 (-129런치/tok, 2026-09-03).
+                // SAFETY: 큐브당 1행, 유닛 0만.
                 unsafe {
-                    ew::rms_rows_part::launch_unchecked(
-                        &self.client,
-                        CubeCount::Static(rows as u32, 1, 1),
-                        CubeDim::new_1d(SEG as u32),
-                        TensorArg::from_raw_parts(xh.clone(), [1].into(), [rows * n].into()),
-                        TensorArg::from_raw_parts(p64.clone(), [1].into(), [rows * SEG].into()),
-                        *n,
-                        SEG,
-                    );
-                    ew::rms_rows_finish::launch_unchecked(
+                    ew::rms_rows1::launch_unchecked(
                         &self.client,
                         CubeCount::Static(rows as u32, 1, 1),
                         CubeDim::new_1d(SEG as u32),
                         TensorArg::from_raw_parts(xh, [1].into(), [rows * n].into()),
                         TensorArg::from_raw_parts(wh, [1].into(), [w_reps * n].into()),
-                        TensorArg::from_raw_parts(p64, [1].into(), [rows * SEG].into()),
                         TensorArg::from_raw_parts(oh, [1].into(), [rows * n].into()),
                         TensorArg::from_raw_parts(pg.clone(), [1].into(), [1].into()),
                         *n,
@@ -2672,7 +2662,7 @@ impl<R: Runtime> GpuMatmul<R> {
                         SEG,
                     );
                 }
-                self.release_bufs(&[(pg, 4), (p64b, rows * SEG * 8)]);
+                self.release_bufs(&[(pg, 4)]);
             }
             FrameOp::NormGated { o, z, w, out, eps, d, n_h } => {
                 let ohh = one(*o)?;

@@ -840,3 +840,55 @@ pub fn l2_rows2_scale(
         }
     }
 }
+
+/// rms_rows 단일 커널 — part+finish 융합: 유닛 0이 32세그 순차 f64
+/// 제곱합(CPU sq_sum·기존 part와 동일 순서) 후 스케일, 유닛 전원이
+/// 원소 분담은 불가(유닛 간 동기 없음) — 유닛 0이 스케일까지 순차.
+/// 행당 원소 n≤~6k 순차는 수 µs권. 산술은 기존 2커널과 동일:
+/// sum(세그 순서) → (sum/len+eps).sqrt() → 1/x → x·inv·w.
+#[cube(launch_unchecked)]
+pub fn rms_rows1(
+    x: &Tensor<f32>,
+    w: &Tensor<f32>,
+    out: &mut Tensor<f32>,
+    params: &Tensor<f32>, // [eps]
+    n: usize,
+    w_reps: usize,
+    #[comptime] seg: usize,
+) {
+    let row = CUBE_POS_X as usize;
+    let u = UNIT_POS_X as usize;
+    if u != 0 {
+        terminate!();
+    }
+    let chunk = n.div_ceil(seg);
+    let mut sum = 0.0f64;
+    let mut u2 = 0usize;
+    while u2 < seg {
+        let lo = u2 * chunk;
+        if lo < n {
+            let hi = (lo + chunk).min(n);
+            let xb = row * n;
+            let mut acc = 0.0f64;
+            let mut i = lo;
+            while i < hi {
+                let d = f64::cast_from(x[xb + i]);
+                acc += d * d;
+                i += 1;
+            }
+            sum += acc;
+        }
+        u2 += 1;
+    }
+    let eps = f64::cast_from(params[0]);
+    let len = f64::cast_from(n as u32);
+    let scale32 = f32::cast_from((sum / len + eps).sqrt());
+    let inv = 1.0f32 / scale32;
+    let xb = row * n;
+    let wb = (row % w_reps) * n;
+    let mut i = 0usize;
+    while i < n {
+        out[xb + i] = x[xb + i] * inv * w[wb + i];
+        i += 1;
+    }
+}
