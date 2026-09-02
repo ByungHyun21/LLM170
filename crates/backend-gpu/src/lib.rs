@@ -1010,6 +1010,25 @@ impl<R: Runtime> GpuMatmul<R> {
                     t,
                     d.ty() as u32 as usize,
                 );
+            } else if slices == 64 {
+                // 토큰-블록 상각 (PP) — 가중치 1회 디양자화로 16토큰 누산.
+                let gy = t.div_ceil(16) as u32;
+                gemm2::gemm_q7::launch_unchecked(
+                    &self.client,
+                    CubeCount::Static(gx as u32, gy, gz as u32),
+                    CubeDim::new_1d(64),
+                    TensorArg::from_raw_parts(xg, [1].into(), [t * n_in].into()),
+                    TensorArg::from_raw_parts(d.gpu()?.clone(), [1].into(), [d.words()].into()),
+                    TensorArg::from_raw_parts(pg.clone(), [1].into(), [t * n_out * slices].into()),
+                    TensorArg::from_raw_parts(self.ktab.clone(), [1].into(), [16].into()),
+                    TensorArg::from_raw_parts(self.grid3.clone(), [1].into(), [512].into()),
+                    n_in,
+                    n_out,
+                    t,
+                    gx,
+                    d.ty() as u32 as usize,
+                    slices,
+                );
             } else {
                 let gy = t.div_ceil(4) as u32;
                 gemm2::gemm_q2::launch_unchecked(

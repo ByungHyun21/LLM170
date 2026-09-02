@@ -331,6 +331,88 @@ pub fn gemm_q2(
     part[((t * n_out + o) * slices) + l] = acc;
 }
 
+/// k-레인 토큰-블록 GEMM (prefill) — q2의 토큰당 가중치 재디양자화 제거.
+/// 큐브 = (행 o, 16토큰 블록) × 64레인: 가중치 원소 1회 디양자화로
+/// 16토큰 동시 누산 (마이크로벤치 평탄 ~4 GFLOPS의 원인 — 2026-09-02).
+/// 누산 순서는 q2와 동일(레인 분할 + reduce_parts 순차 축소) — 수치 불변.
+#[cube(launch_unchecked)]
+pub fn gemm_q7(
+    x: &Tensor<f32>,
+    w: &Tensor<u32>,
+    part: &mut Tensor<f32>,
+    ktab: &Tensor<f32>,
+    grid3: &Tensor<u32>,
+    n_in: usize,
+    n_out: usize,
+    t_len: usize,
+    gx: usize,
+    #[comptime] qtype: usize,
+    #[comptime] slices: usize,
+) {
+    let o = CUBE_POS_X as usize + CUBE_POS_Z as usize * gx;
+    let tb = CUBE_POS_Y as usize * BT;
+    let l = UNIT_POS_X as usize;
+    if o >= n_out || l >= slices {
+        terminate!();
+    }
+    let blck = if qtype == 8 || qtype == 20 || qtype == 7 {
+        32
+    } else if qtype == 0 || qtype == 1 || qtype == 30 {
+        1
+    } else {
+        256
+    };
+    let bsize = if qtype == 0 {
+        4
+    } else if qtype == 1 {
+        2
+    } else if qtype == 30 {
+        2
+    } else if qtype == 8 {
+        34
+    } else if qtype == 20 {
+        18
+    } else if qtype == 7 {
+        24
+    } else if qtype == 12 {
+        144
+    } else if qtype == 13 {
+        176
+    } else if qtype == 14 {
+        210
+    } else if qtype == 11 {
+        110
+    } else if qtype == 23 {
+        136
+    } else {
+        110
+    };
+    let blocks = n_in / blck;
+    let row_base = o * blocks * bsize;
+    const BT: usize = 16;
+    let mut acc = Array::<f32>::new(BT);
+    for ti in 0..BT {
+        acc[ti] = 0.0;
+    }
+    for k in range_stepped(l, n_in, slices) {
+        let b = k / blck;
+        let j = k % blck;
+        let v = de_elem(w, row_base + b * bsize, j, ktab, grid3, qtype);
+        for ti in 0..BT {
+            let tt = tb + ti;
+            if tt < t_len {
+                acc[ti] += x[tt * n_in + k] * v;
+            }
+        }
+    }
+    for ti in 0..BT {
+        let tt = tb + ti;
+        if tt < t_len {
+            part[(tt * n_out + o) * slices + l] = acc[ti];
+        }
+    }
+}
+
 /// 디버그: 블록 0의 요소별 디양자화 값 덤프 — gpu-de 서브커맨드 (python 대조용).
 #[cube(launch_unchecked)]
 pub fn debug_de(
