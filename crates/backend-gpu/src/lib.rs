@@ -1821,9 +1821,17 @@ impl<R: Runtime> Accelerator for GpuMatmul<R> {
         let t2 = std::time::Instant::now();
         let mut to_release: Vec<(Handle, usize)> = Vec::with_capacity(pairs.len() * 2 + 1);
         to_release.push((xg, xf.len() * 4));
-        for (((og, pg, ob, pb), d), &i) in pairs.iter().zip(devs.iter()).zip(idx_gpu.iter()) {
-            let raw = self.client.read_one(og.clone()).map_err(|e| e.to_string())?;
-            let res: &[f32] = bytemuck::cast_slice(&raw);
+        // K개 출력을 1회 read(vec)로 — read당 ~550µs 고정 채널 왕복이
+        // 그룹 크기만큼 중복되던 것을 1회로 (2026-09-02 실측, op당 고정
+        // 오버헤드 rows=1에서 0.56ms — 전부 read phase).
+        let raws = self.client.read(pairs.iter().map(|p| p.0.clone()).collect());
+        for ((((og, pg, ob, pb), d), &i), raw) in pairs
+            .iter()
+            .zip(devs.iter())
+            .zip(idx_gpu.iter())
+            .zip(raws.iter())
+        {
+            let res: &[f32] = bytemuck::cast_slice(raw);
             for (ti, out) in outs[i].iter_mut().enumerate() {
                 out.copy_from_slice(&res[ti * d.shape().1..(ti + 1) * d.shape().1]);
             }

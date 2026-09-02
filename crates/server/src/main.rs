@@ -1271,6 +1271,8 @@ fn cmd_gpu_mm(args: &[String]) -> ExitCode {
             "# bench: {n}회 × {dt:.2?} = {:.3}ms/op",
             dt.as_secs_f64() * 1000.0 / n as f64
         );
+        // 위상 귀속(진단): up/launch/read 누적 — op당 고정오버헤드 분해.
+        llm170_backend_gpu::timing_report();
     }
 
     // CPU (동일 텐서 슬라이스 — 검증 대상 행만)
