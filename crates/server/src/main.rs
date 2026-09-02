@@ -633,6 +633,20 @@ fn cmd_w4a8i_check(args: &[String]) -> ExitCode {
         }
     };
     let iters: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(50);
+    let rows: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let blck0 = w.ty.blck_size() as usize;
+    let bsize0 = w.ty.type_size() as usize;
+    let w = if rows > 0 && rows < w.n_out as usize {
+        println!("# rows 제한 {}/{}", rows, w.n_out);
+        llm170_core::matmul::Weight {
+            data: &w.data[..rows * (w.n_in as usize / blck0) * bsize0],
+            ty: w.ty,
+            n_in: w.n_in,
+            n_out: rows as u64,
+        }
+    } else {
+        w
+    };
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
     let mut seed = 0x9e37_79b9u64;

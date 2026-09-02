@@ -982,18 +982,17 @@ pub fn gemm_q8i(
         terminate!();
     }
     let n_sub = n_in / 32;
-    let base = n_sub / 64;
-    let rem = n_sub % 64;
-    // RCA(2026-09-02): `base + if .. {1} else {0}` 리터럴 분기가 base와
-    // 결합돼 오컴파일 (cnt=2 관측) — 산술 판정으로 우회.
-    let lt = (((((l as i64) - (rem as i64)) >> 63) as usize) & 1); // 1 if l<rem else 0
-    let cnt = base + lt;
-    let start = l * base + if lt == 1 { l } else { rem };
+    // 스트라이드 레인 매핑: 레인 l은 서브블록 l, l+64, l+128, … — 연속
+    // 레인이 연속 16바이트(1섹터)를 읽어 완전 공선조화. f64 레인 미러는
+    // 그룹핑 무관 비트 일치이므로 매핑 자유 (2026-09-02 down 형상 RCA).
+    // cnt = ⌈(n_sub − l)/64⌉ — l ≥ n_sub이면 0 (분기 없음).
+    let cnt = (n_sub + 63 - l) >> 6;
+    let start = l;
     let blocks = n_in / 256;
     let row_base = o * blocks * 136;
     let mut acc = 0.0f64;
     for _m in 0..cnt {
-        let sb = start + _m;
+        let sb = start + _m * 64;
         let b = sb / 8;
         let ib = sb - b * 8;
         let wb = row_base + b * 136;

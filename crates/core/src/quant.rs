@@ -646,15 +646,13 @@ pub fn dot_row_w4a8_iq4xs_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
 /// 레인별 f64 부분합 (디버그·GPU 대조용) — gemm_q8i 그룹핑 미러.
 pub fn dot_row_w4a8_iq4xs_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
     let n_sub = (k / 32) as usize;
-    let base = n_sub / 64;
-    let rem = n_sub % 64;
     let mut lane = [0.0f64; 64];
     for l in 0..64usize {
-        let cnt = base + usize::from(l < rem);
-        let start = l * base + l.min(rem);
+        let cnt = (n_sub + 63 - l) / 64; // 스트라이드 매핑 — gemm_q8i 미러
+        let start = l;
         let mut acc = 0.0f64;
         for m in 0..cnt {
-            let sb = start + m;
+            let sb = start + m * 64;
             let (b, ib) = (sb / 8, sb % 8);
             let wb = &data[b * 136..b * 136 + 136];
             let d = f16(wb, 0);
