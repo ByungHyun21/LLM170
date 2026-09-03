@@ -81,6 +81,18 @@ impl RawCtx {
                 fns.insert(*name, f);
             }
             // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등)
+            if let Some(co2) = std::env::var_os("LLM170_CO2_PATH") {
+                let bytes = std::fs::read(&co2).map_err(|e| format!("CO2 읽기: {e}"))?;
+                let mut m3: hip::hipModule_t = std::ptr::null_mut();
+                ck(hip::hipModuleLoadData(&mut m3, bytes.as_ptr() as *const _), "CO2 ModuleLoadData")?;
+                for name in ["gemm_q5k_v4"] {
+                    let cname = CString::new(name).unwrap();
+                    let mut f: hip::hipFunction_t = std::ptr::null_mut();
+                    if hip::hipModuleGetFunction(&mut f, m3, cname.as_ptr()) == hip::hipError_t_hipSuccess {
+                        fns.insert(name, f);
+                    }
+                }
+            }
             if let Some(co) = std::env::var_os("LLM170_CO_PATH") {
                 let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
                 let mut m2: hip::hipModule_t = std::ptr::null_mut();
@@ -373,7 +385,7 @@ impl RawCtx {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
         let kern = match ty {
-            13 => if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
             23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
@@ -1106,7 +1118,8 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
     let kern_name = match w.ty {
-        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
+        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q5k_v4" }
+            else if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
         llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
         llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
@@ -1135,7 +1148,7 @@ pub fn mm_bench() -> Result<String, String> {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let rpb = if kern_name.ends_with("_j128") { 128 } else { 64 };
+        let rpb = if kern_name.ends_with("_j128") || kern_name.ends_with("_v4") { 128 } else { 64 };
         let gx = n_out.div_ceil(rpb).min(65535) as u32;
         let gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
         let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
@@ -1185,7 +1198,7 @@ pub fn mm_bench() -> Result<String, String> {
                 }
                 _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
             };
-            if kern_name.ends_with("_wm") || kern_name.ends_with("_w32") || kern_name.ends_with("_j128") {
+            if kern_name.ends_with("_wm") || kern_name.ends_with("_w32") || kern_name.ends_with("_j128") || kern_name.ends_with("_v4") {
                 let g = o2[ti * n_out + oo];
                 let denom = c2.abs().max(1.0);
                 let rel = (g - c2).abs() / denom;
