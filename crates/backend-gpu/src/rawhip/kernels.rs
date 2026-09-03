@@ -2853,6 +2853,62 @@ extern "C" __global__ void qsa_mix(const float* q, const float* scores, const fl
     out[t * n_head * hd + h * hd + d_i] = a * g;
 }
 
+// QSA fused flash: score+softmax+mix 단일 패스 (KV 타일 online-softmax).
+// 블록=(t,h) 256스레드, d=tid (hd<=256). q 1회 적재 후 전 p 재사용.
+// 마스크 스킵·게이트·exp_cr는 score/mix2와 동일 시맨틱 (p 오름차순 합산 순서는 동일, 반올림 오차만 상이).
+extern "C" __global__ void qsa_flash(const float* q, const float* ck, const float* cv,
+                                     const unsigned* mask, float* out,
+                                     int n_past, int n_head, int n_kv,
+                                     int hd, int t_len, int sstride, int pos0) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= t_len || h >= n_head) return;
+    int tid = threadIdx.x;              // 0..255 (wave32 x8)
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool active = tid < hd;
+    __shared__ float qf[256];
+    __shared__ float rs[8];
+    int kvh = h / (n_head / n_kv);
+    int qb = t * n_head * 2 * hd + h * 2 * hd;
+    if (active) qf[tid] = q[qb + tid];
+    __syncthreads();
+    float m = -3.4028235e38f;
+    float s = 0.0f;
+    float acc = 0.0f;
+    for (int p = 0; p < n_past; p++) {
+        if (mask[(pos0 + t) * sstride + p] == 0u) continue;
+        int kb = p * n_kv * hd + kvh * hd;
+        float x = active ? qf[tid] * ck[kb + tid] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            x += __shfl_down_sync(0xffffffffffffffffull, x, off);
+        if (lane == 0) rs[wid] = x;
+        __syncthreads();
+        float d;
+        if (wid == 0) {
+            float y = lane < 8 ? rs[lane] : 0.0f;
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1)
+                y += __shfl_down_sync(0xffffffffffffffffull, y, off);
+            if (lane == 0) rs[0] = y;
+        }
+        __syncthreads();
+        d = rs[0];
+        float m_new = fmaxf(m, d);
+        // 루프 exp는 네이티브 f32 (전 스레드 병렬). f64 exp_cr 단일스레드 공유보다 30배+ 빠름.
+        // m-m_new, d-m_new <= 0 이라 오버플로 불가. 최종 오차는 반올림 수준.
+        float e_m = __expf(m - m_new);
+        float e_d = __expf(d - m_new);
+        s = s * e_m + e_d;
+        float vv = active ? cv[kb + tid] : 0.0f;
+        acc = acc * e_m + e_d * vv;
+        m = m_new;
+    }
+    if (!active) return;
+    float g = 1.0f / (1.0f + exp_cr(-q[qb + hd + tid]));
+    out[t * n_head * hd + h * hd + tid] = acc * (1.0f / s) * g;
+}
 "#;
 
 pub const NAMES: &[&str] = &[
@@ -2860,7 +2916,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
