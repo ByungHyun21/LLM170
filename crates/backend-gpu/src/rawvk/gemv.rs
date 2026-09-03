@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 
 const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
 const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
+const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
 const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
@@ -57,6 +58,7 @@ struct QuantPipes {
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    t128pipes: Mutex<Option<TilePipes>>,
     ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
     spipe: Mutex<Option<SiluPipes>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -96,6 +98,7 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            t128pipes: Mutex::new(None),
             ffnbufs: Mutex::new(None),
             spipe: Mutex::new(None),
             sbufs: Mutex::new(None),
@@ -583,9 +586,8 @@ impl Accelerator for VkAcc {
                 *ob = Some(b);
             }
         }
-        // coopmat 타일 경로 (q5_K, t≥2): 16토큰 블록 × 16행 그룹 — M3
-        // 타일 경로 (f16 스테이징 → maxrel ~4e-4) — 스트림 게이트 민감해 env 게이트.
-        // 기본 GEMV(비트근사 exact) — LLM170_VK_TILE=1로 타일 활성.
+        // 128행 coopmat 타일 (q5_K, t≥2) — f16 스테이징 maxrel ~4e-4 (HIP v4급).
+        // LLM170_VK_TILE=1로 활성 (스트림 게이트 민감 — 기본 GEMV exact).
         if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
             // 더미
             {
@@ -609,11 +611,12 @@ impl Accelerator for VkAcc {
             let gx = (n_out + 15) as u32 / 16;
             for tb in (0..t).step_by(16) {
                 let nt = (t - tb).min(16) as u32;
-                let mut push = Vec::with_capacity(16);
+                let mut push = Vec::with_capacity(20);
                 push.extend_from_slice(&(n_in as u32).to_le_bytes());
                 push.extend_from_slice(&(n_out as u32).to_le_bytes());
                 push.extend_from_slice(&(xq_w as u32).to_le_bytes());
                 push.extend_from_slice(&nt.to_le_bytes());
+                push.extend_from_slice(&(tb as u32).to_le_bytes());
                 ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
             }
             let host = unsafe {
@@ -630,6 +633,60 @@ impl Accelerator for VkAcc {
         let xb = self.xbuf.lock().as_ref().unwrap().buf;
         let ob = self.obuf.lock().as_ref().unwrap().buf;
         let p = self.pipes(&mut ctx)?;
+        // 더미 (미사용 청크 슬롯)
+        {
+            let mut d = self.dummy.lock();
+            if d.is_none() {
+                let b = ctx.alloc(16)?;
+                *d = Some(b);
+            }
+        }
+        let dbuf = self.dummy.lock().as_ref().unwrap().buf;
+        // tile128 파이프 (10 바인딩, 16B push)
+        {
+            let mut g = self.t128pipes.lock();
+            if g.is_none() {
+                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(TILE128_SPV, 10, 16)?;
+                *g = Some(TilePipes { dsl, pl, dp, ds, pipe });
+            }
+        }
+        if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
+            let p = {
+                let g = self.t128pipes.lock();
+                let r = g.as_ref().unwrap();
+                TilePipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
+            };
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            let xb0 = self.xbuf.lock().as_ref().unwrap().buf;
+            let ob0 = self.obuf.lock().as_ref().unwrap().buf;
+            binds.push(xb0);
+            binds.push(ob0);
+            ctx.bind_bufs(p.ds, &binds);
+            let gx = (n_out + 15) as u32 / 16;
+            for tb in (0..t).step_by(16) {
+                let nt = (t - tb).min(16) as u32;
+                let mut push = Vec::with_capacity(20);
+                push.extend_from_slice(&(n_in as u32).to_le_bytes());
+                push.extend_from_slice(&(n_out as u32).to_le_bytes());
+                push.extend_from_slice(&(xq_w as u32).to_le_bytes());
+                push.extend_from_slice(&nt.to_le_bytes());
+                push.extend_from_slice(&(tb as u32).to_le_bytes());
+                ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
+            }
+            let host = unsafe {
+                std::slice::from_raw_parts(
+                    self.obuf.lock().as_ref().unwrap().ptr as *const f32,
+                    t * n_out,
+                )
+            };
+            for ti in 0..t {
+                outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+            }
+            return Ok(());
+        }
         // ktab(iq4nl) + grid3s 업로드 (최초 1회)
         {
             let mut tb = self.tables.lock();
@@ -935,8 +992,8 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     llm170_core::matmul::matmul_batch(&xs, wref, &mut ref_outs);
     let mut mx = 0f64;
     let mut rel = 0f64;
-    for (a, b) in outs.iter().zip(ref_outs.iter()) {
-        for (x, y) in a.iter().zip(b.iter()) {
+    for (ti2, (a, b)) in outs.iter().zip(ref_outs.iter()).enumerate() {
+        for (o2, (x, y)) in a.iter().zip(b.iter()).enumerate() {
             let d = (x - y).abs() as f64;
             if d > mx {
                 mx = d;

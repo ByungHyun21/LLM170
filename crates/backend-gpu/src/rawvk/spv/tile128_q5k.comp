@@ -1,0 +1,154 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// q5_K 128행 타일 (RADV subgroup64): 512스레드 = 8서브그룹×16행, 토큰 ≤64.
+// A/B 공유 스테이징 × sb 루프 — HIP v4 구조의 Vulkan 포트 (배리어/원소 8×~16× 절감).
+layout(local_size_x = 512) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint t;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> 25u;
+    uint o = idx & 0x1FFFFFFu;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+shared float16_t A16[128][36];  // 행 × 32k(+pad)
+shared float16_t B16[64][36];   // 토큰 × 32k(+pad)
+shared float Ctmp[128][65];     // 드레인 (루프 후 A/B 사멸 — 별칭 아님, 단순 별도)
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;   // 0..511
+    uint sg = gl_SubgroupID;            // 0..7 (행 그룹: sg*16행)
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int row0 = int(bid) * 128;
+    int nt = int(min(pc.t, 64u));
+    int nrow = int(min(128u, pc.n_out - uint(row0)));
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc3 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb++) {
+        // A 스테이징: 512스레드 → 128행 × 32k를 8원소씩 (레인 64개/행)
+        {
+            int r = int(tid >> 2);              // 행 0..127
+            int kc = int(tid & 3) * 8;          // k 오프셋 0/8/16/24
+            int row = row0 + r;
+            if (row < nrow + row0) {
+                int js = sb & 7;
+                int it = js >> 1;
+                int halfb = js & 1;
+                int wq = ((row * blocks + (sb >> 3)) * 176) >> 2;
+                uint w0 = WG(wq);
+                float d = unpackHalf2x16(w0).x;
+                float dm = unpackHalf2x16(w0).y;
+                uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+                uint r2 = (uint(js & 3)) * 8u;
+                uint b_j   = js < 4 ? (sc0 >> r2) & 0xFFu : (sc1 >> r2) & 0xFFu;
+                uint b_j4  = js < 4 ? (sc1 >> r2) & 0xFFu : (sc2 >> r2) & 0xFFu;
+                uint b_jm4 = (sc0 >> r2) & 0xFFu;
+                uint sc_v, m_v;
+                if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+                else {
+                    sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                    m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+                }
+                float ds0 = d * float(sc_v);
+                float ds1 = dm * float(m_v);
+                uint nsh = uint(halfb << 2);
+                int sh = 2 * it + halfb;
+                int qbase = wq + 12 + it * 8;
+                int qhbase = wq + 4;
+                for (int e = 0; e < 8; e++) {
+                    int k = kc + e;
+                    uint byte_v = (WG(qbase + (k >> 2)) >> uint((k & 3) * 8)) & 0xFFu;
+                    uint nib = (byte_v >> nsh) & 0xFu;
+                    uint hi = (WG(qhbase + (k >> 2)) >> uint((k & 3) * 8 + sh)) & 1u;
+                    float wv = float(nib) + (hi != 0u ? 16.0 : 0.0);
+                    A16[r][k] = float16_t(wv * ds0 - ds1);
+                }
+            } else {
+                for (int e = 0; e < 8; e++) A16[r][kc + e] = float16_t(0.0);
+            }
+        }
+        // B 스테이징: 512스레드 → 64토큰 × 32k (레인 8개/토큰)
+        {
+            // 64토큰 × 32원소 = 2048; 512스레드 × 4원소
+            int fl = int(tid) * 4;            // 0..2047
+            int ti2 = fl >> 5;
+            int k2 = fl & 31;
+            if (ti2 < nt) {
+                uint base = uint(ti2) * pc.xq_w;
+                int xw = (sb << 5) >> 2;
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+                for (int e = 0; e < 4; e++) {
+                    uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
+                    int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
+                    B16[ti2][k2 + e] = float16_t(float(b) * yd);
+                }
+            } else if (ti2 < 64) {
+                for (int e = 0; e < 4; e++) B16[ti2][k2 + e] = float16_t(0.0);
+            }
+        }
+        barrier();
+        // compute: 서브그룹당 16행 × (토큰 4×16)
+        for (int ks = 0; ks < 2; ks++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+            coopMatLoad(fa, A16[sg << 4], ks * 16, 36, gl_CooperativeMatrixLayoutRowMajor);
+            for (int tt = 0; tt < 4; tt++) {
+                if (tt * 16 < nt) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb;
+                    coopMatLoad(fb, B16[tt * 16], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
+                    if (tt == 0) acc0 = coopMatMulAdd(fa, fb, acc0);
+                    else if (tt == 1) acc1 = coopMatMulAdd(fa, fb, acc1);
+                    else if (tt == 2) acc2 = coopMatMulAdd(fa, fb, acc2);
+                    else acc3 = coopMatMulAdd(fa, fb, acc3);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // 드레인: 행(128) × 토큰(64) — coopMatStore RowMajor → Ctmp[r][tok]
+    if (nt > 0) coopMatStore(acc0, Ctmp[sg << 4], 0, 65, gl_CooperativeMatrixLayoutRowMajor);
+    if (nt > 16) coopMatStore(acc1, Ctmp[sg << 4], 16, 65, gl_CooperativeMatrixLayoutRowMajor);
+    if (nt > 32) coopMatStore(acc2, Ctmp[sg << 4], 32, 65, gl_CooperativeMatrixLayoutRowMajor);
+    if (nt > 48) coopMatStore(acc3, Ctmp[sg << 4], 48, 65, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (int i = int(tid); i < nrow * nt; i += 512) {
+        int r = i / nt;
+        int ti = i % nt;
+        outv[uint(ti) * pc.n_out + uint(row0 + r)] = Ctmp[r][ti];
+    }
+}

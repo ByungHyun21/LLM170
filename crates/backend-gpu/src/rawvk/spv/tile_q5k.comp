@@ -20,7 +20,7 @@ layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint t;
+    uint n_in; uint n_out; uint xq_w; uint t; uint t_off;
 } pc;
 
 uint WG(uint idx) {
@@ -102,8 +102,9 @@ void main() {
         {
             int ti = int(l) >> 2;        // 토큰 (4레인당 1토큰·k분할은 아래 루프)
             int rr = int(l) >> 2;
+            uint tokg = pc.t_off + uint(ti); // 전역 토큰
             if (ti < nt) {
-                uint base = uint(ti) * pc.xq_w;
+                uint base = tokg * pc.xq_w;
                 int xw = (sb << 5) >> 2;
                 float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
                 for (int k = 0; k < 32; k++) {
@@ -132,6 +133,6 @@ void main() {
         int ti = i >> 4, rr = i & 15;
         int row = row0 + rr;
         if (uint(row) < pc.n_out && ti < nt)
-            outv[uint(ti) * pc.n_out + uint(row)] = Ctmp[rr][ti];
+            outv[(pc.t_off + uint(ti)) * pc.n_out + uint(row)] = Ctmp[rr][ti];
     }
 }
