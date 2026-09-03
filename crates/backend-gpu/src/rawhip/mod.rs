@@ -388,7 +388,7 @@ impl RawCtx {
             13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_CO2_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -1144,7 +1144,7 @@ pub fn mm_bench() -> Result<String, String> {
             (&mut wp) as *mut _ as *mut std::ffi::c_void,
             (&mut op) as *mut _ as *mut std::ffi::c_void,
         ];
-        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" || kern_name == "gemm_xs_j128" {
+        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" || kern_name == "gemm_xs_j128" || kern_name == "gemm_xs_v4" {
             args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
         }
         args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
