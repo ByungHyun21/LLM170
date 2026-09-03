@@ -88,6 +88,10 @@ fn main() -> ExitCode {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
         },
+        Some("vk-check") => match llm170_backend_gpu::rawvk::smoke_test() {
+            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        },
         Some("roof-test") => match llm170_backend_gpu::rawhip::roof_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

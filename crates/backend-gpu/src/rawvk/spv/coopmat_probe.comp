@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+
+// coopmat 16x16x16 f16×f16→f32 검증 프로브: C = A(패턴) × B(항등)
+// A[i][j] = (i*16+j)값, B = 항등 → C[i][j] = A[i][j].
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Abuf { float16_t a[]; };
+layout(binding = 1) readonly buffer Bbuf { float16_t b[]; };
+layout(binding = 2) buffer Cbuf { float c[]; };
+
+void main() {
+    // coopmat 연산은 스코프 전체 균일 실행 필수 — 조기 return 금지.
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopMatLoad(ma, a, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, b, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+    coopMatStore(acc, c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+}

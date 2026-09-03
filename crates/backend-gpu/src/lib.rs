@@ -5,6 +5,7 @@
 //! 비트계약: raw-HIP greedy 스트림 ≡ CPU W4A8 참조 엔진 (12+64토큰 교차검증).
 
 pub mod rawhip;
+pub mod rawvk;
 
 pub use rawhip::decode::RawDecoder;
 pub use rawhip::{bw_test, dp4a_test, exp_ab, qk_check, q6k_ab_test, raw_probe, tree_test};
