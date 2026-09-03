@@ -1,0 +1,50 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+// quant_q8 — f32 x → q8 패킹 xq (qs워드|d워드|s0,s1워드). HIP quant_q8 포트.
+// round-half-away 명시 (trunc(x±0.5)) — Rust round()와 비트 일치.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Xbuf { float x[]; };
+layout(binding = 1) buffer Qbuf { uint xq[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint t; uint xq_w;
+} pc;
+
+shared float shd[64];
+shared uint shs[64][2];
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    uint lb = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x; // 블록(32원소)
+    uint nblk = pc.n_in >> 5;
+    if (lb >= nblk) return;
+    uint base = tok * pc.n_in;
+    uint qbase = tok * pc.xq_w;
+    uint nwords = pc.n_in >> 2;
+    int b = int(lb) << 5;
+    float amax = 0.0;
+    for (int i = 0; i < 32; i++) amax = max(amax, abs(x[base + uint(b + i)]));
+    float d = amax / 127.0;
+    float id = d != 0.0 ? 1.0 / d : 0.0;
+    uint qs0 = 0u, qs1 = 0u;
+    for (int wi = 0; wi < 8; wi++) {
+        uint word = 0u;
+        for (int k = 0; k < 4; k++) {
+            float xv = x[base + uint(b + wi * 4 + k)] * id;
+            float r = xv >= 0.0 ? float(int(xv + 0.5)) : -float(int(0.5 - xv));
+            float c = clamp(r, -127.0, 127.0);
+            word |= (uint(int(c)) & 0xFFu) << uint(k * 8);
+        }
+        xq[qbase + lb * 8u + uint(wi)] = word;
+        uint sd = 0u;
+        for (int k = 0; k < 4; k++) {
+            int bytev = int((word >> uint(8 * k)) & 0xFFu) << 24 >> 24;
+            sd += uint(bytev);
+        }
+        if (wi < 4) qs0 += sd; else qs1 += sd;
+    }
+    xq[qbase + nwords + lb] = floatBitsToUint(d);
+    uint qsb = pc.n_in / 4u + pc.n_in / 32u;
+    xq[qbase + qsb + lb * 2u] = qs0;
+    xq[qbase + qsb + lb * 2u + 1u] = qs1;
+}

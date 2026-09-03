@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 
 const GEMV_SPV: &[u8] = include_bytes!("spv/gemv.spv");
 const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
+const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 
 struct Pipes {
     dsl: vk::DescriptorSetLayout,
@@ -27,9 +28,19 @@ struct TilePipes {
     pipe: vk::Pipeline,
 }
 
+struct QuantPipes {
+    dsl: vk::DescriptorSetLayout,
+    pl: vk::PipelineLayout,
+    dp: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    pipe: vk::Pipeline,
+}
+
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    qpipes: Mutex<Option<QuantPipes>>,
+    xfbuf: Mutex<Option<VkBuf>>,
     tables: Mutex<Option<(VkBuf, VkBuf)>>,
     dummy: Mutex<Option<VkBuf>>,
     pipes: Mutex<Option<Pipes>>,
@@ -62,6 +73,8 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            qpipes: Mutex::new(None),
+            xfbuf: Mutex::new(None),
             tables: Mutex::new(None),
             dummy: Mutex::new(None),
             pipes: Mutex::new(None),
@@ -69,6 +82,16 @@ impl VkAcc {
             xbuf: Mutex::new(None),
             obuf: Mutex::new(None),
         })
+    }
+
+    fn qpipes(&self, ctx: &mut VkCtx) -> Result<QuantPipes, String> {
+        let mut g = self.qpipes.lock();
+        if g.is_none() {
+            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(QUANT_SPV, 2, 12)?;
+            *g = Some(QuantPipes { dsl, pl, dp, ds, pipe });
+        }
+        let r = g.as_ref().unwrap();
+        Ok(QuantPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe })
     }
 
     fn tpipes(&self, ctx: &mut VkCtx) -> Result<TilePipes, String> {
@@ -123,33 +146,47 @@ impl Accelerator for VkAcc {
         let n_out = w.n_out as usize;
         let t = xs.len();
         let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-        let mut xq_h: Vec<u32> = Vec::with_capacity(t * xq_w);
-        let q8s: Vec<_> = xs
-            .iter()
-            .map(|r| llm170_core::quant::quantize_row_q8_ref(r))
-            .collect();
-        for tok in &q8s {
-            for blk in tok {
-                for c in 0..8 {
-                    let b = c * 4;
-                    xq_h.push((blk.qs[b] as u32 & 0xFF)
-                        | ((blk.qs[b + 1] as u32 & 0xFF) << 8)
-                        | ((blk.qs[b + 2] as u32 & 0xFF) << 16)
-                        | ((blk.qs[b + 3] as u32 & 0xFF) << 24));
+        let mut ctx = self.ctx.lock();
+        // GPU 양자화: xs(f32) 업로드 → quant_q8 → xq (CPU 부담 제거)
+        {
+            let mut xf = self.xfbuf.lock();
+            let need = t * n_in * 4;
+            let ok = xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
+            if !ok {
+                let b = ctx.alloc(need.max(1 << 21))?;
+                *xf = Some(b);
+            }
+            let b = xf.as_ref().unwrap();
+            for (ti, row) in xs.iter().enumerate() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        b.ptr.add(ti * n_in * 4) as *mut f32,
+                        n_in,
+                    );
                 }
             }
-            for blk in tok {
-                xq_h.push(blk.d.to_bits());
-            }
-            for blk in tok {
-                let s0: i32 = blk.qs[..16].iter().map(|&v| v as i32).sum();
-                let s1: i32 = blk.qs[16..].iter().map(|&v| v as i32).sum();
-                xq_h.push(s0 as u32);
-                xq_h.push(s1 as u32);
+        }
+        {
+            let mut xb = self.xbuf.lock();
+            let need = t * xq_w * 4;
+            let ok = xb.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
+            if !ok {
+                let b = ctx.alloc(need.max(1 << 21))?;
+                *xb = Some(b);
             }
         }
-
-        let mut ctx = self.ctx.lock();
+        {
+            let qp = self.qpipes(&mut ctx)?;
+            let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
+            let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
+            ctx.bind_bufs(qp.ds, &[xfbuf, xqbuf]);
+            let mut push = Vec::with_capacity(12);
+            push.extend_from_slice(&(n_in as u32).to_le_bytes());
+            push.extend_from_slice(&(t as u32).to_le_bytes());
+            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
+            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
         // 가중 상주 (ptr 키 — mmap 안정) — 128MB 청크 분할 (maxStorageBufferRange)
         {
             let mut wc = self.wcache.lock();
@@ -177,19 +214,6 @@ impl Accelerator for VkAcc {
         };
         if wbufs.len() > 8 {
             return Err(format!("가중 청크 {}개 > 8 슬롯 (M2 한계)", wbufs.len()));
-        }
-        {
-            let mut xb = self.xbuf.lock();
-            let need = t * xq_w * 4;
-            let ok = xb.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 20))?;
-                *xb = Some(b);
-            }
-            let b = xb.as_ref().unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(xq_h.as_ptr() as *const u8, b.ptr, need);
-            }
         }
         {
             let mut ob = self.obuf.lock();
