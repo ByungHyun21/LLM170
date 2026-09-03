@@ -1057,7 +1057,7 @@ pub fn mm_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
                 _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
             };
-            if kern_name.ends_with("_wm") {
+            if kern_name.ends_with("_wm") || kern_name.ends_with("_wh") {
                 let g = o2[ti * n_out + oo];
                 let denom = c2.abs().max(1.0);
                 let rel = (g - c2).abs() / denom;
