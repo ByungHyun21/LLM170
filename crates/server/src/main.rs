@@ -1053,6 +1053,18 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         }
     }
     wnames.push("output.weight".into());
+    // MTP층 (blk.64) — spec decode용 (has_mtp 시)
+    if eng.has_mtp() {
+        let mtp = 64usize;
+        for w in ["attn_q", "attn_k", "attn_v", "attn_output",
+                  "ffn_gate", "ffn_up", "ffn_down", "nextn.eh_proj"] {
+            wnames.push(format!("blk.{mtp}.{w}.weight"));
+        }
+        for c in ["attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm",
+                  "nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"] {
+            cnames.push(format!("blk.{mtp}.{c}"));
+        }
+    }
     cnames.push("output_norm".into());
     cnames.push("cs".into());
     cnames.push("mask".into());
@@ -1103,6 +1115,8 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
                 } else if k.ends_with("ssm_norm") {
                     // frame35: [d_state] 전헤드 공유 → dt_rank 타일
                     (format!("blk.{il}.ssm_norm.weight"), hp.dt_rank)
+                } else if k.ends_with("post_attention_norm") {
+                    (format!("blk.{il}.post_attention_norm.weight"), 1)
                 } else if k.ends_with("attn_norm") {
                     (format!("blk.{il}.attn_norm.weight"), 1)
                 } else if k.ends_with("post_norm") {

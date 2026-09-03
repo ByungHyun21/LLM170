@@ -237,7 +237,7 @@ impl RawCtx {
     ) -> Result<(), String> {
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3")?;
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
         }
         Ok(())
     }
@@ -414,6 +414,17 @@ impl RawCtx {
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
+        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
+    }
+
+    /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
+    fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
+        let j128 = std::env::var_os("LLM170_EXACT").is_none()
+            && std::env::var_os("LLM170_CO_PATH").is_some();
+        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
+    }
+
+    fn tile_core_inner(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8, j128: bool) -> Result<TileLaunch, String> {
         // wm·mm 상한 64: t>64 무CO는 유효 커널 없음 — 침묵 오답 대신 에러
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
@@ -463,6 +474,15 @@ impl RawCtx {
         args.push((&mut l.xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut l.tt) as *mut _ as *mut std::ffi::c_void);
         args
+    }
+
+    /// spec verify head 전용 — j128/v4 타일 강제 (가중 1회 독서).
+    /// 산술은 동일 W4A8이나 환원 순서가 mm 계열와 달라 스트림 비트계약 대상 아님
+    /// (spec 내부 draft↔verify 일관성만 요구).
+    pub fn gemm_tile_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut l = self.tile_core_head(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
+        let mut args = Self::tile_args(&mut l);
+        self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {

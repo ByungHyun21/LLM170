@@ -477,6 +477,7 @@ pub trait RawDecode: Send + Sync {
         _pos0: usize,
         _emb: &[f32],
         _argmaxes: &mut Vec<u32>,
+        _h_all: &mut Vec<f32>,
     ) -> Result<(), String> {
         Err("raw_verify: 미지원".into())
     }
@@ -490,6 +491,32 @@ pub trait RawDecode: Send + Sync {
         _h_all: &mut Vec<f32>,
     ) -> Result<Vec<f32>, String> {
         Err("raw_prefill_h: 미지원".into())
+    }
+
+    /// MTP 체인 스텝 (h = 내부 mtp_cur): argmax. 기본 Err.
+    fn mtp_step_chain(&self, _seq: usize, _tok_emb: &[f32], _pos: usize) -> Result<u32, String> {
+        Err("mtp_step_chain: 미지원".into())
+    }
+    /// MTP 상태 진행 (trunk h, head 없음). 기본 Err.
+    fn mtp_step_adv(
+        &self,
+        _seq: usize,
+        _tok_emb: &[f32],
+        _h: &[f32],
+        _pos: usize,
+    ) -> Result<(), String> {
+        Err("mtp_step_adv: 미지원".into())
+    }
+
+    /// MTP 1스텝 GPU (blk.64): (argmax, h_next). 기본 Err.
+    fn mtp_step_gpu(
+        &self,
+        _seq: usize,
+        _tok_emb: &[f32],
+        _h: &[f32],
+        _pos: usize,
+    ) -> Result<(u32, Vec<f32>), String> {
+        Err("mtp_step_gpu: 미지원".into())
     }
 
     /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백). 기본 Err.
