@@ -652,9 +652,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
 
-    fragment<accumulator, 16, 16, 16, float> fc[4];
+    fragment<accumulator, 16, 16, 16, float> fc[2];
     #pragma unroll
-    for (int i = 0; i < 4; i++) fill_fragment(fc[i], 0.0f);
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;   // wave32 페어 분할 (wid 그룹 내 2웨이브 중복 제거)
 
     for (int sbp = 0; sbp < n_sub; sbp += 2) {
         #pragma unroll
@@ -729,10 +730,11 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
                 fragment<matrix_a, 16, 16, 16, half, row_major> fa;
                 load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
                 #pragma unroll
-                for (int tt = 0; tt < 4; tt++) {
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
                     fragment<matrix_b, 16, 16, 16, half, col_major> fb;
                     load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
-                    mma_sync(fc[tt], fa, fb, fc[tt]);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
                 }
             }
         }
@@ -741,8 +743,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
     // Ctmp는 A16+B16(18.4KB)에 별칭 — 스테이징 데이터는 루프 후 사멸
     float* CtmpF = (float*)smem;
     #pragma unroll
-    for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
+    for (int tth = 0; tth < 2; tth++) {
+        int tt2 = wpar * 2 + tth;
+        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
+    }
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
@@ -769,9 +773,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
 
-    fragment<accumulator, 16, 16, 16, float> fc[4];
+    fragment<accumulator, 16, 16, 16, float> fc[2];
     #pragma unroll
-    for (int i = 0; i < 4; i++) fill_fragment(fc[i], 0.0f);
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;   // wave32 페어 분할 (wid 그룹 내 2웨이브 중복 제거)
 
     for (int sbp = 0; sbp < n_sub; sbp += 2) {
         #pragma unroll
@@ -842,10 +847,11 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
                 fragment<matrix_a, 16, 16, 16, half, row_major> fa;
                 load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
                 #pragma unroll
-                for (int tt = 0; tt < 4; tt++) {
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
                     fragment<matrix_b, 16, 16, 16, half, col_major> fb;
                     load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
-                    mma_sync(fc[tt], fa, fb, fc[tt]);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
                 }
             }
         }
@@ -853,8 +859,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
     }
     float* CtmpF = (float*)smem;
     #pragma unroll
-    for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
+    for (int tth = 0; tth < 2; tth++) {
+        int tt2 = wpar * 2 + tth;
+        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
+    }
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
@@ -881,9 +889,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
 
-    fragment<accumulator, 16, 16, 16, float> fc[4];
+    fragment<accumulator, 16, 16, 16, float> fc[2];
     #pragma unroll
-    for (int i = 0; i < 4; i++) fill_fragment(fc[i], 0.0f);
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;   // wave32 페어 분할 (wid 그룹 내 2웨이브 중복 제거)
 
     for (int sbp = 0; sbp < n_sub; sbp += 2) {
         #pragma unroll
@@ -965,10 +974,11 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
                 fragment<matrix_a, 16, 16, 16, half, row_major> fa;
                 load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
                 #pragma unroll
-                for (int tt = 0; tt < 4; tt++) {
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
                     fragment<matrix_b, 16, 16, 16, half, col_major> fb;
                     load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
-                    mma_sync(fc[tt], fa, fb, fc[tt]);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
                 }
             }
         }
@@ -976,8 +986,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
     }
     float* CtmpF = (float*)smem;
     #pragma unroll
-    for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
+    for (int tth = 0; tth < 2; tth++) {
+        int tt2 = wpar * 2 + tth;
+        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
+    }
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
@@ -1007,9 +1019,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
     int blocks = n_in >> 8;
     int qsb = (n_in >> 2) + (n_in >> 5);
 
-    fragment<accumulator, 16, 16, 16, float> fc[4];
+    fragment<accumulator, 16, 16, 16, float> fc[2];
     #pragma unroll
-    for (int i = 0; i < 4; i++) fill_fragment(fc[i], 0.0f);
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;   // wave32 페어 분할 (wid 그룹 내 2웨이브 중복 제거)
 
     for (int sbp = 0; sbp < n_sub; sbp += 2) {
         #pragma unroll
@@ -1072,10 +1085,11 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
                 fragment<matrix_a, 16, 16, 16, half, row_major> fa;
                 load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
                 #pragma unroll
-                for (int tt = 0; tt < 4; tt++) {
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
                     fragment<matrix_b, 16, 16, 16, half, col_major> fb;
                     load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
-                    mma_sync(fc[tt], fa, fb, fc[tt]);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
                 }
             }
         }
@@ -1083,8 +1097,10 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
     }
     float* CtmpF = (float*)smem;
     #pragma unroll
-    for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
+    for (int tth = 0; tth < 2; tth++) {
+        int tt2 = wpar * 2 + tth;
+        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
+    }
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;

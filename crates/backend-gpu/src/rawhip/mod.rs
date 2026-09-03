@@ -85,7 +85,8 @@ impl RawCtx {
                 let bytes = std::fs::read(&co2).map_err(|e| format!("CO2 읽기: {e}"))?;
                 let mut m3: hip::hipModule_t = std::ptr::null_mut();
                 ck(hip::hipModuleLoadData(&mut m3, bytes.as_ptr() as *const _), "CO2 ModuleLoadData")?;
-                for name in ["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4"] {
+                // + wm 4종: 오프라인 CO가 있으면 hipRTC 버전을 가림 (실험용 오버라이드, 평소 무동작)
+                for name in ["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm"] {
                     let cname = CString::new(name).unwrap();
                     let mut f: hip::hipFunction_t = std::ptr::null_mut();
                     if hip::hipModuleGetFunction(&mut f, m3, cname.as_ptr()) == hip::hipError_t_hipSuccess {
