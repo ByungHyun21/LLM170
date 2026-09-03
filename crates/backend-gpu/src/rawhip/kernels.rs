@@ -2655,10 +2655,13 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
             ssr[j] *= g_exp;
             part += ssr[j] * ks[(lane << 2) + j];
         }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            part += __shfl_xor(0xFFFFFFFFFFFFFFFFull, part, off);
+        // 트리 환원 (shfl_sync 기반 — 검증된 프리미티브, xor 마스크 회피)
         float sk = part;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
+            sk += pj;
+        }
         float delta = (v[v0 + u] - sk) * beta;
         #pragma unroll
         for (int j = 0; j < 4; j++)
@@ -2667,10 +2670,13 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
         #pragma unroll
         for (int j = 0; j < 4; j++)
             op += ssr[j] * qs[(lane << 2) + j];
+        float otot = op;
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            op += __shfl_xor(0xFFFFFFFFFFFFFFFFull, op, off);
-        if (lane == 0) out[v0 + u] = op * scale;
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
+            otot += pj;
+        }
+        if (lane == 0) out[v0 + u] = otot * scale;
         __syncthreads();
     }
     #pragma unroll
