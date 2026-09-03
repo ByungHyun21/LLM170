@@ -49,7 +49,7 @@ Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
 | ours HIP spec k=4 (warm) | **19.2-19.4** | **1.25×** |
 | ours HIP np4 (batched decode) | 19.0 aggregate | 1.23× |
 | ours HIP np8 (batched decode) | 27.9 aggregate | 1.80× |
-| ours HIP np4×spec4 (merged verify, natural text) | **25.4-27.9 aggregate** | **1.64-1.80×** (llama.cpp np4+MTP 15.5) |
+| ours HIP np4×spec4 (merged verify, natural text) | **27.1-28.1 aggregate** | **1.75-1.81×** (llama.cpp np4+MTP 15.5) |
 | ours HIP np8×spec4 (verify cap 64) | 22.2 aggregate | 1.43× |
 | llama.cpp MTP (np4 server) | 15.5 | 1.00× |
 
