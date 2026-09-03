@@ -1085,6 +1085,49 @@ pub fn roof_test() -> Result<String, String> {
         msg += &format!("mode{mode} ({}): {:.2}ms → {:.2} TIOPS MAC\n",
             ["reg-chain", "same-addr load", "stride load"][mode], dt * 1e3, tips);
     }
+    // mfma 발행률 — rocwmma 16x16x16f32 (8192 FLOP/wave/mma)
+    {
+        let ntiles = 64usize;
+        let ah = vec![0x3c00u16; ntiles * 256];
+        let ad = ctx.alloc(ah.len() * 2)?;
+        let bd = ctx.alloc(ah.len() * 2)?;
+        ctx.h2d(ad, bytemuck::cast_slice(&ah))?;
+        ctx.h2d(bd, bytemuck::cast_slice(&ah))?;
+        let om = ctx.alloc(24)?;
+        for &mode in &[0usize, 1] {
+            let iters = 20000usize;
+            let mut ap = ad as *mut std::ffi::c_void;
+            let mut bp = bd as *mut std::ffi::c_void;
+            let mut op = om as *mut std::ffi::c_void;
+            let mut m = mode as i32;
+            let mut it = iters as i32;
+            let mut nn = ntiles as i32;
+            let mut args = vec![
+                (&mut ap) as *mut _ as *mut std::ffi::c_void,
+                (&mut bp) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut m) as *mut _ as *mut std::ffi::c_void,
+                (&mut it) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("mfma_roof", 640, 1, 1, 64, &mut args)?;
+            ctx.sync()?;
+            let reps = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                ctx.launch3("mfma_roof", 640, 1, 1, 64, &mut args)?;
+            }
+            ctx.sync()?;
+            let dt = t0.elapsed().as_secs_f64() / reps as f64;
+            let mut o3 = [0f64; 3];
+            ctx.d2h(bytemuck::cast_slice_mut(&mut o3).as_mut(), om)?;
+            let wavesize = o3[2];
+            let waves = 640.0 * 64.0 / wavesize;
+            let tflops = waves * iters as f64 * 8192.0 / dt / 1e12;
+            msg += &format!("mfma{mode} ({} wave{}): {:.2}ms → {:.2} TFLOPS f32\n",
+                ["reg-resident", "L1-fed"][mode], wavesize, dt * 1e3, tflops);
+        }
+    }
     Ok(msg)
 }
 

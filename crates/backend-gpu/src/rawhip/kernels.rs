@@ -2307,6 +2307,28 @@ extern "C" __global__ void dot_roof(const unsigned* xq, const unsigned* w,
     out[1] = (double)acc;
 }
 
+// mfma 발행률 프로브 — rocwmma 16x16x16f32, 레지스터 상주 vs L1 피드.
+extern "C" __global__ void mfma_roof(const half* a, const half* b,
+                                     double* out, int mode, int iters, int n) {
+    fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+    fragment<matrix_b, 16, 16, 16, half, row_major> fb;
+    fragment<accumulator, 16, 16, 16, float> fc;
+    fill_fragment(fc, 0.0f);
+    load_matrix_sync(fa, a, 16);
+    load_matrix_sync(fb, b, 16);
+    if (mode == 0) {
+        for (int i = 0; i < iters; i++) mma_sync(fc, fa, fb, fc);
+    } else {
+        for (int i = 0; i < iters; i++) {
+            load_matrix_sync(fa, a + ((i * 37) % n) * 256, 16);
+            load_matrix_sync(fb, b + ((i * 53) % n) * 256, 16);
+            mma_sync(fc, fa, fb, fc);
+        }
+    }
+    if (fc.x[0] == 1.0e30f) out[0] = 1.0;
+    out[1] = (double)fc.x[0];
+    out[2] = (double)__popcll(__ballot_sync(0xffffffffffffffffull, 1));
+}
 // 결정적 argmax — 최저 인덱스 동률 (CPU greedy: v > bv 엄격 대소와 동일).
 // 2단계: 블록별 (최대·최저인덱스) → 단일 블록 결합.
 typedef struct { float v; int i; } AM;
@@ -2916,7 +2938,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
