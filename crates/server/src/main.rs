@@ -1060,7 +1060,14 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
                     }
                     Some(cs)
                 } else {
-                    Some(vec![1.0f32; ctx_n])
+                    // 인과 마스크 [pos][p]: p<=pos 만 1 — qsa 배치용
+                    let mut m = vec![0.0f32; ctx_n * ctx_n];
+                    for pos in 0..ctx_n {
+                        for pp in 0..=pos {
+                            m[pos * ctx_n + pp] = 1.0;
+                        }
+                    }
+                    Some(m)
                 }
             } else if k.ends_with("conv_w") {
                 eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()

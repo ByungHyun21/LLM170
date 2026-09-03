@@ -530,8 +530,10 @@ impl DecodeState {
                     let mut nk = n_kv as i32;
                     let mut h = hd as i32;
                     let mut tl = 1i32;
+                    let mut ss = self.ctx_len as i32;
+                    let mut p0 = pos as i32;
                     let gx = n_past.div_ceil(64) as u32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                     self.ctx.launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  score ok"); }
                 }
@@ -547,8 +549,10 @@ impl DecodeState {
                     let mut nk = n_kv as i32;
                     let mut h = hd as i32;
                     let mut tl = 1i32;
+                    let mut ss = self.ctx_len as i32;
+                    let mut p0 = pos as i32;
                     let gx = hd.div_ceil(64) as u32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                     self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
                 }
@@ -886,40 +890,42 @@ gmark("attn", &mut marks);
                     let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
                     self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
                 }
-                // qsa per-token (n_past 의존)
-                for ti in 0..t {
-                    let pos = pos0 + ti;
-                    let (ao4) = (ti * n_head * hd * 4) as isize;
-                    let n_past = pos + 1;
-                    let scp4 = (ti * n_head * self.ctx_len * 4) as isize;
-                    let aqp4 = (ti * n_head * 2 * hd * 4) as isize;
+                // qsa 배치 (단일 런치 — sstride=ctx, n_past=pos0+t 최대;
+                // 초과 p는 마스크→-3e38→w=0 기여로 원소 산술열 불변)
+                {
+                    let np_max = (pos0 + t) as i32;
+                    let sstr = self.ctx_len as i32;
                     {
-                        let mut qp = unsafe { self.aq_t.offset(aqp4) } as *mut std::ffi::c_void;
+                        let mut qp = self.aq_t as *mut std::ffi::c_void;
                         let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
                         let mut mp = mask as *mut std::ffi::c_void;
-                        let mut scp = unsafe { self.scores_t.offset(scp4) } as *mut std::ffi::c_void;
-                        let mut np_ = n_past as i32;
+                        let mut scp = self.scores_t as *mut std::ffi::c_void;
+                        let mut np_ = np_max;
                         let mut nh = n_head as i32;
                         let mut nk = n_kv as i32;
                         let mut h = hd as i32;
-                        let mut tl = 1i32;
-                        let gx = n_past.div_ceil(64) as u32;
-                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
-                        self.ctx.launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
+                        let mut tl = t as i32;
+                        let mut ss = sstr;
+                        let mut p0 = pos0 as i32;
+                        let gx = np_max.unsigned_abs().div_ceil(64);
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                        self.ctx.launch3("qsa_score", gx, n_head as u32, t as u32, 64, &mut args)?;
                     }
                     {
-                        let mut qp = unsafe { self.aq_t.offset(aqp4) } as *mut std::ffi::c_void;
-                        let mut scp = unsafe { self.scores_t.offset(scp4) } as *mut std::ffi::c_void;
+                        let mut qp = self.aq_t as *mut std::ffi::c_void;
+                        let mut scp = self.scores_t as *mut std::ffi::c_void;
                         let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
-                        let mut op = unsafe { self.aout_t.offset(ao4) } as *mut std::ffi::c_void;
-                        let mut np_ = n_past as i32;
+                        let mut op = self.aout_t as *mut std::ffi::c_void;
+                        let mut np_ = np_max;
                         let mut nh = n_head as i32;
                         let mut nk = n_kv as i32;
                         let mut h = hd as i32;
-                        let mut tl = 1i32;
+                        let mut tl = t as i32;
+                        let mut ss = sstr;
+                        let mut p0 = pos0 as i32;
                         let gx = hd.div_ceil(64) as u32;
-                        let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl)];
-                        self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                        self.ctx.launch3("qsa_mix", gx, n_head as u32, t as u32, 64, &mut args)?;
                     }
                 }
                 // wo 배치
