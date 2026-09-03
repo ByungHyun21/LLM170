@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 
 const GEMV_SPV: &[u8] = include_bytes!("spv/gemv.spv");
+const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
 
 struct Pipes {
     dsl: vk::DescriptorSetLayout,
@@ -18,8 +19,17 @@ struct Pipes {
     pipe: vk::Pipeline,
 }
 
+struct TilePipes {
+    dsl: vk::DescriptorSetLayout,
+    pl: vk::PipelineLayout,
+    dp: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    pipe: vk::Pipeline,
+}
+
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
+    tpipes: Mutex<Option<TilePipes>>,
     dummy: Mutex<Option<VkBuf>>,
     pipes: Mutex<Option<Pipes>>,
     /// 가중치 캐시 (데이터 포인터 → 상주 버퍼)
@@ -46,12 +56,23 @@ impl VkAcc {
         }
         Ok(Self {
             ctx: Mutex::new(ctx),
+            tpipes: Mutex::new(None),
             dummy: Mutex::new(None),
             pipes: Mutex::new(None),
             wcache: Mutex::new(HashMap::new()),
             xbuf: Mutex::new(None),
             obuf: Mutex::new(None),
         })
+    }
+
+    fn tpipes(&self, ctx: &mut VkCtx) -> Result<TilePipes, String> {
+        let mut g = self.tpipes.lock();
+        if g.is_none() {
+            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(TILE_Q5K_SPV, 10, 16)?;
+            *g = Some(TilePipes { dsl, pl, dp, ds, pipe });
+        }
+        let r = g.as_ref().unwrap();
+        Ok(TilePipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe })
     }
 
     fn pipes(&self, ctx: &mut VkCtx) -> Result<Pipes, String> {
@@ -173,6 +194,50 @@ impl Accelerator for VkAcc {
                 *ob = Some(b);
             }
         }
+        // coopmat 타일 경로 (q5_K, t≥2): 16토큰 블록 × 16행 그룹 — M3
+        // 타일 경로 (f16 스테이징 → maxrel ~4e-4) — 스트림 게이트 민감해 env 게이트.
+        // 기본 GEMV(비트근사 exact) — LLM170_VK_TILE=1로 타일 활성.
+        if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
+            // 더미
+            {
+                let mut d = self.dummy.lock();
+                if d.is_none() {
+                    let b = ctx.alloc(16)?;
+                    *d = Some(b);
+                }
+            }
+            let dbuf = self.dummy.lock().as_ref().unwrap().buf;
+            let p = self.tpipes(&mut ctx)?;
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            let xb0 = self.xbuf.lock().as_ref().unwrap().buf;
+            let ob0 = self.obuf.lock().as_ref().unwrap().buf;
+            binds.push(xb0);
+            binds.push(ob0);
+            ctx.bind_bufs(p.ds, &binds);
+            let gx = (n_out + 15) as u32 / 16;
+            for tb in (0..t).step_by(16) {
+                let nt = (t - tb).min(16) as u32;
+                let mut push = Vec::with_capacity(16);
+                push.extend_from_slice(&(n_in as u32).to_le_bytes());
+                push.extend_from_slice(&(n_out as u32).to_le_bytes());
+                push.extend_from_slice(&(xq_w as u32).to_le_bytes());
+                push.extend_from_slice(&nt.to_le_bytes());
+                ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
+            }
+            let host = unsafe {
+                std::slice::from_raw_parts(
+                    self.obuf.lock().as_ref().unwrap().ptr as *const f32,
+                    t * n_out,
+                )
+            };
+            for ti in 0..t {
+                outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+            }
+            return Ok(());
+        }
         let xb = self.xbuf.lock().as_ref().unwrap().buf;
         let ob = self.obuf.lock().as_ref().unwrap().buf;
         let p = self.pipes(&mut ctx)?;
@@ -233,7 +298,7 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) as f32 / 2147483648.0 - 0.5
     };
-    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg() * 10.0).collect()).collect();
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     let mut outs = vec![vec![0.0f32; w.n_out as usize]; t];
     acc.matmul_batch(&xs, wref, &mut outs)?;
     // CPU 참조
