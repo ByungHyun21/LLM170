@@ -429,6 +429,168 @@ impl Accelerator for VkAcc {
         self.rms_norm_gpu(xs, w, eps, outs)
     }
 
+    /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        // 지원 타입 혼합 그룹은 개별 폴백
+        if ws.iter().any(|w| vk_ty(w.ty).is_none()) {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                self.matmul_batch(xs, w, out)?;
+            }
+            return Ok(());
+        }
+        let n_in = ws[0].n_in as usize;
+        if ws.iter().any(|w| w.n_in as usize != n_in) {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                self.matmul_batch(xs, w, out)?;
+            }
+            return Ok(());
+        }
+        let t = xs.len();
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let mut ctx = self.ctx.lock();
+        // 업로드+양자화 1회 (matmul_batch와 동일 로직)
+        {
+            let mut xf = self.xfbuf.lock();
+            let need = t * n_in * 4;
+            let ok = xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
+            if !ok {
+                let b = ctx.alloc(need.max(1 << 21))?;
+                *xf = Some(b);
+            }
+            let b = xf.as_ref().unwrap();
+            for (ti, row) in xs.iter().enumerate() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        b.ptr.add(ti * n_in * 4) as *mut f32,
+                        n_in,
+                    );
+                }
+            }
+        }
+        {
+            let mut xb = self.xbuf.lock();
+            let need = t * xq_w * 4;
+            let ok = xb.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
+            if !ok {
+                let b = ctx.alloc(need.max(1 << 21))?;
+                *xb = Some(b);
+            }
+        }
+        {
+            let qp = self.qpipes(&mut ctx)?;
+            let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
+            let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
+            ctx.bind_bufs(qp.ds, &[xfbuf, xqbuf]);
+            let mut push = Vec::with_capacity(12);
+            push.extend_from_slice(&(n_in as u32).to_le_bytes());
+            push.extend_from_slice(&(t as u32).to_le_bytes());
+            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
+            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
+        // 가중 캐시 (matmul_batch 공용 로직)
+        let tables = {
+            let mut tb = self.tables.lock();
+            if tb.is_none() {
+                let kv: Vec<u32> = (0..256u32)
+                    .map(|b| {
+                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+                        lo | (hi << 8)
+                    })
+                    .collect();
+                let kb = ctx.alloc(1024)?;
+                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
+                let gb = ctx.alloc(2048)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
+                        gb.ptr,
+                        2048,
+                    );
+                }
+                *tb = Some((kb, gb));
+            }
+            let (a, b) = tb.as_ref().unwrap();
+            (a.buf, b.buf)
+        };
+        let p = self.pipes(&mut ctx)?;
+        let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
+        for (wi, w) in ws.iter().enumerate() {
+            let ty = vk_ty(w.ty).unwrap();
+            let n_out = w.n_out as usize;
+            let wbufs: Vec<_> = {
+                let mut wc = self.wcache.lock();
+                let key = w.data.as_ptr() as usize;
+                if !wc.contains_key(&key) {
+                    let ch = ctx.max_ssbo;
+                    let total = w.data.len();
+                    let mut bufs = Vec::new();
+                    let mut off = 0usize;
+                    while off < total {
+                        let nb = ch.min(total - off);
+                        let b = ctx.alloc(nb)?;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, nb);
+                        }
+                        bufs.push(b);
+                        off += nb;
+                    }
+                    wc.insert(key, bufs);
+                }
+                wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
+            };
+            if wbufs.len() > 8 {
+                return Err("가중 청크 > 8 (M2 한계)".into());
+            }
+            {
+                let mut ob = self.obuf.lock();
+                let need = t * n_out * 4;
+                let ok = ob.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
+                if !ok {
+                    let b = ctx.alloc(need.max(1 << 21))?;
+                    *ob = Some(b);
+                }
+            }
+            let ob = self.obuf.lock().as_ref().unwrap().buf;
+            {
+                let mut d = self.dummy.lock();
+                if d.is_none() {
+                    let b = ctx.alloc(16)?;
+                    *d = Some(b);
+                }
+            }
+            let dbuf = self.dummy.lock().as_ref().unwrap().buf;
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(xqbuf);
+            binds.push(ob);
+            binds.push(tables.0);
+            binds.push(tables.1);
+            ctx.bind_bufs(p.ds, &binds);
+            let mut push = Vec::with_capacity(16);
+            push.extend_from_slice(&(n_in as u32).to_le_bytes());
+            push.extend_from_slice(&(n_out as u32).to_le_bytes());
+            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
+            push.extend_from_slice(&ty.to_le_bytes());
+            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+            let host = unsafe {
+                std::slice::from_raw_parts(self.obuf.lock().as_ref().unwrap().ptr as *const f32, t * n_out)
+            };
+            for ti in 0..t {
+                outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+            }
+        }
+        Ok(())
+    }
+
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
         let xs = vec![x.to_vec()];
         let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
