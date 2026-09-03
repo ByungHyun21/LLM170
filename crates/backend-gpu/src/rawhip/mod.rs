@@ -315,7 +315,7 @@ impl RawCtx {
             13 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => "gemm_q6k_mm",
-            23 => "gemm_xs_mm",
+            23 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
