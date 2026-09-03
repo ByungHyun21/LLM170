@@ -1,0 +1,287 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// W4A8 GEMV v2 — 워크그룹=행, 가중 레인 레지스터 상주 × 토큰 내부 루프.
+// 가중 1회 판독 (t 무관) — v1의 t배 재판독(1.5GB/s) 해소.
+// 축소: 토큰당 subgroupAdd(f64).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };
+layout(binding = 11) readonly buffer Gbuf { uint grid3s[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint ty; uint t;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> 25u;
+    uint o = idx & 0x1FFFFFFu;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+int s8(uint v) { return (int(v) << 24) >> 24; }
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+int KVAL(int nib) {
+    const int kv[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+    return kv[nib];
+}
+
+#define MAXCNT 6   // 레인당 최대 sb/블록 수 (n_in=17408 → n_sub=544 → cnt≤9... q4k ffn_down 예외는 가드)
+
+void main() {
+    uint o = gl_WorkGroupID.x;
+    if (o >= pc.n_out) return;
+    uint l = gl_LocalInvocationID.x;
+    int n_in = int(pc.n_in);
+    int t = int(pc.t);
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - int(l)) >> 6;
+
+    // 토큰 루프 외부에서 가중 로드 (레인 레지스터) — 타입별 최대 슬롯
+    uint wq0[MAXCNT*4]; uint wq1[MAXCNT*4]; // ql/qh 또는 ql/ql2 (최대 4워드/sb·q5k·q6k 가상)
+    float dsc[MAXCNT]; float dsc2[MAXCNT];  // 스케일들
+    int qsums_skip = 0;
+
+    if (pc.ty == 13u) {          // q5_K
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 176;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int js = sb & 7;
+            int it = js >> 1;
+            int halfb = js & 1;
+            int wq = (row_base + (sb >> 3) * 176) >> 2;
+            uint w0 = WG(wq);
+            vec2 dd = unpackHalf2x16(w0);
+            uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+            uint r = (uint(js & 3)) * 8u;
+            uint b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+            uint b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+            uint b_jm4 = (sc0 >> r) & 0xFFu;
+            uint sc_v, m_v;
+            if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+            else {
+                sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+            }
+            dsc[m] = dd.x * float(sc_v);
+            dsc2[m] = dd.y * float(m_v);
+            int qhw = wq + 4;
+            int qlb = wq + 12 + it * 8;
+            for (int k = 0; k < 4; k++) {
+                wq0[m*4+k] = WG(qlb + k);
+                wq1[m*4+k] = WG(qhw + k);
+                wq0[(MAXCNT+m)*4+k] = WG(qlb + 4 + k);
+                wq1[(MAXCNT+m)*4+k] = WG(qhw + 4 + k);
+            }
+        }
+        for (int ti = 0; ti < t; ti++) {
+            uint base = uint(ti) * pc.xq_w;
+            float acc = 0.0;
+            for (int m = 0; m < cnt; m++) {
+                int sb = int(l) + (m << 6);
+                int js = sb & 7;
+                int halfb = js & 1;
+                uint nsh = uint(halfb << 2);
+                int xw = (sb << 5) >> 2;
+                int isum = 0;
+                for (int k = 0; k < 8; k++) {
+                    uint qv = k < 4 ? wq0[m*4+k] : wq0[(MAXCNT+m)*4+k-4];
+                    uint hv = k < 4 ? wq1[m*4+k] : wq1[(MAXCNT+m)*4+k-4];
+                    uint yv = xq[base + uint(xw + k)];
+                    uint nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+                    int sh = 2 * (js >> 1) + halfb;
+                    uint bitw = ((hv & (0x01010101u << uint(sh))) >> uint(sh)) << 4;
+                    isum = dot4(nibw | bitw, yv, isum);
+                }
+                int qsb = (n_in >> 2) + (n_in >> 5);
+                int qsum = int(xq[base + uint(qsb + (sb << 1))]) + int(xq[base + uint(qsb + (sb << 1) + 1)]);
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+                acc += yd * dsc[m] * float(isum);
+                acc -= yd * dsc2[m] * float(qsum);
+            }
+            double accd = subgroupAdd(double(acc));
+            if (l == 0u) outv[uint(ti) * pc.n_out + o] = float(accd);
+        }
+    } else if (pc.ty == 12u) {   // q4_K
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 144;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int js = sb & 7;
+            int it = js >> 1;
+            int wq = (row_base + (sb >> 3) * 144) >> 2;
+            uint w0 = WG(wq);
+            vec2 dd = unpackHalf2x16(w0);
+            uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+            uint r = (uint(js & 3)) * 8u;
+            uint b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+            uint b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+            uint b_jm4 = (sc0 >> r) & 0xFFu;
+            uint sc_v, m_v;
+            if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+            else {
+                sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+            }
+            dsc[m] = dd.x * float(sc_v);
+            dsc2[m] = dd.y * float(m_v);
+            int qlb = wq + 4 + it * 8;
+            for (int k = 0; k < 4; k++) {
+                wq0[m*4+k] = WG(qlb + k);
+                wq0[(MAXCNT+m)*4+k] = WG(qlb + 4 + k);
+            }
+        }
+        for (int ti = 0; ti < t; ti++) {
+            uint base = uint(ti) * pc.xq_w;
+            float acc = 0.0;
+            for (int m = 0; m < cnt; m++) {
+                int sb = int(l) + (m << 6);
+                int halfb = sb & 1;
+                uint nsh = uint(halfb << 2);
+                int xw = (sb << 5) >> 2;
+                int isum = 0;
+                for (int k = 0; k < 8; k++) {
+                    uint qv = k < 4 ? wq0[m*4+k] : wq0[(MAXCNT+m)*4+k-4];
+                    uint yv = xq[base + uint(xw + k)];
+                    isum = dot4((qv >> nsh) & 0x0F0F0F0Fu, yv, isum);
+                }
+                int qsb = (n_in >> 2) + (n_in >> 5);
+                int qsum = int(xq[base + uint(qsb + (sb << 1))]) + int(xq[base + uint(qsb + (sb << 1) + 1)]);
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+                acc += yd * dsc[m] * float(isum);
+                acc -= yd * dsc2[m] * float(qsum);
+            }
+            double accd = subgroupAdd(double(acc));
+            if (l == 0u) outv[uint(ti) * pc.n_out + o] = float(accd);
+        }
+    } else if (pc.ty == 14u) {   // q6_K — 16그룹 단위 (q16 합, yd 쌍)
+        int n_g = n_in >> 4;
+        int cntg = (n_g + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 210;
+        // q6k는 구조상 그룹당 가중 워드 8개 (ql 4 + qh 4) — MAXCNT×8 필요하나
+        // ffn용 q6k n_in=5120 → n_g=320 → cntg≤6 OK. ssm_out n_in=5120 동일.
+        for (int m = 0; m < cntg && m < MAXCNT; m++) {
+            int g = int(l) + (m << 6);
+            int blk = g >> 4;
+            int kloc = g - (blk << 4);
+            int wb = row_base + blk * 210;
+            int h2 = kloc >> 3;
+            int src = (kloc - (h2 << 3)) >> 1;
+            int p = kloc & 1;
+            float d;
+            {
+                int bi = wb + 208;
+                d = unpackHalf2x16(WG(uint(bi >> 2)) >> uint((bi & 3) * 8)).x;
+            }
+            int scv = s8((WG(uint((wb + 192 + kloc) >> 2)) >> uint(((wb + 192 + kloc) & 3) * 8)) & 0xFFu);
+            dsc[m] = d * float(scv);
+            int ql_rel = h2 * 64 + p * 16 + ((src & 1) << 5);
+            int qh_rel = 128 + h2 * 32 + p * 16;
+            bool al = ((wb & 3) == 0);
+            int qlw = (wb + ql_rel) >> 2;
+            int qhw = (wb + qh_rel) >> 2;
+            for (int k = 0; k < 4; k++) {
+                wq0[m*4+k] = al ? WG(uint(qlw + k)) : (WG(uint(qlw + k)) >> 16) | (WG(uint(qlw + k + 1)) << 16);
+                wq1[m*4+k] = al ? WG(uint(qhw + k)) : (WG(uint(qhw + k)) >> 16) | (WG(uint(qhw + k + 1)) << 16);
+            }
+        }
+        for (int ti = 0; ti < t; ti++) {
+            uint base = uint(ti) * pc.xq_w;
+            float acc = 0.0;
+            for (int m = 0; m < cntg && m < MAXCNT; m++) {
+                int g = int(l) + (m << 6);
+                int kloc = g & 15;
+                int h2 = kloc >> 3;
+                int src = (kloc - (h2 << 3)) >> 1;
+                int xw = (g << 4) >> 2;
+                int nsh = (src == 0 || src == 1) ? 0 : 4;
+                int hsh = 2 * src;
+                int isum = 0;
+                for (int k = 0; k < 4; k++) {
+                    uint qv = wq0[m*4+k];
+                    uint hv = wq1[m*4+k];
+                    uint yv = xq[base + uint(xw + k)];
+                    uint nibw = (qv >> uint(nsh)) & 0x0F0F0F0Fu;
+                    uint hi16w = (hv >> uint(hsh)) & 0x03030303u;
+                    isum = dot4(nibw + (hi16w << 4), yv, isum);
+                }
+                isum -= 32 * int(xq[base + uint((n_in >> 2) + (n_in >> 5) + g)]);
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (g >> 1))]);
+                acc += yd * dsc[m] * float(isum);
+            }
+            double accd = subgroupAdd(double(acc));
+            if (l == 0u) outv[uint(ti) * pc.n_out + o] = float(accd);
+        }
+    } else {                     // iq4_xs (23) — 4워드/sb
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 136;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int b = sb >> 3;
+            int ib = sb & 7;
+            int wb = row_base + b * 136;
+            int wq = wb >> 2;
+            uint w0 = WG(wq);
+            float d = unpackHalf2x16(w0).x;
+            int ls = int((WG(wq + 1) >> uint((ib >> 1) * 8 + (ib & 1) * 4)) & 0xFu)
+                  | (int(((w0 >> 16) >> uint(2 * ib)) & 3u) << 4);
+            dsc[m] = d * float(ls - 32);
+            int qw = (wb + 8 + ib * 16) >> 2;
+            for (int k = 0; k < 4; k++) wq0[m*4+k] = WG(qw + k);
+        }
+        for (int ti = 0; ti < t; ti++) {
+            uint base = uint(ti) * pc.xq_w;
+            float acc = 0.0;
+            for (int m = 0; m < cnt; m++) {
+                int sb = int(l) + (m << 6);
+                int xw = (sb << 5) >> 2;
+                int isum = 0;
+                for (int k = 0; k < 4; k++) {
+                    uint qv = wq0[m*4+k];
+                    uint yv0 = xq[base + uint(xw + k)];
+                    uint yv1 = xq[base + uint(xw + 4 + k)];
+                    int lo = 0, hi = 0;
+                    for (int b2 = 3; b2 >= 0; b2--) {
+                        uint nb = (qv >> uint(8 * b2)) & 0xFFu;
+                        int vlo = KVAL(int(nb & 0xFu));
+                        int vhi = KVAL(int(nb >> 4));
+                        lo = (lo << 8) | (vlo & 0xFF);
+                        hi = (hi << 8) | (vhi & 0xFF);
+                    }
+                    isum = dot4(uint(lo), yv0, isum);
+                    isum = dot4(uint(hi), yv1, isum);
+                }
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+                acc += yd * dsc[m] * float(isum);
+            }
+            double accd = subgroupAdd(double(acc));
+            if (l == 0u) outv[uint(ti) * pc.n_out + o] = float(accd);
+        }
+    }
+}

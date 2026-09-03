@@ -8,7 +8,7 @@ use llm170_gguf::GgmlType;
 use std::collections::HashMap;
 use parking_lot::Mutex;
 
-const GEMV_SPV: &[u8] = include_bytes!("spv/gemv.spv");
+const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
 const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
 const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
@@ -135,7 +135,7 @@ impl VkAcc {
     fn pipes(&self, ctx: &mut VkCtx) -> Result<Pipes, String> {
         let mut g = self.pipes.lock();
         if g.is_none() {
-            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(GEMV_SPV, 12, 16)?;
+            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(GEMV_SPV, 12, 20)?;
             *g = Some(Pipes { dsl, pl, dp, ds, pipe });
         }
         Ok(Pipes { ..g.as_ref().unwrap().clone() })
@@ -279,7 +279,9 @@ impl VkAcc {
             push.extend_from_slice(&(n_out as u32).to_le_bytes());
             push.extend_from_slice(&(xq0_w as u32).to_le_bytes());
             push.extend_from_slice(&ty.to_le_bytes());
-            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+            let mut push20 = push.clone();
+        push20.extend_from_slice(&(t as u32).to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
         }
         // 3) silu_mul 상주 (bfg, bfu → bglu)
         {
@@ -344,7 +346,9 @@ impl VkAcc {
             push.extend_from_slice(&(n_out as u32).to_le_bytes());
             push.extend_from_slice(&(xq1_w as u32).to_le_bytes());
             push.extend_from_slice(&ty.to_le_bytes());
-            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+            let mut push20 = push.clone();
+        push20.extend_from_slice(&(t as u32).to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
         }
         // 5) 다운로드 1회
         let host = unsafe { std::slice::from_raw_parts(cptrs.2 as *const f32, t * n0) };
@@ -678,7 +682,9 @@ impl Accelerator for VkAcc {
         push.extend_from_slice(&(n_out as u32).to_le_bytes());
         push.extend_from_slice(&(xq_w as u32).to_le_bytes());
         push.extend_from_slice(&ty.to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+        let mut push20 = push.clone();
+        push20.extend_from_slice(&(t as u32).to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
         let host = unsafe {
             std::slice::from_raw_parts(
                 self.obuf.lock().as_ref().unwrap().ptr as *const f32,
@@ -872,7 +878,9 @@ impl Accelerator for VkAcc {
             push.extend_from_slice(&(n_out as u32).to_le_bytes());
             push.extend_from_slice(&(xq_w as u32).to_le_bytes());
             push.extend_from_slice(&ty.to_le_bytes());
-            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+            let mut push20 = push.clone();
+        push20.extend_from_slice(&(t as u32).to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
             let host = unsafe {
                 std::slice::from_raw_parts(self.obuf.lock().as_ref().unwrap().ptr as *const f32, t * n_out)
             };
@@ -909,6 +917,19 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     let mut outs = vec![vec![0.0f32; w.n_out as usize]; t];
     acc.matmul_batch(&xs, wref, &mut outs)?;
+    // 타이밍: 첫 호출(가중 업로드) 후 10회
+    let t0 = std::time::Instant::now();
+    for _ in 0..10 {
+        acc.matmul_batch(&xs, wref, &mut outs)?;
+    }
+    let dt = t0.elapsed().as_secs_f64() / 10.0;
+    eprintln!(
+        "vk-gemv-time: {} {:.2}ms → {:.1}GB/s ({}B 가중)",
+        tname,
+        dt * 1e3,
+        wref.data.len() as f64 / dt / 1e9,
+        wref.data.len()
+    );
     // CPU 참조
     let mut ref_outs = vec![vec![0.0f32; w.n_out as usize]; t];
     llm170_core::matmul::matmul_batch(&xs, wref, &mut ref_outs);
