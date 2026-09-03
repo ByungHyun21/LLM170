@@ -51,7 +51,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **97.4 t/s** (81.8 exact mode, LLM170_EXACT=1) | 0.68x (0.57x) |
+| Prefill pp64 (chunk 64) | 142.8 t/s | **97.8 t/s** (81.8 exact mode) | 0.69x (0.57x) |
+| Prefill pp128 (chunk 128, J-tiles) | — | **132.1 t/s** | 0.45x vs llama-bench 294 |
 | Prefill pp512 | ~230 t/s (server-bench) | **60.9 t/s** | 0.26x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
