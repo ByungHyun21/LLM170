@@ -30,6 +30,7 @@ struct TilePipes {
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    tables: Mutex<Option<(VkBuf, VkBuf)>>,
     dummy: Mutex<Option<VkBuf>>,
     pipes: Mutex<Option<Pipes>>,
     /// 가중치 캐시 (데이터 포인터 → 상주 버퍼)
@@ -44,6 +45,10 @@ fn vk_ty(ty: GgmlType) -> Option<u32> {
         GgmlType::Q4K => Some(12),
         GgmlType::Q6K => Some(14),
         GgmlType::Iq4Xs => Some(23),
+        GgmlType::Q8_0 => Some(8),
+        GgmlType::Iq4Nl => Some(20),
+        GgmlType::Q3K => Some(11),
+        GgmlType::Iq3S => Some(21),
         _ => None,
     }
 }
@@ -57,6 +62,7 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            tables: Mutex::new(None),
             dummy: Mutex::new(None),
             pipes: Mutex::new(None),
             wcache: Mutex::new(HashMap::new()),
@@ -78,7 +84,7 @@ impl VkAcc {
     fn pipes(&self, ctx: &mut VkCtx) -> Result<Pipes, String> {
         let mut g = self.pipes.lock();
         if g.is_none() {
-            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(GEMV_SPV, 10, 16)?;
+            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(GEMV_SPV, 12, 16)?;
             *g = Some(Pipes { dsl, pl, dp, ds, pipe });
         }
         Ok(Pipes { ..g.as_ref().unwrap().clone() })
@@ -241,6 +247,30 @@ impl Accelerator for VkAcc {
         let xb = self.xbuf.lock().as_ref().unwrap().buf;
         let ob = self.obuf.lock().as_ref().unwrap().buf;
         let p = self.pipes(&mut ctx)?;
+        // ktab(iq4nl) + grid3s 업로드 (최초 1회)
+        {
+            let mut tb = self.tables.lock();
+            if tb.is_none() {
+                let kv: Vec<u32> = (0..256u32)
+                    .map(|b| {
+                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+                        lo | (hi << 8)
+                    })
+                    .collect();
+                let kb = ctx.alloc(1024)?;
+                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
+                let gb = ctx.alloc(2048)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
+                        gb.ptr,
+                        2048,
+                    );
+                }
+                *tb = Some((kb, gb));
+            }
+        }
         // 미사용 청크 슬롯: 더미 버퍼 (null 바인딩 방지)
         {
             let mut d = self.dummy.lock();
@@ -256,6 +286,13 @@ impl Accelerator for VkAcc {
         }
         binds.push(xb);
         binds.push(ob);
+        let (kb, gb) = {
+            let tb = self.tables.lock();
+            let (a, b) = tb.as_ref().unwrap();
+            (a.buf, b.buf)
+        };
+        binds.push(kb);
+        binds.push(gb);
         ctx.bind_bufs(p.ds, &binds);
         let mut push = Vec::with_capacity(16);
         push.extend_from_slice(&(n_in as u32).to_le_bytes());

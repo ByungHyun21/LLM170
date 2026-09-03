@@ -17,6 +17,8 @@ layout(binding = 6) readonly buffer W6 { uint w6c[]; };
 layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };   // iq4nl lo|hi<<8 256워드
+layout(binding = 11) readonly buffer Gbuf { uint grid3s[]; };  // iq3_s 512워드
 layout(push_constant) uniform PC {
     uint n_in;
     uint n_out;
@@ -209,6 +211,149 @@ void main() {
             isum -= 32 * int(xq[base + uint((n_in >> 2) + (n_in >> 5) + g)]);
             float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (g >> 1))]);
             acc += yd * d * float(scv) * float(isum);
+        }
+    } else if (pc.ty == 8u) {    // q8_0
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int row_base = int(o) * n_sub * 34;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int wb = row_base + sb * 34;
+            float d;
+            {
+                int bi = wb;
+                uint wd = WG(uint(bi >> 2));
+                d = unpackHalf2x16(wd >> uint((bi & 3) * 8)).x;
+            }
+            int wq = wb >> 2;
+            bool al = ((wb & 3) == 2);
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            for (int k = 0; k < 8; k++) {
+                uint qv = al ? WG(uint(wq + 1 + k))
+                             : (WG(uint(wq + k)) >> 16) | (WG(uint(wq + k + 1)) << 16);
+                uint yv = xq[base + uint(xw + k)];
+                isum = dot4(qv, yv, isum);
+            }
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * d * float(isum);
+        }
+    } else if (pc.ty == 20u) {   // iq4_nl — ktab2 룩업
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int row_base = int(o) * n_sub * 18;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int wb = row_base + sb * 18;
+            float d = unpackHalf2x16(WG(uint(wb >> 2)) >> uint((wb & 3) * 8)).x;
+            bool al = ((wb & 3) == 2);
+            int wq2 = wb >> 2;
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            for (int k = 0; k < 4; k++) {
+                uint qvw = al ? WG(uint(wq2 + 1 + k))
+                              : (WG(uint(wq2 + k)) >> 16) | (WG(uint(wq2 + k + 1)) << 16);
+                uint ylv = xq[base + uint(xw + k)];
+                uint yhv = xq[base + uint(xw + 4 + k)];
+                uint lo = 0, hi = 0;
+                for (int b2 = 3; b2 >= 0; b2--) {
+                    uint t2 = ktab[(qvw >> uint(8 * b2)) & 0xFFu];
+                    lo = (lo << 8) | (t2 & 0xFFu);
+                    hi = (hi << 8) | (t2 >> 8);
+                }
+                isum = dot4(lo, ylv, isum);
+                isum = dot4(hi, yhv, isum);
+            }
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * d * float(isum);
+        }
+    } else if (pc.ty == 11u) {   // q3_K — 16원소 하프블록
+        int n_h = n_in >> 4;
+        int cnt = (n_h + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 110;
+        for (int m = 0; m < cnt; m++) {
+            int h = int(l) + (m << 6);
+            int blk = h >> 4;
+            int kloc = h - (blk << 4);
+            int hh = kloc >> 3;
+            int src = (kloc - (hh << 3)) >> 1;
+            int p = kloc & 1;
+            int wb = row_base + blk * 110;
+            // 스케일 12B (wb+96..107)
+            int sw = (wb + 96) >> 2;
+            int off = (wb + 96) & 3;
+            uint a0, a1, tmp;
+            if (off == 0) { a0 = WG(uint(sw)); a1 = WG(uint(sw+1)); tmp = WG(uint(sw+2)); }
+            else { a0 = (WG(uint(sw)) >> 16) | (WG(uint(sw+1)) << 16); a1 = (WG(uint(sw+1)) >> 16) | (WG(uint(sw+2)) << 16); tmp = (WG(uint(sw+2)) >> 16) | (WG(uint(sw+3)) << 16); }
+            uint k2 = 0x03030303u, k4 = 0x0f0f0f0fu;
+            uint aux2 = ((a0 >> 4) & k4) | (((tmp >> 4) & k2) << 4);
+            uint aux3 = ((a1 >> 4) & k4) | (((tmp >> 6) & k2) << 4);
+            uint aux0 = (a0 & k4) | ((tmp & k2) << 4);
+            uint aux1 = (a1 & k4) | (((tmp >> 2) & k2) << 4);
+            int ai = hh * 8 + src * 2 + p;
+            uint aux = ai < 4 ? aux0 : (ai < 8 ? aux1 : (ai < 12 ? aux2 : aux3));
+            uint scb = (aux >> uint((ai % 4) * 8)) & 0xFFu;
+            float d = unpackHalf2x16(WG(uint((wb + 108) >> 2)) >> uint(((wb + 108) & 3) * 8)).x;
+            float dl = d * float(s8(scb) - 32);
+            int qlb2 = wb + 32 + hh * 32 + p * 16;
+            int hbase2 = wb + p * 16;
+            int xw = (h << 4) >> 2;
+            int qsh = src * 2;
+            bool alq = ((qlb2 & 3) == 0);
+            bool alh = ((hbase2 & 3) == 0);
+            int qlw2 = qlb2 >> 2;
+            int qhw2 = hbase2 >> 2;
+            int isum = 0, qsum2 = 0;
+            for (int k = 0; k < 4; k++) {
+                uint qvw = alq ? WG(uint(qlw2 + k)) : (WG(uint(qlw2 + k)) >> 16) | (WG(uint(qlw2 + k + 1)) << 16);
+                uint hvw = alh ? WG(uint(qhw2 + k)) : (WG(uint(qhw2 + k)) >> 16) | (WG(uint(qhw2 + k + 1)) << 16);
+                uint yv = xq[base + uint(xw + k)];
+                isum = dot4((qvw >> uint(qsh)) & 0x03030303u, yv, isum);
+                qsum2 = dot4(0x04040404u, yv, qsum2);
+                uint bitw = ((hvw >> uint(src)) & 0x01010101u) << 2;
+                isum = dot4(bitw, yv, isum);
+            }
+            isum += -qsum2 + 0; // HIP: isum += bsum - qsum (bsum 포함됨)
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (h >> 1))]);
+            acc += yd * dl * float(isum);
+        }
+    } else if (pc.ty == 21u) {   // iq3_s
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 110;
+        for (int m = 0; m < cnt; m++) {
+            int sub = int(l) + (m << 6);
+            int blk = sub >> 3;
+            int h = sub & 7;
+            int wb = row_base + blk * 110;
+            float d = unpackHalf2x16(WG(uint(wb >> 2)) >> uint((wb & 3) * 8)).x;
+            uint scb = (WG(uint((wb + 106 + (h >> 1)) >> 2)) >> uint(((wb + 106 + (h >> 1)) & 3) * 8)) & 0xFFu;
+            int nib = (h & 1) != 0 ? int(scb >> 4) : int(scb & 0xFu);
+            float db = d * float(1 + 2 * nib);
+            uint qhb = (WG(uint((wb + 66 + h) >> 2)) >> uint(((wb + 66 + h) & 3) * 8)) & 0xFFu;
+            int qs_base = wb + 2 + h * 8;
+            int sg_base = wb + 74 + h * 4;
+            int isum = 0;
+            for (int ll = 0; ll < 4; ll++) {
+                uint idx1 = ((WG(uint((qs_base + 2*ll) >> 2)) >> uint(((qs_base + 2*ll) & 3) * 8)) & 0xFFu) | ((qhb << uint(8 - 2*ll)) & 256u);
+                uint idx2 = ((WG(uint((qs_base + 2*ll + 1) >> 2)) >> uint(((qs_base + 2*ll + 1) & 3) * 8)) & 0xFFu) | ((qhb << uint(7 - 2*ll)) & 256u);
+                // 그리드 512 u32 — ktab 뒤에 별도 바인딩 필요... M2 유지: ktab 256워드만 있어 iq3s는 보류
+                uint sgb = (WG(uint((sg_base + ll) >> 2)) >> uint(((sg_base + ll) & 3) * 8)) & 0xFFu;
+                uint g1 = grid3s[idx1];
+                uint g2 = grid3s[idx2];
+                for (int j = 0; j < 4; j++) {
+                    int w1 = s8((g1 >> uint(8*j)) & 0xFFu) * ((sgb & (1u << uint(j))) != 0u ? -1 : 1);
+                    int w2 = s8((g2 >> uint(8*j)) & 0xFFu) * ((sgb & (1u << uint(4+j))) != 0u ? -1 : 1);
+                    int e1 = 8 * ll + j, e2 = 8 * ll + 4 + j;
+                    int y1 = s8((xq[base + uint(((sub << 5) + e1) >> 2)] >> uint((((sub << 5) + e1) & 3) * 8)) & 0xFFu);
+                    int y2 = s8((xq[base + uint(((sub << 5) + e2) >> 2)] >> uint((((sub << 5) + e2) & 3) * 8)) & 0xFFu);
+                    isum += w1 * y1 + w2 * y2;
+                }
+            }
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sub)]);
+            acc += yd * db * float(isum);
         }
     } else {                     // iq4_xs (23)
         int n_sub = n_in >> 5;
