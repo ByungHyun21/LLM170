@@ -493,6 +493,16 @@ pub trait RawDecode: Send + Sync {
         Err("raw_prefill_h: 미지원".into())
     }
 
+    /// np 배치 디코드 — seq별 logits. 기본 Err.
+    fn raw_step_multi(
+        &self,
+        _seqs: &[usize],
+        _poss: &[u32],
+        _emb: &[f32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        Err("raw_step_multi: 미지원".into())
+    }
+
     /// MTP 체인 스텝 (h = 내부 mtp_cur): argmax. 기본 Err.
     fn mtp_step_chain(&self, _seq: usize, _tok_emb: &[f32], _pos: usize) -> Result<u32, String> {
         Err("mtp_step_chain: 미지원".into())

@@ -3370,7 +3370,9 @@ extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, fl
     float g = 1.0f / (1.0f + exp_cr(-q[qb + hd + tid]));
     out[t * n_head * hd + h * hd + tid] = a * (1.0f / ssum) * g;
 }
+
 "#;
+
 
 pub const NAMES: &[&str] = &[
     "quant_q8", "reduce64",

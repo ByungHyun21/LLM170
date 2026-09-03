@@ -556,6 +556,34 @@ impl Engine {
             self.seqs[seq_ids[0]].pos += 1;
             return Ok(vec![logits]);
         }
+        // np 배치 (rawhip) — 각 seq 1토큰, GEMM 공유 (plans/15)
+        if tokens.len() > 1
+            && seq_ids.len() > 1
+            && self.raw_decode.is_some()
+            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+        {
+            let rd = self.raw_decode.clone().unwrap();
+            let n = self.model.hp.n_embd;
+            if self.embd_cache.is_none() {
+                let t = self.model.wchk("token_embd.weight")?;
+                self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
+            }
+            let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
+            let poss: Vec<u32> = seq_ids.iter().map(|&s| self.seqs[s].pos).collect();
+            let mut rows: Vec<f32> = Vec::with_capacity(tokens.len() * n);
+            for &tk in tokens {
+                let mut r = vec![0.0f32; n];
+                crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n as u64, &mut r);
+                rows.extend(r);
+            }
+            let lgs = rd
+                .raw_step_multi(seq_ids, &poss, &rows)
+                .map_err(ModelError::Accel)?;
+            for s in seq_ids {
+                self.seqs[*s].pos += 1;
+            }
+            return Ok(lgs);
+        }
         let batch: Vec<Vec<u32>> = tokens.iter().map(|t| vec![*t]).collect();
         let logits = self.forward(seq_ids, &batch)?;
         for s in seq_ids {
