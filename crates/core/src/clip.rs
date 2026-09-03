@@ -214,6 +214,53 @@ impl Clip {
         }
     }
 
+    /// 배치 GEMM: out[t][o] = Σ x[t][i]·W[o][i] + b — (토큰×행) 청크 병렬.
+    fn mm_bias_batch(x: &[Vec<f32>], w: &[f32], b: &[f32], ni: usize, out: &mut [Vec<f32>]) {
+        let n_out = out[0].len();
+        let nth = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(32);
+        // 토큰 청크 분할 병렬 — 각 스레드가 서로소 토큰 슬라이스 담당.
+        let nth = nth.max(1).min(x.len());
+        std::thread::scope(|sc| {
+            let mut hs = Vec::new();
+            let tchunk = x.len().div_ceil(nth);
+            let (xo, oo) = (x, out);
+            let mut rest = oo;
+            let mut t0 = 0usize;
+            while t0 < xo.len() {
+                let t1 = (t0 + tchunk).min(xo.len());
+                let xs = &xo[t0..t1];
+                let (head, tail) = rest.split_at_mut(t1 - t0);
+                rest = tail;
+                hs.push(sc.spawn(move || {
+                    for (t, orow) in head.iter_mut().enumerate() {
+                        let xr = &xs[t];
+                        for o in 0..n_out {
+                            let row = &w[o * ni..(o + 1) * ni];
+                            let mut acc = b[o];
+                            let mut i = 0;
+                            while i + 8 <= ni {
+                                acc += xr[i] * row[i] + xr[i + 1] * row[i + 1]
+                                    + xr[i + 2] * row[i + 2] + xr[i + 3] * row[i + 3]
+                                    + xr[i + 4] * row[i + 4] + xr[i + 5] * row[i + 5]
+                                    + xr[i + 6] * row[i + 6] + xr[i + 7] * row[i + 7];
+                                i += 8;
+                            }
+                            while i < ni {
+                                acc += xr[i] * row[i];
+                                i += 1;
+                            }
+                            orow[o] = acc;
+                        }
+                    }
+                }));
+                t0 = t1;
+            }
+            for h in hs {
+                let _ = h.join();
+            }
+        });
+    }
+
     fn dot_bias(x: &[f32], row: &[f32], bias: Option<f32>) -> f32 {
         let ni = row.len();
         let mut s = bias.unwrap_or(0.0) as f64;
@@ -243,21 +290,21 @@ impl Clip {
     ) -> Vec<Vec<f32>> {
         let n_head = n_embd / d_head;
         let mut out = vec![vec![0f32; n_embd]; toks.len()];
-        let mut scores = vec![0f64; n_pos];
+        let mut scores = vec![0f32; n_pos];
         for h in 0..n_head {
             for (ti, &t) in toks.iter().enumerate() {
                 let qb = h * d_head;
                 let kb = n_embd + h * d_head;
-                let mut mx = f64::NEG_INFINITY;
+                let mut mx = f32::NEG_INFINITY;
                 for s2 in 0..n_pos {
-                    let mut d = 0.0f64;
+                    let mut d = 0.0f32;
                     for i in 0..d_head {
-                        d += f64::from(qkv[t][qb + i]) * f64::from(qkv[s2][kb + i]);
+                        d += qkv[t][qb + i] * qkv[s2][kb + i];
                     }
-                    scores[s2] = d * kq_scale as f64;
+                    scores[s2] = d * kq_scale;
                     mx = mx.max(scores[s2]);
                 }
-                let mut sum = 0.0f64;
+                let mut sum = 0.0f32;
                 for v in scores.iter_mut() {
                     *v = (*v - mx).exp();
                     sum += *v;
@@ -269,7 +316,7 @@ impl Clip {
                     }
                     let vb = 2 * n_embd + h * d_head;
                     for i in 0..d_head {
-                        out[ti][h * d_head + i] += (w2 * f64::from(qkv[s2][vb + i])) as f32;
+                        out[ti][h * d_head + i] += w2 * qkv[s2][vb + i];
                     }
                 }
             }
@@ -368,13 +415,13 @@ impl Clip {
             let dnw = self.tensor_f32(&format!("v.blk.{il}.ffn_down.weight"))?;
             let dnb = self.tensor_f32(&format!("v.blk.{il}.ffn_down.bias"))?;
 
-            // LN1 → qkv
-            let mut qkv = vec![vec![0f32; 3 * n_embd]; n_pos];
-            for t in 0..n_pos {
-                let mut x = cur[t].clone();
-                layer_norm(&mut x, &ln1w, &ln1b, self.eps);
-                Self::mm_bias(&x, &qkvw, Some(&qkvb), qkv_ni, &mut qkv[t]);
+            // LN1 → qkv (배치)
+            let mut xn: Vec<Vec<f32>> = cur.clone();
+            for x in xn.iter_mut() {
+                layer_norm(x, &ln1w, &ln1b, self.eps);
             }
+            let mut qkv = vec![vec![0f32; 3 * n_embd]; n_pos];
+            Self::mm_bias_batch(&xn, &qkvw, &qkvb, qkv_ni, &mut qkv);
 
             // 비전 rope (q, k) — 토큰별 (y, x)
             let mut coords = vec![(0u32, 0u32); n_pos];
@@ -438,28 +485,32 @@ impl Clip {
                     }
                 });
             }
-            // attn_out proj + 잔차
+            // attn_out proj + 잔차 (배치)
+            let mut aproj = vec![vec![0f32; n_embd]; n_pos];
+            Self::mm_bias_batch(&attn_out, &ow, &ob, n_embd, &mut aproj);
             for t in 0..n_pos {
-                let mut o = vec![0f32; n_embd];
-                Self::mm_bias(&attn_out[t], &ow, Some(&ob), n_embd, &mut o);
                 for i in 0..n_embd {
-                    cur[t][i] += o[i];
+                    cur[t][i] += aproj[t][i];
                 }
             }
 
-            // LN2 → FFN(GELU) → 잔차
-            for t in 0..n_pos {
-                let mut x = cur[t].clone();
-                layer_norm(&mut x, &ln2w, &ln2b, self.eps);
-                let mut mid = vec![0f32; self.n_ff];
-                Self::mm_bias(&x, &upw, Some(&upb), n_embd, &mut mid);
-                for v in mid.iter_mut() {
+            // LN2 → FFN(GELU) → 잔차 (배치)
+            let mut xn2: Vec<Vec<f32>> = cur.clone();
+            for x in xn2.iter_mut() {
+                layer_norm(x, &ln2w, &ln2b, self.eps);
+            }
+            let mut mid = vec![vec![0f32; self.n_ff]; n_pos];
+            Self::mm_bias_batch(&xn2, &upw, &upb, n_embd, &mut mid);
+            for row in mid.iter_mut() {
+                for v in row.iter_mut() {
                     *v = gelu(*v);
                 }
-                let mut dn = vec![0f32; n_embd];
-                Self::mm_bias(&mid, &dnw, Some(&dnb), self.n_ff, &mut dn);
+            }
+            let mut dn = vec![vec![0f32; n_embd]; n_pos];
+            Self::mm_bias_batch(&mid, &dnw, &dnb, self.n_ff, &mut dn);
+            for t in 0..n_pos {
                 for i in 0..n_embd {
-                    cur[t][i] += dn[i];
+                    cur[t][i] += dn[t][i];
                 }
             }
         }
@@ -477,21 +528,23 @@ impl Clip {
         let mm2w = self.tensor_f32("mm.2.weight")?;
         let mm2b = self.tensor_f32("mm.2.bias")?;
         let n_out_tok = n_pos / 4;
-        let mut out = Vec::with_capacity(n_out_tok);
+        let mut cat_rows = Vec::with_capacity(n_out_tok);
         for m in 0..n_out_tok {
             let mut cat = vec![0f32; n_embd * 4];
             for j in 0..4 {
                 cat[j * n_embd..(j + 1) * n_embd].copy_from_slice(&cur[m * 4 + j]);
             }
-            let mut mid = vec![0f32; n_embd * 4];
-            Self::mm_bias(&cat, &mm0w, Some(&mm0b), n_embd * 4, &mut mid);
-            for v in mid.iter_mut() {
+            cat_rows.push(cat);
+        }
+        let mut mid = vec![vec![0f32; n_embd * 4]; n_out_tok];
+        Self::mm_bias_batch(&cat_rows, &mm0w, &mm0b, n_embd * 4, &mut mid);
+        for row in mid.iter_mut() {
+            for v in row.iter_mut() {
                 *v = gelu(*v);
             }
-            let mut emb = vec![0f32; 5120];
-            Self::mm_bias(&mid, &mm2w, Some(&mm2b), n_embd * 4, &mut emb);
-            out.push(emb);
         }
+        let mut out = vec![vec![0f32; 5120]; n_out_tok];
+        Self::mm_bias_batch(&mid, &mm2w, &mm2b, n_embd * 4, &mut out);
         Ok(out)
     }
 }
