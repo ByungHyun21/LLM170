@@ -733,7 +733,18 @@ gmark("gdn_mm", &mut marks);
                     let mut kk = self.conv_k as i32;
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
-                    self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
+                    if t >= self.conv_k - 1 {
+                        self.ctx.launch3("gdn_conv_t2", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                        let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
+                        let mut sp2 = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
+                        let mut ch2 = conv_ch as i32;
+                        let mut kk2 = self.conv_k as i32;
+                        let mut tt2 = t as i32;
+                        let mut args2 = vec![Self::p(&mut qp2), Self::p(&mut sp2), Self::p(&mut ch2), Self::p(&mut kk2), Self::p(&mut tt2)];
+                        self.ctx.launch3("gdn_conv_state", (self.conv_k - 1) as u32, conv_ch.div_ceil(64) as u32, 1, 64, &mut args2)?;
+                    } else {
+                        self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
+                    }
                 }
 gmark("conv", &mut marks);
                 // split3 전체 배치 (요소별)

@@ -1986,6 +1986,34 @@ extern "C" __global__ void gdn_conv(const float* qkv, const float* cw, float* st
     out[xb] = oc;
 }
 // GDN conv1d + ring — t토큰 순차 (thread0/채널, blockIdx.y=t)
+extern "C" __global__ void gdn_conv_t2(const float* qkv, const float* cw, float* state,
+                                       float* out, int ch, int k, int t) {
+    // 완전 병렬 (c × t): 인과 conv는 이전 '입력'만 참조(출력 아님) — 청크 내
+    // 의존 없음. 가중 합 순서/식은 구형과 원소별 동일열 (비트무영향).
+    // 상태 갱신: ti ∈ [t-(k-1), t) 각자 자기 슬롯만 기입 (경합 없음).
+    // 전제 t >= k-1 (짧은 꼬리 청크는 구형 순차 커널 사용).
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (c >= ch || ti >= t) return;
+    const float* row = qkv + (size_t)ti * ch;
+    float sum = cw[c * k + (k - 1)] * row[c];
+    for (int j = 0; j < k - 1; j++) {
+        int pos = ti - (k - 1) + j;
+        float xv = pos >= 0 ? qkv[(size_t)pos * ch + c] : state[(pos + (k - 1)) * ch + c];
+        sum += cw[c * k + j] * xv;
+    }
+    float oc = sum / (1.0f + exp_cr(-sum));
+    out[(size_t)ti * ch + c] = oc;
+}
+
+// conv 상태 갱신 (conv_t2 이후 별도 런치 — 읽기/쓰기 경합 제거)
+extern "C" __global__ void gdn_conv_state(const float* qkv, float* state, int ch, int k, int t) {
+    int j = blockIdx.x;                 // 0..k-2
+    int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= ch || j >= k - 1) return;
+    state[j * ch + c] = qkv[(size_t)(t - (k - 1) + j) * ch + c];
+}
+
 extern "C" __global__ void gdn_conv_t(const float* qkv, const float* cw, float* state,
                                       float* out, int ch, int k, int t) {
     int c = blockIdx.x;
@@ -2078,43 +2106,41 @@ extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, cons
 extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, const float* v,
                                     const float* beta_ge, float* out, int d, int k_stride,
                                     int v_stride, int h_v, int h_k, float scale, int t) {
-    // u-분할: blockIdx.y = 서브블록(열 그룹), blockIdx.x = pair.
-    // 열 u 산술은 블록 분할과 무관 → 기존과 원소별 동일열 (비트무영향).
-    // k/q/v 슬라이스를 공유 적재해 전역 지연 제거.
+    __shared__ float ss[128 * 64];
     __shared__ float ks[128], qs[128], vs[64];
     int pair = blockIdx.x;
-    int u = threadIdx.x + blockIdx.y * 64;           // blockIdx.y 0..1 × 64스레드
-    int tid = threadIdx.x;
+    int lu = threadIdx.x;
+    int u = lu + blockIdx.y * 64;
     if (u >= d) return;
     int base_s = pair * d * d;
+    // 스레드 lu는 자기 열(128원소) 전체 적재 — 이전 버그: 2원소만 적재
+    #pragma unroll 8
+    for (int j = 0; j < d; j++) ss[j * 64 + lu] = s[base_s + j * d + u];
     for (int ti = 0; ti < t; ti++) {
-        int b = 0;
         int h = pair % h_v;
         int kh = h % h_k;
         int qk0 = ti * k_stride + kh * d;
         int v0 = ti * v_stride + h * d;
         float beta = beta_ge[ti * h_v * 2 + pair * 2];
         float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
-        // k/q 슬라이스 협력 적재 (64스레드 × 2)
-        for (int e = tid; e < d; e += blockDim.x) { ks[e] = k[qk0 + e]; qs[e] = q[qk0 + e]; }
-        for (int e = tid; e < 64; e += blockDim.x) vs[e] = v[v0 + blockIdx.y * 64 + e];
-        __syncthreads();
         float sk = 0.0f;
         for (int kdim = 0; kdim < d; kdim++) {
-            float sv = s[base_s + kdim * d + u] * g_exp;
-            s[base_s + kdim * d + u] = sv;
-            sk += sv * ks[kdim];
+            float sv = ss[kdim * 64 + lu] * g_exp;
+            ss[kdim * 64 + lu] = sv;
+            sk += sv * k[qk0 + kdim];
         }
-        float delta = (vs[u - blockIdx.y * 64] - sk) * beta;
+        float delta = (v[v0 + u] - sk) * beta;
         for (int kdim = 0; kdim < d; kdim++) {
-            s[base_s + kdim * d + u] += ks[kdim] * delta;
+            ss[kdim * 64 + lu] += k[qk0 + kdim] * delta;
         }
         float o = 0.0f;
         for (int kdim = 0; kdim < d; kdim++)
-            o += (s[base_s + kdim * d + u] * qs[kdim]) * scale;
+            o += (ss[kdim * 64 + lu] * q[qk0 + kdim]) * scale;
         out[v0 + u] = o;
         __syncthreads();
     }
+    #pragma unroll 8
+    for (int j = 0; j < d; j++) s[base_s + j * d + u] = ss[j * 64 + lu];
 }
 
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
@@ -2221,7 +2247,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
