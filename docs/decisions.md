@@ -237,3 +237,19 @@ falls back to the value path (one-shot retry, notice on stderr).
 non-frame path; real model tg16 0.43 -> 2.87 t/s (6.7x) — see
 [benchmarks.md](benchmarks.md). qwen35 has no frame yet; the same pattern
 extends (all its layer kernels already exist on GPU).
+
+## ADR-0018 — cubecl removed; raw HIP + raw Vulkan backends (2026-09-05)
+
+**Context**: cubecl's HIP runtime wedged on faults and its WGSL path could
+not express the quantized kernels (no u8 buffers, no dp4a). Every production
+kernel had been hand-ported twice already (HIP C++ and GLSL).
+
+**Decision**: drop cubecl entirely. `rawhip` drives HIP via hip-sys with
+HIP C++ kernel strings (hipRTC JIT + optional offline code objects);
+`rawvk` drives Vulkan via ash with precompiled SPIR-V. Both mirror the CPU
+W4A8 integer arithmetic (see backend-architecture.md).
+
+**Consequence**: one kernel source per backend, no IR layer; ADR-0009's
+"cubecl keeps kernel sources Rust" is superseded — kernel bodies are now
+HIP C++ / GLSL embedded as strings, with Rust owning all orchestration.
+ADRs 0009/0011/0016 remain as history.

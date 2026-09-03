@@ -13,7 +13,7 @@ flowchart LR
     B --> C[Scheduler\nubatch, KV/GDN state, offload]
     C --> D[matmul dispatch\nAccelerator trait]
     D --> E1[CPU\npure Rust reference]
-    D --> E2[GPU\ncubecl kernels, HIP or Vulkan runtime]
+    D --> E2[GPU\nrawhip (HIP) / rawvk (Vulkan)]
     C --> F[Sampler + MTP draft]
     F --> G[CLI/server]
     P[profiler] -.->|debug instrumentation| C
@@ -28,10 +28,12 @@ device. The element-wise kernel set (`backend-gpu/src/ew.rs` — norms with
 f64 sequential accumulation, activations, RoPE, top-k routing, GDN
 conv/beta/softplus), the GDN AR decode kernel and the single-launch chunked
 GDN prefill kernel, grouped MoE GEMM (prefill and batched down-projection),
-and attention score/softmax/mix now also run on GPU. `--gpu-runtime vulkan`
-selects a wgpu/Vulkan client; the same kernel source compiles for both
-runtimes. Remaining per-step host crossings in the frame: the PLE gather
-(host-side hash) and QSA attention (value bridge — cache upload + readback).
+and attention score/softmax/mix now also run on GPU. cubecl was removed in
+favor of two independent backends: `rawhip` (HIP C++ via hipRTC + offline
+code objects, full GPU-resident pipeline) and `rawvk` (GLSL/SPIR-V via ash,
+matmul accelerator). See [backend-architecture.md](backend-architecture.md).
+Runtime selection: `--backend gpu --gpu-runtime hip` or
+`LLM170_GPU_RUNTIME=vulkan`.
 
 qwen4exp is structured as stage modules (`core/src/qwen4exp/stages/`):
 `hc`, `gdn`, `qsa`, `moe`, `ple` are free functions over
@@ -80,21 +82,19 @@ failure) cancel the job.
 1. **CPU backend (pure Rust)** — reference implementation and `universal`
    default. Ground truth for all golden tests; the full stack verifies without
    a GPU.
-2. **GPU backend (cubecl)** — kernels written in Rust via cubecl macros.
-   `hanzo-cubecl-hip` JIT-compiles to gfx1151 (dev machine, ROCm); the same
-   kernels compile through cubecl-wgpu/WGSL to Vulkan, and to CUDA/PTX (sm_80)
-   for the CMP 170HX. Runtime selection via `--backend cpu|gpu` and
-   `--gpu-runtime hip|vulkan` — build features are not used (single binary).
-   Constraint discovered in practice: WGSL has no u8 buffer element, so quant
-   bytes travel as u32 words and kernels unpack bytes with shifts/masks (the
-   same convention as llama.cpp CUDA kernels). The HIP dialect also miscompiles
-   `as i8` casts and if-expressions on the RHS of binary operators, so kernels
-   use pure u32 arithmetic for all byte manipulation.
+2. **GPU backends (post-cubecl)** — `rawhip`: HIP C++ kernel strings
+   JIT-compiled via hipRTC (`rawhip/kernels.rs::SRC`) plus optional offline
+   code objects; `rawvk`: GLSL compute shaders precompiled to SPIR-V
+   (`rawvk/spv/*.comp` via `scripts/build_spv.py`). Quant bytes travel as
+   u32 words and kernels unpack with shifts/masks (llama.cpp CUDA
+   convention). Both backends mirror the CPU W4A8 integer arithmetic;
+   see backend-architecture.md for the kernel contract and verification
+   gates.
 3. **Profiler** — span/event macros, collected in debug builds, zero-cost in
    release (`profile` feature re-enables).
 
 CUDA-specific code remains prohibited until the CMP 170HX arrives (cannot be
-verified on this machine); the cubecl path is expected to carry over directly.
+verified on this machine); the rawhip path carries over directly.
 
 ## FP Semantics and the cmp-stock Rules
 

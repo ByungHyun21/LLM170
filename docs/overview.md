@@ -60,10 +60,12 @@ Both models are GDN (Gated DeltaNet) linear-attention hybrids — qwen35 first
 Both reference models run end-to-end and are verified against llama.cpp greedy
 streams — including long-prompt (2,311 / 1,904 tokens) and parallel-sequence
 cases, under the near-tie-aware standard (ADR-0012 in
-[decisions.md](decisions.md)). On the GPU (cubecl, HIP/ROCm and Vulkan) the
-engine now runs: all quantized GEMM projections (8 types, batched prefill
-variants), the GDN AR + chunked-prefill kernels, grouped MoE GEMM, and an
-element-wise set whose norm kernels are bit-exact vs CPU. qwen4exp decodes
+[decisions.md](decisions.md)). On the GPU the engine has two independent
+backends (see backend-architecture.md): rawhip (HIP/ROCm — full pipeline:
+all quantized GEMM projections in 8 types with batched prefill tiles, fused
+flash attention, the GDN scan, and a bit-exact element-wise set) and rawvk
+(Vulkan — quantized matmul accelerator with GPU-side quantize/rms/silu and
+an FFN resident chain). qwen4exp decodes
 through a GPU-resident frame by default (ADR-0017) — kernels chained by
 handle, ~600 per-step host syncs down to ~14. The HTTP server schedules
 continuous batching across slots; qwen35 has MTP speculative decoding
