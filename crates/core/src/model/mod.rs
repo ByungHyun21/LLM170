@@ -372,6 +372,20 @@ impl Engine {
                     normed[i] = rms_norm(x, &post_w, hp.eps);
                 }
             }
+            // FFN 상주 체인 (가속기 지원 시): 업/다운로드 1회씩.
+            let mut ffn_out: Vec<Vec<f32>> = vec![vec![0.0f32; hp.n_embd]; n_tok];
+            let mut ffn_chained = false;
+            if let Some(a) = acc.as_deref() {
+                ffn_chained = a.ffn_chain(&normed, &gate_w, &up_w, &down_w, &mut ffn_out).is_ok();
+            }
+            if ffn_chained {
+                for (x, o) in xs.iter_mut().zip(ffn_out.iter()) {
+                    for (xi, oi) in x.iter_mut().zip(o.iter()) {
+                        *xi += *oi;
+                    }
+                }
+                continue;
+            }
             let mut ffn_group: [Vec<Vec<f32>>; 2] =
                 [vec![vec![0.0f32; n_ff]; n_tok], vec![vec![0.0f32; n_ff]; n_tok]];
             {

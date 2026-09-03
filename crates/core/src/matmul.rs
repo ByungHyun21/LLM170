@@ -52,6 +52,19 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("rms_norm: 미지원".into())
     }
 
+    /// FFN 상주 체인: xs → [gate,up] GEMV → silu·mul → down GEMV → xs 갱신.
+    /// 미구현 백엔드는 Err (호출부 폴백 — 그룹+silu+down 개별).
+    fn ffn_chain(
+        &self,
+        _xs: &[Vec<f32>],
+        _gate_w: &Weight,
+        _up_w: &Weight,
+        _down_w: &Weight,
+        _xs_out: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        Err("ffn_chain: 미지원".into())
+    }
+
     /// silu(gate)·up 곱 배치 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn silu_mul(
         &self,

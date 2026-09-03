@@ -57,6 +57,7 @@ struct QuantPipes {
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
     spipe: Mutex<Option<SiluPipes>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rpipe: Mutex<Option<RmsPipes>>,
@@ -95,6 +96,7 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            ffnbufs: Mutex::new(None),
             spipe: Mutex::new(None),
             sbufs: Mutex::new(None),
             rpipe: Mutex::new(None),
@@ -154,6 +156,204 @@ unsafe impl Send for VkAcc {}
 unsafe impl Sync for VkAcc {}
 
 impl VkAcc {
+    /// FFN 상주 체인 — 업로드 1회(xs)·다운로드 1회(xs), gate/up/silu/glu/down 전부 GPU 상주.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_chain_gpu(
+        &self,
+        xs: &[Vec<f32>],
+        gate_w: &Weight,
+        up_w: &Weight,
+        down_w: &Weight,
+        xs_out: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let t = xs.len();
+        let n0 = gate_w.n_in as usize;      // n_embd
+        let n_ff = gate_w.n_out as usize;
+        let mut ctx = self.ctx.lock();
+        let tables = {
+            let mut tb = self.tables.lock();
+            if tb.is_none() {
+                let kv: Vec<u32> = (0..256u32)
+                    .map(|b| {
+                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+                        lo | (hi << 8)
+                    })
+                    .collect();
+                let kb = ctx.alloc(1024)?;
+                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
+                let gb = ctx.alloc(2048)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
+                        gb.ptr,
+                        2048,
+                    );
+                }
+                *tb = Some((kb, gb));
+            }
+            let (a, b) = tb.as_ref().unwrap();
+            (a.buf, b.buf)
+        };
+        {
+            let mut d = self.dummy.lock();
+            if d.is_none() {
+                let b = ctx.alloc(16)?;
+                *d = Some(b);
+            }
+        }
+        let dbuf = self.dummy.lock().as_ref().unwrap().buf;
+        // 전용 체인 버퍼 (기존 버퍼와 충돌 회피)
+        let (xbf, bq0, bfg, bfu, bglu, bq1, bob) = {
+            let mut b = self.ffnbufs.lock();
+            if b.is_none() {
+                let xf = ctx.alloc(1 << 23)?;
+                let xq0 = ctx.alloc(1 << 22)?;
+                let fg = ctx.alloc(1 << 24)?;
+                let fu = ctx.alloc(1 << 24)?;
+                let glu = ctx.alloc(1 << 24)?;
+                let xq1 = ctx.alloc(1 << 24)?;
+                let ob = ctx.alloc(1 << 23)?;
+                *b = Some((xf, xq0, fg, fu, glu, xq1, ob));
+            }
+            let r = b.as_ref().unwrap();
+            (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf)
+        };
+        let cptrs = {
+            let b = self.ffnbufs.lock();
+            let r = b.as_ref().unwrap();
+            (r.0.ptr, r.4.ptr, r.6.ptr)
+        };
+        // 1) xs 업로드 → quant(n0)
+        for (ti, row) in xs.iter().enumerate() {
+            unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), cptrs.0.add(ti * n0 * 4) as *mut f32, n0); }
+        }
+        let xq0_w = n0 / 4 + n0 / 32 + n0 / 16;
+        {
+            let qp = self.qpipes(&mut ctx)?;
+            ctx.bind_bufs(qp.ds, &[xbf, bq0]);
+            let mut push = Vec::new();
+            push.extend_from_slice(&(n0 as u32).to_le_bytes());
+            push.extend_from_slice(&(t as u32).to_le_bytes());
+            push.extend_from_slice(&(xq0_w as u32).to_le_bytes());
+            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
+        // 2) gate/up GEMV (같은 xq0) — 상주 출력
+        let p = self.pipes(&mut ctx)?;
+        for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
+            let ty = vk_ty(w.ty).ok_or("ffn 타입 미지원")?;
+            let n_out = w.n_out as usize;
+            let wbufs: Vec<_> = {
+                let mut wc = self.wcache.lock();
+                let key = w.data.as_ptr() as usize;
+                if !wc.contains_key(&key) {
+                    let ch = ctx.max_ssbo;
+                    let total = w.data.len();
+                    let mut bufs = Vec::new();
+                    let mut off = 0usize;
+                    while off < total {
+                        let nb = ch.min(total - off);
+                        let bb = ctx.alloc(nb)?;
+                        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), bb.ptr, nb); }
+                        bufs.push(bb);
+                        off += nb;
+                    }
+                    wc.insert(key, bufs);
+                }
+                wc.get(&key).unwrap().iter().map(|bb| bb.buf).collect()
+            };
+            if wbufs.len() > 8 {
+                return Err("가중 청크 > 8".into());
+            }
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(bq0);
+            binds.push(obuf);
+            binds.push(tables.0);
+            binds.push(tables.1);
+            ctx.bind_bufs(p.ds, &binds);
+            let mut push = Vec::new();
+            push.extend_from_slice(&(n0 as u32).to_le_bytes());
+            push.extend_from_slice(&(n_out as u32).to_le_bytes());
+            push.extend_from_slice(&(xq0_w as u32).to_le_bytes());
+            push.extend_from_slice(&ty.to_le_bytes());
+            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+        }
+        // 3) silu_mul 상주 (bfg, bfu → bglu)
+        {
+            let sp = {
+                let mut g = self.spipe.lock();
+                if g.is_none() {
+                    let (dsl, pl, dp, ds, pipe) = ctx.pipeline(SILU_SPV, 3, 4)?;
+                    *g = Some(SiluPipes { dsl, pl, dp, ds, pipe });
+                }
+                let r = g.as_ref().unwrap();
+                SiluPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
+            };
+            ctx.bind_bufs(sp.ds, &[bfg, bfu, bglu]);
+            let total = (t * n_ff) as u32;
+            ctx.run(sp.pl, sp.ds, sp.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
+        }
+        // 4) glu quant(n_ff) → down GEMV → bob
+        {
+            let qp = self.qpipes(&mut ctx)?;
+            ctx.bind_bufs(qp.ds, &[bglu, bq1]);
+            let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
+            let mut push = Vec::new();
+            push.extend_from_slice(&(n_ff as u32).to_le_bytes());
+            push.extend_from_slice(&(t as u32).to_le_bytes());
+            push.extend_from_slice(&(xq1_w as u32).to_le_bytes());
+            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
+        {
+            let ty = vk_ty(down_w.ty).ok_or("ffn down 타입 미지원")?;
+            let n_out = down_w.n_out as usize;
+            let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
+            let wbufs: Vec<_> = {
+                let mut wc = self.wcache.lock();
+                let key = down_w.data.as_ptr() as usize;
+                if !wc.contains_key(&key) {
+                    let ch = ctx.max_ssbo;
+                    let total = down_w.data.len();
+                    let mut bufs = Vec::new();
+                    let mut off = 0usize;
+                    while off < total {
+                        let nb = ch.min(total - off);
+                        let bb = ctx.alloc(nb)?;
+                        unsafe { std::ptr::copy_nonoverlapping(down_w.data.as_ptr().add(off), bb.ptr, nb); }
+                        bufs.push(bb);
+                        off += nb;
+                    }
+                    wc.insert(key, bufs);
+                }
+                wc.get(&key).unwrap().iter().map(|bb| bb.buf).collect()
+            };
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(bq1);
+            binds.push(bob);
+            binds.push(tables.0);
+            binds.push(tables.1);
+            ctx.bind_bufs(p.ds, &binds);
+            let mut push = Vec::new();
+            push.extend_from_slice(&(n_ff as u32).to_le_bytes());
+            push.extend_from_slice(&(n_out as u32).to_le_bytes());
+            push.extend_from_slice(&(xq1_w as u32).to_le_bytes());
+            push.extend_from_slice(&ty.to_le_bytes());
+            ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, t as u32, 1)?;
+        }
+        // 5) 다운로드 1회
+        let host = unsafe { std::slice::from_raw_parts(cptrs.2 as *const f32, t * n0) };
+        for ti in 0..t {
+            xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
+        }
+        Ok(())
+    }
+
     /// silu_mul 오프로드 — exp_cr f64 호너 GLSL 비트 재현.
     pub fn silu_mul_gpu(
         &self,
@@ -508,6 +708,17 @@ impl Accelerator for VkAcc {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         self.silu_mul_gpu(gs, us, outs)
+    }
+
+    fn ffn_chain(
+        &self,
+        xs: &[Vec<f32>],
+        gate_w: &Weight,
+        up_w: &Weight,
+        down_w: &Weight,
+        xs_out: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        self.ffn_chain_gpu(xs, gate_w, up_w, down_w, xs_out)
     }
 
     /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
