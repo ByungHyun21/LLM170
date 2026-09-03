@@ -384,6 +384,10 @@ impl RawCtx {
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
+        // wm·mm 상한 64: t>64 무CO는 유효 커널 없음 — 침묵 오답 대신 에러
+        if t > 64 && !j128 {
+            return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
+        }
         let kern = match ty {
             13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
@@ -1117,6 +1121,11 @@ pub fn mm_bench() -> Result<String, String> {
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
+    // wm 상한 64: t>64는 V4/J128(CO) 없이 측정 불가 — 침묵 오답 대신 에러 (Q8_0 제외, bound 미확인)
+    if t > 64 && std::env::var_os("LLM170_V4").is_none() && std::env::var_os("LLM170_J128").is_none()
+        && !matches!(w.ty, llm170_gguf::GgmlType::Q8_0) {
+        return Err(format!("mm-bench 미지원: t={t}는 LLM170_V4 또는 LLM170_J128 필요"));
+    }
     let kern_name = match w.ty {
         llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q5k_v4" }
             else if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
