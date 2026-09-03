@@ -29,7 +29,7 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **73.0 t/s** (114.5 fast mode) | 0.51x (0.80x) |
+| Prefill pp64 | 142.8 t/s | **73.9 t/s** (120.3 fast mode) | 0.52x (0.84x) |
 | Prefill pp512 | ~230 t/s (3314-tok) | **50.2 t/s** (66.8 fast mode) | ~0.22x (0.29x) |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
@@ -41,7 +41,8 @@ arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 
 - GDN kernels: causal conv fully parallel over (channel, token) — state
   updated by a separate tail kernel; AR recurrence keeps its state slice
-  resident in shared memory across the sequential scan.
+  resident in shared memory across the sequential scan, with the state
+  update and output passes fused (bit-identical element order).
 - Optional WMMA fast mode (LLM170_WMMA=1): all four quant types (q5_K, q4_K, q6_K, iq4_xs) use
   fp16 tensor-core MMA with scales folded into the f16 operands.
   Per-tensor deviation ~4e-4 relative (same numeric class as llama.cpp's
