@@ -62,22 +62,39 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             other => return usage_err_bench(&format!("unknown flag: {other}")),
         }
     }
-    let Some(model_path) = model else {
+    let Some(model_path): Option<std::path::PathBuf> = model else {
         return usage_err_bench("--model required");
     };
     if pp + tg + 16 >= ctx {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
 
-    // 수제 LCG 합성 토큰
-    let mut seed = 0x1234_5678u64;
-    let mut lcg = || {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((seed >> 33) % 200_000) as u32
+    // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
+    let prompt: Vec<u32> = match std::env::var("LLM170_BENCH_TEXT") {
+        Ok(txt) => {
+            let tok = crate::tokenize::Tokenizer::load(&model_path, None)
+                .unwrap_or_else(|e| panic!("토크나이저 로드 실패: {e}"));
+            let mut ids = tok.encode(&txt);
+            // pp 길이에 맞게 자르기/반복
+            ids.truncate(pp);
+            while ids.len() < pp {
+                let ext = ids.clone();
+                ids.extend(ext);
+                ids.truncate(pp);
+            }
+            ids
+        }
+        Err(_) => {
+            let mut seed = 0x1234_5678u64;
+            let mut lcg = || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) % 200_000) as u32
+            };
+            (0..pp).map(|_| lcg()).collect()
+        }
     };
-    let prompt: Vec<u32> = (0..pp).map(|_| lcg()).collect();
 
     // 아키텍처 판별 (ENOENT 재시도 관례)
     let mut arch: Option<String> = None;

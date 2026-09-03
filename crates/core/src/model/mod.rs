@@ -179,6 +179,9 @@ pub struct SeqState {
     mtp_kv_v: Vec<f32>,
     /// MTP draft h 입력 — 직전 확정 토큰 t의 본체 hidden (h_t).
     pub mtp_h: Vec<f32>,
+    /// MTP 훅이 계산한 직전 토큰의 draft 로짓/hidden (spec step-0 재사용).
+    pub mtp_draft_logits: Vec<f32>,
+    pub mtp_h_next: Vec<f32>,
 }
 
 impl SeqState {
@@ -207,6 +210,8 @@ impl SeqState {
             mtp_kv_k: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
             mtp_kv_v: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
             mtp_h: vec![0.0; if has_mtp { model.hp.n_embd } else { 0 }],
+            mtp_draft_logits: Vec::new(),
+            mtp_h_next: vec![0.0; if has_mtp { model.hp.n_embd } else { 0 }],
         }
     }
 }
@@ -452,6 +457,25 @@ impl Engine {
             }
             result.push(logits);
         }
+        // MTP nextn KV 적립 — 프롬프트/배치 토큰 전체 (draft 어텐션 컨텍스트).
+        // h_in = 본체 최종 hidden (output_norm 전). 로짓 없이 1층만.
+        if !self.seqs[seq_ids[0]].mtp_h.is_empty() {
+            for s in 0..n_seqs {
+                let sid = seq_ids[s];
+                let pos0 = self.seqs[sid].pos as usize;
+                for t in 0..t_len {
+                    // 마지막 토큰만 로짓 (spec step-0 재사용), 나머지는 KV 적립
+                    let wl = t + 1 == t_len;
+                    let h_t = xs[s * t_len + t].clone();
+                    let (lg, hn) =
+                        self.mtp_step(sid, batch[s][t], &h_t, (pos0 + t) as u32, wl)?;
+                    if wl {
+                        self.seqs[sid].mtp_draft_logits = lg;
+                        self.seqs[sid].mtp_h_next = hn;
+                    }
+                }
+            }
+        }
         Ok(result)
     }
 
@@ -520,14 +544,15 @@ impl Engine {
     }
 
     /// MTP draft층 1 forward (06) — eh_proj([enorm(embd(tok)); hnorm(h_t)]) →
-    /// 게이티드 어텐션(자체 KV) → FFN → shared head 로짓. 체인 draft용:
-    /// 반환 (logits, h_{t+1}) — h는 다음 draft 스텝의 hnorm 입력.
-    pub fn mtp_forward(
+    /// 게이티드 어텐션(자체 KV) → FFN → (선택) shared head 로짓.
+    /// with_logits=false → KV 적립·h만 (프리필/디코드 훅 — head GEMV 고가).
+    pub fn mtp_step(
         &mut self,
         seq: usize,
         token: u32,
         h_in: &[f32],
         pos: u32,
+        with_logits: bool,
     ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
         profile_span!("cpu::mtp_forward");
         let hp = self.model.hp.clone();
@@ -576,13 +601,27 @@ impl Engine {
             cur[i] = ffn_out[0][i] + ffn_res[i];
         }
 
-        // 4) shared head — shared_head_norm + output.weight (mtp_use_dedicated_embeddings=false)
+        // 4) shared head — with_logits에만 (output.weight GEMV는 고가)
+        if !with_logits {
+            return Ok((Vec::new(), cur));
+        }
         let sh_norm = self.model.f32_vec(&format!("blk.{il}.nextn.shared_head_norm.weight"))?;
         let head = self.model.wchk("output.weight")?;
         let h = rms_norm(&cur, &sh_norm, hp.eps);
         let mut logits = vec![0.0f32; head.n_out as usize];
         crate::matmul::mm(&acc, &h, &head, &mut logits)?;
         Ok((logits, cur))
+    }
+
+    /// MTP draft forward — 로짓 포함 (spec 체인용).
+    pub fn mtp_forward(
+        &mut self,
+        seq: usize,
+        token: u32,
+        h_in: &[f32],
+        pos: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        self.mtp_step(seq, token, h_in, pos, true)
     }
 
     fn mtp_attn(
@@ -603,13 +642,16 @@ impl Engine {
         let kq_scale = hp.kq_scale();
         let acc = self.acc.clone();
 
+        // llama.cpp: eh_proj 출력 → attn_norm → q/k/v (누락이 0-수용률 주벅)
+        let attn_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?;
+        let xn = crate::ops::rms_norm(x, &attn_norm_w, hp.eps);
         let mut group: [Vec<Vec<f32>>; 3] = [
             vec![vec![0.0f32; wq.n_out as usize]; 1],
             vec![vec![0.0f32; wk.n_out as usize]; 1],
             vec![vec![0.0f32; wv.n_out as usize]; 1],
         ];
         {
-            let xs = vec![x.to_vec()];
+            let xs = vec![xn];
             crate::matmul::mm_group(&acc, &xs, &[wq, wk, wv], &mut group)?;
         }
         let [qg, kk, vv] = group;
@@ -764,45 +806,43 @@ impl Engine {
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
         let eos = 248044u32;
-        // ── draft: 체인 k개 — mtp_forward는 자체 KV에 순차 적립
-        let mut h = self.seqs[seq].mtp_h.clone();
-        let mut drafts: Vec<u32> = Vec::with_capacity(k);
-        let mut tok = last_token;
-        let base_pos = self.seqs[seq].pos;
-        for _ in 0..k {
-            let dpos = base_pos + drafts.len() as u32;
-            let (logits, nh) = self.mtp_forward(seq, tok, &h, dpos)?;
-            let d = greedy(&logits);
-            drafts.push(d);
-            tok = d;
-            h = nh;
-            if d == eos {
-                break;
-            }
-        }
-        // ── verify: 타깃 t=1 순차 forward — draft와 순서 비교 연쇄 수용
+        // 교차 검증: 타깃 decode(토큰) → (hook이 계산한 (토큰,h) 쌍의 draft 로짓) 비교.
+        // draft 체인은 직전 draft 토큰 쌍으로 순차 — target decode가 h를 갱신하는 즉시.
+        let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨; last_token = 위치 base_pos 토큰(미처리)
         let mut accepted: Vec<u32> = Vec::new();
-        let mut cur_tok = last_token;
         let mut total = 0usize;
-        for (i, &d) in drafts.iter().enumerate() {
-            let logits = self.decode(&[seq], &[cur_tok])?;
+        let mut cur = last_token;
+        // 체인 상태: (draft 토큰, 그 pair의 h_next) — j=0은 hook 저장분 사용
+        let mut chain_tok: Option<u32> = None;
+        let mut chain_h: Vec<f32> = Vec::new();
+        let mut chain_pos = base_pos; // 다음 mtp_forward가 쓸 슬롯
+        for j in 0..=k {
+            let logits = self.decode(&[seq], &[cur])?;
             total += 1;
             let t = greedy(&logits[0]);
-            if t == d {
-                accepted.push(t);
-                cur_tok = t;
-                if i + 1 == drafts.len() {
-                    let l2 = self.decode(&[seq], &[cur_tok])?;
-                    total += 1;
-                    accepted.push(greedy(&l2[0]));
-                }
+            // draft 예측
+            let d = if j == 0 {
+                greedy(&self.seqs[seq].mtp_draft_logits)
             } else {
-                accepted.push(t); // 첫 불일치 위치의 타깃 argmax = 보너스
+                // 직전 루프에서 준비한 체인 로짓
+                let (lgt, nh) = self.mtp_forward(seq, chain_tok.unwrap(), &chain_h, chain_pos)?;
+                chain_h = nh;
+                chain_pos += 1;
+                greedy(&lgt)
+            };
+            accepted.push(t);
+            if std::env::var_os("LLM170_SPEC_DBG").is_some() {
+                eprintln!("  verify j={j} target={t} draft={d} {}", if t == d { "OK" } else { "MISS" });
+            }
+            if t != d || t == eos {
                 break;
             }
-            if t == eos {
-                break;
+            // 수용: 다음 비교용 체인 준비 — (d, h_next) pair는 다음 루프에서 forward
+            chain_tok = Some(d);
+            if chain_h.is_empty() {
+                chain_h = self.seqs[seq].mtp_h_next.clone();
             }
+            cur = t;
         }
         Ok((accepted, total))
     }
