@@ -52,7 +52,7 @@ cross-verification against per-token):
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
 | Prefill pp64 (chunk 64) | 142.8 t/s | **106.8 t/s** (81.8 exact mode) | 0.75x (0.57x) |
-| Prefill pp128 (chunk 128, J-tiles) | — | **128.2 t/s** (numerically verified) | 0.44x vs llama-bench 294 |
+| Prefill pp128 (chunk 128, J-tiles + dual-stream FFN) | — | **133.0 t/s** (numerically verified) | 0.45x vs llama-bench 294 |
 | Prefill pp512 (long context) | — | **114.8 t/s** | 0.32x vs llama-bench 358 |
 | Prefill pp512 | ~230 t/s (server-bench) | **~68 t/s** | ~0.30x |
 
