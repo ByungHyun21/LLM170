@@ -29,8 +29,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **73.0 t/s** (100.8 fast mode) | 0.51x (0.71x) |
-| Prefill pp512 | ~230 t/s (3314-tok) | **50.2 t/s** (61.8 fast mode) | ~0.22x (0.27x) |
+| Prefill pp64 | 142.8 t/s | **73.0 t/s** (103.8 fast mode) | 0.51x (0.73x) |
+| Prefill pp512 | ~230 t/s (3314-tok) | **50.2 t/s** (62.9 fast mode) | ~0.22x (0.27x) |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -42,11 +42,11 @@ arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 - GDN kernels: causal conv fully parallel over (channel, token) — state
   updated by a separate tail kernel; AR recurrence keeps its state slice
   resident in shared memory across the sequential scan.
-- Optional WMMA fast mode (LLM170_WMMA=1): q5_K, q4_K and iq4_xs prefill matmuls use
+- Optional WMMA fast mode (LLM170_WMMA=1): all four quant types (q5_K, q4_K, q6_K, iq4_xs) use
   fp16 tensor-core MMA with scales folded into the f16 operands.
   Per-tensor deviation ~4e-4 relative (same numeric class as llama.cpp's
   MMA path); diverges from the bit-exact stream, so it is opt-in — the
-  default engine remains bit-exact.
+  default engine remains bit-exact. WMMA engages only for chunks of 32+ tokens.
 - MMQ tile kernels (llama.cpp mul_mat_q structure): 64-row x 16-token
   blocks with cooperatively staged unpacked weights and activations in
   shared memory, thread fragments owning sb%4 sub-blocks — bit-exact via
