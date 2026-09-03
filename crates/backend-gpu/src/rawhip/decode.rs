@@ -553,7 +553,7 @@ impl DecodeState {
                     let mut p0 = pos as i32;
                     let gx = hd.div_ceil(64) as u32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
-                    self.ctx.launch3("qsa_mix", gx, n_head as u32, 1, 64, &mut args)?;
+                    self.ctx.launch3("qsa_mix2", gx, n_head as u32, 1, 64, &mut args)?;
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
                 }
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
@@ -925,7 +925,7 @@ gmark("attn", &mut marks);
                         let mut p0 = pos0 as i32;
                         let gx = hd.div_ceil(64) as u32;
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
-                        self.ctx.launch3("qsa_mix", gx, n_head as u32, t as u32, 64, &mut args)?;
+                        self.ctx.launch3("qsa_mix2", gx, n_head as u32, t as u32, 64, &mut args)?;
                     }
                 }
                 // wo 배치

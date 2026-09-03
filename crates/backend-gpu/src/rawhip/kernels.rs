@@ -2687,6 +2687,45 @@ extern "C" __global__ void qsa_score(const float* q, const float* ck, const unsi
     scores[(t * n_head + h) * sstride + p] = d;
 }
 // QSA attention mix: softmax-weighted V sum + gate — sequential deterministic order
+extern "C" __global__ void qsa_mix2(const float* q, const float* scores, const float* cv,
+                                    float* out, int n_past, int n_head, int n_kv,
+                                    int hd, int t_len, int sstride, int pos0) {
+    // exp 64× 중복 제거: (t,h)당 wbuf[p]=exp값 협력 적재 1회 — 가중·순차합
+    // 순서는 원소별 불변 (비트무영향). max는 결합법칙으로 스레드별 전체 스캔.
+    __shared__ float wbuf[2048];
+    int d_i = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int t = blockIdx.z;
+    if (h >= n_head || t >= t_len) return;
+    int sbase = (t * n_head + h) * sstride;
+    int tid = threadIdx.x;              // 0..63 (hd=64 — 블록=hd)
+    // max (스레드별 전체 — 결합법칙, 정확)
+    float maxv = scores[sbase];
+    for (int p = 0; p < n_past; p++) {
+        float sv = scores[sbase + p];
+        if (sv > maxv) maxv = sv;
+    }
+    // exp 재계산 (max 반영) — wbuf 갱신: 1패스, 각 원소 1회
+    for (int p = tid; p < n_past; p += 64) wbuf[p] = exp_cr(scores[sbase + p] - maxv);
+    __syncthreads();
+    if (d_i >= hd) return;
+    // 순차 합 (원본 p=0.. 순서 — 비트열 동일)
+    float sum = wbuf[0];
+    for (int p = 1; p < n_past; p++) sum += wbuf[p];
+    int kvh = h / (n_head / n_kv);
+    float a = 0.0f;
+    for (int p = 0; p < n_past; p++) {
+        float w = wbuf[p] / sum;
+        if (w != 0.0f) {
+            int kb = p * n_kv * hd + kvh * hd;
+            a += w * cv[kb + d_i];
+        }
+    }
+    int gb = t * n_head * 2 * hd + h * 2 * hd + hd;
+    float g = 1.0f / (1.0f + exp_cr(-q[gb + d_i]));
+    out[t * n_head * hd + h * hd + d_i] = a * g;
+}
+
 extern "C" __global__ void qsa_mix(const float* q, const float* scores, const float* cv,
                                    float* out, int n_past, int n_head, int n_kv,
                                    int hd, int t_len, int sstride, int pos0) {
@@ -2723,7 +2762,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
