@@ -71,6 +71,7 @@ pub struct DecodeState {
     pub ms_segend: *mut u8,
     pub ms_rownp: *mut u8,
     pub ms_ptrbuf: *mut u8,
+    pub ms_ptrbuf2: *mut u8, // K/V 테이블 분리 (flash 동시 참조)
     pub mtp_e: *mut u8,     // tok embd 임시
     pub mtp_h: *mut u8,     // h 입력 임시
     pub mtp_xq: *mut u8,    // n quant
@@ -234,7 +235,7 @@ impl DecodeState {
             .any(|(k, _)| k == "blk.64.nextn.eh_proj.weight");
         let n_ao = hp.n_head * hp.head_dim; // wo 입력 (6144 > n)
         let b_ms_meta = ctx.alloc(160 * 4).map_err(|e| e.to_string())?; // i32 5×32
-        let b_ms_ptr = ctx.alloc(32 * 8).map_err(|e| e.to_string())?; // 포인터 32행
+        let b_ms_ptr = ctx.alloc(32 * 8 * 2).map_err(|e| e.to_string())?; // K/V 테이블 2×32행
         let b_mtp_xq_sz = (n_ao / 4 + n_ao / 32 + n_ao / 16) * 4;
         let b_mtp_xq2_sz = (2 * n / 4 + 2 * n / 32 + 2 * n / 16) * 4;
         let (mut v_mtp_k, mut v_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
@@ -309,6 +310,7 @@ impl DecodeState {
             ms_segend: unsafe { b_ms_meta.add(96 * 4) },
             ms_rownp: unsafe { b_ms_meta.add(128 * 4) },
             ms_ptrbuf: b_ms_ptr,
+            ms_ptrbuf2: unsafe { b_ms_ptr.add(32 * 8) },
             mtp_e: b_mtp_e,
             mtp_h: b_mtp_h,
             mtp_xq: b_mtp_xq,
@@ -2143,26 +2145,28 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
                     self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
                 }
-                // AR _ms (행별 seq 상태)
-                {
-                    let mut sp3 = self.ms_gdn_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
-                    let mut qp = self.gq_t as *mut std::ffi::c_void;
-                    let mut kp = self.gk_t as *mut std::ffi::c_void;
-                    let mut vp = self.gv_t as *mut std::ffi::c_void;
-                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
-                    let mut op = self.go_t as *mut std::ffi::c_void;
+                                // AR — per-seq 슬라이스 (gdn_ar_w_ms 비대칭 RCA 회피 — 트렁크 검증 커널 재사용)
+                for gi in 0..group_starts.len() {
+                    let (g0, g1) = (group_starts[gi], if gi + 1 < group_starts.len() { group_starts[gi + 1] } else { t });
+                    let gt = g1 - g0;
+                    let sq = seqs[gi];
+                    let mut sp3 = self.st_gdn[recr_idx][sq] as *mut std::ffi::c_void;
+                    let mut qp = unsafe { self.gq_t.add(g0 * k_len * 4) } as *mut std::ffi::c_void;
+                    let mut kp = unsafe { self.gk_t.add(g0 * k_len * 4) } as *mut std::ffi::c_void;
+                    let mut vp = unsafe { self.gv_t.add(g0 * v_len * 4) } as *mut std::ffi::c_void;
+                    let mut bgp = unsafe { self.gbg_t.add(g0 * self.dt_rank * 2 * 4) } as *mut std::ffi::c_void;
+                    let mut op = unsafe { self.go_t.add(g0 * v_len * 4) } as *mut std::ffi::c_void;
                     let mut d = self.d_state as i32;
                     let mut ks = k_len as i32;
                     let mut vs = v_len as i32;
                     let mut hv = self.dt_rank as i32;
                     let mut hk = self.n_group as i32;
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
-                    let mut tt = t as i32;
-                    let mut rs = self.ms_rowseq as *mut std::ffi::c_void;
-                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt), Self::p(&mut rs)];
-                    self.ctx.launch3("gdn_ar_w_ms", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                    let mut tt = gt as i32;
+                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
+                    self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
                 }
-                // norm_gated 공유
+// norm_gated 공유
                 {
                     let mut op = self.go_t as *mut std::ffi::c_void;
                     let mut zp = self.gz_t as *mut std::ffi::c_void;
@@ -2205,10 +2209,10 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut ps), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
                     self.ctx.launch3("qk_norm_rope_ms", rows as u32, t as u32, 1, 32, &mut args)?;
                 }
-                // KV append _ms (행별 kv·off)
+                // KV append _ms (행별 kv·off) — k/v 테이블 분리 버퍼
                 {
-                    let kk = self.ms_kvk_ptr(full_idx, &row_seq)?;
-                    let vv = self.ms_kvv_ptr(full_idx, &row_seq)?;
+                    let kk = self.ms_kvk_ptr_to(full_idx, &row_seq, self.ms_ptrbuf)?;
+                    let vv = self.ms_kvv_ptr_to(full_idx, &row_seq, self.ms_ptrbuf2)?;
                     let mut sp = self.ak_t as *mut std::ffi::c_void;
                     let mut dp = kk as *mut std::ffi::c_void;
                     let mut na = (n_kv * hd) as i32;
@@ -2221,10 +2225,10 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut args2 = vec![Self::p(&mut sp2), Self::p(&mut dp2), Self::p(&mut off), Self::p(&mut na), Self::p(&mut tt)];
                     self.ctx.launch3("kv_append_t_ms", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args2)?;
                 }
-                // flash _ms (행별 ck/cv/np/p0)
+                // flash _ms (행별 ck/cv/np/p0) — K 테이블 재업로드 (v 업로드에 덮어쓰이지 않게 분리)
                 {
-                    let kk = self.ms_kvk_ptr(full_idx, &row_seq)?;
-                    let vv = self.ms_kvv_ptr(full_idx, &row_seq)?;
+                    let kk = self.ms_kvk_ptr_to(full_idx, &row_seq, self.ms_ptrbuf)?;
+                    let vv = self.ms_kvv_ptr_to(full_idx, &row_seq, self.ms_ptrbuf2)?;
                     let mut qp = self.aq_t as *mut std::ffi::c_void;
                     let mut ckp = kk as *mut std::ffi::c_void;
                     let mut cvp = vv as *mut std::ffi::c_void;
@@ -2339,17 +2343,21 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
     }
 
     fn ms_kvk_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
-        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k[il][sq as usize]).collect();
-        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
-        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
-        Ok(self.ms_ptrbuf)
+        self.ms_kvk_ptr_to(il, row_seq, self.ms_ptrbuf)
     }
 
-    fn ms_kvv_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
+    fn ms_kvk_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k[il][sq as usize]).collect();
+        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
+        self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
+        Ok(dst)
+    }
+
+    fn ms_kvv_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
         let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_v[il][sq as usize]).collect();
         let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
-        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
-        Ok(self.ms_ptrbuf)
+        self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
+        Ok(dst)
     }
 
     pub fn gdn_snapshot(&self) -> Result<(), String> {
