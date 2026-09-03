@@ -30,6 +30,24 @@ pub struct RawCtx {
     cursors: std::sync::Mutex<HashMap<usize, usize>>,
 }
 
+/// 타일 발사 파라미터 (스택 로컬 소유 — args 포인터 유효성 보장).
+struct TileLaunch {
+    kern: &'static str,
+    xp: *mut std::ffi::c_void,
+    wp: *mut std::ffi::c_void,
+    op: *mut std::ffi::c_void,
+    ktp: *mut std::ffi::c_void,
+    ni: i32,
+    no: i32,
+    xw: i32,
+    tt: i32,
+    gx: u32,
+    gz: u32,
+    block: u32,
+    ktab: bool,
+}
+
+
 impl RawCtx {
     pub fn new() -> Result<Self, String> {
         unsafe {
@@ -393,14 +411,14 @@ impl RawCtx {
         Ok(())
     }
 
-    pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
         // wm·mm 상한 64: t>64 무CO는 유효 커널 없음 — 침묵 오답 대신 에러
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
         }
-        let kern = match ty {
+        let kern: &'static str = match ty {
             13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
@@ -411,75 +429,53 @@ impl RawCtx {
             8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
-
-        let mut xp = xq as *mut std::ffi::c_void;
-        let mut wp = w as *mut std::ffi::c_void;
-        let mut op = out as *mut std::ffi::c_void;
-        let mut ktp = ktab2 as *mut std::ffi::c_void;
-        let mut ni = n_in as i32;
-        let mut no = n_out as i32;
-        let mut xw = xq_w as i32;
-        let mut tt = t as i32;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut xp) as *mut _ as *mut std::ffi::c_void,
-            (&mut wp) as *mut _ as *mut std::ffi::c_void,
-            (&mut op) as *mut _ as *mut std::ffi::c_void,
-        ];
-        let is_j128 = kern.ends_with("_j128");
-        if ty == 23 || kern == "gemm_nl_v4" {
-            args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
-        }
-        args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
         let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128") || kern.ends_with("_v4");
         let rows_per_block: usize = if kern.ends_with("_j128") || kern.ends_with("_v4") { 128 } else if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
-        let gx = nblocks.min(65535) as u32;
-        let gz = nblocks.div_ceil(65535) as u32;
-        let block: u32 = if mm { 256 } else { 64 };
-        self.launch3(kern, gx, 1, gz, block, &mut args)
+        Ok(TileLaunch {
+            kern,
+            xp: xq as *mut std::ffi::c_void,
+            wp: w as *mut std::ffi::c_void,
+            op: out as *mut std::ffi::c_void,
+            ktp: ktab2 as *mut std::ffi::c_void,
+            ni: n_in as i32,
+            no: n_out as i32,
+            xw: xq_w as i32,
+            tt: t as i32,
+            gx: nblocks.min(65535) as u32,
+            gz: nblocks.div_ceil(65535) as u32,
+            block: if mm { 256 } else { 64 },
+            ktab: ty == 23 || kern == "gemm_nl_v4",
+        })
     }
-    pub fn gemm_tile_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
-        let j128 = std::env::var_os("LLM170_EXACT").is_none()
-            && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
-        let kern = match ty {
-            13 => if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
-            _ => return Err(format!("타일 미지원 타입 {ty}")),
-        };
 
-        let mut xp = xq as *mut std::ffi::c_void;
-        let mut wp = w as *mut std::ffi::c_void;
-        let mut op = out as *mut std::ffi::c_void;
-        let mut ktp = ktab2 as *mut std::ffi::c_void;
-        let mut ni = n_in as i32;
-        let mut no = n_out as i32;
-        let mut xw = xq_w as i32;
-        let mut tt = t as i32;
+    fn tile_args(l: &mut TileLaunch) -> Vec<*mut std::ffi::c_void> {
         let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut xp) as *mut _ as *mut std::ffi::c_void,
-            (&mut wp) as *mut _ as *mut std::ffi::c_void,
-            (&mut op) as *mut _ as *mut std::ffi::c_void,
+            (&mut l.xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut l.wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut l.op) as *mut _ as *mut std::ffi::c_void,
         ];
-        let is_j128 = kern.ends_with("_j128");
-        if ty == 23 || (is_j128 && false) {
-            args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
+        if l.ktab {
+            args.push((&mut l.ktp) as *mut _ as *mut std::ffi::c_void);
         }
-        args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
-        args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128");
-        let rows_per_block: usize = if kern.ends_with("_j128") { 128 } else if mm { 64 } else { 1 };
-        let nblocks = n_out.div_ceil(rows_per_block);
-        let gx = nblocks.min(65535) as u32;
-        let gz = nblocks.div_ceil(65535) as u32;
-        let block: u32 = if mm { 256 } else { 64 };
-        self.launch3s(kern, gx, 1, gz, block, &mut args)
+        args.push((&mut l.ni) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut l.no) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut l.xw) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut l.tt) as *mut _ as *mut std::ffi::c_void);
+        args
+    }
+
+    pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
+        let mut args = Self::tile_args(&mut l);
+        self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
+    }
+
+    /// gemm_tile의 사이드 스트림판 — 커널 선택·인자 구성은 공용 코어에 위임.
+    pub fn gemm_tile_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
+        let mut args = Self::tile_args(&mut l);
+        self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.

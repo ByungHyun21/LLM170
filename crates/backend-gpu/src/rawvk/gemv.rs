@@ -1,78 +1,54 @@
-//! VkAcc — Vulkan matmul 가속기 (plans/12 M2). HIP과 병립:
+//! VkAcc — Vulkan matmul 가속기 (plans/12·13). HIP과 병립:
 //! LLM170_GPU_RUNTIME=vulkan 시 주입, GDN/프레임은 CPU 폴백 (트레이트 Err).
+//! 구조: 파이프라인·버퍼·가중치는 전부 지연 초기화 캐시, dispatch 헬퍼가
+//! SSBO 바인딩+push+발사를 일원화 (M4b 확장 지점).
 
 use crate::rawvk::context::{VkBuf, VkCtx};
 use ash::vk;
 use llm170_core::matmul::{Accelerator, Weight};
 use llm170_gguf::GgmlType;
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
-const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
 const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
 
+/// 파이프라인 세트 (vk 핸들은 복사 가능).
+#[derive(Clone, Copy)]
 struct Pipes {
-    dsl: vk::DescriptorSetLayout,
     pl: vk::PipelineLayout,
-    dp: vk::DescriptorPool,
     ds: vk::DescriptorSet,
     pipe: vk::Pipeline,
 }
 
-struct TilePipes {
-    dsl: vk::DescriptorSetLayout,
-    pl: vk::PipelineLayout,
-    dp: vk::DescriptorPool,
-    ds: vk::DescriptorSet,
-    pipe: vk::Pipeline,
-}
-
-struct SiluPipes {
-    dsl: vk::DescriptorSetLayout,
-    pl: vk::PipelineLayout,
-    dp: vk::DescriptorPool,
-    ds: vk::DescriptorSet,
-    pipe: vk::Pipeline,
-}
-
-struct RmsPipes {
-    dsl: vk::DescriptorSetLayout,
-    pl: vk::PipelineLayout,
-    dp: vk::DescriptorPool,
-    ds: vk::DescriptorSet,
-    pipe: vk::Pipeline,
-}
-
-struct QuantPipes {
-    dsl: vk::DescriptorSetLayout,
-    pl: vk::PipelineLayout,
-    dp: vk::DescriptorPool,
-    ds: vk::DescriptorSet,
-    pipe: vk::Pipeline,
+/// 지연 파이프라인 슬롯.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    Gemv,
+    Tile128,
+    Quant,
+    Rms,
+    Silu,
 }
 
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
-    tpipes: Mutex<Option<TilePipes>>,
-    t128pipes: Mutex<Option<TilePipes>>,
-    ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
-    spipe: Mutex<Option<SiluPipes>>,
-    sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
-    rpipe: Mutex<Option<RmsPipes>>,
-    rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
-    qpipes: Mutex<Option<QuantPipes>>,
-    xfbuf: Mutex<Option<VkBuf>>,
+    pipes: Mutex<HashMap<Slot, Pipes>>,
+    /// 가중치 캐시 (데이터 포인터 → 상주 청크들)
+    wcache: Mutex<HashMap<usize, Vec<VkBuf>>>,
     tables: Mutex<Option<(VkBuf, VkBuf)>>,
     dummy: Mutex<Option<VkBuf>>,
-    pipes: Mutex<Option<Pipes>>,
-    /// 가중치 캐시 (데이터 포인터 → 상주 버퍼)
-    wcache: Mutex<HashMap<usize, Vec<VkBuf>>>,
+    // 값-경로 버퍼 (필요시 성장)
+    xfbuf: Mutex<Option<VkBuf>>,
     xbuf: Mutex<Option<VkBuf>>,
     obuf: Mutex<Option<VkBuf>>,
+    sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
+    rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
+    // FFN 상주 체인 버퍼 (xf, xq0, fg, fu, glu, xq1, ob)
+    ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
 }
 
 fn vk_ty(ty: GgmlType) -> Option<u32> {
@@ -89,6 +65,14 @@ fn vk_ty(ty: GgmlType) -> Option<u32> {
     }
 }
 
+fn push_u32s(vals: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(vals.len() * 4);
+    for x in vals {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v
+}
+
 impl VkAcc {
     pub fn new() -> Result<Self, String> {
         let ctx = VkCtx::new()?;
@@ -97,266 +81,261 @@ impl VkAcc {
         }
         Ok(Self {
             ctx: Mutex::new(ctx),
-            tpipes: Mutex::new(None),
-            t128pipes: Mutex::new(None),
-            ffnbufs: Mutex::new(None),
-            spipe: Mutex::new(None),
-            sbufs: Mutex::new(None),
-            rpipe: Mutex::new(None),
-            rbufs: Mutex::new(None),
-            qpipes: Mutex::new(None),
-            xfbuf: Mutex::new(None),
+            pipes: Mutex::new(HashMap::new()),
+            wcache: Mutex::new(HashMap::new()),
             tables: Mutex::new(None),
             dummy: Mutex::new(None),
-            pipes: Mutex::new(None),
-            wcache: Mutex::new(HashMap::new()),
+            xfbuf: Mutex::new(None),
             xbuf: Mutex::new(None),
             obuf: Mutex::new(None),
+            sbufs: Mutex::new(None),
+            rbufs: Mutex::new(None),
+            ffnbufs: Mutex::new(None),
         })
     }
 
-    fn qpipes(&self, ctx: &mut VkCtx) -> Result<QuantPipes, String> {
-        let mut g = self.qpipes.lock();
-        if g.is_none() {
-            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(QUANT_SPV, 2, 12)?;
-            *g = Some(QuantPipes { dsl, pl, dp, ds, pipe });
+    // ─── 지연 초기화 공용 자원 ───
+
+    fn pipeline(&self, ctx: &mut VkCtx, slot: Slot) -> Result<Pipes, String> {
+        if let Some(&p) = self.pipes.lock().get(&slot) {
+            return Ok(p);
         }
-        let r = g.as_ref().unwrap();
-        Ok(QuantPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe })
+        let (spv, n_buf, pb) = match slot {
+            Slot::Gemv => (GEMV_SPV, 12, 20u32),
+            Slot::Tile128 => (TILE128_SPV, 10, 16),
+            Slot::Quant => (QUANT_SPV, 2, 12),
+            Slot::Rms => (RMS_SPV, 3, 12),
+            Slot::Silu => (SILU_SPV, 3, 4),
+        };
+        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(spv, n_buf, pb)?;
+        let _ = dsl;
+        let _ = dp;
+        let p = Pipes { pl, ds, pipe };
+        self.pipes.lock().insert(slot, p);
+        Ok(p)
     }
 
-    fn tpipes(&self, ctx: &mut VkCtx) -> Result<TilePipes, String> {
-        let mut g = self.tpipes.lock();
-        if g.is_none() {
-            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(TILE_Q5K_SPV, 10, 16)?;
-            *g = Some(TilePipes { dsl, pl, dp, ds, pipe });
+    /// ktab(iq4nl)·grid3s 테이블 + 더미 버퍼 — 최초 1회 업로드.
+    fn ensure_shared(&self, ctx: &mut VkCtx) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer), String> {
+        if self.tables.lock().is_none() {
+            let kv: Vec<u32> = (0..256u32)
+                .map(|b| {
+                    let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+                    let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+                    lo | (hi << 8)
+                })
+                .collect();
+            let kb = ctx.alloc(1024)?;
+            unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
+            let gb = ctx.alloc(2048)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    llm170_core::IQ3S_GRID.as_ptr() as *const u8,
+                    gb.ptr,
+                    2048,
+                );
+            }
+            *self.tables.lock() = Some((kb, gb));
         }
-        let r = g.as_ref().unwrap();
-        Ok(TilePipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe })
+        if self.dummy.lock().is_none() {
+            *self.dummy.lock() = Some(ctx.alloc(16)?);
+        }
+        let t = self.tables.lock();
+        let (a, b) = t.as_ref().unwrap();
+        Ok((a.buf, b.buf, self.dummy.lock().as_ref().unwrap().buf))
     }
 
-    fn pipes(&self, ctx: &mut VkCtx) -> Result<Pipes, String> {
-        let mut g = self.pipes.lock();
-        if g.is_none() {
-            let (dsl, pl, dp, ds, pipe) = ctx.pipeline(GEMV_SPV, 12, 20)?;
-            *g = Some(Pipes { dsl, pl, dp, ds, pipe });
+    /// 가중치 상주 (ptr 키 — mmap 안정) — 128MB 청크 (RADV maxStorageBufferRange).
+    fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
+        let key = w.data.as_ptr() as usize;
+        {
+            let mut wc = self.wcache.lock();
+            if !wc.contains_key(&key) {
+                let ch = ctx.max_ssbo;
+                let total = w.data.len();
+                let mut bufs = Vec::new();
+                let mut off = 0usize;
+                while off < total {
+                    let n = ch.min(total - off);
+                    let b = ctx.alloc(n)?;
+                    unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n) };
+                    bufs.push(b);
+                    off += n;
+                }
+                wc.insert(key, bufs);
+            }
         }
-        Ok(Pipes { ..g.as_ref().unwrap().clone() })
+        let bufs: Vec<vk::Buffer> = {
+            let wc = self.wcache.lock();
+            wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
+        };
+        if bufs.len() > 8 {
+            return Err(format!("가중 청크 {}개 > 8 슬롯 (M2 한계)", bufs.len()));
+        }
+        Ok(bufs)
+    }
+
+    /// GEMV 1회 발사: 가중 청크(8) + xq + out + ktab + grid = 12 바인딩.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_run(
+        &self,
+        ctx: &mut VkCtx,
+        wbufs: &[vk::Buffer],
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        ty: u32,
+        t: usize,
+        xq_buf: vk::Buffer,
+        out_buf: vk::Buffer,
+    ) -> Result<(), String> {
+        let (kb, gb, dbuf) = self.ensure_shared(ctx)?;
+        let p = self.pipeline(ctx, Slot::Gemv)?;
+        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
+        while binds.len() < 8 {
+            binds.push(dbuf);
+        }
+        binds.push(xq_buf);
+        binds.push(out_buf);
+        binds.push(kb);
+        binds.push(gb);
+        ctx.bind_bufs(p.ds, &binds);
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32]);
+        ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, 1, 1)
+    }
+
+    /// 128행 coopmat 타일 (q5_K, t≥2) — f16 스테이징, maxrel ~4.9e-4 (HIP v4급).
+    fn tile128_run(
+        &self,
+        ctx: &mut VkCtx,
+        wbufs: &[vk::Buffer],
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        xq_buf: vk::Buffer,
+        out_buf: vk::Buffer,
+    ) -> Result<(), String> {
+        let (_, _, dbuf) = self.ensure_shared(ctx)?;
+        let p = self.pipeline(ctx, Slot::Tile128)?;
+        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
+        while binds.len() < 8 {
+            binds.push(dbuf);
+        }
+        binds.push(xq_buf);
+        binds.push(out_buf);
+        ctx.bind_bufs(p.ds, &binds);
+        let gx = (n_out + 127) as u32 / 128;
+        for tb in (0..t).step_by(64) {
+            let nt = (t - tb).min(64) as u32;
+            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt]);
+            ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
+        }
+        Ok(())
+    }
+
+    /// xs(f32) 업로드 → quant_q8 → xq 버퍼 (값 버퍼 자동 성장).
+    fn quant_upload(
+        &self,
+        ctx: &mut VkCtx,
+        xs: &[Vec<f32>],
+        n_in: usize,
+        xq_buf: vk::Buffer,
+    ) -> Result<(), String> {
+        let t = xs.len();
+        {
+            let mut xf = self.xfbuf.lock();
+            let need = t * n_in * 4;
+            if !xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+                *xf = Some(ctx.alloc(need.max(1 << 21))?);
+            }
+            let b = xf.as_ref().unwrap();
+            for (ti, row) in xs.iter().enumerate() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        b.ptr.add(ti * n_in * 4) as *mut f32,
+                        n_in,
+                    );
+                }
+            }
+        }
+        let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
+        let p = self.pipeline(ctx, Slot::Quant)?;
+        ctx.bind_bufs(p.ds, &[xfbuf, xq_buf]);
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
+        ctx.run(p.pl, p.ds, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)
+    }
+
+    /// 값 버퍼 확보 (필요시 성장) → 핸들 반환.
+    fn value_buf(&self, ctx: &mut VkCtx, slot: &Mutex<Option<VkBuf>>, need: usize) -> Result<vk::Buffer, String> {
+        let mut g = slot.lock();
+        if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+            *g = Some(ctx.alloc(need.max(1 << 21))?);
+        }
+        Ok(g.as_ref().unwrap().buf)
+    }
+
+    /// out 버퍼에서 호스트 행 복사.
+    fn download_out(&self, outs: &mut [Vec<f32>], n_out: usize, t: usize) {
+        let ob = self.obuf.lock();
+        let host = unsafe { std::slice::from_raw_parts(ob.as_ref().unwrap().ptr as *const f32, t * n_out) };
+        for ti in 0..t {
+            outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+        }
     }
 }
-
-// vk 핸들은 복사 가능 (NonNull 래퍼) — 파이프라인 세트 공유용 Clone.
-impl Clone for Pipes {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for Pipes {}
 
 impl llm170_core::matmul::FrameState for VkAcc {}
-
 unsafe impl Send for VkAcc {}
 unsafe impl Sync for VkAcc {}
 
 impl VkAcc {
-    /// FFN 상주 체인 — 업로드 1회(xs)·다운로드 1회(xs), gate/up/silu/glu/down 전부 GPU 상주.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ffn_chain_gpu(
+    /// rms_norm 오프로드 — f32 세그먼트+f64 결합 (CPU sq_sum 미러와 동일 순서).
+    pub fn rms_norm_gpu(
         &self,
         xs: &[Vec<f32>],
-        gate_w: &Weight,
-        up_w: &Weight,
-        down_w: &Weight,
-        xs_out: &mut [Vec<f32>],
+        w: &[f32],
+        eps: f32,
+        outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         let t = xs.len();
-        let n0 = gate_w.n_in as usize;      // n_embd
-        let n_ff = gate_w.n_out as usize;
+        let n = w.len();
         let mut ctx = self.ctx.lock();
-        let tables = {
-            let mut tb = self.tables.lock();
-            if tb.is_none() {
-                let kv: Vec<u32> = (0..256u32)
-                    .map(|b| {
-                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-                        lo | (hi << 8)
-                    })
-                    .collect();
-                let kb = ctx.alloc(1024)?;
-                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
-                let gb = ctx.alloc(2048)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
-                        gb.ptr,
-                        2048,
-                    );
-                }
-                *tb = Some((kb, gb));
-            }
-            let (a, b) = tb.as_ref().unwrap();
-            (a.buf, b.buf)
-        };
         {
-            let mut d = self.dummy.lock();
-            if d.is_none() {
-                let b = ctx.alloc(16)?;
-                *d = Some(b);
-            }
-        }
-        let dbuf = self.dummy.lock().as_ref().unwrap().buf;
-        // 전용 체인 버퍼 (기존 버퍼와 충돌 회피)
-        let (xbf, bq0, bfg, bfu, bglu, bq1, bob) = {
-            let mut b = self.ffnbufs.lock();
+            let mut b = self.rbufs.lock();
             if b.is_none() {
-                let xf = ctx.alloc(1 << 23)?;
-                let xq0 = ctx.alloc(1 << 22)?;
-                let fg = ctx.alloc(1 << 24)?;
-                let fu = ctx.alloc(1 << 24)?;
-                let glu = ctx.alloc(1 << 24)?;
-                let xq1 = ctx.alloc(1 << 24)?;
-                let ob = ctx.alloc(1 << 23)?;
-                *b = Some((xf, xq0, fg, fu, glu, xq1, ob));
+                let xb = ctx.alloc((t * n * 4).max(1 << 21))?;
+                let wb = ctx.alloc(n * 4)?;
+                let ob = ctx.alloc((t * n * 4).max(1 << 21))?;
+                *b = Some((xb, wb, ob));
             }
+        }
+        {
+            let b = self.rbufs.lock();
+            let (xv, wv, _) = b.as_ref().unwrap();
+            for (ti, row) in xs.iter().enumerate() {
+                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xv.ptr.add(ti * n * 4) as *mut f32, n) };
+            }
+            unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wv.ptr as *mut f32, n) };
+        }
+        let (xb, wb, ob) = {
+            let b = self.rbufs.lock();
             let r = b.as_ref().unwrap();
-            (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf)
+            (r.0.buf, r.1.buf, r.2.buf)
         };
-        let cptrs = {
-            let b = self.ffnbufs.lock();
-            let r = b.as_ref().unwrap();
-            (r.0.ptr, r.4.ptr, r.6.ptr)
+        let p = self.pipeline(&mut ctx, Slot::Rms)?;
+        ctx.bind_bufs(p.ds, &[xb, wb, ob]);
+        let mut push = push_u32s(&[n as u32, t as u32]);
+        push.extend_from_slice(&eps.to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push, t as u32, 1, 1)?;
+        let host = {
+            let b = self.rbufs.lock();
+            unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, t * n) }
         };
-        // 1) xs 업로드 → quant(n0)
-        for (ti, row) in xs.iter().enumerate() {
-            unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), cptrs.0.add(ti * n0 * 4) as *mut f32, n0); }
-        }
-        let xq0_w = n0 / 4 + n0 / 32 + n0 / 16;
-        {
-            let qp = self.qpipes(&mut ctx)?;
-            ctx.bind_bufs(qp.ds, &[xbf, bq0]);
-            let mut push = Vec::new();
-            push.extend_from_slice(&(n0 as u32).to_le_bytes());
-            push.extend_from_slice(&(t as u32).to_le_bytes());
-            push.extend_from_slice(&(xq0_w as u32).to_le_bytes());
-            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
-        }
-        // 2) gate/up GEMV (같은 xq0) — 상주 출력
-        let p = self.pipes(&mut ctx)?;
-        for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
-            let ty = vk_ty(w.ty).ok_or("ffn 타입 미지원")?;
-            let n_out = w.n_out as usize;
-            let wbufs: Vec<_> = {
-                let mut wc = self.wcache.lock();
-                let key = w.data.as_ptr() as usize;
-                if !wc.contains_key(&key) {
-                    let ch = ctx.max_ssbo;
-                    let total = w.data.len();
-                    let mut bufs = Vec::new();
-                    let mut off = 0usize;
-                    while off < total {
-                        let nb = ch.min(total - off);
-                        let bb = ctx.alloc(nb)?;
-                        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), bb.ptr, nb); }
-                        bufs.push(bb);
-                        off += nb;
-                    }
-                    wc.insert(key, bufs);
-                }
-                wc.get(&key).unwrap().iter().map(|bb| bb.buf).collect()
-            };
-            if wbufs.len() > 8 {
-                return Err("가중 청크 > 8".into());
-            }
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            binds.push(bq0);
-            binds.push(obuf);
-            binds.push(tables.0);
-            binds.push(tables.1);
-            ctx.bind_bufs(p.ds, &binds);
-            let mut push = Vec::new();
-            push.extend_from_slice(&(n0 as u32).to_le_bytes());
-            push.extend_from_slice(&(n_out as u32).to_le_bytes());
-            push.extend_from_slice(&(xq0_w as u32).to_le_bytes());
-            push.extend_from_slice(&ty.to_le_bytes());
-            let mut push20 = push.clone();
-        push20.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
-        }
-        // 3) silu_mul 상주 (bfg, bfu → bglu)
-        {
-            let sp = {
-                let mut g = self.spipe.lock();
-                if g.is_none() {
-                    let (dsl, pl, dp, ds, pipe) = ctx.pipeline(SILU_SPV, 3, 4)?;
-                    *g = Some(SiluPipes { dsl, pl, dp, ds, pipe });
-                }
-                let r = g.as_ref().unwrap();
-                SiluPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
-            };
-            ctx.bind_bufs(sp.ds, &[bfg, bfu, bglu]);
-            let total = (t * n_ff) as u32;
-            ctx.run(sp.pl, sp.ds, sp.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
-        }
-        // 4) glu quant(n_ff) → down GEMV → bob
-        {
-            let qp = self.qpipes(&mut ctx)?;
-            ctx.bind_bufs(qp.ds, &[bglu, bq1]);
-            let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
-            let mut push = Vec::new();
-            push.extend_from_slice(&(n_ff as u32).to_le_bytes());
-            push.extend_from_slice(&(t as u32).to_le_bytes());
-            push.extend_from_slice(&(xq1_w as u32).to_le_bytes());
-            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
-        }
-        {
-            let ty = vk_ty(down_w.ty).ok_or("ffn down 타입 미지원")?;
-            let n_out = down_w.n_out as usize;
-            let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
-            let wbufs: Vec<_> = {
-                let mut wc = self.wcache.lock();
-                let key = down_w.data.as_ptr() as usize;
-                if !wc.contains_key(&key) {
-                    let ch = ctx.max_ssbo;
-                    let total = down_w.data.len();
-                    let mut bufs = Vec::new();
-                    let mut off = 0usize;
-                    while off < total {
-                        let nb = ch.min(total - off);
-                        let bb = ctx.alloc(nb)?;
-                        unsafe { std::ptr::copy_nonoverlapping(down_w.data.as_ptr().add(off), bb.ptr, nb); }
-                        bufs.push(bb);
-                        off += nb;
-                    }
-                    wc.insert(key, bufs);
-                }
-                wc.get(&key).unwrap().iter().map(|bb| bb.buf).collect()
-            };
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            binds.push(bq1);
-            binds.push(bob);
-            binds.push(tables.0);
-            binds.push(tables.1);
-            ctx.bind_bufs(p.ds, &binds);
-            let mut push = Vec::new();
-            push.extend_from_slice(&(n_ff as u32).to_le_bytes());
-            push.extend_from_slice(&(n_out as u32).to_le_bytes());
-            push.extend_from_slice(&(xq1_w as u32).to_le_bytes());
-            push.extend_from_slice(&ty.to_le_bytes());
-            let mut push20 = push.clone();
-        push20.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
-        }
-        // 5) 다운로드 1회
-        let host = unsafe { std::slice::from_raw_parts(cptrs.2 as *const f32, t * n0) };
         for ti in 0..t {
-            xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
+            outs[ti].copy_from_slice(&host[ti * n..(ti + 1) * n]);
         }
         Ok(())
     }
@@ -374,8 +353,7 @@ impl VkAcc {
         let mut ctx = self.ctx.lock();
         {
             let mut b = self.sbufs.lock();
-            let ok = b.as_ref().map(|(g, _, _)| g.bytes >= total * 4).unwrap_or(false);
-            if !ok {
+            if !b.as_ref().map(|(g, _, _)| g.bytes >= total * 4).unwrap_or(false) {
                 let g = ctx.alloc((total * 4).max(1 << 21))?;
                 let u = ctx.alloc((total * 4).max(1 << 21))?;
                 let o = ctx.alloc((total * 4).max(1 << 21))?;
@@ -386,33 +364,24 @@ impl VkAcc {
             let b = self.sbufs.lock();
             let (gv, uv, _) = b.as_ref().unwrap();
             for (ti, row) in gs.iter().enumerate() {
-                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), gv.ptr.add(ti * n * 4) as *mut f32, n); }
+                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), gv.ptr.add(ti * n * 4) as *mut f32, n) };
             }
             for (ti, row) in us.iter().enumerate() {
-                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), uv.ptr.add(ti * n * 4) as *mut f32, n); }
+                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), uv.ptr.add(ti * n * 4) as *mut f32, n) };
             }
         }
-        let p = {
-            let mut g = self.spipe.lock();
-            if g.is_none() {
-                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(SILU_SPV, 3, 4)?;
-                *g = Some(SiluPipes { dsl, pl, dp, ds, pipe });
-            }
-            let r = g.as_ref().unwrap();
-            SiluPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
-        };
         let (gb, ub, ob) = {
             let b = self.sbufs.lock();
-            let (a2, b2, c2) = b.as_ref().unwrap();
-            (a2.buf, b2.buf, c2.buf)
+            let r = b.as_ref().unwrap();
+            (r.0.buf, r.1.buf, r.2.buf)
         };
+        let p = self.pipeline(&mut ctx, Slot::Silu)?;
         ctx.bind_bufs(p.ds, &[gb, ub, ob]);
-        let push = (total as u32).to_le_bytes();
-        ctx.run(p.pl, p.ds, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
+        let total_u = total as u32;
+        ctx.run(p.pl, p.ds, p.pipe, &total_u.to_le_bytes(), total_u.div_ceil(256), 1, 1)?;
         let host = {
             let b = self.sbufs.lock();
-            let (_, _, ov) = b.as_ref().unwrap();
-            unsafe { std::slice::from_raw_parts(ov.ptr as *const f32, total) }
+            unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, total) }
         };
         for ti in 0..t {
             outs[ti].copy_from_slice(&host[ti * n..(ti + 1) * n]);
@@ -420,70 +389,80 @@ impl VkAcc {
         Ok(())
     }
 
-    /// rms_norm 오프로드 — f32 세그먼트+f64 결합 (CPU sq_sum 미러와 동일 순서).
-    pub fn rms_norm_gpu(
+    /// FFN 상주 체인 — 업로드 1회(xs)·다운로드 1회(xs), gate/up/silu/glu/down 전부 GPU 상주.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_chain_gpu(
         &self,
         xs: &[Vec<f32>],
-        w: &[f32],
-        eps: f32,
-        outs: &mut [Vec<f32>],
+        gate_w: &Weight,
+        up_w: &Weight,
+        down_w: &Weight,
+        xs_out: &mut [Vec<f32>],
     ) -> Result<(), String> {
         let t = xs.len();
-        let n = w.len();
+        let n0 = gate_w.n_in as usize; // n_embd
+        let n_ff = gate_w.n_out as usize;
+        let xq0_w = n0 / 4 + n0 / 32 + n0 / 16;
+        let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
         let mut ctx = self.ctx.lock();
-        {
-            let mut b = self.rbufs.lock();
-            let need_x = t * n * 4;
-            let need_w = n * 4;
-            let ok = b.as_ref().map(|(x, _, _)| x.bytes >= need_x && x.bytes > 0).unwrap_or(false);
-            if !ok {
-                let xb = ctx.alloc(need_x.max(1 << 21))?;
-                let wb = ctx.alloc(need_w)?;
-                let ob = ctx.alloc(need_x.max(1 << 21))?;
-                *b = Some((xb, wb, ob));
+        // 체인 버퍼 (고정 용량 — 모델 최대 기준)
+        let (xbf, bq0, bfg, bfu, bglu, bq1, bob, xf_ptr, ob_ptr) = {
+            let mut b = self.ffnbufs.lock();
+            if b.is_none() {
+                let xf = ctx.alloc(1 << 23)?;
+                let xq0 = ctx.alloc(1 << 22)?;
+                let fg = ctx.alloc(1 << 24)?;
+                let fu = ctx.alloc(1 << 24)?;
+                let glu = ctx.alloc(1 << 24)?;
+                let xq1 = ctx.alloc(1 << 24)?;
+                let ob = ctx.alloc(1 << 23)?;
+                *b = Some((xf, xq0, fg, fu, glu, xq1, ob));
             }
+            let r = b.as_ref().unwrap();
+            (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf, r.0.ptr, r.6.ptr)
+        };
+        // 1) xs 업로드 → quant(n0)
+        for (ti, row) in xs.iter().enumerate() {
+            unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0) };
         }
-        let (xb, wb, ob) = {
-            let b = self.rbufs.lock();
-            let (a, bb, c) = b.as_ref().unwrap();
-            (a.buf, bb.buf, c.buf)
-        };
         {
-            let b = self.rbufs.lock();
-            let (xv, wv, _) = b.as_ref().unwrap();
-            for (ti, row) in xs.iter().enumerate() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr(),
-                        xv.ptr.add(ti * n * 4) as *mut f32,
-                        n,
-                    );
-                }
-            }
-            unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wv.ptr as *mut f32, n); }
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            ctx.bind_bufs(p.ds, &[xbf, bq0]);
+            let push = push_u32s(&[n0 as u32, t as u32, xq0_w as u32]);
+            ctx.run(p.pl, p.ds, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
         }
-        let p = {
-            let mut g = self.rpipe.lock();
-            if g.is_none() {
-                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(RMS_SPV, 3, 12)?;
-                *g = Some(RmsPipes { dsl, pl, dp, ds, pipe });
-            }
-            let r = g.as_ref().unwrap();
-            RmsPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
-        };
-        ctx.bind_bufs(p.ds, &[xb, wb, ob]);
-        let mut push = Vec::with_capacity(12);
-        push.extend_from_slice(&(n as u32).to_le_bytes());
-        push.extend_from_slice(&(t as u32).to_le_bytes());
-        push.extend_from_slice(&eps.to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push, t as u32, 1, 1)?;
-        let host = {
-            let b = self.rbufs.lock();
-            let (_, _, ov) = b.as_ref().unwrap();
-            unsafe { std::slice::from_raw_parts(ov.ptr as *const f32, t * n) }
-        };
+        // 2) gate/up GEMV (같은 xq0) — 상주 출력
+        for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
+            let ty = vk_ty(w.ty).ok_or("ffn 타입 미지원")?;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            self.gemv_run(&mut ctx, &wbufs, n0, w.n_out as usize, xq0_w, ty, t, bq0, obuf)?;
+        }
+        // 3) silu_mul 상주 (bfg, bfu → bglu)
+        {
+            let p = self.pipeline(&mut ctx, Slot::Silu)?;
+            ctx.bind_bufs(p.ds, &[bfg, bfu, bglu]);
+            let total = (t * n_ff) as u32;
+            ctx.run(p.pl, p.ds, p.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
+        }
+        // 4) glu quant(n_ff)
+        {
+            // bglu는 f32가 아니라 f32→q8 변환 입력 — quant 셰이더에 직접.
+            // (bglu는 silu 출력 f32 → quant가 읽는다)
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            ctx.bind_bufs(p.ds, &[bglu, bq1]);
+            let push = push_u32s(&[n_ff as u32, t as u32, xq1_w as u32]);
+            ctx.run(p.pl, p.ds, p.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
+        // 5) down GEMV
+        {
+            let ty = vk_ty(down_w.ty).ok_or("ffn down 타입 미지원")?;
+            let wbufs = self.weight_bufs(&mut ctx, down_w)?;
+            self.gemv_run(&mut ctx, &wbufs, n_ff, down_w.n_out as usize, xq1_w, ty, t, bq1, bob)?;
+        }
+        // 6) 다운로드 1회
+        let host = unsafe { std::slice::from_raw_parts(ob_ptr as *const f32, t * n0) };
         for ti in 0..t {
-            outs[ti].copy_from_slice(&host[ti * n..(ti + 1) * n]);
+            xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
         }
         Ok(())
     }
@@ -499,7 +478,6 @@ impl Accelerator for VkAcc {
         let ty = match vk_ty(w.ty) {
             Some(t) => t,
             None => {
-                // 미지원 타입(q8_0/nl/q3k/iq3s) — CPU W4A8 경로
                 llm170_core::matmul::matmul_batch(xs, w, outs);
                 return Ok(());
             }
@@ -509,247 +487,55 @@ impl Accelerator for VkAcc {
         let t = xs.len();
         let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
         let mut ctx = self.ctx.lock();
-        // GPU 양자화: xs(f32) 업로드 → quant_q8 → xq (CPU 부담 제거)
-        {
-            let mut xf = self.xfbuf.lock();
-            let need = t * n_in * 4;
-            let ok = xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 21))?;
-                *xf = Some(b);
-            }
-            let b = xf.as_ref().unwrap();
-            for (ti, row) in xs.iter().enumerate() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr(),
-                        b.ptr.add(ti * n_in * 4) as *mut f32,
-                        n_in,
-                    );
-                }
-            }
-        }
-        {
-            let mut xb = self.xbuf.lock();
-            let need = t * xq_w * 4;
-            let ok = xb.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 21))?;
-                *xb = Some(b);
-            }
-        }
-        {
-            let qp = self.qpipes(&mut ctx)?;
-            let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
-            let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
-            ctx.bind_bufs(qp.ds, &[xfbuf, xqbuf]);
-            let mut push = Vec::with_capacity(12);
-            push.extend_from_slice(&(n_in as u32).to_le_bytes());
-            push.extend_from_slice(&(t as u32).to_le_bytes());
-            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
-        }
-        // 가중 상주 (ptr 키 — mmap 안정) — 128MB 청크 분할 (maxStorageBufferRange)
-        {
-            let mut wc = self.wcache.lock();
-            let key = w.data.as_ptr() as usize;
-            if !wc.contains_key(&key) {
-                let ch = ctx.max_ssbo;
-                let total = w.data.len();
-                let mut bufs = Vec::new();
-                let mut off = 0usize;
-                while off < total {
-                    let n = ch.min(total - off);
-                    let b = ctx.alloc(n)?;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
-                    }
-                    bufs.push(b);
-                    off += n;
-                }
-                wc.insert(key, bufs);
-            }
-        }
-        let wbufs: Vec<_> = {
-            let wc = self.wcache.lock();
-            wc.get(&(w.data.as_ptr() as usize)).unwrap().iter().map(|b| b.buf).collect()
-        };
-        if wbufs.len() > 8 {
-            return Err(format!("가중 청크 {}개 > 8 슬롯 (M2 한계)", wbufs.len()));
-        }
-        {
-            let mut ob = self.obuf.lock();
-            let need = t * n_out * 4;
-            let ok = ob.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 20))?;
-                *ob = Some(b);
-            }
-        }
-        // 128행 coopmat 타일 (q5_K, t≥2) — f16 스테이징 maxrel ~4e-4 (HIP v4급).
-        // LLM170_VK_TILE=1로 활성 (스트림 게이트 민감 — 기본 GEMV exact).
+        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+        let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
+        self.quant_upload(&mut ctx, xs, n_in, xq)?;
+        let wbufs = self.weight_bufs(&mut ctx, w)?;
+        // 128행 타일 (q5_K, t≥2, env) — f16 fast 경로
         if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
-            // 더미
-            {
-                let mut d = self.dummy.lock();
-                if d.is_none() {
-                    let b = ctx.alloc(16)?;
-                    *d = Some(b);
-                }
-            }
-            let dbuf = self.dummy.lock().as_ref().unwrap().buf;
-            let p = self.tpipes(&mut ctx)?;
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            let xb0 = self.xbuf.lock().as_ref().unwrap().buf;
-            let ob0 = self.obuf.lock().as_ref().unwrap().buf;
-            binds.push(xb0);
-            binds.push(ob0);
-            ctx.bind_bufs(p.ds, &binds);
-            let gx = (n_out + 15) as u32 / 16;
-            for tb in (0..t).step_by(16) {
-                let nt = (t - tb).min(16) as u32;
-                let mut push = Vec::with_capacity(20);
-                push.extend_from_slice(&(n_in as u32).to_le_bytes());
-                push.extend_from_slice(&(n_out as u32).to_le_bytes());
-                push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-                push.extend_from_slice(&nt.to_le_bytes());
-                push.extend_from_slice(&(tb as u32).to_le_bytes());
-                ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
-            }
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    self.obuf.lock().as_ref().unwrap().ptr as *const f32,
-                    t * n_out,
-                )
-            };
-            for ti in 0..t {
-                outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
-            }
+            self.tile128_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob)?;
+            self.download_out(outs, n_out, t);
             return Ok(());
         }
-        let xb = self.xbuf.lock().as_ref().unwrap().buf;
-        let ob = self.obuf.lock().as_ref().unwrap().buf;
-        let p = self.pipes(&mut ctx)?;
-        // 더미 (미사용 청크 슬롯)
-        {
-            let mut d = self.dummy.lock();
-            if d.is_none() {
-                let b = ctx.alloc(16)?;
-                *d = Some(b);
-            }
-        }
-        let dbuf = self.dummy.lock().as_ref().unwrap().buf;
-        // tile128 파이프 (10 바인딩, 16B push)
-        {
-            let mut g = self.t128pipes.lock();
-            if g.is_none() {
-                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(TILE128_SPV, 10, 16)?;
-                *g = Some(TilePipes { dsl, pl, dp, ds, pipe });
-            }
-        }
-        if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
-            let p = {
-                let g = self.t128pipes.lock();
-                let r = g.as_ref().unwrap();
-                TilePipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
-            };
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            let xb0 = self.xbuf.lock().as_ref().unwrap().buf;
-            let ob0 = self.obuf.lock().as_ref().unwrap().buf;
-            binds.push(xb0);
-            binds.push(ob0);
-            ctx.bind_bufs(p.ds, &binds);
-            let gx = (n_out + 127) as u32 / 128;
-            for tb in (0..t).step_by(64) {
-                let nt = (t - tb).min(64) as u32;
-                let mut push = Vec::with_capacity(16);
-                push.extend_from_slice(&(n_in as u32).to_le_bytes());
-                push.extend_from_slice(&(n_out as u32).to_le_bytes());
-                push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-                push.extend_from_slice(&nt.to_le_bytes());
+        self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+        self.download_out(outs, n_out, t);
+        Ok(())
+    }
 
-                ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
-            }
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    self.obuf.lock().as_ref().unwrap().ptr as *const f32,
-                    t * n_out,
-                )
-            };
-            for ti in 0..t {
-                outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+    /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        if ws.iter().any(|w| vk_ty(w.ty).is_none())
+            || ws.iter().any(|w| w.n_in != ws[0].n_in)
+        {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                self.matmul_batch(xs, w, out)?;
             }
             return Ok(());
         }
-        // ktab(iq4nl) + grid3s 업로드 (최초 1회)
-        {
-            let mut tb = self.tables.lock();
-            if tb.is_none() {
-                let kv: Vec<u32> = (0..256u32)
-                    .map(|b| {
-                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-                        lo | (hi << 8)
-                    })
-                    .collect();
-                let kb = ctx.alloc(1024)?;
-                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
-                let gb = ctx.alloc(2048)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
-                        gb.ptr,
-                        2048,
-                    );
-                }
-                *tb = Some((kb, gb));
+        let n_in = ws[0].n_in as usize;
+        let t = xs.len();
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let mut ctx = self.ctx.lock();
+        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+        self.quant_upload(&mut ctx, xs, n_in, xq)?;
+        for (wi, w) in ws.iter().enumerate() {
+            let ty = vk_ty(w.ty).unwrap();
+            let n_out = w.n_out as usize;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
+            self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+            // 행별 다운로드
+            let obg = self.obuf.lock();
+            let host =
+                unsafe { std::slice::from_raw_parts(obg.as_ref().unwrap().ptr as *const f32, t * n_out) };
+            for ti in 0..t {
+                outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
             }
-        }
-        // 미사용 청크 슬롯: 더미 버퍼 (null 바인딩 방지)
-        {
-            let mut d = self.dummy.lock();
-            if d.is_none() {
-                let b = ctx.alloc(16)?;
-                *d = Some(b);
-            }
-        }
-        let dbuf = self.dummy.lock().as_ref().unwrap().buf;
-        let mut binds: Vec<vk::Buffer> = wbufs.clone();
-        while binds.len() < 8 {
-            binds.push(dbuf);
-        }
-        binds.push(xb);
-        binds.push(ob);
-        let (kb, gb) = {
-            let tb = self.tables.lock();
-            let (a, b) = tb.as_ref().unwrap();
-            (a.buf, b.buf)
-        };
-        binds.push(kb);
-        binds.push(gb);
-        ctx.bind_bufs(p.ds, &binds);
-        let mut push = Vec::with_capacity(16);
-        push.extend_from_slice(&(n_in as u32).to_le_bytes());
-        push.extend_from_slice(&(n_out as u32).to_le_bytes());
-        push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-        push.extend_from_slice(&ty.to_le_bytes());
-        let mut push20 = push.clone();
-        push20.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
-        let host = unsafe {
-            std::slice::from_raw_parts(
-                self.obuf.lock().as_ref().unwrap().ptr as *const f32,
-                t * n_out,
-            )
-        };
-        for ti in 0..t {
-            outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
         }
         Ok(())
     }
@@ -784,170 +570,6 @@ impl Accelerator for VkAcc {
         self.ffn_chain_gpu(xs, gate_w, up_w, down_w, xs_out)
     }
 
-    /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
-    fn matmul_group(
-        &self,
-        xs: &[Vec<f32>],
-        ws: &[Weight],
-        outs: &mut [Vec<Vec<f32>>],
-    ) -> Result<(), String> {
-        // 지원 타입 혼합 그룹은 개별 폴백
-        if ws.iter().any(|w| vk_ty(w.ty).is_none()) {
-            for (w, out) in ws.iter().zip(outs.iter_mut()) {
-                self.matmul_batch(xs, w, out)?;
-            }
-            return Ok(());
-        }
-        let n_in = ws[0].n_in as usize;
-        if ws.iter().any(|w| w.n_in as usize != n_in) {
-            for (w, out) in ws.iter().zip(outs.iter_mut()) {
-                self.matmul_batch(xs, w, out)?;
-            }
-            return Ok(());
-        }
-        let t = xs.len();
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-        let mut ctx = self.ctx.lock();
-        // 업로드+양자화 1회 (matmul_batch와 동일 로직)
-        {
-            let mut xf = self.xfbuf.lock();
-            let need = t * n_in * 4;
-            let ok = xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 21))?;
-                *xf = Some(b);
-            }
-            let b = xf.as_ref().unwrap();
-            for (ti, row) in xs.iter().enumerate() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr(),
-                        b.ptr.add(ti * n_in * 4) as *mut f32,
-                        n_in,
-                    );
-                }
-            }
-        }
-        {
-            let mut xb = self.xbuf.lock();
-            let need = t * xq_w * 4;
-            let ok = xb.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-            if !ok {
-                let b = ctx.alloc(need.max(1 << 21))?;
-                *xb = Some(b);
-            }
-        }
-        {
-            let qp = self.qpipes(&mut ctx)?;
-            let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
-            let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
-            ctx.bind_bufs(qp.ds, &[xfbuf, xqbuf]);
-            let mut push = Vec::with_capacity(12);
-            push.extend_from_slice(&(n_in as u32).to_le_bytes());
-            push.extend_from_slice(&(t as u32).to_le_bytes());
-            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-            ctx.run(qp.pl, qp.ds, qp.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
-        }
-        // 가중 캐시 (matmul_batch 공용 로직)
-        let tables = {
-            let mut tb = self.tables.lock();
-            if tb.is_none() {
-                let kv: Vec<u32> = (0..256u32)
-                    .map(|b| {
-                        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-                        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-                        lo | (hi << 8)
-                    })
-                    .collect();
-                let kb = ctx.alloc(1024)?;
-                unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
-                let gb = ctx.alloc(2048)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        llm170_core::IQ3S_GRID.as_ptr() as *const u8,
-                        gb.ptr,
-                        2048,
-                    );
-                }
-                *tb = Some((kb, gb));
-            }
-            let (a, b) = tb.as_ref().unwrap();
-            (a.buf, b.buf)
-        };
-        let p = self.pipes(&mut ctx)?;
-        let xqbuf = self.xbuf.lock().as_ref().unwrap().buf;
-        for (wi, w) in ws.iter().enumerate() {
-            let ty = vk_ty(w.ty).unwrap();
-            let n_out = w.n_out as usize;
-            let wbufs: Vec<_> = {
-                let mut wc = self.wcache.lock();
-                let key = w.data.as_ptr() as usize;
-                if !wc.contains_key(&key) {
-                    let ch = ctx.max_ssbo;
-                    let total = w.data.len();
-                    let mut bufs = Vec::new();
-                    let mut off = 0usize;
-                    while off < total {
-                        let nb = ch.min(total - off);
-                        let b = ctx.alloc(nb)?;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, nb);
-                        }
-                        bufs.push(b);
-                        off += nb;
-                    }
-                    wc.insert(key, bufs);
-                }
-                wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
-            };
-            if wbufs.len() > 8 {
-                return Err("가중 청크 > 8 (M2 한계)".into());
-            }
-            {
-                let mut ob = self.obuf.lock();
-                let need = t * n_out * 4;
-                let ok = ob.as_ref().map(|b| b.bytes >= need).unwrap_or(false);
-                if !ok {
-                    let b = ctx.alloc(need.max(1 << 21))?;
-                    *ob = Some(b);
-                }
-            }
-            let ob = self.obuf.lock().as_ref().unwrap().buf;
-            {
-                let mut d = self.dummy.lock();
-                if d.is_none() {
-                    let b = ctx.alloc(16)?;
-                    *d = Some(b);
-                }
-            }
-            let dbuf = self.dummy.lock().as_ref().unwrap().buf;
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            binds.push(xqbuf);
-            binds.push(ob);
-            binds.push(tables.0);
-            binds.push(tables.1);
-            ctx.bind_bufs(p.ds, &binds);
-            let mut push = Vec::with_capacity(16);
-            push.extend_from_slice(&(n_in as u32).to_le_bytes());
-            push.extend_from_slice(&(n_out as u32).to_le_bytes());
-            push.extend_from_slice(&(xq_w as u32).to_le_bytes());
-            push.extend_from_slice(&ty.to_le_bytes());
-            let mut push20 = push.clone();
-        push20.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push20, n_out as u32, 1, 1)?;
-            let host = unsafe {
-                std::slice::from_raw_parts(self.obuf.lock().as_ref().unwrap().ptr as *const f32, t * n_out)
-            };
-            for ti in 0..t {
-                outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
-            }
-        }
-        Ok(())
-    }
-
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
         let xs = vec![x.to_vec()];
         let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
@@ -957,7 +579,7 @@ impl Accelerator for VkAcc {
     }
 }
 
-/// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증.
+/// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use llm170_core::matmul::Accelerator;
     let model = llm170_core::model::Model::load(std::path::Path::new(path))
@@ -974,7 +596,6 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     let mut outs = vec![vec![0.0f32; w.n_out as usize]; t];
     acc.matmul_batch(&xs, wref, &mut outs)?;
-    // 타이밍: 첫 호출(가중 업로드) 후 10회
     let t0 = std::time::Instant::now();
     for _ in 0..10 {
         acc.matmul_batch(&xs, wref, &mut outs)?;
@@ -987,13 +608,12 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         wref.data.len() as f64 / dt / 1e9,
         wref.data.len()
     );
-    // CPU 참조
     let mut ref_outs = vec![vec![0.0f32; w.n_out as usize]; t];
     llm170_core::matmul::matmul_batch(&xs, wref, &mut ref_outs);
     let mut mx = 0f64;
     let mut rel = 0f64;
-    for (ti2, (a, b)) in outs.iter().zip(ref_outs.iter()).enumerate() {
-        for (o2, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+    for (a, b) in outs.iter().zip(ref_outs.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
             let d = (x - y).abs() as f64;
             if d > mx {
                 mx = d;
@@ -1006,12 +626,8 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let ia = outs[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
     let ib = ref_outs[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
-    let mut dbg = String::new();
-    for i in 0..0.min(outs[0].len()) {
-        dbg += &format!(" [{:.4}|{:.4}]", outs[0][i], ref_outs[0][i]);
-    }
     Ok(format!(
-        "vk-gemv {tname} t={t}: max|D|={mx:.3e} maxrel={rel:.2e} argmax {ia:?}=={ib:?} {}{dbg}",
+        "vk-gemv {tname} t={t}: max|D|={mx:.3e} maxrel={rel:.2e} argmax {ia:?}=={ib:?} {}",
         if ia == ib { "★" } else { "MISMATCH" }
     ))
 }

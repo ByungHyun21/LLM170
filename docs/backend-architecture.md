@@ -1,0 +1,67 @@
+# Backend Architecture
+
+LLM170 runs Qwen3.8-27B (hybrid GDN + full-attention) on AMD APUs through
+two independent GPU backends plus a CPU reference path. All three produce
+**identical greedy streams** on the standard verification prompts.
+
+## Paths
+
+| Runtime | Entry | Scope |
+|---|---|---|
+| CPU (W4A8) | `--backend cpu` (no GPU env) | Reference engine; every kernel has a bit-matching mirror here |
+| ROCm/HIP | `--backend gpu --gpu-runtime hip` | Full GPU pipeline (`rawhip`): all matmuls, flash attention, GDN scan, EW ops |
+| Vulkan | `--gpu-runtime vulkan` (with `--backend cpu`) | Matmul accelerator (`rawvk`): 8-quant GEMV + coopmat tile, GPU quantize/rms/silu, FFN resident chain |
+
+## Kernel contract
+
+- Quantized matmul kernels mirror `dot_row_w4a8_*` in `crates/core/src/quant.rs`
+  (integer `isum` per 32-element block; scales applied per block). Integer
+  arithmetic is exact, so default-path outputs match the CPU reference to
+  ≤2.4e-7 relative (float reduction order only).
+- The optional WMMA/coopmat tiles stage operands as **f16** (maxrel ~4e-4,
+  llama.cpp MMA class). They are env-gated because they trade a small
+  numerical tolerance for speed.
+- `exp` is computed via an f64 Horner polynomial (`exp_cr`) reproduced
+  bit-identically in HIP C++, GLSL, and Rust — device `expf` differs by 1 ulp
+  and breaks the contract.
+
+## Verification gates
+
+- `llm170 vk-check` — Vulkan device capabilities, cooperative matrix probe,
+  smoke compute, axpy.
+- `llm170 vk-gemv-check <model> <tensor> [t]` — per-type GEMV vs CPU mirror.
+- `llm170 mm-bench2 <model> <tensor>` — HIP per-kernel timing + mismatch check.
+- `scripts/logit-diff.sh` — fast-vs-exact logit divergence gate.
+- Streams: GPU greedy output must equal the CPU reference token-for-token
+  (the primary quality gate used for every change).
+
+## Backend notes
+
+### HIP (`rawhip`)
+Kernels are HIP C++ strings JIT-compiled via hipRTC (`kernels.rs::SRC`), plus
+optional offline code objects (`LLM170_CO_PATH` family) built by
+`scripts/build_co.py` for wave32-compiled variants. DecodeState keeps
+activations, KV cache, and GDN states resident on device across the whole
+forward pass.
+
+### Vulkan (`rawvk`)
+GLSL compute shaders precompiled to SPIR-V by `scripts/build_spv.py` and
+embedded. `VkAcc` implements the `Accelerator` trait (lazy pipelines, resident
+weight cache chunked to RADV's 128MB `maxStorageBufferRange`). Shader
+porting constraints discovered on RADV/gfx1151:
+
+- cooperative-matrix ops require uniform execution across the subgroup
+  (no early returns around them);
+- loop-carried coopmat indexing silently drops results — fully unroll with
+  independent fragment variables;
+- weights >128MB must be split across multiple SSBO bindings.
+
+## Performance (Qwen3.8-27B UD-Q4_K_XL, see benchmarks.md for full table)
+
+| | HIP | Vulkan | CPU |
+|---|---|---|---|
+| decode tg24 | 10.4 t/s | 10.4 t/s | 9.9 t/s |
+| prefill pp64 | 163-169 t/s | ~128 t/s | ~128 t/s |
+
+Vulkan prefill is bounded by the CPU-side attention/GDN layers (the matmul
+offload itself saturates); porting those is the next backend milestone.
