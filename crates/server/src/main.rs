@@ -702,7 +702,56 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             let spec_k: usize = spec_k.unwrap_or(0);
             let has_mtp = eng.has_mtp();
             let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
-            if spec_k > 0 && has_mtp && n == 1 {
+            if spec_k > 0 && has_mtp && n > 1 && std::env::var_os("LLM170_SPEC_GPU").is_some() {
+                // np×spec 병합 (plans/18)
+                let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+                let mut accepted_total = 0usize;
+                let mut cycles = 0usize;
+                let mut min_gen = gen_tokens[0].len();
+                for g in gen_tokens.iter() {
+                    min_gen = min_gen.min(g.len());
+                }
+                while min_gen <= n_predict {
+                    let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
+                    if active.is_empty() {
+                        break;
+                    }
+                    let nexts: Vec<u32> = active.iter().map(|&s| next[s]).collect();
+                    let acc = eng
+                        .spec_step_multi(&active, &nexts, spec_k)
+                        .map_err(|e| e.to_string())?;
+                    cycles += 1;
+                    let mut any = false;
+                    for (i, &s) in active.iter().enumerate() {
+                        for &t in &acc[i] {
+                            if gen_tokens[s].len() > n_predict {
+                                break;
+                            }
+                            pos[s] += 1;
+                            emit(s, pos[s], t, &eng);
+                            gen_tokens[s].push(t);
+                            next[s] = t;
+                            accepted_total += 1;
+                            if t == eos {
+                                finished[s] = true;
+                            }
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        break;
+                    }
+                    min_gen = usize::MAX;
+                    for (s, g) in gen_tokens.iter().enumerate() {
+                        if !finished[s] {
+                            min_gen = min_gen.min(g.len());
+                        }
+                    }
+                }
+                eprintln!(
+                    "# spec-multi(k={spec_k}, n={n}): {cycles}사이클, 수용 {accepted_total}토큰"
+                );
+            } else if spec_k > 0 && has_mtp && n == 1 {
                 let s = 0usize;
                 let mut accepted_total = 0usize;
                 let mut target_forwards = 0usize;

@@ -1010,6 +1010,164 @@ impl Engine {
         Ok((accepted, total))
     }
 
+    /// np×spec 병합 스펙 (plans/18) — 배치 원자 의미론:
+    /// verify 배치 = 시퀀스별 [carried ++ next ++ drafts]. 전 시퀀스 전체수용 시에만
+    /// GDN 유지; 하나라도 부분수용이면 전체 restore + 수용 접두 carried로 재실행.
+    /// 반환: [seq][accepted].
+    pub fn spec_step_multi(
+        &mut self,
+        seqs: &[usize],
+        nexts: &[u32],
+        k: usize,
+    ) -> Result<Vec<Vec<u32>>, ModelError> {
+        let eos = 248044u32;
+        let rd = self.raw_decode.clone().ok_or(ModelError::Accel("raw 없음".into()))?;
+        let n_seq = seqs.len();
+        let n_e = self.model.hp.n_embd;
+        if self.embd_cache.is_none() {
+            let t = self.model.wchk("token_embd.weight")?;
+            self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
+        }
+        let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
+
+        // ── 시퀀스별 draft 체인
+        let mut all_drafts: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
+        {
+            let mut trow = vec![0.0f32; n_e];
+            for si in 0..n_seq {
+                let seq = seqs[si];
+                let mut drafts = Vec::with_capacity(k);
+                let pending = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
+                crate::quant::dequant_row(embd_ty, &embd_arc, nexts[si] as u64, n_e as u64, &mut trow);
+                let (d0, _) = rd
+                    .mtp_step_gpu(seq, &trow, &pending, self.seqs[seq].pos as usize)
+                    .map_err(ModelError::Accel)?;
+                self.seqs[seq].mtp_pending_h = pending;
+                drafts.push(d0);
+                let mut tok = d0;
+                for _ in 1..k {
+                    let dpos = self.seqs[seq].pos as usize + drafts.len() - 1;
+                    crate::quant::dequant_row(embd_ty, &embd_arc, tok as u64, n_e as u64, &mut trow);
+                    let d = rd.mtp_step_chain(seq, &trow, dpos).map_err(ModelError::Accel)?;
+                    drafts.push(d);
+                    tok = d;
+                    if d == eos {
+                        break;
+                    }
+                }
+                all_drafts.push(drafts);
+            }
+        }
+
+        // ── 배치 조립: [s0: carried+next+drafts | ...] — carried 포함 그룹 위치 = pos - carried
+        let mut carried: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
+        for si in 0..n_seq {
+            carried.push(std::mem::take(&mut self.seqs[seqs[si]].gdn_carried));
+        }
+        let mut rows: Vec<f32> = Vec::new();
+        let mut group_starts = Vec::with_capacity(n_seq);
+        let mut group_pos: Vec<usize> = Vec::with_capacity(n_seq); // 그룹 첫 행 위치
+        for si in 0..n_seq {
+            group_starts.push(rows.len() / n_e);
+            let pos0 = self.seqs[seqs[si]].pos as usize - carried[si].len();
+            group_pos.push(pos0);
+            for &tk in carried[si].iter().chain(std::iter::once(&nexts[si])).chain(all_drafts[si].iter()) {
+                let mut r = vec![0.0f32; n_e];
+                crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
+                rows.extend(r);
+            }
+        }
+        rd.gdn_snapshot().map_err(ModelError::Accel)?;
+        let mut am: Vec<u32> = Vec::new();
+        let mut h_all: Vec<f32> = Vec::new();
+        rd.verify_batch_ms(seqs, &group_pos, &group_starts, &rows, &mut am, &mut h_all)
+            .map_err(ModelError::Accel)?;
+
+        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
+            eprintln!("  [msV] groups={group_starts:?} am={am:?} drafts={all_drafts:?}");
+        }
+        // ── 시퀀스별 수용 판정 (신규 세그먼트: next+drafts)
+        let mut all_full = true;
+        let mut results: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
+        let mut new_kept: Vec<usize> = Vec::with_capacity(n_seq); // next+matched drafts 수
+        for si in 0..n_seq {
+            let g0 = group_starts[si];
+            let next_off = carried[si].len(); // 신규 세그먼트 내 next 위치
+            let drafts = &all_drafts[si];
+            let mut accepted: Vec<u32> = Vec::new();
+            for j in 0..drafts.len() {
+                accepted.push(am[g0 + next_off + j]);
+                if am[g0 + next_off + j] != drafts[j] || am[g0 + next_off + j] == eos {
+                    break;
+                }
+            }
+            let full = accepted.len() == drafts.len()
+                && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a);
+            if full {
+                let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { am.len() };
+                accepted.push(am[g1 - 1]); // 보너스 (마지막 행)
+            } else {
+                all_full = false;
+            }
+            // kept new rows = next + matched drafts (보너스 제외)
+            let matched = if full { drafts.len() } else { accepted.len().saturating_sub(1) };
+            new_kept.push(1 + matched);
+            results.push(accepted);
+        }
+
+        // ── 상태 갱신
+        if all_full {
+            for si in 0..n_seq {
+                self.seqs[seqs[si]].gdn_carried = Vec::new();
+            }
+        } else {
+            rd.gdn_restore().map_err(ModelError::Accel)?;
+            for si in 0..n_seq {
+                let seq = seqs[si];
+                let mut c = carried[si].clone();
+                // 유지 신규 행 토큰: next + matched drafts
+                let matched = new_kept[si] - 1;
+                c.push(nexts[si]);
+                for j in 0..matched {
+                    c.push(all_drafts[si][j]);
+                }
+                self.seqs[seq].gdn_carried = c;
+            }
+        }
+        for si in 0..n_seq {
+            self.seqs[seqs[si]].pos += new_kept[si] as u32;
+            // MTP 상태 진행 (shift 페어링): 신규 kept 행 — carried 재적립 멱등
+            let g0 = group_starts[si];
+            let kept = carried[si].len() + new_kept[si];
+            let base = group_pos[si];
+            let mut prev_h = self.seqs[seqs[si]].mtp_pending_h.clone();
+            let mut trow = vec![0.0f32; n_e];
+            for r in carried[si].len()..kept {
+                // 행 r 토큰 = carried면 carried[r], else next/drafts
+                let tok = if r < carried[si].len() {
+                    carried[si][r]
+                } else if r == carried[si].len() {
+                    nexts[si]
+                } else {
+                    all_drafts[si][r - carried[si].len() - 1]
+                };
+                let h_prev = prev_h.clone();
+                let row = &rows[(g0 + r) * n_e..(g0 + r + 1) * n_e];
+                let _ = tok;
+                // draft0 행(next)은 이미 mtp_step_gpu가 처리 — r == carried.len() 스킵
+                if r == carried[si].len() {
+                    prev_h.copy_from_slice(&h_all[(g0 + r) * n_e..(g0 + r + 1) * n_e]);
+                    continue;
+                }
+                rd.mtp_step_adv(seqs[si], row, &h_prev, base + r)
+                    .map_err(ModelError::Accel)?;
+                prev_h.copy_from_slice(&h_all[(g0 + r) * n_e..(g0 + r + 1) * n_e]);
+            }
+            self.seqs[seqs[si]].mtp_pending_h = prev_h;
+        }
+        Ok(results)
+    }
+
     /// GPU 검증 스펙: draft k개(순차) → raw_verify 1배치 → 최장 수용 접두 + 보너스.
     fn spec_step_gpu(
         &mut self,

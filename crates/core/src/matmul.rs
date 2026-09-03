@@ -493,6 +493,19 @@ pub trait RawDecode: Send + Sync {
         Err("raw_prefill_h: 미지원".into())
     }
 
+    /// np×spec 병합 verify — 행별 argmax. group_starts: seq별 그룹 첫 행. 기본 Err.
+    fn verify_batch_ms(
+        &self,
+        _seqs: &[usize],
+        _poss: &[usize],
+        _group_starts: &[usize],
+        _emb: &[f32],
+        _argmaxes: &mut Vec<u32>,
+        _h_all: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        Err("verify_batch_ms: 미지원".into())
+    }
+
     /// np 배치 디코드 — seq별 logits. 기본 Err.
     fn raw_step_multi(
         &self,

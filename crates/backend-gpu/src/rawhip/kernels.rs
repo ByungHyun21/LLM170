@@ -3527,6 +3527,195 @@ extern "C" __global__ void pack_strided(const float* src, float* dst, int n, int
     dst[(size_t)ti * n + j] = src[(size_t)ti * stride + j];
 }
 
+
+// ─── np×spec (plans/18): 행별 포인터/위치 색인 변형 — seq-major 그룹 전제 ───
+
+extern "C" __global__ void kv_append_t_ms(const float* src, float* const* dst,
+                                          const int* offs, int n, int t) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y;
+    if (j >= n || y >= t) return;
+    dst[y][(size_t)offs[y] * n + j] = src[(size_t)y * n + j];
+}
+
+extern "C" __global__ void qk_norm_rope_ms(float* xq, float* xk, const float* qw, const float* kw,
+                                           const float* cs, float eps, float kqs, const int* poss,
+                                           int n_head, int n_kv, int hd, int n_rot) {
+    int r0 = blockIdx.x;
+    int u = threadIdx.x;
+    int y = blockIdx.y;
+    if (r0 >= n_head + n_kv || u != 0) return;
+    bool is_q = r0 < n_head;
+    int half = n_rot >> 1;
+    int csbase = poss[y] * half * 2;
+    int row_base = is_q ? y * (n_head * 2 * hd) + r0 * 2 * hd
+                        : y * (n_kv * hd) + (r0 - n_head) * hd;
+    float* xv = is_q ? xq : xk;
+    const float* wv = is_q ? qw + r0 * hd : kw + (r0 - n_head) * hd;
+    float ms = 0.0f;
+    for (int i = 0; i < hd; i++) ms += xv[row_base + i] * xv[row_base + i];
+    float inv = rsqrtf(ms + eps);
+    for (int i = 0; i < hd; i++) xv[row_base + i] *= inv * wv[i];
+    for (int i = 0; i < half; i++) {
+        float a = xv[row_base + i];
+        float b2 = xv[row_base + i + half];
+        float c = cs[csbase + i * 2];
+        float sn = cs[csbase + i * 2 + 1];
+        xv[row_base + i] = a * c - b2 * sn;
+        xv[row_base + i + half] = a * sn + b2 * c;
+    }
+}
+
+extern "C" __global__ void qsa_flash_ms(const float* q, const float* const* cks,
+                                        const float* const* cvs, const unsigned* mask, float* out,
+                                        const int* nps, const int* p0s,
+                                        int n_head, int n_kv, int hd, int t_len, int sstride) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= t_len || h >= n_head) return;
+    const float* ck = cks[t];
+    const float* cv = cvs[t];
+    int n_past = nps[t];
+    int pos = p0s[t];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool active = tid < hd;
+    __shared__ float qf[256];
+    __shared__ float rs[8];
+    int kvh = h / (n_head / n_kv);
+    int qb = t * n_head * 2 * hd + h * 2 * hd;
+    if (active) qf[tid] = q[qb + tid];
+    __syncthreads();
+    float m = -3.4028235e38f;
+    float sm = 0.0f;
+    float acc = 0.0f;
+    for (int pp = 0; pp < n_past; pp++) {
+        if (mask[pos * sstride + pp] == 0u) continue;
+        int kb = pp * n_kv * hd + kvh * hd;
+        float x = active ? qf[tid] * ck[kb + tid] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            x += __shfl_down_sync(0xffffffffffffffffull, x, off);
+        if (lane == 0) rs[wid] = x;
+        __syncthreads();
+        float d;
+        if (wid == 0) {
+            float y2 = lane < 8 ? rs[lane] : 0.0f;
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1)
+                y2 += __shfl_down_sync(0xffffffffffffffffull, y2, off);
+            if (lane == 0) rs[0] = y2;
+        }
+        __syncthreads();
+        d = rs[0];
+        float m_new = fmaxf(m, d);
+        float e_m = __expf(m - m_new);
+        float e_d = __expf(d - m_new);
+        sm = sm * e_m + e_d;
+        float vv = active ? cv[kb + tid] : 0.0f;
+        acc = acc * e_m + e_d * vv;
+        m = m_new;
+    }
+    if (!active) return;
+    float g = 1.0f / (1.0f + exp_cr(-q[qb + hd + tid]));
+    out[t * n_head * hd + h * hd + tid] = acc * (1.0f / sm) * g;
+}
+
+extern "C" __global__ void gdn_conv_t2_ms(const float* qkv, const float* cw, float* const* states,
+                                          float* out, int ch, int k, int t,
+                                          const int* row_seq, const int* seg_start) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (c >= ch || ti >= t) return;
+    const float* row = qkv + (size_t)ti * ch;
+    float* st = states[row_seq[ti]];
+    int ss = seg_start[ti];
+    float sum = cw[c * k + (k - 1)] * row[c];
+    for (int j = 0; j < k - 1; j++) {
+        int pos = ti - (k - 1) + j;
+        float xv = pos >= ss ? qkv[(size_t)pos * ch + c]
+                             : st[(pos + (k - 1) - ss) * ch + c];
+        sum += cw[c * k + j] * xv;
+    }
+    float oc = sum / (1.0f + exp_cr(-sum));
+    out[(size_t)ti * ch + c] = oc;
+}
+
+extern "C" __global__ void gdn_conv_state_ms(const float* qkv, float* const* states, int ch,
+                                             int k, int t, const int* row_seq, const int* seg_end) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (c >= ch || ti >= t) return;
+    int se = seg_end[ti];
+    int first_tail = se - (k - 1);
+    if (ti < first_tail || ti >= se) return;
+    int j = ti - first_tail;
+    states[row_seq[ti]][j * ch + c] = qkv[(size_t)ti * ch + c];
+}
+
+extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, const float* k, const float* v,
+                                       const float* beta_ge, float* out, int d, int k_stride,
+                                       int v_stride, int h_v, int h_k, float scale, int t,
+                                       const int* row_seq) {
+    int pair = blockIdx.x;
+    int u = blockIdx.y;
+    int lane = threadIdx.x;
+    int base_s = pair * d * d;
+    float* st = states[row_seq[0]];
+    float ssr[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        ssr[j] = st[base_s + ((lane << 2) + j) * d + u];
+    for (int ti = 0; ti < t; ti++) {
+        if (ti > 0 && row_seq[ti] != row_seq[ti - 1]) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                st[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+            st = states[row_seq[ti]];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                ssr[j] = st[base_s + ((lane << 2) + j) * d + u];
+        }
+        int h = pair % h_v;
+        int kh = h % h_k;
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        float part = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            ssr[j] *= g_exp;
+            part += ssr[j] * k[qk0 + (lane << 2) + j];
+        }
+        float sk = part;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
+            sk += pj;
+        }
+        float delta = (v[v0 + u] - sk) * beta;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            ssr[j] += k[qk0 + (lane << 2) + j] * delta;
+        float op = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            op += ssr[j] * q[qk0 + (lane << 2) + j];
+        float otot = op;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
+            otot += pj;
+        }
+        if (lane == 0) out[v0 + u] = otot * scale;
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        st[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+}
+
 "#;
 
 
@@ -3537,7 +3726,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

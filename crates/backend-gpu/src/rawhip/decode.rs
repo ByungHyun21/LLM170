@@ -58,12 +58,19 @@ pub struct DecodeState {
     pub gdn_snap_bytes: usize,
     // MTP (blk.64) — spec draft용 GPU 상주
     pub mtp_on: bool,
-    pub mtp_kv_k: *mut u8,
-    pub mtp_kv_v: *mut u8,
+    pub mtp_kv_k: Vec<*mut u8>,
+    pub mtp_kv_v: Vec<*mut u8>,
     pub mtp_cat: *mut u8,   // [2n] enorm‖hnorm
     pub mtp_cur: *mut u8,   // [n] eh_proj 출력/레이어 hidden
     pub mtp_qkv: *mut u8,   // q(2hd×h)‖k‖v t=1
     pub mtp_ao: *mut u8,    // attn out
+    // np×spec (plans/18) 행 메타·포인터 테이블
+    pub ms_rowseq: *mut u8,
+    pub ms_rowpos: *mut u8,
+    pub ms_segstart: *mut u8,
+    pub ms_segend: *mut u8,
+    pub ms_rownp: *mut u8,
+    pub ms_ptrbuf: *mut u8,
     pub mtp_e: *mut u8,     // tok embd 임시
     pub mtp_h: *mut u8,     // h 입력 임시
     pub mtp_xq: *mut u8,    // n quant
@@ -226,12 +233,19 @@ impl DecodeState {
             .iter()
             .any(|(k, _)| k == "blk.64.nextn.eh_proj.weight");
         let n_ao = hp.n_head * hp.head_dim; // wo 입력 (6144 > n)
+        let b_ms_meta = ctx.alloc(160 * 4).map_err(|e| e.to_string())?; // i32 5×32
+        let b_ms_ptr = ctx.alloc(32 * 8).map_err(|e| e.to_string())?; // 포인터 32행
         let b_mtp_xq_sz = (n_ao / 4 + n_ao / 32 + n_ao / 16) * 4;
         let b_mtp_xq2_sz = (2 * n / 4 + 2 * n / 32 + 2 * n / 16) * 4;
-        let (b_mtp_k, b_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
+        let (mut v_mtp_k, mut v_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
+            let mut vk = Vec::with_capacity(n_seqs);
+            let mut vv = Vec::with_capacity(n_seqs);
+            for _ in 0..n_seqs {
+                vk.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                vv.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+            }
             (
-                ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?,
-                ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?,
+                vk, vv,
                 ctx.alloc(n * 2 * 4).map_err(|e| e.to_string())?,
                 ctx.alloc(n * 4).map_err(|e| e.to_string())?,
                 ctx.alloc((hp.n_head * 2 * hp.head_dim + hp.n_kv * hp.head_dim * 2) * 4)
@@ -243,15 +257,15 @@ impl DecodeState {
                 ctx.alloc(b_mtp_xq2_sz).map_err(|e| e.to_string())?,
             )
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            (Vec::new(), Vec::new(), std::ptr::null_mut(),
              std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
              std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
         };
         if mtp_on {
             // KV 0 초기화 (h2d zeros)
             let zk = vec![0u8; kv_len * 4];
-            ctx.h2d(b_mtp_k, &zk)?;
-            ctx.h2d(b_mtp_v, &zk)?;
+            for &p in v_mtp_k.iter() { ctx.h2d(p, &zk)?; }
+            for &p in v_mtp_v.iter() { ctx.h2d(p, &zk)?; }
         }
         let (b_xs, b_xn, b_gqkv, b_gconv) = (bs(n * 4), bs(n * 4), bs(conv_ch * 4), bs(conv_ch * 4));
         let (b_gz, b_gb, b_ga, b_gbg) = (bs(d_inner * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 2 * 4));
@@ -283,12 +297,18 @@ impl DecodeState {
             gdn_snap: b_gdn_snap,
             gdn_snap_bytes: gdn_bytes,
             mtp_on,
-            mtp_kv_k: b_mtp_k,
-            mtp_kv_v: b_mtp_v,
+            mtp_kv_k: std::mem::take(&mut v_mtp_k),
+            mtp_kv_v: std::mem::take(&mut v_mtp_v),
             mtp_cat: b_mtp_cat,
             mtp_cur: b_mtp_cur,
             mtp_qkv: b_mtp_qkv,
             mtp_ao: b_mtp_ao,
+            ms_rowseq: b_ms_meta,
+            ms_rowpos: unsafe { b_ms_meta.add(32 * 4) },
+            ms_segstart: unsafe { b_ms_meta.add(64 * 4) },
+            ms_segend: unsafe { b_ms_meta.add(96 * 4) },
+            ms_rownp: unsafe { b_ms_meta.add(128 * 4) },
+            ms_ptrbuf: b_ms_ptr,
             mtp_e: b_mtp_e,
             mtp_h: b_mtp_h,
             mtp_xq: b_mtp_xq,
@@ -835,6 +855,22 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
         Ok(())
+    }
+
+    fn verify_batch_ms(
+        &self,
+        seqs: &[usize],
+        poss: &[usize],
+        group_starts: &[usize],
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+        h_all: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .ok_or("raw_decode: 미초기화")?
+            .verify_batch_ms(seqs, poss, group_starts, emb, argmaxes, h_all)
     }
 
     fn raw_step_multi(
@@ -1515,15 +1551,15 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             self.ctx.launch("qk_norm_rope", rows as u32, 1, 32, &mut args)?;
         }
         // MTP KV append
-        self.copy(self.ak, self.mtp_kv_k, 0, pos * n_kv * hd, n_kv * hd)?;
-        self.copy(self.av, self.mtp_kv_v, 0, pos * n_kv * hd, n_kv * hd)?;
+        self.copy(self.ak, self.mtp_kv_k[seq], 0, pos * n_kv * hd, n_kv * hd)?;
+        self.copy(self.av, self.mtp_kv_v[seq], 0, pos * n_kv * hd, n_kv * hd)?;
         // flash attention (np = pos+1)
         {
             let n_past = pos + 1;
             let mask = self.consts.get("mask").copied().ok_or("mask")?;
             let mut qp = self.aq as *mut std::ffi::c_void;
-            let mut ckp = self.mtp_kv_k as *mut std::ffi::c_void;
-            let mut cvp = self.mtp_kv_v as *mut std::ffi::c_void;
+            let mut ckp = self.mtp_kv_k[seq] as *mut std::ffi::c_void;
+            let mut cvp = self.mtp_kv_v[seq] as *mut std::ffi::c_void;
             let mut mp = mask as *mut std::ffi::c_void;
             let mut op = self.mtp_ao as *mut std::ffi::c_void;
             let mut np_ = n_past as i32;
@@ -1979,6 +2015,341 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             for &v in &xc { sc ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15).rotate_left((il % 8) as u32); }
         }
         Ok((sg, sc))
+    }
+
+    /// np×spec 병합 verify (plans/18) — seq-major 행 그룹. group_starts[i] = seq_i 그룹의
+    /// 첫 행 인덱스, group_starts 끝은 t. 행별 argmax 반환 (logits_all 재사용).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_ms(
+        &self,
+        seqs: &[usize],
+        poss: &[usize],
+        group_starts: &[usize],
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+        h_all: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let t = emb.len() / self.n_embd;
+        if t > 32 {
+            return Err(format!("verify_batch_ms t={t} > 32"));
+        }
+        let n = self.n_embd;
+        let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
+        let conv_ch = self.conv_ch;
+        let k_len = self.k_len;
+        let v_len = self.v_len;
+        let d_inner = self.d_inner;
+        let xq_sn = n / 4 + n / 32 + n / 16;
+        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
+        let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
+
+        // 행 메타데이터 (호스트 조립 → 소형 업로드)
+        let mut row_seq = vec![0i32; t];
+        let mut row_pos = vec![0i32; t];
+        let mut seg_start = vec![0i32; t];
+        let mut seg_end = vec![0i32; t];
+        let mut row_np = vec![0i32; t];
+        for gi in 0..group_starts.len() {
+            let (g0, g1) = (group_starts[gi], if gi + 1 < group_starts.len() { group_starts[gi + 1] } else { t });
+            for r in g0..g1 {
+                row_seq[r] = seqs[gi] as i32;
+                row_pos[r] = (poss[gi] + (r - g0)) as i32;
+                seg_start[r] = g0 as i32;
+                seg_end[r] = g1 as i32;
+                row_np[r] = row_pos[r] + 1; // 절대 위치+1 (attention 범위)
+            }
+        }
+        self.h2d_i32_ms(&row_seq, &row_pos, &seg_start, &seg_end, &row_np)?;
+        // per-row KV 포인터 (레이어별) — 업로드는 레이어 루프 내 (kv_k[il][seq])
+        self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
+        let mut recr_idx = 0usize;
+        let mut full_idx = 0usize;
+        let mask = self.consts.get("mask").copied().ok_or("mask")?;
+        let cs = *self.consts.get("cs").ok_or("cs")?;
+        for il in 0..self.n_layer {
+            let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
+            self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            if self.is_recr[il] {
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
+                let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
+                let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
+                let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
+                // conv _ms (행별 seq 상태)
+                {
+                    let mut qp = self.gqkv_t as *mut std::ffi::c_void;
+                    let mut cp = cw as *mut std::ffi::c_void;
+                    let mut sp = self.ms_conv_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
+                    let mut op = self.gconv_t as *mut std::ffi::c_void;
+                    let mut ch = conv_ch as i32;
+                    let mut kk = self.conv_k as i32;
+                    let mut tt = t as i32;
+                    let mut rs = self.ms_rowseq as *mut std::ffi::c_void;
+                    let mut sg = self.ms_segstart as *mut std::ffi::c_void;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt), Self::p(&mut rs), Self::p(&mut sg)];
+                    self.ctx.launch3("gdn_conv_t2_ms", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
+                    let mut sp2 = self.ms_conv_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
+                    let mut ch2 = conv_ch as i32;
+                    let mut kk2 = self.conv_k as i32;
+                    let mut tt2 = t as i32;
+                    let mut rs2 = self.ms_rowseq as *mut std::ffi::c_void;
+                    let mut se = self.ms_segend as *mut std::ffi::c_void;
+                    let mut args2 = vec![Self::p(&mut qp2), Self::p(&mut sp2), Self::p(&mut ch2), Self::p(&mut kk2), Self::p(&mut tt2), Self::p(&mut rs2), Self::p(&mut se)];
+                    self.ctx.launch3("gdn_conv_state_ms", (self.conv_k - 1) as u32, conv_ch.div_ceil(64) as u32, 1, 64, &mut args2)?;
+                }
+                // split3 공유
+                {
+                    let mut sp = self.gconv_t as *mut std::ffi::c_void;
+                    let mut q0 = self.gq_t as *mut std::ffi::c_void;
+                    let mut q1 = self.gk_t as *mut std::ffi::c_void;
+                    let mut q2 = self.gv_t as *mut std::ffi::c_void;
+                    let mut n0 = k_len as i32;
+                    let mut n1 = k_len as i32;
+                    let mut n2 = v_len as i32;
+                    let total = (2 * k_len + v_len) * t;
+                    let mut args = vec![Self::p(&mut sp), Self::p(&mut q0), Self::p(&mut q1), Self::p(&mut q2), Self::p(&mut n0), Self::p(&mut n1), Self::p(&mut n2)];
+                    self.ew_l("split3", total, &mut args)?;
+                }
+                // l2 공유
+                {
+                    let scale = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut qp = self.gq_t as *mut std::ffi::c_void;
+                    let mut kp = self.gk_t as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut sc = scale;
+                    let mut d = self.d_state as i32;
+                    let mut ng = self.n_group as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut ep), Self::p(&mut sc), Self::p(&mut d), Self::p(&mut ng)];
+                    self.ctx.launch3("l2_rows2_scale_w", (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
+                }
+                // beta/e^g 공유
+                {
+                    let mut bp = self.gb_t as *mut std::ffi::c_void;
+                    let mut ap = self.ga_t as *mut std::ffi::c_void;
+                    let mut dp = dtb as *mut std::ffi::c_void;
+                    let mut sp2 = ssa as *mut std::ffi::c_void;
+                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
+                    let mut nh = (self.dt_rank * t) as i32;
+                    let mut dr = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
+                    self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
+                }
+                // AR _ms (행별 seq 상태)
+                {
+                    let mut sp3 = self.ms_gdn_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
+                    let mut qp = self.gq_t as *mut std::ffi::c_void;
+                    let mut kp = self.gk_t as *mut std::ffi::c_void;
+                    let mut vp = self.gv_t as *mut std::ffi::c_void;
+                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
+                    let mut op = self.go_t as *mut std::ffi::c_void;
+                    let mut d = self.d_state as i32;
+                    let mut ks = k_len as i32;
+                    let mut vs = v_len as i32;
+                    let mut hv = self.dt_rank as i32;
+                    let mut hk = self.n_group as i32;
+                    let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut tt = t as i32;
+                    let mut rs = self.ms_rowseq as *mut std::ffi::c_void;
+                    let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt), Self::p(&mut rs)];
+                    self.ctx.launch3("gdn_ar_w_ms", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                }
+                // norm_gated 공유
+                {
+                    let mut op = self.go_t as *mut std::ffi::c_void;
+                    let mut zp = self.gz_t as *mut std::ffi::c_void;
+                    let mut wp = snorm as *mut std::ffi::c_void;
+                    let mut outp = self.ggated_t as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut d = self.d_state as i32;
+                    let mut nh = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
+                    self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                }
+                self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
+                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                recr_idx += 1;
+            } else {
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
+                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
+                let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
+                let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
+                // rope _ms (행별 pos)
+                {
+                    let mut qp = self.aq_t as *mut std::ffi::c_void;
+                    let mut kp = self.ak_t as *mut std::ffi::c_void;
+                    let mut qwp = qn as *mut std::ffi::c_void;
+                    let mut kwp = kn as *mut std::ffi::c_void;
+                    let mut csp = cs as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut kq = self.kq_scale;
+                    let mut ps = self.ms_rowpos as *mut std::ffi::c_void;
+                    let mut nh = n_head as i32;
+                    let mut nk = n_kv as i32;
+                    let mut h = hd as i32;
+                    let mut nr = n_rot as i32;
+                    let rows = n_head + n_kv;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut ps), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
+                    self.ctx.launch3("qk_norm_rope_ms", rows as u32, t as u32, 1, 32, &mut args)?;
+                }
+                // KV append _ms (행별 kv·off)
+                {
+                    let kk = self.ms_kvk_ptr(full_idx, &row_seq)?;
+                    let vv = self.ms_kvv_ptr(full_idx, &row_seq)?;
+                    let mut sp = self.ak_t as *mut std::ffi::c_void;
+                    let mut dp = kk as *mut std::ffi::c_void;
+                    let mut na = (n_kv * hd) as i32;
+                    let mut off = self.ms_rowpos as *mut std::ffi::c_void;
+                    let mut tt = t as i32;
+                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut off), Self::p(&mut na), Self::p(&mut tt)];
+                    self.ctx.launch3("kv_append_t_ms", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    let mut sp2 = self.av_t as *mut std::ffi::c_void;
+                    let mut dp2 = vv as *mut std::ffi::c_void;
+                    let mut args2 = vec![Self::p(&mut sp2), Self::p(&mut dp2), Self::p(&mut off), Self::p(&mut na), Self::p(&mut tt)];
+                    self.ctx.launch3("kv_append_t_ms", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args2)?;
+                }
+                // flash _ms (행별 ck/cv/np/p0)
+                {
+                    let kk = self.ms_kvk_ptr(full_idx, &row_seq)?;
+                    let vv = self.ms_kvv_ptr(full_idx, &row_seq)?;
+                    let mut qp = self.aq_t as *mut std::ffi::c_void;
+                    let mut ckp = kk as *mut std::ffi::c_void;
+                    let mut cvp = vv as *mut std::ffi::c_void;
+                    let mut mp = mask as *mut std::ffi::c_void;
+                    let mut op = self.aout_t as *mut std::ffi::c_void;
+                    let mut npa = self.ms_rownp as *mut std::ffi::c_void;
+                    let mut p0a = self.ms_rowpos as *mut std::ffi::c_void;
+                    let mut nh = n_head as i32;
+                    let mut nk = n_kv as i32;
+                    let mut h = hd as i32;
+                    let mut tl = t as i32;
+                    let mut ss = self.ctx_len as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut npa), Self::p(&mut p0a), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss)];
+                    self.ctx.launch3("qsa_flash_ms", t as u32, n_head as u32, 1, 256, &mut args)?;
+                }
+                self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
+                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                full_idx += 1;
+            }
+            self.axpy(self.xs_t, self.gout_t, n * t)?;
+            // FFN 공유
+            let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
+            self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
+            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
+            self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+            let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
+            self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            {
+                let mut gp = self.fgate_t as *mut std::ffi::c_void;
+                let mut up = self.fup_t as *mut std::ffi::c_void;
+                let mut op = self.fglu_t as *mut std::ffi::c_void;
+                let mut na = (self.n_ff * t) as i32;
+                let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
+                self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
+            }
+            self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
+            self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            self.axpy(self.xs_t, self.fdown_t, n * t)?;
+        }
+        // head (j128 강제) + 행별 argmax
+        let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
+        self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+        self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+        let (wh, th, nih, noh) = self.w("output.weight")?;
+        self.ctx.gemm_tile_head(
+            self.xq_n_t as *const u8,
+            wh as *const u8,
+            self.ktab2 as *const u8,
+            th,
+            nih,
+            noh,
+            xq_sn,
+            t,
+            self.logits_all,
+        )?;
+        argmaxes.clear();
+        argmaxes.resize(t, 0);
+        let mut row_buf = vec![0f32; noh];
+        for ti in 0..t {
+            let src = unsafe { self.logits_all.offset((ti * noh * 4) as isize) } as *const u8;
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut row_buf).as_mut(), src)?;
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row_buf.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    best = i;
+                }
+            }
+            argmaxes[ti] = best as u32;
+        }
+        h_all.clear();
+        h_all.resize(t * self.n_embd, 0.0);
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), self.xs_t)?;
+        Ok(())
+    }
+
+    /// 행 메타 업로드 (i32 5종) — 고정 ms 버퍼.
+    fn h2d_i32_ms(
+        &self,
+        row_seq: &[i32],
+        row_pos: &[i32],
+        seg_start: &[i32],
+        seg_end: &[i32],
+        row_np: &[i32],
+    ) -> Result<(), String> {
+        self.ctx.h2d(self.ms_rowseq, bytemuck::cast_slice(row_seq))?;
+        self.ctx.h2d(self.ms_rowpos, bytemuck::cast_slice(row_pos))?;
+        self.ctx.h2d(self.ms_segstart, bytemuck::cast_slice(seg_start))?;
+        self.ctx.h2d(self.ms_segend, bytemuck::cast_slice(seg_end))?;
+        self.ctx.h2d(self.ms_rownp, bytemuck::cast_slice(row_np))?;
+        Ok(())
+    }
+
+    /// 레이어별 per-seq 상태 포인터 테이블 업로드 (t 엔트리 — 행 → 자기 seq 상태).
+    fn ms_conv_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.st_conv[il][sq as usize]).collect();
+        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
+        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
+        Ok(self.ms_ptrbuf)
+    }
+
+    fn ms_gdn_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.st_gdn[il][sq as usize]).collect();
+        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
+        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
+        Ok(self.ms_ptrbuf)
+    }
+
+    fn ms_kvk_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k[il][sq as usize]).collect();
+        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
+        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
+        Ok(self.ms_ptrbuf)
+    }
+
+    fn ms_kvv_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_v[il][sq as usize]).collect();
+        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
+        self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
+        Ok(self.ms_ptrbuf)
     }
 
     pub fn gdn_snapshot(&self) -> Result<(), String> {
