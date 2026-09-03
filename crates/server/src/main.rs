@@ -1044,10 +1044,10 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         .iter()
         .filter_map(|k| {
             let v = if k == "cs" || k == "mask" {
-                // frame35 초기화 로직 재현 (ctx 상한 2048)
+                // 엔진 실제 ctx 길이로 테이블 구축 (기존 2048 고정 → pos≥2048 OOB fault)
                 let (n_rot, base) = (hp.n_rot, hp.rope_base);
                 let half = n_rot / 2;
-                let ctx_n = 2048usize;
+                let ctx_n = eng.ctx_len();
                 if k == "cs" {
                     let mut cs = vec![0.0f32; ctx_n * half * 2];
                     for pos in 0..ctx_n {
@@ -1108,7 +1108,7 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     let rd: std::sync::Arc<llm170_backend_gpu::rawhip::decode::RawDecoder> =
         std::sync::Arc::new(llm170_backend_gpu::rawhip::decode::RawDecoder::new());
     use llm170_core::matmul::RawDecode;
-    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), 2048, is_recr)
+    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
         .map_err(|e| format!("raw_init: {e}"))?;
     eng.raw_decode = Some(rd);
     Ok(())

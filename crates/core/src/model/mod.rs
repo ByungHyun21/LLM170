@@ -240,6 +240,14 @@ impl Engine {
         }
     }
 
+    /// KV 용량에서 역산한 컨텍스트 길이 (rawhip 상수 테이블 크기 등).
+    pub fn ctx_len(&self) -> usize {
+        let (n_kv, hd) = (self.model.hp.n_kv, self.model.hp.head_dim);
+        self.seqs
+            .first()
+            .and_then(|s| s.kv_k.first().map(|k| k.len() / (n_kv * hd)))
+            .unwrap_or(4096)
+    }
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용) — mmap은 유지.
     /// ctx는 기존 KV 용량에서 역산 (첫 kv_k 길이).
     pub fn reset_states(&mut self) {
