@@ -2619,6 +2619,65 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
     for (int j = 0; j < d; j++) s[base_s + j * d + u] = ss[j * 64 + lu];
 }
 
+// GDN AR 워프 분할 (fast 실험) — wave32당 1열, 레인이 kdim 4개 분담,
+// sk/o는 셔플 트리 환원 (순차 순서 아님 — 스트림 계약).
+extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, const float* v,
+                                   const float* beta_ge, float* out, int d, int k_stride,
+                                   int v_stride, int h_v, int h_k, float scale, int t) {
+    __shared__ float ks[128], qs[128];
+    int pair = blockIdx.x;
+    int u = blockIdx.y;                     // 열 0..127
+    int lane = threadIdx.x;                 // 0..31 — kdim 4개씩
+    int base_s = pair * d * d;
+    // 내 레인의 kdim: lane*4+j (레인당 4)
+    float ssr[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        ssr[j] = s[base_s + ((lane << 2) + j) * d + u];
+    for (int ti = 0; ti < t; ti++) {
+        int h = pair % h_v;
+        int kh = h % h_k;
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        // k/q 스테이징: 32레인 × 4
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            ks[(lane << 2) + j] = k[qk0 + (lane << 2) + j];
+            qs[(lane << 2) + j] = q[qk0 + (lane << 2) + j];
+        }
+        __syncthreads();
+        // sk 부분합 + 트리 환원
+        float part = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            ssr[j] *= g_exp;
+            part += ssr[j] * ks[(lane << 2) + j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            part += __shfl_xor(0xFFFFFFFFFFFFFFFFull, part, off);
+        float sk = part;
+        float delta = (v[v0 + u] - sk) * beta;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            ssr[j] += ks[(lane << 2) + j] * delta;
+        float op = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            op += ssr[j] * qs[(lane << 2) + j];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            op += __shfl_xor(0xFFFFFFFFFFFFFFFFull, op, off);
+        if (lane == 0) out[v0 + u] = op * scale;
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        s[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+}
+
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
 extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float scale,
                                           int d, int n_group) {
@@ -2762,7 +2821,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

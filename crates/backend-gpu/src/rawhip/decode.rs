@@ -822,7 +822,11 @@ gmark("betag", &mut marks);
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
-                    self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, (self.d_state / 64) as u32, 1, 64, &mut args)?;
+                    if std::env::var_os("LLM170_ARW").is_some() && std::env::var_os("LLM170_EXACT").is_none() {
+                        self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                    } else {
+                        self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, (self.d_state / 64) as u32, 1, 64, &mut args)?;
+                    }
                 }
 gmark("ar", &mut marks);
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
