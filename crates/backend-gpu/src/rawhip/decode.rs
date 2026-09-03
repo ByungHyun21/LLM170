@@ -834,7 +834,6 @@ gmark("gdn", &mut marks);
 gmark("normg", &mut marks);
                 // out proj 배치
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
-                gmark("qg", &mut marks);
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
 gmark("outproj", &mut marks);
                 self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
