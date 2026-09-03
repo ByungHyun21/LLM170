@@ -499,7 +499,17 @@ impl Engine {
             crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
             let rd = self.raw_decode.as_ref().unwrap();
             let pos = self.seqs[seq].pos as usize;
-            let logits = rd.raw_step(seq, pos, &row).map_err(ModelError::Accel)?;
+            let mut h_t = Vec::new();
+            let logits = if !self.seqs[seq].mtp_h.is_empty() {
+                let lg = rd.raw_step_h(seq, pos, &row, &mut h_t).map_err(ModelError::Accel)?;
+                let (dl, hn) = self.mtp_step(seq, token, &h_t, pos as u32, true)?;
+                let st = &mut self.seqs[seq];
+                st.mtp_draft_logits = dl;
+                st.mtp_h_next = hn;
+                lg
+            } else {
+                rd.raw_step(seq, pos, &row).map_err(ModelError::Accel)?
+            };
             if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
                 let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let nan = logits.iter().any(|v| v.is_nan());
@@ -738,7 +748,7 @@ impl Engine {
                 && std::env::var_os("LLM170_T1_PREFILL").is_none()
                 && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
             if use_batch {
-                let rd = self.raw_decode.as_ref().unwrap();
+                let rd = self.raw_decode.clone().unwrap();
                 let n = self.model.hp.n_embd as usize;
                 let embd = self.model.wchk("token_embd.weight")?;
                 let mut pos = self.seqs[seq].pos as usize;
@@ -759,7 +769,27 @@ impl Engine {
                     .unwrap_or(if std::env::var_os("LLM170_CO_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() { 128 } else { 64 });
                 for ch in cache.chunks(ch_sz) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
-                    let logits = rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?;
+                    let logits = if !self.seqs[seq].mtp_h.is_empty() {
+                        // MTP KV 적립: 전 토큰 hidden 회수 후 훅 (마지막만 로짓)
+                        let mut h_all: Vec<f32> = Vec::new();
+                        let lg = rd
+                            .raw_prefill_h(seq, pos, &flat, &mut h_all)
+                            .map_err(ModelError::Accel)?;
+                        let n_e = self.model.hp.n_embd;
+                        for ti in 0..ch.len() {
+                            let wl = ti + 1 == ch.len();
+                            let h_t = h_all[ti * n_e..(ti + 1) * n_e].to_vec();
+                            let (dl, hn) = self.mtp_step(seq, tokens[pos + ti], &h_t, (pos + ti) as u32, wl)?;
+                            if wl {
+                                let st = &mut self.seqs[seq];
+                                st.mtp_draft_logits = dl;
+                                st.mtp_h_next = hn;
+                            }
+                        }
+                        lg
+                    } else {
+                        rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?
+                    };
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
                         let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                         eprintln!("logits(batch): max={m:.4} argmax={}", greedy(&logits));
@@ -805,6 +835,14 @@ impl Engine {
         last_token: u32,
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
+        // GPU 검증 경로 (rawhip): draft 체인(CPU MTP층 + GPU head) → 1배치 검증.
+        if self.raw_decode.is_some()
+            && !self.seqs[seq].mtp_h.is_empty()
+            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var_os("LLM170_SPEC_GPU").is_some()
+        {
+            return self.spec_step_gpu(seq, last_token, k);
+        }
         let eos = 248044u32;
         // 교차 검증: 타깃 decode(토큰) → (hook이 계산한 (토큰,h) 쌍의 draft 로짓) 비교.
         // draft 체인은 직전 draft 토큰 쌍으로 순차 — target decode가 h를 갱신하는 즉시.
@@ -845,6 +883,85 @@ impl Engine {
             cur = t;
         }
         Ok((accepted, total))
+    }
+
+    /// GPU 검증 스펙: draft k개(순차) → raw_verify 1배치 → 최장 수용 접두 + 보너스.
+    fn spec_step_gpu(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<(Vec<u32>, usize), ModelError> {
+        let eos = 248044u32;
+        let rd = self.raw_decode.clone().ok_or(ModelError::Accel("raw 없음".into()))?;
+        let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨
+        // ── draft: step-0 = 훅 로짓; j≥1 = 체인 mtp_step(로그릿 없음) + GPU head argmax
+        let mut drafts: Vec<u32> = Vec::with_capacity(k);
+        drafts.push(greedy(&self.seqs[seq].mtp_draft_logits));
+        if drafts[0] != eos {
+            let mut h = self.seqs[seq].mtp_h_next.clone();
+            let mut tok = drafts[0];
+            for _ in 1..k {
+                let dpos = base_pos + drafts.len() as u32 - 1;
+                let (_, hn) = self.mtp_step(seq, tok, &h, dpos, false)?;
+                // shared_head_norm → GPU head argmax
+                let il = 64usize;
+                let sh = self
+                    .model
+                    .f32_vec(&format!("blk.{il}.nextn.shared_head_norm.weight"))?;
+                let hn2 = rms_norm(&hn, &sh, self.model.hp.eps);
+                let d = rd.mtp_head_argmax(&hn2).map_err(ModelError::Accel)?;
+                drafts.push(d);
+                tok = d;
+                h = hn;
+                if d == eos {
+                    break;
+                }
+            }
+        }
+        // ── verify: [last_token, d0, d1, ...] 1배치 — 행별 argmax = 다음 토큰 정답
+        let t = 1 + drafts.len();
+        let n = self.model.hp.n_embd;
+        let embd = self.model.wchk("token_embd.weight")?;
+        let mut rows: Vec<f32> = Vec::with_capacity(t * n);
+        for &tk in std::iter::once(&last_token).chain(drafts.iter()) {
+            let mut r = vec![0.0f32; n];
+            crate::quant::dequant_row(embd.ty, embd.data, tk as u64, n as u64, &mut r);
+            rows.extend(r);
+        }
+        // 부분수용 대비 GDN/conv 스냅샷 (KV는 위치 색인이라 자가치유)
+        rd.gdn_snapshot().map_err(ModelError::Accel)?;
+        let mut am: Vec<u32> = Vec::new();
+        rd.raw_verify(seq, base_pos as usize, &rows, &mut am)
+            .map_err(ModelError::Accel)?;
+        // 수용: am[i] = 행 i 다음 토큰의 정답. am[0] vs d0, am[1] vs d1, ...
+        let mut accepted: Vec<u32> = Vec::new();
+        for i in 0..drafts.len() {
+            accepted.push(am[i]);
+            if am[i] != drafts[i] || am[i] == eos {
+                break;
+            }
+        }
+        let all_acc = accepted.len() == drafts.len()
+            && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a);
+        if all_acc {
+            // 전부 수용 — 보너스 (마지막 행의 argmax). 상태 그대로 유효.
+            accepted.push(am[t - 1]);
+        } else {
+            // 부분수용 — 스냅샷 복원 후 수용 접두만 재실행 (같은 입력 → 같은 상태).
+            let a = accepted.len();
+            rd.gdn_restore().map_err(ModelError::Accel)?;
+            let replay: Vec<f32> = rows[..(a + 1) * n].to_vec();
+            let mut am2: Vec<u32> = Vec::new();
+            rd.raw_verify(seq, base_pos as usize, &replay, &mut am2)
+                .map_err(ModelError::Accel)?;
+            debug_assert_eq!(am2.len(), a + 1);
+            let _ = am2;
+        }
+        // 시퀀스 pos 동기 — verify 배치가 t토큰 처리 → 확정 accepted 수만 반영
+        self.seqs[seq].pos = base_pos + accepted.len() as u32;
+        let n = accepted.len().max(1);
+        Ok((accepted, n))
     }
 }
 

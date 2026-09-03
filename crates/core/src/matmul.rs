@@ -458,6 +458,52 @@ pub trait RawDecode: Send + Sync {
     ) -> Result<(), String>;
     /// 디코드 1스텝 — emb(임베딩 행) 기록 후 전체 층 수행, logits 반환.
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String>;
+
+    /// raw_step + 최종 hidden 회수 (MTP 훅용). 기본 Err.
+    fn raw_step_h(
+        &self,
+        _seq: usize,
+        _pos: usize,
+        _emb: &[f32],
+        _h_out: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        Err("raw_step_h: 미지원".into())
+    }
+
+    /// 배치 검증 — 토큰 t개 처리 + 행별 argmax 반환 (MTP spec). 기본 Err.
+    fn raw_verify(
+        &self,
+        _seq: usize,
+        _pos0: usize,
+        _emb: &[f32],
+        _argmaxes: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        Err("raw_verify: 미지원".into())
+    }
+
+    /// raw_prefill + 전 토큰 hidden 회수 (MTP KV 적립). 기본 Err.
+    fn raw_prefill_h(
+        &self,
+        _seq: usize,
+        _pos0: usize,
+        _emb: &[f32],
+        _h_all: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        Err("raw_prefill_h: 미지원".into())
+    }
+
+    /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백). 기본 Err.
+    fn gdn_snapshot(&self) -> Result<(), String> {
+        Err("gdn_snapshot: 미지원".into())
+    }
+    fn gdn_restore(&self) -> Result<(), String> {
+        Err("gdn_restore: 미지원".into())
+    }
+
+    /// 정규화 h → head argmax (MTP draft). 기본 Err.
+    fn mtp_head_argmax(&self, _h_normed: &[f32]) -> Result<u32, String> {
+        Err("mtp_head_argmax: 미지원".into())
+    }
     /// greedy 스텝 — GPU argmax, 토큰만 (logits 전사 회피).
     fn raw_step_greedy(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<u32, String> {
         Ok(greedy_from(&self.raw_step(seq, pos, emb)?))

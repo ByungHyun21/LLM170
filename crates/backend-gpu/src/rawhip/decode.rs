@@ -53,6 +53,9 @@ pub struct DecodeState {
     pub ggated_t: *mut u8, gout_t: *mut u8, xq_g_t: *mut u8,
     pub fgate_t: *mut u8, fup_t: *mut u8, fglu_t: *mut u8, fdown_t: *mut u8, xq_f_t: *mut u8,
     pub aq_t: *mut u8, ak_t: *mut u8, av_t: *mut u8, aout_t: *mut u8, scores_t: *mut u8,
+    pub logits_all: *mut u8, // [t][vocab] — verify_batch head 출력
+    pub gdn_snap: *mut u8,
+    pub gdn_snap_bytes: usize,
     // 상수 (norm 가중치·conv·cs 테이블·마스크)
     pub consts: std::collections::HashMap<String, *mut u8>,
     // 가중치 (dev 상주 — 업로드 1회)
@@ -201,6 +204,10 @@ impl DecodeState {
         let b_av_t = bs(t_max * n_kv * hd * 4);
         let b_aout_t = bs(t_max * hp.n_head * hp.head_dim * 4);
         let b_scores_t = bs(t_max * hp.n_head * ctx_len * 4);
+        let b_logits_all = ctx.alloc(hp.vocab * 4 * 8).map_err(|e| e.to_string())?; // 최대 8행
+        // GDN 상태 스냅샷 (spec 부분수용 롤백용) — recr 전층 (gdn_s + conv) × seq
+        let gdn_bytes: usize = (n_recr * n_seqs * (gdn_len + conv_len)) * 4;
+        let b_gdn_snap = ctx.alloc(gdn_bytes.max(16)).map_err(|e| e.to_string())?;
         let (b_xs, b_xn, b_gqkv, b_gconv) = (bs(n * 4), bs(n * 4), bs(conv_ch * 4), bs(conv_ch * 4));
         let (b_gz, b_gb, b_ga, b_gbg) = (bs(d_inner * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 2 * 4));
         let (b_gq, b_gk, b_gv, b_go) = (bs(k_len * 4), bs(k_len * 4), bs(v_len * 4), bs(v_len * 4));
@@ -227,6 +234,9 @@ impl DecodeState {
             ggated_t: b_ggated_t, gout_t: b_gout_t, xq_g_t: b_xq_g_t,
             fgate_t: b_fgate_t, fup_t: b_fup_t, fglu_t: b_fglu_t, fdown_t: b_fdown_t, xq_f_t: b_xq_f_t,
             aq_t: b_aq_t, ak_t: b_ak_t, av_t: b_av_t, aout_t: b_aout_t, scores_t: b_scores_t,
+            logits_all: b_logits_all,
+            gdn_snap: b_gdn_snap,
+            gdn_snap_bytes: gdn_bytes,
             kv_k, kv_v, st_conv, st_gdn,
             n_embd: n, n_ff, n_layer: hp.n_layer, n_head: hp.n_head, n_kv: hp.n_kv,
             hd: hp.head_dim, n_rot: hp.n_rot, eps: hp.eps, d_inner, n_group: hp.n_group,
@@ -685,6 +695,72 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         r
     }
 
+    fn raw_prefill_h(
+        &self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        h_all: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let t0 = std::time::Instant::now();
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.step_batch(seq, pos0, emb)?;
+        // 전 토큰 최종 hidden d2h (MTP KV 적립용)
+        let t = emb.len() / ds.n_embd;
+        h_all.resize(t * ds.n_embd, 0.0);
+        ds.ctx
+            .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
+        let r = ds.read_logits();
+        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+            eprintln!("batch_h({} tok) wall={:.1}ms", t, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        r
+    }
+
+    fn raw_step_h(
+        &self,
+        seq: usize,
+        pos: usize,
+        emb: &[f32],
+        h_out: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
+        ds.step(seq, pos)?;
+        ds.read_hidden(h_out)?;
+        ds.read_logits()
+    }
+
+    fn raw_verify(
+        &self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.verify_batch(seq, pos0, emb, argmaxes)
+    }
+
+    fn gdn_snapshot(&self) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_snapshot()
+    }
+
+    fn gdn_restore(&self) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_restore()
+    }
+
+    fn mtp_head_argmax(&self, h_normed: &[f32]) -> Result<u32, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.mtp_head_argmax(h_normed)
+    }
+
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
@@ -1129,6 +1205,112 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let mut out = vec![0f32; noh];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), self.logits)?;
         Ok(out)
+    }
+
+    /// 마지막 스텝의 최종 hidden (output_norm 전) d2h — MTP 훅용.
+    pub fn read_hidden(&self, out: &mut Vec<f32>) -> Result<(), String> {
+        out.resize(self.n_embd, 0.0);
+        self.ctx.d2h(bytemuck::cast_slice_mut(out).as_mut(), self.xs)
+    }
+
+    /// 정규화된 h(공유 head norm 적용됨) → GPU head GEMV + argmax — MTP draft 토큰.
+    pub fn mtp_head_argmax(&self, h_normed: &[f32]) -> Result<u32, String> {
+        let n = self.n_embd;
+        self.ctx.h2d(self.xn, bytemuck::cast_slice(h_normed))?;
+        self.ctx.quant_q8(self.xn, self.xq_n, n)?;
+        let (wh, th, nih, noh) = self.w("output.weight")?;
+        self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
+        self.argmax_token()
+    }
+
+    /// 배치 검증: 토큰 [pos0..pos0+t) 처리 + 전 토큰 head argmax 반환 (MTP spec).
+    /// logits_all 버퍼 [t][vocab] — 행별 argmax는 per-row 발사.
+    pub fn verify_batch(
+        &self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        let t = emb.len() / self.n_embd;
+        if t > 8 {
+            return Err(format!("verify_batch t={t} > 8 (logits_all 상한)"));
+        }
+        let n = self.n_embd;
+        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] step_batch t={t} pos0={pos0}"); }
+        self.step_batch(seq, pos0, emb)?;
+        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] step_batch ok"); }
+        // head: 전 행 rms → quant → output 타일 → 행별 argmax
+        let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
+        self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+        let xq_sn = n / 4 + n / 32 + n / 16;
+        self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+        let (wh, th, nih, noh) = self.w("output.weight")?;
+        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head tile t={t} ty={th} no={noh}"); }
+        self.mm_b(self.xq_n_t, xq_sn, wh, th, nih, noh, self.logits_all, t)?;
+        self.ctx.sync()?;
+        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head ok"); }
+        self.ctx.sync()?;
+        argmaxes.clear();
+        argmaxes.resize(t, 0);
+        let mut row_buf = vec![0f32; noh];
+        for ti in 0..t {
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut row_buf).as_mut(),
+                unsafe { self.logits_all.offset((ti * noh * 4) as isize) } as *const u8)?;
+            let mut best = 0usize; let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row_buf.iter().enumerate() {
+                if v > bv { bv = v; best = i; }
+            }
+            argmaxes[ti] = best as u32;
+        }
+
+        Ok(())
+    }
+
+    /// GDN+conv 상태 GPU 스냅샷 (d2d).
+    pub fn gdn_snapshot(&self) -> Result<(), String> {
+        let (gdn_len, conv_len) = (self.gdn_len(), self.conv_len());
+        let mut off = 0usize;
+        for v in &self.st_gdn {
+            for b in v.iter() {
+                self.copy(*b, self.gdn_snap, 0, off, gdn_len)?;
+                off += gdn_len;
+            }
+        }
+        for v in &self.st_conv {
+            for b in v.iter() {
+                self.copy(*b, self.gdn_snap, 0, off, conv_len)?;
+                off += conv_len;
+            }
+        }
+        Ok(())
+    }
+
+    /// 스냅샷 복원.
+    pub fn gdn_restore(&self) -> Result<(), String> {
+        let (gdn_len, conv_len) = (self.gdn_len(), self.conv_len());
+        let mut off = 0usize;
+        for v in &self.st_gdn {
+            for b in v.iter() {
+                self.copy(self.gdn_snap, *b, off, 0, gdn_len)?;
+                off += gdn_len;
+            }
+        }
+        for v in &self.st_conv {
+            for b in v.iter() {
+                self.copy(self.gdn_snap, *b, off, 0, conv_len)?;
+                off += conv_len;
+            }
+        }
+        Ok(())
+    }
+
+    /// 상태 길이 — copy_rows는 float 단위 (원소 수).
+    fn gdn_len(&self) -> usize {
+        self.dt_rank * self.d_state * self.d_state
+    }
+    fn conv_len(&self) -> usize {
+        (self.conv_k - 1) * self.conv_ch
     }
 
     /// GPU argmax — 최저 인덱스 동률 (CPU greedy와 동일 의미). 토큰만 회수.
