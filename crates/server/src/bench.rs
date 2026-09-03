@@ -157,10 +157,19 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             let m = llm170_core::model::Model::load(&model_path)
                 .map_err(|e| e.to_string())?;
             let mut eng = llm170_core::model::Engine::new(m, 1, ctx);
-            if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
+            if gpu_runtime == "vulkan" {
+                // Vulkan (plans/12): rawhip 미주입 — VkAcc matmul + CPU 엔진 (스펙=CPU 경로).
+                match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                    Ok(acc) => {
+                        eng = eng.with_acc(std::sync::Arc::new(acc));
+                        eprintln!("# backend: gpu (vulkan VkAcc)");
+                    }
+                    Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                }
+            } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
-            let _ = (&backend, &gpu_runtime);
+            let _ = &backend;
             let has_mtp = eng.has_mtp();
             let spec_desc = if spec_k > 0 && has_mtp {
                 format!(" spec{spec_k}")
