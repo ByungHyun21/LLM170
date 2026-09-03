@@ -1,0 +1,11 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Ybuf { float y[]; };
+layout(binding = 1) readonly buffer Xbuf { float x[]; };
+layout(binding = 2) readonly buffer Sbuf { float s[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    y[j] = y[j] + x[j] * s[0];
+}

@@ -6,6 +6,7 @@ use context::VkCtx;
 
 const SMOKE_SPV: &[u8] = include_bytes!("spv/smoke.spv");
 const COOPMAT_PROBE_SPV: &[u8] = include_bytes!("spv/coopmat_probe.spv");
+const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
 
 /// vk-check — 디바이스 역량 + 트리비얼 컴퓨트 값 검증 (M1 게이트).
 pub fn smoke_test() -> Result<String, String> {
@@ -89,6 +90,43 @@ pub fn smoke_test() -> Result<String, String> {
             msg += "coopmat16: ★ 256/256 (A×I=A)\n";
         } else {
             msg += &format!("coopmat16: 불일치 {bad}/256\n");
+        }
+        ctx.device.destroy_pipeline(pipe, None);
+        ctx.device.destroy_pipeline_layout(pl, None);
+        ctx.device.destroy_descriptor_set_layout(dsl, None);
+        ctx.device.destroy_descriptor_pool(dp, None);
+
+        // axpy_scaled: y += x*s — HIP 커널과 동일 산술, 16MB 규모
+        let n = 4 * 1024 * 1024usize;
+        let yb = ctx.alloc(n * 4)?;
+        let xb = ctx.alloc(n * 4)?;
+        let sb = ctx.alloc(4)?;
+        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(AXPY_SPV, 3, 4)?;
+        let y = std::slice::from_raw_parts_mut(yb.ptr as *mut f32, n);
+        let x = std::slice::from_raw_parts_mut(xb.ptr as *mut f32, n);
+        let sc = std::slice::from_raw_parts_mut(sb.ptr as *mut f32, 1);
+        let mut want = vec![0f64; n];
+        for i in 0..n {
+            y[i] = (i % 977) as f32 * 0.25 - 100.0;
+            x[i] = ((i * 31) % 1231) as f32 * 0.5 - 300.0;
+            want[i] = y[i] as f64 + x[i] as f64 * 1.75;
+        }
+        sc[0] = 1.75f32;
+        ctx.bind_bufs(ds, &[yb.buf, xb.buf, sb.buf]);
+        let push = (n as u32).to_le_bytes();
+        let t0 = std::time::Instant::now();
+        ctx.run(pl, ds, pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+        let dt = t0.elapsed().as_secs_f64();
+        let mut bad = 0;
+        for i in 0..n {
+            if (y[i] as f64 - want[i]).abs() > 1e-3 {
+                bad += 1;
+            }
+        }
+        if bad == 0 {
+            msg += &format!("axpy: ★ {n}/{n} 일치 ({:.2}ms, {:.1}GB/s)\n", dt * 1e3, (n as f64 * 4.0 * 3.0) / dt / 1e9);
+        } else {
+            msg += &format!("axpy: 불일치 {bad}/{n}\n");
         }
         ctx.device.destroy_pipeline(pipe, None);
         ctx.device.destroy_pipeline_layout(pl, None);
