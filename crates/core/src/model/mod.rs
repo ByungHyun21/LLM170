@@ -320,8 +320,17 @@ impl Engine {
             let norm_w = self.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?;
             // 잔차: pre-norm 원본 보존 (qwen35.cpp:162-184 — inpSA)
             let residual: Vec<Vec<f32>> = xs.clone();
-            for x in xs.iter_mut() {
-                *x = rms_norm(x, &norm_w, hp.eps);
+            let mut xn: Vec<Vec<f32>> = vec![vec![0.0f32; hp.n_embd]; n_tok];
+            let rms_ok = match acc.as_deref() {
+                Some(a) => a.rms_norm(&xs, &norm_w, hp.eps, &mut xn).is_ok(),
+                None => false,
+            };
+            if rms_ok {
+                xs = xn;
+            } else {
+                for x in xs.iter_mut() {
+                    *x = rms_norm(x, &norm_w, hp.eps);
+                }
             }
 
             let attn_out = if self.model.is_recr(il) {
@@ -353,8 +362,16 @@ impl Engine {
             let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
             let n_ff = hp.n_ff;
 
-            let normed: Vec<Vec<f32>> =
-                xs.iter().map(|x| rms_norm(x, &post_w, hp.eps)).collect();
+            let mut normed: Vec<Vec<f32>> = vec![vec![0.0f32; hp.n_embd]; n_tok];
+            let rms_ok = match acc.as_deref() {
+                Some(a) => a.rms_norm(&xs, &post_w, hp.eps, &mut normed).is_ok(),
+                None => false,
+            };
+            if !rms_ok {
+                for (i, x) in xs.iter().enumerate() {
+                    normed[i] = rms_norm(x, &post_w, hp.eps);
+                }
+            }
             let mut ffn_group: [Vec<Vec<f32>>; 2] =
                 [vec![vec![0.0f32; n_ff]; n_tok], vec![vec![0.0f32; n_ff]; n_tok]];
             {

@@ -41,6 +41,17 @@ impl<'a> Weight<'a> {
 /// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
 /// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
 pub trait Accelerator: FrameState + Send + Sync {
+    /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
+    fn rms_norm(
+        &self,
+        _xs: &[Vec<f32>],
+        _w: &[f32],
+        _eps: f32,
+        _outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        Err("rms_norm: 미지원".into())
+    }
+
     /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
     /// xs 행 순서 = expert_ids 순 (스택 인덱스와 무관).
     #[allow(clippy::too_many_arguments)]

@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 const GEMV_SPV: &[u8] = include_bytes!("spv/gemv.spv");
 const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
 const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
+const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
 
 struct Pipes {
     dsl: vk::DescriptorSetLayout,
@@ -21,6 +22,14 @@ struct Pipes {
 }
 
 struct TilePipes {
+    dsl: vk::DescriptorSetLayout,
+    pl: vk::PipelineLayout,
+    dp: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    pipe: vk::Pipeline,
+}
+
+struct RmsPipes {
     dsl: vk::DescriptorSetLayout,
     pl: vk::PipelineLayout,
     dp: vk::DescriptorPool,
@@ -39,6 +48,8 @@ struct QuantPipes {
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    rpipe: Mutex<Option<RmsPipes>>,
+    rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     qpipes: Mutex<Option<QuantPipes>>,
     xfbuf: Mutex<Option<VkBuf>>,
     tables: Mutex<Option<(VkBuf, VkBuf)>>,
@@ -73,6 +84,8 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            rpipe: Mutex::new(None),
+            rbufs: Mutex::new(None),
             qpipes: Mutex::new(None),
             xfbuf: Mutex::new(None),
             tables: Mutex::new(None),
@@ -126,6 +139,76 @@ impl llm170_core::matmul::FrameState for VkAcc {}
 
 unsafe impl Send for VkAcc {}
 unsafe impl Sync for VkAcc {}
+
+impl VkAcc {
+    /// rms_norm 오프로드 — f32 세그먼트+f64 결합 (CPU sq_sum 미러와 동일 순서).
+    pub fn rms_norm_gpu(
+        &self,
+        xs: &[Vec<f32>],
+        w: &[f32],
+        eps: f32,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let t = xs.len();
+        let n = w.len();
+        let mut ctx = self.ctx.lock();
+        {
+            let mut b = self.rbufs.lock();
+            let need_x = t * n * 4;
+            let need_w = n * 4;
+            let ok = b.as_ref().map(|(x, _, _)| x.bytes >= need_x && x.bytes > 0).unwrap_or(false);
+            if !ok {
+                let xb = ctx.alloc(need_x.max(1 << 21))?;
+                let wb = ctx.alloc(need_w)?;
+                let ob = ctx.alloc(need_x.max(1 << 21))?;
+                *b = Some((xb, wb, ob));
+            }
+        }
+        let (xb, wb, ob) = {
+            let b = self.rbufs.lock();
+            let (a, bb, c) = b.as_ref().unwrap();
+            (a.buf, bb.buf, c.buf)
+        };
+        {
+            let b = self.rbufs.lock();
+            let (xv, wv, _) = b.as_ref().unwrap();
+            for (ti, row) in xs.iter().enumerate() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        xv.ptr.add(ti * n * 4) as *mut f32,
+                        n,
+                    );
+                }
+            }
+            unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wv.ptr as *mut f32, n); }
+        }
+        let p = {
+            let mut g = self.rpipe.lock();
+            if g.is_none() {
+                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(RMS_SPV, 3, 12)?;
+                *g = Some(RmsPipes { dsl, pl, dp, ds, pipe });
+            }
+            let r = g.as_ref().unwrap();
+            RmsPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
+        };
+        ctx.bind_bufs(p.ds, &[xb, wb, ob]);
+        let mut push = Vec::with_capacity(12);
+        push.extend_from_slice(&(n as u32).to_le_bytes());
+        push.extend_from_slice(&(t as u32).to_le_bytes());
+        push.extend_from_slice(&eps.to_le_bytes());
+        ctx.run(p.pl, p.ds, p.pipe, &push, t as u32, 1, 1)?;
+        let host = {
+            let b = self.rbufs.lock();
+            let (_, _, ov) = b.as_ref().unwrap();
+            unsafe { std::slice::from_raw_parts(ov.ptr as *const f32, t * n) }
+        };
+        for ti in 0..t {
+            outs[ti].copy_from_slice(&host[ti * n..(ti + 1) * n]);
+        }
+        Ok(())
+    }
+}
 
 impl Accelerator for VkAcc {
     fn matmul_batch(
@@ -334,6 +417,16 @@ impl Accelerator for VkAcc {
             outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
         }
         Ok(())
+    }
+
+    fn rms_norm(
+        &self,
+        xs: &[Vec<f32>],
+        w: &[f32],
+        eps: f32,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        self.rms_norm_gpu(xs, w, eps, outs)
     }
 
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {

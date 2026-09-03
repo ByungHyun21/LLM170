@@ -1,0 +1,48 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+// rms_norm — HIP rms_part/rms_finish 통합 포트 (f32 세그먼트 누산 + f64 결합).
+// 워크그룹 = 행 1개, 32레인 세그먼트 — CPU sq_sum 미러와 동일 순서.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer Xbuf { float x[]; };
+layout(binding = 1) readonly buffer Wbuf { float wv[]; };
+layout(binding = 2) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n; uint t; float eps;
+} pc;
+
+shared double seg[32];
+shared float invs;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint u = gl_LocalInvocationID.x;
+    uint n = pc.n;
+    if (row >= pc.t) return;
+    int chunk = int((n + 31u) >> 5u);
+    int lo = int(u) * chunk;
+    int xb = int(row * n);
+    float acc = 0.0;
+    if (uint(lo) < n) {
+        int hi = min(lo + chunk, int(n));
+        for (int i = lo; i < hi; i++) {
+            float dv = x[xb + i];
+            acc += dv * dv;
+        }
+    }
+    seg[u] = double(acc);
+    barrier();
+    if (u == 0u) {
+        double sum = 0.0lf;
+        for (int u2 = 0; u2 < 32; u2++) {
+            if (uint(u2 * chunk) < n) sum += seg[u2];
+        }
+        float scale32 = float(sqrt(sum / double(n) + double(pc.eps)));
+        invs = 1.0 / scale32;
+    }
+    barrier();
+    if (uint(lo) < n) {
+        int hi = min(lo + chunk, int(n));
+        for (int i = lo; i < hi; i++) outv[xb + i] = x[xb + i] * invs * wv[i];
+    }
+}
