@@ -717,14 +717,27 @@ impl DecodeState {
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
 gmark("norm", &mut marks);
             if self.is_recr[il] {
+                // 2스트림: qkv+beta(주) ‖ gate+alpha(사이드) — 4독립 GEMM
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gz_t, t)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gb_t, t)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ga_t, t)?;
+                let qkv_tile = matches!(ty, 12 | 13 | 14 | 23) && t > 64;
+                let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
+                let gate_tile = matches!(tg2, 12 | 13 | 14 | 23) && t > 64;
+                let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
+                let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
+                if qkv_tile && gate_tile {
+                    // 사이드는 타일형만 (beta/alpha는 q8_0 gemv — 주 스트림)
+                    self.ctx.side_wait_main()?;
+                    self.mm_b_s(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                    self.ctx.join2()?;
+                } else {
+                    self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                    self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                }
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
