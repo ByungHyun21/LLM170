@@ -984,8 +984,21 @@ gmark("attn", &mut marks);
                     let mut tl = t as i32;
                     let mut ss = self.ctx_len as i32;
                     let mut p0 = pos0 as i32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
-                    self.ctx.launch3("qsa_flash", t as u32, n_head as u32, 1, 256, &mut args)?;
+                    if std::env::var_os("LLM170_QSA_SPLIT").is_some() && np_ > 512 {
+                        let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(64);
+                        let nseg = (pos0 + t + sg - 1) / sg;
+                        // part: [t][n_head][nseg][hd+2]
+                        let part = self.ctx.scratch(t * n_head * nseg * (hd + 2) * 4)?;
+                        let mut pp2 = part as *mut std::ffi::c_void;
+                        let mut sg_a = sg as i32;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
+                        self.ctx.launch3("qsa_flash_split", t as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                        let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
+                        self.ctx.launch3("qsa_flash_merge", t as u32, n_head as u32, 1, 256, &mut margs)?;
+                    } else {
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                        self.ctx.launch3("qsa_flash", t as u32, n_head as u32, 1, 256, &mut args)?;
+                    }
                 }
                 // wo 배치
                 self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
