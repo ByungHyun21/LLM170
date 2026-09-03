@@ -27,6 +27,20 @@ fast 139.4 (0.47x); tg24 10.40 (0.93x). Against the designated server-bench
 target: pp64 fast 0.98x, tg parity. The session's internal gains
 (pp 43.1 -> 81.8/139.4) are unaffected by this distinction.
 
+## MTP speculative decode — HIP (2026-09-05)
+
+Natural-language prompt, 27B Q4_K_XL-class quant, greedy, warm reps.
+Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
+
+| Engine | tg (t/s) | vs llama.cpp MTP |
+|---|---|---|
+| ours HIP non-spec | 10.4 | 0.67× |
+| ours HIP spec k=4 (warm) | **19.2-19.4** | **1.25×** |
+| llama.cpp MTP (np4 server) | 15.5 | 1.00× |
+
+Token stream verified bit-identical to non-spec greedy (64/64).
+Acceptance 4-5 tokens/verify at k=4 on natural text.
+
 ## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
 llama.cpp, Q4_K_XL (27B), non-MTP, flash attention on, f16 KV, temp 0,

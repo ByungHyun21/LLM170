@@ -216,7 +216,8 @@ impl DecodeState {
         let b_av_t = bs(t_max * n_kv * hd * 4);
         let b_aout_t = bs(t_max * hp.n_head * hp.head_dim * 4);
         let b_scores_t = bs(t_max * hp.n_head * ctx_len * 4);
-        let b_logits_all = ctx.alloc(hp.vocab * 4 * 8).map_err(|e| e.to_string())?; // 최대 8행
+        // 최대 32행 — carried 재실행 행 포함 (k≤8: carried≤9 + 1 + 8)
+        let b_logits_all = ctx.alloc(hp.vocab * 4 * 32).map_err(|e| e.to_string())?;
         // GDN 상태 스냅샷 (spec 부분수용 롤백용) — recr 전층 (gdn_s + conv) × seq
         let gdn_bytes: usize = (n_recr * n_seqs * (gdn_len + conv_len)) * 4;
         let b_gdn_snap = ctx.alloc(gdn_bytes.max(16)).map_err(|e| e.to_string())?;
@@ -754,6 +755,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<(), String> {
         let ctx = RawCtx::new()?;
         let ds = DecodeState::new(ctx, hp, weights, consts, n_seqs, ctx_len, is_recr)?;
+        if std::env::var_os("LLM170_MICRO_PROBE").is_some() {
+            if let Ok(msg) = ds.micro_probe(200) {
+                eprintln!("{msg}");
+            }
+        }
         *self.st.lock().map_err(|e| e.to_string())? = Some(ds);
         Ok(())
     }
@@ -1355,8 +1361,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         argmaxes: &mut Vec<u32>,
     ) -> Result<(), String> {
         let t = emb.len() / self.n_embd;
-        if t > 8 {
-            return Err(format!("verify_batch t={t} > 8 (logits_all 상한)"));
+        if t > 32 {
+            return Err(format!("verify_batch t={t} > 32 (logits_all 상한)"));
         }
         let n = self.n_embd;
         let t_b0 = std::time::Instant::now();
@@ -1611,6 +1617,39 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         self.ctx.h2d(self.mtp_h, bytemuck::cast_slice(h))?;
         self.mtp_step_g(seq, tok_emb, self.mtp_h, pos, false)?;
         Ok(())
+    }
+
+    /// 마이크로 프로브: h2d/launch/d2h 단가.
+    pub fn micro_probe(&self, iters: usize) -> Result<String, String> {
+        let n = self.n_embd;
+        let buf = vec![0f32; n];
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.ctx.h2d(self.mtp_e, bytemuck::cast_slice(&buf))?;
+        }
+        self.ctx.sync()?;
+        let h2d = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.quant(self.mtp_e, self.mtp_xq, n)?;
+            self.mm_direct(self.mtp_xq, wq, tq, niq, noq, self.aq)?;
+        }
+        self.ctx.sync()?;
+        let gemv = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let mut b8 = [0u8; 8];
+        let t2 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.ctx.d2h(&mut b8, self.ctx.scratch(16)?)?;
+        }
+        let d2h = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t3 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.rms(self.mtp_e, self.mtp_e, self.mtp_h, n)?;
+        }
+        self.ctx.sync()?;
+        let rms2 = t3.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        Ok(format!("probe: h2d={h2d:.3}ms gemv2l={gemv:.3}ms d2h={d2h:.3}ms rms2l={rms2:.3}ms"))
     }
 
     /// 정규화 입력 x → output GEMV → GPU argmax
