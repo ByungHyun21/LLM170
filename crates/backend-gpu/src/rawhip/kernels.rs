@@ -2646,7 +2646,7 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
 extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, const float* v,
                                    const float* beta_ge, float* out, int d, int k_stride,
                                    int v_stride, int h_v, int h_k, float scale, int t) {
-    __shared__ float ks[128], qs[128];
+    // (ks/qs shared 스테이징 제거: 연산이 레인-로컬이라 크로스레인 동기 불필요 — 셔플 트리만으로 충분)
     int pair = blockIdx.x;
     int u = blockIdx.y;                     // 열 0..127
     int lane = threadIdx.x;                 // 0..31 — kdim 4개씩
@@ -2663,19 +2663,13 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
         int v0 = ti * v_stride + h * d;
         float beta = beta_ge[ti * h_v * 2 + pair * 2];
         float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
-        // k/q 스테이징: 32레인 × 4
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            ks[(lane << 2) + j] = k[qk0 + (lane << 2) + j];
-            qs[(lane << 2) + j] = q[qk0 + (lane << 2) + j];
-        }
-        __syncthreads();
+        // k/q 직접 인덱싱 (레인-로컬 — shared 왕복·동기 제거)
         // sk 부분합 + 트리 환원
         float part = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             ssr[j] *= g_exp;
-            part += ssr[j] * ks[(lane << 2) + j];
+            part += ssr[j] * k[qk0 + (lane << 2) + j];
         }
         // 트리 환원 (shfl_sync 기반 — 검증된 프리미티브, xor 마스크 회피)
         float sk = part;
@@ -2687,11 +2681,11 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
         float delta = (v[v0 + u] - sk) * beta;
         #pragma unroll
         for (int j = 0; j < 4; j++)
-            ssr[j] += ks[(lane << 2) + j] * delta;
+            ssr[j] += k[qk0 + (lane << 2) + j] * delta;
         float op = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++)
-            op += ssr[j] * qs[(lane << 2) + j];
+            op += ssr[j] * q[qk0 + (lane << 2) + j];
         float otot = op;
         #pragma unroll
         for (int off = 1; off < 32; off <<= 1) {
@@ -2699,7 +2693,6 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
             otot += pj;
         }
         if (lane == 0) out[v0 + u] = otot * scale;
-        __syncthreads();
     }
     #pragma unroll
     for (int j = 0; j < 4; j++)
