@@ -67,6 +67,9 @@ impl RawCtx {
             if hip::hiprtcGetCode(prog, code.as_mut_ptr()) != hip::hiprtcResult_HIPRTC_SUCCESS {
                 return Err("GetCode".into());
             }
+            if let Some(path) = std::env::var_os("LLM170_DUMP_MODULE") {
+                let _ = std::fs::write(&path, std::slice::from_raw_parts(code.as_ptr() as *const u8, code_sz));
+            }
             let mut module: hip::hipModule_t = std::ptr::null_mut();
             ck(hip::hipModuleLoadData(&mut module, code.as_ptr() as *const _), "ModuleLoadData")?;
             let mut fns = HashMap::new();
