@@ -859,6 +859,128 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
+        const unsigned* xq, const unsigned* w, float* out,
+        int n_in, int n_out, int xq_w, int t) {
+    __shared__ half A16[2][4][16][36];
+    __shared__ half B16[2][64][36];
+    __shared__ float Ctmp[64][65];
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 6;
+    int lane = tid & 63;
+    int i0 = bid * 64;
+    if (i0 >= n_out) return;
+    int nrow = min(64, n_out - i0);
+    int row0 = wid * 16;
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+
+    fragment<accumulator, 16, 16, 16, float> fc[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) fill_fragment(fc[i], 0.0f);
+
+    for (int sbp = 0; sbp < n_sub; sbp += 2) {
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            int sb = sbp + sbo;
+            if (sb >= n_sub) break;
+            // A16: 레인당 1행 × 8원소 — 스케일은 행당 1회
+            {
+                int rr = lane & 15;
+                int kc = lane >> 4;          // k청크 0..3
+                int row = row0 + rr;
+                if (row < nrow && kc < 4) {
+                    int o = i0 + row;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int k = kc * 8 + e;
+                        int g = sb * 2 + (k >> 4);      // 32열 sb = 그룹 2개
+                        int kloc = k & 15;
+                        int gr = g & 15;
+                        int blk = g >> 4;
+                        int h = gr >> 3;
+                        int src = (gr & 7) >> 1;
+                        int p2 = gr & 1;
+                        int wbase = o * blocks * 210 + blk * 210;
+                        float d = f16w(w, wbase + 208);
+                        int sc = sext8(byte(w, wbase + 192 + gr));
+                        float ds0 = d * (float)sc;
+                        int ql_rel = h * 64 + p2 * 16 + ((src & 1) << 5);
+                        int qh_rel = 128 + h * 32 + p2 * 16;
+                        int nsh = (src < 2) ? 0 : 4;
+                        int hsh = 2 * src;
+                        int qlo = ql_rel + ((kloc >> 2) << 2);
+                        int qho = qh_rel + ((kloc >> 2) << 2);
+                        bool al = (wbase & 3) == 0;
+                        int kk2 = kloc & 3;
+                        unsigned qv, hv;
+                        if (al) {
+                            qv = w[(wbase + qlo) >> 2];
+                            hv = w[(wbase + qho) >> 2];
+                        } else {
+                            int qw0 = (wbase + qlo) >> 2;
+                            int hw0 = (wbase + qho) >> 2;
+                            qv = (w[qw0] >> 16) | (w[qw0 + 1] << 16);
+                            hv = (w[hw0] >> 16) | (w[hw0 + 1] << 16);
+                        }
+                        unsigned nib = (qv >> (kk2 * 8 + nsh)) & 0xFu;
+                        unsigned hi = (hv >> (kk2 * 8 + hsh)) & 0x3u;
+                        float v = (float)(nib + (hi << 4)) - 32.0f;
+                        A16[sbo][wid][rr][k] = __float2half(v * ds0);
+                    }
+                }
+            }
+            (void)qsb;
+            // B16: 스레드당 1토큰 8원소 — yw/yd 로드 1회
+            {
+                int ti = tid >> 2;
+                int kc = tid & 3;
+                if (ti < t) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    unsigned ywa = xt[xw + 2 * kc];
+                    unsigned ywb = xt[xw + 2 * kc + 1];
+                    float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int k = kc * 8 + e;
+                        unsigned yw = ((e >> 2) == 0) ? ywa : ywb;
+                        int b = sext8((yw >> ((k & 3) * 8)) & 0xFFu);
+                        B16[sbo][ti][k] = __float2half((float)b * yd);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            #pragma unroll
+            for (int ks = 0; ks < 2; ks++) {
+                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+                load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
+                #pragma unroll
+                for (int tt = 0; tt < 4; tt++) {
+                    fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                    load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
+                    mma_sync(fc[tt], fa, fb, fc[tt]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int tt = 0; tt < 4; tt++)
+        store_matrix_sync(&Ctmp[row0][tt * 16], fc[tt], 65, mem_row_major);
+    __syncthreads();
+    for (int u = tid; u < 64 * 64; u += 256) {
+        int r = u >> 6, tok = u & 63;
+        if (r < nrow && tok < t)
+            out[(size_t)tok * n_out + i0 + r] = Ctmp[r][tok];
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
         const unsigned* xq, const unsigned* w, float* out, const unsigned* ktab2,
         int n_in, int n_out, int xq_w, int t) {
@@ -2583,7 +2705,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

@@ -312,10 +312,10 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let kern = match ty {
-            13 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => "gemm_q6k_mm",
-            23 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            13 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -999,7 +999,7 @@ pub fn mm_bench() -> Result<String, String> {
     let kern_name = match w.ty {
         llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
         llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-        llm170_gguf::GgmlType::Q6K => "gemm_q6k_mm",
+        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
         _ => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_xs_wm" } else { "gemm_xs_mm" },
     };
     let launch = |ctx: &RawCtx| -> Result<(), String> {
