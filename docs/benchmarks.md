@@ -5,6 +5,12 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+## Engine modes (2026-09-05, user decision)
+
+Default = WMMA fast mode (quality: llama.cpp MMA class — measured logits
+deviation vs bit-exact path: max 8.7e-3 relative, argmax stable).
+`LLM170_EXACT=1` = bit-exact dot4 path (GPU == CPU reference, bit-for-bit).
+
 ## Baseline methodology note (2026-09-05)
 
 Two llama.cpp references exist and must not be mixed:
@@ -45,8 +51,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **74.4 t/s** (123.6 fast mode) | 0.52x (0.86x) |
-| Prefill pp512 | ~230 t/s (3314-tok) | **54.2 t/s** (74.3 fast mode) | ~0.24x (0.32x) |
+| Prefill pp64 | 142.8 t/s | **97.4 t/s** (81.8 exact mode, LLM170_EXACT=1) | 0.68x (0.57x) |
+| Prefill pp512 | ~230 t/s (server-bench) | **60.9 t/s** | 0.26x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
