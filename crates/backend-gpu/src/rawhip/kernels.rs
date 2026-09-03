@@ -3644,8 +3644,9 @@ extern "C" __global__ void gdn_conv_t2_ms(const float* qkv, const float* cw, flo
 
 extern "C" __global__ void gdn_conv_state_ms(const float* qkv, float* const* states, int ch,
                                              int k, int t, const int* row_seq, const int* seg_end) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    int ti = blockIdx.y;
+    // 그리드 (t, ch/64): ti = blockIdx.x, c = blockIdx.y 열 블록 — 세그별 꼬리 기입
+    int ti = blockIdx.x;
+    int c = blockIdx.y * blockDim.x + threadIdx.x;
     if (c >= ch || ti >= t) return;
     int se = seg_end[ti];
     int first_tail = se - (k - 1);

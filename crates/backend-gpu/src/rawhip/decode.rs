@@ -2106,7 +2106,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut rs2 = self.ms_rowseq as *mut std::ffi::c_void;
                     let mut se = self.ms_segend as *mut std::ffi::c_void;
                     let mut args2 = vec![Self::p(&mut qp2), Self::p(&mut sp2), Self::p(&mut ch2), Self::p(&mut kk2), Self::p(&mut tt2), Self::p(&mut rs2), Self::p(&mut se)];
-                    self.ctx.launch3("gdn_conv_state_ms", (self.conv_k - 1) as u32, conv_ch.div_ceil(64) as u32, 1, 64, &mut args2)?;
+                    self.ctx.launch3("gdn_conv_state_ms", t as u32, conv_ch.div_ceil(64) as u32, 1, 64, &mut args2)?;
                 }
                 // split3 공유
                 {
@@ -2191,60 +2191,58 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
-                // rope _ms (행별 pos)
-                {
-                    let mut qp = self.aq_t as *mut std::ffi::c_void;
-                    let mut kp = self.ak_t as *mut std::ffi::c_void;
-                    let mut qwp = qn as *mut std::ffi::c_void;
-                    let mut kwp = kn as *mut std::ffi::c_void;
-                    let mut csp = cs as *mut std::ffi::c_void;
-                    let mut ep = self.eps;
-                    let mut kq = self.kq_scale;
-                    let mut ps = self.ms_rowpos as *mut std::ffi::c_void;
-                    let mut nh = n_head as i32;
-                    let mut nk = n_kv as i32;
-                    let mut h = hd as i32;
-                    let mut nr = n_rot as i32;
-                    let rows = n_head + n_kv;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut ps), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
-                    self.ctx.launch3("qk_norm_rope_ms", rows as u32, t as u32, 1, 32, &mut args)?;
+                                // per-seq 슬라이스 (np 검증 경로 — _ms 의심 바이팩)
+                for gi in 0..group_starts.len() {
+                    let (g0, g1) = (group_starts[gi], if gi + 1 < group_starts.len() { group_starts[gi + 1] } else { t });
+                    let gt = g1 - g0;
+                    let sq = seqs[gi];
+                    let aq_row = unsafe { self.aq_t.add(g0 * n_head * 2 * hd * 4) };
+                    let ak_row = unsafe { self.ak_t.add(g0 * n_kv * hd * 4) };
+                    {
+                        let mut qp = aq_row as *mut std::ffi::c_void;
+                        let mut kp = ak_row as *mut std::ffi::c_void;
+                        let mut qwp = qn as *mut std::ffi::c_void;
+                        let mut kwp = kn as *mut std::ffi::c_void;
+                        let mut csp = cs as *mut std::ffi::c_void;
+                        let mut ep = self.eps;
+                        let mut kq = self.kq_scale;
+                        let mut pp = (poss[gi]) as i32;
+                        let mut nh = n_head as i32;
+                        let mut nk = n_kv as i32;
+                        let mut h = hd as i32;
+                        let mut nr = n_rot as i32;
+                        let rows = n_head + n_kv;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
+                        self.ctx.launch3("qk_norm_rope", rows as u32, gt as u32, 1, 32, &mut args)?;
+                    }
+                    let pos0 = poss[gi];
+                    let av_row = unsafe { self.av_t.add(g0 * n_kv * hd * 4) };
+                    for (src, table) in [(ak_row, &self.kv_k), (av_row, &self.kv_v)] {
+                        let mut sp = src as *mut std::ffi::c_void;
+                        let mut dp = table[full_idx][sq] as *mut std::ffi::c_void;
+                        let mut na = (n_kv * hd) as i32;
+                        let mut p0 = pos0 as i32;
+                        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                        self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, gt as u32, 1, 64, &mut args)?;
+                    }
+                    {
+                        let mut qp = aq_row as *mut std::ffi::c_void;
+                        let mut ckp = self.kv_k[full_idx][sq] as *mut std::ffi::c_void;
+                        let mut cvp = self.kv_v[full_idx][sq] as *mut std::ffi::c_void;
+                        let mut mp = mask as *mut std::ffi::c_void;
+                        let mut op = unsafe { self.aout_t.add(g0 * n_head * hd * 4) } as *mut std::ffi::c_void;
+                        let mut np_ = (pos0 + gt) as i32;
+                        let mut nh = n_head as i32;
+                        let mut nk = n_kv as i32;
+                        let mut h = hd as i32;
+                        let mut tl = gt as i32;
+                        let mut ss = self.ctx_len as i32;
+                        let mut p0 = pos0 as i32;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                        self.ctx.launch3("qsa_flash", gt as u32, n_head as u32, 1, 256, &mut args)?;
+                    }
                 }
-                // KV append _ms (행별 kv·off) — k/v 테이블 분리 버퍼
-                {
-                    let kk = self.ms_kvk_ptr_to(full_idx, &row_seq, self.ms_ptrbuf)?;
-                    let vv = self.ms_kvv_ptr_to(full_idx, &row_seq, self.ms_ptrbuf2)?;
-                    let mut sp = self.ak_t as *mut std::ffi::c_void;
-                    let mut dp = kk as *mut std::ffi::c_void;
-                    let mut na = (n_kv * hd) as i32;
-                    let mut off = self.ms_rowpos as *mut std::ffi::c_void;
-                    let mut tt = t as i32;
-                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut off), Self::p(&mut na), Self::p(&mut tt)];
-                    self.ctx.launch3("kv_append_t_ms", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
-                    let mut sp2 = self.av_t as *mut std::ffi::c_void;
-                    let mut dp2 = vv as *mut std::ffi::c_void;
-                    let mut args2 = vec![Self::p(&mut sp2), Self::p(&mut dp2), Self::p(&mut off), Self::p(&mut na), Self::p(&mut tt)];
-                    self.ctx.launch3("kv_append_t_ms", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args2)?;
-                }
-                // flash _ms (행별 ck/cv/np/p0) — K 테이블 재업로드 (v 업로드에 덮어쓰이지 않게 분리)
-                {
-                    let kk = self.ms_kvk_ptr_to(full_idx, &row_seq, self.ms_ptrbuf)?;
-                    let vv = self.ms_kvv_ptr_to(full_idx, &row_seq, self.ms_ptrbuf2)?;
-                    let mut qp = self.aq_t as *mut std::ffi::c_void;
-                    let mut ckp = kk as *mut std::ffi::c_void;
-                    let mut cvp = vv as *mut std::ffi::c_void;
-                    let mut mp = mask as *mut std::ffi::c_void;
-                    let mut op = self.aout_t as *mut std::ffi::c_void;
-                    let mut npa = self.ms_rownp as *mut std::ffi::c_void;
-                    let mut p0a = self.ms_rowpos as *mut std::ffi::c_void;
-                    let mut nh = n_head as i32;
-                    let mut nk = n_kv as i32;
-                    let mut h = hd as i32;
-                    let mut tl = t as i32;
-                    let mut ss = self.ctx_len as i32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut npa), Self::p(&mut p0a), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss)];
-                    self.ctx.launch3("qsa_flash_ms", t as u32, n_head as u32, 1, 256, &mut args)?;
-                }
-                self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
                 self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;

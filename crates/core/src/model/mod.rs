@@ -1064,6 +1064,39 @@ impl Engine {
         for si in 0..n_seq {
             carried.push(std::mem::take(&mut self.seqs[seqs[si]].gdn_carried));
         }
+        // carried 상한 — 총 행수 > 28이면 커밋 배치로 소화 (verify_batch_ms t≤32 상한)
+        {
+            let total: usize = carried.iter().map(|c| c.len() + 1 + all_drafts[0].len()).sum::<usize>().max(n_seq * (1 + k));
+            if total > 28 {
+                let mut crows: Vec<f32> = Vec::new();
+                let mut starts = Vec::new();
+                let mut sposs = Vec::new();
+                let mut sseqs = Vec::new();
+                for si in 0..n_seq {
+                    if carried[si].is_empty() {
+                        continue;
+                    }
+                    starts.push(crows.len() / n_e);
+                    sposs.push(self.seqs[seqs[si]].pos as usize - carried[si].len());
+                    sseqs.push(seqs[si]);
+                    for &tk in &carried[si] {
+                        let mut r = vec![0.0f32; n_e];
+                        crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
+                        crows.extend(r);
+                    }
+                }
+                if !crows.is_empty() {
+                    let mut cam: Vec<u32> = Vec::new();
+                    let mut ch_all: Vec<f32> = Vec::new();
+                    rd.verify_batch_ms(&sseqs, &sposs, &starts, &crows, &mut cam, &mut ch_all)
+                        .map_err(ModelError::Accel)?;
+                    for si in 0..n_seq {
+                        self.seqs[seqs[si]].gdn_carried = Vec::new();
+                    }
+                    carried = vec![Vec::new(); n_seq];
+                }
+            }
+        }
         let mut rows: Vec<f32> = Vec::new();
         let mut group_starts = Vec::with_capacity(n_seq);
         let mut group_pos: Vec<usize> = Vec::with_capacity(n_seq); // 그룹 첫 행 위치

@@ -44,6 +44,7 @@ Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
 | ours HIP spec k=4 (warm) | **19.2-19.4** | **1.25×** |
 | ours HIP np4 (batched decode) | 19.0 aggregate | 1.23× |
 | ours HIP np8 (batched decode) | 27.9 aggregate | 1.80× |
+| ours HIP np×spec (merged verify) | streams match np reference exactly | combined MTP+np |
 | llama.cpp MTP (np4 server) | 15.5 | 1.00× |
 
 Token stream verified bit-identical to non-spec greedy (64/64).
