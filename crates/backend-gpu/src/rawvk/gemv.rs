@@ -12,6 +12,7 @@ const GEMV_SPV: &[u8] = include_bytes!("spv/gemv.spv");
 const TILE_Q5K_SPV: &[u8] = include_bytes!("spv/tile_q5k.spv");
 const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
+const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
 
 struct Pipes {
     dsl: vk::DescriptorSetLayout,
@@ -22,6 +23,14 @@ struct Pipes {
 }
 
 struct TilePipes {
+    dsl: vk::DescriptorSetLayout,
+    pl: vk::PipelineLayout,
+    dp: vk::DescriptorPool,
+    ds: vk::DescriptorSet,
+    pipe: vk::Pipeline,
+}
+
+struct SiluPipes {
     dsl: vk::DescriptorSetLayout,
     pl: vk::PipelineLayout,
     dp: vk::DescriptorPool,
@@ -48,6 +57,8 @@ struct QuantPipes {
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     tpipes: Mutex<Option<TilePipes>>,
+    spipe: Mutex<Option<SiluPipes>>,
+    sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rpipe: Mutex<Option<RmsPipes>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     qpipes: Mutex<Option<QuantPipes>>,
@@ -84,6 +95,8 @@ impl VkAcc {
         Ok(Self {
             ctx: Mutex::new(ctx),
             tpipes: Mutex::new(None),
+            spipe: Mutex::new(None),
+            sbufs: Mutex::new(None),
             rpipe: Mutex::new(None),
             rbufs: Mutex::new(None),
             qpipes: Mutex::new(None),
@@ -141,6 +154,65 @@ unsafe impl Send for VkAcc {}
 unsafe impl Sync for VkAcc {}
 
 impl VkAcc {
+    /// silu_mul 오프로드 — exp_cr f64 호너 GLSL 비트 재현.
+    pub fn silu_mul_gpu(
+        &self,
+        gs: &[Vec<f32>],
+        us: &[Vec<f32>],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let t = gs.len();
+        let n = gs[0].len();
+        let total = t * n;
+        let mut ctx = self.ctx.lock();
+        {
+            let mut b = self.sbufs.lock();
+            let ok = b.as_ref().map(|(g, _, _)| g.bytes >= total * 4).unwrap_or(false);
+            if !ok {
+                let g = ctx.alloc((total * 4).max(1 << 21))?;
+                let u = ctx.alloc((total * 4).max(1 << 21))?;
+                let o = ctx.alloc((total * 4).max(1 << 21))?;
+                *b = Some((g, u, o));
+            }
+        }
+        {
+            let b = self.sbufs.lock();
+            let (gv, uv, _) = b.as_ref().unwrap();
+            for (ti, row) in gs.iter().enumerate() {
+                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), gv.ptr.add(ti * n * 4) as *mut f32, n); }
+            }
+            for (ti, row) in us.iter().enumerate() {
+                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), uv.ptr.add(ti * n * 4) as *mut f32, n); }
+            }
+        }
+        let p = {
+            let mut g = self.spipe.lock();
+            if g.is_none() {
+                let (dsl, pl, dp, ds, pipe) = ctx.pipeline(SILU_SPV, 3, 4)?;
+                *g = Some(SiluPipes { dsl, pl, dp, ds, pipe });
+            }
+            let r = g.as_ref().unwrap();
+            SiluPipes { dsl: r.dsl, pl: r.pl, dp: r.dp, ds: r.ds, pipe: r.pipe }
+        };
+        let (gb, ub, ob) = {
+            let b = self.sbufs.lock();
+            let (a2, b2, c2) = b.as_ref().unwrap();
+            (a2.buf, b2.buf, c2.buf)
+        };
+        ctx.bind_bufs(p.ds, &[gb, ub, ob]);
+        let push = (total as u32).to_le_bytes();
+        ctx.run(p.pl, p.ds, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
+        let host = {
+            let b = self.sbufs.lock();
+            let (_, _, ov) = b.as_ref().unwrap();
+            unsafe { std::slice::from_raw_parts(ov.ptr as *const f32, total) }
+        };
+        for ti in 0..t {
+            outs[ti].copy_from_slice(&host[ti * n..(ti + 1) * n]);
+        }
+        Ok(())
+    }
+
     /// rms_norm 오프로드 — f32 세그먼트+f64 결합 (CPU sq_sum 미러와 동일 순서).
     pub fn rms_norm_gpu(
         &self,
@@ -427,6 +499,15 @@ impl Accelerator for VkAcc {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         self.rms_norm_gpu(xs, w, eps, outs)
+    }
+
+    fn silu_mul(
+        &self,
+        gs: &[Vec<f32>],
+        us: &[Vec<f32>],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        self.silu_mul_gpu(gs, us, outs)
     }
 
     /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.

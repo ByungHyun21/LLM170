@@ -380,9 +380,18 @@ impl Engine {
                 });
             }
             let [mut gate_y, up_y] = ffn_group;
-            for t in 0..n_tok {
-                for i in 0..n_ff {
-                    gate_y[t][i] = silu(gate_y[t][i]) * up_y[t][i];
+            let mut glu: Vec<Vec<f32>> = vec![vec![0.0f32; n_ff]; n_tok];
+            let silu_ok = match acc.as_deref() {
+                Some(a) => a.silu_mul(&gate_y, &up_y, &mut glu).is_ok(),
+                None => false,
+            };
+            if silu_ok {
+                gate_y = glu;
+            } else {
+                for t in 0..n_tok {
+                    for i in 0..n_ff {
+                        gate_y[t][i] = silu(gate_y[t][i]) * up_y[t][i];
+                    }
                 }
             }
             {

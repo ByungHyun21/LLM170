@@ -52,6 +52,16 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("rms_norm: 미지원".into())
     }
 
+    /// silu(gate)·up 곱 배치 — 미구현 백엔드는 Err (호출부 CPU 폴백).
+    fn silu_mul(
+        &self,
+        _gs: &[Vec<f32>],
+        _us: &[Vec<f32>],
+        _outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        Err("silu_mul: 미지원".into())
+    }
+
     /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
     /// xs 행 순서 = expert_ids 순 (스택 인덱스와 무관).
     #[allow(clippy::too_many_arguments)]
