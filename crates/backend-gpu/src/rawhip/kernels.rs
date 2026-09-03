@@ -2945,6 +2945,141 @@ extern "C" __global__ void qsa_flash(const float* q, const float* ck, const floa
     out[t * n_head * hd + h * hd + tid] = acc * (1.0f / s) * g;
 }
 // QSA split flash, q 2행 다중화 — ck/cv 1회 로드로 t쌍 공유 (K/V 트래픽 ½).
+extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, const float* cv,
+                                              const unsigned* mask, float* part,
+                                              int n_past, int n_head, int n_kv,
+                                              int hd, int t_len, int sstride, int pos0, int seg) {
+    int t0 = blockIdx.x * 4;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (t0 >= t_len || h >= n_head) return;
+    int nq = min(4, t_len - t0);
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool active = tid < hd;
+    __shared__ float qf[4][256];
+    __shared__ float rs[4][4][8];
+    __shared__ float ds[4][4];
+    int kvh = h / (n_head / n_kv);
+    int qb0 = t0 * n_head * 2 * hd + h * 2 * hd;
+    if (active) {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            if (r < nq) qf[r][tid] = q[qb0 + r * n_head * 2 * hd + tid];
+    }
+    __syncthreads();
+    float m[4] = { -3.4028235e38f, -3.4028235e38f, -3.4028235e38f, -3.4028235e38f };
+    float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int mrow0 = (pos0 + t0) * sstride;
+    
+    for (int pb = p0; pb < p1; pb += 4) {
+        int np = min(4, p1 - pb);
+        float x[4][4] = {};
+        bool mka[4][4];
+        bool any_mk = false;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                mka[r][j] = (r < nq) && (j < np) && (mask[mrow0 + r * sstride + pb + j] != 0u);
+                if (mka[r][j]) any_mk = true;
+            }
+        }
+        if (any_mk) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                bool jany = false;
+                #pragma unroll
+                for (int r = 0; r < 4; r++) if (mka[r][j]) jany = true;
+                if (jany) {
+                    int kb = (pb + j) * n_kv * hd + kvh * hd;
+                    float kv = active ? ck[kb + tid] : 0.0f;
+                    if (active) {
+                        #pragma unroll
+                        for (int r = 0; r < 4; r++)
+                            if (mka[r][j]) x[r][j] = qf[r][tid] * kv;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                x[r][0] += __shfl_down_sync(0xffffffffffffffffull, x[r][0], off);
+                x[r][1] += __shfl_down_sync(0xffffffffffffffffull, x[r][1], off);
+                x[r][2] += __shfl_down_sync(0xffffffffffffffffull, x[r][2], off);
+                x[r][3] += __shfl_down_sync(0xffffffffffffffffull, x[r][3], off);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                rs[r][0][wid] = x[r][0]; rs[r][1][wid] = x[r][1];
+                rs[r][2][wid] = x[r][2]; rs[r][3][wid] = x[r][3];
+            }
+        }
+        __syncthreads();
+        if (wid == 0) {
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float y = lane < 8 ? rs[r][j][lane] : 0.0f;
+                    #pragma unroll
+                    for (int off = 4; off > 0; off >>= 1)
+                        y += __shfl_down_sync(0xffffffffffffffffull, y, off);
+                    if (lane == 0) ds[r][j] = y;
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < nq) {
+                float gm = m[r];
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    if (j < np) gm = fmaxf(gm, ds[r][j]);
+                float e_m = __expf(m[r] - gm);
+                s[r] *= e_m;
+                acc[r] *= e_m;
+                m[r] = gm;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < np) {
+                int kb = (pb + j) * n_kv * hd + kvh * hd;
+                float vv = active ? cv[kb + tid] : 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < nq) {
+                        float e_d = __expf(ds[r][j] - m[r]);
+                        s[r] += e_d;
+                        acc[r] += e_d * vv;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    int nseg = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r < nq) {
+            float* pp2 = part + ((size_t)((t0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r];
+            if (tid == 0) { pp2[hd] = m[r]; pp2[hd + 1] = s[r]; }
+        }
+    }
+}
+// QSA split flash, q 2행 다중화 — ck/cv 1회 로드로 t쌍 공유 (K/V 트래픽 ½).
 extern "C" __global__ void qsa_flash_split4q2(const float* q, const float* ck, const float* cv,
                                               const unsigned* mask, float* part,
                                               int n_past, int n_head, int n_kv,
@@ -3242,7 +3377,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
