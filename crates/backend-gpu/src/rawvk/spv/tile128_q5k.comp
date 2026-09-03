@@ -123,18 +123,29 @@ void main() {
         }
         barrier();
         // compute: 서브그룹당 16행 × (토큰 4×16)
+        // tt 완전 전개 — 블록별 독립 fb (루프 캐리 의혹 제거)
         for (int ks = 0; ks < 2; ks++) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
             coopMatLoad(fa, A16[sg << 4], ks * 16, 36, gl_CooperativeMatrixLayoutRowMajor);
-            for (int tt = 0; tt < 4; tt++) {
-                if (tt * 16 < nt) {
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb;
-                    coopMatLoad(fb, B16[tt * 16], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
-                    if (tt == 0) acc0 = coopMatMulAdd(fa, fb, acc0);
-                    else if (tt == 1) acc1 = coopMatMulAdd(fa, fb, acc1);
-                    else if (tt == 2) acc2 = coopMatMulAdd(fa, fb, acc2);
-                    else acc3 = coopMatMulAdd(fa, fb, acc3);
-                }
+            if (nt > 0) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb0;
+                coopMatLoad(fb0, B16[0], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
+                acc0 = coopMatMulAdd(fa, fb0, acc0);
+            }
+            if (nt > 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb1;
+                coopMatLoad(fb1, B16[16], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
+                acc1 = coopMatMulAdd(fa, fb1, acc1);
+            }
+            if (nt > 32) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb2;
+                coopMatLoad(fb2, B16[32], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
+                acc2 = coopMatMulAdd(fa, fb2, acc2);
+            }
+            if (nt > 48) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb3;
+                coopMatLoad(fb3, B16[48], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
+                acc3 = coopMatMulAdd(fa, fb3, acc3);
             }
         }
         barrier();

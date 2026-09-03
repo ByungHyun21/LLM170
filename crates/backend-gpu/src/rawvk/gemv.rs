@@ -665,15 +665,15 @@ impl Accelerator for VkAcc {
             binds.push(xb0);
             binds.push(ob0);
             ctx.bind_bufs(p.ds, &binds);
-            let gx = (n_out + 15) as u32 / 16;
-            for tb in (0..t).step_by(16) {
-                let nt = (t - tb).min(16) as u32;
-                let mut push = Vec::with_capacity(20);
+            let gx = (n_out + 127) as u32 / 128;
+            for tb in (0..t).step_by(64) {
+                let nt = (t - tb).min(64) as u32;
+                let mut push = Vec::with_capacity(16);
                 push.extend_from_slice(&(n_in as u32).to_le_bytes());
                 push.extend_from_slice(&(n_out as u32).to_le_bytes());
                 push.extend_from_slice(&(xq_w as u32).to_le_bytes());
                 push.extend_from_slice(&nt.to_le_bytes());
-                push.extend_from_slice(&(tb as u32).to_le_bytes());
+
                 ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
             }
             let host = unsafe {
