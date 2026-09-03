@@ -29,8 +29,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **63.6 t/s** | 0.44x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **45.6 t/s** | ~0.20x |
+| Prefill pp64 | 142.8 t/s | **73.0 t/s** | 0.51x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **50.2 t/s** | ~0.22x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
@@ -39,6 +39,9 @@ streams** — zero quantization-induced divergence on this benchmark.
 Key techniques (kernels are HIP C++ strings JIT-compiled via hipRTC,
 arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
 
+- GDN kernels: causal conv fully parallel over (channel, token) — state
+  updated by a separate tail kernel; AR recurrence keeps its state slice
+  resident in shared memory across the sequential scan.
 - MMQ tile kernels (llama.cpp mul_mat_q structure): 64-row x 16-token
   blocks with cooperatively staged unpacked weights and activations in
   shared memory, thread fragments owning sb%4 sub-blocks — bit-exact via
