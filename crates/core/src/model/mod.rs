@@ -1020,6 +1020,21 @@ impl Engine {
         nexts: &[u32],
         k: usize,
     ) -> Result<Vec<Vec<u32>>, ModelError> {
+        // 시퀀스 청크 — verify_batch_ms 행 상한 32 (np·(k+1) > 28이면 분할)
+        let per = 60usize / (1 + k);
+        if seqs.len() > per.max(1) {
+            let mut out: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+            for c in seqs.chunks(per.max(1)) {
+                let i0 = out.len();
+                let ns: Vec<u32> = {
+                    let base = seqs.iter().position(|&x| x == c[0]).unwrap_or(0);
+                    (0..c.len()).map(|i| nexts[base + i]).collect()
+                };
+                out.extend(self.spec_step_multi(c, &ns, k)?);
+                let _ = i0;
+            }
+            return Ok(out);
+        }
         let eos = 248044u32;
         let rd = self.raw_decode.clone().ok_or(ModelError::Accel("raw 없음".into()))?;
         let n_seq = seqs.len();
@@ -1064,10 +1079,15 @@ impl Engine {
         for si in 0..n_seq {
             carried.push(std::mem::take(&mut self.seqs[seqs[si]].gdn_carried));
         }
-        // carried 상한 — 총 행수 > 28이면 커밋 배치로 소화 (verify_batch_ms t≤32 상한)
+        // carried 상한 — 총 행수 > 28이면 커밋 배치로 소화 (verify_batch_ms t≤32 상한).
+        // 커밋은 seq 청크로 분할 (np8×k4 = 40행 → 2×20행).
         {
-            let total: usize = carried.iter().map(|c| c.len() + 1 + all_drafts[0].len()).sum::<usize>().max(n_seq * (1 + k));
-            if total > 28 {
+            let total: usize = carried
+                .iter()
+                .zip(all_drafts.iter())
+                .map(|(c, d)| c.len() + 1 + d.len())
+                .sum::<usize>();
+            if total > 60 {
                 let mut crows: Vec<f32> = Vec::new();
                 let mut starts = Vec::new();
                 let mut sposs = Vec::new();
@@ -1086,10 +1106,35 @@ impl Engine {
                     }
                 }
                 if !crows.is_empty() {
-                    let mut cam: Vec<u32> = Vec::new();
-                    let mut ch_all: Vec<f32> = Vec::new();
-                    rd.verify_batch_ms(&sseqs, &sposs, &starts, &crows, &mut cam, &mut ch_all)
+                    // 시퀀스 청크 분할 커밋 (행수 ≤ 28)
+                    let mut ci = 0usize;
+                    while ci < sseqs.len() {
+                        let mut cj = ci;
+                        let mut rows_n = 0usize;
+                        while cj < sseqs.len() {
+                            let add = starts[cj + 1..].first().copied().unwrap_or(crows.len() / n_e) - starts[cj];
+                            if rows_n + add > 60 && cj > ci {
+                                break;
+                            }
+                            rows_n += add;
+                            cj += 1;
+                        }
+                        let r0 = starts[ci] * n_e;
+                        let r1 = if cj < starts.len() { starts[cj] * n_e } else { crows.len() };
+                        let sub_starts: Vec<usize> = starts[ci..cj].iter().map(|&x| x - starts[ci]).collect();
+                        let mut cam: Vec<u32> = Vec::new();
+                        let mut ch_all: Vec<f32> = Vec::new();
+                        rd.verify_batch_ms(
+                            &sseqs[ci..cj],
+                            &sposs[ci..cj],
+                            &sub_starts,
+                            &crows[r0..r1],
+                            &mut cam,
+                            &mut ch_all,
+                        )
                         .map_err(ModelError::Accel)?;
+                        ci = cj;
+                    }
                     for si in 0..n_seq {
                         self.seqs[seqs[si]].gdn_carried = Vec::new();
                     }

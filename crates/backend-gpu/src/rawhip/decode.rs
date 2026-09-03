@@ -224,8 +224,8 @@ impl DecodeState {
         let b_av_t = bs(t_max * n_kv * hd * 4);
         let b_aout_t = bs(t_max * hp.n_head * hp.head_dim * 4);
         let b_scores_t = bs(t_max * hp.n_head * ctx_len * 4);
-        // 최대 32행 — carried 재실행 행 포함 (k≤8: carried≤9 + 1 + 8)
-        let b_logits_all = ctx.alloc(hp.vocab * 4 * 32).map_err(|e| e.to_string())?;
+        // 최대 64행 — carried 재실행 행 포함 (np8×k4=40)
+        let b_logits_all = ctx.alloc(hp.vocab * 4 * 64).map_err(|e| e.to_string())?;
         // GDN 상태 스냅샷 (spec 부분수용 롤백용) — recr 전층 (gdn_s + conv) × seq
         let gdn_bytes: usize = (n_recr * n_seqs * (gdn_len + conv_len)) * 4;
         let b_gdn_snap = ctx.alloc(gdn_bytes.max(16)).map_err(|e| e.to_string())?;
@@ -234,8 +234,8 @@ impl DecodeState {
             .iter()
             .any(|(k, _)| k == "blk.64.nextn.eh_proj.weight");
         let n_ao = hp.n_head * hp.head_dim; // wo 입력 (6144 > n)
-        let b_ms_meta = ctx.alloc(160 * 4).map_err(|e| e.to_string())?; // i32 5×32
-        let b_ms_ptr = ctx.alloc(32 * 8 * 2).map_err(|e| e.to_string())?; // K/V 테이블 2×32행
+        let b_ms_meta = ctx.alloc(320 * 4).map_err(|e| e.to_string())?; // i32 5×64
+        let b_ms_ptr = ctx.alloc(64 * 8 * 2).map_err(|e| e.to_string())?; // K/V 테이블 2×64행
         let b_mtp_xq_sz = (n_ao / 4 + n_ao / 32 + n_ao / 16) * 4;
         let b_mtp_xq2_sz = (2 * n / 4 + 2 * n / 32 + 2 * n / 16) * 4;
         let (mut v_mtp_k, mut v_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
@@ -305,10 +305,10 @@ impl DecodeState {
             mtp_qkv: b_mtp_qkv,
             mtp_ao: b_mtp_ao,
             ms_rowseq: b_ms_meta,
-            ms_rowpos: unsafe { b_ms_meta.add(32 * 4) },
-            ms_segstart: unsafe { b_ms_meta.add(64 * 4) },
-            ms_segend: unsafe { b_ms_meta.add(96 * 4) },
-            ms_rownp: unsafe { b_ms_meta.add(128 * 4) },
+            ms_rowpos: unsafe { b_ms_meta.add(64 * 4) },
+            ms_segstart: unsafe { b_ms_meta.add(128 * 4) },
+            ms_segend: unsafe { b_ms_meta.add(192 * 4) },
+            ms_rownp: unsafe { b_ms_meta.add(256 * 4) },
             ms_ptrbuf: b_ms_ptr,
             ms_ptrbuf2: unsafe { b_ms_ptr.add(32 * 8) },
             mtp_e: b_mtp_e,
@@ -1413,7 +1413,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
     ) -> Result<(), String> {
         let t = emb.len() / self.n_embd;
         if t > 32 {
-            return Err(format!("verify_batch t={t} > 32 (logits_all 상한)"));
+            return Err(format!("verify_batch t={t} > 64 (logits_all 상한)"));
         }
         let n = self.n_embd;
         let t_b0 = std::time::Instant::now();
@@ -2032,8 +2032,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         h_all: &mut Vec<f32>,
     ) -> Result<(), String> {
         let t = emb.len() / self.n_embd;
-        if t > 32 {
-            return Err(format!("verify_batch_ms t={t} > 32"));
+        if t > 64 {
+            return Err(format!("verify_batch_ms t={t} > 64"));
         }
         let n = self.n_embd;
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
