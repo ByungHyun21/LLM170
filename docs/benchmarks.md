@@ -5,6 +5,22 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+## Baseline methodology note (2026-09-05)
+
+Two llama.cpp references exist and must not be mixed:
+
+1. **Designated primary target** (2026-09-02): streaming-server bench (median),
+   pp64 142.8 / tg 10.4. This includes the serving stack and is the official
+   goal reference.
+2. **llama-bench raw compute loop** (2026-09-05, same machine, same GGUF
+   verified by hash, -fa 1): **pp64 294±15, pp512 358±9, tg8 11.2**. This is
+   the apples-to-apples comparison for our raw-loop `llm170 bench` numbers.
+
+Against the raw-loop reference our standing is: pp64 default 81.8 (0.28x),
+fast 139.4 (0.47x); tg24 10.40 (0.93x). Against the designated server-bench
+target: pp64 fast 0.98x, tg parity. The session's internal gains
+(pp 43.1 -> 81.8/139.4) are unaffected by this distinction.
+
 ## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
 llama.cpp, Q4_K_XL (27B), non-MTP, flash attention on, f16 KV, temp 0,
