@@ -1189,29 +1189,16 @@ fn cmd_vl(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (iw, ih) = (img.width() as usize, img.height() as usize);
-    let tgt = 768usize;
-    let mut px = vec![0f32; tgt * tgt * 3];
-    for y in 0..tgt {
-        for x in 0..tgt {
-            let sx = (x as f32 + 0.5) * iw as f32 / tgt as f32 - 0.5;
-            let sy = (y as f32 + 0.5) * ih as f32 / tgt as f32 - 0.5;
-            let (x0, y0) = (sx.floor().max(0.0) as usize, sy.floor().max(0.0) as usize);
-            let (x1, y1) = ((x0 + 1).min(iw - 1), (y0 + 1).min(ih - 1));
-            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let base = (y * tgt + x) * 3;
-            for c in 0..3 {
-                let v00 = img[(x0 as u32, y0 as u32)][c] as f32;
-                let v10 = img[(x1 as u32, y0 as u32)][c] as f32;
-                let v01 = img[(x0 as u32, y1 as u32)][c] as f32;
-                let v11 = img[(x1 as u32, y1 as u32)][c] as f32;
-                let v = v00 * (1.0 - fx) * (1.0 - fy)
-                    + v10 * fx * (1.0 - fy)
-                    + v01 * (1.0 - fx) * fy
-                    + v11 * fx * fy;
-                px[base + c] = (v / 255.0 - 0.5) / 0.5;
-            }
-        }
+    let (iw, ih) = (img.width() as i64, img.height() as i64);
+    // qwen3vl smart_resize (align 32, 토큰 8..4096) + Pillow bicubic
+    let (tw, th) = llm170_core::clip_preproc::smart_resize(iw, ih, 16, 2, 8, 4096);
+    let raw = img.as_raw();
+    let rgb8 = llm170_core::clip_preproc::resize_pillow(raw, iw as usize, ih as usize, tw as usize, th as usize, true);
+    eprintln!("# resize {iw}x{ih} -> {tw}x{th}");
+    let (tw, th) = (tw as usize, th as usize);
+    let mut px = vec![0f32; tw * th * 3];
+    for (i, v) in rgb8.iter().enumerate() {
+        px[i] = ((*v as f32) / 255.0 - 0.5) / 0.5;
     }
     // 2) CLIP
     let t0 = std::time::Instant::now();
@@ -1222,7 +1209,7 @@ fn cmd_vl(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let vis = match clip.encode(&px, tgt, tgt) {
+    let vis = match clip.encode(&px, tw, th) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("clip encode: {e}");

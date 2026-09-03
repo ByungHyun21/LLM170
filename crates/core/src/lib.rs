@@ -6,6 +6,7 @@ pub mod matmul;
 pub mod model;
 pub mod qwen4exp;
 pub mod clip;
+pub mod clip_preproc;
 mod ops;
 pub mod quant;
 mod tables;

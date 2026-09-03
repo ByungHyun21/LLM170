@@ -372,7 +372,13 @@ impl Clip {
 
         // ── pos embd (raster → merge-major 매핑)
         let pos = self.tensor_f32("v.position_embd.weight")?;
-        assert_eq!(pos.len(), n_embd * n_pos, "pos embd 크기 불일치 — 리사이즈 미구현 (768 고정)");
+        let pos_grid = (pos.len() / n_embd) as f64;
+        let pos_side = pos_grid.sqrt() as usize; // 학습 그리드 (768 → 48)
+        let pos_raster = if pos_side * pos_side == n_pos {
+            pos.clone()
+        } else {
+            crate::clip_preproc::pos_resize_bilinear(&pos, pos_side, pw, ph, n_embd)
+        };
         {
             let mut p = 0usize;
             for y0 in (0..ph).step_by(2) {
@@ -380,7 +386,7 @@ impl Clip {
                     for dx in 0..2 {
                         for dy in 0..2 {
                             let raster = (y0 + dy) * pw + (x0 + dx);
-                            let row = &pos[raster * n_embd..(raster + 1) * n_embd];
+                            let row = &pos_raster[raster * n_embd..(raster + 1) * n_embd];
                             for i in 0..n_embd {
                                 toks[p][i] += row[i];
                             }
