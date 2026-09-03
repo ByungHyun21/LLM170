@@ -85,7 +85,7 @@ impl RawCtx {
                 let bytes = std::fs::read(&co2).map_err(|e| format!("CO2 읽기: {e}"))?;
                 let mut m3: hip::hipModule_t = std::ptr::null_mut();
                 ck(hip::hipModuleLoadData(&mut m3, bytes.as_ptr() as *const _), "CO2 ModuleLoadData")?;
-                for name in ["gemm_q5k_v4"] {
+                for name in ["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4"] {
                     let cname = CString::new(name).unwrap();
                     let mut f: hip::hipFunction_t = std::ptr::null_mut();
                     if hip::hipModuleGetFunction(&mut f, m3, cname.as_ptr()) == hip::hipError_t_hipSuccess {
@@ -413,7 +413,7 @@ impl RawCtx {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128");
+        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128") || kern.ends_with("_v4");
         let rows_per_block: usize = if kern.ends_with("_j128") { 128 } else if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
         let gx = nblocks.min(65535) as u32;
@@ -1121,11 +1121,14 @@ pub fn mm_bench() -> Result<String, String> {
         llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q5k_v4" }
             else if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q4k_v4" }
+            else if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
         llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
         llm170_gguf::GgmlType::Q8_0 => if std::env::var_os("LLM170_J128").is_some() { "gemm_q8_j128" } else { "gemm_q8_0" },
-        _ => if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
+        llm170_gguf::GgmlType::Iq4Xs => if std::env::var_os("LLM170_V4").is_some() { "gemm_xs_v4" }
+            else if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
+        _ => "gemm_xs_mm",
     };
     let launch = |ctx: &RawCtx| -> Result<(), String> {
         let mut xp = xq as *mut std::ffi::c_void;
