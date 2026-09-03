@@ -52,8 +52,8 @@ cross-verification against per-token):
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.4-10.5 t/s** (GPU argmax, logits resident) | 1.00-1.01x |
 | Prefill pp64 (chunk 64) | 142.8 t/s | **149.6 t/s** (81.8 exact mode) | **1.05x** (0.57x) |
-| Prefill pp128 (… + odd-type tiles + fused qsa) | — | **228.0 t/s** (fresh-ref verified) | 0.78x vs llama-bench 294 |
-| Prefill pp512 (long context) | — | **208.9 t/s** | 0.58x vs llama-bench 358 |
+| Prefill pp128 (… + odd tiles + flash + q8 tile) | — | **232.9 t/s** (fresh-ref verified) | 0.79x vs llama-bench 294 |
+| Prefill pp512 (long context) | — | **212.1 t/s** | 0.59x vs llama-bench 358 |
 | Prefill pp512 | ~230 t/s (server-bench) | **~68 t/s** | ~0.30x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8

@@ -407,6 +407,7 @@ impl RawCtx {
             20 => if std::env::var_os("LLM170_NLV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
             11 => if std::env::var_os("LLM170_Q3KV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
             21 => if std::env::var_os("LLM170_IQ3SV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
+            8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -1135,7 +1136,7 @@ pub fn mm_bench() -> Result<String, String> {
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
-    // wm 상한 64: t>64는 타입별 128-커널 env 없이 측정 불가 — 침묵 오답 대신 에러 (Q8_0 제외, bound 미확인)
+    // wm 상한 64 + bench GEMV 그리드 부적합: 타일 env 없으면 에러
     let big_ok = match w.ty {
         llm170_gguf::GgmlType::Q5K | llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Iq4Xs
             => std::env::var_os("LLM170_V4").is_some() || std::env::var_os("LLM170_J128").is_some(),
@@ -1143,6 +1144,7 @@ pub fn mm_bench() -> Result<String, String> {
         llm170_gguf::GgmlType::Iq4Nl => std::env::var_os("LLM170_NLV4").is_some(),
         llm170_gguf::GgmlType::Q3K => std::env::var_os("LLM170_Q3KV4").is_some(),
         llm170_gguf::GgmlType::Iq3S => std::env::var_os("LLM170_IQ3SV4").is_some(),
+        llm170_gguf::GgmlType::Q8_0 => std::env::var_os("LLM170_J128").is_some(),
         _ => true,
     };
     if t > 64 && !big_ok {
@@ -1155,7 +1157,7 @@ pub fn mm_bench() -> Result<String, String> {
         llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q4k_v4" }
             else if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
         llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-        llm170_gguf::GgmlType::Q8_0 => if std::env::var_os("LLM170_J128").is_some() { "gemm_q8_j128" } else { "gemm_q8_0" },
+        llm170_gguf::GgmlType::Q8_0 => if std::env::var_os("LLM170_J128").is_some() { "gemm_q8_j128" } else { return Err("mm-bench 미지원: q8_0은 LLM170_J128 필요".into()) },
         llm170_gguf::GgmlType::Iq4Xs => if std::env::var_os("LLM170_V4").is_some() { "gemm_xs_v4" }
             else if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },

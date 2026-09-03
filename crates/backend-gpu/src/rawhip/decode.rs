@@ -1160,7 +1160,10 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             && ((ty == 20 && std::env::var_os("LLM170_NLV4").is_some())
                 || (ty == 11 && std::env::var_os("LLM170_Q3KV4").is_some())
                 || (ty == 21 && std::env::var_os("LLM170_IQ3SV4").is_some()));
-        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4) && std::env::var_os("LLM170_NO_TILE").is_none() {
+        // q8_0 타일 (CO j128): 소형 GEMV 토큰당 재독 제거
+        let q8t = ty == 8 && t > 64 && std::env::var_os("LLM170_EXACT").is_none()
+            && std::env::var_os("LLM170_CO_PATH").is_some();
+        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
         }
