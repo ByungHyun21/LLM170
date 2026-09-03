@@ -993,6 +993,7 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
     half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
     unsigned* kt_s = (unsigned*)(smem + 18432);
     for (int i2 = threadIdx.x; i2 < 256; i2 += 256) kt_s[i2] = ktab2[i2];
+    __syncthreads();   // LUT 가시성 — A 스테이징 룩업 전 필수 (경합 수정)
     half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
     int bid = blockIdx.x;
     int tid = threadIdx.x;

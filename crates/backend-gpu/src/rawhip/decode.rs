@@ -652,6 +652,9 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         let r = ds.read_logits();
+        if let (Some(path), Ok(v)) = (std::env::var_os("LLM170_DUMP_LOGITS"), r.as_ref()) {
+            let _ = std::fs::write(&path, bytemuck::cast_slice(v));
+        }
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("batch({} tok) wall={:.1}ms", emb.len() / ds.n_embd, t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -947,6 +950,23 @@ gmark("ffn_up", &mut marks);
                 self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
             }
 gmark("ffn_silu", &mut marks);
+            if std::env::var_os("LLM170_DUMP_XQN").is_some() && il == 0 {
+                self.ctx.sync()?;
+                let mut bytes = vec![0u8; xq_sn * 4 * t];
+                self.ctx.d2h(bytes.as_mut_slice(), self.xq_n_t)?;
+                let _ = std::fs::write(std::env::var_os("LLM170_DUMP_XQN").unwrap(), &bytes);
+                eprintln!("#  xq_n_t dumped: {} words", xq_sn * t);
+            }
+            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                self.ctx.sync()?;
+                let mut hf = vec![0f32; self.n_ff * t];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut hf).as_mut(), self.fgate_t)?;
+                let bg = hf.iter().filter(|v| v.is_nan() || v.is_infinite()).count();
+                let mut hl = vec![0f32; self.n_ff * t];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut hl).as_mut(), self.fglu_t)?;
+                let bl = hl.iter().filter(|v| v.is_nan() || v.is_infinite()).count();
+                eprintln!("#  F0 fgate nan/inf {bg} | fglu nan/inf {bl}");
+            }
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
 gmark("ffn_quant2", &mut marks);
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;

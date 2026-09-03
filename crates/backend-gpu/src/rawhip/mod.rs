@@ -312,10 +312,10 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let kern = match ty {
-            13 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if std::env::var_os("LLM170_WMMA").is_some() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            13 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -339,7 +339,7 @@ impl RawCtx {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let mm = kern.ends_with("_mm");
+        let mm = kern.ends_with("_mm") || kern.ends_with("_wm");
         let rows_per_block: usize = if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
         let gx = nblocks.min(65535) as u32;
@@ -855,7 +855,14 @@ pub fn mm_tile_bench() -> Result<String, String> {
         }
     }
     let xq = ctx.alloc(xq_h.len() * 4)?;
-    ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
+    if let Some(f) = std::env::var_os("LLM170_XQN_FILE") {
+        let bytes = std::fs::read(&f).unwrap();
+        assert_eq!(bytes.len(), xq_h.len() * 4, "덤프 크기 불일치: {} vs {}", bytes.len(), xq_h.len() * 4);
+        ctx.h2d(xq, &bytes)?;
+        eprintln!("xq 리플레이: {}", f.to_string_lossy());
+    } else {
+        ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
+    }
     let out = ctx.alloc(n_out * 4 * t)?;
     let mut wp = wd as *mut std::ffi::c_void;
     let mut op = out as *mut std::ffi::c_void;
@@ -997,10 +1004,10 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
     let kern_name = match w.ty {
-        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-        _ => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_xs_wm" } else { "gemm_xs_mm" },
+        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+        _ => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
     };
     let launch = |ctx: &RawCtx| -> Result<(), String> {
         let mut xp = xq as *mut std::ffi::c_void;
