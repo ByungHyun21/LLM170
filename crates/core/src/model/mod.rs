@@ -798,8 +798,68 @@ impl Engine {
         Ok(out.into_iter().next().unwrap())
     }
 
+    /// prefill (비전 스플라이스) — marker 토큰 위치를 비전 임베딩 행들로 확대 치환.
+    /// 위치는 순차 (mtmd와 동일 — 비-mrope LLM은 이미지 슬롯도 연속 위치).
+    pub fn prefill_vision(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        marker: u32,
+        vis: &[Vec<f32>],
+    ) -> Result<Vec<f32>, ModelError> {
+        // marker → vis 행 치환 후 내부 prefill 재사용: 임시 토큰열 + 스플라이스 맵은
+        // 복잡하므로 여기서 캐시 행을 직접 조립한다 (prefill과 동일 절차).
+        let n = self.model.hp.n_embd;
+        let embd = self.model.wchk("token_embd.weight")?;
+        let mut cache: Vec<Vec<f32>> = Vec::with_capacity(tokens.len() + vis.len());
+        let mut tok_seq: Vec<u32> = Vec::with_capacity(tokens.len() + vis.len());
+        let mut spliced = 0usize;
+        for &t in tokens {
+            if t == marker && !vis.is_empty() {
+                for row in vis {
+                    cache.push(row.clone());
+                    tok_seq.push(marker);
+                }
+                spliced += 1;
+            } else {
+                let mut r = vec![0.0f32; n];
+                crate::quant::dequant_row(embd.ty, embd.data, t as u64, n as u64, &mut r);
+                cache.push(r);
+                tok_seq.push(t);
+            }
+        }
+        if spliced != 1 {
+            return Err(ModelError::Accel(format!(
+                "prefill_vision: marker {marker} {spliced}회 (1회 기대)"
+            )));
+        }
+        self.prefill_rows(seq, &tok_seq, &cache)
+    }
+
     /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
+
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let n = self.model.hp.n_embd as usize;
+        let (embd_ty, embd_data) = {
+            let t = self.model.wchk("token_embd.weight")?;
+            (t.ty, t.data.to_vec())
+        };
+        let mut cache: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+        for &tok in tokens {
+            let mut row = vec![0.0f32; n];
+            crate::quant::dequant_row(embd_ty, &embd_data, tok as u64, n as u64, &mut row);
+            cache.push(row);
+        }
+        self.prefill_rows(seq, tokens, &cache)
+    }
+
+    /// 행이 미리 조립된 prefill (비전 스플라이스 재사용).
+    pub fn prefill_rows(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        cache: &[Vec<f32>],
+    ) -> Result<Vec<f32>, ModelError> {
         // 1024토큰 청크 — qwen4exp와 동일 근거: 단일 초대형 forward는 GPU
         // 스크래치·상태 크기를 폭주시킨다 (qwen4exp GPF 실측, 2026-08-31).
         // 청킹은 수치 불변 (GDN chunked·attention 캐시는 순차 적립).
@@ -821,24 +881,7 @@ impl Engine {
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
                 let n = self.model.hp.n_embd as usize;
-                // 소유 복사 — 루프 내 self.mtp_step (&mut self)와 공존
-                let (embd_ty, embd_data) = {
-                    let t = self.model.wchk("token_embd.weight")?;
-                    (t.ty, t.data.to_vec())
-                };
                 let mut pos = self.seqs[seq].pos as usize;
-                let mut cache: Vec<Vec<f32>> = Vec::new();
-                for &tok in tokens {
-                    let mut row = vec![0.0f32; n];
-                    crate::quant::dequant_row(
-                        embd_ty,
-                        &embd_data,
-                        tok as u64,
-                        n as u64,
-                        &mut row,
-                    );
-                    cache.push(row);
-                }
                 // 청크 ≤ 64: 소유권형 MMQ (shared ~40KB, acc[16] 레지스터)
                 let ch_sz = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse().ok())
                     .unwrap_or(if std::env::var_os("LLM170_CO_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() { 128 } else { 64 });
@@ -855,10 +898,7 @@ impl Engine {
                         for ti in 0..ch.len() {
                             let wl = ti + 1 == ch.len();
                             let h_t = h_all[ti * n_e..(ti + 1) * n_e].to_vec();
-                            let t_tok = tokens[pos + ti];
-                            let mut trow = vec![0.0f32; n_e];
-                            crate::quant::dequant_row(
-                                embd_ty, &embd_data, t_tok as u64, n_e as u64, &mut trow);
+                            let trow = ch[ti].clone();
                             let rd2 = rd.clone();
                             // llama.cpp 시프트 페어링: MTP(tok_p, h_{p-1}) — h_{-1}=0
                             let (am, _hn) = rd2

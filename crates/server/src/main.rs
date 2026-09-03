@@ -66,6 +66,7 @@ fn main() -> ExitCode {
         Some("infer") => cmd_infer(&args[1..]),
         Some("serve") => return cmd_serve(&args[1..]),
         Some("rawhip-check") => cmd_rawhip_check(&args[1..]),
+        Some("vl") => return cmd_vl(&args[1..]),
         Some("gpu-raw-probe") => {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             match llm170_backend_gpu::rawhip::raw_probe(iters) {
@@ -1149,4 +1150,124 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         .map_err(|e| format!("raw_init: {e}"))?;
     eng.raw_decode = Some(rd);
     Ok(())
+}
+
+/// vl — mmproj 비전 인코딩 + LLM 스플라이스 추론 (plans/16).
+fn cmd_vl(args: &[String]) -> ExitCode {
+    let mut model: Option<PathBuf> = None;
+    let mut mmproj: Option<PathBuf> = None;
+    let mut image: Option<PathBuf> = None;
+    let mut n_predict = 48usize;
+    let mut ctx = 4096usize;
+    let mut backend = "gpu".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--model" => model = it.next().map(PathBuf::from),
+            "--mmproj" => mmproj = it.next().map(PathBuf::from),
+            "--image" => image = it.next().map(PathBuf::from),
+            "--n-predict" => n_predict = it.next().and_then(|v| v.parse().ok()).unwrap_or(48),
+            "--ctx" => ctx = it.next().and_then(|v| v.parse().ok()).unwrap_or(4096),
+            "--backend" => backend = it.next().cloned().unwrap_or_else(|| "gpu".into()),
+            _ => {}
+        }
+    }
+    let (model, mmproj, image) = match (model, mmproj, image) {
+        (Some(m), Some(p), Some(i)) => (m, p, i),
+        _ => {
+            eprintln!("usage: llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--n-predict N]");
+            return ExitCode::from(2);
+        }
+    };
+    // qwen3.8 VL 템플릿 토큰 (서버 /tokenize 확정): <|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe this image in one short sentence.<|im_end|>\n<|im_start|>assistant\n
+    let prompt: Vec<u32> = vec![248045, 846, 198, 248053, 248056, 248054, 72240, 411, 2099, 303, 799, 2716, 11316, 13, 248046, 198, 248045, 74455, 198];
+    // 1) 이미지 → 768×768 RGB 정규화 (쌍선형 임시 — llama.cpp는 bicubic)
+    let img = match image::open(&image) {
+        Ok(i) => i.to_rgb8(),
+        Err(e) => {
+            eprintln!("image: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (iw, ih) = (img.width() as usize, img.height() as usize);
+    let tgt = 768usize;
+    let mut px = vec![0f32; tgt * tgt * 3];
+    for y in 0..tgt {
+        for x in 0..tgt {
+            let sx = (x as f32 + 0.5) * iw as f32 / tgt as f32 - 0.5;
+            let sy = (y as f32 + 0.5) * ih as f32 / tgt as f32 - 0.5;
+            let (x0, y0) = (sx.floor().max(0.0) as usize, sy.floor().max(0.0) as usize);
+            let (x1, y1) = ((x0 + 1).min(iw - 1), (y0 + 1).min(ih - 1));
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let base = (y * tgt + x) * 3;
+            for c in 0..3 {
+                let v00 = img[(x0 as u32, y0 as u32)][c] as f32;
+                let v10 = img[(x1 as u32, y0 as u32)][c] as f32;
+                let v01 = img[(x0 as u32, y1 as u32)][c] as f32;
+                let v11 = img[(x1 as u32, y1 as u32)][c] as f32;
+                let v = v00 * (1.0 - fx) * (1.0 - fy)
+                    + v10 * fx * (1.0 - fy)
+                    + v01 * (1.0 - fx) * fy
+                    + v11 * fx * fy;
+                px[base + c] = (v / 255.0 - 0.5) / 0.5;
+            }
+        }
+    }
+    // 2) CLIP
+    let t0 = std::time::Instant::now();
+    let mut clip = match llm170_core::clip::Clip::load(&mmproj) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("clip load: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let vis = match clip.encode(&px, tgt, tgt) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("clip encode: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("# clip: {} tokens in {:.1}s", vis.len(), t0.elapsed().as_secs_f64());
+    // 3) LLM
+    let m = match llm170_core::model::Model::load(&model) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("model: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut eng = llm170_core::model::Engine::new(m, 1, ctx);
+    if backend != "cpu" {
+        crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+    }
+    let t1 = std::time::Instant::now();
+    let logits = match eng.prefill_vision(0, &prompt, 248056, &vis) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("prefill_vision: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("# prefill {:.1}s", t1.elapsed().as_secs_f64());
+    let mut next = llm170_core::model::greedy(&logits);
+    for _ in 0..n_predict {
+        let lg = match eng.decode(&[0], &[next]) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("decode: {e}");
+                break;
+            }
+        };
+        next = llm170_core::model::greedy(&lg[0]);
+        if next == 248044 {
+            break;
+        }
+        print!("{}", eng.piece(next));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    eprintln!("\n# done");
+    ExitCode::SUCCESS
 }

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+image = { version = "0.25.10", features = ["jpeg", "png"] }
 llm170-gguf = { path = "../gguf" }
 llm170-profiler = { path = "../profiler" }
 memmap2 = "0.9"
