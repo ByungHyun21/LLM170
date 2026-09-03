@@ -84,7 +84,7 @@ impl RawCtx {
                 let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
                 let mut m2: hip::hipModule_t = std::ptr::null_mut();
                 ck(hip::hipModuleLoadData(&mut m2, bytes.as_ptr() as *const _), "CO ModuleLoadData")?;
-                for name in ["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128", "gemm_xs_j128"] {
+                for name in ["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128", "gemm_xs_j128", "gemm_q8_j128"] {
                     let cname = CString::new(name).unwrap();
                     let mut f: hip::hipFunction_t = std::ptr::null_mut();
                     if hip::hipModuleGetFunction(&mut f, m2, cname.as_ptr()) == hip::hipError_t_hipSuccess {
@@ -359,8 +359,8 @@ impl RawCtx {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let mm = kern.ends_with("_mm") || kern.ends_with("_wm");
-        let rows_per_block: usize = if mm { 64 } else { 1 };
+        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128");
+        let rows_per_block: usize = if kern.ends_with("_j128") { 128 } else if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
         let gx = nblocks.min(65535) as u32;
         let gz = nblocks.div_ceil(65535) as u32;
@@ -1028,6 +1028,7 @@ pub fn mm_bench() -> Result<String, String> {
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
         llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
         llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+        llm170_gguf::GgmlType::Q8_0 => if std::env::var_os("LLM170_J128").is_some() { "gemm_q8_j128" } else { "gemm_q8_0" },
         _ => if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
     };
@@ -1079,6 +1080,27 @@ pub fn mm_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_mm(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_mm(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q8_0 => {
+                    let nblk = n_in as usize / 32;
+                    let mut acc = 0.0f32;
+                    for b in 0..nblk {
+                        let wb = &row[b * 34..b * 34 + 34];
+                        let h = ((wb[1] as u16) << 8) | wb[0] as u16;
+                        let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+                        let exp = ((h >> 10) & 0x1F) as i32;
+                        let man = (h & 0x3FF) as f32;
+                        let d = if exp == 0 { sign * man * 2f32.powi(-24) } else { sign * (man / 1024.0 + 1.0) * 2f32.powi(exp - 15) };
+                        let mut isum = 0i64;
+                        for j in 0..32 {
+                            let wv = wb[2 + j] as i8 as i64;
+                            let yv = q8s[ti][b].qs[j] as i64;
+                            isum += wv * yv;
+                        }
+                        let yd = q8s[ti][b].d;
+                        acc += yd * d * isum as f32;
+                    }
+                    acc
+                }
                 _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
             };
             if kern_name.ends_with("_wm") || kern_name.ends_with("_w32") || kern_name.ends_with("_j128") {
