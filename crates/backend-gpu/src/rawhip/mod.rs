@@ -225,6 +225,17 @@ impl RawCtx {
         }
         Ok(())
     }
+    /// 주 스트림 현재 시점 → 사이드 대기 (사이드 입력 준비 경합 방지)
+    pub fn side_wait_main(&self) -> Result<(), String> {
+        unsafe {
+            let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+            ck(hip::hipEventCreateWithFlags(&mut ev, 0), "evCreate2")?;
+            ck(hip::hipEventRecord(ev, self.stream), "evRecord2")?;
+            ck(hip::hipStreamWaitEvent(self.stream2, ev, 0), "evWait2")?;
+            ck(hip::hipEventDestroy(ev), "evDestroy2")?;
+        }
+        Ok(())
+    }
 
     /// W4A8 t=1 GEMV — 타입별 커널 선택, 부분합 reduce까지 수행.
     /// 반환 [n_out] f32. 수치: dot_row_w4a8_*_lane 미러와 동일열.

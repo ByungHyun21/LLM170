@@ -948,14 +948,17 @@ gmark("ffn_quant", &mut marks);
             let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
             if gate_tile && !up_tile {
                 self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if !gate_tile && up_tile {
+                self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if gate_tile && up_tile {
                 // 둘 다 타일 — 하나 사이드
+                self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
