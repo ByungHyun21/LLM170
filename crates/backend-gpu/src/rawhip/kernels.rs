@@ -741,17 +741,18 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
         __syncthreads();
     }
     // Ctmp는 A16+B16(18.4KB)에 별칭 — 스테이징 데이터는 루프 후 사멸
-    float* CtmpF = (float*)smem;
+    // 직접 드레인 (fc.x → out, Ctmp 제거): lane은 wave32 기준
     #pragma unroll
     for (int tth = 0; tth < 2; tth++) {
-        int tt2 = wpar * 2 + tth;
-        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
-    }
-    __syncthreads();
-    for (int u = tid; u < 64 * 64; u += 256) {
-        int r = u >> 6, tok = u & 63;
-        if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
     }
 }
 
@@ -857,17 +858,18 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
         }
         __syncthreads();
     }
-    float* CtmpF = (float*)smem;
+    // 직접 드레인 (fc.x → out, Ctmp 제거): lane은 wave32 기준
     #pragma unroll
     for (int tth = 0; tth < 2; tth++) {
-        int tt2 = wpar * 2 + tth;
-        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
-    }
-    __syncthreads();
-    for (int u = tid; u < 64 * 64; u += 256) {
-        int r = u >> 6, tok = u & 63;
-        if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
     }
 }
 
@@ -984,17 +986,18 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
         }
         __syncthreads();
     }
-    float* CtmpF = (float*)smem;
+    // 직접 드레인 (fc.x → out, Ctmp 제거): lane은 wave32 기준
     #pragma unroll
     for (int tth = 0; tth < 2; tth++) {
-        int tt2 = wpar * 2 + tth;
-        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
-    }
-    __syncthreads();
-    for (int u = tid; u < 64 * 64; u += 256) {
-        int r = u >> 6, tok = u & 63;
-        if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
     }
 }
 
@@ -1095,17 +1098,18 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
         }
         __syncthreads();
     }
-    float* CtmpF = (float*)smem;
+    // 직접 드레인 (fc.x → out, Ctmp 제거): lane은 wave32 기준
     #pragma unroll
     for (int tth = 0; tth < 2; tth++) {
-        int tt2 = wpar * 2 + tth;
-        store_matrix_sync(&CtmpF[row0 * 65 + tt2 * 16], fc[tth], 65, mem_row_major);
-    }
-    __syncthreads();
-    for (int u = tid; u < 64 * 64; u += 256) {
-        int r = u >> 6, tok = u & 63;
-        if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
     }
 }
 
