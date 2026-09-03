@@ -1135,10 +1135,18 @@ pub fn mm_bench() -> Result<String, String> {
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
-    // wm 상한 64: t>64는 V4/J128(CO) 없이 측정 불가 — 침묵 오답 대신 에러 (Q8_0 제외, bound 미확인)
-    if t > 64 && std::env::var_os("LLM170_V4").is_none() && std::env::var_os("LLM170_J128").is_none()
-        && !matches!(w.ty, llm170_gguf::GgmlType::Q8_0) {
-        return Err(format!("mm-bench 미지원: t={t}는 LLM170_V4 또는 LLM170_J128 필요"));
+    // wm 상한 64: t>64는 타입별 128-커널 env 없이 측정 불가 — 침묵 오답 대신 에러 (Q8_0 제외, bound 미확인)
+    let big_ok = match w.ty {
+        llm170_gguf::GgmlType::Q5K | llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Iq4Xs
+            => std::env::var_os("LLM170_V4").is_some() || std::env::var_os("LLM170_J128").is_some(),
+        llm170_gguf::GgmlType::Q6K => std::env::var_os("LLM170_J128").is_some(),
+        llm170_gguf::GgmlType::Iq4Nl => std::env::var_os("LLM170_NLV4").is_some(),
+        llm170_gguf::GgmlType::Q3K => std::env::var_os("LLM170_Q3KV4").is_some(),
+        llm170_gguf::GgmlType::Iq3S => std::env::var_os("LLM170_IQ3SV4").is_some(),
+        _ => true,
+    };
+    if t > 64 && !big_ok {
+        return Err(format!("mm-bench 미지원: t={t}는 타입별 128-커널 env 필요"));
     }
     let kern_name = match w.ty {
         llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q5k_v4" }
