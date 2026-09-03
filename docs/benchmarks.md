@@ -27,6 +27,12 @@ fast 139.4 (0.47x); tg24 10.40 (0.93x). Against the designated server-bench
 target: pp64 fast 0.98x, tg parity. The session's internal gains
 (pp 43.1 -> 81.8/139.4) are unaffected by this distinction.
 
+## Vision (mmproj) — HIP (2026-09-05)
+
+CLIP ViT 27 blocks on GPU (f32 weights resident, tiled GEMM + flash attention v2):
+vision encoding 47s (CPU) → **2.4-3.1s forward** (+7.1s one-time weight upload per process).
+Output verified identical to CPU path and semantically matching llama.cpp on test images.
+
 ## MTP speculative decode — HIP (2026-09-05)
 
 Natural-language prompt, 27B Q4_K_XL-class quant, greedy, warm reps.

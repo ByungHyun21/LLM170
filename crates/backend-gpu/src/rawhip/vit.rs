@@ -82,6 +82,13 @@ impl Vit {
             .ok_or_else(|| format!("vit weight 없음: {k}"))
     }
 
+    fn time_stage(&self, label: &str, t0: &std::time::Instant) {
+        if std::env::var_os("LLM170_VIT_TIME").is_some() {
+            let _ = self.ctx.sync();
+            eprintln!("[vtime] {label} +{:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
     fn gemm(
         &self,
         x: *mut u8,
@@ -120,6 +127,10 @@ impl Vit {
     ) -> Result<Vec<f32>, String> {
         let t = yx.len() / 2; // yx: [t][2]
         assert!(t <= self.t_max);
+        if t > 2304 {
+            // flash_vit의 smem 점수 버퍼 상한 — 초과 해상도는 호출자 폴백
+            return Err(format!("vit: t={t} > 2304 (flash_vit smem 상한)"));
+        }
         let (n, nh, dh) = (self.n_embd, self.n_head, self.d_head);
         self.ctx.h2d(self.b_x, bytemuck::cast_slice(toks))?;
         self.ctx.h2d(self.b_yx, bytemuck::cast_slice(yx))?;
@@ -134,7 +145,13 @@ impl Vit {
             let mut args = vec![arg(&mut sp), arg(&mut dp), arg(&mut na), arg(&mut ss), arg(&mut tt)];
             self.ctx.launch3("pack_strided", n.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
         }
+        let tmark = std::time::Instant::now();
+        let mut tlast = tmark;
         for il in 0..self.n_blk {
+            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+                self.time_stage("L0 total", &tlast);
+                tlast = std::time::Instant::now();
+            }
             // b_x → b_xn (레이어 입력 복사 — q 팩이 b_xn을 덮어쓰므로 매 층 갱신)
             self.pack_strided(self.b_x, 0, n, 1, self.b_xn, t)?;
             // LN1 → qkv
@@ -176,6 +193,10 @@ impl Vit {
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut k).as_mut(), unsafe { self.b_qkv.add(n * 4) })?;
                 eprintln!("[vit] L0 roped k0..3={:?}", &k);
             }
+            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+                self.time_stage("L: ln1+qkv+rope", &tlast);
+                tlast = std::time::Instant::now();
+            }
             // attention — q/k/v는 qkv 내 off 0/n/2n, 행 스트라이드 3n → q도 팩 (b_xn 재활용)
             {
                 self.pack_strided(self.b_qkv, 0, 3 * n, 1, self.b_xn, t)?;
@@ -214,6 +235,10 @@ impl Vit {
                 };
                 eprintln!("[vit] L0 attn sum={asum:.4} a0..7={:?}", &a);
             }
+            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+                self.time_stage("L: attention", &tlast);
+                tlast = std::time::Instant::now();
+            }
             // attn_out proj + 잔차
             let (ow, orows, oni) = self.wt(&format!("v.blk.{il}.attn_out.weight"))?;
             let ob = self.wt(&format!("v.blk.{il}.attn_out.bias"))?.0;
@@ -235,6 +260,9 @@ impl Vit {
             let db = self.wt(&format!("v.blk.{il}.ffn_down.bias"))?.0;
             self.gemm(self.b_mid, dw, db, dni, drows, self.b_proj, t)?;
             self.axpy(self.b_x, self.b_proj, t * n)?;
+        }
+        if std::env::var_os("LLM170_VIT_TIME").is_some() {
+            self.time_stage("L: ffn+residual (last)", &tlast);
         }
         // post_ln → merger: [t/4][4n] pack → mm0 gelu → mm2
         self.ln(self.b_x, "v.post_ln", t)?;
