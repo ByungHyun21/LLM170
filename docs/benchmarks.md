@@ -29,8 +29,8 @@ cross-verification against per-token):
 | Metric | llama.cpp target | LLM170 | Ratio |
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
-| Prefill pp64 | 142.8 t/s | **59.2 t/s** | 0.41x |
-| Prefill pp512 | ~230 t/s (3314-tok) | **43.3 t/s** | ~0.19x |
+| Prefill pp64 | 142.8 t/s | **63.6 t/s** | 0.44x |
+| Prefill pp512 | ~230 t/s (3314-tok) | **45.6 t/s** | ~0.20x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
