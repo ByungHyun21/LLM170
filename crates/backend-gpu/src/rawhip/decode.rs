@@ -992,7 +992,8 @@ gmark("attn", &mut marks);
                         let mut pp2 = part as *mut std::ffi::c_void;
                         let mut sg_a = sg as i32;
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
-                        self.ctx.launch3("qsa_flash_split4", t as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                        // q2 다중화 기본: ck/cv 1회 로드로 t쌍 공유
+                        self.ctx.launch3("qsa_flash_split4q2", ((t + 1) / 2) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
                         self.ctx.launch3("qsa_flash_merge", t as u32, n_head as u32, 1, 256, &mut margs)?;
                     } else {
