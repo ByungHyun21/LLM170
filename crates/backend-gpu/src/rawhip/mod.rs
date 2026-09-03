@@ -1053,3 +1053,17 @@ pub fn mm_bench() -> Result<String, String> {
     }
     Ok(format!("mm({kern_name}): {:.3}ms ({:.1}us/tok) mism {m2}", dt2 * 1e3, dt2 * 1e6 / t as f64))
 }
+
+/// 텐서 차원 출력 (디버그 보조)
+pub fn dims_of(path: &str, names: &[&str]) -> String {
+    let g = match llm170_gguf::GgufFile::open(std::path::Path::new(path)) {
+        Ok(g) => g, Err(e) => return e.to_string(),
+    };
+    let mut s = String::new();
+    for n in names {
+        if let Some(t) = g.tensors.iter().find(|t| t.name == *n) {
+            s += &format!("{n} ne={:?} ty={:?}\n", t.ne, t.ty);
+        }
+    }
+    s
+}

@@ -79,6 +79,11 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("dims") => {
+            let a: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+            print!("{}", llm170_backend_gpu::rawhip::dims_of(a[0], &a[1..]));
+            ExitCode::SUCCESS
+        }
         Some("mm-bench2") => match llm170_backend_gpu::rawhip::mm_bench() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

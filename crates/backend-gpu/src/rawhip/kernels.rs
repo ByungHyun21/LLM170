@@ -2078,8 +2078,13 @@ extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, cons
 extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, const float* v,
                                     const float* beta_ge, float* out, int d, int k_stride,
                                     int v_stride, int h_v, int h_k, float scale, int t) {
+    // u-분할: blockIdx.y = 서브블록(열 그룹), blockIdx.x = pair.
+    // 열 u 산술은 블록 분할과 무관 → 기존과 원소별 동일열 (비트무영향).
+    // k/q/v 슬라이스를 공유 적재해 전역 지연 제거.
+    __shared__ float ks[128], qs[128], vs[64];
     int pair = blockIdx.x;
-    int u = threadIdx.x;
+    int u = threadIdx.x + blockIdx.y * 64;           // blockIdx.y 0..1 × 64스레드
+    int tid = threadIdx.x;
     if (u >= d) return;
     int base_s = pair * d * d;
     for (int ti = 0; ti < t; ti++) {
@@ -2090,20 +2095,25 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
         int v0 = ti * v_stride + h * d;
         float beta = beta_ge[ti * h_v * 2 + pair * 2];
         float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        // k/q 슬라이스 협력 적재 (64스레드 × 2)
+        for (int e = tid; e < d; e += blockDim.x) { ks[e] = k[qk0 + e]; qs[e] = q[qk0 + e]; }
+        for (int e = tid; e < 64; e += blockDim.x) vs[e] = v[v0 + blockIdx.y * 64 + e];
+        __syncthreads();
         float sk = 0.0f;
         for (int kdim = 0; kdim < d; kdim++) {
             float sv = s[base_s + kdim * d + u] * g_exp;
             s[base_s + kdim * d + u] = sv;
-            sk += sv * k[qk0 + kdim];
+            sk += sv * ks[kdim];
         }
-        float delta = (v[v0 + u] - sk) * beta;
+        float delta = (vs[u - blockIdx.y * 64] - sk) * beta;
         for (int kdim = 0; kdim < d; kdim++) {
-            s[base_s + kdim * d + u] += k[qk0 + kdim] * delta;
+            s[base_s + kdim * d + u] += ks[kdim] * delta;
         }
         float o = 0.0f;
         for (int kdim = 0; kdim < d; kdim++)
-            o += (s[base_s + kdim * d + u] * q[qk0 + kdim]) * scale;
+            o += (s[base_s + kdim * d + u] * qs[kdim]) * scale;
         out[v0 + u] = o;
+        __syncthreads();
     }
 }
 

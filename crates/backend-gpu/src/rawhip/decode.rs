@@ -3,6 +3,7 @@
 //! 대체: 영속 버퍼 + 비동기 런치 + 마지막 1회 동기. 수치는 커널 검증
 //! 게이트(rawhip-check·미러)를 통과한 산술과 동일.
 
+use cubecl_hip_sys as hip;
 use super::RawCtx;
 use llm170_core::matmul::Weight;
 
@@ -683,6 +684,16 @@ impl DecodeState {
         let t = emb.len() / self.n_embd;
         debug_assert!(t >= 1 && t <= self.b_t_max);
         let n = self.n_embd;
+        let prof = std::env::var_os("LLM170_PP_PROF").is_some();
+        let t0w = std::time::Instant::now();
+        let mut marks: Vec<(String, hip::hipEvent_t)> = Vec::new();
+        let mut gmark = |lab: &str, marks: &mut Vec<(String, hip::hipEvent_t)>| {
+            if prof {
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                unsafe { hip::hipEventCreate(&mut ev); hip::hipEventRecord(ev, self.ctx.stream); }
+                marks.push((lab.to_string(), ev));
+            }
+        };
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
         let xq_sn = n / 4 + n / 32 + n / 16;
@@ -697,6 +708,7 @@ impl DecodeState {
             let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
             self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+gmark("norm", &mut marks);
             if self.is_recr[il] {
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
                 self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
@@ -710,6 +722,7 @@ impl DecodeState {
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
+gmark("gdn_mm", &mut marks);
                 // conv+ring 배치 (채널 블록 × t 내부 순차)
                 {
                     let mut qp = self.gqkv_t as *mut std::ffi::c_void;
@@ -722,6 +735,7 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
                     self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
                 }
+gmark("conv", &mut marks);
                 // split3 전체 배치 (요소별)
                 {
                     let mut sp = self.gconv_t as *mut std::ffi::c_void;
@@ -747,6 +761,7 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut ep), Self::p(&mut sc), Self::p(&mut d), Self::p(&mut ng)];
                     self.ctx.launch3("l2_rows2_scale", (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
                 }
+gmark("split+l2", &mut marks);
                 // beta/e^g 전체 배치 (요소별)
                 {
                     let mut bp = self.gb_t as *mut std::ffi::c_void;
@@ -759,6 +774,7 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
                     self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
                 }
+gmark("betag", &mut marks);
                 // AR 배치 (pair 블록 × t 내부 순차)
                 {
                     let mut sp3 = self.st_gdn[recr_idx][seq] as *mut std::ffi::c_void;
@@ -775,8 +791,9 @@ impl DecodeState {
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
-                    self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, 1, 1, 128, &mut args)?;
+                    self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, (self.d_state / 64) as u32, 1, 64, &mut args)?;
                 }
+gmark("ar", &mut marks);
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
                     self.ctx.sync()?;
                     let mut hq = vec![0f32; k_len * t];
@@ -789,6 +806,7 @@ impl DecodeState {
                     for &v in &ho { xo_ ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
                     eprintln!("#  G0dbg batch gq xor={xq_:016x} go xor={xo_:016x}");
                 }
+gmark("trace", &mut marks);
                 // norm_gated 전체 배치 (gy=t)
                 {
                     let mut op = self.go_t as *mut std::ffi::c_void;
@@ -801,12 +819,16 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
                     self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
+gmark("gdn", &mut marks);
+gmark("normg", &mut marks);
                 // out proj 배치
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
+gmark("outproj", &mut marks);
                 self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 recr_idx += 1;
-            } else {
+} else {
+gmark("attn", &mut marks);
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
                 self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
@@ -892,15 +914,19 @@ impl DecodeState {
                 self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
             }
-            self.axpy(self.xs_t, self.gout_t, n * t)?;
+self.axpy(self.xs_t, self.gout_t, n * t)?;
+            gmark("proj", &mut marks);
             // FFN 배치
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+gmark("ffn_quant", &mut marks);
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+gmark("ffn_gate", &mut marks);
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
             self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+gmark("ffn_up", &mut marks);
             {
                 let mut gp = self.fgate_t as *mut std::ffi::c_void;
                 let mut up = self.fup_t as *mut std::ffi::c_void;
@@ -909,10 +935,13 @@ impl DecodeState {
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
                 self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
             }
+gmark("ffn_silu", &mut marks);
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+gmark("ffn_quant2", &mut marks);
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
-            self.axpy(self.xs_t, self.fdown_t, n * t)?;
+self.axpy(self.xs_t, self.fdown_t, n * t)?;
+            gmark("ffn", &mut marks);
             if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n * t];
@@ -941,6 +970,25 @@ impl DecodeState {
         self.ctx.quant_q8(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
+        gmark("head", &mut marks);
+        if prof {
+            let wall = t0w.elapsed().as_secs_f64() * 1e3;
+            let _ = wall;
+            if let Some((_, last)) = marks.last() {
+                unsafe { hip::hipEventSynchronize(*last); }
+            }
+            let mut acc: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for w in marks.windows(2) {
+                let mut d = 0f32;
+                unsafe { hip::hipEventElapsedTime(&mut d, w[0].1, w[1].1); }
+                *acc.entry(w[1].0.clone()).or_insert(0.0) += d;
+            }
+            let mut v: Vec<_> = acc.into_iter().collect();
+            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let tot: f32 = v.iter().map(|x| x.1).sum();
+            eprintln!("pprof t={t} total_marks={tot:.1}ms");
+            for (k, ms) in v { eprintln!("  pprof[{k}] {ms:.1}ms"); }
+        }
         Ok(Vec::new()) // logits 상주 — d2h는 호출부 선택
     }
 
