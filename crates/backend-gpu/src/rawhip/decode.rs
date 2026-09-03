@@ -1113,7 +1113,13 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
     #[allow(clippy::too_many_arguments)]
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        if matches!(ty, 12 | 13 | 14 | 23) && t > 1 && std::env::var_os("LLM170_NO_TILE").is_none() {
+        // 홀수 타입 타일 (plans/04): CO3 + 타입별 env + t>=32에서만
+        let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
+            && std::env::var_os("LLM170_CO3_PATH").is_some() && t >= 32
+            && ((ty == 20 && std::env::var_os("LLM170_NLV4").is_some())
+                || (ty == 11 && std::env::var_os("LLM170_Q3KV4").is_some())
+                || (ty == 21 && std::env::var_os("LLM170_IQ3SV4").is_some()));
+        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
         }

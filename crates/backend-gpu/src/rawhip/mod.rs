@@ -93,6 +93,19 @@ impl RawCtx {
                     }
                 }
             }
+            // 홀수 타입 타일 모듈 (iq4_nl/q3_K/iq3_s v4 — plans/04)
+            if let Some(co3) = std::env::var_os("LLM170_CO3_PATH") {
+                let bytes = std::fs::read(&co3).map_err(|e| format!("CO3 읽기: {e}"))?;
+                let mut m4: hip::hipModule_t = std::ptr::null_mut();
+                ck(hip::hipModuleLoadData(&mut m4, bytes.as_ptr() as *const _), "CO3 ModuleLoadData")?;
+                for name in ["gemm_nl_v4", "gemm_q3k_v4", "gemm_iq3s_v4"] {
+                    let cname = CString::new(name).unwrap();
+                    let mut f: hip::hipFunction_t = std::ptr::null_mut();
+                    if hip::hipModuleGetFunction(&mut f, m4, cname.as_ptr()) == hip::hipError_t_hipSuccess {
+                        fns.insert(name, f);
+                    }
+                }
+            }
             if let Some(co) = std::env::var_os("LLM170_CO_PATH") {
                 let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
                 let mut m2: hip::hipModule_t = std::ptr::null_mut();
@@ -379,8 +392,6 @@ impl RawCtx {
         Ok(())
     }
 
-    /// 타일 배치 GEMV (q5_K/q4_K/q6_K/iq4_xs) — out [t][n_out].
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
@@ -393,6 +404,9 @@ impl RawCtx {
             12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
             23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_CO2_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            20 => if std::env::var_os("LLM170_NLV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
+            11 => if std::env::var_os("LLM170_Q3KV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
+            21 => if std::env::var_os("LLM170_IQ3SV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -410,7 +424,7 @@ impl RawCtx {
             (&mut op) as *mut _ as *mut std::ffi::c_void,
         ];
         let is_j128 = kern.ends_with("_j128");
-        if ty == 23 || (is_j128 && false) {
+        if ty == 23 || kern == "gemm_nl_v4" {
             args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
         }
         args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
@@ -418,7 +432,7 @@ impl RawCtx {
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
         let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128") || kern.ends_with("_v4");
-        let rows_per_block: usize = if kern.ends_with("_j128") { 128 } else if mm { 64 } else { 1 };
+        let rows_per_block: usize = if kern.ends_with("_j128") || kern.ends_with("_v4") { 128 } else if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
         let gx = nblocks.min(65535) as u32;
         let gz = nblocks.div_ceil(65535) as u32;
@@ -1137,6 +1151,12 @@ pub fn mm_bench() -> Result<String, String> {
         llm170_gguf::GgmlType::Iq4Xs => if std::env::var_os("LLM170_V4").is_some() { "gemm_xs_v4" }
             else if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
+        llm170_gguf::GgmlType::Iq4Nl => if std::env::var_os("LLM170_NLV4").is_some() { "gemm_nl_v4" }
+            else { return Err("mm-bench 미지원: iq4_nl 타일은 LLM170_NLV4 필요".into()) },
+        llm170_gguf::GgmlType::Q3K => if std::env::var_os("LLM170_Q3KV4").is_some() { "gemm_q3k_v4" }
+            else { return Err("mm-bench 미지원: q3_K 타일은 LLM170_Q3KV4 필요".into()) },
+        llm170_gguf::GgmlType::Iq3S => if std::env::var_os("LLM170_IQ3SV4").is_some() { "gemm_iq3s_v4" }
+            else { return Err("mm-bench 미지원: iq3_s 타일은 LLM170_IQ3SV4 필요".into()) },
         _ => "gemm_xs_mm",
     };
     let launch = |ctx: &RawCtx| -> Result<(), String> {
@@ -1153,7 +1173,7 @@ pub fn mm_bench() -> Result<String, String> {
             (&mut wp) as *mut _ as *mut std::ffi::c_void,
             (&mut op) as *mut _ as *mut std::ffi::c_void,
         ];
-        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" || kern_name == "gemm_xs_j128" || kern_name == "gemm_xs_v4" {
+        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" || kern_name == "gemm_xs_j128" || kern_name == "gemm_xs_v4" || kern_name == "gemm_nl_v4" {
             args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
         }
         args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
@@ -1187,6 +1207,9 @@ pub fn mm_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_mm(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_mm(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Iq4Nl => llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Q3K => llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Iq3S => llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q8_0 => {
                     let nblk = n_in as usize / 32;
                     let mut acc = 0.0f32;
