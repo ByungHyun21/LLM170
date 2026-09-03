@@ -84,7 +84,7 @@ impl RawCtx {
                 let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
                 let mut m2: hip::hipModule_t = std::ptr::null_mut();
                 ck(hip::hipModuleLoadData(&mut m2, bytes.as_ptr() as *const _), "CO ModuleLoadData")?;
-                for name in ["gemm_q5k_w32", "gemm_q5k_j128"] {
+                for name in ["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128", "gemm_xs_j128"] {
                     let cname = CString::new(name).unwrap();
                     let mut f: hip::hipFunction_t = std::ptr::null_mut();
                     if hip::hipModuleGetFunction(&mut f, m2, cname.as_ptr()) == hip::hipError_t_hipSuccess {
@@ -328,11 +328,13 @@ impl RawCtx {
     /// 타일 배치 GEMV (q5_K/q4_K/q6_K/iq4_xs) — out [t][n_out].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let j128 = std::env::var_os("LLM170_EXACT").is_none()
+            && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
         let kern = match ty {
-            13 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            13 => if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
 
@@ -349,7 +351,8 @@ impl RawCtx {
             (&mut wp) as *mut _ as *mut std::ffi::c_void,
             (&mut op) as *mut _ as *mut std::ffi::c_void,
         ];
-        if ty == 23 {
+        let is_j128 = kern.ends_with("_j128");
+        if ty == 23 || (is_j128 && false) {
             args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
         }
         args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
@@ -1022,11 +1025,11 @@ pub fn mm_bench() -> Result<String, String> {
     let out = ctx.alloc(n_out * 4 * t)?;
     let kern_name = match w.ty {
         llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
-            else if std::env::var_os("LLM170_W32").is_some() { "gemm_q5k_w32" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-        _ => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
+        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+        _ => if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
+            else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
     };
     let launch = |ctx: &RawCtx| -> Result<(), String> {
         let mut xp = xq as *mut std::ffi::c_void;
@@ -1042,14 +1045,16 @@ pub fn mm_bench() -> Result<String, String> {
             (&mut wp) as *mut _ as *mut std::ffi::c_void,
             (&mut op) as *mut _ as *mut std::ffi::c_void,
         ];
-        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" {
+        if kern_name == "gemm_xs_mm" || kern_name == "gemm_xs_wm" || kern_name == "gemm_xs_j128" {
             args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
         }
         args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let gx = n_out.div_ceil(if kern_name == "gemm_q5k_w32" || kern_name == "gemm_q5k_j128" { 128 } else { 64 }).min(65535) as u32;
+        let rpb = if kern_name.ends_with("_j128") { 128 } else { 64 };
+        let gx = n_out.div_ceil(rpb).min(65535) as u32;
+        let gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
         let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
         ctx.launch3(kern_name, gx, 1, gz, 256, &mut args)
     };

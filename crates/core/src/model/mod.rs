@@ -665,7 +665,8 @@ impl Engine {
                     cache.push(row);
                 }
                 // 청크 ≤ 64: 소유권형 MMQ (shared ~40KB, acc[16] 레지스터)
-                for ch in cache.chunks(64) {
+                let ch_sz = if std::env::var_os("LLM170_CO_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() { 128 } else { 64 };
+                for ch in cache.chunks(ch_sz) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?;
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {

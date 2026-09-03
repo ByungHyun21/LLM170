@@ -170,7 +170,7 @@ impl DecodeState {
         let max_rows = (n / 32).max(n_ff.max(g6)).max(hp.n_head + hp.n_kv).max(1);
         let bs = |nb: usize| Self::a(&ctx, nb).unwrap();
         // 배치 아레나 (t_max=64)
-        let t_max = 64usize;
+        let t_max = 128usize;
         let (n_kv, hd) = (hp.n_kv, hp.head_dim);
         let xq_sn = n / 4 + n / 32 + n / 16;
         let xq_sf = n_ff / 4 + n_ff / 32 + n_ff / 16;
