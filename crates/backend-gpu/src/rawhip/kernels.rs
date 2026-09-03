@@ -2510,27 +2510,35 @@ extern "C" __global__ void gdn_beta_g(const float* b, const float* a, const floa
 // norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
 extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
                                            float* out, float eps, int d, int n_h) {
+    // 워프(32레인)당 1행 — 레인 u가 세그먼트 u의 순차 f32 부분합(기존과 동일
+    // 경계), f64 결합은 전 레인이 p0..p31 동일 순서로 수행 (미러 산술열 보존).
+    // 초과 세그먼트 부분합 0 가산은 IEEE 항등 — 비트무영향.
     int row = blockIdx.y * n_h + blockIdx.x;
     int u = threadIdx.x;
-    if (u != 0 || blockIdx.x >= n_h) return;
+    if (blockIdx.x >= n_h) return;
     int xb = row * d;
     int wb = blockIdx.x * d;
-    double sum = 0.0;
     int chunk = (d + 31) >> 5;
-    for (int sg = 0; sg < 32; sg++) {
-        int lo = sg * chunk;
-        if (lo >= d) break;
-        int hi = min(lo + chunk, d);
-        float part = 0.0f;  // f32 세그먼트 — 미러와 쌍
-        for (int i = lo; i < hi; i++) {
-            float dv = o[xb + i];
-            part += dv * dv;
+    float part = 0.0f;
+    {
+        int lo = u * chunk;
+        if (lo < d) {
+            int hi = min(lo + chunk, d);
+            for (int i = lo; i < hi; i++) {
+                float dv = o[xb + i];
+                part += dv * dv;
+            }
         }
-        sum += (double)part;
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
+        sum += (double)pj;
     }
     float scale32 = (float)sqrt(sum / (double)d + (double)eps);
     float inv = 1.0f / scale32;
-    for (int i = 0; i < d; i++) {
+    for (int i = u; i < d; i += 32) {
         float nrm = o[xb + i] * inv * w[wb + i];
         float zz = z[xb + i];
         out[xb + i] = nrm * (zz / (1.0f + exp_cr(-zz)));
