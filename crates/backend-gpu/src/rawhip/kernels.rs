@@ -2594,12 +2594,13 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
             sk += sv * k[qk0 + kdim];
         }
         float delta = (v[v0 + u] - sk) * beta;
-        for (int kdim = 0; kdim < d; kdim++) {
-            ss[kdim * 64 + lu] += k[qk0 + kdim] * delta;
-        }
+        // 업데이트+출력 융합 — 원소 순서·식 동일 (비트무영향)
         float o = 0.0f;
-        for (int kdim = 0; kdim < d; kdim++)
-            o += (ss[kdim * 64 + lu] * q[qk0 + kdim]) * scale;
+        for (int kdim = 0; kdim < d; kdim++) {
+            float sv = ss[kdim * 64 + lu] + k[qk0 + kdim] * delta;
+            ss[kdim * 64 + lu] = sv;
+            o += (sv * q[qk0 + kdim]) * scale;
+        }
         out[v0 + u] = o;
         __syncthreads();
     }
