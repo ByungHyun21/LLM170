@@ -636,10 +636,11 @@ extern "C" __global__ void gemm_q5k_mm(const unsigned* xq, const unsigned* w,
 extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
         const unsigned* xq, const unsigned* w, float* out,
         int n_in, int n_out, int xq_w, int t) {
-    __shared__ half A16[2][4][16][36];
-    __shared__ half B16[2][64][36];
-    __shared__ float Ctmp[64][65];
-    int bid = blockIdx.x;
+    // 수동 공유 레이아웃: A16 9216B + B16 9216B, CtmpF는 전체에 별칭(종결부)
+    __shared__ char smem[18432];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
+        int bid = blockIdx.x;
     int tid = threadIdx.x;
     int wid = tid >> 6;
     int lane = tid & 63;
@@ -737,23 +738,25 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
         }
         __syncthreads();
     }
+    // Ctmp는 A16+B16(18.4KB)에 별칭 — 스테이징 데이터는 루프 후 사멸
+    float* CtmpF = (float*)smem;
     #pragma unroll
     for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&Ctmp[row0][tt * 16], fc[tt], 65, mem_row_major);
+        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
         if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = Ctmp[r][tok];
+            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
     }
 }
 
 extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
         const unsigned* xq, const unsigned* w, float* out,
         int n_in, int n_out, int xq_w, int t) {
-    __shared__ half A16[2][4][16][36];
-    __shared__ half B16[2][64][36];
-    __shared__ float Ctmp[64][65];
+    __shared__ char smem[18432];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int wid = tid >> 6;
@@ -848,23 +851,24 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
         }
         __syncthreads();
     }
+    float* CtmpF = (float*)smem;
     #pragma unroll
     for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&Ctmp[row0][tt * 16], fc[tt], 65, mem_row_major);
+        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
         if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = Ctmp[r][tok];
+            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
     }
 }
 
 extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
         const unsigned* xq, const unsigned* w, float* out,
         int n_in, int n_out, int xq_w, int t) {
-    __shared__ half A16[2][4][16][36];
-    __shared__ half B16[2][64][36];
-    __shared__ float Ctmp[64][65];
+    __shared__ char smem[18432];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int wid = tid >> 6;
@@ -970,25 +974,26 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q6k_wm(
         }
         __syncthreads();
     }
+    float* CtmpF = (float*)smem;
     #pragma unroll
     for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&Ctmp[row0][tt * 16], fc[tt], 65, mem_row_major);
+        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
         if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = Ctmp[r][tok];
+            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
     }
 }
 
 extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
         const unsigned* xq, const unsigned* w, float* out, const unsigned* ktab2,
         int n_in, int n_out, int xq_w, int t) {
-    __shared__ half A16[2][4][16][36];
-    __shared__ unsigned kt_s[256];
+    __shared__ char smem[19456];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    unsigned* kt_s = (unsigned*)(smem + 18432);
     for (int i2 = threadIdx.x; i2 < 256; i2 += 256) kt_s[i2] = ktab2[i2];
-    __shared__ half B16[2][64][36];
-    __shared__ float Ctmp[64][65];
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
     int bid = blockIdx.x;
     int tid = threadIdx.x;
     int wid = tid >> 6;
@@ -1075,14 +1080,15 @@ extern "C" __global__ void __launch_bounds__(256) gemm_xs_wm(
         }
         __syncthreads();
     }
+    float* CtmpF = (float*)smem;
     #pragma unroll
     for (int tt = 0; tt < 4; tt++)
-        store_matrix_sync(&Ctmp[row0][tt * 16], fc[tt], 65, mem_row_major);
+        store_matrix_sync(&CtmpF[row0 * 65 + tt * 16], fc[tt], 65, mem_row_major);
     __syncthreads();
     for (int u = tid; u < 64 * 64; u += 256) {
         int r = u >> 6, tok = u & 63;
         if (r < nrow && tok < t)
-            out[(size_t)tok * n_out + i0 + r] = Ctmp[r][tok];
+            out[(size_t)tok * n_out + i0 + r] = CtmpF[r * 65 + tok];
     }
 }
 
