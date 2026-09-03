@@ -84,11 +84,12 @@ impl RawCtx {
                 let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
                 let mut m2: hip::hipModule_t = std::ptr::null_mut();
                 ck(hip::hipModuleLoadData(&mut m2, bytes.as_ptr() as *const _), "CO ModuleLoadData")?;
-                for name in ["gemm_q5k_w32"] {
+                for name in ["gemm_q5k_w32", "gemm_q5k_j128"] {
                     let cname = CString::new(name).unwrap();
                     let mut f: hip::hipFunction_t = std::ptr::null_mut();
-                    ck(hip::hipModuleGetFunction(&mut f, m2, cname.as_ptr()), "CO GetFunction")?;
-                    fns.insert(name, f);
+                    if hip::hipModuleGetFunction(&mut f, m2, cname.as_ptr()) == hip::hipError_t_hipSuccess {
+                        fns.insert(name, f);
+                    }
                 }
             }
 
@@ -1020,7 +1021,8 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
     let kern_name = match w.ty {
-        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_W32").is_some() { "gemm_q5k_w32" }
+        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
+            else if std::env::var_os("LLM170_W32").is_some() { "gemm_q5k_w32" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
         llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
         llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
@@ -1047,7 +1049,7 @@ pub fn mm_bench() -> Result<String, String> {
         args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
-        let gx = n_out.div_ceil(if kern_name == "gemm_q5k_w32" { 128 } else { 64 }).min(65535) as u32;
+        let gx = n_out.div_ceil(if kern_name == "gemm_q5k_w32" || kern_name == "gemm_q5k_j128" { 128 } else { 64 }).min(65535) as u32;
         let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
         ctx.launch3(kern_name, gx, 1, gz, 256, &mut args)
     };
@@ -1074,7 +1076,7 @@ pub fn mm_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
                 _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
             };
-            if kern_name.ends_with("_wm") || kern_name.ends_with("_w32") {
+            if kern_name.ends_with("_wm") || kern_name.ends_with("_w32") || kern_name.ends_with("_j128") {
                 let g = o2[ti * n_out + oo];
                 let denom = c2.abs().max(1.0);
                 let rel = (g - c2).abs() / denom;
