@@ -52,8 +52,8 @@ cross-verification against per-token):
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
 | Prefill pp64 (chunk 64) | 142.8 t/s | **118.0 t/s** (81.8 exact mode) | 0.83x (0.57x) |
-| Prefill pp128 (… + vectorized staging q5k) | — | **157.7 t/s** (fresh-ref verified) | 0.54x vs llama-bench 294 |
-| Prefill pp512 (long context) | — | **135.7 t/s** | 0.38x vs llama-bench 358 |
+| Prefill pp128 (… + vectorized staging q5k+q4k) | — | **159.7 t/s** (fresh-ref verified) | 0.54x vs llama-bench 294 |
+| Prefill pp512 (long context) | — | **136.7 t/s** | 0.38x vs llama-bench 358 |
 | Prefill pp512 | ~230 t/s (server-bench) | **~68 t/s** | ~0.30x |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
