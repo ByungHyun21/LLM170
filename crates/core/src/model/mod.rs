@@ -1082,6 +1082,20 @@ impl Engine {
         let mut h_all: Vec<f32> = Vec::new();
         rd.verify_batch_ms(seqs, &group_pos, &group_starts, &rows, &mut am, &mut h_all)
             .map_err(ModelError::Accel)?;
+        if std::env::var_os("LLM170_MS_AB").is_some() {
+            // A/B: 각 그룹 행을 단일-verify로 재계산해 병합 결과와 비교
+            for si in 0..n_seq {
+                let g0 = group_starts[si];
+                let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { rows.len() / n_e };
+                let sub: Vec<f32> = rows[g0 * n_e..g1 * n_e].to_vec();
+                let mut am2: Vec<u32> = Vec::new();
+                let mut h2: Vec<f32> = Vec::new();
+                rd.raw_verify(seqs[si], group_pos[si], &sub, &mut am2, &mut h2)
+                    .map_err(ModelError::Accel)?;
+                eprintln!("[AB] seq={} merged={:?} single={:?}", seqs[si],
+                    &am[g0..g1], &am2);
+            }
+        }
 
         if std::env::var_os("LLM170_SPEC_DBG").is_some() {
             eprintln!("  [msV] groups={group_starts:?} am={am:?} drafts={all_drafts:?}");
