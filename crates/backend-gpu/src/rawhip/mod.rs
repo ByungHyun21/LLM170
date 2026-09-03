@@ -386,7 +386,7 @@ impl RawCtx {
             && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
         let kern = match ty {
             13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
             23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
