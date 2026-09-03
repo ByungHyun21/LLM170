@@ -48,7 +48,8 @@ impl RawCtx {
             // FMA 수축 차단 — CPU 비트계약 (a+=b*c 축약이 비트 불일치,
             // 2026-09-03 AR xor RCA)
             let o4 = CString::new("-ffp-contract=off").unwrap();
-            let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr()];
+            let o5 = CString::new("-I/opt/rocm/include").unwrap();
+            let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr(), o5.as_ptr()];
             let rs = hip::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_mut_ptr());
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 let mut sz = 0usize;
@@ -311,7 +312,7 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let kern = match ty {
-            13 => "gemm_q5k_mm",
+            13 => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => "gemm_q4k_mm",
             14 => "gemm_q6k_mm",
             23 => "gemm_xs_mm",
@@ -996,7 +997,7 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
     let kern_name = match w.ty {
-        llm170_gguf::GgmlType::Q5K => "gemm_q5k_mm",
+        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_WMMA").is_some() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
         llm170_gguf::GgmlType::Q4K => "gemm_q4k_mm",
         llm170_gguf::GgmlType::Q6K => "gemm_q6k_mm",
         _ => "gemm_xs_mm",
@@ -1039,6 +1040,7 @@ pub fn mm_bench() -> Result<String, String> {
     let bsize = w.ty.type_size() as usize;
     let rb = (n_in / blck) * bsize;
     let mut m2 = 0usize;
+    let mut maxrel = 0f32;
     for ti in 0..t {
         for oo in 0..n_out.min(256) {
             let row = &w.data[oo * rb..];
@@ -1048,10 +1050,16 @@ pub fn mm_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_mm(row, n_in as u64, &q8s[ti]),
                 _ => llm170_core::quant::dot_row_w4a8_iq4xs_mm(row, n_in as u64, &q8s[ti]),
             };
-            if c2.to_bits() != o2[ti * n_out + oo].to_bits() { m2 += 1; }
+            if kern_name.ends_with("_wm") {
+                let g = o2[ti * n_out + oo];
+                let denom = c2.abs().max(1.0);
+                let rel = (g - c2).abs() / denom;
+                if rel > maxrel { maxrel = rel; }
+                if rel > 5e-3 { m2 += 1; }
+            } else if c2.to_bits() != o2[ti * n_out + oo].to_bits() { m2 += 1; }
         }
     }
-    Ok(format!("mm({kern_name}): {:.3}ms ({:.1}us/tok) mism {m2}", dt2 * 1e3, dt2 * 1e6 / t as f64))
+    Ok(format!("mm({kern_name}): {:.3}ms ({:.1}us/tok) mism {m2} maxrel {maxrel:.2e}", dt2 * 1e3, dt2 * 1e6 / t as f64))
 }
 
 /// 텐서 차원 출력 (디버그 보조)
