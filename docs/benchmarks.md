@@ -30,7 +30,7 @@ cross-verification against per-token):
 |---|---|---|---|
 | Decode tg24, t=1 | 10.4 t/s | **10.0-10.5 t/s** (GPU argmax, logits resident) | 0.97-1.01x |
 | Prefill pp64 | 142.8 t/s | **74.4 t/s** (123.6 fast mode) | 0.52x (0.86x) |
-| Prefill pp512 | ~230 t/s (3314-tok) | **50.2 t/s** (66.8 fast mode) | ~0.22x (0.29x) |
+| Prefill pp512 | ~230 t/s (3314-tok) | **54.2 t/s** (74.3 fast mode) | ~0.24x (0.32x) |
 
 Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
 quantized path, and raw-HIP GPU path produce **identical 16-token greedy
