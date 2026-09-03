@@ -324,7 +324,103 @@ impl Clip {
         out
     }
 
-    /// 이미지 → 비전 토큰 임베딩 [n_tok][5120].
+    
+    pub fn n_ff(&self) -> usize {
+        self.n_ff
+    }
+
+    /// GPU 실행기용: conv+patch_bias+pos+merge-major+좌표 (CPU 저렴부) — 산출 토큰 평탄화.
+    pub fn prep_tokens(
+        &mut self,
+        img: &[f32],
+        w: usize,
+        h: usize,
+    ) -> Result<(Vec<f32>, Vec<i32>, usize, usize), String> {
+        let (ps, n_embd) = (self.patch_size, self.n_embd);
+        assert_eq!(w % (ps * 2), 0);
+        assert_eq!(h % (ps * 2), 0);
+        let (pw, ph) = (w / ps, h / ps);
+        let n_pos = pw * ph;
+        let conv_w = self.tensor_f32("v.patch_embd.weight")?;
+        let patch_bias = self.tensor_f32("v.patch_embd.bias")?;
+        let pos = self.tensor_f32("v.position_embd.weight")?;
+        let pos_grid = (pos.len() / n_embd) as f64;
+        let pos_side = pos_grid.sqrt() as usize;
+        let pos_raster = if pos_side * pos_side == n_pos {
+            pos.clone()
+        } else {
+            crate::clip_preproc::pos_resize_bilinear(&pos, pos_side, pw, ph, n_embd)
+        };
+        let kstride = ps * ps;
+        let cstride = ps * ps * 3;
+        let mut toks = vec![0f32; n_pos * n_embd];
+        let mut yx = vec![0i32; n_pos * 2];
+        let mut p = 0usize;
+        for y0 in (0..ph).step_by(2) {
+            for x0 in (0..pw).step_by(2) {
+                for dx in 0..2 {
+                    for dy in 0..2 {
+                        let (py, px) = ((y0 + dy) * ps, (x0 + dx) * ps);
+                        let tb = &mut toks[p * n_embd..(p + 1) * n_embd];
+                        for cout in 0..n_embd {
+                            let mut sm = patch_bias[cout] as f64;
+                            for ky in 0..ps {
+                                for kx in 0..ps {
+                                    let wbase = cout * cstride + cin_base(ky, kx, ps);
+                                    let ibase = ((py + ky) * w + (px + kx)) * 3;
+                                    for cin in 0..3 {
+                                        sm += f64::from(img[ibase + cin])
+                                            * f64::from(conv_w[wbase + cin * kstride]);
+                                    }
+                                }
+                            }
+                            tb[cout] = sm as f32;
+                        }
+                        let raster = (y0 + dy) * pw + (x0 + dx);
+                        for i in 0..n_embd {
+                            tb[i] += pos_raster[raster * n_embd + i];
+                        }
+                        yx[p * 2] = (y0 + dy) as i32;
+                        yx[p * 2 + 1] = (x0 + dx) as i32;
+                        p += 1;
+                    }
+                }
+            }
+        }
+        Ok((toks, yx, pw, ph))
+    }
+
+    /// GPU 실행기용: ViT 전 가중치 f32 (이름, 데이터, rows, ni) — ne 준거 (추측 금지).
+    pub fn vit_weights(&mut self) -> Result<Vec<(String, Vec<f32>, usize, usize)>, String> {
+        let mut names: Vec<String> = Vec::new();
+        for il in 0..self.n_blk {
+            for k in [
+                "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "attn_out.bias",
+                "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias",
+                "ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+            ] {
+                names.push(format!("v.blk.{il}.{k}"));
+            }
+        }
+        for k in ["v.post_ln.weight", "v.post_ln.bias", "mm.0.weight", "mm.0.bias", "mm.2.weight", "mm.2.bias"] {
+            names.push(k.to_string());
+        }
+        let mut out = Vec::new();
+        for n in names {
+            let v = self.tensor_f32(&n)?;
+            let info = self
+                .tensors
+                .get(&n)
+                .ok_or_else(|| format!("tensor info 없음: {n}"))?;
+            // GGUF ne=(ni, rows) — ne[0]=행 길이
+            let (ni, rows) = (info.ne[0] as usize, info.ne[1] as usize);
+            assert_eq!(ni * rows, v.len(), "vit weights: {n} 치수 불일치");
+            out.push((n, v, rows, ni));
+        }
+        Ok(out)
+    }
+
+/// 이미지 → 비전 토큰 임베딩 [n_tok][5120].
     /// img: RGB f32 [h][w][3] 정규화 완료 (mean/std 적용된 것).
     pub fn encode(&mut self, img: &[f32], w: usize, h: usize) -> Result<Vec<Vec<f32>>, String> {
         let (ps, n_embd, n_head, d_head) =
@@ -428,6 +524,12 @@ impl Clip {
             }
             let mut qkv = vec![vec![0f32; 3 * n_embd]; n_pos];
             Self::mm_bias_batch(&xn, &qkvw, &qkvb, qkv_ni, &mut qkv);
+            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+                let ssum: f64 = xn[0].iter().map(|&x| x as f64).sum::<f64>()
+                    + xn.iter().skip(1).map(|r| r.iter().map(|&x| x as f64).sum::<f64>()).sum::<f64>();
+                eprintln!("[cpu] L0 ln1 sum={ssum:.4} x0={:.6} x1={:.6}", xn[0][0], xn[0][1]);
+                eprintln!("[cpu] L0 qkv q0..7={:?}", &qkv[0][..8]);
+            }
 
             // 비전 rope (q, k) — 토큰별 (y, x)
             let mut coords = vec![(0u32, 0u32); n_pos];
@@ -445,6 +547,9 @@ impl Clip {
                 }
             }
             for t in 0..n_pos {
+                if il == 0 && t == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+                    eprintln!("[cpu] L0 pre-rope q0..7={:?}", &qkv[0][..8]);
+                }
                 let (py, px) = coords[t];
                 for part in 0..2 {
                     // 0=q, 1=k — 헤드 순회
@@ -465,6 +570,10 @@ impl Clip {
                 }
             }
 
+            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+                eprintln!("[cpu] L0 roped q0..7={:?}", &qkv[0][..8]);
+                eprintln!("[cpu] L0 roped k0..3={:?}", &qkv[0][n_embd..n_embd + 4]);
+            }
             // MHA (전체 attention, 무마스크)
             let kq_scale = 1.0f32 / (d_head as f32).sqrt();
             let nth = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(32);
@@ -490,6 +599,10 @@ impl Clip {
                         off += n;
                     }
                 });
+            }
+            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+                let asum: f64 = attn_out.iter().flatten().map(|&x| x as f64).sum();
+                eprintln!("[cpu] L0 attn sum={asum:.4} a0..7={:?}", &attn_out[0][..8]);
             }
             // attn_out proj + 잔차 (배치)
             let mut aproj = vec![vec![0f32; n_embd]; n_pos];

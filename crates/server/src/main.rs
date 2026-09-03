@@ -1209,11 +1209,55 @@ fn cmd_vl(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let vis = match clip.encode(&px, tw, th) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("clip encode: {e}");
-            return ExitCode::FAILURE;
+    let vis = if backend != "cpu" {
+        // GPU 경로 (plans/17): CPU conv+pos → ViT 27블록·merger GPU
+        let weights = match clip.vit_weights() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("vit weights: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let (n_embd, n_head, n_blk, eps) = (1152usize, 16usize, 27usize, 1e-6f32);
+        let n_ff = clip.n_ff();
+        let tmax = (tw / 16) * (th / 16);
+        eprintln!("# vit: tw={tw} th={th} tmax={tmax}");
+        let v = (|| -> Result<Vec<Vec<f32>>, String> {
+            let tw0 = std::time::Instant::now();
+            let ctx = std::sync::Arc::new(llm170_backend_gpu::rawhip::RawCtx::new()?);
+            let vit = llm170_backend_gpu::rawhip::vit::Vit::new(
+                ctx, weights, n_embd, n_head, n_ff, n_blk, eps, 16, tmax,
+            )?;
+            eprintln!("# vit weights+upload {:.1}s", tw0.elapsed().as_secs_f64());
+            let tp0 = std::time::Instant::now();
+            let (toks, yx, pw, ph) = clip.prep_tokens(&px, tw, th)?;
+            eprintln!("# vit prep(conv) {:.1}s", tp0.elapsed().as_secs_f64());
+            let tf0 = std::time::Instant::now();
+            let flat = vit.forward(&toks, &yx, pw, ph)?;
+            eprintln!("# vit forward {:.1}s", tf0.elapsed().as_secs_f64());
+            let n_out = flat.len() / 5120;
+            Ok((0..n_out).map(|i| flat[i * 5120..(i + 1) * 5120].to_vec()).collect())
+        })();
+        match v {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("vit gpu: {e} — CPU 폴백");
+                match clip.encode(&px, tw, th) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("clip encode: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+    } else {
+        match clip.encode(&px, tw, th) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("clip encode: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
     eprintln!("# clip: {} tokens in {:.1}s", vis.len(), t0.elapsed().as_secs_f64());

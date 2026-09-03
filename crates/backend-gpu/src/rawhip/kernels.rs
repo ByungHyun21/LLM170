@@ -3371,7 +3371,142 @@ extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, fl
     out[t * n_head * hd + h * hd + tid] = a * (1.0f / ssum) * g;
 }
 
+// ─── CLIP ViT (plans/17) — f32 가중 GEMM + ViT 전용 EW ───
+
+// f32 GEMM 타일: 256스레드 = 32토큰 × 8행 (1D 수동 분해). 그리드 gx=t/32, gy=n_out/8.
+// 4와이드 전개 ILP — 실측 최적 (min-traffic 1토큰판보다 빠름: 지연 은닉 우위).
+extern "C" __global__ void gemm_f32t(const float* x, const float* w, const float* b,
+                                     float* out, int ni, int n_out, int t) {
+    int tx = threadIdx.x & 31;
+    int ty = threadIdx.x >> 5;
+    int ti = blockIdx.x * 32 + tx;
+    int o = (blockIdx.y + blockIdx.z * gridDim.y) * 8 + ty;
+    if (ti >= t || o >= n_out) return;
+    const float* xr = x + (size_t)ti * ni;
+    const float* wr = w + (size_t)o * ni;
+    float acc = b ? b[o] : 0.0f;
+    int i = 0;
+    for (; i + 4 <= ni; i += 4) {
+        acc += xr[i] * wr[i] + xr[i+1] * wr[i+1] + xr[i+2] * wr[i+2] + xr[i+3] * wr[i+3];
+    }
+    for (; i < ni; i++) acc += xr[i] * wr[i];
+    out[(size_t)ti * n_out + o] = acc;
+}
+
+// LayerNorm(w, b) [t][n] — in-place.
+extern "C" __global__ void layernorm_t(float* x, const float* w, const float* b,
+                                       int n, float eps, int t) {
+    int ti = blockIdx.x;
+    if (ti >= t) return;
+    float* r = x + (size_t)ti * n;
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += r[i];
+    mean /= n;
+    float var = 0.0f;
+    for (int i = 0; i < n; i++) { float d = r[i] - mean; var += d * d; }
+    var /= n;
+    float inv = rsqrtf(var + eps);
+    for (int i = 0; i < n; i++) r[i] = (r[i] - mean) * inv * w[i] + b[i];
+}
+
+// 비전 M-RoPE — q/k [t][n_head][72]: 쌍 (i, i+36), i<18 → y, ≥18 → x.
+extern "C" __global__ void vit_rope(float* qk, const int* yx, int n_head, int d_head,
+                                    int t, int part_stride) {
+    int ti = blockIdx.x;
+    int h = blockIdx.y;
+    if (ti >= t || h >= n_head) return;
+    int half = d_head / 2;
+    int base = ti * part_stride + h * d_head;
+    int py = yx[ti * 2];
+    int px = yx[ti * 2 + 1];
+    for (int i = 0; i < half; i++) {
+        int sec = i < half / 2 ? py : px;
+        int local = i < half / 2 ? i : i - half / 2;
+        // theta = sec · 10000^(-2/half)^local — cos/sin은 호스트 사전계산 테이블 재사용
+        float theta = sec * __powf(10000.0f, -2.0f / half * local);
+        float c = cosf(theta), s2 = sinf(theta);
+        float x0 = qk[base + i];
+        float x1 = qk[base + i + half];
+        qk[base + i] = x0 * c - x1 * s2;
+        qk[base + i + half] = x0 * s2 + x1 * c;
+    }
+}
+
+// ViT flash attention — 무게이트 전체 attention. q [t][nh·d], k/v [t][nh·d].
+extern "C" __global__ void flash_vit(const float* q, const float* k, const float* v,
+                                     float* out, int n_past, int n_head, int d_head, float scale) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= gridDim.x || h >= n_head) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool active = tid < d_head;
+    __shared__ float qf[128];
+    __shared__ float rs[4][8];
+    int qb = t * n_head * d_head + h * d_head;
+    if (active) qf[tid] = q[qb + tid];
+    __syncthreads();
+    float m = -3.4028235e38f;
+    float sm = 0.0f;
+    float acc = 0.0f;
+    for (int p = 0; p < n_past; p++) {
+        int kb = p * n_head * d_head + h * d_head;
+        float x = active ? qf[tid] * k[kb + tid] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            x += __shfl_down_sync(0xffffffffffffffffull, x, off);
+        if (lane == 0) rs[wid & 3][wid >> 2] = x;
+        __syncthreads();
+        float d;
+        if (tid == 0) {
+            float y2 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) y2 += rs[j & 3][j >> 2];
+            rs[0][0] = y2;
+        }
+        __syncthreads();
+        d = rs[0][0] * scale;
+        float m_new = fmaxf(m, d);
+        float e_m = __expf(m - m_new);
+        float e_d = __expf(d - m_new);
+        sm = sm * e_m + e_d;
+        float vv = active ? v[kb + tid] : 0.0f;
+        acc = acc * e_m + e_d * vv;
+        m = m_new;
+    }
+    if (!active) return;
+    out[t * n_head * d_head + h * d_head + tid] = acc * (1.0f / sm);
+}
+
+// GELU (tanh 근사) [t][n] — in-place.
+extern "C" __global__ void gelu_t(float* x, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float xx = x[j];
+    const float A = 0.044715f;
+    const float SQ2OPI = 0.7978845608f;
+    x[j] = 0.5f * xx * (1.0f + tanhf(SQ2OPI * xx * (1.0f + A * xx * xx)));
+}
+
+// y += x (요소별)
+extern "C" __global__ void add_f32(float* y, const float* x, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    y[j] += x[j];
+}
+
+// src [t][stride] + off → dst [t][n] 팩
+extern "C" __global__ void pack_strided(const float* src, float* dst, int n, int stride, int t) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (j >= n || ti >= t) return;
+    dst[(size_t)ti * n + j] = src[(size_t)ti * stride + j];
+}
+
 "#;
+
+
 
 
 pub const NAMES: &[&str] = &[
@@ -3379,7 +3514,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
