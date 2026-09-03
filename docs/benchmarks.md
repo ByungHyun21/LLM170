@@ -240,5 +240,9 @@ rawvk smoke suite passes (coopmat probe, axpy bit-exact, 25.5 GB/s) — the Vulk
 path is healthy. Full-model Vulkan runs are currently blocked by a kernel TTM leak:
 18.6 GB of GTT stranded by crashed processes (zero holder PIDs), leaving 11 GB available
 against the 16.3 GB weight pin requirement, so the first queue submit fails with
-ErrorDeviceLost. The reference llama.cpp Vulkan build fails identically. A reboot clears
-the stranded GTT; re-verification and the Vulkan MTP port follow.
+ErrorDeviceLost. The reference llama.cpp Vulkan build fails identically. Kernel log confirms:
+`amdgpu_cs_ioctl: Not enough memory for command submission` — GTT total 16.6 GB
+with 18.6 GB stranded (counter over total, zero holder processes; lost-device
+buffer releases never ran). Full-model Vulkan ran fine earlier in this same
+boot (tg 10.4, pp 128), so the leak is the sole blocker. A reboot clears the
+stranded GTT; re-verification and the Vulkan MTP port follow.
