@@ -29,6 +29,11 @@ target: pp64 fast 0.98x, tg parity. The session's internal gains
 
 ## Vision (mmproj) — HIP (2026-09-05)
 
+Photographic test (llama.cpp's own test-1.jpeg, NYT front page):
+ours reads "The front page of The New York Times newspaper, dated Monday, July 21, 1969,
+features the historic headline \"MEN WALK ON MOON\"" — fine text (date, headline) read
+correctly; llama.cpp reference describes the same image (newspaper, NYT masthead).
+
 CLIP ViT 27 blocks on GPU (f32 weights resident, tiled GEMM + flash attention v2):
 vision encoding 47s (CPU) → **2.4-3.1s forward** (+7.1s one-time weight upload per process).
 Output verified identical to CPU path and semantically matching llama.cpp on test images.
