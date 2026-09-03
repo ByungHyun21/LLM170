@@ -519,6 +519,8 @@ impl DecodeState {
                 self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
+                let flash1 = std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256;
+                if !flash1 {
                 {
                     let n_past = pos + 1;
                     let mut qp = self.aq as *mut std::ffi::c_void;
@@ -555,6 +557,24 @@ impl DecodeState {
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                     self.ctx.launch3("qsa_mix2", gx, n_head as u32, 1, 64, &mut args)?;
                     if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
+                }
+                }
+                // t=1 fused flash (score/mix2 대체)
+                if std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256 {
+                    let mut qp = self.aq as *mut std::ffi::c_void;
+                    let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut mp = mask as *mut std::ffi::c_void;
+                    let mut op = self.aout as *mut std::ffi::c_void;
+                    let mut np_ = (pos + 1) as i32;
+                    let mut nh = n_head as i32;
+                    let mut nk = n_kv as i32;
+                    let mut h = hd as i32;
+                    let mut tl = 1i32;
+                    let mut ss = self.ctx_len as i32;
+                    let mut p0 = pos as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                    self.ctx.launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
                 }
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
                     self.ctx.sync()?;
