@@ -790,7 +790,8 @@ gmark("conv", &mut marks);
                     let mut d = self.d_state as i32;
                     let mut ng = self.n_group as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut ep), Self::p(&mut sc), Self::p(&mut d), Self::p(&mut ng)];
-                    self.ctx.launch3("l2_rows2_scale", (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
+                    let l2k = if std::env::var_os("LLM170_EXACT").is_some() { "l2_rows2_scale" } else { "l2_rows2_scale_w" };
+                    self.ctx.launch3(l2k, (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
                 }
 gmark("split+l2", &mut marks);
                 // beta/e^g 전체 배치 (요소별)

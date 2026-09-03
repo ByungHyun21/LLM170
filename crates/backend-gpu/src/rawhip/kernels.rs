@@ -2732,6 +2732,39 @@ extern "C" __global__ void split3(const float* src, float* d0, float* d1, float*
 }
 
 
+// L2 rows (워프 병렬 fast) — 32레인×4원소 세그먼트 부분합 + 레인 순서 결합.
+// 순차 미러와 f32 그룹핑 다름 (스트림 계약 — EXACT는 구형 유지).
+extern "C" __global__ void l2_rows2_scale_w(float* gq, float* gk, float eps, float scale,
+                                            int d, int n_group) {
+    int y = blockIdx.y;
+    int x = blockIdx.x;
+    int lane = threadIdx.x;
+    if (x >= 2 * n_group) return;
+    bool is_q = x < n_group;
+    int tb = y * n_group * d;
+    int xb = is_q ? tb + x * d : tb + (x - n_group) * d;
+    float* g = is_q ? gq : gk;
+    // 세그먼트 부분합 (레인당 4)
+    float part = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float dv = g[xb + (lane << 2) + j];
+        part += dv * dv;
+    }
+    // 레인 순서 결합
+    float sum = 0.0f;
+    #pragma unroll
+    for (int l2 = 0; l2 < 32; l2++) {
+        float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part, l2);
+        sum += pj;
+    }
+    float scale32 = sqrtf(sum);
+    float inv = 1.0f / fmaxf(scale32, eps);
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        g[xb + (lane << 2) + j] = g[xb + (lane << 2) + j] * inv;
+}
+
 // QSA attention score: dot(q_head, ck[p]) — grid (n_past, n_head, t)
 extern "C" __global__ void qsa_score(const float* q, const float* ck, const unsigned* mask,
                                      float* scores, int n_past, int n_head, int n_kv,
@@ -2827,7 +2860,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
