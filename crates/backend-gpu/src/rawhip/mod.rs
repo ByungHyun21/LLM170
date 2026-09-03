@@ -23,6 +23,7 @@ pub struct RawCtx {
     module: hip::hipModule_t,
     fns: HashMap<&'static str, hip::hipFunction_t>,
     stream: hip::hipStream_t,
+    stream2: hip::hipStream_t,
     /// 크기별 스크래치 풀 — 해제 없는 재사용 (호출마다 신규 할당이
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
@@ -95,7 +96,9 @@ impl RawCtx {
 
             let mut stream: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
-            Ok(RawCtx { module, fns, stream, scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()) })
+            let mut stream2: hip::hipStream_t = std::ptr::null_mut();
+            ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
+            Ok(RawCtx { module, fns, stream, stream2, scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()) })
         }
     }
 
@@ -191,6 +194,34 @@ impl RawCtx {
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3")?;
+        }
+        Ok(())
+    }
+
+    /// 사이드 스트림 발사 (비동기 — join2로 합류)
+    pub fn launch3s(
+        &self,
+        name: &str,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        block: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
+        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        unsafe {
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
+        }
+        Ok(())
+    }
+    /// 사이드 스트림 → 주 스트림 합류: 이벤트 경유
+    pub fn join2(&self) -> Result<(), String> {
+        unsafe {
+            let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+            ck(hip::hipEventCreateWithFlags(&mut ev, 0), "evCreate")?;
+            ck(hip::hipEventRecord(ev, self.stream2), "evRecord")?;
+            ck(hip::hipStreamWaitEvent(self.stream, ev, 0), "evWait")?;
+            ck(hip::hipEventDestroy(ev), "evDestroy")?;
         }
         Ok(())
     }
@@ -366,6 +397,46 @@ impl RawCtx {
         let gz = nblocks.div_ceil(65535) as u32;
         let block: u32 = if mm { 256 } else { 64 };
         self.launch3(kern, gx, 1, gz, block, &mut args)
+    }
+    pub fn gemm_tile_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let j128 = std::env::var_os("LLM170_EXACT").is_none()
+            && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
+        let kern = match ty {
+            13 => if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            _ => return Err(format!("타일 미지원 타입 {ty}")),
+        };
+
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut ktp = ktab2 as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let is_j128 = kern.ends_with("_j128");
+        if ty == 23 || (is_j128 && false) {
+            args.push((&mut ktp) as *mut _ as *mut std::ffi::c_void);
+        }
+        args.push((&mut ni) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut no) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut xw) as *mut _ as *mut std::ffi::c_void);
+        args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
+        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128");
+        let rows_per_block: usize = if kern.ends_with("_j128") { 128 } else if mm { 64 } else { 1 };
+        let nblocks = n_out.div_ceil(rows_per_block);
+        let gx = nblocks.min(65535) as u32;
+        let gz = nblocks.div_ceil(65535) as u32;
+        let block: u32 = if mm { 256 } else { 64 };
+        self.launch3s(kern, gx, 1, gz, block, &mut args)
     }
 
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.

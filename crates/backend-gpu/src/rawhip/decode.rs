@@ -941,11 +941,29 @@ self.axpy(self.xs_t, self.gout_t, n * t)?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
 gmark("ffn_quant", &mut marks);
+            // 2스트림: gate(사이드) ‖ up(주) — 독립 GEMM, 출력버퍼 분리
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
-gmark("ffn_gate", &mut marks);
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
+            let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
+            if gate_tile && !up_tile {
+                self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b_s(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.ctx.join2()?;
+            } else if !gate_tile && up_tile {
+                self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.ctx.join2()?;
+            } else if gate_tile && up_tile {
+                // 둘 다 타일 — 하나 사이드
+                self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.ctx.join2()?;
+            } else {
+                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            }
+gmark("ffn_gate", &mut marks);
 gmark("ffn_up", &mut marks);
             {
                 let mut gp = self.fgate_t as *mut std::ffi::c_void;
@@ -1080,4 +1098,10 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         }
         self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, xq_w, t)
     }
+    /// mm_b 사이드 스트림판 — 타일형만 (비타일은 주 스트림 사용)
+    #[allow(clippy::too_many_arguments)]
+    fn mm_b_s(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        self.ctx.gemm_tile_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
+    }
+
 }
