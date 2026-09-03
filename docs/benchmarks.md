@@ -233,3 +233,12 @@ servers resident would contend for the same VRAM on this UMA machine).
 - Synthetic tiny4 (`scripts/make_tiny4.py`) — model-volume-independent e2e:
   CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2
   (every combination; the frame path is hash-identical to the value path).
+
+## Vulkan status (2026-09-05)
+
+rawvk smoke suite passes (coopmat probe, axpy bit-exact, 25.5 GB/s) — the Vulkan compute
+path is healthy. Full-model Vulkan runs are currently blocked by a kernel TTM leak:
+18.6 GB of GTT stranded by crashed processes (zero holder PIDs), leaving 11 GB available
+against the 16.3 GB weight pin requirement, so the first queue submit fails with
+ErrorDeviceLost. The reference llama.cpp Vulkan build fails identically. A reboot clears
+the stranded GTT; re-verification and the Vulkan MTP port follow.
