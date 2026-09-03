@@ -156,7 +156,11 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
         } else {
             let m = llm170_core::model::Model::load(&model_path)
                 .map_err(|e| e.to_string())?;
-            let mut eng = llm170_core::model::Engine::new(m, 1, ctx);
+            let bench_np0: usize = std::env::var("LLM170_BENCH_NP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let mut eng = llm170_core::model::Engine::new(m, bench_np0, ctx);
             if gpu_runtime == "vulkan" {
                 // Vulkan (plans/12): rawhip 미주입 — VkAcc matmul + CPU 엔진 (스펙=CPU 경로).
                 match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
@@ -191,7 +195,41 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut fwd = 0usize;
-                if spec_k > 0 && has_mtp {
+                let bench_np: usize = std::env::var("LLM170_BENCH_NP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                if spec_k > 0 && has_mtp && bench_np > 1 {
+                    // np×spec 병합 (plans/18) — n seq 동일 프롬프트
+                    let mut nexts: Vec<u32> = vec![llm170_core::model::greedy(&l); bench_np];
+                    let mut done: Vec<usize> = vec![0; bench_np];
+                    let mut total_gen = 0usize;
+                    while total_gen < tg * bench_np {
+                        let active: Vec<usize> = (0..bench_np).filter(|&s2| done[s2] < tg).collect();
+                        if active.is_empty() {
+                            break;
+                        }
+                        let ns: Vec<u32> = active.iter().map(|&s2| nexts[s2]).collect();
+                        let acc = eng
+                            .spec_step_multi(&active, &ns, spec_k)
+                            .map_err(|e| e.to_string())?;
+                        for (i, &s2) in active.iter().enumerate() {
+                            for &t2 in &acc[i] {
+                                if done[s2] >= tg {
+                                    break;
+                                }
+                                nexts[s2] = t2;
+                                done[s2] += 1;
+                                total_gen += 1;
+                            }
+                        }
+                    }
+                    let el = t1.elapsed().as_secs_f64() * 1e3;
+                    lines.push(format!(
+                        "tg{tg} spec{spec_k} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {total_gen})",
+                        total_gen as f64 / (el / 1e3)
+                    ));
+                } else if spec_k > 0 && has_mtp {
                     while n_gen < tg {
                         let (toks, tf) = eng
                             .spec_step(0, next, spec_k)
