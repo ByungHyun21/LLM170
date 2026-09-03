@@ -88,6 +88,16 @@ fn main() -> ExitCode {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
         },
+        Some("vk-gemv-check") => {
+            let args2: Vec<String> = std::env::args().collect();
+            let path = args2.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
+            match llm170_backend_gpu::rawvk::gemv::gemv_check(&path, &tn, t) {
+                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some("vk-check") => match llm170_backend_gpu::rawvk::smoke_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
@@ -640,10 +650,19 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
-            if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
+            if gpu_runtime == "vulkan" {
+                // Vulkan 경로 (plans/12): rawhip 미주입, VkAcc로 matmul만 가속 — GDN·EW는 CPU.
+                match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                    Ok(acc) => {
+                        eng = eng.with_acc(std::sync::Arc::new(acc));
+                        eprintln!("# backend: gpu (vulkan VkAcc)");
+                    }
+                    Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                }
+            } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
-            if backend == "gpu" {
+            if backend == "gpu" && gpu_runtime != "vulkan" {
                 eprintln!("# backend: gpu (raw hip)");
             }
             let eos = 248044u32;

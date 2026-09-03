@@ -22,10 +22,8 @@ pub struct VkCtx {
     pub fence: vk::Fence,
     pub coop_matrix: bool,
     pub coop_f16_f32: bool,
-    mem: vk::DeviceMemory,
-    base: *mut u8,
-    cap: usize,
-    offset: usize,
+    pub max_ssbo: usize,
+    pub mem_ty: u32,
 }
 
 unsafe impl Send for VkCtx {}
@@ -46,7 +44,7 @@ impl VkCtx {
             let pds = instance
                 .enumerate_physical_devices()
                 .map_err(|e| format!("물리장치: {e:?}"))?;
-            let (physical, _props) = pds
+            let (physical, props) = pds
                 .into_iter()
                 .map(|p| (p, instance.get_physical_device_properties(p)))
                 .find(|(_, pr)| pr.vendor_id == 0x1002)
@@ -124,8 +122,7 @@ impl VkCtx {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| format!("펜스: {e:?}"))?;
 
-            // 단일 bump 힙 (host-visible coherent — APU 단일 메모리)
-            let cap = 256usize << 20;
+            // host-visible coherent 메모리 타입 (APU 단일 메모리)
             let mprops = instance.get_physical_device_memory_properties(physical);
             let ty = (0..mprops.memory_type_count as usize)
                 .find(|&i| {
@@ -134,15 +131,6 @@ impl VkCtx {
                         .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
                 })
                 .ok_or("host-visible coherent 메모리 타입 없음")? as u32;
-            let ai = vk::MemoryAllocateInfo::default()
-                .allocation_size(cap as u64)
-                .memory_type_index(ty);
-            let mem = device
-                .allocate_memory(&ai, None)
-                .map_err(|e| format!("할당: {e:?}"))?;
-            let base = device
-                .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(|e| format!("맵: {e:?}"))? as *mut u8;
 
             Ok(Self {
                 entry,
@@ -156,24 +144,16 @@ impl VkCtx {
                 fence,
                 coop_matrix,
                 coop_f16_f32,
-                mem,
-                base,
-                cap,
-                offset: 0,
+                max_ssbo: props.limits.max_storage_buffer_range as usize,
+                mem_ty: ty,
             })
         }
     }
 
-    /// 버퍼 할당 (bump, host 포인터 동반 반환).
+    /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
+    /// bytes는 max_ssbo 이하 권장 (초과 시 호출부에서 청크 분할).
     pub fn alloc(&mut self, bytes: usize) -> Result<VkBuf, String> {
         unsafe {
-            let off = (self.offset + 255) & !255;
-            if off + bytes > self.cap {
-                return Err(format!(
-                    "VkCtx 풀 부족: need {bytes}, left {}",
-                    self.cap - off
-                ));
-            }
             let bci = vk::BufferCreateInfo::default()
                 .size(bytes as u64)
                 .usage(
@@ -186,22 +166,24 @@ impl VkCtx {
                 .device
                 .create_buffer(&bci, None)
                 .map_err(|e| format!("버퍼: {e:?}"))?;
+            let ai = vk::MemoryAllocateInfo::default()
+                .allocation_size(bytes as u64)
+                .memory_type_index(self.mem_ty);
+            let mem = self
+                .device
+                .allocate_memory(&ai, None)
+                .map_err(|e| format!("할당({bytes}): {e:?}"))?;
             self.device
-                .bind_buffer_memory(buf, self.mem, off as u64)
+                .bind_buffer_memory(buf, mem, 0)
                 .map_err(|e| format!("바인드: {e:?}"))?;
-            self.offset = off + bytes;
-            Ok(VkBuf {
-                buf,
-                ptr: self.base.add(off),
-                bytes,
-            })
+            let ptr = self
+                .device
+                .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("맵: {e:?}"))? as *mut u8;
+            Ok(VkBuf { buf, ptr, bytes })
         }
     }
 
-    /// 힙 rewind — 버퍼는 파괴자 책임 하 별도 관리.
-    pub fn rewind(&mut self) {
-        self.offset = 0;
-    }
 
     /// 파이프라인 생성 (push constant + N개 SSBO).
     pub fn pipeline(

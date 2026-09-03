@@ -1,0 +1,262 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// W4A8 GEMV (q5_K/q4_K/q6_K/iq4_xs) — rawhip gemm_* 계열의 GLSL 포트.
+// 워크그룹=64스레드=1행, y=토큰. 레인 부담 sb = l + m*64 순차 (HIP 동일).
+// dot4는 4×i8 signed int 곱으로 전개 (V_DOT4 미사용 — ALU 여유, BW 바운드).
+layout(local_size_x = 64) in;
+// 가중 청크 0..7 (각 ≤128MB, RADV maxStorageBufferRange 대응) + xq + out
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint xq_w;
+    uint ty;   // 13 q5k, 12 q4k, 14 q6k, 23 xs
+} pc;
+
+int s8(uint v) { return (int(v) << 24) >> 24; }
+
+// 워드 인덱스 → 청크 분산 읽기 (128MB = 2^25 워드/청크)
+uint WG(uint idx) {
+    uint c = idx >> 25u;
+    uint o = idx & 0x1FFFFFFu;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+// kvalues_iq4nl (xs·nl 공용 LUT)
+int KVAL(int nib) {
+    const int kv[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+    return kv[nib];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+shared double shred[64];
+
+void main() {
+    uint o = gl_WorkGroupID.x;      // 행 = 워크그룹 (HIP blockIdx.y 상당)
+    uint tok = gl_WorkGroupID.y;    // 토큰 (HIP blockIdx.x 상당)
+    if (o >= pc.n_out) return;
+    uint l = gl_LocalInvocationID.x; // 레인 (HIP threadIdx.x 상당)
+    int n_in = int(pc.n_in);
+    uint base = tok * pc.xq_w;
+    float acc = 0.0;
+
+    if (pc.ty == 13u) {          // q5_K
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 176;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int js = sb & 7;
+            int it = js >> 1;
+            int halfb = js & 1;
+            int wq = (row_base + (sb >> 3) * 176) >> 2;
+            uint w0 = WG(wq);
+            vec2 dd = unpackHalf2x16(w0);
+            float d = dd.x, dm = dd.y;
+            uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+            uint r = (uint(js & 3)) * 8u;
+            uint b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+            uint b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+            uint b_jm4 = (sc0 >> r) & 0xFFu;
+            uint sc_v, m_v;
+            if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+            else {
+                sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+            }
+            int qhw = wq + 4;
+            int qlb = wq + 12 + it * 8;
+            uint nsh = uint(halfb << 2);
+            int sh = 2 * it + halfb;
+            uint hbit = 1u << uint(sh);
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            for (int k = 0; k < 8; k++) {
+                uint qv = WG(qlb + k);
+                uint hv = WG(qhw + k);
+                uint yv = xq[base + uint(xw + k)];
+                uint nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+                uint bitw = ((hv & (hbit * 0x01010101u)) >> uint(sh)) << 4;
+                isum = dot4(nibw | bitw, yv, isum);
+            }
+            int qsb = (n_in >> 2) + (n_in >> 5);
+            int qsum = int(xq[base + uint(qsb + (sb << 1))]) + int(xq[base + uint(qsb + (sb << 1) + 1)]);
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * (d * float(sc_v)) * float(isum);
+            acc -= yd * (dm * float(m_v)) * float(qsum);
+        }
+    } else if (pc.ty == 12u) {   // q4_K
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 144;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int js = sb & 7;
+            int it = js >> 1;
+            int halfb = js & 1;
+            int wq = (row_base + (sb >> 3) * 144) >> 2;
+            uint w0 = WG(wq);
+            vec2 dd = unpackHalf2x16(w0);
+            float d = dd.x, dm = dd.y;
+            uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+            uint r = (uint(js & 3)) * 8u;
+            uint b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+            uint b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+            uint b_jm4 = (sc0 >> r) & 0xFFu;
+            uint sc_v, m_v;
+            if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+            else {
+                sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+            }
+            int qlb = wq + 4 + it * 8;
+            uint nsh = uint(halfb << 2);
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            for (int k = 0; k < 8; k++) {
+                uint qv = WG(qlb + k);
+                uint yv = xq[base + uint(xw + k)];
+                uint nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+                isum = dot4(nibw, yv, isum);
+            }
+            int qsb = (n_in >> 2) + (n_in >> 5);
+            int qsum = int(xq[base + uint(qsb + (sb << 1))]) + int(xq[base + uint(qsb + (sb << 1) + 1)]);
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * (d * float(sc_v)) * float(isum);
+            acc -= yd * (dm * float(m_v)) * float(qsum);
+        }
+    } else if (pc.ty == 14u) {   // q6_K
+        int n_g = n_in >> 4;
+        int cnt = (n_g + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 210;
+        for (int m = 0; m < cnt; m++) {
+            int g = int(l) + (m << 6);
+            int blk = g >> 4;
+            int kloc = g - (blk << 4);
+            int wb = row_base + blk * 210;
+            int h = kloc >> 3;
+            int src = (kloc - (h << 3)) >> 1;
+            int p = kloc & 1;
+            float d = unpackHalf2x16(WG((wb + 208) >> 2) << ((((wb + 208) & 3) ^ 2) * 8)).x;
+            // f16w(w, b): byte 정렬 상관없이 하프 워드 읽기 — 아래 직접 전개
+            {
+                int bi = wb + 208;
+                uint wd = WG(bi >> 2);
+                d = unpackHalf2x16((wd >> uint((bi & 3) * 8))).x;
+            }
+            int scv = s8((WG((wb + 192 + kloc) >> 2) >> uint(((wb + 192 + kloc) & 3) * 8)) & 0xFFu);
+            int ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
+            int qh_rel = 128 + h * 32 + p * 16;
+            bool al = ((wb & 3) == 0);
+            int qlw = (wb + ql_rel) >> 2;
+            int qhw = (wb + qh_rel) >> 2;
+            uint qa0, qa1, qa2, qa3, ha0, ha1, ha2, ha3;
+            if (al) {
+                qa0 = WG(qlw); qa1 = WG(qlw+1); qa2 = WG(qlw+2); qa3 = WG(qlw+3);
+                ha0 = WG(qhw); ha1 = WG(qhw+1); ha2 = WG(qhw+2); ha3 = WG(qhw+3);
+            } else {
+                qa0 = (WG(qlw) >> 16) | (WG(qlw+1) << 16);
+                qa1 = (WG(qlw+1) >> 16) | (WG(qlw+2) << 16);
+                qa2 = (WG(qlw+2) >> 16) | (WG(qlw+3) << 16);
+                qa3 = (WG(qlw+3) >> 16) | (WG(qlw+4) << 16);
+                ha0 = (WG(qhw) >> 16) | (WG(qhw+1) << 16);
+                ha1 = (WG(qhw+1) >> 16) | (WG(qhw+2) << 16);
+                ha2 = (WG(qhw+2) >> 16) | (WG(qhw+3) << 16);
+                ha3 = (WG(qhw+3) >> 16) | (WG(qhw+4) << 16);
+            }
+            int xw = (g << 4) >> 2;
+            int nsh = (src == 0 || src == 1) ? 0 : 4;
+            int hsh = 2 * src;
+            int isum = 0;
+            for (int k = 0; k < 4; k++) {
+                uint qv = k==0?qa0:k==1?qa1:k==2?qa2:qa3;
+                uint hv = k==0?ha0:k==1?ha1:k==2?ha2:ha3;
+                uint yv = xq[base + uint(xw + k)];
+                uint nibw = (qv >> uint(nsh)) & 0x0F0F0F0Fu;
+                uint hi16w = (hv >> uint(hsh)) & 0x03030303u;
+                isum = dot4(nibw + (hi16w << 4), yv, isum);
+            }
+            isum -= 32 * int(xq[base + uint((n_in >> 2) + (n_in >> 5) + g)]);
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (g >> 1))]);
+            acc += yd * d * float(scv) * float(isum);
+        }
+    } else {                     // iq4_xs (23)
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int blocks = n_in >> 8;
+        int row_base = int(o) * blocks * 136;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m << 6);
+            int b = sb >> 3;
+            int ib = sb & 7;
+            int wb = row_base + b * 136;
+            int wq = wb >> 2;
+            uint w0 = WG(wq);
+            float d = unpackHalf2x16(w0).x;
+            int qw = (wb + 8 + ib * 16) >> 2;
+            int ls = int((WG(wq + 1) >> uint((ib >> 1) * 8 + (ib & 1) * 4)) & 0xFu)
+                  | (int(((w0 >> 16) >> uint(2 * ib)) & 3u) << 4);
+            float dl = d * float(ls - 32);
+            int isum = 0;
+            int xw = (sb << 5) >> 2;
+            for (int k = 0; k < 4; k++) {
+                uint qv = WG(qw + k);
+                uint yv0 = xq[base + uint(xw + k)];
+                uint yv1 = xq[base + uint(xw + 4 + k)];
+                // iq4xs: lo 바이트 = 원소 0..15 (니블 lo), hi = 16..31 — CPU 미러 열 순서.
+                // HIP: lo/hii 워드를 k, k+4 y워드와 페어 — 여기 동일.
+                int lo = 0, hi = 0;
+                for (int b2 = 3; b2 >= 0; b2--) {
+                    uint nb = (qv >> uint(8 * b2)) & 0xFFu;
+                    int vlo = KVAL(int(nb & 0xFu));
+                    int vhi = KVAL(int(nb >> 4));
+                    lo = (lo << 8) | (vlo & 0xFF);
+                    hi = (hi << 8) | (vhi & 0xFF);
+                }
+                isum = dot4(uint(lo), yv0, isum);
+                isum = dot4(uint(hi), yv1, isum);
+            }
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * dl * float(isum);
+        }
+    }
+
+    // 트리 환원 — f64, 결정적 순서 (shared 순차)
+    shred[l] = double(acc);
+    barrier();
+    if (l == 0u) {
+        double accd = 0.0lf;
+        for (int i = 0; i < 64; i++) accd += shred[i];
+        outv[tok * pc.n_out + o] = float(accd);
+    }
+}

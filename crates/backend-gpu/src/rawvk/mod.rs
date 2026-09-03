@@ -1,6 +1,7 @@
 //! rawvk — Vulkan 백엔드 (plans/12). 모듈 루트.
 
 pub mod context;
+pub mod gemv;
 
 use context::VkCtx;
 

@@ -10,3 +10,5 @@ llm170-gguf = { path = "../gguf" }
 cubecl-hip-sys = { package = "hanzo-cubecl-hip-sys", version = "7.2" }
 bytemuck = "1"
 ash = "0.38.0"
+parking_lot = "0.12.5"
+half = "2.7.1"
