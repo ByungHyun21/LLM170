@@ -308,7 +308,7 @@ hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
 
 | test | llama.cpp ROCm | llama.cpp Vulkan | LLM170 HIP (tuned CO env) | LLM170 HIP (zero-config) |
 |---|---|---|---|---|
-| pp512 | **361.8** | **349.9** | 184.1 | 108.5 |
+| pp512 | **361.8** | **349.9** | 200.0¹ | 108.5 |
 | pp64  | 274.4 | 221.5 | 106.3 | ~52 |
 | tg8   | 10.92 | 11.82 | 9.49 | 9.49 |
 | tg32  | 11.70 | 12.02 | 10.41 | 10.41 |
@@ -323,3 +323,12 @@ Key readings:
 - llm170 pprof (pp512, tuned): projection GEMMs ~1.05 s + ffn_gate ~0.73 s
   dominate the 2.79 s wall — the raw-parity levers are proj/qkv tile throughput
   and (for zero-config) embedding the offline .co tile kernels.
+
+¹ 2026-09-05: pp512 184.1 → 200.0 (pp128 186 → 253). A 2-day bisect traced
+the 2026-09-04 regression to `prefill()` copying the full token_embd table
+(636 MB, ~170-220 ms fixed) on every prefill call — a borrow-checker
+workaround from the MTP-hook era that the since-moved hooks made
+unnecessary. GPU kernel time was unchanged throughout (identical PP_PROF
+stage sums); the gap was constant per call regardless of token count,
+reps, or ctx. Restored in-place borrow; 41/41 stream bit-exact vs the
+pre-fix binary.
