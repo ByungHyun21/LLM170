@@ -1387,7 +1387,19 @@ fn cmd_vl(args: &[String]) -> ExitCode {
     };
     let mut eng = llm170_core::model::Engine::new(m, 1, ctx);
     if backend != "cpu" {
-        crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+        let rt = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
+        if rt == "vulkan" {
+            if std::env::var_os("LLM170_VK_DECODER").is_some() {
+                match crate::inject_rawvk(&mut eng) {
+                    Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
+                    Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
+                }
+            } else {
+                eprintln!("# backend: vulkan VK_DECODER 미지정 — LLM은 CPU 진행");
+            }
+        } else {
+            crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+        }
     }
     let t1 = std::time::Instant::now();
     let logits = match eng.prefill_vision(0, &prompt, 248056, &vis) {

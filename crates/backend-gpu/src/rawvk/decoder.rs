@@ -15,6 +15,7 @@ const NORM_GATED_SPV: &[u8] = include_bytes!("spv/norm_gated.spv");
 const QK_ROPE_SPV: &[u8] = include_bytes!("spv/qk_rope.spv");
 const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
+const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 
 pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
@@ -89,9 +90,24 @@ pub struct DecoderState {
     b_fglu: VkBuf,
     b_fdown: VkBuf,
     b_out: VkBuf, // [t][n_embd] 결과 다운로드
+    b_lg: VkBuf,  // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
     b_am: VkBuf,  // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
     split_ctr: usize,
+    // ── MTP (blk.64) — Phase A: 전부 t=1 검증 커널 재사용
+    mtp_on: bool,
+    n_vocab: usize,
+    m_e: VkBuf,     // [n] 토큰 임베딩 / rms 임시
+    m_cat: VkBuf,   // [2n] enorm‖hnorm
+    m_xq2: VkBuf,   // [2n] q8
+    m_cur: VkBuf,   // [n] MTP hidden
+    m_xq: VkBuf,    // [n] q8
+    m_h: VkBuf,     // [n] 호스트 h 업로드
+    m_kv_k: Vec<VkBuf>,
+    m_kv_v: Vec<VkBuf>,
+    // GDN/conv 스냅샷 (spec 부분수용 롤백) — 매핑 ptr 직접 복사
+    snap_gdn: Vec<Vec<f32>>,
+    snap_conv: Vec<Vec<f32>>,
 }
 
 unsafe impl Send for DecoderState {}
@@ -136,6 +152,159 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         }
         Ok(last.unwrap_or_default())
     }
+
+    /// raw_step + 최종 hidden 회수 (MTP 훅용).
+    fn raw_step_h(
+        &self,
+        seq: usize,
+        pos: usize,
+        emb: &[f32],
+        h_out: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let lg = ds.step(seq, pos, emb)?;
+        h_out.clear();
+        h_out.extend_from_slice(&ds.hidden_row());
+        Ok(lg)
+    }
+
+    /// raw_prefill + 전 토큰 hidden 회수 (MTP KV 적립용).
+    fn raw_prefill_h(
+        &self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        h_all: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.verify_rows(seq, pos0, emb, &mut Vec::new(), h_all)
+    }
+
+    /// 배치 검증 (MTP spec) — per-token step = 디코드 산술과 동일 (비트계약).
+    fn raw_verify(
+        &self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+        h_all: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.verify_rows(seq, pos0, emb, argmaxes, h_all)?;
+        Ok(())
+    }
+
+    /// np 배치 디코드 — seq별 순차 step (스트림 = 싱글 경로와 동일).
+    fn raw_step_multi(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let n = ds.n_embd;
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, (&sq, &ps)) in seqs.iter().zip(poss.iter()).enumerate() {
+            out.push(ds.step(sq, ps as usize, &emb[i * n..(i + 1) * n])?);
+        }
+        Ok(out)
+    }
+
+    /// np×spec 병합 검증 — 그룹(seq-major)별 per-token step.
+    fn verify_batch_ms(
+        &self,
+        seqs: &[usize],
+        poss: &[usize],
+        group_starts: &[usize],
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+        h_all: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let n = ds.n_embd;
+        let total = emb.len() / n;
+        argmaxes.clear();
+        argmaxes.resize(total, 0);
+        let mut am_i = Vec::with_capacity(total);
+        let mut h_i = Vec::with_capacity(total * n);
+        for (gi, (&sq, &p0)) in seqs.iter().zip(poss.iter()).enumerate() {
+            let g0 = group_starts[gi];
+            let g1 = group_starts.get(gi + 1).copied().unwrap_or(total);
+            let mut am_g = Vec::new();
+            let mut h_g = Vec::new();
+            ds.verify_rows(sq, p0, &emb[g0 * n..g1 * n], &mut am_g, &mut h_g)?;
+            am_i.extend(am_g);
+            h_i.extend(h_g);
+        }
+        *argmaxes = am_i;
+        *h_all = h_i;
+        Ok(())
+    }
+
+    /// MTP 1스텝 (호스트 h, head, h_next 회수) — 프리필/디코드 훅용.
+    fn mtp_step_gpu(
+        &self,
+        seq: usize,
+        tok_emb: &[f32],
+        h: &[f32],
+        pos: usize,
+    ) -> Result<(u32, Vec<f32>), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let am = ds
+            .mtp_step_g(seq, tok_emb, false, h, pos, true)?
+            .ok_or("mtp head")?;
+        let mut h_next = vec![0f32; ds.n_embd];
+        unsafe { std::ptr::copy_nonoverlapping(ds.m_cur.ptr as *const f32, h_next.as_mut_ptr(), ds.n_embd) };
+        Ok((am, h_next))
+    }
+
+    /// MTP 체인 스텝 — h를 내부 mtp_cur에서 직접 (h2d 제거).
+    fn mtp_step_chain(&self, seq: usize, tok_emb: &[f32], pos: usize) -> Result<u32, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.mtp_step_g(seq, tok_emb, true, &[], pos, true)?
+            .ok_or("mtp head".into())
+    }
+
+    /// MTP 상태 진행 (호스트 trunk h, head 없음) — spec 수용 후 KV 동기.
+    fn mtp_step_adv(
+        &self,
+        seq: usize,
+        tok_emb: &[f32],
+        h: &[f32],
+        pos: usize,
+    ) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.mtp_step_g(seq, tok_emb, false, h, pos, false)?;
+        Ok(())
+    }
+
+    /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백).
+    fn gdn_snapshot(&self) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_mut().ok_or("vkdecoder: 미초기화")?.snapshot_states()
+    }
+
+    fn gdn_restore(&self) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_mut().ok_or("vkdecoder: 미초기화")?.restore_states()
+    }
+
+    /// 정규화 h → head GEMV → argmax (MTP draft).
+    fn mtp_head_argmax(&self, h_normed: &[f32]) -> Result<u32, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let n = ds.n_embd;
+        unsafe { std::ptr::copy_nonoverlapping(h_normed.as_ptr(), ds.m_e.ptr as *mut f32, n.min(h_normed.len())) };
+        ds.head_argmax()
+    }
 }
 
 impl VkDecoder {
@@ -169,7 +338,13 @@ impl DecoderState {
         let kv_len = ctx_len * n_kv * hd;
         let gdn_len = hp.dt_rank * hp.d_state * hp.d_state;
         let conv_len = (conv_k - 1) * conv_ch;
-
+        // MTP 탑재·vocab — weights 이동 전 산출.
+        let mtp_on = weights.iter().any(|(k, ..)| k == "blk.64.nextn.eh_proj.weight");
+        let n_vocab = weights
+            .iter()
+            .find(|(k, ..)| k == "output.weight")
+            .map(|(_, _, _, no, _)| *no)
+            .unwrap_or(n);
         // 가중치 — 캐브아웃 (carveout) 업로드 후 언맵 (매핑 잔류 방지)
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
@@ -274,6 +449,30 @@ impl DecoderState {
                 a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(T_MAX * n)?, a(8)?,
             )
         };
+        // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
+        let (mut mkk, mut mvv) = (Vec::new(), Vec::new());
+        if mtp_on {
+            let zeros = vec![0u8; kv_len * 4];
+            for _ in 0..n_seqs {
+                let k = ctx.alloc(kv_len * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), k.ptr, zeros.len()) };
+                let v = ctx.alloc(kv_len * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), v.ptr, zeros.len()) };
+                mkk.push(k);
+                mvv.push(v);
+            }
+        }
+        let xq_2n = 2 * n / 4 + 2 * n / 32 + 2 * n / 16;
+        let mut ah = |sz: usize| -> Result<VkBuf, String> {
+            ctx.alloc_host(sz.max(1) * 4).map_err(|e| e.to_string())
+        };
+        let m_e = ah(n)?;
+        let m_cat = ah(2 * n)?;
+        let m_xq2 = ah(xq_2n)?;
+        let m_cur = ah(n)?;
+        let m_xq = ah(xq_sn)?;
+        let m_h = ah(n)?;
+        let b_lg = ah(n_vocab)?;
         Ok(Self {
             ctx,
             max_ssbo: max_ssbo0,
@@ -331,9 +530,22 @@ impl DecoderState {
             b_fglu,
             b_fdown,
             b_out,
+            b_lg,
             b_am,
             pipes: HashMap::new(),
             split_ctr: 0,
+            mtp_on,
+            n_vocab,
+            m_e,
+            m_cat,
+            m_xq2,
+            m_cur,
+            m_xq,
+            m_h,
+            m_kv_k: mkk,
+            m_kv_v: mvv,
+            snap_gdn: vec![Vec::new(); n_recr * n_seqs],
+            snap_conv: vec![Vec::new(); n_recr * n_seqs],
         })
     }
 
@@ -601,11 +813,10 @@ impl DecoderState {
         }
         self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
         if !noba { self.ctx.begin_batch()?; };
-        self.gemv(self.b_xq_n.buf, "output.weight", self.b_gout.buf, 1)?;
+        self.gemv(self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
-        let no_out = self.w.get("output.weight").map(|(_, _, _, no)| *no).unwrap_or(n);
-        let mut logits = vec![0f32; no_out];
-        unsafe { std::ptr::copy_nonoverlapping(self.b_gout.ptr as *const f32, logits.as_mut_ptr(), no_out.min(self.b_gout.bytes / 4)) };
+        let mut logits = vec![0f32; self.n_vocab];
+        unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
         Ok(logits)
     }
 
@@ -623,6 +834,192 @@ impl DecoderState {
         let push = (total as u32).to_le_bytes().to_vec();
         self.run_pipe("silu", crate::rawvk::gemv::SILU_SPV, 3, 4,
             &[g, u, o], &push, total.div_ceil(256) as u32, 1, 1)
+    }
+
+    // ══ Phase A: MTP·spec·np — 전부 t=1 검증 커널 재사용 (plans/19) ══
+
+    /// b_xs 최종 hidden [n] 판독 (step 완료 후 — GPU 유휴 보장).
+    fn hidden_row(&self) -> Vec<f32> {
+        let n = self.n_embd;
+        let mut v = vec![0f32; n];
+        unsafe { std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, v.as_mut_ptr(), n) };
+        v
+    }
+
+    /// copy_off: src[0..n) → dst[dst_off..).
+    fn copy_off(&mut self, src: vk::Buffer, dst: vk::Buffer, n: usize, dst_off: usize) -> Result<(), String> {
+        let push = Self::push_u32s(&[n as u32, dst_off as u32]);
+        self.run_pipe("copy_off", COPY_OFF_SPV, 2, 8,
+            &[src, dst], &push, n.div_ceil(256) as u32, 1, 1)
+    }
+
+    /// shared head — 정규화 입력(m_e) → 로짓 argmax (b_lg 매핑 판독 + CPU greedy).
+    fn head_argmax(&mut self) -> Result<u32, String> {
+        let n = self.n_embd;
+        self.quant(self.m_e.buf, self.m_xq.buf, n, 1)?;
+        self.ctx.begin_batch()?;
+        self.gemv(self.m_xq.buf, "output.weight", self.b_lg.buf, 1)?;
+        self.ctx.end_batch_wait()?;
+        let lgr: &[f32] = unsafe { std::slice::from_raw_parts(self.b_lg.ptr as *const f32, self.n_vocab) };
+        Ok(llm170_core::matmul::greedy_from(lgr))
+    }
+
+    /// MTP (blk.64) 1스텝 — rawhip mtp_step_g 산술 미러 (t=1 커널 재사용).
+    /// h_from_cur=true: h 입력을 내부 m_cur에서 (체인). 반환: with_head면 argmax.
+    fn mtp_step_g(
+        &mut self,
+        seq: usize,
+        tok_emb: &[f32],
+        h_from_cur: bool,
+        h_host: &[f32],
+        pos: usize,
+        with_head: bool,
+    ) -> Result<Option<u32>, String> {
+        if !self.mtp_on {
+            return Err("mtp_step_gpu: MTP 미로드".into());
+        }
+        let n = self.n_embd;
+        let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
+        debug_assert_eq!(tok_emb.len(), n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(tok_emb.as_ptr(), self.m_e.ptr as *mut f32, n);
+            if !h_from_cur {
+                if h_host.len() >= n {
+                    std::ptr::copy_nonoverlapping(h_host.as_ptr(), self.m_h.ptr as *mut f32, n);
+                } else {
+                    std::ptr::write_bytes(self.m_h.ptr as *mut f32, 0, n);
+                }
+            }
+        }
+        let h_buf = if h_from_cur { self.m_cur.buf } else { self.m_h.buf };
+        let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
+        if !noba { self.ctx.begin_batch()?; }
+        // enorm → cat[0..n] ‖ hnorm → cat[n..2n]
+        let en = self.consts.get("blk.64.nextn.enorm").cloned().ok_or("enorm")?;
+        let hn = self.consts.get("blk.64.nextn.hnorm").cloned().ok_or("hnorm")?;
+        self.rms(self.m_e.buf.clone(), "blk.64.nextn.enorm", self.m_cat.buf, n, 1)?;
+        self.rms(h_buf, "blk.64.nextn.hnorm", self.b_xn.buf, n, 1)?;
+        self.copy_off(self.b_xn.buf, self.m_cat.buf, n, n)?;
+        let _ = (en, hn);
+        // eh_proj [2n → n]
+        self.quant(self.m_cat.buf, self.m_xq2.buf, 2 * n, 1)?;
+        self.gemv(self.m_xq2.buf, "blk.64.nextn.eh_proj.weight", self.m_cur.buf, 1)?;
+        // attn_norm → q/k/v
+        self.rms(self.m_cur.buf, "blk.64.attn_norm", self.m_e.buf, n, 1)?;
+        self.quant(self.m_e.buf, self.m_xq.buf, n, 1)?;
+        self.gemv(self.m_xq.buf, "blk.64.attn_q.weight", self.b_aq.buf, 1)?;
+        self.gemv(self.m_xq.buf, "blk.64.attn_k.weight", self.b_ak.buf, 1)?;
+        self.gemv(self.m_xq.buf, "blk.64.attn_v.weight", self.b_av.buf, 1)?;
+        // q/k norm+rope (t=1 — step과 동일 디스패치)
+        {
+            let qn = self.consts.get("blk.64.attn_q_norm").cloned().ok_or("qn")?;
+            let kn = self.consts.get("blk.64.attn_k_norm").cloned().ok_or("kn")?;
+            let cs = self.consts.get("cs").cloned().ok_or("cs")?;
+            let mut push = self.eps.to_le_bytes().to_vec();
+            push.extend_from_slice(&self.kq_scale.to_le_bytes());
+            push.extend(Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]));
+            self.run_pipe("qk_rope", QK_ROPE_SPV, 5, 28,
+                &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
+                &push, (n_head + n_kv) as u32, 1, 1)?;
+        }
+        // MTP 자체 KV 적립 + flash (np = pos+1)
+        {
+            let push = Self::push_u32s(&[(n_kv * hd) as u32, pos as u32]);
+            self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
+                &[self.b_ak.buf, self.m_kv_k[seq].buf], &push,
+                (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
+            self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
+                &[self.b_av.buf, self.m_kv_v[seq].buf], &push,
+                (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
+        }
+        {
+            let mask = self.consts.get("mask").cloned().ok_or("mask")?;
+            let push = Self::push_u32s(&[(pos + 1) as u32, n_head as u32, n_kv as u32, hd as u32, self.ctx_len as u32, pos as u32]);
+            self.run_pipe("qsa_flash", QSA_FLASH_SPV, 5, 24,
+                &[self.b_aq.buf, self.m_kv_k[seq].buf, self.m_kv_v[seq].buf, mask.buf, self.b_aout.buf],
+                &push, 1, n_head as u32, 1)?;
+        }
+        // wo + 잔차
+        self.quant(self.b_aout.buf, self.b_xq_g.buf, n_head * hd, 1)?;
+        self.gemv(self.b_xq_g.buf, "blk.64.attn_output.weight", self.b_gout.buf, 1)?;
+        self.axpy(self.m_cur.buf, self.b_gout.buf, n)?;
+        // FFN
+        self.rms(self.m_cur.buf, "blk.64.post_attention_norm", self.m_e.buf, n, 1)?;
+        self.quant(self.m_e.buf, self.m_xq.buf, n, 1)?;
+        self.gemv(self.m_xq.buf, "blk.64.ffn_gate.weight", self.b_fgate.buf, 1)?;
+        self.gemv(self.m_xq.buf, "blk.64.ffn_up.weight", self.b_fup.buf, 1)?;
+        self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff)?;
+        self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, 1)?;
+        self.gemv(self.b_xq_f.buf, "blk.64.ffn_down.weight", self.b_fdown.buf, 1)?;
+        self.axpy(self.m_cur.buf, self.b_fdown.buf, n)?;
+        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; }
+        if !with_head {
+            return Ok(None);
+        }
+        // shared head norm → head → argmax
+        self.rms(self.m_cur.buf, "blk.64.nextn.shared_head_norm", self.m_e.buf, n, 1)?;
+        Ok(Some(self.head_argmax()?))
+    }
+
+    /// per-token 검증 — 행별 step + argmax + hidden 회수.
+    fn verify_rows(
+        &mut self,
+        seq: usize,
+        pos0: usize,
+        emb: &[f32],
+        argmaxes: &mut Vec<u32>,
+        h_all: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let n = self.n_embd;
+        let mut last = Vec::new();
+        for (ti, ch) in emb.chunks(n).enumerate() {
+            let lg = self.step(seq, pos0 + ti, ch)?;
+            argmaxes.push(llm170_core::matmul::greedy_from(&lg));
+            h_all.extend_from_slice(&self.hidden_row());
+            last = lg;
+        }
+        Ok(last)
+    }
+
+    /// GDN/conv 상태 스냅샷 (매핑 ptr 직접 — GPU 유휴 시).
+    fn snapshot_states(&mut self) -> Result<(), String> {
+        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ctx.end_batch_wait()?;
+        }
+        let gl = self.dt_rank * self.d_state * self.d_state;
+        let cl = (self.conv_k - 1) * self.conv_ch;
+        for (r, rows) in self.st_gdn.iter().enumerate() {
+            let stride = rows.len();
+            for (s, b) in rows.iter().enumerate() {
+                let src: &[f32] = unsafe { std::slice::from_raw_parts(b.ptr as *const f32, gl) };
+                self.snap_gdn[r * stride + s] = src.to_vec();
+                let cs: &[f32] = unsafe { std::slice::from_raw_parts(self.st_conv[r][s].ptr as *const f32, cl) };
+                self.snap_conv[r * stride + s] = cs.to_vec();
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_states(&mut self) -> Result<(), String> {
+        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ctx.end_batch_wait()?;
+        }
+        let gl = self.dt_rank * self.d_state * self.d_state;
+        let cl = (self.conv_k - 1) * self.conv_ch;
+        for (r, rows) in self.st_gdn.iter().enumerate() {
+            let stride = rows.len();
+            for (s, b) in rows.iter().enumerate() {
+                let snap = self.snap_gdn[r * stride + s].clone();
+                if snap.len() == gl {
+                    unsafe { std::ptr::copy_nonoverlapping(snap.as_ptr(), b.ptr as *mut f32, gl) };
+                }
+                let snapc = self.snap_conv[r * stride + s].clone();
+                if snapc.len() == cl {
+                    unsafe { std::ptr::copy_nonoverlapping(snapc.as_ptr(), self.st_conv[r][s].ptr as *mut f32, cl) };
+                }
+            }
+        }
+        Ok(())
     }
 }
 
