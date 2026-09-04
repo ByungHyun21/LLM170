@@ -161,6 +161,9 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1);
             let mut eng = llm170_core::model::Engine::new(m, bench_np0, ctx);
+            if spec_k > 0 {
+                eng.mtp_wanted = true;
+            }
             if gpu_runtime == "vulkan" {
                 // Vulkan (plans/12): rawhip 미주입 — VkAcc matmul + CPU 엔진 (스펙=CPU 경로).
                 match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {

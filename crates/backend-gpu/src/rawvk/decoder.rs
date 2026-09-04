@@ -149,14 +149,16 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
         let n = ds.n_embd;
-        if std::env::var_os("LLM170_VKD_T1").is_some() {
+        // 기본 per-token (검증 경로). LLM170_VKD_BATCH=1 옵트인 시에만
+        // step_batch 청크 — 2026-09-04 계측: 배치 경로 산술 발산(idx5 동률
+        // 플립, W4A8급) — 커널 원인 조사 전까지 비활성.
+        if std::env::var_os("LLM170_VKD_BATCH").is_none() {
             let mut last = None;
             for (ti, ch) in emb.chunks(n).enumerate() {
                 last = Some(ds.step(seq, pos0 + ti, ch)?);
             }
             return Ok(last.unwrap_or_default());
         }
-        // T_MAX 청크 배치 (plans/20) — 행별 산술 per-token과 비트 동일.
         let mut last = None;
         for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);
@@ -1192,8 +1194,8 @@ impl DecoderState {
         argmaxes: &mut Vec<u32>,
         h_all: &mut Vec<f32>,
     ) -> Result<Vec<f32>, String> {
-        // 배치 경로 (plans/20) — LLM170_VKD_T1=1이면 기존 per-token (A/B 대조).
-        if std::env::var_os("LLM170_VKD_T1").is_none() {
+        // 배치 경로 — LLM170_VKD_BATCH=1 옵트인 (발산 조사 전 비활성).
+        if std::env::var_os("LLM170_VKD_BATCH").is_some() {
             let n = self.n_embd;
             let mut last = Vec::new();
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
