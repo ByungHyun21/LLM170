@@ -30,6 +30,11 @@ pub struct VkCtx {
     pub mem_ty_host: u32,
     /// 배치 모드 — run()은 녹화만 하고 end_batch에서 일괄 제출 (plans/19).
     pub batching: std::sync::atomic::AtomicBool,
+    /// 배치용 per-run 디스크립터 세트 풀 (세트 재사용 하저드 회피 — RCA 2026-09-05:
+    /// 녹화된 커맨드가 같은 세트를 참조해 마지막 바인딩으로 전부 덮어씀).
+    pub batch_dsl: std::cell::Cell<Option<(vk::DescriptorSetLayout, vk::DescriptorPool)>>,
+    pub batch_pool: std::cell::Cell<Option<(vk::DescriptorSetLayout, vk::DescriptorPool)>>,
+    pub batch_sets: std::cell::RefCell<Vec<vk::DescriptorSet>>,
 }
 
 unsafe impl Send for VkCtx {}
@@ -171,6 +176,9 @@ impl VkCtx {
                 mem_ty: ty,
                 mem_ty_host: ty_host,
                 batching: std::sync::atomic::AtomicBool::new(false),
+                batch_dsl: std::cell::Cell::new(None),
+                batch_pool: std::cell::Cell::new(None),
+                batch_sets: std::cell::RefCell::new(Vec::new()),
             })
         }
     }
@@ -183,6 +191,48 @@ impl VkCtx {
             b.ptr = std::ptr::null_mut();
         }
         Ok(())
+    }
+
+    /// 배치용 fresh descriptor set — 전용 대형 풀 (op당 1세트, 제출 후 전량 해제).
+    pub fn fresh_ds(&mut self, n_buf: u32) -> Result<vk::DescriptorSet, String> {
+        unsafe {
+            // 전용 배치 풀 지연 생성 (세트 256·버퍼 12×256)
+            if self.batch_pool.get().is_none() {
+                let dsl = self
+                    .batch_dsl
+                    .get()
+                    .map(|(d, _)| d)
+                    .ok_or("fresh_ds: 배치 컨텍스트 없음")?;
+                let pool_sizes = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(12 * 256)];
+                let pool = self
+                    .device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(256)
+                            .pool_sizes(&pool_sizes)
+                            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+                        None,
+                    )
+                    .map_err(|e| format!("배치 풀: {e:?}"))?;
+                self.batch_pool.set(Some((dsl, pool)));
+            }
+            let (_, pool) = self
+                .batch_pool
+                .get()
+                .ok_or("fresh_ds: 배치 풀 없음")?;
+            let sets = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pool)
+                        .set_layouts(&[self.batch_dsl.get().unwrap().0]),
+                )
+                .map_err(|e| format!("세트 할당: {e:?}"))?;
+            self.batch_sets.borrow_mut().push(sets[0]);
+            Ok(sets[0])
+        }
     }
 
     /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
@@ -224,6 +274,13 @@ impl VkCtx {
             self.device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .map_err(|e| format!("대기2: {e:?}"))?;
+            // 배치 세트 전량 해제 (풀 재사용)
+            if let Some((_, pool)) = self.batch_pool.get() {
+                let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
+                if !sets.is_empty() {
+                    self.device.free_descriptor_sets(pool, &sets);
+                }
+            }
         }
         Ok(())
     }
@@ -432,6 +489,21 @@ impl VkCtx {
                 );
             }
             self.device.cmd_dispatch(cb, gx, gy, gz);
+            // 배치 내 write→read 가시성 배리어 (비배칭 submit+wait의 암시 동기 대체)
+            if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                let bar = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[bar],
+                    &[],
+                    &[],
+                );
+            }
             if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
                 self.device
                     .end_command_buffer(self.cmdbuf)

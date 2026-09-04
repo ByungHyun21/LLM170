@@ -22,6 +22,8 @@ struct Pipes {
     pl: vk::PipelineLayout,
     ds: vk::DescriptorSet,
     pipe: vk::Pipeline,
+    dsl: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
 }
 
 /// 지연 파이프라인 슬롯.
@@ -111,11 +113,23 @@ impl VkAcc {
             Slot::Silu => (SILU_SPV, 3, 4),
         };
         let (dsl, pl, dp, ds, pipe) = ctx.pipeline(spv, n_buf, pb)?;
-        let _ = dsl;
-        let _ = dp;
-        let p = Pipes { pl, ds, pipe };
+        let p = Pipes { pl, ds, pipe, dsl, pool: dp };
         self.pipes.lock().insert(slot, p);
         Ok(p)
+    }
+
+    /// 배치 모드용 — p.ds 대신 fresh 세트에 바인딩해 반환 (세트 재사용 하저드:
+    /// 녹화된 커맨드가 세트 객체를 참조 — 마지막 바인딩으로 전부 덮임).
+    fn bind_ds(&self, ctx: &mut VkCtx, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
+        if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.batch_dsl.set(Some((p.dsl, p.pool)));
+            let ds = ctx.fresh_ds(bufs.len() as u32)?;
+            ctx.bind_bufs(ds, bufs);
+            Ok(ds)
+        } else {
+            ctx.bind_bufs(p.ds, bufs);
+            Ok(p.ds)
+        }
     }
 
     /// ktab(iq4nl)·grid3s 테이블 + 더미 버퍼 — 최초 1회 업로드.
@@ -203,9 +217,9 @@ impl VkAcc {
         binds.push(out_buf);
         binds.push(kb);
         binds.push(gb);
-        ctx.bind_bufs(p.ds, &binds);
+        let ds2 = self.bind_ds(ctx, &p, &binds)?;
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32]);
-        ctx.run(p.pl, p.ds, p.pipe, &push, n_out as u32, 1, 1)
+        ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
 
     /// 128행 coopmat 타일 (q5_K, t≥2) — f16 스테이징, maxrel ~4.9e-4 (HIP v4급).
@@ -228,12 +242,12 @@ impl VkAcc {
         }
         binds.push(xq_buf);
         binds.push(out_buf);
-        ctx.bind_bufs(p.ds, &binds);
+        let ds2 = self.bind_ds(ctx, &p, &binds)?;
         let gx = (n_out + 127) as u32 / 128;
         for tb in (0..t).step_by(64) {
             let nt = (t - tb).min(64) as u32;
             let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt]);
-            ctx.run(p.pl, p.ds, p.pipe, &push, gx, 1, 1)?;
+            ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
         }
         Ok(())
     }
@@ -266,10 +280,10 @@ impl VkAcc {
         }
         let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
         let p = self.pipeline(ctx, Slot::Quant)?;
-        ctx.bind_bufs(p.ds, &[xfbuf, xq_buf]);
+        let ds2 = self.bind_ds(ctx, &p, &[xfbuf, xq_buf])?;
         let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
         let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
-        ctx.run(p.pl, p.ds, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)
+        ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)
     }
 
     /// 값 버퍼 확보 (필요시 성장) → 핸들 반환.
@@ -330,10 +344,10 @@ impl VkAcc {
             (r.0.buf, r.1.buf, r.2.buf)
         };
         let p = self.pipeline(&mut ctx, Slot::Rms)?;
-        ctx.bind_bufs(p.ds, &[xb, wb, ob]);
+        let ds2 = self.bind_ds(&mut ctx, &p, &[xb, wb, ob])?;
         let mut push = push_u32s(&[n as u32, t as u32]);
         push.extend_from_slice(&eps.to_le_bytes());
-        ctx.run(p.pl, p.ds, p.pipe, &push, t as u32, 1, 1)?;
+        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, 1, 1)?;
         let host = {
             let b = self.rbufs.lock();
             unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, t * n) }
@@ -380,9 +394,9 @@ impl VkAcc {
             (r.0.buf, r.1.buf, r.2.buf)
         };
         let p = self.pipeline(&mut ctx, Slot::Silu)?;
-        ctx.bind_bufs(p.ds, &[gb, ub, ob]);
+        let ds2 = self.bind_ds(&mut ctx, &p, &[gb, ub, ob])?;
         let total_u = total as u32;
-        ctx.run(p.pl, p.ds, p.pipe, &total_u.to_le_bytes(), total_u.div_ceil(256), 1, 1)?;
+        ctx.run(p.pl, ds2, p.pipe, &total_u.to_le_bytes(), total_u.div_ceil(256), 1, 1)?;
         let host = {
             let b = self.sbufs.lock();
             unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, total) }
@@ -426,16 +440,18 @@ impl VkAcc {
             (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf, r.0.ptr, r.6.ptr)
         };
         // 배치 모드 — 6연산 단일 제출 (plans/19: sync ~0.9ms×5 절감)
-        ctx.begin_batch()?;
+        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+            ctx.begin_batch()?;
+        }
         // 1) xs 업로드 → quant(n0)
         for (ti, row) in xs.iter().enumerate() {
             unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0) };
         }
         {
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
-            ctx.bind_bufs(p.ds, &[xbf, bq0]);
+            let ds2 = self.bind_ds(&mut ctx, &p, &[xbf, bq0])?;
             let push = push_u32s(&[n0 as u32, t as u32, xq0_w as u32]);
-            ctx.run(p.pl, p.ds, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
+            ctx.run(p.pl, ds2, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
         }
         // 2) gate/up GEMV (같은 xq0) — 상주 출력
         for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
@@ -446,18 +462,18 @@ impl VkAcc {
         // 3) silu_mul 상주 (bfg, bfu → bglu)
         {
             let p = self.pipeline(&mut ctx, Slot::Silu)?;
-            ctx.bind_bufs(p.ds, &[bfg, bfu, bglu]);
+            let ds2 = self.bind_ds(&mut ctx, &p, &[bfg, bfu, bglu])?;
             let total = (t * n_ff) as u32;
-            ctx.run(p.pl, p.ds, p.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
+            ctx.run(p.pl, ds2, p.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
         }
         // 4) glu quant(n_ff)
         {
             // bglu는 f32가 아니라 f32→q8 변환 입력 — quant 셰이더에 직접.
             // (bglu는 silu 출력 f32 → quant가 읽는다)
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
-            ctx.bind_bufs(p.ds, &[bglu, bq1]);
+            let ds2 = self.bind_ds(&mut ctx, &p, &[bglu, bq1])?;
             let push = push_u32s(&[n_ff as u32, t as u32, xq1_w as u32]);
-            ctx.run(p.pl, p.ds, p.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
+            ctx.run(p.pl, ds2, p.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
         }
         // 5) down GEMV
         {
@@ -466,7 +482,9 @@ impl VkAcc {
             self.gemv_run(&mut ctx, &wbufs, n_ff, down_w.n_out as usize, xq1_w, ty, t, bq1, bob)?;
         }
         // 6) 일괄 제출·대기 → 다운로드 1회
-        ctx.end_batch_wait()?;
+        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+            ctx.end_batch_wait()?;
+        }
         let host = unsafe { std::slice::from_raw_parts(ob_ptr as *const f32, t * n0) };
         for ti in 0..t {
             xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
@@ -531,7 +549,10 @@ impl Accelerator for VkAcc {
         let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
         self.quant_upload(&mut ctx, xs, n_in, xq)?;
         // 배치: 모든 가중 GEMV 녹화 → 단일 제출 → 일괄 다운로드 (plans/19)
-        ctx.begin_batch()?;
+        let do_batch = std::env::var_os("LLM170_VK_NOBATCH").is_none();
+        if do_batch {
+            ctx.begin_batch()?;
+        }
         let mut hosts: Vec<(*mut u8, usize, usize)> = Vec::with_capacity(ws.len()); // (ptr, n_out, ti스트라이드)
         for (wi, w) in ws.iter().enumerate() {
             let ty = vk_ty(w.ty).unwrap();
@@ -556,7 +577,9 @@ impl Accelerator for VkAcc {
             let ptr = self.gobufs.lock()[wi].as_ref().unwrap().ptr;
             hosts.push((ptr, n_out, wi));
         }
-        ctx.end_batch_wait()?;
+        if do_batch {
+            ctx.end_batch_wait()?;
+        }
         for (ptr, n_out, wi) in hosts {
             let host = unsafe { std::slice::from_raw_parts(ptr as *const f32, t * n_out) };
             for ti in 0..t {
