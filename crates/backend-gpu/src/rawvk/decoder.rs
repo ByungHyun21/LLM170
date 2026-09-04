@@ -30,6 +30,11 @@ struct I8W {
     n_in: usize,
 }
 
+/// ishs/faccs 워크그룹 상한 — 전 i8w 텐서의 max(n_out/16).
+fn i8_wg_max(map: &HashMap<String, I8W>) -> usize {
+    map.values().map(|e| e.n_out.div_ceil(16)).max().unwrap_or(1)
+}
+
 pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
 }
@@ -546,7 +551,8 @@ impl DecoderState {
                     hs.push(s.spawn(move || {
                         for o in r0..end {
                             for bidx in 0..nblk {
-                                let wb = &data[bidx * 176..bidx * 176 + 176];
+                                let wb0 = (o * nblk + bidx) * 176; // 행 오프셋 — 블록은 행 우선
+                                let wb = &data[wb0..wb0 + 176];
                                 let d = llm170_core::quant::f16(wb, 0);
                                 let dm = llm170_core::quant::f16(wb, 2);
                                 for j in 0..8 {
@@ -570,12 +576,26 @@ impl DecoderState {
                 }
                 for h in hs { let _ = h.join(); }
             });
-            let wbuf = ctx.alloc_host(no * ni)?;
-            unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, wbuf.ptr, no * ni) };
-            let wspbuf = ctx.alloc_host(no * n_sub * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(wsp.as_ptr(), wspbuf.ptr as *mut f32, no * n_sub) };
-            let wsmbuf = ctx.alloc_host(no * n_sub * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(wsm.as_ptr(), wsmbuf.ptr as *mut f32, no * n_sub) };
+            // carveout + 언맵 — alloc_host(대형)는 i8 coopmatLoad 경로에서
+            // 데이터 붕괴 실측 (미니 재현: 소형 carveout ★, 대형 host ✗).
+            let wbuf = {
+                let mut b = ctx.alloc(no * ni)?;
+                unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, b.ptr, no * ni) };
+                ctx.unmap(&mut b)?;
+                b
+            };
+            let wspbuf = {
+                let mut b = ctx.alloc(no * n_sub * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(wsp.as_ptr(), b.ptr as *mut f32, no * n_sub) };
+                ctx.unmap(&mut b)?;
+                b
+            };
+            let wsmbuf = {
+                let mut b = ctx.alloc(no * n_sub * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(wsm.as_ptr(), b.ptr as *mut f32, no * n_sub) };
+                ctx.unmap(&mut b)?;
+                b
+            };
             i8w.insert(name, I8W { w: wbuf, wsp: wspbuf, wsm: wsmbuf, n_out: no, n_in: ni });
         }
         let n_max = hp.n_ff.max(n);
@@ -583,8 +603,9 @@ impl DecoderState {
         let b8 = ctx.alloc_host(T_MAX * n_max)?;
         let ydb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
         let qsb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
-        let ishs = ctx.alloc_host(640 * 256 * 4)?;
-        let faccs = ctx.alloc_host(640 * 256 * 4)?;
+        let wg_max = i8_wg_max(&i8w).max(640);
+        let ishs = ctx.alloc_host(wg_max * 256 * 4)?;
+        let faccs = ctx.alloc_host(wg_max * 256 * 4)?;
         Ok(Self {
             ctx,
             max_ssbo: max_ssbo0,
@@ -1093,13 +1114,17 @@ impl DecoderState {
                     unsafe { std::ptr::copy_nonoverlapping(self.b_gqkv.ptr as *const f32, g.as_mut_ptr(), 8) };
                     let gq: f64 = unsafe { std::slice::from_raw_parts(self.b_gqkv.ptr as *const f32, 128) }.iter().map(|&v| v as f64).sum();
                     let d0 = format!("{:?}", g);
+                    let gz8: Vec<f32> = unsafe { std::slice::from_raw_parts(self.b_gz.ptr as *const f32, 8) }.to_vec();
+                    let gb8: Vec<f32> = unsafe { std::slice::from_raw_parts(self.b_gb.ptr as *const f32, 4) }.to_vec();
+                    eprintln!("#  stage2 gz={:?} gb={:?}", gz8, gb8);
                     let mut b8v = [0i8; 16];
                     unsafe { std::ptr::copy_nonoverlapping(self.b8.ptr as *const i8, b8v.as_mut_ptr(), 16) };
+                    let b8r1: Vec<i8> = unsafe { std::slice::from_raw_parts(self.b8.ptr as *const i8, 32) }[16..].to_vec();
                     let mut ydv = [0f32; 4];
                     unsafe { std::ptr::copy_nonoverlapping(self.ydb.ptr as *const f32, ydv.as_mut_ptr(), 4) };
                     let mut qsv = [0i32; 4];
                     unsafe { std::ptr::copy_nonoverlapping(self.qsb.ptr as *const i32, qsv.as_mut_ptr(), 4) };
-                    eprintln!("#  SB post-gemv4 xs0={s0:.4} gqkv0={gq:.4} first8={d0} b8={:?} yd={:?} qs={:?}", b8v.to_vec(), ydv.to_vec(), qsv.to_vec());
+                    eprintln!("#  SB post-gemv4 xs0={s0:.4} gqkv0={gq:.4} first8={d0} b8={:?} b8tail={:?} yd={:?} qs={:?}", b8v.to_vec(), b8r1, ydv.to_vec(), qsv.to_vec());
                 }
                 // conv — gy=t (이력은 qkv에서 판독, t>1은 링을 conv_state가 갱신)
                 {

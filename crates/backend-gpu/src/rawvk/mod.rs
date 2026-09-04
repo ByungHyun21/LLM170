@@ -65,7 +65,7 @@ use ash::vk;
         let bbuf = ctx.alloc(256)?;
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr() as *const u8, bbuf.ptr, 256) };
         let cbuf = ctx.alloc_host(256 * 4)?;
-        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(
             include_bytes!("spv/i8probe.spv"), 3, 8,
         )?;
         let _ = dsl;
@@ -179,7 +179,8 @@ use ash::vk;
 
     // ── gemm_i8 미니: n_in=32(n_sub=1), no=16, t=2 — 실 커널 소형 등가검증.
     {
-        let (n_in, no, t) = (32usize, 16usize, 2usize);
+        let (n_in, no, t) = (5120usize, 10240usize, 2usize); // 실제 no — 640 워크그룹
+        let _nwg = no.div_ceil(16);
         let n_sub = 1usize;
         // 데이타: w8 [-20,20], wsp/wsm [0.01,0.05], b8 [-100,100], yd/qsum 결정적
         let seed2 = std::cell::Cell::new(42u64);
@@ -190,32 +191,56 @@ use ash::vk;
         let mut b8: Vec<i8> = (0..t * n_in).map(|_| (lcg2() % 201 - 100) as i8).collect();
         b8.resize(16 * n_in, 0); // B 로드가 n=0..15 읽음 — 패딩
         let yd: Vec<f32> = (0..t * n_sub).map(|i| 0.012 + i as f32 * 0.003).collect();
-        let qsum: Vec<i32> = (0..t * n_sub).map(|i| -50 + i as i32 * 30).collect();
+        // qsum은 진짜 Σb8이어야 (커널은 버퍼값을 그대로 씀)
+        let qsum: Vec<i32> = (0..t * n_sub).map(|i| {
+            (0..32usize).map(|k| b8[i * n_in + k] as i32).sum()
+        }).collect();
         let mut mk = |v: &[u8]| -> Result<vk::Buffer, String> {
             let b = ctx.alloc(v.len() + 16)?;
             unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr, v.len()) };
             Ok(b.buf)
         };
         let wbuf = mk(unsafe { std::slice::from_raw_parts(w8.as_ptr() as *const u8, w8.len()) })?;
-        let b8buf = mk(unsafe { std::slice::from_raw_parts(b8.as_ptr() as *const u8, b8.len()) })?;
+
         let wspbuf = mk(bytemuck::cast_slice(&wsp))?;
         let wsmbuf = mk(bytemuck::cast_slice(&wsm))?;
-        let ydbuf = mk(bytemuck::cast_slice(&yd))?;
-        let qsbuf = mk(bytemuck::cast_slice(&qsum))?;
+        // 실경로 미러: b8/yd/qs는 alloc_host (GTT)
+        let b8buf = {
+            let b = ctx.alloc_host(b8.len())?;
+            unsafe { std::ptr::copy_nonoverlapping(b8.as_ptr() as *const u8, b.ptr, b8.len()) };
+            b.buf
+        };
+        let ydbuf = {
+            let b = ctx.alloc_host(yd.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(yd.as_ptr(), b.ptr as *mut f32, yd.len()) };
+            b.buf
+        };
+        let qsbuf = {
+            let b = ctx.alloc_host(qsum.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(qsum.as_ptr(), b.ptr as *mut i32, qsum.len()) };
+            b.buf
+        };
         let obuf = ctx.alloc_host(t * no * 4)?;
         let ishsb = ctx.alloc_host(640 * 256 * 4)?;
         let faccsb = ctx.alloc_host(640 * 256 * 4)?;
         // 센티넬 프리필 — 커널이 실제 쓴 영역 검증
         unsafe { std::ptr::write_bytes(ishsb.ptr as *mut u8, 0xAB, 640 * 256 * 4); }
-        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(
             include_bytes!("spv/gemm_i8.spv"), 16, 16,
         )?;
         let _ = dsl;
         let mut binds16 = vec![wbuf; 8];
-        binds16.extend_from_slice(&[b8buf, obuf.buf, wspbuf, wsmbuf, ydbuf, qsbuf, ishsb.buf, faccsb.buf]);
-        ctx.bind_bufs(ds, &binds16);
+        let ishs_m = ctx.alloc_host(no.div_ceil(16) * 256 * 4)?;
+        let faccs_m = ctx.alloc_host(no.div_ceil(16) * 256 * 4)?;
+        binds16.extend_from_slice(&[b8buf, obuf.buf, wspbuf, wsmbuf, ydbuf, qsbuf, ishs_m.buf, faccs_m.buf]);
+        // 배치 모드 재현 (run_pipe 경로) — fresh_ds + op간 배리어 포함
+        ctx.begin_batch()?;
+        ctx.batch_dsl.set(Some((dsl, dp)));
+        let ds_f = ctx.fresh_ds(16)?;
+        ctx.bind_bufs(ds_f, &binds16);
         let push16: Vec<u8> = [n_in as u32, no as u32, t as u32, n_sub as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
-        ctx.run(pl, ds, pipe, &push16, (no.div_ceil(16)) as u32, 1, 1)?;
+        ctx.run(pl, ds_f, pipe, &push16, (no.div_ceil(16)) as u32, 1, 1)?;
+        ctx.end_batch_wait()?;
         let mut out = vec![0f32; t * no];
         unsafe { std::ptr::copy_nonoverlapping(obuf.ptr as *const f32, out.as_mut_ptr(), out.len()) };
         let sentinel = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 4) }[0];
@@ -224,7 +249,7 @@ use ash::vk;
         let mut mx = 0f64;
         let mut ok = true;
         for tok in 0..t {
-            for o in 0..no {
+            for o in 0..16usize { // 검증은 첫 16행
                 let mut acc = 0f32;
                 for b in 0..n_sub {
                     let mut isum = 0i32;
