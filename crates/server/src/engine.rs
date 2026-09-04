@@ -21,6 +21,9 @@ pub struct InferResult {
     pub tokens: Vec<u32>,
 }
 
+/// serve --spec k 전역 (기본 0).
+pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 pub enum Engine {
     Q35(llm170_core::model::Engine),
     Q4(llm170_core::qwen4exp::layers::Engine4),
@@ -31,6 +34,8 @@ pub enum Engine {
 pub struct SlotJob {
     pub tokens: Vec<u32>,
     pub n_predict: usize,
+    /// MTP 스펙 k (0=off) — serve --spec.
+    pub spec_k: usize,
     /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
     pub stops: Vec<u32>,
     /// 토큰별 SSE 스트림 채널.
@@ -136,11 +141,45 @@ pub fn slot_loop(
             decoded = true;
             match &mut eng {
                 Engine::Q35(e) => {
-                    let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-                    let seqs: Vec<usize> = active.clone();
-                    if let Ok(logits) = e.decode(&seqs, &toks) {
-                        for (row, &i) in active.iter().enumerate() {
-                            slot_step(&mut slots[i], &logits[row]);
+                    // 스펙 슬롯 분리 — spec_step 경로 (plans/21).
+                    let spec_slots: Vec<usize> = active.iter().copied()
+                        .filter(|&i| slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0))
+                        .collect();
+                    if !spec_slots.is_empty() && e.has_mtp() && e.raw_decode.is_some() {
+                        for &i in &spec_slots {
+                            let k = slots[i].job.as_ref().unwrap().spec_k.min(8).max(1);
+                            let next = slots[i].next;
+                            let cap = slots[i].job.as_ref().unwrap().n_predict;
+                            if let Ok((acc, _tf)) = e.spec_step(i, next, k) {
+                                for &t in &acc {
+                                    if slots[i].generated as usize >= cap {
+                                        break;
+                                    }
+                                    slot_emit(&mut slots[i], t);
+                                    if t == EOS {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let plain: Vec<usize> = active.iter().copied()
+                            .filter(|&i| !spec_slots.contains(&i)).collect();
+                        if !plain.is_empty() {
+                            let toks: Vec<u32> = plain.iter().map(|&i| slots[i].next).collect();
+                            let seqs: Vec<usize> = plain.clone();
+                            if let Ok(logits) = e.decode(&seqs, &toks) {
+                                for (row, &i) in plain.iter().enumerate() {
+                                    slot_step(&mut slots[i], &logits[row]);
+                                }
+                            }
+                        }
+                    } else {
+                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+                        let seqs: Vec<usize> = active.clone();
+                        if let Ok(logits) = e.decode(&seqs, &toks) {
+                            for (row, &i) in active.iter().enumerate() {
+                                slot_step(&mut slots[i], &logits[row]);
+                            }
                         }
                     }
                 }

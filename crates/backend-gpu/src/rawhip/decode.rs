@@ -849,13 +849,21 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<(), String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        let t_rv0 = std::time::Instant::now();
         ds.verify_batch(seq, pos0, emb, argmaxes)?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[rv] verify_batch={:.1}ms", t_rv0.elapsed().as_secs_f64() * 1e3);
+        }
         // 행별 최종 hidden export (MTP 상태 진행용) — xs_t에 step_batch 결과 잔존
         let t = emb.len() / ds.n_embd;
         h_all.clear();
         h_all.resize(t * ds.n_embd, 0.0);
+        let t_h0 = std::time::Instant::now();
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[rv] h_all d2h={:.1}ms", t_h0.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(())
     }
 
@@ -1459,16 +1467,23 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let t_a0 = std::time::Instant::now();
         argmaxes.clear();
         argmaxes.resize(t, 0);
-        let mut row_buf = vec![0f32; noh];
-        let _ = t_a0;
+        // 단일 블록 d2h — 행별 동기 왕복이 사이클당 수백 ms였음 (2026-09-04).
+        let mut all_buf = vec![0f32; t * noh];
+        let t_d0 = std::time::Instant::now();
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vb] d2h={:.1}ms ({}MB)", t_d0.elapsed().as_secs_f64() * 1e3, t * noh * 4 / 1048576);
+        }
+        let t_am0 = std::time::Instant::now();
         for ti in 0..t {
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut row_buf).as_mut(),
-                unsafe { self.logits_all.offset((ti * noh * 4) as isize) } as *const u8)?;
             let mut best = 0usize; let mut bv = f32::NEG_INFINITY;
-            for (i, &v) in row_buf.iter().enumerate() {
+            for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
                 if v > bv { bv = v; best = i; }
             }
             argmaxes[ti] = best as u32;
+        }
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vb] argmax_cpu={:.1}ms", t_am0.elapsed().as_secs_f64() * 1e3);
         }
 
         Ok(())
@@ -2292,13 +2307,12 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         )?;
         argmaxes.clear();
         argmaxes.resize(t, 0);
-        let mut row_buf = vec![0f32; noh];
+        let mut all_buf = vec![0f32; t * noh];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
         for ti in 0..t {
-            let src = unsafe { self.logits_all.offset((ti * noh * 4) as isize) } as *const u8;
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut row_buf).as_mut(), src)?;
             let mut best = 0usize;
             let mut bv = f32::NEG_INFINITY;
-            for (i, &v) in row_buf.iter().enumerate() {
+            for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
                 if v > bv {
                     bv = v;
                     best = i;
