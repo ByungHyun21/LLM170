@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// quant_b8v2 (plans/24) — per-row(토큰) 단일 스케일 mlx 방식.
+// 워크그룹(64스레드)×gy=t — 64 스트라이드로 행 전체 스캔.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Xbuf { float x[]; };
+layout(binding = 1) buffer B8buf { int8_t b8[]; };
+layout(binding = 2) buffer Ydbuf { float ydr[]; };  // [t] 스칼라
+layout(push_constant) uniform PC { uint n_in; uint t; } pc;
+shared float sh[64];
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    uint u = gl_LocalInvocationID.x;
+    uint n = pc.n_in;
+    uint base = tok * n;
+    float lo = 0.0f;
+    for (uint i = u; i < n; i += 64u) lo = max(lo, abs(x[base + i]));
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (u < s) sh[u] = max(lo, sh[u + s]);
+        barrier();
+        lo = sh[u];
+        barrier();
+    }
+    if (u == 0u) {
+        float d = lo / 127.0f;
+        ydr[tok] = d;
+        sh[0] = d != 0.0f ? 1.0f / d : 0.0f;
+    }
+    barrier();
+    float id = sh[0];
+    for (uint i = u; i < n; i += 64u) {
+        float xv = x[base + i] * id;
+        float r = xv >= 0.0f ? float(int(xv + 0.5f)) : -float(int(0.5f - xv));
+        b8[base + i] = int8_t(int(clamp(r, -127.0f, 127.0f)));
+    }
+}

@@ -1,0 +1,58 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemm_i8v2 (plans/24) — per-row requant (mlx 방식): 스케일이 행별 상수라
+// K 전체를 단일 int32 어큐뮬레이터로 누적 — drain/barrier/ishs/faccs 없음.
+// out[t][o] = ydr[t]·wsr[o]·Σ_k w8[o][k]·b8[t][k]
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { int8_t w0c[]; };
+layout(binding = 1) readonly buffer W1 { int8_t w1c[]; };
+layout(binding = 2) readonly buffer W2 { int8_t w2c[]; };
+layout(binding = 3) readonly buffer W3 { int8_t w3c[]; };
+layout(binding = 4) readonly buffer W4 { int8_t w4c[]; };
+layout(binding = 5) readonly buffer W5 { int8_t w5c[]; };
+layout(binding = 6) readonly buffer W6 { int8_t w6c[]; };
+layout(binding = 7) readonly buffer W7 { int8_t w7c[]; };
+layout(binding = 8) readonly buffer B8 { int8_t b8[]; };   // [t][n_in]
+layout(binding = 9) buffer Obuf { float outv[]; };          // [t][n_out]
+layout(binding = 10) readonly buffer Wsr { float wsr[]; };  // [n_out] 행 스케일
+layout(binding = 11) readonly buffer Ydr { float ydr[]; };  // [t]
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t;
+} pc;
+shared int32_t ish[256];
+
+void main() {
+    uint rb = gl_WorkGroupID.x;
+    uint row0 = rb * 16u;
+    if (row0 >= pc.n_out) return;
+    for (uint tb = 0u; tb < pc.t; tb += 16u) {
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        // K 전체 누적 — tile_q5k가 검증한 단일 acc 체인 패턴.
+        for (uint k0 = 0u; k0 < pc.n_in; k0 += 16u) {
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+            coopMatLoad(ma, w0c, row0 * pc.n_in + k0, pc.n_in, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb, b8, tb * pc.n_in + k0, pc.n_in, gl_CooperativeMatrixLayoutColumnMajor);
+            acc = coopMatMulAdd(ma, mb, acc);
+        }
+        // 1회 store → 행/토큰 스케일 곱 — drain 없음.
+        coopMatStore(acc, ish, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        uint lane = gl_LocalInvocationID.x;
+        for (uint e = lane * 4u; e < lane * 4u + 4u; e++) {
+            uint m = e >> 4, n = e & 15u;
+            uint tok = tb + n;
+            if (tok < pc.t) {
+                outv[tok * pc.n_out + row0 + m] =
+                    float(ish[e]) * wsr[row0 + m] * ydr[tok];
+            }
+        }
+        barrier();
+    }
+}

@@ -20,6 +20,8 @@ const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
+const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
+const GEMM_I8V2_SPV: &[u8] = include_bytes!("spv/gemm_i8v2.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 struct I8W {
@@ -129,6 +131,7 @@ pub struct DecoderState {
     snap_conv: Vec<Vec<f32>>,
     // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
     i8w: HashMap<String, I8W>,
+    wsr: HashMap<String, VkBuf>, // v2 행 스케일
     b8: VkBuf,   // [T_MAX][n_max] i8 활성 매트릭스
     ydb: VkBuf,  // [T_MAX][n_sub_max] f32
     qsb: VkBuf,  // [T_MAX][n_sub_max] i32
@@ -532,6 +535,7 @@ impl DecoderState {
         let b_lg_t = ah(T_MAX * n_vocab)?;
         // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
         let mut i8w: HashMap<String, I8W> = HashMap::new();
+        let mut wsr_map: HashMap<String, VkBuf> = HashMap::new();
         for (name, data, ni, no) in q5k_src {
             let n_sub = ni / 32;
             let nblk = ni / 256;
@@ -578,12 +582,6 @@ impl DecoderState {
             });
             // carveout + 언맵 — alloc_host(대형)는 i8 coopmatLoad 경로에서
             // 데이터 붕괴 실측 (미니 재현: 소형 carveout ★, 대형 host ✗).
-            let wbuf = {
-                let mut b = ctx.alloc(no * ni)?;
-                unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, b.ptr, no * ni) };
-                ctx.unmap(&mut b)?;
-                b
-            };
             let wspbuf = {
                 let mut b = ctx.alloc(no * n_sub * 4)?;
                 unsafe { std::ptr::copy_nonoverlapping(wsp.as_ptr(), b.ptr as *mut f32, no * n_sub) };
@@ -593,6 +591,57 @@ impl DecoderState {
             let wsmbuf = {
                 let mut b = ctx.alloc(no * n_sub * 4)?;
                 unsafe { std::ptr::copy_nonoverlapping(wsm.as_ptr(), b.ptr as *mut f32, no * n_sub) };
+                ctx.unmap(&mut b)?;
+                b
+            };
+            // v2 (mlx식): 정확 디양자화 후 행별 재양자 — w8 덮어씀 + wsr.
+            // w_deq = d·sc·q − dm·m (q = w_int). v1 wsp/wsm은 이미 계산됨.
+            {
+                let mut wsr_v = vec![0f32; no];
+                for o in 0..no {
+                    let mut mx = 0f32;
+                    for b in 0..n_sub {
+                        let s = wsp[o * n_sub + b];
+                        let mn = wsm[o * n_sub + b];
+                        let mut isum_min = 0i64;
+                        for e in 0..32 {
+                            isum_min += w8[o * ni + b * 32 + e] as i64;
+                        }
+                        // 값 범위: max|d·sc·q − dm·m| 근사 — 실제 최댓값은 원소별 계산
+                        let hi = (s * 47.0).abs() + mn.abs();
+                        let lo = mn.abs();
+                        mx = mx.max(hi.max(lo));
+                    }
+                    // 정확 최댓값: 원소별 (느려도 init 1회)
+                    mx = 0f32;
+                    for b in 0..n_sub {
+                        let s = wsp[o * n_sub + b];
+                        let mn = wsm[o * n_sub + b];
+                        for e in 0..32 {
+                            let v = s * w8[o * ni + b * 32 + e] as f32 - mn;
+                            mx = mx.max(v.abs());
+                        }
+                    }
+                    let d = mx / 127.0f32;
+                    let id = if d > 0.0 { 1.0f32 / d } else { 0.0f32 };
+                    wsr_v[o] = d;
+                    for b in 0..n_sub {
+                        let s = wsp[o * n_sub + b];
+                        let mn = wsm[o * n_sub + b];
+                        for e in 0..32 {
+                            let v = s * w8[o * ni + b * 32 + e] as f32 - mn;
+                            w8[o * ni + b * 32 + e] = (v * id).round().clamp(-127.0, 127.0) as i8;
+                        }
+                    }
+                }
+                let mut b = ctx.alloc(no * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(wsr_v.as_ptr(), b.ptr as *mut f32, no) };
+                ctx.unmap(&mut b)?;
+                wsr_map.insert(name.clone(), b);
+            }
+            let wbuf = {
+                let mut b = ctx.alloc(no * ni)?;
+                unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, b.ptr, no * ni) };
                 ctx.unmap(&mut b)?;
                 b
             };
@@ -681,6 +730,7 @@ impl DecoderState {
             snap_gdn: vec![Vec::new(); n_recr * n_seqs],
             snap_conv: vec![Vec::new(); n_recr * n_seqs],
             i8w,
+            wsr: wsr_map,
             b8,
             ydb,
             qsb,
@@ -776,6 +826,27 @@ impl DecoderState {
         self.run_pipe("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 20, &binds, &push, no as u32, 1, 1)
     }
 
+    /// v2 (mlx식) — per-row 스케일: quant_b8v2 + gemm_i8v2. LLM170_VK_I8=2.
+    fn gemm_i8v2(&mut self, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
+        let (wbuf, ni, no) = (e.w.clone(), e.n_in, e.n_out);
+        let wsr = self.wsr.get(wkey).cloned().ok_or("wsr 없음")?;
+        // quant_b8v2: b_xn → b8 + ydr (ydb 첫 t 슬롯 재사용)
+        let push = Self::push_u32s(&[ni as u32, t as u32]);
+        self.run_pipe("quant_b8v2", QUANT_B8V2_SPV, 3, 8,
+            &[self.b_xn.buf, self.b8.buf, self.ydb.buf], &push,
+            1, t as u32, 1)?;
+        let mut binds: Vec<vk::Buffer> = vec![wbuf.buf; 1];
+        while binds.len() < 8 { binds.push(self.dummy.buf); }
+        binds.push(self.b8.buf);
+        binds.push(out);
+        binds.push(wsr.buf);
+        binds.push(self.ydb.buf);
+        let push2 = Self::push_u32s(&[ni as u32, no as u32, t as u32]);
+        self.run_pipe("gemm_i8v2", GEMM_I8V2_SPV, 12, 12, &binds, &push2,
+            (no as u32 + 15) / 16, 1, 1)
+    }
+
     /// gemm_i8 (plans/23) — q5_K 사전 언패분으로 t행 GEMM.
     fn gemm_i8(&mut self, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
@@ -803,12 +874,15 @@ impl DecoderState {
     fn gemv_stage(&mut self, n: usize, t: usize, jobs: &[(String, vk::Buffer, vk::Buffer)]) -> Result<(), String> {
         let i8_on = t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none();
         let any_i8 = i8_on && jobs.iter().any(|(k, _, _)| self.i8w.contains_key(k));
-        if any_i8 {
-            // b8 양자화 — 이 단계 공유 (src는 jobs[0].0의 xq가 아닌 원본 f32 필요)
-        }
+        let _ = &any_i8;
+        let v2 = std::env::var("LLM170_VK_I8").map(|v| v == "2").unwrap_or(false);
         for (k, xq, out) in jobs {
             if any_i8 && self.i8w.contains_key(k) {
-                self.gemm_i8(k, *out, t)?;
+                if v2 {
+                    self.gemm_i8v2(k, *out, t)?;
+                } else {
+                    self.gemm_i8(k, *out, t)?;
+                }
             } else {
                 self.gemv(*xq, k, *out, t)?;
             }
