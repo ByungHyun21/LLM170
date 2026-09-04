@@ -9,27 +9,30 @@ layout(binding = 0) readonly buffer Q { float q[]; };     // [n_head*2hd]
 layout(binding = 1) readonly buffer Ck { float ck[]; };   // [ctx][n_kv*hd]
 layout(binding = 2) readonly buffer Cv { float cv[]; };   // [ctx][n_kv*hd]
 layout(binding = 3) readonly buffer Mask { uint mask[]; };// [ctx][ctx]
-layout(binding = 4) buffer O { float o[]; };              // [n_head*hd]
+layout(binding = 4) buffer O { float o[]; };              // [t][n_head*hd]
 layout(push_constant) uniform PC {
-    int np; int nh; int nk; int hd; int ss; int pos;
+    int pos0; int nh; int nk; int hd; int ss;
 } pc;
 shared float qf[256];
 shared float rs[8];
 void main() {
+    int row = int(gl_WorkGroupID.x);
     int h = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationIndex);
     int lane = tid & 31;
     int wid = tid >> 5;
     bool act = tid < pc.hd;
     int kvh = h / (pc.nh / pc.nk);
-    int qb = h * 2 * pc.hd;
+    int pos = pc.pos0 + row;
+    int np = pos + 1;
+    int qb = row * pc.nh * 2 * pc.hd + h * 2 * pc.hd;
     if (act) qf[tid] = q[qb + tid];
     barrier();
     float m = -3.4028235e38;
     float sm = 0.0;
     float acc = 0.0;
-    for (int p = 0; p < pc.np; p++) {
-        if (mask[pc.pos * pc.ss + p] == 0u) continue;
+    for (int p = 0; p < np; p++) {
+        if (mask[pos * pc.ss + p] == 0u) continue;
         int kb = p * pc.nk * pc.hd + kvh * pc.hd;
         float x = act ? qf[tid] * ck[kb + tid] : 0.0;
         for (int off = 16; off > 0; off >>= 1)
@@ -54,5 +57,5 @@ void main() {
     }
     if (!act) return;
     float g = 1.0 / (1.0 + exp(-q[qb + pc.hd + tid]));
-    o[h * pc.hd + tid] = acc * (1.0 / sm) * g;
+    o[(row * pc.nh + h) * pc.hd + tid] = acc * (1.0 / sm) * g;
 }
