@@ -1912,6 +1912,11 @@ extern "C" __global__ void gemm_nl(const unsigned* xq, const unsigned* w,
     }
 }
 
+__device__ __forceinline__ float f16w_ldg(const unsigned* w, int byte_off) {
+    unsigned v = __ldg((const unsigned*)((const char*)w + byte_off));
+    return __half2float(__ushort_as_half((unsigned short)(v & 0xFFFFu)));
+}
+
 // q3_K (ty11) — 16원소 하프블록, ql/hm byte() 로드(비정렬)
 extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
                                     double* part, float* out, int n_in, int n_out, int xq_w) {
@@ -1945,8 +1950,8 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         int sw = (wb + 96) >> 2;
         int off = rb2;   // (wb+96)&3 == wb&3 (96≡0 mod 4) — 스레드 불변
         unsigned a0, a1, tmp;
-        if (off == 0) { a0 = w[sw]; a1 = w[sw+1]; tmp = w[sw+2]; }
-        else { a0 = (w[sw] >> 16) | (w[sw+1] << 16); a1 = (w[sw+1] >> 16) | (w[sw+2] << 16); tmp = (w[sw+2] >> 16) | (w[sw+3] << 16); }
+        if (off == 0) { a0 = __ldg(&w[sw]); a1 = __ldg(&w[sw+1]); tmp = __ldg(&w[sw+2]); }
+        else { a0 = (__ldg(&w[sw]) >> 16) | (__ldg(&w[sw+1]) << 16); a1 = (__ldg(&w[sw+1]) >> 16) | (__ldg(&w[sw+2]) << 16); tmp = (__ldg(&w[sw+2]) >> 16) | (__ldg(&w[sw+3]) << 16); }
         unsigned k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
         unsigned aux;
         if (ai < 4) aux = (a0 & k2) | ((tmp & k1) << 4);
@@ -1954,7 +1959,7 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         else if (ai < 12) aux = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
         else aux = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
         unsigned scb = (aux >> aish) & 0xFFu;
-        float dl = f16w(w, wb + 108) * (float)(sext8(scb) - 32);
+        float dl = f16w_ldg(w, wb + 108) * (float)(sext8(scb) - 32);
         int qlb2 = wb + 32 + hh * 32 + p * 16;
         int hbase2 = wb + p * 16;
         int xw = (h << 4) >> 2;
@@ -1969,12 +1974,12 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         unsigned qs[4], hs[4];
         if (alq) {
             #pragma unroll
-            for (int k = 0; k < 4; k++) { qs[k] = w[qlw2 + k]; hs[k] = w[qhw2 + k]; }
+            for (int k = 0; k < 4; k++) { qs[k] = __ldg(&w[qlw2 + k]); hs[k] = __ldg(&w[qhw2 + k]); }
         } else {
-            unsigned s0 = w[qlw2], s1 = w[qlw2+1], s2 = w[qlw2+2], s3 = w[qlw2+3], s4 = w[qlw2+4];
+            unsigned s0 = w[qlw2], s1 = __ldg(&w[qlw2+1]), s2 = __ldg(&w[qlw2+2]), s3 = __ldg(&w[qlw2+3]), s4 = __ldg(&w[qlw2+4]);
             qs[0] = (s0 >> 16) | (s1 << 16); qs[1] = (s1 >> 16) | (s2 << 16);
             qs[2] = (s2 >> 16) | (s3 << 16); qs[3] = (s3 >> 16) | (s4 << 16);
-            unsigned t0 = w[qhw2], t1 = w[qhw2+1], t2 = w[qhw2+2], t3 = w[qhw2+3], t4 = w[qhw2+4];
+            unsigned t0 = w[qhw2], t1 = __ldg(&w[qhw2+1]), t2 = __ldg(&w[qhw2+2]), t3 = __ldg(&w[qhw2+3]), t4 = __ldg(&w[qhw2+4]);
             hs[0] = (t0 >> 16) | (t1 << 16); hs[1] = (t1 >> 16) | (t2 << 16);
             hs[2] = (t2 >> 16) | (t3 << 16); hs[3] = (t3 >> 16) | (t4 << 16);
         }
