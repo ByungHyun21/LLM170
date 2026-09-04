@@ -308,21 +308,26 @@ hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
 
 | test | llama.cpp ROCm | llama.cpp Vulkan | LLM170 HIP (tuned CO env) | LLM170 HIP (zero-config) |
 |---|---|---|---|---|
-| pp512 | **361.8** | **349.9** | 200.0¹ | 108.5 |
-| pp64  | 274.4 | 221.5 | 106.3 | ~52 |
-| tg8   | 10.92 | 11.82 | 9.49 | 9.49 |
+| pp512 | **361.8** | **349.9** | 236.9¹ | 236.9² |
+| pp64  | 274.4 | 221.5 | 172.6 | 172.6 |
+| tg8   | 10.92 | 11.82 | 9.72 | 9.72 |
 | tg32  | 11.70 | 12.02 | 10.41 | 10.41 |
 
 Key readings:
 - llama.cpp **Vulkan ≈ ROCm** on this APU (349.9 vs 361.8 pp512; Vulkan even
   wins tg8) — the RADV coopmat path reaches raw-loop parity, so our Vulkan gap
   (~4.6 t/s pp equivalent) is software, not hardware.
-- Our standing vs the fresh raw loop: pp512 0.51x (tuned) / 0.30x (zero-config),
-  tg 0.81-0.89x; np4×spec4 aggregate 25-28 t/s remains ahead of any llama.cpp
+- Our standing vs the fresh raw loop (2026-09-05): pp512 0.65x
+  (tuned == zero-config since the tile .co embedding), tg 0.89x;
+  np4×spec4 aggregate 25-28 t/s remains ahead of any llama.cpp
   single-stream config; prefix cache gives 2.6x on repeat prompts.
-- llm170 pprof (pp512, tuned): projection GEMMs ~1.05 s + ffn_gate ~0.73 s
-  dominate the 2.79 s wall — the raw-parity levers are proj/qkv tile throughput
-  and (for zero-config) embedding the offline .co tile kernels.
+- llm170 pprof (pp512, 2026-09-05): the earlier "projection GEMMs dominate"
+  reading conflated attention with projection — the unmarked attention
+  kernels drained inside the 'proj' event window (grew 111→410 ms per
+  chunk while GEMM stages stayed flat). With flash defaulted on, the true
+  per-chunk GEMM standing is ffn_gate ~147 ms + ffn ~84 ms + gdn_mm ~70 ms
+  + constant proj ~111 ms; the raw-parity levers are tile throughput
+  (ffn_gate/ffn) and GDN mm.
 
 ¹ 2026-09-05: pp512 184.1 → 200.0 (pp128 186 → 253). A 2-day bisect traced
 the 2026-09-04 regression to `prefill()` copying the full token_embd table
@@ -332,3 +337,10 @@ unnecessary. GPU kernel time was unchanged throughout (identical PP_PROF
 stage sums); the gap was constant per call regardless of token count,
 reps, or ctx. Restored in-place borrow; 41/41 stream bit-exact vs the
 pre-fix binary.
+
+² 2026-09-05 (later the same day): two defaults landed — (a) the three
+offline tile code objects are now `include_bytes!`-embedded and loaded
+automatically (zero-config == tuned, was 108.5 pp512); (b) the fused
+flash-attention kernel is the default path (was opt-in via
+LLM170_QSA_FLASH; kill switch LLM170_NO_FLASH). Stream 41/41 bit-exact
+across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
