@@ -2009,6 +2009,22 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
     const bool alq = (rb2 & 3) == 0;   // qlb2 = wb+32+hh*32+p*16 ≡ wb (mod 4)
     for (int m = 0; m < cnt; m++) {
         int h = l + (m << 6);
+        // ILP-2: 다음 m의 w 로드를 현재 계산과 병렬로 발사 (지연 은닉)
+        unsigned pf_qs[4]; unsigned pf_hs[4]; unsigned pf_a0, pf_a1, pf_tmp;
+        int pf_ok = (m + 1 < cnt);
+        int h2 = l + ((m + 1) << 6);
+        int blk2 = h2 >> 4;
+        int wb2 = row_base + blk2 * 110;
+        int sw2 = (wb2 + 96) >> 2;
+        int qlb2b = wb2 + 32 + hh * 32 + p * 16;
+        int hbase2b = wb2 + p * 16;
+        int qlw2b = qlb2b >> 2;
+        int qhw2b = hbase2b >> 2;
+        if (pf_ok) {
+            pf_a0 = __ldg(&w[sw2]); pf_a1 = __ldg(&w[sw2+1]); pf_tmp = __ldg(&w[sw2+2]);
+            #pragma unroll
+            for (int k = 0; k < 4; k++) { pf_qs[k] = __ldg(&w[qlw2b + k]); pf_hs[k] = __ldg(&w[qhw2b + k]); }
+        }
         int blk = h >> 4;
         int wb = row_base + blk * 110;
         // 스케일 12바이트(wb+96..107) — 필요한 aux 하나만 산출 (ai 고정)
@@ -2035,7 +2051,9 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
         // 스팬 5워드 1회 로드 후 인접 페어funnel로 4워드 구성 (미정렬시).
         int qlw2 = qlb2 >> 2;
         int qhw2 = hbase2 >> 2;
-        int isum = 0, qsum = 0, bsum = 0;
+        // dot4 word-SIMD (gemm_q5k 패턴 이식, 2026-09-05): 니블(0..3)과
+        // 하이비트(+4) 레인을 한 워드에 융합 → dot4 1회/워드. −4·Σy 보정은
+        // xq q16 테이블(Σ y바이트 하/상 16). 기존 3-dot4 대비 ALU 1/3.
         unsigned qs[4], hs[4];
         if (alq) {
             #pragma unroll
@@ -2048,17 +2066,19 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
             hs[0] = (t0 >> 16) | (t1 << 16); hs[1] = (t1 >> 16) | (t2 << 16);
             hs[2] = (t2 >> 16) | (t3 << 16); hs[3] = (t3 >> 16) | (t4 << 16);
         }
+        unsigned hbit = 1u << src;
+        int isum = 0;
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             unsigned yv = k==0?y0:k==1?y1:k==2?y2:y3;
-            isum = dot4((qs[k] >> qsh) & 0x03030303u, yv, isum);
-            qsum = dot4(0x04040404u, yv, qsum);
-            unsigned bitw = ((hs[k] >> src) & 0x01010101u) << 2;
-            bsum = dot4(bitw, yv, bsum);
+            unsigned nibw = (qs[k] >> qsh) & 0x03030303u;
+            unsigned bitw = ((hs[k] & (hbit * 0x01010101u)) >> src) << 2;  // +4 레인
+            isum = dot4(nibw | bitw, yv, isum);
         }
-        isum += bsum - qsum;
+        int qsb = (n_in >> 2) + (n_in >> 5);
+        int qsum = (int)xq[qsb + h] + (int)xq[qsb + h + 1];  // h=16값 idx → 32블록 h>>1의 테이블 [2·(h>>1)] = h
         float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
-        acc += yd * dl * (float)isum;
+        acc += yd * dl * ((float)isum - 4.0f * (float)qsum);
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
