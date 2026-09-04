@@ -420,8 +420,6 @@ extern "C" __global__ void gemm_q5k2(const unsigned* xq, const unsigned* w1, con
     int o;
     if (o0 < no1) { w = w1; out = out1; o = o0; }
     else { w = w2; out = out2; o = o0 - no1; }
-
-    int o = blockIdx.y + blockIdx.z * gridDim.y;  // 토큰=x축 — L2 행 재사용
     int l = threadIdx.x;
     if (l >= 64) return;   // o0 범위는 상단에서 이미 가드
     xq += (int)blockIdx.x * xq_w;
