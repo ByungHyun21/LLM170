@@ -52,11 +52,13 @@ struct Slot {
     touch: u64,
     /// 클라이언트 절단 — progress 채널 송신 실패로 감지 (SSE flush 실패).
     cancelled: bool,
+    /// 접두 캐시 — 상태가 구워진 전체 토큰열 (요청 간 유지, plans/24).
+    cached: Vec<u32>,
 }
 
 impl Slot {
     fn free() -> Self {
-        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0, cancelled: false }
+        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0, cancelled: false, cached: Vec::new() }
     }
 }
 
@@ -115,20 +117,38 @@ pub fn slot_loop(
     loop {
         // ① 새 작업 drain — 전 슬롯 점유 시 큐에 잔류 (bounded: http측 503)
         while let Ok(j) = rx.try_recv() {
-            let free = (0..n_slots)
+            // 접두 캐시 — cached 전체가 새 프롬프트의 접두면 이어서 프리필.
+            let prefix_ok = std::env::var_os("LLM170_NO_PREFIX").is_none();
+            let pick = (0..n_slots)
                 .filter(|&i| slots[i].job.is_none())
-                .min_by_key(|&i| slots[i].touch);
-            let Some(i) = free else { break };
-            eng.reset_seq(i);
+                .map(|i| {
+                    let l = if prefix_ok {
+                        slots[i].cached.iter().zip(j.tokens.iter()).take_while(|(a, b)| a == b).count()
+                    } else { 0 };
+                    let full = l > 0 && l == slots[i].cached.len() && j.tokens.len() > l;
+                    (i, if full { l } else { 0 })
+                })
+                .max_by_key(|&(_, l)| l);
+            let (i, reuse) = pick.unwrap_or((0, 0));
+            if slots[i].job.is_some() { break; }
+            if reuse == 0 {
+                eng.reset_seq(i);
+            }
+            let prev_cached = std::mem::take(&mut slots[i].cached);
             slots[i] = Slot {
                 job: Some(j),
-                prefilled: 0,
+                prefilled: reuse,
                 next: 0,
                 generated: 0,
                 tokens: Vec::new(),
                 touch: tick,
                 cancelled: false,
+                cached: prev_cached,
             };
+            if reuse > 0 {
+                // 시퀀스 pos는 이미 cached.len() — prefilled=reuse로 잔여만 프리필.
+                eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
+            }
         }
         tick += 1;
 
@@ -232,15 +252,37 @@ pub fn slot_loop(
         if !busy {
             match rx.recv() {
                 Ok(j) => {
-                    eng.reset_seq(0);
+                    // 접두 재사용 — drain 경로와 동일 규칙 (plans/24).
+                    let l = slots[0]
+                        .cached
+                        .iter()
+                        .zip(j.tokens.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let reuse = if std::env::var_os("LLM170_NO_PREFIX").is_none()
+                        && l > 0
+                        && l == slots[0].cached.len()
+                        && j.tokens.len() > l
+                    {
+                        l
+                    } else {
+                        0
+                    };
+                    if reuse == 0 {
+                        eng.reset_seq(0);
+                    } else {
+                        eprintln!("# prefix-cache: slot0 reuse {reuse}토큰");
+                    }
+                    let prev = std::mem::take(&mut slots[0].cached);
                     slots[0] = Slot {
                         job: Some(j),
-                        prefilled: 0,
+                        prefilled: reuse,
                         next: 0,
                         generated: 0,
                         tokens: Vec::new(),
                         touch: tick,
                         cancelled: false,
+                        cached: prev,
                     };
                 }
                 Err(_) => break,
@@ -283,10 +325,25 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
                 toks.pop();
             }
             toks.truncate(j.n_predict);
-            let _ = j.out.send(InferResult { tokens: toks });
+            let _ = j.out.send(InferResult { tokens: toks.clone() });
+            // 접두 캐시 — 상태 유지 (프롬프트+생성 = 구워진 열).
+            // 스펙 carried가 남으면 GDN이 뒤처짐 — 트렁크 재실행으로 커밋.
+            if let Engine::Q35(e) = eng {
+                let _ = e.flush_carried(i);
+            }
+            let mut full = j.tokens.clone();
+            full.extend(toks);
+            if std::env::var_os("LLM170_NO_PREFIX").is_none() {
+                s.cached = full;
+            } else {
+                eng.reset_seq(i);
+            }
+        } else {
+            eng.reset_seq(i);
         }
-        eng.reset_seq(i);
+        let c = std::mem::take(&mut s.cached);
         *s = Slot::free();
+        s.cached = c;
     }
 }
 

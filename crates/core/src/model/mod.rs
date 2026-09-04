@@ -1286,6 +1286,36 @@ impl Engine {
         Ok(results)
     }
 
+    /// 스펙 carried 커밋 — 남은 carried 행을 트렁크로 재실행해 GDN/conv 상태를
+    /// pos까지 전진 (KV는 멱등 재기입). 접두 캐시 유지용 (plans/24).
+    pub fn flush_carried(&mut self, seq: usize) -> Result<(), ModelError> {
+        let carried = std::mem::take(&mut self.seqs[seq].gdn_carried);
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let rd = match self.raw_decode.as_ref() {
+            Some(r) => r.clone(),
+            None => return Ok(()),
+        };
+        let n = self.model.hp.n_embd;
+        if self.embd_cache.is_none() {
+            let t = self.model.wchk("token_embd.weight")?;
+            self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
+        }
+        let (ty, data) = self.embd_cache.as_ref().unwrap().clone();
+        let mut rows = Vec::with_capacity(carried.len() * n);
+        for &tk in &carried {
+            let mut r = vec![0.0f32; n];
+            crate::quant::dequant_row(ty, &data, tk as u64, n as u64, &mut r);
+            rows.extend(r);
+        }
+        let pos0 = self.seqs[seq].pos as usize - carried.len();
+        let mut am = Vec::new();
+        let mut h = Vec::new();
+        rd.raw_verify(seq, pos0, &rows, &mut am, &mut h).map_err(ModelError::Accel)?;
+        Ok(())
+    }
+
     /// GPU 검증 스펙: draft k개(순차) → raw_verify 1배치 → 최장 수용 접두 + 보너스.
     fn spec_step_gpu(
         &mut self,
