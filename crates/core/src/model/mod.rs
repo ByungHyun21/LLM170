@@ -287,6 +287,10 @@ impl Engine {
         let n_kv = self.model.hp.n_kv;
         let hd = self.model.hp.head_dim;
         let ctx = self.seqs[seq].kv_k.first().map(|k| k.len() / (n_kv * hd)).unwrap_or(4096);
+        // raw 디코더 상주 상태(GDN/conv)도 제로화 — 슬롯 재사용 시 누수 방지.
+        if let Some(rd) = self.raw_decode.as_ref() {
+            let _ = rd.raw_reset(seq);
+        }
         self.seqs[seq] = SeqState::new(&self.model, ctx);
     }
 

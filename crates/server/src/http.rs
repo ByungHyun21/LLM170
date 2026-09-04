@@ -182,6 +182,14 @@ fn jarr_u32(body: &str, key: &str) -> Option<Vec<u32>> {
 }
 
 /// messages[].content 전개 — 다중 문자열 연결 (최소 파서).
+/// qwen3.8 챗 템플릿 — 사용자 단일 턴 래핑 (이미 템플릿 포함 시 원문).
+fn chat_template(content: &str) -> String {
+    if content.contains("<|im_start|>") {
+        return content.to_string();
+    }
+    format!("<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n")
+}
+
 fn jmessages_content(body: &str) -> String {
     let mut out = String::new();
     if let Some(start) = body.find("\"messages\"") {
@@ -236,25 +244,29 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                         continue;
                     }
                 };
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, req.path.contains("chat"));
+                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, req.path.contains("chat"), Vec::new());
             }
             ("POST", "/v1/chat/completions") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0)).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
-                let text = jmessages_content(&req.body);
+                let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true);
+                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![248046]);
             }
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
-                let text = jmessages_content(&req.body);
+                let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
                 run_and_emit_anthropic(&mut stream, tx.clone(), ids, n_predict, stream_mode);
             }
             _ => resp(&mut stream, 404, "application/json", "{\"error\":\"not found\"}"),
         }
     }
+}
+
+fn json_esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
 }
 
 fn run_and_emit(
@@ -264,6 +276,7 @@ fn run_and_emit(
     n_predict: usize,
     stream_mode: bool,
     chat: bool,
+    stops: Vec<u32>,
 ) {
     // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
     // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
@@ -282,6 +295,7 @@ fn run_and_emit(
     let job = SlotJob {
         tokens: ids,
         n_predict,
+        stops,
         progress: stream_mode.then_some(ptx),
         out: otx,
     };
@@ -294,19 +308,23 @@ fn run_and_emit(
         if let Ok(r) = orx.recv() {
             toks = r.tokens;
         }
+        let mut det = crate::engine::Detok::new();
+        let text: String = toks.iter().map(|&t| det.push(t)).collect();
         let arr: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
+        let esc = json_esc(&text);
         resp(
             stream,
             200,
             "application/json",
-            &format!("{{\"tokens\":[{}],\"object\":\"completion\"}}", arr.join(",")),
+            &format!("{{\"tokens\":[{}],\"text\":\"{esc}\",\"object\":\"completion\"}}", arr.join(",")),
         );
         return;
     }
     resp_sse_open(stream);
     // 토큰 생성 즉시 SSE — 장문 요청이 완료까지 굳지 않게 (2026-09-01).
+    let mut det = crate::engine::Detok::new();
     for t in prx {
-        let piece = crate::engine::piece_escaped(t);
+        let piece = json_esc(&det.push(t));
         if chat {
             sse(
                 stream,
@@ -333,6 +351,7 @@ fn run_and_emit_anthropic(
     let job = SlotJob {
         tokens: ids,
         n_predict,
+        stops: vec![248046],
         progress: stream_mode.then_some(ptx),
         out: otx,
     };
@@ -343,9 +362,9 @@ fn run_and_emit_anthropic(
     if stream_mode {
         resp_sse_open(stream);
         sse(stream, "message_start", "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}");
+        let mut det = crate::engine::Detok::new();
         for t in prx {
-            let p = crate::engine::piece_plain(t);
-            let esc = p.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            let esc = json_esc(&det.push(t));
             sse(
                 stream,
                 "content_block_delta",
@@ -362,11 +381,9 @@ fn run_and_emit_anthropic(
         all.extend(r.tokens);
     }
     if !stream_mode {
-        let mut text = String::new();
-        for t in &all {
-            text.push_str(&crate::engine::piece_plain(*t));
-        }
-        let esc = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let mut det = crate::engine::Detok::new();
+        let text: String = all.iter().map(|&t| det.push(t)).collect();
+        let esc = json_esc(&text);
         resp(
             stream,
             200,
