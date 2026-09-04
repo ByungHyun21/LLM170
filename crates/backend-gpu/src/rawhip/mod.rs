@@ -7,9 +7,21 @@ use cubecl_hip_sys as hip;
 use std::collections::HashMap;
 use std::ffi::CString;
 
-pub mod kernels;
 pub mod decode;
+pub mod kernels;
 pub mod vit;
+
+/// 로드된 오프라인 타일 코드오브젝트 패밀리 (임베딩 or LLM170_CO*_PATH
+/// 오버라이드). RawCtx::new 완료 후 불변. 타일 발사 게이트는 env가 아니라
+/// 이 비트를 본다 — 무환경 기본 성능 = 튜닝 성능.
+pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
+pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
+pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
+static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn co_loaded(bit: u8) -> bool {
+    CO_FAM.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+}
 
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
@@ -99,43 +111,54 @@ impl RawCtx {
                 ck(hip::hipModuleGetFunction(&mut f, module, cname.as_ptr()), "GetFunction")?;
                 fns.insert(*name, f);
             }
-            // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등)
-            if let Some(co2) = std::env::var_os("LLM170_CO2_PATH") {
-                let bytes = std::fs::read(&co2).map_err(|e| format!("CO2 읽기: {e}"))?;
-                let mut m3: hip::hipModule_t = std::ptr::null_mut();
-                ck(hip::hipModuleLoadData(&mut m3, bytes.as_ptr() as *const _), "CO2 ModuleLoadData")?;
-                // + wm 4종: 오프라인 CO가 있으면 hipRTC 버전을 가림 (실험용 오버라이드, 평소 무동작)
-                for name in ["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm"] {
-                    let cname = CString::new(name).unwrap();
-                    let mut f: hip::hipFunction_t = std::ptr::null_mut();
-                    if hip::hipModuleGetFunction(&mut f, m3, cname.as_ptr()) == hip::hipError_t_hipSuccess {
-                        fns.insert(name, f);
+            // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등).
+            // 기본: 바이너리 임베딩(crates/.../co/*.co, gfx1151 빌드).
+            // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
+            // LLM170_NO_CO: 전부 생략 (hipRTC wm/mm + GEMV 폴백 측정용).
+            if std::env::var_os("LLM170_NO_CO").is_none() {
+                let slots: &[(u8, &str, &[u8], &[&str])] = &[
+                    (
+                        CO_V4,
+                        "LLM170_CO2_PATH",
+                        include_bytes!("co/v4all.co"),
+                        &["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4",
+                          "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm"],
+                    ),
+                    (
+                        CO_ODD,
+                        "LLM170_CO3_PATH",
+                        include_bytes!("co/odd_all.co"),
+                        &["gemm_nl_v4", "gemm_q3k_v4", "gemm_iq3s_v4"],
+                    ),
+                    (
+                        CO_J128,
+                        "LLM170_CO_PATH",
+                        include_bytes!("co/w32b.co"),
+                        &["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128",
+                          "gemm_xs_j128", "gemm_q8_j128"],
+                    ),
+                ];
+                for (bit, env_key, embedded, names) in slots {
+                    let bytes: Vec<u8> = match std::env::var_os(env_key) {
+                        Some(p) => std::fs::read(&p)
+                            .map_err(|e| format!("{env_key} 읽기({p:?}): {e}"))?,
+                        None => embedded.to_vec(),
+                    };
+                    let mut m: hip::hipModule_t = std::ptr::null_mut();
+                    ck(hip::hipModuleLoadData(&mut m, bytes.as_ptr() as *const _),
+                       &format!("{env_key} ModuleLoadData"))?;
+                    let mut loaded = 0u8;
+                    for name in *names {
+                        let cname = CString::new(*name).unwrap();
+                        let mut f: hip::hipFunction_t = std::ptr::null_mut();
+                        if hip::hipModuleGetFunction(&mut f, m, cname.as_ptr())
+                            == hip::hipError_t_hipSuccess
+                        {
+                            fns.insert(name, f);
+                            loaded |= bit;
+                        }
                     }
-                }
-            }
-            // 홀수 타입 타일 모듈 (iq4_nl/q3_K/iq3_s v4 — plans/04)
-            if let Some(co3) = std::env::var_os("LLM170_CO3_PATH") {
-                let bytes = std::fs::read(&co3).map_err(|e| format!("CO3 읽기: {e}"))?;
-                let mut m4: hip::hipModule_t = std::ptr::null_mut();
-                ck(hip::hipModuleLoadData(&mut m4, bytes.as_ptr() as *const _), "CO3 ModuleLoadData")?;
-                for name in ["gemm_nl_v4", "gemm_q3k_v4", "gemm_iq3s_v4"] {
-                    let cname = CString::new(name).unwrap();
-                    let mut f: hip::hipFunction_t = std::ptr::null_mut();
-                    if hip::hipModuleGetFunction(&mut f, m4, cname.as_ptr()) == hip::hipError_t_hipSuccess {
-                        fns.insert(name, f);
-                    }
-                }
-            }
-            if let Some(co) = std::env::var_os("LLM170_CO_PATH") {
-                let bytes = std::fs::read(&co).map_err(|e| format!("CO 읽기: {e}"))?;
-                let mut m2: hip::hipModule_t = std::ptr::null_mut();
-                ck(hip::hipModuleLoadData(&mut m2, bytes.as_ptr() as *const _), "CO ModuleLoadData")?;
-                for name in ["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128", "gemm_xs_j128", "gemm_q8_j128"] {
-                    let cname = CString::new(name).unwrap();
-                    let mut f: hip::hipFunction_t = std::ptr::null_mut();
-                    if hip::hipModuleGetFunction(&mut f, m2, cname.as_ptr()) == hip::hipError_t_hipSuccess {
-                        fns.insert(name, f);
-                    }
+                    CO_FAM.fetch_or(loaded, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -414,14 +437,14 @@ impl RawCtx {
 
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
-            && std::env::var_os("LLM170_CO_PATH").is_some() && t > 64;
+            && co_loaded(CO_J128) && t > 64;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
 
     /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
     fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
-            && std::env::var_os("LLM170_CO_PATH").is_some();
+            && co_loaded(CO_J128);
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
 
@@ -430,14 +453,15 @@ impl RawCtx {
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
         }
+        let (v4, odd) = (co_loaded(CO_V4), co_loaded(CO_ODD));
         let kern: &'static str = match ty {
-            13 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 && std::env::var_os("LLM170_CO2_PATH").is_some() { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if std::env::var_os("LLM170_CO2_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
-            20 => if std::env::var_os("LLM170_NLV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
-            11 => if std::env::var_os("LLM170_Q3KV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
-            21 => if std::env::var_os("LLM170_IQ3SV4").is_some() && std::env::var_os("LLM170_CO3_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
+            23 => if j128 { "gemm_xs_j128" } else if v4 && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            20 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
+            11 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
+            21 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
             8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
@@ -1197,39 +1221,38 @@ pub fn mm_bench() -> Result<String, String> {
     let xq = ctx.alloc(xq_h.len() * 4)?;
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
-    // wm 상한 64 + bench GEMV 그리드 부적합: 타일 env 없으면 에러
+    // wm 상한 64 + bench GEMV 그리드 부적합: 128-커널 계열 미로드면 에러
+    let (v4, j128f, odd) = (co_loaded(CO_V4), co_loaded(CO_J128), co_loaded(CO_ODD));
     let big_ok = match w.ty {
         llm170_gguf::GgmlType::Q5K | llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Iq4Xs
-            => std::env::var_os("LLM170_V4").is_some() || std::env::var_os("LLM170_J128").is_some(),
-        llm170_gguf::GgmlType::Q6K => std::env::var_os("LLM170_J128").is_some(),
-        llm170_gguf::GgmlType::Iq4Nl => std::env::var_os("LLM170_NLV4").is_some(),
-        llm170_gguf::GgmlType::Q3K => std::env::var_os("LLM170_Q3KV4").is_some(),
-        llm170_gguf::GgmlType::Iq3S => std::env::var_os("LLM170_IQ3SV4").is_some(),
-        llm170_gguf::GgmlType::Q8_0 => std::env::var_os("LLM170_J128").is_some(),
+            => v4 || j128f,
+        llm170_gguf::GgmlType::Q6K | llm170_gguf::GgmlType::Q8_0 => j128f,
+        llm170_gguf::GgmlType::Iq4Nl | llm170_gguf::GgmlType::Q3K | llm170_gguf::GgmlType::Iq3S => odd,
         _ => true,
     };
     if t > 64 && !big_ok {
-        return Err(format!("mm-bench 미지원: t={t}는 타입별 128-커널 env 필요"));
+        return Err(format!("mm-bench 미지원: t={t}는 타입별 128-커널 필요"));
     }
     let kern_name = match w.ty {
-        llm170_gguf::GgmlType::Q5K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q5k_v4" }
-            else if std::env::var_os("LLM170_J128").is_some() { "gemm_q5k_j128" }
+        llm170_gguf::GgmlType::Q5K => if v4 { "gemm_q5k_v4" }
+            else if j128f { "gemm_q5k_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-        llm170_gguf::GgmlType::Q4K => if std::env::var_os("LLM170_V4").is_some() { "gemm_q4k_v4" }
-            else if std::env::var_os("LLM170_J128").is_some() { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-        llm170_gguf::GgmlType::Q6K => if std::env::var_os("LLM170_J128").is_some() { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-        llm170_gguf::GgmlType::Q8_0 => if std::env::var_os("LLM170_J128").is_some() { "gemm_q8_j128" } else { return Err("mm-bench 미지원: q8_0은 LLM170_J128 필요".into()) },
-        llm170_gguf::GgmlType::Iq4Xs => if std::env::var_os("LLM170_V4").is_some() { "gemm_xs_v4" }
-            else if std::env::var_os("LLM170_J128").is_some() { "gemm_xs_j128" }
+        llm170_gguf::GgmlType::Q4K => if v4 { "gemm_q4k_v4" }
+            else if j128f { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+        llm170_gguf::GgmlType::Q6K => if j128f { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+        llm170_gguf::GgmlType::Q8_0 => if j128f { "gemm_q8_j128" } else { return Err("mm-bench 미지원: q8_0은 j128 커널 필요".into()) },
+        llm170_gguf::GgmlType::Iq4Xs => if v4 { "gemm_xs_v4" }
+            else if j128f { "gemm_xs_j128" }
             else if std::env::var_os("LLM170_EXACT").is_none() { "gemm_xs_wm" } else { "gemm_xs_mm" },
-        llm170_gguf::GgmlType::Iq4Nl => if std::env::var_os("LLM170_NLV4").is_some() { "gemm_nl_v4" }
-            else { return Err("mm-bench 미지원: iq4_nl 타일은 LLM170_NLV4 필요".into()) },
-        llm170_gguf::GgmlType::Q3K => if std::env::var_os("LLM170_Q3KV4").is_some() { "gemm_q3k_v4" }
-            else { return Err("mm-bench 미지원: q3_K 타일은 LLM170_Q3KV4 필요".into()) },
-        llm170_gguf::GgmlType::Iq3S => if std::env::var_os("LLM170_IQ3SV4").is_some() { "gemm_iq3s_v4" }
-            else { return Err("mm-bench 미지원: iq3_s 타일은 LLM170_IQ3SV4 필요".into()) },
+        llm170_gguf::GgmlType::Iq4Nl => if odd { "gemm_nl_v4" }
+            else { return Err("mm-bench 미지원: iq4_nl 타일은 odd CO 필요".into()) },
+        llm170_gguf::GgmlType::Q3K => if odd { "gemm_q3k_v4" }
+            else { return Err("mm-bench 미지원: q3_K 타일은 odd CO 필요".into()) },
+        llm170_gguf::GgmlType::Iq3S => if odd { "gemm_iq3s_v4" }
+            else { return Err("mm-bench 미지원: iq3_s 타일은 odd CO 필요".into()) },
         _ => "gemm_xs_mm",
     };
+
     let launch = |ctx: &RawCtx| -> Result<(), String> {
         let mut xp = xq as *mut std::ffi::c_void;
         let mut wp = wd as *mut std::ffi::c_void;

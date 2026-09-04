@@ -953,6 +953,10 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.mtp_head_argmax(h_normed)
     }
 
+    fn tile_big_chunk(&self) -> bool {
+        super::co_loaded(super::CO_J128)
+    }
+
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
         let guard = self.st.lock().map_err(|e| e.to_string())?;
@@ -2474,15 +2478,13 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
     #[allow(clippy::too_many_arguments)]
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        // 홀수 타입 타일 (plans/04): CO3 + 타입별 env + t>=32에서만
+        // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
         let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
-            && std::env::var_os("LLM170_CO3_PATH").is_some() && t >= 32
-            && ((ty == 20 && std::env::var_os("LLM170_NLV4").is_some())
-                || (ty == 11 && std::env::var_os("LLM170_Q3KV4").is_some())
-                || (ty == 21 && std::env::var_os("LLM170_IQ3SV4").is_some()));
-        // q8_0 타일 (CO j128): 소형 GEMV 토큰당 재독 제거
+            && super::co_loaded(super::CO_ODD) && t >= 32
+            && matches!(ty, 20 | 11 | 21);
+        // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
         let q8t = ty == 8 && t > 64 && std::env::var_os("LLM170_EXACT").is_none()
-            && std::env::var_os("LLM170_CO_PATH").is_some();
+            && super::co_loaded(super::CO_J128);
         if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
