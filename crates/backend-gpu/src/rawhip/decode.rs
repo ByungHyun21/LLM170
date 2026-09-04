@@ -687,7 +687,7 @@ impl DecodeState {
                     if np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
-                        let sg = 128usize;
+                        let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize);
                         let nseg = ((pos + 1) + sg - 1) / sg;
                         let part = self.ctx.scratch(1 * n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
