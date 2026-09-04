@@ -41,6 +41,10 @@ pub struct RawCtx {
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
     cursors: std::sync::Mutex<HashMap<usize, usize>>,
+    /// D2H 핀 스테이징 (필요시 성장, 해제 없음 — ADR-0014).
+    /// pageable 버퍼로의 hipMemcpyAsync D2H는 슬로패스(1MB에 ~90ms,
+    /// 2026-09-05 tg RCA) — 핀 버퍼 경유로 원소복사.
+    pinned: std::sync::Mutex<(usize, *mut u8)>,
 }
 
 /// 타일 발사 파라미터 (스택 로컬 소유 — args 포인터 유효성 보장).
@@ -166,7 +170,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
-            Ok(RawCtx { module, fns, stream, stream2, scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()) })
+            Ok(RawCtx { module, fns, stream, stream2, scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
 
@@ -201,8 +205,20 @@ impl RawCtx {
 
     pub fn d2h(&self, dst: &mut [u8], src: *const u8) -> Result<(), String> {
         unsafe {
-            ck(hip::hipMemcpyAsync(dst.as_mut_ptr() as *mut _, src as *const _, dst.len(), hip::hipMemcpyKind_hipMemcpyDeviceToHost, self.stream), "d2h")?;
-            self.sync()
+            // pageable 직행은 슬로패스 — 핀 스테이징 경유 (2026-09-05 tg RCA:
+            // logits 1MB D2H가 92ms → 핀 경유 시 <1ms 예상)
+            let need = dst.len();
+            let mut pin = self.pinned.lock().map_err(|e| e.to_string())?;
+            if pin.0 < need {
+                let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+                ck(hip::hipMallocHost(&mut p, need), "hipMallocHost")?;
+                *pin = (need, p as *mut u8);
+            }
+            let buf = pin.1;
+            ck(hip::hipMemcpyAsync(buf as *mut _, src as *const _, need, hip::hipMemcpyKind_hipMemcpyDeviceToHost, self.stream), "d2h-pin")?;
+            ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
+            std::ptr::copy_nonoverlapping(buf, dst.as_mut_ptr(), need);
+            Ok(())
         }
     }
 

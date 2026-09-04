@@ -1925,49 +1925,65 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
     int blocks = n_in >> 8;
     int row_base = o * blocks * 110;
     float acc = 0.0f;
+    // 스레드 불변량 호이스트 — h = l + 64m이므로 h%16 == l%16 (매 m 동일).
+    // 구버전은 이 전체를 매 반복 재산출해 스케일 선택사슬이 병목(107GB/s).
+    const int kloc = l & 15;
+    const int hh = kloc >> 3;
+    const int src = (kloc - (hh << 3)) >> 1;
+    const int p = kloc & 1;
+    const int ai = hh * 8 + src * 2 + p;
+    const int aish = (ai & 3) * 8;
+    const int qsh = src * 2;
+    // (wb&3)은 blk%4 고정(110≡2 mod4, blk stride 4) — 워드정렬 여부 불변
+    const int rb2 = (row_base + 2 * ((l >> 4) & 1)) & 3;   // row_base&3 + blk&1贡献
+    const bool alq = (rb2 & 3) == 0;   // qlb2 = wb+32+hh*32+p*16 ≡ wb (mod 4)
     for (int m = 0; m < cnt; m++) {
         int h = l + (m << 6);
         int blk = h >> 4;
-        int kloc = h - (blk << 4);
-        int hh = kloc >> 3;
-        int src = (kloc - (hh << 3)) >> 1;
-        int p = kloc & 1;
         int wb = row_base + blk * 110;
-        // 스케일 12바이트(wb+96..107) — wb%4 ∈ {0,2} 워드 경계 산술
+        // 스케일 12바이트(wb+96..107) — 필요한 aux 하나만 산출 (ai 고정)
         int sw = (wb + 96) >> 2;
-        int off = (wb + 96) & 3;
+        int off = rb2;   // (wb+96)&3 == wb&3 (96≡0 mod 4) — 스레드 불변
         unsigned a0, a1, tmp;
         if (off == 0) { a0 = w[sw]; a1 = w[sw+1]; tmp = w[sw+2]; }
         else { a0 = (w[sw] >> 16) | (w[sw+1] << 16); a1 = (w[sw+1] >> 16) | (w[sw+2] << 16); tmp = (w[sw+2] >> 16) | (w[sw+3] << 16); }
         unsigned k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
-        unsigned aux2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
-        unsigned aux3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
-        unsigned aux0 = (a0 & k2) | ((tmp & k1) << 4);
-        unsigned aux1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
-        int ai = hh * 8 + src * 2 + p;
-        unsigned aux = ai < 4 ? aux0 : (ai < 8 ? aux1 : (ai < 12 ? aux2 : aux3));
-        unsigned scb = (aux >> ((ai % 4) * 8)) & 0xFFu;
+        unsigned aux;
+        if (ai < 4) aux = (a0 & k2) | ((tmp & k1) << 4);
+        else if (ai < 8) aux = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+        else if (ai < 12) aux = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+        else aux = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+        unsigned scb = (aux >> aish) & 0xFFu;
         float dl = f16w(w, wb + 108) * (float)(sext8(scb) - 32);
         int qlb2 = wb + 32 + hh * 32 + p * 16;
         int hbase2 = wb + p * 16;
         int xw = (h << 4) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
         // dot4 — Σ(qv − 4 + 4bit)·y = Σ qv·y − 4Σy + 4Σ bit·y
-        int qsh = src * 2;
-        bool alq = (qlb2 & 3) == 0;
-        bool alh = (hbase2 & 3) == 0;
+        // dot4 — Σ(qv − 4 + 4bit)·y = Σ qv·y − 4Σy + 4Σ bit·y
+        // 스팬 프리로드: k-루프가 w[qlw2+k]/w[qlw2+k+1]을 중복로드(9회) —
+        // 스팬 5워드 1회 로드 후 인접 페어funnel로 4워드 구성 (미정렬시).
         int qlw2 = qlb2 >> 2;
         int qhw2 = hbase2 >> 2;
         int isum = 0, qsum = 0, bsum = 0;
+        unsigned qs[4], hs[4];
+        if (alq) {
+            #pragma unroll
+            for (int k = 0; k < 4; k++) { qs[k] = w[qlw2 + k]; hs[k] = w[qhw2 + k]; }
+        } else {
+            unsigned s0 = w[qlw2], s1 = w[qlw2+1], s2 = w[qlw2+2], s3 = w[qlw2+3], s4 = w[qlw2+4];
+            qs[0] = (s0 >> 16) | (s1 << 16); qs[1] = (s1 >> 16) | (s2 << 16);
+            qs[2] = (s2 >> 16) | (s3 << 16); qs[3] = (s3 >> 16) | (s4 << 16);
+            unsigned t0 = w[qhw2], t1 = w[qhw2+1], t2 = w[qhw2+2], t3 = w[qhw2+3], t4 = w[qhw2+4];
+            hs[0] = (t0 >> 16) | (t1 << 16); hs[1] = (t1 >> 16) | (t2 << 16);
+            hs[2] = (t2 >> 16) | (t3 << 16); hs[3] = (t3 >> 16) | (t4 << 16);
+        }
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            unsigned qvw, hvw;
-            if (alq) qvw = w[qlw2 + k]; else qvw = (w[qlw2 + k] >> 16) | (w[qlw2 + k + 1] << 16);
-            if (alh) hvw = w[qhw2 + k]; else hvw = (w[qhw2 + k] >> 16) | (w[qhw2 + k + 1] << 16);
             unsigned yv = k==0?y0:k==1?y1:k==2?y2:y3;
-            isum = dot4((qvw >> qsh) & 0x03030303u, yv, isum);
+            isum = dot4((qs[k] >> qsh) & 0x03030303u, yv, isum);
             qsum = dot4(0x04040404u, yv, qsum);
-            unsigned bitw = ((hvw >> src) & 0x01010101u) << 2;
+            unsigned bitw = ((hs[k] >> src) & 0x01010101u) << 2;
             bsum = dot4(bitw, yv, bsum);
         }
         isum += bsum - qsum;
