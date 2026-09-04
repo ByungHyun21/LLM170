@@ -31,6 +31,8 @@ pub enum Engine {
 pub struct SlotJob {
     pub tokens: Vec<u32>,
     pub n_predict: usize,
+    /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
+    pub stops: Vec<u32>,
     /// 토큰별 SSE 스트림 채널.
     pub progress: Option<std::sync::mpsc::Sender<u32>>,
     /// 최종 결과 송신.
@@ -227,16 +229,18 @@ fn slot_emit(s: &mut Slot, t: u32) {
     }
 }
 
-/// 완료 조건 검사 — EOS/예산 소진 → 결과 전송·슬롯 반환.
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
     let done = s.job.as_ref().is_some_and(|j| {
         s.prefilled == j.tokens.len()
-            && (s.cancelled || s.next == eos || s.generated as usize >= j.n_predict.max(1))
+            && (s.cancelled
+                || s.next == eos
+                || j.stops.contains(&s.next)
+                || s.generated as usize >= j.n_predict.max(1))
     });
     if done {
         if let Some(j) = s.job.take() {
             let mut toks = s.tokens.clone();
-            while toks.last() == Some(&eos) {
+            while toks.last() == Some(&eos) || j.stops.contains(toks.last().unwrap_or(&0)) {
                 toks.pop();
             }
             toks.truncate(j.n_predict);
@@ -404,6 +408,41 @@ impl Engine {
                 InferResult { tokens: out }
             }
         }
+    }
+}
+
+/// 멀티바이트 꼬리를 버퍼에 유지하고 완결 접두만 방출.
+/// 매핑은 Tokenizer::load의 인코더 변환과 동일 (Ġ/Ċ/latin1/utf8).
+pub struct Detok {
+    buf: Vec<u8>,
+}
+
+impl Detok {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// 토큰 1개 투입 → 지금까지 완결된 텍스트 방출.
+    pub fn push(&mut self, tok: u32) -> String {
+        let pb = TOKENIZER.get().map(|t| t.piece_bytes(tok)).unwrap_or_default();
+        self.buf.extend_from_slice(&pb);
+        let mut v = 0usize;
+        let b = &self.buf;
+        while v < b.len() {
+            let ok2 = v + 1 < b.len() && b[v + 1] & 0xC0 == 0x80;
+            let ok3 = v + 2 < b.len() && b[v + 1] & 0xC0 == 0x80 && b[v + 2] & 0xC0 == 0x80;
+            let ok4 = v + 3 < b.len() && ok3 && b[v + 3] & 0xC0 == 0x80;
+            match b[v] {
+                x if x < 0x80 => v += 1,
+                0xC0..=0xDF if ok2 => v += 2,
+                0xE0..=0xEF if ok3 => v += 3,
+                0xF0..=0xF7 if ok4 => v += 4,
+                _ => break,
+            }
+        }
+        let out = String::from_utf8_lossy(&b[..v]).into_owned();
+        self.buf.drain(..v);
+        out
     }
 }
 

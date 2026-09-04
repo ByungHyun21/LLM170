@@ -929,6 +929,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_snapshot()
     }
 
+    fn raw_reset(&self, seq: usize) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("raw_decode: 미초기화")?.reset_seq_state(seq)
+    }
+
     fn gdn_restore(&self) -> Result<(), String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_restore()
@@ -2356,6 +2361,21 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
         self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
         Ok(dst)
+    }
+
+    /// 시퀀스 상태 제로화 (서버 슬롯 반환) — GDN/conv만 (KV는 위치 색인).
+    pub fn reset_seq_state(&self, seq: usize) -> Result<(), String> {
+        let gl = self.dt_rank * self.d_state * self.d_state;
+        let cl = (self.conv_k - 1) * self.conv_ch;
+        let zg = vec![0u8; gl * 4];
+        let zc = vec![0u8; cl * 4];
+        for r in 0..self.st_gdn.len() {
+            if seq < self.st_gdn[r].len() {
+                self.ctx.h2d(self.st_gdn[r][seq], &zg)?;
+                self.ctx.h2d(self.st_conv[r][seq], &zc)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn gdn_snapshot(&self) -> Result<(), String> {

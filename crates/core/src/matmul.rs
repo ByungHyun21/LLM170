@@ -550,6 +550,11 @@ pub trait RawDecode: Send + Sync {
         Err("gdn_restore: 미지원".into())
     }
 
+    /// 시퀀스 상태 초기화 (서버 슬롯 반환 시) — GDN/conv 상주 상태 제로화.
+    /// KV는 위치 색인이라 미제로 무해 (p ≤ pos만 판독). 기본 no-op.
+    fn raw_reset(&self, _seq: usize) -> Result<(), String> {
+        Ok(())
+    }
     /// 정규화 h → head argmax (MTP draft). 기본 Err.
     fn mtp_head_argmax(&self, _h_normed: &[f32]) -> Result<u32, String> {
         Err("mtp_head_argmax: 미지원".into())

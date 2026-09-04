@@ -286,6 +286,21 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         Ok(())
     }
 
+    /// 시퀀스 상태 제로화 (서버 슬롯 반환) — 매핑 ptr 직접 (GPU 유휴 보장).
+    fn raw_reset(&self, seq: usize) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let gl = ds.dt_rank * ds.d_state * ds.d_state;
+        let cl = (ds.conv_k - 1) * ds.conv_ch;
+        for r in 0..ds.st_gdn.len() {
+            if seq < ds.st_gdn[r].len() {
+                unsafe { std::ptr::write_bytes(ds.st_gdn[r][seq].ptr as *mut f32, 0, gl) };
+                unsafe { std::ptr::write_bytes(ds.st_conv[r][seq].ptr as *mut f32, 0, cl) };
+            }
+        }
+        Ok(())
+    }
+
     /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백).
     fn gdn_snapshot(&self) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
