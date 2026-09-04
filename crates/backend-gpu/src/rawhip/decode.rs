@@ -630,7 +630,7 @@ impl DecodeState {
                 self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
-                let flash1 = std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256;
+                let flash1 = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
                 if !flash1 {
                 {
                     let n_past = pos + 1;
@@ -671,7 +671,7 @@ impl DecodeState {
                 }
                 }
                 // t=1 fused flash (score/mix2 대체)
-                if std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256 {
+                if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
                     let mut qp = self.aq as *mut std::ffi::c_void;
                     let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
                     let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
@@ -1204,7 +1204,7 @@ gmark("attn", &mut marks);
                 // 초과 p는 마스크→-3e38→w=0 기여로 원소 산술열 불변)
                 {
                     // flash 시 기존 score/mix2 스킵 (이중실행 방지)
-                    let flash_only = std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256;
+                    let flash_only = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
                     if !flash_only {
                     let np_max = (pos0 + t) as i32;
                     let sstr = self.ctx_len as i32;
@@ -1243,7 +1243,7 @@ gmark("attn", &mut marks);
                     }
                 }
                 // qsa fused flash: score+softmax+mix 단일 패스 (maxrel 1e-6 검증, 스트림★)
-                if std::env::var_os("LLM170_QSA_FLASH").is_some() && hd <= 256 {
+                if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
                     let mut qp = self.aq_t as *mut std::ffi::c_void;
                     let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
                     let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
