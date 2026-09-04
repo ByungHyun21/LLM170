@@ -250,10 +250,12 @@ np reference (s1 exact; s0 differs only at the known 18/19 near-tie), and MTP
 speculative verify lines show live acceptance (OK/MISS) — MTP, np, and the plain
 path all function on Vulkan.
 
-Per note: after 7 h of continuous compute on this 1.5-day-uptime host, the CPU-side
-engine (GDN/EW on CPU per the VkAcc design) measures ~0.05 t/s pure and caps the Vulkan
-path at ~1.8 t/s tg / 4 t/s pp32; single-matmul GEMV is healthy (48.7 GB/s, ★). Fair
-performance numbers require a fresh boot; HIP (fully GPU-resident) is unaffected (28 t/s).
+Per note: after ~7 h of continuous compute on this 1.5-day-uptime host, the CPU-side
+engine degraded ~180x (identical bench command: 9.33 t/s earlier in the session vs
+0.05 t/s now; all 24 cores parked at 2.0 GHz, governor=powersave, 43°C — cause unclear,
+no external load). This caps the Vulkan path at ~1.8 t/s tg / 4 t/s pp32 while its GPU
+matmul is healthy (48.7 GB/s, ★). Fair Vulkan performance numbers require a fresh boot;
+HIP (fully GPU-resident) is unaffected (28 t/s np4×spec4).
 
 ## Vulkan status (2026-09-05) — superseded
 
