@@ -1,8 +1,9 @@
 #version 450
-// qk_norm_rope (plans/19 2단계) — rawhip qk_norm_rope t=1 미러.
+// qk_norm_rope (plans/19 2단계 + plans/20 t행 확장) — rawhip qk_norm_rope 미러.
 // RMS: hd 원소 평균 제곱 (q는 2hd 중 첫 hd만), k에만 kq_scale.
 // rope: 쌍 (p, p+n_rot/2), f64 산술 미러.
-// grid (n_head+n_kv, 1): 블록당 1스레드 순차.
+// grid (n_head+n_kv, t): y=행 — pos = pos0+y, 버퍼 행 오프셋 적용.
+// t=1 (gy=1): 기존 산술과 비트 동일.
 layout(local_size_x = 1) in;
 layout(binding = 0) buffer Xq { float xq[]; };
 layout(binding = 1) buffer Xk { float xk[]; };
@@ -10,16 +11,18 @@ layout(binding = 2) readonly buffer Qw { float qw[]; };  // [n_head*hd]
 layout(binding = 3) readonly buffer Kw { float kw[]; };  // [n_kv*hd]
 layout(binding = 4) readonly buffer Cs { float cs[]; };  // [pos][half_n*2]
 layout(push_constant) uniform PC {
-    float eps; float kqs; int pos;
+    float eps; float kqs; int pos0;
     int nh; int nk; int hd; int nr;
 } pc;
 void main() {
     int r0 = int(gl_WorkGroupID.x);
     if (r0 >= pc.nh + pc.nk) return;
+    int row = int(gl_WorkGroupID.y);
     bool is_q = r0 < pc.nh;
     int half_n = pc.nr >> 1;
-    int csbase = pc.pos * half_n * 2;
-    int row_base = is_q ? r0 * 2 * pc.hd : (r0 - pc.nh) * pc.hd;
+    int csbase = (pc.pos0 + row) * half_n * 2;
+    int row_base = is_q ? row * pc.nh * 2 * pc.hd + r0 * 2 * pc.hd
+                        : row * pc.nk * pc.hd + (r0 - pc.nh) * pc.hd;
     float ms = 0.0; // f32 부분합 → f64 결합 미러 (순차 f64)
     double sum = 0.0;
     for (int i = 0; i < pc.hd; i++) {
