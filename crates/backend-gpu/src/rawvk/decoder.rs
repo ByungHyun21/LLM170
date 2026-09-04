@@ -439,10 +439,11 @@ impl DecoderState {
                 // conv (t=1 — ring)
                 {
                     let cw = self.consts.get(&format!("blk.{il}.conv_w")).cloned().ok_or("conv_w")?;
-                    let push = Self::push_u32s(&[conv_ch as u32, self.conv_k as u32]);
-                    self.run_pipe("gdn_conv", GDN_CONV_SPV, 4, 8,
+                    // PC: {int ch; int k; int t} + local 64 — gdn-check 준거
+                    let push = Self::push_u32s(&[conv_ch as u32, self.conv_k as u32, 1u32]);
+                    self.run_pipe("gdn_conv", GDN_CONV_SPV, 4, 12,
                         &[self.b_gqkv.buf, cw.buf, self.st_conv[recr_idx][seq].buf, self.b_gconv.buf],
-                        &push, conv_ch as u32, 1, 1)?;
+                        &push, conv_ch.div_ceil(64) as u32, 1, 1)?;
                 }
                 // split3
                 {
@@ -452,12 +453,10 @@ impl DecoderState {
                         &[self.b_gconv.buf, self.b_gq.buf, self.b_gk.buf, self.b_gv.buf],
                         &push, total.div_ceil(64) as u32, 1, 1)?;
                 }
-                // l2
+                // l2 — PC: {float eps; int d; int ng} (스케일은 AR이 적용 — rawhip l2_rows2_scale 준거)
                 {
-                    let scale = 1.0f32 / (d_state as f32).sqrt();
-                    let mut push = Self::push_u32s(&[self.n_group as u32, d_state as u32]);
-                    push.extend_from_slice(&self.eps.to_le_bytes());
-                    push.extend_from_slice(&scale.to_le_bytes());
+                    let mut push = self.eps.to_le_bytes().to_vec();
+                    push.extend(Self::push_u32s(&[d_state as u32, self.n_group as u32]));
                     self.run_pipe("l2", L2_SPV, 2, 12,
                         &[self.b_gq.buf, self.b_gk.buf], &push, (2 * self.n_group) as u32, 1, 1)?;
                 }
@@ -487,8 +486,9 @@ impl DecoderState {
                 if gskip & 2 == 0 {
                 {
                     let sn = self.consts.get(&format!("blk.{il}.ssm_norm")).cloned().ok_or("sn")?;
-                    let mut push = Self::push_u32s(&[self.dt_rank as u32, d_inner as u32]);
-                    push.extend_from_slice(&self.eps.to_le_bytes());
+                    // PC: {float eps; int d=d_state; int n_h=dt_rank} — rawhip norm_gated_silu 준거
+                    let mut push = self.eps.to_le_bytes().to_vec();
+                    push.extend(Self::push_u32s(&[d_state as u32, dt_rank as u32]));
                     self.run_pipe("norm_gated", NORM_GATED_SPV, 4, 12,
                         &[self.b_go.buf, self.b_gz.buf, sn.buf, self.b_ggated.buf],
                         &push, dt_rank as u32, 1, 1)?;
@@ -519,9 +519,10 @@ impl DecoderState {
                     let qn = self.consts.get(&format!("blk.{il}.attn_q_norm")).cloned().ok_or("qn")?;
                     let kn = self.consts.get(&format!("blk.{il}.attn_k_norm")).cloned().ok_or("kn")?;
                     let cs = self.consts.get("cs").cloned().ok_or("cs")?;
-                    let mut push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]);
-                    push.splice(0..0, self.eps.to_le_bytes().iter().copied());
+                    // PC: {float eps; float kqs; int pos; int nh; int nk; int hd; int nr} — gdn-check 준거
+                    let mut push = self.eps.to_le_bytes().to_vec();
                     push.extend_from_slice(&self.kq_scale.to_le_bytes());
+                    push.extend(Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]));
                     self.run_pipe("qk_rope", QK_ROPE_SPV, 5, 28,
                         &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
                         &push, (n_head + n_kv) as u32, 1, 1)?;
