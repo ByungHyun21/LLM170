@@ -24,8 +24,10 @@ void main() {
     int b = int(lb) << 5;
     float amax = 0.0;
     for (int i = 0; i < 32; i++) amax = max(amax, abs(x[base + uint(b + i)]));
-    float d = amax / 127.0;
-    float id = d != 0.0 ? 1.0 / d : 0.0;
+    // f-리터럴 필수: 127.0 등 무접미 리터럴은 f64 승격→이중 반올림 (llama.cpp
+    // quantize.cu도 f32 상수 사용). RADV fdiv rcp-강하의 ≤1ULP는 tolerance로 수용.
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
     uint qs0 = 0u, qs1 = 0u;
     for (int wi = 0; wi < 8; wi++) {
         uint word = 0u;

@@ -630,13 +630,78 @@ impl Accelerator for VkAcc {
 
 /// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
-    use llm170_core::matmul::Accelerator;
     let model = llm170_core::model::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let wref = &w;
     let n_in = w.n_in as usize;
     let acc = VkAcc::new()?;
+    // ── quant 비트 검증: GPU xq vs CPU quantize_row_q8_ref ──
+    {
+        let mut seed2 = 0x1234abcdu64;
+        let mut lcg2 = || {
+            seed2 = seed2.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed2 >> 33) as f32 / 2147483648.0 - 0.5
+        };
+        let xrow: Vec<f32> = (0..n_in).map(|_| lcg2()).collect();
+        let mut ctxg = acc.ctx.lock();
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xqb = ctxg.alloc_host(xq_w * 4)?;
+        acc.quant_upload(&mut ctxg, std::slice::from_ref(&xrow), n_in, xqb.buf)?;
+        let gpu: &[u32] =
+            unsafe { std::slice::from_raw_parts(xqb.ptr as *const u32, xq_w) };
+        let yref = llm170_core::quant::quantize_row_q8_ref(&xrow);
+        // CPU 재구성: qs 워드 + d 비트 + s0/s1
+        let mut qdiff = 0usize;
+        let mut ddiff = 0usize;
+        let mut sdiff = 0usize;
+        let nwords = n_in / 4;
+        let nblk = n_in / 32;
+        for b in 0..nblk {
+            let d_cpu = yref[b].d.to_bits();
+            let d_gpu = gpu[nwords + b];
+            if d_cpu != d_gpu {
+                ddiff += 1;
+                if ddiff <= 3 {
+                    let mut amax = 0.0f32;
+                    for &v in &xrow[b * 32..b * 32 + 32] {
+                        amax = amax.max(v.abs());
+                    }
+                    let (cpu_d, gpu_d, rust_d, f64d) = (d_cpu, d_gpu, (amax / 127.0f32).to_bits(), (amax as f64 / 127.0).to_bits() as u32);
+                    eprintln!("dblk{b}: amax={amax:e} cpu_d={cpu_d:08x} gpu_d={gpu_d:08x} rust_d={rust_d:08x} f64lo={f64d:08x}");
+                }
+            }
+            let mut s0 = 0u32;
+            let mut s1 = 0u32;
+            for wi in 0..8 {
+                let mut word = 0u32;
+                for k in 0..4 {
+                    let qv = yref[b].qs[wi * 4 + k] as i8 as i32 as u32;
+                    word |= (qv & 0xFF) << (8 * k);
+                }
+                if word != gpu[b * 8 + wi] {
+                    qdiff += 1;
+                }
+                let sd: u32 = (0..4).map(|k| ((gpu[b * 8 + wi] >> (8 * k)) & 0xFF).count_ones().min(1) * 0).sum();
+                let _ = sd;
+                let bytes: i32 = (0..4)
+                    .map(|k| ((gpu[b * 8 + wi] >> (8 * k)) & 0xFF) as i32)
+                    .fold(0i32, |a, v| a + (((v << 24) as i32) >> 24));
+                if wi < 4 {
+                    s0 = s0.wrapping_add(bytes as u32);
+                } else {
+                    s1 = s1.wrapping_add(bytes as u32);
+                }
+            }
+            let qsb = nwords + nblk;
+            if s0 != gpu[qsb + b * 2] || s1 != gpu[qsb + b * 2 + 1] {
+                sdiff += 1;
+            }
+        }
+        eprintln!(
+            "quant-bits: qs워드 {qdiff}/{nwords} d {ddiff}/{nblk} s {sdiff}/{nblk} 상이"
+        );
+    }
     let mut seed = 0x9e3779b9u64;
     let mut lcg = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -661,8 +726,15 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     llm170_core::matmul::matmul_batch(&xs, wref, &mut ref_outs);
     let mut mx = 0f64;
     let mut rel = 0f64;
+    let mut ndiff = 0usize;
+    let mut ulp_hist = std::collections::HashMap::<i64, usize>::new();
     for (a, b) in outs.iter().zip(ref_outs.iter()) {
         for (x, y) in a.iter().zip(b.iter()) {
+            if x.to_bits() != y.to_bits() {
+                ndiff += 1;
+                let ulp = (x.to_bits() as i64 - y.to_bits() as i64).abs();
+                *ulp_hist.entry(ulp).or_insert(0) += 1;
+            }
             let d = (x - y).abs() as f64;
             if d > mx {
                 mx = d;
@@ -673,10 +745,16 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
             }
         }
     }
+    let hist: Vec<String> = {
+        let mut v: Vec<(i64, usize)> = ulp_hist.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.iter().take(4).map(|(u, c)| format!("{c}x{u}ulp")).collect()
+    };
     let ia = outs[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
     let ib = ref_outs[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
     Ok(format!(
-        "vk-gemv {tname} t={t}: max|D|={mx:.3e} maxrel={rel:.2e} argmax {ia:?}=={ib:?} {}",
-        if ia == ib { "★" } else { "MISMATCH" }
+        "vk-gemv {tname} t={t}: max|D|={mx:.3e} maxrel={rel:.2e} argmax {ia:?}=={ib:?} {} | bits {ndiff}/{} differ, top {hist:?}",
+        if ia == ib { "★" } else { "MISMATCH" },
+        outs.len() * w.n_out as usize
     ))
 }

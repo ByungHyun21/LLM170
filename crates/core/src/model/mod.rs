@@ -303,6 +303,17 @@ impl Engine {
         seq_ids: &[usize],
         batch: &[Vec<u32>],
     ) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.forward_emb(seq_ids, batch, None)
+    }
+
+    /// forward 변형 — 임베딩 행 사전 조달(비전 스플라이스) 시 rows 직접 사용.
+    /// rows.len() == 전체 토큰 수 필수. None이면 token_embd 디양자화.
+    fn forward_emb(
+        &mut self,
+        seq_ids: &[usize],
+        batch: &[Vec<u32>],
+        rows: Option<&[Vec<f32>]>,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
         profile_span!("engine::forward");
         let n_seqs = batch.len();
         let t_len = batch.first().map(|v| v.len()).unwrap_or(0);
@@ -315,16 +326,22 @@ impl Engine {
         let hp = self.model.hp.clone();
         let n_embd = hp.n_embd;
         let n_tok = n_seqs * t_len;
-        let embd = self.model.wchk("token_embd.weight")?;
 
-        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
-        for seq_tokens in batch {
-            for &tok in seq_tokens {
-                let mut row = vec![0.0f32; n_embd];
-                dequant_row(embd.ty, embd.data, tok as u64, n_embd as u64, &mut row);
-                xs.push(row);
+        let mut xs: Vec<Vec<f32>> = match rows {
+            Some(r) if r.len() == n_tok => r.to_vec(),
+            _ => {
+                let embd = self.model.wchk("token_embd.weight")?;
+                let mut v = Vec::with_capacity(n_tok);
+                for seq_tokens in batch {
+                    for &tok in seq_tokens {
+                        let mut row = vec![0.0f32; n_embd];
+                        dequant_row(embd.ty, embd.data, tok as u64, n_embd as u64, &mut row);
+                        v.push(row);
+                    }
+                }
+                v
             }
-        }
+        };
 
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
@@ -925,15 +942,16 @@ impl Engine {
                 self.seqs[seq].pos = pos as u32;
                 return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
             }
-            for &t in tokens {
+            for (ti, &t) in tokens.iter().enumerate() {
+                let _ = ti;
                 let logits = self.decode(&[seq], &[t])?;
                 last = Some(logits.into_iter().next().unwrap());
             }
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
-        for ch in tokens.chunks(chunk) {
-            let logits = self.forward(&[seq], &[ch.to_vec()])?;
-            self.seqs[seq].pos += ch.len() as u32;
+        for (ch_t, ch_r) in tokens.chunks(chunk).zip(cache.chunks(chunk)) {
+            let logits = self.forward_emb(&[seq], &[ch_t.to_vec()], Some(ch_r))?;
+            self.seqs[seq].pos += ch_t.len() as u32;
             last = Some(logits.into_iter().next().unwrap());
         }
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
