@@ -245,6 +245,11 @@ amdgpu vm_validate. Fix: prefer DEVICE_LOCAL|HOST_VISIBLE (RADV STRIX_HALO heap 
 after upload. Full-model Vulkan now runs and the token stream matches the CPU reference
 exactly (41/41 ★).
 
+Feature coverage on Vulkan after the fix: np multi-sequence streams match the
+np reference (s1 exact; s0 differs only at the known 18/19 near-tie), and MTP
+speculative verify lines show live acceptance (OK/MISS) — MTP, np, and the plain
+path all function on Vulkan.
+
 Per note: after 7 h of continuous compute on this 1.5-day-uptime host, the CPU-side
 engine (GDN/EW on CPU per the VkAcc design) measures ~0.05 t/s pure and caps the Vulkan
 path at ~1.8 t/s tg / 4 t/s pp32; single-matmul GEMV is healthy (48.7 GB/s, ★). Fair
