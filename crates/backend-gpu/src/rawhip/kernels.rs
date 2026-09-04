@@ -408,6 +408,94 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
     }
 }
 
+// 듀얼 텐서 q5_K GEMV (2026-09-05): qkv+gate처럼 같은 xq 입력·같은 포맷의
+// 독립 GEMV 2개를 1런치로 — GEMV 사이의 스트리밍 리셋 제거 (KTRACE 계측 근거).
+// 행별 산술은 gemm_q5k와 완전 동일 (w/o/out만 행 소속에 따라 선택).
+extern "C" __global__ void gemm_q5k2(const unsigned* xq, const unsigned* w1, const unsigned* w2,
+                                    float* out1, float* out2, int n_in, int no1, int no2, int xq_w) {
+    int o0 = blockIdx.y + blockIdx.z * gridDim.y;
+    if (o0 >= no1 + no2) return;
+    const unsigned* w;
+    float* out;
+    int o;
+    if (o0 < no1) { w = w1; out = out1; o = o0; }
+    else { w = w2; out = out2; o = o0 - no1; }
+
+    int o = blockIdx.y + blockIdx.z * gridDim.y;  // 토큰=x축 — L2 행 재사용
+    int l = threadIdx.x;
+    if (l >= 64) return;   // o0 범위는 상단에서 이미 가드
+    xq += (int)blockIdx.x * xq_w;
+    // t=1 전용 (듀얼): blockIdx.x=0 — out 스트라이드 불필요
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 176;
+    float acc = 0.0f;  // f32 레인 누산 (f64 1/16 레이트 RCA)
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int js = sb & 7;
+        int it = js >> 1;
+        int half = js & 1;
+        int wb = row_base + (sb >> 3) * 176;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        float dm = bits_f16(w0 >> 16);
+        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+        unsigned r = (js & 3) * 8;
+        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+        unsigned sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        int qhw = wq + 4;
+        unsigned h0 = w[qhw], h1 = w[qhw+1], h2 = w[qhw+2], h3 = w[qhw+3];
+        unsigned h4 = w[qhw+4], h5 = w[qhw+5], h6 = w[qhw+6], h7 = w[qhw+7];
+        int qlb = wq + 12 + it * 8;
+        unsigned q0 = w[qlb], q1 = w[qlb+1], q2 = w[qlb+2], q3 = w[qlb+3];
+        unsigned q4 = w[qlb+4], q5 = w[qlb+5], q6 = w[qlb+6], q7 = w[qlb+7];
+        int sh = 2 * it + half;
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        // dot4 재작성 — 워드 단위 SIMD-in-register (llama.cpp MMVQ 패턴)
+        int nsh = half << 2;
+        unsigned hbit = 1u << sh;
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv = k < 4 ? (k==0?q0:k==1?q1:k==2?q2:q3) : (k==4?q4:k==5?q5:k==6?q6:q7);
+            unsigned hv = k < 4 ? (k==0?h0:k==1?h1:k==2?h2:h3) : (k==4?h4:k==5?h5:k==6?h6:h7);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+            unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4; // 레인 0x00/0x10
+            isum = dot4(nibw | bitw, yv, isum);
+        }
+        int qsb = (n_in >> 2) + (n_in >> 5);
+        int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
+        acc += yd * (d * (float)sc_v) * (float)isum;
+        acc -= yd * (dm * (float)m_v) * (float)qsum;
+    }
+    // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
+    // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
+    __shared__ double sh32[32];
+    double accd = (double)acc;  // f64 트리 — 미러 tree64와 동일 순서
+    if (l >= 32) sh32[l - 32] = accd;
+    __syncthreads();
+    if (l < 32) {
+        accd += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
+    }
+}
+
 // q8_0 (ty8)
 extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
                                      double* part, float* out, int n_in, int n_out, int xq_w) {
@@ -3941,7 +4029,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "rmsq", "silu_mulq", "gatedq", "reduce64",
+    "quant_q8", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",

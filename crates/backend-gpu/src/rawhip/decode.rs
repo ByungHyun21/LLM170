@@ -331,6 +331,36 @@ impl DecodeState {
     fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
         self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
     }
+    /// 듀얼 텐서 q5_K GEMV — 같은 xq·같은 포맷 독립 2 GEMV를 1런치로.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_into2_q5k(&self, xq: *mut u8, w1: *mut u8, no1: usize, out1: *mut u8,
+                    w2: *mut u8, no2: usize, out2: *mut u8, n_in: usize) -> Result<(), String> {
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut w1p = w1 as *mut std::ffi::c_void;
+        let mut w2p = w2 as *mut std::ffi::c_void;
+        let mut o1p = out1 as *mut std::ffi::c_void;
+        let mut o2p = out2 as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut n1 = no1 as i32;
+        let mut n2 = no2 as i32;
+        let mut xw = (n_in / 4 + n_in / 32 + n_in / 16) as i32;
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut w1p as *mut _ as *mut std::ffi::c_void,
+            &mut w2p as *mut _ as *mut std::ffi::c_void,
+            &mut o1p as *mut _ as *mut std::ffi::c_void,
+            &mut o2p as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut n1 as *mut _ as *mut std::ffi::c_void,
+            &mut n2 as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
+        ];
+        let tot = no1 + no2;
+        let gy = tot.min(65535) as u32;
+        let gz = tot.div_ceil(65535) as u32;
+        self.ctx.launch3("gemm_q5k2", 1, gy, gz, 64, &mut args)
+    }
+
     /// 사이드 스트림 GEMV — side_wait_main 선행 + join2 후속이 계약.
     fn mm_into_s(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
         self.ctx.gemv_q8_out_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
@@ -443,7 +473,9 @@ impl DecodeState {
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
-                if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var_os("LLM170_DUAL").is_some() {
+                    self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
+                } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
                     self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
