@@ -46,6 +46,51 @@ use ash::vk;
     let lcg_v = |n: usize| -> Vec<f32> { (0..n).map(|_| lcg()).collect() };
     let mut lines: Vec<String> = Vec::new();
 
+    // ── i8 coopmat 프로브 (plans/23): C = A(16x16 i8) × B — 하드웨어 정수 MMA 동작 확인.
+    {
+        let mut a = vec![0i8; 256];
+        let mut b = vec![0i8; 256];
+        for m in 0..16 {
+            for k in 0..16 {
+                a[m * 16 + k] = (m + k) as i8 - 8;
+            }
+        }
+        for n in 0..16 {
+            for k in 0..16 {
+                b[n * 16 + k] = (k as i8 - n as i8) * 2;
+            }
+        }
+        let abuf = ctx.alloc(256)?;
+        unsafe { std::ptr::copy_nonoverlapping(a.as_ptr() as *const u8, abuf.ptr, 256) };
+        let bbuf = ctx.alloc(256)?;
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr() as *const u8, bbuf.ptr, 256) };
+        let cbuf = ctx.alloc_host(256 * 4)?;
+        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+            include_bytes!("spv/i8probe.spv"), 3, 8,
+        )?;
+        let _ = dsl;
+        ctx.bind_bufs(ds, &[abuf.buf, bbuf.buf, cbuf.buf]);
+        ctx.run(pl, ds, pipe, &[], 1, 1, 1)?;
+        let mut c = vec![0i32; 256];
+        unsafe { std::ptr::copy_nonoverlapping(cbuf.ptr as *const i32, c.as_mut_ptr(), 256) };
+        // CPU 미러: C[m][n] = Σ_k A[m][k]·B[k][n], B[k][n] = b[n*16+k]
+        let mut ok = true;
+        let mut mx = 0i64;
+        for m in 0..16 {
+            for n in 0..16 {
+                let mut s = 0i32;
+                for k in 0..16 {
+                    s += a[m * 16 + k] as i32 * b[n * 16 + k] as i32;
+                }
+                let d = (c[m * 16 + n] - s) as i64;
+                if d != 0 { ok = false; }
+                mx = mx.max(d.abs());
+            }
+        }
+        let sample = format!("c00={} c01={} c77={}", c[0], c[1], c[7 * 16 + 7]);
+        lines.push(format!("i8coopmat: {} ({} max|D|={})", if ok { "★" } else { "✗" }, sample, mx));
+    }
+
     // ── split3: [t=3][n0+n1+n2=12]
     {
         let (n0, n1, n2, t) = (4usize, 5usize, 3usize, 3usize);

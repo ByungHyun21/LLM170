@@ -7,7 +7,7 @@ use crate::tables::{IQ3S_GRID, KVALUES_IQ4NL};
 use llm170_gguf::GgmlType;
 
 #[inline]
-fn f16(b: &[u8], off: usize) -> f32 {
+pub fn f16(b: &[u8], off: usize) -> f32 {
     half_to_f32(u16::from_le_bytes([b[off], b[off + 1]]))
 }
 
@@ -908,7 +908,7 @@ pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
 }
 
 /// q4_K/q5_K 6비트 scale/min (스토어 내부, 블록 절대 오프셋 버전).
-fn scale_min_k4_local(wb: &[u8], sb: usize) -> (u32, u32) {
+pub fn scale_min_k4_local(wb: &[u8], sb: usize) -> (u32, u32) {
     let sc = &wb[4..16];
     let j = sb; // 서브블록 = scale 인덱스 (0..7)
     if j < 4 {

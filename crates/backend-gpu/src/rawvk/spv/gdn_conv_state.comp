@@ -1,8 +1,9 @@
 #version 450
 // gdn_conv_state (plans/20) — rawhip gdn_conv_state 미러 (레이스 프리 재설계).
-// t행 배치 conv 후 링 갱신: st[j] = (t-k+j ≥ 0) ? qkv[t-k+j] : st_old[t+j].
-// 각 스레드가 열 c의 j=0..k-2를 오름차순 순회 — 읽는 st[t+j]는 j' = t+j > j에
-// 서 후에 갱신되므로 원 값 판독 보장 (j 내림차순이면 깨짐).
+// t행 배치 conv 후 링 갱신: st[j] = (t-k+1+j ≥ 0) ? qkv[t-k+1+j] : st_old[t+j].
+// st_new[j]는 다음 배치 시작 기준 (k-1-j)스텝 이전 입력 = 절대위치 t-(k-1)+j.
+// 폴백 j'=t+j는 idx<0 ⟺ j'<k-1 — 링 범위 내 보장 (이전 버전 idx 1-오프로
+// st_old[3] OOB 판독 — conv 상태가 1토큰분만 적립되는 원인).
 // grid (ceil(ch/64), 1).
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly buffer Qkv { float qkv[]; };  // [t][ch]
@@ -12,7 +13,7 @@ void main() {
     int c = int(gl_GlobalInvocationID.x);
     if (c >= pc.ch) return;
     for (int j = 0; j < pc.k - 1; j++) {
-        int idx = pc.t - pc.k + j;
+        int idx = pc.t - pc.k + 1 + j;
         st[j * pc.ch + c] = idx >= 0 ? qkv[idx * pc.ch + c]
                                       : st[(pc.t + j) * pc.ch + c];
     }
