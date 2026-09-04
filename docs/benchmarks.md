@@ -310,7 +310,7 @@ hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
 |---|---|---|---|---|
 | pp512 | **361.8** | **349.9** | 236.9¹ | 236.9² |
 | pp64  | 274.4 | 221.5 | 172.6 | 172.6 |
-| tg8   | 10.92 | 11.82 | 10.16³ | 10.16³ |
+| tg8   | 10.92 | 11.82 | 10.34⁴ | 10.34⁴ |
 | tg32  | 11.70 | 12.02 | 10.40 | 10.40 |
 
 Key readings:
@@ -347,6 +347,13 @@ t=1 decode flash now segments K/V across blocks when np>512 (was one
 block per head — 48 blocks on a 16+ CU APU). Step decomposition: the
 remaining floor is the layer-stack weight stream (~14GB @ ~160GB/s —
 already at llama's average) plus the 1GB q6_K head.
+
+⁴ 2026-09-05 (late night): tg8 10.16 → 10.34 (0.95x llama ROCm) via
+launch-histogram-driven decode-step work: 1556 kernels/step reduced by
+fusing rms+quant (rmsq) and silu_mul+quant (silu_mulq) — both preserve
+the mirror arithmetic order bit-exactly — plus stream2 overlap of the
+independent in_proj GEMV pairs (qkv‖gate, beta‖alpha, gate‖up; the
+pairs are bandwidth-bound so only latency tails hide).
 
 ² 2026-09-05 (later the same day): two defaults landed — (a) the three
 offline tile code objects are now `include_bytes!`-embedded and loaded
