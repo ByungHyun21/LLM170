@@ -235,6 +235,9 @@ pub struct Engine {
     /// token_embd 원시 복사 캐시 (spec 토큰 행 디양자화용 — 매 스텝 to_vec 폭주 방지).
     pub embd_cache: Option<(llm170_gguf::GgmlType, std::sync::Arc<Vec<u8>>)>,
     pub frame35: Option<Frame35>,
+    /// MTP 스펙 의도 — true일 때만 prefill/decode 훅 활성 (미사용 시
+    /// 훅 비용으로 prefill 3배 저하 방지, 2026-09-04 계측).
+    pub mtp_wanted: bool,
     /// 시퀀스별 프레임 상태 유효 플래그 — 값 경로 실행(prefill 등)마다 무효화.
     pub(crate) frame35_clean: Vec<bool>,
 }
@@ -251,6 +254,7 @@ impl Engine {
             raw_decode: None,
             embd_cache: None,
             frame35: None,
+            mtp_wanted: false,
             frame35_clean: vec![false; n_seqs],
             model,
             seqs,
@@ -496,7 +500,7 @@ impl Engine {
         if std::env::var_os("LLM170_SPEC_DBG").is_some() {
             eprintln!("  [hookguard] mtp_h.len={} seq0={}", self.seqs[seq_ids[0]].mtp_h.len(), seq_ids[0]);
         }
-        if !self.seqs[seq_ids[0]].mtp_h.is_empty() {
+        if !self.seqs[seq_ids[0]].mtp_h.is_empty() && self.mtp_wanted {
             for s in 0..n_seqs {
                 let sid = seq_ids[s];
                 let pos0 = self.seqs[sid].pos as usize;
@@ -545,7 +549,7 @@ impl Engine {
             let rd = self.raw_decode.as_ref().unwrap();
             let pos = self.seqs[seq].pos as usize;
             let mut h_t = Vec::new();
-            let logits = if !self.seqs[seq].mtp_h.is_empty() {
+            let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
                 let lg = rd.raw_step_h(seq, pos, &row, &mut h_t).map_err(ModelError::Accel)?;
                 let rd2 = rd.clone();
                 let prev_h = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
@@ -908,7 +912,7 @@ impl Engine {
                     .unwrap_or(if std::env::var_os("LLM170_CO_PATH").is_some() && std::env::var_os("LLM170_EXACT").is_none() { 128 } else { 64 });
                 for ch in cache.chunks(ch_sz) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
-                    let logits = if !self.seqs[seq].mtp_h.is_empty() {
+                    let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
                         // MTP KV 적립: 전 토큰 hidden 회수 후 훅 (마지막만 로짓)
                         let mut h_all: Vec<f32> = Vec::new();
                         let lg = rd

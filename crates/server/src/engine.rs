@@ -311,6 +311,10 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     } else {
         let m = load_q35_retry(&req.model);
         let mut eng = llm170_core::model::Engine::new(m, n_slots, req.ctx);
+        // serve --spec — 스펙 의도일 때만 MTP prefill 훅 활성 (plans/22).
+        if SPEC_K.get().copied().unwrap_or(0) > 0 {
+            eng.mtp_wanted = true;
+        }
         if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
             crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
         }

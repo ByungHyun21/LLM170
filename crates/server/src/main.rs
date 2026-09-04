@@ -685,6 +685,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
+            if spec_k.is_some() {
+                eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성 (plans/22)
+            }
             if gpu_runtime == "vulkan" {
                 if std::env::var_os("LLM170_VK_DECODER").is_some() {
                     // GPU 상주 디코드 (plans/19 2단계) — 커널 8종 gdn-check ★
@@ -1413,6 +1416,9 @@ fn cmd_vl(args: &[String]) -> ExitCode {
         }
     };
     let mut eng = llm170_core::model::Engine::new(m, n_img, ctx);
+    if spec_k > 0 {
+        eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성
+    }
     if backend != "cpu" {
         let rt = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
         if rt == "vulkan" {
