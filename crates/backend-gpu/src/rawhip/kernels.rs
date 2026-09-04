@@ -2716,7 +2716,7 @@ extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const
 // 동일열(세그먼트 f32합→셔플 f64 순서합), 원소별 nrm·silu(z)는 레지스터
 // 통과 후 32블록 quant. 워프=1행 그대로.
 extern "C" __global__ void gatedq(const float* o, const float* z, const float* w,
-                                  unsigned* xq, float eps, int d, int n_h) {
+                                  unsigned* xq, float eps, int d, int n_h, int n_tot) {
     // 행 = d원소 (호출축: d=d_state, grid.x=dt_rank) — 워프당 1행:
     // 세그먼트 f32합→셔플 f64 순서합 (원본 norm_gated_silu와 동일열),
     // 이후 행 내 d/32개 32블록 quant (레인 lb<d/32).
@@ -2746,7 +2746,9 @@ extern "C" __global__ void gatedq(const float* o, const float* z, const float* w
     float scale32 = (float)sqrt(sum / (double)d + (double)eps);
     float inv = 1.0f / scale32;
     int nblk = d >> 5;              // 행 내 블록 수 (d_state=128 → 4)
-    int rowblk = (int)(((const char*)xq - (const char*)0)); (void)rowblk;
+    int gb0 = xb >> 5;              // 플랫 xq 기준 글로벌 블록 베이스
+    int nwords = n_tot >> 2;
+    int nblk_tot = n_tot >> 5;
     for (int lb = u; lb < nblk; lb += 32) {
         int base = lb << 5;
         float xv[32];
@@ -2773,13 +2775,13 @@ extern "C" __global__ void gatedq(const float* o, const float* z, const float* w
                 float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
                 word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
             }
-            xq[lb * 8 + wi] = word;
+            xq[(gb0 + lb) * 8 + wi] = word;
             if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
             else qs1 = dot4(0x01010101u, word, qs1);
         }
-        xq[(d >> 2) + lb] = __float_as_uint(dd);
-        xq[(d >> 2) + nblk + 2 * lb] = (unsigned)qs0;
-        xq[(d >> 2) + nblk + 2 * lb + 1] = (unsigned)qs1;
+        xq[nwords + gb0 + lb] = __float_as_uint(dd);
+        xq[nwords + nblk_tot + 2 * (gb0 + lb)] = (unsigned)qs0;
+        xq[nwords + nblk_tot + 2 * (gb0 + lb) + 1] = (unsigned)qs1;
     }
 }
 

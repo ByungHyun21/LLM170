@@ -549,18 +549,18 @@ impl DecodeState {
                     }
                     eprintln!("#  G0dbg gk xor={xck:016x} gv xor={xcv:016x} beta xor={xcb:016x} eg xor={xcg:016x}");
                 }
-                // norm_gated silu (rows = dt_rank, w = ssm_norm 반복) + quant
-                // (융합은 행-플랫 레이아웃 불일치로 보류 — 원본 유지)
+                // norm_gated silu + quant 융합 (행=d_state, 플랫 xq 인덱싱)
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
-                if false {
+                if self.d_state % 32 == 0 && self.d_inner % 1024 == 0 {
                     let mut op = self.go as *mut std::ffi::c_void;
                     let mut zp = self.gz as *mut std::ffi::c_void;
                     let mut wp = snorm as *mut std::ffi::c_void;
                     let mut qp = self.xq_g as *mut std::ffi::c_void;
                     let mut ep = self.eps;
-                    let mut d = self.d_inner as i32;
+                    let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
-                    let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
+                    let mut nt = self.d_inner as i32;
+                    let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh), Self::p(&mut nt)];
                     self.ctx.launch("gatedq", self.dt_rank as u32, 1, 32, &mut args)?;
                 } else {
                     let mut op = self.go as *mut std::ffi::c_void;
