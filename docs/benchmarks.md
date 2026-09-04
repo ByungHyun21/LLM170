@@ -234,7 +234,23 @@ servers resident would contend for the same VRAM on this UMA machine).
   CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2
   (every combination; the frame path is hash-identical to the value path).
 
-## Vulkan status (2026-09-05)
+## Vulkan — FIXED (2026-09-05)
+
+Root cause of the full-model failures was never a driver leak: the sysfs GTT counters are
+in **bytes** (the "18.6 GB stranded" was 18.6 MB). The real issue was memory-type
+selection — VkCtx picked the first HOST_VISIBLE type (heap 0, GTT-aperture-limited), and
+16.3 GB of weights cannot pin in a 15.5 GiB GTT aperture, so the first submit failed with
+amdgpu vm_validate. Fix: prefer DEVICE_LOCAL|HOST_VISIBLE (RADV STRIX_HALO heap 1,
+74 GiB carveout) for weights, cached GTT type for scratch, and unmap weight buffers
+after upload. Full-model Vulkan now runs and the token stream matches the CPU reference
+exactly (41/41 ★).
+
+Per note: after 7 h of continuous compute on this 1.5-day-uptime host, the CPU-side
+engine (GDN/EW on CPU per the VkAcc design) measures ~0.05 t/s pure and caps the Vulkan
+path at ~1.8 t/s tg / 4 t/s pp32; single-matmul GEMV is healthy (48.7 GB/s, ★). Fair
+performance numbers require a fresh boot; HIP (fully GPU-resident) is unaffected (28 t/s).
+
+## Vulkan status (2026-09-05) — superseded
 
 rawvk smoke suite passes (coopmat probe, axpy bit-exact, 25.5 GB/s) — the Vulkan compute
 path is healthy. Full-model Vulkan runs are currently blocked by a kernel TTM leak:

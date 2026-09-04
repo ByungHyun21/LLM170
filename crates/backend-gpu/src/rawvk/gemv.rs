@@ -125,9 +125,9 @@ impl VkAcc {
                     lo | (hi << 8)
                 })
                 .collect();
-            let kb = ctx.alloc(1024)?;
+            let kb = ctx.alloc_host(1024)?;
             unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
-            let gb = ctx.alloc(2048)?;
+            let gb = ctx.alloc_host(2048)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     llm170_core::IQ3S_GRID.as_ptr() as *const u8,
@@ -138,7 +138,7 @@ impl VkAcc {
             *self.tables.lock() = Some((kb, gb));
         }
         if self.dummy.lock().is_none() {
-            *self.dummy.lock() = Some(ctx.alloc(16)?);
+            *self.dummy.lock() = Some(ctx.alloc_host(16)?);
         }
         let t = self.tables.lock();
         let (a, b) = t.as_ref().unwrap();
@@ -157,8 +157,9 @@ impl VkAcc {
                 let mut off = 0usize;
                 while off < total {
                     let n = ch.min(total - off);
-                    let b = ctx.alloc(n)?;
+                    let mut b = ctx.alloc(n)?;
                     unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n) };
+                    ctx.unmap(&mut b)?; // WC 매핑 즉시 해제 — op당 동기 비용 방지
                     bufs.push(b);
                     off += n;
                 }
@@ -247,7 +248,7 @@ impl VkAcc {
             let mut xf = self.xfbuf.lock();
             let need = t * n_in * 4;
             if !xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                *xf = Some(ctx.alloc(need.max(1 << 21))?);
+                *xf = Some(ctx.alloc_host(need.max(1 << 21))?);
             }
             let b = xf.as_ref().unwrap();
             for (ti, row) in xs.iter().enumerate() {
@@ -272,7 +273,7 @@ impl VkAcc {
     fn value_buf(&self, ctx: &mut VkCtx, slot: &Mutex<Option<VkBuf>>, need: usize) -> Result<vk::Buffer, String> {
         let mut g = slot.lock();
         if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-            *g = Some(ctx.alloc(need.max(1 << 21))?);
+            *g = Some(ctx.alloc_host(need.max(1 << 21))?);
         }
         Ok(g.as_ref().unwrap().buf)
     }
@@ -306,9 +307,9 @@ impl VkAcc {
         {
             let mut b = self.rbufs.lock();
             if b.is_none() {
-                let xb = ctx.alloc((t * n * 4).max(1 << 21))?;
-                let wb = ctx.alloc(n * 4)?;
-                let ob = ctx.alloc((t * n * 4).max(1 << 21))?;
+                let xb = ctx.alloc_host((t * n * 4).max(1 << 21))?;
+                let wb = ctx.alloc_host(n * 4)?;
+                let ob = ctx.alloc_host((t * n * 4).max(1 << 21))?;
                 *b = Some((xb, wb, ob));
             }
         }
@@ -354,9 +355,9 @@ impl VkAcc {
         {
             let mut b = self.sbufs.lock();
             if !b.as_ref().map(|(g, _, _)| g.bytes >= total * 4).unwrap_or(false) {
-                let g = ctx.alloc((total * 4).max(1 << 21))?;
-                let u = ctx.alloc((total * 4).max(1 << 21))?;
-                let o = ctx.alloc((total * 4).max(1 << 21))?;
+                let g = ctx.alloc_host((total * 4).max(1 << 21))?;
+                let u = ctx.alloc_host((total * 4).max(1 << 21))?;
+                let o = ctx.alloc_host((total * 4).max(1 << 21))?;
                 *b = Some((g, u, o));
             }
         }
@@ -409,13 +410,13 @@ impl VkAcc {
         let (xbf, bq0, bfg, bfu, bglu, bq1, bob, xf_ptr, ob_ptr) = {
             let mut b = self.ffnbufs.lock();
             if b.is_none() {
-                let xf = ctx.alloc(1 << 23)?;
-                let xq0 = ctx.alloc(1 << 22)?;
-                let fg = ctx.alloc(1 << 24)?;
-                let fu = ctx.alloc(1 << 24)?;
-                let glu = ctx.alloc(1 << 24)?;
-                let xq1 = ctx.alloc(1 << 24)?;
-                let ob = ctx.alloc(1 << 23)?;
+                let xf = ctx.alloc_host(1 << 23)?;
+                let xq0 = ctx.alloc_host(1 << 22)?;
+                let fg = ctx.alloc_host(1 << 24)?;
+                let fu = ctx.alloc_host(1 << 24)?;
+                let glu = ctx.alloc_host(1 << 24)?;
+                let xq1 = ctx.alloc_host(1 << 24)?;
+                let ob = ctx.alloc_host(1 << 23)?;
                 *b = Some((xf, xq0, fg, fu, glu, xq1, ob));
             }
             let r = b.as_ref().unwrap();

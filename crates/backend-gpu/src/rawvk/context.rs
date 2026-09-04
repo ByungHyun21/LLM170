@@ -8,6 +8,7 @@ pub struct VkBuf {
     pub buf: vk::Buffer,
     pub ptr: *mut u8,
     pub bytes: usize,
+    pub mem: vk::DeviceMemory,
 }
 
 pub struct VkCtx {
@@ -24,6 +25,8 @@ pub struct VkCtx {
     pub coop_f16_f32: bool,
     pub max_ssbo: usize,
     pub mem_ty: u32,
+    /// GTT(캐시 host-visible) 타입 — 스크래치용.
+    pub mem_ty_host: u32,
 }
 
 unsafe impl Send for VkCtx {}
@@ -122,15 +125,29 @@ impl VkCtx {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| format!("펜스: {e:?}"))?;
 
-            // host-visible coherent 메모리 타입 (APU 단일 메모리)
+            // 메모리 타입: DEVICE_LOCAL|HOST_VISIBLE 우선 (APU 대형 캐브아웃 힙 — RADV
+            // STRIX_HALO heap1 74GB). GTT 힙(heap0)은 커널 GTT 상한(15.5GB) 미만만 핀 가능해
+            // 16GB+ 가중치는 submit 시 vm_validate 실패 — 캐브아웃 배치로 회피.
             let mprops = instance.get_physical_device_memory_properties(physical);
+            let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let ty = (0..mprops.memory_type_count as usize)
                 .find(|&i| {
-                    mprops.memory_types[i]
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+                    mprops.memory_types[i].property_flags
+                        .contains(hv | vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .or_else(|| {
+                    (0..mprops.memory_type_count as usize).find(|&i| {
+                        mprops.memory_types[i].property_flags.contains(hv)
+                    })
                 })
                 .ok_or("host-visible coherent 메모리 타입 없음")? as u32;
+            let ty_host = (0..mprops.memory_type_count as usize)
+                .find(|&i| {
+                    let f = mprops.memory_types[i].property_flags;
+                    f.contains(hv)
+                        && !f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .unwrap_or(ty as usize) as u32;
 
             Ok(Self {
                 entry,
@@ -146,8 +163,29 @@ impl VkCtx {
                 coop_f16_f32,
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
+                mem_ty_host: ty_host,
             })
         }
+    }
+
+    /// 매핑 해제 (가중치 업로드 후) — WC 캐브아웃 매핑이 열려 있으면 펜스 대기가
+    /// 전체 플러시되어 op당 동기화 비용 폭증 (tg 1.8 실측).
+    pub fn unmap(&self, b: &mut VkBuf) -> Result<(), String> {
+        unsafe {
+            self.device.unmap_memory(b.mem);
+            b.ptr = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+
+    /// 스크래치용 할당 — GTT(캐시 호스트 가시) 타입: CPU 쓰기 빠름. 캐브아웃 타입은
+    /// 매핑이 WC여서 토큰별 활성화 왕복이 느림 (실측 tg 1.9 vs 10.4).
+    pub fn alloc_host(&mut self, bytes: usize) -> Result<VkBuf, String> {
+        let saved = self.mem_ty;
+        self.mem_ty = self.mem_ty_host;
+        let r = self.alloc(bytes);
+        self.mem_ty = saved;
+        r
     }
 
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
@@ -180,7 +218,7 @@ impl VkCtx {
                 .device
                 .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .map_err(|e| format!("맵: {e:?}"))? as *mut u8;
-            Ok(VkBuf { buf, ptr, bytes })
+            Ok(VkBuf { buf, ptr, bytes, mem })
         }
     }
 
