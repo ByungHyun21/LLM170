@@ -1,0 +1,82 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemm_i8 (plans/23) — q5_K i8 coopmat GEMM. 64스레드 = 1서브그룹 = 1행블록(16행).
+// 가중은 사전 언팩된 i8 [n_out][n_in] (SSBO 직접 coopMatLoad — 공유 스테이징 없음).
+// 활성 b8 [t][n_in] (토큰-메이저, ColumnMajor B로 해석: B[k][n] = buf[n*n_in + k]).
+// 스케일: 블록(32원소)마다 drain — 정수 내적은 정확, f32 결합만 순서차.
+//   out[t][o] = Σ_b yd[t][b]·( wsp[o][b]·isum − wsm[o][b]·qsum[t][b] )
+// barrier는 1웨이브 그룹 내 (tile128의 512스레드 배리어 병목 회피).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { int8_t w0c[]; };
+layout(binding = 1) readonly buffer W1 { int8_t w1c[]; };
+layout(binding = 2) readonly buffer W2 { int8_t w2c[]; };
+layout(binding = 3) readonly buffer W3 { int8_t w3c[]; };
+layout(binding = 4) readonly buffer W4 { int8_t w4c[]; };
+layout(binding = 5) readonly buffer W5 { int8_t w5c[]; };
+layout(binding = 6) readonly buffer W6 { int8_t w6c[]; };
+layout(binding = 7) readonly buffer W7 { int8_t w7c[]; };
+layout(binding = 8) readonly buffer B8 { int8_t b8[]; };   // [t][n_in]
+layout(binding = 9) buffer Obuf { float outv[]; };          // [t][n_out]
+layout(binding = 10) readonly buffer Wsp { float wsp[]; };  // [n_out][n_sub]
+layout(binding = 11) readonly buffer Wsm { float wsm[]; };  // [n_out][n_sub]
+layout(binding = 12) readonly buffer Ydb { float yd[]; };   // [t][n_sub]
+layout(binding = 13) readonly buffer Qsb { int qsum[]; };   // [t][n_sub]
+layout(binding = 14) buffer Ish { int32_t ishs[]; };        // [wg][256] — coopMatStore SSBO
+layout(binding = 15) buffer Fac { float faccs[]; };         // [wg][256]
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint n_sub;
+} pc;
+
+// i8 어큐뮬레이터 coopmat — i8×i8→i32 (하드웨어 정수 MMA).
+
+void main() {
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    uint rb = gl_WorkGroupID.x;          // 행 블록 (16행)
+    uint wg = rb;
+    uint row0 = rb * 16u;
+    if (row0 >= pc.n_out) return;
+    uint lane = gl_LocalInvocationID.x;
+    for (uint tb = 0u; tb < pc.t; tb += 16u) {
+        // f32 누산 (shared) — 블록 drain용
+        for (uint e = lane; e < 256u; e += 64u) faccs[int(wg) * 256 + e] = 0.0;
+        barrier();
+        for (uint b = 0u; b < pc.n_sub; b++) {
+            uint k0 = b * 32u;
+            // 두 16-k 타일 MMA per 32-블록
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+            // A[m][k] = w8[(row0+m)*n_in + k] — RowMajor, stride n_in
+            coopMatLoad(ma, w0c, (row0) * pc.n_in + k0, pc.n_in, gl_CooperativeMatrixLayoutRowMajor);
+            // B[k][n] = b8[(tb+n)*n_in + k] — ColumnMajor, stride n_in
+            coopMatLoad(mb, b8, (tb) * pc.n_in + k0, pc.n_in, gl_CooperativeMatrixLayoutColumnMajor);
+            acc = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            acc = coopMatMulAdd(ma, mb, acc);
+            coopMatLoad(ma, w0c, (row0) * pc.n_in + k0 + 16u, pc.n_in, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb, b8, (tb) * pc.n_in + k0 + 16u, pc.n_in, gl_CooperativeMatrixLayoutColumnMajor);
+            acc = coopMatMulAdd(ma, mb, acc);
+            coopMatStore(acc, ishs, int(wg) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            // drain: 레인당 4원소 — f32 결합 (블록 오름차순)
+            for (uint e = lane * 4u; e < lane * 4u + 4u; e++) {
+                uint m = e >> 4, n = e & 15u;
+                uint row = row0 + m;
+                uint tok = tb + n;
+                float y = yd[tok * pc.n_sub + b];
+                faccs[int(wg) * 256 + e] += float(ishs[int(wg) * 256 + e]) * wsp[row * pc.n_sub + b] * y
+                         - float(qsum[tok * pc.n_sub + b]) * wsm[row * pc.n_sub + b] * y;
+            }
+            barrier();
+        }
+        for (uint e = lane * 4u; e < lane * 4u + 4u; e++) {
+            uint m = e >> 4, n = e & 15u;
+            uint tok = tb + n;
+            if (tok < pc.t) outv[tok * pc.n_out + row0 + m] = faccs[int(wg) * 256 + e];
+        }
+    }
+}

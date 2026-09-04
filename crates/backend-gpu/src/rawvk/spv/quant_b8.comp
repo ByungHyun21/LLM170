@@ -1,0 +1,38 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+// quant_b8 (plans/23) — f32 x → i8 매트릭스 b8[t][n_in] + 블록 스케일.
+// quant_q8와 동일 반올림(round-half-away) — 정수값 비트 일치.
+// 출력: b8 (1바이트/원소, 토큰-메이저), yd f32 [t][n_sub], qsum i32 [t][n_sub].
+// gemm_i8(coopmat) 전용 — 기존 xq 경로 불변.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Xbuf { float x[]; };
+layout(binding = 1) buffer B8buf { int8_t b8[]; };
+layout(binding = 2) buffer Ydbuf { float yd[]; };
+layout(binding = 3) buffer Qsbuf { int qsum[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint t; uint n_sub;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    uint lb = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x; // 블록(32원소)
+    if (lb >= pc.n_sub) return;
+    uint base = tok * pc.n_in;
+    int b = int(lb) << 5;
+    float amax = 0.0;
+    for (int i = 0; i < 32; i++) amax = max(amax, abs(x[base + uint(b + i)]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    yd[tok * pc.n_sub + lb] = d;
+    int qs = 0;
+    for (int i = 0; i < 32; i++) {
+        float xv = x[base + uint(b + i)] * id;
+        float r = xv >= 0.0f ? float(int(xv + 0.5f)) : -float(int(0.5f - xv));
+        float c = clamp(r, -127.0f, 127.0f);
+        int q = int(c);
+        b8[base + uint(b + i)] = int8_t(q);
+        qs += q;
+    }
+    qsum[tok * pc.n_sub + lb] = qs;
+}

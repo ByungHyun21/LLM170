@@ -18,6 +18,17 @@ const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
 const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
+const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
+const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
+
+/// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
+struct I8W {
+    w: VkBuf,
+    wsp: VkBuf,
+    wsm: VkBuf,
+    n_out: usize,
+    n_in: usize,
+}
 
 pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
@@ -111,6 +122,13 @@ pub struct DecoderState {
     // GDN/conv 스냅샷 (spec 부분수용 롤백) — 매핑 ptr 직접 복사
     snap_gdn: Vec<Vec<f32>>,
     snap_conv: Vec<Vec<f32>>,
+    // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
+    i8w: HashMap<String, I8W>,
+    b8: VkBuf,   // [T_MAX][n_max] i8 활성 매트릭스
+    ydb: VkBuf,  // [T_MAX][n_sub_max] f32
+    qsb: VkBuf,  // [T_MAX][n_sub_max] i32
+    ishs: VkBuf, // [640][256] i32 — coopMatStore SSBO (workgroup별)
+    faccs: VkBuf, // [640][256] f32
 }
 
 unsafe impl Send for DecoderState {}
@@ -373,7 +391,12 @@ impl DecoderState {
             .find(|(k, ..)| k == "output.weight")
             .map(|(_, _, _, no, _)| *no)
             .unwrap_or(n);
-        // 가중치 — 캐브아웃 (carveout) 업로드 후 언맵 (매핑 잔류 방지)
+        // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
+        let q5k_src: Vec<(String, Vec<u8>, usize, usize)> = weights
+            .iter()
+            .filter(|(_, _, ty, _, _)| *ty == 13)
+            .map(|(k, d, _, ni, no)| (k.clone(), d.clone(), *ni, *no))
+            .collect();
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
             let mut bufs = Vec::new();
@@ -502,6 +525,65 @@ impl DecoderState {
         let m_h = ah(n)?;
         let b_lg = ah(n_vocab)?;
         let b_lg_t = ah(T_MAX * n_vocab)?;
+        // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
+        let mut i8w: HashMap<String, I8W> = HashMap::new();
+        for (name, data, ni, no) in q5k_src {
+            let n_sub = ni / 32;
+            let nblk = ni / 256;
+            let mut w8 = vec![0i8; no * ni];
+            let mut wsp = vec![0f32; no * n_sub];
+            let mut wsm = vec![0f32; no * n_sub];
+            std::thread::scope(|s| {
+                let rows_per = (no / 8).max(1);
+                let mut hs = Vec::new();
+                for r0 in (0..no).step_by(rows_per) {
+                    let end = (r0 + rows_per).min(no);
+                    let p8: *mut Vec<i8> = &mut w8;
+                    let pp: *mut Vec<f32> = &mut wsp;
+                    let pm: *mut Vec<f32> = &mut wsm;
+                    let (w8s, wsps, wsms) = unsafe { (&mut *p8, &mut *pp, &mut *pm) };
+                    let data = &data;
+                    hs.push(s.spawn(move || {
+                        for o in r0..end {
+                            for bidx in 0..nblk {
+                                let wb = &data[bidx * 176..bidx * 176 + 176];
+                                let d = llm170_core::quant::f16(wb, 0);
+                                for j in 0..8 {
+                                    let (sc, m) = llm170_core::quant::scale_min_k4_local(wb, j);
+                                    let it = j / 2;
+                                    let half = j % 2;
+                                    let u: u8 = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
+                                    let sb = bidx * 8 + j;
+                                    wsps[o * n_sub + sb] = d * sc as f32;
+                                    wsms[o * n_sub + sb] = d * m as f32;
+                                    for e in 0..32 {
+                                        let q = wb[48 + it * 32 + e];
+                                        let nib = if half == 0 { q & 0xF } else { q >> 4 };
+                                        let hi = if wb[16 + e] & u != 0 { 16i8 } else { 0i8 };
+                                        w8s[o * ni + sb * 32 + e] = nib as i8 + hi;
+                                    }
+                                }
+                            }
+                        }
+                    }));
+                }
+                for h in hs { let _ = h.join(); }
+            });
+            let wbuf = ctx.alloc_host(no * ni)?;
+            unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, wbuf.ptr, no * ni) };
+            let wspbuf = ctx.alloc_host(no * n_sub * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(wsp.as_ptr(), wspbuf.ptr as *mut f32, no * n_sub) };
+            let wsmbuf = ctx.alloc_host(no * n_sub * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(wsm.as_ptr(), wsmbuf.ptr as *mut f32, no * n_sub) };
+            i8w.insert(name, I8W { w: wbuf, wsp: wspbuf, wsm: wsmbuf, n_out: no, n_in: ni });
+        }
+        let n_max = hp.n_ff.max(n);
+        let n_sub_max = n_max / 32;
+        let b8 = ctx.alloc_host(T_MAX * n_max)?;
+        let ydb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
+        let qsb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
+        let ishs = ctx.alloc_host(640 * 256 * 4)?;
+        let faccs = ctx.alloc_host(640 * 256 * 4)?;
         Ok(Self {
             ctx,
             max_ssbo: max_ssbo0,
@@ -576,6 +658,12 @@ impl DecoderState {
             m_kv_v: mvv,
             snap_gdn: vec![Vec::new(); n_recr * n_seqs],
             snap_conv: vec![Vec::new(); n_recr * n_seqs],
+            i8w,
+            b8,
+            ydb,
+            qsb,
+            ishs,
+            faccs,
         })
     }
 
@@ -664,6 +752,55 @@ impl DecoderState {
         binds.push(self.grid3s.buf);
         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, ty, t as u32]);
         self.run_pipe("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 20, &binds, &push, no as u32, 1, 1)
+    }
+
+    /// gemm_i8 (plans/23) — q5_K 사전 언패분으로 t행 GEMM.
+    fn gemm_i8(&mut self, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
+        let (wbuf, wspbuf, wsmbuf, ni, no) = (e.w.clone(), e.wsp.clone(), e.wsm.clone(), e.n_in, e.n_out);
+        let n_sub = ni / 32;
+        let mut binds: Vec<vk::Buffer> = vec![wbuf.buf; 1];
+        while binds.len() < 8 {
+            binds.push(self.dummy.buf);
+        }
+        binds.push(self.b8.buf);
+        binds.push(out);
+        binds.push(wspbuf.buf);
+        binds.push(wsmbuf.buf);
+        binds.push(self.ydb.buf);
+        binds.push(self.qsb.buf);
+        binds.push(self.ishs.buf);
+        binds.push(self.faccs.buf);
+        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, n_sub as u32]);
+        self.run_pipe("gemm_i8", GEMM_I8_SPV, 16, 16, &binds, &push,
+            (no as u32 + 15) / 16, 1, 1)
+    }
+
+    /// 단계 공유 GEMV — q5_K·t≥2는 gemm_i8(LLM170_VK_NOI8 킬스위치),
+    /// 나머지는 기존 xq+gemv3. xq 양자화는 호출부가 이미 수행.
+    fn gemv_stage(&mut self, n: usize, t: usize, jobs: &[(String, vk::Buffer, vk::Buffer)]) -> Result<(), String> {
+        let i8_on = t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none();
+        let any_i8 = i8_on && jobs.iter().any(|(k, _, _)| self.i8w.contains_key(k));
+        if any_i8 {
+            // b8 양자화 — 이 단계 공유 (src는 jobs[0].0의 xq가 아닌 원본 f32 필요)
+        }
+        for (k, xq, out) in jobs {
+            if any_i8 && self.i8w.contains_key(k) {
+                self.gemm_i8(k, *out, t)?;
+            } else {
+                self.gemv(*xq, k, *out, t)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// quant_b8: src f32 [t][n] → b8/yd/qs (gemm_i8 입력).
+    fn quant_b8(&mut self, src: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
+        let n_sub = n / 32;
+        let push = Self::push_u32s(&[n as u32, t as u32, n_sub as u32]);
+        self.run_pipe("quant_b8", QUANT_B8_SPV, 4, 12,
+            &[src, self.b8.buf, self.ydb.buf, self.qsb.buf], &push,
+            (n / 32 + 63) as u32 / 64, t as u32, 1)
     }
 
     /// rms_norm (t행) — 상수 가중치 (consts).
@@ -778,7 +915,22 @@ impl DecoderState {
                     let mut v = vec![0f32; n];
                     unsafe { std::ptr::copy_nonoverlapping(self.b_gout.ptr as *const f32, v.as_mut_ptr(), n) };
                     let sum: f64 = v.iter().map(|&x| x as f64).sum();
-                    eprintln!("#  G0 gout sum={sum:.6} il={il}");
+                    let s = |b: &VkBuf, len: usize| -> f64 {
+                        let mut x = vec![0f32; len];
+                        unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
+                        x.iter().map(|&q| q as f64).sum()
+                    };
+                    let srow = |b: &VkBuf, r: usize, len: usize| -> f64 {
+                        let mut x = vec![0f32; len];
+                        unsafe { std::ptr::copy_nonoverlapping(b.ptr.add(r * len * 4) as *const f32, x.as_mut_ptr(), len) };
+                        x.iter().map(|&q| q as f64).sum()
+                    };
+                    eprintln!("#  G0 il={il} gout={sum:.6} | xs0={:.4} xs1={:.4} xn0={:.4} xn1={:.4} gqkv0={:.4} gconv0={:.4} gq0={:.4} go0={:.4} ggated0={:.4}",
+                        srow(&self.b_xs, 0, 64), srow(&self.b_xs, 1, 64),
+                        srow(&self.b_xn, 0, 64), srow(&self.b_xn, 1, 64),
+                        s(&self.b_gqkv, self.conv_ch.min(64)),
+                        s(&self.b_gconv, self.conv_ch.min(64)), s(&self.b_gq, self.k_len.min(64)),
+                        s(&self.b_go, self.v_len.min(64)), s(&self.b_ggated, self.d_inner.min(64)));
                 }
                 recr_idx += 1;
             } else {
@@ -855,6 +1007,18 @@ impl DecoderState {
             }
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+            let s = |b: &VkBuf, len: usize| -> f64 {
+                let mut x = vec![0f32; len];
+                unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
+                x.iter().map(|&q| q as f64).sum()
+            };
+            eprintln!("#  ST state seq={seq} conv0={:.6} gdn0={:.6} kvk3r0={:.6} kvv3r0={:.6} xsL={:.6}",
+                s(&self.st_conv[0][seq], 30720.min(self.conv_ch * 3)),
+                s(&self.st_gdn[0][seq], 4096),
+                s(&self.kv_k[0][seq], 1024), s(&self.kv_v[0][seq], 1024),
+                s(&self.b_xs, 64));
+        }
         // ── head: output_norm → quant → gemv(output) → 다운로드
         {
             let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
@@ -888,6 +1052,12 @@ impl DecoderState {
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
         }
+        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+            let mut x = vec![0f32; 64];
+            unsafe { std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, x.as_mut_ptr(), 64) };
+            let s0: f64 = x.iter().map(|&v| v as f64).sum();
+            eprintln!("#  SB upload t={t} xs0={s0:.4}");
+        }
         if !noba { self.ctx.begin_batch()?; };
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
@@ -897,11 +1067,39 @@ impl DecoderState {
                 self.rms(xs.buf, &format!("blk.{il}.attn_norm"), xn.buf, n, t)?;
             }
             self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
+            if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                let x = vec![0f32; 64];
+                let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                eprintln!("#  SB post-rms xs0={s0:.4}");
+            }
             if self.is_recr[il] {
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_qkv.weight"), self.b_gqkv.buf, t)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_gate.weight"), self.b_gz.buf, t)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_beta.weight"), self.b_gb.buf, t)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_alpha.weight"), self.b_ga.buf, t)?;
+                if t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none()
+                    && (self.i8w.contains_key(&format!("blk.{il}.attn_qkv.weight"))
+                        || self.i8w.contains_key(&format!("blk.{il}.attn_gate.weight"))) {
+                    self.quant_b8(self.b_xn.buf, n, t)?;
+                }
+                self.gemv_stage(n, t, &[
+                    (format!("blk.{il}.attn_qkv.weight"), self.b_xq_n.buf, self.b_gqkv.buf),
+                    (format!("blk.{il}.attn_gate.weight"), self.b_xq_n.buf, self.b_gz.buf),
+                    (format!("blk.{il}.ssm_beta.weight"), self.b_xq_n.buf, self.b_gb.buf),
+                    (format!("blk.{il}.ssm_alpha.weight"), self.b_xq_n.buf, self.b_ga.buf),
+                ])?;
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    let mut g = vec![0f32; 8];
+                    unsafe { std::ptr::copy_nonoverlapping(self.b_gqkv.ptr as *const f32, g.as_mut_ptr(), 8) };
+                    let gq: f64 = unsafe { std::slice::from_raw_parts(self.b_gqkv.ptr as *const f32, 128) }.iter().map(|&v| v as f64).sum();
+                    let d0 = format!("{:?}", g);
+                    let mut b8v = [0i8; 16];
+                    unsafe { std::ptr::copy_nonoverlapping(self.b8.ptr as *const i8, b8v.as_mut_ptr(), 16) };
+                    let mut ydv = [0f32; 4];
+                    unsafe { std::ptr::copy_nonoverlapping(self.ydb.ptr as *const f32, ydv.as_mut_ptr(), 4) };
+                    let mut qsv = [0i32; 4];
+                    unsafe { std::ptr::copy_nonoverlapping(self.qsb.ptr as *const i32, qsv.as_mut_ptr(), 4) };
+                    eprintln!("#  SB post-gemv4 xs0={s0:.4} gqkv0={gq:.4} first8={d0} b8={:?} yd={:?} qs={:?}", b8v.to_vec(), ydv.to_vec(), qsv.to_vec());
+                }
                 // conv — gy=t (이력은 qkv에서 판독, t>1은 링을 conv_state가 갱신)
                 {
                     let cw = self.consts.get(&format!("blk.{il}.conv_w")).cloned().ok_or("conv_w")?;
@@ -916,6 +1114,11 @@ impl DecoderState {
                             &push, conv_ch.div_ceil(64) as u32, 1, 1)?;
                     }
                 }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-conv xs0={s0:.4}");
+                }
                 // split3 — flat total*t
                 {
                     let total = 2 * k_len + v_len;
@@ -924,12 +1127,22 @@ impl DecoderState {
                         &[self.b_gconv.buf, self.b_gq.buf, self.b_gk.buf, self.b_gv.buf],
                         &push, (total * t).div_ceil(64) as u32, 1, 1)?;
                 }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-split3 xs0={s0:.4}");
+                }
                 // l2 — grid (2*ng, t)
                 {
                     let mut push = self.eps.to_le_bytes().to_vec();
                     push.extend(Self::push_u32s(&[d_state as u32, self.n_group as u32]));
                     self.run_pipe("l2", L2_SPV, 2, 12,
                         &[self.b_gq.buf, self.b_gk.buf], &push, (2 * self.n_group) as u32, t as u32, 1)?;
+                }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-l2 xs0={s0:.4}");
                 }
                 // beta_g — n_h = dt_rank*t
                 {
@@ -939,6 +1152,11 @@ impl DecoderState {
                     self.run_pipe("beta_g", BETA_G_SPV, 5, 8,
                         &[self.b_gb.buf, self.b_ga.buf, dtb.buf, ssa.buf, self.b_gbg.buf],
                         &push, (dt_rank * t).div_ceil(64) as u32, 1, 1)?;
+                }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-betag xs0={s0:.4}");
                 }
                 // AR — PC.t 내부 순차
                 {
@@ -951,6 +1169,11 @@ impl DecoderState {
                           self.b_gv.buf, self.b_gbg.buf, self.b_go.buf],
                         &push, dt_rank as u32, d_state as u32, 1)?;
                 }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-ar xs0={s0:.4}");
+                }
                 // norm_gated — grid (dt_rank, t)
                 {
                     let sn = self.consts.get(&format!("blk.{il}.ssm_norm")).cloned().ok_or("sn")?;
@@ -960,13 +1183,29 @@ impl DecoderState {
                         &[self.b_go.buf, self.b_gz.buf, sn.buf, self.b_ggated.buf],
                         &push, dt_rank as u32, t as u32, 1)?;
                 }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-normgated xs0={s0:.4}");
+                }
                 self.quant(self.b_ggated.buf, self.b_xq_g.buf, d_inner, t)?;
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
+                    let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
+                    eprintln!("#  SB post-quant2 xs0={s0:.4}");
+                }
                 self.gemv(self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, t)?;
                 recr_idx += 1;
             } else {
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_q.weight"), self.b_aq.buf, t)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_k.weight"), self.b_ak.buf, t)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_v.weight"), self.b_av.buf, t)?;
+                if t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none()
+                    && self.i8w.contains_key(&format!("blk.{il}.attn_q.weight")) {
+                    self.quant_b8(self.b_xn.buf, n, t)?;
+                }
+                self.gemv_stage(n, t, &[
+                    (format!("blk.{il}.attn_q.weight"), self.b_xq_n.buf, self.b_aq.buf),
+                    (format!("blk.{il}.attn_k.weight"), self.b_xq_n.buf, self.b_ak.buf),
+                    (format!("blk.{il}.attn_v.weight"), self.b_xq_n.buf, self.b_av.buf),
+                ])?;
                 // qk_rope — grid (nh+nk, t), pos = pos0+행
                 {
                     let qn = self.consts.get(&format!("blk.{il}.attn_q_norm")).cloned().ok_or("qn")?;
@@ -1009,14 +1248,32 @@ impl DecoderState {
                 self.rms(xs.buf, &format!("blk.{il}.post_norm"), xn.buf, n, t)?;
             }
             self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
-            self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ffn_gate.weight"), self.b_fgate.buf, t)?;
-            self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ffn_up.weight"), self.b_fup.buf, t)?;
+            if t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none()
+                && self.i8w.contains_key(&format!("blk.{il}.ffn_gate.weight")) {
+                self.quant_b8(self.b_xn.buf, n, t)?;
+            }
+            self.gemv_stage(n, t, &[
+                (format!("blk.{il}.ffn_gate.weight"), self.b_xq_n.buf, self.b_fgate.buf),
+                (format!("blk.{il}.ffn_up.weight"), self.b_xq_n.buf, self.b_fup.buf),
+            ])?;
             self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff * t)?;
             self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, t)?;
             self.gemv(self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, t)?;
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n * t)?;
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+            let s = |b: &VkBuf, len: usize| -> f64 {
+                let mut x = vec![0f32; len];
+                unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
+                x.iter().map(|&q| q as f64).sum()
+            };
+            eprintln!("#  SB state seq={seq} conv0={:.6} gdn0={:.6} kvk3r0={:.6} kvv3r0={:.6} xsL={:.6}",
+                s(&self.st_conv[0][seq], 30720.min(self.conv_ch * 3)),
+                s(&self.st_gdn[0][seq], 4096),
+                s(&self.kv_k[0][seq], 1024), s(&self.kv_v[0][seq], 1024),
+                s(&self.b_xs, 64));
+        }
         // head
         if all_logits {
             self.rms(self.b_xs.buf, "output_norm", self.b_xn.buf, n, t)?;
