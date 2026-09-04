@@ -20,6 +20,7 @@ pub struct VkCtx {
     pub qf: u32,
     pub pool: vk::CommandPool,
     pub cmdbuf: vk::CommandBuffer,
+    pub cmdbuf2: vk::CommandBuffer,
     pub fence: vk::Fence,
     pub coop_matrix: bool,
     pub coop_f16_f32: bool,
@@ -27,6 +28,8 @@ pub struct VkCtx {
     pub mem_ty: u32,
     /// GTT(캐시 host-visible) 타입 — 스크래치용.
     pub mem_ty_host: u32,
+    /// 배치 모드 — run()은 녹화만 하고 end_batch에서 일괄 제출 (plans/19).
+    pub batching: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for VkCtx {}
@@ -118,9 +121,11 @@ impl VkCtx {
                     None,
                 )
                 .map_err(|e| format!("커맨드 풀: {e:?}"))?;
-            let cmdbuf = device
-                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))
-                .map_err(|e| format!("커맨드 버퍼: {e:?}"))?[0];
+            let cbs = device
+                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2))
+                .map_err(|e| format!("커맨드 버퍼: {e:?}"))?;
+            let cmdbuf = cbs[0];
+            let cmdbuf2 = cbs[1];
             let fence = device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| format!("펜스: {e:?}"))?;
@@ -158,12 +163,14 @@ impl VkCtx {
                 qf,
                 pool,
                 cmdbuf,
+                cmdbuf2,
                 fence,
                 coop_matrix,
                 coop_f16_f32,
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
+                batching: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -174,6 +181,49 @@ impl VkCtx {
         unsafe {
             self.device.unmap_memory(b.mem);
             b.ptr = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+
+    /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
+    pub fn begin_batch(&mut self) -> Result<(), String> {
+        unsafe {
+            self.device
+                .reset_command_buffer(
+                    self.cmdbuf2,
+                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                )
+                .map_err(|e| format!("리셋2: {e:?}"))?;
+            self.device
+                .begin_command_buffer(
+                    self.cmdbuf2,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| format!("시작2: {e:?}"))?;
+        }
+        self.batching.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 배치 종료 — 일괄 제출·대기.
+    pub fn end_batch_wait(&mut self) -> Result<(), String> {
+        self.batching.store(false, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            self.device
+                .end_command_buffer(self.cmdbuf2)
+                .map_err(|e| format!("종료2: {e:?}"))?;
+            self.device
+                .reset_fences(&[self.fence])
+                .map_err(|e| format!("펜스 리셋: {e:?}"))?;
+            let cbs = [self.cmdbuf2];
+            let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[si], self.fence)
+                .map_err(|e| format!("제출2: {e:?}"))?;
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| format!("대기2: {e:?}"))?;
         }
         Ok(())
     }
@@ -343,22 +393,29 @@ impl VkCtx {
         gz: u32,
     ) -> Result<(), String> {
         unsafe {
-            self.device
-                .reset_command_buffer(
-                    self.cmdbuf,
-                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
-                )
-                .map_err(|e| format!("리셋: {e:?}"))?;
-            self.device
-                .begin_command_buffer(
-                    self.cmdbuf,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .map_err(|e| format!("시작: {e:?}"))?;
-            self.device.cmd_bind_pipeline(self.cmdbuf, vk::PipelineBindPoint::COMPUTE, pipe);
+            if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                self.device
+                    .reset_command_buffer(
+                        self.cmdbuf,
+                        vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                    )
+                    .map_err(|e| format!("리셋: {e:?}"))?;
+                self.device
+                    .begin_command_buffer(
+                        self.cmdbuf,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| format!("시작: {e:?}"))?;
+            }
+            let cb = if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                self.cmdbuf2
+            } else {
+                self.cmdbuf
+            };
+            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipe);
             self.device.cmd_bind_descriptor_sets(
-                self.cmdbuf,
+                cb,
                 vk::PipelineBindPoint::COMPUTE,
                 pl,
                 0,
@@ -367,22 +424,29 @@ impl VkCtx {
             );
             if !push.is_empty() {
                 self.device.cmd_push_constants(
-                    self.cmdbuf,
+                    cb,
                     pl,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
                     push,
                 );
             }
-            self.device.cmd_dispatch(self.cmdbuf, gx, gy, gz);
-            self.device
-                .end_command_buffer(self.cmdbuf)
-                .map_err(|e| format!("종료: {e:?}"))?;
+            self.device.cmd_dispatch(cb, gx, gy, gz);
+            if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                self.device
+                    .end_command_buffer(self.cmdbuf)
+                    .map_err(|e| format!("종료: {e:?}"))?;
+            }
             self.device
                 .reset_fences(&[self.fence])
                 .map_err(|e| format!("펜스 리셋: {e:?}"))?;
             let cbs = [self.cmdbuf];
             let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                // 배치 모드: 녹화만. 커맨드 버퍼는 ONE_TIME_SUBMIT이지만 end_batch에서
+                // 제출 전까지 재사용 불가 — 배치 세션 동안 별도 2차 버퍼 사용.
+                return Ok(());
+            }
             self.device
                 .queue_submit(self.queue, &[si], self.fence)
                 .map_err(|e| format!("제출: {e:?}"))?;

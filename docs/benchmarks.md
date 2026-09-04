@@ -257,9 +257,12 @@ no external load). Even with the host partially recovered (CPU probe 112s -> 8.4
 1.85 t/s tg / 4 t/s pp32 — so the dominant cost is architectural, not host state:
 the VkAcc design submits+waits a fence per matmul (~0.9 ms × ~325 matmuls/token
 ≈ 290 ms/token of sync overhead; single GEMV itself is healthy at 48.7 GB/s ★).
-Next step for Vulkan throughput: batch multiple matmuls per command-buffer submit
-(pp32 amortizes to 250 ms/token, confirming the fixed-overhead model). HIP
-(fully GPU-resident, no per-op sync) is the performance path at 28 t/s np4×spec4.
+Command-buffer batching landed (plans/19): the FFN resident chain (6 ops) and
+matmul groups now record to a secondary command buffer and submit once — tg 1.85 →
+2.06 t/s (+11%) with the stream still matching the CPU reference exactly (41/41 ★).
+The remaining gap vs pp32 (238 ms/token amortized) indicates per-op host work beyond
+sync (upload + readback per op); the full fix is offloading the remaining CPU-side
+EW/GDN ops (plans/19 phase 2). HIP remains the performance path at 28 t/s np4×spec4.
 
 ## Vulkan status (2026-09-05) — superseded
 

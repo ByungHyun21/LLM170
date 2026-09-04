@@ -49,6 +49,8 @@ pub struct VkAcc {
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     // FFN 상주 체인 버퍼 (xf, xq0, fg, fu, glu, xq1, ob)
     ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
+    /// 그룹 배칭 가중별 출력 슬롯 (plans/19)
+    gobufs: Mutex<Vec<Option<VkBuf>>>,
 }
 
 fn vk_ty(ty: GgmlType) -> Option<u32> {
@@ -91,6 +93,7 @@ impl VkAcc {
             sbufs: Mutex::new(None),
             rbufs: Mutex::new(None),
             ffnbufs: Mutex::new(None),
+            gobufs: Mutex::new(Vec::new()),
         })
     }
 
@@ -422,6 +425,8 @@ impl VkAcc {
             let r = b.as_ref().unwrap();
             (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf, r.0.ptr, r.6.ptr)
         };
+        // 배치 모드 — 6연산 단일 제출 (plans/19: sync ~0.9ms×5 절감)
+        ctx.begin_batch()?;
         // 1) xs 업로드 → quant(n0)
         for (ti, row) in xs.iter().enumerate() {
             unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0) };
@@ -460,7 +465,8 @@ impl VkAcc {
             let wbufs = self.weight_bufs(&mut ctx, down_w)?;
             self.gemv_run(&mut ctx, &wbufs, n_ff, down_w.n_out as usize, xq1_w, ty, t, bq1, bob)?;
         }
-        // 6) 다운로드 1회
+        // 6) 일괄 제출·대기 → 다운로드 1회
+        ctx.end_batch_wait()?;
         let host = unsafe { std::slice::from_raw_parts(ob_ptr as *const f32, t * n0) };
         for ti in 0..t {
             xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
@@ -524,16 +530,35 @@ impl Accelerator for VkAcc {
         let mut ctx = self.ctx.lock();
         let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
         self.quant_upload(&mut ctx, xs, n_in, xq)?;
+        // 배치: 모든 가중 GEMV 녹화 → 단일 제출 → 일괄 다운로드 (plans/19)
+        ctx.begin_batch()?;
+        let mut hosts: Vec<(*mut u8, usize, usize)> = Vec::with_capacity(ws.len()); // (ptr, n_out, ti스트라이드)
         for (wi, w) in ws.iter().enumerate() {
             let ty = vk_ty(w.ty).unwrap();
             let n_out = w.n_out as usize;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
-            let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
+            // 가중별 독립 출력 버퍼 (그룹 세션 슬롯)
+            let ob = {
+                let mut g = self.gobufs.lock();
+                while g.len() <= wi {
+                    g.push(None);
+                }
+                if g[wi].as_ref().map(|b| b.bytes >= t * n_out * 4).unwrap_or(false) {
+                    g[wi].as_ref().unwrap().buf
+                } else {
+                    let b = ctx.alloc_host(t * n_out * 4)?;
+                    let buf = b.buf;
+                    g[wi] = Some(b);
+                    buf
+                }
+            };
             self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
-            // 행별 다운로드
-            let obg = self.obuf.lock();
-            let host =
-                unsafe { std::slice::from_raw_parts(obg.as_ref().unwrap().ptr as *const f32, t * n_out) };
+            let ptr = self.gobufs.lock()[wi].as_ref().unwrap().ptr;
+            hosts.push((ptr, n_out, wi));
+        }
+        ctx.end_batch_wait()?;
+        for (ptr, n_out, wi) in hosts {
+            let host = unsafe { std::slice::from_raw_parts(ptr as *const f32, t * n_out) };
             for ti in 0..t {
                 outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
             }
