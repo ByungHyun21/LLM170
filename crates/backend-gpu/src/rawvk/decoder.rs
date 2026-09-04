@@ -469,7 +469,8 @@ impl DecoderState {
                         &[self.b_gb.buf, self.b_ga.buf, dtb.buf, ssa.buf, self.b_gbg.buf],
                         &push, dt_rank.div_ceil(64) as u32, 1, 1)?;
                 }
-                // AR
+                // AR (LLM170_VK_GDN_SKIP=1이면 스킵 — L3 크래시 분리용)
+                if std::env::var("LLM170_VK_GDN_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 1 {
                 {
                     let scale = 1.0f32 / (d_state as f32).sqrt();
                     let mut push = Self::push_u32s(&[d_state as u32, k_len as u32, v_len as u32, dt_rank as u32, self.n_group as u32]);
@@ -479,6 +480,7 @@ impl DecoderState {
                         &[self.st_gdn[recr_idx][seq].buf, self.b_gq.buf, self.b_gk.buf,
                           self.b_gv.buf, self.b_gbg.buf, self.b_go.buf],
                         &push, dt_rank as u32, d_state as u32, 1)?;
+                }
                 }
                 // norm_gated
                 {
@@ -561,6 +563,10 @@ impl DecoderState {
             self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, 1)?;
             self.gemv(self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, 1)?;
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n)?;
+            // 실험: L0 FFN 직후 attn_q gemv 강제 (층 위치 vs 가중치 분리)
+            if std::env::var_os("LLM170_VK_FORCE_AQ").is_some() && il == 0 {
+                self.gemv(self.b_xq_n.buf, "blk.3.attn_q.weight", self.b_aq.buf, 1)?;
+            }
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         // ── head: output_norm → quant → gemv(output) → 다운로드
