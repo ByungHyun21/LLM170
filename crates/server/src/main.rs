@@ -674,13 +674,21 @@ fn cmd_infer(args: &[String]) -> ExitCode {
             let n = prompts.len();
             let mut eng = llm170_core::model::Engine::new(m, n, ctx);
             if gpu_runtime == "vulkan" {
-                // Vulkan 경로 (plans/12): rawhip 미주입, VkAcc로 matmul만 가속 — GDN·EW는 CPU.
-                match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
-                    Ok(acc) => {
-                        eng = eng.with_acc(std::sync::Arc::new(acc));
-                        eprintln!("# backend: gpu (vulkan VkAcc)");
+                if std::env::var_os("LLM170_VK_DECODER").is_some() {
+                    // GPU 상주 디코드 (plans/19 2단계) — 커널 8종 gdn-check ★
+                    match crate::inject_rawvk(&mut eng) {
+                        Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
+                        Err(e) => eprintln!("vk-decoder: {e} (VkAcc로 진행)"),
                     }
-                    Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                } else {
+                    // Vulkan 경로 (plans/12): VkAcc로 matmul만 가속 — GDN·EW는 CPU.
+                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                        Ok(acc) => {
+                            eng = eng.with_acc(std::sync::Arc::new(acc));
+                            eprintln!("# backend: gpu (vulkan VkAcc)");
+                        }
+                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                    }
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
@@ -1097,8 +1105,46 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
 }
 
 /// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
-fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+/// VkDecoder 주입 — rawhip과 동일 가중치·상수 목록 (plans/19).
+fn inject_rawvk(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    use llm170_core::matmul::RawDecode;
     let hp = eng.model.hp.clone();
+    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
+    let (wnames, cnames) = crate::raw_names(eng);
+    let mut weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = Vec::new();
+    for n in &wnames {
+        let w = eng.model.wchk(n).map_err(|e| e.to_string())?;
+        weights.push((n.clone(), w));
+    }
+    let mut consts: Vec<(String, Vec<f32>)> = Vec::new();
+    for n in &cnames {
+        let v = eng.model.f32_vec(n).map_err(|e| e.to_string())?;
+        consts.push((n.clone(), v));
+    }
+    // cs/mask는 커널 산술이 rawhip과 다른 경로 — decoder.rs에서 pos 기반 직접 산술(로프)·전체 attention이라 mask 불요.
+    // cs: [ctx][n_rot] cos/sin — rawhip 산술 (freq_base 1e7).
+    let nr = hp.n_rot;
+    let base = hp.rope_base as f64;
+    let ctx_l = eng.ctx_len();
+    let mut cs = Vec::with_capacity(ctx_l * nr);
+    for p2 in 0..ctx_l {
+        for i in 0..(nr >> 1) {
+            let th = p2 as f64 * base.powf(-(2.0 * i as f64 + 1.0) / nr as f64);
+            cs.push(th.cos() as f32);
+            cs.push(th.sin() as f32);
+        }
+    }
+    consts.push(("cs".to_string(), cs));
+    let rd: std::sync::Arc<llm170_backend_gpu::rawvk::decoder::VkDecoder> =
+        std::sync::Arc::new(llm170_backend_gpu::rawvk::decoder::VkDecoder::new());
+    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
+        .map_err(|e| format!("raw_init(vk): {e}"))?;
+    eng.raw_decode = Some(rd);
+    Ok(())
+}
+
+fn raw_names(eng: &llm170_core::model::Engine) -> (Vec<String>, Vec<String>) {
+    let hp = &eng.model.hp;
     let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
     let mut wnames: Vec<String> = Vec::new();
     let mut cnames: Vec<String> = Vec::new();
@@ -1140,6 +1186,13 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     cnames.push("output_norm".into());
     cnames.push("cs".into());
     cnames.push("mask".into());
+    (wnames, cnames)
+}
+
+fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    let hp = eng.model.hp.clone();
+    let (wnames, cnames): (Vec<String>, Vec<String>) = crate::raw_names(eng);
+    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
     let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
         .iter()
         .filter_map(|k| eng.model.wchk(k).ok().map(|w| (k.clone(), w)))

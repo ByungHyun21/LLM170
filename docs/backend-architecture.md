@@ -101,3 +101,20 @@ Attention kernels follow: qk_norm_rope (bit-exact vs CPU f64 mirror — head-RMS
 the first hd elements, k-only kq_scale, rope pairs (p, p+n_rot/2)), kv_append, and
 qsa_flash (gated, online softmax, 6e-8) — all verified in `gdn-check`. The full
 VkDecoder kernel set is now verified; host assembly remains.
+
+
+## VkDecoder (2026-09-05)
+
+GPU-resident Vulkan decode (LLM170_VK_DECODER=1): the full layer stack — GDN chain
+(conv/ring, split3, L2, beta_g, AR recursion, norm-gated), attention (head-RMS rope,
+KV append, gated online-softmax flash), FFN, and the output head — runs as ~400 kernel
+dispatches recorded into a single command buffer per token (batch mode with barriers).
+
+**Correctness**: the 41-token greedy stream is bit-identical to the HIP raw decoder
+(both W4A8 paths agree; both diverge from the F32 CPU reference only at the known
+index-6 near-tie).
+
+**Performance**: 0.6 t/s decode — two identified bottlenecks: the Vulkan GEMV kernel
+runs at 48.7 GB/s vs HIP's ~117 GB/s (2.4x kernel gap), and per-op overhead (fresh
+descriptor set per dispatch, full memory barrier between all dispatches) adds ~1.4 s
+beyond the ~330 ms weight-read floor. Both are kernel/overhead work, not architectural.

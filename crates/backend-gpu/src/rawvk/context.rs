@@ -4,6 +4,7 @@
 use ash::khr;
 use ash::vk;
 
+#[derive(Clone)]
 pub struct VkBuf {
     pub buf: vk::Buffer,
     pub ptr: *mut u8,

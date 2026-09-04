@@ -1,13 +1,14 @@
 //! rawvk — Vulkan 백엔드 (plans/12). 모듈 루트.
 
 pub mod context;
+pub mod decoder;
 pub mod gemv;
 
 use context::VkCtx;
 
 const SMOKE_SPV: &[u8] = include_bytes!("spv/smoke.spv");
 const COOPMAT_PROBE_SPV: &[u8] = include_bytes!("spv/coopmat_probe.spv");
-const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
+pub const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
 
 /// vk-check — 디바이스 역량 + 트리비얼 컴퓨트 값 검증 (M1 게이트).
 /// subsum-check — 서브그룹 리덕션 프로브 (xor 트리 / add / broadcast).

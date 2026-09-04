@@ -10,11 +10,11 @@ use llm170_gguf::GgmlType;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
+pub const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
-const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
-const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
-const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
+pub const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
+pub const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
+pub const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 #[derive(Clone, Copy)]
