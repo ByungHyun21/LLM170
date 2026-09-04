@@ -14,6 +14,7 @@ pub const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
 /// subsum-check — 서브그룹 리덕션 프로브 (xor 트리 / add / broadcast).
 pub fn subsum_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
+use ash::vk;
     let mut ctx = VkCtx::new()?;
     let ob = ctx.alloc(16)?;
     let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/subsum.spv"), 1, 4)?;
@@ -35,6 +36,7 @@ pub fn subsum_check() -> Result<String, String> {
 /// split3·conv_t·beta_g·norm_gated·ar — 각 커널 독립 LCG 입력·CPU 미러 대조.
 pub fn gdn_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
+use ash::vk;
     let mut ctx = VkCtx::new()?;
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {

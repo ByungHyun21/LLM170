@@ -257,6 +257,25 @@ impl VkCtx {
         Ok(())
     }
 
+    /// 비배치 모드 플러시 — cmdbuf2 즉시 제출·대기 (NOBATCH 경로).
+    pub fn flush2(&mut self) -> Result<(), String> {
+        unsafe {
+            self.device.end_command_buffer(self.cmdbuf2).map_err(|e| format!("종료2: {e:?}"))?;
+            self.device.reset_fences(&[self.fence]).map_err(|e| format!("펜스: {e:?}"))?;
+            let cbs = [self.cmdbuf2];
+            let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device.queue_submit(self.queue, &[si], self.fence).map_err(|e| format!("제출2: {e:?}"))?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX).map_err(|e| format!("대기2: {e:?}"))?;
+            if let Some((_, pool)) = self.batch_pool.get() {
+                let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
+                if !sets.is_empty() {
+                    self.device.free_descriptor_sets(pool, &sets);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
         self.batching.store(false, std::sync::atomic::Ordering::Relaxed);

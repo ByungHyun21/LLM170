@@ -91,6 +91,7 @@ pub struct DecoderState {
     b_out: VkBuf, // [t][n_embd] 결과 다운로드
     b_am: VkBuf,  // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
+    split_ctr: usize,
 }
 
 unsafe impl Send for DecoderState {}
@@ -195,9 +196,8 @@ impl DecoderState {
         let mut ktab = ctx.alloc(1024)?;
         unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr(), ktab.ptr as *mut u32, 256) };
         ctx.unmap(&mut ktab)?;
-        let g3: Vec<f32> = (0..6144).map(|i| (i % 7) as f32 - 3.0).collect();
-        let mut grid3s = ctx.alloc(6144 * 4)?;
-        unsafe { std::ptr::copy_nonoverlapping(g3.as_ptr(), grid3s.ptr as *mut f32, 6144) };
+        let mut grid3s = ctx.alloc(2048)?;
+        unsafe { std::ptr::copy_nonoverlapping(llm170_core::IQ3S_GRID.as_ptr() as *const u8, grid3s.ptr, 2048) }; // iq3s 512워드 진테이블 (VkAcc ensure_shared 대칭)
         ctx.unmap(&mut grid3s)?;
         let mut dummy = ctx.alloc(16)?;
         let z16 = [0u8; 16];
@@ -322,6 +322,7 @@ impl DecoderState {
             b_out,
             b_am,
             pipes: HashMap::new(),
+            split_ctr: 0,
         })
     }
 
@@ -340,6 +341,15 @@ impl DecoderState {
 
     /// 바인딩+런치 (배치 모드 자동 — fresh ds).
     fn run_pipe(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32, bufs: &[vk::Buffer], push: &[u8], gx: u32, gy: u32, gz: u32) -> Result<(), String> {
+        // 배치 자동 분할 — 디스패치 512마다 제출·대기·재시작 (세트/CMDBUF 누적 방지).
+        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.split_ctr += 1;
+            if self.split_ctr >= 512 {
+                self.split_ctr = 0;
+                self.ctx.end_batch_wait()?;
+                self.ctx.begin_batch()?;
+            }
+        }
         let (pl, ds_default, pipe, dsl, pool) = {
             let p = self.pipe(name, spv, n_buf, pb)?;
             (p.pl, p.ds, p.pipe, p.dsl, p.pool)
@@ -396,6 +406,7 @@ impl DecoderState {
 
     /// t=1 단일 스텝 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), n);
         let (dt_rank, d_state, d_inner) = (self.dt_rank, self.d_state, self.d_inner);
@@ -404,7 +415,7 @@ impl DecoderState {
         let k_len = self.k_len;
         let v_len = self.v_len;
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
-        self.ctx.begin_batch()?;
+        if !noba { self.ctx.begin_batch()?; };
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         let layer_cut = std::env::var("LLM170_VK_LAYERS").ok().and_then(|v| v.parse::<usize>().ok());
@@ -484,7 +495,15 @@ impl DecoderState {
                 self.gemv(self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1)?;
                 recr_idx += 1;
             } else {
-                // 어텐션
+                // 어텐션 (LLM170_VK_ATTN: 1=qkv gemv만, 2=+rope/kv, 3=+flash, 4=+wo)
+                let attn_cut = std::env::var("LLM170_VK_ATTN").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4);
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 3 {
+                    let (bufs, tyq, niq, noq) = self.w.get(&format!("blk.{il}.attn_q.weight")).unwrap();
+                    let total: usize = bufs.iter().map(|b| b.bytes).sum();
+                    let (gbufs, _, _, gno) = self.w.get("blk.0.attn_qkv.weight").unwrap();
+                    let gtotal: usize = gbufs.iter().map(|b| b.bytes).sum();
+                    eprintln!("#  ATTN3 ty={} ni={} no={} chunks={} bytes={} max_ssbo={} | L0qkv no={} chunks={} bytes={}", tyq, niq, noq, bufs.len(), total, self.max_ssbo, gno, gbufs.len(), gtotal);
+                }
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_q.weight"), self.b_aq.buf, 1)?;
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_k.weight"), self.b_ak.buf, 1)?;
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_v.weight"), self.b_av.buf, 1)?;
@@ -500,6 +519,7 @@ impl DecoderState {
                         &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
                         &push, (n_head + n_kv) as u32, 1, 1)?;
                 }
+                if attn_cut >= 2 {
                 // kv append
                 {
                     let push = Self::push_u32s(&[(n_kv * hd) as u32, pos as u32]);
@@ -510,6 +530,7 @@ impl DecoderState {
                         &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
                         (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
                 }
+                if attn_cut >= 3 {
                 // flash
                 {
                     let mask = self.consts.get("mask").cloned().ok_or("mask")?;
@@ -519,7 +540,11 @@ impl DecoderState {
                         &push, 1, n_head as u32, 1)?;
                 }
                 self.quant(self.b_aout.buf, self.b_xq_g.buf, n_head * hd, 1)?;
+                }
+                if attn_cut >= 4 {
                 self.gemv(self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, 1)?;
+                }
+                }
                 full_idx += 1;
             }
             // 잔차
@@ -537,16 +562,16 @@ impl DecoderState {
             self.gemv(self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, 1)?;
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n)?;
         }
-        self.ctx.end_batch_wait()?;
+        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         // ── head: output_norm → quant → gemv(output) → 다운로드
         {
             let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
             self.rms(xs.buf, "output_norm", xn.buf, n, 1)?;
         }
         self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
-        self.ctx.begin_batch()?;
+        if !noba { self.ctx.begin_batch()?; };
         self.gemv(self.b_xq_n.buf, "output.weight", self.b_gout.buf, 1)?;
-        self.ctx.end_batch_wait()?;
+        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         let no_out = self.w.get("output.weight").map(|(_, _, _, no)| *no).unwrap_or(n);
         let mut logits = vec![0f32; no_out];
         unsafe { std::ptr::copy_nonoverlapping(self.b_gout.ptr as *const f32, logits.as_mut_ptr(), no_out.min(self.b_gout.bytes / 4)) };
