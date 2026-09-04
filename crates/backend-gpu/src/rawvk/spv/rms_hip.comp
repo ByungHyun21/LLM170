@@ -1,0 +1,38 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+// rms — rawhip rms_part+rms_finish 미러: 32세그먼트 f32 부분합 → f64 결합.
+// grid (1, t): 워크그룹 32스레드 = u, 행 = WorkGroupID.y.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer X { float x[]; };     // [t][n]
+layout(binding = 1) readonly buffer W { float w[]; };     // [n]
+layout(binding = 2) buffer Out { float outv[]; };         // [t][n]
+layout(push_constant) uniform PC { uint n; uint t; float eps; } pc;
+shared double sh[32];
+void main() {
+    int u = int(gl_LocalInvocationIndex);
+    int row = int(gl_WorkGroupID.y);
+    if (u >= 32) return;
+    int n = int(pc.n);
+    int chunk = (n + 31) >> 5;
+    int lo = u * chunk;
+    int hi = min(lo + chunk, n);
+    int xb = row * n;
+    float acc = 0.0;
+    if (lo < n) {
+        for (int i = lo; i < hi; i++) {
+            float dv = x[xb + i];
+            acc += dv * dv;
+        }
+    }
+    sh[u] = double(acc);
+    barrier();
+    double sum = 0.0;
+    for (int u2 = 0; u2 < 32; u2++) {
+        if (u2 * chunk < n) sum += sh[u2];
+    }
+    float scale32 = float(sqrt(sum / double(n) + double(pc.eps)));
+    float inv = 1.0 / scale32;
+    if (lo < n) {
+        for (int i = lo; i < hi; i++) outv[xb + i] = x[xb + i] * inv * w[i];
+    }
+}

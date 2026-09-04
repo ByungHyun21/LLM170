@@ -206,12 +206,12 @@ impl VkCtx {
                     .ok_or("fresh_ds: 배치 컨텍스트 없음")?;
                 let pool_sizes = [vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(12 * 256)];
+                    .descriptor_count(12 * 4096)];
                 let pool = self
                     .device
                     .create_descriptor_pool(
                         &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(256)
+                            .max_sets(4096)
                             .pool_sizes(&pool_sizes)
                             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
                         None,

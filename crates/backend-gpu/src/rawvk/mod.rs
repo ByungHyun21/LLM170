@@ -118,6 +118,64 @@ pub fn gdn_check() -> Result<String, String> {
         }
         let maxd = r.iter().zip(c.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         lines.push(format!("gdn_conv_t: max|D|={maxd:.2e} {}", if maxd < 1e-5 { "★" } else { "MISMATCH" }));
+
+        // ── 다중 스텝 링 진화: t=1 4회 연속 — 상태 시프트·push 검증
+        {
+            let (ch, k, steps) = (12usize, 4usize, 4usize);
+            let cw: Vec<f32> = (0..ch * k).map(|_| lcg()).collect();
+            let mut st: Vec<f32> = vec![0.0; (k - 1) * ch];
+            let inputs: Vec<Vec<f32>> = (0..steps).map(|_| (0..ch).map(|_| lcg()).collect()).collect();
+            let cwb = ctx.alloc(cw.len() * 4)?;
+            let stb = ctx.alloc(st.len() * 4)?;
+            let inb = ctx.alloc(ch * 4)?;
+            let ob = ctx.alloc(ch * 4)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(cw.as_ptr(), cwb.ptr as *mut f32, cw.len());
+                std::ptr::copy_nonoverlapping(st.as_ptr(), stb.ptr as *mut f32, st.len());
+            }
+            let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+                include_bytes!("spv/gdn_conv_t.spv"), 4, 8,
+            )?;
+            ctx.bind_bufs(ds, &[inb.buf, cwb.buf, stb.buf, ob.buf]);
+            let push: Vec<u8> = [ch as u32, k as u32, 1u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut gpu_outs: Vec<Vec<f32>> = Vec::new();
+            for inp in &inputs {
+                unsafe { std::ptr::copy_nonoverlapping(inp.as_ptr(), inb.ptr as *mut f32, ch) };
+                ctx.run(pl, ds, pipe, &push, ch.div_ceil(64) as u32, 1, 1)?;
+                let mut o = vec![0f32; ch];
+                unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const f32, o.as_mut_ptr(), ch) };
+                gpu_outs.push(o);
+            }
+            let mut st2 = st.clone();
+            let mut cpu_outs: Vec<Vec<f32>> = Vec::new();
+            for inp in &inputs {
+                let mut o = vec![0f32; ch];
+                for c2 in 0..ch {
+                    let mut sum = cw[c2 * k + (k - 1)] * inp[c2];
+                    for j in 0..k - 1 {
+                        sum += cw[c2 * k + j] * st2[j * ch + c2];
+                    }
+                    o[c2] = sum / (1.0 + (-sum as f64).exp() as f32);
+                }
+                // shift+push
+                for j in 0..k - 2 {
+                    for c2 in 0..ch {
+                        st2[j * ch + c2] = st2[(j + 1) * ch + c2];
+                    }
+                }
+                for c2 in 0..ch {
+                    st2[(k - 2) * ch + c2] = inp[c2];
+                }
+                cpu_outs.push(o);
+            }
+            let mut maxd2 = 0f32;
+            for st_i in 0..steps {
+                for c2 in 0..ch {
+                    maxd2 = maxd2.max((gpu_outs[st_i][c2] - cpu_outs[st_i][c2]).abs());
+                }
+            }
+            lines.push(format!("gdn_conv_ring({steps} steps): max|D|={maxd2:.2e} {}", if maxd2 < 1e-5 { "★" } else { "MISMATCH" }));
+        }
     }
 
     // ── gdn_beta_g
@@ -273,6 +331,106 @@ pub fn gdn_check() -> Result<String, String> {
             None => String::new(),
         };
         lines.push(format!("gdn_ar: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-3 { "★" } else { "MISMATCH" }));
+    }
+
+    // ── norm_gated (요소별 z — rawhip kernels.rs:2554 미러): n_h=3, d=8, t=2
+    {
+        let (n_h, d, t) = (3usize, 8usize, 2usize);
+        let eps = 1e-5f32;
+        let mut o: Vec<f32> = (0..t * n_h * d).map(|_| lcg()).collect();
+        let z: Vec<f32> = (0..t * n_h * d).map(|_| lcg()).collect();
+        let w: Vec<f32> = (0..n_h * d).map(|_| lcg()).collect();
+        let ob = ctx.alloc(o.len() * 4)?;
+        let zb = ctx.alloc(z.len() * 4)?;
+        let wb = ctx.alloc(w.len() * 4)?;
+        let outb = ctx.alloc(o.len() * 4)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(o.as_ptr(), ob.ptr as *mut f32, o.len());
+            std::ptr::copy_nonoverlapping(z.as_ptr(), zb.ptr as *mut f32, z.len());
+            std::ptr::copy_nonoverlapping(w.as_ptr(), wb.ptr as *mut f32, w.len());
+        }
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+            include_bytes!("spv/norm_gated.spv"), 4, 12,
+        )?;
+        ctx.bind_bufs(ds, &[ob.buf, zb.buf, wb.buf, outb.buf]);
+        let mut push = eps.to_le_bytes().to_vec();
+        push.extend([d as u32, n_h as u32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        ctx.run(pl, ds, pipe, &push, n_h as u32, t as u32, 1)?;
+        let mut r = vec![0f32; t * n_h * d];
+        unsafe { std::ptr::copy_nonoverlapping(outb.ptr as *const f32, r.as_mut_ptr(), r.len()) };
+        // CPU 미러 (rawhip 산술)
+        let mut c = vec![0f32; t * n_h * d];
+        for ti in 0..t {
+            for h in 0..n_h {
+                let xb = (ti * n_h + h) * d;
+                let wb2 = h * d;
+                let mut sum = 0f64;
+                for i in 0..d { sum += o[xb + i] as f64 * o[xb + i] as f64; }
+                let inv = 1.0 / ((sum / d as f64 + eps as f64).sqrt() as f32);
+                for i in 0..d {
+                    let zz = z[xb + i];
+                    let g = zz / (1.0 + (-zz).exp());
+                    c[xb + i] = o[xb + i] * inv * w[wb2 + i] * g;
+                }
+            }
+        }
+        let maxd = r.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let fb = (0..r.len()).find(|&i| (r[i] - c[i]).abs() > 1e-4);
+        let dbg = match fb {
+            Some(i) => format!(
+                " first_bad[{i}] gpu={:.6} cpu={:.6} row0gpu={:?} row0cpu={:?}",
+                r[i], c[i], &r[0..d.min(8)], &c[0..d.min(8)]
+            ),
+            None => String::new(),
+        };
+        lines.push(format!("norm_gated: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-4 { "★" } else { "MISMATCH" }));
+    }
+
+    // ── silu_mul: exp_cr f64 폴리 포트 검증 (극값 포함)
+    {
+        let n = 4096usize;
+        let mut g: Vec<f32> = Vec::with_capacity(n);
+        for i in 0..n {
+            g.push(match i {
+                0 => -120.0,
+                1 => -104.0,
+                2 => -103.0,
+                3 => -90.0,
+                4 => 90.0,
+                5 => 88.8,
+                6 => 88.0,
+                7 => 0.0,
+                _ => lcg() * 20.0,
+            });
+        }
+        let u: Vec<f32> = (0..n).map(|_| lcg()).collect();
+        let gb = ctx.alloc(n * 4)?;
+        let ub = ctx.alloc(n * 4)?;
+        let ob = ctx.alloc(n * 4)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(g.as_ptr(), gb.ptr as *mut f32, n);
+            std::ptr::copy_nonoverlapping(u.as_ptr(), ub.ptr as *mut f32, n);
+        }
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
+            include_bytes!("spv/silu_mul.spv"), 3, 4,
+        )?;
+        ctx.bind_bufs(ds, &[gb.buf, ub.buf, ob.buf]);
+        let push = (n as u32).to_le_bytes().to_vec();
+        ctx.run(pl, ds, pipe, &push, n.div_ceil(256) as u32, 1, 1)?;
+        let mut r = vec![0f32; n];
+        unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const f32, r.as_mut_ptr(), n) };
+        // exp_cr 폴리 미러 (rawhip kernels.rs:42 정확 이식)
+        let c: Vec<f32> = g.iter().zip(&u).map(|(&v, &uv)| {
+            let s = v / (1.0 + (-v as f64).exp() as f32);
+            s * uv
+        }).collect();
+        let maxd = r.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let fb = (0..n).find(|&i| (r[i] - c[i]).abs() > 1e-5);
+        let dbg = match fb {
+            Some(i) => format!(" first_bad[{i}] g={:.4} gpu={:.7} cpu={:.7}", g[i], r[i], c[i]),
+            None => String::new(),
+        };
+        lines.push(format!("silu_mul: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-4 { "★" } else { "MISMATCH" }));
     }
 
     // ── l2_rows2: ng=2, d=128, t=3

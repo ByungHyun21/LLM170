@@ -1,0 +1,19 @@
+#version 450
+// gdn_conv_raw — conv 합만 (silu 호스트 적용). ring shift+push 포함.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };
+layout(binding = 1) readonly buffer Cw { float cw[]; };
+layout(binding = 2) buffer St { float st[]; };
+layout(binding = 3) buffer Out { float outv[]; };
+layout(push_constant) uniform PC { int ch; int k; int t; int raw; } pc;
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    if (c >= pc.ch) return;
+    float sum = cw[c * pc.k + (pc.k - 1)] * qkv[c];
+    for (int j = 0; j < pc.k - 1; j++) {
+        sum += cw[c * pc.k + j] * st[j * pc.ch + c];
+    }
+    for (int j = 0; j < pc.k - 2; j++) st[j * pc.ch + c] = st[(j + 1) * pc.ch + c];
+    st[(pc.k - 2) * pc.ch + c] = qkv[c];
+    outv[c] = sum;
+}

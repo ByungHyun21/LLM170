@@ -1105,6 +1105,75 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
 }
 
 /// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
+/// rawhip/VkDecoder 공용 상수 페치 (이름 리맵·타일 포함).
+fn raw_consts(
+    eng: &llm170_core::model::Engine,
+    cnames: &[String],
+) -> Vec<(String, Vec<f32>)> {
+    let hp = &eng.model.hp;
+    let ctx_n = eng.ctx_len();
+    cnames
+        .iter()
+        .filter_map(|k| {
+            let v = if k == "cs" {
+                let half = hp.n_rot >> 1;
+                let mut cs = vec![0.0f32; ctx_n * half * 2];
+                for pos in 0..ctx_n {
+                    for pp in 0..half {
+                        let theta = (hp.rope_base as f32).powf(-(2.0 * pp as f32) / hp.n_rot as f32);
+                        let angle = pos as f32 * theta;
+                        cs[pos * half * 2 + pp * 2] = angle.cos();
+                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
+                    }
+                }
+                Some(cs)
+            } else if k == "mask" {
+                // 인과 마스크 [pos][p]: p<=pos 만 1 — qsa 배치용 (원본 의미 복원)
+                let mut m = vec![0.0f32; ctx_n * ctx_n];
+                for pos in 0..ctx_n {
+                    for pp in 0..=pos {
+                        m[pos * ctx_n + pp] = 1.0;
+                    }
+                }
+                Some(m)
+            } else if k.ends_with("conv_w") {
+                eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()
+            } else {
+                let il = k.split('.').nth(1).unwrap_or("0").to_string();
+                let (tn, tiled) = if k.ends_with("dt_bias") {
+                    (format!("blk.{il}.ssm_dt.bias"), 1)
+                } else if k.ends_with("ssm_a") {
+                    (k.clone(), 1)
+                } else if k.ends_with("ssm_norm") {
+                    (format!("blk.{il}.ssm_norm.weight"), hp.dt_rank)
+                } else if k.ends_with("post_attention_norm") {
+                    (format!("blk.{il}.post_attention_norm.weight"), 1)
+                } else if k.ends_with("attn_norm") {
+                    (format!("blk.{il}.attn_norm.weight"), 1)
+                } else if k.ends_with("post_norm") {
+                    (format!("blk.{il}.post_attention_norm.weight"), 1)
+                } else if k == "output_norm" {
+                    ("output_norm.weight".to_string(), 1)
+                } else if k.ends_with("attn_q_norm") {
+                    (format!("blk.{il}.attn_q_norm.weight"), hp.n_head)
+                } else if k.ends_with("attn_k_norm") {
+                    (format!("blk.{il}.attn_k_norm.weight"), hp.n_kv)
+                } else {
+                    (format!("{k}.weight"), 1)
+                };
+                eng.model.f32_vec(&tn).ok().map(|v| {
+                    if tiled > 1 && (v.len() == hp.d_state || v.len() == hp.head_dim) {
+                        v.iter().copied().cycle().take(v.len() * tiled).collect()
+                    } else {
+                        v
+                    }
+                })
+            };
+            v.map(|v| (k.clone(), v))
+        })
+        .collect()
+}
+
 /// VkDecoder 주입 — rawhip과 동일 가중치·상수 목록 (plans/19).
 fn inject_rawvk(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     use llm170_core::matmul::RawDecode;
@@ -1116,25 +1185,14 @@ fn inject_rawvk(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         let w = eng.model.wchk(n).map_err(|e| e.to_string())?;
         weights.push((n.clone(), w));
     }
-    let mut consts: Vec<(String, Vec<f32>)> = Vec::new();
-    for n in &cnames {
-        let v = eng.model.f32_vec(n).map_err(|e| e.to_string())?;
-        consts.push((n.clone(), v));
-    }
-    // cs/mask는 커널 산술이 rawhip과 다른 경로 — decoder.rs에서 pos 기반 직접 산술(로프)·전체 attention이라 mask 불요.
-    // cs: [ctx][n_rot] cos/sin — rawhip 산술 (freq_base 1e7).
-    let nr = hp.n_rot;
-    let base = hp.rope_base as f64;
-    let ctx_l = eng.ctx_len();
-    let mut cs = Vec::with_capacity(ctx_l * nr);
-    for p2 in 0..ctx_l {
-        for i in 0..(nr >> 1) {
-            let th = p2 as f64 * base.powf(-(2.0 * i as f64 + 1.0) / nr as f64);
-            cs.push(th.cos() as f32);
-            cs.push(th.sin() as f32);
+    let mut consts = crate::raw_consts(eng, &cnames);
+    // VkDecoder 마스크: u32 all-ones (t=1 디코드 행은 p<=pos 전부 활성).
+    {
+        let cl = eng.ctx_len();
+        if let Some(m) = consts.iter_mut().find(|(k, _)| k == "mask") {
+            m.1 = (0..cl * cl).map(|_| f32::from_bits(1)).collect();
         }
     }
-    consts.push(("cs".to_string(), cs));
     let rd: std::sync::Arc<llm170_backend_gpu::rawvk::decoder::VkDecoder> =
         std::sync::Arc::new(llm170_backend_gpu::rawvk::decoder::VkDecoder::new());
     rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
@@ -1200,73 +1258,7 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     if weights.len() != wnames.len() {
         return Err(format!("rawhip: 가중치 누락 {}/{}", weights.len(), wnames.len()));
     }
-    let consts: Vec<(String, Vec<f32>)> = cnames
-        .iter()
-        .filter_map(|k| {
-            let v = if k == "cs" || k == "mask" {
-                // 엔진 실제 ctx 길이로 테이블 구축 (기존 2048 고정 → pos≥2048 OOB fault)
-                let (n_rot, base) = (hp.n_rot, hp.rope_base);
-                let half = n_rot / 2;
-                let ctx_n = eng.ctx_len();
-                if k == "cs" {
-                    let mut cs = vec![0.0f32; ctx_n * half * 2];
-                    for pos in 0..ctx_n {
-                        for pp in 0..half {
-                            let theta = base.powf(-(2.0 * pp as f32) / n_rot as f32);
-                            let angle = pos as f32 * theta;
-                            cs[pos * half * 2 + pp * 2] = angle.cos();
-                            cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
-                        }
-                    }
-                    Some(cs)
-                } else {
-                    // 인과 마스크 [pos][p]: p<=pos 만 1 — qsa 배치용
-                    let mut m = vec![0.0f32; ctx_n * ctx_n];
-                    for pos in 0..ctx_n {
-                        for pp in 0..=pos {
-                            m[pos * ctx_n + pp] = 1.0;
-                        }
-                    }
-                    Some(m)
-                }
-            } else if k.ends_with("conv_w") {
-                eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()
-            } else {
-                let il = k.split('.').nth(1).unwrap_or("0").to_string();
-                let (tn, tiled) = if k.ends_with("dt_bias") {
-                    (format!("blk.{il}.ssm_dt.bias"), 1)
-                } else if k.ends_with("ssm_a") {
-                    (k.clone(), 1)
-                } else if k.ends_with("ssm_norm") {
-                    // frame35: [d_state] 전헤드 공유 → dt_rank 타일
-                    (format!("blk.{il}.ssm_norm.weight"), hp.dt_rank)
-                } else if k.ends_with("post_attention_norm") {
-                    (format!("blk.{il}.post_attention_norm.weight"), 1)
-                } else if k.ends_with("attn_norm") {
-                    (format!("blk.{il}.attn_norm.weight"), 1)
-                } else if k.ends_with("post_norm") {
-                    (format!("blk.{il}.post_attention_norm.weight"), 1)
-                } else if k == "output_norm" {
-                    ("output_norm.weight".to_string(), 1)
-                } else if k.ends_with("attn_q_norm") {
-                    // CPU 값 경로 zip(w): [hd] 전 헤드 공유 → n_head 타일
-                    (format!("blk.{il}.attn_q_norm.weight"), hp.n_head)
-                } else if k.ends_with("attn_k_norm") {
-                    (format!("blk.{il}.attn_k_norm.weight"), hp.n_kv)
-                } else {
-                    (format!("{k}.weight"), 1)
-                };
-                eng.model.f32_vec(&tn).ok().map(|v| {
-                    if tiled > 1 && (v.len() == hp.d_state || v.len() == hp.head_dim) {
-                        v.iter().copied().cycle().take(v.len() * tiled).collect()
-                    } else {
-                        v
-                    }
-                })
-            };
-            v.map(|v| (k.clone(), v))
-        })
-        .collect();
+    let consts = crate::raw_consts(eng, &cnames);
     let rd: std::sync::Arc<llm170_backend_gpu::rawhip::decode::RawDecoder> =
         std::sync::Arc::new(llm170_backend_gpu::rawhip::decode::RawDecoder::new());
     use llm170_core::matmul::RawDecode;

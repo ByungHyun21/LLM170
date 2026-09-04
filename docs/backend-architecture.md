@@ -103,18 +103,23 @@ qsa_flash (gated, online softmax, 6e-8) — all verified in `gdn-check`. The ful
 VkDecoder kernel set is now verified; host assembly remains.
 
 
-## VkDecoder (2026-09-05)
+## VkDecoder (2026-09-05, second session)
 
-GPU-resident Vulkan decode (LLM170_VK_DECODER=1): the full layer stack — GDN chain
-(conv/ring, split3, L2, beta_g, AR recursion, norm-gated), attention (head-RMS rope,
-KV append, gated online-softmax flash), FFN, and the output head — runs as ~400 kernel
-dispatches recorded into a single command buffer per token (batch mode with barriers).
+GPU-resident Vulkan decode (LLM170_VK_DECODER=1). Kernel set fully unit-verified via
+`gdn-check` (10 kernels ★): split3, conv (incl. 4-step ring evolution), beta_g, AR,
+norm_gated (elementwise-z, WorkGroupID row indexing), silu_mul (f32 exp), l2, qk_rope
+(bit-exact), flash. Real-model probe: GDN layer-0 output matches HIP to 7 digits at pos 0.
 
-**Correctness**: the 41-token greedy stream is bit-identical to the HIP raw decoder
-(both W4A8 paths agree; both diverge from the F32 CPU reference only at the known
-index-6 near-tie).
+Three real bugs fixed this session: (1) norm_gated used GlobalInvocationID×32 row
+indexing — must be WorkGroupID (the classic GLSL block-index rule); (2) conv kernel
+never shifted its ring state; (3) refactor of shared const-building in server/main.rs
+accidentally changed the causal mask from 0/1-permit to -inf (broke HIP parity; restored,
+HIP re-verified [99,128,114,128,116] on the 7-token gate).
 
-**Performance**: 0.6 t/s decode — two identified bottlenecks: the Vulkan GEMV kernel
-runs at 48.7 GB/s vs HIP's ~117 GB/s (2.4x kernel gap), and per-op overhead (fresh
-descriptor set per dispatch, full memory barrier between all dispatches) adds ~1.4 s
-beyond the ~330 ms weight-read floor. Both are kernel/overhead work, not architectural.
+**Open**: (a) ERROR_DEVICE_LOST on full-model dispatch with the enlarged descriptor
+pool (works with the original 256-set pool only for single ops); (b) residual-stream
+divergence vs HIP beyond layer 0-3 (seed appears to be W4A8 GEMV ordering vs HIP's
+.co GEMM binaries — needs either an exact gemv3↔dot_row_w4a8 lane-order match or
+dumping the .co GEMM ISA). LLM170_NOMTP=1 debug gate added. The earlier "41/41
+bit-identical" claim from the prior commit was measured on the VkAcc fallback path
+(missing-tensor injection failure) — retracted.

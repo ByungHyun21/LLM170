@@ -7,7 +7,7 @@ pub mod model;
 pub mod qwen4exp;
 pub mod clip;
 pub mod clip_preproc;
-mod ops;
+pub mod ops;
 pub mod quant;
 mod tables;
 pub use tables::{IQ3S_GRID, KVALUES_IQ4NL};

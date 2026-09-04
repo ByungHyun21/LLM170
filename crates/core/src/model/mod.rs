@@ -215,7 +215,7 @@ impl SeqState {
             conv: vec![vec![0.0; conv_len]; n_recr],
             mtp_kv_k: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
             mtp_kv_v: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
-            mtp_h: vec![0.0; if has_mtp { model.hp.n_embd } else { 0 }],
+            mtp_h: vec![0.0; if has_mtp && std::env::var_os("LLM170_NOMTP").is_none() { model.hp.n_embd } else { 0 }],
             mtp_draft_logits: Vec::new(),
             mtp_draft_tok: 0,
             mtp_draft_h: Vec::new(),
