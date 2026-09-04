@@ -310,8 +310,8 @@ hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
 |---|---|---|---|---|
 | pp512 | **361.8** | **349.9** | 236.9¹ | 236.9² |
 | pp64  | 274.4 | 221.5 | 172.6 | 172.6 |
-| tg8   | 10.92 | 11.82 | 9.72 | 9.72 |
-| tg32  | 11.70 | 12.02 | 10.41 | 10.41 |
+| tg8   | 10.92 | 11.82 | 10.16³ | 10.16³ |
+| tg32  | 11.70 | 12.02 | 10.40 | 10.40 |
 
 Key readings:
 - llama.cpp **Vulkan ≈ ROCm** on this APU (349.9 vs 361.8 pp512; Vulkan even
@@ -337,6 +337,16 @@ unnecessary. GPU kernel time was unchanged throughout (identical PP_PROF
 stage sums); the gap was constant per call regardless of token count,
 reps, or ctx. Restored in-place borrow; 41/41 stream bit-exact vs the
 pre-fix binary.
+
+³ 2026-09-05 (night): tg8 9.72 → 10.16 (0.93x llama ROCm). Three fixes:
+pageable-async D2H of logits was taking 92ms per token (pathological
+slow path — now a hipMallocHost staging buffer in RawCtx, 0.07ms);
+q3_K GEMV (the slowest type at 107 GB/s) hoisted thread-invariant
+scale extraction + span-preloaded the ql/hm words + __ldg (146 GB/s);
+t=1 decode flash now segments K/V across blocks when np>512 (was one
+block per head — 48 blocks on a 16+ CU APU). Step decomposition: the
+remaining floor is the layer-stack weight stream (~14GB @ ~160GB/s —
+already at llama's average) plus the 1GB q6_K head.
 
 ² 2026-09-05 (later the same day): two defaults landed — (a) the three
 offline tile code objects are now `include_bytes!`-embedded and loaded
