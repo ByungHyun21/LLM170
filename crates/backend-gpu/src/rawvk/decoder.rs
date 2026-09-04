@@ -548,6 +548,7 @@ impl DecoderState {
                             for bidx in 0..nblk {
                                 let wb = &data[bidx * 176..bidx * 176 + 176];
                                 let d = llm170_core::quant::f16(wb, 0);
+                                let dm = llm170_core::quant::f16(wb, 2);
                                 for j in 0..8 {
                                     let (sc, m) = llm170_core::quant::scale_min_k4_local(wb, j);
                                     let it = j / 2;
@@ -555,7 +556,7 @@ impl DecoderState {
                                     let u: u8 = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
                                     let sb = bidx * 8 + j;
                                     wsps[o * n_sub + sb] = d * sc as f32;
-                                    wsms[o * n_sub + sb] = d * m as f32;
+                                    wsms[o * n_sub + sb] = dm * m as f32;
                                     for e in 0..32 {
                                         let q = wb[48 + it * 32 + e];
                                         let nib = if half == 0 { q & 0xF } else { q >> 4 };
