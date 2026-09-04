@@ -443,14 +443,21 @@ impl DecodeState {
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
-                self.ctx.side_wait_main()?;
-                self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
-                self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
-                self.ctx.join2()?;
-                self.ctx.side_wait_main()?;
-                self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
-                self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
-                self.ctx.join2()?;
+                if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+                    self.ctx.side_wait_main()?;
+                    self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
+                    self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
+                    self.ctx.join2()?;
+                    self.ctx.side_wait_main()?;
+                    self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
+                    self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
+                    self.ctx.join2()?;
+                } else {
+                    self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
+                    self.mm_into(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
+                    self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
+                    self.mm_into(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
+                }
                 // conv + ring
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 {
@@ -762,10 +769,15 @@ impl DecodeState {
             self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            self.ctx.side_wait_main()?;
-            self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
-            self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
-            self.ctx.join2()?;
+            if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+                self.ctx.side_wait_main()?;
+                self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
+                self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
+                self.ctx.join2()?;
+            } else {
+                self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
+                self.mm_into(self.xq_n, wu, tu, niu, nou, self.fup)?;
+            }
             // silu_mul+quant 융합 (t=1, n_ff%2048==0) — 동일 산술열
             if self.n_ff % 2048 == 0 {
                 let mut gp = self.fgate as *mut std::ffi::c_void;
@@ -873,6 +885,9 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
         let r = ds.read_logits();
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            eprintln!("{}", crate::rawhip::ktrace_dump());
+        }
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("batch_h({} tok) wall={:.1}ms", t, t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -1014,11 +1029,15 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
+        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
         ds.step(seq, pos)?;
         let r = ds.read_logits();
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            eprintln!("{}", crate::rawhip::ktrace_dump());
+        }
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("step cpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
