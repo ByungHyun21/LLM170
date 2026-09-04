@@ -1,0 +1,54 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// gdn_ar (plans/19) — rawhip gdn_ar_w 미러. grid (dt_rank, d_state).
+// 32레인 = kdim 4/레인, 레인당 상태 4원소. xor 트리 전체 합.
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };             // [pair][d*d]
+layout(binding = 1) readonly buffer Q { float q[]; };    // [t][k_len]
+layout(binding = 2) readonly buffer K { float k[]; };    // [t][k_len]
+layout(binding = 3) readonly buffer V { float v[]; };    // [t][v_len]
+layout(binding = 4) readonly buffer Bg { float bg[]; };  // [t][hv*2]
+layout(binding = 5) buffer O { float o[]; };             // [t][v_len]
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t;
+} pc;
+void main() {
+    // rawhip 구조: pair/u = 블록 인덱스, lane = 로컬 스레드 — GlobalID는
+    // blockIdx·localSize + localID로 pair와 lane이 뒤섞인다 (RCA).
+    int pair = int(gl_WorkGroupID.x);
+    int u = int(gl_WorkGroupID.y);
+    int lane = int(gl_SubgroupInvocationID);
+    int base_s = pair * pc.d * pc.d;
+    float s0 = s[base_s + (lane * 4 + 0) * pc.d + u];
+    float s1 = s[base_s + (lane * 4 + 1) * pc.d + u];
+    float s2 = s[base_s + (lane * 4 + 2) * pc.d + u];
+    float s3 = s[base_s + (lane * 4 + 3) * pc.d + u];
+    for (int ti = 0; ti < pc.t; ti++) {
+        int h = pair % pc.hv;
+        int kh = h % pc.hk;
+        int qk0 = ti * pc.ks + kh * pc.d;
+        int v0 = ti * pc.vs + h * pc.d;
+        float beta = bg[ti * pc.hv * 2 + pair * 2];
+        float g = bg[ti * pc.hv * 2 + pair * 2 + 1];
+        s0 *= g; s1 *= g; s2 *= g; s3 *= g;
+        float part = s0 * k[qk0 + lane * 4 + 0] + s1 * k[qk0 + lane * 4 + 1]
+                   + s2 * k[qk0 + lane * 4 + 2] + s3 * k[qk0 + lane * 4 + 3];
+        float sk = subgroupAdd(part);
+        float delta = (v[v0 + u] - sk) * beta;
+        s0 += k[qk0 + lane * 4 + 0] * delta;
+        s1 += k[qk0 + lane * 4 + 1] * delta;
+        s2 += k[qk0 + lane * 4 + 2] * delta;
+        s3 += k[qk0 + lane * 4 + 3] * delta;
+        float op = s0 * q[qk0 + lane * 4 + 0] + s1 * q[qk0 + lane * 4 + 1]
+                 + s2 * q[qk0 + lane * 4 + 2] + s3 * q[qk0 + lane * 4 + 3];
+        float otot = subgroupAdd(op);
+        if (lane == 0) o[v0 + u] = otot * pc.scale;
+    }
+    s[base_s + (lane * 4 + 0) * pc.d + u] = s0;
+    s[base_s + (lane * 4 + 1) * pc.d + u] = s1;
+    s[base_s + (lane * 4 + 2) * pc.d + u] = s2;
+    s[base_s + (lane * 4 + 3) * pc.d + u] = s3;
+}

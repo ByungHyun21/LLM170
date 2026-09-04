@@ -1,0 +1,19 @@
+#version 450
+// gdn_beta_g (plans/19) — rawhip gdn_beta_g 미러. n_h = t·dt_rank.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer B { float b[]; };    // [n_h]
+layout(binding = 1) readonly buffer A { float a[]; };    // [n_h]
+layout(binding = 2) readonly buffer Dt { float dtb[]; }; // [dt_rank]
+layout(binding = 3) readonly buffer Sa { float sa[]; };  // [dt_rank]
+layout(binding = 4) buffer Bg { float bg[]; };           // [n_h*2]
+layout(push_constant) uniform PC { int n_h; int dt_rank; } pc;
+void main() {
+    int h = int(gl_GlobalInvocationID.x);
+    if (h >= pc.n_h) return;
+    int h0 = h % pc.dt_rank;
+    float bv = b[h];
+    bg[h * 2] = 1.0 / (1.0 + exp(-bv));
+    float x = min(a[h] + dtb[h0], 80.0);
+    float sp = log2(1.0 + exp2(x * 1.4426950408889634)) * 0.6931471805599453; // log1p(exp(x))
+    bg[h * 2 + 1] = exp(sp * sa[h0]);
+}

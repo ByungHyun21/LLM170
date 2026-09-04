@@ -1,0 +1,23 @@
+#version 450
+// gdn_conv_t (plans/19) — 배치 conv. rawhip gdn_conv_t2/t 미러.
+// grid (ceil(ch/64), t) — 인과 conv: 이전 '입력'만 참조.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };  // [t][ch]
+layout(binding = 1) readonly buffer Cw { float cw[]; };    // [ch][k]
+layout(binding = 2) buffer St { float st[]; };             // [k-1][ch] (t<k-1 잔여 참조용)
+layout(binding = 3) buffer Out { float outv[]; };          // [t][ch]
+layout(push_constant) uniform PC { int ch; int k; int t; } pc;
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    int ti = int(gl_GlobalInvocationID.y);
+    if (c >= pc.ch || ti >= pc.t) return;
+    float sum = cw[c * pc.k + (pc.k - 1)] * qkv[ti * pc.ch + c];
+    for (int j = 0; j < pc.k - 1; j++) {
+        int pos = ti - (pc.k - 1) + j;
+        float xv = pos >= 0 ? qkv[pos * pc.ch + c]
+                            : st[(pos + (pc.k - 1)) * pc.ch + c];
+        sum += cw[c * pc.k + j] * xv;
+    }
+    float oc = sum / (1.0 + exp(-sum));
+    outv[ti * pc.ch + c] = oc;
+}

@@ -99,6 +99,28 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
             }
         }
+        Some("subsum-check") => match llm170_backend_gpu::rawvk::subsum_check() {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("subsum: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("gdn-check") => match llm170_backend_gpu::rawvk::gdn_check() {
+            Ok(msg) => {
+                for l in msg.split('\n') {
+                    println!("{l}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("gdn-check: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("vk-check") => match llm170_backend_gpu::rawvk::smoke_test() {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }

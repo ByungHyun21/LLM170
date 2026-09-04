@@ -1,0 +1,21 @@
+#version 450
+// split3 (plans/19) — [t][n0+n1+n2] 3분할. rawhip split3 미러.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Src { float src[]; };
+layout(binding = 1) buffer D0 { float d0[]; };
+layout(binding = 2) buffer D1 { float d1[]; };
+layout(binding = 3) buffer D2 { float d2[]; };
+layout(push_constant) uniform PC { int n0; int n1; int n2; } pc;
+void main() {
+    int j = int(gl_GlobalInvocationID.x);
+    int total = pc.n0 + pc.n1 + pc.n2;
+    int tok = j / total;
+    int jl = j - tok * total;
+    if (jl < pc.n0) {
+        d0[tok * pc.n0 + jl] = src[j];
+    } else if (jl < pc.n0 + pc.n1) {
+        d1[tok * pc.n1 + jl - pc.n0] = src[j];
+    } else {
+        d2[tok * pc.n2 + jl - pc.n0 - pc.n1] = src[j];
+    }
+}

@@ -1,0 +1,24 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// sub-sum 프로브 — 32레인 xor 트리 합 검증 (lane k 값 = k).
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer O { float o[]; };
+layout(push_constant) uniform PC { int mode; } pc;
+void main() {
+    int lane = int(gl_SubgroupInvocationID);
+    float v = float(lane);
+    float r = v;
+    if (pc.mode == 0) {
+        for (int off = 1; off < 32; off <<= 1) r += subgroupShuffleXor(r, off);
+    } else if (pc.mode == 1) {
+        r = subgroupAdd(v);
+    } else {
+        float sum = 0.0;
+        for (int j = 0; j < 32; j++) sum += subgroupBroadcast(v, j);
+        r = sum;
+    }
+    if (lane == 0) o[pc.mode] = r;
+}

@@ -1,0 +1,40 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// norm_gated_silu (plans/19) — rawhip norm_gated_silu 미러.
+// 워프(32레인)당 1행: 레인별 순차 부분합 → 레인 0..31 순서 결합 → f32 inv.
+// z 게이트는 행 전체 공유 (rawhip zp는 y·d_inner + blockIdx.x — dt_rank 블록당 1값).
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer O { float o[]; };    // [t][d_inner]
+layout(binding = 1) readonly buffer Z { float z[]; };    // [t][dt_rank]
+layout(binding = 2) readonly buffer W { float w[]; };    // [dt_rank][d]
+layout(binding = 3) buffer Out { float outv[]; };        // [t][d_inner]
+layout(push_constant) uniform PC { float eps; int d; int n_h; } pc; // n_h=dt_rank
+void main() {
+    int r = int(gl_GlobalInvocationID.x); // dt_rank 블록
+    int y = int(gl_GlobalInvocationID.y); // 토큰
+    int u = int(gl_SubgroupInvocationID);
+    if (r >= pc.n_h) return;
+    int xb = y * pc.d;             // o 행
+    int wb = r * pc.d;             // w 행 (dt_rank 행)
+    float zz = z[y * pc.n_h + r];  // 게이트 값
+    float g = zz / (1.0 + exp(-zz));
+    // 부분합: 레인 u가 세그먼트 u (chunk = ceil(d/32)) 순차 f32
+    int chunk = (pc.d + 31) >> 5;
+    float part = 0.0;
+    int lo = u * chunk;
+    if (lo < pc.d) {
+        int hi = min(lo + chunk, pc.d);
+        for (int i = lo; i < hi; i++) {
+            float dv = o[xb + i];
+            part += dv * dv;
+        }
+    }
+    // 레인 0..31 순서 결합
+    float sum = 0.0;
+    for (int j = 0; j < 32; j++) sum += subgroupBroadcast(part, j);
+    float inv = 1.0 / sqrt(sum / float(pc.d) + pc.eps);
+    for (int i = u; i < pc.d; i += 32) {
+        outv[xb + i] = o[xb + i] * inv * w[wb + i] * g;
+    }
+}

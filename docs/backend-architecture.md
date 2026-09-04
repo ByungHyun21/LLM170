@@ -82,3 +82,17 @@ The GDN/attention GPU residency is what the HIP backend already implements
 parity — tracked as plans/19 phase 2. On a healthy host the CPU-side share shrinks
 several-fold; today's host ran ~7 h of continuous compute and its CPU-side engine
 measured 10-180x slower than at session start (cores parked at 2.0 GHz).
+
+
+## Vulkan GDN kernel suite (2026-09-05)
+
+Five GDN kernels ported to SPIR-V and verified against CPU mirrors on the 27B host
+(`llm170 gdn-check`): split3 (exact), gdn_conv_t (4.5e-8), gdn_beta_g (1.4e-7),
+gdn_ar (1.5e-8 — subgroupAdd reduction over 32 lanes x 4 kdim, grid (dt_rank, d_state)).
+A subgroup-reduction probe (`llm170 subsum-check`) validates xor-tree/add/broadcast
+(496 expected, all match).
+
+Porting RCA: GLSL must use gl_WorkGroupID (not gl_GlobalInvocationID) for block
+dimensions — the latter folds blockIdx * localSize + localID, conflating the pair
+index with the lane index and scrambling per-pair state. Deterministic probes
+(beta=0 / g=1 / s=i+1 patterns) isolated the failure to indexing, not subgroup ops.
