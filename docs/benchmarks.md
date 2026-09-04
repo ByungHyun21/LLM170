@@ -282,3 +282,20 @@ with 18.6 GB stranded (counter over total, zero holder processes; lost-device
 buffer releases never ran). Full-model Vulkan ran fine earlier in this same
 boot (tg 10.4, pp 128), so the leak is the sole blocker. A reboot clears the
 stranded GTT; re-verification and the Vulkan MTP port follow.
+
+## Prefill hook cost + corrected standing (2026-09-04 evening)
+
+The MTP prefill hook (draft-KV fill per token, ~9-15 ms) had been silently
+loaded on every non-spec workload since the MTP arc, cutting prefill ~3x
+(pp512 70 t/s). Root-caused by worktree bisection; now gated behind explicit
+speculation intent (`--spec` on infer/vl/bench, `serve --spec`). Non-spec
+pp512 restored to **180.3 t/s** (UD-Q4_K_XL, tuned-tile env), tg unchanged
+(10.4). The older 169/228 records predate the hook entirely. Zero-config
+(no .co tile envs) remains ~54 t/s — embedding the offline-built tile
+kernels is the follow-up that would make the tuned rate default.
+
+VkD (Vulkan) note: the batched step_batch claim from earlier this day was
+retracted (measured on a stale binary); the verified default is per-token
+execution, 41/41 stream-exact. Vulkan GEMM remains compute-bound at
+~22-60 GB/s by weight type (software integer dot) — the i8-cooperative-matrix
+kernel arc is specced in the plans.
