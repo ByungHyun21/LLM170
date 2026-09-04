@@ -253,9 +253,13 @@ path all function on Vulkan.
 Per note: after ~7 h of continuous compute on this 1.5-day-uptime host, the CPU-side
 engine degraded ~180x (identical bench command: 9.33 t/s earlier in the session vs
 0.05 t/s now; all 24 cores parked at 2.0 GHz, governor=powersave, 43°C — cause unclear,
-no external load). This caps the Vulkan path at ~1.8 t/s tg / 4 t/s pp32 while its GPU
-matmul is healthy (48.7 GB/s, ★). Fair Vulkan performance numbers require a fresh boot;
-HIP (fully GPU-resident) is unaffected (28 t/s np4×spec4).
+no external load). Even with the host partially recovered (CPU probe 112s -> 8.4s), Vulkan holds at
+1.85 t/s tg / 4 t/s pp32 — so the dominant cost is architectural, not host state:
+the VkAcc design submits+waits a fence per matmul (~0.9 ms × ~325 matmuls/token
+≈ 290 ms/token of sync overhead; single GEMV itself is healthy at 48.7 GB/s ★).
+Next step for Vulkan throughput: batch multiple matmuls per command-buffer submit
+(pp32 amortizes to 250 ms/token, confirming the fixed-overhead model). HIP
+(fully GPU-resident, no per-op sync) is the performance path at 28 t/s np4×spec4.
 
 ## Vulkan status (2026-09-05) — superseded
 
