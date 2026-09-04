@@ -435,6 +435,7 @@ impl DecoderState {
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_gate.weight"), self.b_gz.buf, 1)?;
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_beta.weight"), self.b_gb.buf, 1)?;
                 self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_alpha.weight"), self.b_ga.buf, 1)?;
+                let gskip = std::env::var("LLM170_VK_GDN_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                 // conv (t=1 — ring)
                 {
                     let cw = self.consts.get(&format!("blk.{il}.conv_w")).cloned().ok_or("conv_w")?;
@@ -470,7 +471,7 @@ impl DecoderState {
                         &push, dt_rank.div_ceil(64) as u32, 1, 1)?;
                 }
                 // AR (LLM170_VK_GDN_SKIP=1이면 스킵 — L3 크래시 분리용)
-                if std::env::var("LLM170_VK_GDN_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) != 1 {
+                if gskip & 1 == 0 {
                 {
                     let scale = 1.0f32 / (d_state as f32).sqrt();
                     let mut push = Self::push_u32s(&[d_state as u32, k_len as u32, v_len as u32, dt_rank as u32, self.n_group as u32]);
@@ -482,7 +483,8 @@ impl DecoderState {
                         &push, dt_rank as u32, d_state as u32, 1)?;
                 }
                 }
-                // norm_gated
+                // norm_gated (비트 2)
+                if gskip & 2 == 0 {
                 {
                     let sn = self.consts.get(&format!("blk.{il}.ssm_norm")).cloned().ok_or("sn")?;
                     let mut push = Self::push_u32s(&[self.dt_rank as u32, d_inner as u32]);
@@ -493,8 +495,11 @@ impl DecoderState {
                 }
                 let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
                 let _ = xq_sg;
+                }
                 self.quant(self.b_ggated.buf, self.b_xq_g.buf, d_inner, 1)?;
+                if gskip & 4 == 0 {
                 self.gemv(self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1)?;
+                }
                 recr_idx += 1;
             } else {
                 // 어텐션 (LLM170_VK_ATTN: 1=qkv gemv만, 2=+rope/kv, 3=+flash, 4=+wo)
