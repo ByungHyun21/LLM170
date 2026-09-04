@@ -123,3 +123,58 @@ divergence vs HIP beyond layer 0-3 (seed appears to be W4A8 GEMV ordering vs HIP
 dumping the .co GEMM ISA). LLM170_NOMTP=1 debug gate added. The earlier "41/41
 bit-identical" claim from the prior commit was measured on the VkAcc fallback path
 (missing-tensor injection failure) — retracted.
+
+## VkDecoder session 5 (2026-09-04): full feature surface + accuracy contract
+
+The p2+ prefill divergence is solved: the trait-default `raw_prefill` fed
+512-float embedding chunks (not n_embd rows) to `raw_step` at a fixed pos;
+VkDecoder now overrides it with per-row stepping. A latent head overflow
+(gemv n_out=248320 into a 40960-float buffer — truncated logits hid any
+argmax >= 40960, incl. EOS) is fixed with a dedicated logits buffer.
+
+VkDecoder now implements the full raw-decode surface (all reusing the
+t=1 verified kernels): MTP draft layer with its own KV (eh_proj, attention,
+FFN, shared head), `raw_step_h`/`raw_prefill_h` hidden export,
+`raw_verify` + GDN snapshot/restore for speculative rollback,
+`raw_step_multi` (parallel sequences) and `verify_batch_ms` (merged
+np x spec verify). Gates on the 27B work model: 41/41-token greedy stream
+== TRUE CPU, spec k=4 bit-contract MATCH, np2 == single, np2 x spec4 ==
+single; HIP paths unchanged.
+
+Cross-backend numerics follow the llama.cpp standard: within-backend bit
+contracts (spec == greedy, np == single) are strict; across backends the
+reference is stream/caption agreement (llama.cpp `test-backend-ops` and
+vLLM use tolerance gates; their CPU and GPU quantization formulas
+intentionally differ — e.g. `d_inv = 127/amax` on CUDA). A measured
+RADV fdiv reciprocal-lowering (1 ULP on ~5% of q8 block scales) is
+accepted under this policy; `vk-gemv-check` gained bit-level histograms
+to keep such deviations observable.
+
+## Vision prefill fix (2026-09-04)
+
+The CPU chunked prefill path ignored pre-computed embedding rows (vision
+splices) and re-embedded the marker token — captions were image-blind on
+CPU. `forward` is split into `forward_emb(rows)` so spliced rows reach the
+forward pass; the reference caption is restored exactly.
+
+## Server usability (2026-09-04)
+
+- Tokenizer: GPT-2 `bytes_to_unicode` inverse table (llama.cpp scheme)
+  replaces the latin-1 mis-mapping — Korean text now matches merged vocab
+  tokens (10 byte-fallback -> 6 tokens) and decodes back to valid UTF-8
+  through an incremental byte-buffer detokenizer (no more mojibake).
+- `/v1/chat/completions` and `/v1/messages` apply the qwen chat template
+  and stop at `<|im_end|>`; non-stream responses include a `text` field.
+- Slot recycling now zeroes raw-decoder GDN/conv state (`RawDecode::raw_reset`)
+  — consecutive requests previously diverged via residual state leakage.
+
+## Configuration surface
+
+Zero-config by default: tensor types are dispatched automatically from the
+GGUF (kernel selection is type-driven, as in llama.cpp) and the standard
+models run with no environment variables (verified end-to-end). The
+`LLM170_*` variables split into: operational switches (GPU_RUNTIME, SLOTS,
+W4A8, chunk sizes) and development gates (layer/substep bisectors, path
+isolators, trace hooks, experimental offline-built `.co` tile-kernel A/B
+selectors). The latter are research scaffolding — candidates for a single
+dev-mode umbrella or removal once the corresponding experiments conclude.
