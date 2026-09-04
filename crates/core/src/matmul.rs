@@ -459,6 +459,12 @@ pub trait RawDecode: Send + Sync {
     /// 디코드 1스텝 — emb(임베딩 행) 기록 후 전체 층 수행, logits 반환.
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String>;
 
+    /// 128-행 타일 커널(j128/v4 CO) 로드 여부 — prefill 청크 128 게이트.
+    /// 기본 false (무타일 백엔드).
+    fn tile_big_chunk(&self) -> bool {
+        false
+    }
+
     /// raw_step + 최종 hidden 회수 (MTP 훅용). 기본 Err.
     fn raw_step_h(
         &self,
