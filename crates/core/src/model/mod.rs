@@ -865,16 +865,20 @@ impl Engine {
 
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
         let n = self.model.hp.n_embd as usize;
-        let (embd_ty, embd_data) = {
-            let t = self.model.wchk("token_embd.weight")?;
-            (t.ty, t.data.to_vec())
+        // 제자리 borrow. 과거(훅 루프 &mut self 공존 회피)에는 token_embd 전체
+        // to_vec(636MB)을 매 호출마다 복사해 pp에 고정 ~170ms를 더했음.
+        // 훅은 prefill_rows(embd 스코프 밖)에 있으므로 borrow 충돌 없음.
+        let cache: Vec<Vec<f32>> = {
+            let embd = self.model.wchk("token_embd.weight")?;
+            tokens
+                .iter()
+                .map(|&tok| {
+                    let mut row = vec![0.0f32; n];
+                    crate::quant::dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
+                    row
+                })
+                .collect()
         };
-        let mut cache: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
-        for &tok in tokens {
-            let mut row = vec![0.0f32; n];
-            crate::quant::dequant_row(embd_ty, &embd_data, tok as u64, n as u64, &mut row);
-            cache.push(row);
-        }
         self.prefill_rows(seq, tokens, &cache)
     }
 
