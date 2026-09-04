@@ -120,10 +120,21 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
-        guard
-            .as_mut()
-            .ok_or("vkdecoder: 미초기화")?
-            .step(seq, pos, emb)
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.step(seq, pos, emb)
+    }
+
+    /// 프리필 — 행[t][n_embd]별 t=1 스텝 (기본 구현의 512-float 청크 절단 결함 회피).
+    /// t=1 스텝 산술은 p1 검증 경로와 동일 — 순차 상태 적립으로 수치 불변.
+    fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let n = ds.n_embd;
+        let mut last = None;
+        for (ti, ch) in emb.chunks(n).enumerate() {
+            last = Some(ds.step(seq, pos0 + ti, ch)?);
+        }
+        Ok(last.unwrap_or_default())
     }
 }
 
