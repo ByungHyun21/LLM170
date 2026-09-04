@@ -1,0 +1,46 @@
+#version 450
+// qk_norm_rope (plans/19 2단계) — rawhip qk_norm_rope t=1 미러.
+// RMS: hd 원소 평균 제곱 (q는 2hd 중 첫 hd만), k에만 kq_scale.
+// rope: 쌍 (p, p+n_rot/2), f64 산술 미러.
+// grid (n_head+n_kv, 1): 블록당 1스레드 순차.
+layout(local_size_x = 1) in;
+layout(binding = 0) buffer Xq { float xq[]; };
+layout(binding = 1) buffer Xk { float xk[]; };
+layout(binding = 2) readonly buffer Qw { float qw[]; };  // [n_head*hd]
+layout(binding = 3) readonly buffer Kw { float kw[]; };  // [n_kv*hd]
+layout(binding = 4) readonly buffer Cs { float cs[]; };  // [pos][half_n*2]
+layout(push_constant) uniform PC {
+    float eps; float kqs; int pos;
+    int nh; int nk; int hd; int nr;
+} pc;
+void main() {
+    int r0 = int(gl_WorkGroupID.x);
+    if (r0 >= pc.nh + pc.nk) return;
+    bool is_q = r0 < pc.nh;
+    int half_n = pc.nr >> 1;
+    int csbase = pc.pos * half_n * 2;
+    int row_base = is_q ? r0 * 2 * pc.hd : (r0 - pc.nh) * pc.hd;
+    float ms = 0.0; // f32 부분합 → f64 결합 미러 (순차 f64)
+    double sum = 0.0;
+    for (int i = 0; i < pc.hd; i++) {
+        float dv = is_q ? xq[row_base + i] : xk[row_base + i];
+        sum += double(dv * dv);
+    }
+    float scale = 1.0 / float(sqrt(sum / double(pc.hd) + double(pc.eps)));
+    for (int i = 0; i < pc.hd; i++) {
+        float w = is_q ? qw[r0 * pc.hd + i] : kw[(r0 - pc.nh) * pc.hd + i];
+        float v = (is_q ? xq[row_base + i] : xk[row_base + i]) * scale * w;
+        if (!is_q) v *= pc.kqs;
+        if (is_q) xq[row_base + i] = v; else xk[row_base + i] = v;
+    }
+    for (int p = 0; p < half_n; p++) {
+        double c = double(cs[csbase + p * 2]);
+        double sf = double(cs[csbase + p * 2 + 1]);
+        int a = row_base + p, b = a + half_n;
+        double x0, x1;
+        if (is_q) { x0 = xq[a]; x1 = xq[b]; } else { x0 = xk[a]; x1 = xk[b]; }
+        float ra = float(x0 * c - x1 * sf);
+        float rb = float(x0 * sf + x1 * c);
+        if (is_q) { xq[a] = ra; xq[b] = rb; } else { xk[a] = ra; xk[b] = rb; }
+    }
+}

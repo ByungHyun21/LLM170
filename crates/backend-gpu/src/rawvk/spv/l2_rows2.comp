@@ -1,0 +1,32 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// l2_rows2_scale (plans/19) — rawhip l2_rows2_scale_w 미러.
+// q/k 행 L2 정규화 (n_group·d_state 블록 단위). grid (2*ng, t), 32레인×4원소.
+// 주: rawhip 원본은 scale 인자를 받지만 미사용 (호스트서 1.0 전달) — 여기도 동일.
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer Qb { float q[]; };   // [t][ng*d]
+layout(binding = 1) buffer Kb { float k[]; };   // [t][ng*d]
+layout(push_constant) uniform PC { float eps; int d; int ng; } pc;
+void main() {
+    int y = int(gl_WorkGroupID.y);
+    int x = int(gl_WorkGroupID.x);
+    int lane = int(gl_SubgroupInvocationID);
+    if (x >= 2 * pc.ng) return;
+    bool isq = x < pc.ng;
+    int tb = y * pc.ng * pc.d;
+    int xb = isq ? tb + x * pc.d : tb + (x - pc.ng) * pc.d;
+    float part = 0.0;
+    for (int j = 0; j < 4; j++) {
+        float dv = isq ? q[xb + (lane * 4) + j] : k[xb + (lane * 4) + j];
+        part += dv * dv;
+    }
+    // 레인 0..31 순서 결합
+    float sum = 0.0;
+    for (int l2 = 0; l2 < 32; l2++) sum += subgroupBroadcast(part, l2);
+    float inv = 1.0 / max(sqrt(sum), pc.eps);
+    for (int j = 0; j < 4; j++) {
+        if (isq) q[xb + (lane * 4) + j] *= inv;
+        else k[xb + (lane * 4) + j] *= inv;
+    }
+}

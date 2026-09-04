@@ -1,0 +1,11 @@
+#version 450
+// kv_append (plans/19) — rawhip kv_append_t t=1 미러: src[n] → dst[pos*n..].
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Src { float src[]; };
+layout(binding = 1) buffer Dst { float dst[]; };
+layout(push_constant) uniform PC { int n; int pos; } pc;
+void main() {
+    int j = int(gl_GlobalInvocationID.x);
+    if (j >= pc.n) return;
+    dst[pc.pos * pc.n + j] = src[j];
+}

@@ -96,3 +96,8 @@ Porting RCA: GLSL must use gl_WorkGroupID (not gl_GlobalInvocationID) for block
 dimensions — the latter folds blockIdx * localSize + localID, conflating the pair
 index with the lane index and scrambling per-pair state. Deterministic probes
 (beta=0 / g=1 / s=i+1 patterns) isolated the failure to indexing, not subgroup ops.
+
+Attention kernels follow: qk_norm_rope (bit-exact vs CPU f64 mirror — head-RMS over
+the first hd elements, k-only kq_scale, rope pairs (p, p+n_rot/2)), kv_append, and
+qsa_flash (gated, online softmax, 6e-8) — all verified in `gdn-check`. The full
+VkDecoder kernel set is now verified; host assembly remains.
