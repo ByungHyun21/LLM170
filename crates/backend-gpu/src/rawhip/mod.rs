@@ -24,6 +24,46 @@ pub fn co_loaded(bit: u8) -> bool {
 }
 
 
+fn name_leak(n: &str) -> &'static str {
+    // launch3 호출부의 name은 리터럴 — 그대로 반환 (비-리터럴 경로는 트레이스 스킵 허용)
+    unsafe { std::mem::transmute::<&str, &'static str>(n) }
+}
+
+pub struct KtraceEv(pub &'static str, pub usize);
+pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
+pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
+pub fn ktrace_dump() -> String {
+    let mut g = KTRACE.lock().unwrap();
+    let evs = std::mem::take(g.as_mut().unwrap());
+    let mut out = String::new();
+    let mut prev: Option<(usize, &str)> = None;
+    let mut sums: std::collections::HashMap<&str, (f64, u32)> = std::collections::HashMap::new();
+    let mut total = 0.0f64;
+    let mut gap = 0.0f64;
+    unsafe {
+        for e in evs.iter() {
+            if let Some((p, _)) = prev {
+                let mut ms = 0f32;
+                if hip::hipEventElapsedTime(&mut ms, p as *mut _, e.1 as *mut _) == hip::hipError_t_hipSuccess {
+                    let ent = sums.entry(e.0).or_insert((0.0, 0));
+                    ent.0 += ms as f64; ent.1 += 1;
+                    total += ms as f64;
+                }
+            }
+            prev = Some((e.1, e.0));
+        }
+        for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
+    }
+    let mut v: Vec<_> = sums.iter().collect();
+    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+    out.push_str(&format!("ktrace total={:.2}ms\n", total));
+    for (k, (ms, c)) in v.iter().take(18) {
+        out.push_str(&format!("  {:<24} {:>8.2}ms x{}\n", k, ms, c));
+    }
+    *g = None;
+    out
+}
+
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())
@@ -279,6 +319,14 @@ impl RawCtx {
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev, 0);
+                    hip::hipEventRecord(ev, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize));
+                }
+            }
         }
         Ok(())
     }
