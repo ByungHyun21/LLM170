@@ -500,6 +500,14 @@ impl DecoderState {
                 if gskip & 4 == 0 {
                 self.gemv(self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1)?;
                 }
+                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il < 2 {
+                    self.ctx.end_batch_wait().ok();
+                    self.ctx.begin_batch().ok();
+                    let mut v = vec![0f32; n];
+                    unsafe { std::ptr::copy_nonoverlapping(self.b_gout.ptr as *const f32, v.as_mut_ptr(), n) };
+                    let sum: f64 = v.iter().map(|&x| x as f64).sum();
+                    eprintln!("#  G0 gout sum={sum:.6} il={il}");
+                }
                 recr_idx += 1;
             } else {
                 // 어텐션 (LLM170_VK_ATTN: 1=qkv gemv만, 2=+rope/kv, 3=+flash, 4=+wo)

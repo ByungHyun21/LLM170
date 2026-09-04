@@ -38,11 +38,12 @@ pub fn gdn_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
 use ash::vk;
     let mut ctx = VkCtx::new()?;
-    let mut seed = 0x1234_5678u64;
-    let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    let seed = std::cell::Cell::new(0x1234_5678u64);
+    let lcg = || {
+        seed.set(seed.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+        (seed.get() >> 33) as f32 / 2147483648.0 - 0.5
     };
+    let lcg_v = |n: usize| -> Vec<f32> { (0..n).map(|_| lcg()).collect() };
     let mut lines: Vec<String> = Vec::new();
 
     // ── split3: [t=3][n0+n1+n2=12]
@@ -333,6 +334,83 @@ use ash::vk;
             None => String::new(),
         };
         lines.push(format!("gdn_ar: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-3 { "★" } else { "MISMATCH" }));
+
+        // ── AR 실차원 2스텝 체인 (hv=48, hk=16, d=128) — VkD step 방식 미러
+        {
+            let (d, hv, hk) = (128usize, 48usize, 16usize);
+            let (ks, vs) = (hk * d, hv * d);
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let mut st: Vec<f32> = (0..hv * d * d).map(|_| lcg() * 0.5).collect();
+            let steps = 2usize;
+            let inputs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..steps).map(|_| {
+                (lcg_v(ks), lcg_v(ks), lcg_v(vs), {
+                    let mut bg = vec![0f32; hv * 2];
+                    for h in 0..hv { bg[h * 2] = 0.3; bg[h * 2 + 1] = 0.9; }
+                    bg
+                })
+            }).collect();
+            let sb = ctx.alloc(st.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(st.as_ptr(), sb.ptr as *mut f32, st.len()) };
+            let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/gdn_ar.spv"), 6, 28)?;
+            let mut gpu_outs: Vec<Vec<f32>> = Vec::new();
+            for st_i in 0..steps {
+                let (q, k, v, bg) = &inputs[st_i];
+                let qb = ctx.alloc(ks * 4)?; unsafe { std::ptr::copy_nonoverlapping(q.as_ptr(), qb.ptr as *mut f32, ks) };
+                let kb = ctx.alloc(ks * 4)?; unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), kb.ptr as *mut f32, ks) };
+                let vb = ctx.alloc(vs * 4)?; unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), vb.ptr as *mut f32, vs) };
+                let bb = ctx.alloc(hv * 2 * 4)?; unsafe { std::ptr::copy_nonoverlapping(bg.as_ptr(), bb.ptr as *mut f32, hv * 2) };
+                let ob = ctx.alloc(vs * 4)?;
+                ctx.bind_bufs(ds, &[sb.buf, qb.buf, kb.buf, vb.buf, bb.buf, ob.buf]);
+                let mut push: Vec<u8> = Vec::new();
+                push.extend([d as u32, ks as u32, vs as u32, hv as u32, hk as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+                push.extend(scale.to_le_bytes());
+                push.extend(1u32.to_le_bytes());
+                ctx.run(pl, ds, pipe, &push, hv as u32, d as u32, 1)?;
+                let mut o = vec![0f32; vs];
+                unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const f32, o.as_mut_ptr(), vs) };
+                gpu_outs.push(o);
+            }
+            // CPU 미러 (rawhip gdn_ar 산술, kdim 순차)
+            let mut cs = st.clone();
+            let mut cpu_outs: Vec<Vec<f32>> = Vec::new();
+            for st_i in 0..steps {
+                let (q, k, v, bg) = &inputs[st_i];
+                let mut o = vec![0f32; vs];
+                for pair in 0..hv {
+                    let kh = pair % hk;
+                    let base_s = pair * d * d;
+                    let qk0 = kh * d;
+                    let v0 = pair * d;
+                    let beta = bg[pair * 2];
+                    let g = bg[pair * 2 + 1];
+                    let mut sk2 = vec![0f32; d];
+                    for u2 in 0..d {
+                        let mut acc = 0f32;
+                        for i in 0..d {
+                            let sv = cs[base_s + i * d + u2] * g;
+                            cs[base_s + i * d + u2] = sv;
+                            acc += sv * k[qk0 + i];
+                        }
+                        sk2[u2] = acc;
+                    }
+                    for u2 in 0..d {
+                        let delta = (v[v0 + u2] - sk2[u2]) * beta;
+                        for i in 0..d { cs[base_s + i * d + u2] += k[qk0 + i] * delta; }
+                    }
+                    for u2 in 0..d {
+                        let mut acc = 0f32;
+                        for i in 0..d { acc += cs[base_s + i * d + u2] * q[qk0 + i]; }
+                        o[v0 + u2] = acc * scale;
+                    }
+                }
+                cpu_outs.push(o);
+            }
+            let mut md2 = 0f32;
+            for st_i in 0..steps {
+                for j2 in 0..vs { md2 = md2.max((gpu_outs[st_i][j2] - cpu_outs[st_i][j2]).abs()); }
+            }
+            lines.push(format!("gdn_ar_real2({steps}): max|D|={md2:.2e} {}", if md2 < 1e-2 { "★" } else { "MISMATCH" }));
+        }
     }
 
     // ── norm_gated (요소별 z — rawhip kernels.rs:2554 미러): n_h=3, d=8, t=2

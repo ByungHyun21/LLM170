@@ -316,6 +316,11 @@ impl Engine {
                 mm_batch(&acc, &gated, &wout, &mut out)?;
             });
         }
+        if std::env::var_os("LLM170_CPU_TRACE").is_some() {
+            let last = out.len() - 1;
+            let sum: f64 = out[last].iter().map(|&v| v as f64).sum();
+            eprintln!("  CGDN il={il} out_sum={sum:.6} row={last}");
+        }
         if dbg0 {
             let m = out
                 .iter()
