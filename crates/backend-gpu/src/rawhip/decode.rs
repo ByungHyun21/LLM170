@@ -684,8 +684,22 @@ impl DecodeState {
                     let mut tl = 1i32;
                     let mut ss = self.ctx_len as i32;
                     let mut p0 = pos as i32;
-                    let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
-                    self.ctx.launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
+                    if np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
+                        // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
+                        // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
+                        let sg = 128usize;
+                        let nseg = ((pos + 1) + sg - 1) / sg;
+                        let part = self.ctx.scratch(1 * n_head * nseg * (hd + 2) * 4)?;
+                        let mut pp2 = part as *mut std::ffi::c_void;
+                        let mut sg_a = sg as i32;
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
+                        self.ctx.launch3("qsa_flash_split4q4", 1, n_head as u32, nseg as u32, 256, &mut args)?;
+                        let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
+                        self.ctx.launch3("qsa_flash_merge", 1, n_head as u32, 1, 256, &mut margs)?;
+                    } else {
+                        let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
+                        self.ctx.launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
+                    }
                 }
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
                     self.ctx.sync()?;
