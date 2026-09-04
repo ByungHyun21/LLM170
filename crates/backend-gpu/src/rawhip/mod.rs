@@ -23,6 +23,7 @@ pub fn co_loaded(bit: u8) -> bool {
     CO_FAM.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
 }
 
+
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())
@@ -221,7 +222,6 @@ impl RawCtx {
             Ok(())
         }
     }
-
     pub fn sync(&self) -> Result<(), String> {
         unsafe { ck(hip::hipStreamSynchronize(self.stream), "sync") }
     }
@@ -275,6 +275,7 @@ impl RawCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
@@ -448,6 +449,69 @@ impl RawCtx {
         let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
         args_v.push(xw_ptr);
         self.launch3(kern, t as u32, gy, gz, 64, &mut args_v)?;
+        Ok(())
+    }
+
+    /// 사이드 스트림판 — 호출자가 side_wait_main 후 발사/ join2로 합류.
+    pub fn gemv_q8_out_s(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        out: *mut u8,
+        xq_w: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let part = self.scratch(n_out * 64 * 8)?;
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
+        let kern = match ty {
+            23 => "gemm_xs",
+            13 => "gemm_q5k",
+            8 => "gemm_q8_0",
+            12 => "gemm_q4k",
+            14 => "gemm_q6k",
+            20 => "gemm_nl",
+            11 => "gemm_q3k",
+            21 => "gemm_iq3s",
+            _ => return Err(format!("미지원 타입 {ty}")),
+        };
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w_p = w as *mut std::ffi::c_void;
+        let mut part_p = part as *mut std::ffi::c_void;
+        let mut kt_p = ktab2 as *mut std::ffi::c_void;
+        let mut n_in_a = n_in as i32;
+        let mut n_out_a = n_out as i32;
+        let mut args_v: Vec<*mut std::ffi::c_void> = match ty {
+            23 | 20 => vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut kt_p as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+            ],
+            _ => vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+            ],
+        };
+        let gz = n_out.div_ceil(65535) as u32;
+        let mut out_p0 = out as *mut std::ffi::c_void;
+        match ty {
+            23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+            _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
+        }
+        let mut xw_a = xq_w as i32;
+        let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
+        args_v.push(xw_ptr);
+        self.launch3s(kern, t as u32, gy, gz, 64, &mut args_v)?;
         Ok(())
     }
 
