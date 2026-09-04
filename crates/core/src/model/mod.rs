@@ -1389,11 +1389,20 @@ impl Engine {
             row_toks.push(tk);
         }
         // 부분수용 대비 GDN/conv 스냅샷 (KV는 위치 색인이라 자가치유)
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vv] rows+dequant={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+        }
         rd.gdn_snapshot().map_err(ModelError::Accel)?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vv] snapshot={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+        }
         let mut am: Vec<u32> = Vec::new();
         let mut h_all: Vec<f32> = Vec::new();
         rd.raw_verify(seq, pos0 as usize, &rows, &mut am, &mut h_all)
             .map_err(ModelError::Accel)?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vv] raw_verify={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+        }
         // 수용 (신규 세그먼트만): am[carried_n + j] vs drafts[j]
         let mut accepted: Vec<u32> = Vec::new();
         for j in 0..drafts.len() {

@@ -213,6 +213,7 @@ fn apply_mode(m: llm170_core::mode::Mode) {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;
     let mut port = 8080u16;
+    let mut spec_k = 0usize;
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
     let mut gpu_runtime = String::new();
@@ -241,6 +242,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 Some(m) => mode = Some(m),
                 None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
             },
+            "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(k) => spec_k = k.min(8),
+                None => return usage_err("--spec requires k in 1..=8"),
+            },
             "--gpu-runtime" => match it.next().map(String::as_str) {
                 Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.to_string(),
                 Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
@@ -252,6 +257,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let Some(model_path) = model else { return usage_err("--model required") };
     if let Some(m) = mode {
         apply_mode(m);
+    }
+    if spec_k > 0 {
+        // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
+        // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
+        unsafe { std::env::set_var("LLM170_SPEC_GPU", "1") };
+        let _ = crate::engine::SPEC_K.set(spec_k);
+        eprintln!("# spec: k={spec_k} (MTP 스펙 디코드)");
     }
     // 토크나이저 적재 (part1 메타 → 실패시 part2)
     let part2 = {

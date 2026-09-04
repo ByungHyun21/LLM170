@@ -295,6 +295,7 @@ fn run_and_emit(
     let job = SlotJob {
         tokens: ids,
         n_predict,
+        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
         stops,
         progress: stream_mode.then_some(ptx),
         out: otx,
@@ -351,6 +352,7 @@ fn run_and_emit_anthropic(
     let job = SlotJob {
         tokens: ids,
         n_predict,
+        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
         stops: vec![248046],
         progress: stream_mode.then_some(ptx),
         out: otx,
