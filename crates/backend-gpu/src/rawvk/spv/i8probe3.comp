@@ -1,0 +1,21 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+// offset=37, stride=32 (비정방 피치) — gemm_i8의 실제 로드 패턴 검증.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Abuf { int8_t a[]; };  // 피치 32: a[37 + m*32 + k]
+layout(binding = 1) readonly buffer Bbuf { int8_t b[]; };  // b[37 + n*32 + k] (ColumnMajor B)
+layout(binding = 2) buffer Cbuf { int32_t c[]; };
+void main() {
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopMatLoad(ma, a, 0, 32, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, b, 0, 32, gl_CooperativeMatrixLayoutColumnMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+    coopMatStore(acc, c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+}
