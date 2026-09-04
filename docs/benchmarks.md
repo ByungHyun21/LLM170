@@ -299,3 +299,27 @@ retracted (measured on a stale binary); the verified default is per-token
 execution, 41/41 stream-exact. Vulkan GEMM remains compute-bound at
 ~22-60 GB/s by weight type (software integer dot) — the i8-cooperative-matrix
 kernel arc is specced in the plans.
+
+## Fresh cross-backend measurement (2026-09-04 evening, llama.cpp @ 8b4b3558f = same-day upstream master)
+
+Both llama.cpp backends rebuilt from source/ after `git pull` to the day's master
+(previously the reference was a 2026-08-30 checkout). Same GGUF (UD-Q4_K_XL,
+hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
+
+| test | llama.cpp ROCm | llama.cpp Vulkan | LLM170 HIP (tuned CO env) | LLM170 HIP (zero-config) |
+|---|---|---|---|---|
+| pp512 | **361.8** | **349.9** | 184.1 | 108.5 |
+| pp64  | 274.4 | 221.5 | 106.3 | ~52 |
+| tg8   | 10.92 | 11.82 | 9.49 | 9.49 |
+| tg32  | 11.70 | 12.02 | 10.41 | 10.41 |
+
+Key readings:
+- llama.cpp **Vulkan ≈ ROCm** on this APU (349.9 vs 361.8 pp512; Vulkan even
+  wins tg8) — the RADV coopmat path reaches raw-loop parity, so our Vulkan gap
+  (~4.6 t/s pp equivalent) is software, not hardware.
+- Our standing vs the fresh raw loop: pp512 0.51x (tuned) / 0.30x (zero-config),
+  tg 0.81-0.89x; np4×spec4 aggregate 25-28 t/s remains ahead of any llama.cpp
+  single-stream config; prefix cache gives 2.6x on repeat prompts.
+- llm170 pprof (pp512, tuned): projection GEMMs ~1.05 s + ffn_gate ~0.73 s
+  dominate the 2.79 s wall — the raw-parity levers are proj/qkv tile throughput
+  and (for zero-config) embedding the offline .co tile kernels.
