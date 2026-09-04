@@ -407,7 +407,11 @@ impl DecoderState {
         self.ctx.begin_batch()?;
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
+        let layer_cut = std::env::var("LLM170_VK_LAYERS").ok().and_then(|v| v.parse::<usize>().ok());
         for il in 0..self.n_layer {
+            if layer_cut.is_some_and(|c| il >= c) {
+                break;
+            }
             // ── attn_norm + quant
             {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
