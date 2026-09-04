@@ -206,7 +206,9 @@ impl Engine {
                         dt_rank,
                     );
                     if il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
-                        let sumo: f64 = o_all[r0 * v_len..r1 * v_len].iter().map(|&v| v as f64).sum();
+                        // t_len 무관 마지막 행 기준 (per-token VkD 대조용)
+                        let last = r1 - 1;
+                        let sumo: f64 = o_all[last * v_len..(last + 1) * v_len].iter().map(|&v| v as f64).sum();
                         let sumq: f64 = q_all[r0 * k_len..r1 * k_len].iter().map(|&v| v as f64).sum();
                         let mut xco: u64 = 0; let mut xcq: u64 = 0;
                         for &v in &o_all[r0 * v_len..r1 * v_len] { xco ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
