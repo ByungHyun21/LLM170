@@ -331,6 +331,10 @@ impl DecodeState {
     fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
         self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
     }
+    /// 사이드 스트림 GEMV — side_wait_main 선행 + join2 후속이 계약.
+    fn mm_into_s(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
+        self.ctx.gemv_q8_out_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
+    }
     /// gemv_q8_out과 동일 인자를 직접 launch — q6k/q4k/q5k/q8 단일행.
     fn mm_direct(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
         let kern: &'static str = match ty {
@@ -379,6 +383,20 @@ impl DecodeState {
     fn quant(&self, x: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
         self.ctx.quant_q8(x as *const u8, xq, n)
     }
+    /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
+    fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
+        if n % 1024 != 0 {
+            self.rms(x, w, self.xn, n)?;
+            return self.quant(self.xn, xq, n);
+        }
+        let mut xp = x as *mut std::ffi::c_void;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut qp = xq as *mut std::ffi::c_void;
+        let mut ep = self.eps;
+        let mut na = n as i32;
+        let mut args = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut na)];
+        self.ctx.launch("rmsq", 1, 1, 32, &mut args)
+    }
     fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
         let mut yp = y as *mut std::ffi::c_void;
         let mut xp = x as *mut std::ffi::c_void;
@@ -417,18 +435,22 @@ impl DecodeState {
             }
             // pre-norm + quant
             let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
-            self.rms(self.xs, wn, self.xn, n)?;
-            self.quant(self.xn, self.xq_n, n)?;
+            self.rms_quant(self.xs, wn, self.xq_n, n)?;
             if self.is_recr[il] {
                 // in_proj 4종
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
+                let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
+                let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
+                let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
+                // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
+                self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
-                self.mm_into(self.xq_n, wp, ty, ni, no, self.gz)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
-                self.mm_into(self.xq_n, wp, ty, ni, no, self.gb)?;
-                let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
-                self.mm_into(self.xq_n, wp, ty, ni, no, self.ga)?;
+                self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
+                self.ctx.join2()?;
+                self.ctx.side_wait_main()?;
+                self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
+                self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
+                self.ctx.join2()?;
                 // conv + ring
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 {
@@ -527,9 +549,20 @@ impl DecodeState {
                     }
                     eprintln!("#  G0dbg gk xor={xck:016x} gv xor={xcv:016x} beta xor={xcb:016x} eg xor={xcg:016x}");
                 }
-                // norm_gated silu (rows = dt_rank, w = ssm_norm 반복)
+                // norm_gated silu (rows = dt_rank, w = ssm_norm 반복) + quant
+                // (융합은 행-플랫 레이아웃 불일치로 보류 — 원본 유지)
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
-                {
+                if false {
+                    let mut op = self.go as *mut std::ffi::c_void;
+                    let mut zp = self.gz as *mut std::ffi::c_void;
+                    let mut wp = snorm as *mut std::ffi::c_void;
+                    let mut qp = self.xq_g as *mut std::ffi::c_void;
+                    let mut ep = self.eps;
+                    let mut d = self.d_inner as i32;
+                    let mut nh = self.dt_rank as i32;
+                    let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
+                    self.ctx.launch("gatedq", self.dt_rank as u32, 1, 32, &mut args)?;
+                } else {
                     let mut op = self.go as *mut std::ffi::c_void;
                     let mut zp = self.gz as *mut std::ffi::c_void;
                     let mut wp = snorm as *mut std::ffi::c_void;
@@ -539,9 +572,8 @@ impl DecodeState {
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
                     self.ctx.launch("norm_gated_silu", self.dt_rank as u32, 1, 32, &mut args)?;
+                    self.quant(self.ggated, self.xq_g, self.d_inner)?;
                 }
-                // out proj (ggated → gout) — n_in = d_inner
-                self.quant(self.ggated, self.xq_g, self.d_inner)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
                 self.mm_into(self.xq_g, wp, ty, ni, no, self.gout)?;
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
@@ -727,22 +759,31 @@ impl DecodeState {
             }
             // FFN
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
-            self.rms(self.xs, pw, self.xn, n)?;
-            self.quant(self.xn, self.xq_n, n)?;
+            self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
-            self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            self.mm_into(self.xq_n, wu, tu, niu, nou, self.fup)?;
-            // silu_mul
-            {
+            self.ctx.side_wait_main()?;
+            self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
+            self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
+            self.ctx.join2()?;
+            // silu_mul+quant 융합 (t=1, n_ff%2048==0) — 동일 산술열
+            if self.n_ff % 2048 == 0 {
+                let mut gp = self.fgate as *mut std::ffi::c_void;
+                let mut up = self.fup as *mut std::ffi::c_void;
+                let mut qp = self.xq_f as *mut std::ffi::c_void;
+                let mut na = self.n_ff as i32;
+                let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut qp), Self::p(&mut na)];
+                let gx = (self.n_ff >> 5).div_ceil(64) as u32;
+                self.ctx.launch3("silu_mulq", gx, 1, 1, 64, &mut args)?;
+            } else {
                 let mut gp = self.fgate as *mut std::ffi::c_void;
                 let mut up = self.fup as *mut std::ffi::c_void;
                 let mut op = self.fglu as *mut std::ffi::c_void;
                 let mut na = self.n_ff as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
                 self.ew_l("silu_mul", self.n_ff, &mut args)?;
+                self.quant(self.fglu, self.xq_f, self.n_ff)?;
             }
-            self.quant(self.fglu, self.xq_f, self.n_ff)?;
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
             self.axpy(self.xs, self.fdown, n)?;

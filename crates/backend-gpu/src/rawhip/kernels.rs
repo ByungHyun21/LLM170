@@ -146,6 +146,71 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_
     xq[nwords + nblk + 2 * lb + 1] = (unsigned)qs1;
 }
 
+// rms+quant 융합 (t=1) — rms_part/rms_finish/quant_q8 3런치 → 1.
+// 산술은 셋을 그대로 이어붙인 것 (세그먼트 f32합 → f64 순서합 →
+// x·inv·w 레지스터 통과 → 32블록 quant). chunk=(n+31)>>5가 32배수
+// (n%1024==0)일 때만 사용 — 스레드 청크=quant 블록 경계 정렬.
+extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
+                                float eps, int n) {
+    int u = threadIdx.x;
+    if (u >= 32) return;
+    int chunk = (n + 31) >> 5;
+    int lo = u * chunk;
+    int hi = min(lo + chunk, n);
+    __shared__ double part[32];
+    __shared__ float inv_s;
+    float acc = 0.0f;
+    if (lo < n) {
+        for (int i = lo; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
+    }
+    part[u] = (double)acc;
+    __syncthreads();
+    if (u == 0) {
+        double sum = 0.0;
+        for (int u2 = 0; u2 < 32; u2++) {
+            if (u2 * chunk < n) sum += part[u2];
+        }
+        float scale32 = (float)sqrt(sum / (double)n + (double)eps);
+        inv_s = 1.0f / scale32;
+    }
+    __syncthreads();
+    float inv = inv_s;
+    int nwords = n >> 2;
+    int nblk = n >> 5;
+    if (lo < n) {
+        for (int blk = 0; blk < (chunk >> 5); blk++) {
+            int base = lo + blk * 32;
+            float xv[32];
+            #pragma unroll
+            for (int i = 0; i < 32; i++) xv[i] = x[base + i] * inv * w[base + i];
+            float amax = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xv[i]));
+            float d = amax / 127.0f;
+            float id = d != 0.0f ? 1.0f / d : 0.0f;
+            int qs0 = 0, qs1 = 0;
+            #pragma unroll
+            for (int wi = 0; wi < 8; wi++) {
+                unsigned word = 0u;
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    float v = xv[wi * 4 + k] * id;
+                    float r = v >= 0.0f ? (float)(int)(v + 0.5f)
+                                        : -((float)(int)(0.5f - v));
+                    float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+                    word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
+                }
+                xq[(base >> 5) * 8 + wi] = word;
+                if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
+                else qs1 = dot4(0x01010101u, word, qs1);
+            }
+            xq[nwords + (base >> 5)] = __float_as_uint(d);
+            xq[nwords + nblk + 2 * (base >> 5)] = (unsigned)qs0;
+            xq[nwords + nblk + 2 * (base >> 5) + 1] = (unsigned)qs1;
+        }
+    }
+}
+
 // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
 extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
     int o = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2407,6 +2472,45 @@ extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, 
     float v = g[j];
     out[j] = (v / (1.0f + exp_cr(-v))) * u[j];
 }
+// silu_mul+quant 융합 (t=1) — 동일 산술: v/(1+exp(-v))·u 레지스터 통과 후
+// 32블록 quant. 레인당 quant 블록 1개 (64스레드×32 = n%2048==0 사용).
+extern "C" __global__ void silu_mulq(const float* g, const float* u, unsigned* xq, int n) {
+    int lb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lb >= (n >> 5)) return;
+    int base = lb << 5;
+    float xv[32];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = g[base + i];
+        xv[i] = (v / (1.0f + exp_cr(-v))) * u[base + i];
+    }
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xv[i]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    int nwords = n >> 2;
+    int qs0 = 0, qs1 = 0;
+    #pragma unroll
+    for (int wi = 0; wi < 8; wi++) {
+        unsigned word = 0u;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float v = xv[wi * 4 + k] * id;
+            float r = v >= 0.0f ? (float)(int)(v + 0.5f)
+                                : -((float)(int)(0.5f - v));
+            float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+            word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
+        }
+        xq[lb * 8 + wi] = word;
+        if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
+        else qs1 = dot4(0x01010101u, word, qs1);
+    }
+    xq[nwords + lb] = __float_as_uint(d);
+    xq[nwords + (n >> 5) + 2 * lb] = (unsigned)qs0;
+    xq[nwords + (n >> 5) + 2 * lb + 1] = (unsigned)qs1;
+}
+
 extern "C" __global__ void axpy_scaled(float* y, const float* x, const float* s, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
@@ -2608,6 +2712,77 @@ extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const
         out[xb + i] = nrm * (zz / (1.0f + exp_cr(-zz)));
     }
 }
+// norm_gated_silu+quant 융합 (t=1, d%1024==0) — 축소 산술은 원본과
+// 동일열(세그먼트 f32합→셔플 f64 순서합), 원소별 nrm·silu(z)는 레지스터
+// 통과 후 32블록 quant. 워프=1행 그대로.
+extern "C" __global__ void gatedq(const float* o, const float* z, const float* w,
+                                  unsigned* xq, float eps, int d, int n_h) {
+    // 행 = d원소 (호출축: d=d_state, grid.x=dt_rank) — 워프당 1행:
+    // 세그먼트 f32합→셔플 f64 순서합 (원본 norm_gated_silu와 동일열),
+    // 이후 행 내 d/32개 32블록 quant (레인 lb<d/32).
+    int row = blockIdx.y * n_h + blockIdx.x;
+    int u = threadIdx.x;
+    if (blockIdx.x >= n_h) return;
+    int xb = row * d;
+    int wb = blockIdx.x * d;
+    int chunk = (d + 31) >> 5;
+    float part = 0.0f;
+    {
+        int lo = u * chunk;
+        if (lo < d) {
+            int hi = min(lo + chunk, d);
+            for (int i = lo; i < hi; i++) {
+                float dv = o[xb + i];
+                part += dv * dv;
+            }
+        }
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
+        sum += (double)pj;
+    }
+    float scale32 = (float)sqrt(sum / (double)d + (double)eps);
+    float inv = 1.0f / scale32;
+    int nblk = d >> 5;              // 행 내 블록 수 (d_state=128 → 4)
+    int rowblk = (int)(((const char*)xq - (const char*)0)); (void)rowblk;
+    for (int lb = u; lb < nblk; lb += 32) {
+        int base = lb << 5;
+        float xv[32];
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            float nrm = o[xb + base + i] * inv * w[wb + base + i];
+            float zz = z[xb + base + i];
+            xv[i] = nrm * (zz / (1.0f + exp_cr(-zz)));
+        }
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xv[i]));
+        float dd = amax / 127.0f;
+        float id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        int qs0 = 0, qs1 = 0;
+        #pragma unroll
+        for (int wi = 0; wi < 8; wi++) {
+            unsigned word = 0u;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                float v = xv[wi * 4 + k] * id;
+                float r = v >= 0.0f ? (float)(int)(v + 0.5f)
+                                    : -((float)(int)(0.5f - v));
+                float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
+                word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
+            }
+            xq[lb * 8 + wi] = word;
+            if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
+            else qs1 = dot4(0x01010101u, word, qs1);
+        }
+        xq[(d >> 2) + lb] = __float_as_uint(dd);
+        xq[(d >> 2) + nblk + 2 * lb] = (unsigned)qs0;
+        xq[(d >> 2) + nblk + 2 * lb + 1] = (unsigned)qs1;
+    }
+}
+
 // GDN AR state update (cube = (b,h) pair, unit = dv column)
 extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, const float* v,
                                   const float* beta_ge, float* out, int d, int k_stride,
@@ -3744,7 +3919,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "reduce64",
+    "quant_q8", "rmsq", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
