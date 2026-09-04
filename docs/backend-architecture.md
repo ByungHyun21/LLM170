@@ -65,3 +65,20 @@ porting constraints discovered on RADV/gfx1151:
 
 Vulkan prefill is bounded by the CPU-side attention/GDN layers (the matmul
 offload itself saturates); porting those is the next backend milestone.
+
+
+## Vulkan performance path (2026-09-05)
+
+Status: correctness-complete (stream ★ 41/41 vs CPU reference; MTP, np functional).
+Throughput: tg 2.06 t/s after command-buffer batching (+11%); pp32 4.2 t/s.
+
+Cost model per decode token (~490 ms): ~173 ms GPU submit/fence (was ~290 ms before
+batching; the FFN resident chain and matmul groups now single-submit), remainder is
+host-side: the VkAcc design runs GDN (49 recurrent layers: conv, AR, norm-gated) and
+full attention softmax on the CPU, plus per-op activation upload/readback.
+
+The GDN/attention GPU residency is what the HIP backend already implements
+(rawhip decode.rs kernels); porting that kernel family to SPIR-V is the known path to
+parity — tracked as plans/19 phase 2. On a healthy host the CPU-side share shrinks
+several-fold; today's host ran ~7 h of continuous compute and its CPU-side engine
+measured 10-180x slower than at session start (cores parked at 2.0 GHz).
