@@ -2927,6 +2927,42 @@ extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const
         out[xb + i] = nrm * (zz / (1.0f + exp_cr(-zz)));
     }
 }
+extern "C" __global__ void norm_gated_silu_f32(const float* o, const float* z, const float* w,
+                                           float* out, float eps, int d, int n_h) {
+    // 워프(32레인)당 1행 — 레인 u가 세그먼트 u의 순차 f32 부분합(기존과 동일
+    // 경계), f64 결합은 전 레인이 p0..p31 동일 순서로 수행 (미러 산술열 보존).
+    // 초과 세그먼트 부분합 0 가산은 IEEE 항등 — 비트무영향.
+    int row = blockIdx.y * n_h + blockIdx.x;
+    int u = threadIdx.x;
+    if (blockIdx.x >= n_h) return;
+    int xb = row * d;
+    int wb = blockIdx.x * d;
+    int chunk = (d + 31) >> 5;
+    float part = 0.0f;
+    {
+        int lo = u * chunk;
+        if (lo < d) {
+            int hi = min(lo + chunk, d);
+            for (int i = lo; i < hi; i++) {
+                float dv = o[xb + i];
+                part += dv * dv;
+            }
+        }
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
+        sum += (double)pj;
+    }
+    float scale32 = (float)sqrt(sum / (double)d + (double)eps);
+    float inv = 1.0f / scale32;
+    for (int i = u; i < d; i += 32) {
+        float nrm = o[xb + i] * inv * w[wb + i];
+        float zz = z[xb + i];
+        out[xb + i] = nrm * (zz / (1.0f + __expf(-zz)));
+    }
+}
 // norm_gated_silu+quant 융합 (t=1, d%1024==0) — 축소 산술은 원본과
 // 동일열(세그먼트 f32합→셔플 f64 순서합), 원소별 nrm·silu(z)는 레지스터
 // 통과 후 32블록 quant. 워프=1행 그대로.
@@ -4240,7 +4276,7 @@ pub const NAMES: &[&str] = &[
     "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
-    "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
+    "gdn_conv", "gdn_beta_g", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
     "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
