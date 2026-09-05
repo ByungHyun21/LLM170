@@ -112,6 +112,16 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
             }
         }
+        Some("vk-mmq-check") => {
+            let args2: Vec<String> = std::env::args().collect();
+            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
+            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
+            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(512usize);
+            match llm170_backend_gpu::rawvk::gemv::vk_mmq_check(&path, &tn, t) {
+                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some("vk-gemv-check") => {
             let args2: Vec<String> = std::env::args().collect();
             let path = args2.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
