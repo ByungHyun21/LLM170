@@ -18,6 +18,8 @@ pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
 pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
 pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
 pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
+pub const CO_MMQ2: u8 = 16; // mmq2.co: llama 프로덕션 mul_mat_q<q6_K/iq4_xs> (libggml-hip.so 추출)
+pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
 static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn co_loaded(bit: u8) -> bool {
@@ -218,10 +220,22 @@ impl RawCtx {
                         "LLM170_CO4_PATH",
                         include_bytes!("co/mmq.co"),
                         &["mmq_quant_y",
+                          "mmq_quant_y_d4",
                           "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                          "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                    ),
+                    (
+                        CO_MMQ2,
+                        "LLM170_CO5_PATH",
+                        include_bytes!("co/mmq2.co"),
+                        &["_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
                           "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                    ),
+                    (
+                        CO_MMQ3,
+                        "LLM170_CO6_PATH",
+                        include_bytes!("co/mmq3.co"),
+                        &["_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
                     ),
                     (
                         CO_J128,
