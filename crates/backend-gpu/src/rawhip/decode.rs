@@ -409,7 +409,7 @@ impl DecodeState {
             Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp),
             Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr),
         ];
-        self.ctx.launch("rms_finish", 1, 1, 32, &mut a2)
+        self.ctx.launch("rms_finish", 1, 1, 256, &mut a2)
     }
     fn quant(&self, x: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
         self.ctx.quant_q8(x as *const u8, xq, n)
@@ -1490,7 +1490,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             let mut ep = self.eps;
             let mut wr = 1i32;
             let mut a2 = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp), Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr)];
-            self.ctx.launch("rms_finish", 1, 1, 32, &mut a2)?;
+            self.ctx.launch("rms_finish", 1, 1, 256, &mut a2)?;
         }
         self.ctx.quant_q8(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
@@ -2594,7 +2594,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         let mut ep = self.eps;
         let mut wr = 1i32;
         let mut a2 = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut pp), Self::p(&mut op), Self::p(&mut ep), Self::p(&mut na), Self::p(&mut wr)];
-        self.ctx.launch("rms_finish", t as u32, 1, 32, &mut a2)
+        self.ctx.launch("rms_finish", t as u32, 1, 256, &mut a2)
     }
 
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].

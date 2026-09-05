@@ -2735,8 +2735,8 @@ extern "C" __global__ void rms_part(const float* x, double* part, int n) {
 extern "C" __global__ void rms_finish(const float* x, const float* w, const double* part,
                                       float* out, float eps, int n, int w_reps) {
     int row = blockIdx.x;
-    int u = threadIdx.x;
-    if (u >= 32) return;
+    int tid = threadIdx.x;
+    // 모든 스레드가 inv 직접 계산 (shared 없음 — 수치 경로 원본과 동일)
     double sum = 0.0;
     #pragma unroll
     for (int u2 = 0; u2 < 32; u2++) {
@@ -2747,10 +2747,15 @@ extern "C" __global__ void rms_finish(const float* x, const float* w, const doub
     int xb = row * n;
     int wb = (row % w_reps) * n;
     int schunk = (n + 31) >> 5;
-    int lo = u * schunk;
+    int lo = (tid % 32) * schunk;
     if (lo < n) {
         int hi = min(lo + schunk, n);
-        for (int i = lo; i < hi; i++) out[xb + i] = x[xb + i] * inv * w[wb + i];
+        // 256스레드 = 8그룹×32 — 그룹별 같은 청크, 그룹 내 스트라이드 분할
+        int g = tid >> 5;
+        int gs = (hi - lo + 7) >> 3;
+        int l2 = lo + g * gs;
+        int h2 = min(l2 + gs, hi);
+        for (int i = l2; i < h2; i++) out[xb + i] = x[xb + i] * inv * w[wb + i];
     }
 }
 // q/k norm+rope (f64 중간 — FMA 수축 면역, qk_norm_rope 이식)
