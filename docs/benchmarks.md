@@ -403,3 +403,10 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   chunks the default: pp512 272 -> 277.5 (+2%), bit-identical output streams
   verified with both 19- and 600-token gates. Canonical sources preserved in
   plans/i8_arc/co_src.
+- Addendum: llama.cpp mul_mat_q kernels (q4_K, q5_K) integrated via offline
+  code objects with an f32->block_q8_1_mmq prequant path (+2.1% prefill,
+  interleaved A/B). Token-quadrant z-grid prefill chunks of 512 made default
+  after recovering canonical kernel sources (an earlier regression verdict was
+  a source-drift artifact). Attention rewritten warp-per-query. Cumulative
+  session: pp512 250 -> ~287 (llama.cpp ratio 0.69x -> 0.81x), tg8 0.95x
+  (DRAM-bound).
