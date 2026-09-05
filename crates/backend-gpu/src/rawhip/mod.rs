@@ -529,6 +529,32 @@ impl RawCtx {
     /// W4A8 GEMV — reduce 결과를 상주 out에 직접 기록 (왕복 제거).
     /// 수치는 gemv_q8과 동일열 (동일 커널·reduce).
     #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_out_v2(&self, xq: *const u8, w: *const u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, xq_w: usize, t: usize) -> Result<(), String> {
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w_p = w as *mut std::ffi::c_void;
+        let mut o_p = out as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut no) as *mut _ as *mut std::ffi::c_void,
+            (&mut xw) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let f = *self.fns.get("gemm_q5k_v2").ok_or("gemm_q5k_v2 없음")?;
+        unsafe {
+            ck(hip::hipModuleLaunchKernel(f, t as u32, gy, gz, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "gemm_q5k_v2")?;
+        }
+        Ok(())
+    }
+
     pub fn gemv_q8_out(
         &self,
         xq: *const u8,

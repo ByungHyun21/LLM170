@@ -2654,6 +2654,10 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     }
 
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        // q5_K v2 (부록76): vdr=2 그리드-스트라이드 — 자체 스트림 (비트계약 아님)
+        if ty == 13 && t == 1 && std::env::var_os("LLM170_Q5V2").is_some() {
+            return self.ctx.gemv_q8_out_v2(xq as *const u8, wp as *const u8, ty, n_in, n_out, out, xq_w, t);
+        }
         // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
         let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
             && super::co_loaded(super::CO_ODD) && t >= 32
