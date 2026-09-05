@@ -758,3 +758,121 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         outs.len() * w.n_out as usize
     ))
 }
+
+/// 부록87: llama matmul_q5_k_f16.spv 직접 로드 격리 측정 (t≥2 프리필 GEMM).
+pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let spv = std::fs::read("/home/yoon/LLM170/source/llama.cpp/build-vk/ggml/src/ggml-vulkan/vulkan-shaders.spv/matmul_q5_k_f16.spv")
+        .map_err(|e| e.to_string())?;
+    let mut acc = VkAcc::new()?;
+    let mut ctxg = acc.ctx.lock();
+    // 버퍼: A=가중(호스트맵→h2d는 run 전 복사), B=f16 y, D=f32 out
+    let mut ab = ctxg.alloc_host(w.data.len())?;
+    unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), ab.ptr, w.data.len()); }
+    ctxg.unmap(&mut ab)?;
+    let mut ybuf: Vec<u16> = Vec::with_capacity(n_in * t);
+    let mut seed = 0x1234u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    // y [K][N] f16 (stride_b = K) — CPU 참조와 동일값 사용
+    let mut yf: Vec<f32> = Vec::with_capacity(n_in * t);
+    for _ in 0..n_in * t { let v = lcg(); yf.push(v); ybuf.push(hf(v)); }
+    let mut bb = ctxg.alloc_host(n_in * t * 2)?;
+    unsafe { std::ptr::copy_nonoverlapping(ybuf.as_ptr() as *const u8, bb.ptr, n_in * t * 2); }
+    ctxg.unmap(&mut bb)?;
+    eprintln!("bc: allocs ok");
+    let mut db = ctxg.alloc_host(n_out * t * 4)?;
+    // l 파이프라인 (non-cm, subgroup=64, gfx1151): ids 0..10 + ALIGNED=0
+    let sp = std::env::var("VKMMQ_SPEC").unwrap_or_else(|_| "l".into());
+    let spec: Vec<u32> = match sp.as_str() {
+        "m" => vec![128, 64, 64, 32, 64, 32, 2, 4, 2, 1, 64, 0],
+        "s" => vec![64, 32, 32, 32, 32, 32, 2, 2, 2, 1, 64, 0],
+        "c" => vec![128, 128, 32, 32, 64, 32, 2, 4, 4, 1, 64, 0],
+        "m32" => vec![128, 64, 64, 32, 32, 32, 2, 4, 2, 1, 32, 0],
+        "l32" => vec![128, 128, 128, 32, 64, 64, 2, 4, 4, 1, 32, 0],
+        "cc" => vec![128, 64, 32, 32, 64, 32, 2, 4, 4, 1, 64, 0],
+        _ => vec![128, 128, 128, 32, 128, 64, 2, 4, 4, 1, 64, 0],
+    };
+    eprintln!("bc: y/ab 채움");
+    let (_dsl, pl, _dp, ds, pipe) = ctxg.pipeline_spec(&spv, 3, 17 * 4, &spec)?;
+    eprintln!("bc: 파이프라인 ok");
+    let bufs = [ab.buf, bb.buf, db.buf];
+    ctxg.bind_bufs(ds, &bufs);
+    // push: M,N,K,stride_a=K,stride_b=K,stride_d=M,batch 0들 + k_split=1 등
+    let mut pc: Vec<u32> = vec![
+        n_out as u32, t as u32, n_in as u32,      // M, N, K
+        n_in as u32, n_in as u32, t as u32,       // stride_a=K, stride_b=K, stride_d=N
+        0, 0, 0,                                  // batch strides
+        0, 1, n_in as u32,                        // base_wg_z, num_batches, k_split=K (split_k=1 규약)
+        1, 1, 1, 1,                               // ne02, ne12, broadcast2, broadcast3
+        t as u32,                                 // padded_n (f16 B — 비양자화 경로)
+    ];
+    let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let gx = (n_out as u32).div_ceil(128);
+    let gy = (t as u32).div_ceil(128);
+    ctxg.begin_batch()?;
+    ctxg.run(pl, ds, pipe, &pcb, gx, gy, 1)?;
+    ctxg.end_batch_wait()?;
+    // CPU 참조 대조 (처음 8값) + 타이밍
+    let out: &[f32] = unsafe { std::slice::from_raw_parts(db.ptr as *const f32, n_out * t) };
+    // CPU 참조: 몇 개 (m, n) 지점 대조 — y는 f16 반올림값 사용
+    let yh: Vec<f32> = ybuf.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+    let rb = w.data.len() / n_out;
+    let mut dq = vec![0f32; n_in];
+    let mut ok_nm = 0usize; let mut ok_mn = 0usize; let mut tot = 0usize;
+    for &m in &[0usize, 100, 3000, 6143] {
+        llm170_core::quant::dequant_row(w.ty, &w.data[m * rb..(m + 1) * rb], 0, n_in as u64, &mut dq);
+        for n in 0..t {
+            let yrow = &yh[n * n_in..(n + 1) * n_in];
+            let mut acc = 0f32;
+            for k in 0..n_in { acc += dq[k] * yrow[k]; }
+            let g_nm = out[n * t + m];
+            let g_mn = out[m * t + n];
+            let r = |g: f32| (g - acc).abs() / acc.abs().max(1e-3);
+            if r(g_nm) < 0.01 { ok_nm += 1; }
+            if r(g_mn) < 0.01 { ok_mn += 1; }
+            tot += 1;
+        }
+    }
+    eprintln!("레이아웃 판별: [N][M]={}/{} · [M][N]={}/{}", ok_nm, tot, ok_mn, tot);
+    {
+        let m = 0usize;
+        llm170_core::quant::dequant_row(w.ty, &w.data[m * rb..(m + 1) * rb], 0, n_in as u64, &mut dq);
+        let mut goods = vec![];
+        for n in 0..t {
+            let yrow = &yh[n * n_in..(n + 1) * n_in];
+            let mut acc = 0f32;
+            for k in 0..n_in { acc += dq[k] * yrow[k]; }
+            if ((out[n * t + m] - acc).abs() / acc.abs().max(1e-3)) < 0.01 { goods.push(n); }
+        }
+        eprintln!("m=0 정답 n ({}개): {:?}", goods.len(), &goods[..goods.len().min(20)]);
+    }
+    let mut maxrel = 0f32;
+    for &(m, n) in &[(0, 0), (1, 0), (63, 0), (64, 0), (100, 0), (127, 0), (128, 0), (0, 1), (0, 63), (0, 64), (0, 100), (0, 127), (0, 128), (100, 7), (200, 100)] {
+        if m >= n_out || n >= t { continue; }
+        llm170_core::quant::dequant_row(w.ty, &w.data[m * rb..(m + 1) * rb], 0, n_in as u64, &mut dq);
+        let yrow = &yh[n * n_in..(n + 1) * n_in];
+        let mut acc = 0f64;
+        for k in 0..n_in { acc += dq[k] as f64 * yrow[k] as f64; }
+        let got = out[n * t + m];
+        eprintln!("  ck m={m} n={n}: got={got:.5} ref={:.5}", acc);
+        let rel = if acc.abs() > 1e-6 { ((got - acc as f32) / acc as f32).abs() } else { got.abs() };
+        maxrel = maxrel.max(rel);
+    }
+    // 타이밍 20회
+    ctxg.begin_batch()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..20 { ctxg.run(pl, ds, pipe, &pcb, gx, gy, 1)?; }
+    ctxg.end_batch_wait()?;
+    let dt = t0.elapsed().as_secs_f64() / 20.0;
+    let _ = &mut pc;
+    Ok(format!("vk-mmq({tname}) t={t}: {:.3}ms/회 · maxrel={maxrel:.4}", dt * 1e3))
+}
+
+fn hf(v: f32) -> u16 {
+    // f32→f16 변환 (반올림)
+    half::f16::from_f32(v).to_bits()
+}

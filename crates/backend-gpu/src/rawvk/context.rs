@@ -351,6 +351,103 @@ impl VkCtx {
 
 
     /// 파이프라인 생성 (push constant + N개 SSBO).
+    /// 스펙상수 지원 파이프라인 (부록87 — llama mul_mm 로드용).
+    /// spec[i] → constantID i (llama create_pipeline 규약).
+    pub fn pipeline_spec(
+        &self,
+        spv: &[u8],
+        n_buf: u32,
+        push_bytes: u32,
+        spec: &[u32],
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+        unsafe {
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
+            let dsl = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(|e| format!("DSL: {e:?}"))?;
+            let ranges = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size(push_bytes)];
+            let pl = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&[dsl])
+                        .push_constant_ranges(&ranges),
+                    None,
+                )
+                .map_err(|e| format!("레이아웃: {e:?}"))?;
+            let code: Vec<u32> = spv
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let smci = vk::ShaderModuleCreateInfo::default().code(&code);
+            let sm = self
+                .device
+                .create_shader_module(&smci, None)
+                .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
+            let entries: Vec<vk::SpecializationMapEntry> = spec
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(i as u32)
+                        .offset((i * 4) as u32)
+                        .size(4)
+                })
+                .collect();
+            let spec_bytes: Vec<u8> = spec.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let sinfo = vk::SpecializationInfo::default()
+                .map_entries(&entries)
+                .data(&spec_bytes);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(sm)
+                .name(c"main")
+                .specialization_info(&sinfo);
+            let pci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
+            let pipe = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pci], None)
+                .map_err(|(_, e)| format!("파이프라인(스펙): {e:?}"))?[0];
+            self.device.destroy_shader_module(sm, None);
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(n_buf)];
+            let dp = self
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&pool_sizes)
+                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+                    None,
+                )
+                .map_err(|e| format!("디스크립터 풀: {e:?}"))?;
+            let ds = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(dp)
+                        .set_layouts(&[dsl]),
+                )
+                .map_err(|e| format!("디스크립터 셋: {e:?}"))?[0];
+            Ok((dsl, pl, dp, ds, pipe))
+        }
+    }
+
     pub fn pipeline(
         &self,
         spv: &[u8],
