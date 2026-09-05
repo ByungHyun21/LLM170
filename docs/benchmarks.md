@@ -410,3 +410,9 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   a source-drift artifact). Attention rewritten warp-per-query. Cumulative
   session: pp512 250 -> ~287 (llama.cpp ratio 0.69x -> 0.81x), tg8 0.95x
   (DRAM-bound).
+- Final session addendum: the empty-stub root cause (-DRDNA3 vs -DRDNA3_5
+  config table selection for gfx1151) unlocked iq4_xs MMQ as well — total
+  MMQ coverage q4_K/q5_K/iq4_xs. Session close: pp512 250 -> 294-296
+  (+18%, llama.cpp ratio 0.83x), tg8 10.4 (0.95x, DRAM-bound). q6_K remains
+  the one excluded type (J-independent corruption; Q6_K-specific SRAM layout
+  suspected).
