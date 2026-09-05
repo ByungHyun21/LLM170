@@ -1134,6 +1134,7 @@ gmark("norm", &mut marks);
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 if qkv_tile && gate_tile {
                     // 사이드는 타일형만 (beta/alpha는 q8_0 gemv — 주 스트림)
+                    // (사이드 이동 시도: L2 경합으로 -5 t/s 회귀 — 2026-09-05 측정)
                     self.ctx.side_wait_main()?;
                     self.mm_b_s(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
                     self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
@@ -1494,7 +1495,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         gmark("head", &mut marks);
         if prof {
             let wall = t0w.elapsed().as_secs_f64() * 1e3;
-            let _ = wall;
+            eprintln!("cpu_submit={:.1}ms (CPU returned from launches)", wall);
             if let Some((_, last)) = marks.last() {
                 unsafe { hip::hipEventSynchronize(*last); }
             }
@@ -2601,7 +2602,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             && super::co_loaded(super::CO_ODD) && t >= 32
             && matches!(ty, 20 | 11 | 21);
         // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
-        let q8t = ty == 8 && t > 64 && std::env::var_os("LLM170_EXACT").is_none()
+        let q8t = ty == 8 && t > 64 && n_out >= 128 && std::env::var_os("LLM170_EXACT").is_none()
             && super::co_loaded(super::CO_J128);
         if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
