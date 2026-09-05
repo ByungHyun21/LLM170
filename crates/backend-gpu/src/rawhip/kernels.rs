@@ -3676,6 +3676,106 @@ extern "C" __global__ void qsa_flash_split(const float* q, const float* ck, cons
     if (tid == 0) { pp2[hd] = m; pp2[hd + 1] = s; }
 }
 // 병합: out = Σ acc_i·e^(m_i−M) / Σ s_i·e^(m_i−M), 게이트 적용.
+// warp-per-query flash (llama fattn-tile 구조 차용): 블록 32쿼리(워프당 4),
+// 키 루프 내 sync/shared 왕복 없음 — k/v 재로드는 L1 흡수.
+// 수치: ds·softmax 갱신 순서가 split4q4와 다름(키별 running) — 게이트 판정.
+extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const float* cv,
+                                        const unsigned* mask, float* part,
+                                        int n_past, int n_head, int n_kv,
+                                        int hd, int t_len, int sstride, int pos0, int seg) {
+    int q0 = blockIdx.x * 32;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;
+    int nq = min(32, t_len - q0);
+    int lane = threadIdx.x & 31;
+    int w = threadIdx.x >> 5;              // 워프 0..7 — 쿼리 4개씩
+    int qr = w * 4;                        // 이 워프의 첫 쿼리(블록 내)
+    if (qr >= nq) return;
+    int nqw = min(4, nq - qr);
+    int kvh = h / (n_head / n_kv);
+    int qb0 = (q0 + qr) * n_head * 2 * hd + h * 2 * hd;
+    // 레인당 4 kdim (hd=128 전제)
+    float qv[4][4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            qv[r][j] = (r < nqw) ? q[qb0 + r * n_head * 2 * hd + ((lane << 2) + j)] : 0.0f;
+    float m[4] = {-3.4028235e38f, -3.4028235e38f, -3.4028235e38f, -3.4028235e38f};
+    float s[4] = {0, 0, 0, 0};
+    float acc[4][4] = {};
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int kq0 = (q0 + qr) * sstride;         // mask 행 기준
+    int kb0 = kvh * hd;
+    for (int k = p0; k < p1; k++) {
+        // k 로드 (레인 4 dim)
+        float kv[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            kv[j] = ck[(size_t)k * n_kv * hd + kb0 + ((lane << 2) + j)];
+        float part_[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            float p_ = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) p_ = fmaf(qv[r][j], kv[j], p_);
+            part_[r] = p_;
+        }
+        // 4-값 동시 나비 (5단계)
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float a0 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[0], (lane ^ off) & 31);
+            float a1 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[1], (lane ^ off) & 31);
+            float a2 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[2], (lane ^ off) & 31);
+            float a3 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[3], (lane ^ off) & 31);
+            part_[0] += a0; part_[1] += a1; part_[2] += a2; part_[3] += a3;
+        }
+        // v 로드
+        float vv[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            vv[j] = cv[(size_t)k * n_kv * hd + kb0 + ((lane << 2) + j)];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < nqw) {
+                // split4q4 의미 재현: 마스크 꺼진 키는 ds=0 기여
+                float ds = (mask[kq0 + r * sstride + k] != 0u) ? part_[r] : 0.0f;
+                float gm = fmaxf(m[r], ds);
+                float e_m = __expf(m[r] - gm);
+                float e_d = __expf(ds - gm);
+                s[r] = s[r] * e_m + e_d;
+                m[r] = gm;
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    acc[r][j] = acc[r][j] * e_m + e_d * vv[j];
+            }
+        }
+    }
+    // part 기록: [(t·n_head+h)·nseg+sg]·(hd+2)
+    if (lane == 0) {
+        int nseg = (n_past + seg - 1) / seg;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < nqw) {
+                float* pp2 = part + ((size_t)((q0 + qr + r) * n_head + h) * nseg + sg) * (hd + 2);
+                pp2[hd] = m[r]; pp2[hd + 1] = s[r];
+            }
+        }
+    }
+    __syncwarp();
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r < nqw) {
+            int nseg = (n_past + seg - 1) / seg;
+            float* pp2 = part + ((size_t)((q0 + qr + r) * n_head + h) * nseg + sg) * (hd + 2);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) pp2[(lane << 2) + j] = acc[r][j];
+        }
+    }
+}
+
 extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, float* out,
                                            int n_past, int n_head, int hd, int t_len, int seg) {
     int t = blockIdx.x;
@@ -4060,7 +4160,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
