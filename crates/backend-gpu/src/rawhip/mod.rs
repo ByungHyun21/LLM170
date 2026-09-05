@@ -671,7 +671,7 @@ impl RawCtx {
             13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if v4 && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if v4 && std::env::var_os("LLM170_XS_V4U").is_some() { "gemm_xs_v4u" } else if std::env::var_os("LLM170_XS_MM").is_some() { "gemm_xs_mm" } else if v4 && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
             20 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
             11 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
             21 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
@@ -1697,6 +1697,27 @@ pub fn roof_test() -> Result<String, String> {
 
 
 /// MMQ 포트 A/B — bt vs mm (각 미러).
+pub fn launch_probe() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let mut xp = ctx.alloc(256)?; let mut op = ctx.alloc(256)?; let mut sp = ctx.alloc(256)?;
+    let mut nn = 64i32;
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        (&mut op) as *mut _ as *mut std::ffi::c_void,
+        (&mut xp) as *mut _ as *mut std::ffi::c_void,
+        (&mut sp) as *mut _ as *mut std::ffi::c_void,
+        (&mut nn) as *mut _ as *mut std::ffi::c_void,
+    ];
+    for _ in 0..10 { ctx.launch3("axpy_scaled", 1, 1, 1, 64, &mut args)?; }
+    ctx.sync()?;
+    let n = 200;
+    let t0 = std::time::Instant::now();
+    for _ in 0..n { ctx.launch3("gemm_xs", 1, 1, 1, 64, &mut args)?; }
+    let cpu = t0.elapsed();
+    ctx.sync()?;
+    let wall = t0.elapsed();
+    Ok(format!("launch-probe: {n}회 런치 cpu={:.3}ms/회 (동기 포함 wall={:.3}ms/회)", cpu.as_secs_f64()*1e3/n as f64, wall.as_secs_f64()*1e3/n as f64))
+}
+
 pub fn mm_bench() -> Result<String, String> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
@@ -1810,6 +1831,23 @@ pub fn mm_bench() -> Result<String, String> {
     for _ in 0..reps { launch(&ctx)?; }
     ctx.sync()?;
     let dt2 = t0.elapsed().as_secs_f64() / reps as f64;
+    // 순수 런치 CPU 비용: 그리드 1x1 소형 발사 (GPU 즉시 완료) 100회
+    let (mut sxa, mut swa, mut soa) = (xq as *mut u8, wd as *mut u8, out as *mut u8);
+    let (mut sni, mut sno, mut sxw, mut stt) = (n_in as i32, n_out as i32, xq_w as i32, t as i32);
+    let mut sargs: Vec<*mut std::ffi::c_void> = vec![
+        (&mut sxa) as *mut _ as *mut std::ffi::c_void,
+        (&mut swa) as *mut _ as *mut std::ffi::c_void,
+        (&mut soa) as *mut _ as *mut std::ffi::c_void,
+        (&mut sni) as *mut _ as *mut std::ffi::c_void,
+        (&mut sno) as *mut _ as *mut std::ffi::c_void,
+        (&mut sxw) as *mut _ as *mut std::ffi::c_void,
+        (&mut stt) as *mut _ as *mut std::ffi::c_void,
+    ];
+    let tl0 = std::time::Instant::now();
+    for _ in 0..100 { let _ = ctx.launch3(kern_name, 1, 1, 1, 64, &mut sargs); }
+    let lcpu = tl0.elapsed().as_secs_f64() * 1e3 / 100.0;
+    ctx.sync()?;
+    eprintln!("launch-cpu: {:.3}ms/회 (1x1x64 소형)", lcpu);
     let blck = w.ty.blck_size() as usize;
     let bsize = w.ty.type_size() as usize;
     let rb = (n_in / blck) * bsize;

@@ -89,6 +89,29 @@ fn main() -> ExitCode {
             Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
             Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
         },
+        Some("launch-probe") => {
+            match llm170_backend_gpu::rawhip::launch_probe() {
+                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
+        Some("tty-probe") => {
+            let path = std::env::args().nth(2).unwrap_or_else(|| "/tmp/model_link.gguf".into());
+            match llm170_gguf::GgufFile::open(std::path::Path::new(&path)) {
+                Ok(g) => {
+                    use std::collections::BTreeMap;
+                    let mut cnt: BTreeMap<u32, usize> = BTreeMap::new();
+                    let mut bytes: BTreeMap<u32, u64> = BTreeMap::new();
+                    for t in &g.tensors {
+                        *cnt.entry(t.ty as u32).or_insert(0) += 1;
+                        *bytes.entry(t.ty as u32).or_insert(0) += t.nbytes().unwrap_or(0);
+                    }
+                    for (k, c) in cnt { println!("ty{k}: {c} tensors {:.1}MB", bytes[&k] as f64 / 1e6); }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some("vk-gemv-check") => {
             let args2: Vec<String> = std::env::args().collect();
             let path = args2.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
