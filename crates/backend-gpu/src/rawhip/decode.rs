@@ -611,7 +611,7 @@ impl DecodeState {
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch("norm_gated_silu", self.dt_rank as u32, 1, 32, &mut args)?;
+                    self.ctx.launch(if std::env::var_os("LLM170_F32SILU").is_some() { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, 1, 32, &mut args)?;
                     self.quant(self.ggated, self.xq_g, self.d_inner)?;
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
@@ -1263,7 +1263,7 @@ gmark("trace", &mut marks);
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3(if std::env::var_os("LLM170_F32SILU").is_some() { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
 gmark("gdn", &mut marks);
 gmark("normg", &mut marks);
@@ -2018,7 +2018,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3(if std::env::var_os("LLM170_F32SILU").is_some() { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
@@ -2322,7 +2322,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3("norm_gated_silu", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3(if std::env::var_os("LLM170_F32SILU").is_some() { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
