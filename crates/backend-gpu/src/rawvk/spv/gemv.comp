@@ -71,11 +71,11 @@ void main() {
 
     if (pc.ty == 13u) {          // q5_K
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 176;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) * cnt + m;  // 연속 (코얼레싱)
             int js = sb & 7;
             int it = js >> 1;
             int halfb = js & 1;
@@ -117,11 +117,11 @@ void main() {
         }
     } else if (pc.ty == 12u) {   // q4_K
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 144;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) * cnt + m;  // 연속 (코얼레싱)
             int js = sb & 7;
             int it = js >> 1;
             int halfb = js & 1;
@@ -158,11 +158,11 @@ void main() {
         }
     } else if (pc.ty == 14u) {   // q6_K
         int n_g = n_in >> 4;
-        int cnt = (n_g + 63 - int(l)) >> 6;
+        int cnt = (n_g + 63) >> 6;  // 연속 청크/레인
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 210;
         for (int m = 0; m < cnt; m++) {
-            int g = int(l) + (m << 6);
+            int g = int(l) * cnt + m;  // 연속 (코얼레싱)
             int blk = g >> 4;
             int kloc = g - (blk << 4);
             int wb = row_base + blk * 210;
@@ -214,10 +214,10 @@ void main() {
         }
     } else if (pc.ty == 8u) {    // q8_0
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int row_base = int(o) * n_sub * 34;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) * cnt + m;  // 연속 (코얼레싱)
             int wb = row_base + sb * 34;
             float d;
             {
@@ -240,10 +240,10 @@ void main() {
         }
     } else if (pc.ty == 20u) {   // iq4_nl — ktab2 룩업
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int row_base = int(o) * n_sub * 18;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) * cnt + m;  // 연속 (코얼레싱)
             int wb = row_base + sb * 18;
             float d = unpackHalf2x16(WG(uint(wb >> 2)) >> uint((wb & 3) * 8)).x;
             bool al = ((wb & 3) == 2);
@@ -320,7 +320,7 @@ void main() {
         }
     } else if (pc.ty == 21u) {   // iq3_s
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 110;
         for (int m = 0; m < cnt; m++) {
@@ -357,11 +357,11 @@ void main() {
         }
     } else {                     // iq4_xs (23)
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + 63) >> 6;  // 연속 청크/레인
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 136;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) * cnt + m;  // 연속 (코얼레싱)
             int b = sb >> 3;
             int ib = sb & 7;
             int wb = row_base + b * 136;
