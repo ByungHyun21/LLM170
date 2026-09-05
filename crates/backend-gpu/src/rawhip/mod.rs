@@ -70,7 +70,29 @@ pub fn ktrace_dump() -> String {
                 i += 1;
             }
         }
+        // 런치 갭: end(N)→start(N+1) 같은 스트림 상 연속
+        let mut gap_by_pred: std::collections::HashMap<&str, (f64, u32)> = std::collections::HashMap::new();
+        let mut gap_tot = 0.0f64;
+        let mut prev_end: Option<(usize, &str)> = None;
+        for k in 0..evs.len()/2 {
+            let (st, en) = (&evs[2*k], &evs[2*k+1]);
+            if let Some((pe, pn)) = prev_end {
+                let mut ms = 0f32;
+                if hip::hipEventElapsedTime(&mut ms, pe as *mut _, st.1 as *mut _) == hip::hipError_t_hipSuccess && ms > 0.0 {
+                    let e2 = gap_by_pred.entry(pn).or_insert((0.0, 0));
+                    e2.0 += ms as f64; e2.1 += 1;
+                    gap_tot += ms as f64;
+                }
+            }
+            prev_end = Some((en.1, en.0));
+        }
         for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
+        out.push_str(&format!("LAUNCH GAPS total {:.1}ms\n", gap_tot));
+        let mut gv: Vec<_> = gap_by_pred.iter().collect();
+        gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        for (n, (ms, c)) in gv.iter().take(12) {
+            out.push_str(&format!("  after {:26} {:8.1}ms x{:4}\n", n, ms, c));
+        }
     }
     let mut v: Vec<_> = sums.iter().collect();
     v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
