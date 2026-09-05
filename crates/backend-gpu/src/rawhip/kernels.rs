@@ -265,9 +265,15 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     float inv = inv_s;
     int nwords = n >> 2;
     int nblk = n >> 5;
-    if (lo < n) {
-        for (int blk = 0; blk < (chunk >> 5); blk++) {
-            int base = lo + blk * 32;
+    // 부록78: 양자화 패스를 256레인으로 확장 (합계 파티션·순서는 32레인
+    // 유지 — 비트불변). 스레드 tid가 블록(32원소) 단위 분담.
+    {
+        int tid = (blockDim.x >= 256) ? (u + 32 * (threadIdx.x >> 5)) : u;
+        int nthr = (blockDim.x >= 256) ? (blockDim.x / 32 * 32) : 32;
+        int nblk_tot = n >> 5;
+        for (int blk = tid; blk < nblk_tot; blk += nthr) {
+            int base = blk * 32;
+            if (lo < n) { /* 원 경계 유지용 (lo<n은 32레인 기준) */ }
             float xv[32];
             #pragma unroll
             for (int i = 0; i < 32; i++) xv[i] = x[base + i] * inv * w[base + i];
