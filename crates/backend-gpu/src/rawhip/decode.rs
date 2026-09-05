@@ -1300,6 +1300,9 @@ gmark("betag", &mut marks);
                             Self::p(&mut bnp),
                         ];
                         self.ctx.launch3("gdn_ar_chunk_c2", npair as u32, nc as u32, 1, d as u32, &mut cc)?;
+                    } else if std::env::var_os("LLM170_ARSM").is_some() && self.d_state == 128 {
+                        // 부록82: smem 스테이징 AR (k/q 128중 재독 제거)
+                        self.ctx.launch3("gdn_ar_sm", self.dt_rank as u32, 2, 1, 64, &mut args)?;
                     } else {
                         self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
                     }

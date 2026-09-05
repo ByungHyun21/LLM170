@@ -425,6 +425,30 @@ impl RawCtx {
     }
 
     /// 사이드 스트림 발사 (비동기 — join2로 합류)
+    /// 동적 shared 64KB 런치 (부록82) — 커널당 1회 속성 설정.
+    pub fn launch3_dyn(&self, name: &str, gx: u32, gy: u32, gz: u32, block: u32, smem: u32, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+        use std::collections::HashSet;
+        use std::sync::OnceLock;
+        static SET: OnceLock<std::sync::Mutex<HashSet<usize>>> = OnceLock::new();
+        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        let set = SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+        {
+            let mut g = set.lock().map_err(|e| e.to_string())?;
+            if g.insert(f as usize) {
+                unsafe {
+                    let r = hip::hipFuncSetAttribute(f as *const std::ffi::c_void, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem as i32);
+                    if r != hip::hipError_t_hipSuccess {
+                        return Err(format!("smem 속성 실패: {r:?}"));
+                    }
+                }
+            }
+        }
+        unsafe {
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, smem, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3_dyn")?;
+        }
+        Ok(())
+    }
+
     pub fn launch3s(
         &self,
         name: &str,

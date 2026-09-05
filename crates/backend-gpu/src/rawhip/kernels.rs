@@ -3431,6 +3431,49 @@ extern "C" __global__ void gdn_ar_chunk_b(float* s, const float* lend, const flo
     for (int u2 = 0; u2 < d; u2++) sf[u2 * d + j] = col[u2];
 }
 
+// AR 배치 smem 스테이징 (부록82): 블록=pair, 128스레드=u, 상태 64KB 동적
+// smem + k/q 층마다 1회 스테이징 — u블록 128중 k/q 재독 제거.
+// 산술: 스레드(u)별 kdim 순차 환원 — gdn_ar_w와 원소 동일순서 (비트계약
+// 대상 아님: _w 계열 셔플 환원과 동일 부류).
+extern "C" __global__ void gdn_ar_sm(float* s, const float* q, const float* k, const float* v,
+                                   const float* beta_ge, float* out, int d, int k_stride,
+                                   int v_stride, int h_v, int h_k, float scale, int t) {
+    // 부록82 수정판: 블록=(pair, u절반 64) — 상태 [64][128] f32 = 32KB 정적.
+    __shared__ float st[64][128];
+    __shared__ float ks_sh[128], qs_sh[128];
+    int pair = blockIdx.x;
+    int uh = blockIdx.y;              // 0..1
+    int u0 = uh * 64;
+    int lu = threadIdx.x;            // 0..63
+    int u = u0 + lu;
+    int h = pair % h_v;
+    int kh = h % h_k;
+    int base_s = pair * d * d;
+    // 상태 적재 (전치행)
+    for (int j = 0; j < d; j++) st[lu][j] = s[base_s + u * d + j];
+    __syncthreads();
+    for (int ti = 0; ti < t; ti++) {
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        if (lu < 64 && uh == 0) { ks_sh[lu] = k[qk0 + lu]; qs_sh[lu] = q[qk0 + lu]; }
+        __syncthreads();
+        float sk = 0.0f;
+        for (int j = 0; j < d; j++) sk += st[lu][j] * ks_sh[j];
+        float delta = (v[v0 + u] - sk) * beta;
+        float o = 0.0f;
+        for (int j = 0; j < d; j++) {
+            float sv = st[lu][j] * g_exp + ks_sh[j] * delta;
+            st[lu][j] = sv;
+            o += sv * qs_sh[j];
+        }
+        out[v0 + u] = o * scale;
+        __syncthreads();
+    }
+    for (int j = 0; j < d; j++) s[base_s + u * d + j] = st[lu][j];
+}
+
 // C2: S f16 smem 스테이징 (32KB) — S 재독 제거 (부록 72 처방).
 // 그리드 (npair, nc), 블록 128 = u열.
 extern "C" __global__ void gdn_ar_chunk_c2(float* out, const float* q, const float* pbuf,
@@ -4590,7 +4633,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gemm_q5k_v2", "gemm_q8_0_dual", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gemm_q5k_v2", "gemm_q8_0_dual", "gdn_ar_sm", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
