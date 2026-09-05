@@ -2602,7 +2602,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         if std::env::var_os("LLM170_NO_MMQ").is_none() {
-            if matches!(ty, 12 | 13 | 23) && t >= 32
+            if (matches!(ty, 12 | 13 | 14 | 23) && std::env::var("LLM170_NOQ6MMQ").is_err()) && t >= 32
                 && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                 return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
