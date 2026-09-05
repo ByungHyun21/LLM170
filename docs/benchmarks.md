@@ -72,7 +72,7 @@ Both PP and TG against this table are the first performance goal.
 
 - 2026-09-05: f32 kernel family promoted to default (was opt-in) — pp512 305→317 t/s; `LLM170_F32SILU=0` restores the bit-cast variants.
 - 2026-09-05: q6_K prefill routed to MMQ (was j128 tile) — pp512 318→341 t/s; `LLM170_NOQ6MMQ=1` restores.
-- 2026-09-05 (session final, 3-rep medians interleaved): pp512 250→345 t/s (+38%) — 0.987× of llama 350.06±1.53; tg8 10.44→12.28 — EXCEEDS llama 10.95±0.13 by 12.1%.
+- 2026-09-05 (FINAL, alternating single runs): pp512 250→348-354 t/s (+40%) — PARITY with llama-VK 350.8-352.8 (0.993-1.004×); tg8 12.25-12.30 vs llama 11.79-11.84 = +3.8-4.0% EXCEEDED. Batch AR grid-axis swap (L2 locality) closed the gap.
   Shipped: q6-K MMQ routing (+7.5%), f32 kernel family default (+4%), Vulkan GEMV coalescing (+51%), MMQ 4-path, wk attention, z-grid, rocprof diagnostics.
   Remaining: tg GEMV family rewrite (contiguous-lane transplant triple-confirmed dead: 19/42 gate + 0.71 t/s), pp scattered small items.
 - 2026-09-05: GDN state layout transposed u-major (coalesced AR lane-j access, 16x amplification removed) + decode AR routed to gdn_ar_w — tg8 10.44→12.27 combined-mode — EXCEEDS llama 11.42 by 7.4% (q8_0 dual GEMV + AR transpose + conv parallelization + rmsq widening); pp512 342.6 unchanged.
