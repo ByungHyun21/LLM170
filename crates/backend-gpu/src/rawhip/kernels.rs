@@ -305,6 +305,60 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     }
 }
 
+// q8_0 듀얼 GEMV (부록79): beta+alpha 독립 2 GEMV 1런치 — t=1 전용.
+// 행별 산술은 gemm_q8_0과 원소 동일열.
+extern "C" __global__ void gemm_q8_0_dual(const unsigned* xq, const unsigned* w1, const unsigned* w2,
+                                    float* out1, float* out2, int n_in, int no1, int no2, int xq_w) {
+    int o0 = blockIdx.y + blockIdx.z * gridDim.y;
+    if (o0 >= no1 + no2) return;
+    const unsigned* w;
+    float* out;
+    int o;
+    if (o0 < no1) { w = w1; out = out1; o = o0; }
+    else { w = w2; out = out2; o = o0 - no1; }
+    int l = threadIdx.x;
+    if (l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int row_base = o * n_sub * 34;
+    float acc = 0.0f;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + sb * 34;
+        float d = f16w(w, wb);
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int wq = wb >> 2;
+        bool al = (wb & 3) == 2;
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) {
+                qv = w[wq + 1 + k];
+            } else {
+                qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            }
+            unsigned yv = k==0?y0:k==1?y1:k==2?y2:k==3?y3:k==4?y4:k==5?y5:k==6?y6:y7;
+            isum = dot4(qv, yv, isum);
+        }
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
+        acc += yd * d * (float)isum;
+    }
+    __shared__ double sh32[32];
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
+    __syncthreads();
+    if (l < 32) {
+        accd += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
+    }
+}
+
 // reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
 extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
     int o = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4536,7 +4590,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gemm_q5k_v2", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gemm_q5k_v2", "gemm_q8_0_dual", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
