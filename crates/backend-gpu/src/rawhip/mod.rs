@@ -650,9 +650,10 @@ impl RawCtx {
             ni: n_in as i32,
             no: n_out as i32,
             xw: xq_w as i32,
-            tt: t as i32,
+            // z-그리드 토큰 사분면: t≤128이면 gz=1 (무변형). 초과분은 128씩.
+            tt: t.min(128) as i32,
             gx: nblocks.min(65535) as u32,
-            gz: nblocks.div_ceil(65535) as u32,
+            gz: (nblocks.div_ceil(65535) * t.div_ceil(128)) as u32,
             block: if mm { 256 } else { 64 },
             ktab: ty == 23 || kern == "gemm_nl_v4",
         })

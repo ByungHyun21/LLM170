@@ -192,8 +192,9 @@ impl DecodeState {
         }
         let max_rows = (n / 32).max(n_ff.max(g6)).max(hp.n_head + hp.n_kv).max(1);
         let bs = |nb: usize| Self::a(&ctx, nb).unwrap();
-        // 배치 아레나 (t_max=64)
-        let t_max = 128usize;
+        // 배치 아레나 — 기본 청크 512 (z-그리드). LLM170_CHUNK≤128이면 128.
+        let t_max = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse::<usize>().ok())
+            .map(|c| if c > 128 { 512 } else { 128 }).unwrap_or(512);
         let (n_kv, hd) = (hp.n_kv, hp.head_dim);
         let xq_sn = n / 4 + n / 32 + n / 16;
         let xq_sf = n_ff / 4 + n_ff / 32 + n_ff / 16;
@@ -2604,7 +2605,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             && super::co_loaded(super::CO_ODD) && t >= 32
             && matches!(ty, 20 | 11 | 21);
         // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
-        let q8t = ty == 8 && t > 64 && n_out >= 128 && std::env::var_os("LLM170_EXACT").is_none()
+        let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && std::env::var_os("LLM170_EXACT").is_none()
             && super::co_loaded(super::CO_J128);
         if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
