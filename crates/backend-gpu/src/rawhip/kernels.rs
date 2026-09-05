@@ -111,26 +111,27 @@ DEV float log1p_cr(float y) {
 // d는 별도 float 저장이 간헐 유실되는 코드젠 결함(2026-09-03 RCA) 회피차
 // xq 워드 스트림 뒤 영역(xq[nwords + b])에 u32 비트로 편승 — 저장 경로
 // 단일화. GEMV는 xd[sb] = __uint_as_float(xq[nwords + sb])로 읽음.
-// q6_K 210B → f16 256값 전개 (검증: bad=0 vs 정준, deq_q6_pass.cu)
+// q6_K(우리 엔진 재배열 레이아웃) → f16 256값 전개 — v4 인덱싱 미러:
+// d@208, sc@192+gr, ql=h*64+p2*16+((src&1)<<5)+kloc, qh=128+h*32+p2*16+kloc
+// n2→(gr,kloc): sb=n2>>5, kc=(n2>>4)&1, gr=(sb*2+kc)&15, kloc=n2&15
 extern "C" __global__ void dequant_q6k_f16(const unsigned char* __restrict__ w, __half* __restrict__ out,
                                            int blocks, int n_out) {
     int o = blockIdx.x, blk = blockIdx.y;
     if (o >= n_out) return;
     long bo = ((long)o * blocks + blk) * 210;
-    const unsigned char* ql = w + bo + 2;
-    const unsigned char* qh = w + bo + 130;
-    const signed char*   sc = (const signed char*)(w + bo + 194);
-    float d = __half2float(__ushort_as_half(((const unsigned short*)(w + bo))[0]));
-    int t = threadIdx.x;
-    int grp = t >> 7, quad = (t >> 5) & 3, l = t & 31, is = l >> 4;
-    const unsigned char* qhg = qh + grp*32;
-    int q, sci = grp*8 + is + quad*2;
-    if (quad == 0) { q = (ql[l] & 0xF) | (((qhg[l] >> 0) & 3) << 4); }
-    else if (quad == 1) { q = (ql[32 + l] & 0xF) | (((qhg[l] >> 2) & 3) << 4); }
-    else if (quad == 2) { q = (ql[l] >> 4) | (((qhg[l] >> 4) & 3) << 4); }
-    else { q = (ql[32 + l] >> 4) | (((qhg[l] >> 6) & 3) << 4); }
-    float v = d * sc[sci] * (q - 32);
-    out[((long)o * blocks + blk) * 256 + t] = __float2half(v);
+    const unsigned char* wb8 = w + bo;
+    float d = __half2float(__ushort_as_half((unsigned short)(wb8[208] | (wb8[209] << 8))));
+    int n2 = threadIdx.x;   // 0..255
+    int sb = n2 >> 5, kc = (n2 >> 4) & 1, kloc = n2 & 15;
+    int gr = (sb * 2 + kc) & 15;
+    int h = gr >> 3, src = (gr & 7) >> 1, p2 = gr & 1;
+    int ql_b = h * 64 + p2 * 16 + ((src & 1) << 5) + kloc;
+    int qh_b = 128 + h * 32 + p2 * 16 + kloc;
+    int nib = (wb8[ql_b] >> ((src < 2) ? 0 : 4)) & 0xF;
+    int hi = (wb8[qh_b] >> (2 * src)) & 3;
+    int sc = wb8[192 + gr]; sc = sc > 127 ? sc - 256 : sc;
+    float v = d * (float)sc * ((float)(nib + (hi << 4)) - 32.0f);
+    out[((long)o * blocks + blk) * 256 + n2] = __float2half(v);
 }
 
 extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_w) {
