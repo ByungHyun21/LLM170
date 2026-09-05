@@ -3411,6 +3411,7 @@ extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, c
         }
     }
 }
+
 // QSA split flash, q 2행 다중화 — ck/cv 1회 로드로 t쌍 공유 (K/V 트래픽 ½).
 extern "C" __global__ void qsa_flash_split4q2(const float* q, const float* ck, const float* cv,
                                               const unsigned* mask, float* part,
