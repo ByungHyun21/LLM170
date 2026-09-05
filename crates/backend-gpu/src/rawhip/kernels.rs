@@ -496,6 +496,81 @@ extern "C" __global__ void gemm_q5k(const unsigned* xq, const unsigned* w,
     }
 }
 
+// q5_K GEMV v2 (세션5 부록76): llama mmvq vdr=2 구조 이식 — 스레드당
+// 연속 2 서브블록 (88B 국소성) + stride-128 그리드-스트라이드 (m-아핀).
+// 합산 순서 변경으로 자체 스트림 게이트 대상 (비트계약 아님).
+extern "C" __global__ void gemm_q5k_v2(const unsigned* xq, const unsigned* w,
+                                    float* out, int n_in, int n_out, int xq_w) {
+    int o = blockIdx.y + blockIdx.z * gridDim.y;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    xq += (int)blockIdx.x * xq_w;
+    out += (int)blockIdx.x * n_out;
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 176;
+    float acc = 0.0f;
+    int qsb = (n_in >> 2) + (n_in >> 5);
+    // vdr=2: 페어 인덱스 p = l, sb0 = 2l + 128m (m-아핀)
+    for (int m = 0; ; m++) {
+        int sb0 = (l << 1) + (m << 7);
+        if (sb0 >= n_sub) break;
+        #pragma unroll
+        for (int half2 = 0; half2 < 2; half2++) {
+            int sb = sb0 + half2;
+            if (sb >= n_sub) break;
+            int js = sb & 7;
+            int it = js >> 1;
+            int wb = row_base + (sb >> 3) * 176;
+            int wq = wb >> 2;
+            unsigned w0 = w[wq];
+            float d = bits_f16(w0 & 0xFFFFu);
+            float dm = bits_f16(w0 >> 16);
+            unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+            unsigned r = (js & 3) * 8;
+            unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+            unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+            unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+            unsigned sc_v, m_v;
+            if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+            else {
+                sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+                m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+            }
+            int qhw = wq + 4;
+            int qlb = wq + 12 + it * 8;
+            unsigned nsh = (js & 1) << 2;
+            int sh = 2 * it + (js & 1);
+            unsigned hbit = 1u << sh;
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            for (int k = 0; k < 8; k++) {
+                unsigned qv = w[qlb + k];
+                unsigned hv = w[qhw + k];
+                unsigned yv = xq[xw + k];
+                unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+                unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4;
+                isum = dot4(nibw | bitw, yv, isum);
+            }
+            int qsum = (int)xq[qsb + (sb << 1)] + (int)xq[qsb + (sb << 1) + 1];
+            float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
+            acc += yd * (d * (float)sc_v) * (float)isum;
+            acc -= yd * (dm * (float)m_v) * (float)qsum;
+        }
+    }
+    __shared__ double sh32[32];
+    double accd = (double)acc;
+    if (l >= 32) sh32[l - 32] = accd;
+    __syncthreads();
+    if (l < 32) {
+        accd += sh32[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
+    }
+}
+
 // 듀얼 텐서 q5_K GEMV (2026-09-05): qkv+gate처럼 같은 xq 입력·같은 포맷의
 // 독립 GEMV 2개를 1런치로 — GEMV 사이의 스트리밍 리셋 제거 (KTRACE 계측 근거).
 // 행별 산술은 gemm_q5k와 완전 동일 (w/o/out만 행 소속에 따라 선택).
@@ -4454,7 +4529,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gemm_q5k_v2", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
