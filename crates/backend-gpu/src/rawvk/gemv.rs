@@ -766,6 +766,10 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
+    if std::env::var_os("VK_DUMP_W").is_some() {
+        let _ = std::fs::write("/tmp/q5k_w.bin", w.data);
+        eprintln!("W 더프: {}B n_in={} n_out={}", w.data.len(), n_in, n_out);
+    }
     let spv_name = std::env::var("VKMMQ_SPV").unwrap_or_else(|_| "matmul_q5_k_f16".into());
     let b_is_f32 = spv_name.ends_with("_f32") || spv_name.contains("_f32_");
     let spv = std::fs::read(format!("/home/yoon/LLM170/source/llama.cpp/build-vk/ggml/src/ggml-vulkan/vulkan-shaders.spv/{}.spv", spv_name))
