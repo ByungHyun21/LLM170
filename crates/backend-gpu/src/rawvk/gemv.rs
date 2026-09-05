@@ -766,7 +766,9 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
-    let spv = std::fs::read("/home/yoon/LLM170/source/llama.cpp/build-vk/ggml/src/ggml-vulkan/vulkan-shaders.spv/matmul_q5_k_f16.spv")
+    let spv_name = std::env::var("VKMMQ_SPV").unwrap_or_else(|_| "matmul_q5_k_f16".into());
+    let b_is_f32 = spv_name.ends_with("_f32") || spv_name.contains("_f32_");
+    let spv = std::fs::read(format!("/home/yoon/LLM170/source/llama.cpp/build-vk/ggml/src/ggml-vulkan/vulkan-shaders.spv/{}.spv", spv_name))
         .map_err(|e| e.to_string())?;
     let mut acc = VkAcc::new()?;
     let mut ctxg = acc.ctx.lock();
@@ -780,13 +782,19 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     // y [K][N] f16 (stride_b = K) — CPU 참조와 동일값 사용
     let mut yf: Vec<f32> = Vec::with_capacity(n_in * t);
     for _ in 0..n_in * t { let v = lcg(); yf.push(v); ybuf.push(hf(v)); }
-    let mut bb = ctxg.alloc_host(n_in * t * 2)?;
-    unsafe { std::ptr::copy_nonoverlapping(ybuf.as_ptr() as *const u8, bb.ptr, n_in * t * 2); }
+    let b_bytes = if b_is_f32 { n_in * t * 4 } else { n_in * t * 2 };
+    let mut bb = ctxg.alloc_host(b_bytes)?;
+    if b_is_f32 {
+        unsafe { std::ptr::copy_nonoverlapping(yf.as_ptr() as *const u8, bb.ptr, b_bytes); }
+    } else {
+        unsafe { std::ptr::copy_nonoverlapping(ybuf.as_ptr() as *const u8, bb.ptr, b_bytes); }
+    }
     ctxg.unmap(&mut bb)?;
     eprintln!("bc: allocs ok");
     let mut db = ctxg.alloc_host(n_out * t * 4)?;
     // l 파이프라인 (non-cm, subgroup=64, gfx1151): ids 0..10 + ALIGNED=0
     let sp = std::env::var("VKMMQ_SPEC").unwrap_or_else(|_| "l".into());
+    let is_cm1 = spv_name.contains("_cm1");
     let spec: Vec<u32> = match sp.as_str() {
         "m" => vec![128, 64, 64, 32, 64, 32, 2, 4, 2, 1, 64, 0],
         "s" => vec![64, 32, 32, 32, 32, 32, 2, 2, 2, 1, 64, 0],
@@ -795,10 +803,11 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         "l32" => vec![128, 128, 128, 32, 64, 64, 2, 4, 4, 1, 32, 0],
         "cc" => vec![128, 64, 32, 32, 64, 32, 2, 4, 4, 1, 64, 0],
         "mini" => vec![32, 32, 16, 32, 32, 16, 1, 4, 4, 1, 32, 0],
+        "cm1" => vec![128, 128, 128, 16, 128, 64, 2, 16, 16, 16, 64, 0],
         _ => vec![128, 128, 128, 32, 128, 64, 2, 4, 4, 1, 64, 0],
     };
     eprintln!("bc: y/ab 채움");
-    let (_dsl, pl, _dp, ds, pipe) = ctxg.pipeline_spec(&spv, 3, 17 * 4, &spec)?;
+    let (_dsl, pl, _dp, ds, pipe) = ctxg.pipeline_spec_fg(&spv, 3, 17 * 4, &spec, is_cm1)?;
     eprintln!("bc: 파이프라인 ok");
     let bufs = [ab.buf, bb.buf, db.buf];
     ctxg.bind_bufs(ds, &bufs);
@@ -818,6 +827,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         "s" => (32, 32),
         "c" | "cc" => (64, 32),
         "mini" => (32, 16),
+        "def" => (64, 64),
         _ => (128, 128),
     };
     let gx = (n_out as u32).div_ceil(dx);

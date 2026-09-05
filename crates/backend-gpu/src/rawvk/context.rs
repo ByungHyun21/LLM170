@@ -360,6 +360,18 @@ impl VkCtx {
         push_bytes: u32,
         spec: &[u32],
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+        self.pipeline_spec_fg(spv, n_buf, push_bytes, spec, false)
+    }
+
+    /// full_subgroups 플래그 판 (coopmat 파이프라인용 — 부록87).
+    pub fn pipeline_spec_fg(
+        &self,
+        spv: &[u8],
+        n_buf: u32,
+        push_bytes: u32,
+        spec: &[u32],
+        full_subgroups: bool,
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
         unsafe {
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
                 .map(|i| {
@@ -412,11 +424,14 @@ impl VkCtx {
             let sinfo = vk::SpecializationInfo::default()
                 .map_entries(&entries)
                 .data(&spec_bytes);
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(sm)
                 .name(c"main")
                 .specialization_info(&sinfo);
+            if full_subgroups {
+                stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+            }
             let pci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
             let pipe = self
                 .device
