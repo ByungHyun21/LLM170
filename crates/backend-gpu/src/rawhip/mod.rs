@@ -790,7 +790,23 @@ impl RawCtx {
             let mut b6 = xq_w as i32;
             let mut b7 = t as i32;
             let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
-            ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, 1, 256, 1, 1, 0, self.stream, args2.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+            // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
+            {
+              let mut z1 = xq_p as *mut std::ffi::c_void;
+              let mut z3 = out as *mut std::ffi::c_void;
+              let mut z7 = t.min(128) as i32;
+              let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
+                  &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
+              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, t.div_ceil(128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+            }
+        if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
+            self.sync().ok();
+            let _ = std::fs::write("/tmp/deq_wf16.f16", unsafe { std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2) });
+            let _ = std::fs::write("/tmp/deq_w.bin", unsafe { std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210) });
+            let _ = std::fs::write("/tmp/deq_xq.bin", unsafe { std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4) });
+            eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
+            std::process::exit(0);
+        }
         }
         Ok(())
     }
