@@ -416,3 +416,7 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   (+18%, llama.cpp ratio 0.83x), tg8 10.4 (0.95x, DRAM-bound). q6_K remains
   the one excluded type (J-independent corruption; Q6_K-specific SRAM layout
   suspected).
+- q6_K closure: llama.cpp's own dispatcher caps MMQ for q6_K at batch<=256
+  on RDNA3.5 (prefill uses dequant + hipBLAS MFMA instead), so our exclusion
+  of MMQ-q6 costs nothing relative to their path. The actual q6 lever is a
+  dequant->fp16 MFMA GEMM path (~3-4% potential).
