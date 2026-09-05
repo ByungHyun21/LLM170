@@ -1266,7 +1266,7 @@ gmark("betag", &mut marks);
                             Self::p(&mut asc), Self::p(&mut tt), Self::p(&mut chi),
                             Self::p(&mut bnp),
                         ];
-                        self.ctx.launch3("gdn_ar_chunk_c", npair as u32, t as u32, 1, d as u32, &mut cc)?;
+                        self.ctx.launch3("gdn_ar_chunk_c2", npair as u32, nc as u32, 1, d as u32, &mut cc)?;
                     } else {
                         self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
                     }

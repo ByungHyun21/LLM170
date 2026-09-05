@@ -3295,6 +3295,34 @@ extern "C" __global__ void gdn_ar_chunk_b(float* s, const float* lend, const flo
     for (int u2 = 0; u2 < d; u2++) sf[u2] = col[u2];
 }
 
+// C2: S f16 smem 스테이징 (32KB) — S 재독 제거 (부록 72 처방).
+// 그리드 (npair, nc), 블록 128 = u열.
+extern "C" __global__ void gdn_ar_chunk_c2(float* out, const float* q, const float* pbuf,
+                                          const float* sstart, int d, int k_stride, int v_stride,
+                                          int h_v, int h_k, float scale, int t, int ch, int npair) {
+    int pair = blockIdx.x;
+    int c = blockIdx.y;
+    int t0 = c * ch;
+    __shared__ half S[128][128];
+    const float* ssc = sstart + ((size_t)c * npair + pair) * d * d;
+    for (int i = threadIdx.x; i < d * d; i += blockDim.x)
+        S[i / d][i % d] = __float2half(ssc[i]);
+    __syncthreads();
+    int u = threadIdx.x;
+    int h = pair % h_v;
+    int kh = h % h_k;
+    for (int r = 0; r < ch; r++) {
+        int tt2 = t0 + r;
+        if (tt2 >= t) return;
+        int qk0 = tt2 * k_stride + kh * d;
+        const float* pd = pbuf + (((size_t)c * npair + pair) * ch + r) * d;
+        float acc = 0.0f;
+        for (int j = 0; j < d; j++)
+            acc += __half2float(S[j][u]) * (q[qk0 + j] * pd[j]);
+        out[tt2 * v_stride + h * d + u] += acc * scale;
+    }
+}
+
 // C: 보정 — out[t][u] += scale × Σ_j q[t][j]·P[c][t-c0][j] · s_start[c][j][u]
 // 그리드 (npair, nc*ch) 블록, 128스레드 = u. c≥0 전체 (c=0도 원상태 s0 보정).
 extern "C" __global__ void gdn_ar_chunk_c(float* out, const float* q, const float* pbuf,
@@ -4426,7 +4454,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
