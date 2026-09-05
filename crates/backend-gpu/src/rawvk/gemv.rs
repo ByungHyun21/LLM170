@@ -794,6 +794,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         "m32" => vec![128, 64, 64, 32, 32, 32, 2, 4, 2, 1, 32, 0],
         "l32" => vec![128, 128, 128, 32, 64, 64, 2, 4, 4, 1, 32, 0],
         "cc" => vec![128, 64, 32, 32, 64, 32, 2, 4, 4, 1, 64, 0],
+        "mini" => vec![32, 32, 16, 32, 32, 16, 1, 4, 4, 1, 32, 0],
         _ => vec![128, 128, 128, 32, 128, 64, 2, 4, 4, 1, 64, 0],
     };
     eprintln!("bc: y/ab 채움");
@@ -811,8 +812,9 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         t as u32,                                 // padded_n (f16 B — 비양자화 경로)
     ];
     let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let gx = (n_out as u32).div_ceil(128);
-    let gy = (t as u32).div_ceil(128);
+    let (dx, dy) = if sp == "mini" { (32u32, 16u32) } else { (128, 128) };
+    let gx = (n_out as u32).div_ceil(dx);
+    let gy = (t as u32).div_ceil(dy);
     ctxg.begin_batch()?;
     ctxg.run(pl, ds, pipe, &pcb, gx, gy, 1)?;
     ctxg.end_batch_wait()?;
