@@ -120,23 +120,42 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_
     int nwords = n >> 2;
     int qs0 = 0, qs1 = 0;
     int base = lb << 5;
+    // float4 벡터 로드 (2026-09-05: 스칼라 32로드가 지연 병목 — 79GB/s 측정).
+    // 산술 동일열: amax는 fmaxf 결합律(비트불변), rounding/clamp 공식 원본 그대로.
+    float4 v0 = *(const float4*)(x + base);
+    float4 v1 = *(const float4*)(x + base + 4);
+    float4 v2 = *(const float4*)(x + base + 8);
+    float4 v3 = *(const float4*)(x + base + 12);
+    float4 v4 = *(const float4*)(x + base + 16);
+    float4 v5 = *(const float4*)(x + base + 20);
+    float4 v6 = *(const float4*)(x + base + 24);
+    float4 v7 = *(const float4*)(x + base + 28);
+    const float4 vs[8] = { v0, v1, v2, v3, v4, v5, v6, v7 };
     float amax = 0.0f;
-    for (int i = 0; i < 32; i++) {
-        amax = fmaxf(amax, fabsf(x[base + i]));
-    }
+    #pragma unroll
+    for (int w = 0; w < 8; w++)
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(vs[w].x), fabsf(vs[w].y)),
+                                 fmaxf(fabsf(vs[w].z), fabsf(vs[w].w))));
     float d = amax / 127.0f;
     float id = d != 0.0f ? 1.0f / d : 0.0f;
     #pragma unroll
     for (int wi = 0; wi < 8; wi++) {
-        unsigned word = 0u;
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            float xv = x[base + wi * 4 + k] * id;
-            float r = xv >= 0.0f ? (float)(int)(xv + 0.5f)
-                                : -((float)(int)(0.5f - xv));
-            float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
-            word |= (((unsigned)(int)c) & 0xFFu) << (k * 8);
-        }
+        float xv0 = vs[wi].x * id;
+        float xv1 = vs[wi].y * id;
+        float xv2 = vs[wi].z * id;
+        float xv3 = vs[wi].w * id;
+        float r0 = xv0 >= 0.0f ? (float)(int)(xv0 + 0.5f) : -((float)(int)(0.5f - xv0));
+        float r1 = xv1 >= 0.0f ? (float)(int)(xv1 + 0.5f) : -((float)(int)(0.5f - xv1));
+        float r2 = xv2 >= 0.0f ? (float)(int)(xv2 + 0.5f) : -((float)(int)(0.5f - xv2));
+        float r3 = xv3 >= 0.0f ? (float)(int)(xv3 + 0.5f) : -((float)(int)(0.5f - xv3));
+        float c0 = r0 > 127.0f ? 127.0f : (r0 < -127.0f ? -127.0f : r0);
+        float c1 = r1 > 127.0f ? 127.0f : (r1 < -127.0f ? -127.0f : r1);
+        float c2 = r2 > 127.0f ? 127.0f : (r2 < -127.0f ? -127.0f : r2);
+        float c3 = r3 > 127.0f ? 127.0f : (r3 < -127.0f ? -127.0f : r3);
+        unsigned word = ((((unsigned)(int)c0) & 0xFFu))
+                      | ((((unsigned)(int)c1) & 0xFFu) << 8)
+                      | ((((unsigned)(int)c2) & 0xFFu) << 16)
+                      | ((((unsigned)(int)c3) & 0xFFu) << 24);
         xq[lb * 8 + wi] = word;
         if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
         else qs1 = dot4(0x01010101u, word, qs1);
