@@ -70,6 +70,8 @@ streaming-server bench (median), ROCm 10.0.0 userspace:
 
 Both PP and TG against this table are the first performance goal.
 
+- 2026-09-05: f32 kernel family promoted to default (was opt-in) — pp512 305→317 t/s; `LLM170_F32SILU=0` restores the bit-cast variants.
+
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
 Current standing (raw-HIP backend — pure Rust executor, cubecl removed,
