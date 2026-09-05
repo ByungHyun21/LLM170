@@ -124,6 +124,8 @@ pub struct RawCtx {
     mmq_y: std::sync::Mutex<(usize, *mut u8)>,
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
+    /// q6 정준 재배열 캐시.
+    canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
     mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
@@ -282,6 +284,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
             Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
@@ -826,6 +829,33 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
+        // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
+        let w_eff = if ty == 14 {
+            let key = w as usize ^ 0xdeadbeef;
+            let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
+            if let Some(&p2) = c.get(&key) { p2 }
+            else {
+                let blocks2 = n_in / 256;
+                let p2 = self.alloc(n_out * blocks2 * 210)? as *mut u8;
+                let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
+                unsafe {
+                    let mut a1 = w as *mut std::ffi::c_void;
+                    let mut a2 = p2 as *mut std::ffi::c_void;
+                    let mut a3 = blocks2 as i32;
+                    let mut a4 = n_out as i32;
+                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
+                    ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
+                }
+                if std::env::var_os("LLM170_RQ_DUMP").is_some() {
+                    self.sync().ok();
+                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
+                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
+                    eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
+                }
+                c.insert(key, p2);
+                p2
+            }
+        } else { w as *mut u8 };
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
@@ -861,7 +891,7 @@ impl RawCtx {
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
         let z3: [u32; 3] = [0, 0, 0];
-        let mut ax = w as *mut std::ffi::c_void;
+        let mut ax = w_eff as *mut std::ffi::c_void;
         let mut ay = yb as *mut std::ffi::c_void;
         let mut aid: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut aeb: *mut std::ffi::c_void = std::ptr::null_mut();

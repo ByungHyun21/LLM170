@@ -134,6 +134,52 @@ extern "C" __global__ void dequant_q6k_f16(const unsigned char* __restrict__ w, 
     out[((long)o * blocks + blk) * 256 + n2] = __float2half(v);
 }
 
+// 우리 레이아웃 q6 → ggml 정준 재배열 (MMQ q6 해금, 부록46)
+// 128스레드: l이 정준 l열 전담 — ql 2바이트+qh 1바이트를 통합 기입 (경합 없음).
+// 스케일 인덱싱 동일(grp*8+quad*2+is), 위치만 192→194, d 208→0.
+extern "C" __global__ void requant_q6k_canonical(const unsigned char* __restrict__ w,
+                                                 unsigned char* __restrict__ out,
+                                                 int blocks, int n_out) {
+    int o = blockIdx.x, blk = blockIdx.y;
+    if (o >= n_out) return;
+    long bo = ((long)o * blocks + blk) * 210;
+    const unsigned char* s = w + bo;
+    unsigned char* d2 = out + bo;
+    if (threadIdx.x == 0) {
+        unsigned short dh = (unsigned short)(s[208] | (s[209] << 8));
+        d2[0] = dh & 0xFF; d2[1] = dh >> 8;
+        for (int i = 0; i < 16; i++) d2[194 + i] = s[192 + i];
+        // ql/qh 나머지는 l 스레드들이 기입
+    }
+    int l = threadIdx.x;   // 0..127
+    #pragma unroll
+    for (int grp = 0; grp < 2; grp++) {
+        int qb0 = 2 + grp * 64 + l;        // quads 0,2 바이트
+        int qb1 = 2 + grp * 64 + 32 + l;   // quads 1,3 바이트
+        int hb  = 2 + 128 + grp * 32 + l;  // qh 바이트
+        unsigned b0 = 0, b1 = 0, hbb = 0;
+        #pragma unroll
+        for (int quad = 0; quad < 4; quad++) {
+            int n2 = grp * 128 + quad * 32 + l;
+            int sb = n2 >> 5, kc = (n2 >> 4) & 1, kloc = n2 & 15;
+            int gr = (sb * 2 + kc) & 15;
+            int h = gr >> 3, src2 = (gr & 7) >> 1, p2 = gr & 1;
+            int ql_b = h * 64 + p2 * 16 + ((src2 & 1) << 5) + kloc;
+            int qh_b = 128 + h * 32 + p2 * 16 + kloc;
+            int nib = (s[ql_b] >> ((src2 < 2) ? 0 : 4)) & 0xF;
+            int hi = (s[qh_b] >> (2 * src2)) & 3;
+            int v6 = nib | (hi << 4);   // 0..63
+            int lo4 = v6 & 0xF, hi2 = (v6 >> 4) & 3;
+            if (quad == 0) b0 |= lo4;
+            else if (quad == 1) b1 |= lo4;
+            else if (quad == 2) b0 |= lo4 << 4;
+            else b1 |= lo4 << 4;
+            hbb |= hi2 << (2 * quad);
+        }
+        d2[qb0] = b0; d2[qb1] = b1; d2[hb] = hbb;
+    }
+}
+
 extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_w) {
     int nblk = n >> 5;
     int lb = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4179,7 +4225,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "dequant_q6k_f16", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
+    "quant_q8", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
