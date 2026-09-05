@@ -1477,7 +1477,11 @@ gmark("ffn_quant", &mut marks);
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
             let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
             let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
-            if gate_tile && !up_tile {
+            if std::env::var_os("LLM170_PP_SERIAL").is_some() {
+                // 부록80 실험: 프리필 ffn 페어 직렬 (조인/경합 제거)
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            } else if gate_tile && !up_tile {
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.ctx.side_wait_main()?;
                 self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
