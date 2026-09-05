@@ -2601,9 +2601,16 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     #[allow(clippy::too_many_arguments)]
     /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        if matches!(ty, 12 | 13 | 23) && t >= 32 && std::env::var_os("LLM170_NO_MMQ").is_none()
-            && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
-            return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
+        if std::env::var_os("LLM170_NO_MMQ").is_none() {
+            if matches!(ty, 12 | 13 | 23) && t >= 32
+                && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
+                return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
+            }
+            // q6_K: dequant→f16 v4 타일 (llama dequant+MFMA 경로 대응, 부록42)
+            if ty == 14 && t >= 32 && super::co_loaded(super::CO_MMQ2)
+                && std::env::var_os("LLM170_DEQ16").is_some() {
+                return self.ctx.gemm_f16_q6(y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
+            }
         }
         self.mm_b(xq, xq_w, wp, ty, n_in, n_out, out, t)
     }

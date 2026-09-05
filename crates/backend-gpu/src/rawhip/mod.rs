@@ -18,7 +18,7 @@ pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
 pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
 pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
 pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
-pub const CO_MMQ2: u8 = 16; // mmq2.co: llama 프로덕션 mul_mat_q<q6_K/iq4_xs> (libggml-hip.so 추출)
+pub const CO_MMQ2: u8 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
 pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
 static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -122,6 +122,10 @@ pub struct RawCtx {
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
     /// MMQ 전용 y 버퍼 (size, ptr) — 풀 충돌 격리.
     mmq_y: std::sync::Mutex<(usize, *mut u8)>,
+    /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
+    f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
+    /// f16 경로 xq 버퍼 (size, ptr).
+    mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
     cursors: std::sync::Mutex<HashMap<usize, usize>>,
     /// D2H 핀 스테이징 (필요시 성장, 해제 없음 — ADR-0014).
@@ -232,8 +236,7 @@ impl RawCtx {
                         CO_MMQ2,
                         "LLM170_CO5_PATH",
                         include_bytes!("co/mmq2.co"),
-                        &["_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                        &["gemm_f16_v4"],
                     ),
                     (
                         CO_MMQ3,
@@ -277,7 +280,9 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
-            Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
+            Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
 
@@ -732,6 +737,62 @@ impl RawCtx {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
+    }
+
+    /// q6_K → f16 전개 + gemm_f16_v4 (deq-f16 경로, 부록42).
+    pub fn gemm_f16_q6(&self, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let fns = &self.fns;
+        let fq = *fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?;
+        let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음")?;
+        // f16 전개 버퍼 (지속: w 주소 키 캐시)
+        let key = w as usize;
+        let wf16 = {
+            let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
+            if let Some(&p) = c.get(&key) { p }
+            else {
+                let blocks = n_in / 256;
+                let p = self.alloc(n_out * n_in * 2)? as *mut u8;
+                unsafe {
+                    let mut a1 = w as *mut std::ffi::c_void;
+                    let mut a2 = p as *mut std::ffi::c_void;
+                    let mut a3 = blocks as i32;
+                    let mut a4 = n_out as i32;
+                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
+                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, blocks as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_q6k_f16")?;
+                }
+                c.insert(key, p);
+                p
+            }
+        };
+        // y: f32 → 우리 xq (quant_q8) — y_f32 에서 직접
+        let xq_w = n_in/4 + n_in/32 + n_in/16;
+        let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
+        let xq_p = if xq.0 < xq_w * t {
+            let p = self.alloc(xq_w * t * 4)? as *mut u8;
+            *xq = (xq_w * t, p);
+            p
+        } else { xq.1 };
+        unsafe {
+            let mut a1 = y_f32 as *mut std::ffi::c_void;
+            let mut a2 = xq_p as *mut std::ffi::c_void;
+            let mut a3 = n_in as i32;
+            let mut a4 = xq_w as i32;
+            let mut a5 = t as i32;
+            let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
+            // quant_q8_b: grid(nblk/64, t) block 64 — kernels.rs quant_q8 시그니처 (x, xq, n, xq_w)
+            let fq8 = *fns.get("quant_q8").ok_or("quant_q8 없음")?;
+            ck(hip::hipModuleLaunchKernel(fq8, ((n_in/32).div_ceil(64)) as u32, t as u32, 1, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "quant_q8")?;
+            let mut b1 = xq_p as *mut std::ffi::c_void;
+            let mut b2 = wf16 as *mut std::ffi::c_void;
+            let mut b3 = out as *mut std::ffi::c_void;
+            let mut b4 = n_in as i32;
+            let mut b5 = n_out as i32;
+            let mut b6 = xq_w as i32;
+            let mut b7 = t as i32;
+            let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, 1, 256, 1, 1, 0, self.stream, args2.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+        }
+        Ok(())
     }
 
     /// llama MMQ (mul_mat_q<q4_K/q5_K,128>) — f32 활성 직양자화 + 원형 런치.

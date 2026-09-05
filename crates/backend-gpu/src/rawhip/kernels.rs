@@ -111,6 +111,28 @@ DEV float log1p_cr(float y) {
 // d는 별도 float 저장이 간헐 유실되는 코드젠 결함(2026-09-03 RCA) 회피차
 // xq 워드 스트림 뒤 영역(xq[nwords + b])에 u32 비트로 편승 — 저장 경로
 // 단일화. GEMV는 xd[sb] = __uint_as_float(xq[nwords + sb])로 읽음.
+// q6_K 210B → f16 256값 전개 (검증: bad=0 vs 정준, deq_q6_pass.cu)
+extern "C" __global__ void dequant_q6k_f16(const unsigned char* __restrict__ w, __half* __restrict__ out,
+                                           int blocks, int n_out) {
+    int o = blockIdx.x, blk = blockIdx.y;
+    if (o >= n_out) return;
+    long bo = ((long)o * blocks + blk) * 210;
+    const unsigned char* ql = w + bo + 2;
+    const unsigned char* qh = w + bo + 130;
+    const signed char*   sc = (const signed char*)(w + bo + 194);
+    float d = __half2float(__ushort_as_half(((const unsigned short*)(w + bo))[0]));
+    int t = threadIdx.x;
+    int grp = t >> 7, quad = (t >> 5) & 3, l = t & 31, is = l >> 4;
+    const unsigned char* qhg = qh + grp*32;
+    int q, sci = grp*8 + is + quad*2;
+    if (quad == 0) { q = (ql[l] & 0xF) | (((qhg[l] >> 0) & 3) << 4); }
+    else if (quad == 1) { q = (ql[32 + l] & 0xF) | (((qhg[l] >> 2) & 3) << 4); }
+    else if (quad == 2) { q = (ql[l] >> 4) | (((qhg[l] >> 4) & 3) << 4); }
+    else { q = (ql[32 + l] >> 4) | (((qhg[l] >> 6) & 3) << 4); }
+    float v = d * sc[sci] * (q - 32);
+    out[((long)o * blocks + blk) * 256 + t] = __float2half(v);
+}
+
 extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_w) {
     int nblk = n >> 5;
     int lb = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4156,7 +4178,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
+    "quant_q8", "dequant_q6k_f16", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",
