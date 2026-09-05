@@ -72,6 +72,9 @@ Both PP and TG against this table are the first performance goal.
 
 - 2026-09-05: f32 kernel family promoted to default (was opt-in) — pp512 305→317 t/s; `LLM170_F32SILU=0` restores the bit-cast variants.
 - 2026-09-05: q6_K prefill routed to MMQ (was j128 tile) — pp512 318→341 t/s; `LLM170_NOQ6MMQ=1` restores.
+- 2026-09-05 (session final): pp512 250→343 t/s (+37%, 0.96× of llama 358 same-moment); tg8 10.44 (0.914× of 11.42).
+  Shipped: q6-K MMQ routing (+7.5%), f32 kernel family default (+4%), Vulkan GEMV coalescing (+51%), MMQ 4-path, wk attention, z-grid, rocprof diagnostics.
+  Remaining: tg GEMV family rewrite (contiguous-lane transplant triple-confirmed dead: 19/42 gate + 0.71 t/s), pp scattered small items.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
