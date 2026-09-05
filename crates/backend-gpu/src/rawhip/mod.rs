@@ -29,36 +29,35 @@ fn name_leak(n: &str) -> &'static str {
     unsafe { std::mem::transmute::<&str, &'static str>(n) }
 }
 
-pub struct KtraceEv(pub &'static str, pub usize);
+pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
 pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
 pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
 pub fn ktrace_dump() -> String {
     let mut g = KTRACE.lock().unwrap();
     let evs = std::mem::take(g.as_mut().unwrap());
     let mut out = String::new();
-    let mut prev: Option<(usize, &str)> = None;
-    let mut sums: std::collections::HashMap<&str, (f64, u32)> = std::collections::HashMap::new();
+    let mut prev: Option<(usize, u32, &str)> = None;
+    let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
     let mut total = 0.0f64;
-    let mut gap = 0.0f64;
     unsafe {
         for e in evs.iter() {
-            if let Some((p, _)) = prev {
+            if let Some((p, _py, _pn)) = prev {
                 let mut ms = 0f32;
                 if hip::hipEventElapsedTime(&mut ms, p as *mut _, e.1 as *mut _) == hip::hipError_t_hipSuccess {
-                    let ent = sums.entry(e.0).or_insert((0.0, 0));
+                    let ent = sums.entry((e.0, e.2)).or_insert((0.0, 0));
                     ent.0 += ms as f64; ent.1 += 1;
                     total += ms as f64;
                 }
             }
-            prev = Some((e.1, e.0));
+            prev = Some((e.1, e.2, e.0));
         }
         for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
     }
     let mut v: Vec<_> = sums.iter().collect();
     v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
     out.push_str(&format!("ktrace total={:.2}ms\n", total));
-    for (k, (ms, c)) in v.iter().take(18) {
-        out.push_str(&format!("  {:<24} {:>8.2}ms x{}\n", k, ms, c));
+    for ((k, gy), (ms, c)) in v.iter().take(20) {
+        out.push_str(&format!("  {:<18} gy={:<6} {:>8.2}ms x{}\n", k, gy, ms, c));
     }
     *g = None;
     out
@@ -324,7 +323,7 @@ impl RawCtx {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize));
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
                 }
             }
         }
