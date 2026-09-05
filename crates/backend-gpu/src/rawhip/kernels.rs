@@ -2689,10 +2689,13 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
                                         const float* cs, float eps, float kqs, int pos,
                                         int n_head, int n_kv, int hd, int n_rot) {
     // gy=t 배치 — aq [t][n_head·2hd] (q‖gate 인터리브), ak [t][n_kv·hd].
+    // 32레인 협력 (2026-09-05: 구버전은 블록당 1스레드 — 11.75ms/청크 병목).
+    // 비트보존: 각 레인이 shfl로 32 세그먼트를 전부 모아 **동일 순서** f64 합산
+    // (중복 연산이나 결과 동일), 스케일/로프는 원소별 독립라 순서 무관.
     int r0 = blockIdx.x;
-    int u = threadIdx.x;
+    int u = threadIdx.x;   // 0..31
     int y = blockIdx.y;
-    if (r0 >= n_head + n_kv || u != 0) return;
+    if (r0 >= n_head + n_kv) return;
     bool is_q = r0 < n_head;
     int half = n_rot >> 1;
     int csbase = (pos + y) * half * 2;
@@ -2700,24 +2703,30 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
                         : y * (n_kv * hd) + (r0 - n_head) * hd;
     float* xv = is_q ? xq : xk;
     const float* wv = is_q ? qw + r0 * hd : kw + (r0 - n_head) * hd;
-    float parts[32];  // f32 세그먼트 — 미러 sq_sum과 쌍
     int chunk = (hd + 31) >> 5;
-    for (int uu = 0; uu < 32; uu++) {
-        int lo = uu * chunk;
+    // 레인 u가 세그먼트 u 계산
+    float mypart = 0.0f;
+    {
+        int lo = u * chunk;
         int hi = min(lo + chunk, hd);
-        float acc = 0.0f;
         for (int i = lo; i < hi; i++) {
             float dv = xv[row_base + i];
-            acc += dv * dv;
+            mypart += dv * dv;
         }
-        parts[uu] = acc;
     }
+    // 전 레인이 32 세그먼트를 shfl로 수집 후 동일 순서 f64 합 (비트동일)
+    float parts[32];
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++)
+        parts[uu] = __shfl_sync(0xFFFFFFFFFFFFFFFFull, mypart, uu);
     double sum = 0.0;
+    #pragma unroll
     for (int uu = 0; uu < 32; uu++) sum += parts[uu];
     float scale = 1.0f / (float)sqrt(sum / (double)hd + (double)eps);
-    for (int i = 0; i < hd; i++)
+    for (int i = u; i < hd; i += 32)
         xv[row_base + i] = xv[row_base + i] * scale * wv[i] * (is_q ? 1.0f : kqs);
-    for (int p = 0; p < half; p++) {
+    __syncwarp();
+    for (int p = u; p < half; p += 32) {
         double c = (double)cs[csbase + p * 2];
         double sf = (double)cs[csbase + p * 2 + 1];
         int a = row_base + p, b = a + half;
