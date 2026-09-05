@@ -31,44 +31,54 @@ fn name_leak(n: &str) -> &'static str {
 
 pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
 pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
-pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
-pub fn ktrace_dump() -> String {
-    let mut g = KTRACE.lock().unwrap();
-    let evs = std::mem::take(g.as_mut().unwrap());
-    let mut out = String::new();
-    let mut prev: Option<(usize, u32, &str)> = None;
-    let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
-    let mut total = 0.0f64;
-    unsafe {
-        for e in evs.iter() {
-            if let Some((p, _py, _pn)) = prev {
-                let mut ms = 0f32;
-                if hip::hipEventElapsedTime(&mut ms, p as *mut _, e.1 as *mut _) == hip::hipError_t_hipSuccess {
-                    let ent = sums.entry((e.0, e.2)).or_insert((0.0, 0));
-                    ent.0 += ms as f64; ent.1 += 1;
-                    total += ms as f64;
-                }
-            }
-            prev = Some((e.1, e.2, e.0));
-        }
-        for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
-    }
-    let mut v: Vec<_> = sums.iter().collect();
-    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-    out.push_str(&format!("ktrace total={:.2}ms\n", total));
-    for ((k, gy), (ms, c)) in v.iter().take(20) {
-        out.push_str(&format!("  {:<18} gy={:<6} {:>8.2}ms x{}\n", k, gy, ms, c));
-    }
-    *g = None;
-    out
-}
-
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())
     } else {
         Err(format!("rawhip: {what}: {status:?}"))
     }
+}
+
+pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
+pub fn ktrace_dump() -> String {
+    let mut g = KTRACE.lock().unwrap();
+    let evs = std::mem::take(g.as_mut().unwrap());
+    let mut out = String::new();
+    // 쌍 결합: 연속 동일 (name, gy) 두 이벤트가 start/end
+    let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
+    let mut total = 0.0f64;
+    let mut gaps = 0.0f64;
+    let mut i = 0usize;
+    unsafe {
+        while i + 1 < evs.len() {
+            if evs[i].0 == evs[i+1].0 && evs[i].2 == evs[i+1].2 {
+                let mut ms = 0f32;
+                if hip::hipEventElapsedTime(&mut ms, evs[i].1 as *mut _, evs[i+1].1 as *mut _) == hip::hipError_t_hipSuccess {
+                    let ent = sums.entry((evs[i].0, evs[i].2)).or_insert((0.0, 0));
+                    ent.0 += ms as f64; ent.1 += 1;
+                    total += ms as f64;
+                }
+                i += 2;
+            } else {
+                // 쌍이 아님 → 직전 end에서 이 start까지 갭
+                if i > 0 {
+                    let mut ms = 0f32;
+                    if hip::hipEventElapsedTime(&mut ms, evs[i-1].1 as *mut _, evs[i].1 as *mut _) == hip::hipError_t_hipSuccess {
+                        gaps += ms as f64;
+                    }
+                }
+                i += 1;
+            }
+        }
+        for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
+    }
+    let mut v: Vec<_> = sums.iter().collect();
+    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+    for ((n, gy), (ms, cnt)) in v.iter().take(40) {
+        out.push_str(&format!("{:30} gy={:4} {:9.3}ms x{:4}\n", n, gy, ms, cnt));
+    }
+    out.push_str(&format!("TOTAL {:.1}ms GAPS {:.1}ms\n", total, gaps));
+    out
 }
 
 /// 컴파일된 커널 실행기.
@@ -317,6 +327,14 @@ impl RawCtx {
 
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev0, 0);
+                    hip::hipEventRecord(ev0, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                }
+            }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
             if let Ok(mut g) = KTRACE.lock() {
                 if g.is_some() {
@@ -640,7 +658,15 @@ impl RawCtx {
     pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
-        self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
+        let r = self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args);
+        if std::env::var_os("LLM170_TILE_PROF").is_some() {
+            self.sync().ok();
+            let ti = std::time::Instant::now();
+            self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args).ok();
+            self.sync().ok();
+            eprintln!("tileprof ty={ty} {n_in}x{n_out} t={t} kern={} {:.3}ms", l.kern, ti.elapsed().as_secs_f64()*1e3);
+        }
+        r
     }
 
     /// gemm_tile의 사이드 스트림판 — 커널 선택·인자 구성은 공용 코어에 위임.
