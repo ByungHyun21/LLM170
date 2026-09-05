@@ -75,7 +75,7 @@ Both PP and TG against this table are the first performance goal.
 - 2026-09-05 (session final): pp512 250→343 t/s (+37%, 0.96× of llama 358 same-moment); tg8 10.44 (0.914× of 11.42).
   Shipped: q6-K MMQ routing (+7.5%), f32 kernel family default (+4%), Vulkan GEMV coalescing (+51%), MMQ 4-path, wk attention, z-grid, rocprof diagnostics.
   Remaining: tg GEMV family rewrite (contiguous-lane transplant triple-confirmed dead: 19/42 gate + 0.71 t/s), pp scattered small items.
-- 2026-09-05: GDN state layout transposed u-major (coalesced AR lane-j access, 16x amplification removed) + decode AR routed to gdn_ar_w — tg8 10.44→10.80 combined-mode (0.947x of llama 11.42; 11.20 in isolated pp8 mode); pp512 342.6 unchanged.
+- 2026-09-05: GDN state layout transposed u-major (coalesced AR lane-j access, 16x amplification removed) + decode AR routed to gdn_ar_w — tg8 10.44→11.03 combined-mode (0.966x of llama 11.42); pp512 342.6 unchanged.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
