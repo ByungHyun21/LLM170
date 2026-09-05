@@ -334,6 +334,26 @@ impl DecodeState {
     }
     /// 듀얼 텐서 q5_K GEMV — 같은 xq·같은 포맷 독립 2 GEMV를 1런치로.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn mm_into2_q8(&self, xq: *mut u8, w1: *mut u8, no1: usize, out1: *mut u8, w2: *mut u8, no2: usize, out2: *mut u8, ni: usize) -> Result<(), String> {
+        let gy = (no1 + no2).min(65535) as u32;
+        let gz = (no1 + no2).div_ceil(65535) as u32;
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w1p = w1 as *mut std::ffi::c_void;
+        let mut w2p = w2 as *mut std::ffi::c_void;
+        let mut o1 = out1 as *mut std::ffi::c_void;
+        let mut o2 = out2 as *mut std::ffi::c_void;
+        let mut ni_a = ni as i32;
+        let mut no1a = no1 as i32;
+        let mut no2a = no2 as i32;
+        let mut xw = (ni / 4 + ni / 32 + ni / 16) as i32;
+        let mut args = vec![
+            Self::p(&mut xq_p), Self::p(&mut w1p), Self::p(&mut w2p), Self::p(&mut o1), Self::p(&mut o2),
+            Self::p(&mut ni_a), Self::p(&mut no1a), Self::p(&mut no2a), Self::p(&mut xw),
+        ];
+        self.ctx.launch3("gemm_q8_0_dual", 1, gy, gz, 64, &mut args)
+    }
+
     fn mm_into2_q5k(&self, xq: *mut u8, w1: *mut u8, no1: usize, out1: *mut u8,
                     w2: *mut u8, no2: usize, out2: *mut u8, n_in: usize) -> Result<(), String> {
         let mut xp = xq as *mut std::ffi::c_void;
@@ -476,6 +496,9 @@ impl DecodeState {
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
                 if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
+                } else if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
+                    // q8_0 듀얼 (부록79): beta+alpha 1런치 (산술 동일열)
+                    self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
                 } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
