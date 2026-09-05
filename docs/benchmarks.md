@@ -362,7 +362,7 @@ prefill trace (KTRACE on step_batch) shows tile GEMMs streaming at DRAM parity
 (~10 vs ~13 effective TFLOPS) plus ~74ms/chunk of non-GEMM (quant_q8 21ms,
 gdn_ar 20ms, qk_rope 12ms).
 
-⁶ 2026-09-05 (night, cont.): 238→249 via two non-GEMM kernel fixes found by the
+⁶ 2026-09-05 (night, cont.): 238→249 (peak 251) via two non-GEMM kernel fixes found by the
 prefill KTRACE — quant_q8 float4 loads (32 scalar loads were latency-bound,
 21→18ms/chunk) and qk_norm_rope 32-lane cooperation (was one thread per block,
 11.75ms→off the top list). Both bitwise-preserving. Remaining pp gap: tile GEMM
