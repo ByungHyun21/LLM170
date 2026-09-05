@@ -1138,15 +1138,15 @@ gmark("norm", &mut marks);
                     // (사이드 이동 시도: L2 경합으로 -5 t/s 회귀 — 2026-09-05 측정)
                     self.ctx.side_wait_main()?;
                     self.mm_b_s(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
                     self.ctx.join2()?;
                 } else {
-                    self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
-                    self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                    self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
                 }
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
@@ -1271,16 +1271,16 @@ gmark("normg", &mut marks);
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
 gmark("outproj", &mut marks);
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.ggated_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 recr_idx += 1;
 } else {
 gmark("attn", &mut marks);
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
                 // q/k norm+rope 전체 배치 (gy=t — 커널 pos+y)
@@ -1398,7 +1398,7 @@ gmark("attn", &mut marks);
                 // wo 배치
                 self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
             }
 self.axpy(self.xs_t, self.gout_t, n * t)?;
@@ -1414,24 +1414,24 @@ gmark("ffn_quant", &mut marks);
             let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
             let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
             if gate_tile && !up_tile {
-                self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if !gate_tile && up_tile {
                 self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
-                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if gate_tile && up_tile {
                 // 둘 다 타일 — 하나 사이드
                 self.ctx.side_wait_main()?;
                 self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
-                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else {
-                self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
-                self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
             }
 gmark("ffn_gate", &mut marks);
 gmark("ffn_up", &mut marks);
@@ -1464,7 +1464,7 @@ gmark("ffn_silu", &mut marks);
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
 gmark("ffn_quant2", &mut marks);
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
-            self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
 self.axpy(self.xs_t, self.fdown_t, n * t)?;
             gmark("ffn", &mut marks);
             if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
@@ -1902,13 +1902,13 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
             if self.is_recr[il] {
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
                 let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
@@ -2022,15 +2022,15 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.ggated_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 recr_idx += 1;
             } else {
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
                 let cs = *self.consts.get("cs").ok_or("cs")?;
@@ -2086,7 +2086,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 }
                 self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
             }
             self.axpy(self.xs_t, self.gout_t, n * t)?;
@@ -2095,9 +2095,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+            self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
             {
                 let mut gp = self.fgate_t as *mut std::ffi::c_void;
                 let mut up = self.fup_t as *mut std::ffi::c_void;
@@ -2108,7 +2108,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             }
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
-            self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
             if std::env::var_os("LLM170_NP_DBG3").is_some() && il % 8 == 0 {
                 self.ctx.sync()?;
@@ -2220,13 +2220,13 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
             if self.is_recr[il] {
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
                 let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
@@ -2326,15 +2326,15 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.ggated_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 recr_idx += 1;
             } else {
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.aq_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.ak_t, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
-                self.mm_b(self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
+                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.av_t, t)?;
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
                                 // per-seq 슬라이스 (np 검증 경로 — _ms 의심 바이팩)
@@ -2390,7 +2390,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 }
 self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
-                self.mm_b(self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
             }
             self.axpy(self.xs_t, self.gout_t, n * t)?;
@@ -2399,9 +2399,9 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+            self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            self.mm_b(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
             {
                 let mut gp = self.fgate_t as *mut std::ffi::c_void;
                 let mut up = self.fup_t as *mut std::ffi::c_void;
@@ -2412,7 +2412,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             }
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
-            self.mm_b(self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
         }
         // head (j128 강제) + 행별 argmax
@@ -2599,6 +2599,15 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
 
     /// 배치 GEMV — xq [t][xq_w], out [t][n_out].
     #[allow(clippy::too_many_arguments)]
+    /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
+    fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        if matches!(ty, 12 | 13) && t >= 32 && std::env::var_os("LLM170_NO_MMQ").is_none()
+            && super::co_loaded(super::CO_MMQ) {
+            return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
+        }
+        self.mm_b(xq, xq_w, wp, ty, n_in, n_out, out, t)
+    }
+
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
         let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
