@@ -501,7 +501,7 @@ impl DecodeState {
                     let mut ch = conv_ch as i32;
                     let mut kk = self.conv_k as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk)];
-                    self.ctx.launch("gdn_conv", conv_ch as u32, 1, 32, &mut args)?;
+                    self.ctx.launch("gdn_conv", (conv_ch as u32).div_ceil(256), 1, 256, &mut args)?;
                 }
                 // split3 (q/k/v)
                 {
