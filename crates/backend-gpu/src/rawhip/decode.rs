@@ -893,10 +893,14 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
+        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         let r = ds.read_logits();
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            eprintln!("{}", crate::rawhip::ktrace_dump());
+        }
         if let (Some(path), Ok(v)) = (std::env::var_os("LLM170_DUMP_LOGITS"), r.as_ref()) {
             let _ = std::fs::write(&path, bytemuck::cast_slice(v));
         }
@@ -1368,7 +1372,9 @@ gmark("attn", &mut marks);
                     let mut tl = t as i32;
                     let mut ss = self.ctx_len as i32;
                     let mut p0 = pos0 as i32;
-                    if std::env::var_os("LLM170_QSA_SPLIT").is_some() && np_ > 512 {
+                    // 분할 flash 기본 ON (2026-09-05: pp512 +5 — 청크 2-4의 np 성장
+                    // 구간 병렬화; LLM170_NO_QSA_SPLIT으로 원경로)
+                    if std::env::var_os("LLM170_NO_QSA_SPLIT").is_none() && np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
                         let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(64);
                         let nseg = (pos0 + t + sg - 1) / sg;
                         // part: [t][n_head][nseg][hd+2]
