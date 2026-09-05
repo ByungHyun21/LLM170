@@ -3159,17 +3159,17 @@ extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, cons
     float g_exp = beta_ge[pair * 2 + 1];
     float sk = 0.0f;
     for (int kdim = 0; kdim < d; kdim++) {
-        float sv = s[base_s + kdim * d + u] * g_exp;
-        s[base_s + kdim * d + u] = sv;
+        float sv = s[base_s + u * d + kdim] * g_exp;
+        s[base_s + u * d + kdim] = sv;
         sk += sv * k[qk0 + kdim];
     }
     float delta = (v[v0 + u] - sk) * beta;
     for (int kdim = 0; kdim < d; kdim++) {
-        s[base_s + kdim * d + u] += k[qk0 + kdim] * delta;
+        s[base_s + u * d + kdim] += k[qk0 + kdim] * delta;
     }
     float o = 0.0f;
     for (int kdim = 0; kdim < d; kdim++)
-        o += (s[base_s + kdim * d + u] * q[qk0 + kdim]) * scale;
+        o += (s[base_s + u * d + kdim] * q[qk0 + kdim]) * scale;
     out[v0 + u] = o;
 }
 // GDN AR — t토큰 순차 (block=128=d_state 열, blockIdx.x=pair)
@@ -3185,7 +3185,7 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
     int base_s = pair * d * d;
     // 스레드 lu는 자기 열(128원소) 전체 적재 — 이전 버그: 2원소만 적재
     #pragma unroll 8
-    for (int j = 0; j < d; j++) ss[j * 64 + lu] = s[base_s + j * d + u];
+    for (int j = 0; j < d; j++) ss[j * 64 + lu] = s[base_s + u * d + j];  // 전치
     for (int ti = 0; ti < t; ti++) {
         int h = pair % h_v;
         int kh = h % h_k;
@@ -3213,7 +3213,7 @@ extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, co
         __syncthreads();
     }
     #pragma unroll 8
-    for (int j = 0; j < d; j++) s[base_s + j * d + u] = ss[j * 64 + lu];
+    for (int j = 0; j < d; j++) s[base_s + u * d + j] = ss[j * 64 + lu];  // 전치
 }
 
 // GDN AR 워프 분할 (fast 실험) — wave32당 1열, 레인이 kdim 4개 분담,
@@ -3230,7 +3230,7 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
     float ssr[4];
     #pragma unroll
     for (int j = 0; j < 4; j++)
-        ssr[j] = s[base_s + ((lane << 2) + j) * d + u];
+        ssr[j] = s[base_s + u * d + ((lane << 2) + j)];  // 전치
     for (int ti = 0; ti < t; ti++) {
         int h = pair % h_v;
         int kh = h % h_k;
@@ -3271,7 +3271,7 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
     }
     #pragma unroll
     for (int j = 0; j < 4; j++)
-        s[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+        s[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
 }
 
 // ══ AR 청크 스캔 (세션 3 부록 72) — t 직렬을 ch 청크로 병렬화 ══
@@ -3335,7 +3335,7 @@ extern "C" __global__ void gdn_ar_chunk_a(float* s, const float* q, const float*
     }
     #pragma unroll
     for (int j = 0; j < 4; j++)
-        lend[((size_t)c * npair + pair) * d * d + ((lane << 2) + j) * d + u] = ssr[j];
+        lend[((size_t)c * npair + pair) * d * d + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
     if (u == 0) {
         float* pgs = pgb + ((size_t)c * npair + pair) * d;
         #pragma unroll
@@ -3356,18 +3356,18 @@ extern "C" __global__ void gdn_ar_chunk_b(float* s, const float* lend, const flo
     // 여기선 순차 c 루프 × u 128 (컴파일러 언롤) — 병목 아님 (소형).
     float col[128];
     for (int u2 = 0; u2 < d; u2++)
-        col[u2] = s[(size_t)pair * d * d + j * d + u2];
+        col[u2] = s[(size_t)pair * d * d + u2 * d + j];  // 전치
     for (int c = 0; c < nc; c++) {
         // s_start[c] 기록
-        float* ss = sstart + ((size_t)c * npair + pair) * d * d + j * d;
-        for (int u2 = 0; u2 < d; u2++) ss[u2] = col[u2];
+        float* ss = sstart + ((size_t)c * npair + pair) * d * d;  // 전치: [u][j] 열
+        for (int u2 = 0; u2 < d; u2++) ss[u2 * d + j] = col[u2];
         float g = pgb[((size_t)c * npair + pair) * d + j];
-        const float* le = lend + ((size_t)c * npair + pair) * d * d + j * d;
-        for (int u2 = 0; u2 < d; u2++) col[u2] = col[u2] * g + le[u2];
+        const float* le = lend + ((size_t)c * npair + pair) * d * d;  // 전치
+        for (int u2 = 0; u2 < d; u2++) col[u2] = col[u2] * g + le[u2 * d + j];
     }
     // 최종 상태 기록
-    float* sf = s + (size_t)pair * d * d + j * d;
-    for (int u2 = 0; u2 < d; u2++) sf[u2] = col[u2];
+    float* sf = s + (size_t)pair * d * d;
+    for (int u2 = 0; u2 < d; u2++) sf[u2 * d + j] = col[u2];
 }
 
 // C2: S f16 smem 스테이징 (32KB) — S 재독 제거 (부록 72 처방).
@@ -3415,7 +3415,7 @@ extern "C" __global__ void gdn_ar_chunk_c(float* out, const float* q, const floa
     const float* ssc = sstart + ((size_t)c * npair + pair) * d * d;
     float acc = 0.0f;
     for (int j = 0; j < d; j++)
-        acc += (q[qk0 + j] * pd[j]) * ssc[j * d + u];
+        acc += (q[qk0 + j] * pd[j]) * ssc[u * d + j];  // 전치
     int v0 = tt * v_stride + h * d;
     out[v0 + u] += acc * scale;
 }
@@ -4469,16 +4469,16 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
     float ssr[4];
     #pragma unroll
     for (int j = 0; j < 4; j++)
-        ssr[j] = st[base_s + ((lane << 2) + j) * d + u];
+        ssr[j] = st[base_s + u * d + ((lane << 2) + j)];  // 전치
     for (int ti = 0; ti < t; ti++) {
         if (ti > 0 && row_seq[ti] != row_seq[ti - 1]) {
             #pragma unroll
             for (int j = 0; j < 4; j++)
-                st[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+                st[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
             st = states[row_seq[ti]];
             #pragma unroll
             for (int j = 0; j < 4; j++)
-                ssr[j] = st[base_s + ((lane << 2) + j) * d + u];
+                ssr[j] = st[base_s + u * d + ((lane << 2) + j)];  // 전치
         }
         int h = pair % h_v;
         int kh = h % h_k;
@@ -4516,7 +4516,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
     }
     #pragma unroll
     for (int j = 0; j < 4; j++)
-        st[base_s + ((lane << 2) + j) * d + u] = ssr[j];
+        st[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
 }
 
 "#;
