@@ -540,7 +540,7 @@ impl DecodeState {
                     let mut nh = self.dt_rank as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l("gdn_beta_g", self.dt_rank, &mut args)?;
+                    self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank, &mut args)?;
                 }
                 // AR
                 {
@@ -1164,7 +1164,7 @@ gmark("gdn_mm", &mut marks);
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
                     if t >= self.conv_k - 1 {
-                        self.ctx.launch3("gdn_conv_t2", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                        self.ctx.launch3(if std::env::var_os("LLM170_F32SILU").is_some() { "gdn_conv_t2_f32" } else { "gdn_conv_t2" }, conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
                         let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
                         let mut sp2 = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
                         let mut ch2 = conv_ch as i32;
@@ -1214,7 +1214,7 @@ gmark("split+l2", &mut marks);
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
+                    self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
                 }
 gmark("betag", &mut marks);
                 // AR 배치 (pair 블록 × t 내부 순차)
@@ -1961,7 +1961,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
+                    self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
                 }
                 // AR — per-seq (t=1 슬라이스)
                 for s in 0..t {
@@ -2289,7 +2289,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l("gdn_beta_g", self.dt_rank * t, &mut args)?;
+                    self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
                 }
                                 // AR — per-seq 슬라이스 (gdn_ar_w_ms 비대칭 RCA 회피 — 트렁크 검증 커널 재사용)
                 for gi in 0..group_starts.len() {
