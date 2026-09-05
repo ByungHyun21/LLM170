@@ -1137,7 +1137,7 @@ gmark("norm", &mut marks);
                     // 사이드는 타일형만 (beta/alpha는 q8_0 gemv — 주 스트림)
                     // (사이드 이동 시도: L2 경합으로 -5 t/s 회귀 — 2026-09-05 측정)
                     self.ctx.side_wait_main()?;
-                    self.mm_b_s(self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
+                    self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wg2, tg2, nig2, nog2, self.gz_t, t)?;
                     self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wp, ty, ni, no, self.gqkv_t, t)?;
                     self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
                     self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
@@ -1416,17 +1416,17 @@ gmark("ffn_quant", &mut marks);
             if gate_tile && !up_tile {
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.ctx.side_wait_main()?;
-                self.mm_b_s(self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
+                self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if !gate_tile && up_tile {
                 self.ctx.side_wait_main()?;
-                self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else if gate_tile && up_tile {
                 // 둘 다 타일 — 하나 사이드
                 self.ctx.side_wait_main()?;
-                self.mm_b_s(self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+                self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
             } else {
@@ -2631,6 +2631,15 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     }
     /// mm_b 사이드 스트림판 — 타일형만 (비타일은 주 스트림 사용)
     #[allow(clippy::too_many_arguments)]
+    /// mm_b_s의 MMQ판 — side stream에서 quant+mul_mat_q (부록48).
+    fn mm_b2_s(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        if matches!(ty, 12 | 13 | 23) && t >= 32 && std::env::var_os("LLM170_NO_MMQ").is_none()
+            && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
+            return self.ctx.gemm_mmq_s(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
+        }
+        self.mm_b_s(xq, xq_w, wp, ty, n_in, n_out, out, t)
+    }
+
     fn mm_b_s(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         self.ctx.gemm_tile_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
     }

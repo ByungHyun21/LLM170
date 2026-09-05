@@ -1,36 +1,48 @@
 "Name","Calls","TotalDurationNs","AverageNs","Percentage"
-"void mul_mat_q<(ggml_type)13, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",382,294636039,771298,38.316988472270594
-"void mul_mat_q<(ggml_type)23, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",140,132476494,946260,17.228375424381895
-"void mul_mat_q<(ggml_type)12, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",136,107779964,792499,14.016627606542524
-"void mul_mat_q<(ggml_type)14, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",98,68898718,703048,8.960178097426237
-"void gated_delta_net_cuda<128, false, false>(float const*, float const*, float const*, float const*, float const*, float const*, float*, float*, long, long, long, long, long, long, long, long, long, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float, long, int) [clone .kd]",96,36334638,378485,4.725266841474627
-"void mul_mat_q<(ggml_type)8, 128, true>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",192,32641773,170009,4.245015117636283
-"void unary_gated_op_kernel<&(op_silu(float)), float>(float const*, float const*, float*, long, long, long, long) [clone .kd]",224,11132298,49697,1.4477391685810745
-"void mul_mat_q<(ggml_type)20, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",12,10691893,890991,1.3904651386782685
-"void mul_mat_vec_q<(ggml_type)14, 1, false, false, false>(void const*, void const*, int const*, ggml_cuda_mm_fusion_args_device, float*, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int) [clone .kd]",2,9085552,4542776,1.1815628272419691
-"void mul_mat_q<(ggml_type)11, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",6,7430906,1238484,0.966378520790956
-"void concat_non_cont<unsigned int, 0>(char const*, char const*, char*, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long, long, long, long, long, unsigned long, unsigned long, unsigned long, unsigned long) [clone .kd]",96,6580752,68549,0.8558172292116365
-"void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)0, false>(float const*, int const*, void*, long, long, long, long, long, int, int, int) [clone .kd]",474,5834118,12308,0.758718563114631
-"void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, false>(float const*, int const*, void*, long, long, long, long, long, int, int, int) [clone .kd]",518,5675834,10957,0.7381339590589646
-"void flash_attn_tile<256, 256, 16, 2, false>(char const*, char const*, char const*, char const*, char const*, int const*, float*, HIP_vector_type<float, 2u>*, float, float, float, float, unsigned int, float, int, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, int, int, int, int, int, int, long, int, int, long, int, int, int, int, int, long) [clone .kd]",32,5194043,162313,0.675477740031245
-"void rms_norm_f32<256, true, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>) [clone .kd]",160,5105494,31909,0.6639620713311541
-"void k_bin_bcast<&(op_add(float, float)), float, float, float, float const*>(float const*, float const*, float*, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float const*) [clone .kd]",352,4598907,13065,0.5980811685567242
-"void mul_mat_q<(ggml_type)8, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",24,4241036,176709,0.5515405653497962
-"void rms_norm_f32<1024, true, false>(float const*, float*, int, long, long, long, float, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, float const*, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>) [clone .kd]",258,4075299,15795,0.5299867094807634
-"void ssm_conv_long_token_f32<true, 128ul, 4ul, 32l>(float const*, float const*, float const*, int, int, int, int, float*, int, int, int, long) [clone .kd]",96,3304286,34419,0.4297175898807312
-"void rope_multi<true, false, float>(float const*, float*, int, int, int, int, int, int, int, int, int, int, int, int const*, float, float, float, rope_corr_dims, float, float const*, mrope_sections, bool, bool) [clone .kd]",64,2162152,33783,0.28118472383922055
-"void cpy_scalar<&(void cpy_1_scalar<float, float>(char const*, char*))>(char const*, char*, long, long, long, long, long, long, long, long, long, long, long, long, long, long, long) [clone .kd]",128,2138740,16708,0.27814002728017945
-"scale_f32(float const*, float*, float, float, long) [clone .kd]",192,1971264,10267,0.2563600169896461
-"void mul_mat_q<(ggml_type)21, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",2,1968964,984482,0.25606090533383735
-"void l2_norm_f32<32>(float const*, float*, int, long, long, long, float) [clone .kd]",192,1196689,6232,0.15562766446874826
-"void k_get_rows_float_vec<float>(float const*, int const*, float*, long, long, HIP_vector_type<unsigned int, 3u>, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long) [clone .kd]",96,1062073,11063,0.13812104939989997
-"__amd_rocclr_fillBufferAligned.kd",2,740595,370297,0.0963133029276885
-"void unary_gated_op_kernel<&(op_sigmoid(float)), float>(float const*, float const*, float*, long, long, long, long) [clone .kd]",32,529279,16539,0.06883196438034829
-"void k_set_rows<float, long, __half>(float const*, long const*, __half*, long, long, long, long, long, long, long, long, long, long, long, long, long, long, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>) [clone .kd]",64,429209,6706,0.05581800638174745
-"void k_get_rows_float<float, float>(float const*, int const*, float*, long, long, HIP_vector_type<unsigned int, 3u>, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long) [clone .kd]",98,267652,2731,0.03480775343501061
-"__amd_rocclr_copyBuffer.kd",177,209099,1181,0.027193020920849773
-"void k_bin_bcast<&(op_mul(float, float)), float, float, float, float const*>(float const*, float const*, float*, unsigned int, unsigned int, unsigned int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float const*) [clone .kd]",96,190146,1980,0.024728210828439644
-"void unary_op_kernel<&(op_sigmoid(float)), float>(float const*, float*, int) [clone .kd]",96,149070,1552,0.01938633675278732
-"void unary_op_kernel<&(op_softplus(float)), float>(float const*, float*, int) [clone .kd]",96,137925,1436,0.017936945707574904
-"_ZL13k_get_rows_kqIfTnPFvPKvlPT_iEXadL_ZL15dequantize_q4_KIfEvS1_lS3_iEEEvS1_PKiS3_ll15HIP_vector_typeIjLj3EEmmmmmmmmm.kd",2,69286,34643,0.009010543558419683
-"quantize_q8_1(float const*, void*, long, long, long, long, long, unsigned int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",2,3435,1717,0.00044671675552307265
+"void mul_mat_q<(ggml_type)13, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",319,596299452,1869277,21.28419115973361
+"void mul_mat_q<(ggml_type)23, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",114,324213167,2843975,11.572398733196616
+"void mul_mat_q<(ggml_type)12, 128, false>(char const*, int const*, int const*, int const*, float*, float*, float const*, HIP_vector_type<unsigned int, 3u>, int, int, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>, HIP_vector_type<unsigned int, 3u>, int, int, int, HIP_vector_type<unsigned int, 3u>) [clone .kd]",117,290508551,2482979,10.369353036100426
+"gemm_q5k_v4.kd",63,222465685,3531201,7.94064483899791
+"gemm_q6k_j128.kd",49,201935643,4121135,7.207849702293072
+"gdn_ar_w.kd",96,141330292,1472190,5.0446146504071745
+"gemm_xs_j128.kd",26,136799737,5261528,4.882901943215743
+"gemm_q5k.kd",382,106899299,279841,3.8156418006527364
+"silu_mul.kd",256,79141404,309146,2.824857151446294
+"rms_finish.kd",260,75232720,289356,2.685341381039394
+"gemm_q4k_v4.kd",19,51385984,2704525,1.8341608443856372
+"gemm_xs.kd",140,50676015,361971,1.8088193555367007
+"qsa_flash_wk.kd",16,48389296,3024331,1.7271976734081134
+"gemm_q6k_wm.kd",49,41504534,847031,1.481454381164957
+"gemm_q6k.kd",102,40952319,401493,1.4617437314538917
+"norm_gated_silu.kd",96,40663915,423582,1.4514494978324397
+"gemm_nl_v4.kd",12,40407842,3367320,1.442309280338417
+"gdn_conv_t2.kd",96,39682452,413358,1.416417357457094
+"gemm_q4k.kd",136,36704620,269886,1.310127228702168
+"rms_part.kd",260,36558136,140608,1.304898658648338
+"gemm_q8_j128.kd",108,30871772,285849,1.1019307404758634
+"quant_q8.kd",676,24839103,36744,0.8866018821837062
+"gemm_q3k_v4.kd",6,21405771,3567628,0.764053229224638
+"gemm_q8_0.kd",324,15644112,48284,0.558397746661492
+"axpy_scaled.kd",512,14352216,28031,0.5122850740265099
+"mmq_quant_y.kd",436,14093431,32324,0.5030480549569842
+"qsa_flash_merge.kd",32,9656744,301773,0.344685853034476
+"gdn_ar.kd",96,9417666,98100,0.3361522516081799
+"split3.kd",192,7869873,40988,0.28090564358732
+"gemm_iq3s_v4.kd",2,6702088,3351044,0.23922296370206408
+"qsa_flash.kd",32,6038687,188708,0.21554366355815177
+"qk_norm_rope.kd",64,5971850,93310,0.21315799729639054
+"mmq_quant_y_d4.kd",114,4706756,41287,0.16800198978922276
+"rmsq.kd",256,4599671,17967,0.1641797196149076
+"gemm_nl.kd",12,4550030,379169,0.16240784387392446
+"gdn_conv.kd",96,4093927,42645,0.1461277963106274
+"qsa_flash_split4q4.kd",16,3277466,204841,0.11698520370856802
+"gemm_q3k.kd",6,2802654,467109,0.10003736091072585
+"l2_rows2_scale.kd",96,2417004,25177,0.0862720483765274
+"gatedq.kd",96,2081758,21684,0.07430584594987137
+"l2_rows2_scale_w.kd",96,1629155,16970,0.05815072667354356
+"gdn_beta_g.kd",192,1271504,6622,0.0453848047413029
+"gemm_iq3s.kd",2,777593,388796,0.027755246128367626
+"kv_append_t.kd",64,407038,6359,0.01452873144896945
+"gdn_conv_state.kd",96,188552,1964,0.006730136675607898
+"__amd_rocclr_copyBuffer.kd",115,111046,965,0.0039636533013680825
+"copy_rows.kd",64,78764,1230,0.0028113861699561953

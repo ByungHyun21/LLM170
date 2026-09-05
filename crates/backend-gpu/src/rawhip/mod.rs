@@ -122,6 +122,8 @@ pub struct RawCtx {
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
     /// MMQ 전용 y 버퍼 (size, ptr) — 풀 충돌 격리.
     mmq_y: std::sync::Mutex<(usize, *mut u8)>,
+    /// side-stream MMQ 전용 y 버퍼 (스트림 레이스 격리).
+    mmq_y_s: std::sync::Mutex<(usize, *mut u8)>,
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// q6 정준 재배열 캐시.
@@ -283,6 +285,7 @@ impl RawCtx {
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
             Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
@@ -921,6 +924,118 @@ impl RawCtx {
                 one.as_mut_ptr() as *mut _,
             ];
             ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
+        if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
+            eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
+                (n_out + 127) / 128, (t + 127) / 128, n_in / 256, n_out, n_out);
+        }
+        }
+        Ok(())
+    }
+    pub fn gemm_mmq_s(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let fns = &self.fns;
+        // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
+        let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+            .ok_or("mmq quant 없음")?;
+        let sym = match ty {
+            12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            14 => "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            23 => "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            _ => return Err(format!("MMQ 미지원 타입 {ty}")),
+        };
+        let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
+        // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
+        let w_eff = if ty == 14 {
+            let key = w as usize ^ 0xdeadbeef;
+            let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
+            if let Some(&p2) = c.get(&key) { p2 }
+            else {
+                let blocks2 = n_in / 256;
+                let p2 = self.alloc(n_out * blocks2 * 210)? as *mut u8;
+                let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
+                unsafe {
+                    let mut a1 = w as *mut std::ffi::c_void;
+                    let mut a2 = p2 as *mut std::ffi::c_void;
+                    let mut a3 = blocks2 as i32;
+                    let mut a4 = n_out as i32;
+                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
+                    ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
+                }
+                if std::env::var_os("LLM170_RQ_DUMP").is_some() {
+                    self.sync().ok();
+                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
+                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
+                    eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
+                }
+                c.insert(key, p2);
+                p2
+            }
+        } else { w as *mut u8 };
+        // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
+        // 재작성 위험). MMQ y는 단일 소유로 격리.
+        let yb = {
+            let mut sc = self.mmq_y_s.lock().map_err(|e| e.to_string())?;
+            if sc.0 < (n_in / 128) * t * 144 {
+                if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
+                sc.1 = self.alloc((n_in / 128) * t * 144)? as *mut u8;
+                sc.0 = (n_in / 128) * t * 144;
+            }
+            sc.1
+        };
+        let mut yp = yb as *mut std::ffi::c_void;
+        let mut ysrc = y_f32 as *const std::ffi::c_void;
+        let mut nt = t as i32;
+        let mut ni_a = n_in as i32;
+        unsafe {
+            let mut qargs = vec![
+                &mut ysrc as *mut _ as *mut std::ffi::c_void,
+                &mut yp as *mut _ as *mut std::ffi::c_void,
+                &mut nt as *mut _ as *mut std::ffi::c_void,
+                &mut ni_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream2, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+        }
+        fn fd3(d: u32) -> [u32; 3] {
+            let mut l = 0u32;
+            while l < 32 && (1u32 << l) < d { l += 1; }
+            let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
+            [mp, l, d]
+        }
+        let j: usize = 128;
+        let nbk = (n_in / 256) as u32;
+        let mut bpn = fd3(nbk);
+        let mut one = fd3(1);
+        let z3: [u32; 3] = [0, 0, 0];
+        let mut ax = w_eff as *mut std::ffi::c_void;
+        let mut ay = yb as *mut std::ffi::c_void;
+        let mut aid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut aeb: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut adst = out as *mut std::ffi::c_void;
+        let mut afx: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut ays: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_nrows = n_out as i32;
+        let mut p_ncolsdst = t as i32;
+        let mut p_srow = (n_in / 256) as i32;
+        let mut p_ncolsy = t as i32;
+        let mut p_scol = n_out as i32;
+        let smem: i32 = (j * 4 + 128 * 76 * 4 + ((j * 144 + 1023) / 1024) * 1024) as i32;
+        unsafe {
+            ck(hip::hipFuncSetAttribute(fm as *const _, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem), "mmq smem attr")?;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut ax as *mut _ as *mut _, &mut ay as *mut _ as *mut _,
+                &mut aid as *mut _ as *mut _, &mut aeb as *mut _ as *mut _,
+                &mut adst as *mut _ as *mut _, &mut afx as *mut _ as *mut _,
+                &mut ays as *mut _ as *mut _,
+                bpn.as_mut_ptr() as *mut _, &mut p_nrows as *mut _ as *mut _,
+                &mut p_ncolsdst as *mut _ as *mut _, &mut p_srow as *mut _ as *mut _,
+                &mut p_ncolsy as *mut _ as *mut _, &mut p_scol as *mut _ as *mut _,
+                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+            ];
+            ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
         if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
             eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
                 (n_out + 127) / 128, (t + 127) / 128, n_in / 256, n_out, n_out);
