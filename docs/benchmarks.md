@@ -71,6 +71,7 @@ streaming-server bench (median), ROCm 10.0.0 userspace:
 Both PP and TG against this table are the first performance goal.
 
 - 2026-09-05: f32 kernel family promoted to default (was opt-in) — pp512 305→317 t/s; `LLM170_F32SILU=0` restores the bit-cast variants.
+- 2026-09-05: q6_K prefill routed to MMQ (was j128 tile) — pp512 318→341 t/s; `LLM170_NOQ6MMQ=1` restores.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
