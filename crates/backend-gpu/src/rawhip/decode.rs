@@ -1155,6 +1155,7 @@ impl DecodeState {
         for il in 0..self.n_layer {
             let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
             self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+            self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
 gmark("norm", &mut marks);
             if self.is_recr[il] {
@@ -1470,6 +1471,7 @@ self.axpy(self.xs_t, self.gout_t, n * t)?;
             // FFN 배치
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
+            self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
             self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
 gmark("ffn_quant", &mut marks);
             // 2스트림: gate(사이드) ‖ up(주) — 독립 GEMM, 출력버퍼 분리
@@ -1632,6 +1634,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         // head: 전 행 rms → quant → output 타일 → 행별 argmax
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
+            self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
         let xq_sn = n / 4 + n / 32 + n / 16;
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;

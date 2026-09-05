@@ -127,6 +127,7 @@ pub struct RawCtx {
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
+    mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>,  // (epoch, y_ptr, y_bytes) — 부록81
     /// q6 정준 재배열 캐시.
     canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
@@ -289,6 +290,7 @@ impl RawCtx {
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             ar_cache: std::sync::Mutex::new(None),
+            mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
@@ -617,6 +619,11 @@ impl RawCtx {
         Ok(())
     }
 
+    /// mmq quant_y 캐시 무효화 (y 원본 재기입 직전 호출 — 부록81).
+    pub fn mmq_y_bump(&self) {
+        if let Ok(mut c) = self.mmq_y_cache.lock() { c.0 = c.0.wrapping_add(1); }
+    }
+
     /// AR 청크 버퍼 조기 확보 (DecodeState init에서 호출 — 조각화 회피).
     pub fn ar_chunk_prealloc(&self, npair: usize, d: usize, nc_max: usize, ch: usize) -> Result<(), String> {
         self.ar_chunk_bufs(npair, d, nc_max, ch).map(|_| ())
@@ -924,14 +931,20 @@ impl RawCtx {
         let mut ysrc = y_f32 as *const std::ffi::c_void;
         let mut nt = t as i32;
         let mut ni_a = n_in as i32;
-        unsafe {
-            let mut qargs = vec![
-                &mut ysrc as *mut _ as *mut std::ffi::c_void,
-                &mut yp as *mut _ as *mut std::ffi::c_void,
-                &mut nt as *mut _ as *mut std::ffi::c_void,
-                &mut ni_a as *mut _ as *mut std::ffi::c_void,
-            ];
-            ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+        // 부록81: 동일 에포크·동일 y원본이면 재양자화 스킵 (층당 1회).
+        let y_key = (y_f32 as usize, (n_in / 128) * t * 144);
+        let cached = { self.mmq_y_cache.lock().map(|c| *c == (c.0, y_key.0, y_key.1)).unwrap_or(false) };
+        if !cached {
+            unsafe {
+                let mut qargs = vec![
+                    &mut ysrc as *mut _ as *mut std::ffi::c_void,
+                    &mut yp as *mut _ as *mut std::ffi::c_void,
+                    &mut nt as *mut _ as *mut std::ffi::c_void,
+                    &mut ni_a as *mut _ as *mut std::ffi::c_void,
+                ];
+                ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+            }
+            if let Ok(mut c) = self.mmq_y_cache.lock() { *c = (c.0, y_key.0, y_key.1); }
         }
         fn fd3(d: u32) -> [u32; 3] {
             let mut l = 0u32;
