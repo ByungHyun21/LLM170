@@ -3199,6 +3199,124 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
         s[base_s + ((lane << 2) + j) * d + u] = ssr[j];
 }
 
+// ══ AR 청크 스캔 (세션 3 부록 72) — t 직렬을 ch 청크로 병렬화 ══
+// A: 청크 로컬 스캔 (제로 초기) + L_end(lend)/PG(pgb)/P 접두곱(pbuf) 기록.
+extern "C" __global__ void gdn_ar_chunk_a(float* s, const float* q, const float* k, const float* v,
+                                   const float* beta_ge, float* out, int d, int k_stride,
+                                   int v_stride, int h_v, int h_k, float scale, int t, int ch,
+                                   float* lend, float* pgb, float* pbuf) {
+    int pair = blockIdx.x;
+    int u = blockIdx.y;
+    int c = blockIdx.z;
+    int npair = gridDim.x;
+    int lane = threadIdx.x;
+    int c0 = c * ch;
+    int c1 = min(c0 + ch, t);
+    float ssr[4];
+    float pg[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { ssr[j] = 0.0f; pg[j] = 1.0f; }
+    for (int ti = c0; ti < c1; ti++) {
+        int h = pair % h_v;
+        int kh = h % h_k;
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        float part = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            ssr[j] *= g_exp;
+            pg[j] *= g_exp;
+            part += ssr[j] * k[qk0 + (lane << 2) + j];
+        }
+        float sk = part;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
+            sk += pj;
+        }
+        float delta = (v[v0 + u] - sk) * beta;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            ssr[j] += k[qk0 + (lane << 2) + j] * delta;
+        float op = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            op += ssr[j] * q[qk0 + (lane << 2) + j];
+        float otot = op;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
+            otot += pj;
+        }
+        if (lane == 0) out[v0 + u] = otot * scale;
+        // P 접두곱: pbuf[c][pair][ti-c0][j] — u==0 블록만 기록
+        if (u == 0) {
+            float* pd = pbuf + (((size_t)c * npair + pair) * ch + (ti - c0)) * d;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) pd[(lane << 2) + j] = pg[j];
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        lend[((size_t)c * npair + pair) * d * d + ((lane << 2) + j) * d + u] = ssr[j];
+    if (u == 0) {
+        float* pgs = pgb + ((size_t)c * npair + pair) * d;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) pgs[(lane << 2) + j] = pg[j];
+    }
+    (void)s;
+}
+
+// B: 캐리 전파 — s_start[c] 저장 후 최종 상태 s에 기록.
+// 스레드 (pair, j)당 u열 루프? → 그리드 (npair), 128스레드 = j, u는 내부 128 루프.
+extern "C" __global__ void gdn_ar_chunk_b(float* s, const float* lend, const float* pgb,
+                                          float* sstart, int d, int t, int ch, int npair, int nc) {
+    int pair = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= d) return;
+    // 컬럼 버퍼 (레지스터 대신 로컬 배열 — d=128 가정, 128 f32/스레드는 과함 →
+    // u-블록 재병렬화: 그리드 (npair, 8), 16스레드=j청크? 단순화: 스레드당 u 8개씩.
+    // 여기선 순차 c 루프 × u 128 (컴파일러 언롤) — 병목 아님 (소형).
+    float col[128];
+    for (int u2 = 0; u2 < d; u2++)
+        col[u2] = s[(size_t)pair * d * d + j * d + u2];
+    for (int c = 0; c < nc; c++) {
+        // s_start[c] 기록
+        float* ss = sstart + ((size_t)c * npair + pair) * d * d + j * d;
+        for (int u2 = 0; u2 < d; u2++) ss[u2] = col[u2];
+        float g = pgb[((size_t)c * npair + pair) * d + j];
+        const float* le = lend + ((size_t)c * npair + pair) * d * d + j * d;
+        for (int u2 = 0; u2 < d; u2++) col[u2] = col[u2] * g + le[u2];
+    }
+    // 최종 상태 기록
+    float* sf = s + (size_t)pair * d * d + j * d;
+    for (int u2 = 0; u2 < d; u2++) sf[u2] = col[u2];
+}
+
+// C: 보정 — out[t][u] += scale × Σ_j q[t][j]·P[c][t-c0][j] · s_start[c][j][u]
+// 그리드 (npair, nc*ch) 블록, 128스레드 = u. c≥0 전체 (c=0도 원상태 s0 보정).
+extern "C" __global__ void gdn_ar_chunk_c(float* out, const float* q, const float* pbuf,
+                                          const float* sstart, int d, int k_stride, int v_stride,
+                                          int h_v, int h_k, float scale, int t, int ch, int npair) {
+    int pair = blockIdx.x;
+    int tt = blockIdx.y;          // 전역 타임슬롯 c*ch + r
+    if (tt >= t) return;
+    int u = threadIdx.x;
+    int c = tt / ch;
+    int h = pair % h_v;
+    int kh = h % h_k;
+    int qk0 = tt * k_stride + kh * d;
+    const float* pd = pbuf + (((size_t)c * npair + pair) * ch + (tt - c * ch)) * d;
+    const float* ssc = sstart + ((size_t)c * npair + pair) * d * d;
+    float acc = 0.0f;
+    for (int j = 0; j < d; j++)
+        acc += (q[qk0 + j] * pd[j]) * ssc[j * d + u];
+    int v0 = tt * v_stride + h * d;
+    out[v0 + u] += acc * scale;
+}
+
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
 extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float scale,
                                           int d, int n_group) {
@@ -4308,7 +4426,7 @@ pub const NAMES: &[&str] = &[
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

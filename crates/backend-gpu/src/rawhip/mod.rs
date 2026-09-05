@@ -126,6 +126,7 @@ pub struct RawCtx {
     mmq_y_s: std::sync::Mutex<(usize, *mut u8)>,
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
+    ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
     /// q6 정준 재배열 캐시.
     canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
@@ -287,6 +288,7 @@ impl RawCtx {
             Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ar_cache: std::sync::Mutex::new(None),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
@@ -310,7 +312,11 @@ impl RawCtx {
     /// 영속 디바이스 할당 (해제 없음).
     pub fn alloc(&self, bytes: usize) -> Result<*mut u8, String> {
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe { ck(hip::hipMalloc(&mut p, bytes), "hipMalloc")?; }
+        unsafe {
+            let r = hip::hipMalloc(&mut p, bytes);
+            if r != hip::hipError_t_hipSuccess { eprintln!("alloc {bytes}B → {r:?}"); }
+            ck(r, "hipMalloc")?;
+        }
         Ok(p as *mut u8)
     }
 
@@ -583,6 +589,24 @@ impl RawCtx {
         args_v.push(xw_ptr);
         self.launch3(kern, t as u32, gy, gz, 64, &mut args_v)?;
         Ok(())
+    }
+
+    /// AR 청크 버퍼 조기 확보 (DecodeState init에서 호출 — 조각화 회피).
+    pub fn ar_chunk_prealloc(&self, npair: usize, d: usize, nc_max: usize, ch: usize) -> Result<(), String> {
+        self.ar_chunk_bufs(npair, d, nc_max, ch).map(|_| ())
+    }
+
+    /// AR 청크 스캔 버퍼 (lend/sstart/pgb/pbuf) — b_t_max 기준 1회 할당.
+    pub fn ar_chunk_bufs(&self, npair: usize, d: usize, nc_max: usize, ch: usize) -> Result<(*mut u8, *mut u8, *mut u8, *mut u8), String> {
+        let mut g = self.ar_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(b) = *g { return Ok(b); }
+        let lend = self.alloc(npair * d * d * nc_max)?;
+        let sstart = self.alloc(npair * d * d * nc_max)?;
+        let pgb = self.alloc(npair * d * nc_max)?;
+        let pbuf = self.alloc(npair * ch * d * nc_max)?;
+        let b = (lend, sstart, pgb, pbuf);
+        *g = Some(b);
+        Ok(b)
     }
 
     /// 사이드 스트림판 — 호출자가 side_wait_main 후 발사/ join2로 합류.

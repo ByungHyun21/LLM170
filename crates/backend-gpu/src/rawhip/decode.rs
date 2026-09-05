@@ -1235,6 +1235,38 @@ gmark("betag", &mut marks);
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
                     if std::env::var_os("LLM170_EXACT").is_some() || std::env::var_os("LLM170_AR_T").is_some() {
                         self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, (self.d_state / 64) as u32, 1, 64, &mut args)?;
+                    } else if t >= 128 && self.d_state == 128 && std::env::var_os("LLM170_ARCHUNK").is_some() {
+                        // 청크 스캔 (부록 72): A(로컬)→B(캐리)→C(보정)
+                        const CH: usize = 64;
+                        let npair = self.dt_rank;
+                        let mut d = self.d_state as i32;
+                        let nc = t.div_ceil(CH);
+                        let nc_max = self.b_t_max.div_ceil(CH);
+                        // ffn 버퍼 별칭 (AR은 층 내 ffn 이전 — 라이프타임 무충돌)
+                        let mut sstart = self.fgate_t as *mut u8;
+                        let mut pbuf = self.fup_t as *mut u8;
+                        let mut pgb = self.fglu_t as *mut u8;
+                        let mut lend = (self.fglu_t as *mut u8).wrapping_add(262144);
+                        let _ = nc_max;
+                        let mut chi = CH as i32;
+                        let mut ca: Vec<*mut std::ffi::c_void> = args.clone();
+                        ca.extend([Self::p(&mut chi), Self::p(&mut lend), Self::p(&mut pgb), Self::p(&mut pbuf)].iter().copied());
+                        self.ctx.launch3("gdn_ar_chunk_a", npair as u32, d as u32, nc as u32, 32, &mut ca)?;
+                        let (mut bnp, mut bnc) = (npair as i32, nc as i32);
+                        let mut cb: Vec<*mut std::ffi::c_void> = vec![
+                            Self::p(&mut sp3), Self::p(&mut lend), Self::p(&mut pgb),
+                            Self::p(&mut sstart), Self::p(&mut d), Self::p(&mut tt),
+                            Self::p(&mut chi), Self::p(&mut bnp), Self::p(&mut bnc),
+                        ];
+                        self.ctx.launch3("gdn_ar_chunk_b", npair as u32, 1, 1, d as u32, &mut cb)?;
+                        let mut cc: Vec<*mut std::ffi::c_void> = vec![
+                            Self::p(&mut op), Self::p(&mut qp), Self::p(&mut pbuf),
+                            Self::p(&mut sstart), Self::p(&mut d), Self::p(&mut ks),
+                            Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk),
+                            Self::p(&mut asc), Self::p(&mut tt), Self::p(&mut chi),
+                            Self::p(&mut bnp),
+                        ];
+                        self.ctx.launch3("gdn_ar_chunk_c", npair as u32, t as u32, 1, d as u32, &mut cc)?;
                     } else {
                         self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
                     }
