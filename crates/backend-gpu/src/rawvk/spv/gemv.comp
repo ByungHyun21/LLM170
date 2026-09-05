@@ -42,6 +42,7 @@ uint WG(uint idx) {
     return w7c[o];
 }
 
+
 // kvalues_iq4nl (xs·nl 공용 LUT)
 int KVAL(int nib) {
     const int kv[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
