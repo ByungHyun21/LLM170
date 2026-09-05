@@ -1304,7 +1304,12 @@ gmark("betag", &mut marks);
                         // 부록82: smem 스테이징 AR (k/q 128중 재독 제거)
                         self.ctx.launch3("gdn_ar_sm", self.dt_rank as u32, 2, 1, 64, &mut args)?;
                     } else {
-                        self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                        // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
+                        if std::env::var_os("LLM170_NO_ARSWAP").is_none() {
+                            self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
+                        } else {
+                            self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                        }
                     }
                 }
 gmark("ar", &mut marks);
