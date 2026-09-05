@@ -420,3 +420,7 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   on RDNA3.5 (prefill uses dequant + hipBLAS MFMA instead), so our exclusion
   of MMQ-q6 costs nothing relative to their path. The actual q6 lever is a
   dequant->fp16 MFMA GEMM path (~3-4% potential).
+- Closing win: MMQ extended to the side-stream GEMMs (gate/up/gz) with a
+  dedicated y buffer per stream (the shared buffer was a cross-stream race).
+  Interleaved A/B: 300-303 vs 274-281 on/off. Session final: pp512
+  250 -> ~301 (+20%, llama.cpp ratio 0.85x), tg8 0.95x.
