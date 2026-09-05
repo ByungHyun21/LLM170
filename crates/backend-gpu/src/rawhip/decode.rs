@@ -558,7 +558,10 @@ impl DecodeState {
                     let mut hk = self.n_group as i32;
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc)];
-                    self.ctx.launch("gdn_ar", n_pairs as u32, 1, 128, &mut args)?;
+                    // 전치 레이아웃(부록77)에서는 _w(레인=j)가 코얼레스 — t=1도 포함
+                    let mut t1 = 1i32;
+                    args.push(Self::p(&mut t1));
+                    self.ctx.launch3("gdn_ar_w", n_pairs as u32, self.d_state as u32, 1, 32, &mut args)?;
                 }
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
                     self.ctx.sync()?;
