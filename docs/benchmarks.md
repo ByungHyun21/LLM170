@@ -395,3 +395,11 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   the first-chunk flash path (kept on the legacy kernel for bit-stability),
   and small fused kernels. Final: pp512 265-272 t/s (0.75x), tg8 10.3-10.4
   (0.95x).
+- Session 3 final win: recovered the true (double-buffer) sources of the three
+  embedded code objects — an earlier -5.5% verdict against a kernel patch was
+  actually source drift (the /tmp sources had been left in a slower
+  single-buffer experimental state). Re-applied the token-quadrant z-grid to
+  the true sources (neutral at gz=1, interleaved A/B), made 512-token prefill
+  chunks the default: pp512 272 -> 277.5 (+2%), bit-identical output streams
+  verified with both 19- and 600-token gates. Canonical sources preserved in
+  plans/i8_arc/co_src.
