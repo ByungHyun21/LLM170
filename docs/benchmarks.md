@@ -387,3 +387,11 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   GEMV overlap (-2%), q8 flash multiplexing (neutral).
 - pp512 250 -> 272-274 t/s (llama.cpp ROCm same model: 347-366,
   ratio 0.75x). tg8 unchanged 10.3-10.4 (0.95x).
+- Session 3 addendum: cross-checked both engines under rocprof in the same
+  measurement window. GEMM tile totals are at parity (~600ms vs 663ms for the
+  same p128 workload); the AR recurrent kernel is at parity in isolated
+  harnesses (577us ours vs 560us for a faithful re-implementation of the
+  llama kernel body). The remaining prefill gap concentrates in launch gaps,
+  the first-chunk flash path (kept on the legacy kernel for bit-stability),
+  and small fused kernels. Final: pp512 265-272 t/s (0.75x), tg8 10.3-10.4
+  (0.95x).
