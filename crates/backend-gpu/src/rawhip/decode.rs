@@ -426,7 +426,7 @@ impl DecodeState {
         let mut ep = self.eps;
         let mut na = n as i32;
         let mut args = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut na)];
-        self.ctx.launch("rmsq", 1, 1, 32, &mut args)
+        self.ctx.launch("rmsq", 1, 1, 256, &mut args)
     }
     fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
         let mut yp = y as *mut std::ffi::c_void;
