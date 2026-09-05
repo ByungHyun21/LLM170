@@ -308,7 +308,7 @@ hash-verified earlier), -fa 1, -ngl 99, 2 reps, non-coexisting runs.
 
 | test | llama.cpp ROCm | llama.cpp Vulkan | LLM170 HIP (tuned CO env) | LLM170 HIP (zero-config) |
 |---|---|---|---|---|
-| pp512 | **361.8** | **349.9** | 236.9¹ | 236.9² |
+| pp512 | **361.8** | **349.9** | 238⁵ | 238⁵ |
 | pp64  | 274.4 | 221.5 | 172.6 | 172.6 |
 | tg8   | 10.92 | 11.82 | 10.34⁴ | 10.34⁴ |
 | tg32  | 11.70 | 12.02 | 10.40 | 10.40 |
@@ -354,6 +354,13 @@ fusing rms+quant (rmsq) and silu_mul+quant (silu_mulq) — both preserve
 the mirror arithmetic order bit-exactly — plus stream2 overlap of the
 independent in_proj GEMV pairs (qkv‖gate, beta‖alpha, gate‖up; the
 pairs are bandwidth-bound so only latency tails hide).
+
+⁵ 2026-09-05 (final): pp512 232→238 — segment flash now default in prefill
+(np>128, kill switch LLM170_NO_QSA_SPLIT, threshold LLM170_QSA_TH). Kernel-level
+prefill trace (KTRACE on step_batch) shows tile GEMMs streaming at DRAM parity
+(~43GB/s aggregate weights) — the remaining pp gap to llama is tile-kernel MFU
+(~10 vs ~13 effective TFLOPS) plus ~74ms/chunk of non-GEMM (quant_q8 21ms,
+gdn_ar 20ms, qk_rope 12ms).
 
 ² 2026-09-05 (later the same day): two defaults landed — (a) the three
 offline tile code objects are now `include_bytes!`-embedded and loaded
