@@ -2896,9 +2896,10 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
 // GDN conv1d + ring shift + silu (t=1)
 extern "C" __global__ void gdn_conv(const float* qkv, const float* cw, float* state,
                                     float* out, int ch, int k) {
-    int c = blockIdx.x;
-    int u = threadIdx.x;
-    if (u != 0) return;
+    // 병렬화 (부록78): 채널=스레드 — 구형 블록당 1스레드(1/64 활용) 폐지.
+    // 채널별 산술·순서 동일 (비트불변).
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
     int xb = c; // t=0
     float sum = cw[c * k + (k - 1)] * qkv[xb];
     for (int j = 0; j < k - 1; j++) sum += cw[c * k + j] * state[j * ch + c];
