@@ -2852,6 +2852,25 @@ extern "C" __global__ void gdn_conv_t2(const float* qkv, const float* cw, float*
     float oc = sum / (1.0f + exp_cr(-sum));
     out[(size_t)ti * ch + c] = oc;
 }
+extern "C" __global__ void gdn_conv_t2_f32(const float* qkv, const float* cw, float* state,
+                                       float* out, int ch, int k, int t) {
+    // 완전 병렬 (c × t): 인과 conv는 이전 '입력'만 참조(출력 아님) — 청크 내
+    // 의존 없음. 가중 합 순서/식은 구형과 원소별 동일열 (비트무영향).
+    // 상태 갱신: ti ∈ [t-(k-1), t) 각자 자기 슬롯만 기입 (경합 없음).
+    // 전제 t >= k-1 (짧은 꼬리 청크는 구형 순차 커널 사용).
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (c >= ch || ti >= t) return;
+    const float* row = qkv + (size_t)ti * ch;
+    float sum = cw[c * k + (k - 1)] * row[c];
+    for (int j = 0; j < k - 1; j++) {
+        int pos = ti - (k - 1) + j;
+        float xv = pos >= 0 ? qkv[(size_t)pos * ch + c] : state[(pos + (k - 1)) * ch + c];
+        sum += cw[c * k + j] * xv;
+    }
+    float oc = sum / (1.0f + __expf(-sum));
+    out[(size_t)ti * ch + c] = oc;
+}
 
 // conv 상태 갱신 (conv_t2 이후 별도 런치 — 읽기/쓰기 경합 제거)
 extern "C" __global__ void gdn_conv_state(const float* qkv, float* state, int ch, int k, int t) {
@@ -2889,6 +2908,18 @@ extern "C" __global__ void gdn_beta_g(const float* b, const float* a, const floa
     float x = fminf(a[h] + dtb[h0], 80.0f);
     float sp = log1p_cr(exp_cr(x));
     bg[h * 2 + 1] = exp_cr(sp * sa[h0]);
+}
+extern "C" __global__ void gdn_beta_g_f32(const float* b, const float* a, const float* dtb,
+                                      const float* sa, float* bg, int n_h, int dt_rank) {
+    // n_h = t·dt_rank (배치) — dtb/sa는 토큰 공유 [dt_rank].
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= n_h) return;
+    int h0 = h % dt_rank;
+    float bv = b[h];
+    bg[h * 2] = 1.0f / (1.0f + __expf(-bv));
+    float x = fminf(a[h] + dtb[h0], 80.0f);
+    float sp = log1p_cr(__expf(x));
+    bg[h * 2 + 1] = __expf(sp * sa[h0]);
 }
 // norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
 extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
@@ -4276,8 +4307,8 @@ pub const NAMES: &[&str] = &[
     "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
-    "gdn_conv", "gdn_beta_g", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
+    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_t", "gdn_ar_w", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 
