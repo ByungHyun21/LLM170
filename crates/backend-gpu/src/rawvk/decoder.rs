@@ -920,6 +920,7 @@ impl DecoderState {
         let k_len = self.k_len;
         let v_len = self.v_len;
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
+        let vk_t0 = std::time::Instant::now();
         if !noba { self.ctx.begin_batch()?; };
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
@@ -1007,6 +1008,7 @@ impl DecoderState {
                 }
                 if std::env::var_os("LLM170_VKD_TRACE").is_some() && il < 2 {
                     self.ctx.end_batch_wait().ok();
+        if std::env::var_os("LLM170_VK_PROF").is_some() { eprintln!("[vkprof] layers+head: {:.1}ms (pos {})", vk_t0.elapsed().as_secs_f32()*1e3, pos); }
                     self.ctx.begin_batch().ok();
                     let mut v = vec![0f32; n];
                     unsafe { std::ptr::copy_nonoverlapping(self.b_gout.ptr as *const f32, v.as_mut_ptr(), n) };
