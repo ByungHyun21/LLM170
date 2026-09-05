@@ -424,3 +424,8 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   dedicated y buffer per stream (the shared buffer was a cross-stream race).
   Interleaved A/B: 300-303 vs 274-281 on/off. Session final: pp512
   250 -> ~301 (+20%, llama.cpp ratio 0.85x), tg8 0.95x.
+- Opt-in profile (LLM170_F32SILU): __expf replaces the f64-accurate exp
+  in 4 elementwise kernels (silu_mul, norm_gated_silu, gdn_conv_t2,
+  gdn_beta_g) — pp512 318-320 (+5% over default) at 1e-7-level numeric
+  drift (flips argmax on one sensitive prompt). Default keeps the exact
+  CPU-mirror bit contract.
