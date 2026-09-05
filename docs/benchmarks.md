@@ -374,3 +374,16 @@ automatically (zero-config == tuned, was 108.5 pp512); (b) the fused
 flash-attention kernel is the default path (was opt-in via
 LLM170_QSA_FLASH; kill switch LLM170_NO_FLASH). Stream 41/41 bit-exact
 across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
+
+## 2026-09-05 session 3 — flash attention rewrite (+9% pp512)
+- Replaced the split flash-attention kernel with a warp-per-query design
+  (no __syncthreads or shared-memory round trips inside the key loop,
+  32 queries per block, generic head-dim via per-lane dim slicing).
+  Kernel verified bit-exact against the previous kernel on synthetic
+  inputs (maxabs = 0) and within 1.2e-6 on real activations.
+- Small GEMV latency fix: quantized tile path restricted to n_out >= 128
+  (48-output projections were running on a single CU).
+- Negative results recorded: 4-column AR blocking (-3%), side-stream
+  GEMV overlap (-2%), q8 flash multiplexing (neutral).
+- pp512 250 -> 272-274 t/s (llama.cpp ROCm same model: 347-366,
+  ratio 0.75x). tg8 unchanged 10.3-10.4 (0.95x).
