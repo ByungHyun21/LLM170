@@ -802,7 +802,13 @@ impl DecodeState {
             self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+            if std::env::var_os("LLM170_Q1MMQ").is_some() && matches!(tg | tu, 12 | 13 | 14 | 23)
+                && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
+                // 실험(부록 74): 디코드 GEMV를 mmq 타일로 — f32 직행, 별도 quant 불요.
+                self.rms(self.xs, pw, self.xn, n)?;
+                self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
+                self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
+            } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                 self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
                 self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
@@ -2634,7 +2640,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         if std::env::var_os("LLM170_NO_MMQ").is_none() {
-            if (matches!(ty, 12 | 13 | 14 | 23) && std::env::var("LLM170_NOQ6MMQ").is_err()) && t >= 32
+            if (matches!(ty, 12 | 13 | 14 | 23) && std::env::var("LLM170_NOQ6MMQ").is_err()) && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
                 && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                 return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
