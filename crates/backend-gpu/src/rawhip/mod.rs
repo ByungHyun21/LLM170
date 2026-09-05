@@ -120,6 +120,8 @@ pub struct RawCtx {
     stream2: hip::hipStream_t,
     /// 크기별 스크래치 풀 — 해제 없는 재사용 (호출마다 신규 할당이
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
+    /// MMQ 전용 y 버퍼 (size, ptr) — 풀 충돌 격리.
+    mmq_y: std::sync::Mutex<(usize, *mut u8)>,
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
     cursors: std::sync::Mutex<HashMap<usize, usize>>,
     /// D2H 핀 스테이징 (필요시 성장, 해제 없음 — ADR-0014).
@@ -273,7 +275,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
-            Ok(RawCtx { module, fns, stream, stream2, scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
+            Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
 
@@ -745,7 +747,17 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
-        let yb = self.scratch((n_in / 128) * t * 144)?;
+        // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
+        // 재작성 위험). MMQ y는 단일 소유로 격리.
+        let yb = {
+            let mut sc = self.mmq_y.lock().map_err(|e| e.to_string())?;
+            if sc.0 < (n_in / 128) * t * 144 {
+                if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
+                sc.1 = self.alloc((n_in / 128) * t * 144)? as *mut u8;
+                sc.0 = (n_in / 128) * t * 144;
+            }
+            sc.1
+        };
         let mut yp = yb as *mut std::ffi::c_void;
         let mut ysrc = y_f32 as *const std::ffi::c_void;
         let mut nt = t as i32;
