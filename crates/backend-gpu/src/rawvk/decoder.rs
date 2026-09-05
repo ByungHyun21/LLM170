@@ -1137,6 +1137,7 @@ impl DecoderState {
     /// 아니면 마지막 행만 (b_lg). emb는 [t][n_embd].
     pub fn step_batch(&mut self, seq: usize, pos0: usize, emb: &[f32], all_logits: bool) -> Result<Vec<f32>, String> {
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
+        let vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
         let t = emb.len() / n;
         if t == 0 || emb.len() != t * n || t > T_MAX {
