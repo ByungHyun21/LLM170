@@ -720,7 +720,9 @@ impl RawCtx {
     /// 하니스 검증: q4_K maxrel 6e-4, q5_K maxrel 1.5e-3 (plans/27 부록5·14).
     pub fn gemm_mmq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let fns = &self.fns;
-        let fq = *fns.get("mmq_quant_y").ok_or("mmq_quant_y 없음")?;
+        // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
+        let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+            .ok_or("mmq quant 없음")?;
         let sym = match ty {
             12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
             13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
