@@ -39,6 +39,12 @@ fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     }
 }
 
+static AOUT_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn aout_dumped() -> bool {
+    let r = AOUT_DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst);
+    !r
+}
+
 pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
 pub fn ktrace_dump() -> String {
     let mut g = KTRACE.lock().unwrap();

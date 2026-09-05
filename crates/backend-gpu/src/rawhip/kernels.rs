@@ -3683,47 +3683,49 @@ extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const f
                                         const unsigned* mask, float* part,
                                         int n_past, int n_head, int n_kv,
                                         int hd, int t_len, int sstride, int pos0, int seg) {
+    // 워프퍼쿼리 flash (llama fattn-tile 구조 차용): 블록 32쿼리(워프당 4),
+    // 키 루프 내 sync/shared 왕복 없음. hd=32의 배수 전제 (레인당 hd/32 dim).
+    // 원본 qsa_flash와 동일 의미: 마스크 꺼진 키는 완전 스킵.
     int q0 = blockIdx.x * 32;
     int h = blockIdx.y;
     int sg = blockIdx.z;
     if (q0 >= t_len || h >= n_head) return;
     int nq = min(32, t_len - q0);
     int lane = threadIdx.x & 31;
-    int w = threadIdx.x >> 5;              // 워프 0..7 — 쿼리 4개씩
-    int qr = w * 4;                        // 이 워프의 첫 쿼리(블록 내)
+    int w = threadIdx.x >> 5;
+    int qr = w * 4;
     if (qr >= nq) return;
     int nqw = min(4, nq - qr);
+    const int dpl = hd >> 5;              // 레인당 dim 수 (hd=256 → 8)
     int kvh = h / (n_head / n_kv);
     int qb0 = (q0 + qr) * n_head * 2 * hd + h * 2 * hd;
-    // 레인당 4 kdim (hd=128 전제)
-    float qv[4][4];
+    float qv[4][8];
     #pragma unroll
-    for (int r = 0; r < 4; r++)
+    for (int r = 0; r < 4; r++) {
         #pragma unroll
-        for (int j = 0; j < 4; j++)
-            qv[r][j] = (r < nqw) ? q[qb0 + r * n_head * 2 * hd + ((lane << 2) + j)] : 0.0f;
+        for (int j = 0; j < 8; j++)
+            qv[r][j] = (j < dpl && r < nqw) ? q[qb0 + r * n_head * 2 * hd + lane * dpl + j] : 0.0f;
+    }
     float m[4] = {-3.4028235e38f, -3.4028235e38f, -3.4028235e38f, -3.4028235e38f};
     float s[4] = {0, 0, 0, 0};
-    float acc[4][4] = {};
+    float acc[4][8] = {};
     int p0 = sg * seg;
     int p1 = min(p0 + seg, n_past);
-    int kq0 = (q0 + qr) * sstride;         // mask 행 기준
+    int kq0 = (pos0 + q0 + qr) * sstride;
     int kb0 = kvh * hd;
     for (int k = p0; k < p1; k++) {
-        // k 로드 (레인 4 dim)
-        float kv[4];
+        float kv[8];
         #pragma unroll
-        for (int j = 0; j < 4; j++)
-            kv[j] = ck[(size_t)k * n_kv * hd + kb0 + ((lane << 2) + j)];
+        for (int j = 0; j < 8; j++)
+            kv[j] = (j < dpl) ? ck[(size_t)k * n_kv * hd + kb0 + lane * dpl + j] : 0.0f;
         float part_[4];
         #pragma unroll
         for (int r = 0; r < 4; r++) {
             float p_ = 0.0f;
             #pragma unroll
-            for (int j = 0; j < 4; j++) p_ = fmaf(qv[r][j], kv[j], p_);
+            for (int j = 0; j < 8; j++) p_ = fmaf(qv[r][j], kv[j], p_);
             part_[r] = p_;
         }
-        // 4-값 동시 나비 (5단계)
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             float a0 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[0], (lane ^ off) & 31);
@@ -3732,30 +3734,27 @@ extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const f
             float a3 = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part_[3], (lane ^ off) & 31);
             part_[0] += a0; part_[1] += a1; part_[2] += a2; part_[3] += a3;
         }
-        // v 로드
-        float vv[4];
+        float vv[8];
         #pragma unroll
-        for (int j = 0; j < 4; j++)
-            vv[j] = cv[(size_t)k * n_kv * hd + kb0 + ((lane << 2) + j)];
+        for (int j = 0; j < 8; j++)
+            vv[j] = (j < dpl) ? cv[(size_t)k * n_kv * hd + kb0 + lane * dpl + j] : 0.0f;
         #pragma unroll
         for (int r = 0; r < 4; r++) {
-            if (r < nqw) {
-                // split4q4 의미 재현: 마스크 꺼진 키는 ds=0 기여
-                float ds = (mask[kq0 + r * sstride + k] != 0u) ? part_[r] : 0.0f;
+            if (r < nqw && mask[kq0 + r * sstride + k] != 0u) {
+                float ds = part_[r];
                 float gm = fmaxf(m[r], ds);
                 float e_m = __expf(m[r] - gm);
                 float e_d = __expf(ds - gm);
                 s[r] = s[r] * e_m + e_d;
                 m[r] = gm;
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
-                    acc[r][j] = acc[r][j] * e_m + e_d * vv[j];
+                for (int j = 0; j < 8; j++)
+                    acc[r][j] = acc[r][j] * e_m + ((j < dpl) ? e_d * vv[j] : 0.0f);
             }
         }
     }
-    // part 기록: [(t·n_head+h)·nseg+sg]·(hd+2)
+    int nseg = (n_past + seg - 1) / seg;
     if (lane == 0) {
-        int nseg = (n_past + seg - 1) / seg;
         #pragma unroll
         for (int r = 0; r < 4; r++) {
             if (r < nqw) {
@@ -3768,13 +3767,14 @@ extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const f
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         if (r < nqw) {
-            int nseg = (n_past + seg - 1) / seg;
             float* pp2 = part + ((size_t)((q0 + qr + r) * n_head + h) * nseg + sg) * (hd + 2);
             #pragma unroll
-            for (int j = 0; j < 4; j++) pp2[(lane << 2) + j] = acc[r][j];
+            for (int j = 0; j < 8; j++)
+                if (j < dpl) pp2[lane * dpl + j] = acc[r][j];
         }
     }
 }
+
 
 extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, float* out,
                                            int n_past, int n_head, int hd, int t_len, int seg) {
