@@ -905,14 +905,15 @@ impl RawCtx {
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
         let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
+        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let sym = match ty {
-            12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            14 => "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            23 => "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            12 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type12ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
+            13 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type13ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
+            14 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type14ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
+            23 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type23ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
-        let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
+        let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
         // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
         let w_eff = if ty == 14 {
             let key = w as usize ^ 0xdeadbeef;
@@ -976,7 +977,7 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = 128;
+        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let nbk = (n_in / 256) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
@@ -1023,6 +1024,7 @@ impl RawCtx {
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
         let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
+        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let sym = match ty {
             12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
             13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
@@ -1030,7 +1032,7 @@ impl RawCtx {
             23 => "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
-        let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
+        let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
         // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
         let w_eff = if ty == 14 {
             let key = w as usize ^ 0xdeadbeef;
@@ -1088,7 +1090,7 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = 128;
+        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let nbk = (n_in / 256) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
