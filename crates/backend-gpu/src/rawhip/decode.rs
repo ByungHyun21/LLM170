@@ -829,7 +829,13 @@ impl DecodeState {
                 self.quant(self.fglu, self.xq_f, self.n_ff)?;
             }
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
+            if std::env::var_os("LLM170_DOWN_PROF").is_some() { self.ctx.sync()?; }
+            let __td = std::time::Instant::now();
             self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
+            if std::env::var_os("LLM170_DOWN_PROF").is_some() {
+                self.ctx.sync()?;
+                eprintln!("# down ty={td} no={nod} {:.3}ms", __td.elapsed().as_secs_f64() * 1e3);
+            }
             self.axpy(self.xs, self.fdown, n)?;
             if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
                 self.ctx.sync()?;
