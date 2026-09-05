@@ -912,8 +912,10 @@ impl Engine {
                 let n = self.model.hp.n_embd as usize;
                 let mut pos = self.seqs[seq].pos as usize;
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
+                // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,
+                // 장문600 게이트 chunk128과 비트동일 검증)
                 let ch_sz = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse().ok())
-                    .unwrap_or(if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() { 128 } else { 64 });
+                    .unwrap_or(if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() { 512 } else { 64 });
                 for ch in cache.chunks(ch_sz) {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
