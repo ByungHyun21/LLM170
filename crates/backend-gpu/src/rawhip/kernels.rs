@@ -2660,6 +2660,13 @@ extern "C" __global__ void argmax64(const float* x, int n, int2* out) {
 }
 
 // ─── ew 계열 (큐브cl ew.rs 산술 이식) ───
+extern "C" __global__ void silu_mul_f32(const float* g, const float* u, float* out, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float v = g[j];
+    out[j] = (v / (1.0f + __expf(-v))) * u[j];
+}
+
 extern "C" __global__ void silu_mul(const float* g, const float* u, float* out, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
@@ -4230,7 +4237,7 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
+    "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "norm_gated_silu", "gdn_ar", "l2_rows2_scale", "split3",

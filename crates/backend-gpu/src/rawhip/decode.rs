@@ -1441,7 +1441,7 @@ gmark("ffn_up", &mut marks);
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
+                self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
             }
 gmark("ffn_silu", &mut marks);
             if std::env::var_os("LLM170_DUMP_XQN").is_some() && il == 0 {
@@ -2104,7 +2104,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
+                self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
             }
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
@@ -2408,7 +2408,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l("silu_mul", self.n_ff * t, &mut args)?;
+                self.ew_l(if std::env::var_os("LLM170_F32SILU").is_some() { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
             }
             self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
