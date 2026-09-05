@@ -17,6 +17,7 @@ pub mod vit;
 pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
 pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
 pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
+pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
 static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn co_loaded(bit: u8) -> bool {
@@ -211,6 +212,14 @@ impl RawCtx {
                         "LLM170_CO3_PATH",
                         include_bytes!("co/odd_all.co"),
                         &["gemm_nl_v4", "gemm_q3k_v4", "gemm_iq3s_v4"],
+                    ),
+                    (
+                        CO_MMQ,
+                        "LLM170_CO4_PATH",
+                        include_bytes!("co/mmq.co"),
+                        &["mmq_quant_y",
+                          "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                          "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
                     ),
                     (
                         CO_J128,
@@ -703,6 +712,76 @@ impl RawCtx {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
+    }
+
+    /// llama MMQ (mul_mat_q<q4_K/q5_K,128>) — f32 활성 직양자화 + 원형 런치.
+    /// 하니스 검증: q4_K maxrel 6e-4, q5_K maxrel 1.5e-3 (plans/27 부록5·14).
+    pub fn gemm_mmq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let fns = &self.fns;
+        let fq = *fns.get("mmq_quant_y").ok_or("mmq_quant_y 없음")?;
+        let sym = match ty {
+            12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            _ => return Err(format!("MMQ 미지원 타입 {ty}")),
+        };
+        let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
+        let yb = self.scratch((n_in / 128) * t * 144)?;
+        let mut yp = yb as *mut std::ffi::c_void;
+        let mut ysrc = y_f32 as *const std::ffi::c_void;
+        let mut nt = t as i32;
+        let mut ni_a = n_in as i32;
+        unsafe {
+            let mut qargs = vec![
+                &mut ysrc as *mut _ as *mut std::ffi::c_void,
+                &mut yp as *mut _ as *mut std::ffi::c_void,
+                &mut nt as *mut _ as *mut std::ffi::c_void,
+                &mut ni_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+        }
+        fn fd3(d: u32) -> [u32; 3] {
+            let mut l = 0u32;
+            while l < 32 && (1u32 << l) < d { l += 1; }
+            let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
+            [mp, l, d]
+        }
+        let j: usize = 128;
+        let nbk = (n_in / 256) as u32;
+        let mut bpn = fd3(nbk);
+        let mut one = fd3(1);
+        let z3: [u32; 3] = [0, 0, 0];
+        let mut ax = w as *mut std::ffi::c_void;
+        let mut ay = yb as *mut std::ffi::c_void;
+        let mut aid: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut aeb: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut adst = out as *mut std::ffi::c_void;
+        let mut afx: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut ays: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut p_nrows = n_out as i32;
+        let mut p_ncolsdst = t as i32;
+        let mut p_srow = (n_in / 256) as i32;
+        let mut p_ncolsy = t as i32;
+        let mut p_scol = n_out as i32;
+        let smem: i32 = (j * 4 + 128 * 76 * 4 + ((j * 144 + 1023) / 1024) * 1024) as i32;
+        unsafe {
+            ck(hip::hipFuncSetAttribute(fm as *const _, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem), "mmq smem attr")?;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut ax as *mut _ as *mut _, &mut ay as *mut _ as *mut _,
+                &mut aid as *mut _ as *mut _, &mut aeb as *mut _ as *mut _,
+                &mut adst as *mut _ as *mut _, &mut afx as *mut _ as *mut _,
+                &mut ays as *mut _ as *mut _,
+                bpn.as_mut_ptr() as *mut _, &mut p_nrows as *mut _ as *mut _,
+                &mut p_ncolsdst as *mut _ as *mut _, &mut p_srow as *mut _ as *mut _,
+                &mut p_ncolsy as *mut _ as *mut _, &mut p_scol as *mut _ as *mut _,
+                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+            ];
+            ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
+        }
+        Ok(())
     }
 
     /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
