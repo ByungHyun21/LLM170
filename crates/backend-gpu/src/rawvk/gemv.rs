@@ -812,7 +812,14 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         t as u32,                                 // padded_n (f16 B — 비양자화 경로)
     ];
     let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let (dx, dy) = if sp == "mini" { (32u32, 16u32) } else { (128, 128) };
+    // 그리드 분모 = 스펙의 BM/BN에 정합 (부록87 그리드-스펙 매칭)
+    let (dx, dy) = match sp.as_str() {
+        "m" | "m32" => (64u32, 64),
+        "s" => (32, 32),
+        "c" | "cc" => (64, 32),
+        "mini" => (32, 16),
+        _ => (128, 128),
+    };
     let gx = (n_out as u32).div_ceil(dx);
     let gy = (t as u32).div_ceil(dy);
     ctxg.begin_batch()?;
