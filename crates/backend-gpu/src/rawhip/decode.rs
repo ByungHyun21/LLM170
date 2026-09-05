@@ -474,7 +474,7 @@ impl DecodeState {
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
-                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var_os("LLM170_DUAL").is_some() {
+                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
                 } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                     self.ctx.side_wait_main()?;
