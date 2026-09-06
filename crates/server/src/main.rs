@@ -997,6 +997,11 @@ fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
     s.split(',').map(|t| t.trim().parse::<u32>()).collect()
 }
 
+/// &str → Option<Vec<u32>> (vl 플래그 파싱용).
+fn parse_ids_ref(s: &str) -> Option<Vec<u32>> {
+    parse_ids(s).ok()
+}
+
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
@@ -1295,10 +1300,14 @@ fn raw_names(eng: &llm170_core::model::Engine) -> (Vec<String>, Vec<String>) {
     (wnames, cnames)
 }
 
+/// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
+/// (plans/28: 단계 타이밍 계측 추가 — 공존 지연 RCA용)
 fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     let hp = eng.model.hp.clone();
     let (wnames, cnames): (Vec<String>, Vec<String>) = crate::raw_names(eng);
     let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
+    let t1 = std::time::Instant::now();
     let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
         .iter()
         .filter_map(|k| eng.model.wchk(k).ok().map(|w| (k.clone(), w)))
@@ -1306,12 +1315,22 @@ fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     if weights.len() != wnames.len() {
         return Err(format!("rawhip: 가중치 누락 {}/{}", weights.len(), wnames.len()));
     }
+    eprintln!(
+        "# inject: names+weights {:.1?} ({} tensors, {:.2}GB)",
+        t1.elapsed(),
+        weights.len(),
+        weights.iter().map(|(_, w)| w.data.len()).sum::<usize>() as f64 / (1 << 30) as f64
+    );
     let consts = crate::raw_consts(eng, &cnames);
+    eprintln!("# inject: consts @+{:.1?}", t0.elapsed());
     let rd: std::sync::Arc<llm170_backend_gpu::rawhip::decode::RawDecoder> =
         std::sync::Arc::new(llm170_backend_gpu::rawhip::decode::RawDecoder::new());
     use llm170_core::matmul::RawDecode;
-    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
-        .map_err(|e| format!("raw_init: {e}"))?;
+    let r = rd
+        .raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
+        .map_err(|e| format!("raw_init: {e}"));
+    eprintln!("# inject: raw_init @+{:.1?}", t0.elapsed());
+    r?;
     eng.raw_decode = Some(rd);
     Ok(())
 }
@@ -1325,6 +1344,10 @@ fn cmd_vl(args: &[String]) -> ExitCode {
     let mut ctx = 4096usize;
     let mut backend = "gpu".to_string();
     let mut spec_k = 0usize;
+    // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
+    // vision_end 뒤 — 기본(미지정)은 기존 하드코딩 프롬프트와 동일.
+    let mut prefix_ids: Vec<u32> = Vec::new();
+    let mut question_ids: Option<Vec<u32>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1339,6 +1362,14 @@ fn cmd_vl(args: &[String]) -> ExitCode {
             "--ctx" => ctx = it.next().and_then(|v| v.parse().ok()).unwrap_or(4096),
             "--backend" => backend = it.next().cloned().unwrap_or_else(|| "gpu".into()),
             "--spec" => spec_k = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--prefix-tokens" => match it.next().map(String::as_str).and_then(parse_ids_ref) {
+                Some(v) => prefix_ids = v,
+                None => return usage_err("--prefix-tokens requires comma-separated ids"),
+            },
+            "--question-tokens" => match it.next().map(String::as_str).and_then(parse_ids_ref) {
+                Some(v) => question_ids = Some(v),
+                None => return usage_err("--question-tokens requires comma-separated ids"),
+            },
             _ => {}
         }
     }
@@ -1353,8 +1384,17 @@ fn cmd_vl(args: &[String]) -> ExitCode {
         eprintln!("usage: at least one --image required");
         return ExitCode::from(2);
     }
-    // qwen3.8 VL 템플릿 토큰 (서버 /tokenize 확정): <|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe this image in one short sentence.<|im_end|>\n<|im_start|>assistant\n
-    let prompt: Vec<u32> = vec![248045, 846, 198, 248053, 248056, 248054, 72240, 411, 2099, 303, 799, 2716, 11316, 13, 248046, 198, 248045, 74455, 198];
+    // qwen3.8 VL 템플릿 (서버 /tokenize 확정):
+    // <|im_start|>user\n [prefix] <|vision_start|><|image_pad|><|vision_end|> [question]
+    // <|im_end|>\n<|im_start|>assistant\n — prefix/question 미지정 시 기존 프롬프트 동일.
+    let question: Vec<u32> = question_ids
+        .unwrap_or_else(|| vec![72240, 411, 2099, 303, 799, 2716, 11316, 13]);
+    let mut prompt: Vec<u32> = Vec::with_capacity(prefix_ids.len() + question.len() + 12);
+    prompt.extend_from_slice(&[248045, 846, 198]);
+    prompt.extend_from_slice(&prefix_ids);
+    prompt.extend_from_slice(&[248053, 248056, 248054]);
+    prompt.extend_from_slice(&question);
+    prompt.extend_from_slice(&[248046, 198, 248045, 74455, 198]);
     // 1) 이미지 → 스마트리사이즈·정규화 → CLIP 인코딩 (이미지별 = 시퀀스별)
     let t0 = std::time::Instant::now();
     let mut clip = match llm170_core::clip::Clip::load(&mmproj) {
@@ -1485,7 +1525,16 @@ fn cmd_vl(args: &[String]) -> ExitCode {
     let mut gen_toks: Vec<Vec<u32>> = vec![Vec::new(); n_img];
     let mut texts: Vec<String> = vec![String::new(); n_img];
     let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::model::greedy(l)).collect();
+    // 시퀀스별 유효 프롬프트 길이 (마커 1 → vis 행수 치환) — JSONL pos 기준.
+    let base_len: Vec<usize> = (0..n_img)
+        .map(|s| prompt.len() - 1 + all_vis[s].len())
+        .collect();
+    // 토큰 스트림 JSONL(infer와 동일 형식) — CPU/GPU·spec 동일성 판정용.
     for s in 0..n_img {
+        println!(
+            "{{\"seq\":{s},\"pos\":{},\"token\":{}}}",
+            base_len[s], next[s]
+        );
         texts[s].push_str(&eng.piece(next[s]));
         if next[s] == eos {
             finished[s] = true;
@@ -1518,7 +1567,10 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                         if gen_toks[s].len() > n_predict {
                             break;
                         }
-                        emit(s, t, &eng, &mut texts);
+                        println!(
+                            "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
+                            base_len[s] + gen_toks[s].len()
+                        );
                         gen_toks[s].push(t);
                         next[s] = t;
                         if t == eos {
@@ -1539,7 +1591,10 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                     if gen_toks[s].len() > n_predict {
                         break;
                     }
-                    emit(s, t, &eng, &mut texts);
+                    println!(
+                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
+                        base_len[s] + gen_toks[s].len()
+                    );
                     gen_toks[s].push(t);
                     next[s] = t;
                     if t == eos {
@@ -1558,7 +1613,10 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                 for (i, &s) in active.iter().enumerate() {
                     let t = llm170_core::model::greedy(&logits[i]);
                     next[s] = t;
-                    emit(s, t, &eng, &mut texts);
+                    println!(
+                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
+                        base_len[s] + gen_toks[s].len()
+                    );
                     gen_toks[s].push(t);
                     if t == eos {
                         finished[s] = true;
