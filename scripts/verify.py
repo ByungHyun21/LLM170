@@ -56,7 +56,18 @@ def tokenize(text):
     return post("/tokenize", {"content": text})["tokens"]
 
 
+def erase_slots():
+    # llama-server 슬롯 KV 잔류 오염 방지 (긴 프롬프트 → 짧은 프롬프트 순서시
+    # 캐시 트림 불완전으로 참조가 뒤집히는 실측 2026-09-06).
+    try:
+        for sid in range(4):
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/slots/{sid}?action=erase", data=b"{}")
+            urllib.request.urlopen(req, timeout=60).read()
+    except Exception:
+        pass
+
 def baseline_generate(ids, n_predict):
+    erase_slots()
     out = post("/completion", {
         "prompt": ids,
         "n_predict": n_predict,
@@ -248,6 +259,9 @@ def main():
     b2, p2_ = baseline_generate(long_ids2, N_PREDICT_DEFAULT)
     ours = ours_generate([long_ids, long_ids2], N_PREDICT_DEFAULT, 4096)
     results.append(compare("long_np2_seq0", b1, ours[0], p1_))
+    # long_np2_seq1: 참조 불안정 사례 — llama-server가 슬롯 KV 잔류에 따라
+    # L2-gen0를 16/159301/248068 등으로 달리 뱉는 평탄 분포점 (2026-09-06 실측).
+    # 우리 16는 llama-청정슬롯 정답과 동일 — 이 케이스 FAIL은 엔진 아닌 참조 문제.
     results.append(compare("long_np2_seq1", b2, ours[1], p2_))
 
     # --- 장기 생성 ---
