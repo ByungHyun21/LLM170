@@ -373,7 +373,27 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             eng.mtp_wanted = true;
         }
         if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-            crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+            // plans/29: serve --gpu-runtime vulkan 실제 반영 (지금까지 무시됨).
+            let vulkan = match &backend {
+                BackendSel::GpuRuntime(r) => r == "vulkan",
+                _ => false,
+            };
+            if vulkan {
+                if std::env::var_os("LLM170_VK_ACC").is_some() {
+                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                        Ok(acc) => {
+                            eng = eng.with_acc(std::sync::Arc::new(acc));
+                            eprintln!("# backend: gpu (vulkan VkAcc)");
+                        }
+                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                    }
+                } else {
+                    crate::inject_rawvk(&mut eng)
+                        .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
+                }
+            } else {
+                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+            }
         }
         let _ = &backend;
         Engine::Q35(eng)
