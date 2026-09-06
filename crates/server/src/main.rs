@@ -1478,6 +1478,16 @@ fn cmd_vl(args: &[String]) -> ExitCode {
             }
         };
         eprintln!("# clip[{si}]: {} tokens (총 {:.1}s)", vis.len(), t0.elapsed().as_secs_f64());
+        if std::env::var_os("LLM170_VIS_HASH").is_some() {
+            let mut x: u64 = 0x9E3779B97F4A7C15;
+            for row in &vis[..vis.len().min(2)] {
+                for &v in row[..row.len().min(256)].iter() {
+                    x ^= (v.to_bits() as u64).wrapping_mul(0xC2B2AE3D27D4EB4F);
+                    x = x.rotate_left(17);
+                }
+            }
+            eprintln!("# vis_hash[{si}] {x:016x} v0={:.6}", vis[0][0]);
+        }
         all_vis.push(vis);
     }
     // 3) LLM
@@ -1567,6 +1577,7 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                         if gen_toks[s].len() > n_predict {
                             break;
                         }
+                        emit(s, t, &eng, &mut texts);
                         println!(
                             "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
                             base_len[s] + gen_toks[s].len()
@@ -1591,6 +1602,7 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                     if gen_toks[s].len() > n_predict {
                         break;
                     }
+                    emit(s, t, &eng, &mut texts);
                     println!(
                         "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
                         base_len[s] + gen_toks[s].len()
@@ -1613,6 +1625,7 @@ fn cmd_vl(args: &[String]) -> ExitCode {
                 for (i, &s) in active.iter().enumerate() {
                     let t = llm170_core::model::greedy(&logits[i]);
                     next[s] = t;
+                    emit(s, t, &eng, &mut texts);
                     println!(
                         "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
                         base_len[s] + gen_toks[s].len()
