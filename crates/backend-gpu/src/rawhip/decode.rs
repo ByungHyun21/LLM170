@@ -1213,7 +1213,9 @@ gmark("gdn_mm", &mut marks);
                         self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
                     }
                 }
-gmark("conv", &mut marks);
+                if il == 0 {
+                    self.trace_rows("tr_gconv", self.gconv_t, conv_ch, t)?;
+                }
                 // split3 전체 배치 (요소별)
                 {
                     let mut sp = self.gconv_t as *mut std::ffi::c_void;
@@ -1316,7 +1318,9 @@ gmark("betag", &mut marks);
                         }
                     }
                 }
-gmark("ar", &mut marks);
+                if il == 0 {
+                    self.trace_rows("tr_go", self.go_t, v_len, t)?;
+                }
                 if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
                     self.ctx.sync()?;
                     let mut hq = vec![0f32; k_len * t];
@@ -2310,6 +2314,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
+                if il == 0 {
+                    self.trace_rows("ms_gqkv", self.gqkv_t, conv_ch, t)?;
+                }
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
@@ -2326,7 +2333,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut rs = self.ms_rowseq as *mut std::ffi::c_void;
                     let mut sg = self.ms_segstart as *mut std::ffi::c_void;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt), Self::p(&mut rs), Self::p(&mut sg)];
-                    self.ctx.launch3("gdn_conv_t2_ms", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_conv_t2_ms_f32" } else { "gdn_conv_t2_ms" }, conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
                     let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
                     let mut sp2 = self.ms_conv_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
                     let mut ch2 = conv_ch as i32;
@@ -2336,6 +2343,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut se = self.ms_segend as *mut std::ffi::c_void;
                     let mut args2 = vec![Self::p(&mut qp2), Self::p(&mut sp2), Self::p(&mut ch2), Self::p(&mut kk2), Self::p(&mut tt2), Self::p(&mut rs2), Self::p(&mut se)];
                     self.ctx.launch3("gdn_conv_state_ms", t as u32, conv_ch.div_ceil(64) as u32, 1, 64, &mut args2)?;
+                }
+                if il == 0 {
+                    self.trace_rows("ms_gconv", self.gconv_t, conv_ch, t)?;
                 }
                 // split3 공유
                 {
@@ -2394,6 +2404,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut tt = gt as i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
                     self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                }
+                if il == 0 {
+                    self.trace_rows("ms_go", self.go_t, v_len, t)?;
                 }
 // norm_gated 공유
                 {
@@ -2474,6 +2487,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
 self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
                 self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                if full_idx == 1 {
+                    self.trace_rows("ms_aout", self.aout_t, n_head * hd, t)?;
+                }
                 full_idx += 1;
             }
             self.axpy(self.xs_t, self.gout_t, n * t)?;
@@ -2697,6 +2713,27 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             }
         }
         self.mm_b(xq, xq_w, wp, ty, n_in, n_out, out, t)
+    }
+
+    /// plans/28 디버그: 버퍼의 행별 L1 노름 덤프 (지연 게이트) — 수치 오염 행 탐지.
+    fn trace_rows(&self, label: &str, ptr: *const u8, row_f32: usize, t: usize) -> Result<(), String> {
+        if std::env::var_os("LLM170_MS_TRACE").is_none() {
+            return Ok(());
+        }
+        let mut buf = vec![0f32; row_f32 * t];
+        self.ctx.sync()?;
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut buf).as_mut(), ptr)?;
+        let norms: Vec<String> = (0..t)
+            .map(|r| {
+                let s: f64 = buf[r * row_f32..(r + 1) * row_f32]
+                    .iter()
+                    .map(|&v| v.abs() as f64)
+                    .sum();
+                format!("{s:.3}")
+            })
+            .collect();
+        eprintln!("[mst] {label}: {}", norms.join(" "));
+        Ok(())
     }
 
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
