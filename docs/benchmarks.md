@@ -224,23 +224,59 @@ locally — [decisions.md](decisions.md) ADR-0016.
 ## Verification status
 
 Method: greedy token-stream comparison against llama.cpp under the
-near-tie standard (ADR-0012), run **non-coexisting** — the reference server
-collects the stream first, then stops, then this engine runs alone (both
-servers resident would contend for the same VRAM on this UMA machine).
+near-tie standard (ADR-0012). **Two-phase protocol (2026-09-06)**: the
+reference server (-ngl 0, CPU) collects all baselines first, then stops,
+then this engine runs solo — coexistence was measured to evict our
+mmap'd weight pages, serializing the h2d upload into cold disk reads
+(13 GB @ ~80 MB/s → 5-min loads; strace: 7 s syscalls / 240 s wall).
 
-- qwen35: 11/11 matrix (6 exact + 5 near-tie) on the CPU reference engine
-  (2026-09-02). GPU server <-> CLI self-consistency 7/7 exact (2026-08-31
-  binary). Two-phase GPU-backend verification (baseline collect, then
-  offline judge) is queued; the qwen35 GPU numbers above are `llm170 bench`
-  measurements, not verify.py.
+### Goal matrix (2026-09-06, GPU/rawhip, `scripts/verify.py` 2-phase)
+
+- Text vs llama-server: single_short/ko/code (2 tie + 1 exact),
+  np4_seq0-3 (exact), long (~2300 tok) exact, long_np2 exact ×2
+  (the former reference instability resolved by slot-erase collection),
+  long_np4 (4 unequal lengths, 1705-2302 tok) exact ×4, long_gen96 tie.
+  **All 15 llama-referenced cases PASS.**
+- MTP speculative invariants (spec == non-spec greedy): spec_short,
+  spec_np4, spec_long, spec_long_np4 — all exact.
+  Fixed this session: np×MTP merged verify cross-sequence conv-ring
+  contamination (see git cc243c9) — previously emitted tokens outside
+  llama's top-6.
+- Server (`llm170 serve`) continuous batching: 4 concurrent long
+  completions == CLI np4, exact, both plain and `--spec 4`
+  (`scripts/verify_serve.py` 2/2).
+- Vision (`scripts/verify_vl.py` 5/5): vl_spec_short exact;
+  vl_spec_np2 tie-adjudicated (batch-shape rounding flips a 0.015-gap
+  flat point — ADR-0012 class, evidence via verify-path top-8 logits);
+  vl_np2_isolation exact; vl_spec_long (image + 2302-token prefix)
+  exact; semantic: NYT front page read correctly, matching llama.
+  ViT deterministic (5/5 hash-identical). CPU-clip vs GPU-vit
+  embeddings are not bit-identical — exact CPU↔GPU stream comparison
+  is not applicable for vision (documented; gate uses same-engine
+  invariants + llama semantics).
+
+### Standing speed (2026-09-06, solo, warm)
+
+| Mode | ours | llama.cpp reference | ratio |
+|---|---|---|---|
+| pp512 (bench) | 274 cold / 322 warm | 229.9 (server bench, 3314 tok) | 1.40× |
+| tg single (natural, 256 tok) | 11.0-11.1 | 10.4-11.6 (server bench) | 0.95-1.06× |
+| np4 aggregate | 20.4 | — | — |
+| np4 × MTP spec4 aggregate | 22.2 | 15.5 (llama np4+MTP) | **1.43×** |
+| single × MTP spec4 | 12.2 (19.4 on healthy host, b544e20) | 15.5 | 0.79× today |
+
+Host note: this session's CPU spent long stretches frequency-parked
+(powersave); b544e20's 19.4 t/s single-spec does not reproduce today on
+the same binary (12.2-12.3) while the GPU-bound modes hold. MTP
+acceptance is healthy (~4-5 tokens/cycle; the "acceptance rate/forward"
+stat line divides by verify rows, not cycles).
+
 - qwen4exp (Vulkan, real model): single_ko exact 24/24; single_short /
   long_gen48 near-tie (gap 0.01 nat); single_code near-tie (0.12); np2
   state isolation 25/25 x2. Long single (2,311 tok) and long2 (1,904 tok)
-  exact 24/24 each (immediately preceding binary); long+np2 pending
-  device-memory headroom (Vulkan places weights in host GTT on this iGPU).
+  exact 24/24 each; long+np2 pending device-memory headroom.
 - Synthetic tiny4 (`scripts/make_tiny4.py`) — model-volume-independent e2e:
-  CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2
-  (every combination; the frame path is hash-identical to the value path).
+  CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2.
 
 ## Vulkan — FIXED (2026-09-05)
 
