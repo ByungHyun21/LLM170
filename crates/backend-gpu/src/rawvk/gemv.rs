@@ -106,7 +106,7 @@ impl VkAcc {
             return Ok(p);
         }
         let (spv, n_buf, pb) = match slot {
-            Slot::Gemv => (GEMV_SPV, 12, 20u32),
+            Slot::Gemv => (GEMV_SPV, 12, 24u32),
             Slot::Tile128 => (TILE128_SPV, 10, 16),
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 12),
@@ -168,7 +168,7 @@ impl VkAcc {
         {
             let mut wc = self.wcache.lock();
             if !wc.contains_key(&key) {
-                let ch = ctx.max_ssbo;
+                let ch = ctx.max_ssbo; // plans/29: 균일 청크 — 크기는 push(chunk_words)로 전달
                 let total = w.data.len();
                 let mut bufs = Vec::new();
                 let mut off = 0usize;
@@ -218,7 +218,9 @@ impl VkAcc {
         binds.push(kb);
         binds.push(gb);
         let ds2 = self.bind_ds(ctx, &p, &binds)?;
-        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32]);
+        // plans/29: 균일 청크 워드 수 (weight_bufs가 max_ssbo 단위로 분할).
+        let chunk_words = (ctx.max_ssbo / 4) as u32;
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32, chunk_words]);
         ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
 
