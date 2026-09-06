@@ -2545,6 +2545,19 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             }
             argmaxes[ti] = best as u32;
         }
+        if std::env::var_os("LLM170_MS_LOGITS").is_some() {
+            for ti in 0..t {
+                let mut top: Vec<(u32, f32)> = all_buf[ti * noh..(ti + 1) * noh]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i as u32, v))
+                    .collect();
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                top.truncate(8);
+                eprintln!("[mslg] row{ti}: {}", top.iter()
+                    .map(|(i, v)| format!("{i}:{v:.3}")).collect::<Vec<_>>().join(" "));
+            }
+        }
         h_all.clear();
         h_all.resize(t * self.n_embd, 0.0);
         self.ctx
