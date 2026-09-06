@@ -76,6 +76,7 @@ Both PP and TG against this table are the first performance goal.
   Shipped: q6-K MMQ routing (+7.5%), f32 kernel family default (+4%), Vulkan GEMV coalescing (+51%), MMQ 4-path, wk attention, z-grid, rocprof diagnostics.
   Remaining: tg GEMV family rewrite (contiguous-lane transplant triple-confirmed dead: 19/42 gate + 0.71 t/s), pp scattered small items.
 - 2026-09-05: GDN state layout transposed u-major (coalesced AR lane-j access, 16x amplification removed) + decode AR routed to gdn_ar_w — tg8 10.44→12.27 combined-mode — EXCEEDS llama 11.42 by 7.4% (q8_0 dual GEMV + AR transpose + conv parallelization + rmsq widening); pp512 342.6 unchanged.
+- 2026-09-06 CORRECTNESS AUDIT (user-requested long-context check): 4 semantic regressions found & fixed — gemm_q3k qsum double-read, rmsq dropped scale writes, dual-GEMV dispatch chain skip, q6_K MMQ on custom-layout weights (default OFF, LLM170_Q6MMQ=1). llama-based verify.py 10/11 PASS; 11th (long_np2_seq1) = llama-server reference instability (its own output varies 16/159301/248068 across slots at a flat distribution point). Honest perf after q6-MMQ exclusion: pp512 ~322, tg8 ~10.9.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
