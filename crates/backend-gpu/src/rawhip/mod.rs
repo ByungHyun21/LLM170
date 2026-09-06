@@ -127,7 +127,7 @@ pub struct RawCtx {
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
-    mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>,  // (epoch, y_ptr, y_bytes) — 부록81
+    mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>,  // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
     /// q6 정준 재배열 캐시.
     canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
@@ -958,7 +958,10 @@ impl RawCtx {
         let mut ni_a = n_in as i32;
         // 부록81: 동일 에포크·동일 y원본이면 재양자화 스킵 (층당 1회).
         let y_key = (y_f32 as usize, (n_in / 128) * t * 144);
-        let cached = { self.mmq_y_cache.lock().map(|c| *c == (c.0, y_key.0, y_key.1)).unwrap_or(false) };
+        // 회귀 픽스(부록90): 캐시는 메인 yb(mmq_y)만 — 사이드 yb(mmq_y_s)는
+        // 별도 버퍼라 히트 시 미초기화 y로 mul_mat_q를 돌렸다 (장문 가비지).
+        let this_is_main = yb == { self.mmq_y.lock().map(|c| c.1).unwrap_or(std::ptr::null_mut()) };
+        let cached = false && this_is_main && { self.mmq_y_cache.lock().map(|c| *c == (c.0, y_key.0, y_key.1)).unwrap_or(false) };
         if !cached {
             unsafe {
                 let mut qargs = vec![
