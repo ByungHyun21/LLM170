@@ -278,6 +278,33 @@ stat line divides by verify rows, not cycles).
 - Synthetic tiny4 (`scripts/make_tiny4.py`) — model-volume-independent e2e:
   CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2.
 
+## Vulkan — FUNCTIONAL (2026-09-07, plans/29)
+
+The Vulkan path is now correct end-to-end after fixing the VkDecoder head
+(two stacked bugs, commit 19f68bc):
+
+1. n_vocab derivation read tuple field 4 (n_in=5120) instead of 5
+   (n_out=248,320) — the head argmax'd over 5,120 vocab rows only.
+2. gemv3.comp's WG() weight-chunk walker hardcoded 128MiB chunks
+   (idx>>25) — the 994MB output.weight, uploaded as a single chunk, could
+   only address rows <32,102; high vocab ids were unreachable.
+
+Fix: dynamic chunk_words push constant. VkDecoder is now the default
+vulkan path for infer/vl/bench/serve (VkAcc restorable via
+LLM170_VK_ACC=1); serve --gpu-runtime vulkan is actually honored (was
+silently ignored).
+
+Verified on Vulkan (all 2026-09-07): np4 seq2/3 exact vs llama (seq0/1
+diverge only at HIP's known near-tie points); MTP spec4 == nonspec exact
+x4; long 2302tok exact; mmproj via HIP ViT + VkDecoder LLM coexisting in
+one process (NYT front page read correctly); server multiturn
+cached-continuation == CLI full-prefill exact (16/16). HIP regression
+after all changes: verify.py 19/19 PASS.
+
+Vulkan throughput remains far below HIP (~0.25-1 t/s decode-class) —
+correct first; perf is future work (per-op submit overhead, documented
+below).
+
 ## Vulkan — FIXED (2026-09-05)
 
 Root cause of the full-model failures was never a driver leak: the sysfs GTT counters are
