@@ -265,15 +265,9 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     float inv = inv_s;
     int nwords = n >> 2;
     int nblk = n >> 5;
-    // 부록78: 양자화 패스를 256레인으로 확장 (합계 파티션·순서는 32레인
-    // 유지 — 비트불변). 스레드 tid가 블록(32원소) 단위 분담.
-    {
-        int tid = (blockDim.x >= 256) ? (u + 32 * (threadIdx.x >> 5)) : u;
-        int nthr = (blockDim.x >= 256) ? (blockDim.x / 32 * 32) : 32;
-        int nblk_tot = n >> 5;
-        for (int blk = tid; blk < nblk_tot; blk += nthr) {
-            int base = blk * 32;
-            if (lo < n) { /* 원 경계 유지용 (lo<n은 32레인 기준) */ }
+    if (lo < n) {
+        for (int blk = 0; blk < (chunk >> 5); blk++) {
+            int base = lo + blk * 32;
             float xv[32];
             #pragma unroll
             for (int i = 0; i < 32; i++) xv[i] = x[base + i] * inv * w[base + i];
@@ -305,8 +299,7 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     }
 }
 
-// q8_0 듀얼 GEMV (부록79): beta+alpha 독립 2 GEMV 1런치 — t=1 전용.
-// 행별 산술은 gemm_q8_0과 원소 동일열.
+// reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
 extern "C" __global__ void gemm_q8_0_dual(const unsigned* xq, const unsigned* w1, const unsigned* w2,
                                     float* out1, float* out2, int n_in, int no1, int no2, int xq_w) {
     int o0 = blockIdx.y + blockIdx.z * gridDim.y;
@@ -2385,7 +2378,7 @@ extern "C" __global__ void gemm_q3k(const unsigned* xq, const unsigned* w,
             isum = dot4(nibw | bitw, yv, isum);
         }
         int qsb = (n_in >> 2) + (n_in >> 5);
-        int qsum = (int)xq[qsb + h] + (int)xq[qsb + h + 1];  // h=16값 idx → 32블록 h>>1의 테이블 [2·(h>>1)] = h
+        int qsum = (int)xq[qsb + h];  // h=16값 idx → 32블록 h>>1의 테이블 [2·(h>>1)] = h
         float yd = __uint_as_float(xq[(n_in >> 2) + (h >> 1)]);
         acc += yd * dl * ((float)isum - 4.0f * (float)qsum);
     }

@@ -446,7 +446,7 @@ impl DecodeState {
         let mut ep = self.eps;
         let mut na = n as i32;
         let mut args = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut na)];
-        self.ctx.launch("rmsq", 1, 1, 256, &mut args)
+        self.ctx.launch("rmsq", 1, 1, 32, &mut args)
     }
     fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
         let mut yp = y as *mut std::ffi::c_void;
@@ -494,23 +494,27 @@ impl DecodeState {
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
+                // 회귀 픽스: 듀얼 분기 독립 체인 — 기존 if/else는 q5k듀얼시 beta/alpha,
+                // q8듀얼시 qkv/gate를 건너뛰었다 (부록90).
                 if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
-                } else if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
-                    // q8_0 듀얼 (부록79): beta+alpha 1런치 (산술 동일열)
-                    self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
                 } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
                     self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
                     self.ctx.join2()?;
+                } else {
+                    self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
+                    self.mm_into(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
+                }
+                if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
+                    self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
+                } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
                     self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
                     self.ctx.join2()?;
                 } else {
-                    self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
-                    self.mm_into(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
                     self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
                     self.mm_into(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
                 }
