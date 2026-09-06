@@ -397,7 +397,9 @@ impl DecoderState {
         let n_vocab = weights
             .iter()
             .find(|(k, ..)| k == "output.weight")
-            .map(|(_, _, _, no, _)| *no)
+            // plans/29: 튜플 (k, data, ty, n_in, n_out) — 5번째가 n_out.
+            // 종래 4번째(n_in)를 읽어 헤드가 어휘 5120행만 봄 (발산 근원).
+            .map(|(_, _, _, _, no)| *no)
             .unwrap_or(n);
         // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
         let q5k_src: Vec<(String, Vec<u8>, usize, usize)> = weights
@@ -822,8 +824,11 @@ impl DecoderState {
         binds.push(out);
         binds.push(self.ktab.buf);
         binds.push(self.grid3s.buf);
-        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, ty, t as u32]);
-        self.run_pipe("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 20, &binds, &push, no as u32, 1, 1)
+        // plans/29: 균일 청크 워드 수 전달 (마지막 청크만 부분 — WG 호산소 정합).
+        // 단일 청크면 전체/4 → c 항상 0.
+        let chunk_words = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
+        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, ty, t as u32, chunk_words]);
+        self.run_pipe("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 24, &binds, &push, no as u32, 1, 1)
     }
 
     /// v2 (mlx식) — per-row 스케일: quant_b8v2 + gemm_i8v2. LLM170_VK_I8=2.

@@ -21,7 +21,7 @@ layout(binding = 9) buffer Obuf { float outv[]; };
 layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };   // iq4nl lo|hi<<8 256워드
 layout(binding = 11) readonly buffer Gbuf { uint grid3s[]; };  // iq3_s 512워드
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint ty; uint t;
+    uint n_in; uint n_out; uint xq_w; uint ty; uint t; uint chunk_words;
 } pc;
 
 // 행 전체 공유 스테이징 — 가중 1회 판독, 토큰 내부 루프.
@@ -31,10 +31,12 @@ uint WGS(uint w) { return sh[w - wr0]; }
 
 int s8(uint v) { return (int(v) << 24) >> 24; }
 
-// 워드 인덱스 → 청크 분산 읽기 (128MB = 2^25 워드/청크)
+// 워드 인덱스 → 청크 분산 읽기. plans/29: 청크 크기를 push로 수신 —
+// 종래 2^25워드(128MiB) 하드코딩이 994MB 헤드 단일 청크의 상위 행(≥32,102)
+// 어드레싱을 막아 어휘 선두 32k만 유효했음 (np4 조기 발산의 근원).
 uint WG(uint idx) {
-    uint c = idx >> 25u;
-    uint o = idx & 0x1FFFFFFu;
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
     if (c == 0u) return w0c[o];
     if (c == 1u) return w1c[o];
     if (c == 2u) return w2c[o];
@@ -65,6 +67,7 @@ int dot4(uint a, uint b, int c) {
 void main() {
     uint o = gl_WorkGroupID.x;      // 행 = 워크그룹
     if (o >= pc.n_out) return;
+    if (pc.ty == 999u) { outv[o] = float(o); return; }  // plans/29 기록경로 프로브
     uint l = gl_LocalInvocationID.x;
     int n_in = int(pc.n_in);
     int blocks = n_in >> 8;
