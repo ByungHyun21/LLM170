@@ -722,20 +722,21 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                 eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성 (plans/22)
             }
             if gpu_runtime == "vulkan" {
-                if std::env::var_os("LLM170_VK_DECODER").is_some() {
-                    // GPU 상주 디코드 (plans/19 2단계) — 커널 8종 gdn-check ★
-                    match crate::inject_rawvk(&mut eng) {
-                        Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
-                        Err(e) => eprintln!("vk-decoder: {e} (VkAcc로 진행)"),
-                    }
-                } else {
-                    // Vulkan 경로 (plans/12): VkAcc로 matmul만 가속 — GDN·EW는 CPU.
+                // plans/29: VkDecoder(GPU 상주)가 vulkan 기본 — 헤드 n_vocab·
+                // WG 청크 수정으로 llama 패리티 확보(19f68bc). VkAcc 복원:
+                // LLM170_VK_ACC=1.
+                if std::env::var_os("LLM170_VK_ACC").is_some() {
                     match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
                         Ok(acc) => {
                             eng = eng.with_acc(std::sync::Arc::new(acc));
                             eprintln!("# backend: gpu (vulkan VkAcc)");
                         }
                         Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                    }
+                } else {
+                    match crate::inject_rawvk(&mut eng) {
+                        Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
+                        Err(e) => eprintln!("vk-decoder: {e} (VkAcc로 진행)"),
                     }
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
@@ -1505,13 +1506,11 @@ fn cmd_vl(args: &[String]) -> ExitCode {
     if backend != "cpu" {
         let rt = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
         if rt == "vulkan" {
-            if std::env::var_os("LLM170_VK_DECODER").is_some() {
-                match crate::inject_rawvk(&mut eng) {
-                    Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
-                    Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
-                }
-            } else {
-                eprintln!("# backend: vulkan VK_DECODER 미지정 — LLM은 CPU 진행");
+            // plans/29: LLM은 VkDecoder 기본. ViT는 HIP 시도 → 실패 시
+            // 기존 CPU clip 폴백 (vision 블록의 에러 폴백 경유).
+            match crate::inject_rawvk(&mut eng) {
+                Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
+                Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
             }
         } else {
             crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));

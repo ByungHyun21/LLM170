@@ -16,6 +16,8 @@ BIN = "target/release/llm170"
 MODEL = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf"
 PORT = 18081
 N = 16
+RUNTIME = os.environ.get("LLM170_VERIFY_RUNTIME", "hip")
+VK_ARGS = (["--gpu-runtime", RUNTIME] if RUNTIME == "vulkan" else [])
 
 st = json.load(open('/tmp/verify_q35_base.json'))
 turn1 = st['prompts']['short0']
@@ -25,8 +27,10 @@ follow = st['prompts']['short1']
 def cli_full(ids):
     env = dict(os.environ)
     env["LLM170_SLOTS"] = "1"
+    if RUNTIME == "vulkan":
+        env.pop("LLM170_VK_ACC", None)
     args = [BIN, "infer", "--model", MODEL, "--backend", "gpu",
-            "--n-predict", str(N), "--ctx", "4096",
+            "--n-predict", str(N), "--ctx", "4096", *VK_ARGS,
             "--prompt-tokens", ",".join(map(str, ids))]
     r = subprocess.run(args, capture_output=True, text=True, timeout=3600, env=env)
     assert r.returncode == 0, r.stderr[-300:]
@@ -38,8 +42,10 @@ def main():
     # 서버 기동
     env = dict(os.environ)
     env["LLM170_SLOTS"] = "1"
+    if RUNTIME == "vulkan":
+        env.pop("LLM170_VK_ACC", None)
     proc = subprocess.Popen([BIN, "serve", "--model", MODEL, "--port", str(PORT),
-                             "--ctx", "4096", "--backend", "gpu"],
+                             "--ctx", "4096", "--backend", "gpu", *VK_ARGS],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             env=env)
     base = f"http://127.0.0.1:{PORT}"

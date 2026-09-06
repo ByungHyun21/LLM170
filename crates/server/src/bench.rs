@@ -165,13 +165,18 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 eng.mtp_wanted = true;
             }
             if gpu_runtime == "vulkan" {
-                // Vulkan (plans/12): rawhip 미주입 — VkAcc matmul + CPU 엔진 (스펙=CPU 경로).
-                match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
-                    Ok(acc) => {
-                        eng = eng.with_acc(std::sync::Arc::new(acc));
-                        eprintln!("# backend: gpu (vulkan VkAcc)");
+                // plans/29: VkDecoder 기본 (VkAcc는 LLM170_VK_ACC=1로 복원).
+                if std::env::var_os("LLM170_VK_ACC").is_some() {
+                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                        Ok(acc) => {
+                            eng = eng.with_acc(std::sync::Arc::new(acc));
+                            eprintln!("# backend: gpu (vulkan VkAcc)");
+                        }
+                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
                     }
-                    Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+                } else {
+                    crate::inject_rawvk(&mut eng)
+                        .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
                 crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
