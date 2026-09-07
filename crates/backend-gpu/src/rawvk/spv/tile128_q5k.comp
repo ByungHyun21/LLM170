@@ -90,11 +90,18 @@ void main() {
                 int sh = 2 * it + halfb;
                 int qbase = wq + 12 + it * 8;
                 int qhbase = wq + 4;
+                // ql/qh 워드 호이스팅 — 8원소 = 2워드씩 (WG 호출 16→4)
+                uint ql0 = WG(qbase + (kc >> 2));
+                uint ql1 = WG(qbase + (kc >> 2) + 1);
+                uint qh0 = WG(qhbase + (kc >> 2));
+                uint qh1 = WG(qhbase + (kc >> 2) + 1);
                 for (int e = 0; e < 8; e++) {
                     int k = kc + e;
-                    uint byte_v = (WG(qbase + (k >> 2)) >> uint((k & 3) * 8)) & 0xFFu;
+                    uint qlw = ((k & 4) == 0) ? ql0 : ql1;
+                    uint qhw = ((k & 4) == 0) ? qh0 : qh1;
+                    uint byte_v = (qlw >> uint((k & 3) * 8)) & 0xFFu;
                     uint nib = (byte_v >> nsh) & 0xFu;
-                    uint hi = (WG(qhbase + (k >> 2)) >> uint((k & 3) * 8 + sh)) & 1u;
+                    uint hi = (qhw >> uint((k & 3) * 8 + sh)) & 1u;
                     float wv = float(nib) + (hi != 0u ? 16.0 : 0.0);
                     A16[r][k] = float16_t(wv * ds0 - ds1);
                 }
