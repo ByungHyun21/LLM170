@@ -1239,8 +1239,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
     let is_q5 = w.ty == llm170_gguf::GgmlType::Q5K;
     let is_q6 = w.ty == llm170_gguf::GgmlType::Q6K;
-    if !is_xs && !is_q5 && !is_q6 && w.ty != llm170_gguf::GgmlType::Q8_0 {
-        return Err("gemv4 프로토타입은 q8_0/iq4_xs/q5_K/q6_K만".into());
+    let is_q4 = w.ty == llm170_gguf::GgmlType::Q4K;
+    if !is_xs && !is_q5 && !is_q6 && !is_q4 && w.ty != llm170_gguf::GgmlType::Q8_0 {
+        return Err("gemv4 프로토타입은 q8_0/iq4_xs/q4_K/q5_K/q6_K만".into());
     }
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
@@ -1280,7 +1281,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if is_q6 && std::env::var_os("LLM170_G6").is_some() {
+    let spv_path = if is_q4 && std::env::var_os("LLM170_G6").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv6_q4.spv"
+    } else if is_q6 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q6.spv"
     } else if is_xs && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_xs.spv"
@@ -1296,8 +1299,8 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
     let g6 = std::env::var_os("LLM170_G6").is_some();
-    if is_q6 && !g6 { return Err("q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
-    let n_kb_h = if is_xs { 12 } else if is_q6 { 10 } else { 11 };
+    if (is_q6 || is_q4) && !g6 { return Err("q4/q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
+    let n_kb_h = if is_xs { 12 } else if is_q6 || is_q4 { 10 } else { 11 };
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb_h, if g6 { 24 } else { 32 })?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -1306,7 +1309,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     if is_xs {
         binds.push(kb);
     }
-    if !is_q6 {
+    if !is_q6 && !is_q4 {
         binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
     }
     ctx.bind_bufs(ds, &binds);
