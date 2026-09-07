@@ -867,3 +867,17 @@ remains weight-traffic-bound: the next lever is raising the effective
 per-type bandwidth of the remaining gemv tail (q5/q6/q3 via the gemv6
 layout) and the rms/quant/elementwise minor kernels' real batched
 costs (needs timestamp queries; per-dispatch fences distort them).
+
+### gemv6_q6 — WIP handoff (2026-09-07, session close)
+
+Ported the lane-remap layout to q6_K (output.weight, ~1GB/token — the
+largest single decode gemv). Fixed en route: qh LDS index missing the
+n*32 term, harness n_kb=10 (q6 gemv6 has no ktab/yv4), the debug-run
+transposed grid (old known defect, now fixed for all routes), scale
+index (mm&31)>>4. State: STILL systematically wrong from element 0
+(one-hots mismatch everywhere, some NaN at higher elements) despite the
+mapping re-derived twice against deq_q6_k — the defect is suspected in
+the 210B-block word assembly or the staged-qh word rebuild, not the
+element formulas (all verified against CPU source). Not wired into the
+engine; vk-gemv4-check with LLM170_G6=1 + G4_HOT one-hots reproduces
+in seconds.
