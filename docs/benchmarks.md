@@ -738,3 +738,23 @@ Correctness: gemv5 produces ' Paris' (engine path LLM170_V5=1).
 Unblock for a future round: any upstream glslang ≥13 binary (or
 spirv-tools assembler), then swap the emulation block for
 dotPacked4x8EXT — the surrounding kernel is done.
+
+### Round 9 — OpSDot toolchain unblocked; int-dot measured (2026-09-07)
+
+Unblocked the hardware integer dot without any system packages: built
+scripts/spvtool (a 60-line C tool linking the installed
+libSPIRV-Tools.a static archive — assembler/disassembler/validator via
+ctypes-free CLI), then scripts/patch_sdot.py: gemv5's GLSL keeps a
+canonical 'DOT patch marker' pattern (8 prepared sign-extended operands
++ 4 mul + 4 add), glslc -O0 emits it verbatim, and the disassembly
+block is textually replaced with OpSDot + capability/extension. A
+hand-assembled device probe (vk-sdot-probe) first proved the GPU
+executes OpSDot correctly (1M chained signed dots, gpu==cpu bit-exact).
+
+Measured: hw-dot gemv5 153.1 vs gemv4 147.7 ms — still no decode win.
+Conclusion refined: for iq4_xs the bottleneck is the ktab LUT gather
+unpacking PER ROW, not the multiply. llama's MMQ unpacks each weight
+tile to int8 words in SHARED MEMORY once and reuses it across the whole
+output tile — the exact structure a 'gemv6' (shared-int8 tile + int
+dot, no coopmat, no f16) should copy. All groundwork for that kernel is
+now in-repo and reproducible.

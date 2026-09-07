@@ -1,0 +1,57 @@
+; sdot 장치 지원 프로브 (plans/33)
+; binding 0 SSBO u32[]: [0]=a [1]=b [2]=int dot 결과 [3]=iteration count
+; dot(a,b)를 count회 누산 → 결과 저장. IntegerDotProductKHR 검증+타이밍.
+; SPIR-V
+; Version: 1.3
+; Bound: 40
+OpCapability Shader
+OpCapability DotProduct
+OpExtension "SPV_KHR_integer_dot_product"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_LocalInvocationIndex
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %blk 0 Offset 0
+OpDecorate %blk Block
+OpDecorate %data DescriptorSet 0
+OpDecorate %data Binding 0
+OpDecorate %gl_LocalInvocationIndex BuiltIn LocalInvocationIndex
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f32 = OpTypeFloat 32
+%u32_0 = OpConstant %u32 0
+%u32_1 = OpConstant %u32 1
+%u32_2 = OpConstant %u32 2
+%u32_3 = OpConstant %u32 3
+%u32_1000000 = OpConstant %u32 1000000
+%ptr_u32 = OpTypePointer Uniform %u32
+%arr = OpTypeRuntimeArray %u32
+%blk = OpTypeStruct %arr
+%ptr_blk = OpTypePointer Uniform %blk
+%data = OpVariable %ptr_blk Uniform
+%ptr_in = OpTypePointer Input %u32
+%gl_LocalInvocationIndex = OpVariable %ptr_in Input
+%bool = OpTypeBool
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%pa = OpAccessChain %ptr_u32 %data %u32_0 %u32_0
+%pb = OpAccessChain %ptr_u32 %data %u32_0 %u32_1
+%a = OpLoad %u32 %pa
+%b = OpLoad %u32 %pb
+OpBranch %loop
+%loop = OpLabel
+%i = OpPhi %u32 %u32_0 %entry %inext %body
+%acc = OpPhi %u32 %a %entry %dotres %body
+%cond = OpULessThan %bool %i %u32_1000000
+OpLoopMerge %exit %body None
+OpBranchConditional %cond %body %exit
+%body = OpLabel
+%dotres = OpSDot %u32 %acc %b PackedVectorFormat4x8Bit
+%inext = OpIAdd %u32 %i %u32_1
+OpBranch %loop
+%exit = OpLabel
+%pr = OpAccessChain %ptr_u32 %data %u32_0 %u32_2
+OpStore %pr %acc
+OpReturn
+OpFunctionEnd

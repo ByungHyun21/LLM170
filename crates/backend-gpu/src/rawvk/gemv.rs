@@ -903,6 +903,47 @@ fn hf(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
 }
 
+/// vk-sdot-probe — OpSDot(정수 dot) 장치 지원 검증+타이밍. plans/33.
+pub fn sdot_probe() -> Result<String, String> {
+    use std::time::Instant;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let buf = ctx.alloc_host(16)?;
+    unsafe {
+        let p = buf.ptr as *mut u32;
+        *p.add(0) = 0x0182_0304;      // a (부호 혼합 i8x4)
+        *p.add(1) = 0xF0FF_7F01;      // b
+        *p.add(2) = 0;
+        *p.add(3) = 0;
+    }
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/sdot_probe.spv")
+        .map_err(|e| e.to_string())?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 1, 4)?;
+    let _ = (dsl, pool);
+    ctx.bind_bufs(ds, &[buf.buf]);
+    let t0 = Instant::now();
+    ctx.run(pl, ds, pipe, &1_000_000u32.to_le_bytes(), 1, 1, 1)?;
+    let dt = t0.elapsed().as_secs_f32();
+    let r = unsafe { *(buf.ptr as *const u32).add(2) };
+    // CPU 기준: acc = a; 1M회 acc = sdot(acc, b) — i32 감쇠/순환값
+    let mut cacc: i32 = 0x0182_0304u32 as i32;
+    let b4: i32 = 0xF0FF_7F01u32 as i32;
+    let bx = |v: i32, i: u32| -> i32 {
+        let byte = (v >> (i * 8)) & 0xFF;
+        if byte >= 128 { byte - 256 } else { byte }
+    };
+    for _ in 0..1_000_000 {
+        let mut s = 0i32;
+        for i in 0..4 { s += bx(cacc, i) * bx(b4, i); }
+        cacc = s;
+    }
+    let expect = cacc as u32;
+    Ok(format!(
+        "sdot-probe: gpu={r:#010x} cpu={expect:#010x} {} · {dt:.1}ms (1M 의존 dot)",
+        if r == expect { "일치" } else { "불일치" }
+    ))
+}
+
 /// vk-gemt-check — 프리필 타일 GEMM(iq4_xs) 검증+타이밍. plans/32.
 pub fn gemt_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;

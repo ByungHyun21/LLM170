@@ -132,6 +132,12 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
             }
         }
+        Some("vk-sdot-probe") => {
+            match llm170_backend_gpu::rawvk::gemv::sdot_probe() {
+                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some("vk-gemt-check") => {
             let args2: Vec<String> = std::env::args().collect();
             let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
