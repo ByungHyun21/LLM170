@@ -946,3 +946,17 @@ redundantly fetching the same word. q8_0's existing scalar-vectorized
 path (word-per-lane over 8-word strips) is already at the ceiling —
 q8 was never a straggler in the ktime data. Kept as a documented
 opt-in; engine q8 routing unchanged.
+
+### llama mmv config decoded (2026-09-07, session close)
+
+Read llama's actual mul_mat_vec launch configuration from
+ggml-vulkan.cpp: on AMD RDNA3 the K-quant decode (q3/q4/q5/q6) uses
+NUM_ROWS=2 with FORCED SUBGROUP SIZE 16 (wg_size_subgroup16 pipelines,
+use_subgroups16), not our rpf=8/wave32. The spec-constant row
+multipliers (rm_kq=2 non-GCN AMD, 4 on GCN; rm_iq=4) and the
+subgroup-16 forcing are the two launch-geometry levers we have not
+tried — both are concrete, cheap experiments for the next session
+(VkCtx pipeline creation with subgroupSizeFull/16 via
+VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE or
+requiredSubgroupSize=16, plus rpf=2). This is the remaining
+untested launch-geometry gap against llama's 182GB/s effective.
