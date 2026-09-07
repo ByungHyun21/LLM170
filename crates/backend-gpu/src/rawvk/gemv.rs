@@ -909,8 +909,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let model = llm170_core::model::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
-    if w.ty != llm170_gguf::GgmlType::Q8_0 {
-        return Err("gemv4 프로토타입은 q8_0만".into());
+    let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
+    if !is_xs && w.ty != llm170_gguf::GgmlType::Q8_0 {
+        return Err("gemv4 프로토타입은 q8_0/iq4_xs만".into());
     }
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
@@ -947,13 +948,21 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/gemv4_q8.spv")
-        .map_err(|e| e.to_string())?;
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 10, 24)?;
+    let spv_path = if is_xs {
+        "crates/backend-gpu/src/rawvk/spv/gemv4_xs.spv"
+    } else {
+        "crates/backend-gpu/src/rawvk/spv/gemv4_q8.spv"
+    };
+    let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
+    let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 11 } else { 10 }, 24)?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
     binds.push(ob.buf);
+    if is_xs {
+        binds.push(kb);
+    }
     ctx.bind_bufs(ds, &binds);
     let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words]);
     let _ = pl;
@@ -969,7 +978,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     for (j, x) in xs.iter().enumerate() {
         for r in 0..n_out.min(64) {
             llm170_core::quant::dequant_row(
-                llm170_gguf::GgmlType::Q8_0, w.data, r as u64, n_in as u64, &mut ref_row);
+                w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
             let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
             mx = mx.max((dot - outs[j * n_out + r]).abs() as f64);
         }
