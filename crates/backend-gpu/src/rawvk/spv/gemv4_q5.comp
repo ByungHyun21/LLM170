@@ -1,0 +1,114 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv4_q5 (plans/31) — llama 아키텍처 q5_K. gemv4 구조(32스레드/rpf행/f32활성/
+// subgroupAdd) + CPU deq_q5_k 기하 직역: d f16@0, min f16@2, scales 12B@4,
+// qh 32B@16, ql 128B@48 = 176B/256원소. 서브 j: 페어 P=j>>1, half=j&1;
+// ql 바이트 = 32*P + l; lo니블=원소 64P+l, hi=+32; qh 비트 (1|2)<<(2P).
+// dot = d·sc·Σ(q+qh)·y − dm·m·Σy — Σy(32) 별산.
+// qh는 ql 워드와 k 페어로 워드 단위 호이스팅(벡터화 시 수치 붕괴 — 검증된 스칼라 유지).
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0c { uint w0[]; };
+layout(binding = 1) readonly buffer W1c { uint w1[]; };
+layout(binding = 2) readonly buffer W2c { uint w2[]; };
+layout(binding = 3) readonly buffer W3c { uint w3[]; };
+layout(binding = 4) readonly buffer W4c { uint w4[]; };
+layout(binding = 5) readonly buffer W5c { uint w5[]; };
+layout(binding = 6) readonly buffer W6c { uint w6[]; };
+layout(binding = 7) readonly buffer W7c { uint w7[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint ty; uint t; uint chunk_words; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+
+uint byte_at(uint b) { return (WG(b >> 2) >> ((b & 3u) * 8u)) & 0xFFu; }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+    uint n_sub = n_in >> 5;          // 32원소 서브블록 8개/블록
+    uint blocks = n_in >> 8;
+    for (uint sb = tid; sb < n_sub; sb += 32u) {
+        float yv[32];
+        float ysum = 0.0;
+        [[unroll]] for (uint k = 0; k < 32u; k++) {
+            yv[k] = xa[base + sb * 32u + k];
+            ysum += yv[k];
+        }
+        uint P = (sb & 7u) >> 1;     // 스케일 페어 (블록 로컬)
+        uint lohi = sb & 1u;         // lo/hi 니블
+        for (uint r = 0u; r < RPF; r++) {
+            uint row = row0 + r;
+            if (row >= pc.n_out) break;
+            uint wb = row * blocks * 176u + (sb >> 3) * 176u;
+            uint w0v = WG(wb >> 2);
+            vec2 dm = unpackHalf2x16(w0v);
+            uint j = 2u * P + lohi;
+            uint sc, mn;
+            if (j < 4u) {
+                sc = byte_at(wb + 4u + j) & 63u;
+                mn = byte_at(wb + 8u + j) & 63u;
+            } else {
+                uint b84 = byte_at(wb + 8u + j);
+                uint bj = byte_at(wb + 4u + j);
+                sc = (b84 & 0xFu) | ((byte_at(wb + j) >> 6u) << 4);
+                mn = (b84 >> 4u) | ((bj >> 6u) << 4);
+            }
+            float dl = dm.x * float(sc);
+            float dml = dm.y * float(mn);
+            uint qh_bit = (lohi == 0u ? 1u : 2u) << (2u * P);
+            float ysum2 = 0.0;
+            [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                uint bytei = wb + 48u + 32u * P + 4u * k;
+                uint qv = WG(bytei >> 2);
+                uint rem = bytei & 3u;
+                if (rem != 0u) {
+                    uint w2 = WG((bytei >> 2) + 1u);
+                    qv = (qv >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
+                }
+                uint qhw = (wb + 16u + 4u * k) >> 2;
+                uint hv = WG(qhw);
+                uint hrem = (wb + 16u + 4u * k) & 3u;
+                if (hrem != 0u) {
+                    uint w2 = WG(qhw + 1u);
+                    hv = (hv >> (hrem * 8u)) | (w2 << ((4u - hrem) * 8u));
+                }
+                [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                    uint l = 4u * k + b;
+                    uint qb = (qv >> (8u * b)) & 0xFFu;
+                    int q = int(lohi == 0u ? (qb & 0xFu) : (qb >> 4u));
+                    if (((hv >> (8u * b)) & qh_bit) != 0u) q += 16;
+                    ysum2 += float(q) * yv[l];
+                }
+            }
+            acc[r] += dl * ysum2 - dml * ysum;
+        }
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}

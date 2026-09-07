@@ -20,11 +20,11 @@ layout(binding = 7) readonly buffer W7c { uint w7[]; };
 layout(binding = 8) readonly buffer Xbuf { float xa[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };  // iq4nl 바이트 LUT
+layout(binding = 11) readonly buffer YV4 { vec4 yv4[]; };   // xa의 vec4 뷰
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint ty; uint t; uint chunk_words;
+    uint n_in; uint n_out; uint ty; uint t; uint chunk_words; uint rpf;
 } pc;
 
-const uint RPF = 8u;
 
 uint WG(uint idx) {
     uint c = idx / pc.chunk_words;
@@ -42,16 +42,17 @@ uint WG(uint idx) {
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
     uint row0 = gl_WorkGroupID.y * RPF;
     uint n_in = pc.n_in;
     uint base = tok * n_in;
-    float acc[RPF];
+    float acc[8];
     for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
     uint n_sub = n_in >> 5;          // 32원소 서브블록
     uint blocks = n_in >> 8;
     for (uint sb = tid; sb < n_sub; sb += 32u) {
-        float yv[32];
-        for (uint k = 0; k < 32u; k++) yv[k] = xa[base + sb * 32u + k];
+        vec4 yy[8];
+        for (uint k = 0; k < 8u; k++) yy[k] = yv4[(base + sb * 32u + 4u * k) >> 2u];
         uint blk = sb >> 3;
         uint ib = sb & 7u;
         for (uint r = 0u; r < RPF; r++) {
@@ -87,8 +88,11 @@ void main() {
                     uint t2 = ktab[(wv32 >> (8u * b)) & 0xFFu];
                     int vlo = (int(t2 & 0xFFu) << 24) >> 24;   // 부호 확장
                     int vhi = (int(t2 >> 8u) << 24) >> 24;
-                    ysum += float(vlo) * yv[k * 4u + b]
-                          + float(vhi) * yv[16u + k * 4u + b];
+                    // k*4+b (lo열)와 16+k*4+b (hi열) — yy 워드 인접 페어
+                    uint w0i = (k * 4u + b) >> 2u, w1i = (16u + k * 4u + b) >> 2u;
+                    float ylo = yy[w0i][(k * 4u + b) & 3u];
+                    float yhi = yy[w1i][(16u + k * 4u + b) & 3u];
+                    ysum += float(vlo) * ylo + float(vhi) * yhi;
                 }
             }
             acc[r] += dl * ysum;
