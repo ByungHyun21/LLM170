@@ -383,7 +383,19 @@ at standalone rate (attn_qkv 0.338 vs 0.296 ms) while ALL FFN sites run
 +30-42% over standalone (ffn_down 0.407→0.580 ms) — L2 pollution from
 the interleaved attention/conv kernels is the standing suspect.
 
-Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg 0.49-0.51×, pp 0.10×.
+Round 2b — chunk-walker arithmetic: replaced the per-word integer division
+in WG() with shift/mask (chunks constrained to powers of two; the last
+chunk is allocated at exact size — o = idx & mask always lands on real
+data). Standalone: q8_0 160→247-257 GB/s (+55%), iq4_xs 138→150, q5_K
+118→140, all exact. One integration bug caught by the gates: computing
+the chunk log2 from the first buffer's ACTUAL size wraps single-chunk
+non-pow2 tensors into a phantom chunk 1 (dummy buffer) corrupting weight
+tails — spec==nonspec went False; fixed by using next_power_of_two.
+Engine: decode step median 152→127 ms (-16.5%, 3-run), end-to-end
+tg32 6.19-6.32 t/s (+9% over the 5.68 baseline). rpf sweep knob
+(LLM170_G4_RPF) showed 2/4/8 within noise.
+
+Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg ~0.54×, pp 0.10×.
 Next levers: FFN-site L2 behavior, register-tile GEMM for prefill.
 
 ## Vulkan — FIXED (2026-09-05)
