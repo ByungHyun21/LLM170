@@ -1009,3 +1009,12 @@ VERIFIED gemv4_xs mapping (byte b of sub → elements b lo, 16+b hi)
 before writing gemv8_xs; the same derivation then applies to
 q3/q4/q6 via their llama dequantize4 blocks in dequant_funcs.glsl
 (DATA_A_Q4_K etc.). y loads via the existing yv4 alias binding.
+
+### gemv8_q6 — exact but slower (2026-09-07, close)
+
+Ported the gemv8 recipe to q6_K (one OOB bug caught by the harness:
+scale base is 8n per half, not 16n — sh_dl[16] indexed to 23). Exact
+(0.0000) but 67.6 GB/s vs gemv6_q6's ~90 — the 210-byte block
+misalignment forces per-word remainder assembly in the linear sweep,
+which the SIMD gains don't offset. q6 stays on gemv6 in the engine;
+gemv8_q6 kept harness-only.

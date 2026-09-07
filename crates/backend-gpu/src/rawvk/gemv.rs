@@ -1282,7 +1282,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if is_xs && std::env::var_os("LLM170_G8").is_some() {
+    let spv_path = if is_q6 && std::env::var_os("LLM170_G8").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv8_q6.spv"
+    } else if is_xs && std::env::var_os("LLM170_G8").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv8_xs.spv"
     } else if is_q4 && std::env::var_os("LLM170_G8").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv8_q4.spv"
@@ -1317,7 +1319,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let sg16 = std::env::var_os("LLM170_SG16").is_some();
     let g8 = std::env::var_os("LLM170_G8").is_some();
     let _ = &is_q4;
-    if (is_q6 || is_q4 || is_q3) && !g6 && !sg16 && !g8 { return Err("q3/q4/q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
+    if (is_q6 || is_q4 || is_q3) && !g6 && !sg16 && !g8 { return Err("gemv6/8 전용".into()); }
     let n_kb_h = if is_xs { 12 } else if is_q6 || is_q4 || is_q3 { 10 } else { 11 };
     let (dsl, pl, pool, ds, pipe) = if sg16 {
         ctx.pipeline16(&spv, n_kb_h, 24)?

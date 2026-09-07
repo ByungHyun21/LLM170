@@ -1,0 +1,146 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv8_q6 (plans/33) — gemv8 레시피를 q6_K에 적용. 기하: gemv6_q6(검증)에서
+// 직역 — ql 바이트 m(0..127): n=m>>6, mm=m&63 — lo니블→원소 128n+mm (qh bits
+// (mm&32?2-3:0-1)), hi니블→+64 (bits 6-7/4-5), 스케일 16n+((mm&31)>>4)+오프셋,
+// hm 바이트 = 32n+(mm&31). 레인 L이 ql 워드 4L — 연속 128B.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 1) readonly buffer W1 { uint w1u[]; };
+layout(binding = 2) readonly buffer W2 { uint w2u[]; };
+layout(binding = 3) readonly buffer W3 { uint w3u[]; };
+layout(binding = 4) readonly buffer W4 { uint w4u[]; };
+layout(binding = 5) readonly buffer W5 { uint w5u[]; };
+layout(binding = 6) readonly buffer W6 { uint w6u[]; };
+layout(binding = 7) readonly buffer W7 { uint w7u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0u[o];
+    if (c == 1u) return w1u[o];
+    if (c == 2u) return w2u[o];
+    if (c == 3u) return w3u[o];
+    if (c == 4u) return w4u[o];
+    if (c == 5u) return w5u[o];
+    if (c == 6u) return w6u[o];
+    return w7u[o];
+}
+
+vec4 myunpack8(uint x) {
+    return vec4(
+        float((x        ) & 0xFFu),
+        float((x >> 8u  ) & 0xFFu),
+        float((x >> 16u) & 0xFFu),
+        float((x >> 24u) & 0xFFu));
+}
+
+const uint BLK_B = 210u;
+shared float sh_dl[96][16];
+shared uint sh_qh[96][16];   // qh 16워드
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint rowb = row * n_blk * BLK_B;
+        // 패스1: 헤더 → LDS (gemv6_q6 검증 산법)
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = rowb + b * BLK_B;
+            uint dwi = (bw + 208u) >> 2;
+            uint drem = (bw + 208u) & 3u;
+            uint dw = WG(dwi);
+            uint db = (dw >> (drem * 8u)) & 0xFFFFu;
+            if (drem >= 2u) {
+                uint w2 = WG(dwi + 1u);
+                db = ((dw >> (drem * 8u)) | (w2 << ((4u - drem) * 8u))) & 0xFFFFu;
+            }
+            float d = unpackHalf2x16(db).x;
+            // sc 16B @192 — 워드 5개 (rem 걸침)
+            uint swi = (bw + 192u) >> 2;
+            uint srem = (bw + 192u) & 3u;
+            uint sw0 = WG(swi), sw1 = WG(swi + 1u), sw2 = WG(swi + 2u);
+            uint sw3 = WG(swi + 3u), sw4 = WG(swi + 4u);
+            for (uint j = 0u; j < 16u; j++) {
+                uint absb = srem + j;
+                uint wsel = absb < 4u ? sw0 : (absb < 8u ? sw1 : (absb < 12u ? sw2 : (absb < 16u ? sw3 : sw4)));
+                uint sc8 = (wsel >> ((absb & 3u) * 8u)) & 0xFFu;
+                int sci = int(sc8) << 24 >> 24;   // 산술 시프트 (gemv6_q6 교훈)
+                sh_dl[b][j] = d * float(sci);
+            }
+            // qh 16워드 (64B @128)
+            uint qwi = (bw + 128u) >> 2;
+            uint qrem = (bw + 128u) & 3u;
+            if (qrem == 0u) {
+                for (uint i = 0u; i < 16u; i++) sh_qh[b][i] = WG(qwi + i);
+            } else {
+                uint prev = WG(qwi);
+                for (uint i = 0u; i < 16u; i++) {
+                    uint nx = WG(qwi + 1u + i);
+                    sh_qh[b][i] = (prev >> (qrem * 8u)) | (nx << ((4u - qrem) * 8u));
+                    prev = nx;
+                }
+            }
+        }
+        barrier();
+        // 패스2: ql 선형 스윕 — 레인 L이 ql 바이트 [4L..4L+4) — SIMD 니블
+        float pacc = 0.0;
+        [[unroll]] for (uint b = 0u; b < n_blk; b++) {
+            uint bw = rowb + b * BLK_B;
+            uint lw = bw >> 2;
+            uint lrem = bw & 3u;
+            uint wv = WG(lw + tid);
+            if (lrem != 0u) {
+                uint nx = WG(lw + tid + 1u);
+                wv = (wv >> (lrem * 8u)) | (nx << ((4u - lrem) * 8u));
+            }
+            uint m0 = tid * 4u;
+            uint n = m0 >> 6;
+            uint mm0 = m0 & 63u;
+            uint hi_sel = (mm0 & 32u) != 0u ? 1u : 0u;
+            // lo니블: v&0xF, qh bits 2*hi_sel..+1 → 6비트 값 -32
+            uint qh_abs = 32u * n + (mm0 & 31u);
+            uint qhw = sh_qh[b][qh_abs >> 2];
+            uint qhsh = 8u * (qh_abs & 3u);
+            vec4 lo_nib = myunpack8(wv & 0x0F0F0F0Fu);
+            vec4 hi_nib = myunpack8((wv >> 4u) & 0x0F0F0F0Fu);
+            vec4 qlo = myunpack8((qhw >> (qhsh + 2u * hi_sel)) & 0x03030303u);
+            vec4 qhi = myunpack8((qhw >> (qhsh + 4u + 2u * hi_sel)) & 0x03030303u);
+            vec4 vlo = lo_nib + 16.0 * qlo - 32.0;
+            vec4 vhi = hi_nib + 16.0 * qhi - 32.0;
+            uint isb = 8u * n + ((mm0 & 31u) >> 4);
+            float dl_lo = sh_dl[b][isb + 2u * hi_sel];
+            float dl_hi = sh_dl[b][isb + 4u + 2u * hi_sel];
+            uint e_lo = b * 256u + 128u * n + mm0;
+            vec4 ylo = vec4(xa[base + e_lo], xa[base + e_lo + 1u], xa[base + e_lo + 2u], xa[base + e_lo + 3u]);
+            vec4 yhi = vec4(xa[base + e_lo + 64u], xa[base + e_lo + 65u], xa[base + e_lo + 66u], xa[base + e_lo + 67u]);
+            pacc += dl_lo * dot(vlo, ylo);
+            pacc += dl_hi * dot(vhi, yhi);
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
