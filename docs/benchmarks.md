@@ -890,3 +890,22 @@ in seconds.
   the staged d or the lo/hi nibble-to-element pairing corner cases.
   Next session: dump-based comparison of sh_dl[0][0] against a python
   GGUF read of output.weight bytes 192-210.
+
+### gemv6_q6 SOLVED — family complete (2026-09-07, final)
+
+The dump-driven debug chain closed it: Q6_DUMP ground truth (CPU
+w.data read) + a skip-main-write debug variant (macro-gated
+DBG_MAIN_WRITE) + a row0-scoped dump revealed GPU dl = d×(sc as
+UNSIGNED byte) for exactly the negative-scale entries — the staging's
+`(sc8 << 24u) >> 24u` used UINT shifts (logical, zero-extending);
+sign extension requires casting to int first (int shifts are
+arithmetic). One-line fix: max|D| 1.94 → 0.0000 EXACT.
+
+gemv6 family now covers the three dominant decode types (q5_K,
+iq4_xs, q6_K) — all CPU-exact, all showing the +10-15% true-DRAM
+kernel-rate class, all engine-neutral (step 149.3 vs 142.0 ms; the
+engine absorption pattern holds for the third time). The lane-remap
+campaign is complete: the remaining decode gap to llama is NOT in
+per-kernel access patterns of these types — next candidates are the
+q3/q4/iq3_s tail, the elementwise minors (rms/quant/axpy ~30ms/step
+combined), and timestamp-level attribution of batched execution.
