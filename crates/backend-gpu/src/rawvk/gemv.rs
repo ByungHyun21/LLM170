@@ -820,7 +820,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     ctxg.bind_bufs(ds, &bufs);
     // push: M,N,K,stride_a=K,stride_b=K,stride_d=M,batch 0들 + k_split=1 등
     let mut pc: Vec<u32> = vec![
-        n_out as u32, t as u32, n_in as u32,      // M, N, K
+        n_out.div_ceil(8) as u32, t as u32, n_in as u32,      // M, N, K
         n_in as u32, n_in as u32, t as u32,       // stride_a=K, stride_b=K, stride_d=N
         0, 0, 0,                                  // batch strides
         0, 1, n_in as u32,                        // base_wg_z, num_batches, k_split=K (split_k=1 규약)
@@ -901,4 +901,87 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
 fn hf(v: f32) -> u16 {
     // f32→f16 변환 (반올림)
     half::f16::from_f32(v).to_bits()
+}
+
+/// vk-gemv4-check — llama 아키텍처 프로토타입(q8_0, f32 활성) 검증+타이밍.
+pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    use std::time::Instant;
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    if w.ty != llm170_gguf::GgmlType::Q8_0 {
+        return Err("gemv4 프로토타입은 q8_0만".into());
+    }
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let mut seed = 0x1234u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    let xa = ctx.alloc_host(t * n_in * 4)?;
+    for (j, x) in xs.iter().enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x.as_ptr(), xa.ptr.add(j * n_in) as *mut f32, n_in);
+        }
+    }
+    let ob = ctx.alloc_host(t * n_out * 4)?;  // 매핑 유지 — 판독용
+    // 가중 업로드 — gemv3와 동일한 균일 청크
+    let ch = ctx.max_ssbo;
+    let mut wbufs = Vec::new();
+    let mut off = 0usize;
+    let total = w.data.len();
+    while off < total {
+        let sz = ch.min(total - off);
+        let mut b = ctx.alloc(sz)?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, sz) };
+        ctx.unmap(&mut b)?;
+        wbufs.push(b.buf);
+        off += sz;
+    }
+    while wbufs.len() < 8 {
+        wbufs.push(wbufs[0]);
+    }
+    let chunk_words = (ch / 4) as u32;
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/gemv4_q8.spv")
+        .map_err(|e| e.to_string())?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 10, 24)?;
+    let _ = (dsl, pool);
+    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+    binds.push(xa.buf);
+    binds.push(ob.buf);
+    ctx.bind_bufs(ds, &binds);
+    let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words]);
+    let _ = pl;
+    ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(8) as u32, t as u32)?;
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; t * n_out];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+        v
+    };
+    // CPU 기준: 디양자화 내적
+    let mut mx = 0f64;
+    let mut ref_row = vec![0.0f32; n_in];
+    for (j, x) in xs.iter().enumerate() {
+        for r in 0..n_out.min(64) {
+            llm170_core::quant::dequant_row(
+                llm170_gguf::GgmlType::Q8_0, w.data, r as u64, n_in as u64, &mut ref_row);
+            let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            mx = mx.max((dot - outs[j * n_out + r]).abs() as f64);
+        }
+    }
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(8) as u32, t as u32)?;
+    }
+    let dt = t0.elapsed().as_secs_f64() / 10.0;
+    Ok(format!(
+        "gemv4({tname}) t={t}: {:.3}ms → {:.1}GB/s · max|D|={mx:.4}",
+        dt * 1e3,
+        w.data.len() as f64 / dt / 1e9
+    ))
 }
