@@ -958,7 +958,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     };
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else if is_q5 { 10 } else { 11 }, 28)?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else { 11 }, 28)?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
@@ -966,9 +966,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     if is_xs {
         binds.push(kb);
     }
-    if !is_q5 {
-        binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩; q5는 미사용)
-    }
+    binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
     ctx.bind_bufs(ds, &binds);
     let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
     let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words, rpf]);

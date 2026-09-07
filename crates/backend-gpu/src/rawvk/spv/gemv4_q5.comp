@@ -19,6 +19,7 @@ layout(binding = 6) readonly buffer W6c { uint w6[]; };
 layout(binding = 7) readonly buffer W7c { uint w7[]; };
 layout(binding = 8) readonly buffer Xbuf { float xa[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer YV4 { vec4 yv4[]; };   // xa의 vec4 뷰
 layout(push_constant) uniform PC {
     uint n_in; uint n_out; uint ty; uint t; uint chunk_words; uint rpf;
 } pc;
@@ -50,11 +51,11 @@ void main() {
     uint n_sub = n_in >> 5;          // 32원소 서브블록 8개/블록
     uint blocks = n_in >> 8;
     for (uint sb = tid; sb < n_sub; sb += 32u) {
-        float yv[32];
+        vec4 yy[8];
         float ysum = 0.0;
-        [[unroll]] for (uint k = 0; k < 32u; k++) {
-            yv[k] = xa[base + sb * 32u + k];
-            ysum += yv[k];
+        [[unroll]] for (uint k = 0; k < 8u; k++) {
+            yy[k] = yv4[(base + sb * 32u + 4u * k) >> 2u];
+            ysum += dot(yy[k], vec4(1.0));
         }
         uint P = (sb & 7u) >> 1;     // 스케일 페어 (블록 로컬)
         uint lohi = sb & 1u;         // lo/hi 니블
@@ -100,11 +101,10 @@ void main() {
                     hv = (hv >> (hrem * 8u)) | (w2 << ((4u - hrem) * 8u));
                 }
                 [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                    uint l = 4u * k + b;
                     uint qb = (qv >> (8u * b)) & 0xFFu;
                     int q = int(lohi == 0u ? (qb & 0xFu) : (qb >> 4u));
                     if (((hv >> (8u * b)) & qh_bit) != 0u) q += 16;
-                    ysum2 += float(q) * yv[l];
+                    ysum2 += float(q) * yy[k][b];
                 }
             }
             acc[r] += dl * ysum2 - dml * ysum;
