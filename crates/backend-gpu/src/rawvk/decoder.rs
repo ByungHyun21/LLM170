@@ -17,6 +17,7 @@ const GEMV6_XS_SPV: &[u8] = include_bytes!("spv/gemv6_xs.spv");
 const GEMV6_Q6_SPV: &[u8] = include_bytes!("spv/gemv6_q6.spv");
 const GEMV6_Q4_SPV: &[u8] = include_bytes!("spv/gemv6_q4.spv");
 const GEMV6_Q3_SPV: &[u8] = include_bytes!("spv/gemv6_q3.spv");
+const GEMV8_Q5_SPV: &[u8] = include_bytes!("spv/gemv8_q5.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -931,6 +932,30 @@ impl DecoderState {
             1, no.div_ceil(rpf as usize) as u32, t as u32)
     }
 
+    /// gemv8_q5 (plans/33) — llama mul_mat_vec_q5_k 완전 포트 (typed u16 로드,
+    /// SIMD-in-register 니블, fma 체인). 웜 162GB/s (역대 최고). LLM170_G8=1.
+    fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if ty != 13 {
+            return Err("gemv8: q5_K만".into());
+        }
+        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
+        while binds.len() < 8 {
+            binds.push(self.dummy.buf);
+        }
+        binds.push(xn);
+        binds.push(out);
+        // cw2: u16 단위 청크 상수 — 첫 버퍼는 실측 크기일 수 있어 pow2ceil 기준
+        let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
+        let cw2 = cw2.next_power_of_two();
+        let cw2_log2 = 31u32 - cw2.leading_zeros();
+        let cw2_mask = cw2 - 1;
+        let rpf: u32 = if no < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
+        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
+        self.run_pipe("gemv8_q5", GEMV8_Q5_SPV, 10, 24, &binds, &push,
+            1, no.div_ceil(rpf as usize) as u32, t as u32)
+    }
+
     /// gemv6_q5 (plans/33) — llama iqs lane 리맵 (연속 워드 스윕).
     /// 실DRAM +10.5% (79.7→88.1, L2방출 실측). LLM170_G6=1이면 q5에 우선.
     fn gemv6_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
@@ -967,6 +992,11 @@ impl DecoderState {
     /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
     /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
+        if t == 1 && std::env::var_os("LLM170_G8").is_some() {
+            if self.gemv8_q5(qsrc, wkey, out, t).is_ok() {
+                return Ok(());
+            }
+        }
         if t == 1 && std::env::var_os("LLM170_G6").is_some() {
             if self.gemv6_q5(qsrc, wkey, out, t).is_ok() {
                 return Ok(());

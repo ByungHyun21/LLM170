@@ -1,0 +1,150 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv8_q5 (plans/33) — llama mul_mat_vec_q5_k 완전 포트 (typed u16 로드).
+// 핵심 차이: 가중을 u16 배열로 직접 판독 (워드 조립/시프트 불필요 — llama
+// data_a_packed16 방식, 동일 버퍼의 u16 뷰 바인딩), SIMD-in-register 니블
+// 처리 (0x0F0F0F0F 마스크 + unpack8), fma 체인, 16스레드/블록 × 2블록 병렬.
+// 스레드 기하: itid=tid%16, il=itid/4, ir=itid%4, v_im=il/2, v_in=il%2,
+// l0=4*ir+2*v_in — llama calc_superblock 직역.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0 { uint16_t w0h[]; };
+layout(binding = 1) readonly buffer W1 { uint16_t w1h[]; };
+layout(binding = 2) readonly buffer W2 { uint16_t w2h[]; };
+layout(binding = 3) readonly buffer W3 { uint16_t w3h[]; };
+layout(binding = 4) readonly buffer W4 { uint16_t w4h[]; };
+layout(binding = 5) readonly buffer W5 { uint16_t w5h[]; };
+layout(binding = 6) readonly buffer W6 { uint16_t w6h[]; };
+layout(binding = 7) readonly buffer W7 { uint16_t w7h[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw2_log2; uint cw2_mask; uint rpf;
+} pc;
+
+// u16 인덱스 청크 워크 (cw2_* 는 u16 단위)
+uint16_t WG16(uint idx) {
+    uint c = idx >> pc.cw2_log2;
+    uint o = idx & pc.cw2_mask;
+    if (c == 0u) return w0h[o];
+    if (c == 1u) return w1h[o];
+    if (c == 2u) return w2h[o];
+    if (c == 3u) return w3h[o];
+    if (c == 4u) return w4h[o];
+    if (c == 5u) return w5h[o];
+    if (c == 6u) return w6h[o];
+    return w7h[o];
+}
+
+vec4 myunpack8(uint x) {
+    return vec4(
+        float((x        ) & 0xFFu),
+        float((x >> 8u  ) & 0xFFu),
+        float((x >> 16u) & 0xFFu),
+        float((x >> 24u) & 0xFFu));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint nbpc = n_in >> 8;           // 행당 256원소 블록 수
+    uint base = tok * n_in;
+
+    // llama 스레드 기하
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;
+    const uint il = itid / 4u;
+    const uint ir = itid - 4u * il;
+    const uint v_im = il / 2u;
+    const uint v_in = il % 2u;
+    const uint l0 = 4u * ir + 2u * v_in;
+    const uint q_offset = 32u * v_im + l0;
+    const uint y_offset = 64u * v_im + l0;
+    const uint y1_idx = y_offset;       // 블록 내 y 시작
+    const uint y2_idx = y_offset + 128u;
+
+    float temp[8];
+    for (uint i = 0u; i < RPF; i++) temp[i] = 0.0;
+
+    const uint it_size = 2u;            // 32/16
+    // 행 기저 (u16): 행 = row0+i, 블록 j → WG16 인덱스 = row*nbpc*88 + j*88
+    for (uint i = 0u; i < RPF; i++) {
+        uint row = row0 + i;
+        if (row >= pc.n_out) break;
+        uint rowbase16 = row * nbpc * 88u;
+        float acct = 0.0;
+        [[unroll]] for (uint jj = ix; jj < nbpc; jj += it_size) {
+            uint ib0 = rowbase16 + jj * 88u;
+            // dm (u16쌍 = f16 d/min)
+            uint dm_u32 = uint(WG16(ib0)) | (uint(WG16(ib0 + 1u)) << 16);
+            vec2 dm = unpackHalf2x16(dm_u32);
+            // scales — 단일 u16 3개 (llama: scales[v_im], [v_im+2], [v_im+4] — 각 1개씩)
+            uint scale0_u32 = uint(WG16(ib0 + 2u + v_im));
+            uint scale4_u32 = uint(WG16(ib0 + 2u + v_im + 2u));
+            uint scale8_u32 = uint(WG16(ib0 + 2u + v_im + 4u));
+            uint scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
+            uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2;
+            vec4 scale_0_4_l_f = myunpack8(scale_0_4_l & 0x3F3F3F3Fu);
+            vec4 scale8_f = myunpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h);
+            float sc0 = scale_0_4_l_f.x, sc1 = scale_0_4_l_f.y;
+            float sc2 = scale_0_4_l_f.z, sc3 = scale_0_4_l_f.w;
+            float sc4 = scale8_f.x, sc5 = scale8_f.y, sc6 = scale8_f.z, sc7 = scale8_f.w;
+            // qs — ql 영역 (u16 idx 24..87 = 바이트 48..175)
+            uint qs0_16_u32 = uint(WG16(ib0 + 24u + q_offset / 2u))
+                            | (uint(WG16(ib0 + 24u + q_offset / 2u + 8u)) << 16);
+            uint qs64_80_u32 = uint(WG16(ib0 + 24u + q_offset / 2u + 32u))
+                             | (uint(WG16(ib0 + 24u + q_offset / 2u + 40u)) << 16);
+            uint qs0_16_lo4 = qs0_16_u32 & 0x0F0F0F0Fu;
+            uint qs0_16_hi4 = (qs0_16_u32 >> 4) & 0x0F0F0F0Fu;
+            uint qs64_80_lo4 = qs64_80_u32 & 0x0F0F0F0Fu;
+            uint qs64_80_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0Fu;
+            // qh — u16 idx 8..23 (바이트 16..47)
+            uint qh = uint(WG16(ib0 + 8u + l0 / 2u)) | (uint(WG16(ib0 + 8u + l0 / 2u + 8u)) << 16);
+            uint qs0_16_lo4_off = ((qh >> (2u * v_im)) & 0x01010101u) << 4;
+            uint qs0_16_hi4_off = ((qh >> (2u * v_im)) & 0x02020202u) << 3;
+            uint qs64_80_lo4_off = ((qh >> (2u * v_im)) & 0x10101010u);
+            uint qs64_80_hi4_off = ((qh >> (2u * v_im)) & 0x20202020u) >> 1;
+            qs0_16_lo4 += qs0_16_lo4_off;
+            qs0_16_hi4 += qs0_16_hi4_off;
+            qs64_80_lo4 += qs64_80_lo4_off;
+            qs64_80_hi4 += qs64_80_hi4_off;
+            vec4 q_lo4 = myunpack8(qs0_16_lo4);
+            vec4 q_hi4 = myunpack8(qs0_16_hi4);
+            vec4 q2_lo4 = myunpack8(qs64_80_lo4);
+            vec4 q2_hi4 = myunpack8(qs64_80_hi4);
+            // y vec2 ×8
+            vec2 by10 = vec2(xa[base + jj * 256u + y1_idx], xa[base + jj * 256u + y1_idx + 1u]);
+            vec2 by116 = vec2(xa[base + jj * 256u + y1_idx + 16u], xa[base + jj * 256u + y1_idx + 17u]);
+            vec2 by132 = vec2(xa[base + jj * 256u + y1_idx + 32u], xa[base + jj * 256u + y1_idx + 33u]);
+            vec2 by148 = vec2(xa[base + jj * 256u + y1_idx + 48u], xa[base + jj * 256u + y1_idx + 49u]);
+            vec2 by20 = vec2(xa[base + jj * 256u + y2_idx], xa[base + jj * 256u + y2_idx + 1u]);
+            vec2 by216 = vec2(xa[base + jj * 256u + y2_idx + 16u], xa[base + jj * 256u + y2_idx + 17u]);
+            vec2 by232 = vec2(xa[base + jj * 256u + y2_idx + 32u], xa[base + jj * 256u + y2_idx + 33u]);
+            vec2 by248 = vec2(xa[base + jj * 256u + y2_idx + 48u], xa[base + jj * 256u + y2_idx + 49u]);
+            float sx = fma(by10.x, q_lo4.x, fma(by10.y, q_lo4.y, fma(by116.x, q_lo4.z, by116.y * q_lo4.w)));
+            float sy = fma(by132.x, q_hi4.x, fma(by132.y, q_hi4.y, fma(by148.x, q_hi4.z, by148.y * q_hi4.w)));
+            float sz = fma(by20.x, q2_lo4.x, fma(by20.y, q2_lo4.y, fma(by216.x, q2_lo4.z, by216.y * q2_lo4.w)));
+            float sw = fma(by232.x, q2_hi4.x, fma(by232.y, q2_hi4.y, fma(by248.x, q2_hi4.z, by248.y * q2_hi4.w)));
+            float smin = fma(by10.x + by10.y + by116.x + by116.y, sc2,
+                       fma(by132.x + by132.y + by148.x + by148.y, sc3,
+                       fma(by20.x + by20.y + by216.x + by216.y, sc6,
+                          (by232.x + by232.y + by248.x + by248.y) * sc7)));
+            acct = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))),
+                       fma(-dm.y, smin, acct));
+        }
+        temp[i] = acct;
+    }
+    // 32레인 축소 — llama의 16스레드/블록 구조상 subgroupAdd로 전체 합
+    for (uint i = 0u; i < RPF; i++) {
+        uint row = row0 + i;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(temp[i]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
