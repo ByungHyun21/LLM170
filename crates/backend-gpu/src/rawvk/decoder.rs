@@ -1016,10 +1016,10 @@ impl DecoderState {
 
     /// 비타일 gemv (원본 경로).
     fn gemv_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
-        if self.ktime {
-            *self.kkey.borrow_mut() = Some(format!("gemv:{wkey}"));
-        }
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if self.ktime {
+            *self.kkey.borrow_mut() = Some(format!("gemv:ty{ty}:{wkey}"));
+        }
         let xq_w = ni / 4 + ni / 32 + ni / 16;
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
