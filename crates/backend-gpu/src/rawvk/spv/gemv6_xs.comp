@@ -1,0 +1,102 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// gemv6_xs (plans/33) — llama iqs lane 리맵을 iq4_xs에 적용 (gemv6_q5 처방).
+// 블록 34워드: [0]=d+scales_h, [1]=scales_l, [2..33]=qs 32워드.
+// 웨이브프론트가 qs 워드를 연속 128B로 스윕 — 레인 L = 워드 (w-2),
+// ib=(w-2)>>2, k=(w-2)&3; ktab LDS 스테이징, 스케일 2패스.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0c { uint w0[]; };
+layout(binding = 1) readonly buffer W1c { uint w1[]; };
+layout(binding = 2) readonly buffer W2c { uint w2[]; };
+layout(binding = 3) readonly buffer W3c { uint w3[]; };
+layout(binding = 4) readonly buffer W4c { uint w4[]; };
+layout(binding = 5) readonly buffer W5c { uint w5[]; };
+layout(binding = 6) readonly buffer W6c { uint w6[]; };
+layout(binding = 7) readonly buffer W7c { uint w7[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+
+const uint BLK_W = 34u;   // 136B / 4
+shared float sh_dl[96][8];
+shared uint skt[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < 256u; i += 32u) skt[i] = ktab[i];
+    barrier();
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint roww = row * n_blk * BLK_W;
+        // 패스1: 블록 헤더(d·ls) → LDS
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = roww + b * BLK_W;
+            uint w0v = WG(bw);
+            float d = unpackHalf2x16(w0v).x;
+            uint sh = (w0v >> 16u) & 0xFFFFu;   // scales_h @2 — 워드정렬(34워드 블록: 136k mod4=0) ✓
+            uint w1v = WG(bw + 1u);             // scales_l @4
+            for (uint ib = 0u; ib < 8u; ib++) {
+                uint slb = (w1v >> (8u * (ib >> 1))) & 0xFFu;
+                int ls = int((slb >> (4u * (ib & 1u))) & 0xFu)
+                       | (int((sh >> (2u * ib)) & 3u) << 4);
+                sh_dl[b][ib] = d * float(ls - 32);
+            }
+        }
+        barrier();
+        // 패스2: qs 워드 선형 스윕 — 레인 L이 워드 (2 + L), 블록당 32워드 = 1스윕
+        float pacc = 0.0;
+        for (uint b = 0u; b < n_blk; b++) {
+            uint w = tid;                        // 0..31 → qs 워드 (2 + w)
+            uint ib = w >> 2;
+            uint k = w & 3u;
+            uint qv = WG(roww + b * BLK_W + 2u + w);   // 연속 128B
+            float dl = sh_dl[b][ib];
+            uint e0 = b * 256u + ib * 32u + k * 4u;    // lo 4원소
+            uint e1 = e0 + 16u;                        // hi 4원소
+            float s0 = 0.0, s1 = 0.0;
+            for (uint kk = 0u; kk < 4u; kk++) {
+                uint t2 = skt[(qv >> (8u * kk)) & 0xFFu];
+                float vlo = float((int(t2 & 0xFFu) << 24) >> 24);
+                float vhi = float((int(t2 >> 8u) << 24) >> 24);
+                s0 += vlo * xa[base + e0 + kk];
+                s1 += vhi * xa[base + e1 + kk];
+            }
+            pacc += dl * (s0 + s1);
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
