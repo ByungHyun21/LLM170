@@ -92,24 +92,29 @@ void main() {
                            | (((ktab[(aw >> 8u) & 0xFFu] >> 8u) & 0xFFu) << 8u)
                            | (((ktab[(aw >> 16u) & 0xFFu] >> 8u) & 0xFFu) << 16u)
                            | (((ktab[(aw >> 24u) & 0xFFu] >> 8u) & 0xFFu) << 24u);
-                // 에뮬레이션: 바이트별 i8×i8 적산 (dot4x8 미지원 툴체인)
-                int bl0 = int((bw        ) & 0xFFu) - ((bw        & 0x80u) != 0u ? 256 : 0);
-                int bl1 = int((bw >> 8u  ) & 0xFFu) - ((bw >> 8u  & 0x80u) != 0u ? 256 : 0);
-                int bl2 = int((bw >> 16u) & 0xFFu) - ((bw >> 16u & 0x80u) != 0u ? 256 : 0);
-                int bl3 = int((bw >> 24u) & 0xFFu) - ((bw >> 24u & 0x80u) != 0u ? 256 : 0);
-                qsum += (int(aw_lo & 0xFFu) - ((aw_lo & 0x80u) != 0u ? 256 : 0)) * bl0;
-                qsum += (int((aw_lo >> 8u) & 0xFFu) - (((aw_lo >> 8u) & 0x80u) != 0u ? 256 : 0)) * bl1;
-                qsum += (int((aw_lo >> 16u) & 0xFFu) - (((aw_lo >> 16u) & 0x80u) != 0u ? 256 : 0)) * bl2;
-                qsum += (int((aw_lo >> 24u) & 0xFFu) - (((aw_lo >> 24u) & 0x80u) != 0u ? 256 : 0)) * bl3;
+                // DOT 패치 마커 #LO# — 하드웨어 dot용 정준 패턴 (-O0 컴파일 후 asm 치환)
+                int sa0 = int((aw_lo       ) & 0xFFu) - (((aw_lo & 0x00000080u) != 0u ? 256 : 0));
+                int sa1 = int((aw_lo >> 8u ) & 0xFFu) - (((aw_lo & 0x00008000u) != 0u ? 256 : 0));
+                int sa2 = int((aw_lo >> 16u) & 0xFFu) - (((aw_lo & 0x00800000u) != 0u ? 256 : 0));
+                int sa3 = int((aw_lo >> 24u) & 0xFFu) - (((aw_lo & 0x80000000u) != 0u ? 256 : 0));
+                int sb0 = int((bw          ) & 0xFFu) - (((bw & 0x00000080u) != 0u ? 256 : 0));
+                int sb1 = int((bw  >> 8u   ) & 0xFFu) - (((bw & 0x00008000u) != 0u ? 256 : 0));
+                int sb2 = int((bw  >> 16u  ) & 0xFFu) - (((bw & 0x00800000u) != 0u ? 256 : 0));
+                int sb3 = int((bw  >> 24u  ) & 0xFFu) - (((bw & 0x80000000u) != 0u ? 256 : 0));
+                int p0 = sa0 * sb0; int p1 = sa1 * sb1; int p2 = sa2 * sb2; int p3 = sa3 * sb3;
+                qsum += p0; qsum += p1; qsum += p2; qsum += p3;
+                // DOT 패치 마커 #HI#
                 uint bw2 = xq[xbase + xw + 4u + k];
-                int bh0 = int((bw2        ) & 0xFFu) - ((bw2        & 0x80u) != 0u ? 256 : 0);
-                int bh1 = int((bw2 >> 8u  ) & 0xFFu) - ((bw2 >> 8u  & 0x80u) != 0u ? 256 : 0);
-                int bh2 = int((bw2 >> 16u) & 0xFFu) - ((bw2 >> 16u & 0x80u) != 0u ? 256 : 0);
-                int bh3 = int((bw2 >> 24u) & 0xFFu) - ((bw2 >> 24u & 0x80u) != 0u ? 256 : 0);
-                qsum += (int(aw_hi & 0xFFu) - ((aw_hi & 0x80u) != 0u ? 256 : 0)) * bh0;
-                qsum += (int((aw_hi >> 8u) & 0xFFu) - (((aw_hi >> 8u) & 0x80u) != 0u ? 256 : 0)) * bh1;
-                qsum += (int((aw_hi >> 16u) & 0xFFu) - (((aw_hi >> 16u) & 0x80u) != 0u ? 256 : 0)) * bh2;
-                qsum += (int((aw_hi >> 24u) & 0xFFu) - (((aw_hi >> 24u) & 0x80u) != 0u ? 256 : 0)) * bh3;
+                int sc0 = int((aw_hi       ) & 0xFFu) - (((aw_hi & 0x00000080u) != 0u ? 256 : 0));
+                int sc1 = int((aw_hi >> 8u ) & 0xFFu) - (((aw_hi & 0x00008000u) != 0u ? 256 : 0));
+                int sc2 = int((aw_hi >> 16u) & 0xFFu) - (((aw_hi & 0x00800000u) != 0u ? 256 : 0));
+                int sc3 = int((aw_hi >> 24u) & 0xFFu) - (((aw_hi & 0x80000000u) != 0u ? 256 : 0));
+                int sd0 = int((bw2         ) & 0xFFu) - (((bw2 & 0x00000080u) != 0u ? 256 : 0));
+                int sd1 = int((bw2 >> 8u   ) & 0xFFu) - (((bw2 & 0x00008000u) != 0u ? 256 : 0));
+                int sd2 = int((bw2 >> 16u  ) & 0xFFu) - (((bw2 & 0x00800000u) != 0u ? 256 : 0));
+                int sd3 = int((bw2 >> 24u  ) & 0xFFu) - (((bw2 & 0x80000000u) != 0u ? 256 : 0));
+                int q0 = sc0 * sd0; int q1 = sc1 * sd1; int q2 = sc2 * sd2; int q3 = sc3 * sd3;
+                qsum += q0; qsum += q1; qsum += q2; qsum += q3;
             }
             acc[r] += dl * yd * float(qsum);
         }
