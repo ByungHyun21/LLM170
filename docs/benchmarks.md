@@ -758,3 +758,18 @@ tile to int8 words in SHARED MEMORY once and reuses it across the whole
 output tile — the exact structure a 'gemv6' (shared-int8 tile + int
 dot, no coopmat, no f16) should copy. All groundwork for that kernel is
 now in-repo and reproducible.
+
+### gemv6 design note (2026-09-07, end of session)
+
+Pre-implementation analysis killed the 'shared-int8 tile' idea for the
+DECODE case: with t=1 the output dimension is rows, and each row's
+weights are distinct — unpack-to-shared amortizes only over the token
+dimension (which the coopmat tiles already exploit for prefill). So
+llama's decode win is NOT shared staging; it is (a) typed packed16/32
+buffer views replacing our manual word assembly, (b) their vecq LUT
+path being structurally equal to ours, and (c) the q8-style types
+having no LUT at all. Our per-type standalone rates bracket the
+ceiling: q8_0 257 GB/s (no LUT) vs iq4_xs 150 (4 L1 gathers + byte
+repack per word pair). Closing decode toward llama's 11.4 therefore
+splits into: arithmetic (LUT-free) unpack for q5/q4/q3/q6 (feasible —
+their dequant is shift/mask only), and the FFN-site in-engine mystery.
