@@ -960,3 +960,17 @@ tried — both are concrete, cheap experiments for the next session
 VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE or
 requiredSubgroupSize=16, plus rpf=2). This is the remaining
 untested launch-geometry gap against llama's 182GB/s effective.
+
+### sg16 + rpf=2 (llama RDNA3 launch geometry) — rejected (2026-09-07, close)
+
+Implemented ctx.pipeline16 (requiredSubgroupSize=16 via the subgroup
+size control pnext, the exact llama wg_size_subgroup16 mechanism) and
+ran gemv6_q5 with rpf=2 — llama's RDNA3 K-quant decode configuration.
+Warm rate 150.2 GB/s but true-DRAM (L2-evicted): 75.0 vs our
+wave32/rpf8's 102.9 — WORSE. llama's launch geometry does not
+transfer to our kernel shape; our 32-lane WG with rpf=8 remains the
+best measured configuration. This closes the launch-geometry lever
+list. The remaining decode gap against llama's 182GB/s effective is
+now attributable to their shader-level differences beyond geometry
+(typed packed16/32 buffer views, vec4 B loads with K_PER_ITER=4/8
+unrolling — a full llama mul_mat_vec shader port, not a config change).
