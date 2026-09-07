@@ -1282,7 +1282,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if is_q5 && std::env::var_os("LLM170_G7").is_some() {
+    let spv_path = if w.ty == llm170_gguf::GgmlType::Q8_0 && std::env::var_os("LLM170_G6").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv6_q8.spv"
+    } else if is_q5 && std::env::var_os("LLM170_G7").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv7_q5.spv"
     } else if is_q3 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q3.spv"
