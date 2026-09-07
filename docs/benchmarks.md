@@ -373,11 +373,18 @@ not a kernel effect). HIP regression 19/19 PASS (rawvk-only changes).
 iq4_xs follow-up: staged the iq4nl LUT into shared memory at workgroup
 start (llama's init_iq_shmem approach — 1KB, cooperative load + barrier).
 Standalone 122→138 GB/s and this one DOES translate in-engine: decode
-step 152.4→136.7 ms (tg ~6.3 t/s, +10% over gemv3). Gates: France
-exact, spec==nonspec x4 True, long exact.
+step 152.4→136.7 ms (-10%). End-to-end bench tg16 5.81 t/s (baseline
+5.68, +2.3% — per-token sampling/detok overhead absorbs part of the
+step win). Gates: France exact, spec==nonspec x4 True, long exact.
 
-Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg ~0.55×, pp 0.10×. Next
-levers: q5 engine-regression root cause, register-tile GEMM for prefill.
+Per-dispatch-fence attribution (LLM170_VK_NOBATCH=1 + LLM170_G4_SYNC)
+shows the gemv4 engine gap is NOT q5-specific: attention projections run
+at standalone rate (attn_qkv 0.338 vs 0.296 ms) while ALL FFN sites run
++30-42% over standalone (ffn_down 0.407→0.580 ms) — L2 pollution from
+the interleaved attention/conv kernels is the standing suspect.
+
+Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg 0.49-0.51×, pp 0.10×.
+Next levers: FFN-site L2 behavior, register-tile GEMM for prefill.
 
 ## Vulkan — FIXED (2026-09-05)
 
