@@ -910,8 +910,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
-    if !is_xs && w.ty != llm170_gguf::GgmlType::Q8_0 {
-        return Err("gemv4 프로토타입은 q8_0/iq4_xs만".into());
+    let is_q5 = w.ty == llm170_gguf::GgmlType::Q5K;
+    if !is_xs && !is_q5 && w.ty != llm170_gguf::GgmlType::Q8_0 {
+        return Err("gemv4 프로토타입은 q8_0/iq4_xs/q5_K만".into());
     }
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
@@ -950,12 +951,14 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let chunk_words = (ch / 4) as u32;
     let spv_path = if is_xs {
         "crates/backend-gpu/src/rawvk/spv/gemv4_xs.spv"
+    } else if is_q5 {
+        "crates/backend-gpu/src/rawvk/spv/gemv4_q5.spv"
     } else {
         "crates/backend-gpu/src/rawvk/spv/gemv4_q8.spv"
     };
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 11 } else { 10 }, 24)?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else if is_q5 { 10 } else { 11 }, 28)?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
@@ -963,15 +966,46 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     if is_xs {
         binds.push(kb);
     }
+    if !is_q5 {
+        binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩; q5는 미사용)
+    }
     ctx.bind_bufs(ds, &binds);
-    let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words]);
+    let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
+    let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words, rpf]);
     let _ = pl;
-    ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(8) as u32, t as u32)?;
+    ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
     let outs: Vec<f32> = unsafe {
         let mut v = vec![0f32; t * n_out];
         std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
         v
     };
+    if std::env::var_os("LLM170_G4_DBG").is_some() {
+        // 원-핏 재실행: x=e0 → out = 디양자화 w[.][0]
+        unsafe {
+            let p0 = xa.ptr as *mut f32;
+            for i in 0..t * n_in {
+                *p0.add(i) = 0.0;
+            }
+        }
+        for j in 0..t {
+            let k = std::env::var("LLM170_G4_HOT")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            unsafe { *(xa.ptr.add(j * n_in + k) as *mut f32) = 1.0; }
+        }
+        ctx.run(pl, ds, pipe, &push, n_out.div_ceil(8) as u32, t as u32, 1)?;
+        let o2: Vec<f32> = unsafe {
+            let mut v = vec![0f32; t * n_out];
+            std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+            v
+        };
+        let mut ref_row = vec![0.0f32; n_in];
+        let k = std::env::var("LLM170_G4_HOT")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        for r in 0..4u32 {
+            llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
+            eprintln!("g4dbg row{r}: gpu={:.6} cpu={:.6} w[{k}]", o2[r as usize], ref_row[k]);
+        }
+    }
     // CPU 기준: 디양자화 내적
     let mut mx = 0f64;
     let mut ref_row = vec![0.0f32; n_in];
@@ -985,7 +1019,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     }
     let t0 = Instant::now();
     for _ in 0..10 {
-        ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(8) as u32, t as u32)?;
+        ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
     }
     let dt = t0.elapsed().as_secs_f64() / 10.0;
     Ok(format!(

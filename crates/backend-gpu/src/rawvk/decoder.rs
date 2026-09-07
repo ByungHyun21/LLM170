@@ -7,6 +7,9 @@ use ash::vk;
 use std::collections::HashMap;
 
 const GDN_CONV_SPV: &[u8] = include_bytes!("spv/gdn_conv_t.spv");
+const GEMV4_Q8_SPV: &[u8] = include_bytes!("spv/gemv4_q8.spv");
+const GEMV4_Q5_SPV: &[u8] = include_bytes!("spv/gemv4_q5.spv");
+const GEMV4_XS_SPV: &[u8] = include_bytes!("spv/gemv4_xs.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
 const L2_SPV: &[u8] = include_bytes!("spv/l2_rows2.spv");
@@ -863,6 +866,57 @@ impl DecoderState {
 
     /// GEMV (12바인딩 gemv3): xq × 가중 → out.
     /// t≥2 + q5_K는 coopmat 128행 타일 (plans/20 — f16 스테이징 MMA,
+    /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
+    /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
+    fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
+        if t == 1 && std::env::var("LLM170_VK_GEMV4").map(|v| v == "1").unwrap_or(false) {
+            if self.gemv4_f32(qsrc, wkey, out, t).is_ok() {
+                return Ok(());
+            }
+        }
+        self.quant(qsrc, xq, nq, t)?;
+        self.gemv(xq, wkey, out, t)
+    }
+
+    /// plans/31 gemv4 — f32 활성 직결 (q8_0/q5_K/iq4_xs). llama 아키텍처.
+    fn gemv4_f32(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        let g4t = std::env::var_os("LLM170_G4TIME").is_some();
+        let (spv, pname): (&[u8], &'static str) = match ty {
+            8 => (GEMV4_Q8_SPV, "gemv4_q8"),
+            // q5_K gemv4는 스탠드얼론 97GB/s에도 엔진 내역행(실측 NOQ5 144ms < all 168ms)
+            // — 소형 attn 투영(rpf=1)의 y 재판독 탓. 기본 gemv3, 옵트인 LLM170_G4_Q5=1.
+            13 if std::env::var_os("LLM170_G4_Q5").is_some() => (GEMV4_Q5_SPV, "gemv4_q5"),
+            23 => (GEMV4_XS_SPV, "gemv4_xs"),
+            _ => return Err(format!("gemv4: 타입 {ty} 미지원")),
+        };
+        let n_kb = if ty == 23 { 12 } else if ty == 13 { 10 } else { 11 };
+        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
+        while binds.len() < 8 {
+            binds.push(self.dummy.buf);
+        }
+        binds.push(xn);
+        binds.push(out);
+        if ty == 23 {
+            binds.push(self.ktab.buf);
+        }
+        if ty != 13 {
+            binds.push(xn);   // yv4 vec4 뷰 (동일 버퍼 재바인딩; q5는 미사용)
+        }
+        let chunk_words = (wbufs.first().map(|b| b.bytes / 4).unwrap_or(1)) as u32;
+        // 소형 텐서는 행/WG 축소 — 병렬성 유지 (beta/alpha no=48 등)
+        let rpf: u32 = if no < 4096 { 1 } else { 8 };
+        let push = Self::push_u32s(&[ni as u32, no as u32, ty, t as u32, chunk_words, rpf]);
+        // 셰이더: .y=행블록, .z=tok — grid (1, ceil(no/rpf), t)
+        let t0 = std::time::Instant::now();
+        let r = self.run_pipe(pname, spv, n_kb, 28, &binds, &push,
+            1, no.div_ceil(rpf as usize) as u32, t as u32);
+        if g4t {
+            eprintln!("[g4time] {wkey} ty={ty} no={no} {:.3}ms", t0.elapsed().as_secs_f32() * 1e3);
+        }
+        r
+    }
+
     /// HIP 기본 WMMA와 동일 정확도 클래스 maxrel ~4.9e-4, argmax 안정).
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
@@ -1010,13 +1064,12 @@ impl DecoderState {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
                 self.rms(xs.buf, &format!("blk.{il}.attn_norm"), xn.buf, n, 1)?;
             }
-            self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
             if self.is_recr[il] {
                 // GDN 4 GEMV
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_qkv.weight"), self.b_gqkv.buf, 1)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_gate.weight"), self.b_gz.buf, 1)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_beta.weight"), self.b_gb.buf, 1)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ssm_alpha.weight"), self.b_ga.buf, 1)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_qkv.weight"), self.b_gqkv.buf, 1, n)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_gate.weight"), self.b_gz.buf, 1, n)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ssm_beta.weight"), self.b_gb.buf, 1, n)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ssm_alpha.weight"), self.b_ga.buf, 1, n)?;
                 let gskip = std::env::var("LLM170_VK_GDN_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                 // conv (t=1 — ring)
                 {
@@ -1116,9 +1169,9 @@ impl DecoderState {
                     let gtotal: usize = gbufs.iter().map(|b| b.bytes).sum();
                     eprintln!("#  ATTN3 ty={} ni={} no={} chunks={} bytes={} max_ssbo={} | L0qkv no={} chunks={} bytes={}", tyq, niq, noq, bufs.len(), total, self.max_ssbo, gno, gbufs.len(), gtotal);
                 }
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_q.weight"), self.b_aq.buf, 1)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_k.weight"), self.b_ak.buf, 1)?;
-                self.gemv(self.b_xq_n.buf, &format!("blk.{il}.attn_v.weight"), self.b_av.buf, 1)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_q.weight"), self.b_aq.buf, 1, n)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_k.weight"), self.b_ak.buf, 1, n)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_v.weight"), self.b_av.buf, 1, n)?;
                 // qk_rope
                 {
                     let qn = self.consts.get(&format!("blk.{il}.attn_q_norm")).cloned().ok_or("qn")?;
@@ -1167,16 +1220,14 @@ impl DecoderState {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
                 self.rms(xs.buf, &format!("blk.{il}.post_norm"), xn.buf, n, 1)?;
             }
-            self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
-            self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ffn_gate.weight"), self.b_fgate.buf, 1)?;
-            self.gemv(self.b_xq_n.buf, &format!("blk.{il}.ffn_up.weight"), self.b_fup.buf, 1)?;
+            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ffn_gate.weight"), self.b_fgate.buf, 1, n)?;
+            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ffn_up.weight"), self.b_fup.buf, 1, n)?;
             self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff)?;
-            self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, 1)?;
-            self.gemv(self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, 1)?;
+            self.gemv_w(self.b_fglu.buf.clone(), self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, 1, self.n_ff)?;
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n)?;
             // 실험: L0 FFN 직후 attn_q gemv 강제 (층 위치 vs 가중치 분리)
             if std::env::var_os("LLM170_VK_FORCE_AQ").is_some() && il == 0 {
-                self.gemv(self.b_xq_n.buf, "blk.3.attn_q.weight", self.b_aq.buf, 1)?;
+                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "blk.3.attn_q.weight", self.b_aq.buf, 1, n)?;
             }
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
@@ -1200,7 +1251,7 @@ impl DecoderState {
         }
         self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
         if !noba { self.ctx.begin_batch()?; };
-        self.gemv(self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1)?;
+        self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
@@ -1436,7 +1487,7 @@ impl DecoderState {
             ])?;
             self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff * t)?;
             self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, t)?;
-            self.gemv(self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, t)?;
+            self.gemv_w(self.b_fglu.buf.clone(), self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, t, self.n_ff)?;
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n * t)?;
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
@@ -1457,7 +1508,7 @@ impl DecoderState {
             self.rms(self.b_xs.buf, "output_norm", self.b_xn.buf, n, t)?;
             self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
             if !noba { self.ctx.begin_batch()?; };
-            self.gemv(self.b_xq_n.buf, "output.weight", self.b_lg_t.buf, t)?;
+            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg_t.buf, t, n)?;
             if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
             let mut out = vec![0f32; t * self.n_vocab];
             unsafe { std::ptr::copy_nonoverlapping(self.b_lg_t.ptr as *const f32, out.as_mut_ptr(), t * self.n_vocab) };
@@ -1470,9 +1521,8 @@ impl DecoderState {
                     self.m_e.ptr as *mut f32, n);
             }
             self.rms(self.m_e.buf, "output_norm", self.b_xn.buf, n, 1)?;
-            self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
             if !noba { self.ctx.begin_batch()?; };
-            self.gemv(self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1)?;
+            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
             if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
             let mut logits = vec![0f32; self.n_vocab];
             unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
@@ -1609,7 +1659,7 @@ impl DecoderState {
         self.gemv(self.m_xq.buf, "blk.64.ffn_up.weight", self.b_fup.buf, 1)?;
         self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff)?;
         self.quant(self.b_fglu.buf, self.b_xq_f.buf, self.n_ff, 1)?;
-        self.gemv(self.b_xq_f.buf, "blk.64.ffn_down.weight", self.b_fdown.buf, 1)?;
+        self.gemv_w(self.b_fglu.buf.clone(), self.b_xq_f.buf, "blk.64.ffn_down.weight", self.b_fdown.buf, 1, self.n_ff)?;
         self.axpy(self.m_cur.buf, self.b_fdown.buf, n)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; }
         if !with_head {
