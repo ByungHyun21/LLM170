@@ -936,3 +936,13 @@ of staged once), 40 barriers per WG (vs 16), and the serialized row
 dot inside each lane. Verdict: gemv6's structure is the local optimum
 for this shape; the llama gap is not y-handling. Kept as opt-in
 (LLM170_G7=1) with the harness route.
+
+### gemv6_q8 — rejected (2026-09-07, session close)
+
+The byte-per-lane mapping (32 lanes = 32 qs bytes) is exact
+(max|D|=0.0000) but collapses to 69-73 GB/s vs the existing gemv4_q8's
+257: each byte read becomes a separate WG() walker call with 4 lanes
+redundantly fetching the same word. q8_0's existing scalar-vectorized
+path (word-per-lane over 8-word strips) is already at the ceiling —
+q8 was never a straggler in the ktime data. Kept as a documented
+opt-in; engine q8 routing unchanged.
