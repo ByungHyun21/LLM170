@@ -881,3 +881,12 @@ the 210B-block word assembly or the staged-qh word rebuild, not the
 element formulas (all verified against CPU source). Not wired into the
 engine; vk-gemv4-check with LLM170_G6=1 + G4_HOT one-hots reproduces
 in seconds.
+
+- Update: found the primary gemv6_q6 defect — sh_dl was sized [8] per
+  block but q6_K has SIXTEEN scales per block (two 8-scale halves);
+  the n=1 paths read out of bounds. After fixing to [64][16] the
+  error collapsed from ~1e37 to 1.94 — a residual mismatch remains
+  (one-hots: some elements zero, some close-but-wrong), suspected in
+  the staged d or the lo/hi nibble-to-element pairing corner cases.
+  Next session: dump-based comparison of sh_dl[0][0] against a python
+  GGUF read of output.weight bytes 192-210.

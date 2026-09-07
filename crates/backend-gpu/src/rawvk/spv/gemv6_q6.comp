@@ -35,7 +35,7 @@ uint WG(uint idx) {
     return w7[o];
 }
 
-shared float sh_dl[64][8];   // d·sc — n*8+j
+shared float sh_dl[64][16];  // d·sc — 블록당 16 (n 2× 8)
 shared uint sh_qh[48][16];   // qh 16워드 (64B) — 워드 어셈블후 저장
 
 void main() {
@@ -75,9 +75,8 @@ void main() {
             sw[2] = WG(swi + 2u);
             sw[3] = WG(swi + 3u);
             sw[4] = WG(swi + 4u);
-            for (uint j = 0u; j < 8u; j++) {
-                uint sci = j;   // 바이트 인덱스 = srem + j 인 절대 바이트에서
-                uint absb = srem + j;
+            for (uint j = 0u; j < 16u; j++) {
+                uint absb = srem + j;   // sc 16B 전체 (워드 4+1개 걸침)
                 uint sc8 = (sw[absb >> 2] >> ((absb & 3u) * 8u)) & 0xFFu;
                 sc8 = (sc8 << 24u) >> 24u;   // i8 부호
                 sh_dl[b][j] = d * float(int(sc8));
