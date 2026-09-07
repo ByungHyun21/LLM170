@@ -995,3 +995,17 @@ fma/subgroupAdd accumulation order differs from gemv4/gemv3 by ulps,
 flipping ties in the t=1-vs-t≥2 comparison (same documented class as
 gemv6's caveat). Shipped opt-in (LLM170_G8=1) pending either a
 matching-order variant for verify batches or accepting the tie class.
+
+### gemv8 family extension — xs mapping note (2026-09-07, next session)
+
+The gemv8_q5 recipe (typed views + SIMD-in-register + fma) is the
+proven engine-winning template. For iq4_xs the llama generic
+mul_mat_vec mapping needs care: iqs = col/2 with iq = 16*ib32 +
+(iqs%16) and qshift = (iqs&16)>>2 — dequantize4 returns FOUR
+consecutive same-column elements from ONE word's nibbles, i.e. the
+lane covers 4 elements at col = ib32*32 + (iqs%16)*... plus the
+column split at iqs 16. Derive the exact col↔iqs table against our
+VERIFIED gemv4_xs mapping (byte b of sub → elements b lo, 16+b hi)
+before writing gemv8_xs; the same derivation then applies to
+q3/q4/q6 via their llama dequantize4 blocks in dequant_funcs.glsl
+(DATA_A_Q4_K etc.). y loads via the existing yv4 alias binding.
