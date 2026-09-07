@@ -314,10 +314,15 @@ Engine: tg16 2.52→5.68 t/s (+125%), pp64 2.65→12.45 t/s (+369% with
 LLM170_VKD_BATCH=1). tile128 (coopmat f16, q5_K t≥2) now opt-in
 (LLM170_VK_TILE=1): its numeric family diverged from the t=1 gemv and
 broke the spec==nonspec invariant (measured; NOTILE run restored exact
-equality). VKD_BATCH (step_batch prefill) remains opt-in and broken —
-state corruption after batch prefill (5-token France → repeated-token
-garbage; VKD_TRACE staged, root cause pending — likely conv-ring/AR
-interaction with the t>1 path).
+equality). VKD_BATCH root-caused: the corruption was the gemm_i8/quant_b8
+route (q5_K unpacked i8 weights, t≥2) — LLM170_VK_NOI8=1 reproduced
+correct ' Paris' immediately. i8 routing is now opt-in
+(LLM170_VK_I8ON=1) and batch prefill is functionally correct, but
+shows NO amortization gain (pp512 11.13 t/s ≈ per-token 12.45): the
+gemv inner dot loop is ALU-bound per token — weights are read once per
+chunk but the 32× dot work dominates. Prefill parity with llama-vk
+(127+ t/s) requires per-type register-tile GEMMs (weight fragment →
+all-tokens dot), the same structure as llama's mul_mat MMQ.
 
 llama.cpp Vulkan reference on this machine (server bench, Q4_K_XL):
 pp 127-431 t/s, tg 11.4-11.9. Our Vulkan standing after round 1: tg 0.48×,
