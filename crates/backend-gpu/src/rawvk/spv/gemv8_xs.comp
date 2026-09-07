@@ -1,0 +1,123 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv8_xs (plans/33) — gemv8 레시피(typed 뷰+SIMD 니블+fma)를 iq4_xs에 적용.
+// 매핑 유도 (검증 gemv4_xs 기하 대조):
+//   gemv4_xs: sub ib의 qs 워드 k(0..3), 바이트 b → t2=ktab[바이트],
+//   vlo → 원소 4k+b (lo열), vhi → 원소 16+4k+b (hi열).
+//   → qs 바이트 j(0..15) = 니블쌍: lo니블=원소 j, hi니블=원소 16+j.
+// llama 일반형: iqs = (col%256)/2? 아님 — xs QUANT_R=2: 원소 2개/바이트.
+//   dequantize4(iqs): ib32=iqs/16, iq=16*ib32+(iqs%16), qshift=(iqs&16)>>2 —
+//   iqs∈[0,16) → lo니블들 (원소 16*ib32 + iqs%16*1? — 각 바이트 lo니블=1원소.
+//   결론: 워드 4니블=4원소(같은 열), llama iqs는 원소/2 인덱스 (QUANT_R=2: 원소쌍).
+//   여기선 우리 매핑 그대로: 레인 L이 qs 워드(2+L..) — ktab 조인 후
+//   lo 4원소(4L..)·hi 4원소(16+4L..)를 vec4 fma로.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 1) readonly buffer W1 { uint w1u[]; };
+layout(binding = 2) readonly buffer W2 { uint w2u[]; };
+layout(binding = 3) readonly buffer W3 { uint w3u[]; };
+layout(binding = 4) readonly buffer W4 { uint w4u[]; };
+layout(binding = 5) readonly buffer W5 { uint w5u[]; };
+layout(binding = 6) readonly buffer W6 { uint w6u[]; };
+layout(binding = 7) readonly buffer W7 { uint w7u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0u[o];
+    if (c == 1u) return w1u[o];
+    if (c == 2u) return w2u[o];
+    if (c == 3u) return w3u[o];
+    if (c == 4u) return w4u[o];
+    if (c == 5u) return w5u[o];
+    if (c == 6u) return w6u[o];
+    return w7u[o];
+}
+
+const uint BLK_W = 34u;   // 136B / 4
+shared uint skt[256];
+shared float sh_dl[96][8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < 256u; i += 32u) skt[i] = ktab[i];
+    barrier();
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    // 레인 고정: qs 워드 L (0..31) → sub ib = L>>2, k = L&3
+    //   원소: lo열 4k..+3 (sub 내), hi열 16+4k..+3
+    uint ib = tid >> 2;
+    uint k4 = (tid & 3u) * 4u;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint roww = row * n_blk * BLK_W;
+        // 패스1: 헤더 → LDS (gemv4_xs 검증 산법)
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = roww + b * BLK_W;
+            uint w0v = WG(bw);
+            float d = unpackHalf2x16(w0v).x;
+            uint sh16 = (w0v >> 16u) & 0xFFFFu;
+            uint w1v = WG(bw + 1u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint slb = (w1v >> (8u * (j >> 1))) & 0xFFu;
+                int ls = int((slb >> (4u * (j & 1u))) & 0xFu)
+                       | (int((sh16 >> (2u * j)) & 3u) << 4);
+                sh_dl[b][j] = d * float(ls - 32);
+            }
+        }
+        barrier();
+        // 패스2: qs 선형 스윕 — 레인 L이 워드 (2 + L), ktab SIMD
+        float pacc = 0.0;
+        [[unroll]] for (uint b = 0u; b < n_blk; b++) {
+            uint qv = WG(roww + b * BLK_W + 2u + tid);
+            float dl = sh_dl[b][ib];
+            uint e0 = b * 256u + ib * 32u + k4;      // lo 4원소
+            uint e1 = e0 + 16u;                       // hi 4원소
+            // ktab[byte] = lo|hi<<8 — 4바이트 동시: t2_w = ktab 워드조회 4회 →
+            // lo 4값 = t2&0xFF (부호), hi 4값 = t2>>8 (부호)
+            vec4 vlo, vhi;
+            uint t20 = skt[qv & 0xFFu];
+            uint t21 = skt[(qv >> 8u) & 0xFFu];
+            uint t22 = skt[(qv >> 16u) & 0xFFu];
+            uint t23 = skt[(qv >> 24u) & 0xFFu];
+            vlo = vec4(
+                float((int(t20 & 0xFFu) << 24) >> 24),
+                float((int(t21 & 0xFFu) << 24) >> 24),
+                float((int(t22 & 0xFFu) << 24) >> 24),
+                float((int(t23 & 0xFFu) << 24) >> 24));
+            vhi = vec4(
+                float((int(t20 >> 8u) << 24) >> 24),
+                float((int(t21 >> 8u) << 24) >> 24),
+                float((int(t22 >> 8u) << 24) >> 24),
+                float((int(t23 >> 8u) << 24) >> 24));
+            vec4 ylo = vec4(xa[base + e0], xa[base + e0 + 1u], xa[base + e0 + 2u], xa[base + e0 + 3u]);
+            vec4 yhi = vec4(xa[base + e1], xa[base + e1 + 1u], xa[base + e1 + 2u], xa[base + e1 + 3u]);
+            pacc = fma(dot(vlo, ylo) + dot(vhi, yhi), dl, pacc);
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
