@@ -1268,7 +1268,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if is_xs {
+    let spv_path = if is_xs && std::env::var_os("LLM170_G6").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv6_xs.spv"
+    } else if is_xs {
         "crates/backend-gpu/src/rawvk/spv/gemv4_xs.spv"
     } else if is_q5 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q5.spv"
@@ -1279,7 +1281,8 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     };
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else { 11 }, if is_q5 && std::env::var_os("LLM170_G6").is_some() { 24 } else { 32 })?;
+    let g6 = std::env::var_os("LLM170_G6").is_some();
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else { 11 }, if g6 { 24 } else { 32 })?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
@@ -1292,7 +1295,6 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
     let cw_mask = (1u32 << cw_log2) - 1u32;
-    let g6 = is_q5 && std::env::var_os("LLM170_G6").is_some();
     let push = if g6 {
         push_u32s(&[n_in as u32, n_out as u32, t as u32, cw_log2, cw_mask, rpf])
     } else {

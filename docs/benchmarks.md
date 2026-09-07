@@ -835,3 +835,20 @@ False under G6 (accumulation-order ulp differences cross ties vs the
 gemv3 verify path) — the same class as the documented VL flat point.
 Shipped opt-in (LLM170_G6=1) with the tie caveat; the layout now needs
 to be replicated for iq4_xs/q8/q4_K/q3_K/q6_K where the FFN mass is.
+
+### Round 13 — gemv6_xs; engine absorbs kernel gains (2026-09-07)
+
+Replicated the llama lane layout to iq4_xs (gemv6_xs: 2-pass headers→LDS
+plus a linear qs-word sweep; one LDS-overflow bug caught by ffn_down's
+n_blk=68). Standalone exact, and the true-DRAM (L2-evicted) rate on
+ffn_down: 93.0 → 106.6 GB/s (+14.6%). Engine A/B with gemv6 on both
+q5+xs: 148.8 vs 145.1 ms — slightly worse, within noise.
+
+Conclusion of the decode campaign: every kernel-level DRAM gain this
+session (+10-15% per type, all verified at the kernel level) is
+absorbed by the engine step — the step is dominated by per-dispatch/
+serialization structure (~450 gemv dispatches/token across 64 layers),
+not by any single kernel's bandwidth. The next decode lever is
+therefore dispatch-count reduction (kernel fusion: per-layer
+norm+gemv, or multi-tensor batched gemv dispatches), a different class
+of work than kernel tuning.
