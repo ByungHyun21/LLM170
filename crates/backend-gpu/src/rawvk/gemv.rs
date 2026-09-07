@@ -903,6 +903,139 @@ fn hf(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
 }
 
+/// vk-gemt-check — 프리필 타일 GEMM(iq4_xs) 검증+타이밍. plans/32.
+pub fn gemt_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    use std::time::Instant;
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    if w.ty != llm170_gguf::GgmlType::Iq4Xs {
+        return Err("gemt 프로토타입은 iq4_xs만".into());
+    }
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let mut seed = 0x5678u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    let xa = ctx.alloc_host(t * n_in * 4)?;
+    for (j, x) in xs.iter().enumerate() {
+        unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), xa.ptr.add(j * n_in) as *mut f32, n_in); }
+    }
+    let ob = ctx.alloc_host(t * n_out * 4)?;
+    let ch0 = ctx.max_ssbo;
+    let mut wbufs = Vec::new();
+    let mut off = 0usize;
+    let total = w.data.len();
+    let ch = total.next_power_of_two().min(1usize << (63 - ch0.leading_zeros()));
+    while off < total {
+        let sz = ch.min(total - off);
+        let mut b = ctx.alloc(sz)?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, sz) };
+        ctx.unmap(&mut b)?;
+        wbufs.push(b.buf);
+        off += sz;
+    }
+    while wbufs.len() < 8 {
+        wbufs.push(wbufs[0]);
+    }
+    let cw = (ch / 4) as u32;
+    let cw_log2 = 31u32 - cw.leading_zeros();
+    let cw_mask = (1u32 << cw_log2) - 1u32;
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/gemt_xs.spv")
+        .map_err(|e| e.to_string())?;
+    let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 11, 20)?;
+    let _ = (dsl, pool);
+    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+    binds.push(xa.buf);
+    binds.push(ob.buf);
+    binds.push(kb);
+    ctx.bind_bufs(ds, &binds);
+    let push = push_u32s(&[n_in as u32, n_out as u32, t as u32, cw_log2, cw_mask]);
+    let _ = pl;
+    ctx.run(pl, ds, pipe, &push,
+        n_out.div_ceil(8) as u32, t.div_ceil(32) as u32, 1)?;
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; t * n_out];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+        v
+    };
+    // CPU 기준: 디양자화 내적 — 전 토큰 × 64행 (토큰별 분리)
+    let mut mx = 0f64;
+    let mut per_tok = vec![0f64; t];
+    let mut ref_row = vec![0.0f32; n_in];
+    for r in 0..n_out.min(64) {
+        llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
+        for (j, x) in xs.iter().enumerate() {
+            let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            let d = (dot - outs[j * n_out + r]).abs() as f64;
+            mx = mx.max(d);
+            per_tok[j] = per_tok[j].max(d);
+        }
+    }
+    eprintln!("per-tok max|D|: {:?}", &per_tok[..t.min(8)]);
+    if std::env::var_os("LLM170_GMT_DUP").is_some() {
+        // 두 토큰에 동일 랜덤 벡터 — 누산 대칭성 확인
+        unsafe {
+            std::ptr::copy_nonoverlapping(xs[0].as_ptr(), xa.ptr.add(n_in) as *mut f32, n_in);
+        }
+        ctx.run(pl, ds, pipe, &push, n_out.div_ceil(8) as u32, t.div_ceil(32) as u32, 1)?;
+        let o2: Vec<f32> = unsafe {
+            let mut v = vec![0f32; t * n_out];
+            std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+            v
+        };
+        let d01 = (o2[0] - o2[n_out]).abs();
+        eprintln!("dup: tok0={:.6} tok1={:.6} |diff|={:.6}", o2[0], o2[n_out], d01);
+    }
+    if let Ok(hk) = std::env::var("LLM170_GMT_HOT") {
+        let hk: usize = hk.parse().unwrap_or(0);
+        unsafe {
+            let p0 = xa.ptr as *mut f32;
+            for i in 0..t * n_in { *p0.add(i) = 0.0; }
+            *p0.add(hk) = 1.0;              // tok0 = e_hk
+            if t > 1 { *p0.add(n_in + 5) = 1.0; }  // tok1 = e_5
+        }
+        ctx.run(pl, ds, pipe, &push, n_out.div_ceil(8) as u32, t.div_ceil(32) as u32, 1)?;
+        let o2: Vec<f32> = unsafe {
+            let mut v = vec![0f32; t * n_out];
+            std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+            v
+        };
+        let mut rr = vec![0.0f32; n_in];
+        llm170_core::quant::dequant_row(w.ty, w.data, 0, n_in as u64, &mut rr);
+        eprintln!("hot{hk}: tok0 gpu={:.6} w0[{hk}]={:.6} w0[5]={:.6} | tok1 gpu={:.6}",
+            o2[0], rr[hk], rr[5], o2.get(n_out).copied().unwrap_or(0.0));
+    }
+    if std::env::var_os("LLM170_GMT_DBG").is_some() {
+        llm170_core::quant::dequant_row(w.ty, w.data, 0, n_in as u64, &mut ref_row);
+        let dot0: f32 = ref_row.iter().zip(xs[0].iter()).map(|(a, b)| a * b).sum();
+        eprintln!("gmt dbg: tok0 r0 cpu={:.6} gpu={:.6}", dot0, outs[0]);
+        if t > 1 {
+            let dot1: f32 = ref_row.iter().zip(xs[1].iter()).map(|(a, b)| a * b).sum();
+            eprintln!("gmt dbg: tok1 r0 cpu={:.6} gpu={:.6}", dot1, outs[n_out]);
+        }
+    }
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        ctx.run(pl, ds, pipe, &push,
+            n_out.div_ceil(8) as u32, t.div_ceil(32) as u32, 1)?;
+    }
+    let dt = t0.elapsed().as_secs_f64() / 10.0;
+    // 실효 대역폭: 가중 1회 + y (no/8 WG × t×n_in×4B... L2 히트 가정하고 가중만)
+    Ok(format!(
+        "gemt({tname}) t={t}: {:.3}ms · 가중 {:.1}GB/s · tok당 {:.1}µs · max|D|={mx:.4}",
+        dt * 1e3,
+        w.data.len() as f64 / dt / 1e9,
+        dt * 1e6 / t as f64,
+    ))
+}
+
 /// vk-gemv4-check — llama 아키텍처 프로토타입(q8_0, f32 활성) 검증+타이밍.
 pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
