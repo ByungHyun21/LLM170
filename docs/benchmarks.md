@@ -646,3 +646,25 @@ state scan, KV writes, attention history) — the next prefill lever is
 attributing and batching those. An earlier in-session reading of
 '3,295 t/s prefill' was a misread of a decode-step profile line at
 pos=512; the bench numbers above are the authoritative prefill figures.
+
+### Round 4 — full tile family + kernel-time attribution (2026-09-07)
+
+Added a generic per-kernel timer (LLM170_VK_KTIME=1, best with
+LLM170_VK_NOBATCH=1; per-weight keys for gemv). Attribution on a
+128-token prefill (t=32 chunks): gemv 784ms dominated — the q8_0
+(ssm_out) and q4_K (attention layers' FFN) tensors had no tiles.
+Ported tile_q8 (34B q8_0 blocks) and tile_q4k (144B q4_K, the q5
+variant minus the high-bit plane; shift/mask chunk walker). One
+numbering trap recorded: q8_0 is ty=8 (a first attempt keyed ty=7
+silently matched nothing).
+
+Batch compute 1144→804ms; pp512 26.0→39.1 t/s (+50%; cumulative
++250% over the per-token 11.2 baseline). Tile-mode smoke: coherent
+continuation on a 64-token prompt; default path untouched (tiles stay
+opt-in behind LLM170_VK_TILE=1). HIP regression 19/19 PASS.
+
+Standing mystery for the next round: bench wall time still runs ~4×
+the summed kernel time (13.1s vs ~3.2s for pp512) — a per-token
+~24ms non-kernel overhead somewhere between Engine::prefill and
+step_batch. tiles: tile128 205ms, tile_q4k 75ms, tile_xs 75ms per
+128 tokens; gemv residual ~300ms.
