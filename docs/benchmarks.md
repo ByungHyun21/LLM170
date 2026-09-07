@@ -852,3 +852,18 @@ not by any single kernel's bandwidth. The next decode lever is
 therefore dispatch-count reduction (kernel fusion: per-layer
 norm+gemv, or multi-tensor batched gemv dispatches), a different class
 of work than kernel tuning.
+
+### Correction — dispatch theory rejected by direct measurement (2026-09-07)
+
+Added a t=1 ktime report (step-path hook): decode step wall 212.1ms vs
+kernel sum 200.7ms in NOBATCH mode — kernels are ~95% of the step;
+dispatch/launch overhead is NOT the bottleneck (the batched 145ms wall
+further pipelines the small kernels). The Round-13 'dispatch-count'
+conclusion is retracted. What the breakdown does show: gemv4_xs 22.8ms
+(69 calls), rms 21.4ms (128 — inflated by per-dispatch fences in
+NOBATCH), quant 11.4, gdn_ar 10.4, gemv4_q8 5.6, plus a long tail of
+per-weight q5/q6/q3 gemv entries (the top-12 cut hides ~95ms). Decode
+remains weight-traffic-bound: the next lever is raising the effective
+per-type bandwidth of the remaining gemv tail (q5/q6/q3 via the gemv6
+layout) and the rms/quant/elementwise minor kernels' real batched
+costs (needs timestamp queries; per-dispatch fences distort them).

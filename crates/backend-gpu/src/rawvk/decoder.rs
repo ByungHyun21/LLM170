@@ -1406,6 +1406,16 @@ impl DecoderState {
             }
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        if self.ktime {
+            let mut v: Vec<_> = self.ktimes.iter().collect();
+            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            let tot: f64 = v.iter().map(|(_, (e, _))| *e).sum();
+            eprintln!("[ktime1] wall {:.1}ms · 커널합 {tot:.1}ms", vk_t0.elapsed().as_secs_f32() * 1e3);
+            for (k, (e, c)) in v.iter().take(12) {
+                eprintln!("[ktime1] {:22} {:9.1}ms ({}회)", k, e, c);
+            }
+            self.ktimes.clear();
+        }
         if std::env::var_os("LLM170_VK_PROF").is_some() { eprintln!("[vkprof] step: {:.1}ms (pos {})", vk_t0.elapsed().as_secs_f32()*1e3, pos); }
         if std::env::var_os("LLM170_VKD_TRACE").is_some() {
             let s = |b: &VkBuf, len: usize| -> f64 {
