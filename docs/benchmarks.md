@@ -613,3 +613,25 @@ across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
   gdn_beta_g) — pp512 318-320 (+5% over default) at 1e-7-level numeric
   drift (flips argmax on one sensitive prompt). Default keeps the exact
   CPU-mirror bit contract.
+
+## Vulkan functional audit — np/mtp/mmproj matrix (2026-09-07)
+
+The VL (mmproj) gate had never run against the Vulkan decoder
+(verify_vl.py leaves LLM170_GPU_RUNTIME unset → HIP default). Audited
+explicitly (`LLM170_GPU_RUNTIME=vulkan`):
+
+- HIP reference: 5/5 PASS (vl_spec_np2_seq0 adjudicated tie @gen[12],
+  top-2 gap 0.629 < ε=1.0 — the documented 494/16311 flat point).
+- Vulkan current: vl_spec_short / vl_spec_np2_seq1 / vl_spec_long PASS;
+  vl_spec_np2_seq0 diverged @gen[12] (same 494-vs-16311 pair, no <ε gap
+  evidence that run); vl_np2_isolation failed in the judge run but PASSED
+  on direct re-run.
+- Vulkan pre-session binary (26f34a3 worktree): vl_spec_np2_seq0 also
+  FAILS (@gen[15]) — the flaky flat point predates this session's work;
+  isolation passed there.
+
+Conclusion: text np4/spec/long exact (established), VL+Vulkan functional
+with one run-to-run flaky borderline at the known flat point — the same
+class HIP adjudicates as tie. Divergence position and isolation verdict
+move between runs and binaries (ViT embedding ulp sensitivity suspected).
+Not a functional break; tracked as the known flat-point class.
