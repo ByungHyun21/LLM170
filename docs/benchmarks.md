@@ -696,3 +696,22 @@ byte), direct i8 scales at 192, f16 d at 208 with word-span assembly.
 France-through-batched-prefill verified ' Paris'; pp512 45.4 → 47.3
 t/s. Session cumulative prefill: 11.2 → 47.3 (+323%, 0.37× llama-vk).
 Remaining gemv tail: iq3_s (ty21) stragglers only. HIP 19/19.
+
+### Decode round — two hypotheses rejected (2026-09-07)
+
+Attacking the FFN-site gemv slowdown (+30-42% over standalone) with
+llama/HIP-architecture analogies:
+
+1. GTT dirty-line theory (LLM170_G4_YDEV=1): stage the activation vector
+   into a device-memory buffer before each gemv4. A/B: 141.6 vs 142.1 ms
+   — no effect. Rejected.
+2. Tile-everything decode (LLM170_VK_TILE1=1, threshold 16→1): route the
+   t=1 decode through the coopmat tiles like our HIP backend's WMMA
+   path. A/B: 150.8 vs 144.0 ms — slightly worse; at t=1 the f16
+   A-staging (full weight dequant per step) is not amortized, and our
+   tile staging is not pipelined the way HIP's WMMA loop must be.
+   Rejected for now; the HIP tg=10.4 analog remains unexplained.
+
+Both knobs are kept as documented opt-in experiments. Decode standing:
+~144 ms step (tg 6.2-6.3, 0.55× llama-vk). Prefill standing: 47.3 t/s
+(0.37×).

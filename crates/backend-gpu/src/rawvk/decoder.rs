@@ -129,6 +129,7 @@ pub struct DecoderState {
     // 스크래치 (t_max)
     b_xs: VkBuf,
     b_xn: VkBuf,
+    b_ydev: VkBuf,   // 디바이스 메모리 y 스테이징 (G4_YDEV 실험)
     b_xq_n: VkBuf,
     b_xq_f: VkBuf,
     b_xq_g: VkBuf,
@@ -593,6 +594,10 @@ impl DecoderState {
                 a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(T_MAX * n)?, a(8)?,
             )
         };
+        // y 디바이스 스테이징 — GTT 더티라인 가설 실험 (LLM170_G4_YDEV=1)
+        let b_ydev = ctx
+            .alloc(T_MAX * hp.n_ff.max(n) * 4)
+            .map_err(|e| e.to_string())?;
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
         let (mut mkk, mut mvv) = (Vec::new(), Vec::new());
         if mtp_on {
@@ -776,6 +781,7 @@ impl DecoderState {
             dummy,
             b_xs,
             b_xn,
+            b_ydev,
             b_xq_n,
             b_xq_f,
             b_xq_g,
@@ -914,17 +920,22 @@ impl DecoderState {
             23 => (GEMV4_XS_SPV, "gemv4_xs"),
             _ => return Err(format!("gemv4: 타입 {ty} 미지원")),
         };
+        let ydev_on = std::env::var_os("LLM170_G4_YDEV").is_some();
+        if ydev_on {
+            self.copy_off(xn, self.b_ydev.buf, ni * t, 0)?;
+        }
+        let xn_eff = if ydev_on { self.b_ydev.buf } else { xn };
         let n_kb = if ty == 23 { 12 } else { 11 };
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
             binds.push(self.dummy.buf);
         }
-        binds.push(xn);
+        binds.push(xn_eff);
         binds.push(out);
         if ty == 23 {
             binds.push(self.ktab.buf);
         }
-        binds.push(xn);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
+        binds.push(xn_eff);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
         // 청크 산술어: 첫 버퍼가 싱글청크(non-pow2)일 수 있으므로 pow2ceil 기준 —
         // 마스크 랩으로 가상 청크1 OOB 방지 (실측 spec==nonspec 붕괴의 원인)
         let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
