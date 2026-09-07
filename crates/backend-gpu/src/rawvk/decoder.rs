@@ -482,8 +482,12 @@ impl DecoderState {
         for (name, data, ty, ni, no) in weights {
             let mut bufs = Vec::new();
             let mut off = 0usize;
+            // gemv4 WG() 시프트 산술 — 청크 크기 2의 거듭제곱. 마지막 청크는 실제 크기만
+            // 할당: o = idx & mask 는 항상 청크 내 실데이터 오프셋이라 패딩 불필요.
+            let ch_eff = data.len().next_power_of_two().min(1usize << (63 - ctx.max_ssbo.leading_zeros()));
             while off < data.len() {
-                let sz = ctx.max_ssbo.min(data.len() - off);
+                let rem = data.len() - off;
+                let sz = ch_eff.min(rem);
                 let mut b = ctx.alloc(sz)?;
                 unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(off), b.ptr, sz) };
                 ctx.unmap(&mut b)?;
@@ -901,13 +905,19 @@ impl DecoderState {
             binds.push(self.ktab.buf);
         }
         binds.push(xn);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
-        let chunk_words = (wbufs.first().map(|b| b.bytes / 4).unwrap_or(1)) as u32;
+        // 청크 산술어: 첫 버퍼가 싱글청크(non-pow2)일 수 있으므로 pow2ceil 기준 —
+        // 마스크 랩으로 가상 청크1 OOB 방지 (실측 spec==nonspec 붕괴의 원인)
+        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+        let cw_log2 = 31u32 - cw.leading_zeros();
+        let cw_mask = (1u32 << cw_log2) - 1u32;
         // 소형 텐서는 행/WG 축소 — 병렬성 유지 (beta/alpha no=48 등)
-        let rpf: u32 = if no < 4096 { 1 } else { 8 };
-        let push = Self::push_u32s(&[ni as u32, no as u32, ty, t as u32, chunk_words, rpf]);
+        // rpf 오버라이드: 지연 은폐를 위한 오버서브스크립션 스윕 (llama는 2행/WG×8704WG)
+        let rpf: u32 = std::env::var("LLM170_G4_RPF").ok().and_then(|v| v.parse().ok())
+            .unwrap_or(if no < 4096 { 1 } else { 8 });
+        let push = Self::push_u32s(&[ni as u32, no as u32, ty, t as u32, cw_log2, cw_mask, rpf]);
         // 셰이더: .y=행블록, .z=tok — grid (1, ceil(no/rpf), t)
         let t0 = std::time::Instant::now();
-        let r = self.run_pipe(pname, spv, n_kb, 28, &binds, &push,
+        let r = self.run_pipe(pname, spv, n_kb, 32, &binds, &push,
             1, no.div_ceil(rpf as usize) as u32, t as u32);
         if g4t {
             if std::env::var_os("LLM170_G4_SYNC").is_some() {
