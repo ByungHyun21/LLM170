@@ -6,7 +6,10 @@
 // W4A8 GEMV (q5_K/q4_K/q6_K/iq4_xs) — rawhip gemm_* 계열의 GLSL 포트.
 // 워크그룹=64스레드=1행, y=토큰. 레인 부담 sb = l + m*64 순차 (HIP 동일).
 // dot4는 4×i8 signed int 곱으로 전개 (V_DOT4 미사용 — ALU 여유, BW 바운드).
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
+// plans/30: 단일행 × 256레인 (측정 최적 — 4행×64는 39KB LDS로 점유율 붕괴).
+const uint NT = 256u;
+const int NTI = 256;
 // 가중 청크 0..7 (각 ≤128MB, RADV maxStorageBufferRange 대응) + xq + out
 layout(binding = 0) readonly buffer W0 { uint w0c[]; };
 layout(binding = 1) readonly buffer W1 { uint w1c[]; };
@@ -26,6 +29,7 @@ layout(push_constant) uniform PC {
 
 // 행 전체 공유 스테이징 — 가중 1회 판독, 토큰 내부 루프.
 shared uint sh[3400];
+shared double shd[8];
 uint wr0;
 uint WGS(uint w) { return sh[w - wr0]; }
 
@@ -65,10 +69,10 @@ int dot4(uint a, uint b, int c) {
 
 
 void main() {
+    uint l = gl_LocalInvocationID.x;
     uint o = gl_WorkGroupID.x;      // 행 = 워크그룹
     if (o >= pc.n_out) return;
     if (pc.ty == 999u) { outv[o] = float(o); return; }  // plans/29 기록경로 프로브
-    uint l = gl_LocalInvocationID.x;
     int n_in = int(pc.n_in);
     int blocks = n_in >> 8;
     int row_bytes = pc.ty == 13u ? blocks * 176
@@ -81,7 +85,7 @@ void main() {
                   : blocks * 136;
     wr0 = (uint(int(o)) * uint(row_bytes)) >> 2u;
     uint wr1 = (uint(int(o)) * uint(row_bytes) + uint(row_bytes) + 3u) >> 2u;
-    for (uint wi = wr0 + l; wi < wr1; wi += 64u) sh[wi - wr0] = WG(wi);
+    for (uint wi = wr0 + l; wi < wr1; wi += NT) sh[wi - wr0] = WG(wi);
     barrier();
 
     for (uint tok = 0u; tok < pc.t; tok++) {
@@ -89,11 +93,11 @@ void main() {
     uint base = tok * pc.xq_w;
     if (pc.ty == 13u) {          // q5_K
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 176;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) + (m * NTI);
             int js = sb & 7;
             int it = js >> 1;
             int halfb = js & 1;
@@ -135,11 +139,11 @@ void main() {
         }
     } else if (pc.ty == 12u) {   // q4_K
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 144;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) + (m * NTI);
             int js = sb & 7;
             int it = js >> 1;
             int halfb = js & 1;
@@ -176,11 +180,11 @@ void main() {
         }
     } else if (pc.ty == 14u) {   // q6_K
         int n_g = n_in >> 4;
-        int cnt = (n_g + 63 - int(l)) >> 6;
+        int cnt = (n_g + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 210;
         for (int m = 0; m < cnt; m++) {
-            int g = int(l) + (m << 6);
+            int g = int(l) + (m * NTI);
             int blk = g >> 4;
             int kloc = g - (blk << 4);
             int wb = row_base + blk * 210;
@@ -232,10 +236,10 @@ void main() {
         }
     } else if (pc.ty == 8u) {    // q8_0
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int row_base = int(o) * n_sub * 34;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) + (m * NTI);
             int wb = row_base + sb * 34;
             float d;
             {
@@ -258,10 +262,10 @@ void main() {
         }
     } else if (pc.ty == 20u) {   // iq4_nl — ktab2 룩업
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int row_base = int(o) * n_sub * 18;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) + (m * NTI);
             int wb = row_base + sb * 18;
             float d = unpackHalf2x16(WGS(uint(wb >> 2)) >> uint((wb & 3) * 8)).x;
             bool al = ((wb & 3) == 2);
@@ -287,11 +291,11 @@ void main() {
         }
     } else if (pc.ty == 11u) {   // q3_K — 16원소 하프블록
         int n_h = n_in >> 4;
-        int cnt = (n_h + 63 - int(l)) >> 6;
+        int cnt = (n_h + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 110;
         for (int m = 0; m < cnt; m++) {
-            int h = int(l) + (m << 6);
+            int h = int(l) + (m * NTI);
             int blk = h >> 4;
             int kloc = h - (blk << 4);
             int hh = kloc >> 3;
@@ -338,11 +342,11 @@ void main() {
         }
     } else if (pc.ty == 21u) {   // iq3_s
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 110;
         for (int m = 0; m < cnt; m++) {
-            int sub = int(l) + (m << 6);
+            int sub = int(l) + (m * NTI);
             int blk = sub >> 3;
             int h = sub & 7;
             int wb = row_base + blk * 110;
@@ -375,11 +379,11 @@ void main() {
         }
     } else {                     // iq4_xs (23)
         int n_sub = n_in >> 5;
-        int cnt = (n_sub + 63 - int(l)) >> 6;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
         int blocks = n_in >> 8;
         int row_base = int(o) * blocks * 136;
         for (int m = 0; m < cnt; m++) {
-            int sb = int(l) + (m << 6);
+            int sb = int(l) + (m * NTI);
             int b = sb >> 3;
             int ib = sb & 7;
             int wb = row_base + b * 136;
@@ -398,13 +402,14 @@ void main() {
                 uint yv1 = xq[base + uint(xw + 4 + k)];
                 // iq4xs: lo 바이트 = 원소 0..15 (니블 lo), hi = 16..31 — CPU 미러 열 순서.
                 // HIP: lo/hii 워드를 k, k+4 y워드와 페어 — 여기 동일.
+                // plans/30: KVAL const배열(동적 인덱스 → 스크래치/셀렉트체인)을
+                // ktab SSBU 룩업으로 — 1KB라 L1 상주.
                 int lo = 0, hi = 0;
                 for (int b2 = 3; b2 >= 0; b2--) {
                     uint nb = (qv >> uint(8 * b2)) & 0xFFu;
-                    int vlo = KVAL(int(nb & 0xFu));
-                    int vhi = KVAL(int(nb >> 4));
-                    lo = (lo << 8) | (vlo & 0xFF);
-                    hi = (hi << 8) | (vhi & 0xFF);
+                    uint t2 = ktab[nb];
+                    lo = (lo << 8) | int(t2 & 0xFFu);
+                    hi = (hi << 8) | int(t2 >> 8);
                 }
                 isum = dot4(uint(lo), yv0, isum);
                 isum = dot4(uint(hi), yv1, isum);
@@ -414,8 +419,17 @@ void main() {
         }
     }
 
-    // 토큰당 축소 — subgroupAdd(f64)
-    double accd = subgroupAdd(double(acc));
-    if (l == 0u) outv[tok * pc.n_out + o] = float(accd);
+    // 토큰당 축소 — 서브그룹 f64 + 런타임 서브그룹수 트리 (256스레드).
+    double sub = subgroupAdd(double(acc));
+    uint sgid = gl_SubgroupInvocationID;
+    if (sgid == 0u) shd[gl_SubgroupID] = sub;
+    barrier();
+    uint ns = gl_NumSubgroups;
+    for (uint stride = ns >> 1u; stride > 0u; stride >>= 1u) {
+        if (l < stride) shd[l] += shd[l + stride];
+        barrier();
+    }
+    if (l == 0u) outv[tok * pc.n_out + o] = float(shd[0]);
+    barrier();
     } // 토큰 루프
 }
