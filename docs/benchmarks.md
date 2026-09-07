@@ -909,3 +909,17 @@ campaign is complete: the remaining decode gap to llama is NOT in
 per-kernel access patterns of these types — next candidates are the
 q3/q4/iq3_s tail, the elementwise minors (rms/quant/axpy ~30ms/step
 combined), and timestamp-level attribution of batched execution.
+
+### gemv6 5-type engine verdict (2026-09-07, session close)
+
+Full-family A/B (all five types routed, two runs): g4 142.0/143.9 vs
+g6 149.3/140.9 ms — statistically neutral within the session-long
+140-152ms noise band. Final decode campaign verdict: the llama lane
+layout delivers real, verified per-kernel true-DRAM gains (+10-15% on
+every type) but the engine step remains dominated by aggregate weight
+traffic at the ~105-110GB/s system floor. With q3/q4/q5/xs/q6 all
+lane-remapped and exact, per-kernel access patterns are no longer the
+differentiator against llama-vk's 182GB/s effective — the remaining
+gap lives in per-WG row coverage (llama packs NUM_ROWS×NUM_COLS with
+subgroup-quad reductions), the iq3_s/q8 stragglers, and the
+elementwise minors. All gemv6 paths remain opt-in (LLM170_G6=1).
