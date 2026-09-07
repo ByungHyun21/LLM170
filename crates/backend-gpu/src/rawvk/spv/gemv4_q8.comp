@@ -1,0 +1,84 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// gemv4 (plans/31) — llama mul_mat_vec 아키텍처 포트, q8_0 1타입 프로토타입.
+// 차이점 vs gemv3: 32스레드 WG (wave32), 8행/WG, f32 활성 직접 (xq 양자화 없음),
+// f32 FMA 축산, subgroupAdd 축소. 가중은 q8_0 블록(f16 d + 32 qs) 타입드 로드.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0c { uint w0[]; };
+layout(binding = 1) readonly buffer W1c { uint w1[]; };
+layout(binding = 2) readonly buffer W2c { uint w2[]; };
+layout(binding = 3) readonly buffer W3c { uint w3[]; };
+layout(binding = 4) readonly buffer W4c { uint w4[]; };
+layout(binding = 5) readonly buffer W5c { uint w5[]; };
+layout(binding = 6) readonly buffer W6c { uint w6[]; };
+layout(binding = 7) readonly buffer W7c { uint w7[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };   // [t][n_in] f32 활성
+layout(binding = 9) buffer Obuf { float outv[]; };          // [t][n_out]
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint ty; uint t; uint chunk_words;
+} pc;
+
+const uint RPF = 8u;   // 행/워크그룹
+uint WG(uint idx) {
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+uint WGn(uint idx, uint dummy) { return WG(idx); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_sub = n_in >> 5;
+    uint base = tok * n_in;
+    // y(활성) 블록을 레지스터에: 스레드 tid가 서브블록 tid 소유 — sb 루프가
+    // y를 재판독하지 않게 per-sb y를 지역 합으로 유지 (행 루프 밖).
+    float acc[RPF];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+    for (uint sb = tid; sb < n_sub; sb += 32u) {
+        uint byte0 = sb * 34u;
+        uint qw = (byte0 + 2u) / 4u;
+        bool al = ((byte0 + 2u) & 3u) == 0u;
+        // 이 서브블록의 y 32원소 — 모든 행이 공유
+        float yv[32];
+        for (uint k = 0; k < 8u; k++) {
+            for (uint b = 0; b < 4u; b++) {
+                yv[k * 4u + b] = xa[base + sb * 32u + k * 4u + b];
+            }
+        }
+        for (uint r = 0u; r < RPF; r++) {
+            uint row = row0 + r;
+            if (row >= pc.n_out) break;
+            uint row_base_words = row * n_sub * 34u / 4u;
+            uint wd = WG(row_base_words + byte0 / 4u);
+            float d = unpackHalf2x16(wd >> ((byte0 & 3u) * 8u)).x;
+            float ysum = 0.0;
+            for (uint k = 0; k < 8u; k++) {
+                uint wv32 = al ? WG(row_base_words + qw + k)
+                               : (WG(row_base_words + qw + k) >> 16) | (WG(row_base_words + qw + k + 1u) << 16);
+                for (uint b = 0; b < 4u; b++) {
+                    int q = (int((wv32 >> (8u * b)) & 0xFFu) << 24) >> 24;
+                    ysum += float(q) * yv[k * 4u + b];
+                }
+            }
+            acc[r] += d * ysum;
+        }
+    }
+    // 32레인 subgroupAdd — wave32 = WG 전체
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
