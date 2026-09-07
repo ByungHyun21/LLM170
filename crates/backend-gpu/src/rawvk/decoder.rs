@@ -880,7 +880,7 @@ impl DecoderState {
     /// 단계 공유 GEMV — q5_K·t≥2는 gemm_i8(LLM170_VK_NOI8 킬스위치),
     /// 나머지는 기존 xq+gemv3. xq 양자화는 호출부가 이미 수행.
     fn gemv_stage(&mut self, n: usize, t: usize, jobs: &[(String, vk::Buffer, vk::Buffer)]) -> Result<(), String> {
-        let i8_on = t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none();
+        let i8_on = t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some();
         let any_i8 = i8_on && jobs.iter().any(|(k, _, _)| self.i8w.contains_key(k));
         let _ = &any_i8;
         let v2 = std::env::var("LLM170_VK_I8").map(|v| v == "2").unwrap_or(false);
@@ -1181,9 +1181,9 @@ impl DecoderState {
                 eprintln!("#  SB post-rms xs0={s0:.4}");
             }
             if self.is_recr[il] {
-                if t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none()
-                    && (self.i8w.contains_key(&format!("blk.{il}.attn_qkv.weight"))
-                        || self.i8w.contains_key(&format!("blk.{il}.attn_gate.weight"))) {
+                // plans/30: gemm_i8/quant_b8 경로는 배치 상태를 오염(실측 —
+                // VK_NOI8=1로 재현 해소). LLM170_VK_I8ON=1 옵트인만 사용.
+                if t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some() {
                     self.quant_b8(self.b_xn.buf, n, t)?;
                 }
                 self.gemv_stage(n, t, &[
@@ -1359,8 +1359,7 @@ impl DecoderState {
                 self.rms(xs.buf, &format!("blk.{il}.post_norm"), xn.buf, n, t)?;
             }
             self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
-            if t >= 2 && std::env::var_os("LLM170_VK_NOI8").is_none()
-                && self.i8w.contains_key(&format!("blk.{il}.ffn_gate.weight")) {
+            if t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some() {
                 self.quant_b8(self.b_xn.buf, n, t)?;
             }
             self.gemv_stage(n, t, &[
