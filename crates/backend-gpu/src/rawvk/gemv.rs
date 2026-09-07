@@ -1148,6 +1148,17 @@ pub fn gemt_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
         v
     };
+    if std::env::var_os("LLM170_Q6_DUMP").is_some() {
+        eprintln!("dl[0..16] = {:?}", &outs[n_out-20..n_out-4]);
+        eprintln!("dbits = {}", outs[n_out-1]);
+        // 기준: w.data row0 block0 직독
+        let b = &w.data[0..210];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[208], b[209]])).to_f32();
+        let sc: Vec<i8> = b[192..208].iter().map(|&x| x as i8).collect();
+        let dl_ref: Vec<f32> = sc.iter().map(|&s| d * s as f32).collect();
+        eprintln!("기준 d={d} dl={:?}", dl_ref);
+        eprintln!("ql[0..8]={:?} qh[0..8]={:?}", &b[0..8], &b[128..136]);
+    }
     // CPU 기준: 디양자화 내적 — 전 토큰 × 64행 (토큰별 분리)
     let mut mx = 0f64;
     let mut per_tok = vec![0f64; t];
@@ -1340,6 +1351,17 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
             llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
             eprintln!("g4dbg row{r}: gpu={:.6} cpu={:.6} w[{k}]", o2[r as usize], ref_row[k]);
         }
+    }
+    if std::env::var_os("LLM170_Q6_DUMP").is_some() {
+        eprintln!("dl[0..16] = {:?}", &outs[n_out-20..n_out-4]);
+        eprintln!("dbits = {}", outs[n_out-1]);
+        // 기준: w.data row0 block0 직독
+        let b = &w.data[0..210];
+        let d = half::f16::from_bits(u16::from_le_bytes([b[208], b[209]])).to_f32();
+        let sc: Vec<i8> = b[192..208].iter().map(|&x| x as i8).collect();
+        let dl_ref: Vec<f32> = sc.iter().map(|&s| d * s as f32).collect();
+        eprintln!("기준 d={d} dl={:?}", dl_ref);
+        eprintln!("ql[0..8]={:?} qh[0..8]={:?}", &b[0..8], &b[128..136]);
     }
     // CPU 기준: 디양자화 내적
     let mut mx = 0f64;
