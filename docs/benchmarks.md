@@ -370,9 +370,14 @@ exact, np4 token streams identical to both gemv3 and commit 26f34a3
 (pre-existing 2/24, 17/24, 24/24, 24/24 vs the llama store — store drift,
 not a kernel effect). HIP regression 19/19 PASS (rawvk-only changes).
 
-Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg 0.50×, pp 0.10×. Next
-levers: q5 engine-regression root cause, iq4_xs shared-memory ktab
-(llama's init_iq_shmem), register-tile GEMM for prefill.
+iq4_xs follow-up: staged the iq4nl LUT into shared memory at workgroup
+start (llama's init_iq_shmem approach — 1KB, cooperative load + barrier).
+Standalone 122→138 GB/s and this one DOES translate in-engine: decode
+step 152.4→136.7 ms (tg ~6.3 t/s, +10% over gemv3). Gates: France
+exact, spec==nonspec x4 True, long exact.
+
+Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg ~0.55×, pp 0.10×. Next
+levers: q5 engine-regression root cause, register-tile GEMM for prefill.
 
 ## Vulkan — FIXED (2026-09-05)
 
