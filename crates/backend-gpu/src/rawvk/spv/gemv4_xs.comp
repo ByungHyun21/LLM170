@@ -39,7 +39,14 @@ uint WG(uint idx) {
     return w7[o];
 }
 
+shared uint skt[256];   // iq4nl LUT — llama init_iq_shmem 방식 (LDS gather)
+
 void main() {
+    // ktab 협동 스테이징: 256엔트리 × u32 = 1KB — WG당 1회
+    for (uint i = gl_LocalInvocationID.x; i < 256u; i += 32u) {
+        skt[i] = ktab[i];
+    }
+    barrier();
     uint tid = gl_LocalInvocationID.x;
     uint tok = gl_WorkGroupID.z;
     uint RPF = pc.rpf;
@@ -85,7 +92,7 @@ void main() {
                     wv32 = (wv32 >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
                 }
                 for (uint b = 0; b < 4u; b++) {
-                    uint t2 = ktab[(wv32 >> (8u * b)) & 0xFFu];
+                    uint t2 = skt[(wv32 >> (8u * b)) & 0xFFu];
                     int vlo = (int(t2 & 0xFFu) << 24) >> 24;   // 부호 확장
                     int vhi = (int(t2 >> 8u) << 24) >> 24;
                     // k*4+b (lo열)와 16+k*4+b (hi열) — yy 워드 인접 페어
