@@ -12,6 +12,7 @@ const GEMV4_Q5_SPV: &[u8] = include_bytes!("spv/gemv4_q5.spv");
 const GEMV4_XS_SPV: &[u8] = include_bytes!("spv/gemv4_xs.spv");
 const GEMV5_XS_SPV: &[u8] = include_bytes!("spv/gemv5_xs.spv");
 const GEMV5_Q5_SPV: &[u8] = include_bytes!("spv/gemv5_q5.spv");
+const GEMV6_Q5_SPV: &[u8] = include_bytes!("spv/gemv6_q5.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -926,9 +927,36 @@ impl DecoderState {
             1, no.div_ceil(rpf as usize) as u32, t as u32)
     }
 
+    /// gemv6_q5 (plans/33) — llama iqs lane 리맵 (연속 워드 스윕).
+    /// 실DRAM +10.5% (79.7→88.1, L2방출 실측). LLM170_G6=1이면 q5에 우선.
+    fn gemv6_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if ty != 13 {
+            return Err("gemv6: q5_K만".into());
+        }
+        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
+        while binds.len() < 8 {
+            binds.push(self.dummy.buf);
+        }
+        binds.push(xn);
+        binds.push(out);
+        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+        let cw_log2 = 31u32 - cw.leading_zeros();
+        let cw_mask = (1u32 << cw_log2) - 1u32;
+        let rpf: u32 = if no < 4096 { 1 } else { 8 };
+        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
+        self.run_pipe("gemv6_q5", GEMV6_Q5_SPV, 10, 24, &binds, &push,
+            1, no.div_ceil(rpf as usize) as u32, t as u32)
+    }
+
     /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
     /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
+        if t == 1 && std::env::var_os("LLM170_G6").is_some() {
+            if self.gemv6_q5(qsrc, wkey, out, t).is_ok() {
+                return Ok(());
+            }
+        }
         if t == 1 && std::env::var_os("LLM170_V5").is_some() {
             self.quant(qsrc, xq, nq, t)?;
             if self.gemv5_xq(xq, wkey, out, t).is_ok() {

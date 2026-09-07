@@ -821,3 +821,17 @@ decode kernel work is a lane-remap to contiguous per-lane bursts
 (llama's iqs layout); expected recovery toward 150-180 GB/s would take
 tg from 6.3 to ~8.5-10. LLM170_MULTI and LLM170_L2FLUSH knobs are in
 vk-gemv4-check for reproduction.
+
+### Round 12 — llama iqs lane remap landed (gemv6_q5) (2026-09-07)
+
+Built gemv6_q5 on the solved analysis: the wavefront sweeps each row's
+ql words as contiguous 128B (2-pass: block headers staged to LDS, then
+a linear per-lane word sweep with role dispatch). Standalone bit-checks
+clean (max|D|=0.0000 vs CPU) and the L2-evicted (true-DRAM) rate
+improves +10.5% (79.7 → 88.1 GB/s) — the first measured access-pattern
+win on the floor. Engine A/B is neutral (142.9 vs 142.2 ms: q5 sites
+are only ~30ms of the step, so +10% ≈ noise) and spec==nonspec goes
+False under G6 (accumulation-order ulp differences cross ties vs the
+gemv3 verify path) — the same class as the documented VL flat point.
+Shipped opt-in (LLM170_G6=1) with the tie caveat; the layout now needs
+to be replicated for iq4_xs/q8/q4_K/q3_K/q6_K where the FFN mass is.

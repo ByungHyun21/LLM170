@@ -1,0 +1,122 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// gemv6_q5 (plans/33) — llama iqs 레이아웃 lane 리맵: 웨이브프론트가 행의 ql 워드를
+// 연속 128B로 스윕 (gemv4의 lane→서브블록 176B 스트라이드 교정, DRAM ~105→목표 150+).
+// 기하(검증 gemv4_q5 파생): ql 워드 qi(0..31) → P=qi>>3, l=(qi&7)*4;
+// lo 니블 4원소 = 서브 2P의 l..l+3, hi 니블 = 서브 2P+1; qh 워드 = 블록+4+(qi&7),
+// 비트 (1|2)<<2P; 스케일 j=2P / 2P+1. 2패스: 헤더→LDS, ql 선형 스윕.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0c { uint w0[]; };
+layout(binding = 1) readonly buffer W1c { uint w1[]; };
+layout(binding = 2) readonly buffer W2c { uint w2[]; };
+layout(binding = 3) readonly buffer W3c { uint w3[]; };
+layout(binding = 4) readonly buffer W4c { uint w4[]; };
+layout(binding = 5) readonly buffer W5c { uint w5[]; };
+layout(binding = 6) readonly buffer W6c { uint w6[]; };
+layout(binding = 7) readonly buffer W7c { uint w7[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+
+const uint BLK_W = 44u;   // 176B / 4
+shared float sh_dl[64][8];
+shared float sh_dml[64][8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint roww = row * n_blk * BLK_W;
+        // 패스1: 블록 헤더 → LDS (d·sc, dm·mn 8쌍)
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = roww + b * BLK_W;
+            uint w0v = WG(bw);
+            vec2 dm = unpackHalf2x16(w0v);
+            uint w1v = WG(bw + 1u);
+            uint w2v = WG(bw + 2u);
+            uint w3v = WG(bw + 3u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint sc, mn;
+                if (j < 4u) {
+                    sc = (w1v >> (8u * j)) & 63u;
+                    mn = (w2v >> (8u * j)) & 63u;
+                } else {
+                    uint b84 = (w3v >> (8u * (j - 4u))) & 0xFFu;
+                    uint bj  = (w2v >> (8u * (j - 4u))) & 0xFFu;
+                    uint qm4 = (w1v >> (8u * (j - 4u))) & 0xFFu;
+                    sc = (b84 & 0xFu) | ((qm4 >> 6u) << 4);
+                    mn = (b84 >> 4u) | ((bj >> 6u) << 4);
+                }
+                sh_dl[b][j] = dm.x * float(sc);
+                sh_dml[b][j] = dm.y * float(mn);
+            }
+        }
+        barrier();
+        // 패스2: ql 워드 선형 스윕 — 레인 L이 워드 (qi0 + L), qi = 0..31 블록별
+        float pacc = 0.0;
+        for (uint b = 0u; b < n_blk; b++) {
+            uint qi = tid;                       // 레인 = ql 워드 0..31 — 블록당 1스윕
+            uint P = qi >> 3;
+            uint l = (qi & 7u) * 4u;
+            uint wv = WG(roww + b * BLK_W + 12u + qi);      // 연속 32워드 = 128B
+            uint qhw = WG(roww + b * BLK_W + 4u + (qi & 7u)); // qh 워드
+            uint bit_lo = 1u << (2u * P);
+            uint bit_hi = 2u << (2u * P);
+            float dl0 = sh_dl[b][2u * P];
+            float dl1 = sh_dl[b][2u * P + 1u];
+            float dml0 = sh_dml[b][2u * P];
+            float dml1 = sh_dml[b][2u * P + 1u];
+            uint e0 = b * 256u + (2u * P) * 32u + l;        // lo 4원소
+            uint e1 = e0 + 32u;                             // hi 4원소
+            float s0 = 0.0, s1 = 0.0, my0 = 0.0, my1 = 0.0;
+            for (uint k = 0u; k < 4u; k++) {
+                uint byte_v = (wv >> (8u * k)) & 0xFFu;
+                uint qhb = (qhw >> (8u * k)) & 0xFFu;
+                float y0 = xa[base + e0 + k];
+                float y1 = xa[base + e1 + k];
+                int qlo = int(byte_v & 0xFu) + ((qhb & bit_lo) != 0u ? 16 : 0);
+                int qhi = int((byte_v >> 4u) & 0xFu) + ((qhb & bit_hi) != 0u ? 16 : 0);
+                s0 += float(qlo) * y0;
+                s1 += float(qhi) * y1;
+                my0 += y0;
+                my1 += y1;
+            }
+            pacc += dl0 * s0 - dml0 * my0;
+            pacc += dl1 * s1 - dml1 * my1;
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
