@@ -463,6 +463,91 @@ impl VkCtx {
         }
     }
 
+    /// subgroup16 강제 파이프라인 (llama wg_size_subgroup16 재현) — plans/33.
+    pub fn pipeline16(
+        &self,
+        spv: &[u8],
+        n_buf: u32,
+        push_bytes: u32,
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+        unsafe {
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
+                .map(|i| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(i)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                })
+                .collect();
+            let dsl = self
+                .device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+                .map_err(|e| format!("DSL: {e:?}"))?;
+            let ranges = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size(push_bytes)];
+            let pl = self
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&[dsl])
+                        .push_constant_ranges(&ranges),
+                    None,
+                )
+                .map_err(|e| format!("레이아웃: {e:?}"))?;
+            let code: Vec<u32> = spv
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let sm = self
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
+            // requiredSubgroupSize=16 (VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT
+            // + subgroup size control pnext) — 셰이더 로컬사이즈 32 = 2서브그룹/WG
+            let mut ssc = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(16);
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(sm)
+                .name(c"main")
+                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+                .push_next(&mut ssc);
+            let pci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
+            let pipe = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pci], None)
+                .map_err(|(_, e)| format!("파이프라인(sg16): {e:?}"))?[0];
+            self.device.destroy_shader_module(sm, None);
+            let pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(n_buf)];
+            let dp = self
+                .device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&pool_sizes)
+                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+                    None,
+                )
+                .map_err(|e| format!("디스크립터 풀: {e:?}"))?;
+            let ds = self
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(dp)
+                        .set_layouts(&[dsl]),
+                )
+                .map_err(|e| format!("디스크립터 셋: {e:?}"))?[0];
+            Ok((dsl, pl, dp, ds, pipe))
+        }
+    }
+
     pub fn pipeline(
         &self,
         spv: &[u8],

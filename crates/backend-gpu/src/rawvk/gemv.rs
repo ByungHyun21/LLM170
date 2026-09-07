@@ -1282,7 +1282,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if w.ty == llm170_gguf::GgmlType::Q8_0 && std::env::var_os("LLM170_G6").is_some() {
+    let spv_path = if is_q5 && std::env::var_os("LLM170_SG16").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv6_q5.spv"
+    } else if w.ty == llm170_gguf::GgmlType::Q8_0 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q8.spv"
     } else if is_q5 && std::env::var_os("LLM170_G7").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv7_q5.spv"
@@ -1306,9 +1308,14 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
     let g6 = std::env::var_os("LLM170_G6").is_some() || std::env::var_os("LLM170_G7").is_some();
-    if (is_q6 || is_q4 || is_q3) && !g6 { return Err("q3/q4/q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
+    let sg16 = std::env::var_os("LLM170_SG16").is_some();
+    if (is_q6 || is_q4 || is_q3) && !g6 && !sg16 { return Err("q3/q4/q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
     let n_kb_h = if is_xs { 12 } else if is_q6 || is_q4 || is_q3 { 10 } else { 11 };
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb_h, if g6 { 24 } else { 32 })?;
+    let (dsl, pl, pool, ds, pipe) = if sg16 {
+        ctx.pipeline16(&spv, n_kb_h, 24)?
+    } else {
+        ctx.pipeline(&spv, n_kb_h, if g6 { 24 } else { 32 })?
+    };
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
@@ -1320,10 +1327,10 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
     }
     ctx.bind_bufs(ds, &binds);
-    let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
+    let rpf: u32 = if sg16 { 2 } else if n_out < 4096 { 1 } else { 8 };
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
     let cw_mask = (1u32 << cw_log2) - 1u32;
-    let push = if g6 {
+    let push = if g6 || sg16 {
         push_u32s(&[n_in as u32, n_out as u32, t as u32, cw_log2, cw_mask, rpf])
     } else {
         push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, cw_log2, cw_mask, rpf])
