@@ -332,6 +332,45 @@ is the weakest large kernel). Correctness held throughout: np4 seq2
 exact + others at HIP's known tie points, spec==nonspec x4 exact (after
 tile unification), long 2302tok exact, HIP regression 19/19 PASS.
 
+### Vulkan performance round 2 — gemv4 family (2026-09-07, plans/31)
+
+Ported llama.cpp's mul_mat_vec architecture as a new kernel family
+(`gemv4_{q8,q5,xs}.comp`, opt-in via `LLM170_VK_GEMV4=1`, decode t=1 only):
+32-thread wave32 workgroups, RPF rows per WG with the activation vector held
+in registers across rows, f32 activations fed directly (no xq quantization
+pass), vec4 activation loads (a second descriptor aliasing the same buffer,
+llama's `data_b_v4` trick), and subgroupAdd reduction. Per-type bandwidth
+(vk-gemv4-check, exact CPU-f32 match max|D|=0.0000): q8_0 160 GB/s (gemv3
+107), iq4_xs 122 (57-73), q5_K 100-104 (55).
+
+Engine integration through a `gemv_w` wrapper that lazily quantizes only on
+the gemv3 fallback (dead-quant removal), dynamic rows-per-WG (1 for small
+n_out to preserve parallelism), and per-type pipeline cache keys. Two
+integration bugs worth recording: grid axes must be (1, rows/rpf, t) — the
+shader reads .y as the row block; three spvs sharing one pipeline-cache name
+caused descriptor mismatches (SIGSEGV). Net: decode step 154→146 ms
+(tg 5.68→~5.9 t/s, +5%).
+
+Negative results (all opt-in-preserved): q5_K gemv4 regresses in-engine
+(step 194 vs 146 ms) despite winning standalone — register pressure +
+byte_at scale gathers are the suspects; kept on gemv3 by default
+(`LLM170_G4_Q5=1` to test). Loop unrolling ([[unroll]], GL_EXT_control_
+flow_attributes) fixed the register-spill suspicion standalone (97→104 GB/s)
+but did NOT fix the engine regression. y-staging in shared memory was
+rejected after measuring llama's actual structure: it stages nothing, it
+vectorizes activation loads and reuses them across rows. Batch prefill on
+gemv4 re-reads the t×n_in activation per row-WG — 3× prefill regression;
+decode-only routing required.
+
+Correctness: France ' Paris' exact, spec==nonspec x4 True, long prompt
+exact, np4 token streams identical to both gemv3 and commit 26f34a3
+(pre-existing 2/24, 17/24, 24/24, 24/24 vs the llama store — store drift,
+not a kernel effect). HIP regression 19/19 PASS (rawvk-only changes).
+
+Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg 0.50×, pp 0.10×. Next
+levers: q5 engine-regression root cause, iq4_xs shared-memory ktab
+(llama's init_iq_shmem), register-tile GEMM for prefill.
+
 ## Vulkan — FIXED (2026-09-05)
 
 Root cause of the full-model failures was never a driver leak: the sysfs GTT counters are
