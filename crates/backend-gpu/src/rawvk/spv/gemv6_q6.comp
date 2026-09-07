@@ -78,8 +78,8 @@ void main() {
             for (uint j = 0u; j < 16u; j++) {
                 uint absb = srem + j;   // sc 16B 전체 (워드 4+1개 걸침)
                 uint sc8 = (sw[absb >> 2] >> ((absb & 3u) * 8u)) & 0xFFu;
-                sc8 = (sc8 << 24u) >> 24u;   // i8 부호
-                sh_dl[b][j] = d * float(int(sc8));
+                int sc8i = int(sc8) << 24 >> 24;   // int 시프트 = 산술(부호확장)
+                sh_dl[b][j] = d * float(sc8i);
             }
             // qh 64B @128 = 16워드 — (bw+128)%4 == rowb%4
             uint qwi = (bw + 128u) >> 2;
