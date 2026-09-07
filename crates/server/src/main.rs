@@ -132,6 +132,16 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
             }
         }
+        Some("vk-gemv5-check") => {
+            let args2: Vec<String> = std::env::args().collect();
+            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
+            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.ffn_gate.weight".into());
+            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
+            match llm170_backend_gpu::rawvk::gemv::gemv5_check(&path, &tn, t) {
+                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
+                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some("vk-sdot-probe") => {
             match llm170_backend_gpu::rawvk::gemv::sdot_probe() {
                 Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }

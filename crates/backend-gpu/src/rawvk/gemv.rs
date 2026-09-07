@@ -903,6 +903,148 @@ fn hf(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
 }
 
+/// vk-gemv5-check — 정수 dot(OpSDot) gemv 검증. CPU xq 재현 + 전수 비교.
+pub fn gemv5_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    use std::time::Instant;
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
+    let is_q5 = w.ty == llm170_gguf::GgmlType::Q5K;
+    if !is_xs && !is_q5 {
+        return Err("gemv5는 iq4_xs/q5_K만".into());
+    }
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let mut seed = 0xABCDu64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    // CPU xq 재현 (quant_q8 미러)
+    let nwords = n_in >> 2;
+    let nblk = n_in >> 5;
+    let xq_w = nwords + nblk + nblk / 2;
+    let mut xq = vec![0u32; t * xq_w];
+    for (ti, x) in xs.iter().enumerate() {
+        let qb = ti * xq_w;
+        for lb in 0..nblk {
+            let mut amax = 0f32;
+            for i in 0..32 { amax = amax.max(x[lb * 32 + i].abs()); }
+            let d = amax / 127.0f32;
+            let id = if d != 0.0 { 1.0f32 / d } else { 0.0 };
+            for wi in 0..8 {
+                let mut word = 0u32;
+                for k in 0..4 {
+                    let xv = x[lb * 32 + wi * 4 + k] * id;
+                    let r = if xv >= 0.0 { (xv + 0.5) as i32 as f32 } else { -((0.5 - xv) as i32 as f32) };
+                    let c = r.clamp(-127.0, 127.0);
+                    word |= ((c as i32 as u32) & 0xFF) << (k * 8);
+                }
+                xq[qb + lb * 8 + wi] = word;
+            }
+            xq[qb + nwords + lb] = d.to_bits();
+        }
+    }
+    let xqb = ctx.alloc_host(t * xq_w * 4)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(xq.as_ptr(), xqb.ptr as *mut u32, t * xq_w);
+    }
+    let ob = ctx.alloc_host(t * n_out * 4)?;
+    let ch0 = ctx.max_ssbo;
+    let mut wbufs = Vec::new();
+    let mut off = 0usize;
+    let total = w.data.len();
+    let ch = total.next_power_of_two().min(1usize << (63 - ch0.leading_zeros()));
+    while off < total {
+        let sz = ch.min(total - off);
+        let mut b = ctx.alloc(sz)?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, sz) };
+        ctx.unmap(&mut b)?;
+        wbufs.push(b.buf);
+        off += sz;
+    }
+    while wbufs.len() < 8 { wbufs.push(wbufs[0]); }
+    let cw = (ch / 4) as u32;
+    let cw_log2 = 31u32 - cw.leading_zeros();
+    let cw_mask = (1u32 << cw_log2) - 1u32;
+    let spv = if is_xs {
+        std::fs::read("crates/backend-gpu/src/rawvk/spv/gemv5_xs.spv").map_err(|e| e.to_string())?
+    } else {
+        std::fs::read("crates/backend-gpu/src/rawvk/spv/gemv5_q5.spv").map_err(|e| e.to_string())?
+    };
+    let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
+    let n_kb = if is_xs { 11 } else { 10 };
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, 28)?;
+    let _ = (dsl, pool);
+    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+    binds.push(xqb.buf);
+    binds.push(ob.buf);
+    if is_xs { binds.push(kb); }
+    ctx.bind_bufs(ds, &binds);
+    let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
+    let push = push_u32s(&[n_in as u32, n_out as u32, t as u32, xq_w as u32, cw_log2, cw_mask, rpf]);
+    let _ = pl;
+    ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; t * n_out];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+        v
+    };
+    // CPU 기준: dequant_row w · 정량화 x
+    let mut mx = 0f64;
+    let mut ref_row = vec![0.0f32; n_in];
+    for (j, x) in xs.iter().enumerate() {
+        for r in 0..n_out.min(64) {
+            llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
+            let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            // xq 양자화 오차 허용: 상대 비교
+            let g = outs[j * n_out + r];
+            let rel = ((dot - g) / (dot.abs() + 1e-3)).abs() as f64;
+            mx = mx.max(rel);
+        }
+    }
+    if let Ok(hk) = std::env::var("LLM170_G5_HOT") {
+        let hk: usize = hk.parse().unwrap_or(0);
+        // 원-핏: x = e_hk → xq 재구성 (d = 1/127·1, q = 127 at hk, 0 else)
+        for lb in 0..nblk {
+            let d = if hk / 32 == lb { 1.0f32 / 127.0 } else { 0.0 };
+            for wi in 0..8 { xq[hk / 32 * xq_w + lb * 8 + wi] = 0; }
+            xq[hk / 32 * xq_w + nwords + lb] = d.to_bits();
+        }
+        let lbi = hk / 32;
+        let wi = (hk % 32) / 4;
+        let k = hk % 4;
+        xq[lbi * xq_w + lbi * 8 + wi] = 127u32 << (k * 8);
+        unsafe {
+            std::ptr::copy_nonoverlapping(xq.as_ptr(), xqb.ptr as *mut u32, t * xq_w);
+        }
+        ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
+        let o2: Vec<f32> = unsafe {
+            let mut v = vec![0f32; t * n_out];
+            std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+            v
+        };
+        let mut rr = vec![0.0f32; n_in];
+        for r in 0..4u32 {
+            llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut rr);
+            eprintln!("g5hot row{r}: gpu={:.6} cpu_w[{hk}]={:.6}", o2[r as usize], rr[hk]);
+        }
+    }
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
+    }
+    let dt = t0.elapsed().as_secs_f64() / 10.0;
+    Ok(format!(
+        "gemv5({tname}) t={t}: {:.3}ms → {:.1}GB/s · maxrel={mx:.4}",
+        dt * 1e3, w.data.len() as f64 / dt / 1e9
+    ))
+}
+
 /// vk-sdot-probe — OpSDot(정수 dot) 장치 지원 검증+타이밍. plans/33.
 pub fn sdot_probe() -> Result<String, String> {
     use std::time::Instant;
