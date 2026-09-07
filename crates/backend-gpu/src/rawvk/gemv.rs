@@ -1336,14 +1336,41 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
             mx = mx.max((dot - outs[j * n_out + r]).abs() as f64);
         }
     }
-    let t0 = Instant::now();
+    let solo_t0 = Instant::now();
     for _ in 0..10 {
         ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
     }
-    let dt = t0.elapsed().as_secs_f64() / 10.0;
+    let solo_dt = solo_t0.elapsed().as_secs_f64() / 10.0;
+    if let Ok(list) = std::env::var("LLM170_MULTI") {
+        // TLB/할당수 가설: 추가 텐서들을 같은 컨텍스트에 로드(상주)시킨 뒤
+        // 이 텐서의 타이밍 재측정 — 속도 붕괴 시 가설 확인.
+        for extra in list.split(',').filter(|x| !x.is_empty()) {
+            if extra == tname { continue; }
+            let w2 = match model.w(extra) { Some(w) => w, None => continue };
+            let mut off2 = 0usize;
+            let tot2 = w2.data.len();
+            while off2 < tot2 {
+                let sz2 = ch.min(tot2 - off2);
+                let mut b2 = ctx.alloc(sz2)?;
+                unsafe { std::ptr::copy_nonoverlapping(w2.data.as_ptr().add(off2), b2.ptr, sz2) };
+                ctx.unmap(&mut b2)?;
+                off2 += sz2;
+            }
+        }
+        let t2 = Instant::now();
+        for _ in 0..10 {
+            ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
+        }
+        let dt2 = t2.elapsed().as_secs_f64() / 10.0;
+        let _ = &solo_dt;
+        return Ok(format!(
+            "gemv4-multi({tname}): {:.3}ms → {:.1}GB/s (단독 {:.1})",
+            dt2 * 1e3, w.data.len() as f64 / dt2 / 1e9, w.data.len() as f64 / solo_dt / 1e9
+        ));
+    }
     Ok(format!(
         "gemv4({tname}) t={t}: {:.3}ms → {:.1}GB/s · max|D|={mx:.4}",
-        dt * 1e3,
-        w.data.len() as f64 / dt / 1e9
+        solo_dt * 1e3,
+        w.data.len() as f64 / solo_dt / 1e9
     ))
 }
