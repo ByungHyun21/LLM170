@@ -923,3 +923,16 @@ differentiator against llama-vk's 182GB/s effective — the remaining
 gap lives in per-WG row coverage (llama packs NUM_ROWS×NUM_COLS with
 subgroup-quad reductions), the iq3_s/q8 stragglers, and the
 elementwise minors. All gemv6 paths remain opt-in (LLM170_G6=1).
+
+### gemv7 (y-LDS staging) — negative (2026-09-07, session close)
+
+Tested the y-amplification theory (gemv6 reads y once per row: 160KB
+y vs 28KB weights per WG — 5.7× y redundancy). gemv7 stages each
+block's 256 y floats to LDS once and dots all 8 rows against it.
+True-DRAM (L2-evicted) result: 70.9 vs gemv6's 91.6 GB/s — WORSE. The
+costs that outweighed the y savings: per-row header re-reads (4 words
+× 8 rows × 20 blocks — header traffic is now per (row, block) instead
+of staged once), 40 barriers per WG (vs 16), and the serialized row
+dot inside each lane. Verdict: gemv6's structure is the local optimum
+for this shape; the llama gap is not y-handling. Kept as opt-in
+(LLM170_G7=1) with the harness route.

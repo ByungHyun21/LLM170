@@ -1282,7 +1282,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(wbufs[0]);
     }
     let chunk_words = (ch / 4) as u32;
-    let spv_path = if is_q3 && std::env::var_os("LLM170_G6").is_some() {
+    let spv_path = if is_q5 && std::env::var_os("LLM170_G7").is_some() {
+        "crates/backend-gpu/src/rawvk/spv/gemv7_q5.spv"
+    } else if is_q3 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q3.spv"
     } else if is_q4 && std::env::var_os("LLM170_G6").is_some() {
         "crates/backend-gpu/src/rawvk/spv/gemv6_q4.spv"
@@ -1301,7 +1303,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     };
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
-    let g6 = std::env::var_os("LLM170_G6").is_some();
+    let g6 = std::env::var_os("LLM170_G6").is_some() || std::env::var_os("LLM170_G7").is_some();
     if (is_q6 || is_q4 || is_q3) && !g6 { return Err("q3/q4/q6_K는 gemv6 전용 — LLM170_G6=1".into()); }
     let n_kb_h = if is_xs { 12 } else if is_q6 || is_q4 || is_q3 { 10 } else { 11 };
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb_h, if g6 { 24 } else { 32 })?;
