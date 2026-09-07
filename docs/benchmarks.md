@@ -773,3 +773,20 @@ ceiling: q8_0 257 GB/s (no LUT) vs iq4_xs 150 (4 L1 gathers + byte
 repack per word pair). Closing decode toward llama's 11.4 therefore
 splits into: arithmetic (LUT-free) unpack for q5/q4/q3/q6 (feasible —
 their dequant is shift/mask only), and the FFN-site in-engine mystery.
+
+### Round 10 close — gemv5_q5 resolved; int-dot decode verdict (2026-09-07)
+
+The gemv5_q5 'q-part≡0' bug resolved as a stale-binary artifact
+(include_bytes! requires a cargo rebuild after .spv swaps — the engine
+path was correct all along). Shipped state: gemv5 covers iq4_xs AND
+q5_K with int-arithmetic unpack (LUT-free for q5), France ' Paris'
+verified through both, standalone maxrel 0.09/0.26 (W4A8 quantization
+class). Final A/B: gemv5 161.0 vs gemv4 142.4 ms — the int-dot decode
+structure yields NO win on this stack: the hardware OpSDot executes
+correctly in isolation (probe) but not inside the kernel context
+(patched builds return 0 for the dot term; suspect driver codegen),
+and the int emulation is op-count-neutral against float FMA. Verdict:
+llama's decode advantage is not portable via the dot instruction alone
+on RADV+this toolchain; the remaining decode gap (6.3 vs 11.4) is
+attributed to per-type unpack costs and the FFN-site in-engine
+mystery. All gemv5 paths stay opt-in (LLM170_V5=1).
