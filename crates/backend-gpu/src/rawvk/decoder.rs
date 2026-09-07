@@ -890,7 +890,7 @@ impl DecoderState {
             23 => (GEMV4_XS_SPV, "gemv4_xs"),
             _ => return Err(format!("gemv4: 타입 {ty} 미지원")),
         };
-        let n_kb = if ty == 23 { 12 } else if ty == 13 { 10 } else { 11 };
+        let n_kb = if ty == 23 { 12 } else { 11 };
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
             binds.push(self.dummy.buf);
@@ -900,9 +900,7 @@ impl DecoderState {
         if ty == 23 {
             binds.push(self.ktab.buf);
         }
-        if ty != 13 {
-            binds.push(xn);   // yv4 vec4 뷰 (동일 버퍼 재바인딩; q5는 미사용)
-        }
+        binds.push(xn);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
         let chunk_words = (wbufs.first().map(|b| b.bytes / 4).unwrap_or(1)) as u32;
         // 소형 텐서는 행/WG 축소 — 병렬성 유지 (beta/alpha no=48 등)
         let rpf: u32 = if no < 4096 { 1 } else { 8 };
@@ -912,6 +910,10 @@ impl DecoderState {
         let r = self.run_pipe(pname, spv, n_kb, 28, &binds, &push,
             1, no.div_ceil(rpf as usize) as u32, t as u32);
         if g4t {
+            if std::env::var_os("LLM170_G4_SYNC").is_some() {
+                // 동기 타이밍 — 실 커널 시간 (배치 무시)
+                let _ = self.ctx.flush2();
+            }
             eprintln!("[g4time] {wkey} ty={ty} no={no} {:.3}ms", t0.elapsed().as_secs_f32() * 1e3);
         }
         r
