@@ -635,3 +635,14 @@ with one run-to-run flaky borderline at the known flat point — the same
 class HIP adjudicates as tie. Divergence position and isolation verdict
 move between runs and binaries (ViT embedding ulp sensitivity suspected).
 Not a functional break; tracked as the known flat-point class.
+
+### Prefill scaling attribution (round 3 addendum)
+
+pp scales flat across chunk sizes (pp96 27.4, pp256 26.2, pp512 25.9 t/s
+with tiles+batch): a fixed ~37 ms/token cost dominates — NOT the GEMM
+tiles (which amortize: weight traffic is constant in t). The remaining
+serialized per-token work lives in the non-GEMM prefill path (GDN conv
+state scan, KV writes, attention history) — the next prefill lever is
+attributing and batching those. An earlier in-session reading of
+'3,295 t/s prefill' was a misread of a decode-step profile line at
+pos=512; the bench numbers above are the authoritative prefill figures.
