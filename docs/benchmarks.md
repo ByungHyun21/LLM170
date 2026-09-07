@@ -686,3 +686,13 @@ prefill: 11.2 → 45.4 (+306%), 0.36× of llama-vk. HIP 19/19. Remaining
 prefill: gemv tail is now mostly q6_K (ty14) + iq3_s (ty21) stragglers;
 the per-32tok chunk budget is tile128 150 / tile_xs 71 / tile_q4k 50 /
 gemv ~250 / elementwise ~90 ms.
+
+### Round 6 — q6_K tile (2026-09-07)
+
+tile_q6k completes the type matrix (six quant types now tiled: q8_0,
+q3_K, q4_K, q5_K, q6_K, iq4_xs). q6_K geometry: 210B blocks — ql nibbles
+(lo/hi by quarter), qh 2-bit selectors (bits w*2..w*2+1 of the same
+byte), direct i8 scales at 192, f16 d at 208 with word-span assembly.
+France-through-batched-prefill verified ' Paris'; pp512 45.4 → 47.3
+t/s. Session cumulative prefill: 11.2 → 47.3 (+323%, 0.37× llama-vk).
+Remaining gemv tail: iq3_s (ty21) stragglers only. HIP 19/19.
