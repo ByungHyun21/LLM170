@@ -974,3 +974,24 @@ list. The remaining decode gap against llama's 182GB/s effective is
 now attributable to their shader-level differences beyond geometry
 (typed packed16/32 buffer views, vec4 B loads with K_PER_ITER=4/8
 unrolling — a full llama mul_mat_vec shader port, not a config change).
+
+### gemv8_q5 — llama mul_mat_vec FULL PORT: first engine win (2026-09-07)
+
+Ported llama's mul_mat_vec_q5_k verbatim (typed u16 buffer views of
+the same weight chunks — Vulkan allows the same buffer bound with
+different GLSL block types; SIMD-in-register nibble handling via
+0x0F0F0F0F masks + unpack8; fma chains; 16-threads-per-block ×
+2-blocks geometry). Two port bugs found by the harness: scales must
+load as SINGLE u16s (llama scales[v_im] is one element, not a pair),
+and the engine's cw2 chunk constant must use pow2ceil of the first
+buffer (engine first-chunk is actual size, harness uploads the pow2
+cap).
+
+Results: standalone 162.4 GB/s warm (fastest q5 ever, exact 0.0000);
+ENGINE step 142→128-130ms (-10ms, first kernel win that survives the
+engine); end-to-end tg32 6.60 t/s (from 6.19-6.32). Quality: France
+' Paris' exact, long prompt EXACT; spec==nonspec goes False — the
+fma/subgroupAdd accumulation order differs from gemv4/gemv3 by ulps,
+flipping ties in the t=1-vs-t≥2 comparison (same documented class as
+gemv6's caveat). Shipped opt-in (LLM170_G8=1) pending either a
+matching-order variant for verify batches or accepting the tie class.
