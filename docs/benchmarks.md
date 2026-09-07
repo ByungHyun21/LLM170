@@ -790,3 +790,15 @@ llama's decode advantage is not portable via the dot instruction alone
 on RADV+this toolchain; the remaining decode gap (6.3 vs 11.4) is
 attributed to per-type unpack costs and the FFN-site in-engine
 mystery. All gemv5 paths stay opt-in (LLM170_V5=1).
+
+### FFN-site mystery — refined (2026-09-07, session close)
+
+Recomputing the per-dispatch-fence numbers as bandwidth: in-engine ALL
+gemv sites run at a uniform ~103-107 GB/s (attn_qkv 36MB/0.338ms=107,
+ffn_down 60MB/0.580ms=103, ffn_gate 47MB/0.449ms=105) while the same
+kernels standalone reach 121-146. The loss is proportional to the
+standalone rate, not site-specific — it is a system-level floor (DRAM
+contention / dispatch environment), not an FFN-specific effect. The
+engine floor (~105 GB/s over 16GB = ~150ms step) matches the measured
+142-152ms steps. Next decode lever must therefore raise the engine
+floor itself, not individual kernels.
