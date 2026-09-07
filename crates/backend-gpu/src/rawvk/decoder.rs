@@ -22,6 +22,8 @@ const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
 const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const TILE_XS_SPV: &[u8] = include_bytes!("spv/tile_xs.spv");
+const TILE_Q8_SPV: &[u8] = include_bytes!("spv/tile_q8.spv");
+const TILE_Q4K_SPV: &[u8] = include_bytes!("spv/tile_q4k.spv");
 const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
@@ -110,6 +112,10 @@ pub struct DecoderState {
     eps: f32,
     kq_scale: f32,
     max_ssbo: usize,
+    #[allow(clippy::type_complexity)]
+    ktimes: std::collections::HashMap<String, (f64, u64)>,
+    ktime: bool,
+    kkey: std::cell::RefCell<Option<String>>,
     // 상태 [full|recr][seq]
     kv_k: Vec<Vec<VkBuf>>,
     kv_v: Vec<Vec<VkBuf>>,
@@ -736,6 +742,9 @@ impl DecoderState {
         Ok(Self {
             ctx,
             max_ssbo: max_ssbo0,
+            ktimes: std::collections::HashMap::new(),
+            ktime: std::env::var_os("LLM170_VK_KTIME").is_some(),
+            kkey: std::cell::RefCell::new(None),
             w,
             consts: cmap,
             is_recr,
@@ -832,6 +841,7 @@ impl DecoderState {
 
     /// 바인딩+런치 (배치 모드 자동 — fresh ds).
     fn run_pipe(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32, bufs: &[vk::Buffer], push: &[u8], gx: u32, gy: u32, gz: u32) -> Result<(), String> {
+        let t0k = std::time::Instant::now();
         // 배치 자동 분할 — 디스패치 512마다 제출·대기·재시작 (세트/CMDBUF 누적 방지).
         if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.split_ctr += 1;
@@ -854,7 +864,15 @@ impl DecoderState {
             self.ctx.bind_bufs(ds_default, bufs);
             ds_default
         };
-        self.ctx.run(pl, ds, pipe, push, gx, gy, gz)
+        let r = self.ctx.run(pl, ds, pipe, push, gx, gy, gz);
+        if self.ktime {
+            let e = t0k.elapsed().as_secs_f64() * 1e3;
+            let key = self.kkey.borrow_mut().take().unwrap_or_else(|| name.to_string());
+            let ent = self.ktimes.entry(key).or_insert((0.0f64, 0u64));
+            ent.0 += e;
+            ent.1 += 1;
+        }
+        r
     }
 
     fn push_u32s(vals: &[u32]) -> Vec<u8> {
@@ -933,12 +951,22 @@ impl DecoderState {
     /// HIP 기본 WMMA와 동일 정확도 클래스 maxrel ~4.9e-4, argmax 안정).
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        const TILE_MIN: usize = 16;
+        if t >= TILE_MIN && std::env::var_os("LLM170_VK_TILE").is_some()
+            && (ty == 12 || ty == 13 || ty == 23 || (ty == 8 && no >= 1024)) {
+            return self.gemv_tile(xq, wkey, out, t);
+        }
+        self.gemv_xq(xq, wkey, out, t)
+    }
+
+    /// 타일(coopmat) 경로 — 프리필 전용. plans/32.
+    fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         // plans/30→32: tile128(coopmat f16)은 t=1 gemv와 수치계열이 다르나
         // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
         // 실측 pp512 11.18→17.45 t/s (+56%). 옵트인 LLM170_VK_TILE=1.
-        const TILE_MIN: usize = 16;
-        if t >= TILE_MIN && std::env::var_os("LLM170_VK_TILE").is_some() && (ty == 13 || ty == 23) {
+        {
             let xq_w = ni / 4 + ni / 32 + ni / 16;
             let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
             while binds.len() < 8 {
@@ -952,6 +980,24 @@ impl DecoderState {
                 if ty == 13 {
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
                     self.run_pipe("tile128", TILE128_SPV, 10, 16, &binds, &push, gx, 1, 1)?;
+                } else if ty == 12 {
+                    // tile_q4k: ql@16 128B, qh 없음 — 시프트 청크 push
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe("tile_q4k", TILE_Q4K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                } else if ty == 8 {
+                    // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)은 제외
+                    if no >= 1024 {
+                        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                        let cw_log2 = 31u32 - cw.leading_zeros();
+                        let cw_mask = (1u32 << cw_log2) - 1u32;
+                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                        self.run_pipe("tile_q8", TILE_Q8_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                    } else {
+                        self.gemv_xq(xq, wkey, out, t)?;
+                    }
                 } else {
                     // tile_xs (plans/32): iq4_xs coopmat — ktab 바인딩, 시프트 청크
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
@@ -965,6 +1011,15 @@ impl DecoderState {
             }
             return Ok(());
         }
+        unreachable!("gemv_tile: 타입 미적용")
+    }
+
+    /// 비타일 gemv (원본 경로).
+    fn gemv_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        if self.ktime {
+            *self.kkey.borrow_mut() = Some(format!("gemv:{wkey}"));
+        }
+        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         let xq_w = ni / 4 + ni / 32 + ni / 16;
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
@@ -1516,6 +1571,15 @@ impl DecoderState {
             self.axpy(self.b_xs.buf, self.b_fdown.buf, n * t)?;
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        if self.ktime {
+            let mut v: Vec<_> = self.ktimes.iter().collect();
+            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            let tot: f64 = v.iter().map(|(_, (e, _))| *e).sum();
+            eprintln!("[ktime] t={t} 총 {tot:.0}ms");
+            for (k, (e, c)) in v.iter().take(14) {
+                eprintln!("[ktime] {:22} {:9.1}ms ({}회)", k, e, c);
+            }
+        }
         if std::env::var_os("LLM170_VKD_TRACE").is_some() {
             let s = |b: &VkBuf, len: usize| -> f64 {
                 let mut x = vec![0f32; len];
