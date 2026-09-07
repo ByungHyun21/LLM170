@@ -65,14 +65,19 @@ void main() {
             uint w0v = WG(wb >> 2);
             vec2 dm = unpackHalf2x16(w0v);
             uint j = 2u * P + lohi;
+            // 스케일 12B = 워드 2회(w1: bytes4-7, w2: bytes8-11) — byte_at 산포 로드 제거
+            uint w1v = WG((wb >> 2) + 1u);   // bytes 4-7
+            uint w2v = WG((wb >> 2) + 2u);   // bytes 8-11
+            uint w3v = WG((wb >> 2) + 3u);   // bytes 12-15 (qh 시작과 겹침)
             uint sc, mn;
             if (j < 4u) {
-                sc = byte_at(wb + 4u + j) & 63u;
-                mn = byte_at(wb + 8u + j) & 63u;
+                sc = (w1v >> (8u * j)) & 63u;
+                mn = (w2v >> (8u * j)) & 63u;
             } else {
-                uint b84 = byte_at(wb + 8u + j);
-                uint bj = byte_at(wb + 4u + j);
-                sc = (b84 & 0xFu) | ((byte_at(wb + j) >> 6u) << 4);
+                uint b84 = (w3v >> (8u * (j - 4u))) & 0xFFu;  // q[j+4] = byte 8+j ∈ 12..15 → w3
+                uint bj  = (w2v >> (8u * (j - 4u))) & 0xFFu;   // q[j]   = byte 4+j ∈ 8..11 → w2
+                uint qm4 = (w1v >> (8u * (j - 4u))) & 0xFFu;  // q[j-4] = byte j ∈ 4..7 → w1
+                sc = (b84 & 0xFu) | ((qm4 >> 6u) << 4);
                 mn = (b84 >> 4u) | ((bj >> 6u) << 4);
             }
             float dl = dm.x * float(sc);

@@ -352,11 +352,14 @@ caused descriptor mismatches (SIGSEGV). Net: decode step 154→146 ms
 (tg 5.68→~5.9 t/s, +5%).
 
 Negative results (all opt-in-preserved): q5_K gemv4 regresses in-engine
-(step 194 vs 146 ms) despite winning standalone — register pressure +
-byte_at scale gathers are the suspects; kept on gemv3 by default
-(`LLM170_G4_Q5=1` to test). Loop unrolling ([[unroll]], GL_EXT_control_
-flow_attributes) fixed the register-spill suspicion standalone (97→104 GB/s)
-but did NOT fix the engine regression. y-staging in shared memory was
+(step 178-194 vs 146-151 ms) despite winning standalone at 121 GB/s —
+three suspects eliminated in sequence: register spill ([[unroll]] +
+GL_EXT_control_flow_attributes, standalone 97→104 GB/s, engine unchanged),
+scattered byte_at scale gathers (replaced by two direct word loads,
+standalone →121 GB/s, engine unchanged), vec4-y numerics (a uvec4 nibble
+extraction produced element scrambling — kept the verified scalar path).
+The standalone-vs-engine gap remains unexplained; q5 stays on gemv3 by
+default (`LLM170_G4_Q5=1` to test). y-staging in shared memory was
 rejected after measuring llama's actual structure: it stages nothing, it
 vectorizes activation loads and reuses them across rows. Batch prefill on
 gemv4 re-reads the t×n_in activation per row-WG — 3× prefill regression;
