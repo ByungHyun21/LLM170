@@ -15,6 +15,7 @@ const GEMV5_Q5_SPV: &[u8] = include_bytes!("spv/gemv5_q5.spv");
 const GEMV6_Q5_SPV: &[u8] = include_bytes!("spv/gemv6_q5.spv");
 const GEMV6_XS_SPV: &[u8] = include_bytes!("spv/gemv6_xs.spv");
 const GEMV6_Q6_SPV: &[u8] = include_bytes!("spv/gemv6_q6.spv");
+const GEMV6_Q4_SPV: &[u8] = include_bytes!("spv/gemv6_q4.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -933,8 +934,8 @@ impl DecoderState {
     /// 실DRAM +10.5% (79.7→88.1, L2방출 실측). LLM170_G6=1이면 q5에 우선.
     fn gemv6_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 13 && ty != 23 && ty != 14 {
-            return Err("gemv6: q5_K/iq4_xs/q6_K만".into());
+        if ty != 13 && ty != 23 && ty != 14 && ty != 12 {
+            return Err("gemv6: q4_K/q5_K/iq4_xs/q6_K만".into());
         }
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
@@ -954,6 +955,7 @@ impl DecoderState {
         let (pname, spv, n_kb) = match ty {
             23 => ("gemv6_xs", GEMV6_XS_SPV, 11),
             14 => ("gemv6_q6", GEMV6_Q6_SPV, 10),
+            12 => ("gemv6_q4", GEMV6_Q4_SPV, 10),
             _ => ("gemv6_q5", GEMV6_Q5_SPV, 10),
         };
         self.run_pipe(pname, spv, n_kb, 24, &binds, &push,
