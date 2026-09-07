@@ -51,8 +51,17 @@ def main() -> None:
             ]
             lines[start : end + 1] = new
 
-        patch("sa0", "aw_lo", "bw")
-        patch("sc0", "aw_hi", "bw2")
+        # 매니페스트: 소스의 "// SDOT: <marker> <a_var> <b_var>" 행 전수 치환.
+        # 없으면 기본 2블록(gemv5_xs 호환).
+        src_text = Path(src).read_text()
+        import re as _re
+        manifest = _re.findall(r"//\s*SDOT:\s*(\w+)\s+(\w+)\s+(\w+)", src_text)
+        if manifest:
+            for mk, av, bv in manifest:
+                patch(mk, av, bv)
+        else:
+            patch("sa0", "aw_lo", "bw")
+            patch("sc0", "aw_hi", "bw2")
         ci = 0
         for i, l in enumerate(lines):
             if l.strip().startswith("OpCapability"):

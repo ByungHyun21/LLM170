@@ -10,6 +10,9 @@ const GDN_CONV_SPV: &[u8] = include_bytes!("spv/gdn_conv_t.spv");
 const GEMV4_Q8_SPV: &[u8] = include_bytes!("spv/gemv4_q8.spv");
 const GEMV4_Q5_SPV: &[u8] = include_bytes!("spv/gemv4_q5.spv");
 const GEMV4_XS_SPV: &[u8] = include_bytes!("spv/gemv4_xs.spv");
+const GEMV5_XS_SPV: &[u8] = include_bytes!("spv/gemv5_xs.spv");
+const GEMV5_Q5_SPV: &[u8] = include_bytes!("spv/gemv5_q5.spv");
+const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
 const L2_SPV: &[u8] = include_bytes!("spv/l2_rows2.spv");
@@ -896,9 +899,42 @@ impl DecoderState {
 
     /// GEMV (12바인딩 gemv3): xq × 가중 → out.
     /// t≥2 + q5_K는 coopmat 128행 타일 (plans/20 — f16 스테이징 MMA,
+    /// gemv5 (plans/33) — llama MMQ 정수 dot(OpSDot) 경로. 활성 xq(q8), W4A8 계열.
+    /// xs(ktab LUT)와 q5(산술 언팩) 지원. LLM170_V5=1 옵트인.
+    fn gemv5_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if ty != 23 && ty != 13 {
+            return Err("gemv5: iq4_xs/q5_K만".into());
+        }
+        let xq_w = ni / 4 + ni / 32 + ni / 16;
+        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
+        while binds.len() < 8 {
+            binds.push(self.dummy.buf);
+        }
+        binds.push(xq);
+        binds.push(out);
+        if ty == 23 {
+            binds.push(self.ktab.buf);
+        }
+        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+        let cw_log2 = 31u32 - cw.leading_zeros();
+        let cw_mask = (1u32 << cw_log2) - 1u32;
+        let rpf: u32 = if no < 4096 { 1 } else { 8 };
+        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, xq_w as u32, cw_log2, cw_mask, rpf]);
+        let (pname, spv, nkb) = if ty == 23 { ("gemv5_xs", GEMV5_XS_SPV, 11) } else { ("gemv5_q5", GEMV5_Q5_SPV, 10) };
+        self.run_pipe(pname, spv, nkb, 28, &binds, &push,
+            1, no.div_ceil(rpf as usize) as u32, t as u32)
+    }
+
     /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
     /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
+        if t == 1 && std::env::var_os("LLM170_V5").is_some() {
+            self.quant(qsrc, xq, nq, t)?;
+            if self.gemv5_xq(xq, wkey, out, t).is_ok() {
+                return Ok(());
+            }
+        }
         if t == 1 && std::env::var("LLM170_VK_GEMV4").map(|v| v == "1").unwrap_or(false) {
             if self.gemv4_f32(qsrc, wkey, out, t).is_ok() {
                 return Ok(());
@@ -964,9 +1000,9 @@ impl DecoderState {
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        const TILE_MIN: usize = 16;
-        if t >= TILE_MIN && std::env::var_os("LLM170_VK_TILE").is_some()
-            && (ty == 11 || ty == 12 || ty == 13 || ty == 23 || (ty == 8 && no >= 1024)) {
+        let tile_min: usize = if std::env::var_os("LLM170_VK_TILE1").is_some() { 1 } else { 16 };
+        if t >= tile_min && std::env::var_os("LLM170_VK_TILE").is_some()
+            && (ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 23 || (ty == 8 && no >= 1024)) {
             return self.gemv_tile(xq, wkey, out, t);
         }
         self.gemv_xq(xq, wkey, out, t)
@@ -999,6 +1035,13 @@ impl DecoderState {
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
                     self.run_pipe("tile_q4k", TILE_Q4K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                } else if ty == 14 {
+                    // tile_q6k: ql 니블 + qh 2비트 + i8 스케일 + d @208
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe("tile_q6k", TILE_Q6K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
                 } else if ty == 11 {
                     // tile_q3k: hm 32B + q 64B(2비트) + scales 12B + d @108
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
