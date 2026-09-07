@@ -715,3 +715,26 @@ llama/HIP-architecture analogies:
 Both knobs are kept as documented opt-in experiments. Decode standing:
 ~144 ms step (tg 6.2-6.3, 0.55× llama-vk). Prefill standing: 47.3 t/s
 (0.37×).
+
+### Round 8 — llama MMQ int-dot port attempt (2026-09-07)
+
+Deep-dive into llama's mul_mmq revealed the actual decode architecture:
+weights stay INTEGER and the dot runs on the hardware integer-dot
+instruction (`dotPacked4x8EXT`, SPV_KHR_integer_dot_product — DP4A
+class, one instruction per 4 elements) against q8-quantized activations.
+That is the structural difference from both our paths (scalar f32 FMA
+per element; f16-staged coopmat tiles).
+
+Ported the structure as gemv5_xs (xq int activations, ktab-packed
+int8x4 weight words, per-block scale epilogue). BLOCKED on toolchain:
+shaderc 2023.8 (glslang 14) predates the GLSL extension; the Ubuntu
+noble glslang-tools 15.1 package is missing the extension despite
+upstream support (binary strings confirm); no spirv-as; no sudo; no
+network fetch. Measured with an int unpack emulation instead:
+149.1 vs 144.2 ms — no gain, confirming the win lives in the hardware
+dot itself (emulation ≈ float-FMA op count).
+
+Correctness: gemv5 produces ' Paris' (engine path LLM170_V5=1).
+Unblock for a future round: any upstream glslang ≥13 binary (or
+spirv-tools assembler), then swap the emulation block for
+dotPacked4x8EXT — the surrounding kernel is done.

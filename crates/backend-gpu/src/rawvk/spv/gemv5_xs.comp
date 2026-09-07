@@ -1,0 +1,123 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv5_xs (plans/33) — llama mul_mmq 아키텍처 포트 (int dot).
+// 하드웨어 dotPacked4x8EXT는 이 툴체인(shaderc 2023.8 / Ubuntu glslang 15.1
+// 패키지 결함)에서 컴파일 불가 — int unpack×4 에뮬레이션으로 구조 검증.
+// 가중 iq4_xs 니블을 ktab으로 i8 역양자화 후 int8×4 워드로 팩, 활성 xq(q8)의
+// int8 워드와 하드웨어 dot — 원소당 FMA가 아니라 4원소당 1명령.
+// acc = d·ls·yd·Σ dot4x8(a_word, b_word).
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0c { uint w0[]; };
+layout(binding = 1) readonly buffer W1c { uint w1[]; };
+layout(binding = 2) readonly buffer W2c { uint w2[]; };
+layout(binding = 3) readonly buffer W3c { uint w3[]; };
+layout(binding = 4) readonly buffer W4c { uint w4[]; };
+layout(binding = 5) readonly buffer W5c { uint w5[]; };
+layout(binding = 6) readonly buffer W6c { uint w6[]; };
+layout(binding = 7) readonly buffer W7c { uint w7[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };      // q8 활성: [t][qs 워드][yd f32]
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Kbuf { uint ktab[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint xq_w; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_sub = n_in >> 5;
+    uint blocks = n_in >> 8;
+    uint xbase = tok * pc.xq_w;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+    for (uint sb = tid; sb < n_sub; sb += 32u) {
+        // B: 이 sb의 q8 워드 8개 + yd — 모든 행 공유
+        uint xw = (sb << 3);                       // qs 워드 베이스 (32원소 = 8워드)
+        float yd = uintBitsToFloat(xq[xbase + (n_in >> 2) + sb]);
+        // A 팩: 행별 스케일 + 니블→ktab→int8×4 워드
+        for (uint r = 0u; r < RPF; r++) {
+            uint row = row0 + r;
+            if (row >= pc.n_out) break;
+            uint blk = sb >> 3;
+            uint ib = sb & 7u;
+            uint rowb = row * blocks * 136u + blk * 136u;
+            uint wd = WG(rowb >> 2);
+            float d = unpackHalf2x16(wd >> ((rowb & 3u) * 8u)).x;
+            uint sh = (WG((rowb + 2u) >> 2) >> (((rowb + 2u) & 3u) * 8u)) & 0xFFFFu;
+            if (((rowb + 2u) & 3u) == 3u) {
+                uint w2 = WG(((rowb + 2u) >> 2) + 1u);
+                sh = (sh & 0xFFu) | ((w2 & 0xFFu) << 8);
+            }
+            uint slw = WG((rowb + 4u + (ib >> 1)) >> 2);
+            uint slb = (slw >> (((rowb + 4u + (ib >> 1)) & 3u) * 8u)) & 0xFFu;
+            int ls = int((slb >> (4u * (ib & 1u))) & 0xFu) | (int((sh >> (2u * ib)) & 3u) << 4);
+            float dl = d * float(ls - 32);
+            // qs 16B @8+ib*16 — 워드 4개, 각 워드 = lo열 4원소 + hi열 4원소
+            uint qb = rowb + 8u + ib * 16u;
+            int qsum = 0;
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                uint bytei = qb + k * 4u;
+                uint aw = WG(bytei >> 2);
+                uint rem = bytei & 3u;
+                if (rem != 0u) {
+                    uint w2 = WG((bytei >> 2) + 1u);
+                    aw = (aw >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
+                }
+                uint bw = xq[xbase + xw + k];
+                // lo열(원소 4k..+3): 바이트 k 하니블 → ktab lo
+                // hi열(원소 16+4k..+3): 같은 바이트 상니블 → ktab hi
+                uint aw_lo = (ktab[aw & 0xFFu] & 0xFFu)
+                           | ((ktab[(aw >> 8u) & 0xFFu] & 0xFFu) << 8u)
+                           | ((ktab[(aw >> 16u) & 0xFFu] & 0xFFu) << 16u)
+                           | ((ktab[(aw >> 24u) & 0xFFu] & 0xFFu) << 24u);
+                uint aw_hi = ((ktab[aw & 0xFFu] >> 8u) & 0xFFu)
+                           | (((ktab[(aw >> 8u) & 0xFFu] >> 8u) & 0xFFu) << 8u)
+                           | (((ktab[(aw >> 16u) & 0xFFu] >> 8u) & 0xFFu) << 16u)
+                           | (((ktab[(aw >> 24u) & 0xFFu] >> 8u) & 0xFFu) << 24u);
+                // 에뮬레이션: 바이트별 i8×i8 적산 (dot4x8 미지원 툴체인)
+                int bl0 = int((bw        ) & 0xFFu) - ((bw        & 0x80u) != 0u ? 256 : 0);
+                int bl1 = int((bw >> 8u  ) & 0xFFu) - ((bw >> 8u  & 0x80u) != 0u ? 256 : 0);
+                int bl2 = int((bw >> 16u) & 0xFFu) - ((bw >> 16u & 0x80u) != 0u ? 256 : 0);
+                int bl3 = int((bw >> 24u) & 0xFFu) - ((bw >> 24u & 0x80u) != 0u ? 256 : 0);
+                qsum += (int(aw_lo & 0xFFu) - ((aw_lo & 0x80u) != 0u ? 256 : 0)) * bl0;
+                qsum += (int((aw_lo >> 8u) & 0xFFu) - (((aw_lo >> 8u) & 0x80u) != 0u ? 256 : 0)) * bl1;
+                qsum += (int((aw_lo >> 16u) & 0xFFu) - (((aw_lo >> 16u) & 0x80u) != 0u ? 256 : 0)) * bl2;
+                qsum += (int((aw_lo >> 24u) & 0xFFu) - (((aw_lo >> 24u) & 0x80u) != 0u ? 256 : 0)) * bl3;
+                uint bw2 = xq[xbase + xw + 4u + k];
+                int bh0 = int((bw2        ) & 0xFFu) - ((bw2        & 0x80u) != 0u ? 256 : 0);
+                int bh1 = int((bw2 >> 8u  ) & 0xFFu) - ((bw2 >> 8u  & 0x80u) != 0u ? 256 : 0);
+                int bh2 = int((bw2 >> 16u) & 0xFFu) - ((bw2 >> 16u & 0x80u) != 0u ? 256 : 0);
+                int bh3 = int((bw2 >> 24u) & 0xFFu) - ((bw2 >> 24u & 0x80u) != 0u ? 256 : 0);
+                qsum += (int(aw_hi & 0xFFu) - ((aw_hi & 0x80u) != 0u ? 256 : 0)) * bh0;
+                qsum += (int((aw_hi >> 8u) & 0xFFu) - (((aw_hi >> 8u) & 0x80u) != 0u ? 256 : 0)) * bh1;
+                qsum += (int((aw_hi >> 16u) & 0xFFu) - (((aw_hi >> 16u) & 0x80u) != 0u ? 256 : 0)) * bh2;
+                qsum += (int((aw_hi >> 24u) & 0xFFu) - (((aw_hi >> 24u) & 0x80u) != 0u ? 256 : 0)) * bh3;
+            }
+            acc[r] += dl * yd * float(qsum);
+        }
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
