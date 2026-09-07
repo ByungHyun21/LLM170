@@ -18,6 +18,7 @@ const GEMV6_Q6_SPV: &[u8] = include_bytes!("spv/gemv6_q6.spv");
 const GEMV6_Q4_SPV: &[u8] = include_bytes!("spv/gemv6_q4.spv");
 const GEMV6_Q3_SPV: &[u8] = include_bytes!("spv/gemv6_q3.spv");
 const GEMV8_Q5_SPV: &[u8] = include_bytes!("spv/gemv8_q5.spv");
+const GEMV8_Q4_SPV: &[u8] = include_bytes!("spv/gemv8_q4.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -936,8 +937,8 @@ impl DecoderState {
     /// SIMD-in-register 니블, fma 체인). 웜 162GB/s (역대 최고). LLM170_G8=1.
     fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 13 {
-            return Err("gemv8: q5_K만".into());
+        if ty != 13 && ty != 12 {
+            return Err("gemv8: q4_K/q5_K만".into());
         }
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
@@ -945,12 +946,22 @@ impl DecoderState {
         }
         binds.push(xn);
         binds.push(out);
-        // cw2: u16 단위 청크 상수 — 첫 버퍼는 실측 크기일 수 있어 pow2ceil 기준
+        let rpf: u32 = if no < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
+        if ty == 12 {
+            // q4 — u32 워드 단위 (동일 WG 워커)
+            let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
+            let cw = cw.next_power_of_two();
+            let cw_log2 = 31u32 - cw.leading_zeros();
+            let cw_mask = cw - 1;
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
+            return self.run_pipe("gemv8_q4", GEMV8_Q4_SPV, 10, 24, &binds, &push,
+                1, no.div_ceil(rpf as usize) as u32, t as u32);
+        }
+        // q5 — u16 단위 청크 상수 (typed 뷰), 첫 버퍼 실측 크기 → pow2ceil
         let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
         let cw2 = cw2.next_power_of_two();
         let cw2_log2 = 31u32 - cw2.leading_zeros();
         let cw2_mask = cw2 - 1;
-        let rpf: u32 = if no < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
         let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
         self.run_pipe("gemv8_q5", GEMV8_Q5_SPV, 10, 24, &binds, &push,
             1, no.div_ceil(rpf as usize) as u32, t as u32)
