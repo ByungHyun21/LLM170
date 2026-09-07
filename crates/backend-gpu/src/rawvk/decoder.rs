@@ -24,6 +24,7 @@ const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const TILE_XS_SPV: &[u8] = include_bytes!("spv/tile_xs.spv");
 const TILE_Q8_SPV: &[u8] = include_bytes!("spv/tile_q8.spv");
 const TILE_Q4K_SPV: &[u8] = include_bytes!("spv/tile_q4k.spv");
+const TILE_Q3K_SPV: &[u8] = include_bytes!("spv/tile_q3k.spv");
 const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
@@ -954,7 +955,7 @@ impl DecoderState {
         let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         const TILE_MIN: usize = 16;
         if t >= TILE_MIN && std::env::var_os("LLM170_VK_TILE").is_some()
-            && (ty == 12 || ty == 13 || ty == 23 || (ty == 8 && no >= 1024)) {
+            && (ty == 11 || ty == 12 || ty == 13 || ty == 23 || (ty == 8 && no >= 1024)) {
             return self.gemv_tile(xq, wkey, out, t);
         }
         self.gemv_xq(xq, wkey, out, t)
@@ -987,6 +988,13 @@ impl DecoderState {
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
                     self.run_pipe("tile_q4k", TILE_Q4K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                } else if ty == 11 {
+                    // tile_q3k: hm 32B + q 64B(2비트) + scales 12B + d @108
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe("tile_q3k", TILE_Q3K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
                 } else if ty == 8 {
                     // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)은 제외
                     if no >= 1024 {
