@@ -937,6 +937,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let mut wbufs = Vec::new();
     let mut off = 0usize;
     let total = w.data.len();
+    // 청크 크기 2의 거듭제곱 (WG 시프트 산술) — 마지막 청크는 실제 크기만 할당:
+    // o = idx & mask 는 항상 청크 내 실데이터 오프셋만 생성하므로 패딩 불필요.
+    let ch = total.next_power_of_two().min(1usize << (63 - ch.leading_zeros()));
     while off < total {
         let sz = ch.min(total - off);
         let mut b = ctx.alloc(sz)?;
@@ -958,7 +961,7 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     };
     let spv = std::fs::read(spv_path).map_err(|e| e.to_string())?;
     let (kb, _gb, _db) = acc.ensure_shared(&mut ctx)?;
-    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else { 11 }, 28)?;
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, if is_xs { 12 } else { 11 }, 32)?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
     binds.push(xa.buf);
@@ -969,7 +972,9 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     binds.push(xa.buf);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
     ctx.bind_bufs(ds, &binds);
     let rpf: u32 = if n_out < 4096 { 1 } else { 8 };
-    let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, chunk_words, rpf]);
+    let cw_log2 = 31u32 - chunk_words.leading_zeros();
+    let cw_mask = (1u32 << cw_log2) - 1u32;
+    let push = push_u32s(&[n_in as u32, n_out as u32, 8u32, t as u32, cw_log2, cw_mask, rpf]);
     let _ = pl;
     ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
     let outs: Vec<f32> = unsafe {

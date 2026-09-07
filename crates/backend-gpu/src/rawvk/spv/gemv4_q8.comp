@@ -17,12 +17,13 @@ layout(binding = 8) readonly buffer Xbuf { float xa[]; };   // [t][n_in] f32 활
 layout(binding = 9) buffer Obuf { float outv[]; };          // [t][n_out]
 layout(binding = 10) readonly buffer YV4 { vec4 yv4[]; };   // xa의 vec4 뷰 (동일 버퍼 재바인딩)
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint ty; uint t; uint chunk_words; uint rpf;
+    uint n_in; uint n_out; uint ty; uint t; uint cw_log2; uint cw_mask; uint rpf;
 } pc;
 
 uint WG(uint idx) {
-    uint c = idx / pc.chunk_words;
-    uint o = idx - c * pc.chunk_words;
+    // chunk_words = 2의 거듭제곱(=max_ssbo.min) → 시프트/마스크 (워드당 정수 나눗셈 제거)
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
     if (c == 0u) return w0[o];
     if (c == 1u) return w1[o];
     if (c == 2u) return w2[o];
