@@ -301,9 +301,31 @@ one process (NYT front page read correctly); server multiturn
 cached-continuation == CLI full-prefill exact (16/16). HIP regression
 after all changes: verify.py 19/19 PASS.
 
-Vulkan throughput remains far below HIP (~0.25-1 t/s decode-class) —
-correct first; perf is future work (per-op submit overhead, documented
-below).
+### Vulkan performance round 1 (2026-09-07, plans/30)
+
+gemv3.comp rewrite: 256 threads (was 64), runtime-subgroup-count tree
+reduction, iq4_xs KVAL const-array → ktab SSBO LUT (const-array dynamic
+index lowers to a select-chain — was the worst kernel), sub-block stride
+generalized. Per-type GEMV bandwidth (vk-gemv-time, t=1): iq4_xs 19→57-73
+GB/s, q8_0 60→96-107, head 86. A 4-row×64-lane variant was tested and
+rejected (39KB LDS → occupancy collapse, documented in the shader header).
+
+Engine: tg16 2.52→5.68 t/s (+125%), pp64 2.65→12.45 t/s (+369% with
+LLM170_VKD_BATCH=1). tile128 (coopmat f16, q5_K t≥2) now opt-in
+(LLM170_VK_TILE=1): its numeric family diverged from the t=1 gemv and
+broke the spec==nonspec invariant (measured; NOTILE run restored exact
+equality). VKD_BATCH (step_batch prefill) remains opt-in and broken —
+state corruption after batch prefill (5-token France → repeated-token
+garbage; VKD_TRACE staged, root cause pending — likely conv-ring/AR
+interaction with the t>1 path).
+
+llama.cpp Vulkan reference on this machine (server bench, Q4_K_XL):
+pp 127-431 t/s, tg 11.4-11.9. Our Vulkan standing after round 1: tg 0.48×,
+pp 0.10× — NOT yet ahead; the remaining gap needs per-type tile GEMMs
+(weight-amortized prefill) and further GEMV bandwidth (q3_K at 37 GB/s
+is the weakest large kernel). Correctness held throughout: np4 seq2
+exact + others at HIP's known tie points, spec==nonspec x4 exact (after
+tile unification), long 2302tok exact, HIP regression 19/19 PASS.
 
 ## Vulkan — FIXED (2026-09-05)
 

@@ -799,7 +799,10 @@ impl DecoderState {
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if t >= 2 && ty == 13 && std::env::var_os("LLM170_VK_NOTILE").is_none() {
+        // plans/30: tile128(coopmat f16)은 t≥2와 t=1 gemv의 수치계열을 갈라
+        // spec==nonspec 불변식을 깨뜨림(실측) — 기본 gemv 단일 경로,
+        // tile은 LLM170_VK_TILE=1 옵트인.
+        if t >= 2 && ty == 13 && std::env::var_os("LLM170_VK_TILE").is_some() {
             let xq_w = ni / 4 + ni / 32 + ni / 16;
             let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
             while binds.len() < 8 {
