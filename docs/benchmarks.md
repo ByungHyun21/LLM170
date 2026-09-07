@@ -395,8 +395,28 @@ Engine: decode step median 152→127 ms (-16.5%, 3-run), end-to-end
 tg32 6.19-6.32 t/s (+9% over the 5.68 baseline). rpf sweep knob
 (LLM170_G4_RPF) showed 2/4/8 within noise.
 
-Standing vs llama-vk (tg 11.4-11.9, pp 127+): tg ~0.54×, pp 0.10×.
-Next levers: FFN-site L2 behavior, register-tile GEMM for prefill.
+Round 3 — prefill coopmat tiles (plans/32). tile128 (q5_K) extended to a
+prefill-only threshold (t≥16, keeping spec verify batches on the exact
+gemv path) and joined by a new tile_xs (iq4_xs port of the same 512-thread
+coopmat structure; A-staging dequantizes iq4_xs with the shared ktab).
+Measured pp512: 11.18 (per-token gemv) → 17.45 (q5 tile) → 26.04 t/s
+(both tiles, LLM170_VK_TILE=1 + VKD_BATCH=1). Cumulative +133%.
+
+CRITICAL caveat — the tiles stage operands in f16 (RDNA coopmat has no
+f32 inputs), which shifts the numeric family: with tiles on, the long
+prompt diverges from the token-exact reference stream entirely (0/24 vs
+the llama CPU store; llama's own Vulkan pp has the same f16 property).
+The quality contract therefore keeps tiles OPT-IN
+(LLM170_VK_TILE=1); the default path re-verified clean after the change:
+spec==nonspec True, long 24/24. A plain LDS-y batched gemv (gemt_xs,
+64 threads, 160 barriers) was also built during this round and REJECTED:
+one-hot probes pass but random inputs corrupt outputs through an
+unresolved shared-memory anomaly (sy rows read inconsistently across
+tokens with identical inputs; markers prove staging threads alive and
+stores happening) — kept as a check-harness prototype only
+(vk-gemt-check), not wired into the engine. Standing: tg 0.54×,
+pp 0.20× (default 0.10×). Next: full MMQ family + non-GEMM prefill
+kernels, or an f16-tolerant quality contract.
 
 ## Vulkan — FIXED (2026-09-05)
 

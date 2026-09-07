@@ -21,6 +21,7 @@ const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
 const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
+const TILE_XS_SPV: &[u8] = include_bytes!("spv/tile_xs.spv");
 const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
@@ -933,10 +934,11 @@ impl DecoderState {
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        // plans/30: tile128(coopmat f16)은 t≥2와 t=1 gemv의 수치계열을 갈라
-        // spec==nonspec 불변식을 깨뜨림(실측) — 기본 gemv 단일 경로,
-        // tile은 LLM170_VK_TILE=1 옵트인.
-        if t >= 2 && ty == 13 && std::env::var_os("LLM170_VK_TILE").is_some() {
+        // plans/30→32: tile128(coopmat f16)은 t=1 gemv와 수치계열이 다르나
+        // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
+        // 실측 pp512 11.18→17.45 t/s (+56%). 옵트인 LLM170_VK_TILE=1.
+        const TILE_MIN: usize = 16;
+        if t >= TILE_MIN && std::env::var_os("LLM170_VK_TILE").is_some() && (ty == 13 || ty == 23) {
             let xq_w = ni / 4 + ni / 32 + ni / 16;
             let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
             while binds.len() < 8 {
@@ -947,8 +949,19 @@ impl DecoderState {
             let gx = (no as u32 + 127) / 128;
             for tb in (0..t).step_by(64) {
                 let nt = (t - tb).min(64) as u32;
-                let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                self.run_pipe("tile128", TILE128_SPV, 10, 16, &binds, &push, gx, 1, 1)?;
+                if ty == 13 {
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe("tile128", TILE128_SPV, 10, 16, &binds, &push, gx, 1, 1)?;
+                } else {
+                    // tile_xs (plans/32): iq4_xs coopmat — ktab 바인딩, 시프트 청크
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    binds.push(self.ktab.buf);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe("tile_xs", TILE_XS_SPV, 11, 24, &binds, &push, gx, 1, 1)?;
+                    binds.pop();
+                }
             }
             return Ok(());
         }
