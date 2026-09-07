@@ -668,3 +668,21 @@ the summed kernel time (13.1s vs ~3.2s for pp512) — a per-token
 ~24ms non-kernel overhead somewhere between Engine::prefill and
 step_batch. tiles: tile128 205ms, tile_q4k 75ms, tile_xs 75ms per
 128 tokens; gemv residual ~300ms.
+
+### Round 5 — full type coverage + attribution hygiene (2026-09-07)
+
+Resolved the "4× overhead mystery": it was a division error on my side —
+the ktime total is per-chunk wall time in synchronous mode and matches
+the bench exactly (25.6 ≈ 25.1 ms/tok). No hidden overhead. Then closed
+the type coverage: tile_q3k (110B blocks: 32B bit-packed hm, 64B 2-bit
+q, 12B aux-unpacked scales, f16 d — unaligned word-span assembly), plus
+tile128 ql/qh word hoisting (16→4 walker calls per thread-subblock,
+200→150 ms per 32-token chunk, identical arithmetic). Verified with the
+France prompt pushed through a 38-token batched prefill so ALL five
+tile types engage: ' Paris' survives the f16 family.
+
+pp512: 39.1 → 42.8 (hoisting) → 45.4 t/s (q3_K). Session cumulative
+prefill: 11.2 → 45.4 (+306%), 0.36× of llama-vk. HIP 19/19. Remaining
+prefill: gemv tail is now mostly q6_K (ty14) + iq3_s (ty21) stragglers;
+the per-32tok chunk budget is tile128 150 / tile_xs 71 / tile_q4k 50 /
+gemv ~250 / elementwise ~90 ms.
