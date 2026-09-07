@@ -1,0 +1,128 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv8_q4 (plans/33) — gemv8 레시피(typed 뷰+SIMD-in-register+fma)를 q4_K에 적용.
+// gemv6_q4(검증 기하: 144B 워드정렬 블록, qs 워드 4..35, 바이트 j: p=j>>5, l=j&31,
+// lo니블=원소 64p+l 스케일 2p / hi니블=+32 스케일 2p+1)에 llama식 니블 SIMD 처리.
+// 레인 L이 qs 워드 (4+L) — 연속 128B, 워드당 8원소(lo4+hi4) fma 체인.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 1) readonly buffer W1 { uint w1u[]; };
+layout(binding = 2) readonly buffer W2 { uint w2u[]; };
+layout(binding = 3) readonly buffer W3 { uint w3u[]; };
+layout(binding = 4) readonly buffer W4 { uint w4u[]; };
+layout(binding = 5) readonly buffer W5 { uint w5u[]; };
+layout(binding = 6) readonly buffer W6 { uint w6u[]; };
+layout(binding = 7) readonly buffer W7 { uint w7u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0u[o];
+    if (c == 1u) return w1u[o];
+    if (c == 2u) return w2u[o];
+    if (c == 3u) return w3u[o];
+    if (c == 4u) return w4u[o];
+    if (c == 5u) return w5u[o];
+    if (c == 6u) return w6u[o];
+    return w7u[o];
+}
+
+vec4 myunpack8(uint x) {
+    return vec4(
+        float((x        ) & 0xFFu),
+        float((x >> 8u  ) & 0xFFu),
+        float((x >> 16u) & 0xFFu),
+        float((x >> 24u) & 0xFFu));
+}
+
+const uint BLK_W = 36u;   // 144B / 4
+shared float sh_dl[96][8];
+shared float sh_dml[96][8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    // 레인 고정 파생: qs 워드 L → 바이트 4L..4L+3 (블록 내 j = 4L..4L+3)
+    uint j0 = tid * 4u;
+    uint p = j0 >> 5;              // 항상 동일 p (4바이트는 32 경계 안 넘음: 4L&31 ≤ 28)
+    uint l = j0 & 31u;
+    uint e_lo = p * 64u + l;       // 블록 내 lo 원소
+    uint e_hi = e_lo + 32u;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint roww = row * n_blk * BLK_W;
+        // 패스1: 헤더 (gemv6_q4 검증 산법)
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = roww + b * BLK_W;
+            uint w0v = WG(bw);
+            vec2 dm = unpackHalf2x16(w0v);
+            uint w1v = WG(bw + 1u);
+            uint w2v = WG(bw + 2u);
+            uint w3v = WG(bw + 3u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint sc, mn;
+                if (j < 4u) {
+                    sc = (w1v >> (8u * j)) & 63u;
+                    mn = (w2v >> (8u * j)) & 63u;
+                } else {
+                    uint b84 = (w3v >> (8u * (j - 4u))) & 0xFFu;
+                    uint bj  = (w2v >> (8u * (j - 4u))) & 0xFFu;
+                    uint qm4 = (w1v >> (8u * (j - 4u))) & 0xFFu;
+                    sc = (b84 & 0xFu) | ((qm4 >> 6u) << 4);
+                    mn = (b84 >> 4u) | ((bj >> 6u) << 4);
+                }
+                sh_dl[b][j] = dm.x * float(sc);
+                sh_dml[b][j] = dm.y * float(mn);
+            }
+        }
+        barrier();
+        // 패스2: qs 선형 스윕 + SIMD 니블 + fma
+        float pacc = 0.0;
+        [[unroll]] for (uint b = 0u; b < n_blk; b++) {
+            uint wv = WG(roww + b * BLK_W + 4u + tid);
+            // lo 니블×4 (원소 e_lo..e_lo+3)
+            vec4 qlo = myunpack8(wv & 0x0F0F0F0Fu);
+            vec4 qhi = myunpack8((wv >> 4u) & 0x0F0F0F0Fu);
+            float dl = sh_dl[b][2u * p];
+            float dml = sh_dml[b][2u * p];
+            float dl1 = sh_dl[b][2u * p + 1u];
+            float dml1 = sh_dml[b][2u * p + 1u];
+            vec4 ylo = vec4(xa[base + b * 256u + e_lo],
+                            xa[base + b * 256u + e_lo + 1u],
+                            xa[base + b * 256u + e_lo + 2u],
+                            xa[base + b * 256u + e_lo + 3u]);
+            vec4 yhi = vec4(xa[base + b * 256u + e_hi],
+                            xa[base + b * 256u + e_hi + 1u],
+                            xa[base + b * 256u + e_hi + 2u],
+                            xa[base + b * 256u + e_hi + 3u]);
+            // dot + min 항 fma
+            pacc = fma(dot(qlo, ylo), dl, fma(-dot(vec4(1.0), ylo), dml, pacc));
+            pacc = fma(dot(qhi, yhi), dl1, fma(-dot(vec4(1.0), yhi), dml1, pacc));
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
