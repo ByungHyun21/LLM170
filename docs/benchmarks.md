@@ -802,3 +802,22 @@ contention / dispatch environment), not an FFN-specific effect. The
 engine floor (~105 GB/s over 16GB = ~150ms step) matches the measured
 142-152ms steps. Next decode lever must therefore raise the engine
 floor itself, not individual kernels.
+
+### Engine-floor mystery SOLVED (2026-09-07, session close)
+
+The synthesis: the 'standalone' kernel rates (121-268 GB/s) are
+L2-ASSISTED — the timing loop re-reads the same 36-60MB tensor 10× and
+a 32MB L2 retains much of it. The MULTI runs (interleaved different
+tensors = L2 evicted, exactly like the engine) show the TRUE DRAM
+streaming rate of our kernels: ~105 GB/s uniform. That is why slab
+pooling did nothing (no allocation overhead involved) and why the
+engine floor matches ~105 exactly. llama-vk's decode at an effective
+182 GB/s therefore reflects genuinely better DRAM access patterns, not
+magic: their mul_mat_vec maps lanes to CONSECUTIVE words inside one
+row-block (K_PER_ITER 4-8 word bursts per lane), while our gemv4 maps
+lanes to strided sub-blocks (176B apart for q5_K) — 4-byte
+transactions scattered across 32 sectors per wavefront. The next
+decode kernel work is a lane-remap to contiguous per-lane bursts
+(llama's iqs layout); expected recovery toward 150-180 GB/s would take
+tg from 6.3 to ~8.5-10. LLM170_MULTI and LLM170_L2FLUSH knobs are in
+vk-gemv4-check for reproduction.
