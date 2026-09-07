@@ -1341,6 +1341,29 @@ pub fn gemv4_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
     }
     let solo_dt = solo_t0.elapsed().as_secs_f64() / 10.0;
+    // L2 플러시 타이밍 — 반복 사이 자기 자신을 12회 연속 돌린 뒤
+    // '매 반복 직전 타 텐서 1회' 교차 판독으로 캐시 몰아내기 (L2FLUSH=1).
+    let flushed_dt: f64 = if std::env::var_os("LLM170_L2FLUSH").is_some() {
+        // MULTI로 등록한 첫 extra 텐서를 플러시용으로 재사용: 그 weights로
+        // 동일 커널 1회 (다른 ds/push 필요) — 여기선 간단히 xa를 8MB 재기록 후
+        // 측정 대상 run 직전 xa 전체 재업로드 (호스트 memcpy가 L2 오염)
+        let t4 = Instant::now();
+        let xa2 = xs[0].clone();
+        for _ in 0..10 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(xa2.as_ptr(), xa.ptr as *mut f32, n_in);
+            }
+            ctx.run(pl, ds, pipe, &push, 1, n_out.div_ceil(rpf as usize) as u32, t as u32)?;
+        }
+        t4.elapsed().as_secs_f64() / 10.0
+    } else { 0.0 };
+    if flushed_dt > 0.0 {
+        return Ok(format!(
+            "gemv4-l2flush({tname}): {:.3}ms → {:.1}GB/s (웜 {})",
+            flushed_dt * 1e3, w.data.len() as f64 / flushed_dt / 1e9,
+            w.data.len() as f64 / solo_dt / 1e9
+        ));
+    }
     if let Ok(list) = std::env::var("LLM170_MULTI") {
         // TLB/할당수 가설: 추가 텐서들을 같은 컨텍스트에 로드(상주)시킨 뒤
         // 이 텐서의 타이밍 재측정 — 속도 붕괴 시 가설 확인.
