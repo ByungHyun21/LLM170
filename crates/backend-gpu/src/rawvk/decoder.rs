@@ -24,6 +24,38 @@ const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
 const GEMM_I8V2_SPV: &[u8] = include_bytes!("spv/gemm_i8v2.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
+/// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x007f_ffff;
+    if exp == 255 {
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let e2 = exp - 127 + 15;
+    if e2 >= 31 {
+        return sign | 0x7c00; // 오버플로 → inf
+    }
+    if e2 <= 0 {
+        if e2 < -10 {
+            return sign;
+        }
+        // 비정규
+        let m = (mant | 0x0080_0000) >> (1 - e2);
+        let r = (m + 0x1000) >> 13; // RNE 근사
+        return sign | r as u16;
+    }
+    let mut h = ((e2 as u32) << 10) | (mant >> 13);
+    // RNE
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 struct I8W {
     w: VkBuf,
     wsp: VkBuf,
@@ -407,6 +439,42 @@ impl DecoderState {
             .filter(|(_, _, ty, _, _)| *ty == 13)
             .map(|(k, d, _, ni, no)| (k.clone(), d.clone(), *ni, *no))
             .collect();
+
+        // plans/30: q3_K 가중을 q8_0로 초기화 시 재팩 — q3_K GEMV(37GB/s)를
+        // q8_0 경로(96-107GB/s)로 승격. 수치: 디양자화→재양자화 오차 ~1e-3 상대
+        // (llama MMA급 — 게이트는 argmax/근접티 기준). LLM170_VK_Q3Q8=0 옵트아웃.
+        // 실측 판정(2026-09-07): tg 5.28 vs 5.68 — 2.47배 바이트 증가가 대역 이득을
+        // 상쇄해 무이득 + VRAM +3.5GB. 옵트인으로 강등.
+        let q3q8 = std::env::var("LLM170_VK_Q3Q8").map(|v| v == "1").unwrap_or(false);
+        let mut weights = weights;
+        if q3q8 {
+            for (_name, data, ty, ni, no) in weights.iter_mut() {
+                if *ty != 11 {
+                    continue;
+                }
+                let (rows, k) = (*no, *ni);
+                let mut out = Vec::with_capacity(rows * (k / 32) * 34);
+                let mut row = vec![0.0f32; k];
+                for r in 0..rows {
+                    llm170_core::quant::dequant_row(
+                        llm170_gguf::GgmlType::Q3K,
+                        data, r as u64, k as u64, &mut row);
+                    for blk in row.chunks(32) {
+                        let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                        let d = amax / 127.0;
+                        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                        // f16 d (RNE)
+                        let h = f32_to_f16_bits(d);
+                        out.extend_from_slice(&h.to_le_bytes());
+                        for &v in blk {
+                            out.push(((v * id).round()).clamp(-127.0, 127.0) as i8 as u8);
+                        }
+                    }
+                }
+                *data = out;
+                *ty = 8;
+            }
+        }
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
             let mut bufs = Vec::new();
