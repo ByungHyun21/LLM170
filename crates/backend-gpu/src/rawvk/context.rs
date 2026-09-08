@@ -36,6 +36,9 @@ pub struct VkCtx {
     pub batch_dsl: std::cell::Cell<Option<(vk::DescriptorSetLayout, vk::DescriptorPool)>>,
     pub batch_pool: std::cell::Cell<Option<(vk::DescriptorSetLayout, vk::DescriptorPool)>>,
     pub batch_sets: std::cell::RefCell<Vec<vk::DescriptorSet>>,
+    /// 다음 run() 직후의 write→read 배리어 생략 (독립 병렬 그룹 — decoder가
+    /// 설정, run이 소비·리셋. 그룹 마지막 디스패치는 배리어로 종결해야 안전).
+    pub nobar_next: std::cell::Cell<bool>,
 }
 
 unsafe impl Send for VkCtx {}
@@ -180,6 +183,7 @@ impl VkCtx {
                 batch_dsl: std::cell::Cell::new(None),
                 batch_pool: std::cell::Cell::new(None),
                 batch_sets: std::cell::RefCell::new(Vec::new()),
+                nobar_next: std::cell::Cell::new(false),
             })
         }
     }
@@ -706,8 +710,10 @@ impl VkCtx {
                 );
             }
             self.device.cmd_dispatch(cb, gx, gy, gz);
-            // 배치 내 write→read 가시성 배리어 (비배칭 submit+wait의 암시 동기 대체)
-            if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            // 배치 내 write→read 가시성 배리어 (비배칭 submit+wait의 암시 동기 대체).
+            // nobar_next: 다음 디스패치와 출력 의존이 없는 독립 그룹 내부 — 스킵.
+            let skip_bar = self.nobar_next.replace(false);
+            if self.batching.load(std::sync::atomic::Ordering::Relaxed) && !skip_bar {
                 let bar = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ);
