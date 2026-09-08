@@ -253,3 +253,29 @@ W4A8 integer arithmetic (see backend-architecture.md).
 "cubecl keeps kernel sources Rust" is superseded — kernel bodies are now
 HIP C++ / GLSL embedded as strings, with Rust owning all orchestration.
 ADRs 0009/0011/0016 remain as history.
+
+## ADR-0019 — Experiment-scaffold pruning policy (2026-09-08)
+
+**Context**: the perf campaign (gemv4→8 generations, launch-geometry sweeps,
+HIP A/B batches) left ~75 `LLM170_*` gates, five copy-pasted q5_K GEMV
+shader generations, and 16 zero-launch HIP kernels. An engine-level A/B
+showed the promoted default already beat the surviving opt-in generation
+(q6_K via gemv3+quant 7.06 t/s vs gemv6 6.71 t/s median tg32).
+
+**Decision**: once an experiment concludes, the losing path, its env gates,
+its check tools, and its shader assets are deleted in the same change — no
+opt-in graveyards. Verification infrastructure is exempt (`LLM170_EXACT`
+bit-exact reference kernels, per-tensor check tools, the Mesa OpSDot
+reproducers). Dead-kernel deletion requires a launch-site cross-check
+(kernel name × launch strings), not grep of definitions alone: probes and
+env-gated variants kept several "dead-looking" kernels alive.
+
+**Consequence**: rawvk GEMV routing is a type-driven table — gemv8 (t<16,
+q3/q4/q5/xs, kill-switch `LLM170_G8=0`), quant+gemv3 (everything else,
+including q6_K and q8_0), coopmat tiles (t≥16 prefill, `LLM170_VK_TILE`),
+i8 GEMM (plans/23, opt-in). Model knowledge (raw weight/const manifests,
+rope table) lives in core; backend injection lives in backend-gpu; the
+server is a CLI router + HTTP. The hipRTC kernel string is split into
+family assets (`kernels/src_*.hip`) assembled by `include_str!` — the
+concatenation is byte-identical to the monolith it replaced (hash-checked
+during the split).

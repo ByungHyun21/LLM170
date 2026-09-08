@@ -29,7 +29,8 @@ two independent GPU backends plus a CPU reference path. All three produce
 
 - `llm170 vk-check` — Vulkan device capabilities, cooperative matrix probe,
   smoke compute, axpy.
-- `llm170 vk-gemv-check <model> <tensor> [t]` — per-type GEMV vs CPU mirror.
+- `llm170 vk-gemv-check <model> <tensor> [t]` — engine path (quant+gemv3)
+  GEMV vs CPU mirror; `vk-gemv8-check` — gemv8 family vs dequant dot.
 - `llm170 mm-bench2 <model> <tensor>` — HIP per-kernel timing + mismatch check.
 - `scripts/logit-diff.sh` — fast-vs-exact logit divergence gate.
 - Streams: GPU greedy output must equal the CPU reference token-for-token
@@ -38,11 +39,36 @@ two independent GPU backends plus a CPU reference path. All three produce
 ## Backend notes
 
 ### HIP (`rawhip`)
-Kernels are HIP C++ strings JIT-compiled via hipRTC (`kernels.rs::SRC`), plus
+Kernels are HIP C++ assets JIT-compiled via hipRTC (see "Kernel sources"
+below), plus
 optional offline code objects (`LLM170_CO_PATH` family) built by
 `scripts/build_co.py` for wave32-compiled variants. DecodeState keeps
 activations, KV cache, and GDN states resident on device across the whole
 forward pass.
+
+## GEMV routing (rawvk, 2026-09-08)
+
+Type-driven, one table (decoder.rs `gemv_w`):
+
+| Condition | Path |
+|---|---|
+| t<16, ty ∈ {q3_K, q4_K, q5_K, iq4_xs} | `gemv8` — llama mul_mat_vec port, f32 activations direct (kill-switch `LLM170_G8=0`) |
+| everything else (q6_K, q8_0, iq4_nl, iq3_s, t≥16 non-tile) | `quant` + `gemv3` integer path |
+| t≥16 + `LLM170_VK_TILE` | coopmat f16 tiles (prefill; llama MMA accuracy class) |
+| opt-in `LLM170_VK_I8ON` | i8 coopmat GEMM (plans/23) |
+
+The gemv4/5/6/7 generations were deleted after gemv8 promotion; an
+engine-level A/B kept q6_K on gemv3+quant (7.06 vs 6.71 t/s tg32 median).
+`vk-gemv8-check` verifies each type against the CPU dequant dot; the
+gemv8_q6 shader is retained for the plans/34 retry.
+
+## Kernel sources (rawhip)
+
+HIP C++ lives in `rawhip/kernels/src_*.hip` (family assets: common, quant,
+gemv, gemm, probe, ew, gdn, qsa, vit, ms) assembled by `include_str!`
+concatenation — byte-identical to the former single-string SRC. hipRTC
+compiles the concatenation once at `RawCtx::new`; `NAMES` fetches every
+kernel handle up front.
 
 ### Vulkan (`rawvk`)
 GLSL compute shaders precompiled to SPIR-V by `scripts/build_spv.py` and
@@ -173,8 +199,9 @@ forward pass; the reference caption is restored exactly.
 Zero-config by default: tensor types are dispatched automatically from the
 GGUF (kernel selection is type-driven, as in llama.cpp) and the standard
 models run with no environment variables (verified end-to-end). The
-`LLM170_*` variables split into: operational switches (GPU_RUNTIME, SLOTS,
-W4A8, chunk sizes) and development gates (layer/substep bisectors, path
-isolators, trace hooks, experimental offline-built `.co` tile-kernel A/B
-selectors). The latter are research scaffolding — candidates for a single
-dev-mode umbrella or removal once the corresponding experiments conclude.
+2026-09-08 prune (ADR-0019) removed the concluded-experiment gates
+(~75 → ~50 distinct `LLM170_*` vars); the remainder are operational
+switches (GPU_RUNTIME, SLOTS, W4A8, chunk sizes), verification references
+(EXACT), active-plan opt-ins (VK_I8ON for plans/23, VK_TILE/VKD_BATCH for
+the f16-prefill acceptance decision), and diagnostics (traces, ktime,
+layer bisectors).
