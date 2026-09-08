@@ -8,9 +8,14 @@ two independent GPU backends plus a CPU reference path. All three produce
 
 | Runtime | Entry | Scope |
 |---|---|---|
-| CPU (W4A8) | `--backend cpu` (no GPU env) | Reference engine; every kernel has a bit-matching mirror here |
-| ROCm/HIP | `--backend gpu --gpu-runtime hip` | Full GPU pipeline (`rawhip`): all matmuls, flash attention, GDN scan, EW ops |
-| Vulkan | `--gpu-runtime vulkan` (with `--backend cpu`) | Matmul accelerator (`rawvk`): 8-quant GEMV + coopmat tile, GPU quantize/rms/silu, FFN resident chain |
+| CPU (W4A8) | `--backend cpu` (no `--gpu-runtime`) | Reference engine; every kernel has a bit-matching mirror here |
+| ROCm/HIP | `--gpu-runtime hip` | Full GPU pipeline (`rawhip`): all matmuls, flash attention, GDN scan, EW ops |
+| Vulkan | `--gpu-runtime vulkan` | GPU-resident decoder (`rawvk` VkDecoder): 8-quant GEMV + coopmat tile, GPU quantize/rms/silu, FFN resident chain |
+
+- Routing is driven by `--gpu-runtime` alone; the `--backend` flag is
+  vestigial for engine selection in `infer`/`bench`. The legacy
+  CPU-engine+Vulkan-accelerator mode (VkAcc) remains opt-in via
+  `LLM170_VK_ACC=1`.
 
 ## Kernel contract
 
@@ -200,7 +205,8 @@ Zero-config by default: tensor types are dispatched automatically from the
 GGUF (kernel selection is type-driven, as in llama.cpp) and the standard
 models run with no environment variables (verified end-to-end). The
 2026-09-08 prune (ADR-0019) removed the concluded-experiment gates
-(~75 → ~50 distinct `LLM170_*` vars); the remainder are operational
+(139 → 122 distinct `LLM170_*` names by grep, comments included); the
+remainder are operational
 switches (GPU_RUNTIME, SLOTS, W4A8, chunk sizes), verification references
 (EXACT), active-plan opt-ins (VK_I8ON for plans/23, VK_TILE/VKD_BATCH for
 the f16-prefill acceptance decision), and diagnostics (traces, ktime,
