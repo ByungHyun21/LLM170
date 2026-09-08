@@ -757,3 +757,35 @@ impl Drop for VkCtx {
         }
     }
 }
+
+/// 파이프라인 슬롯 — gemv(VkAcc)와 decoder(VkDecoder)가 공유 (plans/35 P6 단일화).
+#[derive(Clone, Copy)]
+pub struct Pipes {
+    pub pl: vk::PipelineLayout,
+    pub ds: vk::DescriptorSet,
+    pub pipe: vk::Pipeline,
+    pub dsl: vk::DescriptorSetLayout,
+    pub pool: vk::DescriptorPool,
+}
+
+impl VkCtx {
+    /// pipeline()의 튜플을 슬롯 구조체로 랩.
+    pub fn pipeline_pipes(&self, spv: &[u8], n_buf: u32, push_bytes: u32) -> Result<Pipes, String> {
+        let (dsl, pl, dp, ds, pipe) = self.pipeline(spv, n_buf, push_bytes)?;
+        Ok(Pipes { pl, ds, pipe, dsl, pool: dp })
+    }
+
+    /// 바인딩용 ds — 배치 모드는 fresh 세트 (세트 재사용 하저드:
+    /// 녹화된 커맨드가 세트 객체를 참조 — 마지막 바인딩으로 전부 덮임).
+    pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
+        if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.batch_dsl.set(Some((p.dsl, p.pool)));
+            let ds = self.fresh_ds(bufs.len() as u32)?;
+            self.bind_bufs(ds, bufs);
+            Ok(ds)
+        } else {
+            self.bind_bufs(p.ds, bufs);
+            Ok(p.ds)
+        }
+    }
+}

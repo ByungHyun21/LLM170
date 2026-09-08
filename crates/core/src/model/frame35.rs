@@ -117,22 +117,10 @@ impl Frame35 {
         acc.frame_write(f.one, &[1.0f32]).map_err(ModelError::Accel)?;
         // 어텐션(P1): cs 테이블·마스크·KV 캐시 — CPU rope_head과 동일 값.
         {
-            let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
-            let half = n_rot / 2;
-            let _ = n_head;
-            let mut cs = vec![0.0f32; ctx_frames * half * 2];
-            // ctx 상한 — hp에서 파생
-            let ctx_n = ctx_frames;
-            for pos in 0..ctx_n {
-                for pp in 0..half {
-                    let theta = hp.rope_base.powf(-(2.0 * pp as f32) / n_rot as f32);
-                    let angle = pos as f32 * theta;
-                    cs[pos * half * 2 + pp * 2] = angle.cos();
-                    cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
-                }
-            }
+            let (n_kv, hd) = (hp.n_kv, hp.head_dim);
+            let cs = hp.rope_cs(ctx_frames);
             acc.frame_write(f.cs, &cs).map_err(ModelError::Accel)?;
-            let masks: Vec<u32> = vec![1u32; ctx_n];
+            let masks: Vec<u32> = vec![1u32; ctx_frames];
             acc.frame_write_u32(f.mask, &masks).map_err(ModelError::Accel)?;
             let _ = (n_kv, hd);
         }

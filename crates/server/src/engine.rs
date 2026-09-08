@@ -388,11 +388,11 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
                         Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
                     }
                 } else {
-                    crate::inject_rawvk(&mut eng)
+                    llm170_backend_gpu::inject_rawvk(&mut eng)
                         .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
                 }
             } else {
-                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+                llm170_backend_gpu::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
         }
         let _ = &backend;

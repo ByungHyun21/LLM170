@@ -5,33 +5,52 @@
 
 mod bench;
 mod engine;
+mod probes;
 mod http;
 mod tokenize;
+mod vl;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = r#"
-llm170 — CMP 170HX 타깃 순수 Rust 추론 엔진 (개발 중)
+llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
 
-사용법:
+주요 커맨드:
   llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
       GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
   llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan]
-      greedy 추론. --prompt-tokens 반복 = 병렬 시퀀스(np), 콤마 구분 토큰 id.
-      --backend gpu: matmul을 GPU(cubecl)로 오프로드. --gpu-runtime 기본 hip.
-      출력: JSONL {"seq","pos","token","text"}
-  llm170 gpu-ew-check
-      ew 커널 전종 GPU↔CPU 상호검증 (norm 비트일치·활성화 abs<1e-5)
-  llm170 gdn-ar-check [n_group dt_rank d]
-      GDN AR 커널 GPU↔CPU 상호검증. 기본 8/48/128 (16·32·64·128 회귀 권장)
-  llm170 moe-down-check
+              [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+      greedy 추론 (JSONL {"seq","pos","token","text"}).
+      --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
+      OpenAI/Anthropic 호환 HTTP 서버.
+  llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
+            [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
+      비전 인코딩 + LLM 스플라이스 추론.
   llm170 bench --model <file.gguf> [--pp N] [--tg N] [--reps N] [--ctx N]
               [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
-      llama-bench 규격 PP/TG 측정 (t/s). --spec: MTP 스펙 디코드 유효 t/s.
-  llm170 bench-streams <file.gguf> <tensor> [t] [max_n] [iters]
-      동시 스트림 GEMV 집계 대역폭 (n=1..max_n 스윕) — P2-a 관문 측정.
+      llama-bench 규격 PP/TG 측정 (t/s).
+  llm170 check <model.gguf> [--quick] [--backend cpu|gpu]
+      텐서 스캔(NaN/Inf) + GPU↔CPU GEMM 상호검증 + 장문 청크 스모크.
+  llm170 w4a8-check <file> <tensor> [t] [rows]
+      W4A8 변형 ↔ f32 기준 상호검증.
+  llm170 dequant <file> <tensor> <row> <n>
+      디양자화 값 프로브.
+
+개발 프로브 (backend-gpu 검증·타이밍):
+  rawhip-check <file> <tensor>   HIP GEMV ↔ CPU 미러 to_bits 검증
+  gpu-raw-probe [iters]          원시 런치 오버헤드
+  dims <file> [tensor...]        텐서 차원 조회
+  mm-bench2 | mm-bench | mm-tile | launch-probe | roof-test | bw-test | dp4a-test
+  tty-probe [file]               타입별 텐서 수·용량 집계
+  vk-check                       Vulkan 장치·coopmat·axpy 스모크
+  vk-gemv-check <file> <tensor> [t]   엔진 경로(quant+gemv3) GEMV 검증
+  vk-gemv8-check <file> <tensor> [t]  gemv8 패밀리 검증+타이밍
+  vk-mmq-check <file> <tensor> [t]    i8 GEMM(plans/23) 검증
+  vk-sdot-probe                  OpSDot 장치 지원 프로브
+  gdn-check | subsum-check       GDN/서브그룹 축소 커널 검증
+  qk-check | iq3s-probe          qk_rope/iq3_s 커널 검증
   llm170 help
 "#;
 
@@ -61,189 +80,17 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("LLM170_FRAME", "1") };
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cmd) = args.first().map(String::as_str) {
+        if let Some(code) = probes::run(cmd, &args[1..]) {
+            return code;
+        }
+    }
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => cmd_infer(&args[1..]),
         Some("serve") => return cmd_serve(&args[1..]),
-        Some("rawhip-check") => cmd_rawhip_check(&args[1..]),
-        Some("vl") => return cmd_vl(&args[1..]),
-        Some("gpu-raw-probe") => {
-            let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
-            match llm170_backend_gpu::rawhip::raw_probe(iters) {
-                Ok(msg) => {
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("dims") => {
-            let a: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
-            print!("{}", llm170_backend_gpu::rawhip::dims_of(a[0], &a[1..]));
-            ExitCode::SUCCESS
-        }
-        Some("mm-bench2") => match llm170_backend_gpu::rawhip::mm_bench() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("launch-probe") => {
-            match llm170_backend_gpu::rawhip::launch_probe() {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("tty-probe") => {
-            let path = std::env::args().nth(2).unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            match llm170_gguf::GgufFile::open(std::path::Path::new(&path)) {
-                Ok(g) => {
-                    use std::collections::BTreeMap;
-                    let mut cnt: BTreeMap<u32, usize> = BTreeMap::new();
-                    let mut bytes: BTreeMap<u32, u64> = BTreeMap::new();
-                    for t in &g.tensors {
-                        *cnt.entry(t.ty as u32).or_insert(0) += 1;
-                        *bytes.entry(t.ty as u32).or_insert(0) += t.nbytes().unwrap_or(0);
-                    }
-                    for (k, c) in cnt { println!("ty{k}: {c} tensors {:.1}MB", bytes[&k] as f64 / 1e6); }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-mmq-check") => {
-            let args2: Vec<String> = std::env::args().collect();
-            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(512usize);
-            match llm170_backend_gpu::rawvk::gemv::vk_mmq_check(&path, &tn, t) {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-gemv-check") => {
-            let args2: Vec<String> = std::env::args().collect();
-            let path = args2.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
-            match llm170_backend_gpu::rawvk::gemv::gemv_check(&path, &tn, t) {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-gemv5-check") => {
-            let args2: Vec<String> = std::env::args().collect();
-            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.ffn_gate.weight".into());
-            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
-            match llm170_backend_gpu::rawvk::gemv::gemv5_check(&path, &tn, t) {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-sdot-probe") => {
-            match llm170_backend_gpu::rawvk::gemv::sdot_probe() {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-gemt-check") => {
-            let args2: Vec<String> = std::env::args().collect();
-            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.ffn_gate.weight".into());
-            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(32);
-            match llm170_backend_gpu::rawvk::gemv::gemt_check(&path, &tn, t) {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("vk-gemv4-check") => {
-            let args2: Vec<String> = std::env::args().collect();
-            let path = args2.get(2).cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            let tn = args2.get(3).cloned().unwrap_or_else(|| "blk.0.ssm_out.weight".into());
-            let t = args2.get(4).and_then(|v| v.parse().ok()).unwrap_or(1);
-            match llm170_backend_gpu::rawvk::gemv::gemv4_check(&path, &tn, t) {
-                Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-            }
-        }
-        Some("subsum-check") => match llm170_backend_gpu::rawvk::subsum_check() {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("subsum: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some("gdn-check") => match llm170_backend_gpu::rawvk::gdn_check() {
-            Ok(msg) => {
-                for l in msg.split('\n') {
-                    println!("{l}");
-                }
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("gdn-check: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Some("vk-check") => match llm170_backend_gpu::rawvk::smoke_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("roof-test") => match llm170_backend_gpu::rawhip::roof_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("mm-tile") => match llm170_backend_gpu::rawhip::mm_tile_bench() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("mm-bench") => match llm170_backend_gpu::rawhip::mm_batch_bench() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("batch-abtest") => match llm170_backend_gpu::rawhip::batch_ab_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("tree-test") => match llm170_backend_gpu::rawhip::tree_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("q6k-abtest") => match llm170_backend_gpu::rawhip::q6k_ab_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("bw-test") => match llm170_backend_gpu::rawhip::bw_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("dp4a-test") => match llm170_backend_gpu::rawhip::dp4a_test() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("exp-ab") => match llm170_backend_gpu::rawhip::exp_ab() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("iq3s-probe") => match llm170_backend_gpu::rawhip::iq3s_probe() {
-            Ok(msg) => { println!("{msg}"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
-        },
-        Some("qk-check") => match llm170_backend_gpu::rawhip::qk_check() {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("rawhip-check") => return probes::run("rawhip-check", &args[1..]).unwrap(),
+        Some("vl") => return vl::cmd_vl(&args[1..]),
         Some("bench") => return bench::cmd_bench(&args[1..]),
         Some("check") => cmd_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
@@ -644,9 +491,6 @@ fn cmd_check(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// gpu-ew-check — ew 커널 전종 GPU↔CPU 상호검증 (층 GPU 상주 P2-4 1단계).
-/// 판정: norm류 max_rel < 1e-6 (f64 경로 — 비트일치 기대), 활성화류 < 1e-5
-/// (libm 구현차), moe ids 완전일치.
 
 
 
@@ -770,13 +614,13 @@ fn cmd_infer(args: &[String]) -> ExitCode {
                         Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
                     }
                 } else {
-                    match crate::inject_rawvk(&mut eng) {
+                    match llm170_backend_gpu::inject_rawvk(&mut eng) {
                         Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
                         Err(e) => eprintln!("vk-decoder: {e} (VkAcc로 진행)"),
                     }
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+                llm170_backend_gpu::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
             if backend == "gpu" && gpu_runtime != "vulkan" {
                 eprintln!("# backend: gpu (raw hip)");
@@ -1044,648 +888,7 @@ fn usage_err(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// llm170 rawhip-check <file> <tensor> — 원시 HIP GEMV(quant·gemm·reduce)
-/// 대 CPU 레인 미러 to_bits 전행 검증 + 속도.
-fn cmd_rawhip_check(args: &[String]) -> ExitCode {
-    use llm170_backend_gpu::rawhip::RawCtx;
-    if args.len() < 2 {
-        eprintln!("usage: llm170 rawhip-check <file> <tensor>");
-        return ExitCode::from(2);
-    }
-    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
-        Ok(m) => m,
-        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
-    };
-    let w = match model.w(&args[1]) {
-        Some(w) => w,
-        None => { eprintln!("tensor not found: {}", args[1]); return ExitCode::FAILURE; }
-    };
-    let raw_ok = llm170_core::matmul::w4a8_ty(w.ty) || w.ty == llm170_gguf::GgmlType::Iq3S;
-    if !raw_ok {
-        eprintln!("rawhip-check: 미지원 타입");
-        return ExitCode::FAILURE;
-    }
-    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
-    let mut seed = 0x9e37_79b9u64;
-    let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
-    };
-    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
-    let ctx = match RawCtx::new() {
-        Ok(c) => c,
-        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
-    };
-    let y = llm170_core::quant::quantize_row_q8_ref(&x);
-    // GPU 양자화 비트 미러 검증 (quant_q8 커널)
-    let mut xq_gpu: Option<*mut u8> = None;
-    let mut xd_gpu: Option<*mut u8> = None;
-    {
-        let mut inner = || -> Result<(), String> {
-            let xd_buf = ctx.alloc(n_in * 4)?;
-            let xq_buf = ctx.alloc((n_in / 4 + n_in / 32) * 4)?; // 워드 + d 비트
-            xq_gpu = Some(xq_buf);
-            ctx.h2d(xd_buf, bytemuck::cast_slice(&x))?;
-            ctx.quant_q8(xd_buf as *const u8, xq_buf, n_in)?;
-            let mut gq = vec![0u8; (n_in / 4 + n_in / 32) * 4];
-            ctx.d2h(&mut gq, xq_buf)?;
-            let gw: Vec<u32> = bytemuck::cast_slice(&gq[..n_in / 4 * 4]).to_vec();
-            let mut qm = 0usize;
-            let cpu_w: Vec<u32> = {
-                let mut v = Vec::new();
-                for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
-                    let mut word = 0u32;
-                    for (i, b) in c.iter().enumerate() { word |= (**b as u8 as u32) << (8 * i); }
-                    v.push(word);
-                }
-                v
-            };
-            for (i, (a, b)) in gw.iter().zip(cpu_w.iter()).enumerate() {
-                if a != b { qm += 1; if qm == 1 { println!("  ✗ quant 워드[{i}] gpu={a:#x} cpu={b:#x}"); } }
-            }
-            let gdbits: Vec<u32> = bytemuck::cast_slice(&gq[n_in / 4 * 4..]).to_vec();
-            for (i, (a, b)) in gdbits.iter().zip(y.iter().map(|b| b.d.to_bits())).enumerate() {
-                if *a != b { qm += 1; if qm <= 3 { println!("  ✗ quant d[{i}] gpu_bits={a:#x} cpu_bits={b:#x}"); } }
-            }
-            if qm == 0 { println!("  ★ quant_q8 원시 ≡ CPU 비트 일치"); }
-            Ok(())
-        };
-        if let Err(e) = inner() { eprintln!("quant 검증: {e}"); }
-    }
-    let mut qs_words = Vec::with_capacity(n_in / 4);
-    for c in y.iter().flat_map(|b| b.qs.iter()).collect::<Vec<_>>().chunks(4) {
-        let mut word = 0u32;
-        for (i, b) in c.iter().enumerate() {
-            word |= (**b as u8 as u32) << (8 * i);
-        }
-        qs_words.push(word);
-    }
-    let ds: Vec<f32> = y.iter().map(|b| b.d).collect();
-    // ktab2
-    let ktab2: Vec<u32> = (0..256u32)
-        .map(|b| {
-            let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-            let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-            lo | (hi << 8)
-        })
-        .collect();
-    // GPU quant 사용 시: xq 버퍼 = 워드+d 통합 (gemv가 직접 판독)
-    let xq_d = match xq_gpu {
-        Some(p) => p,
-        None => {
-            // CPU 경로: 워드 + d 비트 통합 패킹
-            let buf = ctx.alloc((n_in / 4 + n_in / 32) * 4).expect("alloc");
-            let mut packed = qs_words.clone();
-            packed.extend(y.iter().map(|b| b.d.to_bits()));
-            ctx.h2d(buf, bytemuck::cast_slice(&packed)).expect("pack upload");
-            buf
-        }
-    };
-    let w_d = match ctx.alloc(w.data.len()) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
-    let kt_d = match ctx.alloc(1024) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; } };
-    // GPU quant 출력 재사용 시 xq/xd 업로드 생략 (종단 검증 — d가 GPU 생산값)
-    let up = ctx.h2d(w_d, w.data).and_then(|_| ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2)));
-    if let Err(e) = up {
-        eprintln!("upload: {e}"); return ExitCode::FAILURE;
-    }
-    // 워밍 + 측정
-    let ty = w.ty as u32;
-    let _ = match ctx.gemv_q8(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
-        Ok(v) => v,
-        Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
-    };
-    let reps = 30;
-    let t0 = std::time::Instant::now();
-    let mut g = Vec::new();
-    for _ in 0..reps {
-        g = match ctx.gemv_q8(xq_d as *const u8, w_d as *const u8, kt_d as *const u8, ty, n_in, n_out) {
-            Ok(v) => v,
-            Err(e) => { eprintln!("gemv: {e}"); return ExitCode::FAILURE; }
-        };
-    }
-    let dt = t0.elapsed().as_secs_f64() / reps as f64;
-    // to_bits 전행 비교
-    let blck = w.ty.blck_size() as usize;
-    let bsize = w.ty.type_size() as usize;
-    let rb = (n_in / blck) * bsize;
-    let mut mism = 0usize;
-    let mut first: Option<(usize, f32, f32)> = None;
-        for o in 0..n_out {
-        let row = &w.data[o * rb..];
-        let c = match w.ty {
-            llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Q8_0 => llm170_core::quant::dot_row_w4a8_q8_0_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Iq4Nl => llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Q3K => llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y),
-            llm170_gguf::GgmlType::Iq3S => llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &y),
-            _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
-        };
-        if c.to_bits() != g[o].to_bits() {
-            mism += 1;
-            if first.is_none() { first = Some((o, c, g[o])); }
-        }
-    }
-    println!("[{}] {}: 원시 GEMV 불일치 {mism}/{n_out} — {:.0}µs/op {:.0}GB/s", w.ty.name(), args[1], dt * 1e6, w.data.len() as f64 / dt / 1e9);
-    if let Some((o, c, gv)) = first {
-        println!("  첫 불일치 [{o}]: cpu={c:.7e} gpu={gv:.7e}");
-    }
-    if mism > 0 { ExitCode::FAILURE } else { println!("  ★ 원시 HIP ≡ CPU 비트 일치"); ExitCode::SUCCESS }
-}
 
-/// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
-/// rawhip/VkDecoder 공용 상수 페치 (이름 리맵·타일 포함).
-fn raw_consts(
-    eng: &llm170_core::model::Engine,
-    cnames: &[String],
-) -> Vec<(String, Vec<f32>)> {
-    let hp = &eng.model.hp;
-    let ctx_n = eng.ctx_len();
-    cnames
-        .iter()
-        .filter_map(|k| {
-            let v = if k == "cs" {
-                let half = hp.n_rot >> 1;
-                let mut cs = vec![0.0f32; ctx_n * half * 2];
-                for pos in 0..ctx_n {
-                    for pp in 0..half {
-                        let theta = (hp.rope_base as f32).powf(-(2.0 * pp as f32) / hp.n_rot as f32);
-                        let angle = pos as f32 * theta;
-                        cs[pos * half * 2 + pp * 2] = angle.cos();
-                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
-                    }
-                }
-                Some(cs)
-            } else if k == "mask" {
-                // 인과 마스크 [pos][p]: p<=pos 만 1 — qsa 배치용 (원본 의미 복원)
-                let mut m = vec![0.0f32; ctx_n * ctx_n];
-                for pos in 0..ctx_n {
-                    for pp in 0..=pos {
-                        m[pos * ctx_n + pp] = 1.0;
-                    }
-                }
-                Some(m)
-            } else if k.ends_with("conv_w") {
-                eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()
-            } else {
-                let il = k.split('.').nth(1).unwrap_or("0").to_string();
-                let (tn, tiled) = if k.ends_with("dt_bias") {
-                    (format!("blk.{il}.ssm_dt.bias"), 1)
-                } else if k.ends_with("ssm_a") {
-                    (k.clone(), 1)
-                } else if k.ends_with("ssm_norm") {
-                    (format!("blk.{il}.ssm_norm.weight"), hp.dt_rank)
-                } else if k.ends_with("post_attention_norm") {
-                    (format!("blk.{il}.post_attention_norm.weight"), 1)
-                } else if k.ends_with("attn_norm") {
-                    (format!("blk.{il}.attn_norm.weight"), 1)
-                } else if k.ends_with("post_norm") {
-                    (format!("blk.{il}.post_attention_norm.weight"), 1)
-                } else if k == "output_norm" {
-                    ("output_norm.weight".to_string(), 1)
-                } else if k.ends_with("attn_q_norm") {
-                    (format!("blk.{il}.attn_q_norm.weight"), hp.n_head)
-                } else if k.ends_with("attn_k_norm") {
-                    (format!("blk.{il}.attn_k_norm.weight"), hp.n_kv)
-                } else {
-                    (format!("{k}.weight"), 1)
-                };
-                eng.model.f32_vec(&tn).ok().map(|v| {
-                    if tiled > 1 && (v.len() == hp.d_state || v.len() == hp.head_dim) {
-                        v.iter().copied().cycle().take(v.len() * tiled).collect()
-                    } else {
-                        v
-                    }
-                })
-            };
-            v.map(|v| (k.clone(), v))
-        })
-        .collect()
-}
 
-/// VkDecoder 주입 — rawhip과 동일 가중치·상수 목록 (plans/19).
-fn inject_rawvk(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
-    use llm170_core::matmul::RawDecode;
-    let hp = eng.model.hp.clone();
-    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
-    let (wnames, cnames) = crate::raw_names(eng);
-    let mut weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = Vec::new();
-    for n in &wnames {
-        let w = eng.model.wchk(n).map_err(|e| e.to_string())?;
-        weights.push((n.clone(), w));
-    }
-    let mut consts = crate::raw_consts(eng, &cnames);
-    // VkDecoder 마스크: u32 all-ones (t=1 디코드 행은 p<=pos 전부 활성).
-    {
-        let cl = eng.ctx_len();
-        if let Some(m) = consts.iter_mut().find(|(k, _)| k == "mask") {
-            m.1 = (0..cl * cl).map(|_| f32::from_bits(1)).collect();
-        }
-    }
-    let rd: std::sync::Arc<llm170_backend_gpu::rawvk::decoder::VkDecoder> =
-        std::sync::Arc::new(llm170_backend_gpu::rawvk::decoder::VkDecoder::new());
-    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
-        .map_err(|e| format!("raw_init(vk): {e}"))?;
-    eng.raw_decode = Some(rd);
-    Ok(())
-}
 
-fn raw_names(eng: &llm170_core::model::Engine) -> (Vec<String>, Vec<String>) {
-    let hp = &eng.model.hp;
-    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
-    let mut wnames: Vec<String> = Vec::new();
-    let mut cnames: Vec<String> = Vec::new();
-    for il in 0..hp.n_layer {
-        cnames.push(format!("blk.{il}.attn_norm"));
-        cnames.push(format!("blk.{il}.post_norm"));
-        if is_recr[il] {
-            for w in ["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_out"] {
-                wnames.push(format!("blk.{il}.{w}.weight"));
-            }
-            cnames.push(format!("blk.{il}.conv_w"));
-            cnames.push(format!("blk.{il}.dt_bias"));
-            cnames.push(format!("blk.{il}.ssm_a"));
-            cnames.push(format!("blk.{il}.ssm_norm"));
-        } else {
-            for w in ["attn_q", "attn_k", "attn_v", "attn_output"] {
-                wnames.push(format!("blk.{il}.{w}.weight"));
-            }
-            cnames.push(format!("blk.{il}.attn_q_norm"));
-            cnames.push(format!("blk.{il}.attn_k_norm"));
-        }
-        for w in ["ffn_gate", "ffn_up", "ffn_down"] {
-            wnames.push(format!("blk.{il}.{w}.weight"));
-        }
-    }
-    wnames.push("output.weight".into());
-    // MTP층 (blk.64) — spec decode용 (has_mtp 시)
-    if eng.has_mtp() {
-        let mtp = 64usize;
-        for w in ["attn_q", "attn_k", "attn_v", "attn_output",
-                  "ffn_gate", "ffn_up", "ffn_down", "nextn.eh_proj"] {
-            wnames.push(format!("blk.{mtp}.{w}.weight"));
-        }
-        for c in ["attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm",
-                  "nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"] {
-            cnames.push(format!("blk.{mtp}.{c}"));
-        }
-    }
-    cnames.push("output_norm".into());
-    cnames.push("cs".into());
-    cnames.push("mask".into());
-    (wnames, cnames)
-}
 
-/// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
-/// (plans/28: 단계 타이밍 계측 추가 — 공존 지연 RCA용)
-fn inject_rawhip(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
-    let t0 = std::time::Instant::now();
-    let hp = eng.model.hp.clone();
-    let (wnames, cnames): (Vec<String>, Vec<String>) = crate::raw_names(eng);
-    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
-    let t1 = std::time::Instant::now();
-    let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
-        .iter()
-        .filter_map(|k| eng.model.wchk(k).ok().map(|w| (k.clone(), w)))
-        .collect();
-    if weights.len() != wnames.len() {
-        return Err(format!("rawhip: 가중치 누락 {}/{}", weights.len(), wnames.len()));
-    }
-    eprintln!(
-        "# inject: names+weights {:.1?} ({} tensors, {:.2}GB)",
-        t1.elapsed(),
-        weights.len(),
-        weights.iter().map(|(_, w)| w.data.len()).sum::<usize>() as f64 / (1 << 30) as f64
-    );
-    let consts = crate::raw_consts(eng, &cnames);
-    eprintln!("# inject: consts @+{:.1?}", t0.elapsed());
-    let rd: std::sync::Arc<llm170_backend_gpu::rawhip::decode::RawDecoder> =
-        std::sync::Arc::new(llm170_backend_gpu::rawhip::decode::RawDecoder::new());
-    use llm170_core::matmul::RawDecode;
-    let r = rd
-        .raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
-        .map_err(|e| format!("raw_init: {e}"));
-    eprintln!("# inject: raw_init @+{:.1?}", t0.elapsed());
-    r?;
-    eng.raw_decode = Some(rd);
-    Ok(())
-}
-
-/// vl — mmproj 비전 인코딩 + LLM 스플라이스 추론 (plans/16).
-fn cmd_vl(args: &[String]) -> ExitCode {
-    let mut model: Option<PathBuf> = None;
-    let mut mmproj: Option<PathBuf> = None;
-    let mut images: Vec<PathBuf> = Vec::new();
-    let mut n_predict = 48usize;
-    let mut ctx = 4096usize;
-    let mut backend = "gpu".to_string();
-    let mut spec_k = 0usize;
-    // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
-    // vision_end 뒤 — 기본(미지정)은 기존 하드코딩 프롬프트와 동일.
-    let mut prefix_ids: Vec<u32> = Vec::new();
-    let mut question_ids: Option<Vec<u32>> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--model" => model = it.next().map(PathBuf::from),
-            "--mmproj" => mmproj = it.next().map(PathBuf::from),
-            "--image" => {
-                if let Some(p) = it.next() {
-                    images.push(PathBuf::from(p));
-                }
-            }
-            "--n-predict" => n_predict = it.next().and_then(|v| v.parse().ok()).unwrap_or(48),
-            "--ctx" => ctx = it.next().and_then(|v| v.parse().ok()).unwrap_or(4096),
-            "--backend" => backend = it.next().cloned().unwrap_or_else(|| "gpu".into()),
-            "--spec" => spec_k = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-            "--prefix-tokens" => match it.next().map(String::as_str).and_then(parse_ids_ref) {
-                Some(v) => prefix_ids = v,
-                None => return usage_err("--prefix-tokens requires comma-separated ids"),
-            },
-            "--question-tokens" => match it.next().map(String::as_str).and_then(parse_ids_ref) {
-                Some(v) => question_ids = Some(v),
-                None => return usage_err("--question-tokens requires comma-separated ids"),
-            },
-            _ => {}
-        }
-    }
-    let (model, mmproj) = match (model, mmproj) {
-        (Some(m), Some(p)) => (m, p),
-        _ => {
-            eprintln!("usage: llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...] [--spec k] [--n-predict N]");
-            return ExitCode::from(2);
-        }
-    };
-    if images.is_empty() {
-        eprintln!("usage: at least one --image required");
-        return ExitCode::from(2);
-    }
-    // qwen3.8 VL 템플릿 (서버 /tokenize 확정):
-    // <|im_start|>user\n [prefix] <|vision_start|><|image_pad|><|vision_end|> [question]
-    // <|im_end|>\n<|im_start|>assistant\n — prefix/question 미지정 시 기존 프롬프트 동일.
-    let question: Vec<u32> = question_ids
-        .unwrap_or_else(|| vec![72240, 411, 2099, 303, 799, 2716, 11316, 13]);
-    let mut prompt: Vec<u32> = Vec::with_capacity(prefix_ids.len() + question.len() + 12);
-    prompt.extend_from_slice(&[248045, 846, 198]);
-    prompt.extend_from_slice(&prefix_ids);
-    prompt.extend_from_slice(&[248053, 248056, 248054]);
-    prompt.extend_from_slice(&question);
-    prompt.extend_from_slice(&[248046, 198, 248045, 74455, 198]);
-    // 1) 이미지 → 스마트리사이즈·정규화 → CLIP 인코딩 (이미지별 = 시퀀스별)
-    let t0 = std::time::Instant::now();
-    let mut clip = match llm170_core::clip::Clip::load(&mmproj) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("clip load: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let n_img = images.len();
-    let mut all_vis: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_img);
-    let mut vit_cache: Option<(std::sync::Arc<llm170_backend_gpu::rawhip::RawCtx>, std::sync::Arc<llm170_backend_gpu::rawhip::vit::Vit>, usize)> = None;
-    for (si, ipath) in images.iter().enumerate() {
-        let img = match image::open(ipath) {
-            Ok(i) => i.to_rgb8(),
-            Err(e) => {
-                eprintln!("image: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let (iw, ih) = (img.width() as i64, img.height() as i64);
-        // qwen3vl smart_resize (align 32, 토큰 8..4096) + Pillow bicubic
-        let (tw, th) = llm170_core::clip_preproc::smart_resize(iw, ih, 16, 2, 8, 4096);
-        let raw = img.as_raw();
-        let rgb8 = llm170_core::clip_preproc::resize_pillow(raw, iw as usize, ih as usize, tw as usize, th as usize, true);
-        eprintln!("# resize[{si}] {iw}x{ih} -> {tw}x{th}");
-        let (tw, th) = (tw as usize, th as usize);
-        let mut px = vec![0f32; tw * th * 3];
-        for (i, v) in rgb8.iter().enumerate() {
-            px[i] = ((*v as f32) / 255.0 - 0.5) / 0.5;
-        }
-        let vis = if backend != "cpu" {
-            // GPU 경로 (plans/17): CPU conv+pos → ViT 27블록·merger GPU
-            let (n_embd, n_head, n_blk, eps) = (1152usize, 16usize, 27usize, 1e-6f32);
-            let tmax = (tw / 16) * (th / 16);
-            let v = (|| -> Result<Vec<Vec<f32>>, String> {
-                if vit_cache.is_none() {
-                    let weights = clip.vit_weights()?;
-                    let n_ff = clip.n_ff();
-                    let tw0 = std::time::Instant::now();
-                    let ctx = std::sync::Arc::new(llm170_backend_gpu::rawhip::RawCtx::new()?);
-                    let vit = llm170_backend_gpu::rawhip::vit::Vit::new(
-                        ctx.clone(), weights, n_embd, n_head, n_ff, n_blk, eps, 16, tmax,
-                    )?;
-                    eprintln!("# vit weights+upload {:.1}s", tw0.elapsed().as_secs_f64());
-                    vit_cache = Some((ctx, std::sync::Arc::new(vit), tmax));
-                }
-                let (_, vit, tmax0) = vit_cache.as_ref().unwrap();
-                if tmax > *tmax0 {
-                    return Err(format!("tmax {tmax} > 초기화 {tmax0} — 이미지 해상도 초과"));
-                }
-                let tp0 = std::time::Instant::now();
-                let (toks, yx, pw, ph) = clip.prep_tokens(&px, tw, th)?;
-                eprintln!("# vit prep(conv) {:.1}s", tp0.elapsed().as_secs_f64());
-                let tf0 = std::time::Instant::now();
-                let flat = vit.forward(&toks, &yx, pw, ph)?;
-                eprintln!("# vit forward {:.1}s", tf0.elapsed().as_secs_f64());
-                let n_out = flat.len() / 5120;
-                Ok((0..n_out).map(|i| flat[i * 5120..(i + 1) * 5120].to_vec()).collect())
-            })();
-            match v {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("vit gpu: {e} — CPU 폴백");
-                    match clip.encode(&px, tw, th) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("clip encode: {e}");
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-            }
-        } else {
-            match clip.encode(&px, tw, th) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("clip encode: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        };
-        eprintln!("# clip[{si}]: {} tokens (총 {:.1}s)", vis.len(), t0.elapsed().as_secs_f64());
-        if std::env::var_os("LLM170_VIS_HASH").is_some() {
-            let mut x: u64 = 0x9E3779B97F4A7C15;
-            for row in &vis[..vis.len().min(2)] {
-                for &v in row[..row.len().min(256)].iter() {
-                    x ^= (v.to_bits() as u64).wrapping_mul(0xC2B2AE3D27D4EB4F);
-                    x = x.rotate_left(17);
-                }
-            }
-            eprintln!("# vis_hash[{si}] {x:016x} v0={:.6}", vis[0][0]);
-        }
-        all_vis.push(vis);
-    }
-    // 3) LLM
-    let m = match llm170_core::model::Model::load(&model) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("model: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut eng = llm170_core::model::Engine::new(m, n_img, ctx);
-    if spec_k > 0 {
-        eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성
-    }
-    if backend != "cpu" {
-        let rt = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
-        if rt == "vulkan" {
-            // plans/29: LLM은 VkDecoder 기본. ViT는 HIP 시도 → 실패 시
-            // 기존 CPU clip 폴백 (vision 블록의 에러 폴백 경유).
-            match crate::inject_rawvk(&mut eng) {
-                Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
-                Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
-            }
-        } else {
-            crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
-        }
-    }
-    let eos = 248044u32;
-    let t1 = std::time::Instant::now();
-    let mut last_logits = Vec::with_capacity(n_img);
-    for s in 0..n_img {
-        let l = match eng.prefill_vision(s, &prompt, 248056, &all_vis[s]) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("prefill_vision: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        last_logits.push(l);
-    }
-    eprintln!("# prefill({n_img} seqs) {:.1}s", t1.elapsed().as_secs_f64());
-    let mut finished = vec![false; n_img];
-    let mut gen_toks: Vec<Vec<u32>> = vec![Vec::new(); n_img];
-    let mut texts: Vec<String> = vec![String::new(); n_img];
-    let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::model::greedy(l)).collect();
-    // 시퀀스별 유효 프롬프트 길이 (마커 1 → vis 행수 치환) — JSONL pos 기준.
-    let base_len: Vec<usize> = (0..n_img)
-        .map(|s| prompt.len() - 1 + all_vis[s].len())
-        .collect();
-    // 토큰 스트림 JSONL(infer와 동일 형식) — CPU/GPU·spec 동일성 판정용.
-    for s in 0..n_img {
-        println!(
-            "{{\"seq\":{s},\"pos\":{},\"token\":{}}}",
-            base_len[s], next[s]
-        );
-        texts[s].push_str(&eng.piece(next[s]));
-        if next[s] == eos {
-            finished[s] = true;
-        }
-        gen_toks[s].push(next[s]);
-    }
-    let emit = |s: usize, t: u32, eng: &llm170_core::model::Engine, texts: &mut Vec<String>| {
-        if t != eos {
-            texts[s].push_str(&eng.piece(t));
-        }
-    };
-    let spec_on = spec_k > 0
-        && eng.has_mtp()
-        && std::env::var_os("LLM170_SPEC_GPU").is_some();
-    if spec_k > 0 && !eng.has_mtp() {
-        eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
-    }
-    let gen_res = (|| -> Result<(), String> {
-        if spec_on && n_img > 1 {
-            while gen_toks.iter().filter(|g| !g.is_empty()).min_by_key(|g| g.len()).map(|g| g.len()).unwrap_or(0) <= n_predict {
-                let active: Vec<usize> = (0..n_img).filter(|&s| !finished[s]).collect();
-                if active.is_empty() {
-                    break;
-                }
-                let nexts: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let acc = eng.spec_step_multi(&active, &nexts, spec_k).map_err(|e| e.to_string())?;
-                let mut any = false;
-                for (i, &s) in active.iter().enumerate() {
-                    for &t in &acc[i] {
-                        if gen_toks[s].len() > n_predict {
-                            break;
-                        }
-                        emit(s, t, &eng, &mut texts);
-                        println!(
-                            "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                            base_len[s] + gen_toks[s].len()
-                        );
-                        gen_toks[s].push(t);
-                        next[s] = t;
-                        if t == eos {
-                            finished[s] = true;
-                        }
-                        any = true;
-                    }
-                }
-                if !any {
-                    break;
-                }
-            }
-        } else if spec_on {
-            let s = 0usize;
-            while gen_toks[s].len() <= n_predict && !finished[s] {
-                let (acc_toks, _tf) = eng.spec_step(s, next[s], spec_k).map_err(|e| e.to_string())?;
-                for &t in &acc_toks {
-                    if gen_toks[s].len() > n_predict {
-                        break;
-                    }
-                    emit(s, t, &eng, &mut texts);
-                    println!(
-                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                        base_len[s] + gen_toks[s].len()
-                    );
-                    gen_toks[s].push(t);
-                    next[s] = t;
-                    if t == eos {
-                        finished[s] = true;
-                    }
-                }
-            }
-        } else {
-            for _step in 0..n_predict {
-                let active: Vec<usize> = (0..n_img).filter(|&s| !finished[s]).collect();
-                if active.is_empty() {
-                    break;
-                }
-                let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let logits = eng.decode(&active, &toks).map_err(|e| e.to_string())?;
-                for (i, &s) in active.iter().enumerate() {
-                    let t = llm170_core::model::greedy(&logits[i]);
-                    next[s] = t;
-                    emit(s, t, &eng, &mut texts);
-                    println!(
-                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                        base_len[s] + gen_toks[s].len()
-                    );
-                    gen_toks[s].push(t);
-                    if t == eos {
-                        finished[s] = true;
-                    }
-                }
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = gen_res {
-        eprintln!("decode: {e}");
-    }
-    for s in 0..n_img {
-        if n_img > 1 {
-            println!("seq{s}: {}", texts[s]);
-        } else {
-            println!("{}", texts[s]);
-        }
-    }
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    eprintln!("# done");
-    ExitCode::SUCCESS
-}

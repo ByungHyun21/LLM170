@@ -7,5 +7,6 @@
 pub mod rawhip;
 pub mod rawvk;
 
-pub use rawhip::decode::RawDecoder;
-pub use rawhip::{bw_test, dp4a_test, exp_ab, qk_check, q6k_ab_test, raw_probe, tree_test};
+pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
+pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
+pub use rawvk::decoder::inject as inject_rawvk;

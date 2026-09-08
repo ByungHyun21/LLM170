@@ -10,4 +10,4 @@ pub mod clip_preproc;
 pub mod ops;
 pub mod quant;
 mod tables;
-pub use tables::{IQ3S_GRID, KVALUES_IQ4NL};
+pub use tables::{IQ3S_GRID, KVALUES_IQ4NL, ktab2_packed};
