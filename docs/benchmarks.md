@@ -5,6 +5,52 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+## Vulkan execution-round gate (2026-09-08, plans/36 G1-G4/P1-P4)
+
+Full plans/36 round on q35work.gguf, 3-run medians, zero-config defaults
+(batch prefill + coopmat tiles now default; kill switches VKD_BATCH=0 /
+VK_NOTILE=1): **tg32 7.21 t/s** (from 7.06), **pp512 122.1 t/s** (from
+65.95 opt-in, +85%). Gates: vk judge 19/19 (seven consecutive rolls incl.
+VKD_BATCH+TILE and T_MAX=64 configurations), HIP judge 19/19, cargo 10/10.
+
+What moved the numbers (per-kernel GPU times via a new VK_QUERY_POOL
+timestamp profiler, LLM170_VK_TS=1 — the host-side ktime attribution was
+shown to be split-boundary garbage):
+
+- **Batch prefill + tiles promoted to default** — the 2026-09-04 batch
+  divergence was the descriptor-set reuse race (fixed 2026-09-05); not
+  reproducible since. Verify stays per-token by default (race isolation).
+- **T_MAX 32→64**: chunked prefill re-read all weights per 32-token chunk;
+  64-token chunks halve weight traffic. pp512 68→97 t/s.
+- **Tile type coverage completed**: tile_nl (iq4_nl), tile_iq3s, q8 small-n.
+  The straggler gemv3 calls (iq4_nl/iq3_s/q8_0 at 0.2-3 GB/s) were 36% of
+  chunk GPU time. pp512 97→122 t/s.
+- **gemv8_q6**: llama mul_mat_vec_q6_k direct port with a u16 block view
+  (105 u16/block) — the 210-byte unaligned assembly that capped the old
+  attempt at 67.6 GB/s is gone. 160 GB/s, max|D|=0 vs CPU at t=1. q6_K
+  decode weights and the output head leave gemv3. tg32 6.87→7.21.
+- **addrms fusion** (residual add + rms in one pass, bit-identical by
+  construction), head merged into the trunk batch (single submit), batch
+  auto-split 512→2048, independent-group barrier skip (gemv stages, kv
+  append), lazy stage quantization (dead quant removed).
+- **tile128 2-sb staging**: 64 k-elements per barrier pair (barriers halved,
+  MMA chains doubled). LDS 59.5 KB; split_k was ruled out by measurement
+  (46-59.5 KB LDS → 1 resident WG/CU, queuing hides nothing; double-buffer
+  ping-pong was neutral).
+
+Remaining prefill gap vs llama-vk raw loop (358): tile MFU ~8 TFLOPS vs
+llama ~21.5 — a compute-efficiency frontier, not bandwidth.
+
+i8 coopmat GEMM (plans/23) verdict: v1 per-block drain 29 t/s, v2 row-scale
+(drain-free) 82 t/s — confirming the drain as the v1 bottleneck — vs tiles
+126+ t/s. The i8 path stays experimental opt-in; tiles supersede it for
+prefill across all 8 quant types.
+
+Known open: the gemv8 t≥2 check-harness divergence (deterministic per
+binary, in-process stable, all types; engine path exact through VKD_BATCH
+spec gates) — recorded with the §8 flake; reproducer:
+`llm170 vk-gemv8-check <gguf> blk.4.attn_gate.weight 2`.
+
 ## Refactor no-regression gate (2026-09-08, plans/35)
 
 Behavior-invariant refactor (dead-kernel pruning, gemv generation collapse,
