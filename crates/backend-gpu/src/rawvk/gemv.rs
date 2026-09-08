@@ -1005,8 +1005,8 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let rpf: u32 = if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
     let cw_mask = (1u32 << cw_log2) - 1u32;
-    // cw 단위: q5(u16 typed 뷰)만 u16 단위, 나머지 u32
-    let (cwpl, cwpm) = if is_q5 {
+    // cw 단위: q5/q6(u16 typed 뷰)만 u16 단위, 나머지 u32
+    let (cwpl, cwpm) = if is_q5 || is_q6 {
         (31u32 - (chunk_words * 2).leading_zeros(), (chunk_words * 2) - 1)
     } else { (cw_log2, cw_mask) };
     let push = push_u32s(&[n_in as u32, n_out as u32, t as u32, cwpl, cwpm, rpf]);

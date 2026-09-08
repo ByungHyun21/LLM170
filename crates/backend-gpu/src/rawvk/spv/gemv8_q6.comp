@@ -1,50 +1,56 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
-// gemv8_q6 (plans/33) — gemv8 레시피를 q6_K에 적용. 기하: gemv6_q6(검증)에서
-// 직역 — ql 바이트 m(0..127): n=m>>6, mm=m&63 — lo니블→원소 128n+mm (qh bits
-// (mm&32?2-3:0-1)), hi니블→+64 (bits 6-7/4-5), 스케일 16n+((mm&31)>>4)+오프셋,
-// hm 바이트 = 32n+(mm&31). 레인 L이 ql 워드 4L — 연속 128B.
+// gemv8_q6 (plans/36 G1 재도전) — llama mul_mat_vec_q6_k 직역 + u16 뷰.
+// 핵심: 210B 블록을 u16[105]로 직접 판독 (q5 성공 패턴 — 워드 조립/210B 비정렬
+// 완전 제거). 스레드 기하는 llama 그대로: itid=tid%16, v_im=itid/8, v_in=itid%8,
+// l0=4*v_in, is=v_in/4 — 4쿼터(원소 +0/+32/+64/+96)를 ql lo/hi 니블 + qh 2비트로
+// 조립, 스케일 16 int8(@192) 직독, d f16(@208). fma 체인은 llama :74 순서.
+// 32스레드 = 2블록 병렐(jj = ix; jj += 2), subgroupAdd 종결.
 layout(local_size_x = 32) in;
-layout(binding = 0) readonly buffer W0 { uint w0u[]; };
-layout(binding = 1) readonly buffer W1 { uint w1u[]; };
-layout(binding = 2) readonly buffer W2 { uint w2u[]; };
-layout(binding = 3) readonly buffer W3 { uint w3u[]; };
-layout(binding = 4) readonly buffer W4 { uint w4u[]; };
-layout(binding = 5) readonly buffer W5 { uint w5u[]; };
-layout(binding = 6) readonly buffer W6 { uint w6u[]; };
-layout(binding = 7) readonly buffer W7 { uint w7u[]; };
+layout(binding = 0) readonly buffer W0 { uint16_t w0h[]; };
+layout(binding = 1) readonly buffer W1 { uint16_t w1h[]; };
+layout(binding = 2) readonly buffer W2 { uint16_t w2h[]; };
+layout(binding = 3) readonly buffer W3 { uint16_t w3h[]; };
+layout(binding = 4) readonly buffer W4 { uint16_t w4h[]; };
+layout(binding = 5) readonly buffer W5 { uint16_t w5h[]; };
+layout(binding = 6) readonly buffer W6 { uint16_t w6h[]; };
+layout(binding = 7) readonly buffer W7 { uint16_t w7h[]; };
 layout(binding = 8) readonly buffer Xbuf { float xa[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+    uint n_in; uint n_out; uint t; uint cw2_log2; uint cw2_mask; uint rpf;
 } pc;
 
-uint WG(uint idx) {
-    uint c = idx >> pc.cw_log2;
-    uint o = idx & pc.cw_mask;
-    if (c == 0u) return w0u[o];
-    if (c == 1u) return w1u[o];
-    if (c == 2u) return w2u[o];
-    if (c == 3u) return w3u[o];
-    if (c == 4u) return w4u[o];
-    if (c == 5u) return w5u[o];
-    if (c == 6u) return w6u[o];
-    return w7u[o];
+uint16_t WG16(uint idx) {
+    uint c = idx >> pc.cw2_log2;
+    uint o = idx & pc.cw2_mask;
+    if (c == 0u) return w0h[o];
+    if (c == 1u) return w1h[o];
+    if (c == 2u) return w2h[o];
+    if (c == 3u) return w3h[o];
+    if (c == 4u) return w4h[o];
+    if (c == 5u) return w5h[o];
+    if (c == 6u) return w6h[o];
+    return w7h[o];
 }
 
 vec4 myunpack8(uint x) {
     return vec4(
         float((x        ) & 0xFFu),
         float((x >> 8u  ) & 0xFFu),
-        float((x >> 16u) & 0xFFu),
-        float((x >> 24u) & 0xFFu));
+        float((x >> 16u ) & 0xFFu),
+        float((x >> 24u ) & 0xFFu));
 }
 
-const uint BLK_B = 210u;
-shared float sh_dl[96][16];
-shared uint sh_qh[96][16];   // qh 16워드
+// 스케일 int8 추출 — 바이트 192+s (u16 96+s/2, 홀짝)
+int sc8(uint b16, uint s) {
+    uint w = uint(WG16(b16 + 96u + (s >> 1u)));
+    int v = int((s & 1u) != 0u ? (w >> 8u) : (w & 0xFFu)) & 0xFF;
+    return (v << 24) >> 24;
+}
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -52,95 +58,70 @@ void main() {
     uint RPF = pc.rpf;
     uint row0 = gl_WorkGroupID.y * RPF;
     uint n_in = pc.n_in;
-    uint n_blk = n_in >> 8;
+    uint nbpc = n_in >> 8;           // 행당 256원소 블록 수
     uint base = tok * n_in;
-    float acc[8];
-    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
 
-    for (uint r = 0u; r < RPF; r++) {
-        uint row = row0 + r;
+    // llama 스레드 기하 (q6_K)
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;
+    const uint v_im = itid / 8u;
+    const uint v_in = itid - 8u * v_im;
+    const uint l0 = 4u * v_in;
+    const uint is = v_in / 4u;
+    const uint ql_off = 64u * v_im + l0;    // ql 바이트 (짝수)
+    const uint qh_off = 32u * v_im + l0;    // qh 바이트 (짝수)
+    const uint s_off = 8u * v_im + is;
+    const uint y_off = 128u * v_im + l0;
+
+    float temp[8];
+    for (uint i = 0u; i < RPF; i++) temp[i] = 0.0;
+
+    const uint it_size = 2u;            // 32/16
+    for (uint i = 0u; i < RPF; i++) {
+        uint row = row0 + i;
         if (row >= pc.n_out) break;
-        uint rowb = row * n_blk * BLK_B;
-        // 패스1: 헤더 → LDS (gemv6_q6 검증 산법)
-        for (uint b = tid; b < n_blk; b += 32u) {
-            uint bw = rowb + b * BLK_B;
-            uint dwi = (bw + 208u) >> 2;
-            uint drem = (bw + 208u) & 3u;
-            uint dw = WG(dwi);
-            uint db = (dw >> (drem * 8u)) & 0xFFFFu;
-            if (drem >= 2u) {
-                uint w2 = WG(dwi + 1u);
-                db = ((dw >> (drem * 8u)) | (w2 << ((4u - drem) * 8u))) & 0xFFFFu;
-            }
-            float d = unpackHalf2x16(db).x;
-            // sc 16B @192 — 워드 5개 (rem 걸침)
-            uint swi = (bw + 192u) >> 2;
-            uint srem = (bw + 192u) & 3u;
-            uint sw0 = WG(swi), sw1 = WG(swi + 1u), sw2 = WG(swi + 2u);
-            uint sw3 = WG(swi + 3u), sw4 = WG(swi + 4u);
-            for (uint j = 0u; j < 16u; j++) {
-                uint absb = srem + j;
-                uint wsel = absb < 4u ? sw0 : (absb < 8u ? sw1 : (absb < 12u ? sw2 : (absb < 16u ? sw3 : sw4)));
-                uint sc8 = (wsel >> ((absb & 3u) * 8u)) & 0xFFu;
-                int sci = int(sc8) << 24 >> 24;   // 산술 시프트 (gemv6_q6 교훈)
-                sh_dl[b][j] = d * float(sci);
-            }
-            // qh 16워드 (64B @128)
-            uint qwi = (bw + 128u) >> 2;
-            uint qrem = (bw + 128u) & 3u;
-            if (qrem == 0u) {
-                for (uint i = 0u; i < 16u; i++) sh_qh[b][i] = WG(qwi + i);
-            } else {
-                uint prev = WG(qwi);
-                for (uint i = 0u; i < 16u; i++) {
-                    uint nx = WG(qwi + 1u + i);
-                    sh_qh[b][i] = (prev >> (qrem * 8u)) | (nx << ((4u - qrem) * 8u));
-                    prev = nx;
-                }
-            }
+        uint rowbase16 = row * nbpc * 105u;  // 블록 = 105 u16
+        float acct = 0.0;
+        [[unroll]] for (uint jj = ix; jj < nbpc; jj += it_size) {
+            uint b16 = rowbase16 + jj * 105u;
+            // ql: 바이트 [ql_off, +3]·[ql_off+32, +35] — u16 2쌍
+            uint ql0 = uint(WG16(b16 + (ql_off >> 1u))) | (uint(WG16(b16 + (ql_off >> 1u) + 1u)) << 16);
+            uint ql32 = uint(WG16(b16 + (ql_off >> 1u) + 16u)) | (uint(WG16(b16 + (ql_off >> 1u) + 17u)) << 16);
+            uint qhw = uint(WG16(b16 + 64u + (qh_off >> 1u))) | (uint(WG16(b16 + 64u + (qh_off >> 1u) + 1u)) << 16);
+            // 4쿼터 니블+2비트 조립 (llama :33-47)
+            uint q0 = (ql0 & 0x0F0F0F0Fu) | ((qhw & 0x03030303u) << 4);
+            uint q1 = (ql32 & 0x0F0F0F0Fu) | ((qhw & 0x0C0C0C0Cu) << 2);
+            uint q2 = ((ql0 >> 4) & 0x0F0F0F0Fu) | (qhw & 0x30303030u);
+            uint q3 = ((ql32 >> 4) & 0x0F0F0F0Fu) | ((qhw & 0xC0C0C0C0u) >> 2);
+            vec4 v0 = myunpack8(q0) - 32.0;
+            vec4 v1 = myunpack8(q1) - 32.0;
+            vec4 v2 = myunpack8(q2) - 32.0;
+            vec4 v3 = myunpack8(q3) - 32.0;
+            // 스케일 4 (s_off + 0/2/4/6)
+            float sc0 = float(sc8(b16, s_off));
+            float sc1 = float(sc8(b16, s_off + 2u));
+            float sc2 = float(sc8(b16, s_off + 4u));
+            float sc3 = float(sc8(b16, s_off + 6u));
+            float d = unpackHalf2x16(uint(WG16(b16 + 104u))).x;
+            // y 4쿼터 × vec4
+            uint yb = base + jj * 256u + y_off;
+            vec4 by0 = vec4(xa[yb], xa[yb + 1u], xa[yb + 2u], xa[yb + 3u]);
+            vec4 by32 = vec4(xa[yb + 32u], xa[yb + 33u], xa[yb + 34u], xa[yb + 35u]);
+            vec4 by64 = vec4(xa[yb + 64u], xa[yb + 65u], xa[yb + 66u], xa[yb + 67u]);
+            vec4 by96 = vec4(xa[yb + 96u], xa[yb + 97u], xa[yb + 98u], xa[yb + 99u]);
+            float s0 = fma(by0.x, v0.x, fma(by0.y, v0.y, fma(by0.z, v0.z, by0.w * v0.w)));
+            float s1 = fma(by32.x, v1.x, fma(by32.y, v1.y, fma(by32.z, v1.z, by32.w * v1.w)));
+            float s2 = fma(by64.x, v2.x, fma(by64.y, v2.y, fma(by64.z, v2.z, by64.w * v2.w)));
+            float s3 = fma(by96.x, v3.x, fma(by96.y, v3.y, fma(by96.z, v3.z, by96.w * v3.w)));
+            // llama :74 fma 순서
+            acct = fma(fma(s0, sc0, fma(s1, sc1, fma(s2, sc2, s3 * sc3))), d, acct);
         }
-        barrier();
-        // 패스2: ql 선형 스윕 — 레인 L이 ql 바이트 [4L..4L+4) — SIMD 니블
-        float pacc = 0.0;
-        [[unroll]] for (uint b = 0u; b < n_blk; b++) {
-            uint bw = rowb + b * BLK_B;
-            uint lw = bw >> 2;
-            uint lrem = bw & 3u;
-            uint wv = WG(lw + tid);
-            if (lrem != 0u) {
-                uint nx = WG(lw + tid + 1u);
-                wv = (wv >> (lrem * 8u)) | (nx << ((4u - lrem) * 8u));
-            }
-            uint m0 = tid * 4u;
-            uint n = m0 >> 6;
-            uint mm0 = m0 & 63u;
-            uint hi_sel = (mm0 & 32u) != 0u ? 1u : 0u;
-            // lo니블: v&0xF, qh bits 2*hi_sel..+1 → 6비트 값 -32
-            uint qh_abs = 32u * n + (mm0 & 31u);
-            uint qhw = sh_qh[b][qh_abs >> 2];
-            uint qhsh = 8u * (qh_abs & 3u);
-            vec4 lo_nib = myunpack8(wv & 0x0F0F0F0Fu);
-            vec4 hi_nib = myunpack8((wv >> 4u) & 0x0F0F0F0Fu);
-            vec4 qlo = myunpack8((qhw >> (qhsh + 2u * hi_sel)) & 0x03030303u);
-            vec4 qhi = myunpack8((qhw >> (qhsh + 4u + 2u * hi_sel)) & 0x03030303u);
-            vec4 vlo = lo_nib + 16.0 * qlo - 32.0;
-            vec4 vhi = hi_nib + 16.0 * qhi - 32.0;
-            uint isb = 8u * n + ((mm0 & 31u) >> 4);
-            float dl_lo = sh_dl[b][isb + 2u * hi_sel];
-            float dl_hi = sh_dl[b][isb + 4u + 2u * hi_sel];
-            uint e_lo = b * 256u + 128u * n + mm0;
-            vec4 ylo = vec4(xa[base + e_lo], xa[base + e_lo + 1u], xa[base + e_lo + 2u], xa[base + e_lo + 3u]);
-            vec4 yhi = vec4(xa[base + e_lo + 64u], xa[base + e_lo + 65u], xa[base + e_lo + 66u], xa[base + e_lo + 67u]);
-            pacc += dl_lo * dot(vlo, ylo);
-            pacc += dl_hi * dot(vhi, yhi);
-        }
-        acc[r] = pacc;
-        barrier();
+        temp[i] = acct;
     }
-    for (uint r = 0u; r < RPF; r++) {
-        uint row = row0 + r;
+    for (uint i = 0u; i < RPF; i++) {
+        uint row = row0 + i;
         if (row >= pc.n_out) break;
-        float tot = subgroupAdd(acc[r]);
+        float tot = subgroupAdd(temp[i]);
         if (tid == 0u) outv[tok * pc.n_out + row] = tot;
     }
 }

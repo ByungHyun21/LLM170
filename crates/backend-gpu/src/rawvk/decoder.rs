@@ -11,6 +11,7 @@ const GEMV8_Q5_SPV: &[u8] = include_bytes!("spv/gemv8_q5.spv");
 const GEMV8_Q4_SPV: &[u8] = include_bytes!("spv/gemv8_q4.spv");
 const GEMV8_XS_SPV: &[u8] = include_bytes!("spv/gemv8_xs.spv");
 const GEMV8_Q3_SPV: &[u8] = include_bytes!("spv/gemv8_q3.spv");
+const GEMV8_Q6_SPV: &[u8] = include_bytes!("spv/gemv8_q6.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -889,8 +890,8 @@ impl DecoderState {
     /// bar=false: 독립 병렬 그룹 내부 (직후 배리어 생략).
     fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 13 && ty != 12 && ty != 23 && ty != 11 {
-            return Err("gemv8: q3_K/q4_K/q5_K/iq4_xs만".into());
+        if ty != 13 && ty != 12 && ty != 23 && ty != 11 && ty != 14 {
+            return Err("gemv8: q3_K/q4_K/q5_K/q6_K/iq4_xs만".into());
         }
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
@@ -924,6 +925,16 @@ impl DecoderState {
             let cw_mask = cw - 1;
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
             return self.run_pipe_b("gemv8_q4", GEMV8_Q4_SPV, 10, 24, &binds, &push,
+                1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
+        }
+        if ty == 14 {
+            // q6 — u16 뷰 (105 u16/블록), llama mul_mat_vec_q6_k 직역 (plans/36 G1)
+            let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
+            let cw2 = cw2.next_power_of_two();
+            let cw2_log2 = 31u32 - cw2.leading_zeros();
+            let cw2_mask = cw2 - 1;
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
+            return self.run_pipe_b("gemv8_q6", GEMV8_Q6_SPV, 10, 24, &binds, &push,
                 1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
         }
         // q5 — u16 단위 청크 상수 (typed 뷰), 첫 버퍼 실측 크기 → pow2ceil
@@ -1134,7 +1145,7 @@ impl DecoderState {
         // 사전 판정 (self 대여 분리 — 클로저로 두면 mut 대여와 충돌)
         let elig: Vec<bool> = jobs
             .iter()
-            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(11 | 12 | 13 | 23)))
+            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(11 | 12 | 13 | 14 | 23)))
             .collect();
         let i8s: Vec<bool> = jobs.iter().map(|(k, _, _)| i8_on && self.i8w.contains_key(k)).collect();
         // xq 필요 조건: gemv8/타일 외 폴백 잡이 하나라도 있을 때
