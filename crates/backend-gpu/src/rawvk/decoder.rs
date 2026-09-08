@@ -31,6 +31,7 @@ const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
 const GEMM_I8V2_SPV: &[u8] = include_bytes!("spv/gemm_i8v2.spv");
+const ADDRMS_SPV: &[u8] = include_bytes!("spv/addrms.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -828,18 +829,26 @@ impl DecoderState {
         Ok(self.pipes.get(name).unwrap())
     }
 
-    /// 바인딩+런치 (배치 모드 자동 — fresh ds).
+    /// 바인딩+런치 (배치 모드 자동 — fresh ds). 배리어 포함.
     fn run_pipe(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32, bufs: &[vk::Buffer], push: &[u8], gx: u32, gy: u32, gz: u32) -> Result<(), String> {
+        self.run_pipe_b(name, spv, n_buf, pb, bufs, push, gx, gy, gz, true)
+    }
+
+    /// 바인딩+런치 — bar=false면 직후 배리어 생략 (독립 병렬 그룹 내부).
+    /// 그룹 마지막 디스패치는 반드시 bar=true로 종결해야 소비자가 안전하다.
+    fn run_pipe_b(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32, bufs: &[vk::Buffer], push: &[u8], gx: u32, gy: u32, gz: u32, bar: bool) -> Result<(), String> {
         let t0k = std::time::Instant::now();
-        // 배치 자동 분할 — 디스패치 512마다 제출·대기·재시작 (세트/CMDBUF 누적 방지).
+        // 배치 자동 분할 — 디스패치 2048마다 제출·대기·재시작 (세트/CMDBUF 누적 방지;
+        // 풀 상한 4096세트 이내. 512→2048: 스텝당 중간 드레인 제거, plans/36 G3).
         if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.split_ctr += 1;
-            if self.split_ctr >= 512 {
+            if self.split_ctr >= 2048 {
                 self.split_ctr = 0;
                 self.ctx.end_batch_wait()?;
                 self.ctx.begin_batch()?;
             }
         }
+        self.ctx.nobar_next.set(!bar);
         let p = *self.pipe(name, spv, n_buf, pb)?;
         let ds = self.ctx.bind_ds(&p, bufs)?;
         let r = self.ctx.run(p.pl, ds, p.pipe, push, gx, gy, gz);
@@ -868,7 +877,8 @@ impl DecoderState {
 
     /// gemv8_q5 (plans/33) — llama mul_mat_vec_q5_k 완전 포트 (typed u16 로드,
     /// SIMD-in-register 니블, fma 체인). 웜 162GB/s (역대 최고). LLM170_G8=1.
-    fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+    /// bar=false: 독립 병렬 그룹 내부 (직후 배리어 생략).
+    fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         if ty != 13 && ty != 12 && ty != 23 && ty != 11 {
             return Err("gemv8: q3_K/q4_K/q5_K/iq4_xs만".into());
@@ -894,8 +904,8 @@ impl DecoderState {
             let cw_log2 = 31u32 - cw.leading_zeros();
             let cw_mask = cw - 1;
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
-            return self.run_pipe(pname, spv8, n_kb8, 24, &binds, &push,
-                1, no.div_ceil(rpf as usize) as u32, t as u32);
+            return self.run_pipe_b(pname, spv8, n_kb8, 24, &binds, &push,
+                1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
         }
         if ty == 12 {
             // q4 — u32 워드 단위 (동일 WG 워커)
@@ -904,8 +914,8 @@ impl DecoderState {
             let cw_log2 = 31u32 - cw.leading_zeros();
             let cw_mask = cw - 1;
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
-            return self.run_pipe("gemv8_q4", GEMV8_Q4_SPV, 10, 24, &binds, &push,
-                1, no.div_ceil(rpf as usize) as u32, t as u32);
+            return self.run_pipe_b("gemv8_q4", GEMV8_Q4_SPV, 10, 24, &binds, &push,
+                1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
         }
         // q5 — u16 단위 청크 상수 (typed 뷰), 첫 버퍼 실측 크기 → pow2ceil
         let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
@@ -913,11 +923,9 @@ impl DecoderState {
         let cw2_log2 = 31u32 - cw2.leading_zeros();
         let cw2_mask = cw2 - 1;
         let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
-        self.run_pipe("gemv8_q5", GEMV8_Q5_SPV, 10, 24, &binds, &push,
-            1, no.div_ceil(rpf as usize) as u32, t as u32)
+        self.run_pipe_b("gemv8_q5", GEMV8_Q5_SPV, 10, 24, &binds, &push,
+            1, no.div_ceil(rpf as usize) as u32, t as u32, bar)
     }
-
-
     /// gemv 래우터 — t<16은 gemv8(f32 직결, llama 포트), 그 외·미지원 타입은
     /// quant+gemv3(범용 정수 경로). LLM170_G8=0 킬스위치.
     /// 2026-09-08 A/B: q6_K도 gemv3+quant가 gemv6_q6보다 우위(tg32 7.06 vs 6.71) —
@@ -925,7 +933,7 @@ impl DecoderState {
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
         let g8_off = std::env::var("LLM170_G8").map(|v| v == "0").unwrap_or(false);
         if t < 16 && !g8_off {
-            if self.gemv8_q5(qsrc, wkey, out, t).is_ok() {
+            if self.gemv8_q5(qsrc, wkey, out, t, true).is_ok() {
                 return Ok(());
             }
         }
@@ -937,17 +945,22 @@ impl DecoderState {
     /// HIP 기본 WMMA와 동일 정확도 클래스 maxrel ~4.9e-4, argmax 안정).
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
     fn gemv(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+        self.gemv_bar(xq, wkey, out, t, true)
+    }
+
+    /// bar=false: 독립 그룹 내부 — 최종 디스패치 직후 배리어 생략.
+    fn gemv_bar(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         let tile_min: usize = if std::env::var_os("LLM170_VK_TILE1").is_some() { 1 } else { 16 };
         if t >= tile_min && std::env::var_os("LLM170_VK_TILE").is_some()
             && (ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 23 || (ty == 8 && no >= 1024)) {
-            return self.gemv_tile(xq, wkey, out, t);
+            return self.gemv_tile(xq, wkey, out, t, bar);
         }
-        self.gemv_xq(xq, wkey, out, t)
+        self.gemv_xq(xq, wkey, out, t, bar)
     }
 
     /// 타일(coopmat) 경로 — 프리필 전용. plans/32.
-    fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+    fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         // plans/30→32: tile128(coopmat f16)은 t=1 gemv와 수치계열이 다르나
         // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
@@ -961,32 +974,34 @@ impl DecoderState {
             binds.push(xq);
             binds.push(out);
             let gx = (no as u32 + 127) / 128;
-            for tb in (0..t).step_by(64) {
+            let n_tb = t.div_ceil(64);
+            for (tbi, tb) in (0..t).step_by(64).enumerate() {
                 let nt = (t - tb).min(64) as u32;
+                let last = tbi + 1 == n_tb && bar;
                 if ty == 13 {
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe("tile128", TILE128_SPV, 10, 16, &binds, &push, gx, 1, 1)?;
+                    self.run_pipe_b("tile128", TILE128_SPV, 10, 16, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 12 {
                     // tile_q4k: ql@16 128B, qh 없음 — 시프트 청크 push
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
                     let cw_log2 = 31u32 - cw.leading_zeros();
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                    self.run_pipe("tile_q4k", TILE_Q4K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                    self.run_pipe_b("tile_q4k", TILE_Q4K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 14 {
                     // tile_q6k: ql 니블 + qh 2비트 + i8 스케일 + d @208
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
                     let cw_log2 = 31u32 - cw.leading_zeros();
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                    self.run_pipe("tile_q6k", TILE_Q6K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                    self.run_pipe_b("tile_q6k", TILE_Q6K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 11 {
                     // tile_q3k: hm 32B + q 64B(2비트) + scales 12B + d @108
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
                     let cw_log2 = 31u32 - cw.leading_zeros();
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                    self.run_pipe("tile_q3k", TILE_Q3K_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                    self.run_pipe_b("tile_q3k", TILE_Q3K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 8 {
                     // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)은 제외
                     if no >= 1024 {
@@ -994,9 +1009,9 @@ impl DecoderState {
                         let cw_log2 = 31u32 - cw.leading_zeros();
                         let cw_mask = (1u32 << cw_log2) - 1u32;
                         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                        self.run_pipe("tile_q8", TILE_Q8_SPV, 10, 24, &binds, &push, gx, 1, 1)?;
+                        self.run_pipe_b("tile_q8", TILE_Q8_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                     } else {
-                        self.gemv_xq(xq, wkey, out, t)?;
+                        self.gemv_xq(xq, wkey, out, t, bar)?;
                     }
                 } else {
                     // tile_xs (plans/32): iq4_xs coopmat — ktab 바인딩, 시프트 청크
@@ -1005,7 +1020,7 @@ impl DecoderState {
                     let cw_mask = (1u32 << cw_log2) - 1u32;
                     binds.push(self.ktab.buf);
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                    self.run_pipe("tile_xs", TILE_XS_SPV, 11, 24, &binds, &push, gx, 1, 1)?;
+                    self.run_pipe_b("tile_xs", TILE_XS_SPV, 11, 24, &binds, &push, gx, 1, 1, last)?;
                     binds.pop();
                 }
             }
@@ -1015,7 +1030,7 @@ impl DecoderState {
     }
 
     /// 비타일 gemv (원본 경로).
-    fn gemv_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+    fn gemv_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         if self.ktime {
             *self.kkey.borrow_mut() = Some(format!("gemv:ty{ty}:{wkey}"));
@@ -1033,11 +1048,11 @@ impl DecoderState {
         // 단일 청크면 전체/4 → c 항상 0.
         let chunk_words = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, ty, t as u32, chunk_words]);
-        self.run_pipe("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 24, &binds, &push, no as u32, 1, 1)
+        self.run_pipe_b("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 24, &binds, &push, no as u32, 1, 1, bar)
     }
 
     /// v2 (mlx식) — per-row 스케일: quant_b8v2 + gemm_i8v2. LLM170_VK_I8=2.
-    fn gemm_i8v2(&mut self, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+    fn gemm_i8v2(&mut self, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
         let (wbuf, ni, no) = (e.w.clone(), e.n_in, e.n_out);
         let wsr = self.wsr.get(wkey).cloned().ok_or("wsr 없음")?;
@@ -1053,12 +1068,12 @@ impl DecoderState {
         binds.push(wsr.buf);
         binds.push(self.ydb.buf);
         let push2 = Self::push_u32s(&[ni as u32, no as u32, t as u32]);
-        self.run_pipe("gemm_i8v2", GEMM_I8V2_SPV, 12, 12, &binds, &push2,
-            (no as u32 + 15) / 16, 1, 1)
+        self.run_pipe_b("gemm_i8v2", GEMM_I8V2_SPV, 12, 12, &binds, &push2,
+            (no as u32 + 15) / 16, 1, 1, bar)
     }
 
     /// gemm_i8 (plans/23) — q5_K 사전 언패분으로 t행 GEMM.
-    fn gemm_i8(&mut self, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
+    fn gemm_i8(&mut self, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
         let (wbuf, wspbuf, wsmbuf, ni, no) = (e.w.clone(), e.wsp.clone(), e.wsm.clone(), e.n_in, e.n_out);
         let n_sub = ni / 32;
@@ -1075,30 +1090,43 @@ impl DecoderState {
         binds.push(self.ishs.buf);
         binds.push(self.faccs.buf);
         let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, n_sub as u32]);
-        self.run_pipe("gemm_i8", GEMM_I8_SPV, 16, 16, &binds, &push,
-            (no as u32 + 15) / 16, 1, 1)
+        self.run_pipe_b("gemm_i8", GEMM_I8_SPV, 16, 16, &binds, &push,
+            (no as u32 + 15) / 16, 1, 1, bar)
     }
 
-    /// 단계 공유 GEMV — q5_K·t≥2는 gemm_i8(LLM170_VK_NOI8 킬스위치),
-    /// 나머지는 기존 xq+gemv3. xq 양자화는 호출부가 이미 수행.
+    /// 단계 공유 GEMV 그룹 — 잡들은 상호 독립(동일 입력·상이 출력)이라
+    /// 그룹 내부 배리어 생략, 마지막 잡이 배리어로 종결.
+    /// xq 양자화는 실제 폴백 잡이 있을 때만 수행 (gemv8 직결 사이트의 dead
+    /// quant 스킵 — plans/36 G2). i8 잡(t≥2·VK_I8ON)은 gemm_i8.
     fn gemv_stage(&mut self, n: usize, t: usize, jobs: &[(String, vk::Buffer, vk::Buffer)]) -> Result<(), String> {
-        let xq_f32 = self.b_xn.buf;
+        let g8 = t < 16 && std::env::var("LLM170_G8").map(|v| v != "0").unwrap_or(true);
         let i8_on = t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some();
-        let any_i8 = i8_on && jobs.iter().any(|(k, _, _)| self.i8w.contains_key(k));
-        let _ = &any_i8;
         let v2 = std::env::var("LLM170_VK_I8").map(|v| v == "2").unwrap_or(false);
-        for (k, xq, out) in jobs {
-            if any_i8 && self.i8w.contains_key(k) {
+        // 사전 판정 (self 대여 분리 — 클로저로 두면 mut 대여와 충돌)
+        let elig: Vec<bool> = jobs
+            .iter()
+            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(11 | 12 | 13 | 23)))
+            .collect();
+        let i8s: Vec<bool> = jobs.iter().map(|(k, _, _)| i8_on && self.i8w.contains_key(k)).collect();
+        // xq 필요 조건: gemv8/타일 외 폴백 잡이 하나라도 있을 때
+        let need_xq = (0..jobs.len()).any(|ji| !i8s[ji] && (!g8 || !elig[ji]));
+        if need_xq {
+            self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
+        }
+        let last = jobs.len() - 1;
+        for (ji, (k, xq, out)) in jobs.iter().enumerate() {
+            let bar = ji == last;
+            if i8s[ji] {
                 if v2 {
-                    self.gemm_i8v2(k, *out, t)?;
+                    self.gemm_i8v2(k, *out, t, bar)?;
                 } else {
-                    self.gemm_i8(k, *out, t)?;
+                    self.gemm_i8(k, *out, t, bar)?;
                 }
-            } else if t < 16 && std::env::var("LLM170_G8").map(|v| v != "0").unwrap_or(true) {
+            } else if g8 && elig[ji] {
                 // spec 검증 배치(t≤5)도 gemv8 수치계열로 — 불변식 회복 (plans/33)
-                self.gemv8_q5(xq_f32, k, *out, t)?;
+                self.gemv8_q5(self.b_xn.buf, k, *out, t, bar)?;
             } else {
-                self.gemv(*xq, k, *out, t)?;
+                self.gemv_bar(*xq, k, *out, t, bar)?;
             }
         }
         Ok(())
@@ -1123,6 +1151,17 @@ impl DecoderState {
             &[src, wbuf.buf, out], &push, t as u32, 1, 1)
     }
 
+    /// 잔차 덧셈 + rms_norm 융합 (plans/36 G2) — y += x·1.0 결과를 그대로
+    /// 세그먼트 축소하므로 axpy+rms 2디스패치와 비트동일, 런치만 절감.
+    fn addrms(&mut self, y: vk::Buffer, x: vk::Buffer, wkey: &str, out: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
+        let wbuf = self.consts.get(wkey).cloned().ok_or(format!("상수 없음: {wkey}"))?;
+        let eps = self.eps;
+        let mut push = Self::push_u32s(&[n as u32, t as u32]);
+        push.extend_from_slice(&eps.to_le_bytes());
+        self.run_pipe("addrms", ADDRMS_SPV, 4, 12,
+            &[y, x, wbuf.buf, out], &push, t as u32, 1, 1)
+    }
+
     /// t=1 단일 스텝 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
@@ -1143,17 +1182,19 @@ impl DecoderState {
             if layer_cut.is_some_and(|c| il >= c) {
                 break;
             }
-            // ── attn_norm + quant
-            {
+            // ── attn_norm — 0층만 (이후 층 입력 규격화는 하단 fdown addrms에 융합)
+            if il == 0 {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
-                self.rms(xs.buf, &format!("blk.{il}.attn_norm"), xn.buf, n, 1)?;
+                self.rms(xs.buf, "blk.0.attn_norm", xn.buf, n, 1)?;
             }
             if self.is_recr[il] {
-                // GDN 4 GEMV
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_qkv.weight"), self.b_gqkv.buf, 1, n)?;
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_gate.weight"), self.b_gz.buf, 1, n)?;
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ssm_beta.weight"), self.b_gb.buf, 1, n)?;
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ssm_alpha.weight"), self.b_ga.buf, 1, n)?;
+                // GDN 4 GEMV — 독립 그룹 (gemv_stage: 내부 배리어 생략·dead quant 스킵)
+                self.gemv_stage(n, 1, &[
+                    (format!("blk.{il}.attn_qkv.weight"), self.b_xq_n.buf, self.b_gqkv.buf),
+                    (format!("blk.{il}.attn_gate.weight"), self.b_xq_n.buf, self.b_gz.buf),
+                    (format!("blk.{il}.ssm_beta.weight"), self.b_xq_n.buf, self.b_gb.buf),
+                    (format!("blk.{il}.ssm_alpha.weight"), self.b_xq_n.buf, self.b_ga.buf),
+                ])?;
                 let gskip = std::env::var("LLM170_VK_GDN_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                 // conv (t=1 — ring)
                 {
@@ -1215,9 +1256,8 @@ impl DecoderState {
                 let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
                 let _ = xq_sg;
                 }
-                self.quant(self.b_ggated.buf, self.b_xq_g.buf, d_inner, 1)?;
                 if gskip & 4 == 0 {
-                self.gemv(self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1)?;
+                    self.gemv_w(self.b_ggated.buf.clone(), self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1, d_inner)?;
                 }
                 if std::env::var_os("LLM170_VKD_TRACE").is_some() && il < 2 {
                     self.ctx.end_batch_wait().ok();
@@ -1253,9 +1293,11 @@ impl DecoderState {
                     let gtotal: usize = gbufs.iter().map(|b| b.bytes).sum();
                     eprintln!("#  ATTN3 ty={} ni={} no={} chunks={} bytes={} max_ssbo={} | L0qkv no={} chunks={} bytes={}", tyq, niq, noq, bufs.len(), total, self.max_ssbo, gno, gbufs.len(), gtotal);
                 }
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_q.weight"), self.b_aq.buf, 1, n)?;
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_k.weight"), self.b_ak.buf, 1, n)?;
-                self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.attn_v.weight"), self.b_av.buf, 1, n)?;
+                self.gemv_stage(n, 1, &[
+                    (format!("blk.{il}.attn_q.weight"), self.b_xq_n.buf, self.b_aq.buf),
+                    (format!("blk.{il}.attn_k.weight"), self.b_xq_n.buf, self.b_ak.buf),
+                    (format!("blk.{il}.attn_v.weight"), self.b_xq_n.buf, self.b_av.buf),
+                ])?;
                 // qk_rope
                 {
                     let qn = self.consts.get(&format!("blk.{il}.attn_q_norm")).cloned().ok_or("qn")?;
@@ -1273,9 +1315,10 @@ impl DecoderState {
                 // kv append
                 {
                     let push = Self::push_u32s(&[(n_kv * hd) as u32, pos as u32]);
-                    self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
+                    // k/v 어펜드는 상호 독립 — k 배리어 생략, v가 종결 (flash는 둘 다 판독)
+                    self.run_pipe_b("kv_app", KV_APPEND_SPV, 2, 8,
                         &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push,
-                        (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
+                        (n_kv * hd).div_ceil(64) as u32, 1, 1, false)?;
                     self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
                         &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
                         (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
@@ -1289,31 +1332,38 @@ impl DecoderState {
                         &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, mask.buf, self.b_aout.buf],
                         &push, 1, n_head as u32, 1)?;
                 }
-                self.quant(self.b_aout.buf, self.b_xq_g.buf, n_head * hd, 1)?;
-                }
                 if attn_cut >= 4 {
-                self.gemv(self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, 1)?;
+                    self.gemv_w(self.b_aout.buf.clone(), self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, 1, n_head * hd)?;
+                }
                 }
                 }
                 full_idx += 1;
             }
-            // 잔차
-            self.axpy(self.b_xs.buf, self.b_gout.buf, n)?;
+            // 잔차 + post_norm — addrms 융합 (plans/36 G2: axpy+rms 비트동일)
+            self.addrms(self.b_xs.buf, self.b_gout.buf, &format!("blk.{il}.post_norm"), self.b_xn.buf, n, 1)?;
             // ── FFN
-            {
-                let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
-                self.rms(xs.buf, &format!("blk.{il}.post_norm"), xn.buf, n, 1)?;
-            }
-            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ffn_gate.weight"), self.b_fgate.buf, 1, n)?;
-            self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, &format!("blk.{il}.ffn_up.weight"), self.b_fup.buf, 1, n)?;
+            self.gemv_stage(n, 1, &[
+                (format!("blk.{il}.ffn_gate.weight"), self.b_xq_n.buf, self.b_fgate.buf),
+                (format!("blk.{il}.ffn_up.weight"), self.b_xq_n.buf, self.b_fup.buf),
+            ])?;
             self.silu_mul(self.b_fgate.buf, self.b_fup.buf, self.b_fglu.buf, self.n_ff)?;
             self.gemv_w(self.b_fglu.buf.clone(), self.b_xq_f.buf, &format!("blk.{il}.ffn_down.weight"), self.b_fdown.buf, 1, self.n_ff)?;
-            self.axpy(self.b_xs.buf, self.b_fdown.buf, n)?;
+            // 잔차 + 다음층 attn_norm / head output_norm — addrms 융합
+            let is_last = il + 1 >= self.n_layer || layer_cut.is_some_and(|c| il + 1 >= c);
+            let nkey = if is_last {
+                "output_norm".to_string()
+            } else {
+                format!("blk.{}.attn_norm", il + 1)
+            };
+            self.addrms(self.b_xs.buf, self.b_fdown.buf, &nkey, self.b_xn.buf, n, 1)?;
             // 실험: L0 FFN 직후 attn_q gemv 강제 (층 위치 vs 가중치 분리)
             if std::env::var_os("LLM170_VK_FORCE_AQ").is_some() && il == 0 {
                 self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "blk.3.attn_q.weight", self.b_aq.buf, 1, n)?;
             }
         }
+        // ── head: gemv(output) — output_norm은 마지막 addrms에 융합, quant는
+        // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).
+        self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
@@ -1338,15 +1388,6 @@ impl DecoderState {
                 s(&self.kv_k[0][seq], 1024), s(&self.kv_v[0][seq], 1024),
                 s(&self.b_xs, 64));
         }
-        // ── head: output_norm → quant → gemv(output) → 다운로드
-        {
-            let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
-            self.rms(xs.buf, "output_norm", xn.buf, n, 1)?;
-        }
-        self.quant(self.b_xn.buf, self.b_xq_n.buf, n, 1)?;
-        if !noba { self.ctx.begin_batch()?; };
-        self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
-        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
         Ok(logits)
