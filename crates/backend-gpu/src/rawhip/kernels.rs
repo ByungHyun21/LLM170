@@ -352,15 +352,6 @@ extern "C" __global__ void gemm_q8_0_dual(const unsigned* xq, const unsigned* w1
     }
 }
 
-// reduce: [n_out×64] f64 → [n_out] f32 (레인 순서 합, 1회 캐스트)
-extern "C" __global__ void reduce64(const double* part, float* out, int n_out) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n_out) return;
-    double acc = 0.0;
-    #pragma unroll
-    for (int l = 0; l < 64; l++) acc += part[o * 64 + l];
-    out[o] = (float)acc;
-}
 
 // ─── W4A8 GEMV t=1 — 스트라이드 레인, f64 부분합 ───
 // iq4_xs (ty16)
@@ -762,103 +753,8 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
     }
 }
 
-// q5_K 타일 배치 (ty13) — 블록=1출력행, TT=16 토큰 타일, 가중 1회 독서.
-// 토큰별 isum 레지스터 배열 → 토큰별 트리 환원. 미러와 토큰당 동일열.
-#define TT 16
-extern "C" __global__ void gemm_q5k_bt(const unsigned* xq, const unsigned* w,
-                                       float* out, int n_in, int n_out, int xq_w, int t) {
-    int o = blockIdx.x;
-    int l = threadIdx.x;
-    if (o >= n_out || l >= 64) return;
-    int n_sub = n_in >> 5;
-    int cnt = (n_sub + 63 - l) >> 6;
-    int blocks = n_in >> 8;
-    int row_base = o * blocks * 176;
-    float accs[TT];  // f32 레인 누산 — f64 1/16 레이트가 병목 (RCA 2026-09-04)
-    #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
-    for (int m = 0; m < cnt; m++) {
-        int sb = l + (m << 6);
-        int js = sb & 7;
-        int it = js >> 1;
-        int half = js & 1;
-        int wb = row_base + (sb >> 3) * 176;
-        int wq = wb >> 2;
-        unsigned w0 = w[wq];
-        float d = bits_f16(w0 & 0xFFFFu);
-        float dm = bits_f16(w0 >> 16);
-        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
-        unsigned r = (js & 3) * 8;
-        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
-        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
-        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
-        unsigned sc_v, m_v;
-        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
-        else {
-            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
-            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
-        }
-        int qhw = wq + 4;
-        unsigned h0 = w[qhw], h1 = w[qhw+1], h2 = w[qhw+2], h3 = w[qhw+3];
-        unsigned h4 = w[qhw+4], h5 = w[qhw+5], h6 = w[qhw+6], h7 = w[qhw+7];
-        int qlb = wq + 12 + it * 8;
-        unsigned q0 = w[qlb], q1 = w[qlb+1], q2 = w[qlb+2], q3 = w[qlb+3];
-        unsigned q4 = w[qlb+4], q5 = w[qlb+5], q6 = w[qlb+6], q7 = w[qlb+7];
-        unsigned nsh = half << 2;
-        int sh = 2 * it + half;
-        unsigned hbit = 1u << sh;
-        unsigned nib0 = (q0 >> nsh) & 0x0F0F0F0Fu, nib1 = (q1 >> nsh) & 0x0F0F0F0Fu;
-        unsigned nib2 = (q2 >> nsh) & 0x0F0F0F0Fu, nib3 = (q3 >> nsh) & 0x0F0F0F0Fu;
-        unsigned nib4 = (q4 >> nsh) & 0x0F0F0F0Fu, nib5 = (q5 >> nsh) & 0x0F0F0F0Fu;
-        unsigned nib6 = (q6 >> nsh) & 0x0F0F0F0Fu, nib7 = (q7 >> nsh) & 0x0F0F0F0Fu;
-        unsigned bit0 = ((h0 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit1 = ((h1 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit2 = ((h2 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit3 = ((h3 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit4 = ((h4 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit5 = ((h5 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit6 = ((h6 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned bit7 = ((h7 & (hbit * 0x01010101u)) >> sh) << 4;
-        unsigned wv0 = nib0 | bit0, wv1 = nib1 | bit1, wv2 = nib2 | bit2, wv3 = nib3 | bit3;
-        unsigned wv4 = nib4 | bit4, wv5 = nib5 | bit5, wv6 = nib6 | bit6, wv7 = nib7 | bit7;
-        int xw = (sb << 5) >> 2;
-        // 토큰 타일 — isum/토큰, 가중 워드는 루프 외 1회
-        for (int ti = 0; ti < t; ti++) {
-            const unsigned* xt = xq + ti * xq_w;
-            int isum = 0;
-            unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
-            unsigned y4v = xt[xw+4], y5v = xt[xw+5], y6v = xt[xw+6], y7v = xt[xw+7];
-            isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
-            isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
-            isum = dot4(wv4, y4v, isum); isum = dot4(wv5, y5v, isum);
-            isum = dot4(wv6, y6v, isum); isum = dot4(wv7, y7v, isum);
-            int qsb = (n_in >> 2) + (n_in >> 5);
-            int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
-            float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
-            int q = ti & (TT - 1);
-            accs[q] += yd * (d * (float)sc_v) * (float)isum;
-            accs[q] -= yd * (dm * (float)m_v) * (float)qsum;
-        }
-    }
-    // 토큰별 트리 환원 — accs[TT] 중 ti 카운트
-    __shared__ double sh32[32];
-    for (int ti = 0; ti < t; ti++) {
-        double acc = (double)accs[ti & (TT - 1)];
-        if (l >= 32) sh32[l - 32] = acc;
-        __syncthreads();
-        if (l < 32) {
-            acc += sh32[l];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
-        }
-        __syncthreads();
-    }
-}
 
-// ─── 타일 배치 GEMM (블록=1행, TT 토큰 레지스터, 가중 1회 독서) ───
-// gemm_q5k_bt 참조. 미러와 토큰당 동일 연산열.
+// ─── 타일 배치 MMQ GEMM (mul_mat_q 구조) ───
 
 // q5_K MMQ 포트 (ty13) — llama.cpp mul_mat_q 구조: I=64행×J=16토큰 타일,
 // 256스레드(4×wave64), 스레드당 4토큰 파편. 언팩 가중·y 전부 shared,
@@ -1597,83 +1493,6 @@ extern "C" __global__ void gemm_q4k_mm(const unsigned* xq, const unsigned* w,
     }
 }
 
-// q4_K 타일 (ty12)
-extern "C" __global__ void gemm_q4k_bt(const unsigned* xq, const unsigned* w,
-                                       float* out, int n_in, int n_out, int xq_w, int t) {
-    int o = blockIdx.x;
-    int l = threadIdx.x;
-    if (o >= n_out || l >= 64) return;
-    int n_sub = n_in >> 5;
-    int cnt = (n_sub + 63 - l) >> 6;
-    int blocks = n_in >> 8;
-    int row_base = o * blocks * 144;
-    float accs[TT];
-    #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
-    for (int m = 0; m < cnt; m++) {
-        int sb = l + (m << 6);
-        int js = sb & 7;
-        int it = js >> 1;
-        int half = js & 1;
-        int wb = row_base + (sb >> 3) * 144;
-        int wq = wb >> 2;
-        unsigned w0 = w[wq];
-        float d = bits_f16(w0 & 0xFFFFu);
-        float dm = bits_f16(w0 >> 16);
-        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
-        unsigned r = (js & 3) * 8;
-        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
-        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
-        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
-        unsigned sc_v, m_v;
-        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
-        else {
-            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
-            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
-        }
-        int qlb = wq + 4 + it * 8;
-        unsigned nsh = half << 2;
-        unsigned wv0 = (w[qlb]   >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv1 = (w[qlb+1] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv2 = (w[qlb+2] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv3 = (w[qlb+3] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv4 = (w[qlb+4] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv5 = (w[qlb+5] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv6 = (w[qlb+6] >> nsh) & 0x0F0F0F0Fu;
-        unsigned wv7 = (w[qlb+7] >> nsh) & 0x0F0F0F0Fu;
-        int xw = (sb << 5) >> 2;
-        for (int ti = 0; ti < t; ti++) {
-            const unsigned* xt = xq + ti * xq_w;
-            int isum = 0;
-            unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
-            unsigned y4v = xt[xw+4], y5v = xt[xw+5], y6v = xt[xw+6], y7v = xt[xw+7];
-            isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
-            isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
-            isum = dot4(wv4, y4v, isum); isum = dot4(wv5, y5v, isum);
-            isum = dot4(wv6, y6v, isum); isum = dot4(wv7, y7v, isum);
-            int qsb = (n_in >> 2) + (n_in >> 5);
-            int qsum = (int)xt[qsb + (sb << 1)] + (int)xt[qsb + (sb << 1) + 1];
-            float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
-            int q = ti & (TT - 1);
-            accs[q] += yd * (d * (float)sc_v) * (float)isum;
-            accs[q] -= yd * (dm * (float)m_v) * (float)qsum;
-        }
-    }
-    __shared__ double sh32[32];
-    for (int ti = 0; ti < t; ti++) {
-        double acc = (double)accs[ti & (TT - 1)];
-        if (l >= 32) sh32[l - 32] = acc;
-        __syncthreads();
-        if (l < 32) {
-            acc += sh32[l];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
-        }
-        __syncthreads();
-    }
-}
 
 // q6_K MMQ (ty14) — 16원소 그룹: w = nib + 16·hi2 − 32 (qsum 테이블 분해).
 // 그룹 2개/서브블록? 아님 — q6_K 그룹=16원소, 서브블록 32원소=2그룹.
@@ -1805,82 +1624,6 @@ extern "C" __global__ void gemm_q6k_mm(const unsigned* xq, const unsigned* w,
     }
 }
 
-// q6_K 타일 (ty14) — 16원소 그룹, w = nib + 16·hi2 − 32 분해
-extern "C" __global__ void gemm_q6k_bt(const unsigned* xq, const unsigned* w,
-                                       float* out, int n_in, int n_out, int xq_w, int t) {
-    int o = blockIdx.x;
-    int l = threadIdx.x;
-    if (o >= n_out || l >= 64) return;
-    int n_g = n_in >> 4;
-    int cnt = (n_g + 63 - l) >> 6;
-    int blocks = n_in >> 8;
-    int row_base = o * blocks * 210;
-    float accs[TT];
-    #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
-    for (int m = 0; m < cnt; m++) {
-        int g = l + (m << 6);
-        int blk = g >> 4;
-        int kloc = g - (blk << 4);
-        int wb = row_base + blk * 210;
-        int h = kloc >> 3;
-        int src = (kloc - (h << 3)) >> 1;
-        int p = kloc & 1;
-        float d = f16w(w, wb + 208);
-        int sc = sext8(byte(w, wb + 192 + kloc));
-        int ql_rel = h * 64 + p * 16 + ((src & 1) << 5);
-        int qh_rel = 128 + h * 32 + p * 16;
-        bool al = (wb & 3) == 0;
-        int qlw = (wb + ql_rel) >> 2;
-        int qhw = (wb + qh_rel) >> 2;
-        unsigned qa0, qa1, qa2, qa3, ha0, ha1, ha2, ha3;
-        if (al) {
-            qa0 = w[qlw]; qa1 = w[qlw+1]; qa2 = w[qlw+2]; qa3 = w[qlw+3];
-            ha0 = w[qhw]; ha1 = w[qhw+1]; ha2 = w[qhw+2]; ha3 = w[qhw+3];
-        } else {
-            qa0 = (w[qlw] >> 16) | (w[qlw+1] << 16);
-            qa1 = (w[qlw+1] >> 16) | (w[qlw+2] << 16);
-            qa2 = (w[qlw+2] >> 16) | (w[qlw+3] << 16);
-            qa3 = (w[qlw+3] >> 16) | (w[qlw+4] << 16);
-            ha0 = (w[qhw] >> 16) | (w[qhw+1] << 16);
-            ha1 = (w[qhw+1] >> 16) | (w[qhw+2] << 16);
-            ha2 = (w[qhw+2] >> 16) | (w[qhw+3] << 16);
-            ha3 = (w[qhw+3] >> 16) | (w[qhw+4] << 16);
-        }
-        int nsh = (src == 0 || src == 1) ? 0 : 4;
-        int hsh = 2 * src;
-        unsigned wv0 = ((qa0 >> nsh) & 0x0F0F0F0Fu) + ((((ha0 >> hsh) & 0x03030303u)) << 4);
-        unsigned wv1 = ((qa1 >> nsh) & 0x0F0F0F0Fu) + ((((ha1 >> hsh) & 0x03030303u)) << 4);
-        unsigned wv2 = ((qa2 >> nsh) & 0x0F0F0F0Fu) + ((((ha2 >> hsh) & 0x03030303u)) << 4);
-        unsigned wv3 = ((qa3 >> nsh) & 0x0F0F0F0Fu) + ((((ha3 >> hsh) & 0x03030303u)) << 4);
-        int xw = (g << 4) >> 2;
-        for (int ti = 0; ti < t; ti++) {
-            const unsigned* xt = xq + ti * xq_w;
-            int isum = 0;
-            unsigned y0v = xt[xw], y1v = xt[xw+1], y2v = xt[xw+2], y3v = xt[xw+3];
-            isum = dot4(wv0, y0v, isum); isum = dot4(wv1, y1v, isum);
-            isum = dot4(wv2, y2v, isum); isum = dot4(wv3, y3v, isum);
-            isum -= 32 * (int)xt[(n_in >> 2) + (n_in >> 5) + g];
-            float yd = __uint_as_float(xt[(n_in >> 2) + (g >> 1)]);
-            int q = ti & (TT - 1);
-            accs[q] += yd * d * (float)sc * (float)isum;
-        }
-    }
-    __shared__ double sh32[32];
-    for (int ti = 0; ti < t; ti++) {
-        double acc = (double)accs[ti & (TT - 1)];
-        if (l >= 32) sh32[l - 32] = acc;
-        __syncthreads();
-        if (l < 32) {
-            acc += sh32[l];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
-        }
-        __syncthreads();
-    }
-}
 
 // iq4_xs MMQ (ty23) — ktab2 룩업 언팩, 공유 LUT.
 extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
@@ -1997,78 +1740,6 @@ extern "C" __global__ void gemm_xs_mm(const unsigned* xq, const unsigned* w,
     }
 }
 
-// iq4_xs 타일 (ty23) — kvalues 룩업을 m 루프로 호이스트(토큰 불변)
-extern "C" __global__ void gemm_xs_bt(const unsigned* xq, const unsigned* w,
-                                      float* out, const unsigned* ktab2, int n_in, int n_out,
-                                      int xq_w, int t) {
-    __shared__ unsigned kt_s[256];
-    for (int i = threadIdx.x; i < 256; i += 64) kt_s[i] = ktab2[i];
-    __syncthreads();
-
-    int o = blockIdx.x;
-    int l = threadIdx.x;
-    if (o >= n_out || l >= 64) return;
-    int n_sub = n_in >> 5;
-    int cnt = (n_sub + 63 - l) >> 6;
-    int blocks = n_in >> 8;
-    int row_base = o * blocks * 136;
-    float accs[TT];
-    #pragma unroll
-    for (int q = 0; q < TT; q++) accs[q] = 0.0f;
-    for (int m = 0; m < cnt; m++) {
-        int sb = l + (m << 6);
-        int b = sb >> 3;
-        int ib = sb & 7;
-        int wb = row_base + b * 136;
-        int wq = wb >> 2;
-        unsigned w0 = w[wq];
-        float d = bits_f16(w0 & 0xFFFFu);
-        int qw = (wb + 8 + ib * 16) >> 2;
-        int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
-              | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
-        float dl = d * (float)(ls - 32);
-        // 룩업+패킹 — 토큰 불변, 1회
-        unsigned lo[4], hi[4];
-        #pragma unroll
-        for (int k = 0; k < 4; k++) {
-            unsigned qv = w[qw + k];
-            unsigned lov = 0, hiv = 0;
-            #pragma unroll
-            for (int b2 = 3; b2 >= 0; b2--) {
-                unsigned tt2 = kt_s[(qv >> (8 * b2)) & 0xFFu];
-                lov = (lov << 8) | (tt2 & 0xFFu);
-                hiv = (hiv << 8) | (tt2 >> 8);
-            }
-            lo[k] = lov; hi[k] = hiv;
-        }
-        int xw = (sb << 5) >> 2;
-        for (int ti = 0; ti < t; ti++) {
-            const unsigned* xt = xq + ti * xq_w;
-            int isum = 0;
-            isum = dot4(lo[0], xt[xw], isum); isum = dot4(lo[1], xt[xw+1], isum);
-            isum = dot4(lo[2], xt[xw+2], isum); isum = dot4(lo[3], xt[xw+3], isum);
-            isum = dot4(hi[0], xt[xw+4], isum); isum = dot4(hi[1], xt[xw+5], isum);
-            isum = dot4(hi[2], xt[xw+6], isum); isum = dot4(hi[3], xt[xw+7], isum);
-            float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
-            int q = ti & (TT - 1);
-            accs[q] += yd * dl * (float)isum;
-        }
-    }
-    __shared__ double sh32[32];
-    for (int ti = 0; ti < t; ti++) {
-        double acc = (double)accs[ti & (TT - 1)];
-        if (l >= 32) sh32[l - 32] = acc;
-        __syncthreads();
-        if (l < 32) {
-            acc += sh32[l];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
-            if (l == 0) out[(size_t)ti * n_out + o] = (float)acc;
-        }
-        __syncthreads();
-    }
-}
 
 // q4_K (ty12) — 분할 형태, qh 없음 (qs 16..143)
 extern "C" __global__ void gemm_q4k(const unsigned* xq, const unsigned* w,
@@ -2527,47 +2198,6 @@ extern "C" __global__ void gemm_iq3s(const unsigned* xq, const unsigned* w,
     }
 }
 
-// 디버그: row0의 특정 sub 하나만 계산해 part[0]에 기록.
-extern "C" __global__ void gemm_iq3s_sub(const unsigned* xq, const unsigned* w,
-                                         double* part, int n_in, long sub) {
-    int blk = (int)(sub >> 3);
-    int h = (int)(sub & 7);
-    int wb = blk * 110;
-    float d = f16w(w, wb);
-    unsigned scb = byte(w, wb + 106 + (h >> 1));
-    int nib = (h & 1) ? (int)(scb >> 4) : (int)(scb & 0xFu);
-    float db = d * (float)(1 + 2 * nib);
-    unsigned qhb = byte(w, wb + 66 + h);
-    int qs_base = wb + 2 + h * 8;
-    int sg_base = wb + 74 + h * 4;
-    long isum = 0;
-    #pragma unroll
-    for (int ll = 0; ll < 4; ll++) {
-        unsigned idx1 = byte(w, qs_base + 2*ll) | ((qhb << (8 - 2*ll)) & 256u);
-        unsigned idx2 = byte(w, qs_base + 2*ll + 1) | ((qhb << (7 - 2*ll)) & 256u);
-        unsigned g1 = IQ3S_GRID[idx1];
-        unsigned g2 = IQ3S_GRID[idx2];
-        unsigned sgb = byte(w, sg_base + ll);
-        int e0 = 8 * ll;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            int w1 = sext8((g1 >> (8*j)) & 0xFFu) * ((sgb & (1u << j)) ? -1 : 1);
-            int w2 = sext8((g2 >> (8*j)) & 0xFFu) * ((sgb & (1u << (4+j))) ? -1 : 1);
-            int e1 = e0 + j, e2 = e0 + 4 + j;
-            int y1 = sext8(byte(xq, ((sub << 5) + e1)));
-            int y2 = sext8(byte(xq, ((sub << 5) + e2)));
-            isum += (long)w1 * y1 + (long)w2 * y2;
-        }
-    }
-    float yd = __uint_as_float(xq[(n_in >> 2) + sub]);
-    part[0] = (double)(yd * db * (float)isum);
-    part[1] = (double)isum;
-    part[2] = (double)__uint_as_float(__float_as_uint(db));
-    part[3] = (double)d;
-    part[4] = (double)yd;
-    part[5] = (double)(yd * db);
-    part[6] = (double)((yd * db) * (float)isum);
-}
 
 
 // 디버그: expf 비트 동일성 프로브 — host Rust exp와 비교.
@@ -3197,35 +2827,6 @@ extern "C" __global__ void gatedq(const float* o, const float* z, const float* w
 }
 
 // GDN AR state update (cube = (b,h) pair, unit = dv column)
-extern "C" __global__ void gdn_ar(float* s, const float* q, const float* k, const float* v,
-                                  const float* beta_ge, float* out, int d, int k_stride,
-                                  int v_stride, int h_v, int h_k, float scale) {
-    int pair = blockIdx.x;
-    int u = threadIdx.x;
-    if (u >= d) return;
-    int b = pair / h_v;
-    int h = pair % h_v;
-    int kh = h % h_k;
-    int base_s = pair * d * d;
-    int qk0 = b * k_stride + kh * d;
-    int v0 = b * v_stride + h * d;
-    float beta = beta_ge[pair * 2];
-    float g_exp = beta_ge[pair * 2 + 1];
-    float sk = 0.0f;
-    for (int kdim = 0; kdim < d; kdim++) {
-        float sv = s[base_s + u * d + kdim] * g_exp;
-        s[base_s + u * d + kdim] = sv;
-        sk += sv * k[qk0 + kdim];
-    }
-    float delta = (v[v0 + u] - sk) * beta;
-    for (int kdim = 0; kdim < d; kdim++) {
-        s[base_s + u * d + kdim] += k[qk0 + kdim] * delta;
-    }
-    float o = 0.0f;
-    for (int kdim = 0; kdim < d; kdim++)
-        o += (s[base_s + u * d + kdim] * q[qk0 + kdim]) * scale;
-    out[v0 + u] = o;
-}
 // GDN AR — t토큰 순차 (block=128=d_state 열, blockIdx.x=pair)
 extern "C" __global__ void gdn_ar_t(float* s, const float* q, const float* k, const float* v,
                                     const float* beta_ge, float* out, int d, int k_stride,
@@ -3553,27 +3154,6 @@ extern "C" __global__ void gdn_ar_chunk_c2(float* out, const float* q, const flo
     }
 }
 
-// C: 보정 — out[t][u] += scale × Σ_j q[t][j]·P[c][t-c0][j] · s_start[c][j][u]
-// 그리드 (npair, nc*ch) 블록, 128스레드 = u. c≥0 전체 (c=0도 원상태 s0 보정).
-extern "C" __global__ void gdn_ar_chunk_c(float* out, const float* q, const float* pbuf,
-                                          const float* sstart, int d, int k_stride, int v_stride,
-                                          int h_v, int h_k, float scale, int t, int ch, int npair) {
-    int pair = blockIdx.x;
-    int tt = blockIdx.y;          // 전역 타임슬롯 c*ch + r
-    if (tt >= t) return;
-    int u = threadIdx.x;
-    int c = tt / ch;
-    int h = pair % h_v;
-    int kh = h % h_k;
-    int qk0 = tt * k_stride + kh * d;
-    const float* pd = pbuf + (((size_t)c * npair + pair) * ch + (tt - c * ch)) * d;
-    const float* ssc = sstart + ((size_t)c * npair + pair) * d * d;
-    float acc = 0.0f;
-    for (int j = 0; j < d; j++)
-        acc += (q[qk0 + j] * pd[j]) * ssc[u * d + j];  // 전치
-    int v0 = tt * v_stride + h * d;
-    out[v0 + u] += acc * scale;
-}
 
 // L2 norm rows (sequential f64 — l2_rows arithmetic) + scale (q only)
 extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float scale,
@@ -3715,34 +3295,6 @@ extern "C" __global__ void qsa_mix2(const float* q, const float* scores, const f
     out[t * n_head * hd + h * hd + d_i] = a * g;
 }
 
-extern "C" __global__ void qsa_mix(const float* q, const float* scores, const float* cv,
-                                   float* out, int n_past, int n_head, int n_kv,
-                                   int hd, int t_len, int sstride, int pos0) {
-    int d_i = blockIdx.x * blockDim.x + threadIdx.x;
-    int h = blockIdx.y;
-    int t = blockIdx.z;
-    if (d_i >= hd || h >= n_head || t >= t_len) return;
-    int sbase = (t * n_head + h) * sstride;
-    float maxv = scores[sbase];
-    for (int p = 0; p < n_past; p++) {
-        float sv = scores[sbase + p];
-        if (sv > maxv) maxv = sv;
-    }
-    float sum = exp_cr(scores[sbase] - maxv);
-    for (int p = 1; p < n_past; p++) sum += exp_cr(scores[sbase + p] - maxv);
-    int kvh = h / (n_head / n_kv);
-    float a = 0.0f;
-    for (int p = 0; p < n_past; p++) {
-        float w = exp_cr(scores[sbase + p] - maxv) / sum;
-        if (w != 0.0f) {
-            int kb = p * n_kv * hd + kvh * hd;
-            a += w * cv[kb + d_i];
-        }
-    }
-    int gb = t * n_head * 2 * hd + h * 2 * hd + hd;
-    float g = 1.0f / (1.0f + exp_cr(-q[gb + d_i]));
-    out[t * n_head * hd + h * hd + d_i] = a * g;
-}
 
 // QSA fused flash: score+softmax+mix 단일 패스 (KV 타일 online-softmax).
 // 블록=(t,h) 256스레드, d=tid (hd<=256). q 1회 적재 후 전 p 재사용.
@@ -3936,269 +3488,6 @@ extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, c
     }
 }
 
-// QSA split flash, q 2행 다중화 — ck/cv 1회 로드로 t쌍 공유 (K/V 트래픽 ½).
-extern "C" __global__ void qsa_flash_split4q2(const float* q, const float* ck, const float* cv,
-                                              const unsigned* mask, float* part,
-                                              int n_past, int n_head, int n_kv,
-                                              int hd, int t_len, int sstride, int pos0, int seg) {
-    int t0 = blockIdx.x * 2;
-    int h = blockIdx.y;
-    int sg = blockIdx.z;
-    if (t0 >= t_len || h >= n_head) return;
-    bool has1 = (t0 + 1) < t_len;
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int wid = tid >> 5;
-    bool active = tid < hd;
-    __shared__ float qf[2][256];
-    __shared__ float rs[2][4][8];
-    __shared__ float ds[2][4];
-    int kvh = h / (n_head / n_kv);
-    int qb0 = t0 * n_head * 2 * hd + h * 2 * hd;
-    if (active) {
-        qf[0][tid] = q[qb0 + tid];
-        if (has1) qf[1][tid] = q[qb0 + n_head * 2 * hd + tid];
-    }
-    __syncthreads();
-    float m[2] = { -3.4028235e38f, -3.4028235e38f };
-    float s[2] = { 0.0f, 0.0f };
-    float acc[2] = { 0.0f, 0.0f };
-    int p0 = sg * seg;
-    int p1 = min(p0 + seg, n_past);
-    int mrow0 = (pos0 + t0) * sstride;
-    int mrow1 = mrow0 + sstride;
-    for (int pb = p0; pb < p1; pb += 4) {
-        int np = min(4, p1 - pb);
-        float x[2][4] = {};
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < np) {
-                bool mk0 = mask[mrow0 + pb + j] != 0u;
-                bool mk1 = has1 && mask[mrow1 + pb + j] != 0u;
-                if (mk0 || mk1) {
-                    int kb = (pb + j) * n_kv * hd + kvh * hd;
-                    float kv = active ? ck[kb + tid] : 0.0f;
-                    if (active) {
-                        if (mk0) x[0][j] = qf[0][tid] * kv;
-                        if (mk1) x[1][j] = qf[1][tid] * kv;
-                    }
-                }
-            }
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            #pragma unroll
-            for (int r = 0; r < 2; r++) {
-                x[r][0] += __shfl_down_sync(0xffffffffffffffffull, x[r][0], off);
-                x[r][1] += __shfl_down_sync(0xffffffffffffffffull, x[r][1], off);
-                x[r][2] += __shfl_down_sync(0xffffffffffffffffull, x[r][2], off);
-                x[r][3] += __shfl_down_sync(0xffffffffffffffffull, x[r][3], off);
-            }
-        }
-        if (lane == 0) {
-            #pragma unroll
-            for (int r = 0; r < 2; r++) {
-                rs[r][0][wid] = x[r][0]; rs[r][1][wid] = x[r][1];
-                rs[r][2][wid] = x[r][2]; rs[r][3][wid] = x[r][3];
-            }
-        }
-        __syncthreads();
-        if (wid == 0) {
-            #pragma unroll
-            for (int r = 0; r < 2; r++) {
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    float y = lane < 8 ? rs[r][j][lane] : 0.0f;
-                    #pragma unroll
-                    for (int off = 4; off > 0; off >>= 1)
-                        y += __shfl_down_sync(0xffffffffffffffffull, y, off);
-                    if (lane == 0) ds[r][j] = y;
-                }
-            }
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            float gm = m[r];
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                if (j < np) gm = fmaxf(gm, ds[r][j]);
-            float e_m = __expf(m[r] - gm);
-            s[r] *= e_m;
-            acc[r] *= e_m;
-            m[r] = gm;
-        }
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < np) {
-                int kb = (pb + j) * n_kv * hd + kvh * hd;
-                float vv = active ? cv[kb + tid] : 0.0f;
-                #pragma unroll
-                for (int r = 0; r < 2; r++) {
-                    if (r == 0 || has1) {
-                        float e_d = __expf(ds[r][j] - m[r]);
-                        s[r] += e_d;
-                        acc[r] += e_d * vv;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-    if (!active) return;
-    int nseg = (n_past + seg - 1) / seg;
-    #pragma unroll
-    for (int r = 0; r < 2; r++) {
-        if (r == 0 || has1) {
-            float* pp2 = part + ((size_t)((t0 + r) * n_head + h) * nseg + sg) * (hd + 2);
-            pp2[tid] = acc[r];
-            if (tid == 0) { pp2[hd] = m[r]; pp2[hd + 1] = s[r]; }
-        }
-    }
-}
-// QSA split flash, p 4배 배치 — 로드 ILP 4× + sync 상환 4×. (수치: p 그룹 내
-// 결합 순서만 변경 — 합은 교환법칙, 게이트 전 최종 스케일 불변.)
-extern "C" __global__ void qsa_flash_split4(const float* q, const float* ck, const float* cv,
-                                            const unsigned* mask, float* part,
-                                            int n_past, int n_head, int n_kv,
-                                            int hd, int t_len, int sstride, int pos0, int seg) {
-    int t = blockIdx.x;
-    int h = blockIdx.y;
-    int sg = blockIdx.z;
-    if (t >= t_len || h >= n_head) return;
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int wid = tid >> 5;
-    bool active = tid < hd;
-    __shared__ float qf[256];
-    __shared__ float rs[4][8];
-    __shared__ float ds[4];
-    int kvh = h / (n_head / n_kv);
-    int qb = t * n_head * 2 * hd + h * 2 * hd;
-    if (active) qf[tid] = q[qb + tid];
-    __syncthreads();
-    float m = -3.4028235e38f;
-    float s = 0.0f;
-    float acc = 0.0f;
-    int p0 = sg * seg;
-    int p1 = min(p0 + seg, n_past);
-    int mrow = (pos0 + t) * sstride;
-    for (int pb = p0; pb < p1; pb += 4) {
-        int np = min(4, p1 - pb);
-        // 4 스코어 부분합 (마스크 0 → 기여 0 처리)
-        float x[4] = {0, 0, 0, 0};
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < np && mask[mrow + pb + j] != 0u) {
-                int kb = (pb + j) * n_kv * hd + kvh * hd;
-                if (active) x[j] = qf[tid] * ck[kb + tid];
-            }
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            x[0] += __shfl_down_sync(0xffffffffffffffffull, x[0], off);
-            x[1] += __shfl_down_sync(0xffffffffffffffffull, x[1], off);
-            x[2] += __shfl_down_sync(0xffffffffffffffffull, x[2], off);
-            x[3] += __shfl_down_sync(0xffffffffffffffffull, x[3], off);
-        }
-        if (lane == 0) { rs[0][wid] = x[0]; rs[1][wid] = x[1]; rs[2][wid] = x[2]; rs[3][wid] = x[3]; }
-        __syncthreads();
-        if (wid == 0) {
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                float y = lane < 8 ? rs[j][lane] : 0.0f;
-                #pragma unroll
-                for (int off = 4; off > 0; off >>= 1)
-                    y += __shfl_down_sync(0xffffffffffffffffull, y, off);
-                if (lane == 0) ds[j] = y;
-            }
-        }
-        __syncthreads();
-        // 그룹 온라인 소프트맥스 (그룹 내 최댓값 먼저)
-        float gm = m;
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            if (j < np) gm = fmaxf(gm, ds[j]);
-        float e_m = __expf(m - gm);
-        s *= e_m;
-        acc *= e_m;
-        m = gm;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            if (j < np) {
-                float e_d = __expf(ds[j] - m);
-                s += e_d;
-                int kb = (pb + j) * n_kv * hd + kvh * hd;
-                float vv = active ? cv[kb + tid] : 0.0f;
-                acc += e_d * vv;
-            }
-        }
-        __syncthreads();
-    }
-    if (!active) return;
-    int nseg = (n_past + seg - 1) / seg;
-    float* pp2 = part + ((size_t)(t * n_head + h) * nseg + sg) * (hd + 2);
-    pp2[tid] = acc;
-    if (tid == 0) { pp2[hd] = m; pp2[hd + 1] = s; }
-}
-// QSA split flash (flash-decoding): p-세그먼트 병렬 + 병합. KV 긴 구간 p-직렬 지연 해소.
-// 파셜 레이아웃 [t][h][seg][hd+2]: [0..hd)=acc, [hd]=m, [hd+1]=s.
-extern "C" __global__ void qsa_flash_split(const float* q, const float* ck, const float* cv,
-                                           const unsigned* mask, float* part,
-                                           int n_past, int n_head, int n_kv,
-                                           int hd, int t_len, int sstride, int pos0, int seg) {
-    int t = blockIdx.x;
-    int h = blockIdx.y;
-    int sg = blockIdx.z;
-    if (t >= t_len || h >= n_head) return;
-    int tid = threadIdx.x;              // 0..255
-    int lane = tid & 31;
-    int wid = tid >> 5;
-    bool active = tid < hd;
-    __shared__ float qf[256];
-    __shared__ float rs[8];
-    int kvh = h / (n_head / n_kv);
-    int qb = t * n_head * 2 * hd + h * 2 * hd;
-    if (active) qf[tid] = q[qb + tid];
-    __syncthreads();
-    float m = -3.4028235e38f;
-    float s = 0.0f;
-    float acc = 0.0f;
-    int p0 = sg * seg;
-    int p1 = min(p0 + seg, n_past);
-    for (int p = p0; p < p1; p++) {
-        if (mask[(pos0 + t) * sstride + p] == 0u) continue;
-        int kb = p * n_kv * hd + kvh * hd;
-        float x = active ? qf[tid] * ck[kb + tid] : 0.0f;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            x += __shfl_down_sync(0xffffffffffffffffull, x, off);
-        if (lane == 0) rs[wid] = x;
-        __syncthreads();
-        if (wid == 0) {
-            float y = lane < 8 ? rs[lane] : 0.0f;
-            #pragma unroll
-            for (int off = 4; off > 0; off >>= 1)
-                y += __shfl_down_sync(0xffffffffffffffffull, y, off);
-            if (lane == 0) rs[0] = y;
-        }
-        __syncthreads();
-        float d = rs[0];
-        float m_new = fmaxf(m, d);
-        float e_m = __expf(m - m_new);
-        float e_d = __expf(d - m_new);
-        s = s * e_m + e_d;
-        float vv = active ? cv[kb + tid] : 0.0f;
-        acc = acc * e_m + e_d * vv;
-        m = m_new;
-    }
-    if (!active) return;
-    // 파셜 기록 (세그먼트 빈 경우 m=-inf, s=0 — 병합에서 자연 기여 0)
-    int nseg = (n_past + seg - 1) / seg;
-    float* pp2 = part + ((size_t)(t * n_head + h) * nseg + sg) * (hd + 2);
-    pp2[tid] = acc;
-    if (tid == 0) { pp2[hd] = m; pp2[hd + 1] = s; }
-}
 // 병합: out = Σ acc_i·e^(m_i−M) / Σ s_i·e^(m_i−M), 게이트 적용.
 // warp-per-query flash (llama fattn-tile 구조 차용): 블록 32쿼리(워프당 4),
 // 키 루프 내 sync/shared 왕복 없음 — k/v 재로드는 L1 흡수.
@@ -4487,97 +3776,8 @@ extern "C" __global__ void pack_strided(const float* src, float* dst, int n, int
 
 // ─── np×spec (plans/18): 행별 포인터/위치 색인 변형 — seq-major 그룹 전제 ───
 
-extern "C" __global__ void kv_append_t_ms(const float* src, float* const* dst,
-                                          const int* offs, int n, int t) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y;
-    if (j >= n || y >= t) return;
-    dst[y][(size_t)offs[y] * n + j] = src[(size_t)y * n + j];
-}
 
-extern "C" __global__ void qk_norm_rope_ms(float* xq, float* xk, const float* qw, const float* kw,
-                                           const float* cs, float eps, float kqs, const int* poss,
-                                           int n_head, int n_kv, int hd, int n_rot) {
-    int r0 = blockIdx.x;
-    int u = threadIdx.x;
-    int y = blockIdx.y;
-    if (r0 >= n_head + n_kv || u != 0) return;
-    bool is_q = r0 < n_head;
-    int half = n_rot >> 1;
-    int csbase = poss[y] * half * 2;
-    int row_base = is_q ? y * (n_head * 2 * hd) + r0 * 2 * hd
-                        : y * (n_kv * hd) + (r0 - n_head) * hd;
-    float* xv = is_q ? xq : xk;
-    const float* wv = is_q ? qw + r0 * hd : kw + (r0 - n_head) * hd;
-    float ms = 0.0f;
-    for (int i = 0; i < hd; i++) ms += xv[row_base + i] * xv[row_base + i];
-    float inv = rsqrtf(ms + eps);
-    for (int i = 0; i < hd; i++) xv[row_base + i] *= inv * wv[i];
-    for (int i = 0; i < half; i++) {
-        float a = xv[row_base + i];
-        float b2 = xv[row_base + i + half];
-        float c = cs[csbase + i * 2];
-        float sn = cs[csbase + i * 2 + 1];
-        xv[row_base + i] = a * c - b2 * sn;
-        xv[row_base + i + half] = a * sn + b2 * c;
-    }
-}
 
-extern "C" __global__ void qsa_flash_ms(const float* q, const float* const* cks,
-                                        const float* const* cvs, const unsigned* mask, float* out,
-                                        const int* nps, const int* p0s,
-                                        int n_head, int n_kv, int hd, int t_len, int sstride) {
-    int t = blockIdx.x;
-    int h = blockIdx.y;
-    if (t >= t_len || h >= n_head) return;
-    const float* ck = cks[t];
-    const float* cv = cvs[t];
-    int n_past = nps[t];
-    int pos = p0s[t];
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int wid = tid >> 5;
-    bool active = tid < hd;
-    __shared__ float qf[256];
-    __shared__ float rs[8];
-    int kvh = h / (n_head / n_kv);
-    int qb = t * n_head * 2 * hd + h * 2 * hd;
-    if (active) qf[tid] = q[qb + tid];
-    __syncthreads();
-    float m = -3.4028235e38f;
-    float sm = 0.0f;
-    float acc = 0.0f;
-    for (int pp = 0; pp < n_past; pp++) {
-        if (mask[pos * sstride + pp] == 0u) continue;
-        int kb = pp * n_kv * hd + kvh * hd;
-        float x = active ? qf[tid] * ck[kb + tid] : 0.0f;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            x += __shfl_down_sync(0xffffffffffffffffull, x, off);
-        if (lane == 0) rs[wid] = x;
-        __syncthreads();
-        float d;
-        if (wid == 0) {
-            float y2 = lane < 8 ? rs[lane] : 0.0f;
-            #pragma unroll
-            for (int off = 4; off > 0; off >>= 1)
-                y2 += __shfl_down_sync(0xffffffffffffffffull, y2, off);
-            if (lane == 0) rs[0] = y2;
-        }
-        __syncthreads();
-        d = rs[0];
-        float m_new = fmaxf(m, d);
-        float e_m = __expf(m - m_new);
-        float e_d = __expf(d - m_new);
-        sm = sm * e_m + e_d;
-        float vv = active ? cv[kb + tid] : 0.0f;
-        acc = acc * e_m + e_d * vv;
-        m = m_new;
-    }
-    if (!active) return;
-    float g = 1.0f / (1.0f + exp_cr(-q[qb + hd + tid]));
-    out[t * n_head * hd + h * hd + tid] = acc * (1.0f / sm) * g;
-}
 
 extern "C" __global__ void gdn_conv_t2_ms(const float* qkv, const float* cw, float* const* states,
                                           float* out, int ch, int k, int t,
@@ -4637,67 +3837,6 @@ extern "C" __global__ void gdn_conv_state_ms(const float* qkv, float* const* sta
     states[ti][j * ch + c] = qkv[(size_t)ti * ch + c];
 }
 
-extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, const float* k, const float* v,
-                                       const float* beta_ge, float* out, int d, int k_stride,
-                                       int v_stride, int h_v, int h_k, float scale, int t,
-                                       const int* row_seq) {
-    int pair = blockIdx.x;
-    int u = blockIdx.y;
-    int lane = threadIdx.x;
-    int base_s = pair * d * d;
-    float* st = states[row_seq[0]];
-    float ssr[4];
-    #pragma unroll
-    for (int j = 0; j < 4; j++)
-        ssr[j] = st[base_s + u * d + ((lane << 2) + j)];  // 전치
-    for (int ti = 0; ti < t; ti++) {
-        if (ti > 0 && row_seq[ti] != row_seq[ti - 1]) {
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                st[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
-            st = states[row_seq[ti]];
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-                ssr[j] = st[base_s + u * d + ((lane << 2) + j)];  // 전치
-        }
-        int h = pair % h_v;
-        int kh = h % h_k;
-        int qk0 = ti * k_stride + kh * d;
-        int v0 = ti * v_stride + h * d;
-        float beta = beta_ge[ti * h_v * 2 + pair * 2];
-        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
-        float part = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            ssr[j] *= g_exp;
-            part += ssr[j] * k[qk0 + (lane << 2) + j];
-        }
-        float sk = part;
-        #pragma unroll
-        for (int off = 1; off < 32; off <<= 1) {
-            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
-            sk += pj;
-        }
-        float delta = (v[v0 + u] - sk) * beta;
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            ssr[j] += k[qk0 + (lane << 2) + j] * delta;
-        float op = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-            op += ssr[j] * q[qk0 + (lane << 2) + j];
-        float otot = op;
-        #pragma unroll
-        for (int off = 1; off < 32; off <<= 1) {
-            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
-            otot += pj;
-        }
-        if (lane == 0) out[v0 + u] = otot * scale;
-    }
-    #pragma unroll
-    for (int j = 0; j < 4; j++)
-        st[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
-}
 
 "#;
 
@@ -4705,11 +3844,11 @@ extern "C" __global__ void gdn_ar_w_ms(float* const* states, const float* q, con
 
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq", "reduce64",
+    "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq",
     "gemm_xs", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
-    "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "gdn_ar", "l2_rows2_scale", "split3",
-    "qsa_score", "qsa_mix", "qsa_mix2", "qsa_flash", "qsa_flash_split", "qsa_flash_split4", "qsa_flash_split4q2", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "gemm_iq3s_sub", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_w_swap", "gemm_q5k_v2", "gemm_q8_0_dual", "gdn_ar_sm", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "gemm_q5k_bt", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "kv_append_t_ms", "qk_norm_rope_ms", "qsa_flash_ms", "gdn_conv_t2_ms", "gdn_conv_t2_ms_f32", "gdn_conv_state_ms", "gdn_ar_w_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t", "gemm_q4k_bt", "gemm_q6k_bt", "gemm_xs_bt",
+    "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "l2_rows2_scale", "split3",
+    "qsa_score", "qsa_mix2", "qsa_flash", "qsa_flash_split4q4", "qsa_flash_wk", "qsa_flash_merge", "mfma_roof", "gemm_iq3s", "exp_probe", "dp4a_probe", "bw_probe", "q6k_ab", "tree_probe", "gdn_conv_t", "gdn_conv_t2", "gdn_conv_t2_f32", "gdn_conv_state", "gdn_ar_w_swap", "gemm_q5k_v2", "gemm_q8_0_dual", "gdn_ar_sm", "gdn_ar_t", "gdn_ar_w", "gdn_ar_chunk_a", "gdn_ar_chunk_b", "gdn_ar_chunk_c2", "l2_rows2_scale_w", "kv_append_t", "dot_roof", "gemm_q5k_mm", "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm", "gemm_q4k_mm", "gemm_q6k_mm", "gemm_xs_mm", "argmax64", "gdn_conv_t2_ms", "gdn_conv_t2_ms_f32", "gdn_conv_state_ms", "add_f32", "pack_strided", "gemm_f32t", "layernorm_t", "vit_rope", "flash_vit", "gelu_t",
 ];
 // ─── 원시 HIP ew 계열 (큐브cl ew.rs 산술 이식, 다음 검증 대상) ───
 

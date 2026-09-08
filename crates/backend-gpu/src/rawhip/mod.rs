@@ -309,7 +309,6 @@ impl RawCtx {
         Ok(v[0])
     }
 
-    pub fn scratch_rewind(&self) {}
 
     /// 영속 디바이스 할당 (해제 없음).
     pub fn alloc(&self, bytes: usize) -> Result<*mut u8, String> {
@@ -368,26 +367,6 @@ impl RawCtx {
         Ok(())
     }
 
-    pub fn gemv_iq3s_sub4(&self, xq: *const u8, w: *const u8, n_in: usize, sub: usize) -> Result<[f64; 8], String> {
-        let part = self.scratch(64)?;
-        let mut xq_p = xq as *mut std::ffi::c_void;
-        let mut w_p = w as *mut std::ffi::c_void;
-        let mut part_p = part as *mut std::ffi::c_void;
-        let mut ni = n_in as i32;
-        let mut sb = sub as i64;
-        let mut args = vec![
-            &mut xq_p as *mut _ as *mut std::ffi::c_void,
-            &mut w_p as *mut _ as *mut std::ffi::c_void,
-            &mut part_p as *mut _ as *mut std::ffi::c_void,
-            &mut ni as *mut _ as *mut std::ffi::c_void,
-            &mut sb as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.launch("gemm_iq3s_sub", 1, 1, 1, &mut args)?;
-        self.sync()?;
-        let mut r = [0f64; 8];
-        self.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
-        Ok(r)
-    }
 
     /// 3차원 그리드 런치 (qsa용 — gy 추가).
     #[allow(clippy::too_many_arguments)]
@@ -1136,11 +1115,6 @@ impl RawCtx {
         Ok(())
     }
 
-    /// 버퍼 센티널 기입 (디버그) — 미기록 판별.
-    pub fn fill_f32(&self, dst: *mut u8, n: usize, v: f32) -> Result<(), String> {
-        let vs = vec![v; n];
-        self.h2d(dst, bytemuck::cast_slice(&vs))
-    }
 
     /// 활성 양자화 — quantize_row_q8_ref 비트 미러. 출력은 xq 하나:
     /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
