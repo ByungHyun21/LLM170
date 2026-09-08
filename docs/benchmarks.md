@@ -5,6 +5,14 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+## Refactor no-regression gate (2026-09-08, plans/35)
+
+Behavior-invariant refactor (dead-kernel pruning, gemv generation collapse,
+file splits). Vulkan baselines on q35work.gguf, 3-run medians: tg32 7.06
+t/s, pp512 (VK_TILE+VKD_BATCH opt-in) 65.95 t/s. A side A/B settled the
+q6_K route: gemv3+quant 7.06 vs opt-in gemv6 6.71 t/s — the promoted
+default stays; gemv4/5/6/7 families deleted (ADR-0019).
+
 ## Engine modes (2026-09-05, user decision)
 
 Default = WMMA fast mode (quality: llama.cpp MMA class — measured logits
