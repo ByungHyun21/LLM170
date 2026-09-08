@@ -474,7 +474,7 @@ impl DecodeState {
     pub fn step(&self, seq: usize, pos: usize) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
         let _ = &t0;
-        self.ctx.scratch_rewind();
+
         let n = self.n_embd;
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
@@ -919,11 +919,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<(), String> {
         let ctx = RawCtx::new()?;
         let ds = DecodeState::new(ctx, hp, weights, consts, n_seqs, ctx_len, is_recr)?;
-        if std::env::var_os("LLM170_MICRO_PROBE").is_some() {
-            if let Ok(msg) = ds.micro_probe(200) {
-                eprintln!("{msg}");
-            }
-        }
+
         *self.st.lock().map_err(|e| e.to_string())? = Some(ds);
         Ok(())
     }
@@ -1903,39 +1899,6 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         Ok(())
     }
 
-    /// 마이크로 프로브: h2d/launch/d2h 단가.
-    pub fn micro_probe(&self, iters: usize) -> Result<String, String> {
-        let n = self.n_embd;
-        let buf = vec![0f32; n];
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            self.ctx.h2d(self.mtp_e, bytemuck::cast_slice(&buf))?;
-        }
-        self.ctx.sync()?;
-        let h2d = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
-        let t1 = std::time::Instant::now();
-        for _ in 0..iters {
-            self.quant(self.mtp_e, self.mtp_xq, n)?;
-            self.mm_direct(self.mtp_xq, wq, tq, niq, noq, self.aq)?;
-        }
-        self.ctx.sync()?;
-        let gemv = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let mut b8 = [0u8; 8];
-        let t2 = std::time::Instant::now();
-        for _ in 0..iters {
-            self.ctx.d2h(&mut b8, self.ctx.scratch(16)?)?;
-        }
-        let d2h = t2.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let t3 = std::time::Instant::now();
-        for _ in 0..iters {
-            self.rms(self.mtp_e, self.mtp_e, self.mtp_h, n)?;
-        }
-        self.ctx.sync()?;
-        let rms2 = t3.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        Ok(format!("probe: h2d={h2d:.3}ms gemv2l={gemv:.3}ms d2h={d2h:.3}ms rms2l={rms2:.3}ms"))
-    }
-
     /// 정규화 입력 x → output GEMV → GPU argmax
     fn head_argmax_gpu(&self, x: *mut u8) -> Result<u32, String> {
         let n = self.n_embd;
@@ -2234,22 +2197,6 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             out.push(row.clone());
         }
         Ok(out)
-    }
-
-    /// 상태 체크섬 (np 프리필 상호오염 검출용).
-    pub fn state_cksum(&self, seq: usize) -> Result<(u64, u64), String> {
-        let (gdn_len, conv_len) = (self.dt_rank * self.d_state * self.d_state, (self.conv_k - 1) * (self.d_inner + 2 * self.dt_rank));
-        let mut xg = vec![0f32; gdn_len];
-        let mut xc = vec![0f32; conv_len];
-        let mut sg: u64 = 0;
-        let mut sc: u64 = 0;
-        for il in 0..self.st_gdn.len() {
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut xg).as_mut(), self.st_gdn[il][seq])?;
-            for &v in &xg { sg ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15).rotate_left((il % 8) as u32); }
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut xc).as_mut(), self.st_conv[il][seq])?;
-            for &v in &xc { sc ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15).rotate_left((il % 8) as u32); }
-        }
-        Ok((sg, sc))
     }
 
     /// np×spec 병합 verify (plans/18) — seq-major 행 그룹. group_starts[i] = seq_i 그룹의
