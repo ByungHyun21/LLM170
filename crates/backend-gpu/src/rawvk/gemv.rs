@@ -978,8 +978,13 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(b.buf);
         off += sz;
     }
+    let mut dummy = ctx.alloc_host(16)?;
+    {
+        let z = [0u8; 16];
+        unsafe { std::ptr::copy_nonoverlapping(z.as_ptr(), dummy.ptr, 16) };
+    }
     while wbufs.len() < 8 {
-        wbufs.push(wbufs[0]);
+        wbufs.push(dummy.buf);
     }
     let chunk_words = (ch / 4) as u32;
     let spv_path = match w.ty {
