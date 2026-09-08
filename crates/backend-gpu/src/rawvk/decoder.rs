@@ -2,21 +2,11 @@
 //! 커널 8종은 gdn-check ★ 검증 완료. 기존 gemv/quant/rms/silu SPIR-V 재사용.
 //! rawhip DecodeState 대칭 — 배치 모드(단일 제출+배리어).
 
-use crate::rawvk::context::{VkBuf, VkCtx};
+use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
 use std::collections::HashMap;
 
 const GDN_CONV_SPV: &[u8] = include_bytes!("spv/gdn_conv_t.spv");
-const GEMV4_Q8_SPV: &[u8] = include_bytes!("spv/gemv4_q8.spv");
-const GEMV4_Q5_SPV: &[u8] = include_bytes!("spv/gemv4_q5.spv");
-const GEMV4_XS_SPV: &[u8] = include_bytes!("spv/gemv4_xs.spv");
-const GEMV5_XS_SPV: &[u8] = include_bytes!("spv/gemv5_xs.spv");
-const GEMV5_Q5_SPV: &[u8] = include_bytes!("spv/gemv5_q5.spv");
-const GEMV6_Q5_SPV: &[u8] = include_bytes!("spv/gemv6_q5.spv");
-const GEMV6_XS_SPV: &[u8] = include_bytes!("spv/gemv6_xs.spv");
-const GEMV6_Q6_SPV: &[u8] = include_bytes!("spv/gemv6_q6.spv");
-const GEMV6_Q4_SPV: &[u8] = include_bytes!("spv/gemv6_q4.spv");
-const GEMV6_Q3_SPV: &[u8] = include_bytes!("spv/gemv6_q3.spv");
 const GEMV8_Q5_SPV: &[u8] = include_bytes!("spv/gemv8_q5.spv");
 const GEMV8_Q4_SPV: &[u8] = include_bytes!("spv/gemv8_q4.spv");
 const GEMV8_XS_SPV: &[u8] = include_bytes!("spv/gemv8_xs.spv");
@@ -92,14 +82,6 @@ pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
 }
 
-struct Pipes {
-    pl: vk::PipelineLayout,
-    ds: vk::DescriptorSet,
-    pipe: vk::Pipeline,
-    dsl: vk::DescriptorSetLayout,
-    pool: vk::DescriptorPool,
-}
-
 pub struct DecoderState {
     ctx: VkCtx,
     w: HashMap<String, (Vec<VkBuf>, u32, usize, usize)>,
@@ -141,7 +123,6 @@ pub struct DecoderState {
     // 스크래치 (t_max)
     b_xs: VkBuf,
     b_xn: VkBuf,
-    b_ydev: VkBuf,   // 디바이스 메모리 y 스테이징 (G4_YDEV 실험)
     b_xq_n: VkBuf,
     b_xq_f: VkBuf,
     b_xq_g: VkBuf,
@@ -529,13 +510,7 @@ impl DecoderState {
             cmap.insert(name, b);
         }
         // gemv 공유 테이블
-        let kv: Vec<u32> = (0..256u32)
-            .map(|b| {
-                let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-                let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-                lo | (hi << 8)
-            })
-            .collect();
+        let kv: Vec<u32> = llm170_core::ktab2_packed();
         let mut ktab = ctx.alloc(1024)?;
         unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr(), ktab.ptr as *mut u32, 256) };
         ctx.unmap(&mut ktab)?;
@@ -606,10 +581,6 @@ impl DecoderState {
                 a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(T_MAX * n)?, a(8)?,
             )
         };
-        // y 디바이스 스테이징 — GTT 더티라인 가설 실험 (LLM170_G4_YDEV=1)
-        let b_ydev = ctx
-            .alloc(T_MAX * hp.n_ff.max(n) * 4)
-            .map_err(|e| e.to_string())?;
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
         let (mut mkk, mut mvv) = (Vec::new(), Vec::new());
         if mtp_on {
@@ -793,7 +764,6 @@ impl DecoderState {
             dummy,
             b_xs,
             b_xn,
-            b_ydev,
             b_xq_n,
             b_xq_f,
             b_xq_g,
@@ -852,8 +822,8 @@ impl DecoderState {
     /// 파이프라인 지연 생성 캐시.
     fn pipe(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32) -> Result<&Pipes, String> {
         if !self.pipes.contains_key(name) {
-            let (dsl, pl, pool, ds, pipe) = self.ctx.pipeline(spv, n_buf, pb)?;
-            self.pipes.insert(name, Pipes { pl, ds, pipe, dsl, pool });
+            let p = self.ctx.pipeline_pipes(spv, n_buf, pb)?;
+            self.pipes.insert(name, p);
         }
         Ok(self.pipes.get(name).unwrap())
     }
@@ -870,20 +840,9 @@ impl DecoderState {
                 self.ctx.begin_batch()?;
             }
         }
-        let (pl, ds_default, pipe, dsl, pool) = {
-            let p = self.pipe(name, spv, n_buf, pb)?;
-            (p.pl, p.ds, p.pipe, p.dsl, p.pool)
-        };
-        let ds = if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
-            self.ctx.batch_dsl.set(Some((dsl, pool)));
-            let ds = self.ctx.fresh_ds(n_buf)?;
-            self.ctx.bind_bufs(ds, bufs);
-            ds
-        } else {
-            self.ctx.bind_bufs(ds_default, bufs);
-            ds_default
-        };
-        let r = self.ctx.run(pl, ds, pipe, push, gx, gy, gz);
+        let p = *self.pipe(name, spv, n_buf, pb)?;
+        let ds = self.ctx.bind_ds(&p, bufs)?;
+        let r = self.ctx.run(p.pl, ds, p.pipe, push, gx, gy, gz);
         if self.ktime {
             let e = t0k.elapsed().as_secs_f64() * 1e3;
             let key = self.kkey.borrow_mut().take().unwrap_or_else(|| name.to_string());
@@ -906,34 +865,6 @@ impl DecoderState {
             &[src, xq], &push, (n / 32 + 63) as u32 / 64, t as u32, 1)
     }
 
-    /// GEMV (12바인딩 gemv3): xq × 가중 → out.
-    /// t≥2 + q5_K는 coopmat 128행 타일 (plans/20 — f16 스테이징 MMA,
-    /// gemv5 (plans/33) — llama MMQ 정수 dot(OpSDot) 경로. 활성 xq(q8), W4A8 계열.
-    /// xs(ktab LUT)와 q5(산술 언팩) 지원. LLM170_V5=1 옵트인.
-    fn gemv5_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
-        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 23 && ty != 13 {
-            return Err("gemv5: iq4_xs/q5_K만".into());
-        }
-        let xq_w = ni / 4 + ni / 32 + ni / 16;
-        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
-        while binds.len() < 8 {
-            binds.push(self.dummy.buf);
-        }
-        binds.push(xq);
-        binds.push(out);
-        if ty == 23 {
-            binds.push(self.ktab.buf);
-        }
-        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
-        let cw_log2 = 31u32 - cw.leading_zeros();
-        let cw_mask = (1u32 << cw_log2) - 1u32;
-        let rpf: u32 = if no < 4096 { 1 } else { 8 };
-        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, xq_w as u32, cw_log2, cw_mask, rpf]);
-        let (pname, spv, nkb) = if ty == 23 { ("gemv5_xs", GEMV5_XS_SPV, 11) } else { ("gemv5_q5", GEMV5_Q5_SPV, 10) };
-        self.run_pipe(pname, spv, nkb, 28, &binds, &push,
-            1, no.div_ceil(rpf as usize) as u32, t as u32)
-    }
 
     /// gemv8_q5 (plans/33) — llama mul_mat_vec_q5_k 완전 포트 (typed u16 로드,
     /// SIMD-in-register 니블, fma 체인). 웜 162GB/s (역대 최고). LLM170_G8=1.
@@ -986,41 +917,11 @@ impl DecoderState {
             1, no.div_ceil(rpf as usize) as u32, t as u32)
     }
 
-    /// gemv6_q5 (plans/33) — llama iqs lane 리맵 (연속 워드 스윕).
-    /// 실DRAM +10.5% (79.7→88.1, L2방출 실측). LLM170_G6=1이면 q5에 우선.
-    fn gemv6_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
-        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 13 && ty != 23 && ty != 14 && ty != 12 && ty != 11 {
-            return Err("gemv6: q3_K/q4_K/q5_K/iq4_xs/q6_K만".into());
-        }
-        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
-        while binds.len() < 8 {
-            binds.push(self.dummy.buf);
-        }
-        binds.push(xn);
-        binds.push(out);
-        if ty == 23 {
-            binds.push(self.ktab.buf);
-        }
-        // q6는 f32 활성 직결, n_blk 상한 96 (sh_dl [96][16])
-        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
-        let cw_log2 = 31u32 - cw.leading_zeros();
-        let cw_mask = (1u32 << cw_log2) - 1u32;
-        let rpf: u32 = if no < 4096 { 1 } else { 8 };
-        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
-        let (pname, spv, n_kb) = match ty {
-            23 => ("gemv6_xs", GEMV6_XS_SPV, 11),
-            14 => ("gemv6_q6", GEMV6_Q6_SPV, 10),
-            12 => ("gemv6_q4", GEMV6_Q4_SPV, 10),
-            11 => ("gemv6_q3", GEMV6_Q3_SPV, 10),
-            _ => ("gemv6_q5", GEMV6_Q5_SPV, 10),
-        };
-        self.run_pipe(pname, spv, n_kb, 24, &binds, &push,
-            1, no.div_ceil(rpf as usize) as u32, t as u32)
-    }
 
-    /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
-    /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
+    /// gemv 래우터 — t<16은 gemv8(f32 직결, llama 포트), 그 외·미지원 타입은
+    /// quant+gemv3(범용 정수 경로). LLM170_G8=0 킬스위치.
+    /// 2026-09-08 A/B: q6_K도 gemv3+quant가 gemv6_q6보다 우위(tg32 7.06 vs 6.71) —
+    /// gemv4/5/6/7 세대 전원 삭제(plans/35 P2).
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
         let g8_off = std::env::var("LLM170_G8").map(|v| v == "0").unwrap_or(false);
         if t < 16 && !g8_off {
@@ -1028,77 +929,10 @@ impl DecoderState {
                 return Ok(());
             }
         }
-        if t == 1 && std::env::var_os("LLM170_G6").is_some() {
-            if self.gemv6_q5(qsrc, wkey, out, t).is_ok() {
-                return Ok(());
-            }
-        }
-        if t == 1 && std::env::var_os("LLM170_V5").is_some() {
-            self.quant(qsrc, xq, nq, t)?;
-            if self.gemv5_xq(xq, wkey, out, t).is_ok() {
-                return Ok(());
-            }
-        }
-        if t == 1 && std::env::var("LLM170_VK_GEMV4").map(|v| v == "1").unwrap_or(false) {
-            if self.gemv4_f32(qsrc, wkey, out, t).is_ok() {
-                return Ok(());
-            }
-        }
         self.quant(qsrc, xq, nq, t)?;
         self.gemv(xq, wkey, out, t)
     }
 
-    /// plans/31 gemv4 — f32 활성 직결 (q8_0/q5_K/iq4_xs). llama 아키텍처.
-    fn gemv4_f32(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize) -> Result<(), String> {
-        let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        let g4t = std::env::var_os("LLM170_G4TIME").is_some();
-        let (spv, pname): (&[u8], &'static str) = match ty {
-            8 => (GEMV4_Q8_SPV, "gemv4_q8"),
-            // q5_K gemv4는 스탠드얼론 97GB/s에도 엔진 내역행(실측 NOQ5 144ms < all 168ms)
-            // — 소형 attn 투영(rpf=1)의 y 재판독 탓. 기본 gemv3, 옵트인 LLM170_G4_Q5=1.
-            13 if std::env::var_os("LLM170_G4_Q5").is_some() => (GEMV4_Q5_SPV, "gemv4_q5"),
-            23 => (GEMV4_XS_SPV, "gemv4_xs"),
-            _ => return Err(format!("gemv4: 타입 {ty} 미지원")),
-        };
-        let ydev_on = std::env::var_os("LLM170_G4_YDEV").is_some();
-        if ydev_on {
-            self.copy_off(xn, self.b_ydev.buf, ni * t, 0)?;
-        }
-        let xn_eff = if ydev_on { self.b_ydev.buf } else { xn };
-        let n_kb = if ty == 23 { 12 } else { 11 };
-        let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
-        while binds.len() < 8 {
-            binds.push(self.dummy.buf);
-        }
-        binds.push(xn_eff);
-        binds.push(out);
-        if ty == 23 {
-            binds.push(self.ktab.buf);
-        }
-        binds.push(xn_eff);   // yv4 vec4 뷰 (동일 버퍼 재바인딩)
-        // 청크 산술어: 첫 버퍼가 싱글청크(non-pow2)일 수 있으므로 pow2ceil 기준 —
-        // 마스크 랩으로 가상 청크1 OOB 방지 (실측 spec==nonspec 붕괴의 원인)
-        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
-        let cw_log2 = 31u32 - cw.leading_zeros();
-        let cw_mask = (1u32 << cw_log2) - 1u32;
-        // 소형 텐서는 행/WG 축소 — 병렬성 유지 (beta/alpha no=48 등)
-        // rpf 오버라이드: 지연 은폐를 위한 오버서브스크립션 스윕 (llama는 2행/WG×8704WG)
-        let rpf: u32 = std::env::var("LLM170_G4_RPF").ok().and_then(|v| v.parse().ok())
-            .unwrap_or(if no < 4096 { 1 } else { 8 });
-        let push = Self::push_u32s(&[ni as u32, no as u32, ty, t as u32, cw_log2, cw_mask, rpf]);
-        // 셰이더: .y=행블록, .z=tok — grid (1, ceil(no/rpf), t)
-        let t0 = std::time::Instant::now();
-        let r = self.run_pipe(pname, spv, n_kb, 32, &binds, &push,
-            1, no.div_ceil(rpf as usize) as u32, t as u32);
-        if g4t {
-            if std::env::var_os("LLM170_G4_SYNC").is_some() {
-                // 동기 타이밍 — 실 커널 시간 (배치 무시)
-                let _ = self.ctx.flush2();
-            }
-            eprintln!("[g4time] {wkey} ty={ty} no={no} {:.3}ms", t0.elapsed().as_secs_f32() * 1e3);
-        }
-        r
-    }
 
     /// HIP 기본 WMMA와 동일 정확도 클래스 maxrel ~4.9e-4, argmax 안정).
     /// LLM170_VK_NOTILE=1이면 항상 gemv3 정밀 경로.
@@ -2021,4 +1855,30 @@ impl DecoderState {
 
 fn n_group_len(hp: &llm170_core::model::hparams::Hparams) -> usize {
     hp.n_group * hp.d_state
+}
+
+/// Engine에 VkDecoder 주입 — raw_names/raw_consts 기반 (server에서 이관, plans/35 P4).
+pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    use llm170_core::matmul::RawDecode;
+    let hp = eng.model.hp.clone();
+    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
+    let (wnames, cnames) = llm170_core::model::rawinject::raw_names(eng);
+    let mut weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = Vec::new();
+    for n in &wnames {
+        let w = eng.model.wchk(n).map_err(|e| e.to_string())?;
+        weights.push((n.clone(), w));
+    }
+    let mut consts = llm170_core::model::rawinject::raw_consts(eng, &cnames);
+    // VkDecoder 마스크: u32 all-ones (t=1 디코드 행은 p<=pos 전부 활성).
+    {
+        let cl = eng.ctx_len();
+        if let Some(m) = consts.iter_mut().find(|(k, _)| k == "mask") {
+            m.1 = (0..cl * cl).map(|_| f32::from_bits(1)).collect();
+        }
+    }
+    let rd: std::sync::Arc<VkDecoder> = std::sync::Arc::new(VkDecoder::new());
+    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
+        .map_err(|e| format!("raw_init(vk): {e}"))?;
+    eng.raw_decode = Some(rd);
+    Ok(())
 }

@@ -175,11 +175,11 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                         Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
                     }
                 } else {
-                    crate::inject_rawvk(&mut eng)
+                    llm170_backend_gpu::inject_rawvk(&mut eng)
                         .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-                crate::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+                llm170_backend_gpu::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
             }
             let _ = &backend;
             let has_mtp = eng.has_mtp();

@@ -1300,39 +1300,6 @@ pub fn iq3s_probe() -> Result<String, String> {
 }
 
 
-/// 디버그: expf vs Rust exp 비트 비교.
-pub fn exp_ab() -> Result<String, String> {
-    let ctx = RawCtx::new()?;
-    let n = 4096usize;
-    let x: Vec<f32> = (0..n).map(|i| (i as f32 - 2048.0) / 97.0).collect();
-    let xd = ctx.alloc(n * 4)?;
-    let bits = ctx.alloc(n * 4)?;
-    ctx.h2d(xd, bytemuck::cast_slice(&x))?;
-    let mut xp = xd as *mut std::ffi::c_void;
-    let mut bp = bits as *mut std::ffi::c_void;
-    let mut na = n as i32;
-    let mut args = vec![
-        (&mut xp) as *mut _ as *mut std::ffi::c_void,
-        (&mut bp) as *mut _ as *mut std::ffi::c_void,
-        (&mut na) as *mut _ as *mut std::ffi::c_void,
-    ];
-    ctx.launch("exp_probe", n.div_ceil(64) as u32, 1, 64, &mut args)?;
-    ctx.sync()?;
-    let mut gbits = vec![0u32; n];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut gbits).as_mut(), bits)?;
-    let mut bad = 0;
-    let mut msg = String::new();
-    for i in 0..n {
-        let host = x[i].exp().to_bits();
-        if host != gbits[i] {
-            bad += 1;
-            if bad <= 3 {
-                msg += &format!("x={:.6e} dev={:#010x} host={:#010x}\n", x[i], gbits[i], host);
-            }
-        }
-    }
-    Ok(format!("exp_ab: {bad}/{n} differ\n{msg}"))
-}
 
 /// dp4a 가용성 테스트.
 pub fn dp4a_test() -> Result<String, String> {
@@ -1389,142 +1356,8 @@ pub fn bw_test() -> Result<String, String> {
     Ok(format!("bw_probe: {:.1}us -> {:.0} GB/s (checksum={})", dt * 1e6, bytes as f64 / dt / 1e9, r[63] as u32))
 }
 
-/// q6_K old/new isum A/B — blk.11.attn_k (q6_K) 실데이터.
-pub fn q6k_ab_test() -> Result<String, String> {
-    use std::io::Read;
-    // gguf 직접 파싱 대신 llm170_core로 로드
-    let args: Vec<String> = std::env::args().collect();
-    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.11.attn_k.weight".into());
-    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
-    let w = model.w(&tname).ok_or("tensor 없음")?;
-    let ctx = RawCtx::new()?;
-    let wd = ctx.alloc(w.data.len())?;
-    ctx.h2d(wd, w.data)?;
-    let n_in = w.n_in as usize;
-    // 임의 x: q8 양자화
-    let mut seed = 0x9e3779b9u64;
-    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
-    let x: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
-    let blocks_q = llm170_core::quant::quantize_row_q8_ref(&x);
-    let mut xq_h: Vec<u32> = Vec::new();
-    for b in &blocks_q {
-        for c in 0..8 {
-            xq_h.push((b.qs[c*4] as u32 & 0xFF) | ((b.qs[c*4+1] as u32 & 0xFF) << 8) | ((b.qs[c*4+2] as u32 & 0xFF) << 16) | ((b.qs[c*4+3] as u32 & 0xFF) << 24));
-        }
-    }
-    for b in &blocks_q { xq_h.push(b.d.to_bits()); }
-    let xqd = ctx.alloc(xq_h.len() * 4)?;
-    ctx.h2d(xqd, bytemuck::cast_slice(&xq_h))?;
-    let part = ctx.alloc(32)?;
-    let mut msg = String::new();
-    // row 0, 여러 그룹 시험
-    for g in [0usize, 1, 5, 8, 17, 40, 100, 200] {
-        let mut wp = wd as *mut std::ffi::c_void;
-        let mut xp = xqd as *mut std::ffi::c_void;
-        let mut pp = part as *mut std::ffi::c_void;
-        let mut r0 = 0i32;
-        let mut gi = g as i32;
-        // 커널 wb 계산이 n_in=256 가정이므로 row_base를 0으로 — g>>4 블록 인덱스는 행 내 오프셋으로 유효
-        let mut args = vec![
-            (&mut wp) as *mut _ as *mut std::ffi::c_void,
-            (&mut xp) as *mut _ as *mut std::ffi::c_void,
-            (&mut pp) as *mut _ as *mut std::ffi::c_void,
-            (&mut r0) as *mut _ as *mut std::ffi::c_void,
-            (&mut gi) as *mut _ as *mut std::ffi::c_void,
-        ];
-        ctx.launch("q6k_ab", 1, 1, 1, &mut args)?;
-        ctx.sync()?;
-        let mut r = [0f64; 4];
-        ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
-        msg += &format!("g={}: old={} dot4={} packed={} src={} al={} old==dot4:{} old==packed:{}\n", g, r[0] as i64, r[1] as i64, r[2] as i64, r[2] as i64, r[3] as i64, r[0]==r[1], r[0]==r[2]);
-    }
-    Ok(msg)
-}
 
-/// 트리 환원 순서 A/B — GPU 셔플 vs Rust tree64.
-pub fn tree_test() -> Result<String, String> {
-    let ctx = RawCtx::new()?;
-    let od = ctx.alloc(64)?;
-    let mut op = od as *mut std::ffi::c_void;
-    let mut args = vec![(&mut op) as *mut _ as *mut std::ffi::c_void];
-    ctx.launch("tree_probe", 1, 1, 64, &mut args)?;
-    ctx.sync()?;
-    let mut r = [0f64; 5];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), od)?;
-    Ok(format!("off32={} (32) off1={} (1) tree={} (2016) w64_off32={} (32) w64_tree={} (2016)", r[0], r[1], r[2], r[3], r[4]))
-}
 
-/// 배치 A/B — t=2 quant+gemv가 행별 단일 결과와 동일한지.
-pub fn batch_ab_test() -> Result<String, String> {
-    let args: Vec<String> = std::env::args().collect();
-    let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-    let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
-    let w = model.w(&tname).ok_or("tensor 없음")?;
-    let ctx = RawCtx::new()?;
-    let n_in = w.n_in as usize;
-    let n_out = w.n_out as usize;
-    let wd = ctx.alloc(w.data.len())?;
-    ctx.h2d(wd, w.data)?;
-    let ktab2: Vec<u32> = (0..256u32)
-        .map(|b| {
-            let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-            let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-            lo | (hi << 8)
-        })
-        .collect();
-    let kt_d = ctx.alloc(1024)?;
-    ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
-    // 서로 다른 x 2행
-    let mut seed = 0x9e3779b9u64;
-    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
-    let x0: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
-    let x1: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
-    // 단일 경로 결과 (기준)
-    let mut base = Vec::new();
-    for xr in [&x0, &x1] {
-        let xd = ctx.alloc(n_in * 4)?;
-        ctx.h2d(xd, bytemuck::cast_slice(xr))?;
-        let xq = ctx.alloc((n_in / 4 + n_in / 32 + n_in / 16) * 4)?;
-        ctx.quant_q8(xd, xq, n_in)?;
-        let out = ctx.alloc(n_out * 4)?;
-        ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)?;
-        let mut o = vec![0f32; n_out];
-        ctx.sync()?;
-        ctx.d2h(bytemuck::cast_slice_mut(&mut o).as_mut(), out)?;
-        base.push(o);
-    }
-    // 배치 경로
-    let mut xall: Vec<f32> = x0.clone();
-    xall.extend_from_slice(&x1);
-    let xd = ctx.alloc(n_in * 2 * 4)?;
-    ctx.h2d(xd, bytemuck::cast_slice(&xall))?;
-    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-    let xq = ctx.alloc(xq_w * 4 * 2)?;
-    ctx.quant_q8_b(xd, xq, n_in, xq_w, 2)?;
-    let out = ctx.alloc(n_out * 4 * 2)?;
-    ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out, xq_w, 2)?;
-    ctx.sync()?;
-    let mut o2 = vec![0f32; n_out * 2];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut o2).as_mut(), out)?;
-    // quant y=1 영역 검사
-    let mut xqh = vec![0u32; xq_w * 2];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut xqh).as_mut(), xq)?;
-    let nzq1 = xqh[xq_w..].iter().filter(|v| **v != 0).count();
-    let mut xq1 = vec![0u32; xq_w];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut xq1).as_mut(), unsafe { xq.add(xq_w * 4) } as *const u8)?;
-    eprintln!("diag: quant y1 nonzero {nzq1}/{xq_w}");
-    // 진단: xq_w=0 — y=1이 row0 값을 복사하면 블록 실행·아웃오프셋 정상
-    let out3 = ctx.alloc(n_out * 4)?;
-    ctx.gemv_q8_out(xq, wd, kt_d, w.ty as u32, n_in, n_out, out3, 0, 2)?;
-    ctx.sync()?;
-    let mut o3 = vec![0f32; n_out];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut o3).as_mut(), out3)?;
-    let nz1 = o2[n_out..].iter().filter(|v| **v != 0.0).count();
-    let cp = o3.iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
-    Ok(format!("batch t=2: row0 {} row1 {} 일치 | xqw0=단일 out≠0: {} / o2row1 비영: {}", base[0].iter().zip(&o2[..n_out]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), base[1].iter().zip(&o2[n_out..]).filter(|(a, b)| a.to_bits() == b.to_bits()).count(), n_out - cp, nz1))
-}
 
 /// 배치 mm 타이밍 — gy=1 대비 gy=t 배율.
 pub fn mm_batch_bench() -> Result<String, String> {
@@ -1538,11 +1371,7 @@ pub fn mm_batch_bench() -> Result<String, String> {
     let n_out = w.n_out as usize;
     let wd = ctx.alloc(w.data.len())?;
     ctx.h2d(wd, w.data)?;
-    let ktab2: Vec<u32> = (0..256u32).map(|b| {
-        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-        lo | (hi << 8)
-    }).collect();
+    let ktab2: Vec<u32> = llm170_core::ktab2_packed();
     let kt_d = ctx.alloc(1024)?;
     ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
     let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
@@ -1582,11 +1411,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let n_out = w.n_out as usize;
     let wd = ctx.alloc(w.data.len())?;
     ctx.h2d(wd, w.data)?;
-    let ktab2: Vec<u32> = (0..256u32).map(|b| {
-        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-        lo | (hi << 8)
-    }).collect();
+    let ktab2: Vec<u32> = llm170_core::ktab2_packed();
     let kt_d = ctx.alloc(1024)?;
     ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
     let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
@@ -1795,11 +1620,7 @@ pub fn mm_bench() -> Result<String, String> {
     let n_out = w.n_out as usize;
     let wd = ctx.alloc(w.data.len())?;
     ctx.h2d(wd, w.data)?;
-    let ktab2: Vec<u32> = (0..256u32).map(|b| {
-        let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-        let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-        lo | (hi << 8)
-    }).collect();
+    let ktab2: Vec<u32> = llm170_core::ktab2_packed();
     let kt_d = ctx.alloc(1024)?;
     ctx.h2d(kt_d, bytemuck::cast_slice(&ktab2))?;
     let mut seed = 0x9e3779b9u64;

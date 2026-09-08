@@ -73,3 +73,15 @@ pub const IQ3S_GRID: [u32; 512] = [
 pub const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
+
+/// iq4_nl kvalues u16 팩 테이블(256워드) — GPU ktab2 업로드용 단일 소스.
+/// (rawvk ensure_shared·VkDecoder, rawhip DecodeContext·프로브가 공유)
+pub fn ktab2_packed() -> Vec<u32> {
+    (0..256u32)
+        .map(|b| {
+            let lo = KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
+            let hi = KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
+            lo | (hi << 8)
+        })
+        .collect()
+}

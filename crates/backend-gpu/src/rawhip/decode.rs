@@ -142,13 +142,7 @@ impl DecodeState {
             ctx.h2d(d, w.data)?;
             wmap.insert(k.clone(), (d, w.ty as u32, w.n_in as usize, w.n_out as usize));
         }
-        let ktab2: Vec<u32> = (0..256u32)
-            .map(|b| {
-                let lo = llm170_core::KVALUES_IQ4NL[(b & 0xF) as usize] as u8 as u32;
-                let hi = llm170_core::KVALUES_IQ4NL[(b >> 4) as usize] as u8 as u32;
-                lo | (hi << 8)
-            })
-            .collect();
+        let ktab2: Vec<u32> = llm170_core::ktab2_packed();
         let kt = ctx.alloc(1024).map_err(|e| e.to_string())?;
         ctx.h2d(kt, bytemuck::cast_slice(&ktab2))?;
         let one = ctx.alloc(4).map_err(|e| e.to_string())?;
@@ -2729,4 +2723,39 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         self.ctx.gemm_tile_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
     }
 
+}
+
+/// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
+/// (plans/28: 단계 타이밍 계측 추가 — 공존 지연 RCA용. server에서 이관 plans/35 P4)
+pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    let hp = eng.model.hp.clone();
+    let (wnames, cnames): (Vec<String>, Vec<String>) =
+        llm170_core::model::rawinject::raw_names(eng);
+    let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
+    let t1 = std::time::Instant::now();
+    let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
+        .iter()
+        .filter_map(|k| eng.model.wchk(k).ok().map(|w| (k.clone(), w)))
+        .collect();
+    if weights.len() != wnames.len() {
+        return Err(format!("rawhip: 가중치 누락 {}/{}", weights.len(), wnames.len()));
+    }
+    eprintln!(
+        "# inject: names+weights {:.1?} ({} tensors, {:.2}GB)",
+        t1.elapsed(),
+        weights.len(),
+        weights.iter().map(|(_, w)| w.data.len()).sum::<usize>() as f64 / (1 << 30) as f64
+    );
+    let consts = llm170_core::model::rawinject::raw_consts(eng, &cnames);
+    eprintln!("# inject: consts @+{:.1?}", t0.elapsed());
+    let rd: std::sync::Arc<RawDecoder> = std::sync::Arc::new(RawDecoder::new());
+    use llm170_core::matmul::RawDecode;
+    let r = rd
+        .raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
+        .map_err(|e| format!("raw_init: {e}"));
+    eprintln!("# inject: raw_init @+{:.1?}", t0.elapsed());
+    r?;
+    eng.raw_decode = Some(rd);
+    Ok(())
 }
