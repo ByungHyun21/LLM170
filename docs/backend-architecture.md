@@ -65,7 +65,7 @@ Type-driven, one table (decoder.rs `gemv_w`):
 The gemv4/5/6/7 generations were deleted after gemv8 promotion; an
 engine-level A/B kept q6_K on gemv3+quant (7.06 vs 6.71 t/s tg32 median).
 `vk-gemv8-check` verifies each type against the CPU dequant dot; the
-gemv8_q6 shader is retained for the plans/34 retry.
+gemv8_q6 shader is retained for the q6_K retry (plans/36 G1).
 
 ## Kernel sources (rawhip)
 
