@@ -1,0 +1,160 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// gemv8_q3 (plans/33) — gemv8 레시피를 q3_K에 적용. 기하: gemv6_q3(검증) 직역 +
+// SIMD-in-register 2비트 마스크(0x03030303) + fma 체인.
+// 블록 110B: hm 32B@0, q 64B@32(2비트×4 j), scales 12B@96(aux 전개), d@108.
+// q 바이트 qb(0..63): n=qb>>5, rr=qb&31, hf=rr&16, l=rr&15 — j(0..3)마다 원소
+// e = 256b + 128n + 32j + hf + l, qv=(qb>>2j)&3, sub=(hm[rr]>>j&1)?0:4,
+// sc = 8n + 2j + (hf?1:0) — 값 dl·(qv-sub)·y.
+// 레인 L이 q 바이트 [2L..2L+2) — 64바이트 = 32레인 × 2바이트, 연속 64B 스윕.
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 1) readonly buffer W1 { uint w1u[]; };
+layout(binding = 2) readonly buffer W2 { uint w2u[]; };
+layout(binding = 3) readonly buffer W3 { uint w3u[]; };
+layout(binding = 4) readonly buffer W4 { uint w4u[]; };
+layout(binding = 5) readonly buffer W5 { uint w5u[]; };
+layout(binding = 6) readonly buffer W6 { uint w6u[]; };
+layout(binding = 7) readonly buffer W7 { uint w7u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx >> pc.cw_log2;
+    uint o = idx & pc.cw_mask;
+    if (c == 0u) return w0u[o];
+    if (c == 1u) return w1u[o];
+    if (c == 2u) return w2u[o];
+    if (c == 3u) return w3u[o];
+    if (c == 4u) return w4u[o];
+    if (c == 5u) return w5u[o];
+    if (c == 6u) return w6u[o];
+    return w7u[o];
+}
+
+vec2 myunpack2(uint x) {
+    return vec2(float((x) & 0xFFu), float((x >> 8u) & 0xFFu));
+}
+
+const uint BLK_B = 110u;
+shared float sh_dl[96][16];
+shared uint sh_hm[96][8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.z;
+    uint RPF = pc.rpf;
+    uint row0 = gl_WorkGroupID.y * RPF;
+    uint n_in = pc.n_in;
+    uint n_blk = n_in >> 8;
+    uint base = tok * n_in;
+    float acc[8];
+    for (uint r = 0u; r < RPF; r++) acc[r] = 0.0;
+
+    // 레인 고정: q 바이트 2L, 2L+1 (hf 같음 — 16경계는 2바이트 쌍 안넘음: 2L ≤ 62)
+    uint qb0 = tid * 2u;
+    uint n = qb0 >> 5;
+    uint rr0 = qb0 & 31u;
+    uint hf = rr0 & 16u;
+    uint l0 = rr0 & 15u;
+
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        uint rowb = row * n_blk * BLK_B;
+        // 패스1: 헤더 → LDS (gemv6_q3 검증 산법)
+        for (uint b = tid; b < n_blk; b += 32u) {
+            uint bw = rowb + b * BLK_B;
+            uint dwi = (bw + 108u) >> 2;
+            uint drem = (bw + 108u) & 3u;
+            uint dw = WG(dwi);
+            uint db = (dw >> (drem * 8u)) & 0xFFFFu;
+            if (drem >= 2u) {
+                uint w2 = WG(dwi + 1u);
+                db = ((dw >> (drem * 8u)) | (w2 << ((4u - drem) * 8u))) & 0xFFFFu;
+            }
+            float d = unpackHalf2x16(db).x;
+            uint aux0, aux1, aux2;
+            {
+                uint sbase = bw + 96u;
+                uint wq = sbase >> 2;
+                uint rr = sbase & 3u;
+                uint wa = WG(wq), wb2 = WG(wq + 1u), wc2 = WG(wq + 2u);
+                aux0 = (wa >> (rr * 8u)) | (rr != 0u ? (wb2 << ((4u - rr) * 8u)) : 0u);
+                aux1 = (rr == 0u) ? wb2 : ((wb2 >> (rr * 8u)) | (wc2 << ((4u - rr) * 8u)));
+                uint aux2t = (rr == 0u) ? wc2 : ((wc2 >> (rr * 8u)) | (WG(wq + 3u) << ((4u - rr) * 8u)));
+                aux2 = aux2t & 0xFFFu;
+            }
+            uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+            uint ax2 = ((aux0 >> 4) & kmask2) | (((aux2 >> 4) & kmask1) << 4);
+            uint ax3 = ((aux1 >> 4) & kmask2) | (((aux2 >> 6) & kmask1) << 4);
+            uint aa0 = (aux0 & kmask2) | ((aux2 & kmask1) << 4);
+            uint aa1 = (aux1 & kmask2) | (((aux2 >> 2) & kmask1) << 4);
+            for (uint j = 0u; j < 16u; j++) {
+                uint sw = j < 4u ? aa0 : (j < 8u ? aa1 : (j < 12u ? ax2 : ax3));
+                uint sc8 = (sw >> (8u * (j & 3u))) & 0xFFu;
+                int sci = int(sc8) << 24 >> 24;
+                sh_dl[b][j] = d * float(sci - 32);
+            }
+            uint hq = bw >> 2;
+            uint hr = bw & 3u;
+            if (hr == 0u) {
+                for (uint i = 0u; i < 8u; i++) sh_hm[b][i] = WG(hq + i);
+            } else {
+                uint prev = WG(hq);
+                for (uint i = 0u; i < 8u; i++) {
+                    uint nx = WG(hq + 1u + i);
+                    sh_hm[b][i] = (prev >> (hr * 8u)) | (nx << ((4u - hr) * 8u));
+                    prev = nx;
+                }
+            }
+        }
+        barrier();
+        // 패스2: q 선형 스윕 — 레인이 바이트 2L..2L+1 (u16 로드 후 fma 체인)
+        float pacc = 0.0;
+        [[unroll]] for (uint b = 0u; b < n_blk; b++) {
+            uint bw = rowb + b * BLK_B;
+            uint qwi = (bw + 32u + qb0) >> 2;
+            uint qrem = (bw + 32u + qb0) & 3u;
+            uint wv = WG(qwi);
+            uint wv2 = WG(qwi + 1u);
+            // 2바이트 조립 (rem 보정)
+            uint bytes2 = (wv >> (qrem * 8u)) & 0xFFFFu;
+            if (qrem >= 2u) {
+                bytes2 = ((wv >> (qrem * 8u)) | (wv2 << ((4u - qrem) * 8u))) & 0xFFFFu;
+            } else if (qrem == 1u) {
+                bytes2 = ((wv >> 8u) | (wv2 << 24u)) & 0xFFFFu;
+            }
+            // hm 바이트 rr0, rr0+1
+            uint hmw0 = sh_hm[b][rr0 >> 2];
+            uint hm_shift = 8u * (rr0 & 3u);
+            uint hmw = (hmw0 >> hm_shift) & 0xFFFFu;
+            uint hmb0 = hmw & 0xFFu;
+            uint hmb1 = (hmw >> 8u) & 0xFFu;
+            // j=0..3: qv=(byte>>2j)&3, sub=(hm>>j&1)?0:4 — fma 체인
+            [[unroll]] for (uint jj = 0u; jj < 4u; jj++) {
+                uint sc_idx = 8u * n + 2u * jj + (hf != 0u ? 1u : 0u);
+                float dl = sh_dl[b][sc_idx];
+                uint e_base = b * 256u + 128u * n + 32u * jj + hf + l0;
+                float y0 = xa[base + e_base];
+                float y1 = xa[base + e_base + 1u];
+                int q0 = int((bytes2        ) & 3u) - (((hmb0 >> jj) & 1u) != 0u ? 0 : 4);
+                int q1 = int((bytes2 >> 8u  ) & 3u) - (((hmb1 >> jj) & 1u) != 0u ? 0 : 4);
+                pacc = fma(float(q0) * y0 + float(q1) * y1, dl, pacc);
+            }
+        }
+        acc[r] = pacc;
+        barrier();
+    }
+    for (uint r = 0u; r < RPF; r++) {
+        uint row = row0 + r;
+        if (row >= pc.n_out) break;
+        float tot = subgroupAdd(acc[r]);
+        if (tid == 0u) outv[tok * pc.n_out + row] = tot;
+    }
+}
