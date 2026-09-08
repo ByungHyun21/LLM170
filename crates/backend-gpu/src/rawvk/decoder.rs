@@ -408,7 +408,7 @@ impl VkDecoder {
     }
 }
 
-const T_MAX: usize = 32;
+const T_MAX: usize = 64;
 
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
