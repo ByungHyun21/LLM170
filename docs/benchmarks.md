@@ -229,6 +229,19 @@ wrong; measurements after the fix are runtime-correct. The intermittent
 memory-sweep defect (page reindexing invalidating live handles) and patched
 locally — [decisions.md](decisions.md) ADR-0016.
 
+## Known flake: vk spec==nonspec nondeterminism (2026-09-08)
+
+`--gpu-runtime vulkan --spec 4` np4 runs intermittently flip one near-tie
+token (spec_np4 divergence at a flat distribution point). Measured with a
+fixed seed repro (`plain vs --spec 4`, 4×short2-class prompts, 24 tok):
+**pre-refactor 7758e07 diverges 2/5 runs; post-refactor 4/5** — the defect
+predates the plans/35 refactor, which only shifts timing (non-spec streams
+are bit-identical across the refactor). `LLM170_G8=0` (verify batches fall
+back to quant+gemv3) did not diverge in 2/2 runs — the trigger is the
+gemv8 batched-verify configuration (t=2..5 rows), not the decode path.
+Follow-up tracked in plans/34. The vk judge gate therefore reports
+18/19..19/19 depending on the roll; HIP is unaffected (19/19 stable).
+
 ## Verification status
 
 Method: greedy token-stream comparison against llama.cpp under the

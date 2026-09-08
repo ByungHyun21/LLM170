@@ -233,3 +233,104 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
     }
     if mism > 0 { ExitCode::FAILURE } else { println!("  ★ 원시 HIP ≡ CPU 비트 일치"); ExitCode::SUCCESS }
 }
+
+/// llm170 check <model.gguf> [--quick] [--backend cpu|gpu]
+/// debug 빌드 검증 경로 — ① 텐서 디양자화 스캔(NaN/Inf) ② GPU↔CPU GEMM
+/// 상호검증 ③ 장문 청크 스모크(NaN 가드). RCA 도구 통합 (2026-09-01).
+pub fn run_check(args: &[String]) -> ExitCode {
+    use llm170_core::matmul::Accelerator;
+    let mut path: Option<&str> = None;
+    let mut quick = false;
+    let mut backend = "gpu".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--quick" => quick = true,
+            "--backend" => backend = it.next().cloned().unwrap_or_else(|| "gpu".into()),
+            p if !p.starts_with("--") => path = Some(p),
+            _ => {}
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: llm170 check <model.gguf> [--quick] [--backend cpu|gpu]");
+        return ExitCode::from(2);
+    };
+    let model_path = std::path::PathBuf::from(path);
+    eprintln!("# check: {path} backend={backend} quick={quick}");
+
+    // ① 텐서 스캔 — 각 텐서 첫 행 디양자화해 NaN/Inf 검출
+    let mut n_scan = 0usize;
+    let scan = std::thread::spawn({
+        let p = model_path.clone();
+        move || -> Result<(usize, usize), String> {
+            let g = llm170_gguf::GgufFile::open(&p).map_err(|e| e.to_string())?;
+            let file = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+            // SAFETY: 읽기 전용 매핑
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
+            let mut bad = 0usize;
+            let mut n = 0usize;
+            for t in g.tensors.iter().take(if quick { 64 } else { usize::MAX }) {
+                let (start, end) = match t.file_range(g.data_offset) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let data = &mmap[start as usize..end as usize];
+                let n_in = t.ne[0] as usize;
+                let mut row = vec![0.0f32; n_in.min(4096)];
+                llm170_core::quant::dequant_row(t.ty, data, 0, row.len() as u64, &mut row);
+                n += 1;
+                if row.iter().any(|v| !v.is_finite()) {
+                    eprintln!("# 텐서 비정상: {} ({})", t.name, t.ty.name());
+                    bad += 1;
+                }
+            }
+            Ok((n, bad))
+        }
+    });
+    match scan.join() {
+        Ok(Ok((n, bad))) => {
+            n_scan = n;
+            eprintln!("# ① 텐서 스캔: {n}개 중 비정상 {bad}");
+            if bad > 0 {
+                return ExitCode::FAILURE;
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_) => return ExitCode::FAILURE,
+    }
+    let _ = n_scan;
+
+    // ② GPU↔CPU GEMM 상호검증 (gpu 경로만) — 대표 텐서 t∈{1,64,1024}
+    // (② GPU↔CPU GEMM 검증 — cubecl 제거로 rawhip-check가 대체)
+    
+
+    // ③ 장문 청크 스모크 — 1,024토큰 무작위 prefill (NaN 가드는 LLM170_Q4_TRACE)
+    let arch = llm170_gguf::GgufFile::open(&model_path)
+        .ok()
+        .and_then(|g| g.arch().map(str::to_string));
+    if arch.as_deref() == Some("qwen4exp") {
+        let toks: Vec<String> = (0..1024).map(|i| (100 + (i * 7919) % 200000).to_string()).collect();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
+        cmd.args(["infer", "--model", path, "--prompt-tokens", &toks.join(","), "--n-predict", "2", "--ctx", "2048", "--backend", &backend])
+            .env("LLM170_Q4_TRACE", "1")
+            .env("LLM170_W_CAP_GB", "16")
+            .stdout(std::process::Stdio::null());
+        let st = cmd.status();
+        match st {
+            Ok(s) if s.success() => eprintln!("# ③ 청크 스모크(1024토큰): 통과"),
+            Ok(s) => {
+                eprintln!("# ③ 청크 스모크: 실패 ({s})");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("# ③ 청크 스모크 실행 실패: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    eprintln!("# check 전체 통과");
+    ExitCode::SUCCESS
+}
