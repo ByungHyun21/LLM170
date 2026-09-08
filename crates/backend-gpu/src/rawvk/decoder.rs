@@ -32,6 +32,8 @@ const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
 const GEMM_I8V2_SPV: &[u8] = include_bytes!("spv/gemm_i8v2.spv");
 const ADDRMS_SPV: &[u8] = include_bytes!("spv/addrms.spv");
+const TILE_NL_SPV: &[u8] = include_bytes!("spv/tile_nl.spv");
+const TILE_IQ3S_SPV: &[u8] = include_bytes!("spv/tile_iq3s.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -850,6 +852,12 @@ impl DecoderState {
             }
         }
         self.ctx.nobar_next.set(!bar);
+        if let Some(ts) = &self.ctx.ts {
+            if ts.n.get() + 2 <= 8192 {
+                let key = self.kkey.borrow_mut().take().unwrap_or_else(|| name.to_string());
+                ts.labels.borrow_mut().push(key);
+            }
+        }
         let p = *self.pipe(name, spv, n_buf, pb)?;
         let ds = self.ctx.bind_ds(&p, bufs)?;
         let r = self.ctx.run(p.pl, ds, p.pipe, push, gx, gy, gz);
@@ -956,7 +964,7 @@ impl DecoderState {
         // 타일(coopmat f16) 기본 경로 (2026-09-08 judge TILE 19/19 수용 —
         // llama 자체 pp가 동일 f16-닷 품질계약). 킬스위치 LLM170_VK_NOTILE=1.
         if t >= tile_min && std::env::var_os("LLM170_VK_NOTILE").is_none()
-            && (ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 23 || (ty == 8 && no >= 1024)) {
+            && (ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 20 || ty == 21 || ty == 23 || ty == 8) {
             return self.gemv_tile(xq, wkey, out, t, bar);
         }
         self.gemv_xq(xq, wkey, out, t, bar)
@@ -965,6 +973,9 @@ impl DecoderState {
     /// 타일(coopmat) 경로 — 프리필 전용. plans/32.
     fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if std::env::var_os("LLM170_VK_SHAPES").is_some() {
+            eprintln!("[shape] {wkey} ty={ty} ni={ni} no={no} gx={}", no.div_ceil(128));
+        }
         // plans/30→32: tile128(coopmat f16)은 t=1 gemv와 수치계열이 다르나
         // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
         // 실측 pp512 11.18→17.45 t/s (+56%). 옵트인 LLM170_VK_TILE=1.
@@ -1006,16 +1017,31 @@ impl DecoderState {
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
                     self.run_pipe_b("tile_q3k", TILE_Q3K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 8 {
-                    // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)은 제외
-                    if no >= 1024 {
-                        let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
-                        let cw_log2 = 31u32 - cw.leading_zeros();
-                        let cw_mask = (1u32 << cw_log2) - 1u32;
-                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                        self.run_pipe_b("tile_q8", TILE_Q8_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
-                    } else {
-                        self.gemv_xq(xq, wkey, out, t, bar)?;
-                    }
+                    // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)도 포함
+                    // (gemv3 t≥16 소형은 0.2GB/s급 병목 — ts 프로파일 2026-09-08)
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe_b("tile_q8", TILE_Q8_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
+                } else if ty == 20 {
+                    // tile_nl: iq4_nl 18B 블록 — ktab 니블 LUT (iq4_xs와 공유)
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    binds.push(self.ktab.buf);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe_b("tile_nl", TILE_NL_SPV, 11, 24, &binds, &push, gx, 1, 1, last)?;
+                    binds.pop();
+                } else if ty == 21 {
+                    // tile_iq3s: 110B 블록 + IQ3S_GRID 512워드 바인딩
+                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
+                    let cw_log2 = 31u32 - cw.leading_zeros();
+                    let cw_mask = (1u32 << cw_log2) - 1u32;
+                    binds.push(self.grid3s.buf);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
+                    self.run_pipe_b("tile_iq3s", TILE_IQ3S_SPV, 11, 24, &binds, &push, gx, 1, 1, last)?;
+                    binds.pop();
                 } else {
                     // tile_xs (plans/32): iq4_xs coopmat — ktab 바인딩, 시프트 청크
                     let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
@@ -1035,7 +1061,7 @@ impl DecoderState {
     /// 비타일 gemv (원본 경로).
     fn gemv_xq(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if self.ktime {
+        if self.ktime || self.ctx.ts.is_some() {
             *self.kkey.borrow_mut() = Some(format!("gemv:ty{ty}:{wkey}"));
         }
         let xq_w = ni / 4 + ni / 32 + ni / 16;
@@ -1368,6 +1394,7 @@ impl DecoderState {
         // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).
         self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        self.ctx.ts_report();
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
@@ -1631,6 +1658,7 @@ impl DecoderState {
             self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg_t.buf, t, n)?;
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        self.ctx.ts_report();
         if all_logits {
             let mut out = vec![0f32; t * self.n_vocab];
             unsafe { std::ptr::copy_nonoverlapping(self.b_lg_t.ptr as *const f32, out.as_mut_ptr(), t * self.n_vocab) };

@@ -38,7 +38,27 @@ pub struct VkCtx {
     pub batch_sets: std::cell::RefCell<Vec<vk::DescriptorSet>>,
     /// 다음 run() 직후의 write→read 배리어 생략 (독립 병렬 그룹 — decoder가
     /// 설정, run이 소비·리셋. 그룹 마지막 디스패치는 배리어로 종결해야 안전).
+    /// 타임스탬프 프로파일 (LLM170_VK_TS=1) — 디스패치별 GPU 시간.
+    pub ts: Option<TsProf>,
+    pub ts_period_val: f64,
     pub nobar_next: std::cell::Cell<bool>,
+}
+
+/// VK_QUERY_POOL 타임스탬프 프로파일러 — 디스패치별 GPU 시간 (호스트 ktime의
+/// 자동분할 귀속 왜곡 대체, llama perftools 대응 — plans/36).
+pub struct TsProf {
+    pub pool: vk::QueryPool,
+    pub n: std::cell::Cell<usize>,          // 기록된 타임스탬프 수
+    pub labels: std::cell::RefCell<Vec<String>>,
+}
+
+impl VkCtx {
+    /// 타임스탬프 주기(ns) — 프로파일러 없으면 None.
+    pub fn ts_period(&self) -> Option<f64> {
+        let p = self.ts.as_ref()?;
+        let _ = &p;
+        Some(self.ts_period_val)
+    }
 }
 
 unsafe impl Send for VkCtx {}
@@ -122,6 +142,23 @@ impl VkCtx {
                 .map_err(|e| format!("디바이스: {e:?}"))?;
             let queue = device.get_device_queue(qf, 0);
 
+            // 타임스탬프 프로파일러 (LLM170_VK_TS=1) — 쿼리풀 8192 스탬프(4096 디스패치)
+            let ts = if std::env::var_os("LLM170_VK_TS").is_some() {
+                let qci = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(8192);
+                let pool = device
+                    .create_query_pool(&qci, None)
+                    .map_err(|e| format!("쿼리풀: {e:?}"))?;
+                Some(TsProf {
+                    pool,
+                    n: std::cell::Cell::new(0),
+                    labels: std::cell::RefCell::new(Vec::new()),
+                })
+            } else {
+                None
+            };
+            let ts_period_val = props.limits.timestamp_period as f64;
             let pool = device
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
@@ -183,6 +220,8 @@ impl VkCtx {
                 batch_dsl: std::cell::Cell::new(None),
                 batch_pool: std::cell::Cell::new(None),
                 batch_sets: std::cell::RefCell::new(Vec::new()),
+                ts,
+                ts_period_val,
                 nobar_next: std::cell::Cell::new(false),
             })
         }
@@ -709,6 +748,7 @@ impl VkCtx {
                     push,
                 );
             }
+            self.ts_stamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE);
             self.device.cmd_dispatch(cb, gx, gy, gz);
             // 배치 내 write→read 가시성 배리어 (비배칭 submit+wait의 암시 동기 대체).
             // nobar_next: 다음 디스패치와 출력 의존이 없는 독립 그룹 내부 — 스킵.
@@ -727,6 +767,7 @@ impl VkCtx {
                     &[],
                 );
             }
+            self.ts_stamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
             if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
                 self.device
                     .end_command_buffer(self.cmdbuf)
@@ -751,8 +792,71 @@ impl VkCtx {
             Ok(())
         }
     }
-}
 
+
+    /// 쿼리풀 타임스탬프 1개 기록 (ts 활성 시).
+    fn ts_stamp(&self, cb: vk::CommandBuffer, stage: vk::PipelineStageFlags) {
+        if let Some(ts) = &self.ts {
+            let i = ts.n.get();
+            if i + 2 <= 8192 {
+                unsafe {
+                    self.device.cmd_write_timestamp(cb, stage, ts.pool, i as u32);
+                }
+                ts.n.set(i + 1);
+            }
+        }
+    }
+
+    /// 직전 배치의 디스패치별 GPU 시간 집계·출력 (GPU 유휴 보장 하 호출).
+    pub fn ts_report(&mut self) {
+        let Some(ts) = &self.ts else { return };
+        let n = ts.n.get();
+        if n == 0 {
+            return;
+        }
+        let mut buf = vec![0u64; n];
+        let r = unsafe {
+            self.device.get_query_pool_results(
+                ts.pool,
+                0,
+                &mut buf,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        let ok = r.is_ok();
+        if !ok {
+            eprintln!("[ts] 쿼리 결과 조회 실패 (n={n})");
+        } else {
+            let labels = ts.labels.borrow();
+            let per = self.ts_period_val;
+            let mut agg: std::collections::HashMap<&str, (f64, usize)> = std::collections::HashMap::new();
+            let mut tot = 0.0f64;
+            for (k, lbl) in labels.iter().enumerate() {
+                let a = 2 * k;
+                if a + 1 >= n {
+                    break;
+                }
+                let dt = (buf[a + 1] - buf[a]) as f64 * per / 1e6; // ms
+                let e = agg.entry(lbl.as_str()).or_insert((0.0, 0));
+                e.0 += dt;
+                e.1 += 1;
+                tot += dt;
+            }
+            let mut v: Vec<_> = agg.into_iter().collect();
+            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {})", labels.len());
+            for (k, (e, c)) in v.iter().take(24) {
+                eprintln!("[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회)", k, e / *c as f64);
+            }
+        }
+        ts.n.set(0);
+        ts.labels.borrow_mut().clear();
+        unsafe {
+            self.device
+                .reset_query_pool(ts.pool, 0, 8192)
+        };
+    }
+}
 impl Drop for VkCtx {
     fn drop(&mut self) {
         unsafe {
