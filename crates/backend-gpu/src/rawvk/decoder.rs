@@ -1016,7 +1016,7 @@ impl DecoderState {
     /// gemv 래퍼 — LLM170_VK_GEMV4=1이고 타입 지원 시 f32 직결 경로.
     /// gemv3 폴백 시에만 quant 실행 (gemv4 경로의 죽은 양자화 제거).
     fn gemv_w(&mut self, qsrc: vk::Buffer, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, nq: usize) -> Result<(), String> {
-        if t == 1 && std::env::var_os("LLM170_G8").is_some() {
+        if t < 16 && std::env::var_os("LLM170_G8").is_some() {
             if self.gemv8_q5(qsrc, wkey, out, t).is_ok() {
                 return Ok(());
             }
@@ -1241,6 +1241,7 @@ impl DecoderState {
     /// 단계 공유 GEMV — q5_K·t≥2는 gemm_i8(LLM170_VK_NOI8 킬스위치),
     /// 나머지는 기존 xq+gemv3. xq 양자화는 호출부가 이미 수행.
     fn gemv_stage(&mut self, n: usize, t: usize, jobs: &[(String, vk::Buffer, vk::Buffer)]) -> Result<(), String> {
+        let xq_f32 = self.b_xn.buf;
         let i8_on = t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some();
         let any_i8 = i8_on && jobs.iter().any(|(k, _, _)| self.i8w.contains_key(k));
         let _ = &any_i8;
@@ -1252,6 +1253,9 @@ impl DecoderState {
                 } else {
                     self.gemm_i8(k, *out, t)?;
                 }
+            } else if t < 16 && std::env::var_os("LLM170_G8").is_some() {
+                // spec 검증 배치(t≤5)도 gemv8 수치계열로 — 불변식 회복 (plans/33)
+                self.gemv8_q5(xq_f32, k, *out, t)?;
             } else {
                 self.gemv(*xq, k, *out, t)?;
             }
