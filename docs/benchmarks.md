@@ -1018,3 +1018,15 @@ scale base is 8n per half, not 16n — sh_dl[16] indexed to 23). Exact
 misalignment forces per-word remainder assembly in the linear sweep,
 which the SIMD gains don't offset. q6 stays on gemv6 in the engine;
 gemv8_q6 kept harness-only.
+
+### gemv8 numeric-family UNIFICATION — spec invariant restored (2026-09-07)
+
+Routed the verify batches (t<16) through gemv8 as well — gemv_w's G8
+gate widened from t=1 to t<16 (prefill tiles still own t>=16) and
+gemv_stage jobs dispatch via gemv8 when active. Result: the t=1 decode
+and the spec verify batches now share ONE accumulation order —
+spec==nonspec x4 back to True (measured), France exact, HIP 19/19.
+gemv8 is now a complete-quality path: exact kernels, faster engine
+(step -11.4%, tg32 6.70), invariant-safe. Still opt-in
+(LLM170_G8=1) pending the long-form gate and np4 tie checks on the
+unified family.
