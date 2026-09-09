@@ -1,0 +1,30 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+// kv_append_q8 (plans/38 A4) — f32 k/v 행 [n_kv*hd] → q8_0 블록 [pos][nblocks][34B].
+// 블록 = d f16(2B, RNE) + 32×i8 (round-half-away — quant_q8 준거).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Src { float x[]; };
+layout(binding = 1) buffer Dst { uint8_t q8[]; };
+layout(push_constant) uniform PC {
+    uint n; uint pos;
+} pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;   // 32원소 블록
+    uint nb = pc.n >> 5;
+    if (b >= nb) return;
+    uint base = pc.pos * nb * 34u + b * 34u;
+    float amax = 0.0;
+    for (uint e = 0; e < 32u; e++) amax = max(amax, abs(x[b * 32u + e]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint dh = packHalf2x16(vec2(d, 0.0));   // RNE f16
+    q8[base] = uint8_t(dh & 0xFFu);
+    q8[base + 1u] = uint8_t((dh >> 8u) & 0xFFu);
+    for (uint e = 0; e < 32u; e++) {
+        float xv = x[b * 32u + e] * id;
+        float r = xv >= 0.0 ? float(int(xv + 0.5)) : -float(int(0.5 - xv));
+        float c = clamp(r, -127.0, 127.0);
+        q8[base + 2u + e] = uint8_t(int(c) & 0xFF);
+    }
+}

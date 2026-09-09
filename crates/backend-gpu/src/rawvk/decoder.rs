@@ -22,6 +22,8 @@ const NORM_GATED_SPV: &[u8] = include_bytes!("spv/norm_gated.spv");
 const QK_ROPE_SPV: &[u8] = include_bytes!("spv/qk_rope.spv");
 const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
+const KV_APPEND_Q8_SPV: &[u8] = include_bytes!("spv/kv_append_q8.spv");
+const QSA_FLASH_Q8_SPV: &[u8] = include_bytes!("spv/qsa_flash_q8.spv");
 const COPY_OFF_SPV: &[u8] = include_bytes!("spv/copy_off.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const TILE_XS_SPV: &[u8] = include_bytes!("spv/tile_xs.spv");
@@ -528,7 +530,9 @@ impl DecoderState {
 
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
-        let zeros_kv = vec![0u8; kv_len * 4];
+        let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
+        let kv_store: usize = if kv8 { kv_len / 32 * 34 } else { kv_len * 4 };
+        let zeros_kv = vec![0u8; kv_store];
         let mut kv_k = Vec::with_capacity(n_full);
         let mut kv_v = Vec::with_capacity(n_full);
         for _ in 0..n_full {
@@ -589,7 +593,7 @@ impl DecoderState {
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
         let (mut mkk, mut mvv) = (Vec::new(), Vec::new());
         if mtp_on {
-            let zeros = vec![0u8; kv_len * 4];
+            let zeros = vec![0u8; kv_store];
             for _ in 0..n_seqs {
                 let k = ctx.alloc(kv_len * 4)?;
                 unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), k.ptr, zeros.len()) };
@@ -1205,6 +1209,7 @@ impl DecoderState {
     /// t=1 단일 스텝 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
+        let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), n);
         let (dt_rank, d_state, d_inner) = (self.dt_rank, self.d_state, self.d_inner);
@@ -1356,20 +1361,34 @@ impl DecoderState {
                 {
                     let push = Self::push_u32s(&[(n_kv * hd) as u32, pos as u32]);
                     // k/v 어펜드는 상호 독립 — k 배리어 생략, v가 종결 (flash는 둘 다 판독)
-                    self.run_pipe_b("kv_app", KV_APPEND_SPV, 2, 8,
-                        &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push,
-                        (n_kv * hd).div_ceil(64) as u32, 1, 1, false)?;
-                    self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
-                        &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
-                        (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
+                    if kv8 {
+                        let gq = (n_kv * hd).div_ceil(32).div_ceil(64) as u32;
+                        self.run_pipe_b("kv_app_q8", KV_APPEND_Q8_SPV, 2, 8,
+                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push, gq, 1, 1, false)?;
+                        self.run_pipe("kv_app_q8", KV_APPEND_Q8_SPV, 2, 8,
+                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push, gq, 1, 1)?;
+                    } else {
+                        self.run_pipe_b("kv_app", KV_APPEND_SPV, 2, 8,
+                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push,
+                            (n_kv * hd).div_ceil(64) as u32, 1, 1, false)?;
+                        self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
+                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
+                            (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
+                    }
                 }
                 if attn_cut >= 3 {
                 // flash
                 {
                     let push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32]);
-                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
-                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
-                        &push, 1, n_head as u32, 1)?;
+                    if kv8 {
+                        self.run_pipe("qsa_flash_q8", QSA_FLASH_Q8_SPV, 4, 16,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, 1, n_head as u32, 1)?;
+                    } else {
+                        self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, 1, n_head as u32, 1)?;
+                    }
                 }
                 if attn_cut >= 4 {
                     self.gemv_w(self.b_aout.buf.clone(), self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, 1, n_head * hd)?;
@@ -1438,6 +1457,7 @@ impl DecoderState {
     /// all_logits=true: 전 행 head 로짓 [t][n_vocab] (verify용 — b_lg_t).
     /// 아니면 마지막 행만 (b_lg). emb는 [t][n_embd].
     pub fn step_batch(&mut self, seq: usize, pos0: usize, emb: &[f32], all_logits: bool) -> Result<Vec<f32>, String> {
+        let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
         let vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
@@ -1622,19 +1642,33 @@ impl DecoderState {
                 // kv append — grid (n/64, t). k/v 상호 독립 — k 배리어 생략, v가 종결
                 {
                     let push = Self::push_u32s(&[(n_kv * hd) as u32, pos0 as u32]);
-                    self.run_pipe_b("kv_app", KV_APPEND_SPV, 2, 8,
-                        &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push,
-                        (n_kv * hd).div_ceil(64) as u32, t as u32, 1, false)?;
-                    self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
-                        &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
-                        (n_kv * hd).div_ceil(64) as u32, t as u32, 1)?;
+                    if kv8 {
+                        let gq = (n_kv * hd).div_ceil(32).div_ceil(64) as u32;
+                        self.run_pipe_b("kv_app_q8", KV_APPEND_Q8_SPV, 2, 8,
+                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push, gq, t as u32, 1, false)?;
+                        self.run_pipe("kv_app_q8", KV_APPEND_Q8_SPV, 2, 8,
+                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push, gq, t as u32, 1)?;
+                    } else {
+                        self.run_pipe_b("kv_app", KV_APPEND_SPV, 2, 8,
+                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf], &push,
+                            (n_kv * hd).div_ceil(64) as u32, t as u32, 1, false)?;
+                        self.run_pipe("kv_app", KV_APPEND_SPV, 2, 8,
+                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf], &push,
+                            (n_kv * hd).div_ceil(64) as u32, t as u32, 1)?;
+                    }
                 }
                 // flash — grid (t, n_head), np = pos0+행+1
                 {
                     let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32]);
-                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
-                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
-                        &push, t as u32, n_head as u32, 1)?;
+                    if kv8 {
+                        self.run_pipe("qsa_flash_q8", QSA_FLASH_Q8_SPV, 4, 16,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, t as u32, n_head as u32, 1)?;
+                    } else {
+                        self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, t as u32, n_head as u32, 1)?;
+                    }
                 }
                 self.gemv_w(self.b_aout.buf.clone(), self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, t, n_head * hd)?;
                 full_idx += 1;
