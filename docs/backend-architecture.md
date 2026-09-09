@@ -57,15 +57,18 @@ Type-driven, one table (decoder.rs `gemv_w`):
 
 | Condition | Path |
 |---|---|
-| t<16, ty ∈ {q3_K, q4_K, q5_K, iq4_xs} | `gemv8` — llama mul_mat_vec port, f32 activations direct (kill-switch `LLM170_G8=0`) |
-| everything else (q6_K, q8_0, iq4_nl, iq3_s, t≥16 non-tile) | `quant` + `gemv3` integer path |
-| t≥16 + `LLM170_VK_TILE` | coopmat f16 tiles (prefill; llama MMA accuracy class) |
-| opt-in `LLM170_VK_I8ON` | i8 coopmat GEMM (plans/23) |
+| t<16, ty ∈ {q3_K, q4_K, q5_K, q6_K, iq4_xs} | `gemv8` — llama mul_mat_vec port, f32 activations direct (kill-switch `LLM170_G8=0`) |
+| t≥16 | coopmat f16 tiles — default prefill path (kill-switch `LLM170_VK_NOTILE=1`; batch prefill kill-switch `LLM170_VKD_BATCH=0`) |
+| everything else (q8_0, iq4_nl, iq3_s at t<16) | `quant` + `gemv3` integer path |
+| experimental `LLM170_VK_I8ON` | i8 coopmat GEMM (superseded by tiles; kept for the integer-MMA contract) |
 
-The gemv4/5/6/7 generations were deleted after gemv8 promotion; an
-engine-level A/B kept q6_K on gemv3+quant (7.06 vs 6.71 t/s tg32 median).
-`vk-gemv8-check` verifies each type against the CPU dequant dot; the
-gemv8_q6 shader is retained for the q6_K retry (plans/36 G1).
+The gemv4/5/6/7 generations were deleted after gemv8 promotion; the q6_K
+gemv8 port (u16 block view, 160 GB/s, bit-exact vs CPU at t=1) landed
+2026-09-08 and replaced the gemv3 route for q6_K decode weights and the
+output head. `vk-gemv8-check` verifies each type against the CPU dequant
+dot. Batch prefill and tiles became defaults after the 2026-09-04 divergence
+was root-caused to the (fixed) descriptor-set reuse race; speculative verify
+stays per-token by default (known intermittent flake, plans/38 A2).
 
 ## Kernel sources (rawhip)
 
