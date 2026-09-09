@@ -5,6 +5,23 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+## Vulkan tile-correctness round (2026-09-09, plans/38 A2)
+
+A new `vk-tile-check` harness (per-type tile kernel vs CPU dequant f64 dot)
+found two corrupt tile kernels that the earlier gates had missed: tile_q6k
+(uint zero-extension dropping the sign of negative i8 scales, plus a global
+sb used as a block-local half index — garbage beyond block 0) and tile_xs
+(reading 32B of a 16B sub-block, overwriting columns with the next
+sub-block and OOB-writing shared rows). Both fixed; all 8 tile types now
+maxrel ≤ 0.007 at t=1..64. The np4 prefill degeneracy (degenerate repeated
+tokens for ≥16-token prompts) is gone and the spec path is deterministic;
+the remaining spec-vs-plain near-tie divergence is a separate, deterministic
+MTP numeric-order issue (vulkan-only; HIP exact). Re-assessment note: the
+previous session's "vk judge 19/19×7" runs used the harness default runtime
+(HIP) — the true vulkan gates start this round. Also this round: the ctx²
+f32 mask was removed (qsa_flash's causal loop bound already masks — 256MB at
+8k context), pp64 142 t/s / tg4 7.4 on the corrected tiles.
+
 ## Vulkan execution-round gate (2026-09-08, plans/36 G1-G4/P1-P4)
 
 Full plans/36 round on q35work.gguf, 3-run medians, zero-config defaults
