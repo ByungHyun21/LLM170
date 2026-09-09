@@ -22,6 +22,24 @@ previous session's "vk judge 19/19×7" runs used the harness default runtime
 f32 mask was removed (qsa_flash's causal loop bound already masks — 256MB at
 8k context), pp64 142 t/s / tg4 7.4 on the corrected tiles.
 
+## Vulkan perf-parity round (2026-09-09, plans/39)
+
+Five structural tile experiments against the llama mul_mm gap (tiles = 72%
+of chunk GPU time, 38 vs llama 98 GB/s effective weight streaming): T_MAX
+128 + 128-token tiles (clean, flat), an f16 pre-dequant weight cache
+(63 GB/s streaming but 2x bytes = net loss, opt-in `LLM170_VK_F16W=1`),
+direct coopMatStore ColumnMajor drain (unreliable on RADV — both layout
+interpretations corrupt), a 2-WG/CU occupancy variant (neutral), and a
+family rollout of the q5 kernel structure to all tile types (verified
+maxrel<=0.007, flat). Verdict: the remaining 2.4x is inside the llama
+mul_mm kernel structure (32x32 warp tiles, WMITER, BK=32, 16 KB shmem,
+split_k) — a full port is the single remaining pp lever. tg levers
+(addrms+quant fusion) untried. Feature gates on the rolled-out path:
+np4 clean, spec divergence unchanged (known f16-prefill class), mmproj vl
+reads the NYT moon-landing headline correctly. Side RCA: an init-time
+17.5 GB host-heap clone in the f16w cache OOM-killed the 30 GiB host
+(fixed by borrowing); heavy llm170 processes must run one at a time.
+
 Second pass (same day): q8_0 KV cache (kv_append_q8 + dequant-on-read
 qsa_flash_q8, opt-in `LLM170_VK_KV8=1`) — 3.76x KV bytes cut (2048-ctx
 256→68 MB), tg32 neutral (weights-bound), early-token divergences at short
