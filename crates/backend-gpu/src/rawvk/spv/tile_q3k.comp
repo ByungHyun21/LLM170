@@ -5,9 +5,11 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-// tile_q3k (plans/32) — q3_K 128행 타일. tile_q4k 구조에 q3_K 기하 적용.
-// 블록 110B: hm 32B @0 (비트팩), q 64B @32 (2비트×4), scales 12B @96,
-// d f16 @108. 원소: sb(32) = n*4+j*2+half — 값 = d·(sc-32)·((q>>2j)&3 − (hm비트?0:4)).
+// tile_q3k — q5 tile128 구조로 재생성 (plans/39 패밀리 롤아웃: 2-sb·f16 Ctmp·128토큰): 토큰 128 (T_MAX=128 — pp512 청크 8→4, 가중
+// 재독출 절반). 512스레드=8서브그룹×16행, 2-sb(64k)/반복, 8 accs.
+// 드레인: coopMatStore RowMajor → f16 Ctmp(16.6KB) 후 2분할 전사 —
+// 직접 ColumnMajor 저장은 실측 부정확(레이아웃 해석 상이)하여 폐기.
+// LDS: A 17.4K + B 17.4K + Ctmp 16.6K = 51.4KB.
 layout(local_size_x = 512) in;
 layout(binding = 0) readonly buffer W0 { uint w0c[]; };
 layout(binding = 1) readonly buffer W1 { uint w1c[]; };
@@ -20,12 +22,12 @@ layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint t; uint cw_log2; uint cw_mask;
+    uint n_in; uint n_out; uint xq_w; uint t;
 } pc;
 
 uint WG(uint idx) {
-    uint c = idx >> pc.cw_log2;
-    uint o = idx & pc.cw_mask;
+    uint c = idx >> 25u;
+    uint o = idx & 0x1FFFFFFu;
     if (c == 0u) return w0c[o];
     if (c == 1u) return w1c[o];
     if (c == 2u) return w2c[o];
@@ -36,36 +38,15 @@ uint WG(uint idx) {
     return w7c[o];
 }
 
-shared float16_t A16[128][36];
-shared float16_t B16[64][36];
-shared float Ctmp[128][65];
+shared float16_t A16[128][68];  // 행 × 64k(+pad)
+shared float16_t B16[128][68];  // 토큰 128 × 64k(+pad)
+shared float16_t Ctmp[128][65]; // 드레인 f16 — f16 coopmat 변환 후 저장
 
-void main() {
-    uint bid = gl_WorkGroupID.x;
-    uint tid = gl_LocalInvocationID.x;
-    uint sg = gl_SubgroupID;
-    int n_in = int(pc.n_in);
-    int n_sub = n_in >> 5;
-    int blocks = n_in >> 8;
-    int row0 = int(bid) * 128;
-    int nt = int(min(pc.t, 64u));
-    int nrow = int(min(128u, pc.n_out - uint(row0)));
-
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc3 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-
-    for (int sb = 0; sb < n_sub; sb++) {
-        {
-            int r = int(tid >> 2);
-            int kc = int(tid & 3) * 8;
-            int row = row0 + r;
-            if (row < nrow + row0) {
+void stage_a(int sb, int colb, bool live, int row0, int nrow, int blocks, int tid) {
+    int r = int(tid >> 2);              // 행 0..127
+    int kc = int(tid & 3) * 8;          // k 오프셋 0/8/16/24
+    int row = row0 + r;
+    if (row < nrow + row0) {
                 int rowb = row * blocks * 110 + (sb >> 3) * 110;
                 // d f16 @108
                 uint dw = WG(uint((rowb + 108) >> 2));
@@ -111,66 +92,85 @@ void main() {
                     uint qv = (qsel >> uint(((k & 3) * 8) + 0)) & 0xFFu;  // 아래에서 2비트 시프트
                     uint hm8 = (hsel >> uint((k & 3) * 8)) & 0xFFu;
                     int v = int((qv >> sh2) & 3u) - ((hm8 & hbit) != 0u ? 0 : 4);
-                    A16[r][k] = float16_t(float(v) * dl);
+                    A16[r][colb + k] = float16_t(float(v) * dl);
                 }
             } else {
-                for (int e = 0; e < 8; e++) A16[r][kc + e] = float16_t(0.0);
-            }
+        for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+void stage_b(int sb, int colb, bool live, int nt, int tid, int n_in) {
+    // 512스레드 → 128토큰 × 32k: 스레드당 8원소 (e = tid*8, 토큰 = e>>5)
+    int e0 = int(tid) * 8;
+    int ti2 = e0 >> 5;
+    int k2 = e0 & 31;
+    if (live && ti2 < nt) {
+        uint base = uint(ti2) * pc.xq_w;
+        int xw = (sb << 5) >> 2;
+        float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+        for (int e = 0; e < 8; e++) {
+            uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
+            int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
+            B16[ti2][colb + k2 + e] = float16_t(float(b) * yd);
         }
-        {
-            int fl = int(tid) * 4;
-            int ti2 = fl >> 5;
-            int k2 = fl & 31;
-            if (ti2 < nt) {
-                uint base = uint(ti2) * pc.xq_w;
-                int xw = (sb << 5) >> 2;
-                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
-                for (int e = 0; e < 4; e++) {
-                    uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
-                    int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
-                    B16[ti2][k2 + e] = float16_t(float(b) * yd);
-                }
-            } else if (ti2 < 64) {
-                for (int e = 0; e < 4; e++) B16[ti2][k2 + e] = float16_t(0.0);
-            }
-        }
+    } else if (ti2 < 128) {
+        for (int e = 0; e < 8; e++) B16[ti2][colb + k2 + e] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;   // 0..511
+    uint sg = gl_SubgroupID;            // 0..7 (행 그룹: sg*16행)
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 8;
+    int row0 = int(bid) * 128;
+    int nt = int(min(pc.t, 128u));
+    int nrow = int(min(128u, pc.n_out - uint(row0)));
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    for (int i = 0; i < 8; i++)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb += 2) {
+        stage_a(sb, 0, true, row0, nrow, blocks, int(tid));
+        stage_b(sb, 0, true, nt, int(tid), n_in);
+        bool live2 = sb + 1 < n_sub;
+        stage_a(sb + 1, 32, live2, row0, nrow, blocks, int(tid));
+        stage_b(sb + 1, 32, live2, nt, int(tid), n_in);
         barrier();
-        for (int ks = 0; ks < 2; ks++) {
+        for (int ks = 0; ks < 4; ks++) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
-            coopMatLoad(fa, A16[sg << 4], ks * 16, 36, gl_CooperativeMatrixLayoutRowMajor);
-            if (nt > 0) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb0;
-                coopMatLoad(fb0, B16[0], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
-                acc0 = coopMatMulAdd(fa, fb0, acc0);
-            }
-            if (nt > 16) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb1;
-                coopMatLoad(fb1, B16[16], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
-                acc1 = coopMatMulAdd(fa, fb1, acc1);
-            }
-            if (nt > 32) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb2;
-                coopMatLoad(fb2, B16[32], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
-                acc2 = coopMatMulAdd(fa, fb2, acc2);
-            }
-            if (nt > 48) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb3;
-                coopMatLoad(fb3, B16[48], ks * 16, 36, gl_CooperativeMatrixLayoutColumnMajor);
-                acc3 = coopMatMulAdd(fa, fb3, acc3);
+            coopMatLoad(fa, A16[sg << 4], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+            for (int fb = 0; fb < 8; fb++) {
+                if (nt > fb * 16) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+                    coopMatLoad(fbb, B16[fb * 16], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[fb] = coopMatMulAdd(fa, fbb, acc[fb]);
+                }
             }
         }
         barrier();
     }
-    if (nt > 0) coopMatStore(acc0, Ctmp[sg << 4], 0, 65, gl_CooperativeMatrixLayoutRowMajor);
-    if (nt > 16) coopMatStore(acc1, Ctmp[sg << 4], 16, 65, gl_CooperativeMatrixLayoutRowMajor);
-    if (nt > 32) coopMatStore(acc2, Ctmp[sg << 4], 32, 65, gl_CooperativeMatrixLayoutRowMajor);
-    if (nt > 48) coopMatStore(acc3, Ctmp[sg << 4], 48, 65, gl_CooperativeMatrixLayoutRowMajor);
-    barrier();
-    for (int i = int(tid); i < nrow * nt; i += 512) {
-        int r = i / nt, c = i % nt;
-        int row = row0 + r;
-        if (row < nrow + row0) {
-            outv[uint(c) * pc.n_out + uint(row)] = Ctmp[r][c];
+
+    // 드레인: 토큰 절반(64)씩 2패스 — Ctmp 재사용 (f16)
+    for (int hf = 0; hf < 2; hf++) {
+        int tq = hf * 4;   // acc 인덱스 기저
+        for (int i = 0; i < 4; i++) {
+            if (nt > (tq + i) * 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[tq + i]);
+                coopMatStore(hf16, Ctmp[sg << 4], i * 16, 65, gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
+        barrier();
+        int ncols = min(nt - hf * 64, 64);
+        for (int i = int(tid); i < nrow * ncols; i += 512) {
+            int r = i / ncols;
+            int ti = i % ncols;
+            outv[uint(hf * 64 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+        }
+        barrier();
     }
 }

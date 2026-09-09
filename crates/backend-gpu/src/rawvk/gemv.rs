@@ -1109,6 +1109,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         return Err("tile 검증 t는 1..=128".into());
     }
     let (spv_name, n_kb, extra) = match w.ty {
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_OCC").map(|v| v=="1").unwrap_or(false) => ("tile128o.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_DS").map(|v| v=="1").unwrap_or(false) => ("tile128_ds.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),

@@ -5,7 +5,7 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-// tile_q8 — q5 tile128 구조로 재생성 (plans/39 패밀리 롤아웃: 2-sb·f16 Ctmp·128토큰): 토큰 128 (T_MAX=128 — pp512 청크 8→4, 가중
+// q5_K 128행 타일 (plans/39): 토큰 128 (T_MAX=128 — pp512 청크 8→4, 가중
 // 재독출 절반). 512스레드=8서브그룹×16행, 2-sb(64k)/반복, 8 accs.
 // 드레인: coopMatStore RowMajor → f16 Ctmp(16.6KB) 후 2분할 전사 —
 // 직접 ColumnMajor 저장은 실측 부정확(레이아웃 해석 상이)하여 폐기.
@@ -46,32 +46,46 @@ void stage_a(int sb, int colb, bool live, int row0, int nrow, int blocks, int ti
     int r = int(tid >> 2);              // 행 0..127
     int kc = int(tid & 3) * 8;          // k 오프셋 0/8/16/24
     int row = row0 + r;
-    if (row < nrow + row0) {
-                int rowb = row * n_sub * 34 + sb * 34;   // 바이트 기준 블록
-                uint wd = WG(uint(rowb >> 2));
-                float d = unpackHalf2x16(wd >> uint((rowb & 3) * 8)).x;
-                // qs 32B @2 — 스레드당 8원소 = 2워드
-                uint qb = uint(rowb + 2) + uint(kc);
-                uint wva = WG(qb >> 2);
-                uint rem = qb & 3u;
-                if (rem != 0u) {
-                    uint w2 = WG((qb >> 2) + 1u);
-                    wva = (wva >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
-                }
-                uint qb2 = qb + 4u;
-                uint wvb = WG(qb2 >> 2);
-                rem = qb2 & 3u;
-                if (rem != 0u) {
-                    uint w2 = WG((qb2 >> 2) + 1u);
-                    wvb = (wvb >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
-                }
-                for (int e = 0; e < 8; e++) {
-                    int j = kc + e;
-                    uint wsel = ((j & 4) == 0) ? wva : wvb;
-                    uint b8 = (wsel >> uint((j & 3) * 8)) & 0xFFu;
-                    A16[r][j] = float16_t(float((int(b8) << 24) >> 24) * d);
-                }
-            } else {
+    if (live && row < nrow + row0) {
+        int js = sb & 7;
+        int it = js >> 1;
+        int halfb = js & 1;
+        int wq = ((row * blocks + (sb >> 3)) * 176) >> 2;
+        uint w0 = WG(wq);
+        float d = unpackHalf2x16(w0).x;
+        float dm = unpackHalf2x16(w0).y;
+        uint sc0 = WG(wq+1), sc1 = WG(wq+2), sc2 = WG(wq+3);
+        uint r2 = (uint(js & 3)) * 8u;
+        uint b_j   = js < 4 ? (sc0 >> r2) & 0xFFu : (sc1 >> r2) & 0xFFu;
+        uint b_j4  = js < 4 ? (sc1 >> r2) & 0xFFu : (sc2 >> r2) & 0xFFu;
+        uint b_jm4 = (sc0 >> r2) & 0xFFu;
+        uint sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        float ds0 = d * float(sc_v);
+        float ds1 = dm * float(m_v);
+        uint nsh = uint(halfb << 2);
+        int sh = 2 * it + halfb;
+        int qbase = wq + 12 + it * 8;
+        int qhbase = wq + 4;
+        uint ql0 = WG(qbase + (kc >> 2));
+        uint ql1 = WG(qbase + (kc >> 2) + 1);
+        uint qh0 = WG(qhbase + (kc >> 2));
+        uint qh1 = WG(qhbase + (kc >> 2) + 1);
+        for (int e = 0; e < 8; e++) {
+            int k = kc + e;
+            uint qlw = ((k & 4) == 0) ? ql0 : ql1;
+            uint qhw = ((k & 4) == 0) ? qh0 : qh1;
+            uint byte_v = (qlw >> uint((k & 3) * 8)) & 0xFFu;
+            uint nib = (byte_v >> nsh) & 0xFu;
+            uint hi = (qhw >> uint((k & 3) * 8 + sh)) & 1u;
+            float wv = float(nib) + (hi != 0u ? 16.0 : 0.0);
+            A16[r][colb + k] = float16_t(wv * ds0 - ds1);
+        }
+    } else {
         for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
     }
 }
@@ -131,23 +145,10 @@ void main() {
         barrier();
     }
 
-    // 드레인: 토큰 절반(64)씩 2패스 — Ctmp 재사용 (f16)
-    for (int hf = 0; hf < 2; hf++) {
-        int tq = hf * 4;   // acc 인덱스 기저
-        for (int i = 0; i < 4; i++) {
-            if (nt > (tq + i) * 16) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[tq + i]);
-                coopMatStore(hf16, Ctmp[sg << 4], i * 16, 65, gl_CooperativeMatrixLayoutRowMajor);
-            }
+    // 직접 저장 시험 v2: ColumnMajor stride=1 (전치 해석)
+    for (int fb = 0; fb < 8; fb++) {
+        if (nt > fb * 16) {
+            coopMatStore(acc[fb], outv, uint(row0), 1u, gl_CooperativeMatrixLayoutColumnMajor);
         }
-        barrier();
-        int ncols = min(nt - hf * 64, 64);
-        for (int i = int(tid); i < nrow * ncols; i += 512) {
-            int r = i / ncols;
-            int ti = i % ncols;
-            outv[uint(hf * 64 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
-        }
-        barrier();
     }
 }
