@@ -68,7 +68,7 @@ void main() {
             int row = row0 + r;
             if (row < nrow + row0) {
                 int rowb = row * blocks * 210 + (sb >> 3) * 210;
-                // d f16 @208 — 블록 어긋남(210B) 처리: 바이트 208,209가 워드 걸침 가능
+                // d f16 @208 — 210B 블록: 워드 걸침 가능
                 uint dws = (rowb + 208) & 3;
                 uint dw = WG(uint((rowb + 208) >> 2));
                 uint db = (dw >> (dws * 8)) & 0xFFFFu;
@@ -77,32 +77,27 @@ void main() {
                     db = ((dw >> (dws * 8)) | (w2 << ((4u - dws) * 8))) & 0xFFFFu;
                 }
                 float d = unpackHalf2x16(db).x;
-                int n2 = int(sb >> 2);
+                int n2 = int((sb & 7) >> 2);   // 블록 내 하프 — 전역 sb 그대로 쓰면
+                                                 // 블록≥1에서 폭주 (A2 진범)
                 int w4 = int(sb & 3);
-                // ql/qh 바이트: l = kc+e (0..31 내 kc 그룹)
                 int qloff = (w4 == 1 || w4 == 3) ? 32 : 0;
                 int qlb0 = rowb + n2 * 64 + qloff + (kc & 31);
-                uint qlw0 = WG(uint(qlb0 >> 2));
-                uint qlw1 = WG(uint((qlb0 + 4) >> 2));
                 int qhb0 = rowb + 128 + n2 * 32 + (kc & 31);
-                uint qhw0 = WG(uint(qhb0 >> 2));
-                uint qhw1 = WG(uint((qhb0 + 4) >> 2));
-                // sc: n*8 + (kc/16) + w4*2 (한 스레드 8원소는 같은 16그룹)
+                // sc: n*8 + (kc/16) + w4*2 — int 캐스트 필수 (uint 시프트는
+                // 제로확장 — 음수 i8 스케일 부호 소실이 A2 근본 원인)
                 int sci = n2 * 8 + (kc >> 4) + w4 * 2;
                 int scb0 = (rowb + 192 + sci) & 3;
                 int scw0 = (rowb + 192 + sci) >> 2;
-                uint scv8 = (WG(uint(scw0)) >> uint(scb0 * 8)) & 0xFFu;
+                int scv8 = int((WG(uint(scw0)) >> uint(scb0 * 8)) & 0xFFu);
                 scv8 = (scv8 << 24) >> 24;
-                float dl = d * float(int(scv8));
-                // qh 비트 셀렉터: w=0: bits0-1, 1: 2-3, 2: 4-5, 3: 6-7
+                float dl = d * float(scv8);
                 uint qsh = uint(w4 * 2);
-                uint nsh6 = uint((w4 == 0 || w4 == 1) ? 0 : 4);  // lo/hi 니블
+                uint nsh6 = uint((w4 == 0 || w4 == 1) ? 0 : 4);
                 for (int e = 0; e < 8; e++) {
                     int k = kc + e;
-                    uint qlsel = ((k & 4) == 0) ? qlw0 : qlw1;
-                    uint qhsel = ((k & 4) == 0) ? qhw0 : qhw1;
-                    uint qlb = (qlsel >> uint((k & 3) * 8)) & 0xFFu;
-                    uint qhb = (qhsel >> uint((k & 3) * 8)) & 0xFFu;
+                    // 바이트당 직접 워드 판독 (210B 비정렬에 강제 — A2)
+                    uint qlb = (WG(uint((qlb0 + e) >> 2)) >> uint(((qlb0 + e) & 3) * 8)) & 0xFFu;
+                    uint qhb = (WG(uint((qhb0 + e) >> 2)) >> uint(((qhb0 + e) & 3) * 8)) & 0xFFu;
                     int v = int((qlb >> nsh6) & 0xFu) | int((qhb >> qsh) & 3u) << 4;
                     A16[r][k] = float16_t(float(v - 32) * dl);
                 }
@@ -110,6 +105,7 @@ void main() {
                 for (int e = 0; e < 8; e++) A16[r][kc + e] = float16_t(0.0);
             }
         }
+        // B 스테이징: tile128과 동일 (xq q8 → f16)
         {
             int fl = int(tid) * 4;
             int ti2 = fl >> 5;
