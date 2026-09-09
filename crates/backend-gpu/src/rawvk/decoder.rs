@@ -1366,10 +1366,9 @@ impl DecoderState {
                 if attn_cut >= 3 {
                 // flash
                 {
-                    let mask = self.consts.get("mask").cloned().ok_or("mask")?;
-                    let push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, self.ctx_len as u32]);
-                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 5, 24,
-                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, mask.buf, self.b_aout.buf],
+                    let push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32]);
+                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
+                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
                         &push, 1, n_head as u32, 1)?;
                 }
                 if attn_cut >= 4 {
@@ -1632,10 +1631,9 @@ impl DecoderState {
                 }
                 // flash — grid (t, n_head), np = pos0+행+1
                 {
-                    let mask = self.consts.get("mask").cloned().ok_or("mask")?;
-                    let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, self.ctx_len as u32]);
-                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 5, 24,
-                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, mask.buf, self.b_aout.buf],
+                    let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32]);
+                    self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
+                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
                         &push, t as u32, n_head as u32, 1)?;
                 }
                 self.gemv_w(self.b_aout.buf.clone(), self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, t, n_head * hd)?;
@@ -1822,10 +1820,9 @@ impl DecoderState {
                 (n_kv * hd).div_ceil(64) as u32, 1, 1)?;
         }
         {
-            let mask = self.consts.get("mask").cloned().ok_or("mask")?;
-            let push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, self.ctx_len as u32]);
-            self.run_pipe("qsa_flash", QSA_FLASH_SPV, 5, 24,
-                &[self.b_aq.buf, self.m_kv_k[seq].buf, self.m_kv_v[seq].buf, mask.buf, self.b_aout.buf],
+            let push = Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32]);
+            self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
+                &[self.b_aq.buf, self.m_kv_k[seq].buf, self.m_kv_v[seq].buf, self.b_aout.buf],
                 &push, 1, n_head as u32, 1)?;
         }
         // wo + 잔차
@@ -1947,13 +1944,9 @@ pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         weights.push((n.clone(), w));
     }
     let mut consts = llm170_core::model::rawinject::raw_consts(eng, &cnames);
-    // VkDecoder 마스크: u32 all-ones (t=1 디코드 행은 p<=pos 전부 활성).
-    {
-        let cl = eng.ctx_len();
-        if let Some(m) = consts.iter_mut().find(|(k, _)| k == "mask") {
-            m.1 = (0..cl * cl).map(|_| f32::from_bits(1)).collect();
-        }
-    }
+    // plans/38 A4: qsa_flash가 인과 루프 상한으로 자체 마스킹 — ctx² 마스크
+    // 상수(8k=256MB) 업로드·상주 폐지.
+    consts.retain(|(k, _)| k != "mask");
     let rd: std::sync::Arc<VkDecoder> = std::sync::Arc::new(VkDecoder::new());
     rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
         .map_err(|e| format!("raw_init(vk): {e}"))?;

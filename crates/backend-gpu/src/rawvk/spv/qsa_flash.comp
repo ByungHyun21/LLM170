@@ -2,16 +2,17 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
-// qsa_flash (plans/19) — rawhip qsa_flash t=1 미러. 게이티드 (q+gate 인터리브 2hd).
-// grid (1, n_head), 256스레드 (act = tid < hd). 온라인 softmax f32.
+// qsa_flash (plans/19, plans/38 A4 — 마스크 폐지) — rawhip qsa_flash t=1 미러.
+// 게이티드 (q+gate 인터리브 2hd). grid (t, n_head), 256스레드 (act = tid < hd).
+// 온라인 softmax f32. 인과성은 루프 상한(p < np = pos+1)이 이미 보장 —
+// ctx² f32 마스크 버퍼 제거.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer Q { float q[]; };     // [n_head*2hd]
 layout(binding = 1) readonly buffer Ck { float ck[]; };   // [ctx][n_kv*hd]
 layout(binding = 2) readonly buffer Cv { float cv[]; };   // [ctx][n_kv*hd]
-layout(binding = 3) readonly buffer Mask { uint mask[]; };// [ctx][ctx]
-layout(binding = 4) buffer O { float o[]; };              // [t][n_head*hd]
+layout(binding = 3) buffer O { float o[]; };              // [t][n_head*hd]
 layout(push_constant) uniform PC {
-    int pos0; int nh; int nk; int hd; int ss;
+    int pos0; int nh; int nk; int hd;
 } pc;
 shared float qf[256];
 shared float rs[8];
@@ -32,7 +33,6 @@ void main() {
     float sm = 0.0;
     float acc = 0.0;
     for (int p = 0; p < np; p++) {
-        if (mask[pos * pc.ss + p] == 0u) continue;
         int kb = p * pc.nk * pc.hd + kvh * pc.hd;
         float x = act ? qf[tid] * ck[kb + tid] : 0.0;
         for (int off = 16; off > 0; off >>= 1)
