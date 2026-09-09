@@ -1110,6 +1110,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_V2").as_deref() == Ok("2") => ("tile128v2_dbg.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_V2").as_deref() == Ok("3") => ("tile128v2_dbg2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),
@@ -1122,7 +1123,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         _ => return Err("tile 검증 불가 타입".into()),
     };
     let is_128 = w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none();
-    let v2dbg = std::env::var("LLM170_TILE_V2").as_deref() == Ok("2");
+    let v2dbg = std::env::var("LLM170_TILE_V2").map(|v| v == "2" || v == "3").unwrap_or(false);
     let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
@@ -1193,7 +1194,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         for r in 0..n_out.min(64) {
             llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row2);
             let s: f64 = ref_row2.iter().map(|&v| v as f64).sum();
-            let g = outs[r] as f64;
+            let g = (if std::env::var("LLM170_TILE_V2").as_deref() == Ok("3") { outs[r * 16] } else { outs[r] }) as f64;
             let rel = (g - s).abs() / s.abs().max(1.0);
             if rel > worst.1 { worst = (r, rel, s); }
         }
