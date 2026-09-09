@@ -1,0 +1,112 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// tile_f16 (plans/39) — 사전 디양자화 f16 가중 전용 통일 타일. 모든 양자 타입이
+// init 시 f16 행렬 [no][ni]로 변환됨 — 루프 내 디양자화 ALU 소멸 (MFU 8→~20
+// 목표). 512스레드=8sg×16행, 2-sb(64k)/반복, 토큰 128, f16 Ctmp 2분할 드레인.
+// LDS: A 17.4K + B 17.4K + Ctmp 16.6K = 51.4KB.
+layout(local_size_x = 512) in;
+layout(binding = 0) readonly buffer Wbuf { float16_t w[]; };  // [n_out][n_in]
+layout(binding = 1) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 2) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint t;
+} pc;
+
+shared float16_t A16[128][68];
+shared float16_t B16[128][68];
+shared float16_t Ctmp[128][65];
+
+void stage_a(int sb, int colb, bool live, int row0, int nrow, int tid) {
+    int r = int(tid >> 2);
+    int kc = int(tid & 3) * 16;          // 스레드당 16 k (f16×8 = u16×16)
+    int row = row0 + r;
+    if (live && row < nrow + row0) {
+        uint base = uint(row) * pc.n_in + uint(sb * 32 + kc);
+        for (int e = 0; e < 16; e += 2) {
+            uint wv = packHalf2x16(vec2(float(w[base + uint(e)]), float(w[base + uint(e + 1)])));
+            // f16 그대로 전달 — 재팩킹 불필요, 직접 저장
+            A16[r][colb + kc + e] = w[base + uint(e)];
+            A16[r][colb + kc + e + 1] = w[base + uint(e + 1)];
+        }
+    } else {
+        for (int e = 0; e < 16; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+void stage_b(int sb, int colb, bool live, int nt, int tid, int n_in) {
+    int e0 = int(tid) * 8;
+    int ti2 = e0 >> 5;
+    int k2 = e0 & 31;
+    if (live && ti2 < nt) {
+        uint base = uint(ti2) * pc.xq_w;
+        int xw = (sb << 5) >> 2;
+        float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+        for (int e = 0; e < 8; e++) {
+            uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
+            int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
+            B16[ti2][colb + k2 + e] = float16_t(float(b) * yd);
+        }
+    } else if (ti2 < 128) {
+        for (int e = 0; e < 8; e++) B16[ti2][colb + k2 + e] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 128;
+    int nt = int(min(pc.t, 128u));
+    int nrow = int(min(128u, pc.n_out - uint(row0)));
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    for (int i = 0; i < 8; i++)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb += 2) {
+        stage_a(sb, 0, true, row0, nrow, int(tid));
+        stage_b(sb, 0, true, nt, int(tid), n_in);
+        bool live2 = sb + 1 < n_sub;
+        stage_a(sb + 1, 32, live2, row0, nrow, int(tid));
+        stage_b(sb + 1, 32, live2, nt, int(tid), n_in);
+        barrier();
+        for (int ks = 0; ks < 4; ks++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+            coopMatLoad(fa, A16[sg << 4], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+            for (int fb = 0; fb < 8; fb++) {
+                if (nt > fb * 16) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+                    coopMatLoad(fbb, B16[fb * 16], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[fb] = coopMatMulAdd(fa, fbb, acc[fb]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (int hf = 0; hf < 2; hf++) {
+        int tq = hf * 4;
+        for (int i = 0; i < 4; i++) {
+            if (nt > (tq + i) * 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[tq + i]);
+                coopMatStore(hf16, Ctmp[sg << 4], i * 16, 65, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+        int ncols = min(nt - hf * 64, 64);
+        for (int i = int(tid); i < nrow * ncols; i += 512) {
+            int r = i / ncols;
+            int ti = i % ncols;
+            outv[uint(hf * 64 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+        }
+        barrier();
+    }
+}
