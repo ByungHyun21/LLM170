@@ -39,6 +39,8 @@ const TILE_NL_SPV: &[u8] = include_bytes!("spv/tile_nl.spv");
 const TILE_IQ3S_SPV: &[u8] = include_bytes!("spv/tile_iq3s.spv");
 const TILE_F16_SPV: &[u8] = include_bytes!("spv/tile_f16.spv");
 const TILE128O_SPV: &[u8] = include_bytes!("spv/tile128o.spv");
+const TILE128W_SPV: &[u8] = include_bytes!("spv/tile128w.spv");
+const TILE_LLM_SPV: &[u8] = include_bytes!("spv/tile_llm.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -1075,6 +1077,26 @@ impl DecoderState {
             binds.push(xq);
             binds.push(out);
             let gx = (no as u32 + 127) / 128;
+            // tile_llm (plans/39): llama mul_mm 구조 직역 — f16vec2 shmem 15.4KB → 4 WG/CU
+            if ty == 13 && std::env::var("LLM170_TILE_LLM").map(|v| v == "1").unwrap_or(false) {
+                for tb in (0..t).step_by(64) {
+                    let nt = (t - tb).min(64) as u32;
+                    let last = tb + 64 >= t && bar;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe_b("tile_llm", TILE_LLM_SPV, 10, 16, &binds, &push, gx, 1, 1, last)?;
+                }
+                return Ok(());
+            }
+            // tile128w (plans/39): 256스레드 WMITER=2 → 2 WG/CU 점유
+            if ty == 13 && std::env::var("LLM170_TILE_W").map(|v| v == "1").unwrap_or(false) {
+                for tb in (0..t).step_by(128) {
+                    let nt = (t - tb).min(128) as u32;
+                    let last = tb + 128 >= t && bar;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe_b("tile128w", TILE128W_SPV, 10, 16, &binds, &push, gx, 1, 1, last)?;
+                }
+                return Ok(());
+            }
             // tile128o (점유 변형, plans/39): 64토큰/1-sb/LDS 29.7KB → 2 WG/CU
             if ty == 13 && std::env::var("LLM170_TILE_OCC").map(|v| v == "1").unwrap_or(false) {
                 for tb in (0..t).step_by(64) {
