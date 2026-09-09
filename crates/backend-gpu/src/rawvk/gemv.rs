@@ -1105,8 +1105,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
-    if t < 1 || t > 64 {
-        return Err("tile 검증 t는 1..=64".into());
+    if t < 1 || t > 128 {
+        return Err("tile 검증 t는 1..=128".into());
     }
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),

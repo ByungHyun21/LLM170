@@ -37,6 +37,7 @@ const GEMM_I8V2_SPV: &[u8] = include_bytes!("spv/gemm_i8v2.spv");
 const ADDRMS_SPV: &[u8] = include_bytes!("spv/addrms.spv");
 const TILE_NL_SPV: &[u8] = include_bytes!("spv/tile_nl.spv");
 const TILE_IQ3S_SPV: &[u8] = include_bytes!("spv/tile_iq3s.spv");
+const TILE_F16_SPV: &[u8] = include_bytes!("spv/tile_f16.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -172,6 +173,8 @@ pub struct DecoderState {
     // GDN/conv 스냅샷 (spec 부분수용 롤백) — 매핑 ptr 직접 복사
     snap_gdn: Vec<Vec<f32>>,
     snap_conv: Vec<Vec<f32>>,
+    // ── f16 사전 디양자화 가중 캐시 (plans/39) — 프리필 타일 전용
+    f16w: HashMap<String, VkBuf>,
     // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
     i8w: HashMap<String, I8W>,
     wsr: HashMap<String, VkBuf>, // v2 행 스케일
@@ -413,7 +416,7 @@ impl VkDecoder {
     }
 }
 
-const T_MAX: usize = 64;
+const T_MAX: usize = 128;
 
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
@@ -487,6 +490,17 @@ impl DecoderState {
                 *ty = 8;
             }
         }
+        // f16 사전 디양자화 캐시용 원본 캡처 (plans/39) — weights 소비 전.
+        let f16w_on = std::env::var("LLM170_VK_F16W").map(|v| v == "1").unwrap_or(false);
+        let tiled_src: Vec<(String, Vec<u8>, u32, usize, usize)> = if f16w_on {
+            weights
+                .iter()
+                .filter(|(_, _, ty, _, _)| matches!(*ty, 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
             let mut bufs = Vec::new();
@@ -528,6 +542,43 @@ impl DecoderState {
         let z16 = [0u8; 16];
         unsafe { std::ptr::copy_nonoverlapping(z16.as_ptr(), dummy.ptr, 16) };
 
+        // f16 캐시 생성: CPU 병렬 디양자화(행 단위 f32→f16 RNE) → 순차 업로드.
+        let mut f16w: HashMap<String, VkBuf> = HashMap::new();
+        if f16w_on {
+            let e0 = std::time::Instant::now();
+            let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
+            std::thread::scope(|sc| {
+                let per = (tiled_src.len() / 8).max(1);
+                for chk in tiled_src.chunks(per) {
+                    let outs = &outs;
+                    sc.spawn(move || {
+                        let mut mine = Vec::new();
+                        for (name, data, ty, ni, no) in chk {
+                            let gty = llm170_gguf::GgmlType::from_u32(*ty).unwrap_or(llm170_gguf::GgmlType::Q5K);
+                            let (ni, no) = (*ni, *no);
+                            let mut buf16 = vec![0u16; ni * no];
+                            let mut row = vec![0f32; ni];
+                            for r in 0..no {
+                                llm170_core::quant::dequant_row(gty, data, r as u64, ni as u64, &mut row);
+                                for (k, &v) in row.iter().enumerate() {
+                                    buf16[r * ni + k] = f32_to_f16_bits(v);
+                                }
+                            }
+                            mine.push((name.clone(), buf16));
+                        }
+                        outs.lock().unwrap().extend(mine);
+                    });
+                }
+            });
+            for (name, buf16) in outs.into_inner().unwrap() {
+                let bytes = buf16.len() * 2;
+                let mut b = ctx.alloc(bytes)?;
+                unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
+                ctx.unmap(&mut b)?;
+                f16w.insert(name, b);
+            }
+            eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
+        }
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
@@ -814,6 +865,7 @@ impl DecoderState {
             m_kv_v: mvv,
             snap_gdn: vec![Vec::new(); n_recr * n_seqs],
             snap_conv: vec![Vec::new(); n_recr * n_seqs],
+            f16w,
             i8w,
             wsr: wsr_map,
             b8,
@@ -976,6 +1028,27 @@ impl DecoderState {
     fn gemv_bar(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         let tile_min: usize = if std::env::var_os("LLM170_VK_TILE1").is_some() { 1 } else { 16 };
+        // f16 캐시 경로 (plans/39) — 루프 내 디양자화 없는 통일 타일
+        if t >= tile_min
+            && std::env::var_os("LLM170_VK_NOTILE").is_none()
+            && std::env::var_os("LLM170_VK_NOF16W").is_none()
+            && self.f16w.contains_key(wkey)
+        {
+            let xq_w = no; // 자리표시 — 아래에서 ni 기반 재계산
+            let _ = xq_w;
+            let ni_f = self.w.get(wkey).map(|e| e.2).unwrap_or(0);
+            let xq_wf = ni_f / 4 + ni_f / 32 + ni_f / 16;
+            let fbuf = self.f16w.get(wkey).cloned().unwrap();
+            let gx = (no as u32 + 127) / 128;
+            for tb in (0..t).step_by(128) {
+                let nt = (t - tb).min(128) as u32;
+                let last = tb + 128 >= t && bar;
+                let push = Self::push_u32s(&[ni_f as u32, no as u32, xq_wf as u32, nt]);
+                self.run_pipe_b("tile_f16", TILE_F16_SPV, 3, 16,
+                    &[fbuf.buf, xq, out], &push, gx, 1, 1, last)?;
+            }
+            return Ok(());
+        }
         // 타일(coopmat f16) 기본 경로 (2026-09-08 judge TILE 19/19 수용 —
         // llama 자체 pp가 동일 f16-닷 품질계약). 킬스위치 LLM170_VK_NOTILE=1.
         if t >= tile_min && std::env::var_os("LLM170_VK_NOTILE").is_none()
@@ -1003,9 +1076,10 @@ impl DecoderState {
             binds.push(xq);
             binds.push(out);
             let gx = (no as u32 + 127) / 128;
-            let n_tb = t.div_ceil(64);
-            for (tbi, tb) in (0..t).step_by(64).enumerate() {
-                let nt = (t - tb).min(64) as u32;
+            let step = if ty == 13 { 128 } else { 64 };   // tile128만 128토큰 (plans/39)
+            let n_tb = t.div_ceil(step);
+            for (tbi, tb) in (0..t).step_by(step).enumerate() {
+                let nt = (t - tb).min(step) as u32;
                 let last = tbi + 1 == n_tb && bar;
                 if ty == 13 {
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
