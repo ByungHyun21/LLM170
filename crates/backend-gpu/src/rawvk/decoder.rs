@@ -542,18 +542,17 @@ impl DecoderState {
         let z16 = [0u8; 16];
         unsafe { std::ptr::copy_nonoverlapping(z16.as_ptr(), dummy.ptr, 16) };
 
-        // f16 캐시 생성: CPU 병렬 디양자화(행 단위 f32→f16 RNE) → 순차 업로드.
+        // f16 캐시 생성: 배치별 병렬 디양자화 → 업로드 → 해제 (호스트 피크 = 배치).
         let mut f16w: HashMap<String, VkBuf> = HashMap::new();
         if f16w_on {
             let e0 = std::time::Instant::now();
-            let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
-            std::thread::scope(|sc| {
-                let per = (tiled_src.len() / 8).max(1);
-                for chk in tiled_src.chunks(per) {
-                    let outs = &outs;
-                    sc.spawn(move || {
-                        let mut mine = Vec::new();
-                        for (name, data, ty, ni, no) in chk {
+            let batch = 8usize.max(1);
+            for grp in tiled_src.chunks(batch) {
+                let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
+                std::thread::scope(|sc| {
+                    for (name, data, ty, ni, no) in grp {
+                        let outs = &outs;
+                        sc.spawn(move || {
                             let gty = llm170_gguf::GgmlType::from_u32(*ty).unwrap_or(llm170_gguf::GgmlType::Q5K);
                             let (ni, no) = (*ni, *no);
                             let mut buf16 = vec![0u16; ni * no];
@@ -564,18 +563,17 @@ impl DecoderState {
                                     buf16[r * ni + k] = f32_to_f16_bits(v);
                                 }
                             }
-                            mine.push((name.clone(), buf16));
-                        }
-                        outs.lock().unwrap().extend(mine);
-                    });
+                            outs.lock().unwrap().push((name.clone(), buf16));
+                        });
+                    }
+                });
+                for (name, buf16) in outs.into_inner().unwrap() {
+                    let bytes = buf16.len() * 2;
+                    let mut b = ctx.alloc(bytes)?;
+                    unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
+                    ctx.unmap(&mut b)?;
+                    f16w.insert(name, b);
                 }
-            });
-            for (name, buf16) in outs.into_inner().unwrap() {
-                let bytes = buf16.len() * 2;
-                let mut b = ctx.alloc(bytes)?;
-                unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
-                ctx.unmap(&mut b)?;
-                f16w.insert(name, b);
             }
             eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
         }
