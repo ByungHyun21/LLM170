@@ -1140,6 +1140,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
     let (spv_name, n_kb, extra) = match w.ty {
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if msall => ("tile_q6kms.spv", 10u32, 0u8),
@@ -1171,7 +1172,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Iq3S => ("tile_iq3s.spv", 11, 2),   // grid3s
         _ => return Err("tile 검증 불가 타입".into()),
     };
-    let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall;
+    let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall
+        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
@@ -1228,7 +1230,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw = cw.next_power_of_two();
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
-    let gx = if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
+    let gx = if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+        (n_out as u32 + 63) / 64   // tile_ms128: WG당 64행 × 128토큰
+    } else if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
         (n_out as u32 + 63) / 64   // tile_ms: WG당 64행
     } else if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 31) / 32   // tile_s32b: WG당 32행
