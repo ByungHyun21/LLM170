@@ -490,20 +490,51 @@ impl DecoderState {
                 *ty = 8;
             }
         }
-        // f16 사전 디양자화 캐시용 원본 캡처 (plans/39) — weights 소비 전.
+        // f16 사전 디양자화 캐시 (plans/39) — 데이터 복제 없음(대여만):
+        // 디양자화를 가중 업로드 루프 앞에서 수행 (RCA: .cloned() 전체복제가
+        // 30Gi 호스트 RAM을 초과해 OOM·세션 사망의 원인이었음).
         let f16w_on = std::env::var("LLM170_VK_F16W").map(|v| v == "1").unwrap_or(false);
         let f16w_max = std::env::var("LLM170_VK_F16W_MAX").ok().and_then(|v| v.parse::<usize>().ok());
-        let mut tiled_src: Vec<(String, Vec<u8>, u32, usize, usize)> = if f16w_on {
-            weights
+        let mut f16w: HashMap<String, VkBuf> = HashMap::new();
+        if f16w_on {
+            let e0 = std::time::Instant::now();
+            let mut cand: Vec<&(String, Vec<u8>, u32, usize, usize)> = weights
                 .iter()
                 .filter(|(_, _, ty, _, _)| matches!(*ty, 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if let Some(mx) = f16w_max {
-            tiled_src.truncate(mx);
+                .collect();
+            if let Some(mx) = f16w_max {
+                cand.truncate(mx);
+            }
+            for grp in cand.chunks(8) {
+                let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
+                std::thread::scope(|sc| {
+                    for (name, data, ty, ni, no) in grp {
+                        let outs = &outs;
+                        sc.spawn(move || {
+                            let gty = llm170_gguf::GgmlType::from_u32(*ty).unwrap_or(llm170_gguf::GgmlType::Q5K);
+                            let (ni, no) = (*ni, *no);
+                            let mut buf16 = vec![0u16; ni * no];
+                            let mut row = vec![0f32; ni];
+                            for r in 0..no {
+                                llm170_core::quant::dequant_row(gty, data, r as u64, ni as u64, &mut row);
+                                for (k, &v) in row.iter().enumerate() {
+                                    buf16[r * ni + k] = f32_to_f16_bits(v);
+                                }
+                            }
+                            outs.lock().unwrap().push((name.clone(), buf16));
+                        });
+                    }
+                });
+                for (name, buf16) in outs.into_inner().unwrap() {
+                    let bytes = buf16.len() * 2;
+                    let mut b = ctx.alloc(bytes)?;
+                    unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
+                    ctx.unmap(&mut b)?;
+                    f16w.insert(name, b);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
         }
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
@@ -546,43 +577,6 @@ impl DecoderState {
         let z16 = [0u8; 16];
         unsafe { std::ptr::copy_nonoverlapping(z16.as_ptr(), dummy.ptr, 16) };
 
-        // f16 캐시 생성: 배치별 병렬 디양자화 → 업로드 → 해제 (호스트 피크 = 배치).
-        let mut f16w: HashMap<String, VkBuf> = HashMap::new();
-        if f16w_on {
-            let e0 = std::time::Instant::now();
-            let batch = 8usize.max(1);
-            for grp in tiled_src.chunks(batch) {
-                let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
-                std::thread::scope(|sc| {
-                    for (name, data, ty, ni, no) in grp {
-                        let outs = &outs;
-                        sc.spawn(move || {
-                            let gty = llm170_gguf::GgmlType::from_u32(*ty).unwrap_or(llm170_gguf::GgmlType::Q5K);
-                            let (ni, no) = (*ni, *no);
-                            let mut buf16 = vec![0u16; ni * no];
-                            let mut row = vec![0f32; ni];
-                            for r in 0..no {
-                                llm170_core::quant::dequant_row(gty, data, r as u64, ni as u64, &mut row);
-                                for (k, &v) in row.iter().enumerate() {
-                                    buf16[r * ni + k] = f32_to_f16_bits(v);
-                                }
-                            }
-                            outs.lock().unwrap().push((name.clone(), buf16));
-                        });
-                    }
-                });
-                for (name, buf16) in outs.into_inner().unwrap() {
-                    let bytes = buf16.len() * 2;
-                    let mut b = ctx.alloc(bytes)?;
-                    unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
-                    ctx.unmap(&mut b)?;
-                    f16w.insert(name, b);
-                    // 페이싱: WC 쓰기 독점 회피 (세션 하네스와 기기 공유)
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-            eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
-        }
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
