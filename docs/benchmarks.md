@@ -22,6 +22,16 @@ previous session's "vk judge 19/19×7" runs used the harness default runtime
 f32 mask was removed (qsa_flash's causal loop bound already masks — 256MB at
 8k context), pp64 142 t/s / tg4 7.4 on the corrected tiles.
 
+Second pass (same day): q8_0 KV cache (kv_append_q8 + dequant-on-read
+qsa_flash_q8, opt-in `LLM170_VK_KV8=1`) — 3.76x KV bytes cut (2048-ctx
+256→68 MB), tg32 neutral (weights-bound), early-token divergences at short
+context are the quantized-KV quality class; kept opt-in for long-context
+capacity. The 256-thread occupancy tile variant (tile128v2) is parked with
+strong evidence of a WG-size-dependent codegen issue: byte-identical
+staging code is clean in the 512-thread family and corrupts odd rows k≥16
+at 256 threads (subgroup geometry verified 64x4, store semantics and dump
+machinery eliminated via constant injection).
+
 ## Vulkan execution-round gate (2026-09-08, plans/36 G1-G4/P1-P4)
 
 Full plans/36 round on q35work.gguf, 3-run medians, zero-config defaults
