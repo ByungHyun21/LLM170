@@ -285,7 +285,7 @@ predates the plans/35 refactor, which only shifts timing (non-spec streams
 are bit-identical across the refactor). `LLM170_G8=0` (verify batches fall
 back to quant+gemv3) did not diverge in 2/2 runs — the trigger is the
 gemv8 batched-verify configuration (t=2..5 rows), not the decode path.
-Follow-up tracked in plans/36 §8. The vk judge gate therefore reports
+Follow-up tracked in plans/38 A2 (deterministic harness reproducer). The vk judge gate therefore reports
 18/19..19/19 depending on the roll; HIP is unaffected (19/19 stable).
 
 ## Verification status

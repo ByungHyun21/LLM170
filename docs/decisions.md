@@ -270,10 +270,12 @@ reproducers). Dead-kernel deletion requires a launch-site cross-check
 (kernel name × launch strings), not grep of definitions alone: probes and
 env-gated variants kept several "dead-looking" kernels alive.
 
-**Consequence**: rawvk GEMV routing is a type-driven table — gemv8 (t<16,
-q3/q4/q5/xs, kill-switch `LLM170_G8=0`), quant+gemv3 (everything else,
-including q6_K and q8_0), coopmat tiles (t≥16 prefill, `LLM170_VK_TILE`),
-i8 GEMM (plans/23, opt-in). Model knowledge (raw weight/const manifests,
+**Consequence** (updated 2026-09-09): rawvk GEMV routing is a type-driven
+table — gemv8 (t<16, q3/q4/q5/q6/xs, kill-switch `LLM170_G8=0`), coopmat
+tiles as the default t≥16 prefill path (kill-switches `LLM170_VK_NOTILE=1`,
+`LLM170_VKD_BATCH=0`), quant+gemv3 (q8_0/iq4_nl/iq3_s at t<16), i8 GEMM
+(experimental `LLM170_VK_I8ON`, superseded by tiles — kept for the
+integer-MMA contract). Model knowledge (raw weight/const manifests,
 rope table) lives in core; backend injection lives in backend-gpu; the
 server is a CLI router + HTTP. The hipRTC kernel string is split into
 family assets (`kernels/src_*.hip`) assembled by `include_str!` — the
