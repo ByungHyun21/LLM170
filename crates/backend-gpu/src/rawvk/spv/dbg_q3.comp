@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC { uint n_in; } pc;
+#define WG(idx) w0c[idx]
+uvec4 ld16(uint b) {
+    uint w0 = WG(b >> 2), w1 = WG((b >> 2) + 1u), w2 = WG((b >> 2) + 2u), w3 = WG((b >> 2) + 3u), w4 = WG((b >> 2) + 4u);
+    uint r = b & 3u;
+    if (r == 0u) return uvec4(w0, w1, w2, w3);
+    uint s = (4u - r) * 8u;
+    return uvec4((w0 >> (r * 8u)) | (w1 << s), (w1 >> (r * 8u)) | (w2 << s),
+                 (w2 >> (r * 8u)) | (w3 << s), (w3 >> (r * 8u)) | (w4 << s));
+}
+uint b8(uvec4 w, int j) { return (w[j >> 2] >> uint((j & 3) * 8)) & 0xFFu; }
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int blocks = int(pc.n_in) >> 8;
+    int row = 0;
+    int r = int(tid >> 1);
+    int kc = int(tid & 1) * 16;
+    uint sb = gl_WorkGroupID.x * 64u + (tid >> 1u);   // WG당 64 sb
+    // 각 스레드: (sb, kc) 16원소 → 원소 k = sb*32 + kc + e
+    int rowb = row * blocks * 110 + int(sb >> 3) * 110;
+    uvec4 dww = ld16(uint(rowb + 106));
+    float d = unpackHalf2x16((b8(dww, 2)) | (b8(dww, 3) << 8)).x;
+    uvec4 s0 = ld16(uint(rowb + 96));
+    uvec4 s1 = ld16(uint(rowb + 100));
+    uvec4 s2 = ld16(uint(rowb + 104));
+    uint a0 = b8(s0,0) | (b8(s0,1) << 8) | (b8(s0,2) << 16) | (b8(s0,3) << 24);
+    uint a1 = b8(s1,0) | (b8(s1,1) << 8) | (b8(s1,2) << 16) | (b8(s1,3) << 24);
+    uint tmp = b8(s2,0) | (b8(s2,1) << 8) | (b8(s2,2) << 16) | (b8(s2,3) << 24);  // 12B 스케일 = 104..107 (4바이트!)
+    uint kmask1 = 0x03030303u, kmask2 = 0x0F0F0F0Fu;
+    uint aux2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    uint aux3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    uint aa0 = (a0 & kmask2) | ((tmp & kmask1) << 4);
+    uint aa1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    int is_i = int(((sb >> 2) & 1u) * 8 + (sb & 3) * 2 + uint(kc >> 4));
+    uint sw = (is_i >> 2) == 0 ? aa0 : ((is_i >> 2) == 1 ? aa1 : ((is_i >> 2) == 2 ? aux2 : aux3));
+    int sc8 = int((sw >> uint((is_i & 3) * 8)) & 0xFFu);
+    sc8 = (sc8 << 24) >> 24;
+    float dl = d * float(sc8 - 32);
+    int n2 = int((sb >> 2) & 1u);
+    int qb0 = rowb + 32 + n2 * 32 + (kc >> 4) * 16 + (kc & 15);
+    int hb0 = rowb + (kc >> 4) * 16 + (kc & 15);
+    uvec4 qw = ld16(uint(qb0));
+    uvec4 hw = ld16(uint(hb0));
+    uint sh2 = uint((sb & 3) * 2);
+    uint hbit = 1u << uint(sb & 3);
+    for (int e = 0; e < 16; e += 2) {
+        float vals[2];
+        for (int h = 0; h < 2; h++) {
+            uint qv = b8(qw, e + h);
+            uint hm8 = b8(hw, e + h);
+            int v = int((qv >> sh2) & 3u) - ((hm8 & hbit) != 0u ? 0 : 4);
+            vals[h] = float(v) * dl;
+            outv[uint(sb) * 32u + uint(kc + e + h)] = vals[h];
+        }
+    }
+}
