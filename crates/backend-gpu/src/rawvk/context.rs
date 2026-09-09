@@ -2,6 +2,7 @@
 //! HIP과 병립: LLM170_GPU_RUNTIME=vulkan일 때만 사용.
 
 use ash::khr;
+use ash::vk::Handle;
 use ash::vk;
 
 #[derive(Clone)]
@@ -32,6 +33,9 @@ pub struct VkCtx {
     /// VK_EXT_pipeline_robustness 사용 가능 — NR 파이프라인이 SSBO 무결역 검사 비활성.
     pub pipeline_robustness: bool,
     pub batching: std::sync::atomic::AtomicBool,
+    /// 배치 ds 캐시 (plans/40): (dsl, bufs) 고유 조합별 세트 재사용 —
+    /// 청크당 1409회 allocate+update가 GPU-idle 239ms/청크 유발.
+    pub ds_cache: std::cell::RefCell<std::collections::HashMap<(u64, Vec<u64>), vk::DescriptorSet>>,
     /// 배치용 per-run 디스크립터 세트 풀 (세트 재사용 하저드 회피 — RCA 2026-09-05:
     /// 녹화된 커맨드가 같은 세트를 참조해 마지막 바인딩으로 전부 덮어씀).
     pub batch_dsl: std::cell::Cell<Option<(vk::DescriptorSetLayout, vk::DescriptorPool)>>,
@@ -231,6 +235,7 @@ impl VkCtx {
                 mem_ty: ty,
                 mem_ty_host: ty_host,
                 batching: std::sync::atomic::AtomicBool::new(false),
+                ds_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
                 batch_dsl: std::cell::Cell::new(None),
                 batch_pool: std::cell::Cell::new(None),
                 batch_sets: std::cell::RefCell::new(Vec::new()),
@@ -912,9 +917,19 @@ impl VkCtx {
     /// 녹화된 커맨드가 세트 객체를 참조 — 마지막 바인딩으로 전부 덮임).
     pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            let key = (
+                p.dsl.as_raw(),
+                bufs.iter().map(|b| b.as_raw()).collect::<Vec<u64>>(),
+            );
+            if let Some(&ds) = self.ds_cache.borrow().get(&key) {
+                return Ok(ds);
+            }
             self.batch_dsl.set(Some((p.dsl, p.pool)));
             let ds = self.fresh_ds(bufs.len() as u32)?;
             self.bind_bufs(ds, bufs);
+            self.ds_cache.borrow_mut().insert(key, ds);
+            // 캐시 세트는 영속 — end_batch_wait의 일괄 해제 대상에서 제외
+            self.batch_sets.borrow_mut().pop();
             Ok(ds)
         } else {
             self.bind_bufs(p.ds, bufs);

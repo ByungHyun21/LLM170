@@ -48,6 +48,7 @@ const TILE_Q3KMS_SPV: &[u8] = include_bytes!("spv/tile_q3kms.spv");
 const TILE_Q8MS_SPV: &[u8] = include_bytes!("spv/tile_q8ms.spv");
 const TILE_XSMS_SPV: &[u8] = include_bytes!("spv/tile_xsms.spv");
 const TILE_NLMS_SPV: &[u8] = include_bytes!("spv/tile_nlms.spv");
+const TILE_MS128_SPV: &[u8] = include_bytes!("spv/tile_ms128.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -1099,7 +1100,13 @@ impl DecoderState {
             // tile_msALL (plans/40): 전 타입 ms 골격 (iq3s 제외) — WG() 제거·가드 제거·64행 WG
             let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v == "1").unwrap_or(false);
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
-                13 if msall => Some(("tile_ms4", TILE_MS4_SPV, 10)),
+                13 if msall => {
+                    if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) {
+                        Some(("tile_ms128", TILE_MS128_SPV, 10))
+                    } else {
+                        Some(("tile_ms4", TILE_MS4_SPV, 10))
+                    }
+                }
                 12 if msall => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
                 14 if msall => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
                 11 if msall => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
@@ -1109,10 +1116,11 @@ impl DecoderState {
                 _ => None,
             };
             if let Some((nm, spv, nkb)) = ms_spv {
+                let step: usize = if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) && ty == 13 { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
-                    let last = tb + 64 >= t && bar;
+                for tb in (0..t).step_by(step) {
+                    let nt = (t - tb).min(step) as u32;
+                    let last = tb + step >= t && bar;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
                     self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, gx_ms, 1, 1, last)?;
                 }
