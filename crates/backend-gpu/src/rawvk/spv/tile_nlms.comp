@@ -1,0 +1,164 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// tile_nlms (plans/40) — ms4 골격 + iq4_nl 디코드 (ktab).
+// 핵심 차이 (우리 타일 대비):
+//   1. shmem을 u32(vec2 f16) 배열로 — LDS 트랜잭션 절반 (llama FLOAT_TYPEV2)
+//   2. SHMEM_STRIDE = BK/2 + 4 (llama와 동일 패딩)
+//   3. LDS = BM×20×4 + BN×20×4 = 15.4KB → 4 WG/CU (우리 51KB→1)
+//   sg=토큰 반(32), 워프당 4행슬래브×2토큰슬래브 = 8누산기
+// 측정: 70.7GB/s (ls 36.3 → 2배).
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Ktab { uint kt[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint t;
+} pc;
+
+#define BK 32
+#define BM 64
+#define BN 64
+#define SHMEM_STRIDE (BK / 2 + 4)   // 20 vec2
+
+// 단일 청크 직인덱스 (엔진 ch_eff=텐서 next_pow2 → 항상 1청크, plans/40)
+#define WG(idx) w0c[idx]
+
+// shmem: f16vec2 (llama FLOAT_TYPEV2) — 스트라이드는 vec2 단위
+shared f16vec2 buf_a[BM * SHMEM_STRIDE];
+shared f16vec2 buf_b[BN * SHMEM_STRIDE];
+shared float16_t Ctmp[64][17];   // 16토큰 슬래브 드레인 (f16)
+
+// 16B @바이트 b (비정렬 허용) → 4워드 병합
+uvec4 ld16(uint b) {
+    uint w0 = WG(b >> 2), w1 = WG((b >> 2) + 1u), w2 = WG((b >> 2) + 2u), w3 = WG((b >> 2) + 3u), w4 = WG((b >> 2) + 4u);
+    uint r = b & 3u;
+    if (r == 0u) return uvec4(w0, w1, w2, w3);
+    uint s = (4u - r) * 8u;
+    return uvec4((w0 >> (r * 8u)) | (w1 << s), (w1 >> (r * 8u)) | (w2 << s),
+                 (w2 >> (r * 8u)) | (w3 << s), (w3 >> (r * 8u)) | (w4 << s));
+}
+uint b8(uvec4 w, int j) { return (w[j >> 2] >> uint((j & 3) * 8)) & 0xFFu; }
+
+// iq4_nl 디양자화 — 18B 블록(32k): [d][qs 16B]. ktab LUT (xs 공용).
+void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
+    int r = int(tid >> 1);
+    int kc = int(tid & 1) * 16;
+    int row = row0 + r;
+    if (row >= nrow + row0) {
+        for (int v = 0; v < 8; v++) buf_a[r * SHMEM_STRIDE + (kc >> 1) + v] = f16vec2(float16_t(0.0));
+        return;
+    }
+    int sb = int(k0 >> 5);
+    int rowb = row * blocks * 18 + sb * 18;
+    uvec4 hd = ld16(uint(rowb));
+    float d = unpackHalf2x16(b8(hd, 0) | (b8(hd, 1) << 8)).x;
+    uvec4 qw = ld16(uint(rowb + 2));
+    for (int e = 0; e < 16; e += 2) {
+        float vals[2];
+        for (int h = 0; h < 2; h++) {
+            uint byte_v = b8(qw, (kc & 15) + e + h);
+            uint t2 = kt[byte_v];
+            vals[h] = ((kc < 16)
+                ? float((int(t2 & 0xFFu) << 24) >> 24)
+                : float((int(t2 >> 8u) << 24) >> 24)) * d;
+        }
+        buf_a[r * SHMEM_STRIDE + (kc >> 1) + (e >> 1)] = f16vec2(float16_t(vals[0]), float16_t(vals[1]));
+    }
+}
+
+// 활성 q8 → vec2. 64토큰×32k = 2048 / 128 = 16원소/스레드.
+void load_b(uint k0, int nt, uint tid, int n_in) {
+    int e0 = int(tid) * 16;
+    int ti2 = e0 >> 5;
+    int k2 = e0 & 31;
+    if (ti2 >= nt) {
+        for (int v = 0; v < 8; v++) buf_b[ti2 * SHMEM_STRIDE + (k2 >> 1) + v] = f16vec2(float16_t(0.0));
+        return;
+    }
+    uint base = uint(ti2) * pc.xq_w;
+    int xw = int(k0) >> 2;
+    float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (k0 >> 5))]);
+    for (int e = 0; e < 16; e += 2) {
+        float vals[2];
+        for (int h = 0; h < 2; h++) {
+            uint wv = xq[base + uint(xw + ((k2 + e + h) >> 2))];
+            int b = int((wv >> uint(((k2 + e + h) & 3) * 8)) & 0xFFu) << 24 >> 24;
+            vals[h] = float(b) * yd;
+        }
+        buf_b[ti2 * SHMEM_STRIDE + (k2 >> 1) + (e >> 1)] = f16vec2(float16_t(vals[0]), float16_t(vals[1]));
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;   // 0..127
+    uint sg = gl_SubgroupID;            // 0..1 (wave64)
+    int n_in = int(pc.n_in);
+    int nkb = n_in >> 5;                // 32k 블록 수
+    int blocks = n_in >> 5;   // nl: 32k 블록
+    int row0 = int(bid) * BM;
+    int nt = int(min(pc.t, BN));
+    int nrow = int(min(BM, pc.n_out - uint(row0)));
+
+    // coopmat: TM=TK=TN=16. sg=토큰 반, 워프당 4행슬래브 × 2토큰슬래브 = acc[4][2].
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][2];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint kb = 0; kb < uint(nkb); kb++) {
+        load_a(kb * 32u, row0, nrow, blocks, tid);
+        load_b(kb * 32u, nt, tid, n_in);
+        barrier();
+        // BK/TK = 32/16 = 2 k-스텝. sg: 토큰 반 (sg*32).
+        int tbase = int(sg) * 32;
+        for (uint ks = 0; ks < BK / 16; ks++) {
+            for (uint wm = 0; wm < 4; wm++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+                // vec2 배열: 스트라이드/오프셋 원소 단위 → coopMatLoad f16 기준 2배
+                coopMatLoad(fa, buf_a, (wm * 16) * SHMEM_STRIDE + ks * 8, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint wn = 0; wn < 2; wn++) {
+                    // 가드 없음: load_b가 nt 초과 토큰을 0으로 패딩, 드레인이 클립 (llama 방식)
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+                    coopMatLoad(fbb, buf_b, (tbase + wn * 16) * SHMEM_STRIDE + ks * 8, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[wm][wn] = coopMatMulAdd(fa, fbb, acc[wm][wn]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // 드레인: 16토큰 슬래브. q = sg*2 + wn (소유 워프만 저장).
+    for (int q = 0; q < 4; q++) {
+        if (nt <= q * 16) break;
+        int wn = q - int(sg) * 2;
+        if (wn >= 0 && wn < 2) {
+            for (int wm = 0; wm < 4; wm++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[wm][wn]);
+                coopMatStore(hf16, Ctmp[wm * 16], 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+        int ncols = min(nt - q * 16, 16);
+        for (int i = int(tid); i < nrow * ncols; i += 128) {
+            int r = i / ncols;
+            int ti = i % ncols;
+            outv[uint(q * 16 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+        }
+        barrier();
+    }
+}

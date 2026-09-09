@@ -40,7 +40,14 @@ const TILE_IQ3S_SPV: &[u8] = include_bytes!("spv/tile_iq3s.spv");
 const TILE_F16_SPV: &[u8] = include_bytes!("spv/tile_f16.spv");
 const TILE128O_SPV: &[u8] = include_bytes!("spv/tile128o.spv");
 const TILE128W_SPV: &[u8] = include_bytes!("spv/tile128w.spv");
-const TILE_LLM_SPV: &[u8] = include_bytes!("spv/tile_llm.spv");
+const TILE_MS2_SPV: &[u8] = include_bytes!("spv/tile_ms2.spv");
+const TILE_MS4_SPV: &[u8] = include_bytes!("spv/tile_ms4.spv");
+const TILE_Q4KMS_SPV: &[u8] = include_bytes!("spv/tile_q4kms.spv");
+const TILE_Q6KMS_SPV: &[u8] = include_bytes!("spv/tile_q6kms.spv");
+const TILE_Q3KMS_SPV: &[u8] = include_bytes!("spv/tile_q3kms.spv");
+const TILE_Q8MS_SPV: &[u8] = include_bytes!("spv/tile_q8ms.spv");
+const TILE_XSMS_SPV: &[u8] = include_bytes!("spv/tile_xsms.spv");
+const TILE_NLMS_SPV: &[u8] = include_bytes!("spv/tile_nlms.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -1078,12 +1085,47 @@ impl DecoderState {
             binds.push(out);
             let gx = (no as u32 + 127) / 128;
             // tile_llm (plans/39): llama mul_mm 구조 직역 — f16vec2 shmem 15.4KB → 4 WG/CU
-            if ty == 13 && std::env::var("LLM170_TILE_LLM").map(|v| v == "1").unwrap_or(false) {
+            // tile_ms2 (plans/40): llama m-warptile 지오메트리 + 비트-병렬 q5_K 언팩
+            if ty == 13 && std::env::var("LLM170_TILE_MS2").map(|v| v == "1").unwrap_or(false) {
+                let gx_ms2 = (no as u32 + 63) / 64;
                 for tb in (0..t).step_by(64) {
                     let nt = (t - tb).min(64) as u32;
                     let last = tb + 64 >= t && bar;
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b("tile_llm", TILE_LLM_SPV, 10, 16, &binds, &push, gx, 1, 1, last)?;
+                    self.run_pipe_b("tile_ms2", TILE_MS2_SPV, 10, 16, &binds, &push, gx_ms2, 1, 1, last)?;
+                }
+                return Ok(());
+            }
+            // tile_msALL (plans/40): 전 타입 ms 골격 (iq3s 제외) — WG() 제거·가드 제거·64행 WG
+            let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v == "1").unwrap_or(false);
+            let ms_spv: Option<(&str, &[u8], u32)> = match ty {
+                13 if msall => Some(("tile_ms4", TILE_MS4_SPV, 10)),
+                12 if msall => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
+                14 if msall => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
+                11 if msall => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
+                8 if msall => Some(("tile_q8ms", TILE_Q8MS_SPV, 10)),
+                20 if msall => Some(("tile_nlms", TILE_NLMS_SPV, 11)),
+                _ if msall && ty != 21 => Some(("tile_xsms", TILE_XSMS_SPV, 11)),
+                _ => None,
+            };
+            if let Some((nm, spv, nkb)) = ms_spv {
+                let gx_ms = (no as u32 + 63) / 64;
+                for tb in (0..t).step_by(64) {
+                    let nt = (t - tb).min(64) as u32;
+                    let last = tb + 64 >= t && bar;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, gx_ms, 1, 1, last)?;
+                }
+                return Ok(());
+            }
+            // tile_ms4 (plans/40): ms2 + WG() 제거 + MMA 가드 제거 — 단일 청크 직인덱스 63.7GB/s
+            if ty == 13 && std::env::var("LLM170_TILE_MS4").map(|v| v == "1").unwrap_or(false) {
+                let gx_ms4 = (no as u32 + 63) / 64;
+                for tb in (0..t).step_by(64) {
+                    let nt = (t - tb).min(64) as u32;
+                    let last = tb + 64 >= t && bar;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe_b("tile_ms4", TILE_MS4_SPV, 10, 16, &binds, &push, gx_ms4, 1, 1, last)?;
                 }
                 return Ok(());
             }

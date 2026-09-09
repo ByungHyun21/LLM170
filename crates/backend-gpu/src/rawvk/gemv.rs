@@ -758,14 +758,27 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     }
     let spv_name = std::env::var("VKMMQ_SPV").unwrap_or_else(|_| "matmul_q5_k_f16".into());
     let b_is_f32 = spv_name.ends_with("_f32") || spv_name.contains("_f32_");
-    let spv = std::fs::read(format!("/home/yoon/LLM170/source/llama.cpp/build-vk/ggml/src/ggml-vulkan/vulkan-shaders.spv/{}.spv", spv_name))
-        .map_err(|e| e.to_string())?;
+    let spv = if spv_name.contains('/') {
+        std::fs::read(&spv_name).map_err(|e| e.to_string())?
+    } else {
+        std::fs::read(format!("/home/yoon/local_llm/llama.cpp-master/build-vulkan/ggml/src/ggml-vulkan/vulkan-shaders.spv/{}.spv", spv_name))
+            .map_err(|e| e.to_string())?
+    };
     let mut acc = VkAcc::new()?;
     let mut ctxg = acc.ctx.lock();
     // 버퍼: A=가중(호스트맵→h2d는 run 전 복사), B=f16 y, D=f32 out
-    let mut ab = ctxg.alloc_host(w.data.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), ab.ptr, w.data.len()); }
-    ctxg.unmap(&mut ab)?;
+    let ab_vram = std::env::var("VKMMQ_VRAM").map(|v| v=="1").unwrap_or(false);
+    let ab = if ab_vram {
+        let mut b = ctxg.alloc(w.data.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), b.ptr, w.data.len()); }
+        ctxg.unmap(&mut b)?;
+        b
+    } else {
+        let mut b = ctxg.alloc_host(w.data.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), b.ptr, w.data.len()); }
+        ctxg.unmap(&mut b)?;
+        b
+    };
     let mut ybuf: Vec<u16> = Vec::with_capacity(n_in * t);
     let mut seed = 0x1234u64;
     let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
@@ -793,6 +806,9 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         "l32" => vec![128, 128, 128, 32, 64, 64, 2, 4, 4, 1, 32, 0],
         "cc" => vec![128, 64, 32, 32, 64, 32, 2, 4, 4, 1, 64, 0],
         "mini" => vec![32, 32, 16, 32, 32, 16, 1, 4, 4, 1, 32, 0],
+        "ls" => vec![256, 128, 128, 32, 64, 64, 2, 16, 16, 16, 64, 1],  // AMD RADV l-warptile_mmq
+        "ms" => vec![128, 64, 64, 32, 64, 32, 2, 16, 16, 16, 64, 1],    // m-warptile_mmq
+        "ss" => vec![64, 32, 32, 32, 32, 32, 2, 16, 16, 16, 64, 1],     // s-warptile_mmq
         "def" => vec![64, 64, 64, 16, 32, 32, 2, 4, 2, 1, 32, 0],  // spv 기본값 (부록87 해독)
         "cm1" => vec![128, 128, 128, 16, 128, 64, 2, 16, 16, 16, 64, 0],
         _ => vec![128, 128, 128, 32, 128, 64, 2, 4, 4, 1, 64, 0],
@@ -804,8 +820,8 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     ctxg.bind_bufs(ds, &bufs);
     // push: M,N,K,stride_a=K,stride_b=K,stride_d=M,batch 0들 + k_split=1 등
     let mut pc: Vec<u32> = vec![
-        n_out.div_ceil(8) as u32, t as u32, n_in as u32,      // M, N, K
-        n_in as u32, n_in as u32, t as u32,       // stride_a=K, stride_b=K, stride_d=N
+        n_out as u32, t as u32, n_in as u32,      // M, N, K
+        n_in as u32, n_in as u32, n_out as u32,   // stride_a=K, stride_b=K, stride_d=M
         0, 0, 0,                                  // batch strides
         0, 1, n_in as u32,                        // base_wg_z, num_batches, k_split=K (split_k=1 규약)
         1, 1, 1, 1,                               // ne02, ne12, broadcast2, broadcast3
@@ -814,6 +830,9 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
     // 그리드 분모 = 스펙의 BM/BN에 정합 (부록87 그리드-스펙 매칭)
     let (dx, dy) = match sp.as_str() {
+        "ls" => (128u32, 128),
+        "ms" => (64, 64),
+        "ss" => (32, 32),
         "m" | "m32" => (64u32, 64),
         "s" => (32, 32),
         "c" | "cc" => (64, 32),
@@ -839,7 +858,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
             let yrow = &yh[n * n_in..(n + 1) * n_in];
             let mut acc = 0f32;
             for k in 0..n_in { acc += dq[k] * yrow[k]; }
-            let g_nm = out[n * t + m];
+            let g_nm = out[n * n_out + m];
             let g_mn = out[m * t + n];
             let r = |g: f32| (g - acc).abs() / acc.abs().max(1e-3);
             if r(g_nm) < 0.01 { ok_nm += 1; }
@@ -856,7 +875,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
             let yrow = &yh[n * n_in..(n + 1) * n_in];
             let mut acc = 0f32;
             for k in 0..n_in { acc += dq[k] * yrow[k]; }
-            if ((out[n * t + m] - acc).abs() / acc.abs().max(1e-3)) < 0.01 { goods.push(n); }
+            if ((out[n * n_out + m] - acc).abs() / acc.abs().max(1e-3)) < 0.01 { goods.push(n); }
         }
         eprintln!("m=0 정답 n ({}개): {:?}", goods.len(), &goods[..goods.len().min(20)]);
     }
@@ -867,19 +886,30 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         let yrow = &yh[n * n_in..(n + 1) * n_in];
         let mut acc = 0f64;
         for k in 0..n_in { acc += dq[k] as f64 * yrow[k] as f64; }
-        let got = out[n * t + m];
+        let got = out[n * n_out + m];
         eprintln!("  ck m={m} n={n}: got={got:.5} ref={:.5}", acc);
         let rel = if acc.abs() > 1e-6 { ((got - acc as f32) / acc as f32).abs() } else { got.abs() };
         maxrel = maxrel.max(rel);
     }
     // 타이밍 20회
-    ctxg.begin_batch()?;
-    let t0 = std::time::Instant::now();
-    for _ in 0..20 { ctxg.run(pl, ds, pipe, &pcb, gx, gy, 1)?; }
-    ctxg.end_batch_wait()?;
-    let dt = t0.elapsed().as_secs_f64() / 20.0;
+    let nrep: u32 = std::env::var("VKMMQ_N").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let nb: u32 = std::env::var("VKMMQ_B").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mut per_ms = 0f64;
+    for b in 0..nb {
+        ctxg.begin_batch()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..nrep { ctxg.run(pl, ds, pipe, &pcb, gx, gy, 1)?; }
+        ctxg.end_batch_wait()?;
+        let el = t0.elapsed().as_secs_f64() / nrep as f64;
+        eprintln!("  배치 {b}: {el:.4}ms/회");
+        per_ms = el; // 마지막 배치
+    }
+    let dt = per_ms;
     let _ = &mut pc;
-    Ok(format!("vk-mmq({tname}) t={t}: {:.3}ms/회 · maxrel={maxrel:.4}", dt * 1e3))
+    Ok(format!(
+        "vk-mmq({tname}/{spv_name} spec={sp}) t={t}: {:.4}ms/회 · maxrel={maxrel:.4} · {:.1}GB/s",
+        dt * 1e3, w.data.len() as f64 / dt / 1e9
+    ))
 }
 
 fn hf(v: f32) -> u16 {
@@ -1108,8 +1138,25 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     if t < 1 || t > 128 {
         return Err("tile 검증 t는 1..=128".into());
     }
+    let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
     let (spv_name, n_kb, extra) = match w.ty {
+        llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q6K if msall => ("tile_q6kms.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q3K if msall => ("tile_q3kms.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q8_0 if msall => ("tile_q8ms.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Iq4Xs if msall => ("tile_xsms.spv", 11u32, 1u8),
+        llm170_gguf::GgmlType::Iq4Nl if msall => ("tile_nlms.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_LLM").map(|v| v=="1").unwrap_or(false) => ("tile_llm.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_S32").map(|v| v=="1").unwrap_or(false) => ("tile_s32.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) => ("tile_s32b.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) => ("tile_ms.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false) => ("tile_ms_f16b.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) => ("tile_ms2.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) => ("tile_ms3.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) => ("tile_ms4.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false) => ("tile_ms5.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_NOOPT").map(|v| v=="1").unwrap_or(false) => ("tile128_noopt.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_W").map(|v| v=="1").unwrap_or(false) => ("tile128w.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_OCC").map(|v| v=="1").unwrap_or(false) => ("tile128o.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_DS").map(|v| v=="1").unwrap_or(false) => ("tile128_ds.spv", 10u32, 0u8),
@@ -1124,7 +1171,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Iq3S => ("tile_iq3s.spv", 11, 2),   // grid3s
         _ => return Err("tile 검증 불가 타입".into()),
     };
-    let is_128 = w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none();
+    let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall;
         let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
@@ -1135,8 +1182,16 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     // xq 양자화 (GPU quant — 비트 검증 완료 경로)
     let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-    let xqb = ctx.alloc_host(t * xq_w * 4)?;
-    acc.quant_upload(&mut ctx, &xs, n_in, xqb.buf)?;
+    let msf16b = std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false);
+    let mut xqb = ctx.alloc_host((t * xq_w * 4).max(t * n_in * 2))?;
+    if msf16b {
+        let mut hb: Vec<u16> = Vec::with_capacity(t * n_in);
+        for row in &xs { for &v in row { hb.push(hf(v)); } }
+        unsafe { std::ptr::copy_nonoverlapping(hb.as_ptr() as *const u8, xqb.ptr, t * n_in * 2) };
+        ctx.unmap(&mut xqb)?;
+    } else {
+        acc.quant_upload(&mut ctx, &xs, n_in, xqb.buf)?;
+    }
     let ob = ctx.alloc_host(t * n_out * 4)?;
     // 가중 업로드
     let total = w.data.len();
@@ -1173,7 +1228,13 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw = cw.next_power_of_two();
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
-    let gx = if std::env::var_os("LLM170_TILE_V2").is_some() && w.ty == llm170_gguf::GgmlType::Q5K {
+    let gx = if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
+        (n_out as u32 + 63) / 64   // tile_ms: WG당 64행
+    } else if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+        (n_out as u32 + 31) / 32   // tile_s32b: WG당 32행
+    } else if std::env::var("LLM170_TILE_S32").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+        (n_out as u32 + 31) / 32   // tile_s32: WG당 32행
+    } else if std::env::var_os("LLM170_TILE_V2").is_some() && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 63) / 64   // tile128v2: WG당 64행
     } else {
         (n_out as u32 + 127) / 128
@@ -1192,6 +1253,27 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         v
     };
     let dt = t0.elapsed().as_secs_f64();
+    // 배치 타이밍 (신뢰): N회 녹화 → 1회 제출·대기 — 단독 submit 계측 결함 회피
+    if std::env::var_os("LLM170_TILE_BENCH").is_some() {
+        let n = std::env::var("LLM170_TILE_BENCH").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+        let t1 = std::time::Instant::now();
+        ctx.begin_batch()?;
+        for _ in 0..n {
+            if is_128 {
+                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32]);
+                ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            } else {
+                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, cw_log2, cw_mask]);
+                ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            }
+        }
+        ctx.end_batch_wait()?;
+        let per = t1.elapsed().as_secs_f64() / n as f64;
+        return Ok(format!(
+            "tile-bench({tname}/{spv_name}) t={t}: {per:.4}ms/회 × {n} → {:.1}GB/s",
+            w.data.len() as f64 / per / 1e9
+        ));
+    }
     // CPU 기준: 디양자화 · f64 내적 — 행 0..64 × 전 토큰
     let mut ref_row = vec![0.0f32; n_in];
     let mut maxrel = 0f64;
