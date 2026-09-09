@@ -1,0 +1,80 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+// qsa_flash_q8 (plans/38 A4) — q8_0 KV 판독판. ck/cv는 [pos][nblocks][34B]
+// (d f16 + 32×i8). 레인 tid가 원소 b = kvh*hd + tid를 읽을 때 블록
+// b>>5에서 디양자화: val = d * i8. 나머지는 qsa_flash와 동일(마스크 없음).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Q { float q[]; };     // [n_head*2hd]
+layout(binding = 1) readonly buffer Ck { uint8_t ck8[]; };// [pos][nb][34]
+layout(binding = 2) readonly buffer Cv { uint8_t cv8[]; };// [pos][nb][34]
+layout(binding = 3) buffer O { float o[]; };              // [t][n_head*hd]
+layout(push_constant) uniform PC {
+    int pos0; int nh; int nk; int hd;
+} pc;
+
+float ldq8(uint pos, uint elem, bool is_k) {
+    uint nb = uint(pc.nk * pc.hd) >> 5;
+    uint blk = elem >> 5;
+    uint off = pos * nb * 34u + blk * 34u;
+    if (is_k) {
+        uint dh = uint(ck8[off]) | (uint(ck8[off + 1u]) << 8u);
+        float d = unpackHalf2x16(dh).x;
+        int qv = int(ck8[off + 2u + (elem & 31u)]) << 24 >> 24;
+        return d * float(qv);
+    } else {
+        uint dh = uint(cv8[off]) | (uint(cv8[off + 1u]) << 8u);
+        float d = unpackHalf2x16(dh).x;
+        int qv = int(cv8[off + 2u + (elem & 31u)]) << 24 >> 24;
+        return d * float(qv);
+    }
+}
+
+shared float qf[256];
+shared float rs[8];
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    int h = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID);
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool act = tid < pc.hd;
+    int kvh = h / (pc.nh / pc.nk);
+    int pos = pc.pos0 + row;
+    int np = pos + 1;
+    int qb = row * pc.nh * 2 * pc.hd + h * 2 * pc.hd;
+    if (act) qf[tid] = q[qb + tid];
+    barrier();
+    float m = -3.4028235e38;
+    float sm = 0.0;
+    float acc = 0.0;
+    for (int p = 0; p < np; p++) {
+        int kb = kvh * pc.hd + tid;   // 원소 인덱스 (pos 무관 — 블록 오프셋에 pos)
+        float x = act ? qf[tid] * ldq8(uint(p), uint(kb), true) : 0.0;
+        for (int off = 16; off > 0; off >>= 1)
+            x += subgroupShuffleDown(x, off);
+        if (lane == 0) rs[wid & 7] = x;
+        barrier();
+        float d;
+        if (tid == 0) {
+            float y2 = 0.0;
+            for (int j = 0; j < 8; j++) y2 += rs[j];
+            rs[0] = y2;
+        }
+        barrier();
+        d = rs[0];
+        float m_new = max(m, d);
+        float e_m = exp(m - m_new);
+        float e_d = exp(d - m_new);
+        sm = sm * e_m + e_d;
+        float vv = act ? ldq8(uint(p), uint(kb), false) : 0.0;
+        acc = acc * e_m + e_d * vv;
+        m = m_new;
+    }
+    if (!act) return;
+    float g = 1.0 / (1.0 + exp(-q[qb + pc.hd + tid]));
+    o[(row * pc.nh + h) * pc.hd + tid] = acc * (1.0 / sm) * g;
+}
