@@ -492,7 +492,8 @@ impl DecoderState {
         }
         // f16 사전 디양자화 캐시용 원본 캡처 (plans/39) — weights 소비 전.
         let f16w_on = std::env::var("LLM170_VK_F16W").map(|v| v == "1").unwrap_or(false);
-        let tiled_src: Vec<(String, Vec<u8>, u32, usize, usize)> = if f16w_on {
+        let f16w_max = std::env::var("LLM170_VK_F16W_MAX").ok().and_then(|v| v.parse::<usize>().ok());
+        let mut tiled_src: Vec<(String, Vec<u8>, u32, usize, usize)> = if f16w_on {
             weights
                 .iter()
                 .filter(|(_, _, ty, _, _)| matches!(*ty, 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23))
@@ -501,6 +502,9 @@ impl DecoderState {
         } else {
             Vec::new()
         };
+        if let Some(mx) = f16w_max {
+            tiled_src.truncate(mx);
+        }
         let mut w = HashMap::new();
         for (name, data, ty, ni, no) in weights {
             let mut bufs = Vec::new();
@@ -573,6 +577,8 @@ impl DecoderState {
                     unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
                     ctx.unmap(&mut b)?;
                     f16w.insert(name, b);
+                    // 페이싱: WC 쓰기 독점 회피 (세션 하네스와 기기 공유)
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
             eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
