@@ -1278,14 +1278,22 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
             w.data.len() as f64 / per / 1e9
         ));
     }
-    // CPU 기준: 디양자화 · f64 내적 — 행 0..64 × 전 토큰
+    // CPU 기준: 디양자화 · f64 내적 — 행 0..64 + WG 경계/꼬리 샘플 (plans/40:
+    // 행 64+ 미검증이 ms 패밀리 매핑 버그 은폐 — 전 WG 경계 커버)
+    let mut rows: Vec<usize> = (0..n_out.min(64)).collect();
+    for r in [63usize, 64, 65, 127, 128, 129, 191, 192, n_out.saturating_sub(2), n_out - 1] {
+        if r < n_out && !rows.contains(&r) {
+            rows.push(r);
+        }
+    }
     let mut ref_row = vec![0.0f32; n_in];
     let mut maxrel = 0f64;
     let mut worst = (0usize, 0usize, 0f64, 0f64);
     let mut bad_rows = 0usize;
+    let mut bucket_bad = std::collections::BTreeMap::<u64, usize>::new();
     for (j, x) in xs.iter().enumerate() {
         let mut row_bad = false;
-        for r in 0..n_out.min(64) {
+        for &r in &rows {
             llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
             let dot: f64 = ref_row.iter().zip(x.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
             let g = outs[j * n_out + r] as f64;
@@ -1296,11 +1304,17 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
             }
             if rel > 2e-2 {
                 row_bad = true;
+                *bucket_bad.entry((r / 64) as u64).or_default() += 1;
             }
         }
         if row_bad {
             bad_rows += 1;
         }
+    }
+    eprintln!("[bucket] 2%초과 행(64행 버킷): {:?}", bucket_bad);
+    if std::env::var_os("LLM170_TILE_DUMP").is_some() {
+        eprintln!("[dump] outs[0][0..4] = {:?}", &outs[0..4]);
+        eprintln!("[dump] xs[0][0..6] = {:?}", &xs[0][0..6]);
     }
     Ok(format!(
         "tile({tname}/{spv_name}) t={t}: {dt:.3}ms · maxrel={maxrel:.4} (worst j={} r={} ref={:.4} gpu={:.4}) · 2%초과 토큰 {bad_rows}/{t}",
@@ -1308,3 +1322,71 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     ))
 }
 
+
+
+/// dbg-q3 (plans/40) — tile_q3kms 디코드를 행 0 전원소 덤프해 CPU 진실과 대조.
+pub fn q3_dbg(path: &str, tname: &str) -> Result<String, String> {
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let n_in = w.n_in as usize;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let total = w.data.len();
+    let ch = total.next_power_of_two().min(1usize << (63 - ctx.max_ssbo.leading_zeros()));
+    let mut wbufs = Vec::new();
+    let mut off = 0usize;
+    while off < total {
+        let sz = ch.min(total - off);
+        let mut b = ctx.alloc(sz)?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, sz) };
+        ctx.unmap(&mut b)?;
+        wbufs.push(b.buf);
+        off += sz;
+    }
+    let ob = ctx.alloc_host(n_in * 4 + 4096)?;
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/dbg_q3.spv").map_err(|e| e.to_string())?;
+    let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(&spv, 2, 4)?;
+    ctx.bind_bufs(ds, &[wbufs[0], ob.buf]);
+    let gx = (n_in as u32) / 64 / 32 * 64;  // sb 수/64
+    let n_sb = (n_in / 32) as u32;
+    let gx = n_sb.div_ceil(64);
+    let push = push_u32s(&[n_in as u32]);
+    ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; n_in + 1024];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), n_in + 1024);
+        v
+    };
+    // CPU 진실
+    let mut ref_row = vec![0f32; n_in];
+    llm170_core::quant::dequant_row(w.ty, w.data, 0, n_in as u64, &mut ref_row);
+    let mut bad = 0usize;
+    let mut first = vec![];
+    for k in 0..n_in {
+        let rel = (outs[k] - ref_row[k]).abs() / ref_row[k].abs().max(1e-3);
+        if rel > 1e-3 {
+            bad += 1;
+            if first.len() < 10 { first.push(format!("k={k} gpu={:.5} ref={:.5}", outs[k], ref_row[k])); }
+        }
+    }
+    if std::env::var_os("LLM170_Q3_WIDE").is_some() {
+        let isv: Vec<u32> = outs[n_in..n_in+1024].iter().map(|f| *f as u32).collect();
+        let _ = &isv;
+        eprintln!("[is] k352/368 (sb11 hf0/hf1의 is_i×0.001): {:.4} {:.4}", outs[352]*1000.0, outs[368]*1000.0);
+        eprintln!("[is] k0/16 (sb0): {:.4} {:.4}", outs[0]*1000.0, outs[16]*1000.0);
+        eprintln!("[is] sb8..15: {:?}", &isv[16..32]);
+        eprintln!("[wide] k48..63 gpu: {:?}", &outs[48..64]);
+eprintln!("[wide] k352..383 gpu: {:?}", &outs[352..384]);
+        // 불일치 k의 (sb&3, kc>>4) 히스토그램
+        let mut hh = std::collections::BTreeMap::<(usize, usize), usize>::new();
+        for k in 0..n_in {
+            let rel = (outs[k] - ref_row[k]).abs() / ref_row[k].abs().max(1e-3);
+            if rel > 1e-3 {
+                *hh.entry(((k >> 5) & 3, (k & 16) >> 4)).or_default() += 1;
+            }
+        }
+        eprintln!("[hist] (j, hf) → 불일치 수: {:?}", hh);
+    }
+    Ok(format!("dbg-q3: 불일치 {bad}/{n_in} | {}", first.join(" · ")))
+}

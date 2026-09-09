@@ -1099,23 +1099,46 @@ impl DecoderState {
             }
             // tile_msALL (plans/40): 전 타입 ms 골격 (iq3s 제외) — WG() 제거·가드 제거·64행 WG
             let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v == "1").unwrap_or(false);
+            // 타입별 옵트인 (바이섹트): LLM170_TILE_MS_TYPES="q5,q8,xs,..." — MSALL 대체
+            let ms_types: Option<Vec<u32>> = std::env::var("LLM170_TILE_MS_TYPES").ok().map(|s| {
+                s.split(',').filter_map(|t| match t.trim() {
+                    "q5" => Some(13u32),
+                    "q4" => Some(12),
+                    "q6" => Some(14),
+                    "q3" => Some(11),
+                    "q8" => Some(8),
+                    "nl" => Some(20),
+                    "xs" => Some(0),   // 와일드카드 else-브랜치
+                    _ => None,
+                }).collect()
+            });
+            let ms_on = |t: u32, wildcard: bool| -> bool {
+                if msall { return true; }
+                match &ms_types {
+                    Some(v) => v.contains(&t) || (wildcard && v.contains(&0)),
+                    None => false,
+                }
+            };
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
-                13 if msall => {
+                13 if ms_on(13, false) => {
                     if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) {
                         Some(("tile_ms128", TILE_MS128_SPV, 10))
                     } else {
                         Some(("tile_ms4", TILE_MS4_SPV, 10))
                     }
                 }
-                12 if msall => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
-                14 if msall => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
-                11 if msall => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
-                8 if msall => Some(("tile_q8ms", TILE_Q8MS_SPV, 10)),
-                20 if msall => Some(("tile_nlms", TILE_NLMS_SPV, 11)),
-                _ if msall && ty != 21 => Some(("tile_xsms", TILE_XSMS_SPV, 11)),
+                12 if ms_on(12, false) => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
+                14 if ms_on(14, false) => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
+                11 if ms_on(11, false) => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
+                8 if ms_on(8, false) => Some(("tile_q8ms", TILE_Q8MS_SPV, 10)),
+                20 if ms_on(20, false) => Some(("tile_nlms", TILE_NLMS_SPV, 11)),
+                _ if ms_on(0, true) && ty != 21 => Some(("tile_xsms", TILE_XSMS_SPV, 11)),
                 _ => None,
             };
             if let Some((nm, spv, nkb)) = ms_spv {
+                if nkb == 11 {
+                    binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
+                }
                 let step: usize = if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) && ty == 13 { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
                 for tb in (0..t).step_by(step) {
@@ -1180,12 +1203,11 @@ impl DecoderState {
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
                     self.run_pipe_b("tile_q6k", TILE_Q6K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
                 } else if ty == 11 {
-                    // tile_q3k: hm 32B + q 64B(2비트) + scales 12B + d @108
-                    let cw = wbufs.first().map(|b| b.bytes.next_power_of_two() / 4).unwrap_or(1) as u32;
-                    let cw_log2 = 31u32 - cw.leading_zeros();
-                    let cw_mask = (1u32 << cw_log2) - 1u32;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, cw_log2, cw_mask]);
-                    self.run_pipe_b("tile_q3k", TILE_Q3K_SPV, 10, 24, &binds, &push, gx, 1, 1, last)?;
+                    // q3_K — 구 tile_q3k 디코드 결함(스케일 tmp 3바이트/하프 인덱스 — plans/40)
+                    // → 검증된 tile_q3kms(ms 골격)로 영구 전환. maxrel 0.0033.
+                    let gx_q3 = (no as u32 + 63) / 64;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
+                    self.run_pipe_b("tile_q3kms", TILE_Q3KMS_SPV, 10, 16, &binds, &push, gx_q3, 1, 1, last)?;
                 } else if ty == 8 {
                     // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)도 포함
                     // (gemv3 t≥16 소형은 0.2GB/s급 병목 — ts 프로파일 2026-09-08)
