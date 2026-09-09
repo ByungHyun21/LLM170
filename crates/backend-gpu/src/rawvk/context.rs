@@ -29,7 +29,8 @@ pub struct VkCtx {
     pub mem_ty: u32,
     /// GTT(캐시 host-visible) 타입 — 스크래치용.
     pub mem_ty_host: u32,
-    /// 배치 모드 — run()은 녹화만 하고 end_batch에서 일괄 제출 (plans/19).
+    /// VK_EXT_pipeline_robustness 사용 가능 — NR 파이프라인이 SSBO 무결역 검사 비활성.
+    pub pipeline_robustness: bool,
     pub batching: std::sync::atomic::AtomicBool,
     /// 배치용 per-run 디스크립터 세트 풀 (세트 재사용 하저드 회피 — RCA 2026-09-05:
     /// 녹화된 커맨드가 같은 세트를 참조해 마지막 바인딩으로 전부 덮어씀).
@@ -88,9 +89,16 @@ impl VkCtx {
             // coop matrix 역량 (f16×f16→f32, subgroup 스코프, M>=16, K=16)
             let mut coop_matrix = false;
             let mut coop_f16_f32 = false;
+            let mut pipeline_robustness = false;
             let exts = instance
                 .enumerate_device_extension_properties(physical)
                 .map_err(|e| format!("확장: {e:?}"))?;
+            if exts
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::pipeline_robustness::NAME))
+            {
+                pipeline_robustness = true;
+            }
             if exts
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(khr::cooperative_matrix::NAME))
@@ -118,8 +126,8 @@ impl VkCtx {
 
             // f16/16bit-storage/subgroup-extended-types는 1.2 코어 승격 — Vulkan 1.3 디바이스에서 기본.
             let mut dev_ext: Vec<*const std::ffi::c_char> = Vec::new();
-            if coop_matrix {
-                dev_ext.push(khr::cooperative_matrix::NAME.as_ptr());
+            if pipeline_robustness {
+                dev_ext.push(ash::ext::pipeline_robustness::NAME.as_ptr());
             }
             let mut v11 = vk::PhysicalDeviceVulkan11Features::default()
                 .storage_buffer16_bit_access(true)
@@ -127,6 +135,11 @@ impl VkCtx {
             let mut coopfeat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
                 .cooperative_matrix(true);
             let mut feats = vk::PhysicalDeviceFeatures2::default().push_next(&mut v11);
+            let mut prfeat = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default()
+                .pipeline_robustness(true);
+            if pipeline_robustness {
+                feats = feats.push_next(&mut prfeat);
+            }
             if coop_matrix {
                 feats = feats.push_next(&mut coopfeat);
             }
@@ -212,6 +225,7 @@ impl VkCtx {
                 cmdbuf2,
                 fence,
                 coop_matrix,
+                pipeline_robustness,
                 coop_f16_f32,
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
@@ -635,12 +649,21 @@ impl VkCtx {
                 .device
                 .create_shader_module(&smci, None)
                 .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
-            let pci = vk::ComputePipelineCreateInfo::default().stage(
+            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NR").is_some();
+            let mut rci = vk::PipelineRobustnessCreateInfoEXT::default()
+                .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
+                .uniform_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
+                .vertex_inputs(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
+                .images(vk::PipelineRobustnessImageBehaviorEXT::DISABLED);
+            let mut pci = vk::ComputePipelineCreateInfo::default().stage(
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::COMPUTE)
                     .module(sm)
                     .name(c"main"),
             ).layout(pl);
+            if nr {
+                pci = pci.push_next(&mut rci);
+            }
             let pipe = self
                 .device
                 .create_compute_pipelines(vk::PipelineCache::null(), &[pci], None)
