@@ -1109,8 +1109,6 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         return Err("tile 검증 t는 1..=64".into());
     }
     let (spv_name, n_kb, extra) = match w.ty {
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_V2").as_deref() == Ok("2") => ("tile128v2_dbg.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_V2").as_deref() == Ok("3") => ("tile128v2_dbg2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),
@@ -1123,8 +1121,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         _ => return Err("tile 검증 불가 타입".into()),
     };
     let is_128 = w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none();
-    let v2dbg = std::env::var("LLM170_TILE_V2").map(|v| v == "2" || v == "3").unwrap_or(false);
-    let acc = VkAcc::new()?;
+        let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
     let mut lcg = || {
@@ -1172,7 +1169,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw = cw.next_power_of_two();
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
-    let gx = (n_out as u32 + 127) / 128;
+    let gx = if std::env::var_os("LLM170_TILE_V2").is_some() && w.ty == llm170_gguf::GgmlType::Q5K {
+        (n_out as u32 + 63) / 64   // tile128v2: WG당 64행
+    } else {
+        (n_out as u32 + 127) / 128
+    };
     let t0 = Instant::now();
     if is_128 {
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32]);
@@ -1187,19 +1188,6 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         v
     };
     let dt = t0.elapsed().as_secs_f64();
-    if v2dbg {
-        // B≡1 → out[t][row] = Σ 디양자화 행
-        let mut ref_row2 = vec![0.0f32; n_in];
-        let mut worst = (0usize, 0f64, 0f64);
-        for r in 0..n_out.min(64) {
-            llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row2);
-            let s: f64 = ref_row2.iter().map(|&v| v as f64).sum();
-            let g = (if std::env::var("LLM170_TILE_V2").as_deref() == Ok("3") { outs[r * 16] } else { outs[r] }) as f64;
-            let rel = (g - s).abs() / s.abs().max(1.0);
-            if rel > worst.1 { worst = (r, rel, s); }
-        }
-        return Ok(format!("tile-v2dbg({tname}) t={t}: rowsum maxrel={:.4} (r={} ref={:.4})", worst.1, worst.0, worst.2));
-    }
     // CPU 기준: 디양자화 · f64 내적 — 행 0..64 × 전 토큰
     let mut ref_row = vec![0.0f32; n_in];
     let mut maxrel = 0f64;
