@@ -957,8 +957,10 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let xa = ctx.alloc_host(t * n_in * 4)?;
     for (j, x) in xs.iter().enumerate() {
         unsafe {
+            // 행 스트라이드는 바이트 — n_in f32 = n_in*4바이트 (A2: 이 오타가
+            // t≥2 하니스 오염의 전부였음 — 행1이 행0의 1/4 지점을 덮어씀)
             std::ptr::copy_nonoverlapping(
-                x.as_ptr(), xa.ptr.add(j * n_in) as *mut f32, n_in);
+                x.as_ptr(), xa.ptr.add(j * n_in * 4) as *mut f32, n_in);
         }
     }
     let ob = ctx.alloc_host(t * n_out * 4)?;  // 매핑 유지 — 판독용
@@ -1093,3 +1095,121 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         w.data.len() as f64 / solo_dt / 1e9
     ))
 }
+
+/// vk-tile-check — 타일(coopmat f16) 커널 vs CPU 디양자화 GEMM 검증 (plans/38 A2).
+/// f16 스테이징 품질계약: maxrel 허용치 ~2e-2 (근접 아닌 구조 오류 검출 목적).
+pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    use std::time::Instant;
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    if t < 1 || t > 64 {
+        return Err("tile 검증 t는 1..=64".into());
+    }
+    let (spv_name, n_kb, extra) = match w.ty {
+        llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),
+        llm170_gguf::GgmlType::Q6K => ("tile_q6k.spv", 10, 0),
+        llm170_gguf::GgmlType::Q3K => ("tile_q3k.spv", 10, 0),
+        llm170_gguf::GgmlType::Q8_0 => ("tile_q8.spv", 10, 0),
+        llm170_gguf::GgmlType::Iq4Xs => ("tile_xs.spv", 11, 1),   // ktab
+        llm170_gguf::GgmlType::Iq4Nl => ("tile_nl.spv", 11, 1),    // ktab
+        llm170_gguf::GgmlType::Iq3S => ("tile_iq3s.spv", 11, 2),   // grid3s
+        _ => return Err("tile 검증 불가 타입".into()),
+    };
+    let is_128 = w.ty == llm170_gguf::GgmlType::Q5K;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let mut seed = 0x5deece66u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    // xq 양자화 (GPU quant — 비트 검증 완료 경로)
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+    let xqb = ctx.alloc_host(t * xq_w * 4)?;
+    acc.quant_upload(&mut ctx, &xs, n_in, xqb.buf)?;
+    let ob = ctx.alloc_host(t * n_out * 4)?;
+    // 가중 업로드
+    let total = w.data.len();
+    let ch = total.next_power_of_two().min(1usize << (63 - ctx.max_ssbo.leading_zeros()));
+    let mut wbufs = Vec::new();
+    let mut off = 0usize;
+    while off < total {
+        let sz = ch.min(total - off);
+        let mut b = ctx.alloc(sz)?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, sz) };
+        ctx.unmap(&mut b)?;
+        wbufs.push(b.buf);
+        off += sz;
+    }
+    let (ktab, grid, dummy) = acc.ensure_shared(&mut ctx)?;
+    while wbufs.len() < 8 {
+        wbufs.push(dummy);
+    }
+    let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
+        .map_err(|e| e.to_string())?;
+    let pb: u32 = if is_128 { 16 } else { 24 };
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
+    let _ = (dsl, pool);
+    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+    binds.push(xqb.buf);
+    binds.push(ob.buf);
+    if extra == 1 {
+        binds.push(ktab);
+    } else if extra == 2 {
+        binds.push(grid);
+    }
+    ctx.bind_bufs(ds, &binds);
+    let cw = (ch / 4) as u32;
+    let cw = cw.next_power_of_two();
+    let cw_log2 = 31u32 - cw.leading_zeros();
+    let cw_mask = cw - 1;
+    let gx = (n_out as u32 + 127) / 128;
+    let t0 = Instant::now();
+    if is_128 {
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32]);
+        ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+    } else {
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, cw_log2, cw_mask]);
+        ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+    }
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; t * n_out];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+        v
+    };
+    let dt = t0.elapsed().as_secs_f64();
+    // CPU 기준: 디양자화 · f64 내적 — 행 0..64 × 전 토큰
+    let mut ref_row = vec![0.0f32; n_in];
+    let mut maxrel = 0f64;
+    let mut worst = (0usize, 0usize, 0f64, 0f64);
+    let mut bad_rows = 0usize;
+    for (j, x) in xs.iter().enumerate() {
+        let mut row_bad = false;
+        for r in 0..n_out.min(64) {
+            llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
+            let dot: f64 = ref_row.iter().zip(x.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let g = outs[j * n_out + r] as f64;
+            let rel = (g - dot).abs() / dot.abs().max(1.0);
+            if rel > maxrel {
+                maxrel = rel;
+                worst = (j, r, dot, g);
+            }
+            if rel > 2e-2 {
+                row_bad = true;
+            }
+        }
+        if row_bad {
+            bad_rows += 1;
+        }
+    }
+    Ok(format!(
+        "tile({tname}/{spv_name}) t={t}: {dt:.3}ms · maxrel={maxrel:.4} (worst j={} r={} ref={:.4} gpu={:.4}) · 2%초과 토큰 {bad_rows}/{t}",
+        worst.0, worst.1, worst.2, worst.3
+    ))
+}
+

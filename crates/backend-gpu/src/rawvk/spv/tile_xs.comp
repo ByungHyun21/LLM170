@@ -67,7 +67,7 @@ void main() {
         // A 스테이징(iq4_xs): 512스레드 → 128행 × 32k, 스레드당 8원소(4바이트 lo/hi 쌍)
         {
             int r = int(tid >> 2);              // 행 0..127
-            int kc = int(tid & 3) * 8;          // k 오프셋 0/8/16/24
+            int kc = int(tid & 3) * 4;          // qs 바이트 0/4/8/12 (A2 수정: 서브블록 qs는 16B — 스레드당 4바이트)
             int row = row0 + r;
             if (row < nrow + row0) {
                 int ib = sb & 7;
@@ -83,31 +83,23 @@ void main() {
                 uint slb = (slw >> uint(((rowb + 4 + (ib >> 1)) & 3) * 8)) & 0xFFu;
                 int ls = int((slb >> uint(4 * (ib & 1))) & 0xFu) | (int((sh >> uint(2 * ib)) & 3u) << 4);
                 float dl = d * float(ls - 32);
-                // qs 16B @8+ib*16 — kc/8 = 워드 인덱스(0..3), 스레드당 2워드
-                uint qb = uint(rowb + 8 + ib * 16) + uint(kc >> 2) * 4u;
+                // qs 16B @8+ib*16 — 스레드당 4바이트 1워드: 바이트 j → 원소 j(lo), 16+j(hi)
+                uint qb = uint(rowb + 8 + ib * 16) + uint(kc);
                 uint wva = WG(qb >> 2);
                 uint rem = qb & 3u;
                 if (rem != 0u) {
                     uint w2 = WG((qb >> 2) + 1u);
                     wva = (wva >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
                 }
-                uint qb2 = qb + 4u;
-                uint wvb = WG(qb2 >> 2);
-                rem = qb2 & 3u;
-                if (rem != 0u) {
-                    uint w2 = WG((qb2 >> 2) + 1u);
-                    wvb = (wvb >> (rem * 8u)) | (w2 << ((4u - rem) * 8u));
-                }
-                for (int e = 0; e < 8; e++) {
+                for (int e = 0; e < 4; e++) {
                     int j = kc + e;               // qs 바이트 0..15 (lo열 원소 j, hi열 16+j)
-                    uint wsel = ((j & 4) == 0) ? wva : wvb;
-                    uint byte_v = (wsel >> uint((j & 3) * 8)) & 0xFFu;
+                    uint byte_v = (wva >> uint(e * 8)) & 0xFFu;
                     uint t2 = skt[byte_v];
                     A16[r][j] = float16_t(float((int(t2 & 0xFFu) << 24) >> 24) * dl);
                     A16[r][16 + j] = float16_t(float((int(t2 >> 8u) << 24) >> 24) * dl);
                 }
             } else {
-                for (int e = 0; e < 8; e++) { A16[r][kc + e] = float16_t(0.0); A16[r][16 + kc + e] = float16_t(0.0); }
+                for (int e = 0; e < 4; e++) { A16[r][kc + e] = float16_t(0.0); A16[r][16 + kc + e] = float16_t(0.0); }
             }
         }
         // B 스테이징: tile128과 동일 (xq q8 → f16)

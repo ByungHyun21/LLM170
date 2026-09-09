@@ -48,6 +48,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
   vk-check                       Vulkan 장치·coopmat·axpy 스모크
   vk-gemv-check <file> <tensor> [t]   엔진 경로(quant+gemv3) GEMV 검증
   vk-gemv8-check <file> <tensor> [t]  gemv8 패밀리 검증+타이밍
+  vk-tile-check <file> <tensor> [t]    coopmat 타일 패밀리 검증 (t≤64)
   vk-mmq-check <file> <tensor> [t]    i8 GEMM(plans/23) 검증
   vk-sdot-probe                  OpSDot 장치 지원 프로브
   gdn-check | subsum-check       GDN/서브그룹 축소 커널 검증
