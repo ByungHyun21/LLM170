@@ -1164,8 +1164,6 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="2").unwrap_or(false) => ("tile_ms128s17.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="4").unwrap_or(false) => ("tile_ms128s19.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="3").unwrap_or(false) => ("tile_ms128s18.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
