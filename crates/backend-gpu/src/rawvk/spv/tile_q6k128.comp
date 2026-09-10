@@ -30,7 +30,7 @@ layout(push_constant) uniform PC {
 #define BK 32
 #define BM 64
 #define BN 128
-#define SHMEM_STRIDE (BK / 2 + 4)   // 20 vec2
+#define SHMEM_STRIDE (BK / 2 + 2)   // 18 vec2 (plans/43 점유: 4 WG/CU)
 
 // 단일 청크 직인덱스 (엔진 ch_eff=텐서 next_pow2 → 항상 1청크, plans/40)
 #define WG(idx) w0c[idx]
