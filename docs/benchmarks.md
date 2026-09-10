@@ -1413,3 +1413,14 @@ spread is about +-5% and dominates these deltas. Prefill is at a plateau
 where every weight byte is re-read once per 64-token slab; halving that
 needs a >64-wide accumulator tile whose per-byte rate holds, which ms128
 (BN=128) did not deliver (neutral wall, lower kernel rate).
+
+## ms256 tile — BN=128 with four subgroups (opt-in, plans/43)
+
+tile_ms256 keeps ms4's per-subgroup accumulator layout (acc[4][2]) but runs
+four wave64 subgroups per workgroup, so one 256-thread workgroup covers 128
+tokens per weight read (BM=64, BN=128). Measured: pp512 219.8/220.0 t/s vs
+216.3/216.4 baseline (+1.6%), but 167.6 t/s at pp64 where a 64-token batch
+wastes half the accumulator — hence gated to t >= 128 and kept opt-in
+(LLM170_TILE_MS256=1). Kernel-solo rate drops to 36.7 GB/s (from ms4's 61)
+because of the larger drain and LDS footprint, which eats most of the
+halved weight traffic; the width gain is real but small on this hardware.

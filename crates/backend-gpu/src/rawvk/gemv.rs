@@ -1164,6 +1164,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS256").map(|v| v=="1").unwrap_or(false) => ("tile_ms256.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K if msall && gy2 => ("tile_q4kmgy.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if msall && gy2 => ("tile_q6kmgy.spv", 10u32, 0u8),
@@ -1250,6 +1251,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv") || spv_name == "tile_ms4.spv";
+    let ms256 = spv_name == "tile_ms256.spv";
+    let slab: usize = if ms256 { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
     let pb: u32 = if is_msfam { 20 } else if ms128fam_any { 24 } else if is_128 { 16 } else { 24 };
@@ -1313,9 +1316,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         let ms128fam = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
             || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         if is_msfam {
-            // ms 패밀리: t>64는 64토큰 슬래브로 분할 (tok_base로 전 토큰 커버)
-            for tb in (0..t).step_by(64) {
-                let nt = (t - tb).min(64) as u32;
+            // ms 패밀리: t>슬래브는 분할 (tok_base로 전 토큰 커버; ms256 = 128토큰 슬래브)
+            for tb in (0..t).step_by(slab) {
+                let nt = (t - tb).min(slab) as u32;
                 let push = mpush(nt, tb as u32);
                 ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
             }
@@ -1349,10 +1352,10 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
                 let gy = (t as u32).div_ceil(64);
                 let push = mpush(64, 0);
                 ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
-            } else if is_msfam && t > 64 {
+            } else if is_msfam && t > slab {
                 // 순차 슬래브 (엔진 비-gy 경로와 동일 형태): tok_base=tb로 전 토큰 커버
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
+                for tb in (0..t).step_by(slab) {
+                    let nt = (t - tb).min(slab) as u32;
                     let push = mpush(nt, tb as u32);
                     ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
                 }
