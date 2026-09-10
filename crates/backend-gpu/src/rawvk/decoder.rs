@@ -1177,9 +1177,13 @@ impl DecoderState {
                     None => false,
                 }
             };
+            // plans/40: MS128=ffn — 병렬 attention 그룹 외 FFN만 BN=128 (가중 1회 판독).
+            // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
+            let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
+            let ms128ffn = ms128mode == "ffn" && wkey.contains("ffn");
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
                 13 if ms_on(13, false) => {
-                    if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) {
+                    if ms128mode == "1" || ms128ffn {
                         Some(("tile_ms128", TILE_MS128_SPV, 10))
                     } else {
                         Some(("tile_ms4", TILE_MS4_SPV, 10))
@@ -1197,7 +1201,7 @@ impl DecoderState {
                 if nkb == 11 {
                     binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
                 }
-                let step: usize = if std::env::var("LLM170_TILE_MS128").map(|v| v == "1").unwrap_or(false) && ty == 13 { 128 } else { 64 };
+                let step: usize = if (ms128mode == "1" || (ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13 { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
