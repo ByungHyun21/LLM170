@@ -53,6 +53,13 @@ const TILE128W_SPV: &[u8] = include_bytes!("spv/tile128w.spv");
 const TILE_MS2_SPV: &[u8] = include_bytes!("spv/tile_ms2.spv");
 const TILE_MS4_SPV: &[u8] = include_bytes!("spv/tile_ms4.spv");
 const TILE_MS4GY_SPV: &[u8] = include_bytes!("spv/tile_ms4gy.spv");
+const TILE_Q4KMGY_SPV: &[u8] = include_bytes!("spv/tile_q4kmgy.spv");
+const TILE_Q6KMGY_SPV: &[u8] = include_bytes!("spv/tile_q6kmgy.spv");
+const TILE_Q3KMGY_SPV: &[u8] = include_bytes!("spv/tile_q3kmgy.spv");
+const TILE_Q8MGY_SPV: &[u8] = include_bytes!("spv/tile_q8mgy.spv");
+const TILE_XSMGY_SPV: &[u8] = include_bytes!("spv/tile_xsmgy.spv");
+const TILE_NLMGY_SPV: &[u8] = include_bytes!("spv/tile_nlmgy.spv");
+const Q4K_MGY_SPV: &[u8] = include_bytes!("spv/tile_q4kmgy.spv");
 const TILE_Q4KMS_SPV: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 const TILE_Q6KMS_SPV: &[u8] = include_bytes!("spv/tile_q6kms.spv");
 const TILE_Q3KMS_SPV: &[u8] = include_bytes!("spv/tile_q3kms.spv");
@@ -1189,6 +1196,7 @@ impl DecoderState {
             // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
             let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
             let ms128ffn = (ms128mode == "ffn" || ms128mode == "split") && wkey.contains("ffn") || ms128mode == "split";
+            let gy_on2 = std::env::var("LLM170_VK_GY2").map(|v| v == "1").unwrap_or(false);  // plans/40: 옵트인 (기본 꺼짐 — 디버그 필요)
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
                 13 if ms_on(13, false) => {
                     if std::env::var("LLM170_VK_GY").map(|v| v == "0").unwrap_or(true) {
@@ -1199,6 +1207,12 @@ impl DecoderState {
                         Some(("tile_ms4", TILE_MS4_SPV, 10))
                     }
                 }
+                12 if ms_on(12, false) && gy_on2 => Some(("tile_q4kmgy", TILE_Q4KMGY_SPV, 10)),
+                14 if ms_on(14, false) && gy_on2 => Some(("tile_q6kmgy", TILE_Q6KMGY_SPV, 10)),
+                11 if ms_on(11, false) && gy_on2 => Some(("tile_q3kmgy", TILE_Q3KMGY_SPV, 10)),
+                8 if ms_on(8, false) && gy_on2 => Some(("tile_q8mgy", TILE_Q8MGY_SPV, 10)),
+                20 if ms_on(20, false) && gy_on2 => Some(("tile_nlmgy", TILE_NLMGY_SPV, 11)),
+                _ if ms_on(0, true) && ty != 21 && gy_on2 => Some(("tile_xsmgy", TILE_XSMGY_SPV, 11)),
                 12 if ms_on(12, false) => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
                 14 if ms_on(14, false) => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
                 11 if ms_on(11, false) => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
@@ -1217,11 +1231,22 @@ impl DecoderState {
                 // plans/40: ms128 반그리드 분할 — 팻커널 CU 독점 완화 (인터리브 회복).
                 // MS128=split: 절반씩 2회. GPU합 -120ms/청크는 유지하며 큐 혼합 허용.
                 let split = ms128mode == "split" && ty == 13;
-                if gy_on && ty == 13 {
+                let (gy_nm, gy_spv, gy_nkb): (&str, &[u8], u32) = match ty {
+                    13 => ("tile_ms4gy", TILE_MS4GY_SPV, 10),
+                    12 => ("tile_q4kmgy", TILE_Q4KMGY_SPV, 10),
+                    14 => ("tile_q6kmgy", TILE_Q6KMGY_SPV, 10),
+                    11 => ("tile_q3kmgy", TILE_Q3KMGY_SPV, 10),
+                    8 => ("tile_q8mgy", TILE_Q8MGY_SPV, 10),
+                    20 => ("tile_nlmgy", TILE_NLMGY_SPV, 11),
+                    _ => ("tile_xsmgy", TILE_XSMGY_SPV, 11),
+                };
+                let use_gy = (ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2);
+                if use_gy {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용
                     let gy = (t as u32).div_ceil(64);
+                    if gy_nkb == 11 { binds.push(self.ktab.buf); }
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32]);
-                    return self.run_pipe_b("tile_ms4gy", TILE_MS4GY_SPV, 10, 16, &binds, &push,
+                    return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 16, &binds, &push,
                         (no as u32 + 63) / 64, gy, 1, bar);
                 }
                 for tb in (0..t).step_by(step) {
