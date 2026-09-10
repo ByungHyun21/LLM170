@@ -1,0 +1,76 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_q8b (plans/40) — llama mul_mat_vec(generic) q8_0 구조.
+// 64스레드, NUM_ROWS=2, K_PER_ITER=8: 레인이 워드 2개(원소 8개) dot.
+// 블록 34B: [d f16][32 i8]. 구형 대비 87→~200GB/s 기대.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+vec4 unpk8f(uint x) {
+    return vec4(
+        float(int((x) & 0xFFu) << 24 >> 24),
+        float(int((x >> 8) & 0xFFu) << 24 >> 24),
+        float(int((x >> 16) & 0xFFu) << 24 >> 24),
+        float(int(x >> 24) << 24 >> 24));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint ybase = tok * pc.n_in;
+    float acc0 = 0.0, acc1 = 0.0;
+    const uint n_in = pc.n_in;
+    // 블록 수/행 — 34B 비정렬: 워드 인덱스 산출 후 d 2B 조립
+    const uint KPIT = 64u * 8u;   // 512 k/iter
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        const vec4 bv0 = vec4(xa[ybase + col0], xa[ybase + col0 + 1u], xa[ybase + col0 + 2u], xa[ybase + col0 + 3u]);
+        const vec4 bv1 = vec4(xa[ybase + col0 + 4u], xa[ybase + col0 + 5u], xa[ybase + col0 + 6u], xa[ybase + col0 + 7u]);
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;   // 행 절대 k 기저 — 아래 워드/블록 산출
+            const uint blk = col / 32u;
+            const uint bbase = blk * 34u;
+            const uint rem = col & 31u;                        // 블록 내 원소 (8 정렬)
+            const uint wd = bbase + 2u + rem;
+            const uint w0 = w0u[wd >> 2];
+            const uint w1 = w0u[(wd >> 2) + 1u];
+            const uint sh = (wd & 3u) * 8u;
+            // 원소 8개 = wd..wd+7 바이트 — 두 u32에서 8바이트 조립
+            const uint v0b = (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
+            const uint w2 = w0u[(wd >> 2) + 2u];
+            const uint v1b = (w1 >> sh) | (sh != 0u ? (w2 << (32u - sh)) : 0u);
+            // d f16 @ bbase (2B)
+            const uint dw = w0u[bbase >> 2];
+            const uint dsh = (bbase & 3u) * 8u;
+            uint db = (dw >> dsh) & 0xFFFFu;
+            if (dsh >= 24u) {
+                db = ((dw >> dsh) | (w0u[(bbase >> 2) + 1u] << 8u)) & 0xFFFFu;
+            }
+            const float d = unpackHalf2x16(db).x;
+            const float r = d * (dot(bv0, unpk8f(v0b)) + dot(bv1, unpk8f(v1b)));
+            if (n == 0u) acc0 += r; else acc1 += r;
+        }
+    }
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
