@@ -14,6 +14,8 @@ const GEMV8_Q3_SPV: &[u8] = include_bytes!("spv/gemv8_q3.spv");
 const GEMV8_Q6_SPV: &[u8] = include_bytes!("spv/gemv8_q6.spv");
 const GEMV8_Q8_SPV: &[u8] = include_bytes!("spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
+const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
+const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -1001,6 +1003,12 @@ impl DecoderState {
                 1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
         }
         if ty == 12 {
+            // q4b (plans/40) — llama mul_mat_vec_q4_k 이식: 152→272GB/s. LLM170_VK_Q4B=0 옵트아웃.
+            if std::env::var("LLM170_VK_Q4B").map(|v| v == "0").unwrap_or(true) {
+                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+                return self.run_pipe_b("gemv8_q4b", GEMV8_Q4B_SPV, 10, 24, &binds, &push,
+                    1, no.div_ceil(2) as u32, t as u32, bar);
+            }
             // q4 — u32 워드 단위 (동일 WG 워커)
             let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
             let cw = cw.next_power_of_two();
@@ -1011,6 +1019,12 @@ impl DecoderState {
                 1, no.div_ceil(rpf as usize) as u32, t as u32, bar);
         }
         if ty == 14 {
+            // q6b (plans/40) — llama mul_mat_vec_q6_k 충실 이식(sccache): +35%. LLM170_VK_Q6B=0 옵트아웃.
+            if std::env::var("LLM170_VK_Q6B").map(|v| v == "0").unwrap_or(true) {
+                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+                return self.run_pipe_b("gemv8_q6b", GEMV8_Q6B_SPV, 10, 24, &binds, &push,
+                    1, no.div_ceil(2) as u32, t as u32, bar);
+            }
             // q6 — u16 뷰 (105 u16/블록), llama mul_mat_vec_q6_k 직역 (plans/36 G1)
             let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
             let cw2 = cw2.next_power_of_two();

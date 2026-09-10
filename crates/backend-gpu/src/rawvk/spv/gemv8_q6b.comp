@@ -1,0 +1,123 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_q6b (plans/40) — llama mul_mat_vec_q6_k 충실 이식.
+// 64스레드 WG (16-스레드 블록그룹 × it 4), NUM_ROWS=2, sccache 스케일 이중버퍼.
+// 블록 210B: ql[128] qh[64] sc[16] d@208 (u16 typed 뷰).
+layout(local_size_x = 64) in;
+
+struct Blk {
+    uint16_t ql[64];
+    uint16_t qh[32];
+    int16_t sc[8];
+    float16_t d;
+};
+layout(binding = 0) readonly buffer AP16S { Blk ablk[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uvec4 unpk8(uint x) {
+    return uvec4(x & 0xFFu, (x >> 8) & 0xFFu, (x >> 16) & 0xFFu, x >> 24);
+}
+
+shared float sccache[2][4][16];
+uint csel = 0u;
+float acc0 = 0.0;
+float acc1 = 0.0;
+
+void calc_superblock(const uint bbase, const uint itid, const uint ix,
+                     const uint ql_offset, const uint qh_offset, const uint s_offset,
+                     const uint y_offset, const uint i, const uint num_blocks,
+                     const uint first_row, const uint num_rows, const bool all_threads) {
+    const uint y_idx = bbase + i * 256u + y_offset;
+    [[unroll]] for (uint n = 0u; n < 2u; n++) {
+        if (n >= num_rows) break;
+        csel ^= 1u;
+        const uint ib = (first_row + n) * num_blocks + i;
+        if (!all_threads) {
+            if (i < num_blocks) {
+                int scb = int((uint(ablk[ib].sc[itid >> 1u]) >> (8u * (itid & 1u))) & 0xFFu) << 24 >> 24;
+                sccache[csel][ix][itid] = float(scb);
+            }
+            barrier();
+            if (i >= num_blocks) continue;
+        }
+        const uint ql0 = uint(ablk[ib].ql[ql_offset / 2u]) | (uint(ablk[ib].ql[ql_offset / 2u + 1u]) << 16);
+        const uint ql32 = uint(ablk[ib].ql[ql_offset / 2u + 16u]) | (uint(ablk[ib].ql[ql_offset / 2u + 17u]) << 16);
+        const uint qh = uint(ablk[ib].qh[qh_offset / 2u]) | (uint(ablk[ib].qh[qh_offset / 2u + 1u]) << 16);
+        const uint q0 = (ql0 & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4);
+        const uint q1 = (ql32 & 0x0F0F0F0Fu) | ((qh & 0x0C0C0C0Cu) << 2);
+        const uint q2 = ((ql0 >> 4) & 0x0F0F0F0Fu) | (qh & 0x30303030u);
+        const uint q3 = ((ql32 >> 4) & 0x0F0F0F0Fu) | ((qh & 0xC0C0C0C0u) >> 2);
+        const vec4 v0 = vec4(unpk8(q0)) - 32.0f;
+        const vec4 v1 = vec4(unpk8(q1)) - 32.0f;
+        const vec4 v2 = vec4(unpk8(q2)) - 32.0f;
+        const vec4 v3 = vec4(unpk8(q3)) - 32.0f;
+        if (all_threads) {
+            int scb2 = int((uint(ablk[ib].sc[itid >> 1u]) >> (8u * (itid & 1u))) & 0xFFu) << 24 >> 24;
+            sccache[csel][ix][itid] = float(scb2);
+            barrier();
+        }
+        const float d = float(ablk[ib].d);
+        vec4 by0 = vec4(xa[y_idx], xa[y_idx + 1u], xa[y_idx + 2u], xa[y_idx + 3u]);
+        vec4 by32 = vec4(xa[y_idx + 32u], xa[y_idx + 33u], xa[y_idx + 34u], xa[y_idx + 35u]);
+        vec4 by64 = vec4(xa[y_idx + 64u], xa[y_idx + 65u], xa[y_idx + 66u], xa[y_idx + 67u]);
+        vec4 by96 = vec4(xa[y_idx + 96u], xa[y_idx + 97u], xa[y_idx + 98u], xa[y_idx + 99u]);
+        float sum0 = fma(by0.x, v0.x, fma(by0.y, v0.y, fma(by0.z, v0.z, by0.w * v0.w)));
+        float sum1 = fma(by32.x, v1.x, fma(by32.y, v1.y, fma(by32.z, v1.z, by32.w * v1.w)));
+        float sum2 = fma(by64.x, v2.x, fma(by64.y, v2.y, fma(by64.z, v2.z, by64.w * v2.w)));
+        float sum3 = fma(by96.x, v3.x, fma(by96.y, v3.y, fma(by96.z, v3.z, by96.w * v3.w)));
+        const float r = d * fma(sum0, sccache[csel][ix][s_offset],
+                            fma(sum1, sccache[csel][ix][s_offset + 2u],
+                            fma(sum2, sccache[csel][ix][s_offset + 4u],
+                                sum3 * sccache[csel][ix][s_offset + 6u])));
+        if (n == 0u) acc0 += r; else acc1 += r;
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint num_blocks = pc.n_in / 256u;
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;      // 0..3 (it_size 4)
+    const uint v_im = itid / 8u;
+    const uint v_in = itid - 8u * v_im;
+    const uint l0 = 4u * v_in;
+    const uint is = v_in / 4u;
+    const uint ql_offset = 64u * v_im + l0;
+    const uint qh_offset = 32u * v_im + l0;
+    const uint s_offset = 8u * v_im + is;
+    const uint y_offset = 128u * v_im + l0;
+    acc0 = 0.0; acc1 = 0.0;
+    const uint bbase = tok * pc.n_in;
+
+    const uint it_size = 4u;
+    const uint nbr_par = num_blocks % it_size;
+    const uint nbr_all = num_blocks - nbr_par;
+    uint i0 = 0u;
+    [[unroll]] for (; i0 < nbr_all; i0 += it_size)
+        calc_superblock(bbase, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks, first_row, num_rows, true);
+    calc_superblock(bbase, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks, first_row, num_rows, false);
+
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
