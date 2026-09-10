@@ -1262,9 +1262,9 @@ impl DecoderState {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용
                     let gy = (t as u32).div_ceil(64);
                     // ktab은 위 ms_spv 블록이 이미 push함 (gy_nkb == nkb) — 중복 push 금지
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32]);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32, 0u32]);
                     // plans/41 zs: 슬래브= x(최속), 행 = y — 행블록의 토큰 페어가 인접 스케줄(L2 병합)
-                    return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 16, &binds, &push,
+                    return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 20, &binds, &push,
                         gy, (no as u32 + 63) / 64, 1, bar);
                 }
                 for tb in (0..t).step_by(step) {
@@ -1284,8 +1284,12 @@ impl DecoderState {
                             let _ = first;
                         }
                     } else {
-                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32]);
-                        self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, gx_ms, 1, 1, last)?;
+                        if std::env::var_os("LLM170_DBG_TILE").is_some() {
+                            eprintln!("[dbg_slab] tb={tb} nt={nt} gx={gx_ms} nm={nm}");
+                        }
+                        // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
+                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
+                        self.run_pipe_b(nm, spv, nkb, 20, &binds, &push, gx_ms, 1, 1, last)?;
                     }
                 }
                 return Ok(());
@@ -1296,8 +1300,8 @@ impl DecoderState {
                 for tb in (0..t).step_by(64) {
                     let nt = (t - tb).min(64) as u32;
                     let last = tb + 64 >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b("tile_ms4", TILE_MS4_SPV, 10, 16, &binds, &push, gx_ms4, 1, 1, last)?;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
+                    self.run_pipe_b("tile_ms4", TILE_MS4_SPV, 10, 20, &binds, &push, gx_ms4, 1, 1, last)?;
                 }
                 return Ok(());
             }
@@ -1347,8 +1351,8 @@ impl DecoderState {
                     // q3_K — 구 tile_q3k 디코드 결함(스케일 tmp 3바이트/하프 인덱스 — plans/40)
                     // → 검증된 tile_q3kms(ms 골격)로 영구 전환. maxrel 0.0033.
                     let gx_q3 = (no as u32 + 63) / 64;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b("tile_q3kms", TILE_Q3KMS_SPV, 10, 16, &binds, &push, gx_q3, 1, 1, last)?;
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
+                    self.run_pipe_b("tile_q3kms", TILE_Q3KMS_SPV, 10, 20, &binds, &push, gx_q3, 1, 1, last)?;
                 } else if ty == 8 {
                     // tile_q8 (plans/32): q8_0 coopmat — 소형(beta/alpha)도 포함
                     // (gemv3 t≥16 소형은 0.2GB/s급 병목 — ts 프로파일 2026-09-08)
