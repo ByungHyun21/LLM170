@@ -1250,7 +1250,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
-    let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv") || spv_name == "tile_ms4.spv";
+    let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv")
+        || spv_name == "tile_ms4.spv" || spv_name == "tile_ms256.spv";
     let ms256 = spv_name == "tile_ms256.spv";
     let slab: usize = if ms256 { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
