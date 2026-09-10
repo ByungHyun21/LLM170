@@ -496,6 +496,7 @@ name = "llm170-core"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "llm170-gguf",
  "llm170-profiler",
  "memmap2",
