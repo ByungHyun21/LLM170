@@ -1501,3 +1501,17 @@ The fix also uncovered an opt-out inversion: LLM170_VK_GY=0 selected the
 gy kernel in the arm chain while the dispatcher's use_gy was false, so the
 gy kernel ran with the tb-loop grid and produced garbage - it had masked
 the ms128 path in every earlier A/B.
+
+## Tile width ceiling (plans/43)
+
+BN=256 (four subgroups, tbase = sg*64, same 16 accumulators per subgroup)
+needs 25KB LDS: occupancy drops to 2 WG/CU, the drain grows to sixteen
+16-token slab rounds, and it measured 20 GB/s against ms128's 48.5 - the
+extra width loses more in occupancy than it gains in weight traffic. The
+practical ceiling on this machine is BN=128 with the 18-vec2 LDS stride
+(4 WG/CU for the 128-wide tiles, 5 for the 64-wide ones).
+
+Chunk scaling of the current build (same weights, one pass per prompt):
+pp128 288, pp256 318, pp384 297, pp512 302 t/s - the pass overhead is
+already amortised at 256 tokens, and per-token cost is set by the slab
+count (t/128 reads of every weight tensor), not by the pass length.
