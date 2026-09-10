@@ -22,7 +22,7 @@ layout(binding = 5) readonly buffer W5 { uint w5c[]; };
 layout(binding = 6) readonly buffer W6 { uint w6c[]; };
 layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
-layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 9) writeonly buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
     uint n_in; uint n_out; uint xq_w; uint t; uint row_off;
 } pc;
@@ -158,8 +158,9 @@ void main() {
                 bool full_cols = (q + 1) * 16 <= nt;
                 bool full_rows = row0 + wm * 16 + 16 <= int(pc.n_out);
                 if (full_cols && full_rows) {
-                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf = acc[wm][wn];
-                    coopMatStore(hf, outv, uint(q * 16) * pc.n_out + uint(row0 + wm * 16), pc.n_out, gl_CooperativeMatrixLayoutColumnMajor);
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf32 =
+                        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[wm][wn]);
+                    coopMatStore(hf32, outv, uint(q * 16) * pc.n_out + uint(row0 + wm * 16), pc.n_out, gl_CooperativeMatrixLayoutColumnMajor);
                 }
             }
         }
