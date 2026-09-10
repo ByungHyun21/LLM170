@@ -1250,7 +1250,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv") || spv_name == "tile_ms4.spv";
-    let pb: u32 = if is_msfam { 20 } else if is_128 { 16 } else { 24 };
+    let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
+        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+    let pb: u32 = if is_msfam { 20 } else if ms128fam_any { 24 } else if is_128 { 16 } else { 24 };
     let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
     let _ = (dsl, pool);
@@ -1319,7 +1321,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
             }
         } else {
             let push = if ms128fam {
-                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32])  // row_off
+                // ms128: [n_in,n_out,xq_w,t,row_off,tok_base] (pb=24)
+                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, 0u32])
             } else {
                 push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32])
             };
