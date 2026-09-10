@@ -1263,3 +1263,29 @@ spec-equality class).
 gdn_ar8 (same recipe, 8 columns): 0.176 ms/layer — the ILP gain
 saturates (subgroup shuffle throughput is now the bound). pp64
 192-199 t/s. Bit-identical outputs; LLM170_VK_AR4=8|4|0 selects.
+
+## Tile-kernel exploration closeout (2026-09-10, plans/40 final)
+
+The cm1 tile ceiling (~65-67 GB/s solo) resisted every kernel-internal
+lever: uvec4 staging regresses on RADV (dynamic select chains), a
+double-buffered pipeline can't overlap without async copies (cm1 has
+none — coopMatLoadTensorNV is cm2), and BK=64 (llama's own choice,
+halving k-loop barriers) is neutral — barrier count is not the solo
+binding constraint. Only [[unroll]] staging helped (+4%, shipped).
+
+tile_ms128's engine regression was root-caused to in-order-queue
+scheduling: fat (1.3-2.5ms) kernels stretch waits for the serial
+small-kernel chain (rope/flash/gemv) between them; GPU busy fraction
+is ~equal (~70%) for both variants across whole-run windows. A
+barrier-free direct drain (ms128v2) hit an RADV coopMatStore
+ColumnMajor pathology (workgroups 48-95 of 6144-row tensors drop
+stores entirely; 10240-row tensors unaffected) — sealed. The
+ms128-family harness now pushes the row_off fifth constant (undefined
+memory before, since the split experiment).
+
+The structural fix (layer-crossing dependency graph so layer L+1 tiles
+overlap layer L attention/GDN) is specified in plans/40 for the next
+arc, alongside the WY chunked gdn_ar formulation.
+
+Defaults stand: pp64 195-199 (0.80x), pp512 174-185 (0.51x), tg8
+9.8-10.2 (0.82x), verify 23 PASS / 2 FAIL.
