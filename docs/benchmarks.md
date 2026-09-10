@@ -1318,3 +1318,20 @@ were token-correct from the start. After the fix, all-type gy is
 token-identical but perf-neutral (pp512 183.5, pp64 198.4 vs 183.7/196.9):
 per-tensor slab pairs are already adjacent dispatches, so L2 catches the
 re-read for non-q5 types. Kept opt-in (zero-risk default).
+
+## Single-pass prefill (plans/41, 2026-09-10)
+
+Root cause of the prefill weight re-read: `prefill_rows` capped prefill chunks
+at 64 tokens unless the 128-row legacy tile family was active, so a 512-token
+prompt streamed all 15.79GB of layer weights eight times. The ms tile family
+handles t=512 exactly (token stream byte-identical), so T_MAX was raised to
+512 and the chunk gate now follows the ms family.
+
+Results (Qwen3.8-27B Q4_K_XL, Vulkan/RADV, Strix Halo): pp512 183 -> 219 t/s
+(+20%), pp64 195, tg4 10.0. All-type grid-y slab merge (LLM170_VK_GY2=1) was
+neutral-to-negative at both chunk sizes and stays opt-in; q5 gy remains the
+default.
+
+Measurement note: the per-dispatch timestamp sum is NOT a valid busy-time
+metric when the engine overlaps independent dispatches — at t=512 it reports
+6x the wall clock. Use wall-clock A/B for anything scheduling-related.
