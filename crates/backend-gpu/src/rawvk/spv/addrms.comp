@@ -4,9 +4,9 @@
 // addrms (plans/36 G2) — 잔차 덧셈 + rms_norm 융합 (llama multi_add_rms 대응).
 // y[i] += x[i]·1.0 과 rms(y)를 한 패스: axpy가 쓰던 값과 동일 비트를 계산해
 // 세그먼트 축소하므로 수치는 axpy+rms 2커널 경로와 완전히 동일.
-// 축소 구조는 rms.comp와 동일 (32세그먼트 f32 연속 누산 + f64 순차 결합 —
+// 축소 구조: 256세그먼트 f32 연속 누산 + f64 순차 결합 (plans/40 256스레드 —
 // CPU ops::sq_sum 미러). 런치 절반이 목적 (GPU 시간 아님).
-layout(local_size_x = 32) in;
+layout(local_size_x = 256) in;
 layout(binding = 0) buffer Ybuf { float y[]; };   // 잔류 스트림 (갱신)
 layout(binding = 1) readonly buffer Xbuf { float x[]; }; // 증분 (gout/fdown)
 layout(binding = 2) readonly buffer Wbuf { float wv[]; };
@@ -15,7 +15,7 @@ layout(push_constant) uniform PC {
     uint n; uint t; float eps;
 } pc;
 
-shared double seg[32];
+shared double seg[256];
 shared float invs;
 
 void main() {
@@ -23,7 +23,7 @@ void main() {
     uint u = gl_LocalInvocationID.x;
     uint n = pc.n;
     if (row >= pc.t) return;
-    int chunk = int((n + 31u) >> 5u);
+    int chunk = int((n + 255u) >> 8u);   // plans/40: 256스레드 (구 32 — t WGs뿐이라 과소병렬)
     int lo = int(u) * chunk;
     int xb = int(row * n);
     float acc = 0.0;
@@ -40,7 +40,7 @@ void main() {
     barrier();
     if (u == 0u) {
         double sum = 0.0lf;
-        for (int u2 = 0; u2 < 32; u2++) {
+        for (int u2 = 0; u2 < 256; u2++) {
             if (uint(u2 * chunk) < n) sum += seg[u2];
         }
         float scale32 = float(sqrt(sum / double(n) + double(pc.eps)));
