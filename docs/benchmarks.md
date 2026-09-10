@@ -1401,3 +1401,15 @@ The single-sequence CPU spec loop is structurally unable to beat plain
 decode (each candidate token costs a full target decode), so the viable
 design is the batched verify path; until that is rebuilt, MTP is not a
 throughput lever.
+
+## Prefill plateau confirmation (plans/41 close-out)
+
+Interleaved A/B on the corrected engine: the q5 grid-y dispatch (default)
+measures 215.7/215.9 t/s against 216.2/217.2 with GY=0 (LLM170_VK_GY=0) —
+statistically identical, so the token-slab dispatch no longer matters at
+512-token passes (its 2026-09 win was measured at 64-128-token passes).
+Chunk sweeps 384/512/768 land inside the same 205-219 band, i.e. run-to-run
+spread is about +-5% and dominates these deltas. Prefill is at a plateau
+where every weight byte is re-read once per 64-token slab; halving that
+needs a >64-wide accumulator tile whose per-byte rate holds, which ms128
+(BN=128) did not deliver (neutral wall, lower kernel rate).
