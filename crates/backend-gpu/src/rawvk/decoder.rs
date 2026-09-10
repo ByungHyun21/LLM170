@@ -676,8 +676,11 @@ impl DecoderState {
         let (b_xs, b_xn, b_xq_n, b_xq_f, b_xq_g, b_gqkv, b_gconv, b_gq, b_gk, b_gv,
              b_gb, b_ga, b_gbg, b_gz, b_go, b_ggated, b_aq, b_ak, b_av, b_aout,
              b_gout, b_fgate, b_fup, b_fglu, b_fdown, b_out, b_am) = {
+            // plans/43: 활성 버퍼는 디바이스 힙(캐브아웃)에 — 종전 GTT(시스템 RAM)는
+            // 타일이 K블록마다 활성 타일을 읽을 때 대역 병목(가중의 수 배 트래픽).
+            // 캐브아웃도 HOST_VISIBLE|COHERENT라 CPU 업로드 경로는 그대로 동작.
             let mut a = |sz: usize| -> Result<VkBuf, String> {
-                ctx.alloc_host(sz.max(1) * 4).map_err(|e| e.to_string())
+                ctx.alloc(sz.max(1) * 4).map_err(|e| e.to_string())
             };
             (
                 a(T_MAX * n)?, a(T_MAX * n)?, a(T_MAX * xq_sn)?, a(T_MAX * xq_sf)?,
