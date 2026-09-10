@@ -1196,7 +1196,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         _ => return Err("tile 검증 불가 타입".into()),
     };
     let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall
-        || std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
+        || (std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
@@ -1271,7 +1271,13 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     };
     let t0 = Instant::now();
     if is_128 {
-        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32]);
+        let ms128fam = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
+            || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+        let push = if ms128fam {
+            push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32])  // row_off
+        } else {
+            push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32])
+        };
         ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
     } else {
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, cw_log2, cw_mask]);
@@ -1340,6 +1346,22 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     eprintln!("[bucket] 2%초과 행(64행 버킷): {:?}", bucket_bad);
     if std::env::var_os("LLM170_TILE_DUMP").is_some() {
         eprintln!("[dump] outs[0][0..4] = {:?}", &outs[0..4]);
+        if std::env::var_os("LLM170_TILE_DUMP").is_some() && t >= 1 {
+            let mut zr = None;
+            for (i, v) in outs[0..n_out].iter().enumerate() { if v.abs() < 1e-30 { zr = Some(i); break; } }
+            let mut last_nz = 0;
+            for (i, v) in outs[0..n_out].iter().enumerate() { if v.abs() > 1e-30 { last_nz = i; } }
+            eprintln!("[dump] tok0 첫0행={:?} 마지막비0행={last_nz}", zr);
+        }
+        if n_out >= 6144 {
+            eprintln!("[dump] tok0 rows 6078..6082 = {:?}", &outs[6078..6082]);
+            eprintln!("[dump] tok0 rows 6126..6130 = {:?}", &outs[6126..6130]);
+        }
+        if n_out > 6144 {
+            eprintln!("[dump] tok0 rows 6140..6144 = {:?}", &outs[6140..6144]);
+        } else {
+            eprintln!("[dump] tok0 rows {}..{} = {:?}", n_out-4, n_out, &outs[n_out-4..n_out]);
+        }
         eprintln!("[dump] xs[0][0..6] = {:?}", &xs[0][0..6]);
     }
     Ok(format!(
