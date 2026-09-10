@@ -1189,3 +1189,26 @@ Open levers: tile codegen gap to llama's own shader (64 vs 79 GB/s,
 same geometry — vectorized staging loads); pp512 N-amortization (weight
 re-read per 64-token slab; BN>=256 attempts regressed so far); decode
 timeline (132 ms wall vs llama 89 ms; gemv8 163 vs ~196 GB/s effective).
+
+## Vulkan decode-kernel llama ports (2026-09-10, plans/40 cont.)
+
+Decode GEMVs ported from llama mul_mat_vec_{q5_k,q4_k,q6_k} to the
+gemv8 family: 64-thread WGs (16-thread block groups), 2 rows per WG,
+vec4 SIMD-in-register unpack, u16 typed views on the single weight
+chunk, subgroupAdd reduce. q5 143->225, q4 152->272, q6 ~143->194 GB/s
+(all max|D|=0.0000). q6 uses llama's double-buffered shared scale
+cache; q4's y loads sit at {y1, y1+32, y1+128, y1+160} with
+per-component smin; q5's interleave is {0,1,16,17,32,33,48,49}.
+
+gemv8_q8 added for q8_0 (34B blocks) — moves alpha/beta/v stragglers
+off the legacy gemv path. mmv-check probe runs llama's prebuilt dmmv
+spvs in our harness for reference (beware: repeat-loop timing on
+<32MB tensors measures the L2, not DRAM).
+
+Benchmarks: tg8 7.36 -> 8.63 (+17%), tg32 7.59 -> 8.21. pp unchanged.
+verify: 22 PASS / 3 FAIL — identical set before/after the port.
+
+vs llama Vulkan: pp64 0.72x, pp512 0.46x, tg8 0.71x.
+
+Open: iq4_xs dmmv port (gemv8_xs ~125 GB/s remains); tile staging
+vectorization (64 -> 79 GB/s ceiling); pp512 N-amortization.
