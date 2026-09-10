@@ -41,12 +41,12 @@ void main() {
             const uint e = col & 255u;             // 블록 내 원소 (8의 배수)
             // q3_K 인터리브: 레인 8원소는 16그룹 내 (half/sh2/hm비트 상수).
             const uint l0 = e & 15u;
-            const uint half = (e >> 4) & 1u;
+            const uint half16 = (e >> 4) & 1u;
             const uint n2 = (e >> 7) & 1u;
             const uint sh2 = ((e >> 5) & 3u) * 2u;
             const uint hbit = 1u << ((e >> 5) & 3u);
             // q 8바이트 @ 32+32*n2+16*half+l0 — u32 2개 조립 (비정렬)
-            const uint qoff = bb + 32u + 32u * n2 + 16u * half + l0;
+            const uint qoff = bb + 32u + 32u * n2 + 16u * half16 + l0;
             uint qa = w0u[qoff >> 2];
             uint qb2 = w0u[(qoff >> 2) + 1u];
             uint qc2 = w0u[(qoff >> 2) + 2u];
@@ -54,7 +54,7 @@ void main() {
             uint qbytes0 = (qa >> qsh) | (qsh != 0u ? (qb2 << (32u - qsh)) : 0u);
             uint qbytes1 = (qb2 >> qsh) | (qsh != 0u ? (qc2 << (32u - qsh)) : 0u);
             // hm 8바이트 @ 16*half+l0
-            const uint hoff = bb + 16u * half + l0;
+            const uint hoff = bb + 16u * half16 + l0;
             uint ha = w0u[hoff >> 2];
             uint hb2 = w0u[(hoff >> 2) + 1u];
             uint hc2 = w0u[(hoff >> 2) + 2u];
@@ -75,7 +75,7 @@ void main() {
             uint ax3 = ((a1 >> 4) & km2) | (((aux2 >> 6) & km1) << 4);
             uint aa0 = (a0 & km2) | ((aux2 & km1) << 4);
             uint aa1 = (a1 & km2) | (((aux2 >> 2) & km1) << 4);
-            const uint is_ = 8u * n2 + 2u * ((e >> 5) & 3u) + half;
+            const uint is_ = 8u * n2 + 2u * ((e >> 5) & 3u) + half16;
             uint sw = (is_ < 4u) ? aa0 : ((is_ < 8u) ? aa1 : ((is_ < 12u) ? ax2 : ax3));
             int sc8 = int((sw >> ((is_ & 3u) * 8u)) & 0xFFu) << 24 >> 24;
             // d @108
