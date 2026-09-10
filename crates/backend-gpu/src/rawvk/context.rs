@@ -13,6 +13,9 @@ pub struct VkBuf {
     pub mem: vk::DeviceMemory,
 }
 
+/// ts 쿼리풀 용량 (plans/40: 전체-run 계측용 확대)
+const TS_CAP: u32 = 1 << 18;
+
 pub struct VkCtx {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -163,7 +166,7 @@ impl VkCtx {
             let ts = if std::env::var_os("LLM170_VK_TS").is_some() {
                 let qci = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(8192);
+                    .query_count(TS_CAP);
                 let pool = device
                     .create_query_pool(&qci, None)
                     .map_err(|e| format!("쿼리풀: {e:?}"))?;
@@ -826,7 +829,7 @@ impl VkCtx {
     fn ts_stamp(&self, cb: vk::CommandBuffer, stage: vk::PipelineStageFlags) {
         if let Some(ts) = &self.ts {
             let i = ts.n.get();
-            if i + 2 <= 8192 {
+            if i + 2 <= TS_CAP as usize {
                 unsafe {
                     self.device.cmd_write_timestamp(cb, stage, ts.pool, i as u32);
                 }
