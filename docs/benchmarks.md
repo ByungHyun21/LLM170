@@ -1242,3 +1242,20 @@ Benchmarks (defaults, no env): pp64 192.1-195.7 (was 179), pp512
 179.9 (was 168), tg8 9.46-10.19. vs llama Vulkan: pp64 0.79x, pp512
 0.50x, tg8 ~0.81x. verify: 22 PASS / 3 FAIL — identical set before
 and after all three numeric-order changes.
+
+## gdn_ar4 — ILP across state columns (2026-09-10, plans/40 cont.)
+
+The GDN autoregressive update ran one state column per work group: per
+token step the two subgroupAdd reductions serialize, and nothing else
+in the work group hides their latency. gdn_ar4 keeps four columns per
+work group — four INDEPENDENT recurrence chains interleave, halving
+exposed reduce latency, with 4x fewer work groups and k/q loads
+amortized 4x. Identical per-column scalar arithmetic (bit-equal).
+Prefill gdn_ar 0.383 -> 0.189 ms per layer (-51%); 48 layers save
+~9.3 ms per chunk. LLM170_VK_AR4=0 opts out.
+
+Benchmarks (defaults): pp64 195.8-196.7, pp512 182.7, tg8 9.6.
+vs llama Vulkan: pp64 0.80x, pp512 0.51x, tg8 0.79x.
+verify: 23 PASS / 2 FAIL — best recorded (spec_np4_seq1 now passes;
+remaining: spec_np4_seq2@21, spec_long_np4_seq3@10, both borderline
+spec-equality class).
