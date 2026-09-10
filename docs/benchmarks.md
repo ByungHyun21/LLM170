@@ -1142,3 +1142,50 @@ gemv8 is now a complete-quality path: exact kernels, faster engine
 (step -11.4%, tg32 6.70), invariant-safe. Still opt-in
 (LLM170_G8=1) pending the long-form gate and np4 tie checks on the
 unified family.
+
+## Vulkan ms-geometry tile family + q3_K decode fixes (2026-09-10, plans/40)
+
+Reference re-measured on this machine (llama-bench d222767c, Vulkan):
+pp512 356.66 / pp64 244.08 / tg8 12.12.
+
+Findings: the previous tile family was pinned at ~39 GB/s A-stream not by
+coopmat structure but by two codegen hazards — an 8-way if-chain weight
+indirection (WG()) inside the staging loop and per-MMA uniform guards.
+llama's own mul_mm shader run in our harness on the same geometry reaches
+67-79 GB/s; removing the indirection (single-buffer direct index; every
+tensor fits one chunk since chunk size is per-tensor next-pow2) and the
+guards (zero-padded B, drain clips) recovers most of it: 39 -> 64 GB/s
+at the llama m-warptile geometry (BM64/BN64/BLOCK128, 2 wave64 warps).
+
+Rolled the ms skeleton out to all quant types (q4k/q6k/q3k/q8/xs/nl via
+shared ld16 unaligned-merge), 64-row workgroups, guard-free MMA.
+
+Accuracy: while bisecting the rollout, the harness uncovered THREE latent
+q3_K tile decode defects that predate this round (scale tmp assembled
+from 3 bytes instead of 4 — byte 107 missing; block-half index taken
+from the global 128-element half instead of the within-block half;
+shift/hbit derived from (sb>>1)&3 instead of sb&3). Fixed against the
+ggml reference; verified elementwise via a dump probe (0/5120) and
+tile_check (maxrel 0.0033). The engine q3 path is permanently moved to
+the fixed kernel. xs/nl additionally needed the shared ktab LUT bound
+(omitted in the new dispatch produced garbage tokens).
+
+verify (judge, LLM170_TILE_MSALL=1): 22 PASS / 3 FAIL — prior accepted
+state was 4-8 FAILs; single_ko and np4_seq1 pass for the first time.
+Remaining 3 are spec-equality borderline (first mismatch @gen 10-21).
+
+Memory: raw_init cloned the whole model to_vec() (17.5 GB anonymous —
+the two-process host-RAM OOM that repeatedly killed sessions). Weights
+now stay mmap borrows through upload; after init the file pages are
+madvise(DONTNEED)-returned (page-aligned ranges; tensor offsets are only
+32B aligned). Steady state: anon 0.7 GB, 14.65 GB returned. Two
+concurrent full-model processes complete — previously fatal.
+
+Benchmarks (MSALL, q35work): pp64 168.8-180.2 (was 140), pp512 162.6-167.6
+(was 125), tg 7.36-7.59 (decode path untouched). vs llama Vulkan: pp64
+0.69-0.74x, pp512 0.46x, tg 0.61-0.63x.
+
+Open levers: tile codegen gap to llama's own shader (64 vs 79 GB/s,
+same geometry — vectorized staging loads); pp512 N-amortization (weight
+re-read per 64-token slab; BN>=256 attempts regressed so far); decode
+timeline (132 ms wall vs llama 89 ms; gemv8 163 vs ~196 GB/s effective).
