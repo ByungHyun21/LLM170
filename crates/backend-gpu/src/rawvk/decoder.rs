@@ -1244,7 +1244,7 @@ impl DecoderState {
                 if use_gy {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용
                     let gy = (t as u32).div_ceil(64);
-                    if gy_nkb == 11 { binds.push(self.ktab.buf); }
+                    // ktab은 위 ms_spv 블록이 이미 push함 (gy_nkb == nkb) — 중복 push 금지
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32]);
                     return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 16, &binds, &push,
                         (no as u32 + 63) / 64, gy, 1, bar);
