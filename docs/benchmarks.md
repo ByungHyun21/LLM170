@@ -1576,3 +1576,6 @@ Effective rates on this machine: our engine ~8.2 TMAC/s of tile work
 tile-rate difference is the bulk of the remaining prefill gap, and no
 tile variant tried (BN 64/128/256, four subgroup layouts, BK 16/32, stride
 17/18/19/20, packed or f16 weights) moved it.
+* BK=64 (half the K-loop barriers, 256 threads with split staging) is also
+  neutral on the DRAM case (23.6 vs 23.8 GB/s) and 27% worse when the
+  tensor is L2-resident, closing the barrier-count axis as well.
