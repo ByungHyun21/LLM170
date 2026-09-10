@@ -1259,3 +1259,7 @@ vs llama Vulkan: pp64 0.80x, pp512 0.51x, tg8 0.79x.
 verify: 23 PASS / 2 FAIL — best recorded (spec_np4_seq1 now passes;
 remaining: spec_np4_seq2@21, spec_long_np4_seq3@10, both borderline
 spec-equality class).
+
+gdn_ar8 (same recipe, 8 columns): 0.176 ms/layer — the ILP gain
+saturates (subgroup shuffle throughput is now the bound). pp64
+192-199 t/s. Bit-identical outputs; LLM170_VK_AR4=8|4|0 selects.
