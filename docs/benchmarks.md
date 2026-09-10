@@ -1608,3 +1608,29 @@ The fix direction is fewer, wider loads per thread (16B-weight loads with
 LDS redistribution of the decode), not more parallelism, and it explains
 why the b32 experiment (decode ALU traded for 4x more small loads) was
 neutral as well.
+
+## Next lever: sub-block record repack (design note, not implemented)
+
+Every memory-side probe on the DRAM case came back neutral (load count,
+load width, pipelining, LDS traffic, occupancy, WG count, coarse packing),
+while a linear reader on the same buffer reaches 333 GB/s. The remaining
+explanation is sector granularity: the q5_K layout stores a row's 32-value
+sub-block pieces at fixed offsets inside a 176-byte block, so a warp's
+reads stride 176 bytes per row - one or two 32-byte sectors per 16 bytes
+used - and DRAM transaction rate, not bytes, is the ceiling.
+
+The fix is a load-time repack into per-sub-block records so that a warp
+reads contiguously:
+
+    record[32B] = ql(16B nibbles) | qh(8B) | d(2B f16) | sc(6b)+mb(6b) | pad
+    layout       [row-block 64][256-block][sub-block 8][row 64]
+
+A workgroup then covers 64 rows x 2 sub-blocks (BK=64) with 128 threads,
+one record per thread = two uvec4 loads per thread per iteration instead of
+~24 scalar loads, and each warp touches ~1KB contiguous. Packed size grows
+to 1 byte/value (+45% versus 0.6875), which the issue-rate gain should
+dominate. Verification path: repack the tensor in the harness, check the
+new decode with vk-tile-check (t=512, expect maxrel <= 0.006), then measure
+the 67MB tensor's rate - the decisive number is whether it lifts off the
+23.6 GB/s plateau. The exact qh lane mapping in the current decode
+(qhi/4 with the iqs>>4 byte select) must be transcribed carefully.
