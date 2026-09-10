@@ -25,6 +25,7 @@ const L2_SPV: &[u8] = include_bytes!("spv/l2_rows2.spv");
 const BETA_G_SPV: &[u8] = include_bytes!("spv/gdn_beta_g.spv");
 const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
 const GDN_AR4_SPV: &[u8] = include_bytes!("spv/gdn_ar4.spv");
+const GDN_AR8_SPV: &[u8] = include_bytes!("spv/gdn_ar8.spv");
 const NORM_GATED_SPV: &[u8] = include_bytes!("spv/norm_gated.spv");
 const QK_ROPE_SPV: &[u8] = include_bytes!("spv/qk_rope.spv");
 const QK_ROPE2_SPV: &[u8] = include_bytes!("spv/qk_rope2.spv");
@@ -1824,11 +1825,11 @@ impl DecoderState {
                     push.extend_from_slice(&scale.to_le_bytes());
                     push.extend_from_slice(&(t as u32).to_le_bytes());
                     // plans/40: ar4 — 열 4개 ILP. 옵트아웃 LLM170_VK_AR4=0.
-                    let ar4 = std::env::var("LLM170_VK_AR4").map(|v| v != "0").unwrap_or(true);
-                    let (arnm, arspv, argy) = if ar4 {
-                        ("gdn_ar4", GDN_AR4_SPV, d_state as u32 / 4)
-                    } else {
-                        ("gdn_ar", GDN_AR_SPV, d_state as u32)
+                    let arsel = std::env::var("LLM170_VK_AR4").unwrap_or_else(|_| "8".into());
+                    let (arnm, arspv, argy) = match arsel.as_str() {
+                        "0" => ("gdn_ar", GDN_AR_SPV, d_state as u32),
+                        "4" => ("gdn_ar4", GDN_AR4_SPV, d_state as u32 / 4),
+                        _ => ("gdn_ar8", GDN_AR8_SPV, d_state as u32 / 8),
                     };
                     self.run_pipe(arnm, arspv, 6, 28,
                         &[self.st_gdn[recr_idx][seq].buf, self.b_gq.buf, self.b_gk.buf,
