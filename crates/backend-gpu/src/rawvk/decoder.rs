@@ -54,6 +54,12 @@ const TILE_MS2_SPV: &[u8] = include_bytes!("spv/tile_ms2.spv");
 const TILE_MS4_SPV: &[u8] = include_bytes!("spv/tile_ms4.spv");
 const TILE_MS4GY_SPV: &[u8] = include_bytes!("spv/tile_ms4gy.spv");
 const TILE_MS256_SPV: &[u8] = include_bytes!("spv/tile_ms256.spv");
+const TILE_XS128_SPV: &[u8] = include_bytes!("spv/tile_xs128.spv");
+const TILE_Q4K128_SPV: &[u8] = include_bytes!("spv/tile_q4k128.spv");
+const TILE_Q6K128_SPV: &[u8] = include_bytes!("spv/tile_q6k128.spv");
+const TILE_Q3K128_SPV: &[u8] = include_bytes!("spv/tile_q3k128.spv");
+const TILE_Q8128_SPV: &[u8] = include_bytes!("spv/tile_q8128.spv");
+const TILE_NL128_SPV: &[u8] = include_bytes!("spv/tile_nl128.spv");
 const TILE_Q4KMGY_SPV: &[u8] = include_bytes!("spv/tile_q4kmgy.spv");
 const TILE_Q6KMGY_SPV: &[u8] = include_bytes!("spv/tile_q6kmgy.spv");
 const TILE_Q3KMGY_SPV: &[u8] = include_bytes!("spv/tile_q3kmgy.spv");
@@ -1222,12 +1228,22 @@ impl DecoderState {
             // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
             let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
             let ms128ffn = (ms128mode == "ffn" || ms128mode == "split") && wkey.contains("ffn") || ms128mode == "split";
-            let gy_on2 = std::env::var("LLM170_VK_GY2").map(|v| v == "1").unwrap_or(false);  // plans/40: 옵트인 (기본 꺼짐 — 디버그 필요)
+            let gy_on2 = std::env::var("LLM170_VK_GY2").map(|v| v == "1").unwrap_or(false);  // plans/40: 옵트인 (기본 꺼짐)
+            // plans/43: gy 활성 판정을 arm 선택 전에 확정 (종전 조건 반전 버그:
+            // GY=0이어도 tile_ms4gy가 선택되고 tb 루프가 잘못된 그리드로 디스패치됨)
+            let gy_on = std::env::var("LLM170_VK_GY").map(|v| v != "0").unwrap_or(true);
+            // plans/43: 전 타입 BN=128 (가중 판독 절반) — 옵트인
+            // plans/43: 전 타입 BN=128 — t>=128에서만 (t<128은 128폭 낭비).
+            // 기본 활성, LLM170_TILE_BN128=0 킬스위치.
+            let bn128_on = t >= 128
+                && std::env::var("LLM170_TILE_BN128").map(|v| v != "0").unwrap_or(true);
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
                 13 if ms_on(13, false) => {
                     if t >= 128 && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false) {
                         Some(("tile_ms256", TILE_MS256_SPV, 10))
-                    } else if std::env::var("LLM170_VK_GY").map(|v| v == "0").unwrap_or(true) {
+                    } else if bn128_on {
+                        Some(("tile_ms128", TILE_MS128_SPV, 10))
+                    } else if gy_on {
                         Some(("tile_ms4gy", TILE_MS4GY_SPV, 10))
                     } else if ms128mode == "1" || ms128ffn {
                         Some(("tile_ms128", TILE_MS128_SPV, 10))
@@ -1235,6 +1251,12 @@ impl DecoderState {
                         Some(("tile_ms4", TILE_MS4_SPV, 10))
                     }
                 }
+                12 if ms_on(12, false) && bn128_on => Some(("tile_q4k128", TILE_Q4K128_SPV, 10)),
+                14 if ms_on(14, false) && bn128_on => Some(("tile_q6k128", TILE_Q6K128_SPV, 10)),
+                11 if ms_on(11, false) && bn128_on => Some(("tile_q3k128", TILE_Q3K128_SPV, 10)),
+                8 if ms_on(8, false) && bn128_on => Some(("tile_q8128", TILE_Q8128_SPV, 10)),
+                20 if ms_on(20, false) && bn128_on => Some(("tile_nl128", TILE_NL128_SPV, 11)),
+                _ if ms_on(0, true) && ty != 21 && bn128_on => Some(("tile_xs128", TILE_XS128_SPV, 11)),
                 12 if ms_on(12, false) && gy_on2 => Some(("tile_q4kmgy", TILE_Q4KMGY_SPV, 10)),
                 14 if ms_on(14, false) && gy_on2 => Some(("tile_q6kmgy", TILE_Q6KMGY_SPV, 10)),
                 11 if ms_on(11, false) && gy_on2 => Some(("tile_q3kmgy", TILE_Q3KMGY_SPV, 10)),
@@ -1253,10 +1275,9 @@ impl DecoderState {
                 if nkb == 11 {
                     binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
                 }
-                let gy_on = std::env::var("LLM170_VK_GY").map(|v| v != "0").unwrap_or(true);
                 let ms256_on = ty == 13 && t >= 128
                     && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false);
-                let step: usize = if (ms256_on || (ms128mode != "0" && (ms128mode == "1" || ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13) { 128 } else { 64 };
+                let step: usize = if bn128_on || ms256_on || ((ms128mode != "0" && (ms128mode == "1" || ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13) { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
                 // plans/40: ms128 반그리드 분할 — 팻커널 CU 독점 완화 (인터리브 회복).
                 // MS128=split: 절반씩 2회. GPU합 -120ms/청크는 유지하며 큐 혼합 허용.
@@ -1271,7 +1292,7 @@ impl DecoderState {
                     _ => ("tile_xsmgy", TILE_XSMGY_SPV, 11),
                 };
                 let ms256_on = ty == 13 && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false);
-                let use_gy = ((ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2)) && !ms256_on;
+                let use_gy = ((ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2)) && !ms256_on && !bn128_on;
                 if use_gy {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용.
                     // plans/42: GYGRP=n이면 n토큰 그룹으로 분할 디스패치 (예: 128 → gy=2,
@@ -1308,7 +1329,7 @@ impl DecoderState {
                     } else {
                         // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
                         // ms128 계열은 row_off까지 6필드 (pb=24)
-                        let ms128fam2 = ty == 13 && nm.starts_with("tile_ms128");
+                        let ms128fam2 = nm.ends_with("128");
                         let (push, pb) = if ms128fam2 {
                             (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32, tb as u32]), 24)
                         } else {
