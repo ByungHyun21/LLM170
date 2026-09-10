@@ -1669,3 +1669,17 @@ measures neutral on all three metrics (pp64 210-214, pp512 300-301,
 tg8 9.94): the gemv8 path pays for the same latency through t-fold weight
 re-reads. Both paths are latency-bound for these shapes; a real fix needs
 all ninety-six tiny tensors in one dispatch (multi-tensor batching).
+
+## Prefill non-tile budget (plans/45 close)
+
+A 512-token pass spends 94% of its GPU time in the tiles; the remaining
+6% (inflation-corrected) breaks down as qsa_flash ~38 ms (2.2%), addrms
+~33 ms (1.9%), and everything else (gdn_ar8, quant, silu, norm_gated,
+split3, gdn_conv, qk_rope2, l2) ~32 ms. No single item exceeds 2.2% of the
+pass, so this is not where the remaining ~15% gap lives - it is the tile
+rate itself (~8.2 TMAC/s against llama's ~9.6), which twenty-five
+structural variants failed to move.
+
+Session standing: pp512 183 -> ~303 t/s, pp64 ~195 -> ~211, tg8 ~9.8 ->
+~9.9, verify 25/0 maintained, and every adopted change as well as every
+rejected hypothesis is recorded here with its measurements.
