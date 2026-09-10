@@ -1221,3 +1221,24 @@ Benchmarks after the full decode arc: tg8/tg32 7.36 -> 9.33 t/s
 Open: tile staging vectorization (64 -> 79 GB/s ceiling); pp512
 N-amortization (gate+up merged dispatch); gemv8_q3 remains on the old
 kernel (3 tensors).
+
+## Non-GEMM prefill-kernel fixes (2026-09-10, plans/40 cont.)
+
+Three prefill glue kernels were sequential or thread-starved:
+
+- qk_rope ran ONE thread per work group with sequential f64 arithmetic
+  (0.72 ms/layer at t=64). Parallel RMS (64 threads, f64 partial sums
+  via shared memory) + rope pair per thread: 0.064 ms — 11x.
+- l2 normalized with 32 sequential subgroupBroadcast adds per group;
+  one subgroupAdd replaces the loop: 0.33 -> 0.005 ms — 66x.
+- addrms used 32 threads per row (only t work groups in flight);
+  widened to 256: 0.083 -> 0.045 ms.
+
+gdn_ar (20 ms/chunk) remains sequential-recurrence bound (two subgroup
+reductions per token step); the WY-representation chunked formulation
+is the identified next-arc algorithmic item.
+
+Benchmarks (defaults, no env): pp64 192.1-195.7 (was 179), pp512
+179.9 (was 168), tg8 9.46-10.19. vs llama Vulkan: pp64 0.79x, pp512
+0.50x, tg8 ~0.81x. verify: 22 PASS / 3 FAIL — identical set before
+and after all three numeric-order changes.
