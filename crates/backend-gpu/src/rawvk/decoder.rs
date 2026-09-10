@@ -52,6 +52,7 @@ const TILE128O_SPV: &[u8] = include_bytes!("spv/tile128o.spv");
 const TILE128W_SPV: &[u8] = include_bytes!("spv/tile128w.spv");
 const TILE_MS2_SPV: &[u8] = include_bytes!("spv/tile_ms2.spv");
 const TILE_MS4_SPV: &[u8] = include_bytes!("spv/tile_ms4.spv");
+const TILE_MS4GY_SPV: &[u8] = include_bytes!("spv/tile_ms4gy.spv");
 const TILE_Q4KMS_SPV: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 const TILE_Q6KMS_SPV: &[u8] = include_bytes!("spv/tile_q6kms.spv");
 const TILE_Q3KMS_SPV: &[u8] = include_bytes!("spv/tile_q3kms.spv");
@@ -1190,7 +1191,9 @@ impl DecoderState {
             let ms128ffn = (ms128mode == "ffn" || ms128mode == "split") && wkey.contains("ffn") || ms128mode == "split";
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
                 13 if ms_on(13, false) => {
-                    if ms128mode == "1" || ms128ffn {
+                    if std::env::var("LLM170_VK_GY").map(|v| v == "0").unwrap_or(true) {
+                        Some(("tile_ms4gy", TILE_MS4GY_SPV, 10))
+                    } else if ms128mode == "1" || ms128ffn {
                         Some(("tile_ms128", TILE_MS128_SPV, 10))
                     } else {
                         Some(("tile_ms4", TILE_MS4_SPV, 10))
@@ -1208,11 +1211,19 @@ impl DecoderState {
                 if nkb == 11 {
                     binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
                 }
+                let gy_on = std::env::var("LLM170_VK_GY").map(|v| v != "0").unwrap_or(true);
                 let step: usize = if (ms128mode != "0" && (ms128mode == "1" || ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13 { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
                 // plans/40: ms128 반그리드 분할 — 팻커널 CU 독점 완화 (인터리브 회복).
                 // MS128=split: 절반씩 2회. GPU합 -120ms/청크는 유지하며 큐 혼합 허용.
                 let split = ms128mode == "split" && ty == 13;
+                if gy_on && ty == 13 {
+                    // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용
+                    let gy = (t as u32).div_ceil(64);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32]);
+                    return self.run_pipe_b("tile_ms4gy", TILE_MS4GY_SPV, 10, 16, &binds, &push,
+                        (no as u32 + 63) / 64, gy, 1, bar);
+                }
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
                     let last = tb + step >= t && bar;

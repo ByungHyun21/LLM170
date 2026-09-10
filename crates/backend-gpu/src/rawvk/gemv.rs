@@ -1155,8 +1155,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
-    if t < 1 || t > 128 {
-        return Err("tile 검증 t는 1..=128".into());
+    let ms4gy = std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K;
+    if t < 1 || (t > 128 && !ms4gy) {
+        return Err("tile 검증 t는 1..=128 (MS4GY는 512까지)".into());
     }
     let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
     let (spv_name, n_kb, extra) = match w.ty {
@@ -1176,6 +1177,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false) => ("tile_ms_f16b.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) => ("tile_ms2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) => ("tile_ms3.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) => ("tile_ms4gy.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) => ("tile_ms8.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) => ("tile_ms7.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false) => ("tile_ms6.spv", 10u32, 0u8),
@@ -1255,7 +1257,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw = cw.next_power_of_two();
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
-    let gx = if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+    let gx = if std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+        (n_out as u32 + 63) / 64
+    } else if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 63) / 64
     } else if (std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 63) / 64   // tile_ms6: WG당 64행
@@ -1273,7 +1277,23 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         (n_out as u32 + 127) / 128
     };
     let t0 = Instant::now();
-    if is_128 {
+    if ms4gy {
+        // gy 병렬: 단일 디스패치, gy=t/64, push t=64 (커널은 슬래브당 64토큰)
+        let gy = (t as u32).div_ceil(64);
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, 64u32]);
+        ctx.run(pl, ds, pipe, &push, gx, gy, 1)?;
+        let outs: Vec<f32> = unsafe {
+            let mut v = vec![0f32; t * n_out];
+            std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
+            v
+        };
+        let _ = &outs;
+        // (검증·벤치 공용 경로로 흐르게 outs 사용은 아래와 동일 — 여기선 run만 대체)
+        // 아래 기존 로직이 outs를 다시 읽으므로 여기서 반환하지 않고 흐름 유지:
+        // → 실제로는 아래 outs 재판독이 이 run 결과를 본다.
+        let _ = t;
+    }
+    if is_128 && !ms4gy {
         let ms128fam = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
             || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         let push = if ms128fam {
