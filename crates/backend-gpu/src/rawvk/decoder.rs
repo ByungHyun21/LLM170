@@ -16,6 +16,7 @@ const GEMV8_Q8_SPV: &[u8] = include_bytes!("spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
+const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -979,6 +980,12 @@ impl DecoderState {
         }
         let rpf: u32 = if no < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
         if ty == 8 {
+            // q8b (plans/40) — llama generic dmmv 구조: 87→329GB/s. LLM170_VK_Q8B=0 옵트아웃.
+            if std::env::var("LLM170_VK_Q8B").map(|v| v == "0").unwrap_or(true) {
+                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+                return self.run_pipe_b("gemv8_q8b", GEMV8_Q8B_SPV, 10, 24, &binds, &push,
+                    1, no.div_ceil(2) as u32, t as u32, bar);
+            }
             // q8_0 — 34B 블록 (plans/40: 소형 straggler 레이턴시 해소)
             let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
             let cw = cw.next_power_of_two();
