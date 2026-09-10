@@ -25,7 +25,7 @@ layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(binding = 10) readonly buffer Ktab { uint kt[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint t;
+    uint n_in; uint n_out; uint xq_w; uint t; uint tok_base;
 } pc;
 
 #define BK 32
@@ -88,7 +88,7 @@ void load_b(uint k0, int nt, uint tid, int n_in) {
         for (int v = 0; v < 8; v++) buf_b[ti2 * SHMEM_STRIDE + (k2 >> 1) + v] = f16vec2(float16_t(0.0));
         return;
     }
-    uint base = uint(ti2) * pc.xq_w;
+    uint base = uint(pc.tok_base + uint(ti2)) * pc.xq_w;
     int xw = int(k0) >> 2;
     float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (k0 >> 5))]);
     for (int e = 0; e < 16; e += 2) {
@@ -157,7 +157,7 @@ void main() {
         for (int i = int(tid); i < nrow * ncols; i += 128) {
             int r = i / ncols;
             int ti = i % ncols;
-            outv[uint(q * 16 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+            outv[uint(pc.tok_base + uint(q * 16 + ti)) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
         }
         barrier();
     }

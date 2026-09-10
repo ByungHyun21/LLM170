@@ -1156,14 +1156,21 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
     let ms4gy = std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K;
-    if t < 1 || (t > 128 && !ms4gy) {
-        return Err("tile 검증 t는 1..=128 (MS4GY는 512까지)".into());
-    }
     let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
+    let gy2 = std::env::var("LLM170_TILE_GY2").map(|v| v=="1").unwrap_or(false) && msall && w.ty != llm170_gguf::GgmlType::Q5K;
+    if t < 1 || (t > 128 && !ms4gy && !gy2 && !msall) {
+        return Err("tile 검증 t는 1..=128 (MS4GY/GY2/MSALL는 512까지)".into());
+    }
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q4K if msall && gy2 => ("tile_q4kmgy.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q6K if msall && gy2 => ("tile_q6kmgy.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q3K if msall && gy2 => ("tile_q3kmgy.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q8_0 if msall && gy2 => ("tile_q8mgy.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Iq4Xs if msall && gy2 => ("tile_xsmgy.spv", 11u32, 1u8),
+        llm170_gguf::GgmlType::Iq4Nl if msall && gy2 => ("tile_nlmgy.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if msall => ("tile_q6kms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q3K if msall => ("tile_q3kms.spv", 10u32, 0u8),
@@ -1241,7 +1248,10 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
-    let pb: u32 = if is_128 { 16 } else { 24 };
+    // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
+    let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv") || spv_name == "tile_ms4.spv";
+    let pb: u32 = if is_msfam { 20 } else if is_128 { 16 } else { 24 };
+    let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
     let _ = (dsl, pool);
     let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -1280,7 +1290,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     if ms4gy {
         // gy 병렬: 단일 디스패치, gy=t/64, push t=64 (커널은 슬래브당 64토큰)
         let gy = (t as u32).div_ceil(64);
-        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, 64u32]);
+        let push = mpush(64, 0);
         ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;   // plans/41 zs: 슬래브 x, 행 y
         let outs: Vec<f32> = unsafe {
             let mut v = vec![0f32; t * n_out];
@@ -1293,15 +1303,28 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         // → 실제로는 아래 outs 재판독이 이 run 결과를 본다.
         let _ = t;
     }
-    if is_128 && !ms4gy {
+    if gy2 {
+        let gy = (t as u32).div_ceil(64);
+        let push = mpush(64, 0);
+        ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
+    } else if is_128 && !ms4gy {
         let ms128fam = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
             || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
-        let push = if ms128fam {
-            push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32])  // row_off
+        if is_msfam {
+            // ms 패밀리: t>64는 64토큰 슬래브로 분할 (tok_base로 전 토큰 커버)
+            for tb in (0..t).step_by(64) {
+                let nt = (t - tb).min(64) as u32;
+                let push = mpush(nt, tb as u32);
+                ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            }
         } else {
-            push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32])
-        };
-        ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            let push = if ms128fam {
+                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32])  // row_off
+            } else {
+                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32])
+            };
+            ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+        }
     } else {
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, cw_log2, cw_mask]);
         ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
@@ -1318,7 +1341,22 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         let t1 = std::time::Instant::now();
         ctx.begin_batch()?;
         for _ in 0..n {
-            if is_128 {
+            if gy2 {
+                // gy 단일 디스패치 (엔진 gy와 동일): 슬래브 x, 행 y
+                let gy = (t as u32).div_ceil(64);
+                let push = mpush(64, 0);
+                ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
+            } else if is_msfam && t > 64 {
+                // 순차 슬래브 (엔진 비-gy 경로와 동일 형태): tok_base=tb로 전 토큰 커버
+                for tb in (0..t).step_by(64) {
+                    let nt = (t - tb).min(64) as u32;
+                    let push = mpush(nt, tb as u32);
+                    ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+                }
+            } else if is_msfam {
+                let push = mpush(t as u32, 0);
+                ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            } else if is_128 {
                 let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32]);
                 ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
             } else {
