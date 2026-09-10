@@ -1379,3 +1379,25 @@ lever.
 
 Current standing (Qwen3.8-27B Q4_K_XL, RADV/Vulkan, Strix Halo):
 pp64 197.1 t/s (0.81x llama), pp512 205-213 (0.58-0.60x), tg8 9.75 (0.80x).
+
+## Speculative decode (MTP) — inert on the Vulkan raw path
+
+`--spec k` is opt-in (bench/serve/infer only set `mtp_wanted` when a spec
+budget is requested), so there is no default-path regression. On the raw
+Vulkan path, however, the feature does not do useful work:
+
+* `mtp_draft_logits` is only populated by the non-raw `verify_batch` path;
+  the raw path stores `mtp_draft_tok` (the GPU MTP head's argmax) instead.
+  The CPU spec loop therefore drafts greedy(empty logits) = 0 every step and
+  every draft misses (bench: "fwd 8, gen 8, 1.00 tok/fwd", draft=0 in
+  LLM170_SPEC_DBG).
+* Enabling the MTP hook costs ~150 ms per prompt token in prefill (pp64
+  with --spec 2: 9.9 s vs 0.33 s without), because the MTP layer chain runs
+  per token.
+* The batched GPU verification path (`LLM170_SPEC_GPU=1`) is slower still:
+  1.50 t/s on tg8 (9 fwds for 8 tokens, 0.89 tok/fwd).
+
+The single-sequence CPU spec loop is structurally unable to beat plain
+decode (each candidate token costs a full target decode), so the viable
+design is the batched verify path; until that is rebuilt, MTP is not a
+throughput lever.
