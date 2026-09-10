@@ -1021,7 +1021,7 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     }
     let chunk_words = (ch / 4) as u32;
     let spv_path = match w.ty {
-        llm170_gguf::GgmlType::Q3K if std::env::var("LLM170_Q3B").map(|v| v == "1").unwrap_or(false) =>
+        llm170_gguf::GgmlType::Q3K if std::env::var("LLM170_Q3B").map(|v| v != "0").unwrap_or(true) =>
             "crates/backend-gpu/src/rawvk/spv/gemv8_q3b.spv",
         llm170_gguf::GgmlType::Q3K => "crates/backend-gpu/src/rawvk/spv/gemv8_q3.spv",
         llm170_gguf::GgmlType::Q4K if std::env::var("LLM170_Q4B").map(|v| v != "0").unwrap_or(true) =>
@@ -1057,7 +1057,7 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let q4b = w.ty == llm170_gguf::GgmlType::Q4K && std::env::var("LLM170_Q4B").map(|v| v != "0").unwrap_or(true);
     let q6b = w.ty == llm170_gguf::GgmlType::Q6K && std::env::var("LLM170_Q6B").map(|v| v != "0").unwrap_or(true);
     let q8b = w.ty == llm170_gguf::GgmlType::Q8_0 && std::env::var("LLM170_Q8B").map(|v| v != "0").unwrap_or(true);
-    let q3b = w.ty == llm170_gguf::GgmlType::Q3K && std::env::var("LLM170_Q3B").map(|v| v == "1").unwrap_or(false);
+    let q3b = w.ty == llm170_gguf::GgmlType::Q3K && std::env::var("LLM170_Q3B").map(|v| v != "0").unwrap_or(true);
     let xsb = w.ty == llm170_gguf::GgmlType::Iq4Xs && std::env::var("LLM170_XSB").map(|v| v != "0").unwrap_or(true);
     let rpf: u32 = if q5b || q4b || q6b || q8b || xsb || q3b { 2 } else if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
@@ -1415,6 +1415,44 @@ eprintln!("[wide] k352..383 gpu: {:?}", &outs[352..384]);
     Ok(format!("dbg-q3: 불일치 {bad}/{n_in} | {}", first.join(" · ")))
 }
 
+
+
+/// dbg-q3b (plans/40) — gemv8_q3b 디코드 원소 덤프 ↔ CPU 진실.
+pub fn q3b_dbg(path: &str, tname: &str) -> Result<String, String> {
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let n_in = w.n_in as usize;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let mut b = ctx.alloc(w.data.len())?;
+    unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), b.ptr, w.data.len()) };
+    ctx.unmap(&mut b)?;
+    let ob = ctx.alloc_host(n_in * 4)?;
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/dbg_q3b.spv").map_err(|e| e.to_string())?;
+    let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(&spv, 2, 4)?;
+    ctx.bind_bufs(ds, &[b.buf, ob.buf]);
+    let gx = (n_in as u32).div_ceil(512);
+    let push = push_u32s(&[n_in as u32]);
+    ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+    let outs: Vec<f32> = unsafe {
+        let mut v = vec![0f32; n_in];
+        std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), n_in);
+        v
+    };
+    let mut ref_row = vec![0f32; n_in];
+    llm170_core::quant::dequant_row(w.ty, w.data, 0, n_in as u64, &mut ref_row);
+    let mut bad = 0usize;
+    let mut first = vec![];
+    for k in 0..n_in {
+        let rel = (outs[k] - ref_row[k]).abs() / ref_row[k].abs().max(1e-3);
+        if rel > 1e-3 {
+            bad += 1;
+            if first.len() < 10 { first.push(format!("k={k} gpu={:.5} ref={:.5}", outs[k], ref_row[k])); }
+        }
+    }
+    Ok(format!("dbg-q3b: 불일치 {bad}/{n_in} | {}", first.join(" · ")))
+}
 
 /// mmv-check (plans/40) — llama mul_mat_vec_q5_k 직접 구동 격리 측정 (t≥1 dmmv).
 /// 스펙 {BLOCK 64, NUM_ROWS 2, COLS 1} + full_subgroups(강제 wave64) —

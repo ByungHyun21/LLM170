@@ -11,6 +11,7 @@ const GEMV8_Q5_SPV: &[u8] = include_bytes!("spv/gemv8_q5.spv");
 const GEMV8_Q4_SPV: &[u8] = include_bytes!("spv/gemv8_q4.spv");
 const GEMV8_XS_SPV: &[u8] = include_bytes!("spv/gemv8_xs.spv");
 const GEMV8_Q3_SPV: &[u8] = include_bytes!("spv/gemv8_q3.spv");
+const GEMV8_Q3B_SPV: &[u8] = include_bytes!("spv/gemv8_q3b.spv");
 const GEMV8_Q6_SPV: &[u8] = include_bytes!("spv/gemv8_q6.spv");
 const GEMV8_Q8_SPV: &[u8] = include_bytes!("spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
@@ -1010,6 +1011,12 @@ impl DecoderState {
             11 => ("gemv8_q3", GEMV8_Q3_SPV, 10),
             _ => ("", &[][..], 0),
         };
+        if ty == 11 && std::env::var("LLM170_VK_Q3B").map(|v| v == "0").unwrap_or(true) {
+            // q3b (plans/40) — llama dmmv 구조: 62→122GB/s, max|D|=0.
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+            return self.run_pipe_b("gemv8_q3b", GEMV8_Q3B_SPV, 10, 24, &binds, &push,
+                1, no.div_ceil(2) as u32, t as u32, bar);
+        }
         if ty == 23 || ty == 11 {
             let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
             let cw = cw.next_power_of_two();
