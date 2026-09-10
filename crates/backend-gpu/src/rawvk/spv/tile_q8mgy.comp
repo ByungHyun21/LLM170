@@ -99,8 +99,8 @@ void load_b(uint k0, int nt, uint tid, int n_in, uint tok0) {
 }
 
 void main() {
-    uint bid = gl_WorkGroupID.x;
-    uint tok0 = gl_WorkGroupID.y * BN;   // plans/40 gy
+    uint bid = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.x * BN;   // plans/41 zs: 슬래브 최속(x) — 행블록 페어 인접 스케줄(L2 병합)
     uint tid = gl_LocalInvocationID.x;   // 0..127
     uint sg = gl_SubgroupID;            // 0..1 (wave64)
     int n_in = int(pc.n_in);
