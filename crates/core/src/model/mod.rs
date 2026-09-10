@@ -144,6 +144,41 @@ impl Model {
         Ok(m)
     }
 
+    /// plans/40: 가중 텐서의 mmap 페이지를 커널에 반납 (MADV_DONTNEED).
+    /// GPU 상주 엔진 업로드 후 호출 — 파일 지원 클린 페이지라 즉시 회수되고,
+    /// 이후 재접근 시 디스크에서 다시 읽힘. keep에 포함된 이름·4MiB 미만은 유지.
+    pub fn discard_weight_pages(&self, keep: &[&str]) -> u64 {
+        let mut total = 0u64;
+        for t in &self.gguf.tensors {
+            let name = t.name.as_str();
+            let Some((start, end)) = t.file_range(self.gguf.data_offset) else { continue };
+            let len = (end - start) as usize;
+            if len < (4 << 20) || keep.contains(&name) {
+                continue;
+            }
+            // madvise는 페이지 정렬 필수 — 시작을 내림, 길이 보정
+            const PG: usize = 4096;
+            let s_pg = (start as usize) & !(PG - 1);
+            let e_pg = ((start as usize + len + PG - 1) & !(PG - 1)).min(self.mmap.len());
+            if e_pg <= s_pg {
+                continue;
+            }
+            let rc = unsafe {
+                libc::madvise(
+                    self.mmap.as_ptr().add(s_pg) as *mut libc::c_void,
+                    e_pg - s_pg,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if rc == 0 {
+                total += len as u64;
+            } else {
+                eprintln!("[madvise] {name}: rc={rc} err={}", std::io::Error::last_os_error());
+            }
+        }
+        total
+    }
+
     /// 무게 뷰.
     pub fn w(&self, name: &str) -> Option<Weight<'_>> {
         let t = self.gguf.find_tensor(name)?;

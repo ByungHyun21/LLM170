@@ -210,9 +210,11 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         is_recr: Vec<bool>,
     ) -> Result<(), String> {
         let ctx = VkCtx::new()?;
-        let wv: Vec<(String, Vec<u8>, u32, usize, usize)> = weights
+        // plans/40: 17.5GB to_vec() 클론 폐지 — mmap 뷰를 그대로 빌려 전달.
+        // (클론이 익명 RAM 17.5GB를 상주시켜 2프로세스 OOM의 직접 원인.)
+        let wv: Vec<(&str, &[u8], u32, usize, usize)> = weights
             .iter()
-            .map(|(k, w)| (k.clone(), w.data.to_vec(), w.ty as u32, w.n_in as usize, w.n_out as usize))
+            .map(|(k, w)| (k.as_str(), w.data, w.ty as u32, w.n_in as usize, w.n_out as usize))
             .collect();
         let cv: Vec<(String, Vec<f32>)> = consts.to_vec();
         let ds = DecoderState::new(ctx, wv, cv, hp, is_recr, n_seqs, ctx_len)?;
@@ -432,9 +434,9 @@ const T_MAX: usize = 128;
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<'a>(
         mut ctx: VkCtx,
-        weights: Vec<(String, Vec<u8>, u32, usize, usize)>,
+        weights: Vec<(&'a str, &'a [u8], u32, usize, usize)>,
         consts: Vec<(String, Vec<f32>)>,
         hp: &llm170_core::model::hparams::Hparams,
         is_recr: Vec<bool>,
@@ -450,35 +452,18 @@ impl DecoderState {
         let kv_len = ctx_len * n_kv * hd;
         let gdn_len = hp.dt_rank * hp.d_state * hp.d_state;
         let conv_len = (conv_k - 1) * conv_ch;
-        // MTP 탑재·vocab — weights 이동 전 산출.
-        let mtp_on = weights.iter().any(|(k, ..)| k == "blk.64.nextn.eh_proj.weight");
-        let n_vocab = weights
-            .iter()
-            .find(|(k, ..)| k == "output.weight")
-            // plans/29: 튜플 (k, data, ty, n_in, n_out) — 5번째가 n_out.
-            // 종래 4번째(n_in)를 읽어 헤드가 어휘 5120행만 봄 (발산 근원).
-            .map(|(_, _, _, _, no)| *no)
-            .unwrap_or(n);
-        // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
-        let q5k_src: Vec<(String, Vec<u8>, usize, usize)> = weights
-            .iter()
-            .filter(|(_, _, ty, _, _)| *ty == 13)
-            .map(|(k, d, _, ni, no)| (k.clone(), d.clone(), *ni, *no))
-            .collect();
-
-        // plans/30: q3_K 가중을 q8_0로 초기화 시 재팩 — q3_K GEMV(37GB/s)를
-        // q8_0 경로(96-107GB/s)로 승격. 수치: 디양자화→재양자화 오차 ~1e-3 상대
-        // (llama MMA급 — 게이트는 argmax/근접티 기준). LLM170_VK_Q3Q8=0 옵트아웃.
-        // 실측 판정(2026-09-07): tg 5.28 vs 5.68 — 2.47배 바이트 증가가 대역 이득을
-        // 상쇄해 무이득 + VRAM +3.5GB. 옵트인으로 강등.
+        // plans/30 q3q8 옵트인: 소유 사본 재팩을 먼저 수행하고 모든 소비자는
+        // 최종 뷰(weights_final)를 본다 (기본 경로는 mmap 빌림 그대로 — 클론 0).
         let q3q8 = std::env::var("LLM170_VK_Q3Q8").map(|v| v == "1").unwrap_or(false);
-        let mut weights = weights;
-        if q3q8 {
-            for (_name, data, ty, ni, no) in weights.iter_mut() {
+        let mut weights_owned: Option<Vec<(String, Vec<u8>, u32, usize, usize)>> = if q3q8 {
+            Some(weights.iter().map(|(k, d, ty, ni, no)| (k.to_string(), d.to_vec(), *ty, *ni, *no)).collect())
+        } else { None };
+        if let Some(wv) = weights_owned.as_mut() {
+            for (_name, data, ty, _ni, _no) in wv.iter_mut() {
                 if *ty != 11 {
                     continue;
                 }
-                let (rows, k) = (*no, *ni);
+                let (rows, k) = (*_no, *_ni);
                 let mut out = Vec::with_capacity(rows * (k / 32) * 34);
                 let mut row = vec![0.0f32; k];
                 for r in 0..rows {
@@ -489,7 +474,6 @@ impl DecoderState {
                         let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
                         let d = amax / 127.0;
                         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                        // f16 d (RNE)
                         let h = f32_to_f16_bits(d);
                         out.extend_from_slice(&h.to_le_bytes());
                         for &v in blk {
@@ -501,6 +485,27 @@ impl DecoderState {
                 *ty = 8;
             }
         }
+        let weights_final: Vec<(&str, &[u8], u32, usize, usize)> = match &weights_owned {
+            Some(v) => v.iter().map(|(k, d, t, a, b)| (k.as_str(), d.as_slice(), *t, *a, *b)).collect(),
+            None => weights.clone(),
+        };
+        // MTP 탑재·vocab — weights 이동 전 산출.
+        let mtp_on = weights_final.iter().any(|(k, ..)| *k == "blk.64.nextn.eh_proj.weight");
+        let n_vocab = weights_final
+            .iter()
+            .find(|(k, ..)| *k == "output.weight")
+            // plans/29: 튜플 (k, data, ty, n_in, n_out) — 5번째가 n_out.
+            // 종래 4번째(n_in)를 읽어 헤드가 어휘 5120행만 봄 (발산 근원).
+            .map(|(_, _, _, _, no)| *no)
+            .unwrap_or(n);
+        // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
+        // plans/40: 빌림 유지 — 클론 제거 (구 d.clone()가 q5 전체 ~8GB 복제)
+        let q5k_src: Vec<(&str, &[u8], usize, usize)> = weights_final
+            .iter()
+            .filter(|(_, _, ty, _, _)| *ty == 13)
+            .map(|(k, d, _, ni, no)| (*k, *d, *ni, *no))
+            .collect();
+
         // f16 사전 디양자화 캐시 (plans/39) — 데이터 복제 없음(대여만):
         // 디양자화를 가중 업로드 루프 앞에서 수행 (RCA: .cloned() 전체복제가
         // 30Gi 호스트 RAM을 초과해 OOM·세션 사망의 원인이었음).
@@ -509,7 +514,7 @@ impl DecoderState {
         let mut f16w: HashMap<String, VkBuf> = HashMap::new();
         if f16w_on {
             let e0 = std::time::Instant::now();
-            let mut cand: Vec<&(String, Vec<u8>, u32, usize, usize)> = weights
+            let mut cand: Vec<&(&str, &[u8], u32, usize, usize)> = weights_final
                 .iter()
                 .filter(|(_, _, ty, _, _)| matches!(*ty, 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23))
                 .collect();
@@ -532,7 +537,7 @@ impl DecoderState {
                                     buf16[r * ni + k] = f32_to_f16_bits(v);
                                 }
                             }
-                            outs.lock().unwrap().push((name.clone(), buf16));
+                            outs.lock().unwrap().push((name.to_string(), buf16));
                         });
                     }
                 });
@@ -548,7 +553,7 @@ impl DecoderState {
             eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
         }
         let mut w = HashMap::new();
-        for (name, data, ty, ni, no) in weights {
+        for &(name, data, ty, ni, no) in &weights_final {
             let mut bufs = Vec::new();
             let mut off = 0usize;
             // gemv4 WG() 시프트 산술 — 청크 크기 2의 거듭제곱. 마지막 청크는 실제 크기만
@@ -563,7 +568,7 @@ impl DecoderState {
                 bufs.push(b);
                 off += sz;
             }
-            w.insert(name, (bufs, ty, ni, no));
+            w.insert(name.to_string(), (bufs, ty, ni, no));
         }
         // 상수 — GTT (읽기 전용). "one"은 axpy 계수 1.0.
         let mut consts_in = consts;
@@ -678,7 +683,7 @@ impl DecoderState {
         // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
         let mut i8w: HashMap<String, I8W> = HashMap::new();
         let mut wsr_map: HashMap<String, VkBuf> = HashMap::new();
-        for (name, data, ni, no) in q5k_src {
+        for &(name, data, ni, no) in &q5k_src {
             let n_sub = ni / 32;
             let nblk = ni / 256;
             let mut w8 = vec![0i8; no * ni];
@@ -779,7 +784,7 @@ impl DecoderState {
                 let mut b = ctx.alloc(no * 4)?;
                 unsafe { std::ptr::copy_nonoverlapping(wsr_v.as_ptr(), b.ptr as *mut f32, no) };
                 ctx.unmap(&mut b)?;
-                wsr_map.insert(name.clone(), b);
+                wsr_map.insert(name.to_string(), b);
             }
             let wbuf = {
                 let mut b = ctx.alloc(no * ni)?;
@@ -787,7 +792,7 @@ impl DecoderState {
                 ctx.unmap(&mut b)?;
                 b
             };
-            i8w.insert(name, I8W { w: wbuf, wsp: wspbuf, wsm: wsmbuf, n_out: no, n_in: ni });
+            i8w.insert(name.to_string(), I8W { w: wbuf, wsp: wspbuf, wsm: wsmbuf, n_out: no, n_in: ni });
         }
         let n_max = hp.n_ff.max(n);
         let n_sub_max = n_max / 32;
@@ -2162,5 +2167,15 @@ pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
     rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
         .map_err(|e| format!("raw_init(vk): {e}"))?;
     eng.raw_decode = Some(rd);
+    // plans/40: 가중은 이제 VRAM에만 상주 — mmap 클린 페이지를 커널에 반납해
+    // 호스트 RSS를 emb/소형 상수 수준으로. LLM170_VK_KEEPW=1이면 유지(CPU 디버그).
+    if std::env::var("LLM170_VK_KEEPW").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[vk] 가중 mmap 페이지 유지 (LLM170_VK_KEEPW=1)");
+    } else {
+        let t0 = std::time::Instant::now();
+        let freed = eng.model.discard_weight_pages(&["token_embd.weight", "output.weight", "output_norm.weight"]);
+        eprintln!("[vk] 반납 {:.2}GB", freed as f64 / (1 << 30) as f64);
+        eprintln!("[vk] 가중 mmap 페이지 반납 완료 ({:.1}s)", t0.elapsed().as_secs_f32());
+    }
     Ok(())
 }
