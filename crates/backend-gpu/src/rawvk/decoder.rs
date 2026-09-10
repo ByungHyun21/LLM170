@@ -1151,7 +1151,9 @@ impl DecoderState {
                 return Ok(());
             }
             // tile_msALL (plans/40): 전 타입 ms 골격 (iq3s 제외) — WG() 제거·가드 제거·64행 WG
-            let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v == "1").unwrap_or(false);
+            // plans/40: ms 패밀리 기본 경로 승격 — verify 22/3, pp64 140→177.
+            // 옵트아웃: LLM170_TILE_MSALL=0 (구 패밀리 복귀).
+            let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v != "0").unwrap_or(true);
             // 타입별 옵트인 (바이섹트): LLM170_TILE_MS_TYPES="q5,q8,xs,..." — MSALL 대체
             let ms_types: Option<Vec<u32>> = std::env::var("LLM170_TILE_MS_TYPES").ok().map(|s| {
                 s.split(',').filter_map(|t| match t.trim() {
