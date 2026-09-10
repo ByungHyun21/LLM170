@@ -1,0 +1,109 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_q3b (plans/40) — llama generic dmmv 구조 × q3_K 디코드.
+// 64스레드, 2행/WG, K_PER_ITER=8: 레인 col0=8*tid, 8원소 = q 2바이트 + hm 비트 8.
+// 블록 110B: [hm 32B][q 64B][sc 12B @96][d f16 @108]. 스케일 16원소 단위 —
+// col%16 ∈ {0,8}이라 경계 미횡단. sc는 6비트 보조전개 (ggml 산법).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+float yv(uint base, uint j) { return xa[base + j]; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint ybase = tok * pc.n_in;
+    const uint n_in = pc.n_in;
+    float acc0 = 0.0, acc1 = 0.0;
+    const uint KPIT = 64u * 8u;
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;
+            const uint blk = col >> 8;
+            const uint bb = blk * 110u;
+            const uint e = col & 255u;             // 블록 내 원소 (8의 배수)
+            // q3_K 인터리브: 레인 8원소는 16그룹 내 (half/sh2/hm비트 상수).
+            const uint l0 = e & 15u;
+            const uint half = (e >> 4) & 1u;
+            const uint n2 = (e >> 7) & 1u;
+            const uint sh2 = ((e >> 5) & 3u) * 2u;
+            const uint hbit = 1u << ((e >> 5) & 3u);
+            // q 8바이트 @ 32+32*n2+16*half+l0 — u32 2개 조립 (비정렬)
+            const uint qoff = bb + 32u + 32u * n2 + 16u * half + l0;
+            uint qa = w0u[qoff >> 2];
+            uint qb2 = w0u[(qoff >> 2) + 1u];
+            uint qc2 = w0u[(qoff >> 2) + 2u];
+            const uint qsh = (qoff & 3u) * 8u;
+            uint qbytes0 = (qa >> qsh) | (qsh != 0u ? (qb2 << (32u - qsh)) : 0u);
+            uint qbytes1 = (qb2 >> qsh) | (qsh != 0u ? (qc2 << (32u - qsh)) : 0u);
+            // hm 8바이트 @ 16*half+l0
+            const uint hoff = bb + 16u * half + l0;
+            uint ha = w0u[hoff >> 2];
+            uint hb2 = w0u[(hoff >> 2) + 1u];
+            uint hc2 = w0u[(hoff >> 2) + 2u];
+            const uint hsh = (hoff & 3u) * 8u;
+            uint hbytes0 = (ha >> hsh) | (hsh != 0u ? (hb2 << (32u - hsh)) : 0u);
+            uint hbytes1 = (hb2 >> hsh) | (hsh != 0u ? (hc2 << (32u - hsh)) : 0u);
+            // 스케일 (12B 보조전개)
+            const uint sbase = bb + 96u;
+            const uint sw0 = w0u[sbase >> 2];
+            const uint rr = sbase & 3u;
+            uint a0 = (sw0 >> (rr * 8u)) | (rr != 0u ? (w0u[(sbase >> 2) + 1u] << ((4u - rr) * 8u)) : 0u);
+            uint a1 = (rr == 0u) ? w0u[(sbase >> 2) + 1u]
+                : ((w0u[(sbase >> 2) + 1u] >> (rr * 8u)) | (w0u[(sbase >> 2) + 2u] << ((4u - rr) * 8u)));
+            uint aux2 = (rr == 0u) ? w0u[(sbase >> 2) + 2u]
+                : ((w0u[(sbase >> 2) + 2u] >> (rr * 8u)) | (w0u[(sbase >> 2) + 3u] << ((4u - rr) * 8u)));
+            const uint km1 = 0x03030303u, km2 = 0x0F0F0F0Fu;
+            uint ax2 = ((a0 >> 4) & km2) | (((aux2 >> 4) & km1) << 4);
+            uint ax3 = ((a1 >> 4) & km2) | (((aux2 >> 6) & km1) << 4);
+            uint aa0 = (a0 & km2) | ((aux2 & km1) << 4);
+            uint aa1 = (a1 & km2) | (((aux2 >> 2) & km1) << 4);
+            const uint is_ = 8u * n2 + 2u * ((e >> 5) & 3u) + half;
+            uint sw = (is_ < 4u) ? aa0 : ((is_ < 8u) ? aa1 : ((is_ < 12u) ? ax2 : ax3));
+            int sc8 = int((sw >> ((is_ & 3u) * 8u)) & 0xFFu) << 24 >> 24;
+            // d @108
+            const uint dbb = bb + 108u;
+            const uint dw = w0u[dbb >> 2];
+            const uint dsh = (dbb & 3u) * 8u;
+            uint db = (dw >> dsh) & 0xFFFFu;
+            if (dsh >= 24u) db = ((dw >> dsh) | (w0u[(dbb >> 2) + 1u] << 8u)) & 0xFFFFu;
+            const float d = unpackHalf2x16(db).x;
+            const float dl = d * float(sc8 - 32);
+            // 8원소: q 바이트 l0+j (qbytes[j>>2]), hm 바이트 동일 — 비트 hbit, 시프트 sh2
+            float s = 0.0;
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                const uint qbts = (j < 4u) ? qbytes0 : qbytes1;
+                const uint hbts = (j < 4u) ? hbytes0 : hbytes1;
+                const uint byte_v = (qbts >> ((j & 3u) * 8u)) & 0xFFu;
+                const uint hm_v = (hbts >> ((j & 3u) * 8u)) & 0xFFu;
+                const int v = int((byte_v >> sh2) & 3u) - (((hm_v & hbit) != 0u) ? 0 : 4);
+                s = fma(float(v), yv(ybase, col0 + j), s);
+            }
+            const float r = dl * s;
+            if (n == 0u) acc0 += r; else acc1 += r;
+        }
+    }
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
