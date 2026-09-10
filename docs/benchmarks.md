@@ -1555,3 +1555,24 @@ harness (nkb 10, pb 24, 128-token slabs, tok_base). Root cause not found;
 the experiment is reverted. Worth noting as a robustness gap: a dispatch
 that silently does nothing is indistinguishable from a fast kernel in the
 timing numbers.
+
+## Tile rate is MAC-throughput bound (plans/44 close)
+
+The last instruction-mix hypothesis is closed: tile_ms128b32 - which
+replaces the q8 activation unpack with a direct f32 read, verifies in the
+harness at maxrel 0.0005, and issues markedly fewer instructions per
+K-block - runs at exactly the same per-call time in the engine (0.967 vs
+0.958 ms over 191 calls, from the timestamp profiler). Combined with the
+earlier probes (occupancy, weight layout, activation loads, tensor size),
+the picture is:
+
+* tile time scales with the MAC count (t=64 vs t=128: 48.0 vs 23.5 GB/s
+  on identical weight bytes),
+* it is insensitive to occupancy (2 vs 5 WG/CU), weight packing, and the
+  decode instruction count.
+
+Effective rates on this machine: our engine ~8.2 TMAC/s of tile work
+(1690 ms per 512-token pass), llama.cpp ~9.6 TMAC/s (1436 ms) - the ~17%
+tile-rate difference is the bulk of the remaining prefill gap, and no
+tile variant tried (BN 64/128/256, four subgroup layouts, BK 16/32, stride
+17/18/19/20, packed or f16 weights) moved it.
