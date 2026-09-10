@@ -1158,6 +1158,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let ms4gy = std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K;
     let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
     let gy2 = std::env::var("LLM170_TILE_GY2").map(|v| v=="1").unwrap_or(false) && msall && w.ty != llm170_gguf::GgmlType::Q5K;
+    let bn128 = std::env::var("LLM170_TILE_BN128").map(|v| v=="1").unwrap_or(false) && msall && w.ty != llm170_gguf::GgmlType::Q5K;
     if t < 1 || (t > 128 && !ms4gy && !gy2 && !msall) {
         return Err("tile 검증 t는 1..=128 (MS4GY/GY2/MSALL는 512까지)".into());
     }
@@ -1172,6 +1173,12 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q8_0 if msall && gy2 => ("tile_q8mgy.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Iq4Xs if msall && gy2 => ("tile_xsmgy.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Iq4Nl if msall && gy2 => ("tile_nlmgy.spv", 11u32, 1u8),
+        llm170_gguf::GgmlType::Q4K if bn128 => ("tile_q4k128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q6K if bn128 => ("tile_q6k128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q3K if bn128 => ("tile_q3k128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q8_0 if bn128 => ("tile_q8128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Iq4Xs if bn128 => ("tile_xs128.spv", 11u32, 1u8),
+        llm170_gguf::GgmlType::Iq4Nl if bn128 => ("tile_nl128.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if msall => ("tile_q6kms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q3K if msall => ("tile_q3kms.spv", 10u32, 0u8),
@@ -1250,13 +1257,14 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
+    let bn128spv = spv_name.ends_with("128.spv");   // ms128 계열: 6필드 push·128토큰 슬래브
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv")
-        || spv_name == "tile_ms4.spv" || spv_name == "tile_ms256.spv";
+        || spv_name == "tile_ms4.spv" || spv_name == "tile_ms256.spv" || bn128spv;
     let ms256 = spv_name == "tile_ms256.spv";
-    let slab: usize = if ms256 { 128 } else { 64 };
+    let slab: usize = if ms256 || bn128spv { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
-    let pb: u32 = if is_msfam { 20 } else if ms128fam_any { 24 } else if is_128 { 16 } else { 24 };
+    let pb: u32 = if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
     let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
     let _ = (dsl, pool);
@@ -1320,7 +1328,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
             // ms 패밀리: t>슬래브는 분할 (tok_base로 전 토큰 커버; ms256 = 128토큰 슬래브)
             for tb in (0..t).step_by(slab) {
                 let nt = (t - tb).min(slab) as u32;
-                let push = mpush(nt, tb as u32);
+                let push = if bn128spv {
+                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, 0u32, tb as u32])
+                } else {
+                    mpush(nt, tb as u32)
+                };
                 ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
             }
         } else {
