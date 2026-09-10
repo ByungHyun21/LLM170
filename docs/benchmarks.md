@@ -1683,3 +1683,22 @@ structural variants failed to move.
 Session standing: pp512 183 -> ~303 t/s, pp64 ~195 -> ~211, tg8 ~9.8 ->
 ~9.9, verify 25/0 maintained, and every adopted change as well as every
 rejected hypothesis is recorded here with its measurements.
+
+## Remaining levers quantified (plans/45 final)
+
+* Prefill: tiles are 94% of a pass and the 25 structural variants moved
+  nothing; every non-tile item is under 2.2% of the pass. The ~15% gap is
+  the tile rate itself.
+* Decode: ~25% overhead spread over ~1050 dispatches (~30 us each, from the
+  GDN_SKIP measurement). Fusing a pair of projections (e.g. ssm_beta+alpha,
+  same shape, one launch) saves 48 dispatches per token = ~1.4% of tg and
+  0.08% of a prefill pass - not worth the multi-tensor kernel work.
+  Recovering the whole 25% would need whole-layer fusion.
+* Spec decode: cannot pay off while the "spec output == plain decode
+  output" contract requires per-token verification; the batched verify is
+  8x slower per token by construction.
+
+Session final standing: pp512 183 -> ~303 t/s (0.85x llama), pp64 ~195 ->
+~211 (0.86x), tg8 ~9.8 -> ~9.9 (0.82x), verify 25/0, tree clean, all 40+
+commits pushed, and every adopted change and rejected hypothesis recorded
+here with its measurements.
