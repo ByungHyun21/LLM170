@@ -1210,5 +1210,14 @@ verify: 22 PASS / 3 FAIL — identical set before/after the port.
 
 vs llama Vulkan: pp64 0.72x, pp512 0.46x, tg8 0.71x.
 
-Open: iq4_xs dmmv port (gemv8_xs ~125 GB/s remains); tile staging
-vectorization (64 -> 79 GB/s ceiling); pp512 N-amortization.
+Follow-up: gemv8_q8b (llama generic dmmv structure, 87 -> 329 GB/s)
+and gemv8_xsb (same structure with our verified iq4_xs decode,
+125 -> 182 GB/s), both max|D|=0.0000.
+
+Benchmarks after the full decode arc: tg8/tg32 7.36 -> 9.33 t/s
+(+27%; llama Vulkan 12.12 — 0.77x). pp unchanged. verify: 22 PASS /
+3 FAIL, identical set before/after all four ports.
+
+Open: tile staging vectorization (64 -> 79 GB/s ceiling); pp512
+N-amortization (gate+up merged dispatch); gemv8_q3 remains on the old
+kernel (3 tensors).
