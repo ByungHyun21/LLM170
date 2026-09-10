@@ -1180,7 +1180,7 @@ impl DecoderState {
             // plans/40: MS128=ffn — 병렬 attention 그룹 외 FFN만 BN=128 (가중 1회 판독).
             // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
             let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
-            let ms128ffn = ms128mode == "ffn" && wkey.contains("ffn");
+            let ms128ffn = (ms128mode == "ffn" || ms128mode == "split") && wkey.contains("ffn") || ms128mode == "split";
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
                 13 if ms_on(13, false) => {
                     if ms128mode == "1" || ms128ffn {
@@ -1201,13 +1201,31 @@ impl DecoderState {
                 if nkb == 11 {
                     binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
                 }
-                let step: usize = if (ms128mode == "1" || (ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13 { 128 } else { 64 };
+                let step: usize = if (ms128mode != "0" && (ms128mode == "1" || ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13 { 128 } else { 64 };
                 let gx_ms = (no as u32 + 63) / 64;
+                // plans/40: ms128 반그리드 분할 — 팻커널 CU 독점 완화 (인터리브 회복).
+                // MS128=split: 절반씩 2회. GPU합 -120ms/청크는 유지하며 큐 혼합 허용.
+                let split = ms128mode == "split" && ty == 13;
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
                     let last = tb + step >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, gx_ms, 1, 1, last)?;
+                    if split {
+                        let gxh = gx_ms.div_ceil(2);
+                        let mut ro = 0u32;
+                        let mut first = true;
+                        while ro < gx_ms * 64 {
+                            let g = (gx_ms - ro / 64).min(gxh);
+                            let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, ro]);
+                            let fin = last && ro + g * 64 >= gx_ms * 64;
+                            self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, g, 1, 1, fin)?;
+                            ro += g * 64;
+                            first = false;
+                            let _ = first;
+                        }
+                    } else {
+                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32]);
+                        self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, gx_ms, 1, 1, last)?;
+                    }
                 }
                 return Ok(());
             }
