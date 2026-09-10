@@ -33,6 +33,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
             llm170_backend_gpu::rawvk::gemv::gemv8_check(&path, &tn, t)
         }
+        "mmv-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let tn = args.get(1).cloned().unwrap_or_else(|| "blk.1.attn_qkv.weight".into());
+            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1usize);
+            llm170_backend_gpu::rawvk::gemv::mmv_check(&path, &tn, t)
+        }
         "dbg-q3" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_up.weight".into());

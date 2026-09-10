@@ -1022,6 +1022,8 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let spv_path = match w.ty {
         llm170_gguf::GgmlType::Q3K => "crates/backend-gpu/src/rawvk/spv/gemv8_q3.spv",
         llm170_gguf::GgmlType::Q4K => "crates/backend-gpu/src/rawvk/spv/gemv8_q4.spv",
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_Q5B").map(|v| v != "0").unwrap_or(true) =>
+            "crates/backend-gpu/src/rawvk/spv/gemv8_q5b.spv",
         llm170_gguf::GgmlType::Q5K => "crates/backend-gpu/src/rawvk/spv/gemv8_q5.spv",
         llm170_gguf::GgmlType::Q6K => "crates/backend-gpu/src/rawvk/spv/gemv8_q6.spv",
         llm170_gguf::GgmlType::Iq4Xs => "crates/backend-gpu/src/rawvk/spv/gemv8_xs.spv",
@@ -1039,7 +1041,8 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         binds.push(kb);
     }
     ctx.bind_bufs(ds, &binds);
-    let rpf: u32 = if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
+    let q5b = w.ty == llm170_gguf::GgmlType::Q5K && std::env::var("LLM170_Q5B").map(|v| v != "0").unwrap_or(true);
+    let rpf: u32 = if q5b { 2 } else if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
     let cw_mask = (1u32 << cw_log2) - 1u32;
     // cw 단위: q5/q6(u16 typed 뷰)만 u16 단위, 나머지 u32
@@ -1389,4 +1392,84 @@ eprintln!("[wide] k352..383 gpu: {:?}", &outs[352..384]);
         eprintln!("[hist] (j, hf) → 불일치 수: {:?}", hh);
     }
     Ok(format!("dbg-q3: 불일치 {bad}/{n_in} | {}", first.join(" · ")))
+}
+
+
+/// mmv-check (plans/40) — llama mul_mat_vec_q5_k 직접 구동 격리 측정 (t≥1 dmmv).
+/// 스펙 {BLOCK 64, NUM_ROWS 2, COLS 1} + full_subgroups(강제 wave64) —
+/// llama RADV 설정 직역. B=f32 [t][K], D=f32 [t][M].
+pub fn mmv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("텐서 없음")?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/mmv_llm.spv").map_err(|e| e.to_string())?;
+    let acc = VkAcc::new()?;
+    let mut ctxg = acc.ctx.lock();
+    let ab_vram = std::env::var("VKMMQ_VRAM").map(|v| v == "1").unwrap_or(true);
+    let ab = if ab_vram {
+        let mut b = ctxg.alloc(w.data.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), b.ptr, w.data.len()) };
+        ctxg.unmap(&mut b)?;
+        b
+    } else {
+        let mut b = ctxg.alloc_host(w.data.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr(), b.ptr, w.data.len()) };
+        ctxg.unmap(&mut b)?;
+        b
+    };
+    // y f32 [t][K]
+    let mut seed = 0x1234u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let mut yf: Vec<f32> = Vec::with_capacity(n_in * t);
+    let y0 = std::env::var("VKMMQ_Y0").map(|v| v == "1").unwrap_or(false);
+    for _ in 0..n_in * t { yf.push(if y0 { 0.0 } else { lcg() }); }
+    let mut bb = ctxg.alloc_host(n_in * t * 4)?;
+    unsafe { std::ptr::copy_nonoverlapping(yf.as_ptr() as *const u8, bb.ptr, n_in * t * 4) };
+    ctxg.unmap(&mut bb)?;
+    let db = ctxg.alloc_host(n_out * t * 4)?;
+    unsafe { std::ptr::write_bytes(db.ptr as *mut u8, 0, n_out * t * 4) };
+    // F0/F1 dummy
+    let mut fb = ctxg.alloc_host(64)?;
+    ctxg.unmap(&mut fb)?;
+    let spec = vec![64u32, 2, 1];
+    let (_dsl, pl, _dp, ds, pipe) = ctxg.pipeline_spec_fg(&spv, 5, 13 * 4, &spec, true)?;
+    ctxg.bind_bufs(ds, &[ab.buf, bb.buf, db.buf, fb.buf, fb.buf]);
+    let mut pc: Vec<u32> = vec![
+        n_in as u32, n_in as u32, n_in as u32, n_out as u32,   // ncols, stride_a, stride_b, stride_d
+        0, 0, 0,            // batch strides
+        0,                  // fusion_flags
+        0, t as u32, 1, 1, 1,  // base_wg_y, ne02, ne12, b2, b3
+    ];
+    let _ = &mut pc;
+    let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let gx = (n_out as u32).div_ceil(2);
+    ctxg.begin_batch()?;
+    ctxg.run(pl, ds, pipe, &pcb, gx, t as u32, 1)?;
+    ctxg.end_batch_wait()?;
+    let out: &[f32] = unsafe { std::slice::from_raw_parts(db.ptr as *const f32, n_out * t) };
+    eprintln!("mmv dbg: out[0..16]={:?} (y0={})", &out[0..16], y0);
+    // 근사 검증: 첫 토큰 첫 4행
+    let mut dq = vec![0f32; n_in];
+    let mut maxrel = 0f64;
+    for &(m, n) in &[(0usize, 0usize), (100, 0), (2000, 0), (6143, 0)] {
+        if m >= n_out || n >= t { continue; }
+        llm170_core::quant::dequant_row(w.ty, w.data, m as u64, n_in as u64, &mut dq);
+        let yrow = &yf[n * n_in..(n + 1) * n_in];
+        let acc: f64 = dq.iter().zip(yrow).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+        let got = out[n * n_out + m] as f64;
+        let rel = if acc.abs() > 1e-6 { ((got - acc) / acc).abs() } else { got.abs() };
+        maxrel = maxrel.max(rel);
+    }
+    let nrep: u32 = std::env::var("VKMMQ_N").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    ctxg.begin_batch()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..nrep { ctxg.run(pl, ds, pipe, &pcb, gx, t as u32, 1)?; }
+    ctxg.end_batch_wait()?;
+    let dt = t0.elapsed().as_secs_f64() / nrep as f64;
+    Ok(format!(
+        "mmv({tname}) t={t}: {dt:.4}ms · maxrel={maxrel:.4} · {:.1}GB/s",
+        w.data.len() as f64 / dt / 1e9
+    ))
 }
