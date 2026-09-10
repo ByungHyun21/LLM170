@@ -1172,6 +1172,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false) => ("tile_ms_f16b.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) => ("tile_ms2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) => ("tile_ms3.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) => ("tile_ms7.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false) => ("tile_ms6.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) => ("tile_ms4.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false) => ("tile_ms5.spv", 10u32, 0u8),
@@ -1248,7 +1249,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw = cw.next_power_of_two();
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
-    let gx = if std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
+    let gx = if (std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 63) / 64   // tile_ms6: WG당 64행
     } else if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32 + 63) / 64   // tile_ms128: WG당 64행 × 128토큰
