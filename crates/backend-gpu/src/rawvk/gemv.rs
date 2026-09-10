@@ -1160,6 +1160,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v=="1").unwrap_or(false);
     let (spv_name, n_kb, extra) = match w.ty {
+        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
@@ -1195,6 +1196,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         _ => return Err("tile 검증 불가 타입".into()),
     };
     let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall
+        || std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
