@@ -1465,3 +1465,17 @@ Spec decode therefore cannot beat plain decoding without either a true
 batched verify forward (different numeric class than the per-token
 contract) or accepting that class change; both are engine-scale changes
 rather than a tuning fix. Feature stays opt-in and inert until then.
+
+## Prefill wall-clock accounting (plans/43 close)
+
+Instrumenting the record/drain split inside a 512-token pass settles where
+the wall clock goes: the CPU command-recording span is spent almost entirely
+inside the mid-pass descriptor-pool drain (record span 998/2078 ms against
+drain 1047/2086 ms), i.e. the CPU records ~3.5k dispatches fast and then
+waits for the GPU. The pass therefore runs at the GPU's slab-traffic limit:
+15.79 GB of layer weights read once per 64-token slab = 126 GB per
+512-token pass at ~53 GB/s effective, which is 84% of the kernels' solo
+streaming rate (61-66 GB/s). There is no measurable CPU or idle slack left
+to reclaim; only a wider accumulator tile (fewer weight reads) can move it,
+and BN=128/256 tiles lose the same margin in occupancy (ms256 +1.6%,
+ms512 collapse).

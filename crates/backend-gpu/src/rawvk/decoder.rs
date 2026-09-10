@@ -147,6 +147,7 @@ pub struct DecoderState {
     #[allow(clippy::type_complexity)]
     ktimes: std::collections::HashMap<String, (f64, u64)>,
     ktime: bool,
+    dbg_drain_ms: f64,
     kkey: std::cell::RefCell<Option<String>>,
     // 상태 [full|recr][seq]
     kv_k: Vec<Vec<VkBuf>>,
@@ -837,6 +838,7 @@ impl DecoderState {
             max_ssbo: max_ssbo0,
             ktimes: std::collections::HashMap::new(),
             ktime: std::env::var_os("LLM170_VK_KTIME").is_some(),
+            dbg_drain_ms: 0.0,
             kkey: std::cell::RefCell::new(None),
             w,
             consts: cmap,
@@ -948,7 +950,13 @@ impl DecoderState {
             self.split_ctr += 1;
             if self.split_ctr >= 2048 {
                 self.split_ctr = 0;
-                self.ctx.end_batch_wait()?;
+                if std::env::var_os("LLM170_DBG_REC").is_some() {
+                    let td = std::time::Instant::now();
+                    self.ctx.end_batch_wait()?;
+                    self.dbg_drain_ms += td.elapsed().as_secs_f64() * 1e3;
+                } else {
+                    self.ctx.end_batch_wait()?;
+                }
                 self.ctx.begin_batch()?;
             }
         }
@@ -1820,6 +1828,7 @@ impl DecoderState {
             eprintln!("#  SB upload t={t} xs0={s0:.4}");
         }
         if !noba { self.ctx.begin_batch()?; };
+        let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         for il in 0..self.n_layer {
@@ -2046,6 +2055,11 @@ impl DecoderState {
         /// 동일 배치로 단일 제출·대기 (G3). quant는 gemv_w 폴백 시 내부 수행.
         if all_logits {
             self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg_t.buf, t, n)?;
+        }
+        if std::env::var_os("LLM170_DBG_REC").is_some() {
+            let d = self.dbg_drain_ms;
+            self.dbg_drain_ms = 0.0;
+            eprintln!("#  rec t={t} span={:.1}ms drain={:.1}ms", tw_rec.elapsed().as_secs_f64() * 1e3, d);
         }
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         self.ctx.ts_report();
