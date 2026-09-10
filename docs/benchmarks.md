@@ -1335,3 +1335,17 @@ default.
 Measurement note: the per-dispatch timestamp sum is NOT a valid busy-time
 metric when the engine overlaps independent dispatches — at t=512 it reports
 6x the wall clock. Use wall-clock A/B for anything scheduling-related.
+
+## Prefill chunk correctness fix (plans/41)
+
+The ms-family tile loop rebound the same xq/out buffers for every 64-token
+slab, so any prefill batch above 64 tokens silently computed only its first
+64 rows (a 200-token prompt at chunk 128/512 diverged from the per-token
+reference). Kernels now take a `tok_base` push field and each slab writes a
+disjoint token range; harness maxrel is 0.003-0.006 at t=256/512 and engine
+token streams match `LLM170_VKD_BATCH=0` at every chunk size.
+
+Corrected prefill (pp512, same machine): 113 t/s at 64-token chunks,
+154 at 128, 205-212 at 512 — i.e. within one pass the weight traffic is
+dominated by slab re-reads, and pass count is the cost driver. All earlier
+sub-64-chunk-out-of-spec measurements are superseded by these.

@@ -1284,9 +1284,6 @@ impl DecoderState {
                             let _ = first;
                         }
                     } else {
-                        if std::env::var_os("LLM170_DBG_TILE").is_some() {
-                            eprintln!("[dbg_slab] tb={tb} nt={nt} gx={gx_ms} nm={nm}");
-                        }
                         // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
                         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
                         self.run_pipe_b(nm, spv, nkb, 20, &binds, &push, gx_ms, 1, 1, last)?;
