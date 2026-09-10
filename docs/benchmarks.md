@@ -1307,3 +1307,14 @@ is the traffic reduction, not kernel throughput.
 Benchmarks: pp512 183-186, pp64 195-197, tg 9.8. verify: 25 PASS /
 0 FAIL — all gates green for the first time (previous borderline
 spec_np4_seq2 and spec_long_np4_seq3 now pass).
+
+### gy expansion to all quant types (opt-in, neutral)
+
+tile_ms4gy's pattern (token slabs on grid-y) was mechanically ported to all
+ms tile variants (LLM170_VK_GY2=1). A real bug was found and fixed: the gy
+dispatch re-pushed the ktab LUT that the ms path had already bound (12
+buffers vs an 11-binding layout) — xs/nl output was all zeros; q4/q6/q3/q8
+were token-correct from the start. After the fix, all-type gy is
+token-identical but perf-neutral (pp512 183.5, pp64 198.4 vs 183.7/196.9):
+per-tensor slab pairs are already adjacent dispatches, so L2 catches the
+re-read for non-q5 types. Kept opt-in (zero-risk default).
