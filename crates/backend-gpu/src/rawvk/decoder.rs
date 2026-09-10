@@ -26,6 +26,7 @@ const BETA_G_SPV: &[u8] = include_bytes!("spv/gdn_beta_g.spv");
 const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
 const NORM_GATED_SPV: &[u8] = include_bytes!("spv/norm_gated.spv");
 const QK_ROPE_SPV: &[u8] = include_bytes!("spv/qk_rope.spv");
+const QK_ROPE2_SPV: &[u8] = include_bytes!("spv/qk_rope2.spv");
 const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
 const KV_APPEND_Q8_SPV: &[u8] = include_bytes!("spv/kv_append_q8.spv");
@@ -1584,7 +1585,7 @@ impl DecoderState {
                     let mut push = self.eps.to_le_bytes().to_vec();
                     push.extend_from_slice(&self.kq_scale.to_le_bytes());
                     push.extend(Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]));
-                    self.run_pipe("qk_rope", QK_ROPE_SPV, 5, 28,
+                    self.run_pipe("qk_rope2", QK_ROPE2_SPV, 5, 28,
                         &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
                         &push, (n_head + n_kv) as u32, 1, 1)?;
                 }
@@ -1867,7 +1868,7 @@ impl DecoderState {
                     let mut push = self.eps.to_le_bytes().to_vec();
                     push.extend_from_slice(&self.kq_scale.to_le_bytes());
                     push.extend(Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]));
-                    self.run_pipe("qk_rope", QK_ROPE_SPV, 5, 28,
+                    self.run_pipe("qk_rope2", QK_ROPE2_SPV, 5, 28,
                         &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
                         &push, (n_head + n_kv) as u32, t as u32, 1)?;
                 }
@@ -2071,7 +2072,7 @@ impl DecoderState {
             let mut push = self.eps.to_le_bytes().to_vec();
             push.extend_from_slice(&self.kq_scale.to_le_bytes());
             push.extend(Self::push_u32s(&[pos as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32]));
-            self.run_pipe("qk_rope", QK_ROPE_SPV, 5, 28,
+            self.run_pipe("qk_rope2", QK_ROPE2_SPV, 5, 28,
                 &[self.b_aq.buf, self.b_ak.buf, qn.buf, kn.buf, cs.buf],
                 &push, (n_head + n_kv) as u32, 1, 1)?;
         }
