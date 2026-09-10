@@ -1281,7 +1281,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         // gy 병렬: 단일 디스패치, gy=t/64, push t=64 (커널은 슬래브당 64토큰)
         let gy = (t as u32).div_ceil(64);
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, 64u32]);
-        ctx.run(pl, ds, pipe, &push, gx, gy, 1)?;
+        ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;   // plans/41 zs: 슬래브 x, 행 y
         let outs: Vec<f32> = unsafe {
             let mut v = vec![0f32; t * n_out];
             std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);

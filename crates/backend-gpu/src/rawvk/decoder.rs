@@ -248,6 +248,13 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
 
     /// 프리필 — 행[t][n_embd]별 t=1 스텝 (기본 구현의 512-float 청크 절단 결함 회피).
     /// t=1 스텝 산술은 p1 검증 경로와 동일 — 순차 상태 적립으로 수치 불변.
+    /// prefill 청크 게이트 (plans/41): ms 타일 패밀리는 t=512 단일 패스가
+    /// 정확(tokens 불변 실측)하고 가중 판독이 1회로 줄어 빠름 — 512 승인.
+    /// 구 패밀리 옵트아웃(MSALL=0) 시에는 64 유지.
+    fn tile_big_chunk(&self) -> bool {
+        std::env::var("LLM170_TILE_MSALL").map(|v| v != "0").unwrap_or(true)
+    }
+
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
@@ -265,7 +272,11 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         }
         let mut last = None;
         for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
+            let tw = std::time::Instant::now();
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);
+            if std::env::var_os("LLM170_DBG_WALL").is_some() {
+                eprintln!("#  batch t={} wall={:.1}ms", ch.len() / n, tw.elapsed().as_secs_f64() * 1e3);
+            }
         }
         Ok(last.unwrap_or_default())
     }
@@ -447,7 +458,7 @@ impl VkDecoder {
     }
 }
 
-const T_MAX: usize = 128;
+const T_MAX: usize = 512;   // plans/41: 단일 패스 프리필 (가중 1회 판독)
 
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
@@ -977,6 +988,9 @@ impl DecoderState {
     /// SIMD-in-register 니블, fma 체인). 웜 162GB/s (역대 최고). LLM170_G8=1.
     /// bar=false: 독립 병렬 그룹 내부 (직후 배리어 생략).
     fn gemv8_q5(&mut self, xn: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
+        if std::env::var_os("LLM170_DBG_G8").is_some() {
+            eprintln!("[dbg_g8] t={t} {wkey}");
+        }
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         if ty != 13 && ty != 12 && ty != 23 && ty != 11 && ty != 14 && ty != 8 {
             return Err("gemv8: q3_K/q4_K/q5_K/q6_K/q8_0/iq4_xs만".into());
@@ -1107,6 +1121,9 @@ impl DecoderState {
     /// bar=false: 독립 그룹 내부 — 최종 디스패치 직후 배리어 생략.
     fn gemv_bar(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (_, ty, _, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
+        if std::env::var_os("LLM170_DBG_TILE").is_some() {
+            eprintln!("[dbg_tile] t={t} ty={ty} no={no} {wkey}");
+        }
         let tile_min: usize = if std::env::var_os("LLM170_VK_TILE1").is_some() { 1 } else { 16 };
         // f16 캐시 경로 (plans/39) — 루프 내 디양자화 없는 통일 타일
         if t >= tile_min
@@ -1246,8 +1263,9 @@ impl DecoderState {
                     let gy = (t as u32).div_ceil(64);
                     // ktab은 위 ms_spv 블록이 이미 push함 (gy_nkb == nkb) — 중복 push 금지
                     let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32]);
+                    // plans/41 zs: 슬래브= x(최속), 행 = y — 행블록의 토큰 페어가 인접 스케줄(L2 병합)
                     return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 16, &binds, &push,
-                        (no as u32 + 63) / 64, gy, 1, bar);
+                        gy, (no as u32 + 63) / 64, 1, bar);
                 }
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
@@ -1520,6 +1538,7 @@ impl DecoderState {
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
         let vk_t0 = std::time::Instant::now();
         if !noba { self.ctx.begin_batch()?; };
+        let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         let layer_cut = std::env::var("LLM170_VK_LAYERS").ok().and_then(|v| v.parse::<usize>().ok());
