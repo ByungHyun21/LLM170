@@ -1444,3 +1444,24 @@ its full kernel duration plus a small launch/barrier tail. Fusion math:
 Conclusion: decode remains a latency-chain problem at 64 layers x ~13
 dependent launches; the remaining ~20% gap to llama is launch/dependency
 overhead, not kernel throughput.
+
+## Speculative decode — architectural verdict (plans/43)
+
+Measured on the batched path as well (LLM170_BENCH_NP=4 forces
+spec_step_multi, the design that does batch verification): 32 generated
+tokens in 25.9 s = 1.24 t/s aggregate, i.e. ~810 ms per sequence-token
+against 102 ms for plain decode. Two independent defects:
+
+1. Drafts never materialize on the raw path: `mtp_draft_logits` is only
+   written by the non-raw `verify_batch`; the raw path stores
+   `mtp_draft_tok` (the GPU MTP head's argmax). The spec loop reads the
+   empty logits, drafts token 0, and accepts nothing (LLM170_SPEC_DBG:
+   `draft=0` every step; bench: fwd 8 / gen 8 / 1.00 tok per fwd).
+2. Verification costs ~2.4x a plain decode per token. The bit-contract
+   path re-runs the batch per token (raw_verify "per-token step = decode
+   arithmetic"), so even perfect draft acceptance could not pay for it.
+
+Spec decode therefore cannot beat plain decoding without either a true
+batched verify forward (different numeric class than the per-token
+contract) or accepting that class change; both are engine-scale changes
+rather than a tuning fix. Feature stays opt-in and inert until then.
