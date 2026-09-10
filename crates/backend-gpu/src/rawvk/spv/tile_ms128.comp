@@ -24,7 +24,7 @@ layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint t;
+    uint n_in; uint n_out; uint xq_w; uint t; uint row_off;
 } pc;
 
 #define BK 32
@@ -118,7 +118,7 @@ void main() {
     int n_in = int(pc.n_in);
     int nkb = n_in >> 5;                // 32k 블록 수
     int blocks = n_in >> 8;
-    int row0 = int(bid) * BM;
+    int row0 = int(pc.row_off) + int(bid) * BM;
     int nt = int(min(pc.t, BN));
     int nrow = int(min(BM, pc.n_out - uint(row0)));
 
