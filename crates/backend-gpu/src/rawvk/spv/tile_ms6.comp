@@ -67,7 +67,7 @@ void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
     uvec4 qlw4 = uvec4(WG(wq + 12u + wb), WG(wq + 12u + wb + 1u), WG(wq + 12u + wb + 2u), WG(wq + 12u + wb + 3u));
     uint wbh = (iqs0 & 15u) >> 1;   // qh 워드 기저 — n 오프셋 없음
     uvec4 qhw4 = uvec4(WG(wq + 4u + wbh), WG(wq + 4u + wbh + 1u), WG(wq + 4u + wbh + 2u), WG(wq + 4u + wbh + 3u));
-    for (int c = 0; c < 4; c++) {
+    [[unroll]] for (int c = 0; c < 4; c++) {   // 상수 인덱싱 — 벡터 성분 직접 접근
         int kp = int(sb & 7u) * 32 + kc + c * 4;   // 블록 내 위치 0..255
         // llama 규약: idx = kp/4 (LOAD_VEC_A=4), iqs = (idx%64)*2
         uint iqs = ((uint(kp) >> 2) & 63u) << 1;
@@ -86,8 +86,8 @@ void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
         uint mb = ((scales[mbidx0] >> mbidxshift0) & 0xFu) | ((scales[1] >> mbidxshift1) & 0x30u);
         float d = dm.x * float(sc);
         float m = -dm.y * float(mb);
-        uint qsw = (c == 0) ? qlw4.x : ((c == 1) ? qlw4.y : ((c == 2) ? qlw4.z : qlw4.w));
-        uint qhw = (c == 0) ? qhw4.x : ((c == 1) ? qhw4.y : ((c == 2) ? qhw4.z : qhw4.w));
+        uint qsw = qlw4[c];
+        uint qhw = qhw4[c];
         uint qs = (qsw >> (b * 4u)) & 0x0F0F0F0Fu;
         uint qh = ((qhw >> (iqs >> 4)) & 0x01010101u) << 4;
         vec4 q = vec4(unpk8(qs | qh));
@@ -112,13 +112,12 @@ void load_b(uint k0, int nt, uint tid, int n_in) {
     float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + (k0 >> 5))]);
     uvec4 xb0 = uvec4(xq[base + uint(xw)], xq[base + uint(xw) + 1u], xq[base + uint(xw) + 2u], xq[base + uint(xw) + 3u]);
     uvec4 xb1 = uvec4(xq[base + uint(xw) + 4u], xq[base + uint(xw) + 5u], xq[base + uint(xw) + 6u], xq[base + uint(xw) + 7u]);
-    for (int e = 0; e < 16; e += 2) {
+    [[unroll]] for (int e = 0; e < 16; e += 2) {
         float vals[2];
-        for (int h = 0; h < 2; h++) {
-            uint j = k2 + e + h;
-            uint wv = (j < 4) ? xb0.x : ((j < 8) ? xb0.y : ((j < 12) ? xb0.z : ((j < 16) ? xb0.w :
-                       ((j < 20) ? xb1.x : ((j < 24) ? xb1.y : ((j < 28) ? xb1.z : xb1.w))))));
-            int b = int((wv >> uint((j & 3) * 8)) & 0xFFu) << 24 >> 24;
+        [[unroll]] for (int h = 0; h < 2; h++) {
+            uint j = k2 + uint(e + h);
+            uint wv = (j < 16u) ? xb0[int(j >> 2)] : xb1[int((j - 16u) >> 2)];
+            int b = int((wv >> uint((j & 3u) * 8u)) & 0xFFu) << 24 >> 24;
             vals[h] = float(b) * yd;
         }
         buf_b[ti2 * SHMEM_STRIDE + (k2 >> 1) + (e >> 1)] = f16vec2(float16_t(vals[0]), float16_t(vals[1]));
