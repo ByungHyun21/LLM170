@@ -17,6 +17,7 @@ const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
+const GEMV8_XSB_SPV: &[u8] = include_bytes!("spv/gemv8_xsb.spv");
 const TILE_Q6K_SPV: &[u8] = include_bytes!("spv/tile_q6k.spv");
 const GDN_CONV_STATE_SPV: &[u8] = include_bytes!("spv/gdn_conv_state.spv");
 const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
@@ -977,6 +978,12 @@ impl DecoderState {
         binds.push(out);
         if ty == 23 {
             binds.push(self.ktab.buf);
+        }
+        // xsb (plans/40) — llama generic dmmv 구조 × 검증 xs 디코드: 125→182GB/s.
+        if ty == 23 && std::env::var("LLM170_VK_XSB").map(|v| v == "0").unwrap_or(true) {
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+            return self.run_pipe_b("gemv8_xsb", GEMV8_XSB_SPV, 11, 24, &binds, &push,
+                1, no.div_ceil(2) as u32, t as u32, bar);
         }
         let rpf: u32 = if no < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
         if ty == 8 {

@@ -1,0 +1,95 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_xsb (plans/40) — llama generic dmmv 구조 × 우리 검증 xs 디코드.
+// 64스레드, 2행/WG, K_PER_ITER=8: 레인 8원소 = 서브블록 내 니블면 4바이트(1 u32).
+// 블록 136B: [d f16][sh u16][ls 4B][qs 128B], 8서브×32원소, ktab LUT.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Ktab { uint kt[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+shared uint skt[256];
+
+float kv(uint nib) {
+    // kt[b] = NL[b] | NL[b>>4]<<8 — lo니블 값 = kt[nib] & 0xFF (부호 i8)
+    return float(int(kt[nib] & 0xFFu) << 24 >> 24);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < 256u; i += 64u) skt[i] = kt[i];
+    barrier();
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint ybase = tok * pc.n_in;
+    const uint n_in = pc.n_in;
+    float acc0 = 0.0, acc1 = 0.0;
+    const uint KPIT = 64u * 8u;
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        // 열 8개 y (연속)
+        const vec4 bv0 = vec4(xa[ybase + col0], xa[ybase + col0 + 1u], xa[ybase + col0 + 2u], xa[ybase + col0 + 3u]);
+        const vec4 bv1 = vec4(xa[ybase + col0 + 4u], xa[ybase + col0 + 5u], xa[ybase + col0 + 6u], xa[ybase + col0 + 7u]);
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;
+            const uint blk = col >> 8;               // 256 원소 블록
+            const uint bb = blk * 136u;              // 바이트 기저
+            const uint rel = col & 31u;              // 서브블록 내 위치 (8의 배수)
+            const uint sub = (col >> 5) & 7u;
+            const bool hi = rel >= 16u;
+            const uint bbase = bb + 8u + sub * 16u + (rel & 15u);  // qs 바이트 기저
+            // 4바이트 u32 조립 (비정렬)
+            const uint wi = bbase >> 2;
+            const uint sh = (bbase & 3u) * 8u;
+            const uint wa = w0u[wi];
+            const uint wb = w0u[wi + 1u];
+            const uint wq = (wa >> sh) | (sh != 0u ? (wb << (32u - sh)) : 0u);
+            const uint nib = (wq >> (hi ? 4u : 0u)) & 0x0F0F0F0Fu;
+            // 헤더: d + (sl, sh) → dl
+            const uint hw = w0u[bb >> 2];
+            const float d = unpackHalf2x16(hw & 0xFFFFu).x;
+            const uint shh = (hw >> 16u) & 0xFFFFu;
+            const uint lsw = w0u[(bb >> 2) + 1u];
+            const uint slb = (lsw >> (8u * (sub >> 1))) & 0xFFu;
+            const int ls = int((slb >> (4u * (sub & 1u))) & 0xFu) | (int((shh >> (2u * sub)) & 3u) << 4);
+            const float dl = d * float(ls - 32);
+            // 4니블 → LUT (kt[nib] 하위바이트 = NL 부호값)
+            const vec4 vs = vec4(
+                float(int(skt[nib & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib >> 8) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib >> 16) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[nib >> 24] & 0xFFu) << 24 >> 24));
+            // 나머지 4원소: 다음 4바이트 (rel+4)
+            const uint wi2 = wi + 1u;
+            const uint wc = w0u[wi2 + 1u];
+            const uint wq2 = (wb >> sh) | (sh != 0u ? (wc << (32u - sh)) : 0u);
+            const uint nib2 = (wq2 >> (hi ? 4u : 0u)) & 0x0F0F0F0Fu;
+            const vec4 vs2 = vec4(
+                float(int(skt[nib2 & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib2 >> 8) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib2 >> 16) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[nib2 >> 24] & 0xFFu) << 24 >> 24));
+            const float r = dl * (dot(bv0, vs) + dot(bv1, vs2));
+            if (n == 0u) acc0 += r; else acc1 += r;
+        }
+    }
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
