@@ -1289,3 +1289,21 @@ arc, alongside the WY chunked gdn_ar formulation.
 
 Defaults stand: pp64 195-199 (0.80x), pp512 174-185 (0.51x), tg8
 9.8-10.2 (0.82x), verify 23 PASS / 2 FAIL.
+
+## tile_ms4gy — L2 weight reuse via grid-y (2026-09-10, plans/40)
+
+The pp512 gap mechanism finally decoded: llama's column-tile workgroups
+re-read identical weights within a single dispatch (L2 hits); our host-
+loop 64-token slabs let L2 evict between dispatches. tile_ms4gy puts
+every slab of the chunk in one dispatch on grid-y — 85.5 GB/s effective
+at t=512 solo (vs 65 isolated), halving q5 tile DRAM per chunk. Engine
+default (LLM170_VK_GY=0 opts out). T_MAX stays 128 (256 showed no gain).
+
+The mm_llm large-t harness defect was a stale-spv/env combination
+(recompiled mul_mm + explicit VKMMQ_SPV path): llama's own l-tile
+streams weights at just 41 GB/s solo in our harness — their pp512 win
+is the traffic reduction, not kernel throughput.
+
+Benchmarks: pp512 183-186, pp64 195-197, tg 9.8. verify: 25 PASS /
+0 FAIL — all gates green for the first time (previous borderline
+spec_np4_seq2 and spec_long_np4_seq3 now pass).
