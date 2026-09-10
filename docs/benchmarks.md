@@ -1634,3 +1634,26 @@ new decode with vk-tile-check (t=512, expect maxrel <= 0.006), then measure
 the 67MB tensor's rate - the decisive number is whether it lifts off the
 23.6 GB/s plateau. The exact qh lane mapping in the current decode
 (qhi/4 with the iqs>>4 byte select) must be transcribed carefully.
+
+## Sub-block repack — implemented and rejected (plans/45 close)
+
+The repack design was carried through: a 48-byte per-sub-block record
+(ql nibbles | scales | d | qh bits, three aligned uvec4 loads per thread,
+[row-block][256-block][sub-block][row] layout) plus a matching BK=64 tile
+kernel with the exact original scale/iqs conventions, wired into the
+harness behind LLM170_TILE_PACK=2/LLM170_TILE_RP=1.
+
+Result: numerically wrong (maxrel 2.18, needs debugging) and, more
+importantly, no faster - 23.1 GB/s on the 67MB tensor against the 23.6
+baseline, and 29.5 against 34.3 on the L2 tensor. Together with the earlier
+probes this also falsifies the load-issue hypothesis: cutting a thread's
+global loads from ~24 scalar to 3 wide uvec4 changes nothing on the DRAM
+case.
+
+The 23.6 GB/s DRAM ceiling on this machine is invariant to load count,
+load width, occupancy, workgroup count, latency hiding, LDS traffic,
+coarse and fine layout packing, and the decode arithmetic. The engine
+runs its tiles at ~43 GB/s effective (tensors are smaller and partly
+L2-resident), so this harness ceiling is not the engine's limiter; the
+remaining prefill gap stands at the ~17% tile-rate difference versus
+llama.cpp.
