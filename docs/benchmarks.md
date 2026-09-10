@@ -1515,3 +1515,24 @@ Chunk scaling of the current build (same weights, one pass per prompt):
 pp128 288, pp256 318, pp384 297, pp512 302 t/s - the pass overhead is
 already amortised at 256 tokens, and per-token cost is set by the slab
 count (t/128 reads of every weight tensor), not by the pass length.
+
+## Prefill tile kernels are instruction-bound, not memory-bound (plans/44)
+
+Isolation experiments on the ms128 tile (q5_K, BM=64, BN=128):
+
+| probe | result |
+|---|---|
+| same tensor, t=64 vs t=128 (identical weight bytes) | 48.0 vs 23.5 GB/s - time tracks MACs, not bytes |
+| 2 vs 5 workgroups/CU (dummy LDS) | 23.4 vs 23.9 GB/s - occupancy is irrelevant |
+| packed weight layout ([row-block][256-block][row]) | 23.5 vs 23.6 - access pattern is not the limit |
+| activation loads removed (zero-padded B tile) | 24.0 vs 23.6 - the DRAM case is weight-only |
+| 21.6MB vs 61MB tensor, same type | 50.8 vs 23.6 GB/s - L2 residency artifact, not DRAM |
+
+The kernel delivers ~4.5 TMAC/s regardless of shape, so the prefill cost is
+(total MACs) / (issue rate): widening the tile (BN=128 -> 256) does not help
+because the MAC count is unchanged, and neither does any memory-side tuning.
+The remaining lever is fewer instructions per MAC - pre-dequantized f16
+weights (2x bytes but no decode ALU) - which needs chunked >max_ssbo
+(128MB) buffers; partial caching changes the numeric class (measured token
+streams diverge) and the current f16 tile path is stale (512-thread variant,
+wrong tokens, 123 t/s).
