@@ -1349,3 +1349,14 @@ Corrected prefill (pp512, same machine): 113 t/s at 64-token chunks,
 154 at 128, 205-212 at 512 — i.e. within one pass the weight traffic is
 dominated by slab re-reads, and pass count is the cost driver. All earlier
 sub-64-chunk-out-of-spec measurements are superseded by these.
+
+## Prefill traffic levers — closed (plans/41)
+
+After the tok_base fix, every slab-merging lever was measured on the
+corrected engine and came out neutral: token-group gy dispatch
+(LLM170_VK_GYGRP=128, with and without GY2) 206-211 t/s, BN=128 ms128
+213 t/s — all inside the 205-213 baseline band of a single 512-token pass.
+The harness "gy=2 merge" figure did not transfer: it replays one tensor in
+a tight loop, so it measures L2 residency across reps, not intra-dispatch
+sharing. Prefill remains slab-traffic-bound at roughly 8 weight reads per
+512-token pass; kernels themselves run at their solo streaming rate.

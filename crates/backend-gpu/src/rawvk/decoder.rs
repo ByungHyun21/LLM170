@@ -1259,13 +1259,21 @@ impl DecoderState {
                 };
                 let use_gy = (ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2);
                 if use_gy {
-                    // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용
-                    let gy = (t as u32).div_ceil(64);
-                    // ktab은 위 ms_spv 블록이 이미 push함 (gy_nkb == nkb) — 중복 push 금지
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32, 0u32]);
-                    // plans/41 zs: 슬래브= x(최속), 행 = y — 행블록의 토큰 페어가 인접 스케줄(L2 병합)
-                    return self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 20, &binds, &push,
-                        gy, (no as u32 + 63) / 64, 1, bar);
+                    // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용.
+                    // plans/42: GYGRP=n이면 n토큰 그룹으로 분할 디스패치 (예: 128 → gy=2,
+                    // 하네스 실측 병합 한계 내). 미설정 시 전 토큰 단일 디스패치.
+                    let grp: usize = std::env::var("LLM170_VK_GYGRP").ok()
+                        .and_then(|v| v.parse().ok()).filter(|&g| g >= 64).unwrap_or(t);
+                    let nrows = (no as u32 + 63) / 64;
+                    for g0 in (0..t).step_by(grp) {
+                        let gt = (t - g0).min(grp);
+                        let gy = (gt as u32).div_ceil(64);
+                        let last = g0 + grp >= t && bar;
+                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32, g0 as u32]);
+                        self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 20, &binds, &push,
+                            gy, nrows, 1, last)?;
+                    }
+                    return Ok(());
                 }
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
@@ -1276,17 +1284,23 @@ impl DecoderState {
                         let mut first = true;
                         while ro < gx_ms * 64 {
                             let g = (gx_ms - ro / 64).min(gxh);
-                            let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, ro]);
+                            let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, ro, tb as u32]);
                             let fin = last && ro + g * 64 >= gx_ms * 64;
-                            self.run_pipe_b(nm, spv, nkb, 16, &binds, &push, g, 1, 1, fin)?;
+                            self.run_pipe_b(nm, spv, nkb, 24, &binds, &push, g, 1, 1, fin)?;
                             ro += g * 64;
                             first = false;
                             let _ = first;
                         }
                     } else {
                         // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
-                        let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
-                        self.run_pipe_b(nm, spv, nkb, 20, &binds, &push, gx_ms, 1, 1, last)?;
+                        // ms128 계열은 row_off까지 6필드 (pb=24)
+                        let ms128fam2 = ty == 13 && nm.starts_with("tile_ms128");
+                        let (push, pb) = if ms128fam2 {
+                            (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32, tb as u32]), 24)
+                        } else {
+                            (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]), 20)
+                        };
+                        self.run_pipe_b(nm, spv, nkb, pb, &binds, &push, gx_ms, 1, 1, last)?;
                     }
                 }
                 return Ok(());
