@@ -1,0 +1,73 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// gdn_ar8 (plans/40) — ar4의 열 8개 확장 (ILP×8, WG 2048).
+// 서브그룹 축소 16회의 지연을 상호 은폐 + k/q 로드 8분의 1.
+// grid (dt_rank, d_state/8). 수치: gdn_ar과 동일 산식 (열별 스칼라 연산).
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };             // [pair][d*d]
+layout(binding = 1) readonly buffer Q { float q[]; };    // [t][k_len]
+layout(binding = 2) readonly buffer K { float k[]; };    // [t][k_len]
+layout(binding = 3) readonly buffer V { float v[]; };    // [t][v_len]
+layout(binding = 4) readonly buffer Bg { float bg[]; };  // [t][hv*2]
+layout(binding = 5) buffer O { float o[]; };             // [t][v_len]
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t;
+} pc;
+void main() {
+    int pair = int(gl_WorkGroupID.x);
+    int u0 = int(gl_WorkGroupID.y) * 8;
+    int lane = int(gl_SubgroupInvocationID);
+    int base_s = pair * pc.d * pc.d;
+    float s0[8], s1[8], s2[8], s3[8];
+    [[unroll]] for (int c = 0; c < 8; c++) {
+        s0[c] = s[base_s + (lane * 4 + 0) * pc.d + u0 + c];
+        s1[c] = s[base_s + (lane * 4 + 1) * pc.d + u0 + c];
+        s2[c] = s[base_s + (lane * 4 + 2) * pc.d + u0 + c];
+        s3[c] = s[base_s + (lane * 4 + 3) * pc.d + u0 + c];
+    }
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    for (int ti = 0; ti < pc.t; ti++) {
+        int qk0 = ti * pc.ks + kh * pc.d;
+        int v0 = ti * pc.vs + h * pc.d;
+        float beta = bg[ti * pc.hv * 2 + pair * 2];
+        float g = bg[ti * pc.hv * 2 + pair * 2 + 1];
+        float k0 = k[qk0 + lane * 4 + 0];
+        float k1 = k[qk0 + lane * 4 + 1];
+        float k2 = k[qk0 + lane * 4 + 2];
+        float k3 = k[qk0 + lane * 4 + 3];
+        float q0 = q[qk0 + lane * 4 + 0];
+        float q1 = q[qk0 + lane * 4 + 1];
+        float q2 = q[qk0 + lane * 4 + 2];
+        float q3 = q[qk0 + lane * 4 + 3];
+        float part[8], op[8];
+        [[unroll]] for (int c = 0; c < 8; c++) {
+            s0[c] *= g; s1[c] *= g; s2[c] *= g; s3[c] *= g;
+            part[c] = s0[c] * k0 + s1[c] * k1 + s2[c] * k2 + s3[c] * k3;
+        }
+        float sk[8];
+        [[unroll]] for (int c = 0; c < 8; c++) sk[c] = subgroupAdd(part[c]);
+        float delta[8], vv[8];
+        [[unroll]] for (int c = 0; c < 8; c++) {
+            vv[c] = v[v0 + u0 + c];
+            delta[c] = (vv[c] - sk[c]) * beta;
+            s0[c] += k0 * delta[c];
+            s1[c] += k1 * delta[c];
+            s2[c] += k2 * delta[c];
+            s3[c] += k3 * delta[c];
+            op[c] = s0[c] * q0 + s1[c] * q1 + s2[c] * q2 + s3[c] * q3;
+        }
+        [[unroll]] for (int c = 0; c < 8; c++) {
+            float otot = subgroupAdd(op[c]);
+            if (lane == 0) o[v0 + u0 + c] = otot * pc.scale;
+        }
+    }
+    [[unroll]] for (int c = 0; c < 8; c++) {
+        s[base_s + (lane * 4 + 0) * pc.d + u0 + c] = s0[c];
+        s[base_s + (lane * 4 + 1) * pc.d + u0 + c] = s1[c];
+        s[base_s + (lane * 4 + 2) * pc.d + u0 + c] = s2[c];
+        s[base_s + (lane * 4 + 3) * pc.d + u0 + c] = s3[c];
+    }
+}
