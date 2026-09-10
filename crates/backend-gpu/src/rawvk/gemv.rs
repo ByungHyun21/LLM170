@@ -1021,10 +1021,14 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     let chunk_words = (ch / 4) as u32;
     let spv_path = match w.ty {
         llm170_gguf::GgmlType::Q3K => "crates/backend-gpu/src/rawvk/spv/gemv8_q3.spv",
+        llm170_gguf::GgmlType::Q4K if std::env::var("LLM170_Q4B").map(|v| v != "0").unwrap_or(true) =>
+            "crates/backend-gpu/src/rawvk/spv/gemv8_q4b.spv",
         llm170_gguf::GgmlType::Q4K => "crates/backend-gpu/src/rawvk/spv/gemv8_q4.spv",
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_Q5B").map(|v| v != "0").unwrap_or(true) =>
             "crates/backend-gpu/src/rawvk/spv/gemv8_q5b.spv",
         llm170_gguf::GgmlType::Q5K => "crates/backend-gpu/src/rawvk/spv/gemv8_q5.spv",
+        llm170_gguf::GgmlType::Q6K if std::env::var("LLM170_Q6B").map(|v| v != "0").unwrap_or(true) =>
+            "crates/backend-gpu/src/rawvk/spv/gemv8_q6b.spv",
         llm170_gguf::GgmlType::Q6K => "crates/backend-gpu/src/rawvk/spv/gemv8_q6.spv",
         llm170_gguf::GgmlType::Iq4Xs => "crates/backend-gpu/src/rawvk/spv/gemv8_xs.spv",
         _ => return Err("gemv8: 미지원 타입".into()),
@@ -1042,7 +1046,9 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
     }
     ctx.bind_bufs(ds, &binds);
     let q5b = w.ty == llm170_gguf::GgmlType::Q5K && std::env::var("LLM170_Q5B").map(|v| v != "0").unwrap_or(true);
-    let rpf: u32 = if q5b { 2 } else if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
+    let q4b = w.ty == llm170_gguf::GgmlType::Q4K && std::env::var("LLM170_Q4B").map(|v| v != "0").unwrap_or(true);
+    let q6b = w.ty == llm170_gguf::GgmlType::Q6K && std::env::var("LLM170_Q6B").map(|v| v != "0").unwrap_or(true);
+    let rpf: u32 = if q5b || q4b || q6b { 2 } else if n_out < 4096 { 1 } else { 2 };   // llama NUM_ROWS=2
     let cw_log2 = 31u32 - chunk_words.leading_zeros();
     let cw_mask = (1u32 << cw_log2) - 1u32;
     // cw 단위: q5/q6(u16 typed 뷰)만 u16 단위, 나머지 u32

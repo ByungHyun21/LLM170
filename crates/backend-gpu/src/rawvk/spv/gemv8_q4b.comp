@@ -1,0 +1,125 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_q4b (plans/40) — llama mul_mat_vec_q4_k 충실 이식.
+// 64스레드 WG (16스레드/블록 × 4 it), NUM_ROWS=2/워크그룹, vec4 SIMD 언팩,
+// u16 typed 뷰 (단일 청크 직접 — WG() 간접 없음).
+// 바인딩: 0 = 가중 (typed packed16 뷰), 8 = f32 활성 [t][n_in], 9 = out.
+layout(local_size_x = 64) in;
+struct Blk {
+    f16vec2 dm;
+    uint16_t scales[6];
+    uint16_t qs[64];
+};   // q4_K: 4 + 12 + 128 = 144B
+layout(binding = 0) readonly buffer AP16S { Blk ablk[]; };
+
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uvec4 unpk8(uint x) {
+    return uvec4(x & 0xFFu, (x >> 8) & 0xFFu, (x >> 16) & 0xFFu, x >> 24);
+}
+
+shared float tmpsh[2][64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint nrows = 2u;
+    const uint first_row = nrows * gl_WorkGroupID.y;
+    uint num_rows = nrows;
+    if (first_row + nrows > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint num_blocks_per_row = pc.n_in / 256u;
+    const uint it_size = 64u / 16u;   // 4
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;
+    const uint il = itid / 4u;
+    const uint ir = itid - 4u * il;
+    const uint v_im = il / 2u;
+    const uint v_in = il % 2u;
+    const uint l0 = 4u * (2u * ir + v_in);   // q4_K: 4-스트라이드
+    const uint q_offset = 32u * v_im + l0;
+    const uint y_offset = 64u * v_im + l0;
+    const uint ybase = tok * pc.n_in;
+    float t0 = 0.0, t1 = 0.0;
+
+    for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        // B (y) — q4_K: {y1+0..3, y1+32..35, y1+128..131, y1+160..163}
+        const uint y1 = ybase + i * 256u + y_offset;
+        float by0 = xa[y1];
+        float by1 = xa[y1 + 1u];
+        float by2 = xa[y1 + 2u];
+        float by3 = xa[y1 + 3u];
+        float by4 = xa[y1 + 32u];
+        float by5 = xa[y1 + 33u];
+        float by6 = xa[y1 + 34u];
+        float by7 = xa[y1 + 35u];
+        float by8 = xa[y1 + 128u];
+        float by9 = xa[y1 + 129u];
+        float by10v = xa[y1 + 130u];
+        float by11 = xa[y1 + 131u];
+        float by12 = xa[y1 + 160u];
+        float by13 = xa[y1 + 161u];
+        float by14 = xa[y1 + 162u];
+        float by15 = xa[y1 + 163u];
+
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint ib = (first_row + n) * num_blocks_per_row + i;
+            const vec2 dm = vec2(ablk[ib].dm);
+            // scales: llama 산법 (u16 packed 뷰)
+            const uint s0 = uint(ablk[ib].scales[v_im]);
+            const uint s4 = uint(ablk[ib].scales[v_im + 2u]);
+            const uint s8 = uint(ablk[ib].scales[v_im + 4u]);
+            const uint s_0_4_l = (s4 << 16) | s0;
+            const uint s_0_4_h = (s_0_4_l & 0xC0C0C0C0u) >> 2;
+            const uvec4 s_l4 = unpk8(s_0_4_l & 0x3F3F3F3Fu);
+            const uvec4 s_84 = unpk8((((s8 << 12) | s8) & 0x0F0F0F0Fu) | s_0_4_h);
+            const float sc0 = float(s_l4.x), sc1 = float(s_l4.y), sc2 = float(s_l4.z), sc3 = float(s_l4.w);
+            const float sc4 = float(s_84.x), sc5 = float(s_84.y), sc6 = float(s_84.z), sc7 = float(s_84.w);
+            // q4_K: qs u32 직접 (qh 없음)
+            const uint q_a = uint(ablk[ib].qs[q_offset / 2u]) | (uint(ablk[ib].qs[q_offset / 2u + 1u]) << 16);
+            const uint q_b = uint(ablk[ib].qs[q_offset / 2u + 32u]) | (uint(ablk[ib].qs[q_offset / 2u + 33u]) << 16);
+            uint a_lo = q_a & 0x0F0F0F0Fu;
+            uint a_hi = (q_a >> 4) & 0x0F0F0F0Fu;
+            uint b_lo = q_b & 0x0F0F0F0Fu;
+            uint b_hi = (q_b >> 4) & 0x0F0F0F0Fu;
+            const uvec4 v_a_lo = unpk8(a_lo), v_a_hi = unpk8(a_hi), v_b_lo = unpk8(b_lo), v_b_hi = unpk8(b_hi);
+            // 16 q값
+            const float q0 = float(v_a_lo.x), q1 = float(v_a_lo.y), q2 = float(v_a_lo.z), q3 = float(v_a_lo.w);
+            const float q4 = float(v_a_hi.x), q5 = float(v_a_hi.y), q6 = float(v_a_hi.z), q7 = float(v_a_hi.w);
+            const float q8 = float(v_b_lo.x), q9 = float(v_b_lo.y), q10 = float(v_b_lo.z), q11 = float(v_b_lo.w);
+            const float q12 = float(v_b_hi.x), q13 = float(v_b_hi.y), q14 = float(v_b_hi.z), q15 = float(v_b_hi.w);
+            const float sx = fma(by0, q0, fma(by1, q1, fma(by2, q2, by3 * q3)));
+            const float sy = fma(by4, q4, fma(by5, q5, fma(by6, q6, by7 * q7)));
+            const float sz = fma(by8, q8, fma(by9, q9, fma(by10v, q10, by11 * q11)));
+            const float sw = fma(by12, q12, fma(by13, q13, fma(by14, q14, by15 * q15)));
+            // q4_K smin: 성분별 스케일 (llama 78-81행 구조)
+            const float smin =
+                fma(by0, sc2, fma(by4, sc3, fma(by8, sc6, by12 * sc7)))
+              + fma(by1, sc2, fma(by5, sc3, fma(by9, sc6, by13 * sc7)))
+              + fma(by2, sc2, fma(by6, sc3, fma(by10v, sc6, by14 * sc7)))
+              + fma(by3, sc2, fma(by7, sc3, fma(by11, sc6, by15 * sc7)));
+            const float r = dm.x * fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))) - dm.y * smin;
+            if (n == 0u) t0 = fma(r, 1.0, t0); else t1 += r;
+        }
+    }
+    // 축소: WG = 1 웨이브64 서브그룹
+    const float r0 = subgroupAdd(t0);
+    const float r1 = subgroupAdd(t1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
