@@ -1536,3 +1536,22 @@ weights (2x bytes but no decode ALU) - which needs chunked >max_ssbo
 (128MB) buffers; partial caching changes the numeric class (measured token
 streams diverge) and the current f16 tile path is stale (512-thread variant,
 wrong tokens, 123 t/s).
+
+## f32-activation tile (b32) — kernel correct, engine dispatch no-ops (plans/44)
+
+tile_ms128b32 (same tile with the q8 activation unpack replaced by a direct
+f32 read) verifies in the harness at maxrel 0.0005 - better than the q8
+path's 0.0055, since the activations are no longer quantized. Solo rates
+are unchanged (48.6 vs 50.8 GB/s at t=128, L2-resident tensor; 12.6 vs
+12.4 at t=512).
+
+In the engine the same SPV produces zero output for the q5 tensors, and
+neither bounding a constant B tile nor writing a constant in the drain
+changes the result - the dispatch appears to no-op, which also explains the
+apparent +5% (320 vs 303 t/s pp512) on that path: the work is simply not
+executed. Buffer-handle mapping was verified correct (xq_n -> b_xn,
+xq_g -> b_ggated, xq_f -> b_fglu) and the dispatch parameters match the
+harness (nkb 10, pb 24, 128-token slabs, tok_base). Root cause not found;
+the experiment is reverted. Worth noting as a robustness gap: a dispatch
+that silently does nothing is indistinguishable from a fast kernel in the
+timing numbers.
