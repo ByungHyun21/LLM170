@@ -1579,3 +1579,32 @@ tile variant tried (BN 64/128/256, four subgroup layouts, BK 16/32, stride
 * BK=64 (half the K-loop barriers, 256 threads with split staging) is also
   neutral on the DRAM case (23.6 vs 23.8 GB/s) and 27% worse when the
   tensor is L2-resident, closing the barrier-count axis as well.
+
+## Tile kernel is load-issue bound (plans/45, definitive)
+
+A raw linear streaming reader on the same buffers measures 333 GB/s
+(vec4 loads, 67MB tensor), while the q5_K tile sustains 23.6 GB/s on that
+tensor - and that number is insensitive to every structural lever tried:
+
+| lever | DRAM tensor (67MB) | L2 tensor (22MB) |
+|---|---|---|
+| baseline ms128 | 23.6 GB/s | 34.3 GB/s |
+| register-staged software pipeline | 22.6 | **46.5** (+36%) |
+| coopMatLoad hoisting (20 -> 8 LDS reads/step) | 23.2 | **48.0** (+40%) |
+| + uvec4 d/scales loads | 23.6 | 47.3 |
+| BM=32 (2x workgroups) | 23.1 | 31.0 |
+| f32 activation (b32) | - | - |
+
+The two optimisations that help when data is L2-resident do nothing when it
+streams from DRAM, and neither does request parallelism. The arithmetic
+points at instruction issue: the kernel issues ~12 four-byte global loads
+plus the q5_K decode per thread per K-block, i.e. ~67G loads/s across the
+grid, about 60% of this GPU's theoretical load-issue rate - and the decode
+ALU competes for the same issue slots. That is why occupancy, WG count,
+latency hiding, LDS traffic, load width for one region, and layout packing
+all measure neutral: none of them reduce the instruction count per K-block.
+
+The fix direction is fewer, wider loads per thread (16B-weight loads with
+LDS redistribution of the decode), not more parallelism, and it explains
+why the b32 experiment (decode ALU traded for 4x more small loads) was
+neutral as well.
