@@ -1479,3 +1479,25 @@ streaming rate (61-66 GB/s). There is no measurable CPU or idle slack left
 to reclaim; only a wider accumulator tile (fewer weight reads) can move it,
 and BN=128/256 tiles lose the same margin in occupancy (ms256 +1.6%,
 ms512 collapse).
+
+## BN=128 tiles for all quant types (plans/43) — pp512 +25%
+
+The ms tile family gained 128-token-wide variants for every quant type
+(xs/q4k/q6k/q3k/q8/nl), produced by the same transform that made ms128 out
+of ms4: two subgroups keep the 8-accumulator layout but each covers 64
+tokens, so a weight block is read once per 128 tokens. Every variant
+verifies at maxrel 0.003-0.006 (t=512) and the engine token stream is
+byte-identical. Weight traffic per 512-token pass drops from 8 to 4 reads
+per tensor - now the same as llama's column-tile count with the same
+bandwidth class.
+
+Cost: a 128-wide tile needs t >= 128, so the path is gated there
+(LLM170_TILE_BN128=0 restores the 64-wide family).
+
+Measured: pp512 216.9 -> 269.7 t/s, pp64 198.3 and tg8 9.66 unchanged,
+verify 25 PASS / 0 FAIL.
+
+The fix also uncovered an opt-out inversion: LLM170_VK_GY=0 selected the
+gy kernel in the arm chain while the dispatcher's use_gy was false, so the
+gy kernel ran with the tb-loop grid and produced garbage - it had masked
+the ms128 path in every earlier A/B.
