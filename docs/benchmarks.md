@@ -1424,3 +1424,23 @@ wastes half the accumulator — hence gated to t >= 128 and kept opt-in
 (LLM170_TILE_MS256=1). Kernel-solo rate drops to 36.7 GB/s (from ms4's 61)
 because of the larger drain and LDS footprint, which eats most of the
 halved weight traffic; the width gain is real but small on this hardware.
+
+## Decode chain links are fully exposed (plans/43)
+
+Removing the GDN autoregressive kernel with LLM170_VK_GDN_SKIP=1 saves
+84.5 ms per 8 generated tokens (820.8 -> 736.3 ms), i.e. 10.6 ms/token for
+48 kernels whose own GPU time is 8.6 ms/token: each dependency link costs
+its full kernel duration plus a small launch/barrier tail. Fusion math:
+
+* Fusable tiny links (gdn_conv 0.014, split3 0.001, l2 0.002, beta_g
+  0.002 ms per layer) sum to under 2% of the per-token budget.
+* addrms (add + rms_norm) is the large one at 128 links/token (6.3 ms), but
+  it cannot be merged: the residual add can move into the producing GEMV
+  epilogue, while rms_norm needs a whole-row reduction and its scale cannot
+  be folded into the quantized weights without changing the numeric class.
+* ar kernel variants (AR4=8/4/2, disabled) measure identically, so that
+  kernel's shape is already optimal for this machine.
+
+Conclusion: decode remains a latency-chain problem at 64 layers x ~13
+dependent launches; the remaining ~20% gap to llama is launch/dependency
+overhead, not kernel throughput.
