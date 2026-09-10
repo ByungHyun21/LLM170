@@ -1360,3 +1360,22 @@ The harness "gy=2 merge" figure did not transfer: it replays one tensor in
 a tight loop, so it measures L2 residency across reps, not intra-dispatch
 sharing. Prefill remains slab-traffic-bound at roughly 8 weight reads per
 512-token pass; kernels themselves run at their solo streaming rate.
+
+## Decode cost structure (plans/42)
+
+Layer-scaled decode timing (prompt 8, tg 4) gives a clean linear fit:
+~10.7 ms fixed per token plus ~1.37 ms per layer — at 64 layers that is the
+measured ~98 ms/token. The fixed part is dominated by the output projection
+(1.02 GB of weights per token); the per-layer part streams 247 MB of layer
+weights, i.e. ~181 GB/s effective against llama's ~204-219 GB/s for the same
+structure. Per-kernel GPU sums stay ~1.5x above the wall clock while the
+engine overlaps independent dispatches, so decode gaps are scheduling, not
+kernel math.
+
+Speculative decode (MTP head, --spec k) currently drafts with 0% acceptance
+on the bench prompt (fwd 8, gen 8, 1.00 tok/fwd) and is therefore pure
+overhead — the draft path needs investigation before it can be a throughput
+lever.
+
+Current standing (Qwen3.8-27B Q4_K_XL, RADV/Vulkan, Strix Halo):
+pp64 197.1 t/s (0.81x llama), pp512 205-213 (0.58-0.60x), tg8 9.75 (0.80x).
