@@ -1165,7 +1165,6 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let (spv_name, n_kb, extra) = match w.ty {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS256").map(|v| v=="1").unwrap_or(false) => ("tile_ms256.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q4K if msall && gy2 => ("tile_q4kmgy.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if msall && gy2 => ("tile_q6kmgy.spv", 10u32, 0u8),
@@ -1257,11 +1256,10 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
-    let bn128spv = spv_name.ends_with("128.spv");   // ms128 계열: 6필드 push·128토큰 슬래브
+    let bn128spv = spv_name.ends_with("128.spv");
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv")
-        || spv_name == "tile_ms4.spv" || spv_name == "tile_ms256.spv" || bn128spv;
-    let ms256 = spv_name == "tile_ms256.spv";
-    let slab: usize = if ms256 || bn128spv { 128 } else { 64 };
+        || spv_name == "tile_ms4.spv" || bn128spv;
+    let slab: usize = if bn128spv { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
     let pb: u32 = if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
