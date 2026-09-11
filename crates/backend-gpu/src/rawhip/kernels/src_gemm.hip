@@ -1088,21 +1088,42 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
             qa0 = w[qlw]; qa1 = w[qlw+1]; qa2 = w[qlw+2]; qa3 = w[qlw+3];
             ha0 = w[qhw]; ha1 = w[qhw+1]; ha2 = w[qhw+2]; ha3 = w[qhw+3];
         } else {
-            // 2-mod-4 정렬: 8바이트 경계 uint2 3개로 16B 추출 (워드당 2로드 → 3로드)
+            // 비정렬(오프셋 mod 8 == 2 또는 6): 8바이트 경계에서 24B 로드 후
+            // 시프트 추출. 2026-09-12 RCA: 기존 코드는 mod 8 == 2만 가정해
+            // mod 8 == 6 블록(행 내 25%, 바이트 오프셋 b*210≡6)을 4바이트 밀려 읽었다
+            // (스칼라 기준 대조: k=768·4864 등에서 불일치, 나머지는 일치).
             const uint2* pq = (const uint2*)((const char*)w + (((wb + ql_rel) & ~7u)));
-            unsigned qw[5];
-            qw[0] = pq[0].x; qw[1] = pq[0].y; qw[2] = pq[1].x; qw[3] = pq[1].y; qw[4] = pq[2].x;
-            qa0 = (qw[0] >> 16) | (qw[1] << 16);
-            qa1 = (qw[1] >> 16) | (qw[2] << 16);
-            qa2 = (qw[2] >> 16) | (qw[3] << 16);
-            qa3 = (qw[3] >> 16) | (qw[4] << 16);
+            unsigned qw[6];
+            qw[0] = pq[0].x; qw[1] = pq[0].y; qw[2] = pq[1].x;
+            qw[3] = pq[1].y; qw[4] = pq[2].x; qw[5] = pq[2].y;
+            unsigned sh = (unsigned)((wb + ql_rel) & 7u);
+            if (sh == 2) {
+                qa0 = (qw[0] >> 16) | (qw[1] << 16);
+                qa1 = (qw[1] >> 16) | (qw[2] << 16);
+                qa2 = (qw[2] >> 16) | (qw[3] << 16);
+                qa3 = (qw[3] >> 16) | (qw[4] << 16);
+            } else { // sh == 6
+                qa0 = (qw[1] >> 16) | (qw[2] << 16);
+                qa1 = (qw[2] >> 16) | (qw[3] << 16);
+                qa2 = (qw[3] >> 16) | (qw[4] << 16);
+                qa3 = (qw[4] >> 16) | (qw[5] << 16);
+            }
             const uint2* ph = (const uint2*)((const char*)w + (((wb + qh_rel) & ~7u)));
-            unsigned hw[5];
-            hw[0] = ph[0].x; hw[1] = ph[0].y; hw[2] = ph[1].x; hw[3] = ph[1].y; hw[4] = ph[2].x;
-            ha0 = (hw[0] >> 16) | (hw[1] << 16);
-            ha1 = (hw[1] >> 16) | (hw[2] << 16);
-            ha2 = (hw[2] >> 16) | (hw[3] << 16);
-            ha3 = (hw[3] >> 16) | (hw[4] << 16);
+            unsigned hw[6];
+            hw[0] = ph[0].x; hw[1] = ph[0].y; hw[2] = ph[1].x;
+            hw[3] = ph[1].y; hw[4] = ph[2].x; hw[5] = ph[2].y;
+            unsigned shh = (unsigned)((wb + qh_rel) & 7u);
+            if (shh == 2) {
+                ha0 = (hw[0] >> 16) | (hw[1] << 16);
+                ha1 = (hw[1] >> 16) | (hw[2] << 16);
+                ha2 = (hw[2] >> 16) | (hw[3] << 16);
+                ha3 = (hw[3] >> 16) | (hw[4] << 16);
+            } else { // shh == 6
+                ha0 = (hw[1] >> 16) | (hw[2] << 16);
+                ha1 = (hw[2] >> 16) | (hw[3] << 16);
+                ha2 = (hw[3] >> 16) | (hw[4] << 16);
+                ha3 = (hw[4] >> 16) | (hw[5] << 16);
+            }
         }
         int xw = (g << 4) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];

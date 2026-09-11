@@ -2657,3 +2657,34 @@ of the MTP K cache after each prefill call.
 Remaining step (unchanged): settle the first-stage GEMM with a GPU-side scalar reference
 kernel over the same buffers, since every host-side reconstruction - including the same
 method applied to the known-good main path - fails to reproduce the engine.
+
+## MTP ROOT CAUSE FOUND AND FIXED: q6_K misaligned-block read (2026-09-12)
+
+`gemm_q6k`'s misaligned 16-byte extraction assumed the target offset was 2 (mod 8).
+q6_K blocks are 210 bytes, so a row's block b sits at `o*blocks*210 + b*210`, whose
+offset is 6 (mod 8) whenever b = 3 (mod 4) - i.e. **25% of every q6_K row was read
+4 bytes shifted**. The correct case needs a 24-byte (6-word) load and a second shift
+branch; the kernel now handles both.
+
+Localisation instrument (new, reusable): `llm170 q6k-ref <model> <tensor>` runs the
+engine's GEMV and a scalar GPU reference kernel over the same buffers; with
+`LLM170_Q6K_EK=<k|k1,k2,...>` the activation becomes a unit vector so every output is a
+single decoded weight. Sweeping k showed the failure appearing exactly at block
+offsets 3, 19 (and their mod-4 class) and nowhere else - matching the mod-8 analysis.
+
+Why it hit MTP but not the main decode: the MTP head's GEMMs go through `mm_direct`
+(hipRTC `gemm_q6k`), while the main decode path reaches q6_K through kernels that avoid
+this branch, so the main stream was byte-identical before and after the fix (verified
+three ways: seed prompt, 512-token natural prompt, and CPU engine comparison).
+
+Effect on MTP (natural text, pp128/tg64/k=4):
+
+| path | before | after |
+|---|---|---|
+| first-position draft acceptance | ~23% | **100%** (12/12) |
+| chained acceptance (j>=1) | 0/21 | 50% at j=1, then 33%, 50% |
+| tg, GPU chain (`LLM170_SPEC_GPU=1`) | 3.3-8.0 t/s | **19.98 t/s** |
+| tg, CPU chain | 5.2 t/s | 5.2 t/s (CPU MTP layer ~150 ms/draft, unchanged) |
+| spec vs non-spec stream | - | bit-identical, 25/25 tokens |
+
+19.98 t/s vs 11.0 non-spec is the 1.8x that the earlier session recorded (19.2-19.4).

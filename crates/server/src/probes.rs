@@ -13,6 +13,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
         "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
+        "q6k-ref" => {
+            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let tn = args.get(1).cloned().unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
+            llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
+        }
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-mmq-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
