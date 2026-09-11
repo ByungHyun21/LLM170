@@ -2425,3 +2425,31 @@ measured back-to-back):
 Session net: pp512 313.8 (base 2bacd60) -> ~335-338 = **+7-8%**; tg32 10.92 ->
 11.02-11.08 = **+1%**; spec-MTP pp 84.6 -> 325-328 (+285%); spec tg 16.6 -> 19.4;
 serve np4 12.18 -> 21.48 (+76%); VL gate 5/5; judge 16/19 (3 reference-side).
+
+## Dispatch-structure wins: serial GEMM pairs (+1.5% pp, parity reached) - 2026-09-12
+
+Two pair sites cost more in stream synchronization than they hide in overlap:
+
+| site | change | pp512 | pp64 |
+|---|---|---|---|
+| prefill FFN gate/up pair (t>64) | serial (LLM170_PP_PAIRS=1 restores) | +0.2-0.75% | - |
+| decode FFN pair + decode GDN in_proj pair (t=1) | serial (LLM170_DECODE_PAIRS=1 restores) | +0.9% | +2.1% |
+
+The decode-pair effect lands in the *next* prefill, not in the decode itself: the
+warmup 64-token prefill is identical with and without pairs (370.0 vs 370.6 ms)
+while the timed prefill that follows the warmup decode differs (375.2 vs 365.9 ms).
+tg is within noise across three A/Bs (+0.3/-0.25/-0.3%). In-proj pairs at t>64 stay
+(serial measured -0.6% there: the small gate GEMM does overlap the big qkv).
+
+Bit-identical streams in all cases.
+
+Interleaved standing vs llama-bench (3 rounds each, same GGUF, back to back):
+
+| | llama | ours | ratio |
+|---|---|---|---|
+| pp512 | 342.86 / 341.83 (first run cold: 329.45) | 342.17 / 342.53 / 341.77 | **1.000x** |
+| tg32 | 11.50 / 11.50 / 11.50 | 10.99 / 11.01 / 11.00 | 0.957x |
+
+pp512 has reached parity from 313.8 at session start (+9%). tg remains ~4.5% short;
+the remaining decode budget is 79-80 ms of GEMV (17.54 GB, ~220 GB/s aggregate vs
+243 GB/s for the best single kernels) + 4.7 ms attention + ~6 ms of other elementwise.
