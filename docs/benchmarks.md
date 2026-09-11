@@ -2609,3 +2609,22 @@ a scalar reference kernel launched on the GPU (one thread per output row, explic
 indices, no v4/tree/gather tricks) over the same buffers - that isolates the kernel's
 indexing from every Rust-side argument-passing question, which is the only remaining
 class of explanation.
+
+## Methodological correction: host-side reconstruction is not a valid oracle (2026-09-12)
+
+Control experiment: reconstruct the engine's *main-path* logits on the host and compare.
+`output.weight` rows come from `llm170 dequant` (canonical, gguf-py-verified), the hidden
+comes from a dump taken in the same call, the norm is `x/sqrt(mean(x^2)+eps)*output_norm`.
+Result: relative errors 0.18-8.1 and a different argmax - i.e. the reconstruction does
+not reproduce a path that is *known correct* (CPU-bit-exact against the CPU engine and
+matching llama on natural text). Two instrument bugs were found and fixed along the way
+(the dump read `xs` where the batch path writes `xs_t`, and the logits dump came from the
+decode step while the hidden came from the prefill), and the mismatch survived both.
+
+Consequence for the MTP RCA: the earlier "eh_proj output does not match the canonical
+product" observation used the *same* class of host-side reconstruction, so it is **not
+evidence of a kernel bug** - it must be re-tested with a GPU-side reference (a scalar
+kernel over the same buffers) before any kernel change is made. What remains solid:
+the MTP drafts are degenerate (near-constant generic tokens, 0/21 at chained positions),
+`cat = [enorm(emb), hnorm(h)]` matches canonical math at 4.3e-07, the q8 y-vector matches
+`cat` at 3.8e-3, and the uploaded weight bytes equal the file at row 0/2500/5119.
