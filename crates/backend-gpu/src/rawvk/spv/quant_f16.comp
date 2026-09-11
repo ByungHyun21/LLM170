@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// quant_f16 (plans/46) — f32 활성 → f16 그대로 (q8 스케일 산술 없음).
+// 타일 f16-B 경로용: B 정밀도는 q8(~7bit)보다 높고 llama mul_mm와 동일 클래스.
+// 레이아웃: [t][n] f16 (스트라이드 n — push의 xq_w = n).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Src { float xs[]; };
+layout(binding = 1) buffer Dst { float16_t xd[]; };
+layout(push_constant) uniform PC { uint n; uint t; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint total = pc.n * pc.t;
+    if (j >= total) return;
+    xd[j] = float16_t(xs[j]);
+}

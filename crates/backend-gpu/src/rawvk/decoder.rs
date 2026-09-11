@@ -20,6 +20,8 @@ const GEMV8_NLB_SPV: &[u8] = include_bytes!("spv/gemv8_nlb.spv");
 const GEMV8_I3S_SPV: &[u8] = include_bytes!("spv/gemv8_i3s.spv");
 const GDN_ARF_SPV: &[u8] = include_bytes!("spv/gdn_arf.spv");
 const GDN_AR8F_SPV: &[u8] = include_bytes!("spv/gdn_ar8f.spv");
+const TILE_MS4GY_F16B_SPV: &[u8] = include_bytes!("spv/tile_ms4gy_f16b.spv");
+const QUANT_F16_SPV: &[u8] = include_bytes!("spv/quant_f16.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
@@ -197,6 +199,7 @@ pub struct DecoderState {
     b_out: VkBuf, // [t][n_embd] 결과 다운로드
     b_lg: VkBuf,  // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
     b_ams: VkBuf, // argmax 스테이지1 스크래치 [2*256] u32
+    b_xf16: VkBuf, // f16-B 활성 [T_MAX*n] f16
     b_lg_t: VkBuf, // head 로짓 [T_MAX][n_vocab] — verify 전 행 (plans/20)
     b_am: VkBuf,  // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
@@ -733,6 +736,7 @@ impl DecoderState {
         let m_h = ah(n)?;
         let b_lg = ah(n_vocab)?;
         let b_ams = ah(512)?;   // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
+        let b_xf16 = ah(T_MAX * n * 2)?;   // f16-B 활성 (plans/46, 요소수 T_MAX*n)
         let b_lg_t = ah(T_MAX * n_vocab)?;
         // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
         let mut i8w: HashMap<String, I8W> = HashMap::new();
@@ -919,6 +923,7 @@ impl DecoderState {
             b_out,
             b_lg,
             b_ams,
+            b_xf16,
             b_lg_t,
             b_am,
             pipes: HashMap::new(),
@@ -1006,6 +1011,13 @@ impl DecoderState {
 
     fn push_u32s(vals: &[u32]) -> Vec<u8> {
         vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// quant_f16: [t][n] f32 → f16 (f16-B 타일 경로, plans/46).
+    fn quant_f16(&mut self, src: vk::Buffer, dst: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
+        let push = Self::push_u32s(&[n as u32, t as u32]);
+        self.run_pipe("quant_f16", QUANT_F16_SPV, 2, 8,
+            &[src, dst], &push, (n * t).div_ceil(64) as u32, 1, 1)
     }
 
     /// quant: [t][n] f32 → xq (q8 레이아웃).
@@ -1174,6 +1186,27 @@ impl DecoderState {
                     let tb = 8usize;
                     return self.run_pipe_b("gemv8_q5n", GEMV8_Q5N_SPV, 10, 24, &binds2, &push2,
                         1, no2.div_ceil(2) as u32, t.div_ceil(tb) as u32, true);
+                }
+            }
+        }
+        // plans/46 f16-B: q5 프리필을 f16 활성 직독 타일로 (quant f16화 + load_b 직독).
+        if t >= 16 && std::env::var("LLM170_VK_F16B").map(|v| v == "1").unwrap_or(false) {
+            if let Some((wbufs2, ty2, ni2, _no2)) = self.w.get(wkey).cloned() {
+                if ty2 == 13 {
+                    self.quant_f16(qsrc, self.b_xf16.buf, nq, t)?;
+                    let mut binds2: Vec<vk::Buffer> = wbufs2.iter().map(|b| b.buf).collect();
+                    while binds2.len() < 8 {
+                        binds2.push(self.dummy.buf);
+                    }
+                    binds2.push(self.dummy.buf);   // binding 8: q8 뷰(사용안함)
+                    binds2.push(out);                 // binding 9
+                    binds2.push(self.b_xf16.buf);    // binding 10: f16 뷰
+                    // push: [n_in, n_out, xq_w=n_in(f16 스트라이드), t, tok_base]
+                    let nrows = (_no2 as u32 + 63) / 64;
+                    let gy = (t as u32).div_ceil(64);
+                    let push2 = Self::push_u32s(&[ni2 as u32, _no2 as u32, ni2 as u32, 64u32, 0u32]);
+                    return self.run_pipe_b("tile_ms4gy_f16b", TILE_MS4GY_F16B_SPV, 11, 20,
+                        &binds2, &push2, gy, nrows, 1, true);
                 }
             }
         }
