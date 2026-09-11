@@ -321,17 +321,21 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         Ok(lg)
     }
 
-    /// raw_prefill + 전 토큰 hidden 회수 (MTP KV 적립용).
+    /// raw_prefill + 마지막 행 hidden (MTP carry).
     fn raw_prefill_h(
         &self,
         seq: usize,
         pos0: usize,
         emb: &[f32],
-        h_all: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
-        ds.verify_rows(seq, pos0, emb, &mut Vec::new(), h_all)
+        let mut h_all: Vec<f32> = Vec::new();
+        let lg = ds.verify_rows(seq, pos0, emb, &mut Vec::new(), &mut h_all)?;
+        let n = ds.n_embd;
+        let t = emb.len() / n;
+        let h_last = if h_all.len() >= t * n { h_all[(t - 1) * n..].to_vec() } else { vec![0f32; n] };
+        Ok((lg, h_last))
     }
 
     /// 배치 검증 (MTP spec) — per-token step = 디코드 산술과 동일 (비트계약).

@@ -2763,3 +2763,13 @@ Measured (natural text, pp512/tg32/k=4, 2 reps): NOMTP 1474 ms (347.3 t/s) vs sp
 1506 ms (340.5 t/s) - the MTP prefill now costs 31 ms instead of 64 ms, so spec-mode pp
 is 0.99x of llama (343.7 t/s) instead of 0.97x. tg is unchanged at 16.0 t/s (1.48x
 non-spec 10.83) with either prefill variant.
+
+## MTP prefill: head and FFN skipped on non-final chunks (2026-09-12, second pass)
+
+Only the prompt-ending chunk needs a draft token, so every earlier chunk now appends KV
+only (`with_head=false` -> attention/wo/FFN/head all skipped) and the caller no longer
+downloads the whole chunk hidden - `raw_prefill_h` returns just the last row (1 x n
+instead of t x n per chunk). Verified token-for-token: a 2048-token prompt (4 chunks)
+gives identical output with spec and non-spec, and pp512/pp2048 gaps vs `LLM170_NOMTP=1`
+are 31 ms and 67 ms respectively (2.1% and 1.1% - the remaining cost is the draft
+layer's k/v projections and pair projection, which the KV genuinely needs).
