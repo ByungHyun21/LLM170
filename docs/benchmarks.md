@@ -1755,3 +1755,42 @@ the workgroup, LDS-resident weights).
   path (verified: 84 220 201 198 201 198 201 for both).
 - `LLM170_VKD_BATCH=1` (batched verify) is token-identical to the per-token verify (same
   gemv8 kernels, t < 16).
+
+## Inter-dispatch GPU gaps are the dominant cost (session 2026-09-11, revised)
+
+Earlier in this session a host-side bottleneck was suspected; the instrumentation was
+misplaced (the timer for the "layer loop" was printed after `end_batch_wait()`), so that
+number included the GPU wait. Corrected picture, measured on pp8 (gemv8 path, t=8):
+
+| Quantity | Value |
+|---|---|
+| Wall per forward | ~494 ms |
+| Sum of stamped kernel durations (VK_TS) | ~151 ms |
+| Dispatches per forward | ~1050 |
+| => per-dispatch gap | ~0.33 ms |
+| Wall when the layer loop is cut to 1 layer (LLM170_VK_LAYERS=1) | ~20 ms total |
+| Per-layer instrumented body (timer inside the loop) | 0.02-0.10 ms |
+| `run()` host time (recording, 2210 calls) | 1.4 ms total |
+| Descriptor set alloc+update | 0.2 ms total |
+
+So the host recording path is fast (~1.4 ms for 2210 dispatches) and each layer's own
+instructions account for <0.1 ms, yet the GPU takes ~7.5 ms per layer in elapsed time
+against ~2.4 ms of measured kernel duration. The missing time is between dispatches:
+barriers/state switches/cache flushes, ~0.3 ms each, ~1050 times per forward.
+
+Relevant code: `context.rs::run()` emits, between every dispatch in a batch, a global
+`vk::MemoryBarrier` (SHADER_WRITE -> SHADER_READ) with `COMPUTE_SHADER -> COMPUTE_SHADER`
+and no BY_REGION flag - i.e. a full L2 flush per dispatch on RADV.
+
+How the batched path mostly hides this: pp64 (tile kernels) runs ~190 dispatches per
+forward instead of ~1050 (one tile dispatch covers many tokens), so 64 tokens cost 302 ms
+(~4.7 ms/token) while the gemv8 path (t<16) pays ~1050 dispatches for 8 tokens
+(~62 ms/token). Same weights traffic in both cases; only the dispatch count differs.
+
+Next lever (not attempted): narrow the per-dispatch barrier. Options, in order of effort:
+1. `vk::DependencyFlags::BY_REGION` on the existing barrier (one word).
+2. `VkMemoryBarrier2`/`vkCmdPipelineBarrier2` with explicit buffer ranges instead of a
+   global barrier, so RADV need not flush the whole cache.
+3. Reduce the dispatch count on the small-t path: process >= 16 tokens per dispatch (the
+   tile path) or fuse same-input GEMVs (qkv/gate/up) into one dispatch with an internal
+   row-range switch.
