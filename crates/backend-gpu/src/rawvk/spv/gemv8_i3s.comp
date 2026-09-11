@@ -1,0 +1,100 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_i3s (plans/46) — IQ3_S 전용 gemv (마지막 ty21 폴백 제거). gemv8_q8b
+// 골격: 64스레드, NUM_ROWS=2, K_PER_ITER=8. 스레드의 8원소 = CPU deq_iq3_s의
+// l-그룹 1개(g1 4원소 + g2 4원소)와 정확히 일치 — 산식은 quant.rs 미러.
+// 블록 110B = d(2) qs(64) qh(8) signs(32) scales(4). grid4 = ktab2_packed
+// (IQ3S_GRID u32 = i8×4, 기존 xsb와 동일 바인딩 10).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0u { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer KT { uint kt[]; };   // IQ3S_GRID 256 u32
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+vec4 grid4(uint idx) {
+    const uint w = kt[idx];
+    return vec4(
+        float(int((w) & 0xFFu) << 24 >> 24),
+        float(int((w >> 8) & 0xFFu) << 24 >> 24),
+        float(int((w >> 16) & 0xFFu) << 24 >> 24),
+        float(int((w >> 24) & 0xFFu) << 24 >> 24));
+}
+
+// 바이트 조립 도우미 (워드 경계 무시)
+uint rdu32(uint byteidx) {
+    const uint w0 = w0u[byteidx >> 2];
+    const uint w1 = w0u[(byteidx >> 2) + 1u];
+    const uint sh = (byteidx & 3u) * 8u;
+    return (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
+}
+uint rdbyte(uint byteidx) {
+    return (w0u[byteidx >> 2] >> ((byteidx & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint ybase = tok * pc.n_in;
+    float acc0 = 0.0, acc1 = 0.0;
+    const uint n_in = pc.n_in;
+    const uint KPIT = 64u * 8u;
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        const vec4 bv0 = vec4(xa[ybase + col0], xa[ybase + col0 + 1u], xa[ybase + col0 + 2u], xa[ybase + col0 + 3u]);
+        const vec4 bv1 = vec4(xa[ybase + col0 + 4u], xa[ybase + col0 + 5u], xa[ybase + col0 + 6u], xa[ybase + col0 + 7u]);
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;
+            const uint blk = col / 256u;
+            const uint bbase = blk * 110u;
+            const uint o = col & 255u;                  // 블록 내 원소 (8 정렬)
+            const uint pair = o / 64u;                  // ib32_pair 0..3
+            const uint gHalf = (o / 32u) & 1u;           // db1/db2 반
+            const uint l = (o / 8u) & 3u;               // l-그룹
+            // d f16 @ bbase
+            const float d = unpackHalf2x16(uint(rdu32(bbase) & 0xFFFFu)).x;
+            // db = d·(1+2·니블) — scales[pair]의 gHalf 반 니블 @ bbase+106
+            const uint scb = rdbyte(bbase + 106u + pair);
+            const uint nib = (gHalf == 0u) ? (scb & 0xFu) : (scb >> 4);
+            const float db = d * float(1u + 2u * nib);
+            // g1/g2 인덱스 — qs 바이트 + qh 비트
+            const uint qsb = bbase + 2u + pair * 16u + gHalf * 8u + 2u * l;
+            const uint qhb = bbase + 66u + pair * 2u + gHalf;
+            const uint qs1 = rdbyte(qsb);
+            const uint qs2 = rdbyte(qsb + 1u);
+            const uint qh = rdbyte(qhb);
+            const vec4 g1 = grid4(qs1 | ((qh << (8u - 2u * l)) & 256u));
+            const vec4 g2 = grid4(qs2 | ((qh << (7u - 2u * l)) & 256u));
+            // 부호 — signs[pair*8 + gHalf*4 + l] 비트 (j=0..3 / 4..7)
+            const uint sg = rdbyte(bbase + 74u + pair * 8u + gHalf * 4u + l);
+            const vec4 s1 = vec4(
+                (sg & 1u) != 0u ? -1.0 : 1.0, (sg & 2u) != 0u ? -1.0 : 1.0,
+                (sg & 4u) != 0u ? -1.0 : 1.0, (sg & 8u) != 0u ? -1.0 : 1.0);
+            const vec4 s2 = vec4(
+                (sg & 16u) != 0u ? -1.0 : 1.0, (sg & 32u) != 0u ? -1.0 : 1.0,
+                (sg & 64u) != 0u ? -1.0 : 1.0, (sg & 128u) != 0u ? -1.0 : 1.0);
+            // CPU 산식 순서: y = db · g · ±1 → 내적 bv
+            const float r = db * (dot(bv0, g1 * s1) + dot(bv1, g2 * s2));
+            if (n == 0u) acc0 += r; else acc1 += r;
+        }
+    }
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}

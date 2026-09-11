@@ -17,6 +17,7 @@ const GEMV8_Q8_SPV: &[u8] = include_bytes!("spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
 const GEMV8_Q5N_SPV: &[u8] = include_bytes!("spv/gemv8_q5n.spv");
 const GEMV8_NLB_SPV: &[u8] = include_bytes!("spv/gemv8_nlb.spv");
+const GEMV8_I3S_SPV: &[u8] = include_bytes!("spv/gemv8_i3s.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
@@ -1022,8 +1023,8 @@ impl DecoderState {
             eprintln!("[dbg_g8] t={t} {wkey}");
         }
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
-        if ty != 13 && ty != 12 && ty != 23 && ty != 11 && ty != 14 && ty != 8 && ty != 20 {
-            return Err("gemv8: q3_K/q4_K/q5_K/q6_K/q8_0/iq4_xs/iq4_nl만".into());
+        if ty != 13 && ty != 12 && ty != 23 && ty != 11 && ty != 14 && ty != 8 && ty != 20 && ty != 21 {
+            return Err("gemv8: q3_K/q4_K/q5_K/q6_K/q8_0/iq4_xs/iq4_nl/iq3_s만".into());
         }
 
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
@@ -1034,11 +1035,19 @@ impl DecoderState {
         binds.push(out);
         if ty == 23 {
             binds.push(self.ktab.buf);
+        } else if ty == 21 {
+            binds.push(self.grid3s.buf);   // IQ3S_GRID 512워드 (iq4_nl ktab과 별개)
         }
         // nlb (plans/46) — IQ4_NL 전용 (구 폴백 대체, t=1 스테디 ~2.8ms/토큰 절감).
         if ty == 20 && std::env::var("LLM170_VK_NLB").map(|v| v == "0").unwrap_or(true) {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b("gemv8_nlb", GEMV8_NLB_SPV, 10, 24, &binds, &push,
+                1, no.div_ceil(2) as u32, t as u32, bar);
+        }
+        // i3s (plans/46) — IQ3_S 전용 (마지막 폴백 제거, quant.rs deq_iq3_s 미러).
+        if ty == 21 && std::env::var("LLM170_VK_I3S").map(|v| v == "0").unwrap_or(true) {
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
+            return self.run_pipe_b("gemv8_i3s", GEMV8_I3S_SPV, 11, 24, &binds, &push,
                 1, no.div_ceil(2) as u32, t as u32, bar);
         }
         // xsb (plans/40) — llama generic dmmv 구조 × 검증 xs 디코드: 125→182GB/s.
@@ -1557,7 +1566,7 @@ impl DecoderState {
         // 사전 판정 (self 대여 분리 — 클로저로 두면 mut 대여와 충돌)
         let elig: Vec<bool> = jobs
             .iter()
-            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(8 | 11 | 12 | 13 | 14 | 20 | 23)))
+            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(8 | 11 | 12 | 13 | 14 | 20 | 21 | 23)))
             .collect();
         let i8s: Vec<bool> = jobs.iter().map(|(k, _, _)| i8_on && self.i8w.contains_key(k)).collect();
         // xq 필요 조건: gemv8/타일 외 폴백 잡이 하나라도 있을 때
