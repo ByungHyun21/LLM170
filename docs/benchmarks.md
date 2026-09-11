@@ -2836,3 +2836,14 @@ and loses slightly when the KV is small:
 | 6337 | - | **9.69** | llama 10.69 -> 0.91x (was ~0.85x) |
 
 `LLM170_NO_GQA=1` restores the old path.
+
+## Small-kernel follow-up: instruction-level slimming is neutral (2026-09-12)
+
+`rmsq`'s quantisation phase rewritten with float4 loads and a tree `amax` (bit-exact:
+`fmax` is associative, the quantisation is element-wise, and the reduction path is
+untouched). Verified bit-identical, A/B three interleaved pairs: tg 11.10 vs 11.11
+(neutral), pp 177.2 vs 176.0 (+0.7%, noise). Kept because it is strictly less work, but
+it confirms the conclusion from the multi-block experiment: these kernels' 17-30 us are
+not spent in their instruction stream or in their grid shape. The only structural lever
+that has moved them is *more* WGs when the workload allows (which is why the GQA
+attention helps at long context and hurts below 768).

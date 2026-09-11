@@ -158,21 +158,35 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     if (b < nblk) {
         {
             int base = b << 5;
-            float xv[32];
-            #pragma unroll
-            for (int i = 0; i < 32; i++) xv[i] = x[base + i] * inv * w[base + i];
+            // float4 로드 + 트리 amax — fmax는 순서 무관(결합·교환)이고 양자화는
+            // 원소별이라 산술 불변. 종전 32단 의존 체인과 96개 스칼라 로드를 제거.
+            float4 xv4[8];
+            {
+                const float4* x4 = (const float4*)(x + base);
+                const float4* w4 = (const float4*)(w + base);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float4 a = x4[i], c = w4[i];
+                    xv4[i] = make_float4(a.x * inv * c.x, a.y * inv * c.y, a.z * inv * c.z, a.w * inv * c.w);
+                }
+            }
             float amax = 0.0f;
             #pragma unroll
-            for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xv[i]));
+            for (int i = 0; i < 8; i++) {
+                float4 v = xv4[i];
+                amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
             float d = amax / 127.0f;
             float id = d != 0.0f ? 1.0f / d : 0.0f;
             int qs0 = 0, qs1 = 0;
             #pragma unroll
             for (int wi = 0; wi < 8; wi++) {
                 unsigned word = 0u;
+                float4 vv4 = xv4[wi];
+                float vv[4] = { vv4.x, vv4.y, vv4.z, vv4.w };
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    float v = xv[wi * 4 + k] * id;
+                    float v = vv[k] * id;
                     float r = v >= 0.0f ? (float)(int)(v + 0.5f)
                                         : -((float)(int)(0.5f - v));
                     float c = r > 127.0f ? 127.0f : (r < -127.0f ? -127.0f : r);
