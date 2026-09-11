@@ -379,3 +379,136 @@ extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, fl
     out[t * n_head * hd + h * hd + tid] = a * (1.0f / ssum) * g;
 }
 
+
+// GQA 공유 디코드 flash (t=1): WG가 kv-head의 세그먼트를 담당하고 그 kv-head의
+// q-head 전부(gq = n_head/n_kv, 보통 6)를 한 번의 K/V 로드로 처리 — K/V 트래픽 1/gq.
+// 수치: qsa_flash_split4q4의 4행 구조를 그대로 헤드 축으로 옮긴 것(4키 배치,
+// 워프트리+LDS 2단 감축, softmax 갱신 순서 동일) → 헤드별 결과가 비트동일.
+extern "C" __global__ void qsa_flash_gqa(const float* q, const float* ck, const float* cv,
+                                         const unsigned* mask, float* part,
+                                         int n_past, int n_head, int n_kv,
+                                         int hd, int t_len, int sstride, int pos0, int seg) {
+    int kvh = blockIdx.y;
+    int sg = blockIdx.z;
+    if (kvh >= n_kv || t_len != 1 || hd > 256) return;
+    int gq = n_head / n_kv;
+    if (gq < 1 || gq > 8) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool active = tid < hd;
+    __shared__ float qf[8][256];
+    __shared__ float rs[8][4][8];
+    __shared__ float ds[8][4];
+    int h0 = kvh * gq;
+    if (active) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++)
+            if (r < gq) qf[r][tid] = q[(h0 + r) * 2 * hd + tid];
+    }
+    __syncthreads();
+    float m[8], s[8], acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) { m[r] = -3.4028235e38f; s[r] = 0.0f; acc[r] = 0.0f; }
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int mrow0 = pos0 * sstride;
+    for (int pb = p0; pb < p1; pb += 4) {
+        int np = min(4, p1 - pb);
+        float x[8][4] = {};
+        bool mkj[4];
+        bool any_mk = false;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            mkj[j] = (j < np) && (mask[mrow0 + pb + j] != 0u);  // t=1: 마스크는 키 공통
+            if (mkj[j]) any_mk = true;
+        }
+        if (any_mk) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (mkj[j]) {
+                    int kb = (pb + j) * n_kv * hd + kvh * hd;   // gq 헤드가 공유
+                    float kv = active ? ck[kb + tid] : 0.0f;
+                    if (active) {
+                        #pragma unroll
+                        for (int r = 0; r < 8; r++)
+                            if (r < gq) x[r][j] = qf[r][tid] * kv;
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                if (r < gq) {
+                    x[r][0] += __shfl_down_sync(0xffffffffffffffffull, x[r][0], off);
+                    x[r][1] += __shfl_down_sync(0xffffffffffffffffull, x[r][1], off);
+                    x[r][2] += __shfl_down_sync(0xffffffffffffffffull, x[r][2], off);
+                    x[r][3] += __shfl_down_sync(0xffffffffffffffffull, x[r][3], off);
+                }
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < 8; r++)
+                if (r < gq) { rs[r][0][wid] = x[r][0]; rs[r][1][wid] = x[r][1]; rs[r][2][wid] = x[r][2]; rs[r][3][wid] = x[r][3]; }
+        }
+        __syncthreads();
+        if (wid == 0) {
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                if (r < gq) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        float y = lane < 8 ? rs[r][j][lane] : 0.0f;
+                        #pragma unroll
+                        for (int off = 4; off > 0; off >>= 1)
+                            y += __shfl_down_sync(0xffffffffffffffffull, y, off);
+                        if (lane == 0) ds[r][j] = y;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < gq) {
+                float gm = m[r];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) if (j < np) gm = fmaxf(gm, ds[r][j]);
+                float e_m = __expf(m[r] - gm);
+                s[r] *= e_m;
+                acc[r] *= e_m;
+                m[r] = gm;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j < np) {
+                int kb = (pb + j) * n_kv * hd + kvh * hd;
+                float vv = active ? cv[kb + tid] : 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    if (r < gq) {
+                        float e_d = __expf(ds[r][j] - m[r]);
+                        s[r] += e_d;
+                        acc[r] += e_d * vv;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    int nseg = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        if (r < gq) {
+            // t=1이므로 행 인덱스 0, 헤드는 (h0 + r) — split4q4의 (t0+r)*n_head+h 와 동일
+            float* pp2 = part + ((size_t)(h0 + r) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r];
+            if (tid == 0) { pp2[hd] = m[r]; pp2[hd + 1] = s[r]; }
+        }
+    }
+}
