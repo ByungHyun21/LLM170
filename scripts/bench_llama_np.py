@@ -21,10 +21,19 @@ P.add_argument("--prompt-repeat", type=int, default=24, help="5토큰 시드를 
 P.add_argument("--api", default="/completion")
 P.add_argument("--sse", action="store_true", help="SSE 서버(llm170 serve)")
 P.add_argument("--text", default=None, help="프롬프트를 텍스트로 (미지정 시 시드 토큰 반복)")
+P.add_argument("--tokens-file", default=None, help="자연어 프롬프트 토큰 id 목록(쉼표 구분) 파일")
+P.add_argument("--max-tokens", type=int, default=0, help="프롬프트 토큰 상한(0=전체)")
 A = P.parse_args()
 
 SEED = [760, 6511, 314, 9338, 369]
-PROMPT = A.text if A.text else SEED * A.prompt_repeat
+if A.tokens_file:
+    PROMPT = [int(x) for x in open(A.tokens_file).read().strip().split(",")]
+    if A.max_tokens:
+        PROMPT = PROMPT[: A.max_tokens]
+elif A.text:
+    PROMPT = A.text
+else:
+    PROMPT = SEED * A.prompt_repeat
 
 
 def one(idx, out):
