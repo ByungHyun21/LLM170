@@ -2358,3 +2358,30 @@ per lane per token, two `warp_reduce_sum` per token, and the same fused
 sequentially inside the kernel (grid = H x n_seqs x S_v/4, `__launch_bounds__`
 128 threads). Our `gdn_ar_w_swap` matches that shape, so the 99 ms/pass AR scan is
 at parity and is not the prefill gap.
+
+## Thermal-matched comparison + small-n GEMM falsification (2026-09-12)
+
+Both engines measured back-to-back in the same thermal state (llama ROCm build
+8b4b3558f, then ours, two rounds):
+
+| round | llama pp512 | llama tg32 | ours pp512 | ours tg32 |
+|---|---|---|---|---|
+| 1 | 353.77 | 11.53 | 340.42 / 333.38 | 11.08 / 11.01 |
+| 2 | 344.24 | 11.54 | 338.06 / 334.02 | 11.07 / 10.99 |
+
+Medians: llama 349.0 / 11.535 vs ours 336.5 / 11.03 -> **0.963x pp, 0.956x tg**.
+(llama-bench's own run-to-run spread on this machine is +/-5 t/s at pp512, which
+is why the standing must always be quoted from a same-session alternation.)
+
+Falsified: a dedicated small-n_out q8_0 GEMM (`gemm_q8_smalln`, 8 rows x 32
+tokens per WG, weights staged in LDS). Motivation: the beta/alpha projections
+(5120x48 q8_0, 96 launches/pass) cost a t-independent ~0.2 ms each in the tile
+path (harness: 0.203 ms at t=128 and 0.202 ms at t=512), i.e. 29 ms/pass = 1.9%.
+The dedicated kernel measured **0.967x** (pp 341.5 -> 329.7) and was reverted:
+46 KB of LDS per workgroup caps occupancy at 1 WG/CU, so the staged K-loop wins
+nothing over the tile's structure.
+
+Also closed: the shipped `co/mmq.co` (99,872 B) cannot be reproduced from either
+`plans/i8_arc/mmq_native_q45.cu` (93,232 B) or `mmq_native_rdna35.cu` (55,608 B)
+with the current headers, so neither its exact source nor header revision is
+recoverable from the tree. The MMQ code objects stay immutable.
