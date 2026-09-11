@@ -152,12 +152,21 @@ extern "C" __global__ void norm_gated_silu_f32(const float* o, const float* z, c
     int chunk = (d + 31) >> 5;
     float part = 0.0f;
     {
-        int lo = u * chunk;
+        bool vec = (d >= 128) && ((d & 127) == 0);
+        int lo = vec ? (u << 2) : (u * chunk);
         if (lo < d) {
-            int hi = min(lo + chunk, d);
-            for (int i = lo; i < hi; i++) {
-                float dv = o[xb + i];
-                part += dv * dv;
+            if (vec) {
+                float4 v = *reinterpret_cast<const float4*>(o + xb + lo);
+                float a0 = v.x; part += a0 * a0;
+                float a1 = v.y; part += a1 * a1;
+                float a2 = v.z; part += a2 * a2;
+                float a3 = v.w; part += a3 * a3;
+            } else {
+                int hi = min(lo + chunk, d);
+                for (int i = lo; i < hi; i++) {
+                    float dv = o[xb + i];
+                    part += dv * dv;
+                }
             }
         }
     }
@@ -169,6 +178,20 @@ extern "C" __global__ void norm_gated_silu_f32(const float* o, const float* z, c
     }
     float scale32 = (float)sqrt(sum / (double)d + (double)eps);
     float inv = 1.0f / scale32;
+    if ((d >= 128) && ((d & 127) == 0)) {
+        // 원소별 독립 — 레인당 연속 4원소 float4 경로 (기존 스트라이드 매핑과 동일 값)
+        int i = u << 2;
+        float4 ov = *reinterpret_cast<const float4*>(o + xb + i);
+        float4 zv = *reinterpret_cast<const float4*>(z + xb + i);
+        float4 wv = *reinterpret_cast<const float4*>(w + wb + i);
+        float4 r;
+        float n0 = ov.x * inv * wv.x, z0 = zv.x; r.x = n0 * (z0 / (1.0f + __expf(-z0)));
+        float n1 = ov.y * inv * wv.y, z1 = zv.y; r.y = n1 * (z1 / (1.0f + __expf(-z1)));
+        float n2 = ov.z * inv * wv.z, z2 = zv.z; r.z = n2 * (z2 / (1.0f + __expf(-z2)));
+        float n3 = ov.w * inv * wv.w, z3 = zv.w; r.w = n3 * (z3 / (1.0f + __expf(-z3)));
+        *reinterpret_cast<float4*>(out + xb + i) = r;
+        return;
+    }
     for (int i = u; i < d; i += 32) {
         float nrm = o[xb + i] * inv * w[wb + i];
         float zz = z[xb + i];
