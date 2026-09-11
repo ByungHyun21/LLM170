@@ -1231,7 +1231,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     // xq 양자화 (GPU quant — 비트 검증 완료 경로)
     let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
     let msf16b = std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false);
-    let mut xqb = ctx.alloc_host((t * xq_w * 4).max(t * n_in * 2))?;
+    let mut xqb = if std::env::var_os("LLM170_TILE_BDEV").is_some() {
+        ctx.alloc((t * xq_w * 4).max(t * n_in * 2))?
+    } else {
+        ctx.alloc_host((t * xq_w * 4).max(t * n_in * 2))?
+    };
     if msf16b {
         let mut hb: Vec<u16> = Vec::with_capacity(t * n_in);
         for row in &xs { for &v in row { hb.push(hf(v)); } }
@@ -1351,6 +1355,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, cw_log2, cw_mask]);
         ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
     }
+    ctx.flush2()?;   // plans/46: 판독 전 GPU 완료 — 종전 dt는 비동기 제출만 잼(실측 허수)
     let outs: Vec<f32> = unsafe {
         let mut v = vec![0f32; t * n_out];
         std::ptr::copy_nonoverlapping(ob.ptr as *const f32, v.as_mut_ptr(), t * n_out);
@@ -1389,8 +1394,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         ctx.end_batch_wait()?;
         let per = t1.elapsed().as_secs_f64() / n as f64;
         return Ok(format!(
-            "tile-bench({tname}/{spv_name}) t={t}: {per:.4}ms/회 × {n} → {:.1}GB/s",
-            w.data.len() as f64 / per / 1e9
+            "tile-bench({tname}/{spv_name}) t={t}: {:.4}ms/회 × {n} → {:.1}GB/s",
+            per * 1e3, w.data.len() as f64 / per / 1e9
         ));
     }
     // CPU 기준: 디양자화 · f64 내적 — 행 0..64 + WG 경계/꼬리 샘플 (plans/40:
