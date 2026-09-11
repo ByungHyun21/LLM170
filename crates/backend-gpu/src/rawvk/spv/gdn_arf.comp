@@ -1,0 +1,74 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// gdn_arf (plans/46) — GDN 체인 융합: split3+l2+beta_g를 gdn_ar에 인라인.
+// 디스패치 4→1 (체인 노출 지연 ~1ms/토큰 절감). 수치: 기존 4커널과 비트동일
+// (l2: 레인 4원소 j-상승 제곱합→subgroupAdd→1/max(sqrt,eps); beta/g: gdn_beta_g 동일식).
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };
+layout(binding = 1) readonly buffer GC { float gc[]; };
+layout(binding = 2) readonly buffer Bb { float gbv[]; };
+layout(binding = 3) readonly buffer Aa { float gav[]; };
+layout(binding = 4) readonly buffer Dt { float dtb[]; };
+layout(binding = 5) readonly buffer Sa { float sa[]; };
+layout(binding = 6) buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t; float eps;
+} pc;
+void main() {
+    int pair = int(gl_WorkGroupID.x);
+    int u = int(gl_WorkGroupID.y);
+    int lane = int(gl_SubgroupInvocationID);
+    int base_s = pair * pc.d * pc.d;
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int tot = 2 * pc.ks + pc.vs;
+    float s0 = s[base_s + u * pc.d + lane * 4 + 0];
+    float s1 = s[base_s + u * pc.d + lane * 4 + 1];
+    float s2 = s[base_s + u * pc.d + lane * 4 + 2];
+    float s3 = s[base_s + u * pc.d + lane * 4 + 3];
+    for (int ti = 0; ti < pc.t; ti++) {
+        float qn[4], kn[4];
+        {
+            // 인라인 l2 (l2_rows2와 동일 순서) — kh 그룹 q/k 슬라이스
+            int qb = ti * tot + kh * pc.d + lane * 4;
+            float partq = 0.0, partk = 0.0;
+            [[unroll]] for (int j = 0; j < 4; j++) {
+                float dvq = gc[qb + j];
+                float dvk = gc[pc.ks + qb + j];
+                qn[j] = dvq; kn[j] = dvk;
+                partq += dvq * dvq;
+                partk += dvk * dvk;
+            }
+            float invq = 1.0 / max(sqrt(subgroupAdd(partq)), pc.eps);
+            float invk = 1.0 / max(sqrt(subgroupAdd(partk)), pc.eps);
+            [[unroll]] for (int j = 0; j < 4; j++) { qn[j] *= invq; kn[j] *= invk; }
+        }
+        float beta, g;
+        {
+            int bh = ti * pc.hv + pair;
+            beta = 1.0 / (1.0 + exp(-gbv[bh]));
+            float x = min(gav[bh] + dtb[pair], 80.0);
+            float sp = log2(1.0 + exp2(x * 1.4426950408889634)) * 0.6931471805599453;
+            g = exp(sp * sa[pair]);
+        }
+        int v0 = ti * pc.vs + h * pc.d;
+        s0 *= g; s1 *= g; s2 *= g; s3 *= g;
+        float part = s0 * kn[0] + s1 * kn[1] + s2 * kn[2] + s3 * kn[3];
+        float sk = subgroupAdd(part);
+        float delta = (gc[ti * tot + 2 * pc.ks + h * pc.d + u] - sk) * beta;
+        s0 += kn[0] * delta;
+        s1 += kn[1] * delta;
+        s2 += kn[2] * delta;
+        s3 += kn[3] * delta;
+        float op = s0 * qn[0] + s1 * qn[1] + s2 * qn[2] + s3 * qn[3];
+        float otot = subgroupAdd(op);
+        if (lane == 0) o[v0 + u] = otot * pc.scale;
+    }
+    s[base_s + u * pc.d + lane * 4 + 0] = s0;
+    s[base_s + u * pc.d + lane * 4 + 1] = s1;
+    s[base_s + u * pc.d + lane * 4 + 2] = s2;
+    s[base_s + u * pc.d + lane * 4 + 3] = s3;
+}
