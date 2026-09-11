@@ -2794,3 +2794,18 @@ non-GEMM work than llama - the decode attention's ~100-160 us/layer fixed cost p
 contract-pinned small kernels at 17-30 us each for 2-5 us of work) and MTP-mode pp
 (0.98x; the draft layer's k/v and pair projections, ~17 ms per 512-token chunk, which the
 KV genuinely needs).
+
+## Post-optimization gate re-run (2026-09-12)
+
+`scripts/verify.py` judge after the MTP-prefill work: **16/19 PASS**, identical to the
+post-q6_K-fix run - all 10 spec cases pass (including `spec_long_np4_*`, which exercise
+the multi-chunk prefill with head/FFN skipped on non-final chunks), plus 7 exact and 4
+near-tie non-spec cases. The 3 failures remain the non-spec long-context near-ties
+(`long_np2_seq1`, `long_np4_seq1` at gen[1] ours=13/top-3 gap 5.99; `long_np4_seq2` at
+gen[0] ours=248046 vs 561).
+
+Small-kernel parallelization falsified: making `rmsq` multi-block (it ran all 160 threads
+of a 5120-wide RMS+quant on one CU) is neutral for tg (11.11 vs 11.11 over three
+interleaved pairs) and slightly negative for pp (175.6 vs 177.6 t/s). These kernels are
+latency-bound on their per-thread chains, not throughput-bound - the same reason
+`l2_rows2_scale`/`gatedq`/`gdn_ar_w` cost 17-30 us for 2-5 us of work. Reverted.
