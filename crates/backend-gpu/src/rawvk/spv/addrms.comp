@@ -1,11 +1,13 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
 
-// addrms (plans/36 G2) — 잔차 덧셈 + rms_norm 융합 (llama multi_add_rms 대응).
-// y[i] += x[i]·1.0 과 rms(y)를 한 패스: axpy가 쓰던 값과 동일 비트를 계산해
-// 세그먼트 축소하므로 수치는 axpy+rms 2커널 경로와 완전히 동일.
-// 축소 구조: 256세그먼트 f32 연속 누산 + f64 순차 결합 (plans/40 256스레드 —
-// CPU ops::sq_sum 미러). 런치 절반이 목적 (GPU 시간 아님).
+// addrms (plans/36 G2 → 46 개정) — 잔차 덧셈 + rms_norm 융합.
+// 문제: grid=(t,1,1) — t=1에서 WG 1개×256스레드가 5120행을 처리하며
+// 레인별 20원소 연속 청크가 레인 간 80B 스트라이드 → 산재 로드/스토어로
+// 직렬화 (t=1 실측 0.05ms/콜 ×128콜 = 6.3ms/토큰 = 7.2%).
+// 개정: 협력 결합 로드로 shared에 행 전체 스테이징(40KB) 후 동일 세그먼트
+// 산식(비트동일: 세그먼트 256×20원소 f32 연속 누산 + f64 순차 결합),
+// 스토어도 결합. n≤5120 가정 (n_embd 고정).
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer Ybuf { float y[]; };   // 잔류 스트림 (갱신)
 layout(binding = 1) readonly buffer Xbuf { float x[]; }; // 증분 (gout/fdown)
@@ -15,6 +17,9 @@ layout(push_constant) uniform PC {
     uint n; uint t; float eps;
 } pc;
 
+#define NMAX 5120
+shared float ys[NMAX];
+shared float xs[NMAX];
 shared double seg[256];
 shared float invs;
 
@@ -23,20 +28,30 @@ void main() {
     uint u = gl_LocalInvocationID.x;
     uint n = pc.n;
     if (row >= pc.t) return;
-    int chunk = int((n + 255u) >> 8u);   // plans/40: 256스레드 (구 32 — t WGs뿐이라 과소병렬)
-    int lo = int(u) * chunk;
     int xb = int(row * n);
+    // 1) 결합 협력 로드 — 레인 스트라이드(연속 주소)
+    for (uint k = u; k < n; k += 256u) {
+        ys[k] = y[xb + k];
+        xs[k] = x[xb + k];
+    }
+    barrier();
+    // 2) 세그먼트 산식 — 구 경로와 완전 동일 (청크 20원소 f32 연속 누산,
+    //    산출값도 동일 비트: v = y + x·1.0 순서 보존)
+    int chunk = int((n + 255u) >> 8u);
+    int lo = int(u) * chunk;
     float acc = 0.0;
     if (uint(lo) < n) {
         int hi = min(lo + chunk, int(n));
         for (int i = lo; i < hi; i++) {
-            // axpy_scaled와 동일 연산 순서: y + x·1.0
-            float v = y[xb + i] + x[xb + i] * 1.0;
-            y[xb + i] = v;
+            float v = ys[i] + xs[i] * 1.0;
+            ys[i] = v;
             acc += v * v;
         }
     }
     seg[u] = double(acc);
+    barrier();
+    // 잔차 스트림 전역 갱신 (구 경로는 2단계에서 직접 기록) — 결합 스토어.
+    for (uint k = u; k < n; k += 256u) y[xb + k] = ys[k];
     barrier();
     if (u == 0u) {
         double sum = 0.0lf;
@@ -47,8 +62,8 @@ void main() {
         invs = 1.0 / scale32;
     }
     barrier();
-    if (uint(lo) < n) {
-        int hi = min(lo + chunk, int(n));
-        for (int i = lo; i < hi; i++) outv[xb + i] = y[xb + i] * invs * wv[i];
+    // 3) 결합 스토어 — wv·outv 모두 레인 스트라이드(완전 결합). 값·식순서 동일.
+    for (uint k = u; k < n; k += 256u) {
+        outv[xb + k] = ys[k] * invs * wv[k];
     }
 }
