@@ -2564,3 +2564,21 @@ Facts established for the MTP defect:
 `LLM170_MTP_DUMP=<prefix>` now also writes the q8 y-vector (`*.xq.u32`).
 Next: build a NumPy mirror of the *whole* MTP layer (attention + FFN + shared head)
 against the gguf-py oracle, driven by the stage dumps, and compare token by token.
+
+## VL gate re-run (2026-09-12, judge phase)
+
+`LLM170_VL_PHASE=judge python3 scripts/verify_vl.py` (our engine alone, spec vs
+non-spec + np2 isolation): **2 PASS / 2 FAIL**.
+
+| case | result |
+|---|---|
+| vl_spec_short | FAIL - spec diverges from non-spec at gen[1]: ref [248068, 101, 271, 248069] vs spec [248068, 271, 248069, 271]; no tie basis |
+| vl_spec_np2_seq0/1 | PASS (near tie at gen[12], top-2 gap 0.527 < 1.0) |
+| vl_np2_isolation | FAIL - np2 seq0 != single run (25 vs 25 tokens) |
+
+`vl_spec_short` is a third symptom of the MTP defect (the spec path must reproduce the
+non-spec stream exactly and does not), so MTP breakage now blocks both the base spec
+path and the VL spec path. `vl_np2_isolation` is a separate state-isolation finding:
+the np2 batched vision run must match the single run token for token at the same t.
+Both need the next session; the vision *quality* checks (keyword semantics vs
+llama --mmproj) need the collect phase with llama-server running.
