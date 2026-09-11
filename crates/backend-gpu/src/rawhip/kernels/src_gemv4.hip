@@ -348,3 +348,12 @@ extern "C" __global__ void gemm_q6k4(const unsigned* xq, const unsigned* w,
         }
     }
 }
+
+// 배치 MTP 입력 결합: out[row*2n + i] = e[row*n + i], out[row*2n + n + i] = h[row*n + i].
+extern "C" __global__ void cat2_rows(const float* e, const float* h, float* out, int n, int t) {
+    int row = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= t || i >= n) return;
+    out[(size_t)row * 2 * n + i] = e[(size_t)row * n + i];
+    out[(size_t)row * 2 * n + n + i] = h[(size_t)row * n + i];
+}

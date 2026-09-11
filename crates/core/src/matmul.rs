@@ -548,6 +548,30 @@ pub trait RawDecode: Send + Sync {
         Err("mtp_step_gpu: 미지원".into())
     }
 
+    /// MTP 프리필 배치 — blk.64를 t행 한 번에 처리. 기본 구현은 토큰별 mtp_step_hidden.
+    fn mtp_prefill_batch(
+        &self,
+        seq: usize,
+        tok_embs: &[f32],
+        h_shift: &[f32],
+        t: usize,
+        pos0: usize,
+    ) -> Result<u32, String> {
+        let n = if t == 0 { return Err("mtp_prefill_batch: t=0".into()) } else { tok_embs.len() / t };
+        let mut tok = vec![0f32; n];
+        let mut h = vec![0f32; n];
+        let mut draft = 0u32;
+        for ti in 0..t {
+            tok.copy_from_slice(&tok_embs[ti * n..(ti + 1) * n]);
+            h.copy_from_slice(&h_shift[ti * n..(ti + 1) * n]);
+            let with_head = ti + 1 == t;
+            if let Some(am) = self.mtp_step_hidden(seq, &tok, &h, pos0 + ti, with_head)? {
+                draft = am;
+            }
+        }
+        Ok(draft)
+    }
+
     /// MTP KV 적립 전용 스텝 — with_head=false면 전체 vocab 헤드(argmax)를 생략한다.
     /// 프롬프트 전 토큰의 KV를 쌓는 동안 헤드는 마지막 토큰만 필요하다.
     /// 기본 구현은 항상 헤드를 계산한다(미지원 백엔드 폴백).

@@ -103,32 +103,29 @@ impl Engine {
                             .raw_prefill_h(seq, pos, &flat, &mut h_all)
                             .map_err(ModelError::Accel)?;
                         let n_e = self.model.hp.n_embd;
-                        let mut prev_h = self.seqs[seq].mtp_pending_h.clone();
-                        // 적립 창 — 프롬프트 앞부분의 MTP KV는 직후 드래프트 품질에
-                        // 거의 기여하지 않는다(어차피 트렁크 검증이 정답을 정한다).
-                        // 창 밖 토큰은 KV를 비운 채 prev_h만 전진시킨다.
-                        let mtp_acc = std::env::var("LLM170_MTP_ACC")
-                            .ok()
-                            .and_then(|v| v.parse::<usize>().ok())
-                            .unwrap_or(usize::MAX);
-                        for ti in 0..ch.len() {
-                            let wl = ti + 1 == ch.len();
-                            let h_t = h_all[ti * n_e..(ti + 1) * n_e].to_vec();
-                            if wl || ch.len() - ti <= mtp_acc {
-                                let trow = ch[ti].clone();
-                                let rd2 = rd.clone();
-                                // llama.cpp 시프트 페어링: MTP(tok_p, h_{p-1}) — h_{-1}=0
-                                // 헤드(argmax)는 마지막 토큰만 — 나머지는 KV 적립 전용.
-                                let am = rd2
-                                    .mtp_step_hidden(seq, &trow, &prev_h, pos + ti, wl)
-                                    .map_err(ModelError::Accel)?;
-                                if let (true, Some(a)) = (wl, am) {
-                                    let st = &mut self.seqs[seq];
-                                    st.mtp_draft_tok = a;
-                                    st.mtp_pending_h = h_t.clone();
-                                }
-                            }
-                            prev_h.copy_from_slice(&h_t);
+                        // 배치 MTP 프리필: blk.64를 청크 전체(t행) 한 번에 — t=1 스텝
+                        // ×토큰수 대체(헤드는 마지막 행만). tok/h 시프트 페어링은
+                        // llama.cpp와 동일: MTP(tok_p, h_{p-1}), h_{-1}=pending.
+                        let mut tok_flat: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
+                        for row in ch.iter() {
+                            tok_flat.extend_from_slice(row);
+                        }
+                        let mut h_shift: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
+                        if self.seqs[seq].mtp_pending_h.len() == n_e {
+                            h_shift.extend_from_slice(&self.seqs[seq].mtp_pending_h);
+                        } else {
+                            h_shift.resize(n_e, 0.0);
+                        }
+                        if ch.len() > 1 {
+                            h_shift.extend_from_slice(&h_all[..(ch.len() - 1) * n_e]);
+                        }
+                        let draft = rd
+                            .mtp_prefill_batch(seq, &tok_flat, &h_shift, ch.len(), pos)
+                            .map_err(ModelError::Accel)?;
+                        {
+                            let st = &mut self.seqs[seq];
+                            st.mtp_draft_tok = draft;
+                            st.mtp_pending_h = h_all[(ch.len() - 1) * n_e..].to_vec();
                         }
                         lg
                     } else {
