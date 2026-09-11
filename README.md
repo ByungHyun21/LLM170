@@ -18,7 +18,7 @@ with their conditions — full tables and history in
 | Backend | pp512 prefill | decode | note |
 |---|---|---|---|
 | ROCm/HIP (`rawhip`) | ~322 t/s | 10.9 t/s (tg8) | llama.cpp raw-loop: pp512 358, tg8 11.2 → 0.90× / 0.97× |
-| Vulkan (`rawvk`) | 322 t/s | 11.6 t/s (tg32) | llama.cpp Vulkan: pp512 353, tg32 12.1 → 0.91× / 0.955× |
+| Vulkan (`rawvk`) | 322 t/s | 11.8 t/s (tg32) | llama.cpp Vulkan: pp512 353, tg32 12.1 → 0.91× / 0.97× |
 | CPU (W4A8) | ~128 t/s (pp64) | 9.9 t/s (tg24) | bit-exact reference engine |
 
 The Vulkan backend reached these numbers with three decode/prefill kernel
