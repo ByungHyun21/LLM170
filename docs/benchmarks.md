@@ -2073,3 +2073,21 @@ so the FAILs are not regressions.
    residual is the per-token MTP block (512 sequential t=1 block passes,
    ~1.3 s). A batched MTP prefill (one t=512 pass over blk.64's attention+FFN)
    would bring it to ~300.
+
+### plans-derived candidates for the next round (reviewed 2026-09-12)
+
+- **plans/56 (#28702, fused gate/up + SwiGLU epilogue)**: one Q8_1 quantisation of
+  the shared FFN input, both weight matrices in one kernel, SwiGLU applied after
+  the K-reduction. For HIP this removes the separate `silu_mul_f32` pass (28 ms /
+  pass) and halves `mmq_quant_y` (18 ms) -> ~+2.3% pp. The MMQ objects are
+  llama's headers, so the template's fusion hook is the port target.
+- **plans/49 (#28528 stream-K / #28457 small-M)**: the np4 step (t=4) runs
+  128-column tiles at 3% row utilisation; a narrow-BN tile (BN=16-32) or a
+  split-K/small-M variant is the structural fix for the np path (llama 25.6 vs
+  our 19.8 CLI / 12.18 serve). Small-t MMQ was measured and rejected (0.66x).
+- **plans/46 (handoff)**: (a) spec contract change (batched verify instead of
+  per-token bit-identical verify) — explicitly marked as needing approval;
+  (b) GDN-layer fusion for decode (multi-tensor binding + WG-range selection) —
+  large, and the non-GEMM budget measured here is only ~10 ms/token.
+- **batched MTP prefill** (own design): run blk.64's attention+FFN once with
+  t=chunk instead of 512 sequential t=1 passes; expected pp(spec4) 179 -> ~300.
