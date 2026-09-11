@@ -1801,3 +1801,38 @@ Next lever (not attempted): narrow the per-dispatch barrier. Options, in order o
 3. Reduce the dispatch count on the small-t path: process >= 16 tokens per dispatch (the
    tile path) or fuse same-input GEMVs (qkv/gate/up) into one dispatch with an internal
    row-range switch.
+
+## CORRECTION: dispatch count is NOT the bottleneck (2026-09-11, final)
+
+The previous entry ("dispatch count is the real bottleneck") is falsified by a direct
+experiment: re-running the idempotent `quant` kernel N extra times per layer
+(`LLM170_VK_DUMMY`) adds 64-768 dispatches per forward and changes nothing:
+
+| Extra dispatches/forward | pp8 wall |
+|---|---|
+| +0 | 614.7 ms (thermal-drifted run) |
+| +64 | 617.9 ms |
+| +256 | 503.4 ms |
+| +768 | 501.7 ms |
+
+Marginal cost of a dispatch is unmeasurable (<= a few us). The correct model for the
+same data set is DRAM traffic:
+
+- gemv8 (t < 16) dispatches grid (row-pairs, t): every token re-reads the full weight
+  tensor. A t=8 forward moves 8 x 17.5 GB = 140 GB; at the observed ~280 GB/s streaming
+  rate that is ~500 ms - which is the measured wall (494-617 ms depending on thermal
+  state). Per layer: 8 x 2.2 GB / 280 GB/s = 7.8 ms - matching the measured 7.5 ms/layer.
+- t=1 decode moves 17.5 GB and takes 99 ms -> ~175 GB/s effective (worse latency hiding
+  at t=1). llama.cpp reaches 82 ms -> ~213 GB/s on the same tensor set.
+- The tile path (t >= 16) reads weights once per column-block; pp64 = 302 ms ~ the
+  one-pass tile floor (~300 ms at ~58 GB/s effective on the coopmat path).
+- VK_TS per-dispatch spans (sum 151 ms) under-report dispatch duration (known 6x skew);
+  do not use them to infer GPU idle. Wall + traffic arithmetic is the reliable model.
+
+Remaining single-stream levers, quantified:
+1. tg: close 175 -> 213 GB/s at t=1 by restructuring gemv8 for more ILP per workgroup,
+   the way llama's mul_mat_vec does (NUM_ROWS rows x NUM_COLS tokens per workgroup with
+   cooperative K reduction, spec-constant sized, vs our 1 row-pair per WG). Expected
+   ceiling ~1.2x tg (10 -> 12+ t/s, i.e. llama parity).
+2. pp: tiles re-read weights per BN column-block; raising BN halves re-reads (already
+   at BN=128; BN=256 measured neutral earlier - revisit only with occupancy data).
