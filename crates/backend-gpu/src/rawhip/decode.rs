@@ -1623,8 +1623,9 @@ gmark("ffn_quant", &mut marks);
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
             let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
             let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
-            if std::env::var_os("LLM170_PP_SERIAL").is_some() {
-                // 부록80 실험: 프리필 ffn 페어 직렬 (조인/경합 제거)
+            if std::env::var_os("LLM170_PP_PAIRS").is_none() {
+                // 기본: 직렬 — 2스트림 페어는 join2(이벤트) 오버헤드가 이득을 넘는다
+                // (2026-09-12 A/B: 직렬 +0.75%, LLM170_PP_PAIRS=1로 페어 복원).
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
             } else if gate_tile && !up_tile {
