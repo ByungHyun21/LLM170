@@ -2285,3 +2285,23 @@ the streaming limit), gdn_ar_w_swap 99 ms (4-u smem staging variant measured
 0.982x, prefetch variant neutral, ARSM 0.63x, ARCHUNK 0.89x — all rejected),
 qsa_flash_wk 50 ms + merge 10 ms (three variants measured worse), norm_gated_silu
 22 ms (82 GB/s).
+
+## VL gate and serve np4 re-measure (2026-09-12, session end)
+
+`scripts/verify_vl.py` (2-phase, fresh llama --mmproj reference): **5/5 PASS** —
+vl_spec_short/np2/long and vl_np2_isolation all exact. The semantic keyword check
+warns only because the 24-token budget is spent inside the think block; a manual
+run with the same budget prints "The front page of The New York Times from July
+21, 1969, featuring ..." (llama's reference: "A vintage front page of The New
+York Times featuring the headline MEN WALK ON MOON").
+
+serve np4 (4 concurrent 120-token prompts, 64 tokens each, client-side wall):
+
+| | before this session | after the 4-token GEMV + head fix | llama-server |
+|---|---|---|---|
+| np4 aggregate | 12.18 | **21.48** | 25.6 |
+| np1 | 9.25 | 9.23 | 10.48 |
+
+The remaining np4 gap is 0.84x (serve) / 0.91x (CLI, 23.4) and tracks the same
+per-step efficiency as single-stream tg (0.96x) plus the per-seq state kernels
+(conv/AR/flash 21.6 ms of 163.8 ms per t=4 step, 448 launches).
