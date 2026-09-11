@@ -875,7 +875,18 @@ impl DecodeState {
                         let mut pp2 = part as *mut std::ffi::c_void;
                         let mut sg_a = sg as i32;
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
-                        self.ctx.launch3("qsa_flash_split4q4", 1, n_head as u32, nseg as u32, 256, &mut args)?;
+                        // GQA 공유(t=1): kv-head당 WG 하나가 q-head 전부를 처리 —
+                        // K/V 트래픽 1/(q-heads per kv-head). LLM170_NO_GQA=1이면 종전.
+                        // 실측 교차점: ctx<768은 종전(더 많은 WG), 그 이상은 GQA 공유가
+                        // 이김 (pp512 −1.2%, 1024 +1.6%, 2048 +4.7%, 3072 +8.8%).
+                        let gqa_th = std::env::var("LLM170_GQA_TH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(768);
+                        let gqa = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0
+                            && (pos + 1) > gqa_th;
+                        if gqa {
+                            self.ctx.launch3("qsa_flash_gqa", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
+                        } else {
+                            self.ctx.launch3("qsa_flash_split4q4", 1, n_head as u32, nseg as u32, 256, &mut args)?;
+                        }
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
                         self.ctx.launch3("qsa_flash_merge", 1, n_head as u32, 1, 256, &mut margs)?;
                     } else {

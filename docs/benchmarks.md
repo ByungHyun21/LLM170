@@ -2809,3 +2809,30 @@ of a 5120-wide RMS+quant on one CU) is neutral for tg (11.11 vs 11.11 over three
 interleaved pairs) and slightly negative for pp (175.6 vs 177.6 t/s). These kernels are
 latency-bound on their per-thread chains, not throughput-bound - the same reason
 `l2_rows2_scale`/`gatedq`/`gdn_ar_w` cost 17-30 us for 2-5 us of work. Reverted.
+
+## Long-context decode: GQA-sharing attention kernel (2026-09-12)
+
+Root cause of the long-context tg deficit: `qsa_flash_split4q4` runs one WG per
+(query head, segment), so each of the 24 query heads re-reads its KV head's K and V -
+with 6 query heads per KV head that is a 6x amplification of the KV traffic (at 3k
+context: 24 heads x 3k keys x 2 KB = 147 MB per layer per token). Measured slope before
+the fix: 0.31 us per key per layer, versus llama.cpp's 0.053.
+
+New kernel `qsa_flash_gqa`: one WG per (KV head, segment) handling all `n_head/n_kv`
+query heads of that KV head from a single K/V load (mask read is shared too). The four-row
+structure of split4q4 is mapped onto the head axis 1:1 (same 4-key batching, same
+warp-tree + LDS two-stage reduction, same softmax update order), so per-head results are
+**bit-identical** - verified: base stream == the pre-fix reference, and spec == non-spec.
+
+Gated by context (`LLM170_GQA_TH`, default 768) because the GQA kernel has 6x fewer WGs
+and loses slightly when the KV is small:
+
+| context | old | GQA | ratio to llama |
+|---|---|---|---|
+| 512 | 10.82 | 10.69 | (old kept) |
+| 1024 | 10.49 | 10.66 | - |
+| 2048 | 9.91 | 10.38 | - |
+| 3072 | 9.54 | **10.38** | llama 10.70 -> 0.97x (was 0.89x) |
+| 6337 | - | **9.69** | llama 10.69 -> 0.91x (was ~0.85x) |
+
+`LLM170_NO_GQA=1` restores the old path.
