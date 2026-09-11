@@ -2212,3 +2212,22 @@ header snapshot (i8_arc sources, 2026-09-05). A rebuild from the current
 assumptions no longer hold. **Conclusion: `.co` rebuilds must pin the exact
 header revision used for the shipped objects; without it, treat the precompiled
 path as immutable.** The 81 ms/pass odd-type tiles therefore stay.
+
+## mmproj (VL) condition measured (2026-09-12)
+
+Both engines, same image (`source/llama.cpp/tools/mtmd/test-1.jpeg`, the NYT
+front page) and prompt, greedy, 24 tokens:
+
+| | prompt (encode+prefill) | decode | total request |
+|---|---|---|---|
+| llama.cpp (master build, HIP, `--mmproj mmproj-F16.gguf`) | 1678 ms (362 tok) | 12.31 t/s | 3.68 s |
+| ours (`llm170 vl`) | ~4100 ms (335 tok; 3.0 s of it ViT) | 12.8 t/s | ~6.0 s (steady state) |
+
+Our content is correct ("The front page of The New York Times from July 21,
+1969, featuring" ...), matching the recorded reference. The gap is the vision
+encoder: 3.0 s vs llama's ~1.2 s for the same 27-block CLIP ViT forward (plus a
+one-time 7.1 s mmproj weight upload per process, i.e. a cold-start cost).
+
+Note the decode rate here (12.8 t/s) is higher than the bench tg32 (11.06): the
+VL context is ~360 tokens and a single stream, so this is the same short-context
+effect llama shows (their 12.31 t/s).
