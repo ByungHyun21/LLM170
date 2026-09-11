@@ -14,14 +14,14 @@
 //   sg=토큰 반(32), 워프당 4행슬래브×2토큰슬래브 = 8누산기
 // 측정: 70.7GB/s (ls 36.3 → 2배).
 layout(local_size_x = 128) in;
-layout(binding = 0) readonly buffer W0 { uint w0c[]; };
-layout(binding = 1) readonly buffer W1 { uint w1c[]; };
-layout(binding = 2) readonly buffer W2 { uint w2c[]; };
-layout(binding = 3) readonly buffer W3 { uint w3c[]; };
-layout(binding = 4) readonly buffer W4 { uint w4c[]; };
-layout(binding = 5) readonly buffer W5 { uint w5c[]; };
-layout(binding = 6) readonly buffer W6 { uint w6c[]; };
-layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 0) readonly buffer W0 { uvec4 w0v[]; };
+layout(binding = 1) readonly buffer W1 { uvec4 w1v[]; };
+layout(binding = 2) readonly buffer W2 { uvec4 w2v[]; };
+layout(binding = 3) readonly buffer W3 { uvec4 w3v[]; };
+layout(binding = 4) readonly buffer W4 { uvec4 w4v[]; };
+layout(binding = 5) readonly buffer W5 { uvec4 w5v[]; };
+layout(binding = 6) readonly buffer W6 { uvec4 w6v[]; };
+layout(binding = 7) readonly buffer W7 { uvec4 w7v[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
@@ -33,8 +33,10 @@ layout(push_constant) uniform PC {
 #define BN 64
 #define SHMEM_STRIDE (BK / 2 + 2)   // 18 vec2 (plans/43 점유: 5 WG/CU)
 
-// 단일 청크 직인덱스 (엔진 ch_eff=텐서 next_pow2 → 항상 1청크, plans/40)
-#define WG(idx) w0c[idx]
+// 단일 청크 직인덱스 (엔진 ch_eff=텐서 next_pow2 → 항상 1청크, plans/40).
+// plans/46: uvec4(16B) 로드 — wq는 항상 4의 배수(블록 176B=44u32)라 정렬 보장.
+// c-루프 4연속 u32 = 정확히 uvec4 1개. 값·산식 불변(비트동일).
+#define WG(idx) w0v[(idx) >> 2][(idx) & 3]
 
 // shmem: f16vec2 (llama FLOAT_TYPEV2) — 스트라이드는 vec2 단위
 shared f16vec2 buf_a[BM * SHMEM_STRIDE];
@@ -57,9 +59,9 @@ void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
     }
     uint sb = k0 >> 5;                  // 32k 서브블록 (256k 블록 내)
     int wq = ((row * blocks + int(sb >> 3)) * 176) >> 2;
-    uint w0 = WG(wq);
-    vec2 dm = vec2(unpackHalf2x16(w0));
-    uvec3 scales = uvec3(WG(wq+1), WG(wq+2), WG(wq+3));
+    uvec4 dsc = w0v[wq >> 2];              // dm + scales — 16B 1회 로드
+    vec2 dm = vec2(unpackHalf2x16(dsc.x));
+    uvec3 scales = dsc.yzw;
     [[unroll]] for (int c = 0; c < 4; c++) {
         int kp = int(sb & 7u) * 32 + kc + c * 4;   // 블록 내 위치 0..255
         // llama 규약: idx = kp/4 (LOAD_VEC_A=4), iqs = (idx%64)*2
@@ -79,8 +81,12 @@ void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
         uint mb = ((scales[mbidx0] >> mbidxshift0) & 0xFu) | ((scales[1] >> mbidxshift1) & 0x30u);
         float d = dm.x * float(sc);
         float m = -dm.y * float(mb);
-        uint qs = (WG(wq + 12u + qsi / 4u) >> (b * 4u)) & 0x0F0F0F0Fu;
-        uint qh = ((WG(wq + 4u + qhi / 4u) >> (iqs >> 4)) & 0x01010101u) << 4;
+        // qs vec4 인덱스: B0 = qsi/4(시작) = 8*(s>>1) + 4*(kc>>4), s=sb&7
+        // (검증: n=iqs0>>5=(16s)>>5=s>>1, qsi = n*32 + (iqs&15)*2 → /4 = 8(s>>1)+..)
+        uvec4 qsv = w0v[(wq >> 2) + 3u + 2u * uint((sb & 7u) >> 1) + (kc >> 4)];
+        uvec4 qhv = w0v[(wq >> 2) + 1u + (kc >> 4)];   // qh 4연속
+        uint qs = (qsv[c] >> (b * 4u)) & 0x0F0F0F0Fu;
+        uint qh = ((qhv[c] >> (iqs >> 4)) & 0x01010101u) << 4;
         vec4 q = vec4(unpk8(qs | qh));
         // shmem 지역 k = kp % 32 = kc + 4c
         int kp2 = (kc >> 1) + c * 2;
