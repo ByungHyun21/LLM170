@@ -217,8 +217,13 @@ pub fn slot_loop(
             }
         }
 
-        // ③ 디코드 스텝이 없었으면 프리필 1청크 (대기 쇼트가 디코드를 굶기지 않음)
-        if !decoded {
+        // ③ 프리필 1청크 — 디코드가 없었던 회차이거나, 아직 프리필이 남은 대기 슬롯이
+        // 있는 경우. (디코드 우선이지만 활성 슬롯의 디코드가 대기 슬롯의 프리필을
+        // 영구히 굶기면 서버가 요청을 직렬화한다 — np4 실측 2026-09-12.)
+        let pending_prefill = slots.iter().any(|s| {
+            s.job.is_some() && s.prefilled < s.job.as_ref().unwrap().tokens.len()
+        });
+        if !decoded || pending_prefill {
             let pf = (0..n_slots)
                 .filter(|&i| {
                     slots[i].job.is_some()

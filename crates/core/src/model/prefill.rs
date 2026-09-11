@@ -104,21 +104,31 @@ impl Engine {
                             .map_err(ModelError::Accel)?;
                         let n_e = self.model.hp.n_embd;
                         let mut prev_h = self.seqs[seq].mtp_pending_h.clone();
+                        // 적립 창 — 프롬프트 앞부분의 MTP KV는 직후 드래프트 품질에
+                        // 거의 기여하지 않는다(어차피 트렁크 검증이 정답을 정한다).
+                        // 창 밖 토큰은 KV를 비운 채 prev_h만 전진시킨다.
+                        let mtp_acc = std::env::var("LLM170_MTP_ACC")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(usize::MAX);
                         for ti in 0..ch.len() {
                             let wl = ti + 1 == ch.len();
                             let h_t = h_all[ti * n_e..(ti + 1) * n_e].to_vec();
-                            let trow = ch[ti].clone();
-                            let rd2 = rd.clone();
-                            // llama.cpp 시프트 페어링: MTP(tok_p, h_{p-1}) — h_{-1}=0
-                            let (am, _hn) = rd2
-                                .mtp_step_gpu(seq, &trow, &prev_h, pos + ti)
-                                .map_err(ModelError::Accel)?;
-                            prev_h.copy_from_slice(&h_t);
-                            if wl {
-                                let st = &mut self.seqs[seq];
-                                st.mtp_draft_tok = am;
-                                st.mtp_pending_h = h_t;
+                            if wl || ch.len() - ti <= mtp_acc {
+                                let trow = ch[ti].clone();
+                                let rd2 = rd.clone();
+                                // llama.cpp 시프트 페어링: MTP(tok_p, h_{p-1}) — h_{-1}=0
+                                // 헤드(argmax)는 마지막 토큰만 — 나머지는 KV 적립 전용.
+                                let am = rd2
+                                    .mtp_step_hidden(seq, &trow, &prev_h, pos + ti, wl)
+                                    .map_err(ModelError::Accel)?;
+                                if let (true, Some(a)) = (wl, am) {
+                                    let st = &mut self.seqs[seq];
+                                    st.mtp_draft_tok = a;
+                                    st.mtp_pending_h = h_t.clone();
+                                }
                             }
+                            prev_h.copy_from_slice(&h_t);
                         }
                         lg
                     } else {
