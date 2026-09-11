@@ -1702,3 +1702,16 @@ Session final standing: pp512 183 -> ~303 t/s (0.85x llama), pp64 ~195 ->
 ~211 (0.86x), tg8 ~9.8 -> ~9.9 (0.82x), verify 25/0, tree clean, all 40+
 commits pushed, and every adopted change and rejected hypothesis recorded
 here with its measurements.
+
+## ms256c re-test with correct grid — solo faster, engine slower (plans/46)
+
+The earlier ms256 measurement used a grid that covered only half the rows;
+re-measured with the correct launch the four-subgroup BN=128 tile is
+numerically clean (maxrel 0.0054) and 13% faster per 64 tokens than the
+default 2-subgroup ms128 on an L2-resident tensor (0.265 vs 0.32 ms), yet
+the engine regresses 8% (pp512 278-281 vs 302-304). This reproduces the
+ms128-vs-ms4 pattern exactly: wider workgroups win solo and lose in the
+engine because they co-schedule worse with the other kernels in the chain.
+Solo-rate improvements have now failed to transfer in every tile variant
+tried; the engine's tile configuration (2 subgroups, BM=64, BN=128, 18-vec2
+LDS stride) stays.
