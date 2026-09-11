@@ -13,6 +13,7 @@ use std::collections::HashMap;
 pub const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
+pub const ARGMAX2_SPV: &[u8] = include_bytes!("spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
 pub const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
 

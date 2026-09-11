@@ -680,11 +680,17 @@ impl Engine {
             return Ok(crate::model::greedy(&logits[0]));
         };
         let n = self.model.hp.n_embd;
+        let tw0 = std::time::Instant::now();
         let embd = self.model.wchk("token_embd.weight")?;
         let mut row = vec![0.0f32; n];
         crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
+        let tw1 = std::time::Instant::now();
         let pos = self.seqs[seq].pos as usize;
         let tok = rd.raw_step_greedy(seq, pos, &row).map_err(ModelError::Accel)?;
+        if std::env::var_os("LLM170_DBG_WALL").is_some() {
+            eprintln!("[dg] dequant={:.2}ms step+greedy={:.2}ms",
+                (tw1-tw0).as_secs_f64()*1e3, tw1.elapsed().as_secs_f64()*1e3);
+        }
         self.seqs[seq].pos += 1;
         Ok(tok)
     }

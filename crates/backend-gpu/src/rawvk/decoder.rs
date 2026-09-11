@@ -191,6 +191,7 @@ pub struct DecoderState {
     b_fdown: VkBuf,
     b_out: VkBuf, // [t][n_embd] 결과 다운로드
     b_lg: VkBuf,  // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
+    b_ams: VkBuf, // argmax 스테이지1 스크래치 [2*256] u32
     b_lg_t: VkBuf, // head 로짓 [T_MAX][n_vocab] — verify 전 행 (plans/20)
     b_am: VkBuf,  // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
@@ -251,6 +252,14 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
         ds.step(seq, pos, emb)
+    }
+
+    /// greedy 스텝 — GPU argmax로 토큰만 회수 (608KB 로짓 전사·CPU 스캔 회피).
+    fn raw_step_greedy(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<u32, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.step_core(seq, pos, emb)?;
+        ds.lg_argmax()
     }
 
     /// 프리필 — 행[t][n_embd]별 t=1 스텝 (기본 구현의 512-float 청크 절단 결함 회피).
@@ -718,6 +727,7 @@ impl DecoderState {
         let m_xq = ah(xq_sn)?;
         let m_h = ah(n)?;
         let b_lg = ah(n_vocab)?;
+        let b_ams = ah(512)?;   // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
         let b_lg_t = ah(T_MAX * n_vocab)?;
         // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
         let mut i8w: HashMap<String, I8W> = HashMap::new();
@@ -903,6 +913,7 @@ impl DecoderState {
             b_fdown,
             b_out,
             b_lg,
+            b_ams,
             b_lg_t,
             b_am,
             pipes: HashMap::new(),
@@ -1576,8 +1587,9 @@ impl DecoderState {
             &[y, x, wbuf.buf, out], &push, t as u32, 1, 1)
     }
 
-    /// t=1 단일 스텝 — 배치 모드로 전 층 단일 제출·다운로드 1회.
-    pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+    /// t=1 단일 스텝 본체 — 배치 모드로 전 층 단일 제출·다운로드 1회.
+    /// 로짓은 b_lg에만 남는다 (전사는 step() 래퍼).
+    fn step_core(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<(), String> {
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
         let n = self.n_embd;
@@ -1792,9 +1804,14 @@ impl DecoderState {
         }
         // ── head: gemv(output) — output_norm은 마지막 addrms에 융합, quant는
         // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).
+        let tw_head1 = std::time::Instant::now();
         self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
         if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
         self.ctx.ts_report();
+        if std::env::var_os("LLM170_DBG_WALL").is_some() {
+            eprintln!("[step] head+wait={:.2}ms step총={:.2}ms",
+                tw_head1.elapsed().as_secs_f64()*1e3, vk_t0.elapsed().as_secs_f64()*1e3);
+        }
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
@@ -1818,9 +1835,34 @@ impl DecoderState {
                 s(&self.kv_k[0][seq], 1024), s(&self.kv_v[0][seq], 1024),
                 s(&self.b_xs, 64));
         }
+        Ok(())
+    }
+
+    /// step_core + 전사 로짓 (기존 계약). raw_step_greedy는 아래 lg_argmax 경로로
+    /// 608KB CPU 판독을 우회한다 (GTT 비캐시 판독 ~5ms/토큰 절감, plans/46).
+    pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        self.step_core(seq, pos, emb)?;
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
         Ok(logits)
+    }
+
+    /// b_lg 상주 로짓의 GPU argmax — CPU greedy_from과 동일 의미(첫 최댓값=최저 인덱스).
+    fn lg_argmax(&mut self) -> Result<u32, String> {
+        let nthr = 256usize;
+        let chunk = 8usize;
+        let n = self.n_vocab;
+        let n_wg = n.div_ceil(nthr * chunk);
+        let push0 = Self::push_u32s(&[n as u32, 0u32]);
+        let push1 = Self::push_u32s(&[n_wg as u32, 1u32]);
+        let binds = [self.b_lg.buf, self.b_ams.buf, self.b_am.buf];
+        self.ctx.begin_batch()?;
+        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+            &binds, &push0, n_wg as u32, 1, 1, true)?;
+        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+            &binds, &push1, 1, 1, 1, true)?;
+        self.ctx.end_batch_wait()?;
+        Ok(unsafe { *(self.b_am.ptr as *const u32) })
     }
 
     /// t행 배치 스텝 (plans/20) — 가중 1회 판독 분할 상각. 행별 산술은
