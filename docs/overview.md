@@ -67,7 +67,7 @@ flash attention, the GDN scan, and a bit-exact element-wise set) and rawvk
 (Vulkan — a full pure-Rust/Vulkan pipeline: subgroup GEMV decode kernels
 for all 8 quant types, cooperative-matrix prefill tiles, fused
 residual/RMS/GDN/attention kernels and a GPU-side argmax, reaching
-0.91× (pp512) and 0.955× (tg32) of llama.cpp Vulkan on the reference
+0.91× (pp512) and 0.97× (tg32) of llama.cpp Vulkan on the reference
 APU). qwen4exp decodes
 through a GPU-resident frame by default (ADR-0017) — kernels chained by
 handle, ~600 per-step host syncs down to ~14. The HTTP server schedules
