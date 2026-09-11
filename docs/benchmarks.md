@@ -2305,3 +2305,29 @@ serve np4 (4 concurrent 120-token prompts, 64 tokens each, client-side wall):
 The remaining np4 gap is 0.84x (serve) / 0.91x (CLI, 23.4) and tracks the same
 per-step efficiency as single-stream tg (0.96x) plus the per-seq state kernels
 (conv/AR/flash 21.6 ms of 163.8 ms per t=4 step, 448 launches).
+
+## VL accounting correction + verification snapshot (2026-09-12, end)
+
+`LLM170_VIT_TIME=1` per-block timings: mmproj weights+upload 7.4 s (one-time per
+process), prep(conv) 0.5 s, **vision forward 1.1 s** (27 blocks; ~10 ms ln+qkv+rope
+and ~10 ms attention per block), LLM prefill 1.1 s. So the earlier "3.0 s vision
+encoder" figure in this file was wrong — it included the one-time uploads. The
+steady-state VL request is ~4.2 s (encode 1.1 + prefill 1.1 + 24 tokens at 12 t/s)
+against llama's 3.68 s (prompt 1.68 s incl. encode + 24 tokens) = 0.88x, i.e. the
+VL condition is gated by the same prefill/decode gaps as the text conditions, not
+by a broken encoder (~1.1 s vs their ~1.0 s).
+
+Verification snapshot at commit 36c5604 (all re-run on the current binary):
+
+| gate | result |
+|---|---|
+| `scripts/verify.py` judge (fresh llama reference) | **16/19**, all 9 `spec_*` invariants exact; the 3 FAILs are reference-side (long2 slot-KV instability x2 with identical gaps, long3 single-token degenerate reference) |
+| `scripts/verify_vl.py` | **5/5** (vl_spec_short/np2/long exact, np2 isolation) |
+| greedy streams vs pre-change binaries | bit-identical for every adopted change (5/8/120-token prompts) |
+
+Measured levers that were neutral this session (do not re-try blindly):
+`LLM170_QSA_SEG=256/512` (0.9997/1.0024), `LLM170_ARSM=1` (0.63x),
+`LLM170_ARW4` 4-u AR staging (0.982x), `LLM170_ARCHUNK=1` (0.894x),
+`LLM170_NO_WKFLASH` (0.857x), `LLM170_NO_QSA_SPLIT` (0.823x),
+`LLM170_DEQ16=1` (0.89x), `LLM170_MMQ_SMALLT=1` (0.66x wall on np4),
+`LLM170_NO_MMQ=1` (0.96x), `LLM170_MMQ_ONLY=3` (0.968x).
