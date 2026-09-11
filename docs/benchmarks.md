@@ -1836,3 +1836,26 @@ Remaining single-stream levers, quantified:
    ceiling ~1.2x tg (10 -> 12+ t/s, i.e. llama parity).
 2. pp: tiles re-read weights per BN column-block; raising BN halves re-reads (already
    at BN=128; BN=256 measured neutral earlier - revisit only with occupancy data).
+
+## GDN state coalescing (2026-09-11, session end)
+
+The recurrent GDN state was stored row-major while the ar kernels assign 4 rows per
+lane, so every subgroup load touched 32 cache lines at 2KB stride - the state streamed
+at 36 GB/s (8.3 ms/token across 48 GDN layers). Storing the state transposed
+(`s[col*d + row]`) makes the same loads fully coalesced. Math, lane mapping and
+subgroupAdd order are unchanged, so outputs stay bit-identical.
+
+The first cut fully unrolled the 8-column loop of `gdn_ar8` on top of the new
+addressing; register pressure spilled inside the 512-token loop and regressed pp512
+303 -> 285. Processing columns in rolling pairs halves live temporaries and restores
+prefill:
+
+| Metric | before | after | llama.cpp | ratio |
+|---|---|---|---|---|
+| pp512 | 303 | 304.2 | 356.66 | 0.85x |
+| tg32 | 9.94 | 10.66-10.69 | 12.12 | 0.88x |
+
+gdn_ar per-layer time at t=1: 0.174 ms -> 0.021 ms (8x). Effective decode weight
+bandwidth 175 -> ~190 GB/s. Remaining decode gap vs llama is inside the gemv8
+kernels themselves (~190 vs ~213 GB/s effective) - layouts already match llama's
+dmmv, so further gains need per-instruction tuning or a different access idiom.
