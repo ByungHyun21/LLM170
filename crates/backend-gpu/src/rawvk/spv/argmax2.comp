@@ -1,0 +1,66 @@
+#version 450
+// argmax2 (plans/46) — 로짓 GPU argmax, 2단계. CPU greedy_from과 동일 의미:
+// 동값 시 최저 인덱스 (스레드/WG 모두 (v>best)||(v==best&&i<bi) 비교).
+// stage 0: grid(n_wg) — 스레드당 연속 8원소 스캔 → WG 트리 축소 → sc[2wg..2wg+1]
+//          (floatBitsToUint(max), argmin_index). 스레드 로컬은 오름차순 순회로
+//          첫 최댓값 유지 (CPU 스캔과 정확 동일).
+// stage 1: grid(1) — sc 쌍들을 같은 비교로 축소 → out[0]=인덱스.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Lg { float lg[]; };
+layout(binding = 1) buffer Sc { uint sc[]; };
+layout(binding = 2) buffer Out { uint outv[]; };
+layout(push_constant) uniform PC { uint n; uint stage; } pc;
+shared float sv[256];
+shared uint si[256];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (pc.stage == 0u) {
+        const uint chunk = 8u;
+        uint lo = (gl_WorkGroupID.x * 256u + tid) * chunk;
+        float bv; uint bi;
+        if (lo < pc.n) {
+            bv = lg[lo]; bi = lo;
+            for (uint j = 1u; j < chunk; j++) {
+                uint i2 = lo + j;
+                if (i2 < pc.n) {
+                    float v = lg[i2];
+                    if (v > bv) { bv = v; bi = i2; }
+                }
+            }
+        } else {
+            bv = uintBitsToFloat(0xFF7FFFFFu); bi = 0xFFFFFFFFu;  // -FLT_MAX
+        }
+        sv[tid] = bv; si[tid] = bi;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                uint o = tid + s;
+                if (sv[o] > sv[tid] || (sv[o] == sv[tid] && si[o] < si[tid])) {
+                    sv[tid] = sv[o]; si[tid] = si[o];
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            sc[2u * gl_WorkGroupID.x] = floatBitsToUint(sv[0]);
+            sc[2u * gl_WorkGroupID.x + 1u] = si[0];
+        }
+    } else {
+        sv[tid] = uintBitsToFloat(0xFF7FFFFFu); si[tid] = 0xFFFFFFFFu;
+        if (tid < pc.n) {
+            sv[tid] = uintBitsToFloat(sc[2u * tid]);
+            si[tid] = sc[2u * tid + 1u];
+        }
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                uint o = tid + s;
+                if (sv[o] > sv[tid] || (sv[o] == sv[tid] && si[o] < si[tid])) {
+                    sv[tid] = sv[o]; si[tid] = si[o];
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) outv[0] = si[0];
+    }
+}
