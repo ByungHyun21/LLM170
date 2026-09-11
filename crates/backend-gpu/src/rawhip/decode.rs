@@ -440,7 +440,9 @@ impl DecodeState {
         let mut ep = self.eps;
         let mut na = n as i32;
         let mut args = vec![Self::p(&mut xp), Self::p(&mut wp), Self::p(&mut qp), Self::p(&mut ep), Self::p(&mut na)];
-        self.ctx.launch("rmsq", 1, 1, 32, &mut args)
+        // 블록당 32-블록 1개 (감축은 스레드 0..31) — 32 미만이면 감축만.
+        let blk = (n >> 5).clamp(32, 1024) as u32;
+        self.ctx.launch("rmsq", 1, 1, blk, &mut args)
     }
     fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
         let mut yp = y as *mut std::ffi::c_void;
