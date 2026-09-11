@@ -1,0 +1,100 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// gdn_ar8f (plans/46) — 프리필(t≥2) GDN 체인 융합: split3+l2+beta_g를
+// gdn_ar8(전치·롤링2열)에 인라인. 디스패치 4→1.
+// 비트동일 규칙(0298aaa 방법론):
+//   - l2: precise 누산(수축 금지) + subgroupAdd + 1/max(sqrt,eps)
+//   - 코어: 열별 원본 fma 결합순서 복제 —
+//     part_c = Fma(s3c,k3, Fma(s2c,k2, Fma(s0c,k0, s1c*k1)))
+//     s_jc = Fma(k_j, delta_c, s_jc), op_c 동일 구조
+//   - beta/g: gdn_beta_g 동일식
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };             // [pair][col*d+row] 전치
+layout(binding = 1) readonly buffer GC { float gc[]; };  // [t][2ks+vs]
+layout(binding = 2) readonly buffer Bb { float gbv[]; }; // [t][dt_rank]
+layout(binding = 3) readonly buffer Aa { float gav[]; }; // [t][dt_rank]
+layout(binding = 4) readonly buffer Dt { float dtb[]; }; // [dt_rank]
+layout(binding = 5) readonly buffer Sa { float sa[]; };  // [dt_rank]
+layout(binding = 6) buffer O { float o[]; };             // [t][vs]
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t; float eps;
+} pc;
+void main() {
+    int pair = int(gl_WorkGroupID.x);
+    int u0 = int(gl_WorkGroupID.y) * 8;
+    int lane = int(gl_SubgroupInvocationID);
+    int base_s = pair * pc.d * pc.d;
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int tot = 2 * pc.ks + pc.vs;
+    float s0[8], s1[8], s2[8], s3[8];
+    [[unroll]] for (int c = 0; c < 8; c++) {
+        s0[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 0];
+        s1[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 1];
+        s2[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 2];
+        s3[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 3];
+    }
+    for (int ti = 0; ti < pc.t; ti++) {
+        // ── l2 인라인 — precise 누산 + subgroupAdd (l2_rows2 동일)
+        int qb = ti * tot + kh * pc.d + lane * 4;
+        float dvq0 = gc[qb];       float dvk0 = gc[pc.ks + qb];
+        float dvq1 = gc[qb + 1];   float dvk1 = gc[pc.ks + qb + 1];
+        float dvq2 = gc[qb + 2];   float dvk2 = gc[pc.ks + qb + 2];
+        float dvq3 = gc[qb + 3];   float dvk3 = gc[pc.ks + qb + 3];
+        precise float partq = 0.0;
+        precise float partk = 0.0;
+        partq += dvq0 * dvq0; partk += dvk0 * dvk0;
+        partq += dvq1 * dvq1; partk += dvk1 * dvk1;
+        partq += dvq2 * dvq2; partk += dvk2 * dvk2;
+        partq += dvq3 * dvq3; partk += dvk3 * dvk3;
+        float invq = 1.0 / max(sqrt(subgroupAdd(partq)), pc.eps);
+        float invk = 1.0 / max(sqrt(subgroupAdd(partk)), pc.eps);
+        float k0 = dvk0 * invk; float k1 = dvk1 * invk;
+        float k2 = dvk2 * invk; float k3 = dvk3 * invk;
+        float q0 = dvq0 * invq; float q1 = dvq1 * invq;
+        float q2 = dvq2 * invq; float q3 = dvq3 * invq;
+        // ── beta/g 인라인 (gdn_beta_g 동일식)
+        int bh = ti * pc.hv + pair;
+        float beta = 1.0 / (1.0 + exp(-gbv[bh]));
+        float x = min(gav[bh] + dtb[pair], 80.0);
+        float sp = log2(1.0 + exp2(x * 1.4426950408889634)) * 0.6931471805599453;
+        float g = exp(sp * sa[pair]);
+        int v0 = ti * pc.vs + h * pc.d;
+        // ── 열별 코어 — 원본 fma 결합순서 (2열 롤링 ×4)
+        [[unroll]] for (int c = 0; c < 8; c += 2) {
+            float part[2], op[2];
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                s0[c + j] *= g; s1[c + j] *= g; s2[c + j] *= g; s3[c + j] *= g;
+                part[j] = fma(s0[c + j], k0, s1[c + j] * k1);
+                part[j] = fma(s2[c + j], k2, part[j]);
+                part[j] = fma(s3[c + j], k3, part[j]);
+            }
+            float sk[2];
+            [[unroll]] for (int j = 0; j < 2; j++) sk[j] = subgroupAdd(part[j]);
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                float vv = gc[ti * tot + 2 * pc.ks + h * pc.d + u0 + c + j];
+                float delta = (vv - sk[j]) * beta;
+                s0[c + j] = fma(k0, delta, s0[c + j]);
+                s1[c + j] = fma(k1, delta, s1[c + j]);
+                s2[c + j] = fma(k2, delta, s2[c + j]);
+                s3[c + j] = fma(k3, delta, s3[c + j]);
+                op[j] = fma(s0[c + j], q0, s1[c + j] * q1);
+                op[j] = fma(s2[c + j], q2, op[j]);
+                op[j] = fma(s3[c + j], q3, op[j]);
+            }
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                float otot = subgroupAdd(op[j]);
+                if (lane == 0) o[v0 + u0 + c + j] = otot * pc.scale;
+            }
+        }
+    }
+    [[unroll]] for (int c = 0; c < 8; c++) {
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 0] = s0[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 1] = s1[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 2] = s2[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 3] = s3[c];
+    }
+}
