@@ -2259,3 +2259,29 @@ Remaining, ranked: (1) prefill GEMM (`mul_mat_q` 955 ms/pass at 12 TMAC/s,
 so the alternative is a new WMMA f16 GEMM); (2) np step state kernels
 (conv/AR/flash = 21.6 ms of 163.8 ms per t=4 step, 448 launches); (3) vision
 encoder (3.0 s vs llama ~1.2 s).
+
+## GEMM ceiling established; remaining pp gap is non-GEMM (2026-09-12)
+
+Exact accounting: 25.62 GMAC per token (65 blocks minus the MTP layer, embedding
+gather excluded) = 13.12 TMAC per 512-token pass.
+
+| path | rate |
+|---|---|
+| our `mul_mat_q` (dp4a), per type | 11.7-12.7 TMAC/s |
+| our rocWMMA tiles (v4/j128) | 9.4-11 TMAC/s |
+| ceiling, roof-test "mfma1" (WMMA f16, L1-fed) | 24.05 TFLOPS = **12.0 TMAC/s** |
+| ceiling, roof-test "mfma0" (WMMA f16, register-resident) | 48.8 TFLOPS = 24.4 TMAC/s (unreachable from memory) |
+| llama.cpp implied (pp512 353.62, non-GEMM 15-31% of the pass) | 10.7-13.1 TMAC/s |
+
+Our whole-pass GEMM rate is 10.9 TMAC/s and the MMQ part is at 12 TMAC/s, i.e.
+**at this GPU's measured L1-fed ceiling**. Consequence: writing a new f16 WMMA
+GEMM cannot win (it would land at the same 12 TMAC/s); the remaining 5-6% of pp
+must come from the non-GEMM 310 ms/pass.
+
+Non-GEMM items and what happened to them this session: rms_part/rms_finish
+104->20 ms (fixed), quant_q8 25->6 (skipped for MMQ consumers), token-embedding
+dequant ~20 ms -> ~3 ms (parallelised, +0.6% pp), silu_mul 28.5 ms (244 GB/s, at
+the streaming limit), gdn_ar_w_swap 99 ms (4-u smem staging variant measured
+0.982x, prefetch variant neutral, ARSM 0.63x, ARCHUNK 0.89x — all rejected),
+qsa_flash_wk 50 ms + merge 10 ms (three variants measured worse), norm_gated_silu
+22 ms (82 GB/s).
