@@ -2385,3 +2385,43 @@ Also closed: the shipped `co/mmq.co` (99,872 B) cannot be reproduced from either
 `plans/i8_arc/mmq_native_q45.cu` (93,232 B) or `mmq_native_rdna35.cu` (55,608 B)
 with the current headers, so neither its exact source nor header revision is
 recoverable from the tree. The MMQ code objects stay immutable.
+
+## norm_gated_silu vectorisation (+3.0% pp) and two falsifications (2026-09-12)
+
+Adopted: **norm_gated_silu_f32 float4**. The kernel handled one 128-value row per
+warp (24576 rows per launch): the RMS segment read 4 consecutive scalars per lane
+and the write phase strided 32 across lanes (12 memory ops per lane per row).
+Both phases now use float4 — the reduction keeps the same per-lane element set
+and addition order, and the write is element-wise so the lane mapping is free.
+Bit-identical streams; interleaved A/B pp512 329.7 -> 339.6 (**+3.0%**), tg
+unchanged. The traced mark for this kernel (22 ms) had understated it by ~2x.
+
+Falsified, both reverted:
+
+| experiment | result |
+|---|---|
+| `gemm_q8_smalln` — dedicated 8-row x 32-token q8_0 GEMM for the beta/alpha projections (tile path costs a t-independent ~0.2 ms each = 29 ms/pass) | 0.967x pp: 46 KB LDS per WG caps occupancy at 1 WG/CU, so the staged K-loop beats nothing |
+| fused `silu_mul` -> MMQ y-layout (`silu_mulq_mmq_ds4/d4`, bit-identical to mmq_quant_y's roundf/butterfly/half2 packing, saving the 35.6 MB fglu f32 round trip per layer) | 0.99x pp — the fglu round trip was already largely L2-resident |
+
+`.co` rebuilds are now definitively closed: rebuilding `mmq_native_q45.cu`
+*unchanged* with the current headers also segfaults (the shipped object is
+93,232 B vs the shipped 99,872 B, so the header/ABI revision differs), while the
+same recipe on `v4all_d.cu` reproduces a stream-identical tile object.
+
+Operational fix: a hipRTC compile error in any kernel source made `inject_rawhip`
+fail, and `bench` continued on the **CPU engine** while still printing "GPU"
+numbers (observed: a bad shuffle mask produced 1.5 t/s that looked like a slow
+GPU result). `bench` now returns the injection error instead of falling back;
+`infer`/`serve` keep the fallback.
+
+Final thermal-matched standing this session (llama ROCm 8b4b3558f, same GGUF,
+measured back-to-back):
+
+| | llama | ours | ratio |
+|---|---|---|---|
+| pp512 | 350.5 | 335 (338/331) | 0.956x |
+| tg32 | 11.54 | 11.02 (11.06/10.98) | 0.955x |
+
+Session net: pp512 313.8 (base 2bacd60) -> ~335-338 = **+7-8%**; tg32 10.92 ->
+11.02-11.08 = **+1%**; spec-MTP pp 84.6 -> 325-328 (+285%); spec tg 16.6 -> 19.4;
+serve np4 12.18 -> 21.48 (+76%); VL gate 5/5; judge 16/19 (3 reference-side).
