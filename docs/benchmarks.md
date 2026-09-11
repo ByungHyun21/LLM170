@@ -2628,3 +2628,32 @@ kernel over the same buffers) before any kernel change is made. What remains sol
 the MTP drafts are degenerate (near-constant generic tokens, 0/21 at chained positions),
 `cat = [enorm(emb), hnorm(h)]` matches canonical math at 4.3e-07, the q8 y-vector matches
 `cat` at 3.8e-3, and the uploaded weight bytes equal the file at row 0/2500/5119.
+
+## MTP RCA: reference structure from llama.cpp, and what is ruled out (2026-09-12)
+
+llama.cpp's tree (src/llama-context.cpp) carries the NextN/MTP reference:
+
+- `// extract nextn embeddings (hidden state before the final output norm)` - the head
+  input is the **pre-final-norm** hidden, which is what `raw_step_h` exports (match);
+- the MTP hook batch carries `(next-token id, h_nextn row)` - i.e. the head is fed the
+  embedding of the token being predicted together with the hidden of the position that
+  predicts it. Mapped to our loop that is exactly the pair `(h_{pos-1}, emb(t_pos))`
+  that `mtp_step_gpu` passes, so the pairing convention matches too;
+- plans/54 records the same APU/quant configuration reaching 70-80% draft acceptance
+  with MTP (25.8 t/s short-ctx, 16.1 at 70k) versus 25.7/10.7 without: our 19-23% is
+  therefore a defect, not a property of the model.
+
+Ruled out for our implementation this pass: pairing convention (both options ~19%),
+MTP KV accumulation (prompt length 16/128/512 identical), batched MTP prefill
+(`LLM170_CHUNK=64` identical), degenerate head output (intermediates sane),
+missing chain hidden (fixed, no change), weight layout (disk = VRAM bytes at three
+offsets; disk = gguf-py canonical), the q8 y-vector (matches `cat` at 3.8e-3, qsum
+words exact), the MTP KV being empty after prefill (probe `LLM170_DUMP_MTPKV`: the first
+4 rows of `mtp_kv_k` are non-zero after a 32-token prefill).
+
+New instrument kept: `LLM170_DUMP_MTPKV=1` prints non-zero count/max of the first 16 KB
+of the MTP K cache after each prefill call.
+
+Remaining step (unchanged): settle the first-stage GEMM with a GPU-side scalar reference
+kernel over the same buffers, since every host-side reconstruction - including the same
+method applied to the known-good main path - fails to reproduce the engine.
