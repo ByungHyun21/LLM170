@@ -22,10 +22,10 @@ void main() {
     int u = int(gl_WorkGroupID.y);
     int lane = int(gl_SubgroupInvocationID);
     int base_s = pair * pc.d * pc.d;
-    float s0 = s[base_s + (lane * 4 + 0) * pc.d + u];
-    float s1 = s[base_s + (lane * 4 + 1) * pc.d + u];
-    float s2 = s[base_s + (lane * 4 + 2) * pc.d + u];
-    float s3 = s[base_s + (lane * 4 + 3) * pc.d + u];
+    float s0 = s[base_s + u * pc.d + lane * 4 + 0];
+    float s1 = s[base_s + u * pc.d + lane * 4 + 1];
+    float s2 = s[base_s + u * pc.d + lane * 4 + 2];
+    float s3 = s[base_s + u * pc.d + lane * 4 + 3];
     for (int ti = 0; ti < pc.t; ti++) {
         int h = pair % pc.hv;
         int kh = h % pc.hk;
@@ -47,8 +47,8 @@ void main() {
         float otot = subgroupAdd(op);
         if (lane == 0) o[v0 + u] = otot * pc.scale;
     }
-    s[base_s + (lane * 4 + 0) * pc.d + u] = s0;
-    s[base_s + (lane * 4 + 1) * pc.d + u] = s1;
-    s[base_s + (lane * 4 + 2) * pc.d + u] = s2;
-    s[base_s + (lane * 4 + 3) * pc.d + u] = s3;
+    s[base_s + u * pc.d + lane * 4 + 0] = s0;
+    s[base_s + u * pc.d + lane * 4 + 1] = s1;
+    s[base_s + u * pc.d + lane * 4 + 2] = s2;
+    s[base_s + u * pc.d + lane * 4 + 3] = s3;
 }
