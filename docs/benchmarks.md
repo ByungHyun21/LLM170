@@ -2708,3 +2708,16 @@ np4 x spec4 aggregate (bench `LLM170_BENCH_NP=4`, natural text, single prompt in
 slots): 6.42 t/s aggregate over 128 tokens - 3x *worse* per token than one stream at
 19.98, so the merged-verify np path needs its own pass (the earlier session recorded
 27.1-28.1 for this configuration, so this is a regression to chase).
+
+## Judge after the q6_K fix: 16/19 PASS (was 10/21) - 2026-09-12
+
+`scripts/verify.py` judge phase against the same stored llama-server reference:
+
+- **all 10 spec cases pass** (`spec_short_seq0`, `spec_np4_seq0-3`, `spec_long_seq0`,
+  `spec_long_np4_seq0-3`) - the MTP stream is bit-correct end to end again;
+- np4_seq2/3, long_prompt, long_np2_seq0, long_np4_seq0/3, single_short, np4_seq0/1,
+  long_gen96 also pass (7 exact, 4 near-tie);
+- 3 failures, all *non-spec* long-prompt runs: long_np2_seq1 and long_np4_seq1 diverge
+  at gen[1] (ours = 13 vs 22, top-3, gap 5.99), long_np4_seq2 at gen[0] (ours = 248046
+  vs 561 - the documented flat-point alternative). These are the long-context numerics
+  class, unrelated to MTP.
