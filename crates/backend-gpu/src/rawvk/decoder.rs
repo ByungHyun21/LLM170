@@ -15,6 +15,7 @@ const GEMV8_Q3B_SPV: &[u8] = include_bytes!("spv/gemv8_q3b.spv");
 const GEMV8_Q6_SPV: &[u8] = include_bytes!("spv/gemv8_q6.spv");
 const GEMV8_Q8_SPV: &[u8] = include_bytes!("spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
+const GEMV8_Q5N_SPV: &[u8] = include_bytes!("spv/gemv8_q5n.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
@@ -1137,6 +1138,25 @@ impl DecoderState {
         if t < 16 && !g8_off {
             if self.gemv8_q5(qsrc, wkey, out, t, true).is_ok() {
                 return Ok(());
+            }
+        }
+        // plans/46: N토큰 gemv (q5_K, t≥2, LLM170_VK_Q5N=1 옵트인) — f32 활성 직접
+        // 사용, 가중 WG당 1회 판독(그리드 z=토큰블록×8 — 서로 다른 z가 같은 행을
+        // 동시에 읽어 L2 병합). coopmat 타일 대신 gemv8 접근의 f32 누산.
+        if t >= 2 && std::env::var("LLM170_VK_Q5N").map(|v| v == "1").unwrap_or(false) {
+            if let Some((wbufs2, ty2, ni2, no2)) = self.w.get(wkey).cloned() {
+                if ty2 == 13 {
+                    let mut binds2: Vec<vk::Buffer> = wbufs2.iter().map(|b| b.buf).collect();
+                    while binds2.len() < 8 {
+                        binds2.push(self.dummy.buf);
+                    }
+                    binds2.push(qsrc);
+                    binds2.push(out);
+                    let push2 = Self::push_u32s(&[ni2 as u32, no2 as u32, t as u32, 0, 0, 2]);
+                    let tb = 8usize;
+                    return self.run_pipe_b("gemv8_q5n", GEMV8_Q5N_SPV, 10, 24, &binds2, &push2,
+                        1, no2.div_ceil(2) as u32, t.div_ceil(tb) as u32, true);
+                }
             }
         }
         self.quant(qsrc, xq, nq, t)?;
