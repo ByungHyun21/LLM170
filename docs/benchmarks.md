@@ -2741,3 +2741,25 @@ chunk (measured 64 ms over a 512-token prefill). Closing it needs either a cheap
 construction for non-final prompt tokens or +5% on the base prefill, whose GEMM side is
 at the 12.3 TMAC/s FP32 ceiling of this iGPU (a WMMA path would break the CPU-bit-exact
 contract that the judge's spec equality relies on).
+
+## MTP prefill cost: 64 ms -> 29 ms (2026-09-12)
+
+`LLM170_MTP_TIMING=1` breaks the MTP prefill (t=512) down as: norms+cat 1.3 ms,
+eh_proj 3.3, qkv 5.2, attn+kv 4.0, FFN 21.8, head 7.1, plus ~21 ms of host<->device
+copies of the token embeddings and the shifted hidden.
+
+Two changes, both proven equivalent (base stream bit-identical; spec == non-spec;
+`LLM170_MTP_FULL=1` restore path shows identical tg):
+
+1. **KV-only prefill**: only the last row's attention/wo/FFN is computed (the MTP layer
+   is causal, so earlier rows' outputs are read by nobody - the head uses the last row
+   and the chain uses the decode-step hidden). Removes the FFN's 21.8 ms and the
+   attention's 4 ms over prompt rows.
+2. **Device-side h_shift**: new `row_shift_gather` kernel builds `[carry; hidden[0..t-1]]`
+   on the GPU from the main model's `xs_t`, so the 2 x t x n x 4 B host round trip per
+   chunk disappears (the caller now passes only the one-row carry).
+
+Measured (natural text, pp512/tg32/k=4, 2 reps): NOMTP 1474 ms (347.3 t/s) vs spec
+1506 ms (340.5 t/s) - the MTP prefill now costs 31 ms instead of 64 ms, so spec-mode pp
+is 0.99x of llama (343.7 t/s) instead of 0.97x. tg is unchanged at 16.0 t/s (1.48x
+non-spec 10.83) with either prefill variant.

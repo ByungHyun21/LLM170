@@ -488,3 +488,14 @@ extern "C" __global__ void q6k_ref_scalar(const float* yf, const unsigned char* 
     }
     out[o] = acc;
 }
+
+// 프리필 MTP h_shift: 행 시프트 (dst[0]=carry, dst[i]=src[i-1]) — 호스트 왕복 제거.
+// src는 본체 step_batch가 남긴 device hidden(xs_t), carry는 이전 청크 마지막 행.
+extern "C" __global__ void row_shift_gather(const float* src, const float* carry, float* dst,
+                                            int n, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * t) return;
+    int row = i / n;
+    int col = i - row * n;
+    dst[i] = (row == 0) ? carry[col] : src[(row - 1) * n + col];
+}
