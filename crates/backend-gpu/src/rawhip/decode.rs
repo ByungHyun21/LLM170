@@ -1115,10 +1115,13 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         emb: &[f32],
     ) -> Result<Vec<Vec<f32>>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
-        guard
-            .as_ref()
-            .ok_or("raw_decode: 미초기화")?
-            .step_batch_np(seqs, poss, emb)
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
+        let r = ds.step_batch_np(seqs, poss, emb);
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            eprintln!("{}", crate::rawhip::ktrace_dump());
+        }
+        r
     }
 
     fn mtp_step_chain(&self, seq: usize, tok_emb: &[f32], pos: usize) -> Result<u32, String> {
@@ -2501,17 +2504,36 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
-        self.ctx.gemm_tile_head(
-            self.xq_n_t as *const u8,
-            wh as *const u8,
-            self.ktab2 as *const u8,
-            th,
-            nih,
-            noh,
-            xq_sn,
-            t,
-            self.logits_all,
-        )?;
+        // 소형 t(2..=4)는 4-토큰 GEMV — 타일 헤드는 128열 고정이라 t=4에서 18%를 먹는다
+        // (1.04GB q6_K 헤드를 j128 타일로 읽어 29.7ms/스텝, 실측).
+        if (2..=4).contains(&t)
+            && th == 14
+            && std::env::var_os("LLM170_NO_G4").is_none()
+        {
+            self.ctx.gemm_g4(
+                th,
+                self.xq_n_t as *const u8,
+                wh as *const u8,
+                self.ktab2 as *const u8,
+                nih,
+                noh,
+                xq_sn,
+                t,
+                self.logits_all,
+            )?;
+        } else {
+            self.ctx.gemm_tile_head(
+                self.xq_n_t as *const u8,
+                wh as *const u8,
+                self.ktab2 as *const u8,
+                th,
+                nih,
+                noh,
+                xq_sn,
+                t,
+                self.logits_all,
+            )?;
+        }
         let mut out = Vec::with_capacity(t);
         let mut row = vec![0f32; noh];
         for s in 0..t {
