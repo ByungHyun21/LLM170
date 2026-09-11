@@ -2113,3 +2113,20 @@ Remaining np4 gap: ours ~20-21 t/s aggregate (CLI) vs llama-server 25.6. The
 step is now bounded by the y-side load issue (each of n_out rows re-reads the
 token activations) — the next structural step is multiple output rows per
 workgroup with y staged in shared memory (llama's MMVQ NUM_ROWS approach).
+
+### MMQ 64-row tile (plans/47 #28195) — attempted, not adopted (2026-09-12)
+
+llama.cpp's gfx115x MMQ config uses I=64 rows / 128 threads (38.4 KB smem, 3
+WGs/WGP) for J=128, versus the I=128 / 256-thread entry (58.9 KB, 2 WGs) our
+code objects were built with; plans/47 records a claimed 1.33x from that change.
+Attempted: patched `mmq-config-rdna3-5.cuh` (I=64, nthreads=128, occupancy=3 for
+the Q4_K/Q5_K/Q6_K/IQ4_XS J=128 entries), rebuilt `mmq.co` from
+`plans/i8_arc/mmq_native_q45.cu` via hipcc + bundle extraction (95,536 B, same
+mangled symbols), and added a matching launcher geometry (grid = ceil(n_out/64),
+block 32x4, smem = J*4 + I*76*4 + pad(J*144, nthreads*4) = 38,400 B).
+Result: deterministic SIGSEGV (rc=139) on the first GEMM, also with the smem
+overridden to 58,880 / 65,536, i.e. not a sizing issue — the kernel's internal
+mapping needs more host-side plumbing than the tile geometry alone (llama selects
+the config at runtime in `launch_mul_mat_q`, including the y-tile stride and the
+grid mapping that follow from it). Reverted (config restored, launcher untouched).
+Next attempt should port that plumbing rather than just the geometry.
