@@ -19,6 +19,7 @@ const GEMV8_Q5N_SPV: &[u8] = include_bytes!("spv/gemv8_q5n.spv");
 const GEMV8_NLB_SPV: &[u8] = include_bytes!("spv/gemv8_nlb.spv");
 const GEMV8_I3S_SPV: &[u8] = include_bytes!("spv/gemv8_i3s.spv");
 const GDN_ARF_SPV: &[u8] = include_bytes!("spv/gdn_arf.spv");
+const GDN_AR8F_SPV: &[u8] = include_bytes!("spv/gdn_ar8f.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
@@ -2010,6 +2011,22 @@ impl DecoderState {
                     let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
                     eprintln!("#  SB post-conv xs0={s0:.4}");
                 }
+                // plans/46: 프리필 융합 AR8 (split3+l2+beta_g 인라인) — 기본.
+                let ar8f_on = std::env::var("LLM170_VK_AR8F").map(|v| v != "0").unwrap_or(true);
+                if ar8f_on {
+                    let dtb = self.consts.get(&format!("blk.{il}.dt_bias")).cloned().ok_or("dtb")?;
+                    let ssa = self.consts.get(&format!("blk.{il}.ssm_a")).cloned().ok_or("ssa")?;
+                    let scale = 1.0f32 / (d_state as f32).sqrt();
+                    let mut push = Self::push_u32s(&[d_state as u32, k_len as u32, v_len as u32,
+                        dt_rank as u32, self.n_group as u32]);
+                    push.extend_from_slice(&scale.to_le_bytes());
+                    push.extend_from_slice(&(t as u32).to_le_bytes());
+                    push.extend_from_slice(&self.eps.to_le_bytes());
+                    self.run_pipe("gdn_ar8f", GDN_AR8F_SPV, 7, 32,
+                        &[self.st_gdn[recr_idx][seq].buf, self.b_gconv.buf,
+                          self.b_gb.buf, self.b_ga.buf, dtb.buf, ssa.buf, self.b_go.buf],
+                        &push, dt_rank as u32, d_state as u32 / 8, 1)?;
+                } else {
                 // split3 — flat total*t
                 {
                     let total = 2 * k_len + v_len;
@@ -2067,6 +2084,7 @@ impl DecoderState {
                           self.b_gv.buf, self.b_gbg.buf, self.b_go.buf],
                         &push, dt_rank as u32, argy, 1)?;
                 }
+                } // else (구 체인)
                 if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
                     self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
                     let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
