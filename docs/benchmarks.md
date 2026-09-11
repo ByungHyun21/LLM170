@@ -2484,3 +2484,27 @@ byte-identically on the session-start binary and on both intermediate binaries
 (llama-server np1/np4 and `-ngl 0` CPU all agree). A judge run with a stored
 reference from a different server config is not comparable to the previously
 recorded 23 PASS / 2 FAIL.
+
+## Open defect: MTP draft acceptance ~19% (found 2026-09-12)
+
+`--spec 4` currently *loses* throughput instead of gaining: tg 7.1-8.0 t/s versus
+11.1 non-spec, with `fwd == gen` (one token per forward, xN verification per token).
+Measured acceptance on natural text (`LLM170_BENCH_TEXT`, `LLM170_SPEC_DBG=1`):
+6 OK / 26 MISS at pp128, 2/14 at pp16, 1/15 at pp512 - i.e. 10-19% first-draft
+accuracy instead of the ~80% that 4-5 tokens/verify implies. The earlier recorded
+19.2-19.4 t/s (1.25x llama MTP) is not reproducible with the current build.
+
+What was ruled out (all measured):
+
+| hypothesis | test | result |
+|---|---|---|
+| draft/verify pairing convention | (tok_p, h_{p-1}) vs (tok_p, h_p), env A/B | both ~19% |
+| MTP KV accumulation over the prompt | acceptance vs prompt length (16/128/512) | flat (~19% everywhere) |
+| batched MTP prefill (blk.64, 5617bf5) | `LLM170_CHUNK=64` vs 512 | identical (6 OK both) |
+| degenerate head output | `LLM170_MTP_STAGE=1` intermediates | sane (eh=-117, wo=-113, ff=-340, logits 0-6) |
+| stale `gemv_q8_out` result overwriting `mm_direct` on eh_proj (the code called both; the RCA comment says that path is wrong at ni=10240) | removed the stale `mm_into` call | acceptance unchanged; the duplicate GEMM is gone (kept - it was pure waste) |
+
+Both the GPU head (`mtp_step_gpu`) and the CPU chain (`mtp_forward`, used for j>=1)
+misfire alike, so the defect is in shared state (weights layout, pair convention or
+head input) rather than one kernel. Drafts are frequently 220 (" "), i.e. the head is
+under-informed rather than broken.

@@ -1881,10 +1881,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.mtp_cur)?;
             eprintln!("[g] eh sum={:.5} x0={:.5} x1={:.5}", v.iter().map(|&x| x as f64).sum::<f64>(), v[0], v[1]);
         }
-        if std::env::var_os("LLM170_MTP_DBG").is_some() {
-            eprintln!("[mtp] eh_proj ty={te} ni={nie} no={noe} w={we:p} xq2={:p} cur={:p} cat={:p}", self.mtp_xq2, self.mtp_cur, self.mtp_cat);
-        }
-        self.mm_into(self.mtp_xq2, we, te, nie, noe, self.mtp_cur)?;
+        // (구 gemv_q8_out 경로 mm_into 호출 제거 — RCA: ni=10240에서 오값이
+        //  mm_direct 결과를 덮어써 MTP 초안 품질이 무너졌다. 2026-09-12)
         // attn_norm → q/k/v
         let an = *self.consts.get("blk.64.attn_norm").ok_or("attn_norm")?;
         self.rms(self.mtp_cur, an, self.mtp_e, n)?;
