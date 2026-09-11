@@ -2773,3 +2773,24 @@ instead of t x n per chunk). Verified token-for-token: a 2048-token prompt (4 ch
 gives identical output with spec and non-spec, and pp512/pp2048 gaps vs `LLM170_NOMTP=1`
 are 31 ms and 67 ms respectively (2.1% and 1.1% - the remaining cost is the draft
 layer's k/v projections and pair projection, which the KV genuinely needs).
+
+## Objective audit, post-optimization (2026-09-12, final for this pass)
+
+Interleaved with llama-bench, same model/prompt, natural text where the mode allows.
+
+| mode | metric | llama | ours | ratio |
+|---|---|---|---|---|
+| base | pp512 | 345.4 (350.8/339.9) | **347.0** (347.9/346.2) | **1.005x** |
+| base | tg32 | 11.50-11.68 | 10.83 | 0.94x |
+| MTP (k=4, GPU chain) | tg32 | 11.59 | **15.89** (15.92/15.86) | **1.37x** |
+| MTP | pp512 | 345.4 | 338.6 | 0.98x |
+| np4 (4 streams, 512-tok prompt) | tg aggregate | 12.51 | **16.28** | **1.30x** |
+| np4 | pp (single-stream prefill) | 345.4 | 347.0 | 1.005x |
+| mmproj | vision forward | 1.60 s (vision+prefill) | **1.1 s** (vision) | - |
+| mmproj | gate | - | 3 PASS / 1 FAIL (494/16311 flat point) | - |
+
+Remaining gaps, both quantified: base-mode tg (0.94x; the decode carries ~4 ms/token more
+non-GEMM work than llama - the decode attention's ~100-160 us/layer fixed cost plus
+contract-pinned small kernels at 17-30 us each for 2-5 us of work) and MTP-mode pp
+(0.98x; the draft layer's k/v and pair projections, ~17 ms per 512-token chunk, which the
+KV genuinely needs).
