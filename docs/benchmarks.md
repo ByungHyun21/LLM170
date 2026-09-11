@@ -2130,3 +2130,31 @@ mapping needs more host-side plumbing than the tile geometry alone (llama select
 the config at runtime in `launch_mul_mat_q`, including the y-tile stride and the
 grid mapping that follow from it). Reverted (config restored, launcher untouched).
 Next attempt should port that plumbing rather than just the geometry.
+
+## Batched MTP prefill (2026-09-12, final)
+
+Spec-mode prefill ran `blk.64` once per prompt token: four projections + FFN +
+KV append + flash at t=1, re-reading ~0.7 GB of MTP weights per token. The
+per-token cost (2.5 ms) is one trunk layer's worth, i.e. 512 tokens added 1.28 s
+to a 1.56 s prefill.
+
+`mtp_prefill_batch` runs the block once for the whole chunk:
+enorm/hnorm via `rms_rows` -> `cat2_rows` interleave -> eh_proj -> q/k/v ->
+batched `qk_norm_rope` -> `kv_append_t` -> the existing batched flash (split/wk
+variants) -> attn_output/FFN with the batch kernels, head only on the last row.
+Pairing is unchanged (MTP(tok_p, h_{p-1}), h_{-1} = pending) so the MTP KV and
+`mtp_pending_h` match the per-token path; new `RawDecode::mtp_prefill_batch`
+(default impl = per-token fallback, Vulkan unaffected). Two batch-buffer sizing
+bugs were caught by the HIP illegal-address fault: the shared xq scratch must
+cover `max(n, n_head*hd)` and `max(2n, n_ff)`.
+
+Natural-text spec bench (pp512, tg64, spec4, LLM170_SPEC_GPU=1, 2 reps):
+
+| metric | per-token MTP (head-skip) | batched MTP | plain |
+|---|---|---|---|
+| pp512 spec4 | 179.3 | **325.3-327.5** | 332 |
+| tg64 spec4 | 16.6-17.9 | **19.36-19.59** | 11.07 |
+
+Spec-mode prefill is now at the plain prefill rate, and spec-mode tg is +75%
+over plain. Gate (fresh llama reference, 16/19) unchanged: the same three
+reference-side FAILs with identical gaps, and **all 9 spec_* invariants exact**.
