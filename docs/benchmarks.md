@@ -1978,3 +1978,47 @@ tensors reach 400-457 GB/s (L2-resident). Per-tensor t=1 rates by type: q5_K 253
 q4_K 227, q6_K 204, iq4_xs 198, iq4_nl 158, q8_0 111 GB/s.
 The FFN gate/up GEMVs are already dispatched on two streams; the 4 GDN in-proj
 GEMVs use the fused dual kernels.
+
+## MTP / serve path defects found and fixed (2026-09-12, later)
+
+Two structural defects found while measuring the objective's MTP and np4 conditions:
+
+1. **MTP prefill ran a full-vocab head per prompt token.** The spec-mode prefill
+   loop (`prefill.rs`) called `mtp_step_gpu` for every prompt token, which
+   computes the output head (953 MB `output.weight` GEMV) and D2Hs h_next —
+   only the final token's draft is ever used. Added
+   `RawDecode::mtp_step_hidden(with_head)` (HIP override routes to the existing
+   `mtp_step_g(..., with_head=false)`), so KV accumulation skips the head.
+   Natural-text spec bench (pp512 spec4, LLM170_SPEC_GPU=1):
+   **pp 84.6 -> 179.3 t/s**; tg64 spec4 unchanged 16.3 -> 16.6-17.9 t/s.
+   `spec == nonspec` greedy equality re-verified exact.
+   Remaining spec-mode prefill overhead is the per-token MTP block itself
+   (~1.3 s / 512 tokens); a batched MTP prefill (one t=512 block pass) is the
+   next step, worth ~300 t/s pp under MTP.
+
+2. **serve serialised concurrent requests.** The slot loop only prefilled when
+   *no* slot decoded in that iteration; with 4 co-pending requests, slot 0
+   decoded forever and slots 1-3 never got prefilled (np4 aggregate = 4x the
+   single-stream wall). Prefill now also runs when any slot has unprefilled
+   tokens: **np4 aggregate 9.64 -> 12.18 t/s** (llama-server np4, same machine
+   and prompt: 25.6 t/s). The remaining np4 gap is in the batched-decode path
+   itself (t=4 step), not the scheduler: the CLI np4 (`infer` with 4 prompts)
+   reaches ~19.8 t/s, so the step kernels lose ~40% at batch 4 versus llama's
+   continuous batching.
+
+Reference numbers measured today (HIP, q35work.gguf, greedy, natural text for
+spec):
+| condition | ours | llama.cpp |
+|---|---|---|
+| pp512 / tg32 single stream | 330 / 11.07 | 353.62 / 11.47 |
+| tg64 spec4 (MTP, natural text) | 17.2 (pre-fix metrics) -> 16.6-17.9 | not reproducible today: `--spec-type draft-mtp` fails to load on the master build (ROCm0 16 GB alloc fails with the flag; docs' recorded reference 15.5 np4+MTP) |
+| np4 aggregate (120-tok prompt, 64 gen, client-side) | 12.18 (serve) / ~19.8 (CLI batched) | 25.6 (serve, np1 10.48 baseline) |
+| np4 x spec4 aggregate (CLI merged path) | 13.85 | — |
+
+Honest standing against the stated objective (pp and tg must both beat llama.cpp
+at MTP, mmproj and np4): **not met yet.** tg single-stream is at 0.965x, pp at
+0.93x, np4 at 0.48-0.77x, MTP-mode pp at ~0.5x (llama's prefill is unaffected by
+MTP). The blockers, in order of size: (a) the prefill GEMM (mul_mat_q at ~12
+TMAC/s, one workgroup per CU at 49-59 KB dynamic smem), (b) the q6_K MMQ route
+(+6.5% pp, currently producing garbage — requant layout defect), (c) the np4
+batched-decode step efficiency, (d) spec-mode prefill per-token MTP block.
