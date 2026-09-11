@@ -1034,6 +1034,21 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
+        // 진단: 프리필 후 MTP KV가 채워졌는지 (비영 검사)
+        if std::env::var_os("LLM170_DUMP_MTPKV").is_some() {
+            let nw = 4096usize; // 앞 16KB
+            let mut kv = vec![0f32; nw];
+            if let Some(buf) = ds.mtp_kv_k.get(seq).copied() {
+                let _ = ds.ctx.d2h(bytemuck::cast_slice_mut(&mut kv).as_mut(), buf);
+            }
+            let h = (pos0 + emb.len() / ds.n_embd) as usize;
+            eprintln!(
+                "# mtpkv seq={seq} pos0={pos0} rows={h} first16KB: nonzero={} max={:.4}",
+                kv.iter().filter(|v| **v != 0.0).count(),
+                kv.iter().fold(0f32, |a, b| a.max(b.abs()))
+            );
+        }
+
         // 전 토큰 최종 hidden d2h (MTP KV 적립용)
         let t = emb.len() / ds.n_embd;
         h_all.resize(t * ds.n_embd, 0.0);
