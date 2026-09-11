@@ -2688,3 +2688,23 @@ Effect on MTP (natural text, pp128/tg64/k=4):
 | spec vs non-spec stream | - | bit-identical, 25/25 tokens |
 
 19.98 t/s vs 11.0 non-spec is the 1.8x that the earlier session recorded (19.2-19.4).
+
+## Post-fix verification (2026-09-12, after the q6_K fix)
+
+MTP (natural text, pp128/tg64/k=4, `LLM170_SPEC_GPU=1`): **19.98 t/s** vs 11.0
+non-spec = 1.8x; spec stream bit-identical to non-spec (25/25 tokens). The CPU-chain
+path stays at 5.2 t/s - its per-draft CPU MTP layer (~150 ms) dominates, so the GPU
+chain is the production path.
+
+VL gate (`scripts/verify_vl.py`, judge phase): **3 PASS / 1 FAIL**
+
+| case | before fix | after fix |
+|---|---|---|
+| vl_spec_short | FAIL @gen[1] | FAIL @gen[12] - the documented 494/16311 flat point (top-2 gap 0.527), same pair that the np2 variants pass as a tie |
+| vl_spec_np2_seq0/1 | PASS (tie) | PASS (tie) |
+| vl_np2_isolation | FAIL | **PASS** |
+
+np4 x spec4 aggregate (bench `LLM170_BENCH_NP=4`, natural text, single prompt in 4
+slots): 6.42 t/s aggregate over 128 tokens - 3x *worse* per token than one stream at
+19.98, so the merged-verify np path needs its own pass (the earlier session recorded
+27.1-28.1 for this configuration, so this is a regression to chase).
