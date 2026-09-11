@@ -927,8 +927,12 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
-        // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
-        let w_eff = if ty == 14 {
+        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. mul_mat_q는 llama.cpp
+        // mmq.cuh 직인스턴스화라 정준 블록(ql|qh|scales|d)을 기대한다 — 과거의
+        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
+        // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
+        // LLM170_Q6RQ=1로만 복원.
+        let w_eff = if ty == 14 && std::env::var_os("LLM170_Q6RQ").is_some() {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
             if let Some(&p2) = c.get(&key) { p2 }
@@ -1060,8 +1064,12 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
-        // q6: 우리 레이아웃 → 정준 재배열 (캐시) 후 MMQ (부록46)
-        let w_eff = if ty == 14 {
+        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. mul_mat_q는 llama.cpp
+        // mmq.cuh 직인스턴스화라 정준 블록(ql|qh|scales|d)을 기대한다 — 과거의
+        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
+        // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
+        // LLM170_Q6RQ=1로만 복원.
+        let w_eff = if ty == 14 && std::env::var_os("LLM170_Q6RQ").is_some() {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
             if let Some(&p2) = c.get(&key) { p2 }

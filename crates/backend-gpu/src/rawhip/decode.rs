@@ -481,8 +481,8 @@ impl DecodeState {
                 return false;
             }
         }
-        if ty == 14 && std::env::var_os("LLM170_Q6MMQ").is_none() {
-            // q6_K: 기본은 타일(활성 q8 소비). DEQ16만 f32 직소비.
+        if ty == 14 && std::env::var_os("LLM170_NO_Q6MMQ").is_some() {
+            // q6_K 킬스위치: 타일 경로(활성 q8 소비). DEQ16만 f32 직소비.
             return std::env::var_os("LLM170_DEQ16").is_some()
                 && t >= 32
                 && super::co_loaded(super::CO_MMQ2);
@@ -2760,7 +2760,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         let only = { let _t = std::time::Instant::now(); std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok()) };
         if std::env::var_os("LLM170_NO_MMQ").is_none() || only.is_some() {
-            if (only.is_none() || only.map_or(false, |m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23) && (ty != 14 || std::env::var_os("LLM170_Q6MMQ").is_some()) && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
+            if (only.is_none() || only.map_or(false, |m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none()) && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
                 && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                         return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
