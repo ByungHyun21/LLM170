@@ -1892,6 +1892,19 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             out.extend_from_slice(bytemuck::cast_slice(&ev));
             std::fs::write(format!("{pref}.f32"), &out).map_err(|e| e.to_string())?;
             // y(q8) 원시 워드 — quant 레이아웃 검증용 (2n: int8 워드 + 스케일 + qsum)
+            // 업로드된 가중치 버퍼 앞부분(GPU) vs 파일 비교용
+            let mut wv = vec![0u32; 64];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut wv).as_mut(), we)?;
+            std::fs::write(format!("{pref}.wfirst.u32"), bytemuck::cast_slice(&wv)).map_err(|e| e.to_string())?;
+            // 중간/끝 구간도 대조 (부분 업로드 탐지): row 2500 / row 5119 시작
+            let off_mid = 2500usize * 40 * 210;
+            let off_end = 5119usize * 40 * 210;
+            let mut wm = vec![0u32; 64];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut wm).as_mut(), unsafe { we.add(off_mid) })?;
+            std::fs::write(format!("{pref}.wmid.u32"), bytemuck::cast_slice(&wm)).map_err(|e| e.to_string())?;
+            let mut we2 = vec![0u32; 64];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut we2).as_mut(), unsafe { we.add(off_end) })?;
+            std::fs::write(format!("{pref}.wend.u32"), bytemuck::cast_slice(&we2)).map_err(|e| e.to_string())?;
             let xq_words = 2 * n / 4 + 2 * n / 32 + 2 * n / 16;
             let mut xv = vec![0u32; xq_words];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut xv).as_mut(), self.mtp_xq2)?;
