@@ -1,0 +1,134 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_q5n (plans/46) — q5_K N토큰(8) gemv. gemv8_q5b의 매핑·디양자화를 그대로
+// 쓰고 토큰 루프를 WG 내부로: 가중은 WG당 1회 판독(그리드 y=행, z=토큰블록
+// ×8 — 서로 다른 z의 WG가 같은 행을 동시에 읽어 L2 병합, DRAM은 1회).
+// 산식: q5b와 동일 by-측 폴딩(스케일 그룹별)을 토큰별 반복 — f32 누산.
+// 누산 acc[2][8] 레지스터 상주, LDS 미사용, coopmat 미사용.
+layout(local_size_x = 64) in;
+struct Blk {
+    f16vec2 dm;
+    uint16_t scales[6];
+    uint16_t qh[16];
+    uint16_t qs[64];
+};
+layout(binding = 0) readonly buffer AP16S { Blk ablk[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };   // [t][n_in]
+layout(binding = 9) buffer Obuf { float outv[]; };          // [t][n_out]
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+#define TB 8
+
+uvec4 unpk8(uint x) {
+    return uvec4(x & 0xFFu, (x >> 8) & 0xFFu, (x >> 16) & 0xFFu, x >> 24);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    const uint tok0 = gl_WorkGroupID.z * TB;
+    const uint nt = min(TB, pc.t - tok0);
+    if (nt == 0u) return;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint num_blocks_per_row = pc.n_in / 256u;
+    const uint it_size = 64u / 16u;   // 4
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;
+    const uint il = itid / 4u;
+    const uint ir = itid - 4u * il;
+    const uint v_im = il / 2u;
+    const uint v_in = il % 2u;
+    const uint l0 = 4u * ir + 2u * v_in;
+    const uint q_offset = 32u * v_im + l0;
+    const uint y_offset = 64u * v_im + l0;
+    float acc0[TB], acc1[TB];
+    [[unroll]] for (uint k = 0; k < TB; k++) { acc0[k] = 0.0; acc1[k] = 0.0; }
+
+    for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        const uint y1 = i * 256u + y_offset;
+        // 토큰별 by 16값 로드 (L2 상주 활성)
+        float by[TB][16];
+        [[unroll]] for (uint k = 0; k < TB; k++) {
+            if (k >= nt) break;
+            const uint yb = (tok0 + k) * pc.n_in + y1;
+            by[k][0]  = xa[yb];        by[k][1]  = xa[yb + 1u];
+            by[k][2]  = xa[yb + 16u];  by[k][3]  = xa[yb + 17u];
+            by[k][4]  = xa[yb + 32u];  by[k][5]  = xa[yb + 33u];
+            by[k][6]  = xa[yb + 48u];  by[k][7]  = xa[yb + 49u];
+            by[k][8]  = xa[yb + 128u]; by[k][9]  = xa[yb + 129u];
+            by[k][10] = xa[yb + 144u]; by[k][11] = xa[yb + 145u];
+            by[k][12] = xa[yb + 160u]; by[k][13] = xa[yb + 161u];
+            by[k][14] = xa[yb + 176u]; by[k][15] = xa[yb + 177u];
+        }
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint ib = (first_row + n) * num_blocks_per_row + i;
+            const vec2 dm = vec2(ablk[ib].dm);
+            const uint s0 = uint(ablk[ib].scales[v_im]);
+            const uint s4 = uint(ablk[ib].scales[v_im + 2u]);
+            const uint s8 = uint(ablk[ib].scales[v_im + 4u]);
+            const uint s_0_4_l = (s4 << 16) | s0;
+            const uint s_0_4_h = (s_0_4_l & 0xC0C0C0C0u) >> 2;
+            const uvec4 s_l4 = unpk8(s_0_4_l & 0x3F3F3F3Fu);
+            const uvec4 s_84 = unpk8((((s8 << 12) | s8) & 0x0F0F0F0Fu) | s_0_4_h);
+            const float sc0 = float(s_l4.x), sc1 = float(s_l4.y), sc2 = float(s_l4.z), sc3 = float(s_l4.w);
+            const float sc4 = float(s_84.x), sc5 = float(s_84.y), sc6 = float(s_84.z), sc7 = float(s_84.w);
+            const uint q_a = uint(ablk[ib].qs[q_offset / 2u]) | (uint(ablk[ib].qs[q_offset / 2u + 8u]) << 16);
+            const uint q_b = uint(ablk[ib].qs[q_offset / 2u + 32u]) | (uint(ablk[ib].qs[q_offset / 2u + 40u]) << 16);
+            uint a_lo = q_a & 0x0F0F0F0Fu;
+            uint a_hi = (q_a >> 4) & 0x0F0F0F0Fu;
+            uint b_lo = q_b & 0x0F0F0F0Fu;
+            uint b_hi = (q_b >> 4) & 0x0F0F0F0Fu;
+            const uint qh = uint(ablk[ib].qh[l0 / 2u]) | (uint(ablk[ib].qh[l0 / 2u + 8u]) << 16);
+            a_lo += ((qh >> (2u * v_im)) & 0x01010101u) << 4;
+            a_hi += ((qh >> (2u * v_im)) & 0x02020202u) << 3;
+            b_lo += (qh >> (2u * v_im)) & 0x10101010u;
+            b_hi += ((qh >> (2u * v_im)) & 0x20202020u) >> 1;
+            const uvec4 v_a_lo = unpk8(a_lo), v_a_hi = unpk8(a_hi), v_b_lo = unpk8(b_lo), v_b_hi = unpk8(b_hi);
+            const float q0 = float(v_a_lo.x), q1 = float(v_a_lo.y), q2 = float(v_a_lo.z), q3 = float(v_a_lo.w);
+            const float q4 = float(v_a_hi.x), q5 = float(v_a_hi.y), q6 = float(v_a_hi.z), q7 = float(v_a_hi.w);
+            const float q8 = float(v_b_lo.x), q9 = float(v_b_lo.y), q10 = float(v_b_lo.z), q11 = float(v_b_lo.w);
+            const float q12 = float(v_b_hi.x), q13 = float(v_b_hi.y), q14 = float(v_b_hi.z), q15 = float(v_b_hi.w);
+            [[unroll]] for (uint k = 0; k < TB; k++) {
+                if (k >= nt) break;
+                const float b0 = by[k][0], b1 = by[k][1], b2 = by[k][2], b3 = by[k][3];
+                const float b4 = by[k][4], b5 = by[k][5], b6 = by[k][6], b7 = by[k][7];
+                const float b8 = by[k][8], b9 = by[k][9], b10v = by[k][10], b11 = by[k][11];
+                const float b12 = by[k][12], b13 = by[k][13], b14 = by[k][14], b15 = by[k][15];
+                const float sx = fma(b0, q0, fma(b1, q1, fma(b2, q2, b3 * q3)));
+                const float sy = fma(b4, q4, fma(b5, q5, fma(b6, q6, b7 * q7)));
+                const float sz = fma(b8, q8, fma(b9, q9, fma(b10v, q10, b11 * q11)));
+                const float sw = fma(b12, q12, fma(b13, q13, fma(b14, q14, b15 * q15)));
+                const float smin =
+                    fma(b0 + b1 + b2 + b3, sc2,
+                    fma(b4 + b5 + b6 + b7, sc3,
+                    fma(b8 + b9 + b10v + b11, sc6,
+                        (b12 + b13 + b14 + b15) * sc7)));
+                const float r = dm.x * fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))) - dm.y * smin;
+                if (n == 0u) acc0[k] += r; else acc1[k] += r;
+            }
+        }
+    }
+    const float r0[TB] = { subgroupAdd(acc0[0]), subgroupAdd(acc0[1]), subgroupAdd(acc0[2]), subgroupAdd(acc0[3]),
+                           subgroupAdd(acc0[4]), subgroupAdd(acc0[5]), subgroupAdd(acc0[6]), subgroupAdd(acc0[7]) };
+    const float r1[TB] = { subgroupAdd(acc1[0]), subgroupAdd(acc1[1]), subgroupAdd(acc1[2]), subgroupAdd(acc1[3]),
+                           subgroupAdd(acc1[4]), subgroupAdd(acc1[5]), subgroupAdd(acc1[6]), subgroupAdd(acc1[7]) };
+    if (tid == 0u) {
+        [[unroll]] for (uint k = 0; k < TB; k++) {
+            if (k >= nt) break;
+            if (num_rows > 0u) outv[(tok0 + k) * pc.n_out + first_row] = r0[k];
+            if (num_rows > 1u) outv[(tok0 + k) * pc.n_out + first_row + 1u] = r1[k];
+        }
+    }
+}
