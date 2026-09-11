@@ -2231,3 +2231,31 @@ one-time 7.1 s mmproj weight upload per process, i.e. a cold-start cost).
 Note the decode rate here (12.8 t/s) is higher than the bench tg32 (11.06): the
 VL context is ~360 tokens and a single stream, so this is the same short-context
 effect llama shows (their 12.31 t/s).
+
+## Session summary (2026-09-12, HIP focus)
+
+Consolidated interleaved A/B of the whole session, 3 pairs, base = 2bacd60:
+
+| metric | base | now | delta | llama.cpp | ratio |
+|---|---|---|---|---|---|
+| pp512 | 309.2 | **334.6** | +8.2% | 353.62 | 0.946x |
+| tg32 | 10.98 | **11.04** | +0.5% | 11.47 | 0.963x |
+| spec4 pp512 (MTP, natural text) | 84.6 | **325-328** | +285% | (n/a) | — |
+| spec4 tg64 | 16.6 | **19.4-19.6** | +18% | (n/a) | — |
+| np4 aggregate (CLI, 4x64 tok) | 19.8 | **~23.4** | +18% | 25.6 | 0.91x |
+| np4 aggregate (serve) | 9.64 | 12.18 | +26% | 25.6 | 0.48x |
+| VL request (steady state) | — | 6.0 s | — | 3.68 s | 0.61x |
+
+Adopted: rmsq/rms_part/rms_finish vectorisation, MMQ activation-quant skip,
+q6_K MMQ route fixed and enabled, MTP head-skip + batched MTP prefill,
+serve prefill interleave, 4-token GEMV (all types + head), KTRACE coverage.
+
+Falsified with measurements: small-t MMQ, MTP accumulation window, GDN AR
+prefetch, AR smem variant, DEQ16, ARCHUNK, two attention variants, two
+`.co` rebuilds, MMQ I=64 geometry.
+
+Remaining, ranked: (1) prefill GEMM (`mul_mat_q` 955 ms/pass at 12 TMAC/s,
+1 WG/CU at 58.9 KB smem — the `.co` is immutable without its header revision,
+so the alternative is a new WMMA f16 GEMM); (2) np step state kernels
+(conv/AR/flash = 21.6 ms of 163.8 ms per t=4 step, 448 launches); (3) vision
+encoder (3.0 s vs llama ~1.2 s).
