@@ -578,7 +578,7 @@ impl DecodeState {
                 // q8듀얼시 qkv/gate를 건너뛰었다 (부록90).
                 if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
-                } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+                } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
                     self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
@@ -589,7 +589,7 @@ impl DecodeState {
                 }
                 if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
                     self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
-                } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+                } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
                     self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
@@ -918,7 +918,7 @@ impl DecodeState {
                 self.rms(self.xs, pw, self.xn, n)?;
                 self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
                 self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
-            } else if std::env::var_os("LLM170_NO_PAIRS").is_none() {
+            } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
                 self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
                 self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
