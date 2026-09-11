@@ -70,10 +70,21 @@ extern "C" __global__ void rms_part(const float* x, double* part, int n) {
     int lo = u * chunk;
     if (lo >= n) { part[row * 32 + u] = 0.0; return; }
     int hi = min(lo + chunk, n);
-    int xb = row * n;
+    const float* xr = x + (size_t)row * n;
     float acc = 0.0f;  // f32 세그먼트 (f64 1/16 레이트) — 미러 sq_sum과 쌍
-    for (int i = lo; i < hi; i++) {
-        float dv = x[xb + i];
+    int i = lo;
+    // 4원소 벡터 로드 — 가산 순서는 스칼라판과 동일(x,y,z,w). n%4!=0이면 스칼라만.
+    if ((n & 3) == 0) {
+        for (; i + 4 <= hi; i += 4) {
+            float4 v = *reinterpret_cast<const float4*>(xr + i);
+            float d0 = v.x; acc += d0 * d0;
+            float d1 = v.y; acc += d1 * d1;
+            float d2 = v.z; acc += d2 * d2;
+            float d3 = v.w; acc += d3 * d3;
+        }
+    }
+    for (; i < hi; i++) {
+        float dv = xr[i];
         acc += dv * dv;
     }
     part[row * 32 + u] = (double)acc;
@@ -90,18 +101,34 @@ extern "C" __global__ void rms_finish(const float* x, const float* w, const doub
     }
     float scale32 = (float)sqrt(sum / (double)n + (double)eps);
     float inv = 1.0f / scale32;
-    int xb = row * n;
-    int wb = (row % w_reps) * n;
-    int schunk = (n + 31) >> 5;
-    int lo = (tid % 32) * schunk;
-    if (lo < n) {
-        int hi = min(lo + schunk, n);
-        // 256스레드 = 8그룹×32 — 그룹별 같은 청크, 그룹 내 스트라이드 분할
-        int g = tid >> 5;
-        int gs = (hi - lo + 7) >> 3;
-        int l2 = lo + g * gs;
-        int h2 = min(l2 + gs, hi);
-        for (int i = l2; i < h2; i++) out[xb + i] = x[xb + i] * inv * w[wb + i];
+    if ((n & 3) != 0) {
+        // n%4!=0 폴백 — 원본 매핑 유지 (벡터 경로 정렬 불가)
+        int schunk = (n + 31) >> 5;
+        int lo = (tid % 32) * schunk;
+        if (lo < n) {
+            int hi = min(lo + schunk, n);
+            int g = tid >> 5;
+            int gs = (hi - lo + 7) >> 3;
+            int l2 = lo + g * gs;
+            int h2 = min(l2 + gs, hi);
+            for (int i = l2; i < h2; i++) out[(size_t)row * n + i] = x[(size_t)row * n + i] * inv * w[(size_t)(row % w_reps) * n + i];
+        }
+        return;
+    }
+    // 원소별 독립 — float4 스트라이드(완전 코얼레스). 곱 결합은 (x*inv)*w 유지.
+    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)row * n);
+    const float4* w4 = reinterpret_cast<const float4*>(w + (size_t)(row % w_reps) * n);
+    float4* o4 = reinterpret_cast<float4*>(out + (size_t)row * n);
+    int n4 = n >> 2;
+    for (int i = tid; i < n4; i += blockDim.x) {
+        float4 vx = x4[i];
+        float4 vw = w4[i];
+        float4 r;
+        r.x = vx.x * inv * vw.x;
+        r.y = vx.y * inv * vw.y;
+        r.z = vx.z * inv * vw.z;
+        r.w = vx.w * inv * vw.w;
+        o4[i] = r;
     }
 }
 // q/k norm+rope (f64 중간 — FMA 수축 면역, qk_norm_rope 이식)

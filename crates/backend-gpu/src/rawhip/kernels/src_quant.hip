@@ -128,17 +128,18 @@ extern "C" __global__ void quant_q8(const float* x, unsigned* xq, int n, int xq_
 extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
                                 float eps, int n) {
     int u = threadIdx.x;
-    if (u >= 32) return;
     int chunk = (n + 31) >> 5;
-    int lo = u * chunk;
-    int hi = min(lo + chunk, n);
     __shared__ double part[32];
     __shared__ float inv_s;
-    float acc = 0.0f;
-    if (lo < n) {
-        for (int i = lo; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
+    if (u < 32) {
+        int lo = u * chunk;
+        int hi = min(lo + chunk, n);
+        float acc = 0.0f;
+        if (lo < n) {
+            for (int i = lo; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
+        }
+        part[u] = (double)acc;
     }
-    part[u] = (double)acc;
     __syncthreads();
     if (u == 0) {
         double sum = 0.0;
@@ -152,9 +153,11 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     float inv = inv_s;
     int nwords = n >> 2;
     int nblk = n >> 5;
-    if (lo < n) {
-        for (int blk = 0; blk < (chunk >> 5); blk++) {
-            int base = lo + blk * 32;
+    // 스레드당 1개 32-블록 — base는 이전 (u*5+blk) 매핑과 동일 → 산술 불변.
+    int b = u;
+    if (b < nblk) {
+        {
+            int base = b << 5;
             float xv[32];
             #pragma unroll
             for (int i = 0; i < 32; i++) xv[i] = x[base + i] * inv * w[base + i];

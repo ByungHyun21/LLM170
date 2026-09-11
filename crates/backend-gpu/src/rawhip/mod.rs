@@ -34,6 +34,10 @@ fn name_leak(n: &str) -> &'static str {
 
 pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
 pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
+/// MMQ mul_mat_q 동적 smem 상한 설정 캐시 — 런치마다 드라이버 호출하지 않도록.
+/// (hipFuncSetAttribute는 커널 로드 갱신을 유발할 수 있어 GEMM마다 부르면 손해)
+static MMQ_SMEM_SET: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(usize, i32)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())
@@ -350,6 +354,20 @@ impl RawCtx {
         unsafe { ck(hip::hipStreamSynchronize(self.stream), "sync") }
     }
 
+    /// KTRACE 전용 이벤트 마커 — launch3를 거치지 않는 직접 런치 경로용.
+    fn ktr_mark(&self, name: &'static str, gy: u32) {
+        if let Ok(mut g) = KTRACE.lock() {
+            if g.is_some() {
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                unsafe {
+                    hip::hipEventCreateWithFlags(&mut ev, 0);
+                    hip::hipEventRecord(ev, self.stream);
+                }
+                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            }
+        }
+    }
+
     /// 커널 런치 — args는 각 인자 값에 대한 포인터 배열 (호출자 슬롯 유지).
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
@@ -362,7 +380,23 @@ impl RawCtx {
     ) -> Result<(), String> {
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev0, 0);
+                    hip::hipEventRecord(ev0, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                }
+            }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev, 0);
+                    hip::hipEventRecord(ev, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                }
+            }
         }
         Ok(())
     }
@@ -949,7 +983,9 @@ impl RawCtx {
                     &mut nt as *mut _ as *mut std::ffi::c_void,
                     &mut ni_a as *mut _ as *mut std::ffi::c_void,
                 ];
+                self.ktr_mark("mmq_quant_y", t as u32);
                 ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+                self.ktr_mark("mmq_quant_y", t as u32);
             }
             if let Ok(mut c) = self.mmq_y_cache.lock() { *c = (c.0, y_key.0, y_key.1); }
         }
@@ -993,7 +1029,9 @@ impl RawCtx {
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
                 one.as_mut_ptr() as *mut _,
             ];
+            self.ktr_mark("mul_mat_q", t as u32);
             ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
+            self.ktr_mark("mul_mat_q", t as u32);
         if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
             eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
                 (n_out + 127) / 128, (t + 127) / 128, n_in / 256, n_out, n_out);
