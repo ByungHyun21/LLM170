@@ -2582,3 +2582,30 @@ path and the VL spec path. `vl_np2_isolation` is a separate state-isolation find
 the np2 batched vision run must match the single run token for token at the same t.
 Both need the next session; the vision *quality* checks (keyword semantics vs
 llama --mmproj) need the collect phase with llama-server running.
+
+## MTP RCA, fourth pass: every input verified, output still inconsistent (2026-09-12)
+
+Verified for `blk.64.nextn.eh_proj.weight` (q6_K, [10240 x 5120]):
+
+| element | check | result |
+|---|---|---|
+| weights on disk | `llm170 dequant` vs gguf-py, rows 0/1000/3000/5119 | exact match (canonical) |
+| weights in VRAM | d2h of the engine's uploaded buffer vs file, first/mid/end (row 0 / 2500 / 5119) | byte-identical |
+| y input | dumped q8 buffer vs `cat` = [enorm(emb), hnorm(h)] | 3.8e-3 (quantization), qsum words exact |
+| `cat` itself | vs canonical RMS math on the dumped emb/h | 4.3e-07 |
+| instrument | two prompts -> different dumps; md5 differs; all four vectors from one call | ok |
+
+Yet the dumped eh_proj output matches *no* constructed reference: canonical `W @ y`
+(rel 0.16-28), dims swapped (`Wf.reshape(10240,5120) @ y[:5120]`, 0.8-11), or a
+truncated column range (0.8-11). `w4a8-check` is not evidence here - it validates the
+CPU w4a8 kernel against CPU f32, not the GPU path. `rawhip-check` fails for q5_K and
+q6_K while the engine is CPU-bit-exact for those types in the main model, so that
+probe is also not an oracle.
+
+Consequence: `gemm_q6k` is proven correct for the main model's shapes (5120/6144/
+17408 wide rows, CPU-bit-exact stream) but produces values inconsistent with the
+canonical product for this 10240-wide row. Since no *input* differs, the next step is
+a scalar reference kernel launched on the GPU (one thread per output row, explicit
+indices, no v4/tree/gather tricks) over the same buffers - that isolates the kernel's
+indexing from every Rust-side argument-passing question, which is the only remaining
+class of explanation.
