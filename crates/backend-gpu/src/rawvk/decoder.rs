@@ -18,6 +18,7 @@ const GEMV8_Q5B_SPV: &[u8] = include_bytes!("spv/gemv8_q5b.spv");
 const GEMV8_Q5N_SPV: &[u8] = include_bytes!("spv/gemv8_q5n.spv");
 const GEMV8_NLB_SPV: &[u8] = include_bytes!("spv/gemv8_nlb.spv");
 const GEMV8_I3S_SPV: &[u8] = include_bytes!("spv/gemv8_i3s.spv");
+const GDN_ARF_SPV: &[u8] = include_bytes!("spv/gdn_arf.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
@@ -1669,7 +1670,22 @@ impl DecoderState {
                         &[self.b_gqkv.buf, cw.buf, self.st_conv[recr_idx][seq].buf, self.b_gconv.buf],
                         &push, conv_ch.div_ceil(64) as u32, 1, 1)?;
                 }
-                // split3
+                // plans/46: 융합 AR (split3+l2+beta_g 인라인, 비트동일) — 기본.
+                let arf_on = std::env::var("LLM170_VK_ARF").map(|v| v != "0").unwrap_or(true);
+                if arf_on && gskip & 1 == 0 {
+                    let dtb2 = self.consts.get(&format!("blk.{il}.dt_bias")).cloned().ok_or("dtb")?;
+                    let ssa2 = self.consts.get(&format!("blk.{il}.ssm_a")).cloned().ok_or("ssa")?;
+                    let scale2 = 1.0f32 / (d_state as f32).sqrt();
+                    let mut push2 = Self::push_u32s(&[d_state as u32, k_len as u32, v_len as u32,
+                        dt_rank as u32, self.n_group as u32]);
+                    push2.extend_from_slice(&scale2.to_le_bytes());
+                    push2.extend_from_slice(&1u32.to_le_bytes());
+                    push2.extend_from_slice(&self.eps.to_le_bytes());
+                    self.run_pipe("gdn_arf", GDN_ARF_SPV, 7, 32,
+                        &[self.st_gdn[recr_idx][seq].buf, self.b_gconv.buf,
+                          self.b_gb.buf, self.b_ga.buf, dtb2.buf, ssa2.buf, self.b_go.buf],
+                        &push2, dt_rank as u32, d_state as u32, 1)?;
+                } else {
                 {
                     let total = 2 * k_len + v_len;
                     let push = Self::push_u32s(&[k_len as u32, k_len as u32, v_len as u32]);
@@ -1693,8 +1709,8 @@ impl DecoderState {
                         &[self.b_gb.buf, self.b_ga.buf, dtb.buf, ssa.buf, self.b_gbg.buf],
                         &push, dt_rank.div_ceil(64) as u32, 1, 1)?;
                 }
-                // AR (LLM170_VK_GDN_SKIP=1이면 스킵 — L3 크래시 분리용)
-                if gskip & 1 == 0 {
+                } // else (구 체인)
+                if !arf_on && gskip & 1 == 0 {
                 {
                     let scale = 1.0f32 / (d_state as f32).sqrt();
                     let mut push = Self::push_u32s(&[d_state as u32, k_len as u32, v_len as u32, dt_rank as u32, self.n_group as u32]);
