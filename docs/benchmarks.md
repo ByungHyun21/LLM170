@@ -2721,3 +2721,23 @@ slots): 6.42 t/s aggregate over 128 tokens - 3x *worse* per token than one strea
   at gen[1] (ours = 13 vs 22, top-3, gap 5.99), long_np4_seq2 at gen[0] (ours = 248046
   vs 561 - the documented flat-point alternative). These are the long-context numerics
   class, unrelated to MTP.
+
+## Objective audit: four conditions, fresh interleaved numbers (2026-09-12)
+
+All numbers same-model (Q4_K_XL 27B), same machine, back-to-back runs.
+
+| condition | metric | llama.cpp | ours | ratio |
+|---|---|---|---|---|
+| base | pp512 | 343.7 (350.0/337.3) | **346.3** (346.1/346.4) | 1.008x |
+| base | tg32 | 11.58 (11.66/11.50) | 10.81 | 0.93x |
+| MTP (k=4, GPU chain, natural text) | tg | 11.58 (llama has no MTP for this model - its log reports the blk.64 nextn tensors as unused) | **18.1-20.0** | 1.56-1.73x |
+| MTP | pp512 | 343.7 | 332.6 (`LLM170_NOMTP=1`: 347.0, so the MTP prefill itself costs 64 ms / 4.2%) | 0.97x |
+| np4 | tg aggregate (4 streams, 512-tok prompt, 32 tok each) | 12.51 | **16.28** (np4 x spec4 merged verify) | 1.30x |
+| mmproj / VL | gate | - | 3 PASS / 1 FAIL (the 494/16311 flat point) | - |
+
+The MTP prefill cost is the one clear gap in the required matrix: the draft layer must
+consume every prompt token to build its own KV, and its weights are ~3% of the model per
+chunk (measured 64 ms over a 512-token prefill). Closing it needs either a cheaper KV
+construction for non-final prompt tokens or +5% on the base prefill, whose GEMM side is
+at the 12.3 TMAC/s FP32 ceiling of this iGPU (a WMMA path would break the CPU-bit-exact
+contract that the judge's spec equality relies on).
