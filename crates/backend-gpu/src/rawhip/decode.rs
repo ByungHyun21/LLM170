@@ -1891,6 +1891,11 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             out.extend_from_slice(bytemuck::cast_slice(&cv));
             out.extend_from_slice(bytemuck::cast_slice(&ev));
             std::fs::write(format!("{pref}.f32"), &out).map_err(|e| e.to_string())?;
+            // y(q8) 원시 워드 — quant 레이아웃 검증용 (2n: int8 워드 + 스케일 + qsum)
+            let xq_words = 2 * n / 4 + 2 * n / 32 + 2 * n / 16;
+            let mut xv = vec![0u32; xq_words];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut xv).as_mut(), self.mtp_xq2)?;
+            std::fs::write(format!("{pref}.xq.u32"), bytemuck::cast_slice(&xv)).map_err(|e| e.to_string())?;
         }
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
             self.ctx.sync()?;
