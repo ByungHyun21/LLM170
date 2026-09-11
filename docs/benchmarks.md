@@ -1901,3 +1901,80 @@ End state: tg 11.86 (0.977x), pp512 305-318 (0.87-0.90x) of llama.cpp Vulkan
 on the reference APU. 22 falsified hypotheses are logged in this file; the
 remaining gap localises to vector-ALU instruction mix inside the quantized
 kernels (RGP-measured 79% VALU) and diffuse non-GEMM pipeline costs.
+
+## HIP re-baseline and RMS-kernel round (2026-09-12)
+
+Backend focus moved to ROCm/HIP (the Vulkan arc closed at 0.977x tg / 0.87-0.90x pp).
+Interleaved A/B harness: `scripts/ab_bench.sh <binA> <binB> <reps> --pp 512 --tg 32`
+(A/B alternation cancels the ~3% thermal drift that made single-run comparisons
+unreliable; all ratios below are B/A medians of 3 pairs).
+
+Reference (llama.cpp build 8b4b3558f, same GGUF `q35work.gguf`, `-ngl 99 -fa 1`,
+llama-bench): **pp512 353.62, tg32 11.47**.  Our zero-config HIP at HEAD (2bacd60):
+**pp512 313.6, tg32 10.98** (0.887x / 0.958x).
+
+### Where the prefill time goes (LLM170_KTRACE=1, t=512 single pass)
+
+After extending KTRACE to `launch()` and the direct MMQ launches (the MMQ GEMMs
+were previously invisible — they are launched with `hipModuleLaunchKernel`, not
+through `launch3`), the 512-token pass decomposes as:
+
+| item | ms | note |
+|---|---|---|
+| mul_mat_q (q4_K/q5_K/iq4_xs) | 955 | 221 launches, 59 GB/s effective on 4x weight re-reads |
+| q6_K tiles (j128) | 163 | 2.86 GB at 70 GB/s |
+| gdn AR scan | 99 | 48 layers, sequential over 512 tokens |
+| qsa_flash_wk + merge | 60 | 16 full-attention layers |
+| q8_0 / iq4_nl / q3_K / iq3_s tiles | 81 | |
+| rms_part + rms_finish | 104 -> 20 | fixed this round (below) |
+| silu_mul_f32 | 28 | 244 GB/s, at streaming limit |
+| norm_gated_silu_f32 | 22 | one warp per row, ~82 GB/s |
+| quant_q8 | 25 -> 6 | skippable for f32-direct consumers |
+| mmq_quant_y | 18 | y re-quantized per GEMM (cache disabled since 부록90) |
+| axpy/split3/conv/qk_rope/l2 | 38 | |
+
+### Adopted this round
+
+1. **rmsq (t=1 norm+quant) widened 32 -> nblk threads** (one 32-value block per
+   thread; the reduction keeps its 32-chunk order). Bit-identical greedy stream.
+2. **rms_part/rms_finish vectorized** (float4 loads; rms_part keeps the exact
+   per-chunk addition order x,y,z,w; rms_finish is elementwise so it uses a
+   coalesced stride). 104 ms -> 20 ms per pass.
+3. **Activation q8 skipped when every consumer takes the f32-direct path**
+   (MMQ reads y_f32 and re-quantizes internally). `mmq_used`/`mmq_used_s` mirror
+   mm_b2/gemm_mmq_s conditions exactly; the skip is group-conservative (all
+   consumers, both streams). t=512 launches 256 -> 102, kernel time 25 -> 6 ms;
+   end-to-end neutral (the removed work was hidden behind the side-stream GEMMs).
+4. **hipFuncSetAttribute(MMQ smem) cached per function** instead of per GEMM.
+
+Combined: pp512 314.0 -> 327.8 (+4.4%), tg32 10.96 -> 11.06 (+0.9%) at step 1-2;
+330-333 pp after step 3 (within noise of 327.8). Standing: **0.94x pp / 0.965x tg**
+of llama.cpp ROCm.
+
+### Falsified / rejected this round (measured)
+
+| variant | ratio vs default |
+|---|---|
+| `LLM170_Q6MMQ=1` (q6_K through mul_mat_q) | pp +6.5% but **garbage tokens** on >=32-token prefills (requant_q6k_canonical layout defect) — not adopted |
+| `LLM170_DEQ16=1` (q6_K dequant->f16 + WMMA tiles) | 0.89x pp |
+| `LLM170_NO_MMQ=1` (all types on tiles) | 0.96x pp |
+| `LLM170_MMQ_ONLY=3` (iq4_xs to tiles) | 0.968x pp |
+| `LLM170_MMQ_ONLY=2050` (q4_K to tiles) | 1.005x pp (noise) |
+| `LLM170_ARCHUNK=1` (chunked-parallel AR scan) | 0.894x pp |
+| `LLM170_NO_WKFLASH=1` (split4q4 flash) | 0.857x pp |
+| `LLM170_NO_QSA_SPLIT=1` (plain flash) | 0.823x pp |
+
+The MMQ routing default (q4_K + q5_K + iq4_xs on mul_mat_q) is confirmed optimal
+among the tested routings. Per-type MMQ rates are uniform (11.7-12.7 TMAC/s),
+which points at a shared issue/LDS limit rather than a per-type defect; the
+kernel holds 49-59 KB of dynamic shared memory, i.e. one workgroup per CU.
+
+### Decode (tg) accounting
+
+`step+greedy` = 90.3 ms/token, of which GEMV kernels ~78 ms (17.55 GB of weights
+-> 225 GB/s effective), non-GEMV ~10 ms, host ~1-2 ms. Isolated single-kernel
+measurements: tensors >=47 MB stream at 207-218 GB/s (DRAM-bound), 21-36 MB
+tensors reach 400-457 GB/s (L2-resident). Per-tensor t=1 rates by type: q5_K 253,
+q4_K 227, q6_K 204, iq4_xs 198, iq4_nl 158, q8_0 111 GB/s.
+The FFN gate/up GEMVs are already dispatched on two streams; the 4 GDN in-proj
+GEMVs use the fused dual kernels.
