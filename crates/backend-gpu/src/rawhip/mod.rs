@@ -1029,9 +1029,16 @@ impl RawCtx {
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
                 one.as_mut_ptr() as *mut _,
             ];
-            self.ktr_mark("mul_mat_q", t as u32);
+            let tag: &'static str = match ty {
+                12 => "mmq_q4k",
+                13 => "mmq_q5k",
+                14 => "mmq_q6k",
+                23 => "mmq_xs",
+                _ => "mmq_other",
+            };
+            self.ktr_mark(tag, t as u32);
             ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
-            self.ktr_mark("mul_mat_q", t as u32);
+            self.ktr_mark(tag, t as u32);
         if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
             eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
                 (n_out + 127) / 128, (t + 127) / 128, n_in / 256, n_out, n_out);
