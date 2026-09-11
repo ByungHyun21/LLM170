@@ -1778,9 +1778,16 @@ instructions account for <0.1 ms, yet the GPU takes ~7.5 ms per layer in elapsed
 against ~2.4 ms of measured kernel duration. The missing time is between dispatches:
 barriers/state switches/cache flushes, ~0.3 ms each, ~1050 times per forward.
 
-Relevant code: `context.rs::run()` emits, between every dispatch in a batch, a global
-`vk::MemoryBarrier` (SHADER_WRITE -> SHADER_READ) with `COMPUTE_SHADER -> COMPUTE_SHADER`
-and no BY_REGION flag - i.e. a full L2 flush per dispatch on RADV.
+The barrier is NOT the cause: setting `vk::DependencyFlags::BY_REGION` changes nothing
+(493.8 ms), and disabling the inter-dispatch `vk::MemoryBarrier` entirely changes nothing
+either (490.6 ms, pp8). So the gap is the fixed per-dispatch GPU cost (workgroup launch,
+drain and state switch), roughly 0.46 ms per dispatch at t=8 and 0.76 ms at t=1 - which
+is why the same ~1050 dispatches cost 484 ms for 8 tokens but 800 ms for 1 token.
+
+Consequence: the number of dispatches is the primary lever on the small-t paths. Cutting
+3 dispatches per layer (fusing the same-input qkv/gate/up GEMVs into one row-ranged
+dispatch) removes ~192 dispatches per forward: ~115 ms per pp8 forward, and ~23 ms per
+tg token (~23%, i.e. tg 10 -> 13 t/s), which is what parity with llama.cpp needs.
 
 How the batched path mostly hides this: pp64 (tile kernels) runs ~190 dispatches per
 forward instead of ~1050 (one tile dispatch covers many tokens), so 64 tokens cost 302 ms
