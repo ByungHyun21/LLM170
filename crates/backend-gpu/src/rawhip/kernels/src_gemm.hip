@@ -1088,14 +1088,21 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
             qa0 = w[qlw]; qa1 = w[qlw+1]; qa2 = w[qlw+2]; qa3 = w[qlw+3];
             ha0 = w[qhw]; ha1 = w[qhw+1]; ha2 = w[qhw+2]; ha3 = w[qhw+3];
         } else {
-            qa0 = (w[qlw] >> 16) | (w[qlw+1] << 16);
-            qa1 = (w[qlw+1] >> 16) | (w[qlw+2] << 16);
-            qa2 = (w[qlw+2] >> 16) | (w[qlw+3] << 16);
-            qa3 = (w[qlw+3] >> 16) | (w[qlw+4] << 16);
-            ha0 = (w[qhw] >> 16) | (w[qhw+1] << 16);
-            ha1 = (w[qhw+1] >> 16) | (w[qhw+2] << 16);
-            ha2 = (w[qhw+2] >> 16) | (w[qhw+3] << 16);
-            ha3 = (w[qhw+3] >> 16) | (w[qhw+4] << 16);
+            // 2-mod-4 정렬: 8바이트 경계 uint2 3개로 16B 추출 (워드당 2로드 → 3로드)
+            const uint2* pq = (const uint2*)((const char*)w + (((wb + ql_rel) & ~7u)));
+            unsigned qw[5];
+            qw[0] = pq[0].x; qw[1] = pq[0].y; qw[2] = pq[1].x; qw[3] = pq[1].y; qw[4] = pq[2].x;
+            qa0 = (qw[0] >> 16) | (qw[1] << 16);
+            qa1 = (qw[1] >> 16) | (qw[2] << 16);
+            qa2 = (qw[2] >> 16) | (qw[3] << 16);
+            qa3 = (qw[3] >> 16) | (qw[4] << 16);
+            const uint2* ph = (const uint2*)((const char*)w + (((wb + qh_rel) & ~7u)));
+            unsigned hw[5];
+            hw[0] = ph[0].x; hw[1] = ph[0].y; hw[2] = ph[1].x; hw[3] = ph[1].y; hw[4] = ph[2].x;
+            ha0 = (hw[0] >> 16) | (hw[1] << 16);
+            ha1 = (hw[1] >> 16) | (hw[2] << 16);
+            ha2 = (hw[2] >> 16) | (hw[3] << 16);
+            ha3 = (hw[3] >> 16) | (hw[4] << 16);
         }
         int xw = (g << 4) >> 2;
         unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
