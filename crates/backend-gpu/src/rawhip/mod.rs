@@ -656,6 +656,52 @@ impl RawCtx {
         Ok(())
     }
 
+    /// np 소형 배치(t=2..4) 4-토큰 GEMV — 가중 1회 독서.
+    /// y는 [t][xq_w], out은 [t][n_out] (토큰별 독립 누산·환원).
+    pub fn gemm_g4(
+        &self,
+        ty: u32,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
+        let kern = match ty {
+            12 => "gemm_q4k4",
+            13 => "gemm_q5k4",
+            14 => "gemm_q6k4",
+            23 => "gemm_xs4",
+            _ => return Err(format!("g4 미지원 타입 {ty}")),
+        };
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut op = out as *mut std::ffi::c_void;
+        let mut kt = ktab2 as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+        ];
+        if ty == 23 {
+            args.push(&mut kt as *mut _ as *mut std::ffi::c_void);
+        }
+        args.push(&mut op as *mut _ as *mut std::ffi::c_void);
+        args.push(&mut ni as *mut _ as *mut std::ffi::c_void);
+        args.push(&mut no as *mut _ as *mut std::ffi::c_void);
+        args.push(&mut xw as *mut _ as *mut std::ffi::c_void);
+        args.push(&mut tt as *mut _ as *mut std::ffi::c_void);
+        self.launch3(kern, 1, gy, gz, 64, &mut args)
+    }
+
     /// mmq quant_y 캐시 무효화 (y 원본 재기입 직전 호출 — 부록81).
     pub fn mmq_y_bump(&self) {
         if let Ok(mut c) = self.mmq_y_cache.lock() { c.0 = c.0.wrapping_add(1); }

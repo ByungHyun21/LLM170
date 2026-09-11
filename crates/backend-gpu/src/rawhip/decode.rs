@@ -2795,6 +2795,25 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     }
 
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        // np 소형 배치(t=2..4): 4-토큰 GEMV — 타일은 128열 고정이라 t=4에서
+        // 124열을 낭비한다(t=4 0.34ms vs t=128 0.83ms, 동일 가중). 가중 1회
+        // 독서로 토큰별 독립 누산. LLM170_NO_G4=1로 끔.
+        if (2..=4).contains(&t)
+            && matches!(ty, 12 | 13 | 14 | 23)
+            && std::env::var_os("LLM170_NO_G4").is_none()
+        {
+            return self.ctx.gemm_g4(
+                ty,
+                xq as *const u8,
+                wp as *const u8,
+                self.ktab2 as *const u8,
+                n_in,
+                n_out,
+                xq_w,
+                t,
+                out,
+            );
+        }
         // q5_K v2 (부록76): vdr=2 그리드-스트라이드 — 자체 스트림 (비트계약 아님)
         if ty == 13 && t == 1 && std::env::var_os("LLM170_Q5V2").is_some() {
             return self.ctx.gemv_q8_out_v2(xq as *const u8, wp as *const u8, ty, n_in, n_out, out, xq_w, t);
