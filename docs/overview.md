@@ -64,8 +64,11 @@ cases, under the near-tie-aware standard (ADR-0012 in
 backends (see backend-architecture.md): rawhip (HIP/ROCm — full pipeline:
 all quantized GEMM projections in 8 types with batched prefill tiles, fused
 flash attention, the GDN scan, and a bit-exact element-wise set) and rawvk
-(Vulkan — quantized matmul accelerator with GPU-side quantize/rms/silu and
-an FFN resident chain). qwen4exp decodes
+(Vulkan — a full pure-Rust/Vulkan pipeline: subgroup GEMV decode kernels
+for all 8 quant types, cooperative-matrix prefill tiles, fused
+residual/RMS/GDN/attention kernels and a GPU-side argmax, reaching
+0.91× (pp512) and 0.955× (tg32) of llama.cpp Vulkan on the reference
+APU). qwen4exp decodes
 through a GPU-resident frame by default (ADR-0017) — kernels chained by
 handle, ~600 per-step host syncs down to ~14. The HTTP server schedules
 continuous batching across slots; qwen35 has MTP speculative decoding

@@ -97,6 +97,10 @@ porting constraints discovered on RADV/gfx1151:
 | decode tg24 | 10.4 t/s | 10.4 t/s | 9.9 t/s |
 | prefill pp64 | 163-169 t/s | ~128 t/s | ~128 t/s |
 
+Vulkan backend on the same machine (2026-09): pp512 322 t/s, tg32 11.6 t/s —
+0.91× / 0.955× of llama.cpp Vulkan (353 / 12.1). The gap analysis and the full
+falsification log (14 hypotheses, all measured) is in benchmarks.md.
+
 Vulkan prefill is bounded by the CPU-side attention/GDN layers (the matmul
 offload itself saturates); porting those is the next backend milestone.
 
