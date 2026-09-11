@@ -18,8 +18,14 @@ with their conditions — full tables and history in
 | Backend | pp512 prefill | decode | note |
 |---|---|---|---|
 | ROCm/HIP (`rawhip`) | ~322 t/s | 10.9 t/s (tg8) | llama.cpp raw-loop: pp512 358, tg8 11.2 → 0.90× / 0.97× |
-| Vulkan (`rawvk`) | 66 t/s (coopmat tile, opt-in) | 7.1 t/s (tg32) | GPU-resident decode; prefill porting in progress |
+| Vulkan (`rawvk`) | 322 t/s | 11.6 t/s (tg32) | llama.cpp Vulkan: pp512 353, tg32 12.1 → 0.91× / 0.955× |
 | CPU (W4A8) | ~128 t/s (pp64) | 9.9 t/s (tg24) | bit-exact reference engine |
+
+The Vulkan backend reached these numbers with three decode/prefill kernel
+families of its own — subgroup GEMV (decode, faithful llama dmmv ports),
+cooperative-matrix tiles (prefill) and fused elementwise kernels — all
+arithmetic-mirrored from the CPU reference. A year of measured experiments
+behind the current numbers is logged in [docs/benchmarks.md](docs/benchmarks.md).
 
 Speculative decode (HIP, np4 × spec k=4): **27-28 t/s aggregate** vs
 llama.cpp MTP 15.5 (1.75-1.81×), with the accepted token stream bit-identical
