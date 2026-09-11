@@ -1859,3 +1859,23 @@ gdn_ar per-layer time at t=1: 0.174 ms -> 0.021 ms (8x). Effective decode weight
 bandwidth 175 -> ~190 GB/s. Remaining decode gap vs llama is inside the gemv8
 kernels themselves (~190 vs ~213 GB/s effective) - layouts already match llama's
 dmmv, so further gains need per-instruction tuning or a different access idiom.
+
+## GPU-side argmax for greedy decode (2026-09-11, final block)
+
+Measured per token (same run): step() 88.2ms vs step+greedy 93.4ms - the trait default
+materialised the full 151936-float logits vector and scanned it on the CPU, and reading
+608KB from the mapped GTT buffer costs ~5.15ms (uncached read path).
+
+`step()` now splits into `step_core` (leaves logits resident) plus a wrapper, and a
+two-stage argmax kernel (256-thread WGs, 8 contiguous elements per thread, deterministic
+tree reduction, ties to lowest index - identical selection to the CPU scan, verified over
+8 generated tokens) returns just the token.
+
+| Metric | before | after | llama.cpp | ratio |
+|---|---|---|---|---|
+| tg32 | 10.66-10.76 | 10.87-11.34 | 12.12 | 0.90-0.94x |
+| pp512 | 304.2 | 304.2 | 356.66 | 0.85x |
+
+Judge gate 19/19 PASS after the change. Remaining decode gap ~6% is inside the gemv8
+kernels (effective ~199 vs llama's ~212 GB/s); remaining per-token fixed cost after the
+argmax fix is ~1-2ms host + 1ms gdn_ar + ~1ms small kernels.
