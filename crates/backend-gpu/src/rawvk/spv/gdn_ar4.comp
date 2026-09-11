@@ -22,10 +22,10 @@ void main() {
     int base_s = pair * pc.d * pc.d;
     float s0[4], s1[4], s2[4], s3[4];
     [[unroll]] for (int c = 0; c < 4; c++) {
-        s0[c] = s[base_s + (lane * 4 + 0) * pc.d + u0 + c];
-        s1[c] = s[base_s + (lane * 4 + 1) * pc.d + u0 + c];
-        s2[c] = s[base_s + (lane * 4 + 2) * pc.d + u0 + c];
-        s3[c] = s[base_s + (lane * 4 + 3) * pc.d + u0 + c];
+        s0[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 0];
+        s1[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 1];
+        s2[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 2];
+        s3[c] = s[base_s + (u0 + c) * pc.d + lane * 4 + 3];
     }
     int h = pair % pc.hv;
     int kh = h % pc.hk;
@@ -65,9 +65,9 @@ void main() {
         }
     }
     [[unroll]] for (int c = 0; c < 4; c++) {
-        s[base_s + (lane * 4 + 0) * pc.d + u0 + c] = s0[c];
-        s[base_s + (lane * 4 + 1) * pc.d + u0 + c] = s1[c];
-        s[base_s + (lane * 4 + 2) * pc.d + u0 + c] = s2[c];
-        s[base_s + (lane * 4 + 3) * pc.d + u0 + c] = s3[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 0] = s0[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 1] = s1[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 2] = s2[c];
+        s[base_s + (u0 + c) * pc.d + lane * 4 + 3] = s3[c];
     }
 }
