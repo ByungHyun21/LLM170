@@ -55,7 +55,9 @@ pub fn aout_dumped() -> bool {
 pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
 pub fn ktrace_dump() -> String {
     let mut g = KTRACE.lock().unwrap();
-    let evs = std::mem::take(g.as_mut().unwrap());
+    // ktrace_on 없이 호출되면(스펙 경로 등) 빈 문자열 — 과거 unwrap 패닉
+    let Some(slot) = g.as_mut() else { return String::new() };
+    let evs = std::mem::take(slot);
     let mut out = String::new();
     // 쌍 결합: 연속 동일 (name, gy) 두 이벤트가 start/end
     let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();

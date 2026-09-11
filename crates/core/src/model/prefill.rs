@@ -121,17 +121,15 @@ impl Engine {
                         for row in ch.iter() {
                             tok_flat.extend_from_slice(row);
                         }
-                        let mut h_shift: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
+                        // h_shift는 GPU에서 조립(디바이스 행 시프트) — carry만 호스트에서 전달.
+                        let mut carry: Vec<f32> = Vec::with_capacity(n_e);
                         if self.seqs[seq].mtp_pending_h.len() == n_e {
-                            h_shift.extend_from_slice(&self.seqs[seq].mtp_pending_h);
+                            carry.extend_from_slice(&self.seqs[seq].mtp_pending_h);
                         } else {
-                            h_shift.resize(n_e, 0.0);
-                        }
-                        if ch.len() > 1 {
-                            h_shift.extend_from_slice(&h_all[..(ch.len() - 1) * n_e]);
+                            carry.resize(n_e, 0.0);
                         }
                         let draft = rd
-                            .mtp_prefill_batch(seq, &tok_flat, &h_shift, ch.len(), pos)
+                            .mtp_prefill_batch(seq, &tok_flat, &carry, ch.len(), pos)
                             .map_err(ModelError::Accel)?;
                         {
                             let st = &mut self.seqs[seq];
