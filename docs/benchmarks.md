@@ -2091,3 +2091,25 @@ so the FAILs are not regressions.
   large, and the non-GEMM budget measured here is only ~10 ms/token.
 - **batched MTP prefill** (own design): run blk.64's attention+FFN once with
   t=chunk instead of 512 sequential t=1 passes; expected pp(spec4) 179 -> ~300.
+
+## 4-token GEMV for the np small-batch path (2026-09-12)
+
+Measured cause: the np decode step (t = number of active slots) used the
+128-column tile kernels, whose cost is essentially independent of t (harness:
+0.339 ms at t=4 vs 0.833 ms at t=128 on the same 36 MB q5_K tensor) — 124 of
+128 columns are padding work.
+
+`gemm_{q4k,q5k,q6k,xs}4` (src_gemv4.hip): identical decode arithmetic and
+per-token accumulation order as the t=1 gemv kernels, but each weight word is
+loaded once per sub-block and reused for t tokens (independent accumulators, one
+tree reduction per token, y read from `xq + k*xq_w`). Routed in `mm_b` for
+t in 2..=4 for q4_K/q5_K/q6_K/iq4_xs; `LLM170_NO_G4=1` restores tiles.
+
+CLI np4 (4 prompts x 64 tokens): wall 23.2 -> 21.4 s (**-7.9%**), token streams
+bit-identical to the tile path. Judge re-run: same 16/19 with the same three
+reference-side FAILs and identical gaps, i.e. our outputs are unchanged.
+
+Remaining np4 gap: ours ~20-21 t/s aggregate (CLI) vs llama-server 25.6. The
+step is now bounded by the y-side load issue (each of n_out rows re-reads the
+token activations) — the next structural step is multiple output rows per
+workgroup with y staged in shared memory (llama's MMVQ NUM_ROWS approach).
