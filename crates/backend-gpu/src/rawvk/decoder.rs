@@ -972,7 +972,7 @@ impl DecoderState {
         // 풀 상한 4096세트 이내. 512→2048: 스텝당 중간 드레인 제거, plans/36 G3).
         if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.split_ctr += 1;
-            if self.split_ctr >= 2048 {
+            if self.split_ctr >= std::env::var("LLM170_VK_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048) {
                 self.split_ctr = 0;
                 if std::env::var_os("LLM170_DBG_REC").is_some() {
                     let td = std::time::Instant::now();
