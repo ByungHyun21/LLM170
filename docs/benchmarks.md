@@ -1879,3 +1879,25 @@ tree reduction, ties to lowest index - identical selection to the CPU scan, veri
 Judge gate 19/19 PASS after the change. Remaining decode gap ~6% is inside the gemv8
 kernels (effective ~199 vs llama's ~212 GB/s); remaining per-token fixed cost after the
 argmax fix is ~1-2ms host + 1ms gdn_ar + ~1ms small kernels.
+
+## Session arc conclusion (2026-09-12/13)
+
+Two further adopted wins and three falsified families close this optimization arc:
+
+| Change | Effect |
+|---|---|
+| Fused GDN recurrence (decode: split3+l2+beta_g into one kernel; prefill: same for the t>=2 path) | tg 11.79 → 11.83-11.86 t/s |
+| Bit-identity technique: replicate the legacy chain's exact FMA contraction (explicit fma() chains + precise on accumulators) | spec-decode contract preserved |
+| f16-B tile, conversion-pass variant | -2.3%, falsified |
+| f16-B tile, producer-dual-write variant | token corruption, reverted; expected ceiling +0-1% |
+| Single-buffered tile (occupancy 3x) | neutral |
+
+The 1-ulp FMA contraction lesson is the arc's key transferable finding: glslc
+contracts different-but-equivalent source differently by context, so any kernel
+fusion must pin the operation structure explicitly (Fma count verified against
+the legacy SPIR-V) to stay bit-identical for speculative decoding.
+
+End state: tg 11.86 (0.977x), pp512 305-318 (0.87-0.90x) of llama.cpp Vulkan
+on the reference APU. 22 falsified hypotheses are logged in this file; the
+remaining gap localises to vector-ALU instruction mix inside the quantized
+kernels (RGP-measured 79% VALU) and diffuse non-GEMM pipeline costs.
