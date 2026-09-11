@@ -2535,3 +2535,32 @@ hnorm and the concat order are correct), so the defect is downstream of the proj
 Next: compare the GPU head (`mtp_step_g`) against the CPU layer (`mtp_step`/`mtp_forward`)
 on identical (token, h, pos) inputs - both exist, so the disagreement needs no external
 reference to localise.
+
+## MTP RCA, third pass: validated oracle + the remaining contradiction (2026-09-12)
+
+New capability: **llama.cpp's `gguf-py` dequantizer is a working reference** for the
+engine's weights. Verified on `blk.64.nextn.eh_proj.weight` (q6_K, rows 0/1000/3000/
+5119): `llm170 dequant` matches `gguf.quants.dequantize` exactly, so the engine's
+weight buffer is canonical - there is no hidden repack, and the hand-written q6_K
+dequantizer I used earlier was simply wrong (its element order was off). This also
+means `rawhip-check` is *not* a stale mirror: it genuinely disagrees with the engine
+for q5_K and q6_K while agreeing for q4_K and iq4_xs, yet the engine is bit-exact
+CPU vs GPU (`infer --backend cpu` vs gpu on 512 natural tokens: 9/9 identical tokens;
+the w4a8 cross-check on the eh_proj reports 4.7e-3 relative against its f32 reference).
+So the probe measures something other than the engine's path - open tooling question,
+do not use it as an oracle for k-quants.
+
+Facts established for the MTP defect:
+
+- drafts on repetitive text cycle in phase with the targets but emit the generic
+  separator token (220 = " "), i.e. the head is close to uninformative;
+- stage 1 is correct: `cat = [enorm(emb), hnorm(h)]` reproduces the canonical math at
+  maxrel 4.3e-07, and the q8 y-vector matches cat at 3.8e-3 (qsum words verified);
+- the first chain position (j>=1) fails 21/21 even after fixing the missing
+  `mtp_h_next` store, so the chain's input convention needs the mirror treatment;
+- the CPU engine path is bit-exact with the GPU path, so nothing in the shared decode
+  machinery is at fault.
+
+`LLM170_MTP_DUMP=<prefix>` now also writes the q8 y-vector (`*.xq.u32`).
+Next: build a NumPy mirror of the *whole* MTP layer (attention + FFN + shared head)
+against the gguf-py oracle, driven by the stage dumps, and compare token by token.
