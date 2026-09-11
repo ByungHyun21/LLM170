@@ -452,4 +452,39 @@ extern "C" __global__ void gemm_q8_0(const unsigned* xq, const unsigned* w,
     }
 }
 
-
+// 진단 전용: q6_K 스칼라 기준 GEMV — 명시적 인덱스, 벡터화/트리/게더 없음.
+// yf는 양자화 전(또는 복원된) f32 활성. 목적: 엔진 GEMV와 같은 버퍼를
+// 서로 다른 코드로 계산해 커널 인덱싱 오류를 분리 판정한다.
+extern "C" __global__ void q6k_ref_scalar(const float* yf, const unsigned char* w, float* out,
+                                          int n_in, int n_out) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+    int blocks = n_in >> 8;
+    const unsigned char* row = w + (size_t)o * (size_t)blocks * 210u;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks; b++) {
+        const unsigned char* blk = row + b * 210;
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const signed char* sc = (const signed char*)(blk + 192);
+        unsigned short dh = *(const unsigned short*)(blk + 208);
+        float d = bits_f16((unsigned)dh);
+        int base = b * 256;
+        #pragma unroll
+        for (int n128 = 0; n128 < 2; n128++) {
+            for (int l = 0; l < 32; l++) {
+                int is = l >> 4;
+                int q1 = (int)((ql[l +             n128*64] & 0x0Fu) | (((qh[l + n128*32] >> 0) & 3u) << 4)) - 32;
+                int q2 = (int)((ql[l + 32 +        n128*64] & 0x0Fu) | (((qh[l + n128*32] >> 2) & 3u) << 4)) - 32;
+                int q3 = (int)((ql[l +             n128*64] >> 4)   | (((qh[l + n128*32] >> 4) & 3u) << 4)) - 32;
+                int q4 = (int)((ql[l + 32 +        n128*64] >> 4)   | (((qh[l + n128*32] >> 6) & 3u) << 4)) - 32;
+                int p = base + n128*128;
+                acc += d * (float)sc[is + 0 + n128*8] * (float)q1 * yf[p + l +  0];
+                acc += d * (float)sc[is + 2 + n128*8] * (float)q2 * yf[p + l + 32];
+                acc += d * (float)sc[is + 4 + n128*8] * (float)q3 * yf[p + l + 64];
+                acc += d * (float)sc[is + 6 + n128*8] * (float)q4 * yf[p + l + 96];
+            }
+        }
+    }
+    out[o] = acc;
+}

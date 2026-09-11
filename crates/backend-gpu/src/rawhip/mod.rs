@@ -1897,3 +1897,109 @@ pub fn dims_of(path: &str, names: &[&str]) -> String {
     }
     s
 }
+
+/// 진단: q6_K GEMV ↔ GPU 스칼라 기준 대조. 두 커널이 같은 가중 버퍼·같은 활성을
+/// 서로 다른 코드로 소비한다 — 커널 인덱싱 오류와 호스트 인자 문제를 분리한다.
+pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
+    let model = llm170_core::model::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("tensor 없음")?;
+    if w.ty != llm170_gguf::GgmlType::Q6K {
+        return Err(format!("q6k-ref: q6_K 전용 (ty={:?})", w.ty));
+    }
+    let ctx = RawCtx::new()?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    // LLM170_Q6K_EK=k: y = e_k (단위 벡터) → out[o]가 곧 복호된 가중치 W[o][k]
+    let x: Vec<f32> = if let Ok(spec) = std::env::var("LLM170_Q6K_EK") {
+        let ks: Vec<usize> = spec.split(',').filter_map(|v| v.trim().parse::<usize>().ok()).collect();
+        if ks.is_empty() || ks.iter().any(|&k| k >= n_in) {
+            return Err("LLM170_Q6K_EK: 인덱스 범위 밖".into());
+        }
+        let mut v = vec![0f32; n_in];
+        for &k in ks.iter() { v[k] = 1.0; }
+        v
+    } else {
+        (0..n_in).map(|_| lcg()).collect()
+    };
+    // y는 엔진과 같은 커널(quant_q8)로 만든다 — 호스트 인코딩 차이를 배제.
+    let xf = ctx.alloc(n_in * 4)?;
+    ctx.h2d(xf, bytemuck::cast_slice(&x))?;
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+    let xq = ctx.alloc(xq_w * 4)?;
+    ctx.quant_q8(xf, xq, n_in)?;
+    ctx.sync()?;
+    // 장치 y를 되읽어 f32로 복원 (스칼라 기준 입력)
+    let mut yw = vec![0u32; xq_w];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut yw).as_mut(), xq)?;
+    let mut y_deq = vec![0f32; n_in];
+    for blk in 0..(n_in / 32) {
+        let d = f32::from_bits(yw[n_in / 4 + blk]);
+        for c in 0..32 {
+            let w_ = yw[(blk * 32 + c) / 4];
+            let byte = ((w_ >> (((blk * 32 + c) % 4) * 8)) & 0xFF) as u8 as i8;
+            y_deq[blk * 32 + c] = byte as f32 * d;
+        }
+    }
+    let yf = ctx.alloc(n_in * 4)?;
+    ctx.h2d(yf, bytemuck::cast_slice(&y_deq))?;
+    let out_a = ctx.alloc(n_out * 4)?;
+    let out_b = ctx.alloc(n_out * 4)?;
+    let part = ctx.alloc(n_out * 64 * 8)?;
+    // ① 엔진 GEMV (mm_direct와 동일 인자·그리드)
+    {
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut op = out_a as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void, &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void, &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void, &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
+        ];
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
+        ctx.launch3("gemm_q6k", 1, gy, gz, 64, &mut args)?;
+    }
+    // ② GPU 스칼라 기준
+    {
+        let mut yp = yf as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut op = out_b as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut args = vec![
+            &mut yp as *mut _ as *mut std::ffi::c_void, &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void, &mut no as *mut _ as *mut std::ffi::c_void,
+        ];
+        let gx = (n_out as u32).div_ceil(64);
+        ctx.launch("q6k_ref_scalar", gx, 1, 64, &mut args)?;
+    }
+    ctx.sync()?;
+    let mut va = vec![0f32; n_out];
+    let mut vb = vec![0f32; n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut va).as_mut(), out_a)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut vb).as_mut(), out_b)?;
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    let mut nbad = 0usize;
+    for i in 0..n_out {
+        let e = (va[i] - vb[i]).abs();
+        let r = e / vb[i].abs().max(1e-6);
+        if r > 1e-3 { nbad += 1; }
+        max_abs = max_abs.max(e);
+        max_rel = max_rel.max(r);
+    }
+    Ok(format!(
+        "[q6k-ref] {tname} n_in={n_in} n_out={n_out}: 불일치 {nbad}/{n_out} max_abs={max_abs:.6} max_rel={max_rel:.3e}\n  엔진[0..4]={:?}\n  기준[0..4]={:?}",
+        &va[..4.min(n_out)], &vb[..4.min(n_out)]
+    ))
+}
