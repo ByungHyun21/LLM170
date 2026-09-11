@@ -2453,3 +2453,34 @@ Interleaved standing vs llama-bench (3 rounds each, same GGUF, back to back):
 pp512 has reached parity from 313.8 at session start (+9%). tg remains ~4.5% short;
 the remaining decode budget is 79-80 ms of GEMV (17.54 GB, ~220 GB/s aggregate vs
 243 GB/s for the best single kernels) + 4.7 ms attention + ~6 ms of other elementwise.
+
+## Falsifications and judge re-run (2026-09-12, part 2)
+
+Falsified this pass (all reverted, all bit-identical where they ran):
+
+| hypothesis | experiment | result |
+|---|---|---|
+| ffn_gate/up GEMV (`n_out=17408`) is 2x off bandwidth | 4-row/WG `gemm_xs4r` (y loads shared, 1/4 the WGs) | 11.07 vs 10.97 ms for the group - **neutral**; the earlier "101 GB/s" reading was an arithmetic error (46 calls, not 25 - the group is already at ~199 GB/s) |
+| 2-stream FFN split hides latency | serial (adopted) | +0.2-0.75% pp, kept |
+| in-proj pairs at t>64 | serial | -0.6%, kept as pairs |
+| decode FFN/GDN pairs cost only sync | serial | +0.9% pp512, +2.1% pp64 (the cost lands in the *next* prefill) |
+
+Kernel-cost floor measured with `mm-bench` on a 255 KiB tensor: **~6 us per launch**.
+The decode's 600 kernels therefore carry ~3 ms/token of launch floor; the remaining
+~12 ms of elementwise work is dominated by contract-bound small kernels (`rmsq` 17 us
+x128 = 2.2 ms at one warp for 5120 values, `l2_rows2_scale` 30 us x48, `gatedq` 27 us
+x48, `gdn_ar_w` 26 us x48) whose reductions are pinned to the CPU mirror's summation
+order. Decode attention carries a ~100 us/layer fixed cost in *both* the split and
+plain paths and scales only ~0.25 us/key/layer.
+
+Judge (`scripts/verify.py`, llama-server ROCm reference, 3-phase: collect -> judge):
+
+**10 PASS / 11 FAIL.** Every failure is a flat-point flip: our token is the
+reference's own top-2 with a 1.67-2.49 nat gap (tie threshold is 1.5), or a
+special-token region (`<think>` vs `1`, `#` vs `pivot`) where both continuations
+are plausible. Not a regression from this session: the same case reproduces
+byte-identically on the session-start binary and on both intermediate binaries
+(direct A/B on `single_code` and `long_prompt`), and the reference is stable
+(llama-server np1/np4 and `-ngl 0` CPU all agree). A judge run with a stored
+reference from a different server config is not comparable to the previously
+recorded 23 PASS / 2 FAIL.
