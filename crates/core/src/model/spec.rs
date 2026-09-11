@@ -225,7 +225,12 @@ impl Engine {
             let t = greedy(&logits[0]);
             // draft 예측
             let d = if j == 0 {
-                greedy(&self.seqs[seq].mtp_draft_logits)
+                // raw 경로는 mtp_draft_logits를 채우지 않음(GPU MTP 헤드 argmax만 저장) — 폴백.
+                if self.seqs[seq].mtp_draft_logits.is_empty() {
+                    self.seqs[seq].mtp_draft_tok
+                } else {
+                    greedy(&self.seqs[seq].mtp_draft_logits)
+                }
             } else {
                 // 직전 루프에서 준비한 체인 로짓
                 let (lgt, nh) = self.mtp_forward(seq, chain_tok.unwrap(), &chain_h, chain_pos)?;

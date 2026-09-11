@@ -539,24 +539,41 @@ impl Engine {
             eprintln!("  [hookguard] mtp_h.len={} seq0={}", self.seqs[seq_ids[0]].mtp_h.len(), seq_ids[0]);
         }
         if !self.seqs[seq_ids[0]].mtp_h.is_empty() && self.mtp_wanted {
+            // plans/46: raw 백엔드는 GPU MTP 스텝을 사용 — CPU mtp_step은 토큰당 ~150ms로
+            // 프리필·검증을 30× 악화시켰다. GPU 경로는 argmax만 반환 → mtp_draft_tok 사용.
+            let raw = self.raw_decode.clone();
+            let n_e = self.model.hp.n_embd;
             for s in 0..n_seqs {
                 let sid = seq_ids[s];
                 let pos0 = self.seqs[sid].pos as usize;
                 let mut prev_h = std::mem::take(&mut self.seqs[sid].mtp_pending_h);
                 for t in 0..t_len {
-                    // 마지막 토큰만 로짓 (spec step-0 재사용), 나머지는 KV 적립
                     let wl = t + 1 == t_len;
                     let h_t = xs[s * t_len + t].clone();
-                    // 시프트 페어링: MTP(tok_p, h_{p-1})
-                    let (lg, hn) =
-                        self.mtp_step(sid, batch[s][t], &prev_h, (pos0 + t) as u32, wl)?;
-                    prev_h.copy_from_slice(&h_t);
-                    if wl {
-                        let am = crate::model::greedy(&lg);
-                        self.seqs[sid].mtp_draft_logits = lg;
-                        self.seqs[sid].mtp_h_next = hn;
-                        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-                            eprintln!("  [hook] sid={sid} tok={:?} am={am}", batch[s][t]);
+                    if let Some(rd) = &raw {
+                        let embd = self.model.wchk("token_embd.weight")?;
+                        let mut row = vec![0.0f32; n_e];
+                        crate::quant::dequant_row(
+                            embd.ty, embd.data, batch[s][t] as u64, n_e as u64, &mut row);
+                        let (am, hn) = rd
+                            .mtp_step_gpu(sid, &row, &prev_h, pos0 + t)
+                            .map_err(ModelError::Accel)?;
+                        prev_h.copy_from_slice(&h_t);
+                        if wl {
+                            let st = &mut self.seqs[sid];
+                            st.mtp_draft_tok = am;
+                            st.mtp_draft_logits.clear();
+                            st.mtp_h_next = hn;
+                        }
+                    } else {
+                        // 시프트 페어링: MTP(tok_p, h_{p-1}) — CPU 폴백
+                        let (lg, hn) =
+                            self.mtp_step(sid, batch[s][t], &prev_h, (pos0 + t) as u32, wl)?;
+                        prev_h.copy_from_slice(&h_t);
+                        if wl {
+                            let am = crate::model::greedy(&lg);
+                            self.seqs[sid].mtp_draft_logits = lg;
+                            self.seqs[sid].mtp_h_next = hn;
                         }
                     }
                 }

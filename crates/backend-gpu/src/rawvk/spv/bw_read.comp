@@ -1,0 +1,25 @@
+#version 450
+// 선형 DRAM 스트리밍 측정용 — vec4 읽기 + 합산(결과는 1개 워드로 축소)
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer In { uvec4 in4[]; };
+layout(binding = 1) buffer Out { uint outv[]; };
+layout(push_constant) uniform PC { uint n_vec; } pc;
+shared uint acc[256];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x;
+    uint nwg = gl_NumWorkGroups.x;
+    uint stride = nwg * 256u;
+    uint s = 0u;
+    for (uint i = gid * 256u + tid; i < pc.n_vec; i += stride) {
+        uvec4 v = in4[i];
+        s += v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc[tid] = s;
+    barrier();
+    if (tid == 0u) {
+        uint t = 0u;
+        for (int i = 0; i < 256; i++) t ^= acc[i];
+        outv[gid] = t;
+    }
+}

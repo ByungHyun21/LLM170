@@ -2277,7 +2277,11 @@ impl DecoderState {
             let mut last = Vec::new();
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
                 let t = ch.len() / n;
+                let _tt = std::time::Instant::now();
                 let rows = self.step_batch(seq, pos0 + off, ch, true)?;
+                if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+                    eprintln!("[vb] step_batch t={t} = {:.1}ms", _tt.elapsed().as_secs_f64()*1e3);
+                }
                 for r in 0..t {
                     argmaxes.push(llm170_core::matmul::greedy_from(
                         &rows[r * self.n_vocab..(r + 1) * self.n_vocab]));
