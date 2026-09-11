@@ -2508,3 +2508,30 @@ Both the GPU head (`mtp_step_gpu`) and the CPU chain (`mtp_forward`, used for j>
 misfire alike, so the defect is in shared state (weights layout, pair convention or
 head input) rather than one kernel. Drafts are frequently 220 (" "), i.e. the head is
 under-informed rather than broken.
+
+## MTP defect, second pass (2026-09-12)
+
+Acceptance is broken, not merely weak: on a trivially predictable prompt
+(`LLM170_BENCH_TEXT="one two three one two three ..."`, pp32/tg32/k=4) the drafts
+hit 9/23 at the first position and **0/9 at every chained position**, and on natural
+text 12/53 at j=0, 0/12 at j=1. A correct MTP head should be near-perfect on the
+repetitive prompt.
+
+Concrete fix applied: `mtp_h_next` was never written on the raw decode path (the GPU
+MTP step *returns* the MTP layer's hidden and the hook discarded it with `let (am, _)`),
+so the j>=1 chain ran with zero input vectors. Now stored. Acceptance did not change,
+so the chain has at least one further defect - but the wiring is now correct.
+
+Tooling caveat found while hunting this: `rawhip-check` reports a GEMV mismatch for
+*every* q6_K tensor, including main-model tensors whose output stream is proven
+bit-identical to the CPU engine. The probe's CPU mirror does not account for the
+engine's q6_K repack, so it is not a valid oracle for q6_K; the same applies to naive
+canonical-order comparisons of GGUF weights. `llm170 dequant` prints the engine order.
+
+New diagnostic: `LLM170_MTP_DUMP=<prefix>` writes tok_emb/h/cat/eh as f32 after the
+eh_proj. The first stage checks out against canonical math (cat maxrel 4.3e-07: enorm,
+hnorm and the concat order are correct), so the defect is downstream of the projection.
+
+Next: compare the GPU head (`mtp_step_g`) against the CPU layer (`mtp_step`/`mtp_forward`)
+on identical (token, h, pos) inputs - both exist, so the disagreement needs no external
+reference to localise.

@@ -1875,6 +1875,23 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         // RCA 대상: gemv_q8_out 경로가 ni=10240에서만 700 — 직접 launch는 동일 파라미터로
         // 성공(gy 스위프 검증). 동일 직접 경로로 실행 (산술은 gemm_q6k로 동일).
         self.mm_direct(self.mtp_xq2, we, te, nie, noe, self.mtp_cur)?;
+        // 진단 덤프 (MTP 헤드 1단계 수치 미러 대조): tok_emb/h/cat/eh
+        if let Some(pref) = std::env::var_os("LLM170_MTP_DUMP") {
+            let pref = pref.to_string_lossy().to_string();
+            self.ctx.sync()?;
+            let mut hv = vec![0f32; n];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), h_gpu)?;
+            let mut cv = vec![0f32; 2 * n];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut cv).as_mut(), self.mtp_cat)?;
+            let mut ev = vec![0f32; n];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut ev).as_mut(), self.mtp_cur)?;
+            let mut out = Vec::with_capacity((5 * n + 2 * n) * 4);
+            out.extend_from_slice(bytemuck::cast_slice(tok_emb));
+            out.extend_from_slice(bytemuck::cast_slice(&hv));
+            out.extend_from_slice(bytemuck::cast_slice(&cv));
+            out.extend_from_slice(bytemuck::cast_slice(&ev));
+            std::fs::write(format!("{pref}.f32"), &out).map_err(|e| e.to_string())?;
+        }
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];

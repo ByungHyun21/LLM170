@@ -608,11 +608,16 @@ impl Engine {
                 let lg = rd.raw_step_h(seq, pos, &row, &mut h_t).map_err(ModelError::Accel)?;
                 let rd2 = rd.clone();
                 let prev_h = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
-                let (am, _) = rd2
+                let (am, hn) = rd2
                     .mtp_step_gpu(seq, &row, &prev_h, pos)
                     .map_err(ModelError::Accel)?;
                 let st = &mut self.seqs[seq];
                 st.mtp_draft_tok = am;
+                // 체인용 MTP층 hidden — 미저장이면 j>=1 초안이 0입력으로 계산된다
+                // (2026-09-12 RCA: j>=1 수락 0/12).
+                if st.mtp_h_next.len() == hn.len() {
+                    st.mtp_h_next.copy_from_slice(&hn);
+                }
                 st.mtp_pending_h = h_t;
                 lg
             } else {
