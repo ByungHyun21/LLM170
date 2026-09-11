@@ -1715,3 +1715,43 @@ engine because they co-schedule worse with the other kernels in the chain.
 Solo-rate improvements have now failed to transfer in every tile variant
 tried; the engine's tile configuration (2 subgroups, BM=64, BN=128, 18-vec2
 LDS stride) stays.
+
+## Speculative decoding on Vulkan — cost breakdown (session 2026-09-11)
+
+Measured with `LLM170_SPEC_TIMING=1 LLM170_SPEC_GPU=1 LLM170_VKD_BATCH=1` on tg spec=3
+(q35work, pp64): step total 1280.9 ms for acc=2 tokens. Components:
+
+| Stage | Cost | Note |
+|---|---|---|
+| draft chain (k=3) | 351 ms (117 ms/draft) | MTP layer GEMVs at solo rate (~30 GB/s) |
+| state snapshot | 620 ms | rollback save of GDN state (~150 MB) — dominant |
+| verify `step_batch` t=4 | 296 ms (74 ms/token) | **no weight amortisation at small t** |
+| advance | 4 ms | |
+
+Plain decode reference: ~62 ms/token, so the spec path was 10-20x slower than plain.
+
+### Root finding: weight traffic is not shared across the batch dimension at small t
+
+- gemv8 (t < 16) dispatches one workgroup per (row-pair, token): the same weight rows are
+  re-read by every token slab, and the z-ordered launch gives no temporal locality for L2 to
+  merge. Traffic scales ~linearly with t.
+- Forcing the tile path with `LLM170_VK_TILE1=1` does **not** change this: verify t=4 stays at
+  293 ms (73 ms/token), i.e. slower than 4 independent t=1 decodes.
+- At t >= 16 the tile kernels *do* amortise (pp64: 624 ms / 64 = 9.8 ms/token, 6x better than
+  t=1), because a workgroup keeps the weight tile in LDS while iterating over tokens.
+
+Consequence: speculative verification with small batches (k+1 tokens) cannot win on this
+backend regardless of the draft cost or snapshot cost. A batched verify only becomes
+profitable if the verification batch is large (>= 16) or if the small-t GEMV path is
+restructured so that one workgroup covers several tokens (i.e. move the token loop inside
+the workgroup, LDS-resident weights).
+
+### Secondary findings (kept, correctness-neutral)
+
+- The prefill MTP KV hook used the **CPU** `mtp_step` (~150 ms/token), which was the cause of
+  the "spec enabled makes prefill 30x slower" observation (pp64: 207 -> 6.5 t/s). It now uses
+  `mtp_step_gpu` (argmax only, `mtp_draft_tok`); the draft fallback in `spec.rs` reads that
+  field when `mtp_draft_logits` is empty. Spec output remains token-identical to the plain
+  path (verified: 84 220 201 198 201 198 201 for both).
+- `LLM170_VKD_BATCH=1` (batched verify) is token-identical to the per-token verify (same
+  gemv8 kernels, t < 16).
