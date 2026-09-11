@@ -968,13 +968,14 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
+    let is_nl = w.ty == llm170_gguf::GgmlType::Iq4Nl;
     let is_q5 = w.ty == llm170_gguf::GgmlType::Q5K;
     let is_q6 = w.ty == llm170_gguf::GgmlType::Q6K;
     let is_q4 = w.ty == llm170_gguf::GgmlType::Q4K;
     let is_q3 = w.ty == llm170_gguf::GgmlType::Q3K;
     let is_q8 = w.ty == llm170_gguf::GgmlType::Q8_0;
-    if !is_xs && !is_q5 && !is_q6 && !is_q4 && !is_q3 && !is_q8 {
-        return Err("gemv8 검증은 q3_K/q4_K/q5_K/q6_K/iq4_xs만".into());
+    if !is_xs && !is_nl && !is_q5 && !is_q6 && !is_q4 && !is_q3 && !is_q8 {
+        return Err("gemv8 검증은 q3_K/q4_K/q5_K/q6_K/iq4_xs/iq4_nl만".into());
     }
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
@@ -1030,6 +1031,8 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         llm170_gguf::GgmlType::Q4K => "crates/backend-gpu/src/rawvk/spv/gemv8_q4.spv",
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_Q5B").map(|v| v != "0").unwrap_or(true) =>
             "crates/backend-gpu/src/rawvk/spv/gemv8_q5b.spv",
+        llm170_gguf::GgmlType::Iq4Nl =>
+            "crates/backend-gpu/src/rawvk/spv/gemv8_nlb.spv",
         llm170_gguf::GgmlType::Q5K => "crates/backend-gpu/src/rawvk/spv/gemv8_q5.spv",
         llm170_gguf::GgmlType::Q6K if std::env::var("LLM170_Q6B").map(|v| v != "0").unwrap_or(true) =>
             "crates/backend-gpu/src/rawvk/spv/gemv8_q6b.spv",

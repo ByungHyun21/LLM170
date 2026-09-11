@@ -1,0 +1,86 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8_nlb (plans/46) — IQ4_NL 전용 gemv (구 폴백 대체). gemv8_q8b 골격:
+// 64스레드, NUM_ROWS=2, K_PER_ITER=8 (KPIT=512). 블록 18B = [d f16][qs 16B
+// = 32 니블]. 니블 → kvalues_iq4nl LUT (llama types.glsl 상수). t=1 스테디에서
+// 폴백 7텐서 ~3.2ms/토큰 중 6개(≈2.8ms)를 이 커널이 흡수.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0u { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+const float kvals[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.z;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint ybase = tok * pc.n_in;
+    float acc0 = 0.0, acc1 = 0.0;
+    const uint n_in = pc.n_in;
+    const uint KPIT = 64u * 8u;   // 512 k/iter
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        const vec4 bv0 = vec4(xa[ybase + col0], xa[ybase + col0 + 1u], xa[ybase + col0 + 2u], xa[ybase + col0 + 3u]);
+        const vec4 bv1 = vec4(xa[ybase + col0 + 4u], xa[ybase + col0 + 5u], xa[ybase + col0 + 6u], xa[ybase + col0 + 7u]);
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;
+            const uint blk = col / 32u;
+            const uint bbase = blk * 18u;
+            const uint rem = col & 31u;              // 블록 내 원소 (8 정렬)
+            // CPU 규약(quant.rs deq_iq4_nl): 바이트 j의 lo 니블 = 원소 j(앞 16),
+            // hi 니블 = 원소 16+j(뒤 16). 8원소 = 바이트 8개(rem&15 기저)의
+            // 같은 니블 면 → u32 2개 조립.
+            const uint bb = rem & 15u;
+            const uint nsh = (rem < 16u) ? 0u : 4u;
+            const uint wd = bbase + 2u + bb;
+            const uint w0 = w0u[wd >> 2];
+            const uint w1 = w0u[(wd >> 2) + 1u];
+            const uint w2 = w0u[(wd >> 2) + 2u];
+            const uint sh = (wd & 3u) * 8u;
+            const uint vA = (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
+            const uint vB = (w1 >> sh) | (sh != 0u ? (w2 << (32u - sh)) : 0u);
+            // d f16 @ bbase (2B)
+            const uint dw = w0u[bbase >> 2];
+            const uint dsh = (bbase & 3u) * 8u;
+            uint db = (dw >> dsh) & 0xFFFFu;
+            if (dsh >= 24u) {
+                db = ((dw >> dsh) | (w0u[(bbase >> 2) + 1u] << 8u)) & 0xFFFFu;
+            }
+            const float d = unpackHalf2x16(db).x;
+            // 원소 순서: 바이트 i의 lo=원소 2i, hi=2i+1 (llama 규약)
+            const float kk0 = kvals[(vA >> (0u + nsh)) & 0xFu];
+            const float kk1 = kvals[(vA >> (8u + nsh)) & 0xFu];
+            const float kk2 = kvals[(vA >> (16u + nsh)) & 0xFu];
+            const float kk3 = kvals[(vA >> (24u + nsh)) & 0xFu];
+            const float kk4 = kvals[(vB >> (0u + nsh)) & 0xFu];
+            const float kk5 = kvals[(vB >> (8u + nsh)) & 0xFu];
+            const float kk6 = kvals[(vB >> (16u + nsh)) & 0xFu];
+            const float kk7 = kvals[(vB >> (24u + nsh)) & 0xFu];
+            const float r = d * (bv0.x * kk0 + bv0.y * kk1 + bv0.z * kk2 + bv0.w * kk3
+                               + bv1.x * kk4 + bv1.y * kk5 + bv1.z * kk6 + bv1.w * kk7);
+            if (n == 0u) acc0 += r; else acc1 += r;
+        }
+    }
+    const float r0 = subgroupAdd(acc0);
+    const float r1 = subgroupAdd(acc1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[tok * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[tok * pc.n_out + first_row + 1u] = r1;
+    }
+}
