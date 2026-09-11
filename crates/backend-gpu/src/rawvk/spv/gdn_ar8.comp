@@ -2,11 +2,13 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-// gdn_ar8 (plans/40) — ar4의 열 8개 확장 (ILP×8, WG 2048).
-// 서브그룹 축소 16회의 지연을 상호 은폐 + k/q 로드 8분의 1.
-// grid (dt_rank, d_state/8). 수치: gdn_ar과 동일 산식 (열별 스칼라 연산).
+// gdn_ar8 (plans/40→46) — ar4의 열 8개 확장. 전치 상태 레이아웃 s[col*d + row]
+// (결합 로드, plans/46 커밋 510ed11). t≥2 프리필에서 전치 주소 지정이 레지스터
+// 압력을 넘겨 스파일→루프 코드젠 악화(실측 pp512 303→285)했으므로, 열 8개를
+// 2개씩 롤링 처리해 라이브 레지스터를 절반 이하로 — 열별 산식·순서는 완전 동일
+// (비트동일). grid (dt_rank, d_state/8).
 layout(local_size_x = 32) in;
-layout(binding = 0) buffer S { float s[]; };             // [pair][d*d]
+layout(binding = 0) buffer S { float s[]; };             // [pair][col*d + row] (전치)
 layout(binding = 1) readonly buffer Q { float q[]; };    // [t][k_len]
 layout(binding = 2) readonly buffer K { float k[]; };    // [t][k_len]
 layout(binding = 3) readonly buffer V { float v[]; };    // [t][v_len]
@@ -42,26 +44,29 @@ void main() {
         float q1 = q[qk0 + lane * 4 + 1];
         float q2 = q[qk0 + lane * 4 + 2];
         float q3 = q[qk0 + lane * 4 + 3];
-        float part[8], op[8];
-        [[unroll]] for (int c = 0; c < 8; c++) {
-            s0[c] *= g; s1[c] *= g; s2[c] *= g; s3[c] *= g;
-            part[c] = s0[c] * k0 + s1[c] * k1 + s2[c] * k2 + s3[c] * k3;
-        }
-        float sk[8];
-        [[unroll]] for (int c = 0; c < 8; c++) sk[c] = subgroupAdd(part[c]);
-        float delta[8], vv[8];
-        [[unroll]] for (int c = 0; c < 8; c++) {
-            vv[c] = v[v0 + u0 + c];
-            delta[c] = (vv[c] - sk[c]) * beta;
-            s0[c] += k0 * delta[c];
-            s1[c] += k1 * delta[c];
-            s2[c] += k2 * delta[c];
-            s3[c] += k3 * delta[c];
-            op[c] = s0[c] * q0 + s1[c] * q1 + s2[c] * q2 + s3[c] * q3;
-        }
-        [[unroll]] for (int c = 0; c < 8; c++) {
-            float otot = subgroupAdd(op[c]);
-            if (lane == 0) o[v0 + u0 + c] = otot * pc.scale;
+        // 열 2개씩 롤링 — 부분곱/축소 버퍼를 [2]로 유지 (레지스터 절감).
+        // 열별 연산 순서는 구 ar8과 byte-for-byte 동일.
+        [[unroll]] for (int c = 0; c < 8; c += 2) {
+            float part[2], op[2];
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                s0[c + j] *= g; s1[c + j] *= g; s2[c + j] *= g; s3[c + j] *= g;
+                part[j] = s0[c + j] * k0 + s1[c + j] * k1 + s2[c + j] * k2 + s3[c + j] * k3;
+            }
+            float sk[2];
+            [[unroll]] for (int j = 0; j < 2; j++) sk[j] = subgroupAdd(part[j]);
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                float vv = v[v0 + u0 + c + j];
+                float delta = (vv - sk[j]) * beta;
+                s0[c + j] += k0 * delta;
+                s1[c + j] += k1 * delta;
+                s2[c + j] += k2 * delta;
+                s3[c + j] += k3 * delta;
+                op[j] = s0[c + j] * q0 + s1[c + j] * q1 + s2[c + j] * q2 + s3[c + j] * q3;
+            }
+            [[unroll]] for (int j = 0; j < 2; j++) {
+                float otot = subgroupAdd(op[j]);
+                if (lane == 0) o[v0 + u0 + c + j] = otot * pc.scale;
+            }
         }
     }
     [[unroll]] for (int c = 0; c < 8; c++) {
