@@ -2188,3 +2188,27 @@ Remaining np4 levers, measured: (a) the per-seq state kernels (conv/AR/flash =
 21.6 ms/step, 192+192+64 launches) — batching them across slots or fusing the
 GDN chain; (b) G4 at 143-169 GB/s vs the 225 GB/s single-stream rate (the y-side
 loads repeat per output row); (c) ~1500 launches per step at ~4-5 us each.
+
+### MMQ `.co` rebuild attempts — both segfault (2026-09-12)
+
+Two experiments rebuilt `mmq.co` from `plans/i8_arc/mmq_native_q45.cu` with
+`hipcc --offload-arch=gfx1151 -O3 -I <llama.cpp/ggml-cuda>` plus bundle
+extraction (the recipe in `scripts/build_co.py`):
+
+1. **64-row tile config** (plans/47 #28195: I=64, nthreads=128, occupancy=3 for
+   the J=128 entries) with a matching launcher geometry (grid ceil(n_out/64),
+   block 32x4, smem 38,400 B per llama's `mmq_get_nbytes_shared`). Deterministic
+   SIGSEGV on the first GEMM, also with smem forced to 58,880/65,536 B — not a
+   sizing issue.
+2. **Extra type instantiations** (q8_0/q3_K/iq4_nl/iq3_s at J=128, to move the
+   81 ms/pass of odd-type tiles onto MMQ): the rebuilt `.co` exports all eight
+   mangled symbols (verified byte-exact against our generated names) and loads,
+   but the first GEMM segfaults.
+
+Common factor: the shipped `co/mmq.co` was built against a *specific* llama.cpp
+header snapshot (i8_arc sources, 2026-09-05). A rebuild from the current
+`source/llama.cpp` tree produces a kernel whose compile-time ABI differs
+(`ggml_cuda_mmq_config` / smem layout / tile parameters), so the launcher's
+assumptions no longer hold. **Conclusion: `.co` rebuilds must pin the exact
+header revision used for the shipped objects; without it, treat the precompiled
+path as immutable.** The 81 ms/pass odd-type tiles therefore stay.
