@@ -465,6 +465,55 @@ impl DecodeState {
         self.weights.get(key).copied().ok_or_else(|| format!("weight 없음: {key}"))
     }
 
+    /// mm_b2/mm_b2_s가 f32 y를 직접 소비하는 경로(MMQ/q6 DEQ16)를 택하는가.
+    /// 라우팅 조건은 mm_b2와 동일해야 한다 — 어긋나면 활성 q8을 건너뛴 쪽이
+    /// 미초기화 버퍼를 읽는다.
+    fn mmq_used(&self, ty: u32, t: usize) -> bool {
+        if !matches!(ty, 12 | 13 | 14 | 23) {
+            return false;
+        }
+        let only = std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok());
+        if std::env::var_os("LLM170_NO_MMQ").is_some() && only.is_none() {
+            return false;
+        }
+        if let Some(m) = only {
+            if m & (1u32 << (ty - 12)) == 0 {
+                return false;
+            }
+        }
+        if ty == 14 && std::env::var_os("LLM170_Q6MMQ").is_none() {
+            // q6_K: 기본은 타일(활성 q8 소비). DEQ16만 f32 직소비.
+            return std::env::var_os("LLM170_DEQ16").is_some()
+                && t >= 32
+                && super::co_loaded(super::CO_MMQ2);
+        }
+        (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
+            && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
+    }
+
+    /// 사이드 스트림(mm_b2_s → gemm_mmq_s)의 f32 직소비 여부 — 조건 미러.
+    /// (gemm_mmq_s는 ty14를 다루지 않는다.)
+    fn mmq_used_s(&self, ty: u32, t: usize) -> bool {
+        matches!(ty, 12 | 13 | 23)
+            && t >= 32
+            && std::env::var_os("LLM170_NO_MMQ").is_none()
+            && std::env::var_os("LLM170_NO_MMQ_S").is_none()
+            && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
+    }
+
+    /// 지정 가중치들이 모두 f32 직소비 경로면 활성 quant를 생략할 수 있다.
+    fn grp_mmq(&self, names: &[String], t: usize) -> bool {
+        let r = names.iter().all(|n| {
+            self.weights
+                .get(n)
+                .map_or(false, |&(_, ty, _, _)| self.mmq_used(ty, t) && self.mmq_used_s(ty, t))
+        });
+        if std::env::var_os("LLM170_QSKIP_DBG").is_some() {
+            eprintln!("# qskip t={t} n={} -> {r}", names.len());
+        }
+        r
+    }
+
     /// 디코드 1스텝 (t=1, 단일 시퀀스) — logits 반환. xs에 임베딩 h2d 완료 전제.
     #[allow(clippy::too_many_lines)]
     pub fn step(&self, seq: usize, pos: usize) -> Result<Vec<f32>, String> {
@@ -1152,7 +1201,18 @@ impl DecodeState {
             let wn = *self.consts.get(&format!("blk.{il}.attn_norm")).ok_or("attn_norm")?;
             self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
             self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
-            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            // qkv/gate/beta/alpha(또는 q/k/v)가 모두 f32 직소비면 q8 활성은 사장 —
+            // MMQ는 y_f32를 직접 읽고 내부에서 mmq 레이아웃으로 재양자화한다.
+            let proj_names: Vec<String> = if self.is_recr[il] {
+                ["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha"].iter()
+                    .map(|k2| format!("blk.{il}.{k2}.weight")).collect()
+            } else {
+                ["attn_q", "attn_k", "attn_v"].iter()
+                    .map(|k2| format!("blk.{il}.{k2}.weight")).collect()
+            };
+            if !self.grp_mmq(&proj_names, t) {
+                self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            }
 gmark("norm", &mut marks);
             if self.is_recr[il] {
                 // 2스트림: qkv+beta(주) ‖ gate+alpha(사이드) — 4독립 GEMM
@@ -1341,7 +1401,9 @@ gmark("trace", &mut marks);
 gmark("gdn", &mut marks);
 gmark("normg", &mut marks);
                 // out proj 배치
-                self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
+                if !self.grp_mmq(&[format!("blk.{il}.ssm_out.weight")], t) {
+                    self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
+                }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
 gmark("outproj", &mut marks);
                 self.mm_b2(self.ggated_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
@@ -1469,7 +1531,9 @@ gmark("attn", &mut marks);
                     }
                 }
                 // wo 배치
-                self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                if !self.grp_mmq(&[format!("blk.{il}.attn_output.weight")], t) {
+                    self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
                 self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
@@ -1480,7 +1544,12 @@ self.axpy(self.xs_t, self.gout_t, n * t)?;
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
             self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
-            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            if !self.grp_mmq(
+                &[format!("blk.{il}.ffn_gate.weight"), format!("blk.{il}.ffn_up.weight")],
+                t,
+            ) {
+                self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            }
 gmark("ffn_quant", &mut marks);
             // 2스트림: gate(사이드) ‖ up(주) — 독립 GEMM, 출력버퍼 분리
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
@@ -1539,7 +1608,9 @@ gmark("ffn_silu", &mut marks);
                 let bl = hl.iter().filter(|v| v.is_nan() || v.is_infinite()).count();
                 eprintln!("#  F0 fgate nan/inf {bg} | fglu nan/inf {bl}");
             }
-            self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
+                self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            }
 gmark("ffn_quant2", &mut marks);
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
@@ -2130,7 +2201,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                         self.ctx.launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
                     }
                 }
-                self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                if !self.grp_mmq(&[format!("blk.{il}.attn_output.weight")], t) {
+                    self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
+                }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
                 self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
                 full_idx += 1;
@@ -2139,7 +2212,12 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             // FFN 공유
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
-            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            if !self.grp_mmq(
+                &[format!("blk.{il}.ffn_gate.weight"), format!("blk.{il}.ffn_up.weight")],
+                t,
+            ) {
+                self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            }
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
@@ -2152,7 +2230,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
                 self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
             }
-            self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
+                self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            }
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
@@ -2439,7 +2519,12 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             // FFN 공유
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
-            self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            if !self.grp_mmq(
+                &[format!("blk.{il}.ffn_gate.weight"), format!("blk.{il}.ffn_up.weight")],
+                t,
+            ) {
+                self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
+            }
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
@@ -2452,7 +2537,9 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
                 self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
             }
-            self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
+                self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
+            }
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
