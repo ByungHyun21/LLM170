@@ -2022,3 +2022,54 @@ MTP). The blockers, in order of size: (a) the prefill GEMM (mul_mat_q at ~12
 TMAC/s, one workgroup per CU at 49-59 KB dynamic smem), (b) the q6_K MMQ route
 (+6.5% pp, currently producing garbage — requant layout defect), (c) the np4
 batched-decode step efficiency, (d) spec-mode prefill per-token MTP block.
+
+## q6_K MMQ fix + gate results (2026-09-12, final block)
+
+**Root cause of the q6_K MMQ garbage, found in plans/i8_arc**: the MMQ code
+objects are direct instantiations of llama.cpp's own headers
+(`mmq_native_rdna35.cu` does `#include "mmq.cuh"`), so `mul_mat_q<Q6_K>` expects
+the ggml canonical block (ql|qh|scales|d with d at 208). Our weights are uploaded
+verbatim from the GGUF, i.e. already canonical — but the Q6MMQ path first ran
+`requant_q6k_canonical`, which permutes them into a d-first layout
+(d at 0, scales at 194). The kernel then read ql from the wrong bytes and
+produced garbage on >=32-token prefills. Bypassing the requant makes the route
+correct: identical greedy stream to the tile path on a 120-token prefill, and
+`LLM170_Q6MMQ=1` measures +1.3% pp.
+
+q6_K now takes the MMQ route by default (`LLM170_NO_Q6MMQ=1` restores tiles,
+`LLM170_Q6RQ=1` restores the legacy requant). Interleaved A/B (3 pairs):
+**pp512 328.5 -> 332.4 (+1.2%)**, tg32 unchanged 11.06.
+
+Gate (scripts/verify.py, 2-phase, fresh llama reference re-collected and
+re-judged): **16/19 PASS, all 9 spec_* invariants exact** (`--spec 4` output ==
+non-spec greedy). The three FAILs are reference-side:
+- `long_np2_seq1` / `long_np4_seq1` (long2): llama's reference stream changes
+  between collections (the documented 2026-09-06 slot-KV instability case); our
+  tokens match the previously recorded llama output (16, 13, 159301).
+- `long_np4_seq2` (long3): the llama reference produced a single token
+  (248044) — a degenerate reference; our first token ranks top-5 (gap 1.56,
+  epsilon 1.5).
+Both binaries (pre/post this round) produce identical streams on these cases,
+so the FAILs are not regressions.
+
+### Falsified this block
+
+| variant | result |
+|---|---|
+| `LLM170_MMQ_SMALLT=1` (MMQ for t=2..31, i.e. the np4 step at t=4) | 0.66x wall — mul_mat_q stages a full 128-row y tile for 4 real rows |
+| `LLM170_MTP_ACC=64` / `=8` (shrink the MTP KV accumulation window) | pp 240/312 (from 84.6) but tg spec4 12.97/5.33 (from 16.3) — the accumulation is what makes the drafts land |
+
+### Remaining gaps, in order of size (all measured)
+
+1. **np4 batched-decode step (t=4)**: ours ~19.8 t/s aggregate (CLI) / 12.18
+   (serve, after the scheduler fix) vs llama-server 25.6. The t=4 step runs the
+   128-wide tile kernels at 3% row utilisation; MMQ is worse (above).
+2. **prefill GEMM** (mul_mat_q ~12 TMAC/s, 1 WG/CU at 49-59 KB dynamic smem):
+   pp512 332 vs llama 353.6 = 0.94x. llama.cpp does not use MMQ at t=512 on this
+   device (its RDNA3 heuristic disables it above 256 tokens) — it dequantises to
+   f16 and calls hipBLAS, which the pure-Rust constraint forbids; the
+   equivalent would be a WMMA f16 GEMM with proper tiling.
+3. **MTP-mode prefill**: 179 t/s after the head-skip fix (from 84.6); the
+   residual is the per-token MTP block (512 sequential t=1 block passes,
+   ~1.3 s). A batched MTP prefill (one t=512 pass over blk.64's attention+FFN)
+   would bring it to ~300.
