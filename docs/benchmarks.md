@@ -2331,3 +2331,30 @@ Measured levers that were neutral this session (do not re-try blindly):
 `LLM170_NO_WKFLASH` (0.857x), `LLM170_NO_QSA_SPLIT` (0.823x),
 `LLM170_DEQ16=1` (0.89x), `LLM170_MMQ_SMALLT=1` (0.66x wall on np4),
 `LLM170_NO_MMQ=1` (0.96x), `LLM170_MMQ_ONLY=3` (0.968x).
+
+## Late-session levers: one adopted, several falsified (2026-09-12)
+
+Adopted: **q6_K GEMV misaligned-word path** rewritten to three 8-byte `uint2`
+loads at the aligned base (q6_K rows are 210-byte blocks, so `wb+ql_rel` is
+2-mod-4 for half the blocks and the old path issued 5 overlapping 4-byte loads
+per 4 words). Bit-identical; interleaved A/B tg32 10.99 -> 11.07 (+0.73%).
+
+Falsified (all measured this session, do not retry blindly):
+
+| knob | result |
+|---|---|
+| `LLM170_T1SG=64/32` (decode attention split granularity) | tg 1.0004 / 0.9987 |
+| `LLM170_QSA_SEG=256/512` (prefill attention segment) | pp 0.9997 / 1.0024 |
+| `LLM170_ARW4` 4-u AR with smem k/q staging | pp 0.982x |
+| `LLM170_QSA_SEG`+`QSA_TH` variants, `NO_WKFLASH`, `NO_QSA_SPLIT` | 0.86-1.00x |
+| rebuilt `mmq.co` (extra types / 64-row config) | segfault (header revision) |
+| rebuilt `v4all.co` | works (stream-identical) but no change |
+
+**llama.cpp's GDN kernel is structurally identical to ours** — read at
+`source/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu`: one warp per state
+column, `rows_per_lane = S_v/warp_size = 4` state shard per lane, 4 k + 4 q loads
+per lane per token, two `warp_reduce_sum` per token, and the same fused
+`S = g*S + k*delta` / `attn = S^T q` update, with the whole token range scanned
+sequentially inside the kernel (grid = H x n_seqs x S_v/4, `__launch_bounds__`
+128 threads). Our `gdn_ar_w_swap` matches that shape, so the 99 ms/pass AR scan is
+at parity and is not the prefill gap.
