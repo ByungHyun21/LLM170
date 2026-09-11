@@ -1,0 +1,81 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// gdn_arf (plans/46) — GDN 체인 융합: split3+l2+beta_g를 gdn_ar에 인라인.
+// 디스패치 4→1 (체인 노출 지연 ~1ms/토큰 절감). 수치: 기존 4커널과 비트동일
+// (l2: 레인 4원소 j-상승 제곱합→subgroupAdd→1/max(sqrt,eps); beta/g: gdn_beta_g 동일식).
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };
+layout(binding = 1) readonly buffer GC { float gc[]; };
+layout(binding = 2) readonly buffer Bb { float gbv[]; };
+layout(binding = 3) readonly buffer Aa { float gav[]; };
+layout(binding = 4) readonly buffer Dt { float dtb[]; };
+layout(binding = 5) readonly buffer Sa { float sa[]; };
+layout(binding = 6) buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t; float eps;
+} pc;
+void main() {
+    int pair = int(gl_WorkGroupID.x);
+    int u = int(gl_WorkGroupID.y);
+    int lane = int(gl_SubgroupInvocationID);
+    int base_s = pair * pc.d * pc.d;
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int tot = 2 * pc.ks + pc.vs;
+    float s0 = s[base_s + u * pc.d + lane * 4 + 0];
+    float s1 = s[base_s + u * pc.d + lane * 4 + 1];
+    float s2 = s[base_s + u * pc.d + lane * 4 + 2];
+    float s3 = s[base_s + u * pc.d + lane * 4 + 3];
+    for (int ti = 0; ti < pc.t; ti++) {
+        // ── l2 인라인 (l2_rows2와 동일 순서) — 스칼라 전개
+        int qb = ti * tot + kh * pc.d + lane * 4;
+        float dvq0 = gc[qb];       float dvk0 = gc[pc.ks + qb];
+        float dvq1 = gc[qb + 1];   float dvk1 = gc[pc.ks + qb + 1];
+        float dvq2 = gc[qb + 2];   float dvk2 = gc[pc.ks + qb + 2];
+        float dvq3 = gc[qb + 3];   float dvk3 = gc[pc.ks + qb + 3];
+        // precise: l2_rows2는 수축 없는 mul+add로 컴파일됨 — 동일 강제.
+        precise float partq = 0.0;
+        precise float partk = 0.0;
+        partq += dvq0 * dvq0; partk += dvk0 * dvk0;
+        partq += dvq1 * dvq1; partk += dvk1 * dvk1;
+        partq += dvq2 * dvq2; partk += dvk2 * dvk2;
+        partq += dvq3 * dvq3; partk += dvk3 * dvk3;
+        float invq = 1.0 / max(sqrt(subgroupAdd(partq)), pc.eps);
+        float invk = 1.0 / max(sqrt(subgroupAdd(partk)), pc.eps);
+        float k0 = dvk0 * invk; float k1 = dvk1 * invk;
+        float k2 = dvk2 * invk; float k3 = dvk3 * invk;
+        float q0 = dvq0 * invq; float q1 = dvq1 * invq;
+        float q2 = dvq2 * invq; float q3 = dvq3 * invq;
+        // ── beta/g 인라인 (gdn_beta_g 동일식)
+        int bh = ti * pc.hv + pair;
+        float beta = 1.0 / (1.0 + exp(-gbv[bh]));
+        float x = min(gav[bh] + dtb[pair], 80.0);
+        float sp = log2(1.0 + exp2(x * 1.4426950408889634)) * 0.6931471805599453;
+        float g = exp(sp * sa[pair]);
+        int v0 = ti * pc.vs + h * pc.d;
+        s0 *= g; s1 *= g; s2 *= g; s3 *= g;
+        // 원본 gdn_ar의 Fma 결합순서 정확 복제 (glslc가 자동 수축한 구조):
+        // part = Fma(s3,k3, Fma(s2,k2, Fma(s0,k0, s1*k1)))
+        float part = fma(s0, k0, s1 * k1);
+        part = fma(s2, k2, part);
+        part = fma(s3, k3, part);
+        float sk = subgroupAdd(part);
+        float delta = (gc[ti * tot + 2 * pc.ks + h * pc.d + u] - sk) * beta;
+        s0 = fma(k0, delta, s0);
+        s1 = fma(k1, delta, s1);
+        s2 = fma(k2, delta, s2);
+        s3 = fma(k3, delta, s3);
+        float op = fma(s0, q0, s1 * q1);
+        op = fma(s2, q2, op);
+        op = fma(s3, q3, op);
+        float otot = subgroupAdd(op);
+        if (lane == 0) o[v0 + u] = otot * pc.scale;
+    }
+        s[base_s + u * pc.d + lane * 4 + 0] = s0;
+    s[base_s + u * pc.d + lane * 4 + 1] = s1;
+    s[base_s + u * pc.d + lane * 4 + 2] = s2;
+    s[base_s + u * pc.d + lane * 4 + 3] = s3;
+}
