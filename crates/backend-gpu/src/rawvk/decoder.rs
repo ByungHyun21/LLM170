@@ -1557,7 +1557,7 @@ impl DecoderState {
         // 사전 판정 (self 대여 분리 — 클로저로 두면 mut 대여와 충돌)
         let elig: Vec<bool> = jobs
             .iter()
-            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(8 | 11 | 12 | 13 | 14 | 23)))
+            .map(|(k, _, _)| matches!(self.w.get(k).map(|e| e.1), Some(8 | 11 | 12 | 13 | 14 | 20 | 23)))
             .collect();
         let i8s: Vec<bool> = jobs.iter().map(|(k, _, _)| i8_on && self.i8w.contains_key(k)).collect();
         // xq 필요 조건: gemv8/타일 외 폴백 잡이 하나라도 있을 때
