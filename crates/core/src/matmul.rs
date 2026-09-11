@@ -548,6 +548,21 @@ pub trait RawDecode: Send + Sync {
         Err("mtp_step_gpu: 미지원".into())
     }
 
+    /// MTP KV 적립 전용 스텝 — with_head=false면 전체 vocab 헤드(argmax)를 생략한다.
+    /// 프롬프트 전 토큰의 KV를 쌓는 동안 헤드는 마지막 토큰만 필요하다.
+    /// 기본 구현은 항상 헤드를 계산한다(미지원 백엔드 폴백).
+    fn mtp_step_hidden(
+        &self,
+        seq: usize,
+        tok_emb: &[f32],
+        h: &[f32],
+        pos: usize,
+        with_head: bool,
+    ) -> Result<Option<u32>, String> {
+        let (am, _h) = self.mtp_step_gpu(seq, tok_emb, h, pos)?;
+        Ok(if with_head { Some(am) } else { None })
+    }
+
     /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백). 기본 Err.
     fn gdn_snapshot(&self) -> Result<(), String> {
         Err("gdn_snapshot: 미지원".into())

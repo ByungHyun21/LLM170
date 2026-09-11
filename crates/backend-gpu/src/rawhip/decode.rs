@@ -1143,6 +1143,21 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.mtp_head_argmax(h_normed)
     }
 
+    /// MTP KV 적립 전용 — 헤드 생략 시 전체 vocab GEMV(953MB 읽기)를 건너뛴다.
+    fn mtp_step_hidden(
+        &self,
+        seq: usize,
+        tok_emb: &[f32],
+        h: &[f32],
+        pos: usize,
+        with_head: bool,
+    ) -> Result<Option<u32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.ctx.h2d(ds.mtp_h, bytemuck::cast_slice(h))?;
+        ds.mtp_step_g(seq, tok_emb, ds.mtp_h, pos, with_head)
+    }
+
     fn tile_big_chunk(&self) -> bool {
         super::co_loaded(super::CO_J128)
     }
