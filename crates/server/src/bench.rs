@@ -179,7 +179,14 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                         .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-                llm170_backend_gpu::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+                // GPU 런타임이 요청됐는데 백엔드 주입이 실패하면 조용히 CPU 엔진으로
+                // 떨어져 "GPU" 수치가 CPU 수치가 된다 (2026-09-12 hipRTC 컴파일 오류로
+                // 1.5 t/s를 GPU로 오인). 벤치는 실패로 승격한다.
+                if let Err(e) = llm170_backend_gpu::inject_rawhip(&mut eng) {
+                    eprintln!("rawhip: {e}");
+                    eprintln!("error: GPU 백엔드 주입 실패 — bench는 CPU 폴백하지 않는다 (--gpu-runtime hip 확인)");
+                    return Err(e);
+                }
             }
             let _ = &backend;
             let has_mtp = eng.has_mtp();
