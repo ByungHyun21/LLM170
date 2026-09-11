@@ -48,15 +48,26 @@ impl Engine {
         // 훅은 prefill_rows(embd 스코프 밖)에 있으므로 borrow 충돌 없음.
         let cache: Vec<Vec<f32>> = {
             let embd = self.model.wchk("token_embd.weight")?;
-            tokens
-                .iter()
-                .map(|&tok| {
-                    let mut row = vec![0.0f32; n];
-                    crate::quant::dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
-                    row
-                })
-                .collect()
+            // 512행 × 5120값 q4_K 디양자화를 단일 스레드로 돌리면 pp512에서
+            // ~20ms가 GPU 패스 밖(호스트)에 붙는다 — 행 단위로 병렬화.
+            let mut rows: Vec<Vec<f32>> = tokens.iter().map(|_| vec![0.0f32; n]).collect();
+            let nt = crate::matmul::n_threads().max(1).min(rows.len().max(1));
+            let per = rows.len().div_ceil(nt).max(1);
+            std::thread::scope(|s| {
+                for (lo, ch) in rows.chunks_mut(per).enumerate() {
+                    let t0 = lo * per;
+                    let toks = &tokens[t0..t0 + ch.len()];
+                    let embd = &embd;
+                    s.spawn(move || {
+                        for (row, &tok) in ch.iter_mut().zip(toks.iter()) {
+                            crate::quant::dequant_row(embd.ty, embd.data, tok as u64, n as u64, row);
+                        }
+                    });
+                }
+            });
+            rows
         };
+        let _ = n;
         self.prefill_rows(seq, tokens, &cache)
     }
 
