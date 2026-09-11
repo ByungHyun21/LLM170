@@ -2158,3 +2158,33 @@ Natural-text spec bench (pp512, tg64, spec4, LLM170_SPEC_GPU=1, 2 reps):
 Spec-mode prefill is now at the plain prefill rate, and spec-mode tg is +75%
 over plain. Gate (fresh llama reference, 16/19) unchanged: the same three
 reference-side FAILs with identical gaps, and **all 9 spec_* invariants exact**.
+
+## np decode step profile and the head fix (2026-09-12)
+
+`raw_step_multi` now honours `LLM170_KTRACE`, so the np step (t = active slots)
+can be profiled. Per step at t=4, before the fix: 163.8 ms total, of which
+
+| kernel | ms | note |
+|---|---|---|
+| gemm_q6k_j128 (head) | 29.7 | 1.04 GB q6_K head through the 128-column tile at t=4 |
+| gemm_q5k4 (G4) | 47.1 | 7.93 GB at 169 GB/s |
+| gemm_xs4 (G4) | 19.8 | 3.13 GB at 158 GB/s |
+| gemm_q4k4 (G4) | 11.3 | 3.06 GB |
+| gemm_q6k4 (G4) | 9.2 | 1.82 GB (excl. head) |
+| gdn_conv_t | 8.5 | 192 launches (per-seq) |
+| qsa_flash | 7.9 | 64 launches |
+| gdn_ar_w | 5.2 | 192 launches |
+| rms/axpy/quant/kv/rope/misc | ~10 | |
+
+GEMM total ~122 ms for 17.5 GB = 143 GB/s effective (floor is ~78 ms at
+225 GB/s), non-GEMM ~32 ms, the rest is launch overhead at ~1500 launches/step.
+
+Fix: route the t=2..=4 head through `gemm_q6k4` (1.04 GB read once instead of a
+128-column tile). CLI np4 wall 23.34 -> 19.84 s (**-15%**), streams identical,
+judge unchanged (16/19, all 9 spec invariants exact). Cumulative np4 this
+session: 23.4 -> 19.8 s, aggregate ~19.8 -> ~23.4 t/s vs llama-server 25.6.
+
+Remaining np4 levers, measured: (a) the per-seq state kernels (conv/AR/flash =
+21.6 ms/step, 192+192+64 launches) — batching them across slots or fusing the
+GDN chain; (b) G4 at 143-169 GB/s vs the 225 GB/s single-stream rate (the y-side
+loads repeat per output row); (c) ~1500 launches per step at ~4-5 us each.
