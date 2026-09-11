@@ -1023,13 +1023,14 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
                 r
     }
 
+    /// MTP 훅용 프리필: 로짓 + **마지막 행** hidden(체인 carry)만 반환한다
+    /// (전행 d2h 10.5MB/chunk 제거 — MTP는 디바이스 xs_t를 직접 읽는다).
     fn raw_prefill_h(
         &self,
         seq: usize,
         pos0: usize,
         emb: &[f32],
-        h_all: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let t0 = std::time::Instant::now();
         if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
@@ -1050,11 +1051,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
             );
         }
 
-        // 전 토큰 최종 hidden d2h (MTP KV 적립용)
+        // 마지막 행 최종 hidden d2h (MTP carry 전용 — 전행 회수 제거)
         let t = emb.len() / ds.n_embd;
-        h_all.resize(t * ds.n_embd, 0.0);
-        ds.ctx
-            .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
+        let mut h_last = vec![0f32; ds.n_embd];
+        let last_row = unsafe { ds.xs_t.add((t - 1) * ds.n_embd * 4) };
+        ds.ctx.d2h(bytemuck::cast_slice_mut(&mut h_last).as_mut(), last_row)?;
         let r = ds.read_logits();
         if std::env::var_os("LLM170_KTRACE").is_some() {
             eprintln!("{}", crate::rawhip::ktrace_dump());
@@ -1062,7 +1063,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
             eprintln!("batch_h({} tok) wall={:.1}ms", t, t0.elapsed().as_secs_f64() * 1e3);
         }
-                r
+                Ok((r?, h_last))
     }
 
     fn raw_step_h(
@@ -1205,10 +1206,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         carry_h: &[f32],
         t: usize,
         pos0: usize,
+        with_head: bool,
     ) -> Result<u32, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        ds.mtp_prefill_batch(seq, tok_embs, carry_h, t, pos0)
+        ds.mtp_prefill_batch(seq, tok_embs, carry_h, t, pos0, with_head)
     }
 
     /// MTP KV 적립 전용 — 헤드 생략 시 전체 vocab GEMV(953MB 읽기)를 건너뛴다.
@@ -2051,6 +2053,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         carry_h: &[f32],
         t: usize,
         pos0: usize,
+        with_head: bool,
     ) -> Result<u32, String> {
         if !self.mtp_on {
             return Err("mtp_prefill_batch: MTP 미로드".into());
@@ -2224,6 +2227,14 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             }
         }
         mark("attn+kv", &mut cp);
+        // 중간 청크(with_head=false)는 KV 적립만 — 마지막 행의 attention/FFN/헤드도
+        // 아무도 읽지 않는다 (초안은 프롬프트 종료 청크에서만 필요).
+        if !with_head {
+            if mtp_time {
+                eprintln!("[mtpb] TOTAL {:.2}ms (t={t}, kv-only)", t_mtp.elapsed().as_secs_f64() * 1e3);
+            }
+            return Ok(0);
+        }
         // ⑤⑥ KV-only: 마지막 행만 (앞 행들의 wo/FFN 출력은 아무도 쓰지 않는다)
         let nrow_ffn = if full { t } else { 1 };
         let coff = if full { 0 } else { (t - 1) * n };

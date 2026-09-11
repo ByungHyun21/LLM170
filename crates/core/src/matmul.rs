@@ -488,14 +488,13 @@ pub trait RawDecode: Send + Sync {
         Err("raw_verify: 미지원".into())
     }
 
-    /// raw_prefill + 전 토큰 hidden 회수 (MTP KV 적립). 기본 Err.
+    /// raw_prefill + 마지막 행 hidden 회수 (MTP carry). 기본 Err.
     fn raw_prefill_h(
         &self,
         _seq: usize,
         _pos0: usize,
         _emb: &[f32],
-        _h_all: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         Err("raw_prefill_h: 미지원".into())
     }
 
@@ -548,28 +547,19 @@ pub trait RawDecode: Send + Sync {
         Err("mtp_step_gpu: 미지원".into())
     }
 
-    /// MTP 프리필 배치 — blk.64를 t행 한 번에 처리. 기본 구현은 토큰별 mtp_step_hidden.
+    /// MTP 프리필 배치 (HIP 전용). carry_h = 이전 청크 마지막 행 hidden 1행 —
+    /// 나머지 행은 디바이스의 본체 hidden(xs_t)에서 행 시프트로 조립한다.
+    /// with_head=false면 KV 적립만(초안 없음). 다른 백엔드는 미지원.
     fn mtp_prefill_batch(
         &self,
-        seq: usize,
-        tok_embs: &[f32],
-        h_shift: &[f32],
-        t: usize,
-        pos0: usize,
+        _seq: usize,
+        _tok_embs: &[f32],
+        _carry_h: &[f32],
+        _t: usize,
+        _pos0: usize,
+        _with_head: bool,
     ) -> Result<u32, String> {
-        let n = if t == 0 { return Err("mtp_prefill_batch: t=0".into()) } else { tok_embs.len() / t };
-        let mut tok = vec![0f32; n];
-        let mut h = vec![0f32; n];
-        let mut draft = 0u32;
-        for ti in 0..t {
-            tok.copy_from_slice(&tok_embs[ti * n..(ti + 1) * n]);
-            h.copy_from_slice(&h_shift[ti * n..(ti + 1) * n]);
-            let with_head = ti + 1 == t;
-            if let Some(am) = self.mtp_step_hidden(seq, &tok, &h, pos0 + ti, with_head)? {
-                draft = am;
-            }
-        }
-        Ok(draft)
+        Err("mtp_prefill_batch: 미지원(백엔드)".into())
     }
 
     /// MTP KV 적립 전용 스텝 — with_head=false면 전체 vocab 헤드(argmax)를 생략한다.

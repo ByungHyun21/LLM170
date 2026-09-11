@@ -105,13 +105,13 @@ impl Engine {
                 // 장문600 게이트 chunk128과 비트동일 검증)
                 let ch_sz = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse().ok())
                     .unwrap_or(if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() { 512 } else { 64 });
-                for ch in cache.chunks(ch_sz) {
+                let n_chunks = cache.len().div_ceil(ch_sz).max(1);
+                for (ci, ch) in cache.chunks(ch_sz).enumerate() {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
-                        // MTP KV 적립: 전 토큰 hidden 회수 후 훅 (마지막만 로짓)
-                        let mut h_all: Vec<f32> = Vec::new();
-                        let lg = rd
-                            .raw_prefill_h(seq, pos, &flat, &mut h_all)
+                        // MTP KV 적립: 마지막 행 hidden(carry)만 회수
+                        let (lg, h_last) = rd
+                            .raw_prefill_h(seq, pos, &flat)
                             .map_err(ModelError::Accel)?;
                         let n_e = self.model.hp.n_embd;
                         // 배치 MTP 프리필: blk.64를 청크 전체(t행) 한 번에 — t=1 스텝
@@ -128,13 +128,17 @@ impl Engine {
                         } else {
                             carry.resize(n_e, 0.0);
                         }
+                        // 헤드는 프롬프트 종료 청크에서만 (초안은 그때만 쓰인다).
+                        let with_head = ci + 1 == n_chunks;
                         let draft = rd
-                            .mtp_prefill_batch(seq, &tok_flat, &carry, ch.len(), pos)
+                            .mtp_prefill_batch(seq, &tok_flat, &carry, ch.len(), pos, with_head)
                             .map_err(ModelError::Accel)?;
                         {
                             let st = &mut self.seqs[seq];
-                            st.mtp_draft_tok = draft;
-                            st.mtp_pending_h = h_all[(ch.len() - 1) * n_e..].to_vec();
+                            if with_head {
+                                st.mtp_draft_tok = draft;
+                            }
+                            st.mtp_pending_h = h_last;
                         }
                         lg
                     } else {
