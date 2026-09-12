@@ -300,7 +300,7 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp256 / pp512 | (server cells below) | 9.4-9.8 / 11.1 / 11.1 t/s | 1.77 t/s (pp32) |
+| Prefill pp32 / pp256 / pp512 / pp2311 | (server cells below) | 9.4-9.8 / 11.1 / 11.18 / **10.99** t/s | 1.77 t/s (pp32) |
 | Decode tg16 (ctx 4096, warm) | 15.70 t/s solo (7.2.2) | **10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
@@ -352,6 +352,10 @@ Long prompts: the value path and the opt-in frame prefill both handle a
 the j128 tile defect was worked around (tile dispatches are now sliced to
 ≤128 tokens: the j128 CO faults with >1 token quadrant for n_in=6144 shapes
 such as ssm_out; the GEMV path is bit-identical, other n_in values tolerate it).
+
+Prefill is flat in prompt length (11.0-11.2 t/s from 256 to 2311 tokens), which
+matches the per-token host cost the stage timing shows — it is not an
+attention-quadratic effect.
 
 ### Open
 
