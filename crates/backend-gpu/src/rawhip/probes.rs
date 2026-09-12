@@ -374,6 +374,69 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `q5-1-bench [rows] [n_in] [n_out] [reps]` — q5_1 GEMM 격리 계측.
+/// 실모델 MoE expert-down 형상(20행 × 640 × 2560)을 합성 데이터로 돌려 커널
+/// 자체의 시간을 잰다 — KTRACE가 0.24ms/런치를 보고한 그 값과 대조하면
+/// 문제가 커널인지 컨텍스트(L2 상태·주변 런치)인지 갈린다.
+pub fn q5_1_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    // q5_1 블록 = 32원소(24B). 행당 n_in/32 블록.
+    let n_sub = n_in / 32;
+    let wrow = n_sub * 24;
+    let wbytes = n_out * wrow;
+    let xq_w = crate::rawhip::q4acc::xq_words(n_in);
+    let xbytes = rows * xq_w * 4;
+    let obytes = rows * n_out * 4;
+    let wdev = ctx.alloc(wbytes.max(4))?;
+    let xdev = ctx.alloc(xbytes.max(4))?;
+    let odev = ctx.alloc(obytes.max(4))?;
+    let part = ctx.scratch(n_out * 64 * 8)?;
+    // 합성: 가중치는 0x3c 패턴(d/m f16 = 1.0/0.0 근사), x는 1
+    let w = vec![0x3cu8; wbytes];
+    let x = vec![0x01u8; xbytes];
+    ctx.h2d(wdev, &w)?;
+    ctx.h2d(xdev, &x)?;
+    let launch = |kern: &str, gx: u32, block: u32| -> Result<(), String> {
+        let (mut xp, mut wp, mut pp, mut op) =
+            (xdev, wdev, part, odev);
+        let (mut ni, mut no, mut xw, mut tt) = (n_in as i32, n_out as i32, xq_w as i32, rows as i32);
+        let mut args: Vec<*mut c_void> = vec![
+            (&mut xp) as *mut _ as *mut c_void,
+            (&mut wp) as *mut _ as *mut c_void,
+            (&mut pp) as *mut _ as *mut c_void,
+            (&mut op) as *mut _ as *mut c_void,
+            (&mut ni) as *mut _ as *mut c_void,
+            (&mut no) as *mut _ as *mut c_void,
+            (&mut xw) as *mut _ as *mut c_void,
+            (&mut tt) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3(kern, gx, n_out.min(65535) as u32, n_out.div_ceil(65535) as u32, block, &mut args)
+    };
+    // 워밍업 + 시간
+    let mut msg = String::new();
+    for (kern, gx, blk) in [
+        ("q4_gemm_q5_1", rows as u32, 64u32),
+        ("q4_gemm_q5_1_t", rows.div_ceil(16) as u32, 256),
+    ] {
+        for _ in 0..2 {
+            launch(kern, gx, blk)?;
+        }
+        ctx.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            launch(kern, gx, blk)?;
+        }
+        ctx.sync()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let gb = wbytes as f64 / (ms / 1e3) / 1e9;
+        msg += &format!(
+            "# {kern}: {ms:.3}ms/런치 ({gb:.1}GB/s 가중치) rows={rows} {n_in}x{n_out}\n"
+        );
+    }
+    Ok(msg)
+}
+
 /// `q4-d2h-bench` — 소형 d2h 비용 격리(프레임 MoE가 ids 20KB를 읽는 데 15.5ms를
 /// 쓰고 있었다). 크기별·경로별로 잰다.
 pub fn d2h_bench() -> Result<String, String> {

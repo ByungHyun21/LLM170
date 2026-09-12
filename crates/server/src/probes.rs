@@ -13,6 +13,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
         "q4-d2h-bench" => llm170_backend_gpu::rawhip::d2h_bench(),
+        "q5-1-bench" => {
+            let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+            llm170_backend_gpu::rawhip::q5_1_bench(a(0, 20), a(1, 640), a(2, 2560), a(3, 50))
+        }
         "q4-qsa-check" => {
             let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(200usize);
             let np = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(200usize);
