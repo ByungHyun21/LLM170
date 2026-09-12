@@ -3617,3 +3617,23 @@ issue, the dependency was.
 Design consequence: a tile kernel where each lane accumulates its own dots (Q in registers, K/V in
 shared, per-key-batch statistics with a shared combine) removes the chain entirely; that is a
 smaller and more tractable change than the WMMA path, and it is contract-free in the prefill.
+
+## The attention bottleneck is shuffle *throughput*, and a 2.3% kernel that fails the gate (2026-09-12)
+
+Timing-only experiment: wrap `qsa_flash_wk16`'s butterfly in a skip (wrong results, valid timing) and
+pp3314 jumps **316.3 -> 370.1 t/s (+17%)**. Remaining at 1.10x llama if the butterfly cost nothing,
+so the shuffle work - not the FMAs, not the loads - is what the prefill attention spends its time on.
+
+Two attempts to attack it:
+
+| attempt | result |
+|---|---|
+| interleaving two keys' butterflies in source (bit-identical by construction) | **neutral** (316.7 vs 315.8) - the shuffles are throughput-limited, not latency-limited |
+| `qsa_flash_wk8` for hd=256: 8 lanes/row x 32 dims, warp = 4 rows, butterfly 4 -> 3 levels (2.7x fewer shuffles) | **+2.3% paired** (317.4 vs 310.4) **but 16/19 on the judge, with 3 real divergences** (long_np2_seq1, long_np4_seq1, long_np4_seq2; top-3 gaps 2.2-6.0, i.e. not ties) - **reverted** |
+
+The divergence appeared only on the judge's long prompts. A 200-token single-chunk prompt produced
+*bit-identical* tokens, so the bug lives in the chunked-prefill path (nseg > 4, n_past well beyond the
+chunk). Next step for this line: re-add the `part` dump in the launcher, run a >512-token prompt with
+wk8 and with the shipped kernel, and diff (row, head, segment) - the same method that localised the
+shared-memory bug in the WMMA attempt. The +2.3% (and the 17% ceiling measured above) makes it worth
+resuming.
