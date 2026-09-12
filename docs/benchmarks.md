@@ -4308,3 +4308,34 @@ structure viable there, whereas on RDNA3/HIP the `v_dot2_f32_f16` instruction (n
 SPIR-V equivalent) was the second half. Estimated payoff from the FA rewrite is ~1-3% pp
 and <1% tg at Vulkan's current numbers, for a ~2-3 hour shader+host rewrite - recorded so
 the decision is explicit rather than implied.
+
+## KV: f32 original removed - 3x memory cut, bit-identical (2026-09-12)
+
+The HIP KV cache held **6 bytes per element**: an f32 original (`alloc(kv_len*4)`) plus the f16
+mirror the decode attention reads. The f32 original existed only because the prefill attention was
+written first, and it read f32 to convert it to f16 in its own staging - i.e. it consumed a copy of
+what the mirror already stored, through the same deterministic conversion.
+
+So the f32 buffers were removed outright. The prefill kernels (`qsa_flash_wmma`, `wk8`, `wk16`, `wk`,
+`split4q4`) now take `const half*` and either copy the mirror (the WMMA staging, previously a
+float4 load plus four converts) or convert per element (the direct-read kernels). `qsa_flash` stays
+f32 because the MTP draft path and the `NO_FLASH` fallback use it. `kv_append_t` and the f32 copies
+now run only when a decode fallback is enabled (`legacy_f32()`: `NO_FLASH`/`NO_GQA`/`NO_GQA2`), and
+the conversion reads the activation buffer directly instead of the f32 KV it used to pass through.
+
+| ctx | before (f32+f16) | after (f16 only) | 16 attention layers |
+|---|---|---|---|
+| 4096 | 6 B/element | **2 B/element** | 805 MB -> **268 MB** |
+| 32768 | 6 B/element | 2 B/element | 6.4 GB -> **2.1 GB** (the 8 GB CMP's enabler) |
+
+Verification: **token-identical** on a 300-token prompt (the conversion is deterministic, so the
+values the kernels see are unchanged); `attn-check` 0 outliers over 50.3M elements (the m|delta| of
+0.0156 is the accepted f16-prefill class); `wmma-attn-check` 0 mismatches / 6e-4 after updating its
+synthetic harness to build an f16 mirror; `gqa-bench` unchanged at 5.05e-4; the ktrace's kernel sum
+per token **fell 19.36 -> 17.95 ms** (the f32 copy is gone, the conversion costs 0.19 ms); tg512
+median over three runs **11.66 t/s**, unchanged.
+
+Also added along the way: `scripts/check_hip_syntax.sh` - `cargo build` never sees `.hip` (hipRTC
+compiles at runtime), so a kernel edit's first feedback used to be a broken model run. The script
+concatenates the kernel assets in `include_str!` order and runs `hipcc -fsyntax-only` in ~2 seconds;
+it is what found the four type errors in this change and would have caught the earlier failed attempt.

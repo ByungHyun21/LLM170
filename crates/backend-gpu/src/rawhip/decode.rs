@@ -177,13 +177,17 @@ impl DecodeState {
             let mut ck16 = Vec::with_capacity(n_seqs);
             let mut cv16 = Vec::with_capacity(n_seqs);
             for s in 0..n_seqs {
-                ck.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
-                cv2.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                // f32 원본은 legacy 폴백에서만 필요 — 기본은 f16 미러만(메모리 3배 절감).
+                let lf = legacy_f32();
+                ck.push(if lf { ctx.alloc(kv_len * 4).map_err(|e| e.to_string())? } else { std::ptr::null_mut() });
+                cv2.push(if lf { ctx.alloc(kv_len * 4).map_err(|e| e.to_string())? } else { std::ptr::null_mut() });
                 // f16 미러: 초기값은 변환 전까지 읽히지 않는다(항상 [0,n_past) 를 변환)
                 ck16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
                 cv16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
-                ctx.h2d(ck[s], bytemuck::cast_slice(&zero_k))?;
-                ctx.h2d(cv2[s], bytemuck::cast_slice(&zero_k))?;
+                if lf {
+                    ctx.h2d(ck[s], bytemuck::cast_slice(&zero_k))?;
+                    ctx.h2d(cv2[s], bytemuck::cast_slice(&zero_k))?;
+                }
             }
             kv_k.push(ck);
             kv_v.push(cv2);
@@ -821,10 +825,13 @@ impl DecodeState {
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.aq)?;
                     eprintln!("#  A3dbg gate h0 [0..4]={:?}", &hq[hd..hd + 4]);
                 }
-                self.copy(self.ak, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
-                self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
-                kv_to_f16(&self.ctx, self.kv_k[full_idx][seq], self.kv_k16[full_idx][seq], pos * n_kv * hd, n_kv * hd)?;
-                kv_to_f16(&self.ctx, self.kv_v[full_idx][seq], self.kv_v16[full_idx][seq], pos * n_kv * hd, n_kv * hd)?;
+                if legacy_f32() {
+                    self.copy(self.ak, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                    self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                }
+                let dpos = pos * n_kv * hd;
+                kv_to_f16(&self.ctx, self.ak, self.kv_k16[full_idx][seq], 0, dpos, n_kv * hd)?;
+                kv_to_f16(&self.ctx, self.av, self.kv_v16[full_idx][seq], 0, dpos, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
                 let flash1 = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
@@ -1047,9 +1054,16 @@ impl RawDecoder {
 
 /// f32 KV → f16 미러 변환 (디코드 어텐션의 v_dot2 경로 전제).
 /// off·n 단위는 원소 수. 같은 스트림에 넣으므로 이후 커널이 순서대로 본다.
-fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, off: usize, n: usize) -> Result<(), String> {
-    let mut sp = unsafe { (src as *mut f32).add(off) } as *mut std::ffi::c_void;
-    let mut dp = unsafe { (dst as *mut u16).add(off) } as *mut std::ffi::c_void;
+/// f32 KV 원본이 필요한 경로(디코드 폴백)인지. 기본 경로는 f16 미러만 쓴다.
+fn legacy_f32() -> bool {
+    std::env::var_os("LLM170_NO_FLASH").is_some()
+        || std::env::var_os("LLM170_NO_GQA").is_some()
+        || std::env::var_os("LLM170_NO_GQA2").is_some()
+}
+
+fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: usize, n: usize) -> Result<(), String> {
+    let mut sp = unsafe { (src as *mut f32).add(src_off) } as *mut std::ffi::c_void;
+    let mut dp = unsafe { (dst as *mut u16).add(dst_off) } as *mut std::ffi::c_void;
     let mut nn = n as i32;
     let mut args: Vec<*mut std::ffi::c_void> = vec![
         &mut sp as *mut _ as *mut std::ffi::c_void,
@@ -1606,26 +1620,30 @@ gmark("attn", &mut marks);
                 }
                 // KV append 배치 (gy=t)
                 {
-                    let mut sp = self.ak_t as *mut std::ffi::c_void;
-                    let mut dp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
-                    let mut na = (n_kv * hd) as i32;
-                    let mut p0 = pos0 as i32;
-                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
-                    self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
-                    let off = pos0 * n_kv * hd;
+                    if legacy_f32() {
+                        let mut sp = self.ak_t as *mut std::ffi::c_void;
+                        let mut dp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut na = (n_kv * hd) as i32;
+                        let mut p0 = pos0 as i32;
+                        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                        self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    }
+                    let dst = pos0 * n_kv * hd;
                     let n = t * n_kv * hd;
-                    kv_to_f16(&self.ctx, self.kv_k[full_idx][seq], self.kv_k16[full_idx][seq], off, n)?;
+                    kv_to_f16(&self.ctx, self.ak_t, self.kv_k16[full_idx][seq], 0, dst, n)?;
                 }
                 {
-                    let mut sp = self.av_t as *mut std::ffi::c_void;
-                    let mut dp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
-                    let mut na = (n_kv * hd) as i32;
-                    let mut p0 = pos0 as i32;
-                    let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
-                    self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
-                    let off = pos0 * n_kv * hd;
+                    if legacy_f32() {
+                        let mut sp = self.av_t as *mut std::ffi::c_void;
+                        let mut dp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut na = (n_kv * hd) as i32;
+                        let mut p0 = pos0 as i32;
+                        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                        self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    }
+                    let dst = pos0 * n_kv * hd;
                     let n = t * n_kv * hd;
-                    kv_to_f16(&self.ctx, self.kv_v[full_idx][seq], self.kv_v16[full_idx][seq], off, n)?;
+                    kv_to_f16(&self.ctx, self.av_t, self.kv_v16[full_idx][seq], 0, dst, n)?;
                 }
                 // qsa 배치 (단일 런치 — sstride=ctx, n_past=pos0+t 최대;
                 // 초과 p는 마스크→-3e38→w=0 기여로 원소 산술열 불변)
@@ -1637,7 +1655,7 @@ gmark("attn", &mut marks);
                     let sstr = self.ctx_len as i32;
                     {
                         let mut qp = self.aq_t as *mut std::ffi::c_void;
-                        let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut ckp = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
                         let mut mp = mask as *mut std::ffi::c_void;
                         let mut scp = self.scores_t as *mut std::ffi::c_void;
                         let mut np_ = np_max;
@@ -1654,7 +1672,7 @@ gmark("attn", &mut marks);
                     {
                         let mut qp = self.aq_t as *mut std::ffi::c_void;
                         let mut scp = self.scores_t as *mut std::ffi::c_void;
-                        let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                        let mut cvp = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
                         let mut op = self.aout_t as *mut std::ffi::c_void;
                         let mut np_ = np_max;
                         let mut nh = n_head as i32;
@@ -1672,8 +1690,8 @@ gmark("attn", &mut marks);
                 // qsa fused flash: score+softmax+mix 단일 패스 (maxrel 1e-6 검증, 스트림★)
                 if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
                     let mut qp = self.aq_t as *mut std::ffi::c_void;
-                    let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
-                    let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut ckp = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut cvp = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
                     let mut mp = mask as *mut std::ffi::c_void;
                     let mut op = self.aout_t as *mut std::ffi::c_void;
                     let mut np_ = (pos0 + t) as i32;
@@ -2674,8 +2692,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     // flash per-seq (t=1)
                     {
                         let mut qp = aq_row as *mut std::ffi::c_void;
-                        let mut ckp = self.kv_k[full_idx][seqs[s]] as *mut std::ffi::c_void;
-                        let mut cvp = self.kv_v[full_idx][seqs[s]] as *mut std::ffi::c_void;
+                        let mut ckp = self.kv_k16[full_idx][seqs[s]] as *mut std::ffi::c_void;
+                        let mut cvp = self.kv_v16[full_idx][seqs[s]] as *mut std::ffi::c_void;
                         let mut mp = mask as *mut std::ffi::c_void;
                         let mut op = unsafe { self.aout_t.add(s * n_head * hd * 4) } as *mut std::ffi::c_void;
                         let mut np_ = (pos + 1) as i32;
@@ -2999,8 +3017,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     }
                     {
                         let mut qp = aq_row as *mut std::ffi::c_void;
-                        let mut ckp = self.kv_k[full_idx][sq] as *mut std::ffi::c_void;
-                        let mut cvp = self.kv_v[full_idx][sq] as *mut std::ffi::c_void;
+                        let mut ckp = self.kv_k16[full_idx][sq] as *mut std::ffi::c_void;
+                        let mut cvp = self.kv_v16[full_idx][sq] as *mut std::ffi::c_void;
                         let mut mp = mask as *mut std::ffi::c_void;
                         let mut op = unsafe { self.aout_t.add(g0 * n_head * hd * 4) } as *mut std::ffi::c_void;
                         let mut np_ = (pos0 + gt) as i32;
