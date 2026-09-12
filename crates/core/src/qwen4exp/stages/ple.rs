@@ -8,6 +8,11 @@ use crate::ops::{rms_norm, sigmoid, silu};
 use llm170_profiler::profile_span;
 
     /// PLE 블록 — 해시 gather→key/value→게이트→방송→dilated conv→잔차 2경로.
+    /// 순수 gather 래퍼 — 스레드에서 쓰기 위한 별칭(ple_gather_parts는 Sync).
+    fn plo_gather(data: &[u8], ty: llm170_gguf::GgmlType, hd: usize, rows: &[u32], out: &mut [f32]) {
+        crate::qwen4exp::ple_gather_parts(data, ty, hd, rows, out)
+    }
+
     /// 호스트 PLE 블록의 토큰 병렬 폭 — 토큰별 산술 순서는 그대로라 수치 불변.
     fn ple_threads(t: usize) -> usize {
         std::thread::available_parallelism()
@@ -49,12 +54,34 @@ use llm170_profiler::profile_span;
         let hit = prefetched
             .as_ref()
             .is_some_and(|p| p.len() == t && p.iter().all(|r| r.len() == emb_w));
+        let nt = ple_threads(t);
+        let per = t.div_ceil(nt);
         if !hit {
-            for (ti, r) in rows.chunks(heads).enumerate() {
-                let mut flat = vec![0.0f32; emb_w];
-                ctx.model.ple_gather(r, &mut flat)?;
-                emb[ti] = flat;
-            }
+            // mmap 랜덤 읽기 + 디양자화 — 토큰별 독립이므로 스레드로 나눈다
+            // (수치 불변: 토큰별 결과가 그대로 emb[ti]).
+            // 테이블 뷰를 미리 해석해 순수 함수(ple_gather_parts)로 호출 —
+            // Model4는 내부 RefCell 캐시가 있어 스레드 간 공유가 불가능하다.
+            let (tptr, tlen, tty, thd) = ctx.model.ple_table_view()?;
+            let tdata: &[u8] = unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
+            std::thread::scope(|sc| {
+                let mut rest: &mut [Vec<f32>] = &mut emb;
+                let mut base = 0usize;
+                while base < t {
+                    let take = per.min(t - base);
+                    let (head, tail) = rest.split_at_mut(take);
+                    rest = tail;
+                    let b = base;
+                    sc.spawn(move || {
+                        for (i, out) in head.iter_mut().enumerate() {
+                            let r = &rows[(b + i) * heads..(b + i + 1) * heads];
+                            let mut flat = vec![0.0f32; emb_w];
+                            plo_gather(tdata, tty, thd, r, &mut flat);
+                            *out = flat;
+                        }
+                    });
+                    base += take;
+                }
+            });
         } else {
             emb = prefetched.unwrap();
             if std::env::var_os("LLM170_PLE_VERIFY").is_some() {
@@ -90,8 +117,6 @@ use llm170_profiler::profile_span;
         }
 
         let mut gated_hist: Vec<Vec<f32>> = vec![Vec::new(); t];
-        let nt = ple_threads(t);
-        let per = t.div_ceil(nt);
         {
         let res_hc_ro: &[Vec<f32>] = res_hc;
         std::thread::scope(|sc| {
