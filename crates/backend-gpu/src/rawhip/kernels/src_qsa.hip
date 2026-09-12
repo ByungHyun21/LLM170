@@ -360,11 +360,23 @@ extern "C" __global__ void qsa_flash_merge(const float* q, const float* part, fl
     bool active = tid < hd;
     int nseg = (n_past + seg - 1) / seg;
     const float* base = part + ((size_t)(t * n_head + h) * nseg) * (hd + 2);
-    float M = -3.4028235e38f;
-    for (int i = 0; i < nseg; i++) {
-        float mi = base[i * (hd + 2) + hd];
-        if (mi > M) M = mi;
+    // 세그먼트 m_i 는 (hd+2) 플로트 간격 = 1032B 스트라이드라 매 원소가 다른 캐시라인이다.
+    // 스레드마다 104개를 직렬로 읽으면 로드 지연이 그대로 노출되므로(실측 80us/런치)
+    // 워프 하나가 레인별로 나눠 읽고 셔플로 합친다.
+    __shared__ float msh;
+    if (tid < 32) {
+        float M = -3.4028235e38f;
+        for (int i = tid; i < nseg; i += 32) {
+            float mi = base[i * (hd + 2) + hd];
+            if (mi > M) M = mi;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            M = fmaxf(M, __shfl_xor_sync(0xffffffffffffffffull, M, off));
+        if (tid == 0) msh = M;
     }
+    __syncthreads();
+    float M = msh;
     float a = 0.0f, ssum = 0.0f;
     for (int i = 0; i < nseg; i++) {
         const float* pi = base + i * (hd + 2);

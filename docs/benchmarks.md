@@ -4168,3 +4168,22 @@ the KV, which is exactly the kind of bug that costs a session. End-to-end with t
 
 `LLM170_NO_GQA2D=1` restores the f32-KV kernel. The f16 mirror also halves the KV footprint for one
 sequence, which is the configuration RAM/SSD offloading will care about.
+
+## qsa_flash_merge measured: 0.61ms, not worth chasing (2026-09-12)
+
+The todolist carried this as "0.64ms to merge 2.6MB (50x off bandwidth), +0.45ms of the context
+penalty". Two corrections from measuring instead of trusting that framing:
+
+1. **0.64 ms is the total across the 16 launches of a decode step**, i.e. ~40 us per launch, not per
+   launch as implied. Against a 93.8 ms step at 3314 the whole merge is **0.65%** - the maximum any
+   merge work can return, context penalty included.
+2. **The obvious suspect was wrong.** The m_i scan reads one float per segment at a 1032 B stride, so
+   every read is a different cache line, and each thread looped all nseg=104 of them serially - it
+   looked like pure exposed latency. Parallelising that scan across a warp (lanes stride segments,
+   shuffle max) is bit-identical and moved the total only **0.64 -> 0.61 ms** (-5%). So the scan was
+   not the limiter; what is left is 24 blocks (one per head, ~12% occupancy) each taking ~40 us, and
+   splitting that further would need either dim-split blocks or a tree merge.
+
+Kept anyway because it is bit-identical and free. Recorded so the next session does not spend another
+hour on a 0.6 ms item: the decode attention (2.59 ms in situ) and the prefill attention are where the
+remaining base gap lives, not here.
