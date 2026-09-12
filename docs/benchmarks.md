@@ -3938,3 +3938,31 @@ claim above; pp3314 two runs 329.2/333.0 (median 331.1) against wk8's 324.7/324.
 One pp512 run measured 341.5 in between - a single-run outlier, so any future A/B here should take a
 median of three or four, not one. Opposite the llama-bench reference the medians give **pp512 1.014x
 and pp3314 0.988x** (the latter was 0.89x before this change).
+
+## Where the tg-vs-context penalty actually lives (2026-09-12)
+
+tg against context, this machine, greedy: 11.45 (512) / 11.17 (1024) / 11.02 (2048) / 10.77 (3314) -
+a linear +5.6 ms/token, while llama-bench is flat (11.56 -> 11.54). `LLM170_KTRACE` per-kernel
+attribution on a decode step names the culprit exactly:
+
+| kernel | 512 | 3314 |
+|---|---|---|
+| `qsa_flash_gqa` (decode attention) | 1.71 ms | **5.44 ms** |
+| `qsa_flash_merge` | 0.19 ms | 0.63 ms |
+| TOTAL step | 90.6 ms | 94.4 ms |
+
+So the decode attention grows by 3.73 ms - **67% of the whole context penalty** - and its share of a
+token goes from 1.9% to 5.8%. Neither the segment size (`LLM170_QSA_SEG` 256/512/2048 and no-split
+all measure 10.77-10.80 t/s, exactly neutral) nor the KV traffic explains it: the kernel's traffic is
+already optimal (one block per kv-head reads its own 3314 keys once and shares them across all 6
+query heads, so 27 MB per layer, no head redundancy, well inside DRAM bandwidth).
+
+The cost is the **reduction**, not the memory. `qsa_flash_gqa` decomposes as *thread = dimension*
+(256 threads cover hd=256), so every (key, head) dot product is finished by a **5-stage warp shuffle
+plus a shared round-trip across the 8 warps - about 8 reduction stages per key** against a single
+coalesced load. At 3314 keys x 6 heads that is ~99k shuffle ops per layer-block with a 5-deep
+dependency chain each; the kernel moves 27 MB in 680 us = **39 GB/s, 5x below what DRAM offers**.
+There is no ILP trick and no segment-size knob that fixes a wrong decomposition: the fix is the
+thread-per-key layout (one thread owns a key and walks hd, loading the K tile coalesced into shared
+first), which removes the cross-lane reduction entirely. Expected: ~3.7 ms/token back, i.e. tg3314
+10.77 -> ~11.3 (0.92x -> 0.98x of llama-bench), with the same treatment applying to the merge.
