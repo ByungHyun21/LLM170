@@ -3872,3 +3872,34 @@ excess, which is why the attention is the right target and the GEMV/GEMM side is
 Also worth recording for whoever resumes this: my earlier "the staging converts exceed the mma
 counts" reasoning was wrong as a cost model (it compared instruction counts, not throughputs - one
 mma is worth 16-32 cycles, one convert is one op). The staging is not the bottleneck; occupancy is.
+
+## The attention redesign, specified from llama.cpp's own kernel (2026-09-12)
+
+Our kernel's shape was assumed to be wrong; it is not. llama.cpp's fp16 MMA flash attention
+(`fattn-mma-f16.cuh`, the path gfx1151 actually takes via `AMD_WMMA_AVAILABLE`, and the one that
+produced the 335.06 t/s reference) is *also* "block owns a query tile, loops over the whole KV" with
+stream-K off at pp3314 lengths. The differences that matter are four, all of them implementable:
+
+| | ours (`qsa_flash_wmma`) | llama.cpp RDNA3 hd=256 f16 (config table at `fattn-mma-f16.cuh:128-177`) |
+|---|---|---|
+| threads | 256 | 256 (8 wave32) |
+| **KV rows per iteration** | **16** | **64** (nbatch_fa) |
+| **K/V smem** | 16 KB, K and V simultaneously | nbatch_K2 = nbatch_V2 = 128 half2 = the whole head dim in one load, K then V through the *same* buffer |
+| **Q smem** | 32 KB, kept live | **Q_in_reg = true**: the Q is consumed into registers once per block and its 33,792 B buffer is then **reused as the K/V tile** |
+| dynamic smem total | 61,440 B | **38,400 B** = max(Q, KV+mask, combine), not the sum |
+| occupancy target | 1 (implied) | **2** |
+| softmax row reduction | 3-stage `__shfl_xor` (8/4/2/1) | **one `__shfl_xor(16)` per column per KV chunk** |
+
+The two changes that unlock occupancy 2 are coupled: `tile_K = tile_Q` only works *because* the Q
+lives in registers, and the 64-row KV step only fits *because* that 32 KB was freed. Together they
+take the budget from 61 KB to ~38 KB, which is what the occupancy-2 target needs.
+
+The one-shuffle reduction is a *layout* difference, not an algorithmic one: llama's mirrored RDNA3
+mma layout (`mma_tile_sizes`, `fattn-mma-f16.cuh:1085-1130`) puts a softmax row across 2 lane groups
+rather than 16 lanes, so one xor suffices where we need three. Closing that needs the same mma
+instruction/layout we currently get from rocWMMA - a deeper change than the buffer reshuffle, and
+worth deferring until the occupancy work has been measured.
+
+Also confirmed from the scout: the 335.06 t/s reference is the ROCm/HIP build (build 8b4b3558f), i.e.
+*this* kernel - not the Vulkan shader. So the pp3314 target is a specific, reachable fp16-mma
+implementation, and the redesign above is the difference between it and ours.
