@@ -1145,3 +1145,121 @@ extern "C" __global__ void qsa_flash_gqa2h(const float* q, const half* ck, const
         }
     }
 }
+
+// f16 KV + v_dot2_f32_f16 디코드 어텐션(프로토타입) — llama 의 flash_attn_tile 구조.
+// 레인=키 하나, 256차원 내적을 그 레인에서 128회 v_dot2_f32_f16 으로 직렬 계산한다.
+// QK 에 셔플이 전혀 없다(현 gqa2 는 (키,헤드)마다 5단 셔플). PV 는 종전과 같이 스레드=dim.
+// K 는 공유에 행당 258 half(2 half 패딩 = 홀수 word 스트라이드)로 적재해 LDS 뱅크 충돌을 없앤다.
+extern "C" __global__ void qsa_flash_gqa2d(const float* q, const half* ck, const half* cv,
+                                           const unsigned* mask, float* part,
+                                           int n_past, int n_head, int n_kv,
+                                           int hd, int t_len, int sstride, int pos0, int seg) {
+    int kvh = blockIdx.y;
+    int sg = blockIdx.z;
+    if (kvh >= n_kv || t_len != 1 || hd != 256) return;
+    int gq = n_head / n_kv;
+    if (gq < 1 || gq > 8) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    int h0 = kvh * gq;
+
+    constexpr int KS = 258;                 // 행 스트라이드(half). 256+2 → word 129 = 홀수
+    __shared__ half q16[8][256];
+    __shared__ half kv16[32 * KS];          // K 타일 → 그 위에 V 를 덮어쓴다
+    __shared__ float pf[8][32];             // 확률(스레드=dim 단계로 넘김)
+    __shared__ float stnew[8];              // 타일별 새 러닝 최대(전 스레드 공유)
+    __shared__ float smfin[8], sfin[8];     // 최종 m/s (워프 레인0 이 기록)
+
+    for (int i = tid; i < gq * 256; i += 256)
+        q16[i >> 8][i & 255] = __float2half(q[(h0 + (i >> 8)) * 2 * hd + (i & 255)]);
+    __syncthreads();
+
+    float m[8], acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) { m[r] = -3.4028235e38f; acc[r] = 0.0f; }
+    float mrun[8], srun[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) { mrun[r] = -3.4028235e38f; srun[r] = 0.0f; }
+
+    int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    int mrow0 = pos0 * sstride;
+
+    for (int pb = p0; pb < p1; pb += 32) {
+        int np = min(32, p1 - pb);
+        // K 타일 적재(전역 f16 → 공유, d 방향 연속 = 코얼레스)
+        for (int i = tid; i < 32 * 256; i += 256) {
+            int row = i >> 8, d = i & 255;
+            kv16[row * KS + d] = (row < np)
+                ? ck[((size_t)(pb + row) * n_kv + kvh) * hd + d]
+                : __float2half(0.0f);
+        }
+        __syncthreads();
+        // QK: 워프 r = 헤드 r, 레인 = 키 l. 내적 전체가 레인 안에서 끝난다.
+        if (wid < gq) {
+            float a = 0.0f;
+            const half2* q2 = reinterpret_cast<const half2*>(&q16[wid][0]);
+            const half2* k2 = reinterpret_cast<const half2*>(&kv16[lane * KS]);
+            #pragma unroll 8
+            for (int d2 = 0; d2 < 128; d2++) {
+                half2 qv = q2[d2], kvv = k2[d2];
+                asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(a) : "v"(qv), "v"(kvv));
+            }
+            // 마스크/범위: 유효하지 않으면 -inf
+            int kk = pb + lane;
+            a = ((lane < np) && (mask[mrow0 + kk] != 0u)) ? a : -3.4028235e38f;
+            // 워프 max (5단) → 새 러닝 최대
+            // 러닝 최대/합은 워프 레지스터 사본으로만 갱신한다 — 공유를 읽고 쓰면
+            // 레인 간 경합으로 e_m 이 1 로 붕괴한다.
+            float mx = a;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffull, mx, off));
+            float m_old = mrun[wid];
+            float mn = fmaxf(m_old, mx);
+            float e = __expf(a - mn);
+            pf[wid][lane] = e;
+            float es = e;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                es += __shfl_xor_sync(0xffffffffffffffffull, es, off);
+            if (lane == 0) { srun[wid] = srun[wid] * __expf(m_old - mn) + es; mrun[wid] = mn; }
+            stnew[wid] = mn;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < gq) { acc[r] *= __expf(m[r] - stnew[r]); m[r] = stnew[r]; }
+        }
+        __syncthreads();
+        // V 타일 적재(K 위에 덮어씀) + PV(스레드 = dim)
+        for (int i = tid; i < 32 * 256; i += 256) {
+            int row = i >> 8, d = i & 255;
+            kv16[row * KS + d] = (row < np)
+                ? cv[((size_t)(pb + row) * n_kv + kvh) * hd + d]
+                : __float2half(0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < gq) {
+                float ar = acc[r];
+                for (int kk = 0; kk < np; kk++)
+                    ar += pf[r][kk] * __half2float(kv16[kk * KS + tid]);
+                acc[r] = ar;
+            }
+        }
+        __syncthreads();
+    }
+    if (wid < gq && lane == 0) { smfin[wid] = mrun[wid]; sfin[wid] = srun[wid]; }
+    __syncthreads();
+    int nseg = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        if (r < gq) {
+            float* pp2 = part + ((size_t)(h0 + r) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r];
+            if (tid == 0) { pp2[hd] = smfin[r]; pp2[hd + 1] = sfin[r]; }
+        }
+    }
+}
