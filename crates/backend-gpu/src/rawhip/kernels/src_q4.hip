@@ -126,6 +126,62 @@ extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
     }
 }
 
+// q5_1 MMQ급 타일 — 16출력 × 16행/블록(256스레드). 스레드당 (출력,행) 한 쌍을
+// k 직렬 누산하고 가중치 행은 shared로 1회 적재해 16행이 공유한다. 스레드당
+// 읽는 바이트가 원판(~1B)의 수백 배가 되어 총 지연에서 벗어난다.
+// 누산 순서가 원판(레인=서브블록 + 셔플 트리)과 다르므로 **비트 동일이 아니다**
+// — llama.cpp/vLLM과 같은 허용 오차 계약(q4-acc-check max_rel)으로 검증한다.
+extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w, float* out,
+                                          int n_in, int n_out, int xq_w, int t) {
+    extern __shared__ unsigned wsh[];
+    int n_sub = n_in >> 5;
+    int wrow = n_sub * 6;                 // 워드/출력행
+    int o0 = (int)blockIdx.x * 16;
+    int r0 = (int)blockIdx.y * 16;
+    // 가중치 cooperative 적재 (16행 × wrow 워드) — 연속 워드라 코얼레스드.
+    for (int i = threadIdx.x; i < 16 * wrow; i += 256) {
+        int oo = i / wrow;
+        int ww = i - oo * wrow;
+        if (o0 + oo < n_out) wsh[i] = w[(size_t)(o0 + oo) * wrow + ww];
+    }
+    __syncthreads();
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = o0 + ox;
+    int r = r0 + rx;
+    if (o >= n_out || r >= t) return;
+    const unsigned* wr = wsh + ox * wrow;
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sb = 0; sb < n_sub; sb++) {
+        int wb = sb * 6;
+        float d = bits_f16(wr[wb] & 0xFFFFu);
+        float mn = bits_f16((wr[wb] >> 16) & 0xFFFFu);
+        unsigned qh = wr[wb + 1];
+        unsigned qsw0 = wr[wb + 2];
+        unsigned qsw1 = wr[wb + 3];
+        unsigned qsw2 = wr[wb + 4];
+        unsigned qsw3 = wr[wb + 5];
+        int xw = (sb << 5) >> 2;
+        int s_lo = 0, s_hi = 0, s1 = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qs4 = (k & 3) == 0 ? qsw0 : (k & 3) == 1 ? qsw1 : (k & 3) == 2 ? qsw2 : qsw3;
+            unsigned nib = (k < 4) ? (qs4 & 0x0F0F0F0Fu) : ((qs4 >> 4) & 0x0F0F0F0Fu);
+            unsigned hb = (qh >> (4 * k)) & 0xFu;
+            unsigned hb_p = (hb & 1u) << 4 | (hb & 2u) << 11 | (hb & 4u) << 18 | (hb & 8u) << 25;
+            unsigned y = xr[xw + k];
+            s_lo += dot4(nib, y, 0);
+            s_hi += dot4(hb_p, y, 0);
+            s1 += dot4(ones, y, 0);
+        }
+        float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+        acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
 // f32 가중치 GEMV/GEMM (MoE 라우터 ffn_gate_inp 등) — 무양자화.
 // grid (t, n_out), 64레인, x 행 스트라이드 = x_stride (float).
 extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* out,

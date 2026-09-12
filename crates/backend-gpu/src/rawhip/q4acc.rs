@@ -458,7 +458,17 @@ impl Q4Acc {
             // 16행 타일 판(2026-09-13) — 가중치 1회 독서로 상각. 원판은 행마다
             // 같은 가중치 행을 다시 읽어 MoE expert-down(20행 그룹)에서 20배
             // 증폭이었다(실측 2715ms/청크). 산술 순서는 동일 = 비트 동일.
-            let kern = if tiled { "q4_gemm_q5_1_t" } else { "q4_gemm_q5_1" };
+            // MMQ급 판(스레드당 누산, 허용 오차 계약)은 초기 구현이 오답
+            // (t=64 max_rel 1.0, t=20 폴트)이라 기본에서 제외한다 — 옵트인
+            // 플래그로만 남긴다(디버깅·검증 세션용). 기본은 비트 동일 타일.
+            let mmq = t >= 16
+                && std::env::var_os("LLM170_Q5_1_MMQ").is_some()
+                && ty == ggml_id(GgmlType::Q5_1);
+            let kern = match (mmq, tiled) {
+                (true, _) => "q4_gemm_q5_1_m",
+                (false, true) => "q4_gemm_q5_1_t",
+                (false, false) => "q4_gemm_q5_1",
+            };
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -469,8 +479,20 @@ impl Q4Acc {
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
             ];
+            if kern.ends_with("_m") {
+                let nblk = n_out.div_ceil(16);
+                let smem = (16 * (n_in / 32) * 24) as u32;
+                return self.ctx.launch3_dyn(
+                    kern,
+                    nblk.min(65535) as u32,
+                    t.div_ceil(16) as u32,
+                    1,
+                    256,
+                    smem,
+                    &mut args,
+                );
+            }
             let gx = if tiled { t.div_ceil(16) as u32 } else { t as u32 };
-            // 참고: shared 스테이징 판은 실측 역효과(pp512 103.7→97.8) — 되돌림.
             return self.ctx.launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
