@@ -932,15 +932,12 @@ use ash::vk;
         lines.push(format!("qk_rope: q|D|={qd:.2e} k|D|={kd:.2e} {}", if qd < 1e-5 && kd < 1e-5 { "★" } else { "MISMATCH" }));
 
         // 2) kv_append: k/v → kv 캐시 [np][nk*hd] (이미 그 형상) pos=np-1 재기입 → 검증 생략(자명)
-        // 3) qsa_flash: mask 전 1, np=16
-        let maskv: Vec<u32> = vec![1u32; np * np];
-        let mb = ctx.alloc(maskv.len() * 4)?;
-        unsafe { std::ptr::copy_nonoverlapping(maskv.as_ptr(), mb.ptr as *mut u32, maskv.len()) };
+        // 3) qsa_flash: PC {pos0=np-1, nh, nk, hd} — 인과 루프 상한이 np개 키 전부를 덮는다
         let ob = ctx.alloc(nh * hd * 4)?;
         {
-            let (_d, pl, _p, ds, pipe) = ctx.pipeline(include_bytes!("spv/qsa_flash.spv"), 5, 24)?;
-            ctx.bind_bufs(ds, &[qb.buf, ckb.buf, vb.buf, mb.buf, ob.buf]);
-            let push: Vec<u8> = [np as u32, nh as u32, nk as u32, hd as u32, np as u32, (np - 1) as u32]
+            let (_d, pl, _p, ds, pipe) = ctx.pipeline(include_bytes!("spv/qsa_flash.spv"), 4, 16)?;
+            ctx.bind_bufs(ds, &[qb.buf, ckb.buf, vb.buf, ob.buf]);
+            let push: Vec<u8> = [(np - 1) as u32, nh as u32, nk as u32, hd as u32]
                 .iter().flat_map(|v| v.to_le_bytes()).collect();
             ctx.run(pl, ds, pipe, &push, 1, nh as u32, 1)?;
         }

@@ -6,7 +6,7 @@ for the NVIDIA CMP 170HX, currently developed and benchmarked on AMD APUs
 
 No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF parsing, quantization, kernels, scheduling, profiling — is implemented in Rust from scratch.
 
-> **Why the CMP 170HX?** It's a GA100 (A100-class) die sold as a mining card at a fraction of the price: 8 GB HBM2e at ~1.5 TB/s, sm_80, and standard NVIDIA drivers. The catch: eFUSE throttling caps FP32 FFMA at 1/32 rate and tensor cores at ~12% — while leaving **FP16 half2 (~42 TFLOPS) and INT32 at full speed**. Stock inference stacks are crippled by this; an engine designed around the constraint is not. With the 2026 community unlock (40–64 GB), the card becomes a serious decode machine. Details in [docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
+> **Why the CMP 170HX?** It's a GA100 (A100-class) die sold as a mining card at a fraction of the price: 8 GB HBM2e at ~1.5 TB/s, sm_80, and standard NVIDIA drivers. The catch: eFUSE throttling caps FP32 FFMA at 1/32 rate and tensor cores at ~12% — while leaving **FP16 half2 (~42 TFLOPS) and INT32 at full speed**. Stock inference stacks are crippled by this; an engine designed around the constraint is not. With the 2026 community unlock (64 GB), the card becomes a serious decode machine. Details in [docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
 
 ## Benchmarks
 
@@ -26,7 +26,7 @@ hardware rationale — 8 GB HBM2e at ~1.5 TB/s with eFUSE FFMA throttling to
 | Mode | pp512 prefill | decode (tg32) | note |
 |---|---|---|---|
 | `cmp-stock` (8 GB, eFUSE throttle) | — | — | half2/INT32 kernels, decomposed FFMA |
-| `cmp-unlocked` (40–64 GB) | — | — | full-rate kernels, to be finalized after unlock measurements |
+| `cmp-unlocked` (64 GB) | — | — | full-rate kernels, to be finalized after unlock measurements |
 
 ### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) — current dev machine
 
