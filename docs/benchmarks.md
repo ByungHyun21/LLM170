@@ -3359,3 +3359,23 @@ Two levers remain, both bounded and characterized:
 
 The GEMV itself (91% of the decode, 190GB/s) is at the APU's practical wall; the dual-GEMV form,
 the launch gaps (0.0ms) and the attention geometry have all now been measured and excluded.
+
+## Why the decode attention is slow, precisely: a serial latency chain per block (2026-09-12)
+
+`qsa_flash_gqa` takes 107us per call at 512 tokens. Its grid is only (1, n_kv=8, nseg=4) = **32
+blocks**, each doing ~2us of arithmetic (128 keys x a load/mul plus 5-level shuffle trees for
+gq=3 heads) - i.e. it runs at ~2% of its instruction throughput. The reason is the structure of
+the inner loop: per 4-key group there is a strict chain of load (DRAM latency) -> multiply ->
+5-level shuffle tree -> shared store -> __syncthreads -> warp-0 combine -> __syncthreads -> exp
+-> V load -> FMA, which is ~3us of *latency*, and 32 groups per segment gives the measured ~107us.
+There is no independent work to overlap because the grid is tiny.
+
+This also explains why `LLM170_QSA_SEG` is exactly neutral (32/64/128/256 all measure 11.33/11.24):
+more segments multiply the blocks (better latency hiding for the flash kernel) but grow the merge
+kernel proportionally (the merge is itself a 24-block latency-bound kernel), so the two effects
+cancel. The segmentation knob cannot win; the kernels need software pipelining (issue the next
+group's K/V loads before the current group's reductions) or a fundamentally different decomposition.
+
+Both routes change either the reduction tree or the online-softmax rescale points, and the latter is
+exactly what the spec contract (decode argmax == verify argmax) is sensitive to - which is why this
+remains the last item behind the batch/single kernel-arithmetic unification.
