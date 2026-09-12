@@ -182,15 +182,41 @@ impl Frame4 {
         put("output_hc_norm", &model.f32_vec4("output_hc_norm.weight")?)?;
         // 전 시퀀스의 현재 CPU 상태를 초기값으로 (dirty 해소)
         for (si, st) in seqs.iter().enumerate() {
-            f.sync_states(acc, si, st)?;
+            f.sync_states(acc, si, st, hp.d_state)?;
         }
         Ok(f)
     }
 
+    /// (dv,kdim) 전치 — AR 커널(gdn_ar_w_swap)이 kdim 연속 레이아웃을 쓴다.
+    /// 이전 열 단위 접근은 d=128에서 512B 스트라이드로 대역폭을 32배 증폭시켰다
+    /// (실측 AR 3.97s/청크 = 프리필 38%). 경계(h2d/d2h)에서만 전치한다.
+    pub fn transpose_pairs(s: &[f32], d: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; s.len()];
+        if d == 0 {
+            return out;
+        }
+        let pair = d * d;
+        for b in (0..s.len()).step_by(pair) {
+            for kd in 0..d {
+                for dv in 0..d {
+                    out[b + dv * d + kd] = s[b + kd * d + dv];
+                }
+            }
+        }
+        out
+    }
+
     /// CPU SeqState4의 GDN 상태를 GPU로 재동기 (prefill 직후) — 시퀀스 지정.
-    pub fn sync_states(&mut self, acc: &dyn Accelerator, seq: usize, st: &SeqState4) -> Result<(), Q4Error> {
+    pub fn sync_states(
+        &mut self,
+        acc: &dyn Accelerator,
+        seq: usize,
+        st: &SeqState4,
+        d_state: usize,
+    ) -> Result<(), Q4Error> {
         for (ri, h) in self.st_gdn[seq].iter().enumerate() {
-            acc.frame_write(*h, &st.gdn_s[ri]).map_err(Q4Error::Io)?;
+            let t = Self::transpose_pairs(&st.gdn_s[ri], d_state);
+            acc.frame_write(*h, &t).map_err(Q4Error::Io)?;
         }
         for (ri, h) in self.st_conv[seq].iter().enumerate() {
             acc.frame_write(*h, &st.conv[ri]).map_err(Q4Error::Io)?;

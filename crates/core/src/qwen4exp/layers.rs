@@ -296,7 +296,10 @@ impl Engine4 {
                 if let Some(acc) = self.acc.as_deref() {
                     let st = &mut self.seqs[seq];
                     for (ri, h) in f.st_gdn[seq].iter().enumerate() {
-                        acc.frame_read(*h, &mut st.gdn_s[ri]).map_err(Q4Error::Io)?;
+                        // 프레임 상태는 전치 레이아웃(AR 커널 규약) — CPU로 되돌린다.
+                        let mut t = vec![0.0f32; st.gdn_s[ri].len()];
+                        acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
+                        st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
                     }
                     for (ri, h) in f.st_conv[seq].iter().enumerate() {
                         acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
@@ -330,7 +333,7 @@ impl Engine4 {
             let mut last = None;
             for ch in tokens.chunks(chunk) {
                 if f.dirty[seq] {
-                    f.sync_states(acc, seq, &self.seqs[seq])?;
+                    f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
                 }
                 let ctx = Ctx { model: &self.model, acc: Some(acc) };
                 let logits = super::frame::frame_forward(
@@ -411,7 +414,7 @@ impl Engine4 {
             let f = self.frame.as_mut().unwrap();
             let r = (|| {
                 if f.dirty[seq] {
-                    f.sync_states(acc, seq, &self.seqs[seq])?;
+                    f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
                 }
                 let ctx = Ctx { model: &self.model, acc: Some(acc) };
                 super::frame::decode_frame(
