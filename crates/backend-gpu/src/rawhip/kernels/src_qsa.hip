@@ -577,3 +577,35 @@ extern "C" __global__ void qsa_flash_wk16(const float* q, const float* ck, const
     #pragma unroll
     for (int j = 0; j < 16; j++) pp2[own * 16 + j] = acc[j];
 }
+
+// rocwmma 16x16x16 프래그먼트 레이아웃 검증 프로브.
+// mode 0: B col_major (QK^T 용) — C[i][j] = Σ_k a[i][k]*b[j][k]
+// mode 1: B row_major (PV 용)  — C[i][n] = Σ_k a[i][k]*b[k][n]
+extern "C" __global__ void wmma_probe(const float* a, const float* b, float* c, int mode) {
+    __shared__ half sa[256];
+    __shared__ half sb[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        sa[i] = __float2half(a[i]);
+        sb[i] = __float2half(b[i]);
+    }
+    __syncthreads();
+    fragment<accumulator, 16, 16, 16, float> fc;
+    fill_fragment(fc, 0.0f);
+    fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+    load_matrix_sync(fa, sa, 16);
+    if (mode == 0) {
+        fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+        load_matrix_sync(fb, sb, 16);
+        mma_sync(fc, fa, fb, fc);
+    } else {
+        fragment<matrix_b, 16, 16, 16, half, row_major> fb;
+        load_matrix_sync(fb, sb, 16);
+        mma_sync(fc, fa, fb, fc);
+    }
+    int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int sl = 0; sl < 8; sl++) {
+        int idx = lane + (sl << 5);
+        c[idx] = fc.x[sl];
+    }
+}
