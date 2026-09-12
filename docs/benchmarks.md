@@ -2970,3 +2970,17 @@ Session totals for the base mode: pp512 313.8 -> 342.7 (+9%), tg32 10.83 -> 11.2
 Remaining gaps: base-mode tg 2.0% (the residue is rmsq's f32 chain, the GDN AR's state
 bandwidth and the decode attention's residual) and MTP-mode pp 0.5% (the draft layer's
 k/v projections, which its own KV genuinely needs).
+
+## Attention kernel is shuffle-bound (2026-09-12)
+
+Launch-probe sweep of `qsa_flash_gqa` (grid = kv-heads x segments, back-to-back launches):
+4 keys -> 9.15 us, 8 -> 15.20, 32 -> 51.46 us, i.e. **~1.5 us per key** with a ~3 us
+intercept, independent of block and thread counts. Per key the kernel performs
+`gq(6) x 4 keys x 5` shuffle steps per key-group - about 30 shuffles per key at ~35
+cycles of shuffle latency - which is the same order as the measurement. The decode spend
+1.46 ms/token here (16 layers, 91 us/layer), so the next attention win is reducing the
+per-key reduction depth (e.g. one warp per query head, sharing the K/V through L1),
+not the grid shape.
+
+Diagnostics kept in `llm170 launch-probe` (rmsq n-sweep, axpy baseline, gatedq block
+sweep, qsa_flash_gqa segment sweep) - they are what identified both the f64 exp and this.
