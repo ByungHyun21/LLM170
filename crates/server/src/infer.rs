@@ -306,13 +306,26 @@ fn run_q4_infer(
     gpu_runtime: &str,
 ) -> ExitCode {
     let t_start = std::time::Instant::now();
+    let want_gpu = crate::engine::q4_gpu_wanted_str(backend, gpu_runtime);
     let res = llm170_core::qwen4exp::Model4::load(model_path)
         .map_err(|e| e.to_string())
         .and_then(|m| {
             let n = prompts.len();
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
-            if backend == "gpu" {
-                eprintln!("# backend: gpu — qwen4exp (cubecl 제거: CPU 폴백)");
+            if want_gpu {
+                // plans/64 P1 — rawhip 값 경로. 실패는 조용히 넘기지 않는다
+                // (cubecl 제거 후 CPU 폴백이 GPU 수치로 오인된 이력).
+                match llm170_backend_gpu::new_q4_acc() {
+                    Ok(acc) => {
+                        eng = eng.with_acc(acc);
+                        eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");
+                    }
+                    Err(e) => {
+                        eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
+                        eprintln!("error: GPU 없이 돌리려면 --backend cpu (조용한 폴백 금지)");
+                        return Err(e);
+                    }
+                }
             }
             let eos = eng.model.eos;
             let mut finished = vec![false; n];

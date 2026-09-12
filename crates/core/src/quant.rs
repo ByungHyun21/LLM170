@@ -472,6 +472,27 @@ pub fn dot_q8k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     d * y[0].d * isum as f32
 }
 
+/// q5_1(32) × q8 — value = d·q + m (q 무부호 5bit; lo4 + 16·hi1 분해).
+pub fn dot_q5_1_q8(w: &[u8], y: &[Q8Block]) -> f32 {
+    let d = f16(w, 0);
+    let m = f16(w, 2);
+    let qh = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+    let mut s_lo = 0i64;
+    let mut s_hi = 0i64;
+    let mut s1 = 0i64;
+    for j in 0..32usize {
+        let byte = w[8 + (j & 15)] as u32;
+        let lo4 = if j < 16 { byte & 0xF } else { (byte >> 4) & 0xF };
+        let hi1 = (qh >> j) & 1;
+        let yv = y_el(y, j);
+        s_lo += yv * lo4 as i64;
+        s_hi += yv * hi1 as i64;
+        s1 += yv;
+    }
+    let isum = s_lo + (s_hi << 4);
+    y[0].d * (d * isum as f32 + m * s1 as f32)
+}
+
 /// q4_K(256) × q8 — deq_q4_k 순서: p=it*64+l(lo), +32(hi).
 pub fn dot_q4k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     let d = f16(w, 0);
@@ -731,6 +752,7 @@ pub fn dot_row_w4a8(ty: GgmlType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
             GgmlType::Q6K => dot_q6k_q8(wb, yb),
             GgmlType::Q3K => dot_q3k_q8(wb, yb),
             GgmlType::Q8_0 => dot_q8k_q8(wb, yb),
+            GgmlType::Q5_1 => dot_q5_1_q8(wb, yb),
             GgmlType::Iq4Xs => dot_iq4xs_q8(wb, yb),
             GgmlType::Iq4Nl => dot_iq4nl_q8(wb, yb),
             GgmlType::Iq3S => dot_iq3s_q8(wb, yb),
@@ -755,6 +777,47 @@ pub fn dot_row_w4a8(ty: GgmlType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
 #[cfg(test)]
 mod w4a8_tests {
     use super::*;
+
+    /// q5_1 산술 정밀 검증 — f32 디퀀트 기준 vs dot_q5_1_q8 vs 레인 미러.
+    /// (m 항을 반드시 포함: d=1.0, m=−0.5 f16 고정, 4블록 = 128원소)
+    #[test]
+    fn q5_1_block_exact() {
+        let mut seed = 0x5A5A_1234u64;
+        let mut lcg = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as u32
+        };
+        let n = 128usize;
+        let mut bytes = vec![0u8; (n / 32) * 24];
+        for b in bytes.iter_mut() {
+            *b = (lcg() & 0xFF) as u8;
+        }
+        for blk in bytes.chunks_mut(24) {
+            // d = 1.0 (f16 0x3C00), m = -0.5 (f16 0xB800)
+            blk[0] = 0x00;
+            blk[1] = 0x3C;
+            blk[2] = 0x00;
+            blk[3] = 0xB8;
+        }
+        let x: Vec<f32> = (0..n).map(|_| ((lcg() >> 8) as f32 / (1u32 << 24) as f32) - 0.5).collect();
+        let y = quantize_row_q8_ref(&x);
+        // 기준: f32 디퀀트 × q8 재구성 (측정 대상 산술만 남긴다)
+        let mut wv = vec![0.0f32; n];
+        dequant_row(GgmlType::Q5_1, &bytes, 0, n as u64, &mut wv);
+        let mut want = 0.0f64;
+        for i in 0..n {
+            want += (wv[i] as f64) * (y[i / 32].d as f64) * (y[i / 32].qs[i % 32] as f64);
+        }
+        // 블록 단위 미러(전 블록 합)와 레인 미러가 f32 디퀀트 기준과 일치해야 한다
+        let mut got_block = 0.0f64;
+        for b in 0..n / 32 {
+            got_block += dot_q5_1_q8(&bytes[b * 24..b * 24 + 24], &y[b..b + 1]) as f64;
+        }
+        let got_lane = dot_row_w4a8_q5_1_lane(&bytes, n as u64, &y) as f64;
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-3);
+        assert!(rel(got_block, want) < 1e-4, "block {got_block} vs {want}");
+        assert!(rel(got_lane, want) < 1e-4, "lane {got_lane} vs {want}");
+    }
 
     /// 각 타입: 임의 블록 바이트 → f32 dequant 내적 vs dot_*_q8 — 상대오차 < 1.5e-2
     /// (q8 활성 양자화 오차가 유일한 차이원).
@@ -983,6 +1046,47 @@ pub fn dot_row_w4a8_q8_0_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
             }
             let yd = y[sb].d;
             acc += yd * d * isum as f32;
+        }
+        lane[l] = acc as f64;
+    }
+    lane
+}
+
+/// W4A8 레인 미러(q5_1) — 32원소 블록 = d(f16)·q + m(f16), q 무부호 5bit.
+/// q = lo4 + 16·hi1 분해 → isum = Σxq·lo4 + 16·Σxq·hi1, s1 = Σxq.
+/// HIP `q4_gemm_q5_1`과 동일 연산열 (block: yd·(d·isum + m·s1) f32 누산).
+pub fn dot_row_w4a8_q5_1_lane(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
+    let lane = dot_row_w4a8_q5_1_lane_parts(data, k, y);
+    tree64(&lane) as f32
+}
+
+pub fn dot_row_w4a8_q5_1_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 64] {
+    let n_sub = (k / 32) as usize;
+    let mut lane = [0.0f64; 64];
+    for l in 0..64usize {
+        let cnt = (n_sub + 63 - l) / 64;
+        let mut acc = 0.0f32;
+        for m in 0..cnt {
+            let sb = l + m * 64;
+            let wb = &data[sb * 24..sb * 24 + 24];
+            let d = f16(wb, 0);
+            let mn = f16(wb, 2);
+            let qh = u32::from_le_bytes([wb[4], wb[5], wb[6], wb[7]]);
+            let mut s_lo = 0i64;
+            let mut s_hi = 0i64;
+            let mut s1 = 0i64;
+            for j in 0..32usize {
+                let byte = wb[8 + (j & 15)] as u32;
+                let lo4 = if j < 16 { byte & 0xF } else { (byte >> 4) & 0xF };
+                let hi1 = (qh >> j) & 1;
+                let yv = y_el(y, sb * 32 + j);
+                s_lo += yv * lo4 as i64;
+                s_hi += yv * hi1 as i64;
+                s1 += yv;
+            }
+            let yd = y[sb].d;
+            let isum = s_lo + (s_hi << 4);
+            acc += yd * (d * isum as f32 + mn * s1 as f32);
         }
         lane[l] = acc as f64;
     }

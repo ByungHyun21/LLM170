@@ -12,6 +12,22 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "q4-acc-check" => {
+            let path = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            if args.first().map(String::as_str) == Some("micro") {
+                return Some(match llm170_backend_gpu::rawhip::q4acc::micro_check() {
+                    Ok(s) => { println!("{s}"); ExitCode::SUCCESS }
+                    Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+                });
+            }
+            let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_gate_exps.weight".into());
+            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2usize);
+            let rows = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(256usize);
+            llm170_backend_gpu::rawhip::q4acc::check_tensor(std::path::Path::new(&path), &tn, t, rows)
+        }
         "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
         "q6k-ref" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
