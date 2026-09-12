@@ -3708,3 +3708,24 @@ and passed in the next with nothing but the harness change between them.
 With that, `qsa_flash_wk8` (8 lanes/row, 3-level butterfly) is the default prefill attention for
 hd=256: paired pp3314 317.4 vs 310.4 t/s (+2.3%), `LLM170_NO_WK8=1` restores wk16. Judge: 16 PASS,
 3 INFO, 0 FAIL.
+
+## The scalar attention line is closed: shuffles are the floor, MMA is the only way past (2026-09-12)
+
+Two independent checks say the remaining 17% (measured by skipping the butterfly: pp3314 316 -> 370
+t/s) cannot be recovered on the scalar path:
+
+- **Bandwidth**: SIMD shuffle throughput is ~128 float/cycle/SM on this part versus 32 float/cycle/SM
+  for shared memory - 4x in the shuffle's favour. Moving the dot's reduction to shared memory (the
+  obvious alternative) costs 512 KB of shared traffic per 16x16 tile, i.e. ~62 cycles per (row, key)
+  against ~17 for the shuffle version. That prediction matches the earlier measurement where shared
+  staging came out 6.8% *worse*.
+- **Structure**: with 8 lanes/row and a 3-level butterfly the shuffle+add overhead is 48 of 560
+  lane-ops per (row,key) on paper, yet removing it measures 17% of the *whole prefill* - the SIMD
+  shuffle unit is the actual limiter, not the instruction count. wk8 (adopted, +2.3%) already banks
+  the part of that which is reachable by shaving levels.
+
+So the prefill attention's remaining headroom requires the reduction to happen *in hardware*: a
+tensor-core (WMMA) tile kernel, which is what llama.cpp uses. That is the open item in
+plans/47-attention-wmma.md; the ad-hoc attempt got as far as compiles-and-runs with the fragment
+layouts verified by `wmma-check`, but still produces NaN on multi-chunk prompts. The measured prize
+is pp3314 ~370 t/s = 1.10x llama, which would close the pp cell.
