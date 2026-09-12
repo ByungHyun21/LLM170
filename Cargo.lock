@@ -485,6 +485,7 @@ dependencies = [
  "bytemuck",
  "half",
  "hanzo-cubecl-hip-sys",
+ "libc",
  "llm170-core",
  "llm170-gguf",
  "llm170-profiler",
