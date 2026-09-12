@@ -3931,3 +3931,10 @@ What is left on this axis: llama's 64-row KV step (ours is 16, so 4x more syncs 
 which needs the shared budget above 32 KB and so requires re-checking the occupancy-2 target, and the
 single-`__shfl_xor(16)` softmax reduction, which needs llama's mirrored RDNA3 mma layout rather than
 the generic rocWMMA one.
+
+Median-based confirmation of the WMMA default (same day): pp512 four runs 356.9/360.0/359.3/359.9
+(median 359.6) against wk8's 361.5/360.5, i.e. parity at 512 and not the 361.3-vs-360.2 single-run
+claim above; pp3314 two runs 329.2/333.0 (median 331.1) against wk8's 324.7/324.1, i.e. **+2.0%**.
+One pp512 run measured 341.5 in between - a single-run outlier, so any future A/B here should take a
+median of three or four, not one. Opposite the llama-bench reference the medians give **pp512 1.014x
+and pp3314 0.988x** (the latter was 0.89x before this change).
