@@ -3449,3 +3449,22 @@ flash attention would therefore be memory-bound at ~100-200ms for the same work,
 the tree: `src_common.hip` includes rocwmma, `gemm_q5k_wm` (src_gemm.hip:140) is a working WMMA
 kernel with manual shared layouts and wave32 pairing, and `mfma_roof` (src_probe.hip:71) is the
 probe behind the table above. Plan: plans/47-attention-wmma.md.
+
+## Prefill attention: four structural hypotheses tested and excluded (2026-09-12)
+
+All measured at pp3314 (the length-dependent deficit lives here), each reverted after measurement:
+
+| hypothesis | experiment | result |
+|---|---|---|
+| instruction throughput (shuffle count) | `qsa_flash_wk8`: 8 lanes/row x 16 dims instead of 32 lanes x 4 dims, 4 rows in parallel - 56 -> 22 ops per lane per key | **neutral** (302.6 vs 303.5 t/s) |
+| load latency | key loop unrolled 4x so the next key's K/V loads issue during the current key's butterfly/softmax | **neutral** (303.2 vs 303.5) |
+| parallelism | `LLM170_QSA_SEG` 64/128/256/512 segments | neutral (298.7-303.8, larger slightly better) |
+| gq-head KV reuse | (not implemented - blocked: the block already owns one head and sharing needs 3x the state) | - |
+
+So the prefill attention is not bound by instructions, load latency, or grid parallelism. It also
+cannot be the K/V bandwidth (4.2GB of KV reads for 1.29s = 3.2GB/s against a ~190GB/s wall). Its
+33.7 GFLOP in 1.29s is 26 GFLOP/s = ~3% of even the *scalar* MAC roof measured on this device (7.0
+TIOPS), which points at something structural in the per-key scalar pipeline (butterfly + online
+softmax + mask handling) rather than any single knob. The WMMA route (plans/47) sidesteps the whole
+structure - the roof probe measures 23.6-48.4 TFLOPS for rocwmma 16x16x16 on this part - and is the
+only remaining lever with the ~1000x headroom the arithmetic implies.
