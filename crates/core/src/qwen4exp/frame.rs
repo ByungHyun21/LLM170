@@ -356,6 +356,7 @@ pub fn frame_forward(
     };
 
     let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+    let t_call = std::time::Instant::now();
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
     for il in 0..hp.n_layer {
@@ -435,6 +436,9 @@ pub fn frame_forward(
         let mut logits = vec![0.0f32; hp.vocab];
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
         ftime_report(t);
+        if ftime_on() {
+            eprintln!("# frame-total t={t} {:.1}ms", t_call.elapsed().as_secs_f64() * 1e3);
+        }
         if std::env::var_os("LLM170_Q4_DBG").is_some() {
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
