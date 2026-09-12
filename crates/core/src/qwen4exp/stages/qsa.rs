@@ -86,6 +86,9 @@ use llm170_profiler::profile_span;
         let w_ik = ctx.model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
 
         let n_tok = t_len;
+        let tm = std::env::var_os("LLM170_Q4_TIME").is_some();
+        let t_all = std::time::Instant::now();
+        let mut t_lap = t_all;
         // q/k/v/iq/ik는 동일 입력 xs — 그룹 1호출 (왕복 5→1).
         let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
         let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
@@ -101,6 +104,10 @@ use llm170_profiler::profile_span;
                 std::mem::take(&mut ik),
             ];
             ctx.mm_group(xs, &[wq, wk, wv, w_iq, w_ik], &mut gi)?;
+            if tm {
+                eprintln!("# qsa-stage mm_group={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                t_lap = std::time::Instant::now();
+            }
             qg = std::mem::take(&mut gi[0]);
             kk = std::mem::take(&mut gi[1]);
             vv = std::mem::take(&mut gi[2]);
@@ -230,6 +237,10 @@ use llm170_profiler::profile_span;
             );
             attn_all[t] = attn_out;
         }
+        if tm {
+            eprintln!("# qsa-stage sel+proj={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+            t_lap = std::time::Instant::now();
+        }
         // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
         // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
         if gpu_attn {
@@ -283,5 +294,13 @@ use llm170_profiler::profile_span;
             }
         }
         ctx.mm_batch(&attn_all, &wo, &mut out)?;
+        if tm {
+            eprintln!(
+                "# qsa-stage attn={:.1}ms out_mm={:.1}ms total={:.1}ms",
+                t_lap.elapsed().as_secs_f64() * 1e3,
+                0.0,
+                t_all.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(out)
     }
