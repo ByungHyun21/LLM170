@@ -258,8 +258,10 @@ use llm170_profiler::profile_span;
                         }
                     }
                     Err(e) => {
+                        // 12개 QSA 층 × 매 호출로 반복되므로 프로세스당 1회만 알린다.
+                        static ONCE: std::sync::Once = std::sync::Once::new();
                         if std::env::var_os("LLM170_Q4_NOFAST").is_none() {
-                            eprintln!("# qsa: GPU 어텐션 폴백 ({e})");
+                            ONCE.call_once(|| eprintln!("# qsa: GPU 어텐션 폴백 — CPU 재계산 ({e})"));
                         }
                         // 폴백은 실제로 CPU 재계산을 해야 한다 — 이전 구현은
                         // 행을 빈 채로 두어 12개 QSA 층의 어텐션이 조용히
