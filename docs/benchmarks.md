@@ -3671,3 +3671,22 @@ skipped), and the shipped `wk16` remains the fastest variant that passes the gat
 
 Same reasoning applies to the WMMA tile path and to the decode attention: their value is real
 (+17% ceiling measured by skipping the butterfly) but they trade numerical identity for it.
+
+## `attn-check`: wk8 is numerically correct - the divergence is amplification (2026-09-12)
+
+New diagnostic (`llm170 attn-check`) feeds *identical* Q/K/V/mask to `qsa_flash_wk16` and
+`qsa_flash_wk8` for the case the model diverged in (pos0=1536, t=512, nseg=16, full causal mask,
+deterministic pseudo-random inputs) and compares the part buffers:
+
+**max|delta| = 1.1e-05, with 0 of 50,331,648 accumulator elements above 1e-4.**
+
+So the 8-lane kernel is correct; the difference from wk16 is pure reduction-tree rounding. The
+long-prompt divergence that failed the judge is therefore *amplification*: a 1e-5 perturbation grows
+through the model (GDN recurrence + attention softmax) until it moves an argmax, which is also why the
+judge saw flips at high-confidence points.
+
+That is a policy finding, not a kernel bug: **any** attention change that alters the reduction order
+(8-lane, WMMA, f16 staging) will produce a different long trajectory and fail the judge's stored
+reference, however correct it is. The conservative choice - keeping the reference gate intact - is
+what the tree does; re-baselining the judge's long cases would unlock wk8 (+2.3%) and the WMMA path
+(17% ceiling measured by skipping the butterfly).
