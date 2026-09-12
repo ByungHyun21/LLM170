@@ -637,8 +637,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 sp as usize, qp as usize, kp as usize, vp as usize, bp as usize, op_ as usize
             );
         }
+        // gdn_ar_w_swap: 전치 상태 레이아웃(s[dv*d+kdim]) + d=128 고정(레인당
+        // kdim 4개). 구 q4_gdn_ar_w의 열 단위 접근은 512B 스트라이드였다.
         self.ctx.launch3(
-            "q4_gdn_ar_w",
+            "gdn_ar_w_swap",
             d as u32,
             h_v as u32,
             1,
@@ -1393,12 +1395,15 @@ pub fn ar_check_t(t: usize) -> Result<String, String> {
     acc.frame_write(hk, &k)?;
     acc.frame_write(hv, &v)?;
     acc.frame_write(hbg, &bg)?;
-    acc.frame_write(hst, &st0)?;
+    // 프레임 AR은 전치 상태 레이아웃(gdn_ar_w_swap) — 업로드 전치, 판독 후 복원.
+    let st0_t = llm170_core::qwen4exp::frame::Frame4::transpose_pairs(&st0, d);
+    acc.frame_write(hst, &st0_t)?;
     acc.frame_gdn_ar(hq, hk, hv, hbg, hst, ho, 1, n_group, dt_rank, d)?;
     let mut o_gpu = vec![0.0f32; v_len * t];
     acc.frame_read(ho, &mut o_gpu)?;
-    let mut st_gpu = vec![0.0f32; st0.len()];
-    acc.frame_read(hst, &mut st_gpu)?;
+    let mut st_gpu_t = vec![0.0f32; st0.len()];
+    acc.frame_read(hst, &mut st_gpu_t)?;
+    let st_gpu = llm170_core::qwen4exp::frame::Frame4::transpose_pairs(&st_gpu_t, d);
     let rel = |a: &[f32], b: &[f32]| -> f64 {
         a.iter()
             .zip(b)
