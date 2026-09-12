@@ -3966,3 +3966,17 @@ There is no ILP trick and no segment-size knob that fixes a wrong decomposition:
 thread-per-key layout (one thread owns a key and walks hd, loading the K tile coalesced into shared
 first), which removes the cross-lane reduction entirely. Expected: ~3.7 ms/token back, i.e. tg3314
 10.77 -> ~11.3 (0.92x -> 0.98x of llama-bench), with the same treatment applying to the merge.
+
+Knob sweep for the decode attention (same day), tg32 at pp3314: `LLM170_T1SG` 64/128/256/512 gives
+10.70/10.75/10.29/9.52 t/s against the default 32's 10.77 - larger segments lose parallelism faster
+than they save setup, so the existing default is already optimal and the segment size is a dead end
+(as is `LLM170_QSA_SEG` for the prefill, and no-split). The kernel's own scaling splits into a fixed
+part (1.71 ms at 512, i.e. ~214 us per layer-launch of block setup and Q prefetch) and a linear part
+(3.73 ms over the 2802 extra keys = 1.33 ms per 1000 keys per token). That linear part moves 8 MB of
+unique K/V per 1000 keys per layer in 166 us = **48 GB/s, 4x below what the weight-streaming path
+already sustains** - so the fix must be inside the kernel: the QK phase finishes every (key, head)
+dot with a 5-stage shuffle over 256 threads *plus* a shared round-trip across 8 warps *plus* two
+block syncs, per 4 keys. One warp computing whole keys for its own tile (thread = dim within the
+warp, 8 dims per lane) removes the cross-warp step and both syncs, and cuts the shuffle work per key
+by 8x. That rewrite needs the spec/nonspec gate suite to validate the arithmetic change, so it is
+scoped as its own task rather than folded into this session.
