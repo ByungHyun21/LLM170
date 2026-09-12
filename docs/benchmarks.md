@@ -4063,3 +4063,33 @@ outliers over 50.3M elements; `gqa-bench` 0 mismatches at 5.1e-7.
 Two base cells are still short, and both localise to the attention: pp3314 by 1.2% (the attention's
 quadratic term, where the f16 KV would halve the traffic) and tg3314 by 4.5% (decode attention plus
 the merge kernel). Everything else the objective names is ahead, several of them by ~2x.
+
+## f16 KV measured for the decode attention: real but too small to ship (2026-09-12)
+
+The standing hypothesis after the decode rewrite was that an f16 KV cache would halve the attention's
+traffic and buy back the remaining tg3314 gap. Measured directly instead of assumed: `kv_f16` (a
+vectorised f32->f16 pass) plus `qsa_flash_gqa2h` (gqa2 reading the f16 mirror; the K load drops from
+two float4 to one 16-byte load) are both in-tree and wired into `gqa-bench` as a third variant.
+
+| n_past | v2 (f32 KV) | v2h (f16 KV) | gain | max rel. diff | over 1e-3 |
+|---|---|---|---|---|---|
+| 512 | 33.9 us | 31.2 us | 1.09x | 4.8e-4 | 0 |
+| 1024 | 66.9 | 61.4 | 1.09x | 4.8e-4 | 0 |
+| 2048 | 116.2 | 109.3 | 1.06x | 4.8e-4 | 0 |
+| 3314 | 178.4 | **157.0** | **1.14x** | 4.8e-4 | 0 |
+
+So the decode attention gains 6-14%, i.e. ~21 us per launch at 3314, and a token runs 16 launches
+(8 layers x attention+merge): **~0.34 ms/token, or +0.4% tg**. The numeric cost of f16 KV is 4.8e-4
+relative (the same class as the f16 prefill the user already accepted). Not shipped: a change that
+touches the KV writers, every attention kernel and the MTP KV, for +0.4% on one cell, is not worth
+its verification surface - the earlier expectation that the bytes were the limiter was wrong, because
+the kernel is latency-bound, not bandwidth-bound (0.7% of FP32 peak, 59 GB/s in situ).
+
+The measurement is kept as a probe (`gqa-bench` variant v2h) so the decision can be re-taken if the
+economics change - e.g. if KV capacity rather than speed becomes the constraint (RAM/SSD offloading),
+where halving the KV footprint is worth more than +0.4%.
+
+Also recorded here because it cost time: the first two runs of this probe reported "inf" differences
+because the conversion block had been inserted *before* the h2d uploads, so it converted zeros. A
+probe that silently reads uninitialised device memory is indistinguishable from a broken kernel -
+the launch error was absent (it was a legal launch over zeros).
