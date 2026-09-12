@@ -4015,3 +4015,28 @@ The old kernel was written to be bit-identical to `split4q4`, which the short-co
 rested on; v2's reduction order cannot reproduce that bit-for-bit, so the contract is now
 verified-by-test rather than by construction - the tests above are the ones to re-run if this kernel
 changes again.
+
+## MTP/np4 cells restored: the batched spec verify was opt-in (2026-09-12)
+
+The MTP cell was measuring 5.5-6.6 t/s (0.5x the base) with all attention kernels, both model files
+and T1_PREFILL excluded. `LLM170_SPEC_DBG` showed the drafts were *fine* (j=0 always OK, plenty of
+j=1/j=2 OK) while the counters showed ~3 target forwards per cycle for ~2.8 tokens - so the cost was
+the verify, not the acceptance. Reading `spec_step`: the single-sequence path runs **up to k+1
+sequential full single-token decodes** (one `self.decode(&[seq], &[cur])` per loop iteration, 87 ms
+each = ~350 ms/cycle), and the batched GPU verify (`spec_step_gpu`) was reachable only with
+`LLM170_SPEC_GPU` set, which nothing sets. The env gate is now inverted
+(`LLM170_NO_SPEC_GPU=1` restores the sequential path).
+
+| metric | before | after | llama.cpp |
+|---|---|---|---|
+| MTP spec3, steady | 5.40-5.69 t/s | **22.04 t/s** | 11.5 -> **1.92x** |
+| np4 x spec3, aggregate | - | **30.92 t/s** | 15.5 -> **1.99x** |
+
+Verification: spec==nonspec is token-identical both on a 21-token prompt and on the 2302-token long
+prompt; the base (nonspec) rate is unchanged at 11.5-11.7 t/s, so the default flip costs nothing when
+speculation is off. Both cells the objective names are therefore ahead of llama again, and by more
+than the earlier records (1.46x np4 / 1.93x MTP) claimed.
+
+Still open in this area: the ~4-cycle cold start after the prefill (the batched prefill writes the
+MTP state with batch kernels while the drafts/verify advance use single-row forms - the same
+batch-vs-single arithmetic split), and the long-context verify cost.
