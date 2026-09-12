@@ -33,7 +33,7 @@ hardware rationale — 8 GB HBM2e at ~1.5 TB/s with eFUSE FFMA throttling to
 | Backend | pp512 prefill | decode (tg32) | note |
 |---|---|---|---|
 | ROCm/HIP (`rawhip`) | **364 t/s** | **11.6 t/s** | llama-bench ROCm, same GGUF, CLI-to-CLI: 354.7 / 11.56 → **1.03× / 1.01×** |
-| Vulkan (`rawvk`) | 318 t/s | 10.9 t/s | llama.cpp Vulkan: 350.8 / 11.48 → 0.91× / 0.95× |
+| Vulkan (`rawvk`) | 323 t/s | 10.9 t/s | llama.cpp Vulkan: 350.8 / 11.48 → 0.92× / 0.95× |
 | CPU (W4A8) | 181 t/s (pp64) | 11.7 t/s (tg24) | bit-exact reference engine |
 
 At longer contexts the HIP backend holds its lead on prompt processing
@@ -44,8 +44,17 @@ moves its f16 KV at ~221 GB/s effective.
 The Vulkan backend reached these numbers with three decode/prefill kernel
 families of its own — subgroup GEMV (decode, faithful llama dmmv ports),
 cooperative-matrix tiles (prefill) and fused elementwise kernels — all
-arithmetic-mirrored from the CPU reference. A year of measured experiments
-behind the current numbers is logged in [docs/benchmarks.md](docs/benchmarks.md).
+arithmetic-mirrored from the CPU reference. It trails the HIP backend because
+its attention kernels are a generation behind: the HIP path's fp16 WMMA
+prefill attention and lane-per-key decode attention have not been ported, and
+`qsa_flash` still finishes every key with five subgroup shuffle stages, two
+block barriers and a single-thread reduction. Note that llama.cpp itself runs
+Vulkan within 1% of ROCm on this machine, so the gap is an implementation
+gap, not an API limit — the port is specified (lane = key with the whole dot
+in one thread, plus K staged in shared) but measured at only 1-3% end-to-end
+against a 2-3 hour rewrite, so it is deferred behind the ROCm/HIP work. A
+year of measured experiments behind the current numbers is logged in
+[docs/benchmarks.md](docs/benchmarks.md).
 
 Speculative decode (HIP, MTP) runs its verify as a batched GPU forward by
 default: **22.1 t/s** single-stream at `--spec 3` and **30.6 t/s aggregate** at
