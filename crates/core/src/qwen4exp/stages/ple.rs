@@ -8,6 +8,15 @@ use crate::ops::{rms_norm, sigmoid, silu};
 use llm170_profiler::profile_span;
 
     /// PLE 블록 — 해시 gather→key/value→게이트→방송→dilated conv→잔차 2경로.
+    /// 호스트 PLE 블록의 토큰 병렬 폭 — 토큰별 산술 순서는 그대로라 수치 불변.
+    fn ple_threads(t: usize) -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(t.max(1))
+            .min(16)
+    }
+
     pub fn ple_block(
         ctx: &Ctx,
         seq: &mut SeqState4,
@@ -80,8 +89,25 @@ use llm170_profiler::profile_span;
             );
         }
 
-        let mut gated_hist: Vec<Vec<f32>> = Vec::with_capacity(t);
-        for ti in 0..t {
+        let mut gated_hist: Vec<Vec<f32>> = vec![Vec::new(); t];
+        let nt = ple_threads(t);
+        let per = t.div_ceil(nt);
+        {
+        let res_hc_ro: &[Vec<f32>] = res_hc;
+        std::thread::scope(|sc| {
+            let mut rest: &mut [Vec<f32>] = &mut gated_hist;
+            let mut base = 0usize;
+            while base < t {
+                let take = per.min(t - base);
+                let (head, tail) = rest.split_at_mut(take);
+                rest = tail;
+                let b = base;
+                let (key, value) = (&key, &value);
+                let (n_key, n_query, n_conv) = (&n_key, &n_query, &n_conv);
+                let (res_hc_v, hp) = (res_hc_ro, &hp);
+                sc.spawn(move || {
+                    for (i, out) in head.iter_mut().enumerate() {
+                        let ti = b + i;
             // grouped norm key / query — 감마는 전체 [hc_dim] 폭
             let mut k_n = vec![0.0f32; key[ti].len().max(hc_dim)];
             let kl = key[ti].len();
@@ -93,7 +119,7 @@ use llm170_profiler::profile_span;
             }
             let mut q_n = vec![0.0f32; hc_dim];
             for s in 0..hc {
-                let head = res_hc[ti][s * n_embd..(s + 1) * n_embd].to_vec();
+                let head = res_hc_v[ti][s * n_embd..(s + 1) * n_embd].to_vec();
                 q_n[s * n_embd..(s + 1) * n_embd]
                     .copy_from_slice(&rms_norm(&head, &n_query[s * n_embd..(s + 1) * n_embd], hp.eps));
             }
@@ -122,7 +148,12 @@ use llm170_profiler::profile_span;
                     &rms_norm(&head, &n_conv[s * n_embd..(s + 1) * n_embd], hp.eps),
                 );
             }
-            gated_hist.push(normalized);
+                        *out = normalized;
+                    }
+                });
+                base += take;
+            }
+        });
         }
 
         // dilated depthwise conv (kern 4, dil 3, hist 9) — 시퀀스 상태 이용
@@ -139,18 +170,33 @@ use llm170_profiler::profile_span;
             padded.push(g.clone());
         }
         let mut conv_out = vec![vec![0.0f32; hc_dim]; t];
-        for ti in 0..t {
-            for k in 0..kern {
-                let start = hist + ti - (kern - 1 - k) * dil;
-                let src = &padded[start];
-                for c in 0..hc_dim {
-                    conv_out[ti][c] += conv_w[c * kern + k] * src[c];
-                }
+        std::thread::scope(|sc| {
+            let mut rest: &mut [Vec<f32>] = &mut conv_out;
+            let mut base = 0usize;
+            while base < t {
+                let take = per.min(t - base);
+                let (head, tail) = rest.split_at_mut(take);
+                rest = tail;
+                let b = base;
+                let (padded, conv_w) = (&padded, &conv_w);
+                sc.spawn(move || {
+                    for (i, out) in head.iter_mut().enumerate() {
+                        let ti = b + i;
+                        for k in 0..kern {
+                            let start = hist + ti - (kern - 1 - k) * dil;
+                            let src = &padded[start];
+                            for c in 0..hc_dim {
+                                out[c] += conv_w[c * kern + k] * src[c];
+                            }
+                        }
+                        for c in 0..hc_dim {
+                            out[c] = silu(out[c]);
+                        }
+                    }
+                });
+                base += take;
             }
-            for c in 0..hc_dim {
-                conv_out[ti][c] = silu(conv_out[ti][c]);
-            }
-        }
+        });
         // 상태 갱신: 마지막 hist 열
         for j in 0..hist {
             let src = &padded[t + j];
@@ -160,7 +206,19 @@ use llm170_profiler::profile_span;
         // 잔차: hidden + gated(norm 전 방송값) + conv_out — build_ple 반환식 그대로.
         // gated_pre는 conv 블록 위에서 이미 계산했으므로 재계산 대신 저장 구조 사용:
         // (value·gate 방송은 위 루프에서 `gated`로 존재했으나 norm에 덮어씀 — 재계산)
-        for ti in 0..t {
+        std::thread::scope(|sc| {
+            let mut rest: &mut [Vec<f32>] = &mut res_hc[..];
+            let mut base = 0usize;
+            while base < t {
+                let take = per.min(t - base);
+                let (head, tail) = rest.split_at_mut(take);
+                rest = tail;
+                let b = base;
+                let (key, value, conv_out) = (&key, &value, &conv_out);
+                let (n_key, n_query, hp) = (&n_key, &n_query, &hp);
+                sc.spawn(move || {
+                    for (i, row) in head.iter_mut().enumerate() {
+            let ti = b + i;
             // 게이트 재계산 (결정적 동일값)
             let mut k_n = vec![0.0f32; hc_dim];
             for s in 0..hc {
@@ -170,7 +228,7 @@ use llm170_profiler::profile_span;
             }
             let mut q_n = vec![0.0f32; hc_dim];
             for s in 0..hc {
-                let head = res_hc[ti][s * n_embd..(s + 1) * n_embd].to_vec();
+                let head = row[s * n_embd..(s + 1) * n_embd].to_vec();
                 q_n[s * n_embd..(s + 1) * n_embd]
                     .copy_from_slice(&rms_norm(&head, &n_query[s * n_embd..(s + 1) * n_embd], hp.eps));
             }
@@ -183,10 +241,14 @@ use llm170_profiler::profile_span;
                 let mag = dot.abs().max(1e-6).sqrt();
                 let g = sigmoid(if dot >= 0.0 { mag } else { -mag });
                 for i in 0..n_embd {
-                    res_hc[ti][s * n_embd + i] += value[ti][i] * g + conv_out[ti][s * n_embd + i];
+                    row[s * n_embd + i] += value[ti][i] * g + conv_out[ti][s * n_embd + i];
                 }
             }
-        }
+                    }
+                });
+                base += take;
+            }
+        });
         Ok(())
     }
 

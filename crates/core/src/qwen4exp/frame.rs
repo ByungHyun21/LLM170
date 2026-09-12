@@ -371,6 +371,7 @@ pub fn frame_forward(
             stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
             let flat: Vec<f32> = rows.concat();
             acc.frame_write(f.res_hc, &flat).map_err(Q4Error::Io)?;
+            sync_mark(acc, "hc.ple_bridge", f.res_hc)?;
         }
 
         // 2) hc attn mix
