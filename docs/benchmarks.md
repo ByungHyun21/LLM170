@@ -300,7 +300,7 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 86.4 / 71.4 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
+| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 103.7 / 72.2 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
 | Decode tg4 / tg8 / tg16 (ctx 4096-8192, warm) | 15.70 t/s solo (7.2.2) | **8.6 / 7.7-9.2 / 10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
@@ -398,6 +398,13 @@ tiling-bound (16-row x 1-output, 32-row and 16-row x 4-output all land within
 1932-2067 ms at ~7.3 GB/s effective, ~27x off the DRAM floor), so the next
 step is a j128-class structure with shared-staged activations - that family is
 precompiled offline (.co), so the build pipeline needs checking first.
+
+The PLE bridge's remaining serial part - the per-token mmap gather - is now
+split across threads too (ple_table_view() resolves the table once so the pure
+ple_gather_parts() can be called from scoped threads; Model4::ple_gather itself
+cannot be shared because of its RefCell cache): ple_bridge 1011 -> 113 ms and
+pp512 86.4 -> 103.7 t/s, tokens unchanged. pp512 now stands at 2.8x the
+attention-correct baseline measured at the start of the session.
 
 Known outlier: RmsRows costs 15.5 ms per call (96 per chunk, 5.2 M elements
 each) = ~336 M elements/s, about 1/13 of the measured transfer bandwidth. A
