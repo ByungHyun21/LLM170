@@ -3053,3 +3053,29 @@ the same criterion that accepted the fast exp.
 Note the discipline this establishes: these kernels' summation orders are pinned by our
 own mirror, not by an external requirement, so a numerics change is admissible when the
 *acceptance gate* (the judge against llama) does not regress - measured, not assumed.
+
+## Final gate sweep (2026-09-12, end of session)
+
+| gate | result |
+|---|---|
+| `scripts/verify.py` (judge vs llama-server) | **17/19 PASS** (10/10 spec cases, np4 set, long_prompt, long_np4_seq0/3, long_gen96) |
+| `scripts/verify_vl.py` (mmproj) | **5/5 PASS** (one semantic WARN: our 24-token answer opens in `<think>`) |
+| `llm170 check` (full) | pass - 866 tensors, GPU<->CPU GEMM cross-validation |
+| spec == non-spec | holds (checked with `LLM170_REQUIRE_GPU=1` throughout) |
+| `LLM170_EXACTEXP=1` | reproduces the pre-session bit-identical reference |
+
+Four-mode standing, interleaved with llama-bench:
+
+| mode | metric | llama | ours | ratio |
+|---|---|---|---|---|
+| base | pp512 | 342.6 (346.2/342.6/336.0) | **342.9** | **1.001x** |
+| base | tg32 | 11.51 (11.55/11.51/11.49) | 11.30 | 0.982x |
+| MTP | tg32 | 11.51 | **15.8** | **1.37x** |
+| MTP | pp512 | 341.8 | 340.1 | 0.995x |
+| np4 | tg aggregate | 12.51 | **17.77** | **1.42x** |
+| mmproj | vision forward / gate | 1.60 s / - | **1.1 s** / 5-of-5 | - |
+
+Session totals (base mode): pp512 313.8 -> 342.9 (+9.3%), tg32 10.83 -> 11.30 (+4.3%).
+Remaining shortfalls, both fully characterised: base/mmproj-mode tg ~2% (decode attention
+1.46 ms/token frozen by the verify bit-contract; needs a paired decode+verify rewrite) and
+MTP-mode pp 0.5% (needs the +682 MB embedding residency).
