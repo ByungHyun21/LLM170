@@ -1200,11 +1200,20 @@ extern "C" __global__ void qsa_flash_gqa2d(const float* q, const half* ck, const
     for (int pb = p0; pb < p1; pb += 32) {
         int np = min(32, p1 - pb);
         // K 타일 적재(전역 f16 → 공유, d 방향 연속 = 코얼레스)
-        for (int i = tid; i < 32 * 256; i += 256) {
+        // 16바이트 로드(uint4 = half 8개) — 2바이트 스칼라 로드 32회를 4회로 줄인다
+        for (int i = tid * 8; i < 32 * 256; i += 256 * 8) {
             int row = i >> 8, d = i & 255;
-            kv16[row * KS + d] = (row < np)
-                ? ck[((size_t)(pb + row) * n_kv + kvh) * hd + d]
-                : __float2half(0.0f);
+            half* dst = &kv16[row * KS + d];
+            if (row < np) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                        ck + ((size_t)(pb + row) * n_kv + kvh) * hd + d);
+                const half* hs = reinterpret_cast<const half*>(&v);
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = hs[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = __float2half(0.0f);
+            }
         }
         __syncthreads();
         // QK: 워프 r = 헤드 r, 레인 = 키 l. 내적 전체가 레인 안에서 끝난다.
@@ -1215,7 +1224,7 @@ extern "C" __global__ void qsa_flash_gqa2d(const float* q, const half* ck, const
             #pragma unroll 8
             for (int d2 = 0; d2 < 128; d2++) {
                 half2 qv = q2[d2], kvv = k2[d2];
-                asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(a) : "v"(qv), "v"(kvv));
+                asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(a) : "v"(qv), "v"(kvv));
             }
             // 마스크/범위: 유효하지 않으면 -inf
             int kk = pb + lane;
@@ -1245,11 +1254,19 @@ extern "C" __global__ void qsa_flash_gqa2d(const float* q, const half* ck, const
         }
         __syncthreads();
         // V 타일 적재(K 위에 덮어씀) + PV(스레드 = dim)
-        for (int i = tid; i < 32 * 256; i += 256) {
+        for (int i = tid * 8; i < 32 * 256; i += 256 * 8) {
             int row = i >> 8, d = i & 255;
-            kv16[row * KS + d] = (row < np)
-                ? cv[((size_t)(pb + row) * n_kv + kvh) * hd + d]
-                : __float2half(0.0f);
+            half* dst = &kv16[row * KS + d];
+            if (row < np) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                        cv + ((size_t)(pb + row) * n_kv + kvh) * hd + d);
+                const half* hs = reinterpret_cast<const half*>(&v);
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = hs[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = __float2half(0.0f);
+            }
         }
         __syncthreads();
         #pragma unroll

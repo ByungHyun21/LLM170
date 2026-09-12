@@ -4187,3 +4187,29 @@ penalty". Two corrections from measuring instead of trusting that framing:
 Kept anyway because it is bit-identical and free. Recorded so the next session does not spend another
 hour on a 0.6 ms item: the decode attention (2.59 ms in situ) and the prefill attention are where the
 remaining base gap lives, not here.
+
+## v_dot2 decode attention: 101 -> 61 us at 3314 (2026-09-12)
+
+Two changes on top of the shipped v_dot2 kernel, both bit-identical:
+
+1. **Dropped `volatile` from the `v_dot2_f32_f16` asm** (106.9 -> 101.2 us). `volatile` forbids
+   reordering, so the LDS loads feeding each dot could not be hoisted; without it the compiler
+   pipelines them. llama's own helper keeps the volatile - here it cost 5%.
+2. **Vectored the K/V staging to 16-byte loads** (101.2 -> **61.2 us**). The staging loop was reading
+   the f16 KV with 2-byte scalar loads (32 per thread); `uint4` reads make it 4 per thread. That was
+   the real bottleneck: the kernel had looked bandwidth-limited at 160 GB/s, but the scalar loads, not
+   the bytes, were setting the pace. This is the largest single decode-attention gain of the session.
+
+`gqa-bench` with the both changes:
+
+| n_past | v2 (f32, warp-per-key) | v2d (f16 + v_dot2) | v2d/v2 |
+|---|---|---|---|
+| 2048 | 112.2 us | **40.5** | 2.77x |
+| 3314 | 182.4 | **61.2** | 2.98x |
+
+(against the original v1: 4.6x). Correctness unchanged: 5.05e-4 max relative difference, 0 elements
+over 1e-3. Engine: tg512 11.60 -> 11.65, **tg3314 11.16 -> 11.32** (+1.4%, now **0.981x** of
+llama-bench, from 0.966x), tokens identical on a 300-token prompt.
+
+Lesson worth keeping: the kernel was misdiagnosed as bandwidth-bound from its GB/s figure alone; the
+actual limiter was load width in a loop that looked trivial.
