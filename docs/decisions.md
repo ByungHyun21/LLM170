@@ -315,7 +315,10 @@ change, spec==nonspec identical at 21 and 2302 tokens, and a full gate run at
 
 **Consequence**: pp512 364 t/s (1.03× of llama-bench ROCm), pp3314 339 t/s
 (1.01×), tg512 11.6 t/s (1.01×), tg3314 11.3 t/s (0.98×); MTP 22.1 t/s
-single-stream (1.92×) and 30.6 t/s aggregate at np4 (1.97×). The decode
+single-stream (1.92×) and 30.6 t/s aggregate at np4 (1.97×) — those are the figures at the time of
+this decision. After the subsequent KV and Vulkan work the same cells read MTP **23.5 t/s (2.04×)**
+and np4 **31.0 t/s (2.00×)**, Vulkan tg32 **11.44 t/s (1.00× of llama.cpp Vulkan)**, and a 13k-context
+np4+MTP acceptance passed with spec == nonspec exactly. The decode
 attention is now bandwidth-bound (~221 GB/s effective), so the next lever
 there is KV quantization, not kernel structure. The f16 KV mirror also halves
 the KV footprint per sequence, which is the configuration the RAM/SSD
