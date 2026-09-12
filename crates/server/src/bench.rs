@@ -143,9 +143,16 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             let dev = if want_gpu { " gpu" } else { " cpu" };
             for r in 0..reps {
                 eng.reset_states();
+                // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
+                if std::env::var_os("LLM170_KTRACE").is_some() {
+                    llm170_backend_gpu::rawhip::ktrace_on();
+                }
                 let t0 = Instant::now();
                 let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+                if std::env::var_os("LLM170_KTRACE").is_some() {
+                    eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
+                }
                 let mut next = llm170_core::model::greedy(&l);
                 // TG — 프레임 경로는 decode1 내부 분기
                 let t1 = Instant::now();
