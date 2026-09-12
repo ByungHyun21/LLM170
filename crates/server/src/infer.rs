@@ -128,7 +128,14 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                     }
                 }
             } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-                llm170_backend_gpu::inject_rawhip(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+                // LLM170_REQUIRE_GPU=1이면 폴백 금지 — 조용한 CPU 추론으로 검증이
+                // 무효화되는 사고 방지 (2026-09-12: infer 검증이 폴백으로 통과한 사례).
+                if let Err(e) = llm170_backend_gpu::inject_rawhip(&mut eng) {
+                    eprintln!("rawhip: {e}");
+                    if std::env::var_os("LLM170_REQUIRE_GPU").is_some() {
+                        return Err(format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"));
+                    }
+                }
             }
             if backend == "gpu" && gpu_runtime != "vulkan" {
                 eprintln!("# backend: gpu (raw hip)");
