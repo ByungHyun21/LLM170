@@ -3518,3 +3518,22 @@ tile path. Note that fewer lanes per row only wins if the rows then run *in para
 for hd=256 the arithmetic is per (row,key): hd MACs plus L*2*log2(L) shuffle lane-ops, so L=8 with 4
 rows in flight is ~1.9x cheaper than the current L=32 sequential-4-rows - but it needs ~128 live
 floats per lane (qv/acc/kv/vv x 32 dims) against ~64 for L=16 (2 rows in flight, 1.5x cheaper).
+
+## First valid prefill-attention win: 16 lanes/row (2026-09-12)
+
+`qsa_flash_wk16` (registered in kernels/mod.rs this time): 16 lanes per row with 2 rows in flight
+per warp (grid t/16), instead of 32 lanes per row with 4 rows processed sequentially. The
+per-(row,key) cost drops from hd MACs + 32*2*5 shuffle lane-ops to hd MACs + 16*2*4, i.e. ~1.5x
+fewer lane-ops. Paired 3-rep means at pp3314: **303.7 vs 299.9 t/s (+1.3%, run noise +-1.5%)**;
+single runs ranged +1.1% (pp512) to +2.0%. Judge: **17/19, unchanged** - the prefill is
+contract-free but the correctness gate still passes. Now the default for hd=256
+(`LLM170_NO_WK16=1` restores the old kernel).
+
+One real bug surfaced and was fixed: the first version returned early per *lane* when its row was
+out of range, which deadlocks `__shfl_xor_sync` when the tail block has <16 rows (the judge's
+~20-token cases caught it, rc=1). Lanes whose row is out of range now keep participating and only
+suppress their stores.
+
+The win is real but small: the attention is shuffle-bound in a way that only shows ~1.3-2%, so a
+large pp gain still needs the WMMA tile path (plans/47) - but that path must be re-attempted with
+the kernel registered, since the earlier "neutral" reading was an artifact.

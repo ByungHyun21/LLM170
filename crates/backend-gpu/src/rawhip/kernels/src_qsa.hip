@@ -512,3 +512,68 @@ extern "C" __global__ void qsa_flash_gqa(const float* q, const float* ck, const 
         }
     }
 }
+
+// 워프퍼쿼리 flash, 16레인/행 판 (prefill 전용). 기존 qsa_flash_wk 는 32레인/행이고 4행을
+// 순차 처리하므로 (행,키)당 hd MAC + L·2·log2(L) 셔플 레인연산이 든다. 여기서는 16레인/행으로
+// 2행을 워프 안에서 동시에 처리한다: 워프당 2행 x (hd MAC + 16·2·4 셔플) → 약 1.5x 절감.
+// 그리드 (ceil(t/16), n_head, nseg), 256스레드=8워프, 워프당 2행. hd=256 전제(레인당 16 dim).
+extern "C" __global__ void qsa_flash_wk16(const float* q, const float* ck, const float* cv,
+                                          const unsigned* mask, float* part,
+                                          int n_past, int n_head, int n_kv,
+                                          int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    int q0 = blockIdx.x * 16;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;
+    int nq = min(16, t_len - q0);
+    int lane = threadIdx.x & 31;
+    int w = threadIdx.x >> 5;
+    int grp = lane >> 4;             // 0/1 → 워프 내 행 슬롯
+    int own = lane & 15;             // 16레인 그룹 내 위치 → 담당 dim
+    int r = w * 2 + grp;
+    // 셔플은 워프 전원 참여가 필수 — 범위 밖 행도 조기 반환하지 않고 계산만 하고 저장을 막는다.
+    bool real = (r < nq);
+    int rf = real ? r : 0;
+    int kvh = h / (n_head / n_kv);
+    const float* qrow = q + ((size_t)(q0 + rf) * n_head + h) * 2 * hd;
+    float qv[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) qv[j] = qrow[own * 16 + j];
+    float m = -3.4028235e38f, s = 0.0f;
+    float acc[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = 0.0f;
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int kb0 = kvh * hd;
+    int kq = (pos0 + q0 + rf) * sstride;
+    for (int k = p0; k < p1; k++) {
+        const float* krow = ck + (size_t)k * n_kv * hd + kb0 + own * 16;
+        float kv[16];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) kv[j] = krow[j];
+        float pr = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) pr = fmaf(qv[j], kv[j], pr);
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1)
+            pr += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, pr, off);
+        if (real && mask[kq + k] != 0u) {
+            float gm = fmaxf(m, pr);
+            float e_m = __expf(m - gm);
+            float e_d = __expf(pr - gm);
+            s = s * e_m + e_d;
+            m = gm;
+            const float* vrow = cv + (size_t)k * n_kv * hd + kb0 + own * 16;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) acc[j] = acc[j] * e_m + e_d * vrow[j];
+        }
+    }
+    if (!real) return;
+    int nseg = (n_past + seg - 1) / seg;
+    float* pp2 = part + ((size_t)((q0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+    if (own == 0) { pp2[hd] = m; pp2[hd + 1] = s; }
+    #pragma unroll
+    for (int j = 0; j < 16; j++) pp2[own * 16 + j] = acc[j];
+}
