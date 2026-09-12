@@ -19,11 +19,11 @@ target. Built from scratch — no llama.cpp, no ggml.
 |---|---|---|---|
 | `universal` | Any device (CPU / generic GPU) | none | Portability first. This PC is the reference environment |
 | `cmp-stock` | CMP 170HX stock (8 GB, eFUSE throttle) | no FFMA, no tensor cores | half2/INT32, decomposed FMA |
-| `cmp-unlocked` | CMP 170HX unlocked (40–64 GB, compute unlock) | full rate allowed | Performance first (to be finalized after unlock measurements) |
+| `cmp-unlocked` | CMP 170HX unlocked (64 GB, compute unlock) | full rate allowed | Performance first (to be finalized after unlock measurements) |
 
 - Modes are implemented as **runtime flags + kernel-variant selection**. The
   engine core (model, scheduler, loader) is mode-agnostic.
-- Memory budgets per mode: stock ~7 GiB / unlocked 40–64 GiB — see
+- Memory budgets per mode: stock ~7 GiB / unlocked 64 GiB — see
   [hardware/CMP 170HX](hardware/cmp170hx.md).
 
 ## Reference Models (GGUF)
