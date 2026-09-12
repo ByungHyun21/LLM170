@@ -4281,3 +4281,30 @@ without buying occupancy. plans/62 pre-registered exactly this falsification con
 Consequence for the Vulkan plan: V1 is closed; the remaining candidates are the int8
 coopmat1 path (V2), the FA K/V shared-memory staging (V3) and the attention redesign port
 (V4).
+
+## Vulkan plan V2/V3 assessed; the FA's real fix located (2026-09-12)
+
+**V2 (int8 coopmat1, llama PR #27952) - premise weakened.** The in-tree prototype was
+measured before investing in the rewrite: `LLM170_VK_I8ON=1` at pp512 gives **32.76 t/s**
+against the default's 323.06, i.e. **10x slower**, and the kernel is already documented as
+superseded by the coopmat tiles ("kept for the integer-MMA contract"). The PR's approach is
+a different implementation, but with the tiles already at 0.91x of llama-Vulkan and the
+prototype off by an order of magnitude, a 12-quant-type shader rewrite has no measured
+premise. Closed unless a concrete need for the integer path appears.
+
+**V3 (FA K/V shared staging) is only half the story.** Our records already measured K/V
+prefetch as neutral for a shuffle-bound attention, which is what the Vulkan FA is - but
+reading `qsa_flash.comp` shows why staging alone cannot help and what the real fix is.
+Per key the kernel currently does: one FMA, **five subgroup shuffle stages**, two
+**block-wide barriers**, and a serial 8-way sum executed by a **single thread**
+(`if (tid == 0)`). At np=3314 that is 6628 block barriers per (row, head) block plus a
+1-thread dependency chain per key.
+
+The HIP arc's answer ports directly and needs both halves together: **lane = key with the
+whole hd dot computed in one thread** (HIP's `qsa_flash_gqa2`, which was 1.5-2.4x before
+`v_dot2` was even involved) **plus the K staged in shared** - on Vulkan the lane-per-key
+dot reads K with a 256-way stride straight from global, so staging is what makes the
+structure viable there, whereas on RDNA3/HIP the `v_dot2_f32_f16` instruction (no portable
+SPIR-V equivalent) was the second half. Estimated payoff from the FA rewrite is ~1-3% pp
+and <1% tg at Vulkan's current numbers, for a ~2-3 hour shader+host rewrite - recorded so
+the decision is explicit rather than implied.
