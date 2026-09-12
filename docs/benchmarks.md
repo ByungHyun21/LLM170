@@ -3846,3 +3846,29 @@ instead) would free 32 KB and should unlock 2-4 blocks per CU - that is the next
 the tensor cores should finally pay off against the scalar butterfly (the 17% measured by skipping
 it). Until then the model path stays on wk8, since a numerically different kernel at parity is not
 worth adopting.
+
+### Why the WMMA kernel is at parity rather than ahead (structural)
+
+The two optimizations above removed the *instruction-count* overheads, but the kernel is still
+latency-bound for a structural reason: a 64-row query tile with 256-dim points needs 32 KB of Q
+staging in shared, plus 16 KB of K/V per 16-key tile plus P/S - 61 KB total, which caps the CU at one
+block, i.e. 8 warps over 4 schedulers = 2 warps/scheduler. The mma's latency (~20-30 cycles) cannot
+be hidden at that depth, so the tensor cores idle. Two back-of-envelope checks agree: at t=1536 the
+attention's FLOPs are ~14.5 GFLOP, and at the WMMA peak this is ~3.6 ms total, while the measured
+attention share is ~72 ms - about 20x off the peak.
+
+The *block* assignment is what forces this. My kernel gives each block a **query tile** and loops it
+over the whole KV, so every block re-stages the entire K/V (24 query blocks at t=1536 all restage
+each segment). llama.cpp's tile config does the opposite: a block **owns a KV segment in shared and
+streams query tiles through it**, staging each K/V element once. That is the redesign this kernel
+needs - the current shape shares the *wrong* operand. f16 shadow KV/Q buffers (converting once per
+layer per chunk instead of per block) are the second half of it, and together they are the path to
+the measured 10.5% pp3314 prize rather than the ~1% left in the current shape.
+
+Reference for that prize: llama-bench (build 8b4b3558f, ROCm, same machine, same GGUF) gives pp3314
+335.06 vs our 299.7 - the deficit is long-context-specific (pp512 is 0.98x) and equals the attention
+excess, which is why the attention is the right target and the GEMV/GEMM side is not.
+
+Also worth recording for whoever resumes this: my earlier "the staging converts exceed the mma
+counts" reasoning was wrong as a cost model (it compared instruction counts, not throughputs - one
+mma is worth 16-32 cycles, one convert is one op). The staging is not the bottleneck; occupancy is.
