@@ -3537,3 +3537,19 @@ suppress their stores.
 The win is real but small: the attention is shuffle-bound in a way that only shows ~1.3-2%, so a
 large pp gain still needs the WMMA tile path (plans/47) - but that path must be re-attempted with
 the kernel registered, since the earlier "neutral" reading was an artifact.
+
+## `wmma-check`: rocWMMA layout probe (2026-09-12)
+
+New diagnostic (`llm170 wmma-check`, kernels/mod.rs-registered `wmma_probe`) exercises one
+16x16x16 rocwmma mma with exact integer data and compares against a CPU reference for both B
+layouts. Result: **max|delta| = 2e-6 for mode0 (B col_major, the QK^T pattern) and mode1 (B
+row_major, the PV pattern)**. This pins down, with evidence rather than assumption, that:
+
+- the accumulator mapping is `idx = lane + 32*sl`, `row = idx>>4`, `col = idx&15` (what the
+  attention kernels rely on),
+- `matrix_a` row_major with ldm = 16 reads a [16][16] f16 tile as expected,
+- `matrix_b` col_major reads a row-major [16][16] tile as B^T (so K stored [key][dim] gives QK^T),
+- `matrix_b` row_major reads it as V stored [key][dim] for PV.
+
+So the layouts are not the WMMA attention kernel's problem; its bug must be in the Q/K/V staging
+indices, masking, segment/pos handling or the P hand-off. The probe is kept as a permanent check.

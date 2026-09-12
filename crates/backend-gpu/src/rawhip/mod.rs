@@ -1612,6 +1612,57 @@ pub fn mm_tile_bench() -> Result<String, String> {
 }
 
 /// dot4 루프-오버헤드 루프 프로브 — 모드별 유효 TIOPS.
+/// rocwmma 16x16x16 프래그먼트 레이아웃 검증 — C 레이아웃(idx=lane+32*sl, row=idx>>4,
+/// col=idx&15)과 A/B 레이아웃 가정을 정수 데이터로 정확히 확인한다(plans/47).
+pub fn wmma_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let a: Vec<f32> = (0..256).map(|i| (((i / 16) * 3 + (i % 16)) % 9) as f32 - 4.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| (((i / 16) * 5 + (i % 16)) % 7) as f32 - 3.0).collect();
+    let ad = ctx.alloc(256 * 4)?;
+    let bd = ctx.alloc(256 * 4)?;
+    let cd = ctx.alloc(256 * 4)?;
+    ctx.h2d(ad, bytemuck::cast_slice(&a))?;
+    ctx.h2d(bd, bytemuck::cast_slice(&b))?;
+    let mut msg = String::new();
+    for mode in [0i32, 1] {
+        let mut ap = ad as *mut c_void;
+        let mut bp = bd as *mut c_void;
+        let mut cp = cd as *mut c_void;
+        let mut m = mode;
+        let mut args = vec![
+            (&mut ap) as *mut _ as *mut c_void,
+            (&mut bp) as *mut _ as *mut c_void,
+            (&mut cp) as *mut _ as *mut c_void,
+            (&mut m) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3("wmma_probe", 1, 1, 1, 32, &mut args)?;
+        ctx.sync()?;
+        let mut c = vec![0f32; 256];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+        let mut maxerr = 0f32;
+        let mut first = String::new();
+        for i in 0..16usize {
+            for jj in 0..16usize {
+                let mut sum = 0f32;
+                for k2 in 0..16usize {
+                    let av = a[i * 16 + k2];
+                    let bv = if mode == 0 { b[jj * 16 + k2] } else { b[k2 * 16 + jj] };
+                    sum += av * bv;
+                }
+                let idx = i * 16 + jj;
+                let d = (c[idx] - sum).abs();
+                if d > 1e-3 && first.is_empty() {
+                    first = format!(" 첫 불일치 (i={i},j={jj},idx={idx}) 기대 {sum} 실제 {}", c[idx]);
+                }
+                maxerr = maxerr.max(d);
+            }
+        }
+        msg += &format!("mode{mode}: max|delta| = {maxerr:.6}{first}\n");
+    }
+    Ok(msg)
+}
+
 pub fn roof_test() -> Result<String, String> {
     let ctx = RawCtx::new()?;
     let n_in = 5120usize;
