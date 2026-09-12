@@ -71,6 +71,12 @@ pub struct Q4Acc {
     /// 모델 파트 파일 — 있으면 업로드가 mmap 폴트 대신 pread 스테이징을 쓴다.
     sources: Vec<Source>,
     stage: std::sync::Mutex<Vec<u8>>,
+    /// 프레임 버퍼 레지스트리 — 핸들 = 인덱스+1 (해제 없음, ADR-0014).
+    frames: std::sync::Mutex<Vec<(*mut u8, usize)>>,
+    /// 프레임 활성 q8 스크래치 (값 경로 xq와 분리 — 프레임/값 교차 안전).
+    fxq: std::sync::Mutex<GBuf>,
+    /// rms_part 부분합 스크래치 (rows×32 double).
+    fpart: std::sync::Mutex<GBuf>,
     xf: std::sync::Mutex<GBuf>,
     xq: std::sync::Mutex<GBuf>,
     yf: std::sync::Mutex<GBuf>,
@@ -124,6 +130,9 @@ impl Q4Acc {
             time: Default::default(),
             sources,
             stage: std::sync::Mutex::new(Vec::new()),
+            frames: Default::default(),
+            fxq: std::sync::Mutex::new(GBuf::new("fxq")),
+            fpart: std::sync::Mutex::new(GBuf::new("fpart")),
             xf: std::sync::Mutex::new(GBuf::new("xf")),
             xq: std::sync::Mutex::new(GBuf::new("xq")),
             yf: std::sync::Mutex::new(GBuf::new("yf")),
@@ -287,6 +296,58 @@ impl Q4Acc {
             .map_err(|e| e.to_string())?
             .insert(key, (ptr, is_f32));
         Ok((ptr, is_f32))
+    }
+
+    // ─── 프레임(활성화 상주) 지원 — plans/64 P1 ───
+
+    fn fptr(&self, h: u64) -> Result<*mut u8, String> {
+        let v = self.frames.lock().map_err(|e| e.to_string())?;
+        v.get((h.checked_sub(1).ok_or("frame 핸들 0")?) as usize)
+            .map(|(p, _)| *p)
+            .ok_or_else(|| format!("frame 핸들 없음: {h}"))
+    }
+
+    fn flen(&self, h: u64) -> Result<usize, String> {
+        let v = self.frames.lock().map_err(|e| e.to_string())?;
+        v.get((h.checked_sub(1).ok_or("frame 핸들 0")?) as usize)
+            .map(|(_, l)| *l)
+            .ok_or_else(|| format!("frame 핸들 없음: {h}"))
+    }
+
+    /// 프레임 활성 q8 준비 — x(프레임 f32) → xq 스크래치. (xq, xq_w)
+    fn frame_quant(&self, x: *mut u8, n_in: usize, t: usize) -> Result<(*mut u8, usize), String> {
+        let xq_w = xq_words(n_in);
+        let buf = {
+            let mut b = self.fxq.lock().map_err(|e| e.to_string())?;
+            b.ensure(&self.ctx, t * xq_w * 4)?
+        };
+        self.ctx.quant_q8_b(x, buf, n_in, xq_w, t)?;
+        Ok((buf, xq_w))
+    }
+
+    /// 프레임 GEMM 1건 — x는 프레임 f32, 무게는 mmap 참조(업로드 캐시).
+    fn frame_gemm(&self, x: *mut u8, w: &llm170_core::matmul::Weight<'_>, out: *mut u8, t: usize) -> Result<(), String> {
+        let n_in = w.n_in as usize;
+        let n_out = w.n_out as usize;
+        let (wd, f32w) = self.dev_weight(w)?;
+        if f32w {
+            return self.launch_gemm_f32(x, wd, n_in, n_out, t, out);
+        }
+        let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
+        self.launch_gemm(ggml_id(w.ty), xq, wd, n_in, n_out, xq_w, t, out)
+    }
+
+    /// 프레임 op 런치 헬퍼 — gx/gy/gz + 32/64/128/256 스레드.
+    fn kop(
+        &self,
+        kern: &str,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        block: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
+        self.ctx.launch3(kern, gx, gy, gz, block, args)
     }
 
     /// GEMV/GEMM 1런치 — xq는 이미 업로드·양자화된 활성 포인터.
@@ -471,7 +532,108 @@ impl Q4Acc {
     }
 }
 
-impl llm170_core::matmul::FrameState for Q4Acc {}
+impl llm170_core::matmul::FrameState for Q4Acc {
+    /// GDN AR (프레임) — qwen35 raw 디코더와 동일 커널(gdn_ar_w_swap).
+    /// q는 호출부에서 1/√d 스케일이 끝난 상태 → 커널 scale=1.0.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar(
+        &self,
+        q_scaled: u64,
+        k: u64,
+        v: u64,
+        beta_ge: u64,
+        states: u64,
+        out: u64,
+        n_seqs: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        if n_seqs != 1 {
+            return Err("q4acc: frame_gdn_ar np 미지원".into());
+        }
+        let (mut sp, mut qp, mut kp, mut vp, mut bp, mut op_) = (
+            self.fptr(states)?,
+            self.fptr(q_scaled)?,
+            self.fptr(k)?,
+            self.fptr(v)?,
+            self.fptr(beta_ge)?,
+            self.fptr(out)?,
+        );
+        let mut dd = d as i32;
+        let mut ks = (h_k * d) as i32;
+        let mut vs = (h_v * d) as i32;
+        let mut hv = h_v as i32;
+        let mut hk = h_k as i32;
+        let mut sc = 1.0f32;
+        let mut tt = 1i32;
+        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+            eprintln!(
+                "# ar-args s={:?} q={:?} k={:?} v={:?} bg={:?} out={:?} d={dd} ks={ks} vs={vs} hv={hv} hk={hk}",
+                sp as usize, qp as usize, kp as usize, vp as usize, bp as usize, op_ as usize
+            );
+        }
+        self.ctx.launch3(
+            "q4_gdn_ar_w",
+            d as u32,
+            h_v as u32,
+            1,
+            32,
+            &mut cargs!(&mut sp, &mut qp, &mut kp, &mut vp, &mut bp, &mut op_, &mut dd, &mut ks, &mut vs, &mut hv, &mut hk, &mut sc, &mut tt),
+        )
+    }
+
+    /// MoE ids 구동 전문가 GEMM — 스택 + ids(프레임 상주). ids는 행당 u32.
+    /// ids 40바이트 판독 후 전문가 연속 그룹으로 기존 커널을 런치한다(그룹당
+    /// 1런치, 스택은 1회 업로드). ids-aware 단일 런치는 후속 최적화.
+    fn frame_moe_gemm(
+        &self,
+        x: u64,
+        ws: &llm170_core::matmul::Weight<'_>,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+    ) -> Result<(), String> {
+        let n_in = ws.n_in as usize;
+        let n_out = ws.n_out as usize / n_expert_stack.max(1);
+        let rows = self.flen(x)? / n_in;
+        let mut idv = vec![0u32; rows];
+        let idp = self.fptr(ids)?;
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
+        let xp = self.fptr(x)?;
+        let op_ = self.fptr(out)?;
+        let (wd, f32w) = self.dev_weight(ws)?;
+        let per_expert = ws.data.len() / n_expert_stack.max(1);
+        let (xq, xq_w) = if f32w {
+            (std::ptr::null_mut(), 0usize)
+        } else {
+            self.frame_quant(xp, n_in, rows)?
+        };
+        let mut i = 0usize;
+        while i < rows {
+            let e = idv[i];
+            let mut j = i + 1;
+            while j < rows && idv[j] == e {
+                j += 1;
+            }
+            let r = j - i;
+            let xsrc = if f32w {
+                unsafe { xp.add(i * n_in * 4) }
+            } else {
+                unsafe { xq.add(i * xq_w * 4) }
+            };
+            let wsrc = unsafe { wd.add(e as usize * per_expert) };
+            let dst = unsafe { op_.add(i * n_out * 4) };
+            if f32w {
+                self.launch_gemm_f32(xsrc, wsrc, n_in, n_out, r, dst)?;
+            } else {
+                self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, r, dst)?;
+            }
+            i = j;
+        }
+        Ok(())
+    }
+}
 
 impl llm170_core::matmul::Accelerator for Q4Acc {
     fn barrier(&self) {
@@ -684,7 +846,215 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
         Ok(out)
     }
+
+    // ─── 프레임(활성화 GPU 상주) — plans/64 P1 ───
+    // 계약: core `qwen4exp/frame.rs`의 op 순서·산술 그대로. 프레임 경로는
+    // 스텝당 동기를 ~14회로 줄인다(값 경로 ~1300회).
+
+    /// 버퍼 할당 — `len`은 **원소 수**(f32 4바이트/u32 1워드). core frame.rs
+    /// 규약(`a(k_len)`, `a(v.len())`)을 따른다.
+    fn frame_alloc(&self, len: usize) -> Result<u64, String> {
+        let p = self.ctx.alloc((len.max(4)) * 4)?;
+        let mut v = self.frames.lock().map_err(|e| e.to_string())?;
+        v.push((p, len));
+        Ok(v.len() as u64)
+    }
+
+    fn frame_free(&self, _h: u64) -> Result<(), String> {
+        // 해제 없음 (ADR-0014) — 풀은 영구.
+        Ok(())
+    }
+
+    fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
+        let p = self.fptr(h)?;
+        self.ctx.h2d(p, bytemuck::cast_slice(data))
+    }
+
+    fn frame_write_u32(&self, h: u64, data: &[u32]) -> Result<(), String> {
+        let p = self.fptr(h)?;
+        self.ctx.h2d(p, bytemuck::cast_slice(data))
+    }
+
+    fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
+        let p = self.fptr(h)?;
+        // 동기 hipMemcpy — 공유 핀 스테이징(d2h 헬퍼)의 재사용 상태에 의존하지
+        // 않는다. 프레임 판독은 스텝당 몇 회뿐이라 동기 경로 비용이 무의미하다.
+        unsafe {
+            ck(
+                hip::hipMemcpy(
+                    out.as_mut_ptr() as *mut std::ffi::c_void,
+                    p as *const std::ffi::c_void,
+                    out.len() * 4,
+                    hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                ),
+                "frame_read",
+            )
+        }
+    }
+
+    fn frame_mm(&self, x: u64, w: &llm170_core::matmul::Weight<'_>, out: u64, t: usize) -> Result<(), String> {
+        let (xp, op) = (self.fptr(x)?, self.fptr(out)?);
+        self.frame_gemm(xp, w, op, t)
+    }
+
+    fn frame_mm_group(&self, x: u64, ws: &[llm170_core::matmul::Weight<'_>], outs: &[u64], t: usize) -> Result<(), String> {
+        if ws.len() != outs.len() {
+            return Err(format!("frame_mm_group: ws({}) != outs({})", ws.len(), outs.len()));
+        }
+        let xp = self.fptr(x)?;
+        // 동일 입력 — 양자화 1회 공유 (f32 계열이 섞이면 개별).
+        let f32_family = |ty: GgmlType| matches!(ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        let f32w = f32_family(ws[0].ty);
+        if ws.iter().all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w) && !f32w {
+            let (xq, xq_w) = self.frame_quant(xp, ws[0].n_in as usize, t)?;
+            for (w, o) in ws.iter().zip(outs) {
+                let (wd, _) = self.dev_weight(w)?;
+                let op = self.fptr(*o)?;
+                self.launch_gemm(ggml_id(w.ty), xq, wd, w.n_in as usize, w.n_out as usize, xq_w, t, op)?;
+            }
+            return Ok(());
+        }
+        for (w, o) in ws.iter().zip(outs) {
+            let op = self.fptr(*o)?;
+            self.frame_gemm(xp, w, op, t)?;
+        }
+        Ok(())
+    }
+
+    /// 상주 elementwise/RoPE/인덱서 연산 — qwen4exp 프레임이 쓰는 변형만 구현.
+    fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
+        use llm170_core::matmul::FrameOp as O;
+        match *op {
+            O::SiluDiv { t, div, n } => {
+                let mut p = self.fptr(t)?;
+                let mut d = div;
+                let mut nn = n as i32;
+                self.kop("q4_silu_div", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut p, &mut d, &mut nn))
+            }
+            O::SiluMul { g, u, out, n } => {
+                let (mut gp, mut up, mut op) = (self.fptr(g)?, self.fptr(u)?, self.fptr(out)?);
+                let mut nn = n as i32;
+                self.kop("silu_mul", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut gp, &mut up, &mut op, &mut nn))
+            }
+            O::Sigmoid { t, n } => {
+                let mut p = self.fptr(t)?;
+                let mut nn = n as i32;
+                self.kop("q4_sigmoid", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut p, &mut nn))
+            }
+            O::RmsRows { x, w, out, eps, n, w_reps } => {
+                let (xp, wp) = (self.fptr(x)?, self.fptr(w)?);
+                let rows = self.flen(x)? / n;
+                let part = {
+                    let mut b = self.fpart.lock().map_err(|e| e.to_string())?;
+                    b.ensure(&self.ctx, rows * 32 * 8)?
+                };
+                {
+                    let mut xa = xp;
+                    let mut pa = part;
+                    let mut nn = n as i32;
+                    self.kop("rms_part", rows as u32, 1, 1, 32, &mut cargs!(&mut xa, &mut pa, &mut nn))?;
+                }
+                let mut xa = xp;
+                let mut wa = wp;
+                let mut pa = part;
+                let mut op_ = self.fptr(out)?;
+                let mut e = eps;
+                let mut nn = n as i32;
+                let mut rr = w_reps as i32;
+                self.kop("rms_finish", rows as u32, 1, 1, 128, &mut cargs!(&mut xa, &mut wa, &mut pa, &mut op_, &mut e, &mut nn, &mut rr))
+            }
+            O::NormGated { o, z, w, out, eps, d, n_h } => {
+                let mut op_ = self.fptr(o)?;
+                let mut zp = self.fptr(z)?;
+                let mut wp = self.fptr(w)?;
+                let mut outp = self.fptr(out)?;
+                let mut e = eps;
+                let mut dd = d as i32;
+                let mut nh = n_h as i32;
+                let rows = (self.flen(o)? / d).max(1);
+                self.kop("q4_norm_gated_sig", n_h as u32, (rows / n_h.max(1)) as u32, 1, 32, &mut cargs!(&mut op_, &mut zp, &mut wp, &mut outp, &mut e, &mut dd, &mut nh))
+            }
+            O::L2Rows { x, eps, d } => {
+                let mut xp = self.fptr(x)?;
+                let mut e = eps;
+                let mut dd = d as i32;
+                let rows = (self.flen(x)? / d).max(1) as u32;
+                self.kop("q4_l2_rows", rows, 1, 1, 32, &mut cargs!(&mut xp, &mut e, &mut dd))
+            }
+            O::Scale { t, s, n } => {
+                let mut p = self.fptr(t)?;
+                let mut ss = s;
+                let mut nn = n as i32;
+                self.kop("q4_scale", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut p, &mut ss, &mut nn))
+            }
+            O::CopyRows { src, dst, src_off, dst_off, n } => {
+                let (mut sp, mut dp) = (self.fptr(src)?, self.fptr(dst)?);
+                let (mut so, mut dfo) = (src_off as i32, dst_off as i32);
+                let mut nn = n as i32;
+                self.kop("copy_rows", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut sp, &mut dp, &mut so, &mut dfo, &mut nn))
+            }
+            O::HcGateMean { xn, gate, out, hc, n } => {
+                let (mut xp, mut gp, mut op_) = (self.fptr(xn)?, self.fptr(gate)?, self.fptr(out)?);
+                let mut h = hc as i32;
+                let mut nn = n as i32;
+                self.kop("q4_hc_gate_mean", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut xp, &mut gp, &mut op_, &mut h, &mut nn))
+            }
+            O::HcCombine { res, out, inj, hc, n, total: _ } => {
+                let (mut rp, mut op_, mut ip) = (self.fptr(res)?, self.fptr(out)?, self.fptr(inj)?);
+                let mut h = hc as i32;
+                let mut nn = n as i32;
+                self.kop("q4_hc_combine", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut rp, &mut op_, &mut ip, &mut h, &mut nn))
+            }
+            O::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
+                let (mut bp, mut ap, mut dp, mut sp, mut gp) = (
+                    self.fptr(b)?, self.fptr(a)?, self.fptr(dtb)?, self.fptr(sa)?, self.fptr(bg)?,
+                );
+                let mut nh = n_h as i32;
+                let mut dr = n_h as i32;   // t=1: 행 = dt_rank
+                self.kop("gdn_beta_g", (n_h as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut bp, &mut ap, &mut dp, &mut sp, &mut gp, &mut nh, &mut dr))
+            }
+            O::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
+                if t_len != 1 {
+                    return Err("q4acc: GdnConv t>1 미지원 (프레임은 t=1)".into());
+                }
+                let (mut qp, mut cp, mut stp, mut op_) = (
+                    self.fptr(qkv)?, self.fptr(cw)?, self.fptr(state)?, self.fptr(out)?,
+                );
+                let mut chh = ch as i32;
+                let mut kk = k as i32;
+                self.kop("gdn_conv", (ch as u32).div_ceil(64), 1, 1, 64, &mut cargs!(&mut qp, &mut cp, &mut stp, &mut op_, &mut chh, &mut kk))
+            }
+            O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+                let (mut rp, mut ip, mut wp) = (self.fptr(route)?, self.fptr(ids)?, self.fptr(wt)?);
+                let mut ne = n_exp as i32;
+                let mut ks = k_sel as i32;
+                self.kop("q4_moe_top10", 1, 1, 1, 1, &mut cargs!(&mut rp, &mut ip, &mut wp, &mut ne, &mut ks))
+            }
+            O::MoeWeightedSum { ys, wt, out, k, n } => {
+                let (mut yp, mut wp, mut op_) = (self.fptr(ys)?, self.fptr(wt)?, self.fptr(out)?);
+                let mut kk = k as i32;
+                let mut nn = n as i32;
+                self.kop("q4_moe_weighted_sum", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut yp, &mut wp, &mut op_, &mut kk, &mut nn))
+            }
+            O::AxpyScaled { y, x, s, n } => {
+                let (mut yp, mut xp, mut sp) = (self.fptr(y)?, self.fptr(x)?, self.fptr(s)?);
+                let mut nn = n as i32;
+                self.kop("axpy_scaled", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut yp, &mut xp, &mut sp, &mut nn))
+            }
+            ref other => Err(format!("q4acc: 프레임 op 미지원 {other:?}")),
+        }
+    }
 }
+
+/// 프레임 op 인자 벡터 — 로컬 변수의 주소를 c_void로.
+macro_rules! cargs {
+    ($($e:expr),+ $(,)?) => {{
+        let mut v: Vec<*mut std::ffi::c_void> = Vec::new();
+        $( v.push($e as *mut _ as *mut std::ffi::c_void); )+
+        v
+    }};
+}
+use cargs;
 
 /// Engine4에 주입할 가속기 생성 — 실패 시 호출부가 CPU로 폴백(경고).
 pub fn new_acc() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
@@ -735,6 +1105,76 @@ pub fn micro_check() -> Result<String, String> {
     Ok(format!(
         "micro q5_1: gpu={:?} cpu={cpu:.6} qh={qh:#010x} block={:02x?}",
         gpu[0][0], bytes
+    ))
+}
+
+/// `q4-ar-check` — 프레임 AR 커널(q4_gdn_ar_w) ↔ core `gdn_ar_batch` 대조.
+/// 합성 입력(결정적 LCG)으로 수치 계약을 직접 확인한다.
+#[allow(clippy::many_single_char_names)]
+pub fn ar_check() -> Result<String, String> {
+    use llm170_core::matmul::{Accelerator, FrameState};
+    let (n_group, dt_rank, d) = (16usize, 48usize, 128usize);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let k_len = n_group * d;
+    let v_len = dt_rank * d;
+    let q: Vec<f32> = (0..k_len).map(|_| lcg()).collect();
+    let k: Vec<f32> = (0..k_len).map(|_| lcg()).collect();
+    let v: Vec<f32> = (0..v_len).map(|_| lcg()).collect();
+    let beta: Vec<f32> = (0..dt_rank).map(|_| lcg()).collect();
+    let g: Vec<f32> = (0..dt_rank).map(|_| lcg()).collect();
+    let st0: Vec<f32> = (0..dt_rank * d * d).map(|_| lcg() * 0.1).collect();
+
+    // CPU 기준 (프레임 규약: β = σ(b), g는 원값 — AR이 exp)
+    let beta_sig: Vec<f32> = beta
+        .iter()
+        .map(|&b| 1.0 / (1.0 + llm170_core::ops::exp_cr(-b)))
+        .collect();
+    let mut st_cpu = st0.clone();
+    let mut o_cpu = vec![0.0f32; v_len];
+    llm170_core::gdn::gdn_ar_batch(
+        &q, &k, &v, &beta_sig, &g, &mut st_cpu, &mut o_cpu, 1, n_group, dt_rank,
+    );
+
+    // GPU 프레임 (q는 1/√d 선스케일, bg는 인터리브 [σ(b), e^g])
+    let acc = Q4Acc::new()?;
+    let hq = acc.frame_alloc(k_len)?;
+    let hk = acc.frame_alloc(k_len)?;
+    let hv = acc.frame_alloc(v_len)?;
+    let hbg = acc.frame_alloc(dt_rank * 2)?;
+    let hst = acc.frame_alloc(st0.len())?;
+    let ho = acc.frame_alloc(v_len)?;
+    let mut bg = vec![0.0f32; dt_rank * 2];
+    for h in 0..dt_rank {
+        bg[h * 2] = beta_sig[h];
+        bg[h * 2 + 1] = llm170_core::ops::exp_cr(g[h]);
+    }
+    let qs: Vec<f32> = q.iter().map(|x| x / (d as f32).sqrt()).collect();
+    acc.frame_write(hq, &qs)?;
+    acc.frame_write(hk, &k)?;
+    acc.frame_write(hv, &v)?;
+    acc.frame_write(hbg, &bg)?;
+    acc.frame_write(hst, &st0)?;
+    acc.frame_gdn_ar(hq, hk, hv, hbg, hst, ho, 1, n_group, dt_rank, d)?;
+    let mut o_gpu = vec![0.0f32; v_len];
+    acc.frame_read(ho, &mut o_gpu)?;
+    let mut st_gpu = vec![0.0f32; st0.len()];
+    acc.frame_read(hst, &mut st_gpu)?;
+    let rel = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| ((x - y).abs() as f64) / (y.abs().max(1e-3) as f64))
+            .fold(0.0f64, f64::max)
+    };
+    Ok(format!(
+        "q4-ar-check n_group={n_group} dt_rank={dt_rank} d={d}: out rel={:.3e} (cpu[0]={:+.6} gpu[0]={:+.6}), state rel={:.3e}",
+        rel(&o_gpu, &o_cpu),
+        o_cpu[0],
+        o_gpu[0],
+        rel(&st_gpu, &st_cpu)
     ))
 }
 

@@ -12,6 +12,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "q4-ar-check" => llm170_backend_gpu::rawhip::q4acc::ar_check(),
         "q4-acc-check" => {
             let path = args
                 .first()
