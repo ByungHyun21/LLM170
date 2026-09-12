@@ -2897,3 +2897,27 @@ confirmed), and spec == non-spec still holds. Two further findings: the fix only
 where the *chain* is the cost (rmsq/l2 sums), not where loads are already batched or the
 work is trivial, and `gdn_ar_w`'s 26 us for ~0.1 us of actual arithmetic remains
 unexplained (a warp-per-block kernel whose cost is unaffected by this pattern).
+
+## GQA at every context + AR warp batching (2026-09-12)
+
+The decode profile (clean single-step trace) shows GEMM 82.1 ms + non-GEMM 8.8 ms per
+token (was 12.4 ms before today's kernel work). Two further changes:
+
+1. **GQA for all contexts**: the split branch (and therefore the GQA kernel) was gated at
+   `np_ > 512`, so short contexts still ran the old per-head `qsa_flash` (64 us/call).
+   GQA now applies whenever the head layout allows: tg16 at ctx 128 -> 11.23 vs 11.17
+   (+0.5%), ctx 512 unchanged (that path already used it).
+2. **`gdn_ar_w` warp batching**: 4096 one-warp blocks -> 512 eight-warp blocks (one
+   column per warp, identical math). Token-for-token identical to the swap variant, but
+   A/B against the unchanged default is neutral (11.25/11.26/11.24 vs 11.23/11.26/11.25) -
+   so the block count is *not* what costs 26 us per call in these kernels. Kept (strictly
+   fewer blocks, verified equivalent).
+
+Gates after both: judge **16/19** (all spec cases, same 3 long-context near-ties),
+VL **4/5**.
+
+Per-token non-GEMM breakdown now (us/call): rmsq 13.3 (was 17.5) x128, gatedq 26.9 x48,
+gdn_ar_w 26.3 x48, qsa_flash 64 x16 (now GQA), axpy 5.5 x128, quant_q8 7.2 x81,
+l2_rows2_scale 12.0 (was 30) x48, silu_mul 7.8 x64, gdn_conv 8.4 x48, beta 6.1 x48,
+split3 5.8 x48. The remaining ~2.5 ms sits in gatedq + gdn_ar_w, whose ~26 us is
+unexplained by instruction count, block count or launch setup.

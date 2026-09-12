@@ -866,7 +866,10 @@ impl DecodeState {
                     let mut tl = 1i32;
                     let mut ss = self.ctx_len as i32;
                     let mut p0 = pos as i32;
-                    if np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
+                    // GQA 공유 커널은 세그먼트 수와 무관하게 우월 — 단문(ctx<512)에서도
+                    // 평문 qsa_flash 대신 사용한다 (gq=1이면 종전과 동일 산술).
+                    let gqa_ok = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0;
+                    if gqa_ok || np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
                         // 32키 세그먼트 + GQA 공유가 최적 (실측: ctx512 11.08/11.02 vs
@@ -882,7 +885,7 @@ impl DecodeState {
                         // K/V 트래픽 1/(q-heads per kv-head). LLM170_NO_GQA=1이면 종전.
                         // 실측 교차점: ctx<768은 종전(더 많은 WG), 그 이상은 GQA 공유가
                         // 이김 (pp512 −1.2%, 1024 +1.6%, 2048 +4.7%, 3072 +8.8%).
-                        let gqa = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0;
+                        let gqa = gqa_ok;
                         if gqa {
                             self.ctx.launch3("qsa_flash_gqa", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
                         } else {
@@ -1463,7 +1466,9 @@ gmark("betag", &mut marks);
                         if std::env::var_os("LLM170_NO_ARSWAP").is_none() {
                             self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
                         } else {
-                            self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                            // 8워프/블록 (워프당 1열) — 블록 수 1/8
+                            let uw = 8u32;
+                            self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, (self.d_state as u32).div_ceil(uw), 1, 32 * uw, &mut args)?;
                         }
                     }
                 }
