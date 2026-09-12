@@ -3448,7 +3448,7 @@ flash attention would therefore be memory-bound at ~100-200ms for the same work,
 299.7 t/s to ~340-350 (1.01-1.04x llama) and closing the pp cell. The infrastructure is already in
 the tree: `src_common.hip` includes rocwmma, `gemm_q5k_wm` (src_gemm.hip:140) is a working WMMA
 kernel with manual shared layouts and wave32 pairing, and `mfma_roof` (src_probe.hip:71) is the
-probe behind the table above. Plan: plans/47-attention-wmma.md.
+probe behind the table above. Plan: plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default).
 
 ## Prefill attention: four structural hypotheses tested and excluded (2026-09-12)
 
@@ -3481,7 +3481,7 @@ So the entire length-dependent deficit sits in `qsa_flash_wk`: 1.29s for 33.7 GF
 (~0.2% of the L1-fed WMMA roof), and it does not respond to instruction count, load prefetching,
 unrolling, lane mapping or segmentation (all measured neutral, above). Closing pp3314 from 0.89x to
 ~1.00x therefore reduces to replacing that one kernel with a tile-based WMMA flash attention -
-plans/47-attention-wmma.md - with the reference and the infrastructure both already in the tree.
+plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default) - with the reference and the infrastructure both already in the tree.
 
 Nothing else in the prefill budget is actionable: `gdn_ar_w_swap` 0.66s (the recurrence, t>=512
 chunks), `gemm_q8_j128` 0.20s, `silu_mul` 0.19s, `mmq_quant_y` 0.16s - all small and near their own
@@ -3570,7 +3570,7 @@ WMMA roof) and the decode GEMV runs at ~190GB/s (llama's effective ~198), so nei
 
 The three settings the objective names are all ahead: MTP tg 1.36-1.84x, np4 aggregate 1.46x
 (server to server, 22.64 vs 15.5), mmproj vision 1.45x / batched VL 1.23x. What remains is the
-base-mode attention, and `plans/47-attention-wmma.md` records the state of that attempt: layouts
+base-mode attention, and `plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default)` records the state of that attempt: layouts
 verified by `wmma-check`, toolchain constraints pinned, one shared-memory bug fixed via the
 part-diff method, and the recommendation to port llama's `fattn-mma-f16.cuh` rather than keep
 hand-rolling the tile kernel.
@@ -3726,7 +3726,7 @@ t/s) cannot be recovered on the scalar path:
 
 So the prefill attention's remaining headroom requires the reduction to happen *in hardware*: a
 tensor-core (WMMA) tile kernel, which is what llama.cpp uses. That is the open item in
-plans/47-attention-wmma.md; the ad-hoc attempt got as far as compiles-and-runs with the fragment
+plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default); the ad-hoc attempt got as far as compiles-and-runs with the fragment
 layouts verified by `wmma-check`, but still produces NaN on multi-chunk prompts. The measured prize
 is pp3314 ~370 t/s = 1.10x llama, which would close the pp cell.
 
