@@ -3101,3 +3101,27 @@ the head axis (every arithmetic operation preserved), whereas any change to the 
 depth changes row results and must be proven bit-identical against the verify path first.
 The decode attention's 1.46 ms/token therefore stays, and remains the largest single
 identified item in the base-mode tg gap.
+
+## Final standing, end of session (2026-09-12)
+
+Interleaved with llama-bench, 3 rounds, same model/prompt:
+
+| metric | llama | ours | ratio |
+|---|---|---|---|
+| pp512 | 340.6 (348.3/338.9/340.6) | **345.8** (346.6/345.8/345.1) | **1.015x** |
+| tg32 | 11.48 (11.64/11.48/11.48) | 11.32 | 0.986x |
+
+Session totals: **pp512 313.8 -> 345.8 (+10.2%)**, **tg32 10.83 -> 11.32 (+4.5%)**,
+MTP-mode tg 3.3 -> 15.8 t/s (the q6_K kernel fix), np4 aggregate 12.2 -> 17.8.
+
+Four modes vs llama: base pp 1.015x / tg 0.986x; MTP tg 1.37x / pp 0.995x; np4 tg 1.42x /
+pp 1.01x; mmproj vision 1.1 s vs 1.60 s, gate 5/5.
+Gates: judge 17/19 (10/10 spec), VL 5/5, check pass, spec == non-spec, all verified with
+`LLM170_REQUIRE_GPU=1`.
+
+The remaining 1.4% of base-mode tg is spread over items whose costs are now individually
+measured and whose fixes are individually blocked or rejected: the decode attention
+(1.46 ms/token, needs the row-level exactness debug of a paired rewrite), the GDN AR
+kernel (1.27 ms/token; block-count and warp-batching experiments are neutral, so it is
+state-bandwidth plus an unexplained per-call latency), and ~2.7 ms of small kernels that
+sit at a measured ~2 us launch floor each.
