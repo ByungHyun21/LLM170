@@ -3273,3 +3273,30 @@ That alone fixes the MTP cold start (making the bench protocol measure the stead
 unblocks the attention rewrite for base tg. Until then: `--spec 3` is the better default
 (+60% steady state over spec4), and the MTP/np4 cells should be read from per-cycle timing,
 not from short-run averages.
+
+## np4 (server, 4 concurrent) beats llama 1.46x - the short-bench numbers were prefill artifacts
+
+Measuring the actual server surface (4 concurrent requests, 512-token prompt, 128 tokens each),
+decode-only aggregate:
+
+| config | aggregate | vs llama-server |
+|---|---|---|
+| no spec | **22.64 t/s** | **1.46x** (llama np4+MTP 15.5) |
+| spec3, slots sequential (before) | 12.07 t/s | 0.78x |
+| spec3, merged verify (after) | 14.35 t/s | 0.93x |
+
+Two protocol lessons. First, short runs measure the *prefill*: 4 concurrent 24-token requests
+cost 4 serial prefills (~5.6s) against ~3s of decode, which is where the earlier "np4 = 11.8-13.2,
+0.76x" readings came from; with a 128-token generation the aggregate is 22.6 t/s and the np4
+cell is met. Second, the engine's spec path (`spec_step_multi`, the merged verify) was not reachable
+from the server: the scheduler ran each spec slot through `spec_step` sequentially, so np4+spec paid
+4 full single-stream cycles. The scheduler now routes >=2 spec slots through `spec_step_multi`:
+measured 12.07 -> 14.35 t/s aggregate, and `scripts/verify_serve.py` (server np4 == CLI np4 tokens)
+stays 2/2 PASS.
+
+Note that on this repeated-text prompt spec *loses* to plain batched decode (14.35 vs 22.64): the
+per-cycle acceptance on that prompt is ~2.5 tokens/seq, so the MTP's benefit does not cover the
+verify's 4x row count. For np>1 the plain batched decode is currently the better operating point.
+
+Remaining server item: a ~60ms/token host-side gap (np1 server 148ms/token vs engine 88ms), which
+caps the single-stream server rate at ~7 t/s even though the CLI measures 11.3 base / 21 spec3.

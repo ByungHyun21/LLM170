@@ -166,7 +166,34 @@ pub fn slot_loop(
                         .filter(|&i| slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0))
                         .collect();
                     if !spec_slots.is_empty() && e.has_mtp() && e.raw_decode.is_some() {
-                        for &i in &spec_slots {
+                        // np×spec 병합 (plans/18): 스펙 슬롯 2개 이상이면 한 배치로 검증.
+                        // 슬롯별 순차 spec_step은 배치 이득을 전부 잃는다 (2026-09-12 측정:
+                        // 서버 np4 spec 12.1 vs 비스펙 22.6 t/s agg).
+                        let kmin = spec_slots
+                            .iter()
+                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.min(8).max(1))
+                            .min()
+                            .unwrap_or(1);
+                        let mut done_spec: Vec<usize> = Vec::new();
+                        if spec_slots.len() > 1 {
+                            let ns: Vec<u32> = spec_slots.iter().map(|&i| slots[i].next).collect();
+                            if let Ok(accs) = e.spec_step_multi(&spec_slots, &ns, kmin) {
+                                for (row, &i) in spec_slots.iter().enumerate() {
+                                    let cap = slots[i].job.as_ref().unwrap().n_predict;
+                                    for &t in &accs[row] {
+                                        if slots[i].generated as usize >= cap {
+                                            break;
+                                        }
+                                        slot_emit(&mut slots[i], t);
+                                        if t == EOS {
+                                            break;
+                                        }
+                                    }
+                                }
+                                done_spec = spec_slots.clone();
+                            }
+                        }
+                        for &i in spec_slots.iter().filter(|&i| !done_spec.contains(i)) {
                             let k = slots[i].job.as_ref().unwrap().spec_k.min(8).max(1);
                             let next = slots[i].next;
                             let cap = slots[i].job.as_ref().unwrap().n_predict;
