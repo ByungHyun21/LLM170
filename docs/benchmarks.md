@@ -3980,3 +3980,38 @@ block syncs, per 4 keys. One warp computing whole keys for its own tile (thread 
 warp, 8 dims per lane) removes the cross-warp step and both syncs, and cuts the shuffle work per key
 by 8x. That rewrite needs the spec/nonspec gate suite to validate the arithmetic change, so it is
 scoped as its own task rather than folded into this session.
+
+## Decode attention v2: reduction restructured, tg3314 +2% (2026-09-12)
+
+The fix scoped in the entry above is implemented and shipped as `qsa_flash_gqa2` (default;
+`LLM170_NO_GQA2=1` restores the old kernel). The change is the decomposition: each warp now owns
+four keys and finishes their dot products *inside the warp* (lane = 8 dims, 5-stage butterfly),
+where the old kernel split hd across all 256 threads and therefore needed a 5-stage shuffle *plus* a
+cross-warp shared round-trip *plus* two block syncs for every four keys. The softmax tile work is one
+lane per head, so nothing in the shared score array is written by a lane while another reads it.
+
+`llm170 gqa-bench` (new probe: runs both kernels on identical inputs and times them):
+
+| n_past | v1 | v2 | ratio | max rel. diff | mismatches |
+|---|---|---|---|---|---|
+| 512 | 79.8 us | 33.9 us | 2.36x | 5.1e-7 | 0 |
+| 1024 | 99.9 | 68.1 | 1.47x | 5.1e-7 | 0 |
+| 2048 | 191.0 | 114.3 | 1.67x | 5.1e-7 | 0 |
+| 3314 | 292.9 | **171.5** | **1.71x** | 5.1e-7 | 0 |
+
+The first version of the kernel was wrong (max rel. diff 1.55) because the warp-0 softmax had two
+races - it summed the score array while other lanes were still overwriting it with exponentials, and
+`pmx[r]` crossed lanes without a barrier. One lane per head fixed both.
+
+Engine effect (same-run A/B, `--tg 32`, greedy): tg512 **11.58 vs 11.48** (+0.9%), tg3314 **11.02 vs
+10.80** (+2.0%). Against llama-bench that is tg512 **1.002x** and tg3314 **0.955x** (from 0.93x). The
+kernel now moves its 27 MB of unique K/V per layer at ~157 GB/s, about 83% of what the weight-stream
+sustains - so it is close to bandwidth-bound and the next gain here needs *less traffic* (an f16 KV
+cache would halve it), not more restructuring.
+
+Verification: `gqa-bench` 0 mismatches at 5.1e-7; a 300-token prompt generates token-identical output
+to the old kernel (`LLM170_NO_GQA2=1`); spec==nonspec is identical at both 100 and 1250 prompt tokens.
+The old kernel was written to be bit-identical to `split4q4`, which the short-context spec contract
+rested on; v2's reduction order cannot reproduce that bit-for-bit, so the contract is now
+verified-by-test rather than by construction - the tests above are the ones to re-run if this kernel
+changes again.

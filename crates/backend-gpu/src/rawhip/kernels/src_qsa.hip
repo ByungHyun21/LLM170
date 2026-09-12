@@ -885,3 +885,132 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
         }
     }
 }
+
+// 디코드(t=1) GQA 어텐션 v2 — 감축 구조 교체판.
+// 기존 qsa_flash_gqa 는 스레드=dim(256스레드=256dim)이라 (키,헤드) 내적마다
+// 5단 셔플 + 8워프 공유 왕복 + 블록 동기화 2회를 키 4개마다 치렀다.
+// 여기서는 워프가 키 4개를 전담하고 워프 안에서 레인이 8 dim 씩 맡아 내적을
+// 완성한다: 키당 셔플 5회(워프 내부), 크로스워프 왕복 없음, 타일(32키)당
+// 동기화 2회. 인자·part 규약·그리드는 qsa_flash_gqa 와 동일하다.
+extern "C" __global__ void qsa_flash_gqa2(const float* q, const float* ck, const float* cv,
+                                          const unsigned* mask, float* part,
+                                          int n_past, int n_head, int n_kv,
+                                          int hd, int t_len, int sstride, int pos0, int seg) {
+    int kvh = blockIdx.y;
+    int sg = blockIdx.z;
+    if (kvh >= n_kv || t_len != 1 || hd != 256) return;
+    int gq = n_head / n_kv;
+    if (gq < 1 || gq > 8) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    int h0 = kvh * gq;
+
+    __shared__ float qf[8][256];
+    __shared__ float sc[8][32];     // 타일 점수 → exp (헤드 x 키)
+    __shared__ float pmx[8];        // 타일 최대 (헤드별)
+    __shared__ float pe[8];         // 타일 exp 합 (헤드별)
+
+    for (int i = tid; i < gq * 256; i += 256)
+        qf[i >> 8][i & 255] = q[(h0 + (i >> 8)) * 2 * hd + (i & 255)];
+    __syncthreads();
+    // 레인 = dim [8*lane, 8*lane+8) 담당 → Q 레지스터 사본
+    float qreg[8][8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++)
+        #pragma unroll
+        for (int d = 0; d < 8; d++)
+            qreg[r][d] = (r < gq) ? qf[r][lane * 8 + d] : 0.0f;
+
+    float m[8], s[8], acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) { m[r] = -3.4028235e38f; s[r] = 0.0f; acc[r] = 0.0f; }
+    int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    int mrow0 = pos0 * sstride;
+
+    for (int pb = p0; pb < p1; pb += 32) {
+        int np = min(32, p1 - pb);
+        // ── QK: 워프 wid 가 키 [pb+4*wid, +4), 레인 lane 이 dim 8개
+        // 발산 금지 — 셔플은 워프 전원이 참여해야 하므로 마스크는 값으로만 반영한다.
+        float x[8][4];
+        #pragma unroll
+        for (int r = 0; r < 8; r++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) x[r][j] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int kk = pb + wid * 4 + j;
+            if (kk < p1 && (mask[mrow0 + kk] != 0u)) {
+                const float4* kp = reinterpret_cast<const float4*>(
+                        ck + ((size_t)kk * n_kv + kvh) * hd + lane * 8);
+                float4 k0 = kp[0], k1 = kp[1];
+                float kv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float a = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < 8; d++) a += qreg[r][d] * kv[d];
+                    x[r][j] = (r < gq) ? a : 0.0f;
+                }
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            #pragma unroll
+            for (int r = 0; r < 8; r++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    x[r][j] += __shfl_xor_sync(0xffffffffffffffffull, x[r][j], off);
+        if (lane < gq * 4) {
+            int r = lane >> 2, j = lane & 3;
+            int kk = pb + wid * 4 + j;
+            if (kk < p1)
+                sc[r][wid * 4 + j] = (mask[mrow0 + kk] != 0u) ? x[r][j] : -3.4028235e38f;
+        }
+        __syncthreads();
+        // ── 워프 0 이 타일 최대·exp·합을 전담 (타일당 동기화 2회로 끝낸다)
+        // 레인 r(<gq) 이 헤드 r 을 전담한다 — 공유 배열을 다른 레인이 덮어쓰는 경합이 없다.
+        if (wid == 0 && lane < gq) {
+            int r = lane;
+            float mx = -3.4028235e38f;
+            for (int jj = 0; jj < np; jj++) mx = fmaxf(mx, sc[r][jj]);
+            mx = fmaxf(mx, m[r]);
+            pmx[r] = mx;
+            float tmp[32];
+            float sm = 0.0f;
+            for (int jj = 0; jj < np; jj++) { tmp[jj] = __expf(sc[r][jj] - mx); sm += tmp[jj]; }
+            for (int jj = 0; jj < np; jj++) sc[r][jj] = tmp[jj];
+            pe[r] = sm;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < gq) {
+                float e_m = __expf(m[r] - pmx[r]);
+                s[r] = s[r] * e_m + pe[r];
+                acc[r] *= e_m;
+                m[r] = pmx[r];
+            }
+        }
+        // ── PV: 스레드 = dim (감축 없음)
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            if (j < np) {
+                float vv = cv[((size_t)(pb + j) * n_kv + kvh) * hd + tid];
+                #pragma unroll
+                for (int r = 0; r < 8; r++)
+                    if (r < gq) acc[r] += sc[r][j] * vv;
+            }
+        }
+        __syncthreads();   // 다음 타일의 sc 기록 전에 PV 완료 보장
+    }
+    int nseg = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        if (r < gq) {
+            float* pp2 = part + ((size_t)(h0 + r) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r];
+            if (tid == 0) { pp2[hd] = m[r]; pp2[hd + 1] = s[r]; }
+        }
+    }
+}
