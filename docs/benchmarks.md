@@ -3406,3 +3406,22 @@ the rest the same memory-efficiency gap the decode shows.
 Everything measured before this note compared against the server-protocol table; MTP/np4 remain
 apples-to-apples (both measured through servers) but the *base* pp/tg claims need to be read against
 the table above.
+
+## Attention experiments: what is and is not the bottleneck (2026-09-12)
+
+Software-pipelining `qsa_flash_gqa` (issue the next 4-key group's K/V loads before the current
+group's reduction and barriers; values and arithmetic order unchanged) measured **neutral**: 11.33
+t/s at pp512 (baseline 11.33) and 10.72 at pp3314 (baseline 10.66). So the decode attention is not
+load-latency bound - it is bound by the per-key shuffle chains and the two `__syncthreads()` per
+4-key group. Reverted.
+
+The same holds for `qsa_flash_wk` (prefill): each (row, key) dot is 4 FMA + a 5-level shuffle tree
+plus a barrier-synchronised softmax update, i.e. shuffles/barriers dominate. Restructuring it is the
+single largest remaining lever, and **the prefill attention is not contract-constrained**: spec and
+greedy runs share one prefill, so its arithmetic can change freely (unlike the decode attention,
+whose argmaxes the spec contract compares row by row). At pp3314 the prefill attention is 1.29s of
+11.06s.
+
+Current measured standing (CLI to CLI, same GGUF, live llama-bench build 8b4b3558f):
+pp512 0.98x, pp3314 0.89x, tg512 0.98x, tg3314 0.92x - the remaining deficits are attention
+(contract-free in the prefill) plus the GEMV/MMQ memory-efficiency gap.
