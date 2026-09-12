@@ -695,3 +695,23 @@ extern "C" __global__ void wmma_probe_ldm(const float* a, const float* b, float*
     #pragma unroll
     for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
 }
+
+// PV 경로 프로브: A = P(16x16, ldm=16) / B = V(16키 x 256dim, **row_major**, ldm=256).
+// 어텐션 커널의 PV 와 동일 패턴 — ldm 프로브(mode2)는 col_major(K)만 검증했다.
+extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* c) {
+    __shared__ half sp[16 * 16];
+    __shared__ half sv[16 * 256];
+    for (int i = threadIdx.x; i < 16 * 16; i += blockDim.x) sp[i] = __float2half(p[i]);
+    for (int i = threadIdx.x; i < 16 * 256; i += blockDim.x) sv[i] = __float2half(v[i]);
+    __syncthreads();
+    fragment<accumulator, 16, 16, 16, float> fc;
+    fill_fragment(fc, 0.0f);
+    fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+    load_matrix_sync(fa, sp, 16);
+    fragment<matrix_b, 16, 16, 16, half, row_major> fb;
+    load_matrix_sync(fb, sv, 256);
+    mma_sync(fc, fa, fb, fc);
+    int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
+}

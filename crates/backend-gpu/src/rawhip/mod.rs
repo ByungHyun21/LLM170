@@ -1663,6 +1663,44 @@ pub fn wmma_check() -> Result<String, String> {
     Ok(msg)
 }
 
+/// PV 경로 프로브: A=P(16x16 ldm=16) x B=V(16x256 **row_major** ldm=256) — 어텐션 PV 와 동일.
+pub fn wmma_check_pv() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let pv: Vec<f32> = (0..16 * 16).map(|i| (((i * 7) % 5) as f32) * 0.25).collect();
+    let vv: Vec<f32> = (0..16 * 256).map(|i| (((i / 256) * 5 + (i % 256)) % 7) as f32 - 3.0).collect();
+    let pd = ctx.alloc(16 * 16 * 4)?;
+    let vd = ctx.alloc(16 * 256 * 4)?;
+    let cd = ctx.alloc(256 * 4)?;
+    ctx.h2d(pd, bytemuck::cast_slice(&pv))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&vv))?;
+    let mut pp = pd as *mut c_void;
+    let mut vp = vd as *mut c_void;
+    let mut cp = cd as *mut c_void;
+    let mut args = vec![
+        (&mut pp) as *mut _ as *mut c_void,
+        (&mut vp) as *mut _ as *mut c_void,
+        (&mut cp) as *mut _ as *mut c_void,
+    ];
+    ctx.launch3("wmma_probe_pv", 1, 1, 1, 32, &mut args)?;
+    ctx.sync()?;
+    let mut c = vec![0f32; 256];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+    let mut maxerr = 0f32;
+    let mut nnan = 0usize;
+    for row in 0..16usize {
+        for dim in 0..16usize {
+            let mut sum = 0f32;
+            for key in 0..16usize { sum += pv[row * 16 + key] * vv[key * 256 + dim]; }
+            let got = c[row * 16 + dim];
+            if got.is_nan() { nnan += 1; }
+            let d = (got - sum).abs();
+            if d > maxerr { maxerr = d; }
+        }
+    }
+    Ok(format!("PV 경로 (B row_major ldm=256): max|delta| = {maxerr:.4}, NaN {nnan}/256"))
+}
+
 /// mode2 프로브: 16x256 타일을 ldm=256 으로 적재했을 때 프래그먼트 레이아웃이 맞는지.
 pub fn wmma_check_ldm() -> Result<String, String> {
     use std::ffi::c_void;

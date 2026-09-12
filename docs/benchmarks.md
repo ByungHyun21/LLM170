@@ -3762,3 +3762,27 @@ shuffles, and wk8 already banks what level-shaving can (+2.3%). The remaining ro
 tensor-core tile kernel; `wmma-check` and `wmma-check-ldm` (both committed) have verified every
 primitive it needs, and the ad-hoc attempt's remaining defect is confined to the softmax bookkeeping
 and the P hand-off.
+
+## WMMA building blocks fully verified; the defect is glue-only (2026-09-12)
+
+Three probes now cover every primitive the tile kernel uses, each against a CPU reference with exact
+integer data:
+
+| probe | pattern | result |
+|---|---|---|
+| `wmma-check` mode0/1 | 16x16 tiles, ldm=16, B col_major (QK^T) and row_major (PV) | 2e-6 |
+| `wmma-check-ldm` | 16x256 tile, **col_major ldm=256** (the K path) | 0.0000, NaN 0/256 |
+| `wmma-check-pv` | A=P(ldm=16) x B=V **row_major ldm=256** (the PV path) | 0.0000, NaN 0/256 |
+
+Also excluded by inspection: `launch3_dyn` does call `hipFuncSetAttribute(MaxDynamicSharedMemorySize)`
+(with a OnceLock cache), so the 53248 B request is legal; the buffer offsets (Q 0, K 32768, V 40960,
+P 49152 with 4096 B exactly to 53248) do not overlap; the fragment index mapping
+`idx = lane + 32*sl, row = idx>>4, col = idx&15` is what all three probes assume; and the softmax
+slot bookkeeping re-derives correctly (`hc = lane>>4`, row = hc + 2*sl, xor-butterfly offsets 8..1
+stay inside each 16-lane half, so `e_m[sl]` matches the accumulator's row).
+
+So the multi-chunk NaN lives in the kernel's glue rather than in any verified primitive - most likely
+a warp-divergent early return interacting with the per-key-tile `__syncthreads()` (the classic
+deadlock/UB pattern; my final revision had removed the early return but the earlier ones did not, and
+there is no committed revision to compare against). The next attempt should build the tile kernel
+from these three probes outward rather than re-deriving the primitives.
