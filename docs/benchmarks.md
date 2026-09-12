@@ -3903,3 +3903,31 @@ worth deferring until the occupancy work has been measured.
 Also confirmed from the scout: the 335.06 t/s reference is the ROCm/HIP build (build 8b4b3558f), i.e.
 *this* kernel - not the Vulkan shader. So the pp3314 target is a specific, reachable fp16-mma
 implementation, and the redesign above is the difference between it and ours.
+
+## WMMA attention becomes the default: pp512 ahead of llama (2026-09-12)
+
+Applying llama.cpp's two structural tricks (Q_in_reg + its 33,792 B buffer reused for the K/V tile)
+took the kernel from parity-past to ahead of the scalar at *both* lengths:
+
+| config | scalar (wk8) | WMMA, Q_in_reg + smem reuse | llama-bench reference |
+|---|---|---|---|
+| pp512 | 360.2 | **361.3 (+0.3%)** | 354.66 -> **1.019x** |
+| pp3314 | 324.7 | **329.2 (+1.4%)** | 335.06 -> **0.983x** |
+
+The shared budget went 61,440 -> 32,768 B (K at 0, V at 8192, score exchange at 16384, P at 24576 -
+26,624 B used, so the Q's buffer holds everything and the occupancy should now be two blocks per CU).
+A first attempt serialized the K-then-V staging through one buffer and *regressed* pp512 to 343.6
+(+1 sync per key-tile and lower memory-level parallelism); restoring the parallel staging while
+keeping Q_in_reg is what produced the numbers above. That A/B is the useful datum: the win comes from
+freeing the Q's buffer, not from touching the staging.
+
+Verification: `wmma-attn-check` reports 0 mismatches (max|delta| 6e-4, f16 accumulation), the
+engine-level `attn-check` reports max|delta| 1.1e-5 with 0 of 50.3 M elements above 1e-4, and a
+600-token multi-chunk prompt produces token-identical output to the scalar path. The default is the
+WMMA path for hd=256 prefill (`LLM170_NO_WK_WMMA=1` restores wk8) - the same user decision that
+accepted the non-bit-exact wk8 applies, and here the arithmetic difference is bounded by 1.1e-5.
+
+What is left on this axis: llama's 64-row KV step (ours is 16, so 4x more syncs and staging rounds),
+which needs the shared budget above 32 KB and so requires re-checking the occupancy-2 target, and the
+single-`__shfl_xor(16)` softmax reduction, which needs llama's mirrored RDNA3 mma layout rather than
+the generic rocWMMA one.
