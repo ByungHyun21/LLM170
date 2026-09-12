@@ -3205,3 +3205,30 @@ documented next lever is therefore dispatch *count*: fusing the same-input qkv/g
 into one row-ranged dispatch (~192 fewer dispatches per forward) is numerics-neutral (each
 output row keeps its own accumulation order) and is now the highest-value remaining item for
 base/mmproj tg.
+
+## MTP/np4 regressed: the spec verify batch runs at half the decode's bandwidth (2026-09-12)
+
+Measured today, Q4_K_XL 27B, ROCm, bench protocol (`--tg 32/64`):
+
+| mode | today | docs' last record | llama.cpp |
+|---|---|---|---|
+| base pp512 | 347-348 t/s | 348-354 | 350.8-352.8 (~1.00x) |
+| base tg | 11.31-11.34 | 11.32 | 11.48 (0.986x) |
+| MTP tg, spec4 | **12.03** | 16.6-17.9 | 11.5 (**1.05x** vs 1.37-1.55x) |
+| MTP tg, spec3 | 13.99 | - | 11.5 (1.22x) |
+| np4 x spec4 | **11.78 agg** | 17.77 | 15.5 (**0.76x** vs 1.42x) |
+
+The acceptance is *not* the problem: `LLM170_SPEC_TIMING` shows ~3.2-5 accepted per cycle.
+The cost is the verify batch. A t=5 verify takes 197-211ms of GPU time (t=4: 171ms via
+`gemm_g4`), against the 88ms the t=1 decode needs for **the same 15.67GB of weights** -
+80-92GB/s versus the decode's 178GB/s, i.e. the batch path is 2x less bandwidth-efficient.
+The t=5 profile (171ms) is uniformly inflated: ffn_gate 62.6, ffn 40.9, proj 31.2,
+gdn_mm 23.6 - every projection costs ~2x its t=1 share. cpu_submit is 5.5ms, so this is
+GPU-side, not dispatch overhead.
+
+Consequence: with the t=1 decode's bandwidth efficiency the verify would cost ~90-110ms and a
+spec step ~150ms for ~3.5 tokens, i.e. ~23 t/s single-stream and a proportionally better np4
+aggregate - the MTP/NP4 cells would clear llama.cpp by ~2x. Making the t=2..8 batch GEMV
+paths (`gemm_g4` for t=2..4, `gemm_tile` for t>4) reach the decode's bandwidth is therefore
+the highest-value remaining work for this objective. Note also that t=5 falls *off* the g4
+path onto the tile: spec3 (t=4) already wins 14.0 vs 12.0 t/s.
