@@ -347,14 +347,21 @@ than patched.
   out rel 1.2e-5, state rel 2.6e-5 at production dims
   (n_group 16 / dt_rank 48 / d_state 128) for t=1..3.
 
+Long prompts: the value path and the opt-in frame prefill both handle a
+200-token prompt correctly (`271 248068 198 760 1156`, identical streams) after
+the j128 tile defect was worked around (tile dispatches are now sliced to
+≤128 tokens: the j128 CO faults with >1 token quadrant for n_in=6144 shapes
+such as ssm_out; the GEMV path is bit-identical, other n_in values tolerate it).
+
 ### Open
 
 - **Prefill is the remaining gap** (11 t/s vs 178-266): the value path keeps
   activations on the host, so pp512 spends 16.6 s in hc + 16.6 s in MoE +
   11.2 s in GDN of a 45.6 s pass — host elementwise work and per-op transfers,
-  not GEMM. A frame-based prefill (`LLM170_FRAME_PREFILL=1`, opt-in) exists and
-  is token-correct for small chunks, but faults on long prompts (≥~260 tokens)
-  and is off by default.
+  not GEMM. The frame-based prefill (`LLM170_FRAME_PREFILL=1`, opt-in) is
+  token-correct at 200 tokens but cannot yet run pp512: its t_max-sized buffers
+  (~600 MiB) fail to allocate on this carve (`hipMalloc: 2`), and with a
+  512-token chunk it faults elsewhere.
 - Decode is 10.7 t/s against llama's 15.7 solo (0.68x): the remaining cost is
   the per-layer round trips that the frame has not yet removed (QSA/PLE value
   bridges, module-level launches).
