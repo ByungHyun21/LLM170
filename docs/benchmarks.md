@@ -4368,3 +4368,21 @@ Lesson for the next kernel-input-type change: the launcher passes `*mut c_void`,
 between a kernel and its buffers is **silent**. Every launcher of the changed kernel must be grepped
 and every distinct execution path (short prompt, split prefill, spec, np, MTP) token-tested - the
 300-token prompt alone exercises only the split path.
+
+## Long-context np4 + MTP acceptance: 13k prompts, spec == nonspec exact (2026-09-12)
+
+Requested by the user: throw ~13k-token prompts at the engine with np4 and MTP, and check the output
+is correct. Four distinct long prompts built from the stored token ids (13812 / 13615 / 12654 / 13640
+tokens), `--ctx 16384`, `--n-predict 32`, `--spec 3`, four parallel sequences:
+
+| check | result |
+|---|---|
+| Output coherence | every sequence continues its prompt correctly (e.g. `...vexingly quick daft zebras jump! Sphinx of black`, `...Its river carries more water than any other river on Earth`, `...Error correction remains the central engineering challenge. Quantum computers`) |
+| **spec3 vs no-spec token streams** | **identical, all 4 sequences x 33 tokens** - the MTP/verify contract holds at 13k context |
+| Runtime | 132 tokens generated in 226-229 s wall including the ~12 s model load and the 52k-token prefill |
+| Memory | 4 sequences x 13.8k context: ~3.4 GB of f16 KV total (the same test on the previous f32+f16 scheme would have been ~10 GB) |
+
+This is the longest-context verification the engine has been through (earlier records topped out at
+~2.3k), and it exercises the paths that the f32-KV regression had broken - the short-prefill single
+kernel, the per-sequence KV pointer tables, and the MTP draft - at a scale where a silent corruption
+would be obvious in the text.
