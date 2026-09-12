@@ -110,6 +110,10 @@ Reference implementation (read-only during development): the upstream
   chunked GDN prefill kernel, batched MoE down (one launch, K experts),
   token-expert grouped prefill GEMM, element-wise set (norm kernels
   bit-exact), QSA block-key cache, decode frame.
+- Note (2026-09-13): the QSA prefill attention was silently dropped by a
+  fallback that set a flag without recomputing (all 12 QSA layers, both paths -
+  see docs/benchmarks.md). The `q4-qsa-check` probe settles the kernel itself;
+  any fallback must recompute, never return empty rows.
 - History note: a t=1 MoE fast-path regression (routed-expert contribution
   zero on the default decode path) was found 2026-09-01 by diffing against
   the frame path; both CPU and GPU value paths shared it, so self-consistent

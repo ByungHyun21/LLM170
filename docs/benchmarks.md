@@ -300,8 +300,8 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp256 / pp512 / pp2311 | (server cells below) | 9.4-9.8 / 11.1 / 11.18 / **10.99** t/s | 1.77 t/s (pp32) |
-| Decode tg16 (ctx 4096, warm) | 15.70 t/s solo (7.2.2) | **10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
+| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 36.9 / 33.0 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
+| Decode tg4 / tg8 / tg16 (ctx 4096-8192, warm) | 15.70 t/s solo (7.2.2) | **8.6 / 7.7-9.2 / 10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
 `-ngl all -ot per_layer_token_embd=CPU --load-mode mmap -fa on -b 1024 -ub 512`,
@@ -330,6 +330,39 @@ than patched.
   read at 20-180 MB/s; buffered pread reads the same file at 1.2 GB/s
   (4.5 GB/s O_DIRECT ceiling), which is what makes the 35 s load possible
   (llama.cpp needs a fork patch for the same reason).
+
+### 2026-09-13 — attention restored, frame prefill promoted
+
+Two defects were found while investigating the "QSA t>128 kernel defect"; both
+changed the numbers in the table above.
+
+1. **The QSA prefill attention was not running at all.** The guard made
+   `qsa_attention` return `Err` for t>128, but the caller's fallback only set a
+   flag: the per-token loop had already `continue`d past the CPU attention, so
+   the attention rows stayed empty and all 12 QSA layers contributed zero
+   attention for the whole prefill. Both the frame and value paths degraded
+   identically, so the frame==value self-consistency check passed. The kernel
+   itself was fine: `llm170 q4-qsa-check` matches a CPU mirror at t=129/200/512
+   (n_past 512) to 2.0e-5 with no non-finite outputs. Fixed by extracting
+   `cpu_attn_row()` and actually recomputing on failure; the guard is now only
+   `LLM170_QSA_CPU=1`. Cross-check: frame == value == forced CPU fallback =
+   760/6511/314/1002 on a 230-token prompt (previously 271/248068/198, i.e. the
+   attention-free stream).
+2. **`q4_hc_combine` wrote out of range for hc>1.** The kernel is one thread
+   per (token, dim) but used the op's `total` (= hc*n*t) as its grid/limit, so
+   the frame prefill faulted (sticky 700) at t>~200. Isolated with
+   `llm170 q4-hc-check` (which reproduces the fault for hc>1 at any t/n) and
+   fixed. The device-resident frame prefill is now the default; its t_max is
+   capped at 512 (t_max buffers are ~0.8 GB and 1024 failed hipMalloc).
+
+Frame-vs-value A/B on the same prompt is token-identical at 230 (chunk 512),
+300 (chunk 128, three chunks - so the cross-chunk GDN/conv state is right) and
+700 tokens, with the attention active.
+
+Prefill is now 3.0-3.3x the value path and is **kernel-bound, not
+transfer-bound**: h2d measures 34-40 GB/s (UMA), yet a 512-token chunk streams
+~80 GB of weights in 13.9 s = 5.7 GB/s effective. The remaining levers are
+kernel-level (MoE expert GEMM batching, HC fusion), not host overhead.
 
 ### Verification (2026-09-12)
 
