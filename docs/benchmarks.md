@@ -3079,3 +3079,25 @@ Session totals (base mode): pp512 313.8 -> 342.9 (+9.3%), tg32 10.83 -> 11.30 (+
 Remaining shortfalls, both fully characterised: base/mmproj-mode tg ~2% (decode attention
 1.46 ms/token frozen by the verify bit-contract; needs a paired decode+verify rewrite) and
 MTP-mode pp 0.5% (needs the +682 MB embedding residency).
+
+## Paired attention rewrite: attempted, reverted (2026-09-12)
+
+Following up on the shuffle-bound diagnosis, a single kernel (`qsa_flash_wh`: one warp per
+(row, head) work item, lane-serial dot over hd/32 dims + a 5-step warp tree, no LDS/syncs)
+was wired into *both* sides of the contract - the t=1 decode and the t<=8 verify/small-batch
+branch of `step_batch` - with a unified 32-key segment so the per-row arithmetic is
+identical by construction.
+
+Result: the two paths agree for the first few tokens (760, 6511, 198 in both) and then
+diverge, i.e. the *exact* spec contract (which requires bit-identical rows, not ties) is
+violated somewhere the first tokens do not exercise - with `LLM170_NO_WH=1` restoring the
+session baseline exactly. Reverted rather than debugged blind: localising it needs the
+verify-path logits compared row by row (the `LLM170_MS_LOGITS` dump path exists for this),
+which is a session of its own.
+
+Both attention restructures have now been tried and rejected on contract grounds:
+per-head GQA sharing was accepted because it maps split4q4's four-row structure 1:1 onto
+the head axis (every arithmetic operation preserved), whereas any change to the reduction
+depth changes row results and must be proven bit-identical against the verify path first.
+The decode attention's 1.46 ms/token therefore stays, and remains the largest single
+identified item in the base-mode tg gap.
