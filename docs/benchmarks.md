@@ -3574,3 +3574,28 @@ base-mode attention, and `plans/47-attention-wmma.md` records the state of that 
 verified by `wmma-check`, toolchain constraints pinned, one shared-memory bug fixed via the
 part-diff method, and the recommendation to port llama's `fattn-mma-f16.cuh` rather than keep
 hand-rolling the tile kernel.
+
+## Where the pp gap lives, fitted (2026-09-12)
+
+Fitting the pp curve of both engines as T(n) = f*n + c*n^2/2 (f = per-token cost, i.e. the weight
+streaming and matmuls; c = the attention's quadratic term), from pp512 and pp3314 measurements:
+
+| term | ours | llama-bench | ratio |
+|---|---|---|---|
+| linear (matmuls/weights) | **2.679 ms/token** | 2.758 ms/token | **0.971x (we are 3% faster)** |
+| quadratic (attention) | 3.681e-07 | **1.366e-07** | **2.69x slower** |
+
+Predicted ratios: pp512 0.993x (parity), pp3314 0.907x, pp6337 0.83x, **pp13569 0.71x**. So at the
+long end the entire gap is the attention's quadratic term - the matmuls are ahead of llama's, which
+also matches the direct measurement (24.1 TFLOP/s = 102% of this device's L1-fed WMMA roof).
+
+Where the 2.7x comes from, from llama's own tile config table
+(`fattn-tile.cuh: ggml_cuda_fattn_tile_get_config_amd_rdna`): for large head dims they use
+**nbatch_fa = 64-128 query rows per block, nbatch_K = 64-128 keys, 128-256 threads, occupancy 3-8**
+with the K/V staged in shared. Our prefill kernel covers **16 query rows per block, one key per
+iteration**, re-reading the K/V per warp with a shuffle chain per (row,key). That amortisation gap,
+not the shuffle count (wk16 cut those 1.5x for only +1.3%), is what the 2.7x measures.
+
+Direction for the next attempt (simpler than the WMMA path and contract-free): a tile kernel with
+~128 query rows per block, the 16/32-key K/V tiles in shared, and the query tile kept in registers -
+i.e. llama's tile shape - before any fragment-level work.
