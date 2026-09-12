@@ -3183,3 +3183,25 @@ change to the attention's reduction order re-rolls the near-ties on one side onl
 last 1.4% of base-mode tg requires **first** unifying the projection numerics between the
 verify batch and the decode step (the decode's fused dual GEMVs versus the batch's separate
 GEMMs), and only then re-attempting the attention structure.
+
+## Verify/decode attention unified + where the last 1.4% actually lives (2026-09-12)
+
+Two results.
+
+**(1) The attention contract is now structural.** The verify (t<=8) was running `qsa_flash_wk`
+while the decode runs `qsa_flash_split4q4` - different kernels, hence different reduction
+orders, hence near-ties that any attention-numerics change re-rolls on one side only. `wk` is
+now gated to t>8 (it is the *prefill* kernel: forcing split4q4 there costs 15% pp), so the
+verify uses the decode's kernel and the contract is guaranteed by construction rather than
+empirically. Judge: 17/19, unchanged; pp512 347 and tg32 11.33 unchanged, so the alignment is
+free. Any future attention change (the row x head rewrite included) is now safe to land.
+
+**(2) The base tg gap is dispatch overhead, not GPU throughput.** A decode token reads the
+15.67GB of weights and takes 88ms of wall (11.3 t/s) - ~178GB/s of the APU's ~256GB/s peak,
+bandwidth-bound like llama.cpp's 11.48 t/s. The GPU-side mark sum per token is ~34.5ms, so
+the rest is not arithmetic. The per-token dispatch count is ~600 at 2-5us of submit+barrier
+each, i.e. **~1.2-3ms of the 88ms token** - which brackets the entire 1.4% gap (1.4ms). The
+documented next lever is therefore dispatch *count*: fusing the same-input qkv/gate/up GEMVs
+into one row-ranged dispatch (~192 fewer dispatches per forward) is numerics-neutral (each
+output row keeps its own accumulation order) and is now the highest-value remaining item for
+base/mmproj tg.
