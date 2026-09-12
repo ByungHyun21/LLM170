@@ -411,7 +411,13 @@ pub fn q5_1_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result
             (&mut xw) as *mut _ as *mut c_void,
             (&mut tt) as *mut _ as *mut c_void,
         ];
-        ctx.launch3(kern, gx, n_out.min(65535) as u32, n_out.div_ceil(65535) as u32, block, &mut args)
+        let (gy, gz) = if kern.ends_with("_t") {
+            let nb = n_out.div_ceil(4);
+            (nb.min(65535) as u32, nb.div_ceil(65535) as u32)
+        } else {
+            (n_out.min(65535) as u32, n_out.div_ceil(65535) as u32)
+        };
+        ctx.launch3(kern, gx, gy, gz, block, &mut args)
     };
     // 워밍업 + 시간
     let mut msg = String::new();
