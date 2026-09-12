@@ -436,8 +436,12 @@ pub fn q5_1_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result
         ctx.sync()?;
         let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
         let gb = wbytes as f64 / (ms / 1e3) / 1e9;
+        let attrs = ctx
+            .kern_attrs(kern)
+            .map(|(regs, loc, mx)| format!("regs={regs} local={loc}B maxthr={mx}"))
+            .unwrap_or_else(|| "attrs 없음".into());
         msg += &format!(
-            "# {kern}: {ms:.3}ms/런치 ({gb:.1}GB/s 가중치) rows={rows} {n_in}x{n_out}\n"
+            "# {kern}: {ms:.3}ms/런치 ({gb:.1}GB/s 가중치) rows={rows} {n_in}x{n_out} grid=({gx},{n_out}) blk={blk} {attrs}\n"
         );
     }
     Ok(msg)

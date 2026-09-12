@@ -911,6 +911,18 @@ impl RawCtx {
         r
     }
 
+    /// 커널 속성 조회 — (레지스터, 로컬 바이트, 최대 스레드). 점유율 진단용.
+    pub fn kern_attrs(&self, name: &str) -> Option<(i32, usize, i32)> {
+        let f = *self.fns.get(name)?;
+        let mut a: hip::hipFuncAttributes = unsafe { std::mem::zeroed() };
+        let r = unsafe { hip::hipFuncGetAttributes(&mut a, f as *const std::ffi::c_void) };
+        if r == hip::hipError_t_hipSuccess {
+            Some((a.numRegs, a.localSizeBytes, a.maxThreadsPerBlock))
+        } else {
+            None
+        }
+    }
+
     /// gemm_tile의 사이드 스트림판 — 커널 선택·인자 구성은 공용 코어에 위임.
     pub fn gemm_tile_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
