@@ -3298,5 +3298,8 @@ Note that on this repeated-text prompt spec *loses* to plain batched decode (14.
 per-cycle acceptance on that prompt is ~2.5 tokens/seq, so the MTP's benefit does not cover the
 verify's 4x row count. For np>1 the plain batched decode is currently the better operating point.
 
-Remaining server item: a ~60ms/token host-side gap (np1 server 148ms/token vs engine 88ms), which
-caps the single-stream server rate at ~7 t/s even though the CLI measures 11.3 base / 21 spec3.
+Correction (same day): the apparent ~60ms/token server gap was the *model load* - the server
+prints its listen log before loading 15.67GB, so a first request absorbs ~9-12s. Instrumenting the
+scheduler loop shows `decode=87.9ms step=0.1ms n=1`, i.e. the server decodes at exactly the CLI's
+engine rate; the warm server runs at 11.3 t/s base and ~21 t/s spec3, and the 128-token np4 numbers
+above (22.6 t/s) already had the load amortised. No server-side per-token overhead exists.
