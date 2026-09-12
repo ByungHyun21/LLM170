@@ -380,9 +380,13 @@ extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, co
                                    const float* beta_ge, float* out, int d, int k_stride,
                                    int v_stride, int h_v, int h_k, float scale, int t) {
     // (ks/qs shared 스테이징 제거: 연산이 레인-로컬이라 크로스레인 동기 불필요 — 셔플 트리만으로 충분)
+    // 블록을 8워프로 — 워프당 (pair,u) 하나. 플랫폼은 블록당 비용이 있어
+    // 4096개 1-워프 블록 → 512개로 줄인다. 워프별 산술·레인 매핑은 동일(비트동일).
     int pair = blockIdx.x;
-    int u = blockIdx.y;                     // 열 0..127
-    int lane = threadIdx.x;                 // 0..31 — kdim 4개씩
+    int nwarps = (int)(blockDim.x >> 5);
+    int u = (int)blockIdx.y * nwarps + (int)(threadIdx.x >> 5);
+    if (u >= d) return;
+    int lane = threadIdx.x & 31;            // 0..31 — kdim 4개씩
     int base_s = pair * d * d;
     // 내 레인의 kdim: lane*4+j (레인당 4)
     float ssr[4];
