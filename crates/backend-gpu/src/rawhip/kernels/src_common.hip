@@ -36,6 +36,11 @@ DEV int dot4(unsigned a, unsigned b, int c) {
 // (ARM routines) → 결과 비트 일치 (경계 2^-28 확률 제외). 디바이스
 // expf는 1ulp 빗나감(244/4096 실측, 2026-09-03) — W4A8 비트계약 위반.
 DEV float exp_cr(float xf) {
+#ifdef LLM170_FASTEXP
+    // 빠른 경로(옵트인): 디바이스 __expf — 1ulp 이내 오차, glibc 올림정확과는
+    // 경계에서 다를 수 있다(f64 호너 제거로 커널당 수 µs → 수백 ns).
+    return __expf(xf);
+#else
     double x = (double)xf;
     if (x > 88.72) return __int_as_float(0x7f800000u);
     if (x < -103.97) return 0.0f;
@@ -65,6 +70,7 @@ DEV float exp_cr(float xf) {
     long long eb = (long long)(k + 1023) << 52;
     double scale = __longlong_as_double(eb);
     return (float)(p * scale);
+#endif
 }
 
 // f64 자연로그 — atanh 급수 fma 호너 (Rust ops::ln_cr과 동일 연산열).

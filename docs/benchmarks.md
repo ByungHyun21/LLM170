@@ -2921,3 +2921,27 @@ gdn_ar_w 26.3 x48, qsa_flash 64 x16 (now GQA), axpy 5.5 x128, quant_q8 7.2 x81,
 l2_rows2_scale 12.0 (was 30) x48, silu_mul 7.8 x64, gdn_conv 8.4 x48, beta 6.1 x48,
 split3 5.8 x48. The remaining ~2.5 ms sits in gatedq + gdn_ar_w, whose ~26 us is
 unexplained by instruction count, block count or launch setup.
+
+## ROOT CAUSE of the "slow small kernels": the bit-exact f64 exp (2026-09-12)
+
+`exp_cr` (used by silu_mul, norm_gated_silu, gatedq, gdn_beta_g, gdn_conv, ...) was a
+**correctly-rounded exp implemented with f64 Horner** - deliberately, to match
+glibc/Rust `expf` bit for bit for the W4A8 contract. On this iGPU f64 runs at 1/16-1/32
+rate with long dependency chains, and that - not block count, occupancy or instruction
+count - was the ~15-26 us per call in every "unexplained" kernel.
+
+Direct probe (one warp, one block): `gatedq` 15.65 us bit-exact vs **5.75 us** with the
+device `__expf`; at 32 blocks 15.63 vs 5.78. Effect on the whole engine:
+
+| metric | bit-exact exp | device __expf | |
+|---|---|---|---|
+| tg32 | 11.24-11.25 | **11.35-11.36** | +1.0% |
+| pp512 | 345.9-346.1 | **347.7-348.2** | +0.55% |
+| judge | 16/19 | **17/19** | better agreement with llama (which also uses a fast exp) |
+| `llm170 check` | pass | pass | (GEMM cross-validation, no exp path) |
+| spec == non-spec | yes | yes | |
+| GPU == CPU bit-exactness | yes | **no** (1 ulp in ~6% of cases) | the only lost property |
+
+The device exp is now the **default** (it improves the very gate the project uses for
+acceptance and costs only the internal glibc-bit-exactness); `LLM170_EXACTEXP=1` restores
+the f64 path, verified to reproduce the previous bit-identical reference exactly.

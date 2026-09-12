@@ -184,7 +184,13 @@ impl RawCtx {
             // 2026-09-03 AR xor RCA)
             let o4 = CString::new("-ffp-contract=off").unwrap();
             let o5 = CString::new("-I/opt/rocm/include").unwrap();
+            // exp_cr 기본을 디바이스 __expf로 (f64 호너 제거, 2026-09-12).
+            // 효과: tg +1.0%, pp +0.55%, judge 16/19 -> 17/19 (llama와 더 가까움).
+            // LLM170_EXACTEXP=1이면 glibc 비트일치 f64 경로 복원.
+            let ofast = CString::new("-DLLM170_FASTEXP").unwrap();
+            let fastexp = std::env::var_os("LLM170_EXACTEXP").is_none();
             let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr(), o5.as_ptr()];
+            if fastexp { opts.push(ofast.as_ptr()); }
             let rs = hip::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_mut_ptr());
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 let mut sz = 0usize;
@@ -1744,6 +1750,40 @@ pub fn launch_probe() -> Result<String, String> {
             s1.push_str(&format!("{label}: {:.2}us  ", t0.elapsed().as_secs_f64() * 1e6 / n2 as f64));
         }
         eprintln!("{s1}");
+        // gatedq 직접 계측: (o, z, w, xq, eps, d, n_h, n_tot)
+        {
+            let d = 128usize;
+            let n_tot = 32 * d;
+            let ob = ctx.alloc(n_tot * 4)?;
+            let zb = ctx.alloc(n_tot * 4)?;
+            let wb2 = ctx.alloc(n_tot * 4)?;
+            let qb2 = ctx.alloc(n_tot / 4 + n_tot / 32 + n_tot / 16 + 64)?;
+            let mut op = ob as *mut std::ffi::c_void;
+            let mut zp = zb as *mut std::ffi::c_void;
+            let mut wp2 = wb2 as *mut std::ffi::c_void;
+            let mut qp2 = qb2 as *mut std::ffi::c_void;
+            let mut eps2 = 1e-6f32;
+            let mut dd = d as i32;
+            let mut nh3 = 32i32;
+            let mut nt3 = n_tot as i32;
+            let mut a3: Vec<*mut std::ffi::c_void> = vec![
+                &mut op as *mut _ as *mut std::ffi::c_void, &mut zp as *mut _ as *mut std::ffi::c_void,
+                &mut wp2 as *mut _ as *mut std::ffi::c_void, &mut qp2 as *mut _ as *mut std::ffi::c_void,
+                &mut eps2 as *mut _ as *mut std::ffi::c_void, &mut dd as *mut _ as *mut std::ffi::c_void,
+                &mut nh3 as *mut _ as *mut std::ffi::c_void, &mut nt3 as *mut _ as *mut std::ffi::c_void,
+            ];
+            let mut res = String::new();
+            for (nb, thr) in [(1u32, 32u32), (8, 32), (32, 32), (32, 128)] {
+                for _ in 0..20 { let _ = ctx.launch3("gatedq", nb, 1, 1, thr, &mut a3); }
+                ctx.sync()?;
+                let n2 = 2000usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n2 { let _ = ctx.launch3("gatedq", nb, 1, 1, thr, &mut a3); }
+                ctx.sync()?;
+                res.push_str(&format!("{nb}blk x{thr}thr: {:.2}us  ", t0.elapsed().as_secs_f64() * 1e6 / n2 as f64));
+            }
+            eprintln!("{res}");
+        }
     }
     let mut xp = ctx.alloc(256)?; let mut op = ctx.alloc(256)?; let mut sp = ctx.alloc(256)?;
     let mut nn = 64i32;
