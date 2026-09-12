@@ -3239,3 +3239,37 @@ aggregate - the MTP/NP4 cells would clear llama.cpp by ~2x. Making the t=2..8 ba
 paths (`gemm_g4` for t=2..4, `gemm_tile` for t>4) reach the decode's bandwidth is therefore
 the highest-value remaining work for this objective. Note also that t=5 falls *off* the g4
 path onto the tile: spec3 (t=4) already wins 14.0 vs 12.0 t/s.
+
+## MTP: the records hold in the steady state; the deficit is a cold start (2026-09-12)
+
+Per-cycle timing (`LLM170_SPEC_TIMING`) of spec runs, splitting the first cycles from the rest:
+
+| config | first 4 cycles | steady state | llama.cpp |
+|---|---|---|---|
+| spec4 (verify t=5) | 4.3 t/s (1.25 tok/step) | 11.9-16.6 t/s (4.25 tok/step) | 11.5 |
+| **spec3 (verify t=4)** | 4.8 t/s (1.25 tok/step) | **20.7-21.4 t/s (4.00 tok/step)** | 11.5 (**1.80-1.86x**) |
+
+So the documented 16.6-17.9 t/s was a steady-state figure and the current short benchmarks
+(tg32/tg64) understate the MTP badly: the first ~4 cycles after the prefill accept only
+1.25 tokens/step, then it recovers to 4.0-4.75. `spec3` keeps the verify at t=4, which stays
+on the fast `gemm_g4` path, and reaches **1.8x llama** - the k=4 case (verify t=5) falls onto
+`gemm_tile` (a prefill kernel) *and* its partial acceptance piles up `carried` rows, making the
+effective verify 9-10 rows: 340ms/step against spec3's 190ms.
+
+Root of the cold start: the batched MTP prefill writes the MTP's state with the batch kernels
+(`rms_rows`, `mm_b2`->tile/MMQ) while the drafts and the verify's advance step use the
+single-row forms (`rms`, `mm_direct`) - the *same* batch-vs-single arithmetic split that blocks
+the attention rewrite. Measured at pp=64: the KV rows agree to 4e-7 at row 0 but diverge to
+~1% from row 1 on, and the gathered h and pending h differ by tens of percent between the two
+prefill paths. With `LLM170_T1_PREFILL=1` (per-token prefill, single forms throughout) the
+first draft is *correct* (196665 == the target), which is the clean A/B; no per-row patch of
+the batched prefill's head or eh_proj changes the outcome, so the divergence is the KV/h
+arithmetic as a whole, written once per prompt and then diluted by the verify-written rows
+(hence the self-correction after ~4 cycles).
+
+**One prerequisite unifies everything**: make the batch kernels (`gemm_g4`/`gemm_tile`/MMQ,
+`rms_rows`) arithmetically identical to the single-row ones (`gemv_q8_out`, `mm_direct`, `rms`).
+That alone fixes the MTP cold start (making the bench protocol measure the steady state) and
+unblocks the attention rewrite for base tg. Until then: `--spec 3` is the better default
+(+60% steady state over spec4), and the MTP/np4 cells should be read from per-cycle timing,
+not from short-run averages.
