@@ -3226,6 +3226,13 @@ The t=5 profile (171ms) is uniformly inflated: ffn_gate 62.6, ffn 40.9, proj 31.
 gdn_mm 23.6 - every projection costs ~2x its t=1 share. cpu_submit is 5.5ms, so this is
 GPU-side, not dispatch overhead.
 
+Mechanism: `mm_b` routes t=2..4 to `gemm_g4` and t>4 to `gemm_tile`, and the tile is a
+*prefill* kernel - 16-token slots, 11 of them empty at t=5, i.e. ~3x the t=1 cost per phase
+(ffn_gate 62.6ms at t=5 against a ~20-25ms t=1 share). This is structural, not
+prompt-dependent: **`--spec 3` (verify t=4, the g4 path) beats `--spec 4` (verify t=5, the
+tile) 13.99 vs 12.03 t/s on the same prompt**, and it should be the default until the tile
+learns to handle small token counts.
+
 Consequence: with the t=1 decode's bandwidth efficiency the verify would cost ~90-110ms and a
 spec step ~150ms for ~3.5 tokens, i.e. ~23 t/s single-stream and a proportionally better np4
 aggregate - the MTP/NP4 cells would clear llama.cpp by ~2x. Making the t=2..8 batch GEMV
