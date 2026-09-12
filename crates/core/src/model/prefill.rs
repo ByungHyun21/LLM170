@@ -109,18 +109,20 @@ impl Engine {
                 for (ci, ch) in cache.chunks(ch_sz).enumerate() {
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
                     let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
+                        let n_e = self.model.hp.n_embd;
+                        // 임베딩 선반입: 사이드 스트림 async h2d를 메인 프리필과 중첩
+                        // (청크당 10.5MB 블로킹 업로드 제거).
+                        let mut tok_flat: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
+                        for row in ch.iter() { tok_flat.extend_from_slice(row); }
+                        rd.mtp_upload_tok_emb(&tok_flat).map_err(ModelError::Accel)?;
                         // MTP KV 적립: 마지막 행 hidden(carry)만 회수
                         let (lg, h_last) = rd
                             .raw_prefill_h(seq, pos, &flat)
                             .map_err(ModelError::Accel)?;
-                        let n_e = self.model.hp.n_embd;
                         // 배치 MTP 프리필: blk.64를 청크 전체(t행) 한 번에 — t=1 스텝
                         // ×토큰수 대체(헤드는 마지막 행만). tok/h 시프트 페어링은
                         // llama.cpp와 동일: MTP(tok_p, h_{p-1}), h_{-1}=pending.
-                        let mut tok_flat: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
-                        for row in ch.iter() {
-                            tok_flat.extend_from_slice(row);
-                        }
+
                         // h_shift는 GPU에서 조립(디바이스 행 시프트) — carry만 호스트에서 전달.
                         let mut carry: Vec<f32> = Vec::with_capacity(n_e);
                         if self.seqs[seq].mtp_pending_h.len() == n_e {

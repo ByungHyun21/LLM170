@@ -488,6 +488,11 @@ pub trait RawDecode: Send + Sync {
         Err("raw_verify: 미지원".into())
     }
 
+    /// MTP 임베딩 선반입 (사이드 스트림) — 미지원 백엔드는 no-op.
+    fn mtp_upload_tok_emb(&self, _tok_flat: &[f32]) -> Result<(), String> {
+        Ok(())
+    }
+
     /// raw_prefill + 마지막 행 hidden 회수 (MTP carry). 기본 Err.
     fn raw_prefill_h(
         &self,
