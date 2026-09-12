@@ -96,7 +96,7 @@ cargo run --release -- serve --model <model.gguf> --port 8080 --backend gpu
 cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --gpu-runtime hip
 
 # Runtime mode (memory-budget profile today; kernel variants when cmp-stock lands)
-cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --mode universal
+cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16
 ```
 
 The HIP attention path is a recent redesign worth naming: the prefill kernel is

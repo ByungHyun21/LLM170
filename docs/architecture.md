@@ -61,27 +61,41 @@ decode-first budgeting, prefill in 1,024-token chunks in the remaining
 budget, slots returned on completion, and client disconnects (SSE flush
 failure) cancel the job.
 
-## Mode System
+## Device Measurement (replaces the mode system, 2026-09-13)
 
-`universal` / `cmp-stock` / `cmp-unlocked` — see [overview.md](overview.md).
-- Mode = runtime flag + **kernel variant selection** (decomposed mul+add vs
-  full-rate FMA) + memory budget profile.
-- The engine core (loader, graph, scheduler, sampler) is mode-agnostic.
-  Mode-dependent code is confined to kernel selection and the memory planner.
-- Implemented (2026-09-01): `core/src/mode.rs` + `infer|serve --mode` sets
-  the weight-residency and prefill-chunk defaults (`LLM170_W_CAP_GB`,
-  `LLM170_Q4_CHUNK`); explicit env values win. Update (2026-09-02): when the
-  qwen4exp decode frame is active (its default), the mode's W_CAP preset is
-  skipped so the weight store derives its budget from the measured device
-  region (the frame needs the full expert stacks resident). Kernel variants
-  are the remaining half — `Mode` is the branch key when the cmp-stock
-  kernel set lands.
+There is no hardware-profile flag. ADR-0002's `--mode` set two environment
+knobs, of which only the prefill chunk had a reader, and the decode frame
+already capped that; the flag was measured to be inert and was removed
+(plans/64).
+
+Instead the runtime measures the device once at accelerator init and routes
+on the result:
+
+- `hipDeviceGetName` / `hipMemGetInfo` — identity, free and total device
+  memory.
+- Host↔device transfer bandwidth (three 64 MiB round trips, pageable) — the
+  UMA vs discrete signal: unified memory reaches memory-bandwidth rates,
+  PCIe cards do not, so the same residency logic adapts without a flag.
+- `wmma_probe` — the attention WMMA tile path is only taken when the probe
+  reproduces the CPU mirror (otherwise the scalar `wk8` path runs).
+
+Reported as one line at startup, e.g.
+
+```
+# device: Radeon 8060S | mem free=..GiB total=..GiB | h2d=..GB/s d2h=..GB/s | wmma=ok
+```
+
+Everything else already routes on measurement or capability: the
+device-resident decode frame falls back to the value path when its buffers
+cannot be allocated, the weight store derives its budget from the measured
+total, and kernel variants are chosen per shape (GEMV vs GEMM by token
+count, tile vs accumulator by `n_in`).
 
 ## Backend Strategy
 
-1. **CPU backend (pure Rust)** — reference implementation and `universal`
-   default. Ground truth for all golden tests; the full stack verifies without
-   a GPU.
+1. **CPU backend (pure Rust)** — reference implementation and the portability
+   baseline. Ground truth for all golden tests; the full stack verifies
+   without a GPU.
 2. **GPU backends (post-cubecl)** — `rawhip`: HIP C++ kernel strings
    JIT-compiled via hipRTC (`rawhip/kernels.rs::SRC`) plus optional offline
    code objects; `rawvk`: GLSL compute shaders precompiled to SPIR-V
@@ -102,9 +116,8 @@ Rust is strict FP by default (no implicit FMA contraction). Therefore:
 - **No `f32::mul_add` in hot paths** (explicit FMA = up to 32x penalty under
   cmp-stock throttling).
 - No fast-math compiler flags.
-- These rules alone make universal/cmp-stock kernel sharing work.
-  `cmp-unlocked` adds a full-rate variant (mul_add allowed) after unlock
-  measurements.
+- These rules keep one kernel set shareable across hardware; a full-rate
+  variant (mul_add allowed) is added after unlock measurements exist.
 - Verification duty: confirm generated code contains no FMA (SASS/SPIR-V dump)
   — to be folded into the profiler/CI procedure. GPU accumulation order
   matches the CPU reference (block-sequential, element-sequential per row), so

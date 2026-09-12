@@ -24,7 +24,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan]
       OpenAI/Anthropic 호환 HTTP 서버.
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -108,25 +108,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// --mode 파싱·적용 — env 기본값으로 반영 (기존 env 관례의 단일 소스 유지).
-/// LLM170_W_CAP_GB·LLM170_Q4_CHUNK가 이미 있으면 사용자 명시로 존중.
-fn apply_mode(m: llm170_core::mode::Mode) {
-    // 프레임 기본 ON(2026-09-02): 전문가 스택 상주(~88GiB)가 성립 조건이라
-    // 모드 프리셋 W_CAP(72GiB)를 세우면 프레임이 원천 불능이 된다. 프레임이
-    // 켜져 있으면 프리셋을 생략해 WeightStore가 실측 총량의 95%로 유도하게
-    // 한다(작은 기기는 상주 실패 → value 폴백). 사용자 명시는 존중.
-    let frame_on = std::env::var("LLM170_FRAME").is_ok_and(|v| v != "0");
-    if std::env::var_os("LLM170_W_CAP_GB").is_none() && !frame_on {
-        // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
-        unsafe { std::env::set_var("LLM170_W_CAP_GB", m.w_cap_gb().to_string()) };
-    }
-    if std::env::var_os("LLM170_Q4_CHUNK").is_none() {
-        // SAFETY: 위와 동일
-        unsafe { std::env::set_var("LLM170_Q4_CHUNK", m.prefill_chunk().to_string()) };
-    }
-    eprintln!("# mode: {m:?} (w_cap={}GiB chunk={})", m.w_cap_gb(), m.prefill_chunk());
-}
-
 /// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
 fn cmd_serve(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;
@@ -135,7 +116,6 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
     let mut gpu_runtime = String::new();
-    let mut mode: Option<llm170_core::mode::Mode> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -156,10 +136,6 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
                 None => return usage_err("--backend requires cpu|gpu"),
             },
-            "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
-                Some(m) => mode = Some(m),
-                None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
-            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) => spec_k = k.min(8),
                 None => return usage_err("--spec requires k in 1..=8"),
@@ -173,9 +149,6 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     }
     let Some(model_path) = model else { return usage_err("--model required") };
-    if let Some(m) = mode {
-        apply_mode(m);
-    }
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).

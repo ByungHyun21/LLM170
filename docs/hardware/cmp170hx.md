@@ -17,6 +17,10 @@ Deployment priority-1 device. Factual basis: local research notes
 
 ## Throttle Matrix (stock eFUSE) — kernel rules for `cmp-stock` mode
 
+(The `cmp-stock` / `cmp-unlocked` profile flags were removed 2026-09-13 —
+ADR-0002 superseded; these tables remain the kernel rules for that hardware.) The
+throttle matrix below is enforced by kernel choice, not by a flag.
+
 | Path | Measured | Status |
 |---|---|---|
 | FP32 FFMA (fused) | 0.39 TFLOPS (1/32) | **forbidden** — decompose FMA into mul+add |

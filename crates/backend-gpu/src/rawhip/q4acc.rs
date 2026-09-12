@@ -1216,6 +1216,7 @@ pub fn new_acc_with_sources(
     eprintln!(
         "# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)"
     );
+    eprintln!("{}", crate::rawhip::probes::device_report(&a.ctx));
     Ok(std::sync::Arc::new(a))
 }
 

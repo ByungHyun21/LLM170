@@ -1736,7 +1736,11 @@ gmark("attn", &mut marks);
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
                         let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
                         if wk16 {
-                            if wk && hd == 256 && std::env::var_os("LLM170_NO_WK_WMMA").is_none() {
+                            if wk
+                                && hd == 256
+                                && std::env::var_os("LLM170_NO_WK_WMMA").is_none()
+                                && super::probes::wmma_ok()
+                            {
                                 // WMMA 타일 판(기본): Q_in_reg + Q 버퍼를 K/V 로 재사용. 공유 32768B.
                                 // pp512 361.3 / pp3314 329.2 vs 스칼라 360.2 / 324.7 (2026-09-12).
                                 // 산술이 f16 누적이라 스칼라와 다른데, 토큰 동일성은 600토큰
