@@ -56,7 +56,8 @@ pub struct Frame4 {
     pub hxn: u64,  // [hc·n_embd]
     pub hlo: u64,
     pub hgate: u64,
-    pub hin: u64, // [n_embd]
+    pub hin: u64, // [t·n_embd]
+    pub hin_last: u64, // [n_embd] — 헤드 입력(마지막 토큰)
     pub logits: u64, // [vocab]
     // 저랭크 버퍼 길이 (hc_down/output_hc_down n_out — 생성 시 고정)
     pub lo_len: usize,
@@ -84,6 +85,7 @@ impl Frame4 {
         acc: &dyn Accelerator,
         model: &Model4,
         seqs: &[SeqState4],
+        t_max: usize,
     ) -> Result<Self, Q4Error> {
         let hp = &model.hp;
         let (n, hc) = (hp.n_embd, hp.hc);
@@ -91,47 +93,50 @@ impl Frame4 {
         let v_len = hp.dt_rank * hp.d_state;
         let conv_ch = 2 * k_len + v_len;
         let n_recr = (0..hp.n_layer).filter(|&il| hp.is_recr(il)).count();
+        let t_max = t_max.max(1);
         let a = |len: usize| alloc(acc, len);
+        let at = |len: usize| alloc(acc, len * t_max);
         let lo_n = model.w4("blk.0.hc_attn_down.weight")?.n_out as usize;
         let hlo_n = model.w4("output_hc_down.weight")?.n_out as usize;
 
         let mut f = Frame4 {
-            res_hc: a(hc * n)?,
-            xn: a(hc * n)?,
-            lo: a(lo_n)?,
-            gate: a(hc * n)?,
-            inj: a(hc)?,
-            mix: a(n)?,
-            ffn_out: a(n)?,
-            gqkv: a(conv_ch)?,
-            gz: a(hp.d_inner)?,
-            gb: a(hp.dt_rank)?,
-            ga: a(hp.dt_rank)?,
-            gbg: a(hp.dt_rank * 2)?,
-            gconv: a(conv_ch)?,
-            gq: a(k_len)?,
-            gk: a(k_len)?,
-            gv: a(v_len)?,
-            go: a(v_len)?,
-            ggated: a(hp.d_inner)?,
-            mroute: a(hp.n_expert)?,
-            msgate: a(1)?,
-            mids: a(hp.n_expert_used)?,
-            mwt: a(hp.n_expert_used)?,
-            mxsel: a(hp.n_expert_used * n)?,
-            mgu: a(hp.n_expert_used * hp.n_ff_exp)?,
-            mup: a(hp.n_expert_used * hp.n_ff_exp)?,
-            mglu: a(hp.n_expert_used * hp.n_ff_exp)?,
-            my: a(hp.n_expert_used * n)?,
-            mout: a(n)?,
-            shg: a(hp.n_ff_exp)?,
-            shu: a(hp.n_ff_exp)?,
-            shglu: a(hp.n_ff_exp)?,
-            shout: a(n)?,
-            hxn: a(hc * n)?,
-            hlo: a(hlo_n)?,
-            hgate: a(hc * n)?,
-            hin: a(n)?,
+            res_hc: at(hc * n)?,
+            xn: at(hc * n)?,
+            lo: at(lo_n)?,
+            gate: at(hc * n)?,
+            inj: at(hc)?,
+            mix: at(n)?,
+            ffn_out: at(n)?,
+            gqkv: at(conv_ch)?,
+            gz: at(hp.d_inner)?,
+            gb: at(hp.dt_rank)?,
+            ga: at(hp.dt_rank)?,
+            gbg: at(hp.dt_rank * 2)?,
+            gconv: at(conv_ch)?,
+            gq: at(k_len)?,
+            gk: at(k_len)?,
+            gv: at(v_len)?,
+            go: at(v_len)?,
+            ggated: at(hp.d_inner)?,
+            mroute: at(hp.n_expert)?,
+            msgate: at(1)?,
+            mids: at(hp.n_expert_used)?,
+            mwt: at(hp.n_expert_used)?,
+            mxsel: at(hp.n_expert_used * n)?,
+            mgu: at(hp.n_expert_used * hp.n_ff_exp)?,
+            mup: at(hp.n_expert_used * hp.n_ff_exp)?,
+            mglu: at(hp.n_expert_used * hp.n_ff_exp)?,
+            my: at(hp.n_expert_used * n)?,
+            mout: at(n)?,
+            shg: at(hp.n_ff_exp)?,
+            shu: at(hp.n_ff_exp)?,
+            shglu: at(hp.n_ff_exp)?,
+            shout: at(n)?,
+            hxn: at(hc * n)?,
+            hlo: at(hlo_n)?,
+            hgate: at(hc * n)?,
+            hin: at(n)?,
+            hin_last: a(n)?,
             logits: a(hp.vocab)?,
             lo_len: lo_n,
             hlo_len: hlo_n,
@@ -195,6 +200,13 @@ impl Frame4 {
     }
 }
 
+/// 프레임 스텝 시작 알림 — 버퍼는 t_max 크기이므로 op 커널이 토큰 수를
+/// 버퍼 길이에서 유도할 수 없다. 명시적으로 전달한다.
+fn fs_begin(acc: &dyn Accelerator, t: usize) {
+    let fs: &dyn FrameState = acc;
+    fs.frame_begin(t);
+}
+
 /// 단계 덤프 (LLM170_Q4_DBG=1) — 값 경로와 같은 양을 찍어 대조한다.
 fn dbg(tag: &str, acc: &dyn Accelerator, h: u64, n: usize) {
     if std::env::var_os("LLM170_Q4_DBG").is_none() {
@@ -209,7 +221,134 @@ fn dbg(tag: &str, acc: &dyn Accelerator, h: u64, n: usize) {
     eprintln!("# fdbg {tag}: sum={s:.6} max={mx:.6} v0..3={:?}", &v[..3.min(n)]);
 }
 
-/// 프레임 디코드 1스텝 — Engine4::decode1에서 호출 (t=1 전용).
+/// 프레임 forward — t토큰 (t=1 디코드도 이 경로; decode_frame이 래퍼).
+pub fn frame_forward(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seq: usize,
+    seq_st: &mut SeqState4,
+    f: &mut Frame4,
+    tokens: &[u32],
+) -> Result<Vec<f32>, Q4Error> {
+    let hp: &Hparams4 = &model.hp;
+    let (n, hc) = (hp.n_embd, hp.hc);
+    let k_len = hp.n_group * hp.d_state;
+    let v_len = hp.dt_rank * hp.d_state;
+    let conv_ch = 2 * k_len + v_len;
+    let eps = hp.eps;
+    let t = tokens.len();
+    fs_begin(acc, t);
+
+    // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
+    {
+        let embd = model
+            .w("token_embd.weight")
+            .ok_or(Q4Error::MissingTensor("token_embd".into()))?;
+        let mut row = vec![0.0f32; n];
+        let mut r = vec![0.0f32; t * hc * n];
+        for (ti, &tok) in tokens.iter().enumerate() {
+            dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
+            for s in 0..hc {
+                r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
+            }
+        }
+        acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+    }
+
+    // PLE n-gram 행 (호스트 해시)
+    let ple_rows = if hp.is_ple(1) {
+        stages::ple_hash(ctx, seq_st, tokens)
+    } else {
+        Vec::new()
+    };
+
+    let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+    let mut recr_idx = 0usize;
+    let mut full_idx = 0usize;
+    for il in 0..hp.n_layer {
+        if trace {
+            eprintln!("# frame layer {il} t={t} (ple={} recr={})", hp.is_ple(il), hp.is_recr(il));
+        }
+        // 1) PLE (blk.1) — CPU 브리지: res_hc 판독 → CPU → 기록
+        if hp.is_ple(il) {
+            let mut r = vec![0.0f32; t * hc * n];
+            acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
+            let mut rows: Vec<Vec<f32>> = r.chunks_exact(hc * n).map(|c| c.to_vec()).collect();
+            stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
+            let flat: Vec<f32> = rows.concat();
+            acc.frame_write(f.res_hc, &flat).map_err(Q4Error::Io)?;
+        }
+
+        // 2) hc attn mix
+        hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
+        if il == 0 {
+            dbg("res_hc", acc, f.res_hc, hc * n * t);
+        }
+
+        // 3) attention — GDN 프레임 / QSA 값 브리지
+        if hp.is_recr(il) {
+            gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t)?;
+            recr_idx += 1;
+            hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
+        } else {
+            // QSA 값 경로 브리지 — mix 판독 → qsa_layer(t행) → 출력 기록
+            let mut mix_v = vec![0.0f32; t * n];
+            acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
+            let xs: Vec<Vec<f32>> = mix_v.chunks_exact(n).map(|c| c.to_vec()).collect();
+            let out = stages::qsa_layer(ctx, seq_st, il, &xs, t, full_idx)?;
+            let flat: Vec<f32> = out.concat();
+            acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
+            full_idx += 1;
+            hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
+        }
+
+        // 4) hc ffn mix + MoE
+        if il == 0 {
+        }
+        hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
+        if il == 0 {
+            dbg("mix2", acc, f.mix, n * t);
+        }
+        moe_frame(acc, model, f, il, n, t)?;
+        if il == 0 {
+        }
+        hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
+        if il == 0 {
+        }
+    }
+
+    // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
+    {
+        let w_norm = f.consts["output_hc_norm"];
+        op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.hxn, eps, n, w_reps: hc })?;
+        let w_down = model.w4("output_hc_down.weight")?;
+        acc.frame_mm(f.hxn, &w_down, f.hlo, t).map_err(Q4Error::Io)?;
+        op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len * t })?;
+        let w_up = model.w4("output_hc_up.weight")?;
+        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
+        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n })?;
+        if t > 1 {
+            op(acc, FrameOp::CopyRows { src: f.hin, dst: f.hin_last, src_off: (t - 1) * n, dst_off: 0, n })?;
+        }
+        let hin = if t > 1 { f.hin_last } else { f.hin };
+        let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
+        acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
+        let mut logits = vec![0.0f32; hp.vocab];
+        acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
+        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            eprintln!(
+                "# fdbg logits t={t}: top5 {:?}",
+                idx[..5].iter().map(|&i| (i, logits[i])).collect::<Vec<_>>()
+            );
+        }
+        Ok(logits)
+    }
+}
+
+/// 프레임 디코드 1스텝 — Engine4::decode1에서 호출.
 pub fn decode_frame(
     acc: &dyn Accelerator,
     model: &Model4,
@@ -219,92 +358,11 @@ pub fn decode_frame(
     f: &mut Frame4,
     token: u32,
 ) -> Result<Vec<f32>, Q4Error> {
-    let hp: &Hparams4 = &model.hp;
-    let (n, hc) = (hp.n_embd, hp.hc);
-    let k_len = hp.n_group * hp.d_state;
-    let v_len = hp.dt_rank * hp.d_state;
-    let conv_ch = 2 * k_len + v_len;
-    let eps = hp.eps;
-
-    // 0) 임베딩 — CPU dequant → 4스트림 방송 기록
-    {
-        let embd = model
-            .w("token_embd.weight")
-            .ok_or(Q4Error::MissingTensor("token_embd".into()))?;
-        let mut row = vec![0.0f32; n];
-        dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
-        let mut r = vec![0.0f32; hc * n];
-        for s in 0..hc {
-            r[s * n..(s + 1) * n].copy_from_slice(&row);
-        }
-        acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
-    }
-
-    // PLE n-gram 행 (호스트 해시) — PLE층 직전에 CPU에서 필요
-    let ple_rows = if hp.is_ple(1) {
-        stages::ple_hash(ctx, seq_st, &[token])
-    } else {
-        Vec::new()
-    };
-
-    let mut recr_idx = 0usize;
-    let mut full_idx = 0usize;
-    for il in 0..hp.n_layer {
-        // 1) PLE (blk.1) — CPU 브리지: res_hc 판독 → CPU → 기록
-        if hp.is_ple(il) {
-            let mut r = vec![0.0f32; hc * n];
-            acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
-            let mut rows = vec![r];
-            stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
-            acc.frame_write(f.res_hc, &rows[0]).map_err(Q4Error::Io)?;
-        }
-
-        // 2) hc attn mix — rms → down/inject 그룹 → silu(hc 나눗셈) → up → 게이트 평균
-        hc_mix_frame(acc, model, f, il, "attn", eps, n, hc)?;
-
-        // 3) attention — GDN 프레임 / QSA 값 브리지
-        if hp.is_recr(il) {
-            gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps)?;
-            recr_idx += 1;
-            let o = f.ffn_out;
-            let inj = f.inj;
-            hc_combine_frame(acc, f, o, inj, n, hc)?;
-        } else {
-            // QSA 값 경로 브리지 — mix 판독 → qsa_layer → 출력 기록 (1 sync)
-            let mut mix_v = vec![0.0f32; n];
-            acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
-            let xs = vec![mix_v];
-            let out = stages::qsa_layer(ctx, seq_st, il, &xs, 1, full_idx)?;
-            acc.frame_write(f.ffn_out, &out[0]).map_err(Q4Error::Io)?;
-            full_idx += 1;
-            hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc)?;
-        }
-
-        // 4) hc ffn mix + MoE
-        hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc)?;
-        moe_frame(acc, model, f, il, n)?;
-        hc_combine_frame(acc, f, f.mout, f.inj, n, hc)?;
-    }
-
-    // 5) head — output hc mix + output GEMM + 판독 (최종 1 sync)
-    {
-        let w_norm = f.consts["output_hc_norm"];
-        op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.hxn, eps, n, w_reps: hc })?;
-        let w_down = model.w4("output_hc_down.weight")?;
-        acc.frame_mm(f.hxn, &w_down, f.hlo, 1).map_err(Q4Error::Io)?;
-        op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len })?;
-        let w_up = model.w4("output_hc_up.weight")?;
-        acc.frame_mm(f.hlo, &w_up, f.hgate, 1).map_err(Q4Error::Io)?;
-        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n })?;
-        let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
-        acc.frame_mm(f.hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
-        let mut logits = vec![0.0f32; hp.vocab];
-        acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
-        Ok(logits)
-    }
+    frame_forward(acc, model, ctx, seq, seq_st, f, &[token])
 }
 
 /// hc_mix 프레임 — CPU stages/hc.rs hc_mix와 동일 순서 (inject 반환 포함).
+#[allow(clippy::too_many_arguments)]
 fn hc_mix_frame(
     acc: &dyn Accelerator,
     model: &Model4,
@@ -314,16 +372,17 @@ fn hc_mix_frame(
     eps: f32,
     n: usize,
     hc: usize,
+    t: usize,
 ) -> Result<(), Q4Error> {
     let w_norm = f.consts[&format!("blk.{il}.hc_{kind}_norm")];
     op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.xn, eps, n, w_reps: hc })?;
     let w_down = model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
     let w_inject = model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
-    acc.frame_mm_group(f.xn, &[w_down, w_inject], &[f.lo, f.inj], 1)
+    acc.frame_mm_group(f.xn, &[w_down, w_inject], &[f.lo, f.inj], t)
         .map_err(Q4Error::Io)?;
-    op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len })?;
+    op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len * t })?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
-    acc.frame_mm(f.lo, &w_up, f.gate, 1).map_err(Q4Error::Io)?;
+    acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
     op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n })?;
     Ok(())
 }
@@ -336,8 +395,9 @@ fn hc_combine_frame(
     inj: u64,
     n: usize,
     hc: usize,
+    t: usize,
 ) -> Result<(), Q4Error> {
-    op(acc, FrameOp::HcCombine { res: f.res_hc, out, inj, hc, n, total: hc * n })
+    op(acc, FrameOp::HcCombine { res: f.res_hc, out, inj, hc, n, total: hc * n * t })
 }
 
 /// GDN 프레임 — stages/gdn.rs와 동일 순서 (t=1).
@@ -353,6 +413,7 @@ fn gdn_frame(
     k_len: usize,
     v_len: usize,
     eps: f32,
+    t: usize,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
     // qkv/z/b/a 그룹 — 동일 입력 mix
@@ -360,39 +421,33 @@ fn gdn_frame(
     let wz = model.w4(&format!("blk.{il}.attn_gate.weight"))?;
     let wb = model.w4(&format!("blk.{il}.ssm_beta.weight"))?;
     let wa = model.w4(&format!("blk.{il}.ssm_alpha.weight"))?;
-    acc.frame_mm_group(f.mix, &[wqkv, wz, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], 1)
+    acc.frame_mm_group(f.mix, &[wqkv, wz, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], t)
         .map_err(Q4Error::Io)?;
     // β/e^g
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
-    op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank })?;
+    op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
     // conv + ring
     let cw = f.consts[&format!("blk.{il}.conv_w")];
-    op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
-    // q/k/v 분할 + l2 + q·scale
-    op(acc, FrameOp::CopyRows { src: f.gconv, dst: f.gq, src_off: 0, dst_off: 0, n: k_len })?;
-    op(acc, FrameOp::CopyRows { src: f.gconv, dst: f.gk, src_off: k_len, dst_off: 0, n: k_len })?;
-    op(acc, FrameOp::CopyRows { src: f.gconv, dst: f.gv, src_off: 2 * k_len, dst_off: 0, n: v_len })?;
+    op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: t })?;
+    // q/k/v 분할 (토큰 배치 = split3) + l2 + q·scale
+    op(acc, FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
     op(acc, FrameOp::L2Rows { x: f.gq, eps, d: hp.d_state })?;
     op(acc, FrameOp::L2Rows { x: f.gk, eps, d: hp.d_state })?;
     let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-    op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len })?;
+    op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
+    if il == 0 {
+        dbg("gbg_post", acc, f.gbg, hp.dt_rank * 2 * t);
+    }
     fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
         .map_err(Q4Error::Io)?;
-    if il == 0 {
-        dbg("st_gdn", acc, f.st_gdn[seq][ri], hp.dt_rank * hp.d_state * hp.d_state);
-        dbg("gdn_ar", acc, f.go, v_len);
-        dbg("conv", acc, f.gconv, conv_ch);
-        dbg("gq", acc, f.gq, k_len);
-        dbg("gbg", acc, f.gbg, hp.dt_rank * 2);
-    }
     // norm_gated + out proj
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
     op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
     let wout = model.w4(&format!("blk.{il}.ssm_out.weight"))?;
-    acc.frame_mm(f.ggated, &wout, f.ffn_out, 1).map_err(Q4Error::Io)?;
+    acc.frame_mm(f.ggated, &wout, f.ffn_out, t).map_err(Q4Error::Io)?;
     Ok(())
 }
 
@@ -406,6 +461,7 @@ fn moe_frame(
     f: &mut Frame4,
     il: usize,
     n: usize,
+    t: usize,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
     let k_sel = hp.n_expert_used;
@@ -413,35 +469,48 @@ fn moe_frame(
     // route + shared 게이트
     let w_route = model.w4(&format!("blk.{il}.ffn_gate_inp.weight"))?;
     let w_route_sh = model.w4(&format!("blk.{il}.ffn_gate_inp_shexp.weight"))?;
-    acc.frame_mm_group(f.mix, &[w_route, w_route_sh], &[f.mroute, f.msgate], 1)
+    acc.frame_mm_group(f.mix, &[w_route, w_route_sh], &[f.mroute, f.msgate], t)
         .map_err(Q4Error::Io)?;
     op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
-    // x 브로드캐스트 (전문가당 동일 입력)
-    for e in 0..k_sel {
-        op(acc, FrameOp::CopyRows { src: f.mix, dst: f.mxsel, src_off: 0, dst_off: e * n, n })?;
-    }
     let fs: &dyn FrameState = acc;
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
-    fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert)
-        .map_err(Q4Error::Io)?;
-    fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert)
-        .map_err(Q4Error::Io)?;
-    op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: k_sel * n_ff })?;
     let w_down = model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
-    fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert)
-        .map_err(Q4Error::Io)?;
-    op(acc, FrameOp::MoeWeightedSum { ys: f.my, wt: f.mwt, out: f.mout, k: k_sel, n })?;
+    if t == 1 {
+        // 디코드: mix를 k_sel회 브로드캐스트 → 3회 스택 GEMM
+        for e in 0..k_sel {
+            op(acc, FrameOp::CopyRows { src: f.mix, dst: f.mxsel, src_off: 0, dst_off: e * n, n })?;
+        }
+        fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: k_sel * n_ff })?;
+        fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        op(acc, FrameOp::MoeWeightedSum { ys: f.my, wt: f.mwt, out: f.mout, k: k_sel, n })?;
+    } else {
+        // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
+        fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
+        fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: t * k_sel * n_ff })?;
+        fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
+        fs.frame_moe_scatter(f.my, f.mwt, f.mout, k_sel, n, t).map_err(Q4Error::Io)?;
+    }
     // shared 전문가 — σ(sgate)·shout 가산
-    op(acc, FrameOp::Sigmoid { t: f.msgate, n: 1 })?;
+    op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
     let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
     let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
-    acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], 1)
+    acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
         .map_err(Q4Error::Io)?;
-    op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff })?;
+    op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
     let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
-    acc.frame_mm(f.shglu, &shd_w, f.shout, 1).map_err(Q4Error::Io)?;
-    op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n })?;
+    acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
+    op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
     Ok(())
 }
 

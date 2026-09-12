@@ -225,24 +225,30 @@ extern "C" __global__ void q4_l2_rows(float* x, float eps, int d) {
 }
 
 // hc 게이트 적용 + 스트림 평균: out[i] = Σ_s xn[s·n+i]·σ(gate[s·n+i]) / hc
-extern "C" __global__ void q4_hc_gate_mean(const float* xn, const float* gate, float* out, int hc, int n) {
+// total = t·n (토큰 배치) — 행 = 토큰.
+extern "C" __global__ void q4_hc_gate_mean(const float* xn, const float* gate, float* out, int hc, int n, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= total) return;
+    int ti = i / n;
+    int ii = i % n;
     float acc = 0.0f;
     for (int s = 0; s < hc; s++) {
-        int k = s * n + i;
+        int k = ti * hc * n + s * n + ii;
         acc += xn[k] * (1.0f / (1.0f + exp_cr(-gate[k])));
     }
     out[i] = acc / (float)hc;
 }
 
 // hc combine: res[s·n+i] += out[i]·2σ(inj[s]/hc)
-extern "C" __global__ void q4_hc_combine(float* res, const float* out, const float* inj, int hc, int n) {
+// total = t·n (토큰 배치) — inj는 토큰당 hc개.
+extern "C" __global__ void q4_hc_combine(float* res, const float* out, const float* inj, int hc, int n, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= total) return;
+    int ti = i / n;
+    int ii = i % n;
     for (int s = 0; s < hc; s++) {
-        float g = 2.0f / (1.0f + exp_cr(-inj[s] / (float)hc));
-        res[s * n + i] += out[i] * g;
+        float g = 2.0f / (1.0f + exp_cr(-inj[ti * hc + s] / (float)hc));
+        res[ti * hc * n + s * n + ii] += out[i] * g;
     }
 }
 
@@ -281,18 +287,22 @@ extern "C" __global__ void q4_norm_gated_sig(const float* o, const float* z, con
 // 동일 순서를 보장하는 것이 성능보다 중요하다.
 extern "C" __global__ void q4_moe_top10(const float* route, unsigned* ids, float* wt,
                                         int n_exp, int k_sel) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (threadIdx.x != 0) return;
+    int tok = blockIdx.x;
+    const float* rt = route + (size_t)tok * n_exp;
+    ids += (size_t)tok * k_sel;
+    wt += (size_t)tok * k_sel;
     float mx = -3.4028235e38f;
-    for (int e = 0; e < n_exp; e++) mx = fmaxf(mx, route[e]);
+    for (int e = 0; e < n_exp; e++) mx = fmaxf(mx, rt[e]);
     float zs = 0.0f;
-    for (int e = 0; e < n_exp; e++) zs += exp_cr(route[e] - mx);
+    for (int e = 0; e < n_exp; e++) zs += exp_cr(rt[e] - mx);
     // 삽입 정렬 — 후보를 인덱스 오름차순으로 넣고 "확률 이상" 뒤에 삽입(안정)
     int sel[64];          // k_sel ≤ 64 가정 (qwen4exp = 10)
     float sp[64];
     if (k_sel > 64) return;
     int cnt = 0;
     for (int e = 0; e < n_exp; e++) {
-        float p = exp_cr(route[e] - mx) / zs;
+        float p = exp_cr(rt[e] - mx) / zs;
         int pos = cnt;
         for (int j = 0; j < cnt; j++) {
             if (p > sp[j]) { pos = j; break; }
@@ -368,4 +378,37 @@ extern "C" __global__ void q4_gdn_ar_w(float* s, const float* q, const float* k,
             otot += __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
         if (lane == 0) out[v0 + u] = otot * scale;
     }
+}
+
+
+// MoE (t>1) — (토큰, 전문가) 페어 행 gather: xsel[(tok·k_sel+e)·n + i] = mix[tok·n + i]
+extern "C" __global__ void q4_moe_gather(const float* mix, float* xsel, int n, int k_sel, int t) {
+    long j = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)t * k_sel * n;
+    if (j >= total) return;
+    int ti = (int)(j / ((long)k_sel * n));
+    int i = (int)(j % n);
+    xsel[j] = mix[(long)ti * n + i];
+}
+
+// MoE (t>1) — 전문가 가중 합: out[tok·n + i] = Σ_e wt[tok·k_sel + e]·ys[(tok·k_sel+e)·n + i]
+extern "C" __global__ void q4_moe_scatter(const float* ys, const float* wt, float* out, int k_sel, int n, int t) {
+    long j = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)t * n;
+    if (j >= total) return;
+    int tok = (int)(j / n);
+    int i = (int)(j % n);
+    float acc = 0.0f;
+    for (int e = 0; e < k_sel; e++)
+        acc += wt[(size_t)tok * k_sel + e] * ys[((size_t)tok * k_sel + e) * n + i];
+    out[j] = acc;
+}
+
+
+
+// 토큰 배치 axpy: y[t·n_i + i] += x[...]·s[t]
+extern "C" __global__ void q4_axpy_scaled_t(float* y, const float* x, const float* s, int n, int per) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    y[j] = y[j] + x[j] * s[j / per];
 }

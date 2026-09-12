@@ -292,33 +292,72 @@ quoted only as a warning.
 
 ## qwen4exp — Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split
 
-| Metric | llama.cpp (PR #27742 runtime) | LLM170 (GPU) |
-|---|---|---|
-| Prefill pp, 2311 tok (single) | 178–237 t/s per slot (HIP 7.2.2; 2026-08-27) | **~3.3 t/s** (~699 s incl. load+decode; Vulkan, 2026-09-01 — token-exact 24/24) |
-| Decode tg16, real model | 11.6–15.1 t/s per slot (HIP 7.2.2) | value path **0.43 t/s** -> frame **2.87 t/s** (2026-09-02, 6.7x) |
+The engine ran qwen4exp CPU-only for a while: cubecl's removal (ADR-0018) took
+the only `Accelerator` implementation with it, so the recorded frame numbers
+became unreproducible. The GPU path was rebuilt on rawhip (plans/64) — a
+per-op value path for prefill plus a device-resident frame for decode.
 
-Decode-frame follow-up (2026-09-02): with the GPU-resident frame verified
-bit-exact on the synthetic e2e (frame == non-frame == CPU), the real model
-went tg16 0.43 -> 2.87 t/s and pp32 5.23 -> 6.01. The frame is now
-**default on** (`LLM170_FRAME=0` disables): the default path, no env vars,
-re-measured tg16 2.85 t/s / pp32 6.37. Same kernels as the value path,
-chained by handle — the host-glue-elimination thesis confirmed empirically.
-Remaining qwen4exp gap: the PLE gather and QSA dense attention still cross
-to values each step (not yet framed).
+| Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
+|---|---|---|---|
+| Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
+| Prefill pp32 / pp256 / pp512 | (server cells below) | 9.4-9.8 / 11.1 / 11.1 t/s | 1.77 t/s (pp32) |
+| Decode tg16 (ctx 4096, warm) | 15.70 t/s solo (7.2.2) | **10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
-Per-step decode breakdown before the frame (value path, `LLM170_Q4_TIME`,
-2026-09-01, after same-input projection grouping): MoE ~190 ms (was ~690 —
-expert gate/up grouped into one call, down as a paired batch), GDN ~126 ms
-(CPU recurrence; the GPU AR kernel landed after), HC ~55 ms, QSA ~18 ms.
-Host round-trips dropped from ~1,680/step to ~600/step; the frame takes
-that to ~14.
+Reference conditions (measured from the runtime logs, not this repo): llama-server,
+`-ngl all -ot per_layer_token_embd=CPU --load-mode mmap -fa on -b 1024 -ub 512`,
+np2 × 262144, ~11.75k-token prompts: pp 178-266 t/s per slot, tg 8.9-13.2 (8.9-15.7
+solo) on ROCm 7.2.2; pp 272-468 / tg 11.9-19.6 on ROCm 10 + master. **The earlier
+"Prefill pp, 2311 tok" row was a condition error**: the reference prompts are
+~11.75k tokens and the timings are server-slot, so the row was removed rather
+than patched.
 
-Runtime attribution note (corrected 2026-09-01): the qwen4exp infer path
-previously hardcoded the HIP runtime, so earlier "Vulkan" attributions were
-wrong; measurements after the fix are runtime-correct. The intermittent
-`Memory page N doesn't exist` fault was root-caused to a cubecl-runtime
-memory-sweep defect (page reindexing invalidating live handles) and patched
-locally — [decisions.md](decisions.md) ADR-0016.
+### What is on the GPU now (plans/64 P1)
+
+- **Value path** (`rawhip/q4acc.rs`): `matmul`/`matmul_batch`/`matmul_group`
+  (one activation upload + q8 quantize per group), `moe_down` (expert-stack
+  GEMM grouped by ids), `qsa_attention` (masked dense GQA bridge). Weights
+  upload once per mmap pointer and stay resident; bf16/f16 weights expand to
+  f32 on upload. New kernels: **q5_1** (25.2 GiB of expert-down weights had no
+  GPU kernel at all), **f32** (MoE router), masked **QSA attention**.
+- **Frame (decode)**: `Frame4`'s op set — 16 `FrameOp` variants plus
+  `frame_mm`/`frame_mm_group`/`frame_moe_gemm`/`frame_gdn_ar` — is implemented
+  on rawhip, so the decode step keeps activations and GDN state on the device
+  (kernels chained by handle, ~14 syncs/step instead of ~1300). New kernels:
+  `q4_rms`-family reuse, `q4_silu_div`, `q4_sigmoid`, `q4_scale`, `q4_l2_rows`,
+  `q4_hc_gate_mean`, `q4_hc_combine`, `q4_norm_gated_sig` (qwen4exp's sigmoid
+  z-gate), `q4_moe_top10`, `q4_moe_weighted_sum`, `q4_gdn_ar_w`.
+- **Loader**: `Model4::part_sources()` + pread staging. The mmap fault path
+  read at 20-180 MB/s; buffered pread reads the same file at 1.2 GB/s
+  (4.5 GB/s O_DIRECT ceiling), which is what makes the 35 s load possible
+  (llama.cpp needs a fork patch for the same reason).
+
+### Verification (2026-09-12)
+
+- Token streams: the GPU value path, the GPU frame path and the CPU W4A8
+  reference (`LLM170_W4A8=1`) agree token-for-token on the real model
+  (279 3516 4042 369 6312 11 414 707 13 1116 864, greedy, ctx 4096) and on the
+  tiny4 synthetic (frame == value == CPU-W4A8). tiny4's f32 CPU stream differs
+  by design — the GPU paths are the W4A8 numeric class, like the qwen35 raw
+  decoder.
+- `llm170 q4-acc-check <model> <tensor> [t] [rows]`: GPU vs the CPU W4A8 lane
+  mirror — q8_0 / q4_K / q5_1 **bit-identical**, bf16 / f32 ≤1.2e-7 (reduction
+  order only). This probe caught a real q5_1 defect (the high-bit mask already
+  carries the ×16 weight; the kernel shifted it a second time).
+- `llm170 q4-ar-check [t]`: the frame's GDN AR kernel vs `gdn_ar_batch` —
+  out rel 1.2e-5, state rel 2.6e-5 at production dims
+  (n_group 16 / dt_rank 48 / d_state 128) for t=1..3.
+
+### Open
+
+- **Prefill is the remaining gap** (11 t/s vs 178-266): the value path keeps
+  activations on the host, so pp512 spends 16.6 s in hc + 16.6 s in MoE +
+  11.2 s in GDN of a 45.6 s pass — host elementwise work and per-op transfers,
+  not GEMM. A frame-based prefill (`LLM170_FRAME_PREFILL=1`, opt-in) exists and
+  is token-correct for small chunks, but faults on long prompts (≥~260 tokens)
+  and is off by default.
+- Decode is 10.7 t/s against llama's 15.7 solo (0.68x): the remaining cost is
+  the per-layer round trips that the frame has not yet removed (QSA/PLE value
+  bridges, module-level launches).
 
 ## Known flake: vk spec==nonspec nondeterminism (2026-09-08)
 

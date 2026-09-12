@@ -338,6 +338,12 @@ pub enum FrameOp {
 /// 프레임 상태 연산 — 상주 상태(kv/gdn/conv/blk)를 갱신하는 가속기 전용
 /// 메서드. 값 경로 Accelerator 메서드와 대응하되 입출력이 전부 핸들.
 pub trait FrameState {
+    /// 프레임 forward 시작 — 이번 스텝의 토큰 수. 프레임 버퍼는 t_max 크기로
+    /// 잡히므로 "행 수 = 버퍼 길이/n" 유도가 t>1 청크에서 틀린다. op 커널이
+    /// 토큰 수를 알아야 하는 지점(RmsRows/HcGateMean/NormGated/L2Rows/top-k/
+    /// 가중합/split3)이 이 값을 쓴다.
+    fn frame_begin(&self, _t: usize) {}
+
     /// GDN AR 상태 갱신 (gdn_ar의 프레임 변형) — states·out 상주, 판독 없음.
     #[allow(clippy::too_many_arguments)]
     fn frame_gdn_ar(
@@ -373,6 +379,33 @@ pub trait FrameState {
     ) -> Result<(), String> {
         Err("frame_qsa_attention: 미지원".into())
     }
+    /// MoE (t>1) — (토큰,전문가) 페어 행 gather:
+    /// xsel[(tok·k_sel+e)·n + i] = mix[tok·n + i]. 기본 미지원.
+    fn frame_moe_gather(
+        &self,
+        _mix: u64,
+        _xsel: u64,
+        _n: usize,
+        _k_sel: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        Err("frame_moe_gather: 미지원".into())
+    }
+
+    /// MoE (t>1) — 전문가 가중 합(토큰별):
+    /// out[tok·n + i] = Σ_e wt[tok·k_sel+e]·ys[(tok·k_sel+e)·n + i]. 기본 미지원.
+    fn frame_moe_scatter(
+        &self,
+        _ys: u64,
+        _wt: u64,
+        _out: u64,
+        _k_sel: usize,
+        _n: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        Err("frame_moe_scatter: 미지원".into())
+    }
+
     /// MoE ids 구동 배치 GEMM — x 상주, ids 상주(GPU top10 출력 직결).
     /// stack은 전문가 스택 전체 뷰. outs는 [k_sel·n_out] 단일 프레임.
     fn frame_moe_gemm(
@@ -382,6 +415,7 @@ pub trait FrameState {
         _ids: u64,
         _out: u64,
         _n_expert_stack: usize,
+        _k_sel: usize,
     ) -> Result<(), String> {
         Err("frame_moe_gemm: 미지원".into())
     }
