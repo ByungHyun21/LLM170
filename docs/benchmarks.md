@@ -2869,3 +2869,11 @@ Gates after the change: judge **16/19 PASS** (all 10 spec cases, same 3 long-con
 near-ties as before), VL gate **4/5 PASS** (one semantic WARN: our 24-token answer starts
 in a `<think>` block), and `llm170 check` full pass (866 tensors, GPU<->CPU GEMM
 cross-validation intact - the attention's segment split was never part of that contract).
+
+## Verification-tooling fix: LLM170_REQUIRE_GPU (2026-09-12)
+
+Twice today a "bit-identical" verification run was actually the **CPU fallback**: when
+any kernel source fails to compile, `inject_rawhip` fails and `infer` (unlike `bench`,
+which was hardened earlier) continues on the CPU engine, so the CPU reference stream
+matched itself. `infer` now honours `LLM170_REQUIRE_GPU=1` and returns an error instead
+of falling back; all the verification claims in this file were re-run with it.
