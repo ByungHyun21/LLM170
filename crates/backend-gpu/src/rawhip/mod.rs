@@ -1691,6 +1691,60 @@ pub fn roof_test() -> Result<String, String> {
 /// MMQ 포트 A/B — bt vs mm (각 미러).
 pub fn launch_probe() -> Result<String, String> {
     let ctx = RawCtx::new()?;
+    // 디코드 소형 커널의 실제 런치 비용 (트레이스 페어링 무관, 직접 계측).
+    {
+        let n = 5120usize;
+        let xb = ctx.alloc(n * 4)?;
+        let wb = ctx.alloc(n * 4)?;
+        let qb = ctx.alloc(n / 4 + n / 32 + n / 16 + 64)?;
+        let mut xp0 = xb as *mut std::ffi::c_void;
+        let mut wp0 = wb as *mut std::ffi::c_void;
+        let mut qp0 = qb as *mut std::ffi::c_void;
+        let mut eps0 = 1e-6f32;
+        let mut na0 = n as i32;
+        let mut a0: Vec<*mut std::ffi::c_void> = vec![
+            &mut xp0 as *mut _ as *mut std::ffi::c_void, &mut wp0 as *mut _ as *mut std::ffi::c_void,
+            &mut qp0 as *mut _ as *mut std::ffi::c_void, &mut eps0 as *mut _ as *mut std::ffi::c_void,
+            &mut na0 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let mut s0 = String::new();
+        for (label, blk) in [("rmsq n=512", 160u32), ("rmsq n=5120", 512u32), ("rmsq n=20480", 640u32)] {
+            let nv: i32 = match label { "rmsq n=512" => 512, "rmsq n=5120" => 5120, _ => 20480 };
+            na0 = nv;
+            for _ in 0..20 { let _ = ctx.launch("rmsq", 1, 1, blk, &mut a0); }
+            ctx.sync()?;
+            let n2 = 2000usize;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n2 { let _ = ctx.launch("rmsq", 1, 1, blk, &mut a0); }
+            ctx.sync()?;
+            s0.push_str(&format!("{label}: {:.2}us  ", t0.elapsed().as_secs_f64() * 1e6 / n2 as f64));
+        }
+        eprintln!("{s0}");
+        // 기준선: 자명한 커널(axpy_scaled)의 런치 비용 — n 크기별
+        let ab = ctx.alloc(5120 * 4)?;
+        let bb = ctx.alloc(5120 * 4)?;
+        let cb = ctx.alloc(5120 * 4)?;
+        let mut ap = ab as *mut std::ffi::c_void;
+        let mut bp = bb as *mut std::ffi::c_void;
+        let mut cp = cb as *mut std::ffi::c_void;
+        let mut nn = 64i32;
+        let mut a2: Vec<*mut std::ffi::c_void> = vec![
+            &mut ap as *mut _ as *mut std::ffi::c_void, &mut bp as *mut _ as *mut std::ffi::c_void,
+            &mut cp as *mut _ as *mut std::ffi::c_void, &mut nn as *mut _ as *mut std::ffi::c_void,
+        ];
+        let mut s1 = String::new();
+        for (label, nval, gx) in [("axpy n=64 1blk", 64i32, 1u32), ("axpy n=5120 80blk", 5120, 80)] {
+            nn = nval;
+            for _ in 0..20 { let _ = ctx.launch3("axpy_scaled", gx, 1, 1, 64, &mut a2); }
+            ctx.sync()?;
+            let n2 = 2000usize;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n2 { let _ = ctx.launch3("axpy_scaled", gx, 1, 1, 64, &mut a2); }
+            ctx.sync()?;
+            s1.push_str(&format!("{label}: {:.2}us  ", t0.elapsed().as_secs_f64() * 1e6 / n2 as f64));
+        }
+        eprintln!("{s1}");
+    }
     let mut xp = ctx.alloc(256)?; let mut op = ctx.alloc(256)?; let mut sp = ctx.alloc(256)?;
     let mut nn = 64i32;
     let mut args: Vec<*mut std::ffi::c_void> = vec![

@@ -612,17 +612,32 @@ extern "C" __global__ void l2_rows2_scale(float* gq, float* gk, float eps, float
     int tb = y * n_group * d;
     int xb = is_q ? tb + x * d : tb + (x - n_group) * d;
     float* g = is_q ? gq : gk;
-    float sum = 0.0f;  // 순차 f32 — 미러 l2_norm과 쌍
-    for (int i = 0; i < d; i++) {
-        float dv = g[xb + i];
-        sum += dv * dv;
+    // 순차 f32 합 순서는 미러 계약 — 가산 순서 불변, 로드만 4개 선행.
+    float sum = 0.0f;
+    {
+        int i = 0;
+        for (; i + 3 < d; i += 4) {
+            float a0 = g[xb + i], a1 = g[xb + i + 1], a2 = g[xb + i + 2], a3 = g[xb + i + 3];
+            sum += a0 * a0;
+            sum += a1 * a1;
+            sum += a2 * a2;
+            sum += a3 * a3;
+        }
+        for (; i < d; i++) { float dv = g[xb + i]; sum += dv * dv; }
     }
     float scale32 = sqrtf(sum);
     float inv = 1.0f / fmaxf(scale32, eps);
-    if (is_q) {
-        for (int i = 0; i < d; i++) g[xb + i] = g[xb + i] * inv;
-    } else {
-        for (int i = 0; i < d; i++) g[xb + i] = g[xb + i] * inv;
+    // 스케일 패스는 원소별 — 읽기 4개 선행 후 순서대로 곱/쓰기 (산술 불변).
+    {
+        int i = 0;
+        for (; i + 3 < d; i += 4) {
+            float a0 = g[xb + i], a1 = g[xb + i + 1], a2 = g[xb + i + 2], a3 = g[xb + i + 3];
+            g[xb + i] = a0 * inv;
+            g[xb + i + 1] = a1 * inv;
+            g[xb + i + 2] = a2 * inv;
+            g[xb + i + 3] = a3 * inv;
+        }
+        for (; i < d; i++) g[xb + i] = g[xb + i] * inv;
     }
 }
 // KV append 배치 — gy=t, 고정 src 행 → 캐시 pos0+y 행.

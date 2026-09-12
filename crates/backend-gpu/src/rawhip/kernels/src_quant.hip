@@ -136,7 +136,17 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
         int hi = min(lo + chunk, n);
         float acc = 0.0f;
         if (lo < n) {
-            for (int i = lo; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
+            // 로드 4개 선행 후 가산은 원소 순서 그대로 — 합 순서 불변(계약),
+            // 로드 지연만 숨긴다 (직렬 load→add→load 체인의 3cycle/원소 제거).
+            int i = lo;
+            for (; i + 3 < hi; i += 4) {
+                float a0 = x[i], a1 = x[i + 1], a2 = x[i + 2], a3 = x[i + 3];
+                acc += a0 * a0;
+                acc += a1 * a1;
+                acc += a2 * a2;
+                acc += a3 * a3;
+            }
+            for (; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
         }
         part[u] = (double)acc;
     }

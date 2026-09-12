@@ -2877,3 +2877,23 @@ any kernel source fails to compile, `inject_rawhip` fails and `infer` (unlike `b
 which was hardened earlier) continues on the CPU engine, so the CPU reference stream
 matched itself. `infer` now honours `LLM170_REQUIRE_GPU=1` and returns an error instead
 of falling back; all the verification claims in this file were re-run with it.
+
+## Decode small kernels: batched loads on the serial chains (+1.5%, bit-exact)
+
+Direct launch micro-benchmark (new `launch-probe` case, no trace pairing): the platform's
+baseline launch cost is **2.0 us** (`axpy_scaled`, any n), while `rmsq` measured
+5.1/11.7/33.9 us at n=512/5120/20480 - i.e. it scales at ~1.4 ns per element (about
+3 cycles), a *serial load->add chain*, not launch overhead. Batching four loads ahead of
+a chain whose add order must stay pinned to the CPU mirror is bit-exact and removes it:
+
+| kernel | fix | effect |
+|---|---|---|
+| `rmsq` sum loop | 4 loads ahead, adds still element-ordered | 11.7 -> 8.1 us per call (n=5120), 33.9 -> 19.6 us (n=20480); A/B tg **+0.63%** (11.12 -> 11.18) |
+| `l2_rows2_scale` sum + scale pass | same, both loops (x2 blocks) | A/B tg **+0.85%** (11.17 -> 11.27), pp +0.6% |
+| `gatedq` quant phase | float4 loads + tree amax (exactly equivalent) | **neutral** (11.28 -> 11.28) - reverted |
+
+Both adopted changes are bit-identical (verified with `LLM170_REQUIRE_GPU=1`, GPU path
+confirmed), and spec == non-spec still holds. Two further findings: the fix only helps
+where the *chain* is the cost (rmsq/l2 sums), not where loads are already batched or the
+work is trivial, and `gdn_ar_w`'s 26 us for ~0.1 us of actual arithmetic remains
+unexplained (a warp-per-block kernel whose cost is unaffected by this pattern).
