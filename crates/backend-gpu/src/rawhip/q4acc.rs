@@ -694,6 +694,76 @@ impl llm170_core::matmul::FrameState for Q4Acc {
     }
 }
 
+impl Q4Acc {
+    /// q4_qsa_attn 커널 런치 본체 — 가드 없음(격리 프로브·진단 전용).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attn_raw(
+        &self,
+        q: &[f32],
+        ck: &[f32],
+        cv: &[f32],
+        mask: &[u32],
+        kq_scale: f32,
+        n_past: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        let (qdev, kdev, vdev, mdev, odev) = {
+            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
+            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
+            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
+            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
+            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let mdev = d.ensure(&self.ctx, mask.len() * 4)?;
+            let mut e2 = self.atn.lock().map_err(|e| e.to_string())?;
+            let odev = e2.ensure(&self.ctx, t * n_head * hd * 4)?;
+            (qdev, kdev, vdev, mdev, odev)
+        };
+        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
+        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
+        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        self.ctx.h2d(mdev, bytemuck::cast_slice(mask))?;
+        let mut q_p = qdev as *mut std::ffi::c_void;
+        let mut k_p = kdev as *mut std::ffi::c_void;
+        let mut v_p = vdev as *mut std::ffi::c_void;
+        let mut m_p = mdev as *mut std::ffi::c_void;
+        let mut o_p = odev as *mut std::ffi::c_void;
+        let mut sc = kq_scale;
+        let mut np_ = n_past as i32;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut m_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut np_) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx
+            .launch3("q4_qsa_attn", t as u32, n_head as u32, 1, 256, &mut args)?;
+        let mut out = vec![0.0f32; t * n_head * hd];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
+        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+            let bad = out.iter().filter(|v| !v.is_finite()).count();
+            let badq = q.iter().filter(|v| !v.is_finite()).count();
+            eprintln!("# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}", out.len());
+        }
+        Ok(out)
+    }
+}
+
 impl llm170_core::matmul::Accelerator for Q4Acc {
     fn barrier(&self) {
         unsafe {
@@ -858,62 +928,15 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         hd: usize,
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        // 커널 결함(2026-09-12): t>128에서 비유한 출력이 섞인다(7498/25600 실측).
-        // 값 경로 브리지는 CPU 폴백이 정답이므로 명시적으로 미지원을 알린다.
-        if t > 128 {
-            return Err(format!("q4acc: qsa_attention t={t} > 128 미지원(커널 결함, CPU 폴백)"));
+        // t>128 가드 해제(2026-09-13): q4-qsa-check 프로브로 커널이 t=129·200·
+        // 512(n_past 512)에서 CPU 미러와 일치함을 확인(최대 2e-5). 기존 가드는
+        // 폴백을 유발했지만 호출자(qsa.rs)의 Err 경로가 CPU 재계산 없이 **빈
+        // 어텐션 행**을 반환해 어텐션 자체가 누락됐다(양 경로 동일 → 자가일치
+        // 검사가 통과). 유일한 강제 폴백: LLM170_QSA_CPU=1.
+        if std::env::var_os("LLM170_QSA_CPU").is_some() {
+            return Err(format!("q4acc: qsa_attention t={t} CPU 강제(LLM170_QSA_CPU)"));
         }
-        let (qdev, kdev, vdev, mdev, odev) = {
-            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
-            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
-            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
-            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
-            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
-            let mdev = d.ensure(&self.ctx, mask.len() * 4)?;
-            let mut e2 = self.atn.lock().map_err(|e| e.to_string())?;
-            let odev = e2.ensure(&self.ctx, t * n_head * hd * 4)?;
-            (qdev, kdev, vdev, mdev, odev)
-        };
-        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
-        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
-        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
-        self.ctx.h2d(mdev, bytemuck::cast_slice(mask))?;
-        let mut q_p = qdev as *mut std::ffi::c_void;
-        let mut k_p = kdev as *mut std::ffi::c_void;
-        let mut v_p = vdev as *mut std::ffi::c_void;
-        let mut m_p = mdev as *mut std::ffi::c_void;
-        let mut o_p = odev as *mut std::ffi::c_void;
-        let mut sc = kq_scale;
-        let mut np_ = n_past as i32;
-        let mut nh = n_head as i32;
-        let mut nk = n_kv as i32;
-        let mut h = hd as i32;
-        let mut tt = t as i32;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut m_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut sc) as *mut _ as *mut std::ffi::c_void,
-            (&mut np_) as *mut _ as *mut std::ffi::c_void,
-            (&mut nh) as *mut _ as *mut std::ffi::c_void,
-            (&mut nk) as *mut _ as *mut std::ffi::c_void,
-            (&mut h) as *mut _ as *mut std::ffi::c_void,
-            (&mut tt) as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.ctx
-            .launch3("q4_qsa_attn", t as u32, n_head as u32, 1, 256, &mut args)?;
-        let mut out = vec![0.0f32; t * n_head * hd];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
-        if std::env::var_os("LLM170_Q4_DBG").is_some() {
-            let bad = out.iter().filter(|v| !v.is_finite()).count();
-            let badq = q.iter().filter(|v| !v.is_finite()).count();
-            eprintln!("# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}", out.len());
-        }
-        Ok(out)
+        self.qsa_attn_raw(q, ck, cv, mask, kq_scale, n_past, n_head, n_kv, hd, t)
     }
 
     // ─── 프레임(활성화 GPU 상주) — plans/64 P1 ───
@@ -1072,12 +1095,15 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 let mut tt = total as i32;
                 self.kop("q4_hc_gate_mean", (total as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut xp, &mut gp, &mut op_, &mut h, &mut nn, &mut tt))
             }
-            O::HcCombine { res, out, inj, hc, n, total } => {
+            O::HcCombine { res, out, inj, hc, n, total: _ } => {
+                // 커널은 (토큰,차원)당 1스레드 — op의 total(=hc·n·t)을 범위로 쓰면
+                // hc배만큼 범위 밖을 쓴다(실측: hc>1에서 폴트). n·t를 쓴다.
                 let (mut rp, mut op_, mut ip) = (self.fptr(res)?, self.fptr(out)?, self.fptr(inj)?);
+                let tn = n * self.t_cur();
                 let mut h = hc as i32;
                 let mut nn = n as i32;
-                let mut tt = total as i32;
-                self.kop("q4_hc_combine", (total as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut rp, &mut op_, &mut ip, &mut h, &mut nn, &mut tt))
+                let mut tt = tn as i32;
+                self.kop("q4_hc_combine", (tn as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut rp, &mut op_, &mut ip, &mut h, &mut nn, &mut tt))
             }
             O::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
                 let (mut sp, mut a0, mut a1, mut a2) = (
@@ -1301,6 +1327,170 @@ pub fn ar_check_t(t: usize) -> Result<String, String> {
         o_cpu[0],
         o_gpu[0],
         rel(&st_gpu, &st_cpu)
+    ))
+}
+
+/// `q4-qsa-check [t] [n_past]` — q4_qsa_attn GPU ↔ CPU 미러(합성 Q/K/V·마스크).
+/// t>128 결함(오답)의 원인을 좁히기 위한 격리 하네스.
+pub fn qsa_check(t: usize, n_past: usize) -> Result<String, String> {
+    use llm170_core::ops::exp_cr;
+    let (n_head, n_kv, hd) = (24usize, 2usize, 256usize);
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    // 인과 + 블록 스파스 마스크: 위치 p는 (tok, p)가 허용될 때만 1.
+    let total = n_past;
+    let q: Vec<f32> = (0..t * n_head * 2 * hd).map(|_| lcg()).collect();
+    let ck: Vec<f32> = (0..total * n_kv * hd).map(|_| lcg()).collect();
+    let cv: Vec<f32> = (0..total * n_kv * hd).map(|_| lcg()).collect();
+    let mut mask = vec![0u32; t * n_past];
+    let base = n_past - t; // 이 배치 이전 위치 수
+    for tok in 0..t {
+        for p in 0..n_past {
+            // 인과: p <= base+tok. 스파스: 4토큰 블록당 최근 2블록만 남기는 흉내.
+            let causal = p <= base + tok;
+            let blk = p / 4;
+            let cur = (base + tok) / 4;
+            let keep = blk + 2 > cur;
+            mask[tok * n_past + p] = if causal && keep { 1 } else { 0 };
+        }
+    }
+    let kq_scale = 1.0f32;
+    let acc = Q4Acc::new()?;
+    let gpu = acc.qsa_attn_raw(&q, &ck, &cv, &mask, kq_scale, n_past, n_head, n_kv, hd, t)?;
+    // CPU 미러 (core stages::qsa_attention과 같은 산술 구조).
+    let mut cpu = vec![0.0f32; t * n_head * hd];
+    for tok in 0..t {
+        for h in 0..n_head {
+            let kvh = h / (n_head / n_kv);
+            let qh = &q[(tok * n_head + h) * 2 * hd..(tok * n_head + h) * 2 * hd + hd];
+            let gate = &q[(tok * n_head + h) * 2 * hd + hd..(tok * n_head + h) * 2 * hd + 2 * hd];
+            let mut m = f32::NEG_INFINITY;
+            let mut sc = vec![f32::NEG_INFINITY; n_past];
+            for p in 0..n_past {
+                if mask[tok * n_past + p] == 0 {
+                    continue;
+                }
+                let k = &ck[p * n_kv * hd + kvh * hd..p * n_kv * hd + kvh * hd + hd];
+                let mut s = 0.0f32;
+                for i in 0..hd {
+                    s += qh[i] * k[i];
+                }
+                s *= kq_scale;
+                sc[p] = s;
+                m = m.max(s);
+            }
+            let mut l = 0.0f32;
+            let mut a = [0.0f32; 256];
+            for p in 0..n_past {
+                if sc[p] == f32::NEG_INFINITY {
+                    continue;
+                }
+                let e = exp_cr(sc[p] - m);
+                l += e;
+                let v = &cv[p * n_kv * hd + kvh * hd..p * n_kv * hd + kvh * hd + hd];
+                for i in 0..hd {
+                    a[i] += e * v[i];
+                }
+            }
+            for i in 0..hd {
+                let o = if l > 0.0 { a[i] / l } else { 0.0 };
+                cpu[(tok * n_head + h) * hd + i] = o * (1.0 / (1.0 + exp_cr(-gate[i])));
+            }
+        }
+    }
+    let mut nz = 0usize;
+    let mut maxrel = 0.0f64;
+    let mut nonfinite = 0usize;
+    for (i, (&a, &b)) in gpu.iter().zip(&cpu).enumerate() {
+        if !a.is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        let d = ((a - b).abs() as f64) / (b.abs().max(1e-3) as f64);
+        if d > 1e-3 {
+            nz += 1;
+            if nz <= 3 {
+                let tok = i / (n_head * hd);
+                let h = (i / hd) % n_head;
+                let dim = i % hd;
+                eprintln!("# qsa diff #{nz} tok={tok} h={h} dim={dim} gpu={a} cpu={b}");
+            }
+        }
+        maxrel = maxrel.max(d);
+    }
+    Ok(format!(
+        "q4-qsa-check t={t} n_past={n_past}: nonfinite={nonfinite} mismatch={nz}/{} maxrel={maxrel:.3e}",
+        gpu.len()
+    ))
+}
+
+/// `q4-hc-check [t] [n] [hc]` — 프레임 HC op(HcGateMean/HcCombine) 격리 검증.
+/// 합성 입력으로 GPU ↔ CPU 미러를 대조하고, 폴트 여부를 직접 보고한다.
+pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
+    use llm170_core::matmul::{Accelerator, FrameOp, FrameState};
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let acc = Q4Acc::new()?;
+    let hxn = acc.frame_alloc(t * hc * n)?;
+    let hgate = acc.frame_alloc(t * hc * n)?;
+    let hmix = acc.frame_alloc(t * n)?;
+    let hres = acc.frame_alloc(t * hc * n)?;
+    let hout = acc.frame_alloc(t * n)?;
+    let hinj = acc.frame_alloc(t * hc)?;
+    let xn: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+    let gate: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+    let res0: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+    let out: Vec<f32> = (0..t * n).map(|_| lcg()).collect();
+    let inj: Vec<f32> = (0..t * hc).map(|_| lcg()).collect();
+    acc.frame_write(hxn, &xn)?;
+    acc.frame_write(hgate, &gate)?;
+    acc.frame_write(hres, &res0)?;
+    acc.frame_write(hout, &out)?;
+    acc.frame_write(hinj, &inj)?;
+    acc.frame_begin(t);
+    acc.frame_op(&FrameOp::HcGateMean { xn: hxn, gate: hgate, out: hmix, hc, n })?;
+    acc.frame_op(&FrameOp::HcCombine { res: hres, out: hout, inj: hinj, hc, n, total: hc * n * t })?;
+    let mut mix_gpu = vec![0.0f32; t * n];
+    acc.frame_read(hmix, &mut mix_gpu)?;
+    let mut res_gpu = vec![0.0f32; t * hc * n];
+    acc.frame_read(hres, &mut res_gpu)?;
+    // CPU 미러
+    let sig = |x: f32| 1.0f32 / (1.0 + llm170_core::ops::exp_cr(-x));
+    let mut mix_cpu = vec![0.0f32; t * n];
+    for ti in 0..t {
+        for i in 0..n {
+            let mut a = 0.0f32;
+            for s in 0..hc {
+                let k = ti * hc * n + s * n + i;
+                a += xn[k] * sig(gate[k]);
+            }
+            mix_cpu[ti * n + i] = a / hc as f32;
+        }
+    }
+    let mut res_cpu = res0.clone();
+    for ti in 0..t {
+        for i in 0..n {
+            for s in 0..hc {
+                res_cpu[ti * hc * n + s * n + i] += out[ti * n + i] * 2.0 * sig(inj[ti * hc + s] / hc as f32);
+            }
+        }
+    }
+    let rel = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| ((x - y).abs() as f64) / (y.abs().max(1e-3) as f64))
+            .fold(0.0f64, f64::max)
+    };
+    Ok(format!(
+        "q4-hc-check t={t} n={n} hc={hc}: mix rel={:.3e} res rel={:.3e}",
+        rel(&mix_gpu, &mix_cpu),
+        rel(&res_gpu, &res_cpu)
     ))
 }
 

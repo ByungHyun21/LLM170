@@ -12,6 +12,17 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "q4-qsa-check" => {
+            let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(200usize);
+            let np = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(200usize);
+            llm170_backend_gpu::rawhip::q4acc::qsa_check(t, np)
+        }
+        "q4-hc-check" => {
+            let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(230usize);
+            let n = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(2560usize);
+            let hc = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4usize);
+            llm170_backend_gpu::rawhip::q4acc::hc_check(t, n, hc)
+        }
         "q4-ar-check" => {
             let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(1usize);
             llm170_backend_gpu::rawhip::q4acc::ar_check_t(t)

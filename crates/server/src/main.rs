@@ -67,6 +67,7 @@ fn main() -> ExitCode {
     }
     let _ = log::set_logger(&EL);
     log::set_max_level(log::LevelFilter::Error);
+    let args: Vec<String> = std::env::args().skip(1).collect();
     // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
     // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
     // 런만 희생되게 한다 (무권한으로는 보호 불가 — 우선순위 이동만 가능).
@@ -81,7 +82,6 @@ fn main() -> ExitCode {
         // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
         unsafe { std::env::set_var("LLM170_FRAME", "1") };
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(cmd) = args.first().map(String::as_str) {
         if let Some(code) = probes::run(cmd, &args[1..]) {
             return code;
