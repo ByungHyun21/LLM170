@@ -11,8 +11,10 @@
 //! | cmp-stock | CMP 170HX 스톡 (40GiB HBM2, 스로틀) | 36GiB | 512 |
 //! | cmp-unlocked | CMP 170HX 언락 (40→64GiB) | 36GiB | 1024 |
 //!
-//! 커널 변형(cmp-stock: half2/BF16 벡터·INT32 경로, tensor core·FMA 금지)은
-//! cubecl 커널 세트가 갖춰질 때 이 enum을 분기 키로 사용한다.
+//! 라우팅 범위(현재): 가중치 상주 예산 · 프리필 청크 · **디바이스 상주 경로
+//! (프레임) 기본값**. 커널 변형(cmp-stock: half2/BF16 벡터·INT32 경로,
+//! tensor core·FFMA 금지 — docs/hardware/cmp170hx.md)은 이 enum을 분기 키로
+//! 두고 백엔드 커널 세트가 갖춰질 때 추가한다.
 
 /// 실행 모드 — 빌드 feature 아님 (단일 바이너리, 런타임 플래그).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

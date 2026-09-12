@@ -105,12 +105,17 @@ impl Q4Timings {
 }
 
 /// 프레임 버퍼의 토큰 상한 — 프리필 청크와 동일(디코드 t=1 포함).
+/// 512 상한: t_max 버퍼는 청크에 비례하고(≈0.8 GB @512), 1024는 실측
+/// hipMalloc OOM이었다. 값 경로 청크(1024)와 독립.
+const FRAME_T_MAX: usize = 512;
+
 fn frame_t_max() -> usize {
     std::env::var("LLM170_Q4_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024)
         .clamp(16, 1024)
+        .min(FRAME_T_MAX)
 }
 
 impl Engine4 {
@@ -278,7 +283,7 @@ impl Engine4 {
     /// 1024토큰 청크로 분할 — 단일 초대형 forward는 libamdhip64 GPF 트리거
     /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
-        // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024).
+        // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024; 프레임 경로는 t_max 상한).
         let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -299,13 +304,15 @@ impl Engine4 {
                 }
             }
         }
-        // 프레임(디바이스 상주) 프리필 — 옵트인 (LLM170_FRAME_PREFILL=1).
-        // 짧은 청크는 토큰 정확이 검증됐고, 긴 프롬프트(≥~260토큰)는 폴트가
-        // 남아 있어 기본 off (plans/64 P2).
+        // 프레임(디바이스 상주) 프리필 — 기본 on (끄기: LLM170_FRAME_PREFILL=0).
+        // 토큰 계약 검증: 230@512·300@128(3청크)·512 모두 값 경로와 일치.
+        // pp512 36.8 t/s = 값 경로(11.2)의 3.3배.
         let frame_on = self.acc.is_some()
             && !self.frame_broken
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v == "1").unwrap_or(false);
+            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        // 프레임 버퍼(t_max)보다 큰 청크는 범위를 넘는다 — 프레임 경로는 청크를 묶는다.
+        let chunk = if frame_on { chunk.min(FRAME_T_MAX) } else { chunk };
         if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {

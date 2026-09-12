@@ -8,6 +8,61 @@ use crate::matmul::Accelerator;
 use crate::ops::{rms_norm, rope_head, sigmoid};
 use llm170_profiler::profile_span;
 
+    /// 토큰 1개의 CPU 마스크드 GQA + 게이트 — 루프 본문과 GPU 실패 폴백이 공용.
+    /// 수치 경로는 원문 그대로(이동만).
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_attn_row(
+        attn_out: &mut [f32],
+        q_t: &[f32],
+        mask_t: &[bool],
+        n_past: usize,
+        cache_k: &[f32],
+        cache_v: &[f32],
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        kq_scale: f32,
+    ) {
+        for h in 0..n_head {
+            let kvh = h / (n_head / n_kv);
+            let mut maxv = f32::NEG_INFINITY;
+            let mut scores = vec![0.0f32; n_past];
+            for (p, sc) in scores.iter_mut().enumerate() {
+                if !mask_t[p] {
+                    *sc = f32::NEG_INFINITY;
+                    continue;
+                }
+                let b = p * n_kv * hd + kvh * hd;
+                let mut d = 0.0f32;
+                for i in 0..hd {
+                    d += q_t[h * 2 * hd + i] * cache_k[b + i];
+                }
+                *sc = d * kq_scale;
+                maxv = maxv.max(*sc);
+            }
+            let mut sum = 0.0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - maxv).exp();
+                sum += *sc;
+            }
+            let ob = h * hd;
+            for (p, sc) in scores.iter().enumerate() {
+                let w = sc / sum;
+                if w == 0.0 {
+                    continue;
+                }
+                let b = p * n_kv * hd + kvh * hd;
+                for i in 0..hd {
+                    attn_out[ob + i] += w * cache_v[b + i];
+                }
+            }
+            let gb = h * 2 * hd + hd;
+            for i in 0..hd {
+                attn_out[ob + i] *= sigmoid(q_t[gb + i]);
+            }
+        }
+    }
+
     /// QSA층 — 인덱서 top-k 마스크 게이트드 GQA.
     pub fn qsa_layer(
         ctx: &Ctx,
@@ -170,44 +225,10 @@ use llm170_profiler::profile_span;
                 continue;
             }
             let mut attn_out = std::mem::take(&mut attn_all[t]);
-            for h in 0..n_head {
-                let kvh = h / (n_head / n_kv);
-                let mut maxv = f32::NEG_INFINITY;
-                let mut scores = vec![0.0f32; n_past];
-                for (p, sc) in scores.iter_mut().enumerate() {
-                    if !mask_all[t][p] {
-                        *sc = f32::NEG_INFINITY;
-                        continue;
-                    }
-                    let b = p * n_kv * hd + kvh * hd;
-                    let mut d = 0.0f32;
-                    for i in 0..hd {
-                        d += qg[t][h * 2 * hd + i] * cache_k[b + i];
-                    }
-                    *sc = d * kq_scale;
-                    maxv = maxv.max(*sc);
-                }
-                let mut sum = 0.0f32;
-                for sc in scores.iter_mut() {
-                    *sc = (*sc - maxv).exp();
-                    sum += *sc;
-                }
-                let ob = h * hd;
-                for (p, sc) in scores.iter().enumerate() {
-                    let w = sc / sum;
-                    if w == 0.0 {
-                        continue;
-                    }
-                    let b = p * n_kv * hd + kvh * hd;
-                    for i in 0..hd {
-                        attn_out[ob + i] += w * cache_v[b + i];
-                    }
-                }
-                let gb = h * 2 * hd + hd;
-                for i in 0..hd {
-                    attn_out[ob + i] *= sigmoid(qg[t][gb + i]);
-                }
-            }
+            cpu_attn_row(
+                &mut attn_out, &qg[t], &mask_all[t], n_past, cache_k, cache_v,
+                n_head, n_kv, hd, kq_scale,
+            );
             attn_all[t] = attn_out;
         }
         // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
@@ -241,7 +262,21 @@ use llm170_profiler::profile_span;
                         if std::env::var_os("LLM170_Q4_NOFAST").is_none() {
                             eprintln!("# qsa: GPU 어텐션 폴백 ({e})");
                         }
+                        // 폴백은 실제로 CPU 재계산을 해야 한다 — 이전 구현은
+                        // 행을 빈 채로 두어 12개 QSA 층의 어텐션이 조용히
+                        // 누락됐다(2026-09-13 발견: 프레임==값 자가일치 통과).
                         cpu_attn = true;
+                        for (t, row) in attn_all.iter_mut().enumerate() {
+                            let n_past = (pos0 as usize) + t + 1;
+                            let mask_t = mask_all[t].clone();
+                            let q_t = qg[t].clone();
+                            let mut attn_out = std::mem::take(row);
+                            cpu_attn_row(
+                                &mut attn_out, &q_t, &mask_t, n_past, &ck, &cv,
+                                n_head, n_kv, hd, kq_scale,
+                            );
+                            *row = attn_out;
+                        }
                     }
                 }
             }
