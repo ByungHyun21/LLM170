@@ -3018,3 +3018,24 @@ projections but the host-side work - dequantising the token embeddings into `tok
 and uploading them (10.5 MB per chunk, a second pass over the same embeddings the main
 model already dequantised and uploaded). Optimising that needs the embedding lookup to
 happen on the device from token ids, which is the documented next step for this 0.5% gap.
+
+## MTP prefill, second attempt: device embedding lookup (rejected, 2026-09-12)
+
+The MTP prefill's remaining ~13 ms/chunk of host-side cost is the `tok_flat` path:
+the caller dequantises the token embeddings to f32 and uploads t x n x 4 B (10.5 MB per
+512-token chunk) *a second time* - the main prefill already built that matrix from the
+same GGUF rows. A device kernel (`embd_rows_q4k`, mirroring the host `deq_q4_k` exactly)
+plus an int32 id array (2 KB/chunk) would remove it.
+
+Rejected on the trade, not on the implementation: `token_embd.weight` is not in the
+decoder's injected weight map (`weight 없음: token_embd.weight`), because the GPU never
+needs it today - adding it means a **+682 MB** persistent upload/VRAM residency to win
+~0.5% of pp512 in spec mode. The measured MTP-mode pp is 341.8 vs llama's 341.8 t/s
+(0.995x), and this path is the only way to recover it, so the gap stays documented rather
+than paid for.
+
+Both remaining gaps are now fully characterised with their costs:
+- base tg 0.980x: the decode attention's 1.46 ms/token is frozen by the verify bit-contract
+  (see the previous section) - accessible only by rewriting the decode *and* verify
+  attention kernels together;
+- MTP pp 0.995x: needs the +682 MB embedding residency above.
