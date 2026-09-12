@@ -411,6 +411,7 @@ pub fn frame_forward(
         if il == 0 {
         }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
+        sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
         if il == 0 {
         }
     }
@@ -474,14 +475,19 @@ fn hc_mix_frame(
 ) -> Result<(), Q4Error> {
     let w_norm = f.consts[&format!("blk.{il}.hc_{kind}_norm")];
     op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.xn, eps, n, w_reps: hc })?;
+    sync_mark(acc, "hc.rms", f.xn)?;
     let w_down = model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
     let w_inject = model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
     acc.frame_mm_group(f.xn, &[w_down, w_inject], &[f.lo, f.inj], t)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "hc.down", f.lo)?;
     op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len * t })?;
+    sync_mark(acc, "hc.silu", f.lo)?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
     acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
+    sync_mark(acc, "hc.up", f.gate)?;
     op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n })?;
+    sync_mark(acc, "hc.gate", f.mix)?;
     Ok(())
 }
 
