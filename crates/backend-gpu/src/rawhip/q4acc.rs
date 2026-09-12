@@ -20,22 +20,43 @@ use super::{ck, RawCtx};
 
 /// 용도별 성장형 디바이스 버퍼 (해제 없음 — ADR-0014).
 struct GBuf {
+    name: &'static str,
     bytes: usize,
     ptr: *mut u8,
 }
 
 impl GBuf {
-    const fn new() -> Self {
-        GBuf { bytes: 0, ptr: std::ptr::null_mut() }
+    const fn new(name: &'static str) -> Self {
+        GBuf { name, bytes: 0, ptr: std::ptr::null_mut() }
     }
 
     fn ensure(&mut self, ctx: &RawCtx, bytes: usize) -> Result<*mut u8, String> {
         if bytes > self.bytes {
+            if std::env::var_os("LLM170_Q4ACC_STATS").is_some() {
+                eprintln!("# q4acc: {} 확장 {} → {} B", self.name, self.bytes, bytes);
+            }
             self.ptr = ctx.alloc(bytes)?;
             self.bytes = bytes;
         }
         Ok(self.ptr)
     }
+}
+
+/// 무게 파일 소스 — mmap 베이스 주소 범위 + 파일 핸들 (staged pread 업로드용).
+struct Source {
+    base: usize,
+    len: usize,
+    file: std::fs::File,
+}
+
+/// per-op 시간 누적 (LLM170_Q4ACC_TIME=1) — (업로드, 양자화, 런치, d2h, 호출수)
+#[derive(Default)]
+struct AccTime {
+    upload_ns: u64,
+    quant_ns: u64,
+    launch_ns: u64,
+    d2h_ns: u64,
+    calls: u64,
 }
 
 pub struct Q4Acc {
@@ -46,6 +67,10 @@ pub struct Q4Acc {
     /// (인덱서 투영 — bf16 24텐서 0.04 GiB, 전개 비용 무시 가능).
     weights: std::sync::Mutex<std::collections::HashMap<usize, (*mut u8, bool)>>,
     wbytes: std::sync::atomic::AtomicUsize,
+    time: std::sync::Mutex<AccTime>,
+    /// 모델 파트 파일 — 있으면 업로드가 mmap 폴트 대신 pread 스테이징을 쓴다.
+    sources: Vec<Source>,
+    stage: std::sync::Mutex<Vec<u8>>,
     xf: std::sync::Mutex<GBuf>,
     xq: std::sync::Mutex<GBuf>,
     yf: std::sync::Mutex<GBuf>,
@@ -72,6 +97,11 @@ fn ggml_id(ty: GgmlType) -> u32 {
 
 impl Q4Acc {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_sources(Vec::new())
+    }
+
+    /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
+    pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
         let ctx = RawCtx::new()?;
         let ktab2 = {
             let p = ctx.alloc(1024)?;
@@ -79,25 +109,125 @@ impl Q4Acc {
             ctx.h2d(p, bytemuck::cast_slice(&kt))?;
             p
         };
+        let mut sources = Vec::with_capacity(parts.len());
+        for (base, len, path) in parts {
+            match std::fs::File::open(&path) {
+                Ok(file) => sources.push(Source { base, len, file }),
+                Err(e) => eprintln!("# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})", path.display()),
+            }
+        }
         Ok(Q4Acc {
             ctx,
             ktab2,
             weights: Default::default(),
             wbytes: Default::default(),
-            xf: std::sync::Mutex::new(GBuf::new()),
-            xq: std::sync::Mutex::new(GBuf::new()),
-            yf: std::sync::Mutex::new(GBuf::new()),
-            qs: std::sync::Mutex::new(GBuf::new()),
-            ckv: std::sync::Mutex::new(GBuf::new()),
-            cvv: std::sync::Mutex::new(GBuf::new()),
-            msk: std::sync::Mutex::new(GBuf::new()),
-            atn: std::sync::Mutex::new(GBuf::new()),
+            time: Default::default(),
+            sources,
+            stage: std::sync::Mutex::new(Vec::new()),
+            xf: std::sync::Mutex::new(GBuf::new("xf")),
+            xq: std::sync::Mutex::new(GBuf::new("xq")),
+            yf: std::sync::Mutex::new(GBuf::new("yf")),
+            qs: std::sync::Mutex::new(GBuf::new("qs")),
+            ckv: std::sync::Mutex::new(GBuf::new("ckv")),
+            cvv: std::sync::Mutex::new(GBuf::new("cvv")),
+            msk: std::sync::Mutex::new(GBuf::new("msk")),
+            atn: std::sync::Mutex::new(GBuf::new("atn")),
         })
+    }
+
+    fn note(&self, up: u64, q: u64, k: u64, d: u64) {
+        if let Ok(mut t) = self.time.lock() {
+            t.upload_ns += up;
+            t.quant_ns += q;
+            t.launch_ns += k;
+            t.d2h_ns += d;
+            t.calls += 1;
+            if t.calls % 200 == 0 {
+                eprintln!(
+                    "# q4acc[{}]: upload={:.1}s quant={:.1}s launch={:.1}s d2h={:.1}s (평균 {:.1} ms/호출)",
+                    t.calls,
+                    t.upload_ns as f64 / 1e9,
+                    t.quant_ns as f64 / 1e9,
+                    t.launch_ns as f64 / 1e9,
+                    t.d2h_ns as f64 / 1e9,
+                    (t.upload_ns + t.quant_ns + t.launch_ns + t.d2h_ns) as f64 / 1e6 / t.calls as f64
+                );
+            }
+        }
     }
 
     /// 업로드 누적 바이트 (진단).
     pub fn uploaded_bytes(&self) -> usize {
         self.wbytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// madvise 래퍼 (페이지 정렬 가정 — mmap 베이스 + 4096 배수 오프셋).
+    fn advise(addr: usize, len: usize, advice: libc::c_int) {
+        if len == 0 {
+            return;
+        }
+        unsafe {
+            let _ = libc::madvise(addr as *mut libc::c_void, len, advice);
+        }
+    }
+
+    /// 대형 텐서 업로드 — 8 MiB 청크로 파이프라인 선반입 + 사용 후 캐시 반납.
+    ///
+    /// 실측(2026-09-12): mmap 폴트 경로는 20-60 MB/s(페이지 폴트당 4 KB),
+    /// 캐시 적중 시 4-24 GB/s. llama도 같은 문제를 pread 스테이징 패치로
+    /// 해결했다(83 GB/91 s). 여기서는 (a) 다음 청크에 MADV_WILLNEED를 미리
+    /// 걸어 폴트가 선반입된 페이지에 떨어지게 하고, (b) 사용한 청크는
+    /// MADV_DONTNEED로 커널에 반납해 30 GiB 호스트 RAM의 캐시 압박을 없앤다.
+    /// 반납해도 무게는 VRAM 사본이 정본이므로 재독은 없다.
+    /// pread 스테이징 업로드 — 파일에서 직접 8 MiB 청크로 읽어 h2d.
+    /// 반환 None = 이 포인터가 알려진 파트 밖(폴백 필요).
+    /// 실측: mmap 폴트 20-180 MB/s vs 버퍼드 pread 1.2 GB/s (같은 파일).
+    fn staged_upload(&self, dst: *mut u8, ptr: usize, len: usize) -> Option<Result<(), String>> {
+        use std::os::unix::fs::FileExt;
+        let src = self
+            .sources
+            .iter()
+            .find(|s| ptr >= s.base && ptr.checked_add(len).map(|e| e <= s.base + s.len).unwrap_or(false))?;
+        let mut off = (ptr - src.base) as u64;
+        let result = (|| -> Result<(), String> {
+            const CH: usize = 8 << 20;
+            let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
+            if stage.len() < CH.min(len) {
+                *stage = vec![0u8; CH.min(len)];
+            }
+            let mut done = 0usize;
+            while done < len {
+                let n = CH.min(len - done);
+                src.file.read_exact_at(&mut stage[..n], off).map_err(|e| format!("pread {off}: {e}"))?;
+                self.ctx.h2d(unsafe { dst.add(done) }, &stage[..n])?;
+                done += n;
+                off += n as u64;
+            }
+            Ok(())
+        })();
+        Some(result)
+    }
+
+    fn upload_pipelined(&self, dst: *mut u8, data: &[u8]) -> Result<(), String> {
+        const CH: usize = 8 << 20;
+        let base = data.as_ptr() as usize;
+        let n = data.len();
+        if base % 4096 != 0 || n < (4 << 20) {
+            Self::advise(base & !4095, ((base & 4095) + n + 4095) & !4095, libc::MADV_WILLNEED);
+            return self.ctx.h2d(dst, data);
+        }
+        let mut off = 0usize;
+        Self::advise(base, CH.min(n), libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL);
+        while off < n {
+            let sz = CH.min(n - off);
+            if off + sz < n {
+                Self::advise(base + off + sz, CH.min(n - off - sz), libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL);
+            }
+            self.ctx.h2d(unsafe { dst.add(off) }, &data[off..off + sz])?;
+            Self::advise(base + off, sz, libc::MADV_DONTNEED);
+            off += sz;
+        }
+        Ok(())
     }
 
     /// 무게 1회 업로드 후 상주 — mmap 포인터가 키.
@@ -134,9 +264,24 @@ impl Q4Acc {
             }
             _ => (self.ctx.alloc(w.data.len().max(1))?, false),
         };
-        self.ctx.h2d(ptr, w.data)?;
+        let t0 = std::time::Instant::now();
+        if let Some(r) = self.staged_upload(ptr, w.data.as_ptr() as usize, w.data.len()) {
+            r?;
+        } else {
+            self.upload_pipelined(ptr, w.data)?;
+        }
         self.wbytes
             .fetch_add(w.data.len(), std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("LLM170_Q4ACC_STATS").is_some() && w.data.len() >= (1 << 20) {
+            let total = self.wbytes.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "# q4acc: 업로드 {:.1} MiB ({:.1} ms → {:.0} MB/s, 누적 {:.2} GiB)",
+                w.data.len() as f64 / (1u64 << 20) as f64,
+                t0.elapsed().as_secs_f64() * 1e3,
+                w.data.len() as f64 / t0.elapsed().as_secs_f64() / 1e6,
+                total as f64 / (1u64 << 30) as f64
+            );
+        }
         self.weights
             .lock()
             .map_err(|e| e.to_string())?
@@ -177,6 +322,16 @@ impl Q4Acc {
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
             ];
             return self.ctx.launch3("q4_gemm_q5_1", t as u32, gy, gz, 64, &mut args);
+        }
+        // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
+        // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
+        if t >= 16
+            && self
+                .ctx
+                .gemm_tile(xq, w, self.ktab2, ty, n_in, n_out, xq_w, t, out)
+                .is_ok()
+        {
+            return Ok(());
         }
         self.ctx.gemv_q8_out(
             xq as *const u8,
@@ -222,6 +377,82 @@ impl Q4Acc {
 
     /// 배치 GEMM 본체 — xs [t][n_in] f32 → outs [t][n_out] f32.
     /// `x_start`/`w_off`은 moe_down의 전문가 그룹 런치용 부분 범위.
+    /// 활성 준비 — 업로드(+q8 양자화) 1회. 그룹/전문가 호출이 공유한다.
+    /// 반환: (xf 포인터, xq 포인터(양자화 전이면 null), xq_w, t). w_f32면 xf를 쓴다.
+    fn prepare_x(
+        &self,
+        xs: &[Vec<f32>],
+        n_in: usize,
+        w_f32: bool,
+    ) -> Result<(*mut u8, *mut u8, usize, usize), String> {
+        let t = xs.len();
+        let mut xflat = Vec::with_capacity(t * n_in);
+        for row in xs {
+            if row.len() != n_in {
+                return Err(format!("matmul: x({}) != n_in({n_in})", row.len()));
+            }
+            xflat.extend_from_slice(row);
+        }
+        let xdev = {
+            let mut xb = self.xf.lock().map_err(|e| e.to_string())?;
+            xb.ensure(&self.ctx, t * n_in * 4)?
+        };
+        self.ctx.h2d(xdev, bytemuck::cast_slice(&xflat))?;
+        if w_f32 {
+            return Ok((xdev, std::ptr::null_mut(), 0, t));
+        }
+        let xq_w = xq_words(n_in);
+        let xq_buf = {
+            let mut xb = self.xq.lock().map_err(|e| e.to_string())?;
+            xb.ensure(&self.ctx, t * xq_w * 4)?
+        };
+        self.ctx.quant_q8_b(xdev, xq_buf, n_in, xq_w, t)?;
+        Ok((xdev, xq_buf, xq_w, t))
+    }
+
+    /// 준비된 활성으로 1회 런치 + 판독.
+    fn run_prepared(
+        &self,
+        xf: *mut u8,
+        xq: *mut u8,
+        xq_w: usize,
+        t: usize,
+        w: &llm170_core::matmul::Weight<'_>,
+        w_off_bytes: usize,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let n_in = w.n_in as usize;
+        let n_out = w.n_out as usize;
+        let tt = std::env::var_os("LLM170_Q4ACC_TIME").is_some();
+        let t_up = std::time::Instant::now();
+        let (w_dev, w_f32) = self.dev_weight(w)?;
+        let up_ns = t_up.elapsed().as_nanos() as u64;
+        let w_slice = unsafe { w_dev.add(w_off_bytes) };
+        let ydev = {
+            let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
+            yb.ensure(&self.ctx, t * n_out * 4)?
+        };
+        let mut yflat = vec![0.0f32; t * n_out];
+        let t_k = std::time::Instant::now();
+        if w_f32 {
+            self.launch_gemm_f32(xf, w_slice, n_in, n_out, t, ydev)?;
+        } else {
+            self.launch_gemm(ggml_id(w.ty), xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
+        }
+        let k_ns = t_k.elapsed().as_nanos() as u64;
+        let t_d = std::time::Instant::now();
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
+        let d_ns = t_d.elapsed().as_nanos() as u64;
+        if tt {
+            self.note(up_ns, 0, k_ns, d_ns);
+        }
+        for (o, v) in outs.iter_mut().zip(yflat.chunks_exact(n_out)) {
+            o.copy_from_slice(v);
+        }
+        Ok(())
+    }
+
+    /// 배치 GEMM 본체 — xs [t][n_in] f32 → outs [t][n_out] f32.
     fn batch_into(
         &self,
         xs: &[Vec<f32>],
@@ -229,57 +460,14 @@ impl Q4Acc {
         w: &llm170_core::matmul::Weight<'_>,
         w_off_bytes: usize,
     ) -> Result<(), String> {
-        let t = xs.len();
-        if t == 0 {
+        if xs.is_empty() {
             return Ok(());
         }
         let n_in = w.n_in as usize;
-        let n_out = w.n_out as usize;
-        let ty = ggml_id(w.ty);
-        let (w_dev, w_f32) = self.dev_weight(w)?;
-        let w_slice = unsafe { w_dev.add(w_off_bytes) };
-        // 활성 업로드 (연속 f32)
-        let mut xflat = Vec::with_capacity(t * n_in);
-        for row in xs {
-            if row.len() != n_in {
-                return Err(format!("matmul_batch: x({}) != n_in({})", row.len(), n_in));
-            }
-            xflat.extend_from_slice(row);
-        }
-        let mut yflat = vec![0.0f32; t * n_out];
-        let mut out_dev = None;
-        {
-            let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
-            let ydev = yb.ensure(&self.ctx, t * n_out * 4)?;
-            out_dev = Some(ydev);
-        }
-        let ydev = out_dev.unwrap();
-        if w_f32 {
-            let xdev = {
-                let mut xb = self.xf.lock().map_err(|e| e.to_string())?;
-                xb.ensure(&self.ctx, t * n_in * 4)?
-            };
-            self.ctx.h2d(xdev, bytemuck::cast_slice(&xflat))?;
-            self.launch_gemm_f32(xdev, w_slice, n_in, n_out, t, ydev)?;
-        } else {
-            let xq_w = xq_words(n_in);
-            let xq_buf = {
-                let mut xb = self.xq.lock().map_err(|e| e.to_string())?;
-                xb.ensure(&self.ctx, t * xq_w * 4)?
-            };
-            let xdev = {
-                let mut xb = self.xf.lock().map_err(|e| e.to_string())?;
-                xb.ensure(&self.ctx, t * n_in * 4)?
-            };
-            self.ctx.h2d(xdev, bytemuck::cast_slice(&xflat))?;
-            self.ctx.quant_q8_b(xdev, xq_buf, n_in, xq_w, t)?;
-            self.launch_gemm(ty, xq_buf, w_slice, n_in, n_out, xq_w, t, ydev)?;
-        }
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
-        for (o, v) in outs.iter_mut().zip(yflat.chunks_exact(n_out)) {
-            o.copy_from_slice(v);
-        }
-        Ok(())
+        // f32 계열은 양자화를 건너뛰므로 준비 단계가 w_f32를 알아야 한다.
+        let w_f32 = matches!(w.ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        let (xf, xq, xq_w, t) = self.prepare_x(xs, n_in, w_f32)?;
+        self.run_prepared(xf, xq, xq_w, t, w, w_off_bytes, outs)
     }
 }
 
@@ -320,12 +508,27 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         ws: &[llm170_core::matmul::Weight<'_>],
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), String> {
-        // 동일 입력 — 양자화 1회 후 가중치별 런치. (값 경로 x 업로드 절약)
+        // 동일 입력 — 업로드·양자화 1회를 그룹 전체가 공유한다(값 경로에서
+        // 왕복이 스텝 비용의 대부분이라 그룹 호출당 3→1로 줄인다).
         if ws.len() != outs.len() {
             return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
         }
+        if ws.is_empty() || xs.is_empty() {
+            return Ok(());
+        }
+        let n_in = ws[0].n_in as usize;
+        let f32_family = |t: GgmlType| matches!(t, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        let w_f32 = f32_family(ws[0].ty);
+        // 타입 계열·n_in이 섞이면 준비를 공유할 수 없다 — 개별 경로로.
+        if ws.iter().any(|w| w.n_in as usize != n_in || f32_family(w.ty) != w_f32) {
+            for (w, o) in ws.iter().zip(outs.iter_mut()) {
+                self.batch_into(xs, o, w, 0)?;
+            }
+            return Ok(());
+        }
+        let (xf, xq, xq_w, t) = self.prepare_x(xs, n_in, w_f32)?;
         for (w, o) in ws.iter().zip(outs.iter_mut()) {
-            self.batch_into(xs, o, w, 0)?;
+            self.run_prepared(xf, xq, xq_w, t, w, 0, o)?;
         }
         Ok(())
     }
@@ -378,31 +581,17 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         }
         let per_expert = ws.data.len() / n_expert_stack.max(1);
         let n_in = ws.n_in as usize;
-        let n_out = ws.n_out as usize;
+        // 3D 전문가 스택은 n_out = 전문가수×전문가당 행으로 온다 — 런치·출력
+        // 버퍼는 전문가당 행 기준이다(mul_mat_id와 동일한 해석).
+        let n_out = ws.n_out as usize / n_expert_stack.max(1);
         let (w_dev, w_f32) = self.dev_weight(ws)?;
         // 활성 업로드 + 양자화 1회 (전문가 공통)
-        let mut xflat = Vec::with_capacity(t * n_in);
-        for row in xs {
-            if row.len() != n_in {
-                return Err(format!("moe_down: x({}) != n_in({})", row.len(), n_in));
-            }
-            xflat.extend_from_slice(row);
-        }
+        let (xdev_f32, xq_buf, xq_w, t) = self.prepare_x(xs, n_in, w_f32)?;
         let mut yflat = vec![0.0f32; t * n_out];
-        let xq_w = xq_words(n_in);
-        let (xdev, xq_buf, ydev, xdev_f32) = {
-            let mut xb = self.xf.lock().map_err(|e| e.to_string())?;
-            let xdev = xb.ensure(&self.ctx, t * n_in * 4)?;
-            let mut qb = self.xq.lock().map_err(|e| e.to_string())?;
-            let xq_buf = qb.ensure(&self.ctx, t * xq_w * 4)?;
+        let ydev = {
             let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
-            let ydev = yb.ensure(&self.ctx, t * n_out * 4)?;
-            (xdev, xq_buf, ydev, xdev)
+            yb.ensure(&self.ctx, t * n_out * 4)?
         };
-        self.ctx.h2d(xdev, bytemuck::cast_slice(&xflat))?;
-        if !w_f32 {
-            self.ctx.quant_q8_b(xdev, xq_buf, n_in, xq_w, t)?;
-        }
         // 전문가별 연속 그룹 런치
         let mut i = 0usize;
         while i < t {
@@ -499,7 +688,14 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
 
 /// Engine4에 주입할 가속기 생성 — 실패 시 호출부가 CPU로 폴백(경고).
 pub fn new_acc() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
-    let a = Q4Acc::new()?;
+    new_acc_with_sources(Vec::new())
+}
+
+/// 파트 소스 지정판 — 서버 배선이 `Model4::part_sources()`를 넘긴다.
+pub fn new_acc_with_sources(
+    parts: Vec<(usize, usize, std::path::PathBuf)>,
+) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
+    let a = Q4Acc::new_with_sources(parts)?;
     eprintln!(
         "# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)"
     );

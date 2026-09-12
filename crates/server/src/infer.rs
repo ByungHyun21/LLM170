@@ -311,11 +311,12 @@ fn run_q4_infer(
         .map_err(|e| e.to_string())
         .and_then(|m| {
             let n = prompts.len();
+            let sources = m.part_sources();
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
             if want_gpu {
                 // plans/64 P1 — rawhip 값 경로. 실패는 조용히 넘기지 않는다
                 // (cubecl 제거 후 CPU 폴백이 GPU 수치로 오인된 이력).
-                match llm170_backend_gpu::new_q4_acc() {
+                match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                     Ok(acc) => {
                         eng = eng.with_acc(acc);
                         eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");

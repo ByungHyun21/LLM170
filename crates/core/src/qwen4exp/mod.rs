@@ -323,6 +323,16 @@ impl Model4 {
         self.w(name).ok_or_else(|| Q4Error::MissingTensor(name.into()))
     }
 
+    /// GPU 사전 적재용 파트 소스 — (mmap 베이스 주소, 길이, 파일 경로).
+    /// 무게 텐서의 파일 오프셋 = 포인터 − 베이스 (파트는 오프셋 0부터 매핑).
+    /// pread 스테이징(실측 1.2 GB/s)이 mmap 폴트 경로(20-180 MB/s)보다 빠르다.
+    pub fn part_sources(&self) -> Vec<(usize, usize, std::path::PathBuf)> {
+        self.parts
+            .iter()
+            .map(|p| (p.mmap.as_ptr() as usize, p.mmap.len(), p.path.clone()))
+            .collect()
+    }
+
     /// f32 벡터 텐서 디양자화 — 캐시. 대상(norm 가중치 등)은 결정적이라
     /// 첫 호출 1회 디양자화 후 재사용 (수치 불변).
     pub fn f32_vec4(&self, name: &str) -> Result<Vec<f32>, Q4Error> {

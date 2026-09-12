@@ -113,12 +113,13 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
         if arch.as_deref() == Some("qwen4exp") {
             let m = llm170_core::qwen4exp::Model4::load(&model_path)
                 .map_err(|e| e.to_string())?;
+            let sources = m.part_sources();
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
             // plans/64 P1: GPU는 --backend gpu 명시 시에만. 주입 실패는 실패로
             // 승격한다 (cubecl 제거 후 CPU 폴백 수치가 GPU로 오인된 이력).
             let want_gpu = crate::engine::q4_gpu_wanted_str(&backend, &gpu_runtime);
             if want_gpu {
-                match llm170_backend_gpu::new_q4_acc() {
+                match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                     Ok(acc) => {
                         eng = eng.with_acc(acc);
                     }

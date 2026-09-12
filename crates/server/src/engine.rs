@@ -438,12 +438,13 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         .and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
         let m = load_q4_retry(&req.model);
+        let sources = m.part_sources();
         let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
         // qwen4exp GPU 경로 (rawhip 값 경로) — plans/64 P1. 기본 CPU(정확성
         // 기준); --backend gpu / --gpu-runtime hip일 때만 상주 가속기를 붙인다.
         let want_gpu = q4_gpu_wanted(&backend);
         if want_gpu {
-            match llm170_backend_gpu::new_q4_acc() {
+            match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                 Ok(acc) => {
                     eng = eng.with_acc(acc);
                     eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");
