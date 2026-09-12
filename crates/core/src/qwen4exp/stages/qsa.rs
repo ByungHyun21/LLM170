@@ -59,8 +59,9 @@ use llm170_profiler::profile_span;
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
         let n_past_max = (pos0 as usize) + t_len;
-        let gpu_attn = ctx.acc.is_some();
+        let mut gpu_attn = ctx.acc.is_some();
         let mut mask_all: Vec<Vec<bool>> = vec![vec![false; n_past_max]; n_tok];
+        let mut cpu_attn = false;   // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함)
 
         let seq_state = &mut *seq;
         for t in 0..t_len {
@@ -165,7 +166,7 @@ use llm170_profiler::profile_span;
             mask_all[t] = mask;
 
             // 마스크 밀집 GQA + 게이트 — acc 있으면 루프 후 GPU 일괄, 없으면 즉시 CPU
-            if gpu_attn {
+            if gpu_attn && !cpu_attn {
                 continue;
             }
             let mut attn_out = std::mem::take(&mut attn_all[t]);
@@ -225,14 +226,23 @@ use llm170_profiler::profile_span;
                 let kn = n_past_max * n_kv * hd;
                 let ck = seq.kv_k[full_idx][..kn].to_vec();
                 let cv = seq.kv_v[full_idx][..kn].to_vec();
-                let res = acc
-                    .qsa_attention(
-                        &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
-                        &masku32, kq_scale, n_past_max, n_head, n_kv, hd, n_tok,
-                    )
-                    .map_err(Q4Error::Io)?;
-                for (t, row) in attn_all.iter_mut().enumerate() {
-                    row.copy_from_slice(&res[t * n_head * hd..(t + 1) * n_head * hd]);
+                // 미지원(예: t>128 커널 결함)이면 CPU 어텐션으로 폴백 — gdn_ar과
+                // 같은 규약. 값 경로 프리필은 원래 CPU 어텐션이었으므로 회귀 아님.
+                match acc.qsa_attention(
+                    &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
+                    &masku32, kq_scale, n_past_max, n_head, n_kv, hd, n_tok,
+                ) {
+                    Ok(res) => {
+                        for (t, row) in attn_all.iter_mut().enumerate() {
+                            row.copy_from_slice(&res[t * n_head * hd..(t + 1) * n_head * hd]);
+                        }
+                    }
+                    Err(e) => {
+                        if std::env::var_os("LLM170_Q4_NOFAST").is_none() {
+                            eprintln!("# qsa: GPU 어텐션 폴백 ({e})");
+                        }
+                        cpu_attn = true;
+                    }
                 }
             }
         }

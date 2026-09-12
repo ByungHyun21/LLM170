@@ -138,6 +138,9 @@ extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const fl
             continue;
         }
         float nrun = fmaxf(mrun, red[0]);
+        // red 재사용 전 배리어 — 없으면 다른 워프가 red[0]을 읽기 전에
+        // psum이 덮어써 NaN이 섞인다(2026-09-12 실측 t=200에서 7498/25600 비유한).
+        __syncthreads();
         float corr = (mrun <= Q4_NEG) ? 0.0f : exp_cr(mrun - nrun);
         acc *= corr;
         lrun *= corr;
