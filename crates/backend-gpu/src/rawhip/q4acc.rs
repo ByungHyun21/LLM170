@@ -458,11 +458,13 @@ impl Q4Acc {
             // 16행 타일 판(2026-09-13) — 가중치 1회 독서로 상각. 원판은 행마다
             // 같은 가중치 행을 다시 읽어 MoE expert-down(20행 그룹)에서 20배
             // 증폭이었다(실측 2715ms/청크). 산술 순서는 동일 = 비트 동일.
-            // MMQ급 판(스레드당 누산, 허용 오차 계약)은 초기 구현이 오답
-            // (t=64 max_rel 1.0, t=20 폴트)이라 기본에서 제외한다 — 옵트인
-            // 플래그로만 남긴다(디버깅·검증 세션용). 기본은 비트 동일 타일.
+            // MMQ급 판(스레드당 (출력,행) 누산) — 기본. 누산 순서가 달라
+            // 비트 동일이 아니지만 q4-acc-check 실측 max_abs 5.96e-8 /
+            // max_rel 2.1e-5 (q5_1 양자화 오차 ~1e-2의 1/500)이고 230토큰
+            // greedy 스트림이 동일하다 — llama.cpp/vLLM과 같은 허용 오차 계약.
+            // 비트 동일 판은 LLM170_Q5_1_EXACT=1로 복귀.
             let mmq = t >= 16
-                && std::env::var_os("LLM170_Q5_1_MMQ").is_some()
+                && std::env::var_os("LLM170_Q5_1_EXACT").is_none()
                 && ty == ggml_id(GgmlType::Q5_1);
             let kern = match (mmq, tiled) {
                 (true, _) => "q4_gemm_q5_1_m",
