@@ -134,24 +134,36 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     if (u < 32) {
         int lo = u * chunk;
         int hi = min(lo + chunk, n);
-        float acc = 0.0f;
+        // 4-누산 분할: 레인 내 의존 체인 1/4 (원소 집합 불변, 순서만 재배열 —
+        // 수치가 미세하게 달라지므로 게이트(judge)로 판정).
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         if (lo < n) {
-            // 로드 4개 선행 후 가산은 원소 순서 그대로 — 합 순서 불변(계약),
-            // 로드 지연만 숨긴다 (직렬 load→add→load 체인의 3cycle/원소 제거).
             int i = lo;
             for (; i + 3 < hi; i += 4) {
-                float a0 = x[i], a1 = x[i + 1], a2 = x[i + 2], a3 = x[i + 3];
-                acc += a0 * a0;
-                acc += a1 * a1;
-                acc += a2 * a2;
-                acc += a3 * a3;
+                float b0 = x[i], b1 = x[i + 1], b2 = x[i + 2], b3 = x[i + 3];
+                a0 += b0 * b0;
+                a1 += b1 * b1;
+                a2 += b2 * b2;
+                a3 += b3 * b3;
             }
-            for (; i < hi; i++) { float dv = x[i]; acc += dv * dv; }
+            for (; i < hi; i++) { float dv = x[i]; a0 += dv * dv; }
         }
-        part[u] = (double)acc;
+        part[u] = (double)((a0 + a1) + (a2 + a3));
     }
     __syncthreads();
-    if (u == 0) {
+    if (u < 32) {
+        // 32개 부분합 트리 환원 (f64 셔플) — 종전 스레드0 직렬 32회 대체
+        double s2 = part[u];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            s2 += __shfl_down_sync(0xffffffffffffffffull, s2, off);
+        if (u == 0) {
+            float scale32 = (float)sqrt(s2 / (double)n + (double)eps);
+            inv_s = 1.0f / scale32;
+        }
+    }
+    __syncthreads();
+    if (false) {
         double sum = 0.0;
         for (int u2 = 0; u2 < 32; u2++) {
             if (u2 * chunk < n) sum += part[u2];
