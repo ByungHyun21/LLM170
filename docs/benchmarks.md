@@ -300,7 +300,7 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 79.1 / 64.6 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
+| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 86.4 / 71.4 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
 | Decode tg4 / tg8 / tg16 (ctx 4096-8192, warm) | 15.70 t/s solo (7.2.2) | **8.6 / 7.7-9.2 / 10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
@@ -385,6 +385,19 @@ bridges remain.
 Resolved: RmsRows was never slow (1.4 ms per call after the mark moved the
 PLE bridge out of its interval) - the earlier 15.5 ms and the failed
 coalescing experiment were both misattribution.
+
+Kernel-level tracing (`LLM170_KTRACE=1` on the bench's prefill) named the
+remaining cost: `q4_gemm_q5_1` held 2715 ms of a 5066 ms chunk (54%). The MoE
+expert-down weights are q5_1 (25.2 GiB) and q5_1 had no tile kernel, so
+`launch_gemm` fell through to a GEMV-shaped kernel whose block is (row, output)
+- every row of an expert group re-read the same weight row, 20x at t=512.
+`q4_gemm_q5_1_t` (16-row x 4-output tile, per-row arithmetic order unchanged)
+is bit-exact against the CPU mirror (`q4-acc-check`, 100% at t=20/64) and took
+2715 -> 1980 ms; pp512 80.0 -> 86.4. It is now latency-bound rather than
+tiling-bound (16-row x 1-output, 32-row and 16-row x 4-output all land within
+1932-2067 ms at ~7.3 GB/s effective, ~27x off the DRAM floor), so the next
+step is a j128-class structure with shared-staged activations - that family is
+precompiled offline (.co), so the build pipeline needs checking first.
 
 Known outlier: RmsRows costs 15.5 ms per call (96 per chunk, 5.2 M elements
 each) = ~336 M elements/s, about 1/13 of the measured transfer bandwidth. A
