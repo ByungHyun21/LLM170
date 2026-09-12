@@ -4235,3 +4235,23 @@ becomes a single segment and the merge runs once). Tokens are identical before a
 
 Base standing after this session: pp512 1.026x, pp3314 1.013x, tg512 1.008x, tg3314 0.981x against
 llama-bench CLI-to-CLI, with MTP 1.92x, np4 1.99x and mmproj 1.45x on the named settings.
+
+## Dispatch fusion scoped and rejected on evidence (2026-09-12)
+
+The plans survey named fusing the same-input projection dispatches (qkv / gate / up,
+~192 launches per forward) as the best remaining lever for base tg, on the documented
+bracket of ~600 dispatches x 2-5 us = 1.2-3 ms of an 88 ms token. Scoping it against the
+current model killed the idea as stated: the weights are **mixed-quantization** in this
+GGUF - `blk.0.attn_gate` is Q5K, `blk.0.ffn_gate` is Iq4Xs, `blk.0.ffn_up` is Q3K - so a
+fused row-ranged launch cannot wrap one type-specialized GEMV body; it would need a
+per-row-range type switch inside a new kernel, i.e. a refactor of the GEMV family that
+re-specializes the same bodies it would merge. Estimated ceiling after that work is
++0.2-0.4% tg (192 of ~600 launches, at the low end of the bracket), against a 2-3 hour
+refactor of the hottest kernels in the engine. Rejected; re-open only if a future model
+uses a single quantization type across q/k/v and gate/up, where the fusion degenerates to
+one indexed launch per group.
+
+Also worth recording because it was measured here rather than assumed: our HIP decode
+attention is now bandwidth-bound (~221 GB/s effective on the f16 KV), so the remaining
+tg3314 gap is KV bytes, not kernel structure - which makes KV quantization the next
+lever on that cell rather than further attention work.
