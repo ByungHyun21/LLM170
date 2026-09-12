@@ -59,16 +59,18 @@ extern "C" __global__ void q4_gemm_q5_1(const unsigned* xq, const unsigned* w,
     }
 }
 
-// q5_1 16행 타일 — 기존 q4_gemm_q5_1은 (행, 출력) 블록이라 같은 가중치 행을
+// q5_1 16행×4출력 타일 — 기존 q4_gemm_q5_1은 (행, 출력) 블록이라 같은 가중치 행을
 // 행 수만큼 다시 읽었다(MoE expert-down = 25.2GiB q5_1: t=20 그룹에서 20배
 // 증폭, 실측 2715ms/청크 = 전체의 54%). 이 판은 출력 1개당 16행을 묶어 가중치
 // 1회 독서로 상각한다. 행별 누산 순서는 원판과 동일(비트 동일 — q4-acc-check).
 extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
                                           double* part, float* out, int n_in, int n_out,
                                           int xq_w, int t) {
-    int o = blockIdx.y + blockIdx.z * gridDim.y;
-    int l = threadIdx.x;
-    if (o >= n_out || l >= 64) return;
+    // 256 스레드 = 4출력 × 64레인 — 블록당 연산을 4배로(블록 수·환원 오버헤드 1/4).
+    int sub = threadIdx.x >> 6;
+    int l = threadIdx.x & 63;
+    int o = ((int)blockIdx.y + (int)blockIdx.z * gridDim.y) * 4 + sub;
+    if (o >= n_out) return;
     int r0 = (int)blockIdx.x * 16;
     int rc = min(16, t - r0);
     if (rc <= 0) return;
@@ -108,14 +110,14 @@ extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
             acc[r] += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
         }
     }
-    __shared__ double sh32[32 * 16];
+    __shared__ double sh32[4 * 16 * 32];
     for (int r = 0; r < rc; r++) {
-        if (l >= 32) sh32[r * 32 + (l - 32)] = (double)acc[r];
+        if (l >= 32) sh32[(sub * 16 + r) * 32 + (l - 32)] = (double)acc[r];
     }
     __syncthreads();
     if (l < 32) {
         for (int r = 0; r < rc; r++) {
-            double a = (double)acc[r] + sh32[r * 32 + l];
+            double a = (double)acc[r] + sh32[(sub * 16 + r) * 32 + l];
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 a += __shfl_down_sync(0xffffffffffffffffull, a, off);

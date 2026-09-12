@@ -440,8 +440,12 @@ impl Q4Acc {
         out: *mut u8,
     ) -> Result<(), String> {
         if ty == ggml_id(GgmlType::Q5_1) {
-            let gy = n_out.min(65535) as u32;
-            let gz = n_out.div_ceil(65535) as u32;
+            // 타일 판은 출력 4개/블록 — 그리드도 4로 나눈다.
+            let tiled = std::env::var_os("LLM170_NO_Q5_1_T").is_none();
+            let outs_per_block = if tiled { 4usize } else { 1 };
+            let nblk = n_out.div_ceil(outs_per_block);
+            let gy = nblk.min(65535) as u32;
+            let gz = nblk.div_ceil(65535) as u32;
             let part = self.ctx.scratch(n_out * 64 * 8)?;
             let mut xq_p = xq as *mut std::ffi::c_void;
             let mut w_p = w as *mut std::ffi::c_void;
@@ -454,11 +458,7 @@ impl Q4Acc {
             // 16행 타일 판(2026-09-13) — 가중치 1회 독서로 상각. 원판은 행마다
             // 같은 가중치 행을 다시 읽어 MoE expert-down(20행 그룹)에서 20배
             // 증폭이었다(실측 2715ms/청크). 산술 순서는 동일 = 비트 동일.
-            let kern = if std::env::var_os("LLM170_NO_Q5_1_T").is_none() {
-                "q4_gemm_q5_1_t"
-            } else {
-                "q4_gemm_q5_1"
-            };
+            let kern = if tiled { "q4_gemm_q5_1_t" } else { "q4_gemm_q5_1" };
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -469,8 +469,8 @@ impl Q4Acc {
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
             ];
-            let gx = if kern.ends_with("_t") { t.div_ceil(16) as u32 } else { t as u32 };
-            return self.ctx.launch3(kern, gx, gy, gz, 64, &mut args);
+            let gx = if tiled { t.div_ceil(16) as u32 } else { t as u32 };
+            return self.ctx.launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
