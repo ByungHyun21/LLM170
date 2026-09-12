@@ -393,14 +393,28 @@ impl Q4Acc {
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
-        if t >= 16
-            && std::env::var_os("LLM170_Q4_NO_TILE").is_none()
-            && self
-                .ctx
-                .gemm_tile(xq, w, self.ktab2, ty, n_in, n_out, xq_w, t, out)
-                .is_ok()
-        {
-            return Ok(());
+        // t≥16: MMQ 타일 우선 — 단 **128토큰 이하로 쪼개서** 호출한다.
+        // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다
+        // (2026-09-12 실측: t=129 폴트, t=128 정상, GEMV 경로는 비트 동일).
+        if t >= 16 && std::env::var_os("LLM170_Q4_NO_TILE").is_none() {
+            let mut ok = true;
+            for c in 0..t.div_ceil(128) {
+                let t0 = c * 128;
+                let tc = 128.min(t - t0);
+                let xsrc = unsafe { xq.add(t0 * xq_w * 4) };
+                let osrc = unsafe { out.add(t0 * n_out * 4) };
+                if self
+                    .ctx
+                    .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Ok(());
+            }
         }
         self.ctx.gemv_q8_out(
             xq as *const u8,
