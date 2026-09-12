@@ -447,7 +447,9 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                 Ok(acc) => {
                     eng = eng.with_acc(acc);
-                    eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");
+                    eprintln!(
+                        "# backend: gpu (qwen4exp rawhip — 프리필 프레임(기본)/디코드 프레임)"
+                    );
                 }
                 Err(e) => {
                     eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
