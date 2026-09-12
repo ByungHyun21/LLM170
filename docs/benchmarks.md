@@ -3739,3 +3739,26 @@ right at the real stride. So neither the loaders nor the layouts nor the shared-
 53248 B bug, fixed) explain the multi-chunk NaN; the remaining suspects inside the tile kernel are
 the softmax bookkeeping around `mrun`/`srun` per fragment slot and the P hand-off through shared
 memory. Everything else about the kernel has now been verified in isolation.
+
+## Session close: where the base cells stand and what is left (2026-09-12)
+
+Measured with the current build (wk8 adopted):
+
+| metric | ours | llama-bench (live) | ratio |
+|---|---|---|---|
+| pp512 | 345.5 (paired) | 345.85 ± 1.63 | **0.999x (parity)** |
+| pp3314 | 314-319 | 335.06 | 0.94-0.95x |
+| tg512 | 11.2-11.5 | 11.68 ± 0.05 | 0.96-0.98x |
+| tg3314 | ~10.7 | 11.54 | 0.92x |
+| MTP (spec3 steady) | **22.2 t/s** | 11.5 (recorded) | **1.93x** |
+| np4 (server, 4 concurrent) | **22.64 agg** | 15.5 (recorded) | **1.46x** |
+| mmproj vision | 1.1 s | 1.60 s | **1.45x** |
+
+The fitted pp model splits the remaining gaps cleanly: our *linear* term is 2.679 ms/token against
+llama's 2.758 (we are 3% faster on matmuls and weight streaming), and the whole deficit is the
+attention's quadratic term (3.68e-7 vs 1.37e-7). That term is bounded below by the SIMD shuffle unit
+on the scalar path - skipping it measures +17% (316 -> 370 t/s), shared memory is 4x slower than
+shuffles, and wk8 already banks what level-shaving can (+2.3%). The remaining route is a
+tensor-core tile kernel; `wmma-check` and `wmma-check-ldm` (both committed) have verified every
+primitive it needs, and the ad-hoc attempt's remaining defect is confined to the softmax bookkeeping
+and the P hand-off.
