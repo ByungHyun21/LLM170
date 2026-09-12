@@ -3007,3 +3007,14 @@ rewrite of the decode *and* verify attention kernels.
 
 GQA (adopted earlier today) was compatible precisely because it mapped split4q4's four-row
 structure onto the head axis 1:1, keeping every arithmetic operation in place.
+
+## MTP prefill: q projection skipped on non-final chunks (2026-09-12)
+
+Only k/v feed the draft layer's KV, and the attention (which is the only consumer of q)
+runs on the prompt-ending chunk, so the q projection is now gated by `with_head` like the
+head itself. Output-neutral (verified: the spec stream is unchanged) but *performance*
+neutral too: the MTP prefill's remaining ~33 ms per 512-token chunk is not the
+projections but the host-side work - dequantising the token embeddings into `tok_flat`
+and uploading them (10.5 MB per chunk, a second pass over the same embeddings the main
+model already dequantised and uploaded). Optimising that needs the embedding lookup to
+happen on the device from token ids, which is the documented next step for this 0.5% gap.

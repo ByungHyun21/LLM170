@@ -2152,8 +2152,11 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let an = *self.consts.get("blk.64.attn_norm").ok_or("attn_norm")?;
         self.rms_rows(self.mtp_b_cur, an, self.mtp_b_e, n, t)?;
         self.ctx.quant_q8_b(self.mtp_b_e, self.mtp_b_xqn, n, xq_n, t)?;
+        // q 투영은 attention(=종료 청크)에서만 필요 — KV는 k/v만 적립한다.
         let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
-        self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wq, tq, niq, noq, self.aq_t, t)?;
+        if with_head {
+            self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wq, tq, niq, noq, self.aq_t, t)?;
+        }
         let (wk, tk, nik, nok) = self.w("blk.64.attn_k.weight")?;
         self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wk, tk, nik, nok, self.ak_t, t)?;
         let (wv, tv, niv, nov) = self.w("blk.64.attn_v.weight")?;
