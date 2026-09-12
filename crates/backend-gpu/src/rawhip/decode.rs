@@ -60,6 +60,8 @@ pub struct DecodeState {
     pub mtp_on: bool,
     pub mtp_kv_k: Vec<*mut u8>,
     pub mtp_kv_v: Vec<*mut u8>,
+    pub mtp_kv_k16: Vec<*mut u8>,
+    pub mtp_kv_v16: Vec<*mut u8>,
     pub mtp_cat: *mut u8,   // [2n] enorm‖hnorm
     pub mtp_cur: *mut u8,   // [n] eh_proj 출력/레이어 hidden
     pub mtp_qkv: *mut u8,   // q(2hd×h)‖k‖v t=1
@@ -257,12 +259,17 @@ impl DecodeState {
         let b_ms_ptr = ctx.alloc(64 * 8 * 2).map_err(|e| e.to_string())?; // K/V 테이블 2×64행
         let b_mtp_xq_sz = (n_ao / 4 + n_ao / 32 + n_ao / 16) * 4;
         let b_mtp_xq2_sz = (2 * n / 4 + 2 * n / 32 + 2 * n / 16) * 4;
+        let mut v_mtp_k16: Vec<*mut u8> = Vec::new();
+        let mut v_mtp_v16: Vec<*mut u8> = Vec::new();
         let (mut v_mtp_k, mut v_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
             let mut vk = Vec::with_capacity(n_seqs);
             let mut vv = Vec::with_capacity(n_seqs);
             for _ in 0..n_seqs {
                 vk.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
                 vv.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                // MTP 어텐션도 f16 미러를 읽는다(qsa_flash 가 f16).
+                v_mtp_k16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
+                v_mtp_v16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
             }
             (
                 vk, vv,
@@ -306,6 +313,9 @@ impl DecodeState {
             let zk = vec![0u8; kv_len * 4];
             for &p in v_mtp_k.iter() { ctx.h2d(p, &zk)?; }
             for &p in v_mtp_v.iter() { ctx.h2d(p, &zk)?; }
+            let zh = vec![0u8; kv_len * 2];
+            for &p in v_mtp_k16.iter() { ctx.h2d(p, &zh)?; }
+            for &p in v_mtp_v16.iter() { ctx.h2d(p, &zh)?; }
         }
         let (b_xs, b_xn, b_gqkv, b_gconv) = (bs(n * 4), bs(n * 4), bs(conv_ch * 4), bs(conv_ch * 4));
         let (b_gz, b_gb, b_ga, b_gbg) = (bs(d_inner * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 4), bs(hp.dt_rank * 2 * 4));
@@ -339,6 +349,8 @@ impl DecodeState {
             mtp_on,
             mtp_kv_k: std::mem::take(&mut v_mtp_k),
             mtp_kv_v: std::mem::take(&mut v_mtp_v),
+            mtp_kv_k16: v_mtp_k16,
+            mtp_kv_v16: v_mtp_v16,
             mtp_cat: b_mtp_cat,
             mtp_cur: b_mtp_cur,
             mtp_qkv: b_mtp_qkv,
@@ -815,6 +827,7 @@ impl DecodeState {
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hk).as_mut(), self.ak)?;
                     eprintln!("#  A3dbg pos{pos} ak[0..4]={:?}", &hk[0..4]);
                     let mut hck = vec![0f32; (pos + 1) * n_kv * hd];
+                    if !legacy_f32() { return Err("dump env needs the f32 KV (set LLM170_NO_GQA2D)".into()); }
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hck).as_mut(), self.kv_k[full_idx][seq])?;
                     let b0 = pos * n_kv * hd;
                     eprintln!("#  A3dbg pos{pos} cache_k[b0..4]={:?} cache_k[0..4]={:?}", &hck[b0..b0 + 4], &hck[0..4]);
@@ -877,8 +890,8 @@ impl DecodeState {
                 // t=1 fused flash (score/mix2 대체)
                 if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
                     let mut qp = self.aq as *mut std::ffi::c_void;
-                    let mut ckp = self.kv_k[full_idx][seq] as *mut std::ffi::c_void;
-                    let mut cvp = self.kv_v[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut ckp = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
+                    let mut cvp = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
                     let mut mp = mask as *mut std::ffi::c_void;
                     let mut op = self.aout as *mut std::ffi::c_void;
                     let mut np_ = (pos + 1) as i32;
@@ -1059,6 +1072,7 @@ fn legacy_f32() -> bool {
     std::env::var_os("LLM170_NO_FLASH").is_some()
         || std::env::var_os("LLM170_NO_GQA").is_some()
         || std::env::var_os("LLM170_NO_GQA2").is_some()
+        || std::env::var_os("LLM170_NO_GQA2D").is_some()
 }
 
 fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: usize, n: usize) -> Result<(), String> {
@@ -2106,13 +2120,15 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         // MTP KV append
         self.copy(self.ak, self.mtp_kv_k[seq], 0, pos * n_kv * hd, n_kv * hd)?;
         self.copy(self.av, self.mtp_kv_v[seq], 0, pos * n_kv * hd, n_kv * hd)?;
+        kv_to_f16(&self.ctx, self.ak, self.mtp_kv_k16[seq], 0, pos * n_kv * hd, n_kv * hd)?;
+        kv_to_f16(&self.ctx, self.av, self.mtp_kv_v16[seq], 0, pos * n_kv * hd, n_kv * hd)?;
         // flash attention (np = pos+1)
         {
             let n_past = pos + 1;
             let mask = self.consts.get("mask").copied().ok_or("mask")?;
             let mut qp = self.aq as *mut std::ffi::c_void;
-            let mut ckp = self.mtp_kv_k[seq] as *mut std::ffi::c_void;
-            let mut cvp = self.mtp_kv_v[seq] as *mut std::ffi::c_void;
+            let mut ckp = self.mtp_kv_k16[seq] as *mut std::ffi::c_void;
+            let mut cvp = self.mtp_kv_v16[seq] as *mut std::ffi::c_void;
             let mut mp = mask as *mut std::ffi::c_void;
             let mut op = self.mtp_ao as *mut std::ffi::c_void;
             let mut np_ = n_past as i32;
@@ -2310,9 +2326,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             ];
             self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)?;
         }
-        for (src, dst) in [
-            (self.ak_t, self.mtp_kv_k[seq]),
-            (self.av_t, self.mtp_kv_v[seq]),
+        for (src, dst, dst16) in [
+            (self.ak_t, self.mtp_kv_k[seq], self.mtp_kv_k16[seq]),
+            (self.av_t, self.mtp_kv_v[seq], self.mtp_kv_v16[seq]),
         ] {
             let mut sp = src as *mut std::ffi::c_void;
             let mut dp = dst as *mut std::ffi::c_void;
@@ -2320,6 +2336,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             let mut p0 = pos0 as i32;
             let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
             self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+            let dstoff = pos0 * n_kv * hd;
+            kv_to_f16(&self.ctx, src, dst16, 0, dstoff, t * n_kv * hd)?;
         }
         {
             // KV-only: 원소 i의 MTP층 출력은 (a) 헤드에서 마지막 행만, (b) 체인은
@@ -2327,8 +2345,8 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             // 인과 구조상 마지막 행의 출력은 앞 행들의 *KV*만 필요하다 (이미 적립).
             // LLM170_MTP_FULL=1이면 종전 전행 경로.
             let mut qp = unsafe { self.aq_t.add(qoff * 4) } as *mut std::ffi::c_void;
-            let mut ckp = self.mtp_kv_k[seq] as *mut std::ffi::c_void;
-            let mut cvp = self.mtp_kv_v[seq] as *mut std::ffi::c_void;
+            let mut ckp = self.mtp_kv_k16[seq] as *mut std::ffi::c_void;
+            let mut cvp = self.mtp_kv_v16[seq] as *mut std::ffi::c_void;
             let mut mp = mask as *mut std::ffi::c_void;
             let mut op = unsafe { self.aout_t.add(ooff * 4) } as *mut std::ffi::c_void;
             let mut np_ = (pos0 + t) as i32;
@@ -2681,14 +2699,20 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     // KV append per-seq
                     let pos = poss[s] as usize;
                     let av_row = unsafe { self.av_t.add(s * n_kv * hd * 4) };
-                    for (src, table) in [(ak_row, &self.kv_k), (av_row, &self.kv_v)] {
-                        let mut sp = src as *mut std::ffi::c_void;
-                        let mut dp = table[full_idx][seqs[s]] as *mut std::ffi::c_void;
-                        let mut na = (n_kv * hd) as i32;
-                        let mut p0 = pos as i32;
-                        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
-                        self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, 1, 1, 64, &mut args)?;
+                    if legacy_f32() {
+                        for (src, table) in [(ak_row, &self.kv_k), (av_row, &self.kv_v)] {
+                            let mut sp = src as *mut std::ffi::c_void;
+                            let mut dp = table[full_idx][seqs[s]] as *mut std::ffi::c_void;
+                            let mut na = (n_kv * hd) as i32;
+                            let mut p0 = pos as i32;
+                            let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                            self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, 1, 1, 64, &mut args)?;
+                        }
                     }
+                    // f16 미러: 활성 행에서 직접 변환(어텐션은 미러만 읽는다)
+                    let si = seqs[s];
+                    kv_to_f16(&self.ctx, ak_row, self.kv_k16[full_idx][si], 0, pos * n_kv * hd, n_kv * hd)?;
+                    kv_to_f16(&self.ctx, av_row, self.kv_v16[full_idx][si], 0, pos * n_kv * hd, n_kv * hd)?;
                     // flash per-seq (t=1)
                     {
                         let mut qp = aq_row as *mut std::ffi::c_void;
@@ -3157,14 +3181,14 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     }
 
     fn ms_kvk_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
-        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k[il][sq as usize]).collect();
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k16[il][sq as usize]).collect();
         let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
         self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
         Ok(dst)
     }
 
     fn ms_kvv_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
-        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_v[il][sq as usize]).collect();
+        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_v16[il][sq as usize]).collect();
         let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
         self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
         Ok(dst)
