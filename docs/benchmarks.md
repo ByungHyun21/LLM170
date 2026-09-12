@@ -2945,3 +2945,28 @@ device `__expf`; at 32 blocks 15.63 vs 5.78. Effect on the whole engine:
 The device exp is now the **default** (it improves the very gate the project uses for
 acceptance and costs only the internal glibc-bit-exactness); `LLM170_EXACTEXP=1` restores
 the f64 path, verified to reproduce the previous bit-identical reference exactly.
+
+## Four-mode audit with the fast exp (2026-09-12, final for this pass)
+
+Interleaved with llama-bench (3 rounds), same model and prompt.
+
+| mode | metric | llama | ours | ratio |
+|---|---|---|---|---|
+| base | pp512 | 341.8 (346.5/335.1/341.8) | **342.7** | **1.003x** |
+| base | tg32 | 11.51 (11.63/11.51/11.50) | 11.28 | 0.980x |
+| MTP (k=4, GPU chain) | tg32 | 11.51 | **15.8** | **1.37x** |
+| MTP | pp512 | 341.8 | 340.1 | 0.995x |
+| np4 (4 streams x spec4) | tg aggregate | 12.51 | **17.77** | **1.42x** |
+| np4 | pp | 341.8 | 342.7 | 1.003x |
+| mmproj | vision forward | 1.60 s | **1.1 s** | - |
+| mmproj | gate | - | 4/5 (one semantic WARN: our 24-token answer opens in `<think>`) | - |
+
+Judged correctness: **17/19** (was 16/19 before the exp change; `long_prompt`, `long_np4_seq0`,
+all 10 spec cases and the np4 set pass; the two remaining failures are the non-spec
+long-context near-ties `long_np2_seq1`/`long_np4_seq1` at gen[1] where ours is top-3 with a
+5.99 gap).
+
+Session totals for the base mode: pp512 313.8 -> 342.7 (+9%), tg32 10.83 -> 11.28 (+4.2%).
+Remaining gaps: base-mode tg 2.0% (the residue is rmsq's f32 chain, the GDN AR's state
+bandwidth and the decode attention's residual) and MTP-mode pp 0.5% (the draft layer's
+k/v projections, which its own KV genuinely needs).
