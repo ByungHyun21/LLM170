@@ -182,6 +182,24 @@ extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w,
     out[(size_t)r * n_out + o] = acc;
 }
 
+// f32 MMQ급 타일 — 16출력 × 16행/블록(256스레드). 스레드당 (출력,행) 한 쌍을
+// k 직렬 누산한다. 원판은 (행,출력) 블록 + 64레인 분할이라 스레드당 일감이
+// 40 MAC뿐이었고(총 지연), 같은 가중치 행을 행 수만큼 다시 읽었다.
+// 누산 순서가 달라 비트 동일은 아니다(허용 오차 계약).
+extern "C" __global__ void q4_gemm_f32_m(const float* x, const float* w, float* out,
+                                         int n_in, int n_out, int x_stride, int t) {
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = (int)blockIdx.x * 16 + ox;
+    int r = (int)blockIdx.y * 16 + rx;
+    if (o >= n_out || r >= t) return;
+    const float* xr = x + (size_t)r * x_stride;
+    const float* wr = w + (size_t)o * n_in;
+    float acc = 0.0f;
+    for (int k = 0; k < n_in; k++) acc += xr[k] * wr[k];
+    out[(size_t)r * n_out + o] = acc;
+}
+
 // f32 가중치 GEMV/GEMM (MoE 라우터 ffn_gate_inp 등) — 무양자화.
 // grid (t, n_out), 64레인, x 행 스트라이드 = x_stride (float).
 extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* out,

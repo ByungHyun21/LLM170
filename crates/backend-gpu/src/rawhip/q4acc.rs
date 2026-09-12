@@ -545,14 +545,37 @@ impl Q4Acc {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
-        let gy = n_out.min(65535) as u32;
-        let gz = n_out.div_ceil(65535) as u32;
         let mut x_p = x as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut o_p = out as *mut std::ffi::c_void;
         let mut ni = n_in as i32;
         let mut no = n_out as i32;
         let mut st = n_in as i32;
+        // MMQ급 타일 — 커널 자체는 276→176ms로 빨라지지만(스레드당 40 MAC →
+        // 2560 MAC) 엔드투엔드 pp512는 136.5 vs 137.8로 **차이 없음**(파이프라인
+        // 뒤에 숨음). 이득 없는 계약 변경이라 기본에서 제외 — 옵트인만 남긴다.
+        if t >= 16 && std::env::var_os("LLM170_F32_MMQ").is_some() {
+            let mut tt = t as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut st) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.ctx.launch3(
+                "q4_gemm_f32_m",
+                n_out.div_ceil(16) as u32,
+                t.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            );
+        }
+        let gy = n_out.min(65535) as u32;
+        let gz = n_out.div_ceil(65535) as u32;
         let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&mut x_p) as *mut _ as *mut std::ffi::c_void,
             (&mut w_p) as *mut _ as *mut std::ffi::c_void,
