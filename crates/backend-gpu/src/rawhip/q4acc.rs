@@ -87,6 +87,10 @@ pub struct Q4Acc {
     cvv: std::sync::Mutex<GBuf>,
     msk: std::sync::Mutex<GBuf>,
     atn: std::sync::Mutex<GBuf>,
+    /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
+    xperm: std::sync::Mutex<GBuf>,
+    yperm: std::sync::Mutex<GBuf>,
+    rperm: std::sync::Mutex<GBuf>,
 }
 
 // SAFETY: 포인터는 디바이스 주소 — 스레드 간 공유해도 HIP 런타임이 직렬화한다
@@ -104,6 +108,36 @@ fn ggml_id(ty: GgmlType) -> u32 {
 }
 
 impl Q4Acc {
+    /// 행 순열 gather: dst[g] = src[perm[g]] (row_u32 = 행당 u32 수).
+    /// 산란은 역순열을 넘겨 같은 커널로 수행한다.
+    fn rows_permute(
+        &self,
+        src: *mut u8,
+        perm: &[u32],
+        dst: *mut u8,
+        row_u32: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 || row_u32 == 0 {
+            return Ok(());
+        }
+        let pd = {
+            let mut g = self.rperm.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, n * 4)?
+        };
+        self.ctx.h2d(pd, bytemuck::cast_slice(perm))?;
+        let (mut a, mut b, mut c) = (src, pd, dst);
+        let (mut ru, mut nn) = (row_u32 as i32, n as i32);
+        self.kop(
+            "q4_rows_permute_u32",
+            n as u32,
+            1,
+            1,
+            128,
+            &mut cargs!(&mut a, &mut b, &mut c, &mut ru, &mut nn),
+        )
+    }
+
     pub fn new() -> Result<Self, String> {
         Self::new_with_sources(Vec::new())
     }
@@ -144,6 +178,9 @@ impl Q4Acc {
             cvv: std::sync::Mutex::new(GBuf::new("cvv")),
             msk: std::sync::Mutex::new(GBuf::new("msk")),
             atn: std::sync::Mutex::new(GBuf::new("atn")),
+            xperm: std::sync::Mutex::new(GBuf::new("xperm")),
+            yperm: std::sync::Mutex::new(GBuf::new("yperm")),
+            rperm: std::sync::Mutex::new(GBuf::new("rperm")),
         })
     }
 
@@ -641,8 +678,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
     }
 
     /// MoE ids 구동 전문가 GEMM — 스택 + ids(프레임 상주). ids는 행당 u32.
-    /// ids 40바이트 판독 후 전문가 연속 그룹으로 기존 커널을 런치한다(그룹당
-    /// 1런치, 스택은 1회 업로드). ids-aware 단일 런치는 후속 최적화.
+    /// ids는 확률순(전문가순 아님)이라 연속 런이 1행씩 흩어진다 — 실측
+    /// t=512·k_sel=10에서 런치 ~4000회/층. 카운팅 정렬로 전문가 순으로 묶어
+    /// 런치 수를 전문가 수 수준으로 줄이고(순열은 relu 없이 안정), 결과 행
+    /// 순서는 역순열 산란으로 복원한다(가중합이 원래 행 순서를 요구).
     fn frame_moe_gemm(
         &self,
         x: u64,
@@ -668,30 +707,54 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         } else {
             self.frame_quant(xp, n_in, rows)?
         };
-        let mut i = 0usize;
-        while i < rows {
-            let e = idv[i];
-            let mut j = i + 1;
-            while j < rows && idv[j] == e {
-                j += 1;
+        let ne = n_expert_stack.max(1);
+        let mut off = vec![0usize; ne + 1];
+        for &e in &idv {
+            off[(e as usize).min(ne - 1) + 1] += 1;
+        }
+        for e in 0..ne {
+            off[e + 1] += off[e];
+        }
+        let mut cur = off[..ne].to_vec();
+        let mut perm = vec![0u32; rows];
+        let mut inv = vec![0u32; rows];
+        for (i, &e) in idv.iter().enumerate() {
+            let e = (e as usize).min(ne - 1);
+            let p = cur[e];
+            perm[p] = i as u32;
+            inv[i] = p as u32;
+            cur[e] += 1;
+        }
+        let row_u32 = if f32w { n_in } else { xq_w };
+        let xg = {
+            let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, rows * row_u32 * 4)?
+        };
+        let yg = {
+            let mut g = self.yperm.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, rows * n_out * 4)?
+        };
+        let xsrc0 = if f32w { xp } else { xq };
+        self.rows_permute(xsrc0, &perm, xg, row_u32, rows)?;
+        for e in 0..ne {
+            let r = off[e + 1] - off[e];
+            if r == 0 {
+                continue;
             }
-            let r = j - i;
-            let xsrc = if f32w {
-                unsafe { xp.add(i * n_in * 4) }
-            } else {
-                unsafe { xq.add(i * xq_w * 4) }
-            };
-            let wsrc = unsafe { wd.add(e as usize * per_expert) };
-            let dst = unsafe { op_.add(i * n_out * 4) };
+            let start = off[e];
+            let xsrc = unsafe { xg.add(start * row_u32 * 4) };
+            let wsrc = unsafe { wd.add(e * per_expert) };
+            let dst = unsafe { yg.add(start * n_out * 4) };
             if f32w {
                 self.launch_gemm_f32(xsrc, wsrc, n_in, n_out, r, dst)?;
             } else {
                 self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, r, dst)?;
             }
-            i = j;
         }
+        self.rows_permute(yg, &inv, op_, n_out, rows)?;
         Ok(())
     }
+
 }
 
 impl Q4Acc {
@@ -883,32 +946,52 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
             yb.ensure(&self.ctx, t * n_out * 4)?
         };
-        // 전문가별 연속 그룹 런치
-        let mut i = 0usize;
-        while i < t {
-            let e = expert_ids[i];
-            let mut j = i + 1;
-            while j < t && expert_ids[j] == e {
-                j += 1;
+        // 전문가 순 그룹화 (2026-09-13): ids는 확률순이라 연속 런이 1행씩
+        // 흩어진다(프레임 실측 t=512·k=10 ≈4000런치/층). 카운팅 정렬로 묶어
+        // 런치 수를 전문가 수 수준으로 줄인다. x 행은 순열 gather로 모으고,
+        // 결과 행 순서는 d2h 후 호스트 산란으로 복원한다(가중합이 원래 행
+        // 순서를 요구 — 호스트 비용은 perm 인덱싱뿐).
+        let ne = n_expert_stack.max(1);
+        let mut off = vec![0usize; ne + 1];
+        for &e in expert_ids {
+            off[(e as usize).min(ne - 1) + 1] += 1;
+        }
+        for e in 0..ne {
+            off[e + 1] += off[e];
+        }
+        let mut cur = off[..ne].to_vec();
+        let mut perm = vec![0u32; t];
+        for (i, &e) in expert_ids.iter().enumerate() {
+            let e = (e as usize).min(ne - 1);
+            let p = cur[e];
+            perm[p] = i as u32;
+            cur[e] += 1;
+        }
+        let row_u32 = if w_f32 { n_in } else { xq_w };
+        let xbase = if w_f32 { xdev_f32 } else { xq_buf };
+        let xg = {
+            let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * row_u32 * 4)?
+        };
+        self.rows_permute(xbase, &perm, xg, row_u32, t)?;
+        for e in 0..ne {
+            let rows = off[e + 1] - off[e];
+            if rows == 0 {
+                continue;
             }
-            let rows = j - i;
-            let xsrc = if w_f32 {
-                unsafe { xdev_f32.add(i * n_in * 4) }
-            } else {
-                unsafe { xq_buf.add(i * xq_w * 4) }
-            };
-            let wsrc = unsafe { w_dev.add(e as usize * per_expert) };
-            let dst = unsafe { ydev.add(i * n_out * 4) };
+            let start = off[e];
+            let xsrc = unsafe { xg.add(start * row_u32 * 4) };
+            let wsrc = unsafe { w_dev.add(e * per_expert) };
+            let dst = unsafe { ydev.add(start * n_out * 4) };
             if w_f32 {
                 self.launch_gemm_f32(xsrc, wsrc, n_in, n_out, rows, dst)?;
             } else {
                 self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, rows, dst)?;
             }
-            i = j;
         }
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
-        for (o, v) in outs.iter_mut().zip(yflat.chunks_exact(n_out)) {
-            o.copy_from_slice(v);
+        for (g, v) in yflat.chunks_exact(n_out).enumerate() {
+            outs[perm[g] as usize].copy_from_slice(v);
         }
         Ok(())
     }

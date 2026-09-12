@@ -394,6 +394,17 @@ extern "C" __global__ void q4_moe_gather(const float* mix, float* xsel, int n, i
     xsel[j] = mix[(long)ti * n + i];
 }
 
+// 행 순열: dst[g] = src[perm[g]] (row_u32 = 행당 u32 수, 행은 4바이트 정렬).
+// MoE 전문가 그룹화의 gather·scatter 공용 — 산란은 역순열을 넘긴다.
+extern "C" __global__ void q4_rows_permute_u32(const unsigned* src, const unsigned* perm,
+                                               unsigned* dst, int row_u32, int n) {
+    int g = blockIdx.x;
+    if (g >= n || row_u32 <= 0) return;
+    const unsigned* s = src + (size_t)perm[g] * row_u32;
+    unsigned* d = dst + (size_t)g * row_u32;
+    for (int i = threadIdx.x; i < row_u32; i += blockDim.x) d[i] = s[i];
+}
+
 // MoE (t>1) — 전문가 가중 합: out[tok·n + i] = Σ_e wt[tok·k_sel + e]·ys[(tok·k_sel+e)·n + i]
 extern "C" __global__ void q4_moe_scatter(const float* ys, const float* wt, float* out, int k_sel, int n, int t) {
     long j = (long)blockIdx.x * blockDim.x + threadIdx.x;
