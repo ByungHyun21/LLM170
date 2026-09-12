@@ -470,6 +470,7 @@ impl Q4Acc {
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
             ];
             let gx = if tiled { t.div_ceil(16) as u32 } else { t as u32 };
+            // 참고: shared 스테이징 판은 실측 역효과(pp512 103.7→97.8) — 되돌림.
             return self.ctx.launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
