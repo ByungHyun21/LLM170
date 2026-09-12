@@ -3651,13 +3651,22 @@ part-diff explains exactly why:
   where the reference has 5.99 and 2.20 logit margins, which no rounding-level difference can do by
   itself; it needs the recurrence to carry it there.
 
-Consequence, and this is the important part: **our numerics already sit at the edge of the reference
-tolerance** (the shipped kernel passes 17/19 with two documented borderline cases). Any change to the
-attention's arithmetic - a different reduction tree, f16 staging, a WMMA tile reorder - shifts the
-trajectory past what the gates accept, *even when the kernel is provably correct*. So the remaining
-1.3-2.7x in the prefill attention is not reachable by arithmetic-preserving engineering alone
-(prefetch, unroll, lane mapping and shared staging were all measured neutral-to-worse), and reaching
-it would require re-baselining the judge's reference - a decision for the user, not a kernel change.
+Open question, stated honestly rather than papered over:
+
+- a 200-token single-chunk prompt with wk8 produced **bit-identical tokens** to wk16, which a
+  different reduction tree cannot do by luck;
+- yet on multi-chunk prompts wk8 diverges, and its layer-0 part diff (9.2e-5) is ~100x larger than
+  tree reordering alone would explain (relative error of a cancellation-prone sum, so not impossible,
+  but larger than expected).
+
+So the cause is either (a) length-dependent amplification through the recurrence, or (b) a residual
+bug in wk8 that only manifests with the chunked path (nseg > 4). The discriminator is a harness that
+feeds *identical* Q/K/V to both kernels for a late layer and compares the part buffers; if wk8 is
+then bit-identical, the divergence is amplification, otherwise it is a bug. Until that is settled,
+wk8 stays out.
+
+Either way the ceiling is measured: **17% of the prefill** (316 -> 370 t/s when the butterfly is
+skipped), and the shipped `wk16` remains the fastest variant that passes the gate.
 
 Same reasoning applies to the WMMA tile path and to the decode attention: their value is real
 (+17% ceiling measured by skipping the butterfly) but they trade numerical identity for it.
