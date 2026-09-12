@@ -1636,8 +1636,16 @@ gmark("attn", &mut marks);
                         // wk는 t>8(프리필) 전용 — 소형 배치(검증 t<=8)는 디코드와 같은
                         // split4q4를 써서 spec/greedy 계약을 구조적으로 만든다.
                         let wk = t > 8 && std::env::var_os("LLM170_NO_WKFLASH").is_none();
-                        let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };
-                        self.ctx.launch3(kn, gx, n_head as u32, nseg as u32, 256, &mut args)?;
+                        // hd=256 프리필은 16레인/행 판이 기본 (판정기 17/19 유지).
+                        // 3회 평균 pp3314 303.7 vs 종전 299.9 (+1.3%, 구동 잡음 ±1.5%).
+                        // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
+                        let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
+                        if wk16 {
+                            self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                        } else {
+                            let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };
+                            self.ctx.launch3(kn, gx, n_head as u32, nseg as u32, 256, &mut args)?;
+                        }
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
                         self.ctx.launch3("qsa_flash_merge", t as u32, n_head as u32, 1, 256, &mut margs)?;
                     } else {
