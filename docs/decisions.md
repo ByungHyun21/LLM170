@@ -15,7 +15,13 @@ only the recommendation was rejected.
 **Implication**: the GPU kernel path is wgpu (WGSL) or rust-gpu (.rs→SPIR-V)
 (decided at ADR-0004 time). Native CUDA waits for cuda-oxide maturity.
 
-## ADR-0002 — Mode system universal / cmp-stock / cmp-unlocked (2026-08-30)
+## ADR-0002 — Mode system universal / cmp-stock / cmp-unlocked (2026-08-30) — SUPERSEDED (2026-09-13)
+
+**Superseded by device measurement.** The flag set `LLM170_W_CAP_GB` (which
+had no reader) and `LLM170_Q4_CHUNK` (whose 1024/512 split the decode frame
+already capped), so it changed no route. Removed; the runtime now measures the
+device at accelerator init (name, free/total memory, host↔device bandwidth)
+and gates the WMMA attention path on a probe rather than a profile.
 
 **Decision**: three modes. Runtime flags + kernel variants + memory profiles.
 The core is mode-agnostic.
@@ -187,9 +193,7 @@ plus, for stateful stages, `&mut SeqState4`. Dispatch helpers
 (mm/mm_batch/mm_group/mm_paired) moved onto `Ctx`; the matrix-dispatch
 variants (grouped same-input projections, paired per-expert rows) are part
 of the context contract. `Engine4` keeps forward/prefill/decode and timing
-only. The runtime `--mode` flag (`core::mode`, ADR-0002 made concrete)
-selects memory budgets today and is the branch key for future cmp-stock
-kernel variants.
+only.
 
 **Consequences**: `layers.rs` is 335 lines; stages are backend-independent
 and independently testable. Numerics unchanged (pure code motion):

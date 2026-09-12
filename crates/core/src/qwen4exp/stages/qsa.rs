@@ -4,7 +4,6 @@
 use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
-use crate::matmul::Accelerator;
 use crate::ops::{rms_norm, rope_head, sigmoid};
 use llm170_profiler::profile_span;
 

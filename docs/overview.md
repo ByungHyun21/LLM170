@@ -8,10 +8,10 @@ target. Built from scratch — no llama.cpp, no ggml.
 1. **Priority 1 — CMP 170HX** (GA100, sm_80): maximum performance, assuming the
    40/64 GB unlock.
 2. **Priority 2 — portability**: runs on arbitrary hardware (any CPU, any GPU).
-   Solo development, so the universal mode doubles as the development and
-   verification baseline.
-3. **What happens on this machine now**: **universal-mode development**. The CMP
-   170HX is not yet accessible.
+   Solo development, so this machine (Ryzen AI Max+ 395 / gfx1151) doubles as
+   the development and verification baseline.
+3. **What happens on this machine now**: development on the integrated GPU. The
+   CMP 170HX is not yet accessible.
 
 ## Mode System
 

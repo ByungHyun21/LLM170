@@ -364,7 +364,63 @@ pub fn mm_tile_bench() -> Result<String, String> {
 /// dot4 루프-오버헤드 루프 프로브 — 모드별 유효 TIOPS.
 /// rocwmma 16x16x16 프래그먼트 레이아웃 검증 — C 레이아웃(idx=lane+32*sl, row=idx>>4,
 /// col=idx&15)과 A/B 레이아웃 가정을 정수 데이터로 정확히 확인한다(plans/47).
+/// WMMA 가용성 게이트 — 기동 1회 측정 후 캐시(플래그 대신 실측).
+/// 불가/오차 초과면 어텐션은 스칼라 판(wk8)으로 간다.
+pub fn wmma_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| matches!(wmma_probe_both(), Ok((ok, _)) if ok))
+}
+
+/// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
+/// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
+/// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+pub fn device_report(ctx: &RawCtx) -> String {
+    let name = unsafe {
+        let mut buf = vec![0i8; 256];
+        if hip::hipDeviceGetName(buf.as_mut_ptr(), 256, 0) == hip::hipError_t_hipSuccess {
+            std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+        } else {
+            "unknown".to_string()
+        }
+    };
+    let (free, total) = unsafe {
+        let (mut f, mut t) = (0usize, 0usize);
+        let e = hip::hipMemGetInfo(&mut f, &mut t);
+        if e == hip::hipError_t_hipSuccess { (f as u64, t as u64) } else { (0, 0) }
+    };
+    // 호스트↔디바이스 왕복 64 MiB (pageable) — 오프로딩 비용 신호.
+    let n = 64usize << 20;
+    let mut h2d = 0.0f64;
+    let mut d2h = 0.0f64;
+    if let Ok(d) = ctx.scratch(n) {
+        let src = vec![0x5au8; n];
+        let mut dst = vec![0u8; n];
+        for rep in 0..3 {
+            let t0 = std::time::Instant::now();
+            let _ = ctx.h2d(d, &src);
+            let dt = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            let _ = ctx.d2h(&mut dst, d as *const u8);
+            let dt2 = t1.elapsed().as_secs_f64();
+            if rep == 2 {
+                h2d = n as f64 / dt / 1e9;
+                d2h = n as f64 / dt2 / 1e9;
+            }
+        }
+    }
+    format!(
+        "# device: {name} | mem free={:.1}GiB total={:.1}GiB | h2d={h2d:.1}GB/s d2h={d2h:.1}GB/s | wmma={}",
+        free as f64 / (1u64 << 30) as f64,
+        total as f64 / (1u64 << 30) as f64,
+        if wmma_ok() { "ok" } else { "none" }
+    )
+}
+
 pub fn wmma_check() -> Result<String, String> {
+    wmma_probe_both().map(|(_, m)| m)
+}
+
+fn wmma_probe_both() -> Result<(bool, String), String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
     let a: Vec<f32> = (0..256).map(|i| (((i / 16) * 3 + (i % 16)) % 9) as f32 - 4.0).collect();
@@ -375,6 +431,7 @@ pub fn wmma_check() -> Result<String, String> {
     ctx.h2d(ad, bytemuck::cast_slice(&a))?;
     ctx.h2d(bd, bytemuck::cast_slice(&b))?;
     let mut msg = String::new();
+    let mut ok = true;
     for mode in [0i32, 1] {
         let mut ap = ad as *mut c_void;
         let mut bp = bd as *mut c_void;
@@ -409,8 +466,9 @@ pub fn wmma_check() -> Result<String, String> {
             }
         }
         msg += &format!("mode{mode}: max|delta| = {maxerr:.6}{first}\n");
+        ok &= maxerr <= 1e-3;
     }
-    Ok(msg)
+    Ok((ok, msg))
 }
 
 /// 합성 어텐션 검증: qsa_flash_wmma 를 작은 단일 케이스로 돌려 **CPU 기준**과 비교한다.

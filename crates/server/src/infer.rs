@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::{apply_mode, parse_ids_ref, usage_err};
+use crate::{parse_ids_ref, usage_err};
 
 pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;
@@ -13,7 +13,6 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
     let mut ctx = 4096usize;
     let mut backend = "cpu".to_string();
     let mut gpu_runtime = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
-    let mut mode: Option<llm170_core::mode::Mode> = None;
     let mut spec_k: Option<usize> = None;
 
     let mut it = args.iter();
@@ -49,10 +48,6 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                 Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
                 None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
-            "--mode" => match it.next().map(String::as_str).and_then(llm170_core::mode::Mode::from_str) {
-                Some(m) => mode = Some(m),
-                None => return usage_err("--mode requires universal|cmp-stock|cmp-unlocked"),
-            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) if k >= 1 && k <= 8 => spec_k = Some(k),
                 _ => return usage_err("--spec requires k in 1..=8"),
@@ -64,9 +59,6 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
     let Some(model_path) = model else {
         return usage_err("--model required");
     };
-    if let Some(m) = mode {
-        apply_mode(m);
-    }
     if prompts.is_empty() {
         return usage_err("at least one --prompt-tokens required");
     }
