@@ -3142,7 +3142,8 @@ That puts MTP-mode pp at ~1.00x of llama (was 0.995x) on top of the base-mode pp
 
 ## Attention rewrite, third attempt: kernel proven correct, divergence is verify-side (2026-09-12)
 
-A unit probe (`wh-check` in `launch-probe`) feeds the row x head kernel a synthetic setup
+A unit probe (added to `launch-probe` alongside the kernel attempt; both are reverted, so
+re-add together) feeds the row x head kernel a synthetic setup
 with an analytic answer - unit query, unit key, values = dimension index - and the kernel
 returns exactly m = 256, s = 1, acc error 0. The kernel's dot reduction, online softmax
 and part write are therefore correct; the spec != non-spec divergence seen when it was
