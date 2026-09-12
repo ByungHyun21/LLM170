@@ -609,3 +609,65 @@ extern "C" __global__ void wmma_probe(const float* a, const float* b, float* c, 
         c[idx] = fc.x[sl];
     }
 }
+
+// 진단 전용: wk16 의 8레인/행 판(버터플라이 3단). 모델 경로에는 연결하지 않고
+// `llm170 attn-check` 가 wk16 과 동일 입력으로 비교하는 데만 쓴다(plans/47 판별 하네스).
+extern "C" __global__ void qsa_flash_wk8(const float* q, const float* ck, const float* cv,
+                                         const unsigned* mask, float* part,
+                                         int n_past, int n_head, int n_kv,
+                                         int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    int q0 = blockIdx.x * 32;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;
+    int nq = min(32, t_len - q0);
+    int lane = threadIdx.x & 31;
+    int w = threadIdx.x >> 5;
+    int grp = lane >> 3;
+    int own = lane & 7;
+    int r = w * 4 + grp;
+    bool real = (r < nq);
+    int rf = real ? r : 0;
+    int kvh = h / (n_head / n_kv);
+    const float* qrow = q + ((size_t)(q0 + rf) * n_head + h) * 2 * hd;
+    float qv[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) qv[j] = qrow[own * 32 + j];
+    float m = -3.4028235e38f, ssum = 0.0f;
+    float acc[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) acc[j] = 0.0f;
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int kb0 = kvh * hd + own * 32;
+    int kq = (pos0 + q0 + rf) * sstride;
+    for (int k = p0; k < p1; k++) {
+        const float* kp = ck + (size_t)k * n_kv * hd + kb0;
+        float kv[32];
+        #pragma unroll
+        for (int j = 0; j < 32; j++) kv[j] = kp[j];
+        float pr = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) pr = fmaf(qv[j], kv[j], pr);
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            pr += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, pr, off);
+        if (real && mask[kq + k] != 0u) {
+            float gm = fmaxf(m, pr);
+            float e_m = __expf(m - gm);
+            float e_d = __expf(pr - gm);
+            ssum = ssum * e_m + e_d;
+            m = gm;
+            const float* vp = cv + (size_t)k * n_kv * hd + kb0;
+            #pragma unroll
+            for (int j = 0; j < 32; j++) acc[j] = acc[j] * e_m + e_d * vp[j];
+        }
+    }
+    if (!real) return;
+    int nseg = (n_past + seg - 1) / seg;
+    float* pp2 = part + ((size_t)((q0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+    if (own == 0) { pp2[hd] = m; pp2[hd + 1] = ssum; }
+    #pragma unroll
+    for (int j = 0; j < 32; j++) pp2[own * 32 + j] = acc[j];
+}

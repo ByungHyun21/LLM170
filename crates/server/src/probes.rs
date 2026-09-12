@@ -65,6 +65,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
         "roof-test" => llm170_backend_gpu::rawhip::roof_test(),
         "wmma-check" => llm170_backend_gpu::rawhip::wmma_check(),
+        "attn-check" => llm170_backend_gpu::rawhip::attn_check(),
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
         "bw-test" => llm170_backend_gpu::rawhip::bw_test(),

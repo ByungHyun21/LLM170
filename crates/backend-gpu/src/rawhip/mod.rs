@@ -1663,6 +1663,93 @@ pub fn wmma_check() -> Result<String, String> {
     Ok(msg)
 }
 
+/// 두 prefill 어텐션 커널(wk16 vs wk8)에 **동일한** Q/K/V/마스크를 넣고 part 버퍼를 비교한다.
+/// 같은 입력에서 part 가 갈리면 커널 버그, 일치하면(또는 반올림 수준이면) 긴 문맥 발산은
+/// 재귀 층을 통한 증폭이다. plans/47 의 판별 하네스.
+pub fn attn_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_head, n_kv, hd) = (24usize, 4usize, 256usize);
+    let (t, pos0, seg, sstride, ctx_len) = (512usize, 1536usize, 128usize, 2048usize, 2048usize);
+    let n_past = pos0 + t;
+    let nseg = (n_past + seg - 1) / seg;
+    // 입력: 결정적 의사난수(양 커널에 동일)
+    let qv: Vec<f32> = (0..t * n_head * 2 * hd)
+        .map(|i| (((i * 1103515245 + 12345) % 2000) as f32 - 1000.0) * 1e-3)
+        .collect();
+    let kv_k: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 214013 + 2531011) % 2000) as f32 - 1000.0) * 1e-3)
+        .collect();
+    let kv_v: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 1260231 + 999983) % 2000) as f32 - 1000.0) * 1e-3)
+        .collect();
+    let mut mask: Vec<u32> = vec![0u32; (pos0 + t) * sstride];
+    for r in 0..(pos0 + t) {
+        for k in 0..=r.min(ctx_len - 1) {
+            mask[r * sstride + k] = 1;
+        }
+    }
+    let qd = ctx.alloc(qv.len() * 4)?;
+    let kd = ctx.alloc(kv_k.len() * 4)?;
+    let vd = ctx.alloc(kv_v.len() * 4)?;
+    let md = ctx.alloc(mask.len() * 4)?;
+    let pd = ctx.alloc(t * n_head * nseg * (hd + 2) * 4)?;
+    ctx.h2d(qd, bytemuck::cast_slice(&qv))?;
+    ctx.h2d(kd, bytemuck::cast_slice(&kv_k))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&kv_v))?;
+    ctx.h2d(md, bytemuck::cast_slice(&mask))?;
+    let mut out = String::new();
+    for (name, gx) in [("qsa_flash_wk16", (t + 15) / 16), ("qsa_flash_wk8", (t + 31) / 32)] {
+        let mut qp = qd as *mut c_void;
+        let mut kp = kd as *mut c_void;
+        let mut vp = vd as *mut c_void;
+        let mut mp = md as *mut c_void;
+        let mut pp = pd as *mut c_void;
+        let mut np_ = n_past as i32;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tl = t as i32;
+        let mut ss = sstride as i32;
+        let mut p0 = pos0 as i32;
+        let mut sg = seg as i32;
+        let mut args = vec![
+            (&mut qp) as *mut _ as *mut c_void, (&mut kp) as *mut _ as *mut c_void,
+            (&mut vp) as *mut _ as *mut c_void, (&mut mp) as *mut _ as *mut c_void,
+            (&mut pp) as *mut _ as *mut c_void, (&mut np_) as *mut _ as *mut c_void,
+            (&mut nh) as *mut _ as *mut c_void, (&mut nk) as *mut _ as *mut c_void,
+            (&mut h) as *mut _ as *mut c_void, (&mut tl) as *mut _ as *mut c_void,
+            (&mut ss) as *mut _ as *mut c_void, (&mut p0) as *mut _ as *mut c_void,
+            (&mut sg) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3(name, gx as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+        ctx.sync()?;
+        let mut v = vec![0f32; t * n_head * nseg * (hd + 2)];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), pd)?;
+        if name == "qsa_flash_wk16" {
+            std::fs::write("/tmp/attn_wk16.f32", bytemuck::cast_slice(&v)).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::write("/tmp/attn_wk8.f32", bytemuck::cast_slice(&v)).map_err(|e| e.to_string())?;
+        }
+        out += &format!("{name}: {gx} blocks, {nseg} segs\n");
+    }
+    // 비교
+    let a = std::fs::read("/tmp/attn_wk16.f32").map_err(|e| e.to_string())?;
+    let b = std::fs::read("/tmp/attn_wk8.f32").map_err(|e| e.to_string())?;
+    let a: &[f32] = bytemuck::cast_slice(&a);
+    let b: &[f32] = bytemuck::cast_slice(&b);
+    let mut maxd = 0f32;
+    let mut nbad = 0usize;
+    let pr = hd + 2;
+    for i in 0..a.len() {
+        let d = (a[i] - b[i]).abs();
+        if d > maxd { maxd = d; }
+        if (i % pr) < hd && d > 1e-4 { nbad += 1; }
+    }
+    out += &format!("max|delta| = {maxd:.6}, acc 원소(>1e-4) 불일치 {nbad} / {}\n", a.len() / pr * hd);
+    Ok(out)
+}
+
 pub fn roof_test() -> Result<String, String> {
     let ctx = RawCtx::new()?;
     let n_in = 5120usize;
