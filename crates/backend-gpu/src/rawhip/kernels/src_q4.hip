@@ -131,8 +131,8 @@ extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
 // 읽는 바이트가 원판(~1B)의 수백 배가 되어 총 지연에서 벗어난다.
 // 누산 순서가 원판(레인=서브블록 + 셔플 트리)과 다르므로 **비트 동일이 아니다**
 // — llama.cpp/vLLM과 같은 허용 오차 계약(q4-acc-check max_rel)으로 검증한다.
-extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w, float* out,
-                                          int n_in, int n_out, int xq_w, int t) {
+extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w, double* part,
+                                          float* out, int n_in, int n_out, int xq_w, int t) {
     extern __shared__ unsigned wsh[];
     int n_sub = n_in >> 5;
     int wrow = n_sub * 6;                 // 워드/출력행
