@@ -17,6 +17,50 @@ pub struct InferRequest {
     pub ctx: usize,
 }
 
+/// qwen4exp GPU 경로 요청 여부 (plans/64 P1).
+/// GPU = `--backend gpu` 명시 시에만 (기본은 CPU golden 경로).
+/// `LLM170_Q4_CPU=1` / `LLM170_RAWHIP=0`이면 항상 CPU.
+pub fn q4_gpu_env_off() -> bool {
+    if std::env::var_os("LLM170_Q4_CPU").is_some() {
+        return true;
+    }
+    std::env::var("LLM170_RAWHIP").map(|v| v == "0").unwrap_or(false)
+}
+
+pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
+    if q4_gpu_env_off() {
+        return false;
+    }
+    match backend {
+        BackendSel::Cpu => false,
+        BackendSel::Gpu => true,
+        BackendSel::GpuRuntime(r) => {
+            if r != "hip" {
+                eprintln!(
+                    "# qwen4exp: --gpu-runtime {r}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
+                );
+            }
+            true
+        }
+    }
+}
+
+/// qwen4exp GPU 요청 판정 — CLI 문자열판 (infer/bench).
+pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
+    if q4_gpu_env_off() {
+        return false;
+    }
+    if backend != "gpu" {
+        return false;
+    }
+    if runtime != "hip" {
+        eprintln!(
+            "# qwen4exp: --gpu-runtime {runtime}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
+        );
+    }
+    true
+}
+
 pub struct InferResult {
     pub tokens: Vec<u32>,
 }
@@ -395,7 +439,21 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     if arch.as_deref() == Some("qwen4exp") {
         let m = load_q4_retry(&req.model);
         let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
-        let _ = &backend;
+        // qwen4exp GPU 경로 (rawhip 값 경로) — plans/64 P1. 기본 CPU(정확성
+        // 기준); --backend gpu / --gpu-runtime hip일 때만 상주 가속기를 붙인다.
+        let want_gpu = q4_gpu_wanted(&backend);
+        if want_gpu {
+            match llm170_backend_gpu::new_q4_acc() {
+                Ok(acc) => {
+                    eng = eng.with_acc(acc);
+                    eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");
+                }
+                Err(e) => {
+                    eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
+                    eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
+                }
+            }
+        }
         Engine::Q4(eng)
     } else {
         let m = load_q35_retry(&req.model);

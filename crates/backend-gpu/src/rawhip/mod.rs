@@ -9,6 +9,7 @@ use std::ffi::CString;
 
 pub mod decode;
 pub mod kernels;
+pub mod q4acc;
 pub mod vit;
 
 /// 로드된 오프라인 타일 코드오브젝트 패밀리 (임베딩 or LLM170_CO*_PATH

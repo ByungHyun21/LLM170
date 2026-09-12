@@ -16,10 +16,11 @@ pub const SRC: &str = concat!(
     include_str!("src_qsa.hip"),
     include_str!("src_vit.hip"),
     include_str!("src_ms.hip"),
+    include_str!("src_q4.hip"),
 );
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq",
+    "quant_q8", "q4_gemm_q5_1", "q4_gemm_f32", "q4_qsa_attn", "silu_mul_f32", "dequant_q6k_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq",
     "gemm_xs", "row_shift_gather", "q6k_ref_scalar", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "l2_rows2_scale", "split3",

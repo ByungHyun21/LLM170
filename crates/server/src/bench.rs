@@ -114,7 +114,21 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             let m = llm170_core::qwen4exp::Model4::load(&model_path)
                 .map_err(|e| e.to_string())?;
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
-            let _ = (&backend, &gpu_runtime);
+            // plans/64 P1: GPU는 --backend gpu 명시 시에만. 주입 실패는 실패로
+            // 승격한다 (cubecl 제거 후 CPU 폴백 수치가 GPU로 오인된 이력).
+            let want_gpu = crate::engine::q4_gpu_wanted_str(&backend, &gpu_runtime);
+            if want_gpu {
+                match llm170_backend_gpu::new_q4_acc() {
+                    Ok(acc) => {
+                        eng = eng.with_acc(acc);
+                    }
+                    Err(e) => {
+                        eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
+                        eprintln!("error: bench는 CPU 폴백하지 않는다 (--backend cpu로 명시할 것)");
+                        return Err(e);
+                    }
+                }
+            }
             let eos = eng.model.eos;
             // 워밍업 1회 (스크래치 풀·가속기 warm)
             {
@@ -122,7 +136,10 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
                 let _ = llm170_core::model::greedy(&l);
             }
-            let frame_on = std::env::var("LLM170_FRAME").is_ok_and(|v| v != "0");
+            let _ = std::env::var("LLM170_FRAME");
+            // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
+            // 사라졌고, env를 "frame"으로 표기해 GPU 수치로 오인된 이력이 있다.
+            let dev = if want_gpu { " gpu" } else { " cpu" };
             for r in 0..reps {
                 eng.reset_states();
                 let t0 = Instant::now();
@@ -143,7 +160,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     }
                 }
                 let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
-                let fr = if frame_on { " frame" } else { "" };
+                let fr = dev;
                 lines.push(format!(
                     "pp{pp}{fr} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
                     pp as f64 / (pp_ms / 1e3)

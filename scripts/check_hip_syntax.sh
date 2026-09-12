@@ -10,7 +10,7 @@ ARCH="${1:-gfx1151}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)/crates/backend-gpu/src/rawhip/kernels"
 OUT="$(mktemp -t llm170_hip_XXXX).hip"
 # include_str! 순서와 동일하게 이어붙인다 (kernels/mod.rs SRC).
-for f in src_common src_quant src_gemv src_gemv4 src_gemm src_probe src_ew src_gdn src_qsa src_vit src_ms; do
+for f in src_common src_quant src_gemv src_gemv4 src_gemm src_probe src_ew src_gdn src_qsa src_vit src_ms src_q4; do
   [ -f "$DIR/$f.hip" ] && cat "$DIR/$f.hip" >> "$OUT"
 done
 if hipcc -x hip --offload-arch="$ARCH" --cuda-device-only -fsyntax-only -I"$DIR" "$OUT" 2>&1; then

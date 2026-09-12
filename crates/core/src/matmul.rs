@@ -635,6 +635,7 @@ pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
             | llm170_gguf::GgmlType::Q4K
             | llm170_gguf::GgmlType::Q5K
             | llm170_gguf::GgmlType::Q8_0
+            | llm170_gguf::GgmlType::Q5_1
             | llm170_gguf::GgmlType::Iq4Nl
             | llm170_gguf::GgmlType::Q6K
     )
@@ -744,6 +745,9 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
                     }
                     llm170_gguf::GgmlType::Q6K => {
                         crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, y)
+                    }
+                    llm170_gguf::GgmlType::Q5_1 => {
+                        crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, y)
                     }
                     _ => crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y),
                 };
