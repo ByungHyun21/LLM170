@@ -3303,3 +3303,26 @@ prints its listen log before loading 15.67GB, so a first request absorbs ~9-12s.
 scheduler loop shows `decode=87.9ms step=0.1ms n=1`, i.e. the server decodes at exactly the CLI's
 engine rate; the warm server runs at 11.3 t/s base and ~21 t/s spec3, and the 128-token np4 numbers
 above (22.6 t/s) already had the load amortised. No server-side per-token overhead exists.
+
+## Reference-length check: pp is far ahead, tg is the only unmet cell (2026-09-12)
+
+Running our bench at the Primary Target table's prompt lengths (llama.cpp ROCm 10 reference):
+
+| prompt | ours pp | llama pp | ours tg | llama tg |
+|---|---|---|---|---|
+| 512 | 348 | 350.8 | 11.34 | 11.48 (0.986x) |
+| 3314 | **299.7** | 229.9 (**1.30x**) | 10.66 | 11.6 (**0.92x**) |
+
+So prompt processing now leads llama substantially at the long-prompt sizes, while tg at 3314 is
+0.92x - the gap is larger at long context than the 512-token figure suggests, i.e. it includes a
+long-context attention term (~1.7ms at 512 tokens growing ~6x at 3314), not just the constant GEMV
+deficit. `LLM170_QSA_SEG` (128/256/512) is exactly neutral, so the segmented flash path is not
+segment-bound.
+
+Where the decode time actually goes (t=1, KTRACE, 1148 launches): kernels total 91.0ms of which
+**82.4ms (91%) is GEMV/GEMM** - 15.67GB of weights in 82ms = **190GB/s**, essentially the APU's
+practical wall - with rmsq 1.5, qsa_flash_gqa 1.7, gdn_ar 1.3, axpy 0.7 and everything else under
+1ms. Launch gaps are 0.0ms: the dispatch-count thesis from the earlier sessions no longer applies
+(the launches pipe fine). The remaining base-tg work is therefore (a) GEMV memory efficiency inside
+the quantized kernels and (b) the long-context attention path - and any change to (b) must be applied
+identically to the decode and the verify, since the spec contract compares their argmaxes.
