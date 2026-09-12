@@ -1641,6 +1641,14 @@ gmark("attn", &mut marks);
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
                         let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
                         if wk16 {
+                            if wk && hd == 256 && std::env::var_os("LLM170_NO_WK_WMMA").is_none() {
+                                // WMMA 타일 판(기본): Q_in_reg + Q 버퍼를 K/V 로 재사용. 공유 32768B.
+                                // pp512 361.3 / pp3314 329.2 vs 스칼라 360.2 / 324.7 (2026-09-12).
+                                // 산술이 f16 누적이라 스칼라와 다른데, 토큰 동일성은 600토큰
+                                // 다중 청크에서 확인했고 커널 정확성은 wmma-attn-check 가 보증한다.
+                                // LLM170_NO_WK_WMMA=1 이면 wk8 로 복귀.
+                                self.ctx.launch3_dyn("qsa_flash_wmma", ((t + 63) / 64) as u32, n_head as u32, nseg as u32, 256, 32768, &mut args)?;
+                            } else {
                             // hd=256 프리필은 8레인/행 판(셔플 3단)이 기본 — wk16 대비 페어 +2.3%.
                             // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
                             // `llm170 attn-check` 로 보증된다(사용자 결정 2026-09-12).
@@ -1649,6 +1657,7 @@ gmark("attn", &mut marks);
                                 self.ctx.launch3("qsa_flash_wk8", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else {
                                 self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            }
                             }
                         } else {
                             let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };

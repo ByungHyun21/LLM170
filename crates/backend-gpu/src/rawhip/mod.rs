@@ -1717,7 +1717,7 @@ pub fn wmma_attn_check() -> Result<String, String> {
         (&mut ss) as *mut _ as *mut c_void, (&mut p0) as *mut _ as *mut c_void,
         (&mut sg) as *mut _ as *mut c_void,
     ];
-    let smem = (4 * 16 * 256 * 2 + 2 * 16 * 256 * 2 + 4 * 2 * 256 * 2 + 4 * 2 * 256 * 4) as u32;
+    let smem = (4 * 16 * 256 * 2) as u32;   // Q 32768B — K/V·S·P 는 이 버퍼를 재사용한다
     ctx.launch3_dyn("qsa_flash_wmma", (t / 64) as u32, n_head as u32, nseg as u32, 256, smem, &mut args)?;
     ctx.sync()?;
     let mut got = vec![0f32; t * n_head * nseg * (hd + 2)];

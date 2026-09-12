@@ -737,11 +737,15 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
     int p0 = sg * seg, p1 = min(p0 + seg, n_past);
     int hc = lane >> 4, cc = lane & 15;
 
+    // llama 의 Q_in_reg 를 따른다: Q 를 레지스터 프래그먼트로 소비한 뒤 그 공유 버퍼를
+    // K/V 타일로 재사용한다. 공유 예산이 (Q + KV + P) 합이 아니라 최대값이 되므로
+    // 61440 -> 32768B, 점유율 1 -> 2 블록/CU 를 노린다.
     extern __shared__ float gSmem[];
-    half* gQ16 = (half*)gSmem;                                   // 0
-    half* gK16 = (half*)(gSmem + (4 * 16 * 256) / 2);            // 32768B
-    half* gV16 = (half*)(gSmem + (4 * 16 * 256 + 16 * 256) / 2);  // 40960B
-    half* gP16 = (half*)(gSmem + (4 * 16 * 256 + 2 * 16 * 256) / 2); // 49152B
+    half* gQ16  = (half*)gSmem;                  // 0 .. 32768  (Q 전용, 이후 재사용)
+    half* gK16  = (half*)gSmem;                  // 0 .. 8192   (K)
+    half* gV16  = (half*)(gSmem + 2048);         // 8192 .. 16384 (V)
+    float* gS32 = (float*)(gSmem + 4096);        // 16384 .. 24576 (스코어 교환)
+    half* gP16  = (half*)(gSmem + 6144);         // 24576 .. 26624 (P)
 
     for (int i = tid; i < 4 * 16 * 256; i += 256) {
         int t2 = i >> 12, rr = (i >> 8) & 15, d = i & 255;
@@ -750,6 +754,15 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
                              : __float2half(0.0f);
     }
     __syncthreads();
+    // 절반 워프는 QK 의 k 를 8청크씩 나눠 맡으므로 자기 8개 프래그먼트만 로드한다
+    // (프래그먼트 8개 = half2 32개 = VGPR 32개).
+    fragment<matrix_a, 16, 16, 16, half, row_major> QA[8];
+    #pragma unroll
+    for (int kc = 0; kc < 8; kc++) {
+        int kd = hf * 8 + kc;
+        load_matrix_sync(QA[kc], &gQ16[pair * 16 * 256 + kd * 16], 256);
+    }
+    __syncthreads();   // 전 워프가 QA 로드 완료 → gSmem[0..8192) 를 K/V 로 덮어써도 된다
 
     float mrun[8], srun[8];
     #pragma unroll
@@ -764,10 +777,12 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
             int row = i >> 8, d = i & 255;
             bool isk = (row < 16);
             int r2 = isk ? row : (row - 16);
-            const float* src = isk ? ck : cv;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (r2 < nk) v = *reinterpret_cast<const float4*>(src + ((size_t)(kt + r2) * n_kv + kvh) * hd + d);
-            half* dst = isk ? &gK16[row * 256 + d] : &gV16[(row - 16) * 256 + d];
+            if (r2 < nk) {
+                const float* src = isk ? ck : cv;
+                v = *reinterpret_cast<const float4*>(src + ((size_t)(kt + r2) * n_kv + kvh) * hd + d);
+            }
+            half* dst = (isk ? &gK16[row * 256 + d] : &gV16[(row - 16) * 256 + d]);
             dst[0] = __float2half(v.x); dst[1] = __float2half(v.y);
             dst[2] = __float2half(v.z); dst[3] = __float2half(v.w);
         }
@@ -778,13 +793,10 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
         #pragma unroll
         for (int kc = 0; kc < 8; kc++) {
             int kd = hf * 8 + kc;
-            fragment<matrix_a, 16, 16, 16, half, row_major> fa;
             fragment<matrix_b, 16, 16, 16, half, col_major> fb;
-            load_matrix_sync(fa, &gQ16[pair * 16 * 256 + kd * 16], 256);
             load_matrix_sync(fb, &gK16[kd * 16], 256);
-            mma_sync(fs, fa, fb, fs);
+            mma_sync(fs, QA[kc], fb, fs);
         }
-        float* gS32 = (float*)(gSmem + (4 * 16 * 256 + 2 * 16 * 256) / 2 + 4 * 2 * 256 / 2);
         #pragma unroll
         for (int sl = 0; sl < 8; sl++) {
             int idx = lane + (sl << 5);
