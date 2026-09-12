@@ -715,3 +715,145 @@ extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* 
     #pragma unroll
     for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
 }
+
+// WMMA prefill 어텐션 (hd=256, 진단용). 조기 반환 없음(모든 가드가 플래그), 그래서
+// 키-타일 __syncthreads() 와 발산이 상호작용하지 않는다. 프리미티브는 세 프로브로 검증됨.
+extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
+        const float* q, const float* ck, const float* cv,
+        const unsigned* mask, float* part,
+        int n_past, int n_head, int n_kv, int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    int q0 = blockIdx.x * 64;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;      // 블록 균일 → 발산 없음
+    int nq = min(64, t_len - q0);
+    int tid = threadIdx.x;
+    int w = tid >> 5, lane = tid & 31;
+    int pair = w >> 1, hf = w & 1;
+    int qr = pair * 16;
+    int nqw = (qr < nq) ? min(16, nq - qr) : 0;
+    int kvh = h / (n_head / n_kv);
+    int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    int hc = lane >> 4, cc = lane & 15;
+
+    extern __shared__ float gSmem[];
+    half* gQ16 = (half*)gSmem;                                   // 0
+    half* gK16 = (half*)(gSmem + (4 * 16 * 256) / 2);            // 32768B
+    half* gV16 = (half*)(gSmem + (4 * 16 * 256 + 16 * 256) / 2);  // 40960B
+    half* gP16 = (half*)(gSmem + (4 * 16 * 256 + 2 * 16 * 256) / 2); // 49152B
+
+    for (int i = tid; i < 4 * 16 * 256; i += 256) {
+        int t2 = i >> 12, rr = (i >> 8) & 15, d = i & 255;
+        int row = t2 * 16 + rr, src = q0 + row;
+        gQ16[i] = (row < nq) ? __float2half(q[((size_t)src * n_head + h) * 2 * hd + d])
+                             : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    float mrun[8], srun[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) { mrun[j] = -3.4028235e38f; srun[j] = 0.0f; }
+    fragment<accumulator, 16, 16, 16, float> fc[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) fill_fragment(fc[j], 0.0f);
+
+    for (int kt = p0; kt < p1; kt += 16) {
+        int nk = min(16, p1 - kt);
+        for (int i = tid; i < 2 * 16 * 256; i += 256) {
+            int row = i >> 8, d = i & 255;
+            bool isk = (row < 16);
+            int r2 = isk ? row : (row - 16);
+            const float* src = isk ? ck : cv;
+            float v = (r2 < nk) ? src[((size_t)(kt + r2) * n_kv + kvh) * hd + d] : 0.0f;
+            if (isk) gK16[row * 256 + d] = __float2half(v);
+            else gV16[(row - 16) * 256 + d] = __float2half(v);
+        }
+        __syncthreads();
+        fragment<accumulator, 16, 16, 16, float> fs;
+        fill_fragment(fs, 0.0f);
+        #pragma unroll
+        for (int kc = 0; kc < 16; kc++) {
+            fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+            fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+            load_matrix_sync(fa, &gQ16[pair * 16 * 256 + kc * 16], 256);
+            load_matrix_sync(fb, &gK16[kc * 16], 256);
+            mma_sync(fs, fa, fb, fs);
+        }
+        int krow = (pos0 + q0 + qr) * sstride;
+        bool ok[8];
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int r = hc + 2 * sl;
+            ok[sl] = (r < nqw) && (cc < nk) && (mask[krow + r * sstride + kt + cc] != 0u);
+        }
+        float rmax[8];
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) rmax[sl] = ok[sl] ? fs.x[sl] : -3.4028235e38f;
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1)
+            #pragma unroll
+            for (int sl = 0; sl < 8; sl++)
+                rmax[sl] = fmaxf(rmax[sl], __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, rmax[sl], off));
+        // 개별 e (P 용) 와 행 합 (s 용) 을 분리한다 — 행의 16개 키는 16개 레인에 있으므로
+        // s 는 반드시 16레인 버터플라이로 합쳐야 한다(최대값만 줄이고 합을 안 줄이던 버그).
+        float e_m[8], erow[8];
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            float mn = fmaxf(mrun[sl], rmax[sl]);
+            e_m[sl] = __expf(mrun[sl] - mn);
+            float e = ok[sl] ? __expf(fs.x[sl] - mn) : 0.0f;
+            fs.x[sl] = e;         // P 행렬용 개별 확률
+            erow[sl] = e;         // 행 합용 사본
+            mrun[sl] = mn;
+        }
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1)
+            #pragma unroll
+            for (int sl = 0; sl < 8; sl++)
+                erow[sl] += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, erow[sl], off);
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) srun[sl] = srun[sl] * e_m[sl] + erow[sl];
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            #pragma unroll
+            for (int sl = 0; sl < 8; sl++) fc[j].x[sl] *= e_m[sl];
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int r = hc + 2 * sl;
+            gP16[(pair * 2 + hf) * 256 + r * 16 + cc] = __float2half(fs.x[sl]);
+        }
+        __syncthreads();
+        fragment<matrix_a, 16, 16, 16, half, row_major> fp;
+        load_matrix_sync(fp, &gP16[(pair * 2 + hf) * 256], 16);
+        #pragma unroll
+        for (int dc = 0; dc < 8; dc++) {
+            fragment<matrix_b, 16, 16, 16, half, row_major> fb;
+            load_matrix_sync(fb, &gV16[(hf * 8 + dc) * 16], 256);
+            mma_sync(fc[dc], fp, fb, fc[dc]);
+        }
+        __syncthreads();
+    }
+    int nseg2 = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int r = hc + 2 * sl;
+            if (r < nqw) {
+                float* pp2 = part + ((size_t)((q0 + qr + r) * n_head + h) * nseg2 + sg) * (hd + 2);
+                pp2[(hf * 8 + j) * 16 + cc] = fc[j].x[sl];
+            }
+        }
+    if (cc == 0) {
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int r = hc + 2 * sl;
+            if (r < nqw) {
+                float* pp2 = part + ((size_t)((q0 + qr + r) * n_head + h) * nseg2 + sg) * (hd + 2);
+                pp2[hd] = mrun[sl];
+                pp2[hd + 1] = srun[sl];
+            }
+        }
+    }
+}

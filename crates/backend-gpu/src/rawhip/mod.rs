@@ -1663,6 +1663,147 @@ pub fn wmma_check() -> Result<String, String> {
     Ok(msg)
 }
 
+/// 합성 어텐션 검증: qsa_flash_wmma 를 작은 단일 케이스로 돌려 **CPU 기준**과 비교한다.
+/// part 규약: seg 별 acc=Σ e_d·v (m,s 는 러닝 최대/합). 첫 불일치 위치를 보고한다.
+pub fn wmma_attn_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_head, n_kv, hd) = (4usize, 2usize, 256usize);
+    // 후반 청크 재현: pos0>0, n_past>t (실제 모델이 NaN 을 낸 구성)
+    let (t, pos0, seg, sstride, ctx_len) = (64usize, 32usize, 16usize, 256usize, 256usize);
+    let n_past = 96usize;
+    let nseg = (pos0 + t + seg - 1) / seg;   // 4
+    let qv: Vec<f32> = (0..t * n_head * 2 * hd)
+        .map(|i| (((i * 1103515245 + 12345) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let kk: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 214013 + 2531011) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let vv: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 1260231 + 999983) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let mut mask: Vec<u32> = vec![0u32; (pos0 + t) * sstride];
+    for r in 0..(pos0 + t) {
+        for k in 0..=r.min(ctx_len - 1) { mask[r * sstride + k] = 1; }
+    }
+    let qd = ctx.alloc(qv.len() * 4)?;
+    let kd = ctx.alloc(kk.len() * 4)?;
+    let vd = ctx.alloc(vv.len() * 4)?;
+    let md = ctx.alloc(mask.len() * 4)?;
+    let pd = ctx.alloc(t * n_head * nseg * (hd + 2) * 4)?;
+    ctx.h2d(qd, bytemuck::cast_slice(&qv))?;
+    ctx.h2d(kd, bytemuck::cast_slice(&kk))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&vv))?;
+    ctx.h2d(md, bytemuck::cast_slice(&mask))?;
+    let mut qp = qd as *mut c_void;
+    let mut kp = kd as *mut c_void;
+    let mut vp = vd as *mut c_void;
+    let mut mp = md as *mut c_void;
+    let mut pp = pd as *mut c_void;
+    let mut np_ = n_past as i32;
+    let mut nh = n_head as i32;
+    let mut nk = n_kv as i32;
+    let mut h = hd as i32;
+    let mut tl = t as i32;
+    let mut ss = sstride as i32;
+    let mut p0 = pos0 as i32;
+    let mut sg = seg as i32;
+    let mut args = vec![
+        (&mut qp) as *mut _ as *mut c_void, (&mut kp) as *mut _ as *mut c_void,
+        (&mut vp) as *mut _ as *mut c_void, (&mut mp) as *mut _ as *mut c_void,
+        (&mut pp) as *mut _ as *mut c_void, (&mut np_) as *mut _ as *mut c_void,
+        (&mut nh) as *mut _ as *mut c_void, (&mut nk) as *mut _ as *mut c_void,
+        (&mut h) as *mut _ as *mut c_void, (&mut tl) as *mut _ as *mut c_void,
+        (&mut ss) as *mut _ as *mut c_void, (&mut p0) as *mut _ as *mut c_void,
+        (&mut sg) as *mut _ as *mut c_void,
+    ];
+    let smem = (4 * 16 * 256 * 2 + 2 * 16 * 256 * 2 + 8 * 256 * 2) as u32;
+    ctx.launch3_dyn("qsa_flash_wmma", (t / 64) as u32, n_head as u32, nseg as u32, 256, smem, &mut args)?;
+    ctx.sync()?;
+    let mut got = vec![0f32; t * n_head * nseg * (hd + 2)];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut got).as_mut(), pd)?;
+    // CPU 기준 (f32, 같은 소프트맥스 규약)
+    let mut maxerr = 0f32;
+    let mut nbad = 0usize;
+    let mut first = String::new();
+    for row in 0..t {
+        for hh in 0..n_head {
+            let kvh = hh / (n_head / n_kv);
+            let sgc = row / seg;
+            let lo = sgc * seg;
+            let hi = (lo + seg).min(n_past);
+            let mut m = f32::NEG_INFINITY;
+            let mut sc: Vec<f32> = Vec::new();
+            let mut ks: Vec<usize> = Vec::new();
+            for k in lo..hi {
+                if mask[(pos0 + row) * sstride + k] == 0 { continue; }   // 인과 마스크 반영
+                let mut s2 = 0f32;
+                for d in 0..hd {
+                    s2 += qv[(row * n_head + hh) * 2 * hd + d] * kk[(k * n_kv + kvh) * hd + d];
+                }
+                sc.push(s2);
+                ks.push(k);
+                if s2 > m { m = s2; }
+            }
+            let mut ssum = 0f32;
+            let mut acc = vec![0f32; hd];
+            for (i, &s2) in sc.iter().enumerate() {
+                let e = (s2 - m).exp();
+                ssum += e;
+                let k = ks[i];
+                for d in 0..hd { acc[d] += e * vv[(k * n_kv + kvh) * hd + d]; }
+            }
+            let base = ((row * n_head + hh) * nseg + sgc) * (hd + 2);
+            for d in 0..hd {
+                let dv = (got[base + d] - acc[d]).abs();
+                if dv.is_nan() || dv > 2.0 {
+                    nbad += 1;
+                    if first.is_empty() {
+                        first = format!("행{row} 헤드{hh} 세그{sgc} dim{d}: ours {:.4} ref {:.4}", got[base + d], acc[d]);
+                    }
+                }
+                if dv.is_finite() && dv > maxerr { maxerr = dv; }
+            }
+            let (gm, gs) = (got[base + hd], got[base + hd + 1]);
+            if (gm - m).abs() > 1.0 || (gs - ssum).abs() > 1.0 {
+                if first.is_empty() {
+                    first = format!("행{row} 헤드{hh} 세그{sgc}: m {gm:.4}/{m:.4} s {gs:.4}/{ssum:.4}");
+                }
+                nbad += 1;
+            }
+        }
+    }
+    // 진단 상세: 행0 헤드0 세그0 의 acc 앞 4개 / m / s (ours vs ref)
+    let b0 = 0usize;
+    let (gm, gs) = (got[b0 + hd], got[b0 + hd + 1]);
+    let mut det = String::new();
+    {
+        let row = 0usize;
+        let hh = 0usize;
+        let kvh = 0usize;
+        let lo = 0usize;
+        let hi = seg.min(n_past);
+        let mut m = f32::NEG_INFINITY;
+        let mut sc: Vec<f32> = Vec::new();
+        for k in lo..hi {
+            let mut s2 = 0f32;
+            for d in 0..hd { s2 += qv[(row * n_head + hh) * 2 * hd + d] * kk[(k * n_kv + kvh) * hd + d]; }
+            sc.push(s2);
+            if s2 > m { m = s2; }
+        }
+        let mut ssum = 0f32;
+        let mut acc = vec![0f32; hd];
+        for (i, &s2) in sc.iter().enumerate() {
+            let e = (s2 - m).exp();
+            ssum += e;
+            for d in 0..4 { acc[d] += e * vv[((lo + i) * n_kv + kvh) * hd + d]; }
+        }
+        det = format!(" | 행0h0세그0: ours acc {:?} m {:.4} s {:.4} / ref acc {:?} m {:.4} s {:.4}",
+            [got[0], got[1], got[2], got[3]], gm, gs, [acc[0], acc[1], acc[2], acc[3]], m, ssum);
+    }
+    Ok(format!("합성 어텐션: acc 불일치 {nbad}개, max|delta| {maxerr:.4}  {}{}", if first.is_empty() { "전부 일치 ✓".to_string() } else { first }, det))
+}
+
 /// PV 경로 프로브: A=P(16x16 ldm=16) x B=V(16x256 **row_major** ldm=256) — 어텐션 PV 와 동일.
 pub fn wmma_check_pv() -> Result<String, String> {
     use std::ffi::c_void;

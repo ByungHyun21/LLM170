@@ -3786,3 +3786,39 @@ a warp-divergent early return interacting with the per-key-tile `__syncthreads()
 deadlock/UB pattern; my final revision had removed the early return but the earlier ones did not, and
 there is no committed revision to compare against). The next attempt should build the tile kernel
 from these three probes outward rather than re-deriving the primitives.
+
+## WMMA tile kernel: correct at last, and what it costs (2026-09-12)
+
+**The NaN root cause, found by a synthetic check.** New `llm170 wmma-attn-check` runs the tile kernel
+on a small single-head case (t=64, pos0=32, n_past=96, 6 segments, causal mask) against a CPU
+reference, f32 accumulation, same part convention. First run localised it immediately: **m matched
+(1.1632 vs 1.1630) but s read 1.0000 against 6.9076** - the kernel reduced the row *maximum* across
+the 16 lanes but never reduced the row *sum*; each lane's `s` only ever saw its own key. For rows
+whose keys are masked, `s` stayed 0, and the merge kernel's later `acc/s` turned that into NaN. Fix:
+keep the individual exponentials for the P matrix and butterfly-sum a *copy* across the row's 16
+lanes for `s`. The check then reports **0 mismatches, max|delta| = 0.0006** (f16 rounding), and the
+same case with pos0/t/n_past as above - and a 600-token multi-chunk prompt through the model - both
+produce identical tokens to the scalar path.
+
+**And what it costs.** It is correct but currently *slower* than the scalar kernel:
+
+| config | scalar (wk8) | WMMA tile |
+|---|---|---|
+| pp512 | 360.2 t/s | 344.7 |
+| pp3314 | 316.9 | 288.6 (-9%) |
+
+So the model path stays on wk8 (the launcher branch was reverted); the kernel, its registration and
+the three probes stay as diagnostic assets. Where the 9% goes, in the order worth attacking:
+
+1. **Per-key-tile f32->f16 staging** - 8192 elements converted and two `__syncthreads()` per 16-key
+   tile, repeated for every segment a block visits. The fix is an f16 shadow KV written once when the
+   KV is appended (the docs' earlier note that "the f16 conversion is only ~2 vector ops per
+   (query,key)" was for the *staging count*, not for the *conversion inside the key loop*).
+2. **2x redundant QK** - each half-warp computes the full QK^T because the scores are not shared
+   between them; sharing them via shared memory halves that work.
+3. **Occupancy 1** - 53 KB of dynamic shared per block caps the SM at one block; llama's RDNA tile
+   config targets occupancy 3-8 with 128-256 threads.
+
+This is now a *performance* problem with a verified-correct kernel, not a correctness problem - a
+much better starting point than the five earlier attempts. The measured prize is still pp3314 ~370
+t/s (1.10x llama).
