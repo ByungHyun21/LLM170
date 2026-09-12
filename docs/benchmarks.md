@@ -3430,3 +3430,22 @@ pp512 0.98x, pp3314 0.89x, tg512 0.98x, tg3314 0.92x - the remaining deficits ar
 512 -> 303.80 t/s. Larger segments are marginally better for pp (within run noise) and neutral for
 tg, so the knob does not move the needle either - the attention needs a different decomposition
 (tensor-core MMA or a warp-per-row layout), not a tuning change.
+
+## Attention headroom, measured: ~1000x (2026-09-12)
+
+`llm170 roof-test` on this device (gfx1151, rocwmma 16x16x16):
+
+| mode | rate |
+|---|---|
+| mfma0 (register-resident wave32) | **48.43 TFLOPS f32** |
+| mfma1 (L1-fed wave32) | **23.56 TFLOPS f32** |
+| scalar MAC, reg-chain | 6.99 TIOPS |
+| scalar MAC, stride load | 0.97 TIOPS (the pattern the attention's butterfly approximates) |
+
+The pp3314 attention does ~33.7 GFLOP (3314^2/2 key-query pairs x 24 heads x 256 FLOP) in 1.29s =
+**26 GFLOP/s**, i.e. ~1000x below the WMMA ceiling and ~5-30x below the KV bandwidth bound. A WMMA
+flash attention would therefore be memory-bound at ~100-200ms for the same work, taking pp3314 from
+299.7 t/s to ~340-350 (1.01-1.04x llama) and closing the pp cell. The infrastructure is already in
+the tree: `src_common.hip` includes rocwmma, `gemm_q5k_wm` (src_gemm.hip:140) is a working WMMA
+kernel with manual shared layouts and wave32 pairing, and `mfma_roof` (src_probe.hip:71) is the
+probe behind the table above. Plan: plans/47-attention-wmma.md.
