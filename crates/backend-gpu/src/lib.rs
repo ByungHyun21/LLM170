@@ -8,6 +8,6 @@ pub mod rawhip;
 pub mod rawvk;
 
 pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
-pub use rawhip::q4acc::new_acc as new_q4_acc;
+pub use rawhip::q4acc::{new_acc as new_q4_acc, new_acc_with_sources as new_q4_acc_with_sources};
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawvk::decoder::inject as inject_rawvk;

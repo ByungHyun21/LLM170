@@ -72,7 +72,15 @@ use llm170_profiler::profile_span;
         // 디코드 t=1 빠른 경로: 선택 전문가들의 gate·up가 동일 입력 — 그룹 1호출로
         // 2×n_used회 왕복을 1회로 (실측 병목: 전문가당 GPU 왕복 1,440회/스텝).
         let nofast = std::env::var_os("LLM170_Q4_NOFAST").is_some();
-        if t == 1 && !nofast {
+        // MoE 실행 경로 선택 (plans/64 P1). 기본값은 가속기 유무: 상주 가속기에서는
+        // 스택 1회 업로드 + ids 그룹 런치가 정답이다 — 전문가 슬라이스별 업로드는
+        // 슬라이스마다 신규 디바이스 버퍼를 잡아 VRAM을 텐서 수만큼 부풀린다.
+        // LLM170_MOE_BATCH=0으로 해제, =1로 강제.
+        let batch_on = std::env::var_os("LLM170_MOE_CPU").is_none()
+            && std::env::var("LLM170_MOE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(ctx.acc.is_some());
+        if t == 1 && !nofast && !batch_on {
             let sel: Vec<usize> = (0..n_exp).filter(|&e| !by_expert[e].is_empty()).collect();
             let n_sel = sel.len();
             let mut gate_y = vec![vec![0.0f32; n_ff]; n_sel];
@@ -171,12 +179,10 @@ use llm170_profiler::profile_span;
         }
         // 프리필 그룹 경로 (03 §3.3): 토큰-메이저 (ti,e,w) 페어로 gate·up·down
         // 스택 GEMM 3런치 — 전문가별 서브배치(≤n_exp×3회 왕복) 대신.
-        // LLM170_MOE_BATCH=1(스택 상주 예산 확보)에서만 — 페어 정렬은
-        // 토큰 메이저·전문가 오름차순(전문가별 경로의 토큰별 누산 순서와 동일).
+        // 페어 정렬은 토큰 메이저·전문가 오름차순(전문가별 경로의 토큰별 누산
+        // 순서와 동일). 경로 선택은 위 batch_on.
         let mut grouped_done = false;
-        let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
-            && std::env::var_os("LLM170_MOE_CPU").is_none();
-        if t > 1 && batch_on {
+        if batch_on {
             if let Some(acc) = ctx.acc {
                 let mut pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(t * n_used);
                 for e in 0..n_exp {
