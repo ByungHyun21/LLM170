@@ -869,7 +869,10 @@ impl DecodeState {
                     if np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
-                        let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                        // 32키 세그먼트 + GQA 공유가 최적 (실측: ctx512 11.08/11.02 vs
+                        // 종전 128+헤드별 10.82; ctx3072 10.44 vs 9.60). 세그먼트가
+                        // 작을수록 WG가 많아 플랫폼 지연을 숨긴다.
+                        let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok()).unwrap_or(32usize);
                         let nseg = ((pos + 1) + sg - 1) / sg;
                         let part = self.ctx.scratch(1 * n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
@@ -879,9 +882,7 @@ impl DecodeState {
                         // K/V 트래픽 1/(q-heads per kv-head). LLM170_NO_GQA=1이면 종전.
                         // 실측 교차점: ctx<768은 종전(더 많은 WG), 그 이상은 GQA 공유가
                         // 이김 (pp512 −1.2%, 1024 +1.6%, 2048 +4.7%, 3072 +8.8%).
-                        let gqa_th = std::env::var("LLM170_GQA_TH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(768);
-                        let gqa = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0
-                            && (pos + 1) > gqa_th;
+                        let gqa = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0;
                         if gqa {
                             self.ctx.launch3("qsa_flash_gqa", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
                         } else {

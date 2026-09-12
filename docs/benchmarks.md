@@ -2847,3 +2847,25 @@ it confirms the conclusion from the multi-block experiment: these kernels' 17-30
 not spent in their instruction stream or in their grid shape. The only structural lever
 that has moved them is *more* WGs when the workload allows (which is why the GQA
 attention helps at long context and hurts below 768).
+
+## GQA + 32-key segments as decode-attention defaults (2026-09-12)
+
+The GQA kernel's 6x smaller grid hurt at short context, so the segment size was re-tuned:
+smaller segments restore the WG count while keeping the shared K/V traffic. Sweep
+(tg16, natural text):
+
+| ctx | old (per-head, sg=128) | GQA sg=128 | GQA sg=64 | GQA sg=32 | GQA sg=16 |
+|---|---|---|---|---|---|
+| 512 | 10.82 | 10.68 | - | 11.02 | **11.08** |
+| 3072 | 9.60 | 10.38 | 10.35 | **10.44** | 10.37 |
+
+sg=32 is the best compromise (11.02 / 10.44), so GQA is now unconditional (no threshold)
+with `LLM170_T1SG=32` as the default; `LLM170_NO_GQA=1` restores the old path.
+
+Versus llama at the same contexts: 128 -> 10.99 vs 11.48 (0.957x), 3072 -> 10.45 vs 10.70
+(0.977x, was 0.89x), 6337 -> 9.80 vs 10.69 (0.917x, was ~0.85x).
+
+Gates after the change: judge **16/19 PASS** (all 10 spec cases, same 3 long-context
+near-ties as before), VL gate **4/5 PASS** (one semantic WARN: our 24-token answer starts
+in a `<think>` block), and `llm170 check` full pass (866 tensors, GPU<->CPU GEMM
+cross-validation intact - the attention's segment split was never part of that contract).
