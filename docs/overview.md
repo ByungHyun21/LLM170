@@ -70,12 +70,12 @@ projections in 8 types with batched prefill tiles, flash attention, the GDN
 scan, and a bit-exact element-wise set) and rawvk (Vulkan — subgroup GEMV
 decode kernels for all 8 quant types, cooperative-matrix prefill tiles, fused
 residual/RMS/GDN/attention kernels and a GPU-side argmax, reaching 0.91×
-(pp512) and 0.95× (tg32) of llama.cpp Vulkan on the reference APU).
+(pp512) and 1.00× (tg32) of llama.cpp Vulkan on the reference APU).
 
 **HIP standing against llama-bench ROCm, CLI-to-CLI, same GGUF:** pp512 364 t/s
 (1.03×), pp3314 339 t/s (1.01×), tg512 11.6 t/s (1.01×), tg3314 11.3 t/s
-(0.98×); MTP speculative decode 22.1 t/s single-stream (1.92×) and 30.6 t/s
-aggregate at np4 (1.97×); vision encoding 1.1 s vs 1.60 s (1.45×). The
+(0.98×); MTP speculative decode 23.5 t/s single-stream (2.04×) and 31.0 t/s
+aggregate at np4 (2.00×); vision encoding 1.1 s vs 1.60 s (1.45×). The
 attention path was redesigned to get there: an fp16 WMMA tile kernel for
 prefill (Q in registers, its shared buffer reused as the K/V tile) and a
 decode kernel that puts one key per lane and computes each 256-dim dot with
