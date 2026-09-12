@@ -3822,3 +3822,27 @@ the three probes stay as diagnostic assets. Where the 9% goes, in the order wort
 This is now a *performance* problem with a verified-correct kernel, not a correctness problem - a
 much better starting point than the five earlier attempts. The measured prize is still pp3314 ~370
 t/s (1.10x llama).
+
+## WMMA tile kernel: two optimizations close the gap to parity (2026-09-12)
+
+| config | scalar (wk8) | WMMA (first correct) | WMMA (optimized) |
+|---|---|---|---|
+| pp512 | 360.3 | 344.7 (-4.4%) | **357.4 (-0.8%)** |
+| pp3314 | 324.1 | 288.6 (-9%) | **321.8 (-0.7%)** |
+
+Two changes, both verified by `wmma-attn-check` (still 0 mismatches, max|delta| 6e-4):
+
+1. **QK halved**: each half-warp now computes 8 of the 16 mma over its own dims and the two partial
+   score matrices are summed through shared memory (separate buffers per half, so no race) - the first
+   draft's exchange, now with the row-sum bug fixed.
+2. **Vectorized staging**: the per-key-tile f32->f16 conversion loads `float4` and writes four halves
+   instead of one element per iteration, quartering the load instruction count (the convert count is
+   fixed at 8192 per 16-key tile).
+
+Remaining overhead, ~1% plus the occupancy item: the block still takes 61440 B of dynamic shared (Q
+32 KB + K/V 16 KB + P 4 KB + exchange 8 KB), which caps it at one block per CU, and the per-key-tile
+staging repeats for every segment. Removing the Q staging (loading Q fragments from an f16 Q shadow
+instead) would free 32 KB and should unlock 2-4 blocks per CU - that is the next step, and with it
+the tensor cores should finally pay off against the scalar butterfly (the 17% measured by skipping
+it). Until then the model path stays on wk8, since a numerically different kernel at parity is not
+worth adopting.
