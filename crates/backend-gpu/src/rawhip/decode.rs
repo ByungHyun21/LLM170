@@ -80,6 +80,7 @@ pub struct DecodeState {
     pub t_max_mtp: usize,    // 배치 MTP 버퍼 행 상한 (t_max와 동일)
     pub mtp_b_e: *mut u8,    // [t_max][n] enorm 출력
     pub mtp_b_hs: *mut u8,   // [t_max][n] hnorm 입력 (h_{p-1} 시프트)
+    pub mtp_prefetched: std::sync::atomic::AtomicBool,  // 사이드 h2d 선반입됨
     pub mtp_b_cat: *mut u8,  // [t_max][2n] enorm‖hnorm
     pub mtp_b_cur: *mut u8,  // [t_max][n] hidden
     pub mtp_b_xqn: *mut u8,  // [t_max][xq(n)]
@@ -341,6 +342,7 @@ impl DecodeState {
             t_max_mtp: t_max,
             mtp_b_e: b_mtp_be,
             mtp_b_hs: b_mtp_bhs,
+            mtp_prefetched: std::sync::atomic::AtomicBool::new(false),
             mtp_b_cat: b_mtp_bcat,
             mtp_b_cur: b_mtp_bcur,
             mtp_b_xqn: b_mtp_bxqn,
@@ -1040,6 +1042,15 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     /// MTP 훅용 프리필: 로짓 + **마지막 행** hidden(체인 carry)만 반환한다
     /// (전행 d2h 10.5MB/chunk 제거 — MTP는 디바이스 xs_t를 직접 읽는다).
+    /// MTP 임베딩 선반입: 사이드 스트림 async h2d (메인 프리필과 중첩).
+    fn mtp_upload_tok_emb(&self, tok_flat: &[f32]) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        ds.ctx.h2d_async_s(ds.mtp_b_e, bytemuck::cast_slice(tok_flat))?;
+        ds.mtp_prefetched.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     fn raw_prefill_h(
         &self,
         seq: usize,
@@ -2105,7 +2116,11 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let qoff = if full { 0 } else { (t - 1) * qstride };
         let ooff = if full { 0 } else { (t - 1) * ostride };
         // ① enorm(tok) ‖ hnorm(h_{p-1}) → cat [t][2n]  (mtp_b_cur/mtp_b_e는 임시)
-        self.ctx.h2d(self.mtp_b_e, bytemuck::cast_slice(tok_embs))?;
+        if self.mtp_prefetched.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.ctx.join2()?;   // 사이드 h2d 완료 대기 (메인 프리필과 중첩됨)
+        } else {
+            self.ctx.h2d(self.mtp_b_e, bytemuck::cast_slice(tok_embs))?;
+        }
         // h_shift는 device에서 조립 — src=본체 hidden(xs_t), carry=이전 청크 마지막 행.
         // (호스트 왕복 2×t·n·4B 제거)
         if carry_h.len() != n {

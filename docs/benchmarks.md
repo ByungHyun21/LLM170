@@ -3125,3 +3125,17 @@ measured and whose fixes are individually blocked or rejected: the decode attent
 kernel (1.27 ms/token; block-count and warp-batching experiments are neutral, so it is
 state-bandwidth plus an unexplained per-call latency), and ~2.7 ms of small kernels that
 sit at a measured ~2 us launch floor each.
+
+## MTP embedding prefetch: overlapped upload (2026-09-12)
+
+The MTP prefill's blocking host cost was the 10.5 MB `tok_flat` upload per chunk. It is now
+issued as an **async copy on the side stream before the main prefill** and joined with
+`ctx.join2()` right before the draft batch, so it overlaps the main model's GPU work:
+
+- caller builds `tok_flat` before `raw_prefill_h` and calls `mtp_upload_tok_emb`, the batch
+  then joins instead of re-uploading (`mtp_prefetched` flag on the decoder state);
+- spec-mode pp512 gap vs `LLM170_NOMTP=1`: ~13-33 ms -> **6.7-8 ms** (348.0 vs 341.3/340.0 t/s);
+- spec == non-spec holds; tg unchanged at 15.4-15.5 t/s.
+
+That puts MTP-mode pp at ~1.00x of llama (was 0.995x) on top of the base-mode pp being
+1.015x, closing the last pp cell of the objective's matrix.

@@ -333,6 +333,13 @@ impl RawCtx {
         Ok(p as *mut u8)
     }
 
+    /// 사이드 스트림 비동기 h2d — 메인 스트림 작업과 중첩시킨 뒤 join2로 합류.
+    pub fn h2d_async_s(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
+        unsafe {
+            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(),
+                hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream2), "h2d-async-s")
+        }
+    }
     pub fn h2d(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
             ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), "h2d")?;
