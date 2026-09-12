@@ -3425,3 +3425,8 @@ whose argmaxes the spec contract compares row by row). At pp3314 the prefill att
 Current measured standing (CLI to CLI, same GGUF, live llama-bench build 8b4b3558f):
 pp512 0.98x, pp3314 0.89x, tg512 0.98x, tg3314 0.92x - the remaining deficits are attention
 (contract-free in the prefill) plus the GEMV/MMQ memory-efficiency gap.
+
+`LLM170_QSA_SEG` for the prefill (pp3314, reps=1): 64 -> 298.65, 128 -> 301.76, 256 -> 303.36,
+512 -> 303.80 t/s. Larger segments are marginally better for pp (within run noise) and neutral for
+tg, so the knob does not move the needle either - the attention needs a different decomposition
+(tensor-core MMA or a warp-per-row layout), not a tuning change.
