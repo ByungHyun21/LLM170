@@ -537,6 +537,65 @@ extern "C" __global__ void q4_moe_weighted_sum(const float* ys, const float* wt,
     out[i] = acc;
 }
 
+// q4_moe_top10_m — 워프(32레인)/토큰 병렬판. 원판은 **1스레드/토큰**이라
+// 디코드(t=1)에서 256회 exp를 한 스레드가 돌아 0.85ms/호출이었다(디코드
+// 토큰당 48콜 = 41ms = 디코드의 36%). max·exp를 워프 병렬로 계산하고
+// 선택 삽입 정렬은 원판과 **동일 로직**이라 결과는 비트 동일.
+extern "C" __global__ void q4_moe_top10_m(const float* route, unsigned* ids, float* wt,
+                                          int n_exp, int k_sel) {
+    __shared__ float sh[1024];
+    int tok = blockIdx.x;
+    int l = threadIdx.x;
+    if (l >= 32 || n_exp > 1024) return;
+    const float* rt = route + (size_t)tok * n_exp;
+    float mx = -3.4028235e38f;
+    for (int e = l; e < n_exp; e += 32) mx = fmaxf(mx, rt[e]);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float pj = __shfl_xor_sync(0xffffffffffffffffull, mx, off);
+        mx = fmaxf(mx, pj);
+    }
+    float zs = 0.0f;
+    for (int e = l; e < n_exp; e += 32) {
+        float p = exp_cr(rt[e] - mx);
+        sh[e] = p;
+        zs += p;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        zs += __shfl_xor_sync(0xffffffffffffffffull, zs, off);
+    zs = __shfl_sync(0xffffffffffffffffull, zs, 0);
+    __syncwarp();
+    if (l != 0 || k_sel > 64) return;
+    ids += (size_t)tok * k_sel;
+    wt += (size_t)tok * k_sel;
+    int sel[64];
+    float sp[64];
+    int cnt = 0;
+    for (int e = 0; e < n_exp; e++) {
+        float p = sh[e] / zs;
+        int pos = cnt;
+        for (int j = 0; j < cnt; j++) {
+            if (p > sp[j]) { pos = j; break; }
+        }
+        if (pos < k_sel) {
+            int last = min(cnt, k_sel - 1);
+            for (int j = last; j > pos; j--) { sel[j] = sel[j - 1]; sp[j] = sp[j - 1]; }
+            sel[pos] = e;
+            sp[pos] = p;
+            if (cnt < k_sel) cnt++;
+        }
+    }
+    float wsum = 0.0f;
+    for (int j = 0; j < cnt; j++) wsum += sp[j];
+    wsum = fmaxf(wsum, 6.103515625e-5f);
+    for (int j = 0; j < k_sel; j++) {
+        int e = (j < cnt) ? sel[j] : 0;
+        ids[j] = (unsigned)e;
+        wt[j] = (j < cnt) ? sp[j] / wsum : 0.0f;
+    }
+}
+
 // qwen4exp GDN AR — 상태 = core gdn_ar_batch 레이아웃 (st[kdim*d+dv])
 extern "C" __global__ void q4_gdn_ar_w(float* s, const float* q, const float* k, const float* v,
                                        const float* beta_ge, float* out, int d, int k_stride,

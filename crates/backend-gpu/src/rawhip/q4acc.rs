@@ -1449,7 +1449,10 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 let mut ne = n_exp as i32;
                 let mut ks = k_sel as i32;
                 let t = self.t_cur();
-                self.kop("q4_moe_top10", t as u32, 1, 1, 1, &mut cargs!(&mut rp, &mut ip, &mut wp, &mut ne, &mut ks))
+                // 워프 병렬판(2026-09-13) — 원판은 1스레드/토큰이라 디코드에서
+                // 0.85ms/호출이었다(토큰당 48콜 = 41ms). 선택 로직은 동일해
+                // 결과는 비트 동일.
+                self.kop("q4_moe_top10_m", t as u32, 1, 1, 32, &mut cargs!(&mut rp, &mut ip, &mut wp, &mut ne, &mut ks))
             }
             O::MoeWeightedSum { ys, wt, out, k, n } => {
                 let (mut yp, mut wp, mut op_) = (self.fptr(ys)?, self.fptr(wt)?, self.fptr(out)?);
