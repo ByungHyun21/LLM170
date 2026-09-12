@@ -195,6 +195,20 @@ impl Frame4 {
     }
 }
 
+/// 단계 덤프 (LLM170_Q4_DBG=1) — 값 경로와 같은 양을 찍어 대조한다.
+fn dbg(tag: &str, acc: &dyn Accelerator, h: u64, n: usize) {
+    if std::env::var_os("LLM170_Q4_DBG").is_none() {
+        return;
+    }
+    let mut v = vec![0.0f32; n];
+    if acc.frame_read(h, &mut v).is_err() {
+        return;
+    }
+    let s: f64 = v.iter().map(|&x| x as f64).sum();
+    let mx = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    eprintln!("# fdbg {tag}: sum={s:.6} max={mx:.6} v0..3={:?}", &v[..3.min(n)]);
+}
+
 /// 프레임 디코드 1스텝 — Engine4::decode1에서 호출 (t=1 전용).
 pub fn decode_frame(
     acc: &dyn Accelerator,
@@ -367,6 +381,13 @@ fn gdn_frame(
     let fs: &dyn FrameState = acc;
     fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
         .map_err(Q4Error::Io)?;
+    if il == 0 {
+        dbg("st_gdn", acc, f.st_gdn[seq][ri], hp.dt_rank * hp.d_state * hp.d_state);
+        dbg("gdn_ar", acc, f.go, v_len);
+        dbg("conv", acc, f.gconv, conv_ch);
+        dbg("gq", acc, f.gq, k_len);
+        dbg("gbg", acc, f.gbg, hp.dt_rank * 2);
+    }
     // norm_gated + out proj
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
     op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;

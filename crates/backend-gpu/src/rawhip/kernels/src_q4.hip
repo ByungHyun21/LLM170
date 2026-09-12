@@ -174,3 +174,198 @@ extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const fl
     float g = 1.0f / (1.0f + exp_cr(-gate[tid]));
     out[((size_t)tok * n_head + h) * hd + tid] = o * g;
 }
+
+// ─── qwen4exp 프레임 op 커널 (plans/64 P1) ───
+// 수치 계약: core `qwen4exp/stages/*`·`layers.rs`와 동일 산술. rms/norm_gated는
+// 기존 커널(rms_part/finish·norm_gated_silu 구조)의 세그먼트 f32 + f64 결합을
+// 그대로 따르고, 나머지는 원소별 순서를 유지한다.
+
+// in-place: v ← silu(v/div)
+extern "C" __global__ void q4_silu_div(float* t, float div, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float v = t[j] / div;
+    t[j] = v / (1.0f + exp_cr(-v));
+}
+
+// in-place sigmoid
+extern "C" __global__ void q4_sigmoid(float* t, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    t[j] = 1.0f / (1.0f + exp_cr(-t[j]));
+}
+
+// in-place scale
+extern "C" __global__ void q4_scale(float* t, float s, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    t[j] *= s;
+}
+
+// 행별 L2 정규화 (in-place, d원소 행) — ops::l2_norm 미러(순차 f32 합 + floor)
+extern "C" __global__ void q4_l2_rows(float* x, float eps, int d) {
+    int row = blockIdx.x;
+    int u = threadIdx.x;
+    if (u >= 32) return;
+    float part = 0.0f;
+    int chunk = (d + 31) >> 5;
+    int lo = u * chunk;
+    if (lo < d) {
+        int hi = min(lo + chunk, d);
+        for (int i = lo; i < hi; i++) {
+            float v = x[row * d + i];
+            part += v * v;
+        }
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) sum += (double)__shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
+    float s = 1.0f / fmaxf(sqrtf((float)sum), eps);
+    for (int i = u; i < d; i += 32) x[row * d + i] *= s;
+}
+
+// hc 게이트 적용 + 스트림 평균: out[i] = Σ_s xn[s·n+i]·σ(gate[s·n+i]) / hc
+extern "C" __global__ void q4_hc_gate_mean(const float* xn, const float* gate, float* out, int hc, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.0f;
+    for (int s = 0; s < hc; s++) {
+        int k = s * n + i;
+        acc += xn[k] * (1.0f / (1.0f + exp_cr(-gate[k])));
+    }
+    out[i] = acc / (float)hc;
+}
+
+// hc combine: res[s·n+i] += out[i]·2σ(inj[s]/hc)
+extern "C" __global__ void q4_hc_combine(float* res, const float* out, const float* inj, int hc, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    for (int s = 0; s < hc; s++) {
+        float g = 2.0f / (1.0f + exp_cr(-inj[s] / (float)hc));
+        res[s * n + i] += out[i] * g;
+    }
+}
+
+// GDN norm_gated(sigmoid z) — qwen4exp 변형 (qwen35는 silu).
+// out = rms(o_head)·σ(z)·w_head. 행 = (y·n_h + head), w는 헤드별 [d].
+extern "C" __global__ void q4_norm_gated_sig(const float* o, const float* z, const float* w,
+                                             float* out, float eps, int d, int n_h) {
+    int row = blockIdx.y * n_h + blockIdx.x;
+    int u = threadIdx.x;
+    if (blockIdx.x >= n_h) return;
+    int xb = row * d;
+    int wb = blockIdx.x * d;
+    int chunk = (d + 31) >> 5;
+    float part = 0.0f;
+    {
+        int lo = u * chunk;
+        if (lo < d) {
+            int hi = min(lo + chunk, d);
+            for (int i = lo; i < hi; i++) {
+                float dv = o[xb + i];
+                part += dv * dv;
+            }
+        }
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) sum += (double)__shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
+    float inv = 1.0f / (float)sqrt(sum / (double)d + (double)eps);
+    for (int i = u; i < d; i += 32) {
+        out[xb + i] = o[xb + i] * inv * w[wb + i] * (1.0f / (1.0f + exp_cr(-z[xb + i])));
+    }
+}
+
+// MoE 라우팅: softmax → top-k(확률 내림차순, 동점은 인덱스 오름차순 = CPU
+// 안정 정렬 미러) → 재정규화(하한 2^-14). 단일 스레드(512 전문가) — CPU와
+// 동일 순서를 보장하는 것이 성능보다 중요하다.
+extern "C" __global__ void q4_moe_top10(const float* route, unsigned* ids, float* wt,
+                                        int n_exp, int k_sel) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float mx = -3.4028235e38f;
+    for (int e = 0; e < n_exp; e++) mx = fmaxf(mx, route[e]);
+    float zs = 0.0f;
+    for (int e = 0; e < n_exp; e++) zs += exp_cr(route[e] - mx);
+    // 삽입 정렬 — 후보를 인덱스 오름차순으로 넣고 "확률 이상" 뒤에 삽입(안정)
+    int sel[64];          // k_sel ≤ 64 가정 (qwen4exp = 10)
+    float sp[64];
+    if (k_sel > 64) return;
+    int cnt = 0;
+    for (int e = 0; e < n_exp; e++) {
+        float p = exp_cr(route[e] - mx) / zs;
+        int pos = cnt;
+        for (int j = 0; j < cnt; j++) {
+            if (p > sp[j]) { pos = j; break; }
+        }
+        if (pos < k_sel) {
+            int last = min(cnt, k_sel - 1);
+            for (int j = last; j > pos; j--) { sel[j] = sel[j - 1]; sp[j] = sp[j - 1]; }
+            sel[pos] = e;
+            sp[pos] = p;
+            if (cnt < k_sel) cnt++;
+        }
+    }
+    float wsum = 0.0f;
+    for (int j = 0; j < cnt; j++) wsum += sp[j];
+    wsum = fmaxf(wsum, 6.103515625e-5f);
+    for (int j = 0; j < k_sel; j++) {
+        int e = (j < cnt) ? sel[j] : 0;
+        ids[j] = (unsigned)e;
+        wt[j] = (j < cnt) ? sp[j] / wsum : 0.0f;
+    }
+}
+
+// MoE 전문가 가중 합: out[i] = Σ_e wt[e]·ys[e·n+i]
+extern "C" __global__ void q4_moe_weighted_sum(const float* ys, const float* wt, float* out, int k, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.0f;
+    for (int e = 0; e < k; e++) acc += wt[e] * ys[e * n + i];
+    out[i] = acc;
+}
+
+// qwen4exp GDN AR — 상태 = core gdn_ar_batch 레이아웃 (st[kdim*d+dv])
+extern "C" __global__ void q4_gdn_ar_w(float* s, const float* q, const float* k, const float* v,
+                                       const float* beta_ge, float* out, int d, int k_stride,
+                                       int v_stride, int h_v, int h_k, float scale, int t) {
+    // qwen4exp 프레임용 — (a) 상태 레이아웃이 core `gdn_ar_batch`와 동일
+    // (st[kdim*d + dv]), (b) **임의 d** 지원: 레인당 kdim = lane + 32k.
+    // (qwen35용 gdn_ar_w_swap은 전치 레이아웃 + 레인당 kdim 4개 고정 = d=128 전용.)
+    int u = blockIdx.x;                     // dv
+    int pair = blockIdx.y;
+    int lane = threadIdx.x & 31;
+    if (u >= d) return;
+    int base_s = pair * d * d;
+    for (int ti = 0; ti < t; ti++) {
+        int h = pair % h_v;
+        int kh = h % h_k;
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        // sk[dv] = Σ_kdim (S·e^g)[kdim][dv]·k[kdim]
+        float part = 0.0f;
+        for (int kd = lane; kd < d; kd += 32) {
+            float sv = s[base_s + kd * d + u] * g_exp;
+            s[base_s + kd * d + u] = sv;
+            part += sv * k[qk0 + kd];
+        }
+        float sk = part;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1)
+            sk += __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
+        float delta = (v[v0 + u] - sk) * beta;
+        // S[kdim][dv] += k[kdim]·delta;  o[dv] = Σ_kdim S[kdim][dv]·q[kdim]
+        float op = 0.0f;
+        for (int kd = lane; kd < d; kd += 32) {
+            float sv = s[base_s + kd * d + u] + k[qk0 + kd] * delta;
+            s[base_s + kd * d + u] = sv;
+            op += sv * q[qk0 + kd];
+        }
+        float otot = op;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1)
+            otot += __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
+        if (lane == 0) out[v0 + u] = otot * scale;
+    }
+}
