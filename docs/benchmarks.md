@@ -3486,3 +3486,35 @@ plans/47-attention-wmma.md - with the reference and the infrastructure both alre
 Nothing else in the prefill budget is actionable: `gdn_ar_w_swap` 0.66s (the recurrence, t>=512
 chunks), `gemm_q8_j128` 0.20s, `silu_mul` 0.19s, `mmq_quant_y` 0.16s - all small and near their own
 bounds.
+
+## Attention experiments, corrected: what was actually tested (2026-09-12)
+
+**Process trap first.** The rawhip kernels are compiled from an explicit name list in
+`crates/backend-gpu/src/rawhip/kernels/mod.rs` (~line 26). A new `extern "C" __global__` function
+that is not added to that list is silently absent at launch ("커널 없음") and any A/B against it
+silently measures the *default* path instead. Two of this day's earlier "neutral" results were
+produced that way and are void:
+
+- `qsa_flash_wk8` (8 lanes/row) - never compiled *and* gated on `hd == 128`, which this model never
+  satisfies (hd is 256: mod.rs:1296 sets `hd = 256usize`, n_kv=4, KV row = 1024 floats).
+- `qsa_flash_wmma` (the first WMMA draft) - same double miss; the trace showed `qsa_flash_wk`
+  running in both arms.
+
+Valid results (kernel present in the list, or existing kernel modified):
+
+| hypothesis | experiment | result |
+|---|---|---|
+| load latency | key loop unrolled 4x in `qsa_flash_wk` (existing kernel) | neutral (303.2 vs 303.5) |
+| grid parallelism | `LLM170_QSA_SEG` 64/128/256/512 | neutral (298.7-303.8) |
+| K/V access redundancy | `qsa_flash_wk_s`, now registered: block-level shared staging, 16-key chunks, values and accumulation order unchanged so the result is bit-identical | **worse: 286.2 vs 307.1 t/s at pp3314, 346.0 vs 354.0 at pp512** |
+
+The staging loss is informative: the 8x-per-block redundant K/V reads hit cache cheaply, while the
+per-chunk `__syncthreads()` (8 per 128-key segment per block) and the shared-memory round-trip cost
+more than the saved global traffic. So the attention is not bound by global-load bandwidth, issue
+slots, grid parallelism, or latency.
+
+Still untested (both were voided by the trap above): the fewer-lanes-per-row mapping and the WMMA
+tile path. Note that fewer lanes per row only wins if the rows then run *in parallel* in the warp -
+for hd=256 the arithmetic is per (row,key): hd MACs plus L*2*log2(L) shuffle lane-ops, so L=8 with 4
+rows in flight is ~1.9x cheaper than the current L=32 sequential-4-rows - but it needs ~128 live
+floats per lane (qv/acc/kv/vv x 32 dims) against ~64 for L=16 (2 rows in flight, 1.5x cheaper).
