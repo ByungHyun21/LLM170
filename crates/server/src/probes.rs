@@ -12,6 +12,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "q4k-micro" => llm170_backend_gpu::rawhip::q4k_micro(),
         "q4-d2h-bench" => llm170_backend_gpu::rawhip::d2h_bench(),
         "q5-1-bench" => {
             let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
