@@ -439,6 +439,42 @@ impl Q4Acc {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
+        // q4_K MMQ급 타일 — 산술은 core dot_q4k_q8과 동일 순서로 썼지만 실측
+        // 오답(ffn_gate_exps t=20: max_abs 1.105, max_rel 330)이라 **기본 제외**,
+        // 옵트인(LLM170_Q4K_MMQ=1)으로만 남긴다. 원인 규명은 다음 세션:
+        // 64원소 인터리브 배열(저니블=요소 0-31, 고니블=32-63)과 x 워드 대응
+        // (x1=it*16, x2=it*16+8)이 의심 지점.
+        if ty == ggml_id(GgmlType::Q4K)
+            && t >= 16
+            && std::env::var_os("LLM170_Q4K_MMQ").is_some()
+        {
+            let mut xq_p = xq as *mut std::ffi::c_void;
+            let mut w_p = w as *mut std::ffi::c_void;
+            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let mut o_p = out as *mut std::ffi::c_void;
+            let mut ni = n_in as i32;
+            let mut no = n_out as i32;
+            let mut xw = xq_w as i32;
+            let mut tt = t as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.ctx.launch3(
+                "q4_gemm_q4k_m",
+                n_out.div_ceil(16) as u32,
+                t.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            );
+        }
         if ty == ggml_id(GgmlType::Q5_1) {
             // 타일 판은 출력 4개/블록 — 그리드도 4로 나눈다.
             let tiled = std::env::var_os("LLM170_NO_Q5_1_T").is_none();

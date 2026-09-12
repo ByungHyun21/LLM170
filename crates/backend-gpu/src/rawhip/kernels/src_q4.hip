@@ -182,6 +182,65 @@ extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w,
     out[(size_t)r * n_out + o] = acc;
 }
 
+// q4_K MMQ급 타일 — 16출력 × 16행, 스레드당 (출력,행) 직렬 누산(스레드당 수백
+// 바이트). 산술은 core `dot_q4k_q8`과 **동일 순서**(it 0..3, 각 it에서
+// 저니블→고니블 순 가산)라 비트 동일이 기대된다 — q4-acc-check로 확인.
+// q4_K 블록 = 144B/256원소: d(2) dmin(2) scales[12](6비트 스케일·민 8쌍) qs[128].
+extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, double* part,
+                                         float* out, int n_in, int n_out, int xq_w, int t) {
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = (int)blockIdx.x * 16 + ox;
+    int r = (int)blockIdx.y * 16 + rx;
+    if (o >= n_out || r >= t) return;
+    int n_super = n_in >> 8;
+    const unsigned char* wr = (const unsigned char*)w + (size_t)o * (n_super * 144);
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned xw_base = (unsigned)(n_in >> 2);
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sIdx = 0; sIdx < n_super; sIdx++) {
+        const unsigned char* blk = wr + sIdx * 144;
+        float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
+        float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+        #pragma unroll
+        for (int it = 0; it < 4; it++) {
+            unsigned q[8];
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const unsigned char* p = qs + it * 32 + m * 4;
+                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            }
+            const int j1 = 2 * it;
+            const int j2 = 2 * it + 1;
+            unsigned s1, m1, s2, m2;
+            if (j1 < 4) { s1 = sc[j1] & 63u; m1 = sc[j1 + 4] & 63u; }
+            else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
+            if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
+            else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
+            const unsigned* x1 = xr + it * 16;
+            const unsigned* x2 = x1 + 8;
+            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                unsigned y1 = x1[m];
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
+                qs1 += dot4(ones, y1, 0);
+                unsigned y2 = x2[m];
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                qs2 += dot4(ones, y2, 0);
+            }
+            float yd1 = __uint_as_float(xr[xw_base + 2 * it]);
+            float yd2 = __uint_as_float(xr[xw_base + 2 * it + 1]);
+            acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
+            acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
+        }
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
 // f32 MMQ급 타일 — 16출력 × 16행/블록(256스레드). 스레드당 (출력,행) 한 쌍을
 // k 직렬 누산한다. 원판은 (행,출력) 블록 + 64레인 분할이라 스레드당 일감이
 // 40 MAC뿐이었고(총 지연), 같은 가중치 행을 행 수만큼 다시 읽었다.
