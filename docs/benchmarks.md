@@ -3175,3 +3175,11 @@ Consequence for the attention rewrite: the row x head kernel is not "wrong" - it
 probe is exact and its only sin is perturbing the near-ties in a different direction,
 which flipped one at token 5 of the seed prompt. Whether it can be adopted is therefore a
 judge question, not a contract argument.
+
+**Verdict: rejected.** The judge with the row x head kernel scores **14/19** (from 17/19),
+i.e. several spec cases lose their exactness, exactly as the seed-prompt flip predicted.
+Reverted. The decisive obstacle is the batch-vs-single projection difference above: any
+change to the attention's reduction order re-rolls the near-ties on one side only, so the
+last 1.4% of base-mode tg requires **first** unifying the projection numerics between the
+verify batch and the decode step (the decode's fused dual GEMVs versus the batch's separate
+GEMMs), and only then re-attempting the attention structure.
