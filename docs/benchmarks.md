@@ -3599,3 +3599,21 @@ not the shuffle count (wk16 cut those 1.5x for only +1.3%), is what the 2.7x mea
 Direction for the next attempt (simpler than the WMMA path and contract-free): a tile kernel with
 ~128 query rows per block, the 16/32-key K/V tiles in shared, and the query tile kept in registers -
 i.e. llama's tile shape - before any fragment-level work.
+
+## The 2.7x, located: our per-key shuffle dependency chain (2026-09-12)
+
+`fattn-tile.cuh` contains **zero `__shfl` calls**. Its KQ dots are computed with each lane doing its
+own serial accumulation over the head dim (`nbatch_K` chunks of K staged in shared via
+`load_tiles`, `KQ[cpw]` per thread), and the only cross-lane steps are `warp_reduce_sum` for the
+softmax statistics plus a shared-memory combine per key *batch* (lines 983/1014), not per key.
+
+Our `qsa_flash_wk16` instead chains 5+ dependent shuffle levels per (row, key): the lane-level op
+count is comparable (24 lane-ops/row vs their ~8 cycles/row), but ours is a *latency* chain -
+each key's reduction cannot start before the previous one's data is ready and vice versa - while
+theirs is independent per-lane work that the scheduler pipelines freely. That is the 2.7x, and it
+also explains why cutting the shuffle *count* 1.5x (wk16) bought only 1.3%: the count was never the
+issue, the dependency was.
+
+Design consequence: a tile kernel where each lane accumulates its own dots (Q in registers, K/V in
+shared, per-key-batch statistics with a shared combine) removes the chain entirely; that is a
+smaller and more tractable change than the WMMA path, and it is contract-free in the prefill.
