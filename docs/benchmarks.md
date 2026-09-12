@@ -3161,3 +3161,17 @@ streams), which localises the masked-segment handling directly.
 The decode attention's 1.46 ms/token stands: it is ~10x more shuffle work per key than the
 row x head design (8 warps each partially reducing every head x key, 5 shuffles each),
 and that is the last identified item of the base-mode tg gap.
+
+## The spec contract is empirical, not structural (2026-09-12)
+
+Dumping the attention inputs from both paths at the same position (120) shows the batch
+(t=5) and single-row (t=1) forwards differ by ~0.5-0.7% *relative* in q, gate and k - a
+rounding-level difference, e.g. the decode's fused dual GEMVs versus the batch's separate
+GEMVs. The spec == greedy equality therefore cannot be structural: it holds because the
+model's logits are peaked enough that the argmaxes agree, and it is the *judge* (10 spec
+cases, exactness) that empirically certifies it.
+
+Consequence for the attention rewrite: the row x head kernel is not "wrong" - its unit
+probe is exact and its only sin is perturbing the near-ties in a different direction,
+which flipped one at token 5 of the seed prompt. Whether it can be adopted is therefore a
+judge question, not a contract argument.
