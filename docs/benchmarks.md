@@ -3039,3 +3039,17 @@ Both remaining gaps are now fully characterised with their costs:
   (see the previous section) - accessible only by rewriting the decode *and* verify
   attention kernels together;
 - MTP pp 0.995x: needs the +682 MB embedding residency above.
+
+## rmsq parallel reduction (+1.0% tg, judge held) - 2026-09-12
+
+`rmsq`'s per-lane sum was a single-accumulator chain over 160 elements, which the launch
+probe priced at ~1.4 ns/element. Split into four accumulators (same element set, the
+order within a lane rearranged - a slightly *more* accurate sum) plus an f64 shuffle tree
+over the 32 partials instead of thread 0's serial loop: 8.13 -> **6.51 us** at n=5120
+(19.63 -> 15.49 at n=20480). End to end: tg32 **11.28 -> 11.39-11.40 (+1.0%)**, spec ==
+non-spec holds, and the judge stayed at **17/19** - the numerics change is acceptable by
+the same criterion that accepted the fast exp.
+
+Note the discipline this establishes: these kernels' summation orders are pinned by our
+own mirror, not by an external requirement, so a numerics change is admissible when the
+*acceptance gate* (the judge against llama) does not regress - measured, not assumed.
