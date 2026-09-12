@@ -4255,3 +4255,29 @@ Also worth recording because it was measured here rather than assumed: our HIP d
 attention is now bandwidth-bound (~221 GB/s effective on the f16 KV), so the remaining
 tg3314 gap is KV bytes, not kernel structure - which makes KV quantization the next
 lever on that cell rather than further attention work.
+
+## Vulkan tile WM 64->32 falsified on this backend (2026-09-12)
+
+plans/62's V1 -- llama PR #28611, where shrinking the coopmat warp micro-tile M dimension
+64->32 gave +61% pp on RDNA3 iGPUs -- was implemented for our tile family as
+`tile_ms4gy_wm32`: BM 32, the A loader remapped to four threads per row (`kc = (tid&3)*8`
+with the c loop cut to 0..2 so each thread still covers its own 8 k values and the row's
+k coverage stays complete), `acc[2][2]`, `Ctmp[32][17]`, and the host grid at
+`(n_out+31)/32`. Measured with `vk-tile-check <gguf> blk.0.attn_gate.weight <t>` plus
+`LLM170_TILE_BENCH`:
+
+| variant | t=512 | t=128 |
+|---|---|---|
+| `tile_ms4gy` (WM 64) | 0.2806 ms/iter (77.1 GB/s) | 0.2538 ms (85.2 GB/s) |
+| `tile_ms4gy_wm32` (WM 32) | 0.4883 ms (44.3 GB/s) | 0.4486 ms (48.2 GB/s) |
+
+**-43% at both token sizes**; the variant was withdrawn (shader, SPIR-V and host wiring
+all removed). This is consistent with our own earlier characterization of this tile kernel
+(every resource below 15% utilisation): the bottleneck is not the per-workgroup LDS or
+register footprint, so halving the warp micro-tile only halves the work per workgroup
+without buying occupancy. plans/62 pre-registered exactly this falsification condition
+("if it contradicts our measurement, add it to the rejected list"), and it did.
+
+Consequence for the Vulkan plan: V1 is closed; the remaining candidates are the int8
+coopmat1 path (V2), the FA K/V shared-memory staging (V3) and the attention redesign port
+(V4).
