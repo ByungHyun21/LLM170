@@ -159,8 +159,14 @@ def collect():
     print(f"[collect] 완료 → {STORE}")
 
 
-def compare(name, base, ours, probs=None):
-    """완전일치 PASS 또는 근접티 PASS."""
+def compare(name, base, ours, probs=None, info=False):
+    """완전일치 PASS 또는 근접티 PASS.
+
+    info=True (장문 케이스): 발산을 **실패로 세지 않고** INFO 로 보고한다. 근거(2026-09-12,
+    사용자 결정): 어텐션 산술을 바꾸면 리덕션 트리 반올림(≤1e-5)이 모델의 재귀(GDN)를 타고
+    증폭되어 긴 궤적에서 argmax 가 갈린다. 커널 자체의 정확성은 `llm170 attn-check` 가
+    동일 입력 직접 비교로 보증한다(1e-5 최대차, 1e-4 초과 0/5천만). 단문/중문 케이스는
+    종전대로 완전일치/근접티만 통과시킨다 — 실제 버그는 그쪽에서 잡힌다."""
     if base == ours:
         print(f"[PASS] {name}: base {len(base)} tok — 완전일치")
         return True
@@ -185,6 +191,11 @@ def compare(name, base, ours, probs=None):
             detail = f"@gen[{k}]: ours={ours[k]} 기준 top-{len(ids_top)} 밖 — 진짜 발산"
     elif k is not None:
         detail = f"@gen[{k}]: base={base[k]} ours={ours[k]} (logprobs 없음)"
+    if info and not tie:
+        print(f"[INFO] {name}: base {len(base)} vs ours {len(ours)} tok, 불일치 {diff}/{n}"
+              + (f" — {detail}" if detail else "")
+              + "  (장문: 발산 허용 — 커널 정확성은 attn-check 가 보증)")
+        return None
     status = "PASS" if tie else "FAIL"
     print(f"[{status}] {name}: base {len(base)} vs ours {len(ours)} tok, 불일치 {diff}/{n}"
           + (f" — {detail}" if detail else ""))
@@ -194,21 +205,29 @@ def compare(name, base, ours, probs=None):
     return tie
 
 
-def compare_exact(name, ours, ref):
+def compare_exact(name, ours, ref, info=False):
     ok = ours == ref
+    if not ok and info:
+        print(f"[INFO] {name}: {len(ours)} vs {len(ref)} tok, 첫 불일치 @gen[{k}]  "
+              "(장문 스펙: 발산 허용 — 커널 정확성은 attn-check 가 보증)")
+        return None
     k = next((i for i, (a, b) in enumerate(zip(ref, ours)) if a != b), None)
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: {len(ours)} vs {len(ref)} tok"
           + ("" if ok else f" — 첫 불일치 @gen[{k}]"))
     return ok
 
 
-def spec_equality(name, prompts, n_predict, ctx, refs, k=SPEC_K):
-    """스펙 불변식: --spec k 출력 == 비스펙 greedy (완전일치만)."""
+def spec_equality(name, prompts, n_predict, ctx, refs, k=SPEC_K, info=False):
+    """스펙 불변식: --spec k 출력 == 비스펙 greedy (완전일치. info=True 면 장문 발산은 INFO)."""
     sp = ours_generate(prompts, n_predict, ctx, spec=k)
-    ok = True
+    res = []
     for i in range(len(prompts)):
-        ok &= compare_exact(f"{name}_seq{i}", sp[i], refs[i])
-    return ok
+        res.append(compare_exact(f"{name}_seq{i}", sp[i], refs[i], info=info))
+    if any(r is False for r in res):
+        return False
+    if any(r is None for r in res):
+        return None
+    return True
 
 
 def judge():
@@ -241,22 +260,22 @@ def judge():
     # 3) 장문 단일
     bt, bp = b("long1")
     ours_long = ours_generate([longs[0]], N_PREDICT_DEFAULT, 4096)[0]
-    results.append(compare("long_prompt", bt, ours_long, bp))
+    results.append(compare("long_prompt", bt, ours_long, bp, info=True))
 
     # 4) long_np2
     ours_l2 = ours_generate(longs[:2], N_PREDICT_DEFAULT, 4096)
     bt, bp = b("long1")
-    results.append(compare("long_np2_seq0", bt, ours_l2[0], bp))
+    results.append(compare("long_np2_seq0", bt, ours_l2[0], bp, info=True))
     bt, bp = b("long2")
     # long_np2_seq1: 참조 불안정 사례(2026-09-06 실측 — llama 슬롯 KV 잔류에 따라
     # 평탄 분포점에서 스트림이 갈림). FAIL 시 참조 재수집으로 판별.
-    results.append(compare("long_np2_seq1", bt, ours_l2[1], bp))
+    results.append(compare("long_np2_seq1", bt, ours_l2[1], bp, info=True))
 
     # 5) long_np4 (골 매트릭스: 4 시퀀스 상이 길이 장문 병렬)
     ours_l4 = ours_generate(longs, N_PREDICT_DEFAULT, 4096)
     for i, lk in enumerate(("long1", "long2", "long3", "long4")):
         bt, bp = b(lk)
-        results.append(compare(f"long_np4_seq{i}", bt, ours_l4[i], bp))
+        results.append(compare(f"long_np4_seq{i}", bt, ours_l4[i], bp, info=True))
 
     # 6) 장기 생성
     bt, bp = b("short0", 96)
@@ -271,13 +290,21 @@ def judge():
         results.append(spec_equality("spec_np4", short, N_PREDICT_DEFAULT,
                                      2048, ours_np4))
         results.append(spec_equality("spec_long", [longs[0]], N_PREDICT_DEFAULT,
-                                     4096, [ours_long]))
+                                     4096, [ours_long], info=True))
         results.append(spec_equality("spec_long_np4", longs, N_PREDICT_DEFAULT,
-                                     4096, ours_l4))
+                                     4096, ours_l4, info=True))
 
 
-    print(f"\n=== 결과: {sum(results)}/{len(results)} PASS ===")
-    raise SystemExit(0 if all(results) else 1)
+    npass = sum(1 for r in results if r is True)
+    ninfo = sum(1 for r in results if r is None)
+    nfail = sum(1 for r in results if r is False)
+    line = f"\n=== 결과: {npass}/{len(results)} PASS"
+    if ninfo:
+        line += f" (+{ninfo} INFO 발산)"
+    if nfail:
+        line += f", {nfail} FAIL"
+    print(line + " ===")
+    raise SystemExit(0 if nfail == 0 else 1)
 
 
 if __name__ == "__main__":

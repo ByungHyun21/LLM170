@@ -1641,7 +1641,15 @@ gmark("attn", &mut marks);
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
                         let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
                         if wk16 {
-                            self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            // hd=256 프리필은 8레인/행 판(셔플 3단)이 기본 — wk16 대비 페어 +2.3%.
+                            // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
+                            // `llm170 attn-check` 로 보증된다(사용자 결정 2026-09-12).
+                            // LLM170_NO_WK8=1 이면 wk16(4단)으로 복귀.
+                            if std::env::var_os("LLM170_NO_WK8").is_none() {
+                                self.ctx.launch3("qsa_flash_wk8", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            } else {
+                                self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            }
                         } else {
                             let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };
                             self.ctx.launch3(kn, gx, n_head as u32, nseg as u32, 256, &mut args)?;

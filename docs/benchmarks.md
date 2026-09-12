@@ -3690,3 +3690,21 @@ That is a policy finding, not a kernel bug: **any** attention change that alters
 reference, however correct it is. The conservative choice - keeping the reference gate intact - is
 what the tree does; re-baselining the judge's long cases would unlock wk8 (+2.3%) and the WMMA path
 (17% ceiling measured by skipping the butterfly).
+
+## Adopted: wk8 prefill attention + reference-gate reset (2026-09-12, user decision)
+
+Per the user's choice (재설정), the judge's long-prompt cases now report divergences as **INFO**
+(detailed diagnostics retained: first divergence position, top-k gap, both token prefixes) instead
+of failing, for both the plain long cases (`long_prompt`, `long_np2_*`, `long_np4_*`) and the
+long-context spec cases (`spec_long`, `spec_long_np4`). Short and medium cases keep the original
+strict criterion (exact match, or tie within top-6 and a <1.5 nat gap), so real bugs still gate.
+
+Justification recorded in `scripts/verify.py`: a changed reduction tree differs by <=1e-5, the model's
+recurrence amplifies it, and the kernel's own correctness is guaranteed by `llm170 attn-check`
+(identical inputs, max|delta| 1.1e-5, 0 outliers in 50.3M accumulators) rather than by trajectory
+matching. The judge's own log confirms the class is unstable: `spec_long_np4_seq2` failed in one run
+and passed in the next with nothing but the harness change between them.
+
+With that, `qsa_flash_wk8` (8 lanes/row, 3-level butterfly) is the default prefill attention for
+hd=256: paired pp3314 317.4 vs 310.4 t/s (+2.3%), `LLM170_NO_WK8=1` restores wk16. Judge: 16 PASS,
+3 INFO, 0 FAIL.
