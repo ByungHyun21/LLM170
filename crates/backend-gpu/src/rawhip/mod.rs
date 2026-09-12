@@ -1699,7 +1699,48 @@ pub fn gqa_bench() -> Result<String, String> {
     let (mut us1, mut us2) = (0f64, 0f64);
     for n_past in [512usize, 1024, 2048, 3314] {
         let nseg = n_past.div_ceil(seg);
-        for (lab, pd) in [("v1", p1d), ("v2", p2d)] {
+    let p3d = ctx.alloc(npart * 4)?;
+    let k16 = ctx.alloc(kk.len() * 2)?;
+    let v16 = ctx.alloc(vv.len() * 2)?;
+    {
+        let mut a: Vec<*mut c_void> = Vec::new();
+        let mut sp = kd as *mut c_void;
+        let mut dp = k16 as *mut c_void;
+        let mut nn = kk.len() as i32;
+        a.push(&mut sp as *mut _ as *mut c_void);
+        a.push(&mut dp as *mut _ as *mut c_void);
+        a.push(&mut nn as *mut _ as *mut c_void);
+        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
+        let mut sp2 = vd as *mut c_void;
+        let mut dp2 = v16 as *mut c_void;
+        let mut a2: Vec<*mut c_void> = Vec::new();
+        a2.push(&mut sp2 as *mut _ as *mut c_void);
+        a2.push(&mut dp2 as *mut _ as *mut c_void);
+        a2.push(&mut nn as *mut _ as *mut c_void);
+        ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a2)?;
+        ctx.sync()?;
+        // 변환 검증: 앞 8개 half 를 되읽어 f32 원본과 비교
+        let mut hb = vec![0u16; 8];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut hb).as_mut(), k16)?;
+        let f0: Vec<f32> = (0..8)
+            .map(|i| {
+                let h = hb[i] as u16;
+                let s = (h >> 15) & 1;
+                let e = (h >> 10) & 0x1f;
+                let m = h & 0x3ff;
+                let v = if e == 0 {
+                    (m as f32) * 2f32.powi(-24)
+                } else {
+                    (1.0 + (m as f32) / 1024.0) * 2f32.powi(e as i32 - 15)
+                };
+                if s == 1 { -v } else { v }
+            })
+            .collect();
+        eprintln!("# kv_f16 앞 8개: f16={:?}", f0.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>());
+        eprintln!("# kv_f16 원본  : {:?}", kk.iter().take(8).map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>());
+    }
+        for (lab, pd) in [("v1", p1d), ("v2", p2d), ("v2h", p3d)] {
             let mut qp = qd as *mut c_void;
             let mut kp = kd as *mut c_void;
             let mut vp = vd as *mut c_void;
@@ -1722,7 +1763,16 @@ pub fn gqa_bench() -> Result<String, String> {
                 &mut ss as *mut _ as *mut c_void, &mut p0 as *mut _ as *mut c_void,
                 &mut sg as *mut _ as *mut c_void,
             ];
-            let name = if lab == "v1" { "qsa_flash_gqa" } else { "qsa_flash_gqa2" };
+            let name = match lab {
+                "v1" => "qsa_flash_gqa",
+                "v2" => "qsa_flash_gqa2",
+                _ => "qsa_flash_gqa2h",
+            };
+            if lab == "v2h" {
+                // f16 KV 를 읽는 판: ck/cv 자리에 f16 버퍼를 넘긴다(q 는 그대로 f32)
+                kp = k16 as *mut c_void;
+                vp = v16 as *mut c_void;
+            }
             for _ in 0..20 { let _ = ctx.launch3(name, 1, n_kv as u32, nseg as u32, 256, &mut args); }
             ctx.sync()?;
             let iters = 200usize;
@@ -1732,6 +1782,23 @@ pub fn gqa_bench() -> Result<String, String> {
             let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
             if lab == "v1" {
                 us1 = us;
+            } else if lab == "v2h" {
+                let mut b = vec![0f32; npart];
+                let mut c = vec![0f32; npart];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut b).as_mut(), p2d)?;
+                ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), p3d)?;
+                let cmp_len = n_head * nseg * (hd + 2);
+                let mut worst = 0f32;
+                let mut bad = 0usize;
+                for i in 0..cmp_len {
+                    let d = (b[i] - c[i]).abs();
+                    let rel = d / (1.0f32 + b[i].abs());
+                    if rel > worst { worst = rel; }
+                    if rel > 1e-3 { bad += 1; }
+                }
+                out.push_str(&format!(
+                    "n_past={n_past:5}  v1 {us1:8.2}us  v2 {us2:8.2}us  v2h {us:8.2}us  v2h/v2={:.2}x  v2h vs v2 최대상대차 {worst:.2e} (>1e-3 {bad})\n",
+                    us2 / us));
             } else {
                 us2 = us;
                 let mut a = vec![0f32; npart];

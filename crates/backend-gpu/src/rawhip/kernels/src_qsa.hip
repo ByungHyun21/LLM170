@@ -1014,3 +1014,134 @@ extern "C" __global__ void qsa_flash_gqa2(const float* q, const float* ck, const
         }
     }
 }
+
+// KV f32→f16 변환 (요소별, 벡터화). 디코드 어텐션이 f16 KV를 읽을 수 있는지 실측하기 위한 것.
+extern "C" __global__ void kv_f16(const float* src, half* dst, int n) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 3 < n) {
+        float4 v = *reinterpret_cast<const float4*>(src + i);
+        half* d = dst + i;
+        d[0] = __float2half(v.x); d[1] = __float2half(v.y);
+        d[2] = __float2half(v.z); d[3] = __float2half(v.w);
+    }
+}
+
+// gqa2 의 f16 KV 판(실험): K 로드가 16바이트 1회로 줄어든다(32바이트 2회 → 16바이트 1회).
+extern "C" __global__ void qsa_flash_gqa2h(const float* q, const half* ck, const half* cv,
+                                           const unsigned* mask, float* part,
+                                           int n_past, int n_head, int n_kv,
+                                           int hd, int t_len, int sstride, int pos0, int seg) {
+    int kvh = blockIdx.y;
+    int sg = blockIdx.z;
+    if (kvh >= n_kv || t_len != 1 || hd != 256) return;
+    int gq = n_head / n_kv;
+    if (gq < 1 || gq > 8) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    int h0 = kvh * gq;
+
+    __shared__ float qf[8][256];
+    __shared__ float sc[8][32];
+    __shared__ float pmx[8];
+    __shared__ float pe[8];
+
+    for (int i = tid; i < gq * 256; i += 256)
+        qf[i >> 8][i & 255] = q[(h0 + (i >> 8)) * 2 * hd + (i & 255)];
+    __syncthreads();
+    float qreg[8][8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++)
+        #pragma unroll
+        for (int d = 0; d < 8; d++)
+            qreg[r][d] = (r < gq) ? qf[r][lane * 8 + d] : 0.0f;
+
+    float m[8], s[8], acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) { m[r] = -3.4028235e38f; s[r] = 0.0f; acc[r] = 0.0f; }
+    int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    int mrow0 = pos0 * sstride;
+
+    for (int pb = p0; pb < p1; pb += 32) {
+        int np = min(32, p1 - pb);
+        float x[8][4];
+        #pragma unroll
+        for (int r = 0; r < 8; r++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) x[r][j] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int kk = pb + wid * 4 + j;
+            if (kk < p1 && (mask[mrow0 + kk] != 0u)) {
+                const half* kp = ck + ((size_t)kk * n_kv + kvh) * hd + lane * 8;
+                const uint4 raw = *reinterpret_cast<const uint4*>(kp);
+                const half* hs = reinterpret_cast<const half*>(&raw);
+                float kv[8];
+                #pragma unroll
+                for (int d = 0; d < 8; d++) kv[d] = __half2float(hs[d]);
+                #pragma unroll
+                for (int r = 0; r < 8; r++) {
+                    float a = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < 8; d++) a += qreg[r][d] * kv[d];
+                    x[r][j] = (r < gq) ? a : 0.0f;
+                }
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            #pragma unroll
+            for (int r = 0; r < 8; r++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    x[r][j] += __shfl_xor_sync(0xffffffffffffffffull, x[r][j], off);
+        if (lane < gq * 4) {
+            int r = lane >> 2, j = lane & 3;
+            int kk = pb + wid * 4 + j;
+            if (kk < p1)
+                sc[r][wid * 4 + j] = (mask[mrow0 + kk] != 0u) ? x[r][j] : -3.4028235e38f;
+        }
+        __syncthreads();
+        if (wid == 0 && lane < gq) {
+            int r = lane;
+            float mx = -3.4028235e38f;
+            for (int jj = 0; jj < np; jj++) mx = fmaxf(mx, sc[r][jj]);
+            mx = fmaxf(mx, m[r]);
+            pmx[r] = mx;
+            float tmp[32];
+            float sm = 0.0f;
+            for (int jj = 0; jj < np; jj++) { tmp[jj] = __expf(sc[r][jj] - mx); sm += tmp[jj]; }
+            for (int jj = 0; jj < np; jj++) sc[r][jj] = tmp[jj];
+            pe[r] = sm;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < gq) {
+                float e_m = __expf(m[r] - pmx[r]);
+                s[r] = s[r] * e_m + pe[r];
+                acc[r] *= e_m;
+                m[r] = pmx[r];
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            if (j < np) {
+                float vv = __half2float(cv[((size_t)(pb + j) * n_kv + kvh) * hd + tid]);
+                #pragma unroll
+                for (int r = 0; r < 8; r++)
+                    if (r < gq) acc[r] += sc[r][j] * vv;
+            }
+        }
+        __syncthreads();
+    }
+    int nseg = (n_past + seg - 1) / seg;
+    #pragma unroll
+    for (int r = 0; r < 8; r++) {
+        if (r < gq) {
+            float* pp2 = part + ((size_t)(h0 + r) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r];
+            if (tid == 0) { pp2[hd] = m[r]; pp2[hd + 1] = s[r]; }
+        }
+    }
+}
