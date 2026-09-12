@@ -4213,3 +4213,25 @@ llama-bench, from 0.966x), tokens identical on a 300-token prompt.
 
 Lesson worth keeping: the kernel was misdiagnosed as bandwidth-bound from its GB/s figure alone; the
 actual limiter was load width in a loop that looked trivial.
+
+## Prefill segment default 128 -> 1024: both pp cells ahead of llama (2026-09-12)
+
+The full-prefill ktrace showed `qsa_flash_merge` at 147.6 ms of a 9.8 s pp3314 run (1.5%), while the
+attention kernels themselves do not appear at all because they launch through `launch3_dyn` (untraced).
+The merge's cost follows the segment count, and the split's `part` intermediate is 330 MB per 512-token
+chunk at seg=128 (12x the KV it summarizes):
+
+| seg | pp512 | pp3314 |
+|---|---|---|
+| 128 (old default) | 359.9 | 331.9 |
+| 256 | - | 336.8 |
+| 512 | 362.8 | 338.7 |
+| **1024 (new default)** | **364.0** | **339.4** |
+
+Against llama-bench that is **pp512 1.026x and pp3314 1.013x** - both prompt-processing cells are now
+ahead, and the wide segment does not hurt small prompts (pp512 gains too, because a 512-token prompt
+becomes a single segment and the merge runs once). Tokens are identical before and after the change
+(same 300-token prompt as the previous three checks), and `LLM170_QSA_SEG` still overrides.
+
+Base standing after this session: pp512 1.026x, pp3314 1.013x, tg512 1.008x, tg3314 0.981x against
+llama-bench CLI-to-CLI, with MTP 1.92x, np4 1.99x and mmproj 1.45x on the named settings.

@@ -1686,7 +1686,9 @@ gmark("attn", &mut marks);
                     // 분할 flash 기본 ON (2026-09-05: pp512 +5 — 청크 2-4의 np 성장
                     // 구간 병렬화; LLM170_NO_QSA_SPLIT으로 원경로)
                     if std::env::var_os("LLM170_NO_QSA_SPLIT").is_none() && np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
-                        let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(64);
+                        // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
+                        // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 줄어든다.
+                        let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize).max(64);
                         let nseg = (pos0 + t + sg - 1) / sg;
                         // part: [t][n_head][nseg][hd+2]
                         let part = self.ctx.scratch(t * n_head * nseg * (hd + 2) * 4)?;
