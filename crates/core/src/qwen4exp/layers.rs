@@ -104,6 +104,15 @@ impl Q4Timings {
     }
 }
 
+/// 프레임 버퍼의 토큰 상한 — 프리필 청크와 동일(디코드 t=1 포함).
+fn frame_t_max() -> usize {
+    std::env::var("LLM170_Q4_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
+        .clamp(16, 1024)
+}
+
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
@@ -290,6 +299,48 @@ impl Engine4 {
                 }
             }
         }
+        // 프레임(디바이스 상주) 프리필 — 옵트인 (LLM170_FRAME_PREFILL=1).
+        // 짧은 청크는 토큰 정확이 검증됐고, 긴 프롬프트(≥~260토큰)는 폴트가
+        // 남아 있어 기본 off (plans/64 P2).
+        let frame_on = self.acc.is_some()
+            && !self.frame_broken
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v == "1").unwrap_or(false);
+        if frame_on {
+            let acc = self.acc.as_deref().unwrap();
+            if self.frame.is_none() {
+                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max()) {
+                    Ok(f) => self.frame = Some(f),
+                    Err(e) => {
+                        self.frame_broken = true;
+                        eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                    }
+                }
+            }
+        }
+        if let Some(f) = self.frame.as_mut().filter(|_| frame_on) {
+            let acc = self.acc.as_deref().unwrap();
+            let mut last = None;
+            for ch in tokens.chunks(chunk) {
+                if f.dirty[seq] {
+                    f.sync_states(acc, seq, &self.seqs[seq])?;
+                }
+                let ctx = Ctx { model: &self.model, acc: Some(acc) };
+                let logits = super::frame::frame_forward(
+                    acc,
+                    &self.model,
+                    &ctx,
+                    seq,
+                    &mut self.seqs[seq],
+                    f,
+                    ch,
+                )?;
+                self.seqs[seq].pos += ch.len() as u32;
+                f.dirty[seq] = false;
+                last = Some(logits);
+            }
+            return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
+        }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
@@ -326,11 +377,12 @@ impl Engine4 {
         // 발생해 상태 오염 전에 중단된다.
         let frame_on = self.acc.is_some()
             && !self.frame_broken
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0");
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
         let frame_try = if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {
-                match super::frame::Frame4::new(acc, &self.model, &self.seqs) {
+                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max()) {
                     Ok(f) => {
                         self.frame = Some(f);
                         Some(())
