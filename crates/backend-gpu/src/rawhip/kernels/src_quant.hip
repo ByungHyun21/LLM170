@@ -225,3 +225,85 @@ extern "C" __global__ void rmsq(const float* x, const float* w, unsigned* xq,
     }
 }
 
+
+// rms+quant 행 배치판 — rmsq와 행 단위 산술 완전 동일 (검증 경로 t<=8용).
+// blockIdx.x = 행 인덱스, 나머지는 rmsq와 같은 코드. xq는 행당 rowstride.
+extern "C" __global__ void rmsq_rows(const float* x, const float* w, unsigned* xq,
+                                     float eps, int n, int rowstride) {
+    long r = blockIdx.x;
+    x += r * (long)n;
+    xq += r * (long)rowstride;
+    int u = threadIdx.x;
+    int chunk = (n + 31) >> 5;
+    __shared__ double part[32];
+    __shared__ float inv_s;
+    if (u < 32) {
+        int lo = u * chunk;
+        int hi = min(lo + chunk, n);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        if (lo < n) {
+            int i = lo;
+            for (; i + 3 < hi; i += 4) {
+                float b0 = x[i], b1 = x[i + 1], b2 = x[i + 2], b3 = x[i + 3];
+                a0 += b0 * b0;
+                a1 += b1 * b1;
+                a2 += b2 * b2;
+                a3 += b3 * b3;
+            }
+            for (; i < hi; i++) { float dv = x[i]; a0 += dv * dv; }
+        }
+        part[u] = (double)((a0 + a1) + (a2 + a3));
+    }
+    __syncthreads();
+    if (u < 32) {
+        double s2 = part[u];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            s2 += __shfl_down_sync(0xffffffffffffffffull, s2, off);
+        if (u == 0) inv_s = 1.0f / (float)sqrt(s2 / (double)n + (double)eps);
+    }
+    __syncthreads();
+    float inv = inv_s;
+    int nwords = n >> 2;
+    int nblk = n >> 5;
+    int b = u;
+    if (b < nblk) {
+        int base = b << 5;
+        float4 xv4[8];
+        const float4* x4 = (const float4*)(x + base);
+        const float4* w4 = (const float4*)(w + base);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float4 a = x4[i], c = w4[i];
+            xv4[i] = make_float4(a.x * inv * c.x, a.y * inv * c.y, a.z * inv * c.z, a.w * inv * c.w);
+        }
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float4 v = xv4[i];
+            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+        float d = amax / 127.0f;
+        float id = d != 0.0f ? 1.0f / d : 0.0f;
+        int qs0 = 0, qs1 = 0;
+        #pragma unroll
+        for (int wi = 0; wi < 8; wi++) {
+            unsigned word = 0u;
+            float4 vv4 = xv4[wi];
+            float vv[4] = { vv4.x, vv4.y, vv4.z, vv4.w };
+            #pragma unroll
+            for (int k2 = 0; k2 < 4; k2++) {
+                float v = vv[k2] * id;
+                float r2 = v >= 0.0f ? (float)(int)(v + 0.5f) : -((float)(int)(0.5f - v));
+                float c2 = r2 > 127.0f ? 127.0f : (r2 < -127.0f ? -127.0f : r2);
+                word |= (((unsigned)(int)c2) & 0xFFu) << (k2 * 8);
+            }
+            xq[(base >> 5) * 8 + wi] = word;
+            if (wi < 4) qs0 = dot4(0x01010101u, word, qs0);
+            else qs1 = dot4(0x01010101u, word, qs1);
+        }
+        xq[nwords + (base >> 5)] = __float_as_uint(d);
+        xq[nwords + nblk + 2 * (base >> 5)] = (unsigned)qs0;
+        xq[nwords + nblk + 2 * (base >> 5) + 1] = (unsigned)qs1;
+    }
+}

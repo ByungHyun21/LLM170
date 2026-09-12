@@ -467,7 +467,7 @@ impl DecodeState {
     }
     /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
     fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        if n % 1024 != 0 {
+        if n % 1024 != 0 || std::env::var_os("LLM170_RMSQ_SPLIT").is_some() {
             self.rms(x, w, self.xn, n)?;
             return self.quant(self.xn, xq, n);
         }
@@ -1633,7 +1633,9 @@ gmark("attn", &mut marks);
                         let mut sg_a = sg as i32;
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
                         // q4 다중화 기본: ck/cv 1회 로드로 t 4행 공유 (레지스터 여유 내 최대 배율)
-                        let wk = std::env::var_os("LLM170_NO_WKFLASH").is_none();
+                        // wk는 t>8(프리필) 전용 — 소형 배치(검증 t<=8)는 디코드와 같은
+                        // split4q4를 써서 spec/greedy 계약을 구조적으로 만든다.
+                        let wk = t > 8 && std::env::var_os("LLM170_NO_WKFLASH").is_none();
                         let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };
                         self.ctx.launch3(kn, gx, n_head as u32, nseg as u32, 256, &mut args)?;
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
@@ -2244,7 +2246,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0),
                     Self::p(&mut sg_a),
                 ];
-                let wk = std::env::var_os("LLM170_NO_WKFLASH").is_none();
+                let wk = nrow_attn > 8 && std::env::var_os("LLM170_NO_WKFLASH").is_none();
                 let (kn2, gx) = if wk { ("qsa_flash_wk", (nrow_attn.div_ceil(32)) as u32) } else { ("qsa_flash_split4q4", (nrow_attn.div_ceil(4)) as u32) };
                 self.ctx.launch3(kn2, gx, n_head as u32, nseg as u32, 256, &mut args)?;
                 let mut margs = vec![
