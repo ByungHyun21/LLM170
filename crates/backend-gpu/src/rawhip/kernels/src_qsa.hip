@@ -106,7 +106,7 @@ extern "C" __global__ void qsa_flash(const float* q, const float* ck, const floa
         float e_m = __expf(m - m_new);
         float e_d = __expf(d - m_new);
         s = s * e_m + e_d;
-        float vv = active ? cv[kb + tid] : 0.0f;
+        float vv = active ? __half2float(cv[kb + tid]) : 0.0f;
         acc = acc * e_m + e_d * vv;
         m = m_new;
     }
@@ -115,7 +115,7 @@ extern "C" __global__ void qsa_flash(const float* q, const float* ck, const floa
     out[t * n_head * hd + h * hd + tid] = acc * (1.0f / s) * g;
 }
 // QSA split flash, q 2행 다중화 — ck/cv 1회 로드로 t쌍 공유 (K/V 트래픽 ½).
-extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void qsa_flash_split4q4(const float* q, const half* ck, const half* cv,
                                               const unsigned* mask, float* part,
                                               int n_past, int n_head, int n_kv,
                                               int hd, int t_len, int sstride, int pos0, int seg) {
@@ -167,7 +167,7 @@ extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, c
                 for (int r = 0; r < 4; r++) if (mka[r][j]) jany = true;
                 if (jany) {
                     int kb = (pb + j) * n_kv * hd + kvh * hd;
-                    float kv = active ? ck[kb + tid] : 0.0f;
+                    float kv = active ? __half2float(ck[kb + tid]) : 0.0f;
                     if (active) {
                         #pragma unroll
                         for (int r = 0; r < 4; r++)
@@ -225,7 +225,7 @@ extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, c
         for (int j = 0; j < 4; j++) {
             if (j < np) {
                 int kb = (pb + j) * n_kv * hd + kvh * hd;
-                float vv = active ? cv[kb + tid] : 0.0f;
+                float vv = active ? __half2float(cv[kb + tid]) : 0.0f;
                 #pragma unroll
                 for (int r = 0; r < 4; r++) {
                     if (r < nq) {
@@ -254,7 +254,7 @@ extern "C" __global__ void qsa_flash_split4q4(const float* q, const float* ck, c
 // warp-per-query flash (llama fattn-tile 구조 차용): 블록 32쿼리(워프당 4),
 // 키 루프 내 sync/shared 왕복 없음 — k/v 재로드는 L1 흡수.
 // 수치: ds·softmax 갱신 순서가 split4q4와 다름(키별 running) — 게이트 판정.
-extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void qsa_flash_wk(const float* q, const half* ck, const half* cv,
                                         const unsigned* mask, float* part,
                                         int n_past, int n_head, int n_kv,
                                         int hd, int t_len, int sstride, int pos0, int seg) {
@@ -292,7 +292,7 @@ extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const f
         float kv[8];
         #pragma unroll
         for (int j = 0; j < 8; j++)
-            kv[j] = (j < dpl) ? ck[(size_t)k * n_kv * hd + kb0 + lane * dpl + j] : 0.0f;
+            kv[j] = (j < dpl) ? __half2float(ck[(size_t)k * n_kv * hd + kb0 + lane * dpl + j]) : 0.0f;
         float part_[4];
         #pragma unroll
         for (int r = 0; r < 4; r++) {
@@ -312,7 +312,7 @@ extern "C" __global__ void qsa_flash_wk(const float* q, const float* ck, const f
         float vv[8];
         #pragma unroll
         for (int j = 0; j < 8; j++)
-            vv[j] = (j < dpl) ? cv[(size_t)k * n_kv * hd + kb0 + lane * dpl + j] : 0.0f;
+            vv[j] = (j < dpl) ? __half2float(cv[(size_t)k * n_kv * hd + kb0 + lane * dpl + j]) : 0.0f;
         #pragma unroll
         for (int r = 0; r < 4; r++) {
             if (r < nqw && mask[kq0 + r * sstride + k] != 0u) {
@@ -440,7 +440,7 @@ extern "C" __global__ void qsa_flash_gqa(const float* q, const float* ck, const 
             for (int j = 0; j < 4; j++) {
                 if (mkj[j]) {
                     int kb = (pb + j) * n_kv * hd + kvh * hd;   // gq 헤드가 공유
-                    float kv = active ? ck[kb + tid] : 0.0f;
+                    float kv = active ? __half2float(ck[kb + tid]) : 0.0f;
                     if (active) {
                         #pragma unroll
                         for (int r = 0; r < 8; r++)
@@ -499,7 +499,7 @@ extern "C" __global__ void qsa_flash_gqa(const float* q, const float* ck, const 
         for (int j = 0; j < 4; j++) {
             if (j < np) {
                 int kb = (pb + j) * n_kv * hd + kvh * hd;
-                float vv = active ? cv[kb + tid] : 0.0f;
+                float vv = active ? __half2float(cv[kb + tid]) : 0.0f;
                 #pragma unroll
                 for (int r = 0; r < 8; r++) {
                     if (r < gq) {
@@ -529,7 +529,7 @@ extern "C" __global__ void qsa_flash_gqa(const float* q, const float* ck, const 
 // 순차 처리하므로 (행,키)당 hd MAC + L·2·log2(L) 셔플 레인연산이 든다. 여기서는 16레인/행으로
 // 2행을 워프 안에서 동시에 처리한다: 워프당 2행 x (hd MAC + 16·2·4 셔플) → 약 1.5x 절감.
 // 그리드 (ceil(t/16), n_head, nseg), 256스레드=8워프, 워프당 2행. hd=256 전제(레인당 16 dim).
-extern "C" __global__ void qsa_flash_wk16(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void qsa_flash_wk16(const float* q, const half* ck, const half* cv,
                                           const unsigned* mask, float* part,
                                           int n_past, int n_head, int n_kv,
                                           int hd, int t_len, int sstride, int pos0, int seg) {
@@ -561,10 +561,10 @@ extern "C" __global__ void qsa_flash_wk16(const float* q, const float* ck, const
     int kb0 = kvh * hd;
     int kq = (pos0 + q0 + rf) * sstride;
     for (int k = p0; k < p1; k++) {
-        const float* krow = ck + (size_t)k * n_kv * hd + kb0 + own * 16;
+        const half* krow = ck + (size_t)k * n_kv * hd + kb0 + own * 16;
         float kv[16];
         #pragma unroll
-        for (int j = 0; j < 16; j++) kv[j] = krow[j];
+        for (int j = 0; j < 16; j++) kv[j] = __half2float(krow[j]);
         float pr = 0.0f;
         #pragma unroll
         for (int j = 0; j < 16; j++) pr = fmaf(qv[j], kv[j], pr);
@@ -577,9 +577,9 @@ extern "C" __global__ void qsa_flash_wk16(const float* q, const float* ck, const
             float e_d = __expf(pr - gm);
             s = s * e_m + e_d;
             m = gm;
-            const float* vrow = cv + (size_t)k * n_kv * hd + kb0 + own * 16;
+            const half* vrow = cv + (size_t)k * n_kv * hd + kb0 + own * 16;
             #pragma unroll
-            for (int j = 0; j < 16; j++) acc[j] = acc[j] * e_m + e_d * vrow[j];
+            for (int j = 0; j < 16; j++) acc[j] = acc[j] * e_m + e_d * __half2float(vrow[j]);
         }
     }
     if (!real) return;
@@ -624,7 +624,7 @@ extern "C" __global__ void wmma_probe(const float* a, const float* b, float* c, 
 
 // 진단 전용: wk16 의 8레인/행 판(버터플라이 3단). 모델 경로에는 연결하지 않고
 // `llm170 attn-check` 가 wk16 과 동일 입력으로 비교하는 데만 쓴다(plans/47 판별 하네스).
-extern "C" __global__ void qsa_flash_wk8(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void qsa_flash_wk8(const float* q, const half* ck, const half* cv,
                                          const unsigned* mask, float* part,
                                          int n_past, int n_head, int n_kv,
                                          int hd, int t_len, int sstride, int pos0, int seg) {
@@ -655,10 +655,10 @@ extern "C" __global__ void qsa_flash_wk8(const float* q, const float* ck, const 
     int kb0 = kvh * hd + own * 32;
     int kq = (pos0 + q0 + rf) * sstride;
     for (int k = p0; k < p1; k++) {
-        const float* kp = ck + (size_t)k * n_kv * hd + kb0;
+        const half* kp = ck + (size_t)k * n_kv * hd + kb0;
         float kv[32];
         #pragma unroll
-        for (int j = 0; j < 32; j++) kv[j] = kp[j];
+        for (int j = 0; j < 32; j++) kv[j] = __half2float(kp[j]);
         float pr = 0.0f;
         #pragma unroll
         for (int j = 0; j < 32; j++) pr = fmaf(qv[j], kv[j], pr);
@@ -671,9 +671,9 @@ extern "C" __global__ void qsa_flash_wk8(const float* q, const float* ck, const 
             float e_d = __expf(pr - gm);
             ssum = ssum * e_m + e_d;
             m = gm;
-            const float* vp = cv + (size_t)k * n_kv * hd + kb0;
+            const half* vp = cv + (size_t)k * n_kv * hd + kb0;
             #pragma unroll
-            for (int j = 0; j < 32; j++) acc[j] = acc[j] * e_m + e_d * vp[j];
+            for (int j = 0; j < 32; j++) acc[j] = acc[j] * e_m + e_d * __half2float(vp[j]);
         }
     }
     if (!real) return;
@@ -731,7 +731,7 @@ extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* 
 // WMMA prefill 어텐션 (hd=256, 진단용). 조기 반환 없음(모든 가드가 플래그), 그래서
 // 키-타일 __syncthreads() 와 발산이 상호작용하지 않는다. 프리미티브는 세 프로브로 검증됨.
 extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
-        const float* q, const float* ck, const float* cv,
+        const float* q, const half* ck, const half* cv,
         const unsigned* mask, float* part,
         int n_past, int n_head, int n_kv, int hd, int t_len, int sstride, int pos0, int seg) {
     if (hd != 256) return;
@@ -789,14 +789,17 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
             int row = i >> 8, d = i & 255;
             bool isk = (row < 16);
             int r2 = isk ? row : (row - 16);
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (r2 < nk) {
-                const float* src = isk ? ck : cv;
-                v = *reinterpret_cast<const float4*>(src + ((size_t)(kt + r2) * n_kv + kvh) * hd + d);
-            }
             half* dst = (isk ? &gK16[row * 256 + d] : &gV16[(row - 16) * 256 + d]);
-            dst[0] = __float2half(v.x); dst[1] = __float2half(v.y);
-            dst[2] = __float2half(v.z); dst[3] = __float2half(v.w);
+            if (r2 < nk) {
+                const half* src = isk ? ck : cv;
+                const uint2 raw = *reinterpret_cast<const uint2*>(
+                        src + ((size_t)(kt + r2) * n_kv + kvh) * hd + d);
+                const half* hs = reinterpret_cast<const half*>(&raw);
+                dst[0] = hs[0]; dst[1] = hs[1]; dst[2] = hs[2]; dst[3] = hs[3];
+            } else {
+                dst[0] = __float2half(0.0f); dst[1] = __float2half(0.0f);
+                dst[2] = __float2half(0.0f); dst[3] = __float2half(0.0f);
+            }
         }
         __syncthreads();
         // QK 를 절반 워프가 8 mma 씩 분담(전체 16)한 뒤 공유로 합산한다.

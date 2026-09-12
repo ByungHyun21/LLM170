@@ -623,9 +623,27 @@ pub fn wmma_attn_check() -> Result<String, String> {
     ctx.h2d(kd, bytemuck::cast_slice(&kk))?;
     ctx.h2d(vd, bytemuck::cast_slice(&vv))?;
     ctx.h2d(md, bytemuck::cast_slice(&mask))?;
+    // 커널은 f16 KV 미러를 읽는다 — 합성 입력도 f16 사본을 만들어 넘긴다.
+    let kh = ctx.alloc(kk.len() * 2)?;
+    let vh = ctx.alloc(vv.len() * 2)?;
+    {
+        let mut sp = kd as *mut c_void;
+        let mut dp = kh as *mut c_void;
+        let mut nn = kk.len() as i32;
+        let mut a: Vec<*mut c_void> = vec![&mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void, &mut nn as *mut _ as *mut c_void];
+        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
+        let mut sp2 = vd as *mut c_void;
+        let mut dp2 = vh as *mut c_void;
+        let mut a2: Vec<*mut c_void> = vec![&mut sp2 as *mut _ as *mut c_void,
+            &mut dp2 as *mut _ as *mut c_void, &mut nn as *mut _ as *mut c_void];
+        ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a2)?;
+        ctx.sync()?;
+    }
     let mut qp = qd as *mut c_void;
-    let mut kp = kd as *mut c_void;
-    let mut vp = vd as *mut c_void;
+    let mut kp = kh as *mut c_void;
+    let mut vp = vh as *mut c_void;
     let mut mp = md as *mut c_void;
     let mut pp = pd as *mut c_void;
     let mut np_ = n_past as i32;
