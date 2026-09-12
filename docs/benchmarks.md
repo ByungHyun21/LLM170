@@ -300,7 +300,7 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 103.7 / 72.2 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
+| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 137.8 / 86.3 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
 | Decode tg4 / tg8 / tg16 (ctx 4096-8192, warm) | 15.70 t/s solo (7.2.2) | **8.6 / 7.7-9.2 / 10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
@@ -405,6 +405,34 @@ ple_gather_parts() can be called from scoped threads; Model4::ple_gather itself
 cannot be shared because of its RefCell cache): ple_bridge 1011 -> 113 ms and
 pp512 86.4 -> 103.7 t/s, tokens unchanged. pp512 now stands at 2.8x the
 attention-correct baseline measured at the start of the session.
+
+**q5_1 became the default tile (2026-09-13, biggest single win of the session).**
+The MoE expert-down weights are q5_1 and the kernel that served them was a
+GEMV-shaped one whose block is (row, output), so every row of an expert group
+re-read the same weight row. An isolation harness (`llm170 q5-1-bench`, the
+synthetic shape with hot data) showed the kernel itself was the limit at
+6.3 GB/s, and all structural variants landed within 1932-2067 ms until one
+thing changed: how many bytes each thread reads. The original read ~1 byte per
+thread (pure latency), a 16-row tile 16 bytes, and the new `q4_gemm_q5_1_m`
+(16 outputs x 16 rows per block, one (output,row) pair per thread accumulated
+over k serially, weights staged once in shared) reads hundreds.
+
+It changes the accumulation order, so it is verified the way llama.cpp and
+vLLM verify kernels - by tolerance, not bit-exactness:
+
+- `q4-acc-check` vs the CPU W4A8 mirror: max_abs 5.96e-8, max_rel 1.3-2.1e-5 at
+  t=20/64/128 - about 1/500 of the q5_1 quantization error itself (~1e-2).
+- Greedy token streams are identical on both the 230- and 700-token prompts,
+  and identical between the new path and the bit-exact one.
+- `LLM170_Q5_1_EXACT=1` restores the bit-exact tile.
+
+Result: the kernel 1932 -> 316 ms per chunk (6x), pp512 104.1 -> 137.8 (+32%),
+pp2311 72.2 -> 86.3 (+20%).
+
+For reference, in the local sources: llama.cpp's test-backend-ops compares
+backends by nmse with bounds calibrated from the quantization error, and runs
+q5_1 through MMQ; vLLM's kernel tests use assert_close(rtol, atol) - neither
+demands bit-exactness across kernels.
 
 Known outlier: RmsRows costs 15.5 ms per call (96 per chunk, 5.2 M elements
 each) = ~336 M elements/s, about 1/13 of the measured transfer bandwidth. A
