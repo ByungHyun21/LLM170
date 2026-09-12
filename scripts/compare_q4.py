@@ -20,7 +20,7 @@ for name, ref in store.items():
     ids = ref["ids"]
     toks = ref["tokens"]
     args = [BIN, "infer", "--model",
-            os.environ.get("LLM170_MODEL", "/home/yoon/local_llm/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")]
+            os.environ.get("LLM170_MODEL", "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")]
     args += EXTRA + ["--n-predict", "24", "--ctx", "4096",
                      "--prompt-tokens", ",".join(map(str, ids))]
     r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
