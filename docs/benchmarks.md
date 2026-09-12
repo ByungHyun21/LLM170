@@ -3637,3 +3637,27 @@ chunk). Next step for this line: re-add the `part` dump in the launcher, run a >
 wk8 and with the shipped kernel, and diff (row, head, segment) - the same method that localised the
 shared-memory bug in the WMMA attempt. The +2.3% (and the 17% ceiling measured above) makes it worth
 resuming.
+
+## Strategic finding: the attention's remaining speedup is blocked by numerics tolerance, not design (2026-09-12)
+
+`qsa_flash_wk8` (8 lanes/row, butterfly 4 -> 3 levels) was +2.3% but 16/19 on the judge, and the
+part-diff explains exactly why:
+
+- **layer 0 of the first chunk matches wk16 to 9.2e-5** - i.e. the kernel itself is correct and the
+  shallower reduction tree costs only rounding.
+- **every later layer diverges, up to 9.5** - the 1e-5-level rounding difference is *amplified*
+  through the model's recurrent (GDN) layers until the argmax moves.
+- The judge's failure signature confirms amplification rather than a kernel bug: it flipped tokens
+  where the reference has 5.99 and 2.20 logit margins, which no rounding-level difference can do by
+  itself; it needs the recurrence to carry it there.
+
+Consequence, and this is the important part: **our numerics already sit at the edge of the reference
+tolerance** (the shipped kernel passes 17/19 with two documented borderline cases). Any change to the
+attention's arithmetic - a different reduction tree, f16 staging, a WMMA tile reorder - shifts the
+trajectory past what the gates accept, *even when the kernel is provably correct*. So the remaining
+1.3-2.7x in the prefill attention is not reachable by arithmetic-preserving engineering alone
+(prefetch, unroll, lane mapping and shared staging were all measured neutral-to-worse), and reaching
+it would require re-baselining the judge's reference - a decision for the user, not a kernel change.
+
+Same reasoning applies to the WMMA tile path and to the decode attention: their value is real
+(+17% ceiling measured by skipping the butterfly) but they trade numerical identity for it.
