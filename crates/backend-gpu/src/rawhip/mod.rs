@@ -1700,6 +1700,7 @@ pub fn gqa_bench() -> Result<String, String> {
     for n_past in [512usize, 1024, 2048, 3314] {
         let nseg = n_past.div_ceil(seg);
     let p3d = ctx.alloc(npart * 4)?;
+    let p4d = ctx.alloc(npart * 4)?;
     let k16 = ctx.alloc(kk.len() * 2)?;
     let v16 = ctx.alloc(vv.len() * 2)?;
     {
@@ -1740,7 +1741,7 @@ pub fn gqa_bench() -> Result<String, String> {
         eprintln!("# kv_f16 앞 8개: f16={:?}", f0.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>());
         eprintln!("# kv_f16 원본  : {:?}", kk.iter().take(8).map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>());
     }
-        for (lab, pd) in [("v1", p1d), ("v2", p2d), ("v2h", p3d)] {
+        for (lab, pd) in [("v1", p1d), ("v2", p2d), ("v2h", p3d), ("v2d", p4d)] {
             let mut qp = qd as *mut c_void;
             let mut kp = kd as *mut c_void;
             let mut vp = vd as *mut c_void;
@@ -1766,9 +1767,10 @@ pub fn gqa_bench() -> Result<String, String> {
             let name = match lab {
                 "v1" => "qsa_flash_gqa",
                 "v2" => "qsa_flash_gqa2",
-                _ => "qsa_flash_gqa2h",
+                "v2h" => "qsa_flash_gqa2h",
+                _ => "qsa_flash_gqa2d",
             };
-            if lab == "v2h" {
+            if lab == "v2h" || lab == "v2d" {
                 // f16 KV 를 읽는 판: ck/cv 자리에 f16 버퍼를 넘긴다(q 는 그대로 f32)
                 kp = k16 as *mut c_void;
                 vp = v16 as *mut c_void;
@@ -1798,6 +1800,23 @@ pub fn gqa_bench() -> Result<String, String> {
                 }
                 out.push_str(&format!(
                     "n_past={n_past:5}  v1 {us1:8.2}us  v2 {us2:8.2}us  v2h {us:8.2}us  v2h/v2={:.2}x  v2h vs v2 최대상대차 {worst:.2e} (>1e-3 {bad})\n",
+                    us2 / us));
+            } else if lab == "v2d" {
+                let mut b = vec![0f32; npart];
+                let mut c = vec![0f32; npart];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut b).as_mut(), p2d)?;
+                ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), p4d)?;
+                let cmp_len = n_head * nseg * (hd + 2);
+                let mut worst = 0f32;
+                let mut bad = 0usize;
+                for i in 0..cmp_len {
+                    let d = (b[i] - c[i]).abs();
+                    let rel = d / (1.0f32 + b[i].abs());
+                    if rel > worst { worst = rel; }
+                    if rel > 1e-3 { bad += 1; }
+                }
+                out.push_str(&format!(
+                    "n_past={n_past:5}  v2 {us2:8.2}us  v2d {us:8.2}us  v2d/v2={:.2}x  vs v2 최대상대차 {worst:.2e} (>1e-3 {bad})\n",
                     us2 / us));
             } else {
                 us2 = us;

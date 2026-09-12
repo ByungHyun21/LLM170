@@ -92,6 +92,8 @@ pub struct DecodeState {
     pub ktab2: *mut u8,
     // KV/GDN 상태 [seq][...]
     pub kv_k: Vec<Vec<*mut u8>>,  // [full층][seq]
+    pub kv_k16: Vec<Vec<*mut u8>>, // f16 미러(디코드 v_dot2 경로용)
+    pub kv_v16: Vec<Vec<*mut u8>>,
     pub kv_v: Vec<Vec<*mut u8>>,
     pub st_conv: Vec<Vec<*mut u8>>,  // [recr층][seq]
     pub st_gdn: Vec<Vec<*mut u8>>,
@@ -167,17 +169,26 @@ impl DecodeState {
         let zero_k = vec![0f32; kv_len];
         let mut kv_k = Vec::with_capacity(n_full);
         let mut kv_v = Vec::with_capacity(n_full);
+        let mut kv_k16 = Vec::with_capacity(n_full);
+        let mut kv_v16 = Vec::with_capacity(n_full);
         for _ in 0..n_full {
             let mut ck = Vec::with_capacity(n_seqs);
             let mut cv2 = Vec::with_capacity(n_seqs);
+            let mut ck16 = Vec::with_capacity(n_seqs);
+            let mut cv16 = Vec::with_capacity(n_seqs);
             for s in 0..n_seqs {
                 ck.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
                 cv2.push(ctx.alloc(kv_len * 4).map_err(|e| e.to_string())?);
+                // f16 미러: 초기값은 변환 전까지 읽히지 않는다(항상 [0,n_past) 를 변환)
+                ck16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
+                cv16.push(ctx.alloc(kv_len * 2).map_err(|e| e.to_string())?);
                 ctx.h2d(ck[s], bytemuck::cast_slice(&zero_k))?;
                 ctx.h2d(cv2[s], bytemuck::cast_slice(&zero_k))?;
             }
             kv_k.push(ck);
             kv_v.push(cv2);
+            kv_k16.push(ck16);
+            kv_v16.push(cv16);
         }
         let zero_conv = vec![0f32; conv_len];
         let zero_gdn = vec![0f32; gdn_len];
@@ -347,7 +358,7 @@ impl DecodeState {
             mtp_b_cur: b_mtp_bcur,
             mtp_b_xqn: b_mtp_bxqn,
             mtp_b_xq2: b_mtp_bxq2,
-            kv_k, kv_v, st_conv, st_gdn,
+            kv_k, kv_v, kv_k16, kv_v16, st_conv, st_gdn,
             n_embd: n, n_ff, n_layer: hp.n_layer, n_head: hp.n_head, n_kv: hp.n_kv,
             hd: hp.head_dim, n_rot: hp.n_rot, eps: hp.eps, d_inner, n_group: hp.n_group,
             dt_rank: hp.dt_rank, d_state: hp.d_state, conv_k: hp.conv_k, conv_ch,
@@ -812,6 +823,8 @@ impl DecodeState {
                 }
                 self.copy(self.ak, self.kv_k[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
                 self.copy(self.av, self.kv_v[full_idx][seq], 0, pos * n_kv * hd, n_kv * hd)?;
+                kv_to_f16(&self.ctx, self.kv_k[full_idx][seq], self.kv_k16[full_idx][seq], pos * n_kv * hd, n_kv * hd)?;
+                kv_to_f16(&self.ctx, self.kv_v[full_idx][seq], self.kv_v16[full_idx][seq], pos * n_kv * hd, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
                 let flash1 = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
@@ -892,7 +905,29 @@ impl DecodeState {
                         // gqa-bench 실측 3314키 292.9 -> 171.5us (1.71x), 최대상대차 5.1e-7.
                         // LLM170_NO_GQA2=1 이면 종전 커널로 복귀.
                         let gqa2 = std::env::var_os("LLM170_NO_GQA2").is_none();
-                        if gqa && gqa2 {
+                        // v_dot2(f16 KV) 경로가 기본: QK 에 셔플이 없다 (gqa-bench 3314 175.9→106.9us)
+                        let gqa2d = gqa2 && std::env::var_os("LLM170_NO_GQA2D").is_none();
+                        if gqa2d {
+                            // f16 미러 + v_dot2: 인자 순서는 gqa2 와 같고 K/V 만 half 버퍼
+                            let mut k16 = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
+                            let mut v16 = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
+                            let mut args16: Vec<*mut std::ffi::c_void> = vec![
+                                &mut qp as *mut _ as *mut std::ffi::c_void,
+                                &mut k16 as *mut _ as *mut std::ffi::c_void,
+                                &mut v16 as *mut _ as *mut std::ffi::c_void,
+                                &mut mp as *mut _ as *mut std::ffi::c_void,
+                                &mut pp2 as *mut _ as *mut std::ffi::c_void,
+                                &mut np_ as *mut _ as *mut std::ffi::c_void,
+                                &mut nh as *mut _ as *mut std::ffi::c_void,
+                                &mut nk as *mut _ as *mut std::ffi::c_void,
+                                &mut h as *mut _ as *mut std::ffi::c_void,
+                                &mut tl as *mut _ as *mut std::ffi::c_void,
+                                &mut ss as *mut _ as *mut std::ffi::c_void,
+                                &mut p0 as *mut _ as *mut std::ffi::c_void,
+                                &mut sg_a as *mut _ as *mut std::ffi::c_void,
+                            ];
+                            self.ctx.launch3("qsa_flash_gqa2d", 1, n_kv as u32, nseg as u32, 256, &mut args16)?;
+                        } else if gqa && gqa2 {
                             self.ctx.launch3("qsa_flash_gqa2", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
                         } else if gqa {
                             self.ctx.launch3("qsa_flash_gqa", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
@@ -1008,6 +1043,20 @@ impl RawDecoder {
     pub fn new() -> Self {
         RawDecoder { st: std::sync::Mutex::new(None) }
     }
+}
+
+/// f32 KV → f16 미러 변환 (디코드 어텐션의 v_dot2 경로 전제).
+/// off·n 단위는 원소 수. 같은 스트림에 넣으므로 이후 커널이 순서대로 본다.
+fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, off: usize, n: usize) -> Result<(), String> {
+    let mut sp = unsafe { (src as *mut f32).add(off) } as *mut std::ffi::c_void;
+    let mut dp = unsafe { (dst as *mut u16).add(off) } as *mut std::ffi::c_void;
+    let mut nn = n as i32;
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        &mut sp as *mut _ as *mut std::ffi::c_void,
+        &mut dp as *mut _ as *mut std::ffi::c_void,
+        &mut nn as *mut _ as *mut std::ffi::c_void,
+    ];
+    ctx.launch3("kv_f16", ((n + 1023) / 1024) as u32, 1, 1, 256, &mut args)
 }
 
 impl llm170_core::matmul::RawDecode for RawDecoder {
@@ -1563,6 +1612,9 @@ gmark("attn", &mut marks);
                     let mut p0 = pos0 as i32;
                     let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
                     self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    let off = pos0 * n_kv * hd;
+                    let n = t * n_kv * hd;
+                    kv_to_f16(&self.ctx, self.kv_k[full_idx][seq], self.kv_k16[full_idx][seq], off, n)?;
                 }
                 {
                     let mut sp = self.av_t as *mut std::ffi::c_void;
@@ -1571,6 +1623,9 @@ gmark("attn", &mut marks);
                     let mut p0 = pos0 as i32;
                     let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
                     self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    let off = pos0 * n_kv * hd;
+                    let n = t * n_kv * hd;
+                    kv_to_f16(&self.ctx, self.kv_v[full_idx][seq], self.kv_v16[full_idx][seq], off, n)?;
                 }
                 // qsa 배치 (단일 런치 — sstride=ctx, n_past=pos0+t 최대;
                 // 초과 p는 마스크→-3e38→w=0 기여로 원소 산술열 불변)

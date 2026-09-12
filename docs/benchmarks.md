@@ -4130,3 +4130,41 @@ Implementation spec for the next session: f16 KV (writers or mirror), a decode k
 max/sum butterfly over the tile, the P handed to the thread-per-dim PV stage through shared, and the
 existing `part`+merge split (llama's combine is the same scheme). Expected to remove most of the 3.65
 ms/token the attention costs at 3314.
+
+## v_dot2 decode attention shipped: tg3314 11.02 -> 11.15 (2026-09-12)
+
+The decode kernel now follows llama's tile design: `qsa_flash_gqa2d` puts **one key per lane** and
+computes that key's whole 256-dim dot with 128 `v_dot2_f32_f16` in a single thread - the QK has *no
+cross-lane reduction at all* (our previous shape needed 5 shuffle stages per (key, head)). The K tile
+is staged in shared with a 258-half row stride (2 halves of padding make the stride an odd number of
+words, so the per-lane row reads are bank-conflict-free), and the softmax is a 5-stage max/sum
+butterfly per warp with the probabilities handed to the thread-per-dim PV stage through shared. The
+running max/sum live in per-warp registers - an earlier draft kept them in shared and the lane-to-lane
+race collapsed `e_m` to 1, which `gqa-bench` caught immediately.
+
+`gqa-bench` now measures four variants on identical inputs:
+
+| n_past | v1 (original) | v2 (f32, warp-per-key) | v2h (f32 kernel on f16 KV) | v2d (f16 + v_dot2) | v2d/v2 |
+|---|---|---|---|---|---|
+| 512 | 79.8 us | 33.9 | 31.5 | **22.5** | 1.51x |
+| 1024 | 100.0 | 69.2 | 61.0 | **42.6** | 1.62x |
+| 2048 | 190.5 | 113.7 | 108.9 | **66.0** | 1.72x |
+| 3314 | 291.0 | 175.9 | 157.4 | **106.9** | 1.65x |
+
+Correctness: max relative difference 5.05e-4 against the f32 kernel (0 elements over 1e-3), i.e. the
+f16 input quantization, same class as the accepted f16 prefill.
+
+Engine: an f16 mirror of the KV is maintained **at the write sites** (`kv_to_f16` after each
+`kv_append_t` in the prefill and after the decode's single-row copy) rather than by a watermark in the
+attention launcher - the watermark variant would silently go stale whenever the spec path truncates
+the KV, which is exactly the kind of bug that costs a session. End-to-end with the mirror:
+
+| metric | before | after |
+|---|---|---|
+| tg512 | 11.58 | 11.60 |
+| tg3314 | 11.02 | **11.15** (+1.2%, 0.966x of llama-bench) |
+| MTP spec3 (steady) | 22.04 | **22.21** |
+| tokens | - | identical on a 300-token prompt; spec==nonspec identical at 21 and 2302 tokens |
+
+`LLM170_NO_GQA2D=1` restores the f32-KV kernel. The f16 mirror also halves the KV footprint for one
+sequence, which is the configuration RAM/SSD offloading will care about.
