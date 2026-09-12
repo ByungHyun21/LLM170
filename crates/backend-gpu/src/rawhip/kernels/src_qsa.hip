@@ -760,25 +760,41 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wmma(
 
     for (int kt = p0; kt < p1; kt += 16) {
         int nk = min(16, p1 - kt);
-        for (int i = tid; i < 2 * 16 * 256; i += 256) {
+        for (int i = tid * 4; i < 2 * 16 * 256; i += 1024) {
             int row = i >> 8, d = i & 255;
             bool isk = (row < 16);
             int r2 = isk ? row : (row - 16);
             const float* src = isk ? ck : cv;
-            float v = (r2 < nk) ? src[((size_t)(kt + r2) * n_kv + kvh) * hd + d] : 0.0f;
-            if (isk) gK16[row * 256 + d] = __float2half(v);
-            else gV16[(row - 16) * 256 + d] = __float2half(v);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (r2 < nk) v = *reinterpret_cast<const float4*>(src + ((size_t)(kt + r2) * n_kv + kvh) * hd + d);
+            half* dst = isk ? &gK16[row * 256 + d] : &gV16[(row - 16) * 256 + d];
+            dst[0] = __float2half(v.x); dst[1] = __float2half(v.y);
+            dst[2] = __float2half(v.z); dst[3] = __float2half(v.w);
         }
         __syncthreads();
+        // QK 를 절반 워프가 8 mma 씩 분담(전체 16)한 뒤 공유로 합산한다.
         fragment<accumulator, 16, 16, 16, float> fs;
         fill_fragment(fs, 0.0f);
         #pragma unroll
-        for (int kc = 0; kc < 16; kc++) {
+        for (int kc = 0; kc < 8; kc++) {
+            int kd = hf * 8 + kc;
             fragment<matrix_a, 16, 16, 16, half, row_major> fa;
             fragment<matrix_b, 16, 16, 16, half, col_major> fb;
-            load_matrix_sync(fa, &gQ16[pair * 16 * 256 + kc * 16], 256);
-            load_matrix_sync(fb, &gK16[kc * 16], 256);
+            load_matrix_sync(fa, &gQ16[pair * 16 * 256 + kd * 16], 256);
+            load_matrix_sync(fb, &gK16[kd * 16], 256);
             mma_sync(fs, fa, fb, fs);
+        }
+        float* gS32 = (float*)(gSmem + (4 * 16 * 256 + 2 * 16 * 256) / 2 + 4 * 2 * 256 / 2);
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int idx = lane + (sl << 5);
+            gS32[(pair * 2 + hf) * 256 + idx] = fs.x[sl];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int idx = lane + (sl << 5);
+            fs.x[sl] += gS32[(pair * 2 + (1 - hf)) * 256 + idx];
         }
         int krow = (pos0 + q0 + qr) * sstride;
         bool ok[8];
