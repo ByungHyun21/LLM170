@@ -1663,6 +1663,43 @@ pub fn wmma_check() -> Result<String, String> {
     Ok(msg)
 }
 
+/// mode2 프로브: 16x256 타일을 ldm=256 으로 적재했을 때 프래그먼트 레이아웃이 맞는지.
+pub fn wmma_check_ldm() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let a2: Vec<f32> = (0..16 * 256).map(|i| (((i / 256) * 3 + (i % 256)) % 9) as f32 - 4.0).collect();
+    let b2: Vec<f32> = (0..16 * 256).map(|i| (((i / 256) * 5 + (i % 256)) % 7) as f32 - 3.0).collect();
+    let ad2 = ctx.alloc(16 * 256 * 4)?;
+    let bd2 = ctx.alloc(16 * 256 * 4)?;
+    let cd2 = ctx.alloc(256 * 4)?;
+    ctx.h2d(ad2, bytemuck::cast_slice(&a2))?;
+    ctx.h2d(bd2, bytemuck::cast_slice(&b2))?;
+    let mut ap = ad2 as *mut c_void;
+    let mut bp = bd2 as *mut c_void;
+    let mut cp = cd2 as *mut c_void;
+    let mut args = vec![
+        (&mut ap) as *mut _ as *mut c_void,
+        (&mut bp) as *mut _ as *mut c_void,
+        (&mut cp) as *mut _ as *mut c_void,
+    ];
+    ctx.launch3("wmma_probe_ldm", 1, 1, 1, 256, &mut args)?;
+    ctx.sync()?;
+    let mut c = vec![0f32; 256];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd2)?;
+    let mut maxerr = 0f32;
+    let mut nnan = 0usize;
+    for i in 0..16usize {
+        for jj in 0..16usize {
+            let mut sum = 0f32;
+            for k2 in 0..256usize { sum += a2[i * 256 + k2] * b2[jj * 256 + k2]; }
+            let d = (c[i * 16 + jj] - sum).abs();
+            if c[i * 16 + jj].is_nan() { nnan += 1; }
+            if d > maxerr { maxerr = d; }
+        }
+    }
+    Ok(format!("mode2 (ldm=256): max|delta| = {maxerr:.4}, NaN {nnan}/256"))
+}
+
 /// 두 prefill 어텐션 커널(wk16 vs wk8)에 **동일한** Q/K/V/마스크를 넣고 part 버퍼를 비교한다.
 /// 같은 입력에서 part 가 갈리면 커널 버그, 일치하면(또는 반올림 수준이면) 긴 문맥 발산은
 /// 재귀 층을 통한 증폭이다. plans/47 의 판별 하네스.

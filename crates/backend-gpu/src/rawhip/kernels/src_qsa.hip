@@ -671,3 +671,27 @@ extern "C" __global__ void qsa_flash_wk8(const float* q, const float* ck, const 
     #pragma unroll
     for (int j = 0; j < 32; j++) pp2[own * 32 + j] = acc[j];
 }
+
+// mode2 프로브: 16행 x 256dim 타일을 ldm=256 으로 적재 (어텐션 커널과 동일 패턴 검증).
+extern "C" __global__ void wmma_probe_ldm(const float* a, const float* b, float* c) {
+    __shared__ half sa[16 * 256];
+    __shared__ half sb[16 * 256];
+    for (int i = threadIdx.x; i < 16 * 256; i += blockDim.x) {
+        sa[i] = __float2half(a[i]);
+        sb[i] = __float2half(b[i]);
+    }
+    __syncthreads();
+    fragment<accumulator, 16, 16, 16, float> fc;
+    fill_fragment(fc, 0.0f);
+    #pragma unroll
+    for (int kc = 0; kc < 16; kc++) {
+        fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+        fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+        load_matrix_sync(fa, &sa[kc * 16], 256);
+        load_matrix_sync(fb, &sb[kc * 16], 256);
+        mma_sync(fc, fa, fb, fc);
+    }
+    int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
+}

@@ -3729,3 +3729,13 @@ tensor-core (WMMA) tile kernel, which is what llama.cpp uses. That is the open i
 plans/47-attention-wmma.md; the ad-hoc attempt got as far as compiles-and-runs with the fragment
 layouts verified by `wmma-check`, but still produces NaN on multi-chunk prompts. The measured prize
 is pp3314 ~370 t/s = 1.10x llama, which would close the pp cell.
+
+## `wmma-check-ldm`: the attention kernel's actual stride pattern is correct (2026-09-12)
+
+The first WMMA verification only exercised 16x16 tiles with ldm=16, while the attention kernel loads
+fragments from 16x256 tiles with **ldm=256**. New diagnostic (`llm170 wmma-check-ldm`,
+`wmma_probe_ldm`) tests exactly that: **max|delta| = 0.0000, NaN 0/256** - the fragment loaders are
+right at the real stride. So neither the loaders nor the layouts nor the shared-memory size (the
+53248 B bug, fixed) explain the multi-chunk NaN; the remaining suspects inside the tile kernel are
+the softmax bookkeeping around `mrun`/`srun` per fragment slot and the P hand-off through shared
+memory. Everything else about the kernel has now been verified in isolation.
