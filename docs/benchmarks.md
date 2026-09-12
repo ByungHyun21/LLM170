@@ -3553,3 +3553,24 @@ row_major, the PV pattern)**. This pins down, with evidence rather than assumpti
 
 So the layouts are not the WMMA attention kernel's problem; its bug must be in the Q/K/V staging
 indices, masking, segment/pos handling or the P hand-off. The probe is kept as a permanent check.
+
+## Final paired audit vs the live reference (2026-09-12, 3 reps each, same session)
+
+| metric | ours (mean of 3) | llama-bench (3 reps) | ratio |
+|---|---|---|---|
+| pp512 | 352.2 (343.3-360.4) | **358.21 ± 8.91** | 0.983x |
+| tg32 | 11.41 (11.38-11.47) | **11.65 ± 0.09** | **0.979x** |
+| pp3314 | ~303-314 | 335.06 ± 0.17 | 0.90-0.94x |
+| tg3314 | 10.66 | 11.54 ± 0.06 | 0.92x |
+
+At 512 tokens we are within mutual noise on pp and ~2% behind on tg (llama's ±0.09 makes its tg
+figure solid, ours varies ~1%). At 3314 the gap is 6-10% and, per the kernel budgets, sits in the
+prefill/decode attention: the prefill matmuls measure 24.1 TFLOP/s (102% of this device's L1-fed
+WMMA roof) and the decode GEMV runs at ~190GB/s (llama's effective ~198), so neither has headroom.
+
+The three settings the objective names are all ahead: MTP tg 1.36-1.84x, np4 aggregate 1.46x
+(server to server, 22.64 vs 15.5), mmproj vision 1.45x / batched VL 1.23x. What remains is the
+base-mode attention, and `plans/47-attention-wmma.md` records the state of that attempt: layouts
+verified by `wmma-check`, toolchain constraints pinned, one shared-memory bug fixed via the
+part-diff method, and the recommendation to port llama's `fattn-mma-f16.cuh` rather than keep
+hand-rolling the tile kernel.
