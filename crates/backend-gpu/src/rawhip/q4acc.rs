@@ -42,6 +42,17 @@ impl GBuf {
     }
 }
 
+/// MoE 전문가 그룹화 캐시 — 같은 라우팅(ids)에 대한 gate/up/down 3개 투영이
+/// 같은 순열을 쓴다. 게이트가 1회만 d2h·정렬·업로드하고 나머지는 재사용한다.
+/// (실측: 호출마다 d2h+h2d 동기 → 층당 9회 → MoE 77ms/층, 청크의 59%.)
+struct MoeGroup {
+    generation: u64,
+    rows: usize,
+    perm_d: u64,
+    inv_d: u64,
+    off: Vec<usize>,
+}
+
 /// 무게 파일 소스 — mmap 베이스 주소 범위 + 파일 핸들 (staged pread 업로드용).
 struct Source {
     base: usize,
@@ -91,6 +102,10 @@ pub struct Q4Acc {
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
     rperm: std::sync::Mutex<GBuf>,
+    rperm2: std::sync::Mutex<GBuf>,
+    /// 그룹화 캐시(위 MoeGroup) + 무효화 세대(라우팅이 갱신될 때 증가).
+    moe_group: std::sync::Mutex<Option<MoeGroup>>,
+    moe_gen: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: 포인터는 디바이스 주소 — 스레드 간 공유해도 HIP 런타임이 직렬화한다
@@ -126,7 +141,22 @@ impl Q4Acc {
             g.ensure(&self.ctx, n * 4)?
         };
         self.ctx.h2d(pd, bytemuck::cast_slice(perm))?;
-        let (mut a, mut b, mut c) = (src, pd, dst);
+        self.rows_permute_dev(src, pd as *mut u8, dst, row_u32, n)
+    }
+
+    /// 디바이스 순열판 — 순열이 이미 GPU에 있으면 h2d/동기 없이 런치만 한다.
+    fn rows_permute_dev(
+        &self,
+        src: *mut u8,
+        perm_d: *mut u8,
+        dst: *mut u8,
+        row_u32: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        if n == 0 || row_u32 == 0 {
+            return Ok(());
+        }
+        let (mut a, mut b, mut c) = (src, perm_d, dst);
         let (mut ru, mut nn) = (row_u32 as i32, n as i32);
         self.kop(
             "q4_rows_permute_u32",
@@ -181,6 +211,9 @@ impl Q4Acc {
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
+            rperm2: std::sync::Mutex::new(GBuf::new("rperm2")),
+            moe_group: std::sync::Mutex::new(None),
+            moe_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -417,6 +450,15 @@ impl Q4Acc {
             let mut ni = n_in as i32;
             let mut no = n_out as i32;
             let mut xw = xq_w as i32;
+            let mut tt = t as i32;
+            // 16행 타일 판(2026-09-13) — 가중치 1회 독서로 상각. 원판은 행마다
+            // 같은 가중치 행을 다시 읽어 MoE expert-down(20행 그룹)에서 20배
+            // 증폭이었다(실측 2715ms/청크). 산술 순서는 동일 = 비트 동일.
+            let kern = if std::env::var_os("LLM170_NO_Q5_1_T").is_none() {
+                "q4_gemm_q5_1_t"
+            } else {
+                "q4_gemm_q5_1"
+            };
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -425,8 +467,10 @@ impl Q4Acc {
                 (&mut ni) as *mut _ as *mut std::ffi::c_void,
                 (&mut no) as *mut _ as *mut std::ffi::c_void,
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
             ];
-            return self.ctx.launch3("q4_gemm_q5_1", t as u32, gy, gz, 64, &mut args);
+            let gx = if kern.ends_with("_t") { t.div_ceil(16) as u32 } else { t as u32 };
+            return self.ctx.launch3(kern, gx, gy, gz, 64, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
@@ -693,40 +737,100 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         n_expert_stack: usize,
         k_sel: usize,
     ) -> Result<(), String> {
+        let tm = std::env::var_os("LLM170_MOE_TIME").is_some();
+        let t0 = std::time::Instant::now();
+        let mut lap = t0;
+        let mut phase = |name: &str, lap: &mut std::time::Instant| {
+            if tm {
+                let ms = lap.elapsed().as_secs_f64() * 1e3;
+                if ms >= 0.05 {
+                    eprintln!("# moe-phase {name}={ms:.2}ms");
+                }
+                *lap = std::time::Instant::now();
+            }
+        };
         let n_in = ws.n_in as usize;
         let n_out = ws.n_out as usize / n_expert_stack.max(1);
         // 행 수 = t·k_sel — 버퍼는 t_max 크기라 길이에서 유도할 수 없다.
         let rows = self.t_cur() * k_sel.max(1);
-        let mut idv = vec![0u32; rows];
-        let idp = self.fptr(ids)?;
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
         let xp = self.fptr(x)?;
         let op_ = self.fptr(out)?;
         let (wd, f32w) = self.dev_weight(ws)?;
         let per_expert = ws.data.len() / n_expert_stack.max(1);
+        phase("weight", &mut lap);
         let (xq, xq_w) = if f32w {
             (std::ptr::null_mut(), 0usize)
         } else {
             self.frame_quant(xp, n_in, rows)?
         };
+        phase("quant", &mut lap);
         let ne = n_expert_stack.max(1);
-        let mut off = vec![0usize; ne + 1];
-        for &e in &idv {
-            off[(e as usize).min(ne - 1) + 1] += 1;
+        // 그룹화 캐시 — gate/up/down 3개 투영이 같은 라우팅을 공유한다. 게이트가
+        // 1회만 d2h(동기)+정렬+순열 업로드하고 나머지는 디바이스 순열을 재사용.
+        // 실측: 호출마다 동기하던 시절 층당 9회 → MoE 77ms/층(청크 59%).
+        let generation = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
+        let hit = {
+            let c = self.moe_group.lock().map_err(|e| e.to_string())?;
+            c.as_ref()
+                .filter(|g| g.generation == generation && g.rows == rows)
+                .map(|g| (g.perm_d, g.inv_d, g.off.clone()))
+        };
+        if tm {
+            eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        for e in 0..ne {
-            off[e + 1] += off[e];
-        }
-        let mut cur = off[..ne].to_vec();
-        let mut perm = vec![0u32; rows];
-        let mut inv = vec![0u32; rows];
-        for (i, &e) in idv.iter().enumerate() {
-            let e = (e as usize).min(ne - 1);
-            let p = cur[e];
-            perm[p] = i as u32;
-            inv[i] = p as u32;
-            cur[e] += 1;
-        }
+        let (perm_d, inv_d, off) = match hit {
+            Some(v) => v,
+            None => {
+                let mut lp = std::time::Instant::now();
+                let idp = self.fptr(ids)?;
+                let mut idv = vec![0u32; rows];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
+                if tm {
+                    let ms = lp.elapsed().as_secs_f64() * 1e3;
+                    if ms >= 0.05 { eprintln!("# moe-miss d2h={ms:.2}ms rows={rows}"); }
+                    lp = std::time::Instant::now();
+                }
+                let mut off = vec![0usize; ne + 1];
+                for &e in &idv {
+                    off[(e as usize).min(ne - 1) + 1] += 1;
+                }
+                for e in 0..ne {
+                    off[e + 1] += off[e];
+                }
+                let mut cur = off[..ne].to_vec();
+                let mut perm = vec![0u32; rows];
+                let mut inv = vec![0u32; rows];
+                for (i, &e) in idv.iter().enumerate() {
+                    let e = (e as usize).min(ne - 1);
+                    let p = cur[e];
+                    perm[p] = i as u32;
+                    inv[i] = p as u32;
+                    cur[e] += 1;
+                }
+                if tm {
+                    let ms = lp.elapsed().as_secs_f64() * 1e3;
+                    if ms >= 0.05 { eprintln!("# moe-miss sort={ms:.2}ms"); }
+                    lp = std::time::Instant::now();
+                }
+                let (pd, ivd) = {
+                    let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
+                    let pd = a.ensure(&self.ctx, rows * 4)? as u64;
+                    let mut b = self.rperm2.lock().map_err(|e| e.to_string())?;
+                    let ivd = b.ensure(&self.ctx, rows * 4)? as u64;
+                    (pd, ivd)
+                };
+                self.ctx.h2d(pd as *mut u8, bytemuck::cast_slice(&perm))?;
+                self.ctx.h2d(ivd as *mut u8, bytemuck::cast_slice(&inv))?;
+                if tm {
+                    let ms = lp.elapsed().as_secs_f64() * 1e3;
+                    if ms >= 0.05 { eprintln!("# moe-miss h2d={ms:.2}ms"); }
+                }
+                let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
+                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, off: off.clone() });
+                (pd, ivd, off)
+            }
+        };
+        phase("group", &mut lap);
         let row_u32 = if f32w { n_in } else { xq_w };
         let xg = {
             let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
@@ -737,7 +841,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             g.ensure(&self.ctx, rows * n_out * 4)?
         };
         let xsrc0 = if f32w { xp } else { xq };
-        self.rows_permute(xsrc0, &perm, xg, row_u32, rows)?;
+        self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
+        phase("gather", &mut lap);
         for e in 0..ne {
             let r = off[e + 1] - off[e];
             if r == 0 {
@@ -753,7 +858,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, r, dst)?;
             }
         }
-        self.rows_permute(yg, &inv, op_, n_out, rows)?;
+        phase("gemms", &mut lap);
+        self.rows_permute_dev(yg, inv_d as *mut u8, op_, n_out, rows)?;
+        phase("scatter", &mut lap);
+        if tm {
+            eprintln!("# moe-phase TOTAL={:.2}ms rows={rows}", t0.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(())
     }
 
@@ -1249,6 +1359,8 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 Ok(())
             }
             O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+                // 라우팅이 새로 쓰였다 — 그룹화 캐시 무효화.
+                self.moe_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (mut rp, mut ip, mut wp) = (self.fptr(route)?, self.fptr(ids)?, self.fptr(wt)?);
                 let mut ne = n_exp as i32;
                 let mut ks = k_sel as i32;

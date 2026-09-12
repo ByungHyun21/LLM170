@@ -59,6 +59,71 @@ extern "C" __global__ void q4_gemm_q5_1(const unsigned* xq, const unsigned* w,
     }
 }
 
+// q5_1 16행 타일 — 기존 q4_gemm_q5_1은 (행, 출력) 블록이라 같은 가중치 행을
+// 행 수만큼 다시 읽었다(MoE expert-down = 25.2GiB q5_1: t=20 그룹에서 20배
+// 증폭, 실측 2715ms/청크 = 전체의 54%). 이 판은 출력 1개당 16행을 묶어 가중치
+// 1회 독서로 상각한다. 행별 누산 순서는 원판과 동일(비트 동일 — q4-acc-check).
+extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
+                                          double* part, float* out, int n_in, int n_out,
+                                          int xq_w, int t) {
+    int o = blockIdx.y + blockIdx.z * gridDim.y;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int r0 = (int)blockIdx.x * 16;
+    int rc = min(16, t - r0);
+    if (rc <= 0) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int row_base = o * n_sub * 24;
+    const unsigned ones = 0x01010101u;
+    float acc[16];
+    #pragma unroll
+    for (int r = 0; r < 16; r++) acc[r] = 0.0f;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + sb * 24;
+        float d = f16w(w, wb);
+        float mn = f16w(w, wb + 2);
+        unsigned qh = w[(wb + 4) >> 2];
+        unsigned qsw0 = w[(wb + 8) >> 2];
+        unsigned qsw1 = w[(wb + 12) >> 2];
+        unsigned qsw2 = w[(wb + 16) >> 2];
+        unsigned qsw3 = w[(wb + 20) >> 2];
+        int xw = (sb << 5) >> 2;
+        for (int r = 0; r < rc; r++) {
+            const unsigned* xr = xq + (size_t)(r0 + r) * xq_w;
+            int s_lo = 0, s_hi = 0, s1 = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qs4 = (k & 3) == 0 ? qsw0 : (k & 3) == 1 ? qsw1 : (k & 3) == 2 ? qsw2 : qsw3;
+                unsigned nib = (k < 4) ? (qs4 & 0x0F0F0F0Fu) : ((qs4 >> 4) & 0x0F0F0F0Fu);
+                unsigned hb = (qh >> (4 * k)) & 0xFu;
+                unsigned hb_p = (hb & 1u) << 4 | (hb & 2u) << 11 | (hb & 4u) << 18 | (hb & 8u) << 25;
+                unsigned y = xr[xw + k];
+                s_lo += dot4(nib, y, 0);
+                s_hi += dot4(hb_p, y, 0);
+                s1 += dot4(ones, y, 0);
+            }
+            float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+            acc[r] += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
+        }
+    }
+    __shared__ double sh32[32 * 16];
+    for (int r = 0; r < rc; r++) {
+        if (l >= 32) sh32[r * 32 + (l - 32)] = (double)acc[r];
+    }
+    __syncthreads();
+    if (l < 32) {
+        for (int r = 0; r < rc; r++) {
+            double a = (double)acc[r] + sh32[r * 32 + l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a += __shfl_down_sync(0xffffffffffffffffull, a, off);
+            if (l == 0) out[(size_t)(r0 + r) * n_out + o] = (float)a;
+        }
+    }
+}
+
 // f32 가중치 GEMV/GEMM (MoE 라우터 ffn_gate_inp 등) — 무양자화.
 // grid (t, n_out), 64레인, x 행 스트라이드 = x_stride (float).
 extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* out,

@@ -588,7 +588,9 @@ fn moe_frame(
     let w_route_sh = model.w4(&format!("blk.{il}.ffn_gate_inp_shexp.weight"))?;
     acc.frame_mm_group(f.mix, &[w_route, w_route_sh], &[f.mroute, f.msgate], t)
         .map_err(Q4Error::Io)?;
+    sync_mark(acc, "moe.route", f.mroute)?;
     op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
+    sync_mark(acc, "moe.top10", f.mids)?;
     let fs: &dyn FrameState = acc;
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
@@ -609,6 +611,7 @@ fn moe_frame(
     } else {
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
+        sync_mark(acc, "moe.gather", f.mxsel)?;
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
@@ -616,7 +619,9 @@ fn moe_frame(
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: t * k_sel * n_ff })?;
         fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
+        sync_mark(acc, "moe.gemm3", f.my)?;
         fs.frame_moe_scatter(f.my, f.mwt, f.mout, k_sel, n, t).map_err(Q4Error::Io)?;
+        sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
     op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
@@ -628,6 +633,7 @@ fn moe_frame(
     let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
     acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
     op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
+    sync_mark(acc, "moe.shared", f.mout)?;
     Ok(())
 }
 

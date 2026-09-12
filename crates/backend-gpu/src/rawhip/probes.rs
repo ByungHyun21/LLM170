@@ -374,6 +374,34 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `q4-d2h-bench` — 소형 d2h 비용 격리(프레임 MoE가 ids 20KB를 읽는 데 15.5ms를
+/// 쓰고 있었다). 크기별·경로별로 잰다.
+pub fn d2h_bench() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let mut out = String::new();
+    for &n in &[20 << 10usize, 1 << 20, 8 << 20] {
+        let d = ctx.alloc(n)?;
+        let mut dst = vec![0u8; n];
+        // 워밍업 + 5회 평균
+        for _ in 0..2 {
+            ctx.d2h(&mut dst, d as *const u8)?;
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            ctx.d2h(&mut dst, d as *const u8)?;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / 5.0;
+        // 순수 커널 런치 1회 비용(동기 없음) 대조
+        let t1 = std::time::Instant::now();
+        for _ in 0..5 {
+            let _ = ctx.scratch(4);
+        }
+        let lms = t1.elapsed().as_secs_f64() * 1e3 / 5.0;
+        out += &format!("# d2h {}KB: {:.3}ms (scratch {:.3}ms)\n", n >> 10, ms, lms);
+    }
+    Ok(out)
+}
+
 pub fn device_report(ctx: &RawCtx) -> String {
     let name = unsafe {
         let mut buf = vec![0i8; 256];
