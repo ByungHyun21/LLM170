@@ -114,7 +114,7 @@ unsafe impl Send for Q4Acc {}
 unsafe impl Sync for Q4Acc {}
 
 /// 활성 q8 버퍼의 행 스트라이드(워드) — quant_q8과 동일 규약.
-fn xq_words(n: usize) -> usize {
+pub(crate) fn xq_words(n: usize) -> usize {
     n / 4 + n / 32 + n / 16
 }
 
