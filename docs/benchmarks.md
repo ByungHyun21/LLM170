@@ -3334,3 +3334,28 @@ practical wall - with rmsq 1.5, qsa_flash_gqa 1.7, gdn_ar 1.3, axpy 0.7 and ever
 (the launches pipe fine). The remaining base-tg work is therefore (a) GEMV memory efficiency inside
 the quantized kernels and (b) the long-context attention path - and any change to (b) must be applied
 identically to the decode and the verify, since the spec contract compares their argmaxes.
+
+## Base-decode levers, measured and excluded (2026-09-12)
+
+Round of experiments on the single-stream decode (the only unmet cell), each measured, all
+reverted or noted:
+
+| lever | result |
+|---|---|
+| attention block 256 -> 128 (frees the 4 idle warps' registers, rs zero-init keeps the tree bit-identical) | **worse**: 9.97 vs 11.34 t/s at pp512, neutral at pp3314 (kernel is warp-latency-bound, not register-bound) |
+| `LLM170_QSA_SEG` 128/256/512 | exactly neutral - the segmented flash path is not segment-bound |
+| `LLM170_NODUAL=1` (separate GEMVs instead of fused duals) | neutral (11.28 vs 11.30) - not a locality effect |
+
+Two levers remain, both bounded and characterized:
+
+1. **Launch fusion in the small kernels.** t=1 has 1148 launches; rmsq 128 calls x 11.9us = 1.5ms,
+   axpy_scaled 128 x 5.4us = 0.69ms, quant_q8 81 x 6.8us, silu 64 x 5.6us. These tiny kernels are
+   launch/latency-bound (a 20KB rmsq running 12us is ~4x its work). Fusing the residual add into the
+   preceding GEMV epilogue (`xs[i] += dot_i` instead of write-then-axpy) is bit-identical and worth
+   ~0.7-1.0ms/token (0.8-1.1%) - enough for roughly half of the pp512 gap, but it vanishes at long
+   contexts where the attention dominates.
+2. **The batch/single kernel arithmetic unification** (below): the prerequisite for restructuring the
+   long-context attention, which is where the pp3314 gap (0.92x) actually lives.
+
+The GEMV itself (91% of the decode, 190GB/s) is at the APU's practical wall; the dual-GEMV form,
+the launch gaps (0.0ms) and the attention geometry have all now been measured and excluded.
