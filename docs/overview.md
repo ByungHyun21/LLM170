@@ -55,26 +55,38 @@ Both models are GDN (Gated DeltaNet) linear-attention hybrids — qwen35 first
 - Operational issues live at the bottom of each model/topic document
   (date header + symptom/cause/verification)
 
-## Current Stage (2026-09-02)
+## Current Stage (2026-09-12)
 
 Both reference models run end-to-end and are verified against llama.cpp greedy
-streams — including long-prompt (2,311 / 1,904 tokens) and parallel-sequence
-cases, under the near-tie-aware standard (ADR-0012 in
-[decisions.md](decisions.md)). On the GPU the engine has two independent
-backends (see backend-architecture.md): rawhip (HIP/ROCm — full pipeline:
-all quantized GEMM projections in 8 types with batched prefill tiles, fused
-flash attention, the GDN scan, and a bit-exact element-wise set) and rawvk
-(Vulkan — a full pure-Rust/Vulkan pipeline: subgroup GEMV decode kernels
-for all 8 quant types, cooperative-matrix prefill tiles, fused
-residual/RMS/GDN/attention kernels and a GPU-side argmax, reaching
-0.91× (pp512) and 0.97× (tg32) of llama.cpp Vulkan on the reference
-APU). qwen4exp decodes
-through a GPU-resident frame by default (ADR-0017) — kernels chained by
-handle, ~600 per-step host syncs down to ~14. The HTTP server schedules
-continuous batching across slots; qwen35 has MTP speculative decoding
-(`--spec k`).
+streams — including long-prompt and parallel-sequence cases, under the
+near-tie-aware standard (ADR-0012 in [decisions.md](decisions.md)). The latest
+full gate run is 17/19 PASS + 2 INFO (the two INFO cases are the accepted
+long-context f16-prefill class, where kernel accuracy is guaranteed separately
+by `attn-check`).
+
+On the GPU the engine has two independent backends (see
+backend-architecture.md): rawhip (HIP/ROCm — full pipeline: all quantized GEMM
+projections in 8 types with batched prefill tiles, flash attention, the GDN
+scan, and a bit-exact element-wise set) and rawvk (Vulkan — subgroup GEMV
+decode kernels for all 8 quant types, cooperative-matrix prefill tiles, fused
+residual/RMS/GDN/attention kernels and a GPU-side argmax, reaching 0.91×
+(pp512) and 0.95× (tg32) of llama.cpp Vulkan on the reference APU).
+
+**HIP standing against llama-bench ROCm, CLI-to-CLI, same GGUF:** pp512 364 t/s
+(1.03×), pp3314 339 t/s (1.01×), tg512 11.6 t/s (1.01×), tg3314 11.3 t/s
+(0.98×); MTP speculative decode 22.1 t/s single-stream (1.92×) and 30.6 t/s
+aggregate at np4 (1.97×); vision encoding 1.1 s vs 1.60 s (1.45×). The
+attention path was redesigned to get there: an fp16 WMMA tile kernel for
+prefill (Q in registers, its shared buffer reused as the K/V tile) and a
+decode kernel that puts one key per lane and computes each 256-dim dot with
+`v_dot2_f32_f16` — no cross-lane reduction — over an f16 KV mirror maintained
+at the KV write sites. qwen4exp decodes through a GPU-resident frame by
+default (ADR-0017) — kernels chained by handle, ~600 per-step host syncs down
+to ~14. The HTTP server schedules continuous batching across slots; qwen35 has
+MTP speculative decoding (`--spec k`), whose verify runs as a batched GPU
+forward.
 
 Remaining before the CMP arrives: the qwen35 decode frame, PLE/QSA frame
-bridges for qwen4exp, prefill/decode throughput toward the llama.cpp target
-([benchmarks.md](benchmarks.md)), and the cmp-stock kernel variants. The
+bridges for qwen4exp, KV quantization (a capacity lever, and the last
+bandwidth lever for decode attention), and the cmp-stock kernel variants. The
 staged plan lives in [architecture.md](architecture.md).

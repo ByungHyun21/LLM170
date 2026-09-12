@@ -15,11 +15,16 @@ gfx1151), greedy, single-tenant `llm170 bench`. Numbers are only ever quoted
 with their conditions — full tables and history in
 [docs/benchmarks.md](docs/benchmarks.md).
 
-| Backend | pp512 prefill | decode | note |
+| Backend | pp512 prefill | decode (tg32) | note |
 |---|---|---|---|
-| ROCm/HIP (`rawhip`) | ~322 t/s | 10.9 t/s (tg8) | llama.cpp raw-loop: pp512 358, tg8 11.2 → 0.90× / 0.97× |
-| Vulkan (`rawvk`) | 322 t/s | 11.8 t/s (tg32) | llama.cpp Vulkan: pp512 353, tg32 12.1 → 0.91× / 0.97× |
-| CPU (W4A8) | ~128 t/s (pp64) | 9.9 t/s (tg24) | bit-exact reference engine |
+| ROCm/HIP (`rawhip`) | **364 t/s** | **11.6 t/s** | llama-bench ROCm, same GGUF, CLI-to-CLI: 354.7 / 11.56 → **1.03× / 1.01×** |
+| Vulkan (`rawvk`) | 318 t/s | 10.9 t/s | llama.cpp Vulkan: 350.8 / 11.48 → 0.91× / 0.95× |
+| CPU (W4A8) | 181 t/s (pp64) | 11.7 t/s (tg24) | bit-exact reference engine |
+
+At longer contexts the HIP backend holds its lead on prompt processing
+(pp3314 339 t/s vs llama-bench 335, 1.01×) and closes to 0.98× on decode
+(11.3 vs 11.5). The decode attention is bandwidth-bound at that point: it
+moves its f16 KV at ~221 GB/s effective.
 
 The Vulkan backend reached these numbers with three decode/prefill kernel
 families of its own — subgroup GEMV (decode, faithful llama dmmv ports),
@@ -27,9 +32,11 @@ cooperative-matrix tiles (prefill) and fused elementwise kernels — all
 arithmetic-mirrored from the CPU reference. A year of measured experiments
 behind the current numbers is logged in [docs/benchmarks.md](docs/benchmarks.md).
 
-Speculative decode (HIP, np4 × spec k=4): **27-28 t/s aggregate** vs
-llama.cpp MTP 15.5 (1.75-1.81×), with the accepted token stream bit-identical
-to non-spec greedy.
+Speculative decode (HIP, MTP) runs its verify as a batched GPU forward by
+default: **22.1 t/s** single-stream at `--spec 3` and **30.6 t/s aggregate** at
+np4, against llama.cpp's MTP references of 11.5 and 15.5 — **1.92× and 1.97×** —
+with the accepted token stream identical to non-spec greedy on both short and
+2.3k-token prompts.
 
 Reference models: Qwen3.8-27B (`qwen35` — Gated DeltaNet + Gated Attention)
 and Qwen3.8-Flash-Next (`qwen4exp` — sparse attention, MoE, PLE).
@@ -69,10 +76,22 @@ cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --gpu-runtim
 cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --mode universal
 ```
 
+The HIP attention path is a recent redesign worth naming: the prefill kernel is
+an fp16 WMMA tile implementation (Q consumed into registers and its shared
+buffer reused as the K/V tile, 32 KB of dynamic shared) that replaced a
+shuffle-bound scalar kernel, and the decode kernel follows llama.cpp's tile
+structure — one key per lane with the whole 256-dim dot computed in a single
+thread via `v_dot2_f32_f16`, so the QK phase has no cross-lane reduction at
+all — reading an f16 KV mirror maintained at the KV write sites. Both were
+validated against CPU references (`wmma-attn-check`, `gqa-bench`) before
+becoming defaults.
+
 GPU kernel self-check subcommands (cross-validated against the CPU reference):
 `vk-check` (device/coopmat smoke) · `gdn-check` (GDN/attention kernel suite) ·
 `vk-gemv-check` / `vk-gemv8-check` (per-type GEMV) · `rawhip-check` (HIP GEMV
 bit-parity) · `subsum-check` (subgroup reductions) · `qk-check` ·
+`wmma-attn-check` (WMMA attention vs CPU reference) · `gqa-bench` (decode
+attention variants, timing + differential) ·
 `iq3s-probe` · `check` (tensor scan + cross-validation + chunk smoke) ·
 `w4a8-check`. Run `llm170 help` for the full list.
 
