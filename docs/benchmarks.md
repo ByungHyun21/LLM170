@@ -3379,3 +3379,30 @@ group's K/V loads before the current group's reductions) or a fundamentally diff
 Both routes change either the reduction tree or the online-softmax rescale points, and the latter is
 exactly what the spec contract (decode argmax == verify argmax) is sensitive to - which is why this
 remains the last item behind the batch/single kernel-arithmetic unification.
+
+## CORRECTION: the live CLI reference, and the protocol mismatch behind the old claims (2026-09-12)
+
+The Primary Target table records llama.cpp ROCm numbers measured with a *streaming server* client.
+Our bench is a CLI/engine measurement. Re-measuring the reference the way ours is measured - same
+machine, same GGUF, `llama-bench` (build 8b4b3558f, ROCm, gfx1151) - gives very different numbers:
+
+| metric | ours (CLI) | llama-bench (CLI) | ratio | old record (llama server) |
+|---|---|---|---|---|
+| pp512 | 346-348 | **354.66 ± 6.70** | **0.98x** | 350.8-352.8 |
+| pp3314 | **299.7** | **335.06 ± 0.17** | **0.89x** | 229.9 |
+| tg32@512 | 11.32-11.34 | **11.56 ± 0.02** | **0.98x** | 11.48 |
+| tg32@3314 | 10.66 | **11.54 ± 0.06** | **0.92x** | 11.6 |
+| tg64@512 | 11.29-11.34 | **11.66 ± 0.04** | **0.97x** | - |
+
+Two conclusions. First, the "pp 1.30x at 3314" and "pp/tg parity at 512" claims were artifacts of
+comparing our CLI against llama's *server* protocol, whose prompt processing carries the streaming
+client's overhead (335 -> 230 t/s, -31%). CLI to CLI we are **2% behind at 512 and 11% behind at
+3314 on pp, 2% and 8% behind on tg**. Second - and this is the useful part - the deficit *grows with
+context length* in both pp and tg, which points at the attention again: at pp3314 the kernel budget
+(excluding trace overhead; total 11.06s) is MMQ 7.7s (66%), **qsa_flash_wk 1.29s (11%)**, gdn_ar
+0.66s. llama's total is 9.89s, so ~1.2s separates us and roughly half of it is the attention term,
+the rest the same memory-efficiency gap the decode shows.
+
+Everything measured before this note compared against the server-protocol table; MTP/np4 remain
+apples-to-apples (both measured through servers) but the *base* pp/tg claims need to be read against
+the table above.
