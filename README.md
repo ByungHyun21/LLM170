@@ -10,10 +10,25 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 
 ## Benchmarks
 
-Qwen3.8-27B (hybrid GDN + full attention) on the dev machine (Radeon 8060S,
-gfx1151), greedy, single-tenant `llm170 bench`. Numbers are only ever quoted
-with their conditions — full tables and history in
+Qwen3.8-27B (hybrid GDN + full attention), greedy, single-tenant `llm170 bench`.
+Numbers are only ever quoted with their conditions — full tables and history in
 [docs/benchmarks.md](docs/benchmarks.md).
+
+### CMP 170HX (GA100) — benchmark in preparation
+
+**Development in preparation**: the card is not yet accessible, so no numbers
+are quoted here. The protocol will match the Strix Halo table below (pp512 /
+tg32, same GGUF, greedy, single-tenant `llm170 bench`) in both modes; the
+hardware rationale — 8 GB HBM2e at ~1.5 TB/s with eFUSE FFMA throttling to
+1/32, versus full-rate half2 (~42 TFLOPS) and INT32 — is in
+[docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
+
+| Mode | pp512 prefill | decode (tg32) | note |
+|---|---|---|---|
+| `cmp-stock` (8 GB, eFUSE throttle) | — | — | half2/INT32 kernels, decomposed FFMA |
+| `cmp-unlocked` (40–64 GB) | — | — | full-rate kernels, to be finalized after unlock measurements |
+
+### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) — current dev machine
 
 | Backend | pp512 prefill | decode (tg32) | note |
 |---|---|---|---|
