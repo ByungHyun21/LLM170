@@ -2984,3 +2984,26 @@ not the grid shape.
 
 Diagnostics kept in `llm170 launch-probe` (rmsq n-sweep, axpy baseline, gatedq block
 sweep, qsa_flash_gqa segment sweep) - they are what identified both the f64 exp and this.
+
+## Why the decode attention cannot be restructured (2026-09-12)
+
+Attempt: `qsa_flash_gqa_w` - one warp per query head, no LDS and no `__syncthreads` in the
+key loop, 5 shuffle steps per key instead of ~30 (the launch probe says the current kernel
+spends ~1.5 us per key on those shuffles, 1.46 ms/token across 16 layers).
+
+Result: **rejected**. With it the engine's spec stream no longer equals the non-spec
+stream (`LLM170_SPEC_GPU=1` vs plain), i.e. the verify batch and the decode step produce
+different numbers for the same row. That equality is a product invariant - the batched
+verify path (`qsa_flash_split4q4`/`wk` with tl=k+1) must reproduce the decode path's row
+results bit for bit, which is how the 10 spec cases in the judge pass. Any change to the
+per-(head,key) reduction order or to the online-softmax update order on one side must be
+mirrored on the other, so the decode attention's structure is effectively frozen by the
+verify contract until both sides are rewritten together.
+
+That is the structural reason behind the long-context attention plateau reported over the
+previous sessions, and it is the last identified blocker for the remaining ~2% of
+base-mode tg: the per-key shuffle cost (1.46 ms/token) is only accessible by a paired
+rewrite of the decode *and* verify attention kernels.
+
+GQA (adopted earlier today) was compatible precisely because it mapped split4q4's four-row
+structure onto the head axis 1:1, keeping every arithmetic operation in place.
