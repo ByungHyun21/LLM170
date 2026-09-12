@@ -300,7 +300,7 @@ per-op value path for prefill plus a device-resident frame for decode.
 | Metric | llama.cpp reference | LLM170 (GPU, rawhip) | LLM170 (CPU-only, before) |
 |---|---|---|---|
 | Load (non-PLE weights) | 83 GB / 91 s (fork patch) | **76.25 GiB / ~35 s** (2.6 GB/s median) | mmap, no upload |
-| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 36.9 / 33.0 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
+| Prefill pp32 / pp512 / pp2311 | (server cells below) | **19.9 / 77.4 / 63.4 t/s** (device-resident frame, 2026-09-13) · 9.4-11.2 (value path) | 1.77 t/s (pp32) |
 | Decode tg4 / tg8 / tg16 (ctx 4096-8192, warm) | 15.70 t/s solo (7.2.2) | **8.6 / 7.7-9.2 / 10.05-10.67 t/s** (frame) · 4.08-4.33 (value path) | 0.56 t/s |
 
 Reference conditions (measured from the runtime logs, not this repo): llama-server,
@@ -359,10 +359,27 @@ Frame-vs-value A/B on the same prompt is token-identical at 230 (chunk 512),
 300 (chunk 128, three chunks - so the cross-chunk GDN/conv state is right) and
 700 tokens, with the attention active.
 
-Prefill is now 3.0-3.3x the value path and is **kernel-bound, not
-transfer-bound**: h2d measures 34-40 GB/s (UMA), yet a 512-token chunk streams
-~80 GB of weights in 13.9 s = 5.7 GB/s effective. The remaining levers are
-kernel-level (MoE expert GEMM batching, HC fusion), not host overhead.
+Prefill is now 6-8x the value path and still **kernel-bound**: with
+`LLM170_FRAME_TIME=1` a 512-token chunk is 6.5 s, split MoE 63% / RmsRows 23% /
+QSA bridge 10% / hc projections 4% / everything else <2%.
+
+Two fixes carried the 2026-09-13 numbers:
+
+- **MoE expert grouping**: the router emits ids in probability order, so the
+  "contiguous run" GEMM loop ran ~4000 one-row launches per layer. Counting
+  sorting by expert cut runs to the expert count (<= 256): pp512 36.9 -> 49.0.
+- **Transposed GDN AR state**: `q4_gdn_ar_w` read the state one column at a
+  time (kdim striding by d=128 floats), so every 4-byte load pulled a 128-byte
+  sector - the state alone was ~148 GB per chunk, i.e. 3.7 s at the measured
+  39.6 GB/s, matching the 3.97 s the AR stage cost. qwen35's
+  `gdn_ar_w_swap` (transposed, d=128) carries over unchanged: AR 3969 -> 73 ms
+  (54x) and pp512 49.0 -> 77.4.
+
+Known outlier: RmsRows costs 15.5 ms per call (96 per chunk, 5.2 M elements
+each) = ~336 M elements/s, about 1/13 of the measured transfer bandwidth. A
+coalesced shared-staging variant measured no change (bit-identical,
+76.3 t/s), so the cause is not the load pattern; an isolated micro-benchmark
+over rows/n is the next step.
 
 ### Verification (2026-09-12)
 
