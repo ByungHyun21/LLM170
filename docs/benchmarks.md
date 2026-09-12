@@ -3653,8 +3653,9 @@ part-diff explains exactly why:
 
 Open question, stated honestly rather than papered over:
 
-- a 200-token single-chunk prompt with wk8 produced **bit-identical tokens** to wk16, which a
-  different reduction tree cannot do by luck;
+- a 200-token single-chunk prompt with wk8 produced identical *tokens* to wk16 - but tokens are
+  argmaxes and survive rounding-level differences, so this says only that the divergence needs a
+  longer trajectory, not that wk8's internals were identical;
 - yet on multi-chunk prompts wk8 diverges, and its layer-0 part diff (9.2e-5) is ~100x larger than
   tree reordering alone would explain (relative error of a cancellation-prone sum, so not impossible,
   but larger than expected).
