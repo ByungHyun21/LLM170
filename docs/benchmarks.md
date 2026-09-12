@@ -3139,3 +3139,24 @@ issued as an **async copy on the side stream before the main prefill** and joine
 
 That puts MTP-mode pp at ~1.00x of llama (was 0.995x) on top of the base-mode pp being
 1.015x, closing the last pp cell of the objective's matrix.
+
+## Attention rewrite, third attempt: kernel proven correct, divergence is verify-side (2026-09-12)
+
+A unit probe (`wh-check` in `launch-probe`) feeds the row x head kernel a synthetic setup
+with an analytic answer - unit query, unit key, values = dimension index - and the kernel
+returns exactly m = 256, s = 1, acc error 0. The kernel's dot reduction, online softmax
+and part write are therefore correct; the spec != non-spec divergence seen when it was
+wired into both the decode and the t<=8 verify branch is **not** a kernel-math bug.
+
+Where that leaves the investigation: the two paths differ in the *context* they present to
+the same kernel - the verify's `n_past` covers all t rows (so segments beyond a row's own
+position exist, and their partials depend on how masked keys are treated) while the
+decode's covers only its own row. The old kernels tolerate that difference (which is why
+the contract has held until now) but the exact mechanism was not identified in the
+remaining budget. Next session should start from `qsa_flash_wh` + this probe and compare
+the *verify* path's part buffers against the decode's for one row (rather than the token
+streams), which localises the masked-segment handling directly.
+
+The decode attention's 1.46 ms/token stands: it is ~10x more shuffle work per key than the
+row x head design (8 warps each partially reducing every head x key, 5 shuffles each),
+and that is the last identified item of the base-mode tg gap.
