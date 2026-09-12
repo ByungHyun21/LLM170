@@ -4339,3 +4339,32 @@ Also added along the way: `scripts/check_hip_syntax.sh` - `cargo build` never se
 compiles at runtime), so a kernel edit's first feedback used to be a broken model run. The script
 concatenates the kernel assets in `include_str!` order and runs `hipcc -fsyntax-only` in ~2 seconds;
 it is what found the four type errors in this change and would have caught the earlier failed attempt.
+
+## Regression found and fixed: the f32-KV removal missed three launcher paths (2026-09-12)
+
+The f32-KV removal above shipped with a silent breakage on three paths the initial verification did
+not cover, found when the Vulkan agent's acceptance test compared a short prompt across backends:
+
+- **Short prompts** (np <= 128) take the single-kernel `qsa_flash` prefill path, not the split path.
+  That kernel was left f32 while the launcher was switched to the f16 mirror -> garbage output
+  (`? ? ?` from a 5-token prompt; the 300-token test used the split path and was bit-identical).
+- **The MTP draft and the per-sequence (spec/np) paths** pass the KV through `self.kv_k` / a
+  per-row pointer table (`ms_kvk_ptr_to`), all of which still pointed at the now-NULL f32 buffers:
+  `rawhip: d2h-sync: 700` (illegal address) on np4 and on any `--spec` run. The t=1 fused flash in
+  the spec path had the same problem.
+- `LLM170_NO_GQA2D=1` crashed for the same reason (the f32 allocation is conditional on the legacy
+  envs, and that env was missing from the list).
+
+Fixes: `qsa_flash` converted to f16 like the other prefill kernels; an f16 mirror added for the MTP
+KV with conversions at its append sites; the per-seq append loops and the pointer tables switched to
+the mirrors (plus the mirror conversion they were missing entirely); `NO_GQA2D` added to
+`legacy_f32()`; the debug d2h guarded.
+
+Verification after the fix: 5-token coherent, **300-token bit-identical**, np4 no-spec 68 tokens OK,
+**np4 x spec3 31.03 t/s (2.00x llama)** and spec3 single-stream steady **23.5 t/s (2.04x)** - both
+above the previous records - plus `attn-check` 0 outliers and `wmma-attn-check` 0 mismatches.
+
+Lesson for the next kernel-input-type change: the launcher passes `*mut c_void`, so a type mismatch
+between a kernel and its buffers is **silent**. Every launcher of the changed kernel must be grepped
+and every distinct execution path (short prompt, split prefill, spec, np, MTP) token-tested - the
+300-token prompt alone exercises only the split path.

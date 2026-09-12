@@ -61,7 +61,7 @@ extern "C" __global__ void qsa_mix2(const float* q, const float* scores, const f
 // QSA fused flash: score+softmax+mix 단일 패스 (KV 타일 online-softmax).
 // 블록=(t,h) 256스레드, d=tid (hd<=256). q 1회 적재 후 전 p 재사용.
 // 마스크 스킵·게이트·exp_cr는 score/mix2와 동일 시맨틱 (p 오름차순 합산 순서는 동일, 반올림 오차만 상이).
-extern "C" __global__ void qsa_flash(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void qsa_flash(const float* q, const half* ck, const half* cv,
                                      const unsigned* mask, float* out,
                                      int n_past, int n_head, int n_kv,
                                      int hd, int t_len, int sstride, int pos0) {
@@ -84,7 +84,7 @@ extern "C" __global__ void qsa_flash(const float* q, const float* ck, const floa
     for (int p = 0; p < n_past; p++) {
         if (mask[(pos0 + t) * sstride + p] == 0u) continue;
         int kb = p * n_kv * hd + kvh * hd;
-        float x = active ? qf[tid] * ck[kb + tid] : 0.0f;
+        float x = active ? qf[tid] * __half2float(ck[kb + tid]) : 0.0f;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             x += __shfl_down_sync(0xffffffffffffffffull, x, off);
@@ -106,7 +106,7 @@ extern "C" __global__ void qsa_flash(const float* q, const float* ck, const floa
         float e_m = __expf(m - m_new);
         float e_d = __expf(d - m_new);
         s = s * e_m + e_d;
-        float vv = active ? __half2float(cv[kb + tid]) : 0.0f;
+        float vv = active ? __half2float(__half2float(cv[kb + tid])) : 0.0f;
         acc = acc * e_m + e_d * vv;
         m = m_new;
     }
