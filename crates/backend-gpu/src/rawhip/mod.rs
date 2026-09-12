@@ -353,17 +353,34 @@ impl RawCtx {
             // pageable 직행은 슬로패스 — 핀 스테이징 경유 (2026-09-05 tg RCA:
             // logits 1MB D2H가 92ms → 핀 경유 시 <1ms 예상)
             let need = dst.len();
+            // 핀 스테이징 실패(호스트 메모리 압박 등)는 조용히 페이지어블 경로로
+            // 폴백한다 — 폴트 여부를 가리는 대신 판독은 성공시킨다(2026-09-12:
+            // 장문 청크에서 hipMallocHost: 700으로 판독이 통째로 실패).
             let mut pin = self.pinned.lock().map_err(|e| e.to_string())?;
             if pin.0 < need {
                 let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
-                ck(hip::hipMallocHost(&mut p, need), "hipMallocHost")?;
-                *pin = (need, p as *mut u8);
+                if hip::hipMallocHost(&mut p, need) == hip::hipError_t_hipSuccess {
+                    *pin = (need, p as *mut u8);
+                } else {
+                    *pin = (0, std::ptr::null_mut());
+                }
             }
-            let buf = pin.1;
-            ck(hip::hipMemcpyAsync(buf as *mut _, src as *const _, need, hip::hipMemcpyKind_hipMemcpyDeviceToHost, self.stream), "d2h-pin")?;
-            ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
-            std::ptr::copy_nonoverlapping(buf, dst.as_mut_ptr(), need);
-            Ok(())
+            if !pin.1.is_null() {
+                let buf = pin.1;
+                ck(hip::hipMemcpyAsync(buf as *mut _, src as *const _, need, hip::hipMemcpyKind_hipMemcpyDeviceToHost, self.stream), "d2h-pin")?;
+                ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
+                std::ptr::copy_nonoverlapping(buf, dst.as_mut_ptr(), need);
+                return Ok(());
+            }
+            ck(
+                hip::hipMemcpy(
+                    dst.as_mut_ptr() as *mut std::os::raw::c_void,
+                    src as *const std::os::raw::c_void,
+                    need,
+                    hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                ),
+                "d2h-pageable",
+            )
         }
     }
     pub fn sync(&self) -> Result<(), String> {
