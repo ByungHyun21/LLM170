@@ -1664,6 +1664,98 @@ pub fn wmma_check() -> Result<String, String> {
 }
 
 /// 합성 어텐션 검증: qsa_flash_wmma 를 작은 단일 케이스로 돌려 **CPU 기준**과 비교한다.
+/// 디코드(t=1) GQA 어텐션 v2 검증·계측: 기존 qsa_flash_gqa 와 출력을 대조하고
+/// n_past 별로 두 커널의 런치 시간을 잰다. 모델 구성(n_head=24, n_kv=4, hd=256)을 쓴다.
+pub fn gqa_bench() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_head, n_kv, hd) = (24usize, 4usize, 256usize);
+    let sstride = 4096usize;
+    let seg = 32usize;
+    let n_max = 3314usize;
+    let qv: Vec<f32> = (0..n_head * 2 * hd)
+        .map(|i| (((i * 1103515245 + 12345) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let kk: Vec<f32> = (0..n_max * n_kv * hd)
+        .map(|i| (((i * 214013 + 2531011) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let vv: Vec<f32> = (0..n_max * n_kv * hd)
+        .map(|i| (((i * 1260231 + 999983) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let mask: Vec<u32> = vec![1u32; sstride];
+    let qd = ctx.alloc(qv.len() * 4)?;
+    let kd = ctx.alloc(kk.len() * 4)?;
+    let vd = ctx.alloc(vv.len() * 4)?;
+    let md = ctx.alloc(mask.len() * 4)?;
+    let nseg_max = n_max.div_ceil(seg);
+    let npart = n_head * nseg_max * (hd + 2);
+    let p1d = ctx.alloc(npart * 4)?;
+    let p2d = ctx.alloc(npart * 4)?;
+    ctx.h2d(qd, bytemuck::cast_slice(&qv))?;
+    ctx.h2d(kd, bytemuck::cast_slice(&kk))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&vv))?;
+    ctx.h2d(md, bytemuck::cast_slice(&mask))?;
+    let mut out = String::new();
+    let (mut us1, mut us2) = (0f64, 0f64);
+    for n_past in [512usize, 1024, 2048, 3314] {
+        let nseg = n_past.div_ceil(seg);
+        for (lab, pd) in [("v1", p1d), ("v2", p2d)] {
+            let mut qp = qd as *mut c_void;
+            let mut kp = kd as *mut c_void;
+            let mut vp = vd as *mut c_void;
+            let mut mp = md as *mut c_void;
+            let mut pp = pd as *mut c_void;
+            let mut np_ = n_past as i32;
+            let mut nh = n_head as i32;
+            let mut nk = n_kv as i32;
+            let mut h = hd as i32;
+            let mut tl = 1i32;
+            let mut ss = sstride as i32;
+            let mut p0 = 0i32;
+            let mut sg = seg as i32;
+            let mut args: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void, &mut mp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void, &mut np_ as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
+                &mut h as *mut _ as *mut c_void, &mut tl as *mut _ as *mut c_void,
+                &mut ss as *mut _ as *mut c_void, &mut p0 as *mut _ as *mut c_void,
+                &mut sg as *mut _ as *mut c_void,
+            ];
+            let name = if lab == "v1" { "qsa_flash_gqa" } else { "qsa_flash_gqa2" };
+            for _ in 0..20 { let _ = ctx.launch3(name, 1, n_kv as u32, nseg as u32, 256, &mut args); }
+            ctx.sync()?;
+            let iters = 200usize;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters { let _ = ctx.launch3(name, 1, n_kv as u32, nseg as u32, 256, &mut args); }
+            ctx.sync()?;
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            if lab == "v1" {
+                us1 = us;
+            } else {
+                us2 = us;
+                let mut a = vec![0f32; npart];
+                let mut b = vec![0f32; npart];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut a).as_mut(), p1d)?;
+                ctx.d2h(bytemuck::cast_slice_mut(&mut b).as_mut(), p2d)?;
+                let mut worst = 0f32;
+                let mut bad = 0usize;
+                let cmp_len = n_head * nseg * (hd + 2);   // 기록된 구간만 비교
+                for i in 0..cmp_len {
+                    let d = (a[i] - b[i]).abs();
+                    let rel = d / (1.0f32 + a[i].abs());
+                    if rel > worst { worst = rel; }
+                    if rel > 1e-4 { bad += 1; }
+                }
+                out.push_str(&format!(
+                    "n_past={n_past:5}  v1 {us1:8.2}us  v2 {us2:8.2}us  v1/v2={:.2}x  최대상대차 {worst:.2e}  불일치 {bad}\n",
+                    us1 / us2));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// part 규약: seg 별 acc=Σ e_d·v (m,s 는 러닝 최대/합). 첫 불일치 위치를 보고한다.
 pub fn wmma_attn_check() -> Result<String, String> {
     use std::ffi::c_void;

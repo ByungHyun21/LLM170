@@ -888,7 +888,13 @@ impl DecodeState {
                         // 실측 교차점: ctx<768은 종전(더 많은 WG), 그 이상은 GQA 공유가
                         // 이김 (pp512 −1.2%, 1024 +1.6%, 2048 +4.7%, 3072 +8.8%).
                         let gqa = gqa_ok;
-                        if gqa {
+                        // v2 기본(2026-09-12): 워프가 키 4개를 전담해 감축을 워프 안에서 끝낸다.
+                        // gqa-bench 실측 3314키 292.9 -> 171.5us (1.71x), 최대상대차 5.1e-7.
+                        // LLM170_NO_GQA2=1 이면 종전 커널로 복귀.
+                        let gqa2 = std::env::var_os("LLM170_NO_GQA2").is_none();
+                        if gqa && gqa2 {
+                            self.ctx.launch3("qsa_flash_gqa2", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
+                        } else if gqa {
                             self.ctx.launch3("qsa_flash_gqa", 1, n_kv as u32, nseg as u32, 256, &mut args)?;
                         } else {
                             self.ctx.launch3("qsa_flash_split4q4", 1, n_head as u32, nseg as u32, 256, &mut args)?;
