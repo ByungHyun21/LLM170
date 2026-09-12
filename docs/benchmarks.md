@@ -3319,6 +3319,14 @@ long-context attention term (~1.7ms at 512 tokens growing ~6x at 3314), not just
 deficit. `LLM170_QSA_SEG` (128/256/512) is exactly neutral, so the segmented flash path is not
 segment-bound.
 
+Profiling the same decode at pp=3314 (KTRACE): 95.5-96.1ms total, **GEMV 82.5ms (constant)** and
+attention 5.63-5.73ms + merge 0.67ms (up from 1.7+0.7 at 512 tokens). The attention reads the whole
+KV (3314 x 8 x 128 x 4B x 16 layers = ~217MB) in 6.3ms = **~35GB/s, 5x off the wall** - it is
+latency/ALU bound, and `qsa_flash_gqa` explains why: `active = tid < hd` leaves half of a 256-thread
+block idle at hd=128, and each key's dot is reduced with cross-lane shuffles (`lane = tid & 31`).
+Any fix changes the reduction order, which the spec contract (decode argmax == verify argmax) forbids
+until the batch/single kernel arithmetic is unified - the same prerequisite as the MTP cold start.
+
 Where the decode time actually goes (t=1, KTRACE, 1148 launches): kernels total 91.0ms of which
 **82.4ms (91%) is GEMV/GEMM** - 15.67GB of weights in 82ms = **190GB/s**, essentially the APU's
 practical wall - with rmsq 1.5, qsa_flash_gqa 1.7, gdn_ar 1.3, axpy 0.7 and everything else under
