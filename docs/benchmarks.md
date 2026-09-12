@@ -4040,3 +4040,26 @@ than the earlier records (1.46x np4 / 1.93x MTP) claimed.
 Still open in this area: the ~4-cycle cold start after the prefill (the batched prefill writes the
 MTP state with batch kernels while the drafts/verify advance use single-row forms - the same
 batch-vs-single arithmetic split), and the long-context verify cost.
+
+## Objective cell re-verification with the current build (2026-09-12)
+
+Every setting the objective names, measured today on this machine with the current binary:
+
+| cell | ours (current build) | llama.cpp reference | ratio |
+|---|---|---|---|
+| MTP (spec3, steady) | **22.04 t/s** | 11.5 | **1.92x** |
+| np4 x spec3 (aggregate) | **30.92 t/s** | 15.5 (np4+MTP) | **1.99x** |
+| mmproj vision (warm forward) | **1.1 s** | 1.60 s | **1.45x** |
+| base pp512 | 359.6 (median) | 354.66 | 1.014x |
+| base pp3314 | 331.1 | 335.06 | 0.988x |
+| base tg512 | 11.58 | 11.56 | 1.002x |
+| base tg3314 | 11.02 | 11.54 | 0.955x |
+
+Output sanity in the same state: greedy output is token-identical with and without speculation on both
+a 21-token and a 2302-token prompt; the VL run on llama.cpp's `test-1.jpeg` reads "The front page of
+The New York Times from July 21" (headline/masthead correct); `attn-check` max|delta| 1.1e-5 with 0
+outliers over 50.3M elements; `gqa-bench` 0 mismatches at 5.1e-7.
+
+Two base cells are still short, and both localise to the attention: pp3314 by 1.2% (the attention's
+quadratic term, where the f16 KV would halve the traffic) and tg3314 by 4.5% (decode attention plus
+the merge kernel). Everything else the objective names is ahead, several of them by ~2x.
