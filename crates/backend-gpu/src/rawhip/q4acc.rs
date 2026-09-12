@@ -394,6 +394,7 @@ impl Q4Acc {
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
         if t >= 16
+            && std::env::var_os("LLM170_Q4_NO_TILE").is_none()
             && self
                 .ctx
                 .gemm_tile(xq, w, self.ktab2, ty, n_in, n_out, xq_w, t, out)
@@ -843,6 +844,11 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         hd: usize,
         t: usize,
     ) -> Result<Vec<f32>, String> {
+        // 커널 결함(2026-09-12): t>128에서 비유한 출력이 섞인다(7498/25600 실측).
+        // 값 경로 브리지는 CPU 폴백이 정답이므로 명시적으로 미지원을 알린다.
+        if t > 128 {
+            return Err(format!("q4acc: qsa_attention t={t} > 128 미지원(커널 결함, CPU 폴백)"));
+        }
         let (qdev, kdev, vdev, mdev, odev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
@@ -888,6 +894,11 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             .launch3("q4_qsa_attn", t as u32, n_head as u32, 1, 256, &mut args)?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
+        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+            let bad = out.iter().filter(|v| !v.is_finite()).count();
+            let badq = q.iter().filter(|v| !v.is_finite()).count();
+            eprintln!("# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}", out.len());
+        }
         Ok(out)
     }
 
