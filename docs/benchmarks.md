@@ -4093,3 +4093,40 @@ Also recorded here because it cost time: the first two runs of this probe report
 because the conversion block had been inserted *before* the h2d uploads, so it converted zeros. A
 probe that silently reads uninitialised device memory is indistinguishable from a broken kernel -
 the launch error was absent (it was a legal launch over zeros).
+
+## The decode attention's real design, extracted from llama.cpp (2026-09-12)
+
+Scout extraction from the vendored source. On gfx1151 with f16 KV, hd=256 and GQA 24/4, llama.cpp's
+decode does **not** run `fattn-vec` and does **not** run the WMMA path: `ggml_cuda_get_best_fattn_kernel`
+(`fattn.cu:673-687`) excludes WMMA because `Q->ne[1] * gqa_ratio_eff = 1*2 = 2` is not > 16, and
+`gqa_opt_applies` excludes the vec kernel for non-quantized KV. It runs **`flash_attn_tile<256,256,1,2>`**
+(RDNA config row `fattn-tile.cuh:293`):
+
+| | llama `flash_attn_tile` | ours (`qsa_flash_gqa2`) |
+|---|---|---|
+| threads | **64 (2 warps)** | 256 (8 warps) |
+| work per lane | **one key: the whole 256-dim dot, serial** | 8 dims of a key, partial |
+| QK reduction | **none - 128 `v_dot2_f32_f16` in one thread** | **5 shuffle stages per (key, head)** |
+| keys per block | 32, one per lane | 32, four per warp |
+| shuffles per 32-key tile | **one 5-stage max butterfly** | 5 stages x 6 heads x 32 keys |
+| KV staging | shared, 128-bit copies, nbatch_K=64 halves per pass | direct global float4 x2 per lane |
+| probabilities | shared KQ buffer hand-off | shared score tile |
+| KV axis | split across ~26 parallel blocks + combine kernel | split into 104 segments + `qsa_flash_merge` |
+| occupancy | 8 | ~2 |
+
+The headline is the QK: llama computes each key's dot product **inside a single thread** with the RDNA
+dot-product instruction `v_dot2_f32_f16` (half2 x half2 -> f32 accumulate, `common.cuh:763-770`), so
+the cross-lane reduction disappears entirely. Ours pays 5 shuffle stages for *every* (key, head) pair -
+that is the latency chain the ktrace attributed 3.65 ms/token to, and it is also why the kernel sits at
+0.7% of FP32 peak.
+
+This also re-frames the f16-KV measurement above: `v_dot2_f32_f16` *requires* half inputs, so f16 KV is
+the enabling condition for the fast path rather than a bandwidth optimization. The probe measured only
+1.06-1.14x because it kept the scalar f32-FMA dot; with a lane-per-key + v_dot2 kernel the shuffle work
+(a few hundred instructions per tile) collapses to 128 dot instructions per lane.
+
+Implementation spec for the next session: f16 KV (writers or mirror), a decode kernel with lane=key and
+`v_dot2_f32_f16` over the 256-dim head (K in f16, Q converted once per block), the softmax as a per-warp
+max/sum butterfly over the tile, the P handed to the thread-per-dim PV stage through shared, and the
+existing `part`+merge split (llama's combine is the same scheme). Expected to remove most of the 3.65
+ms/token the attention costs at 3314.
