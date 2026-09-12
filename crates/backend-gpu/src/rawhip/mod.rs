@@ -1784,6 +1784,53 @@ pub fn launch_probe() -> Result<String, String> {
             }
             eprintln!("{res}");
         }
+        // qsa_flash_gqa 직접 계측 (13 인자)
+        {
+            let hd = 256usize;
+            let nh = 24usize;
+            let nkv = 4usize;
+            let npast = 128i32;
+            let nseg = 4usize;
+            let qb = ctx.alloc(nh * 2 * hd * 4)?;
+            let kb = ctx.alloc(nkv * 4096 * hd * 4)?;
+            let vb = ctx.alloc(nkv * 4096 * hd * 4)?;
+            let mb = ctx.alloc(4096 * 4)?;
+            let pb = ctx.alloc(nseg * nh * (hd + 2) * 4)?;
+            let mut a4: Vec<*mut std::ffi::c_void> = Vec::new();
+            let mut qp4 = qb as *mut std::ffi::c_void;
+            let mut kp4 = kb as *mut std::ffi::c_void;
+            let mut vp4 = vb as *mut std::ffi::c_void;
+            let mut mp4 = mb as *mut std::ffi::c_void;
+            let mut pp4 = pb as *mut std::ffi::c_void;
+            let mut np_ = npast; let mut nh4 = nh as i32; let mut nk4 = nkv as i32;
+            let mut h4 = hd as i32; let mut tl4 = 1i32; let mut ss4 = 4096i32; let mut p04 = 0i32; let mut sg4 = 32i32;
+            a4.push(&mut qp4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut kp4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut vp4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut mp4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut pp4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut np_ as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut nh4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut nk4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut h4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut tl4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut ss4 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut p04 as *mut _ as *mut std::ffi::c_void);
+            a4.push(&mut sg4 as *mut _ as *mut std::ffi::c_void);
+            let mut r2 = String::new();
+            for (lab, nb, thr) in [("sg4  ", 1u32, 256u32), ("sg8  ", 1, 256), ("sg32 ", 1, 256), ("sg32x4", 4, 256)] {
+                sg4 = match lab { "sg4  " => 4, "sg8  " => 8, _ => 32 };
+                for _ in 0..20 { let _ = ctx.launch3("qsa_flash_gqa", 1, 4, nb, thr, &mut a4); }
+                ctx.sync()?;
+                let n2 = 2000usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n2 { let _ = ctx.launch3("qsa_flash_gqa", 1, 4, nb, thr, &mut a4); }
+                ctx.sync()?;
+                r2.push_str(&format!("{lab}: {:.2}us  ", t0.elapsed().as_secs_f64() * 1e6 / n2 as f64));
+                let _ = nseg;
+            }
+            eprintln!("{r2}");
+        }
     }
     let mut xp = ctx.alloc(256)?; let mut op = ctx.alloc(256)?; let mut sp = ctx.alloc(256)?;
     let mut nn = 64i32;
