@@ -281,3 +281,42 @@ server is a CLI router + HTTP. The hipRTC kernel string is split into
 family assets (`kernels/src_*.hip`) assembled by `include_str!` — the
 concatenation is byte-identical to the monolith it replaced (hash-checked
 during the split).
+
+## ADR-0020 — HIP attention defaults after the 2026-09 attention arc (2026-09-12)
+
+**Context**: the base cells sat at 0.89-0.98× of llama-bench ROCm. ktrace and
+probe measurements localised the residual to the attention on both sides: the
+prefill kernel was shuffle-bound (5 shuffle stages per (key, head)), and the
+decode kernel split hd across 256 threads, so every dot product needed a
+cross-warp reduction. Separately, the MTP cell measured 0.5× the base because
+the batched GPU verify was reachable only behind an env gate that nothing set,
+so the default ran k+1 sequential single-token decodes per speculative step.
+
+**Decision**: four HIP defaults, each with a kill-switch:
+`qsa_flash_wmma` for hd=256 prefill — an fp16 WMMA tile kernel that consumes Q
+into registers and reuses its 32 KB shared buffer as the K/V tile
+(`LLM170_NO_WK_WMMA=1` → `qsa_flash_wk8`); `qsa_flash_gqa2d` for t=1 decode —
+one key per lane, the whole 256-dim dot in a single thread via
+`v_dot2_f32_f16`, no cross-lane reduction, reading an f16 KV mirror maintained
+at the KV write sites (`LLM170_NO_GQA2D=1` → the f32 `qsa_flash_gqa2`); split
+segment default 1024 instead of 128 (`LLM170_QSA_SEG`); and the batched GPU
+spec verify as the spec default (`LLM170_NO_SPEC_GPU=1` → the sequential
+path). The attention kernels accumulate in fp16 storage but f32 accumulators,
+a numerics class accepted for the prefill in the 2026-09-12 decision recorded
+in `benchmarks.md`, now extended to the decode path under the same evidence
+bar.
+
+**Evidence**: `wmma-attn-check` (0 mismatches vs a CPU reference, 6e-4),
+`attn-check` (max|delta| 1.1e-5, 0 outliers over 50.3M elements), `gqa-bench`
+(0 mismatches at 5.05e-4 across four kernel variants and four context
+lengths), token-identical greedy output on a 300-token prompt for every
+change, spec==nonspec identical at 21 and 2302 tokens, and a full gate run at
+17/19 PASS + 2 INFO - unchanged from the pre-change baseline.
+
+**Consequence**: pp512 364 t/s (1.03× of llama-bench ROCm), pp3314 339 t/s
+(1.01×), tg512 11.6 t/s (1.01×), tg3314 11.3 t/s (0.98×); MTP 22.1 t/s
+single-stream (1.92×) and 30.6 t/s aggregate at np4 (1.97×). The decode
+attention is now bandwidth-bound (~221 GB/s effective), so the next lever
+there is KV quantization, not kernel structure. The f16 KV mirror also halves
+the KV footprint per sequence, which is the configuration the RAM/SSD
+offloading work will build on.
