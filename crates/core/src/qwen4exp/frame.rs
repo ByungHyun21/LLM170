@@ -209,15 +209,68 @@ fn fs_begin(acc: &dyn Accelerator, t: usize) {
 
 /// 스테이지 동기 마커 (LLM170_FRAME_SYNC=1) — 스티키 폴트의 발생 지점을
 /// 즉시 드러낸다(폴트는 다음 API 호출에서야 보고된다).
+thread_local! {
+    /// 스테이지 누적 시간 — (마지막 경계 시각, [(접미사, us, 호출수)]).
+    static FT: std::cell::RefCell<(std::time::Instant, Vec<(String, u64, u64)>)> =
+        std::cell::RefCell::new((std::time::Instant::now(), Vec::new()));
+}
+
+/// 프레임 스테이지 시간 계측 (LLM170_FRAME_TIME=1). sync_mark가 만드는 경계
+/// 에서만 측정한다 — 프레임 op는 비동기라 호출 시간만으로는 GPU 시간이 안 나온다.
+fn ftime_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LLM170_FRAME_TIME").is_some())
+}
+
 fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
-    if std::env::var_os("LLM170_FRAME_SYNC").is_some() {
-        // 1원소 판독 = 동기 + 폴트 보고 (barrier는 오류를 삼킨다).
-        let mut v = [0.0f32; 1];
-        acc.frame_read(h, &mut v)
-            .map_err(|e| Q4Error::Io(format!("fsync {tag}: {e}")))?;
-        eprintln!("# fsync {tag}");
+    match (ftime_on(), std::env::var_os("LLM170_FRAME_SYNC").is_some()) {
+        (false, false) => return Ok(()),
+        (ft, sync) => {
+            // 1원소 판독 = 동기 + 폴트 보고 (barrier는 오류를 삼킨다).
+            let mut v = [0.0f32; 1];
+            acc.frame_read(h, &mut v)
+                .map_err(|e| Q4Error::Io(format!("fsync {tag}: {e}")))?;
+            if ft {
+                FT.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let dt = s.0.elapsed().as_micros() as u64;
+                    s.0 = std::time::Instant::now();
+                    let key = tag.rsplit('.').next().unwrap_or(tag).to_string();
+                    match s.1.iter_mut().find(|e| e.0 == key) {
+                        Some(e) => {
+                            e.1 += dt;
+                            e.2 += 1;
+                        }
+                        None => s.1.push((key, dt, 1)),
+                    }
+                });
+            }
+            if sync {
+                eprintln!("# fsync {tag}");
+            }
+        }
     }
     Ok(())
+}
+
+/// 청크 단위 리포트 — t>1(프리필 청크)에서 한 줄 출력 후 초기화.
+fn ftime_report(t: usize) {
+    if !ftime_on() {
+        return;
+    }
+    FT.with(|s| {
+        let mut s = s.borrow_mut();
+        if t > 1 && !s.1.is_empty() {
+            s.1.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut line = String::from("# frame-time(t) ");
+            for (k, us, n) in s.1.iter() {
+                line.push_str(&format!("{k}={:.1}ms×{n} ", *us as f64 / 1e3));
+            }
+            eprintln!("{line}");
+            s.1.clear();
+        }
+        s.0 = std::time::Instant::now();
+    });
 }
 
 /// 단계 덤프 (LLM170_Q4_DBG=1) — 값 경로와 같은 양을 찍어 대조한다.
@@ -315,6 +368,7 @@ pub fn frame_forward(
             let flat: Vec<f32> = out.concat();
             acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
             full_idx += 1;
+            sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
         }
 
@@ -322,10 +376,12 @@ pub fn frame_forward(
         if il == 0 {
         }
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
+        sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
         if il == 0 {
             dbg("mix2", acc, f.mix, n * t);
         }
         moe_frame(acc, model, f, il, n, t)?;
+        sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
         if il == 0 {
         }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
@@ -351,6 +407,7 @@ pub fn frame_forward(
         acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
         let mut logits = vec![0.0f32; hp.vocab];
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
+        ftime_report(t);
         if std::env::var_os("LLM170_Q4_DBG").is_some() {
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
