@@ -3468,3 +3468,21 @@ TIOPS), which points at something structural in the per-key scalar pipeline (but
 softmax + mask handling) rather than any single knob. The WMMA route (plans/47) sidesteps the whole
 structure - the roof probe measures 23.6-48.4 TFLOPS for rocwmma 16x16x16 on this part - and is the
 only remaining lever with the ~1000x headroom the arithmetic implies.
+
+## The pp3314 gap is 100% attention: the matmuls are already at the roof (2026-09-12)
+
+Sanity estimate from the pp3314 kernel budget: the MMQ family (7.70s of 11.06s) processes the
+model's 15.67GB of weights across 3314 tokens, i.e. ~9.3e13 MAC = 1.85e14 FLOP, which is
+**24.1 TFLOP/s** - 102% of the L1-fed rocwmma roof measured on this part (23.56 TFLOPS) and half
+the register-resident roof. In other words the prefill matmuls have no headroom left; the WMMA
+conversion already happened where it pays (the MMQ kernels).
+
+So the entire length-dependent deficit sits in `qsa_flash_wk`: 1.29s for 33.7 GFLOP = 26 GFLOP/s
+(~0.2% of the L1-fed WMMA roof), and it does not respond to instruction count, load prefetching,
+unrolling, lane mapping or segmentation (all measured neutral, above). Closing pp3314 from 0.89x to
+~1.00x therefore reduces to replacing that one kernel with a tile-based WMMA flash attention -
+plans/47-attention-wmma.md - with the reference and the infrastructure both already in the tree.
+
+Nothing else in the prefill budget is actionable: `gdn_ar_w_swap` 0.66s (the recurrence, t>=512
+chunks), `gemm_q8_j128` 0.20s, `silu_mul` 0.19s, `mmq_quant_y` 0.16s - all small and near their own
+bounds.
