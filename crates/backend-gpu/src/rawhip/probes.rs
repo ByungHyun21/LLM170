@@ -374,6 +374,55 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `q4k-micro` — q4_K MMQ 타일을 **단일 256원소 슈퍼블록**에서 CPU 미러
+/// (`dot_q4k_q8`)와 직접 대조한다. 인덱스 매핑 버그를 값 수준에서 드러낸다.
+pub fn q4k_micro() -> Result<String, String> {
+    use crate::rawhip::q4acc::Q4Acc;
+    use llm170_core::matmul::Accelerator;
+    let (n_out, n_in, t) = (16usize, 256usize, 16usize);
+    // 합성 q4_K 블록: d=1.0, dmin=0.5, 6비트 스케일 패턴, 결정적 니블
+    let mut blk = vec![0u8; 144];
+    blk[0] = 0x00; blk[1] = 0x3C;   // d = 1.0
+    blk[2] = 0x00; blk[3] = 0x38;   // dmin = 0.5
+    for j in 0..12 { blk[4 + j] = (0x15u8.wrapping_mul(j as u8 + 1)) & 0x3F; }
+    for i in 0..128 { blk[16 + i] = ((i * 37 + 11) & 0xFF) as u8; }
+    let w: Vec<u8> = (0..n_out).flat_map(|o| {
+        let mut b = blk.clone();
+        b[4] = (b[4].wrapping_add(o as u8)) & 0x3F;
+        b
+    }).collect();
+    let xs: Vec<Vec<f32>> = (0..t)
+        .map(|r| (0..n_in).map(|i| (((r * 31 + i) as u64 * 2654435761u64) % 1000) as f32 / 500.0 - 1.0).collect())
+        .collect();
+    let weight = llm170_core::matmul::Weight {
+        data: &w,
+        ty: llm170_gguf::GgmlType::Q4K,
+        n_in: n_in as u64,
+        n_out: n_out as u64,
+    };
+    let acc = Q4Acc::new()?;
+    let mut out = vec![vec![0.0f32; n_out]; t];
+    acc.matmul_batch(&xs, &weight, &mut out)?;
+    let mut max_abs = 0.0f32;
+    let mut first = String::new();
+    for r in 0..t {
+        let y = llm170_core::quant::quantize_row_q8_ref(&xs[r]);
+        for o in 0..n_out {
+            let cpu = llm170_core::quant::dot_q4k_q8(&w[o * 144..(o + 1) * 144], &y);
+            let gpu = out[r][o];
+            let d = (cpu - gpu).abs();
+            if d > max_abs { max_abs = d; }
+            if first.is_empty() && d > 1e-4 {
+                first = format!(" 첫 불일치 r={r} o={o} gpu={gpu:.6} cpu={cpu:.6}");
+            }
+        }
+    }
+    Ok(format!(
+        "q4k-micro {n_out}x{n_in} t={t}: max_abs={max_abs:.3e} ({}){first}",
+        if max_abs < 1e-4 { "일치" } else { "불일치" }
+    ))
+}
+
 /// `q5-1-bench [rows] [n_in] [n_out] [reps]` — q5_1 GEMM 격리 계측.
 /// 실모델 MoE expert-down 형상(20행 × 640 × 2560)을 합성 데이터로 돌려 커널
 /// 자체의 시간을 잰다 — KTRACE가 0.24ms/런치를 보고한 그 값과 대조하면

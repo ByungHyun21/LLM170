@@ -220,7 +220,7 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
             else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
             if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
             else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
-            const unsigned* x1 = xr + it * 16;
+            const unsigned* x1 = xr + sIdx * 64 + it * 16;
             const unsigned* x2 = x1 + 8;
             int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
             #pragma unroll
@@ -232,8 +232,8 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
                 il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
                 qs2 += dot4(ones, y2, 0);
             }
-            float yd1 = __uint_as_float(xr[xw_base + 2 * it]);
-            float yd2 = __uint_as_float(xr[xw_base + 2 * it + 1]);
+            float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
+            float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
             acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
             acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
         }
