@@ -1355,12 +1355,86 @@ impl Q4Acc {
             (&mut h) as *mut _ as *mut std::ffi::c_void,
             (&mut tt) as *mut _ as *mut std::ffi::c_void,
         ];
+        // 블록 16워프 = 16토큰(워프당 1헤드) — 목록만 순회하는 기본판.
         self.ctx.launch3(
             "q4_qsa_attn_sel",
             t.div_ceil(16) as u32,
             n_head as u32,
             1,
             512,
+            &mut args,
+        )?;
+        let mut out = vec![0.0f32; t * n_head * hd];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
+        Ok(out)
+    }
+
+    /// q4_qsa_attn_sel4 런치 본체 — 선택 목록(오름차순 위치)만 순회한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attn_sel4_raw(
+        &self,
+        q: &[f32],
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<Vec<f32>, String> {
+        let (qdev, kdev, vdev, sdev, odev, ofdev) = {
+            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
+            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
+            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
+            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
+            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
+            let mut f2 = self.atn.lock().map_err(|e| e.to_string())?;
+            let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
+            (qdev, kdev, vdev, sdev, odev, ofdev)
+        };
+        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
+        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
+        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
+        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
+        let mut q_p = qdev as *mut std::ffi::c_void;
+        let mut k_p = kdev as *mut std::ffi::c_void;
+        let mut v_p = vdev as *mut std::ffi::c_void;
+        let mut si_p = sdev as *mut std::ffi::c_void;
+        let mut so_p = ofdev as *mut std::ffi::c_void;
+        let mut o_p = odev as *mut std::ffi::c_void;
+        let mut sc = kq_scale;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        // 8워프 = 4토큰 × 2헤드묶음(묶음당 4헤드) — gy 3슬라이스가 24헤드를 덮는다.
+        self.ctx.launch3(
+            "q4_qsa_attn_sel4",
+            t.div_ceil(4) as u32,
+            (n_head / 8) as u32,
+            1,
+            256,
             &mut args,
         )?;
         let mut out = vec![0.0f32; t * n_head * hd];
@@ -1667,7 +1741,14 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         if std::env::var_os("LLM170_QSA_CPU").is_some() {
             return Err(format!("q4acc: qsa_attention_sel t={t} CPU 강제"));
         }
-        self.qsa_attn_sel_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t)
+        // 4헤드-퍼-워프판은 K/V 행을 4헤드가 공유한다(트래픽 1/4) — 프리필에서
+        // −20%. 단 t가 작으면(디코드) 블록의 워프 대부분이 놀아 역효과이므로
+        // t≤3은 헤드당 워프 1개인 `_sel`로 보낸다. 둘은 비트 동일(프로브 확인).
+        if t <= 3 {
+            self.qsa_attn_sel_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t)
+        } else {
+            self.qsa_attn_sel4_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t)
+        }
     }
 
     // ─── 프레임(활성화 GPU 상주) — plans/64 P1 ───
@@ -2205,10 +2286,23 @@ pub fn qsa_check(t: usize, n_past: usize) -> Result<String, String> {
         let d2 = ((b - c).abs() as f64) / (c.abs().max(1e-3) as f64);
         maxrel_cpu = maxrel_cpu.max(d2);
     }
+    let gpu_sel4 = acc.qsa_attn_sel4_raw(
+        &q, &ck, &cv, &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, t,
+    )?;
+    let mut bit_diff4 = 0usize;
+    let mut maxrel_sel4 = 0.0f64;
+    for (&b, &c) in gpu_sel.iter().zip(&gpu_sel4) {
+        if b != c {
+            bit_diff4 += 1;
+        }
+        let d = ((c - b).abs() as f64) / (b.abs().max(1e-3) as f64);
+        maxrel_sel4 = maxrel_sel4.max(d);
+    }
     Ok(format!(
-        "q4-qsa-check t={t} n_past={n_past}: nonfinite={nonfinite} mismatch={nz}/{} maxrel={maxrel:.3e} | sel: bit_diff={bit_diff}/{} maxrel_sel_vs_cpu={maxrel_sel:.3e} maxrel_mask_vs_cpu={maxrel_cpu:.3e} sel_keys={} (스캔 {}키 대비 {:.1}배 적음)",
+        "q4-qsa-check t={t} n_past={n_past}: nonfinite={nonfinite} mismatch={nz}/{} maxrel={maxrel:.3e} | sel: bit_diff={bit_diff}/{} sel4_bit_diff={bit_diff4}/{} maxrel_sel4_vs_sel={maxrel_sel4:.3e} maxrel_sel_vs_cpu={maxrel_sel:.3e} maxrel_mask_vs_cpu={maxrel_cpu:.3e} sel_keys={} (스캔 {}키 대비 {:.1}배 적음)",
         gpu.len(),
         gpu_sel.len(),
+        gpu_sel4.len(),
         sel_idx.len(),
         t * n_past,
         (t * n_past) as f64 / (sel_idx.len().max(1)) as f64,

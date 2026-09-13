@@ -607,6 +607,84 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
 
 
 
+// 4헤드-퍼-워프 — 선택 목록이 **토큰 단위**라(인덱서가 헤드 합산) 같은 토큰의
+// 여러 Q헤드가 같은 K/V 행을 쓴다. 워프가 4헤드를 맡아 K/V 로드를 1/4로 줄인다
+// (24 Q헤드 = 2 KV헤드 → 12 Q헤드가 같은 키를 읽던 것을 3워프로 접음).
+// 산술은 `_sel`과 동일 순서(키당 헤드별 독립 온라인 소프트맥스) → 비트 동일.
+extern "C" __global__ void q4_qsa_attn_sel4(const float* q, const float* ck, const float* cv,
+                                            const unsigned* sel_idx, const unsigned* sel_off,
+                                            float* out, float kq_scale,
+                                            int n_head, int n_kv, int hd, int t) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int tok = (int)blockIdx.x * 4 + (wid >> 1);   // 블록 8워프 = 4토큰 × 2헤드묶음
+    int h0 = (int)blockIdx.y * 8 + (wid & 1) * 4; // 묶음당 4헤드
+    if (tok >= t || h0 + 3 >= n_head || hd != 256) return;
+    int kvh = h0 / (n_head / n_kv);
+    float qr[4][8], gate[4][8], acc[4][8];
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        const float* qh = q + ((size_t)tok * n_head + h0 + g) * 2 * hd;
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) {
+            qr[g][t2] = qh[lane + 32 * t2];
+            gate[g][t2] = qh[hd + lane + 32 * t2];
+            acc[g][t2] = 0.0f;
+        }
+    }
+    float mrun[4], lrun[4];
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        mrun[g] = Q4_NEG;
+        lrun[g] = 0.0f;
+    }
+    const unsigned long long FULL = 0xffffffffffffffffull;
+    const int j0 = (int)sel_off[tok];
+    const int j1 = (int)sel_off[tok + 1];
+    for (int j = j0; j < j1; j++) {
+        const int p = (int)sel_idx[j];
+        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        const float* v = cv + (size_t)p * n_kv * hd + kvh * hd;
+        float kr[8], vr[8];
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) {
+            kr[t2] = k[lane + 32 * t2];
+            vr[t2] = v[lane + 32 * t2];
+        }
+        #pragma unroll
+        for (int g = 0; g < 4; g++) {
+            float a = 0.0f;
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) a += qr[g][t2] * kr[t2];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(FULL, a, off);
+            float sc = a * kq_scale;
+            float mr = mrun[g], lr = lrun[g];
+            if (sc > mr) {
+                float corr = (mr <= Q4_NEG) ? 0.0f : exp_cr(mr - sc);
+                #pragma unroll
+                for (int t2 = 0; t2 < 8; t2++) acc[g][t2] *= corr;
+                lr *= corr;
+                mr = sc;
+            }
+            float e = exp_cr(sc - mr);
+            lr += e;
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) acc[g][t2] += e * vr[t2];
+            mrun[g] = mr;
+            lrun[g] = lr;
+        }
+    }
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) {
+            float o = (lrun[g] > 0.0f) ? acc[g][t2] / lrun[g] : 0.0f;
+            float gt = 1.0f / (1.0f + exp_cr(-gate[g][t2]));
+            out[((size_t)tok * n_head + h0 + g) * hd + lane + 32 * t2] = o * gt;
+        }
+    }
+}
+
 // 워프-퍼-토큰 — 블록의 8워프가 "같은 head의 8토큰"을 각각 맡는다.
 // ① K행을 8토큰이 공유(L2 트래픽 1/8, 나머지는 L1) ② 블록 배리어 없음(워프 내부
 // 셔플만) — 기존 커널은 128키 청크마다 ~10회 __syncthreads를 돌렸다.
