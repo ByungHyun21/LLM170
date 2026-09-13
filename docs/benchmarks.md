@@ -380,7 +380,7 @@ full workspace test suite:
 | QSA `sel+proj` (indexer, CPU) | 51.6 s | **10.0 s** |
 | QSA `attn` (kernel) | 50.5 s | **30.5 s** |
 | QSA total | 107.3 s | 50.0 s |
-| prefill wall clock (incl. load) | 213.9 s | **141.0 s** |
+| prefill wall clock (incl. load) | 213.9 s | **138.3 s** |
 
 - Indexer: the per-row clone of the block-key cache was hoisted to a local
   buffer, the full sort became a partial select, and the dot was unrolled to 4
@@ -392,6 +392,12 @@ full workspace test suite:
   Measured at 11,750 tokens (prefill incl. load): 155.2 s @512, 146.4 s @1024,
   **141.0 s @2048**; `moe.gemm3` 58.9 -> 45.2 s. `LLM170_FRAME_TMAX` and
   `LLM170_Q4_CHUNK` override; the 8 GB CMP keeps 512 (1024 OOM'd there).
+- The QSA attention kernel is now warp-per-token: one warp per (token, head),
+  lanes cover the head dimension for one key at a time, K rows are shared by the
+  8 tokens of the block, and there are no block barriers. The mirror check
+  (`q4-qsa-check` vs a CPU reference) reads 2.263e-4, the same as the previous
+  kernel, and tokens are unchanged. (A first attempt with lanes over *keys*
+  summed partials of different keys; the mirror caught it before it landed.)
 - Attention: the shared dot product in `q4_qsa_attn` used a single accumulator
   and was latency-bound (4-accumulator unroll, 1.5-2.2x); the score phase then
   moved to warp-per-key with lane=dim so its loads are coalesced (a further
