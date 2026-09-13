@@ -59,6 +59,8 @@ struct MoeGroup {
     rows_pad_d: u64,
     /// 디바이스 전문가 오프셋 포인터(폴백이 필요할 때만 사용).
     off_d: u64,
+    /// 오프셋의 비동기 d2h 목적지(핀) — 폴백이 읽는다.
+    pinned_off: *mut u8,
     off: Vec<usize>,
 }
 
@@ -1096,21 +1098,24 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
                 .filter(|g| g.generation == generation && g.rows == rows)
-                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d))
+                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d, g.pinned_off))
         };
         if tm {
             eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, rows_pad_d, off, off_d) = match hit {
+        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, rows_pad_d, off, off_d, pinned_off) = match hit {
             Some(v) => v,
             None => {
                 // t=1(디코드): 그룹화를 GPU에서 한다. 호스트 왕복(동기 d2h + 테이블
                 // 빌드 + h2d 3회)이 스텝의 44%(48층×0.9ms)였다 — 테이블은 ids의
                 // 순수 함수라 커널로 옮기면 사라진다. 결과는 호스트판과 동일 순서라
                 // 비트 동일. (프리필은 행 수가 커서 기존 호스트 경로 유지.)
-                // 기본 off(옵트인) — 2026-09-14 실측: down(q8_0)이 폴백이라 오프셋
-                // d2h가 남아 스텝당 +25ms 회귀(층당 왕복은 그대로). q8_0 그룹 커널을
-                // 붙여 폴백을 없애면 켠다. 테이블은 호스트판과 비트 동일(검증됨).
+                // 기본은 호스트 경로 — 2026-09-14 A/B: 호스트 755.4ms vs
+                // 디바이스 1006.9ms(tg8, 같은 바이너리). 디바이스판은 테이블이
+                // 비트 동일하고 호스트 빌드·h2d 3회를 없애지만, 추가분(그룹 커널
+                // + 상한(rows*16+16) 크기로 커진 gather/scatter + 폴백의 이벤트
+                // 대기)이 그보다 커서 +31ms/스텝이다. down(q8_0) 폴백까지 그룹
+                // 커널로 덮으면 재평가한다. 옵트인: LLM170_MOE_GROUP_DEV=1.
                 if std::env::var_os("LLM170_MOE_GROUP_DEV").is_some()
                     && self.t_cur() == 1
                     && ne <= 512
@@ -1140,13 +1145,16 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         (ppd, ipd, txd, offd, rpd)
                     };
                     self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd)?;
+                    // 폴백(비 Q4K/Q5_1 타입)용 오프셋을 지금 걸어 둔다 —
+                    // 소비 시점(층 하단)까지 gate/up GEMM이 지연을 덮는다.
+                    let pinned_off = self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?;
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
                         generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
                         perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd,
-                        rows_pad: bound, rows_pad_d: rpd, off_d: offd, off: Vec::new(),
+                        rows_pad: bound, rows_pad_d: rpd, off_d: offd, pinned_off, off: Vec::new(),
                     });
-                    (pd, ivd, rxd, ppd, ipd, txd, bound, rpd, Vec::new(), offd)
+                    (pd, ivd, rxd, ppd, ipd, txd, bound, rpd, Vec::new(), offd, pinned_off)
                 } else {
                 // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                 // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
@@ -1254,8 +1262,8 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out")?;
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                 *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
-                    perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, rows_pad_d: 0, off_d: 0, off: off.clone() });
-                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, 0u64, off, 0u64)
+                    perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, rows_pad_d: 0, off_d: 0, pinned_off: std::ptr::null_mut(), off: off.clone() });
+                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, 0u64, off, 0u64, std::ptr::null_mut())
                 }
             }
         };
@@ -1399,8 +1407,15 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         // 왕복은 GPU가 이미 끝냈으므로 여기서는 (ne+1)개 int만 받는다.
         let off_d2h;
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
+            self.ctx.d2h_wait()?;
             let mut b = vec![0i32; ne + 1];
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut b), off_d as *const u8)?;
+            if !pinned_off.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(pinned_off as *const u8, b.as_mut_ptr() as *mut u8, (ne + 1) * 4);
+                }
+            } else {
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut b), off_d as *const u8)?;
+            }
             off_d2h = b.iter().map(|&x| x.max(0) as usize).collect::<Vec<usize>>();
             &off_d2h
         } else {

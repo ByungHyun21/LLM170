@@ -475,6 +475,64 @@ impl RawCtx {
         }
     }
 
+    /// 비동기 d2h용 이벤트(스텝 간 재사용) — 한 스트림에 순서대로 걸린다.
+    fn d2h_ev(&self) -> Result<hip::hipEvent_t, String> {
+        static EV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let p = *EV.get_or_init(|| {
+            let mut e: hip::hipEvent_t = std::ptr::null_mut();
+            unsafe {
+                let _ = hip::hipEventCreateWithFlags(&mut e, 0);
+            }
+            e as usize
+        });
+        Ok(p as hip::hipEvent_t)
+    }
+
+    /// 비동기 d2h 예약 — 핀 버퍼로 스트림 복사만 걸고 sync하지 않는다.
+    /// 그 사이 커널을 계속 발사해 전송·대기 지연을 다른 연산 뒤에 숨기고,
+    /// 필요해지는 지점에서 `d2h_wait()`로 완료를 기다린다. 반환 = 핀 버퍼.
+    pub fn d2h_issue(&self, need: usize, src: *const u8) -> Result<*mut u8, String> {
+        unsafe {
+            let mut pin = self.pinned.lock().map_err(|e| e.to_string())?;
+            if pin.0 < need {
+                let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+                if hip::hipMallocHost(&mut p, need) == hip::hipError_t_hipSuccess {
+                    *pin = (need, p as *mut u8);
+                } else {
+                    *pin = (0, std::ptr::null_mut());
+                }
+            }
+            let buf = pin.1;
+            if buf.is_null() {
+                return Ok(std::ptr::null_mut());
+            }
+            ck(
+                hip::hipMemcpyAsync(
+                    buf as *mut _,
+                    src as *const _,
+                    need,
+                    hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                    self.stream,
+                ),
+                "d2h-issue",
+            )?;
+            let ev = self.d2h_ev()?;
+            ck(hip::hipEventRecord(ev, self.stream), "d2h-ev")?;
+            Ok(buf)
+        }
+    }
+
+    /// `d2h_issue` 완료 대기 — **복사 이벤트만** 기다린다(스트림 전체를 비우지
+    /// 않으므로 그 뒤에 큐잉된 커널은 계속 진행된다). 파이프라인을 살려 두는
+    /// 것이 이 API의 존재 이유다(2026-09-14: 전체 sync는 층마다 파이프라인을
+    /// 비워 shared 스테이지가 25.8 → 50.7ms로 두 배가 됐다).
+    pub fn d2h_wait(&self) -> Result<(), String> {
+        unsafe {
+            let ev = self.d2h_ev()?;
+            ck(hip::hipEventSynchronize(ev), "d2h-ev-wait")
+        }
+    }
+
     pub fn d2h(&self, dst: &mut [u8], src: *const u8) -> Result<(), String> {
         unsafe {
             // pageable 직행은 슬로패스 — 핀 스테이징 경유 (2026-09-05 tg RCA:
