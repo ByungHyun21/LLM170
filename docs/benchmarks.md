@@ -348,8 +348,28 @@ difference is not attributable to it and remains unexplained - treat 79.7 s as
 the current figure.
 
 Kernel time (KTRACE) totals 46.1 s of the 78.9 s wall, so ~32.8 s is outside
-the traced kernel set (host work, chunk boundaries, syncs). That gap is the
-largest single item left before the kernel table.
+the traced kernel set. That gap is the largest single item left before the
+kernel table, and it is now located: it is the pipeline drain/fill around the
+**QSA host bridge**.
+
+Evidence: `LLM170_Q4_TIME=1` shows the QSA stage itself costs 30 ms per layer at
+t=2048 (mm_group 19 ms + selection 2.9 ms + attention 8 ms) - far below the
+`qsa_bridge` row in `LLM170_FRAME_TIME=1` (6.0-8.2 s per chunk, growing with
+context). Running the same benchmark with the bridge removed
+(`LLM170_STAGE_SKIP=qsa`, a diagnostic only - the output is invalid) drops
+pp2048 from 10,017 ms to **6,647 ms**, i.e. **3,370 ms per chunk (34%)** is
+attributable to the bridge even though its own work is ~0.4 s.
+
+The bridge is `crates/core/src/qwen4exp/frame.rs:414`: it reads the layer's
+`mix` to the host (21 MB d2h), converts it to `Vec<Vec<f32>>`, runs the CPU
+`stages::qsa_layer`, and writes the result back (21 MB h2d). The d2h forces a
+full device sync every QSA layer, so the GPU drains and then waits for the host
+- the span that `FRAME_TIME` attributes to `qsa_bridge` is that drain/fill.
+
+The fix is to make the QSA layer device-native (its projections are ordinary
+GEMMs the frame already has kernels for; the indexer's pool/RMS/rope, block
+scores and top-k need kernels - the decode path already has the value-attention
+side: `qsa_score`, `qsa_mix2`, `qsa_flash_wk16`).
 
 ### 2026-09-13 — prefill stage breakdown (frame path, `LLM170_FRAME_TIME=1`)
 
