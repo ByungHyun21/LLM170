@@ -427,10 +427,9 @@ spends **124 us dispatching 164k empty blocks** (the kernel body never runs -
 that size, so their measured 96 us is essentially block dispatch, not
 arithmetic: **the engine is block-dispatch-bound, not launch-bound**. Fewer,
 fatter blocks (the tile/quadrant kernels) is the lever, not fewer host calls.
-
-The host (2,477 ms) exceeds the GPU (1,984 ms), so the critical path is the
-*launch rate*, not the kernels. The launches break down as follows (per layer
-of the 48; GPU time is the sum over the 512-token prefill):
+The launches still break down as follows (per layer of the 48; GPU time is the
+sum over the 512-token prefill) - the counts matter as much as the times,
+because each one re-dispatches its grid:
 
 | kernel | launches/layer | GPU ms | us each |
 |---|---|---|---|
