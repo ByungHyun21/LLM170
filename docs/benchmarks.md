@@ -357,8 +357,12 @@ t=2048 (mm_group 19 ms + selection 2.9 ms + attention 8 ms) - far below the
 `qsa_bridge` row in `LLM170_FRAME_TIME=1` (6.0-8.2 s per chunk, growing with
 context). Running the same benchmark with the bridge removed
 (`LLM170_STAGE_SKIP=qsa`, a diagnostic only - the output is invalid) drops
-pp2048 from 10,017 ms to **6,647 ms**, i.e. **3,370 ms per chunk (34%)** is
-attributable to the bridge even though its own work is ~0.4 s.
+pp2048 from 10,017 ms to **6,647 ms**. **That 3,370 ms/chunk is an upper bound,
+not an attribution**: skipping the bridge also removes its output write, so
+every downstream op runs on garbage input and the expert routing / grouped
+expert GEMM costs change with it. The stage's own cost (30 ms/layer) is the
+lower bound; the bridge is somewhere in between, and the d2h sync is what makes
+the difference structural.
 
 The bridge is `crates/core/src/qwen4exp/frame.rs:414`: it reads the layer's
 `mix` to the host (21 MB d2h), converts it to `Vec<Vec<f32>>`, runs the CPU
