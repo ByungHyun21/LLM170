@@ -19,7 +19,7 @@ use llm170_profiler::profile_span;
             .map(|n| n.get())
             .unwrap_or(1)
             .min(t.max(1))
-            .min(16)
+            .min(32)
     }
 
     pub fn ple_block(
