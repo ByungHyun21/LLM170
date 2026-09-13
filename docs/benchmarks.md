@@ -409,6 +409,24 @@ start/end pair, with the event creation falling outside the pair), and the
 kernel names/counts are reliable; only the gap splits are not. The
 wall-clock numbers above are the ground truth.
 
+### Biggest remaining lever: the grouped MoE GEMM is the only non-WMMA GEMM
+
+The dense paths already dispatch to WMMA kernels (`gemm_q4k_wm` / `gemm_q5k_wm` /
+the `_v4` quadrant variants - `src_gemm.hip`), but the *grouped* MoE expert GEMM
+(`q4_gemm_q4k_ge`) is a scalar dequant+FMA loop that measures **4.4 TFLOPS int8**
+where the device's int8 WMMA peak is 30-60 TFLOPS (7-15 %). That kernel is 15 % of
+the chunk's GPU time (366 ms/chunk), so porting the WMMA tiling to the grouped
+form is worth ~12 % of the prefill - larger than the shuffle floor (4 %) or the
+whole remaining transition budget (~5 %).
+
+The port shape is exact: WMMA fragments are 16x16x16, and the grouped layout is
+already 16-row aligned (one expert per 16-row tile, from the q5_1 grouping work),
+so one fragment maps to one expert tile; only the A (weight) load needs
+`tile_exp[blockIdx.y]` and the 64x64 tiling becomes 16x64. The existing WMMA
+kernel's dequant and fragment code is reused. It is not bit-contracted (the
+existing WMMA paths are "stream-validated" too), so acceptance is the CPU oracle
+(`q4-acc-check` / `q4-qsa-check` mirrors) plus a coherent-output check.
+
 ### The residual idle is per-kernel-transition, ~60 us each (pp512, current build)
 
 Re-profiling after the host-side changes (thread caps, parallel pass A):
