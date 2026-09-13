@@ -330,6 +330,28 @@ measurements were taken sequentially.
 
 **Gap**: prefill ≈ 4.2x behind the reference; decode ≈ 1.6x behind.
 
+### 2026-09-13 — prefill stage breakdown (frame path, `LLM170_FRAME_TIME=1`)
+
+2311 tokens (chunks of 512), 48 layers, wall-clock per stage as measured by the
+frame's sync markers:
+
+| Stage | chunk 1 | chunks 2-4 (steady) | share of 42.6 s total |
+|---|---|---|---|
+| `moe.gemm3` (gather + 3 grouped expert GEMMs) | 17.8 s | ~1.7 s each | **56 %** |
+| `qsa_bridge` (12 QSA layers) | 0.87 s | 1.35 -> 3.23 s | **24 %** |
+| MoE route/shared/out/down/up/group | — | ~0.9 s | ~10 % |
+| GDN AR + conv + comb | — | ~0.08 s | ~2 % |
+
+Two levers dominate:
+
+1. **Expert GEMM** — grouped (token, expert) gather + 3 stacked GEMMs; the first
+   chunk pays a one-time ~16 s (weight streaming) that the server load does not
+   cover, afterwards ~35 ms/layer at t=512.
+2. **QSA attention bridge** — `qsa_attn_raw` uploads q/k/v/mask and downloads the
+   output *per layer* (host round trip) and the kernel attends densely over the
+   context, so its cost grows with n_past while llama's paged/top-k sparse path
+   grows with the selected blocks.
+
 ### What is on the GPU now (plans/64 P1)
 
 - **Value path** (`rawhip/q4acc.rs`): `matmul`/`matmul_batch`/`matmul_group`
