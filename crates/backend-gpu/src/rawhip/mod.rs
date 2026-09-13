@@ -1743,5 +1743,69 @@ mod micro_tests {
             dt * 1e3,
             gb / dt
         );
+
+        // MoE 그룹 커널 + 비동기 d2h 왕복 격리 — 디코드 디바이스 경로가
+        // +30ms/스텝을 보이는데, 그 추가분의 실체를 여기서 가른다.
+        let ne = 512i32;
+        let rows = 10i32;
+        let bound = (rows * 16 + 16) as usize;
+        let ids = ctx.scratch(rows as usize * 4).expect("ids");
+        let offb = ctx.scratch((ne as usize + 2) * 4).expect("off");
+        let permb = ctx.scratch(bound * 4).expect("perm");
+        let invb = ctx.scratch(rows as usize * 4).expect("inv");
+        let rexb = ctx.scratch(rows as usize * 4).expect("rex");
+        let ppb = ctx.scratch(bound * 4).expect("pp");
+        let ipb = ctx.scratch(rows as usize * 4).expect("ip");
+        let txb = ctx.scratch(bound).expect("tx");
+        let rpb = ctx.scratch(4).expect("rp");
+        let launch_g = || {
+            let (mut a, mut b) = (ids as *mut std::ffi::c_void, offb as *mut std::ffi::c_void);
+            let (mut c, mut d) = (permb as *mut std::ffi::c_void, invb as *mut std::ffi::c_void);
+            let (mut e, mut f) = (rexb as *mut std::ffi::c_void, ppb as *mut std::ffi::c_void);
+            let (mut g, mut h) = (ipb as *mut std::ffi::c_void, txb as *mut std::ffi::c_void);
+            let mut i = rpb as *mut std::ffi::c_void;
+            let (mut n_e, mut rws) = (ne, rows);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut a) as *mut _ as *mut std::ffi::c_void,
+                (&mut n_e) as *mut _ as *mut std::ffi::c_void,
+                (&mut rws) as *mut _ as *mut std::ffi::c_void,
+                (&mut b) as *mut _ as *mut std::ffi::c_void,
+                (&mut c) as *mut _ as *mut std::ffi::c_void,
+                (&mut d) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut f) as *mut _ as *mut std::ffi::c_void,
+                (&mut g) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+                (&mut i) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args).unwrap();
+        };
+        for _ in 0..20 {
+            launch_g();
+        }
+        ctx.sync().unwrap();
+        let tg1 = std::time::Instant::now();
+        for _ in 0..N {
+            launch_g();
+        }
+        let enqg = tg1.elapsed().as_secs_f64() * 1e3;
+        ctx.sync().unwrap();
+        let totg = tg1.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "# micro group kernel {N}회: host {enqg:.1}ms ({:.2}µs), 총 {totg:.1}ms ({:.2}µs)",
+            enqg / N as f64 * 1e3,
+            totg / N as f64 * 1e3
+        );
+        // 비동기 d2h + 이벤트 대기 왕복(디바이스 경로가 층마다 하는 것)
+        let tg2 = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = ctx.d2h_issue((ne as usize + 1) * 4, offb as *const u8).unwrap();
+            ctx.d2h_wait().unwrap();
+        }
+        let totd = tg2.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "# micro d2h_issue+wait {N}회: 총 {totd:.1}ms ({:.2}µs/회)",
+            totd / N as f64 * 1e3
+        );
     }
 }
