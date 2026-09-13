@@ -553,6 +553,41 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             let mut ov3 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov3), od as *const u8)?;
             out += &format!("# 블록별 기여(실측/기대):{per_nb}\n");
+            // 원소 커버리지 스캔: (행 0, 열 j) 한 원소만 1.0, x=전부 1 → out[0]=1이면
+            // 그 j가 GEMM의 읽기 범위 안. j별로 **다른 포인터**를 써야 f16 캐시(포인터 키)를
+            // 피한다 — 257행 버퍼에서 j번째 행을 가중치 시작으로 넘긴다.
+            {
+                let row_bytes = (n_in / 32) * 34;
+                let big = ctx.alloc((n_out + 1) * row_bytes)?;
+                let zeros = vec![0u8; (n_out + 1) * row_bytes];
+                ctx.h2d(big, &zeros)?;
+                let mut covered = Vec::new();
+                let mut holes = Vec::new();
+                for j in 0..n_in {
+                    let mut one = vec![0u8; 34];
+                    one[0] = 0x00;
+                    one[1] = 0x3C;
+                    one[2 + (j % 32)] = 1;
+                    let wptr = unsafe { big.add(j * row_bytes + (j / 32) * 34) };
+                    ctx.h2d(wptr, &one)?;
+                    let wp = unsafe { big.add(j * row_bytes) };
+                    ctx.gemm_f16_deq(8, xd as *const u8, wp as *const u8, n_in, n_out, 1, od)?;
+                    ctx.sync()?;
+                    let mut oo = vec![0.0f32; n_out];
+                    ctx.d2h(bytemuck::cast_slice_mut(&mut oo), od as *const u8)?;
+                    if oo[0].abs() > 0.25 {
+                        covered.push(j);
+                    } else {
+                        holes.push(j);
+                    }
+                }
+                out += &format!(
+                    "# 원소 커버리지: {}/{} (구멍 앞 12: {:?})\n",
+                    covered.len(),
+                    n_in,
+                    &holes[..12.min(holes.len())]
+                );
+            }
             out += &format!(
                 "# 값검증: 전원소1 → {} (기대 {n_in}) / d=0.5,q=2 → {} (기대 {n_in}) / 부호·스케일 → {} (기대 {expect:.3})\n",
                 ov[0], ov2[0], ov3[0]
