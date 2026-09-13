@@ -717,6 +717,19 @@ impl Q4Acc {
                 return Ok(());
             }
         }
+        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+            use std::sync::Mutex;
+            use std::sync::OnceLock;
+            static SEEN: OnceLock<Mutex<Vec<(u32, usize, usize, usize)>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
+            if let Ok(mut v) = seen.lock() {
+                let key = (ty, n_in, n_out, (t / 128) * 128);
+                if !v.contains(&key) && v.len() < 16 {
+                    v.push(key);
+                    eprintln!("# launch_gemm(GEMV): ty={ty} n_in={n_in} n_out={n_out} t={t}");
+                }
+            }
+        }
         self.ctx.gemv_q8_out(
             xq as *const u8,
             w as *const u8,
