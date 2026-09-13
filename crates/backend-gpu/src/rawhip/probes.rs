@@ -458,9 +458,33 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             ctx.sync()?;
             let mut ov2 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov2), od as *const u8)?;
+            // 실효 k-범위: 전원소 1 가중치 + 원-핫 x(j) → out[0]=1이면 j는 기여, 0이면 범위 밖
+            let mut contrib = Vec::new();
+            let mut missing = Vec::new();
+            for j in 0..n_in {
+                let mut xo = vec![0.0f32; n_in];
+                xo[j] = 1.0;
+                ctx.h2d(xd, bytemuck::cast_slice(&xo))?;
+                ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+                ctx.sync()?;
+                let mut oo = vec![0.0f32; n_out];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut oo), od as *const u8)?;
+                if oo[0].abs() > 0.25 {
+                    contrib.push(j);
+                } else {
+                    missing.push(j);
+                }
+            }
             out += &format!(
                 "# 값검증: 전원소1 → out[0]={} (기대 {n_in}) / d=0.5,q=2 → out[0]={} (기대 {n_in})\n",
                 ov[0], ov2[0]
+            );
+            out += &format!(
+                "# 실효 k범위: 기여 {}개 (앞 12: {:?}) / 누락 {}개 (앞 12: {:?})\n",
+                contrib.len(),
+                &contrib[..12.min(contrib.len())],
+                missing.len(),
+                &missing[..12.min(missing.len())]
             );
         }
         out += &format!("# blk={b}: 1:1={distinct} 빈칸={holes} 다중={multi}\n");
