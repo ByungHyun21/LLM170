@@ -155,6 +155,26 @@ Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
 Token stream verified bit-identical to non-spec greedy (64/64).
 Acceptance 4-5 tokens/verify at k=4 on natural text.
 
+## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
+
+The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
+single dense WMMA launch: an MMA fragment shares the A operand across the token
+axis, but the grouped layout makes A (the expert weights) a function of the token
+(the expert varies per token). Folding the expert into the grid z axis reads out
+of range; the only valid decomposition is one launch per expert.
+
+Per-expert dense `gemm_q4k_j128` launches were implemented and measured: numerics
+valid (diverse-prompt output identical; an 11,750-token random prompt diverges at
+one newline token, 271 vs 198 - a rounding tie-break, the expected signature of an
+alternative accumulation order). Speed: 110.3 s vs 112.1 s total = -1.6%, within
+the ~10 s run-to-run load variance. No gain.
+
+Reason: at t=2048 there are 16,384 grouped rows over ~512 active experts, i.e.
+~32 rows per expert, so a 128-token WMMA tile is 75% wasted, plus ~512 launches
+per chunk. The scalar grouped kernel (4.4 TFLOPS) is effectively optimal for this
+shape. The -11% seen with the (incorrect) dense-tiling kernel is therefore not
+reachable in the grouped layout.
+
 ## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
 llama.cpp, Q4_K_XL (27B), non-MTP, flash attention on, f16 KV, temp 0,
