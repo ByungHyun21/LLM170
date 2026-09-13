@@ -127,6 +127,11 @@ use llm170_profiler::profile_span;
         let seq_state = &mut *seq;
         // 블록 키 캐시는 행마다 clone하지 않고 지역 버퍼로 승격한다(핫 루프 복사 제거).
         let mut bk_local: Vec<f32> = std::mem::take(&mut seq_state.idx_bk[full_idx]);
+        let r = hp.compress[il] as usize;
+        // 패스 A(직렬): KV·인덱서 캐시 적립 + q_rope(q norm·rope 포함).
+        // 패스 B(병렬): 블록 점수 + 선택 + 마스크. 행이 서로 독립이라 층 단위로
+        // 스레드를 한 번만 띄운다(행마다 spawn하면 오버헤드가 이득을 넘는다 — 실측).
+        let mut q_rows: Vec<Vec<Vec<f32>>> = Vec::with_capacity(t_len);
         for t in 0..t_len {
             let pos = pos0 + t as u32;
             let (cache_k, cache_v, idx_cache) = {
@@ -151,9 +156,7 @@ use llm170_profiler::profile_span;
                 .copy_from_slice(&ik[t]);
 
             // 인덱서 스코어: 완전 블록(4토큰) mean-pool → rms → rope(b*4) → ReLU 헤드합
-            let r = hp.compress[il] as usize;
             let n_blocks = n_past / r;
-            let tail_start = n_blocks * r;
             // 블록 키 캐시 — 이 토큰 시점까지의 완전 블록만 유효 (증분).
             // 이전 청크가 계산한 키는 재사용, 신규 블록만 계산 (수치 동일).
             if bk_local.len() < n_blocks * hp.idx_dim {
@@ -162,8 +165,8 @@ use llm170_profiler::profile_span;
                     let mut pooled = vec![0.0f32; hp.idx_dim];
                     for j in 0..r {
                         let base = (b * r + j) * hp.idx_dim;
-                        for i in 0..hp.idx_dim {
-                            pooled[i] += idx_cache[base + i];
+                        for i2 in 0..hp.idx_dim {
+                            pooled[i2] += idx_cache[base + i2];
                         }
                     }
                     for v in pooled.iter_mut() {
@@ -175,7 +178,6 @@ use llm170_profiler::profile_span;
                     b += 1;
                 }
             }
-            let bk_cache: &[f32] = &bk_local[..n_blocks * hp.idx_dim];
             let mut q_rope: Vec<Vec<f32>> = Vec::with_capacity(hp.idx_heads);
             for h in 0..hp.idx_heads {
                 let mut qh = rms_norm(
@@ -186,55 +188,9 @@ use llm170_profiler::profile_span;
                 rope_head(&mut qh, pos, hp.idx_dim, hp.rope_base);
                 q_rope.push(qh);
             }
-            let mut block_score = vec![0.0f32; n_blocks];
-            for b in 0..n_blocks {
-                let pk = &bk_cache[b * hp.idx_dim..(b + 1) * hp.idx_dim];
-                for qh in &q_rope {
-                    // 4-누산기로 펼쳐 의존 사슬을 끊는다(SSE 4-wide 자동 벡터화).
-                    let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    let mut i = 0usize;
-                    while i + 4 <= hp.idx_dim {
-                        d0 += qh[i] * pk[i];
-                        d1 += qh[i + 1] * pk[i + 1];
-                        d2 += qh[i + 2] * pk[i + 2];
-                        d3 += qh[i + 3] * pk[i + 3];
-                        i += 4;
-                    }
-                    while i < hp.idx_dim {
-                        d0 += qh[i] * pk[i];
-                        i += 1;
-                    }
-                    let dot = (d0 + d1) + (d2 + d3);
-                    if dot > 0.0 {
-                        block_score[b] += dot;
-                    }
-                }
-            }
+            q_rows.push(q_rope);
 
-            // 선택: 테일(강제) + 상위 B개 완전블록 — 폭 = min(n_past, top_k + r − 1)
-            let width = n_past.min(hp.idx_top_k + r - 1);
-            let tail_cnt = n_past - tail_start;
-            let n_sel_blocks = ((width - tail_cnt) / r).min(n_blocks);
-            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
-            if n_sel_blocks < n_blocks {
-                // 상위 n_sel_blocks개만 필요 — 전체 정렬 대신 부분 선택(평균 O(n)).
-                sel_blocks.select_nth_unstable_by(n_sel_blocks, |&a, &b| {
-                    block_score[b]
-                        .partial_cmp(&block_score[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            let mut mask = vec![false; n_past];
-            for j in tail_start..n_past {
-                mask[j] = true;
-            }
-            for &b in &sel_blocks[..n_sel_blocks] {
-                for j in b * r..(b + 1) * r {
-                    mask[j] = true;
-                }
-            }
-
-            // q norm·rope를 qg에 즉시 적용 (attention은 루프 후 일괄)
+            // q norm·rope를 qg에 즉시 적용 (attention은 패스 뒤 일괄)
             for h in 0..n_head {
                 let src = qg[t][h * 2 * hd..h * 2 * hd + hd].to_vec();
                 let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
@@ -243,18 +199,95 @@ use llm170_profiler::profile_span;
                     *b = *a;
                 }
             }
-            mask_all[t] = mask;
+        }
 
-            // 마스크 밀집 GQA + 게이트 — acc 있으면 루프 후 GPU 일괄, 없으면 즉시 CPU
-            if gpu_attn && !cpu_attn {
-                continue;
+        // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
+        {
+            let bkl: &[f32] = &bk_local;
+            let qr: &[Vec<Vec<f32>>] = &q_rows;
+            let idx_dim = hp.idx_dim;
+            let idx_top_k = hp.idx_top_k;
+            let nthreads = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(4)
+                .min(16);
+            let per = t_len.div_ceil(nthreads.max(1)).max(1);
+            let pos0u = pos0 as usize;
+            std::thread::scope(|sc| {
+                for (ci, chunk) in mask_all.chunks_mut(per).enumerate() {
+                    let base = ci * per;
+                    sc.spawn(move || {
+                        for (i, slot) in chunk.iter_mut().enumerate() {
+                            let t = base + i;
+                            let n_past = pos0u + t + 1;
+                            let n_blocks = n_past / r;
+                            let tail_start = n_blocks * r;
+                            let bk = &bkl[..n_blocks * idx_dim];
+                            let mut block_score = vec![0.0f32; n_blocks];
+                            for b in 0..n_blocks {
+                                let pk = &bk[b * idx_dim..(b + 1) * idx_dim];
+                                for qh in &qr[t] {
+                                    // 4-누산기로 펼쳐 의존 사슬을 끊는다.
+                                    let (mut d0, mut d1, mut d2, mut d3) =
+                                        (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                                    let mut i2 = 0usize;
+                                    while i2 + 4 <= idx_dim {
+                                        d0 += qh[i2] * pk[i2];
+                                        d1 += qh[i2 + 1] * pk[i2 + 1];
+                                        d2 += qh[i2 + 2] * pk[i2 + 2];
+                                        d3 += qh[i2 + 3] * pk[i2 + 3];
+                                        i2 += 4;
+                                    }
+                                    while i2 < idx_dim {
+                                        d0 += qh[i2] * pk[i2];
+                                        i2 += 1;
+                                    }
+                                    let dot = (d0 + d1) + (d2 + d3);
+                                    if dot > 0.0 {
+                                        block_score[b] += dot;
+                                    }
+                                }
+                            }
+                            // 선택: 테일(강제) + 상위 B개 완전블록 — 폭 = min(n_past, top_k + r − 1)
+                            let width = n_past.min(idx_top_k + r - 1);
+                            let tail_cnt = n_past - tail_start;
+                            let n_sel_blocks = ((width - tail_cnt) / r).min(n_blocks);
+                            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
+                            if n_sel_blocks < n_blocks {
+                                // 상위 n_sel_blocks개만 필요 — 전체 정렬 대신 부분 선택(평균 O(n)).
+                                sel_blocks.select_nth_unstable_by(n_sel_blocks, |&a, &b| {
+                                    block_score[b]
+                                        .partial_cmp(&block_score[a])
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            }
+                            let mut mask = vec![false; n_past];
+                            for j in tail_start..n_past {
+                                mask[j] = true;
+                            }
+                            for &b in &sel_blocks[..n_sel_blocks] {
+                                for j in b * r..(b + 1) * r {
+                                    mask[j] = true;
+                                }
+                            }
+                            *slot = mask;
+                        }
+                    });
+                }
+            });
+        }
+        // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(폴백 경로).
+        if !(gpu_attn && !cpu_attn) {
+            let (ckv, cvv) = (&seq_state.kv_k[full_idx], &seq_state.kv_v[full_idx]);
+            for t in 0..t_len {
+                let n_past = (pos0 as usize) + t + 1;
+                let mut attn_out = std::mem::take(&mut attn_all[t]);
+                cpu_attn_row(
+                    &mut attn_out, &qg[t], &mask_all[t], n_past, ckv, cvv,
+                    n_head, n_kv, hd, kq_scale,
+                );
+                attn_all[t] = attn_out;
             }
-            let mut attn_out = std::mem::take(&mut attn_all[t]);
-            cpu_attn_row(
-                &mut attn_out, &qg[t], &mask_all[t], n_past, cache_k, cache_v,
-                n_head, n_kv, hd, kq_scale,
-            );
-            attn_all[t] = attn_out;
         }
         seq_state.idx_bk[full_idx] = bk_local;
         if tm {
