@@ -363,7 +363,23 @@ t<=3, where the 4-head block would leave most warps idle (195 vs 203 ms/step).
 ### Kernel distribution after the change (KTRACE, pp11750)
 
 `q4_qsa_attn_sel4` falls from 17.9 s to **2.25 s** (72 launches, 31 ms each) with
-the 4-head grouping. The largest kernels are now `q4_gemm_q4k_ge` (7.3 s, 470
+the 4-head grouping. That 4x traffic cut bought only 20 % of prefill wall time,
+and the decode (same kernel at t=1) did not move at all - so the remaining cost
+is not load traffic. Three hypotheses were tested and rejected against it:
+
+- warp occupancy: one 32-thread block per token (bit-identical) made the decode
+  *worse* (274 vs 195 ms/step);
+- ILP/dependency chain: interleaving two keys per iteration (verified
+  bit-identical by the probe) left the decode unchanged (195.4 vs 194.8 ms/step)
+  and cost the prefill 1.4 %;
+- bandwidth: 2.25 s for ~206 GB of L2 reads is ~91 GB/s, an order of magnitude
+  below the L2's capability.
+
+The loop does five `__shfl_xor_sync` rounds per key per head regardless of how
+many loads it saves, so the **shuffle unit is the floor** - consistent with the
+earlier scalar-attention finding (commit `eded6cc`). Removing it needs the
+lane=key layout, which requires a transposed K slab (the current cache is
+position-major so lane=key would issue one cache line per lane). The largest kernels are now `q4_gemm_q4k_ge` (7.3 s, 470
 launches) and `gemm_q8_j128` (4.6 s, 4639 launches), and the KTRACE's
 `after <kernel>` rows - time attributed between one kernel's completion and the
 next traced event - total ~29 s, dominated by `after q4_rows_permute_u32`
