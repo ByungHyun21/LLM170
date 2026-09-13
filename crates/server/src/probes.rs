@@ -12,6 +12,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "f16-bench" => {
+            let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+            llm170_backend_gpu::rawhip::f16_bench(a(0, 128), a(1, 2560), a(2, 640), a(3, 20))
+        }
         "q4k-bench" => {
             let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
             llm170_backend_gpu::rawhip::q4k_bench(a(0, 128), a(1, 2560), a(2, 640), a(3, 20))

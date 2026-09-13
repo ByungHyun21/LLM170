@@ -425,6 +425,8 @@ impl Q4Acc {
         {
             return Ok(());
         }
+        // f16 전개 경로는 gemm_f16_deq(미검증) 참조 — .co GEMM이 기대하는 f16
+        // 레이아웃 계약을 아직 맞추지 못했다(plans/65 §11). 배선하지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
         self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, out)
     }
@@ -1426,6 +1428,7 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 {
                     continue;
                 }
+                // f16 경로 미검증(위 frame_gemm 주석 참조) — 배선 보류.
                 let (xqi, xwi) = if mmq_on { self.frame_quant(xp, n_in, t)? } else { (xq, xq_w) };
                 self.launch_gemm(ty, xqi, wd, n_in, n_out, xwi, t, op)?;
             }
