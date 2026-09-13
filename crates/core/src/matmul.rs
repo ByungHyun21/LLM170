@@ -337,7 +337,8 @@ pub enum FrameOp {
     /// GDN norm_gated silu 변형 (qwen35): out = rms(o)·silu(z)·w.
     NormGatedSilu { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
     /// GDN q/k 헤드별 in-place L2 norm.
-    L2Rows { x: u64, eps: f32, d: usize },
+    /// n = 처리할 원소 수(행 수 = n/d). 버퍼 길이가 아니라 토큰 수에서 온다.
+    L2Rows { x: u64, eps: f32, d: usize, n: usize },
     /// conv 출력 3분할 (q/k/v) — 카피 3런치 융합.
     Split3 { src: u64, d0: u64, d1: u64, d2: u64, n0: usize, n1: usize, n2: usize },
     /// L2 이중 행 + q 스케일 융합 (산술 l2_rows+scale 과 동일).

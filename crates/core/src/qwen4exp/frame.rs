@@ -564,40 +564,53 @@ fn gdn_frame(
     let wz = model.w4(&format!("blk.{il}.attn_gate.weight"))?;
     let wb = model.w4(&format!("blk.{il}.ssm_beta.weight"))?;
     let wa = model.w4(&format!("blk.{il}.ssm_alpha.weight"))?;
-    acc.frame_mm_group(f.mix, &[wqkv, wz, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], t)
-        .map_err(Q4Error::Io)?;
+    if !stage_skipped("gdn.mm") {
+        acc.frame_mm_group(f.mix, &[wqkv, wz, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], t)
+            .map_err(Q4Error::Io)?;
+    }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
     // β/e^g
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
-    op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
+    if !stage_skipped("gdn.betag") {
+        op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
+    }
     sync_mark(acc, "gdn.betag", f.gbg)?;
     // conv + ring
     let cw = f.consts[&format!("blk.{il}.conv_w")];
-    op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: t })?;
+    if !stage_skipped("gdn.conv") {
+        op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: t })?;
+    }
     sync_mark(acc, "gdn.conv", f.gconv)?;
     // q/k/v 분할 (토큰 배치 = split3) + l2 + q·scale
-    op(acc, FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
-    sync_mark(acc, "gdn.split3", f.gq)?;
-    op(acc, FrameOp::L2Rows { x: f.gq, eps, d: hp.d_state })?;
-    op(acc, FrameOp::L2Rows { x: f.gk, eps, d: hp.d_state })?;
-    let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-    op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
+    if !stage_skipped("gdn.l2") {
+        op(acc, FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
+        op(acc, FrameOp::L2Rows { x: f.gq, eps, d: hp.d_state, n: k_len * t })?;
+        op(acc, FrameOp::L2Rows { x: f.gk, eps, d: hp.d_state, n: k_len * t })?;
+        let scale = 1.0f32 / (hp.d_state as f32).sqrt();
+        op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
+    }
     sync_mark(acc, "gdn.l2scale", f.gq)?;
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
     if il == 0 {
         dbg("gbg_post", acc, f.gbg, hp.dt_rank * 2 * t);
     }
-    fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
-        .map_err(Q4Error::Io)?;
+    if !stage_skipped("gdn.ar") {
+        fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
+            .map_err(Q4Error::Io)?;
+    }
     sync_mark(acc, "gdn.ar", f.go)?;
     // norm_gated + out proj
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
-    op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
+    if !stage_skipped("gdn.ng") {
+        op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
+    }
     sync_mark(acc, "gdn.normgated", f.ggated)?;
     let wout = model.w4(&format!("blk.{il}.ssm_out.weight"))?;
-    acc.frame_mm(f.ggated, &wout, f.ffn_out, t).map_err(Q4Error::Io)?;
+    if !stage_skipped("gdn.out") {
+        acc.frame_mm(f.ggated, &wout, f.ffn_out, t).map_err(Q4Error::Io)?;
+    }
     sync_mark(acc, "gdn.out", f.ffn_out)?;
     Ok(())
 }

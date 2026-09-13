@@ -1948,11 +1948,13 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 let rows = n_h * self.t_cur();
                 self.kop("q4_norm_gated_sig", n_h as u32, (rows / n_h.max(1)) as u32, 1, 32, &mut cargs!(&mut op_, &mut zp, &mut wp, &mut outp, &mut e, &mut dd, &mut nh))
             }
-            O::L2Rows { x, eps, d } => {
+            O::L2Rows { x, eps, d, n } => {
                 let mut xp = self.fptr(x)?;
                 let mut e = eps;
                 let mut dd = d as i32;
-                let rows = (d * 0 + self.flen(x)? / d).max(1) as u32;
+                // 행 수는 *토큰 수*에서 온다. 버퍼 길이(t_max)를 쓰면 t=1에서도
+                // t_max행을 처리해 33.7ms/스텝을 낭비한다(2026-09-14 실측).
+                let rows = (n / d).max(1) as u32;
                 self.kop("q4_l2_rows", rows, 1, 1, 32, &mut cargs!(&mut xp, &mut e, &mut dd))
             }
             O::Scale { t, s, n } => {
