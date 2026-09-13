@@ -352,17 +352,28 @@ the traced kernel set. That gap is the largest single item left before the
 kernel table, and it is now located: it is the pipeline drain/fill around the
 **QSA host bridge**.
 
-Evidence: `LLM170_Q4_TIME=1` shows the QSA stage itself costs 30 ms per layer at
-t=2048 (mm_group 19 ms + selection 2.9 ms + attention 8 ms) - far below the
-`qsa_bridge` row in `LLM170_FRAME_TIME=1` (6.0-8.2 s per chunk, growing with
-context). Running the same benchmark with the bridge removed
-(`LLM170_STAGE_SKIP=qsa`, a diagnostic only - the output is invalid) drops
-pp2048 from 10,017 ms to **6,647 ms**. **That 3,370 ms/chunk is an upper bound,
-not an attribution**: skipping the bridge also removes its output write, so
-every downstream op runs on garbage input and the expert routing / grouped
-expert GEMM costs change with it. The stage's own cost (30 ms/layer) is the
-lower bound; the bridge is somewhere in between, and the d2h sync is what makes
-the difference structural.
+Direct instrumentation of the bridge (`LLM170_Q4_TIME=1`, steady t=2048
+layers, per layer):
+
+| part | per layer | per chunk (12 QSA layers) |
+|---|---|---|
+| `frame_read` (21 MB d2h + drain) | 77-115 ms | ~1.0 s |
+| CPU `stages::qsa_layer` | **230-402 ms** | **~2.9 s** |
+| `frame_write` (21 MB h2d) | 2.1 ms | ~0.03 s |
+
+so the bridge costs ~3.9 s per 2048-token chunk, i.e. **~40 % of the 10.0 s
+chunk** - consistent with the 3,370 ms/chunk that removing it saves
+(`LLM170_STAGE_SKIP=qsa` drops pp2048 from 10,017 to 6,647 ms; that diagnostic is
+timing-only since the output is invalid). Note: an earlier reading of 30 ms/layer
+came from the t=1 warmup lines of the same counter, not from t=2048.
+
+The 230-402 ms is dominated by the CPU-side quantized projections (q/k/v/iq/ik
+plus the output projection, ~82 GFLOP/chunk/layer at that width); the indexer
+selection and the attention are the smaller part. Moving the projections to the
+existing frame GEMM path on the device is therefore the direct win (~2.9 s per
+chunk = ~29 % of the prefill), and it does not require new indexer kernels -
+only registering the QSA weights in the frame and reading back the small
+projection outputs (64 MB d2h ≈ 3 ms).
 
 The bridge is `crates/core/src/qwen4exp/frame.rs:414`: it reads the layer's
 `mix` to the host (21 MB d2h), converts it to `Vec<Vec<f32>>`, runs the CPU
