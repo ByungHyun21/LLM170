@@ -413,7 +413,36 @@ heads map to 2 KV heads, so a 12x traffic reduction is available), i.e. a
 flash-style block over (tokens x head-group) rather than one warp per
 (token, head). Expected ~15 s per chunk = ~20 % of the prefill.
 
-Decode: **156 ms/step at 2,048 context** (6.41 t/s) and 195 ms/step at 8,192.
+Decode: **156 ms/step at 2,048 context** (6.41 t/s) and ~196 ms/step at 8,192.
+
+Per-op breakdown of one decode step (t=1, `LLM170_FRAME_TIME=1`, ~177 ms measured
+with the sync-per-tag instrumentation; the tracer reads back one element per
+tag so it is itself a sync point):
+
+| tag | ms/step | count | | tag | ms/step | count |
+|---|---|---|---|---|---|---|
+| qsa_bridge | 44.7 | 12 | | out | 5.5 | 36 |
+| shared | 26.9 | 48 | | route | 4.1 | 48 |
+| l2scale | 24.7 | 36 | | ar | 1.6 | 36 |
+| top10 | 17.0 | 48 | | gate | 1.4 | 96 |
+| mm_group | 12.3 | 36 | | silu | 1.3 | 96 |
+| rms | 10.0 | 96 | | ffn_combine | 0.7 | 48 |
+| down | 8.5 | 96 | | normgated | 0.7 | 36 |
+| ple_bridge | 7.3 | 1 | | conv | 0.7 | 36 |
+| up | 6.8 | 96 | | rest | ~3 | ~250 |
+
+There is no single dominant item: ~700 ops cost ~0.25 ms each, so the decode is
+spread across the whole frame op set (the QSA bridge is the largest single tag
+at 25 %). Cutting it means fewer ops/syncs per step, not a faster kernel.
+
+Two negative results recorded here so they are not retried blind:
+- giving `L2Rows` the current row count instead of the buffer's (`flen/d`, which
+  is the max t) removed ~2000x of the work with **identical tokens** but made the
+  step **slower** (232 vs 195 ms). The extra rows are stale, so their values feed
+  whatever reads the tail of the buffer; the effect is unexplained and worth
+  isolating.
+- batching `q4_l2_rows` 8 rows per block (bit-identical) changed nothing
+  (196.4 vs 194.8 ms), so that 24.7 ms tag is real work, not block-launch cost.
 
 The decode runs the same kernel at t=1, where only 24 warps exist (one per head).
 Raising that concurrency by launching one 32-thread block per token (adding a
