@@ -1259,9 +1259,10 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         }
         if ws.ty == GgmlType::Q4K && !f32w && rows > 0 {
             let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
-            let mut x_p = xg as *mut std::ffi::c_void;
+            // 커널이 perm[r]로 직접 읽으므로 **비-gather 원본**(xsrc0)을 넘긴다.
+            let mut x_p = xsrc0 as *mut std::ffi::c_void;
             let mut w_p = wd as *mut std::ffi::c_void;
-            let mut o_p = yg as *mut std::ffi::c_void;
+            let mut o_p = op_ as *mut std::ffi::c_void;
             let mut rx_p = rowexp_d as *mut std::ffi::c_void;
             let (mut ni, mut no, mut xw, mut tt, mut eb) = (
                 n_in as i32,
