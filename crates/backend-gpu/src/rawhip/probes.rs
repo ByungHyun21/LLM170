@@ -374,6 +374,49 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `f16-map` — `.co` f16 GEMM(`gemm_f16_v4`, 래퍼 `gemm_f16_deq`)이 기대하는
+/// k-축 매핑을 관찰한다. q8_0 **항등 가중치**(256x256) + 원-핫 활성 → 출력의
+/// 1 위치가 곧 매핑이다(항등이면 k 그대로, 순열이면 그 순열).
+pub fn f16_map() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let (n_out, n_in) = (256usize, 256usize);
+    let mut w = vec![0u8; n_out * (n_in / 32) * 34];
+    for o in 0..n_out {
+        for sb in 0..n_in / 32 {
+            let b = &mut w[(o * (n_in / 32) + sb) * 34..][..34];
+            b[0] = 0x00;
+            b[1] = 0x3C; // d = 1.0
+            for l in 0..32 {
+                b[2 + l] = if o == sb * 32 + l { 1 } else { 0 };
+            }
+        }
+    }
+    let wd = ctx.alloc(w.len())?;
+    let xd = ctx.alloc(n_in * 4)?;
+    let od = ctx.alloc(n_out * 4)?;
+    ctx.h2d(wd, &w)?;
+    let mut out = String::new();
+    let ks: Vec<usize> = (0..n_in).collect();
+    for k in ks {
+        let mut x = vec![0.0f32; n_in];
+        x[k] = 1.0;
+        ctx.h2d(xd, bytemuck::cast_slice(&x))?;
+        ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+        ctx.sync()?;
+        let mut o = vec![0.0f32; n_out];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut o), od as *const u8)?;
+        let _ = &ctx;
+        let nz: Vec<usize> = o
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.abs() > 0.25)
+            .map(|(i, _)| i)
+            .collect();
+        out += &format!("{k}:{}\n", nz.first().copied().unwrap_or(usize::MAX));
+    }
+    Ok(out)
+}
+
 /// `f16-bench [rows] [n_in] [n_out] [reps]` — 기존 `.co` f16 GEMM(`gemm_f16_v4`)을
 /// 직접 측정한다. q4k-bench와 같은 형상으로 재면 "텐서코어 경로의 상한"이 나온다
 /// (roof-test mfma1 L1-fed 24.9 TFLOPS). 새 커널 없이 경로 가치를 판정하는 용도.
