@@ -374,9 +374,12 @@ either. They are most likely a **measurement artifact**: `launch3` creates two
 `hipEvent` objects per launch when `LLM170_KTRACE` is set and never destroys
 them (`mod.rs`), so a run with ~10k launches allocates ~20k events and the
 event-record cost lands *between* consecutive kernels - exactly where the
-`after` rows measure. Treat the kernel *names and counts* from KTRACE as
-reliable and its gap/timing splits as suspect; the wall-clock numbers above are
-the ground truth.
+`after` rows measure. Concretely, a KTRACE run of this benchmark wall-clocks
+~74 s of prefill against 60.9 s without it (~21% inflation). The *durations* are
+still trustworthy (each is the elapsed time between a freshly recorded
+start/end pair, with the event creation falling outside the pair), and the
+kernel names/counts are reliable; only the gap splits are not. The
+wall-clock numbers above are the ground truth.
 
 ### The attention kernel was the largest kernel (traffic-bound)
 
