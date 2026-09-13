@@ -177,6 +177,11 @@ pub trait Accelerator: FrameState + Send + Sync {
     ) -> Result<(), String>;
     /// out[o] = Σ_i x[i]·W[o,i]
     fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
+    /// 디바이스 총 메모리(바이트). 미지원/CPU면 0 — 적응형 버퍼 상한 결정에 쓴다.
+    fn total_mem_bytes(&self) -> u64 {
+        0
+    }
+
     /// QSA 마스크드 밀집 GQA (GPU 전용 — 기본 미지원).
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention(

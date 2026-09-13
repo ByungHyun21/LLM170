@@ -109,13 +109,29 @@ impl Q4Timings {
 /// hipMalloc OOM이었다. 값 경로 청크(1024)와 독립.
 const FRAME_T_MAX: usize = 512;
 
-fn frame_t_max() -> usize {
+/// 프레임 토큰 상한 — 기본 512(8GB CMP에서 1024는 hipMalloc OOM 이력).
+/// `LLM170_FRAME_TMAX`로 올릴 수 있다(대형 VRAM 기기: 전문가당 행 수가 늘어
+/// MoE 가중치 재사용이 좋아진다).
+fn frame_t_max_cap(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
+    if let Some(v) = std::env::var("LLM170_FRAME_TMAX").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return v.clamp(16, 4096);
+    }
+    // 적응형: 큰 VRAM(≥16GB)이면 1024 — 전문가당 행 수가 늘어 MoE 가중치 재사용이
+    // 좋아진다(11,750토큰 실측: 총 −5.7%, gemm3 −14%, qsa −9%). 8GB CMP는 512
+    // 유지(1024는 hipMalloc OOM 이력).
+    match acc.map(|a| a.total_mem_bytes()).unwrap_or(0) {
+        m if m >= 16 * 1024 * 1024 * 1024 => 1024,
+        _ => FRAME_T_MAX,
+    }
+}
+
+fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
     std::env::var("LLM170_Q4_CHUNK")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1024)
-        .clamp(16, 1024)
-        .min(FRAME_T_MAX)
+        .clamp(16, 4096)
+        .min(frame_t_max_cap(acc))
 }
 
 impl Engine4 {
@@ -315,11 +331,11 @@ impl Engine4 {
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         // 프레임 버퍼(t_max)보다 큰 청크는 범위를 넘는다 — 프레임 경로는 청크를 묶는다.
-        let chunk = if frame_on { chunk.min(FRAME_T_MAX) } else { chunk };
+        let chunk = if frame_on { chunk.min(frame_t_max_cap(self.acc.as_deref())) } else { chunk };
         if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {
-                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max()) {
+                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
                     Ok(f) => self.frame = Some(f),
                     Err(e) => {
                         self.frame_broken = true;
@@ -392,7 +408,7 @@ impl Engine4 {
         let frame_try = if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {
-                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max()) {
+                match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
                     Ok(f) => {
                         self.frame = Some(f);
                         Some(())
