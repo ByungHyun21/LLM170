@@ -404,6 +404,26 @@ start/end pair, with the event creation falling outside the pair), and the
 kernel names/counts are reliable; only the gap splits are not. The
 wall-clock numbers above are the ground truth.
 
+### The residual idle is per-kernel-transition, ~60 us each (pp512, current build)
+
+Re-profiling after the host-side changes (thread caps, parallel pass A):
+
+| | before | now |
+|---|---|---|
+| kernels in the 512-token prefill | 8,694 | 7,454 |
+| GPU busy | 80 % | **87 %** |
+| gaps | 611 ms (25 %) | **363 ms (18 %)** |
+
+The gaps are no longer a few long stalls: **6,077 of the ~7,450 transitions have
+a gap, averaging 60 us** (largest 11 ms). With ~1 us host launches, that 60 us is
+device-side start latency per kernel, so **kernel count is the currency** - and
+it explains why moving work to the GPU without removing a launch (the indexer
+score experiment) loses. Fusion targets ranked by transition count per layer:
+`gemm_q8_0` 33.4 (one launch per dense matrix), `quant_q8` 22.7 (per-GEMM
+activation quantize), `q4_rows_permute_u32` 13.8 (MoE gather/scatter, fusable
+into the grouped GEMM via the perm it already carries - bit-identical),
+`gemm_q8_j128` 12.1, `rms_part`+`rms_finish` 8 (2 launches per norm).
+
 ### The prefill is block-dispatch-bound (rocprofv3, pp512 + probe)
 
 A narrow rocprofv3 window (pp512 prefill only - the trace's window must exclude
