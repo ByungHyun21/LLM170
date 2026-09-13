@@ -125,6 +125,8 @@ use llm170_profiler::profile_span;
         let mut cpu_attn = false;   // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함)
 
         let seq_state = &mut *seq;
+        // 블록 키 캐시는 행마다 clone하지 않고 지역 버퍼로 승격한다(핫 루프 복사 제거).
+        let mut bk_local: Vec<f32> = std::mem::take(&mut seq_state.idx_bk[full_idx]);
         for t in 0..t_len {
             let pos = pos0 + t as u32;
             let (cache_k, cache_v, idx_cache) = {
@@ -154,10 +156,9 @@ use llm170_profiler::profile_span;
             let tail_start = n_blocks * r;
             // 블록 키 캐시 — 이 토큰 시점까지의 완전 블록만 유효 (증분).
             // 이전 청크가 계산한 키는 재사용, 신규 블록만 계산 (수치 동일).
-            let cached = seq_state.idx_bk[full_idx].clone();
-            if cached.len() < n_blocks * hp.idx_dim {
-                let mut ext = cached.clone();
-                for b in (cached.len() / hp.idx_dim)..n_blocks {
+            if bk_local.len() < n_blocks * hp.idx_dim {
+                let mut b = bk_local.len() / hp.idx_dim;
+                while b < n_blocks {
                     let mut pooled = vec![0.0f32; hp.idx_dim];
                     for j in 0..r {
                         let base = (b * r + j) * hp.idx_dim;
@@ -170,11 +171,11 @@ use llm170_profiler::profile_span;
                     }
                     let mut pk = rms_norm(&pooled, &ik_w, hp.eps);
                     rope_head(&mut pk, (b * r) as u32, hp.idx_dim, hp.rope_base);
-                    ext.extend_from_slice(&pk);
+                    bk_local.extend_from_slice(&pk);
+                    b += 1;
                 }
-                seq_state.idx_bk[full_idx] = ext;
             }
-            let bk_cache = seq_state.idx_bk[full_idx].clone();
+            let bk_cache: &[f32] = &bk_local[..n_blocks * hp.idx_dim];
             let mut q_rope: Vec<Vec<f32>> = Vec::with_capacity(hp.idx_heads);
             for h in 0..hp.idx_heads {
                 let mut qh = rms_norm(
@@ -189,10 +190,21 @@ use llm170_profiler::profile_span;
             for b in 0..n_blocks {
                 let pk = &bk_cache[b * hp.idx_dim..(b + 1) * hp.idx_dim];
                 for qh in &q_rope {
-                    let mut dot = 0.0f32;
-                    for i in 0..hp.idx_dim {
-                        dot += qh[i] * pk[i];
+                    // 4-누산기로 펼쳐 의존 사슬을 끊는다(SSE 4-wide 자동 벡터화).
+                    let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    let mut i = 0usize;
+                    while i + 4 <= hp.idx_dim {
+                        d0 += qh[i] * pk[i];
+                        d1 += qh[i + 1] * pk[i + 1];
+                        d2 += qh[i + 2] * pk[i + 2];
+                        d3 += qh[i + 3] * pk[i + 3];
+                        i += 4;
                     }
+                    while i < hp.idx_dim {
+                        d0 += qh[i] * pk[i];
+                        i += 1;
+                    }
+                    let dot = (d0 + d1) + (d2 + d3);
                     if dot > 0.0 {
                         block_score[b] += dot;
                     }
@@ -202,9 +214,16 @@ use llm170_profiler::profile_span;
             // 선택: 테일(강제) + 상위 B개 완전블록 — 폭 = min(n_past, top_k + r − 1)
             let width = n_past.min(hp.idx_top_k + r - 1);
             let tail_cnt = n_past - tail_start;
-            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
-            sel_blocks.sort_by(|&a, &b| block_score[b].partial_cmp(&block_score[a]).unwrap());
             let n_sel_blocks = ((width - tail_cnt) / r).min(n_blocks);
+            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
+            if n_sel_blocks < n_blocks {
+                // 상위 n_sel_blocks개만 필요 — 전체 정렬 대신 부분 선택(평균 O(n)).
+                sel_blocks.select_nth_unstable_by(n_sel_blocks, |&a, &b| {
+                    block_score[b]
+                        .partial_cmp(&block_score[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             let mut mask = vec![false; n_past];
             for j in tail_start..n_past {
                 mask[j] = true;
@@ -237,6 +256,7 @@ use llm170_profiler::profile_span;
             );
             attn_all[t] = attn_out;
         }
+        seq_state.idx_bk[full_idx] = bk_local;
         if tm {
             eprintln!("# qsa-stage sel+proj={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
             t_lap = std::time::Instant::now();
