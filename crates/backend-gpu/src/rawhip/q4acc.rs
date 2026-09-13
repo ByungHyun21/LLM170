@@ -51,6 +51,10 @@ struct MoeGroup {
     perm_d: u64,
     inv_d: u64,
     rowexp_d: u64,   // 행→전문가 (순열 후 순서) — 그룹 GEMM용
+    perm_pad_d: u64,
+    inv_pad_d: u64,
+    tilexp_d: u64,
+    rows_pad: usize,
     off: Vec<usize>,
 }
 
@@ -104,6 +108,11 @@ pub struct Q4Acc {
     yperm: std::sync::Mutex<GBuf>,
     rperm: std::sync::Mutex<GBuf>,
     rexp: std::sync::Mutex<GBuf>,
+    texp: std::sync::Mutex<GBuf>,
+    gxp: std::sync::Mutex<GBuf>,
+    gyp: std::sync::Mutex<GBuf>,
+    gp: std::sync::Mutex<GBuf>,
+    gi: std::sync::Mutex<GBuf>,
     rperm2: std::sync::Mutex<GBuf>,
     /// 그룹화 캐시(위 MoeGroup) + 무효화 세대(라우팅이 갱신될 때 증가).
     moe_group: std::sync::Mutex<Option<MoeGroup>>,
@@ -217,6 +226,11 @@ impl Q4Acc {
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
             rexp: std::sync::Mutex::new(GBuf::new("rexp")),
+            texp: std::sync::Mutex::new(GBuf::new("texp")),
+            gxp: std::sync::Mutex::new(GBuf::new("gxp")),
+            gyp: std::sync::Mutex::new(GBuf::new("gyp")),
+            gp: std::sync::Mutex::new(GBuf::new("gp")),
+            gi: std::sync::Mutex::new(GBuf::new("gi")),
             rperm2: std::sync::Mutex::new(GBuf::new("rperm2")),
             moe_group: std::sync::Mutex::new(None),
             quant_cache: std::sync::Mutex::new(None),
@@ -1026,12 +1040,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
                 .filter(|g| g.generation == generation && g.rows == rows)
-                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.off.clone()))
+                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.off.clone()))
         };
         if tm {
             eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        let (perm_d, inv_d, rowexp_d, off) = match hit {
+        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, off) = match hit {
             Some(v) => v,
             None => {
                 let mut lp = std::time::Instant::now();
@@ -1082,13 +1096,62 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     rowexp[p] = idv[(perm[p] as usize).min(rows - 1)].min((ne - 1) as u32);
                 }
                 self.ctx.h2d(rxd as *mut u8, bytemuck::cast_slice(&rowexp))?;
+                let mut off_pad = vec![0usize; ne + 1];
+                for e in 0..ne {
+                    off_pad[e + 1] = off_pad[e] + (off[e + 1] - off[e]).div_ceil(16) * 16;
+                }
+                let rows_pad = off_pad[ne].max(16);
+                let mut perm_pad = vec![0u32; rows_pad];
+                let mut inv_pad = vec![0u32; rows];
+                for e in 0..ne {
+                    let r = off[e + 1] - off[e];
+                    for i in 0..(off_pad[e + 1] - off_pad[e]) {
+                        let pd = off_pad[e] + i;
+                        if i < r {
+                            let src = off[e] + i;
+                            perm_pad[pd] = perm[src];
+                            inv_pad[perm[src] as usize] = pd as u32;
+                        } else {
+                            perm_pad[pd] = 0;
+                        }
+                    }
+                }
+                let mut tilexp = vec![0u32; rows_pad / 16];
+                for e in 0..ne {
+                    for tg in off_pad[e] / 16..off_pad[e + 1] / 16 {
+                        tilexp[tg] = e as u32;
+                    }
+                }
+                let (ppd, ipd, txd) = {
+                    let mut a = self.gp.lock().map_err(|e| e.to_string())?;
+                    let ppd = a.ensure(&self.ctx, rows_pad * 4)? as u64;
+                    let mut b = self.gi.lock().map_err(|e| e.to_string())?;
+                    let ipd = b.ensure(&self.ctx, rows * 4)? as u64;
+                    let mut c = self.texp.lock().map_err(|e| e.to_string())?;
+                    let txd = c.ensure(&self.ctx, (rows_pad / 16).max(1) * 4)? as u64;
+                    (ppd, ipd, txd)
+                };
+                if std::env::var_os("LLM170_GE5_DBG").is_some() {
+                    eprintln!(
+                        "# ge5 rows={rows} rows_pad={rows_pad} ne={ne} ppd={ppd} ipd={ipd} txd={txd} \
+perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
+                        &perm_pad[..perm_pad.len().min(4)],
+                        &inv_pad[..inv_pad.len().min(4)],
+                        &tilexp[..tilexp.len().min(4)],
+                        &off[..off.len().min(4)]
+                    );
+                }
+                self.ctx.h2d(ppd as *mut u8, bytemuck::cast_slice(&perm_pad))?;
+                self.ctx.h2d(ipd as *mut u8, bytemuck::cast_slice(&inv_pad))?;
+                self.ctx.h2d(txd as *mut u8, bytemuck::cast_slice(&tilexp))?;
                 if tm {
                     let ms = lp.elapsed().as_secs_f64() * 1e3;
                     if ms >= 0.05 { eprintln!("# moe-miss h2d={ms:.2}ms"); }
                 }
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
-                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd, off: off.clone() });
-                (pd, ivd, rxd, off)
+                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
+                    perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, off: off.clone() });
+                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, off)
             }
         };
         phase("group", &mut lap);
@@ -1111,6 +1174,59 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // 그룹 런치(옵트인) — q4_K 전문가를 한 번에: 청크당 런치 7.4만 → 48.
         // 호스트/갭 ~2.7초@pp2048 제거(KTRACE 실측). 산술은 _m과 동일(비트 동일).
         // 기본 경로 — 비트 동일(토큰 검증), pp2048 −1.8%, 런치 7.4만→48/청크.
+        // q5_1(다운) 그룹판 — 16배수 패딩 레이아웃으로 타일=전문가, 가중치 재독 1회.
+        if ws.ty == GgmlType::Q5_1 && !f32w && rows > 0 {
+            let xgp = {
+                let mut g = self.gxp.lock().map_err(|e| e.to_string())?;
+                g.ensure(&self.ctx, rows_pad * xq_w * 4)?
+            };
+            self.rows_permute_dev(xq as *mut u8, perm_pad_d as *mut u8, xgp, xq_w, rows_pad)?;
+            let ygp = {
+                let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
+                g.ensure(&self.ctx, rows_pad * n_out * 4)?
+            };
+            {
+                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+                let mut x_p = xgp as *mut std::ffi::c_void;
+                let mut w_p = wd as *mut std::ffi::c_void;
+                let mut o_p = ygp as *mut std::ffi::c_void;
+                let mut tx_p = tilexp_d as *mut std::ffi::c_void;
+                let (mut ni, mut no, mut xw, mut tt, mut ew) = (
+                    n_in as i32,
+                    n_out as i32,
+                    xq_w as i32,
+                    rows_pad as i32,
+                    (per_expert / 4) as i32,
+                );
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ew) as *mut _ as *mut std::ffi::c_void,
+                ];
+                let smem = (16 * (n_in / 32) * 24) as u32;
+                self.ctx.launch3_dyn(
+                    "q4_gemm_q5_1_gm",
+                    n_out.div_ceil(16).min(65535) as u32,
+                    rows_pad.div_ceil(16) as u32,
+                    1,
+                    256,
+                    smem,
+                    &mut args,
+                )?;
+            }
+            self.rows_permute_dev(ygp, inv_pad_d as *mut u8, op_, n_out, rows)?;
+            if tm {
+                eprintln!("# moe-phase TOTAL={:.2}ms rows={rows} ge5", t0.elapsed().as_secs_f64() * 1e3);
+            }
+            return Ok(());
+        }
         if ws.ty == GgmlType::Q4K && !f32w && rows > 0 {
             let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
             let mut x_p = xg as *mut std::ffi::c_void;
