@@ -557,9 +557,11 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             // 그 j가 GEMM의 읽기 범위 안. j별로 **다른 포인터**를 써야 f16 캐시(포인터 키)를
             // 피한다 — 257행 버퍼에서 j번째 행을 가중치 시작으로 넘긴다.
             {
+                // n_out=1 스캔: 가중치 1행 = 8블록 = 272B. j마다 **별도 슬롯(272B)** 을
+                // 포인터로 넘겨 캐시 키(포인터)를 회피하고, 1은 그 슬롯 안의 (j/32, j%32)에 둔다.
                 let row_bytes = (n_in / 32) * 34;
-                let big = ctx.alloc((n_out + 1) * row_bytes)?;
-                let zeros = vec![0u8; (n_out + 1) * row_bytes];
+                let big = ctx.alloc((n_in + 1) * row_bytes)?;
+                let zeros = vec![0u8; (n_in + 1) * row_bytes];
                 ctx.h2d(big, &zeros)?;
                 let mut covered = Vec::new();
                 let mut holes = Vec::new();
@@ -571,9 +573,9 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     let wptr = unsafe { big.add(j * row_bytes + (j / 32) * 34) };
                     ctx.h2d(wptr, &one)?;
                     let wp = unsafe { big.add(j * row_bytes) };
-                    ctx.gemm_f16_deq(8, xd as *const u8, wp as *const u8, n_in, n_out, 1, od)?;
+                    ctx.gemm_f16_deq(8, xd as *const u8, wp as *const u8, n_in, 1, 1, od)?;
                     ctx.sync()?;
-                    let mut oo = vec![0.0f32; n_out];
+                    let mut oo = vec![0.0f32; 1];
                     ctx.d2h(bytemuck::cast_slice_mut(&mut oo), od as *const u8)?;
                     if oo[0].abs() > 0.25 {
                         covered.push(j);
@@ -582,10 +584,11 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     }
                 }
                 out += &format!(
-                    "# 원소 커버리지: {}/{} (구멍 앞 12: {:?})\n",
+                    "# 원소 커버리지: {}/{} (구멍 앞 12: {:?}, covered: {:?})\n",
                     covered.len(),
                     n_in,
-                    &holes[..12.min(holes.len())]
+                    &holes[..12.min(holes.len())],
+                    covered
                 );
             }
             out += &format!(
