@@ -812,6 +812,11 @@ impl Q4Acc {
                     .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
                     .is_ok()
             {
+                // 임시 진단: LLM170_F16_DBG=1 이면 호출 직후 동기화해 실패 지점을 명명한다.
+                if std::env::var_os("LLM170_F16_DBG").is_some() {
+                    self.ctx.sync().map_err(|e| format!("f16 sync [{n_in}x{n_out}] t={t}: {e}"))?;
+                    eprintln!("f16-deq OK [{n_in}x{n_out}] t={t}");
+                }
             } else {
             self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
             }
