@@ -41,6 +41,24 @@ impl<'a> Weight<'a> {
 /// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
 /// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
 pub trait Accelerator: FrameState + Send + Sync {
+    /// 그래프 캡처 시작/종료·재생 — 미지원 백엔드는 Err (드라이버가 폴백).
+    fn graph_capture_begin(&self) -> Result<(), String> {
+        Err("graph capture: 미지원".into())
+    }
+    fn graph_capture_end(&self) -> Result<(), String> {
+        Err("graph capture: 미지원".into())
+    }
+    fn graph_replay(&self, _on: bool) -> Result<(), String> {
+        Err("graph capture: 미지원".into())
+    }
+
+    /// 그래프 캡처 세그먼트 경계 — 스텝 내 호스트 왕복(d2h/h2d) 지점에서 호출된다.
+    /// 캡처 구현체는 이 지점에서 현재 세그먼트를 닫고 다음을 연다(재생 시엔 순서대로 발사).
+    /// 기본 no-op — 그래프를 지원하지 않는 백엔드는 그대로 둔다.
+    fn capture_mark(&self, _tag: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn rms_norm(
         &self,

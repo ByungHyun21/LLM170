@@ -354,6 +354,7 @@ pub fn frame_forward(
             }
         }
         acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+        acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
     }
 
     // PLE n-gram 행 (호스트 해시)
@@ -374,11 +375,13 @@ pub fn frame_forward(
         // 1) PLE (blk.1) — CPU 브리지: res_hc 판독 → CPU → 기록
         if hp.is_ple(il) {
             let mut r = vec![0.0f32; t * hc * n];
+            acc.capture_mark("ple_in").map_err(Q4Error::Io)?;
             acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
             let mut rows: Vec<Vec<f32>> = r.chunks_exact(hc * n).map(|c| c.to_vec()).collect();
             stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
             let flat: Vec<f32> = rows.concat();
             acc.frame_write(f.res_hc, &flat).map_err(Q4Error::Io)?;
+            acc.capture_mark("ple_out").map_err(Q4Error::Io)?;
             sync_mark(acc, "hc.ple_bridge", f.res_hc)?;
         }
 
@@ -407,6 +410,7 @@ pub fn frame_forward(
             let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
             let mut ql = std::time::Instant::now();
             let mut mix_v = vec![0.0f32; t * n];
+            acc.capture_mark("recr_in").map_err(Q4Error::Io)?;
             acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
             let read_ms = ql.elapsed().as_secs_f64() * 1e3;
             ql = std::time::Instant::now();
@@ -416,6 +420,7 @@ pub fn frame_forward(
             ql = std::time::Instant::now();
             let flat: Vec<f32> = out.concat();
             acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
+            acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             if qtm {
                 eprintln!(
                     "# qsa-bridge L{il} t={t} read(d2h+드레인)={read_ms:.1}ms stage={stage_ms:.1}ms write(h2d)={:.1}ms",
@@ -463,6 +468,7 @@ pub fn frame_forward(
         let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
         let mut logits = vec![0.0f32; hp.vocab];
+        acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
         ftime_report(t);
         if ftime_on() {

@@ -64,6 +64,9 @@ pub struct Engine4 {
     pub frame: Option<super::frame::Frame4>,
     /// 프레임 폴백 확정 — 상주 불가 등 오류 시 value 경로로 영구 전환.
     frame_broken: bool,
+    /// 디코드 그래프 캡처(LLM170_GRAPH=1) — 0=워밍, 1=캡처, 2+=재생.
+    graph_want: bool,
+    graph_step: usize,
     /// PLE 프리페치 (05-2) — 토큰 t 확정 직후 t+1분 16행×ple_head_dim을
     /// 사이드 스레드에서 mmap 읽기+디양자화. 다음 decode의 ple_block이 소비.
     pub ple_next: Option<std::sync::Arc<std::sync::Mutex<PlePrefetched>>>,
@@ -142,7 +145,12 @@ fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
-        Engine4 { model, seqs, acc: None, frame: None, frame_broken: false, ple_next: None, ple_consume: None, ple_worker: None }
+        Engine4 {
+            model, seqs, acc: None, frame: None, frame_broken: false,
+            graph_want: std::env::var_os("LLM170_GRAPH").is_some(),
+            graph_step: 0,
+            ple_next: None, ple_consume: None, ple_worker: None,
+        }
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
@@ -434,7 +442,25 @@ impl Engine4 {
         let logits = if let (true, Some(())) = (frame_on, frame_try.as_ref().filter(|_| self.frame.is_some()).map(|_| ())) {
             let acc = self.acc.as_deref().unwrap();
             let f = self.frame.as_mut().unwrap();
-            let r = (|| {
+            // 그래프 캡처(LLM170_GRAPH=1): 스텝1 = 캡처, 스텝2+ = 재생.
+            // 캡처 중에는 커널이 *기록만* 되고 실행되지 않으므로(상태 미진행,
+            // 호스트 판독은 직전 값) 캡처 스텝은 결과를 버리고 같은 토큰으로
+            // 즉시 재생해 실제 진행·정답 로짓을 얻는다.
+            let cap = self.graph_want;
+            let cap_step = cap && self.graph_step == 1;
+            let rep_step = cap && self.graph_step >= 2;
+            if cap_step {
+                if let Err(e) = acc.graph_capture_begin() {
+                    eprintln!("# graph: 캡처 시작 실패 — 정상 경로 ({e})");
+                    self.graph_want = false;
+                }
+            } else if rep_step {
+                if let Err(e) = acc.graph_replay(true) {
+                    eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
+                    self.graph_want = false;
+                }
+            }
+            let mut run_step = || -> Result<Vec<f32>, Q4Error> {
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
                 }
@@ -442,7 +468,36 @@ impl Engine4 {
                 super::frame::decode_frame(
                     acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
                 )
-            })();
+            };
+            let r0 = run_step();
+            let r = if cap_step {
+                let close = acc.graph_capture_end();
+                match close {
+                    Err(e) => {
+                        eprintln!("# graph: 캡처 실패 — 정상 경로 유지 ({e})");
+                        self.graph_want = false;
+                        r0
+                    }
+                    Ok(()) => {
+                        if let Err(e) = acc.graph_replay(true) {
+                            eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
+                            self.graph_want = false;
+                            r0
+                        } else {
+                            let r1 = run_step();
+                            let _ = acc.graph_replay(false);
+                            self.graph_step += 1;
+                            r1
+                        }
+                    }
+                }
+            } else {
+                if rep_step {
+                    let _ = acc.graph_replay(false);
+                    self.graph_step += 1;
+                }
+                r0
+            };
             match r {
                 Ok(l) => l,
                 Err(e) => {

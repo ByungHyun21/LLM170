@@ -1065,6 +1065,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, off) = match hit {
             Some(v) => v,
             None => {
+                // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
+                // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
+                crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in")?;
                 let mut lp = std::time::Instant::now();
                 let idp = self.fptr(ids)?;
                 let mut idv = vec![0u32; rows];
@@ -1165,6 +1168,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     let ms = lp.elapsed().as_secs_f64() * 1e3;
                     if ms >= 0.05 { eprintln!("# moe-miss h2d={ms:.2}ms"); }
                 }
+                crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out")?;
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                 *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
                     perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, off: off.clone() });
@@ -1554,6 +1558,19 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::Accelerator for Q4Acc {
+    fn capture_mark(&self, tag: &str) -> Result<(), String> {
+        crate::rawhip::capture_mark(self.ctx.stream, tag)
+    }
+    fn graph_capture_begin(&self) -> Result<(), String> {
+        crate::rawhip::graph_capture_begin(self.ctx.stream)
+    }
+    fn graph_capture_end(&self) -> Result<(), String> {
+        crate::rawhip::graph_capture_end(self.ctx.stream)
+    }
+    fn graph_replay(&self, on: bool) -> Result<(), String> {
+        crate::rawhip::graph_replay(on)
+    }
+
     fn barrier(&self) {
         unsafe {
             let _ = ck(hip::hipDeviceSynchronize(), "hipDeviceSynchronize");
