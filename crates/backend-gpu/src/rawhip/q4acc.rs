@@ -105,6 +105,9 @@ pub struct Q4Acc {
     rperm2: std::sync::Mutex<GBuf>,
     /// 그룹화 캐시(위 MoeGroup) + 무효화 세대(라우팅이 갱신될 때 증가).
     moe_group: std::sync::Mutex<Option<MoeGroup>>,
+    /// 활성 양자화 캐시 — 전문가별 GEMM 256회가 같은 행 집합을 재양자화하던 것
+    /// (호출당 ~40us)을 1회로. 버퍼(fxq)가 단일 슬롯이라 새 양자화가 곧 교체다.
+    quant_cache: std::sync::Mutex<Option<(usize, usize, u64, u64, usize)>>,
     moe_gen: std::sync::atomic::AtomicU64,
 }
 
@@ -213,6 +216,7 @@ impl Q4Acc {
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
             rperm2: std::sync::Mutex::new(GBuf::new("rperm2")),
             moe_group: std::sync::Mutex::new(None),
+            quant_cache: std::sync::Mutex::new(None),
             moe_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -410,8 +414,19 @@ impl Q4Acc {
         if f32w {
             return self.launch_gemm_f32(x, wd, n_in, n_out, t, out);
         }
+        // llama MMQ 경로(부록5: q4_K maxrel 6e-4) — qwen35 raw 디코더가 쓰는
+        // 바로 그 mul_mat_q 커널. f32 활성을 직접 양자화하므로 frame_quant를
+        // 건너뛴다. 형상은 qwen35와 같은 게이트(t>=32).
+        let ty = ggml_id(w.ty);
+        if t >= 32
+            && matches!(ty, 12 | 13 | 14 | 23)
+            && std::env::var_os("LLM170_Q4_MMQ").is_some()
+            && self.ctx.gemm_mmq(ty, x as *const u8, wd, n_in, n_out, t, out).is_ok()
+        {
+            return Ok(());
+        }
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
-        self.launch_gemm(ggml_id(w.ty), xq, wd, n_in, n_out, xq_w, t, out)
+        self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, out)
     }
 
     /// 프레임 op 런치 헬퍼 — gx/gy/gz + 32/64/128/256 스레드.
@@ -446,8 +461,107 @@ impl Q4Acc {
         // (x1=it*16, x2=it*16+8)이 의심 지점.
         if ty == ggml_id(GgmlType::Q4K)
             && t >= 16
-            && std::env::var_os("LLM170_Q4K_MMQ").is_some()
+            && (std::env::var_os("LLM170_Q4K_MMQ").is_some()
+                || std::env::var_os("LLM170_Q4K_OUTS").is_some())
         {
+            // 행-배치 타일(plans/65) — 가중치 디퀀트를 행 루프 밖으로.
+            if std::env::var_os("LLM170_Q4K_Y").is_some() {
+                let rpt: usize = std::env::var("LLM170_Q4K_YRPT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                // 커널이 += 누산이므로 출력을 0으로 초기화한다(출력 버퍼는 매
+                // 호출 새로 쓰이는 스크래치라 안전).
+                unsafe {
+                    std::ptr::write_bytes(out as *mut f32, 0, t * n_out);
+                }
+                let mut xq_p = xq as *mut std::ffi::c_void;
+                let mut w_p = w as *mut std::ffi::c_void;
+                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+                let mut o_p = out as *mut std::ffi::c_void;
+                let (mut ni, mut no, mut xw, mut tt, mut rp) =
+                    (n_in as i32, n_out as i32, xq_w as i32, t as i32, rpt as i32);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut rp) as *mut _ as *mut std::ffi::c_void,
+                ];
+                return self.ctx.launch3(
+                    "q4_gemm_q4k_y",
+                    n_out.div_ceil(256) as u32,
+                    t.div_ceil(rpt) as u32,
+                    1,
+                    256,
+                    &mut args,
+                );
+            }
+            // x-스테이징 타일(plans/65) — 출력별 x 재독 제거. 로직·순서는 _m과 동일.
+            if std::env::var_os("LLM170_Q4K_X").is_some() {
+                let mut xq_p = xq as *mut std::ffi::c_void;
+                let mut w_p = w as *mut std::ffi::c_void;
+                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+                let mut o_p = out as *mut std::ffi::c_void;
+                let (mut ni, mut no, mut xw, mut tt) =
+                    (n_in as i32, n_out as i32, xq_w as i32, t as i32);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                ];
+                return self.ctx.launch3(
+                    "q4_gemm_q4k_x",
+                    n_out.div_ceil(16) as u32,
+                    t.div_ceil(16) as u32,
+                    1,
+                    256,
+                    &mut args,
+                );
+            }
+            // 형상 스윕용 가변 타일(plans/65) — outs/rows를 env로 지정.
+            if let (Ok(outs), Ok(rows)) = (
+                std::env::var("LLM170_Q4K_OUTS").map(|v| v.parse::<usize>()),
+                std::env::var("LLM170_Q4K_ROWS").map(|v| v.parse::<usize>()),
+            ) {
+                let (outs, rows) = (outs.unwrap_or(16), rows.unwrap_or(16));
+                let mut xq_p = xq as *mut std::ffi::c_void;
+                let mut w_p = w as *mut std::ffi::c_void;
+                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+                let mut o_p = out as *mut std::ffi::c_void;
+                let (mut ni, mut no, mut xw, mut tt) =
+                    (n_in as i32, n_out as i32, xq_w as i32, t as i32);
+                let (mut oo, mut rr) = (outs as i32, rows as i32);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut oo) as *mut _ as *mut std::ffi::c_void,
+                    (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                ];
+                return self.ctx.launch3(
+                    "q4_gemm_q4k_g",
+                    n_out.div_ceil(outs) as u32,
+                    t.div_ceil(rows) as u32,
+                    1,
+                    (outs * rows) as u32,
+                    &mut args,
+                );
+            }
             let mut xq_p = xq as *mut std::ffi::c_void;
             let mut w_p = w as *mut std::ffi::c_void;
             let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
@@ -842,10 +956,26 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let (wd, f32w) = self.dev_weight(ws)?;
         let per_expert = ws.data.len() / n_expert_stack.max(1);
         phase("weight", &mut lap);
+        let gen_q = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
         let (xq, xq_w) = if f32w {
             (std::ptr::null_mut(), 0usize)
         } else {
-            self.frame_quant(xp, n_in, rows)?
+            let key = (xp as usize, rows, gen_q);
+            let hit = {
+                let c = self.quant_cache.lock().map_err(|e| e.to_string())?;
+                c.as_ref()
+                    .filter(|(xp0, r0, g0, _, _)| (*xp0, *r0, *g0) == key)
+                    .map(|(_, _, _, q, w)| (*q as *mut u8, *w))
+            };
+            match hit {
+                Some(v) => v,
+                None => {
+                    let (q, w) = self.frame_quant(xp, n_in, rows)?;
+                    let mut c = self.quant_cache.lock().map_err(|e| e.to_string())?;
+                    *c = Some((key.0, key.1, key.2, q as u64, w));
+                    (q, w)
+                }
+            }
         };
         phase("quant", &mut lap);
         let ne = n_expert_stack.max(1);
@@ -1277,11 +1407,27 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         let f32_family = |ty: GgmlType| matches!(ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
         let f32w = f32_family(ws[0].ty);
         if ws.iter().all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w) && !f32w {
-            let (xq, xq_w) = self.frame_quant(xp, ws[0].n_in as usize, t)?;
+            // llama MMQ 우선(옵트인) — 같은 입력을 여러 커널이 공유하는 그룹이라
+            // 항목별로 MMQ 가능 타입이면 MMQ를 쓰고 나머지는 기존 타일로 간다.
+            let mmq_on = t >= 32 && std::env::var_os("LLM170_Q4_MMQ").is_some();
+            let (xq, xq_w) = if mmq_on {
+                (std::ptr::null_mut(), 0usize)
+            } else {
+                self.frame_quant(xp, ws[0].n_in as usize, t)?
+            };
             for (w, o) in ws.iter().zip(outs) {
                 let (wd, _) = self.dev_weight(w)?;
                 let op = self.fptr(*o)?;
-                self.launch_gemm(ggml_id(w.ty), xq, wd, w.n_in as usize, w.n_out as usize, xq_w, t, op)?;
+                let ty = ggml_id(w.ty);
+                let n_in = w.n_in as usize;
+                let n_out = w.n_out as usize;
+                if mmq_on && matches!(ty, 12 | 13 | 14 | 23)
+                    && self.ctx.gemm_mmq(ty, xp as *const u8, wd, n_in, n_out, t, op).is_ok()
+                {
+                    continue;
+                }
+                let (xqi, xwi) = if mmq_on { self.frame_quant(xp, n_in, t)? } else { (xq, xq_w) };
+                self.launch_gemm(ty, xqi, wd, n_in, n_out, xwi, t, op)?;
             }
             return Ok(());
         }

@@ -307,3 +307,29 @@ extern "C" __global__ void rmsq_rows(const float* x, const float* w, unsigned* x
         xq[nwords + nblk + 2 * (base >> 5) + 1] = (unsigned)qs1;
     }
 }
+
+// q4_K(ggml 표준 블록 144B) → f16 256값 전개. 요소 순서는 행 순서 그대로
+// (저니블 = it*64+0..31, 고니블 = it*64+32..63). 밀집 가중치(전문가 제외)를
+// 영구 f16 캐시에 올려 텐서코어 GEMM에 넘기기 위한 전처리.
+extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
+                                           __half* __restrict__ out, int nsuper, int n_out) {
+    int o = blockIdx.x, blk = blockIdx.y;
+    if (o >= n_out) return;
+    const unsigned char* wb = w + ((size_t)o * nsuper + blk) * 144;
+    float d = bits_f16((unsigned)wb[0] | ((unsigned)wb[1] << 8));
+    float dmin = bits_f16((unsigned)wb[2] | ((unsigned)wb[3] << 8));
+    const unsigned char* sc = wb + 4;
+    const unsigned char* qs = wb + 16;
+    int e = threadIdx.x;              // 0..255
+    int it = e >> 6;
+    int l = e & 63;
+    int j = (l < 32) ? (2 * it) : (2 * it + 1);
+    unsigned s, mn;
+    if (j < 4) { s = sc[j] & 63u; mn = sc[j + 4] & 63u; }
+    else { s = (sc[j + 4] & 0xFu) | ((unsigned)(sc[j - 4] >> 6) << 4);
+           mn = (sc[j + 4] >> 4) | ((unsigned)(sc[j] >> 6) << 4); }
+    unsigned char byte = qs[it * 32 + (l & 31)];
+    unsigned q = (l < 32) ? (byte & 0xFu) : (byte >> 4);
+    float v = d * (float)s * (float)q - dmin * (float)mn;
+    out[((size_t)o * nsuper + blk) * 256 + e] = __float2half(v);
+}
