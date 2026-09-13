@@ -337,8 +337,15 @@ row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
 
 | Condition | LLM170 (rawhip) | llama.cpp (276.68 t/s) | gap |
 |---|---|---|---|
-| pp 11,750 | **60.88 s** (193.0 t/s) | 42.47 s | **1.43x** |
-| pp 2,048 | 9,814 ms (208.7 t/s) | — | — |
+| pp 11,750 | **57.70 s** (203.7 t/s) | 42.47 s | **1.36x** |
+| pp 2,048 | 9,094 ms (225.2 t/s) | — | — |
+
+The two host-side changes behind that (both bit-identical, verified by tokens):
+the QSA/PLE stage thread caps went from 16 to 32 (16 cores x SMT; while the host
+stages compute the GPU has nothing to run - the profiler's ~25 % idle), and QSA
+pass A (per-token KV cache, indexer raw-k, q_rope) was parallelized with the
+order-dependent block-key pooling split into its own pass. Together: pp11750
+60,500 -> 57,697 ms (-4.6 %), pp2048 9,814 -> 9,094 ms (-7.3 %).
 
 The 79.70 s figure above becomes 77.92 s with the mask flatten in
 `stages/qsa.rs` parallelized over tokens (it was a serial 24M-element push of a
