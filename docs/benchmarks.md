@@ -337,8 +337,8 @@ row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
 
 | Condition | LLM170 (rawhip) | llama.cpp (276.68 t/s) | gap |
 |---|---|---|---|
-| pp 11,750 | **77.92 s** (150.8 t/s) | 42.47 s | **1.83x** |
-| pp 2,048 | 10,016 ms (204.5 t/s) | — | — |
+| pp 11,750 | **60.88 s** (193.0 t/s) | 42.47 s | **1.43x** |
+| pp 2,048 | 9,814 ms (208.7 t/s) | — | — |
 
 The 79.70 s figure above becomes 77.92 s with the mask flatten in
 `stages/qsa.rs` parallelized over tokens (it was a serial 24M-element push of a
@@ -351,7 +351,16 @@ now walked directly - 5.7x fewer iterations at 11,750 and no divergence.
 `q4-qsa-check` proves the two kernels are **bit-identical** (identical
 arithmetic order) at t=64/n_past=4096 and t=128/n_past=11750.
 
-### The attention kernel is now the single largest kernel (traffic-bound)
+The 77.92 s figure becomes **60.88 s** with the 4-heads-per-warp kernel
+(`q4_qsa_attn_sel4`, commit `a338b48`): the indexer selection is **per token**
+(its score sums over the indexer heads), so four query heads of the same token
+share one warp and read each selected K/V row once instead of four times - a
+quarter of the traffic. Arithmetic per head is unchanged and the probe reports
+`sel4_bit_diff=0` against `_sel` at t=64/128/256, so results are identical
+(harness tokens unchanged). Decode keeps the one-head-per-warp kernel for
+t<=3, where the 4-head block would leave most warps idle (195 vs 203 ms/step).
+
+### The attention kernel was the largest kernel (traffic-bound)
 
 KTRACE at pp11750: total kernel time 45.0 s of the 76.4 s wall, of which
 **`q4_qsa_attn_sel` is 17.9 s (72 launches, 248 ms each)** - 40 % of all kernel
@@ -367,8 +376,11 @@ heads map to 2 KV heads, so a 12x traffic reduction is available), i.e. a
 flash-style block over (tokens x head-group) rather than one warp per
 (token, head). Expected ~15 s per chunk = ~20 % of the prefill.
 
-Decode at 8,192 context: **195 ms/step** (5.13 t/s, 3 steps) - down from
-~250 ms/step at the same context before the selection kernel.
+Decode: **156 ms/step at 2,048 context** (6.41 t/s) and 195 ms/step at 8,192.
+The decode is the same kernel at t=1, where only 24 warps exist (one per head),
+so it is latency/occupancy-bound rather than at the L2 limit: a split-K variant
+(like the value path's `qsa_flash_split4q4` + merge) over the selection list is
+the next step and would give the same 4x concurrency.
 
 Two consecutive runs measured 79,730.4 and 79,703.7 ms. The earlier 117.1 s row
 in the history above is **not reproducible today** under identical flags; the
