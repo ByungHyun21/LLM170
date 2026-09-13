@@ -378,16 +378,19 @@ full workspace test suite:
 | Stage @11,750 tok | before | after |
 |---|---|---|
 | QSA `sel+proj` (indexer, CPU) | 51.6 s | **10.0 s** |
-| QSA `attn` (kernel) | 50.5 s | **34.3 s** |
+| QSA `attn` (kernel) | 50.5 s | **30.5 s** |
 | QSA total | 107.3 s | 50.0 s |
-| prefill wall clock (incl. load) | 213.9 s | **158.6 s** |
+| prefill wall clock (incl. load) | 213.9 s | **155.2 s** |
 
 - Indexer: the per-row clone of the block-key cache was hoisted to a local
   buffer, the full sort became a partial select, and the dot was unrolled to 4
   accumulators; the per-row work then moved into a parallel pass (one scoped
   thread group per layer-chunk; per-row spawning regressed and was rejected).
 - Attention: the shared dot product in `q4_qsa_attn` used a single accumulator
-  and was latency-bound; a 4-accumulator unroll gave 1.5-2.2x.
+  and was latency-bound (4-accumulator unroll, 1.5-2.2x); the score phase then
+  moved to warp-per-key with lane=dim so its loads are coalesced (a further
+  1.13-1.33x). An "iterate only the selected keys" variant was implemented,
+  measured neutral, and reverted.
 
 Remaining at 11,750: `attn` 34.3 s, expert `moe.gemm3` ~44 s (of which ~18 s is
 the one-time expert-weight upload in the first chunk), `sel+proj` 10 s.
