@@ -204,6 +204,26 @@ over a short decode (bench --pp 24 --tg 4), and compare the per-kernel fetched b
 against the tensor sizes the kernel should touch. Keep the profile to a single step;
 whole-run counter collection is not safe on this machine.
 
+## qwen4exp decode: the MoE grouping round trip and the device-side attempt (2026-09-14)
+
+The per-layer MoE grouping is the decode's largest single cost. Skipping the
+moe.top10 stage (which also keeps the grouping cache valid) runs tg8 in 497.5 ms
+versus 770.4 ms normally, i.e. the round trip - a synchronous d2h of the routing
+ids, the host table build and three h2d uploads, 48 times per step - costs
+34 ms/step. Removing it alone would put the decode at 62 ms/step, level with
+llama.cpp's 61 on this model.
+
+A device-side grouping kernel (q4_moe_group_t1) builds the same tables on the GPU
+and is bit-identical (the diverse prompt output is unchanged), and it also has a
+block-parallel form, but the path measures 1009-1011 ms against the host path's
+770, so it is opt-in behind LLM170_MOE_GROUP_DEV. Its additions were isolated in
+the micro test (group kernel 30.95 us/call, d2h_issue+d2h_wait 15.98 us/call, about
+3.8 ms/step together) and a forced-bound experiment put the enlarged buffers at only
+2.4 ms/step, so every added operation is excluded and the remaining candidate is the
+changed stream ordering: the host path drains the stream at its ids d2h where the
+device path does not. Decisive next experiment: drop d2h_issue from the device path
+and re-run the A/B to separate ordering from added work.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
