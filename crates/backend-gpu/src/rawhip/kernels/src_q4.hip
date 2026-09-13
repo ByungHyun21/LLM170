@@ -500,7 +500,7 @@ extern "C" __global__ void q4_qsa_attn_wt(const float* q, const float* ck, const
                                            int n_past, int n_head, int n_kv, int hd, int t) {
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int tok = (int)blockIdx.x * 8 + wid;
+    int tok = (int)blockIdx.x * 16 + wid;   // 블록당 16토큰 = K/V 행 재사용 2배
     int h = blockIdx.y;
     if (tok >= t || h >= n_head || hd != 256) return;
     int kvh = h / (n_head / n_kv);
