@@ -431,9 +431,16 @@ The top kernels are all over-parallelised:
 | kernel | grid | blocks | note |
 |---|---|---|---|
 | `q4_l2_rows` | (1048576,1,1) x32 | **1,048,576** | one 128-wide row per block; the row count comes from the *max-t* buffer (`flen/d`), of which only ~t are live |
-| `q4_gemm_q4k_ge` | (10240,320,1) x256 | **3,276,800** | its 1,949 us is almost entirely dispatch (3.3M x 0.75 ns ~ 2.5 ms) |
-| `q4_gemm_f32_m` | (8192,32,1) x256 | 262,144 | MoE router, 0.4 GFLOP at ~0.7 TFLOPS, 48x its memory-bound time |
+| `q4_gemm_q4k_ge` | 40x320 x256 (measured: n_in=2560, n_out=640, rows=5120) | 12,800 | **efficient** - 8.4 GFLOP in 1,949 us = 4.4 TFLOPS int8 |
 | `gemm_q8_j128` | (20480,1,4) x256 | 81,920 | 128x128 tiles, the healthy reference |
+
+An earlier reading of this table attributed a (10240,320) grid to `q4_gemm_q4k_ge`
+and called it dispatch-dominated; instrumenting the launcher shows the real
+shape (n_in=2560, n_out=640, rows=5120 -> 40x320 blocks) and the kernel runs at
+4.4 TFLOPS, i.e. it is *not* a target. The f32 router GEMM is the outlier: its
+grid is sized correctly (gx = n_out/16, gy = t/16) so the ~1.3 TFLOPS it reaches
+is the kernel's *inner loop*, a mixed f32-weight x int8-activation dot at ~11 %
+of the device's f32 peak.
 
 The tile path is load-bearing: forcing the GEMV fallback (`LLM170_Q4_NO_TILE=1`)
 slows the 512-token prefill from 2,420 ms to 8,450 ms (3.5x).

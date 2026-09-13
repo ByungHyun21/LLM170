@@ -1269,6 +1269,25 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
                 (&mut eb) as *mut _ as *mut std::ffi::c_void,
             ];
+            {
+                use std::sync::Mutex;
+                use std::sync::OnceLock;
+                static SEEN: OnceLock<Mutex<Vec<(usize, usize, usize)>>> = OnceLock::new();
+                if std::env::var_os("LLM170_Q4_DBG").is_some() {
+                    let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
+                    if let Ok(mut v) = seen.lock() {
+                        let key = (n_in, n_out, rows);
+                        if !v.contains(&key) && v.len() < 8 {
+                            v.push(key);
+                            eprintln!(
+                                "# q4_gemm_q4k_ge: n_in={n_in} n_out={n_out} rows={rows} blocks={}x{}",
+                                n_out.div_ceil(16),
+                                rows.div_ceil(16)
+                            );
+                        }
+                    }
+                }
+            }
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
                 n_out.div_ceil(16) as u32,
