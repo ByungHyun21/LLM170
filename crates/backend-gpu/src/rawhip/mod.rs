@@ -1512,3 +1512,78 @@ impl RawCtx {
 
 pub mod probes;
 pub use probes::*;
+
+#[cfg(test)]
+mod micro_tests {
+    use super::*;
+
+    /// 런치 비용 분해 — 호스트 enqueue와 디바이스 디스패치를 가른다.
+    /// 디코드 스텝은 ~3,222런치가 129ms를 쓰는데, 그 37µs/런치가 호스트인지
+    /// 디바이스인지가 다음 수(융합 vs 배관)를 정한다.
+    #[test]
+    fn launch_cost_split() {
+        let ctx = RawCtx::new().expect("ctx");
+        let n = 1024i32;
+        let a = ctx.scratch(4096).expect("a");
+        let b = ctx.scratch(4096).expect("b");
+        let launch = || {
+            let (mut ap, mut bp) = (a as *mut std::ffi::c_void, b as *mut std::ffi::c_void);
+            let (mut nn, mut rr) = (n, 1i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut ap) as *mut _ as *mut std::ffi::c_void,
+                (&mut bp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("bcast_rows", 8, 1, 1, 128, &mut args).unwrap();
+        };
+        for _ in 0..20 {
+            launch();
+        }
+        ctx.sync().unwrap();
+        const N: usize = 2000;
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            launch();
+        }
+        let enq = t0.elapsed().as_secs_f64() * 1e3;
+        ctx.sync().unwrap();
+        let total = t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "# micro {N}런치: host-enqueue {enq:.1}ms ({:.2}µs/런치), sync포함 총 {total:.1}ms ({:.2}µs/런치)",
+            enq / N as f64 * 1e3,
+            total / N as f64 * 1e3
+        );
+
+        // 이상 커널 격리 — q4_l2_rows(d=2560, 1블록×32스레드). 디코드에서
+        // 0.34ms/회로 관측된 그 커널이 정말 그런지, 아니면 측정 맥락 탓인지.
+        let x = ctx.scratch(2560 * 4).expect("x");
+        let launch_l2 = || {
+            let mut xp = x as *mut std::ffi::c_void;
+            let mut e = 1e-6f32;
+            let mut d = 2560i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut xp) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut d) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("q4_l2_rows", 1, 1, 1, 32, &mut args).unwrap();
+        };
+        for _ in 0..20 {
+            launch_l2();
+        }
+        ctx.sync().unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..N {
+            launch_l2();
+        }
+        let enq2 = t1.elapsed().as_secs_f64() * 1e3;
+        ctx.sync().unwrap();
+        let total2 = t1.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "# micro q4_l2_rows(d=2560) {N}런치: host {enq2:.1}ms ({:.2}µs/런치), 총 {total2:.1}ms ({:.2}µs/런치)",
+            enq2 / N as f64 * 1e3,
+            total2 / N as f64 * 1e3
+        );
+    }
+}
