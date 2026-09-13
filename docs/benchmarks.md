@@ -5104,3 +5104,32 @@ the kernels themselves are microseconds.
 Fix direction: build those tables on the device (they are pure functions of the ids),
 which removes the round trip and keeps the results bit-identical; the prefill can keep
 the host path. This also unblocks the graph capture facility (segments collapse).
+
+## qwen4exp: the weight read pattern is the bottleneck (measured 2026-09-14)
+
+A strided-read probe (rawhip kernels::bw_strided, 576 MB, four passes) reproduces the
+weight access pattern and settles the long-standing "effective bandwidth" mystery:
+
+| mode | pattern | touched range | bytes actually used |
+|---|---|---|---|
+| 0 | sequential, scalar 4 B | 267 GB/s | 7.4 GB/s |
+| 1 | q4_K block stride (144 B), scalar | 235 GB/s | **6.5 GB/s** |
+| 2 | same stride, 16 B vector loads | 266 GB/s | **29.6 GB/s** |
+
+The DRAM is fine - every mode moves 235-267 GB/s through the memory system. What is
+wrong is utilisation: the q4_K kernels read 4 bytes out of each 144-byte block with
+per-thread scalar loads, so a 128-byte line delivers ~4 useful bytes (a 36x waste).
+Mode 2 shows that merely vectorising the same pattern recovers 4.5x.
+
+This is the common cause behind the decode, the prefill (MoE -39% of a 2048-token
+prefill) and the 27B's apparent "bandwidth bound": the weights are device-resident
+(dev_weight uploads once and caches by mmap pointer, verified) but are read through
+the worst possible pattern.
+
+Fix, in order: (1) vectorise the weight loads in the q4_K/q5_1/q8_0 grouped and dense
+kernels - a 4.5x weight-bandwidth recovery, independent of any format change;
+(2) the bf16 dequant cache of plans/66 P1, which turns the layout contiguous so the
+sequential mode (267 GB/s) applies, at the cost of 2x the bytes - a 36x pattern gain
+against a 2x volume loss. The 27B record is corrected accordingly: its decode is not
+at the bandwidth bound, it is at the pattern bound, so P1 applies there too.
+

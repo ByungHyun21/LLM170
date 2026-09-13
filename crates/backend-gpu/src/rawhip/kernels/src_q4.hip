@@ -552,6 +552,30 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
 // 테이블은 ids의 순수 함수라 GPU에서 만들면 왕복이 사라진다.
 // 호스트판과 **동일 순서**(안정 카운팅, 전문가 id 오름차순, 16행 정렬 패딩) →
 // 테이블 동일 → GEMM 결과 비트 동일. 단일 스레드(ne≤512, rows=10).
+// bw_strided — 가중치 접근 패턴 재현 프로브. q4_K 블록(144B)을 스칼라로
+// 읽는 방식(스레드가 같은 오프셋, 행 간 144B 스트라이드)이 실효 대역을
+// 얼마나 깎는지 측정한다(2026-09-14: 디코드·프리필의 저대역 미스터리 규명용).
+// mode 0 = 순차, mode 1 = 144B 스트라이드(블록 내 스칼라), mode 2 = 스트라이드
+// 이지만 워드 단위 벡터 로드.
+extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsigned* __restrict__ acc,
+                                      int nblocks, int mode) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)nblocks) return;
+    const unsigned char* p = w + i * 144;
+    unsigned v = 0;
+    if (mode == 0) {
+        v = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+    } else if (mode == 1) {
+        // 스칼라 4회(가중치 커널의 실제 패턴: 블록 내 소량만 읽음)
+        v = (unsigned)p[0] ^ (unsigned)p[4] ^ (unsigned)p[16] ^ (unsigned)p[80];
+    } else {
+        const uint4* q = (const uint4*)(p + 16);
+        uint4 t = *q;
+        v = t.x ^ t.y ^ t.z ^ t.w;
+    }
+    if (v == 0xDEADBEEFu) acc[0] = v;
+}
+
 extern "C" __global__ void q4_moe_group_t1(
         const unsigned* __restrict__ ids, int ne, int rows,
         int* __restrict__ out_off, unsigned* __restrict__ perm, unsigned* __restrict__ inv,

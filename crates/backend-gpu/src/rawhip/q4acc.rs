@@ -1145,9 +1145,17 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         (ppd, ipd, txd, offd, rpd)
                     };
                     self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd)?;
-                    // 폴백(비 Q4K/Q5_1 타입)용 오프셋을 지금 걸어 둔다 —
+                    // 폴백(비 Q4K/Q5_1 타입)용 오프셋. 기본은 비동기로 미리 걸어
                     // 소비 시점(층 하단)까지 gate/up GEMM이 지연을 덮는다.
-                    let pinned_off = self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?;
+                    // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
+                    // 호스트 경로와 같은 순서 조건을 만들어 순서 효과를 검정한다.
+                    let pinned_off = if std::env::var_os("LLM170_MOE_GROUP_SYNC").is_some() {
+                        let buf = self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?;
+                        self.ctx.d2h_wait()?;
+                        buf
+                    } else {
+                        self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?
+                    };
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
                         generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,

@@ -1744,6 +1744,47 @@ mod micro_tests {
             gb / dt
         );
 
+        // 가중치 접근 패턴 프로브 — 144B 블록 스트라이드에서 실효 대역.
+        // (q4_K 가중치를 스칼라로 읽는 현 커널들의 실제 패턴)
+        let nb = 4_000_000usize; // 4M 블록 × 144B = 576MB
+        let wbuf = ctx.scratch(nb * 144).expect("wbuf");
+        let accb = ctx.scratch(4).expect("acc");
+        for mode in [0i32, 1, 2] {
+            let launch_bw = || {
+                let (mut wp, mut ap) = (wbuf as *mut std::ffi::c_void, accb as *mut std::ffi::c_void);
+                let (mut n, mut m) = (nb as i32, mode);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut wp) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ap) as *mut _ as *mut std::ffi::c_void,
+                    (&mut n) as *mut _ as *mut std::ffi::c_void,
+                    (&mut m) as *mut _ as *mut std::ffi::c_void,
+                ];
+                ctx.launch3("bw_strided", ((nb as u32).div_ceil(256)), 1, 1, 256, &mut args)
+                    .unwrap();
+            };
+            launch_bw();
+            ctx.sync().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..4 {
+                launch_bw();
+            }
+            ctx.sync().unwrap();
+            let dt = t.elapsed().as_secs_f64();
+            // 접근한 바이트 수(스칼라 4B/8B, 벡터 16B) 기준 실효 대역
+            let bytes = match mode {
+                0 => nb as f64 * 4.0,
+                1 => nb as f64 * 4.0,
+                _ => nb as f64 * 16.0,
+            } * 4.0;
+            let touched = nb as f64 * 144.0 * 4.0; // 실제로 건드린 메모리 범위
+            eprintln!(
+                "# micro bw_strided mode{mode}: {:.1}ms → 실사용 {:.1} GB/s (건드린 범위 기준 {:.1} GB/s)",
+                dt * 1e3,
+                bytes / dt / 1e9,
+                touched / dt / 1e9
+            );
+        }
+
         // MoE 그룹 커널 + 비동기 d2h 왕복 격리 — 디코드 디바이스 경로가
         // +30ms/스텝을 보이는데, 그 추가분의 실체를 여기서 가른다.
         let ne = 512i32;
