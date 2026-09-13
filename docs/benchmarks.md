@@ -330,6 +330,27 @@ measurements were taken sequentially.
 
 **Gap**: prefill ≈ 4.2x behind the reference; decode ≈ 1.6x behind.
 
+### 2026-09-13 — qwen4exp prefill 79.7 s at 11,750 (reproducible)
+
+Current reproducible figure for the Flash-Next prefill, same flags as the llama
+row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
+
+| Condition | LLM170 (rawhip) | llama.cpp (276.68 t/s) | gap |
+|---|---|---|---|
+| pp 11,750 | **79.70 s** (147.4 t/s) | 42.47 s | **1.88x** |
+| pp 2,048 | 10,017 ms (204.5 t/s) | — | — |
+
+Two consecutive runs measured 79,730.4 and 79,703.7 ms. The earlier 117.1 s row
+in the history above is **not reproducible today** under identical flags; the
+only code change in between (the grouped q5_1 MoE path, `57215df`) was measured
+A/B at 11,750 and is neutral there (79,685.7 ms off vs 79,703.7 ms on), so the
+difference is not attributable to it and remains unexplained - treat 79.7 s as
+the current figure.
+
+Kernel time (KTRACE) totals 46.1 s of the 78.9 s wall, so ~32.8 s is outside
+the traced kernel set (host work, chunk boundaries, syncs). That gap is the
+largest single item left before the kernel table.
+
 ### 2026-09-13 — prefill stage breakdown (frame path, `LLM170_FRAME_TIME=1`)
 
 2311 tokens (chunks of 512), 48 layers, wall-clock per stage as measured by the
