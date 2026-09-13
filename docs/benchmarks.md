@@ -410,6 +410,24 @@ the ~35 s model load or the numbers are meaningless) shows:
 | GPU idle (gaps) | 611 ms (25 %) |
 | **host cost per launch** | **0.285 ms** (14x a typical ~20 us launch) |
 
+**The host launch is not the cost.** A dedicated probe
+(`llm170 launch-rate N`, `rawhip::launch_rate`) launches a trivial kernel N times
+and reports the host rate for several grid sizes:
+
+| grid | host us/launch | GPU tail per launch |
+|---|---|---|
+| (1,1,1) | 0.9 | 1.1 us |
+| (64,2560,1) - 164k blocks | 0.9 | **124.5 us** |
+| (2048,1,1) | 1.0 | 2.5 us |
+| (65535,1,1) | 0.9 | 49.7 us |
+
+The host issues a launch in **~1 us regardless of the grid**, but the *device*
+spends **124 us dispatching 164k empty blocks** (the kernel body never runs -
+`q4_scale` bounds-checks and returns). The frame's GEMMs launch grids of exactly
+that size, so their measured 96 us is essentially block dispatch, not
+arithmetic: **the engine is block-dispatch-bound, not launch-bound**. Fewer,
+fatter blocks (the tile/quadrant kernels) is the lever, not fewer host calls.
+
 The host (2,477 ms) exceeds the GPU (1,984 ms), so the critical path is the
 *launch rate*, not the kernels. The launches break down as follows (per layer
 of the 48; GPU time is the sum over the 512-token prefill):

@@ -38,6 +38,53 @@ pub fn raw_probe(iters: usize) -> Result<String, String> {
     ))
 }
 
+/// 런치율(호스트) — 원소별 커널(q4_scale)을 N회 비동기 런치하고 µs/런치를 잰다.
+/// 프레임 op의 런치당 비용(프로파일 실측 ≈0.285ms)이 **런치 API 자체**인지
+/// 프레임 디스패치인지 가른다: 이 값이 작으면 범인은 디스패치 쪽이다.
+pub fn launch_rate(iters: usize) -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let n = 256usize;
+    let buf = ctx.alloc(n * 4)?;
+    let data: Vec<f32> = vec![1.0; n];
+    ctx.h2d(buf, bytemuck::cast_slice(&data))?;
+    ctx.sync()?;
+    let mut p = buf as *mut std::ffi::c_void;
+    let mut s = 1.0f32;
+    let mut nn = n as i32;
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        (&mut p) as *mut _ as *mut std::ffi::c_void,
+        (&mut s) as *mut _ as *mut std::ffi::c_void,
+        (&mut nn) as *mut _ as *mut std::ffi::c_void,
+    ];
+    for _ in 0..64 {
+        ctx.launch3("q4_scale", 1, 1, 1, 128, &mut args)?;
+    }
+    ctx.sync()?;
+    // 그리드 크기를 바꿔가며 — 프레임의 GEMM은 (64,2560)~164k 블록이다.
+    // q4_scale은 j<n 가드가 있어 초과 블록은 즉시 반환한다(안전).
+    let mut out = String::new();
+    for (gx, gy, gz) in [(1u32, 1u32, 1u32), (64, 2560, 1), (2048, 1, 1), (65535, 1, 1)] {
+        for _ in 0..32 {
+            ctx.launch3("q4_scale", gx, gy, gz, 128, &mut args)?;
+        }
+        ctx.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            ctx.launch3("q4_scale", gx, gy, gz, 128, &mut args)?;
+        }
+        let host = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        ctx.sync()?;
+        let tail = t1.elapsed().as_secs_f64();
+        out += &format!(
+            "grid=({gx},{gy},{gz}): 호스트 {:.1}µs/런치, GPU 꼬리 {:.1}µs/런치\n",
+            host * 1e6 / iters as f64,
+            tail * 1e6 / iters as f64
+        );
+    }
+    Ok(out)
+}
+
 /// qk_norm_rope 단독 검증 — 디코드와 동일 파라미터.
 pub fn qk_check() -> Result<String, String> {
     let ctx = RawCtx::new()?;
