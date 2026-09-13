@@ -427,6 +427,31 @@ kernel's dequant and fragment code is reused. It is not bit-contracted (the
 existing WMMA paths are "stream-validated" too), so acceptance is the CPU oracle
 (`q4-acc-check` / `q4-qsa-check` mirrors) plus a coherent-output check.
 
+### Verification standard: a diverse prompt, not the repetitive harness prompt
+
+The token-identity checks used earlier in this work used a repetitive
+230-token prompt; the model simply copies it, so the output is insensitive to
+errors in most of the network and the check had no discriminating power. Two
+real regressions survived it:
+
+1. a MoE gather/scatter fusion whose launcher passed the pre-gathered buffer
+   while the kernel indexes with `perm[r]` - the model degenerated
+   (`68 56 220 16 17 15 ...`);
+2. the QSA pass-A parallelization dropped the q norm+rope loop, so the
+   attention consumed unnormalized q - plausible-looking but wrong output.
+
+Both were found only after switching to a **diverse 24-token prompt with 16
+generated tokens**. The current baseline, identical for the pre-work commit and
+for the current tree:
+
+```
+5513 248046 198 248045 74455 198 248068 198 760 1156 579 1876 7701 310 381 7132 36412
+```
+
+`LLM170_QSA_HASH=1` prints per-QSA-layer checksums of the k/v/idx caches, the
+block-key cache, the indexer q rows and the layer output, which localizes a
+divergence to a specific path (it is what pinned bug 2 to the qg normalization).
+
 ### The residual idle is per-kernel-transition, ~60 us each (pp512, current build)
 
 Re-profiling after the host-side changes (thread caps, parallel pass A):
