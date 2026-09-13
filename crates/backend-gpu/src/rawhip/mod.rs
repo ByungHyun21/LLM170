@@ -299,7 +299,12 @@ impl RawCtx {
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 return Err(format!("hiprtcCreateProgram: {rs:?}"));
             }
-            let inc = cubecl_hip_sys::get_hip_include_path().map_err(|e| e.to_string())?;
+            // LLM170_HIP_INC: hipconfig 서브프로세스 없이 include 경로를 준다
+            // (rocprof 등 서브프로세스를 방해하는 도구 아래에서 필요).
+            let inc = match std::env::var_os("LLM170_HIP_INC") {
+                Some(v) => v.to_string_lossy().into_owned(),
+                None => cubecl_hip_sys::get_hip_include_path().map_err(|e| e.to_string())?,
+            };
             let o1 = CString::new(format!("-I{inc}")).unwrap();
             let o2 = CString::new("--std=c++17").unwrap();
             let o3 = CString::new("-O3").unwrap();
