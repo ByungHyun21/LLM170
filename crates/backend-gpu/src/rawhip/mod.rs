@@ -54,6 +54,128 @@ pub fn aout_dumped() -> bool {
 }
 
 pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
+
+// ── 프레임 그래프 캡처(디코드 스텝) ────────────────────────────────────────
+// 스텝 내 호스트 왕복(capture_mark)을 경계로 스트림 캡처를 세그먼트로 끊어
+// 그래프로 굳히고, 재생 시에는 런치 함수가 즉시 반환되어 커널이 그래프에서
+// 실행된다(런치 ~3천 회/스텝 → 세그먼트 수 회). 프로세스 전역 — CLI는 가속기
+// 1개, 재생은 스텝 단위 단일 스레드라 전역으로 충분하다.
+pub enum GraphMode {
+    Off,
+    Capture { segs: Vec<hip::hipGraph_t>, open: bool },
+    Replay { execs: Vec<hip::hipGraphExec_t>, idx: usize },
+}
+// SAFETY: 그래프 핸들은 디바이스 객체 — HIP 런타임이 직렬화하며, 재생은 스텝
+// 단위로 단일 스레드에서만 일어난다.
+unsafe impl Send for GraphMode {}
+pub static GRAPH: std::sync::Mutex<GraphMode> = std::sync::Mutex::new(GraphMode::Off);
+pub static GRAPH_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NOLAUNCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[inline]
+pub fn nolaunch_on() -> bool {
+    *NOLAUNCH.get_or_init(|| std::env::var_os("LLM170_NOLAUNCH").is_some())
+}
+
+/// 캡처 시작 — BeginCapture는 **첫 마크에서** 건다. 마크 이전 구간(임베딩 h2d 등
+/// 캡처 불가 연산)을 캡처 밖에 두기 위해서다.
+pub fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
+    *GRAPH.lock().map_err(|e| e.to_string())? =
+        GraphMode::Capture { segs: Vec::new(), open: false };
+    Ok(())
+}
+
+/// 캡처 종료 — 마지막 세그먼트를 닫고 전부 instantiate, 재생 모드로 전환.
+pub fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
+    let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
+    let GraphMode::Capture { segs, open } = &mut *g else {
+        return Err("graph_capture_end: 캡처 중이 아님".into());
+    };
+    let mut segs = std::mem::take(segs);
+    if *open {
+        unsafe {
+            let mut gr: hip::hipGraph_t = std::ptr::null_mut();
+            ck(hip::hipStreamEndCapture(stream, &mut gr), "EndCapture")?;
+            segs.push(gr);
+        }
+        *open = false;
+    }
+    let mut execs = Vec::with_capacity(segs.len());
+    for g0 in &segs {
+        unsafe {
+            let mut ex: hip::hipGraphExec_t = std::ptr::null_mut();
+            ck(hip::hipGraphInstantiate(&mut ex, *g0, std::ptr::null_mut(), std::ptr::null_mut(), 0), "GraphInstantiate")?;
+            execs.push(ex);
+        }
+    }
+    eprintln!("# graph: 세그먼트 {}개 캡처·인스턴스화", execs.len());
+    *g = GraphMode::Replay { execs, idx: 0 };
+    Ok(())
+}
+
+/// 재생 모드 진입/이탈 — 진입 시 런치 함수가 커널 발사를 건너뛴다(그래프가 실행).
+pub fn graph_replay(on: bool) -> Result<(), String> {
+    if on {
+        let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
+        if let GraphMode::Replay { idx, .. } = &mut *g {
+            *idx = 0;
+        }
+    }
+    GRAPH_SKIP.store(on, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// 세그먼트 경계 — 호스트 왕복 직전에 호출. 캡처 중이면 현재 세그먼트를 닫고
+/// 다음을 열고, 재생 중이면 앞 세그먼트 그래프를 발사한다.
+#[inline]
+fn is_end(tag: &str) -> bool {
+    tag.ends_with("_in")
+}
+
+pub fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), String> {
+    let dbg = std::env::var_os("LLM170_GRAPH_DEBUG").is_some();
+    let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
+    match &mut *g {
+        GraphMode::Off => Ok(()),
+        // 규약: `*_in` = 호스트 왕복 *직전* → 현재 세그먼트 종료(그래프 굳힘).
+        //       `*_out` = 왕복 *직후* → 다음 세그먼트 시작. 왕복 구간(d2h/h2d)은
+        //       어느 그래프에도 들어가지 않는다(캡처 불가 연산).
+        GraphMode::Capture { segs, open } => unsafe {
+            if is_end(tag) {
+                if *open {
+                    let mut gr: hip::hipGraph_t = std::ptr::null_mut();
+                    let r = hip::hipStreamEndCapture(stream, &mut gr);
+                    if r != hip::hipError_t_hipSuccess {
+                        return Err(format!("EndCapture 실패({r:?}) tag={tag} seg={}", segs.len()));
+                    }
+                    segs.push(gr);
+                    *open = false;
+                    if dbg {
+                        eprintln!("# graph-mark {tag} 종료 (seg {})", segs.len());
+                    }
+                }
+            } else if !*open {
+                let r = hip::hipStreamBeginCapture(stream, hip::hipStreamCaptureMode_hipStreamCaptureModeThreadLocal);
+                if r != hip::hipError_t_hipSuccess {
+                    return Err(format!("BeginCapture 실패({r:?}) tag={tag}"));
+                }
+                *open = true;
+                if dbg {
+                    eprintln!("# graph-mark {tag} 시작 (seg {})", segs.len());
+                }
+            }
+            Ok(())
+        },
+        GraphMode::Replay { execs, idx } => {
+            // 세그먼트는 `*_in`(종료) 지점에서 발사된다 — 그 그래프가 직전 구간.
+            if is_end(tag) && *idx < execs.len() {
+                unsafe { ck(hip::hipGraphLaunch(execs[*idx], stream), "GraphLaunch")?; }
+                *idx += 1;
+            }
+            Ok(())
+        }
+    }
+}
 pub fn ktrace_dump() -> String {
     let mut g = KTRACE.lock().unwrap();
     // ktrace_on 없이 호출되면(스펙 경로 등) 빈 문자열 — 과거 unwrap 패닉
@@ -412,7 +534,8 @@ impl RawCtx {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
         // 진단(LLM170_NOLAUNCH): 런치를 건너뛰고 호스트 스켈레톤 시간만 측정한다.
-        if std::env::var_os("LLM170_NOLAUNCH").is_some() {
+        // 그래프 재생 중에도 즉시 반환한다(커널은 그래프가 실행).
+        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
         }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
@@ -451,6 +574,9 @@ impl RawCtx {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
 
+        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
+            return Ok(());
+        }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             if let Ok(mut g) = KTRACE.lock() {
@@ -477,6 +603,9 @@ impl RawCtx {
     /// 사이드 스트림 발사 (비동기 — join2로 합류)
     /// 동적 shared 64KB 런치 (부록82) — 커널당 1회 속성 설정.
     pub fn launch3_dyn(&self, name: &str, gx: u32, gy: u32, gz: u32, block: u32, smem: u32, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
+            return Ok(());
+        }
         use std::collections::HashSet;
         use std::sync::OnceLock;
         static SET: OnceLock<std::sync::Mutex<HashSet<usize>>> = OnceLock::new();
