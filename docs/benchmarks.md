@@ -411,7 +411,30 @@ the ~35 s model load or the numbers are meaningless) shows:
 | **host cost per launch** | **0.285 ms** (14x a typical ~20 us launch) |
 
 The host (2,477 ms) exceeds the GPU (1,984 ms), so the critical path is the
-*launch rate*, not the kernels. This is the ~31 s of non-kernel time in the
+*launch rate*, not the kernels. The launches break down as follows (per layer
+of the 48; GPU time is the sum over the 512-token prefill):
+
+| kernel | launches/layer | GPU ms | us each |
+|---|---|---|---|
+| `gemm_q8_0` | **33.4** | 154 | 96 |
+| `quant_q8` | 22.7 | 48 | 44 |
+| `q4_rows_permute_u32` | 13.8 | 43 | 66 |
+| `gemm_q8_j128` | 12.1 | 262 | 452 |
+| `__amd_rocclr_copyBuffer` (h2d/d2h) | 11.6 | 0.9 | 1.6 |
+| `copy_rows` | 10.0 | 0.5 | 1.0 |
+| `gemm_q5k` | 9.1 | 9 | 20 |
+| `q4_gemm_f32_m` / `q4_gemm_f32` | 6.0 + 6.0 | 181 + 9 | 629 / 32 |
+| `rms_part` + `rms_finish` | 4.0 + 4.0 | 38 | 97 |
+| `q4_hc_gate_mean` / `q4_hc_combine` | 4.0 / 4.0 | 24 / 13 | 124 / 69 |
+| `silu_mul` / `q4_silu_div` | 4.0 / 4.0 | 6 / 0.4 | 32 / 2 |
+| `q4_gemm_q4k_ge` | 3.9 | 366 | 1949 |
+
+`matmul_group`/`matmul_batch` batch only the *synchronisation*, not the launch:
+each matrix gets its own kernel, which is why a layer issues 33 `gemm_q8_0`
+launches. Two cheap classes stand out: the per-matrix dense GEMMs (group them
+with a tile->matrix table, the pattern `q4_gemm_q4k_ge` already uses for
+experts) and the sub-3-us kernels (`copy_rows`, `q4_silu_div`, the h2d/d2h
+copies: 26 launches/layer doing ~1 us of work each). This is the ~31 s of non-kernel time in the
 60.5 s prefilling (kernel sum ~26-29 s). The frame's fine-grained op structure
 (~180 launches per layer) costs more than the GPU work it schedules, so **op
 fusion - not kernel tuning - is the next lever**. Reproduce with:
