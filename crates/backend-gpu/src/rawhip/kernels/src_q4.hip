@@ -83,10 +83,17 @@ extern "C" __global__ void q4_gemm_q4k_y(const unsigned* xq, const unsigned* w, 
         #pragma unroll
         for (int it = 0; it < 4; it++) {
             unsigned q[8];
+            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
+            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
+            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
+            const uint4* p4 = (const uint4*)(qs + it * 32);
             #pragma unroll
-            for (int m = 0; m < 8; m++) {
-                const unsigned char* p = qs + it * 32 + m * 4;
-                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            for (int m4 = 0; m4 < 2; m4++) {
+                uint4 t4 = p4[m4];
+                q[m4 * 4 + 0] = t4.x;
+                q[m4 * 4 + 1] = t4.y;
+                q[m4 * 4 + 2] = t4.z;
+                q[m4 * 4 + 3] = t4.w;
             }
             const int j1 = 2 * it;
             const int j2 = 2 * it + 1;
@@ -227,10 +234,17 @@ extern "C" __global__ void q4_gemm_q4k_g(const unsigned* xq, const unsigned* w, 
         #pragma unroll
         for (int it = 0; it < 4; it++) {
             unsigned q[8];
+            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
+            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
+            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
+            const uint4* p4 = (const uint4*)(qs + it * 32);
             #pragma unroll
-            for (int m = 0; m < 8; m++) {
-                const unsigned char* p = qs + it * 32 + m * 4;
-                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            for (int m4 = 0; m4 < 2; m4++) {
+                uint4 t4 = p4[m4];
+                q[m4 * 4 + 0] = t4.x;
+                q[m4 * 4 + 1] = t4.y;
+                q[m4 * 4 + 2] = t4.z;
+                q[m4 * 4 + 3] = t4.w;
             }
             const int j1 = 2 * it;
             const int j2 = 2 * it + 1;
@@ -463,10 +477,17 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
         #pragma unroll
         for (int it = 0; it < 4; it++) {
             unsigned q[8];
+            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
+            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
+            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
+            const uint4* p4 = (const uint4*)(qs + it * 32);
             #pragma unroll
-            for (int m = 0; m < 8; m++) {
-                const unsigned char* p = qs + it * 32 + m * 4;
-                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            for (int m4 = 0; m4 < 2; m4++) {
+                uint4 t4 = p4[m4];
+                q[m4 * 4 + 0] = t4.x;
+                q[m4 * 4 + 1] = t4.y;
+                q[m4 * 4 + 2] = t4.z;
+                q[m4 * 4 + 3] = t4.w;
             }
             const int j1 = 2 * it;
             const int j2 = 2 * it + 1;
@@ -682,10 +703,17 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
         #pragma unroll
         for (int it = 0; it < 4; it++) {
             unsigned q[8];
+            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
+            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
+            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
+            const uint4* p4 = (const uint4*)(qs + it * 32);
             #pragma unroll
-            for (int m = 0; m < 8; m++) {
-                const unsigned char* p = qs + it * 32 + m * 4;
-                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            for (int m4 = 0; m4 < 2; m4++) {
+                uint4 t4 = p4[m4];
+                q[m4 * 4 + 0] = t4.x;
+                q[m4 * 4 + 1] = t4.y;
+                q[m4 * 4 + 2] = t4.z;
+                q[m4 * 4 + 3] = t4.w;
             }
             const int j1 = 2 * it;
             const int j2 = 2 * it + 1;
