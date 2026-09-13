@@ -966,6 +966,11 @@ extern "C" __global__ void q4_moe_weighted_sum(const float* ys, const float* wt,
 extern "C" __global__ void q4_moe_top10_m(const float* route, unsigned* ids, float* wt,
                                           int n_exp, int k_sel) {
     __shared__ float sh[1024];
+    // 선택 삽입 정렬용 배열 — 지역배열(동적 인덱싱)은 local memory(DRAM 왕복)로
+    // 떨어져 512회 루프에서 0.9ms/호출이 됐다. shared로 올리면 알고리즘·순서가
+    // 그대로여서 결과는 비트 동일하고 지연만 사라진다(2026-09-14).
+    __shared__ int sh_sel[64];
+    __shared__ float sh_sp[64];
     int tok = blockIdx.x;
     int l = threadIdx.x;
     if (l >= 32 || n_exp > 1024) return;
@@ -991,8 +996,8 @@ extern "C" __global__ void q4_moe_top10_m(const float* route, unsigned* ids, flo
     if (l != 0 || k_sel > 64) return;
     ids += (size_t)tok * k_sel;
     wt += (size_t)tok * k_sel;
-    int sel[64];
-    float sp[64];
+    int* sel = sh_sel;
+    float* sp = sh_sp;
     int cnt = 0;
     for (int e = 0; e < n_exp; e++) {
         float p = sh[e] / zs;
