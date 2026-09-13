@@ -486,6 +486,35 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                 missing.len(),
                 &missing[..12.min(missing.len())]
             );
+            // x-측 매핑: 행 0의 각 열 j에 라벨 (j mod 127)+1 을 심고(q8_0 d=1/127),
+            // 원-핫 x(j)의 출력값 × 127 = 짝지어진 열 → x가 어디로 가는지 값으로 읽힌다.
+            let mut wl = vec![0u8; n_out * (n_in / 32) * 34];
+            for sb in 0..n_in / 32 {
+                let blk2 = &mut wl[(0 * (n_in / 32) + sb) * 34..][..34];
+                blk2[0] = 0x00;
+                // d = 1/127 ≈ 0x1C04? → 대신 d=1 로 두고 q 값 자체를 라벨로 쓴다(출력=q).
+                blk2[1] = 0x3C;
+                for l in 0..32 {
+                    let j = sb * 32 + l;
+                    blk2[2 + l] = ((j % 127) + 1) as u8;
+                }
+            }
+            ctx.h2d(wd, &wl)?;
+            let mut xmap = Vec::new();
+            for j in [0usize, 1, 2, 5, 16, 31, 32, 33, 63, 64, 127, 128, 200, 255] {
+                if j >= n_in {
+                    continue;
+                }
+                let mut xo = vec![0.0f32; n_in];
+                xo[j] = 1.0;
+                ctx.h2d(xd, bytemuck::cast_slice(&xo))?;
+                ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+                ctx.sync()?;
+                let mut oo = vec![0.0f32; n_out];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut oo), od as *const u8)?;
+                xmap.push((j, oo[0]));
+            }
+            out += &format!("# x-측 매핑(j → out[0]): {xmap:?}\n");
         }
         out += &format!("# blk={b}: 1:1={distinct} 빈칸={holes} 다중={multi}\n");
         if b == 0 {
