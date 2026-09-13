@@ -286,14 +286,15 @@ fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
     Ok(())
 }
 
-/// 청크 단위 리포트 — t>1(프리필 청크)에서 한 줄 출력 후 초기화.
+/// 청크/스텝 단위 리포트 — 누적이 있으면 한 줄 출력 후 초기화.
+/// (디코드 t=1도 찍는다: 프리필과 달리 동기 지점이 많아 누적-지연 왜곡이 없다.)
 fn ftime_report(t: usize) {
     if !ftime_on() {
         return;
     }
     FT.with(|s| {
         let mut s = s.borrow_mut();
-        if t > 1 && !s.1.is_empty() {
+        if !s.1.is_empty() {
             s.1.sort_by(|a, b| b.1.cmp(&a.1));
             let mut line = String::from("# frame-time(t) ");
             for (k, us, n) in s.1.iter() {
