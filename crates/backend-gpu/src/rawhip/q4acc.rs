@@ -1166,8 +1166,16 @@ impl Q4Acc {
             (&mut h) as *mut _ as *mut std::ffi::c_void,
             (&mut tt) as *mut _ as *mut std::ffi::c_void,
         ];
-        self.ctx
-            .launch3("q4_qsa_attn", t as u32, n_head as u32, 1, 256, &mut args)?;
+        // 워프-퍼-토큰 커널 — 블록 배리어 없음 + K를 8토큰이 공유(§41).
+        // 미러 대조 2.263e-4(구 커널과 동일), 토큰 동일, 프리필 −1.9%@11.75k.
+        self.ctx.launch3(
+            "q4_qsa_attn_wt",
+            t.div_ceil(8) as u32,
+            n_head as u32,
+            1,
+            256,
+            &mut args,
+        )?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
         if std::env::var_os("LLM170_Q4_DBG").is_some() {

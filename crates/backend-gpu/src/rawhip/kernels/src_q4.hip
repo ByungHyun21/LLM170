@@ -489,107 +489,66 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
 // q [t][n_head·2·hd] (앞 hd = q, 뒤 hd = gate) · ck/cv [n_past][n_kv·hd] ·
 // mask [t][n_past] u32 (0 = 차단) · out [t][n_head·hd].
 // 온라인 소프트맥스(청크 128) — CPU 참조(max 후 exp/합)와 수학 동일.
-// 차단 위치는 Q4_NEG(=-FLT_MAX) — hipRTC에는 INFINITY 매크로가 없다.
 #define Q4_NEG (-3.4028235e38f)
-extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const float* cv,
-                                       const unsigned* mask, float* out, float kq_scale,
-                                       int n_past, int n_head, int n_kv, int hd, int t) {
-    int tok = blockIdx.x;
+
+// 워프-퍼-토큰 — 블록의 8워프가 "같은 head의 8토큰"을 각각 맡는다.
+// ① K행을 8토큰이 공유(L2 트래픽 1/8, 나머지는 L1) ② 블록 배리어 없음(워프 내부
+// 셔플만) — 기존 커널은 128키 청크마다 ~10회 __syncthreads를 돌렸다.
+// 산술은 마스크드 온라인 소프트맥스로 동일하나 청크가 32키라 반올림 순서가 다르다.
+extern "C" __global__ void q4_qsa_attn_wt(const float* q, const float* ck, const float* cv,
+                                           const unsigned* mask, float* out, float kq_scale,
+                                           int n_past, int n_head, int n_kv, int hd, int t) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int tok = (int)blockIdx.x * 8 + wid;
     int h = blockIdx.y;
-    int tid = threadIdx.x;              // dim = hd (256)
-    if (tok >= t || h >= n_head || tid >= hd) return;
+    if (tok >= t || h >= n_head || hd != 256) return;
     int kvh = h / (n_head / n_kv);
     const float* qh = q + ((size_t)tok * n_head + h) * 2 * hd;
     const float* gate = qh + hd;
     const unsigned* mrow = mask + (size_t)tok * n_past;
-    if (hd != 256) return;   // 점수 단계가 레인=차원(hd/32=8) 고정 — 계약 위반 시 무출력
-    float acc = 0.0f;                   // dim tid
+    float qr[8];
+    #pragma unroll
+    for (int t2 = 0; t2 < 8; t2++) qr[t2] = qh[lane + 32 * t2];
+    float acc[8];
+    #pragma unroll
+    for (int t2 = 0; t2 < 8; t2++) acc[t2] = 0.0f;
     float mrun = Q4_NEG;
     float lrun = 0.0f;
-    __shared__ float sc[128];
-    __shared__ float wexp[128];
-    __shared__ float red[8];
-    for (int base = 0; base < n_past; base += 128) {
-        int cnt = min(128, n_past - base);
-        // 1) 청크 점수 — 워프당 키 1개, 레인 = 차원(응집 로드).
-        // 기존(스레드=키 행)은 레인이 서로 다른 1KB 행을 읽어 로드가 완전 비응집
-        // 이었다: 실측 104 GFLOPS(피크의 ~2-5%). q는 레지스터에 1회 적재.
-        {
-            int wid2 = tid >> 5, lane = tid & 31;
-            float qr[8];
+    const unsigned long long FULL = 0xffffffffffffffffull;   // 이 플랫폼은 64비트 마스크 요구
+    // 키를 하나씩: 레인 = 차원(hd/32 = 8개), 점수는 워프 환원으로 만든다.
+    // (레인=키로 두면 셔플이 서로 다른 키의 부분합을 섞는다 — 실측 maxrel 1e2 오류.)
+    for (int p = 0; p < n_past; p++) {
+        bool selv = (mrow[p] != 0u);
+        float a = 0.0f;
+        if (selv) {
+            const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
             #pragma unroll
-            for (int t2 = 0; t2 < 8; t2++) qr[t2] = qh[lane + 32 * t2];
-            for (int r2 = 0; r2 < 16; r2++) {
-                int j = r2 * 8 + wid2;
-                if (j >= cnt) break;
-                int p = base + j;
-                float s = Q4_NEG;
-                if (mrow[p] != 0u) {
-                    const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
-                    float a = 0.f;
-                    #pragma unroll
-                    for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * k[lane + 32 * t2];
-                    for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffffffffffull, a, off);
-                    s = a * kq_scale;
-                }
-                if (lane == 0) sc[j] = s;
-            }
+            for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * k[lane + 32 * t2];
         }
-        __syncthreads();
-        // 2) 청크 최대 (블록 환원)
-        float cmax = (tid < cnt) ? sc[tid] : Q4_NEG;
-        for (int off = 16; off > 0; off >>= 1) cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffffffffffffull, cmax, off));
-        if ((tid & 31) == 0) red[tid >> 5] = cmax;
-        __syncthreads();
-        if (tid == 0) {
-            float v = red[0];
-            for (int w = 1; w < 8; w++) v = fmaxf(v, red[w]);
-            red[0] = v;
+        // 셔플은 수렴 상태에서(분기 밖) — 발산 셔플은 UB/예외.
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(FULL, a, off);
+        float s = selv ? a * kq_scale : Q4_NEG;
+        if (s > mrun) {
+            float corr = (mrun <= Q4_NEG) ? 0.0f : exp_cr(mrun - s);
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) acc[t2] *= corr;
+            lrun *= corr;
+            mrun = s;
         }
-        __syncthreads();
-        if (red[0] <= Q4_NEG) {         // 청크 전체 차단 — 기여 없음
-            __syncthreads();
-            continue;
+        float e = (s > Q4_NEG) ? exp_cr(s - mrun) : 0.0f;
+        lrun += e;
+        if (e > 0.0f) {
+            const float* vr = cv + (size_t)p * n_kv * hd + kvh * hd;
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) acc[t2] += e * vr[lane + 32 * t2];
         }
-        float nrun = fmaxf(mrun, red[0]);
-        // red 재사용 전 배리어 — 없으면 다른 워프가 red[0]을 읽기 전에
-        // psum이 덮어써 NaN이 섞인다(2026-09-12 실측 t=200에서 7498/25600 비유한).
-        __syncthreads();
-        float corr = (mrun <= Q4_NEG) ? 0.0f : exp_cr(mrun - nrun);
-        acc *= corr;
-        lrun *= corr;
-        mrun = nrun;
-        // 3) exp + 청크 합
-        float psum = 0.0f;
-        if (tid < cnt && sc[tid] > Q4_NEG) {
-            float e = exp_cr(sc[tid] - mrun);
-            wexp[tid] = e;
-            psum = e;
-        } else if (tid < cnt) {
-            wexp[tid] = 0.0f;
-        }
-        for (int off = 16; off > 0; off >>= 1) psum += __shfl_xor_sync(0xffffffffffffffffull, psum, off);
-        __syncthreads();
-        if ((tid & 31) == 0) red[tid >> 5] = psum;
-        __syncthreads();
-        if (tid == 0) {
-            float v = red[0];
-            for (int w = 1; w < 8; w++) v += red[w];
-            red[0] = v;
-        }
-        __syncthreads();
-        lrun += red[0];
-        // 4) V 누적 — 스레드 = dim
-        for (int j = 0; j < cnt; j++) {
-            float wv = wexp[j];
-            if (wv == 0.0f) continue;
-            acc += wv * cv[(size_t)(base + j) * n_kv * hd + kvh * hd + tid];
-        }
-        __syncthreads();
     }
-    float o = (lrun > 0.0f) ? acc / lrun : 0.0f;
-    float g = 1.0f / (1.0f + exp_cr(-gate[tid]));
-    out[((size_t)tok * n_head + h) * hd + tid] = o * g;
+    for (int t2 = 0; t2 < 8; t2++) {
+        float o = (lrun > 0.0f) ? acc[t2] / lrun : 0.0f;
+        float g = 1.0f / (1.0f + exp_cr(-gate[lane + 32 * t2]));
+        out[((size_t)tok * n_head + h) * hd + lane + 32 * t2] = o * g;
+    }
 }
 
 // ─── qwen4exp 프레임 op 커널 (plans/64 P1) ───
