@@ -407,12 +407,6 @@ impl Q4Acc {
             .ok_or_else(|| format!("frame 핸들 없음: {h}"))
     }
 
-    fn flen(&self, h: u64) -> Result<usize, String> {
-        let v = self.frames.lock().map_err(|e| e.to_string())?;
-        v.get((h.checked_sub(1).ok_or("frame 핸들 0")?) as usize)
-            .map(|(_, l)| *l)
-            .ok_or_else(|| format!("frame 핸들 없음: {h}"))
-    }
 
     /// 프레임 활성 q8 준비 — x(프레임 f32) → xq 스크래치. (xq, xq_w)
     fn frame_quant(&self, x: *mut u8, n_in: usize, t: usize) -> Result<(*mut u8, usize), String> {
