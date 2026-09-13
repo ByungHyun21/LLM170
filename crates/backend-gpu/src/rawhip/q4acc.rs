@@ -788,6 +788,7 @@ impl Q4Acc {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
         let tt = std::env::var_os("LLM170_Q4ACC_TIME").is_some();
+
         let t_up = std::time::Instant::now();
         let (w_dev, w_f32) = self.dev_weight(w)?;
         let up_ns = t_up.elapsed().as_nanos() as u64;
@@ -801,7 +802,19 @@ impl Q4Acc {
         if w_f32 {
             self.launch_gemm_f32(xf, w_slice, n_in, n_out, t, ydev)?;
         } else {
-            self.launch_gemm(ggml_id(w.ty), xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
+            // f16 경로 A/B — 실모델 텐서·실활성으로 검증(q4-acc-check가 미러와 대조).
+            let ty0 = ggml_id(w.ty);
+            if t >= 32
+                && ty0 == 8
+                && std::env::var_os("LLM170_F16_ACC").is_some()
+                && self
+                    .ctx
+                    .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
+                    .is_ok()
+            {
+            } else {
+            self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
+            }
         }
         let k_ns = t_k.elapsed().as_nanos() as u64;
         let t_d = std::time::Instant::now();

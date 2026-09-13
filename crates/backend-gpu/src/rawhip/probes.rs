@@ -374,6 +374,21 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// f32 → f16 비트(호스트측, 프로브 전용 근사).
+fn half_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
+    let frac = (x >> 13) & 0x3FF;
+    if exp <= 0 {
+        return sign;
+    }
+    if exp >= 31 {
+        return sign | 0x7C00;
+    }
+    sign | ((exp as u16) << 10) | frac as u16
+}
+
 /// `f16-map` — `.co` f16 GEMM(`gemm_f16_v4`, 래퍼 `gemm_f16_deq`)의 k-축 매핑을
 /// **블록별로 분리 측정**한다. 가중치를 한 32원소 블록으로 제한(b)하고 원-핫
 /// 활성(k)을 넣으면, 출력의 1 위치가 곧 "x의 k가 어느 열과 곱해지는가"다.
@@ -477,9 +492,37 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     missing.push(j);
                 }
             }
+            // 부호/블록별 스케일 검증: 블록마다 q = l-16 (합 -16), d_블록 = (sb+1)/16
+            //  → 기대 out[0] = Σ_블록 d_블록 × (-16)
+            let mut wv3 = vec![0u8; n_out * (n_in / 32) * 34];
+            let mut expect = 0.0f32;
+            for sb in 0..n_in / 32 {
+                let dv = ((sb % 16) + 1) as f32 / 16.0;
+                for o in 0..n_out {
+                    let blk2 = &mut wv3[(o * (n_in / 32) + sb) * 34..][..34];
+                    let h = half_bits(dv);
+                    blk2[0] = (h & 0xFF) as u8;
+                    blk2[1] = (h >> 8) as u8;
+                    let mut ssum = 0i32;
+                    for l in 0..32 {
+                        let q = l as i32 - 16;
+                        blk2[2 + l] = q as u8;
+                        ssum += q;
+                    }
+                    if o == 0 {
+                        expect += dv * ssum as f32;
+                    }
+                }
+            }
+            let wd3 = ctx.alloc(wv3.len())?;
+            ctx.h2d(wd3, &wv3)?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd3 as *const u8, n_in, n_out, 1, od)?;
+            ctx.sync()?;
+            let mut ov3 = vec![0.0f32; n_out];
+            ctx.d2h(bytemuck::cast_slice_mut(&mut ov3), od as *const u8)?;
             out += &format!(
-                "# 값검증: 전원소1 → out[0]={} (기대 {n_in}) / d=0.5,q=2 → out[0]={} (기대 {n_in})\n",
-                ov[0], ov2[0]
+                "# 값검증: 전원소1 → {} (기대 {n_in}) / d=0.5,q=2 → {} (기대 {n_in}) / 부호·스케일 → {} (기대 {expect:.3})\n",
+                ov[0], ov2[0], ov3[0]
             );
             out += &format!(
                 "# 실효 k범위: 기여 {}개 (앞 12: {:?}) / 누락 {}개 (앞 12: {:?})\n",
@@ -526,26 +569,34 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             out += &format!("# x-측 매핑(j → out[0]): {xmap:?}\n");
             // t>1 검증: 전부-1 가중치, x는 t행 — 행 r의 one-hot j가 행 r로 나와야 한다.
             {
-                let tt = 4usize;
+                let tt = 256usize;   // 128 경계를 넘겨 행 블록 z>0까지 검증
                 let mut xt = vec![0.0f32; tt * n_in];
-                for r in 0..tt {
-                    xt[r * n_in + (r * 7 + 3)] = 1.0;
+                let rows = [0usize, 1, 127, 128, 129, 255];
+                for &r in rows.iter() {
+                    xt[r * n_in + (r % 7 + 3)] = 1.0;
                 }
-                ctx.h2d(xd, bytemuck::cast_slice(&xt))?;
+                let xd2 = ctx.alloc(tt * n_in * 4)?;
+                ctx.h2d(xd2, bytemuck::cast_slice(&xt))?;
                 let odt = ctx.alloc(tt * n_out * 4)?;
-                ctx.gemm_f16_deq(8, xd as *const u8, wd1 as *const u8, n_in, n_out, tt, odt)?;
+                let _ = &xd;
+                ctx.gemm_f16_deq(8, xd2 as *const u8, wd1 as *const u8, n_in, n_out, tt, odt)?;
                 ctx.sync()?;
                 let mut ot = vec![0.0f32; tt * n_out];
                 ctx.d2h(bytemuck::cast_slice_mut(&mut ot), odt as *const u8)?;
                 let mut info = String::new();
-                for r in 0..tt {
+                for &r in rows.iter() {
                     let nz: Vec<(usize, f32)> = ot[r * n_out..(r + 1) * n_out]
                         .iter()
                         .enumerate()
                         .filter(|(_, v)| v.abs() > 0.25)
                         .map(|(i, &v)| (i, v))
                         .collect();
-                    info += &format!(" r{r}(one-hot {}): {nz:?}", r * 7 + 3);
+                    info += &format!(
+                        " r{r}: nz={} first={:?} val={:.2}",
+                        nz.len(),
+                        nz.first().map(|(i, _)| *i),
+                        nz.first().map(|(_, v)| *v).unwrap_or(0.0)
+                    );
                 }
                 out += &format!("# t>1 검증(t={tt}):{info}\n");
             }
