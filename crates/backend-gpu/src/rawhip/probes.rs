@@ -374,6 +374,71 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `f16-bench [rows] [n_in] [n_out] [reps]` — 기존 `.co` f16 GEMM(`gemm_f16_v4`)을
+/// 직접 측정한다. q4k-bench와 같은 형상으로 재면 "텐서코어 경로의 상한"이 나온다
+/// (roof-test mfma1 L1-fed 24.9 TFLOPS). 새 커널 없이 경로 가치를 판정하는 용도.
+pub fn f16_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let xq_w = crate::rawhip::q4acc::xq_words(n_in);
+    let xdev = ctx.alloc(xq_w * rows * 4)?;
+    let wdev = ctx.alloc(n_out * n_in * 2)?;
+    let odev = ctx.alloc(n_out * rows * 4)?;
+    let x = vec![0x11u8; xq_w * rows * 4];
+    let w = vec![0x22u8; n_out * n_in * 2];
+    ctx.h2d(xdev, &x)?;
+    ctx.h2d(wdev, &w)?;
+    let fns = &ctx.fns;
+    let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음(co/mmq2.co 미로드)")?;
+    let launch = || -> Result<(), String> {
+        unsafe {
+            let mut a1 = xdev as *mut std::ffi::c_void;
+            let mut a2 = wdev as *mut std::ffi::c_void;
+            let mut a3 = odev as *mut std::ffi::c_void;
+            let (mut ni, mut no, mut xw, mut tt) =
+                (n_in as i32, n_out as i32, xq_w as i32, rows.min(128) as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut a1) as *mut _ as *mut std::ffi::c_void,
+                (&mut a2) as *mut _ as *mut std::ffi::c_void,
+                (&mut a3) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            let e = hip::hipModuleLaunchKernel(
+                fm,
+                ((n_out + 127) / 128) as u32,
+                1,
+                rows.div_ceil(128) as u32,
+                256,
+                1,
+                1,
+                0,
+                ctx.stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if e != hip::hipError_t_hipSuccess {
+                return Err(format!("gemm_f16_v4 launch {e:?}"));
+            }
+        }
+        Ok(())
+    };
+    launch()?;
+    ctx.sync()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        launch()?;
+    }
+    ctx.sync()?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    let gb = (n_out * n_in * 2) as f64 / (ms / 1e3) / 1e9;
+    let flops = 2.0 * (n_out * n_in * rows) as f64 / (ms / 1e3) / 1e12;
+    Ok(format!(
+        "# f16-bench t={rows} {n_in}x{n_out}: {ms:.3}ms/호출 ({gb:.1}GB/s, {flops:.1} TFLOPS)"
+    ))
+}
+
 /// `q4k-bench [rows] [n_in] [n_out] [reps]` — q4_K GEMM 형상 격리 계측.
 /// 합성 q4_K 텐서로 커널 변형별 실효 대역을 잰다(plans/65 하한 분석의 입력).
 pub fn q4k_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<String, String> {

@@ -1001,6 +1001,86 @@ impl RawCtx {
         }
         Ok(())
     }
+    pub fn gemm_f16_deq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let fns = &self.fns;
+        // f16 전개 커널 선택 — 우리 .co의 GEMM이 소비하는 레이아웃으로 전개한다.
+        let (fq, blk_div) = match ty {
+            14 => (*fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?, 1usize),
+            12 => (*fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?, 1),
+            8 => (*fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?, 1),
+            _ => return Err(format!("f16 경로 미지원 타입 {ty}")),
+        };
+        let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음")?;
+        // f16 전개 버퍼 (지속: w 주소 키 캐시)
+        let key = (w as usize) ^ ((ty as usize) << 60);
+        // 크기 가드: 전문가 스택(수십 GB)은 f16 캐시 불가 → 호출자가 거른다.
+        if (n_out as u64) * (n_in as u64) * 2 > 512 * 1024 * 1024 {
+            return Err("f16 캐시 상한 초과".into());
+        }
+        let wf16 = {
+            let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
+            if let Some(&p) = c.get(&key) { p }
+            else {
+                let blocks = n_in / 256;
+                let p = self.alloc(n_out * n_in * 2)? as *mut u8;
+                unsafe {
+                    let mut a1 = w as *mut std::ffi::c_void;
+                    let mut a2 = p as *mut std::ffi::c_void;
+                    let mut a3 = blocks as i32;
+                    let mut a4 = n_out as i32;
+                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
+                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, blocks as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_f16")?;
+                }
+                c.insert(key, p);
+                p
+            }
+        };
+        // y: f32 → 우리 xq (quant_q8) — y_f32 에서 직접
+        let xq_w = n_in/4 + n_in/32 + n_in/16;
+        let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
+        let xq_p = if xq.0 < xq_w * t {
+            let p = self.alloc(xq_w * t * 4)? as *mut u8;
+            *xq = (xq_w * t, p);
+            p
+        } else { xq.1 };
+        unsafe {
+            let mut a1 = y_f32 as *mut std::ffi::c_void;
+            let mut a2 = xq_p as *mut std::ffi::c_void;
+            let mut a3 = n_in as i32;
+            let mut a4 = xq_w as i32;
+            let mut a5 = t as i32;
+            let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
+            // quant_q8_b: grid(nblk/64, t) block 64 — kernels.rs quant_q8 시그니처 (x, xq, n, xq_w)
+            let fq8 = *fns.get("quant_q8").ok_or("quant_q8 없음")?;
+            ck(hip::hipModuleLaunchKernel(fq8, ((n_in/32).div_ceil(64)) as u32, t as u32, 1, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "quant_q8")?;
+            let mut b1 = xq_p as *mut std::ffi::c_void;
+            let mut b2 = wf16 as *mut std::ffi::c_void;
+            let mut b3 = out as *mut std::ffi::c_void;
+            let mut b4 = n_in as i32;
+            let mut b5 = n_out as i32;
+            let mut b6 = xq_w as i32;
+            let mut b7 = t as i32;
+            let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
+            {
+              let mut z1 = xq_p as *mut std::ffi::c_void;
+              let mut z3 = out as *mut std::ffi::c_void;
+              let mut z7 = t.min(128) as i32;
+              let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
+                  &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
+              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, t.div_ceil(128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+            }
+        if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
+            self.sync().ok();
+            let _ = std::fs::write("/tmp/deq_wf16.f16", unsafe { std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2) });
+            let _ = std::fs::write("/tmp/deq_w.bin", unsafe { std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210) });
+            let _ = std::fs::write("/tmp/deq_xq.bin", unsafe { std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4) });
+            eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
+            std::process::exit(0);
+        }
+        }
+        Ok(())
+    }
 
     /// llama MMQ (mul_mat_q<q4_K/q5_K,128>) — f32 활성 직양자화 + 원형 런치.
     /// 하니스 검증: q4_K maxrel 6e-4, q5_K maxrel 1.5e-3 (plans/27 부록5·14).
