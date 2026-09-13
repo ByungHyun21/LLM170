@@ -174,80 +174,120 @@ fn mask_from_list(
         // 패스 A(직렬): KV·인덱서 캐시 적립 + q_rope(q norm·rope 포함).
         // 패스 B(병렬): 블록 점수 + 선택 + 마스크. 행이 서로 독립이라 층 단위로
         // 스레드를 한 번만 띄운다(행마다 spawn하면 오버헤드가 이득을 넘는다 — 실측).
-        let mut q_rows: Vec<Vec<Vec<f32>>> = Vec::with_capacity(t_len);
-        for t in 0..t_len {
-            let pos = pos0 + t as u32;
-            let (cache_k, cache_v, idx_cache) = {
-                let st = &mut seq_state.kv_k[full_idx];
-                let st2 = &mut seq_state.kv_v[full_idx];
-                let st3 = &mut seq_state.idx_k[full_idx];
-                // 안전 분할: 세 벡터는 서로 다른 필드 — std::split_at_mut 불필요
-                (st.as_mut_slice(), st2.as_mut_slice(), st3.as_mut_slice())
-            };
-            let n_past = pos as usize + 1;
-
-            // K/V 캐시 적립 + 인덱서 raw k 캐시
-            for h in 0..n_kv {
-                let src = kk[t][h * hd..h * hd + hd].to_vec();
-                let mut head = rms_norm(&src, &k_norm_w, hp.eps);
-                rope_head(&mut head, pos, n_rot, hp.rope_base);
-                let b = pos as usize * n_kv * hd + h * hd;
-                cache_k[b..b + hd].copy_from_slice(&head);
-                cache_v[b..b + hd].copy_from_slice(&vv[t][h * hd..h * hd + hd]);
-            }
-            idx_cache[pos as usize * hp.idx_dim..(pos as usize + 1) * hp.idx_dim]
-                .copy_from_slice(&ik[t]);
-
-            // 인덱서 스코어: 완전 블록(4토큰) mean-pool → rms → rope(b*4) → ReLU 헤드합
-            let n_blocks = n_past / r;
-            // 블록 키 캐시 — 이 토큰 시점까지의 완전 블록만 유효 (증분).
-            // 이전 청크가 계산한 키는 재사용, 신규 블록만 계산 (수치 동일).
-            if bk_local.len() < n_blocks * hp.idx_dim {
-                let mut b = bk_local.len() / hp.idx_dim;
-                while b < n_blocks {
-                    let mut pooled = vec![0.0f32; hp.idx_dim];
-                    for j in 0..r {
-                        let base = (b * r + j) * hp.idx_dim;
-                        for i2 in 0..hp.idx_dim {
-                            pooled[i2] += idx_cache[base + i2];
+        // 패스 A(병렬): 토큰별 독립 — KV 캐시·인덱서 raw k·q_rope(q norm·rope).
+        // 블록 키 풀링만 토큰 순서에 의존(증분)하므로 패스 A 뒤에 따로 병렬로 돈다.
+        // 행별 산술은 그대로고 스레드 배정만 달라 수치 불변(토큰 동일로 검증).
+        let mut q_rows: Vec<Vec<Vec<f32>>> = vec![Vec::new(); t_len];
+        {
+            let nthreads_a = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(4)
+                .min(32);
+            let per_a = t_len.div_ceil(nthreads_a.max(1)).max(1);
+            let pos0u = pos0 as usize;
+            let (idx_dim, idx_heads) = (hp.idx_dim, hp.idx_heads);
+            let (n_rot_l, rope_base, eps) = (n_rot, hp.rope_base, hp.eps);
+            let skip_kv = pos0u * n_kv * hd;
+            let skip_idx = pos0u * idx_dim;
+            let kk_r: &[Vec<f32>] = &kk;
+            let vv_r: &[Vec<f32>] = &vv;
+            let iq_r: &[Vec<f32>] = &iq;
+            let ik_r: &[Vec<f32>] = &ik;
+            let knw: &[f32] = &k_norm_w;
+            let iqw: &[f32] = &iq_w;
+            let st = &mut *seq_state;
+            let (kv_k, kv_v, idx_k) = (
+                st.kv_k[full_idx].as_mut_slice(),
+                st.kv_v[full_idx].as_mut_slice(),
+                st.idx_k[full_idx].as_mut_slice(),
+            );
+            std::thread::scope(|sc| {
+                for (ci, (((kc, vc), ic), qc)) in kv_k[skip_kv..]
+                    .chunks_mut(per_a * n_kv * hd)
+                    .zip(kv_v[skip_kv..].chunks_mut(per_a * n_kv * hd))
+                    .zip(idx_k[skip_idx..].chunks_mut(per_a * idx_dim))
+                    .zip(q_rows.chunks_mut(per_a))
+                    .enumerate()
+                {
+                    let base = ci * per_a;
+                    sc.spawn(move || {
+                        for (i, (((kch, vch), ich), qslot)) in kc
+                            .chunks_mut(n_kv * hd)
+                            .zip(vc.chunks_mut(n_kv * hd))
+                            .zip(ic.chunks_mut(idx_dim))
+                            .zip(qc.iter_mut())
+                            .enumerate()
+                        {
+                            let t = base + i;
+                            if t >= t_len {
+                                break;
+                            }
+                            let pos = pos0u as u32 + t as u32;
+                            for h in 0..n_kv {
+                                let lo = h * hd;
+                                let mut head = rms_norm(&kk_r[t][lo..lo + hd], knw, eps);
+                                rope_head(&mut head, pos, n_rot_l, rope_base);
+                                kch[lo..lo + hd].copy_from_slice(&head);
+                                vch[lo..lo + hd].copy_from_slice(&vv_r[t][lo..lo + hd]);
+                            }
+                            ich.copy_from_slice(&ik_r[t][..idx_dim]);
+                            let mut qr: Vec<Vec<f32>> = Vec::with_capacity(idx_heads);
+                            for h in 0..idx_heads {
+                                let lo = h * idx_dim;
+                                let mut qh = rms_norm(&iq_r[t][lo..lo + idx_dim], iqw, eps);
+                                rope_head(&mut qh, pos, idx_dim, rope_base);
+                                qr.push(qh);
+                            }
+                            *qslot = qr;
                         }
-                    }
-                    for v in pooled.iter_mut() {
-                        *v /= r as f32;
-                    }
-                    let mut pk = rms_norm(&pooled, &ik_w, hp.eps);
-                    rope_head(&mut pk, (b * r) as u32, hp.idx_dim, hp.rope_base);
-                    bk_local.extend_from_slice(&pk);
-                    b += 1;
+                    });
                 }
-            }
-            let mut q_rope: Vec<Vec<f32>> = Vec::with_capacity(hp.idx_heads);
-            for h in 0..hp.idx_heads {
-                let mut qh = rms_norm(
-                    &iq[t][h * hp.idx_dim..(h + 1) * hp.idx_dim].to_vec(),
-                    &iq_w,
-                    hp.eps,
-                );
-                rope_head(&mut qh, pos, hp.idx_dim, hp.rope_base);
-                q_rope.push(qh);
-            }
-            q_rows.push(q_rope);
-
-            // q norm·rope를 qg에 즉시 적용 (attention은 패스 뒤 일괄)
-            for h in 0..n_head {
-                let src = qg[t][h * 2 * hd..h * 2 * hd + hd].to_vec();
-                let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
-                rope_head(&mut qh, pos, n_rot, hp.rope_base);
-                for (a, b) in qh.iter().zip(qg[t][h * 2 * hd..h * 2 * hd + hd].iter_mut()) {
-                    *b = *a;
-                }
+            });
+        }
+        // 블록 키 캐시 — 청크 끝까지의 완전 블록을 병렬로(증분, 이전 청크분은 재사용).
+        {
+            let n_blocks_max = (pos0 as usize + t_len) / r;
+            if bk_local.len() < n_blocks_max * hp.idx_dim {
+                let dim = hp.idx_dim;
+                let b0 = bk_local.len() / dim;
+                bk_local.resize(n_blocks_max * dim, 0.0);
+                let idx_all: &[f32] = seq_state.idx_k[full_idx].as_slice();
+                let ikw: &[f32] = &ik_w;
+                let (eps, rope_base) = (hp.eps, hp.rope_base);
+                let nthreads_b = std::thread::available_parallelism()
+                    .map(|v| v.get())
+                    .unwrap_or(4)
+                    .min(32);
+                let per_b = (n_blocks_max - b0).div_ceil(nthreads_b.max(1)).max(1);
+                std::thread::scope(|sc| {
+                    for (ci, chunk) in bk_local[b0 * dim..].chunks_mut(per_b * dim).enumerate() {
+                        let base = b0 + ci * per_b;
+                        sc.spawn(move || {
+                            for (i, slot) in chunk.chunks_mut(dim).enumerate() {
+                                let b = base + i;
+                                if b >= n_blocks_max {
+                                    break;
+                                }
+                                let mut pooled = vec![0.0f32; dim];
+                                for j in 0..r {
+                                    let src = (b * r + j) * dim;
+                                    for i2 in 0..dim {
+                                        pooled[i2] += idx_all[src + i2];
+                                    }
+                                }
+                                for v in pooled.iter_mut() {
+                                    *v /= r as f32;
+                                }
+                                let mut pk = rms_norm(&pooled, ikw, eps);
+                                rope_head(&mut pk, (b * r) as u32, dim, rope_base);
+                                slot.copy_from_slice(&pk);
+                            }
+                        });
+                    }
+                });
             }
         }
 
-        if tm {
-            eprintln!("# qsa-stage passA={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
-            t_lap = std::time::Instant::now();
-        }
         // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
         // 선택된 블록은 (정렬해) 고정 보폭 배열에 적재한다 — 이어서 패스 C가
         // 오름차순 위치 목록으로 압축하고, GPU는 그 목록만 순회한다.
