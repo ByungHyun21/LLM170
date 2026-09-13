@@ -374,45 +374,59 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
-/// `f16-map` — `.co` f16 GEMM(`gemm_f16_v4`, 래퍼 `gemm_f16_deq`)이 기대하는
-/// k-축 매핑을 관찰한다. q8_0 **항등 가중치**(256x256) + 원-핫 활성 → 출력의
-/// 1 위치가 곧 매핑이다(항등이면 k 그대로, 순열이면 그 순열).
+/// `f16-map` — `.co` f16 GEMM(`gemm_f16_v4`, 래퍼 `gemm_f16_deq`)의 k-축 매핑을
+/// **블록별로 분리 측정**한다. 가중치를 한 32원소 블록으로 제한(b)하고 원-핫
+/// 활성(k)을 넣으면, 출력의 1 위치가 곧 "x의 k가 어느 열과 곱해지는가"다.
+/// (전체 항등으로 한 번에 재면 블록 간 간섭이 섞여 전단사가 깨진다 — plans/65 §12)
 pub fn f16_map() -> Result<String, String> {
     let ctx = RawCtx::new()?;
     let (n_out, n_in) = (256usize, 256usize);
-    let mut w = vec![0u8; n_out * (n_in / 32) * 34];
-    for o in 0..n_out {
-        for sb in 0..n_in / 32 {
-            let b = &mut w[(o * (n_in / 32) + sb) * 34..][..34];
-            b[0] = 0x00;
-            b[1] = 0x3C; // d = 1.0
-            for l in 0..32 {
-                b[2 + l] = if o == sb * 32 + l { 1 } else { 0 };
-            }
-        }
-    }
-    let wd = ctx.alloc(w.len())?;
+    let wd = ctx.alloc(n_out * (n_in / 32) * 34)?;
     let xd = ctx.alloc(n_in * 4)?;
     let od = ctx.alloc(n_out * 4)?;
-    ctx.h2d(wd, &w)?;
     let mut out = String::new();
-    let ks: Vec<usize> = (0..n_in).collect();
-    for k in ks {
-        let mut x = vec![0.0f32; n_in];
-        x[k] = 1.0;
-        ctx.h2d(xd, bytemuck::cast_slice(&x))?;
-        ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
-        ctx.sync()?;
-        let mut o = vec![0.0f32; n_out];
-        ctx.d2h(bytemuck::cast_slice_mut(&mut o), od as *const u8)?;
-        let _ = &ctx;
-        let nz: Vec<usize> = o
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.abs() > 0.25)
-            .map(|(i, _)| i)
-            .collect();
-        out += &format!("{k}:{}\n", nz.first().copied().unwrap_or(usize::MAX));
+    for b in 0..8usize {
+        // 가중치: 블록 b에만 항등(그 블록의 요소 j가 행 o=j에)
+        let mut w = vec![0u8; n_out * (n_in / 32) * 34];
+        for o in 0..n_out {
+            let blk = &mut w[(o * (n_in / 32) + b) * 34..][..34];
+            blk[0] = 0x00;
+            blk[1] = 0x3C;
+            for l in 0..32 {
+                blk[2 + l] = if o == b * 32 + l { 1 } else { 0 };
+            }
+        }
+        ctx.h2d(wd, &w)?;
+        let mut pairs = Vec::new();
+        for k in 0..n_in {
+            let mut x = vec![0.0f32; n_in];
+            x[k] = 1.0;
+            ctx.h2d(xd, bytemuck::cast_slice(&x))?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+            ctx.sync()?;
+            let mut o = vec![0.0f32; n_out];
+            ctx.d2h(bytemuck::cast_slice_mut(&mut o), od as *const u8)?;
+            let nz: Vec<usize> = o
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.abs() > 0.25)
+                .map(|(i, _)| i)
+                .collect();
+            match nz.len() {
+                1 => pairs.push((k, nz[0])),
+                0 => pairs.push((k, usize::MAX)),
+                _ => pairs.push((k, 1000 + nz[0])),
+            }
+        }
+        let distinct = pairs.iter().filter(|(_, o)| *o < 1000).count();
+        let holes = pairs.iter().filter(|(_, o)| *o == usize::MAX).count();
+        let multi = pairs.iter().filter(|(_, o)| *o >= 1000).count();
+        out += &format!("# blk={b}: 1:1={distinct} 빈칸={holes} 다중={multi}\n");
+        if b == 0 {
+            for (k, o) in pairs.iter() {
+                out += &format!("{k}:{o}\n");
+            }
+        }
     }
     Ok(out)
 }
