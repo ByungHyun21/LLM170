@@ -372,6 +372,8 @@ pub enum FrameOp {
     Scale { t: u64, s: f32, n: usize },
     /// 행 복사: dst[dst_off..+n] = src[src_off..+n] — 캐시 append 부품.
     CopyRows { src: u64, dst: u64, src_off: usize, dst_off: usize, n: usize },
+    /// k_sel행 브로드캐스트 — dst의 모든 행 = src 0행 (MoE t=1 gate/up, 1런치).
+    BcastRows { src: u64, dst: u64, n: usize, rows: usize },
     /// MoE shared 가산: y += x·s (s는 1원소 프레임 버퍼).
     AxpyScaled { y: u64, x: u64, s: u64, n: usize },
     /// MoE 전문가 가중 합: out = Σ_e wt[e]·ys[e].

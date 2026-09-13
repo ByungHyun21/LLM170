@@ -1961,6 +1961,11 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 let mut nn = n as i32;
                 self.kop("q4_scale", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut p, &mut ss, &mut nn))
             }
+            O::BcastRows { src, dst, n, rows } => {
+                let (mut sp, mut dp) = (self.fptr(src)?, self.fptr(dst)?);
+                let (mut nn, mut rr) = (n as i32, rows as i32);
+                self.kop("bcast_rows", (n as u32).div_ceil(128), rows as u32, 1, 128, &mut cargs!(&mut sp, &mut dp, &mut nn, &mut rr))
+            }
             O::CopyRows { src, dst, src_off, dst_off, n } => {
                 let (mut sp, mut dp) = (self.fptr(src)?, self.fptr(dst)?);
                 let (mut so, mut dfo) = (src_off as i32, dst_off as i32);

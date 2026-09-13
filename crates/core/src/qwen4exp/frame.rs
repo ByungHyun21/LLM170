@@ -630,10 +630,8 @@ fn moe_frame(
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
     let w_down = model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
     if t == 1 {
-        // 디코드: mix를 k_sel회 브로드캐스트 → 3회 스택 GEMM
-        for e in 0..k_sel {
-            op(acc, FrameOp::CopyRows { src: f.mix, dst: f.mxsel, src_off: 0, dst_off: e * n, n })?;
-        }
+        // 디코드: mix를 k_sel행 브로드캐스트 — 전용 커널 1런치(기존 k_sel런치).
+        op(acc, FrameOp::BcastRows { src: f.mix, dst: f.mxsel, n, rows: k_sel })?;
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
