@@ -1174,10 +1174,10 @@ impl Q4Acc {
         // 미러 대조 2.263e-4(구 커널과 동일), 토큰 동일, 프리필 −1.9%@11.75k.
         self.ctx.launch3(
             "q4_qsa_attn_wt",
-            t.div_ceil(8) as u32,
+            t.div_ceil(16) as u32,
             n_head as u32,
             1,
-            256,
+            512,
             &mut args,
         )?;
         let mut out = vec![0.0f32; t * n_head * hd];
