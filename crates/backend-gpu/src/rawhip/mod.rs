@@ -955,8 +955,10 @@ impl RawCtx {
                 p
             }
         };
-        // y: f32 → 우리 xq (quant_q8) — y_f32 에서 직접
-        let xq_w = n_in/4 + n_in/32 + n_in/16;
+        // y: f32 → **llama q8_1**(mmq_quant_y, 144B/128원소) — v4 GEMM은 llama
+        // 계열이라 이 레이아웃을 기대한다. 우리 quant_q8(1.375B/원소)을 넣으면
+        // 레이아웃이 어긋나 쓰레기 토큰이 나온다(plans/65 §13-14 실측).
+        let xq_w = (n_in / 128) * 36;
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
         let xq_p = if xq.0 < xq_w * t {
             let p = self.alloc(xq_w * t * 4)? as *mut u8;
@@ -971,8 +973,8 @@ impl RawCtx {
             let mut a5 = t as i32;
             let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
             // quant_q8_b: grid(nblk/64, t) block 64 — kernels.rs quant_q8 시그니처 (x, xq, n, xq_w)
-            let fq8 = *fns.get("quant_q8").ok_or("quant_q8 없음")?;
-            ck(hip::hipModuleLaunchKernel(fq8, ((n_in/32).div_ceil(64)) as u32, t as u32, 1, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "quant_q8")?;
+            let fq8 = *fns.get("mmq_quant_y").ok_or("mmq_quant_y 없음")?;
+            ck(hip::hipModuleLaunchKernel(fq8, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
             let mut b1 = xq_p as *mut std::ffi::c_void;
             let mut b2 = wf16 as *mut std::ffi::c_void;
             let mut b3 = out as *mut std::ffi::c_void;

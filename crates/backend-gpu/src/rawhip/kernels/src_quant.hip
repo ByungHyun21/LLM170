@@ -312,6 +312,9 @@ extern "C" __global__ void rmsq_rows(const float* x, const float* w, unsigned* x
 // f16 슬롯 매핑 — `.co` f16 GEMM(gemm_f16_v4)의 k-축 순서. 256x256 항등 가중치 +
 // 원-핫 활성 프로브(`llm170 f16-map`)로 블록별 분리 측정해 확정한 전단사:
 //   blk=0 → s = 8*(k&31);  blk>=1 → s = 8*(((k&31)-1)&31) + ((8-blk)&7)
+// f16 슬롯 매핑 — `.co` f16 GEMM(gemm_f16_v4)의 k-축 순서. 256x256 항등 가중치 +
+// 원-핫 활성 프로브(`llm170 f16-map`)로 블록별 분리 측정해 확정한 전단사(plans/65 §12):
+//   blk=0 → s = 8*(k&31);  blk>=1 → s = 8*(((k&31)-1)&31) + ((8-blk)&7)
 DEV int f16_slot(int k) {
     int blk = k >> 5, l = k & 31;
     if (blk == 0) return 8 * l;
