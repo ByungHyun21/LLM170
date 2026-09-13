@@ -689,11 +689,19 @@ impl Q4Acc {
                 let tc = if tq_mode { t } else { 128.min(t - t0) };
                 let xsrc = unsafe { xq.add(t0 * xq_w * 4) };
                 let osrc = unsafe { out.add(t0 * n_out * 4) };
-                if self
+                if let Err(e) = self
                     .ctx
                     .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
-                    .is_err()
                 {
+                    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if std::env::var_os("LLM170_Q4_DBG").is_some() {
+                        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k < 8 {
+                            eprintln!(
+                                "# gemm_tile 폴백#{k}: ty={ty} n_in={n_in} n_out={n_out} t={tc} err={e}"
+                            );
+                        }
+                    }
                     ok = false;
                     break;
                 }

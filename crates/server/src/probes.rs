@@ -12,6 +12,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             llm170_backend_gpu::rawhip::raw_probe(iters)
         }
+        "launch-rate" => {
+            let iters: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(20000);
+            llm170_backend_gpu::rawhip::launch_rate(iters)
+        }
         "f16-map" => llm170_backend_gpu::rawhip::f16_map(
             args.first().and_then(|v| v.parse().ok()).unwrap_or(256),
         ),
