@@ -397,6 +397,34 @@ start/end pair, with the event creation falling outside the pair), and the
 kernel names/counts are reliable; only the gap splits are not. The
 wall-clock numbers above are the ground truth.
 
+### The prefill is launch-rate-bound, not kernel-bound (rocprofv3, pp512)
+
+A narrow rocprofv3 window (pp512 prefill only - the trace's window must exclude
+the ~35 s model load or the numbers are meaningless) shows:
+
+| | |
+|---|---|
+| kernels in the 512-token prefill | **8,694** (~180 launches per layer) |
+| window span | 2,477 ms (bench prefill: 2,454 ms) |
+| GPU busy (sum of kernel durations) | 1,984 ms (80 %) |
+| GPU idle (gaps) | 611 ms (25 %) |
+| **host cost per launch** | **0.285 ms** (14x a typical ~20 us launch) |
+
+The host (2,477 ms) exceeds the GPU (1,984 ms), so the critical path is the
+*launch rate*, not the kernels. This is the ~31 s of non-kernel time in the
+60.5 s prefilling (kernel sum ~26-29 s). The frame's fine-grained op structure
+(~180 launches per layer) costs more than the GPU work it schedules, so **op
+fusion - not kernel tuning - is the next lever**. Reproduce with:
+
+```
+rocprofv3 --log-level error --kernel-trace -d /tmp/prof -o q4 -- \
+  ./target/release/llm170 bench --model <flash-next> --pp 512 --tg 0 \
+  --ctx 4096 --backend gpu --gpu-runtime hip
+```
+
+(`--log-level error` is required: rocprofv3 logs every child process to stderr
+and `hanzo-cubecl-hip-sys` panics when a `hipconfig` call produces any stderr.)
+
 ### The attention kernel was the largest kernel (traffic-bound)
 
 KTRACE at pp11750: total kernel time 45.0 s of the 76.4 s wall, of which
