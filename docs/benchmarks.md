@@ -380,12 +380,19 @@ full workspace test suite:
 | QSA `sel+proj` (indexer, CPU) | 51.6 s | **10.0 s** |
 | QSA `attn` (kernel) | 50.5 s | **30.5 s** |
 | QSA total | 107.3 s | 50.0 s |
-| prefill wall clock (incl. load) | 213.9 s | **138.3 s** |
+| prefill wall clock (incl. load) | 213.9 s | **121.3 s** |
 
 - Indexer: the per-row clone of the block-key cache was hoisted to a local
   buffer, the full sort became a partial select, and the dot was unrolled to 4
   accumulators; the per-row work then moved into a parallel pass (one scoped
   thread group per layer-chunk; per-row spawning regressed and was rejected).
+- The offline tile kernels (`w32b.co`, `v4all.co`) gained a **token quadrant**
+  axis (`blockIdx.z`), so a prefill chunk of N tokens is one GEMM launch per
+  matrix instead of N/128 pieces. Each piece previously re-read the whole weight
+  matrix, a 16x over-read for a 2048-token chunk. `gemm_q8_j128` went from
+  2049 ms in 8652 launches to 760 ms in 781; total prefill 129.3 s -> 121.3 s at
+  11,750 tokens. Fixed sources: `plans/i8_arc/co_src/{wm32_q,v4all_q}.cu`
+  (built with `scripts/build_co.py`).
 - The prefill chunk is now chosen by device memory (the frame buffers scale with
   it): `>= 48 GB` -> 2048 tokens, `>= 16 GB` -> 1024, else 512. Larger chunks put
   more rows on each expert in the MoE GEMM, so weights are reused more.
