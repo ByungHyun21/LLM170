@@ -403,12 +403,24 @@ pub fn frame_forward(
             if stage_skipped("qsa") {
                 // 진단용: QSA 브리지 생략(출력 무효).
             } else {
+            let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
+            let mut ql = std::time::Instant::now();
             let mut mix_v = vec![0.0f32; t * n];
             acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
+            let read_ms = ql.elapsed().as_secs_f64() * 1e3;
+            ql = std::time::Instant::now();
             let xs: Vec<Vec<f32>> = mix_v.chunks_exact(n).map(|c| c.to_vec()).collect();
             let out = stages::qsa_layer(ctx, seq_st, il, &xs, t, full_idx)?;
+            let stage_ms = ql.elapsed().as_secs_f64() * 1e3;
+            ql = std::time::Instant::now();
             let flat: Vec<f32> = out.concat();
             acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
+            if qtm {
+                eprintln!(
+                    "# qsa-bridge L{il} t={t} read(d2h+드레인)={read_ms:.1}ms stage={stage_ms:.1}ms write(h2d)={:.1}ms",
+                    ql.elapsed().as_secs_f64() * 1e3
+                );
+            }
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
