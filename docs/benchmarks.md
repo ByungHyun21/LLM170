@@ -360,6 +360,19 @@ quarter of the traffic. Arithmetic per head is unchanged and the probe reports
 (harness tokens unchanged). Decode keeps the one-head-per-warp kernel for
 t<=3, where the 4-head block would leave most warps idle (195 vs 203 ms/step).
 
+### Kernel distribution after the change (KTRACE, pp11750)
+
+`q4_qsa_attn_sel4` falls from 17.9 s to **2.25 s** (72 launches, 31 ms each) with
+the 4-head grouping. The largest kernels are now `q4_gemm_q4k_ge` (7.3 s, 470
+launches) and `gemm_q8_j128` (4.6 s, 4639 launches), and the KTRACE's
+`after <kernel>` rows - time attributed between one kernel's completion and the
+next traced event - total ~29 s, dominated by `after q4_rows_permute_u32`
+(10.5 s over 1986 launches) and `after q4_gemm_f32_m` (8.8 s over 1728). Those
+rows are *not* kernel time; with the kernels suppressed (`LLM170_NOLAUNCH`) the
+host work of the whole layer loop is only 0.15 s, so they are launch/queue
+latency rather than host compute. Their exact meaning has not been pinned down
+yet and is the next measurement to make.
+
 ### The attention kernel was the largest kernel (traffic-bound)
 
 KTRACE at pp11750: total kernel time 45.0 s of the 76.4 s wall, of which
