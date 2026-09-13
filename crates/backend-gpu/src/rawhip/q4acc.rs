@@ -795,7 +795,13 @@ impl Q4Acc {
         let w_slice = unsafe { w_dev.add(w_off_bytes) };
         let ydev = {
             let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
-            yb.ensure(&self.ctx, t * n_out * 4)?
+            // f16 경로는 128 사분면 경계까지 쓰므로 여유를 둔다(행 < t 만 사용).
+            let need = if std::env::var_os("LLM170_F16_ACC").is_some() {
+                t.div_ceil(128) * 128 * n_out * 4
+            } else {
+                t * n_out * 4
+            };
+            yb.ensure(&self.ctx, need)?
         };
         let mut yflat = vec![0.0f32; t * n_out];
         let t_k = std::time::Instant::now();

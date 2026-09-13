@@ -959,10 +959,11 @@ impl RawCtx {
         // 계열이라 이 레이아웃을 기대한다. 우리 quant_q8(1.375B/원소)을 넣으면
         // 레이아웃이 어긋나 쓰레기 토큰이 나온다(plans/65 §13-14 실측).
         let xq_w = (n_in / 128) * 36;
+        let tr = t.div_ceil(128) * 128;   // 커널의 128 단위 사분면 경계 (범위 밖 쓰기 방지)
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
-        let xq_p = if xq.0 < xq_w * t {
-            let p = self.alloc(xq_w * t * 4)? as *mut u8;
-            *xq = (xq_w * t, p);
+        let xq_p = if xq.0 < xq_w * tr {
+            let p = self.alloc(xq_w * tr * 4)? as *mut u8;
+            *xq = (xq_w * tr, p);
             p
         } else { xq.1 };
         unsafe {
@@ -981,7 +982,7 @@ impl RawCtx {
             let mut b4 = n_in as i32;
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
-            let mut b7 = t as i32;
+            let mut b7 = tr as i32;
             let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
@@ -990,7 +991,7 @@ impl RawCtx {
               let mut z7 = t.min(128) as i32;
               let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
                   &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
-              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, t.div_ceil(128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
             }
         if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
             self.sync().ok();
@@ -1040,10 +1041,14 @@ impl RawCtx {
         };
         // y: f32 → 우리 xq (quant_q8) — y_f32 에서 직접
         let xq_w = n_in/4 + n_in/32 + n_in/16;
+        // 커널은 t를 128 단위 사분면으로 소비하고 드레인도 그 경계까지 쓴다 →
+        // 부분 t에서 범위 밖 쓰기가 생긴다. 런치 t를 128 배수로 올려 in-bounds로 만든다
+        // (행 < t 만 유효, 호출자가 그만큼만 읽는다).
+        let tr = t.div_ceil(128) * 128;
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
-        let xq_p = if xq.0 < xq_w * t {
-            let p = self.alloc(xq_w * t * 4)? as *mut u8;
-            *xq = (xq_w * t, p);
+        let xq_p = if xq.0 < xq_w * tr {
+            let p = self.alloc(xq_w * tr * 4)? as *mut u8;
+            *xq = (xq_w * tr, p);
             p
         } else { xq.1 };
         unsafe {
@@ -1062,7 +1067,7 @@ impl RawCtx {
             let mut b4 = n_in as i32;
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
-            let mut b7 = t as i32;
+            let mut b7 = tr as i32;
             let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
@@ -1071,7 +1076,7 @@ impl RawCtx {
               let mut z7 = t.min(128) as i32;
               let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
                   &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
-              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, t.div_ceil(128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+              ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
             }
         if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
             self.sync().ok();

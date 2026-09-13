@@ -398,7 +398,7 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
     let (n_out, n_in) = (256usize, n_in_arg.max(128));
     let wd = ctx.alloc(n_out * (n_in / 32) * 34)?;
     let xd = ctx.alloc(n_in * 4 * 8)?;   // t ≤ 8 여유
-    let od = ctx.alloc(n_out * 4 * 8)?;
+    let od = ctx.alloc(n_out * 4 * 512)?;   // 커널은 t를 128 사분면 경계까지 쓴다(§29)
     let mut out = String::new();
     for b in 0..8usize {
         // 가중치: 블록 b에만 항등(그 블록의 요소 j가 행 o=j에)
