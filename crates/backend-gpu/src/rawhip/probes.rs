@@ -555,6 +555,31 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             let mut ov3 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov3), od as *const u8)?;
             out += &format!("# 블록별 기여(실측/기대):{per_nb}\n");
+            // 덤프용 마지막 호출: nb=1(블록 0만 비영) 패턴. LLM170_DEQ_DUMP=1 이면
+            // 이 호출의 wf16이 /tmp/deq_wf16.f16 에 남는다.
+            {
+                let mut wv5 = vec![0u8; n_out * (n_in / 32) * 34];
+                for sb in 0..n_in / 32 {
+                    let on = sb == 0;
+                    let dv = if on { 0.0625f32 } else { 0.0 };
+                    for o in 0..n_out {
+                        let blk2 = &mut wv5[(o * (n_in / 32) + sb) * 34..][..34];
+                        let h = half_bits(dv);
+                        blk2[0] = (h & 0xFF) as u8;
+                        blk2[1] = (h >> 8) as u8;
+                        for l in 0..32 {
+                            blk2[2 + l] = if on { (l as i32 - 16) as u8 } else { 0 };
+                        }
+                    }
+                }
+                let wd5 = ctx.alloc(wv5.len())?;
+                ctx.h2d(wd5, &wv5)?;
+                ctx.gemm_f16_deq(8, xd as *const u8, wd5 as *const u8, n_in, n_out, 1, od)?;
+                ctx.sync()?;
+                let mut ov5 = vec![0.0f32; n_out];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut ov5), od as *const u8)?;
+                out += &format!("# 덤프용 nb=1 재호출: out[0]={:.3} (기대 -1.000)\n", ov5[0]);
+            }
             // 원소 커버리지 스캔: (행 0, 열 j) 한 원소만 1.0, x=전부 1 → out[0]=1이면
             // 그 j가 GEMM의 읽기 범위 안. j별로 **다른 포인터**를 써야 f16 캐시(포인터 키)를
             // 피한다 — 257행 버퍼에서 j번째 행을 가중치 시작으로 넘긴다.
