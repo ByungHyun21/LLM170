@@ -1182,8 +1182,8 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             g.ensure(&self.ctx, rows * n_out * 4)?
         };
         let xsrc0 = if f32w { xp } else { xq };
-        self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
-        phase("gather", &mut lap);
+        // gather는 그룹 q4_K 커널이 perm으로 직접 읽으므로 폴백 경로에서만 필요하다
+        // (아래 전문가별 루프 직전으로 이동 — 런치 1개/그룹 절약).
         if llm170_core::qwen4exp::frame::stage_skipped("moe") {
             // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
             return Ok(());
@@ -1257,12 +1257,14 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 rows as i32,
                 per_expert as i32,
             );
+            let mut pm_p = perm_d as *mut std::ffi::c_void;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut part_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut o_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut rx_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut pm_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut ni) as *mut _ as *mut std::ffi::c_void,
                 (&mut no) as *mut _ as *mut std::ffi::c_void,
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
@@ -1296,13 +1298,15 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 256,
                 &mut args,
             )?;
-            self.rows_permute_dev(yg, inv_d as *mut u8, op_, n_out, rows)?;
+            // scatter 없음 — 커널이 perm으로 원래 행 위치에 직접 쓴다(런치 절약).
             phase("scatter", &mut lap);
             if tm {
                 eprintln!("# moe-phase TOTAL={:.2}ms rows={rows}", t0.elapsed().as_secs_f64() * 1e3);
             }
             return Ok(());
         }
+        self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
+        phase("gather", &mut lap);
         for e in 0..ne {
             let r = off[e + 1] - off[e];
             if r == 0 {
