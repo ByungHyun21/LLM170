@@ -491,6 +491,68 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
 // 온라인 소프트맥스(청크 128) — CPU 참조(max 후 exp/합)와 수학 동일.
 #define Q4_NEG (-3.4028235e38f)
 
+// q4_K MMQ 타일 — **전문가 그룹판**. 원판(_m)은 전문가마다 런치해 청크당 7.4만
+// 런치(호스트 ~2.7초@pp2048, KTRACE 실측)였다. rowexp(행→전문가) + expert_bytes면
+// 한 런치로 전부 처리한다. 산술 순서는 _m과 동일(비트 동일).
+extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned char* w, double* part,
+                                          float* out, const unsigned* rowexp,
+                                          int n_in, int n_out, int xq_w, int t, int expert_bytes) {
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = (int)blockIdx.x * 16 + ox;
+    int r = (int)blockIdx.y * 16 + rx;
+    if (o >= n_out || r >= t) return;
+    int n_super = n_in >> 8;
+    int e = (int)rowexp[r];
+    const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned xw_base = (unsigned)(n_in >> 2);
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sIdx = 0; sIdx < n_super; sIdx++) {
+        const unsigned char* blk = wr + sIdx * 144;
+        float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
+        float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+        #pragma unroll
+        for (int it = 0; it < 4; it++) {
+            unsigned q[8];
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                const unsigned char* p = qs + it * 32 + m * 4;
+                q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+            }
+            const int j1 = 2 * it;
+            const int j2 = 2 * it + 1;
+            unsigned s1, m1, s2, m2;
+            if (j1 < 4) { s1 = sc[j1] & 63u; m1 = sc[j1 + 4] & 63u; }
+            else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
+            if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
+            else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
+            const unsigned* x1 = xr + sIdx * 64 + it * 16;
+            const unsigned* x2 = x1 + 8;
+            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                unsigned y1 = x1[m];
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
+                qs1 += dot4(ones, y1, 0);
+                unsigned y2 = x2[m];
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                qs2 += dot4(ones, y2, 0);
+            }
+            float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
+            float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
+            acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
+            acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
+        }
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
+
+
 // 워프-퍼-토큰 — 블록의 8워프가 "같은 head의 8토큰"을 각각 맡는다.
 // ① K행을 8토큰이 공유(L2 트래픽 1/8, 나머지는 L1) ② 블록 배리어 없음(워프 내부
 // 셔플만) — 기존 커널은 128키 청크마다 ~10회 __syncthreads를 돌렸다.
