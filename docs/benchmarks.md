@@ -380,12 +380,17 @@ full workspace test suite:
 | QSA `sel+proj` (indexer, CPU) | 51.6 s | **10.0 s** |
 | QSA `attn` (kernel) | 50.5 s | **30.5 s** |
 | QSA total | 107.3 s | 50.0 s |
-| prefill wall clock (incl. load) | 213.9 s | **155.2 s** |
+| prefill wall clock (incl. load) | 213.9 s | **146.4 s** |
 
 - Indexer: the per-row clone of the block-key cache was hoisted to a local
   buffer, the full sort became a partial select, and the dot was unrolled to 4
   accumulators; the per-row work then moved into a parallel pass (one scoped
   thread group per layer-chunk; per-row spawning regressed and was rejected).
+- Frame chunk cap is now adaptive: `>= 16 GB` device memory raises the prefill
+  chunk from 512 to 1024 tokens, which doubles the rows per expert in the MoE
+  GEMM (better weight reuse). Measured at 11,750 tokens: total 155.2 -> 146.4 s,
+  `moe.gemm3` 58.9 -> 50.4 s, `qsa_bridge` 50.0 -> 45.7 s. `LLM170_FRAME_TMAX`
+  overrides it; the 8 GB CMP keeps 512 (1024 OOM'd there historically).
 - Attention: the shared dot product in `q4_qsa_attn` used a single accumulator
   and was latency-bound (4-accumulator unroll, 1.5-2.2x); the score phase then
   moved to warp-per-key with lane=dim so its loads are coalesced (a further

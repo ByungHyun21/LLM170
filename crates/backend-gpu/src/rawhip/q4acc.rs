@@ -1349,6 +1349,16 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
     }
 
     /// QSA 마스크드 밀집 GQA (값 경로 브리지) — f32 캐시.
+    fn total_mem_bytes(&self) -> u64 {
+        let (mut f, mut t) = (0usize, 0usize);
+        unsafe {
+            if hip::hipMemGetInfo(&mut f, &mut t) != hip::hipError_t_hipSuccess {
+                return 0;
+            }
+        }
+        t as u64
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention(
         &self,
