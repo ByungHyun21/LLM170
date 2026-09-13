@@ -337,8 +337,13 @@ row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
 
 | Condition | LLM170 (rawhip) | llama.cpp (276.68 t/s) | gap |
 |---|---|---|---|
-| pp 11,750 | **79.70 s** (147.4 t/s) | 42.47 s | **1.88x** |
-| pp 2,048 | 10,017 ms (204.5 t/s) | — | — |
+| pp 11,750 | **77.92 s** (150.8 t/s) | 42.47 s | **1.83x** |
+| pp 2,048 | 10,016 ms (204.5 t/s) | — | — |
+
+The 79.70 s figure above becomes 77.92 s with the mask flatten in
+`stages/qsa.rs` parallelized over tokens (it was a serial 24M-element push of a
+96 MB `u32` mask per QSA layer - at 11,750 tokens that is 2048x11750 entries per
+layer). pp2048 is unchanged (10,016 ms), so the win scales with context.
 
 Two consecutive runs measured 79,730.4 and 79,703.7 ms. The earlier 117.1 s row
 in the history above is **not reproducible today** under identical flags; the

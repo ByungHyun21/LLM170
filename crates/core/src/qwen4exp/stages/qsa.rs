@@ -72,6 +72,7 @@ use llm170_profiler::profile_span;
         full_idx: usize,
     ) -> Result<Vec<Vec<f32>>, Q4Error> {
         profile_span!("q4::layer_qsa");
+        let w_t0 = std::time::Instant::now();
         let hp = ctx.model.hp.clone();
         let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
         let wq = ctx.model.w4(&format!("blk.{il}.attn_q.weight"))?;
@@ -87,6 +88,12 @@ use llm170_profiler::profile_span;
 
         let n_tok = t_len;
         let tm = std::env::var_os("LLM170_Q4_TIME").is_some();
+        if tm {
+            eprintln!(
+                "# qsa-stage wlookup={:.1}ms",
+                w_t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         let t_all = std::time::Instant::now();
         let mut t_lap = t_all;
         // q/k/v/iq/ik는 동일 입력 xs — 그룹 1호출 (왕복 5→1).
@@ -201,6 +208,10 @@ use llm170_profiler::profile_span;
             }
         }
 
+        if tm {
+            eprintln!("# qsa-stage passA={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+            t_lap = std::time::Instant::now();
+        }
         // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
         {
             let bkl: &[f32] = &bk_local;
@@ -298,13 +309,45 @@ use llm170_profiler::profile_span;
         // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
         if gpu_attn {
             if let Some(acc) = ctx.acc.as_deref() {
+                if tm {
+                    eprintln!("# qsa-stage passB={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                    t_lap = std::time::Instant::now();
+                }
                 let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
-                let mut masku32: Vec<u32> = Vec::with_capacity(n_tok * n_past_max);
-                for t in 0..t_len {
-                    let n_past = (pos0 as usize) + t + 1;
-                    for p in 0..n_past_max {
-                        masku32.push((p < n_past && mask_all[t][p]) as u32);
-                    }
+                // 마스크 u32 평탄화 — 토큰 단위로 독립이라 스레드로 나눈다.
+                // (직렬 24M push는 청크당 ~100-200ms를 먹었다 - 96MB 전송과 함께
+                //  QSA 브리지 비용의 큰 부분.)
+                let mut masku32: Vec<u32> = vec![0u32; n_tok * n_past_max];
+                {
+                    let pos0u = pos0 as usize;
+                    let mall: &[Vec<bool>] = &mask_all;
+                    let nthreads = std::thread::available_parallelism()
+                        .map(|v| v.get())
+                        .unwrap_or(4)
+                        .min(16);
+                    let per = t_len.div_ceil(nthreads.max(1)).max(1);
+                    std::thread::scope(|sc| {
+                        for (ci, chunk) in masku32.chunks_mut(per * n_past_max).enumerate() {
+                            let base = ci * per;
+                            sc.spawn(move || {
+                                for (i, row) in chunk.chunks_mut(n_past_max).enumerate() {
+                                    let t = base + i;
+                                    if t >= t_len {
+                                        break;
+                                    }
+                                    let n_past = pos0u + t + 1;
+                                    let m = &mall[t];
+                                    for (p, o) in row.iter_mut().enumerate() {
+                                        *o = (p < n_past && m[p]) as u32;
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+                if tm {
+                    eprintln!("# qsa-stage mask_u32={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                    t_lap = std::time::Instant::now();
                 }
                 // 전체 ctx clone은 디코드 스텝당 ~800MB 복사 — 사용 prefix만.
                 let kn = n_past_max * n_kv * hd;
