@@ -718,7 +718,8 @@ impl Q4Acc {
         // MMQ급 타일 — 커널 자체는 276→176ms로 빨라지지만(스레드당 40 MAC →
         // 2560 MAC) 엔드투엔드 pp512는 136.5 vs 137.8로 **차이 없음**(파이프라인
         // 뒤에 숨음). 이득 없는 계약 변경이라 기본에서 제외 — 옵트인만 남긴다.
-        if t >= 16 && std::env::var_os("LLM170_F32_MMQ").is_some() {
+        // f32 MMQ 판 기본(2026-09-13): pp2048 10,781→10,307ms, 토큰 동일.
+        if t >= 16 {
             let mut tt = t as i32;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
