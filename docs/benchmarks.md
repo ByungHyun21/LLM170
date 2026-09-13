@@ -380,12 +380,15 @@ full workspace test suite:
 | QSA `sel+proj` (indexer, CPU) | 51.6 s | **10.0 s** |
 | QSA `attn` (kernel) | 50.5 s | **30.5 s** |
 | QSA total | 107.3 s | 50.0 s |
-| prefill wall clock (incl. load) | 213.9 s | **121.3 s** |
+| prefill wall clock (incl. load) | 213.9 s | **117.1 s** |
 
 - Indexer: the per-row clone of the block-key cache was hoisted to a local
   buffer, the full sort became a partial select, and the dot was unrolled to 4
   accumulators; the per-row work then moved into a parallel pass (one scoped
   thread group per layer-chunk; per-row spawning regressed and was rejected).
+- The f32 GEMM (the MoE router, `ffn_gate_inp`) now defaults to its tiled/MMQ
+  variant: 924 ms -> 615 ms of GPU time for a 2048-token prefill, prefill
+  121.3 s -> 117.1 s at 11,750 tokens, tokens unchanged.
 - The offline tile kernels (`w32b.co`, `v4all.co`) gained a **token quadrant**
   axis (`blockIdx.z`), so a prefill chunk of N tokens is one GEMM launch per
   matrix instead of N/128 pieces. Each piece previously re-read the whole weight
