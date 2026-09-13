@@ -343,7 +343,32 @@ row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
 The 79.70 s figure above becomes 77.92 s with the mask flatten in
 `stages/qsa.rs` parallelized over tokens (it was a serial 24M-element push of a
 96 MB `u32` mask per QSA layer - at 11,750 tokens that is 2048x11750 entries per
-layer). pp2048 is unchanged (10,016 ms), so the win scales with context.
+layer), and **76.39 s** with the selection-list attention kernel
+(`q4_qsa_attn_sel`, commit `923aafa`): the mask-scan kernel iterated every past
+key (one warp shuffle round per key) even though it already skipped the loads of
+unselected keys, so the selected positions (top-k blocks + tail, ascending) are
+now walked directly - 5.7x fewer iterations at 11,750 and no divergence.
+`q4-qsa-check` proves the two kernels are **bit-identical** (identical
+arithmetic order) at t=64/n_past=4096 and t=128/n_past=11750.
+
+### The attention kernel is now the single largest kernel (traffic-bound)
+
+KTRACE at pp11750: total kernel time 45.0 s of the 76.4 s wall, of which
+**`q4_qsa_attn_sel` is 17.9 s (72 launches, 248 ms each)** - 40 % of all kernel
+time. The selection change removed the *iterations* (1.5 s) but not the
+*traffic*: every (token, head) pair reads its selected K/V rows independently,
+i.e. 2048 tokens x 24 heads x ~2051 keys x 256 dims x 2 (K and V) x 4 B ~ 206 GB
+per chunk, at ~830 GB/s effective - well past the LPDDR5x rate, so the L2 is
+doing the heavy lifting and is the limit.
+
+The fix is the classic one: stage K/V rows in shared memory once per block and
+let many query heads of the same KV head read them from there (the 24 query
+heads map to 2 KV heads, so a 12x traffic reduction is available), i.e. a
+flash-style block over (tokens x head-group) rather than one warp per
+(token, head). Expected ~15 s per chunk = ~20 % of the prefill.
+
+Decode at 8,192 context: **195 ms/step** (5.13 t/s, 3 steps) - down from
+~250 ms/step at the same context before the selection kernel.
 
 Two consecutive runs measured 79,730.4 and 79,703.7 ms. The earlier 117.1 s row
 in the history above is **not reproducible today** under identical flags; the
