@@ -224,6 +224,16 @@ changed stream ordering: the host path drains the stream at its ids d2h where th
 device path does not. Decisive next experiment: drop d2h_issue from the device path
 and re-run the A/B to separate ordering from added work.
 
+## Measurement protocol: use --reps 3 and quote the warm reps (2026-09-14)
+
+bench --reps 3 shows rep0 (cold) at 759.3 ms and reps 1-2 at 725.1/721.7, i.e. the
+warm spread is +-0.5% while a single-run comparison carries +-6%. Every A/B in this
+session that used one rep (753 vs 767 and similar) sat inside that noise band, so
+reps 3 and the warm reps are the protocol from here on. Under it the qwen4exp decode
+is 723.4 ms per 8 steps = 90.4 ms/step, and the row-batch Q4K kernel variant
+(LLM170_Q4K_Y=1 YRPT=4), which was the third attempt at recovering memory-level
+parallelism, is neutral at 719.9 ms.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
