@@ -374,6 +374,49 @@ pub fn wmma_ok() -> bool {
 /// 기기 실측 리포트 — 이름·가용/전체 메모리·호스트↔디바이스 대역폭.
 /// 라우트 선택의 근거(기동 1회). UMA면 h2d/d2h가 메모리 대역폭급으로 높고,
 /// PCIe 디스크리트면 수 GB/s 수준 — 같은 코드가 이 값으로 상주 정책을 정한다.
+/// `q4k-bench [rows] [n_in] [n_out] [reps]` — q4_K GEMM 형상 격리 계측.
+/// 합성 q4_K 텐서로 커널 변형별 실효 대역을 잰다(plans/65 하한 분석의 입력).
+pub fn q4k_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<String, String> {
+    use crate::rawhip::q4acc::Q4Acc;
+    use llm170_core::matmul::Accelerator;
+    let mut seed = 0x243F_6A88_85A3_08D3u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let n_super = n_in / 256;
+    let nblk = n_out * n_super;
+    let mut w = vec![0u8; nblk * 144];
+    for b in 0..nblk {
+        let o = &mut w[b * 144..(b + 1) * 144];
+        o[0] = 0x00; o[1] = 0x38;   // d = 0.5
+        o[2] = 0x00; o[3] = 0x30;   // dmin = 0.25
+        for j in 0..12 { o[4 + j] = ((b * 7 + j * 13) & 0x3F) as u8; }
+        for i in 0..128 { o[16 + i] = ((b * 31 + i * 37) & 0xFF) as u8; }
+    }
+    let xs: Vec<Vec<f32>> = (0..rows)
+        .map(|_| (0..n_in).map(|_| lcg()).collect())
+        .collect();
+    let weight = llm170_core::matmul::Weight {
+        data: &w,
+        ty: llm170_gguf::GgmlType::Q4K,
+        n_in: n_in as u64,
+        n_out: n_out as u64,
+    };
+    let acc = Q4Acc::new()?;
+    let mut out = vec![vec![0.0f32; n_out]; rows];
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        acc.matmul_batch(&xs, &weight, &mut out)?;
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    let gb = (nblk * 144) as f64 / (ms / 1e3) / 1e9;
+    Ok(format!(
+        "# q4k-bench t={rows} {n_in}x{n_out}: {ms:.3}ms/호출 ({gb:.1}GB/s 가중치, {}MB)",
+        nblk * 144 / 1_000_000
+    ))
+}
+
 /// `q4k-micro` — q4_K MMQ 타일을 **단일 256원소 슈퍼블록**에서 CPU 미러
 /// (`dot_q4k_q8`)와 직접 대조한다. 인덱스 매핑 버그를 값 수준에서 드러낸다.
 pub fn q4k_micro() -> Result<String, String> {
