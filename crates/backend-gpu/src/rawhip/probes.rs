@@ -421,6 +421,48 @@ pub fn f16_map() -> Result<String, String> {
         let distinct = pairs.iter().filter(|(_, o)| *o < 1000).count();
         let holes = pairs.iter().filter(|(_, o)| *o == usize::MAX).count();
         let multi = pairs.iter().filter(|(_, o)| *o >= 1000).count();
+        // 값 검증: 같은 블록 구성에서 전 원소 = 1.0 (d=1, q=1) → x=전부 1이면 출력 = n_in
+        {
+            let mut wv = vec![0u8; n_out * (n_in / 32) * 34];
+            for o in 0..n_out {
+                for sb in 0..n_in / 32 {
+                    let blk2 = &mut wv[(o * (n_in / 32) + sb) * 34..][..34];
+                    blk2[0] = 0x00;
+                    blk2[1] = 0x3C; // d = 1.0
+                    for l in 0..32 {
+                        blk2[2 + l] = 1;
+                    }
+                }
+            }
+            ctx.h2d(wd, &wv)?;
+            let xones = vec![1.0f32; n_in];
+            ctx.h2d(xd, bytemuck::cast_slice(&xones))?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+            ctx.sync()?;
+            let mut ov = vec![0.0f32; n_out];
+            ctx.d2h(bytemuck::cast_slice_mut(&mut ov), od as *const u8)?;
+            // 두 번째: d = 0.5(f16 0x3800), q = 2 → 같은 1.0 (스케일 경로 검증)
+            let mut wv2 = wv.clone();
+            for o in 0..n_out {
+                for sb in 0..n_in / 32 {
+                    let blk2 = &mut wv2[(o * (n_in / 32) + sb) * 34..][..34];
+                    blk2[0] = 0x00;
+                    blk2[1] = 0x38;
+                    for l in 0..32 {
+                        blk2[2 + l] = 2;
+                    }
+                }
+            }
+            ctx.h2d(wd, &wv2)?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+            ctx.sync()?;
+            let mut ov2 = vec![0.0f32; n_out];
+            ctx.d2h(bytemuck::cast_slice_mut(&mut ov2), od as *const u8)?;
+            out += &format!(
+                "# 값검증: 전원소1 → out[0]={} (기대 {n_in}) / d=0.5,q=2 → out[0]={} (기대 {n_in})\n",
+                ov[0], ov2[0]
+            );
+        }
         out += &format!("# blk={b}: 1:1={distinct} 빈칸={holes} 다중={multi}\n");
         if b == 0 {
             for (k, o) in pairs.iter() {
