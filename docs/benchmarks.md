@@ -397,7 +397,7 @@ start/end pair, with the event creation falling outside the pair), and the
 kernel names/counts are reliable; only the gap splits are not. The
 wall-clock numbers above are the ground truth.
 
-### The prefill is launch-rate-bound, not kernel-bound (rocprofv3, pp512)
+### The prefill is block-dispatch-bound (rocprofv3, pp512 + probe)
 
 A narrow rocprofv3 window (pp512 prefill only - the trace's window must exclude
 the ~35 s model load or the numbers are meaningless) shows:
@@ -408,7 +408,7 @@ the ~35 s model load or the numbers are meaningless) shows:
 | window span | 2,477 ms (bench prefill: 2,454 ms) |
 | GPU busy (sum of kernel durations) | 1,984 ms (80 %) |
 | GPU idle (gaps) | 611 ms (25 %) |
-| **host cost per launch** | **0.285 ms** (14x a typical ~20 us launch) |
+| launches | ~181 per layer (8,694 / 48) |
 
 **The host launch is not the cost.** A dedicated probe
 (`llm170 launch-rate N`, `rawhip::launch_rate`) launches a trivial kernel N times
@@ -423,10 +423,20 @@ and reports the host rate for several grid sizes:
 
 The host issues a launch in **~1 us regardless of the grid**, but the *device*
 spends **124 us dispatching 164k empty blocks** (the kernel body never runs -
-`q4_scale` bounds-checks and returns). The frame's GEMMs launch grids of exactly
-that size, so their measured 96 us is essentially block dispatch, not
-arithmetic: **the engine is block-dispatch-bound, not launch-bound**. Fewer,
-fatter blocks (the tile/quadrant kernels) is the lever, not fewer host calls.
+`q4_scale` bounds-checks and returns). The device dispatches roughly one block
+per cycle (~0.75 ns), so **block count is time**: the engine is
+block-dispatch-bound, not launch-bound, and fewer/fatter blocks is the lever.
+The top kernels are all over-parallelised:
+
+| kernel | grid | blocks | note |
+|---|---|---|---|
+| `q4_l2_rows` | (1048576,1,1) x32 | **1,048,576** | one 128-wide row per block; the row count comes from the *max-t* buffer (`flen/d`), of which only ~t are live |
+| `q4_gemm_q4k_ge` | (10240,320,1) x256 | **3,276,800** | its 1,949 us is almost entirely dispatch (3.3M x 0.75 ns ~ 2.5 ms) |
+| `q4_gemm_f32_m` | (8192,32,1) x256 | 262,144 | MoE router, 0.4 GFLOP at ~0.7 TFLOPS, 48x its memory-bound time |
+| `gemm_q8_j128` | (20480,1,4) x256 | 81,920 | 128x128 tiles, the healthy reference |
+
+The tile path is load-bearing: forcing the GEMV fallback (`LLM170_Q4_NO_TILE=1`)
+slows the 512-token prefill from 2,420 ms to 8,450 ms (3.5x).
 The launches still break down as follows (per layer of the 48; GPU time is the
 sum over the 512-token prefill) - the counts matter as much as the times,
 because each one re-dispatches its grid:
