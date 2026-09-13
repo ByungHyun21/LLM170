@@ -521,7 +521,9 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                 let mut exp4 = 0.0f32;
                 for sb in 0..n_in / 32 {
                     let on = sb < nb;
-                    let dv = if on { ((sb % 16) + 1) as f32 / 16.0 } else { 0.0 };
+                    // d는 모든 블록 동일(1/16) — q 패턴만 불균일하게 두어 "블록별 d"와
+                    // "블록 0 이상"을 분리한다.
+                    let dv = if on { 0.0625f32 } else { 0.0 };
                     for o in 0..n_out {
                         let blk2 = &mut wv4[(o * (n_in / 32) + sb) * 34..][..34];
                         let h = half_bits(dv);
