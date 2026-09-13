@@ -425,9 +425,8 @@ impl Q4Acc {
         {
             return Ok(());
         }
-        // f16 경로는 아직 미검증(plans/65 §15): f16-map이 **항등 짝지음**을
-        // 증명했으므로(가중치 슬롯 매핑 + llama q8_1 x) 남은 차이는 값 수준이다
-        // (스케일/레이아웃 의미). 기본 경로는 건드리지 않는다.
+        // f16 경로는 t=1에서만 검증됨(plans/65 §19): t>1(프리필)은 x 취급이 어긋나
+        // 값이 깨진다(f16-map t=4 프로브로 재현). t>1 해결 전에는 배선하지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
         self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, out)
     }
