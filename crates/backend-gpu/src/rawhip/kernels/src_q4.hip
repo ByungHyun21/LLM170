@@ -146,9 +146,6 @@ extern "C" __global__ void q4_gemm_q4k_x(const unsigned* xq, const unsigned* w, 
     const int n_super = n_in >> 8;
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;
-    // unroll 2: 다음 슈퍼블록의 가중치/활성 로드를 현재의 연산과 겹친다.
-    // 누산 순서는 그대로(컴파일러가 시맨틱 유지) → 수치 불변, MLP만 증가.
-    #pragma unroll 2
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         // ── x 16행 스테이징 (행당 64 워드 + 8 스케일)
         for (int i = threadIdx.x; i < 16 * 72; i += 256) {
@@ -228,9 +225,6 @@ extern "C" __global__ void q4_gemm_q4k_g(const unsigned* xq, const unsigned* w, 
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;
-    // unroll 2: 다음 슈퍼블록의 가중치/활성 로드를 현재의 연산과 겹친다.
-    // 누산 순서는 그대로(컴파일러가 시맨틱 유지) → 수치 불변, MLP만 증가.
-    #pragma unroll 2
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
         float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
@@ -474,9 +468,6 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;
-    // unroll 2: 다음 슈퍼블록의 가중치/활성 로드를 현재의 연산과 겹친다.
-    // 누산 순서는 그대로(컴파일러가 시맨틱 유지) → 수치 불변, MLP만 증가.
-    #pragma unroll 2
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
         float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
@@ -703,9 +694,6 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;
-    // unroll 2: 다음 슈퍼블록의 가중치/활성 로드를 현재의 연산과 겹친다.
-    // 누산 순서는 그대로(컴파일러가 시맨틱 유지) → 수치 불변, MLP만 증가.
-    #pragma unroll 2
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
         float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
