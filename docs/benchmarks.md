@@ -5065,3 +5065,22 @@ This is the longest-context verification the engine has been through (earlier re
 ~2.3k), and it exercises the paths that the f32-KV regression had broken - the short-prefill single
 kernel, the per-sequence KV pointer tables, and the MTP draft - at a scale where a silent corruption
 would be obvious in the text.
+
+## qwen4exp decode: the per-layer MoE grouping round trip is 44% of the step (2026-09-14)
+
+Stage-skip deltas after the L2Rows fix (tg8, two runs each, noise +-4%):
+none 790/887/837 ms, moe.shared 775/771 (about -8 ms/step), **moe.top10 491/478
+(-353 ms over 8 steps = -44 ms/step = 44% of the 100 ms step)**.
+
+The top10 op itself is not the cost: moving its selection arrays from (dynamically
+indexed, hence local-memory) `int sel[64]; float sp[64]` to shared memory changed
+nothing measurable (826.8 ms, bit-identical output). What the skip actually removes
+is the `moe_gen` bump, which invalidates the MoE grouping cache - so the 44 ms is
+the per-layer host round trip: a synchronous d2h of the routing ids, the host builds
+of the perm/inv/rowexp/padded tables, and three h2d uploads, 48 times per step. Each
+d2h flushes the pipeline, which is why the GPU sits near 20% utilisation even though
+the kernels themselves are microseconds.
+
+Fix direction: build those tables on the device (they are pure functions of the ids),
+which removes the round trip and keeps the results bit-identical; the prefill can keep
+the host path. This also unblocks the graph capture facility (segments collapse).

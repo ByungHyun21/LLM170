@@ -636,7 +636,10 @@ fn moe_frame(
     acc.frame_mm_group(f.mix, &[w_route, w_route_sh], &[f.mroute, f.msgate], t)
         .map_err(Q4Error::Io)?;
     sync_mark(acc, "moe.route", f.mroute)?;
-    op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
+    let _ = stage_skipped("moe.route");
+    if !stage_skipped("moe.top10") {
+        op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
+    }
     sync_mark(acc, "moe.top10", f.mids)?;
     let fs: &dyn FrameState = acc;
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
@@ -669,15 +672,17 @@ fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
-    op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
-    let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
-    let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
-    acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
-        .map_err(Q4Error::Io)?;
-    op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
-    let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
-    acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
-    op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
+    if !stage_skipped("moe.shared") {
+        op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
+        let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
+        let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
+        acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
+            .map_err(Q4Error::Io)?;
+        op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
+        let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
+        acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
+        op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
+    }
     sync_mark(acc, "moe.shared", f.mout)?;
     Ok(())
 }
