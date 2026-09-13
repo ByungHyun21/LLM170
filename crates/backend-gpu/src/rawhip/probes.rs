@@ -514,12 +514,45 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     }
                 }
             }
+            // 비영 블록 수를 늘려가며 관측(인덱싱 버그의 패턴을 드러낸다)
+            let mut per_nb = String::new();
+            for nb in [1usize, 2, 8] {
+                let mut wv4 = vec![0u8; n_out * (n_in / 32) * 34];
+                let mut exp4 = 0.0f32;
+                for sb in 0..n_in / 32 {
+                    let on = sb < nb;
+                    let dv = if on { ((sb % 16) + 1) as f32 / 16.0 } else { 0.0 };
+                    for o in 0..n_out {
+                        let blk2 = &mut wv4[(o * (n_in / 32) + sb) * 34..][..34];
+                        let h = half_bits(dv);
+                        blk2[0] = (h & 0xFF) as u8;
+                        blk2[1] = (h >> 8) as u8;
+                        let mut ssum = 0i32;
+                        for l in 0..32 {
+                            let q = if on { l as i32 - 16 } else { 0 };
+                            blk2[2 + l] = q as u8;
+                            ssum += q;
+                        }
+                        if o == 0 {
+                            exp4 += dv * ssum as f32;
+                        }
+                    }
+                }
+                let wd4 = ctx.alloc(wv4.len())?;
+                ctx.h2d(wd4, &wv4)?;
+                ctx.gemm_f16_deq(8, xd as *const u8, wd4 as *const u8, n_in, n_out, 1, od)?;
+                ctx.sync()?;
+                let mut ov4 = vec![0.0f32; n_out];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut ov4), od as *const u8)?;
+                per_nb += &format!(" nb={nb}: {:.3}/{exp4:.3}", ov4[0]);
+            }
             let wd3 = ctx.alloc(wv3.len())?;
             ctx.h2d(wd3, &wv3)?;
             ctx.gemm_f16_deq(8, xd as *const u8, wd3 as *const u8, n_in, n_out, 1, od)?;
             ctx.sync()?;
             let mut ov3 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov3), od as *const u8)?;
+            out += &format!("# 블록별 기여(실측/기대):{per_nb}\n");
             out += &format!(
                 "# 값검증: 전원소1 → {} (기대 {n_in}) / d=0.5,q=2 → {} (기대 {n_in}) / 부호·스케일 → {} (기대 {expect:.3})\n",
                 ov[0], ov2[0], ov3[0]
