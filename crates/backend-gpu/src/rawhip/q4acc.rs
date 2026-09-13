@@ -425,9 +425,9 @@ impl Q4Acc {
         {
             return Ok(());
         }
-        // f16 경로는 아직 미검증(plans/65 §13): 가중치 슬롯 매핑을 고쳐도 토큰이
-        // 어긋난다 — q6_K 선례의 dequant를 역산하면 그 매핑은 **항등**이므로,
-        // 원인은 가중치가 아니라 x(q8 레이아웃) 쪽으로 보인다. 배선하지 않는다.
+        // f16 경로는 아직 미검증(plans/65 §15): f16-map이 **항등 짝지음**을
+        // 증명했으므로(가중치 슬롯 매핑 + llama q8_1 x) 남은 차이는 값 수준이다
+        // (스케일/레이아웃 의미). 기본 경로는 건드리지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
         self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, out)
     }
