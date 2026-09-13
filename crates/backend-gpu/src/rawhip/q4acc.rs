@@ -183,7 +183,7 @@ impl Q4Acc {
             (&mut tx) as *mut _ as *mut std::ffi::c_void,
             (&mut rpd) as *mut _ as *mut std::ffi::c_void,
         ];
-        self.ctx.launch3("q4_moe_group_t1", 1, 1, 1, 32, &mut args)
+        self.ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args)
     }
 
 
