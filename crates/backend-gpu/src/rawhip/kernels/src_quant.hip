@@ -308,6 +308,16 @@ extern "C" __global__ void rmsq_rows(const float* x, const float* w, unsigned* x
     }
 }
 
+
+// f16 슬롯 매핑 — `.co` f16 GEMM(gemm_f16_v4)의 k-축 순서. 256x256 항등 가중치 +
+// 원-핫 활성 프로브(`llm170 f16-map`)로 블록별 분리 측정해 확정한 전단사:
+//   blk=0 → s = 8*(k&31);  blk>=1 → s = 8*(((k&31)-1)&31) + ((8-blk)&7)
+DEV int f16_slot(int k) {
+    int blk = k >> 5, l = k & 31;
+    if (blk == 0) return 8 * l;
+    return 8 * (((l - 1) & 31)) + ((8 - blk) & 7);
+}
+
 // q4_K(ggml 표준 블록 144B) → f16 256값 전개. 요소 순서는 행 순서 그대로
 // (저니블 = it*64+0..31, 고니블 = it*64+32..63). 밀집 가중치(전문가 제외)를
 // 영구 f16 캐시에 올려 텐서코어 GEMM에 넘기기 위한 전처리.
@@ -331,7 +341,7 @@ extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
     unsigned char byte = qs[it * 32 + (l & 31)];
     unsigned q = (l < 32) ? (byte & 0xFu) : (byte >> 4);
     float v = d * (float)s * (float)q - dmin * (float)mn;
-    out[((size_t)o * nsuper + blk) * 256 + e] = __float2half(v);
+    out[((size_t)o * nsuper + blk) * 256 + f16_slot(e)] = __float2half(v);
 }
 
 // q8_0(34B 블록: d f16 + 32 int8) → f16 256값 전개. dequant_q4k_f16와 같은 격자.
@@ -345,5 +355,5 @@ extern "C" __global__ void dequant_q8_0_f16(const unsigned char* __restrict__ w,
     const unsigned char* wb = w + ((size_t)o * nblk + blk * 8 + sb) * 34;
     float d = bits_f16((unsigned)wb[0] | ((unsigned)wb[1] << 8));
     signed char q = (signed char)wb[2 + l];
-    out[((size_t)o * nblk + blk) * 256 + e] = __float2half(d * (float)q);
+    out[((size_t)o * nblk + blk) * 256 + f16_slot(e)] = __float2half(d * (float)q);
 }

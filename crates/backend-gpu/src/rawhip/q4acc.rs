@@ -425,8 +425,9 @@ impl Q4Acc {
         {
             return Ok(());
         }
-        // f16 전개 경로는 gemm_f16_deq(미검증) 참조 — .co GEMM이 기대하는 f16
-        // 레이아웃 계약을 아직 맞추지 못했다(plans/65 §11). 배선하지 않는다.
+        // f16 경로는 아직 미검증(plans/65 §13): 가중치 슬롯 매핑을 고쳐도 토큰이
+        // 어긋난다 — q6_K 선례의 dequant를 역산하면 그 매핑은 **항등**이므로,
+        // 원인은 가중치가 아니라 x(q8 레이아웃) 쪽으로 보인다. 배선하지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
         self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, out)
     }
