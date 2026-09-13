@@ -411,6 +411,10 @@ impl RawCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        // 진단(LLM170_NOLAUNCH): 런치를 건너뛰고 호스트 스켈레톤 시간만 측정한다.
+        if std::env::var_os("LLM170_NOLAUNCH").is_some() {
+            return Ok(());
+        }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             if let Ok(mut g) = KTRACE.lock() {
