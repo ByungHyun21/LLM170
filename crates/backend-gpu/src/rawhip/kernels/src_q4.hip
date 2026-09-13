@@ -502,6 +502,7 @@ extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const fl
     const float* qh = q + ((size_t)tok * n_head + h) * 2 * hd;
     const float* gate = qh + hd;
     const unsigned* mrow = mask + (size_t)tok * n_past;
+    if (hd != 256) return;   // 점수 단계가 레인=차원(hd/32=8) 고정 — 계약 위반 시 무출력
     float acc = 0.0f;                   // dim tid
     float mrun = Q4_NEG;
     float lrun = 0.0f;
@@ -510,25 +511,29 @@ extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const fl
     __shared__ float red[8];
     for (int base = 0; base < n_past; base += 128) {
         int cnt = min(128, n_past - base);
-        // 1) 청크 점수 — 스레드 = 위치 (전체 hd 순차 dot)
-        if (tid < cnt) {
-            int p = base + tid;
-            float s = Q4_NEG;
-            if (mrow[p] != 0u) {
-                const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
-                // 4-누산기 언롤 — 단일 누산기는 FMA 지연 사슬에 묶여 ~4배 손해.
-                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-                int i = 0;
-                for (; i + 4 <= hd; i += 4) {
-                    a0 += qh[i] * k[i];
-                    a1 += qh[i + 1] * k[i + 1];
-                    a2 += qh[i + 2] * k[i + 2];
-                    a3 += qh[i + 3] * k[i + 3];
+        // 1) 청크 점수 — 워프당 키 1개, 레인 = 차원(응집 로드).
+        // 기존(스레드=키 행)은 레인이 서로 다른 1KB 행을 읽어 로드가 완전 비응집
+        // 이었다: 실측 104 GFLOPS(피크의 ~2-5%). q는 레지스터에 1회 적재.
+        {
+            int wid2 = tid >> 5, lane = tid & 31;
+            float qr[8];
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) qr[t2] = qh[lane + 32 * t2];
+            for (int r2 = 0; r2 < 16; r2++) {
+                int j = r2 * 8 + wid2;
+                if (j >= cnt) break;
+                int p = base + j;
+                float s = Q4_NEG;
+                if (mrow[p] != 0u) {
+                    const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+                    float a = 0.f;
+                    #pragma unroll
+                    for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * k[lane + 32 * t2];
+                    for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffffffffffull, a, off);
+                    s = a * kq_scale;
                 }
-                for (; i < hd; i++) a0 += qh[i] * k[i];
-                s = ((a0 + a1) + (a2 + a3)) * kq_scale;
+                if (lane == 0) sc[j] = s;
             }
-            sc[tid] = s;
         }
         __syncthreads();
         // 2) 청크 최대 (블록 환원)
