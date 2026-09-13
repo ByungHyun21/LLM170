@@ -283,10 +283,13 @@ fn mask_from_list(
             let qr: &[Vec<Vec<f32>>] = &q_rows;
             let idx_dim = hp.idx_dim;
             let idx_top_k = hp.idx_top_k;
+            // 16코어 × SMT = 32 논리 CPU — 캡을 두면 CPU 스테이지가 노는 동안
+            // GPU가 굶는다(프로파일: 창의 ~25% 유휴). 토큰별 산술은 그대로라
+            // 스레드 수는 수치에 영향이 없다.
             let nthreads = std::thread::available_parallelism()
                 .map(|v| v.get())
                 .unwrap_or(4)
-                .min(16);
+                .min(32);
             let per = t_len.div_ceil(nthreads.max(1)).max(1);
             let pos0u = pos0 as usize;
             std::thread::scope(|sc| {
