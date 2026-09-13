@@ -311,6 +311,25 @@ solo) on ROCm 7.2.2; pp 272-468 / tg 11.9-19.6 on ROCm 10 + master. **The earlie
 ~11.75k tokens and the timings are server-slot, so the row was removed rather
 than patched.
 
+### 2026-09-13 — same-condition llama.cpp baseline (both on this machine)
+
+Measured back-to-back on the same host, same GGUF (UD-Q4_K_XL 4-split), single
+sequence, greedy:
+
+| Condition | llama.cpp (qwen4exp runtime, `-ngl all -fa on`) | LLM170 (rawhip, CLI) |
+|---|---|---|
+| pp 230 (server steady state) | **250.72 t/s**, tg 20.47 | — (CLI elapsed includes load) |
+| pp 11,750 | **276.68 t/s**, tg 16.33 | ≈ 66 t/s pp, tg ~10 (212.4 s total incl. ~35 s load) |
+
+llama.cpp was served from `/home/yoon/local_llm-runtimes/qwen4exp` (PR #27742
+build) with the model's own `run.sh`; timings are llama-server `timings`
+fields from `/completion`. The LLM170 figure is the CLI's `elapsed` minus the
+measured load time (~35 s), so it is an upper bound on per-token prefill cost.
+The two runtimes cannot coexist in memory (llama's ~76 GB resident), so the
+measurements were taken sequentially.
+
+**Gap**: prefill ≈ 4.2x behind the reference; decode ≈ 1.6x behind.
+
 ### What is on the GPU now (plans/64 P1)
 
 - **Value path** (`rawhip/q4acc.rs`): `matmul`/`matmul_batch`/`matmul_group`
