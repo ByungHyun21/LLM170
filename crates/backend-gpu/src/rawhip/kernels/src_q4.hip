@@ -516,9 +516,17 @@ extern "C" __global__ void q4_qsa_attn(const float* q, const float* ck, const fl
             float s = Q4_NEG;
             if (mrow[p] != 0u) {
                 const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
-                s = 0.0f;
-                for (int i = 0; i < hd; i++) s += qh[i] * k[i];
-                s *= kq_scale;
+                // 4-누산기 언롤 — 단일 누산기는 FMA 지연 사슬에 묶여 ~4배 손해.
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                int i = 0;
+                for (; i + 4 <= hd; i += 4) {
+                    a0 += qh[i] * k[i];
+                    a1 += qh[i + 1] * k[i + 1];
+                    a2 += qh[i + 2] * k[i + 2];
+                    a3 += qh[i + 3] * k[i + 3];
+                }
+                for (; i < hd; i++) a0 += qh[i] * k[i];
+                s = ((a0 + a1) + (a2 + a3)) * kq_scale;
             }
             sc[tid] = s;
         }
