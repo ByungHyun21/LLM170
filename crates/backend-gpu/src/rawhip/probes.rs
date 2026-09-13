@@ -378,9 +378,9 @@ pub fn wmma_ok() -> bool {
 /// **블록별로 분리 측정**한다. 가중치를 한 32원소 블록으로 제한(b)하고 원-핫
 /// 활성(k)을 넣으면, 출력의 1 위치가 곧 "x의 k가 어느 열과 곱해지는가"다.
 /// (전체 항등으로 한 번에 재면 블록 간 간섭이 섞여 전단사가 깨진다 — plans/65 §12)
-pub fn f16_map() -> Result<String, String> {
+pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
     let ctx = RawCtx::new()?;
-    let (n_out, n_in) = (256usize, 256usize);
+    let (n_out, n_in) = (256usize, n_in_arg.max(128));
     let wd = ctx.alloc(n_out * (n_in / 32) * 34)?;
     let xd = ctx.alloc(n_in * 4)?;
     let od = ctx.alloc(n_out * 4)?;
