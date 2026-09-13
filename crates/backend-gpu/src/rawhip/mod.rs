@@ -1585,5 +1585,100 @@ mod micro_tests {
             enq2 / N as f64 * 1e3,
             total2 / N as f64 * 1e3
         );
+
+        // GDN l2scale 시퀀스 격리 — 디코드에서 0.69ms/층으로 관측된 그 4커널
+        // (split3 → l2_rows ×2 → scale). 실제로 그만큼 드는지, 맥락 탓인지 가른다.
+        let conv_ch = 4096i32;
+        let kv = 1024i32;
+        let dstate = 128i32;
+        let src = ctx.scratch(conv_ch as usize * 4).expect("src");
+        let gq = ctx.scratch(kv as usize * 4).expect("gq");
+        let gk = ctx.scratch(kv as usize * 4).expect("gk");
+        let gv = ctx.scratch(kv as usize * 4).expect("gv");
+        let launch_seq = || {
+            let (mut sp, mut p0, mut p1, mut p2) = (
+                src as *mut std::ffi::c_void,
+                gq as *mut std::ffi::c_void,
+                gk as *mut std::ffi::c_void,
+                gv as *mut std::ffi::c_void,
+            );
+            let (mut n0, mut n1, mut n2) = (kv, kv, kv);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut p0) as *mut _ as *mut std::ffi::c_void,
+                (&mut p1) as *mut _ as *mut std::ffi::c_void,
+                (&mut p2) as *mut _ as *mut std::ffi::c_void,
+                (&mut n0) as *mut _ as *mut std::ffi::c_void,
+                (&mut n1) as *mut _ as *mut std::ffi::c_void,
+                (&mut n2) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("split3", ((kv * 3) as u32).div_ceil(256), 1, 1, 256, &mut args)
+                .unwrap();
+            for x in [gq as *mut std::ffi::c_void, gk as *mut std::ffi::c_void] {
+                let (mut xp, mut e, mut d) = (x, 1e-6f32, dstate);
+                let mut a2: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut xp) as *mut _ as *mut std::ffi::c_void,
+                    (&mut e) as *mut _ as *mut std::ffi::c_void,
+                    (&mut d) as *mut _ as *mut std::ffi::c_void,
+                ];
+                ctx.launch3("q4_l2_rows", 1, 1, 1, 32, &mut a2).unwrap();
+            }
+            let (mut gp, mut sc, mut nn) = (gq as *mut std::ffi::c_void, 0.088f32, kv);
+            let mut a3: Vec<*mut std::ffi::c_void> = vec![
+                (&mut gp) as *mut _ as *mut std::ffi::c_void,
+                (&mut sc) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("q4_scale", (kv as u32).div_ceil(128), 1, 1, 128, &mut a3).unwrap();
+        };
+        for _ in 0..20 {
+            launch_seq();
+        }
+        ctx.sync().unwrap();
+        const M: usize = 2000;
+        let t2 = std::time::Instant::now();
+        for _ in 0..M {
+            launch_seq();
+        }
+        let enq3 = t2.elapsed().as_secs_f64() * 1e3;
+        ctx.sync().unwrap();
+        let total3 = t2.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "# micro GDN l2scale 시퀀스(4커널) {M}회: host {enq3:.1}ms ({:.2}µs/회), 총 {total3:.1}ms ({:.2}µs/회)",
+            enq3 / M as f64 * 1e3,
+            total3 / M as f64 * 1e3
+        );
+
+        // DRAM 대역 — 512MB 버퍼를 bcast_rows(읽기 n*4 + 쓰기 n*4)로 훑는다.
+        // 디코드의 실 트래픽 추정(129.5ms × 대역)에 필요한 값.
+        let big = 512usize * 1024 * 1024 / 4; // f32 개수
+        let sb = ctx.scratch(big * 4).expect("src-big");
+        let db = ctx.scratch(big * 4).expect("dst-big");
+        let launch_big = || {
+            let (mut sp, mut dp) = (sb as *mut std::ffi::c_void, db as *mut std::ffi::c_void);
+            let (mut nn, mut rr) = (big as i32, 1i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+            ];
+            ctx.launch3("bcast_rows", (big as u32).div_ceil(128), 1, 1, 128, &mut args)
+                .unwrap();
+        };
+        for _ in 0..3 {
+            launch_big();
+        }
+        ctx.sync().unwrap();
+        let t3 = std::time::Instant::now();
+        launch_big();
+        ctx.sync().unwrap();
+        let dt = t3.elapsed().as_secs_f64();
+        let gb = (big as f64 * 8.0) / 1e9; // 읽기+쓰기
+        eprintln!(
+            "# micro DRAM 대역(512MB x2): {:.2}ms → {:.0} GB/s",
+            dt * 1e3,
+            gb / dt
+        );
     }
 }
