@@ -155,6 +155,32 @@ Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
 Token stream verified bit-identical to non-spec greedy (64/64).
 Acceptance 4-5 tokens/verify at k=4 on natural text.
 
+## qwen4exp decode: where the time actually goes (measured 2026-09-14)
+
+Decode step = 129.5 ms (tg8 1036 ms). Decomposition, all measured on the 8060S:
+
+- Host skeleton (LLM170_NOLAUNCH, extended to launch3): 12.8 ms. So the step is
+  device-side.
+- Launch cost is NOT the issue: a micro-benchmark (rawhip::micro_tests::
+  launch_cost_split) puts host enqueue at 0.97 us/launch and a tiny kernel at
+  2.4 us/launch, q4_l2_rows at 10.8 us. A HIP graph capture of the whole step
+  (62 segments) is bit-identical but 6% slower, which is consistent: removing host
+  launches cannot help when it costs 1 us each.
+- KTRACE/ftime per-kernel figures for the tiny kernels (0.34 ms/call) are inflated
+  by event pairing and sync costs; treat the stage-skip deltas as ground truth.
+- Stage-skip deltas (LLM170_STAGE_SKIP=...): GDN -50.0 ms/step (39%), MoE -24.4
+  (19%), QSA -10.5 (8%). Per layer: GDN 1.39 ms, MoE 0.51 ms, QSA 0.87 ms.
+- Ideal weight traffic per step (n_embd 2560, 48 layers, 512 experts top-10, expert
+  n_ff 640): MoE 1.3 GB + GDN projections 1.1 GB + shared/QSA/PLE ~0.4 GB = ~2.8 GB,
+  i.e. ~12 ms at 230 GB/s. Measured 129.5 ms is ~11x the bound, and llama.cpp's
+  61 ms/step is ~5x, so neither implementation is bandwidth-bound: the cost is the
+  dependency chain of ~3,200 kernels and the t=1 kernel shapes.
+
+Next levers, in order: fuse the GDN per-layer chain (l2+scale, conv+ar, the
+elementwise group), retune the t=1 GEMM/GEMV block shapes (gemm_q8_0 runs 546
+launches/step with prefill-sized grids), then the MoE top10 (17.0 ms/step for 48
+calls) and the QSA bridge (10.3 ms/step for 12 calls).
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
