@@ -658,10 +658,19 @@ impl Q4Acc {
         // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다
         // (2026-09-12 실측: t=129 폴트, t=128 정상, GEMV 경로는 비트 동일).
         if t >= 16 && std::env::var_os("LLM170_Q4_NO_TILE").is_none() {
+            // j128/v4 계열(=8/12/13/14/23)은 사분면 지원 — 그 외 타입만 128씩 분할.
+            let tq_mode = matches!(
+                ty,
+                x if x == ggml_id(GgmlType::Q8_0)
+                    || x == ggml_id(GgmlType::Q4K)
+                    || x == ggml_id(GgmlType::Q5K)
+                    || x == ggml_id(GgmlType::Q6K)
+                    || x == ggml_id(GgmlType::Q3K)
+            );
             let mut ok = true;
-            for c in 0..t.div_ceil(128) {
+            for c in 0..if tq_mode { 1 } else { t.div_ceil(128) } {
                 let t0 = c * 128;
-                let tc = 128.min(t - t0);
+                let tc = if tq_mode { t } else { 128.min(t - t0) };
                 let xsrc = unsafe { xq.add(t0 * xq_w * 4) };
                 let osrc = unsafe { out.add(t0 * n_out * 4) };
                 if self
@@ -2112,6 +2121,19 @@ pub fn check_tensor(
             max_rel = max_rel.max(d / b.abs().max(1e-3) as f64);
             bit_eq += (a.to_bits() == b.to_bits()) as usize;
             n += 1;
+        }
+    }
+    if std::env::var_os("LLM170_Q4ACC_ROWDBG").is_some() {
+        for &ri in &[0usize, 1, 2, 127, 128, 129, 130, 199, 200, 201, 255] {
+            if ri >= gpu.len() {
+                continue;
+            }
+            let m = gpu[ri]
+                .iter()
+                .zip(&cpu[ri])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("# row {ri}: maxerr={m:.5}");
         }
     }
     if std::env::var_os("LLM170_Q4ACC_DBG").is_some() {
