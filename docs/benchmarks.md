@@ -377,10 +377,16 @@ flash-style block over (tokens x head-group) rather than one warp per
 (token, head). Expected ~15 s per chunk = ~20 % of the prefill.
 
 Decode: **156 ms/step at 2,048 context** (6.41 t/s) and 195 ms/step at 8,192.
-The decode is the same kernel at t=1, where only 24 warps exist (one per head),
-so it is latency/occupancy-bound rather than at the L2 limit: a split-K variant
-(like the value path's `qsa_flash_split4q4` + merge) over the selection list is
-the next step and would give the same 4x concurrency.
+
+The decode runs the same kernel at t=1, where only 24 warps exist (one per head).
+Raising that concurrency by launching one 32-thread block per token (adding a
+`tpb` argument to `q4_qsa_attn_sel`; verified bit-identical by the probe at
+t=1 and t=256) made it **worse** - 274 vs 195 ms/step - so the limit is not
+simple warp occupancy, and that change was reverted. The block's early-exit
+warps (15 of 16 return immediately) appear to help rather than hurt. A split-K
+over the selection list (like the value path's `qsa_flash_split4q4` + merge) is
+still the untried option, but it changes the softmax rounding order, so it needs
+its own baseline - it cannot be validated by token identity.
 
 Two consecutive runs measured 79,730.4 and 79,703.7 ms. The earlier 117.1 s row
 in the history above is **not reproducible today** under identical flags; the
