@@ -55,6 +55,10 @@ struct MoeGroup {
     inv_pad_d: u64,
     tilexp_d: u64,
     rows_pad: usize,
+    /// 디바이스 rows_pad 포인터(디바이스 그룹화 경로에서만 != 0).
+    rows_pad_d: u64,
+    /// 디바이스 전문가 오프셋 포인터(폴백이 필요할 때만 사용).
+    off_d: u64,
     off: Vec<usize>,
 }
 
@@ -140,6 +144,47 @@ fn ggml_id(ty: GgmlType) -> u32 {
 impl Q4Acc {
     /// 행 순열 gather: dst[g] = src[perm[g]] (row_u32 = 행당 u32 수).
     /// 산란은 역순열을 넘겨 같은 커널로 수행한다.
+    /// 디바이스 그룹화 런치 — q4_moe_group_t1(단일 블록·단일 스레드).
+    /// 호스트 왕복(동기 d2h + 테이블 빌드 + h2d 3회)을 대체한다. 테이블은
+    /// ids의 순수 함수이므로 결과는 호스트판과 동일(비트 동일).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_group_dev(
+        &self,
+        ids: u64,
+        ne: usize,
+        rows: usize,
+        off_d: u64,
+        perm_d: u64,
+        inv_d: u64,
+        rowexp_d: u64,
+        perm_pad_d: u64,
+        inv_pad_d: u64,
+        tilexp_d: u64,
+        rows_pad_d: u64,
+    ) -> Result<(), String> {
+        let mut ip = self.fptr(ids)?;
+        let (mut od, mut pd, mut iv) = (off_d as *mut u8, perm_d as *mut u8, inv_d as *mut u8);
+        let (mut rx, mut pp, mut ipd) =
+            (rowexp_d as *mut u8, perm_pad_d as *mut u8, inv_pad_d as *mut u8);
+        let (mut tx, mut rpd) = (tilexp_d as *mut u8, rows_pad_d as *mut u8);
+        let (mut n_e, mut rws) = (ne as i32, rows as i32);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut ip) as *mut _ as *mut std::ffi::c_void,
+            (&mut n_e) as *mut _ as *mut std::ffi::c_void,
+            (&mut rws) as *mut _ as *mut std::ffi::c_void,
+            (&mut od) as *mut _ as *mut std::ffi::c_void,
+            (&mut pd) as *mut _ as *mut std::ffi::c_void,
+            (&mut iv) as *mut _ as *mut std::ffi::c_void,
+            (&mut rx) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ipd) as *mut _ as *mut std::ffi::c_void,
+            (&mut tx) as *mut _ as *mut std::ffi::c_void,
+            (&mut rpd) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("q4_moe_group_t1", 1, 1, 1, 32, &mut args)
+    }
+
+
     fn rows_permute(
         &self,
         src: *mut u8,
@@ -1051,14 +1096,58 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
                 .filter(|g| g.generation == generation && g.rows == rows)
-                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.off.clone()))
+                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d))
         };
         if tm {
             eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, off) = match hit {
+        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, rows_pad_d, off, off_d) = match hit {
             Some(v) => v,
             None => {
+                // t=1(디코드): 그룹화를 GPU에서 한다. 호스트 왕복(동기 d2h + 테이블
+                // 빌드 + h2d 3회)이 스텝의 44%(48층×0.9ms)였다 — 테이블은 ids의
+                // 순수 함수라 커널로 옮기면 사라진다. 결과는 호스트판과 동일 순서라
+                // 비트 동일. (프리필은 행 수가 커서 기존 호스트 경로 유지.)
+                // 기본 off(옵트인) — 2026-09-14 실측: down(q8_0)이 폴백이라 오프셋
+                // d2h가 남아 스텝당 +25ms 회귀(층당 왕복은 그대로). q8_0 그룹 커널을
+                // 붙여 폴백을 없애면 켠다. 테이블은 호스트판과 비트 동일(검증됨).
+                if std::env::var_os("LLM170_MOE_GROUP_DEV").is_some()
+                    && self.t_cur() == 1
+                    && ne <= 512
+                    && rows > 0
+                {
+                    let bound = rows * 16 + 16; // rows_pad 상한(전문가당 16행 정렬)
+                    let (pd, ivd, rxd) = {
+                        let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
+                        let pd = a.ensure(&self.ctx, rows * 4)? as u64;
+                        let mut b = self.rperm2.lock().map_err(|e| e.to_string())?;
+                        let ivd = b.ensure(&self.ctx, rows * 4)? as u64;
+                        let mut c = self.rexp.lock().map_err(|e| e.to_string())?;
+                        let rxd = c.ensure(&self.ctx, rows * 4)? as u64;
+                        (pd, ivd, rxd)
+                    };
+                    let (ppd, ipd, txd, offd, rpd) = {
+                        let mut a = self.gp.lock().map_err(|e| e.to_string())?;
+                        let ppd = a.ensure(&self.ctx, (bound + 1) * 4)? as u64;
+                        let mut b = self.gi.lock().map_err(|e| e.to_string())?;
+                        let ipd = b.ensure(&self.ctx, rows * 4)? as u64;
+                        let mut c = self.texp.lock().map_err(|e| e.to_string())?;
+                        let txd = c.ensure(&self.ctx, (bound / 16 + 1) * 4)? as u64;
+                        let mut d = self.gyp.lock().map_err(|e| e.to_string())?;
+                        let base = d.ensure(&self.ctx, (ne + 2) * 4)? as u64;
+                        let offd = base;
+                        let rpd = base + (ne as u64 + 1) * 4; // off 뒤 4B = rows_pad
+                        (ppd, ipd, txd, offd, rpd)
+                    };
+                    self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd)?;
+                    let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
+                    *c = Some(MoeGroup {
+                        generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
+                        perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd,
+                        rows_pad: bound, rows_pad_d: rpd, off_d: offd, off: Vec::new(),
+                    });
+                    (pd, ivd, rxd, ppd, ipd, txd, bound, rpd, Vec::new(), offd)
+                } else {
                 // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                 // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
                 crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in")?;
@@ -1165,8 +1254,9 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out")?;
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                 *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
-                    perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, off: off.clone() });
-                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, off)
+                    perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, rows_pad_d: 0, off_d: 0, off: off.clone() });
+                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, 0u64, off, 0u64)
+                }
             }
         };
         phase("group", &mut lap);
@@ -1248,6 +1338,8 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             let mut w_p = wd as *mut std::ffi::c_void;
             let mut o_p = yg as *mut std::ffi::c_void;
             let mut rx_p = rowexp_d as *mut std::ffi::c_void;
+            // 디바이스 그룹화 경로면 rows_pad를 커널이 디바이스에서 읽는다(가드).
+            let mut rpd_p = rows_pad_d as *mut u8;
             let (mut ni, mut no, mut xw, mut tt, mut eb) = (
                 n_in as i32,
                 n_out as i32,
@@ -1266,6 +1358,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 (&mut xw) as *mut _ as *mut std::ffi::c_void,
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
                 (&mut eb) as *mut _ as *mut std::ffi::c_void,
+                (&mut rpd_p) as *mut _ as *mut std::ffi::c_void,
             ];
             {
                 use std::sync::Mutex;
@@ -1289,7 +1382,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
                 n_out.div_ceil(16) as u32,
-                rows.div_ceil(16) as u32,
+                rows_pad.div_ceil(16) as u32,
                 1,
                 256,
                 &mut args,
@@ -1301,6 +1394,18 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             }
             return Ok(());
         }
+        // 디바이스 그룹화 경로(off 비어 있음): 폴백(비 Q4K/Q5_1 타입, 예: down의
+        // q8_0)은 전문가별 런치를 위해 오프셋만 읽는다 — 그룹화·테이블 빌드·업로드
+        // 왕복은 GPU가 이미 끝냈으므로 여기서는 (ne+1)개 int만 받는다.
+        let off_d2h;
+        let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
+            let mut b = vec![0i32; ne + 1];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut b), off_d as *const u8)?;
+            off_d2h = b.iter().map(|&x| x.max(0) as usize).collect::<Vec<usize>>();
+            &off_d2h
+        } else {
+            &off
+        };
         for e in 0..ne {
             let r = off[e + 1] - off[e];
             if r == 0 {
