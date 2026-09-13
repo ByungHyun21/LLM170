@@ -116,22 +116,27 @@ fn frame_t_max_cap(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
     if let Some(v) = std::env::var("LLM170_FRAME_TMAX").ok().and_then(|v| v.parse::<usize>().ok()) {
         return v.clamp(16, 4096);
     }
-    // 적응형: 큰 VRAM(≥16GB)이면 1024 — 전문가당 행 수가 늘어 MoE 가중치 재사용이
-    // 좋아진다(11,750토큰 실측: 총 −5.7%, gemm3 −14%, qsa −9%). 8GB CMP는 512
-    // 유지(1024는 hipMalloc OOM 이력).
+    // 적응형: 청크가 크면 전문가당 행 수가 늘어 MoE 가중치 재사용이 좋아진다.
+    // 11,750토큰 실측(프리필 elapsed, 로드 포함): 512→1024 −5.7%, 1024→2048 −5.1%
+    // (누적 155.2→139.0s). 프레임 버퍼는 청크에 비례(≈0.8GB@512)하므로 VRAM 계층으로
+    // 고른다. 8GB CMP는 512 유지(1024는 hipMalloc OOM 이력).
+    const GB: u64 = 1024 * 1024 * 1024;
     match acc.map(|a| a.total_mem_bytes()).unwrap_or(0) {
-        m if m >= 16 * 1024 * 1024 * 1024 => 1024,
+        m if m >= 48 * GB => 2048,
+        m if m >= 16 * GB => 1024,
         _ => FRAME_T_MAX,
     }
 }
 
 fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
+    let cap = frame_t_max_cap(acc);
+    // 기본값 = 적응형 상한(env는 "요청"이고 상한이 최종 결정 — VRAM이 작으면 내려간다).
     std::env::var("LLM170_Q4_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1024)
+        .unwrap_or(cap)
         .clamp(16, 4096)
-        .min(frame_t_max_cap(acc))
+        .min(cap)
 }
 
 impl Engine4 {
@@ -300,11 +305,12 @@ impl Engine4 {
     /// (t=2311 실측, llama-server -ub 512도 같은 이유로 청크).
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
         // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024; 프레임 경로는 t_max 상한).
+        let cap0 = frame_t_max_cap(self.acc.as_deref());
         let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1024)
-            .clamp(16, 1024);
+            .unwrap_or(cap0)
+            .clamp(16, 4096);   // 상한은 frame_t_max_cap이 결정(적응형)
         // 프레임 상태가 권위적이면(직전 디코드) CPU 사본을 GPU에서 갱신 —
         // 이후 값 경로 prefill이 정합 상태에서 시작한다.
         if let Some(f) = &self.frame {
