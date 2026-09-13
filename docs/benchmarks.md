@@ -181,6 +181,29 @@ elementwise group), retune the t=1 GEMM/GEMV block shapes (gemm_q8_0 runs 546
 launches/step with prefill-sized grids), then the MoE top10 (17.0 ms/step for 48
 calls) and the QSA bridge (10.3 ms/step for 12 calls).
 
+## qwen4exp decode traffic: 11x redundancy (measured 2026-09-14)
+
+Micro-benchmarks (rawhip::micro_tests::launch_cost_split, cargo test -p
+llm170-backend-gpu --release) establish the constants: host enqueue 0.76 us/launch,
+a tiny kernel 2.0 us/launch, q4_l2_rows(d=2560) 10.8 us, a dependent 4-kernel GDN
+l2scale sequence (split3 + 2x l2_rows + scale) 11.8 us, DRAM (512 MB read+write)
+239 GB/s, cache-resident bw_probe 1112 GB/s, f32 FMA 51 TFLOPS.
+
+Against those constants the decode step (129.5 ms) implies ~31 GB of traffic per
+token. The ideal is ~2.8 GB (active weights, 6B-A at Q4, plus a few PLE rows), so
+there is an 11x redundancy - a single token reads 44% of the model's 70 GB. Compute
+is irrelevant (12 GFLOP needs 0.24 ms), launch cost is irrelevant (2 us), the host
+skeleton is 12.8 ms and a dependent 4-kernel chain runs in 11.8 us, so the per-stage
+times seen in ftime (e.g. l2scale 690 us/layer, moe.shared 560 us/layer) are 20-60x
+their isolated cost and cannot be explained by kernels, launches or chain latency.
+The residual is memory traffic.
+
+To localize it, profile the bytes rather than the time: run rocprofv3 with
+FETCH_SIZE/WRITE_SIZE counters filtered to one kernel (e.g. gemm_q8_0 / q4_gemm_q4k_ge)
+over a short decode (bench --pp 24 --tg 4), and compare the per-kernel fetched bytes
+against the tensor sizes the kernel should touch. Keep the profile to a single step;
+whole-run counter collection is not safe on this machine.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
