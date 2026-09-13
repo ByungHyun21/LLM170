@@ -62,6 +62,34 @@ use llm170_profiler::profile_span;
         }
     }
 
+/// 선택 목록에서 마스크를 복원한다 — `mask_all[t]`이 비어 있을 때만(즉
+/// 마스크를 만들지 않은 GPU 경로에서 CPU 폴백이 걸릴 때) 호출된다.
+fn mask_from_list(
+    mask_all: &[Vec<bool>],
+    sel_blk: &[u32],
+    sel_cnt: &[u32],
+    sel_stride: usize,
+    r: usize,
+    t: usize,
+    n_past: usize,
+) -> Vec<bool> {
+    if !mask_all[t].is_empty() {
+        return mask_all[t].clone();
+    }
+    let mut m = vec![false; n_past];
+    let tail_start = (n_past / r) * r;
+    for k2 in 0..sel_cnt[t] as usize {
+        let b = sel_blk[t * sel_stride + k2] as usize;
+        for j in b * r..(b + 1) * r {
+            m[j] = true;
+        }
+    }
+    for j in tail_start..n_past {
+        m[j] = true;
+    }
+    m
+}
+
     /// QSA층 — 인덱서 top-k 마스크 게이트드 GQA.
     pub fn qsa_layer(
         ctx: &Ctx,
@@ -128,7 +156,15 @@ use llm170_profiler::profile_span;
         let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
         let n_past_max = (pos0 as usize) + t_len;
         let mut gpu_attn = ctx.acc.is_some();
-        let mut mask_all: Vec<Vec<bool>> = vec![vec![false; n_past_max]; n_tok];
+        // 마스크는 CPU 어텐션 경로에서만 쓴다 — GPU 경로는 선택 목록을 쓴다.
+        // (행당 n_past bool을 2048행 만들면 24MB 할당 + 4.2M 채우기가 층마다 든다.)
+        // GPU 경로에서 폴백이 걸리면 목록에서 그때 만든다(mask_of).
+        let need_mask = !gpu_attn;
+        let mut mask_all: Vec<Vec<bool>> = if need_mask {
+            vec![vec![false; n_past_max]; n_tok]
+        } else {
+            vec![Vec::new(); n_tok]
+        };
         let mut cpu_attn = false;   // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함)
 
         let seq_state = &mut *seq;
@@ -218,6 +254,30 @@ use llm170_profiler::profile_span;
         let sel_stride = hp.idx_top_k / r + 2;
         let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
         let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
+        // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
+        // 선택된 블록은 (정렬해) 고정 보폭 배열에 적재한다 — 이어서 패스 C가
+        // 오름차순 위치 목록으로 압축하고, GPU는 그 목록만 순회한다.
+        let sel_stride = hp.idx_top_k / r + 2;
+        let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
+        let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
+        // 선택 목록에서 마스크를 복원한다 (GPU 경로에서 CPU 폴백이 걸릴 때만).
+        let mask_of = |t: usize, n_past: usize| -> Vec<bool> {
+            if !mask_all[t].is_empty() {
+                return mask_all[t].clone();
+            }
+            let mut m = vec![false; n_past];
+            let tail_start = (n_past / r) * r;
+            for k2 in 0..sel_cnt[t] as usize {
+                let b = sel_blk[t * sel_stride + k2] as usize;
+                for j in b * r..(b + 1) * r {
+                    m[j] = true;
+                }
+            }
+            for j in tail_start..n_past {
+                m[j] = true;
+            }
+            m
+        };
         {
             let bkl: &[f32] = &bk_local;
             let qr: &[Vec<Vec<f32>>] = &q_rows;
@@ -285,13 +345,15 @@ use llm170_profiler::profile_span;
                                         .unwrap_or(std::cmp::Ordering::Equal)
                                 });
                             }
-                            let mut mask = vec![false; n_past];
-                            for j in tail_start..n_past {
-                                mask[j] = true;
-                            }
-                            for &b in &sel_blocks[..n_sel_blocks] {
-                                for j in b * r..(b + 1) * r {
+                            let mut mask = if need_mask { vec![false; n_past] } else { Vec::new() };
+                            if need_mask {
+                                for j in tail_start..n_past {
                                     mask[j] = true;
+                                }
+                                for &b in &sel_blocks[..n_sel_blocks] {
+                                    for j in b * r..(b + 1) * r {
+                                        mask[j] = true;
+                                    }
                                 }
                             }
                             // 목록용: 선택 블록을 오름차순으로 고정 보폭 배열에.
@@ -313,8 +375,9 @@ use llm170_profiler::profile_span;
             for t in 0..t_len {
                 let n_past = (pos0 as usize) + t + 1;
                 let mut attn_out = std::mem::take(&mut attn_all[t]);
+                let m_t = mask_from_list(&mask_all, &sel_blk, &sel_cnt, sel_stride, r, t, n_past);
                 cpu_attn_row(
-                    &mut attn_out, &qg[t], &mask_all[t], n_past, ckv, cvv,
+                    &mut attn_out, &qg[t], &m_t, n_past, ckv, cvv,
                     n_head, n_kv, hd, kq_scale,
                 );
                 attn_all[t] = attn_out;
@@ -385,7 +448,8 @@ use llm170_profiler::profile_span;
                         cpu_attn = true;
                         for (t, row) in attn_all.iter_mut().enumerate() {
                             let n_past = (pos0 as usize) + t + 1;
-                            let mask_t = mask_all[t].clone();
+                            let mask_t =
+                                mask_from_list(&mask_all, &sel_blk, &sel_cnt, sel_stride, r, t, n_past);
                             let q_t = qg[t].clone();
                             let mut attn_out = std::mem::take(row);
                             cpu_attn_row(
