@@ -50,6 +50,7 @@ struct MoeGroup {
     rows: usize,
     perm_d: u64,
     inv_d: u64,
+    rowexp_d: u64,   // 행→전문가 (순열 후 순서) — 그룹 GEMM용
     off: Vec<usize>,
 }
 
@@ -102,6 +103,7 @@ pub struct Q4Acc {
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
     rperm: std::sync::Mutex<GBuf>,
+    rexp: std::sync::Mutex<GBuf>,
     rperm2: std::sync::Mutex<GBuf>,
     /// 그룹화 캐시(위 MoeGroup) + 무효화 세대(라우팅이 갱신될 때 증가).
     moe_group: std::sync::Mutex<Option<MoeGroup>>,
@@ -214,6 +216,7 @@ impl Q4Acc {
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
+            rexp: std::sync::Mutex::new(GBuf::new("rexp")),
             rperm2: std::sync::Mutex::new(GBuf::new("rperm2")),
             moe_group: std::sync::Mutex::new(None),
             quant_cache: std::sync::Mutex::new(None),
@@ -1013,12 +1016,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
                 .filter(|g| g.generation == generation && g.rows == rows)
-                .map(|g| (g.perm_d, g.inv_d, g.off.clone()))
+                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.off.clone()))
         };
         if tm {
             eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        let (perm_d, inv_d, off) = match hit {
+        let (perm_d, inv_d, rowexp_d, off) = match hit {
             Some(v) => v,
             None => {
                 let mut lp = std::time::Instant::now();
@@ -1052,22 +1055,30 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     if ms >= 0.05 { eprintln!("# moe-miss sort={ms:.2}ms"); }
                     lp = std::time::Instant::now();
                 }
-                let (pd, ivd) = {
+                let (pd, ivd, rxd) = {
                     let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
                     let pd = a.ensure(&self.ctx, rows * 4)? as u64;
                     let mut b = self.rperm2.lock().map_err(|e| e.to_string())?;
                     let ivd = b.ensure(&self.ctx, rows * 4)? as u64;
-                    (pd, ivd)
+                    let mut c = self.rexp.lock().map_err(|e| e.to_string())?;
+                    let rxd = c.ensure(&self.ctx, rows * 4)? as u64;
+                    (pd, ivd, rxd)
                 };
                 self.ctx.h2d(pd as *mut u8, bytemuck::cast_slice(&perm))?;
                 self.ctx.h2d(ivd as *mut u8, bytemuck::cast_slice(&inv))?;
+                // rowexp: 순열 후 행 p의 전문가 = idv[perm[p]]
+                let mut rowexp = vec![0u32; rows];
+                for p in 0..rows {
+                    rowexp[p] = idv[(perm[p] as usize).min(rows - 1)].min((ne - 1) as u32);
+                }
+                self.ctx.h2d(rxd as *mut u8, bytemuck::cast_slice(&rowexp))?;
                 if tm {
                     let ms = lp.elapsed().as_secs_f64() * 1e3;
                     if ms >= 0.05 { eprintln!("# moe-miss h2d={ms:.2}ms"); }
                 }
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
-                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, off: off.clone() });
-                (pd, ivd, off)
+                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd, off: off.clone() });
+                (pd, ivd, rxd, off)
             }
         };
         phase("group", &mut lap);
@@ -1085,6 +1096,49 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         phase("gather", &mut lap);
         if llm170_core::qwen4exp::frame::stage_skipped("moe") {
             // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
+            return Ok(());
+        }
+        // 그룹 런치(옵트인) — q4_K 전문가를 한 번에: 청크당 런치 7.4만 → 48.
+        // 호스트/갭 ~2.7초@pp2048 제거(KTRACE 실측). 산술은 _m과 동일(비트 동일).
+        // 기본 경로 — 비트 동일(토큰 검증), pp2048 −1.8%, 런치 7.4만→48/청크.
+        if ws.ty == GgmlType::Q4K && !f32w && rows > 0 {
+            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let mut x_p = xg as *mut std::ffi::c_void;
+            let mut w_p = wd as *mut std::ffi::c_void;
+            let mut o_p = yg as *mut std::ffi::c_void;
+            let mut rx_p = rowexp_d as *mut std::ffi::c_void;
+            let (mut ni, mut no, mut xw, mut tt, mut eb) = (
+                n_in as i32,
+                n_out as i32,
+                xq_w as i32,
+                rows as i32,
+                per_expert as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut rx_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut eb) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_gemm_q4k_ge",
+                n_out.div_ceil(16) as u32,
+                rows.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+            self.rows_permute_dev(yg, inv_d as *mut u8, op_, n_out, rows)?;
+            phase("scatter", &mut lap);
+            if tm {
+                eprintln!("# moe-phase TOTAL={:.2}ms rows={rows}", t0.elapsed().as_secs_f64() * 1e3);
+            }
             return Ok(());
         }
         for e in 0..ne {
