@@ -438,9 +438,16 @@ An earlier reading of this table attributed a (10240,320) grid to `q4_gemm_q4k_g
 and called it dispatch-dominated; instrumenting the launcher shows the real
 shape (n_in=2560, n_out=640, rows=5120 -> 40x320 blocks) and the kernel runs at
 4.4 TFLOPS, i.e. it is *not* a target. The f32 router GEMM is the outlier: its
-grid is sized correctly (gx = n_out/16, gy = t/16) so the ~1.3 TFLOPS it reaches
-is the kernel's *inner loop*, a mixed f32-weight x int8-activation dot at ~11 %
-of the device's f32 peak.
+grid is sized correctly (gx = n_out/16, gy = t/16), so the ~1.3 TFLOPS is the
+kernel's inner loop. Reading it explains why: each thread computes one output
+with a full `for (k = 0; k < n_in; k++) acc += xr[k] * wr[k];` where the 16
+threads sharing a row read `w + o * n_in + k` - addresses 10 KB apart, one cache
+line per thread per step, and one FMA per 8 bytes loaded. The kernel is purely
+uncoalesced-memory-bound. The GEMV variant in the same file (`q4_gemm_f32`) has
+the right pattern (k across the 64 lanes, warp reduction); the tiled variant
+never got it. Fixing it is worth ~7 % of the chunk's GPU time (~1.6 % of the
+prefill) - smaller than the ~25 % of the window the GPU spends idle at the
+frame's blocking readbacks.
 
 The tile path is load-bearing: forcing the GEMV fallback (`LLM170_Q4_NO_TILE=1`)
 slows the 512-token prefill from 2,420 ms to 8,450 ms (3.5x).
