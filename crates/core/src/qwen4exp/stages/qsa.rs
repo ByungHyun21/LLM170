@@ -392,7 +392,7 @@ use llm170_profiler::profile_span;
         ctx.mm_batch(&attn_all, &wo, &mut out)?;
         if tm {
             eprintln!(
-                "# qsa-stage attn={:.1}ms out_mm={:.1}ms total={:.1}ms",
+                "# qsa-stage t={t_len} attn={:.1}ms out_mm={:.1}ms total={:.1}ms",
                 t_lap.elapsed().as_secs_f64() * 1e3,
                 0.0,
                 t_all.elapsed().as_secs_f64() * 1e3

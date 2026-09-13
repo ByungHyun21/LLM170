@@ -358,12 +358,15 @@ kernel table, and it is now located: it is the pipeline drain/fill around the
 **QSA host bridge**.
 
 Direct instrumentation of the bridge (`LLM170_Q4_TIME=1`, steady t=2048
-layers, per layer):
+layers, per layer) - the two independent timers (the bridge's and the stage's
+own) agree once both are filtered to `t=2048`:
 
 | part | per layer | per chunk (12 QSA layers) |
 |---|---|---|
 | `frame_read` (21 MB d2h + drain) | 77-115 ms | ~1.0 s |
-| CPU `stages::qsa_layer` | **230-402 ms** | **~2.9 s** |
+| `stages::qsa_layer` | **230-255 ms** | **~2.9 s** |
+| - of which the attention lap | 93-97 ms | ~1.1 s |
+| - of which the projection group | ~12 ms | ~0.15 s |
 | `frame_write` (21 MB h2d) | 2.1 ms | ~0.03 s |
 
 so the bridge costs ~3.9 s per 2048-token chunk, i.e. **~40 % of the 10.0 s
