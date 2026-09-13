@@ -213,6 +213,11 @@ use llm170_profiler::profile_span;
             t_lap = std::time::Instant::now();
         }
         // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
+        // 선택된 블록은 (정렬해) 고정 보폭 배열에 적재한다 — 이어서 패스 C가
+        // 오름차순 위치 목록으로 압축하고, GPU는 그 목록만 순회한다.
+        let sel_stride = hp.idx_top_k / r + 2;
+        let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
+        let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
         {
             let bkl: &[f32] = &bk_local;
             let qr: &[Vec<Vec<f32>>] = &q_rows;
@@ -225,10 +230,18 @@ use llm170_profiler::profile_span;
             let per = t_len.div_ceil(nthreads.max(1)).max(1);
             let pos0u = pos0 as usize;
             std::thread::scope(|sc| {
-                for (ci, chunk) in mask_all.chunks_mut(per).enumerate() {
+                for (ci, (chunk, (blk_chunk, cnt_chunk))) in mask_all
+                    .chunks_mut(per)
+                    .zip(sel_blk.chunks_mut(per * sel_stride).zip(sel_cnt.chunks_mut(per)))
+                    .enumerate()
+                {
                     let base = ci * per;
                     sc.spawn(move || {
-                        for (i, slot) in chunk.iter_mut().enumerate() {
+                        for ((i, slot), (bslot, cslot)) in chunk
+                            .iter_mut()
+                            .enumerate()
+                            .zip(blk_chunk.chunks_mut(sel_stride).zip(cnt_chunk.iter_mut()))
+                        {
                             let t = base + i;
                             let n_past = pos0u + t + 1;
                             let n_blocks = n_past / r;
@@ -281,6 +294,13 @@ use llm170_profiler::profile_span;
                                     mask[j] = true;
                                 }
                             }
+                            // 목록용: 선택 블록을 오름차순으로 고정 보폭 배열에.
+                            let mut sb: Vec<usize> = sel_blocks[..n_sel_blocks].to_vec();
+                            sb.sort_unstable();
+                            for (k2, &b) in sb.iter().enumerate() {
+                                bslot[k2] = b as u32;
+                            }
+                            *cslot = n_sel_blocks as u32;
                             *slot = mask;
                         }
                     });
@@ -314,50 +334,39 @@ use llm170_profiler::profile_span;
                     t_lap = std::time::Instant::now();
                 }
                 let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
-                // 마스크 u32 평탄화 — 토큰 단위로 독립이라 스레드로 나눈다.
-                // (직렬 24M push는 청크당 ~100-200ms를 먹었다 - 96MB 전송과 함께
-                //  QSA 브리지 비용의 큰 부분.)
-                let mut masku32: Vec<u32> = vec![0u32; n_tok * n_past_max];
-                {
-                    let pos0u = pos0 as usize;
-                    let mall: &[Vec<bool>] = &mask_all;
-                    let nthreads = std::thread::available_parallelism()
-                        .map(|v| v.get())
-                        .unwrap_or(4)
-                        .min(16);
-                    let per = t_len.div_ceil(nthreads.max(1)).max(1);
-                    std::thread::scope(|sc| {
-                        for (ci, chunk) in masku32.chunks_mut(per * n_past_max).enumerate() {
-                            let base = ci * per;
-                            sc.spawn(move || {
-                                for (i, row) in chunk.chunks_mut(n_past_max).enumerate() {
-                                    let t = base + i;
-                                    if t >= t_len {
-                                        break;
-                                    }
-                                    let n_past = pos0u + t + 1;
-                                    let m = &mall[t];
-                                    for (p, o) in row.iter_mut().enumerate() {
-                                        *o = (p < n_past && m[p]) as u32;
-                                    }
-                                }
-                            });
-                        }
-                    });
+                // 선택 목록 압축 — 블록(오름차순) + 테일. 위치는 오름차순이므로
+                // 마스크 스캔과 산술 순서가 같다(프로브에서 비트 동일 확인).
+                let mut sel_off: Vec<u32> = vec![0u32; n_tok + 1];
+                for t2 in 0..n_tok {
+                    let n_past = pos0 as usize + t2 + 1;
+                    let tail_cnt = n_past - (n_past / r) * r;
+                    sel_off[t2 + 1] = sel_off[t2] + sel_cnt[t2] * r as u32 + tail_cnt as u32;
                 }
-                if tm {
-                    eprintln!("# qsa-stage mask_u32={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
-                    t_lap = std::time::Instant::now();
+                let mut sel_idx: Vec<u32> = vec![0u32; sel_off[n_tok] as usize];
+                for t2 in 0..n_tok {
+                    let n_past = pos0 as usize + t2 + 1;
+                    let tail_start = (n_past / r) * r;
+                    let mut o = sel_off[t2] as usize;
+                    for k2 in 0..sel_cnt[t2] as usize {
+                        let b = sel_blk[t2 * sel_stride + k2] as usize;
+                        for j in 0..r {
+                            sel_idx[o] = (b * r + j) as u32;
+                            o += 1;
+                        }
+                    }
+                    for j in tail_start..n_past {
+                        sel_idx[o] = j as u32;
+                        o += 1;
+                    }
                 }
                 // 전체 ctx clone은 디코드 스텝당 ~800MB 복사 — 사용 prefix만.
                 let kn = n_past_max * n_kv * hd;
                 let ck = seq.kv_k[full_idx][..kn].to_vec();
                 let cv = seq.kv_v[full_idx][..kn].to_vec();
-                // 미지원(예: t>128 커널 결함)이면 CPU 어텐션으로 폴백 — gdn_ar과
-                // 같은 규약. 값 경로 프리필은 원래 CPU 어텐션이었으므로 회귀 아님.
-                match acc.qsa_attention(
+                // 미지원이면 CPU 어텐션 폴백 — gdn_ar과 같은 규약.
+                match acc.qsa_attention_sel(
                     &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
-                    &masku32, kq_scale, n_past_max, n_head, n_kv, hd, n_tok,
+                    &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, n_tok,
                 ) {
                     Ok(res) => {
                         for (t, row) in attn_all.iter_mut().enumerate() {

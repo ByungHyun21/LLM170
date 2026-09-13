@@ -200,6 +200,26 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_attention: 이 가속기는 미지원".into())
     }
 
+    /// QSA 선택-목록 GQA — 마스크 대신 (t+1) 오프셋 + **오름차순** 위치 목록.
+    /// 마스크 스캔과 산술 순서가 같다(선택 밖 키는 소프트맥스 상태를 바꾸지
+    /// 않는다) — 프로브 `q4-qsa-check`가 비트 동일로 확인한다.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_sel(
+        &self,
+        _q: &[f32],
+        _ck: &[f32],
+        _cv: &[f32],
+        _sel_idx: &[u32],
+        _sel_off: &[u32],
+        _kq_scale: f32,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+    ) -> Result<Vec<f32>, String> {
+        Err("qsa_attention_sel: 이 가속기는 미지원".into())
+    }
+
     /// 전문가 down처럼 입력이 가중치마다 다른 1행 짝: outs[i][o] = xs[i]·W_i[o].
     /// 기본 = 개별 실행. GPU 구현은 런치 배치 + 단일 동기화로 파이프라이닝.
     fn matmul_paired(

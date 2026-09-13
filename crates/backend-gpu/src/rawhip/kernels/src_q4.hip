@@ -667,6 +667,61 @@ extern "C" __global__ void q4_qsa_attn_wt(const float* q, const float* ck, const
     }
 }
 
+// 선택 목록판 — `_wt`와 동일 산술·구조이나 키 순회가 마스크 스캔이 아니라
+// 압축된 선택 인덱스 목록(오름차순)이다. 목록은 top-k 블록 + 테일을 담는다.
+extern "C" __global__ void q4_qsa_attn_sel(const float* q, const float* ck, const float* cv,
+                                           const unsigned* sel_idx, const unsigned* sel_off,
+                                           float* out, float kq_scale,
+                                           int n_head, int n_kv, int hd, int t) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int tok = (int)blockIdx.x * 16 + wid;   // 블록당 16토큰 = K/V 행 재사용 2배
+    int h = blockIdx.y;
+    if (tok >= t || h >= n_head || hd != 256) return;
+    int kvh = h / (n_head / n_kv);
+    const float* qh = q + ((size_t)tok * n_head + h) * 2 * hd;
+    const float* gate = qh + hd;
+    float qr[8];
+    #pragma unroll
+    for (int t2 = 0; t2 < 8; t2++) qr[t2] = qh[lane + 32 * t2];
+    float acc[8];
+    #pragma unroll
+    for (int t2 = 0; t2 < 8; t2++) acc[t2] = 0.0f;
+    float mrun = Q4_NEG;
+    float lrun = 0.0f;
+    const unsigned long long FULL = 0xffffffffffffffffull;   // 이 플랫폼은 64비트 마스크 요구
+    // 선택 목록만 순회 — 마스크 확인·발산이 없다(전 키 스캔 대비 키 수가
+    // top_k/r 배로 줄고, 내부 루프가 완전 수렴한다).
+    const int j0 = (int)sel_off[tok];
+    const int j1 = (int)sel_off[tok + 1];
+    for (int j = j0; j < j1; j++) {
+        const int p = (int)sel_idx[j];
+        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        float a = 0.0f;
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * k[lane + 32 * t2];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(FULL, a, off);
+        float s = a * kq_scale;
+        if (s > mrun) {
+            float corr = (mrun <= Q4_NEG) ? 0.0f : exp_cr(mrun - s);
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) acc[t2] *= corr;
+            lrun *= corr;
+            mrun = s;
+        }
+        float e = exp_cr(s - mrun);
+        lrun += e;
+        const float* vr = cv + (size_t)p * n_kv * hd + kvh * hd;
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) acc[t2] += e * vr[lane + 32 * t2];
+    }
+    for (int t2 = 0; t2 < 8; t2++) {
+        float o = (lrun > 0.0f) ? acc[t2] / lrun : 0.0f;
+        float g = 1.0f / (1.0f + exp_cr(-gate[lane + 32 * t2]));
+        out[((size_t)tok * n_head + h) * hd + lane + 32 * t2] = o * g;
+    }
+}
+
 // ─── qwen4exp 프레임 op 커널 (plans/64 P1) ───
 // 수치 계약: core `qwen4exp/stages/*`·`layers.rs`와 동일 산술. rms/norm_gated는
 // 기존 커널(rms_part/finish·norm_gated_silu 구조)의 세그먼트 f32 + f64 결합을
