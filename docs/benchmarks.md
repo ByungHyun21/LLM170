@@ -368,10 +368,15 @@ launches) and `gemm_q8_j128` (4.6 s, 4639 launches), and the KTRACE's
 `after <kernel>` rows - time attributed between one kernel's completion and the
 next traced event - total ~29 s, dominated by `after q4_rows_permute_u32`
 (10.5 s over 1986 launches) and `after q4_gemm_f32_m` (8.8 s over 1728). Those
-rows are *not* kernel time; with the kernels suppressed (`LLM170_NOLAUNCH`) the
-host work of the whole layer loop is only 0.15 s, so they are launch/queue
-latency rather than host compute. Their exact meaning has not been pinned down
-yet and is the next measurement to make.
+rows are *not* kernel time: with the kernels suppressed (`LLM170_NOLAUNCH`) the
+host work of the whole layer loop is only 0.15 s, so they are not host compute
+either. They are most likely a **measurement artifact**: `launch3` creates two
+`hipEvent` objects per launch when `LLM170_KTRACE` is set and never destroys
+them (`mod.rs`), so a run with ~10k launches allocates ~20k events and the
+event-record cost lands *between* consecutive kernels - exactly where the
+`after` rows measure. Treat the kernel *names and counts* from KTRACE as
+reliable and its gap/timing splits as suspect; the wall-clock numbers above are
+the ground truth.
 
 ### The attention kernel was the largest kernel (traffic-bound)
 
