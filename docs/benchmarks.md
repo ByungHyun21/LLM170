@@ -442,12 +442,17 @@ grid is sized correctly (gx = n_out/16, gy = t/16), so the ~1.3 TFLOPS is the
 kernel's inner loop. Reading it explains why: each thread computes one output
 with a full `for (k = 0; k < n_in; k++) acc += xr[k] * wr[k];` where the 16
 threads sharing a row read `w + o * n_in + k` - addresses 10 KB apart, one cache
-line per thread per step, and one FMA per 8 bytes loaded. The kernel is purely
-uncoalesced-memory-bound. The GEMV variant in the same file (`q4_gemm_f32`) has
-the right pattern (k across the 64 lanes, warp reduction); the tiled variant
-never got it. Fixing it is worth ~7 % of the chunk's GPU time (~1.6 % of the
-prefill) - smaller than the ~25 % of the window the GPU spends idle at the
-frame's blocking readbacks.
+line per thread per step, and one FMA per 8 bytes loaded. **That diagnosis was tested and refuted.** A transposed-weight kernel
+(`q4_gemm_f32_mt`: lane = contiguous `o`, so the warp reads 64 B per k step) was
+implemented and verified bit-identical, and it was *slower*: pp2048 9,814 ->
+10,067 ms (+2.6 %). The old layout is one cache line per thread per step, but
+each thread walks its row **sequentially**, which the hardware prefetches
+perfectly; the transposed layout strides 2,560 B per k step and defeats
+prefetch. Coalescing is not the metric here - per-thread sequentiality is.
+
+What the ~1.3 TFLOPS actually is then remains open (the loop is 1 FMA per 8
+bytes over 2,560 sequential steps, so it should be compute/MLP-bound, not
+line-count-bound).
 
 The tile path is load-bearing: forcing the GEMV fallback (`LLM170_Q4_NO_TILE=1`)
 slows the 512-token prefill from 2,420 ms to 8,450 ms (3.5x).
