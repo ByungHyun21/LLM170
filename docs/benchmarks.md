@@ -352,6 +352,24 @@ Two levers dominate:
    context, so its cost grows with n_past while llama's paged/top-k sparse path
    grows with the selected blocks.
 
+### 2026-09-13 — long-context prefill split (11,750 tokens)
+
+`LLM170_FRAME_TIME=1` + `LLM170_Q4_TIME=1`, frame path, 24 chunks of 512:
+
+| Stage | 2,311 tok | 11,750 tok |
+|---|---|---|
+| frame total | 42.6 s | 191.1 s |
+| `qsa_bridge` (12 layers) | 10.2 s | **107.7 s (56 %)** |
+| `moe.gemm3` | 24.1 s (17.8 s of it in the cold first chunk) | 58.9 s (31 %) |
+| QSA `sel+proj` (CPU indexer) | 2.9 s | **51.6 s** |
+| QSA `attn` (kernel + PCIe) | 6.3 s | 50.5 s |
+
+The indexer's cost matches a scalar MAC estimate (210 G MAC ≈ 52 s), so it is
+CPU-bound, and it grows with rows x blocks (context-quadratic). Parallelizing it
+per row with `std::thread::scope` **regressed** (51.6 -> 69.7 s) because thread
+spawn cost dominates at that granularity; it was reverted. The next lever is a
+device-side indexer (block scores are a batched matrix product).
+
 ### What is on the GPU now (plans/64 P1)
 
 - **Value path** (`rawhip/q4acc.rs`): `matmul`/`matmul_batch`/`matmul_group`
