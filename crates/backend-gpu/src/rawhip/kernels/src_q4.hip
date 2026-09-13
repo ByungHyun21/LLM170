@@ -558,50 +558,75 @@ extern "C" __global__ void q4_moe_group_t1(
         unsigned* __restrict__ rowexp, unsigned* __restrict__ perm_pad,
         unsigned* __restrict__ inv_pad, unsigned* __restrict__ tilexp,
         int* __restrict__ rows_pad_out) {
+    // 단일 스레드판은 전역 쓰기 ~700회가 캐시 미스 지연으로 직렬화되어
+    // 0.5ms/층(=24ms/스텝)이었다. 스캔만 lane 0이 하고 나머지는 워프/블록
+    // 병렬로 — 순서는 호스트판과 동일(안정 카운팅, 16행 정렬 패딩)이라
+    // 테이블이 비트 동일하다.
+    __shared__ int cnt[513];
     __shared__ int off[513];
+    __shared__ int off_pad[513];
     __shared__ int cur[512];
-    if (blockIdx.x != 0 || threadIdx.x != 0 || ne > 512) return;
-    for (int e = 0; e <= ne; e++) off[e] = 0;
-    for (int i = 0; i < rows; i++) {
+    __shared__ int rows_pad_sh;
+    const int l = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    if (ne > 512) return;
+    for (int e = l; e <= ne; e += nt) { cnt[e] = 0; off[e] = 0; off_pad[e] = 0; }
+    if (l < 512) cur[l] = 0;
+    __syncthreads();
+    for (int i = l; i < rows; i += nt) {
         int e = (int)ids[i];
         e = e < 0 ? 0 : (e >= ne ? ne - 1 : e);
-        off[e + 1] += 1;
+        atomicAdd(&cnt[e], 1);
     }
-    for (int e = 0; e < ne; e++) off[e + 1] += off[e];
-    for (int e = 0; e <= ne; e++) out_off[e] = off[e];
-    for (int e = 0; e < ne; e++) cur[e] = off[e];
-    for (int i = 0; i < rows; i++) {
-        int e = (int)ids[i];
-        e = e < 0 ? 0 : (e >= ne ? ne - 1 : e);
-        int p = cur[e];
-        cur[e] = p + 1;
-        perm[p] = (unsigned)i;
-        inv[i] = (unsigned)p;
-        rowexp[p] = (unsigned)e;
-    }
-    int acc = 0;
-    for (int e = 0; e < ne; e++) {
-        int r = off[e + 1] - off[e];
-        int pad = (r + 15) / 16 * 16;
-        for (int i = 0; i < pad; i++) {
-            int pd = acc + i;
-            if (i < r) {
-                unsigned src = perm[off[e] + i];
-                perm_pad[pd] = src;
-                inv_pad[src] = (unsigned)pd;
-            } else {
-                perm_pad[pd] = 0;
-            }
+    __syncthreads();
+    if (l == 0) {
+        int acc = 0;
+        for (int e = 0; e < ne; e++) { off[e] = acc; acc += cnt[e]; }
+        off[ne] = acc;
+        int accp = 0;
+        for (int e = 0; e < ne; e++) {
+            int r = off[e + 1] - off[e];
+            off_pad[e] = accp;
+            accp += (r + 15) / 16 * 16;
         }
-        for (int tg = acc / 16; tg < (acc + pad) / 16; tg++) tilexp[tg] = (unsigned)e;
-        acc += pad;
+        off_pad[ne] = accp;
+        int rp = accp < 16 ? 16 : accp;
+        rows_pad_sh = rp;
+        *rows_pad_out = rp;
+        for (int e = 0; e < ne; e++) cur[e] = off[e];
+        for (int i = 0; i < rows; i++) {
+            int e = (int)ids[i];
+            e = e < 0 ? 0 : (e >= ne ? ne - 1 : e);
+            int p = cur[e];
+            cur[e] = p + 1;
+            perm[p] = (unsigned)i;
+            inv[i] = (unsigned)p;
+            rowexp[p] = (unsigned)e;
+        }
+        for (int e = 0; e < ne; e++) {
+            for (int tg = off_pad[e] / 16; tg < off_pad[e + 1] / 16; tg++) tilexp[tg] = (unsigned)e;
+        }
     }
-    int rows_pad = acc < 16 ? 16 : acc;
-    // 상한(rows*16+16)까지 0으로 채운다 — 호스트가 상한 그리드로 gather를 걸어도
-    // 패딩/여분 행이 0번 행을 읽어 안전하다(값은 GEMM 가드로 무시된다).
+    __syncthreads();
+    for (int e = l; e <= ne; e += nt) out_off[e] = off[e];
+    // 패딩 슬롯 병렬 채움(전역 읽기/쓰기 각 1회, 라인 단위로 흩어짐)
+    const int rp = rows_pad_sh;
+    for (int pd = l; pd < rp; pd += nt) {
+        int e = (int)tilexp[pd >> 4];
+        int i = pd - off_pad[e];
+        int r = off[e + 1] - off[e];
+        if (i < r) {
+            unsigned src = perm[off[e] + i];
+            perm_pad[pd] = src;
+            inv_pad[src] = (unsigned)pd;
+        } else {
+            perm_pad[pd] = 0;
+        }
+    }
     int bound = rows * 16 + 16;
-    for (int i = acc; i < bound; i++) perm_pad[i] = 0;
-    *rows_pad_out = rows_pad;
+    for (int pd = (rp > (bound & ~15) ? rp : (bound & ~15)); pd < bound; pd += nt) {
+        perm_pad[pd] = 0;
+    }
 }
 
 // 한 런치로 전부 처리한다. 산술 순서는 _m과 동일(비트 동일).
