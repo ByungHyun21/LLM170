@@ -693,13 +693,20 @@ impl Q4Acc {
                     .ctx
                     .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
                 {
-                    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                     if std::env::var_os("LLM170_Q4_DBG").is_some() {
-                        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if k < 8 {
-                            eprintln!(
-                                "# gemm_tile 폴백#{k}: ty={ty} n_in={n_in} n_out={n_out} t={tc} err={e}"
-                            );
+                        use std::sync::Mutex;
+                        use std::sync::OnceLock;
+                        static SEEN: OnceLock<Mutex<Vec<(u32, usize, usize, usize)>>> = OnceLock::new();
+                        let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
+                        if let Ok(mut v) = seen.lock() {
+                            // (ty, n_in, n_out) 별 1회 + t는 128 단위 구간으로 구분.
+                            let key = (ty, n_in, n_out, (tc / 128) * 128);
+                            if !v.contains(&key) && v.len() < 24 {
+                                v.push(key);
+                                eprintln!(
+                                    "# gemm_tile 폴백: ty={ty} n_in={n_in} n_out={n_out} t={tc} err={e}"
+                                );
+                            }
                         }
                     }
                     ok = false;
