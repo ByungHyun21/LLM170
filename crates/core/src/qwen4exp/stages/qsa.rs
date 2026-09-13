@@ -244,6 +244,39 @@ fn mask_from_list(
                 }
             });
         }
+        // q norm·rope를 qg에 적용 — 원본과 동일 산술(어텐션은 패스 뒤 일괄).
+        // 패스 A 병렬화 때 이 루프가 누락되어 어텐션이 비정규화 q를 쓰는 회귀가 있었다
+        // (diverse 프롬프트 감사로 발견: out 해시가 갈렸다).
+        {
+            let nthreads_q = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(4)
+                .min(32);
+            let per_q = t_len.div_ceil(nthreads_q.max(1)).max(1);
+            let pos0u = pos0 as usize;
+            let qn: &[f32] = &q_norm_w;
+            let (n_rot_l, rope_base, eps) = (n_rot, hp.rope_base, hp.eps);
+            std::thread::scope(|sc| {
+                for (ci, chunk) in qg.chunks_mut(per_q).enumerate() {
+                    let base = ci * per_q;
+                    sc.spawn(move || {
+                        for (i, row) in chunk.iter_mut().enumerate() {
+                            let t = base + i;
+                            if t >= t_len {
+                                break;
+                            }
+                            let pos = pos0u as u32 + t as u32;
+                            for h in 0..n_head {
+                                let lo = h * 2 * hd;
+                                let mut qh = rms_norm(&row[lo..lo + hd], qn, eps);
+                                rope_head(&mut qh, pos, n_rot_l, rope_base);
+                                row[lo..lo + hd].copy_from_slice(&qh);
+                            }
+                        }
+                    });
+                }
+            });
+        }
         // 블록 키 캐시 — 청크 끝까지의 완전 블록을 병렬로(증분, 이전 청크분은 재사용).
         {
             let n_blocks_max = (pos0 as usize + t_len) / r;
@@ -512,6 +545,28 @@ fn mask_from_list(
                 t_lap.elapsed().as_secs_f64() * 1e3,
                 0.0,
                 t_all.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if std::env::var_os("LLM170_QSA_HASH").is_some() {
+            let used_kv = (((pos0 as usize) + t_len) * n_kv * hd).min(seq.kv_k[full_idx].len());
+            let used_idx = (((pos0 as usize) + t_len) * hp.idx_dim).min(seq.idx_k[full_idx].len());
+            let h = |v: &[f32]| -> u64 {
+                let mut x = 0xcbf29ce484222325u64;
+                for f in v.iter() {
+                    x ^= f.to_bits() as u64;
+                    x = x.wrapping_mul(0x100000001b3);
+                }
+                x
+            };
+            let qflat: Vec<f32> = q_rows.iter().flatten().flatten().copied().collect();
+            let oflat: Vec<f32> = out.iter().flatten().copied().collect();
+            eprintln!(
+                "# qsa-hash il={il} kv={:016x} idx={:016x} bk={:016x} q={:016x} out={:016x}",
+                h(&seq.kv_k[full_idx][..used_kv]),
+                h(&seq.idx_k[full_idx][..used_idx]),
+                h(&seq.idx_bk[full_idx]),
+                h(&qflat),
+                h(&oflat),
             );
         }
         Ok(out)
