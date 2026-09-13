@@ -325,7 +325,8 @@ DEV int f16_slot(int k) {
 // (저니블 = it*64+0..31, 고니블 = it*64+32..63). 밀집 가중치(전문가 제외)를
 // 영구 f16 캐시에 올려 텐서코어 GEMM에 넘기기 위한 전처리.
 extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
-                                           __half* __restrict__ out, int nsuper, int n_out) {
+                                           __half* __restrict__ out, int nsuper, int n_out,
+                                           int n_in) {
     int o = blockIdx.x, blk = blockIdx.y;
     if (o >= n_out) return;
     const unsigned char* wb = w + ((size_t)o * nsuper + blk) * 144;
@@ -334,6 +335,7 @@ extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
     const unsigned char* sc = wb + 4;
     const unsigned char* qs = wb + 16;
     int e = threadIdx.x;              // 0..255
+    if (blk * 256 + e >= n_in) return;
     int it = e >> 6;
     int l = e & 63;
     int j = (l < 32) ? (2 * it) : (2 * it + 1);
@@ -349,14 +351,17 @@ extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
 
 // q8_0(34B 블록: d f16 + 32 int8) → f16 256값 전개. dequant_q4k_f16와 같은 격자.
 extern "C" __global__ void dequant_q8_0_f16(const unsigned char* __restrict__ w,
-                                            __half* __restrict__ out, int nblk, int n_out) {
+                                            __half* __restrict__ out, int nb32, int n_out,
+                                            int n_in) {
     int o = blockIdx.x, blk = blockIdx.y;
     if (o >= n_out) return;
     int e = threadIdx.x;              // 0..255
     int sb = e >> 5;
     int l = e & 31;
-    const unsigned char* wb = w + ((size_t)o * nblk + blk * 8 + sb) * 34;
+    int idx = blk * 256 + e;          // 전역 요소 인덱스
+    if (idx >= n_in) return;          // n_in이 256의 배수가 아닐 때의 가드
+    const unsigned char* wb = w + ((size_t)o * nb32 + blk * 8 + sb) * 34;
     float d = bits_f16((unsigned)wb[0] | ((unsigned)wb[1] << 8));
     signed char q = (signed char)wb[2 + l];
-    out[((size_t)o * nblk + blk) * 256 + f16_slot(e)] = __float2half(d * (float)q);
+    out[((size_t)o * (nb32 / 8) + blk) * 256 + f16_slot(e)] = __float2half(d * (float)q);
 }

@@ -941,7 +941,7 @@ impl RawCtx {
             let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
             if let Some(&p) = c.get(&key) { p }
             else {
-                let blocks = n_in / 256;
+                let blocks = n_in.div_ceil(256);   // 256요소 슈퍼블록 격자(부분 허용)
                 let p = self.alloc(n_out * n_in * 2)? as *mut u8;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
@@ -1028,10 +1028,11 @@ impl RawCtx {
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
                     let mut a2 = p as *mut std::ffi::c_void;
-                    let mut a3 = blocks as i32;
+                    let mut a3 = (n_in / 32) as i32;   // 행당 32블록 수 = 행 스트라이드
                     let mut a4 = n_out as i32;
-                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
-                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, blocks as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_f16")?;
+                    let mut a5 = n_in as i32;          // 유효 요소 수(부분 블록 가드)
+                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
+                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, n_in.div_ceil(256) as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_f16")?;
                 }
                 c.insert(key, p);
                 p

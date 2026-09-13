@@ -382,8 +382,8 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
     let ctx = RawCtx::new()?;
     let (n_out, n_in) = (256usize, n_in_arg.max(128));
     let wd = ctx.alloc(n_out * (n_in / 32) * 34)?;
-    let xd = ctx.alloc(n_in * 4)?;
-    let od = ctx.alloc(n_out * 4)?;
+    let xd = ctx.alloc(n_in * 4 * 8)?;   // t ≤ 8 여유
+    let od = ctx.alloc(n_out * 4 * 8)?;
     let mut out = String::new();
     for b in 0..8usize {
         // 가중치: 블록 b에만 항등(그 블록의 요소 j가 행 o=j에)
@@ -434,10 +434,11 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     }
                 }
             }
-            ctx.h2d(wd, &wv)?;
+            let wd1 = ctx.alloc(wv.len())?;
+            ctx.h2d(wd1, &wv)?;
             let xones = vec![1.0f32; n_in];
             ctx.h2d(xd, bytemuck::cast_slice(&xones))?;
-            ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd1 as *const u8, n_in, n_out, 1, od)?;
             ctx.sync()?;
             let mut ov = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov), od as *const u8)?;
@@ -453,8 +454,9 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                     }
                 }
             }
-            ctx.h2d(wd, &wv2)?;
-            ctx.gemm_f16_deq(8, xd as *const u8, wd as *const u8, n_in, n_out, 1, od)?;
+            let wd2 = ctx.alloc(wv2.len())?;
+            ctx.h2d(wd2, &wv2)?;
+            ctx.gemm_f16_deq(8, xd as *const u8, wd2 as *const u8, n_in, n_out, 1, od)?;
             ctx.sync()?;
             let mut ov2 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov2), od as *const u8)?;
@@ -512,9 +514,41 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
                 ctx.sync()?;
                 let mut oo = vec![0.0f32; n_out];
                 ctx.d2h(bytemuck::cast_slice_mut(&mut oo), od as *const u8)?;
-                xmap.push((j, oo[0]));
+                // out[0]만 보면 모순이 생긴다(plans/65 §18) — 전체 비영 분포를 찍는다.
+                let nz2: Vec<(usize, f32)> = oo
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.abs() > 0.25)
+                    .map(|(i, &v)| (i, v))
+                    .collect();
+                xmap.push((j, nz2));
             }
             out += &format!("# x-측 매핑(j → out[0]): {xmap:?}\n");
+            // t>1 검증: 전부-1 가중치, x는 t행 — 행 r의 one-hot j가 행 r로 나와야 한다.
+            {
+                let tt = 4usize;
+                let mut xt = vec![0.0f32; tt * n_in];
+                for r in 0..tt {
+                    xt[r * n_in + (r * 7 + 3)] = 1.0;
+                }
+                ctx.h2d(xd, bytemuck::cast_slice(&xt))?;
+                let odt = ctx.alloc(tt * n_out * 4)?;
+                ctx.gemm_f16_deq(8, xd as *const u8, wd1 as *const u8, n_in, n_out, tt, odt)?;
+                ctx.sync()?;
+                let mut ot = vec![0.0f32; tt * n_out];
+                ctx.d2h(bytemuck::cast_slice_mut(&mut ot), odt as *const u8)?;
+                let mut info = String::new();
+                for r in 0..tt {
+                    let nz: Vec<(usize, f32)> = ot[r * n_out..(r + 1) * n_out]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.abs() > 0.25)
+                        .map(|(i, &v)| (i, v))
+                        .collect();
+                    info += &format!(" r{r}(one-hot {}): {nz:?}", r * 7 + 3);
+                }
+                out += &format!("# t>1 검증(t={tt}):{info}\n");
+            }
         }
         out += &format!("# blk={b}: 1:1={distinct} 빈칸={holes} 다중={multi}\n");
         if b == 0 {
