@@ -610,7 +610,7 @@ fn dequant_row_into(
 mod forward_tests {
     use super::*;
 
-    const MODEL: &str = "/home/yoon/local_llm/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    const MODEL: &str = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
     /// prefill+디코드 2토큰: 유한 logits·결정성·greedy 후보 정상 범위.
     #[test]

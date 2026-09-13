@@ -392,7 +392,7 @@ impl Model4 {
 mod tests {
     use super::*;
 
-    const MODEL: &str = "/home/yoon/local_llm/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    const MODEL: &str = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
     /// 실측 모델 로더 계약: split 4파일 병합·hparams·PLE 행 gather·전문가 슬라이스.
     /// 파일 없으면 skip (real_models.rs 관례).
