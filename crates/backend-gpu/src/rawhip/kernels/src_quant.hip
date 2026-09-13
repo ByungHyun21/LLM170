@@ -346,7 +346,7 @@ extern "C" __global__ void dequant_q4k_f16(const unsigned char* __restrict__ w,
     unsigned char byte = qs[it * 32 + (l & 31)];
     unsigned q = (l < 32) ? (byte & 0xFu) : (byte >> 4);
     float v = d * (float)s * (float)q - dmin * (float)mn;
-    out[((size_t)o * nsuper + blk) * 256 + f16_slot(e)] = __float2half(v);
+    out[((size_t)o * nsuper + blk) * 256 + e] = __float2half(v);
 }
 
 // q8_0(34B 블록: d f16 + 32 int8) → f16 256값 전개. dequant_q4k_f16와 같은 격자.
@@ -363,5 +363,5 @@ extern "C" __global__ void dequant_q8_0_f16(const unsigned char* __restrict__ w,
     const unsigned char* wb = w + ((size_t)o * nb32 + blk * 8 + sb) * 34;
     float d = bits_f16((unsigned)wb[0] | ((unsigned)wb[1] << 8));
     signed char q = (signed char)wb[2 + l];
-    out[((size_t)o * (nb32 / 8) + blk) * 256 + f16_slot(e)] = __float2half(d * (float)q);
+    out[((size_t)o * (nb32 / 8) + blk) * 256 + e] = __float2half(d * (float)q);
 }
