@@ -548,10 +548,8 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
 // q4_K MMQ 타일 — **전문가 그룹판**. 원판(_m)은 전문가마다 런치해 청크당 7.4만
 // 런치(호스트 ~2.7초@pp2048, KTRACE 실측)였다. rowexp(행→전문가) + expert_bytes면
 // 한 런치로 전부 처리한다. 산술 순서는 _m과 동일(비트 동일).
-// `perm`으로 x를 직접 읽고(사전 gather 제거) 결과를 원래 행 위치에 직접 쓴다
-// (사전 scatter 제거) — 값·산술이 동일해 **비트 동일**. 런치 2개/그룹 절약.
 extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned char* w, double* part,
-                                          float* out, const unsigned* rowexp, const unsigned* perm,
+                                          float* out, const unsigned* rowexp,
                                           int n_in, int n_out, int xq_w, int t, int expert_bytes) {
     int ox = threadIdx.x & 15;
     int rx = threadIdx.x >> 4;
@@ -561,8 +559,7 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
     int n_super = n_in >> 8;
     int e = (int)rowexp[r];
     const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
-    const int rout = (int)perm[r];
-    const unsigned* xr = xq + (size_t)rout * xq_w;
+    const unsigned* xr = xq + (size_t)r * xq_w;
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;
@@ -605,7 +602,7 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
             acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
         }
     }
-    out[(size_t)rout * n_out + o] = acc;
+    out[(size_t)r * n_out + o] = acc;
 }
 
 
