@@ -61,6 +61,14 @@ extern "C" __global__ void copy_rows(const float* src, float* dst, int src_off, 
     if (j >= n) return;
     dst[dst_off + j] = src[src_off + j];
 }
+// k_sel행 브로드캐스트 — dst의 모든 행이 src 0행의 복사 (MoE t=1 gate/up).
+// 기존 CopyRows k_sel회(런치 480회/스텝)를 1회로 접는다.
+extern "C" __global__ void bcast_rows(const float* src, float* dst, int n, int rows) {
+    int r = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n || r >= rows) return;
+    dst[(size_t)r * n + j] = src[j];
+}
 // rms 2-커널 (part: 32유닛 세그 f64, finish: 순차 결합+스케일)
 extern "C" __global__ void rms_part(const float* x, double* part, int n) {
     int row = blockIdx.x;
