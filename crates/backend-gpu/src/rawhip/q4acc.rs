@@ -1083,6 +1083,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let xsrc0 = if f32w { xp } else { xq };
         self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
         phase("gather", &mut lap);
+        if llm170_core::qwen4exp::frame::stage_skipped("moe") {
+            // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
+            return Ok(());
+        }
         for e in 0..ne {
             let r = off[e + 1] - off[e];
             if r == 0 {

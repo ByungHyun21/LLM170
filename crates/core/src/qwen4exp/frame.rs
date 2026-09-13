@@ -248,6 +248,13 @@ fn ftime_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("LLM170_FRAME_TIME").is_some())
 }
 
+/// 진단용 스테이지 스킵(LLM170_STAGE_SKIP="qsa,gdn,moe") — 비용 분해 전용.
+pub fn stage_skipped(name: &str) -> bool {
+    std::env::var("LLM170_STAGE_SKIP")
+        .map(|v| v.split(',').any(|x| x.trim() == name))
+        .unwrap_or(false)
+}
+
 fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
     match (ftime_on(), std::env::var_os("LLM170_FRAME_SYNC").is_some()) {
         (false, false) => return Ok(()),
@@ -383,18 +390,26 @@ pub fn frame_forward(
 
         // 3) attention — GDN 프레임 / QSA 값 브리지
         if hp.is_recr(il) {
+            if stage_skipped("gdn") {
+                // 진단용: GDN 단계 생략(출력 무효) — 디코드 스텝 비용 분해.
+            } else {
             gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t)?;
+            }
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
             sync_mark(acc, &format!("L{il}.gdn_combine"), f.res_hc)?;
         } else {
             // QSA 값 경로 브리지 — mix 판독 → qsa_layer(t행) → 출력 기록
+            if stage_skipped("qsa") {
+                // 진단용: QSA 브리지 생략(출력 무효).
+            } else {
             let mut mix_v = vec![0.0f32; t * n];
             acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
             let xs: Vec<Vec<f32>> = mix_v.chunks_exact(n).map(|c| c.to_vec()).collect();
             let out = stages::qsa_layer(ctx, seq_st, il, &xs, t, full_idx)?;
             let flat: Vec<f32> = out.concat();
             acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
+            }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
