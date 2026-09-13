@@ -20,7 +20,7 @@ pub const SRC: &str = concat!(
 );
 
 pub const NAMES: &[&str] = &[
-    "quant_q8", "q4_gemm_q5_1", "q4_gemm_f32", "q4_silu_div", "q4_sigmoid", "q4_scale", "q4_l2_rows", "q4_hc_gate_mean", "q4_hc_combine", "q4_norm_gated_sig", "q4_moe_top10", "q4_moe_top10_m", "q4_moe_weighted_sum", "q4_moe_gather", "q4_moe_scatter", "q4_rows_permute_u32", "q4_gemm_q5_1_t", "q4_gemm_q5_1_m", "q4_gemm_q5_1_gm", "q4_gemm_f32_m", "q4_gemm_q4k_m", "q4_gemm_q4k_ge", "q4_qsa_attn_wt", "q4_qsa_attn_sel", "q4_gemm_q4k_g", "q4_gemm_q4k_x", "q4_gemm_q4k_y", "q4_axpy_scaled_t", "q4_gdn_ar_w", "silu_mul_f32", "dequant_q6k_f16", "dequant_q4k_f16", "dequant_q8_0_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq",
+    "quant_q8", "q4_gemm_q5_1", "q4_gemm_f32", "q4_silu_div", "q4_sigmoid", "q4_scale", "q4_l2_rows", "q4_hc_gate_mean", "q4_hc_combine", "q4_norm_gated_sig", "q4_moe_top10", "q4_moe_top10_m", "q4_moe_weighted_sum", "q4_moe_gather", "q4_moe_scatter", "q4_rows_permute_u32", "q4_gemm_q5_1_t", "q4_gemm_q5_1_m", "q4_gemm_q5_1_gm", "q4_gemm_f32_m", "q4_gemm_q4k_m", "q4_gemm_q4k_ge", "q4_qsa_attn_wt", "q4_qsa_attn_sel", "q4_qsa_attn_sel4", "q4_gemm_q4k_g", "q4_gemm_q4k_x", "q4_gemm_q4k_y", "q4_axpy_scaled_t", "q4_gdn_ar_w", "silu_mul_f32", "dequant_q6k_f16", "dequant_q4k_f16", "dequant_q8_0_f16", "requant_q6k_canonical", "rmsq", "gemm_q5k2", "silu_mulq", "gatedq",
     "gemm_xs", "row_shift_gather", "q6k_ref_scalar", "gemm_q5k", "gemm_q8_0", "gemm_q4k", "gemm_q6k", "gemm_nl", "gemm_q3k",
     "silu_mul", "axpy_scaled", "copy_rows", "rms_part", "rms_finish", "qk_norm_rope",
     "gdn_conv", "gdn_beta_g", "gdn_beta_g_f32", "norm_gated_silu", "norm_gated_silu_f32", "l2_rows2_scale", "split3",
