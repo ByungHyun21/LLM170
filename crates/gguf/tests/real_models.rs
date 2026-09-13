@@ -6,8 +6,8 @@
 
 use llm170_gguf::GgufFile;
 
-const P27B: &str = "/home/yoon/local_llm/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
-const PFLASH: &str = "/home/yoon/local_llm/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+const P27B: &str = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
+const PFLASH: &str = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
 fn open_if_exists(path: &str) -> Option<GgufFile> {
     let p = std::path::Path::new(path);
