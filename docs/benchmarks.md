@@ -337,8 +337,13 @@ row above (`--pp 11750 --ctx 16384`, rawhip/CLI bench):
 
 | Condition | LLM170 (rawhip) | llama.cpp (276.68 t/s) | gap |
 |---|---|---|---|
-| pp 11,750 | **57.70 s** (203.7 t/s) | 42.47 s | **1.36x** |
-| pp 2,048 | 9,094 ms (225.2 t/s) | — | — |
+| pp 11,750 | **56.40 s** (208.3 t/s) | 42.47 s | **1.33x** |
+| pp 2,048 | 8,952 ms (228.9 t/s) | — | — |
+
+Also fused: the MoE gather/scatter (`q4_rows_permute_u32`, 13.8 launches/layer)
+into the grouped q4_K GEMM via the `perm` it already receives - the kernel reads
+`xq[perm[r]]` and writes `out[perm[r]]`, so two launches per expert group
+disappear (bit-identical; pp11750 57.70 -> 56.40 s, -2.25 %).
 
 The two host-side changes behind that (both bit-identical, verified by tokens):
 the QSA/PLE stage thread caps went from 16 to 32 (16 cores x SMT; while the host
