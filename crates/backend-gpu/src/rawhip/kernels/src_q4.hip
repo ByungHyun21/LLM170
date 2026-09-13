@@ -547,10 +547,71 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
 
 // q4_K MMQ 타일 — **전문가 그룹판**. 원판(_m)은 전문가마다 런치해 청크당 7.4만
 // 런치(호스트 ~2.7초@pp2048, KTRACE 실측)였다. rowexp(행→전문가) + expert_bytes면
+// q4_moe_group_t1 — t=1(디코드) 전문가 그룹화. 층당 호스트 왕복(동기 d2h +
+// 테이블 빌드 + h2d 3회)이 스텝의 44%였다(2026-09-14 실측: 48층 × 0.9ms).
+// 테이블은 ids의 순수 함수라 GPU에서 만들면 왕복이 사라진다.
+// 호스트판과 **동일 순서**(안정 카운팅, 전문가 id 오름차순, 16행 정렬 패딩) →
+// 테이블 동일 → GEMM 결과 비트 동일. 단일 스레드(ne≤512, rows=10).
+extern "C" __global__ void q4_moe_group_t1(
+        const unsigned* __restrict__ ids, int ne, int rows,
+        int* __restrict__ out_off, unsigned* __restrict__ perm, unsigned* __restrict__ inv,
+        unsigned* __restrict__ rowexp, unsigned* __restrict__ perm_pad,
+        unsigned* __restrict__ inv_pad, unsigned* __restrict__ tilexp,
+        int* __restrict__ rows_pad_out) {
+    __shared__ int off[513];
+    __shared__ int cur[512];
+    if (blockIdx.x != 0 || threadIdx.x != 0 || ne > 512) return;
+    for (int e = 0; e <= ne; e++) off[e] = 0;
+    for (int i = 0; i < rows; i++) {
+        int e = (int)ids[i];
+        e = e < 0 ? 0 : (e >= ne ? ne - 1 : e);
+        off[e + 1] += 1;
+    }
+    for (int e = 0; e < ne; e++) off[e + 1] += off[e];
+    for (int e = 0; e <= ne; e++) out_off[e] = off[e];
+    for (int e = 0; e < ne; e++) cur[e] = off[e];
+    for (int i = 0; i < rows; i++) {
+        int e = (int)ids[i];
+        e = e < 0 ? 0 : (e >= ne ? ne - 1 : e);
+        int p = cur[e];
+        cur[e] = p + 1;
+        perm[p] = (unsigned)i;
+        inv[i] = (unsigned)p;
+        rowexp[p] = (unsigned)e;
+    }
+    int acc = 0;
+    for (int e = 0; e < ne; e++) {
+        int r = off[e + 1] - off[e];
+        int pad = (r + 15) / 16 * 16;
+        for (int i = 0; i < pad; i++) {
+            int pd = acc + i;
+            if (i < r) {
+                unsigned src = perm[off[e] + i];
+                perm_pad[pd] = src;
+                inv_pad[src] = (unsigned)pd;
+            } else {
+                perm_pad[pd] = 0;
+            }
+        }
+        for (int tg = acc / 16; tg < (acc + pad) / 16; tg++) tilexp[tg] = (unsigned)e;
+        acc += pad;
+    }
+    int rows_pad = acc < 16 ? 16 : acc;
+    // 상한(rows*16+16)까지 0으로 채운다 — 호스트가 상한 그리드로 gather를 걸어도
+    // 패딩/여분 행이 0번 행을 읽어 안전하다(값은 GEMM 가드로 무시된다).
+    int bound = rows * 16 + 16;
+    for (int i = acc; i < bound; i++) perm_pad[i] = 0;
+    *rows_pad_out = rows_pad;
+}
+
 // 한 런치로 전부 처리한다. 산술 순서는 _m과 동일(비트 동일).
 extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned char* w, double* part,
                                           float* out, const unsigned* rowexp,
-                                          int n_in, int n_out, int xq_w, int t, int expert_bytes) {
+                                          int n_in, int n_out, int xq_w, int t, int expert_bytes,
+                                          const int* rows_pad_p) {
+    // rows_pad_p가 주어지면 행 수를 디바이스에서 읽는다(GPU 그룹화 경로 —
+    // 호스트 왕복 없이 정확한 타일 수를 알기 위함). NULL이면 t를 그대로 쓴다.
+    if (rows_pad_p != 0) t = *rows_pad_p;
     int ox = threadIdx.x & 15;
     int rx = threadIdx.x >> 4;
     int o = (int)blockIdx.x * 16 + ox;
