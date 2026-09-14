@@ -5432,7 +5432,9 @@ for the prefill; the frame-total and bridge timers are the trustworthy pair.
 ## Why the QSA bridge costs 24% of the prefill (2026-09-14)
 
 Direct measurement with LLM170_Q4_TIME corrects the earlier frame-timer reading. For the
-2048-token chunk, across 24 QSA calls (12 layers x 2 chunks), the bridge is:
+2048-token chunk, across 24 QSA calls (12 layers x 2 chunks), the bridge is (note: this
+5.0 s total spans two chunks, so the stage is ~2.5 s per 8.9 s chunk, not the 54% the text
+below originally claimed - see the corrected per-t table at the end of this file):
 
 | part | total | share |
 |---|---|---|
@@ -5457,13 +5459,13 @@ main remaining lever, and it is an architectural change rather than a tuning one
 
 LLM170_Q4_TIME splits the host stage (2048-token chunk, 24 layer calls) as:
 
-| stage | total | share | calls |
+| stage | total (2 chunks) | share of the 5.0 s | per chunk |
 |---|---|---|---|
-| mm_group | 1.92 s | 38% | 72 |
-| attn (device call + copies + mm_batch) | 1.87 s | 37% | 24 |
-| sel_build (host selection list) | 0.71 s | 14% | 72 |
-| sel+proj | 0.52 s | 10% | 72 |
-| wlookup, passB | 0.00 s | 0% | 72 |
+| attn (device call + copies + mm_batch) | 1.87 s | 37% | 0.94 s |
+| mm_group | 1.92 s | 38% | 0.96 s |
+| sel_build (host selection list) | 0.71 s | 14% | 0.36 s |
+| sel+proj | 0.52 s | 10% | 0.26 s |
+| wlookup, passB | 0.00 s | 0% | - |
 
 Follow-up instrumentation splits the attention lap and corrects part of the picture. The
 device path is in fact taken - no fallback message fires - and dev_weight caches device
@@ -5599,3 +5601,24 @@ volume (25 KB), so launch/sync count or prepare_x is the suspect and needs measu
 The stage timers do not include device time for asynchronous launches: stage_attn reports
 2.4 ms while the same kernel measures 1.425 ms per call in KTRACE, so frame stage timings
 are host-side unless the stage ends in a d2h.
+
+## Corrected QSA stage shares, split by t (2026-09-14, supersedes the 54%/57%/58% figures)
+
+The stage timers mix prefill and decode calls unless t is filtered, and summing them
+without that filter produced three wrong shares earlier in this file. With t as a label:
+
+| stage | t=1 per call | x12 layers = per step | t=2048 per call |
+|---|---|---|---|
+| attn | 2.55 ms | 30.6 ms | 100.97 ms |
+| sel_build | 1.39 ms | 16.7 ms | 32.66 ms |
+| sel+proj | 0.69 ms | 8.3 ms | 41.89 ms |
+| mm_group | 0.40 ms | 4.8 ms | 72.76 ms |
+| total | 5.03 ms | 60.4 ms | 248.3 ms |
+
+So the QSA stage is 42% of the long-context decode step (144.2 ms frame, 83.9 ms of
+kernels), not 58%, and 2.98 s per 8.9 s prefill chunk (33%), not 54-57% - the 5.0 s
+figure was a two-chunk total. In both regimes the largest single stage is attn, and
+KTRACE confirms the attention kernel is the device-side maximum at long context
+(1.425 ms/call, 17.1 ms/step). The stage prints now carry a t label so this cannot
+recur.
+
