@@ -1850,12 +1850,14 @@ mod micro_tests {
         // +30ms/스텝을 보이는데, 그 추가분의 실체를 여기서 가른다.
         let ne = 512i32;
         let rows = 10i32;
-        let bound = (rows * 16 + 16) as usize;
+        // 상한은 프로덕션과 같은 식(rows + 16*ne)을 쓴다 — 커널도 이 값을 인자로
+        // 받고, rowexp·x 버퍼가 이 크기를 전제한다(2026-09-14 단일화).
+        let bound = (rows + 16 * ne) as usize;
         let ids = ctx.scratch(rows as usize * 4).expect("ids");
         let offb = ctx.scratch((ne as usize + 2) * 4).expect("off");
         let permb = ctx.scratch(bound * 4).expect("perm");
         let invb = ctx.scratch(rows as usize * 4).expect("inv");
-        let rexb = ctx.scratch(rows as usize * 4).expect("rex");
+        let rexb = ctx.scratch(bound * 4).expect("rex"); // GEMM이 rows_pad까지 읽는다
         let ppb = ctx.scratch(bound * 4).expect("pp");
         let ipb = ctx.scratch(rows as usize * 4).expect("ip");
         let txb = ctx.scratch(bound).expect("tx");
@@ -1867,6 +1869,7 @@ mod micro_tests {
             let (mut g, mut h) = (ipb as *mut std::ffi::c_void, txb as *mut std::ffi::c_void);
             let mut i = rpb as *mut std::ffi::c_void;
             let (mut n_e, mut rws) = (ne, rows);
+            let mut bnd = bound as i32;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut a) as *mut _ as *mut std::ffi::c_void,
                 (&mut n_e) as *mut _ as *mut std::ffi::c_void,
@@ -1879,6 +1882,7 @@ mod micro_tests {
                 (&mut g) as *mut _ as *mut std::ffi::c_void,
                 (&mut h) as *mut _ as *mut std::ffi::c_void,
                 (&mut i) as *mut _ as *mut std::ffi::c_void,
+                (&mut bnd) as *mut _ as *mut std::ffi::c_void,
             ];
             ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args).unwrap();
         };
