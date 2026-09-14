@@ -3066,8 +3066,19 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             }
             return Ok(());
         }
+        // plans/71: q8_0 가중치 + t>=32는 MMQ(int8 dp4a) — f32 활성을 직접 받아
+        // 자체 양자화. 종전 j128 타일 대비 측정 이득은 벤치로 검증.
         for (w, o) in ws.iter().zip(outs) {
             let op = self.fptr(*o)?;
+            if w.ty == GgmlType::Q8_0 && t >= 32
+                && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")
+            {
+                let (wd, _) = self.dev_weight(w)?;
+                self.ctx
+                    .gemm_mmq(8, xp as *const u8, wd, w.n_in as usize, w.n_out as usize, t, op)
+                    .map_err(|e| format!("q8mmq: {e}"))?;
+                continue;
+            }
             self.frame_gemm(xp, w, op, t)?;
         }
         Ok(())
