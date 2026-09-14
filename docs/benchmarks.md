@@ -5552,3 +5552,24 @@ shapes), and within that the QSA projection GEMMs run at roughly 1 TFLOP/s again
 GEMM at these shapes, not a dispatch or host problem, and it is the item that would move
 the prefill.
 
+
+## The fused f16 dequant gate is not the lever either - it needs a per-graph cache (2026-09-14)
+
+The f16 fused-dequant GEMM was gated to q8_0 only (ty0 == 8) even though dequant_q4k_f16
+and dequant_q6k_f16 were already wired into its dispatcher. Extending the gate to
+matches!(ty0, 8 | 12 | 14) and re-measuring:
+
+- the path is taken: LLM170_F16_DBG=1 shows 48 calls at a 200-token prefill, including the
+  QSA projections ([6144x2560] x12 = wq, [2560x512] x24 = wk/wv/indexer) and the shared
+  expert's FFN ([2560x12288] x12);
+- it is correct: a 200-token prompt (t >= 32, so the gate is actually exercised, unlike the
+  24-token diverse which never reaches it) produces token-for-token the same greedy stream
+  as the default path;
+- it is neutral: pp2048 9,087.8 ms against 9,043.9 ms baseline.
+
+So plans/66 P1's actual content is the part that was skipped: "dequant once per graph and
+cache". Here the dequant runs per call, so every call pays a full dequant pass over the
+weight (8.8 MB Q4_K -> 25 MB f16 written and re-read) and the saving on the integer-ALU
+side is cancelled. The gate extension was reverted as neutral; the recorded next step is a
+graph-scoped dequant cache, which is what would make the f16 WMMA route pay.
+
