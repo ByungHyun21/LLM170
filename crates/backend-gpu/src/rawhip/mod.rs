@@ -22,7 +22,8 @@ pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
 pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
 pub const CO_MMQ2: u8 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
 pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
-pub const CO_MMQ8: u8 = 64; // mmq8.co: libggml-hip fatbin에서 추출한 mul_mat_q<q8_0>(plans/71)
+pub const CO_MMQ8: u8 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/71)
+pub const CO_QY: u8 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
 static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn co_loaded(bit: u8) -> bool {
@@ -439,6 +440,14 @@ impl RawCtx {
                         "LLM170_CO7_PATH",
                         include_bytes!("co/mmq8.co"),
                         &["_ZL9mul_mat_qIL9ggml_type8ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                    ),
+                    (
+                        CO_QY,
+                        "LLM170_CO8_PATH",
+                        include_bytes!("co/quanty_new.co"),
+                        &["_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii",
+                          "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout1ELb0EEvPKfPKiPvllllliii",
+                          "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout2ELb0EEvPKfPKiPvllllliii"],
                     ),
                     (
                         CO_J128,
@@ -1451,7 +1460,9 @@ impl RawCtx {
     pub fn gemm_mmq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let fns = &self.fns;
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
-        let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+        // DS 레이아웃(mmq.cuh): Q6K/IQ4XS/Q8_0 → D4, Q4K/Q5K → DS4.
+        // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
+        let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
         let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let sym = match ty {
@@ -1516,6 +1527,43 @@ impl RawCtx {
         let this_is_main = yb == { self.mmq_y.lock().map(|c| c.1).unwrap_or(std::ptr::null_mut()) };
         let cached = false && this_is_main && { self.mmq_y_cache.lock().map(|c| *c == (c.0, y_key.0, y_key.1)).unwrap_or(false) };
         if !cached {
+            if ty == 8 {
+                // plans/71: Q8_0의 y양자화는 신형 quantize_mmq_q8_1<D4,false>
+                // (ROCm 10 빌드) — 구형 mmq_quant_y*는 block_q8_1_mmq ABI가 달라
+                // 혼합 시 HIP 700. 인자: (x, ids=null, vy, ne00, s01, s02, s03,
+                // ne0, ne1, ne2, n_expert_used) 그리드 (t, ceil(n_in/512), 1) 128.
+                let fq2 = *self.fns.get("_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii")
+                    .ok_or("quantize_mmq_q8_1<D4> 없음")?;
+                let mut xp2 = y_f32 as *mut std::ffi::c_void;
+                let mut idsp: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut ne00 = n_in as i64;
+                let mut s01 = n_in as i64;
+                let mut s02 = 0i64;
+                let mut s03 = 0i64;
+                let mut ne0 = n_in as i64;
+                let mut ne1 = t as i32;
+                let mut ne2 = 1i32;
+                let mut neu = 0i32;
+                let mut q2 = vec![
+                    &mut xp2 as *mut _ as *mut std::ffi::c_void,
+                    &mut idsp as *mut _ as *mut std::ffi::c_void,
+                    &mut yp as *mut _ as *mut std::ffi::c_void,
+                    &mut ne00 as *mut _ as *mut std::ffi::c_void,
+                    &mut s01 as *mut _ as *mut std::ffi::c_void,
+                    &mut s02 as *mut _ as *mut std::ffi::c_void,
+                    &mut s03 as *mut _ as *mut std::ffi::c_void,
+                    &mut ne0 as *mut _ as *mut std::ffi::c_void,
+                    &mut ne1 as *mut _ as *mut std::ffi::c_void,
+                    &mut ne2 as *mut _ as *mut std::ffi::c_void,
+                    &mut neu as *mut _ as *mut std::ffi::c_void,
+                ];
+                // ne0는 128 배수여야 함(assert 위) — n_in이 128 미만 배수면
+                // 상위 경로에서 이미 128 정렬(27B/Flash 폭은 전부 128배수).
+                unsafe {
+                    let gy = n_in.div_ceil(512) as u32;
+                    ck(hip::hipModuleLaunchKernel(fq2, t as u32, gy, 1, 128, 1, 1, 0, self.stream, q2.as_mut_ptr(), std::ptr::null_mut()), "quantize_mmq_q8_1")?;
+                }
+            } else {
             unsafe {
                 let mut qargs = vec![
                     &mut ysrc as *mut _ as *mut std::ffi::c_void,
@@ -1526,6 +1574,7 @@ impl RawCtx {
                 self.ktr_mark("mmq_quant_y", t as u32);
                 ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
                 self.ktr_mark("mmq_quant_y", t as u32);
+            }
             }
             if let Ok(mut c) = self.mmq_y_cache.lock() { *c = (c.0, y_key.0, y_key.1); }
         }
@@ -1592,7 +1641,9 @@ impl RawCtx {
     pub fn gemm_mmq_s(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let fns = &self.fns;
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
-        let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+        // DS 레이아웃(mmq.cuh): Q6K/IQ4XS/Q8_0 → D4, Q4K/Q5K → DS4.
+        // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
+        let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
         let _j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let sym = match ty {
