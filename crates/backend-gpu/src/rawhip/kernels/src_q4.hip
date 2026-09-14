@@ -993,6 +993,82 @@ extern "C" __global__ void q4_qsa_attn_sel4(const float* q, const float* ck, con
     }
 }
 
+// 6헤드-퍼-워프 — `_sel4`의 확장. `_sel4`는 게이트를 레지스터에 들고 있어
+// qr+gate+acc = 96 floats/lane이 한계였고, 그래서 24헤드가 6워프로 갈려
+// K/V 행을 6번 읽는다(프리필 대역폭의 직접 원인: t=2048 콜당 ~34GB/236GB/s
+// ~= 실측 101ms). 게이트는 마지막에 전역에서 한 번 읽으면 되므로 레지스터에서
+// 빼면 6헤드(qr[6][8]+acc[6][8]=96)가 같은 예산에 들어가 재독이 4회로 준다.
+// 산술 순서는 `_sel4`와 동일(헤드별 독립 온라인 소프트맥스) → 비트 동일.
+// 실측(2026-09-14): pp2048 9,012-9,118 -> 8,748-8,908ms(-1.6~2.9%), diverse 스트림
+// 동일. 분할판(_sel4s)도 6헤드로 올려 pp8192 tg가 1,035 -> 1,020ms가 됐다.
+extern "C" __global__ void q4_qsa_attn_sel6(const float* q, const float* ck, const float* cv,
+                                            const unsigned* sel_idx, const unsigned* sel_off,
+                                            float* out, float kq_scale,
+                                            int n_head, int n_kv, int hd, int t) {
+    int wid = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int tok = (int)blockIdx.x * 4 + (wid >> 1);   // 블록 8워프 = 4토큰 × 2헤드묶음
+    int h0 = (int)blockIdx.y * 12 + (wid & 1) * 6; // 묶음당 6헤드
+    if (tok >= t || h0 + 5 >= n_head || hd != 256) return;
+    int kvh = h0 / (n_head / n_kv);
+    float qr[6][8], acc[6][8];
+    #pragma unroll
+    for (int g = 0; g < 6; g++) {
+        const float* qh = q + ((size_t)tok * n_head + h0 + g) * 2 * hd;
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) {
+            qr[g][t2] = qh[lane + 32 * t2];
+            acc[g][t2] = 0.0f;
+        }
+    }
+    float mrun[6], lrun[6];
+    #pragma unroll
+    for (int g = 0; g < 6; g++) { mrun[g] = Q4_NEG; lrun[g] = 0.0f; }
+    const unsigned long long FULL = 0xffffffffffffffffull;
+    const int j0 = (int)sel_off[tok];
+    const int j1 = (int)sel_off[tok + 1];
+    for (int j = j0; j < j1; j++) {
+        const int p = (int)sel_idx[j];
+        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        const float* v = cv + (size_t)p * n_kv * hd + kvh * hd;
+        float kr[8], vr[8];
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) { kr[t2] = k[lane + 32 * t2]; vr[t2] = v[lane + 32 * t2]; }
+        #pragma unroll
+        for (int g = 0; g < 6; g++) {
+            float a = 0.0f;
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) a += qr[g][t2] * kr[t2];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(FULL, a, off);
+            float sc = a * kq_scale;
+            float mr = mrun[g], lr = lrun[g];
+            if (sc > mr) {
+                float corr = (mr <= Q4_NEG) ? 0.0f : exp_cr(mr - sc);
+                #pragma unroll
+                for (int t2 = 0; t2 < 8; t2++) acc[g][t2] *= corr;
+                lr *= corr;
+                mr = sc;
+            }
+            float e = exp_cr(sc - mr);
+            lr += e;
+            #pragma unroll
+            for (int t2 = 0; t2 < 8; t2++) acc[g][t2] += e * vr[t2];
+            mrun[g] = mr;
+            lrun[g] = lr;
+        }
+    }
+    #pragma unroll
+    for (int g = 0; g < 6; g++) {
+        const float* gh = q + ((size_t)tok * n_head + h0 + g) * 2 * hd + hd;
+        #pragma unroll
+        for (int t2 = 0; t2 < 8; t2++) {
+            float o = (lrun[g] > 0.0f) ? acc[g][t2] / lrun[g] : 0.0f;
+            float gt = 1.0f / (1.0f + exp_cr(-gh[lane + 32 * t2]));
+            out[((size_t)tok * n_head + h0 + g) * hd + lane + 32 * t2] = o * gt;
+        }
+    }
+}
+
 // 워프-퍼-토큰 — 블록의 8워프가 "같은 head의 8토큰"을 각각 맡는다.
 // ① K행을 8토큰이 공유(L2 트래픽 1/8, 나머지는 L1) ② 블록 배리어 없음(워프 내부
 // 셔플만) — 기존 커널은 128키 청크마다 ~10회 __syncthreads를 돌렸다.
@@ -1465,9 +1541,9 @@ extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, co
                                              int n_head, int n_kv, int hd) {
     int wid = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int h0 = ((int)blockIdx.y * 2 + (wid & 1)) * 4;   // 묶음당 4헤드, 블록당 2묶음
+    int h0 = ((int)blockIdx.y * 2 + (wid & 1)) * 6;   // 묶음당 6헤드(게이트는 병합커널이 적용)
     int sp = (int)blockIdx.x * 4 + (wid >> 1);        // 블록당 4분할
-    if (h0 + 3 >= n_head || hd != 256 || sp >= n_splits) return;
+    if (h0 + 5 >= n_head || hd != 256 || sp >= n_splits) return;
     int kvh = h0 / (n_head / n_kv);
     const int j0 = (int)sel_off[0];
     const int j1 = (int)sel_off[1];
@@ -1475,20 +1551,19 @@ extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, co
     const int per = (len + n_splits - 1) / n_splits;
     const int a0 = j0 + sp * per;
     const int a1 = (a0 + per < j1) ? a0 + per : j1;
-    float qr[4][8], gate[4][8], acc[4][8];
+    float qr[6][8], acc[6][8];
     #pragma unroll
-    for (int g = 0; g < 4; g++) {
+    for (int g = 0; g < 6; g++) {
         const float* qh = q + (size_t)(h0 + g) * 2 * hd;
         #pragma unroll
         for (int t2 = 0; t2 < 8; t2++) {
             qr[g][t2] = qh[lane + 32 * t2];
-            gate[g][t2] = qh[hd + lane + 32 * t2];
             acc[g][t2] = 0.0f;
         }
     }
-    float mrun[4], lrun[4];
+    float mrun[6], lrun[6];
     #pragma unroll
-    for (int g = 0; g < 4; g++) { mrun[g] = Q4_NEG; lrun[g] = 0.0f; }
+    for (int g = 0; g < 6; g++) { mrun[g] = Q4_NEG; lrun[g] = 0.0f; }
     const unsigned long long FULL = 0xffffffffffffffffull;
     for (int j = a0; j < a1; j++) {
         const int p = (int)sel_idx[j];
@@ -1498,7 +1573,7 @@ extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, co
         #pragma unroll
         for (int t2 = 0; t2 < 8; t2++) { kr[t2] = k[lane + 32 * t2]; vr[t2] = v[lane + 32 * t2]; }
         #pragma unroll
-        for (int g = 0; g < 4; g++) {
+        for (int g = 0; g < 6; g++) {
             float a = 0.0f;
             #pragma unroll
             for (int t2 = 0; t2 < 8; t2++) a += qr[g][t2] * kr[t2];
@@ -1520,7 +1595,7 @@ extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, co
     // 부분 결과: [head][split][lane][ m, l, acc0..7 ] — acc는 레인별이므로
     // 레인 축이 반드시 필요하다(없으면 32레인이 같은 슬롯을 덮어쓴다).
     #pragma unroll
-    for (int g = 0; g < 4; g++) {
+    for (int g = 0; g < 6; g++) {
         float* pr = part + (((size_t)(h0 + g) * n_splits + sp) * 32 + lane) * 10;
         pr[0] = mrun[g];
         pr[1] = lrun[g];

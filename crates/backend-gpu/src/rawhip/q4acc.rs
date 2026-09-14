@@ -1746,15 +1746,17 @@ impl Q4Acc {
             (&mut h) as *mut _ as *mut std::ffi::c_void,
             (&mut tt) as *mut _ as *mut std::ffi::c_void,
         ];
-        // 8워프 = 4토큰 × 2헤드묶음(묶음당 4헤드) — gy 3슬라이스가 24헤드를 덮는다.
-        self.ctx.launch3(
-            "q4_qsa_attn_sel4",
-            t.div_ceil(4) as u32,
-            (n_head / 8) as u32,
-            1,
-            256,
-            &mut args,
-        )?;
+        // 8워프 = 4토큰 × 2헤드묶음. 묶음당 헤드 수는 6이 기본(2026-09-14):
+        // 게이트를 레지스터에서 빼면 qr[6][8]+acc[6][8]=96으로 4헤드판과 같은
+        // 예산이라 K/V 행 재독이 6회 -> 4회로 준다(프리필 어텐션이 대역폭 바운드:
+        // t=2048 콜당 ~34GB/236GB/s ~= 실측 101ms). 12의 배수가 아니면 4헤드판.
+        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        let (kern, gy) = if use6 {
+            ("q4_qsa_attn_sel6", (n_head / 12) as u32)
+        } else {
+            ("q4_qsa_attn_sel4", (n_head / 8) as u32)
+        };
+        self.ctx.launch3(kern, t.div_ceil(4) as u32, gy, 1, 256, &mut args)?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
         Ok(out)
@@ -1838,10 +1840,11 @@ impl Q4Acc {
                 (&mut nk) as *mut _ as *mut std::ffi::c_void,
                 (&mut h) as *mut _ as *mut std::ffi::c_void,
             ];
+            // 묶음당 6헤드(블록당 2묶음) — 분할판도 같은 재독 절감.
             self.ctx.launch3(
                 "q4_qsa_attn_sel4s",
                 n_splits.div_ceil(4) as u32,
-                (n_head / 8) as u32,
+                (n_head / 12) as u32,
                 1,
                 256,
                 &mut args,
