@@ -871,15 +871,26 @@ fn moe_frame(
     }
     // shared 전문가 — σ(sgate)·shout 가산
     if !stage_skipped("moe.shared") {
-        op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
         let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
         let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
-        acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
-            .map_err(Q4Error::Io)?;
-        op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
         let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
-        acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
-        op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
+        // plans/72: t=1은 융합 2런치(gate+up+silu → down+sigmoid·axpy).
+        // 기존 8런치(quant×2+gemv×3+sigmoid+silu+axpy)가 19.4ms/step의
+        // 지배 항이었다 — 런치 오버헤프 지배(유효 대역폭 1.5GB/s).
+        if t == 1 && std::env::var_os("LLM170_NO_SHEXP_FUSED").is_none() {
+            op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
+            acc.shexp_gu(f.mix, &shg_w, &shu_w, f.shglu, n, n_ff)
+                .map_err(Q4Error::Io)?;
+            acc.shexp_da(f.shglu, &shd_w, f.msgate, f.mout, n, n_ff)
+                .map_err(Q4Error::Io)?;
+        } else {
+            op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
+            acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
+                .map_err(Q4Error::Io)?;
+            op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
+            acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
+            op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
+        }
     }
     sync_mark(acc, "moe.shared", f.mout)?;
     Ok(())

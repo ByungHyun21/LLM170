@@ -1642,3 +1642,92 @@ extern "C" __global__ void q4_qsa_attn_sel4s_merge(const float* part, const floa
         out[(size_t)h * hd + lane + 32 * t2] = o * g;
     }
 }
+
+// ─── plans/72: Flash-Next 디코드 shared expert 융합 (8런치→2런치) ───
+// q4_shexp_gu: gate=W_g×x, up=W_u×x, h=silu(gate)*up — Q8_0 가중치 f32 입력.
+// q4_shexp_da: out=W_d×h, mout += s·out — W_d는 Q8_0, s는 sigmoid 스칼라.
+// 디코드 t=1 전용. shared expert가 층당 8런치(19.4ms/step)의 지배 항이었다.
+extern "C" __global__ void __launch_bounds__(256) q4_shexp_gu(
+        const float* __restrict__ x,     // [n_in] f32 입력
+        const unsigned char* __restrict__ wg, // Q8_0 [n_hidden][n_in] gate
+        const unsigned char* __restrict__ wu, // Q8_0 [n_hidden][n_in] up
+        float* __restrict__ h,           // [n_hidden] f32 출력 silu(gate)*up
+        int n_in, int n_hidden) {
+    // Q8_0 블록: 32원소당 2B f16 scale + 32B quant = 34B
+    // 각 블록이 n_hidden 행 중 일부를 담당 — warp당 1행, 워프 내 lane분산 dot.
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (row >= n_hidden) return;
+    const int lane = threadIdx.x & 31;
+    const int nblk = n_in / 32;
+
+    float acc_g = 0.0f, acc_u = 0.0f;
+    const unsigned char* wg_row = wg + (size_t)row * nblk * 34;
+    const unsigned char* wu_row = wu + (size_t)row * nblk * 34;
+
+    for (int blk = lane; blk < nblk; blk += 32) {
+        const unsigned char* bg = wg_row + blk * 34;
+        const unsigned char* bu = wu_row + blk * 34;
+        // f16 scale (처음 2바이트)
+        const half2 dg2 = *(const half2*)bg;
+        const half2 du2 = *(const half2*)bu;
+        const float dg = __low2float(dg2);
+        const float du = __low2float(du2);
+        // 32개 int8 quant (2바이트 뒤)
+        const char* qg = (const char*)(bg + 2);
+        const char* qu = (const char*)(bu + 2);
+        float sg = 0.0f, su = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const float xv = x[blk * 32 + j];
+            sg += (float)qg[j] * xv;
+            su += (float)qu[j] * xv;
+        }
+        acc_g += dg * sg;
+        acc_u += du * su;
+    }
+    // warp reduce
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc_g, off);
+        acc_u += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc_u, off);
+    }
+    if (lane == 0) {
+        // silu(gate) * up
+        const float gate = acc_g;
+        const float up = acc_u;
+        h[row] = gate / (1.0f + exp_cr(-gate)) * up;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) q4_shexp_da(
+        const float* __restrict__ h,     // [n_hidden] f32 silu(gate)*up
+        const unsigned char* __restrict__ wd, // Q8_0 [n_in][n_hidden] down
+        const float* __restrict__ s_ptr, // [1] sigmoid 스칼라(디바이스)
+        float* __restrict__ mout,        // [n_in] 누적 대상
+        int n_in, int n_hidden) {
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (row >= n_in) return;
+    const int lane = threadIdx.x & 31;
+    const int nblk = n_hidden / 32;
+    const unsigned char* wd_row = wd + (size_t)row * nblk * 34;
+
+    float acc = 0.0f;
+    for (int blk = lane; blk < nblk; blk += 32) {
+        const unsigned char* bd = wd_row + blk * 34;
+        const float dd = __low2float(*(const half2*)bd);
+        const char* qd = (const char*)(bd + 2);
+        float sd = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            sd += (float)qd[j] * h[blk * 32 + j];
+        }
+        acc += dd * sd;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc, off);
+    }
+    if (lane == 0) {
+        mout[row] += (*s_ptr) * acc;
+    }
+}
