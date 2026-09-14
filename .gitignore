@@ -1,5 +1,7 @@
 plans/
 source/
+# docs/source 는 공개 문서(코드 1:1 측정 기록)라 추적한다 — 위 source/ 는 벤더 소스용.
+!docs/source/
 target*/
 docs-inner/
 __pycache__/
