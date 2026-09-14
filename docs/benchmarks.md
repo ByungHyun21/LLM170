@@ -281,6 +281,18 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### q8_0 MMQ for Flash-Next: wrong AND slower - closed negative (2026-09-14)
+
+With the ROCm 10-built mul_mat_q<q8_0,128> and quantize_mmq_q8_1<D4,false>
+from the same fresh cmake build, the kernel launches and completes on
+Flash-Next (short prompts generate), but the full Korean diverse gate FAILS
+(numerically wrong stream) and pp2048 measures **283.2 vs 290.2 t/s** (-2.4%)
+for the existing j128 tile path. The subtle mismatch is in the y-quantization
+stride/padding for the D4 ds-layout vs what the kernel computes internally.
+Combined: no case for enabling - the j128 tiles remain optimal for Q8_0 at
+these shapes. Assets kept: CO extraction pipeline, ntx fastdiv fix (needed by
+any future new-MMQ), qk=32 block contract fix. plans/71 closed.
+
 ### q8_0 MMQ groundwork landed dormant - wholesale refresh needed (2026-09-14, plans/71)
 
 The q8_0 route for the hc/dense projections (Flash-Next pp promise 278 -> 321
