@@ -10,7 +10,7 @@ import struct
 import subprocess
 import sys
 
-ROCM = "/opt/rocm-7.2.2"
+ROCM = "/opt/rocm-10.0.0/install" if __import__("os").path.isdir("/opt/rocm-10.0.0/install") else "/opt/rocm-7.2.2"
 HIPCC = f"{ROCM}/bin/hipcc"
 WANT = "hipv4-amdgcn-amd-amdhsa--gfx1151"
 
