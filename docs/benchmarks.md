@@ -5431,17 +5431,24 @@ for the prefill; the frame-total and bridge timers are the trustworthy pair.
 
 ## Why the QSA bridge costs 24% of the prefill (2026-09-14)
 
-The bridge in frame.rs is read (d2h plus drain) -> host QSA stage -> write (h2d). The
-arithmetic of the timings says the transfer itself is not the bulk: the round trip per
-QSA layer moves ~21 MB at PCIe/shared-memory rates, well under the measured ~175 ms per
-layer. What dominates is the structure around it. The drain is a full synchronisation, so
-the device idles for the entire host-side stage; and each call additionally churns ~4,096
-heap allocations (2048 per-row Vecs from chunks_exact().map(to_vec), then out.concat()),
-so twelve layers times two chunks per pp2048 walk about 98k allocations per forward.
+Direct measurement with LLM170_Q4_TIME corrects the earlier frame-timer reading. For the
+2048-token chunk, across 24 QSA calls (12 layers x 2 chunks), the bridge is:
 
-Removing them (a single flat buffer with the stage taking a &[f32]) is a bounded cleanup
-worth doing, but the larger fix is the architecture: the QSA value path is host-side, so
-no overlap is possible while it stays there. Making it device-resident removes the
-synchronisation, the transfers and the allocation churn together, and that is the
-Flash-Next prefill's main remaining lever.
+| part | total | share |
+|---|---|---|
+| read (d2h + drain) | 0.02 s | 0% |
+| stage (host QSA) | 4.74 s | 99% |
+| write (h2d) | 0.05 s | 1% |
+
+So the transfers are irrelevant and the bridge is not really a bridge problem: the host
+QSA stage itself is 4.74 s of CPU work, 81 ms per 1024-token layer call and 54% of the
+8,831 ms frame total - the largest single component of the Flash-Next prefill, and the
+reason the frame timer's 24% figure was wrong (that timer nests inside the frame). The
+per-call heap churn (2048 per-row Vecs then out.concat(), ~98k allocations per forward)
+is real but secondary.
+
+The fix is to move the QSA value path onto the device rather than trimming the round trip
+around it: that removes the 4.74 s of CPU work, the full-synchronisation drain that idles
+the device through it, and the allocation churn together. This is the Flash-Next prefill's
+main remaining lever, and it is an architectural change rather than a tuning one.
 
