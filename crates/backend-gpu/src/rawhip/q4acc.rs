@@ -2024,6 +2024,117 @@ impl Q4Acc {
         Ok(out)
     }
 
+    /// 분할판의 **디바이스 q·출력판** (plans/67 2c) — q를 wq 출력 버퍼에서 직접
+    /// 읽고 어텐션 출력도 프레임 버퍼에 쓴다(왕복 0). 산술은 sel4s와 동일
+    /// 커널 쌍이라 greedy 스트림 동일. t=1 장문맥 디코드의 지연 바운드를
+    /// 분할로 푼다(142.5→124.4ms/스텝 실측치의 디바이스 상속).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attn_sel4s_dev_raw(
+        &self,
+        q: u64,
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        let list_len = sel_off
+            .get(1)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
+        let cap = std::env::var("LLM170_QSA_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+        let (kdev, vdev, sdev, ofdev, pdev) = {
+            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
+                * n_kv.max(1) * hd.max(1);
+            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
+            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
+            let mut g = self.qsp.lock().map_err(|e| e.to_string())?;
+            let pdev = g.ensure(&self.ctx, n_head * n_splits * 32 * 10 * 4)?;
+            (kdev, vdev, sdev, ofdev, pdev)
+        };
+        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
+        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
+        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
+        let qdev = self.fptr(q)?;
+        let odev = self.fptr(out)?;
+        {
+            let mut q_p = qdev as *mut std::ffi::c_void;
+            let mut k_p = kdev as *mut std::ffi::c_void;
+            let mut v_p = vdev as *mut std::ffi::c_void;
+            let mut si_p = sdev as *mut std::ffi::c_void;
+            let mut so_p = ofdev as *mut std::ffi::c_void;
+            let mut pa_p = pdev as *mut std::ffi::c_void;
+            let mut ns = n_splits as i32;
+            let mut sc = kq_scale;
+            let mut nh = n_head as i32;
+            let mut nk = n_kv as i32;
+            let mut h = hd as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut pa_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut sc) as *mut _ as *mut std::ffi::c_void,
+                (&mut nh) as *mut _ as *mut std::ffi::c_void,
+                (&mut nk) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_qsa_attn_sel4s",
+                n_splits.div_ceil(4) as u32,
+                (n_head / 12) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        {
+            let mut pa_p = pdev as *mut std::ffi::c_void;
+            let mut q_p = qdev as *mut std::ffi::c_void;
+            let mut o_p = odev as *mut std::ffi::c_void;
+            let mut ns = n_splits as i32;
+            let mut nh = n_head as i32;
+            let mut h = hd as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut pa_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut nh) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_qsa_attn_sel4s_merge",
+                n_head.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
     /// q4_qsa_attn 커널 런치 본체 — 가드 없음(격리 프로브·진단 전용).
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_raw(
@@ -2255,7 +2366,14 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         t: usize,
         out: u64,
     ) -> Result<(), String> {
-        self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        // t=1은 위치 분할판(flash-decoding형) — 디바이스 q·출력판이 같은 커널
+        // 쌍을 쓴다. 규약은 호스트 판(qsa_attention_sel)과 동일: LLM170_QSA_SPLIT=0
+        // 이면 비분할 sel6/sel4로 돌아간다.
+        if t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0") {
+            self.qsa_attn_sel4s_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        } else {
+            self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        }
     }
 
     fn matmul_paired(
