@@ -5760,3 +5760,31 @@ than kept on a guess. Two lessons for the next attempt: prefill runs vary by ~3%
 run, so a ~2% effect needs more reps (or a KTRACE comparison, which reports device time
 rather than the wall), and the geometry change is worth re-testing only with that protocol.
 
+
+## The Flash-Next prefill is 55% non-kernel, and the QSA stage is most of it (2026-09-14)
+
+KTRACE for a pp2048 chunk (17 kernel types, 4,006 ms total against a ~8,900 ms wall):
+
+| kernel | total | calls | share |
+|---|---|---|---|
+| q4_gemm_q4k_ge (MoE gate/up grouped) | 785.5 ms | 52 | 20% |
+| gemm_q8_j128 | 760.9 ms | 776 | 19% |
+| q4_gemm_f32_m | 630.3 ms | 288 | 16% |
+| gdn_ar_w_swap | 344.4 ms | 36 | 9% |
+| q4_qsa_attn_sel6 | 286.6 ms | 12 | 7% |
+| q4_rows_permute_u32 | 226.1 ms | 331 | 6% |
+| gemm_q8_0 / quant_q8 / rms_* / hc_* | ~880 ms | | 22% |
+
+45% of the chunk is on the device, and the remaining 4.9 s is host and synchronisation.
+The t-labelled stage timers place 2.98 s of that in the QSA stage: mm_group 873 ms,
+attn 1,212 ms, sel+proj 503 ms, sel_build 392 ms. attn is the clearest case - its kernel is
+only 287 ms while the stage reports 1,212 ms, so ~926 ms is the d2h drain waiting on queued
+work, which also fixes the numbers for the earlier "attention is bandwidth-bound" reading:
+the kernel itself is 3.2% of the chunk, not 41% of the QSA stage, and the geometry
+experiment's ceiling was therefore ~143 ms (1.6%) - below the run-to-run noise, which is
+exactly what the inconclusive A/B showed.
+
+The prefill's lever is therefore synchronisation and host work in the frame path (QSA
+2.98 s, plus ~1.9 s elsewhere), not kernel traffic. The attention kernel itself (287 ms,
+3.2%) is not worth pursuing further.
+
