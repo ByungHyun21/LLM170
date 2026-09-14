@@ -260,6 +260,21 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_kv_dev: 이 가속기는 미지원".into())
     }
 
+    /// plans/72: 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
+    /// down+sigmoid·axpy(1런치). 기존 8런치를 대체.
+    fn shexp_gu(
+        &self, _x: u64, _wg: &Weight, _wu: &Weight, _h: u64,
+        _n_in: usize, _n_hidden: usize,
+    ) -> Result<(), String> {
+        Err("shexp_gu: 이 가속기는 미지원".into())
+    }
+    fn shexp_da(
+        &self, _h: u64, _wd: &Weight, _s: u64, _mout: u64,
+        _n_in: usize, _n_hidden: usize,
+    ) -> Result<(), String> {
+        Err("shexp_da: 이 가속기는 미지원".into())
+    }
+
     /// 진단: 상주 풀 내용이 호스트 캐시와 비트一致하는지 검증(plans/67 3단계 디버그).
     fn qsa_kv_check(
         &self,

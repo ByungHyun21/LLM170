@@ -2739,6 +2739,53 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         self.qsa_kv_dev_impl(full_idx, seq, k, v, t, pos0, n_kv, hd)
     }
 
+    fn shexp_gu(
+        &self, x: u64, wg: &llm170_core::matmul::Weight, wu: &llm170_core::matmul::Weight,
+        h: u64, n_in: usize, n_hidden: usize,
+    ) -> Result<(), String> {
+        let mut xp = self.fptr(x)? as *mut std::ffi::c_void;
+        let (wgd, _) = self.dev_weight(wg)?;
+        let (wud, _) = self.dev_weight(wu)?;
+        let mut wgp = wgd as *mut std::ffi::c_void;
+        let mut wup = wud as *mut std::ffi::c_void;
+        let mut hp = self.fptr(h)? as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut nh = n_hidden as i32;
+        let mut args = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wgp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wup) as *mut _ as *mut std::ffi::c_void,
+            (&mut hp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+        ];
+        // n_hidden=640, warp당 1행 → 640 워프 = 20블록(256스레드=8워프)
+        self.ctx.launch3("q4_shexp_gu", n_hidden.div_ceil(8) as u32, 1, 1, 256, &mut args)
+    }
+
+    fn shexp_da(
+        &self, h: u64, wd: &llm170_core::matmul::Weight, s: u64, mout: u64,
+        n_in: usize, n_hidden: usize,
+    ) -> Result<(), String> {
+        let mut hp = self.fptr(h)? as *mut std::ffi::c_void;
+        let (wdd, _) = self.dev_weight(wd)?;
+        let mut wdp = wdd as *mut std::ffi::c_void;
+        let mut sp = self.fptr(s)? as *mut std::ffi::c_void;
+        let mut mp = self.fptr(mout)? as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut nh = n_hidden as i32;
+        let mut args = vec![
+            (&mut hp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wdp) as *mut _ as *mut std::ffi::c_void,
+            (&mut sp) as *mut _ as *mut std::ffi::c_void,
+            (&mut mp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+        ];
+        // n_in=2560, warp당 1행 → 2560 워프 = 320블록(8워프/블록)
+        self.ctx.launch3("q4_shexp_da", n_in.div_ceil(8) as u32, 1, 1, 256, &mut args)
+    }
+
     fn qsa_kv_check(
         &self,
         full_idx: usize,
