@@ -164,6 +164,7 @@ impl Q4Acc {
         inv_pad_d: u64,
         tilexp_d: u64,
         rows_pad_d: u64,
+        bound: usize,
     ) -> Result<(), String> {
         let mut ip = self.fptr(ids)?;
         let (mut od, mut pd, mut iv) = (off_d as *mut u8, perm_d as *mut u8, inv_d as *mut u8);
@@ -171,6 +172,7 @@ impl Q4Acc {
             (rowexp_d as *mut u8, perm_pad_d as *mut u8, inv_pad_d as *mut u8);
         let (mut tx, mut rpd) = (tilexp_d as *mut u8, rows_pad_d as *mut u8);
         let (mut n_e, mut rws) = (ne as i32, rows as i32);
+        let mut bnd = bound as i32;
         let mut args: Vec<*mut std::ffi::c_void> = vec![
             (&mut ip) as *mut _ as *mut std::ffi::c_void,
             (&mut n_e) as *mut _ as *mut std::ffi::c_void,
@@ -183,6 +185,7 @@ impl Q4Acc {
             (&mut ipd) as *mut _ as *mut std::ffi::c_void,
             (&mut tx) as *mut _ as *mut std::ffi::c_void,
             (&mut rpd) as *mut _ as *mut std::ffi::c_void,
+            (&mut bnd) as *mut _ as *mut std::ffi::c_void,
         ];
         self.ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args)
     }
@@ -1224,19 +1227,30 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // + 상한(rows*16+16) 크기로 커진 gather/scatter + 폴백의 이벤트
                 // 대기)이 그보다 커서 +31ms/스텝이다. down(q8_0) 폴백까지 그룹
                 // 커널로 덮으면 재평가한다. 옵트인: LLM170_MOE_GROUP_DEV=1.
-                if std::env::var_os("LLM170_MOE_GROUP_DEV").is_some()
+                // t=1 전용 (프리필은 아직 불가). 2026-09-14 리팩터: 상한을 한 곳에서
+                // 계산(rows + 16*ne)해 커널 인자·모든 버퍼에 쓰고, 소비 지점에서
+                // 디바이스가 보고한 rows_pad를 검증한다 — 리팩터 전에는 상한이
+                // 5곳에 흩어져 이 경로 자체가 잠재 OOB였다(rows*16+16=176 vs 실제
+                // ≤8,202). 리팩터 후 t=1은 비트 동일로 검증됨.
+                // 프리필(t>1)은 아직 5번째 상한 축이 남아 실패한다(h2d 8MB — 크기는
+                // h2d 진단이 보고한다). 켜려면 그 축부터 찾아야 한다.
+                if std::env::var("LLM170_MOE_GROUP_DEV").as_deref() != Ok("0")
                     && self.t_cur() == 1
                     && ne <= 512
                     && rows > 0
                 {
-                    let bound = rows * 16 + 16; // rows_pad 상한(전문가당 16행 정렬)
+                    // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
+                    // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
+                    // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
+                    let bound = rows + 16 * ne;
                     let (pd, ivd, rxd) = {
                         let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
                         let pd = a.ensure(&self.ctx, rows * 4)? as u64;
                         let mut b = self.rperm2.lock().map_err(|e| e.to_string())?;
                         let ivd = b.ensure(&self.ctx, rows * 4)? as u64;
                         let mut c = self.rexp.lock().map_err(|e| e.to_string())?;
-                        let rxd = c.ensure(&self.ctx, rows * 4)? as u64;
+                        // GEMM이 rows_pad까지 rowexp를 읽는다 → bound 크기.
+                        let rxd = c.ensure(&self.ctx, bound * 4)? as u64;
                         (pd, ivd, rxd)
                     };
                     let (ppd, ipd, txd, offd, rpd) = {
@@ -1252,7 +1266,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         let rpd = base + (ne as u64 + 1) * 4; // off 뒤 4B = rows_pad
                         (ppd, ipd, txd, offd, rpd)
                     };
-                    self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd)?;
+                    self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd, bound)?;
                     // 폴백(비 Q4K/Q5_1 타입)용 오프셋. 기본은 비동기로 미리 걸어
                     // 소비 시점(층 하단)까지 gate/up GEMM이 지연을 덮는다.
                     // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
@@ -1261,11 +1275,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     let pinned_off = if std::env::var_os("LLM170_MOE_GROUP_NOD2H").is_some() {
                         std::ptr::null_mut()
                     } else if std::env::var_os("LLM170_MOE_GROUP_SYNC").is_some() {
-                        let buf = self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?;
+                        let buf = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
                         self.ctx.d2h_wait()?;
                         buf
                     } else {
-                        self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?
+                        // +4B: 오프셋 뒤에 디바이스가 계산한 rows_pad가 붙어 있다(가드용).
+                        self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?
                     };
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
@@ -1388,9 +1403,12 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         };
         phase("group", &mut lap);
         let row_u32 = if f32w { n_in } else { xq_w };
+        // 디바이스 그룹화 경로의 GEMM은 t = rows_pad로 x를 읽는다(패딩 행의 출력은
+        // scatter가 버리므로 값은 무관, 크기만 rows_pad까지 필요).
+        let xbuf_rows = if rows_pad_d != 0 { rows + 16 * ne } else { rows };
         let xg = {
             let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
-            g.ensure(&self.ctx, rows * row_u32 * 4)?
+            g.ensure(&self.ctx, xbuf_rows * row_u32 * 4)?
         };
         let yg = {
             let mut g = self.yperm.lock().map_err(|e| e.to_string())?;
@@ -1568,15 +1586,25 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         let off_d2h;
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
             self.ctx.d2h_wait()?;
-            let mut b = vec![0i32; ne + 1];
+            // 오프셋 + 그 뒤 4B(디바이스가 계산한 rows_pad)를 함께 읽어 **상한을
+            // 검증**한다. 초과하면 크래시(h2d 700) 대신 진단 메시지로 실패시킨다 —
+            // 2026-09-14에 상한 가정이 5곳에 흩어져 있어 디버깅이 오래 걸렸다.
+            let mut b = vec![0i32; ne + 2];
             if !pinned_off.is_null() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(pinned_off as *const u8, b.as_mut_ptr() as *mut u8, (ne + 1) * 4);
+                    std::ptr::copy_nonoverlapping(pinned_off as *const u8, b.as_mut_ptr() as *mut u8, (ne + 2) * 4);
                 }
             } else {
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut b), off_d as *const u8)?;
             }
-            off_d2h = b.iter().map(|&x| x.max(0) as usize).collect::<Vec<usize>>();
+            let rows_pad_dev = b[ne + 1].max(0) as usize;
+            let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
+            if rows_pad_dev > bound {
+                return Err(format!(
+                    "moe 그룹화: rows_pad {rows_pad_dev} > bound {bound} (ne={ne}) — 상한 가정 위반"
+                ));
+            }
+            off_d2h = b[..ne + 1].iter().map(|&x| x.max(0) as usize).collect::<Vec<usize>>();
             &off_d2h
         } else {
             &off
