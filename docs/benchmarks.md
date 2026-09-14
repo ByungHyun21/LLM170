@@ -5828,9 +5828,16 @@ Launch gaps, by predecessor (3,838.6 ms total):
 | q4_hc_combine + hc_gate_mean | 325.4 ms | 193 | ~1.7 ms |
 
 The single largest item is therefore the host work that follows rows_permute_u32: 5.2 ms per
-call, 331 calls, 1.73 s per chunk (19% of the prefill). That is the MoE path's per-expert
-host loop (frame_moe_gemm launches one GEMM per expert and permutes rows around it), i.e.
-exactly what plans/57's mul_mat_id work targets; the grouped kernel it needs already exists
-and is used for the gate/up. The other gaps are the same shape at smaller scale: host submit
+call, 331 calls, 1.73 s per chunk (19% of the prefill). It is host, not device - the gap is
+the device idling while the host prepares the next submission.
+
+One candidate was tested and ruled out: the MoE routing's top-k selection sorts all 512
+expert logits per token (`idx.sort_by` in stages/moe.rs). Replacing it with
+`select_nth_unstable_by` plus a k-element sort - which preserves the selection and is
+bit-identical on the diverse stream - measured neutral at pp2048 (8,940-8,959 vs
+8,878-9,034 ms) and -1.2% at the decode (567.5 vs 574.3 ms per 8 steps), so it was reverted;
+the routing sort is not what the 5.2 ms consists of. The remaining suspects are the
+per-expert host loop in frame_moe_gemm (one GEMM launch per non-empty expert, plans/57's
+mul_mat_id target) and the offsets d2h that precedes it. The other gaps are the same shape at smaller scale: host submit
 work after each small launch.
 
