@@ -244,6 +244,20 @@ pub fn ktrace_dump() -> String {
             }
             prev_end = Some((en.1, en.0));
         }
+        // 런치 **순서** 덤프 (LLM170_KTRACE_SEQ=N): 갭의 주인은 전임자가 아니라
+        // (2026-09-14: 이 덤프로 MoE 묶음이 gather → gate GEMM → scatter → up GEMM …
+        //  순서임을 확인해 그룹화 호스트 경로를 특정했다)
+        // **후속 op의 호스트 비용**이므로(갭이 후속에 따라 달라진다), 순서를 봐야
+        // 어떤 op인지 특정된다.
+        if let Ok(v) = std::env::var("LLM170_KTRACE_SEQ") {
+            let n: usize = v.parse().unwrap_or(64);
+            for k in 0..npair.min(n) {
+                let (st, en) = (&evs[2 * k], &evs[2 * k + 1]);
+                let mut sms = 0f32;
+                let _ = hip::hipEventElapsedTime(&mut sms, st.1 as *mut _, en.1 as *mut _);
+                out.push_str(&format!("# seq {k:4} {:<28} gy={:<6} {:8.3}ms\n", st.0, st.2, sms));
+            }
+        }
         for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
         out.push_str(&format!("LAUNCH GAPS total {:.1}ms\n", gap_tot));
         let mut gv: Vec<_> = gap_by_pred.iter().collect();
