@@ -784,7 +784,26 @@ impl RawCtx {
             }
         }
         unsafe {
+            // KTRACE 이벤트 짝 — launch3와 동일(2026-09-14 plans/69: 이 기록이
+            // 없어 qsa_flash_wmma의 실행 시간이 'kv_f16 뒤 갭 12s'로 위장,
+            // 8.4× 프리필 격차의 원인 파악을 하루 종일 돌렸다).
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev0, 0);
+                    hip::hipEventRecord(ev0, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                }
+            }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, smem, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3_dyn")?;
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev, 0);
+                    hip::hipEventRecord(ev, self.stream);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                }
+            }
         }
         Ok(())
     }
