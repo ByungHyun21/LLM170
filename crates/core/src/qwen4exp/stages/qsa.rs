@@ -91,6 +91,213 @@ fn mask_from_list(
 }
 
     /// QSA층 — 인덱서 top-k 마스크 게이트드 GQA.
+    /// plans/67 2b: 선택부만 추출 — 투영 결과를 받아 (1) 인덱서 norm·rope와
+    /// KV/idx 캐시 적립, (2) 블록 키 풀링, (3) 블록 점수·top-k 선택을 수행하고
+    /// 선택 블록 목록을 반환한다. **q/k의 attention norm·rope는 포함하지 않는다**
+    /// (새 경로는 디바이스가 수행 — frame_qk_norm_rope). `qsa_layer`가 이 함수를
+    /// 호출하므로 동작 불변(diverse 게이트로 확인).
+    pub fn qsa_select(
+        ctx: &Ctx,
+        seq_state: &mut SeqState4,
+        il: usize,
+        kk: &[Vec<f32>],
+        vv: &[Vec<f32>],
+        iq: &[Vec<f32>],
+        ik: &[Vec<f32>],
+        t_len: usize,
+        full_idx: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>, usize), Q4Error> {
+        let hp = &ctx.model.hp;
+        let (n_kv, hd) = (hp.n_kv, hp.head_dim);
+        let (n_rot, idx_dim, idx_heads) = (hp.n_rot, hp.idx_dim, hp.idx_heads);
+        let (rope_base, eps) = (hp.rope_base, hp.eps);
+        let r = hp.compress[il] as usize;
+        let knw = &ctx.model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let iqw = &ctx.model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
+        let ikw = &ctx.model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        let pos0 = seq_state.pos;
+        let mut bk_local: Vec<f32> = std::mem::take(&mut seq_state.idx_bk[full_idx]);
+        // 패스 A: KV·인덱서 캐시 적립 + 인덱서 q_rope(norm·rope).
+        let mut q_rows: Vec<Vec<Vec<f32>>> = vec![Vec::new(); t_len];
+        {
+            let nthreads_a = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(4)
+                .min(32);
+            let per_a = t_len.div_ceil(nthreads_a.max(1)).max(1);
+            let pos0u = pos0 as usize;
+            let skip_kv = pos0u * n_kv * hd;
+            let skip_idx = pos0u * idx_dim;
+            let st = &mut *seq_state;
+            let (kv_k, kv_v, idx_k) = (
+                st.kv_k[full_idx].as_mut_slice(),
+                st.kv_v[full_idx].as_mut_slice(),
+                st.idx_k[full_idx].as_mut_slice(),
+            );
+            std::thread::scope(|sc| {
+                for (ci, (((kc, vc), ic), qc)) in kv_k[skip_kv..]
+                    .chunks_mut(per_a * n_kv * hd)
+                    .zip(kv_v[skip_kv..].chunks_mut(per_a * n_kv * hd))
+                    .zip(idx_k[skip_idx..].chunks_mut(per_a * idx_dim))
+                    .zip(q_rows.chunks_mut(per_a))
+                    .enumerate()
+                {
+                    let base = ci * per_a;
+                    sc.spawn(move || {
+                        for (i, (((kch, vch), ich), qslot)) in kc
+                            .chunks_mut(n_kv * hd)
+                            .zip(vc.chunks_mut(n_kv * hd))
+                            .zip(ic.chunks_mut(idx_dim))
+                            .zip(qc.iter_mut())
+                            .enumerate()
+                        {
+                            let t = base + i;
+                            if t >= t_len { break; }
+                            let pos = pos0u as u32 + t as u32;
+                            for h in 0..n_kv {
+                                let lo = h * hd;
+                                let mut head = rms_norm(&kk[t][lo..lo + hd], knw, eps);
+                                rope_head(&mut head, pos, n_rot, rope_base);
+                                kch[lo..lo + hd].copy_from_slice(&head);
+                                vch[lo..lo + hd].copy_from_slice(&vv[t][lo..lo + hd]);
+                            }
+                            ich.copy_from_slice(&ik[t][..idx_dim]);
+                            let mut qr: Vec<Vec<f32>> = Vec::with_capacity(idx_heads);
+                            for h in 0..idx_heads {
+                                let lo = h * idx_dim;
+                                let mut qh = rms_norm(&iq[t][lo..lo + idx_dim], iqw, eps);
+                                rope_head(&mut qh, pos, idx_dim, rope_base);
+                                qr.push(qh);
+                            }
+                            *qslot = qr;
+                        }
+                    });
+                }
+            });
+        }
+        // 블록 키 캐시 — 청크 끝까지의 완전 블록을 병렬로(증분, 원본과 동일 산술:
+        // 블록 내 r개 인덱서 k의 mean-pool → rms_norm → rope(pos = 블록 시작)).
+        {
+            let n_blocks_max = (pos0 as usize + t_len) / r;
+            if bk_local.len() < n_blocks_max * idx_dim {
+                let dim = idx_dim;
+                let b0 = bk_local.len() / dim;
+                bk_local.resize(n_blocks_max * dim, 0.0);
+                let idx_all: &[f32] = seq_state.idx_k[full_idx].as_slice();
+                let nthreads_b = std::thread::available_parallelism()
+                    .map(|v| v.get())
+                    .unwrap_or(4)
+                    .min(32);
+                let per_b = (n_blocks_max - b0).div_ceil(nthreads_b.max(1)).max(1);
+                std::thread::scope(|sc| {
+                    for (ci, chunk) in bk_local[b0 * dim..].chunks_mut(per_b * dim).enumerate() {
+                        let base = b0 + ci * per_b;
+                        sc.spawn(move || {
+                            for (i, slot) in chunk.chunks_mut(dim).enumerate() {
+                                let b = base + i;
+                                if b >= n_blocks_max {
+                                    break;
+                                }
+                                let mut pooled = vec![0.0f32; dim];
+                                for j in 0..r {
+                                    let src = (b * r + j) * dim;
+                                    for i2 in 0..dim {
+                                        pooled[i2] += idx_all[src + i2];
+                                    }
+                                }
+                                for v in pooled.iter_mut() {
+                                    *v /= r as f32;
+                                }
+                                let mut pk = rms_norm(&pooled, ikw, eps);
+                                rope_head(&mut pk, (b * r) as u32, dim, rope_base);
+                                slot.copy_from_slice(&pk);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        seq_state.idx_bk[full_idx] = bk_local;
+        // 패스 B: 블록 점수 + 선택(top-k).
+        let sel_stride = hp.idx_top_k / r + 2;
+        let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
+        let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
+        {
+            let bkl: &[f32] = &seq_state.idx_bk[full_idx];
+            let qr: &[Vec<Vec<f32>>] = &q_rows;
+            let idx_top_k = hp.idx_top_k;
+            let nthreads = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(4)
+                .min(32);
+            let per = t_len.div_ceil(nthreads.max(1)).max(1);
+            let pos0u = pos0 as usize;
+            std::thread::scope(|sc| {
+                for (ci, (blk_chunk, cnt_chunk)) in sel_blk
+                    .chunks_mut(per * sel_stride)
+                    .zip(sel_cnt.chunks_mut(per))
+                    .enumerate()
+                {
+                    let base = ci * per;
+                    sc.spawn(move || {
+                        for (i, (bslot, cslot)) in blk_chunk
+                            .chunks_mut(sel_stride)
+                            .zip(cnt_chunk.iter_mut())
+                            .enumerate()
+                        {
+                            let t = base + i;
+                            if t >= t_len { break; }
+                            let n_past = pos0u + t + 1;
+                            let n_blocks = n_past / r;
+                            let tail_start = n_blocks * r;
+                            let bk = &bkl[..n_blocks * idx_dim];
+                            let mut block_score = vec![0.0f32; n_blocks];
+                            for b in 0..n_blocks {
+                                let pk = &bk[b * idx_dim..(b + 1) * idx_dim];
+                                for qh in &qr[t] {
+                                    let (mut d0, mut d1, mut d2, mut d3) =
+                                        (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                                    let mut i2 = 0usize;
+                                    while i2 + 4 <= idx_dim {
+                                        d0 += qh[i2] * pk[i2];
+                                        d1 += qh[i2 + 1] * pk[i2 + 1];
+                                        d2 += qh[i2 + 2] * pk[i2 + 2];
+                                        d3 += qh[i2 + 3] * pk[i2 + 3];
+                                        i2 += 4;
+                                    }
+                                    while i2 < idx_dim {
+                                        d0 += qh[i2] * pk[i2];
+                                        i2 += 1;
+                                    }
+                                    let dot = (d0 + d1) + (d2 + d3);
+                                    if dot > 0.0 { block_score[b] += dot; }
+                                }
+                            }
+                            let width = n_past.min(idx_top_k + r - 1);
+                            let tail_cnt = n_past - tail_start;
+                            let n_sel_blocks = ((width - tail_cnt) / r).min(n_blocks);
+                            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
+                            if n_sel_blocks < n_blocks {
+                                sel_blocks.select_nth_unstable_by(n_sel_blocks, |&a, &b| {
+                                    block_score[b]
+                                        .partial_cmp(&block_score[a])
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            }
+                            let mut sb: Vec<usize> = sel_blocks[..n_sel_blocks].to_vec();
+                            sb.sort_unstable();
+                            for (k2, &b) in sb.iter().enumerate() {
+                                bslot[k2] = b as u32;
+                            }
+                            *cslot = n_sel_blocks as u32;
+                        }
+                    });
+                }
+            });
+        }
+        Ok((sel_blk, sel_cnt, sel_stride))
+    }
+
     pub fn qsa_layer(
         ctx: &Ctx,
         seq: &mut SeqState4,
