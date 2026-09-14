@@ -1,5 +1,6 @@
 //! 커널·프리미티브 검증 프로브 모음 — CLI(`llm170 <probe>`)와 게이트 스크립트가 호출한다.
 //! 본체(rawhip/mod.rs)의 비공개 항목을 그대로 쓰기 위해 `use super::*` 로 가져온다.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::*;
 
@@ -13,7 +14,7 @@ pub fn raw_probe(iters: usize) -> Result<String, String> {
     ctx.h2d(x, bytemuck::cast_slice(&xh))?;
     let nblk = n / 32;
     let gx = nblk.div_ceil(64) as u32;
-    let mut xq = ctx.alloc((n / 4 + n / 32 + n / 16) * 4)?;
+    let xq = ctx.alloc((n / 4 + n / 32 + n / 16) * 4)?;
     let mut xp = x as *mut std::ffi::c_void;
     let mut xqp = xq as *mut std::ffi::c_void;
     let mut na = n as i32;
@@ -362,13 +363,13 @@ pub fn mm_tile_bench() -> Result<String, String> {
         ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     }
     let out = ctx.alloc(n_out * 4 * t)?;
-    let mut wp = wd as *mut std::ffi::c_void;
-    let mut op = out as *mut std::ffi::c_void;
-    let mut xp = xq as *mut std::ffi::c_void;
-    let mut ni = n_in as i32;
-    let mut no = n_out as i32;
-    let mut xw = xq_w as i32;
-    let mut tt = t as i32;
+    let _wp = wd as *mut std::ffi::c_void;
+    let _op = out as *mut std::ffi::c_void;
+    let _xp = xq as *mut std::ffi::c_void;
+    let _ni = n_in as i32;
+    let _no = n_out as i32;
+    let _xw = xq_w as i32;
+    let _tt = t as i32;
     ctx.gemm_tile(xq, wd, kt_d, w.ty as u32, n_in, n_out, xq_w, t, out)?;
     ctx.sync()?;
     let mut o = vec![0f32; n_out * t];
@@ -1114,6 +1115,7 @@ fn wmma_probe_both() -> Result<(bool, String), String> {
 /// 합성 어텐션 검증: qsa_flash_wmma 를 작은 단일 케이스로 돌려 **CPU 기준**과 비교한다.
 /// 디코드(t=1) GQA 어텐션 v2 검증·계측: 기존 qsa_flash_gqa 와 출력을 대조하고
 /// n_past 별로 두 커널의 런치 시간을 잰다. 모델 구성(n_head=24, n_kv=4, hd=256)을 쓴다.
+#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn gqa_bench() -> Result<String, String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
@@ -1291,6 +1293,7 @@ pub fn gqa_bench() -> Result<String, String> {
 }
 
 /// part 규약: seg 별 acc=Σ e_d·v (m,s 는 러닝 최대/합). 첫 불일치 위치를 보고한다.
+#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn wmma_attn_check() -> Result<String, String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
@@ -1700,6 +1703,7 @@ pub fn roof_test() -> Result<String, String> {
 
 
 /// MMQ 포트 A/B — bt vs mm (각 미러).
+#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn launch_probe() -> Result<String, String> {
     let ctx = RawCtx::new()?;
     // 디코드 소형 커널의 실제 런치 비용 (트레이스 페어링 무관, 직접 계측).
@@ -1952,7 +1956,7 @@ pub fn mm_bench() -> Result<String, String> {
         args.push((&mut tt) as *mut _ as *mut std::ffi::c_void);
         let rpb = if kern_name.ends_with("_j128") || kern_name.ends_with("_v4") { 128 } else { 64 };
         let gx = n_out.div_ceil(rpb).min(65535) as u32;
-        let gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
+        let _gz = n_out.div_ceil(rpb).div_ceil(65535) as u32;
         let gz = n_out.div_ceil(64).div_ceil(65535) as u32;
         ctx.launch3(kern_name, gx, 1, gz, 256, &mut args)
     };

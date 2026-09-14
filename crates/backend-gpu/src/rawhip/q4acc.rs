@@ -1109,7 +1109,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let tm = std::env::var_os("LLM170_MOE_TIME").is_some();
         let t0 = std::time::Instant::now();
         let mut lap = t0;
-        let mut phase = |name: &str, lap: &mut std::time::Instant| {
+        let phase = |name: &str, lap: &mut std::time::Instant| {
             if tm {
                 let ms = lap.elapsed().as_secs_f64() * 1e3;
                 if ms >= 0.05 {
@@ -1848,7 +1848,7 @@ impl Q4Acc {
         t: usize,
         out: u64,
     ) -> Result<(), String> {
-        let (qdev, kdev, vdev, sdev, ofdev, odev) = {
+        let (qdev, kdev, vdev, sdev, ofdev, _odev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, t.max(1) * n_head * 2 * hd * 4)?;
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;

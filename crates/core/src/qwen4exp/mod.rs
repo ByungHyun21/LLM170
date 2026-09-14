@@ -11,6 +11,7 @@
 //! - PLE(blk.1): n-gram 해시(호스트 u64) → 16행×160 gather → key/value → sgn√|s| 게이트
 //!   → 4스트림 방송 → dilated(3) depthwise conv(4) → 잔차 2경로. 테이블 26.8GiB mmap 오프로드.
 //! - 4-split GGUF: part1=메타 전용, parts2-4가 텐서 1224개 분산 보관.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 pub mod frame;
 pub mod layers;
@@ -182,7 +183,7 @@ impl Model4 {
                 let has_ple = g.tensors.iter().any(|t| t.name == "per_layer_token_embd.weight");
                 if has_ple {
                     // SAFETY: 어드바이스는 힌트 — 잘못돼도 안전
-                    unsafe { mmap.advise(Advice::Random) }.ok();
+                    mmap.advise(Advice::Random).ok();
                 }
             }
             parts.push(PartMap {

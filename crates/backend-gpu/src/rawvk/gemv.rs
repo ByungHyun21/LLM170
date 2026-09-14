@@ -2,6 +2,7 @@
 //! LLM170_GPU_RUNTIME=vulkan 시 주입, GDN/프레임은 CPU 폴백 (트레이트 Err).
 //! 구조: 파이프라인·버퍼·가중치는 전부 지연 초기화 캐시, dispatch 헬퍼가
 //! SSBO 바인딩+push+발사를 일원화 (M4b 확장 지점).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
@@ -765,7 +766,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
         std::fs::read(format!("/home/yoon/local_llm/llama.cpp-master/build-vulkan/ggml/src/ggml-vulkan/vulkan-shaders.spv/{}.spv", spv_name))
             .map_err(|e| e.to_string())?
     };
-    let mut acc = VkAcc::new()?;
+    let acc = VkAcc::new()?;
     let mut ctxg = acc.ctx.lock();
     // 버퍼: A=가중(호스트맵→h2d는 run 전 복사), B=f16 y, D=f32 out
     let ab_vram = std::env::var("VKMMQ_VRAM").map(|v| v=="1").unwrap_or(false);
@@ -795,7 +796,7 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
     }
     ctxg.unmap(&mut bb)?;
     eprintln!("bc: allocs ok");
-    let mut db = ctxg.alloc_host(n_out * t * 4)?;
+    let db = ctxg.alloc_host(n_out * t * 4)?;
     // l 파이프라인 (non-cm, subgroup=64, gfx1151): ids 0..10 + ALIGNED=0
     let sp = std::env::var("VKMMQ_SPEC").unwrap_or_else(|_| "l".into());
     let is_cm1 = spv_name.contains("_cm1");
@@ -1013,7 +1014,7 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         wbufs.push(b.buf);
         off += sz;
     }
-    let mut dummy = ctx.alloc_host(16)?;
+    let dummy = ctx.alloc_host(16)?;
     {
         let z = [0u8; 16];
         unsafe { std::ptr::copy_nonoverlapping(z.as_ptr(), dummy.ptr, 16) };
@@ -1484,7 +1485,7 @@ pub fn q3_dbg(path: &str, tname: &str) -> Result<String, String> {
     let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/dbg_q3.spv").map_err(|e| e.to_string())?;
     let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(&spv, 2, 4)?;
     ctx.bind_bufs(ds, &[wbufs[0], ob.buf]);
-    let gx = (n_in as u32) / 64 / 32 * 64;  // sb 수/64
+    let _gx = (n_in as u32) / 64 / 32 * 64;  // sb 수/64
     let n_sb = (n_in / 32) as u32;
     let gx = n_sb.div_ceil(64);
     let push = push_u32s(&[n_in as u32]);

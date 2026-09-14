@@ -1,7 +1,7 @@
 //! 엔진 파사드 — qwen35/qwen4exp 통합, 아키텍처 자동 판별.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub enum BackendSel {
     Cpu,

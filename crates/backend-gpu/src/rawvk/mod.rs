@@ -1,4 +1,5 @@
 //! rawvk — Vulkan 백엔드 (plans/12). 모듈 루트.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 pub mod context;
 pub mod decoder;
@@ -14,7 +15,6 @@ pub const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
 /// subsum-check — 서브그룹 리덕션 프로브 (xor 트리 / add / broadcast).
 pub fn subsum_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
-use ash::vk;
     let mut ctx = VkCtx::new()?;
     let ob = ctx.alloc(16)?;
     let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/subsum.spv"), 1, 4)?;
@@ -34,6 +34,7 @@ use ash::vk;
 
 /// gdn-check — GDN 커널군 (plans/19) GPU↔CPU 상호검증.
 /// split3·conv_t·beta_g·norm_gated·ar — 각 커널 독립 LCG 입력·CPU 미러 대조.
+#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn gdn_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
 use ash::vk;
@@ -65,7 +66,7 @@ use ash::vk;
         let bbuf = ctx.alloc(256)?;
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr() as *const u8, bbuf.ptr, 256) };
         let cbuf = ctx.alloc_host(256 * 4)?;
-        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(
+        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
             include_bytes!("spv/i8probe.spv"), 3, 8,
         )?;
         let _ = dsl;
@@ -184,7 +185,7 @@ use ash::vk;
         let n_sub = 1usize;
         // 데이타: w8 [-20,20], wsp/wsm [0.01,0.05], b8 [-100,100], yd/qsum 결정적
         let seed2 = std::cell::Cell::new(42u64);
-        let mut lcg2 = || { seed2.set(seed2.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)); (seed2.get() >> 33) as i32 };
+        let lcg2 = || { seed2.set(seed2.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)); (seed2.get() >> 33) as i32 };
         let w8: Vec<i8> = (0..no * n_in).map(|_| (lcg2() % 41 - 20) as i8).collect();
         let wsp: Vec<f32> = (0..no * n_sub).map(|i| 0.01 + (i % 7) as f32 * 0.005).collect();
         let wsm: Vec<f32> = (0..no * n_sub).map(|i| 0.02 + (i % 5) as f32 * 0.004).collect();
@@ -222,10 +223,10 @@ use ash::vk;
         };
         let obuf = ctx.alloc_host(t * no * 4)?;
         let ishsb = ctx.alloc_host(640 * 256 * 4)?;
-        let faccsb = ctx.alloc_host(640 * 256 * 4)?;
+        let _faccsb = ctx.alloc_host(640 * 256 * 4)?;
         // 센티넬 프리필 — 커널이 실제 쓴 영역 검증
         unsafe { std::ptr::write_bytes(ishsb.ptr as *mut u8, 0xAB, 640 * 256 * 4); }
-        let (dsl, pl, dp, ds, pipe) = ctx.pipeline(
+        let (dsl, pl, dp, _ds, pipe) = ctx.pipeline(
             include_bytes!("spv/gemm_i8.spv"), 16, 16,
         )?;
         let _ = dsl;
@@ -244,7 +245,7 @@ use ash::vk;
         let mut out = vec![0f32; t * no];
         unsafe { std::ptr::copy_nonoverlapping(obuf.ptr as *const f32, out.as_mut_ptr(), out.len()) };
         let sentinel = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 4) }[0];
-        let nsent = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 256) }.iter().filter(|&&x| x == 0xABABABAB).count();
+        let _nsent = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 256) }.iter().filter(|&&x| x == 0xABABABAB).count();
         // CPU 미러: out[tok][o] = Σ_b yd·(wsp·isum − wsm·qsum)
         let mut mx = 0f64;
         let mut ok = true;
@@ -265,11 +266,11 @@ use ash::vk;
                 mx = mx.max(d);
             }
         }
-        let f8: Vec<String> = out[..8].iter().map(|v| format!("{v:.4}")).collect();
+        let _f8: Vec<String> = out[..8].iter().map(|v| format!("{v:.4}")).collect();
         // ishs 검증: wg0의 isum[m][n=0] — 기대 Σ_k w8[m*32+k]·b8[0*32+k]
         let mut iv = vec![0i32; 256];
         unsafe { std::ptr::copy_nonoverlapping(ishsb.ptr as *const i32, iv.as_mut_ptr(), 32) };
-        let mut iok = true;
+        let mut _iok = true;
         let mut first_bad = String::new();
         for m in 0..16usize {
             let mut s = 0i32;
@@ -277,7 +278,7 @@ use ash::vk;
                 s += w8[m * n_in + k] as i32 * b8[0 * n_in + k] as i32;
             }
             if iv[m * 16] != s {
-                iok = false;
+                _iok = false;
                 if first_bad.is_empty() {
                     first_bad = format!("m={m} got={} want={s}", iv[m * 16]);
                 }
@@ -329,7 +330,7 @@ use ash::vk;
         let (n0, n1, n2, t) = (4usize, 5usize, 3usize, 3usize);
         let total = n0 + n1 + n2;
         let src: Vec<f32> = (0..t * total).map(|_| lcg()).collect();
-        let mut sbuf = ctx.alloc(t * total * 4)?;
+        let sbuf = ctx.alloc(t * total * 4)?;
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), sbuf.ptr as *mut f32, src.len()) };
         let d0 = ctx.alloc(t * n0 * 4)?;
         let d1 = ctx.alloc(t * n1 * 4)?;
@@ -404,7 +405,7 @@ use ash::vk;
         {
             let (ch, k, steps) = (12usize, 4usize, 4usize);
             let cw: Vec<f32> = (0..ch * k).map(|_| lcg()).collect();
-            let mut st: Vec<f32> = vec![0.0; (k - 1) * ch];
+            let st: Vec<f32> = vec![0.0; (k - 1) * ch];
             let inputs: Vec<Vec<f32>> = (0..steps).map(|_| (0..ch).map(|_| lcg()).collect()).collect();
             let cwb = ctx.alloc(cw.len() * 4)?;
             let stb = ctx.alloc(st.len() * 4)?;
@@ -618,7 +619,7 @@ use ash::vk;
             let (d, hv, hk) = (128usize, 48usize, 16usize);
             let (ks, vs) = (hk * d, hv * d);
             let scale = 1.0f32 / (d as f32).sqrt();
-            let mut st: Vec<f32> = (0..hv * d * d).map(|_| lcg() * 0.5).collect();
+            let st: Vec<f32> = (0..hv * d * d).map(|_| lcg() * 0.5).collect();
             let steps = 2usize;
             let inputs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..steps).map(|_| {
                 (lcg_v(ks), lcg_v(ks), lcg_v(vs), {
@@ -695,7 +696,7 @@ use ash::vk;
     {
         let (n_h, d, t) = (3usize, 8usize, 2usize);
         let eps = 1e-5f32;
-        let mut o: Vec<f32> = (0..t * n_h * d).map(|_| lcg()).collect();
+        let o: Vec<f32> = (0..t * n_h * d).map(|_| lcg()).collect();
         let z: Vec<f32> = (0..t * n_h * d).map(|_| lcg()).collect();
         let w: Vec<f32> = (0..n_h * d).map(|_| lcg()).collect();
         let ob = ctx.alloc(o.len() * 4)?;
@@ -817,7 +818,7 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(kb.ptr as *const f32, kv.as_mut_ptr(), kv.len());
         }
         // CPU 미러
-        let mut cq = qv.clone();
+        let _cq = qv.clone();
         let ck = kv.clone();
         let _ = &ck;
         let mut q0: Vec<f32> = (0..t * row).map(|_| lcg()).collect();
@@ -843,7 +844,7 @@ use ash::vk;
         let (nh, nk, hd, nr, np) = (4usize, 2usize, 128usize, 64usize, 16usize);
         // q [nh*2hd], k/v [np][nk*hd]
         let mut qv: Vec<f32> = (0..nh * 2 * hd).map(|_| lcg()).collect();
-        let mut kvv: Vec<f32> = (0..np * nk * hd).map(|_| lcg()).collect();
+        let kvv: Vec<f32> = (0..np * nk * hd).map(|_| lcg()).collect();
         let ckk: Vec<f32> = (0..np * nk * hd).map(|_| lcg()).collect();
         let qwt: Vec<f32> = (0..nh * hd).map(|_| lcg()).collect();
         let kwt: Vec<f32> = (0..nk * hd).map(|_| lcg()).collect();

@@ -1,6 +1,7 @@
 //! VkDecoder — GDN/어텐션 GPU 상주 디코드 (plans/19 2단계).
 //! 커널 8종은 gdn-check ★ 검증 완료. 기존 gemv/quant/rms/silu SPIR-V 재사용.
 //! rawhip DecodeState 대칭 — 배치 모드(단일 제출+배리어).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
@@ -491,6 +492,7 @@ const T_MAX: usize = 512;   // plans/41: 단일 패스 프리필 (가중 1회 �
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_assignments)] // 진단 코드의 중간 변수
     pub fn new<'a>(
         mut ctx: VkCtx,
         weights: Vec<(&'a str, &'a [u8], u32, usize, usize)>,
@@ -634,7 +636,7 @@ impl DecoderState {
         // 상수 — GTT (읽기 전용, 매핑 유지 무방하나 언맵)
         let mut cmap = HashMap::new();
         for (name, vals) in consts {
-            let mut b = ctx.alloc_host(vals.len() * 4)?;
+            let b = ctx.alloc_host(vals.len() * 4)?;
             unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), b.ptr as *mut f32, vals.len()) };
             cmap.insert(name, b);
         }
@@ -646,7 +648,7 @@ impl DecoderState {
         let mut grid3s = ctx.alloc(2048)?;
         unsafe { std::ptr::copy_nonoverlapping(llm170_core::IQ3S_GRID.as_ptr() as *const u8, grid3s.ptr, 2048) }; // iq3s 512워드 진테이블 (VkAcc ensure_shared 대칭)
         ctx.unmap(&mut grid3s)?;
-        let mut dummy = ctx.alloc(16)?;
+        let dummy = ctx.alloc(16)?;
         let z16 = [0u8; 16];
         unsafe { std::ptr::copy_nonoverlapping(z16.as_ptr(), dummy.ptr, 16) };
 
@@ -812,9 +814,9 @@ impl DecoderState {
                     for b in 0..n_sub {
                         let s = wsp[o * n_sub + b];
                         let mn = wsm[o * n_sub + b];
-                        let mut isum_min = 0i64;
+                        let mut _isum_min = 0i64;
                         for e in 0..32 {
-                            isum_min += w8[o * ni + b * 32 + e] as i64;
+                            _isum_min += w8[o * ni + b * 32 + e] as i64;
                         }
                         // 값 범위: max|d·sc·q − dm·m| 근사 — 실제 최댓값은 원소별 계산
                         let hi = (s * 47.0).abs() + mn.abs();
@@ -1263,6 +1265,8 @@ impl DecoderState {
     }
 
     /// 타일(coopmat) 경로 — 프리필 전용. plans/32.
+    #[allow(unused_assignments)] // 진단 코드의 중간 변수
+    #[allow(unreachable_code)] // 마지막 타일 경로가 무조건 return (2026-09-14 경고 정리)
     fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
         if std::env::var_os("LLM170_VK_SHAPES").is_some() {
@@ -1379,7 +1383,7 @@ impl DecoderState {
                     20 => ("tile_nlmgy", TILE_NLMGY_SPV, 11),
                     _ => ("tile_xsmgy", TILE_XSMGY_SPV, 11),
                 };
-                let ms256_on = ty == 13 && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false);
+                let _ms256_on = ty == 13 && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false);
                 let use_gy = ((ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2)) && !bn128_on;
                 if use_gy {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용.
@@ -1526,6 +1530,7 @@ impl DecoderState {
             }
             return Ok(());
         }
+        // 진입 불가: 위에서 지원 타입 전부가 return 됨(2026-09-14 경고 정리).
         unreachable!("gemv_tile: 타입 미적용")
     }
 
@@ -1677,7 +1682,7 @@ impl DecoderState {
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
         let vk_t0 = std::time::Instant::now();
         if !noba { self.ctx.begin_batch()?; };
-        let tw_rec = std::time::Instant::now();
+        let _tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         let layer_cut = std::env::var("LLM170_VK_LAYERS").ok().and_then(|v| v.parse::<usize>().ok());
@@ -1962,7 +1967,7 @@ impl DecoderState {
     pub fn step_batch(&mut self, seq: usize, pos0: usize, emb: &[f32], all_logits: bool) -> Result<Vec<f32>, String> {
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
         let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
-        let vk_t0b = std::time::Instant::now();
+        let _vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
         let t = emb.len() / n;
         if t == 0 || emb.len() != t * n || t > T_MAX {
@@ -1994,7 +1999,7 @@ impl DecoderState {
             }
             if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
                 self.ctx.end_batch_wait().ok(); self.ctx.begin_batch().ok();
-                let x = vec![0f32; 64];
+                let _x = vec![0f32; 64];
                 let s0: f64 = unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }.iter().map(|&v| v as f64).sum();
                 eprintln!("#  SB post-rms xs0={s0:.4}");
             }
@@ -2224,7 +2229,7 @@ impl DecoderState {
             self.addrms(self.b_xs.buf, self.b_fdown.buf, &nkey, self.b_xn.buf, n, t)?;
         }
         // ── head (all_logits) — output_norm은 마지막 addrms에 융합. 트렁크와
-        /// 동일 배치로 단일 제출·대기 (G3). quant는 gemv_w 폴백 시 내부 수행.
+        // 동일 배치로 단일 제출·대기 (G3). quant는 gemv_w 폴백 시 내부 수행.
         if all_logits {
             self.gemv_w(self.b_xn.buf.clone(), self.b_xq_n.buf, "output.weight", self.b_lg_t.buf, t, n)?;
         }

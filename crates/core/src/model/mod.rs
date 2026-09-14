@@ -571,7 +571,7 @@ impl Engine {
                             self.mtp_step(sid, batch[s][t], &prev_h, (pos0 + t) as u32, wl)?;
                         prev_h.copy_from_slice(&h_t);
                         if wl {
-                            let am = crate::model::greedy(&lg);
+                            let _am = crate::model::greedy(&lg);
                             self.seqs[sid].mtp_draft_logits = lg;
                             self.seqs[sid].mtp_h_next = hn;
                         }

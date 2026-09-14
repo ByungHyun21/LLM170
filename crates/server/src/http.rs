@@ -14,6 +14,7 @@
 //!
 //! 토크나이저는 탐욕 최장일치 근사 — 자기일관(self-consistent) 검증용.
 //! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 
 use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
