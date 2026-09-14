@@ -238,6 +238,22 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### q8_0 MMQ groundwork landed dormant - wholesale refresh needed (2026-09-14, plans/71)
+
+The q8_0 route for the hc/dense projections (Flash-Next pp promise 278 -> 321
+t/s measured pre-gate) is wired but opt-in (LLM170_Q8MMQ=1, default off):
+extraction of llama mul_mat_q<q8_0> from a fresh cmake build, the qk=32 block
+contract fix, and launch verification are all in; the remaining fault is an ABI
+mismatch between the fresh type-8 kernel and the old MMQ quant kernels (the
+current source reworked block_q8_1_mmq into a per-x-type union and renamed the
+quant entry points). Completing it means re-extracting the whole MMQ family +
+quant from one build and updating the dispatch - documented step-by-step in
+plans/71. Also answered with measurements: the Flash-Next "A6B" label counts
+only its tiny MoE (512 experts x 4.9M = 2.5B total, 640-wide); the dense GDN
+backbone dominates at ~14-16GB of weights per decoded token, so tg is already
+at 85-90% of the DRAM roofline (15.6 t/s ceiling) and pp at 80-97% of the
+measured compute rooflines.
+
 ### plans/66 P5/P6 quick audits: structurally clear (2026-09-14)
 
 - **P5 (TOP_K tie handling)**: our expert top-k (qsa_select) uses
