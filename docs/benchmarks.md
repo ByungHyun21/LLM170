@@ -5469,10 +5469,13 @@ Follow-up instrumentation splits the attention lap and corrects part of the pict
 device path is in fact taken - no fallback message fires - and dev_weight caches device
 copies by host pointer, so neither mm_group nor attn is a re-upload. mm_group and attn
 are accelerator work already, run at prefill batch shapes through GEMV-class kernels
-rather than MMQ-class ones. What is genuinely host-side and removable is sel_build: 0.71 s
-of nested-loop index construction (sel_off prefix sums then a per-row block expansion into
-a fresh multi-megabyte Vec, zero-initialised, freed, and rebuilt on every call), i.e. 14%
-of the stage and 8% of the pp2048 chunk. Routing the prefill's QSA through the device kernels therefore removes
+rather than MMQ-class ones. sel_build is the one clearly host-side item at 0.71 s, but it is not the allocation
+churn: rewriting it to reuse a thread-local buffer and fill by push (no zero-initialised
+Vec) measured 0.70 s, i.e. neutral, and was reverted. The cost is the materialisation
+itself - a token selecting top_k blocks expands to top_k*r positions and the whole list is
+written out per call, tens of megabytes at memory-write speed. Removing it means having the
+attention kernel walk the block list directly instead of a flattened index array, which is
+a kernel-interface change rather than a host cleanup. Routing the prefill's QSA through the device kernels therefore removes
 ~4.45 s of the 8,831 ms chunk, i.e. about half of the Flash-Next prefill, without writing
 new math. The work is structural - the frame accelerator's interface has to expose the QSA
 op so the QSA layers can run device-resident - and it is the single largest remaining win
