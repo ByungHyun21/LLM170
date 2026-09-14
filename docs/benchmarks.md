@@ -207,6 +207,20 @@ for the current tree:
 block-key cache, the indexer q rows and the layer output, which localizes a
 divergence to a specific path (it is what pinned bug 2 to the qg normalization).
 
+### Device-resident QSA stage: prefill +10-19%, long-ctx decode 91->87 ms (2026-09-14)
+
+plans/67 step 2c landed: the QSA attention stage keeps its projections, norm,
+rope, attention and output projection on the GPU; only the indexer inputs and
+the cache-append copies (iq/ik/k/v, ~t*3.8k floats) cross to the host.
+Two latent defects surfaced while wiring it (both now documented in code):
+the frame_qk_norm_rope launch passed kqs=0.0 which would zero every k row, and
+the kernel reads norm weights as per-head tiles so the shared [hd] vector must
+be tiled before upload (same convention as the decode path's rawinject).
+Measured (`bench --ctx 8192 --gpu-runtime hip`): pp2048 233-252 -> 277.75 t/s;
+pp8000+tg32 91 -> 87.0 ms/step (the t=1 split-attention path must be routed
+through the device-side split kernel pair, otherwise decode regresses to
+122.7 ms). Gate: 208-token Korean prompt stream identical, 12/12 tests.
+
 ### 27B prefill: HIP is 8.4x behind the Vulkan backend (2026-09-14)
 
 `bench --pp 512 --ctx 4096`, same binary, same machine, alternating runs:
