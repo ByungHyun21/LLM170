@@ -5,6 +5,10 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
+> **파일별 실측 기록은 `docs/source/`로 분리했다** (코드 경로 1:1, 계측기 플래그 표와
+> 검증 게이트 포함). 이 문서는 요약 지표와 모델 간 비교를 담는다. 새 측정은 해당
+> 소스 파일의 `docs/source/...` 문서에 먼저 적고, 지표가 바뀌면 여기 요약표를 갱신한다.
+
 ## Vulkan tile-correctness round (2026-09-09, plans/38 A2)
 
 A new `vk-tile-check` harness (per-type tile kernel vs CPU dequant f64 dot)
@@ -21,6 +25,7 @@ previous session's "vk judge 19/19×7" runs used the harness default runtime
 (HIP) — the true vulkan gates start this round. Also this round: the ctx²
 f32 mask was removed (qsa_flash's causal loop bound already masks — 256MB at
 8k context), pp64 142 t/s / tg4 7.4 on the corrected tiles.
+
 
 ## Vulkan perf-parity round (2026-09-09, plans/39)
 
@@ -49,6 +54,7 @@ strong evidence of a WG-size-dependent codegen issue: byte-identical
 staging code is clean in the 512-thread family and corrupts odd rows k≥16
 at 256 threads (subgroup geometry verified 64x4, store semantics and dump
 machinery eliminated via constant injection).
+
 
 ## Vulkan execution-round gate (2026-09-08, plans/36 G1-G4/P1-P4)
 
@@ -96,6 +102,7 @@ binary, in-process stable, all types; engine path exact through VKD_BATCH
 spec gates) — recorded with the §8 flake; reproducer:
 `llm170 vk-gemv8-check <gguf> blk.4.attn_gate.weight 2`.
 
+
 ## Refactor no-regression gate (2026-09-08, plans/35)
 
 Behavior-invariant refactor (dead-kernel pruning, gemv generation collapse,
@@ -104,11 +111,13 @@ t/s, pp512 (VK_TILE+VKD_BATCH opt-in) 65.95 t/s. A side A/B settled the
 q6_K route: gemv3+quant 7.06 vs opt-in gemv6 6.71 t/s — the promoted
 default stays; gemv4/5/6/7 families deleted (ADR-0019).
 
+
 ## Engine modes (2026-09-05, user decision)
 
 Default = WMMA fast mode (quality: llama.cpp MMA class — measured logits
 deviation vs bit-exact path: max 8.7e-3 relative, argmax stable).
 `LLM170_EXACT=1` = bit-exact dot4 path (GPU == CPU reference, bit-for-bit).
+
 
 ## Baseline methodology note (2026-09-05)
 
@@ -126,6 +135,7 @@ fast 139.4 (0.47x); tg24 10.40 (0.93x). Against the designated server-bench
 target: pp64 fast 0.98x, tg parity. The session's internal gains
 (pp 43.1 -> 81.8/139.4) are unaffected by this distinction.
 
+
 ## Vision (mmproj) — HIP (2026-09-05)
 
 Photographic test (llama.cpp's own test-1.jpeg, NYT front page):
@@ -136,6 +146,7 @@ correctly; llama.cpp reference describes the same image (newspaper, NYT masthead
 CLIP ViT 27 blocks on GPU (f32 weights resident, tiled GEMM + flash attention v2):
 vision encoding 47s (CPU) → **2.4-3.1s forward** (+7.1s one-time weight upload per process).
 Output verified identical to CPU path and semantically matching llama.cpp on test images.
+
 
 ## MTP speculative decode — HIP (2026-09-05)
 
@@ -154,6 +165,7 @@ Ours: GPU MTP layer + batch verify + carry-over GDN (spec k=4):
 
 Token stream verified bit-identical to non-spec greedy (64/64).
 Acceptance 4-5 tokens/verify at k=4 on natural text.
+
 
 ## qwen4exp decode: where the time actually goes (measured 2026-09-14)
 
@@ -181,6 +193,7 @@ elementwise group), retune the t=1 GEMM/GEMV block shapes (gemm_q8_0 runs 546
 launches/step with prefill-sized grids), then the MoE top10 (17.0 ms/step for 48
 calls) and the QSA bridge (10.3 ms/step for 12 calls).
 
+
 ## qwen4exp decode traffic: 11x redundancy (measured 2026-09-14)
 
 Micro-benchmarks (rawhip::micro_tests::launch_cost_split, cargo test -p
@@ -204,25 +217,6 @@ over a short decode (bench --pp 24 --tg 4), and compare the per-kernel fetched b
 against the tensor sizes the kernel should touch. Keep the profile to a single step;
 whole-run counter collection is not safe on this machine.
 
-## qwen4exp decode: the MoE grouping round trip and the device-side attempt (2026-09-14)
-
-The per-layer MoE grouping is the decode's largest single cost. Skipping the
-moe.top10 stage (which also keeps the grouping cache valid) runs tg8 in 497.5 ms
-versus 770.4 ms normally, i.e. the round trip - a synchronous d2h of the routing
-ids, the host table build and three h2d uploads, 48 times per step - costs
-34 ms/step. Removing it alone would put the decode at 62 ms/step, level with
-llama.cpp's 61 on this model.
-
-A device-side grouping kernel (q4_moe_group_t1) builds the same tables on the GPU
-and is bit-identical (the diverse prompt output is unchanged), and it also has a
-block-parallel form, but the path measures 1009-1011 ms against the host path's
-770, so it is opt-in behind LLM170_MOE_GROUP_DEV. Its additions were isolated in
-the micro test (group kernel 30.95 us/call, d2h_issue+d2h_wait 15.98 us/call, about
-3.8 ms/step together) and a forced-bound experiment put the enlarged buffers at only
-2.4 ms/step, so every added operation is excluded and the remaining candidate is the
-changed stream ordering: the host path drains the stream at its ids d2h where the
-device path does not. Decisive next experiment: drop d2h_issue from the device path
-and re-run the A/B to separate ordering from added work.
 
 ## Measurement protocol: use --reps 3 and quote the warm reps (2026-09-14)
 
@@ -233,6 +227,7 @@ reps 3 and the warm reps are the protocol from here on. Under it the qwen4exp de
 is 723.4 ms per 8 steps = 90.4 ms/step, and the row-batch Q4K kernel variant
 (LLM170_Q4K_Y=1 YRPT=4), which was the third attempt at recovering memory-level
 parallelism, is neutral at 719.9 ms.
+
 
 ## Why the weight reads are pattern-limited, and what fixes them (2026-09-14)
 
@@ -260,23 +255,6 @@ which the tooling here cannot yet provide.
 
 
 
-## Confirmed with the reps-3 protocol: the grouping round trip is 35% of the decode (2026-09-14)
-
-Warm reps (--reps 3, reps 1-2):
-| run | warm ms (tg8) | per step |
-|---|---|---|
-| baseline | 735.4 / 728.6 = 732.0 | 91.5 ms |
-| moe.top10 skipped (keeps the grouping cache valid) | 473.1 / 485.5 = 479.3 | **59.9 ms** |
-| device-side grouping (LLM170_MOE_GROUP_DEV=1) | 921.1 / 943.2 = 932.2 | 116.5 ms |
-
-So the per-layer grouping round trip - a synchronous d2h of the routing ids, the host
-table build and three h2d uploads, 48 times per step - is 31.6 ms/step, 35% of the
-decode, and removing it alone reaches 59.9 ms/step, below llama.cpp's 61 on this model.
-The device-side grouping is bit-identical but 27 ms/step slower, reproducibly and
-warm, and every component it adds has been measured cheap in isolation (group kernel
-31 us, async d2h 16 us, bound-sized buffers 2.4 ms/step) while the ordering and drain
-variants make no difference. That unexplained 27 ms is what gates reaching llama
-parity, and it needs device-side timestamps or a counter-based method to resolve.
 
 ## Correction: the weight reads are not bandwidth-limited, they are latency-limited (2026-09-14)
 
@@ -302,25 +280,6 @@ the plan of record becomes: increase per-block work or waves so the latency hide
 The earlier unroll and row-per-thread experiments were neutral, so the remaining
 levers are the tile/wave configuration and explicit prefetch depth.
 
-## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
-
-The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
-single dense WMMA launch: an MMA fragment shares the A operand across the token
-axis, but the grouped layout makes A (the expert weights) a function of the token
-(the expert varies per token). Folding the expert into the grid z axis reads out
-of range; the only valid decomposition is one launch per expert.
-
-Per-expert dense `gemm_q4k_j128` launches were implemented and measured: numerics
-valid (diverse-prompt output identical; an 11,750-token random prompt diverges at
-one newline token, 271 vs 198 - a rounding tie-break, the expected signature of an
-alternative accumulation order). Speed: 110.3 s vs 112.1 s total = -1.6%, within
-the ~10 s run-to-run load variance. No gain.
-
-Reason: at t=2048 there are 16,384 grouped rows over ~512 active experts, i.e.
-~32 rows per expert, so a 128-token WMMA tile is 75% wasted, plus ~512 launches
-per chunk. The scalar grouped kernel (4.4 TFLOPS) is effectively optimal for this
-shape. The -11% seen with the (incorrect) dense-tiling kernel is therefore not
-reachable in the grouped layout.
 
 ## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
@@ -344,118 +303,6 @@ Both PP and TG against this table are the first performance goal.
 - 2026-09-05: GDN state layout transposed u-major (coalesced AR lane-j access, 16x amplification removed) + decode AR routed to gdn_ar_w — tg8 10.44→12.27 combined-mode — EXCEEDS llama 11.42 by 7.4% (q8_0 dual GEMV + AR transpose + conv parallelization + rmsq widening); pp512 342.6 unchanged.
 - 2026-09-06 CORRECTNESS AUDIT (user-requested long-context check): 4 semantic regressions found & fixed — gemm_q3k qsum double-read, rmsq dropped scale writes, dual-GEMV dispatch chain skip, q6_K MMQ on custom-layout weights (default OFF, LLM170_Q6MMQ=1). llama-based verify.py 10/11 PASS; 11th (long_np2_seq1) = llama-server reference instability (its own output varies 16/159301/248068 across slots at a flat distribution point). Honest perf after q6-MMQ exclusion: pp512 ~322, tg8 ~10.9.
 
-## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
-
-Current standing (raw-HIP backend — pure Rust executor, cubecl removed,
-single-tenant `llm170 bench`, 2026-09-03). All paths bit-exact against the
-CPU W4A8 reference engine (greedy streams identical, incl. 64-token batch
-cross-verification against per-token):
-
-| Metric | llama.cpp target | LLM170 | Ratio |
-|---|---|---|---|
-| Decode tg24, t=1 | 10.4 t/s | **10.4-10.5 t/s** (GPU argmax, logits resident) | 1.00-1.01x |
-| Prefill pp64 (chunk 64) | 142.8 t/s | **169 t/s** (88.4 exact mode) | **1.18x** (0.62x) |
-| Prefill pp128 (… + full drain swap) | — | **254.6 t/s** (fresh-ref verified) | 0.87x vs llama-bench 294 |
-| Prefill pp512 / pp2048 (… + split4q4) | 229.9 t/s (3314 tok) | **228.5 / 184.9 t/s** | ~1.0x / 0.62x |
-| Prefill pp512 | ~230 t/s (server-bench) | **~68 t/s** | ~0.30x |
-
-Numerical-quality chain (2026-09-03): f32 full-precision path, W4A8
-quantized path, and raw-HIP GPU path produce **identical 16-token greedy
-streams** — zero quantization-induced divergence on this benchmark.
-
-Key techniques (kernels are HIP C++ strings JIT-compiled via hipRTC,
-arithmetic mirrors `dot_row_w4a8_*_lane` in `crates/core/src/quant.rs`):
-
-- GDN kernels: causal conv fully parallel over (channel, token) — state
-  updated by a separate tail kernel; AR recurrence keeps its state slice
-  resident in shared memory across the sequential scan, with the state
-  update and output passes fused (bit-identical element order).
-- Optional WMMA fast mode (LLM170_WMMA=1): all four quant types (q5_K, q4_K, q6_K, iq4_xs) use
-  fp16 tensor-core MMA with scales folded into the f16 operands.
-  Per-tensor deviation ~4e-4 relative (same numeric class as llama.cpp's
-  MMA path); diverges from the bit-exact stream, so it is opt-in — the
-  default engine remains bit-exact. WMMA engages only for chunks of 32+ tokens.
-- MMQ tile kernels (llama.cpp mul_mat_q structure): 64-row x 16-token
-  blocks with cooperatively staged unpacked weights and activations in
-  shared memory, thread fragments owning sb%4 sub-blocks — bit-exact via
-  paired CPU mirrors. Ownership layout follows llama.cpp's MMQ vec_dot:
-  each thread exclusively owns one row x 8 tokens, accumulates in f32
-  registers across all k-chunks (no shared partial-sum round-trip), and
-  hoists its weight words/scales to registers per sub-block, reusing
-  them across every owned token. Covers up to 64 tokens per launch.
-- GPU-resident logits with deterministic on-device argmax
-  (lowest-index tie-break, identical semantics to the CPU greedy): 8-byte
-  readback per token instead of a full vocabulary transfer.
-- f32 lane accumulation: consumer-RDNA f64 runs at 1/16 rate and was
-  ~80% of GEMV issue bandwidth; all lane partials accumulate in f32
-  (mirrors redefined in lockstep — the bit contract is kernel==mirror),
-  combined through an f64 tree reduction.
-- `__ockl_sdot4` integer dot (i8x4 lanes) for all K-quant GEMV
-  (llama.cpp MMVQ analog). Lane-wise u32 subtraction is forbidden
-  (borrow crosses lanes) — decompose into separate dot chains instead.
-- In-kernel tree reduction (shared half-exchange + 32-wide shuffle tree,
-  HIP shuffles cannot cross lane 32) eliminates the partials roundtrip;
-  CPU mirror sums lanes in the identical tree order.
-- Bit-exact transcendentals: `exp_cr`/`ln_cr` f64-fma polynomials shared
-  verbatim between Rust and HIP (glibc `expf` is 0.5-ulp — device `expf`
-  differs on ~6% of inputs); `-ffp-contract=off` blocks FMA contraction.
-- Batch prefill: gy-dimension kernels for quant/rms/elementwise,
-  sequential-state kernels with internal t-loops for conv/AR, tiled GEMM
-  (one block per output row, TT=16 token registers, weights read once)
-  for the four dominant quant types.
-
-Session progression (same binary lineage, gfx1151):
-
-- First cut: pp64 **2.12 t/s**, tg24 **1.32 t/s**.
-- GDN chunk `kkt` precompute kernel (2-stage solve): GDN-chunk-on-GPU
-  measures identical to GDN-chunk-on-CPU at pp64 — chunked GDN is **not**
-  the prefill bottleneck.
-- `gpu-mm` microbench on `ffn_gate` (t=64): ~4.8 GFLOPS vs ~1400 GFLOPS
-  llama estimate; GFLOPS is flat ~4 across t in {1,16,64,256} — the k-lane
-  kernel re-reads weights per token with zero batch amortization.
-  **Prefill priority moved to quantized-GEMM batch throughput.**
-- `gemm_q7` (16-token blocks, unrolled register accumulators):
-  pp64 2.25 -> **6.49 t/s (2.9x)**.
-- `de4` (block-invariant hoisting: one dequant of d/dmin/scales per
-  4-element batch instead of per element): pp64 -> **13.04 t/s (5.8x
-  cumulative)**, tg24 1.33 -> **2.63 t/s (2.0x)**.
-- Per-type GEMV bandwidth (dedicated harness, t=1, 2026-09-02): q3_K
-  **18 GB/s**, iq4_xs **67**, q5_K **97**, q8_0 **94 — vs ~161 GB/s
-  effective for llama.cpp on the same APU. The earlier "141 GB/s,
-  llama-level" rocprof-derived figure was measurement error (queue-wait
-  inclusion); the per-type kernel bandwidth above reconciles exactly with
-  the 281 ms/token wall (GEMV ~207 ms by type mix + bridges + glue).
-  **Decode priority: GEMV kernel bandwidth per quant type** — q3_K
-  (`ffn_up`, 35% of wall) first. Concurrent-stream GEMV was measured and
-  rejected: aggregate saturates at the single-stream rate (1.00-1.13x).
-- `q3_K de4` (block-invariant scale hoisting for q3_K, previously only
-  K-quants/iq4_xs — element cost ~16 loads -> ~4.25, value-identical):
-  `ffn_up` 18 -> **50 GB/s** isolated; decode tg24 **3.56 -> 3.86 t/s**
-  (2026-09-02, minimal-prefill measurement; a preceding 22-min pp512 run
-  measurably throttles the APU and masks gains — measure tg with --pp 8).
-- W4A8 full rollout (2026-09-02, `LLM170_W4A8=1`): all 7 quant types on the
-  integer path (iq4_xs/q3_K/q4_K/q5_K/q6_K/q8_0/iq4_nl), the attention
-  CPU bridge removed via an f64-intermediate rms+rope kernel (FMA-contraction
-  immune — the technique that unlocked what P1 deemed impossible), and
-  prefill GEMMs on weight-amortized batch kernels. Decode **tg24 3.86 ->
-  6.96 t/s**; every step verified GPU==CPU greedy-stream identical.
-  Prefill W4A8 = 10.26 t/s vs the f32 path's 13.8 — the f32 path is
-  faster but CPU/GPU numerically inconsistent (near-tie divergence), so
-  W4A8 is kept for correctness; structural prefill work (host round-trips,
-  GDN chunk) is the remaining path to 143.
-- W4A8 integer-MAC prototype (`gemm_q8i`, 2026-09-02): activations
-  quantized to q8 (per-32-block scales), integer accumulation, per-block
-  float contributions accumulated in **f64 lane partials** — grouping-
-  independent bit-exactness vs a CPU mirror of the same op sequence.
-  iq4_xs `ffn_gate`: **146 GB/s, bit-exact on all rows** (2.18x the f32
-  path's 67, 91% of llama.cpp's effective rate). Known open issue: the
-  `ffn_down` shape (n_in=17408) regresses to 40-61 GB/s — under
-  investigation. Engine wiring (on-GPU q8 quantize kernel, q3_K variant,
-  frame integration) is the follow-up.
-
-Measurement caution: a co-resident run (llama-server holding VRAM) measured
-tg 0.58 t/s — invalid per the non-coexistence rule (see Verification below),
-quoted only as a warning.
 
 ## qwen4exp — Qwen3.8-Flash-Next 125B-A6B, UD-Q4 4-split
 
@@ -1097,6 +944,7 @@ attention-quadratic effect.
   the per-layer round trips that the frame has not yet removed (QSA/PLE value
   bridges, module-level launches).
 
+
 ## Known flake: vk spec==nonspec nondeterminism (2026-09-08)
 
 `--gpu-runtime vulkan --spec 4` np4 runs intermittently flip one near-tie
@@ -1109,6 +957,7 @@ back to quant+gemv3) did not diverge in 2/2 runs — the trigger is the
 gemv8 batched-verify configuration (t=2..5 rows), not the decode path.
 Follow-up tracked in plans/38 A2 (deterministic harness reproducer). The vk judge gate therefore reports
 18/19..19/19 depending on the roll; HIP is unaffected (19/19 stable).
+
 
 ## Verification status
 
@@ -1166,6 +1015,7 @@ stat line divides by verify rows, not cycles).
   exact 24/24 each; long+np2 pending device-memory headroom.
 - Synthetic tiny4 (`scripts/make_tiny4.py`) — model-volume-independent e2e:
   CPU == GPU 26/26, np2 26/26 x2, long 2000+ 25/25, long+np2 25/25 x2.
+
 
 ## Vulkan — FUNCTIONAL (2026-09-07, plans/29)
 
@@ -1307,6 +1157,7 @@ stores happening) — kept as a check-harness prototype only
 pp 0.20× (default 0.10×). Next: full MMQ family + non-GEMM prefill
 kernels, or an f16-tolerant quality contract.
 
+
 ## Vulkan — FIXED (2026-09-05)
 
 Root cause of the full-model failures was never a driver leak: the sysfs GTT counters are
@@ -1343,6 +1194,7 @@ the dominant costs remain host-side GDN/attention and per-op upload/readback, so
 path to Vulkan throughput is unchanged — GPU residency of the GDN family
 (plans/19 phase 2). HIP remains the performance path at 28 t/s np4×spec4.
 
+
 ## Vulkan status (2026-09-05) — superseded
 
 rawvk smoke suite passes (coopmat probe, axpy bit-exact, 25.5 GB/s) — the Vulkan compute
@@ -1355,6 +1207,7 @@ with 18.6 GB stranded (counter over total, zero holder processes; lost-device
 buffer releases never ran). Full-model Vulkan ran fine earlier in this same
 boot (tg 10.4, pp 128), so the leak is the sole blocker. A reboot clears the
 stranded GTT; re-verification and the Vulkan MTP port follow.
+
 
 ## Prefill hook cost + corrected standing (2026-09-04 evening)
 
@@ -1372,6 +1225,7 @@ retracted (measured on a stale binary); the verified default is per-token
 execution, 41/41 stream-exact. Vulkan GEMM remains compute-bound at
 ~22-60 GB/s by weight type (software integer dot) — the i8-cooperative-matrix
 kernel arc is specced in the plans.
+
 
 ## Fresh cross-backend measurement (2026-09-04 evening, llama.cpp @ 8b4b3558f = same-day upstream master)
 
@@ -1448,60 +1302,6 @@ flash-attention kernel is the default path (was opt-in via
 LLM170_QSA_FLASH; kill switch LLM170_NO_FLASH). Stream 41/41 bit-exact
 across both changes; tg8 picked up ~2% (9.55 → 9.72) as a side effect.
 
-## 2026-09-05 session 3 — flash attention rewrite (+9% pp512)
-- Replaced the split flash-attention kernel with a warp-per-query design
-  (no __syncthreads or shared-memory round trips inside the key loop,
-  32 queries per block, generic head-dim via per-lane dim slicing).
-  Kernel verified bit-exact against the previous kernel on synthetic
-  inputs (maxabs = 0) and within 1.2e-6 on real activations.
-- Small GEMV latency fix: quantized tile path restricted to n_out >= 128
-  (48-output projections were running on a single CU).
-- Negative results recorded: 4-column AR blocking (-3%), side-stream
-  GEMV overlap (-2%), q8 flash multiplexing (neutral).
-- pp512 250 -> 272-274 t/s (llama.cpp ROCm same model: 347-366,
-  ratio 0.75x). tg8 unchanged 10.3-10.4 (0.95x).
-- Session 3 addendum: cross-checked both engines under rocprof in the same
-  measurement window. GEMM tile totals are at parity (~600ms vs 663ms for the
-  same p128 workload); the AR recurrent kernel is at parity in isolated
-  harnesses (577us ours vs 560us for a faithful re-implementation of the
-  llama kernel body). The remaining prefill gap concentrates in launch gaps,
-  the first-chunk flash path (kept on the legacy kernel for bit-stability),
-  and small fused kernels. Final: pp512 265-272 t/s (0.75x), tg8 10.3-10.4
-  (0.95x).
-- Session 3 final win: recovered the true (double-buffer) sources of the three
-  embedded code objects — an earlier -5.5% verdict against a kernel patch was
-  actually source drift (the /tmp sources had been left in a slower
-  single-buffer experimental state). Re-applied the token-quadrant z-grid to
-  the true sources (neutral at gz=1, interleaved A/B), made 512-token prefill
-  chunks the default: pp512 272 -> 277.5 (+2%), bit-identical output streams
-  verified with both 19- and 600-token gates. Canonical sources preserved in
-  plans/i8_arc/co_src.
-- Addendum: llama.cpp mul_mat_q kernels (q4_K, q5_K) integrated via offline
-  code objects with an f32->block_q8_1_mmq prequant path (+2.1% prefill,
-  interleaved A/B). Token-quadrant z-grid prefill chunks of 512 made default
-  after recovering canonical kernel sources (an earlier regression verdict was
-  a source-drift artifact). Attention rewritten warp-per-query. Cumulative
-  session: pp512 250 -> ~287 (llama.cpp ratio 0.69x -> 0.81x), tg8 0.95x
-  (DRAM-bound).
-- Final session addendum: the empty-stub root cause (-DRDNA3 vs -DRDNA3_5
-  config table selection for gfx1151) unlocked iq4_xs MMQ as well — total
-  MMQ coverage q4_K/q5_K/iq4_xs. Session close: pp512 250 -> 294-296
-  (+18%, llama.cpp ratio 0.83x), tg8 10.4 (0.95x, DRAM-bound). q6_K remains
-  the one excluded type (J-independent corruption; Q6_K-specific SRAM layout
-  suspected).
-- q6_K closure: llama.cpp's own dispatcher caps MMQ for q6_K at batch<=256
-  on RDNA3.5 (prefill uses dequant + hipBLAS MFMA instead), so our exclusion
-  of MMQ-q6 costs nothing relative to their path. The actual q6 lever is a
-  dequant->fp16 MFMA GEMM path (~3-4% potential).
-- Closing win: MMQ extended to the side-stream GEMMs (gate/up/gz) with a
-  dedicated y buffer per stream (the shared buffer was a cross-stream race).
-  Interleaved A/B: 300-303 vs 274-281 on/off. Session final: pp512
-  250 -> ~301 (+20%, llama.cpp ratio 0.85x), tg8 0.95x.
-- Opt-in profile (LLM170_F32SILU): __expf replaces the f64-accurate exp
-  in 4 elementwise kernels (silu_mul, norm_gated_silu, gdn_conv_t2,
-  gdn_beta_g) — pp512 318-320 (+5% over default) at 1e-7-level numeric
-  drift (flips argmax on one sensitive prompt). Default keeps the exact
-  CPU-mirror bit contract.
 
 ## Vulkan functional audit — np/mtp/mmproj matrix (2026-09-07)
 
@@ -1920,6 +1720,7 @@ gemv8 is now a complete-quality path: exact kernels, faster engine
 (LLM170_G8=1) pending the long-form gate and np4 tie checks on the
 unified family.
 
+
 ## Vulkan ms-geometry tile family + q3_K decode fixes (2026-09-10, plans/40)
 
 Reference re-measured on this machine (llama-bench d222767c, Vulkan):
@@ -1967,6 +1768,7 @@ same geometry — vectorized staging loads); pp512 N-amortization (weight
 re-read per 64-token slab; BN>=256 attempts regressed so far); decode
 timeline (132 ms wall vs llama 89 ms; gemv8 163 vs ~196 GB/s effective).
 
+
 ## Vulkan decode-kernel llama ports (2026-09-10, plans/40 cont.)
 
 Decode GEMVs ported from llama mul_mat_vec_{q5_k,q4_k,q6_k} to the
@@ -1999,6 +1801,7 @@ Open: tile staging vectorization (64 -> 79 GB/s ceiling); pp512
 N-amortization (gate+up merged dispatch); gemv8_q3 remains on the old
 kernel (3 tensors).
 
+
 ## Non-GEMM prefill-kernel fixes (2026-09-10, plans/40 cont.)
 
 Three prefill glue kernels were sequential or thread-starved:
@@ -2020,26 +1823,6 @@ Benchmarks (defaults, no env): pp64 192.1-195.7 (was 179), pp512
 0.50x, tg8 ~0.81x. verify: 22 PASS / 3 FAIL — identical set before
 and after all three numeric-order changes.
 
-## gdn_ar4 — ILP across state columns (2026-09-10, plans/40 cont.)
-
-The GDN autoregressive update ran one state column per work group: per
-token step the two subgroupAdd reductions serialize, and nothing else
-in the work group hides their latency. gdn_ar4 keeps four columns per
-work group — four INDEPENDENT recurrence chains interleave, halving
-exposed reduce latency, with 4x fewer work groups and k/q loads
-amortized 4x. Identical per-column scalar arithmetic (bit-equal).
-Prefill gdn_ar 0.383 -> 0.189 ms per layer (-51%); 48 layers save
-~9.3 ms per chunk. LLM170_VK_AR4=0 opts out.
-
-Benchmarks (defaults): pp64 195.8-196.7, pp512 182.7, tg8 9.6.
-vs llama Vulkan: pp64 0.80x, pp512 0.51x, tg8 0.79x.
-verify: 23 PASS / 2 FAIL — best recorded (spec_np4_seq1 now passes;
-remaining: spec_np4_seq2@21, spec_long_np4_seq3@10, both borderline
-spec-equality class).
-
-gdn_ar8 (same recipe, 8 columns): 0.176 ms/layer — the ILP gain
-saturates (subgroup shuffle throughput is now the bound). pp64
-192-199 t/s. Bit-identical outputs; LLM170_VK_AR4=8|4|0 selects.
 
 ## Tile-kernel exploration closeout (2026-09-10, plans/40 final)
 
@@ -2066,6 +1849,7 @@ arc, alongside the WY chunked gdn_ar formulation.
 
 Defaults stand: pp64 195-199 (0.80x), pp512 174-185 (0.51x), tg8
 9.8-10.2 (0.82x), verify 23 PASS / 2 FAIL.
+
 
 ## tile_ms4gy — L2 weight reuse via grid-y (2026-09-10, plans/40)
 
@@ -2096,6 +1880,7 @@ token-identical but perf-neutral (pp512 183.5, pp64 198.4 vs 183.7/196.9):
 per-tensor slab pairs are already adjacent dispatches, so L2 catches the
 re-read for non-q5 types. Kept opt-in (zero-risk default).
 
+
 ## Single-pass prefill (plans/41, 2026-09-10)
 
 Root cause of the prefill weight re-read: `prefill_rows` capped prefill chunks
@@ -2113,6 +1898,7 @@ Measurement note: the per-dispatch timestamp sum is NOT a valid busy-time
 metric when the engine overlaps independent dispatches — at t=512 it reports
 6x the wall clock. Use wall-clock A/B for anything scheduling-related.
 
+
 ## Prefill chunk correctness fix (plans/41)
 
 The ms-family tile loop rebound the same xq/out buffers for every 64-token
@@ -2127,6 +1913,7 @@ Corrected prefill (pp512, same machine): 113 t/s at 64-token chunks,
 dominated by slab re-reads, and pass count is the cost driver. All earlier
 sub-64-chunk-out-of-spec measurements are superseded by these.
 
+
 ## Prefill traffic levers — closed (plans/41)
 
 After the tok_base fix, every slab-merging lever was measured on the
@@ -2137,6 +1924,7 @@ The harness "gy=2 merge" figure did not transfer: it replays one tensor in
 a tight loop, so it measures L2 residency across reps, not intra-dispatch
 sharing. Prefill remains slab-traffic-bound at roughly 8 weight reads per
 512-token pass; kernels themselves run at their solo streaming rate.
+
 
 ## Decode cost structure (plans/42)
 
@@ -2156,6 +1944,7 @@ lever.
 
 Current standing (Qwen3.8-27B Q4_K_XL, RADV/Vulkan, Strix Halo):
 pp64 197.1 t/s (0.81x llama), pp512 205-213 (0.58-0.60x), tg8 9.75 (0.80x).
+
 
 ## Speculative decode (MTP) — inert on the Vulkan raw path
 
@@ -2179,6 +1968,7 @@ decode (each candidate token costs a full target decode), so the viable
 design is the batched verify path; until that is rebuilt, MTP is not a
 throughput lever.
 
+
 ## Prefill plateau confirmation (plans/41 close-out)
 
 Interleaved A/B on the corrected engine: the q5 grid-y dispatch (default)
@@ -2191,6 +1981,7 @@ where every weight byte is re-read once per 64-token slab; halving that
 needs a >64-wide accumulator tile whose per-byte rate holds, which ms128
 (BN=128) did not deliver (neutral wall, lower kernel rate).
 
+
 ## ms256 tile — BN=128 with four subgroups (opt-in, plans/43)
 
 tile_ms256 keeps ms4's per-subgroup accumulator layout (acc[4][2]) but runs
@@ -2201,6 +1992,7 @@ wastes half the accumulator — hence gated to t >= 128 and kept opt-in
 (LLM170_TILE_MS256=1). Kernel-solo rate drops to 36.7 GB/s (from ms4's 61)
 because of the larger drain and LDS footprint, which eats most of the
 halved weight traffic; the width gain is real but small on this hardware.
+
 
 ## Decode chain links are fully exposed (plans/43)
 
@@ -2221,6 +2013,7 @@ its full kernel duration plus a small launch/barrier tail. Fusion math:
 Conclusion: decode remains a latency-chain problem at 64 layers x ~13
 dependent launches; the remaining ~20% gap to llama is launch/dependency
 overhead, not kernel throughput.
+
 
 ## Speculative decode — architectural verdict (plans/43)
 
@@ -2243,6 +2036,7 @@ batched verify forward (different numeric class than the per-token
 contract) or accepting that class change; both are engine-scale changes
 rather than a tuning fix. Feature stays opt-in and inert until then.
 
+
 ## Prefill wall-clock accounting (plans/43 close)
 
 Instrumenting the record/drain split inside a 512-token pass settles where
@@ -2256,6 +2050,7 @@ streaming rate (61-66 GB/s). There is no measurable CPU or idle slack left
 to reclaim; only a wider accumulator tile (fewer weight reads) can move it,
 and BN=128/256 tiles lose the same margin in occupancy (ms256 +1.6%,
 ms512 collapse).
+
 
 ## BN=128 tiles for all quant types (plans/43) — pp512 +25%
 
@@ -2279,6 +2074,7 @@ gy kernel in the arm chain while the dispatcher's use_gy was false, so the
 gy kernel ran with the tb-loop grid and produced garbage - it had masked
 the ms128 path in every earlier A/B.
 
+
 ## Tile width ceiling (plans/43)
 
 BN=256 (four subgroups, tbase = sg*64, same 16 accumulators per subgroup)
@@ -2292,6 +2088,7 @@ Chunk scaling of the current build (same weights, one pass per prompt):
 pp128 288, pp256 318, pp384 297, pp512 302 t/s - the pass overhead is
 already amortised at 256 tokens, and per-token cost is set by the slab
 count (t/128 reads of every weight tensor), not by the pass length.
+
 
 ## Prefill tile kernels are instruction-bound, not memory-bound (plans/44)
 
@@ -2314,6 +2111,7 @@ weights (2x bytes but no decode ALU) - which needs chunked >max_ssbo
 streams diverge) and the current f16 tile path is stale (512-thread variant,
 wrong tokens, 123 t/s).
 
+
 ## f32-activation tile (b32) — kernel correct, engine dispatch no-ops (plans/44)
 
 tile_ms128b32 (same tile with the q8 activation unpack replaced by a direct
@@ -2332,6 +2130,7 @@ harness (nkb 10, pb 24, 128-token slabs, tok_base). Root cause not found;
 the experiment is reverted. Worth noting as a robustness gap: a dispatch
 that silently does nothing is indistinguishable from a fast kernel in the
 timing numbers.
+
 
 ## Tile rate is MAC-throughput bound (plans/44 close)
 
@@ -2356,6 +2155,7 @@ tile variant tried (BN 64/128/256, four subgroup layouts, BK 16/32, stride
 * BK=64 (half the K-loop barriers, 256 threads with split staging) is also
   neutral on the DRAM case (23.6 vs 23.8 GB/s) and 27% worse when the
   tensor is L2-resident, closing the barrier-count axis as well.
+
 
 ## Tile kernel is load-issue bound (plans/45, definitive)
 
@@ -2386,6 +2186,7 @@ LDS redistribution of the decode), not more parallelism, and it explains
 why the b32 experiment (decode ALU traded for 4x more small loads) was
 neutral as well.
 
+
 ## Next lever: sub-block record repack (design note, not implemented)
 
 Every memory-side probe on the DRAM case came back neutral (load count,
@@ -2412,6 +2213,7 @@ the 67MB tensor's rate - the decisive number is whether it lifts off the
 23.6 GB/s plateau. The exact qh lane mapping in the current decode
 (qhi/4 with the iqs>>4 byte select) must be transcribed carefully.
 
+
 ## Sub-block repack — implemented and rejected (plans/45 close)
 
 The repack design was carried through: a 48-byte per-sub-block record
@@ -2435,17 +2237,6 @@ L2-resident), so this harness ceiling is not the engine's limiter; the
 remaining prefill gap stands at the ~17% tile-rate difference versus
 llama.cpp.
 
-## Tiny-tensor routing — neutral (plans/45)
-
-The pp64 profile shows the small q8 tensors (ssm_alpha/beta at 48 rows,
-attn_k/v at 1024) costing ~108 ms of a ~306 ms pass - the tile kernel
-launches a single workgroup for a 48-row tensor and pays the full
-K-iteration latency for 0.26MB of weights. Routing everything with
-n_out <= 128 through the row-parallel gemv8 kernel is token-identical but
-measures neutral on all three metrics (pp64 210-214, pp512 300-301,
-tg8 9.94): the gemv8 path pays for the same latency through t-fold weight
-re-reads. Both paths are latency-bound for these shapes; a real fix needs
-all ninety-six tiny tensors in one dispatch (multi-tensor batching).
 
 ## Prefill non-tile budget (plans/45 close)
 
@@ -2460,6 +2251,7 @@ structural variants failed to move.
 Session standing: pp512 183 -> ~303 t/s, pp64 ~195 -> ~211, tg8 ~9.8 ->
 ~9.9, verify 25/0 maintained, and every adopted change as well as every
 rejected hypothesis is recorded here with its measurements.
+
 
 ## Remaining levers quantified (plans/45 final)
 
@@ -2480,6 +2272,7 @@ Session final standing: pp512 183 -> ~303 t/s (0.85x llama), pp64 ~195 ->
 commits pushed, and every adopted change and rejected hypothesis recorded
 here with its measurements.
 
+
 ## ms256c re-test with correct grid — solo faster, engine slower (plans/46)
 
 The earlier ms256 measurement used a grid that covered only half the rows;
@@ -2492,6 +2285,7 @@ engine because they co-schedule worse with the other kernels in the chain.
 Solo-rate improvements have now failed to transfer in every tile variant
 tried; the engine's tile configuration (2 subgroups, BM=64, BN=128, 18-vec2
 LDS stride) stays.
+
 
 ## Speculative decoding on Vulkan — cost breakdown (session 2026-09-11)
 
@@ -2532,6 +2326,7 @@ the workgroup, LDS-resident weights).
   path (verified: 84 220 201 198 201 198 201 for both).
 - `LLM170_VKD_BATCH=1` (batched verify) is token-identical to the per-token verify (same
   gemv8 kernels, t < 16).
+
 
 ## Inter-dispatch GPU gaps are the dominant cost (session 2026-09-11, revised)
 
@@ -2579,6 +2374,7 @@ Next lever (not attempted): narrow the per-dispatch barrier. Options, in order o
    tile path) or fuse same-input GEMVs (qkv/gate/up) into one dispatch with an internal
    row-range switch.
 
+
 ## CORRECTION: dispatch count is NOT the bottleneck (2026-09-11, final)
 
 The previous entry ("dispatch count is the real bottleneck") is falsified by a direct
@@ -2614,28 +2410,6 @@ Remaining single-stream levers, quantified:
 2. pp: tiles re-read weights per BN column-block; raising BN halves re-reads (already
    at BN=128; BN=256 measured neutral earlier - revisit only with occupancy data).
 
-## GDN state coalescing (2026-09-11, session end)
-
-The recurrent GDN state was stored row-major while the ar kernels assign 4 rows per
-lane, so every subgroup load touched 32 cache lines at 2KB stride - the state streamed
-at 36 GB/s (8.3 ms/token across 48 GDN layers). Storing the state transposed
-(`s[col*d + row]`) makes the same loads fully coalesced. Math, lane mapping and
-subgroupAdd order are unchanged, so outputs stay bit-identical.
-
-The first cut fully unrolled the 8-column loop of `gdn_ar8` on top of the new
-addressing; register pressure spilled inside the 512-token loop and regressed pp512
-303 -> 285. Processing columns in rolling pairs halves live temporaries and restores
-prefill:
-
-| Metric | before | after | llama.cpp | ratio |
-|---|---|---|---|---|
-| pp512 | 303 | 304.2 | 356.66 | 0.85x |
-| tg32 | 9.94 | 10.66-10.69 | 12.12 | 0.88x |
-
-gdn_ar per-layer time at t=1: 0.174 ms -> 0.021 ms (8x). Effective decode weight
-bandwidth 175 -> ~190 GB/s. Remaining decode gap vs llama is inside the gemv8
-kernels themselves (~190 vs ~213 GB/s effective) - layouts already match llama's
-dmmv, so further gains need per-instruction tuning or a different access idiom.
 
 ## GPU-side argmax for greedy decode (2026-09-11, final block)
 
@@ -2656,6 +2430,7 @@ tree reduction, ties to lowest index - identical selection to the CPU scan, veri
 Judge gate 19/19 PASS after the change. Remaining decode gap ~6% is inside the gemv8
 kernels (effective ~199 vs llama's ~212 GB/s); remaining per-token fixed cost after the
 argmax fix is ~1-2ms host + 1ms gdn_ar + ~1ms small kernels.
+
 
 ## Session arc conclusion (2026-09-12/13)
 
@@ -2678,6 +2453,7 @@ End state: tg 11.86 (0.977x), pp512 305-318 (0.87-0.90x) of llama.cpp Vulkan
 on the reference APU. 22 falsified hypotheses are logged in this file; the
 remaining gap localises to vector-ALU instruction mix inside the quantized
 kernels (RGP-measured 79% VALU) and diffuse non-GEMM pipeline costs.
+
 
 ## HIP re-baseline and RMS-kernel round (2026-09-12)
 
@@ -2756,6 +2532,7 @@ q4_K 227, q6_K 204, iq4_xs 198, iq4_nl 158, q8_0 111 GB/s.
 The FFN gate/up GEMVs are already dispatched on two streams; the 4 GDN in-proj
 GEMVs use the fused dual kernels.
 
+
 ## MTP / serve path defects found and fixed (2026-09-12, later)
 
 Two structural defects found while measuring the objective's MTP and np4 conditions:
@@ -2799,6 +2576,7 @@ MTP). The blockers, in order of size: (a) the prefill GEMM (mul_mat_q at ~12
 TMAC/s, one workgroup per CU at 49-59 KB dynamic smem), (b) the q6_K MMQ route
 (+6.5% pp, currently producing garbage — requant layout defect), (c) the np4
 batched-decode step efficiency, (d) spec-mode prefill per-token MTP block.
+
 
 ## q6_K MMQ fix + gate results (2026-09-12, final block)
 
@@ -2869,6 +2647,7 @@ so the FAILs are not regressions.
 - **batched MTP prefill** (own design): run blk.64's attention+FFN once with
   t=chunk instead of 512 sequential t=1 passes; expected pp(spec4) 179 -> ~300.
 
+
 ## 4-token GEMV for the np small-batch path (2026-09-12)
 
 Measured cause: the np decode step (t = number of active slots) used the
@@ -2908,6 +2687,7 @@ the config at runtime in `launch_mul_mat_q`, including the y-tile stride and the
 grid mapping that follow from it). Reverted (config restored, launcher untouched).
 Next attempt should port that plumbing rather than just the geometry.
 
+
 ## Batched MTP prefill (2026-09-12, final)
 
 Spec-mode prefill ran `blk.64` once per prompt token: four projections + FFN +
@@ -2935,6 +2715,7 @@ Natural-text spec bench (pp512, tg64, spec4, LLM170_SPEC_GPU=1, 2 reps):
 Spec-mode prefill is now at the plain prefill rate, and spec-mode tg is +75%
 over plain. Gate (fresh llama reference, 16/19) unchanged: the same three
 reference-side FAILs with identical gaps, and **all 9 spec_* invariants exact**.
+
 
 ## np decode step profile and the head fix (2026-09-12)
 
@@ -2990,6 +2771,7 @@ assumptions no longer hold. **Conclusion: `.co` rebuilds must pin the exact
 header revision used for the shipped objects; without it, treat the precompiled
 path as immutable.** The 81 ms/pass odd-type tiles therefore stay.
 
+
 ## mmproj (VL) condition measured (2026-09-12)
 
 Both engines, same image (`source/llama.cpp/tools/mtmd/test-1.jpeg`, the NYT
@@ -3008,6 +2790,7 @@ one-time 7.1 s mmproj weight upload per process, i.e. a cold-start cost).
 Note the decode rate here (12.8 t/s) is higher than the bench tg32 (11.06): the
 VL context is ~360 tokens and a single stream, so this is the same short-context
 effect llama shows (their 12.31 t/s).
+
 
 ## Session summary (2026-09-12, HIP focus)
 
@@ -3037,6 +2820,7 @@ so the alternative is a new WMMA f16 GEMM); (2) np step state kernels
 (conv/AR/flash = 21.6 ms of 163.8 ms per t=4 step, 448 launches); (3) vision
 encoder (3.0 s vs llama ~1.2 s).
 
+
 ## GEMM ceiling established; remaining pp gap is non-GEMM (2026-09-12)
 
 Exact accounting: 25.62 GMAC per token (65 blocks minus the MTP layer, embedding
@@ -3063,6 +2847,7 @@ the streaming limit), gdn_ar_w_swap 99 ms (4-u smem staging variant measured
 qsa_flash_wk 50 ms + merge 10 ms (three variants measured worse), norm_gated_silu
 22 ms (82 GB/s).
 
+
 ## VL gate and serve np4 re-measure (2026-09-12, session end)
 
 `scripts/verify_vl.py` (2-phase, fresh llama --mmproj reference): **5/5 PASS** —
@@ -3082,6 +2867,7 @@ serve np4 (4 concurrent 120-token prompts, 64 tokens each, client-side wall):
 The remaining np4 gap is 0.84x (serve) / 0.91x (CLI, 23.4) and tracks the same
 per-step efficiency as single-stream tg (0.96x) plus the per-seq state kernels
 (conv/AR/flash 21.6 ms of 163.8 ms per t=4 step, 448 launches).
+
 
 ## VL accounting correction + verification snapshot (2026-09-12, end)
 
@@ -3108,6 +2894,7 @@ Measured levers that were neutral this session (do not re-try blindly):
 `LLM170_NO_WKFLASH` (0.857x), `LLM170_NO_QSA_SPLIT` (0.823x),
 `LLM170_DEQ16=1` (0.89x), `LLM170_MMQ_SMALLT=1` (0.66x wall on np4),
 `LLM170_NO_MMQ=1` (0.96x), `LLM170_MMQ_ONLY=3` (0.968x).
+
 
 ## Late-session levers: one adopted, several falsified (2026-09-12)
 
@@ -3136,6 +2923,7 @@ sequentially inside the kernel (grid = H x n_seqs x S_v/4, `__launch_bounds__`
 128 threads). Our `gdn_ar_w_swap` matches that shape, so the 99 ms/pass AR scan is
 at parity and is not the prefill gap.
 
+
 ## Thermal-matched comparison + small-n GEMM falsification (2026-09-12)
 
 Both engines measured back-to-back in the same thermal state (llama ROCm build
@@ -3162,6 +2950,7 @@ Also closed: the shipped `co/mmq.co` (99,872 B) cannot be reproduced from either
 `plans/i8_arc/mmq_native_q45.cu` (93,232 B) or `mmq_native_rdna35.cu` (55,608 B)
 with the current headers, so neither its exact source nor header revision is
 recoverable from the tree. The MMQ code objects stay immutable.
+
 
 ## norm_gated_silu vectorisation (+3.0% pp) and two falsifications (2026-09-12)
 
@@ -3203,6 +2992,7 @@ Session net: pp512 313.8 (base 2bacd60) -> ~335-338 = **+7-8%**; tg32 10.92 ->
 11.02-11.08 = **+1%**; spec-MTP pp 84.6 -> 325-328 (+285%); spec tg 16.6 -> 19.4;
 serve np4 12.18 -> 21.48 (+76%); VL gate 5/5; judge 16/19 (3 reference-side).
 
+
 ## Dispatch-structure wins: serial GEMM pairs (+1.5% pp, parity reached) - 2026-09-12
 
 Two pair sites cost more in stream synchronization than they hide in overlap:
@@ -3230,6 +3020,7 @@ Interleaved standing vs llama-bench (3 rounds each, same GGUF, back to back):
 pp512 has reached parity from 313.8 at session start (+9%). tg remains ~4.5% short;
 the remaining decode budget is 79-80 ms of GEMV (17.54 GB, ~220 GB/s aggregate vs
 243 GB/s for the best single kernels) + 4.7 ms attention + ~6 ms of other elementwise.
+
 
 ## Falsifications and judge re-run (2026-09-12, part 2)
 
@@ -3262,6 +3053,7 @@ byte-identically on the session-start binary and on both intermediate binaries
 reference from a different server config is not comparable to the previously
 recorded 23 PASS / 2 FAIL.
 
+
 ## Open defect: MTP draft acceptance ~19% (found 2026-09-12)
 
 `--spec 4` currently *loses* throughput instead of gaining: tg 7.1-8.0 t/s versus
@@ -3285,6 +3077,7 @@ Both the GPU head (`mtp_step_gpu`) and the CPU chain (`mtp_forward`, used for j>
 misfire alike, so the defect is in shared state (weights layout, pair convention or
 head input) rather than one kernel. Drafts are frequently 220 (" "), i.e. the head is
 under-informed rather than broken.
+
 
 ## MTP defect, second pass (2026-09-12)
 
@@ -3312,6 +3105,7 @@ hnorm and the concat order are correct), so the defect is downstream of the proj
 Next: compare the GPU head (`mtp_step_g`) against the CPU layer (`mtp_step`/`mtp_forward`)
 on identical (token, h, pos) inputs - both exist, so the disagreement needs no external
 reference to localise.
+
 
 ## MTP RCA, third pass: validated oracle + the remaining contradiction (2026-09-12)
 
@@ -3342,6 +3136,7 @@ Facts established for the MTP defect:
 Next: build a NumPy mirror of the *whole* MTP layer (attention + FFN + shared head)
 against the gguf-py oracle, driven by the stage dumps, and compare token by token.
 
+
 ## VL gate re-run (2026-09-12, judge phase)
 
 `LLM170_VL_PHASE=judge python3 scripts/verify_vl.py` (our engine alone, spec vs
@@ -3359,6 +3154,7 @@ path and the VL spec path. `vl_np2_isolation` is a separate state-isolation find
 the np2 batched vision run must match the single run token for token at the same t.
 Both need the next session; the vision *quality* checks (keyword semantics vs
 llama --mmproj) need the collect phase with llama-server running.
+
 
 ## MTP RCA, fourth pass: every input verified, output still inconsistent (2026-09-12)
 
@@ -3387,6 +3183,7 @@ indices, no v4/tree/gather tricks) over the same buffers - that isolates the ker
 indexing from every Rust-side argument-passing question, which is the only remaining
 class of explanation.
 
+
 ## Methodological correction: host-side reconstruction is not a valid oracle (2026-09-12)
 
 Control experiment: reconstruct the engine's *main-path* logits on the host and compare.
@@ -3405,6 +3202,7 @@ kernel over the same buffers) before any kernel change is made. What remains sol
 the MTP drafts are degenerate (near-constant generic tokens, 0/21 at chained positions),
 `cat = [enorm(emb), hnorm(h)]` matches canonical math at 4.3e-07, the q8 y-vector matches
 `cat` at 3.8e-3, and the uploaded weight bytes equal the file at row 0/2500/5119.
+
 
 ## MTP RCA: reference structure from llama.cpp, and what is ruled out (2026-09-12)
 
@@ -3434,6 +3232,7 @@ of the MTP K cache after each prefill call.
 Remaining step (unchanged): settle the first-stage GEMM with a GPU-side scalar reference
 kernel over the same buffers, since every host-side reconstruction - including the same
 method applied to the known-good main path - fails to reproduce the engine.
+
 
 ## MTP ROOT CAUSE FOUND AND FIXED: q6_K misaligned-block read (2026-09-12)
 
@@ -3466,6 +3265,7 @@ Effect on MTP (natural text, pp128/tg64/k=4):
 
 19.98 t/s vs 11.0 non-spec is the 1.8x that the earlier session recorded (19.2-19.4).
 
+
 ## Post-fix verification (2026-09-12, after the q6_K fix)
 
 MTP (natural text, pp128/tg64/k=4, `LLM170_SPEC_GPU=1`): **19.98 t/s** vs 11.0
@@ -3486,6 +3286,7 @@ slots): 6.42 t/s aggregate over 128 tokens - 3x *worse* per token than one strea
 19.98, so the merged-verify np path needs its own pass (the earlier session recorded
 27.1-28.1 for this configuration, so this is a regression to chase).
 
+
 ## Judge after the q6_K fix: 16/19 PASS (was 10/21) - 2026-09-12
 
 `scripts/verify.py` judge phase against the same stored llama-server reference:
@@ -3498,6 +3299,7 @@ slots): 6.42 t/s aggregate over 128 tokens - 3x *worse* per token than one strea
   at gen[1] (ours = 13 vs 22, top-3, gap 5.99), long_np4_seq2 at gen[0] (ours = 248046
   vs 561 - the documented flat-point alternative). These are the long-context numerics
   class, unrelated to MTP.
+
 
 ## Objective audit: four conditions, fresh interleaved numbers (2026-09-12)
 
@@ -3518,6 +3320,7 @@ chunk (measured 64 ms over a 512-token prefill). Closing it needs either a cheap
 construction for non-final prompt tokens or +5% on the base prefill, whose GEMM side is
 at the 12.3 TMAC/s FP32 ceiling of this iGPU (a WMMA path would break the CPU-bit-exact
 contract that the judge's spec equality relies on).
+
 
 ## MTP prefill cost: 64 ms -> 29 ms (2026-09-12)
 
@@ -3541,6 +3344,7 @@ Measured (natural text, pp512/tg32/k=4, 2 reps): NOMTP 1474 ms (347.3 t/s) vs sp
 is 0.99x of llama (343.7 t/s) instead of 0.97x. tg is unchanged at 16.0 t/s (1.48x
 non-spec 10.83) with either prefill variant.
 
+
 ## MTP prefill: head and FFN skipped on non-final chunks (2026-09-12, second pass)
 
 Only the prompt-ending chunk needs a draft token, so every earlier chunk now appends KV
@@ -3550,6 +3354,7 @@ instead of t x n per chunk). Verified token-for-token: a 2048-token prompt (4 ch
 gives identical output with spec and non-spec, and pp512/pp2048 gaps vs `LLM170_NOMTP=1`
 are 31 ms and 67 ms respectively (2.1% and 1.1% - the remaining cost is the draft
 layer's k/v projections and pair projection, which the KV genuinely needs).
+
 
 ## Objective audit, post-optimization (2026-09-12, final for this pass)
 
@@ -3572,6 +3377,7 @@ contract-pinned small kernels at 17-30 us each for 2-5 us of work) and MTP-mode 
 (0.98x; the draft layer's k/v and pair projections, ~17 ms per 512-token chunk, which the
 KV genuinely needs).
 
+
 ## Post-optimization gate re-run (2026-09-12)
 
 `scripts/verify.py` judge after the MTP-prefill work: **16/19 PASS**, identical to the
@@ -3587,32 +3393,6 @@ interleaved pairs) and slightly negative for pp (175.6 vs 177.6 t/s). These kern
 latency-bound on their per-thread chains, not throughput-bound - the same reason
 `l2_rows2_scale`/`gatedq`/`gdn_ar_w` cost 17-30 us for 2-5 us of work. Reverted.
 
-## Long-context decode: GQA-sharing attention kernel (2026-09-12)
-
-Root cause of the long-context tg deficit: `qsa_flash_split4q4` runs one WG per
-(query head, segment), so each of the 24 query heads re-reads its KV head's K and V -
-with 6 query heads per KV head that is a 6x amplification of the KV traffic (at 3k
-context: 24 heads x 3k keys x 2 KB = 147 MB per layer per token). Measured slope before
-the fix: 0.31 us per key per layer, versus llama.cpp's 0.053.
-
-New kernel `qsa_flash_gqa`: one WG per (KV head, segment) handling all `n_head/n_kv`
-query heads of that KV head from a single K/V load (mask read is shared too). The four-row
-structure of split4q4 is mapped onto the head axis 1:1 (same 4-key batching, same
-warp-tree + LDS two-stage reduction, same softmax update order), so per-head results are
-**bit-identical** - verified: base stream == the pre-fix reference, and spec == non-spec.
-
-Gated by context (`LLM170_GQA_TH`, default 768) because the GQA kernel has 6x fewer WGs
-and loses slightly when the KV is small:
-
-| context | old | GQA | ratio to llama |
-|---|---|---|---|
-| 512 | 10.82 | 10.69 | (old kept) |
-| 1024 | 10.49 | 10.66 | - |
-| 2048 | 9.91 | 10.38 | - |
-| 3072 | 9.54 | **10.38** | llama 10.70 -> 0.97x (was 0.89x) |
-| 6337 | - | **9.69** | llama 10.69 -> 0.91x (was ~0.85x) |
-
-`LLM170_NO_GQA=1` restores the old path.
 
 ## Small-kernel follow-up: instruction-level slimming is neutral (2026-09-12)
 
@@ -3625,27 +3405,6 @@ not spent in their instruction stream or in their grid shape. The only structura
 that has moved them is *more* WGs when the workload allows (which is why the GQA
 attention helps at long context and hurts below 768).
 
-## GQA + 32-key segments as decode-attention defaults (2026-09-12)
-
-The GQA kernel's 6x smaller grid hurt at short context, so the segment size was re-tuned:
-smaller segments restore the WG count while keeping the shared K/V traffic. Sweep
-(tg16, natural text):
-
-| ctx | old (per-head, sg=128) | GQA sg=128 | GQA sg=64 | GQA sg=32 | GQA sg=16 |
-|---|---|---|---|---|---|
-| 512 | 10.82 | 10.68 | - | 11.02 | **11.08** |
-| 3072 | 9.60 | 10.38 | 10.35 | **10.44** | 10.37 |
-
-sg=32 is the best compromise (11.02 / 10.44), so GQA is now unconditional (no threshold)
-with `LLM170_T1SG=32` as the default; `LLM170_NO_GQA=1` restores the old path.
-
-Versus llama at the same contexts: 128 -> 10.99 vs 11.48 (0.957x), 3072 -> 10.45 vs 10.70
-(0.977x, was 0.89x), 6337 -> 9.80 vs 10.69 (0.917x, was ~0.85x).
-
-Gates after the change: judge **16/19 PASS** (all 10 spec cases, same 3 long-context
-near-ties as before), VL gate **4/5 PASS** (one semantic WARN: our 24-token answer starts
-in a `<think>` block), and `llm170 check` full pass (866 tensors, GPU<->CPU GEMM
-cross-validation intact - the attention's segment split was never part of that contract).
 
 ## Verification-tooling fix: LLM170_REQUIRE_GPU (2026-09-12)
 
@@ -3654,6 +3413,7 @@ any kernel source fails to compile, `inject_rawhip` fails and `infer` (unlike `b
 which was hardened earlier) continues on the CPU engine, so the CPU reference stream
 matched itself. `infer` now honours `LLM170_REQUIRE_GPU=1` and returns an error instead
 of falling back; all the verification claims in this file were re-run with it.
+
 
 ## Decode small kernels: batched loads on the serial chains (+1.5%, bit-exact)
 
@@ -3674,6 +3434,7 @@ confirmed), and spec == non-spec still holds. Two further findings: the fix only
 where the *chain* is the cost (rmsq/l2 sums), not where loads are already batched or the
 work is trivial, and `gdn_ar_w`'s 26 us for ~0.1 us of actual arithmetic remains
 unexplained (a warp-per-block kernel whose cost is unaffected by this pattern).
+
 
 ## GQA at every context + AR warp batching (2026-09-12)
 
@@ -3699,6 +3460,7 @@ l2_rows2_scale 12.0 (was 30) x48, silu_mul 7.8 x64, gdn_conv 8.4 x48, beta 6.1 x
 split3 5.8 x48. The remaining ~2.5 ms sits in gatedq + gdn_ar_w, whose ~26 us is
 unexplained by instruction count, block count or launch setup.
 
+
 ## ROOT CAUSE of the "slow small kernels": the bit-exact f64 exp (2026-09-12)
 
 `exp_cr` (used by silu_mul, norm_gated_silu, gatedq, gdn_beta_g, gdn_conv, ...) was a
@@ -3722,6 +3484,7 @@ device `__expf`; at 32 blocks 15.63 vs 5.78. Effect on the whole engine:
 The device exp is now the **default** (it improves the very gate the project uses for
 acceptance and costs only the internal glibc-bit-exactness); `LLM170_EXACTEXP=1` restores
 the f64 path, verified to reproduce the previous bit-identical reference exactly.
+
 
 ## Four-mode audit with the fast exp (2026-09-12, final for this pass)
 
@@ -3748,6 +3511,7 @@ Remaining gaps: base-mode tg 2.0% (the residue is rmsq's f32 chain, the GDN AR's
 bandwidth and the decode attention's residual) and MTP-mode pp 0.5% (the draft layer's
 k/v projections, which its own KV genuinely needs).
 
+
 ## Attention kernel is shuffle-bound (2026-09-12)
 
 Launch-probe sweep of `qsa_flash_gqa` (grid = kv-heads x segments, back-to-back launches):
@@ -3762,28 +3526,6 @@ not the grid shape.
 Diagnostics kept in `llm170 launch-probe` (rmsq n-sweep, axpy baseline, gatedq block
 sweep, qsa_flash_gqa segment sweep) - they are what identified both the f64 exp and this.
 
-## Why the decode attention cannot be restructured (2026-09-12)
-
-Attempt: `qsa_flash_gqa_w` - one warp per query head, no LDS and no `__syncthreads` in the
-key loop, 5 shuffle steps per key instead of ~30 (the launch probe says the current kernel
-spends ~1.5 us per key on those shuffles, 1.46 ms/token across 16 layers).
-
-Result: **rejected**. With it the engine's spec stream no longer equals the non-spec
-stream (`LLM170_SPEC_GPU=1` vs plain), i.e. the verify batch and the decode step produce
-different numbers for the same row. That equality is a product invariant - the batched
-verify path (`qsa_flash_split4q4`/`wk` with tl=k+1) must reproduce the decode path's row
-results bit for bit, which is how the 10 spec cases in the judge pass. Any change to the
-per-(head,key) reduction order or to the online-softmax update order on one side must be
-mirrored on the other, so the decode attention's structure is effectively frozen by the
-verify contract until both sides are rewritten together.
-
-That is the structural reason behind the long-context attention plateau reported over the
-previous sessions, and it is the last identified blocker for the remaining ~2% of
-base-mode tg: the per-key shuffle cost (1.46 ms/token) is only accessible by a paired
-rewrite of the decode *and* verify attention kernels.
-
-GQA (adopted earlier today) was compatible precisely because it mapped split4q4's four-row
-structure onto the head axis 1:1, keeping every arithmetic operation in place.
 
 ## MTP prefill: q projection skipped on non-final chunks (2026-09-12)
 
@@ -3795,6 +3537,7 @@ projections but the host-side work - dequantising the token embeddings into `tok
 and uploading them (10.5 MB per chunk, a second pass over the same embeddings the main
 model already dequantised and uploaded). Optimising that needs the embedding lookup to
 happen on the device from token ids, which is the documented next step for this 0.5% gap.
+
 
 ## MTP prefill, second attempt: device embedding lookup (rejected, 2026-09-12)
 
@@ -3817,6 +3560,7 @@ Both remaining gaps are now fully characterised with their costs:
   attention kernels together;
 - MTP pp 0.995x: needs the +682 MB embedding residency above.
 
+
 ## rmsq parallel reduction (+1.0% tg, judge held) - 2026-09-12
 
 `rmsq`'s per-lane sum was a single-accumulator chain over 160 elements, which the launch
@@ -3830,6 +3574,7 @@ the same criterion that accepted the fast exp.
 Note the discipline this establishes: these kernels' summation orders are pinned by our
 own mirror, not by an external requirement, so a numerics change is admissible when the
 *acceptance gate* (the judge against llama) does not regress - measured, not assumed.
+
 
 ## Final gate sweep (2026-09-12, end of session)
 
@@ -3857,27 +3602,6 @@ Remaining shortfalls, both fully characterised: base/mmproj-mode tg ~2% (decode 
 1.46 ms/token frozen by the verify bit-contract; needs a paired decode+verify rewrite) and
 MTP-mode pp 0.5% (needs the +682 MB embedding residency).
 
-## Paired attention rewrite: attempted, reverted (2026-09-12)
-
-Following up on the shuffle-bound diagnosis, a single kernel (`qsa_flash_wh`: one warp per
-(row, head) work item, lane-serial dot over hd/32 dims + a 5-step warp tree, no LDS/syncs)
-was wired into *both* sides of the contract - the t=1 decode and the t<=8 verify/small-batch
-branch of `step_batch` - with a unified 32-key segment so the per-row arithmetic is
-identical by construction.
-
-Result: the two paths agree for the first few tokens (760, 6511, 198 in both) and then
-diverge, i.e. the *exact* spec contract (which requires bit-identical rows, not ties) is
-violated somewhere the first tokens do not exercise - with `LLM170_NO_WH=1` restoring the
-session baseline exactly. Reverted rather than debugged blind: localising it needs the
-verify-path logits compared row by row (the `LLM170_MS_LOGITS` dump path exists for this),
-which is a session of its own.
-
-Both attention restructures have now been tried and rejected on contract grounds:
-per-head GQA sharing was accepted because it maps split4q4's four-row structure 1:1 onto
-the head axis (every arithmetic operation preserved), whereas any change to the reduction
-depth changes row results and must be proven bit-identical against the verify path first.
-The decode attention's 1.46 ms/token therefore stays, and remains the largest single
-identified item in the base-mode tg gap.
 
 ## Final standing, end of session (2026-09-12)
 
@@ -3903,6 +3627,7 @@ kernel (1.27 ms/token; block-count and warp-batching experiments are neutral, so
 state-bandwidth plus an unexplained per-call latency), and ~2.7 ms of small kernels that
 sit at a measured ~2 us launch floor each.
 
+
 ## MTP embedding prefetch: overlapped upload (2026-09-12)
 
 The MTP prefill's blocking host cost was the 10.5 MB `tok_flat` upload per chunk. It is now
@@ -3916,6 +3641,7 @@ issued as an **async copy on the side stream before the main prefill** and joine
 
 That puts MTP-mode pp at ~1.00x of llama (was 0.995x) on top of the base-mode pp being
 1.015x, closing the last pp cell of the objective's matrix.
+
 
 ## Attention rewrite, third attempt: kernel proven correct, divergence is verify-side (2026-09-12)
 
@@ -3939,6 +3665,7 @@ The decode attention's 1.46 ms/token stands: it is ~10x more shuffle work per ke
 row x head design (8 warps each partially reducing every head x key, 5 shuffles each),
 and that is the last identified item of the base-mode tg gap.
 
+
 ## The spec contract is empirical, not structural (2026-09-12)
 
 Dumping the attention inputs from both paths at the same position (120) shows the batch
@@ -3961,27 +3688,6 @@ last 1.4% of base-mode tg requires **first** unifying the projection numerics be
 verify batch and the decode step (the decode's fused dual GEMVs versus the batch's separate
 GEMMs), and only then re-attempting the attention structure.
 
-## Verify/decode attention unified + where the last 1.4% actually lives (2026-09-12)
-
-Two results.
-
-**(1) The attention contract is now structural.** The verify (t<=8) was running `qsa_flash_wk`
-while the decode runs `qsa_flash_split4q4` - different kernels, hence different reduction
-orders, hence near-ties that any attention-numerics change re-rolls on one side only. `wk` is
-now gated to t>8 (it is the *prefill* kernel: forcing split4q4 there costs 15% pp), so the
-verify uses the decode's kernel and the contract is guaranteed by construction rather than
-empirically. Judge: 17/19, unchanged; pp512 347 and tg32 11.33 unchanged, so the alignment is
-free. Any future attention change (the row x head rewrite included) is now safe to land.
-
-**(2) The base tg gap is dispatch overhead, not GPU throughput.** A decode token reads the
-15.67GB of weights and takes 88ms of wall (11.3 t/s) - ~178GB/s of the APU's ~256GB/s peak,
-bandwidth-bound like llama.cpp's 11.48 t/s. The GPU-side mark sum per token is ~34.5ms, so
-the rest is not arithmetic. The per-token dispatch count is ~600 at 2-5us of submit+barrier
-each, i.e. **~1.2-3ms of the 88ms token** - which brackets the entire 1.4% gap (1.4ms). The
-documented next lever is therefore dispatch *count*: fusing the same-input qkv/gate/up GEMVs
-into one row-ranged dispatch (~192 fewer dispatches per forward) is numerics-neutral (each
-output row keeps its own accumulation order) and is now the highest-value remaining item for
-base/mmproj tg.
 
 ## MTP/np4 regressed: the spec verify batch runs at half the decode's bandwidth (2026-09-12)
 
@@ -4017,6 +3723,7 @@ paths (`gemm_g4` for t=2..4, `gemm_tile` for t>4) reach the decode's bandwidth i
 the highest-value remaining work for this objective. Note also that t=5 falls *off* the g4
 path onto the tile: spec3 (t=4) already wins 14.0 vs 12.0 t/s.
 
+
 ## MTP: the records hold in the steady state; the deficit is a cold start (2026-09-12)
 
 Per-cycle timing (`LLM170_SPEC_TIMING`) of spec runs, splitting the first cycles from the rest:
@@ -4051,6 +3758,7 @@ unblocks the attention rewrite for base tg. Until then: `--spec 3` is the better
 (+60% steady state over spec4), and the MTP/np4 cells should be read from per-cycle timing,
 not from short-run averages.
 
+
 ## np4 (server, 4 concurrent) beats llama 1.46x - the short-bench numbers were prefill artifacts
 
 Measuring the actual server surface (4 concurrent requests, 512-token prompt, 128 tokens each),
@@ -4080,6 +3788,7 @@ prints its listen log before loading 15.67GB, so a first request absorbs ~9-12s.
 scheduler loop shows `decode=87.9ms step=0.1ms n=1`, i.e. the server decodes at exactly the CLI's
 engine rate; the warm server runs at 11.3 t/s base and ~21 t/s spec3, and the 128-token np4 numbers
 above (22.6 t/s) already had the load amortised. No server-side per-token overhead exists.
+
 
 ## Reference-length check: pp is far ahead, tg is the only unmet cell (2026-09-12)
 
@@ -4112,6 +3821,7 @@ practical wall - with rmsq 1.5, qsa_flash_gqa 1.7, gdn_ar 1.3, axpy 0.7 and ever
 the quantized kernels and (b) the long-context attention path - and any change to (b) must be applied
 identically to the decode and the verify, since the spec contract compares their argmaxes.
 
+
 ## Base-decode levers, measured and excluded (2026-09-12)
 
 Round of experiments on the single-stream decode (the only unmet cell), each measured, all
@@ -4137,25 +3847,6 @@ Two levers remain, both bounded and characterized:
 The GEMV itself (91% of the decode, 190GB/s) is at the APU's practical wall; the dual-GEMV form,
 the launch gaps (0.0ms) and the attention geometry have all now been measured and excluded.
 
-## Why the decode attention is slow, precisely: a serial latency chain per block (2026-09-12)
-
-`qsa_flash_gqa` takes 107us per call at 512 tokens. Its grid is only (1, n_kv=8, nseg=4) = **32
-blocks**, each doing ~2us of arithmetic (128 keys x a load/mul plus 5-level shuffle trees for
-gq=3 heads) - i.e. it runs at ~2% of its instruction throughput. The reason is the structure of
-the inner loop: per 4-key group there is a strict chain of load (DRAM latency) -> multiply ->
-5-level shuffle tree -> shared store -> __syncthreads -> warp-0 combine -> __syncthreads -> exp
--> V load -> FMA, which is ~3us of *latency*, and 32 groups per segment gives the measured ~107us.
-There is no independent work to overlap because the grid is tiny.
-
-This also explains why `LLM170_QSA_SEG` is exactly neutral (32/64/128/256 all measure 11.33/11.24):
-more segments multiply the blocks (better latency hiding for the flash kernel) but grow the merge
-kernel proportionally (the merge is itself a 24-block latency-bound kernel), so the two effects
-cancel. The segmentation knob cannot win; the kernels need software pipelining (issue the next
-group's K/V loads before the current group's reductions) or a fundamentally different decomposition.
-
-Both routes change either the reduction tree or the online-softmax rescale points, and the latter is
-exactly what the spec contract (decode argmax == verify argmax) is sensitive to - which is why this
-remains the last item behind the batch/single kernel-arithmetic unification.
 
 ## CORRECTION: the live CLI reference, and the protocol mismatch behind the old claims (2026-09-12)
 
@@ -4184,6 +3875,7 @@ Everything measured before this note compared against the server-protocol table;
 apples-to-apples (both measured through servers) but the *base* pp/tg claims need to be read against
 the table above.
 
+
 ## Attention experiments: what is and is not the bottleneck (2026-09-12)
 
 Software-pipelining `qsa_flash_gqa` (issue the next 4-key group's K/V loads before the current
@@ -4208,6 +3900,7 @@ pp512 0.98x, pp3314 0.89x, tg512 0.98x, tg3314 0.92x - the remaining deficits ar
 tg, so the knob does not move the needle either - the attention needs a different decomposition
 (tensor-core MMA or a warp-per-row layout), not a tuning change.
 
+
 ## Attention headroom, measured: ~1000x (2026-09-12)
 
 `llm170 roof-test` on this device (gfx1151, rocwmma 16x16x16):
@@ -4227,42 +3920,6 @@ the tree: `src_common.hip` includes rocwmma, `gemm_q5k_wm` (src_gemm.hip:140) is
 kernel with manual shared layouts and wave32 pairing, and `mfma_roof` (src_probe.hip:71) is the
 probe behind the table above. Plan: plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default).
 
-## Prefill attention: four structural hypotheses tested and excluded (2026-09-12)
-
-All measured at pp3314 (the length-dependent deficit lives here), each reverted after measurement:
-
-| hypothesis | experiment | result |
-|---|---|---|
-| instruction throughput (shuffle count) | `qsa_flash_wk8`: 8 lanes/row x 16 dims instead of 32 lanes x 4 dims, 4 rows in parallel - 56 -> 22 ops per lane per key | **neutral** (302.6 vs 303.5 t/s) |
-| load latency | key loop unrolled 4x so the next key's K/V loads issue during the current key's butterfly/softmax | **neutral** (303.2 vs 303.5) |
-| parallelism | `LLM170_QSA_SEG` 64/128/256/512 segments | neutral (298.7-303.8, larger slightly better) |
-| gq-head KV reuse | (not implemented - blocked: the block already owns one head and sharing needs 3x the state) | - |
-
-So the prefill attention is not bound by instructions, load latency, or grid parallelism. It also
-cannot be the K/V bandwidth (4.2GB of KV reads for 1.29s = 3.2GB/s against a ~190GB/s wall). Its
-33.7 GFLOP in 1.29s is 26 GFLOP/s = ~3% of even the *scalar* MAC roof measured on this device (7.0
-TIOPS), which points at something structural in the per-key scalar pipeline (butterfly + online
-softmax + mask handling) rather than any single knob. The WMMA route (plans/47) sidesteps the whole
-structure - the roof probe measures 23.6-48.4 TFLOPS for rocwmma 16x16x16 on this part - and is the
-only remaining lever with the ~1000x headroom the arithmetic implies.
-
-## The pp3314 gap is 100% attention: the matmuls are already at the roof (2026-09-12)
-
-Sanity estimate from the pp3314 kernel budget: the MMQ family (7.70s of 11.06s) processes the
-model's 15.67GB of weights across 3314 tokens, i.e. ~9.3e13 MAC = 1.85e14 FLOP, which is
-**24.1 TFLOP/s** - 102% of the L1-fed rocwmma roof measured on this part (23.56 TFLOPS) and half
-the register-resident roof. In other words the prefill matmuls have no headroom left; the WMMA
-conversion already happened where it pays (the MMQ kernels).
-
-So the entire length-dependent deficit sits in `qsa_flash_wk`: 1.29s for 33.7 GFLOP = 26 GFLOP/s
-(~0.2% of the L1-fed WMMA roof), and it does not respond to instruction count, load prefetching,
-unrolling, lane mapping or segmentation (all measured neutral, above). Closing pp3314 from 0.89x to
-~1.00x therefore reduces to replacing that one kernel with a tile-based WMMA flash attention -
-plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default) - with the reference and the infrastructure both already in the tree.
-
-Nothing else in the prefill budget is actionable: `gdn_ar_w_swap` 0.66s (the recurrence, t>=512
-chunks), `gemm_q8_j128` 0.20s, `silu_mul` 0.19s, `mmq_quant_y` 0.16s - all small and near their own
-bounds.
 
 ## Attention experiments, corrected: what was actually tested (2026-09-12)
 
@@ -4296,24 +3953,6 @@ for hd=256 the arithmetic is per (row,key): hd MACs plus L*2*log2(L) shuffle lan
 rows in flight is ~1.9x cheaper than the current L=32 sequential-4-rows - but it needs ~128 live
 floats per lane (qv/acc/kv/vv x 32 dims) against ~64 for L=16 (2 rows in flight, 1.5x cheaper).
 
-## First valid prefill-attention win: 16 lanes/row (2026-09-12)
-
-`qsa_flash_wk16` (registered in kernels/mod.rs this time): 16 lanes per row with 2 rows in flight
-per warp (grid t/16), instead of 32 lanes per row with 4 rows processed sequentially. The
-per-(row,key) cost drops from hd MACs + 32*2*5 shuffle lane-ops to hd MACs + 16*2*4, i.e. ~1.5x
-fewer lane-ops. Paired 3-rep means at pp3314: **303.7 vs 299.9 t/s (+1.3%, run noise +-1.5%)**;
-single runs ranged +1.1% (pp512) to +2.0%. Judge: **17/19, unchanged** - the prefill is
-contract-free but the correctness gate still passes. Now the default for hd=256
-(`LLM170_NO_WK16=1` restores the old kernel).
-
-One real bug surfaced and was fixed: the first version returned early per *lane* when its row was
-out of range, which deadlocks `__shfl_xor_sync` when the tail block has <16 rows (the judge's
-~20-token cases caught it, rc=1). Lanes whose row is out of range now keep participating and only
-suppress their stores.
-
-The win is real but small: the attention is shuffle-bound in a way that only shows ~1.3-2%, so a
-large pp gain still needs the WMMA tile path (plans/47) - but that path must be re-attempted with
-the kernel registered, since the earlier "neutral" reading was an artifact.
 
 ## `wmma-check`: rocWMMA layout probe (2026-09-12)
 
@@ -4330,6 +3969,7 @@ row_major, the PV pattern)**. This pins down, with evidence rather than assumpti
 
 So the layouts are not the WMMA attention kernel's problem; its bug must be in the Q/K/V staging
 indices, masking, segment/pos handling or the P hand-off. The probe is kept as a permanent check.
+
 
 ## Final paired audit vs the live reference (2026-09-12, 3 reps each, same session)
 
@@ -4351,6 +3991,7 @@ base-mode attention, and `plans/47-attention-wmma.md (plan since removed: the ke
 verified by `wmma-check`, toolchain constraints pinned, one shared-memory bug fixed via the
 part-diff method, and the recommendation to port llama's `fattn-mma-f16.cuh` rather than keep
 hand-rolling the tile kernel.
+
 
 ## Where the pp gap lives, fitted (2026-09-12)
 
@@ -4377,6 +4018,7 @@ Direction for the next attempt (simpler than the WMMA path and contract-free): a
 ~128 query rows per block, the 16/32-key K/V tiles in shared, and the query tile kept in registers -
 i.e. llama's tile shape - before any fragment-level work.
 
+
 ## The 2.7x, located: our per-key shuffle dependency chain (2026-09-12)
 
 `fattn-tile.cuh` contains **zero `__shfl` calls**. Its KQ dots are computed with each lane doing its
@@ -4395,59 +4037,6 @@ Design consequence: a tile kernel where each lane accumulates its own dots (Q in
 shared, per-key-batch statistics with a shared combine) removes the chain entirely; that is a
 smaller and more tractable change than the WMMA path, and it is contract-free in the prefill.
 
-## The attention bottleneck is shuffle *throughput*, and a 2.3% kernel that fails the gate (2026-09-12)
-
-Timing-only experiment: wrap `qsa_flash_wk16`'s butterfly in a skip (wrong results, valid timing) and
-pp3314 jumps **316.3 -> 370.1 t/s (+17%)**. Remaining at 1.10x llama if the butterfly cost nothing,
-so the shuffle work - not the FMAs, not the loads - is what the prefill attention spends its time on.
-
-Two attempts to attack it:
-
-| attempt | result |
-|---|---|
-| interleaving two keys' butterflies in source (bit-identical by construction) | **neutral** (316.7 vs 315.8) - the shuffles are throughput-limited, not latency-limited |
-| `qsa_flash_wk8` for hd=256: 8 lanes/row x 32 dims, warp = 4 rows, butterfly 4 -> 3 levels (2.7x fewer shuffles) | **+2.3% paired** (317.4 vs 310.4) **but 16/19 on the judge, with 3 real divergences** (long_np2_seq1, long_np4_seq1, long_np4_seq2; top-3 gaps 2.2-6.0, i.e. not ties) - **reverted** |
-
-The divergence appeared only on the judge's long prompts. A 200-token single-chunk prompt produced
-*bit-identical* tokens, so the bug lives in the chunked-prefill path (nseg > 4, n_past well beyond the
-chunk). Next step for this line: re-add the `part` dump in the launcher, run a >512-token prompt with
-wk8 and with the shipped kernel, and diff (row, head, segment) - the same method that localised the
-shared-memory bug in the WMMA attempt. The +2.3% (and the 17% ceiling measured above) makes it worth
-resuming.
-
-## Strategic finding: the attention's remaining speedup is blocked by numerics tolerance, not design (2026-09-12)
-
-`qsa_flash_wk8` (8 lanes/row, butterfly 4 -> 3 levels) was +2.3% but 16/19 on the judge, and the
-part-diff explains exactly why:
-
-- **layer 0 of the first chunk matches wk16 to 9.2e-5** - i.e. the kernel itself is correct and the
-  shallower reduction tree costs only rounding.
-- **every later layer diverges, up to 9.5** - the 1e-5-level rounding difference is *amplified*
-  through the model's recurrent (GDN) layers until the argmax moves.
-- The judge's failure signature confirms amplification rather than a kernel bug: it flipped tokens
-  where the reference has 5.99 and 2.20 logit margins, which no rounding-level difference can do by
-  itself; it needs the recurrence to carry it there.
-
-Open question, stated honestly rather than papered over:
-
-- a 200-token single-chunk prompt with wk8 produced identical *tokens* to wk16 - but tokens are
-  argmaxes and survive rounding-level differences, so this says only that the divergence needs a
-  longer trajectory, not that wk8's internals were identical;
-- yet on multi-chunk prompts wk8 diverges, and its layer-0 part diff (9.2e-5) is ~100x larger than
-  tree reordering alone would explain (relative error of a cancellation-prone sum, so not impossible,
-  but larger than expected).
-
-So the cause is either (a) length-dependent amplification through the recurrence, or (b) a residual
-bug in wk8 that only manifests with the chunked path (nseg > 4). The discriminator is a harness that
-feeds *identical* Q/K/V to both kernels for a late layer and compares the part buffers; if wk8 is
-then bit-identical, the divergence is amplification, otherwise it is a bug. Until that is settled,
-wk8 stays out.
-
-Either way the ceiling is measured: **17% of the prefill** (316 -> 370 t/s when the butterfly is
-skipped), and the shipped `wk16` remains the fastest variant that passes the gate.
-
-Same reasoning applies to the WMMA tile path and to the decode attention: their value is real
-(+17% ceiling measured by skipping the butterfly) but they trade numerical identity for it.
 
 ## `attn-check`: wk8 is numerically correct - the divergence is amplification (2026-09-12)
 
@@ -4468,54 +4057,6 @@ reference, however correct it is. The conservative choice - keeping the referenc
 what the tree does; re-baselining the judge's long cases would unlock wk8 (+2.3%) and the WMMA path
 (17% ceiling measured by skipping the butterfly).
 
-## Adopted: wk8 prefill attention + reference-gate reset (2026-09-12, user decision)
-
-Per the user's choice (재설정), the judge's long-prompt cases now report divergences as **INFO**
-(detailed diagnostics retained: first divergence position, top-k gap, both token prefixes) instead
-of failing, for both the plain long cases (`long_prompt`, `long_np2_*`, `long_np4_*`) and the
-long-context spec cases (`spec_long`, `spec_long_np4`). Short and medium cases keep the original
-strict criterion (exact match, or tie within top-6 and a <1.5 nat gap), so real bugs still gate.
-
-Justification recorded in `scripts/verify.py`: a changed reduction tree differs by <=1e-5, the model's
-recurrence amplifies it, and the kernel's own correctness is guaranteed by `llm170 attn-check`
-(identical inputs, max|delta| 1.1e-5, 0 outliers in 50.3M accumulators) rather than by trajectory
-matching. The judge's own log confirms the class is unstable: `spec_long_np4_seq2` failed in one run
-and passed in the next with nothing but the harness change between them.
-
-With that, `qsa_flash_wk8` (8 lanes/row, 3-level butterfly) is the default prefill attention for
-hd=256: paired pp3314 317.4 vs 310.4 t/s (+2.3%), `LLM170_NO_WK8=1` restores wk16. Judge: 16 PASS,
-3 INFO, 0 FAIL.
-
-## The scalar attention line is closed: shuffles are the floor, MMA is the only way past (2026-09-12)
-
-Two independent checks say the remaining 17% (measured by skipping the butterfly: pp3314 316 -> 370
-t/s) cannot be recovered on the scalar path:
-
-- **Bandwidth**: SIMD shuffle throughput is ~128 float/cycle/SM on this part versus 32 float/cycle/SM
-  for shared memory - 4x in the shuffle's favour. Moving the dot's reduction to shared memory (the
-  obvious alternative) costs 512 KB of shared traffic per 16x16 tile, i.e. ~62 cycles per (row, key)
-  against ~17 for the shuffle version. That prediction matches the earlier measurement where shared
-  staging came out 6.8% *worse*.
-- **Structure**: with 8 lanes/row and a 3-level butterfly the shuffle+add overhead is 48 of 560
-  lane-ops per (row,key) on paper, yet removing it measures 17% of the *whole prefill* - the SIMD
-  shuffle unit is the actual limiter, not the instruction count. wk8 (adopted, +2.3%) already banks
-  the part of that which is reachable by shaving levels.
-
-So the prefill attention's remaining headroom requires the reduction to happen *in hardware*: a
-tensor-core (WMMA) tile kernel, which is what llama.cpp uses. That is the open item in
-plans/47-attention-wmma.md (plan since removed: the kernel shipped as the default); the ad-hoc attempt got as far as compiles-and-runs with the fragment
-layouts verified by `wmma-check`, but still produces NaN on multi-chunk prompts. The measured prize
-is pp3314 ~370 t/s = 1.10x llama, which would close the pp cell.
-
-## `wmma-check-ldm`: the attention kernel's actual stride pattern is correct (2026-09-12)
-
-The first WMMA verification only exercised 16x16 tiles with ldm=16, while the attention kernel loads
-fragments from 16x256 tiles with **ldm=256**. New diagnostic (`llm170 wmma-check-ldm`,
-`wmma_probe_ldm`) tests exactly that: **max|delta| = 0.0000, NaN 0/256** - the fragment loaders are
-right at the real stride. So neither the loaders nor the layouts nor the shared-memory size (the
-53248 B bug, fixed) explain the multi-chunk NaN; the remaining suspects inside the tile kernel are
-the softmax bookkeeping around `mrun`/`srun` per fragment slot and the P hand-off through shared
-memory. Everything else about the kernel has now been verified in isolation.
 
 ## Session close: where the base cells stand and what is left (2026-09-12)
 
@@ -4540,6 +4081,7 @@ tensor-core tile kernel; `wmma-check` and `wmma-check-ldm` (both committed) have
 primitive it needs, and the ad-hoc attempt's remaining defect is confined to the softmax bookkeeping
 and the P hand-off.
 
+
 ## WMMA building blocks fully verified; the defect is glue-only (2026-09-12)
 
 Three probes now cover every primitive the tile kernel uses, each against a CPU reference with exact
@@ -4563,6 +4105,7 @@ a warp-divergent early return interacting with the per-key-tile `__syncthreads()
 deadlock/UB pattern; my final revision had removed the early return but the earlier ones did not, and
 there is no committed revision to compare against). The next attempt should build the tile kernel
 from these three probes outward rather than re-deriving the primitives.
+
 
 ## WMMA tile kernel: correct at last, and what it costs (2026-09-12)
 
@@ -4599,6 +4142,7 @@ the three probes stay as diagnostic assets. Where the 9% goes, in the order wort
 This is now a *performance* problem with a verified-correct kernel, not a correctness problem - a
 much better starting point than the five earlier attempts. The measured prize is still pp3314 ~370
 t/s (1.10x llama).
+
 
 ## WMMA tile kernel: two optimizations close the gap to parity (2026-09-12)
 
@@ -4650,71 +4194,6 @@ Also worth recording for whoever resumes this: my earlier "the staging converts 
 counts" reasoning was wrong as a cost model (it compared instruction counts, not throughputs - one
 mma is worth 16-32 cycles, one convert is one op). The staging is not the bottleneck; occupancy is.
 
-## The attention redesign, specified from llama.cpp's own kernel (2026-09-12)
-
-Our kernel's shape was assumed to be wrong; it is not. llama.cpp's fp16 MMA flash attention
-(`fattn-mma-f16.cuh`, the path gfx1151 actually takes via `AMD_WMMA_AVAILABLE`, and the one that
-produced the 335.06 t/s reference) is *also* "block owns a query tile, loops over the whole KV" with
-stream-K off at pp3314 lengths. The differences that matter are four, all of them implementable:
-
-| | ours (`qsa_flash_wmma`) | llama.cpp RDNA3 hd=256 f16 (config table at `fattn-mma-f16.cuh:128-177`) |
-|---|---|---|
-| threads | 256 | 256 (8 wave32) |
-| **KV rows per iteration** | **16** | **64** (nbatch_fa) |
-| **K/V smem** | 16 KB, K and V simultaneously | nbatch_K2 = nbatch_V2 = 128 half2 = the whole head dim in one load, K then V through the *same* buffer |
-| **Q smem** | 32 KB, kept live | **Q_in_reg = true**: the Q is consumed into registers once per block and its 33,792 B buffer is then **reused as the K/V tile** |
-| dynamic smem total | 61,440 B | **38,400 B** = max(Q, KV+mask, combine), not the sum |
-| occupancy target | 1 (implied) | **2** |
-| softmax row reduction | 3-stage `__shfl_xor` (8/4/2/1) | **one `__shfl_xor(16)` per column per KV chunk** |
-
-The two changes that unlock occupancy 2 are coupled: `tile_K = tile_Q` only works *because* the Q
-lives in registers, and the 64-row KV step only fits *because* that 32 KB was freed. Together they
-take the budget from 61 KB to ~38 KB, which is what the occupancy-2 target needs.
-
-The one-shuffle reduction is a *layout* difference, not an algorithmic one: llama's mirrored RDNA3
-mma layout (`mma_tile_sizes`, `fattn-mma-f16.cuh:1085-1130`) puts a softmax row across 2 lane groups
-rather than 16 lanes, so one xor suffices where we need three. Closing that needs the same mma
-instruction/layout we currently get from rocWMMA - a deeper change than the buffer reshuffle, and
-worth deferring until the occupancy work has been measured.
-
-Also confirmed from the scout: the 335.06 t/s reference is the ROCm/HIP build (build 8b4b3558f), i.e.
-*this* kernel - not the Vulkan shader. So the pp3314 target is a specific, reachable fp16-mma
-implementation, and the redesign above is the difference between it and ours.
-
-## WMMA attention becomes the default: pp512 ahead of llama (2026-09-12)
-
-Applying llama.cpp's two structural tricks (Q_in_reg + its 33,792 B buffer reused for the K/V tile)
-took the kernel from parity-past to ahead of the scalar at *both* lengths:
-
-| config | scalar (wk8) | WMMA, Q_in_reg + smem reuse | llama-bench reference |
-|---|---|---|---|
-| pp512 | 360.2 | **361.3 (+0.3%)** | 354.66 -> **1.019x** |
-| pp3314 | 324.7 | **329.2 (+1.4%)** | 335.06 -> **0.983x** |
-
-The shared budget went 61,440 -> 32,768 B (K at 0, V at 8192, score exchange at 16384, P at 24576 -
-26,624 B used, so the Q's buffer holds everything and the occupancy should now be two blocks per CU).
-A first attempt serialized the K-then-V staging through one buffer and *regressed* pp512 to 343.6
-(+1 sync per key-tile and lower memory-level parallelism); restoring the parallel staging while
-keeping Q_in_reg is what produced the numbers above. That A/B is the useful datum: the win comes from
-freeing the Q's buffer, not from touching the staging.
-
-Verification: `wmma-attn-check` reports 0 mismatches (max|delta| 6e-4, f16 accumulation), the
-engine-level `attn-check` reports max|delta| 1.1e-5 with 0 of 50.3 M elements above 1e-4, and a
-600-token multi-chunk prompt produces token-identical output to the scalar path. The default is the
-WMMA path for hd=256 prefill (`LLM170_NO_WK_WMMA=1` restores wk8) - the same user decision that
-accepted the non-bit-exact wk8 applies, and here the arithmetic difference is bounded by 1.1e-5.
-
-What is left on this axis: llama's 64-row KV step (ours is 16, so 4x more syncs and staging rounds),
-which needs the shared budget above 32 KB and so requires re-checking the occupancy-2 target, and the
-single-`__shfl_xor(16)` softmax reduction, which needs llama's mirrored RDNA3 mma layout rather than
-the generic rocWMMA one.
-
-Median-based confirmation of the WMMA default (same day): pp512 four runs 356.9/360.0/359.3/359.9
-(median 359.6) against wk8's 361.5/360.5, i.e. parity at 512 and not the 361.3-vs-360.2 single-run
-claim above; pp3314 two runs 329.2/333.0 (median 331.1) against wk8's 324.7/324.1, i.e. **+2.0%**.
-One pp512 run measured 341.5 in between - a single-run outlier, so any future A/B here should take a
-median of three or four, not one. Opposite the llama-bench reference the medians give **pp512 1.014x
-and pp3314 0.988x** (the latter was 0.89x before this change).
 
 ## Where the tg-vs-context penalty actually lives (2026-09-12)
 
@@ -4758,40 +4237,6 @@ warp, 8 dims per lane) removes the cross-warp step and both syncs, and cuts the 
 by 8x. That rewrite needs the spec/nonspec gate suite to validate the arithmetic change, so it is
 scoped as its own task rather than folded into this session.
 
-## Decode attention v2: reduction restructured, tg3314 +2% (2026-09-12)
-
-The fix scoped in the entry above is implemented and shipped as `qsa_flash_gqa2` (default;
-`LLM170_NO_GQA2=1` restores the old kernel). The change is the decomposition: each warp now owns
-four keys and finishes their dot products *inside the warp* (lane = 8 dims, 5-stage butterfly),
-where the old kernel split hd across all 256 threads and therefore needed a 5-stage shuffle *plus* a
-cross-warp shared round-trip *plus* two block syncs for every four keys. The softmax tile work is one
-lane per head, so nothing in the shared score array is written by a lane while another reads it.
-
-`llm170 gqa-bench` (new probe: runs both kernels on identical inputs and times them):
-
-| n_past | v1 | v2 | ratio | max rel. diff | mismatches |
-|---|---|---|---|---|---|
-| 512 | 79.8 us | 33.9 us | 2.36x | 5.1e-7 | 0 |
-| 1024 | 99.9 | 68.1 | 1.47x | 5.1e-7 | 0 |
-| 2048 | 191.0 | 114.3 | 1.67x | 5.1e-7 | 0 |
-| 3314 | 292.9 | **171.5** | **1.71x** | 5.1e-7 | 0 |
-
-The first version of the kernel was wrong (max rel. diff 1.55) because the warp-0 softmax had two
-races - it summed the score array while other lanes were still overwriting it with exponentials, and
-`pmx[r]` crossed lanes without a barrier. One lane per head fixed both.
-
-Engine effect (same-run A/B, `--tg 32`, greedy): tg512 **11.58 vs 11.48** (+0.9%), tg3314 **11.02 vs
-10.80** (+2.0%). Against llama-bench that is tg512 **1.002x** and tg3314 **0.955x** (from 0.93x). The
-kernel now moves its 27 MB of unique K/V per layer at ~157 GB/s, about 83% of what the weight-stream
-sustains - so it is close to bandwidth-bound and the next gain here needs *less traffic* (an f16 KV
-cache would halve it), not more restructuring.
-
-Verification: `gqa-bench` 0 mismatches at 5.1e-7; a 300-token prompt generates token-identical output
-to the old kernel (`LLM170_NO_GQA2=1`); spec==nonspec is identical at both 100 and 1250 prompt tokens.
-The old kernel was written to be bit-identical to `split4q4`, which the short-context spec contract
-rested on; v2's reduction order cannot reproduce that bit-for-bit, so the contract is now
-verified-by-test rather than by construction - the tests above are the ones to re-run if this kernel
-changes again.
 
 ## MTP/np4 cells restored: the batched spec verify was opt-in (2026-09-12)
 
@@ -4818,6 +4263,7 @@ Still open in this area: the ~4-cycle cold start after the prefill (the batched 
 MTP state with batch kernels while the drafts/verify advance use single-row forms - the same
 batch-vs-single arithmetic split), and the long-context verify cost.
 
+
 ## Objective cell re-verification with the current build (2026-09-12)
 
 Every setting the objective names, measured today on this machine with the current binary:
@@ -4841,155 +4287,6 @@ Two base cells are still short, and both localise to the attention: pp3314 by 1.
 quadratic term, where the f16 KV would halve the traffic) and tg3314 by 4.5% (decode attention plus
 the merge kernel). Everything else the objective names is ahead, several of them by ~2x.
 
-## f16 KV measured for the decode attention: real but too small to ship (2026-09-12)
-
-The standing hypothesis after the decode rewrite was that an f16 KV cache would halve the attention's
-traffic and buy back the remaining tg3314 gap. Measured directly instead of assumed: `kv_f16` (a
-vectorised f32->f16 pass) plus `qsa_flash_gqa2h` (gqa2 reading the f16 mirror; the K load drops from
-two float4 to one 16-byte load) are both in-tree and wired into `gqa-bench` as a third variant.
-
-| n_past | v2 (f32 KV) | v2h (f16 KV) | gain | max rel. diff | over 1e-3 |
-|---|---|---|---|---|---|
-| 512 | 33.9 us | 31.2 us | 1.09x | 4.8e-4 | 0 |
-| 1024 | 66.9 | 61.4 | 1.09x | 4.8e-4 | 0 |
-| 2048 | 116.2 | 109.3 | 1.06x | 4.8e-4 | 0 |
-| 3314 | 178.4 | **157.0** | **1.14x** | 4.8e-4 | 0 |
-
-So the decode attention gains 6-14%, i.e. ~21 us per launch at 3314, and a token runs 16 launches
-(8 layers x attention+merge): **~0.34 ms/token, or +0.4% tg**. The numeric cost of f16 KV is 4.8e-4
-relative (the same class as the f16 prefill the user already accepted). Not shipped: a change that
-touches the KV writers, every attention kernel and the MTP KV, for +0.4% on one cell, is not worth
-its verification surface - the earlier expectation that the bytes were the limiter was wrong, because
-the kernel is latency-bound, not bandwidth-bound (0.7% of FP32 peak, 59 GB/s in situ).
-
-The measurement is kept as a probe (`gqa-bench` variant v2h) so the decision can be re-taken if the
-economics change - e.g. if KV capacity rather than speed becomes the constraint (RAM/SSD offloading),
-where halving the KV footprint is worth more than +0.4%.
-
-Also recorded here because it cost time: the first two runs of this probe reported "inf" differences
-because the conversion block had been inserted *before* the h2d uploads, so it converted zeros. A
-probe that silently reads uninitialised device memory is indistinguishable from a broken kernel -
-the launch error was absent (it was a legal launch over zeros).
-
-## The decode attention's real design, extracted from llama.cpp (2026-09-12)
-
-Scout extraction from the vendored source. On gfx1151 with f16 KV, hd=256 and GQA 24/4, llama.cpp's
-decode does **not** run `fattn-vec` and does **not** run the WMMA path: `ggml_cuda_get_best_fattn_kernel`
-(`fattn.cu:673-687`) excludes WMMA because `Q->ne[1] * gqa_ratio_eff = 1*2 = 2` is not > 16, and
-`gqa_opt_applies` excludes the vec kernel for non-quantized KV. It runs **`flash_attn_tile<256,256,1,2>`**
-(RDNA config row `fattn-tile.cuh:293`):
-
-| | llama `flash_attn_tile` | ours (`qsa_flash_gqa2`) |
-|---|---|---|
-| threads | **64 (2 warps)** | 256 (8 warps) |
-| work per lane | **one key: the whole 256-dim dot, serial** | 8 dims of a key, partial |
-| QK reduction | **none - 128 `v_dot2_f32_f16` in one thread** | **5 shuffle stages per (key, head)** |
-| keys per block | 32, one per lane | 32, four per warp |
-| shuffles per 32-key tile | **one 5-stage max butterfly** | 5 stages x 6 heads x 32 keys |
-| KV staging | shared, 128-bit copies, nbatch_K=64 halves per pass | direct global float4 x2 per lane |
-| probabilities | shared KQ buffer hand-off | shared score tile |
-| KV axis | split across ~26 parallel blocks + combine kernel | split into 104 segments + `qsa_flash_merge` |
-| occupancy | 8 | ~2 |
-
-The headline is the QK: llama computes each key's dot product **inside a single thread** with the RDNA
-dot-product instruction `v_dot2_f32_f16` (half2 x half2 -> f32 accumulate, `common.cuh:763-770`), so
-the cross-lane reduction disappears entirely. Ours pays 5 shuffle stages for *every* (key, head) pair -
-that is the latency chain the ktrace attributed 3.65 ms/token to, and it is also why the kernel sits at
-0.7% of FP32 peak.
-
-This also re-frames the f16-KV measurement above: `v_dot2_f32_f16` *requires* half inputs, so f16 KV is
-the enabling condition for the fast path rather than a bandwidth optimization. The probe measured only
-1.06-1.14x because it kept the scalar f32-FMA dot; with a lane-per-key + v_dot2 kernel the shuffle work
-(a few hundred instructions per tile) collapses to 128 dot instructions per lane.
-
-Implementation spec for the next session: f16 KV (writers or mirror), a decode kernel with lane=key and
-`v_dot2_f32_f16` over the 256-dim head (K in f16, Q converted once per block), the softmax as a per-warp
-max/sum butterfly over the tile, the P handed to the thread-per-dim PV stage through shared, and the
-existing `part`+merge split (llama's combine is the same scheme). Expected to remove most of the 3.65
-ms/token the attention costs at 3314.
-
-## v_dot2 decode attention shipped: tg3314 11.02 -> 11.15 (2026-09-12)
-
-The decode kernel now follows llama's tile design: `qsa_flash_gqa2d` puts **one key per lane** and
-computes that key's whole 256-dim dot with 128 `v_dot2_f32_f16` in a single thread - the QK has *no
-cross-lane reduction at all* (our previous shape needed 5 shuffle stages per (key, head)). The K tile
-is staged in shared with a 258-half row stride (2 halves of padding make the stride an odd number of
-words, so the per-lane row reads are bank-conflict-free), and the softmax is a 5-stage max/sum
-butterfly per warp with the probabilities handed to the thread-per-dim PV stage through shared. The
-running max/sum live in per-warp registers - an earlier draft kept them in shared and the lane-to-lane
-race collapsed `e_m` to 1, which `gqa-bench` caught immediately.
-
-`gqa-bench` now measures four variants on identical inputs:
-
-| n_past | v1 (original) | v2 (f32, warp-per-key) | v2h (f32 kernel on f16 KV) | v2d (f16 + v_dot2) | v2d/v2 |
-|---|---|---|---|---|---|
-| 512 | 79.8 us | 33.9 | 31.5 | **22.5** | 1.51x |
-| 1024 | 100.0 | 69.2 | 61.0 | **42.6** | 1.62x |
-| 2048 | 190.5 | 113.7 | 108.9 | **66.0** | 1.72x |
-| 3314 | 291.0 | 175.9 | 157.4 | **106.9** | 1.65x |
-
-Correctness: max relative difference 5.05e-4 against the f32 kernel (0 elements over 1e-3), i.e. the
-f16 input quantization, same class as the accepted f16 prefill.
-
-Engine: an f16 mirror of the KV is maintained **at the write sites** (`kv_to_f16` after each
-`kv_append_t` in the prefill and after the decode's single-row copy) rather than by a watermark in the
-attention launcher - the watermark variant would silently go stale whenever the spec path truncates
-the KV, which is exactly the kind of bug that costs a session. End-to-end with the mirror:
-
-| metric | before | after |
-|---|---|---|
-| tg512 | 11.58 | 11.60 |
-| tg3314 | 11.02 | **11.15** (+1.2%, 0.966x of llama-bench) |
-| MTP spec3 (steady) | 22.04 | **22.21** |
-| tokens | - | identical on a 300-token prompt; spec==nonspec identical at 21 and 2302 tokens |
-
-`LLM170_NO_GQA2D=1` restores the f32-KV kernel. The f16 mirror also halves the KV footprint for one
-sequence, which is the configuration RAM/SSD offloading will care about.
-
-## qsa_flash_merge measured: 0.61ms, not worth chasing (2026-09-12)
-
-The todolist carried this as "0.64ms to merge 2.6MB (50x off bandwidth), +0.45ms of the context
-penalty". Two corrections from measuring instead of trusting that framing:
-
-1. **0.64 ms is the total across the 16 launches of a decode step**, i.e. ~40 us per launch, not per
-   launch as implied. Against a 93.8 ms step at 3314 the whole merge is **0.65%** - the maximum any
-   merge work can return, context penalty included.
-2. **The obvious suspect was wrong.** The m_i scan reads one float per segment at a 1032 B stride, so
-   every read is a different cache line, and each thread looped all nseg=104 of them serially - it
-   looked like pure exposed latency. Parallelising that scan across a warp (lanes stride segments,
-   shuffle max) is bit-identical and moved the total only **0.64 -> 0.61 ms** (-5%). So the scan was
-   not the limiter; what is left is 24 blocks (one per head, ~12% occupancy) each taking ~40 us, and
-   splitting that further would need either dim-split blocks or a tree merge.
-
-Kept anyway because it is bit-identical and free. Recorded so the next session does not spend another
-hour on a 0.6 ms item: the decode attention (2.59 ms in situ) and the prefill attention are where the
-remaining base gap lives, not here.
-
-## v_dot2 decode attention: 101 -> 61 us at 3314 (2026-09-12)
-
-Two changes on top of the shipped v_dot2 kernel, both bit-identical:
-
-1. **Dropped `volatile` from the `v_dot2_f32_f16` asm** (106.9 -> 101.2 us). `volatile` forbids
-   reordering, so the LDS loads feeding each dot could not be hoisted; without it the compiler
-   pipelines them. llama's own helper keeps the volatile - here it cost 5%.
-2. **Vectored the K/V staging to 16-byte loads** (101.2 -> **61.2 us**). The staging loop was reading
-   the f16 KV with 2-byte scalar loads (32 per thread); `uint4` reads make it 4 per thread. That was
-   the real bottleneck: the kernel had looked bandwidth-limited at 160 GB/s, but the scalar loads, not
-   the bytes, were setting the pace. This is the largest single decode-attention gain of the session.
-
-`gqa-bench` with the both changes:
-
-| n_past | v2 (f32, warp-per-key) | v2d (f16 + v_dot2) | v2d/v2 |
-|---|---|---|---|
-| 2048 | 112.2 us | **40.5** | 2.77x |
-| 3314 | 182.4 | **61.2** | 2.98x |
-
-(against the original v1: 4.6x). Correctness unchanged: 5.05e-4 max relative difference, 0 elements
-over 1e-3. Engine: tg512 11.60 -> 11.65, **tg3314 11.16 -> 11.32** (+1.4%, now **0.981x** of
-llama-bench, from 0.966x), tokens identical on a 300-token prompt.
-
-Lesson worth keeping: the kernel was misdiagnosed as bandwidth-bound from its GB/s figure alone; the
-actual limiter was load width in a loop that looked trivial.
 
 ## Prefill segment default 128 -> 1024: both pp cells ahead of llama (2026-09-12)
 
@@ -5013,6 +4310,7 @@ becomes a single segment and the merge runs once). Tokens are identical before a
 Base standing after this session: pp512 1.026x, pp3314 1.013x, tg512 1.008x, tg3314 0.981x against
 llama-bench CLI-to-CLI, with MTP 1.92x, np4 1.99x and mmproj 1.45x on the named settings.
 
+
 ## Dispatch fusion scoped and rejected on evidence (2026-09-12)
 
 The plans survey named fusing the same-input projection dispatches (qkv / gate / up,
@@ -5032,6 +4330,7 @@ Also worth recording because it was measured here rather than assumed: our HIP d
 attention is now bandwidth-bound (~221 GB/s effective on the f16 KV), so the remaining
 tg3314 gap is KV bytes, not kernel structure - which makes KV quantization the next
 lever on that cell rather than further attention work.
+
 
 ## Vulkan tile WM 64->32 falsified on this backend (2026-09-12)
 
@@ -5059,6 +4358,7 @@ Consequence for the Vulkan plan: V1 is closed; the remaining candidates are the 
 coopmat1 path (V2), the FA K/V shared-memory staging (V3) and the attention redesign port
 (V4).
 
+
 ## Vulkan plan V2/V3 assessed; the FA's real fix located (2026-09-12)
 
 **V2 (int8 coopmat1, llama PR #27952) - premise weakened.** The in-tree prototype was
@@ -5085,6 +4385,7 @@ structure viable there, whereas on RDNA3/HIP the `v_dot2_f32_f16` instruction (n
 SPIR-V equivalent) was the second half. Estimated payoff from the FA rewrite is ~1-3% pp
 and <1% tg at Vulkan's current numbers, for a ~2-3 hour shader+host rewrite - recorded so
 the decision is explicit rather than implied.
+
 
 ## KV: f32 original removed - 3x memory cut, bit-identical (2026-09-12)
 
@@ -5117,34 +4418,6 @@ compiles at runtime), so a kernel edit's first feedback used to be a broken mode
 concatenates the kernel assets in `include_str!` order and runs `hipcc -fsyntax-only` in ~2 seconds;
 it is what found the four type errors in this change and would have caught the earlier failed attempt.
 
-## Regression found and fixed: the f32-KV removal missed three launcher paths (2026-09-12)
-
-The f32-KV removal above shipped with a silent breakage on three paths the initial verification did
-not cover, found when the Vulkan agent's acceptance test compared a short prompt across backends:
-
-- **Short prompts** (np <= 128) take the single-kernel `qsa_flash` prefill path, not the split path.
-  That kernel was left f32 while the launcher was switched to the f16 mirror -> garbage output
-  (`? ? ?` from a 5-token prompt; the 300-token test used the split path and was bit-identical).
-- **The MTP draft and the per-sequence (spec/np) paths** pass the KV through `self.kv_k` / a
-  per-row pointer table (`ms_kvk_ptr_to`), all of which still pointed at the now-NULL f32 buffers:
-  `rawhip: d2h-sync: 700` (illegal address) on np4 and on any `--spec` run. The t=1 fused flash in
-  the spec path had the same problem.
-- `LLM170_NO_GQA2D=1` crashed for the same reason (the f32 allocation is conditional on the legacy
-  envs, and that env was missing from the list).
-
-Fixes: `qsa_flash` converted to f16 like the other prefill kernels; an f16 mirror added for the MTP
-KV with conversions at its append sites; the per-seq append loops and the pointer tables switched to
-the mirrors (plus the mirror conversion they were missing entirely); `NO_GQA2D` added to
-`legacy_f32()`; the debug d2h guarded.
-
-Verification after the fix: 5-token coherent, **300-token bit-identical**, np4 no-spec 68 tokens OK,
-**np4 x spec3 31.03 t/s (2.00x llama)** and spec3 single-stream steady **23.5 t/s (2.04x)** - both
-above the previous records - plus `attn-check` 0 outliers and `wmma-attn-check` 0 mismatches.
-
-Lesson for the next kernel-input-type change: the launcher passes `*mut c_void`, so a type mismatch
-between a kernel and its buffers is **silent**. Every launcher of the changed kernel must be grepped
-and every distinct execution path (short prompt, split prefill, spec, np, MTP) token-tested - the
-300-token prompt alone exercises only the split path.
 
 ## Long-context np4 + MTP acceptance: 13k prompts, spec == nonspec exact (2026-09-12)
 
@@ -5164,24 +4437,6 @@ This is the longest-context verification the engine has been through (earlier re
 kernel, the per-sequence KV pointer tables, and the MTP draft - at a scale where a silent corruption
 would be obvious in the text.
 
-## qwen4exp decode: the per-layer MoE grouping round trip is 44% of the step (2026-09-14)
-
-Stage-skip deltas after the L2Rows fix (tg8, two runs each, noise +-4%):
-none 790/887/837 ms, moe.shared 775/771 (about -8 ms/step), **moe.top10 491/478
-(-353 ms over 8 steps = -44 ms/step = 44% of the 100 ms step)**.
-
-The top10 op itself is not the cost: moving its selection arrays from (dynamically
-indexed, hence local-memory) `int sel[64]; float sp[64]` to shared memory changed
-nothing measurable (826.8 ms, bit-identical output). What the skip actually removes
-is the `moe_gen` bump, which invalidates the MoE grouping cache - so the 44 ms is
-the per-layer host round trip: a synchronous d2h of the routing ids, the host builds
-of the perm/inv/rowexp/padded tables, and three h2d uploads, 48 times per step. Each
-d2h flushes the pipeline, which is why the GPU sits near 20% utilisation even though
-the kernels themselves are microseconds.
-
-Fix direction: build those tables on the device (they are pure functions of the ids),
-which removes the round trip and keeps the results bit-identical; the prefill can keep
-the host path. This also unblocks the graph capture facility (segments collapse).
 
 ## qwen4exp: the weight read pattern is the bottleneck (measured 2026-09-14)
 
@@ -5211,21 +4466,6 @@ sequential mode (267 GB/s) applies, at the cost of 2x the bytes - a 36x pattern 
 against a 2x volume loss. The 27B record is corrected accordingly: its decode is not
 at the bandwidth bound, it is at the pattern bound, so P1 applies there too.
 
-
-## P1 (deq-f16 weights) does not transfer to this engine (measured 2026-09-14)
-
-The reference stack's #05 (bf16/f16 dequant cache + tensor-core GEMM, ablation 1.42x
-on a 16384-token prefill) was ported as far as this engine already allowed: the
-dequant_q4k_f16 kernel and the gemm_f16_v4 tensor-core path existed, so a q4_K sibling
-of gemm_f16_q6 was added and wired into both the single-weight and the grouped frame
-GEMMs, gated to t>=128. Measured on pp2048 with --reps 3: 9125.1/8176.9 ms against
-9079.4/8192.9 baseline, i.e. neutral. Reverted.
-
-The reason is visible in the numbers: our prefill runs at 2.8 TFLOPS (5.5% of the f32
-peak) and streams the weights far below DRAM bandwidth, so it is bounded neither by
-compute nor by bandwidth - the deq-f16 route addresses both of those and therefore
-changes nothing. The prefill needs the same treatment the decode got: decompose it by
-stage, find the inefficiency, and fix that. This also lowers P1's priority for the 27B.
 
 
 ## Prefill decomposition (pp2048, --reps 2, warm rep, 2026-09-14)
@@ -5257,6 +4497,7 @@ Across decode, prefill and the 27B the bound is the same 53 GB/s weight-read pat
 so a contiguous f16 weight layout is the common highest-value lever.
 
 
+
 ## Prefill stage timings (pp2048, LLM170_FRAME_TIME, 2026-09-14)
 
 | stage | total ms | calls | per call |
@@ -5281,207 +4522,6 @@ weight traffic at the measured 53 GB/s gives 3.15 s against 3.70 s measured. Not
 also explains why the deq-f16 port was neutral: a contiguous f16 layout does not change
 the access shape, so it doubles the bytes without fixing the pattern.
 
-
-## Direct-ids MoE GEMM for t=1: -8% decode, bit-identical (2026-09-14)
-
-The t=1 MoE no longer builds a grouping at all. Two new kernels
-(q4_gemm_q4k_ge_ids for the gate/up, q4_gemm_q5_1_gm_ids for the down - the down is
-Q5_1 in this quantization, which is why making only the gate/up direct recovered
-nothing: the grouping still fired at the down) read ids[row] directly, so the row
-order is the ids order and the gather, the scatter and the whole host round trip
-(a synchronous ids d2h, the table build, three h2d uploads) disappear. The per-row
-dot products are unchanged, so the diverse-prompt output is bit-identical and the 27B
-is unaffected.
-
-Warm tg8 with --reps 3: 716.7/715.2 before, 673.2/669.2 after = 671.2 ms, i.e. the
-decode goes from 91.3 to 83.9 ms/step (-8%), and the session's total from 131.9 to
-83.9 (-36%). The direct path is the default; LLM170_MOE_GROUPED=1 restores the
-grouped path.
-
-Note on an earlier number: the moe.top10 stage-skip showed -33 ms/step, but that
-measurement leaves stale ids in place so the model degenerates and its GEMMs speed up.
-With the direct path in place the same skip still shows -27 ms/step, which is that
-artefact plus the top-k op itself; the real recoverable grouping cost was the 5.3
-ms/step this change delivers.
-
-
-## Parallel top-k selection in the MoE router: -12 ms/step, bit-identical (2026-09-14)
-
-After the direct-ids change the decode step's kernel list showed q4_moe_top10_m as the
-single largest entry: 13.3 ms/step at 0.278 ms per call for 48 calls, against a
-theoretical ~10 us of work. The cause was the selection: a single lane ran a 512
-iteration stable insertion sort. It is now a k-round warp selection - each of the 32
-lanes owns 16 experts, picks its own best unused one, and a shuffle butterfly
-reduces to the global best, whose lane then consumes that slot; the zeros and the
-weighted sum follow the same order as before, so the diverse-prompt output is
-bit-identical.
-
-Warm tg8 (--reps 3): 673.2/669.2 -> 579.7/568.9 = 574.3 ms, i.e. 83.9 -> 71.8 ms/step.
-Across the session the decode went from 131.9 to 71.8 ms/step (-46%), and against
-llama.cpp's 61 ms/step the gap is now 1.18x, down from 2.16x.
-
-
-## The MoE gate/up GEMM is already near-optimal; the down projection is the gap (2026-09-14)
-
-Arithmetic correction. The t=1 grouped GEMM for the gate/up launches 94 times per
-step at 4.76 ms total (51 us per call), and each call reads ten experts' slices of
-0.92 MB, i.e. 9.2 MB - so the effective pull is 180 GB/s against the 236 GB/s the
-probe measures. The kernel is at ~76% of DRAM and there is little to win there, which
-is exactly why the K-split (4x the blocks) bought 1.4%, the GEMV-style grid (16x the
-blocks, per-output-row tree reduction) was neutral, and the access-pattern probes
-never matched a 10x deficit: the deficit was arithmetic, not architectural. Both
-experiments were reverted.
-
-The real gap is the down projection: q4_gemm_q5_1_gm_ids takes 5.97 ms for 0.43 GB,
-i.e. 72 GB/s against the gate/up's 180 - a 2.5x deficit worth about 4 ms/step. That
-kernel keeps a shared-memory tile load from the grouped form (it stages a 16-row
-weight tile cooperatively) and its per-row expert lookup defeats that staging; giving
-it the gate/up treatment is the next step.
-
-
-## 27B (qwen35) decode kernel breakdown: it is already near the DRAM limit (2026-09-14)
-
-KTRACE of a 27B decode step (88.6 ms of kernels, 40 kernel types):
-
-| kernel | total ms | calls | effective |
-|---|---|---|---|
-| gemm_q5k (n_out=17408) | 14.21 | 51 | ~179 GB/s |
-| gemm_q5k (n_out=5120) | 13.92 | 75 | ~85 GB/s |
-| gemm_xs (n_out=17408) | 10.87 | 46 | ~180 GB/s |
-| gemm_q6k (65535 / 5120) | 10.88 | 27 | ~180 GB/s |
-| gemm_q4k (17408 / 10240) | 7.83 | 42 | ~150 GB/s |
-
-Across the step the model's ~15 GB of weights move at ~169 GB/s, 71% of the 236 GB/s
-the probe measures, and the large FFN GEMMs individually sit at ~179 GB/s. So the 27B's
-decode is close to the practical DRAM limit and there is only ~10-20% of headroom
-there; for this model the earlier "pattern-limited" correction does not apply. Its real
-headroom is the prefill: 363 t/s is 34% of the f32 peak while the weights stream at
-only 10.6 GB/s, i.e. compute/tile limited, which is what the plans/66 P1-style work
-(bf16 tensor-core GEMM, measured 1.42x in the reference stack) targets.
-
-
-## Prefill measurement instrument caveats and the 27B op breakdown (2026-09-14)
-
-`LLM170_PP_PROF` records hipEvents around each raw-path section and is valid only for
-the dense/raw path (the 27B). On the Flash-Next frame path it emits nothing; use the
-stage timers there (and note pp2048 measures 224.5 t/s today, not the earlier figure).
-
-For the 27B at pp512 the sections sum to the full wall, 1,409 ms:
-
-| section | ms | | section | ms |
-|---|---|---|---|---|
-| ffn_gate | 520.6 | | ffn_silu | 28.5 |
-| ffn | 279.2 | | gdn | 18.6 |
-| gdn_mm | 212.8 | | split+l2 | 18.4 |
-| proj | 204.4 | | norm+quant | 21.3 |
-| trace | 95.8 | | head | 5.8 |
-
-The host is not a factor on this path: the same run reports cpu_submit=11.0 ms for the
-whole warm step_batch, so every remaining millisecond is device-side. The four GEMM
-sections (ffn_gate, ffn, gdn_mm, proj) are 1,217 ms or 86%; at 2*512*27e9 FLOP that is
-~19.5 TFLOPS, 34% of the f32 peak, so the lever is the batched GEMM tiles rather than
-anything host-side. Two instruments mislead on this path and should not be trusted for
-it: LLM170_KTRACE sums only 366 ms against a 1,409 ms wall, and LLM170_NOLAUNCH reports
-a 1,014 ms "host skeleton" that contradicts the 11 ms cpu_submit - both are unreliable
-for batched launches. The trace section's 95.8 ms is the PP_PROF instrumentation's own
-hipEventCreate cost, not work.
-
-
-## Why the MoE down projection cannot use the grouped kernel's staging (2026-09-14)
-
-The down projection (Q5_1, direct ids) runs at 72 GB/s. The cause is the weight access
-pattern: each thread owns one (output, row) pair and walks its own weight row, so a warp
-covers 16 consecutive output rows 480 bytes apart - sixteen 32-byte sectors per 64 useful
-bytes, an 8x sector amplification that puts the real DRAM traffic at the limit while the
-useful rate reads as 72 GB/s. `q5_1_gm` avoids this by staging a 16-row weight tile
-cooperatively (its (oo, ww) load has consecutive ww, hence coalesced).
-
-Porting that staging to the direct-ids kernel was attempted and fails structurally: the
-staging invariant is one expert per tile (tile_exp), while the unsorted direct form has a
-different expert per row. An output row's weights must come from sixteen different
-experts (one per row in the tile), so no single shared buffer represents it. The kernel
-was reverted; the diverse baseline is intact.
-
-A warp-per-output-row kernel was designed as the remaining candidate and also fails on
-inspection: q5_1 stores six words per 32-value super-block, so a lane holding whole
-super-blocks walks the row in 24-byte strides and still touches 15 sectors per 80 useful
-bytes, a threefold gain at best rather than the eightfold the pattern suggests. Reaching
-full coalescing requires splitting a lane's work by word role (scale, high bits, four
-quants) and shuffling them back, at which point the kernel's complexity outweighs the
-~2.5 ms/step. Routing the down projection through the sorted grouped path instead costs a
-per-layer permute plus the grouping round trip, which the earlier measurement puts at
-about the same 2.4 ms the coalescing would recover - i.e. neutral. Conclusion: the down
-projection's 6 ms is inherent to the Q5_1 layout under the unsorted direct-ids scheme, and
-the gate/up path's 180 GB/s is not a reachable target for it. The Flash-Next decode
-therefore sits near its practical floor at 70.8 ms/step, with the prefill (MoE down plus
-QSA) as the remaining lever.
-
-
-## Flash-Next prefill split: a quarter of it is the QSA bridge (2026-09-14)
-
-With LLM170_FRAME_TIME the pp2048 frame reports 8,831 ms for the 2048-token chunk
-(223-230 t/s, matching the bench wall of 8,917 ms). The frame's own timer accounts for
-76% of that; the remainder, ~2,119 ms, is the QSA bridge - the read/drain/write round
-trip around each QSA stage. Twelve QSA layers therefore cost ~175 ms each in transfers
-alone, which is a larger and more targeted lever than anything inside the frame stages.
-The Q4_TRACE stage prints only fire on the NaN guard path, so the older per-stage sums
-(21 ms per layer) do not account for the chunked frame's real cost and should not be used
-for the prefill; the frame-total and bridge timers are the trustworthy pair.
-
-
-## Why the QSA bridge costs 24% of the prefill (2026-09-14)
-
-Direct measurement with LLM170_Q4_TIME corrects the earlier frame-timer reading. For the
-2048-token chunk, across 24 QSA calls (12 layers x 2 chunks), the bridge is (note: this
-5.0 s total spans two chunks, so the stage is ~2.5 s per 8.9 s chunk, not the 54% the text
-below originally claimed - see the corrected per-t table at the end of this file):
-
-| part | total | share |
-|---|---|---|
-| read (d2h + drain) | 0.02 s | 0% |
-| stage (host QSA) | 4.74 s | 99% |
-| write (h2d) | 0.05 s | 1% |
-
-So the transfers are irrelevant and the bridge is not really a bridge problem: the host
-QSA stage itself is 4.74 s of CPU work, 81 ms per 1024-token layer call and 54% of the
-8,831 ms frame total - the largest single component of the Flash-Next prefill, and the
-reason the frame timer's 24% figure was wrong (that timer nests inside the frame). The
-per-call heap churn (2048 per-row Vecs then out.concat(), ~98k allocations per forward)
-is real but secondary.
-
-The fix is to move the QSA value path onto the device rather than trimming the round trip
-around it: that removes the 4.74 s of CPU work, the full-synchronisation drain that idles
-the device through it, and the allocation churn together. This is the Flash-Next prefill's
-main remaining lever, and it is an architectural change rather than a tuning one.
-
-
-## The host QSA stage's 4.96 s is two CPU kernels that already exist on the device (2026-09-14)
-
-LLM170_Q4_TIME splits the host stage (2048-token chunk, 24 layer calls) as:
-
-| stage | total (2 chunks) | share of the 5.0 s | per chunk |
-|---|---|---|---|
-| attn (device call + copies + mm_batch) | 1.87 s | 37% | 0.94 s |
-| mm_group | 1.92 s | 38% | 0.96 s |
-| sel_build (host selection list) | 0.71 s | 14% | 0.36 s |
-| sel+proj | 0.52 s | 10% | 0.26 s |
-| wlookup, passB | 0.00 s | 0% | - |
-
-Follow-up instrumentation splits the attention lap and corrects part of the picture. The
-device path is in fact taken - no fallback message fires - and dev_weight caches device
-copies by host pointer, so neither mm_group nor attn is a re-upload. mm_group and attn
-are accelerator work already, run at prefill batch shapes through GEMV-class kernels
-rather than MMQ-class ones. sel_build is the one clearly host-side item at 0.71 s, but it is not the allocation
-churn: rewriting it to reuse a thread-local buffer and fill by push (no zero-initialised
-Vec) measured 0.70 s, i.e. neutral, and was reverted. The cost is the materialisation
-itself - a token selecting top_k blocks expands to top_k*r positions and the whole list is
-written out per call, tens of megabytes at memory-write speed. Removing it means having the
-attention kernel walk the block list directly instead of a flattened index array, which is
-a kernel-interface change rather than a host cleanup. Routing the prefill's QSA through the device kernels therefore removes
-~4.45 s of the 8,831 ms chunk, i.e. about half of the Flash-Next prefill, without writing
-new math. The work is structural - the frame accelerator's interface has to expose the QSA
-op so the QSA layers can run device-resident - and it is the single largest remaining win
-for this model.
 
 
 ## Flash-Next decode kernel composition today (2026-09-14)
@@ -5508,24 +4548,6 @@ fusing them - not retuning them - is the lever. GDN's AR kernel is only 0.83 ms/
 not the 50 ms the older plan recorded, so plans/66 P2 is a prefill-targeted item on this
 codebase.
 
-
-## The Q4_K MMQ-class tile is correct but not faster at prefill shapes (2026-09-14)
-
-q4_gemm_q4k_y (row-batched tile, dequant hoisted out of the row loop) was default-off with
-a comment citing a measured wrong result at ffn_gate_exps t=20. Re-verified:
-
-| check | default | LLM170_Q4K_MMQ=1 | +LLM170_Q4K_Y=1 |
-|---|---|---|---|
-| q4k-micro (16x256, t=16) vs CPU ref | 3.66e-4 | **0.0 (bit-identical)** | 4.88e-4 |
-| Flash-Next diverse 24-token prefill + 8 decode | baseline | **baseline (bit-identical)** | **baseline (bit-identical)** |
-| pp2048 | 9,012-9,118 ms | - | 8,899-9,155 ms |
-
-So the numeric objection no longer holds - the kernel agrees with dot_q4k_q8 exactly on the
-probe and the model stream is unchanged with it enabled. It is still default-off, but now
-for a speed reason: pp2048 is neutral within noise, and q4k-bench at t=20, 2560x640 shows
-0.498 vs 0.434 ms per call, i.e. the tiled form loses at these shapes. That closes the
-tiled-Q4_K route as a lever for the QSA stage's mm_group: the prefill's Q4_K projections
-are not slow because the wrong kernel is selected.
 
 
 ## Flash-Next prefill: the remaining levers are kernel-interface work (2026-09-14)
@@ -5555,191 +4577,6 @@ GEMM at these shapes, not a dispatch or host problem, and it is the item that wo
 the prefill.
 
 
-## The fused f16 dequant gate is not the lever either - it needs a per-graph cache (2026-09-14)
-
-The f16 fused-dequant GEMM was gated to q8_0 only (ty0 == 8) even though dequant_q4k_f16
-and dequant_q6k_f16 were already wired into its dispatcher. Extending the gate to
-matches!(ty0, 8 | 12 | 14) and re-measuring:
-
-- the path is taken: LLM170_F16_DBG=1 shows 48 calls at a 200-token prefill, including the
-  QSA projections ([6144x2560] x12 = wq, [2560x512] x24 = wk/wv/indexer) and the shared
-  expert's FFN ([2560x12288] x12);
-- it is correct: a 200-token prompt (t >= 32, so the gate is actually exercised, unlike the
-  24-token diverse which never reaches it) produces token-for-token the same greedy stream
-  as the default path;
-- it is neutral: pp2048 9,087.8 ms against 9,043.9 ms baseline.
-
-So plans/66 P1's actual content is the part that was skipped: "dequant once per graph and
-cache". Here the dequant runs per call, so every call pays a full dequant pass over the
-weight (8.8 MB Q4_K -> 25 MB f16 written and re-read) and the saving on the integer-ALU
-side is cancelled. The gate extension was reverted as neutral; the recorded next step is a
-graph-scoped dequant cache, which is what would make the f16 WMMA route pay.
-
-
-## Long-context decode: the QSA stage is 58% of the step (2026-09-14)
-
-pp8192 then 4 decode steps, frame timers plus KTRACE (the bench's tg without a long prompt
-never exercises this - n_past is the prompt length, so ctx alone does not reach it):
-
-| item | total | per call |
-|---|---|---|
-| frame-total t=1 (decode step) | 684.7 ms / 5 | 137 ms/step |
-| stage_mm_group | 3,654 ms / 120 | 30 ms |
-| stage_sel+proj | 2,147 ms / 120 | 18 ms |
-| stage_sel_build | 1,617 ms / 120 | 13 ms |
-| stage_attn (host side only) | 144 ms / 60 | 2.4 ms |
-| q4_qsa_attn_sel (KTRACE, device) | 17.1 ms/step | 1.425 ms |
-
-Two things stand out. First, the wall at long context is 195.7 ms/step against 83.9 ms of
-kernels, so over half the step is outside the kernel list even though the host submit cost
-is small elsewhere - that gap is unexplained and is the next thing to attribute. Second,
-within the QSA stage the cost is not the attention kernel but mm_group / sel+proj /
-sel_build, ~62 ms of the 137 ms step; these are host-visible and sync-bound because
-run_prepared ends in a d2h. mm_group at t=1 costing 30 ms is not explained by its transfer
-volume (25 KB), so launch/sync count or prepare_x is the suspect and needs measuring.
-
-The stage timers do not include device time for asynchronous launches: stage_attn reports
-2.4 ms while the same kernel measures 1.425 ms per call in KTRACE, so frame stage timings
-are host-side unless the stage ends in a d2h.
-
-## Corrected QSA stage shares, split by t (2026-09-14, supersedes the 54%/57%/58% figures)
-
-The stage timers mix prefill and decode calls unless t is filtered, and summing them
-without that filter produced three wrong shares earlier in this file. With t as a label:
-
-| stage | t=1 per call | x12 layers = per step | t=2048 per call |
-|---|---|---|---|
-| attn | 2.55 ms | 30.6 ms | 100.97 ms |
-| sel_build | 1.39 ms | 16.7 ms | 32.66 ms |
-| sel+proj | 0.69 ms | 8.3 ms | 41.89 ms |
-| mm_group | 0.40 ms | 4.8 ms | 72.76 ms |
-| total | 5.03 ms | 60.4 ms | 248.3 ms |
-
-So the QSA stage is 42% of the long-context decode step (144.2 ms frame, 83.9 ms of
-kernels), not 58%, and 2.98 s per 8.9 s prefill chunk (33%), not 54-57% - the 5.0 s
-figure was a two-chunk total. In both regimes the largest single stage is attn, and
-KTRACE confirms the attention kernel is the device-side maximum at long context
-(1.425 ms/call, 17.1 ms/step). The stage prints now carry a t label so this cannot
-recur.
-
-
-## QSA decode attention: position splitting (flash-style) lands -12.7% at long context (2026-09-14)
-
-The t=1 attention kernel was latency-bound: `_sel4` puts 4 heads in a warp (register
-limit) and walks the whole selection list serially per warp, so at n_past 8192 a warp
-runs 8192 positions x ~35 cycles = ~200 us - and the t=1 grid is only (1, n_head/8) = 3
-blocks, i.e. almost no parallelism. Measured 1.425 ms/call = 17.1 ms/step.
-
-New: `q4_qsa_attn_sel4s` splits the selection list across (split, head-group) blocks,
-each warp keeping its own online softmax over its chunk, with
-`q4_qsa_attn_sel4s_merge` combining the partials in flash order. Splits adapt to the
-list length (list/32, capped at 64) so short contexts pay nothing.
-
-| measurement | before | after |
-|---|---|---|
-| pp8192 tg, per step | 142.5 ms | 124.4 ms (**-12.7%**) |
-| pp24 tg, per step | 566-576 ms / 8 | 574.6 ms / 8 (no regression) |
-
-The garbage first attempt is worth recording: the partial buffer was laid out
-[head][split][m,l,acc0..7], but acc is per-lane, so 32 lanes overwrote the same ten
-floats and the model diverged after the first token. The layout is now
-[head][split][lane][m,l,acc0..7].
-
-Correctness: the merge changes the summation order, so this is not bit-identical; the
-diverse stream and a 200-token prompt reproduce token-for-token, which is the repo's
-contract for such kernels (same as the q5_1 MMQ tile). LLM170_QSA_SPLIT=0 restores the
-bit-exact path. The 27B is untouched (no QSA) and its timings are unchanged.
-
-
-## QSA attention: 6 heads per warp instead of 4 (2026-09-14)
-
-`_sel4` keeps the gate in registers, so q + gate + acc = 96 floats per lane and 4 heads is
-the ceiling - which means 24 heads split into 6 warps that each read the same K/V rows,
-a 6x re-read. The gate is only needed at the end, so reading it from global there frees
-those registers and lets the same 96-float budget hold 6 heads, cutting the re-read to 4x.
-That matters because the prefill attention is bandwidth-bound: at t=2048 each call moves
-~34 GB against 236 GB/s ~= the measured 101 ms.
-
-`q4_qsa_attn_sel6` (prefill path, chosen when n_head % 12 == 0) and the split kernel (both
-head groups now 6) preserve the arithmetic order exactly, so this is bit-identical - the
-diverse stream and the 200-token prompt reproduce unchanged, with no numerical contract
-relaxed.
-
-| measurement | before | after |
-|---|---|---|
-| pp2048 | 9,012-9,118 ms | 8,748-8,908 ms (-1.6 to -2.9%) |
-| pp8192 tg8 (with the split kernel) | 1,140.3 ms | 1,019.9 ms (-10.6% cumulative) |
-
-LLM170_QSA_H6=0 restores the 4-head kernel.
-
-
-## The Flash-Next prefill GEMMs are flat at ~2.5 TFLOPS across batch sizes (2026-09-14)
-
-q4k-bench on the QSA wq shape (2560x6144, Q4_K, MMQ tile path by default):
-
-| t | ms/call | TFLOPS | weight rate |
-|---|---|---|---|
-| 128 | 1.474 | 2.73 | 6.0 GB/s |
-| 512 | 6.401 | 2.52 | 1.4 GB/s |
-| 1024 | 12.581 | 2.56 | 0.7 GB/s |
-| 2048 | 27.203 | 2.37 | 0.3 GB/s |
-
-Flat efficiency means this is not an occupancy or batch-shape problem: the kernel costs
-the same per FLOP at t=128 as at t=2048, and the weight rate is nowhere near DRAM either,
-so it is per-element cost in the Q4_K dequant/dot path for this shape. That is also why
-the 27B reaches 19.5 TFLOPS with the same kernel family - its n_in/n_out (5120x17408) are
-large enough to amortise the row work. Closing the Flash-Next prefill gap therefore means
-a better tile for short-K wide-N shapes, not a scheduling change.
-
-
-## Removing a redundant KV clone in the QSA stage: -27.6% on long-context decode (2026-09-14)
-
-frame.rs' QSA bridge copied the KV prefix into fresh Vecs on every layer call:
-
-    let ck = seq.kv_k[full_idx][..kn].to_vec();   // kn = n_past_max * n_kv * hd
-
-At n_past 8192 that is 33.6 MB per layer, 403 MB per decode step, and it showed up as the
-sel_build stage timer (1.39 ms/layer = 24 GB/s, exactly the measured memcpy rate). The
-accelerator takes &[f32], so borrowing the slice is sufficient - NLL accepts it because the
-fallback later reborrows seq immutably.
-
-| measurement | before | after |
-|---|---|---|
-| pp8192 tg8 | 1,019.9 ms | **738.4 ms (-27.6%)**, 92.3 ms/step |
-| pp24 tg8 | 566-576 ms | 566.3 ms (unchanged) |
-| diverse stream | baseline | identical (pure refactor) |
-
-The saving exceeds the 16.7 ms/step the copy itself accounts for because the copy also
-pushed the KV out of L2/L3 ahead of the kernels that read it. Cumulative on the long-context
-decode this session: 142.5 -> 92.3 ms/step (-35%).
-
-
-## The KV h2d is not a meaningful cost - measured, and the ptr-keyed device cache is unsound (2026-09-14)
-
-Earlier text in this file attributed ~23 ms/step of the long-context decode to uploading the
-KV prefix every layer (33.6 MB/layer at n_past 8192). That was wrong, and the experiment
-that tried to remove it showed why.
-
-What was built: a per-(host pointer) device cache with delta uploads, plus a `pos0`
-parameter on `qsa_attention_sel` as the explicit reset signal (pos0 == 0 = sequence start).
-The invalidation logic was validated: a short prompt (24 tokens) followed by a longer one
-(200 tokens) in the same process reproduced both single-sequence token streams exactly
-(seq0: 220 248046 198 248045 74455, seq1: 477 871 198 220 3376), so the stale-prefix hazard
-is handled.
-
-It did not help, for two reasons. First, the timing was identical with the cache in place
-(737.5 vs 738.4 ms for pp8192 tg8) even though it was missing on every call, which means
-the upload was never on the critical path. Second, the design itself is unsound: keying on
-the host pointer means a growing prefix needs a larger buffer, and allocating a fresh entry
-per length fills the map (48 entries, ~1 GB) and thrashes; growing the entry in place leaks
-the previous device buffer on each growth until an h2d fails with error 700.
-
-So the context-scaling cost measured earlier (pp2048 103.9 -> pp8192 141.8 ms/step) comes
-from the kernel's K/V reads and the longer selection list, not from the upload. If this is
-revisited, the KV must be device-resident and owned by the frame's sequence state with the
-append done device-side - not a pointer-keyed cache in the adapter. The `pos0` reset idea
-remains valid for that design.
-
 
 ## Attention geometry experiments are below the prefill measurement noise (2026-09-14)
 
@@ -5760,137 +4597,4 @@ than kept on a guess. Two lessons for the next attempt: prefill runs vary by ~3%
 run, so a ~2% effect needs more reps (or a KTRACE comparison, which reports device time
 rather than the wall), and the geometry change is worth re-testing only with that protocol.
 
-
-## The Flash-Next prefill is 55% non-kernel, and the QSA stage is most of it (2026-09-14)
-
-KTRACE for a pp2048 chunk (17 kernel types, 4,006 ms total against a ~8,900 ms wall):
-
-| kernel | total | calls | share |
-|---|---|---|---|
-| q4_gemm_q4k_ge (MoE gate/up grouped) | 785.5 ms | 52 | 20% |
-| gemm_q8_j128 | 760.9 ms | 776 | 19% |
-| q4_gemm_f32_m | 630.3 ms | 288 | 16% |
-| gdn_ar_w_swap | 344.4 ms | 36 | 9% |
-| q4_qsa_attn_sel6 | 286.6 ms | 12 | 7% |
-| q4_rows_permute_u32 | 226.1 ms | 331 | 6% |
-| gemm_q8_0 / quant_q8 / rms_* / hc_* | ~880 ms | | 22% |
-
-CAREFUL - the same instrument caveat recorded for the 27B applies here: KTRACE's sum
-(366 ms) under-measured a 1,409 ms 27B prefill wall by 4x, and this 4,006 ms likewise
-cannot be read as "45% of the chunk is on the device". The table's *relative* ranking is
-useful (one instrument, all kernels) but the split against the wall is not; the earlier
-"4.9 s is host and synchronisation" claim was wrong and is withdrawn. What is measurable
-independently is the stage-timer side (qsa.rs prints t-labelled per-stage times, and those
-do sum to the frame total), which puts 2.98 s of the chunk in the QSA stage.
-The t-labelled stage timers place 2.98 s of that in the QSA stage: mm_group 873 ms,
-attn 1,212 ms, sel+proj 503 ms, sel_build 392 ms. attn is the clearest case - its kernel is
-only 287 ms while the stage reports 1,212 ms, so ~926 ms is the d2h drain waiting on queued
-work, which also fixes the numbers for the earlier "attention is bandwidth-bound" reading:
-the kernel itself is 3.2% of the chunk, not 41% of the QSA stage, and the geometry
-experiment's ceiling was therefore ~143 ms (1.6%) - below the run-to-run noise, which is
-exactly what the inconclusive A/B showed.
-
-The one trustworthy conclusion is narrower: the attention's own kernel is small relative
-to its stage (287 ms against a 1,212 ms stage reading), so the geometry experiment's
-ceiling was ~143 ms (1.6%) - below the run-to-run noise, which is what the inconclusive A/B
-showed. Everything else in this section needs a working device-time instrument before it
-can be acted on.
-
-
-## KTRACE fixed: the prefill is 49% kernels and 43% launch gaps, and the gaps are the lever (2026-09-14)
-
-The KTRACE sum was wrong because ktrace_dump paired events with a heuristic ("consecutive
-events with the same name and gy are a start/end pair"), which breaks whenever the same
-kernel launches repeatedly - exactly what batched shapes do. It now uses the fixed stride-2
-pairing (each launch records exactly two events), the same assumption the gap code already
-used. Validation: the 27B pp512 now reports TOTAL 1,380 ms against a 1,516 ms wall (it was
-366 ms, a 4x under-measurement), and the Flash-Next pp2048 chunk reports 5,088 ms of
-kernels plus 3,839 ms of gaps against an ~8,900 ms wall - fully accounted.
-
-| kernel | total | calls | share |
-|---|---|---|---|
-| gemm_q8_j128 | 1,085.4 ms | 776 | 25% |
-| q4_gemm_q4k_ge (MoE gate/up) | 787.0 ms | 52 | 18% |
-| q4_gemm_f32_m | 609.2 ms | 288 | 14% |
-| gdn_ar_w_swap | 344.6 ms | 36 | 8% |
-| q4_qsa_attn_sel6 | 285.8 ms | 12 | 7% |
-| q4_rows_permute_u32 | 226.3 ms | 331 | 5% |
-| gemm_q8_0 / quant_q8 / rms_* / hc_* | ~950 ms | | 22% |
-
-Launch gaps, by predecessor (3,838.6 ms total):
-
-| after | gap | calls | per call |
-|---|---|---|---|
-| q4_rows_permute_u32 | 1,728.7 ms | 331 | 5.2 ms |
-| gemm_q8_j128 | 722.1 ms | 776 | 0.93 ms |
-| q4_gemm_f32_m | 654.4 ms | 288 | 2.3 ms |
-| q4_qsa_attn_sel6 | 367.1 ms | 12 | 30.6 ms |
-| q4_hc_combine + hc_gate_mean | 325.4 ms | 193 | ~1.7 ms |
-
-The single largest item is therefore the host work that follows rows_permute_u32: 5.2 ms per
-call, 331 calls, 1.73 s per chunk (19% of the prefill). It is host, not device - the gap is
-the device idling while the host prepares the next submission.
-
-One candidate was tested and ruled out: the MoE routing's top-k selection sorts all 512
-expert logits per token (`idx.sort_by` in stages/moe.rs). Replacing it with
-`select_nth_unstable_by` plus a k-element sort - which preserves the selection and is
-bit-identical on the diverse stream - measured neutral at pp2048 (8,940-8,959 vs
-8,878-9,034 ms) and -1.2% at the decode (567.5 vs 574.3 ms per 8 steps), so it was reverted;
-the routing sort is not what the 5.2 ms consists of. The remaining suspects are the
-per-expert host loop in frame_moe_gemm (one GEMM launch per non-empty expert, plans/57's
-mul_mat_id target) and the offsets d2h that precedes it.
-
-A second candidate was also tested and ruled out. The routing loop normalises all 512
-expert logits per token (a third pass of f32 divisions), which at 2048 tokens is ~1M
-divisions ~= 7 ms per layer - the right order of magnitude for the 5.2 ms gap. Narrowing
-that pass to the selected k (bit-identical: the same v/zs per selected expert, summed in
-the same order) left the gap unchanged at 1,716.7 ms against 1,728.7 ms, so it was reverted.
-The arithmetic that made it look promising also shows why it cannot be the whole story: the
-routing runs once per layer (48 times) while the gap is counted 331 times, so most of those
-gaps are the host work for whatever runs next, not the routing. The other gaps are the same shape at smaller scale: host submit
-work after each small launch.
-
-
-## The prefill's MoE grouping is 25 ms per call = ~2.4 s per chunk (27%) (2026-09-14)
-
-Measured with the existing LLM170_MOE_TIME (moe-phase buckets, 604 calls over a cold+warm
-pair):
-
-| phase | total | calls | per call |
-|---|---|---|---|
-| weight | 21.77 s | 144 | 151 ms (one-off cold uploads: 48 layers x 3 tensors = 144) |
-| group | 4.855 s | 192 | 25.3 ms |
-| gemms | 0.005 s | 14 | 0.33 ms |
-| gather | 0.000 s | 4 | 0.12 ms |
-
-The weight bucket is the first-use weight upload (exactly 144 = 48x3, so it is a cold cost,
-not steady state). The group bucket is steady state and is the real item: at 192 calls over
-~2 chunks it is ~2.4 s per chunk, about 27% of the prefill.
-
-Where it comes from: frame_moe_gemm branches on t_cur() == 1. Decode takes the device
-path (d2h_issue, async, deliberately hidden behind the gate/up GEMMs), while the prefill
-takes the host path - a synchronous d2h of the routing ids (rows = t*k_sel = 20,480 u32 =
-80 KB), then a host-side sort into perm/inv/rowexp/tilexp tables, then three h2d's. That
-host path was chosen because the device path pads each expert to 16 rows (bound =
-rows*16+16), which at 20,480 rows is 16x the gather/scatter work - so the device variant is
-t=1 only, with an A/B recorded in the code (host 755.4 ms vs device 1006.9 ms at tg8).
-
-The lever is therefore a device grouping with an exact (unpadded) bound for the prefill, or
-at minimum removing the synchronous 80 KB d2h from the host path. Either way it is the
-largest identified prefill item now that the gap map is trustworthy.
-
-Attempts so far (all reverted). q4_moe_group_t1 computes off_pad as
-`accp += (r + 15) / 16 * 16` per expert, i.e. exactly 16-row alignment, so
-Sigma_e ceil(r_e/16)*16 <= rows + 16*ne is a valid bound and the path's rows*16+16 is a 16x
-overestimate. Enabling the device path for the prefill with the tighter bound (and dropping
-the t_cur()==1 gate) still fails immediately with h2d error 700, so the bound is not what
-breaks: the fault is elsewhere in the device path when it runs at prefill scale (rows
-20,480 against the decode's 10). That was checked: the fault is a second copy of the bound.
-q4_moe_group_t1 also zero-fills perm_pad from max(rp, bound & ~15) up to `int bound =
-rows*16+16` computed *inside the kernel*, so a host that uses a smaller bound writes past
-the allocation. Passing the bound in as an argument (one signature change plus one launcher
-arg) fixed that inconsistency but the run still fails with h2d 700 at the first call, so at
-least one more place still assumes the 16x bound - the padded GEMM/gather path is the
-obvious next suspect. Until all of them agree, the prefill stays on the host path and the
-25.3 ms/call stands.
 
