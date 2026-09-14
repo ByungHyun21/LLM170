@@ -5879,13 +5879,18 @@ The lever is therefore a device grouping with an exact (unpadded) bound for the 
 at minimum removing the synchronous 80 KB d2h from the host path. Either way it is the
 largest identified prefill item now that the gap map is trustworthy.
 
-First attempt, for the record. q4_moe_group_t1 computes off_pad as
+Attempts so far (all reverted). q4_moe_group_t1 computes off_pad as
 `accp += (r + 15) / 16 * 16` per expert, i.e. exactly 16-row alignment, so
 Sigma_e ceil(r_e/16)*16 <= rows + 16*ne is a valid bound and the path's rows*16+16 is a 16x
 overestimate. Enabling the device path for the prefill with the tighter bound (and dropping
 the t_cur()==1 gate) still fails immediately with h2d error 700, so the bound is not what
 breaks: the fault is elsewhere in the device path when it runs at prefill scale (rows
-20,480 against the decode's 10). The next thing to check is the buffer sizing around
-rows_pad, which the device discovers at runtime while the host sizes buffers from the
-conservative bound.
+20,480 against the decode's 10). That was checked: the fault is a second copy of the bound.
+q4_moe_group_t1 also zero-fills perm_pad from max(rp, bound & ~15) up to `int bound =
+rows*16+16` computed *inside the kernel*, so a host that uses a smaller bound writes past
+the allocation. Passing the bound in as an argument (one signature change plus one launcher
+arg) fixed that inconsistency but the run still fails with h2d 700 at the first call, so at
+least one more place still assumes the 16x bound - the padded GEMM/gather path is the
+obvious next suspect. Until all of them agree, the prefill stays on the host path and the
+25.3 ms/call stands.
 
