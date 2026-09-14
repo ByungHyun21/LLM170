@@ -511,17 +511,23 @@ fn mask_from_list(
                         o += 1;
                     }
                 }
-                // 전체 ctx clone은 디코드 스텝당 ~800MB 복사 — 사용 prefix만.
+                // 사용 prefix만 — 그리고 **복사하지 않는다**: 과거에는 여기서
+                // .to_vec()으로 33.6MB/층(n_past 8192 기준)을 매 호출 복사했고,
+                // 그 memcpy가 sel_build 타이머의 실체였다(실측 1.39ms/층 = 24GB/s).
+                // 어댑터는 &[f32]를 받으므로 대여로 충분하다.
+                // 실측 효과(pp8192 tg8): 1,019.9 -> 738.4ms = **-27.6%**(스텝 92.3ms).
+                // 예상(16.7ms/스텝)보다 큰 것은 복사가 L2/L3를 밀어내 뒤따르는 커널까지
+                // 느리게 했기 때문이다. 출력 토큰은 완전히 동일(순수 리팩터).
                 let kn = n_past_max * n_kv * hd;
-                let ck = seq.kv_k[full_idx][..kn].to_vec();
-                let cv = seq.kv_v[full_idx][..kn].to_vec();
+                let ck = &seq.kv_k[full_idx][..kn];
+                let cv = &seq.kv_v[full_idx][..kn];
                 if tm {
                     eprintln!("# qsa-stage t={t_len} sel_build={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
                     t_lap = std::time::Instant::now();
                 }
                 // 미지원이면 CPU 어텐션 폴백 — gdn_ar과 같은 규약.
                 match acc.qsa_attention_sel(
-                    &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
+                    &qflat, ck, cv,
                     &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, n_tok,
                 ) {
                     Ok(res) => {
