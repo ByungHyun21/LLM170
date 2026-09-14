@@ -5850,3 +5850,32 @@ routing runs once per layer (48 times) while the gap is counted 331 times, so mo
 gaps are the host work for whatever runs next, not the routing. The other gaps are the same shape at smaller scale: host submit
 work after each small launch.
 
+
+## The prefill's MoE grouping is 25 ms per call = ~2.4 s per chunk (27%) (2026-09-14)
+
+Measured with the existing LLM170_MOE_TIME (moe-phase buckets, 604 calls over a cold+warm
+pair):
+
+| phase | total | calls | per call |
+|---|---|---|---|
+| weight | 21.77 s | 144 | 151 ms (one-off cold uploads: 48 layers x 3 tensors = 144) |
+| group | 4.855 s | 192 | 25.3 ms |
+| gemms | 0.005 s | 14 | 0.33 ms |
+| gather | 0.000 s | 4 | 0.12 ms |
+
+The weight bucket is the first-use weight upload (exactly 144 = 48x3, so it is a cold cost,
+not steady state). The group bucket is steady state and is the real item: at 192 calls over
+~2 chunks it is ~2.4 s per chunk, about 27% of the prefill.
+
+Where it comes from: frame_moe_gemm branches on t_cur() == 1. Decode takes the device
+path (d2h_issue, async, deliberately hidden behind the gate/up GEMMs), while the prefill
+takes the host path - a synchronous d2h of the routing ids (rows = t*k_sel = 20,480 u32 =
+80 KB), then a host-side sort into perm/inv/rowexp/tilexp tables, then three h2d's. That
+host path was chosen because the device path pads each expert to 16 rows (bound =
+rows*16+16), which at 20,480 rows is 16x the gather/scatter work - so the device variant is
+t=1 only, with an A/B recorded in the code (host 755.4 ms vs device 1006.9 ms at tg8).
+
+The lever is therefore a device grouping with an exact (unpadded) bound for the prefill, or
+at minimum removing the synchronous 80 KB d2h from the host path. Either way it is the
+largest identified prefill item now that the gap map is trustworthy.
+
