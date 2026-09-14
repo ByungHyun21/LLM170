@@ -5713,3 +5713,30 @@ The saving exceeds the 16.7 ms/step the copy itself accounts for because the cop
 pushed the KV out of L2/L3 ahead of the kernels that read it. Cumulative on the long-context
 decode this session: 142.5 -> 92.3 ms/step (-35%).
 
+
+## The KV h2d is not a meaningful cost - measured, and the ptr-keyed device cache is unsound (2026-09-14)
+
+Earlier text in this file attributed ~23 ms/step of the long-context decode to uploading the
+KV prefix every layer (33.6 MB/layer at n_past 8192). That was wrong, and the experiment
+that tried to remove it showed why.
+
+What was built: a per-(host pointer) device cache with delta uploads, plus a `pos0`
+parameter on `qsa_attention_sel` as the explicit reset signal (pos0 == 0 = sequence start).
+The invalidation logic was validated: a short prompt (24 tokens) followed by a longer one
+(200 tokens) in the same process reproduced both single-sequence token streams exactly
+(seq0: 220 248046 198 248045 74455, seq1: 477 871 198 220 3376), so the stale-prefix hazard
+is handled.
+
+It did not help, for two reasons. First, the timing was identical with the cache in place
+(737.5 vs 738.4 ms for pp8192 tg8) even though it was missing on every call, which means
+the upload was never on the critical path. Second, the design itself is unsound: keying on
+the host pointer means a growing prefix needs a larger buffer, and allocating a fresh entry
+per length fills the map (48 entries, ~1 GB) and thrashes; growing the entry in place leaks
+the previous device buffer on each growth until an h2d fails with error 700.
+
+So the context-scaling cost measured earlier (pp2048 103.9 -> pp8192 141.8 ms/step) comes
+from the kernel's K/V reads and the longer selection list, not from the upload. If this is
+revisited, the KV must be device-resident and owned by the frame's sequence state with the
+append done device-side - not a pointer-keyed cache in the adapter. The `pos0` reset idea
+remains valid for that design.
+
