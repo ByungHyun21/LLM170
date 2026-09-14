@@ -1149,7 +1149,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // 소비 시점(층 하단)까지 gate/up GEMM이 지연을 덮는다.
                     // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
                     // 호스트 경로와 같은 순서 조건을 만들어 순서 효과를 검정한다.
-                    let pinned_off = if std::env::var_os("LLM170_MOE_GROUP_SYNC").is_some() {
+                    // 이분법: 비동기 예약 자체를 건너뛴다(폴백은 동기 d2h로).
+                    let pinned_off = if std::env::var_os("LLM170_MOE_GROUP_NOD2H").is_some() {
+                        std::ptr::null_mut()
+                    } else if std::env::var_os("LLM170_MOE_GROUP_SYNC").is_some() {
                         let buf = self.ctx.d2h_issue((ne + 1) * 4, offd as *const u8)?;
                         self.ctx.d2h_wait()?;
                         buf
