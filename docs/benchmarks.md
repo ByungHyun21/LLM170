@@ -261,7 +261,21 @@ pp8000+tg32 91 -> 87.0 ms/step (the t=1 split-attention path must be routed
 through the device-side split kernel pair, otherwise decode regresses to
 122.7 ms). Gate: 208-token Korean prompt stream identical, 12/12 tests.
 
-### 27B prefill: HIP is 8.4x behind the Vulkan backend (2026-09-14)
+### 27B prefill: the 8.4x HIP gap was one broken kernel default - CLOSED (2026-09-14)
+
+Follow-up measurement traced the gap: KTRACE showed only 1.4s of GPU kernels
+in a 13.4s pp512 run with 12s attributed as a "gap after kv_f16" - but
+launch3_dyn records no kernel events, so that "gap" was the qsa_flash_wmma
+attention kernel itself executing. A/B: WMMA 38.2 t/s vs the wk8 scalar tile
+364.2 t/s (**9.5x**) on this ROCm/HIP build - the wmma_ok() probe passes
+(silent emulation/spill suspected; it was the best variant in the Vulkan era).
+WMMA is now opt-in (LLM170_WK_WMMA=1). Result: pp512 38.2 -> **365.1 t/s**,
+pp2048 **339.5 t/s**, decode 86.6 ms unchanged; attn-check 50M elements zero
+mismatches above 1e-4; gates and 12/12 tests pass. The primary plans/66 goal
+(llama.cpp pp512 350-360 parity) now holds on HIP as well. The section below
+is kept for the measurement-discipline note.
+
+### 27B prefill: HIP is 8.4x behind the Vulkan backend (2026-09-14) [resolved above]
 
 `bench --pp 512 --ctx 4096`, same binary, same machine, alternating runs:
 HIP 38.1-38.5 t/s (13.3-13.4 s) vs Vulkan 321.6 t/s (1.59 s). Decode is NOT
