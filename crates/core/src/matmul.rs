@@ -390,6 +390,10 @@ pub trait FrameState {
     /// 가중합/split3)이 이 값을 쓴다.
     fn frame_begin(&self, _t: usize) {}
 
+    /// 컨텍스트 길이 주입 — 가속기가 KV 등 **상한이 정해진 풀을 선할당**하는 데 쓴다
+    /// (llama.cpp/vLLM처럼 "한 번 잡고 그 안에서만"). 기본은 무시.
+    fn set_ctx_len(&self, _n: usize) {}
+
     /// GDN AR 상태 갱신 (gdn_ar의 프레임 변형) — states·out 상주, 판독 없음.
     #[allow(clippy::too_many_arguments)]
     fn frame_gdn_ar(

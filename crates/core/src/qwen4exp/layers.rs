@@ -154,6 +154,12 @@ impl Engine4 {
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
+        // 컨텍스트 길이를 가속기에 주입한다 — KV 등 상한이 정해진 풀을 **선할당**하게
+        // 하기 위함(호스트 KV는 SeqState4가 ctx로 이미 잡혀 있다, model/mod.rs:331 참조).
+        let (n_kv, hd) = (self.model.hp.n_kv.max(1), self.model.hp.head_dim.max(1));
+        if let Some(k) = self.seqs.first().and_then(|s| s.kv_k.first()) {
+            acc.set_ctx_len(k.len() / (n_kv * hd));
+        }
         self.acc = Some(acc);
         self
     }
