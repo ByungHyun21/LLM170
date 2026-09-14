@@ -1747,9 +1747,17 @@ gmark("attn", &mut marks);
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
                         let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
                         if wk16 {
+                            // WMMA 타일 판은 **옵트인**(LLM170_WK_WMMA=1)으로 강등
+                            // (2026-09-14, plans/69): 이 기기의 ROCm/HIP 빌드에서
+                            // wmma_ok() 프로브는 통과하지만 실측이 파탄이다 —
+                            // pp512 38.2 t/s vs wk8 364.2 t/s(**9.5×**). 커널이
+                            // 에뮬레이션/스필 경로로 떨어지는 것으로 추정(원인은
+                            // 미상 — VK 시대 기록 361.3과 같은 수치를 냈던 판이다).
+                            // launch3_dyn이 KTRACE 이벤트를 안 남겨 'kv_f16 뒤
+                            // 갭 12s'로 위장한 게 이 어텐션 커널 시간이었다.
                             if wk
                                 && hd == 256
-                                && std::env::var_os("LLM170_NO_WK_WMMA").is_none()
+                                && std::env::var_os("LLM170_WK_WMMA").is_some()
                                 && super::probes::wmma_ok()
                             {
                                 // WMMA 타일 판(기본): Q_in_reg + Q 버퍼를 K/V 로 재사용. 공유 32768B.
