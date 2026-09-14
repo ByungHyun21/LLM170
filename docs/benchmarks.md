@@ -5232,3 +5232,28 @@ from 3.3 s to ~0.9 s, about -27% of the prefill. The QSA follows.
 Across decode, prefill and the 27B the bound is the same 53 GB/s weight-read pattern,
 so a contiguous f16 weight layout is the common highest-value lever.
 
+
+## Prefill stage timings (pp2048, LLM170_FRAME_TIME, 2026-09-14)
+
+| stage | total ms | calls | per call |
+|---|---|---|---|
+| gemm3 (MoE 3 GEMMs) | 3704.7 | 48 | 77 ms |
+| qsa_bridge | 2526.7 | 12 | 210 ms |
+| rms | 539.2 | 96 | 5.6 ms |
+| ple_bridge | 476.7 | 1 | - |
+| mm_group | 357.4 | 36 | 9.9 ms |
+| ar | 344.9 | 36 | 9.6 ms |
+| route | 324.7 | 48 | 6.8 ms |
+| down / out / up / gate | ~560 | 96 each | 1-3 ms |
+
+The QSA is compute-bound and healthy: a full 2048-token attention over 12 layers is
+about 123 TFLOP, i.e. 2.4 s at the measured 51 TFLOPS, against 2.53 s measured - 95%
+of the roof. Its 28% share is specific to this short-chunk measurement, because at
+2048 tokens the top-2048 selection still includes every key; over a real 11750-token
+prompt the sparsity bites and the share falls. No waste to recover there.
+
+The MoE (gemm3) is the same pattern-limited story as the decode: 167 GB of reread-aware
+weight traffic at the measured 53 GB/s gives 3.15 s against 3.70 s measured. Note this
+also explains why the deq-f16 port was neutral: a contiguous f16 layout does not change
+the access shape, so it doubles the bytes without fixing the pattern.
+
