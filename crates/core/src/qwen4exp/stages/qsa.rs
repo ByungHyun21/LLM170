@@ -502,6 +502,10 @@ fn mask_from_list(
                 let kn = n_past_max * n_kv * hd;
                 let ck = seq.kv_k[full_idx][..kn].to_vec();
                 let cv = seq.kv_v[full_idx][..kn].to_vec();
+                if tm {
+                    eprintln!("# qsa-stage sel_build={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                    t_lap = std::time::Instant::now();
+                }
                 // 미지원이면 CPU 어텐션 폴백 — gdn_ar과 같은 규약.
                 match acc.qsa_attention_sel(
                     &qflat, &ck[..n_past_max * n_kv * hd], &cv[..n_past_max * n_kv * hd],
