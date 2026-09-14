@@ -499,6 +499,16 @@ extern "C" __global__ void q4_gemm_q5_1_gm_ids(const unsigned* xq, const unsigne
     out[(size_t)r * n_out + o] = acc;
 }
 
+// K-분할 부분합 리덕션 — k 오름차순(결정적).
+extern "C" __global__ void q4_gemm_q4k_ids_reduce(const double* __restrict__ part,
+                                                  float* __restrict__ out, int n, int ksplit) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    double s = 0.0;
+    for (int k = 0; k < ksplit; k++) s += part[(size_t)i * ksplit + k];
+    out[i] = (float)s;
+}
+
 // q4_K MMQ급 타일 — 16출력 × 16행, 스레드당 (출력,행) 직렬 누산(스레드당 수백
 // 바이트). 산술은 core `dot_q4k_q8`과 **동일 순서**(it 0..3, 각 it에서
 // 저니블→고니블 순 가산)라 비트 동일이 기대된다 — q4-acc-check로 확인.
@@ -843,8 +853,14 @@ extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned
     const unsigned* xr = xq;   // t=1: 전 행이 같은 입력 벡터(0번 행)
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
+    // K-분할: z축이 슈퍼블록 구간을 나눠 블록 수를 ksplit배로(타일 40블록=1/CU
+    // 이던 점유율을 올려 K-루프 로드 지연을 가린다). 부분합은 part에 남기고
+    // reduce 커널이 k 오름차순으로 합산(결정적).
+    const int ksplit = (int)gridDim.z;
+    const int s0 = (int)(((long)n_super * blockIdx.z) / ksplit);
+    const int s1 = (int)(((long)n_super * (blockIdx.z + 1)) / ksplit);
     float acc = 0.0f;
-    for (int sIdx = 0; sIdx < n_super; sIdx++) {
+    for (int sIdx = s0; sIdx < s1; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
         float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
         float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
@@ -890,7 +906,11 @@ extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned
             acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
         }
     }
-    out[(size_t)r * n_out + o] = acc;
+    if (ksplit > 1) {
+        part[((size_t)r * n_out + o) * ksplit + blockIdx.z] = (double)acc;
+    } else {
+        out[(size_t)r * n_out + o] = acc;
+    }
 }
 
 

@@ -1099,9 +1099,19 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && std::env::var_os("LLM170_MOE_GROUPED").is_none()
         {
             let idp = self.fptr(ids)?;
+            // K-분할: 타일 40블록(=1/CU)이던 점유율을 ksplit배로. 부분합은 part에
+            // 남기고 reduce가 k 오름차순 합산(결정적, 순서 재결합만 다른 미세 드리프트).
+            let ksplit: u32 = std::env::var("LLM170_MOE_KSPLIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+                .clamp(1, 8);
             let mut x_p = xq as *mut std::ffi::c_void;
             let mut w_p = wd as *mut std::ffi::c_void;
-            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let part_buf = self
+                .ctx
+                .scratch(rows * n_out * ksplit as usize * 8)?;
+            let mut part_p = part_buf as *mut std::ffi::c_void;
             let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
             let mut ip = idp as *mut std::ffi::c_void;
             let (mut ni, mut no) = (n_in as i32, n_out as i32);
@@ -1124,10 +1134,30 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 "q4_gemm_q4k_ge_ids",
                 n_out.div_ceil(16) as u32,
                 rows.div_ceil(16) as u32,
-                1,
+                ksplit,
                 256,
                 &mut args,
             )?;
+            if ksplit > 1 {
+                let mut pp = part_buf as *mut std::ffi::c_void;
+                let mut op2 = self.fptr(out)? as *mut std::ffi::c_void;
+                let mut nn = (rows * n_out) as i32;
+                let mut ks = ksplit as i32;
+                let mut rargs: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                    (&mut op2) as *mut _ as *mut std::ffi::c_void,
+                    (&mut nn) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ks) as *mut _ as *mut std::ffi::c_void,
+                ];
+                self.ctx.launch3(
+                    "q4_gemm_q4k_ids_reduce",
+                    ((rows * n_out) as u32).div_ceil(256),
+                    1,
+                    1,
+                    256,
+                    &mut rargs,
+                )?;
+            }
             return Ok(());
         }
         let ne = n_expert_stack.max(1);
