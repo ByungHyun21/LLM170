@@ -200,26 +200,32 @@ pub fn ktrace_dump() -> String {
     let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
     let mut total = 0.0f64;
     let mut gaps = 0.0f64;
-    let mut i = 0usize;
+    // 쌍은 **고정 stride-2**다: 런치마다 (start, end)를 정확히 2개 기록한다.
+    // 종전 휴리스틱("연속 같은 (name,gy) = 쌍")은 같은 커널이 연속 런치될 때
+    // end→start를 한 쌍으로 묶어 합계를 통째로 어긋나게 했다 — 배치 형상에서
+    // 흔하고, 27B pp512에서 합계 366ms 대 벽 1,409ms(4배 과소)로 나타났다
+    // (2026-09-14 규명). 갭도 같은 순회에서 end(k) → start(k+1)로 잰다.
+    let npair = evs.len() / 2;
     unsafe {
-        while i + 1 < evs.len() {
-            if evs[i].0 == evs[i+1].0 && evs[i].2 == evs[i+1].2 {
-                let mut ms = 0f32;
-                if hip::hipEventElapsedTime(&mut ms, evs[i].1 as *mut _, evs[i+1].1 as *mut _) == hip::hipError_t_hipSuccess {
-                    let ent = sums.entry((evs[i].0, evs[i].2)).or_insert((0.0, 0));
-                    ent.0 += ms as f64; ent.1 += 1;
-                    total += ms as f64;
+        for k in 0..npair {
+            let (st, en) = (&evs[2 * k], &evs[2 * k + 1]);
+            // 짝이 어긋난 런치(다른 커널과 섞임)면 방어적으로 건너뛴다.
+            if st.0 != en.0 || st.2 != en.2 {
+                continue;
+            }
+            let mut ms = 0f32;
+            if hip::hipEventElapsedTime(&mut ms, st.1 as *mut _, en.1 as *mut _) == hip::hipError_t_hipSuccess {
+                let ent = sums.entry((st.0, st.2)).or_insert((0.0, 0));
+                ent.0 += ms as f64;
+                ent.1 += 1;
+                total += ms as f64;
+            }
+            if k + 1 < npair {
+                let nst = &evs[2 * (k + 1)];
+                let mut gm = 0f32;
+                if hip::hipEventElapsedTime(&mut gm, en.1 as *mut _, nst.1 as *mut _) == hip::hipError_t_hipSuccess {
+                    gaps += gm as f64;
                 }
-                i += 2;
-            } else {
-                // 쌍이 아님 → 직전 end에서 이 start까지 갭
-                if i > 0 {
-                    let mut ms = 0f32;
-                    if hip::hipEventElapsedTime(&mut ms, evs[i-1].1 as *mut _, evs[i].1 as *mut _) == hip::hipError_t_hipSuccess {
-                        gaps += ms as f64;
-                    }
-                }
-                i += 1;
             }
         }
         // 런치 갭: end(N)→start(N+1) 같은 스트림 상 연속
