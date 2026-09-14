@@ -1621,7 +1621,7 @@ impl RawCtx {
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
                 one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _,
+                ntx_fd.as_mut_ptr() as *mut _,
             ];
             let tag: &'static str = match ty {
                 12 => "mmq_q4k",
@@ -1754,7 +1754,7 @@ impl RawCtx {
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
                 one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
                 z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _,
+                ntx_fd.as_mut_ptr() as *mut _,
             ];
             ck(hip::hipModuleLaunchKernel(fm, ((n_out + 127) / 128) as u32, ((t + 127) / 128) as u32, 1, 32, 8, 1, smem as u32, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
         if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
