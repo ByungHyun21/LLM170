@@ -702,7 +702,25 @@ impl RawCtx {
     ) -> Result<(), String> {
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
+            // KTRACE 훅 — 프레임 경로의 dense GEMM이 전부 이 경로(stream2)를 쓴다.
+            // 훅이 없어 프레임 트레이스에서 통째로 누락되던 버그(2026-09-14).
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev0, 0);
+                    hip::hipEventRecord(ev0, self.stream2);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                }
+            }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
+            if let Ok(mut g) = KTRACE.lock() {
+                if g.is_some() {
+                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                    hip::hipEventCreateWithFlags(&mut ev, 0);
+                    hip::hipEventRecord(ev, self.stream2);
+                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                }
+            }
         }
         Ok(())
     }
