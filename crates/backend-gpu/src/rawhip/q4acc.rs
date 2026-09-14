@@ -1822,6 +1822,80 @@ impl Q4Acc {
         Ok(out)
     }
 
+    /// plans/67 1단계: **디바이스 q판** — q가 wq의 frame_mm_group 출력(디바이스)에
+    /// 이미 있을 때 h2d 없이 어텐션을 돌고 결과를 디바이스 out에 쓴다(d2h도 없음).
+    /// k/v는 기존 풀 업로드 경로(실측: KV 업로드는 유의미한 비용이 아님).
+    /// 산술은 `qsa_attn_sel6_raw`와 동일(같은 커널) → 비트 동일 기대.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_attn_dev_raw(
+        &self,
+        q: u64,
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        let (qdev, kdev, vdev, sdev, ofdev, odev) = {
+            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
+            let qdev = a.ensure(&self.ctx, t.max(1) * n_head * 2 * hd * 4)?;
+            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(1) * 4)?;
+            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(1) * 4)?;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
+            let mut f2 = self.atn.lock().map_err(|e| e.to_string())?;
+            let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
+            (qdev, kdev, vdev, sdev, ofdev, odev)
+        };
+        let _ = qdev; // q는 인자로 받은 디바이스 버퍼를 그대로 쓴다(업로드 없음).
+        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
+        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
+        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
+        let mut q_p = self.fptr(q)? as *mut std::ffi::c_void;
+        let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
+        let mut k_p = kdev as *mut std::ffi::c_void;
+        let mut v_p = vdev as *mut std::ffi::c_void;
+        let mut si_p = sdev as *mut std::ffi::c_void;
+        let mut so_p = ofdev as *mut std::ffi::c_void;
+        let mut sc = kq_scale;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        let (kern, gy, blk) = if use6 {
+            ("q4_qsa_attn_sel6", (n_head / 12) as u32, 256u32)
+        } else {
+            ("q4_qsa_attn_sel4", (n_head / 8) as u32, 256u32)
+        };
+        let gx = t.div_ceil(4) as u32;
+        self.ctx.launch3(kern, gx, gy, 1, blk, &mut args)?;
+        Ok(())
+    }
+
     /// t=1 위치 분할판 — 선택목록을 n_splits로 쪼개 (split, 헤드묶음) 그리드로
     /// 펼친다. `_sel4`는 워프가 목록 전체를 직렬 순회해 t=1에서 지연 바운드다
     /// (실측 1.425ms/콜). 부분 (m,l,acc)를 남기고 2차 커널이 flash 규약으로
@@ -2095,6 +2169,23 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             self.run_prepared(xf, xq, xq_w, t, w, 0, o)?;
         }
         Ok(())
+    }
+
+    fn qsa_attention_dev(
+        &self,
+        q: u64,
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
     }
 
     fn matmul_paired(
