@@ -207,6 +207,19 @@ for the current tree:
 block-key cache, the indexer q rows and the layer output, which localizes a
 divergence to a specific path (it is what pinned bug 2 to the qg normalization).
 
+### 27B prefill: HIP is 8.4x behind the Vulkan backend (2026-09-14)
+
+`bench --pp 512 --ctx 4096`, same binary, same machine, alternating runs:
+HIP 38.1-38.5 t/s (13.3-13.4 s) vs Vulkan 321.6 t/s (1.59 s). Decode is NOT
+affected (HIP tg32 11.62 t/s = 86 ms/step, matching the recorded 87 ms).
+Cause: the 27B prefill optimizations from the Vulkan era (MMQ routing, tile
+kernels, f32 family - see the 2026-09-05/06 entries) live in `rawvk`; the
+`rawhip` prefill path for the dense 27B model was never ported. Verified not a
+regression of this session: `git stash` A/B on the warning cleanup reproduces
+38 t/s on both sides. Note for tracking numbers: "pp512 352-360 t/s" in older
+notes is a Vulkan-era figure - always record the runtime with a pp number.
+Reproduce: `scripts/gate-27b.sh --bench` then `RUNTIME=vulkan scripts/gate-27b.sh --bench`.
+
 ### The residual idle is per-kernel-transition, ~60 us each (pp512, current build)
 
 Re-profiling after the host-side changes (thread caps, parallel pass A):
