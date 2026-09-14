@@ -34,13 +34,13 @@ Interleaved A/B, same binaries, same day (llama-bench from our source tree,
 LLM170 current build; **run sequentially** - two concurrent GPU benches on
 this APU collapse to half rate, which initially masqueraded as a ROCm 10 leak):
 
-| 27B Q4_K_XL | llama 7.2.2 | llama ROCm 10 | LLM170 7.2.2 | LLM170 ROCm 10 |
-|---|---|---|---|---|
-| pp418 | 224.9 ±95* | **316.7 ±14** | 308.5 | **320.5** |
-| pp3314 | 244.8 | **314.4 ±38** | 330.0 | **337.9** |
-| tg16 (post-418) | 9.82 | **11.26** | 11.38 | **11.65** |
-| tg16 (post-3314) | - | 11.26 | 11.33 | 11.29 |
-| pp512 | - | - | 365.1 | **371-378** |
+| 27B Q4_K_XL | llama 7.2.2 | llama ROCm 10 | LLM170 ROCm 10 (final) |
+|---|---|---|---|
+| pp418 | 224.9 ±95* | **316.7 ±14** | **319-325** |
+| pp3314 | 244.8 | **314.4 ±38** | **332-338** |
+| tg16 (post-418) | 9.82 | **11.26** | **11.66** |
+| tg16 (post-3314) | - | 11.26 | 10.9-11.3 |
+| pp512 | - | - | **365-378** |
 
 (*first-rep warmup; llama's own spread was large at r=2.)
 
