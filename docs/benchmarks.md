@@ -5402,9 +5402,17 @@ different expert per row. An output row's weights must come from sixteen differe
 experts (one per row in the tile), so no single shared buffer represents it. The kernel
 was reverted; the diverse baseline is intact.
 
-The correct fix is a warp-per-output-row kernel: the warp's 32 lanes walk one weight row
-consecutively (coalesced) and reduce with a shuffle tree, with the cross-warp combine done
-through the existing deterministic K-split reducer. The PLE/gate/up path already reads
-180 GB/s with the same direct-ids scheme, so the down projection's ~2.5 ms/step is real
-and reachable, but it is a new kernel rather than a port of the grouped one.
+A warp-per-output-row kernel was designed as the remaining candidate and also fails on
+inspection: q5_1 stores six words per 32-value super-block, so a lane holding whole
+super-blocks walks the row in 24-byte strides and still touches 15 sectors per 80 useful
+bytes, a threefold gain at best rather than the eightfold the pattern suggests. Reaching
+full coalescing requires splitting a lane's work by word role (scale, high bits, four
+quants) and shuffling them back, at which point the kernel's complexity outweighs the
+~2.5 ms/step. Routing the down projection through the sorted grouped path instead costs a
+per-layer permute plus the grouping round trip, which the earlier measurement puts at
+about the same 2.4 ms the coalescing would recover - i.e. neutral. Conclusion: the down
+projection's 6 ms is inherent to the Q5_1 layout under the unsorted direct-ids scheme, and
+the gate/up path's 180 GB/s is not a reachable target for it. The Flash-Next decode
+therefore sits near its practical floor at 70.8 ms/step, with the prefill (MoE down plus
+QSA) as the remaining lever.
 
