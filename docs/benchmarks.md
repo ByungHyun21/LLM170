@@ -278,6 +278,30 @@ warm, and every component it adds has been measured cheap in isolation (group ke
 variants make no difference. That unexplained 27 ms is what gates reaching llama
 parity, and it needs device-side timestamps or a counter-based method to resolve.
 
+## Correction: the weight reads are not bandwidth-limited, they are latency-limited (2026-09-14)
+
+A fifth probe mode reads the same buffer fully coalesced (lane = consecutive word,
+one 128-byte transaction per warp), and it settles the question:
+
+| mode | pattern | touched bandwidth |
+|---|---|---|
+| 0 | sequential scalar 4 B | 264 GB/s |
+| 3 | a thread streaming its own row (the GEMM shape) | 239 GB/s |
+| 5 | fully coalesced (lane = word) | 236 GB/s |
+
+Every pattern touches memory at 235-264 GB/s, so the DRAM delivers full bandwidth
+regardless of shape, and the "53 GB/s effective" seen for the grouped MoE GEMM is not
+a memory ceiling. The real GEMMs run at 42-53 GB/s, i.e. in the coalesced class, and
+they are at about 1% of the f32 compute roofline and ~20% of memory bandwidth at the
+same time - so they are latency-bound, with a small amount of work per block and a
+dependency chain that the memory latency dominates.
+
+That invalidates the contiguous-f16 thesis (and explains, for the second time, why the
+deq-f16 port measured neutral: it doubles the bytes without addressing latency), and
+the plan of record becomes: increase per-block work or waves so the latency hides.
+The earlier unroll and row-per-thread experiments were neutral, so the remaining
+levers are the tile/wave configuration and explicit prefetch depth.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
