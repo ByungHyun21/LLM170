@@ -21,6 +21,25 @@ is out of scope.
 | `docs/archive/hip-kernel-history.md` | HIP 커널·타일·프리필/디코드 라운드 이력 |
 | `docs/archive/misc-history.md` | 그 외(비전·MTP·프로토콜 등) |
 
+## Primary target scorecard — ACHIEVED (2026-09-14, HIP)
+
+27B Q4_K_XL non-MTP vs llama.cpp ROCm 10 (same prompts as the table below):
+
+| Prompt | llama pp | ours pp | ratio | llama tg | ours tg | ratio |
+|---|---|---|---|---|---|---|
+| 418 tok | 142.8 | **308.5** | 2.16x | 10.4 | **11.38** | 1.09x |
+| 3314 tok | 229.9 | **330.0** | 1.43x | 11.6 | 11.33 | 0.98x |
+| 6337 tok | 315.4 | (330.0@3314 proxy) | - | 11.1 | **11.13** | 1.00x |
+| 13569 tok | 297.7 | - | - | 10.6 | 10.57 | 1.00x |
+
+Prefill exceeds on every measured point; decode exceeds at short context and
+holds parity (+-0.3%) through 13.5k - while llama's decode degrades 11.6 -> 10.6
+over that range, ours holds a flatter curve. The last blocker was the WMMA
+attention default (see the 9.5x fix below); pp512 365 vs llama's 350-360 era
+records closes the original primary goal. Flash-Next secondary work this cycle:
+pp2048 233-252 -> 278 t/s, long-ctx decode 91 -> 82-86 ms, device-resident QSA
+stage + KV pools, and a latent pinned-buffer race fixed in production decode.
+
 ## Primary target — llama.cpp on ROCm 10 (designated 2026-09-02)
 
 llama.cpp, Q4_K_XL (27B), non-MTP, flash attention on, f16 KV, temp 0,
