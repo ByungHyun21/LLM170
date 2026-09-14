@@ -5452,3 +5452,25 @@ around it: that removes the 4.74 s of CPU work, the full-synchronisation drain t
 the device through it, and the allocation churn together. This is the Flash-Next prefill's
 main remaining lever, and it is an architectural change rather than a tuning one.
 
+
+## The host QSA stage's 4.96 s is two CPU kernels that already exist on the device (2026-09-14)
+
+LLM170_Q4_TIME splits the host stage (2048-token chunk, 24 layer calls) as:
+
+| stage | total | share | calls |
+|---|---|---|---|
+| attn | 2.29 s | 46% | 24 |
+| mm_group | 2.16 s | 44% | 72 |
+| sel+proj | 0.51 s | 10% | 72 |
+| wlookup, passB | 0.00 s | 0% | 72 |
+
+attn and mm_group together are 90% of it, and both are CPU implementations of operations
+the raw path already runs on the device: mm_group is the grouped Q4_K GEMM
+(q4_gemm_q4k_ge_ids) and attn is qsa_flash / qsa_mix2 / qsa_score, all of which the decode
+path exercises and the correctness gates cover. The frame path simply has a second, host
+QSA implementation. Routing the prefill's QSA through the device kernels therefore removes
+~4.45 s of the 8,831 ms chunk, i.e. about half of the Flash-Next prefill, without writing
+new math. The work is structural - the frame accelerator's interface has to expose the QSA
+op so the QSA layers can run device-resident - and it is the single largest remaining win
+for this model.
+
