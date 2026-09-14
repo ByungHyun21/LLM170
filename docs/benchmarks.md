@@ -5740,3 +5740,23 @@ revisited, the KV must be device-resident and owned by the frame's sequence stat
 append done device-side - not a pointer-keyed cache in the adapter. The `pos0` reset idea
 remains valid for that design.
 
+
+## Attention geometry experiments are below the prefill measurement noise (2026-09-14)
+
+Hypothesis: `_sel6`'s block is 4 tokens x 2 head-groups, and the two groups are on different
+tokens, so they read different K/V rows and L1 cannot serve the second group - 24 heads / 6
+per warp means each row is still read 4 times. A token-per-block variant (4 warps = 2 kvh x
+2 groups, all 24 heads of one token) would put both groups of a kvh on the same rows and
+halve the re-read. It was implemented (`q4_qsa_attn_sel6t`, bit-identical by construction -
+the diverse stream reproduced exactly) and measured:
+
+| geometry | pp2048 reps |
+|---|---|
+| `_sel6` (4 tokens x 2 groups) | 9,048.7 / 9,161.2 ms |
+| `_sel6t` (1 token x 4 warps) | 9,152.6 / 8,782.5 ms |
+
+The ranges overlap, so the L1 hypothesis is unresolved and the change was reverted rather
+than kept on a guess. Two lessons for the next attempt: prefill runs vary by ~3% run to
+run, so a ~2% effect needs more reps (or a KTRACE comparison, which reports device time
+rather than the wall), and the geometry change is worth re-testing only with that protocol.
+
