@@ -281,6 +281,26 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### Flash-Next vs llama.cpp first head-to-head (2026-09-15, ROCm 10)
+
+Same GGUF (UD-Q4_K_XL 103.7 GiB, 177B-A3B as llama-bench identifies it),
+same runtime, same GPU, r=2 for llama:
+
+| Metric | llama.cpp | LLM170 | ratio |
+|---|---|---|---|
+| pp2048 | 240.0 ± 2.0 | **290.1** | **1.21x** |
+| tg32 | **17.78 ± 0.29** | 12.66 | 0.71x |
+
+Prefill leads by 21%; decode trails by 40%. KTRACE decode breakdown: 76.4ms
+kernel + 54.2ms launch gaps per step; gemm_q8_0 dominates (~121ms across MoE
+expert gate/up/down GEMV shapes gy=10240/2560/6144) - bandwidth-bound on
+reading 10 experts x 3 projections per layer (~15-18GB/step at DRAM rates).
+The remaining decode gap vs llama is in MoE GEMV efficiency and launch-gap
+reduction. Note: the model is 177B-A3B (not 125B-A6B as earlier notes said);
+the dense GDN backbone + tiny 640-wide experts make per-token traffic
+~14-16GB despite the "A3B" label. This decode gap is the next optimization
+target for Flash-Next.
+
 ### q8_0 MMQ for Flash-Next: wrong AND slower - closed negative (2026-09-14)
 
 With the ROCm 10-built mul_mat_q<q8_0,128> and quantize_mmq_q8_1<D4,false>
