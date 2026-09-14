@@ -590,7 +590,7 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
         const unsigned short* h = (const unsigned short*)p;
         unsigned v2 = 0;
         for (int i = 0; i < 8; i++) v2 += h[i * 320];
-        if (v2 == 0xDEADBEEFu) acc[0] = v2;
+        atomicAdd(&acc[0], v2);
         return;
     }
     if (mode == 4) {
@@ -599,7 +599,7 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
         int lane = threadIdx.x & 31;
         unsigned v3 = 0;
         for (int i = 0; i < 8; i++) v3 += h[lane + i * 32];
-        if (v3 == 0xDEADBEEFu) acc[0] = v3;
+        atomicAdd(&acc[0], v3);
         return;
     }
     if (mode == 0) {
@@ -612,7 +612,7 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
         uint4 t = *q;
         v = t.x ^ t.y ^ t.z ^ t.w;
     }
-    if (v == 0xDEADBEEFu) acc[0] = v;
+    atomicAdd(&acc[0], v);
 }
 
 extern "C" __global__ void q4_moe_group_t1(

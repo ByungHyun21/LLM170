@@ -243,17 +243,22 @@ were meant to model the GEMM's row-per-thread and warp-cooperative patterns, pro
 impossible figures (2578 GB/s) because the compiler elided the loads; that tooling
 needs fixing before it can be quoted.
 
-The analysis that does hold: in the grouped MoE GEMM each thread accumulates one
-output row, so a warp's 32 lanes read 32 different weight rows - a 2.5-5 kB stride per
-lane, which uses a few bytes of each 128-byte line. The measured 53 GB/s effective is
-consistent with that, and it is already better than the raw probe because a warp
-touches two rows at once. The fix is to make the weight read cooperative: either have
-the warp read one row with lane=column and reduce by shuffle, or store the dequantised
-f16 weights transposed ([k][o] instead of [o][k]) so that lanes reading different
-outputs at the same k hit consecutive addresses. The transposed layout is the cheaper
-change - it is confined to the dequant kernels plus the GEMM indexing - and should take
-the MoE from 53 to roughly 200 GB/s, worth about -27% of the prefill and a comparable
-share of the decode.
+With the loads made un-elidable (atomicAdd), the probe reads: mode 0 sequential scalar
+7.3 GB/s used of 264 touched, mode 1 per-thread 144-byte stride 6.5 of 235, mode 2 the
+same stride with 16-byte vectors 29.3 of 264, mode 3 (a thread streaming its own row,
+the GEMM shape) 26.4 of 238. Mode 4 was meant to model a warp-cooperative read but
+does not (its lanes still touch different 144-byte blocks), so it is not quoted.
+
+An important correction follows from the real kernel's shape: 16 of the 32 lanes in a
+warp read the same address (they share the output column), so a load instruction
+touches two lines and the lane's m-loop then consumes those lines fully. Line
+utilisation in the grouped MoE GEMM is therefore high, and the 53 GB/s effective is
+not a simple coalescing failure. A transposed f16 layout would not obviously fix it,
+so that change should not be made on this evidence; the remaining unexplained factor
+between 53 and the 238-264 GB/s the DRAM delivers needs a counter-based measurement,
+which the tooling here cannot yet provide.
+
+
 
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
