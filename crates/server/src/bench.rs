@@ -158,8 +158,17 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut step = 0usize;
+                // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
+                let mut kt_done = false;
                 while n_gen < tg {
+                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
+                        llm170_backend_gpu::rawhip::ktrace_on();
+                    }
                     let l = eng.decode1(0, next).map_err(|e| e.to_string())?;
+                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
+                        eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
+                        kt_done = true;
+                    }
                     next = llm170_core::model::greedy(&l);
                     n_gen += 1;
                     step += 1;
