@@ -158,6 +158,27 @@ fn ggml_id(ty: GgmlType) -> u32 {
 }
 
 impl Q4Acc {
+    /// 진단(LLM170_MOE_HASH): moe 최종 출력(out) 해시 — DEV/HOST 경로 비교용.
+    fn moe_hash_check(&self, tag: &str, op: *mut u8, rows: usize, n_out: usize) -> Result<(), String> {
+        if std::env::var_os("LLM170_MOE_HASH").is_none() {
+            return Ok(());
+        }
+        // out의 행 수는 토큰 수(t) — rows는 t·k_sel이므로 rows/k_sel… 대신
+        // 버퍼 규약상 out은 [t][n_out]이고 t = frame t_cur.
+        let t = self.t_cur().max(1);
+        let n = (t * n_out).min(rows * n_out);
+        let mut v = vec![0.0f32; n];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut v), op as *const u8)?;
+        let mut x = 0xcbf29ce484222325u64;
+        for f in v.iter() {
+            x ^= f.to_bits() as u64;
+            x = x.wrapping_mul(0x100000001b3);
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let q = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("# moe-hash {tag} #{q} t={t} n_out={n_out} h={x:016x}");
+        Ok(())
+    }
     /// 행 순열 gather: dst[g] = src[perm[g]] (row_u32 = 행당 u32 수).
     /// 산란은 역순열을 넘겨 같은 커널로 수행한다.
     /// 디바이스 그룹화 런치 — q4_moe_group_t1(단일 블록·단일 스레드).
@@ -1265,6 +1286,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // ≤8,202). 리팩터 후 t=1은 비트 동일로 검증됨.
                 // 프리필(t>1)은 아직 5번째 상한 축이 남아 실패한다(h2d 8MB — 크기는
                 // h2d 진단이 보고한다). 켜려면 그 축부터 찾아야 한다.
+                // t=1(디코드) 전용 — 프리필(t>1)은 plans/68에서 레이아웃 혼재
+                // (패딩/비패딩 gather·scatter·폴백 오프셋)를 전면 교정했으나
+                // 잔여 발산(16토큰 중 마지막 1개 플립)과 진단 동기화 시에만
+                // 재현되는 폴백 행 수 오염이 남아 기본 경로는 유지한다.
                 if std::env::var("LLM170_MOE_GROUP_DEV").as_deref() != Ok("0")
                     && self.t_cur() == 1
                     && ne <= 512
@@ -1298,6 +1323,51 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         (ppd, ipd, txd, offd, rpd)
                     };
                     self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd, bound)?;
+                    if std::env::var_os("LLM170_MOE_GCHECK").is_some() {
+                        // 진단: 디바이스 테이블과 호스트 재계산을 비교(첫 불일치 지점 출력).
+                        self.ctx.sync().map_err(|e| e.to_string())?;
+                        let mut dev_off = vec![0i32; ne + 2];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut dev_off), offd as *const u8)?;
+                        let mut dev_perm = vec![0u32; rows];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut dev_perm), pd as *const u8)?;
+                        let mut dev_rowexp = vec![0u32; bound];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut dev_rowexp), rxd as *const u8)?;
+                        let idp = self.fptr(ids)?;
+                        let mut idv = vec![0u32; rows];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
+                        let mut cnt = vec![0i32; ne];
+                        for &e in &idv { cnt[(e as usize).min(ne - 1)] += 1; }
+                        let mut hoff = vec![0usize; ne + 1];
+                        let mut acc2 = 0;
+                        for e in 0..ne { hoff[e] = acc2; acc2 += cnt[e] as usize; }
+                        hoff[ne] = acc2;
+                        let mut bad = 0;
+                        for e in 0..=ne {
+                            if dev_off[e] as usize != hoff[e] {
+                                eprintln!("# gcheck off[{e}] dev={} host={}", dev_off[e], hoff[e]);
+                                bad += 1;
+                                if bad > 4 { break; }
+                            }
+                        }
+                        if bad == 0 {
+                            let mut cur = hoff[..ne].to_vec();
+                            for (i, &e) in idv.iter().enumerate() {
+                                let e2 = (e as usize).min(ne - 1);
+                                let ppos = cur[e2]; cur[e2] += 1;
+                                if dev_perm[ppos] as usize != i { 
+                                    eprintln!("# gcheck perm@{ppos} dev={} host={i}", dev_perm[ppos]);
+                                    bad += 1;
+                                    if bad > 4 { break; }
+                                }
+                                if dev_rowexp[ppos] as usize != e2 {
+                                    eprintln!("# gcheck rowexp@{ppos} dev={} host={e2}", dev_rowexp[ppos]);
+                                    bad += 1;
+                                    if bad > 4 { break; }
+                                }
+                            }
+                        }
+                        eprintln!("# gcheck rows={rows} rows_pad_dev={} bad={bad}", dev_off[ne + 1]);
+                    }
                     // 폴백(비 Q4K/Q5_1 타입)용 오프셋. 기본은 비동기로 미리 걸어
                     // 소비 시점(층 하단)까지 gate/up GEMM이 지연을 덮는다.
                     // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
@@ -1434,6 +1504,9 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         };
         phase("group", &mut lap);
         let row_u32 = if f32w { n_in } else { xq_w };
+        // plans/68 레이아웃 실험 플래그 — t=1의 기존(검증된) 동작은 그대로 두고
+        // 프리필 디바이스 그룹화 실험에서만 패딩 도메인 레이아웃을 쓴다.
+        let pad_layout = rows_pad_d != 0 && self.t_cur() > 1;
         // 디바이스 그룹화 경로의 GEMM은 t = rows_pad로 x를 읽는다(패딩 행의 출력은
         // scatter가 버리므로 값은 무관, 크기만 rows_pad까지 필요).
         let xbuf_rows = if rows_pad_d != 0 { rows + 16 * ne } else { rows };
@@ -1443,10 +1516,22 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         };
         let yg = {
             let mut g = self.yperm.lock().map_err(|e| e.to_string())?;
-            g.ensure(&self.ctx, rows * n_out * 4)?
+            // ★ 5번째 축(plans/68): q4_gemm_q4k_ge는 r < *rows_pad까지
+            // out[r·n_out+o]에 기록한다 — 디바이스 그룹화 경로(rows_pad_d≠0)는
+            // 패딩 행(≤16·ne)분까지 버퍼를 확보해야 한다. 종전 rows 크기여서
+            // 프리필에서 out 끝을 넘는 쓰기 → HIP 700(10차 소거의 정체).
+            let ybuf_rows = if rows_pad_d != 0 { rows + 16 * ne } else { rows };
+            g.ensure(&self.ctx, ybuf_rows * n_out * 4)?
         };
         let xsrc0 = if f32w { xp } else { xq };
-        self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
+        // plans/68 레이아웃 일관화: 디바이스 그룹화(rows_pad_d≠0)는 GEMM이
+        // **패딩 도메인**(r < *rows_pad, rowexp=패딩 인덱스)으로 읽는다 — gather도
+        // perm_pad/bound행으로. 호스트 경로는 종전대로 비패딩 perm_d/rows.
+        if pad_layout {
+            self.rows_permute_dev(xsrc0, perm_pad_d as *mut u8, xg, row_u32, rows + 16 * ne)?;
+        } else {
+            self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
+        }
         phase("gather", &mut lap);
         if llm170_core::qwen4exp::frame::stage_skipped("moe") {
             // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
@@ -1604,17 +1689,21 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 256,
                 &mut args,
             )?;
-            self.rows_permute_dev(yg, inv_d as *mut u8, op_, n_out, rows)?;
+            let scat = if pad_layout { inv_pad_d } else { inv_d };
+            self.rows_permute_dev(yg, scat as *mut u8, op_, n_out, rows)?;
             phase("scatter", &mut lap);
             if tm {
                 eprintln!("# moe-phase TOTAL={:.2}ms rows={rows}", t0.elapsed().as_secs_f64() * 1e3);
             }
+            self.moe_hash_check("ge", op_, rows, n_out)?;
             return Ok(());
         }
         // 디바이스 그룹화 경로(off 비어 있음): 폴백(비 Q4K/Q5_1 타입, 예: down의
         // q8_0)은 전문가별 런치를 위해 오프셋만 읽는다 — 그룹화·테이블 빌드·업로드
         // 왕복은 GPU가 이미 끝냈으므로 여기서는 (ne+1)개 int만 받는다.
-        let off_d2h;
+        let mut off_d2h;
+        // plans/68: 디바이스 그룹화 경로의 xg는 **패딩 도메인** — 폴백(전문가별
+        // 런치)도 패딩 오프셋(off_pad)에서 구간을 읽어야 행이 맞는다.
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
             self.ctx.d2h_wait()?;
             // 오프셋 + 그 뒤 4B(디바이스가 계산한 rows_pad)를 함께 읽어 **상한을
@@ -1628,6 +1717,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             } else {
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut b), off_d as *const u8)?;
             }
+            let _ = &b;
             let rows_pad_dev = b[ne + 1].max(0) as usize;
             let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
             if rows_pad_dev > bound {
@@ -1635,7 +1725,28 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     "moe 그룹화: rows_pad {rows_pad_dev} > bound {bound} (ne={ne}) — 상한 가정 위반"
                 ));
             }
-            off_d2h = b[..ne + 1].iter().map(|&x| x.max(0) as usize).collect::<Vec<usize>>();
+            if pad_layout {
+                // [프리필 실험] 시작점은 패딩 도메인, 행 수는 실제 카운트 — 패딩
+                // 행을 타일 GEMM에 넘기면 블록 단위 처리가 실제 행 결과를 흔든다
+                // (해시 국소화로 확인, 2026-09-14). starts = Σ ceil16(cnt).
+                let mut starts = vec![0usize; ne + 1];
+                let mut accp2 = 0usize;
+                for e in 0..ne {
+                    starts[e] = accp2;
+                    let c = (b[e + 1].max(0) as usize).saturating_sub(b[e].max(0) as usize);
+                    accp2 += c.div_ceil(16) * 16;
+                }
+                starts[ne] = accp2;
+                off_d2h = vec![0usize; ne + 1];
+                for e in 0..ne {
+                    off_d2h[e] = starts[e];
+                    off_d2h[e + 1] = starts[e]
+                        + (b[e + 1].max(0) as usize).saturating_sub(b[e].max(0) as usize);
+                }
+            } else {
+                // t=1 종전 동작: 비패딩 off를 그대로(gather도 perm_d라 일관).
+                off_d2h = b[..ne + 1].iter().map(|&x| x.max(0) as usize).collect();
+            }
             &off_d2h
         } else {
             &off
@@ -1656,13 +1767,16 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             }
         }
         phase("gemms", &mut lap);
-        self.rows_permute_dev(yg, inv_d as *mut u8, op_, n_out, rows)?;
+        let scat2 = if pad_layout { inv_pad_d } else { inv_d };
+        self.rows_permute_dev(yg, scat2 as *mut u8, op_, n_out, rows)?;
         phase("scatter", &mut lap);
         if tm {
             eprintln!("# moe-phase TOTAL={:.2}ms rows={rows}", t0.elapsed().as_secs_f64() * 1e3);
         }
+        self.moe_hash_check("fb", op_, rows, n_out)?;
         Ok(())
     }
+
 
 }
 
