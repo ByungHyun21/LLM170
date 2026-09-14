@@ -5796,3 +5796,41 @@ ceiling was ~143 ms (1.6%) - below the run-to-run noise, which is what the incon
 showed. Everything else in this section needs a working device-time instrument before it
 can be acted on.
 
+
+## KTRACE fixed: the prefill is 49% kernels and 43% launch gaps, and the gaps are the lever (2026-09-14)
+
+The KTRACE sum was wrong because ktrace_dump paired events with a heuristic ("consecutive
+events with the same name and gy are a start/end pair"), which breaks whenever the same
+kernel launches repeatedly - exactly what batched shapes do. It now uses the fixed stride-2
+pairing (each launch records exactly two events), the same assumption the gap code already
+used. Validation: the 27B pp512 now reports TOTAL 1,380 ms against a 1,516 ms wall (it was
+366 ms, a 4x under-measurement), and the Flash-Next pp2048 chunk reports 5,088 ms of
+kernels plus 3,839 ms of gaps against an ~8,900 ms wall - fully accounted.
+
+| kernel | total | calls | share |
+|---|---|---|---|
+| gemm_q8_j128 | 1,085.4 ms | 776 | 25% |
+| q4_gemm_q4k_ge (MoE gate/up) | 787.0 ms | 52 | 18% |
+| q4_gemm_f32_m | 609.2 ms | 288 | 14% |
+| gdn_ar_w_swap | 344.6 ms | 36 | 8% |
+| q4_qsa_attn_sel6 | 285.8 ms | 12 | 7% |
+| q4_rows_permute_u32 | 226.3 ms | 331 | 5% |
+| gemm_q8_0 / quant_q8 / rms_* / hc_* | ~950 ms | | 22% |
+
+Launch gaps, by predecessor (3,838.6 ms total):
+
+| after | gap | calls | per call |
+|---|---|---|---|
+| q4_rows_permute_u32 | 1,728.7 ms | 331 | 5.2 ms |
+| gemm_q8_j128 | 722.1 ms | 776 | 0.93 ms |
+| q4_gemm_f32_m | 654.4 ms | 288 | 2.3 ms |
+| q4_qsa_attn_sel6 | 367.1 ms | 12 | 30.6 ms |
+| q4_hc_combine + hc_gate_mean | 325.4 ms | 193 | ~1.7 ms |
+
+The single largest item is therefore the host work that follows rows_permute_u32: 5.2 ms per
+call, 331 calls, 1.73 s per chunk (19% of the prefill). That is the MoE path's per-expert
+host loop (frame_moe_gemm launches one GEMM per expert and permutes rows around it), i.e.
+exactly what plans/57's mul_mat_id work targets; the grouped kernel it needs already exists
+and is used for the gate/up. The other gaps are the same shape at smaller scale: host submit
+work after each small launch.
+
