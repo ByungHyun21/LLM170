@@ -712,6 +712,11 @@ impl Q4Acc {
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
+        // 실측(2026-09-14, q4k-bench t=2048 2560x6144): 23.7ms/호출 = 2.7 TFLOPS
+        // (f32 피크의 16%)이면서 가중치는 0.4 GB/s뿐 — 연산도 대역폭도 아닌
+        // 점유율/정수-ALU 병목이고, 여기가 llama.cpp 대비 프리필 1.33x가 사는 곳이다.
+        // 같은 형상에서 q4_K MMQ 타일(LLM170_Q4K_MMQ/Y)은 오히려 느렸고(33-34ms),
+        // Q6K/Q4_K f16 융합 dequant도 중립이었다. 남은 방향은 그래프당 dequant 캐시.
         // t≥16: MMQ 타일 우선 — 단 **128토큰 이하로 쪼개서** 호출한다.
         // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다
         // (2026-09-12 실측: t=129 폴트, t=128 정상, GEMV 경로는 비트 동일).
@@ -889,12 +894,20 @@ impl Q4Acc {
             };
             yb.ensure(&self.ctx, need)?
         };
+        // 실측(2026-09-14, pp2048): 아래 할당+d2h+행 산포가 청크당 ~0.75s(8%)를
+        // 쓴다(LLM170_Q4ACC_TIME으로 d2h=1.5s/400콜). 스테이지가 행 벡터 대신
+        // 디바이스 상주 버퍼를 받으면 사라지는 비용 — QSA 선택목록 물질화와 같은 뿌리.
         let mut yflat = vec![0.0f32; t * n_out];
         let t_k = std::time::Instant::now();
         if w_f32 {
             self.launch_gemm_f32(xf, w_slice, n_in, n_out, t, ydev)?;
         } else {
             // f16 경로 A/B — 실모델 텐서·실활성으로 검증(q4-acc-check가 미러와 대조).
+            // 실측(2026-09-14): 게이트를 Q4_K/Q6_K(12/14)로 넓혀도 pp2048 중립이었다
+            // (9,087.8 vs 9,043.9ms). 경로는 실제로 타고(F16_DBG=48콜: QSA wq
+            // [6144x2560]x12, wk/wv [2560x512]x24) 200토큰 프롬프트 greedy 스트림도
+            // 동일했지만, dequant가 **호출마다** 돌아 상각되지 않는다. plans/66 P1의
+            // 실제 내용은 "그래프당 1회 dequant 후 캐시"이고 그게 빠져 있다.
             let ty0 = ggml_id(w.ty);
             if t >= 32
                 && ty0 == 8
@@ -1131,6 +1144,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 (&mut eb) as *mut _ as *mut std::ffi::c_void,
                 (&mut rp) as *mut _ as *mut std::ffi::c_void,
             ];
+            // 실측(2026-09-14): 호출당 10전문가 x 0.92MB = 9.2MB를 51us에 옮긴다
+            // = 180 GB/s ≈ DRAM(236)의 76%. 이미 최적에 가까워 K-분할(4배 블록,
+            // -1.4%), GEMV형 그리드(16배 블록 + 트리 환원, 중립), 접근 패턴
+            // 프로브(235-264 GB/s로 평탄)가 모두 중립이었다 — 격차가 아니라 산술이었다.
             self.ctx.launch3(
                 "q4_gemm_q4k_ge_ids",
                 n_out.div_ceil(16) as u32,
@@ -1374,6 +1391,13 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         if ws.ty == GgmlType::Q5_1 && !f32w && rows > 0 {
             // direct-ids(t=1): down도 그룹화 없이 — 게이트/up만 direct로는 down에서
             // 그룹화(d2h+빌드+h2d)가 1회 발생해 이득이 사라진다.
+            // 실측(2026-09-14): down은 72 GB/s로 게이트/up의 180에 크게 못 미친다.
+            // 원인은 워프가 출력행마다 480B 스트라이드로 읽어 32B 섹터당 4B만
+            // 쓰는 8배 증폭. gm의 협조 적재 이식은 **불가능**하다(그 불변식은
+            // 타일당 단일 전문가인데 비정렬 direct는 행마다 전문가가 다르다 —
+            // o-행 하나에 16전문가 가중치가 필요해 공유 버퍼로 표현 불가, 시도 후 복원).
+            // 워프-퍼-행 재설계도 q5_1의 6워드 슈퍼블록 입도 때문에 3배가 한계였다.
+            // 즉 6ms는 Q5_1 레이아웃 고유 비용이다.
             if self.t_cur() == 1 && std::env::var_os("LLM170_MOE_GROUPED").is_none() {
                 let idp = self.fptr(ids)?;
                 let mut x_p = xq as *mut std::ffi::c_void;
@@ -2026,6 +2050,14 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         // 4헤드-퍼-워프판은 K/V 행을 4헤드가 공유한다(트래픽 1/4) — 프리필에서
         // −20%. 단 t가 작으면(디코드) 블록의 워프 대부분이 놀아 역효과이므로
         // t≤3은 헤드당 워프 1개인 `_sel`로 보낸다. 둘은 비트 동일(프로브 확인).
+        // 실측(2026-09-14): 그 강제(LLM170_QSA_SEL4_DEC)는 디코드에서 중립이었다
+        // (589.7/562.2 vs 576.3/566.2ms, 토큰 동일) — 점유율 손실이 트래픽 이득을 상쇄.
+        // 장문맥 디코드의 실제 비용은 아래와 같다(pp8192, KTRACE):
+        //   q4_qsa_attn_sel = 1.425 ms/콜 = 17.1 ms/스텝(커널 합 83.9ms의 20%, 최대 단일)
+        //   = 8192위치 x 256 x 2(K,V) x 24헤드 = 403 MB/층 -> 236 GB/s로 1.7ms ≈ 측정치
+        // 즉 **헤드 24개가 같은 K/V 행을 각자 다시 읽는 대역폭 문제**다. 4헤드 공유로는
+        // 점유율 때문에 안 되고, flash-decoding형(선택목록을 블록 간 분할 + 부분 softmax
+        // 병합)으로 K/V를 1회만 읽어야 한다 — 17.1ms -> ~1ms, 스텝의 ~8%.
         if t <= 3 {
             self.qsa_attn_sel_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t)
         } else {
