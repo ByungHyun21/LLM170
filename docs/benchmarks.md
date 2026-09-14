@@ -260,6 +260,24 @@ which the tooling here cannot yet provide.
 
 
 
+## Confirmed with the reps-3 protocol: the grouping round trip is 35% of the decode (2026-09-14)
+
+Warm reps (--reps 3, reps 1-2):
+| run | warm ms (tg8) | per step |
+|---|---|---|
+| baseline | 735.4 / 728.6 = 732.0 | 91.5 ms |
+| moe.top10 skipped (keeps the grouping cache valid) | 473.1 / 485.5 = 479.3 | **59.9 ms** |
+| device-side grouping (LLM170_MOE_GROUP_DEV=1) | 921.1 / 943.2 = 932.2 | 116.5 ms |
+
+So the per-layer grouping round trip - a synchronous d2h of the routing ids, the host
+table build and three h2d uploads, 48 times per step - is 31.6 ms/step, 35% of the
+decode, and removing it alone reaches 59.9 ms/step, below llama.cpp's 61 on this model.
+The device-side grouping is bit-identical but 27 ms/step slower, reproducibly and
+warm, and every component it adds has been measured cheap in isolation (group kernel
+31 us, async d2h 16 us, bound-sized buffers 2.4 ms/step) while the ordering and drain
+variants make no difference. That unexplained 27 ms is what gates reaching llama
+parity, and it needs device-side timestamps or a counter-based method to resolve.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
