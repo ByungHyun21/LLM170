@@ -207,6 +207,18 @@ for the current tree:
 block-key cache, the indexer q rows and the layer output, which localizes a
 divergence to a specific path (it is what pinned bug 2 to the qg normalization).
 
+### Functional matrix re-verified after the device-resident work (2026-09-14)
+
+With the QSA bridge, resident KV pools and kernel-routing changes in, the
+non-benchmark paths were exercised end to end:
+- **np (parallel sequences)**: two interleaved prompt groups generate
+  independently; the resident pools are keyed (layer, seq) and stayed clean.
+- **MTP speculative decode** (27B, nextn=1): `--spec 2` ran 12 cycles,
+  12 accepted tokens over 13 target forwards (0.92 acceptance/forward).
+- **mmproj/VL** (27B + mmproj-F16): `llm170 vl` on a test image produced a
+  coherent caption through the full vision-encode + splice path.
+Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
+
 ### Device-resident QSA KV cache: long-ctx decode 87->82.3 ms (2026-09-14)
 
 The QSA KV cache now lives on the GPU in per-(layer,seq) pools: each step
