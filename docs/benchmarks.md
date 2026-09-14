@@ -5474,3 +5474,28 @@ new math. The work is structural - the frame accelerator's interface has to expo
 op so the QSA layers can run device-resident - and it is the single largest remaining win
 for this model.
 
+
+## Flash-Next decode kernel composition today (2026-09-14)
+
+KTRACE of a tg8 run, per step: 68 ms of kernels across 39 types. The q8_0 family is the
+largest single block at 33.1 ms (49%), and its breakdown says it is not a target:
+
+| n_out | total | calls | per call | effective |
+|---|---|---|---|---|
+| 10240 | 12.14 ms | 134 | 0.091 ms | ~305 GB/s |
+| 2560 | 6.66 ms | 147 | 0.045 ms | - |
+| 6144 | 3.93 ms | 36 | 0.109 ms | - |
+| 65535 (head) | 3.69 ms | 1 | 3.69 ms | - |
+| 12288 | 2.37 ms | 12 | 0.20 ms | - |
+| 320/640/512 | 4.35 ms | 217 | 0.014-0.023 ms | launch-bound |
+
+The 10240-output GEMMs run at ~305 GB/s, above the 236 GB/s DRAM figure, i.e. they are
+already served largely from L2 (the shared expert's weights are re-read every step) - no
+headroom there. The MoE gate/up sits at 180 GB/s of DRAM and the down projection is capped
+by its Q5_1 layout, so the decode's large GEMMs are done. What remains is the long tail:
+217 small GEMMs (n_out 320/512/640, the hyper-connection and routed-expert shapes) spend
+4.35 ms at 14-23 us per call, which is launch and ramp cost rather than transfer, so
+fusing them - not retuning them - is the lever. GDN's AR kernel is only 0.83 ms/step here,
+not the 50 ms the older plan recorded, so plans/66 P2 is a prefill-targeted item on this
+codebase.
+
