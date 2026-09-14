@@ -21,6 +21,37 @@ is out of scope.
 | `docs/archive/hip-kernel-history.md` | HIP 커널·타일·프리필/디코드 라운드 이력 |
 | `docs/archive/misc-history.md` | 그 외(비전·MTP·프로토콜 등) |
 
+## ROCm 10 userspace adopted — same binary, +28-41% for llama.cpp (2026-09-14)
+
+The machine carries a TheRock ROCm 10.0.0 userspace build for gfx1151
+(`/opt/rocm-10.0.0`, moved from `~/local_llm-runtimes` at the user's request).
+Its `libamdhip64.so.7` keeps the soname, so **no relink is needed** -
+`LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib` switches the runtime; the gate
+scripts now default to it (with fallback to the system 7.2.2). Kernel driver
+(KFD) needs no change.
+
+Interleaved A/B, same binaries, same day (llama-bench from our source tree,
+LLM170 current build; **run sequentially** - two concurrent GPU benches on
+this APU collapse to half rate, which initially masqueraded as a ROCm 10 leak):
+
+| 27B Q4_K_XL | llama 7.2.2 | llama ROCm 10 | LLM170 7.2.2 | LLM170 ROCm 10 |
+|---|---|---|---|---|
+| pp418 | 224.9 ±95* | **316.7 ±14** | 308.5 | **320.5** |
+| pp3314 | 244.8 | **314.4 ±38** | 330.0 | **337.9** |
+| tg16 (post-418) | 9.82 | **11.26** | 11.38 | **11.65** |
+| tg16 (post-3314) | - | 11.26 | 11.33 | 11.29 |
+| pp512 | - | - | 365.1 | **371-378** |
+
+(*first-rep warmup; llama's own spread was large at r=2.)
+
+On the **equal ROCm 10 footing LLM170 leads every prefill cell** (pp418 1.01x,
+pp3314 **1.07x**) and edges decode (+3% short-context, tie long). Both model
+gates pass bit-identical under the new runtime. Flash-Next under ROCm 10:
+pp2048 **288 t/s** (was 270-278), tg32 short 13.35, tg32 @8k **12.24 t/s**
+(81.7 ms/step, improved from 11.5-11.6). Next lever with the new toolchain:
+recompile the offline code objects (COs) and the llama-derived MMQ family with
+ROCm 10's hipcc - the current kernels were all built by 7.2.2's compiler.
+
 ## Primary target scorecard — ACHIEVED (2026-09-14, HIP)
 
 27B Q4_K_XL non-MTP vs llama.cpp ROCm 10 (same prompts as the table below):

@@ -18,6 +18,10 @@
 #   HIP tg 86-87 ms/스텝 (VK 시대 기록 12.25-12.30 t/s = 81-82 ms)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# ROCm 10 런타임 기본(2026-09-14, 사용자 지시) — 없으면 시스템(7.2.2)으로 폴백.
+if [ -d /opt/rocm-10.0.0/install/lib ]; then
+    export LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
 
 MODEL=${LLM170_M27:-/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf}
 RUNTIME=${RUNTIME:-hip}

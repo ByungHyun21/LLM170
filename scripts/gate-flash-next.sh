@@ -15,6 +15,10 @@
 #   (구 난수 프롬프트 베이스라인: 5513 248046 198 248045 74455 198 248068 198 760 1156 579 1876 7701 310 381 7132 36412)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# ROCm 10 런타임 기본(2026-09-14, 사용자 지시) — 없으면 시스템(7.2.2)으로 폴백.
+if [ -d /opt/rocm-10.0.0/install/lib ]; then
+    export LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
 
 MODEL=${LLM170_MFLASH:-/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}
 RUNTIME=${RUNTIME:-hip}

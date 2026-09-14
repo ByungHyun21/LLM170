@@ -1,5 +1,10 @@
 # docs/source — 코드 1:1 측정 기록
 
+
+**Runtime default (2026-09-14)**: benchmarks and gates run on the TheRock
+ROCm 10.0.0 userspace (`/opt/rocm-10.0.0/install/lib` via `LD_LIBRARY_PATH`,
+soname-compatible, no relink; system 7.2.2 as fallback). Numbers quoted before
+this date were measured on 7.2.2 unless noted.
 `docs/benchmarks.md`가 350 KB를 넘어 커지면서, **파일 단위로 대응하는 문서**를 여기로 분리한다.
 목적은 두 가지다: (1) 코드를 고칠 때 그 파일에 대한 실측 근거를 바로 찾을 수 있고,
 (2) `benchmarks.md`는 **요약 지표와 모델 간 비교**만 남겨 짧게 유지한다.
