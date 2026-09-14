@@ -1591,6 +1591,8 @@ impl RawCtx {
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
+        let j_now: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let mut ntx_fd = fd3(((t + j_now - 1) / j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;
         let mut ay = yb as *mut std::ffi::c_void;
@@ -1722,6 +1724,8 @@ impl RawCtx {
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
+        let j_now: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let mut ntx_fd = fd3(((t + j_now - 1) / j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;
         let mut ay = yb as *mut std::ffi::c_void;
