@@ -757,7 +757,10 @@ extern "C" __global__ void q4_moe_group_t1(
             perm_pad[pd] = 0;
         }
     }
-    for (int pd = (rp > (bound & ~15) ? rp : (bound & ~15)); pd < bound; pd += nt) {
+    // [rp, bound) 전체를 0으로 — 종전엔 16정렬 꼬리만 채워 [rp, bound&~15)이
+    // 낡은 값으로 남았고, gather가 그 인덱스로 xq를 읽어 OOB(폴트/오염) 냈다
+    // (plans/68 12차). 0 = 원본 0번 행(유효) — 어차피 패딩 슬롯이라 안 읽힌다.
+    for (int pd = rp; pd < bound; pd += nt) {
         perm_pad[pd] = 0;
     }
 }
