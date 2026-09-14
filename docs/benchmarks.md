@@ -238,6 +238,19 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### plans/66 P1 (dequant-cache WMMA) measured: not adopted - MMQ already at 81% of the practical MMA roofline (2026-09-14)
+
+Built the full P1 path for the 27B's dominant iq4_xs weights (dequant-to-f16
+kernels + a cache-fed WMMA GEMM, bit-identical to the inline path across all
+1.11M outputs) and measured it against production: f16-cache GEMM 7.0 TFLOPS,
+inline-dequant WMMA 12.2, int8 MMQ (current) 19.9. The cache route reads 3.7x
+more weight bytes (4.25-bit quant -> 16-bit f16), which dominates at this tile
+shape regardless of coalescing; and the ceiling for any MMA route here is the
+measured L1-fed roofline of 24.5 TFLOPS (roof-test), leaving at most 1.2x over
+MMQ before cache costs. plans/66's 1.42x came from an f32 baseline - our int8
+MMQ baseline already sits at 81% of the practical roofline. Negative result
+recorded in plans/70; kernels and the wc-check probe kept as opt-in assets.
+
 ### hc up-projection j128 is the best available path, not a broken default (2026-09-14)
 
 After the WMMA discovery (a silently-broken default), the next kernel-time

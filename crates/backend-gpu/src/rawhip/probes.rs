@@ -1057,6 +1057,218 @@ pub fn device_report(ctx: &RawCtx) -> String {
     )
 }
 
+fn half_f32(bits: u16) -> f32 {
+    let s = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = ((bits >> 10) & 0x1F) as i32 - 15;
+    let m = (bits & 0x3FF) as f32;
+    if e == -15 { s * m * 2f32.powi(-24) } else { s * (1.0 + m / 1024.0) * 2f32.powi(e) }
+}
+
+/// plans/70 P1 검증 — f16 dequant-cache GEMM(gemm_q5k_wc)이 인라인 디퀀트판
+/// (gemm_q5k_wm)과 **비트 동일** 출력을 내는지 + 처리량 비교. t ≤ 64(wm B16 한계).
+pub fn wc_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
+    use std::ffi::c_void;
+    let t = t.clamp(1, 64);
+    let model = llm170_core::model::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("tensor 없음")?;
+    let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
+    if w.ty != llm170_gguf::GgmlType::Q5K && !is_xs {
+        return Err(format!("wc-check: q5_K/iq4_xs 전용 (ty={:?})", w.ty));
+    }
+    let ctx = RawCtx::new()?;
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    if n_in % 256 != 0 {
+        return Err("wc-check: n_in이 256의 배수가 아님".into());
+    }
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    // f16 캐시 생성(1회) — xs는 ktab2 LUT 필요
+    let ac = ctx.alloc(n_out * n_in * 2)?;
+    // 진단: 디퀀트 커널 값 검증 — CPU 대조 (xs만, o=0 앞 8원소)
+    if is_xs && std::env::var_os("LLM170_WC_CPUCHK").is_some() {
+        ctx.sync()?;
+        let mut ac_host = vec![0u16; n_in.min(64) as usize];
+        ctx.d2h(unsafe { std::slice::from_raw_parts_mut(ac_host.as_mut_ptr() as *mut u8, ac_host.len() * 2) }, ac)?;
+        let f16v = |bits: u16| half_f32(bits);
+        let wq = w.data;
+        let blocks = n_in >> 8;
+        let mut cpu = vec![0f32; 8];
+        for (sb2, cv) in cpu.iter_mut().enumerate() {
+            let ib = sb2 & 7;
+            let wb = 0usize * blocks * 136 + (sb2 >> 3) * 136;
+            let wqf = wb >> 2;
+            let w0 = u32::from_le_bytes([wq[wqf*4], wq[wqf*4+1], wq[wqf*4+2], wq[wqf*4+3]]);
+            let d = f16v((w0 & 0xFFFF) as u16);
+            let w1 = u32::from_le_bytes([wq[(wqf+1)*4], wq[(wqf+1)*4+1], wq[(wqf+1)*4+2], wq[(wqf+1)*4+3]]);
+            let ls = ((w1 >> ((ib >> 1) * 8 + (ib & 1) * 4)) & 0xF) as i32
+                  | ((((w0 >> 16) >> (2 * ib)) & 3) as i32) << 4;
+            let ds0 = d * (ls - 32) as f32;
+            let qw = (wb + 8 + ib * 16) >> 2;
+            let k = sb2 * 4; // sb2=0..7 → k=0,4,8..28 (원소 8개 샘플)
+            let qv = u32::from_le_bytes([wq[(qw + ((k & 15) >> 2))*4], wq[(qw + ((k & 15) >> 2))*4+1], wq[(qw + ((k & 15) >> 2))*4+2], wq[(qw + ((k & 15) >> 2))*4+3]]);
+            let byte_v = ((qv >> ((k & 3) * 8)) & 0xFF) as u8;
+            let kt = llm170_core::ktab2_packed();
+            let tt2 = kt[byte_v as usize];
+            let val = if k < 16 { ((tt2 & 0xFF) as i8) as i32 } else { ((tt2 >> 8) as i8) as i32 };
+            *cv = val as f32 * ds0;
+        }
+        eprintln!("# wc-cpuchk o=0 k=0..28(4씩): cpu={:?}", &cpu);
+        eprintln!("# wc-cpuchk        ac(f16)={:?}",
+            (0..8usize).map(|i| f16v(ac_host[i*4])).collect::<Vec<_>>());
+        // 전체 체크섬 — 어디든 썼는지
+        let mut all16 = vec![0u16; n_out * n_in];
+        let _ = ctx.d2h(unsafe { std::slice::from_raw_parts_mut(all16.as_mut_ptr() as *mut u8, all16.len() * 2) }, ac);
+        let nz = all16.iter().filter(|&&v| v != 0).count();
+        let mut sum = 0f64;
+        for &v in all16.iter() { sum += f16v(v) as f64; }
+        eprintln!("# wc-cpuchk 전체: nonzero {nz}/{} sum={sum:.3}", all16.len());
+    }
+    let (dq_kern, wm_kern, wc_kern, warg) = if is_xs {
+        ("dequant_f16_xs", "gemm_xs_wm", "gemm_xs_wc", {
+            let kt: Vec<u32> = llm170_core::ktab2_packed();
+            let ktd = ctx.alloc(kt.len() * 4)?;
+            ctx.h2d(ktd, bytemuck::cast_slice(&kt))?;
+            ktd
+        })
+    } else {
+        ("dequant_f16_q5k", "gemm_q5k_wm", "gemm_q5k_wc", std::ptr::null_mut())
+    };
+    if std::env::var_os("LLM170_WC_DBG").is_some() {
+        let mut acp2 = ac as *mut c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut a2 = vec![(&mut acp2) as *mut _ as *mut c_void, (&mut ni) as *mut _ as *mut c_void, (&mut no) as *mut _ as *mut c_void];
+        ctx.launch3("dequant_f16_xs_dbg", n_out as u32, 1, 1, 256, &mut a2)?;
+        ctx.sync()?;
+        let mut probe16 = vec![0u16; 256];
+        let _ = ctx.d2h(unsafe { std::slice::from_raw_parts_mut(probe16.as_mut_ptr() as *mut u8, 512) }, ac);
+        let nz2 = probe16.iter().filter(|&&v| v != 0).count();
+        eprintln!("# wc-dbg 상수쓰기: 첫 256 중 nonzero={nz2} (0,1,2..여야)");
+        return Err("디버그 종료".into());
+    }
+    {
+        let mut wp = wd as *mut c_void;
+        let mut ktp = warg as *mut c_void;
+        let mut acp = ac as *mut c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut args = if is_xs {
+            vec![(&mut wp) as *mut _ as *mut c_void, (&mut ktp) as *mut _ as *mut c_void, (&mut acp) as *mut _ as *mut c_void,
+                 (&mut ni) as *mut _ as *mut c_void, (&mut no) as *mut _ as *mut c_void]
+        } else {
+            vec![(&mut wp) as *mut _ as *mut c_void, (&mut acp) as *mut _ as *mut c_void,
+                 (&mut ni) as *mut _ as *mut c_void, (&mut no) as *mut _ as *mut c_void]
+        };
+        ctx.launch3(dq_kern, n_out as u32, 1, 1, 256, &mut args)?;
+    }
+    // 합성 활성 t행 — quant_q8로 장치 인코딩
+    let mut seed = 0x1234_5678u64;
+    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let xf: Vec<f32> = (0..t * n_in).map(|_| lcg()).collect();
+    let xfd = ctx.alloc(xf.len() * 4)?;
+    ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+    let xq_w = n_in / 4 + n_in / 32;
+    let xq = ctx.alloc(t * xq_w * 4)?;
+    for ti in 0..t {
+        let row = unsafe { xfd.add(ti * n_in * 4) };
+        let dst = unsafe { xq.add(ti * xq_w * 4) };
+        ctx.quant_q8(row, dst, n_in)?;
+    }
+    let o1 = ctx.alloc(t * n_out * 4)?;
+    let o2 = ctx.alloc(t * n_out * 4)?;
+    let gx = n_out.div_ceil(64) as u32;
+    let launch = |kern: &str, wp2: *mut u8, out: *mut u8| -> Result<(), String> {
+        let mut xqp = xq as *mut c_void;
+        let mut w2 = wp2 as *mut c_void;
+        let mut op = out as *mut c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args = vec![(&mut xqp) as *mut _ as *mut c_void, (&mut w2) as *mut _ as *mut c_void,
+                            (&mut op) as *mut _ as *mut c_void, (&mut ni) as *mut _ as *mut c_void,
+                            (&mut no) as *mut _ as *mut c_void, (&mut xw) as *mut _ as *mut c_void,
+                            (&mut tt) as *mut _ as *mut c_void];
+        ctx.launch3(kern, gx, 1, 1, 256, &mut args)
+    };
+    // xs 원판은 ktab2를 추가 인자로 받는다 — 런처 분기
+    if is_xs {
+        let mut xqp = xq as *mut c_void;
+        let mut w2 = wd as *mut c_void;
+        let mut op = o1 as *mut c_void;
+        let mut ktp = warg as *mut c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut tt = t as i32;
+        let mut args = vec![(&mut xqp) as *mut _ as *mut c_void, (&mut w2) as *mut _ as *mut c_void,
+                            (&mut op) as *mut _ as *mut c_void, (&mut ktp) as *mut _ as *mut c_void,
+                            (&mut ni) as *mut _ as *mut c_void, (&mut no) as *mut _ as *mut c_void,
+                            (&mut xw) as *mut _ as *mut c_void, (&mut tt) as *mut _ as *mut c_void];
+        ctx.launch3(wm_kern, gx, 1, 1, 256, &mut args)?;
+    } else {
+        launch(wm_kern, wd, o1)?;
+    }
+    launch(wc_kern, ac, o2)?;
+    ctx.sync()?;
+    let mut b1 = vec![0f32; t * n_out];
+    let mut b2 = vec![0f32; t * n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut b1).as_mut(), o1)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut b2).as_mut(), o2)?;
+    let (mut bit_same, mut maxd) = (0usize, 0f32);
+    let mut first = String::new();
+    for i in 0..t * n_out {
+        if b1[i].to_bits() == b2[i].to_bits() { bit_same += 1; }
+        let d = (b1[i] - b2[i]).abs();
+        if d > maxd { maxd = d; }
+        if first.is_empty() && d > 1e-4 {
+            first = format!(" 첫 불일치 i={i} wm={:e} wc={:e}", b1[i], b2[i]);
+        }
+    }
+    // 처리량 — 각 20회
+    let bench = |kern: &str, wp2: *mut u8, out: *mut u8| -> Result<f64, String> {
+        let reps = 20;
+        ctx.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            launch(kern, wp2, out)?;
+        }
+        ctx.sync()?;
+        Ok(t0.elapsed().as_secs_f64() / reps as f64 * 1e3)
+    };
+    let ms_wm = if is_xs {
+        // xs 원판 벤치 (ktab2 인자 포함 런치 20회)
+        let reps = 20;
+        ctx.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut xqp = xq as *mut c_void;
+            let mut w2 = wd as *mut c_void;
+            let mut op = o1 as *mut c_void;
+            let mut ktp = warg as *mut c_void;
+            let mut ni = n_in as i32;
+            let mut no = n_out as i32;
+            let mut xw = xq_w as i32;
+            let mut tt = t as i32;
+            let mut args = vec![(&mut xqp) as *mut _ as *mut c_void, (&mut w2) as *mut _ as *mut c_void,
+                                (&mut op) as *mut _ as *mut c_void, (&mut ktp) as *mut _ as *mut c_void,
+                                (&mut ni) as *mut _ as *mut c_void, (&mut no) as *mut _ as *mut c_void,
+                                (&mut xw) as *mut _ as *mut c_void, (&mut tt) as *mut _ as *mut c_void];
+            ctx.launch3(wm_kern, gx, 1, 1, 256, &mut args)?;
+        }
+        ctx.sync()?;
+        t0.elapsed().as_secs_f64() / reps as f64 * 1e3
+    } else {
+        bench(wm_kern, wd, o1)?
+    };
+    let ms_wc = bench(wc_kern, ac, o2)?;
+    let tf = |ms: f64| 2.0 * t as f64 * n_in as f64 * n_out as f64 / (ms * 1e-3) / 1e12;
+    Ok(format!(
+        "wc-check {tname} [{n_out}x{n_in}] t={t}: 비트동일 {bit_same}/{} max|Δ|={maxd:.2e}{first}\n처리량: wm(인라인 디퀀트) {ms_wm:.3}ms={:.1} TFLOPS · wc(f16 캐시) {ms_wc:.3}ms={:.1} TFLOPS ({:.2}x)\n캐시 {:.1}MB (1회 dequant)",
+        t * n_out, tf(ms_wm), tf(ms_wc), ms_wm / ms_wc, n_out * n_in * 2 / 1048576,
+    ))
+}
+
 pub fn wmma_check() -> Result<String, String> {
     wmma_probe_both().map(|(_, m)| m)
 }

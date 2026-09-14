@@ -66,6 +66,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::q4acc::check_tensor(std::path::Path::new(&path), &tn, t, rows)
         }
         "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
+        "wc-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf".into());
+            let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_gate.weight".into());
+            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(64usize);
+            llm170_backend_gpu::rawhip::wc_check(&path, &tn, t)
+        }
         "q6k-ref" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
