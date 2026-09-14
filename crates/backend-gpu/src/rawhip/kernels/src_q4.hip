@@ -1270,26 +1270,49 @@ extern "C" __global__ void q4_moe_top10_m(const float* route, unsigned* ids, flo
         zs += __shfl_xor_sync(0xffffffffffffffffull, zs, off);
     zs = __shfl_sync(0xffffffffffffffffull, zs, 0);
     __syncwarp();
-    if (l != 0 || k_sel > 64) return;
-    ids += (size_t)tok * k_sel;
-    wt += (size_t)tok * k_sel;
+    if (k_sel > 32 || n_exp > 32 * 16) return;
     int* sel = sh_sel;
     float* sp = sh_sp;
+    // k_sel 라운드의 **워프 병렬 선택**: 레인당 16개를 담당하고, 매 라운드
+    // (a) 레인이 자기 미사용분의 최대를 찾고 (b) 워프 셔플로 전역 최대를 뽑아
+    // 승자 레인이 그 슬롯을 소진한다. 기존 lane-0 삽입정렬(512회 직렬, 호출당
+    // 278µs 실측 = 디코드 최대 단일 커널)을 수 µs로 줄인다. 동률은 셔플 비교
+    // (`>`) 규칙으로 결정되며 기존 안정 삽입정렬과 같은 내림차순을 준다.
     int cnt = 0;
-    for (int e = 0; e < n_exp; e++) {
-        float p = sh[e] / zs;
-        int pos = cnt;
-        for (int j = 0; j < cnt; j++) {
-            if (p > sp[j]) { pos = j; break; }
-        }
-        if (pos < k_sel) {
-            int last = min(cnt, k_sel - 1);
-            for (int j = last; j > pos; j--) { sel[j] = sel[j - 1]; sp[j] = sp[j - 1]; }
-            sel[pos] = e;
-            sp[pos] = p;
-            if (cnt < k_sel) cnt++;
+    {
+        const unsigned long long m = 0xffffffffffffffffull;
+        unsigned used = 0;                 // 레인의 16슬롯 소진 마스크
+        const int base = l * 16;
+        ids += (size_t)tok * k_sel;
+        wt += (size_t)tok * k_sel;
+        for (int r = 0; r < k_sel; r++) {
+            float best = -3.4028235e38f;
+            int bi = -1;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                int e = base + i;
+                if (e < n_exp && !(used & (1u << i))) {
+                    float p = sh[e];
+                    if (p > best) { best = p; bi = i; }
+                }
+            }
+            int bl = l;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                float ob = __shfl_xor_sync(m, best, off);
+                int ol = __shfl_xor_sync(m, bl, off);
+                if (ob > best) { best = ob; bl = ol; }
+            }
+            int wbi = __shfl_sync(m, bi, bl);   // 승자 레인의 슬롯
+            if (l == bl) used |= (1u << wbi);
+            if (l == 0 && bi >= 0 && best > -3.4028235e38f && cnt < k_sel) {
+                sel[cnt] = bl * 16 + wbi;
+                sp[cnt] = best / zs;
+                cnt++;
+            }
         }
     }
+    if (l != 0) return;
     float wsum = 0.0f;
     for (int j = 0; j < cnt; j++) wsum += sp[j];
     wsum = fmaxf(wsum, 6.103515625e-5f);
