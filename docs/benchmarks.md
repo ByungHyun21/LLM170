@@ -5320,3 +5320,21 @@ Warm tg8 (--reps 3): 673.2/669.2 -> 579.7/568.9 = 574.3 ms, i.e. 83.9 -> 71.8 ms
 Across the session the decode went from 131.9 to 71.8 ms/step (-46%), and against
 llama.cpp's 61 ms/step the gap is now 1.18x, down from 2.16x.
 
+
+## The MoE gate/up GEMM is already near-optimal; the down projection is the gap (2026-09-14)
+
+Arithmetic correction. The t=1 grouped GEMM for the gate/up launches 94 times per
+step at 4.76 ms total (51 us per call), and each call reads ten experts' slices of
+0.92 MB, i.e. 9.2 MB - so the effective pull is 180 GB/s against the 236 GB/s the
+probe measures. The kernel is at ~76% of DRAM and there is little to win there, which
+is exactly why the K-split (4x the blocks) bought 1.4%, the GEMV-style grid (16x the
+blocks, per-output-row tree reduction) was neutral, and the access-pattern probes
+never matched a 10x deficit: the deficit was arithmetic, not architectural. Both
+experiments were reverted.
+
+The real gap is the down projection: q4_gemm_q5_1_gm_ids takes 5.97 ms for 0.43 GB,
+i.e. 72 GB/s against the gate/up's 180 - a 2.5x deficit worth about 4 ms/step. That
+kernel keeps a shared-memory tile load from the grouped form (it stages a 16-row
+weight tile cooperatively) and its per-row expert lookup defeats that staging; giving
+it the gate/up treatment is the next step.
+
