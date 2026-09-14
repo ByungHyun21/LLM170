@@ -1055,6 +1055,10 @@ extern "C" __global__ void q4_qsa_attn_wt(const float* q, const float* ck, const
 
 // 선택 목록판 — `_wt`와 동일 산술·구조이나 키 순회가 마스크 스캔이 아니라
 // 압축된 선택 인덱스 목록(오름차순)이다. 목록은 top-k 블록 + 테일을 담는다.
+// 실측(2026-09-14, pp8192 t=1): 1.425 ms/호출 = 17.1 ms/스텝으로 최대 단일 커널.
+// 워프 = (토큰, 헤드) 하나이고 선택 목록은 토큰별이라 **24헤드가 같은 K/V 행을
+// 각자 다시 읽는다**: 8192위치 x 256 x 2 x 24헤드 = 403 MB/층 -> 236 GB/s로 1.7ms로
+// 측정치와 일치(대역폭 한계). 헤드 공유(4헤드판)는 t=1에서 점유율 때문에 중립이었다.
 extern "C" __global__ void q4_qsa_attn_sel(const float* q, const float* ck, const float* cv,
                                            const unsigned* sel_idx, const unsigned* sel_off,
                                            float* out, float kq_scale,

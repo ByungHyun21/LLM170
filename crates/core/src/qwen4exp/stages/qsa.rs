@@ -138,6 +138,11 @@ fn mask_from_list(
                 std::mem::take(&mut iq),
                 std::mem::take(&mut ik),
             ];
+            // 실측(2026-09-14, pp2048 청크): QSA 호스트 스테이지는 5.0s이고
+            // mm_group 38% + attn 37%(둘 다 가속기 작업) + sel_build 14% +
+            // sel+proj 10%다. 전송(d2h/h2d)은 0.07s로 무죄였다.
+            // sel_build의 버퍼 재사용은 중립(0.70 vs 0.71s) — 비용은 평탄화된
+            // 선택목록 물질화 자체라 커널이 블록 목록을 직접 순회해야 줄어든다.
             ctx.mm_group(xs, &[wq, wk, wv, w_iq, w_ik], &mut gi)?;
             if tm {
                 eprintln!("# qsa-stage mm_group={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);

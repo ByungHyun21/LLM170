@@ -2,6 +2,16 @@
 //! frame35의 op 순서를 그대로 옮기되 cubecl 프레임(op당 블로킹 제출)을
 //! 대체: 영속 버퍼 + 비동기 런치 + 마지막 1회 동기. 수치는 커널 검증
 //! 게이트(rawhip-check·미러)를 통과한 산술과 동일.
+//!
+//! 실측(2026-09-14, 27B Q4_K_XL):
+//! - 디코드 스텝 88.6ms 커널 / 40종. 큰 FFN GEMM은 개별 ~179 GB/s, 스텝 전체
+//!   ~169 GB/s = DRAM(236)의 71%로 사실상 한계다 — 이 모델의 디코드 여지는 ~10-20%뿐.
+//! - 프리필 pp512 = 1,415ms이고 네 GEMM 섹션(ffn_gate/ffn/gdn_mm/proj)이 86%,
+//!   ~19.5 TFLOPS = f32 피크의 34%. 호스트는 무죄다(cpu_submit=11.0ms).
+//! - 계측기 주의: LLM170_KTRACE 합계(366ms)와 LLM170_NOLAUNCH(1,014ms "호스트
+//!   스켈레톤")는 **배치 런치에서 신뢰 불가**하다(벽시계 1,409ms와 모순).
+//!   LLM170_PP_PROF 마크는 이 raw 경로 전용이고(프레임 경로는 무출력),
+//!   trace 섹션의 95.8ms는 계측기 자신의 hipEventCreate 비용이다.
 
 use cubecl_hip_sys as hip;
 use super::RawCtx;
