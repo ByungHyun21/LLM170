@@ -516,11 +516,12 @@ impl Q4Acc {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
-        // q4_K MMQ급 타일 — 산술은 core dot_q4k_q8과 동일 순서로 썼지만 실측
-        // 오답(ffn_gate_exps t=20: max_abs 1.105, max_rel 330)이라 **기본 제외**,
-        // 옵트인(LLM170_Q4K_MMQ=1)으로만 남긴다. 원인 규명은 다음 세션:
-        // 64원소 인터리브 배열(저니블=요소 0-31, 고니블=32-63)과 x 워드 대응
-        // (x1=it*16, x2=it*16+8)이 의심 지점.
+        // q4_K MMQ급 타일 — 산술은 core dot_q4k_q8과 동일 순서로 썼다.
+        // 2026-09-14 재검증: q4k-micro가 max_abs 0.0(CPU 참조와 비트 동일)이고
+        // Flash-Next diverse(24토큰 프리필+8디코드)도 기준열과 비트 동일하다 —
+        // 과거 "실측 오답(ffn_gate_exps t=20)" 기록은 이후 수정으로 해소됐다.
+        // 다만 pp2048 실측이 9,012~9,118 → 8,899~9,155ms로 중립(노이즈 범위)이라
+        // 기본은 여전히 끈 상태다: 이득이 아니라 속도 근거로 옵트인 유지.
         if ty == ggml_id(GgmlType::Q4K)
             && t >= 16
             && (std::env::var_os("LLM170_Q4K_MMQ").is_some()

@@ -5506,3 +5506,22 @@ fusing them - not retuning them - is the lever. GDN's AR kernel is only 0.83 ms/
 not the 50 ms the older plan recorded, so plans/66 P2 is a prefill-targeted item on this
 codebase.
 
+
+## The Q4_K MMQ-class tile is correct but not faster at prefill shapes (2026-09-14)
+
+q4_gemm_q4k_y (row-batched tile, dequant hoisted out of the row loop) was default-off with
+a comment citing a measured wrong result at ffn_gate_exps t=20. Re-verified:
+
+| check | default | LLM170_Q4K_MMQ=1 | +LLM170_Q4K_Y=1 |
+|---|---|---|---|
+| q4k-micro (16x256, t=16) vs CPU ref | 3.66e-4 | **0.0 (bit-identical)** | 4.88e-4 |
+| Flash-Next diverse 24-token prefill + 8 decode | baseline | **baseline (bit-identical)** | **baseline (bit-identical)** |
+| pp2048 | 9,012-9,118 ms | - | 8,899-9,155 ms |
+
+So the numeric objection no longer holds - the kernel agrees with dot_q4k_q8 exactly on the
+probe and the model stream is unchanged with it enabled. It is still default-off, but now
+for a speed reason: pp2048 is neutral within noise, and q4k-bench at t=20, 2560x640 shows
+0.498 vs 0.434 ms per call, i.e. the tiled form loses at these shapes. That closes the
+tiled-Q4_K route as a lever for the QSA stage's mm_group: the prefill's Q4_K projections
+are not slow because the wrong kernel is selected.
+
