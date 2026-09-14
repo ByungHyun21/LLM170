@@ -22,6 +22,7 @@ pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
 pub const CO_MMQ: u8 = 8; // mmq.co: llama mul_mat_q<q4_K/q5_K,128> + mmq_quant_y
 pub const CO_MMQ2: u8 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
 pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
+pub const CO_MMQ8: u8 = 64; // mmq8.co: libggml-hip fatbin에서 추출한 mul_mat_q<q8_0>(plans/71)
 static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn co_loaded(bit: u8) -> bool {
@@ -432,6 +433,12 @@ impl RawCtx {
                         "LLM170_CO6_PATH",
                         include_bytes!("co/mmq3.co"),
                         &["_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                    ),
+                    (
+                        CO_MMQ8,
+                        "LLM170_CO7_PATH",
+                        include_bytes!("co/mmq8.co"),
+                        &["_ZL9mul_mat_qIL9ggml_type8ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
                     ),
                     (
                         CO_J128,
@@ -1452,6 +1459,7 @@ impl RawCtx {
             13 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type13ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
             14 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type14ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
             23 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type23ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
+            8 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type8ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
@@ -1528,7 +1536,10 @@ impl RawCtx {
             [mp, l, d]
         }
         let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
-        let nbk = (n_in / 256) as u32;
+        // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
+        // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
+        let qk: usize = if ty == 8 { 32 } else { 256 };
+        let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
         let z3: [u32; 3] = [0, 0, 0];
@@ -1541,7 +1552,7 @@ impl RawCtx {
         let mut ays: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut p_nrows = n_out as i32;
         let mut p_ncolsdst = t as i32;
-        let mut p_srow = (n_in / 256) as i32;
+        let mut p_srow = (n_in / qk) as i32;
         let mut p_ncolsy = t as i32;
         let mut p_scol = n_out as i32;
         let smem: i32 = (j * 4 + 128 * 76 * 4 + ((j * 144 + 1023) / 1024) * 1024) as i32;
@@ -1654,7 +1665,10 @@ impl RawCtx {
             [mp, l, d]
         }
         let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
-        let nbk = (n_in / 256) as u32;
+        // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
+        // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
+        let qk: usize = if ty == 8 { 32 } else { 256 };
+        let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
         let z3: [u32; 3] = [0, 0, 0];
@@ -1667,7 +1681,7 @@ impl RawCtx {
         let mut ays: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut p_nrows = n_out as i32;
         let mut p_ncolsdst = t as i32;
-        let mut p_srow = (n_in / 256) as i32;
+        let mut p_srow = (n_in / qk) as i32;
         let mut p_ncolsy = t as i32;
         let mut p_scol = n_out as i32;
         let smem: i32 = (j * 4 + 128 * 76 * 4 + ((j * 144 + 1023) / 1024) * 1024) as i32;
