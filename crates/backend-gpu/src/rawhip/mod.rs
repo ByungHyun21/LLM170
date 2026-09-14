@@ -181,6 +181,20 @@ pub fn ktrace_dump() -> String {
     // ktrace_on 없이 호출되면(스펙 경로 등) 빈 문자열 — 과거 unwrap 패닉
     let Some(slot) = g.as_mut() else { return String::new() };
     let evs = std::mem::take(slot);
+    // 이벤트 핸들 정리 — 파괴하지 않으면 hipEvent 풀이 고갈되어(런치당 2개 생성,
+    // 13k 런치) 이후 생성이 실패하고 트레이스에서 통째로 누락된다(2026-09-14 규명).
+    struct Evs(Vec<KtraceEv>);
+    impl Drop for Evs {
+        fn drop(&mut self) {
+            unsafe {
+                for e in &self.0 {
+                    let _ = hip::hipEventDestroy(e.1 as *mut _);
+                }
+            }
+        }
+    }
+    let _evs_guard = Evs(evs);
+    let evs = &_evs_guard.0;
     let mut out = String::new();
     // 쌍 결합: 연속 동일 (name, gy) 두 이벤트가 start/end
     let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
@@ -639,6 +653,9 @@ impl RawCtx {
 
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
+        }
+        if std::env::var_os("LLM170_KT_NAMES").is_some() {
+            eprintln!("# KT3 {name} gy={gy}");
         }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
