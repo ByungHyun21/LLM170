@@ -13,7 +13,7 @@ pub use gdn::gdn_layer;
 pub use hc::{hc_mix, hc_mix_head};
 pub use moe::moe_ffn;
 pub use ple::{ple_block, ple_hash};
-pub use qsa::qsa_layer;
+pub use qsa::{qsa_cpu_attn_rows, qsa_layer, qsa_select, qsa_sel_list};
 
 use super::{Model4, Q4Error};
 use crate::matmul::{matmul, matmul_batch, Accelerator, Weight};
