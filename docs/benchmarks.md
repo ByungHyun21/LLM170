@@ -5143,3 +5143,19 @@ sequential mode (267 GB/s) applies, at the cost of 2x the bytes - a 36x pattern 
 against a 2x volume loss. The 27B record is corrected accordingly: its decode is not
 at the bandwidth bound, it is at the pattern bound, so P1 applies there too.
 
+
+## P1 (deq-f16 weights) does not transfer to this engine (measured 2026-09-14)
+
+The reference stack's #05 (bf16/f16 dequant cache + tensor-core GEMM, ablation 1.42x
+on a 16384-token prefill) was ported as far as this engine already allowed: the
+dequant_q4k_f16 kernel and the gemm_f16_v4 tensor-core path existed, so a q4_K sibling
+of gemm_f16_q6 was added and wired into both the single-weight and the grouped frame
+GEMMs, gated to t>=128. Measured on pp2048 with --reps 3: 9125.1/8176.9 ms against
+9079.4/8192.9 baseline, i.e. neutral. Reverted.
+
+The reason is visible in the numbers: our prefill runs at 2.8 TFLOPS (5.5% of the f32
+peak) and streams the weights far below DRAM bandwidth, so it is bounded neither by
+compute nor by bandwidth - the deq-f16 route addresses both of those and therefore
+changes nothing. The prefill needs the same treatment the decode got: decompose it by
+stage, find the inefficiency, and fix that. This also lowers P1's priority for the 27B.
+
