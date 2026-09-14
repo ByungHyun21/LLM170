@@ -5672,3 +5672,22 @@ relaxed.
 
 LLM170_QSA_H6=0 restores the 4-head kernel.
 
+
+## The Flash-Next prefill GEMMs are flat at ~2.5 TFLOPS across batch sizes (2026-09-14)
+
+q4k-bench on the QSA wq shape (2560x6144, Q4_K, MMQ tile path by default):
+
+| t | ms/call | TFLOPS | weight rate |
+|---|---|---|---|
+| 128 | 1.474 | 2.73 | 6.0 GB/s |
+| 512 | 6.401 | 2.52 | 1.4 GB/s |
+| 1024 | 12.581 | 2.56 | 0.7 GB/s |
+| 2048 | 27.203 | 2.37 | 0.3 GB/s |
+
+Flat efficiency means this is not an occupancy or batch-shape problem: the kernel costs
+the same per FLOP at t=128 as at t=2048, and the weight rate is nowhere near DRAM either,
+so it is per-element cost in the Q4_K dequant/dot path for this shape. That is also why
+the 27B reaches 19.5 TFLOPS with the same kernel family - its n_in/n_out (5120x17408) are
+large enough to amortise the row work. Closing the Flash-Next prefill gap therefore means
+a better tile for short-K wide-N shapes, not a scheduling change.
+
