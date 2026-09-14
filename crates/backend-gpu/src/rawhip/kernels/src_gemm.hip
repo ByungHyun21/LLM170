@@ -263,6 +263,269 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wm(
     }
 }
 
+// ─── plans/70 P1: f16 dequant-cache ───
+// dequant_f16_q5k — Q5_K 가중치를 f16 행우선 캐시로 1회 변환.
+// 값은 gemm_q5k_wm의 인라인 경로와 동일식(wv·ds0−ds1 → half)이라 캐시판
+// GEMM(gemm_q5k_wc)과 원판의 산술은 조각값부터 동일하다.
+extern "C" __global__ void dequant_f16_q5k(const unsigned* w, half* ac,
+                                           int n_in, int n_out) {
+    int o = blockIdx.x;              // 출력 행
+    if (o >= n_out) return;
+    int tid = threadIdx.x;           // 256스레드 = 서브블록 8 × 원소 32
+    int e8 = tid & 31;               // 서브블록 내 원소(0..31)
+    int blocks = n_in >> 8;
+    int n_sub = n_in >> 5;
+    for (int sb = tid >> 5; sb < n_sub; sb += 8) {
+    int js = sb & 7;
+    int it = js >> 1, half_ = js & 1;
+    int wq = ((o * blocks + (sb >> 3)) * 176) >> 2;
+    unsigned w0 = w[wq];
+    float d = bits_f16(w0 & 0xFFFFu);
+    float dm = bits_f16(w0 >> 16);
+    unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+    unsigned rr2 = (js & 3) * 8;
+    unsigned b1 = js < 4 ? (sc0 >> rr2) & 0xFFu : (sc1 >> rr2) & 0xFFu;
+    unsigned b4 = js < 4 ? (sc1 >> rr2) & 0xFFu : (sc2 >> rr2) & 0xFFu;
+    unsigned bm = (sc0 >> rr2) & 0xFFu;
+    unsigned sc_v, m_v;
+    if (js < 4) { sc_v = b1 & 63u; m_v = b4 & 63u; }
+    else { sc_v = (b4 & 0xFu) | ((bm >> 6) << 4); m_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+    float ds0 = d * (float)sc_v;
+    float ds1 = dm * (float)m_v;
+    unsigned nsh = half_ << 2;
+    int sh = 2 * it + half_;
+    int qbase = wq + 12 + it * 8;
+    int qhbase = wq + 4;
+    half* dst = ac + (size_t)o * n_in + (size_t)sb * 32;
+    int k = e8;                       // 스레드당 원소 1개(256스레드=256원소/블록 × 서브블록)
+    // e8는 0..31 — 서브블록 32원소를 32스레드가 1개씩: sb는 8개 중 1개 →
+    // 블록당 256스레드가 256원소를 정확히 덮는다(sb×32+e8 = tid).
+    unsigned byte_v = (w[qbase + (k >> 2)] >> ((k & 3) * 8)) & 0xFFu;
+    unsigned nib = (byte_v >> nsh) & 0xFu;
+    unsigned hi = (w[qhbase + (k >> 2)] >> ((k & 3) * 8 + sh)) & 1u;
+    float wv = (float)nib + (hi ? 16.0f : 0.0f);
+    dst[k] = __float2half(wv * ds0 - ds1);
+    }
+}
+
+// gemm_q5k_wc — gemm_q5k_wm의 A 적재만 f16 캐시 직독으로 교체.
+// B16·MMA·드레인은 원판과 동일(산술 상속, 조각값 동일 → 비트 동일 기대).
+extern "C" __global__ void __launch_bounds__(256) gemm_q5k_wc(
+        const unsigned* xq, const half* ac, float* out,
+        int n_in, int n_out, int xq_w, int t) {
+    __shared__ char smem[18432];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 6;
+    int lane = tid & 63;
+    int i0 = bid * 64;
+    if (i0 >= n_out) return;
+    int nrow = min(64, n_out - i0);
+    int row0 = wid * 16;
+    int n_sub = n_in >> 5;
+
+    fragment<accumulator, 16, 16, 16, float> fc[2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;
+
+    for (int sbp = 0; sbp < n_sub; sbp += 2) {
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            int sb = sbp + sbo;
+            if (sb >= n_sub) break;
+            // A16: 캐시 직독 — 레인당 1행 × 8원소(16B 정렬 연속)
+            {
+                int rr = lane & 15;
+                int kc = lane >> 4;
+                int row = row0 + rr;
+                if (row < nrow && kc < 4) {
+                    const half* Ar = ac + (size_t)(i0 + row) * n_in + (size_t)sb * 32;
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++)
+                        A16[sbo][wid][rr][kc * 8 + e] = Ar[kc * 8 + e];
+                }
+            }
+            // B16: 원판과 동일
+            {
+                int ti = tid >> 2;
+                int kc = tid & 3;
+                if (ti < t) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    unsigned ywa = xt[xw + 2 * kc];
+                    unsigned ywb = xt[xw + 2 * kc + 1];
+                    float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int k = kc * 8 + e;
+                        unsigned yw = ((e >> 2) == 0) ? ywa : ywb;
+                        int b = sext8((yw >> ((k & 3) * 8)) & 0xFFu);
+                        B16[sbo][ti][k] = __float2half((float)b * yd);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            #pragma unroll
+            for (int ks = 0; ks < 2; ks++) {
+                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+                load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
+                #pragma unroll
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
+                    fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                    load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int tth = 0; tth < 2; tth++) {
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
+    }
+}
+
+// dequant_f16_xs — iq4_xs(136B/256원소, LUT+6bit 스케일) → f16 행우선 캐시.
+// 값은 gemm_xs_wm 인라인 경로와 동일식(val·ds0 → half) — 캐시판 GEMM과 산술 동일.
+extern "C" __global__ void dequant_f16_xs(const unsigned* w, const unsigned* ktab2, half* ac,
+                                          int n_in, int n_out) {
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;            // 256 = 8서브블록 × 32원소
+    int k = tid & 31;
+    int blocks = n_in >> 8;
+    int n_sub = n_in >> 5;
+    for (int sb = tid >> 5; sb < n_sub; sb += 8) {
+    int ib = sb & 7;
+    int wb = o * blocks * 136 + (sb >> 3) * 136;
+    int wq = wb >> 2;
+    unsigned w0 = w[wq];
+    float d = bits_f16(w0 & 0xFFFFu);
+    int ls = (int)((w[wq + 1] >> (((ib >> 1) * 8 + (ib & 1) * 4))) & 0xFu)
+          | (int)((((w0 >> 16) >> (2 * ib)) & 3u) << 4);
+    float ds0 = d * (float)(ls - 32);
+    int qw = (wb + 8 + ib * 16) >> 2;
+    unsigned qv = w[qw + ((k & 15) >> 2)];
+    unsigned byte_v = (qv >> ((k & 3) * 8)) & 0xFFu;
+    unsigned tt2 = ktab2[byte_v];
+    int val = (k < 16) ? sext8(tt2 & 0xFFu) : sext8(tt2 >> 8);
+    ac[(size_t)o * n_in + (size_t)sb * 32 + k] = __float2half((float)val * ds0);
+    }
+}
+
+// dequant_f16_xs_dbg — 쓰기경로 검증(원소값 = tid).
+extern "C" __global__ void dequant_f16_xs_dbg(half* ac, int n_in, int n_out) {
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    ac[(size_t)o * n_in + tid] = __float2half((float)tid);
+}
+
+// gemm_xs_wc — gemm_xs_wm의 A 적재만 f16 캐시 직독으로 교체(산술 상속).
+extern "C" __global__ void __launch_bounds__(256) gemm_xs_wc(
+        const unsigned* xq, const half* ac, float* out,
+        int n_in, int n_out, int xq_w, int t) {
+    __shared__ char smem[18432];
+    half (*A16)[4][16][36] = (half (*)[4][16][36])smem;
+    half (*B16)[64][36] = (half (*)[64][36])(smem + 9216);
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int wid = tid >> 6;
+    int lane = tid & 63;
+    int i0 = bid * 64;
+    if (i0 >= n_out) return;
+    int nrow = min(64, n_out - i0);
+    int row0 = wid * 16;
+    int n_sub = n_in >> 5;
+
+    fragment<accumulator, 16, 16, 16, float> fc[2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) fill_fragment(fc[i], 0.0f);
+    int wpar = (tid >> 5) & 1;
+
+    for (int sbp = 0; sbp < n_sub; sbp += 2) {
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            int sb = sbp + sbo;
+            if (sb >= n_sub) break;
+            // A16: 캐시 직독 — 4레인이 한 행의 64B(4×16B)를 결합 로드
+            {
+                int rr = lane >> 2;            // 0..15행
+                int kc = lane & 3;             // 행 내 16B 청크
+                int row = row0 + rr;
+                if (row < nrow) {
+                    const half* Ar = ac + (size_t)(i0 + row) * n_in + (size_t)sb * 32;
+                    // 16B 벡터 로드 — f16 8개 = uint4 1회
+                    *(uint4*)&A16[sbo][wid][rr][kc * 8] = *(const uint4*)&Ar[kc * 8];
+                }
+            }
+            // B16: 원판과 동일
+            {
+                int ti = tid >> 2;
+                int kc = tid & 3;
+                if (ti < t) {
+                    const unsigned* xt = xq + ti * xq_w;
+                    int xw = (sb << 5) >> 2;
+                    unsigned ywa = xt[xw + 2 * kc];
+                    unsigned ywb = xt[xw + 2 * kc + 1];
+                    float yd = __uint_as_float(xt[(n_in >> 2) + sb]);
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int k = kc * 8 + e;
+                        unsigned yw = ((e >> 2) == 0) ? ywa : ywb;
+                        int b = sext8((yw >> ((k & 3) * 8)) & 0xFFu);
+                        B16[sbo][ti][k] = __float2half((float)b * yd);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sbo = 0; sbo < 2; sbo++) {
+            #pragma unroll
+            for (int ks = 0; ks < 2; ks++) {
+                fragment<matrix_a, 16, 16, 16, half, row_major> fa;
+                load_matrix_sync(fa, &A16[sbo][wid][0][ks * 16], 36);
+                #pragma unroll
+                for (int tth = 0; tth < 2; tth++) {
+                    int tt = wpar * 2 + tth;
+                    fragment<matrix_b, 16, 16, 16, half, col_major> fb;
+                    load_matrix_sync(fb, &B16[sbo][tt * 16][ks * 16], 36);
+                    mma_sync(fc[tth], fa, fb, fc[tth]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int tth = 0; tth < 2; tth++) {
+        int tt = wpar * 2 + tth;
+        #pragma unroll
+        for (int sl = 0; sl < 8; sl++) {
+            int pp2 = (tid & 31) + (sl << 5);
+            int dr = pp2 >> 4, dc = pp2 & 15;
+            int gr = row0 + dr, gc = tt * 16 + dc;
+            if (gr < nrow && gc < t)
+                out[(size_t)gc * n_out + i0 + gr] = fc[tth].x[sl];
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) gemm_q4k_wm(
         const unsigned* xq, const unsigned* w, float* out,
         int n_in, int n_out, int xq_w, int t) {
