@@ -5879,11 +5879,13 @@ The lever is therefore a device grouping with an exact (unpadded) bound for the 
 at minimum removing the synchronous 80 KB d2h from the host path. Either way it is the
 largest identified prefill item now that the gap map is trustworthy.
 
-First attempt, for the record: the device path's bound is rows*16+16 - a 16x overestimate,
-since the per-expert padding is at most 15 rows, so Sigma_e ceil(r_e/16)*16 <= rows + 16*ne.
-Enabling the device path for the prefill with that tighter bound (and dropping the t_cur()==1
-gate) fails immediately with h2d error 700 at the first call, which means the bound is not
-the padding rule the device kernel actually indexes by. The kernel's tile/padding semantics
-need reading before this can be retried; the conservative bound is not merely wasteful but
-load-bearing.
+First attempt, for the record. q4_moe_group_t1 computes off_pad as
+`accp += (r + 15) / 16 * 16` per expert, i.e. exactly 16-row alignment, so
+Sigma_e ceil(r_e/16)*16 <= rows + 16*ne is a valid bound and the path's rows*16+16 is a 16x
+overestimate. Enabling the device path for the prefill with the tighter bound (and dropping
+the t_cur()==1 gate) still fails immediately with h2d error 700, so the bound is not what
+breaks: the fault is elsewhere in the device path when it runs at prefill scale (rows
+20,480 against the decode's 10). The next thing to check is the buffer sizing around
+rows_pad, which the device discovers at runtime while the host sizes buffers from the
+conservative bound.
 
