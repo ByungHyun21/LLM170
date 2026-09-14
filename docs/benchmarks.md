@@ -52,6 +52,18 @@ pp2048 **288 t/s** (was 270-278), tg32 short 13.35, tg32 @8k **12.24 t/s**
 recompile the offline code objects (COs) and the llama-derived MMQ family with
 ROCm 10's hipcc - the current kernels were all built by 7.2.2's compiler.
 
+### ROCm 10 hipcc CO rebuild: neutral to worse - keep the 7.2.2-built kernels (2026-09-14)
+
+Rebuilt the three embedded code-object families (w32b j128 tiles, v4all,
+odd_all) from their canonical sources with the ROCm 10 hipcc and A/B'd them
+via the CO_PATH env overrides: 27B pp512 375.5 (old) vs 376.8 (new) - tie;
+Flash-Next pp2048 interleaved 281.5/288.5 (old) vs 274.7/267.8 (new) - the
+ROCm 10 build is 3-7% **slower** for the j128 family. The ROCm 10 gain is in
+the runtime (allocator/dispatch), not in codegen for these kernels; the
+7.2.2-compiled COs stay. build_co.py now prefers the ROCm 10 toolchain when
+present for future experiments, with this measurement as the reason the
+embedded COs were not swapped.
+
 ## Primary target scorecard — ACHIEVED (2026-09-14, HIP)
 
 27B Q4_K_XL non-MTP vs llama.cpp ROCm 10 (same prompts as the table below):
