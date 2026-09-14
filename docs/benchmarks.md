@@ -5573,3 +5573,29 @@ weight (8.8 MB Q4_K -> 25 MB f16 written and re-read) and the saving on the inte
 side is cancelled. The gate extension was reverted as neutral; the recorded next step is a
 graph-scoped dequant cache, which is what would make the f16 WMMA route pay.
 
+
+## Long-context decode: the QSA stage is 58% of the step (2026-09-14)
+
+pp8192 then 4 decode steps, frame timers plus KTRACE (the bench's tg without a long prompt
+never exercises this - n_past is the prompt length, so ctx alone does not reach it):
+
+| item | total | per call |
+|---|---|---|
+| frame-total t=1 (decode step) | 684.7 ms / 5 | 137 ms/step |
+| stage_mm_group | 3,654 ms / 120 | 30 ms |
+| stage_sel+proj | 2,147 ms / 120 | 18 ms |
+| stage_sel_build | 1,617 ms / 120 | 13 ms |
+| stage_attn (host side only) | 144 ms / 60 | 2.4 ms |
+| q4_qsa_attn_sel (KTRACE, device) | 17.1 ms/step | 1.425 ms |
+
+Two things stand out. First, the wall at long context is 195.7 ms/step against 83.9 ms of
+kernels, so over half the step is outside the kernel list even though the host submit cost
+is small elsewhere - that gap is unexplained and is the next thing to attribute. Second,
+within the QSA stage the cost is not the attention kernel but mm_group / sel+proj /
+sel_build, ~62 ms of the 137 ms step; these are host-visible and sync-bound because
+run_prepared ends in a d2h. mm_group at t=1 costing 30 ms is not explained by its transfer
+volume (25 KB), so launch/sync count or prepare_x is the suspect and needs measuring.
+
+The stage timers do not include device time for asynchronous launches: stage_attn reports
+2.4 ms while the same kernel measures 1.425 ms per call in KTRACE, so frame stage timings
+are host-side unless the stage ends in a d2h.
