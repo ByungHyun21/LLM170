@@ -5525,3 +5525,30 @@ for a speed reason: pp2048 is neutral within noise, and q4k-bench at t=20, 2560x
 tiled-Q4_K route as a lever for the QSA stage's mm_group: the prefill's Q4_K projections
 are not slow because the wrong kernel is selected.
 
+
+## Flash-Next prefill: the remaining levers are kernel-interface work (2026-09-14)
+
+Three candidate quick wins were measured at pp2048 (base 9,012-9,118 ms, 224-228 t/s)
+and all came back neutral, so none is the lever:
+
+| candidate | gate | result |
+|---|---|---|
+| Q4_K MMQ tile | LLM170_Q4K_MMQ=1 +Y=1 | 8,899-9,155 ms (neutral) |
+| f16 fused dequant GEMM (q8_0) | LLM170_F16_ACC=1 | 8,968-9,168 ms (neutral), diverse bit-identical |
+| selection-list buffer reuse | - | 0.70 vs 0.71 s (neutral, reverted) |
+
+Phase timing with LLM170_Q4ACC_TIME across ~400 accelerator calls shows upload 0.2 s
+(weights stay resident, as designed) and d2h 1.5 s, i.e. ~0.75 s per pp2048 chunk or 8% of
+it spent copying GEMM outputs back to host. That is inherent to the stage API: run_prepared
+allocates a fresh t*n_out f32 buffer, copies the device result into it and then scatters
+rows into Vec<Vec<f32>>, for every call. Removing it means letting stages consume
+device-resident buffers rather than row vectors - the same interface change that the QSA
+stage needs, and the common root of both the 8% d2h and the 14% selection-list cost.
+
+Where the 1.33x gap to llama.cpp (276.68 t/s at pp11750) actually sits: the QSA stage is
+57% of our prefill (mm_group 38% and attn 37% of it, both accelerator work at prefill
+shapes), and within that the QSA projection GEMMs run at roughly 1 TFLOP/s against the
+19.5 TFLOPS the 27B's MMQ paths reach. That is a kernel-quality gap in batched grouped
+GEMM at these shapes, not a dispatch or host problem, and it is the item that would move
+the prefill.
+
