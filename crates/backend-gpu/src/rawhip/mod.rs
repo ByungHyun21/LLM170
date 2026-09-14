@@ -504,10 +504,23 @@ impl RawCtx {
     }
     pub fn h2d(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
-            // 실패 시 크기·목적지를 남긴다 — 상한 가정이 여러 곳에 흩어진 경로에서
-            // "h2d: 700"만으로는 어느 복사인지 알 수 없었다(2026-09-14).
+            // 실패 시 크기·목적지·**호출 지점**을 남긴다. 상한 가정이 여러 곳에
+            // 흩어진 경로에서 "h2d: 700"만으로는 어느 복사인지 알 수 없었고,
+            // 크기만으로도 부족했다(2026-09-14). 백트레이스는 강제로 잡는다
+            // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
-            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag)?;
+            if let Err(e) = ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag) {
+                // 사후 hipMemGetInfo는 sticky 오류 때문에 0을 돌려준다(확인함) —
+                // 메모리 진단이 필요하면 이 h2d **전에** 조회해야 한다.
+                let bt = std::backtrace::Backtrace::force_capture();
+                let frames: Vec<String> = format!("{bt}")
+                    .lines()
+                    .filter(|l| l.contains("llm170") && !l.contains("backtrace"))
+                    .take(4)
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                return Err(format!("{e} | 호출: {}", frames.join(" <- ")));
+            }
             self.sync()
         }
     }
