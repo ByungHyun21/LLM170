@@ -1159,6 +1159,19 @@ impl RawCtx {
             8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
+        if std::env::var_os("LLM170_TILE_SHAPES").is_some() {
+            use std::sync::Mutex;
+            use std::sync::OnceLock;
+            static SEEN: OnceLock<Mutex<Vec<(String, usize, usize, usize)>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
+            if let Ok(mut v) = seen.lock() {
+                let key = (kern.to_string(), n_in, n_out, (t / 128) * 128);
+                if !v.contains(&key) {
+                    v.push(key.clone());
+                    eprintln!("# tile-shape {kern} n_in={n_in} n_out={n_out} t~{t}");
+                }
+            }
+        }
         let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128") || kern.ends_with("_v4");
         let rows_per_block: usize = if kern.ends_with("_j128") || kern.ends_with("_v4") { 128 } else if mm { 64 } else { 1 };
         let nblocks = n_out.div_ceil(rows_per_block);
