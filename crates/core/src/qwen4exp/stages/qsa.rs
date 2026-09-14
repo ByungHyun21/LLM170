@@ -387,83 +387,14 @@ fn mask_from_list(
         };
         let mut cpu_attn = false;   // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함)
 
-        let seq_state = &mut *seq;
         // 블록 키 캐시는 행마다 clone하지 않고 지역 버퍼로 승격한다(핫 루프 복사 제거).
-        let mut bk_local: Vec<f32> = std::mem::take(&mut seq_state.idx_bk[full_idx]);
+        // plans/67 2b(후반): 선택부를 추출본 qsa_select에 위임 — 캐시 적립(Pass A)·
+        // 블록 키 풀링·top-k 선택(Pass B)이 거기에 있고 산술은 원본과 동일하다.
+        // 여기는 q rope + CPU 폴백 마스크 복원 + 패스 C만 남는다.
+        let (sel_blk, sel_cnt, sel_stride) = qsa_select(
+            ctx, seq, il, &kk, &vv, &iq, &ik, t_len, full_idx,
+        )?;
         let r = hp.compress[il] as usize;
-        // 패스 A(직렬): KV·인덱서 캐시 적립 + q_rope(q norm·rope 포함).
-        // 패스 B(병렬): 블록 점수 + 선택 + 마스크. 행이 서로 독립이라 층 단위로
-        // 스레드를 한 번만 띄운다(행마다 spawn하면 오버헤드가 이득을 넘는다 — 실측).
-        // 패스 A(병렬): 토큰별 독립 — KV 캐시·인덱서 raw k·q_rope(q norm·rope).
-        // 블록 키 풀링만 토큰 순서에 의존(증분)하므로 패스 A 뒤에 따로 병렬로 돈다.
-        // 행별 산술은 그대로고 스레드 배정만 달라 수치 불변(토큰 동일로 검증).
-        let mut q_rows: Vec<Vec<Vec<f32>>> = vec![Vec::new(); t_len];
-        {
-            let nthreads_a = std::thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(4)
-                .min(32);
-            let per_a = t_len.div_ceil(nthreads_a.max(1)).max(1);
-            let pos0u = pos0 as usize;
-            let (idx_dim, idx_heads) = (hp.idx_dim, hp.idx_heads);
-            let (n_rot_l, rope_base, eps) = (n_rot, hp.rope_base, hp.eps);
-            let skip_kv = pos0u * n_kv * hd;
-            let skip_idx = pos0u * idx_dim;
-            let kk_r: &[Vec<f32>] = &kk;
-            let vv_r: &[Vec<f32>] = &vv;
-            let iq_r: &[Vec<f32>] = &iq;
-            let ik_r: &[Vec<f32>] = &ik;
-            let knw: &[f32] = &k_norm_w;
-            let iqw: &[f32] = &iq_w;
-            let st = &mut *seq_state;
-            let (kv_k, kv_v, idx_k) = (
-                st.kv_k[full_idx].as_mut_slice(),
-                st.kv_v[full_idx].as_mut_slice(),
-                st.idx_k[full_idx].as_mut_slice(),
-            );
-            std::thread::scope(|sc| {
-                for (ci, (((kc, vc), ic), qc)) in kv_k[skip_kv..]
-                    .chunks_mut(per_a * n_kv * hd)
-                    .zip(kv_v[skip_kv..].chunks_mut(per_a * n_kv * hd))
-                    .zip(idx_k[skip_idx..].chunks_mut(per_a * idx_dim))
-                    .zip(q_rows.chunks_mut(per_a))
-                    .enumerate()
-                {
-                    let base = ci * per_a;
-                    sc.spawn(move || {
-                        for (i, (((kch, vch), ich), qslot)) in kc
-                            .chunks_mut(n_kv * hd)
-                            .zip(vc.chunks_mut(n_kv * hd))
-                            .zip(ic.chunks_mut(idx_dim))
-                            .zip(qc.iter_mut())
-                            .enumerate()
-                        {
-                            let t = base + i;
-                            if t >= t_len {
-                                break;
-                            }
-                            let pos = pos0u as u32 + t as u32;
-                            for h in 0..n_kv {
-                                let lo = h * hd;
-                                let mut head = rms_norm(&kk_r[t][lo..lo + hd], knw, eps);
-                                rope_head(&mut head, pos, n_rot_l, rope_base);
-                                kch[lo..lo + hd].copy_from_slice(&head);
-                                vch[lo..lo + hd].copy_from_slice(&vv_r[t][lo..lo + hd]);
-                            }
-                            ich.copy_from_slice(&ik_r[t][..idx_dim]);
-                            let mut qr: Vec<Vec<f32>> = Vec::with_capacity(idx_heads);
-                            for h in 0..idx_heads {
-                                let lo = h * idx_dim;
-                                let mut qh = rms_norm(&iq_r[t][lo..lo + idx_dim], iqw, eps);
-                                rope_head(&mut qh, pos, idx_dim, rope_base);
-                                qr.push(qh);
-                            }
-                            *qslot = qr;
-                        }
-                    });
-                }
-            });
-        }
         // q norm·rope를 qg에 적용 — 원본과 동일 산술(어텐션은 패스 뒤 일괄).
         // 패스 A 병렬화 때 이 루프가 누락되어 어텐션이 비정규화 q를 쓰는 회귀가 있었다
         // (diverse 프롬프트 감사로 발견: out 해시가 갈렸다).
@@ -497,67 +428,8 @@ fn mask_from_list(
                 }
             });
         }
-        // 블록 키 캐시 — 청크 끝까지의 완전 블록을 병렬로(증분, 이전 청크분은 재사용).
-        {
-            let n_blocks_max = (pos0 as usize + t_len) / r;
-            if bk_local.len() < n_blocks_max * hp.idx_dim {
-                let dim = hp.idx_dim;
-                let b0 = bk_local.len() / dim;
-                bk_local.resize(n_blocks_max * dim, 0.0);
-                let idx_all: &[f32] = seq_state.idx_k[full_idx].as_slice();
-                let ikw: &[f32] = &ik_w;
-                let (eps, rope_base) = (hp.eps, hp.rope_base);
-                let nthreads_b = std::thread::available_parallelism()
-                    .map(|v| v.get())
-                    .unwrap_or(4)
-                    .min(32);
-                let per_b = (n_blocks_max - b0).div_ceil(nthreads_b.max(1)).max(1);
-                std::thread::scope(|sc| {
-                    for (ci, chunk) in bk_local[b0 * dim..].chunks_mut(per_b * dim).enumerate() {
-                        let base = b0 + ci * per_b;
-                        sc.spawn(move || {
-                            for (i, slot) in chunk.chunks_mut(dim).enumerate() {
-                                let b = base + i;
-                                if b >= n_blocks_max {
-                                    break;
-                                }
-                                let mut pooled = vec![0.0f32; dim];
-                                for j in 0..r {
-                                    let src = (b * r + j) * dim;
-                                    for i2 in 0..dim {
-                                        pooled[i2] += idx_all[src + i2];
-                                    }
-                                }
-                                for v in pooled.iter_mut() {
-                                    *v /= r as f32;
-                                }
-                                let mut pk = rms_norm(&pooled, ikw, eps);
-                                rope_head(&mut pk, (b * r) as u32, dim, rope_base);
-                                slot.copy_from_slice(&pk);
-                            }
-                        });
-                    }
-                });
-            }
-        }
-
-        // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
-        // 선택된 블록은 (정렬해) 고정 보폭 배열에 적재한다 — 이어서 패스 C가
-        // 오름차순 위치 목록으로 압축하고, GPU는 그 목록만 순회한다.
-        let sel_stride = hp.idx_top_k / r + 2;
-        let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
-        let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
-        // 패스 B — 행 단위 독립: 블록 점수 + 선택 + 마스크를 병렬로.
-        // 선택된 블록은 (정렬해) 고정 보폭 배열에 적재한다 — 이어서 패스 C가
-        // 오름차순 위치 목록으로 압축하고, GPU는 그 목록만 순회한다.
-        let sel_stride = hp.idx_top_k / r + 2;
-        let mut sel_blk: Vec<u32> = vec![0u32; t_len * sel_stride];
-        let mut sel_cnt: Vec<u32> = vec![0u32; t_len];
-        // 선택 목록에서 마스크를 복원한다 (GPU 경로에서 CPU 폴백이 걸릴 때만).
+        // CPU 폴백용 마스크 복원(GPU 경로에서 폴백이 걸릴 때만 필요 — 선택 목록에서 만든다).
         let mask_of = |t: usize, n_past: usize| -> Vec<bool> {
-            if !mask_all[t].is_empty() {
-                return mask_all[t].clone();
-            }
             let mut m = vec![false; n_past];
             let tail_start = (n_past / r) * r;
             for k2 in 0..sel_cnt[t] as usize {
@@ -571,103 +443,17 @@ fn mask_from_list(
             }
             m
         };
-        {
-            let bkl: &[f32] = &bk_local;
-            let qr: &[Vec<Vec<f32>>] = &q_rows;
-            let idx_dim = hp.idx_dim;
-            let idx_top_k = hp.idx_top_k;
-            // 16코어 × SMT = 32 논리 CPU — 캡을 두면 CPU 스테이지가 노는 동안
-            // GPU가 굶는다(프로파일: 창의 ~25% 유휴). 토큰별 산술은 그대로라
-            // 스레드 수는 수치에 영향이 없다.
-            let nthreads = std::thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(4)
-                .min(32);
-            let per = t_len.div_ceil(nthreads.max(1)).max(1);
-            let pos0u = pos0 as usize;
-            std::thread::scope(|sc| {
-                for (ci, (chunk, (blk_chunk, cnt_chunk))) in mask_all
-                    .chunks_mut(per)
-                    .zip(sel_blk.chunks_mut(per * sel_stride).zip(sel_cnt.chunks_mut(per)))
-                    .enumerate()
-                {
-                    let base = ci * per;
-                    sc.spawn(move || {
-                        for ((i, slot), (bslot, cslot)) in chunk
-                            .iter_mut()
-                            .enumerate()
-                            .zip(blk_chunk.chunks_mut(sel_stride).zip(cnt_chunk.iter_mut()))
-                        {
-                            let t = base + i;
-                            let n_past = pos0u + t + 1;
-                            let n_blocks = n_past / r;
-                            let tail_start = n_blocks * r;
-                            let bk = &bkl[..n_blocks * idx_dim];
-                            let mut block_score = vec![0.0f32; n_blocks];
-                            for b in 0..n_blocks {
-                                let pk = &bk[b * idx_dim..(b + 1) * idx_dim];
-                                for qh in &qr[t] {
-                                    // 4-누산기로 펼쳐 의존 사슬을 끊는다.
-                                    let (mut d0, mut d1, mut d2, mut d3) =
-                                        (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                                    let mut i2 = 0usize;
-                                    while i2 + 4 <= idx_dim {
-                                        d0 += qh[i2] * pk[i2];
-                                        d1 += qh[i2 + 1] * pk[i2 + 1];
-                                        d2 += qh[i2 + 2] * pk[i2 + 2];
-                                        d3 += qh[i2 + 3] * pk[i2 + 3];
-                                        i2 += 4;
-                                    }
-                                    while i2 < idx_dim {
-                                        d0 += qh[i2] * pk[i2];
-                                        i2 += 1;
-                                    }
-                                    let dot = (d0 + d1) + (d2 + d3);
-                                    if dot > 0.0 {
-                                        block_score[b] += dot;
-                                    }
-                                }
-                            }
-                            // 선택: 테일(강제) + 상위 B개 완전블록 — 폭 = min(n_past, top_k + r − 1)
-                            let width = n_past.min(idx_top_k + r - 1);
-                            let tail_cnt = n_past - tail_start;
-                            let n_sel_blocks = ((width - tail_cnt) / r).min(n_blocks);
-                            let mut sel_blocks: Vec<usize> = (0..n_blocks).collect();
-                            if n_sel_blocks < n_blocks {
-                                // 상위 n_sel_blocks개만 필요 — 전체 정렬 대신 부분 선택(평균 O(n)).
-                                sel_blocks.select_nth_unstable_by(n_sel_blocks, |&a, &b| {
-                                    block_score[b]
-                                        .partial_cmp(&block_score[a])
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                            }
-                            let mut mask = if need_mask { vec![false; n_past] } else { Vec::new() };
-                            if need_mask {
-                                for j in tail_start..n_past {
-                                    mask[j] = true;
-                                }
-                                for &b in &sel_blocks[..n_sel_blocks] {
-                                    for j in b * r..(b + 1) * r {
-                                        mask[j] = true;
-                                    }
-                                }
-                            }
-                            // 목록용: 선택 블록을 오름차순으로 고정 보폭 배열에.
-                            let mut sb: Vec<usize> = sel_blocks[..n_sel_blocks].to_vec();
-                            sb.sort_unstable();
-                            for (k2, &b) in sb.iter().enumerate() {
-                                bslot[k2] = b as u32;
-                            }
-                            *cslot = n_sel_blocks as u32;
-                            *slot = mask;
-                        }
-                    });
-                }
-            });
+        // CPU 어텐션 경로(need_mask)에서는 mask_all을 선택 목록에서 복원해 채운다 —
+        // 원본 Pass B가 마스크를 같이 채웠지만 추출본에는 목록만 있다(2026-09-14).
+        if need_mask {
+            for t in 0..n_tok {
+                let n_past = pos0 as usize + t + 1;
+                mask_all[t] = mask_of(t, n_past);
+            }
         }
         // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(폴백 경로).
         if !(gpu_attn && !cpu_attn) {
-            let (ckv, cvv) = (&seq_state.kv_k[full_idx], &seq_state.kv_v[full_idx]);
+            let (ckv, cvv) = (&seq.kv_k[full_idx], &seq.kv_v[full_idx]);
             for t in 0..t_len {
                 let n_past = (pos0 as usize) + t + 1;
                 let mut attn_out = std::mem::take(&mut attn_all[t]);
@@ -679,7 +465,6 @@ fn mask_from_list(
                 attn_all[t] = attn_out;
             }
         }
-        seq_state.idx_bk[full_idx] = bk_local;
         if tm {
             eprintln!("# qsa-stage t={t_len} sel+proj={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
             t_lap = std::time::Instant::now();
@@ -788,7 +573,7 @@ fn mask_from_list(
                 }
                 x
             };
-            let qflat: Vec<f32> = q_rows.iter().flatten().flatten().copied().collect();
+            let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
             let oflat: Vec<f32> = out.iter().flatten().copied().collect();
             eprintln!(
                 "# qsa-hash il={il} kv={:016x} idx={:016x} bk={:016x} q={:016x} out={:016x}",
