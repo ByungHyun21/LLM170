@@ -138,20 +138,22 @@ fn mask_from_list(
                 std::mem::take(&mut iq),
                 std::mem::take(&mut ik),
             ];
-            // 실측(2026-09-14, pp8192+tg4 프레임 타이머): **장문맥 디코드(t=1)의
-            // 최대 비용이 이 스테이지다** — 스텝 137ms 중 79ms(58%)이고 내역은
-            // mm_group 30ms/콜, sel+proj 18ms/콜, sel_build 13ms/콜이다. 어텐션
-            // 커널(KTRACE 1.425ms/콜 = 17.1ms/스텝)보다 이 host-visible 구간이 크다.
-            // mm_group이 t=1에서 30ms인 것은 전송량(d2h 25KB)으로 설명되지 않으므로
-            // 다음 조사 대상이다(런치+동기 횟수 또는 prepare_x 쪽 의심).
-            // 참고(pp2048 청크): QSA 호스트 스테이지는 5.0s이고
+            // 실측(2026-09-14, pp8192, t 라벨로 분리한 콜당 값):
+            //   t=1   : attn 2.55 · sel_build 1.39 · sel+proj 0.69 · mm_group 0.40 = 5.03ms
+            //           -> 스텝(12층) 60.4ms = 장문맥 디코드 프레임 144.2ms의 42%
+            //   t=2048: attn 100.97 · mm_group 72.76 · sel+proj 41.89 · sel_build 32.66
+            //           = 248.3ms/콜 -> 청크 12층 2.98s = 청크 8.9s의 33%
+            // 라벨 없이 합산하면 두 체제가 섞여 오염된 평균이 나온다(과거 5.0s/57%,
+            // 58% 주장의 원인). 최대 항목은 양쪽 모두 **attn**이고, KTRACE로 본
+            // 어텐션 커널 자체는 1.425ms/콜 = 17.1ms/스텝(장문맥 디코드).
+            // 확인된 것(pp2048 청크 전용): QSA 호스트 스테이지는 5.0s이고
             // mm_group 38% + attn 37%(둘 다 가속기 작업) + sel_build 14% +
             // sel+proj 10%다. 전송(d2h/h2d)은 0.07s로 무죄였다.
             // sel_build의 버퍼 재사용은 중립(0.70 vs 0.71s) — 비용은 평탄화된
             // 선택목록 물질화 자체라 커널이 블록 목록을 직접 순회해야 줄어든다.
             ctx.mm_group(xs, &[wq, wk, wv, w_iq, w_ik], &mut gi)?;
             if tm {
-                eprintln!("# qsa-stage mm_group={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                eprintln!("# qsa-stage t={t_len} mm_group={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
                 t_lap = std::time::Instant::now();
             }
             qg = std::mem::take(&mut gi[0]);
@@ -472,7 +474,7 @@ fn mask_from_list(
         }
         seq_state.idx_bk[full_idx] = bk_local;
         if tm {
-            eprintln!("# qsa-stage sel+proj={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+            eprintln!("# qsa-stage t={t_len} sel+proj={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
             t_lap = std::time::Instant::now();
         }
         // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
@@ -514,7 +516,7 @@ fn mask_from_list(
                 let ck = seq.kv_k[full_idx][..kn].to_vec();
                 let cv = seq.kv_v[full_idx][..kn].to_vec();
                 if tm {
-                    eprintln!("# qsa-stage sel_build={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
+                    eprintln!("# qsa-stage t={t_len} sel_build={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
                     t_lap = std::time::Instant::now();
                 }
                 // 미지원이면 CPU 어텐션 폴백 — gdn_ar과 같은 규약.
