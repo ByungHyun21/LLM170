@@ -5459,16 +5459,20 @@ LLM170_Q4_TIME splits the host stage (2048-token chunk, 24 layer calls) as:
 
 | stage | total | share | calls |
 |---|---|---|---|
-| attn | 2.29 s | 46% | 24 |
-| mm_group | 2.16 s | 44% | 72 |
-| sel+proj | 0.51 s | 10% | 72 |
+| mm_group | 1.92 s | 38% | 72 |
+| attn (device call + copies + mm_batch) | 1.87 s | 37% | 24 |
+| sel_build (host selection list) | 0.71 s | 14% | 72 |
+| sel+proj | 0.52 s | 10% | 72 |
 | wlookup, passB | 0.00 s | 0% | 72 |
 
-attn and mm_group together are 90% of it, and both are CPU implementations of operations
-the raw path already runs on the device: mm_group is the grouped Q4_K GEMM
-(q4_gemm_q4k_ge_ids) and attn is qsa_flash / qsa_mix2 / qsa_score, all of which the decode
-path exercises and the correctness gates cover. The frame path simply has a second, host
-QSA implementation. Routing the prefill's QSA through the device kernels therefore removes
+Follow-up instrumentation splits the attention lap and corrects part of the picture. The
+device path is in fact taken - no fallback message fires - and dev_weight caches device
+copies by host pointer, so neither mm_group nor attn is a re-upload. mm_group and attn
+are accelerator work already, run at prefill batch shapes through GEMV-class kernels
+rather than MMQ-class ones. What is genuinely host-side and removable is sel_build: 0.71 s
+of nested-loop index construction (sel_off prefix sums then a per-row block expansion into
+a fresh multi-megabyte Vec, zero-initialised, freed, and rebuilt on every call), i.e. 14%
+of the stage and 8% of the pp2048 chunk. Routing the prefill's QSA through the device kernels therefore removes
 ~4.45 s of the 8,831 ms chunk, i.e. about half of the Flash-Next prefill, without writing
 new math. The work is structural - the frame accelerator's interface has to expose the QSA
 op so the QSA layers can run device-resident - and it is the single largest remaining win
