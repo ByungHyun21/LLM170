@@ -2005,8 +2005,8 @@ impl Q4Acc {
             )?;
             return Ok(());
         }
-        // 비분할 — sel6/sel4 (기존 dev_raw와 동일 커널 선택)
-        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        // 비분할 — t>3은 sel4(K/V 4헤드 공유), t≤3은 sel. 상동 사유.
+        let use6 = false && n_head % 12 == 0;
         let mut q_p = qdev as *mut std::ffi::c_void;
         let mut o_p = odev as *mut std::ffi::c_void;
         let mut k_p = ckp as *mut std::ffi::c_void;
@@ -2101,14 +2101,24 @@ impl Q4Acc {
             (&mut h) as *mut _ as *mut std::ffi::c_void,
             (&mut tt) as *mut _ as *mut std::ffi::c_void,
         ];
-        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
-        let (kern, gy, blk) = if use6 {
-            ("q4_qsa_attn_sel6", (n_head / 12) as u32, 256u32)
-        } else {
+        // 프리필(t>3)은 sel4 — K/V를 4헤드가 공유(트래픽 1/4, 호스트 경로와
+        // 동일 선택). sel6(6헤드)은 K/V를 묶음마다 재독해 t=2048 실측 40ms/런치
+        // 까지 올라갔다(2026-09-14 KTRACE, 48런치 1.92s) — 프리필 회귀였음.
+        // t≤3도 호스트 규약대로 sel(헤드당 워프)을 쓴다.
+        let _ = n_head % 12;
+        let (kern, gy, blk) = if t > 3 {
             ("q4_qsa_attn_sel4", (n_head / 8) as u32, 256u32)
+        } else {
+            ("q4_qsa_attn_sel", (n_head / 4) as u32, 128u32)
         };
-        let gx = t.div_ceil(4) as u32;
-        self.ctx.launch3(kern, gx, gy, 1, blk, &mut args)?;
+        if t > 3 {
+            let gx = t.div_ceil(4) as u32;
+            self.ctx.launch3(kern, gx, gy, 1, blk, &mut args)?;
+        } else {
+            // _sel 원본 규격: 블록 16워프=16토큰(워프당 1헤드), gy=n_head.
+            self.ctx
+                .launch3("q4_qsa_attn_sel", t.div_ceil(16) as u32, n_head as u32, 1, 512, &mut args)?;
+        }
         Ok(())
     }
 
