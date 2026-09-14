@@ -689,7 +689,7 @@ extern "C" __global__ void q4_moe_group_t1(
         int* __restrict__ out_off, unsigned* __restrict__ perm, unsigned* __restrict__ inv,
         unsigned* __restrict__ rowexp, unsigned* __restrict__ perm_pad,
         unsigned* __restrict__ inv_pad, unsigned* __restrict__ tilexp,
-        int* __restrict__ rows_pad_out) {
+        int* __restrict__ rows_pad_out, int bound) {
     // 단일 스레드판은 전역 쓰기 ~700회가 캐시 미스 지연으로 직렬화되어
     // 0.5ms/층(=24ms/스텝)이었다. 스캔만 lane 0이 하고 나머지는 워프/블록
     // 병렬로 — 순서는 호스트판과 동일(안정 카운팅, 16행 정렬 패딩)이라
@@ -747,6 +747,8 @@ extern "C" __global__ void q4_moe_group_t1(
         int e = (int)tilexp[pd >> 4];
         int i = pd - off_pad[e];
         int r = off[e + 1] - off[e];
+        // rowexp는 GEMM이 t = rows_pad로 읽으므로 패딩 슬롯까지 채워야 한다.
+        rowexp[pd] = (unsigned)e;
         if (i < r) {
             unsigned src = perm[off[e] + i];
             perm_pad[pd] = src;
@@ -755,7 +757,6 @@ extern "C" __global__ void q4_moe_group_t1(
             perm_pad[pd] = 0;
         }
     }
-    int bound = rows * 16 + 16;
     for (int pd = (rp > (bound & ~15) ? rp : (bound & ~15)); pd < bound; pd += nt) {
         perm_pad[pd] = 0;
     }

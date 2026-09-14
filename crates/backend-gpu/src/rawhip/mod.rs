@@ -504,7 +504,10 @@ impl RawCtx {
     }
     pub fn h2d(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
-            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), "h2d")?;
+            // 실패 시 크기·목적지를 남긴다 — 상한 가정이 여러 곳에 흩어진 경로에서
+            // "h2d: 700"만으로는 어느 복사인지 알 수 없었다(2026-09-14).
+            let tag = format!("h2d {}B dst={dst:p}", src.len());
+            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag)?;
             self.sync()
         }
     }
