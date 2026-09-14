@@ -526,6 +526,13 @@ impl RawCtx {
                 hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream2), "h2d-async-s")
         }
     }
+    /// 디바이스→디바이드 복사(메인 스트림) — QSA KV 상주 풀 append용(plans/67 3단계).
+    pub fn d2d(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<(), String> {
+        unsafe {
+            ck(hip::hipMemcpyAsync(dst as *mut _, src as *const _, bytes,
+                hip::hipMemcpyKind_hipMemcpyDeviceToDevice, self.stream), "d2d")
+        }
+    }
     pub fn h2d(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
             // 실패 시 크기·목적지·**호출 지점**을 남긴다. 상한 가정이 여러 곳에

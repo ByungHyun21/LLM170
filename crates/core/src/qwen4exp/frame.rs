@@ -444,7 +444,7 @@ pub fn frame_forward(
             // 시점엔 캐시 미변경이라 이중 적립이 없다.
             if stage_skipped("qsa") {
                 // 진단용: QSA 브리지 생략(출력 무효).
-            } else if qsa_frame(acc, model, ctx, seq_st, f, il, t, full_idx).is_ok() {
+            } else if qsa_frame(acc, model, ctx, seq_st, f, il, t, full_idx, seq).is_ok() {
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             } else {
             let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
@@ -554,8 +554,12 @@ fn qsa_frame(
     il: usize,
     t: usize,
     full_idx: usize,
+    seq: usize,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
+    let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
+    let t_qsa = std::time::Instant::now();
+    let mut lap = t_qsa;
     let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
     let (n_rot, idx_dim) = (hp.n_rot, hp.idx_dim);
     let wq = model.w4(&format!("blk.{il}.attn_q.weight"))?;
@@ -591,6 +595,10 @@ fn qsa_frame(
     )
     .map_err(Q4Error::Io)?;
     sync_mark(acc, "qsa.qkrope", f.qsa_k)?;
+    if qtm {
+        eprintln!("# qsa-frame L{il} t={t} mm+rope={:.2}ms", t_qsa.elapsed().as_secs_f64() * 1e3);
+        lap = std::time::Instant::now();
+    }
     // 3) 캐시 적립용 최소 d2h — iq/ik(선택 로직 입력) + k(이미 norm·rope됨)/v.
     let (iq_len, ik_len, kv_len) = (
         hp.idx_heads * idx_dim,
@@ -609,6 +617,10 @@ fn qsa_frame(
     let rows = |flat: &[f32], w: usize| -> Vec<Vec<f32>> {
         flat.chunks_exact(w).map(|c| c.to_vec()).collect()
     };
+    if qtm {
+        eprintln!("# qsa-frame L{il} t={t} d2h={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
+        lap = std::time::Instant::now();
+    }
     let kk = rows(&k_v, kv_len);
     let vv = rows(&v_v, kv_len);
     let iq = rows(&iq_v, iq_len);
@@ -621,15 +633,45 @@ fn qsa_frame(
     let r = hp.compress[il] as usize;
     let (sel_idx, sel_off) =
         stages::qsa_sel_list(&sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t);
+    if qtm {
+        eprintln!("# qsa-frame L{il} t={t} select+list={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
+        lap = std::time::Instant::now();
+    }
     // 5) 어텐션 — q를 디바이스 버퍼에서 직접. 실패 시에만 d2h q + CPU 재계산.
     let kq_scale = hp.kq_scale();
     let kn_max = (pos0 as usize + t) * n_kv * hd;
+    // plans/67 3단계: KV 상주 풀 우선 — k/v를 D2D append하고 어텐션이 풀을
+    // 직접 읽는다(매 층 매 스텝의 캐시 재업로드 8k 문맥 32MB 제거).
+    // 미지원/실측 실패 시 기존 업로드 경로(qsa_attention_dev)로, 그것도
+    // 실패하면 CPU 재계산으로 — 3단 폴백.
+    let res = if std::env::var_os("LLM170_QSA_NORES").is_some() {
+        Err("진단: 상주 풀 비활성".to_string())
+    } else {
+        acc.qsa_kv_dev(full_idx, seq, f.qsa_k, f.qsa_v, t, pos0 as usize, n_kv, hd)
+            .and_then(|(kc, vc)| {
+                acc.qsa_attention_dev_res(
+                    f.qsa_q, kc, vc, &sel_idx, &sel_off, kq_scale,
+                    n_head, n_kv, hd, t, f.qsa_attn,
+                )
+            })
+    };
     let ck = &seq_st.kv_k[full_idx][..kn_max];
     let cv = &seq_st.kv_v[full_idx][..kn_max];
-    if let Err(e) = acc.qsa_attention_dev(
-        f.qsa_q, ck, cv, &sel_idx, &sel_off, kq_scale,
-        n_head, n_kv, hd, t, f.qsa_attn,
-    ) {
+    if std::env::var_os("LLM170_QSA_RESCHECK").is_some() {
+        if let Err(e) = acc.qsa_kv_check(full_idx, seq, ck, cv) {
+            eprintln!("# qsa-rescheck L{il} t={t} pos0={pos0}: {e}");
+        }
+    }
+    let attn = res.or_else(|e2| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("# qsa-frame: 상주 풀 미사용 — 업로드 경로 ({e2})"));
+        acc.qsa_attention_dev(
+            f.qsa_q, ck, cv, &sel_idx, &sel_off, kq_scale,
+            n_head, n_kv, hd, t, f.qsa_attn,
+        )
+        .map_err(|e| format!("{e2}; {e}"))
+    });
+    if let Err(e) = attn {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             eprintln!("# qsa-frame: GPU 어텐션 폴백 — CPU 재계산 ({e})")
@@ -645,8 +687,13 @@ fn qsa_frame(
         acc.frame_write(f.qsa_attn, &flat).map_err(Q4Error::Io)?;
     }
     // 6) wo 투영 — 어텐션 출력을 디바이스에서 ffn_out으로(왕복 0).
+    if qtm {
+        eprintln!("# qsa-frame L{il} t={t} attn={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
+        lap = std::time::Instant::now();
+    }
     acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
         .map_err(Q4Error::Io)?;
+    let _ = &mut lap;
     Ok(())
 }
 

@@ -119,6 +119,11 @@ pub struct Q4Acc {
     qn: std::sync::Mutex<GBuf>,
     kn: std::sync::Mutex<GBuf>,
     cst: std::sync::Mutex<GBuf>,
+    /// QSA KV 상주 풀 [(full_idx, seq)] → (k, v) — plans/67 3단계.
+    qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf)>>,
+    /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
+    /// 구멍(값 경로 청크·롤백·리줌)을 읽는 사고를 막는다(불일치 → 업로드 폴백).
+    qsa_kv_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -289,6 +294,8 @@ impl Q4Acc {
             qn: std::sync::Mutex::new(GBuf::new("qn")),
             kn: std::sync::Mutex::new(GBuf::new("kn")),
             cst: std::sync::Mutex::new(GBuf::new("cst")),
+            qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
@@ -1832,6 +1839,208 @@ impl Q4Acc {
     /// plans/67 1단계: **디바이스 q판** — q가 wq의 frame_mm_group 출력(디바이스)에
     /// 이미 있을 때 h2d 없이 어텐션을 돌고 결과를 디바이스 out에 쓴다(d2h도 없음).
     /// k/v는 기존 풀 업로드 경로(실측: KV 업로드는 유의미한 비용이 아님).
+    /// QSA KV 상주 풀 — ctx_len 전체를 선할당(주소 안정성: ensure 재할당이
+    /// 어텐션 커널에 전달된 포인터를 무효화하지 않게 1회 확정). k/v 행은
+    /// D2D로 append(왕복 0). 반환 핸들 = 풀 포인터(디바이스 주소).
+    fn qsa_kv_dev_impl(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        k: u64,
+        v: u64,
+        t: usize,
+        pos0: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Result<(u64, u64), String> {
+        let ctx_len = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx_len == 0 {
+            return Err("qsa_kv_dev: ctx_len 미주입".into());
+        }
+        let bytes = ctx_len * n_kv * hd * 4;
+        // 워터마크 — 이 풀에 적립된 다음 위치. 규칙:
+        //   pos0 == w: 정상 순차 적립.
+        //   pos0 <  w: **되감기** — 위치 p의 k/v는 (토큰 접두어, p)의 결정 함수라
+        //              접두어가 불변인 되감기(벤치 워밍업 후 재시작, 스펙 롤백,
+        //              슬롯 재프리필)에서 [0, pos0)의 기존 값과 새 값이 동일하다.
+        //              재구축도 순서대로 돌아 과거 청크가 이번 재구축분을 덮는다.
+        //   pos0 >  w: 구멍(값 경로 청크 등) — 읽을 수 없으니 업로드 경로로 폴백.
+        {
+            let mut wm = self.qsa_kv_pos.lock().map_err(|e| e.to_string())?;
+            let w = wm.entry((full_idx, seq)).or_insert(0);
+            if pos0 > *w {
+                return Err(format!(
+                    "qsa_kv_dev: 워터마크 구멍 w={w} pos0={pos0} — 업로드 경로로 폴백"
+                ));
+            }
+            *w = pos0 + t;
+        }
+        let mut m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
+        let ent = m
+            .entry((full_idx, seq))
+            .or_insert_with(|| (GBuf::new("qsakv_k"), GBuf::new("qsakv_v")));
+        if ent.0.bytes < bytes {
+            ent.0.ensure(&self.ctx, bytes)?;
+            ent.1.ensure(&self.ctx, bytes)?;
+        }
+        let (kp, vp) = (ent.0.ptr, ent.1.ptr);
+        let rows = t * n_kv * hd * 4;
+        let ksrc = self.fptr(k)?;
+        let vsrc = self.fptr(v)?;
+        self.ctx
+            .d2d(unsafe { kp.add(pos0 * n_kv * hd * 4) }, ksrc, rows)?;
+        self.ctx
+            .d2d(unsafe { vp.add(pos0 * n_kv * hd * 4) }, vsrc, rows)?;
+        Ok((kp as u64, vp as u64))
+    }
+
+    /// 상주 캐시판 어텐션 — ck/cv가 디바이스 주소(업로드 없음). 커널 선택은
+    /// qsa_attention_dev와 동일(t=1 분할 우선).
+    fn qsa_attn_res(
+        &self,
+        q: u64,
+        ckp: u64,
+        cvp: u64,
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        let use_split = t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0");
+        let (sdev, ofdev, pdev) = {
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
+            let n_splits = if use_split {
+                let list_len = sel_off
+                    .get(1)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
+                let cap = std::env::var("LLM170_QSA_SPLITS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(64);
+                (list_len / 32).clamp(1, cap.max(1).min(512))
+            } else {
+                1
+            };
+            let mut g = self.qsp.lock().map_err(|e| e.to_string())?;
+            let pdev = g.ensure(&self.ctx, n_head * n_splits * 32 * 10 * 4)?;
+            (sdev, ofdev, pdev)
+        };
+        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
+        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
+        let qdev = self.fptr(q)?;
+        let odev = self.fptr(out)?;
+        if use_split {
+            let list_len = sel_off
+                .get(1)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
+            let cap = std::env::var("LLM170_QSA_SPLITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+            let mut q_p = qdev as *mut std::ffi::c_void;
+            let mut k_p = ckp as *mut std::ffi::c_void;
+            let mut v_p = cvp as *mut std::ffi::c_void;
+            let mut si_p = sdev as *mut std::ffi::c_void;
+            let mut so_p = ofdev as *mut std::ffi::c_void;
+            let mut pa_p = pdev as *mut std::ffi::c_void;
+            let mut ns = n_splits as i32;
+            let mut sc = kq_scale;
+            let mut nh = n_head as i32;
+            let mut nk = n_kv as i32;
+            let mut h = hd as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut pa_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut sc) as *mut _ as *mut std::ffi::c_void,
+                (&mut nh) as *mut _ as *mut std::ffi::c_void,
+                (&mut nk) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_qsa_attn_sel4s",
+                n_splits.div_ceil(4) as u32,
+                (n_head / 12) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+            let mut pa_p = pdev as *mut std::ffi::c_void;
+            let mut q_p = qdev as *mut std::ffi::c_void;
+            let mut o_p = odev as *mut std::ffi::c_void;
+            let mut ns = n_splits as i32;
+            let mut nh = n_head as i32;
+            let mut h = hd as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut pa_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut nh) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_qsa_attn_sel4s_merge",
+                n_head.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+            return Ok(());
+        }
+        // 비분할 — sel6/sel4 (기존 dev_raw와 동일 커널 선택)
+        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        let mut q_p = qdev as *mut std::ffi::c_void;
+        let mut o_p = odev as *mut std::ffi::c_void;
+        let mut k_p = ckp as *mut std::ffi::c_void;
+        let mut v_p = cvp as *mut std::ffi::c_void;
+        let mut si_p = sdev as *mut std::ffi::c_void;
+        let mut so_p = ofdev as *mut std::ffi::c_void;
+        let mut sc = kq_scale;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tt = t as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let (kern, gy, blk) = if use6 {
+            ("q4_qsa_attn_sel6", (n_head / 12) as u32, 256u32)
+        } else {
+            ("q4_qsa_attn_sel4", (n_head / 8) as u32, 256u32)
+        };
+        let gx = t.div_ceil(4) as u32;
+        self.ctx.launch3(kern, gx, gy, 1, blk, &mut args)?;
+        Ok(())
+    }
+
     /// 산술은 `qsa_attn_sel6_raw`와 동일(같은 커널) → 비트 동일 기대.
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_dev_raw(
@@ -2043,6 +2252,7 @@ impl Q4Acc {
         t: usize,
         out: u64,
     ) -> Result<(), String> {
+        let _ = t; // t==1 규약(호출부가 보장) — 커널은 sel_off로 범위를 안다
         let list_len = sel_off
             .get(1)
             .copied()
@@ -2374,6 +2584,75 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         } else {
             self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
         }
+    }
+
+    fn qsa_kv_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        k: u64,
+        v: u64,
+        t: usize,
+        pos0: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Result<(u64, u64), String> {
+        self.qsa_kv_dev_impl(full_idx, seq, k, v, t, pos0, n_kv, hd)
+    }
+
+    fn qsa_kv_check(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        host_ck: &[f32],
+        host_cv: &[f32],
+    ) -> Result<(), String> {
+        let m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
+        let Some((kb, vb)) = m.get(&(full_idx, seq)) else {
+            return Err("qsa_kv_check: 풀 없음".into());
+        };
+        let n = host_ck.len().min(kb.bytes / 4);
+        let mut got = vec![0.0f32; n];
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut got), kb.ptr as *const u8)
+            .map_err(|e| e.to_string())?;
+        for (i, (a, b)) in got.iter().zip(host_ck[..n].iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                return Err(format!(
+                    "qsa_kv_check k 불일치 @float {i}: pool={a:e} host={b:e}"
+                ));
+            }
+        }
+        let n = host_cv.len().min(vb.bytes / 4);
+        let mut got = vec![0.0f32; n];
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut got), vb.ptr as *const u8)
+            .map_err(|e| e.to_string())?;
+        for (i, (a, b)) in got.iter().zip(host_cv[..n].iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                return Err(format!(
+                    "qsa_kv_check v 불일치 @float {i}: pool={a:e} host={b:e}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn qsa_attention_dev_res(
+        &self,
+        q: u64,
+        ck: u64,
+        cv: u64,
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        self.qsa_attn_res(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
     }
 
     fn matmul_paired(

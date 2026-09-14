@@ -241,6 +241,56 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("frame_qk_norm_rope: 이 가속기는 미지원".into())
     }
 
+    /// plans/67 3단계: QSA KV 캐시 **디바이스 상주화** — (full_idx, seq) 풀에
+    /// k/v 행(mm_group 출력 버퍼, 이미 norm·rope 완료)을 D2D append하고 풀
+    /// 핸들을 반환한다. 어텐션이 이 풀을 직접 읽으면 매 층 매 스텝의 캐시
+    /// 재업로드(8k 문맥 32MB)가 사라진다. 미지원이면 Err(호출부가 업로드 경로로).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_kv_dev(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _k: u64,
+        _v: u64,
+        _t: usize,
+        _pos0: usize,
+        _n_kv: usize,
+        _hd: usize,
+    ) -> Result<(u64, u64), String> {
+        Err("qsa_kv_dev: 이 가속기는 미지원".into())
+    }
+
+    /// 진단: 상주 풀 내용이 호스트 캐시와 비트一致하는지 검증(plans/67 3단계 디버그).
+    fn qsa_kv_check(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _host_ck: &[f32],
+        _host_cv: &[f32],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 디바이스 상주 캐시판 어텐션 — ck/cv는 qsa_kv_dev가 반환한 핸들.
+    /// 산술·커널은 qsa_attention_dev와 동일(t=1 분할 규약 포함).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev_res(
+        &self,
+        _q: u64,
+        _ck: u64,
+        _cv: u64,
+        _sel_idx: &[u32],
+        _sel_off: &[u32],
+        _kq_scale: f32,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+        _out: u64,
+    ) -> Result<(), String> {
+        Err("qsa_attention_dev_res: 이 가속기는 미지원".into())
+    }
+
     /// QSA 선택-목록 GQA의 **디바이스 q판** — q가 이미 디바이스 버퍼(wq의
     /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다(plans/67 1단계).
     /// k/v는 기존처럼 캐시 업로드 경로(kv_sync)를 쓴다. 출력은 out 버퍼에.
