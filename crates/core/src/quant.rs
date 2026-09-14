@@ -507,8 +507,8 @@ pub fn dot_q4k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
         let (d2, mm2) = (d * sc2 as f32, min * m2 as f32);
         let mut isum1 = 0i64;
         let mut isum2 = 0i64;
-        let mut qsum1 = 0i64;
-        let mut qsum2 = 0i64;
+        let qsum1: i64;
+        let qsum2: i64;
         for l in 0..32 {
             let q = qs[it * 32 + l];
             isum1 += (q & 0xF) as i64 * y_el(y, it * 64 + l);

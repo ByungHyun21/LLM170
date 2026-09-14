@@ -233,8 +233,8 @@ fn fs_begin(acc: &dyn Accelerator, t: usize) {
     fs.frame_begin(t);
 }
 
-/// 스테이지 동기 마커 (LLM170_FRAME_SYNC=1) — 스티키 폴트의 발생 지점을
-/// 즉시 드러낸다(폴트는 다음 API 호출에서야 보고된다).
+// 스테이지 동기 마커 (LLM170_FRAME_SYNC=1) — 스티키 폴트의 발생 지점을
+// 즉시 드러낸다(폴트는 다음 API 호출에서야 보고된다).
 thread_local! {
     /// 스테이지 누적 시간 — (마지막 경계 시각, [(접미사, us, 호출수)]).
     static FT: std::cell::RefCell<(std::time::Instant, Vec<(String, u64, u64)>)> =
@@ -288,7 +288,7 @@ fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
 
 /// 청크/스텝 단위 리포트 — 누적이 있으면 한 줄 출력 후 초기화.
 /// (디코드 t=1도 찍는다: 프리필과 달리 동기 지점이 많아 누적-지연 왜곡이 없다.)
-fn ftime_report(t: usize) {
+fn ftime_report(_t: usize) {
     if !ftime_on() {
         return;
     }

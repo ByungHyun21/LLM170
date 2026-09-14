@@ -2,6 +2,7 @@
 //! llama.cpp mtmd/models/qwen3vl.cpp 산술 미러:
 //!   conv 패치 → merge-major 재배열 → +patch_bias → +pos_embd → 27×(LN→qkv→비전 M-RoPE→
 //!   MHA→잔차→LN→GELU FFN→잔차) → post_ln → 2×2 결합 → mm.0 GELU → mm.2 → [576][5120].
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;

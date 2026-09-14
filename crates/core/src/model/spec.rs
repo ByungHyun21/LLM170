@@ -498,7 +498,7 @@ impl Engine {
             let kept = carried[si].len() + new_kept[si];
             let base = group_pos[si];
             let mut prev_h = self.seqs[seqs[si]].mtp_pending_h.clone();
-            let mut trow = vec![0.0f32; n_e];
+            let _trow = vec![0.0f32; n_e];
             for r in carried[si].len()..kept {
                 // 행 r 토큰 = carried면 carried[r], else next/drafts
                 let tok = if r < carried[si].len() {

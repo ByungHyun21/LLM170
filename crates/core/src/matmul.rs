@@ -3,6 +3,7 @@
 //! ggml 텐서 레이아웃: W [ne0=n_in, ne1=n_out] 행 우선 — out[o] = Σ_i x[i]·W[o,i].
 //! ADR-0005: GPU 커널이 아닌 CPU 참조 경로. FMA 없는 mul+add (x86-64 기본 타깃은
 //! auto-FMA가 없어 자동으로 성립; target-feature 변경 시 재검토 필요 — 주석 유지).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use llm170_gguf::GgmlType;
 use llm170_profiler::profile_span;

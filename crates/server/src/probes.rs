@@ -2,6 +2,7 @@
 //! 본체는 backend-gpu(rawhip 프로브 fn, rawvk check fn)에 있고 여기는
 //! 인자 파싱+호출만. 결론난 A/B 하니스(batch-abtest·tree-test·q6k-abtest·
 //! exp-ab)는 2026-09-08 폐기.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use std::process::ExitCode;
 
@@ -322,8 +323,9 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
 /// llm170 check <model.gguf> [--quick] [--backend cpu|gpu]
 /// debug 빌드 검증 경로 — ① 텐서 디양자화 스캔(NaN/Inf) ② GPU↔CPU GEMM
 /// 상호검증 ③ 장문 청크 스모크(NaN 가드). RCA 도구 통합 (2026-09-01).
+#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn run_check(args: &[String]) -> ExitCode {
-    use llm170_core::matmul::Accelerator;
+    
     let mut path: Option<&str> = None;
     let mut quick = false;
     let mut backend = "gpu".to_string();

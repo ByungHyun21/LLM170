@@ -2,6 +2,7 @@
 //! hipRTC로 임베디드 HIP C++ 소스를 컴파일하고 hipModuleLaunchKernel로
 //! 실행. 버퍼는 영속 아레나(해제 없음, ADR-0014 동일 규칙). 커널 산술은
 //! core 미러(dot_row_w4a8_*_lane)와 동일 연산열 — to_bits 검증 게이트.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
@@ -535,7 +536,7 @@ impl RawCtx {
             // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
             if std::env::var_os("LLM170_MEMDBG").is_some() && src.len() >= (1 << 20) {
                 let (mut fb, mut tb) = (0usize, 0usize);
-                unsafe { let _ = hip::hipMemGetInfo(&mut fb, &mut tb); }
+                let _ = hip::hipMemGetInfo(&mut fb, &mut tb);
                 eprintln!("# memdbg before {tag}: free={}MB/{}MB", fb / 1048576, tb / 1048576);
             }
             if let Err(e) = ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag) {
@@ -901,7 +902,7 @@ impl RawCtx {
     /// W4A8 GEMV — reduce 결과를 상주 out에 직접 기록 (왕복 제거).
     /// 수치는 gemv_q8과 동일열 (동일 커널·reduce).
     #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8_out_v2(&self, xq: *const u8, w: *const u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, xq_w: usize, t: usize) -> Result<(), String> {
+    pub fn gemv_q8_out_v2(&self, xq: *const u8, w: *const u8, _ty: u32, n_in: usize, n_out: usize, out: *mut u8, xq_w: usize, t: usize) -> Result<(), String> {
         let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
         let mut xq_p = xq as *mut std::ffi::c_void;
@@ -941,7 +942,7 @@ impl RawCtx {
     ) -> Result<(), String> {
         let part = self.scratch(n_out * 64 * 8)?;
         let gy = n_out.min(65535) as u32;
-        let gz = n_out.div_ceil(65535) as u32;
+        let _gz = n_out.div_ceil(65535) as u32;
         let kern = match ty {
             23 => "gemm_xs",
             13 => "gemm_q5k",
@@ -1073,7 +1074,7 @@ impl RawCtx {
     ) -> Result<(), String> {
         let part = self.scratch(n_out * 64 * 8)?;
         let gy = n_out.min(65535) as u32;
-        let gz = n_out.div_ceil(65535) as u32;
+        let _gz = n_out.div_ceil(65535) as u32;
         let kern = match ty {
             23 => "gemm_xs",
             13 => "gemm_q5k",
@@ -1288,7 +1289,7 @@ impl RawCtx {
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
             let mut b7 = tr as i32;
-            let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            let _args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
               let mut z1 = xq_p as *mut std::ffi::c_void;
@@ -1300,9 +1301,9 @@ impl RawCtx {
             }
         if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
             self.sync().ok();
-            let _ = std::fs::write("/tmp/deq_wf16.f16", unsafe { std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2) });
-            let _ = std::fs::write("/tmp/deq_w.bin", unsafe { std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210) });
-            let _ = std::fs::write("/tmp/deq_xq.bin", unsafe { std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4) });
+            let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
+            let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
+            let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
             eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
             std::process::exit(0);
         }
@@ -1312,7 +1313,7 @@ impl RawCtx {
     pub fn gemm_f16_deq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
         let fns = &self.fns;
         // f16 전개 커널 선택 — 우리 .co의 GEMM이 소비하는 레이아웃으로 전개한다.
-        let (fq, blk_div) = match ty {
+        let (fq, _blk_div) = match ty {
             14 => (*fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?, 1usize),
             12 => (*fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?, 1),
             8 => (*fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?, 1),
@@ -1329,7 +1330,7 @@ impl RawCtx {
             let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
             if let Some(&p) = c.get(&key) { p }
             else {
-                let blocks = n_in / 256;
+                let _blocks = n_in / 256;
                 let p = self.alloc(n_out * n_in * 2)? as *mut u8;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
@@ -1373,7 +1374,7 @@ impl RawCtx {
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
             let mut b7 = tr as i32;
-            let mut args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            let _args2 = vec![&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
               let mut z1 = xq_p as *mut std::ffi::c_void;
@@ -1385,9 +1386,9 @@ impl RawCtx {
             }
         if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
             self.sync().ok();
-            let _ = std::fs::write("/tmp/deq_wf16.f16", unsafe { std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2) });
-            let _ = std::fs::write("/tmp/deq_w.bin", unsafe { std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210) });
-            let _ = std::fs::write("/tmp/deq_xq.bin", unsafe { std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4) });
+            let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
+            let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
+            let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
             eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
             std::process::exit(0);
         }
@@ -1539,7 +1540,7 @@ impl RawCtx {
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
         let fq = *fns.get(if matches!(ty, 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
-        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let _j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
         let sym = match ty {
             12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
             13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",

@@ -3,6 +3,7 @@
 //! 게이트: LLM170_FRAME35=1 (기본 off — 검증 통과 후 전환).
 //! 수치 계약: 값 경로(model/layers.rs)와 동일 순서 — 잔차는 AxpyScaled(s=1)로
 //! xs += out·1.0 (x·1.0 ≡ x, f32 비트 불변).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::{Engine, ModelError};
 use crate::matmul::{Accelerator, FrameOp, FrameState};
@@ -144,7 +145,7 @@ impl Frame35 {
             f.kv_v.push(vv);
         }
         // 상수 가중치 — 층별 norm·GDN 계수 (qwen4exp Frame4 관례 동일).
-        let mut put = |f: &mut Frame35, name: &str, v: &[f32]| -> Result<(), ModelError> {
+        let put = |f: &mut Frame35, name: &str, v: &[f32]| -> Result<(), ModelError> {
             let h = acc.frame_alloc(v.len()).map_err(ModelError::Accel)?;
             acc.frame_write(h, v).map_err(ModelError::Accel)?;
             f.consts.insert(name.into(), h);
@@ -206,11 +207,11 @@ impl Engine {
     pub fn decode1_frame35(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, ModelError> {
         let acc = self.acc.clone().ok_or(ModelError::Accel("frame35: 가속기 없음".into()))?;
         let hp = self.model.hp.clone();
-        let n = hp.n_embd;
-        let k_len = hp.n_group * hp.d_state;
-        let v_len = hp.dt_rank * hp.d_state;
-        let conv_ch = hp.conv_ch();
-        let eps = hp.eps;
+        let _n = hp.n_embd;
+        let _k_len = hp.n_group * hp.d_state;
+        let _v_len = hp.dt_rank * hp.d_state;
+        let _conv_ch = hp.conv_ch();
+        let _eps = hp.eps;
 
         if self.frame35.is_none() {
             let f0 = Frame35::new(acc.as_ref(), self)?;
@@ -308,12 +309,12 @@ impl Engine {
                 // 어텐션 프레임 (P1): q/k/v mm → 프리페어(rms·rope·인터리브·
                 // 캐시 append) → qsa_attention(전가시 마스크) → wo.
                 let pos = eng.seqs[seq].pos as usize;
-                let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
+                let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
                 if pos >= 2048 {
                     return Err(ModelError::Accel("frame35: ctx 2048 초과 (cs/캐시 상한)".into()));
                 }
                 let pos = eng.seqs[seq].pos as usize;
-                let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
+                let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
                 if pos >= 2048 {
                     return Err(ModelError::Accel("frame35: ctx 2048 초과".into()));
                 }

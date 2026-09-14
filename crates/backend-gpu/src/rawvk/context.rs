@@ -260,7 +260,7 @@ impl VkCtx {
     }
 
     /// 배치용 fresh descriptor set — 전용 대형 풀 (op당 1세트, 제출 후 전량 해제).
-    pub fn fresh_ds(&mut self, n_buf: u32) -> Result<vk::DescriptorSet, String> {
+    pub fn fresh_ds(&mut self, _n_buf: u32) -> Result<vk::DescriptorSet, String> {
         unsafe {
             // 전용 배치 풀 지연 생성 (세트 256·버퍼 12×256)
             if self.batch_pool.get().is_none() {
@@ -334,7 +334,7 @@ impl VkCtx {
             if let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
                 if !sets.is_empty() {
-                    self.device.free_descriptor_sets(pool, &sets);
+                    let _ = self.device.free_descriptor_sets(pool, &sets);
                 }
             }
         }
@@ -363,7 +363,7 @@ impl VkCtx {
             if let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
                 if !sets.is_empty() {
-                    self.device.free_descriptor_sets(pool, &sets);
+                    let _ = self.device.free_descriptor_sets(pool, &sets);
                 }
             }
         }

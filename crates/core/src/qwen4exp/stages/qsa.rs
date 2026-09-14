@@ -1,5 +1,6 @@
 //! qsa(인덩서 top-k 게이트드 GQA) 스테이지 — Engine4에서 분리 (리팩토링 P1, 2026-09-01).
 //! 수치 경로 불변 — 이동만. Ctx 기반 백엔드 독립 (CPU/GPU 동일 코드).
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::super::Q4Error;
 use super::Ctx;
@@ -298,6 +299,7 @@ fn mask_from_list(
         Ok((sel_blk, sel_cnt, sel_stride))
     }
 
+    #[allow(unused_assignments)] // 진단 코드의 중간 변수
     pub fn qsa_layer(
         ctx: &Ctx,
         seq: &mut SeqState4,
@@ -315,9 +317,9 @@ fn mask_from_list(
         let wv = ctx.model.w4(&format!("blk.{il}.attn_v.weight"))?;
         let wo = ctx.model.w4(&format!("blk.{il}.attn_output.weight"))?;
         let q_norm_w = ctx.model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
-        let k_norm_w = ctx.model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
-        let iq_w = ctx.model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
-        let ik_w = ctx.model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        let _k_norm_w = ctx.model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let _iq_w = ctx.model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
+        let _ik_w = ctx.model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let w_iq = ctx.model.w4(&format!("blk.{il}.indexer.q_proj.weight"))?;
         let w_ik = ctx.model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
 
@@ -375,7 +377,7 @@ fn mask_from_list(
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
         let n_past_max = (pos0 as usize) + t_len;
-        let mut gpu_attn = ctx.acc.is_some();
+        let gpu_attn = ctx.acc.is_some();
         // 마스크는 CPU 어텐션 경로에서만 쓴다 — GPU 경로는 선택 목록을 쓴다.
         // (행당 n_past bool을 2048행 만들면 24MB 할당 + 4.2M 채우기가 층마다 든다.)
         // GPU 경로에서 폴백이 걸리면 목록에서 그때 만든다(mask_of).

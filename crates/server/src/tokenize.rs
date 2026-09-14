@@ -1,6 +1,7 @@
 //! 탐욕 최장일치 토크나이저 (근사 — 자기일관 검증용).
 //! llama.cpp의 BPE pre-tokenizer·병합 순서와 일치하지 않음:
 //! 서버 자체의 /tokenize→생성→판정 루프가 자기일관이면 매트릭스 유효.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use llm170_gguf::GgufFile;
 use std::collections::HashMap;

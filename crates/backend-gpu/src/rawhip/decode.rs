@@ -12,6 +12,7 @@
 //!   스켈레톤")는 **배치 런치에서 신뢰 불가**하다(벽시계 1,409ms와 모순).
 //!   LLM170_PP_PROF 마크는 이 raw 경로 전용이고(프레임 경로는 무출력),
 //!   trace 섹션의 95.8ms는 계측기 자신의 hipEventCreate 비용이다.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use cubecl_hip_sys as hip;
 use super::RawCtx;
@@ -716,7 +717,7 @@ impl DecodeState {
                     let sumo: f64 = ho.iter().map(|&v| v as f64).sum();
                     let mut hq = vec![0f32; k_len];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq)?;
-                    let sumq: f64 = hq.iter().map(|&v| v as f64).sum();
+                    let _sumq: f64 = hq.iter().map(|&v| v as f64).sum();
                     let mut xco: u64 = 0; let mut xcq: u64 = 0;
                     for &v in &ho { xco ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
                     for &v in &hq { xcq ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
@@ -1384,7 +1385,7 @@ impl DecodeState {
         let prof = std::env::var_os("LLM170_PP_PROF").is_some();
         let t0w = std::time::Instant::now();
         let mut marks: Vec<(String, hip::hipEvent_t)> = Vec::new();
-        let mut gmark = |lab: &str, marks: &mut Vec<(String, hip::hipEvent_t)>| {
+        let gmark = |lab: &str, marks: &mut Vec<(String, hip::hipEvent_t)>| {
             if prof {
                 let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                 unsafe { hip::hipEventCreate(&mut ev); hip::hipEventRecord(ev, self.ctx.stream); }
@@ -1990,7 +1991,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         self.ctx.sync()?;
         if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head ok"); }
         self.ctx.sync()?;
-        let t_a0 = std::time::Instant::now();
+        let _t_a0 = std::time::Instant::now();
         argmaxes.clear();
         argmaxes.resize(t, 0);
         // 단일 블록 d2h — 행별 동기 왕복이 사이클당 수백 ms였음 (2026-09-04).
@@ -2201,7 +2202,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         // shared head norm → output head → argmax
         let shn = *self.consts.get("blk.64.nextn.shared_head_norm").ok_or("shn")?;
         self.rms(self.mtp_cur, shn, self.mtp_e, n)?;
-        let t0h = std::time::Instant::now();
+        let _t0h = std::time::Instant::now();
         let am = self.head_argmax_gpu(self.mtp_e)?;
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
             eprintln!("[mt] head={:.2}ms", t0s.elapsed().as_secs_f64() * 1e3);
@@ -2237,7 +2238,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let mask = self.consts.get("mask").copied().ok_or("mask")?;
         let t_mtp = std::time::Instant::now();
         let mtp_time = std::env::var_os("LLM170_MTP_TIMING").is_some();
-        let mut mark = |label: &str, last: &mut std::time::Instant| {
+        let mark = |label: &str, last: &mut std::time::Instant| {
             if mtp_time {
                 self.ctx.sync().ok();
                 eprintln!("[mtpb] {label}: {:.2}ms", last.elapsed().as_secs_f64() * 1e3);

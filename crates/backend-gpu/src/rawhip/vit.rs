@@ -1,5 +1,6 @@
 //! CLIP ViT GPU 실행기 (plans/17) — mmproj 가중치 f32 업로드 1회, 커널 파이프라인.
 //! 산술은 core::clip (CPU) 미러 — 검증: 행별 최대오차.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawhip::RawCtx;
 use std::collections::HashMap;
@@ -122,8 +123,8 @@ impl Vit {
         &self,
         toks: &[f32],
         yx: &[i32],
-        pw: usize,
-        ph: usize,
+        _pw: usize,
+        _ph: usize,
     ) -> Result<Vec<f32>, String> {
         let t = yx.len() / 2; // yx: [t][2]
         assert!(t <= self.t_max);
@@ -201,8 +202,8 @@ impl Vit {
             {
                 self.pack_strided(self.b_qkv, 0, 3 * n, 1, self.b_xn, t)?;
                 let qp = self.b_xn as *mut std::ffi::c_void;
-                let kp = unsafe { self.b_qkv.add(n * 4) } as *mut std::ffi::c_void;
-                let vp = unsafe { self.b_qkv.add(2 * n * 4) } as *mut std::ffi::c_void;
+                let _kp = unsafe { self.b_qkv.add(n * 4) } as *mut std::ffi::c_void;
+                let _vp = unsafe { self.b_qkv.add(2 * n * 4) } as *mut std::ffi::c_void;
                 // q/k/v가 3n 스트라이드 — flash_vit는 nh·d 스트라이드 가정 →
                 // stride 변형 필요. 여기서는 커널에 stride를 추가하지 않고
                 // k/v를 b_mid에 압축 복사(행별 n_embd) 후 실행.

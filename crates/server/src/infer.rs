@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::{parse_ids_ref, usage_err};
+use crate::usage_err;
 
 pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
     let mut model: Option<PathBuf> = None;

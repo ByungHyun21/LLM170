@@ -98,7 +98,7 @@ impl Engine {
                 && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
-                let n = self.model.hp.n_embd as usize;
+                let _n = self.model.hp.n_embd as usize;
                 let mut pos = self.seqs[seq].pos as usize;
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
                 // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,

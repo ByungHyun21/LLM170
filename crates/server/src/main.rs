@@ -2,6 +2,7 @@
 //!
 //! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
+#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 mod bench;
 mod engine;
