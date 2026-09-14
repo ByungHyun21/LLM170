@@ -111,6 +111,8 @@ pub struct Q4Acc {
     soff: std::sync::Mutex<GBuf>,
     atn: std::sync::Mutex<GBuf>,
     qsp: std::sync::Mutex<GBuf>,
+    /// 출력 스테이징 재사용 버퍼(d2h가 전체를 덮어쓰므로 0-채움 불필요).
+    ybuf: std::sync::Mutex<Vec<f32>>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -276,6 +278,7 @@ impl Q4Acc {
             soff: std::sync::Mutex::new(GBuf::new("soff")),
             atn: std::sync::Mutex::new(GBuf::new("atn")),
             qsp: std::sync::Mutex::new(GBuf::new("qsp")),
+            ybuf: std::sync::Mutex::new(Vec::new()),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
@@ -919,7 +922,13 @@ impl Q4Acc {
         // = 50MB -> 2.8ms + 런치/커널). 즉 **출력을 호스트로 가져오는 한 이 비용은
         // 사라지지 않는다** — 스테이지 API를 디바이스 상주 버퍼로 바꾸는 것이
         // 프리필(8%)과 장문맥 디코드(58% QSA 스테이지)의 공통 해법이다.
-        let mut yflat = vec![0.0f32; t * n_out];
+        // 출력 스테이징은 **영속 버퍼**를 재사용한다: d2h가 전체를 덮어쓰므로
+        // 매 호출 `vec![0.0; t*n_out]`로 할당+0-채움할 필요가 없다(프리필에서
+        // 호출당 50MB — 그룹 5회면 250MB의 memset이 사라진다).
+        let mut yb = self.ybuf.lock().map_err(|e| e.to_string())?;
+        if yb.len() < t * n_out {
+            yb.resize(t * n_out, 0.0); // 확장 시에만 0 채움
+        }
         let t_k = std::time::Instant::now();
         if w_f32 {
             self.launch_gemm_f32(xf, w_slice, n_in, n_out, t, ydev)?;
@@ -950,7 +959,8 @@ impl Q4Acc {
         }
         let k_ns = t_k.elapsed().as_nanos() as u64;
         let t_d = std::time::Instant::now();
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
+        let yflat = &mut yb[..t * n_out];
+        self.ctx.d2h(bytemuck::cast_slice_mut(yflat), ydev)?;
         let d_ns = t_d.elapsed().as_nanos() as u64;
         if tt {
             self.note(up_ns, 0, k_ns, d_ns);
