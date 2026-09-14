@@ -5359,3 +5359,30 @@ headroom is the prefill: 363 t/s is 34% of the f32 peak while the weights stream
 only 10.6 GB/s, i.e. compute/tile limited, which is what the plans/66 P1-style work
 (bf16 tensor-core GEMM, measured 1.42x in the reference stack) targets.
 
+
+## Prefill measurement instrument caveats and the 27B op breakdown (2026-09-14)
+
+`LLM170_PP_PROF` records hipEvents around each raw-path section and is valid only for
+the dense/raw path (the 27B). On the Flash-Next frame path it emits nothing; use the
+stage timers there (and note pp2048 measures 224.5 t/s today, not the earlier figure).
+
+For the 27B at pp512 the sections sum to the full wall, 1,409 ms:
+
+| section | ms | | section | ms |
+|---|---|---|---|---|
+| ffn_gate | 520.6 | | ffn_silu | 28.5 |
+| ffn | 279.2 | | gdn | 18.6 |
+| gdn_mm | 212.8 | | split+l2 | 18.4 |
+| proj | 204.4 | | norm+quant | 21.3 |
+| trace | 95.8 | | head | 5.8 |
+
+The host is not a factor on this path: the same run reports cpu_submit=11.0 ms for the
+whole warm step_batch, so every remaining millisecond is device-side. The four GEMM
+sections (ffn_gate, ffn, gdn_mm, proj) are 1,217 ms or 86%; at 2*512*27e9 FLOP that is
+~19.5 TFLOPS, 34% of the f32 peak, so the lever is the batched GEMM tiles rather than
+anything host-side. Two instruments mislead on this path and should not be trusted for
+it: LLM170_KTRACE sums only 366 ms against a 1,409 ms wall, and LLM170_NOLAUNCH reports
+a 1,014 ms "host skeleton" that contradicts the 11 ms cpu_submit - both are unreliable
+for batched launches. The trace section's 95.8 ms is the PP_PROF instrumentation's own
+hipEventCreate cost, not work.
+
