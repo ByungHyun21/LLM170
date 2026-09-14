@@ -238,6 +238,17 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### plans/66 P5/P6 quick audits: structurally clear (2026-09-14)
+
+- **P5 (TOP_K tie handling)**: our expert top-k (qsa_select) uses
+  `select_nth_unstable_by` - no radix gather, so the reference stack's failure
+  mode (count errors in tied buckets dropping/duplicating indices) cannot occur
+  structurally, and partitioning is deterministic for a given input.
+- **P6 (grouped/mmid shared-memory sizing)**: every dynamic-smem launch scales
+  with `n_in` (16 * n_in/32 * 24), never with token count; the largest
+  production shape (27B ffn 5120 -> 61,440B) stays under the 64KB LDS limit,
+  and larger-n_in weights route through MMQ instead.
+
 ### plans/66 P1 (dequant-cache WMMA) measured: not adopted - MMQ already at 81% of the practical MMA roofline (2026-09-14)
 
 Built the full P1 path for the 27B's dominant iq4_xs weights (dequant-to-f16
