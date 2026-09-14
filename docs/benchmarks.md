@@ -5838,6 +5838,15 @@ bit-identical on the diverse stream - measured neutral at pp2048 (8,940-8,959 vs
 8,878-9,034 ms) and -1.2% at the decode (567.5 vs 574.3 ms per 8 steps), so it was reverted;
 the routing sort is not what the 5.2 ms consists of. The remaining suspects are the
 per-expert host loop in frame_moe_gemm (one GEMM launch per non-empty expert, plans/57's
-mul_mat_id target) and the offsets d2h that precedes it. The other gaps are the same shape at smaller scale: host submit
+mul_mat_id target) and the offsets d2h that precedes it.
+
+A second candidate was also tested and ruled out. The routing loop normalises all 512
+expert logits per token (a third pass of f32 divisions), which at 2048 tokens is ~1M
+divisions ~= 7 ms per layer - the right order of magnitude for the 5.2 ms gap. Narrowing
+that pass to the selected k (bit-identical: the same v/zs per selected expert, summed in
+the same order) left the gap unchanged at 1,716.7 ms against 1,728.7 ms, so it was reverted.
+The arithmetic that made it look promising also shows why it cannot be the whole story: the
+routing runs once per layer (48 times) while the gap is counted 331 times, so most of those
+gaps are the host work for whatever runs next, not the routing. The other gaps are the same shape at smaller scale: host submit
 work after each small launch.
 
