@@ -5386,3 +5386,25 @@ a 1,014 ms "host skeleton" that contradicts the 11 ms cpu_submit - both are unre
 for batched launches. The trace section's 95.8 ms is the PP_PROF instrumentation's own
 hipEventCreate cost, not work.
 
+
+## Why the MoE down projection cannot use the grouped kernel's staging (2026-09-14)
+
+The down projection (Q5_1, direct ids) runs at 72 GB/s. The cause is the weight access
+pattern: each thread owns one (output, row) pair and walks its own weight row, so a warp
+covers 16 consecutive output rows 480 bytes apart - sixteen 32-byte sectors per 64 useful
+bytes, an 8x sector amplification that puts the real DRAM traffic at the limit while the
+useful rate reads as 72 GB/s. `q5_1_gm` avoids this by staging a 16-row weight tile
+cooperatively (its (oo, ww) load has consecutive ww, hence coalesced).
+
+Porting that staging to the direct-ids kernel was attempted and fails structurally: the
+staging invariant is one expert per tile (tile_exp), while the unsorted direct form has a
+different expert per row. An output row's weights must come from sixteen different
+experts (one per row in the tile), so no single shared buffer represents it. The kernel
+was reverted; the diverse baseline is intact.
+
+The correct fix is a warp-per-output-row kernel: the warp's 32 lanes walk one weight row
+consecutively (coalesced) and reduce with a shuffle tree, with the cross-warp combine done
+through the existing deterministic K-split reducer. The PLE/gate/up path already reads
+180 GB/s with the same direct-ids scheme, so the down projection's ~2.5 ms/step is real
+and reachable, but it is a new kernel rather than a port of the grouped one.
+
