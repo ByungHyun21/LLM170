@@ -451,6 +451,54 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
     out[(size_t)r * n_out + o] = acc;
 }
 
+// q4_gemm_q5_1_gm_ids — t=1 전용 direct-ids판. down 투영이 Q5_1이라 그룹화를
+// 여기서도 없애야 한다(게이트/up만 direct로는 down에서 그룹화가 1회 발생).
+// 행마다 전문가가 다르므로 타일 공유 적재 대신 스레드가 자기 행의 전문가 행을
+// 직접 읽는다. 내적 루프는 gm과 동일 → 비트 동일 기대.
+extern "C" __global__ void q4_gemm_q5_1_gm_ids(const unsigned* xq, const unsigned* w, double* part,
+                                          float* out, const unsigned* ids,
+                                          int n_in, int n_out, int xq_w, int t, int expert_words) {
+    int n_sub = n_in >> 5;
+    int wrow = n_sub * 6;                 // 워드/출력행
+    int o0 = (int)blockIdx.x * 16;
+    int r0 = (int)blockIdx.y * 16;
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = o0 + ox;
+    int r = r0 + rx;
+    if (o >= n_out || r >= t) return;
+    const unsigned* wr = w + (size_t)ids[r] * (size_t)expert_words + (size_t)o * wrow;
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sb = 0; sb < n_sub; sb++) {
+        int wb = sb * 6;
+        float d = bits_f16(wr[wb] & 0xFFFFu);
+        float mn = bits_f16((wr[wb] >> 16) & 0xFFFFu);
+        unsigned qh = wr[wb + 1];
+        unsigned qsw0 = wr[wb + 2];
+        unsigned qsw1 = wr[wb + 3];
+        unsigned qsw2 = wr[wb + 4];
+        unsigned qsw3 = wr[wb + 5];
+        int xw = (sb << 5) >> 2;
+        int s_lo = 0, s_hi = 0, s1 = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qs4 = (k & 3) == 0 ? qsw0 : (k & 3) == 1 ? qsw1 : (k & 3) == 2 ? qsw2 : qsw3;
+            unsigned nib = (k < 4) ? (qs4 & 0x0F0F0F0Fu) : ((qs4 >> 4) & 0x0F0F0F0Fu);
+            unsigned hb = (qh >> (4 * k)) & 0xFu;
+            unsigned hb_p = (hb & 1u) << 4 | (hb & 2u) << 11 | (hb & 4u) << 18 | (hb & 8u) << 25;
+            unsigned y = xr[xw + k];
+            s_lo += dot4(nib, y, 0);
+            s_hi += dot4(hb_p, y, 0);
+            s1 += dot4(ones, y, 0);
+        }
+        float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+        acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
 // q4_K MMQ급 타일 — 16출력 × 16행, 스레드당 (출력,행) 직렬 누산(스레드당 수백
 // 바이트). 산술은 core `dot_q4k_q8`과 **동일 순서**(it 0..3, 각 it에서
 // 저니블→고니블 순 가산)라 비트 동일이 기대된다 — q4-acc-check로 확인.
@@ -709,6 +757,79 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
     int e = (int)rowexp[r];
     const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
     const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned xw_base = (unsigned)(n_in >> 2);
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sIdx = 0; sIdx < n_super; sIdx++) {
+        const unsigned char* blk = wr + sIdx * 144;
+        float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
+        float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+        #pragma unroll
+        for (int it = 0; it < 4; it++) {
+            unsigned q[8];
+            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
+            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
+            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
+            const uint4* p4 = (const uint4*)(qs + it * 32);
+            #pragma unroll
+            for (int m4 = 0; m4 < 2; m4++) {
+                uint4 t4 = p4[m4];
+                q[m4 * 4 + 0] = t4.x;
+                q[m4 * 4 + 1] = t4.y;
+                q[m4 * 4 + 2] = t4.z;
+                q[m4 * 4 + 3] = t4.w;
+            }
+            const int j1 = 2 * it;
+            const int j2 = 2 * it + 1;
+            unsigned s1, m1, s2, m2;
+            if (j1 < 4) { s1 = sc[j1] & 63u; m1 = sc[j1 + 4] & 63u; }
+            else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
+            if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
+            else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
+            const unsigned* x1 = xr + sIdx * 64 + it * 16;
+            const unsigned* x2 = x1 + 8;
+            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                unsigned y1 = x1[m];
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
+                qs1 += dot4(ones, y1, 0);
+                unsigned y2 = x2[m];
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                qs2 += dot4(ones, y2, 0);
+            }
+            float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
+            float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
+            acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
+            acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
+        }
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
+// 한 런치로 전부 처리한다. 산술 순서는 _m과 동일(비트 동일).
+// q4_gemm_q4k_ge_ids — t=1 전용 direct-ids 그룹 GEMM. 그룹화 테이블(perm_pad/
+// rowexp) 없이 **커널이 ids[row]를 직접 읽어** 가중치 베이스를 정한다. 행 순서가
+// 곧 ids 순서이므로 gather·scatter가 통째로 사라지고(가중합이 ids 순서를 요구),
+// 호스트 왕복(ids d2h + 테이블 빌드 + h2d)도 불필요하다. t=1에서는 k_sel행이
+// 모두 같은 입력 벡터이므로 xq_w에 0을 넘겨 전 행이 0번 행을 읽는다.
+// 산술: 행별 내적은 _ge와 동일 순서 → 비트 동일 기대.
+extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned char* w, double* part,
+                                          float* out, const unsigned* ids,
+                                          int n_in, int n_out, int xq_w, int t, int expert_bytes,
+                                          const int* rows_pad_p) {
+    (void)rows_pad_p; (void)xq_w;
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = (int)blockIdx.x * 16 + ox;
+    int r = (int)blockIdx.y * 16 + rx;
+    if (o >= n_out || r >= t) return;
+    int n_super = n_in >> 8;
+    int e = (int)ids[r];
+    const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
+    const unsigned* xr = xq;   // t=1: 전 행이 같은 입력 벡터(0번 행)
     const unsigned xw_base = (unsigned)(n_in >> 2);
     const unsigned ones = 0x01010101u;
     float acc = 0.0f;

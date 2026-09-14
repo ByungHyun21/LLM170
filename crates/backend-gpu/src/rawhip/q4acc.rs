@@ -1089,6 +1089,47 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             }
         };
         phase("quant", &mut lap);
+        // direct-ids(t=1, LLM170_MOE_DIRECT=1): 그룹화 테이블·gather·scatter를
+        // 전부 건너뛰고 커널이 ids[row]를 직접 읽는다. 행 순서가 곧 ids 순서라
+        // 가중합(ys[e*n+i])이 그대로 맞고, 호스트 왕복(ids d2h+빌드+h2d)도 없다.
+        // t=1에서는 k_sel행이 같은 벡터이므로 스트라이드 0으로 0번 행을 읽는다.
+        if self.t_cur() == 1
+            && ws.ty == GgmlType::Q4K
+            && !f32w
+            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+        {
+            let idp = self.fptr(ids)?;
+            let mut x_p = xq as *mut std::ffi::c_void;
+            let mut w_p = wd as *mut std::ffi::c_void;
+            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
+            let mut ip = idp as *mut std::ffi::c_void;
+            let (mut ni, mut no) = (n_in as i32, n_out as i32);
+            let (mut xw, mut tt, mut eb) = (0i32, rows as i32, per_expert as i32);
+            let mut rp: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ip) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut eb) as *mut _ as *mut std::ffi::c_void,
+                (&mut rp) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_gemm_q4k_ge_ids",
+                n_out.div_ceil(16) as u32,
+                rows.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+            return Ok(());
+        }
         let ne = n_expert_stack.max(1);
         // 그룹화 캐시 — gate/up/down 3개 투영이 같은 라우팅을 공유한다. 게이트가
         // 1회만 d2h(동기)+정렬+순열 업로드하고 나머지는 디바이스 순열을 재사용.
@@ -1300,6 +1341,40 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         // 기본 경로 — 비트 동일(토큰 검증), pp2048 −1.8%, 런치 7.4만→48/청크.
         // q5_1(다운) 그룹판 — 16배수 패딩 레이아웃으로 타일=전문가, 가중치 재독 1회.
         if ws.ty == GgmlType::Q5_1 && !f32w && rows > 0 {
+            // direct-ids(t=1): down도 그룹화 없이 — 게이트/up만 direct로는 down에서
+            // 그룹화(d2h+빌드+h2d)가 1회 발생해 이득이 사라진다.
+            if self.t_cur() == 1 && std::env::var_os("LLM170_MOE_GROUPED").is_none() {
+                let idp = self.fptr(ids)?;
+                let mut x_p = xq as *mut std::ffi::c_void;
+                let mut w_p = wd as *mut std::ffi::c_void;
+                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+                let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
+                let mut ip = idp as *mut std::ffi::c_void;
+                let (mut ni, mut no) = (n_in as i32, n_out as i32);
+                let (mut xw, mut tt) = (xq_w as i32, rows as i32);
+                let mut ew = (per_expert / 4) as i32;
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ip) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                    (&mut no) as *mut _ as *mut std::ffi::c_void,
+                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ew) as *mut _ as *mut std::ffi::c_void,
+                ];
+                self.ctx.launch3(
+                    "q4_gemm_q5_1_gm_ids",
+                    n_out.div_ceil(16) as u32,
+                    rows.div_ceil(16) as u32,
+                    1,
+                    256,
+                    &mut args,
+                )?;
+                return Ok(());
+            }
             let xgp = {
                 let mut g = self.gxp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * xq_w * 4)?
