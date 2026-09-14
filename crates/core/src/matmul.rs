@@ -218,6 +218,27 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_attention: 이 가속기는 미지원".into())
     }
 
+    /// QSA 선택-목록 GQA의 **디바이스 q판** — q가 이미 디바이스 버퍼(wq의
+    /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다(plans/67 1단계).
+    /// k/v는 기존처럼 캐시 업로드 경로(kv_sync)를 쓴다. 출력은 out 버퍼에.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev(
+        &self,
+        _q: u64,
+        _ck: &[f32],
+        _cv: &[f32],
+        _sel_idx: &[u32],
+        _sel_off: &[u32],
+        _kq_scale: f32,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+        _out: u64,
+    ) -> Result<(), String> {
+        Err("qsa_attention_dev: 이 가속기는 미지원".into())
+    }
+
     /// QSA 선택-목록 GQA — 마스크 대신 (t+1) 오프셋 + **오름차순** 위치 목록.
     /// 마스크 스캔과 산술 순서가 같다(선택 밖 키는 소프트맥스 상태를 바꾸지
     /// 않는다) — 프로브 `q4-qsa-check`가 비트 동일로 확인한다.
