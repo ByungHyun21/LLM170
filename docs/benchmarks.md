@@ -207,6 +207,16 @@ for the current tree:
 block-key cache, the indexer q rows and the layer output, which localizes a
 divergence to a specific path (it is what pinned bug 2 to the qg normalization).
 
+### Device-resident QSA KV cache: long-ctx decode 87->82.3 ms (2026-09-14)
+
+The QSA KV cache now lives on the GPU in per-(layer,seq) pools: each step
+appends its k/v rows with D2D copies and the attention kernels read the pool
+in place, removing a per-layer per-step cache upload (32 MB at 8k context).
+A watermark allows sequential appends and same-prefix rewinds, holes fall
+back to the upload path. pp8000+tg32 measured 87.0 -> 82.3 ms/step; short-ctx
+decode and pp2048 (277 t/s) unchanged; stream gates identical, 12/12 tests.
+Debug envs: LLM170_QSA_NORES (A/B), LLM170_QSA_RESCHECK (pool-vs-host compare).
+
 ### Device-resident QSA stage: prefill +10-19%, long-ctx decode 91->87 ms (2026-09-14)
 
 plans/67 step 2c landed: the QSA attention stage keeps its projections, norm,
