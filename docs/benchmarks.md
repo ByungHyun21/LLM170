@@ -5775,7 +5775,13 @@ KTRACE for a pp2048 chunk (17 kernel types, 4,006 ms total against a ~8,900 ms w
 | q4_rows_permute_u32 | 226.1 ms | 331 | 6% |
 | gemm_q8_0 / quant_q8 / rms_* / hc_* | ~880 ms | | 22% |
 
-45% of the chunk is on the device, and the remaining 4.9 s is host and synchronisation.
+CAREFUL - the same instrument caveat recorded for the 27B applies here: KTRACE's sum
+(366 ms) under-measured a 1,409 ms 27B prefill wall by 4x, and this 4,006 ms likewise
+cannot be read as "45% of the chunk is on the device". The table's *relative* ranking is
+useful (one instrument, all kernels) but the split against the wall is not; the earlier
+"4.9 s is host and synchronisation" claim was wrong and is withdrawn. What is measurable
+independently is the stage-timer side (qsa.rs prints t-labelled per-stage times, and those
+do sum to the frame total), which puts 2.98 s of the chunk in the QSA stage.
 The t-labelled stage timers place 2.98 s of that in the QSA stage: mm_group 873 ms,
 attn 1,212 ms, sel+proj 503 ms, sel_build 392 ms. attn is the clearest case - its kernel is
 only 287 ms while the stage reports 1,212 ms, so ~926 ms is the d2h drain waiting on queued
@@ -5784,7 +5790,9 @@ the kernel itself is 3.2% of the chunk, not 41% of the QSA stage, and the geomet
 experiment's ceiling was therefore ~143 ms (1.6%) - below the run-to-run noise, which is
 exactly what the inconclusive A/B showed.
 
-The prefill's lever is therefore synchronisation and host work in the frame path (QSA
-2.98 s, plus ~1.9 s elsewhere), not kernel traffic. The attention kernel itself (287 ms,
-3.2%) is not worth pursuing further.
+The one trustworthy conclusion is narrower: the attention's own kernel is small relative
+to its stage (287 ms against a 1,212 ms stage reading), so the geometry experiment's
+ceiling was ~143 ms (1.6%) - below the run-to-run noise, which is what the inconclusive A/B
+showed. Everything else in this section needs a working device-time instrument before it
+can be acted on.
 
