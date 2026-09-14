@@ -5691,3 +5691,25 @@ the 27B reaches 19.5 TFLOPS with the same kernel family - its n_in/n_out (5120x1
 large enough to amortise the row work. Closing the Flash-Next prefill gap therefore means
 a better tile for short-K wide-N shapes, not a scheduling change.
 
+
+## Removing a redundant KV clone in the QSA stage: -27.6% on long-context decode (2026-09-14)
+
+frame.rs' QSA bridge copied the KV prefix into fresh Vecs on every layer call:
+
+    let ck = seq.kv_k[full_idx][..kn].to_vec();   // kn = n_past_max * n_kv * hd
+
+At n_past 8192 that is 33.6 MB per layer, 403 MB per decode step, and it showed up as the
+sel_build stage timer (1.39 ms/layer = 24 GB/s, exactly the measured memcpy rate). The
+accelerator takes &[f32], so borrowing the slice is sufficient - NLL accepts it because the
+fallback later reborrows seq immutably.
+
+| measurement | before | after |
+|---|---|---|
+| pp8192 tg8 | 1,019.9 ms | **738.4 ms (-27.6%)**, 92.3 ms/step |
+| pp24 tg8 | 566-576 ms | 566.3 ms (unchanged) |
+| diverse stream | baseline | identical (pure refactor) |
+
+The saving exceeds the 16.7 ms/step the copy itself accounts for because the copy also
+pushed the KV out of L2/L3 ahead of the kernels that read it. Cumulative on the long-context
+decode this session: 142.5 -> 92.3 ms/step (-35%).
+
