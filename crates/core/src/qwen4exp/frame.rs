@@ -52,6 +52,15 @@ pub struct Frame4 {
     pub shu: u64,    // [n_ff] shared up
     pub shglu: u64,  // [n_ff]
     pub shout: u64,  // [n_embd]
+    // QSA (plans/67 2c — 디바이스 상주 투영·어텐션)
+    pub qsa_q: u64,    // [t][n_head·2hd] — wq 출력(q‖게이트 인터리브)
+    pub qsa_k: u64,    // [t][n_kv·hd] — norm+rope 후 k
+    pub qsa_v: u64,    // [t][n_kv·hd] — v
+    pub qsa_iq: u64,   // [t][idx_heads·idx_dim]
+    pub qsa_ik: u64,   // [t][idx_dim]
+    pub qsa_attn: u64, // [t][n_head·hd] — 어텐션 출력(wo 입력)
+    /// rope cos/sin 테이블 호스트 사본 — frame_qk_norm_rope가 받아 올린다.
+    pub qsa_cs: Vec<f32>,
     // head
     pub hxn: u64,  // [hc·n_embd]
     pub hlo: u64,
@@ -132,6 +141,32 @@ impl Frame4 {
             shu: at(hp.n_ff_exp)?,
             shglu: at(hp.n_ff_exp)?,
             shout: at(n)?,
+            qsa_q: at(hp.n_head * 2 * hp.head_dim)?,
+            qsa_k: at(hp.n_kv * hp.head_dim)?,
+            qsa_v: at(hp.n_kv * hp.head_dim)?,
+            qsa_iq: at(hp.idx_heads * hp.idx_dim)?,
+            qsa_ik: at(hp.idx_dim)?,
+            qsa_attn: at(hp.n_head * hp.head_dim)?,
+            qsa_cs: {
+                let ctx_n = seqs
+                    .first()
+                    .and_then(|s| s.kv_k.first())
+                    .map(|k| k.len() / (hp.n_kv.max(1) * hp.head_dim.max(1)))
+                    .unwrap_or(8192);
+                // Hparams4에 rope_cs 헬퍼가 없어 로컬 빌드 — 산술은
+                // model/hparams.rs rope_cs(=ops::rope_head)와 동일 값을 쓴다.
+                let (half, base) = (hp.n_rot / 2, hp.rope_base);
+                let mut cs = vec![0.0f32; ctx_n * half * 2];
+                for pos in 0..ctx_n {
+                    for pp in 0..half {
+                        let theta = base.powf(-(2.0 * pp as f32) / hp.n_rot as f32);
+                        let angle = pos as f32 * theta;
+                        cs[pos * half * 2 + pp * 2] = angle.cos();
+                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
+                    }
+                }
+                cs
+            },
             hxn: at(hc * n)?,
             hlo: at(hlo_n)?,
             hgate: at(hc * n)?,
@@ -403,9 +438,14 @@ pub fn frame_forward(
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
             sync_mark(acc, &format!("L{il}.gdn_combine"), f.res_hc)?;
         } else {
-            // QSA 값 경로 브리지 — mix 판독 → qsa_layer(t행) → 출력 기록
+            // QSA — plans/67 2c: 디바이스 상주 경로 우선. 투영·norm·rope·어텐션·
+            // wo가 전부 GPU에 있고 d2h는 iq/ik/k/v(캐시 적립)뿐이다. 초기 3단계
+            // (mm_group/qk_norm_rope/판독) 실패 시에만 구값 브리지로 폴백 — 그
+            // 시점엔 캐시 미변경이라 이중 적립이 없다.
             if stage_skipped("qsa") {
                 // 진단용: QSA 브리지 생략(출력 무효).
+            } else if qsa_frame(acc, model, ctx, seq_st, f, il, t, full_idx).is_ok() {
+                acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             } else {
             let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
             let mut ql = std::time::Instant::now();
@@ -497,6 +537,117 @@ pub fn decode_frame(
     token: u32,
 ) -> Result<Vec<f32>, Q4Error> {
     frame_forward(acc, model, ctx, seq, seq_st, f, &[token])
+}
+
+/// QSA 프레임 (plans/67 2c) — 투영·norm·rope·어텐션·wo 전부 디바이스 상주.
+/// d2h는 캐시 적립용 iq/ik/k/v(t×(idx_heads·idx_dim+idx_dim+2·n_kv·hd) ≈ t×3,840
+/// floats)뿐 — 기존 값 브리지는 mix+wq+wo 왕복 t×~10,880 floats를 나르던 것과
+/// 비교해 첫 3단계 실패 시에만 호출부가 값 브리지로 폴백한다(그 시점엔 아직
+/// 캐시를 건드리지 않는다 — 이중 적립 없음).
+#[allow(clippy::too_many_arguments)]
+fn qsa_frame(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seq_st: &mut SeqState4,
+    f: &mut Frame4,
+    il: usize,
+    t: usize,
+    full_idx: usize,
+) -> Result<(), Q4Error> {
+    let hp = &model.hp;
+    let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
+    let (n_rot, idx_dim) = (hp.n_rot, hp.idx_dim);
+    let wq = model.w4(&format!("blk.{il}.attn_q.weight"))?;
+    let wk = model.w4(&format!("blk.{il}.attn_k.weight"))?;
+    let wv = model.w4(&format!("blk.{il}.attn_v.weight"))?;
+    let wo = model.w4(&format!("blk.{il}.attn_output.weight"))?;
+    let w_iq = model.w4(&format!("blk.{il}.indexer.q_proj.weight"))?;
+    let w_ik = model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
+    // 1) 5투영 — 디바이스 그룹 1호출(왕복 0). wq 출력 [t][n_head·2hd]는 어텐션
+    //    커널의 q 레이아웃(q‖게이트 인터리브)과 정확히 일치(plans/67 위험 항 해소).
+    acc.frame_mm_group(
+        f.mix,
+        &[wq, wk, wv, w_iq, w_ik],
+        &[f.qsa_q, f.qsa_k, f.qsa_v, f.qsa_iq, f.qsa_ik],
+        t,
+    )
+    .map_err(Q4Error::Io)?;
+    sync_mark(acc, "qsa.mm_group", f.qsa_q)?;
+    // 2) q/k norm+rope in-place — 커널 산술은 호스트 rms_norm(sq_sum 32세그먼트
+    //    f64)+rope_head(f64 회전)와 동일열(비트 동일 기대).
+    let pos0 = seq_st.pos;
+    // qk_norm_rope 커널은 norm 가중치를 **헤드별 타일**(qw[r0·hd..])로 읽는다
+    // (decode 경로는 rawinject가 타일해 업로드 — ssm_norm 타일링과 같은 규약).
+    // 공유 [hd] 원본을 그대로 올리면 24헤드 분량(6144)을 256원소 버퍼에서 읽어
+    // illegal address(700)로 폭주한다 — plans/67 2c 연결 시 실측 발견(2026-09-14).
+    let qn_raw = model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
+    let kn_raw = model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
+    let qn: Vec<f32> = qn_raw.iter().copied().cycle().take(qn_raw.len() * n_head).collect();
+    let kn: Vec<f32> = kn_raw.iter().copied().cycle().take(kn_raw.len() * n_kv).collect();
+    acc.frame_qk_norm_rope(
+        f.qsa_q, f.qsa_k, &qn, &kn, &f.qsa_cs, hp.eps, pos0 as usize,
+        n_head, n_kv, hd, n_rot, t,
+    )
+    .map_err(Q4Error::Io)?;
+    sync_mark(acc, "qsa.qkrope", f.qsa_k)?;
+    // 3) 캐시 적립용 최소 d2h — iq/ik(선택 로직 입력) + k(이미 norm·rope됨)/v.
+    let (iq_len, ik_len, kv_len) = (
+        hp.idx_heads * idx_dim,
+        idx_dim,
+        n_kv * hd,
+    );
+    let mut iq_v = vec![0.0f32; t * iq_len];
+    let mut ik_v = vec![0.0f32; t * ik_len];
+    let mut k_v = vec![0.0f32; t * kv_len];
+    let mut v_v = vec![0.0f32; t * kv_len];
+    acc.frame_read(f.qsa_iq, &mut iq_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_ik, &mut ik_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_k, &mut k_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_v, &mut v_v).map_err(Q4Error::Io)?;
+    sync_mark(acc, "qsa.d2h", f.qsa_v)?;
+    let rows = |flat: &[f32], w: usize| -> Vec<Vec<f32>> {
+        flat.chunks_exact(w).map(|c| c.to_vec()).collect()
+    };
+    let kk = rows(&k_v, kv_len);
+    let vv = rows(&v_v, kv_len);
+    let iq = rows(&iq_v, iq_len);
+    let ik = rows(&ik_v, ik_len);
+    // 4) 선택(호스트) — k_prenormed=true: 디바이스가 norm·rope를 마친 k를
+    //    그대로 적립. 이후 단계는 캐시가 갱신된 뒤라 폴백 없이 진행한다.
+    let (sel_blk, sel_cnt, sel_stride) = stages::qsa_select(
+        ctx, seq_st, il, &kk, &vv, &iq, &ik, t, full_idx, true,
+    )?;
+    let r = hp.compress[il] as usize;
+    let (sel_idx, sel_off) =
+        stages::qsa_sel_list(&sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t);
+    // 5) 어텐션 — q를 디바이스 버퍼에서 직접. 실패 시에만 d2h q + CPU 재계산.
+    let kq_scale = hp.kq_scale();
+    let kn_max = (pos0 as usize + t) * n_kv * hd;
+    let ck = &seq_st.kv_k[full_idx][..kn_max];
+    let cv = &seq_st.kv_v[full_idx][..kn_max];
+    if let Err(e) = acc.qsa_attention_dev(
+        f.qsa_q, ck, cv, &sel_idx, &sel_off, kq_scale,
+        n_head, n_kv, hd, t, f.qsa_attn,
+    ) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("# qsa-frame: GPU 어텐션 폴백 — CPU 재계산 ({e})")
+        });
+        let mut q_v = vec![0.0f32; t * n_head * 2 * hd];
+        acc.frame_read(f.qsa_q, &mut q_v).map_err(Q4Error::Io)?;
+        let qg = rows(&q_v, n_head * 2 * hd);
+        let attn = stages::qsa_cpu_attn_rows(
+            &qg, seq_st, full_idx, &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t,
+            n_head, n_kv, hd, kq_scale,
+        );
+        let flat: Vec<f32> = attn.concat();
+        acc.frame_write(f.qsa_attn, &flat).map_err(Q4Error::Io)?;
+    }
+    // 6) wo 투영 — 어텐션 출력을 디바이스에서 ffn_out으로(왕복 0).
+    acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
+        .map_err(Q4Error::Io)?;
+    Ok(())
 }
 
 /// hc_mix 프레임 — CPU stages/hc.rs hc_mix와 동일 순서 (inject 반환 포함).

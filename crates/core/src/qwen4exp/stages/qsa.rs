@@ -107,6 +107,7 @@ fn mask_from_list(
         ik: &[Vec<f32>],
         t_len: usize,
         full_idx: usize,
+        k_prenormed: bool,
     ) -> Result<(Vec<u32>, Vec<u32>, usize), Q4Error> {
         let hp = &ctx.model.hp;
         let (n_kv, hd) = (hp.n_kv, hp.head_dim);
@@ -157,9 +158,15 @@ fn mask_from_list(
                             let pos = pos0u as u32 + t as u32;
                             for h in 0..n_kv {
                                 let lo = h * hd;
-                                let mut head = rms_norm(&kk[t][lo..lo + hd], knw, eps);
-                                rope_head(&mut head, pos, n_rot, rope_base);
-                                kch[lo..lo + hd].copy_from_slice(&head);
+                                if k_prenormed {
+                                    // plans/67 2c: 디바이스(frame_qk_norm_rope)가 이미
+                                    // norm+rope를 적용한 k — 그대로 적립(재적용 금지).
+                                    kch[lo..lo + hd].copy_from_slice(&kk[t][lo..lo + hd]);
+                                } else {
+                                    let mut head = rms_norm(&kk[t][lo..lo + hd], knw, eps);
+                                    rope_head(&mut head, pos, n_rot, rope_base);
+                                    kch[lo..lo + hd].copy_from_slice(&head);
+                                }
                                 vch[lo..lo + hd].copy_from_slice(&vv[t][lo..lo + hd]);
                             }
                             ich.copy_from_slice(&ik[t][..idx_dim]);
@@ -299,6 +306,74 @@ fn mask_from_list(
         Ok((sel_blk, sel_cnt, sel_stride))
     }
 
+/// 선택 목록(sel_blk/sel_cnt)을 GPU 어텐션 커널 규약의 평탄화된 위치 리스트로
+/// 펼친다 — 블록(오름차순) + 테일. 위치는 오름차순이므로 마스크 스캔과 산술
+/// 순서가 같다(프로브에서 비트 동일 확인). qsa_layer와 프레임 브리지가 공용.
+pub fn qsa_sel_list(
+    sel_blk: &[u32],
+    sel_cnt: &[u32],
+    sel_stride: usize,
+    r: usize,
+    pos0: usize,
+    n_tok: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut sel_off: Vec<u32> = vec![0u32; n_tok + 1];
+    for t2 in 0..n_tok {
+        let n_past = pos0 + t2 + 1;
+        let tail_cnt = n_past - (n_past / r) * r;
+        sel_off[t2 + 1] = sel_off[t2] + sel_cnt[t2] * r as u32 + tail_cnt as u32;
+    }
+    let mut sel_idx: Vec<u32> = vec![0u32; sel_off[n_tok] as usize];
+    for t2 in 0..n_tok {
+        let n_past = pos0 + t2 + 1;
+        let tail_start = (n_past / r) * r;
+        let mut o = sel_off[t2] as usize;
+        for k2 in 0..sel_cnt[t2] as usize {
+            let b = sel_blk[t2 * sel_stride + k2] as usize;
+            for j in 0..r {
+                sel_idx[o] = (b * r + j) as u32;
+                o += 1;
+            }
+        }
+        for j in tail_start..n_past {
+            sel_idx[o] = j as u32;
+            o += 1;
+        }
+    }
+    (sel_idx, sel_off)
+}
+
+/// CPU 어텐션 일괄 — GPU 어텐션 실패 폴백. q행은 [t][n_head·2hd](게이트 포함,
+/// wq 출력 레이아웃 그대로). qsa_layer 폴백과 프레임 브리지 폴백이 공용.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_cpu_attn_rows(
+    qg: &[Vec<f32>],
+    seq_state: &SeqState4,
+    full_idx: usize,
+    sel_blk: &[u32],
+    sel_cnt: &[u32],
+    sel_stride: usize,
+    r: usize,
+    pos0: usize,
+    t_len: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    kq_scale: f32,
+) -> Vec<Vec<f32>> {
+    let (ckv, cvv) = (&seq_state.kv_k[full_idx], &seq_state.kv_v[full_idx]);
+    let mut out = vec![vec![0.0f32; n_head * hd]; t_len];
+    for t in 0..t_len {
+        let n_past = pos0 + t + 1;
+        let m_t = mask_from_list(&[], sel_blk, sel_cnt, sel_stride, r, t, n_past);
+        cpu_attn_row(
+            &mut out[t], &qg[t], &m_t, n_past, ckv, cvv,
+            n_head, n_kv, hd, kq_scale,
+        );
+    }
+    out
+}
+
     #[allow(unused_assignments)] // 진단 코드의 중간 변수
     pub fn qsa_layer(
         ctx: &Ctx,
@@ -394,7 +469,7 @@ fn mask_from_list(
         // 블록 키 풀링·top-k 선택(Pass B)이 거기에 있고 산술은 원본과 동일하다.
         // 여기는 q rope + CPU 폴백 마스크 복원 + 패스 C만 남는다.
         let (sel_blk, sel_cnt, sel_stride) = qsa_select(
-            ctx, seq, il, &kk, &vv, &iq, &ik, t_len, full_idx,
+            ctx, seq, il, &kk, &vv, &iq, &ik, t_len, full_idx, false,
         )?;
         let r = hp.compress[il] as usize;
         // q norm·rope를 qg에 적용 — 원본과 동일 산술(어텐션은 패스 뒤 일괄).

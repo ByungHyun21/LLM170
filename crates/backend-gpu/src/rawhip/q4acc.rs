@@ -2211,9 +2211,13 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         let mut qwp = qnd as *mut std::ffi::c_void;
         let mut kwp = knd as *mut std::ffi::c_void;
         let mut csp = csd as *mut std::ffi::c_void;
-        // kq_scale은 이 커널이 쓰지 않지만 시그니처가 요구한다(decode 판과 동일).
+        // kq_scale은 이 커널의 decode 판은 k에 구워 넣지만(kqs=self.kq_scale),
+        // QSA 프레임 경로는 **k를 무척도(1.0)로 둔다** — QSA KV 캐시 규약이
+        // 무척도 k이고 qsa_attn_sel6가 q·k에 kq_scale을 곱하기 때문. 초기 구현은
+        // 0.0을 넘겨 k를 전부 0으로 만드는 잠복 결함이었음(미호출 경로라 미발견,
+        // 2026-09-14 plans/67 2c 연결 시 발견·수정).
+        let mut kq = 1.0f32;
         let mut ep = eps;
-        let mut kq = 0.0f32;
         let mut pp = pos0 as i32;
         let mut nh = n_head as i32;
         let mut nk = n_kv as i32;
