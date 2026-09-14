@@ -1238,3 +1238,29 @@ error: io: rawhip: launch3: 700 kern=q4_gemm_q4k_ge gx=40 gy=519 gz=1 blk=256
 — `gy=519`(rows_pad=8,304)에서 폴트한다. 이제 `HIP_LAUNCH_BLOCKING=1`로 **정확히 그
 런치에서** 재현되므로, 다음 시도는 그 커널의 인덱스 세 곳(`rows_pad_p`, `rowexp[r]`,
 `xq[r*xq_w]`)을 범위 증명과 함께 점검하면 된다.
+
+### 6차 확인: 4축 수정 상태에서도 커널 런치 폴트 — 재현 경로 확보 (2026-09-14)
+
+현재 커밋 상태를 확인한 결과 **네 축은 이미 반영돼 있다**(커널 `rowexp[pd]=e` 채움,
+`int bound` 인자, 런처 전달, `xbuf_rows` 버퍼). 그런데도 `HIP_LAUNCH_BLOCKING=1`에서
+
+```
+launch3: 700 kern=q4_gemm_q4k_ge gx=40 gy=519 gz=1 blk=256
+```
+
+가 재현된다. 즉 **다섯 번째 범위 가정이 남아 있고**, 값들은 다음과 같이 정합적이다:
+
+| 값 | 계산 | 판정 |
+|---|---|---|
+| `expert_bytes` | 스택 471MB ÷ 512 = **0.92MB** (앞서 본 "8MB"는 *h2d 청크 상수*와의 우연한 일치) | 정상 |
+| `gz/gx` | `n_out` 640 ÷ 16 = 40 | 정상 |
+| `gy` 519 | `rows_pad` 8,304 = `rows`(240) + 패딩 | 상한 내 |
+| `rowexp[r]` | 패딩 슬롯까지 채움(수정 반영) | 상한 내 |
+| `xq[r*xq_w]` | 버퍼를 `rows+16*ne`로 확보(수정 반영) | 상한 내 |
+
+**다음 시도 절차(확정)**: q4_K 분기에는 q5_1 분기의 `LLM170_GE5_DBG` 같은 값 덤프가
+없다 → 먼저 `rows / rows_pad / ne / off_pad[0..4] / rowexp[0..4] / t(디바이스 값)`를
+찍고, `HIP_LAUNCH_BLOCKING=1`로 **그 런치에서** 값을 본다. 재현이 3분이므로 반복이 싸다.
+그 다음 `q4_gemm_q4k_ge`의 세 인덱스(`w + e*expert_bytes + o*(n_super*144)`,
+`rowexp[r]`, `xq + r*xq_w`)를 범위 증명과 함께 본다 — 특히 **`rowexp`가 *가리키는
+전문가 id*가 실제 스택 크기 안인지**(패딩 슬롯에 다른 타일의 e가 들어갔을 가능성).
