@@ -289,6 +289,10 @@ pub struct RawCtx {
     mmq_y_s: std::sync::Mutex<(usize, *mut u8)>,
     /// q6→f16 전개 캐시 (w주소 → f16 버퍼).
     f16_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
+    /// hipMalloc 범위 등록부 — h2d 실패 시 목적지가 살아있는 할당 안인지 보고한다.
+    /// 2026-09-14: 이것으로 "실패한 목적지가 정상 할당 내"임을 한 번에 확인해
+    /// 원인을 커널 런치로 좁혔다(해제는 하지 않으므로 목록은 영구, 수백 개 수준).
+    allocs: std::sync::Mutex<Vec<(usize, usize)>>,
     ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
     mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>,  // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
     /// q6 정준 재배열 캐시.
@@ -463,6 +467,7 @@ impl RawCtx {
             Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            allocs: std::sync::Mutex::new(Vec::new()),
             ar_cache: std::sync::Mutex::new(None),
             mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -492,7 +497,25 @@ impl RawCtx {
             if r != hip::hipError_t_hipSuccess { eprintln!("alloc {bytes}B → {r:?}"); }
             ck(r, "hipMalloc")?;
         }
+        if let Ok(mut v) = self.allocs.lock() {
+            v.push((p as usize, p as usize + bytes));
+        }
         Ok(p as *mut u8)
+    }
+
+    /// `p`가 살아있는 할당 안인지(그리고 몇 바이트 남았는지) — h2d 실패 진단용.
+    fn alloc_span(&self, p: usize, need: usize) -> String {
+        let Ok(v) = self.allocs.lock() else { return "등록부 잠금 실패".into() };
+        for &(s, e) in v.iter() {
+            if p >= s && p < e {
+                return if p + need <= e {
+                    format!("할당 내 [{s:#x},{e:#x})")
+                } else {
+                    format!("할당 경계 초과! [{s:#x},{e:#x}) +{}B", p + need - e)
+                };
+            }
+        }
+        format!("할당 밖 (등록 {}개)", v.len())
     }
 
     /// 사이드 스트림 비동기 h2d — 메인 스트림 작업과 중첩시킨 뒤 join2로 합류.
@@ -518,6 +541,7 @@ impl RawCtx {
             if let Err(e) = ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag) {
                 // 사후 hipMemGetInfo는 sticky 오류 때문에 0을 돌려준다(확인함) —
                 // 메모리 진단이 필요하면 이 h2d **전에** 조회해야 한다.
+                let span = self.alloc_span(dst as usize, src.len());
                 let bt = std::backtrace::Backtrace::force_capture();
                 let frames: Vec<String> = format!("{bt}")
                     .lines()
@@ -525,7 +549,10 @@ impl RawCtx {
                     .take(4)
                     .map(|l| l.trim().to_string())
                     .collect();
-                return Err(format!("{e} | 호출: {}", frames.join(" <- ")));
+                return Err(format!(
+                    "{e} | dst {span} | 호출: {}",
+                    frames.join(" <- ")
+                ));
             }
             self.sync()
         }
