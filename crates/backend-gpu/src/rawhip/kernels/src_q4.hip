@@ -584,6 +584,24 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
     if (i >= (size_t)nblocks) return;
     const unsigned char* p = w + i * 144;
     unsigned v = 0;
+    if (mode == 3) {
+        // GEMM 패턴: 스레드마다 자기 출력행의 연속 스트림을 읽는다(행 간 5KB 스트라이드).
+        // warp 32레인이 32개 다른 행 → 라인당 소량만 사용.
+        const unsigned short* h = (const unsigned short*)p;
+        unsigned v2 = 0;
+        for (int i = 0; i < 8; i++) v2 += h[i * 320];
+        if (v2 == 0xDEADBEEFu) acc[0] = v2;
+        return;
+    }
+    if (mode == 4) {
+        // 목표 패턴: 워프가 한 행을 협동으로(레인=연속 열) → 완전 병합.
+        const unsigned short* h = (const unsigned short*)p;
+        int lane = threadIdx.x & 31;
+        unsigned v3 = 0;
+        for (int i = 0; i < 8; i++) v3 += h[lane + i * 32];
+        if (v3 == 0xDEADBEEFu) acc[0] = v3;
+        return;
+    }
     if (mode == 0) {
         v = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
     } else if (mode == 1) {
