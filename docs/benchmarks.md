@@ -5650,3 +5650,25 @@ diverse stream and a 200-token prompt reproduce token-for-token, which is the re
 contract for such kernels (same as the q5_1 MMQ tile). LLM170_QSA_SPLIT=0 restores the
 bit-exact path. The 27B is untouched (no QSA) and its timings are unchanged.
 
+
+## QSA attention: 6 heads per warp instead of 4 (2026-09-14)
+
+`_sel4` keeps the gate in registers, so q + gate + acc = 96 floats per lane and 4 heads is
+the ceiling - which means 24 heads split into 6 warps that each read the same K/V rows,
+a 6x re-read. The gate is only needed at the end, so reading it from global there frees
+those registers and lets the same 96-float budget hold 6 heads, cutting the re-read to 4x.
+That matters because the prefill attention is bandwidth-bound: at t=2048 each call moves
+~34 GB against 236 GB/s ~= the measured 101 ms.
+
+`q4_qsa_attn_sel6` (prefill path, chosen when n_head % 12 == 0) and the split kernel (both
+head groups now 6) preserve the arithmetic order exactly, so this is bit-identical - the
+diverse stream and the 200-token prompt reproduce unchanged, with no numerical contract
+relaxed.
+
+| measurement | before | after |
+|---|---|---|
+| pp2048 | 9,012-9,118 ms | 8,748-8,908 ms (-1.6 to -2.9%) |
+| pp8192 tg8 (with the split kernel) | 1,140.3 ms | 1,019.9 ms (-10.6% cumulative) |
+
+LLM170_QSA_H6=0 restores the 4-head kernel.
+
