@@ -5176,10 +5176,15 @@ Skipping stages via LLM170_STAGE_SKIP:
 | gdn.l2 | 9017.2 ms | 0 |
 
 So 73% of the prefill is the MoE (44%) plus the QSA (29%), and within the MoE the
-grouped GEMM carries ~37% (the routing is 7%). The grouped GEMM's arithmetic explains
-it: with 16x16 tiles each row tile re-reads its expert's weight slice, so a 2048-token
-chunk (20480 rows, 1536 row tiles) reads the expert weights about 12x over - roughly
-the gap between the measured 3.3 s and the 280 ms the weights would cost at DRAM
-bandwidth. The fix is a taller GEMM tile (128-256 rows per block instead of 16),
-which multiplies the weight reuse by 8-16x. The QSA is the next target after that.
+grouped GEMM carries ~37% (the routing is 7%). Correcting an earlier reading: the
+16x16 tiles re-read an expert's weight slice 2.5x, not 12x (a 20480-row chunk over 512
+experts averages ~40 rows each), so the reread-aware traffic is 167 GB and the measured
+3.3 s implies an effective 53 GB/s - the same pattern-limited figure the decode shows.
+The fix is therefore not a taller tile (worth at most 2.5x) but a grouped f16
+contiguous weight path: the dense gemm_f16_v4 cannot serve the grouped layout, so the
+grouped kernel needs its own f16 form, which should take 53 to ~200 GB/s and the MoE
+from 3.3 s to ~0.9 s, about -27% of the prefill. The QSA follows.
+
+Across decode, prefill and the 27B the bound is the same 53 GB/s weight-read pattern,
+so a contiguous f16 weight layout is the common highest-value lever.
 
