@@ -5280,3 +5280,19 @@ With the direct path in place the same skip still shows -27 ms/step, which is th
 artefact plus the top-k op itself; the real recoverable grouping cost was the 5.3
 ms/step this change delivers.
 
+
+## Parallel top-k selection in the MoE router: -12 ms/step, bit-identical (2026-09-14)
+
+After the direct-ids change the decode step's kernel list showed q4_moe_top10_m as the
+single largest entry: 13.3 ms/step at 0.278 ms per call for 48 calls, against a
+theoretical ~10 us of work. The cause was the selection: a single lane ran a 512
+iteration stable insertion sort. It is now a k-round warp selection - each of the 32
+lanes owns 16 experts, picks its own best unused one, and a shuffle butterfly
+reduces to the global best, whose lane then consumes that slot; the zeros and the
+weighted sum follow the same order as before, so the diverse-prompt output is
+bit-identical.
+
+Warm tg8 (--reps 3): 673.2/669.2 -> 579.7/568.9 = 574.3 ms, i.e. 83.9 -> 71.8 ms/step.
+Across the session the decode went from 131.9 to 71.8 ms/step (-46%), and against
+llama.cpp's 61 ms/step the gap is now 1.18x, down from 2.16x.
+
