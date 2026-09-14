@@ -5257,3 +5257,26 @@ weight traffic at the measured 53 GB/s gives 3.15 s against 3.70 s measured. Not
 also explains why the deq-f16 port was neutral: a contiguous f16 layout does not change
 the access shape, so it doubles the bytes without fixing the pattern.
 
+
+## Direct-ids MoE GEMM for t=1: -8% decode, bit-identical (2026-09-14)
+
+The t=1 MoE no longer builds a grouping at all. Two new kernels
+(q4_gemm_q4k_ge_ids for the gate/up, q4_gemm_q5_1_gm_ids for the down - the down is
+Q5_1 in this quantization, which is why making only the gate/up direct recovered
+nothing: the grouping still fired at the down) read ids[row] directly, so the row
+order is the ids order and the gather, the scatter and the whole host round trip
+(a synchronous ids d2h, the table build, three h2d uploads) disappear. The per-row
+dot products are unchanged, so the diverse-prompt output is bit-identical and the 27B
+is unaffected.
+
+Warm tg8 with --reps 3: 716.7/715.2 before, 673.2/669.2 after = 671.2 ms, i.e. the
+decode goes from 91.3 to 83.9 ms/step (-8%), and the session's total from 131.9 to
+83.9 (-36%). The direct path is the default; LLM170_MOE_GROUPED=1 restores the
+grouped path.
+
+Note on an earlier number: the moe.top10 stage-skip showed -33 ms/step, but that
+measurement leaves stale ids in place so the model degenerates and its GEMMs speed up.
+With the direct path in place the same skip still shows -27 ms/step, which is that
+artefact plus the top-k op itself; the real recoverable grouping cost was the 5.3
+ms/step this change delivers.
+
