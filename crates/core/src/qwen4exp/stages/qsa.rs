@@ -138,7 +138,13 @@ fn mask_from_list(
                 std::mem::take(&mut iq),
                 std::mem::take(&mut ik),
             ];
-            // 실측(2026-09-14, pp2048 청크): QSA 호스트 스테이지는 5.0s이고
+            // 실측(2026-09-14, pp8192+tg4 프레임 타이머): **장문맥 디코드(t=1)의
+            // 최대 비용이 이 스테이지다** — 스텝 137ms 중 79ms(58%)이고 내역은
+            // mm_group 30ms/콜, sel+proj 18ms/콜, sel_build 13ms/콜이다. 어텐션
+            // 커널(KTRACE 1.425ms/콜 = 17.1ms/스텝)보다 이 host-visible 구간이 크다.
+            // mm_group이 t=1에서 30ms인 것은 전송량(d2h 25KB)으로 설명되지 않으므로
+            // 다음 조사 대상이다(런치+동기 횟수 또는 prepare_x 쪽 의심).
+            // 참고(pp2048 청크): QSA 호스트 스테이지는 5.0s이고
             // mm_group 38% + attn 37%(둘 다 가속기 작업) + sel_build 14% +
             // sel+proj 10%다. 전송(d2h/h2d)은 0.07s로 무죄였다.
             // sel_build의 버퍼 재사용은 중립(0.70 vs 0.71s) — 비용은 평탄화된
