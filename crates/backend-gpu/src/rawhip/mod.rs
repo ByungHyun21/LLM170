@@ -509,6 +509,12 @@ impl RawCtx {
             // 크기만으로도 부족했다(2026-09-14). 백트레이스는 강제로 잡는다
             // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
+            // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
+            if std::env::var_os("LLM170_MEMDBG").is_some() && src.len() >= (1 << 20) {
+                let (mut fb, mut tb) = (0usize, 0usize);
+                unsafe { let _ = hip::hipMemGetInfo(&mut fb, &mut tb); }
+                eprintln!("# memdbg before {tag}: free={}MB/{}MB", fb / 1048576, tb / 1048576);
+            }
             if let Err(e) = ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag) {
                 // 사후 hipMemGetInfo는 sticky 오류 때문에 0을 돌려준다(확인함) —
                 // 메모리 진단이 필요하면 이 h2d **전에** 조회해야 한다.

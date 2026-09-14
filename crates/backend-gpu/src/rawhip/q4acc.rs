@@ -113,6 +113,8 @@ pub struct Q4Acc {
     qsp: std::sync::Mutex<GBuf>,
     /// 출력 스테이징 재사용 버퍼(d2h가 전체를 덮어쓰므로 0-채움 불필요).
     ybuf: std::sync::Mutex<Vec<f32>>,
+    /// 컨텍스트 길이(엔진이 주입). KV 풀을 이 크기로 선할당한다.
+    ctx_len: std::sync::atomic::AtomicUsize,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -279,6 +281,7 @@ impl Q4Acc {
             atn: std::sync::Mutex::new(GBuf::new("atn")),
             qsp: std::sync::Mutex::new(GBuf::new("qsp")),
             ybuf: std::sync::Mutex::new(Vec::new()),
+            ctx_len: std::sync::atomic::AtomicUsize::new(0),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
@@ -991,6 +994,10 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::FrameState for Q4Acc {
+    fn set_ctx_len(&self, n: usize) {
+        self.ctx_len.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn frame_begin(&self, t: usize) {
         self.cur_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
     }
@@ -1664,10 +1671,14 @@ impl Q4Acc {
         let (qdev, kdev, vdev, sdev, odev, ofdev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
+            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
+            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
+                * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
             let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
@@ -1750,10 +1761,14 @@ impl Q4Acc {
         let (qdev, kdev, vdev, sdev, odev, ofdev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
+            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
+            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
+                * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
             let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
@@ -1841,10 +1856,14 @@ impl Q4Acc {
         let (qdev, kdev, vdev, sdev, ofdev, pdev, odev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len().max(1) * 4)?;
+            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
+            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
+            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
+                * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len().max(1) * 4)?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len().max(1) * 4)?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
             let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
@@ -1942,10 +1961,14 @@ impl Q4Acc {
         let (qdev, kdev, vdev, mdev, odev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
+            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
+            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
+                * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len() * 4)?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len() * 4)?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let mdev = d.ensure(&self.ctx, mask.len() * 4)?;
             let mut e2 = self.atn.lock().map_err(|e| e.to_string())?;
