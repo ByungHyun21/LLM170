@@ -32,14 +32,22 @@ hardware rationale — 8 GB HBM2e at ~1.5 TB/s with eFUSE FFMA throttling to
 
 | Backend | pp512 prefill | decode (tg32) | note |
 |---|---|---|---|
-| ROCm/HIP (`rawhip`) | **364 t/s** | **11.6 t/s** | llama-bench ROCm, same GGUF, CLI-to-CLI: 354.7 / 11.56 → **1.03× / 1.01×** |
+| ROCm/HIP (`rawhip`, **ROCm 10 userspace**) | **372 t/s** | **11.6-11.7 t/s** | llama-bench on the same ROCm 10: 316.7 pp418 / 11.26 tg → **we lead every prefill cell** (pp3314 337.9 vs 314.4 = 1.07×) |
 | Vulkan (`rawvk`) | 320 t/s | **11.4 t/s** | llama.cpp Vulkan: 350.8 / 11.48 → 0.91× / **1.00×** |
 | CPU (W4A8) | 181 t/s (pp64) | 11.7 t/s (tg24) | bit-exact reference engine |
 
+The runtime is the TheRock ROCm 10.0.0 userspace for gfx1151
+(`/opt/rocm-10.0.0`) selected via `LD_LIBRARY_PATH` - same soname, no relink;
+the gate/bench scripts default to it with fallback to the system 7.2.2.
+Switching the runtime alone moved llama.cpp +28-41% on prefill, which is why
+all comparisons are now quoted on the equal ROCm 10 footing.
+Qwen3.8-Flash-Next (125B hybrid) on the same stack: pp2048 **288 t/s**,
+decode 81.7 ms/step at 8k context.
+
 At longer contexts the HIP backend holds its lead on prompt processing
-(pp3314 339 t/s vs llama-bench 335, 1.01×) and closes to 0.98× on decode
-(11.3 vs 11.5). The decode attention is bandwidth-bound at that point: it
-moves its f16 KV at ~221 GB/s effective.
+(pp3314 337.9 t/s vs llama-bench ROCm 10 314.4, **1.07×**) and decodes at
+parity (11.29 vs 11.26). The decode attention is bandwidth-bound at that
+point: it moves its f16 KV at ~221 GB/s effective.
 
 The Vulkan backend reached these numbers with three decode/prefill kernel
 families of its own — subgroup GEMV (decode, faithful llama dmmv ports),
