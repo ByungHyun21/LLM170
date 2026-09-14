@@ -219,6 +219,24 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### Prefill MoE device grouping: correct but slower - and a production race fixed (2026-09-14)
+
+Finishing plans/68 fixed two defects that matter beyond the experiment:
+d2h() and d2h_issue() shared one pinned staging buffer, so any synchronous
+read between an async issue and its wait overwrote the MoE offset table with
+that read's float payload (fallback row count 1.04e9 = float bits as int,
+HIP 700; the t=1 production path carried this race latently - now each has
+its own slot), and the grouping kernel left perm_pad slots in [rp, bound&~15)
+stale, making the gather index activations out of bounds (the residual
+last-token flip). With both fixed the experimental prefill grouping is
+bit-correct (gate PASS) but measures 9% slower than the host path
+(253 vs 278 t/s pp2048): padded rows inflate the GEMM ~20% and the serial
+grouping kernel costs more than the host counting sort. Prefill stays on the
+host grouping (LLM170_MOE_GROUP_PF=1 opts in). Methodology note: the earlier
+frame-time sync-mark attribution of "49% host cost" included GPU drain -
+kernel-time traces are the reliable measure; the next prefill levers are the
+dense GEMM kernels themselves (gemm_q8_j128 799ms/chunk, q4_gemm_f32_m 601ms).
+
 ### Device-resident QSA KV cache: long-ctx decode 87->82.3 ms (2026-09-14)
 
 The QSA KV cache now lives on the GPU in per-(layer,seq) pools: each step
