@@ -5338,3 +5338,24 @@ kernel keeps a shared-memory tile load from the grouped form (it stages a 16-row
 weight tile cooperatively) and its per-row expert lookup defeats that staging; giving
 it the gate/up treatment is the next step.
 
+
+## 27B (qwen35) decode kernel breakdown: it is already near the DRAM limit (2026-09-14)
+
+KTRACE of a 27B decode step (88.6 ms of kernels, 40 kernel types):
+
+| kernel | total ms | calls | effective |
+|---|---|---|---|
+| gemm_q5k (n_out=17408) | 14.21 | 51 | ~179 GB/s |
+| gemm_q5k (n_out=5120) | 13.92 | 75 | ~85 GB/s |
+| gemm_xs (n_out=17408) | 10.87 | 46 | ~180 GB/s |
+| gemm_q6k (65535 / 5120) | 10.88 | 27 | ~180 GB/s |
+| gemm_q4k (17408 / 10240) | 7.83 | 42 | ~150 GB/s |
+
+Across the step the model's ~15 GB of weights move at ~169 GB/s, 71% of the 236 GB/s
+the probe measures, and the large FFN GEMMs individually sit at ~179 GB/s. So the 27B's
+decode is close to the practical DRAM limit and there is only ~10-20% of headroom
+there; for this model the earlier "pattern-limited" correction does not apply. Its real
+headroom is the prefill: 363 t/s is 34% of the f32 peak while the weights stream at
+only 10.6 GB/s, i.e. compute/tile limited, which is what the plans/66 P1-style work
+(bf16 tensor-core GEMM, measured 1.42x in the reference stack) targets.
+
