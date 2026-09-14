@@ -5416,3 +5416,15 @@ the gate/up path's 180 GB/s is not a reachable target for it. The Flash-Next dec
 therefore sits near its practical floor at 70.8 ms/step, with the prefill (MoE down plus
 QSA) as the remaining lever.
 
+
+## Flash-Next prefill split: a quarter of it is the QSA bridge (2026-09-14)
+
+With LLM170_FRAME_TIME the pp2048 frame reports 8,831 ms for the 2048-token chunk
+(223-230 t/s, matching the bench wall of 8,917 ms). The frame's own timer accounts for
+76% of that; the remainder, ~2,119 ms, is the QSA bridge - the read/drain/write round
+trip around each QSA stage. Twelve QSA layers therefore cost ~175 ms each in transfers
+alone, which is a larger and more targeted lever than anything inside the frame stages.
+The Q4_TRACE stage prints only fire on the NaN guard path, so the older per-stage sums
+(21 ms per layer) do not account for the chunked frame's real cost and should not be used
+for the prefill; the frame-total and bridge timers are the trustworthy pair.
+
