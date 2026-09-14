@@ -5428,3 +5428,20 @@ The Q4_TRACE stage prints only fire on the NaN guard path, so the older per-stag
 (21 ms per layer) do not account for the chunked frame's real cost and should not be used
 for the prefill; the frame-total and bridge timers are the trustworthy pair.
 
+
+## Why the QSA bridge costs 24% of the prefill (2026-09-14)
+
+The bridge in frame.rs is read (d2h plus drain) -> host QSA stage -> write (h2d). The
+arithmetic of the timings says the transfer itself is not the bulk: the round trip per
+QSA layer moves ~21 MB at PCIe/shared-memory rates, well under the measured ~175 ms per
+layer. What dominates is the structure around it. The drain is a full synchronisation, so
+the device idles for the entire host-side stage; and each call additionally churns ~4,096
+heap allocations (2048 per-row Vecs from chunks_exact().map(to_vec), then out.concat()),
+so twelve layers times two chunks per pp2048 walk about 98k allocations per forward.
+
+Removing them (a single flat buffer with the stage taking a &[f32]) is a bounded cleanup
+worth doing, but the larger fix is the architecture: the QSA value path is host-side, so
+no overlap is possible while it stays there. Making it device-resident removes the
+synchronisation, the transfers and the allocation churn together, and that is the
+Flash-Next prefill's main remaining lever.
+
