@@ -238,6 +238,17 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### hc up-projection j128 is the best available path, not a broken default (2026-09-14)
+
+After the WMMA discovery (a silently-broken default), the next kernel-time
+leader - the hc up-projection (Q8_0 [2560x640], gemm_q8_j128, ~800ms/chunk) -
+was A/B'd the same way: disabling the tile path (LLM170_Q4_NO_TILE) falls to
+the GEMV route at 54.8 t/s pp2048 vs 270 for j128. So j128 is genuinely the
+best of the available kernels for this shape; its ~2.5 TFLOPS ceiling is a
+small-n_in amortization limit (the code comment's own analysis). Beating it
+needs a dequant-cache or MMQ-style kernel for Q8_0 at this shape - recorded as
+the next prefill lever, not a quick default flip.
+
 ### Prefill MoE device grouping: correct but slower - and a production race fixed (2026-09-14)
 
 Finishing plans/68 fixed two defects that matter beyond the experiment:
