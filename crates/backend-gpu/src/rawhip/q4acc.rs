@@ -1633,6 +1633,15 @@ impl Q4Acc {
             let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
             (qdev, kdev, vdev, sdev, odev, ofdev)
         };
+        // 주의(실측 2026-09-14): 아래 h2d는 **매 호출 KV 캐시 전체**를 올린다.
+        // n_past 8192에서 8192 x 2 x 256 x 4B x 2(K,V) = 33.6MB/층, 12층이면
+        // 403MB/스텝이고 d2h 대역 실측(17.6 GB/s)으로 ~23ms/스텝 = 장문맥 스텝의 16%다.
+        // 컨텍스트 스케일링 실측이 이를 지지한다: pp2048 103.9ms/스텝 ->
+        // pp8192 141.8ms/스텝(+37.9)이고 KV 증가분만 302MB/스텝 ~17ms(증가의 45%)다.
+        // 정공법은 KV를 디바이스 상주로 두고 증가분만 올리는 것 — 프레임 SeqState4가
+        // 호스트 측이라 지금은 매번 전체를 올린다. 상태 캐시이므로 시퀀스 재시작·
+        // 프롬프트 교체 시 무효화가 필요해 서버 다중 시퀀스까지 검증해야 한다.
+        // (_sel4_raw도 같은 블록을 쓴다.)
         self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
         self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
         self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
