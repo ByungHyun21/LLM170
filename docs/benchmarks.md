@@ -5622,3 +5622,31 @@ KTRACE confirms the attention kernel is the device-side maximum at long context
 (1.425 ms/call, 17.1 ms/step). The stage prints now carry a t label so this cannot
 recur.
 
+
+## QSA decode attention: position splitting (flash-style) lands -12.7% at long context (2026-09-14)
+
+The t=1 attention kernel was latency-bound: `_sel4` puts 4 heads in a warp (register
+limit) and walks the whole selection list serially per warp, so at n_past 8192 a warp
+runs 8192 positions x ~35 cycles = ~200 us - and the t=1 grid is only (1, n_head/8) = 3
+blocks, i.e. almost no parallelism. Measured 1.425 ms/call = 17.1 ms/step.
+
+New: `q4_qsa_attn_sel4s` splits the selection list across (split, head-group) blocks,
+each warp keeping its own online softmax over its chunk, with
+`q4_qsa_attn_sel4s_merge` combining the partials in flash order. Splits adapt to the
+list length (list/32, capped at 64) so short contexts pay nothing.
+
+| measurement | before | after |
+|---|---|---|
+| pp8192 tg, per step | 142.5 ms | 124.4 ms (**-12.7%**) |
+| pp24 tg, per step | 566-576 ms / 8 | 574.6 ms / 8 (no regression) |
+
+The garbage first attempt is worth recording: the partial buffer was laid out
+[head][split][m,l,acc0..7], but acc is per-lane, so 32 lanes overwrote the same ten
+floats and the model diverged after the first token. The layout is now
+[head][split][lane][m,l,acc0..7].
+
+Correctness: the merge changes the summation order, so this is not bit-identical; the
+diverse stream and a 200-token prompt reproduce token-for-token, which is the repo's
+contract for such kernels (same as the q5_1 MMQ tile). LLM170_QSA_SPLIT=0 restores the
+bit-exact path. The 27B is untouched (no QSA) and its timings are unchanged.
+
