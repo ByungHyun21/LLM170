@@ -5159,3 +5159,27 @@ compute nor by bandwidth - the deq-f16 route addresses both of those and therefo
 changes nothing. The prefill needs the same treatment the decode got: decompose it by
 stage, find the inefficiency, and fix that. This also lowers P1's priority for the 27B.
 
+
+## Prefill decomposition (pp2048, --reps 2, warm rep, 2026-09-14)
+
+Skipping stages via LLM170_STAGE_SKIP:
+
+| skip | pp2048 | delta |
+|---|---|---|
+| none | 8980.8 ms | - |
+| moe | 5024.7 ms | **-44%** |
+| qsa | 6385.4 ms | **-29%** |
+| gdn | 7498.0 ms | -17% |
+| moe.top10 | 8344.0 ms | -7% (routing) |
+| moe.shared | 9034.0 ms | 0 |
+| gdn.mm | 8622.8 ms | -4% |
+| gdn.l2 | 9017.2 ms | 0 |
+
+So 73% of the prefill is the MoE (44%) plus the QSA (29%), and within the MoE the
+grouped GEMM carries ~37% (the routing is 7%). The grouped GEMM's arithmetic explains
+it: with 16x16 tiles each row tile re-reads its expert's weight slice, so a 2048-token
+chunk (20480 rows, 1536 row tiles) reads the expert weights about 12x over - roughly
+the gap between the measured 3.3 s and the 280 ms the weights would cost at DRAM
+bandwidth. The fix is a taller GEMM tile (128-256 rows per block instead of 16),
+which multiplies the weight reuse by 8-16x. The QSA is the next target after that.
+
