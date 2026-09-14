@@ -281,6 +281,22 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### Flash-Next decode decomposition and the hc path bottleneck (2026-09-15)
+
+FRAME_TIME per-step marks (t=1 decode, ROCm 10, fused shared expert):
+**hc path ~40ms** (rms 7.4 + down 15.8 + up 13.2 + gate 2.8 + combine 1.4)
+> shared expert 17.7 > QSA/GDN mm_group 15.7 > MoE routing 4.7 >
+QSA bridge 4.6 > GDN out 3.8. Total ~75ms/step (13.3 t/s).
+
+The hc (hyper-connections) backbone reads only 154MB/step (0.65ms at DRAM)
+but takes 40ms - **61x above bandwidth floor**, dominated by 576 launches
+(6 ops x 2 stages x 48 layers). The fused shared expert kernel (8 to 2
+launches) was performance-neutral because the launch overhead was already
+hidden behind the async pipeline. The hc path has 50% more launches and
+less GPU work per launch, making it the prime fusion target - a fused
+hc stage kernel could save ~30ms = 40% decode improvement (13.3 to ~22
+t/s, beating llama's 17.78).
+
 ### Flash-Next vs llama.cpp first head-to-head (2026-09-15, ROCm 10)
 
 Same GGUF (UD-Q4_K_XL 103.7 GiB, 177B-A3B as llama-bench identifies it),
