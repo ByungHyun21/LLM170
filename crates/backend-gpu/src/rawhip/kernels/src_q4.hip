@@ -632,6 +632,17 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
     if (i >= (size_t)nblocks) return;
     const unsigned char* p = w + i * 144;
     unsigned v = 0;
+    if (mode == 5) {
+        // 완전 병합: 워프 레인이 연속 워드를 읽는다(4B × 32 = 128B 트랜잭션 1개).
+        // mode 3(스레드가 자기 행 스트림)과의 차이가 곧 "행 단위 스트라이드"의 대가.
+        const unsigned* u = (const unsigned*)p;
+        int lane = threadIdx.x & 31;
+        unsigned v5 = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) v5 += u[lane + i * 32];
+        atomicAdd(&acc[0], v5);
+        return;
+    }
     if (mode == 3) {
         // GEMM 패턴: 스레드마다 자기 출력행의 연속 스트림을 읽는다(행 간 5KB 스트라이드).
         // warp 32레인이 32개 다른 행 → 라인당 소량만 사용.

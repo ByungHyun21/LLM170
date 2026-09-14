@@ -1784,7 +1784,7 @@ mod micro_tests {
         let nb = 4_000_000usize; // 4M 블록 × 144B = 576MB
         let wbuf = ctx.scratch(nb * 144).expect("wbuf");
         let accb = ctx.scratch(4).expect("acc");
-        for mode in [0i32, 1, 2, 3, 4] {
+        for mode in [0i32, 1, 2, 3, 4, 5] {
             let launch_bw = || {
                 let (mut wp, mut ap) = (wbuf as *mut std::ffi::c_void, accb as *mut std::ffi::c_void);
                 let (mut n, mut m) = (nb as i32, mode);
@@ -1811,6 +1811,7 @@ mod micro_tests {
                 1 => nb as f64 * 4.0,
                 2 => nb as f64 * 16.0,
                 3 => nb as f64 * 2.0 * 8.0,   // f16 8회/스레드
+                5 => nb as f64 * 4.0 * 8.0,   // 워드 8회/레인(완전 병합)
                 _ => nb as f64 * 2.0 * 8.0,   // 워프 협동도 같은 바이트
             } * 4.0;
             let touched = nb as f64 * 144.0 * 4.0; // 실제로 건드린 메모리 범위
