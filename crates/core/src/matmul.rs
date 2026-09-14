@@ -218,6 +218,28 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_attention: 이 가속기는 미지원".into())
     }
 
+    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
+    /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
+    /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_qk_norm_rope(
+        &self,
+        _q: u64,
+        _k: u64,
+        _q_norm: &[f32],
+        _k_norm: &[f32],
+        _cs: &[f32],
+        _eps: f32,
+        _pos0: usize,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _n_rot: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        Err("frame_qk_norm_rope: 이 가속기는 미지원".into())
+    }
+
     /// QSA 선택-목록 GQA의 **디바이스 q판** — q가 이미 디바이스 버퍼(wq의
     /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다(plans/67 1단계).
     /// k/v는 기존처럼 캐시 업로드 경로(kv_sync)를 쓴다. 출력은 out 버퍼에.

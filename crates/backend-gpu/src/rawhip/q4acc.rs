@@ -115,6 +115,10 @@ pub struct Q4Acc {
     ybuf: std::sync::Mutex<Vec<f32>>,
     /// 컨텍스트 길이(엔진이 주입). KV 풀을 이 크기로 선할당한다.
     ctx_len: std::sync::atomic::AtomicUsize,
+    /// plans/67 2a: q/k norm·cs(로프 테이블) 상수용 소형 풀.
+    qn: std::sync::Mutex<GBuf>,
+    kn: std::sync::Mutex<GBuf>,
+    cst: std::sync::Mutex<GBuf>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -282,6 +286,9 @@ impl Q4Acc {
             qsp: std::sync::Mutex::new(GBuf::new("qsp")),
             ybuf: std::sync::Mutex::new(Vec::new()),
             ctx_len: std::sync::atomic::AtomicUsize::new(0),
+            qn: std::sync::Mutex::new(GBuf::new("qn")),
+            kn: std::sync::Mutex::new(GBuf::new("kn")),
+            cst: std::sync::Mutex::new(GBuf::new("cst")),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
@@ -2169,6 +2176,65 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             self.run_prepared(xf, xq, xq_w, t, w, 0, o)?;
         }
         Ok(())
+    }
+
+    fn frame_qk_norm_rope(
+        &self,
+        q: u64,
+        k: u64,
+        q_norm: &[f32],
+        k_norm: &[f32],
+        cs: &[f32],
+        eps: f32,
+        pos0: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        n_rot: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        // 상수 3개(qn/kn/cs)를 디바이스에 올린다(작음 — 매 호출 h2d 수십 µs).
+        let (qnd, knd, csd) = {
+            let mut a = self.qn.lock().map_err(|e| e.to_string())?;
+            let qnd = a.ensure(&self.ctx, q_norm.len().max(1) * 4)?;
+            let mut b = self.kn.lock().map_err(|e| e.to_string())?;
+            let knd = b.ensure(&self.ctx, k_norm.len().max(1) * 4)?;
+            let mut c = self.cst.lock().map_err(|e| e.to_string())?;
+            let csd = c.ensure(&self.ctx, cs.len().max(1) * 4)?;
+            (qnd, knd, csd)
+        };
+        self.ctx.h2d(qnd, bytemuck::cast_slice(q_norm))?;
+        self.ctx.h2d(knd, bytemuck::cast_slice(k_norm))?;
+        self.ctx.h2d(csd, bytemuck::cast_slice(cs))?;
+        let mut qp = self.fptr(q)? as *mut std::ffi::c_void;
+        let mut kp = self.fptr(k)? as *mut std::ffi::c_void;
+        let mut qwp = qnd as *mut std::ffi::c_void;
+        let mut kwp = knd as *mut std::ffi::c_void;
+        let mut csp = csd as *mut std::ffi::c_void;
+        // kq_scale은 이 커널이 쓰지 않지만 시그니처가 요구한다(decode 판과 동일).
+        let mut ep = eps;
+        let mut kq = 0.0f32;
+        let mut pp = pos0 as i32;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut nr = n_rot as i32;
+        let rows = n_head + n_kv;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut qp) as *mut _ as *mut std::ffi::c_void,
+            (&mut kp) as *mut _ as *mut std::ffi::c_void,
+            (&mut qwp) as *mut _ as *mut std::ffi::c_void,
+            (&mut kwp) as *mut _ as *mut std::ffi::c_void,
+            (&mut csp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ep) as *mut _ as *mut std::ffi::c_void,
+            (&mut kq) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut nr) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)
     }
 
     fn qsa_attention_dev(
