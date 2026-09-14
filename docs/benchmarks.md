@@ -234,6 +234,27 @@ is 723.4 ms per 8 steps = 90.4 ms/step, and the row-batch Q4K kernel variant
 (LLM170_Q4K_Y=1 YRPT=4), which was the third attempt at recovering memory-level
 parallelism, is neutral at 719.9 ms.
 
+## Why the weight reads are pattern-limited, and what fixes them (2026-09-14)
+
+The strided probe's modes 1-2 (per-thread strided scalar 4 B vs the same stride with
+16-byte vectors) measure 6.5 and 29.6 GB/s of useful bytes against 235-267 GB/s
+touched, i.e. the memory system is fine and the utilisation is not. Modes 3-4, which
+were meant to model the GEMM's row-per-thread and warp-cooperative patterns, produced
+impossible figures (2578 GB/s) because the compiler elided the loads; that tooling
+needs fixing before it can be quoted.
+
+The analysis that does hold: in the grouped MoE GEMM each thread accumulates one
+output row, so a warp's 32 lanes read 32 different weight rows - a 2.5-5 kB stride per
+lane, which uses a few bytes of each 128-byte line. The measured 53 GB/s effective is
+consistent with that, and it is already better than the raw probe because a warp
+touches two rows at once. The fix is to make the weight read cooperative: either have
+the warp read one row with lane=column and reduce by shuffle, or store the dequantised
+f16 weights transposed ([k][o] instead of [o][k]) so that lanes reading different
+outputs at the same k hit consecutive addresses. The transposed layout is the cheaper
+change - it is confined to the dequant kernels plus the GEMM indexing - and should take
+the MoE from 53 to roughly 200 GB/s, worth about -27% of the prefill and a comparable
+share of the decode.
+
 ## MoE GEMM ceiling (qwen4exp, measured 2026-09-14)
 
 The grouped MoE GEMM (q4_K, per-expert 16-row-aligned padded layout) cannot use a
