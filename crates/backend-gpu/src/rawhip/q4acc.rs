@@ -1290,8 +1290,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // (패딩/비패딩 gather·scatter·폴백 오프셋)를 전면 교정했으나
                 // 잔여 발산(16토큰 중 마지막 1개 플립)과 진단 동기화 시에만
                 // 재현되는 폴백 행 수 오염이 남아 기본 경로는 유지한다.
+                let pf_exp = std::env::var("LLM170_MOE_GROUP_PF").as_deref() == Ok("1");
                 if std::env::var("LLM170_MOE_GROUP_DEV").as_deref() != Ok("0")
-                    && self.t_cur() == 1
+                    && (self.t_cur() == 1 || pf_exp)
                     && ne <= 512
                     && rows > 0
                 {
@@ -1720,6 +1721,20 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             let _ = &b;
             let rows_pad_dev = b[ne + 1].max(0) as usize;
             let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
+            if std::env::var_os("LLM170_MOE_BCHECK").is_some() {
+                // b(pinned off) 무결성 — r 오염(gemm_q5k gx=1.04억)의 원본 관찰.
+                let mut mono_ok = true;
+                for i in 0..ne {
+                    if b[i] > b[i + 1] { mono_ok = false; break; }
+                }
+                let total = b[ne];
+                if !mono_ok || total < 0 || total as usize > bound || b[..ne.min(8)].iter().any(|&x| x < 0) {
+                    eprintln!(
+                        "# bcheck BAD rows={rows} ne={ne} mono={mono_ok} total={total} bound={bound} b0..7={:?} rp={}",
+                        &b[..8.min(ne)], b[ne + 1]
+                    );
+                }
+            }
             if rows_pad_dev > bound {
                 return Err(format!(
                     "moe 그룹화: rows_pad {rows_pad_dev} > bound {bound} (ne={ne}) — 상한 가정 위반"

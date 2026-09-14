@@ -306,6 +306,10 @@ pub struct RawCtx {
     /// pageable 버퍼로의 hipMemcpyAsync D2H는 슬로패스(1MB에 ~90ms,
     /// 2026-09-05 tg RCA) — 핀 버퍼 경유로 원소복사.
     pinned: std::sync::Mutex<(usize, *mut u8)>,
+    /// d2h_issue(비동기) 전용 핀 — 동기 d2h와 버퍼를 공유하면 issue→wait 사이의
+    /// 어느 동기 판독이든 내용을 덮어쓴다(plans/68 12차: b가 실수값으로 오염돼
+    /// 폴백 행 수 1.04억 → HIP 700. t=1 프로덕션에도 잠복 경쟁이었다).
+    pinned_a: std::sync::Mutex<(usize, *mut u8)>,
 }
 
 /// 타일 발사 파라미터 (스택 로컬 소유 — args 포인터 유효성 보장).
@@ -472,7 +476,7 @@ impl RawCtx {
             ar_cache: std::sync::Mutex::new(None),
             mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
-            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())) })
+            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())), pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
 
@@ -584,7 +588,7 @@ impl RawCtx {
     /// 필요해지는 지점에서 `d2h_wait()`로 완료를 기다린다. 반환 = 핀 버퍼.
     pub fn d2h_issue(&self, need: usize, src: *const u8) -> Result<*mut u8, String> {
         unsafe {
-            let mut pin = self.pinned.lock().map_err(|e| e.to_string())?;
+            let mut pin = self.pinned_a.lock().map_err(|e| e.to_string())?;
             if pin.0 < need {
                 let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
                 if hip::hipMallocHost(&mut p, need) == hip::hipError_t_hipSuccess {
