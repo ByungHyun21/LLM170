@@ -16,63 +16,43 @@ Numbers are only ever quoted with their conditions — full tables and history i
 
 ### CMP 170HX (GA100) — benchmark in preparation
 
-**Development in preparation**: the card is not yet accessible, so no numbers
-are quoted here. The protocol will match the Strix Halo table below (pp512 /
-tg32, same GGUF, greedy, single-tenant `llm170 bench`) in both modes; the
-hardware rationale — 8 GB HBM2e at ~1.5 TB/s with eFUSE FFMA throttling to
-1/32, versus full-rate half2 (~42 TFLOPS) and INT32 — is in
-[docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
+| Mode | pp512 | tg32 |
+|---|---|---|
+| `cmp-stock` (8 GB) | — | — |
+| `cmp-unlocked` (64 GB) | — | — |
 
-| Mode | pp512 prefill | decode (tg32) | note |
-|---|---|---|---|
-| `cmp-stock` (8 GB, eFUSE throttle) | — | — | half2/INT32 kernels, decomposed FFMA |
-| `cmp-unlocked` (64 GB) | — | — | full-rate kernels, to be finalized after unlock measurements |
+Hardware rationale: [docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
 
 ### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) — current dev machine
 
-| Backend | pp512 prefill | decode (tg32) | note |
-|---|---|---|---|
-| ROCm/HIP (`rawhip`, **ROCm 10 userspace**) | **372 t/s** | **11.6-11.7 t/s** | llama-bench on the same ROCm 10: 316.7 pp418 / 11.26 tg → **we lead every prefill cell** (pp3314 337.9 vs 314.4 = 1.07×) |
-| Vulkan (`rawvk`) | 320 t/s | **11.4 t/s** | llama.cpp Vulkan: 350.8 / 11.48 → 0.91× / **1.00×** |
-| CPU (W4A8) | 181 t/s (pp64) | 11.7 t/s (tg24) | bit-exact reference engine |
+Runtime: TheRock ROCm 10.0.0 userspace (`LD_LIBRARY_PATH`, no relink).
 
-The runtime is the TheRock ROCm 10.0.0 userspace for gfx1151
-(`/opt/rocm-10.0.0`) selected via `LD_LIBRARY_PATH` - same soname, no relink;
-the gate/bench scripts default to it with fallback to the system 7.2.2.
-Switching the runtime alone moved llama.cpp +28-41% on prefill, which is why
-all comparisons are now quoted on the equal ROCm 10 footing.
-Qwen3.8-Flash-Next (177B-A3B hybrid, 103.7 GiB) on the same stack:
-pp2048 **288 t/s** (llama.cpp 240.0 → **1.21×**), decode 75 ms/step
-(13.3 t/s vs llama 17.8 — 0.75×; the gap is the dense GDN backbone +
-MoE expert GEMV bandwidth, analyzed in benchmarks.md §2026-09-15).
+#### Qwen3.8-27B (Q4_K_XL, greedy, `llm170 bench`)
 
-At longer contexts the HIP backend holds its lead on prompt processing
-(pp3314 337.9 t/s vs llama-bench ROCm 10 314.4, **1.07×**) and decodes at
-parity (11.29 vs 11.26). The decode attention is bandwidth-bound at that
-point: it moves its f16 KV at ~221 GB/s effective.
+| Backend | pp512 | pp418 | pp3314 | tg32 |
+|---|---|---|---|---|
+| **ROCm/HIP** | **372** | **320** | **338** | **11.7** |
+| Vulkan | 320 | — | — | 11.4 |
+| CPU (W4A8) | 181 | — | — | 11.7 |
 
-The Vulkan backend reached these numbers with three decode/prefill kernel
-families of its own — subgroup GEMV (decode, faithful llama dmmv ports),
-cooperative-matrix tiles (prefill) and fused elementwise kernels — all
-arithmetic-mirrored from the CPU reference. Its attention shader was rewritten to the
-HIP design — one key per lane with the K tile staged in shared, which removes
-the per-key cross-lane reduction entirely (three `OpControlBarrier`s per 32-key
-tile instead of two per key): decode went 10.9 -> 11.44 t/s, i.e. within 0.3% of
-llama.cpp Vulkan on this machine, and prompt processing is unchanged at ~320 t/s.
-The remaining Vulkan weakness is long context (pp3314 161 t/s against the HIP
-backend's 339) because its prefill attention has not had the equivalent tile
-work; that is scoped but deferred behind the ROCm/HIP priority. A
-year of measured experiments behind the current numbers is logged in
-[docs/benchmarks.md](docs/benchmarks.md).
+vs llama.cpp ROCm 10: pp418 317 / pp3314 314 / tg 11.3 → **prefill 1.01-1.07×, decode +3%**.
 
-Speculative decode (HIP, MTP) runs its verify as a batched GPU forward by
-default: **23.5 t/s** single-stream at `--spec 3` and **31.0 t/s aggregate** at
-np4, against llama.cpp's MTP references of 11.5 and 15.5 — **2.04× and 2.00×** —
-with the accepted token stream identical to non-spec greedy on both short and
-2.3k-token prompts.
+#### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-Reference models: Qwen3.8-27B (`qwen35` — Gated DeltaNet + Gated Attention)
-and Qwen3.8-Flash-Next (`qwen4exp` — sparse attention, MoE, PLE).
+| Backend | pp2048 | tg32 |
+|---|---|---|
+| **ROCm/HIP** | **288** | 13.3 |
+
+vs llama.cpp: pp **1.21×** / tg 0.75× (dense GDN backbone + MoE bandwidth, see benchmarks.md).
+
+#### Speculative decode (27B, MTP `--spec 3`)
+
+| Config | t/s | vs llama MTP |
+|---|---|---|
+| single-stream | **23.5** | 2.04× |
+| np4 aggregate | **31.0** | 2.00× |
+
+Full history and analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Build & run
 
