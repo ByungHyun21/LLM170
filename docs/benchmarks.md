@@ -135,3 +135,42 @@ was added for paths that must match the host bit-for-bit (PLE).
   mmap'd pages); sequential not concurrent; runtime always quoted with
   pp numbers; KTRACE (own hipEvent tracer) for kernel truth — external
   GPU profilers are forbidden by policy.
+
+### 2026-09-16 - MTP on hip: verify amortized + np+spec repaired (headline cells)
+
+Three defects on paths the single-stream gate never enters were fixed today; the
+MTP cells the README had marked unmeasurable are now measured.
+
+| Condition (HIP, ROCm 10, greedy, natural text, pp512/ctx8192/tg128) | LLM170 | llama.cpp ref | ratio |
+|---|---|---|---|
+| 27B MTP single (`--spec 3`) | **14.3 t/s** | ~12 (MTP) | ~1.2x |
+| 27B MTP + np4 (aggregate, 4 slots) | **20.4 t/s** | 15.5 | **1.32x** |
+| 27B np4 aggregate (no MTP) | **25.1 t/s** | - | - |
+
+1. `verify_batch_ms` (np>1 + MTP only) never got the f16-mirror migration: it
+   launched `kv_append_t` into the f32 pools that are deliberately NULL once the
+   mirror is default (MEMORY_FAULT at NULL+pos*row) and never wrote the mirror.
+   Guard + per-group `kv_to_f16` added; `scripts/verify.py` spec_np4_seq0..3 now
+   PASS token-exact (24/24 each).
+2. `gemm_mmq`/`gemm_mmq_s` y workspace lacked llama.cpp's J-row slack
+   (`nbytes_src1_q8_1`): a `t` that is not a multiple of 128 makes the last MMQ
+   tile read past the buffer. Surfaced at np-verify t=33. Both pools now add
+   128*144 bytes.
+3. The verify lm_head went straight to the tile kernel, re-reading the 380MB
+   head per row at t=4 (27.3ms vs 5.6ms for the t=1 GEMV). Routed through
+   `mm_b` (g4 family) for t<=8: 5.8ms. MTP single went 5.71 -> 14.3 t/s.
+
+Note on the stat line: `(fwd 128, gen 128, 1.00 tok/fwd)` divides by verify
+rows, not cycles - 1.00 is perfect acceptance, not 1 token/cycle.
+
+Negative results from the same session (both gate-verified, both slower):
+`gemm_q8_0_w4` (16 lanes x 4 quadrants, bit-identical arithmetic) 15.64 t/s and
+`gemm_q8_0_w16` (16 consecutive lanes + 2-way ILP) 15.97 t/s against the
+incumbent `gemm_q8_0` at 17.23 t/s on Flash-Next tg128 - at these shapes
+coalescing/ILP binds, not lane occupancy (details in
+`docs/source/core/qwen4exp/frames.md`).
+
+Also measured: the per-layer QSA norm uploads used a single-slot cache and
+missed on every layer (24KB+2KB synchronous copies x 12 layers = 40ms/step of
+host stalls). Now cached per (ptr,len); KTRACE decode gaps fell 40.0 -> 10.2ms
+with no wall-time change (the GPU stayed busy on the queue).
