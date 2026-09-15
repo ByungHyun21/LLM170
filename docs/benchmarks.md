@@ -266,3 +266,12 @@ verified in the trace; the residue is per-sequence state ops + attention and
 g4 efficiency at t=4) + ~15 ms server-side per-step overhead (4x logits d2h
 2.4 MB + CPU argmax over 4x152k + slot bookkeeping). NOLAUNCH host-logic
 measurement: 0.7 ms/step - the Rust launch-prep path is not a factor.
+
+g4 token-loop hoist (2026-09-16): the per-token-invariant nibble/high-bit
+extraction in `gemm_q5k4` was hoisted out of the token loop explicitly -
+measured neutral (117.6 -> 117.7 ms/step): the compiler was already hoisting,
+and g4's +28% over the t=1 GEMV is the genuine 4x dot4 ALU. Kept (identical
+arithmetic, gate-verified bit-identical, clearer code). The 27B np4 engine gap
+(~130 vs ~110 ms) is therefore not g4-code slack; closing it needs either
+fewer dot4s per weight (packed multi-token dot4 does not exist on this ISA)
+or a different batched kernel family.
