@@ -50,17 +50,24 @@ unchanged under MTP+np4:
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
 | tg single | — | 11.1 (4k) / 11.5 (16k) | — | 9.2 | — | 11.6 / 11.9 |
-| MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP) |
+| MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP, old build) |
 | np4 aggregate | 374 (pp512) | **25.1** | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
-| MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 |
+| MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 *(old build)* |
 
 Conditions for the filled 2026-09-16 cells: HIP, ROCm 10, greedy, natural-text
-prompt, pp512 / ctx 8192 / tg128, all np slots prefilled with the same prompt
-(`LLM170_BENCH_NP`). llama's np4+MTP 15.5 t/s is the recorded server reference
-(ROCm 7.2.2 era, 11.75k-token slots) — the comparison is cross-condition, noted
-as such. MTP = `--spec 3`; acceptance is perfect (4 tokens/cycle) with the
-gguf's own nextn head, and spec output is token-identical to greedy
-(`scripts/verify.py` spec cases).
+prompt, same host. np cells are 4 concurrent HTTP completions (128 tokens each,
+short shared prompt, ctx 8192/slot) measured back-to-back on both engines:
+**LLM170 np4 26.3 vs llama-server 35.1 t/s (0.75x)** — llama's 4-row batch step
+costs 1.30x its single-token step, ours 1.75x. MTP = `--spec 3` with the gguf's
+own nextn head (acceptance 4/4 per cycle, token-identical to greedy).
+
+llama's np4+MTP 15.5 t/s reference is from the **older** llama build (ROCm
+7.2.2 era, 11.75k-token slots); the current build exposes no flag to engage the
+embedded nextn draft (verified in --help and server logs — no draft is loaded),
+so that cell cannot be re-measured here and the 1.32x ratio below compares
+against a stale reference. Against the current build's plain np4 (35.1), our
+MTP+np4 20.4 is 0.58x — aggregate throughput favors llama; single-stream MTP
+(14.3 vs 11.9 plain) favors us.
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
