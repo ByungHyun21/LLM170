@@ -33,11 +33,14 @@ failed with ERROR_DEVICE_LOST under the Vulkan driver at that shape.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
-| backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
-|---|---|---|---|---|
-| LLM170 hip | 324 | 253 | 11.1 | 10.5 |
-| LLM170 vulkan | 150 | — | 9.2 | — |
-| llama.cpp (ROCm 10) | **342** | **317** | **11.6** | **11.9** |
+| backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|
+| LLM170 hip | **374** | 324 | 253 | 11.1 | 11.5 |
+| LLM170 vulkan | — | 150 | — | 9.2 | — |
+| llama.cpp (ROCm 10) | 347 | **342** | **317** | **11.6** | **11.9** |
+
+(Measured 2026-09-16 on the current hip build, greedy, natural-text prompt, pp512
+prompt / ctx 4096 (tg@4k) and 16384 (tg@16k).)
 
 Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
 `--spec 3`). MTP does not change prefill — the np4 pp aggregate applies
@@ -46,7 +49,7 @@ unchanged under MTP+np4:
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | 11.4 | — | 9.2 | — | 11.9 |
+| tg single | — | 11.1 (4k) / 11.5 (16k) | — | 9.2 | — | 11.6 / 11.9 |
 | MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP) |
 | np4 aggregate | 374 (pp512) | **25.1** | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
 | MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 |
@@ -63,9 +66,12 @@ gguf's own nextn head, and spec output is token-identical to greedy
 
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
-| LLM170 hip | **270** | **243** | 17.1 | 16.8 |
+| LLM170 hip | **270** | **243** | 18.0 | 17.9 |
 | LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
+
+(Decode cells re-measured 2026-09-16: 16-lane/row GEMV for small shapes,
+17.2 -> 18.0 t/s at the standard point, gate stream identical.)
 
 Decode modes (aggregate t/s over 4 parallel slots; the model has no
 nextn/MTP head — MTP rows are structurally inapplicable):
@@ -73,8 +79,7 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | 17.5 | — | 17.1 | — | 19.8 |
-| tg vs llama (2026-09-16) | — | 17.2 (ctx 4k) / 17.3 (ctx 16k) | — | — | — | 19.8 / 20.0 |
+| tg single | — | **18.0** (ctx 4k) / **17.9** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
 | MTP single | — | — | — | — | — | — |
 | np4 aggregate | TFNPP4 | TFNP4 | TFNPP4V | TFNP4V | LFNPP4 | LFNP4 |
 | MTP + np4 | — | — | — | — | — | — |
