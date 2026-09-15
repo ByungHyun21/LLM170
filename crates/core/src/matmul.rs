@@ -306,6 +306,104 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_attention_dev_res: 이 가속기는 미지원".into())
     }
 
+    /// plans/73 SELCHECK 진단: qsa_sel_dev가 만든 디바이스 선택 목록을 호스트로
+    /// 읽어 돌려준다(검증 전용 — 프로덕션 경로는 부르지 않는다).
+    fn qsa_sel_readback(
+        &self,
+        _sel_idx: u64,
+        _sel_off: u64,
+        _list_len: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        Err("qsa_sel_readback: 이 가속기는 미지원".into())
+    }
+
+    /// plans/73: QSA 인덱서 선택의 **디바이스판** (디코드 t=1). iq/ik가 프레임
+    /// 버퍼(디바이스)에 있을 때 호스트 왕복 없이 (1) ik를 idx 풀에 적립,
+    /// (2) iq norm+rope, (3) 블록키 증분 갱신, (4) 점수·top-k·선택목록 전개까지
+    /// 커널로 수행한다. 반환 = (sel_idx 디바이스 핸들, sel_off 핸들, 목록 길이).
+    /// 산술은 stages::qsa_select와 동일 순서 — SELCHECK 프로브로 목록 일치 검증.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_dev(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _iq: u64,
+        _ik: u64,
+        _t: usize,
+        _pos0: usize,
+        _idx_heads: usize,
+        _idx_dim: usize,
+        _r: usize,
+        _idx_top_k: usize,
+        _iqw: &[f32],
+        _ikw: &[f32],
+        _cs_idx: &[f32],
+        _eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        Err("qsa_sel_dev: 이 가속기는 미지원".into())
+    }
+
+    /// plans/73: 프리필(t>1)이 호스트 선택 후 **디바이스 idx 풀만** 갱신 — ik 청크
+    /// h2d 적립 + 완성 블록의 블록키 재계산. 이후 디코드의 qsa_sel_dev가
+    /// 풀을 이어 쓴다.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_idx_append_host(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _ik_host: &[f32],
+        _t: usize,
+        _pos0: usize,
+        _idx_dim: usize,
+        _r: usize,
+        _ikw: &[f32],
+        _cs_idx: &[f32],
+        _eps: f32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// plans/73: 디바이스 풀 → 호스트 캐시 재구축(디코드가 호스트 갱신을 건너뛴
+    /// 뒤 프리필/폴백 진입 시 1회). kv_k/kv_v는 [pos*kv_row], idx_k는
+    /// [pos*idx_dim], bk는 [(pos/r)*idx_dim]까지 채운다.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_host_rebuild(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _pos: usize,
+        _kv_row: usize,
+        _kv_k: &mut [f32],
+        _kv_v: &mut [f32],
+        _idx_k: &mut [f32],
+        _bk: &mut [f32],
+        _r: usize,
+        _idx_dim: usize,
+    ) -> Result<(), String> {
+        Err("qsa_host_rebuild: 이 가속기는 미지원".into())
+    }
+
+    /// plans/73: sel 목록이 **디바이스 버퍼**에 이미 있는 상주 캐시판 어텐션 —
+    /// 업로드 없이 qsa_attention_dev_res와 동일 커널(t=1 분할 우선).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev_sel(
+        &self,
+        _q: u64,
+        _ck: u64,
+        _cv: u64,
+        _sel_idx: u64,
+        _sel_off: u64,
+        _list_len: usize,
+        _kq_scale: f32,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _t: usize,
+        _out: u64,
+    ) -> Result<(), String> {
+        Err("qsa_attention_dev_sel: 이 가속기는 미지원".into())
+    }
+
     /// QSA 선택-목록 GQA의 **디바이스 q판** — q가 이미 디바이스 버퍼(wq의
     /// frame_mm_group 출력)에 있을 때 h2d 없이 어텐션을 돈다(plans/67 1단계).
     /// k/v는 기존처럼 캐시 업로드 경로(kv_sync)를 쓴다. 출력은 out 버퍼에.

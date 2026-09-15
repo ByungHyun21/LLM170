@@ -32,6 +32,9 @@ pub struct SeqState4 {
     /// PLE n-gram 직전 토큰 히스토리 (최대 ngram-1개, 오래된 것이 앞)
     pub ple_hist: Vec<u32>,
     pub ple_next_pos: u32,
+    /// plans/73: 디코드가 QSA 선택을 디바이스에서 수행해 호스트 kv/idx 캐시
+    /// 갱신을 건너뛰었음. 프리필(t>1) 진입 시 풀에서 1회 재구축한다.
+    pub qsa_host_stale: bool,
 }
 
 impl SeqState4 {
@@ -53,6 +56,7 @@ impl SeqState4 {
             ple_conv: vec![0.0; if has_ple { ple_hist_len * hp.hc * hp.n_embd } else { 0 }],
             ple_hist: Vec::new(),
             ple_next_pos: 0,
+            qsa_host_stale: false,
         }
     }
 }

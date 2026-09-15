@@ -61,6 +61,9 @@ pub struct Frame4 {
     pub qsa_attn: u64, // [t][n_head·hd] — 어텐션 출력(wo 입력)
     /// rope cos/sin 테이블 호스트 사본 — frame_qk_norm_rope가 받아 올린다.
     pub qsa_cs: Vec<f32>,
+    /// 인덱서 로프 cos/sin 테이블(π n_rot=idx_dim) — 디바이스 선택(plans/73)이
+    /// 받아 올린다. qsa_cs와 동일 산술, 다른 n_rot.
+    pub qsa_cs_idx: Vec<f32>,
     // head
     pub hxn: u64,  // [hc·n_embd]
     pub hlo: u64,
@@ -160,6 +163,26 @@ impl Frame4 {
                 for pos in 0..ctx_n {
                     for pp in 0..half {
                         let theta = base.powf(-(2.0 * pp as f32) / hp.n_rot as f32);
+                        let angle = pos as f32 * theta;
+                        cs[pos * half * 2 + pp * 2] = angle.cos();
+                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
+                    }
+                }
+                cs
+            },
+            qsa_cs_idx: {
+                // 인덱서 로프 — rope_head(pos, n_rot=idx_dim, base)와 동일 값을
+                // 쓴다(디바이스 q4_idx_q_rope/bk_update가 소비, plans/73).
+                let ctx_n = seqs
+                    .first()
+                    .and_then(|s| s.idx_k.first())
+                    .map(|k| k.len() / hp.idx_dim.max(1))
+                    .unwrap_or(8192);
+                let (half, base) = (hp.idx_dim / 2, hp.rope_base);
+                let mut cs = vec![0.0f32; ctx_n * half * 2];
+                for pos in 0..ctx_n {
+                    for pp in 0..half {
+                        let theta = base.powf(-(2.0 * pp as f32) / hp.idx_dim as f32);
                         let angle = pos as f32 * theta;
                         cs[pos * half * 2 + pp * 2] = angle.cos();
                         cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
@@ -599,6 +622,85 @@ fn qsa_frame(
         eprintln!("# qsa-frame L{il} t={t} mm+rope={:.2}ms", t_qsa.elapsed().as_secs_f64() * 1e3);
         lap = std::time::Instant::now();
     }
+    // ─── plans/73: 디코드(t=1) 디바이스 선택 ───
+    // iq/ik/k/v의 d2h 4회(각각 동기식 드레인) + 호스트 선택(0.8-1.5ms/층)이
+    // 스텝의 최대 단일 유휴였다(KTRACE 16k: "after qk_norm_rope" 40ms/step).
+    // 선택 전 과정을 커널로 옮기고 어텐션이 목록을 디바이스에서 직접 읽는다.
+    // 호스트 kv/idx 캐시는 이 경로에서 갱신하지 않는다(→ qsa_host_stale;
+    // 프리필 진입 시 풀에서 1회 재구축). LLM170_QSA_HOSTSEL=1이면 구경로.
+    let kq_scale = hp.kq_scale();
+    let r = hp.compress[il] as usize;
+    if t == 1 && std::env::var_os("LLM170_QSA_HOSTSEL").is_none() {
+        let iqw = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
+        let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        let dev = acc
+            .qsa_sel_dev(
+                full_idx, seq, f.qsa_iq, f.qsa_ik, t, pos0 as usize,
+                hp.idx_heads, hp.idx_dim, r, hp.idx_top_k,
+                &iqw, &ikw, &f.qsa_cs_idx, hp.eps,
+            )
+            .and_then(|(sd, od, list_len)| {
+                acc.qsa_kv_dev(full_idx, seq, f.qsa_k, f.qsa_v, t, pos0 as usize, n_kv, hd)
+                    .and_then(|(kc, vc)| {
+                        acc.qsa_attention_dev_sel(
+                            f.qsa_q, kc, vc, sd, od, list_len, kq_scale,
+                            n_head, n_kv, hd, t, f.qsa_attn,
+                        )
+                        .map(|_| (sd, od, list_len))
+                    })
+            });
+        match dev {
+            Ok((sd, od, list_len)) => {
+                if std::env::var_os("LLM170_QSA_SELCHECK").is_some() {
+                    // 검증 그림자: 동일 입력으로 호스트 선택을 재계산해 목록을
+                    // 대조한다. 이 경로는 호스트 캐시도 갱신하므로 stale가 유지
+                    // 되지 않는다(프리필 재구축 불필요 — 검증 모드의 부수 효과).
+                    let (h_idx, h_off) =
+                        qsa_selcheck_host(ctx, acc, seq_st, f, il, t, full_idx, pos0 as usize, r)?;
+                    match acc.qsa_sel_readback(sd, od, list_len) {
+                        Ok((d_idx, d_off)) => {
+                            if h_idx != d_idx
+                                || h_off.first() != d_off.first()
+                                || h_off.get(1) != d_off.get(1)
+                            {
+                                eprintln!(
+                                    "# qsa-selcheck L{il} pos={pos0} MISMATCH host({} entries) dev({} entries)",
+                                    h_idx.len(),
+                                    d_idx.len()
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("# qsa-selcheck L{il} readback 실패: {e}"),
+                    }
+                } else {
+                    seq_st.qsa_host_stale = true;
+                }
+                acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
+                    .map_err(Q4Error::Io)?;
+                return Ok(());
+            }
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# qsa-frame: 디바이스 선택 폴백 — 호스트 경로 ({e})"));
+            }
+        }
+    }
+    // ─── 프리필(t>1) 진입: 호스트 캐시 재구축(디코드가 갱신을 건너뛴 경우) ───
+    if t > 1 && seq_st.qsa_host_stale {
+        let pos = pos0 as usize;
+        let nb = pos / r.max(1);
+        let mut bk = vec![0.0f32; nb * idx_dim];
+        acc.qsa_host_rebuild(
+            full_idx, seq, pos, n_kv * hd,
+            &mut seq_st.kv_k[full_idx], &mut seq_st.kv_v[full_idx],
+            &mut seq_st.idx_k[full_idx], &mut bk, r, idx_dim,
+        )
+        .map_err(|e| {
+            Q4Error::Io(format!("L{il} t={t} 풀→호스트 재구축 실패: {e}"))
+        })?;
+        seq_st.idx_bk[full_idx] = bk;
+        seq_st.qsa_host_stale = false;
+    }
     // 3) 캐시 적립용 최소 d2h — iq/ik(선택 로직 입력) + k(이미 norm·rope됨)/v.
     let (iq_len, ik_len, kv_len) = (
         hp.idx_heads * idx_dim,
@@ -630,15 +732,25 @@ fn qsa_frame(
     let (sel_blk, sel_cnt, sel_stride) = stages::qsa_select(
         ctx, seq_st, il, &kk, &vv, &iq, &ik, t, full_idx, true,
     )?;
-    let r = hp.compress[il] as usize;
     let (sel_idx, sel_off) =
         stages::qsa_sel_list(&sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t);
+    if t > 1 {
+        // plans/73: 프리필도 디바이스 idx 풀을 갱신 — 이후 디코드의 qsa_sel_dev가
+        // 풀을 이어 쓴다(호스트 선택 결과와 무관하게 풀은 항상 최신).
+        let ikw2 = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        if let Err(e) = acc.qsa_idx_append_host(
+            full_idx, seq, &ik_v, t, pos0 as usize, hp.idx_dim, r,
+            &ikw2, &f.qsa_cs_idx, hp.eps,
+        ) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("# qsa-frame: idx 풀 적립 실패(디코드 폴백 예정) — {e}"));
+        }
+    }
     if qtm {
         eprintln!("# qsa-frame L{il} t={t} select+list={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
         lap = std::time::Instant::now();
     }
     // 5) 어텐션 — q를 디바이스 버퍼에서 직접. 실패 시에만 d2h q + CPU 재계산.
-    let kq_scale = hp.kq_scale();
     let kn_max = (pos0 as usize + t) * n_kv * hd;
     // plans/67 3단계: KV 상주 풀 우선 — k/v를 D2D append하고 어텐션이 풀을
     // 직접 읽는다(매 층 매 스텝의 캐시 재업로드 8k 문맥 32MB 제거).
@@ -657,7 +769,7 @@ fn qsa_frame(
     };
     let ck = &seq_st.kv_k[full_idx][..kn_max];
     let cv = &seq_st.kv_v[full_idx][..kn_max];
-    if std::env::var_os("LLM170_QSA_RESCHECK").is_some() {
+    if std::env::var_os("LLM170_QSA_RESCHECK").is_some() && !seq_st.qsa_host_stale {
         if let Err(e) = acc.qsa_kv_check(full_idx, seq, ck, cv) {
             eprintln!("# qsa-rescheck L{il} t={t} pos0={pos0}: {e}");
         }
@@ -695,6 +807,46 @@ fn qsa_frame(
         .map_err(Q4Error::Io)?;
     let _ = &mut lap;
     Ok(())
+}
+
+/// SELCHECK 검증 그림자(plans/73) — 디바이스 선택과 동일 입력으로 호스트
+/// 선택을 재계산해 목록을 돌려준다. 기존 d2h+qsa_select 경로를 그대로 쓰므로
+/// 호스트 kv/idx 캐시도 함께 갱신된다(검증 모드에선 stale가 유지되지 않음).
+#[allow(clippy::too_many_arguments)]
+fn qsa_selcheck_host(
+    ctx: &Ctx,
+    acc: &dyn Accelerator,
+    seq_st: &mut SeqState4,
+    f: &Frame4,
+    il: usize,
+    t: usize,
+    full_idx: usize,
+    pos0: usize,
+    r: usize,
+) -> Result<(Vec<u32>, Vec<u32>), Q4Error> {
+    let hp = &ctx.model.hp;
+    let (n_kv, hd) = (hp.n_kv, hp.head_dim);
+    let (iq_len, ik_len, kv_len) = (hp.idx_heads * hp.idx_dim, hp.idx_dim, n_kv * hd);
+    let mut iq_v = vec![0.0f32; t * iq_len];
+    let mut ik_v = vec![0.0f32; t * ik_len];
+    let mut k_v = vec![0.0f32; t * kv_len];
+    let mut v_v = vec![0.0f32; t * kv_len];
+    acc.frame_read(f.qsa_iq, &mut iq_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_ik, &mut ik_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_k, &mut k_v).map_err(Q4Error::Io)?;
+    acc.frame_read(f.qsa_v, &mut v_v).map_err(Q4Error::Io)?;
+    let rows = |flat: &[f32], w: usize| -> Vec<Vec<f32>> {
+        flat.chunks_exact(w).map(|c| c.to_vec()).collect()
+    };
+    let (kk, vv, iq, ik) = (
+        rows(&k_v, kv_len),
+        rows(&v_v, kv_len),
+        rows(&iq_v, iq_len),
+        rows(&ik_v, ik_len),
+    );
+    let (sel_blk, sel_cnt, sel_stride) =
+        stages::qsa_select(ctx, seq_st, il, &kk, &vv, &iq, &ik, t, full_idx, true)?;
+    Ok(stages::qsa_sel_list(&sel_blk, &sel_cnt, sel_stride, r, pos0, t))
 }
 
 /// hc_mix 프레임 — CPU stages/hc.rs hc_mix와 동일 순서 (inject 반환 포함).

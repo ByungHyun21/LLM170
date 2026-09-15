@@ -124,6 +124,24 @@ pub struct Q4Acc {
     /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
     /// 구멍(값 경로 청크·롤백·리줌)을 읽는 사고를 막는다(불일치 → 업로드 폴백).
     qsa_kv_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
+    /// plans/73: 인덱서 k 상주 풀 [(full_idx, seq)] — 디바이스 선택의 원천.
+    qsa_idxk: std::sync::Mutex<std::collections::HashMap<(usize, usize), GBuf>>,
+    /// 블록키 상주 풀 [(full_idx, seq)] — 증분 갱신(q4_idx_bk_update).
+    qsa_bk: std::sync::Mutex<std::collections::HashMap<(usize, usize), GBuf>>,
+    /// 인덱서 풀 워터마크(qsa_kv_pos와 동일 규약).
+    qsa_idx_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
+    /// 선택 스크래치: iq_rope / 점수 / 선택플래그.
+    qsa_iqr: std::sync::Mutex<GBuf>,
+    qsa_scr: std::sync::Mutex<GBuf>,
+    qsa_selflag: std::sync::Mutex<GBuf>,
+    /// 인덱저 상수(콘텐츠 해시로 1회 업로드 캐시).
+    qsa_iqw: std::sync::Mutex<(u64, GBuf)>,
+    qsa_ikw: std::sync::Mutex<(u64, GBuf)>,
+    qsa_csidx: std::sync::Mutex<(usize, usize, GBuf)>,
+    /// qk_norm_rope 상수 업로드 캐시(포인터/해시 키) — 매 스텝 3회 h2d+sync 제거.
+    qn_cache: std::sync::Mutex<(u64, usize)>,
+    kn_cache: std::sync::Mutex<(u64, usize)>,
+    cst_cache: std::sync::Mutex<(usize, usize)>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -317,6 +335,18 @@ impl Q4Acc {
             cst: std::sync::Mutex::new(GBuf::new("cst")),
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_idxk: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_idx_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_iqr: std::sync::Mutex::new(GBuf::new("qsa_iqr")),
+            qsa_scr: std::sync::Mutex::new(GBuf::new("qsa_scr")),
+            qsa_selflag: std::sync::Mutex::new(GBuf::new("qsa_selflag")),
+            qsa_iqw: std::sync::Mutex::new((0, GBuf::new("qsa_iqw"))),
+            qsa_ikw: std::sync::Mutex::new((0, GBuf::new("qsa_ikw"))),
+            qsa_csidx: std::sync::Mutex::new((0, 0, GBuf::new("qsa_csidx"))),
+            qn_cache: std::sync::Mutex::new((0, 0)),
+            kn_cache: std::sync::Mutex::new((0, 0)),
+            cst_cache: std::sync::Mutex::new((0, 0)),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
             rperm: std::sync::Mutex::new(GBuf::new("rperm")),
@@ -2023,6 +2053,125 @@ impl Q4Acc {
         Ok((kp as u64, vp as u64))
     }
 
+    /// plans/73 공용: ik를 idx 풀에 적립하고 완성 블록의 블록키를 증분 갱신한다.
+    /// 소스가 디바이스(디코드, f.qsa_ik)면 d2d, 호스트(프리필 청크)면 h2d.
+    /// 워터마크 규약은 qsa_kv_dev_impl과 동일(순차 적립/접두어 되감기 허용).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_idx_append(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        ik_dev: *const u8,
+        ik_host: &[f32],
+        t: usize,
+        pos0: usize,
+        idx_dim: usize,
+        r: usize,
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(*mut u8, *mut u8), String> {
+        let ctx_len = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx_len == 0 {
+            return Err("qsa_idx_append: ctx_len 미주입".into());
+        }
+        if r == 0 || idx_dim != 128 {
+            return Err(format!("qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"));
+        }
+        {
+            let mut wm = self.qsa_idx_pos.lock().map_err(|e| e.to_string())?;
+            let w = wm.entry((full_idx, seq)).or_insert(0);
+            if pos0 > *w {
+                return Err(format!("qsa_idx_append: 워터마크 구멍 w={w} pos0={pos0}"));
+            }
+            *w = pos0 + t;
+        }
+        let nb_max = ctx_len / r + 1;
+        let (idxk_p, bk_p) = {
+            let mut m = self.qsa_idxk.lock().map_err(|e| e.to_string())?;
+            let idxk = m
+                .entry((full_idx, seq))
+                .or_insert_with(|| GBuf::new("qsa_idxk"));
+            idxk.ensure(&self.ctx, ctx_len * idx_dim * 4)?;
+            let mut b = self.qsa_bk.lock().map_err(|e| e.to_string())?;
+            let bk = b
+                .entry((full_idx, seq))
+                .or_insert_with(|| GBuf::new("qsa_bk"));
+            bk.ensure(&self.ctx, nb_max * idx_dim * 4)?;
+            (idxk.ptr, bk.ptr)
+        };
+        if !ik_dev.is_null() {
+            self.ctx.d2d(
+                unsafe { idxk_p.add(pos0 * idx_dim * 4) },
+                ik_dev,
+                t * idx_dim * 4,
+            )?;
+        } else {
+            // hk: h2d는 동기 API — 프리필 청크(드문 경로)라 비용 무의미.
+            self.ctx.h2d(
+                unsafe { idxk_p.add(pos0 * idx_dim * 4) },
+                bytemuck::cast_slice(&ik_host[..t * idx_dim]),
+            )?;
+        }
+        let b0 = pos0 / r;
+        let b1 = (pos0 + t) / r;
+        if b1 > b0 {
+            let ikw_d = self.upload_hashed(&self.qsa_ikw, ikw)?;
+            let cs_d = self.upload_by_ptr(&self.qsa_csidx, cs_idx)?;
+            let (mut ikp, mut bkp, mut iw, mut cp) = (
+                idxk_p as *mut std::ffi::c_void,
+                bk_p as *mut std::ffi::c_void,
+                ikw_d as *mut std::ffi::c_void,
+                cs_d as *mut std::ffi::c_void,
+            );
+            let (mut e, mut bb0, mut rr, mut dd) =
+                (eps, b0 as i32, r as i32, idx_dim as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut ikp) as *mut _ as *mut std::ffi::c_void,
+                (&mut bkp) as *mut _ as *mut std::ffi::c_void,
+                (&mut iw) as *mut _ as *mut std::ffi::c_void,
+                (&mut cp) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut bb0) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                (&mut dd) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("q4_idx_bk_update", (b1 - b0) as u32, 1, 1, 32, &mut args)?;
+        }
+        Ok((idxk_p, bk_p))
+    }
+
+    /// 소형 상수 업로드 캐시 — 내용 FNV 해시가 같으면 재업로드 생략(매 스텝
+    /// h2d+sync를 낳던 qn/kn/iqw/ikw 류 제거). 반환 = 디바이스 포인터.
+    fn upload_hashed(&self, slot: &std::sync::Mutex<(u64, GBuf)>, data: &[f32]) -> Result<*mut u8, String> {
+        let h = fnv_hash(data);
+        let mut g = slot.lock().map_err(|e| e.to_string())?;
+        if g.0 != h || g.1.ptr.is_null() {
+            g.1.ensure(&self.ctx, data.len().max(1) * 4)?;
+            self.ctx.h2d(g.1.ptr, bytemuck::cast_slice(data))?;
+            g.0 = h;
+        }
+        Ok(g.1.ptr)
+    }
+
+    /// 대형 상수(cs 테이블) 업로드 캐시 — (ptr, len) 키. 프레임 필드 벡터는
+    /// 스텝 사이 포인터가 안정적이라 해시(4MB)보다 저렴하다.
+    fn upload_by_ptr(
+        &self,
+        slot: &std::sync::Mutex<(usize, usize, GBuf)>,
+        data: &[f32],
+    ) -> Result<*mut u8, String> {
+        let key = (data.as_ptr() as usize, data.len());
+        let mut g = slot.lock().map_err(|e| e.to_string())?;
+        if g.0 != key.0 || g.1 != key.1 || g.2.ptr.is_null() {
+            g.2.ensure(&self.ctx, data.len().max(1) * 4)?;
+            self.ctx.h2d(g.2.ptr, bytemuck::cast_slice(data))?;
+            (g.0, g.1) = (key.0, key.1);
+        }
+        Ok(g.2.ptr)
+    }
+
     /// 상주 캐시판 어텐션 — ck/cv가 디바이스 주소(업로드 없음). 커널 선택은
     /// qsa_attention_dev와 동일(t=1 분할 우선).
     fn qsa_attn_res(
@@ -2653,19 +2802,33 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         n_rot: usize,
         t: usize,
     ) -> Result<(), String> {
-        // 상수 3개(qn/kn/cs)를 디바이스에 올린다(작음 — 매 호출 h2d 수십 µs).
+        // 상수 3개(qn/kn/cs) — plans/73: 매 호출 h2d(+sync)가 스텝당 36회의
+        // 동기를 만들었다. 내용 해시(qn/kn)·포인터 키(cs)로 1회 업로드 캐시.
+        // cs(qsa_cs)는 Frame4 필드 벡터라 포인터가 안정적이다.
         let (qnd, knd, csd) = {
-            let mut a = self.qn.lock().map_err(|e| e.to_string())?;
-            let qnd = a.ensure(&self.ctx, q_norm.len().max(1) * 4)?;
-            let mut b = self.kn.lock().map_err(|e| e.to_string())?;
-            let knd = b.ensure(&self.ctx, k_norm.len().max(1) * 4)?;
-            let mut c = self.cst.lock().map_err(|e| e.to_string())?;
-            let csd = c.ensure(&self.ctx, cs.len().max(1) * 4)?;
-            (qnd, knd, csd)
+            let qh = fnv_hash(q_norm);
+            let kh = fnv_hash(k_norm);
+            let mut a = (self.qn.lock().map_err(|e| e.to_string())?, self.qn_cache.lock().map_err(|e| e.to_string())?);
+            if a.1 .0 != qh || a.0.ptr.is_null() {
+                a.0.ensure(&self.ctx, q_norm.len().max(1) * 4)?;
+                self.ctx.h2d(a.0.ptr, bytemuck::cast_slice(q_norm))?;
+                *a.1 = (qh, q_norm.len());
+            }
+            let mut b = (self.kn.lock().map_err(|e| e.to_string())?, self.kn_cache.lock().map_err(|e| e.to_string())?);
+            if b.1 .0 != kh || b.0.ptr.is_null() {
+                b.0.ensure(&self.ctx, k_norm.len().max(1) * 4)?;
+                self.ctx.h2d(b.0.ptr, bytemuck::cast_slice(k_norm))?;
+                *b.1 = (kh, k_norm.len());
+            }
+            let cskey = (cs.as_ptr() as usize, cs.len());
+            let mut c = (self.cst.lock().map_err(|e| e.to_string())?, self.cst_cache.lock().map_err(|e| e.to_string())?);
+            if *c.1 != cskey || c.0.ptr.is_null() {
+                c.0.ensure(&self.ctx, cs.len().max(1) * 4)?;
+                self.ctx.h2d(c.0.ptr, bytemuck::cast_slice(cs))?;
+                *c.1 = cskey;
+            }
+            (a.0.ptr, b.0.ptr, c.0.ptr)
         };
-        self.ctx.h2d(qnd, bytemuck::cast_slice(q_norm))?;
-        self.ctx.h2d(knd, bytemuck::cast_slice(k_norm))?;
-        self.ctx.h2d(csd, bytemuck::cast_slice(cs))?;
         let mut qp = self.fptr(q)? as *mut std::ffi::c_void;
         let mut kp = self.fptr(k)? as *mut std::ffi::c_void;
         let mut qwp = qnd as *mut std::ffi::c_void;
@@ -2839,6 +3002,351 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         out: u64,
     ) -> Result<(), String> {
         self.qsa_attn_res(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+    }
+
+    fn qsa_sel_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        iq: u64,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_heads: usize,
+        idx_dim: usize,
+        r: usize,
+        idx_top_k: usize,
+        iqw: &[f32],
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        if t != 1 {
+            return Err(format!("qsa_sel_dev: t={t} (디코드 전용)"));
+        }
+        if r == 0 {
+            return Err("qsa_sel_dev: r=0".into());
+        }
+        let n_past = pos0 + t;
+        let n_blocks = n_past / r;
+        if n_blocks > 8192 {
+            return Err(format!("qsa_sel_dev: n_blocks={n_blocks} > 8192 (expand shared)"));
+        }
+        let iqp = self.fptr(iq)?;
+        let ikp = self.fptr(ik)?;
+        let (_idxk_p, bk_p) =
+            self.qsa_idx_append(full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
+        // (1) iq norm+rope — iqr 스크래치.
+        let iqr = {
+            let mut g = self.qsa_iqr.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * idx_heads * idx_dim * 4)?
+        };
+        let iqw_d = self.upload_hashed(&self.qsa_iqw, iqw)?;
+        let cs_d = self.upload_by_ptr(&self.qsa_csidx, cs_idx)?;
+        {
+            let (mut qp, mut op, mut iw, mut cp) = (
+                iqp as *mut std::ffi::c_void,
+                iqr as *mut std::ffi::c_void,
+                iqw_d as *mut std::ffi::c_void,
+                cs_d as *mut std::ffi::c_void,
+            );
+            let (mut e, mut pp, mut tt, mut ih, mut dd) = (
+                eps,
+                pos0 as i32,
+                t as i32,
+                idx_heads as i32,
+                idx_dim as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut qp) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut iw) as *mut _ as *mut std::ffi::c_void,
+                (&mut cp) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ih) as *mut _ as *mut std::ffi::c_void,
+                (&mut dd) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("q4_idx_q_rope", idx_heads as u32, t as u32, 1, 32, &mut args)?;
+        }
+        // (2) 블록 점수 — 스레드당 블록.
+        let scr = {
+            let mut g = self.qsa_scr.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, n_blocks.max(1) * 4)?
+        };
+        if n_blocks > 0 {
+            let (mut qp, mut bp, mut sp) = (
+                iqr as *mut std::ffi::c_void,
+                bk_p as *mut std::ffi::c_void,
+                scr as *mut std::ffi::c_void,
+            );
+            let (mut nb, mut ih, mut dd) = (n_blocks as i32, idx_heads as i32, idx_dim as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut qp) as *mut _ as *mut std::ffi::c_void,
+                (&mut bp) as *mut _ as *mut std::ffi::c_void,
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
+                (&mut ih) as *mut _ as *mut std::ffi::c_void,
+                (&mut dd) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_idx_score",
+                (n_blocks as u32).div_ceil(256),
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // (3) top-k 순위 + 목록 전개. n_sel 산술은 stages::qsa_select 패스 B와
+        // 동일(usize 정수 — 호스트에서 계산해도 무동기).
+        let tail_start = n_blocks * r;
+        let tail_cnt = n_past - tail_start;
+        let width = n_past.min(idx_top_k + r - 1);
+        let n_sel = ((width - tail_cnt) / r).min(n_blocks);
+        let list_len = n_sel * r + tail_cnt;
+        let (sdev, ofdev) = {
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, list_len.max(1) * 4)? as u64;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, 2 * 4)? as u64;
+            (sdev, ofdev)
+        };
+        {
+            let selflag = {
+                let mut g = self.qsa_selflag.lock().map_err(|e| e.to_string())?;
+                g.ensure(&self.ctx, n_blocks.max(1) * 4)?
+            };
+            if n_blocks > 0 {
+                let (mut sp, mut fp) = (
+                    scr as *mut std::ffi::c_void,
+                    selflag as *mut std::ffi::c_void,
+                );
+                let (mut nb, mut ns) = (n_blocks as i32, n_sel as i32);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                    (&mut fp) as *mut _ as *mut std::ffi::c_void,
+                    (&mut nb) as *mut _ as *mut std::ffi::c_void,
+                    (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                ];
+                self.ctx.launch3(
+                    "q4_idx_rank",
+                    (n_blocks as u32).div_ceil(256),
+                    1,
+                    1,
+                    256,
+                    &mut args,
+                )?;
+            }
+            let (mut fp, mut si, mut so) = (
+                selflag as *mut std::ffi::c_void,
+                sdev as *mut std::ffi::c_void,
+                ofdev as *mut std::ffi::c_void,
+            );
+            let (mut nb, mut ns, mut rr, mut np) =
+                (n_blocks as i32, n_sel as i32, r as i32, n_past as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut fp) as *mut _ as *mut std::ffi::c_void,
+                (&mut si) as *mut _ as *mut std::ffi::c_void,
+                (&mut so) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                (&mut np) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("q4_idx_expand", 1, 1, 1, 256, &mut args)?;
+        }
+        Ok((sdev, ofdev, list_len))
+    }
+
+    fn qsa_idx_append_host(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        ik_host: &[f32],
+        t: usize,
+        pos0: usize,
+        idx_dim: usize,
+        r: usize,
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(), String> {
+        self.qsa_idx_append(
+            full_idx,
+            seq,
+            std::ptr::null(),
+            ik_host,
+            t,
+            pos0,
+            idx_dim,
+            r,
+            ikw,
+            cs_idx,
+            eps,
+        )
+        .map(|_| ())
+    }
+
+    fn qsa_host_rebuild(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        pos: usize,
+        kv_row: usize,
+        kv_k: &mut [f32],
+        kv_v: &mut [f32],
+        idx_k: &mut [f32],
+        bk: &mut [f32],
+        r: usize,
+        idx_dim: usize,
+    ) -> Result<(), String> {
+        let kv_ok = {
+            let wm = self.qsa_kv_pos.lock().map_err(|e| e.to_string())?;
+            wm.get(&(full_idx, seq)).copied().unwrap_or(0) >= pos
+        };
+        let idx_ok = {
+            let wm = self.qsa_idx_pos.lock().map_err(|e| e.to_string())?;
+            wm.get(&(full_idx, seq)).copied().unwrap_or(0) >= pos
+        };
+        if !kv_ok || !idx_ok {
+            return Err(format!(
+                "qsa_host_rebuild: 풀 워터마크 부족 kv={kv_ok} idx={idx_ok} pos={pos}"
+            ));
+        }
+        let nb = pos / r;
+        {
+            let m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
+            let ent = m
+                .get(&(full_idx, seq))
+                .ok_or("qsa_host_rebuild: kv 풀 없음")?;
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut kv_k[..pos * kv_row]), ent.0.ptr)?;
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut kv_v[..pos * kv_row]), ent.1.ptr)?;
+        }
+        {
+            let m = self.qsa_idxk.lock().map_err(|e| e.to_string())?;
+            let p = m
+                .get(&(full_idx, seq))
+                .ok_or("qsa_host_rebuild: idx 풀 없음")?
+                .ptr;
+            self.ctx
+                .d2h(bytemuck::cast_slice_mut(&mut idx_k[..pos * idx_dim]), p)?;
+        }
+        {
+            let m = self.qsa_bk.lock().map_err(|e| e.to_string())?;
+            let p = m
+                .get(&(full_idx, seq))
+                .ok_or("qsa_host_rebuild: bk 풀 없음")?
+                .ptr;
+            self.ctx
+                .d2h(bytemuck::cast_slice_mut(&mut bk[..nb * idx_dim]), p)?;
+        }
+        Ok(())
+    }
+
+    fn qsa_attention_dev_sel(
+        &self,
+        q: u64,
+        ck: u64,
+        cv: u64,
+        sel_idx: u64,
+        sel_off: u64,
+        list_len: usize,
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        // sel 버퍼가 이미 디바이스에 있다 — 업로드 없이 qsa_attn_res와 동일한
+        // 커널 쌍(t=1 분할 우선)을 발사한다.
+        if t != 1 || std::env::var("LLM170_QSA_SPLIT").as_deref() == Ok("0") {
+            return Err(format!("qsa_attention_dev_sel: t={t} 비분할은 미지원"));
+        }
+        let cap = std::env::var("LLM170_QSA_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+        let pdev = {
+            let mut g = self.qsp.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, n_head * n_splits * 32 * 10 * 4)?
+        };
+        let (qdev, odev) = (self.fptr(q)?, self.fptr(out)?);
+        let mut q_p = qdev as *mut std::ffi::c_void;
+        let mut k_p = ck as *mut std::ffi::c_void;
+        let mut v_p = cv as *mut std::ffi::c_void;
+        let mut si_p = sel_idx as *mut std::ffi::c_void;
+        let mut so_p = sel_off as *mut std::ffi::c_void;
+        let mut pa_p = pdev as *mut std::ffi::c_void;
+        let mut ns = n_splits as i32;
+        let mut sc = kq_scale;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut pa_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ns) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3(
+            "q4_qsa_attn_sel4s",
+            n_splits.div_ceil(4) as u32,
+            (n_head / 12) as u32,
+            1,
+            256,
+            &mut args,
+        )?;
+        let mut pa2_p = pdev as *mut std::ffi::c_void;
+        let mut q2_p = qdev as *mut std::ffi::c_void;
+        let mut o2_p = odev as *mut std::ffi::c_void;
+        let mut ns2 = n_splits as i32;
+        let mut nh2 = n_head as i32;
+        let mut h2 = hd as i32;
+        let mut margs: Vec<*mut std::ffi::c_void> = vec![
+            (&mut pa2_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut q2_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o2_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ns2) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh2) as *mut _ as *mut std::ffi::c_void,
+            (&mut h2) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3(
+            "q4_qsa_attn_sel4s_merge",
+            n_head.div_ceil(8) as u32,
+            1,
+            1,
+            256,
+            &mut margs,
+        )?;
+        Ok(())
+    }
+
+    fn qsa_sel_readback(
+        &self,
+        sel_idx: u64,
+        sel_off: u64,
+        list_len: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        let mut idx = vec![0u32; list_len];
+        let mut off = vec![0u32; 2];
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut idx), sel_idx as *const u8)?;
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut off), sel_off as *const u8)?;
+        Ok((idx, off))
     }
 
     fn matmul_paired(
@@ -3321,6 +3829,16 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             ref other => Err(format!("q4acc: 프레임 op 미지원 {other:?}")),
         }
     }
+}
+
+/// FNV-1a f32 슬라이스 해시 — 상수 업로드 캐시 키(plans/73).
+fn fnv_hash(data: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &v in data {
+        h ^= v.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// 프레임 op 인자 벡터 — 로컬 변수의 주소를 c_void로.
