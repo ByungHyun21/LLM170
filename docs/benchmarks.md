@@ -289,8 +289,13 @@ FRAME_TIME per-step marks (t=1 decode, ROCm 10, fused shared expert):
 QSA bridge 4.6 > GDN out 3.8. Total ~75ms/step (13.3 t/s).
 
 The hc (hyper-connections) backbone reads only 154MB/step (0.65ms at DRAM)
-but takes 40ms - **61x above bandwidth floor**, dominated by 576 launches
-(6 ops x 2 stages x 48 layers). The fused shared expert kernel (8 to 2
+but takes 40ms async / 51ms sequential (HIP_LAUNCH_BLOCKING measured).
+True GPU kernel time ~13ms (GEMV-dominated); the remaining ~27ms is
+pipeline/launch overhead. hc=4 streams, down [10240→320] Q8_0 (3.3MB),
+up [320→10240] Q8_0 (3.3MB) per stage. The down GEMV at 320 outputs has
+very low occupancy (2.5 blocks on 40 CUs) - split-K GEMV would improve
+bandwidth. Fusion of hc stages may be neutral (like shared expert) since
+launches are already pipelined behind MoE work for 36/48 GDN layers. The fused shared expert kernel (8 to 2
 launches) was performance-neutral because the launch overhead was already
 hidden behind the async pipeline. The hc path has 50% more launches and
 less GPU work per launch, making it the prime fusion target - a fused
