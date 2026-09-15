@@ -1083,8 +1083,10 @@ impl RawCtx {
         // 킬스위치 LLM170_Q8W16_SMALL=0.
         if t == 1
             && ty == 8
-            && n_in / 32 <= 32
-            && std::env::var("LLM170_Q8W16_SMALL").as_deref() != Ok("0")
+            && (n_in / 32 <= 32
+                || (n_out >= 32768 && std::env::var("LLM170_Q8W16_HEAD").as_deref() == Ok("1")))
+            && (std::env::var("LLM170_Q8W16_SMALL").as_deref() != Ok("0")
+                || std::env::var("LLM170_Q8W16_HEAD").as_deref() == Ok("1"))
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
