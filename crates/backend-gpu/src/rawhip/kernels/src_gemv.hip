@@ -607,6 +607,76 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q8_0_w(const unsigned* xq
     if (lane == 0) orow[o] = (float)accd;
 }
 
+// 멀티토큰 q8_0 GEMV (2026-09-16, plans/73 np) — 무게 행을 **1회** 읽고
+// tt개 토큰의 활성과 각각 내적한다. 종전 gemm_q8_0의 grid=(t,n_out) 배치는
+// 토큰마다 같은 무게 행을 재독했다(hc up [320→10240] t=4에서 4.3× — L2 도움
+// 없이 4배 트래픽). 산술은 단일토큰 판과 **비트 동일**: 레인 l이 서브블록
+// sb=l+64m의 f32 체인을 토큰별로 유지하고, 환원도 토큰별로 동일한
+// f64(상/하반 sh32 교환 + 32레인 shfl 트리) 순서를 쓴다.
+extern "C" __global__ void __launch_bounds__(64) gemm_q8_0_mt(
+        const unsigned* xq, const unsigned* w, double* part, float* out,
+        int n_in, int n_out, int xq_w, int tt) {
+    int o = blockIdx.y + blockIdx.z * gridDim.y;  // 출력 행
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 64) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 63 - l) >> 6;
+    int row_base = o * n_sub * 34;
+    float acc[8];
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) acc[ti] = 0.0f;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 6);
+        int wb = row_base + sb * 34;
+        float d = f16w(w, wb);
+        int wq = wb >> 2;
+        bool al = (wb & 3) == 2;
+        // 무게 8워드 1회 로드 — 토큰 공유
+        unsigned wv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            wv[k] = al ? w[wq + 1 + k]
+                       : (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+        }
+        int xw = (sb << 5) >> 2;
+        for (int ti = 0; ti < tt; ti++) {
+            const unsigned* xr = xq + (size_t)ti * xq_w;
+            unsigned y0 = xr[xw], y1 = xr[xw+1], y2 = xr[xw+2], y3 = xr[xw+3];
+            unsigned y4 = xr[xw+4], y5 = xr[xw+5], y6 = xr[xw+6], y7 = xr[xw+7];
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                    : (k==4?y4:k==5?y5:k==6?y6:y7);
+                isum = dot4(wv[k], yv, isum);
+            }
+            float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+            acc[ti] += yd * d * (float)isum;
+        }
+    }
+    // 토큰별 환원 — 단일토큰 판과 동일 순서(f64).
+    __shared__ double sh32[8][32];
+    double accd[8];
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) {
+        accd[ti] = (double)acc[ti];
+        if (l >= 32) sh32[ti][l - 32] = accd[ti];
+    }
+    __syncthreads();
+    if (l < 32) {
+        #pragma unroll
+        for (int ti = 0; ti < 8; ti++) {
+            if (ti < tt) {
+                accd[ti] += sh32[ti][l];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    accd[ti] += __shfl_down_sync(0xffffffffffffffffull, accd[ti], off);
+                if (l == 0) out[(size_t)ti * n_out + o] = (float)accd[ti];
+            }
+        }
+    }
+}
+
 // q8_0 GEMV — **16레인 × 4사분면** (2026-09-16). 종전 gemm_q8_0(64레인/행,
 // cnt=ceil(n_sub/64))은 n_sub=80 형상에서 두 번째 반복에 16레인만 활동해
 // 레인 효율 62.5%, 10240행 qkv에서 106GB/s(=DRAM 236의 45%)에 그쳤다.

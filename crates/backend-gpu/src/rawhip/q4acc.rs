@@ -2861,6 +2861,22 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::Accelerator for Q4Acc {
+    /// plans/73(np): 프레임 버퍼 행 뷰 — 배치 디코드의 per-seq 상태 op용.
+    fn frame_slice(&self, h: u64, off_elems: usize, len: usize) -> Result<u64, String> {
+        let mut v = self.frames.lock().map_err(|e| e.to_string())?;
+        let idx = (h.checked_sub(1).ok_or("frame 핸들 0")?) as usize;
+        let (base, cap) = *v
+            .get(idx)
+            .ok_or_else(|| format!("frame 핸들 없음: {h}"))?;
+        let need = (off_elems + len) * 4;
+        if need > cap {
+            return Err(format!("frame_slice 범위 초과: need {need} > cap {cap}"));
+        }
+        let ptr = unsafe { base.add(off_elems * 4) };
+        v.push((ptr, len * 4));
+        Ok(v.len() as u64)
+    }
+
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
         crate::rawhip::capture_mark(self.ctx.stream, tag)
     }

@@ -410,6 +410,78 @@ impl Engine4 {
 
     /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
     /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 + PLE 프리페치 조인·소비.
+    /// plans/73(np): 다중 시퀀스 배치 디코드 — 무게 스트리밍 공유(t=seqs.len()).
+    /// 실패 시 프레임을 버리고 순차 decode1로 폴백해 서비스가 끊기지 않게 한다.
+    pub fn decode_batch(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<Vec<Vec<f32>>, Q4Error> {
+        if seqs.len() < 2 || seqs.len() != tokens.len() {
+            let mut out = Vec::with_capacity(seqs.len());
+            for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
+                out.push(self.decode1(s, tk)?);
+            }
+            return Ok(out);
+        }
+        let frame_on = self.acc.is_some()
+            && !self.frame_broken
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
+            && std::env::var_os("LLM170_NO_NP_BATCH").is_none();
+        if !frame_on {
+            let mut out = Vec::with_capacity(seqs.len());
+            for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
+                out.push(self.decode1(s, tk)?);
+            }
+            return Ok(out);
+        }
+        // PLE 프리페치 worker 조인(배치 경로는 프리페치 시작 안 함)
+        if let Some(h) = self.ple_worker.take() {
+            let _ = h.join();
+        }
+        self.ple_next = None;
+        self.ple_consume = None;
+        let acc = self.acc.as_deref().unwrap();
+        if self.frame.is_none() {
+            match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
+                Ok(f) => self.frame = Some(f),
+                Err(e) => {
+                    self.frame_broken = true;
+                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                }
+            }
+        }
+        let r = (|| -> Result<Vec<Vec<f32>>, Q4Error> {
+            let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
+            let acc = self.acc.as_deref().unwrap();
+            for &s in seqs {
+                if f.dirty[s] {
+                    f.sync_states(acc, s, &self.seqs[s], self.model.hp.d_state)?;
+                }
+            }
+            let ctx = Ctx { model: &self.model, acc: Some(acc) };
+            super::frame::frame_forward_np(
+                acc, &self.model, &ctx, seqs, &mut self.seqs, f, tokens,
+            )
+        })();
+        match r {
+            Ok(ls) => {
+                for &s in seqs {
+                    self.seqs[s].pos += 1;
+                }
+                Ok(ls)
+            }
+            Err(e) => {
+                // 배치 경로 실패 — 프레임 폐기 후 순차 폴백(상태 무결성 우선)
+                self.frame = None;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# frame-np: 배치 디코드 실패 — 순차 폴백 ({e})"));
+                let mut out = Vec::with_capacity(seqs.len());
+                for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
+                    out.push(self.decode1(s, tk)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
         // 05-2: 직전 스텝이 예측한 토큰의 프리페치 완료 대기 (조인)
         if let Some(h) = self.ple_worker.take() {
