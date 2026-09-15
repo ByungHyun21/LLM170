@@ -32,7 +32,6 @@ Runtime: ROCm 10 userspace. Greedy, `--reps 2` (warm rep). Same GGUF, same GPU.
 | LLM170 | **360** | 324 | 253 | 11.4 | 11.1 | 10.5 |
 | llama.cpp | 347 | **342** | **317** | **11.9** | **11.6** | **11.9** |
 
-*(2026-09-15 세션: FN 디코드 대폭 개선 — 아래 표 참조. 27B는 pp4096 +2.7%, tg@16k +2.3%.)*
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -41,9 +40,10 @@ Runtime: ROCm 10 userspace. Greedy, `--reps 2` (warm rep). Same GGUF, same GPU.
 | LLM170 | **251** | **270** | **243** | 17.5 | 17.1 | 16.8 |
 | llama.cpp | 206 | 237 | 229 | **19.8** | **20.2** | **20.0** |
 
-*세션 누적 (2026-09-15): FN tg 13.40 → 17.54 (+31%, 단문맥) / 11.3 → 16.83 (+49%, 16k).*
-*주요 구조: QSA 인덱서 선택·PLE 의 GPU 이전(호스트 동기 제거), 워프 GEMV 5종,*
-*비트동일 top-k. 모든 게이트 스트림 동일 유지.*
+*Session gains (2026-09-15): Flash-Next tg 13.40 → 17.54 t/s (+31%, short ctx) and
+11.3 → 16.83 (+49%, 16k ctx). Levers: QSA indexer selection and PLE moved onto the
+GPU (host synchronization removed), five warp-per-row GEMV kernels, bit-identical
+bitonic top-k. All gate streams unchanged.*
 
 #### Speculative decode (27B, MTP `--spec 3`)
 
