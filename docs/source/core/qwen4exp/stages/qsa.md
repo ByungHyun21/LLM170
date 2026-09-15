@@ -1,7 +1,7 @@
-# `crates/core/src/qwen4exp/stages/qsa.rs + stages/moe.rs` — 측정 기록
+# `crates/core/src/qwen4exp/stages/qsa.rs + stages/moe.rs` — measurement record
 
-> `docs/benchmarks.md`에서 **이 파일에 해당하는 항목만** 옮긴 것(제목 기준).
-> 표·수치는 원문 그대로. 요약 지표는 benchmarks.md에 남는다.
+> Items from `docs/benchmarks.md` that correspond to this file (by section title).
+> Tables and numbers are verbatim. Summary metrics remain in benchmarks.md.
 
 ## qwen4exp decode: the MoE grouping round trip and the device-side attempt (2026-09-14)
 

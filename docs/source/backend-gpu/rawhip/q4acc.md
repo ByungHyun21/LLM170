@@ -1,7 +1,13 @@
-# `crates/backend-gpu/src/rawhip/q4acc.rs` — 측정 기록
+# `crates/backend-gpu/src/rawhip/q4acc.rs` — measurement record
 
-> `docs/benchmarks.md`에서 **이 파일에 해당하는 항목만** 옮긴 것(제목 기준).
-> 표·수치는 원문 그대로. 요약 지표는 benchmarks.md에 남는다.
+
+> **Note**: The detailed measurement prose below was written in Korean (the
+> project's working language during development). Section titles and key
+> conclusions are in English; full translation of the prose is planned as
+> the document stabilizes. Numbers, tables, and code are language-neutral.
+
+> Items from `docs/benchmarks.md` specific to this file (by section title).
+> Tables and numbers verbatim. Summary metrics remain in benchmarks.md.
 
 ## 2026-09-05 session 3 — flash attention rewrite (+9% pp512)
 - Replaced the split flash-attention kernel with a warp-per-query design
@@ -318,7 +324,7 @@ Same reasoning applies to the WMMA tile path and to the decode attention: their 
 
 ## Adopted: wk8 prefill attention + reference-gate reset (2026-09-12, user decision)
 
-Per the user's choice (재설정), the judge's long-prompt cases now report divergences as **INFO**
+Per the user's choice (reset), the judge's long-prompt cases now report divergences as **INFO**
 (detailed diagnostics retained: first divergence position, top-k gap, both token prefixes) instead
 of failing, for both the plain long cases (`long_prompt`, `long_np2_*`, `long_np4_*`) and the
 long-context spec cases (`spec_long`, `spec_long_np4`). Short and medium cases keep the original
@@ -916,7 +922,7 @@ can be acted on.
 
 
 
-## 디바이스 그룹화를 프리필로 확장 시도 (2026-09-14, 미해결 — 3회 실패)
+## 디바이스 그룹화를 프리필로 확장 시도 (2026-09-14, unresolved — 3 failures)
 
 프리필의 `group` phase 25.3ms/콜(청크의 27%)은 호스트 경로 때문이다: ids **동기 d2h**
 (20,480 u32 = 80KB) + 호스트 정렬 + h2d 3회. 디바이스 경로(`q4_moe_group_t1`)는

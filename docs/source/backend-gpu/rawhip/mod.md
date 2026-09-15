@@ -1,7 +1,7 @@
-# `crates/backend-gpu/src/rawhip/mod.rs` — 측정 기록
+# `crates/backend-gpu/src/rawhip/mod.rs` — measurement record
 
-> `docs/benchmarks.md`에서 **이 파일에 해당하는 항목만** 옮긴 것(제목 기준).
-> 표·수치는 원문 그대로. 요약 지표는 benchmarks.md에 남는다.
+> Items from `docs/benchmarks.md` that correspond to this file (by section title).
+> Tables and numbers are verbatim. Summary metrics remain in benchmarks.md.
 
 ## Prefill measurement instrument caveats and the 27B op breakdown (2026-09-14)
 
