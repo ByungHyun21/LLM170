@@ -142,6 +142,9 @@ mod tests {
     #[test]
     fn unknown_measurements_pass_with_warning() {
         assert!(check(103_700 * (1 << 20), None, None).is_ok());
-        assert!(check(103_700 * (1 << 20), Some(90 * GIB), None).is_ok());
+        // 호스트 불능 + VRAM 만으로 모델×슬랙을 못 덮으면 거부 — 가드의 목적
+        // (이중 적재 동결 방지)상 이것이 옳다(2026-09-16: 통과 기대는 산식과
+        // 모순되어 수정).
+        assert!(check(103_700 * (1 << 20), Some(90 * GIB), None).is_err());
     }
 }

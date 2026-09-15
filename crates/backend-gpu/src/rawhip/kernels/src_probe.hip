@@ -195,3 +195,48 @@ extern "C" __global__ void argmax_rows_s2(const int2* part, int2* out, int nblk)
     }
 }
 
+
+// plans/74 N4: RDNA3 raw WMMA(w32) 프래그먼트 ABI 프로브 — llama fattn-mma 가 쓰는
+// __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 의 레인↔요소 매핑을 실측 확정.
+// mode bit0: D 레이아웃(0=llama j=2l+g, 1=j=l+8g) · bit1: A/B 적재(0=연속 8g..8g+7, 1=스트라이드 2l+g).
+extern "C" __global__ void wmma2_probe(const __fp16* A, const __fp16* B, float* C, int mode) {
+    typedef __attribute__((ext_vector_type(16))) _Float16 h16;
+    typedef __attribute__((ext_vector_type(8))) float f8;
+    int lane = threadIdx.x;
+    int i = lane % 16, g = lane / 16;
+    _Float16 abuf[16], bbuf[16];
+    #pragma unroll
+    for (int l = 0; l < 16; l++) {
+        int col = ((mode & 2) == 0) ? (8 * g + l) : (2 * l + g);
+        abuf[l] = A[i * 16 + col];
+        bbuf[l] = B[i * 16 + col];
+    }
+    f8 z = {};
+    f8 d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+        *(const h16*)abuf, *(const h16*)bbuf, z);
+    #pragma unroll
+    for (int l = 0; l < 8; l++) {
+        int j = ((mode & 1) == 0) ? (2 * l + g) : (l + 8 * g);
+        C[i * 16 + j] = d[l];
+    }
+}
+
+// plans/74 N4: raw WMMA(w32) 레인 매핑 역추론 — d[l] 를 (lane,l) 원시 덤프.
+// 호스트가 A=e_{r,k}·B=I (또는 반전) 조합으로 (lane,l)→(i,k) 테이블을 적출한다.
+extern "C" __global__ void wmma2_dump(const __fp16* A, const __fp16* B, float* C) {
+    typedef __attribute__((ext_vector_type(16))) _Float16 h16;
+    typedef __attribute__((ext_vector_type(8))) float f8;
+    int lane = threadIdx.x;
+    _Float16 abuf[16], bbuf[16];
+    #pragma unroll
+    for (int l = 0; l < 16; l++) {
+        int src = (lane % 16) * 16 + l;  // 하프워프별 행 중복 적재(ABI 가설)
+        abuf[l] = A[src];
+        bbuf[l] = B[src];
+    }
+    f8 z = {};
+    f8 d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+        *(const h16*)abuf, *(const h16*)bbuf, z);
+    #pragma unroll
+    for (int l = 0; l < 8; l++) C[lane * 8 + l] = d[l];
+}

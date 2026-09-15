@@ -1903,3 +1903,179 @@ extern "C" __global__ void q4_idx_topk(const float* __restrict__ scores,
         sel_idx[(unsigned)n_sel * (unsigned)r + (unsigned)j2] = (unsigned)(tail_start + j2);
     if (tid == 0) { sel_off[0] = 0u; sel_off[1] = (unsigned)(n_sel * r + tail_cnt); }
 }
+
+// ══ plans/74 N4: raw WMMA(w32 builtin) 프리필 어텐션 — qsa_flash_wmma2 ══
+// rocwmma fragment API 대신 __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 직접
+// 사용(ABI 는 wmma2-map2 프로브로 실측 확정, 512/512 스윕 일치):
+//   A/B 프래그먼트: 레인 L 이 소스 행 L%16 의 16 half 전체(하프워프 중복 적재)
+//   수학: D = A·Bᵀ   ·   C 레지스터: 레인 L 원소 l = D[2l + L/16][L%16]
+// 블록 64스레드(워프 2): 워프 w 가 d 반분(0/128)의 Q(레지스터)와 VKQ 누산을
+// 담당하고, KQ 부분합은 smem 결합 후 워프0 이 행별(레인=행) 소프트맥스를
+// 실행해 sP/sM 을 공유한다. 부분출력은 qsa_flash_merge 파트 계약 그대로
+// (part[(t·n_head+h)·nseg+sg][0..hd)=VKQ, [hd]=m, [hd+1]=s).
+extern "C" __global__ void __launch_bounds__(64) qsa_flash_wmma2(
+        const float* q, const _Float16* ck, const _Float16* cv,
+        const unsigned* mask, float* part,
+        int n_past, int n_head, int n_kv, int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    typedef __attribute__((ext_vector_type(16))) _Float16 h16;
+    typedef __attribute__((ext_vector_type(8))) float f8;
+    const int q0 = blockIdx.x * 16;
+    const int h = blockIdx.y;
+    if (q0 >= t_len || h >= n_head) return;
+    const int nq = min(16, t_len - q0);
+    const int kvh = h / (n_head / n_kv);
+    const int sg = blockIdx.z;
+    const int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    const int nseg = gridDim.z;
+    const int tid = threadIdx.x;
+    const int w = tid >> 5, lane = tid & 31;
+    const int g = lane >> 4, lc = lane & 15;
+
+    __shared__ float sS[16][17];        // 스코어는 f32 유지(llama 와 동일 — f16 반올림이 평탄분포 아그맥스를 흔든다)
+    __shared__ _Float16 sP[16][17];
+    __shared__ float sM[16];
+
+    // Q 프래그먼트 — 워프 d 반분 8 슬라이스. 레인 L ← q 행 L%16 전체.
+    h16 QA[8];
+    {
+        const int src = q0 + (lane & 15);
+        const float* qb = q + ((size_t)src * n_head + h) * 2 * hd + w * 128;
+        _Float16 tmp[16];
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            if (src < q0 + nq) {
+                #pragma unroll
+                for (int d = 0; d < 16; d++) tmp[d] = (_Float16)qb[s * 16 + d];
+            } else {
+                #pragma unroll
+                for (int d = 0; d < 16; d++) tmp[d] = (_Float16)0;
+            }
+            QA[s] = *(const h16*)tmp;
+        }
+    }
+    // 워프0 행주인 레인(lc)의 온라임 상태 — 행 = lc.
+    float mrow = -3.4028235e38f;
+    float srow = 0.0f;
+    f8 VKQ[8];
+    {
+        float z[8] = {0,0,0,0,0,0,0,0};
+        #pragma unroll
+        for (int s = 0; s < 8; s++) VKQ[s] = *(const f8*)z;
+    }
+
+    for (int kt = p0; kt < p1; kt += 16) {
+        const int nk = min(16, p1 - kt);
+        // ── KQ 부분합[16q][16k]: A=Q(행=질의), B=K(행=키) → D=Q·Kᵀ.
+        f8 KQp;
+        {
+            float z[8] = {0,0,0,0,0,0,0,0};
+            KQp = *(const f8*)z;
+            _Float16 tmp[16];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                const int d0 = w * 128 + s * 16;
+                const int key = kt + (lane & 15);
+                const _Float16* kb = ck + ((size_t)key * n_kv + kvh) * hd + d0;
+                if (key < p1) {
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) tmp[d] = kb[d];
+                } else {
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) tmp[d] = (_Float16)0;
+                }
+                f8 p2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(QA[s], *(const h16*)tmp, *(const f8*)z);
+                #pragma unroll
+                for (int l = 0; l < 8; l++) ((float*)&KQp)[l] += ((float*)&p2)[l];
+            }
+        }
+        __syncthreads();  // sS 이전 타일 소진 보장
+        if (w == 0) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                const int r = 2 * l + g;
+                sS[r][lc] = ((float*)&KQp)[l];
+            }
+        }
+        __syncthreads();
+        if (w == 1) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                const int r = 2 * l + g;
+                sS[r][lc] += ((float*)&KQp)[l];
+            }
+        }
+        __syncthreads();
+        // ── 소프트맥스(워프0 레인=행주인; 워프1 은 대기).
+        if (w == 0) {
+            const int r = lane;  // 0..31 → 16행을 2레인씩? — 레인 0..15 만 사용
+            if (lane < 16) {
+                float mn = mrow;
+                for (int j = 0; j < nk; j++) {
+                    float sc = sS[lane][j];
+                    const int qr = lane;
+                    if (qr >= nq || mask[(size_t)(pos0 + q0 + qr) * sstride + kt + j] == 0u)
+                        sc = -3.4028235e38f;
+                    mn = fmaxf(mn, sc);
+                }
+                float scale = (mrow > -3.0e38f && mn > -3.0e38f) ? __expf(mrow - mn) : 0.0f;
+                float sr = srow * scale;
+                for (int j = 0; j < nk; j++) {
+                    float sc = sS[lane][j];
+                    const int qr = lane;
+                    float p = 0.0f;
+                    if (qr < nq && mask[(size_t)(pos0 + q0 + qr) * sstride + kt + j] != 0u && sc > -3.0e38f)
+                        p = __expf(sc - mn);
+                    sP[lane][j] = (_Float16)p;
+                    sr += p;
+                }
+                sM[lane] = scale;
+                mrow = mn;
+                srow = sr;
+            }
+        }
+        __syncthreads();
+        // ── VKQ 재스케일(행별 scale) + P·V — 워프별 d 반분.
+        //    A=P(행=질의), B=Vt 조각(행=d, 열=키): 레인 L ← V[kt+c][d0+L%16].
+        {
+            _Float16 ptmp[16];
+            #pragma unroll
+            for (int l2 = 0; l2 < 16; l2++) ptmp[l2] = sP[lane & 15][l2];
+            const h16 pf = *(const h16*)ptmp;
+            _Float16 vtmp[16];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                float* vk = (float*)&VKQ[s];
+                #pragma unroll
+                for (int l = 0; l < 8; l++) vk[l] *= sM[2 * l + g];
+                const int d0 = w * 128 + s * 16;
+                #pragma unroll
+                for (int c = 0; c < 16; c++) {
+                    const int key = kt + c;
+                    vtmp[c] = (key < p1) ? cv[((size_t)key * n_kv + kvh) * hd + d0 + (lane & 15)]
+                                         : (_Float16)0;
+                }
+                VKQ[s] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, *(const h16*)vtmp, VKQ[s]);
+            }
+        }
+        __syncthreads();
+    }
+    // ── 부분출력: 원소 (s,l) → 행 q0+2l+g, 열 w·128+s·16+lc.
+    #pragma unroll
+    for (int s = 0; s < 8; s++) {
+        const float* vk = (float*)&VKQ[s];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const int r = 2 * l + g;
+            if (r < nq) {
+                float* pb = part + (((size_t)(q0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+                pb[w * 128 + s * 16 + lc] = vk[l];
+            }
+        }
+    }
+    if (w == 0 && lane < 16 && lane < nq) {
+        float* pb = part + (((size_t)(q0 + lane) * n_head + h) * nseg + sg) * (hd + 2);
+        pb[hd] = mrow;
+        pb[hd + 1] = srow;
+    }
+}
