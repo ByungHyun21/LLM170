@@ -931,6 +931,27 @@ impl Q4Acc {
                 &mut args,
             );
         }
+        // plans/74: t=2..8 은 멀티토큰 워프판(무게 1회 독서) — 종전 t판은
+        // np 라우터/PLE 투영에서 17GB/s였다. LLM170_NO_F32MT=1 복귀.
+        if t >= 2 && t <= 8 && n_in % 4 == 0 && std::env::var_os("LLM170_NO_F32MT").is_none() {
+            let mut tt = t as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.ctx.launch3(
+                "q4_gemm_f32_mt",
+                n_out.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            );
+        }
         let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
         let mut args: Vec<*mut std::ffi::c_void> = vec![
