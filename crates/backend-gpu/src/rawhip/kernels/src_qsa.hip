@@ -795,6 +795,162 @@ extern "C" __global__ void wmma_probe_ldm(const float* a, const float* b, float*
     for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
 }
 
+
+// plans/73: 프리필 어텐션의 v_dot2 판(qsa_flash_wk8d). 스칼라 wk8/wk8i 는
+// f32 fmaf 로 어텐션 FLOP의 ~6% 효율(103 GFLOP/층·청크 @16k — pp16k 병목).
+// 디코드 기본커널 gqa2d 의 구조를 t>1 로 확장한다: 워프=쿼리 1개, 레인=키,
+// 256차원 내적을 레인 안 v_dot2_f32_f16 128회로 끝낸다(QK 셔플 0회). K/V
+// 32키 타일은 블록 공유(8쿼리 × 24헤드 재사용). 수치는 f16-q × f16-K f32 누적
+// (gqa2d/wmma 와 같은 클래스) — greedy 스트림 동일성으로 검증.
+// LLM170_NO_WK8D=1 이면 wk8i 로 복귀.
+extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8d(
+        const float* q, const half* ck, const half* cv,
+        const unsigned* mask, float* part,
+        int n_past, int n_head, int n_kv,
+        int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    const int q0 = blockIdx.x * 8;
+    const int h = blockIdx.y;
+    const int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;
+    const int nq = min(8, t_len - q0);
+    const int kvh = h / (n_head / n_kv);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;          // 워프 = 쿼리 q0 + wid
+    const bool real = wid < nq;
+
+    constexpr int KS = 258;
+    __shared__ half q16[8][256];
+    __shared__ half kv16[32 * KS];
+    __shared__ float pf[8][32];
+    __shared__ float stnew[8];
+    __shared__ float smfin[8], sfin[8];
+
+    for (int i = tid; i < 8 * 256; i += 256) {
+        int w2 = i >> 8, d = i & 255;
+        q16[w2][d] = (w2 < nq)
+            ? __float2half(q[((size_t)(q0 + w2) * n_head + h) * 2 * hd + d])
+            : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    // 러닝 최대/합은 **공유 배열**(gqa2d 규약): 레지스터로 두면 lane 0 만
+    // 갱신해 레인별 스케일이 갈라진다(실측: 청크 경계부터 스트림 붕괴).
+    __shared__ float mrun[8], srun[8];
+    if (tid < 8) { mrun[tid] = -3.4028235e38f; srun[tid] = 0.0f; }
+    __syncthreads();
+    float m[8], acc[8];                 // 스레드=dim, 쿼리 8개 전부 (gqa2d PV 규약)
+    #pragma unroll
+    for (int r2 = 0; r2 < 8; r2++) { m[r2] = -3.4028235e38f; acc[r2] = 0.0f; }
+
+    const int p0 = sg * seg;
+    const int p1 = min(p0 + seg, n_past);
+    const int mrow = real ? (pos0 + q0 + wid) * sstride : pos0 * sstride;
+
+    for (int pb = p0; pb < p1; pb += 32) {
+        const int np = min(32, p1 - pb);
+        // K 타일 적재(uint4 = half8, d 방향 연속 = 코얼레스)
+        for (int i = tid * 8; i < 32 * 256; i += 256 * 8) {
+            int row = i >> 8, d = i & 255;
+            half* dst = &kv16[row * KS + d];
+            if (row < np) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                        ck + ((size_t)(pb + row) * n_kv + kvh) * hd + d);
+                const half* hs = reinterpret_cast<const half*>(&v);
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = hs[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        // QK: 워프=쿼리, 레인=키. 내적 전체가 레인 안에서 끝난다(셔플 0회).
+        {
+            float a = 0.0f;
+            const half2* q2 = reinterpret_cast<const half2*>(&q16[wid][0]);
+            const half2* k2 = reinterpret_cast<const half2*>(&kv16[lane * KS]);
+            #pragma unroll 2
+            for (int d2 = 0; d2 < 128; d2++) {
+                half2 qv2 = q2[d2], kv2 = k2[d2];
+                asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(a) : "v"(qv2), "v"(kv2));
+            }
+            const int kk = pb + lane;
+            // 프리필 인과경계 너머의 **완전 마스크 타일**이 존재한다(디코드 t=1엔
+            // 없는 경우 — gqa2d 는 이 경로를 안 건넜다). 마스크된 키의 e 는
+            // 반드시 0: -MAX-MAX=0 → exp(0)=1 로 미래 키가 확률 1로 새는 것 방지.
+            const bool okk = (lane < np) && (mask[mrow + kk] != 0u);
+            a = okk ? a : -3.4028235e38f;
+            float mx = a;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffull, mx, off));
+            const float m_old = mrun[wid];
+            const float mn = fmaxf(m_old, mx);
+            const float e = okk ? __expf(a - mn) : 0.0f;
+            pf[wid][lane] = real ? e : 0.0f;
+            float es = e;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                es += __shfl_xor_sync(0xffffffffffffffffull, es, off);
+            if (lane == 0) { srun[wid] = srun[wid] * __expf(m_old - mn) + es; mrun[wid] = mn; }
+            stnew[wid] = mn;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r2 = 0; r2 < 8; r2++) {
+            acc[r2] *= __expf(m[r2] - stnew[r2]);
+            m[r2] = stnew[r2];
+        }
+        __syncthreads();
+        // V 타일 적재(K 위에 덮어씀)
+        for (int i = tid * 8; i < 32 * 256; i += 256 * 8) {
+            int row = i >> 8, d = i & 255;
+            half* dst = &kv16[row * KS + d];
+            if (row < np) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                        cv + ((size_t)(pb + row) * n_kv + kvh) * hd + d);
+                const half* hs = reinterpret_cast<const half*>(&v);
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = hs[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) dst[j] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        {
+            // 각 스레드(=dim)가 블록의 8쿼리 전부에 누적 — V 행은 1회만 읽는다.
+            // (초판은 자기 워프의 쿼리만 봐 쿼리 w 행의 dims 32w..32w+31 만 채웠다.)
+            float ar[8];
+            #pragma unroll
+            for (int r2 = 0; r2 < 8; r2++) ar[r2] = acc[r2];
+            for (int k2i = 0; k2i < np; k2i++) {
+                const float vv = __half2float(kv16[k2i * KS + tid]);
+                #pragma unroll
+                for (int r2 = 0; r2 < 8; r2++) ar[r2] += pf[r2][k2i] * vv;
+            }
+            #pragma unroll
+            for (int r2 = 0; r2 < 8; r2++) acc[r2] = ar[r2];
+        }
+        __syncthreads();
+    }
+    if (wid < nq && lane == 0) { smfin[wid] = mrun[wid]; sfin[wid] = srun[wid]; }
+    __syncthreads();
+    const int nseg = (n_past + seg - 1) / seg;
+    // 기록도 8쿼리 전부: 스레드(=dim)가 자기 dim 을 모든 쿼리 행에 쓴다
+    // (gqa2d 최종 기록과 동일 구조 — 초판은 자기 워프 행만 써 dims 32w.. 만 채웠다).
+    #pragma unroll
+    for (int r2 = 0; r2 < 8; r2++) {
+        if (r2 < nq) {
+            float* pp2 = part + ((size_t)((q0 + r2) * n_head + h) * nseg + sg) * (hd + 2);
+            pp2[tid] = acc[r2];
+            if (tid == 0) { pp2[hd] = smfin[r2]; pp2[hd + 1] = sfin[r2]; }
+        }
+    }
+}
+
 // PV 경로 프로브: A = P(16x16, ldm=16) / B = V(16키 x 256dim, **row_major**, ldm=256).
 // 어텐션 커널의 PV 와 동일 패턴 — ldm 프로브(mode2)는 col_major(K)만 검증했다.
 extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* c) {
