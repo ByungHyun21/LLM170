@@ -1149,7 +1149,11 @@ fn frame_forward_np_ex(
         // MoE: 기본 행별 t=1(모멘텀 유지 — t 배치 gather 판이 t=4 에서 10ms 느림,
         // 2026-09-16 실측). LLM170_NP_MOE_BATCH=1이면 t 배치(gather — 전문가
         // 가중합 순서 차이로 근접 평탄점 플립 가능, 문서화 tie 등급).
-        if std::env::var_os("LLM170_NP_MOE_BATCH").is_some() {
+        // plans/74: np 기본 배치 MoE — direct-ids 커널이 rows<=64 에서도
+        // 돌아가므로 t·k_sel=40행 1회 GEMM(행별 루프 대비 런치 1/4, 점유율 4배,
+        // 산술 비트동일 — q4_moe_scatter 합산순서 = q4_moe_weighted_sum).
+        // LLM170_NO_MOE_NPB=1 이면 행별로 복귀.
+        if t > 1 && std::env::var_os("LLM170_NO_MOE_NPB").is_none() {
             moe_frame(acc, model, f, il, n, t)?;
         } else {
             moe_frame_np(acc, model, f, il, n, seqs)?;
@@ -1763,6 +1767,22 @@ fn moe_frame(
                 .map_err(Q4Error::Io)?;
             acc.shexp_da(f.shglu, &shd_w, f.msgate, f.mout, n, n_ff)
                 .map_err(Q4Error::Io)?;
+        } else if let Some(vv2) = f.np_views.as_ref() {
+            // plans/74: np 배치판도 공유전문가는 **행별 융합 2런치** — 일반
+            // GEMM+SiluMul 경로와 융합 커널의 산술이 미세히 달라 토큰이 갈라
+            // 진다(실측). 행별 융합으로 per-row 경로와 비트동일 유지.
+            // 프리필(np_views 없음)은 일반 배치 경로 유지.
+            let rows_avail = vv2.mix.len().min(t);
+            op(acc, FrameOp::Sigmoid { t: f.msgate, n: rows_avail })?;
+            for row in 0..rows_avail {
+                acc.shexp_gu(vv2.mix[row], &shg_w, &shu_w, f.shglu, n, n_ff)
+                    .map_err(Q4Error::Io)?;
+                let sg_view = acc
+                    .frame_slice(f.msgate, row, 1)
+                    .map_err(Q4Error::Io)?;
+                acc.shexp_da(f.shglu, &shd_w, sg_view, vv2.mout[row], n, n_ff)
+                    .map_err(Q4Error::Io)?;
+            }
         } else {
             op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
             acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
