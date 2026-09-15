@@ -488,6 +488,7 @@ impl Engine4 {
 /// np 배치 디코드 greedy — 토큰만 회수 (logits 전사·CPU greedy 회피, plans/74 N1).
 /// 구조·폴백 규칙은 decode_batch와 동일.
 pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<Vec<u32>, Q4Error> {
+    let npg_t0 = std::time::Instant::now();
     if seqs.len() < 2 || seqs.len() != tokens.len() {
         let mut out = Vec::with_capacity(seqs.len());
         for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
@@ -538,6 +539,9 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         }
         r2
     })();
+    if std::env::var_os("LLM170_NP_TIME").is_some() {
+        eprintln!("[npstep4] t={} {:.1}ms", seqs.len(), npg_t0.elapsed().as_secs_f64() * 1e3);
+    }
     match r {
         Ok(toks) => {
             for &s in seqs {
