@@ -223,6 +223,15 @@ pub trait Accelerator: FrameState + Send + Sync {
     /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
     /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
     #[allow(clippy::too_many_arguments)]
+    /// plans/73(np): 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
+    /// 등록해 새 핸들을 반환한다. np 배치 디코드가 per-seq 상태 op(conv/AR/
+    /// QSA 선택·rope·어텐션)에 행 슬라이스를 그대로 넘기기 위해서다.
+    /// 기존 메서드·커널은 무변경(핸들 = 포인터이므로 그대로 소비된다).
+    fn frame_slice(&self, _h: u64, _off_elems: usize, _len: usize) -> Result<u64, String> {
+        Err("frame_slice: 이 가속기는 미지원".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn frame_qk_norm_rope(
         &self,
         _q: u64,

@@ -340,17 +340,34 @@ fn run_q4_infer(
                 if active.is_empty() {
                     break;
                 }
-                for &s in &active {
-                    let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
-                    let t = llm170_core::model::greedy(&l);
-                    next[s] = t;
-                    pos[s] += 1;
-                    println!(
-                        "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
-                        pos[s],
-                        json_escape(&eng.piece(t))
-                    );
-                    finished[s] = t == eos;
+                // plans/73(np): 활성 2+ 는 배치 디코드(무게 스트리밍 공유).
+                if active.len() > 1 {
+                    let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
+                    let ls = eng.decode_batch(&active, &toks).map_err(|e| e.to_string())?;
+                    for (row, &s) in active.iter().enumerate() {
+                        let t = llm170_core::model::greedy(&ls[row]);
+                        next[s] = t;
+                        pos[s] += 1;
+                        println!(
+                            "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
+                            pos[s],
+                            json_escape(&eng.piece(t))
+                        );
+                        finished[s] = t == eos;
+                    }
+                } else {
+                    for &s in &active {
+                        let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
+                        let t = llm170_core::model::greedy(&l);
+                        next[s] = t;
+                        pos[s] += 1;
+                        println!(
+                            "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
+                            pos[s],
+                            json_escape(&eng.piece(t))
+                        );
+                        finished[s] = t == eos;
+                    }
                 }
             }
             eprintln!(

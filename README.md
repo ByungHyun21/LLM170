@@ -81,17 +81,20 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
 | tg single | — | **18.0** (ctx 4k) / **17.9** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
 | MTP single | — | — | — | — | — | — |
-| np4 aggregate | — | **16.2** | TFNPP4V | TFNP4V | — | **39.4** |
+| np4 aggregate | — | **21.0-22.5** | TFNPP4V | TFNP4V | — | **39.4** |
 | MTP + np4 | — | — | — | — | — | — |
 
 (Flash-Next np4, measured 2026-09-16 same-host/same-prompt HTTP 4-way:
-**LLM170 16.2 t/s aggregate** — the slot loop interleaves single-sequence
-forwards, so np requests share time rather than weights — vs **llama-server
-39.4 t/s** (0.41x). Batching the frame decode would amortize weights, but the
-measured marginal row cost bounds a 4-row batch at ~23-29 t/s (per-row host
-work, ~1450+ launches/step, per-sequence GDN/QSA state ops), still short of
-llama's 39.4 — recorded as the structural gap for this model rather than
-attempted under the deadline.)
+**LLM170 21.0-22.5 t/s aggregate** vs **llama-server 39.4 t/s** (0.55x). The
+frame now batches np decode (2026-09-16): weight-streaming GEMMs run once for
+all rows — a new multi-token q8_0 GEMV (`gemm_q8_0_mt`, one weight-row read,
+per-token accumulation, bit-identical arithmetic) removed the per-row weight
+re-read — while per-sequence state (GDN conv ring, AR, QSA rope/selection/KV,
+PLE) runs per row at t=1 through row views. np4 output is token-identical to
+sequential decoding (52/52 verified; np2 shows one documented near-tie flip,
+logit gap 0.13). The remaining gap is the MoE: rows pick different experts, so
+expert weights cannot be shared — dedup/grouping by expert id is the recorded
+next lever.)
 
 Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 

@@ -283,9 +283,22 @@ pub fn slot_loop(
                     }
                 }
                 Engine::Q4(e) => {
-                    for &i in &active {
-                        if let Ok(logits) = e.decode1(i, slots[i].next) {
-                            slot_step(&mut slots[i], &logits);
+                    // plans/73(np): 활성 2+ 슬롯은 배치 디코드(무게 스트리밍 공유).
+                    // 실패 시 decode_batch 내부가 순차 decode1로 폴백한다.
+                    if active.len() > 1 {
+                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+                        if let Ok(logitss) = e.decode_batch(&active, &toks) {
+                            for (row, &i) in active.iter().enumerate() {
+                                if let Some(l) = logitss.get(row) {
+                                    slot_step(&mut slots[i], l);
+                                }
+                            }
+                        }
+                    } else {
+                        for &i in &active {
+                            if let Ok(logits) = e.decode1(i, slots[i].next) {
+                                slot_step(&mut slots[i], &logits);
+                            }
                         }
                     }
                 }

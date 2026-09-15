@@ -1044,10 +1044,34 @@ impl RawCtx {
         }
         let mut out_p0 = out as *mut std::ffi::c_void;
         let mut xw_a = xq_w as i32;
+        let mut tt_a = t as i32;
         // plans/73 (2026-09-16): t=1 q8_0 전 형상을 **16레인×4사분면** 판으로 —
         // 종전 64레인/행은 n_sub=80(qkv/gate)에서 62.5%, n_sub=10(hc up)에서 31%
         // 레인 효율이었고 그만큼 대역폭이 깎였다(GDN mm_group 15.0ms = 106GB/s).
         // 산술은 비트 동일(gemm_q8_0_w4 주석의 트리 재구성). 킬스위치 LLM170_Q8W4=0.
+        // 멀티토큰 판(2026-09-16, np 배치): t=2..8 q8_0은 무게 행 1회 독서로
+        // 토큰별 내적 — grid=(t,n_out) 배치가 토큰마다 무게를 재독하는 것과
+        // 달리 가중치 트래픽이 t배 증가하지 않는다. 산술 비트 동일.
+        if t >= 2 && t <= 8 && ty == 8 && std::env::var("LLM170_Q8MT").as_deref() != Ok("0") {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+                &mut tt_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3(
+                "gemm_q8_0_mt",
+                1,
+                n_out.min(65535) as u32,
+                n_out.div_ceil(65535) as u32,
+                64,
+                &mut args,
+            );
+        }
         // 실측(2026-09-16): w4(사분면, 비트 동일) -9%, w16(연속 매핑) -7% —
         // 둘 다 레인 효율은 100%지만 종전 64레인 판(coalescing·ILP)이 더 빠르다.
         // 따라서 **기본은 종전 커널**, 실험판은 옵트인(LLM170_Q8W4=1 / Q8W16=1).
