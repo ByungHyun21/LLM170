@@ -72,6 +72,38 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("frame_argmax_rows: 미지원".into())
     }
 
+    /// np 행별 conv — qkv/out은 [t][ch] 연속, states는 행(시퀀스)별 상태
+    /// 핸들. gdn_conv(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    fn frame_gdn_conv_np(
+        &self,
+        _qkv: u64,
+        _out: u64,
+        _states: &[u64],
+        _cw: u64,
+        _ch: usize,
+        _k: usize,
+    ) -> Result<(), String> {
+        Err("frame_gdn_conv_np: 미지원".into())
+    }
+
+    /// np 행별 AR — q/k/v/beta_ge/out은 [t][·] 연속, states는 행별 상태
+    /// 핸들. gdn_ar_w_swap(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar_np(
+        &self,
+        _q: u64,
+        _k: u64,
+        _v: u64,
+        _beta_ge: u64,
+        _out: u64,
+        _states: &[u64],
+        _h_k: usize,
+        _h_v: usize,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("frame_gdn_ar_np: 미지원".into())
+    }
+
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn rms_norm(
         &self,

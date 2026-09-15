@@ -832,14 +832,26 @@ fn gdn_frame_np(
             }
         }
     };
-    // conv(링) — per-seq t=1. 상태 커널은 프레임 전역 t_cur로 행 수를 유추하므로
-    // 이 구간만 t_cur=1로 내린다(나머지는 배치 t).
-    fs_begin(acc, 1);
-    for (row, &sq) in seqs.iter().enumerate() {
-        op(acc, FrameOp::GdnConv {
-            qkv: vv.gqkv[row], cw, state: f.st_conv[sq][ri], out: vv.gconv[row],
-            ch: conv_ch, k: hp.conv_k, t_len: 1,
-        })?;
+    // conv(링) — plans/74 N2: 행별 상태를 포인터 테이블로 1런치. 실패 시
+    // 종전 행별 t=1 루프(상태 커널이 t_cur 로 행 수를 유추해 t_cur=1로 내린다).
+    // qkv/gconv는 [t][ch] 연속 프레임 버퍼라 정본 핸들 직접.
+    let conv_states: Vec<u64> = seqs.iter().map(|&sq| f.st_conv[sq][ri]).collect();
+    if seqs.len() > 1
+        && std::env::var_os("LLM170_NO_NPCONV").is_none()
+        && acc
+            .frame_gdn_conv_np(f.gqkv, f.gconv, &conv_states, cw, conv_ch, hp.conv_k)
+            .is_ok()
+    {
+        fs_begin(acc, t);
+    } else {
+        fs_begin(acc, 1);
+        for (row, &sq) in seqs.iter().enumerate() {
+            op(acc, FrameOp::GdnConv {
+                qkv: vv.gqkv[row], cw, state: f.st_conv[sq][ri], out: vv.gconv[row],
+                ch: conv_ch, k: hp.conv_k, t_len: 1,
+            })?;
+        }
+        fs_begin(acc, t);
     }
     fs_begin(acc, t); // split/l2/scale는 전 행 배치
     psum(acc, vv.gconv[0], conv_ch, "conv_row0");
@@ -851,11 +863,22 @@ fn gdn_frame_np(
     let scale = 1.0f32 / (hp.d_state as f32).sqrt();
     op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
     // AR(상태) — per-seq t=1 (다시 내림)
+    // AR(상태) — plans/74 N2: 행별 상태 테이블 1런치. 실패 시 종전 행별 t=1.
+    let ar_states: Vec<u64> = seqs.iter().map(|&sq| f.st_gdn[sq][ri]).collect();
     let fs: &dyn FrameState = acc;
-    fs_begin(acc, 1);
-    for (row, &sq) in seqs.iter().enumerate() {
-        fs.frame_gdn_ar(vv.gq[row], vv.gk[row], vv.gv[row], vv.gbg[row], f.st_gdn[sq][ri], vv.go[row], 1, hp.n_group, hp.dt_rank, hp.d_state)
-            .map_err(Q4Error::Io)?;
+    if seqs.len() > 1
+        && std::env::var_os("LLM170_NO_NPAR").is_none()
+        && acc
+            .frame_gdn_ar_np(f.gq, f.gk, f.gv, f.gbg, f.go, &ar_states, hp.n_group, hp.dt_rank, hp.d_state)
+            .is_ok()
+    {
+        // 1런치 경로 사용
+    } else {
+        fs_begin(acc, 1);
+        for (row, &sq) in seqs.iter().enumerate() {
+            fs.frame_gdn_ar(vv.gq[row], vv.gk[row], vv.gv[row], vv.gbg[row], f.st_gdn[sq][ri], vv.go[row], 1, hp.n_group, hp.dt_rank, hp.d_state)
+                .map_err(Q4Error::Io)?;
+        }
     }
     if seqs.len() > 1 {
         psum(acc, vv.gq[0], k_len, "ar_in_q0");
@@ -1077,9 +1100,9 @@ fn frame_forward_np_ex(
 
         // 4) hc ffn mix(t 공유) + MoE(행별 t=1 — 산술 불변) + combine(t 공유)
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
-        // MoE: 기본 t 배치(gather 경로 — 전문가 가중합 순서가 t=1과 달라 근접
-        // 평탄점 플립 가능, 문서화된 tie 등급). LLM170_NP_MOE_SEQ=1이면 행별
-        // t=1(비트 동일)로 되돌린다.
+        // MoE: 기본 행별 t=1(모멘텀 유지 — t 배치 gather 판이 t=4 에서 10ms 느림,
+        // 2026-09-16 실측). LLM170_NP_MOE_BATCH=1이면 t 배치(gather — 전문가
+        // 가중합 순서 차이로 근접 평탄점 플립 가능, 문서화 tie 등급).
         if std::env::var_os("LLM170_NP_MOE_BATCH").is_some() {
             moe_frame(acc, model, f, il, n, t)?;
         } else {
