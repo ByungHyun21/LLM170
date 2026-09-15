@@ -482,6 +482,76 @@ impl Engine4 {
         }
     }
 
+/// np 배치 디코드 greedy — 토큰만 회수 (logits 전사·CPU greedy 회피, plans/74 N1).
+/// 구조·폴백 규칙은 decode_batch와 동일.
+pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<Vec<u32>, Q4Error> {
+    if seqs.len() < 2 || seqs.len() != tokens.len() {
+        let mut out = Vec::with_capacity(seqs.len());
+        for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
+            let lg = self.decode1(s, tk)?;
+            out.push(crate::model::greedy(&lg));
+        }
+        return Ok(out);
+    }
+    let frame_on = self.acc.is_some()
+        && !self.frame_broken
+        && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+        && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
+        && std::env::var_os("LLM170_NO_NP_BATCH").is_none()
+        && std::env::var("LLM170_NP_GREEDY").map(|v| v != "0").unwrap_or(true);
+    if !frame_on {
+        let lg = self.decode_batch(seqs, tokens)?;
+        return Ok(lg.iter().map(|l| crate::model::greedy(l)).collect());
+    }
+    if let Some(h) = self.ple_worker.take() {
+        let _ = h.join();
+    }
+    self.ple_next = None;
+    self.ple_consume = None;
+    let acc = self.acc.as_deref().unwrap();
+    if self.frame.is_none() {
+        match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
+            Ok(f) => self.frame = Some(f),
+            Err(e) => {
+                self.frame_broken = true;
+                eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+            }
+        }
+    }
+    let r = (|| -> Result<Vec<u32>, Q4Error> {
+        let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
+        let acc = self.acc.as_deref().unwrap();
+        for &s in seqs {
+            if f.dirty[s] {
+                f.sync_states(acc, s, &self.seqs[s], self.model.hp.d_state)?;
+            }
+        }
+        let ctx = Ctx { model: &self.model, acc: Some(acc) };
+        super::frame::frame_forward_np_greedy(
+            acc, &self.model, &ctx, seqs, &mut self.seqs, f, tokens,
+        )
+    })();
+    match r {
+        Ok(toks) => {
+            for &s in seqs {
+                self.seqs[s].pos += 1;
+            }
+            Ok(toks)
+        }
+        Err(e) => {
+            self.frame = None;
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("# frame-np-greedy: 배치 실패 — 순차 폴백 ({e})"));
+            let mut out = Vec::with_capacity(seqs.len());
+            for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
+                let lg = self.decode1(s, tk)?;
+                out.push(crate::model::greedy(&lg));
+            }
+            Ok(out)
+        }
+    }
+}
+
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
         // 05-2: 직전 스텝이 예측한 토큰의 프리페치 완료 대기 (조인)
         if let Some(h) = self.ple_worker.take() {

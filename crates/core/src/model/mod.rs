@@ -677,6 +677,45 @@ impl Engine {
         Ok(logits)
     }
 
+    /// np 배치 greedy 디코드 — 토큰만 회수 (logits 전사 회피, plans/74 N1).
+    /// raw np 경로가 없으면 decode+CPU greedy 폴백. LLM170_NP_GREEDY=0 게이트.
+    pub fn decode_np_greedy(
+        &mut self,
+        seq_ids: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<u32>, ModelError> {
+        if tokens.len() > 1
+            && seq_ids.len() > 1
+            && self.raw_decode.is_some()
+            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_NP_GREEDY").map(|v| v != "0").unwrap_or(true)
+        {
+            let rd = self.raw_decode.clone().unwrap();
+            let n = self.model.hp.n_embd;
+            if self.embd_cache.is_none() {
+                let t = self.model.wchk("token_embd.weight")?;
+                self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
+            }
+            let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
+            let poss: Vec<u32> = seq_ids.iter().map(|&s| self.seqs[s].pos).collect();
+            let mut rows: Vec<f32> = Vec::with_capacity(tokens.len() * n);
+            for &tk in tokens {
+                let mut r = vec![0.0f32; n];
+                crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n as u64, &mut r);
+                rows.extend(r);
+            }
+            let toks = rd
+                .raw_step_multi_greedy(seq_ids, &poss, &rows)
+                .map_err(ModelError::Accel)?;
+            for s in seq_ids {
+                self.seqs[*s].pos += 1;
+            }
+            return Ok(toks);
+        }
+        let logits = self.decode(seq_ids, tokens)?;
+        Ok(logits.iter().map(|l| greedy(l)).collect())
+    }
+
     /// greedy 디코드 — GPU argmax 경로 (logits 전사 없음). raw 활성 시 유효.
     pub fn decode_greedy(&mut self, seq: usize, token: u32) -> Result<u32, ModelError> {
         let Some(rd) = self.raw_decode.as_ref() else {
