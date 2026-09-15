@@ -177,6 +177,15 @@ with no wall-time change (the GPU stayed busy on the queue).
 
 
 
+### q4_idx_topk sort-size fix (94d7c46, 2026-09-17)
+
+The QSA selection top-k always ran a full 4096-entry bitonic network (78
+stages) regardless of the actual block count (41-512 by context). Sized to
+next_pow2(n_blocks) — key packing, padding, and comparisons unchanged, so
+order and tie semantics (equal score -> lower index) are identical. SELCHECK
+over a 600-token context: zero device-vs-host mismatches; gate PASS.
+FN tg128 18.0 -> 18.13-18.68 (best of session; start 17.6).
+
 ## 2026-09-17 session close — np batched MoE, f32 multi-token
 
 - **np batched MoE** (10e4318): the three direct-ids expert kernels were gated
