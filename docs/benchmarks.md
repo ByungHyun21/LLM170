@@ -220,3 +220,22 @@ at llama's own tile size (J=128, the RDNA3.5 maximum).
 - Flash-Next: gate bit-identical; np2 dual-sequence run verified semantically
   (seq0 "The capital of ... Paris", seq1 "... Berlin" - state isolation holds;
   the two prompts differ only in the city token).
+
+### Flash-Next np4: measured both engines + why batching is not attempted (2026-09-16)
+
+Same host, same natural-text prompt, greedy, 4 concurrent HTTP completions x 64
+tokens, ctx 4096/slot: **llama-server 39.4 t/s aggregate** (1.99x its
+single-stream 19.8 - real batching) vs **LLM170 16.2 t/s** (0.82x its
+single-stream 18.0 - the slot loop interleaves single-sequence forwards, so np
+requests share time, not weights).
+
+A batched frame decode was scoped with measurements: marginal per-row cost is
+55.5 ms at t=1, 36 ms at t=8, 28.5 ms at t=32 (pp-chunk sweep), i.e. a 4-row
+batch lands at ~23-29 t/s once per-row host work, ~1450+ launches per step, and
+per-sequence GDN conv/AR + QSA selection state ops are accounted - short of
+llama's 39.4. Not attempted under the deadline; the numbers are the scope.
+
+Also fixed on the way: the HTTP server dropped concurrent requests when all
+slots were busy (consumed-then-discarded from the queue -> instant empty
+responses; 6f4f309). With the fix, 4x64 tokens complete 256/256 on a 4-slot
+Flash-Next server.
