@@ -1032,6 +1032,10 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
             ],
         };
+        // plans/73: vdr=2 판(v2)은 측정 역행(10.83 vs 11.35 t/s) — 옵트인 자산.
+        if t == 1 && ty == 13 && std::env::var("LLM170_Q5KV2").as_deref() == Ok("1") {
+            return self.gemv_q8_out_v2(xq, w, ty, n_in, n_out, out, xq_w, t);
+        }
         let mut out_p0 = out as *mut std::ffi::c_void;
         let mut xw_a = xq_w as i32;
         // plans/73: t=1 소형 n_sub(≤32) q8_0은 워프판 — 64스레드/출력 레이아웃은
