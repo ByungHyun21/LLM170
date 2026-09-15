@@ -299,3 +299,49 @@ investigated with LLM170_SPEC_TIMING + KTRACE:
 Also: the bench tool's plain (non-spec) tg loop decodes only sequence 0 —
 `LLM170_BENCH_NP=4` without `--spec` does not measure a true 4-way
 aggregate (needs a fix before quoting np4 cells).
+
+## MTP verify amortized + np+spec crash root cause (2026-09-15, session 3)
+
+Two defects fixed in the same unit; both were invisible to the single-stream
+gate because they only live on paths the gate never enters.
+
+### 1. verify_batch_ms never got the f16-mirror migration (np+MTP = MEMORY_FAULT)
+
+`kv_k`/`kv_v` f32 pools are intentionally NULL once the f16 mirror became the
+default (`legacy_f32()` false; memory 3x saving). Every other KV-append site
+guards the `kv_append_t` launch with `if legacy_f32()` and then converts into
+the mirror with `kv_to_f16`. `verify_batch_ms` (the multi-sequence verify used
+only by np>1 + MTP) had neither: it launched `kv_append_t` unconditionally
+(NULL destination + `pos*row` offset -> `HSA_STATUS_ERROR_MEMORY_FAULT`,
+address 0x13000 = exactly `pos*1024*4` with a NULL base) and never wrote the
+f16 mirror, so with `LLM170_LEGACY_F32=1` the attention would have read stale
+zeros for the new rows instead. Guard + `kv_to_f16` per group added; the np
+verify now writes the mirror with `doff = pos0*n_kv*hd`, `cnt = gt*n_kv*hd`.
+
+Evidence: `scripts/verify.py` judge, `spec_np4_seq0..3` all PASS (24/24 tok
+exact) on the fixed build; before the fix the same case faulted the GPU queue.
+Bench: `LLM170_BENCH_NP=4 ... --spec 3` at pp512/ctx8192/tg128 = **20.43 t/s
+agg** (llama np4+MTP reference 15.5 -> 1.32x).
+
+### 2. mmq y workspace was missing llama.cpp's J-row slack
+
+`gemm_mmq`/`gemm_mmq_s` sized the y buffer as `(n_in/128)*t*144`. The MMQ tile
+reads full 128-row y tiles, so when `t` is not a multiple of 128 the last tile
+reads up to 127 rows past the end. llama.cpp allocates
+`... + J_max*sizeof(block_q8_1_mmq)` for exactly this (mmq.cu
+`nbytes_src1_q8_1`). The latent OOB read only faults when the largest `t` ever
+seen is itself misaligned — np verify hit t=33 (carried rows), so it surfaced
+there: `mul_mat_q<Q5_K,128>` faulting with the address sitting exactly one tile
+past the allocation. Both pools now carry a `128*144` byte slack.
+
+### 3. verify head GEMM routed around the amortized path
+
+`verify_batch`'s lm_head call went straight to `gemm_tile_head`, which at t=4
+cost 27.3ms (vs 5.6ms for the t=1 GEMV on the same 380MB weight — the tile
+kernel re-reads the weight per row for these shapes). Routing `t<=8` through
+`mm_b` (g4 family: one weight read, per-token accumulation) drops it to 5.8ms.
+Cycle accounting after all three: MTP single 14.33 t/s on natural text
+(was 5.71), acceptance 4/4 per cycle, fwd==gen rows.
+
+Note for readers of earlier sections: `(fwd 128, gen 128, 1.00 tok/fwd)` means
+the stat divides by *verify rows*, not cycles — 1.00 is perfect acceptance.

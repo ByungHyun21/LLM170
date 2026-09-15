@@ -207,11 +207,11 @@ def compare(name, base, ours, probs=None, info=False):
 
 def compare_exact(name, ours, ref, info=False):
     ok = ours == ref
+    k = next((i for i, (a, b) in enumerate(zip(ref, ours)) if a != b), None)
     if not ok and info:
         print(f"[INFO] {name}: {len(ours)} vs {len(ref)} tok, 첫 불일치 @gen[{k}]  "
               "(장문 스펙: 발산 허용 — 커널 정확성은 attn-check 가 보증)")
         return None
-    k = next((i for i, (a, b) in enumerate(zip(ref, ours)) if a != b), None)
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: {len(ours)} vs {len(ref)} tok"
           + ("" if ok else f" — 첫 불일치 @gen[{k}]"))
     return ok

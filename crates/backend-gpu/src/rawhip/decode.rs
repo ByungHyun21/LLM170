@@ -1382,6 +1382,9 @@ impl DecodeState {
     /// conv/AR/KV/qsa 순차·토큰 의존 — 토큰 루프. 산술은 step()과 토큰당 동일열.
     #[allow(clippy::too_many_lines)]
     pub fn step_batch(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
+        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+            eprintln!("[xf] step_batch");
+        }
         let t = emb.len() / self.n_embd;
         debug_assert!(t >= 1 && t <= self.b_t_max);
         let n = self.n_embd;
@@ -2009,7 +2012,20 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         } else {
             self.ctx.sync()?;
         }
+        // plans/73: t≤8 은 mm_b 라우팅(g4 = 무게 1회 독서) — 직접 tile 호출은
         let t_h0 = std::time::Instant::now();
+        if t <= 8 && matches!(th, 8 | 12 | 13 | 14 | 23) {
+            self.mm_b(
+                self.xq_n_t,
+                xq_sn,
+                wh,
+                th,
+                nih,
+                noh,
+                self.logits_all,
+                t,
+            )?;
+        } else {
         self.ctx.gemm_tile_head(
             self.xq_n_t as *const u8,
             wh as *const u8,
@@ -2021,6 +2037,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             t,
             self.logits_all,
         )?;
+        }
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
             self.ctx.sync()?;
             eprintln!("[vb] head mm t={t}: {:.1}ms", t_h0.elapsed().as_secs_f64() * 1e3);
@@ -2259,6 +2276,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         pos0: usize,
         with_head: bool,
     ) -> Result<u32, String> {
+        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+            eprintln!("[xf] mtp_prefill_batch");
+        }
         if !self.mtp_on {
             return Err("mtp_prefill_batch: MTP 미로드".into());
         }
@@ -2574,6 +2594,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         poss: &[u32],
         emb: &[f32],
     ) -> Result<Vec<Vec<f32>>, String> {
+        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+            eprintln!("[xf] step_batch_np");
+        }
         let t = seqs.len();
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), t * n);
@@ -2888,6 +2911,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         argmaxes: &mut Vec<u32>,
         h_all: &mut Vec<f32>,
     ) -> Result<(), String> {
+        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+            eprintln!("[xf] verify_batch_ms t={} seqs={:?} poss={:?} gs={:?}", emb.len() / self.n_embd, seqs, poss, group_starts);
+        }
         let t = emb.len() / self.n_embd;
         if t > 64 {
             return Err(format!("verify_batch_ms t={t} > 64"));
@@ -3083,13 +3109,23 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     }
                     let pos0 = poss[gi];
                     let av_row = unsafe { self.av_t.add(g0 * n_kv * hd * 4) };
-                    for (src, table) in [(ak_row, &self.kv_k), (av_row, &self.kv_v)] {
-                        let mut sp = src as *mut std::ffi::c_void;
-                        let mut dp = table[full_idx][sq] as *mut std::ffi::c_void;
-                        let mut na = (n_kv * hd) as i32;
-                        let mut p0 = pos0 as i32;
-                        let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
-                        self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, gt as u32, 1, 64, &mut args)?;
+                    // f32 원본은 legacy 전용(flash 기본에선 kv_k/v 가 NULL — 가드 필수),
+                    // 어텐션은 f16 미러만 읽으므로 미러 변환도 여기서 반드시 수행한다.
+                    if legacy_f32() {
+                        for (src, table) in [(ak_row, &self.kv_k), (av_row, &self.kv_v)] {
+                            let mut sp = src as *mut std::ffi::c_void;
+                            let mut dp = table[full_idx][sq] as *mut std::ffi::c_void;
+                            let mut na = (n_kv * hd) as i32;
+                            let mut p0 = pos0 as i32;
+                            let mut args = vec![Self::p(&mut sp), Self::p(&mut dp), Self::p(&mut na), Self::p(&mut p0)];
+                            self.ctx.launch3("kv_append_t", (n_kv * hd).div_ceil(64) as u32, gt as u32, 1, 64, &mut args)?;
+                        }
+                    }
+                    {
+                        let doff = pos0 * n_kv * hd;
+                        let cnt = gt * n_kv * hd;
+                        kv_to_f16(&self.ctx, ak_row, self.kv_k16[full_idx][sq], 0, doff, cnt)?;
+                        kv_to_f16(&self.ctx, av_row, self.kv_v16[full_idx][sq], 0, doff, cnt)?;
                     }
                     {
                         let mut qp = aq_row as *mut std::ffi::c_void;
@@ -3346,7 +3382,13 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         let only = { let _t = std::time::Instant::now(); std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok()) };
         if std::env::var_os("LLM170_NO_MMQ").is_none() || only.is_some() {
-            if (only.is_none() || only.map_or(false, |m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23) || (ty == 8 && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none()) && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
+            // plans/73 우선순위 수정: && 가 || 보다 먼저 결합해 좌변(K계열)이
+            // t 게이트·CO 검사를 **우회**했다 — step_batch 의 verify(t=4~16)가
+            // 전부 MMQ 로 돌아 296ms/4행 (3.9x, 무계약)을 낸 근원. 게이트가
+            // 양쪽 분기 모두에 적용되도록 괄호 명시.
+            if (((only.is_none() || only.map_or(false, |m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
+                || ((ty == 8 && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none())))
+                && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
                 && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                         return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }

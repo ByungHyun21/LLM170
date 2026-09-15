@@ -755,7 +755,10 @@ impl RawCtx {
         gz: u32,
         block: u32,
         args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), String> {
+    ) -> Result<(), String> {        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+            eprintln!("[lbt] {name} gx={gx} gy={gy} gz={gz}");
+        }
+
 
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
@@ -1542,11 +1545,16 @@ impl RawCtx {
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
+            // 마지막 128행 타일은 t를 넘어 읽는다 — llama.cpp도 y 버퍼에
+            // J_max*sizeof(block_q8_1_mmq) 슬랙을 둔다(mmq.cu nbytes_src1_q8_1).
+            // 슬랙이 없으면 t가 128의 배수가 아닐 때(예: 검증 배치 t=33) OOB read.
+            const MMQ_Y_SLACK: usize = 128 * 144;
+            let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
             let mut sc = self.mmq_y.lock().map_err(|e| e.to_string())?;
-            if sc.0 < (n_in / 128) * t * 144 {
+            if sc.0 < need {
                 if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
-                sc.1 = self.alloc((n_in / 128) * t * 144)? as *mut u8;
-                sc.0 = (n_in / 128) * t * 144;
+                sc.1 = self.alloc(need)? as *mut u8;
+                sc.0 = need;
             }
             sc.1
         };
@@ -1724,11 +1732,13 @@ impl RawCtx {
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
+            const MMQ_Y_SLACK: usize = 128 * 144;
+            let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
             let mut sc = self.mmq_y_s.lock().map_err(|e| e.to_string())?;
-            if sc.0 < (n_in / 128) * t * 144 {
+            if sc.0 < need {
                 if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
-                sc.1 = self.alloc((n_in / 128) * t * 144)? as *mut u8;
-                sc.0 = (n_in / 128) * t * 144;
+                sc.1 = self.alloc(need)? as *mut u8;
+                sc.0 = need;
             }
             sc.1
         };
