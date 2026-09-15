@@ -191,5 +191,40 @@ extern "C" __global__ void qk_norm_rope(float* xq, float* xk, const float* qw, c
     }
 }
 
+// plans/73: 소형 행 수(t·w_reps ≤ 32)용 rms 단일 커널 — part/finish 2런치가
+// 매 스텝 97쌍(1.26ms)이었다. 워프=행, 레인 u가 세그먼트 u 의 f32 부분합을
+// 내고 shfl 로 전 레인 수집 후 **동일 순서** f64 합산(qk_norm_rope 와 같은
+// 구조) — 산술열이 원 2커널 판과 같아 비트 동일.
+extern "C" __global__ void rms_small(const float* __restrict__ x, const float* __restrict__ w,
+                                     float* __restrict__ out, float eps, int n, int rows, int w_reps) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int u = threadIdx.x & 31;
+    if (row >= rows) return;
+    const int chunk = (n + 31) >> 5;
+    const int lo = u * chunk;
+    float mypart = 0.0f;
+    if (lo < n) {
+        const int hi = min(lo + chunk, n);
+        const float* xr = x + (size_t)row * n;
+        for (int i = lo; i < hi; i++) {
+            const float dv = xr[i];
+            mypart += dv * dv;
+        }
+    }
+    float parts[32];
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++)
+        parts[uu] = __shfl_sync(0xffffffffffffffffull, mypart, uu);
+    double sum = 0.0;
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++) sum += parts[uu];
+    const float scale = 1.0f / (float)sqrt(sum / (double)n + (double)eps);
+    const float* xr = x + (size_t)row * n;
+    const float* wr = w + (size_t)(row % w_reps) * n;
+    float* orow = out + (size_t)row * n;
+    for (int i = u; i < n; i += 32)
+        orow[i] = xr[i] * scale * wr[i];
+}
+
 
 

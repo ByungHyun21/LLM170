@@ -3789,6 +3789,24 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             O::RmsRows { x, w, out, eps, n, w_reps } => {
                 let (xp, wp) = (self.fptr(x)?, self.fptr(w)?);
                 let rows = w_reps * self.t_cur();
+                // plans/73: 융합 판은 측정 역행(16.78→16.28 t/s) — 옵트인 자산.
+                // 워프=행의 320-원소 직렬 f32 체인이 part/finish 의 병렬 2런치보다 느리다.
+                if rows <= 32 && std::env::var_os("LLM170_RMSSMALL").is_some() {
+                    let mut xa = xp;
+                    let mut wa = wp;
+                    let mut op_ = self.fptr(out)?;
+                    let mut e = eps;
+                    let mut nn = n as i32;
+                    let (mut rws, mut rr) = (rows as i32, w_reps as i32);
+                    return self.kop(
+                        "rms_small",
+                        rows.div_ceil(8) as u32,
+                        1,
+                        1,
+                        256,
+                        &mut cargs!(&mut xa, &mut wa, &mut op_, &mut e, &mut nn, &mut rws, &mut rr),
+                    );
+                }
                 let part = {
                     let mut b = self.fpart.lock().map_err(|e| e.to_string())?;
                     b.ensure(&self.ctx, rows * 32 * 8)?
