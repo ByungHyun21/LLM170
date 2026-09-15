@@ -297,3 +297,15 @@ least one more place still assumes the 16x bound - the padded GEMM/gather path i
 obvious next suspect. Until all of them agree, the prefill stays on the host path and the
 25.3 ms/call stands.
 
+
+## plans/73 — selection moved to device for decode (2026-09-15)
+
+qsa_select's host path remains the prefill (t>1) implementation; decode
+(t=1) now selects on-device (kernels in rawhip; see q4acc.md). Host kv/idx
+caches are no longer updated during decode (seq_state.qsa_host_stale);
+prefill entry rebuilds them once from the device pools (accelerator
+`qsa_host_rebuild`), prefill appends its chunk to the device pools
+(`qsa_idx_append_host`). The value-bridge fallback and RESCHECK see fresh
+caches. LLM170_QSA_SELCHECK runs both paths and compares the selection
+lists (zero mismatches over the diverse gate run); LLM170_QSA_HOSTSEL=1
+restores the full host path.
