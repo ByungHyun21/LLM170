@@ -47,9 +47,17 @@ unchanged under MTP+np4:
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
 | tg single | — | 11.4 | — | 9.2 | — | 11.9 |
-| MTP single | — | T27MT1 | — | T27MT1V | — | L27MT1 |
-| np4 aggregate | T27NPP4 | T27NP4 | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
-| MTP + np4 | (np4) | T27MTNP | (np4) | T27MTNPV | (np4) | L27MTNP |
+| MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP) |
+| np4 aggregate | 374 (pp512) | **25.1** | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
+| MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 |
+
+Conditions for the filled 2026-09-16 cells: HIP, ROCm 10, greedy, natural-text
+prompt, pp512 / ctx 8192 / tg128, all np slots prefilled with the same prompt
+(`LLM170_BENCH_NP`). llama's np4+MTP 15.5 t/s is the recorded server reference
+(ROCm 7.2.2 era, 11.75k-token slots) — the comparison is cross-condition, noted
+as such. MTP = `--spec 3`; acceptance is perfect (4 tokens/cycle) with the
+gguf's own nextn head, and spec output is token-identical to greedy
+(`scripts/verify.py` spec cases).
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -66,6 +74,7 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
 | tg single | — | 17.5 | — | 17.1 | — | 19.8 |
+| tg vs llama (2026-09-16) | — | 17.2 (ctx 4k) / 17.3 (ctx 16k) | — | — | — | 19.8 / 20.0 |
 | MTP single | — | — | — | — | — | — |
 | np4 aggregate | TFNPP4 | TFNP4 | TFNPP4V | TFNP4V | LFNPP4 | LFNP4 |
 | MTP + np4 | — | — | — | — | — | — |

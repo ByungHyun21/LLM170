@@ -1075,7 +1075,36 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if t == 1 && ty == 8 && n_in / 32 <= 32 && std::env::var("LLM170_Q8W").as_deref() != Ok("0") {
+        // 실험(2026-09-16): 워프판(32레인/행)을 n_sub>32 형상까지 확대 —
+        // n_sub=80에서 레인 효율 83% vs 종전 62.5%. LLM170_Q8W_ALL=1로 옵트인.
+        let w_all = t == 1 && ty == 8 && std::env::var("LLM170_Q8W_ALL").as_deref() == Ok("1");
+        // 소형 n_sub(≤32) 구간은 w16(16레인/행, 레인 효율 62.5-100% vs 워프판
+        // 31%)으로 — FN tg128 17.2 → 18.0 t/s (+4.8%, 2026-09-16 실측, 게이트 동일).
+        // 킬스위치 LLM170_Q8W16_SMALL=0.
+        if t == 1
+            && ty == 8
+            && n_in / 32 <= 32
+            && std::env::var("LLM170_Q8W16_SMALL").as_deref() != Ok("0")
+        {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3(
+                "gemm_q8_0_w16",
+                n_out.div_ceil(8) as u32,
+                t as u32,
+                1,
+                128,
+                &mut args,
+            );
+        }
+        if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && std::env::var("LLM170_Q8W").as_deref() != Ok("0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
