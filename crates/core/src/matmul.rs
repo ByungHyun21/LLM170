@@ -60,6 +60,9 @@ pub trait Accelerator: FrameState + Send + Sync {
         Ok(())
     }
 
+    /// KTRACE 덤프+재시작(q4acc 등 백엔드 훅) — 진단용 기본 no-op.
+    fn ktrace_tick(&self) {}
+
     /// 프레임 logits [t][vocab]의 행별 argmax — GPU 판정 후 토큰만 회수
     /// (np greedy: vocab×t 플로트 전사 회피). 동률 시 최저 인덱스(CPU greedy와
     /// 동일 의미). 미구현 백엔드는 Err (호출부 폴백).
