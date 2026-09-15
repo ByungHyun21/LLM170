@@ -8,6 +8,7 @@ mod bench;
 mod engine;
 mod infer;
 mod probes;
+mod resource;
 mod http;
 mod tokenize;
 mod vl;
@@ -59,6 +60,23 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
 
 
 fn main() -> ExitCode {
+    // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
+    // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)가 --model을 받으므로
+    // 여기서 한 번에 검사한다. 백엔드 인자가 없으면 CPU 경로(host만 판정).
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--model") {
+            if let Some(mp) = args.get(i + 1) {
+                let gpu = args.windows(2).any(|w| w == ["--backend", "gpu"])
+                    || args.windows(2).any(|w| w == ["--gpu-runtime", "hip"])
+                    || args.windows(2).any(|w| w == ["--gpu-runtime", "vulkan"]);
+                if let Err(e) = resource::preflight(std::path::Path::new(mp), gpu) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
     // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
     struct EL;
     impl log::Log for EL {

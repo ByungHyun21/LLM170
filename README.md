@@ -92,6 +92,15 @@ executor for this model.)
 
 Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
+## Safety: pre-load resource guard
+
+Before any subcommand loads a model, the engine compares the model's size
+(all split parts) against free VRAM + 0.85 x available RAM and refuses to
+start when it would not fit — instead of driving the host into an OOM freeze
+(`LLM170_NO_RSRC_GUARD=1` overrides). This exists because running two
+inference servers on one 96 GiB APU with a 104 GiB model froze the machine
+once (2026-09-16).
+
 ## Build & run
 
 Requires Rust 1.95+ (stable, edition 2024). No GPU or CUDA toolkit needed to build.
