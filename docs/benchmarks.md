@@ -11,21 +11,21 @@ deleted, only regrouped here.
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
-| backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
-|---|---|---|---|---|
-| LLM170 hip | 324 | 253 | 11.1 | 10.5 |
-| LLM170 vulkan | 150 | — (device lost) | 9.2 | — (device lost) |
-| llama.cpp (ROCm 10) | **342** | **317** | **11.6** | **11.9** |
+| backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|
+| LLM170 hip (2026-09-16) | **374** | 324 | 253 | 11.1 | 11.5 |
+| LLM170 vulkan | — | 150 | — (device lost) | 9.2 | — (device lost) |
+| llama.cpp (ROCm 10) | 347 | **342** | **317** | **11.6** | **11.9** |
 
-(hip session progression: pp4096 315→324, tg@16k 10.3→10.5; the 27B
-decode is within ~10% of the practical DRAM limit — see "ceilings"
-below. pp512: LLM170 hip 360 vs llama 347.)
+(hip session progression: pp4096 315→324, tg@16k 10.3→11.5; the 27B
+decode is within ~5% of the practical DRAM limit — see "ceilings"
+below. pp512 374 leaves llama's 347 behind.)
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
-| LLM170 hip | **270** | **243** | 17.1 | 16.8 |
+| LLM170 hip (2026-09-16) | **270** | **243** | 18.0 | 17.9 |
 | LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
 
@@ -174,3 +174,26 @@ Also measured: the per-layer QSA norm uploads used a single-slot cache and
 missed on every layer (24KB+2KB synchronous copies x 12 layers = 40ms/step of
 host stalls). Now cached per (ptr,len); KTRACE decode gaps fell 40.0 -> 10.2ms
 with no wall-time change (the GPU stayed busy on the queue).
+
+## 2026-09-16 - remaining-gap accounting (what was tried and why it stands)
+
+Prefill (27B, KTRACE over 32 chunks of 16384 tokens, 64.25s kernel total):
+attention `qsa_flash_wk8i` 26.3%, MMQ family 56.6%, `gdn_ar_w_swap` 4.9%.
+MMQ runs at ~14.8 TOPS; llama.cpp's prefill uses its per-arch `J_max` (256 on
+RDNA3.5, `mmq-config-rdna3-5.cuh`) while this engine hardcodes J=128 - a J=256
+instance is not in the shipped `mmq.co`, and that object was extracted from an
+older llama.cpp fatbin (pre-`mmq_args` ABI, commit 6eddde06a); the RDNA3.5
+config data arrives only *after* that ABI change, so J=256 cannot be mixed in
+without rewriting the MMQ launcher against the new ABI. Not attempted.
+
+Attention: `wk8i` reaches ~28% of the FP32 peak. Vectorizing its f16 loads
+(uint4 per 8 dims, arithmetically identical) measured neutral (251.9 vs 252.7
+t/s at pp16384) - the compiler already coalesces those accesses - and was
+reverted. The v_dot2 variant (`wk8d`) is QK-fast but PV-bound, and the WMMA
+path is 9.5x slow on this ROCm build (silent emulation/spill).
+
+Flash-Next decode: measured per-kernel (KTRACE, decode step) - q8_0 GEMVs run
+at 156-169 GB/s, MoE ids GEMVs 55-72us/call (~180 GB/s per the in-code
+measurement), lm head 3.7ms single call (~100 GB/s). Replacing the head kernel
+with the 16-lane variant is neutral; graph capture/replay (`LLM170_GRAPH=1`)
+is neutral, i.e. launch overhead is not the limiter.
