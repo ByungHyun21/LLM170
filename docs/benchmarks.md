@@ -218,6 +218,19 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### np4 step launch-count decomposition (2026-09-17)
+
+KTRACE on the FN np4 step: **3084 kernel launches**, GAPS 14.7ms (~4.75us
+per launch — device-side dispatch latency between mostly data-dependent
+kernels). Largest by count: quant_q8 x447, f32_mt x288, shexp x384, rms
+x194, MoE ids x137. The earlier single-stream graph-capture/replay test
+being neutral confirms these gaps are not host launch overhead (graphs
+remove that); closing them requires kernel fusion at ~0.5-1.5ms per fused
+site. The step's GEMM kernels run 123-151 GB/s effective vs llama's
+whole-step 143 GB/s — i.e. their tiled MMQ family (VDR=8, smem-staged,
+dp4a-dense) holds an ~18-25% per-token edge that the dot4-GEMV family
+cannot reach; matching it is a kernel-family port, not a tuning change.
+
 ### q8 mt4 (w16-layout multi-token) neutral (2026-09-17, not landed)
 
 Extending the contiguous 16-lane/row w16 layout with a token loop for the
