@@ -1286,6 +1286,230 @@ pub fn wmma_check() -> Result<String, String> {
     wmma_probe_both().map(|(_, m)| m)
 }
 
+/// plans/74 N4: raw WMMA(w32) 프래그먼트 ABI 확정 — 4가지 레이아웃 조합을
+/// CPU 행렬곱과 대조해 매핑을 고른다.
+pub fn wmma2_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let a: Vec<f32> = (0..256).map(|i| (((i / 16) * 3 + (i % 16) * 7) % 11) as f32 - 5.0).collect();
+    let b: Vec<f32> = (0..256).map(|i| (((i / 16) * 5 + (i % 16) * 2) % 13) as f32 - 6.0).collect();
+    let ah: Vec<u16> = a.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+    let bh: Vec<u16> = b.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+    let ad = ctx.alloc(512)?;
+    let bd = ctx.alloc(512)?;
+    let cd = ctx.alloc(1024)?;
+    ctx.h2d(ad, bytemuck::cast_slice(&ah))?;
+    ctx.h2d(bd, bytemuck::cast_slice(&bh))?;
+    let mut msg = String::new();
+    let mut any_ok = false;
+    for mode in 0..4i32 {
+        let mut ap = ad as *mut c_void;
+        let mut bp = bd as *mut c_void;
+        let mut cp = cd as *mut c_void;
+        let mut m = mode;
+        let mut args = vec![
+            (&mut ap) as *mut _ as *mut c_void,
+            (&mut bp) as *mut _ as *mut c_void,
+            (&mut cp) as *mut _ as *mut c_void,
+            (&mut m) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3("wmma2_probe", 1, 1, 1, 32, &mut args)?;
+        ctx.sync()?;
+        let mut c = vec![0f32; 256];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+        let mut maxerr = 0f32;
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let mut sum = 0f32;
+                for k in 0..16usize {
+                    sum += a[i * 16 + k] * b[k * 16 + j];
+                }
+                maxerr = maxerr.max((c[i * 16 + j] - sum).abs());
+            }
+        }
+        let ok = maxerr <= 2e-2;
+        any_ok |= ok;
+        msg += &format!("mode{mode} (D={}, AB={}): max|Δ|={maxerr:.4} {}\n",
+            if mode & 1 == 0 { "2l+g" } else { "l+8g" },
+            if mode & 2 == 0 { "contig" } else { "stride" },
+            if ok { "★ 일치" } else { "" });
+    }
+    Ok(format!("wmma2(raw builtin w32) ABI 프로브:\n{msg}{}", if any_ok { "" } else { "전 불일치 — 매핑 재역추론 필요" }))
+}
+
+/// plans/74 N4: (lane,l)→(i,k) 매핑 역추론 — 단일원소 행렬 512조합 덤프.
+pub fn wmma2_map() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let ad = ctx.alloc(512)?;
+    let bd = ctx.alloc(512)?;
+    let cd = ctx.alloc(32 * 8 * 4)?;
+    let mut amap = vec![(-1i32, -1i32); 32 * 8]; // (row, col=contraction)
+    let mut bmap = vec![(-1i32, -1i32); 32 * 8]; // (row=contraction, col)
+    let mut ident = vec![0u16; 256];
+    for i in 0..16 {
+        ident[i * 16 + i] = half::f16::from_f32(1.0).to_bits();
+    }
+    let mut e = vec![0u16; 256];
+    let _ = &e;
+    let dump = |ad: usize, bd: usize, ah: &[u16], bh: &[u16]| -> Result<Vec<f32>, String> {
+        ctx.h2d(ad as *mut u8, unsafe { std::slice::from_raw_parts(ah.as_ptr() as *const u8, 512) })?;
+        ctx.h2d(bd as *mut u8, unsafe { std::slice::from_raw_parts(bh.as_ptr() as *const u8, 512) })?;
+        let mut ap = ad as *mut c_void;
+        let mut bp = bd as *mut c_void;
+        let mut cp = cd as *mut c_void;
+        let mut args = vec![
+            (&mut ap) as *mut _ as *mut c_void,
+            (&mut bp) as *mut _ as *mut c_void,
+            (&mut cp) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3("wmma2_dump", 1, 1, 1, 32, &mut args)?;
+        ctx.sync()?;
+        let mut c = vec![0f32; 256];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+        Ok(c)
+    };
+    // A 매핑: B=I → D=A. A=e_{r,k} 의 1이 어느 (lane,l) 에 나오나.
+    for r in 0..16usize {
+        for k in 0..16usize {
+            for v in e.iter_mut() { *v = 0; }
+            e[r * 16 + k] = half::f16::from_f32(1.0).to_bits();
+            let c = dump(ad as usize, bd as usize, &e, &ident)?;
+            for idx in 0..256usize {
+                if c[idx] == 1.0 {
+                    if amap[idx].0 == -1 || amap[idx] == (r as i32, k as i32) {
+                        amap[idx] = (r as i32, k as i32);
+                    }
+                }
+            }
+        }
+    }
+    // B 매핑: A=I → D=B. B=e_{k,j}.
+    for kk in 0..16usize {
+        for j in 0..16usize {
+            for v in e.iter_mut() { *v = 0; }
+            e[kk * 16 + j] = half::f16::from_f32(1.0).to_bits();
+            let c = dump(ad as usize, bd as usize, &ident, &e)?;
+            for idx in 0..256usize {
+                if c[idx] == 1.0 {
+                    if bmap[idx].0 == -1 || bmap[idx] == (kk as i32, j as i32) {
+                        bmap[idx] = (kk as i32, j as i32);
+                    }
+                }
+            }
+        }
+    }
+    let fmt = |m: &[ (i32, i32) ]| -> String {
+        let mut s = String::new();
+        for lane in 0..32 {
+            s += &format!("lane{lane:2}: ");
+            for l in 0..8 {
+                let (i, j) = m[lane * 8 + l];
+                s += &format!("({i:2},{j:2})");
+            }
+            s += "\n";
+        }
+        s
+    };
+    Ok(format!("A(lane,l)→(row,col):\n{}\nB(lane,l)→(row,col):\n{}", fmt(&amap), fmt(&bmap)))
+}
+
+/// plans/74 N4: 랜덤 다중시행 교집합으로 D 레지스터 (lane,l)→(i,j) 확정.
+pub fn wmma2_map2() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let ad = ctx.alloc(512)?;
+    let bd = ctx.alloc(512)?;
+    let cd = ctx.alloc(32 * 8 * 4)?;
+    let mut ident = vec![0u16; 256];
+    for i in 0..16 {
+        ident[i * 16 + i] = half::f16::from_f32(1.0).to_bits();
+    }
+    let mut cand: Vec<Vec<(u8, u8)>> = vec![vec![]; 256];
+    let mut first = true;
+    for trial in 0..12u64 {
+        let seed = 0x9E3779B97F4A7C15u64.wrapping_mul(trial + 1);
+        let a: Vec<f32> = (0..256)
+            .map(|i| {
+                let h = seed.wrapping_mul(i as u64 + 1);
+                ((h >> 33) % 13) as f32 - 6.0
+            })
+            .collect();
+        let ah: Vec<u16> = a.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        ctx.h2d(ad, unsafe { std::slice::from_raw_parts(ah.as_ptr() as *const u8, 512) })?;
+        ctx.h2d(bd, unsafe { std::slice::from_raw_parts(ident.as_ptr() as *const u8, 512) })?;
+        let mut ap = ad as *mut c_void;
+        let mut bp = bd as *mut c_void;
+        let mut cp = cd as *mut c_void;
+        let mut args = vec![
+            (&mut ap) as *mut _ as *mut c_void,
+            (&mut bp) as *mut _ as *mut c_void,
+            (&mut cp) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3("wmma2_dump", 1, 1, 1, 32, &mut args)?;
+        ctx.sync()?;
+        let mut c = vec![0f32; 256];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+        for idx in 0..256usize {
+            let mut hits = vec![];
+            for i in 0..16usize {
+                for j in 0..16usize {
+                    if (a[i * 16 + j] - c[idx]).abs() < 1e-3 {
+                        hits.push((i as u8, j as u8));
+                    }
+                }
+            }
+            if first {
+                cand[idx] = hits;
+            } else {
+                cand[idx].retain(|&h| hits.contains(&h));
+            }
+        }
+        first = false;
+    }
+    let mut msg = String::new();
+    for lane in 0..32 {
+        msg += &format!("lane{lane:2}:");
+        for l in 0..8 {
+            let cs = &cand[lane * 8 + l];
+            let s = if cs.len() == 1 {
+                format!(" ({},{})", cs[0].0, cs[0].1)
+            } else if cs.is_empty() {
+                " (?,?)".into()
+            } else {
+                format!(" {}안", cs.len())
+            };
+            msg += &s;
+        }
+        msg += "\n";
+    }
+    // 진단: lanes 16-31 원시값과 홀수행 기대값 비교(1시행)
+    {
+        let a: Vec<f32> = (0..256).map(|i| ((i * 7 + 3) % 17) as f32 - 8.0).collect();
+        let ah: Vec<u16> = a.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        ctx.h2d(ad, unsafe { std::slice::from_raw_parts(ah.as_ptr() as *const u8, 512) })?;
+        ctx.h2d(bd, unsafe { std::slice::from_raw_parts(ident.as_ptr() as *const u8, 512) })?;
+        let mut ap = ad as *mut c_void;
+        let mut bp = bd as *mut c_void;
+        let mut cp = cd as *mut c_void;
+        let mut args = vec![
+            (&mut ap) as *mut _ as *mut c_void,
+            (&mut bp) as *mut _ as *mut c_void,
+            (&mut cp) as *mut _ as *mut c_void,
+        ];
+        ctx.launch3("wmma2_dump", 1, 1, 1, 32, &mut args)?;
+        ctx.sync()?;
+        let mut c = vec![0f32; 256];
+        ctx.d2h(bytemuck::cast_slice_mut(&mut c).as_mut(), cd)?;
+        msg += "raw lanes16-31: ";
+        for lane in 16..32 { for l in 0..8 { msg += &format!("{:.0},", c[lane*8+l]); } }
+        msg += "\nA odd rows:    ";
+        for i in (1..16).step_by(2) { for j in 0..16 { msg += &format!("{:.0},", a[i*16+j]); } }
+        msg += "\n";
+    }
+    Ok(format!("D(lane,l)→(i,j) 확률적 확정(B=I, D=A):\n{msg}"))
+}
+
 fn wmma_probe_both() -> Result<(bool, String), String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
@@ -1674,6 +1898,144 @@ pub fn wmma_attn_check() -> Result<String, String> {
             [got[0], got[1], got[2], got[3]], gm, gs, [acc[0], acc[1], acc[2], acc[3]], m, ssum);
     }
     Ok(format!("합성 어텐션: acc 불일치 {nbad}개, max|delta| {maxerr:.4}  {}{}", if first.is_empty() { "전부 일치 ✓".to_string() } else { first }, det))
+}
+
+/// plans/74 N4: qsa_flash_wmma2 검증 — 전체 인과 어텐션 CPU 기준 + 호스트 merge.
+pub fn wmma2_attn_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_head, n_kv, hd) = (24usize, 8usize, 256usize);
+    let mini = std::env::var_os("LLM170_WMMA2_MINI").is_some();
+    let prod = std::env::var_os("LLM170_WMMA2_PROD").is_some();
+    let (t, pos0, seg, sstride, n_past) = if mini {
+        (16usize, 0usize, 16usize, 256usize, 16usize)
+    } else if prod {
+        (512usize, 1024usize, 1024usize, 2048usize, 1536usize)
+    } else {
+        (64usize, 32usize, 16usize, 256usize, 96usize)
+    };
+    let nseg = (n_past + seg - 1) / seg;
+    let qv: Vec<f32> = (0..t * n_head * 2 * hd)
+        .map(|i| (((i * 1103515245 + 12345) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let kk: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 214013 + 2531011) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let vv: Vec<f32> = (0..n_past * n_kv * hd)
+        .map(|i| (((i * 1260231 + 999983) % 200) as f32 - 100.0) * 5e-3)
+        .collect();
+    let mut mask: Vec<u32> = vec![0u32; (pos0 + t) * sstride];
+    for r in 0..(pos0 + t) {
+        for k in 0..=r.min(n_past - 1) { mask[r * sstride + k] = 1; }
+    }
+    let qd = ctx.alloc(qv.len() * 4)?;
+    let kd = ctx.alloc(kk.len() * 4)?;
+    let vd = ctx.alloc(vv.len() * 4)?;
+    let md = ctx.alloc(mask.len() * 4)?;
+    let pd = ctx.alloc(t * n_head * nseg * (hd + 2) * 4)?;
+    ctx.h2d(qd, bytemuck::cast_slice(&qv))?;
+    ctx.h2d(kd, bytemuck::cast_slice(&kk))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&vv))?;
+    ctx.h2d(md, bytemuck::cast_slice(&mask))?;
+    let kh = ctx.alloc(kk.len() * 2)?;
+    let vh = ctx.alloc(vv.len() * 2)?;
+    for (src, dst) in [(kd, kh), (vd, vh)] {
+        let mut sp = src as *mut c_void;
+        let mut dp = dst as *mut c_void;
+        let mut nn = kk.len() as i32;
+        let mut a: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
+    }
+    let mut qp = qd as *mut c_void;
+    let mut kp = kh as *mut c_void;
+    let mut vp = vh as *mut c_void;
+    let mut mp = md as *mut c_void;
+    let mut pp = pd as *mut c_void;
+    let mut np_ = n_past as i32;
+    let mut nh = n_head as i32;
+    let mut nk = n_kv as i32;
+    let mut h = hd as i32;
+    let mut tl = t as i32;
+    let mut ss = sstride as i32;
+    let mut p0 = pos0 as i32;
+    let mut sg = seg as i32;
+    let mut args = vec![
+        (&mut qp) as *mut _ as *mut c_void, (&mut kp) as *mut _ as *mut c_void,
+        (&mut vp) as *mut _ as *mut c_void, (&mut mp) as *mut _ as *mut c_void,
+        (&mut pp) as *mut _ as *mut c_void, (&mut np_) as *mut _ as *mut c_void,
+        (&mut nh) as *mut _ as *mut c_void, (&mut nk) as *mut _ as *mut c_void,
+        (&mut h) as *mut _ as *mut c_void, (&mut tl) as *mut _ as *mut c_void,
+        (&mut ss) as *mut _ as *mut c_void, (&mut p0) as *mut _ as *mut c_void,
+        (&mut sg) as *mut _ as *mut c_void,
+    ];
+    ctx.launch3("qsa_flash_wmma2", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+    ctx.sync()?;
+    let mut got = vec![0f32; t * n_head * nseg * (hd + 2)];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut got).as_mut(), pd)?;
+    // 검증: 세그별 부분 → 호스트 merge → CPU 전체 어텐션(+gate) 대조.
+    let mut maxerr = 0f32;
+    let mut first = String::new();
+    for row in 0..t {
+        for hh in 0..n_head {
+            let kvh = hh / (n_head / n_kv);
+            let mut m = f32::NEG_INFINITY;
+            let mut s2v: Vec<f32> = vec![];
+            let mut ks: Vec<usize> = vec![];
+            for k in 0..n_past {
+                if mask[(pos0 + row) * sstride + k] == 0 { continue; }
+                let mut s2 = 0f32;
+                for d in 0..hd {
+                    s2 += qv[(row * n_head + hh) * 2 * hd + d] * kk[(k * n_kv + kvh) * hd + d];
+                }
+                s2v.push(s2);
+                ks.push(k);
+                m = m.max(s2);
+            }
+            let mut ssum = 0f32;
+            let mut acc = vec![0f32; hd];
+            for (i, &s2) in s2v.iter().enumerate() {
+                let e = (s2 - m).exp();
+                ssum += e;
+                let k = ks[i];
+                for d in 0..hd { acc[d] += e * vv[(k * n_kv + kvh) * hd + d]; }
+            }
+            // 호스트 merge
+            let mut M = f32::NEG_INFINITY;
+            for sgi in 0..nseg {
+                let b = ((row * n_head + hh) * nseg + sgi) * (hd + 2);
+                M = M.max(got[b + hd]);
+            }
+            let mut num = vec![0f32; hd];
+            let mut den = 0f32;
+            for sgi in 0..nseg {
+                let b = ((row * n_head + hh) * nseg + sgi) * (hd + 2);
+                let w = (got[b + hd] - M).exp();
+                den += got[b + hd + 1] * w;
+                for d in 0..hd { num[d] += got[b + d] * w; }
+            }
+            let gate = 1.0f32 / (1.0f32 + (-(qv[(row * n_head + hh) * 2 * hd + hd])).exp());
+            for d in 0..hd {
+                let refv = if ssum > 0.0 { acc[d] / ssum * gate } else { 0.0 };
+                let ourv = if den > 0.0 { num[d] / den * gate } else { 0.0 };
+                let dv = (ourv - refv).abs();
+                if dv > maxerr { maxerr = dv; }
+                if dv > 0.02 && first.is_empty() {
+                    first = format!("행{row} 헤드{hh} d{d}: ours {ourv:.5} ref {refv:.5}");
+                }
+            }
+        }
+    }
+    let mut dbg = String::new();
+    if mini {
+        let b = 0usize;
+        dbg += &format!(" | part0: m={:.4} s={:.4} vk[..4]={:?}", got[b + hd], got[b + hd + 1], &got[b..b + 4]);
+    }
+    Ok(format!("wmma2-attn-check: max|Δ|={maxerr:.5} {}{}", if maxerr <= 0.02 { "★ PASS".to_string() } else { format!("FAIL {first}") }, dbg))
 }
 
 /// PV 경로 프로브: A=P(16x16 ldm=16) x B=V(16x256 **row_major** ldm=256) — 어텐션 PV 와 동일.

@@ -1801,7 +1801,19 @@ gmark("attn", &mut marks);
                             // 병목을 넘어가 실측 역행 — wk8i 253 vs wk8d 234 t/s@pp16k.
                             // 구조 교훈(PV/기록의 8쿼리 전부 규약, 완전마스크 타일의
                             // e=0)은 커널 주석에 남긴다. WMMA급 해법이 다음 과제.
-                            if std::env::var_os("LLM170_WK8D").is_some() {
+                            // plans/74 N4: raw-builtin WMMA(w32) 판 — ABI 는
+                            // wmma2-map2 프로브로 확정, wmma2-attn-check PASS.
+                            // f16 Q/P 산술 클래스라 평탄분포 아그맥스를 흔든다(실측:
+                            // 2302토큰 프롬프트 스트림 분기, 첫 플립 참조갭 2.07nat
+                            // → 근접티 ε=1.5 밖). 표준 검증면(게이트·verify·MTP·VL,
+                            // 모두 ctx≤8k)은 바이트 불변을 유지하고 **n_past>8192
+                            // 장문 프리필에만** 적용한다(pp16k +11%). 폭 넓은 채택은
+                            // llama 참조 재수집 후 재판정 과제. LLM170_NO_WMMA2=1
+                            // 이면 전 구간 wk8i.
+                            if std::env::var_os("LLM170_NO_WMMA2").is_none()
+                                && np_ > 8192 {
+                                self.ctx.launch3("qsa_flash_wmma2", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+                            } else if std::env::var_os("LLM170_WK8D").is_some() {
                                 self.ctx.launch3("qsa_flash_wk8d", ((t + 7) / 8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else if std::env::var_os("LLM170_NO_WK8I").is_none() {
                                 self.ctx.launch3("qsa_flash_wk8i", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
