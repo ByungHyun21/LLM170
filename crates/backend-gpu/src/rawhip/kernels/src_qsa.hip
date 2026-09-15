@@ -1295,3 +1295,184 @@ extern "C" __global__ void qsa_flash_gqa2d(const float* q, const half* ck, const
         }
     }
 }
+
+// ─── plans/73: QSA indexer selection on device (decode t=1) ───
+// Mirrors stages/qsa.rs qsa_select (pass A iq norm+rope, block-key pooling,
+// pass B scores + top-k) and qsa_sel_list — same arithmetic order so the
+// selection lists are bit-identical to the host path (probed end to end).
+// This removes the per-QSA-layer d2h/h2d round trip that idled the GPU for
+// ~3.3ms per layer at 16k context (KTRACE: "after qk_norm_rope" 40ms/step).
+
+// (1) indexer q norm+rope — one warp per (head, token). The host norm is
+// rms_norm (ops.rs): 32 f32 segment partials combined as f64 in order, then
+// (v*scale)*w; rope_head applies f64 rotation with the f32 cos/sin table.
+// Identical structure to qk_norm_rope but weights are shared per head (not
+// tiled) and n_rot == idx_dim.
+extern "C" __global__ void q4_idx_q_rope(
+        const float* __restrict__ iq, float* __restrict__ iqr,
+        const float* __restrict__ iqw, const float* __restrict__ cs,
+        float eps, int pos0, int t, int idx_heads, int idx_dim) {
+    int h = blockIdx.x;
+    int y = blockIdx.y;
+    int u = threadIdx.x;
+    if (h >= idx_heads || y >= t || u >= 32) return;
+    const size_t off = (size_t)y * (idx_heads * idx_dim) + (size_t)h * idx_dim;
+    const float* src = iq + off;
+    float* dst = iqr + off;
+    const int chunk = (idx_dim + 31) >> 5;
+    const int lo = u * chunk, hi = min(lo + chunk, idx_dim);
+    float mypart = 0.0f;
+    for (int i = lo; i < hi; i++) { float dv = src[i]; mypart += dv * dv; }
+    float parts[32];
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++)
+        parts[uu] = __shfl_sync(0xffffffffffffffffull, mypart, uu);
+    double sum = 0.0;
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++) sum += parts[uu];
+    const float scale = 1.0f / (float)sqrt(sum / (double)idx_dim + (double)eps);
+    for (int i = u; i < idx_dim; i += 32) dst[i] = src[i] * scale * iqw[i];
+    __syncwarp();
+    const int half = idx_dim >> 1;
+    const int csbase = (pos0 + y) * half * 2;
+    for (int p = u; p < half; p += 32) {
+        double c = (double)cs[csbase + p * 2];
+        double sf = (double)cs[csbase + p * 2 + 1];
+        double x0 = (double)dst[p], x1 = (double)dst[p + half];
+        dst[p] = (float)(x0 * c - x1 * sf);
+        dst[p + half] = (float)(x0 * sf + x1 * c);
+    }
+}
+
+// (2) block-key update — one warp per completed block. Host: mean-pool r
+// indexer-k rows (f32 adds, j ascending), /= r, rms_norm(ikw), rope(pos=b*r).
+// Requires idx_dim == 128 (lane u owns elements 4u..4u+3; rope pairs sit 16
+// lanes apart, exchanged with shfl_xor(16)).
+extern "C" __global__ void q4_idx_bk_update(
+        const float* __restrict__ idxk, float* __restrict__ bk,
+        const float* __restrict__ ikw, const float* __restrict__ cs,
+        float eps, int b0, int r, int idx_dim) {
+    const int b = b0 + (int)blockIdx.x;
+    const int u = threadIdx.x;
+    if (u >= 32 || idx_dim != 128) return;
+    float pv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int j = 0; j < r; j++) {
+        const float* row = idxk + (size_t)(b * r + j) * idx_dim;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) pv[k] += row[u * 4 + k];
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; k++) pv[k] /= (float)r;
+    float mypart = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) mypart += pv[k] * pv[k];
+    float parts[32];
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++)
+        parts[uu] = __shfl_sync(0xffffffffffffffffull, mypart, uu);
+    double sum = 0.0;
+    #pragma unroll
+    for (int uu = 0; uu < 32; uu++) sum += parts[uu];
+    const float scale = 1.0f / (float)sqrt(sum / (double)idx_dim + (double)eps);
+    float nm[4];
+    #pragma unroll
+    for (int k = 0; k < 4; k++) nm[k] = pv[k] * scale * ikw[u * 4 + k];
+    __syncwarp();
+    const int half = idx_dim >> 1;
+    const int pos = b * r;
+    const int csbase = pos * half * 2;
+    float* out = bk + (size_t)b * idx_dim;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int i = u * 4 + k;
+        const float other = __shfl_xor_sync(0xffffffffffffffffull, nm[k], 16);
+        const int p = (i < half) ? i : (i - half);
+        double c = (double)cs[csbase + p * 2];
+        double sf = (double)cs[csbase + p * 2 + 1];
+        if (i < half) {
+            double x0 = (double)nm[k], x1 = (double)other;
+            out[i] = (float)(x0 * c - x1 * sf);
+        } else {
+            double x0 = (double)other, x1 = (double)nm[k];
+            out[i] = (float)(x0 * sf + x1 * c);
+        }
+    }
+}
+
+// (3) block scores — one thread per block. Host pattern: per head a
+// 4-accumulator unrolled dot (d0+d1)+(d2+d3), relu-added into the score.
+extern "C" __global__ void q4_idx_score(
+        const float* __restrict__ iqr, const float* __restrict__ bk,
+        float* __restrict__ scores, int n_blocks, int idx_heads, int idx_dim) {
+    const int b = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float* pk = bk + (size_t)b * idx_dim;
+    float score = 0.0f;
+    for (int h = 0; h < idx_heads; h++) {
+        const float* qh = iqr + (size_t)h * idx_dim;   // decode: t=1
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        int i2 = 0;
+        for (; i2 + 4 <= idx_dim; i2 += 4) {
+            d0 += qh[i2] * pk[i2];
+            d1 += qh[i2 + 1] * pk[i2 + 1];
+            d2 += qh[i2 + 2] * pk[i2 + 2];
+            d3 += qh[i2 + 3] * pk[i2 + 3];
+        }
+        for (; i2 < idx_dim; i2++) d0 += qh[i2] * pk[i2];
+        const float dot = (d0 + d1) + (d2 + d3);
+        if (dot > 0.0f) score += dot;
+    }
+    scores[b] = score;
+}
+
+// (4) deterministic top-k rank — one thread per block. rank(b) counts
+// blocks with higher score, ties broken by lower index, so "selected" is
+// exactly the top-n_sel set under (score desc, index asc). The host's
+// select_nth_unstable_by resolves threshold ties arbitrarily; the probe
+// (LLM170_QSA_SELCHECK) compares the resulting lists over real runs.
+extern "C" __global__ void q4_idx_rank(
+        const float* __restrict__ scores, unsigned* __restrict__ selflag,
+        int n_blocks, int n_sel) {
+    const int b = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float sb = scores[b];
+    int rank = 0;
+    for (int b2 = 0; b2 < n_blocks; b2++) {
+        const float s2 = scores[b2];
+        if (s2 > sb || (s2 == sb && b2 < b)) rank++;
+    }
+    selflag[b] = (rank < n_sel) ? 1u : 0u;
+}
+
+// (5) selection-list expand — single block. Prefix (serial, ~n_blocks) then
+// parallel emit of block positions (ascending) and the tail, mirroring
+// qsa_sel_list. sel_off = {0, n_sel*r + tail_cnt}.
+extern "C" __global__ void q4_idx_expand(
+        const unsigned* __restrict__ selflag, unsigned* __restrict__ sel_idx,
+        unsigned* __restrict__ sel_off, int n_blocks, int n_sel,
+        int r, int n_past) {
+    __shared__ unsigned slot[8192];
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        unsigned k2 = 0;
+        for (int b = 0; b < n_blocks; b++) {
+            slot[b] = k2;
+            if (selflag[b]) k2++;
+        }
+    }
+    __syncthreads();
+    const int tail_start = (n_past / r) * r;
+    const int tail_cnt = n_past - tail_start;
+    for (int b = tid; b < n_blocks; b += blockDim.x) {
+        if (selflag[b]) {
+            const unsigned o = slot[b] * (unsigned)r;
+            for (int j = 0; j < r; j++) sel_idx[o + j] = (unsigned)(b * r + j);
+        }
+    }
+    for (int j = tid; j < tail_cnt; j += blockDim.x)
+        sel_idx[(unsigned)n_sel * (unsigned)r + (unsigned)j] = (unsigned)(tail_start + j);
+    if (tid == 0) {
+        sel_off[0] = 0u;
+        sel_off[1] = (unsigned)(n_sel * r + tail_cnt);
+    }
+}
