@@ -14,7 +14,7 @@ deleted, only regrouped here.
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
 | LLM170 hip | 324 | 253 | 11.1 | 10.5 |
-| LLM170 vulkan | 150 | (pp16k: see archive) | 9.2 | — |
+| LLM170 vulkan | 150 | — (device lost) | 9.2 | — (device lost) |
 | llama.cpp (ROCm 10) | **342** | **317** | **11.6** | **11.9** |
 
 (hip session progression: pp4096 315→324, tg@16k 10.3→10.5; the 27B
@@ -26,6 +26,7 @@ below. pp512: LLM170 hip 360 vs llama 347.)
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
 | LLM170 hip | **270** | **243** | 17.1 | 16.8 |
+| LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
 
 (hip session progression for tg: 13.40→17.5 short ctx (+31%),
