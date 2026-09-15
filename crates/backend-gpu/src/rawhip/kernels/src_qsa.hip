@@ -684,6 +684,93 @@ extern "C" __global__ void qsa_flash_wk8(const float* q, const half* ck, const h
     for (int j = 0; j < 32; j++) pp2[own * 32 + j] = acc[j];
 }
 
+// plans/73: wk8의 ILP 판(qsa_flash_wk8i). 원판은 키당 pr = fmaf 32연쇄(엄격 FP
+// 재결합 불가)가 임계 경로라 키 직렬 처리 시 체인 레이턴시가 그대로 노출된다.
+// 여기선 레인이 **키 4개의 fmaf 체인을 인터리브**해 레이턴시를 4키로 분산한다.
+// 메모리 패턴·차원 배치·셔플 트리·소프트맥스 갱신 순서(키 오름차순)는 원판
+// 그대로 → **비트 동일**. (공유 타일 판은 8레인×64B 스트라이드 읽기의 4-way
+// 뱅크 충돌 + 32KB 공유로 점유율이 무너져 실측 역행 — pp16k 257→209 — 폐기.)
+// LLM170_NO_WK8I=1 복귀.
+extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8i(
+        const float* q, const half* ck, const half* cv,
+        const unsigned* mask, float* part,
+        int n_past, int n_head, int n_kv,
+        int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    int q0 = blockIdx.x * 32;
+    int h = blockIdx.y;
+    int sg = blockIdx.z;
+    if (q0 >= t_len || h >= n_head) return;
+    int nq = min(32, t_len - q0);
+    int lane = threadIdx.x & 31;
+    int w = threadIdx.x >> 5;
+    int grp = lane >> 3;
+    int own = lane & 7;
+    int r = w * 4 + grp;
+    bool real = (r < nq);
+    int rf = real ? r : 0;
+    int kvh = h / (n_head / n_kv);
+    const float* qrow = q + ((size_t)(q0 + rf) * n_head + h) * 2 * hd;
+    float qv[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) qv[j] = qrow[own * 32 + j];
+    float m = -3.4028235e38f, ssum = 0.0f;
+    float acc[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) acc[j] = 0.0f;
+    int p0 = sg * seg;
+    int p1 = min(p0 + seg, n_past);
+    int kb0 = kvh * hd + own * 32;
+    const size_t krow_stride = (size_t)n_kv * hd;
+    int kq = (pos0 + q0 + rf) * sstride;
+    for (int kb = p0; kb < p1; kb += 4) {
+        const int nk4 = min(4, p1 - kb);
+        float pr[4];
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) pr[kk] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            // 꼬리 그룹: 유효 키 범위 밖 로드는 마지막 유효 키로 클램프(값은 버림).
+            const int k1 = (1 < nk4) ? kb + 1 : kb;
+            const int k2 = (2 < nk4) ? kb + 2 : kb;
+            const int k3 = (3 < nk4) ? kb + 3 : kb;
+            const float kj0 = __half2float(ck[(size_t)kb * krow_stride + kb0 + j]);
+            const float kj1 = __half2float(ck[(size_t)k1 * krow_stride + kb0 + j]);
+            const float kj2 = __half2float(ck[(size_t)k2 * krow_stride + kb0 + j]);
+            const float kj3 = __half2float(ck[(size_t)k3 * krow_stride + kb0 + j]);
+            pr[0] = fmaf(qv[j], kj0, pr[0]);
+            pr[1] = fmaf(qv[j], kj1, pr[1]);
+            pr[2] = fmaf(qv[j], kj2, pr[2]);
+            pr[3] = fmaf(qv[j], kj3, pr[3]);
+        }
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            if (kk >= nk4) continue;
+            float prr = pr[kk];
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1)
+                prr += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, prr, off);
+            if (real && mask[kq + kb + kk] != 0u) {
+                float gm = fmaxf(m, prr);
+                float e_m = __expf(m - gm);
+                float e_d = __expf(prr - gm);
+                ssum = ssum * e_m + e_d;
+                m = gm;
+                const half* vp = cv + (size_t)(kb + kk) * krow_stride + kb0;
+                #pragma unroll
+                for (int j = 0; j < 32; j++)
+                    acc[j] = acc[j] * e_m + e_d * __half2float(vp[j]);
+            }
+        }
+    }
+    if (!real) return;
+    int nseg = (n_past + seg - 1) / seg;
+    float* pp2 = part + ((size_t)((q0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+    if (own == 0) { pp2[hd] = m; pp2[hd + 1] = ssum; }
+    #pragma unroll
+    for (int j = 0; j < 32; j++) pp2[own * 32 + j] = acc[j];
+}
+
 // mode2 프로브: 16행 x 256dim 타일을 ldm=256 으로 적재 (어텐션 커널과 동일 패턴 검증).
 extern "C" __global__ void wmma_probe_ldm(const float* a, const float* b, float* c) {
     __shared__ half sa[16 * 256];
