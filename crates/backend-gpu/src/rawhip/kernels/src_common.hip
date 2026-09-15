@@ -73,6 +73,39 @@ DEV float exp_cr(float xf) {
 #endif
 }
 
+// FASTEXP 무관 항상-정밀 판(plans/73) — 호스트 ops::exp_cr(f64 fma 호너)과
+// 비트 일치가 필요한 경로(PLE 수학 등)용. PLE 데이터가 μs급이라 비용 무의미.
+DEV float exp_cr_exact(float xf) {
+    double x = (double)xf;
+    if (x > 88.72) return __int_as_float(0x7f800000u);
+    if (x < -103.97) return 0.0f;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double INV_LN2 = 1.44269504088896338700e+00;
+    double kd = rint(x * INV_LN2);
+    int k = (int)kd;
+    double r = fma(-kd, LN2_HI, x);
+    r = fma(-kd, LN2_LO, r);
+    double p = 1.0 / 1307674368000.0;
+    p = fma(p, r, 1.0 / 479001600.0);
+    p = fma(p, r, 1.0 / 39916800.0);
+    p = fma(p, r, 1.0 / 3628800.0);
+    p = fma(p, r, 1.0 / 362880.0);
+    p = fma(p, r, 1.0 / 40320.0);
+    p = fma(p, r, 1.0 / 5040.0);
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    if (k > 127) return __int_as_float(0x7f800000u);
+    long long eb = (long long)(k + 1023) << 52;
+    double scale = __longlong_as_double(eb);
+    return (float)(p * scale);
+}
+
 // f64 자연로그 — atanh 급수 fma 호너 (Rust ops::ln_cr과 동일 연산열).
 DEV double ln_cr(double v) {
     long long bits = __double_as_longlong(v);

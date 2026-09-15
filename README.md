@@ -36,7 +36,7 @@ Runtime: ROCm 10 userspace. Greedy, `--reps 2` (warm rep). Same GGUF, same GPU.
 
 | | pp512 | pp4096 | pp16384 | tg128@512 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|---|
-| LLM170 | **251** | **270** | **243** | 16.8 | 16.7 | 16.1 |
+| LLM170 | **251** | **270** | **243** | 17.5 | 17.1 | 16.8 |
 | llama.cpp | 206 | 237 | 229 | **19.8** | **20.2** | **20.0** |
 
 #### Speculative decode (27B, MTP `--spec 3`)

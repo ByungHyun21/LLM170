@@ -45,6 +45,9 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let hc = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4usize);
             llm170_backend_gpu::rawhip::q4acc::hc_check(t, n, hc)
         }
+        "q4-ple-check" => {
+            llm170_backend_gpu::rawhip::q4acc::ple_gate_check()
+        }
         "q4-ar-check" => {
             let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(1usize);
             llm170_backend_gpu::rawhip::q4acc::ar_check_t(t)

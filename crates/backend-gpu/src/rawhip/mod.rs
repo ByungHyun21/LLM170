@@ -546,6 +546,15 @@ impl RawCtx {
                 hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream2), "h2d-async-s")
         }
     }
+
+    /// 메인 스트림 비동기 h2d — 발사 순서가 커널과 같은 큐를 따라야 하는
+    /// 소형 업로드(플레 임베딩 등)용. 동기화 없음(plans/73).
+    pub fn h2d_async_m(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
+        unsafe {
+            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(),
+                hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), "h2d-async-m")
+        }
+    }
     /// 디바이스→디바이드 복사(메인 스트림) — QSA KV 상주 풀 append용(plans/67 3단계).
     pub fn d2d(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<(), String> {
         unsafe {

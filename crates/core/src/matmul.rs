@@ -317,6 +317,35 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_sel_readback: 이 가속기는 미지원".into())
     }
 
+    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
+    /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
+    /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
+    #[allow(clippy::too_many_arguments)]
+    fn ple_math_dev(
+        &self,
+        _res: u64,
+        _key: u64,
+        _value: u64,
+        _nk: &[f32],
+        _nq: &[f32],
+        _nc: &[f32],
+        _conv_w: &[f32],
+        _gated: u64,
+        _conv_out: u64,
+        _gate_out: u64,
+        _seq: usize,
+        _t: usize,
+        _eps: f32,
+        _n_embd: usize,
+        _hc: usize,
+        _kern: usize,
+        _dil: usize,
+        _hist: usize,
+        _host_ring: &[f32],
+    ) -> Result<(), String> {
+        Err("ple_math_dev: 이 가속기는 미지원".into())
+    }
+
     /// plans/73: QSA 인덱서 선택의 **디바이스판** (디코드 t=1). iq/ik가 프레임
     /// 버퍼(디바이스)에 있을 때 호스트 왕복 없이 (1) ik를 idx 풀에 적립,
     /// (2) iq norm+rope, (3) 블록키 증분 갱신, (4) 점수·top-k·선택목록 전개까지
