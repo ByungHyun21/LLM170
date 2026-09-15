@@ -1476,3 +1476,71 @@ extern "C" __global__ void q4_idx_expand(
         sel_off[1] = (unsigned)(n_sel * r + tail_cnt);
     }
 }
+
+// (4') plans/73 개선: top-k + 목록 전개를 **단일 블록 비토닉 정렬**로 수행.
+// 종전 rank(O(B²) 스레드당 16k 비교) + expand(직렬 prefix) 콤보는 0.228ms/콜
+// (16k 문맥 × 12층 = 2.7ms/step)이었다. (score,idx)를 u64로 팩해 내림차순
+// 정렬하면 상위 n_sel이 정확히 "점수 내림, 인덱스 오름차순" 집합(= rank 판정과
+// 동일)이고, 인덱스만 다시 오름차순 정렬해 전개한다. n_blocks ≤ 4096 전용
+// (공유메모리 34KB) — 넘으면 구형 rank+expand로 폴백.
+extern "C" __global__ void q4_idx_topk(const float* __restrict__ scores,
+                                       unsigned* __restrict__ sel_idx,
+                                       unsigned* __restrict__ sel_off,
+                                       int n_blocks, int n_sel, int r, int n_past) {
+    __shared__ unsigned long long sh[4096];
+    __shared__ unsigned sel_ids[4096];
+    const int tid = threadIdx.x;
+    // f32 → 순서 보존 u32 매핑(음수 비트 반전, 양수 최상위 비트 세트).
+    for (int b = tid; b < n_blocks; b += 256) {
+        unsigned u = __float_as_uint(scores[b]);
+        u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+        sh[b] = ((unsigned long long)u << 32) | (unsigned)b;
+    }
+    for (int b = n_blocks + tid; b < 4096; b += 256) sh[b] = 0ull;
+    __syncthreads();
+    // 비토닉 내림차순(4096 고정 — 패딩은 최솟값 0).
+    for (int k = 2; k <= 4096; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < 4096; i += 256) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const unsigned long long a = sh[i], b2 = sh[l];
+                    const bool sw = ((i & k) == 0) ? (a < b2) : (a > b2);
+                    if (sw) { sh[i] = b2; sh[l] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // 상위 n_sel 인덱스 추출 → 오름차순 정렬(np = 다음 2의 거듭제곱, 패딩 최대값).
+    for (int k2 = tid; k2 < n_sel; k2 += 256)
+        sel_ids[k2] = (unsigned)(sh[k2] & 0xFFFFFFFFull);
+    int np = 1;
+    while (np < n_sel) np <<= 1;
+    for (int k2 = n_sel + tid; k2 < np; k2 += 256) sel_ids[k2] = 0xFFFFFFFFu;
+    __syncthreads();
+    for (int k = 2; k <= np; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < np; i += 256) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const unsigned a = sel_ids[i], b2 = sel_ids[l];
+                    const bool sw = ((i & k) == 0) ? (a > b2) : (a < b2);
+                    if (sw) { sel_ids[i] = b2; sel_ids[l] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // 전개: 선택 블록(오름차순) 위치 + 테일 — qsa_sel_list와 동일 구성.
+    const int tail_start = (n_past / r) * r;
+    const int tail_cnt = n_past - tail_start;
+    for (int k2 = tid; k2 < n_sel; k2 += 256) {
+        const unsigned b3 = sel_ids[k2];
+        const unsigned o = (unsigned)k2 * (unsigned)r;
+        for (int j2 = 0; j2 < r; j2++) sel_idx[o + j2] = b3 * (unsigned)r + (unsigned)j2;
+    }
+    for (int j2 = tid; j2 < tail_cnt; j2 += 256)
+        sel_idx[(unsigned)n_sel * (unsigned)r + (unsigned)j2] = (unsigned)(tail_start + j2);
+    if (tid == 0) { sel_off[0] = 0u; sel_off[1] = (unsigned)(n_sel * r + tail_cnt); }
+}

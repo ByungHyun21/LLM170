@@ -618,6 +618,36 @@ extern "C" __global__ void q4_gemm_f32(const float* x, const float* w, float* ou
     }
 }
 
+// plans/73: f32 GEMV **워프-퍼-출력판**(디코드 t=1). 원판(64스레드/출력)은
+// 저출력 형상에서 GPU 전체가 놀았다 — hc inject [10240→4]는 블록 4개로
+// 48µs(164KB!). 레인이 연속 4원소(float4)를 소유해 완전 병합 + MLP 4배.
+// 누산 순서가 원판과 달라진다(스칼라 스트라이드 → 4원소 청크) — f32 재배열
+// 편차(~1e-6 상대) 계열, 게이트 스트림 동일성으로 검증한다.
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_f32_w(
+        const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+        int n_in, int n_out) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (o >= n_out) return;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const float4* r4 = reinterpret_cast<const float4*>(w + (size_t)o * n_in);
+    const int n4 = n_in >> 2;
+    float4 a = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = lane; k < n4; k += 32) {
+        const float4 xv = x4[k];
+        const float4 rv = r4[k];
+        a.x += xv.x * rv.x;
+        a.y += xv.y * rv.y;
+        a.z += xv.z * rv.z;
+        a.w += xv.w * rv.w;
+    }
+    float acc = (a.x + a.y) + (a.z + a.w);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffffffffffull, acc, off);
+    if (lane == 0) out[o] = acc;
+}
+
 // QSA 마스크드 밀집 GQA — 값 경로 브리지 (f32 KV, 게이트 인터리브 q).
 // q [t][n_head·2·hd] (앞 hd = q, 뒤 hd = gate) · ck/cv [n_past][n_kv·hd] ·
 // mask [t][n_past] u32 (0 = 차단) · out [t][n_head·hd].
