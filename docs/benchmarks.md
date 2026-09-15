@@ -218,6 +218,15 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### q8 mt4 (w16-layout multi-token) neutral (2026-09-17, not landed)
+
+Extending the contiguous 16-lane/row w16 layout with a token loop for the
+t=4 q8_0 mt kernels (fixing the 62.5% lane efficiency at n_sub=80) measured
+neutral on the FN np4 engine (kernel total 114 vs 115ms, engine 138.2 vs
+139.8). Confirms the earlier instruction-count analysis: at t=4 these GEMVs
+are dot4-ALU bound (~2 warp-instr/byte → ~68GB/s ceiling), not lane- or
+bandwidth-bound; measured 47-81GB/s is the family limit. Removed.
+
 ### g4 ILP-2 negative (2026-09-17, not landed)
 
 Two-sub-block-per-iteration q5k4 (both blocks' weight words prefetched into
