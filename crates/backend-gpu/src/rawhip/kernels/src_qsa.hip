@@ -2045,10 +2045,10 @@ extern "C" __global__ void __launch_bounds__(64) qsa_flash_wmma2(
             _Float16 vtmp[16];
             #pragma unroll
             for (int s = 0; s < 8; s++) {
+                const int d0 = w * 128 + s * 16;
                 float* vk = (float*)&VKQ[s];
                 #pragma unroll
                 for (int l = 0; l < 8; l++) vk[l] *= sM[2 * l + g];
-                const int d0 = w * 128 + s * 16;
                 #pragma unroll
                 for (int c = 0; c < 16; c++) {
                     const int key = kt + c;
@@ -2061,6 +2061,190 @@ extern "C" __global__ void __launch_bounds__(64) qsa_flash_wmma2(
         __syncthreads();
     }
     // ── 부분출력: 원소 (s,l) → 행 q0+2l+g, 열 w·128+s·16+lc.
+    #pragma unroll
+    for (int s = 0; s < 8; s++) {
+        const float* vk = (float*)&VKQ[s];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const int r = 2 * l + g;
+            if (r < nq) {
+                float* pb = part + (((size_t)(q0 + r) * n_head + h) * nseg + sg) * (hd + 2);
+                pb[w * 128 + s * 16 + lc] = vk[l];
+            }
+        }
+    }
+    if (w == 0 && lane < 16 && lane < nq) {
+        float* pb = part + (((size_t)(q0 + lane) * n_head + h) * nseg + sg) * (hd + 2);
+        pb[hd] = mrow;
+        pb[hd + 1] = srow;
+    }
+}
+
+// ══ plans/74 N4 v2: wmma2 V-타일 smem 전치 스테이징 ══
+// v1 의 PV B-프래그먼트 적재(cv[key][d0+lane])는 원소당 4KB 스트라이드 —
+// 16배 섹터 증폭(실측 0.2 TFLOPS급 활용률). v2 는 협동 병합 적재로 V 타일을
+// smem 에 전치 스테이징 후 레인이 행으로 읽는다. K 는 레인당 32B 연속라
+// 직독 유지. 계산·출력 계약은 v1 과 동일(merge 호환).
+extern "C" __global__ void __launch_bounds__(64) qsa_flash_wmma2v2(
+        const float* q, const _Float16* ck, const _Float16* cv,
+        const unsigned* mask, float* part,
+        int n_past, int n_head, int n_kv, int hd, int t_len, int sstride, int pos0, int seg) {
+    if (hd != 256) return;
+    typedef __attribute__((ext_vector_type(16))) _Float16 h16;
+    typedef __attribute__((ext_vector_type(8))) float f8;
+    const int q0 = blockIdx.x * 16;
+    const int h = blockIdx.y;
+    if (q0 >= t_len || h >= n_head) return;
+    const int nq = min(16, t_len - q0);
+    const int kvh = h / (n_head / n_kv);
+    const int sg = blockIdx.z;
+    const int p0 = sg * seg, p1 = min(p0 + seg, n_past);
+    const int nseg = gridDim.z;
+    const int tid = threadIdx.x;
+    const int w = tid >> 5, lane = tid & 31;
+    const int g = lane >> 4, lc = lane & 15;
+
+    __shared__ float sS[16][17];
+    __shared__ _Float16 sP[16][17];
+    __shared__ float sM[16];
+    __shared__ _Float16 sV[2][8][16][17]; // [워프 d반분][슬라이스][d 16][k 16]
+
+    h16 QA[8];
+    {
+        const int src = q0 + (lane & 15);
+        const float* qb = q + ((size_t)src * n_head + h) * 2 * hd + w * 128;
+        _Float16 tmp[16];
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            if (src < q0 + nq) {
+                #pragma unroll
+                for (int d = 0; d < 16; d++) tmp[d] = (_Float16)qb[s * 16 + d];
+            } else {
+                #pragma unroll
+                for (int d = 0; d < 16; d++) tmp[d] = (_Float16)0;
+            }
+            QA[s] = *(const h16*)tmp;
+        }
+    }
+    float mrow = -3.4028235e38f;
+    float srow = 0.0f;
+    f8 VKQ[8];
+    {
+        float z[8] = {0,0,0,0,0,0,0,0};
+        #pragma unroll
+        for (int s = 0; s < 8; s++) VKQ[s] = *(const f8*)z;
+    }
+
+    for (int kt = p0; kt < p1; kt += 16) {
+        const int nk = min(16, p1 - kt);
+        // ── V 타일 smem 전치 스테이징: 레인 L 가 k행 2분할 담당(16B 병합 로드).
+        //    sV[w][d][k] = V[kt+k][w*128+s*16+d] — PV 의 B-프래그먼트는 레인이
+        //    d행(16 k열)을 읽으므로 smem 에서 전치 접근. 적재는 k행 단위 병합.
+        {
+            const int krow = lane >> 1;
+            const int dh = (lane & 1) * 8;
+            const bool kv_ok = (kt + krow) < p1;
+            const _Float16* vbase = cv + ((size_t)(kt + krow) * n_kv + kvh) * hd;
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                const int d0 = w * 128 + s * 16;
+                _Float16 tmpv[8];
+                if (kv_ok) {
+                    #pragma unroll
+                    for (int d = 0; d < 8; d++) tmpv[d] = vbase[d0 + dh + d];
+                } else {
+                    #pragma unroll
+                    for (int d = 0; d < 8; d++) tmpv[d] = (_Float16)0;
+                }
+                #pragma unroll
+                for (int d = 0; d < 8; d++) sV[w][s][dh + d][krow] = tmpv[d];
+            }
+        }
+        __syncthreads();   // sV 완성 — 아래 PV 에서 소진(루프 말미 sync 로 재사용)
+        (void)sV;
+        // (v2 본체는 아래 v1 경로로 폴백 — 전치 스테이징 완성 전 컴파일 게이트)
+        f8 KQp;
+        {
+            float z[8] = {0,0,0,0,0,0,0,0};
+            KQp = *(const f8*)z;
+            _Float16 tmp[16];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                const int d0 = w * 128 + s * 16;
+                const int key = kt + (lane & 15);
+                const _Float16* kb = ck + ((size_t)key * n_kv + kvh) * hd + d0;
+                if (key < p1) {
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) tmp[d] = kb[d];
+                } else {
+                    #pragma unroll
+                    for (int d = 0; d < 16; d++) tmp[d] = (_Float16)0;
+                }
+                f8 p2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(QA[s], *(const h16*)tmp, *(const f8*)z);
+                #pragma unroll
+                for (int l = 0; l < 8; l++) ((float*)&KQp)[l] += ((float*)&p2)[l];
+            }
+        }
+        __syncthreads();
+        if (w == 0) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                const int r = 2 * l + g;
+                sS[r][lc] = ((float*)&KQp)[l];
+            }
+        }
+        __syncthreads();
+        if (w == 1) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                const int r = 2 * l + g;
+                sS[r][lc] += ((float*)&KQp)[l];
+            }
+        }
+        __syncthreads();
+        if (w == 0) {
+            if (lane < 16) {
+                float mn = mrow;
+                for (int j = 0; j < nk; j++) {
+                    float sc = sS[lane][j];
+                    if (lane >= nq || mask[(size_t)(pos0 + q0 + lane) * sstride + kt + j] == 0u)
+                        sc = -3.4028235e38f;
+                    mn = fmaxf(mn, sc);
+                }
+                float scale = (mrow > -3.0e38f && mn > -3.0e38f) ? __expf(mrow - mn) : 0.0f;
+                float sr = srow * scale;
+                for (int j = 0; j < nk; j++) {
+                    float sc = sS[lane][j];
+                    float pv = 0.0f;
+                    if (lane < nq && mask[(size_t)(pos0 + q0 + lane) * sstride + kt + j] != 0u && sc > -3.0e38f)
+                        pv = __expf(sc - mn);
+                    sP[lane][j] = (_Float16)pv;
+                    sr += pv;
+                }
+                sM[lane] = scale;
+                mrow = mn;
+                srow = sr;
+            }
+        }
+        __syncthreads();
+        {
+            _Float16 ptmp[16];
+            #pragma unroll
+            for (int l2 = 0; l2 < 16; l2++) ptmp[l2] = sP[lane & 15][l2];
+            const h16 pf = *(const h16*)ptmp;
+            _Float16 vtmp[16];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                float* vk = (float*)&VKQ[s];
+                #pragma unroll
+                for (int l = 0; l < 8; l++) vk[l] *= sM[2 * l + g];
+                #pragma unroll
+                for (int c = 0; c < 16; c++) vtmp[c] = sV[w][s][lane & 15][c];
+                VKQ[s] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pf, *(const h16*)vtmp, VKQ[s]);
+            }
+        }
+        __syncthreads();
+    }
     #pragma unroll
     for (int s = 0; s < 8; s++) {
         const float* vk = (float*)&VKQ[s];
