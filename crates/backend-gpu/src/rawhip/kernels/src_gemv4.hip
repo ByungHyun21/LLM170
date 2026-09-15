@@ -438,16 +438,20 @@ extern "C" __global__ void gemm_q5k4_w2(const unsigned* xq, const unsigned* w,
             acc[k] -= yd * (dm * (float)m_v) * (float)qsum;
         }
     }
-    __shared__ double sh32[4][32];
+    // 블록=32: 워프 내 f64 트리 환원(원판과 동일 정밀도 클래스).
     double accd[4];
     #pragma unroll
     for (int k = 0; k < 4; k++) accd[k] = (double)acc[k];
-    // 블록=32: 상반 교환 불필요 — 워프 내 트리만.
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd[k] += __shfl_down_sync(0xffffffffffffffffull, accd[k], off);
+    }
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int k = 0; k < 4; k++) out[(size_t)k * n_out + o] = (float)accd[k];
     }
-    (void)sh32;
 }
 
 // q4_K 4-토큰 GEMV — 워프=행 실험(q5k4_w2 의 성공 처방 이식, plans/74 N3).
@@ -509,8 +513,17 @@ extern "C" __global__ void gemm_q4k4_w2(const unsigned* xq, const unsigned* w,
             acc[k] -= yd * (dm * (float)m_v) * (float)qsum;
         }
     }
+    double accd[4];
+    #pragma unroll
+    for (int k = 0; k < 4; k++) accd[k] = (double)acc[k];
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd[k] += __shfl_down_sync(0xffffffffffffffffull, accd[k], off);
+    }
     if (threadIdx.x == 0) {
         #pragma unroll
-        for (int k = 0; k < 4; k++) out[(size_t)k * n_out + o] = acc[k];
+        for (int k = 0; k < 4; k++) out[(size_t)k * n_out + o] = (float)accd[k];
     }
 }
