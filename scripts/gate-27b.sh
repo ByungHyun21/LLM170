@@ -58,8 +58,11 @@ fi
 
 if [[ "${1:-}" == "--bench" ]]; then
     echo "== 벤치 (pp512 / tg32, ctx 4096, $RUNTIME) =="
-    ./target/release/llm170 bench --model "$MODEL" --pp 512 --tg 0 \
-        --ctx 4096 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| pp"
-    ./target/release/llm170 bench --model "$MODEL" --pp 0 --tg 32 \
-        --ctx 4096 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| tg"
+    # 표준 벤치 지점: pp 512/4k/16k, tg 128
+    for pt in 512 4096 16384; do
+        ./target/release/llm170 bench --model "$MODEL" --pp $pt --tg 0 \
+            --ctx 20480 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| pp"
+    done
+    ./target/release/llm170 bench --model "$MODEL" --pp 512 --tg 128 \
+        --ctx 20480 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| tg"
 fi
