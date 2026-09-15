@@ -29,10 +29,13 @@ pub fn serve(addr: &str, req: InferRequest, backend: BackendSel) -> Result<(), S
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1)
         .clamp(1, 16);
+    // 대기열 기본 512(2026-09-16, 사용자 지시): 대기 작업은 토큰 배열+채널뿐인
+    // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
+    // 503 대신 대기로 흡수한다. LLM170_QUEUE로 재정의 가능.
     let qcap = std::env::var("LLM170_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(64);
+        .unwrap_or(512);
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), backend, slots);
     std::thread::spawn(move || crate::engine::slot_loop(eng, rx, slots));

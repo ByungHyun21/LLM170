@@ -239,3 +239,19 @@ Also fixed on the way: the HTTP server dropped concurrent requests when all
 slots were busy (consumed-then-discarded from the queue -> instant empty
 responses; 6f4f309). With the fix, 4x64 tokens complete 256/256 on a 4-slot
 Flash-Next server.
+
+### 2026-09-16 evening correction: fresh llama np4 reference, stale MTP reference flagged
+
+Measured back-to-back, same host/prompt/conditions (4 concurrent HTTP
+completions, 128 tokens, short shared prompt, ctx 8192/slot, greedy):
+**llama-server 27B np4 = 35.1 t/s** (9.12 t/s per slot, 109.6 ms per 4-row
+step; server log confirms plain eval, no draft) vs **LLM170 26.3 t/s** (0.75x).
+llama's batch step costs 1.30x its single-token step; ours 1.75x.
+
+The previously quoted llama np4+MTP 15.5 t/s is from the older build (ROCm
+7.2.2 era, 11.75k-token slots); the current llama build exposes no flag to
+engage the embedded nextn draft (no --spec-type/--spec-on in --help, no draft
+lines in logs), so the MTP+np4 comparison cell cannot be re-measured on this
+build and the earlier 1.32x ratio was against that stale reference — flagged in
+the README. Against the current build's plain np4 (35.1), our MTP+np4 20.4 is
+0.58x on aggregate; single-stream MTP 14.3 vs plain 11.9 still favors us.
