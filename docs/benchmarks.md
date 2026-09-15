@@ -211,3 +211,12 @@ genuinely cannot serve this kernel shape faster than the scalar f32 tiles. The
 27B long-prefill gap (pp16k 0.80x) therefore has no known lever on this stack;
 attention runs at ~28% of the FP32 peak and MMQ is already llama's own kernel
 at llama's own tile size (J=128, the RDNA3.5 maximum).
+
+### Final integrity sweep (2026-09-16, HEAD 8ff3e62)
+
+- 27B: gates bit-identical; verify.py 16/19 PASS + 3 INFO (spec_np4 exact 4/4);
+  np2 text isolation exact; VL caption semantically correct ("The New York
+  Times ..."); cargo test 12/12; build 0 warnings.
+- Flash-Next: gate bit-identical; np2 dual-sequence run verified semantically
+  (seq0 "The capital of ... Paris", seq1 "... Berlin" - state isolation holds;
+  the two prompts differ only in the city token).
