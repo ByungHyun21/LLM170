@@ -44,6 +44,18 @@ extern "C" __global__ void gemm_q5k4(const unsigned* xq, const unsigned* w,
         unsigned hbit = 1u << sh;
         int qsb = (n_in >> 2) + (n_in >> 5);
         int xw = (sb << 5) >> 2;
+        // 2026-09-16: 니블/하이비트 추출(nibw|bitw)은 **토큰 불변** — 토큰 루프
+        // 밖에서 1회 계산한다(종전 토큰마다 재계산, t=4에서 dot4 외 ALU가 4배).
+        // dot4 순서·누산은 그대로 → 비트 동일.
+        unsigned wv[8];
+        #pragma unroll
+        for (int kk = 0; kk < 8; kk++) {
+            unsigned qv = kk < 4 ? (kk==0?q0:kk==1?q1:kk==2?q2:q3) : (kk==4?q4:kk==5?q5:kk==6?q6:q7);
+            unsigned hv = kk < 4 ? (kk==0?h0:kk==1?h1:kk==2?h2:h3) : (kk==4?h4:kk==5?h5:kk==6?h6:h7);
+            unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+            unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4;
+            wv[kk] = nibw | bitw;
+        }
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             if (k >= t) break;
@@ -53,12 +65,8 @@ extern "C" __global__ void gemm_q5k4(const unsigned* xq, const unsigned* w,
             int isum = 0;
             #pragma unroll
             for (int kk = 0; kk < 8; kk++) {
-                unsigned qv = kk < 4 ? (kk==0?q0:kk==1?q1:kk==2?q2:q3) : (kk==4?q4:kk==5?q5:kk==6?q6:q7);
-                unsigned hv = kk < 4 ? (kk==0?h0:kk==1?h1:kk==2?h2:h3) : (kk==4?h4:kk==5?h5:kk==6?h6:h7);
                 unsigned yv = kk < 4 ? (kk==0?y0:kk==1?y1:kk==2?y2:y3) : (kk==4?y4:kk==5?y5:kk==6?y6:y7);
-                unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
-                unsigned bitw = ((hv & (hbit * 0x01010101u)) >> sh) << 4;
-                isum = dot4(nibw | bitw, yv, isum);
+                isum = dot4(wv[kk], yv, isum);
             }
             int qsum = (int)xk[qsb + (sb << 1)] + (int)xk[qsb + (sb << 1) + 1];
             float yd = __uint_as_float(xk[(n_in >> 2) + sb]);
