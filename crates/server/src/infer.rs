@@ -133,11 +133,11 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                 eprintln!("# backend: gpu (raw hip)");
             }
             let eos = 248044u32;
-            // prefill (시퀀스별 — GDN chunked 경로)
-            let mut last_logits = Vec::with_capacity(n);
             let dbg_topk = std::env::var("LLM170_DEBUG_TOPK")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok());
+            // prefill (시퀀스별 — GDN chunked 경로)
+            let mut last_logits = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
                 if let Some(k) = dbg_topk {
@@ -257,6 +257,18 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                 let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
                 let seq_ids: Vec<usize> = active.clone();
                 let logits = eng.decode(&seq_ids, &toks).map_err(|e| e.to_string())?;
+                if let Some(k) = dbg_topk {
+                    for (i, &s) in active.iter().enumerate() {
+                        let l = &logits[i];
+                        let mut idx: Vec<usize> = (0..l.len()).collect();
+                        idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
+                        let top: Vec<String> = idx[..k.min(l.len())]
+                            .iter()
+                            .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
+                            .collect();
+                        eprintln!("topk-dec seq{s}: {}", top.join(" "));
+                    }
+                }
                 for (i, &s) in active.iter().enumerate() {
                     let t = llm170_core::model::greedy(&logits[i]);
                     next[s] = t;
@@ -320,6 +332,9 @@ fn run_q4_infer(
                     }
                 }
             }
+            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
             let mut next: Vec<u32> = Vec::with_capacity(n);
@@ -358,6 +373,15 @@ fn run_q4_infer(
                 } else {
                     for &s in &active {
                         let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
+                        if let Some(k) = dbg_topk {
+                            let mut idx: Vec<usize> = (0..l.len()).collect();
+                            idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
+                            let top: Vec<String> = idx[..k.min(l.len())]
+                                .iter()
+                                .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
+                                .collect();
+                            eprintln!("topk-dec seq{s}: {}", top.join(" "));
+                        }
                         let t = llm170_core::model::greedy(&l);
                         next[s] = t;
                         pos[s] += 1;

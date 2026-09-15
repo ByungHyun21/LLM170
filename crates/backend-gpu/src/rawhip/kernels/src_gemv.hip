@@ -910,3 +910,95 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q8_0_ids(const unsigned* 
         accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
     if (lane == 0) out[(size_t)r * n_out + o] = (float)accd;
 }
+
+// q8_0 멀티토큰 GEMV — 16레인/행(연속 서브블록) × 무게 1회 독서 (plans/74 N2).
+// gemm_q8_0_mt(64레인/행)은 소형 n_sub(hc up/down=10)에서 레인 효율 15%로
+// np t=4 에 182us/호출(18GB/s)이었다. w16 의 구조에 토큰 누산만 얹는다:
+// 토큰별 산술 순서 = gemm_q8_0_w16(게이트 검증 클래스).
+extern "C" __global__ void __launch_bounds__(128) gemm_q8_0_mt16(
+        const unsigned* xq, const unsigned* w, double* part, float* out,
+        int n_in, int n_out, int xq_w, int tt) {
+    const int lane = threadIdx.x & 31;
+    const int q = lane >> 4;
+    const int t = lane & 15;
+    const int rows_per_block = (blockDim.x >> 5) * 2;
+    const int o = (int)blockIdx.x * rows_per_block + (threadIdx.x >> 5) * 2 + q;
+    if (o >= n_out) return;
+    const int n_sub = n_in >> 5;
+    const int row_base = o * n_sub * 34;
+    float acc[8];
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) acc[ti] = 0.0f;
+    int sb = t;
+    for (; sb + 16 < n_sub; sb += 32) {
+        #pragma unroll
+        for (int u = 0; u < 2; u++) {
+            const int s1 = sb + 16 * u;
+            const int wb = row_base + s1 * 34;
+            const float d = f16w(w, wb);
+            const int wq = wb >> 2;
+            const bool al = (wb & 3) == 2;
+            unsigned wv[8];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                wv[k] = al ? w[wq + 1 + k]
+                           : (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            }
+            const int xw = (s1 << 5) >> 2;
+            #pragma unroll
+            for (int ti = 0; ti < 8; ti++) {
+                if (ti >= tt) break;
+                const unsigned* xrow = xq + (size_t)ti * xq_w;
+                unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+                unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+                int isum = 0;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                        : (k==4?y4:k==5?y5:k==6?y6:y7);
+                    isum = dot4(wv[k], yv, isum);
+                }
+                const float yd = __uint_as_float(xrow[(n_in >> 2) + s1]);
+                acc[ti] += yd * d * (float)isum;
+            }
+        }
+    }
+    if (sb < n_sub) {
+        const int wb = row_base + sb * 34;
+        const float d = f16w(w, wb);
+        const int xw = (sb << 5) >> 2;
+        const int wq = wb >> 2;
+        const bool al = (wb & 3) == 2;
+        unsigned wv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            wv[k] = al ? w[wq + 1 + k]
+                       : (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+        }
+        #pragma unroll
+        for (int ti = 0; ti < 8; ti++) {
+            if (ti >= tt) break;
+            const unsigned* xrow = xq + (size_t)ti * xq_w;
+            unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+            unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                    : (k==4?y4:k==5?y5:k==6?y6:y7);
+                isum = dot4(wv[k], yv, isum);
+            }
+            const float yd = __uint_as_float(xrow[(n_in >> 2) + sb]);
+            acc[ti] += yd * d * (float)isum;
+        }
+    }
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) {
+        if (ti >= tt) break;
+        double accd = (double)acc[ti];
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1)
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off, 16);
+        if (t == 0) out[(size_t)ti * n_out + o] = (float)accd;
+    }
+}

@@ -1155,6 +1155,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         )
     }
 
+
     fn frame_moe_gather(
         &self,
         mix: u64,
@@ -2861,6 +2862,97 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::Accelerator for Q4Acc {
+
+    /// np 행별 conv 1런치 (plans/74 N2) — gdn_conv(t=1) 산술, 상태는 행
+    /// 포인터 테이블. qkv/out은 [t][ch] 연속 프레임 버퍼.
+    fn frame_gdn_conv_np(
+        &self,
+        qkv: u64,
+        out: u64,
+        states: &[u64],
+        cw: u64,
+        ch: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let t = states.len();
+        if t == 0 {
+            return Ok(());
+        }
+        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
+        for &h in states {
+            ptrs.push(self.fptr(h)? as usize);
+        }
+        let tbl = self.ctx.scratch(t * 8)?;
+        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        let (mut q, mut c, mut s_, mut o_) = (
+            self.fptr(qkv)?,
+            self.fptr(cw)?,
+            tbl as *mut std::ffi::c_void,
+            self.fptr(out)?,
+        );
+        let (mut chh, mut kk, mut tt) = (ch as i32, k as i32, t as i32);
+        self.kop(
+            "gdn_conv_np",
+            (ch as u32).div_ceil(64),
+            t as u32,
+            1,
+            64,
+            &mut cargs!(&mut q, &mut c, &mut s_, &mut o_, &mut chh, &mut kk, &mut tt),
+        )
+    }
+    /// np 행별 AR 1런치 (plans/74 N2) — gdn_ar_w_swap(t=1) 산술(scale=1,
+    /// q는 L2Rows+Scale 로 선스케일), 상태는 행 포인터 테이블.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar_np(
+        &self,
+        q: u64,
+        k: u64,
+        v: u64,
+        beta_ge: u64,
+        out: u64,
+        states: &[u64],
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        let t = states.len();
+        if t == 0 {
+            return Ok(());
+        }
+        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
+        for &h in states {
+            ptrs.push(self.fptr(h)? as usize);
+        }
+        let tbl = self.ctx.scratch(t * 8)?;
+        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        let (mut sp, mut qp, mut kp, mut vp, mut bp, mut op_) = (
+            tbl as *mut std::ffi::c_void,
+            self.fptr(q)?,
+            self.fptr(k)?,
+            self.fptr(v)?,
+            self.fptr(beta_ge)?,
+            self.fptr(out)?,
+        );
+        let (mut dd, mut ks, mut vs, mut hv, mut hk, mut sc, mut tt) = (
+            d as i32,
+            (h_k * d) as i32,
+            (h_v * d) as i32,
+            h_v as i32,
+            h_k as i32,
+            1.0f32,
+            t as i32,
+        );
+        // gx=h_v(페어 축 — 커널의 blockIdx.x), gy=d(u 축). 27B rawhip 판과
+        // 동일 순서(2026-09-16 실수로 (d,h_v)로 바꿔써 GPU 메모리 폴트).
+        self.ctx.launch3(
+            "gdn_ar_w_np",
+            h_v as u32,
+            d as u32,
+            1,
+            32,
+            &mut cargs!(&mut sp, &mut qp, &mut kp, &mut vp, &mut bp, &mut op_, &mut dd, &mut ks, &mut vs, &mut hv, &mut hk, &mut sc, &mut tt),
+        )
+    }
     /// plans/73(np): 프레임 버퍼 행 뷰 — 배치 디코드의 per-seq 상태 op용.
     fn frame_slice(&self, h: u64, off_elems: usize, len: usize) -> Result<u64, String> {
         let mut v = self.frames.lock().map_err(|e| e.to_string())?;

@@ -1052,6 +1052,31 @@ impl RawCtx {
         // 멀티토큰 판(2026-09-16, np 배치): t=2..8 q8_0은 무게 행 1회 독서로
         // 토큰별 내적 — grid=(t,n_out) 배치가 토큰마다 무게를 재독하는 것과
         // 달리 가중치 트래픽이 t배 증가하지 않는다. 산술 비트 동일.
+        // plans/74 N2: 소형 n_sub(≤32 — hc up/down=10)는 16레인/행 mt16 판 —
+        // mt(64레인)은 이 형상에서 레인 효율 15%(np t=4 182us/호출 실측).
+        // 킬스위치 LLM170_Q8MT16=0.
+        if t >= 2 && t <= 8 && ty == 8 && n_in / 32 <= 32
+            && std::env::var("LLM170_Q8MT16").as_deref() != Ok("0")
+        {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+                &mut tt_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3(
+                "gemm_q8_0_mt16",
+                n_out.div_ceil(8) as u32,
+                1,
+                1,
+                128,
+                &mut args,
+            );
+        }
         if t >= 2 && t <= 8 && ty == 8 && std::env::var("LLM170_Q8MT").as_deref() != Ok("0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
