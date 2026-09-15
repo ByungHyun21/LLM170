@@ -120,3 +120,78 @@ extern "C" __global__ void argmax64(const float* x, int n, int2* out) {
     }
 }
 
+// np greedy 병렬 argmax (plans/74 N3) — argmax64 는 1블록 64레인이라
+// vocab 248k 스캔에 ~1.2ms(직렬 꼬리). 2단계: s1 은 행×청크 블록 병렬,
+// s2 는 행별 1블록 결합. 동률 최저 인덱스 — (v,-i) 사전식 최대라 결합
+// 순서와 무관하게 결정적(CPU greedy / argmax64 와 동일 의미).
+extern "C" __global__ void argmax_rows_s1(const float* x, int vocab, int2* part, int nblk) {
+    int r = blockIdx.y;
+    int b = blockIdx.x;
+    int chunk = (vocab + nblk - 1) / nblk;
+    int lo = b * chunk;
+    int hi = min(lo + chunk, vocab);
+    const float* xr = x + (size_t)r * vocab;
+    float bv = -3.0e38f;
+    int bi = 0x7fffffff;
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        float v = xr[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    int l = threadIdx.x & 31;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off);
+        int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (l == 0) { sv[threadIdx.x >> 5] = bv; si[threadIdx.x >> 5] = bi; }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        bv = -3.0e38f; bi = 0x7fffffff;
+        int nw = (int)(blockDim.x >> 5);
+        if (threadIdx.x < nw) { bv = sv[threadIdx.x]; bi = si[threadIdx.x]; }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off);
+            int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (threadIdx.x == 0) {
+            part[(size_t)r * nblk + b].x = __float_as_int(bv);
+            part[(size_t)r * nblk + b].y = bi;
+        }
+    }
+}
+
+extern "C" __global__ void argmax_rows_s2(const int2* part, int2* out, int nblk) {
+    int r = blockIdx.x;
+    const int2* p = part + (size_t)r * nblk;
+    float bv = -3.0e38f;
+    int bi = 0x7fffffff;
+    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
+        float v = __int_as_float(p[b].x);
+        int i = p[b].y;
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    __shared__ float sv[2];
+    __shared__ int si[2];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffffffffffull, bv, off);
+        int oi = __shfl_down_sync(0xffffffffffffffffull, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (threadIdx.x == 0) { sv[0] = bv; si[0] = bi; }
+    else if (threadIdx.x == 32) { sv[1] = bv; si[1] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float cv = sv[0], ov2 = sv[1];
+        int ci = si[0], oi2 = si[1];
+        if (ov2 > cv || (ov2 == cv && oi2 < ci)) { cv = ov2; ci = oi2; }
+        out[r].x = __float_as_int(cv);
+        out[r].y = ci;
+    }
+}
+
