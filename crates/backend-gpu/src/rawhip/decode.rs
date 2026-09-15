@@ -1774,9 +1774,14 @@ gmark("attn", &mut marks);
                             // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
                             // `llm170 attn-check` 로 보증된다(사용자 결정 2026-09-12).
                             // LLM170_NO_WK8=1 이면 wk16(4단)으로 복귀.
-                            // plans/73: ILP 판 기본 — 공유 타일 + 키 4 인터리브(비트 동일).
-                            // LLM170_NO_WK8I=1 이면 원판 wk8, LLM170_NO_WK8=1 이면 wk16.
-                            if std::env::var_os("LLM170_NO_WK8I").is_none() {
+                            // plans/73: v_dot2 판은 **옵트인**(LLM170_WK8D=1). QK 는
+                            // 4× 빨라지지만 PV(스레드=dim × 8쿼리)가 스칼라 f32 FMA 로
+                            // 병목을 넘어가 실측 역행 — wk8i 253 vs wk8d 234 t/s@pp16k.
+                            // 구조 교훈(PV/기록의 8쿼리 전부 규약, 완전마스크 타일의
+                            // e=0)은 커널 주석에 남긴다. WMMA급 해법이 다음 과제.
+                            if std::env::var_os("LLM170_WK8D").is_some() {
+                                self.ctx.launch3("qsa_flash_wk8d", ((t + 7) / 8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            } else if std::env::var_os("LLM170_NO_WK8I").is_none() {
                                 self.ctx.launch3("qsa_flash_wk8i", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else if std::env::var_os("LLM170_NO_WK8").is_none() {
                                 self.ctx.launch3("qsa_flash_wk8", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
@@ -1790,6 +1795,15 @@ gmark("attn", &mut marks);
                         }
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
                         self.ctx.launch3("qsa_flash_merge", t as u32, n_head as u32, 1, 256, &mut margs)?;
+                        if let Some(path) = std::env::var_os("LLM170_ATTN_DUMP") {
+                            if full_idx == 0 {
+                                self.ctx.sync().ok();
+                                let mut v = vec![0f32; t * n_head * hd];
+                                self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.aout_t)?;
+                                std::fs::write(&path, bytemuck::cast_slice(&v)).ok();
+                                eprintln!("# attn-dump L0 t={t} n_head={n_head} hd={hd}");
+                            }
+                        }
                     } else {
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                         self.ctx.launch3("qsa_flash", t as u32, n_head as u32, 1, 256, &mut args)?;
