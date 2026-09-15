@@ -1973,7 +1973,8 @@ pub fn wmma2_attn_check() -> Result<String, String> {
         (&mut ss) as *mut _ as *mut c_void, (&mut p0) as *mut _ as *mut c_void,
         (&mut sg) as *mut _ as *mut c_void,
     ];
-    ctx.launch3("qsa_flash_wmma2", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+    let v2 = std::env::var_os("LLM170_WMMA2V2").is_some();
+    ctx.launch3(if v2 { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
     ctx.sync()?;
     let mut got = vec![0f32; t * n_head * nseg * (hd + 2)];
     ctx.d2h(bytemuck::cast_slice_mut(&mut got).as_mut(), pd)?;

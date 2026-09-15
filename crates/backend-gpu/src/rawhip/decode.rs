@@ -1813,7 +1813,8 @@ gmark("attn", &mut marks);
                             // 이면 전 구간 wk8i.
                             if std::env::var_os("LLM170_NO_WMMA2").is_none()
                                 && np_ > 2560 {
-                                self.ctx.launch3("qsa_flash_wmma2", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+                                let v2k = std::env::var_os("LLM170_NO_WMMA2V2").is_none();
+                                self.ctx.launch3(if v2k { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
                             } else if std::env::var_os("LLM170_WK8D").is_some() {
                                 self.ctx.launch3("qsa_flash_wk8d", ((t + 7) / 8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else if std::env::var_os("LLM170_NO_WK8I").is_none() {
