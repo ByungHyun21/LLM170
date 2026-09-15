@@ -499,3 +499,59 @@ extern "C" __global__ void row_shift_gather(const float* src, const float* carry
     int col = i - row * n;
     dst[i] = (row == 0) ? carry[col] : src[(row - 1) * n + col];
 }
+
+// plans/73: gemm_q8_0의 256스레드 판 — hc down[10240→320] 등 저출력 GEMV의
+// 메모리 레벨 병렬성 개선. 원판은 64스레드 고정(스레드당 5서브블록 =
+// 레이턴시 바운드). 256스레드로 스레드당 ~1서브블록.
+extern "C" __global__ void gemm_q8_0_w256(const unsigned* xq, const unsigned* w,
+                                          double* part, float* out, int n_in, int n_out, int xq_w) {
+    int o = blockIdx.y + blockIdx.z * gridDim.y;
+    int l = threadIdx.x;
+    if (o >= n_out || l >= 256) return;
+    xq += (int)blockIdx.x * xq_w;
+    out += (int)blockIdx.x * n_out;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 255 - l) >> 8;
+    int row_base = o * n_sub * 34;
+    float acc = 0.0f;
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 8);
+        if (sb >= n_sub) break;
+        int wb = row_base + sb * 34;
+        float d = f16w(w, wb);
+        int xw = (sb << 5) >> 2;
+        unsigned y0 = xq[xw], y1 = xq[xw+1], y2 = xq[xw+2], y3 = xq[xw+3];
+        unsigned y4 = xq[xw+4], y5 = xq[xw+5], y6 = xq[xw+6], y7 = xq[xw+7];
+        int wq = wb >> 2;
+        bool al = (wb & 3) == 2;
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) {
+                qv = w[wq + 1 + k];
+            } else {
+                qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            }
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            isum = dot4(qv, yv, isum);
+        }
+        float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
+        acc += yd * d * (float)isum;
+    }
+    // 256스레드 트리 환원 — 8워프 → 공유메모리 → 워프 트리
+    __shared__ double sh[256];
+    sh[l] = (double)acc;
+    __syncthreads();
+    if (l < 128) sh[l] += sh[l + 128];
+    __syncthreads();
+    if (l < 64) sh[l] += sh[l + 64];
+    __syncthreads();
+    if (l < 32) {
+        double accd = sh[l] + sh[l + 32];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+        if (l == 0) out[o] = (float)accd;
+    }
+}
