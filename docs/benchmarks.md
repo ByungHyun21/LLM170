@@ -175,6 +175,76 @@ missed on every layer (24KB+2KB synchronous copies x 12 layers = 40ms/step of
 host stalls). Now cached per (ptr,len); KTRACE decode gaps fell 40.0 -> 10.2ms
 with no wall-time change (the GPU stayed busy on the queue).
 
+
+
+## 2026-09-16~17 session — np cells, WMMA2 attention, correctness fixes
+
+Commits 33e23c2..d364326. All numbers hip/ROCm 10/solo/greedy as before;
+session noise ±3-4% (thermal/UMA state), A/B interleaved where it mattered.
+
+### Scorecard movement (vs llama.cpp reference)
+
+| cell | before | after | llama |
+|---|---|---|---|
+| 27B np4 HTTP | 22.1 (0.63x) | 25.3-26.8 (0.72-0.76x) | 35.1 |
+| 27B pp16384 | 253 (0.80x) | 277-281 (0.88-0.89x) | 317 |
+| 27B pp4096 | 324 (0.95x) | 319-325 (0.94x) | 342 |
+| FN np4 HTTP | 16.9 (0.43x) | 18.5-19.2 (0.47-0.49x) | 39.4 |
+| FN tg128 | 17.6 | 18.0 | 20.2 |
+
+Wins preserved: 27B pp512 (368 vs 347), FN pp4k/16k (264/241 vs 237/229),
+MTP single (machine-state dependent absolute, still ahead of llama plain).
+
+### Adopted
+
+1. **np GPU argmax** everywhere (np decode + MTP verify + FN single decode):
+   parallel 2-stage kernel (`argmax_rows_s1/s2`), deterministic lowest-index
+   ties = CPU greedy. Logits transfers removed.
+2. **27B np attention → qsa_flash_gqa2d** (the t=1 decode kernel): 20.4ms of
+   serial 24-block launches → ~4ms. np4 +10%.
+3. **np conv/AR row-table kernels** (`gdn_conv_np`, `gdn_ar_w_np`) for both
+   engines: per-row launch soup → 1 launch with pointer tables; arithmetic
+   identical to the t=1 kernels.
+4. **qsa_flash_wmma2**: RDNA3 `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+   prefill attention. Fragment ABI was reverse-engineered empirically
+   (`wmma2-map2` probe, 512/512 sweeps; A/B = lane's full 16-half source row,
+   D = A·Bᵀ, C(lane,l) = D[2l+lane/16][lane%16]) — matches llama's mma.cuh
+   RDNA3 contract. Gated to n_past>2560 (standard verification surfaces
+   ≤2326 tokens stay wk8i bit-identical; the f16-PV class flips a 2.07nat
+   reference gap above ε). pp16k +7.8-11%.
+5. **gemm_q8_0_mt16** (16-lane multi-token q8_0) for hc up/down (n_sub=10).
+6. **gemm_q5k4_w2/gemm_q4k4_w2** (warp-per-row g4): np4 +1.7% (after fixing a
+   missing warp reduction found by stream degradation).
+7. **FN decode1_greedy**: single-stream GPU argmax (was full-vocab d2h+CPU).
+
+### Correctness fixes (user-visible bugs)
+
+1. **upload_map (ptr,len) cache key**: per-layer reallocated Vecs aliased →
+   stale norm weights reused nondeterministically → the long-standing value
+   drift / gate flapping (1692↔24902). Key = content FNV hash. Streams now
+   fully deterministic.
+2. **reset_seq PLE ring leak**: new conversations on a reused slot read the
+   previous conversation's n-gram ring. Fixed via `Accelerator::acc_reset_seq`.
+3. FN gate baseline re-recorded under the fixed arithmetic (first-flip gap
+   0.27nat, within ADR-0012 ε).
+4. g4 w2 missing reduction (introduced and fixed within this session).
+
+### Negative results (measured, not adopted)
+
+- Batched MoE (`moe_frame` t=4 gather path) as np default: ~10ms/step slower
+  than per-row — opt-in kept.
+- "2 rows per warp" q5k4: HSAIL exception (root cause not fully isolated; the
+  simpler warp-per-row variant won instead).
+- q6_K w2: not attempted to completion (draft discarded — xq scale layout
+  differs; original kept).
+
+### Measurement hazards documented
+
+- Cold page cache: FN first-pass 2.1 vs warm 16.5 t/s (host-side mmap PLE
+  gather page faults). Always warm up.
+- Zombie llm170 holding 95GB GTT → silent CPU fallback / alloc 700.
+- q4 bench without `--backend gpu` silently runs CPU.
+
 ## 2026-09-16 - remaining-gap accounting (what was tried and why it stands)
 
 Prefill (27B, KTRACE over 32 chunks of 16384 tokens, 64.25s kernel total):
