@@ -1286,6 +1286,25 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
             .mtp_step_adv(seq, tok_emb, h, pos)
     }
 
+    /// np greedy — step_batch_np_greedy 위임 (logits 전사 회피).
+    fn raw_step_multi_greedy(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+    ) -> Result<Vec<u32>, String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            crate::rawhip::ktrace_on();
+        }
+        let r = ds.step_batch_np_greedy(seqs, poss, emb);
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            eprintln!("{}", crate::rawhip::ktrace_dump());
+        }
+        r
+    }
+
     fn mtp_step_gpu(
         &self,
         seq: usize,
@@ -2047,24 +2066,23 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         self.ctx.sync()?;
         let _t_a0 = std::time::Instant::now();
         argmaxes.clear();
-        argmaxes.resize(t, 0);
-        // 단일 블록 d2h — 행별 동기 왕복이 사이클당 수백 ms였음 (2026-09-04).
-        let mut all_buf = vec![0f32; t * noh];
-        let t_d0 = std::time::Instant::now();
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[vb] d2h={:.1}ms ({}MB)", t_d0.elapsed().as_secs_f64() * 1e3, t * noh * 4 / 1048576);
-        }
-        let t_am0 = std::time::Instant::now();
-        for ti in 0..t {
-            let mut best = 0usize; let mut bv = f32::NEG_INFINITY;
-            for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
-                if v > bv { bv = v; best = i; }
+        // GPU argmax — t×vocab 플로트 d2h + CPU 스캔 제거 (2026-09-15, plans/74 N1).
+        // LLM170_MS_LOGITS 진단은 전사 경로를 유지한다.
+        if std::env::var_os("LLM170_MS_LOGITS").is_some() {
+            let mut all_buf = vec![0f32; t * noh];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
+            for ti in 0..t {
+                let mut best = 0usize; let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
+                    if v > bv { bv = v; best = i; }
+                }
+                argmaxes.push(best as u32);
             }
-            argmaxes[ti] = best as u32;
+        } else {
+            argmaxes.extend(self.argmax_rows(self.logits_all, t, noh)?);
         }
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[vb] argmax_cpu={:.1}ms", t_am0.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[vb] argmax={:.1}ms", _t_a0.elapsed().as_secs_f64() * 1e3);
         }
 
         Ok(())
@@ -2072,7 +2090,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
 
     /// GDN+conv 상태 GPU 스냅샷 (d2d).
     /// MTP (blk.64) 1스텝 GPU 실행 — CPU mtp_step과 동일 산술 순서.
-    /// tok_emb: 토큰 임베딩 행 [n], h: 트렁크 hidden [n], 반환: (argmax, h_next)
+    /// tok_emb: 토큰 임베딩 행 [n], h: 트런크 hidden [n], 반환: (argmax, h_next)
     pub fn mtp_step_g(
         &self,
         seq: usize,
@@ -2594,6 +2612,27 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         poss: &[u32],
         emb: &[f32],
     ) -> Result<Vec<Vec<f32>>, String> {
+        self.step_batch_np_ex(seqs, poss, emb, false).map(|(l, _)| l)
+    }
+
+    /// np greedy판 — head 후 logits 전사 대신 GPU argmax, 토큰만 회수.
+    /// 산술·상태 갱신은 동일(greedy 플래그는 tail 판독만 갈린다).
+    pub fn step_batch_np_greedy(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+    ) -> Result<Vec<u32>, String> {
+        self.step_batch_np_ex(seqs, poss, emb, true).map(|(_, t)| t)
+    }
+
+    fn step_batch_np_ex(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+        greedy: bool,
+    ) -> Result<(Vec<Vec<f32>>, Vec<u32>), String> {
         if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
             eprintln!("[xf] step_batch_np");
         }
@@ -2890,17 +2929,24 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 self.logits_all,
             )?;
         }
-        let mut out = Vec::with_capacity(t);
-        let mut row = vec![0f32; noh];
-        for s in 0..t {
-            let src = unsafe { self.logits_all.offset((s * noh * 4) as isize) } as *const u8;
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut row).as_mut(), src)?;
-            out.push(row.clone());
-        }
+        let (out, toks) = if greedy {
+            // GPU argmax — 4×608KB d2h + CPU 스캔 + 행별 동기 왕복 제거.
+            // 산술은 CPU greedy와 동일 의미(동률 최저 인덱스, argmax64).
+            (Vec::new(), self.argmax_rows(self.logits_all, t, noh)?)
+        } else {
+            let mut out = Vec::with_capacity(t);
+            let mut row = vec![0f32; noh];
+            for s in 0..t {
+                let src = unsafe { self.logits_all.offset((s * noh * 4) as isize) } as *const u8;
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut row).as_mut(), src)?;
+                out.push(row.clone());
+            }
+            (out, Vec::new())
+        };
         if std::env::var_os("LLM170_NP_TIME").is_some() {
-            eprintln!("[npstep] t={t} {:.1}ms", np_t0.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[npstep] t={t} greedy={greedy} {:.1}ms", np_t0.elapsed().as_secs_f64() * 1e3);
         }
-        Ok(out)
+        Ok((out, toks))
     }
 
     /// np×spec 병합 verify (plans/18) — seq-major 행 그룹. group_starts[i] = seq_i 그룹의
@@ -3202,21 +3248,21 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             self.logits_all,
         )?;
         argmaxes.clear();
-        argmaxes.resize(t, 0);
-        let mut all_buf = vec![0f32; t * noh];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
-        for ti in 0..t {
-            let mut best = 0usize;
-            let mut bv = f32::NEG_INFINITY;
-            for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
-                if v > bv {
-                    bv = v;
-                    best = i;
-                }
-            }
-            argmaxes[ti] = best as u32;
-        }
+        // GPU argmax — t×vocab 전사 회피 (plans/74 N1). MS_LOGITS 진단만 전사.
         if std::env::var_os("LLM170_MS_LOGITS").is_some() {
+            let mut all_buf = vec![0f32; t * noh];
+            self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
+            for ti in 0..t {
+                let mut best = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in all_buf[ti * noh..(ti + 1) * noh].iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        best = i;
+                    }
+                }
+                argmaxes.push(best as u32);
+            }
             for ti in 0..t {
                 let mut top: Vec<(u32, f32)> = all_buf[ti * noh..(ti + 1) * noh]
                     .iter()
@@ -3228,6 +3274,8 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 eprintln!("[mslg] row{ti}: {}", top.iter()
                     .map(|(i, v)| format!("{i}:{v:.3}")).collect::<Vec<_>>().join(" "));
             }
+        } else {
+            argmaxes.extend(self.argmax_rows(self.logits_all, t, noh)?);
         }
         h_all.clear();
         h_all.resize(t * self.n_embd, 0.0);
@@ -3363,6 +3411,31 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         self.ctx.d2h(&mut r, out)?;
         let idx = i32::from_le_bytes([r[4], r[5], r[6], r[7]]);
         Ok(idx as u32)
+    }
+
+    /// [t][row_f32] logits의 행별 GPU argmax — 토큰만 회수 (np greedy/MTP verify).
+    /// 행당 1블록(64레인) 발사 후 8·t 바이트 단일 d2h(d2h가 스트림을 동기화).
+    pub fn argmax_rows(&self, base: *mut u8, t: usize, row_f32: usize) -> Result<Vec<u32>, String> {
+        let sc = self.ctx.scratch(t.max(1) * 8)?;
+        for s in 0..t {
+            let mut xp = unsafe { base.add(s * row_f32 * 4) } as *mut std::ffi::c_void;
+            let mut n2 = row_f32 as i32;
+            let mut op = unsafe { sc.add(s * 8) } as *mut std::ffi::c_void;
+            let mut args = vec![
+                (&mut xp) as *mut _ as *mut std::ffi::c_void,
+                (&mut n2) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch("argmax64", 1, 1, 64, &mut args)?;
+        }
+        let mut r8 = vec![0u8; t * 8];
+        self.ctx.d2h(&mut r8, sc)?;
+        Ok((0..t)
+            .map(|s| {
+                let b = &r8[s * 8..s * 8 + 8];
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]])
+            })
+            .collect())
     }
 
     /// 배치 rms — rows=t.

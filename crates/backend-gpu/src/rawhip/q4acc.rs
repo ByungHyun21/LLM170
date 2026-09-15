@@ -3921,6 +3921,32 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         }
     }
 
+    /// [t][vocab] logits 행별 GPU argmax — np greedy 판정 (plans/74 N1).
+    /// argmax64 = CPU greedy와 동일 의미(동률 최저 인덱스).
+    fn frame_argmax_rows(&self, logits: u64, t: usize, vocab: usize) -> Result<Vec<u32>, String> {
+        let base = self.fptr(logits)?;
+        let sc = self.ctx.scratch(t.max(1) * 8)?;
+        for s in 0..t {
+            let mut xp = unsafe { base.add(s * vocab * 4) } as *mut std::ffi::c_void;
+            let mut n2 = vocab as i32;
+            let mut op = unsafe { sc.add(s * 8) } as *mut std::ffi::c_void;
+            let mut args = vec![
+                (&mut xp) as *mut _ as *mut std::ffi::c_void,
+                (&mut n2) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3("argmax64", 1, 1, 1, 64, &mut args)?;
+        }
+        let mut r8 = vec![0u8; t * 8];
+        self.ctx.d2h(&mut r8, sc)?;
+        Ok((0..t)
+            .map(|s| {
+                let b = &r8[s * 8..s * 8 + 8];
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]])
+            })
+            .collect())
+    }
+
     fn frame_mm(&self, x: u64, w: &llm170_core::matmul::Weight<'_>, out: u64, t: usize) -> Result<(), String> {
         let (xp, op) = (self.fptr(x)?, self.fptr(out)?);
         self.frame_gemm(xp, w, op, t)

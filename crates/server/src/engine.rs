@@ -197,6 +197,9 @@ pub fn slot_loop(
                 cancelled: false,
                 cached: prev_cached,
             };
+            if std::env::var_os("LLM170_SLOT_DBG").is_some() {
+                eprintln!("# slot-dbg: job assigned to slot{i} reuse={reuse}");
+            }
             if reuse > 0 {
                 // 시퀀스 pos는 이미 cached.len() — prefilled=reuse로 잔여만 프리필.
                 eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
@@ -266,19 +269,25 @@ pub fn slot_loop(
                         if !plain.is_empty() {
                             let toks: Vec<u32> = plain.iter().map(|&i| slots[i].next).collect();
                             let seqs: Vec<usize> = plain.clone();
-                            if let Ok(logits) = e.decode(&seqs, &toks) {
-                                for (row, &i) in plain.iter().enumerate() {
-                                    slot_step(&mut slots[i], &logits[row]);
+                            match e.decode_np_greedy(&seqs, &toks) {
+                                Ok(toks) => {
+                                    for (row, &i) in plain.iter().enumerate() {
+                                        slot_emit(&mut slots[i], toks[row]);
+                                    }
                                 }
-                            }
+                                Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
                         }
+                    }
                     } else {
                         let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
                         let seqs: Vec<usize> = active.clone();
-                        if let Ok(logits) = e.decode(&seqs, &toks) {
-                            for (row, &i) in active.iter().enumerate() {
-                                slot_step(&mut slots[i], &logits[row]);
+                        match e.decode_np_greedy(&seqs, &toks) {
+                            Ok(toks) => {
+                                for (row, &i) in active.iter().enumerate() {
+                                    slot_emit(&mut slots[i], toks[row]);
+                                }
                             }
+                            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
                         }
                     }
                 }
@@ -287,12 +296,13 @@ pub fn slot_loop(
                     // 실패 시 decode_batch 내부가 순차 decode1로 폴백한다.
                     if active.len() > 1 {
                         let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-                        if let Ok(logitss) = e.decode_batch(&active, &toks) {
-                            for (row, &i) in active.iter().enumerate() {
-                                if let Some(l) = logitss.get(row) {
-                                    slot_step(&mut slots[i], l);
+                        match e.decode_batch_greedy(&active, &toks) {
+                            Ok(toks) => {
+                                for (row, &i) in active.iter().enumerate() {
+                                    slot_emit(&mut slots[i], toks[row]);
                                 }
                             }
+                            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
                         }
                     } else {
                         for &i in &active {

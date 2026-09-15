@@ -60,6 +60,18 @@ pub trait Accelerator: FrameState + Send + Sync {
         Ok(())
     }
 
+    /// 프레임 logits [t][vocab]의 행별 argmax — GPU 판정 후 토큰만 회수
+    /// (np greedy: vocab×t 플로트 전사 회피). 동률 시 최저 인덱스(CPU greedy와
+    /// 동일 의미). 미구현 백엔드는 Err (호출부 폴백).
+    fn frame_argmax_rows(
+        &self,
+        _logits: u64,
+        _t: usize,
+        _vocab: usize,
+    ) -> Result<Vec<u32>, String> {
+        Err("frame_argmax_rows: 미지원".into())
+    }
+
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn rms_norm(
         &self,
@@ -858,6 +870,17 @@ pub trait RawDecode: Send + Sync {
     /// MTP 체인 스텝 (h = 내부 mtp_cur): argmax. 기본 Err.
     fn mtp_step_chain(&self, _seq: usize, _tok_emb: &[f32], _pos: usize) -> Result<u32, String> {
         Err("mtp_step_chain: 미지원".into())
+    }
+    /// np 배치 디코드 greedy — 행별 토큰만 회수 (logits 전사·CPU 스캔 회피).
+    /// 기본 구현은 raw_step_multi + CPU greedy 폴백.
+    fn raw_step_multi_greedy(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+    ) -> Result<Vec<u32>, String> {
+        let ls = self.raw_step_multi(seqs, poss, emb)?;
+        Ok(ls.iter().map(|l| greedy_from(l)).collect())
     }
     /// MTP 상태 진행 (trunk h, head 없음). 기본 Err.
     fn mtp_step_adv(

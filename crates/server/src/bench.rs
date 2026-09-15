@@ -307,10 +307,11 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     let mut act: Vec<usize> = (0..bench_np).collect();
                     while n_gen < tg * bench_np {
                         let ns: Vec<u32> = act.iter().map(|&s| nexts[s]).collect();
-                        let l = eng.decode(&act, &ns).map_err(|e| e.to_string())?;
+                        // np greedy — logits 전사 회피 (plans/74 N1)
+                        let l = eng.decode_np_greedy(&act, &ns).map_err(|e| e.to_string())?;
                         let mut eos: Vec<usize> = Vec::new();
                         for (i, &s) in act.iter().enumerate() {
-                            nexts[s] = llm170_core::model::greedy(&l[i]);
+                            nexts[s] = l[i];
                             n_gen += 1;
                             if nexts[s] == 248044 {
                                 eos.push(s);

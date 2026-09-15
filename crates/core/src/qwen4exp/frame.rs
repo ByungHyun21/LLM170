@@ -956,6 +956,33 @@ pub fn frame_forward_np(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<Vec<Vec<f32>>, Q4Error> {
+    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, false).map(|(l, _)| l)
+}
+
+/// np greedy판 — head 후 전사 대신 GPU argmax, 토큰만 회수 (plans/74 N1).
+pub fn frame_forward_np_greedy(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seqs: &[usize],
+    seq_sts: &mut [SeqState4],
+    f: &mut Frame4,
+    tokens: &[u32],
+) -> Result<Vec<u32>, Q4Error> {
+    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, true).map(|(_, t)| t)
+}
+
+#[allow(clippy::too_many_lines)]
+fn frame_forward_np_ex(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seqs: &[usize],
+    seq_sts: &mut [SeqState4],
+    f: &mut Frame4,
+    tokens: &[u32],
+    greedy: bool,
+) -> Result<(Vec<Vec<f32>>, Vec<u32>), Q4Error> {
     let hp: &Hparams4 = &model.hp;
     let (n, hc) = (hp.n_embd, hp.hc);
     let k_len = hp.n_group * hp.d_state;
@@ -1074,21 +1101,27 @@ pub fn frame_forward_np(
         op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n })?;
         let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(f.hin, &wout, f.logits_t, t).map_err(Q4Error::Io)?;
-        let mut all = vec![0.0f32; hp.vocab * t];
-        acc.frame_read(f.logits_t, &mut all).map_err(Q4Error::Io)?;
+        let (logits, toks) = if greedy {
+            // GPU argmax — vocab×t 플로트 전사·CPU 스캔 회피 (plans/74 N1).
+            (Vec::new(), acc.frame_argmax_rows(f.logits_t, t, hp.vocab).map_err(Q4Error::Io)?)
+        } else {
+            let mut all = vec![0.0f32; hp.vocab * t];
+            acc.frame_read(f.logits_t, &mut all).map_err(Q4Error::Io)?;
+            if std::env::var_os("LLM170_NP_DBG").is_some() {
+                for r in 0..t {
+                    let row = &all[r * hp.vocab..(r + 1) * hp.vocab];
+                    let (i1, v1) = row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+                    let (i2, v2) = row.iter().enumerate().filter(|(i, _)| *i != i1).max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+                    eprintln!("# npdbg logits row{r}: top2 ({i1},{v1:.4}) ({i2},{v2:.4}) gap={:.4}", v1 - v2);
+                }
+            }
+            ((0..t).map(|r| all[r * hp.vocab..(r + 1) * hp.vocab].to_vec()).collect(), Vec::new())
+        };
         ftime_report(t);
         if ftime_on() {
-            eprintln!("# np-frame-total t={t} {:.1}ms", t_call.elapsed().as_secs_f64() * 1e3);
+            eprintln!("# np-frame-total t={t} greedy={greedy} {:.1}ms", t_call.elapsed().as_secs_f64() * 1e3);
         }
-        if std::env::var_os("LLM170_NP_DBG").is_some() {
-            for r in 0..t {
-                let row = &all[r * hp.vocab..(r + 1) * hp.vocab];
-                let (i1, v1) = row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-                let (i2, v2) = row.iter().enumerate().filter(|(i, _)| *i != i1).max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-                eprintln!("# npdbg logits row{r}: top2 ({i1},{v1:.4}) ({i2},{v2:.4}) gap={:.4}", v1 - v2);
-            }
-        }
-        Ok((0..t).map(|r| all[r * hp.vocab..(r + 1) * hp.vocab].to_vec()).collect())
+        Ok((logits, toks))
     }
 }
 
