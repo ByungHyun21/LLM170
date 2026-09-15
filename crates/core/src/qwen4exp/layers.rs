@@ -312,6 +312,9 @@ impl Engine4 {
 
     /// 슬롯 단위 상태 초기화 (연속 배칭 서버 — 04). dirty[seq]만 표시.
     pub fn reset_seq(&mut self, seq: usize) {
+        if let Some(acc) = self.acc.as_deref() {
+            acc.acc_reset_seq(seq);
+        }
         if let Some(f) = &mut self.frame {
             f.dirty[seq] = true;
         }

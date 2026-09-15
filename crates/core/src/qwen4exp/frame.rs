@@ -1047,6 +1047,15 @@ fn frame_forward_np_ex(
         Vec::new()
     };
 
+    let ck_on = std::env::var_os("LLM170_NP_CHECKSUM").is_some();
+    let ck = |acc: &dyn Accelerator, h: u64, n2: usize, tag: &str| {
+        if !ck_on { return; }
+        let mut v = vec![0.0f32; n2];
+        if acc.frame_read(h, &mut v).is_ok() {
+            let s2: f64 = v.iter().map(|&x| x as f64).sum();
+            eprintln!("[npck] {tag} sum={s2:.6} v0={:.6} v1={:.6}", v[0], v.get(1).copied().unwrap_or(0.0));
+        }
+    };
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
     for il in 0..hp.n_layer {
@@ -1082,17 +1091,21 @@ fn frame_forward_np_ex(
 
         fs_begin(acc, t); // 공유 구간
         // 2) hc attn mix (t 공유)
+        if il < 4 { ck(acc, f.res_hc, 64, &format!("L{il}.res_in")); }
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
+        if il < 4 { ck(acc, f.mix, 64, &format!("L{il}.mix")); }
         sync_mark(acc, &format!("np{il}.hc_attn"), f.mix)?;
 
         // 3) GDN / QSA
         if hp.is_recr(il) {
             gdn_frame_np(acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t)?;
+            if il < 4 { ck(acc, f.ffn_out, 64, &format!("L{il}.gdn")); }
             sync_mark(acc, &format!("np{il}.gdn"), f.ffn_out)?;
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
         } else {
             qsa_frame_np(acc, model, ctx, seq_sts, seqs, f, il, t, full_idx)?;
+            if il < 4 { ck(acc, f.ffn_out, 64, &format!("L{il}.qsa")); }
             sync_mark(acc, &format!("np{il}.qsa"), f.ffn_out)?;
             full_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -1109,8 +1122,10 @@ fn frame_forward_np_ex(
             moe_frame_np(acc, model, f, il, n, seqs)?;
         }
         sync_mark(acc, &format!("np{il}.moe"), f.mout)?;
+        if il < 4 { ck(acc, f.mout, 64, &format!("L{il}.moe")); }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
     }
+    if ck_on { ck(acc, f.res_hc, 64, "head.res"); }
 
     // 5) head — 전 행 GEMM 1회 → [t][vocab] 판독
     {
