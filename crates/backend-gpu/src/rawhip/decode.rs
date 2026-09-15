@@ -2598,6 +2598,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             eprintln!("[xf] step_batch_np");
         }
         let t = seqs.len();
+        let np_t0 = std::time::Instant::now();
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), t * n);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
@@ -2895,6 +2896,9 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             let src = unsafe { self.logits_all.offset((s * noh * 4) as isize) } as *const u8;
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut row).as_mut(), src)?;
             out.push(row.clone());
+        }
+        if std::env::var_os("LLM170_NP_TIME").is_some() {
+            eprintln!("[npstep] t={t} {:.1}ms", np_t0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(out)
     }

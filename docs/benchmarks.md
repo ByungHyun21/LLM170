@@ -255,3 +255,14 @@ lines in logs), so the MTP+np4 comparison cell cannot be re-measured on this
 build and the earlier 1.32x ratio was against that stale reference — flagged in
 the README. Against the current build's plain np4 (35.1), our MTP+np4 20.4 is
 0.58x on aggregate; single-stream MTP 14.3 vs plain 11.9 still favors us.
+
+### 27B np4 gap decomposition (2026-09-16, KTRACE + LLM170_NP_TIME)
+
+Engine step at t=4/ctx8192: **130-134 ms** (LLM170_NP_TIME in-server) vs
+llama's whole-step 109.6 ms (their server's 4-token step inside the 14.6 s
+window). Our wall aggregate 27.1 t/s = ~148 ms/step-equivalent, so the gap
+splits as: ~20 ms engine (GEMMs already weight-amortized through mm_b->g4 -
+verified in the trace; the residue is per-sequence state ops + attention and
+g4 efficiency at t=4) + ~15 ms server-side per-step overhead (4x logits d2h
+2.4 MB + CPU argmax over 4x152k + slot bookkeeping). NOLAUNCH host-logic
+measurement: 0.7 ms/step - the Rust launch-prep path is not a factor.
