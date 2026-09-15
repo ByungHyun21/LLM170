@@ -569,6 +569,9 @@ impl RawCtx {
             // 크기만으로도 부족했다(2026-09-14). 백트레이스는 강제로 잡는다
             // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
+            if std::env::var_os("LLM170_H2D_TRACE").is_some() {
+                eprintln!("# h2d {}B dst={dst:p} q0={:?}", src.len(), &src[..src.len().min(2)]);
+            }
             // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
             if std::env::var_os("LLM170_MEMDBG").is_some() && src.len() >= (1 << 20) {
                 let (mut fb, mut tb) = (0usize, 0usize);
@@ -1041,8 +1044,37 @@ impl RawCtx {
         }
         let mut out_p0 = out as *mut std::ffi::c_void;
         let mut xw_a = xq_w as i32;
-        // plans/73: t=1 소형 n_sub(≤32) q8_0은 워프판 — 64스레드/출력 레이아웃은
-        // hc up[320→10240]에서 10/64 레인만 활동(59GB/s).
+        // plans/73 (2026-09-16): t=1 q8_0 전 형상을 **16레인×4사분면** 판으로 —
+        // 종전 64레인/행은 n_sub=80(qkv/gate)에서 62.5%, n_sub=10(hc up)에서 31%
+        // 레인 효율이었고 그만큼 대역폭이 깎였다(GDN mm_group 15.0ms = 106GB/s).
+        // 산술은 비트 동일(gemm_q8_0_w4 주석의 트리 재구성). 킬스위치 LLM170_Q8W4=0.
+        // 실측(2026-09-16): w4(사분면, 비트 동일) -9%, w16(연속 매핑) -7% —
+        // 둘 다 레인 효율은 100%지만 종전 64레인 판(coalescing·ILP)이 더 빠르다.
+        // 따라서 **기본은 종전 커널**, 실험판은 옵트인(LLM170_Q8W4=1 / Q8W16=1).
+        if t == 1
+            && ty == 8
+            && (std::env::var("LLM170_Q8W4").as_deref() == Ok("1")
+                || std::env::var("LLM170_Q8W16").as_deref() == Ok("1"))
+        {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            let alt = std::env::var("LLM170_Q8W16").as_deref() == Ok("1");
+            return self.launch3(
+                if alt { "gemm_q8_0_w16" } else { "gemm_q8_0_w4" },
+                n_out.div_ceil(8) as u32,
+                t as u32,
+                1,
+                128,
+                &mut args,
+            );
+        }
         if t == 1 && ty == 8 && n_in / 32 <= 32 && std::env::var("LLM170_Q8W").as_deref() != Ok("0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,

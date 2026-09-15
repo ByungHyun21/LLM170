@@ -71,6 +71,11 @@ pub struct Frame4 {
     /// 인덱서 로프 cos/sin 테이블(π n_rot=idx_dim) — 디바이스 선택(plans/73)이
     /// 받아 올린다. qsa_cs와 동일 산술, 다른 n_rot.
     pub qsa_cs_idx: Vec<f32>,
+    /// QSA q/k norm의 헤드 타일 사본 (full_idx 순) — 스텝마다 새 Vec을 만들어
+    /// 가속기 업로드 캐시가 **매 층 미스**하던 것(24KB 동기 복사 ×2/층)을 막는다.
+    /// 포인터가 고정이라 가속기의 포인터 키 캐시가 상주한다.
+    pub qsa_qn_t: Vec<Vec<f32>>,
+    pub qsa_kn_t: Vec<Vec<f32>>,
     // head
     pub hxn: u64,  // [hc·n_embd]
     pub hlo: u64,
@@ -202,6 +207,29 @@ impl Frame4 {
                     }
                 }
                 cs
+            },
+            qsa_qn_t: {
+                // 헤드 타일: qk_norm_rope 커널이 qw[r0·hd..] 형태로 읽는다.
+                let mut v = Vec::new();
+                for il in 0..hp.n_layer {
+                    if hp.is_recr(il) {
+                        continue;
+                    }
+                    let src = model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
+                    v.push(src.iter().copied().cycle().take(src.len() * hp.n_head).collect());
+                }
+                v
+            },
+            qsa_kn_t: {
+                let mut v = Vec::new();
+                for il in 0..hp.n_layer {
+                    if hp.is_recr(il) {
+                        continue;
+                    }
+                    let src = model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
+                    v.push(src.iter().copied().cycle().take(src.len() * hp.n_kv).collect());
+                }
+                v
             },
             hxn: at(hc * n)?,
             hlo: at(hlo_n)?,
@@ -720,6 +748,7 @@ fn qsa_frame(
     let w_ik = model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
     // 1) 5투영 — 디바이스 그룹 1호출(왕복 0). wq 출력 [t][n_head·2hd]는 어텐션
     //    커널의 q 레이아웃(q‖게이트 인터리브)과 정확히 일치(plans/67 위험 항 해소).
+    let t_mm = std::time::Instant::now();
     acc.frame_mm_group(
         f.mix,
         &[wq, wk, wv, w_iq, w_ik],
@@ -727,6 +756,8 @@ fn qsa_frame(
         t,
     )
     .map_err(Q4Error::Io)?;
+    if qtm { eprintln!("# qsa-frame L{il} t={t} proj-mm={:.2}ms", t_mm.elapsed().as_secs_f64()*1e3); }
+    let t_rp = std::time::Instant::now();
     sync_mark(acc, "qsa.mm_group", f.qsa_q)?;
     // 2) q/k norm+rope in-place — 커널 산술은 호스트 rms_norm(sq_sum 32세그먼트
     //    f64)+rope_head(f64 회전)와 동일열(비트 동일 기대).
@@ -735,15 +766,13 @@ fn qsa_frame(
     // (decode 경로는 rawinject가 타일해 업로드 — ssm_norm 타일링과 같은 규약).
     // 공유 [hd] 원본을 그대로 올리면 24헤드 분량(6144)을 256원소 버퍼에서 읽어
     // illegal address(700)로 폭주한다 — plans/67 2c 연결 시 실측 발견(2026-09-14).
-    let qn_raw = model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
-    let kn_raw = model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
-    let qn: Vec<f32> = qn_raw.iter().copied().cycle().take(qn_raw.len() * n_head).collect();
-    let kn: Vec<f32> = kn_raw.iter().copied().cycle().take(kn_raw.len() * n_kv).collect();
+    let (qn, kn) = (&f.qsa_qn_t[full_idx], &f.qsa_kn_t[full_idx]);
     acc.frame_qk_norm_rope(
-        f.qsa_q, f.qsa_k, &qn, &kn, &f.qsa_cs, hp.eps, pos0 as usize,
+        f.qsa_q, f.qsa_k, qn, kn, &f.qsa_cs, hp.eps, pos0 as usize,
         n_head, n_kv, hd, n_rot, t,
     )
     .map_err(Q4Error::Io)?;
+    if qtm { eprintln!("# qsa-frame L{il} t={t} rope={:.2}ms", t_rp.elapsed().as_secs_f64()*1e3); }
     sync_mark(acc, "qsa.qkrope", f.qsa_k)?;
     if qtm {
         eprintln!("# qsa-frame L{il} t={t} mm+rope={:.2}ms", t_qsa.elapsed().as_secs_f64() * 1e3);
@@ -758,8 +787,11 @@ fn qsa_frame(
     let kq_scale = hp.kq_scale();
     let r = hp.compress[il] as usize;
     if t == 1 && std::env::var_os("LLM170_QSA_HOSTSEL").is_none() {
+        let t_w = std::time::Instant::now();
         let iqw = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        if qtm { eprintln!("# qsa-frame L{il} w-extract={:.2}ms", t_w.elapsed().as_secs_f64()*1e3); }
+        let t_s = std::time::Instant::now();
         let dev = acc
             .qsa_sel_dev(
                 full_idx, seq, f.qsa_iq, f.qsa_ik, t, pos0 as usize,
@@ -767,13 +799,18 @@ fn qsa_frame(
                 &iqw, &ikw, &f.qsa_cs_idx, hp.eps,
             )
             .and_then(|(sd, od, list_len)| {
+                if qtm { eprintln!("# qsa-frame L{il} sel_dev={:.2}ms", t_s.elapsed().as_secs_f64()*1e3); }
+                let t_kv = std::time::Instant::now();
                 acc.qsa_kv_dev(full_idx, seq, f.qsa_k, f.qsa_v, t, pos0 as usize, n_kv, hd)
                     .and_then(|(kc, vc)| {
-                        acc.qsa_attention_dev_sel(
+                        if qtm { eprintln!("# qsa-frame L{il} kv_dev={:.2}ms", t_kv.elapsed().as_secs_f64()*1e3); }
+                        let t_attn = std::time::Instant::now();
+                        let r = acc.qsa_attention_dev_sel(
                             f.qsa_q, kc, vc, sd, od, list_len, kq_scale,
                             n_head, n_kv, hd, t, f.qsa_attn,
-                        )
-                        .map(|_| (sd, od, list_len))
+                        );
+                        if qtm { eprintln!("# qsa-frame L{il} attn_sel={:.2}ms", t_attn.elapsed().as_secs_f64()*1e3); }
+                        r.map(|_| (sd, od, list_len))
                     })
             });
         match dev {
