@@ -2005,16 +2005,16 @@ pub fn wmma2_attn_check() -> Result<String, String> {
                 for d in 0..hd { acc[d] += e * vv[(k * n_kv + kvh) * hd + d]; }
             }
             // 호스트 merge
-            let mut M = f32::NEG_INFINITY;
+            let mut m_all = f32::NEG_INFINITY;
             for sgi in 0..nseg {
                 let b = ((row * n_head + hh) * nseg + sgi) * (hd + 2);
-                M = M.max(got[b + hd]);
+                m_all = m_all.max(got[b + hd]);
             }
             let mut num = vec![0f32; hd];
             let mut den = 0f32;
             for sgi in 0..nseg {
                 let b = ((row * n_head + hh) * nseg + sgi) * (hd + 2);
-                let w = (got[b + hd] - M).exp();
+                let w = (got[b + hd] - m_all).exp();
                 den += got[b + hd + 1] * w;
                 for d in 0..hd { num[d] += got[b + d] * w; }
             }
