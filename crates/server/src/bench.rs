@@ -295,6 +295,38 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                             n_gen += 1;
                         }
                     }
+                } else if bench_np > 1 {
+                    // np 집계(스펙 없음) — 종전엔 seq0만 디코드해 np 셀을 못 채웠다.
+                    // llama-server np4 슬롯과 동일 조건으로 전 슬롯에 같은 프롬프트를
+                    // 프리필한 뒤(집계 시간 제외) 배치 디코드로 tg*bench_np 생성.
+                    for s in 1..bench_np {
+                        eng.prefill(s, &prompt).map_err(|e| e.to_string())?;
+                    }
+                    let t_np = Instant::now();
+                    let mut nexts: Vec<u32> = vec![next; bench_np];
+                    let mut act: Vec<usize> = (0..bench_np).collect();
+                    while n_gen < tg * bench_np {
+                        let ns: Vec<u32> = act.iter().map(|&s| nexts[s]).collect();
+                        let l = eng.decode(&act, &ns).map_err(|e| e.to_string())?;
+                        let mut eos: Vec<usize> = Vec::new();
+                        for (i, &s) in act.iter().enumerate() {
+                            nexts[s] = llm170_core::model::greedy(&l[i]);
+                            n_gen += 1;
+                            if nexts[s] == 248044 {
+                                eos.push(s);
+                            }
+                        }
+                        // EOS 시퀀스 퇴출(집계 지속) — 남은 시퀀스만 다음 배치 참여
+                        if !eos.is_empty() && eos.len() < act.len() {
+                            act.retain(|s| !eos.contains(s));
+                        }
+                    }
+                    let el = t_np.elapsed().as_secs_f64() * 1e3;
+                    lines.push(format!(
+                        "tg{tg} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {n_gen})",
+                        n_gen as f64 / (el / 1e3)
+                    ));
+                    continue;
                 } else {
                     while n_gen < tg {
                         next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;

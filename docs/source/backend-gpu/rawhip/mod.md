@@ -85,3 +85,12 @@ gaps are the host work for whatever runs next, not the routing. The other gaps a
 work after each small launch.
 
 
+
+## gemm_mmq y workspace (2026-09-15): J-row slack required
+
+The MMQ y (activation) workspace is sized in `gemm_mmq`/`gemm_mmq_s`. The tile
+kernel reads whole 128-row y tiles, so a non-multiple-of-128 `t` reads past the
+last real row; llama.cpp's `nbytes_src1_q8_1` adds
+`J_max*sizeof(block_q8_1_mmq)` for this reason. Both pools now add
+`MMQ_Y_SLACK = 128*144` bytes. Repro that caught it: np+MTP verify with
+carried rows reaching t=33 -> `mul_mat_q<Q5_K,128>` memory fault.
