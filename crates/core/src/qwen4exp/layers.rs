@@ -603,7 +603,11 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
             }
             let ctx = Ctx { model: &self.model, acc: Some(acc) };
-            super::frame::decode_frame_greedy(acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token)
+            let r3 = super::frame::decode_frame_greedy(acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token);
+            if std::env::var_os("LLM170_KTRACE").is_some() {
+                acc.ktrace_tick();
+            }
+            r3
         })();
         match r {
             Ok(tok) => {
