@@ -92,9 +92,10 @@ per-token accumulation, bit-identical arithmetic) removed the per-row weight
 re-read — while per-sequence state (GDN conv ring, AR, QSA rope/selection/KV,
 PLE) runs per row at t=1 through row views. np4 output is token-identical to
 sequential decoding (52/52 verified; np2 shows one documented near-tie flip,
-logit gap 0.13). The remaining gap is the MoE: rows pick different experts, so
-expert weights cannot be shared — dedup/grouping by expert id is the recorded
-next lever.)
+logit gap 0.13). The remaining gap is structural: rows pick different experts
+(diverse prompts share almost none), so the MoE weight traffic is irreducibly
+per-row — dedup would only pay under identical-prompt routing, i.e. the
+benchmark condition itself, which is not optimized for on principle.)
 
 Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 

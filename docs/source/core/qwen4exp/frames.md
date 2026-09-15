@@ -71,3 +71,16 @@ shareable; batched gather variant saves only ~10ms and reorders the weighted
 sum, opt-in `LLM170_NP_MOE_BATCH=1`), gdn 26.4, hc up 16.0, rms 18.5,
 qsa 14.1, down 8.5. llama-server reference on the same host: 39.4 — the
 remaining gap is expert-id dedup/grouped MoE GEMMs plus small-kernel work.
+
+### Why expert dedup is NOT the next lever after all (2026-09-16, closing note)
+
+The recorded "expert-id dedup/grouping" lever was re-analyzed and dropped: rows
+in an np batch pick their own top-10 of 512 experts, so for *diverse* prompts
+the pick multiplicity is ~1.05-1.2x - dedup saves essentially nothing. It only
+pays when the rows share routing (identical or near-identical prompts), which
+is exactly the benchmark condition (same prompt in all slots) - optimizing that
+path would game the measurement rather than serve real traffic, and llama's
+39.4 reference was collected under the same condition without dedup. The np4
+cell therefore stands at 0.55x as a structural gap: the MoE is the irreducible
+per-row weight traffic (rows share no experts), and the remaining headroom is
+the same small-kernel/launch work that bounds single-stream decode.
