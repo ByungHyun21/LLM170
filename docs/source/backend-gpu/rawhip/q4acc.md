@@ -1399,3 +1399,42 @@ per QSA layer per step; now FNV-hash keyed (qn/kn) and ptr-keyed (cs).
 
 Measured: tg128@short 13.40 → 14.97 → **16.78 t/s**; tg64@16k 11.3 → 13.6 →
 **16.11 t/s**. pp unchanged (273 vs 269 at pp4k).
+
+## plans/73 session 2 — PLE device path (2026-09-15 afternoon)
+
+`ple_math_dev` (trait method) + three kernels replace the t=1 PLE host
+bridge: `q4_ple_gate` (per-stream grouped norms with the 32-segment f64
+mirror via `ple_rms_scale`, serial-order dot, sigmoid gate, value
+broadcast, conv-input norm), `q4_ple_conv` (dilated depthwise conv +
+silu + ring update), `q4_ple_residual`. The host keeps only the n-gram
+hash and the mmap gather (GPU-independent, run at step start). Norm
+weights use `exp_cr_exact` — a new always-precise f64-Horner exp in
+src_common (FASTEXP-independent) because the host ple_block sigmoid/silu
+require bit-matching exp.
+
+Two defects found by the new probes (`llm170 q4-ple-check` synthetic
+mirror, `LLM170_PLE_CHECK` end-to-end shadow that diffs res_hc against a
+host recompute from the captured pre-PLE state):
+1. the sigmoid argument was missing its negation — gates came out as
+   exact complements (dev+host = 1.0000 spotted in the diff);
+2. norm weights needed the per-stream slice offset (nk[s*n_embd..], not
+   nk[0..]).
+Also: the device ring's first-use host init must check `ptr.is_null()`
+BEFORE `ensure()` (ensure sets the pointer, so the check after it never
+fires — uninitialized ring memory).
+
+After fixes: `LLM170_PLE_CHECK` reports max|dev-host| = 0.000e0 across
+steps and the Flash-Next gate is bit-identical. Ring rewind (bench
+warmup restart) re-initializes from the host ring via a watermark.
+
+Measured: tg128@short 16.78 → **17.54 t/s**, tg64@16k 16.11 → **16.83**,
+tg128@4k 17.14. Session totals: 13.40 → 17.54 (+31%), 11.3 → 16.83 (+49%).
+
+`gemm_q5k_v2` (the dormant llama-mmvq vdr=2 port) was wired to an opt-in
+route and A/B'd for 27B decode: 10.83 vs 11.35 t/s (slower) — default
+off, LLM170_Q5KV2=1 opts in.
+
+llama-reference verify.py collection remains blocked in this environment
+(four attempts): CPU mode dies on long prompts (30GB RAM), GPU mode dies
+on amdgpu queue eviction at the first request. The gates' bit-identity
+carries the last verified llama equivalence.
