@@ -41,8 +41,10 @@ The runtime is the TheRock ROCm 10.0.0 userspace for gfx1151
 the gate/bench scripts default to it with fallback to the system 7.2.2.
 Switching the runtime alone moved llama.cpp +28-41% on prefill, which is why
 all comparisons are now quoted on the equal ROCm 10 footing.
-Qwen3.8-Flash-Next (125B hybrid) on the same stack: pp2048 **288 t/s**,
-decode 81.7 ms/step at 8k context.
+Qwen3.8-Flash-Next (177B-A3B hybrid, 103.7 GiB) on the same stack:
+pp2048 **288 t/s** (llama.cpp 240.0 → **1.21×**), decode 75 ms/step
+(13.3 t/s vs llama 17.8 — 0.75×; the gap is the dense GDN backbone +
+MoE expert GEMV bandwidth, analyzed in benchmarks.md §2026-09-15).
 
 At longer contexts the HIP backend holds its lead on prompt processing
 (pp3314 337.9 t/s vs llama-bench ROCm 10 314.4, **1.07×**) and decodes at
