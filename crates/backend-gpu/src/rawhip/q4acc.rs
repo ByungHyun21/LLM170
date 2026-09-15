@@ -4013,24 +4013,48 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         }
     }
 
+    /// KTRACE 진단 훅 — 스텝 단위 덤프+재시작(core→백엔드 의존 방향 존중).
+    fn ktrace_tick(&self) {
+        eprintln!("{}", crate::rawhip::ktrace_dump());
+        crate::rawhip::ktrace_on();
+    }
+
     /// [t][vocab] logits 행별 GPU argmax — np greedy 판정 (plans/74 N1).
     /// argmax64 = CPU greedy와 동일 의미(동률 최저 인덱스).
     fn frame_argmax_rows(&self, logits: u64, t: usize, vocab: usize) -> Result<Vec<u32>, String> {
         let base = self.fptr(logits)?;
-        let sc = self.ctx.scratch(t.max(1) * 8)?;
-        for s in 0..t {
-            let mut xp = unsafe { base.add(s * vocab * 4) } as *mut std::ffi::c_void;
-            let mut n2 = vocab as i32;
-            let mut op = unsafe { sc.add(s * 8) } as *mut std::ffi::c_void;
+        // 병렬 2단계(plans/74 N3) — argmax64 1블록 판은 vocab 248k 에서
+        // ~1.2ms/행 직렬 꼬리(FN np4 KTRACE 4.6ms/step).
+        let nblk = (vocab / 4096).clamp(1, 64) as u32;
+        let part = self.ctx.scratch(t.max(1) * nblk as usize * 8)?;
+        let outb = self.ctx.scratch(t.max(1) * 8 + 8 * nblk as usize * t.max(1))?;
+        let out = unsafe { outb.add(t.max(1) * nblk as usize * 8) };
+        {
+            let mut xp = base as *mut std::ffi::c_void;
+            let mut vb = vocab as i32;
+            let mut pp = part as *mut std::ffi::c_void;
+            let mut nb = nblk as i32;
             let mut args = vec![
                 (&mut xp) as *mut _ as *mut std::ffi::c_void,
-                (&mut n2) as *mut _ as *mut std::ffi::c_void,
-                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut vb) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx.launch3("argmax64", 1, 1, 1, 64, &mut args)?;
+            self.ctx.launch3("argmax_rows_s1", nblk, t.max(1) as u32, 1, 256, &mut args)?;
+        }
+        {
+            let mut pp = part as *mut std::ffi::c_void;
+            let mut op = out as *mut std::ffi::c_void;
+            let mut nb = nblk as i32;
+            let mut args = vec![
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3("argmax_rows_s2", t.max(1) as u32, 1, 1, 64, &mut args)?;
         }
         let mut r8 = vec![0u8; t * 8];
-        self.ctx.d2h(&mut r8, sc)?;
+        self.ctx.d2h(&mut r8, out)?;
         Ok((0..t)
             .map(|s| {
                 let b = &r8[s * 8..s * 8 + 8];

@@ -527,9 +527,13 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             }
         }
         let ctx = Ctx { model: &self.model, acc: Some(acc) };
-        super::frame::frame_forward_np_greedy(
+        let r2 = super::frame::frame_forward_np_greedy(
             acc, &self.model, &ctx, seqs, &mut self.seqs, f, tokens,
-        )
+        );
+        if std::env::var_os("LLM170_KTRACE").is_some() {
+            acc.ktrace_tick();
+        }
+        r2
     })();
     match r {
         Ok(toks) => {
