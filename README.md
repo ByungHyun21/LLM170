@@ -49,7 +49,7 @@ unchanged under MTP+np4:
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | 11.1 (4k) / 11.5 (16k) | — | 9.2 | — | 11.6 / 11.9 |
+| tg single | — | 11.3-11.6 (4k) / 10.8-11.5 (16k) | — | 9.2 | — | 11.6 / 11.9 |
 | MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP, old build) |
 | np4 aggregate | 374 (pp512) | **25.1** | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
 | MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 *(old build)* |
@@ -57,8 +57,9 @@ unchanged under MTP+np4:
 Conditions for the filled 2026-09-16 cells: HIP, ROCm 10, greedy, natural-text
 prompt, same host. np cells are 4 concurrent HTTP completions (128 tokens each,
 short shared prompt, ctx 8192/slot) measured back-to-back on both engines:
-**LLM170 np4 26.3 vs llama-server 35.1 t/s (0.75x)** — llama's 4-row batch step
-costs 1.30x its single-token step, ours 1.75x. MTP = `--spec 3` with the gguf's
+**LLM170 np4 25.3-26.8 vs llama-server 35.1 t/s (0.72-0.76x)** — llama's 4-row
+batch step costs 1.30x its single-token step, ours ~1.6x after the 2026-09-16
+session (GPU argmax, gqa2d attention, batched conv/AR, warp-per-row g4). MTP = `--spec 3` with the gguf's
 own nextn head (acceptance 4/4 per cycle, token-identical to greedy).
 
 llama's np4+MTP 15.5 t/s reference is from the **older** llama build (ROCm
@@ -73,7 +74,7 @@ MTP+np4 20.4 is 0.58x — aggregate throughput favors llama; single-stream MTP
 
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
-| LLM170 hip | **270** | **243** | 18.0 | 17.9 |
+| LLM170 hip | **264** | **241** | 17.5-18.0 | 16.8-17.5 |
 | LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
 
@@ -86,14 +87,14 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | **18.0** (ctx 4k) / **17.9** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
+| tg single | — | **17.5-18.0** (ctx 4k) / **16.8-17.5** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
 | MTP single | — | — | — | — | — | — |
 | np4 aggregate | — | **21.0-22.5** | TFNPP4V | TFNP4V | — | **39.4** |
 | MTP + np4 | — | — | — | — | — | — |
 
 (Flash-Next np4, measured 2026-09-16 same-host/same-prompt HTTP 4-way:
-**LLM170 21.0-22.5 t/s aggregate** vs **llama-server 39.4 t/s** (0.55x). The
-frame now batches np decode (2026-09-16): weight-streaming GEMMs run once for
+**LLM170 18.5-19.2 t/s aggregate** vs **llama-server 39.4 t/s** (0.47-0.49x).
+The frame batches np decode (2026-09-16): weight-streaming GEMMs run once for
 all rows — a new multi-token q8_0 GEMV (`gemm_q8_0_mt`, one weight-row read,
 per-token accumulation, bit-identical arithmetic) removed the per-row weight
 re-read — while per-sequence state (GDN conv ring, AR, QSA rope/selection/KV,
