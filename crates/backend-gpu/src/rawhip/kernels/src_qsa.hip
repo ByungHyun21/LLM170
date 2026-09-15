@@ -954,6 +954,7 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8d(
 // PV 경로 프로브: A = P(16x16, ldm=16) / B = V(16키 x 256dim, **row_major**, ldm=256).
 // 어텐션 커널의 PV 와 동일 패턴 — ldm 프로브(mode2)는 col_major(K)만 검증했다.
 extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* c) {
+
     __shared__ half sp[16 * 16];
     __shared__ half sv[16 * 256];
     for (int i = threadIdx.x; i < 16 * 16; i += blockDim.x) sp[i] = __float2half(p[i]);
@@ -969,6 +970,119 @@ extern "C" __global__ void wmma_probe_pv(const float* p, const float* v, float* 
     int lane = threadIdx.x & 31;
     #pragma unroll
     for (int sl = 0; sl < 8; sl++) c[lane + (sl << 5)] = fc.x[sl];
+}
+
+// ─── plans/73: PLE 디바이스 포팅(디코드) ───
+// ple_bridge는 스텝당 4.5-11ms(레이어 1의 동기 d2h + CPU mm_batch 투영 2회
+// [2560→10240] + 호스트 원소연산)이었다. 해시/gather는 GPU 무의존이라 호스트가
+// 스텝 초에 수행하고, 투영은 프레임 GEMM, 아래 3커널이 수학을 맡는다.
+// 산술은 stages/ple.rs 의 루프 순서를 **그대로** — 스레드당 (t,s) 직렬로
+// 미러해 비트 동일(rms_norm 32세그 f64, dot i-오름차순 f32 직렬, silu/sigmoid
+// 는 공유 exp_cr).
+
+// (1) 게이트+방송+그룹 norm: k_n=rms(key[s]), q_n=rms(res[s]) → gate →
+//     gated=value·gate → rms(n_conv) → gated_hist. gate_out은 (3)이 재사용.
+//     스레드 = (토큰, 스트림). 2560 원소 ×수 패스 — μs급.
+DEV float ple_rms_scale(const float* x, int n_embd, float eps) {
+    const int chunk = (n_embd + 31) >> 5;
+    float parts[32];
+    #pragma unroll
+    for (int u = 0; u < 32; u++) {
+        float acc = 0.0f;
+        const int lo = u * chunk, hi = min(lo + chunk, n_embd);
+        for (int i = lo; i < hi; i++) { const float dv = x[i]; acc += dv * dv; }
+        parts[u] = acc;
+    }
+    double sum = 0.0;
+    #pragma unroll
+    for (int u = 0; u < 32; u++) sum += (double)parts[u];
+    return 1.0f / (float)sqrt(sum / (double)n_embd + (double)eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) q4_ple_gate(
+        const float* __restrict__ res, const float* __restrict__ key,
+        const float* __restrict__ value,
+        const float* __restrict__ nk, const float* __restrict__ nq,
+        const float* __restrict__ nc,
+        float* __restrict__ gated_hist, float* __restrict__ gate_out,
+        float eps, int n_embd, int hc, int t) {
+    const int s = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int ti = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (s >= hc || ti >= t || lane != 0) return;
+    const float* ks_row = key + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    const float* rs_row = res + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    const float sk = ple_rms_scale(ks_row, n_embd, eps);
+    const float sq = ple_rms_scale(rs_row, n_embd, eps);
+    // dot: k_n[i]·q_n[i] 를 i 오름차순 f32 직렬 누산(호스트와 동일).
+    // k_n[i] = (key[i]·sk)·nk[i] — 저장 없이 동일 반올림 사슬로 재현.
+    float dot = 0.0f;
+    const float* nk_s = nk + (size_t)s * n_embd;   // 노름 가중치는 스트림별 슬라이스
+    const float* nq_s = nq + (size_t)s * n_embd;
+    for (int i = 0; i < n_embd; i++) {
+        const float a = (ks_row[i] * sk) * nk_s[i];
+        const float b = (rs_row[i] * sq) * nq_s[i];
+        dot += a * b;
+    }
+    dot /= (float)sqrt((float)n_embd);
+    const float mag = fmaxf(fabsf(dot), 1e-6f);
+    const float g = 1.0f / (1.0f + exp_cr_exact(dot >= 0.0f ? -sqrtf(mag) : sqrtf(mag)));
+    gate_out[(size_t)ti * hc + s] = g;
+    // gated = value·gate → rms(n_conv). value는 [t][n_embd] 스트림 공유.
+    const float* val = value + (size_t)ti * n_embd;
+    float* out = gated_hist + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+    for (int i = 0; i < n_embd; i++) out[i] = val[i] * g;
+    const float sg = ple_rms_scale(out, n_embd, eps);
+    for (int i = 0; i < n_embd; i++) out[i] = out[i] * sg * nc[(size_t)s * n_embd + i];
+}
+
+// (2) dilated depthwise conv(kern=4, dil=3, hist=9) + silu + 링 갱신.
+//     out[c] = Σ_k conv_w[c·kern+k]·padded[hist+ti-(kern-1-k)·dil][c] (k 오름차순).
+//     링 st[j] = padded[t+j] (마지막 hist 열).
+extern "C" __global__ void __launch_bounds__(256) q4_ple_conv(
+        const float* __restrict__ gated_hist, const float* __restrict__ conv_w,
+        float* __restrict__ ring, float* __restrict__ conv_out,
+        int hc_dim, int t, int kern, int dil, int hist) {
+    const int c = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= hc_dim) return;
+    for (int ti = 0; ti < t; ti++) {
+        float acc = 0.0f;
+        for (int k = 0; k < kern; k++) {
+            const int start = hist + ti - (kern - 1 - k) * dil;
+            const float* src;
+            float tmp;
+            if (start >= hist) src = gated_hist + (size_t)(start - hist) * hc_dim + c;
+            else src = ring + (size_t)start * hc_dim + c;
+            acc += conv_w[c * kern + k] * (*src);
+            (void)tmp;
+        }
+        conv_out[(size_t)ti * hc_dim + c] = acc / (1.0f + exp_cr_exact(-acc));
+    }
+    // 링 갱신(스레드 c별): st[j] = padded[t+j] — t<hist 일부는 기존 링 이동.
+    for (int j = 0; j < hist; j++) {
+        const int src_col = t + j;   // padded 인덱스
+        float v;
+        if (src_col >= hist) v = gated_hist[(size_t)(src_col - hist) * hc_dim + c];
+        else v = ring[(size_t)src_col * hc_dim + c];
+        ring[(size_t)j * hc_dim + c] = v;
+    }
+}
+
+// (3) 잔차: res[s·n+i] += value[i]·g + conv_out[s·n+i] — 호스트 식 그대로
+//     ((value·g) + conv_out) 를 한 번에 가산.
+extern "C" __global__ void q4_ple_residual(
+        float* __restrict__ res, const float* __restrict__ value,
+        const float* __restrict__ gate_out, const float* __restrict__ conv_out,
+        int n_embd, int hc, int t) {
+    const int i = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    for (int ti = 0; ti < t; ti++) {
+        const float v = value[(size_t)ti * n_embd + i];
+        for (int s = 0; s < hc; s++) {
+            const size_t idx = (size_t)ti * hc * n_embd + (size_t)s * n_embd + i;
+            res[idx] += v * gate_out[(size_t)ti * hc + s] + conv_out[idx];
+        }
+    }
 }
 
 // WMMA prefill 어텐션 (hd=256, 진단용). 조기 반환 없음(모든 가드가 플래그), 그래서

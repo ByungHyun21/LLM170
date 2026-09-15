@@ -142,6 +142,14 @@ pub struct Q4Acc {
     qn_cache: std::sync::Mutex<(u64, usize)>,
     kn_cache: std::sync::Mutex<(u64, usize)>,
     cst_cache: std::sync::Mutex<(usize, usize)>,
+    /// plans/73: PLE conv 링 상주 상태 [seq] + 워터마크(접두 되감기 검출).
+    ple_ring: std::sync::Mutex<std::collections::HashMap<usize, GBuf>>,
+    ple_ring_pos: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    /// PLE norm/conv 상수(콘텐츠 해시 1회 업로드).
+    ple_nk: std::sync::Mutex<(u64, GBuf)>,
+    ple_nq: std::sync::Mutex<(u64, GBuf)>,
+    ple_nc: std::sync::Mutex<(u64, GBuf)>,
+    ple_cw: std::sync::Mutex<(u64, GBuf)>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -339,6 +347,12 @@ impl Q4Acc {
             qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idx_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_iqr: std::sync::Mutex::new(GBuf::new("qsa_iqr")),
+            ple_ring: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_ring_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_nk: std::sync::Mutex::new((0, GBuf::new("ple_nk"))),
+            ple_nq: std::sync::Mutex::new((0, GBuf::new("ple_nq"))),
+            ple_nc: std::sync::Mutex::new((0, GBuf::new("ple_nc"))),
+            ple_cw: std::sync::Mutex::new((0, GBuf::new("ple_cw"))),
             qsa_scr: std::sync::Mutex::new(GBuf::new("qsa_scr")),
             qsa_selflag: std::sync::Mutex::new(GBuf::new("qsa_selflag")),
             qsa_iqw: std::sync::Mutex::new((0, GBuf::new("qsa_iqw"))),
@@ -3476,6 +3490,168 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         Ok((idx, off))
     }
 
+    fn ple_math_dev(
+        &self,
+        res: u64,
+        key: u64,
+        value: u64,
+        nk: &[f32],
+        nq: &[f32],
+        nc: &[f32],
+        conv_w: &[f32],
+        gated: u64,
+        conv_out: u64,
+        gate_out: u64,
+        seq: usize,
+        t: usize,
+        eps: f32,
+        n_embd: usize,
+        hc: usize,
+        kern: usize,
+        dil: usize,
+        hist: usize,
+        host_ring: &[f32],
+    ) -> Result<(), String> {
+        if t != 1 {
+            return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
+        }
+        let hc_dim = hc * n_embd;
+        let ring_bytes = hist * hc_dim * 4;
+        // 링 풀 + 워터마크(되감기면 호스트 링으로 리프레시).
+        let rewind = {
+            let mut wm = self.ple_ring_pos.lock().map_err(|e| e.to_string())?;
+            let w = wm.entry(seq).or_insert(0);
+            let rw = *w > t; // pos0=0 재시작(벤치 워밍업 등)
+            *w = t;          // t=1: 이번 토큰까지 유효
+            rw
+        };
+        let ring = {
+            let mut m = self.ple_ring.lock().map_err(|e| e.to_string())?;
+            let g = m.entry(seq).or_insert_with(|| GBuf::new("ple_ring"));
+            // 주의: ensure 가 ptr 을 세우므로 최초 판정은 ensure **전**에.
+            let fresh = g.ptr.is_null();
+            g.ensure(&self.ctx, ring_bytes)?;
+            if fresh || rewind {
+                // 최초/되감기: 호스트 링(정합 상태)으로 초기화 — 동기 h2d 1회.
+                self.ctx.h2d(g.ptr, bytemuck::cast_slice(host_ring))?;
+            }
+            g.ptr
+        };
+        let (resp, keyp, valp, gp, cop, gop) = (
+            self.fptr(res)?,
+            self.fptr(key)?,
+            self.fptr(value)?,
+            self.fptr(gated)?,
+            self.fptr(conv_out)?,
+            self.fptr(gate_out)?,
+        );
+        let nk_d = self.upload_hashed(&self.ple_nk, nk)?;
+        let nq_d = self.upload_hashed(&self.ple_nq, nq)?;
+        let nc_d = self.upload_hashed(&self.ple_nc, nc)?;
+        let cw_d = self.upload_hashed(&self.ple_cw, conv_w)?;
+        // (1) gate + 방송 + 그룹 norm — 워프당 (t,s), 레인 0 실행.
+        {
+            let (mut rp, mut kp, mut vp) = (
+                resp as *mut std::ffi::c_void,
+                keyp as *mut std::ffi::c_void,
+                valp as *mut std::ffi::c_void,
+            );
+            let (mut nk_, mut nq_, mut nc_) = (
+                nk_d as *mut std::ffi::c_void,
+                nq_d as *mut std::ffi::c_void,
+                nc_d as *mut std::ffi::c_void,
+            );
+            let (mut gp_, mut gop_) = (gp as *mut std::ffi::c_void, gop as *mut std::ffi::c_void);
+            let (mut e, mut ne, mut hcc, mut tt) =
+                (eps, n_embd as i32, hc as i32, t as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut rp) as *mut _ as *mut std::ffi::c_void,
+                (&mut kp) as *mut _ as *mut std::ffi::c_void,
+                (&mut vp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nk_) as *mut _ as *mut std::ffi::c_void,
+                (&mut nq_) as *mut _ as *mut std::ffi::c_void,
+                (&mut nc_) as *mut _ as *mut std::ffi::c_void,
+                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
+                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut ne) as *mut _ as *mut std::ffi::c_void,
+                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_gate",
+                hc.div_ceil(8) as u32,
+                t as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // (2) dilated conv + silu + 링 갱신.
+        {
+            let (mut gp_, mut cw_, mut ring_, mut cop_) = (
+                gp as *mut std::ffi::c_void,
+                cw_d as *mut std::ffi::c_void,
+                ring as *mut std::ffi::c_void,
+                cop as *mut std::ffi::c_void,
+            );
+            let (mut hd, mut tt, mut k2, mut d2, mut h2) = (
+                hc_dim as i32,
+                t as i32,
+                kern as i32,
+                dil as i32,
+                hist as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cw_) as *mut _ as *mut std::ffi::c_void,
+                (&mut ring_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut hd) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut k2) as *mut _ as *mut std::ffi::c_void,
+                (&mut d2) as *mut _ as *mut std::ffi::c_void,
+                (&mut h2) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_conv",
+                hc_dim.div_ceil(256) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // (3) 잔차.
+        {
+            let (mut rp, mut vp, mut gop_, mut cop_) = (
+                resp as *mut std::ffi::c_void,
+                valp as *mut std::ffi::c_void,
+                gop as *mut std::ffi::c_void,
+                cop as *mut std::ffi::c_void,
+            );
+            let (mut ne, mut hcc, mut tt) = (n_embd as i32, hc as i32, t as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut rp) as *mut _ as *mut std::ffi::c_void,
+                (&mut vp) as *mut _ as *mut std::ffi::c_void,
+                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut ne) as *mut _ as *mut std::ffi::c_void,
+                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_residual",
+                n_embd.div_ceil(256) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+
     fn matmul_paired(
         &self,
         xs: &[Vec<f32>],
@@ -4057,6 +4233,81 @@ pub fn ar_check() -> Result<String, String> {
 }
 
 /// t토큰 AR 대조 — t>1은 커널 내부 순차 재귀 경로.
+/// `q4-ple-check` — q4_ple_gate 커널 ↔ 호스트 산술 미러 대조(합성 입력).
+pub fn ple_gate_check() -> Result<String, String> {
+    use std::ffi::c_void;
+    let ctx = RawCtx::new()?;
+    let (n_embd, hc) = (2560usize, 4usize);
+    let hc_dim = hc * n_embd;
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let res: Vec<f32> = (0..hc_dim).map(|_| lcg()).collect();
+    let key: Vec<f32> = (0..hc_dim).map(|_| lcg()).collect();
+    let val: Vec<f32> = (0..n_embd).map(|_| lcg()).collect();
+    let nk: Vec<f32> = (0..hc_dim).map(|_| 0.8 + lcg().abs()).collect();
+    let nq: Vec<f32> = (0..hc_dim).map(|_| 0.8 + lcg().abs()).collect();
+    let nc: Vec<f32> = (0..hc_dim).map(|_| 0.8 + lcg().abs()).collect();
+    let rd = ctx.alloc(hc_dim * 4)?;
+    let kd = ctx.alloc(hc_dim * 4)?;
+    let vd = ctx.alloc(n_embd * 4)?;
+    let nkd = ctx.alloc(hc_dim * 4)?;
+    let nqd = ctx.alloc(hc_dim * 4)?;
+    let ncd = ctx.alloc(hc_dim * 4)?;
+    let gd = ctx.alloc(hc_dim * 4)?;
+    let god = ctx.alloc(hc * 4)?;
+    ctx.h2d(rd, bytemuck::cast_slice(&res))?;
+    ctx.h2d(kd, bytemuck::cast_slice(&key))?;
+    ctx.h2d(vd, bytemuck::cast_slice(&val))?;
+    ctx.h2d(nkd, bytemuck::cast_slice(&nk))?;
+    ctx.h2d(nqd, bytemuck::cast_slice(&nq))?;
+    ctx.h2d(ncd, bytemuck::cast_slice(&nc))?;
+    let (mut rp, mut kp, mut vp, mut nk_, mut nq_, mut nc_, mut gp_, mut gop_) = (
+        rd as *mut c_void, kd as *mut c_void, vd as *mut c_void,
+        nkd as *mut c_void, nqd as *mut c_void, ncd as *mut c_void,
+        gd as *mut c_void, god as *mut c_void,
+    );
+    let (mut e, mut ne, mut hcc, mut tt) = (1e-6f32, n_embd as i32, hc as i32, 1i32);
+    let mut args: Vec<*mut c_void> = vec![
+        &mut rp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+        &mut vp as *mut _ as *mut c_void, &mut nk_ as *mut _ as *mut c_void,
+        &mut nq_ as *mut _ as *mut c_void, &mut nc_ as *mut _ as *mut c_void,
+        &mut gp_ as *mut _ as *mut c_void, &mut gop_ as *mut _ as *mut c_void,
+        &mut e as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
+        &mut hcc as *mut _ as *mut c_void, &mut tt as *mut _ as *mut c_void,
+    ];
+    ctx.launch3("q4_ple_gate", hc.div_ceil(8) as u32, 1, 1, 256, &mut args)?;
+    ctx.sync()?;
+    let mut dgate = vec![0f32; hc];
+    let mut dgated = vec![0f32; hc_dim];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut dgate).as_mut(), god)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut dgated).as_mut(), gd)?;
+    // 호스트 미러(ple_block 산술)
+    let eps = 1e-6f32;
+    let mut out = String::new();
+    for s in 0..hc {
+        let kn = llm170_core::ops::rms_norm(&key[s * n_embd..(s + 1) * n_embd], &nk[s * n_embd..(s + 1) * n_embd], eps);
+        let qn = llm170_core::ops::rms_norm(&res[s * n_embd..(s + 1) * n_embd], &nq[s * n_embd..(s + 1) * n_embd], eps);
+        let mut dot = 0.0f32;
+        for i in 0..n_embd { dot += kn[i] * qn[i]; }
+        dot /= (n_embd as f32).sqrt();
+        let mag = dot.abs().max(1e-6).sqrt();
+        let g = llm170_core::ops::sigmoid(if dot >= 0.0 { mag } else { -mag });
+        let mut gated: Vec<f32> = (0..n_embd).map(|i| val[i] * g).collect();
+        let sg = {
+            let sum = llm170_core::ops::sq_sum(&gated);
+            1.0 / ((sum / n_embd as f64 + eps as f64).sqrt() as f32)
+        };
+        for i in 0..n_embd { gated[i] = gated[i] * sg * nc[s * n_embd + i]; }
+        let gmax = gated.iter().zip(dgated[s * n_embd..(s + 1) * n_embd].iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        out += &format!("s{s}: gate dev={:.6} host={:.6} (dot={:.4}) gated max|d-h|={gmax:.2e}\n", dgate[s], g, dot);
+    }
+    Ok(out)
+}
+
 pub fn ar_check_t(t: usize) -> Result<String, String> {
     use llm170_core::matmul::{Accelerator, FrameState};
     let (n_group, dt_rank, d) = (16usize, 48usize, 128usize);
