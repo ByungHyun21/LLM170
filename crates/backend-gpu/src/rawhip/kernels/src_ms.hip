@@ -62,3 +62,22 @@ extern "C" __global__ void gdn_conv_state_ms(const float* qkv, float* const* sta
 }
 
 
+
+// np 행별 conv (plans/74 N3) — gdn_conv_t(t=1)와 동일 산술(exp_cr silu +
+// 링 시프트), 상태만 행 포인터 테이블. gdn_conv_t2_ms 는 그룹 행수 ≥ k-1
+// 전제(세그 전체를 그룹 행으로 채움)라 group=1 np 에서 링 시프트가 빠지고
+// silu 도 __expf 클래스 — 참조 t=1 경로와 값이 갈라진다(실측 2026-09-16).
+extern "C" __global__ void gdn_conv_np(const float* qkv, const float* cw, float* const* states,
+                                       float* out, int ch, int k, int t) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int ti = blockIdx.y;
+    if (c >= ch || ti >= t) return;
+    float* st = states[ti];
+    const float* row = qkv + (size_t)ti * ch;
+    float sum = cw[c * k + (k - 1)] * row[c];
+    for (int j = 0; j < k - 1; j++) sum += cw[c * k + j] * st[j * ch + c];
+    float oc = sum / (1.0f + exp_cr(-sum));
+    for (int j = 0; j < k - 2; j++) st[j * ch + c] = st[(j + 1) * ch + c];
+    st[(k - 2) * ch + c] = row[c];
+    out[(size_t)ti * ch + c] = oc;
+}
