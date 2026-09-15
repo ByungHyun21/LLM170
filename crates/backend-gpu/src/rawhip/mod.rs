@@ -1199,9 +1199,13 @@ impl RawCtx {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
+        // plans/74 N3: q5_K 은 워프=행(블록 32, 스트라이드 32레인)이 기본 —
+        // 원판(블록 64) 대비 np4 마이크로벤치 +4.5%, 토큰 A/B 동일.
+        // LLM170_NO_Q5K4W2=1 이면 원판 복귀.
+        let w2 = ty == 13 && std::env::var_os("LLM170_NO_Q5K4W2").is_none();
         let kern = match ty {
             12 => "gemm_q4k4",
-            13 => "gemm_q5k4",
+            13 => if w2 { "gemm_q5k4_w2" } else { "gemm_q5k4" },
             14 => "gemm_q6k4",
             23 => "gemm_xs4",
             _ => return Err(format!("g4 미지원 타입 {ty}")),
@@ -1228,7 +1232,11 @@ impl RawCtx {
         args.push(&mut no as *mut _ as *mut std::ffi::c_void);
         args.push(&mut xw as *mut _ as *mut std::ffi::c_void);
         args.push(&mut tt as *mut _ as *mut std::ffi::c_void);
-        self.launch3(kern, 1, gy, gz, 64, &mut args)
+        if w2 && std::env::var_os("LLM170_G4_TRACE").is_some() {
+            eprintln!("[g4w2] n_in={n_in} n_out={n_out} t={t} gy={gy} gz={gz}");
+        }
+        let blk: u32 = if w2 { 32 } else { 64 };
+        self.launch3(kern, 1, gy, gz, blk, &mut args)
     }
 
     /// mmq quant_y 캐시 무효화 (y 원본 재기입 직전 호출 — 부록81).
