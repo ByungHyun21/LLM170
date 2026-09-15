@@ -4031,6 +4031,18 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         crate::rawhip::ktrace_on();
     }
 
+    /// 슬롯 반납 — PLE 링/워터마크 제거(2026-09-16 RCA: reset_seq 이 링을
+    /// 못 지워 새 대화가 이전 대화의 n-gram 링을 읽었다 — np4 잔여 비결정성
+    /// 및 슬롯 재사용 오염의 원인).
+    fn acc_reset_seq(&self, seq: usize) {
+        if let Ok(mut m) = self.ple_ring.lock() {
+            m.remove(&seq);
+        }
+        if let Ok(mut wm) = self.ple_ring_pos.lock() {
+            wm.remove(&seq);
+        }
+    }
+
     /// [t][vocab] logits 행별 GPU argmax — np greedy 판정 (plans/74 N1).
     /// argmax64 = CPU greedy와 동일 의미(동률 최저 인덱스).
     fn frame_argmax_rows(&self, logits: u64, t: usize, vocab: usize) -> Result<Vec<u32>, String> {
