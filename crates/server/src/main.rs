@@ -61,19 +61,44 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
 
 fn main() -> ExitCode {
     // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
-    // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)가 --model을 받으므로
-    // 여기서 한 번에 검사한다. 백엔드 인자가 없으면 CPU 경로(host만 판정).
+    // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)를 커버한다:
+    //   - --model <v> / --model=<v> (serve·infer·vl·bench)
+    //   - check의 첫 비플래그 위치인자 (모델 경로)
+    //   - GPU 판정: --backend gpu|=<v>, --gpu-runtime*; check는 기본이 gpu.
     {
         let args: Vec<String> = std::env::args().collect();
-        if let Some(i) = args.iter().position(|a| a == "--model") {
-            if let Some(mp) = args.get(i + 1) {
-                let gpu = args.windows(2).any(|w| w == ["--backend", "gpu"])
-                    || args.windows(2).any(|w| w == ["--gpu-runtime", "hip"])
-                    || args.windows(2).any(|w| w == ["--gpu-runtime", "vulkan"]);
-                if let Err(e) = resource::preflight(std::path::Path::new(mp), gpu) {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
+        let sub = args.get(1).map(String::as_str);
+        let mut model: Option<String> = None;
+        let mut gpu = false;
+        let mut i = 2;
+        while i < args.len() {
+            let a = &args[i];
+            if let Some(v) = a.strip_prefix("--model=") {
+                model = Some(v.to_string());
+            } else if a == "--model" {
+                if let Some(v) = args.get(i + 1) {
+                    model = Some(v.clone());
                 }
+            } else if let Some(v) = a.strip_prefix("--backend=") {
+                gpu = gpu || v == "gpu";
+            } else if a == "--backend" {
+                if args.get(i + 1).is_some_and(|v| v == "gpu") {
+                    gpu = true;
+                }
+            } else if a.starts_with("--gpu-runtime") {
+                gpu = true;
+            } else if sub == Some("check") && !a.starts_with("--") && model.is_none() {
+                model = Some(a.clone());
+            }
+            i += 1;
+        }
+        if sub == Some("check") {
+            gpu = true; // run_check의 백엔드 기본값이 gpu다.
+        }
+        if let Some(mp) = model {
+            if let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
             }
         }
     }

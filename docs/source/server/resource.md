@@ -21,9 +21,19 @@ an immediate, descriptive error before any weight is touched.
 
 ## Wiring
 
-`main()` scans argv for `--model <path>` before dispatching any subcommand
-(serve / infer / vl / bench / check all take it), and treats the run as
-GPU-bound when `--backend gpu` or `--gpu-runtime hip|vulkan` is present.
+`main()` scans argv before dispatching any subcommand and covers every
+model-loading entry:
+- `--model <v>` and `--model=<v>` (serve / infer / vl / bench),
+- the `check` subcommand's positional model path (its backend defaults to
+  GPU, so it is treated as GPU-bound even without flags),
+- `--backend gpu`, `--backend=gpu`, and any `--gpu-runtime*` form all mark
+  the run GPU-bound.
+
+Verified live with a Flash-Next server resident (VRAM 16.6 GiB free): both
+`llm170 check <FN> --quick` and `llm170 infer --model <FN> --backend=gpu`
+refuse in <1s; `LLM170_NO_RSRC_GUARD=1` bypasses. Note the guard prevents the
+catastrophic OOM freeze, not performance degradation from contention — run
+benchmarks with the GPU solo.
 
 ## Verified
 
