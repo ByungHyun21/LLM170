@@ -2285,7 +2285,19 @@ impl Q4Acc {
         name: &'static str,
         data: &[f32],
     ) -> Result<*mut u8, String> {
-        let key = (data.as_ptr() as u64, data.len());
+        // 2026-09-16 RCA(값 드리프트): 호출부(qsa_frame*)가 **층마다 재할당되는
+        // 로컬 Vec** 를 건넨다 — 할당기가 같은 주소를 재사용하면 (ptr,len) 키가
+        // 이전 층 버퍼에 히트해 **내용이 다른 노름 가중치를 재업로드 없이 재사용**
+        // 한다. 서버 스레드 타이밍에 따라 발동 → 로짓 ~0.1-0.5 드리프트(근접 타이
+        // 플립, FN 게이트 1692↔24902)의 원인. 키를 **내용 FNV 해시**로 바꾼다
+        // (24KB 해싱 ~2us — 절감 40ms 대 무의미).
+        let bytes = bytemuck::cast_slice::<f32, u8>(data);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let key = (h, data.len());
         let mut m = map.lock().map_err(|e| e.to_string())?;
         if let Some(b) = m.get(&key) {
             return Ok(b.ptr);
