@@ -207,3 +207,34 @@ in 1.386s gives **19.9 TFLOPS = 34% of the wmma peak (59)** — headroom exists
 but the lever is tile/WMMA-family kernel rewrites (plans/66 P1).
 Side note: before the `LLM170_KTRACE` fix, this prefill was under-reported
 4x at 366ms (see the pairing entry in qsa.md).
+
+## plans/73 — 27B attention round (2026-09-15)
+
+**Adaptive decode segment** — sg was fixed 32 (short-ctx latency hiding) but
+at 16k context nseg=512 forced `qsa_flash_merge` through 500+ partials per
+head serially (KTRACE 16k: gqa2d 5.59 + merge 4.17ms/step). sg now scales:
+`((pos+1)/64).clamp(32,256)` keeps nseg ≤ 64; short-context numerics
+unchanged (the gate prompt stays in the sg=32 regime — bit-identical).
+tg128@16k 10.3 → 10.54.
+
+**qsa_flash_wk8i (prefill, default)** — 4-key register ILP on the attention
+fmaf chains (strict-FP forbids reassociation, so the 32-fma chain per key
+was the critical path). Per-key j-order, shuffle tree and softmax update
+order preserved = bit-identical (gate PASS at t=208 prefill). pp4096
+315 → 323.6 (+2.7%), pp16384 tie (253 vs 254). A shared-tile variant was
+tried first and rejected: the own*32 lane stride makes 4-way LDS bank
+conflicts and 32KB shared halves occupancy — pp16k 257 → 209 (reverted).
+
+**qsa_flash_wk8d (v_dot2 QK, opt-in LLM170_WK8D=1)** — gqa2d's structure
+extended to t>1 (warp=query, lane=key, 128 v_dot2 per lane, shared K/V
+tile, thread=dim PV). Two structural defects found via differential
+attention-output dumps (new LLM170_ATTN_DUMP debug env, layer 0 after
+merge): (1) PV accumulation AND the final part write must cover ALL 8
+queries per thread (gqa2d convention — the first cut left query w's row
+filled only at dims 32w..32w+31); (2) fully-masked causal tiles (which
+never occur at t=1) need e=0 explicitly or exp(-MAX-(-MAX))=1 leaks future
+keys with weight 1. After both fixes the kernel is numerically sane
+(matches wk8i's token at t=129) but the scalar-f32 PV phase dominates:
+pp16384 234 vs wk8i 253 — kept as an asset; the identified next step is a
+WMMA/tensor-core PV. Prefill seg sweep at 16k: 1024 optimal (2048→249.7,
+4096→246.0).

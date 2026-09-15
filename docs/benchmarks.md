@@ -24,6 +24,51 @@ history has been moved to per-area archives:
 | `docs/archive/hip-kernel-history.md` | HIP kernel, tile, and prefill/decode rounds |
 | `docs/archive/misc-history.md` | Others (vision, MTP, protocols, etc.) |
 
+
+## plans/73 optimization round (2026-09-15)
+
+Goal: beat llama.cpp on both models. Same conditions as the tables above
+(ROCm 10, solo, greedy). Two committed rounds:
+
+**Flash-Next decode** (the 0.56-0.67x cell — the largest gap):
+
+| Metric | before | after | llama |
+|---|---|---|---|
+| tg128 @short ctx | 13.40 | **16.78** (+25%) | 19.8 |
+| tg64 @16k ctx | 11.3 | **16.11** (+43%) | 20.0 |
+
+Levers, all gate bit-identical (SELCHECK probe: device selection lists ==
+host lists over the full run):
+
+1. **Device-side QSA selection** — the decode step's largest idle was the
+   per-QSA-layer round trip (4 sync d2h + host select + uploads; KTRACE
+   "after qk_norm_rope" 40ms/step at 16k). New kernels
+   `q4_idx_q_rope/bk_update/score/rank/expand` mirror `stages::qsa_select`
+   arithmetic exactly; device idx_k/bk pools are the source of truth, host
+   caches rebuild once at prefill entry (`qsa_host_rebuild`).
+2. `q4_gemm_f32_w` — warp-per-output float4 f32 GEMV (hc inject
+   [10240→4] ran 4 blocks / 48µs; f32 family ~10ms/step).
+3. Bitonic single-block top-k+expand (`q4_idx_topk`) — replaced the O(B²)
+   rank + serial-prefix expand pair (0.228 → ~0.01ms per call).
+4. `q4_gemm_q5_1_w_ids` — Q5_1 MoE down read rows with a 480B lane stride
+   (8× sector amplification, 72-89GB/s); warp-per-row is fully coalesced,
+   serial sb-order sum keeps it bit-identical to `gm_ids`.
+5. `gemm_q8_0_ids` + `gemm_q8_0_w` — direct-ids path for Q8_0-down expert
+   layers (was gather+10×GEMV+scatter, ~0.35ms/layer) and a warp variant
+   for small-n_sub shapes (hc up had 10 of 64 lanes active).
+6. qk_norm_rope/qsa const uploads cached (were 3 h2d+sync per QSA layer
+   per step).
+
+**27B**: adaptive decode segment (sg was fixed 32; at 16k the merge walked
+500+ partials per head serially — now nseg ≤ 64; tg128@16k 10.3 → 10.54),
+`qsa_flash_wk8i` (4-key register ILP on the prefill attention FMA chains,
+bit-identical; pp4096 315 → 323.6), and the `qsa_flash_wk8d` v_dot2 variant
+built-and-documented as opt-in (see decode.md for the structural analysis —
+after fixing two real defects its scalar PV phase still loses to wk8i).
+
+Standing after the round — cells we lead: FN pp512/4k/16k (1.16-1.22×),
+27B pp512 (1.04×), 27B MTP spec (2.0×). Cells still behind: FN tg (0.85×),
+27B pp4k (0.95×), pp16k (0.80×), tg (0.89-0.96×).
 ## ROCm 10 userspace adopted — same binary, +28-41% for llama.cpp (2026-09-14)
 
 The machine carries a TheRock ROCm 10.0.0 userspace build for gfx1151

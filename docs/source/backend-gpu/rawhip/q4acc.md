@@ -1360,3 +1360,42 @@ launch3: 700 kern=q4_gemm_q4k_ge gx=40 gy=519 gz=1 blk=256
 grid-limit/드라이버 버그). 후자는 `gy`를 65535 이하로 유지한 채 **행 상한을 줄여**
 (상한을 실제 `rp`에 가깝게) 시험하면 갈린다 — 상한을 줄이는 것 자체가 4축 수정으로
 안전해졌으므로 3분 검증이 가능하다.
+
+## plans/73 — Flash-Next decode kernel round (2026-09-15)
+
+Gate bit-identical throughout (SELCHECK: device selection lists == host lists).
+
+**Device-side QSA selection (decode t=1)** — the step's largest idle was the
+per-QSA-layer host round trip (4 sync frame_reads + select+list ~0.8-1.5ms +
+drain/refill; KTRACE at 16k ctx: "after qk_norm_rope" 40.1ms/step over 12
+layers). New path: `q4_idx_q_rope` (iq norm+rope, 32-seg f64 mirror),
+`q4_idx_bk_update` (incremental block keys, mean→rms→rope, shfl_xor(16)
+pairing for idx_dim=128), `q4_idx_score` (4-acc dot mirror),
+`q4_idx_topk` (single-block bitonic over (score-mapped,idx) u64 — the
+O(B²) `q4_idx_rank` + serial-prefix `q4_idx_expand` pair cost 0.228ms/call,
+the bitonic ~0.01ms), attention via `qsa_attention_dev_sel` reading the
+device list directly. Device idx_k/bk pools (watermark rewind contract as
+qsa_kv) are the source of truth; host caches rebuild once at prefill entry
+(`qsa_host_rebuild`), prefill appends via `qsa_idx_append_host`. Debug envs:
+LLM170_QSA_HOSTSEL (force old path), LLM170_QSA_SELCHECK (shadow-compare
+lists + keep host caches fresh), LLM170_QSA_TOPK=0 (rank+expand pair).
+
+**Warp GEMV family** — `q4_gemm_f32_w` (t=1 f32: hc inject [10240→4] ran
+4 blocks/48µs, router [2560→512] 106GB/s; family was ~10ms/step),
+`q4_gemm_q5_1_w_ids` (Q5_1 MoE down: lane-per-row 480B stride was 8×
+sector amplification at 72-89GB/s; warp-per-row coalesced, lane-0 serial
+sb-order sum = bit-identical to gm_ids — an f32 warp-tree variant flipped
+the gate's 16th token 1692→24902 and was replaced),
+`gemm_q8_0_ids` (Q8_0-down experts: was gather+10×GEMV+scatter ~0.35ms/
+layer; byte-offset addressing — q8_0's 34B rows are never word-aligned;
+f64-tree reduction = bit-identical to gemm_q8_0), `gemm_q8_0_w`
+(small-n_sub q8_0: hc up [320→10240] had 10 of 64 lanes active, 59GB/s).
+Route guards: LLM170_F32W / Q5W / Q8IDS / Q8W (=0 disables each).
+A lane-0-only `__shfl_sync` reduction crashed (divergent warp hardware
+exception) — all-lane participation is mandatory.
+
+**Const upload caching** — qk_norm_rope uploaded qn/kn/cs (3 h2d+sync)
+per QSA layer per step; now FNV-hash keyed (qn/kn) and ptr-keyed (cs).
+
+Measured: tg128@short 13.40 → 14.97 → **16.78 t/s**; tg64@16k 11.3 → 13.6 →
+**16.11 t/s**. pp unchanged (273 vs 269 at pp4k).
