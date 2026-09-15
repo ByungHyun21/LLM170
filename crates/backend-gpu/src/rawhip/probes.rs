@@ -1015,6 +1015,19 @@ pub fn d2h_bench() -> Result<String, String> {
     Ok(out)
 }
 
+/// 가드용 최소 VRAM 조회 (2026-09-16) — 컨텍스트 없이 런타임 질의만.
+/// 성공 시 (free, total) 바이트.
+pub fn gpu_mem_free() -> Option<(u64, u64)> {
+    unsafe {
+        let (mut f, mut t) = (0usize, 0usize);
+        if hip::hipMemGetInfo(&mut f, &mut t) == hip::hipError_t_hipSuccess {
+            Some((f as u64, t as u64))
+        } else {
+            None
+        }
+    }
+}
+
 pub fn device_report(ctx: &RawCtx) -> String {
     let name = unsafe {
         let mut buf = vec![0i8; 256];
