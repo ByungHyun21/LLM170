@@ -1331,8 +1331,10 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
     int blocks = n_in >> 8;
     int row_base = o * blocks * 210;
     float acc = 0.0f;
-    for (int m = 0; m < cnt; m++) {
-        int g = l + (m << 6);
+    // 2026-09-16 ILP: 그룹 기여를 람다로 분리해 2-way 교차 발행 — 로드/ALU
+    // 레이턴시를 겹친다(q6_K 디퀀트가 무거워 head GEMV 119GB/s ALU 바운드).
+    // 그룹별 산술·가산 순서는 g 오름차순 그대로 → 비트 동일.
+    auto grp = [&](int g) -> float {
         int blk = g >> 4;
         int kloc = g - (blk << 4);
         int wb = row_base + blk * 210;
@@ -1406,7 +1408,19 @@ extern "C" __global__ void gemm_q6k(const unsigned* xq, const unsigned* w,
         }
         isum -= 32 * (int)xq[(n_in >> 2) + (n_in >> 5) + g]; // q16[g]=Σy, 체인은 32×Σy
         float yd = __uint_as_float(xq[(n_in >> 2) + (g >> 1)]);
-        acc += yd * d * (float)sc * (float)isum;
+        return yd * d * (float)sc * (float)isum;
+    };
+    {
+        int m = 0;
+        for (; m + 1 < cnt; m += 2) {
+            float c0 = grp(l + (m << 6));
+            float c1 = grp(l + ((m + 1) << 6));
+            acc += c0;
+            acc += c1;
+        }
+        for (; m < cnt; m++) {
+            acc += grp(l + (m << 6));
+        }
     }
     // 트리 환원 (미러 tree64와 동일 순서) — part 왕복 제거.
     // 셔플 폭 32 제한(RCA 2026-09-03): 상/하 절반 공유메모리 교환 후 워프 트리.
