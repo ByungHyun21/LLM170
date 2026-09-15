@@ -218,6 +218,17 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### g4 ILP-2 negative (2026-09-17, not landed)
+
+Two-sub-block-per-iteration q5k4 (both blocks' weight words prefetched into
+registers, same ascending accumulate order — gate-verified bit-identical)
+measured 28.5 vs 29.0 t/s on the np4 micro-bench. The compiler already
+extracts full ILP from the simple loop; combined with the block-geometry
+negative this closes the "g4 code slack" hypothesis: the t=4 GEMM sits near
+its dot4-instruction roofline (~0.85 warp-instr/byte, ~160GB/s ceiling) and
+measured 120-123GB/s is the practical limit of this kernel family on this
+GPU. Removed.
+
 ### g4 block-geometry negative (2026-09-17, not landed)
 
 4-warps-per-block q5k4 (128 threads, 4 rows/block, pure per-warp shfl
