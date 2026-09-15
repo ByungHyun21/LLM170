@@ -1023,16 +1023,37 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
             ],
         };
-        let gz = n_out.div_ceil(65535) as u32;
         let mut out_p0 = out as *mut std::ffi::c_void;
+        let mut xw_a = xq_w as i32;
+        // plans/73: t=1 소형 n_sub(≤32) q8_0은 워프판 — 64스레드/출력 레이아웃은
+        // hc up[320→10240]에서 10/64 레인만 활동(59GB/s).
+        if t == 1 && ty == 8 && n_in / 32 <= 32 && std::env::var("LLM170_Q8W").as_deref() != Ok("0") {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3(
+                "gemm_q8_0_w",
+                n_out.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            );
+        }
+        let gz2 = n_out.div_ceil(65535) as u32;
         match ty {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
             _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
         }
-        let mut xw_a = xq_w as i32;
         let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
         args_v.push(xw_ptr);
-        self.launch3(kern, t as u32, gy, gz, 64, &mut args_v)?;
+        self.launch3(kern, t as u32, gy, gz2, 64, &mut args_v)?;
         Ok(())
     }
 

@@ -1309,7 +1309,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && ws.ty == GgmlType::Q5_1
             && !f32w
             && rows > 0
+            && n_in / 32 <= 32
             && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+            && std::env::var("LLM170_Q5W").as_deref() != Ok("0")
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
@@ -1333,9 +1335,52 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 (&mut ew) as *mut _ as *mut std::ffi::c_void,
             ];
             self.ctx.launch3(
-                "q4_gemm_q5_1_gm_ids",
-                n_out.div_ceil(16) as u32,
-                rows.div_ceil(16) as u32,
+                "q4_gemm_q5_1_w_ids",
+                n_out.div_ceil(8) as u32,
+                rows as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+            return Ok(());
+        }
+        // plans/73: Q8_0 다운 전문가도 direct-ids 워프판으로 — 종전엔 이 층들이
+        if self.t_cur() == 1
+            && ws.ty == GgmlType::Q8_0
+            && !f32w
+            && rows > 0
+            && n_in / 32 <= 32
+            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+            && std::env::var("LLM170_Q8IDS").as_deref() != Ok("0")
+        {
+            let idp = self.fptr(ids)?;
+            let mut x_p = xq as *mut std::ffi::c_void;
+            let mut w_p = wd as *mut std::ffi::c_void;
+            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
+            let mut ip = idp as *mut std::ffi::c_void;
+            let mut ew = per_expert as i32; // 바이트 — 34B 행 비정렬 오프셋용
+            let (mut ni, mut no) = (n_in as i32, n_out as i32);
+            let (mut xw, mut tt) = (xq_w as i32, rows as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ip) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ew) as *mut _ as *mut std::ffi::c_void,
+            ];
+            if std::env::var_os("LLM170_Q8IDS_DBG").is_some() {
+                eprintln!("# q8ids launch n_in={n_in} n_out={n_out} rows={rows} per_expert={per_expert}");
+            }
+            self.ctx.launch3(
+                "gemm_q8_0_ids",
+                n_out.div_ceil(8) as u32,
+                rows as u32,
                 1,
                 256,
                 &mut args,
