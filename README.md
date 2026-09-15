@@ -16,34 +16,28 @@ Numbers are only ever quoted with their conditions — full tables and history i
 
 ### CMP 170HX (GA100) — benchmark in preparation
 
-| Mode | pp512 | tg32 |
+| Mode | pp512 | tg128 |
 |---|---|---|
 | `cmp-stock` (8 GB) | — | — |
 | `cmp-unlocked` (64 GB) | — | — |
 
-Hardware rationale: [docs/hardware/cmp170hx.md](docs/hardware/cmp170hx.md).
+### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151)
 
-### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) — current dev machine
+Runtime: ROCm 10 userspace. Greedy, `--reps 2` (warm rep). Same GGUF, same GPU.
 
-Runtime: TheRock ROCm 10.0.0 userspace (`LD_LIBRARY_PATH`, no relink).
+#### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
-#### Qwen3.8-27B (Q4_K_XL, greedy, `llm170 bench`)
-
-| Backend | pp512 | pp418 | pp3314 | tg32 |
-|---|---|---|---|---|
-| **ROCm/HIP** | **372** | **320** | **338** | **11.7** |
-| Vulkan | 320 | — | — | 11.4 |
-| CPU (W4A8) | 181 | — | — | 11.7 |
-
-vs llama.cpp ROCm 10: pp418 317 / pp3314 314 / tg 11.3 → **prefill 1.01-1.07×, decode +3%**.
+| | pp512 | pp4096 | pp16384 | tg128@512 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|---|
+| LLM170 | **371** | 320 | 256 | 11.5 | 11.2 | 10.3 |
+| llama.cpp | 347 | **342** | **317** | **11.9** | — | — |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-| Backend | pp2048 | tg32 |
-|---|---|---|
-| **ROCm/HIP** | **288** | 13.3 |
-
-vs llama.cpp: pp **1.21×** / tg 0.75× (dense GDN backbone + MoE bandwidth, see benchmarks.md).
+| | pp512 | pp4096 | pp16384 | tg128@512 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|---|
+| LLM170 | **237** | **270** | **244** | 13.3 | 12.9 | 11.3 |
+| llama.cpp | 206 | 237 | 229 | **19.8** | — | — |
 
 #### Speculative decode (27B, MTP `--spec 3`)
 
@@ -52,7 +46,7 @@ vs llama.cpp: pp **1.21×** / tg 0.75× (dense GDN backbone + MoE bandwidth, see
 | single-stream | **23.5** | 2.04× |
 | np4 aggregate | **31.0** | 2.00× |
 
-Full history and analysis: [docs/benchmarks.md](docs/benchmarks.md).
+Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Build & run
 
