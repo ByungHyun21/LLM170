@@ -66,9 +66,27 @@ bit-identical; pp4096 315 → 323.6), and the `qsa_flash_wk8d` v_dot2 variant
 built-and-documented as opt-in (see decode.md for the structural analysis —
 after fixing two real defects its scalar PV phase still loses to wk8i).
 
-Standing after the round — cells we lead: FN pp512/4k/16k (1.16-1.22×),
-27B pp512 (1.04×), 27B MTP spec (2.0×). Cells still behind: FN tg (0.85×),
-27B pp4k (0.95×), pp16k (0.80×), tg (0.89-0.96×).
+Session 2 (same day, afternoon) added the **PLE device path**: the t=1 PLE
+host bridge (4.5-11ms/step — sync res_hc round trip + CPU mm_batch
+projections) moved to host-hash/gather + frame GEMM + three mirror kernels
+(bit-identical; see q4acc.md for the two defects the new probes caught).
+gemm_q5k_v2 was wired and measured slower for 27B decode (10.83 vs 11.35 —
+opt-in asset).
+
+| Metric | session start | after S1 | after S2 |
+|---|---|---|---|
+| FN tg128@short | 13.40 | 16.78 | **17.54** |
+| FN tg64@16k | 11.3 | 16.11 | **16.83** |
+| FN tg128@4k | — | — | **17.14** |
+
+Standing — cells we lead: FN pp512/4k/16k (1.16-1.22×), 27B pp512 (1.04×),
+27B MTP spec (2.0×). Cells still behind: FN tg (0.85-0.89×), 27B pp4k
+(0.95×), pp16k (0.80× — needs tensor-core PV), tg (0.89-0.96×).
+Verification on the final build: gates bit-identical, 12/12 tests, np2
+isolation exact (both models), MTP spec==greedy, VL coherent, multiturn
+works. llama-reference collection blocked by llama-server crashes in this
+environment (4 attempts, CPU RAM + GPU queue eviction) — gates carry the
+equivalence.
 ## ROCm 10 userspace adopted — same binary, +28-41% for llama.cpp (2026-09-14)
 
 The machine carries a TheRock ROCm 10.0.0 userspace build for gfx1151
