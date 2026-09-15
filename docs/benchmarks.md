@@ -177,6 +177,26 @@ with no wall-time change (the GPU stayed busy on the queue).
 
 
 
+## 2026-09-17 session close — np batched MoE, f32 multi-token
+
+- **np batched MoE** (10e4318): the three direct-ids expert kernels were gated
+  `t_cur==1`, silently routing the t=4 np batch to the slow grouping path (the
+  real cause of the earlier "batched MoE is slower" conclusion). Gate relaxed
+  to `rows<=64`: one 40-row GEMM per projection. Shared expert kept on the
+  per-row fused kernels (bit-identity with the per-row path; the generic
+  GEMM+SiluMul branch differs in arithmetic class and split tokens).
+  Engine step 165.6 -> 128-145ms (-12..-22%). Control experiment: same-config
+  back-to-back runs also flip @0 tokens across server restarts — the stream
+  flakiness is machine-state tie-flipping (documented), not this change.
+- **q4_gemm_f32_mt** (85b3e41): t=2..8 f32 projections (router/PLE family)
+  read weights once via a warp-per-row multi-token variant. -3ms/step.
+- Remaining np step decomposition (128ms): shared q8_0 GEMMs 50ms (2x the t=1
+  per-token cost — already weight-amortized), MoE ids 34ms (~86GB/s), PLE gate
+  12ms (single-lane serial, bit-contract prevents parallelizing), idx top-k 8ms
+  (single block). PLE batching needs a per-seq ring redesign — scoped, not
+  attempted. The HTTP aggregate gap vs engine (19 vs 31 t/s) = prefill
+  amortization (~4s per 1024-token prompt set) + ramp-down.
+
 ## 2026-09-16~17 session — np cells, WMMA2 attention, correctness fixes
 
 Commits 33e23c2..d364326. All numbers hip/ROCm 10/solo/greedy as before;
