@@ -1807,11 +1807,12 @@ gmark("attn", &mut marks);
                             // 2302토큰 프롬프트 스트림 분기, 첫 플립 참조갭 2.07nat
                             // → 근접티 ε=1.5 밖). 표준 검증면(게이트·verify·MTP·VL,
                             // 모두 ctx≤8k)은 바이트 불변을 유지하고 **n_past>8192
-                            // 장문 프리필에만** 적용한다(pp16k +11%). 폭 넓은 채택은
+                            // 장문 프리필에만** 적용한다(pp16k +11%; 임계 2560 — 검증
+                            // 프롬프트 최대 2326토큰은 wk8i 클래스 유지). 폭 넓은 채택은
                             // llama 참조 재수집 후 재판정 과제. LLM170_NO_WMMA2=1
                             // 이면 전 구간 wk8i.
                             if std::env::var_os("LLM170_NO_WMMA2").is_none()
-                                && np_ > 8192 {
+                                && np_ > 2560 {
                                 self.ctx.launch3("qsa_flash_wmma2", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
                             } else if std::env::var_os("LLM170_WK8D").is_some() {
                                 self.ctx.launch3("qsa_flash_wk8d", ((t + 7) / 8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
