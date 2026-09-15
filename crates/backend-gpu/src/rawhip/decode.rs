@@ -918,10 +918,13 @@ impl DecodeState {
                     if gqa_ok || np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
-                        // 32키 세그먼트 + GQA 공유가 최적 (실측: ctx512 11.08/11.02 vs
-                        // 종전 128+헤드별 10.82; ctx3072 10.44 vs 9.60). 세그먼트가
-                        // 작을수록 WG가 많아 플랫폼 지연을 숨긴다.
-                        let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok()).unwrap_or(32usize);
+                        // sg = 32 고정은 단문맥 최적(플랫폼 지연 은닉)이지만 장문맥에서
+                        // nseg=512@16k 가 되어 merge 가 헤드당 500+ 부분합을 직렬 합산한다
+                        // (KTRACE 16k: gqa2d 5.6 + merge 4.2ms/step). plans/73: 문맥에
+                        // 비례해 키우면 nseg ≤ 64 로 유지 — 블록 수(4kvh×nseg)는
+                        // 256+ 로 충분히 병렬. 단문맥(sg=32 구간)은 수치 순서 불변.
+                        let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok())
+                            .unwrap_or_else(|| ((pos + 1) / 64).clamp(32, 256));
                         let nseg = ((pos + 1) + sg - 1) / sg;
                         let part = self.ctx.scratch(1 * n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
@@ -1771,7 +1774,11 @@ gmark("attn", &mut marks);
                             // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
                             // `llm170 attn-check` 로 보증된다(사용자 결정 2026-09-12).
                             // LLM170_NO_WK8=1 이면 wk16(4단)으로 복귀.
-                            if std::env::var_os("LLM170_NO_WK8").is_none() {
+                            // plans/73: ILP 판 기본 — 공유 타일 + 키 4 인터리브(비트 동일).
+                            // LLM170_NO_WK8I=1 이면 원판 wk8, LLM170_NO_WK8=1 이면 wk16.
+                            if std::env::var_os("LLM170_NO_WK8I").is_none() {
+                                self.ctx.launch3("qsa_flash_wk8i", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                            } else if std::env::var_os("LLM170_NO_WK8").is_none() {
                                 self.ctx.launch3("qsa_flash_wk8", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else {
                                 self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
