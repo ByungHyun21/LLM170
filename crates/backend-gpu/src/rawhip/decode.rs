@@ -2828,8 +2828,50 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let si = seqs[s];
                     kv_to_f16(&self.ctx, ak_row, self.kv_k16[full_idx][si], 0, pos * n_kv * hd, n_kv * hd)?;
                     kv_to_f16(&self.ctx, av_row, self.kv_v16[full_idx][si], 0, pos * n_kv * hd, n_kv * hd)?;
-                    // flash per-seq (t=1)
-                    {
+                    // flash per-seq (t=1) — plans/74 N3: 종전 평문 qsa_flash
+                    // (gx=1, gy=n_head → 24블록)는 npt4 에서 64런치 직렬
+                    // 20.4ms/step 였다. t=1 디코드 경로와 동일 gqa2d(v_dot2
+                    // f16) + merge — sg 세그먼트 병렬. part 스크래치는 행별
+                    // 분할(공유 충돌 회피). LLM170_NO_NPGQA=1 이면 종전 판.
+                    let np_gqa = std::env::var_os("LLM170_NO_NPGQA").is_none()
+                        && std::env::var_os("LLM170_NO_FLASH").is_none()
+                        && std::env::var_os("LLM170_NO_GQA2D").is_none()
+                        && hd <= 256
+                        && n_head % n_kv == 0;
+                    if np_gqa {
+                        let sg = ((pos + 1) / 64).clamp(32, 256);
+                        let nseg = (pos + 1).div_ceil(sg).max(1);
+                        // 행별 nseg 가 pos 로 달라진다 — stride 는 최대 nseg 기준
+                        // 단일 버퍼(스크래치 크기 키 균일), 행은 오프셋 분할.
+                        let pos_max = poss.iter().map(|&p| p as usize).max().unwrap_or(0);
+                        let nseg_max = ((pos_max + 1).div_ceil(((pos_max + 1) / 64).clamp(32, 256))).max(1);
+                        let part = self.ctx.scratch(t * n_head * nseg_max * (hd + 2) * 4)?;
+                        let prow = unsafe { part.add(s * n_head * nseg_max * (hd + 2) * 4) };
+                        let mut qp = aq_row as *mut std::ffi::c_void;
+                        let mut k16 = self.kv_k16[full_idx][seqs[s]] as *mut std::ffi::c_void;
+                        let mut v16 = self.kv_v16[full_idx][seqs[s]] as *mut std::ffi::c_void;
+                        let mut mp = mask as *mut std::ffi::c_void;
+                        let mut pp2 = prow as *mut std::ffi::c_void;
+                        let mut np_ = (pos + 1) as i32;
+                        let mut nh = n_head as i32;
+                        let mut nk = n_kv as i32;
+                        let mut h = hd as i32;
+                        let mut tl = 1i32;
+                        let mut ss = self.ctx_len as i32;
+                        let mut p0 = pos as i32;
+                        let mut sg_a = sg as i32;
+                        let args16: Vec<*mut std::ffi::c_void> = vec![
+                            Self::p(&mut qp), Self::p(&mut k16), Self::p(&mut v16), Self::p(&mut mp),
+                            Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk),
+                            Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0),
+                            Self::p(&mut sg_a),
+                        ];
+                        let mut args16 = args16;
+                        self.ctx.launch3("qsa_flash_gqa2d", 1, n_kv as u32, nseg as u32, 256, &mut args16)?;
+                        let mut op = unsafe { self.aout_t.add(s * n_head * hd * 4) } as *mut std::ffi::c_void;
+                        let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
+                        self.ctx.launch3("qsa_flash_merge", 1, n_head as u32, 1, 256, &mut margs)?;
+                    } else {
                         let mut qp = aq_row as *mut std::ffi::c_void;
                         let mut ckp = self.kv_k16[full_idx][seqs[s]] as *mut std::ffi::c_void;
                         let mut cvp = self.kv_v16[full_idx][seqs[s]] as *mut std::ffi::c_void;
@@ -3416,20 +3458,39 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
     /// [t][row_f32] logits의 행별 GPU argmax — 토큰만 회수 (np greedy/MTP verify).
     /// 행당 1블록(64레인) 발사 후 8·t 바이트 단일 d2h(d2h가 스트림을 동기화).
     pub fn argmax_rows(&self, base: *mut u8, t: usize, row_f32: usize) -> Result<Vec<u32>, String> {
-        let sc = self.ctx.scratch(t.max(1) * 8)?;
-        for s in 0..t {
-            let mut xp = unsafe { base.add(s * row_f32 * 4) } as *mut std::ffi::c_void;
-            let mut n2 = row_f32 as i32;
-            let mut op = unsafe { sc.add(s * 8) } as *mut std::ffi::c_void;
+        // 병렬 2단계 (plans/74 N3) — argmax64 1블록 판은 vocab 248k 에서
+        // ~1.2ms/행의 직렬 꼬리였다(npt4 KTRACE 4.8ms/step).
+        let nblk = (row_f32 / 4096).clamp(1, 64) as u32;
+        let part = self.ctx.scratch(t.max(1) * nblk as usize * 8)?;
+        let outb = self.ctx.scratch(t.max(1) * 8 + 8 * nblk as usize * t.max(1))?;
+        // out 을 part 와 다른 크기 슬롯에: scratch 는 크기 키 슬롯0 재사용.
+        let out = unsafe { outb.add(t.max(1) * nblk as usize * 8) };
+        {
+            let mut xp = base as *mut std::ffi::c_void;
+            let mut vb = row_f32 as i32;
+            let mut pp = part as *mut std::ffi::c_void;
+            let mut nb = nblk as i32;
             let mut args = vec![
                 (&mut xp) as *mut _ as *mut std::ffi::c_void,
-                (&mut n2) as *mut _ as *mut std::ffi::c_void,
-                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut vb) as *mut _ as *mut std::ffi::c_void,
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx.launch("argmax64", 1, 1, 64, &mut args)?;
+            self.ctx.launch3("argmax_rows_s1", nblk, t.max(1) as u32, 1, 256, &mut args)?;
+        }
+        {
+            let mut pp = part as *mut std::ffi::c_void;
+            let mut op = out as *mut std::ffi::c_void;
+            let mut nb = nblk as i32;
+            let mut args = vec![
+                (&mut pp) as *mut _ as *mut std::ffi::c_void,
+                (&mut op) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3("argmax_rows_s2", t.max(1) as u32, 1, 1, 64, &mut args)?;
         }
         let mut r8 = vec![0u8; t * 8];
-        self.ctx.d2h(&mut r8, sc)?;
+        self.ctx.d2h(&mut r8, out)?;
         Ok((0..t)
             .map(|s| {
                 let b = &r8[s * 8..s * 8 + 8];
