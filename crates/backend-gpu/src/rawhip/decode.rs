@@ -1991,14 +1991,22 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         }
         if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] step_batch ok"); }
         // head: 전 행 rms → quant → output 타일 → 행별 argmax
+        let t_r0 = std::time::Instant::now();
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
             self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
         let xq_sn = n / 4 + n / 32 + n / 16;
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
+        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            eprintln!("[vb] head prep: {:.1}ms", t_r0.elapsed().as_secs_f64() * 1e3);
+        }
         if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head tile t={t} ty={th} no={noh}"); }
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            let t_s0 = std::time::Instant::now();
+            self.ctx.sync()?;
+            eprintln!("[vb] trunk drain: {:.1}ms", t_s0.elapsed().as_secs_f64() * 1e3);
+        } else {
             self.ctx.sync()?;
         }
         let t_h0 = std::time::Instant::now();

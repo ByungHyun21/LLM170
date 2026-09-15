@@ -271,3 +271,31 @@ i.e. fixing the pathological qsa_flash_wmma (60 t/s vs wk8i 360 on the
 current ROCm 10 runtime, re-confirmed today; numerics correct per
 wmma-attn-check, roof test shows the hardware path at 24.6 TFLOPS —
 spill is the prime suspect given QA[8]+fc[8] fragment liveness).
+
+## MTP spec on hip: acceptance is PERFECT, the verify batch is not amortized (2026-09-15, evening)
+
+The README's 23.5/31.0 t/s MTP cells were Vulkan-era measurements
+(2026-09-12). On the hip path MTP runs at 5.71 t/s (spec3, tg128) —
+investigated with LLM170_SPEC_TIMING + KTRACE:
+
+- **Acceptance is not the problem**: acc=4/4 per cycle (spec3 accepts all
+  three drafts), greedy stream equality holds.
+- **The verify trunk is**: a t=4 verify costs 296.9ms of GPU (trunk-drain
+  mark added to verify_batch) vs ~75ms for a single-token step — 3.9x for
+  4 rows, i.e. **zero weight amortization**. Cycle = draft 28ms + verify
+  297ms + advance 4ms ≈ 330ms / 4 tokens ≈ 82ms/tok — barely better than
+  plain decode, and at larger context (the 5.71 bench) worse.
+- KTRACE of the verify: the MMQ tile family runs at gy=t (mmq_q5k
+  0.72ms/call vs 0.28ms for the t=1 GEMV on the same weight) and the
+  dedicated t=2..4 amortized path (`gemm_g4`, "one weight read, per-token
+  accumulation") is **not taken** — mm_b's g4 route is bypassed by the
+  grouping path the trunk uses (grp_mmq class gating).
+- Fix direction: route the verify trunk's t=4 batches through the
+  weight-amortized kernels (g4 or the j128 tiles with the token-quadrant
+  axis, both read weights once). Expected cycle ≈ draft 28 + verify
+  ~90ms + 4 ≈ 122ms/4tok ≈ **~30 t/s** (vs llama MTP 15.5). The new
+  debug marks ([vb] trunk drain / [vb] head prep) are env-gated and stay.
+
+Also: the bench tool's plain (non-spec) tg loop decodes only sequence 0 —
+`LLM170_BENCH_NP=4` without `--spec` does not measure a true 4-way
+aggregate (needs a fix before quoting np4 cells).
