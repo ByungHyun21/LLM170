@@ -84,6 +84,12 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | np4 aggregate | TFNPP4 | TFNP4 | TFNPP4V | TFNP4V | LFNPP4 | LFNP4 |
 | MTP + np4 | — | — | — | — | — | — |
 
+(Flash-Next np cells are unmeasured: the device frame path decodes one
+sequence per forward — there is no np batched decode yet, so an np4 aggregate
+would report the single-stream rate (~18 t/s total) rather than a batched
+figure. Batching the frame decode is the structural gap vs llama's graph
+executor for this model.)
+
 Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Build & run
