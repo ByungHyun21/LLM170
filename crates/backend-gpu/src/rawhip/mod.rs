@@ -1203,8 +1203,10 @@ impl RawCtx {
         // 원판(블록 64) 대비 np4 마이크로벤치 +4.5%, 토큰 A/B 동일.
         // LLM170_NO_Q5K4W2=1 이면 원판 복귀.
         let w2 = ty == 13 && std::env::var_os("LLM170_NO_Q5K4W2").is_none();
+        // q4_K 도 워프=행 기본(인터리브 3회: 30.6/30.0 vs 31.0/31.1/32.2).
+        let w2q4 = ty == 12 && std::env::var_os("LLM170_NO_Q4K4W2").is_none();
         let kern = match ty {
-            12 => "gemm_q4k4",
+            12 => if w2q4 { "gemm_q4k4_w2" } else { "gemm_q4k4" },
             13 => if w2 { "gemm_q5k4_w2" } else { "gemm_q5k4" },
             14 => "gemm_q6k4",
             23 => "gemm_xs4",
@@ -1235,7 +1237,7 @@ impl RawCtx {
         if w2 && std::env::var_os("LLM170_G4_TRACE").is_some() {
             eprintln!("[g4w2] n_in={n_in} n_out={n_out} t={t} gy={gy} gz={gz}");
         }
-        let blk: u32 = if w2 { 32 } else { 64 };
+        let blk: u32 = if w2 || w2q4 { 32 } else { 64 };
         self.launch3(kern, 1, gy, gz, blk, &mut args)
     }
 

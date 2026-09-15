@@ -449,3 +449,68 @@ extern "C" __global__ void gemm_q5k4_w2(const unsigned* xq, const unsigned* w,
     }
     (void)sh32;
 }
+
+// q4_K 4-토큰 GEMV — 워프=행 실험(q5k4_w2 의 성공 처방 이식, plans/74 N3).
+// 레인 l = tid(0..31), 스트라이드 32. 산술은 원판과 행별 동일 순서.
+extern "C" __global__ void gemm_q4k4_w2(const unsigned* xq, const unsigned* w,
+                                     float* out, int n_in, int n_out, int xq_w, int t) {
+    int o = blockIdx.y + blockIdx.z * gridDim.y;
+    int l = threadIdx.x;
+    if (o >= n_out) return;
+    int n_sub = n_in >> 5;
+    int cnt = (n_sub + 31 - l) >> 5;
+    int blocks = n_in >> 8;
+    int row_base = o * blocks * 144;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int m = 0; m < cnt; m++) {
+        int sb = l + (m << 5);
+        int js = sb & 7;
+        int it = js >> 1;
+        int half = js & 1;
+        int wb = row_base + (sb >> 3) * 144;
+        int wq = wb >> 2;
+        unsigned w0 = w[wq];
+        float d = bits_f16(w0 & 0xFFFFu);
+        float dm = bits_f16(w0 >> 16);
+        unsigned sc0 = w[wq+1], sc1 = w[wq+2], sc2 = w[wq+3];
+        unsigned r = (js & 3) * 8;
+        unsigned b_j   = js < 4 ? (sc0 >> r) & 0xFFu : (sc1 >> r) & 0xFFu;
+        unsigned b_j4  = js < 4 ? (sc1 >> r) & 0xFFu : (sc2 >> r) & 0xFFu;
+        unsigned b_jm4 = (sc0 >> r) & 0xFFu;
+        unsigned sc_v, m_v;
+        if (js < 4) { sc_v = b_j & 63u; m_v = b_j4 & 63u; }
+        else {
+            sc_v = (b_j4 & 0xFu) | ((b_jm4 >> 6) << 4);
+            m_v  = (b_j4 >> 4) | ((b_j >> 6) << 4);
+        }
+        int qlb = wq + 4 + it * 8;
+        unsigned q0 = w[qlb], q1 = w[qlb+1], q2 = w[qlb+2], q3 = w[qlb+3];
+        unsigned q4 = w[qlb+4], q5 = w[qlb+5], q6 = w[qlb+6], q7 = w[qlb+7];
+        int xw = (sb << 5) >> 2;
+        int nsh = half << 2;
+        int qsb = (n_in >> 2) + (n_in >> 5);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            if (k >= t) break;
+            const unsigned* xk = xq + (size_t)k * xq_w;
+            unsigned y0 = xk[xw], y1 = xk[xw+1], y2 = xk[xw+2], y3 = xk[xw+3];
+            unsigned y4 = xk[xw+4], y5 = xk[xw+5], y6 = xk[xw+6], y7 = xk[xw+7];
+            int isum = 0;
+            #pragma unroll
+            for (int kk = 0; kk < 8; kk++) {
+                unsigned qv = kk < 4 ? (kk==0?q0:kk==1?q1:kk==2?q2:q3) : (kk==4?q4:kk==5?q5:kk==6?q6:q7);
+                unsigned yv = kk < 4 ? (kk==0?y0:kk==1?y1:kk==2?y2:y3) : (kk==4?y4:kk==5?y5:kk==6?y6:y7);
+                unsigned nibw = (qv >> nsh) & 0x0F0F0F0Fu;
+                isum = dot4(nibw, yv, isum);
+            }
+            int qsum = (int)xk[qsb + (sb << 1)] + (int)xk[qsb + (sb << 1) + 1];
+            float yd = __uint_as_float(xk[(n_in >> 2) + sb]);
+            acc[k] += yd * (d * (float)sc_v) * (float)isum;
+            acc[k] -= yd * (dm * (float)m_v) * (float)qsum;
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int k = 0; k < 4; k++) out[(size_t)k * n_out + o] = acc[k];
+    }
+}
