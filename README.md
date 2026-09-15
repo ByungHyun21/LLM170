@@ -74,7 +74,7 @@ MTP+np4 20.4 is 0.58x — aggregate throughput favors llama; single-stream MTP
 
 | backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|
-| LLM170 hip | **264** | **241** | 17.5-18.0 | 16.8-17.5 |
+| LLM170 hip | **264** | **241** | 18.3-18.7 | 16.8-17.5 |
 | LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
 
@@ -87,7 +87,7 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | **17.5-18.0** (ctx 4k) / **16.8-17.5** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
+| tg single | — | **18.3-18.7** (ctx 4k) / **16.8-17.5** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
 | MTP single | — | — | — | — | — | — |
 | np4 aggregate | — | **21.0-22.5** | TFNPP4V | TFNP4V | — | **39.4** |
 | MTP + np4 | — | — | — | — | — | — |
