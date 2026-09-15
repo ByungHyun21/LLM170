@@ -238,3 +238,23 @@ keys with weight 1. After both fixes the kernel is numerically sane
 pp16384 234 vs wk8i 253 — kept as an asset; the identified next step is a
 WMMA/tensor-core PV. Prefill seg sweep at 16k: 1024 optimal (2048→249.7,
 4096→246.0).
+
+## plans/73 — wk8d PV experiments (2026-09-15, session 2 tail)
+
+Two PV variants for the opt-in `qsa_flash_wk8d`, both negative:
+1. **pf transposed to [key][query]** so each thread reads the 8 query
+   probabilities for a key as one contiguous 32B load (was 8 scattered
+   broadcast LDS per key): pp16384 234.3/233.4 — **neutral** (broadcast
+   reads were already conflict-free).
+2. **PV via v_dot2 with a transposed V tile** (vT[dim][key+pad] shared,
+   P stored f16, per-(dim,query) 16 dot2 over the 32 keys): pp16384
+   211.9/209.9 — **regression** (the strided transposed V store costs
+   more than the ~8x instruction reduction saves; shared budget also
+   grew). Sanity output still matched wk8i's tokens at t=129.
+Both reverted; the scalar-PV wk8d (234) stays the opt-in best, still
+behind wk8i's 253. Conclusion recorded for the next attempt: the win
+requires keeping V row-major AND tensor-core fragments (WMMA) for PV —
+i.e. fixing the pathological qsa_flash_wmma (60 t/s vs wk8i 360 on the
+current ROCm 10 runtime, re-confirmed today; numerics correct per
+wmma-attn-check, roof test shows the hardware path at 24.6 TFLOPS —
+spill is the prime suspect given QA[8]+fc[8] fragment liveness).

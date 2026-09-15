@@ -823,7 +823,7 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8d(
     constexpr int KS = 258;
     __shared__ half q16[8][256];
     __shared__ half kv16[32 * KS];
-    __shared__ float pf[8][32];
+    __shared__ float pf[8][32];          // 확률(스레드=dim 전달)
     __shared__ float stnew[8];
     __shared__ float smfin[8], sfin[8];
 
@@ -922,7 +922,9 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8d(
         __syncthreads();
         {
             // 각 스레드(=dim)가 블록의 8쿼리 전부에 누적 — V 행은 1회만 읽는다.
-            // (초판은 자기 워프의 쿼리만 봐 쿼리 w 행의 dims 32w..32w+31 만 채웠다.)
+            // (plans/73 부정결과 2건 기록: pf 전치 32B 벡터화 — 중립(234); PV 를
+            // v_dot2+V전치로 — 211로 역행(전치 적재 비용이 명령 절감을 초과).
+            // 둘 다 스칼라 판 이하라 원판 유지. WMMA 급 해법이 다음 과제.)
             float ar[8];
             #pragma unroll
             for (int r2 = 0; r2 < 8; r2++) ar[r2] = acc[r2];
