@@ -5,21 +5,24 @@ numbers on the dev machine (Radeon 8060S, gfx1151, 32-thread CPU) unless
 noted. Relative regression tracking only — absolute cross-machine comparison
 is out of scope.
 
-> **파일별 실측 기록은 `docs/source/`로 분리했다** (코드 경로 1:1, 계측기 플래그 표와
-> 검증 게이트 포함). 이 문서는 요약 지표와 모델 간 비교를 담는다. 새 측정은 해당
-> 소스 파일의 `docs/source/...` 문서에 먼저 적고, 지표가 바뀌면 여기 요약표를 갱신한다.
+> **Per-file measurement records live in `docs/source/`** (1:1 with code paths,
+> including instrumentation flag tables and verification gates). This document
+> holds summary metrics and cross-model comparisons. New measurements go into
+> the relevant `docs/source/...` file first; this summary table is updated
+> when a headline number changes.
 
-## 이력은 어디에 있나
+## Where is the history
 
-이 문서는 **요약 지표와 기준**만 담는다. 날짜별 측정 이력은 영역별로 옮겼다:
+This document holds **summary metrics and baselines only**. Dated measurement
+history has been moved to per-area archives:
 
-| 문서 | 내용 |
+| Document | Contents |
 |---|---|
-| `docs/source/<경로>.md` | **파일별 실측**(코드 1:1) + 계측기 플래그 표 + 검증 게이트 |
-| `docs/archive/vulkan-history.md` | Vulkan 백엔드 시기(plans/29-40 등) 측정·감사 |
-| `docs/archive/qwen35-history.md` | 27B/GDN 관련 이력 |
-| `docs/archive/hip-kernel-history.md` | HIP 커널·타일·프리필/디코드 라운드 이력 |
-| `docs/archive/misc-history.md` | 그 외(비전·MTP·프로토콜 등) |
+| `docs/source/<path>.md` | **Per-file measurements** (1:1 with code) + instrumentation flags + gates |
+| `docs/archive/vulkan-history.md` | Vulkan backend era measurements and audits |
+| `docs/archive/qwen35-history.md` | 27B/GDN-related history |
+| `docs/archive/hip-kernel-history.md` | HIP kernel, tile, and prefill/decode rounds |
+| `docs/archive/misc-history.md` | Others (vision, MTP, protocols, etc.) |
 
 ## ROCm 10 userspace adopted — same binary, +28-41% for llama.cpp (2026-09-14)
 

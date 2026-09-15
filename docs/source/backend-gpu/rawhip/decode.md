@@ -1,7 +1,7 @@
-# `crates/backend-gpu/src/rawhip/decode.rs` — 측정 기록
+# `crates/backend-gpu/src/rawhip/decode.rs` — measurement record
 
-> `docs/benchmarks.md`에서 **이 파일에 해당하는 항목만** 옮긴 것(제목 기준).
-> 표·수치는 원문 그대로. 요약 지표는 benchmarks.md에 남는다.
+> Items from `docs/benchmarks.md` that correspond to this file (by section title).
+> Tables and numbers are verbatim. Summary metrics remain in benchmarks.md.
 
 ## qwen35 — Qwen3.8-27B, UD-Q4_K_XL
 
@@ -185,13 +185,14 @@ only 10.6 GB/s, i.e. compute/tile limited, which is what the plans/66 P1-style w
 
 
 
-## 27B 프리필의 커널 지도 (2026-09-14, KTRACE 수리 후 정확값)
+## WB prefill kernel map (2026-09-14, accurate after KTRACE fix)
 
-수리된 KTRACE로 pp512(warm)을 재측정하면 **커널 1,386.1ms + 갭 24.7ms = 1,410.8ms**로
-벽시계 1,518ms의 93%가 설명된다. 갭 비중은 **1.7%**뿐이다 — 즉 27B 프리필은 **커널
-바운드**이고, Flash-Next(갭 43%)와 정반대다. 최적화 레버는 커널 안에만 있다.
+Re-measuring pp512 (warm) with the fixed KTRACE: **kernel 1,386.1ms + gap
+24.7ms = 1,410.8ms**, explaining 93% of the 1,518ms wall clock. The gap is
+only **1.7%** — 27B prefill is **kernel-bound**, the opposite of Flash-Next
+(gap 43%). The optimization lever is inside the kernels.
 
-| 커널 | 시간 | 콜 | 비중 |
+| Kernel | Time | Calls | Share |
 |---|---|---|---|
 | mmq_q5k | 506.1 ms | 161 | 37% |
 | mmq_xs | 237.2 ms | 67 | 17% |
@@ -201,7 +202,8 @@ only 10.6 GB/s, i.e. compute/tile limited, which is what the plans/66 P1-style w
 | gemm_q8_j128 | 30.5 ms | 108 | 2% |
 | silu_mul_f32 | 28.5 ms | 64 | 2% |
 
-`mmq_*`가 합계의 77%다. 2 x 512 x 27e9 ≈ 27.6 TFLOP를 1.386s에 처리하므로 **19.9 TFLOPS
-= wmma 피크(59)의 34%** — 여유가 크지만 레버는 타일/WMMA 계열 커널 재작성(plans/66 P1)이다.
-부수 확인: `LLM170_KTRACE` 수리 전에는 이 프리필이 366ms로 4배 과소 보고됐다(qsa.md의
-페어링 항목 참조).
+`mmq_*` accounts for 77% of the total. Processing 2 x 512 x 27e9 ≈ 27.6 TFLOP
+in 1.386s gives **19.9 TFLOPS = 34% of the wmma peak (59)** — headroom exists
+but the lever is tile/WMMA-family kernel rewrites (plans/66 P1).
+Side note: before the `LLM170_KTRACE` fix, this prefill was under-reported
+4x at 366ms (see the pairing entry in qsa.md).
