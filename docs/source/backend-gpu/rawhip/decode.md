@@ -1,5 +1,18 @@
 # `crates/backend-gpu/src/rawhip/decode.rs` — measurement record
 
+## Index (2026-09-15 regroup)
+
+**Adopted**: adaptive decode segment (sg with ctx) · `qsa_flash_wk8i`
+(4-key register ILP, bit-identical, default) · (see q4acc.md for the
+decode kernel family).
+
+**Rejected**: shared-tile wk8i (pp16k 257→209) · `qsa_flash_wk8d` as
+default (PV-bound; opt-in LLM170_WK8D=1 — includes the two PV variants,
+transposed-pf neutral 234 and v_dot2+transposed-V regression 211) ·
+prefill seg >1024 · WMMA attention default (60 t/s on current ROCm 10 —
+numerics correct, spill suspected; LLM170_WK_WMMA=1).
+
+
 > Items from `docs/benchmarks.md` that correspond to this file (by section title).
 > Tables and numbers are verbatim. Summary metrics remain in benchmarks.md.
 
