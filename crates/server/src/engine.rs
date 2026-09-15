@@ -158,7 +158,18 @@ pub fn slot_loop(
     const EOS: u32 = 248044;
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
     let mut tick: u64 = 0;
+    let npw = std::env::var_os("LLM170_WALL_TIME").is_some();
+    let t0w = std::time::Instant::now();
+    let mut last_wt = std::time::Instant::now();
     loop {
+        if npw {
+            let now = std::time::Instant::now();
+            let dt = last_wt.elapsed().as_secs_f64();
+            if dt > 0.05 {
+                eprintln!("[wall] +{dt:.2}s @{}s", t0w.elapsed().as_secs_f64());
+            }
+            last_wt = now;
+        }
         // ① 새 작업 drain — 전 슬롯 점유 시 큐에 잔류 (bounded: http측 503)
         // 회귀 픽스(2026-09-16): 종전엔 try_recv로 꺼낸 뒤 "슬롯 점유"를 발견하면
         // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
@@ -344,6 +355,9 @@ pub fn slot_loop(
                     };
                     (end, r)
                 };
+                if npw {
+                    eprintln!("[wall] prefill slot{i} {start}tok done @{}s", t0w.elapsed().as_secs_f64());
+                }
                 if let Ok(l) = logits {
                     slots[i].prefilled = start;
                     if start == slots[i].job.as_ref().unwrap().tokens.len() {

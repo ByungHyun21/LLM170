@@ -1247,7 +1247,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // 전부 건너뛰고 커널이 ids[row]를 직접 읽는다. 행 순서가 곧 ids 순서라
         // 가중합(ys[e*n+i])이 그대로 맞고, 호스트 왕복(ids d2h+빌드+h2d)도 없다.
         // t=1에서는 k_sel행이 같은 벡터이므로 스트라이드 0으로 0번 행을 읽는다.
-        if self.t_cur() == 1
+        // plans/74: direct-ids 는 행 수만 보면 된다 — np t=4(k_sel×4=40행)도
+        // 이 빠른 경로로(그룹화 경로는 프리필 대량 행 전용). rows<=64 게이트로
+        if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q4K
             && !f32w
             && std::env::var_os("LLM170_MOE_GROUPED").is_none()
@@ -1322,7 +1324,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // 종전엔 캐시 미스가 q4_moe_group_t1 커널 + 비동기 d2h를 매층 발사하고
         // 곧바로 direct-ids로 반환해 그 작업이 전부 쓰레기였다(0.034ms × 48층
         // + 스텝당 48회의 d2h_issue).
-        if self.t_cur() == 1
+        if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q5_1
             && !f32w
             && rows > 0
@@ -1362,7 +1364,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             return Ok(());
         }
         // plans/73: Q8_0 다운 전문가도 direct-ids 워프판으로 — 종전엔 이 층들이
-        if self.t_cur() == 1
+        if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q8_0
             && !f32w
             && rows > 0
