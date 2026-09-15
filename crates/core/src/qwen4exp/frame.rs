@@ -456,6 +456,33 @@ pub fn frame_forward(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<Vec<f32>, Q4Error> {
+    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, false).map(|(l, _)| l)
+}
+
+/// greedy 판 — head 후 전사 대신 GPU argmax 로 토큰만 회수(plans/74).
+pub fn frame_forward_greedy(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seq: usize,
+    seq_st: &mut SeqState4,
+    f: &mut Frame4,
+    tokens: &[u32],
+) -> Result<u32, Q4Error> {
+    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, true).map(|(_, t)| t.expect("greedy token"))
+}
+
+#[allow(clippy::too_many_lines)]
+fn frame_forward_ex(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seq: usize,
+    seq_st: &mut SeqState4,
+    f: &mut Frame4,
+    tokens: &[u32],
+    greedy: bool,
+) -> Result<(Vec<f32>, Option<u32>), Q4Error> {
     let hp: &Hparams4 = &model.hp;
     let (n, hc) = (hp.n_embd, hp.hc);
     let k_len = hp.n_group * hp.d_state;
@@ -711,6 +738,12 @@ pub fn frame_forward(
         let hin = if t > 1 { f.hin_last } else { f.hin };
         let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
+        if greedy {
+            // GPU argmax — vocab×4B 전사·CPU 스캔 회피(plans/74).
+            let toks = acc.frame_argmax_rows(f.logits, 1, hp.vocab).map_err(Q4Error::Io)?;
+            ftime_report(t);
+            return Ok((Vec::new(), Some(toks[0])));
+        }
         let mut logits = vec![0.0f32; hp.vocab];
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
@@ -726,7 +759,7 @@ pub fn frame_forward(
                 idx[..5].iter().map(|&i| (i, logits[i])).collect::<Vec<_>>()
             );
         }
-        Ok(logits)
+        Ok((logits, None))
     }
 }
 
@@ -1173,6 +1206,19 @@ pub fn decode_frame(
     token: u32,
 ) -> Result<Vec<f32>, Q4Error> {
     frame_forward(acc, model, ctx, seq, seq_st, f, &[token])
+}
+
+/// decode_frame 의 greedy 판 — head 후 로짓 전사 대신 GPU argmax(plans/74).
+pub fn decode_frame_greedy(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seq: usize,
+    seq_st: &mut SeqState4,
+    f: &mut Frame4,
+    token: u32,
+) -> Result<u32, Q4Error> {
+    frame_forward_greedy(acc, model, ctx, seq, seq_st, f, &[token])
 }
 
 /// QSA 프레임 (plans/67 2c) — 투영·norm·rope·어텐션·wo 전부 디바이스 상주.

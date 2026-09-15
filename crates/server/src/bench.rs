@@ -164,12 +164,12 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
                         llm170_backend_gpu::rawhip::ktrace_on();
                     }
-                    let l = eng.decode1(0, next).map_err(|e| e.to_string())?;
                     if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
                         eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
                         kt_done = true;
                     }
-                    next = llm170_core::model::greedy(&l);
+                    // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
+                    next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
                     n_gen += 1;
                     step += 1;
                     if next == eos {

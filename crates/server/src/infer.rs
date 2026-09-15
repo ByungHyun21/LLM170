@@ -372,8 +372,8 @@ fn run_q4_infer(
                     }
                 } else {
                     for &s in &active {
-                        let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
-                        if let Some(k) = dbg_topk {
+                        let t = if let Some(k) = dbg_topk {
+                            let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
                             let mut idx: Vec<usize> = (0..l.len()).collect();
                             idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
                             let top: Vec<String> = idx[..k.min(l.len())]
@@ -381,8 +381,10 @@ fn run_q4_infer(
                                 .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
                                 .collect();
                             eprintln!("topk-dec seq{s}: {}", top.join(" "));
-                        }
-                        let t = llm170_core::model::greedy(&l);
+                            llm170_core::model::greedy(&l)
+                        } else {
+                            eng.decode1_greedy(s, next[s]).map_err(|e| e.to_string())?
+                        };
                         next[s] = t;
                         pos[s] += 1;
                         println!(
