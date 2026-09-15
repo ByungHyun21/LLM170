@@ -896,6 +896,25 @@ impl Q4Acc {
                 &mut args,
             );
         }
+        // plans/73: t=1은 워프-퍼-출력판 — 저출력(hc inject [10240→4])·라우터
+        // 형상에서 원판 대비 3-6×. 누산 재배열 편차는 게이트로 검증.
+        if t == 1 && n_in % 4 == 0 && std::env::var("LLM170_F32W").as_deref() != Ok("0") {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.ctx.launch3(
+                "q4_gemm_f32_w",
+                n_out.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            );
+        }
         let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
         let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -1280,6 +1299,47 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     &mut rargs,
                 )?;
             }
+            return Ok(());
+        }
+        // plans/73: Q5_1 다운의 direct-ids를 **그룹화 캐시 평가 전에** 올린다 —
+        // 종전엔 캐시 미스가 q4_moe_group_t1 커널 + 비동기 d2h를 매층 발사하고
+        // 곧바로 direct-ids로 반환해 그 작업이 전부 쓰레기였다(0.034ms × 48층
+        // + 스텝당 48회의 d2h_issue).
+        if self.t_cur() == 1
+            && ws.ty == GgmlType::Q5_1
+            && !f32w
+            && rows > 0
+            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+        {
+            let idp = self.fptr(ids)?;
+            let mut x_p = xq as *mut std::ffi::c_void;
+            let mut w_p = wd as *mut std::ffi::c_void;
+            let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
+            let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
+            let mut ip = idp as *mut std::ffi::c_void;
+            let (mut ni, mut no) = (n_in as i32, n_out as i32);
+            let (mut xw, mut tt) = (xq_w as i32, rows as i32);
+            let mut ew = (per_expert / 4) as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut part_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ip) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ew) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_gemm_q5_1_gm_ids",
+                n_out.div_ceil(16) as u32,
+                rows.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
             return Ok(());
         }
         let ne = n_expert_stack.max(1);
@@ -3114,6 +3174,28 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
             let ofdev = e2.ensure(&self.ctx, 2 * 4)? as u64;
             (sdev, ofdev)
         };
+        if n_blocks > 0 && n_blocks <= 4096 && std::env::var("LLM170_QSA_TOPK").as_deref() != Ok("0")
+        {
+            // 비토닉 단일 블록판 — rank+expand 콤보 대비 ~20×(0.228 → ~0.01ms).
+            let (mut sp, mut si, mut so) = (
+                scr as *mut std::ffi::c_void,
+                sdev as *mut std::ffi::c_void,
+                ofdev as *mut std::ffi::c_void,
+            );
+            let (mut nb, mut ns, mut rr, mut np) =
+                (n_blocks as i32, n_sel as i32, r as i32, n_past as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut si) as *mut _ as *mut std::ffi::c_void,
+                (&mut so) as *mut _ as *mut std::ffi::c_void,
+                (&mut nb) as *mut _ as *mut std::ffi::c_void,
+                (&mut ns) as *mut _ as *mut std::ffi::c_void,
+                (&mut rr) as *mut _ as *mut std::ffi::c_void,
+                (&mut np) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3("q4_idx_topk", 1, 1, 1, 256, &mut args)?;
+            return Ok((sdev, ofdev, list_len));
+        }
         {
             let selflag = {
                 let mut g = self.qsa_selflag.lock().map_err(|e| e.to_string())?;
