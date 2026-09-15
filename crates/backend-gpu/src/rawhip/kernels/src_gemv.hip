@@ -555,3 +555,154 @@ extern "C" __global__ void gemm_q8_0_w256(const unsigned* xq, const unsigned* w,
         if (l == 0) out[o] = (float)accd;
     }
 }
+
+// ─── plans/73: t=1 소형 GEMV 워프판 3종 ───
+// 공통 동기: 종전 레이아웃은 (a) 64스레드/출력 — n_sub가 작으면 대부분의 레인이
+// 놀고(hc up [320→10240]은 10/64), (b) 16출력×2행 타일 — 워프의 16레인이 480B
+// 간격의 행을 읽어 32B섹터당 4B만 사용(q5_1 down 8배 증폭, 72-89GB/s).
+// 워프가 한 행을 통째로 맡고 레인이 연속 서브블록을 읽으면 행 전체가 완전
+// 병합된다. 누산 순서는 변경(레인 sb-스트라이드 + 워프 트리) — f32 재배열
+// 편차 계열, 게이트 스트림 동일성으로 검증.
+
+// q8_0 무ids판 — hc up 등 t=1 소형 n_sub(≤32) 전용. ids 없이 w[o] 행 직접.
+extern "C" __global__ void __launch_bounds__(256) gemm_q8_0_w(const unsigned* xq, const unsigned* w,
+                                                              double* part, float* out,
+                                                              int n_in, int n_out, int xq_w) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int r = (int)blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (o >= n_out) return;
+    const int n_sub = n_in >> 5;
+    const int row_base = o * n_sub * 34;
+    const unsigned* xrow = xq + (size_t)r * xq_w;
+    float* orow = out + (size_t)r * n_out;
+    float acc = 0.0f;
+    for (int sb = lane; sb < n_sub; sb += 32) {
+        const int wb = row_base + sb * 34;
+        const float d = f16w(w, wb);
+        const int xw = (sb << 5) >> 2;
+        unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+        unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+        const int wq = wb >> 2;
+        const bool al = (wb & 3) == 2;
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) qv = w[wq + 1 + k];
+            else    qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            isum = dot4(qv, yv, isum);
+        }
+        const float yd = __uint_as_float(xrow[(n_in >> 2) + sb]);
+        acc += yd * d * (float)isum;
+    }
+    // 비트 동일 합산 — 레인 0이 sb 오름차순 직렬 가산(q4_gemm_q5_1_w_ids 참조).
+    // 원판 gemm_q8_0과 **비트 동일** 환원: f64 부분합 + 32레인 shfl_down 트리
+    // (n_sub ≤ 32이므로 원판의 64레인 상반부는 전부 0 — f64 +0.0은 항등).
+    double accd = (double)acc;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+    if (lane == 0) orow[o] = (float)accd;
+}
+
+// q5_1 ids판 — MoE down(direct-ids). 행마다 전문가가 다르다.
+// 종전 q4_gemm_q5_1_gm_ids는 워프의 16레인이 480B 간격 행을 읽어 32B섹터당
+// 4B만 사용(8배 증폭, 72-89GB/s). 여기선 워프가 한 행을 맡고 레인이 연속
+// 서브블록을 읽어 행 전체가 병합된다.
+// 합산은 원판과 **비트 동일**: 레인 l이 서브블록 l의 부분합을 내고 레인 0이
+// sb 오름차순으로 직렬 가산(n_sub ≤ 32 — 런치 조건 보장). 게이트 실측
+// (2026-09-15): 워프 트리 환원은 재배열 편차로 마지막 토큰을 플립했다
+// (1692→24902) — 이 순서 보존으로 해소.
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5_1_w_ids(const unsigned* xq, const unsigned* w,
+                                                                     double* part, float* out,
+                                                                     const unsigned* ids,
+                                                                     int n_in, int n_out, int xq_w,
+                                                                     int t, int expert_words) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int r = (int)blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (o >= n_out || r >= t) return;
+    const int n_sub = n_in >> 5;
+    const int wrow = n_sub * 6;
+    const unsigned* wr = w + (size_t)ids[r] * (size_t)expert_words + (size_t)o * wrow;
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    const unsigned ones = 0x01010101u;
+    float acc = 0.0f;
+    for (int sb = lane; sb < n_sub; sb += 32) {
+        const int wb = sb * 6;
+        const float d = bits_f16(wr[wb] & 0xFFFFu);
+        const float mn = bits_f16((wr[wb] >> 16) & 0xFFFFu);
+        const unsigned qh = wr[wb + 1];
+        const unsigned qsw0 = wr[wb + 2];
+        const unsigned qsw1 = wr[wb + 3];
+        const unsigned qsw2 = wr[wb + 4];
+        const unsigned qsw3 = wr[wb + 5];
+        const int xw = (sb << 5) >> 2;
+        int s_lo = 0, s_hi = 0, s1 = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qs4 = (k & 3) == 0 ? qsw0 : (k & 3) == 1 ? qsw1 : (k & 3) == 2 ? qsw2 : qsw3;
+            unsigned nib = (k < 4) ? (qs4 & 0x0F0F0F0Fu) : ((qs4 >> 4) & 0x0F0F0F0Fu);
+            unsigned hb = (qh >> (4 * k)) & 0xFu;
+            unsigned hb_p = (hb & 1u) << 4 | (hb & 2u) << 11 | (hb & 4u) << 18 | (hb & 8u) << 25;
+            unsigned y = xr[xw + k];
+            s_lo += dot4(nib, y, 0);
+            s_hi += dot4(hb_p, y, 0);
+            s1 += dot4(ones, y, 0);
+        }
+        const float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+        acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
+    }
+    float sum = 0.0f;
+    for (int sb2 = 0; sb2 < n_sub; sb2++)
+        sum += __shfl_sync(0xffffffffffffffffull, acc, sb2);  // 전 레인 참여(다이버전스 금지)
+    if (lane == 0) out[(size_t)r * n_out + o] = sum;
+}
+
+// q8_0 ids판 — Q8_0 down 전문가 직접 경로(그룹화 gather/scatter 불필요).
+// 주의: q8_0 행은 34B 단위라 워드 정렬이 없다 — ids/출력 오프셋은 모두
+// **바이트**로 계산해 기저 w에 절대 오프셋으로 접근한다(gemm_q8_0와 동일
+// 슬라이딩 워드 판독). expert_bytes = 전문가당 바이트.
+extern "C" __global__ void __launch_bounds__(256) gemm_q8_0_ids(const unsigned* xq, const unsigned* w,
+                                                                double* part, float* out,
+                                                                const unsigned* ids,
+                                                                int n_in, int n_out, int xq_w,
+                                                                int t, int expert_bytes) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int r = (int)blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (o >= n_out || r >= t) return;
+    const int n_sub = n_in >> 5;
+    const size_t row_base = (size_t)ids[r] * (size_t)expert_bytes + (size_t)o * (size_t)n_sub * 34u;
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    float acc = 0.0f;
+    for (int sb = lane; sb < n_sub; sb += 32) {
+        const size_t wb8 = row_base + (size_t)sb * 34u;
+        const float d = f16w(w, (int)wb8);
+        const int xw = (sb << 5) >> 2;
+        unsigned y0 = xr[xw], y1 = xr[xw+1], y2 = xr[xw+2], y3 = xr[xw+3];
+        unsigned y4 = xr[xw+4], y5 = xr[xw+5], y6 = xr[xw+6], y7 = xr[xw+7];
+        const int wq = (int)(wb8 >> 2);
+        const bool al = ((wb8 & 3) == 2);
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) qv = w[wq + 1 + k];
+            else    qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:y3) : (k==4?y4:k==5?y5:k==6?y6:y7);
+            isum = dot4(qv, yv, isum);
+        }
+        const float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+        acc += yd * d * (float)isum;
+    }
+    // 원판 gemm_q8_0과 **비트 동일** 환원: f64 부분합 + 32레인 shfl_down 트리
+    // (n_sub ≤ 32이므로 원판의 64레인 상반부는 전부 0 — f64 +0.0은 항등).
+    double accd = (double)acc;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+    if (lane == 0) out[(size_t)r * n_out + o] = (float)accd;
+}
