@@ -138,9 +138,11 @@ pub struct Q4Acc {
     qsa_iqw: std::sync::Mutex<(u64, GBuf)>,
     qsa_ikw: std::sync::Mutex<(u64, GBuf)>,
     qsa_csidx: std::sync::Mutex<(usize, usize, GBuf)>,
-    /// qk_norm_rope 상수 업로드 캐시(포인터/해시 키) — 매 스텝 3회 h2d+sync 제거.
-    qn_cache: std::sync::Mutex<(u64, usize)>,
-    kn_cache: std::sync::Mutex<(u64, usize)>,
+    /// qk_norm_rope 상수 업로드 캐시 — **(ptr,len) 키 맵**.
+    /// 단일 슬롯이던 시절엔 층마다 타일이 달라 매 층 미스 → 24KB+2KB 동기 복사
+    /// ×12층 = 3.4ms/층(스텝의 40ms)이 호스트를 세웠다 (2026-09-16 실측).
+    qn_map: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    kn_map: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     cst_cache: std::sync::Mutex<(usize, usize)>,
     /// plans/73: PLE conv 링 상주 상태 [seq] + 워터마크(접두 되감기 검출).
     ple_ring: std::sync::Mutex<std::collections::HashMap<usize, GBuf>>,
@@ -358,8 +360,8 @@ impl Q4Acc {
             qsa_iqw: std::sync::Mutex::new((0, GBuf::new("qsa_iqw"))),
             qsa_ikw: std::sync::Mutex::new((0, GBuf::new("qsa_ikw"))),
             qsa_csidx: std::sync::Mutex::new((0, 0, GBuf::new("qsa_csidx"))),
-            qn_cache: std::sync::Mutex::new((0, 0)),
-            kn_cache: std::sync::Mutex::new((0, 0)),
+            qn_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            kn_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             cst_cache: std::sync::Mutex::new((0, 0)),
             xperm: std::sync::Mutex::new(GBuf::new("xperm")),
             yperm: std::sync::Mutex::new(GBuf::new("yperm")),
@@ -2274,6 +2276,31 @@ impl Q4Acc {
         Ok(g.1.ptr)
     }
 
+    /// (ptr,len) 키 다중 엔트리 업로드 캐시 — 층별로 다른 상수를 상주시킨다.
+    /// 단일 슬롯이면 층마다 미스해 매층 동기 h2d가 발생한다(실측 3.4ms/층).
+    fn upload_map(
+        &self,
+        map: &std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+        name: &'static str,
+        data: &[f32],
+    ) -> Result<*mut u8, String> {
+        let key = (data.as_ptr() as u64, data.len());
+        let mut m = map.lock().map_err(|e| e.to_string())?;
+        if let Some(b) = m.get(&key) {
+            return Ok(b.ptr);
+        }
+        // 상한: 층 수 × 소수 항목이면 충분하다 — 넘치면 비운다(재업로드 비용 < 무한 증가).
+        if m.len() >= 64 {
+            m.clear();
+        }
+        let mut b = GBuf::new(name);
+        b.ensure(&self.ctx, data.len().max(1) * 4)?;
+        self.ctx.h2d(b.ptr, bytemuck::cast_slice(data))?;
+        let p = b.ptr;
+        m.insert(key, b);
+        Ok(p)
+    }
+
     /// 대형 상수(cs 테이블) 업로드 캐시 — (ptr, len) 키. 프레임 필드 벡터는
     /// 스텝 사이 포인터가 안정적이라 해시(4MB)보다 저렴하다.
     fn upload_by_ptr(
@@ -2922,23 +2949,16 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         t: usize,
     ) -> Result<(), String> {
         // 상수 3개(qn/kn/cs) — plans/73: 매 호출 h2d(+sync)가 스텝당 36회의
-        // 동기를 만들었다. 내용 해시(qn/kn)·포인터 키(cs)로 1회 업로드 캐시.
-        // cs(qsa_cs)는 Frame4 필드 벡터라 포인터가 안정적이다.
+        // 동기를 만들었다. **키는 (ptr,len)** — 내용 해시는 층마다 값이 달라
+        // 단일 슬롯 캐시가 매 층 미스했고(24KB+2KB 동기 복사 ×12층 = 40ms/스텝),
+        // 프레임이 헤드 타일을 1회 만들어 상주시키므로 포인터가 곧 신원이다.
+        // (2026-09-16: LLM170_Q4_TIME 계측 — qsa.mm+rope 3.4ms/층의 전부가 이 복사였다)
         let (qnd, knd, csd) = {
-            let qh = fnv_hash(q_norm);
-            let kh = fnv_hash(k_norm);
-            let mut a = (self.qn.lock().map_err(|e| e.to_string())?, self.qn_cache.lock().map_err(|e| e.to_string())?);
-            if a.1 .0 != qh || a.0.ptr.is_null() {
-                a.0.ensure(&self.ctx, q_norm.len().max(1) * 4)?;
-                self.ctx.h2d(a.0.ptr, bytemuck::cast_slice(q_norm))?;
-                *a.1 = (qh, q_norm.len());
-            }
-            let mut b = (self.kn.lock().map_err(|e| e.to_string())?, self.kn_cache.lock().map_err(|e| e.to_string())?);
-            if b.1 .0 != kh || b.0.ptr.is_null() {
-                b.0.ensure(&self.ctx, k_norm.len().max(1) * 4)?;
-                self.ctx.h2d(b.0.ptr, bytemuck::cast_slice(k_norm))?;
-                *b.1 = (kh, k_norm.len());
-            }
+            let qnd = self.upload_map(&self.qn_map, "qn_t", q_norm)?;
+            let knd = self.upload_map(&self.kn_map, "kn_t", k_norm)?;
+            let qh = q_norm.as_ptr() as u64;
+            let kh = k_norm.as_ptr() as u64;
+            let _ = (qh, kh);
             let cskey = (cs.as_ptr() as usize, cs.len());
             let mut c = (self.cst.lock().map_err(|e| e.to_string())?, self.cst_cache.lock().map_err(|e| e.to_string())?);
             if *c.1 != cskey || c.0.ptr.is_null() {
@@ -2946,7 +2966,7 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
                 self.ctx.h2d(c.0.ptr, bytemuck::cast_slice(cs))?;
                 *c.1 = cskey;
             }
-            (a.0.ptr, b.0.ptr, c.0.ptr)
+            (qnd, knd, c.0.ptr)
         };
         let mut qp = self.fptr(q)? as *mut std::ffi::c_void;
         let mut kp = self.fptr(k)? as *mut std::ffi::c_void;

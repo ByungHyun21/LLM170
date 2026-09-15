@@ -607,6 +607,140 @@ extern "C" __global__ void __launch_bounds__(256) gemm_q8_0_w(const unsigned* xq
     if (lane == 0) orow[o] = (float)accd;
 }
 
+// q8_0 GEMV — **16레인 × 4사분면** (2026-09-16). 종전 gemm_q8_0(64레인/행,
+// cnt=ceil(n_sub/64))은 n_sub=80 형상에서 두 번째 반복에 16레인만 활동해
+// 레인 효율 62.5%, 10240행 qkv에서 106GB/s(=DRAM 236의 45%)에 그쳤다.
+// 여기선 레인 t가 종전 레인 {t, t+16, t+32, t+48}의 누적을 **f32 체인 4개**로
+// 각각 유지하고(각 체인의 가산 순서 = 종전 레인과 동일), 종전 64레인 트리를
+// 같은 순서로 재구성한다:
+//   v[t] = acc[t] + acc[t+32]            → (a0 + a2)
+//   off16: v[t] += v[t+16]               → (a0+a2) + (a1+a3)
+//   off8/4/2/1: 16레인 그룹 내 셔플      → 동일 순서
+// 따라서 산술은 **비트 동일**, 레인 효율은 100%(n_sub≥16).
+// 4행/워프(16레인씩) + 128스레드/블록 = 8행/블록.
+extern "C" __global__ void __launch_bounds__(128) gemm_q8_0_w4(
+        const unsigned* xq, const unsigned* w, double* part, float* out,
+        int n_in, int n_out, int xq_w) {
+    const int lane = threadIdx.x & 31;
+    const int q = lane >> 4;                        // 16레인 그룹 = 행 슬롯
+    const int t = lane & 15;                        // 그룹 내 레인
+    const int rows_per_block = (blockDim.x >> 5) * 2;
+    const int o = (int)blockIdx.x * rows_per_block + (threadIdx.x >> 5) * 2 + q;
+    if (o >= n_out) return;
+    const int n_sub = n_in >> 5;
+    const int row_base = o * n_sub * 34;
+    const unsigned* xrow = xq + (size_t)blockIdx.y * xq_w;
+    float* orow = out + (size_t)blockIdx.y * n_out;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int l = t + 16 * j;
+        if (l >= n_sub) break;
+        float acc = 0.0f;
+        for (int sb = l; sb < n_sub; sb += 64) {
+            const int wb = row_base + sb * 34;
+            const float d = f16w(w, wb);
+            const int xw = (sb << 5) >> 2;
+            unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+            unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+            const int wq = wb >> 2;
+            const bool al = (wb & 3) == 2;
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qv;
+                if (al) qv = w[wq + 1 + k];
+                else    qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+                unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                    : (k==4?y4:k==5?y5:k==6?y6:y7);
+                isum = dot4(qv, yv, isum);
+            }
+            const float yd = __uint_as_float(xrow[(n_in >> 2) + sb]);
+            acc += yd * d * (float)isum;
+        }
+        if (j == 0) a0 = acc; else if (j == 1) a1 = acc; else if (j == 2) a2 = acc; else a3 = acc;
+    }
+    double accd = ((double)a0 + (double)a2) + ((double)a1 + (double)a3);
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1)
+        accd += __shfl_down_sync(0xffffffffffffffffull, accd, off, 16);
+    if (t == 0) orow[o] = (float)accd;
+}
+
+// q8_0 GEMV — 16레인/행(연속 서브블록) × 4행/워프 (2026-09-16).
+// w4(사분면 매핑)는 산술 비트 동일했지만 레인별 주소가 4덩어리로 흩어져
+// 코얼레싱이 나빠져 -9%였다(실측 15.64 vs 17.23). 여기선 레인이 **연속**
+// 서브블록을 맡아(n_sub=80 → 5회, 100% 레인) 워프가 행마다 544B 연속을 읽는다.
+// 산술 순서는 종전과 다르다(레인별 부분합 구성이 달라짐) → 게이트로 검증.
+extern "C" __global__ void __launch_bounds__(128) gemm_q8_0_w16(
+        const unsigned* xq, const unsigned* w, double* part, float* out,
+        int n_in, int n_out, int xq_w) {
+    const int lane = threadIdx.x & 31;
+    const int q = lane >> 4;
+    const int t = lane & 15;
+    const int rows_per_block = (blockDim.x >> 5) * 2;
+    const int o = (int)blockIdx.x * rows_per_block + (threadIdx.x >> 5) * 2 + q;
+    if (o >= n_out) return;
+    const int n_sub = n_in >> 5;
+    const int row_base = o * n_sub * 34;
+    const unsigned* xrow = xq + (size_t)blockIdx.y * xq_w;
+    float* orow = out + (size_t)blockIdx.y * n_out;
+    float acc = 0.0f;
+    // 2-way ILP: 두 서브블록을 교차 적재해 대기시간을 겹친다(합산은 오름차순 유지).
+    int sb = t;
+    for (; sb + 16 < n_sub; sb += 32) {
+        #pragma unroll
+        for (int u = 0; u < 2; u++) {
+            const int s1 = sb + 16 * u;
+            const int wb = row_base + s1 * 34;
+            const float d = f16w(w, wb);
+            const int xw = (s1 << 5) >> 2;
+            unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+            unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+            const int wq = wb >> 2;
+            const bool al = (wb & 3) == 2;
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qv;
+                if (al) qv = w[wq + 1 + k];
+                else    qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+                unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                    : (k==4?y4:k==5?y5:k==6?y6:y7);
+                isum = dot4(qv, yv, isum);
+            }
+            const float yd = __uint_as_float(xrow[(n_in >> 2) + s1]);
+            acc += yd * d * (float)isum;
+        }
+    }
+    if (sb < n_sub) {
+        const int wb = row_base + sb * 34;
+        const float d = f16w(w, wb);
+        const int xw = (sb << 5) >> 2;
+        unsigned y0 = xrow[xw], y1 = xrow[xw+1], y2 = xrow[xw+2], y3 = xrow[xw+3];
+        unsigned y4 = xrow[xw+4], y5 = xrow[xw+5], y6 = xrow[xw+6], y7 = xrow[xw+7];
+        const int wq = wb >> 2;
+        const bool al = (wb & 3) == 2;
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned qv;
+            if (al) qv = w[wq + 1 + k];
+            else    qv = (w[wq + k] >> 16) | (w[wq + k + 1] << 16);
+            unsigned yv = k < 4 ? (k==0?y0:k==1?y1:k==2?y2:k==3?y3:0u)
+                                : (k==4?y4:k==5?y5:k==6?y6:y7);
+            isum = dot4(qv, yv, isum);
+        }
+        const float yd = __uint_as_float(xrow[(n_in >> 2) + sb]);
+        acc += yd * d * (float)isum;
+    }
+    double accd = (double)acc;
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1)
+        accd += __shfl_down_sync(0xffffffffffffffffull, accd, off, 16);
+    if (t == 0) orow[o] = (float)accd;
+}
+
 // q5_1 ids판 — MoE down(direct-ids). 행마다 전문가가 다르다.
 // 종전 q4_gemm_q5_1_gm_ids는 워프의 16레인이 480B 간격 행을 읽어 32B섹터당
 // 4B만 사용(8배 증폭, 72-89GB/s). 여기선 워프가 한 행을 맡고 레인이 연속
