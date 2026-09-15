@@ -1855,12 +1855,19 @@ extern "C" __global__ void q4_idx_topk(const float* __restrict__ scores,
         u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
         sh[b] = ((unsigned long long)u << 32) | (unsigned)b;
     }
-    for (int b = n_blocks + tid; b < 4096; b += 256) sh[b] = 0ull;
+    // 2026-09-17 plans/74: 정렬 크기를 n_blocks 의 다음 2의 거듭제곱으로 —
+    // 종전 4096 고정이 실제 41~512 항목(문맥별)을 78단계.full 정렬로 돌렸다.
+    // 네트워크 모양만 축소: (스코어,인덱스) u64 키·패딩 0·비교식 불변이라
+    // 순서·타이(동점→낮은 인덱스) 의미는 종전과 동일.
+    int npad = 1;
+    while (npad < n_blocks) npad <<= 1;
+    if (npad < 2) npad = 2;
+    for (int b = n_blocks + tid; b < npad; b += 256) sh[b] = 0ull;
     __syncthreads();
-    // 비토닉 내림차순(4096 고정 — 패딩은 최솟값 0).
-    for (int k = 2; k <= 4096; k <<= 1) {
+    // 비토닉 내림차순(npad — 패딩은 최솟값 0).
+    for (int k = 2; k <= npad; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = tid; i < 4096; i += 256) {
+            for (int i = tid; i < npad; i += 256) {
                 const int l = i ^ j;
                 if (l > i) {
                     const unsigned long long a = sh[i], b2 = sh[l];
