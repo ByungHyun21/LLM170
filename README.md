@@ -39,14 +39,17 @@ failed with ERROR_DEVICE_LOST under the Vulkan driver at that shape.
 | LLM170 vulkan | 150 | — | 9.2 | — |
 | llama.cpp (ROCm 10) | **342** | **317** | **11.6** | **11.9** |
 
-Decode modes (aggregate t/s, 4 parallel slots where noted; MTP = `--spec 3`):
+Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
+`--spec 3`). MTP does not change prefill — the np4 pp aggregate applies
+unchanged under MTP+np4:
 
-| mode | LLM170 hip | LLM170 vulkan | llama.cpp (ROCm 10) |
-|---|---|---|---|
-| tg single | 11.4 | 9.2 | 11.9 |
-| MTP single | T27MT1 | T27MT1V | L27MT1 |
-| np4 aggregate | T27NP4 | T27NP4V | L27NP4 |
-| MTP + np4 | T27MTNP | T27MTNPV | L27MTNP |
+| mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
+|---|---|---|---|---|---|---|
+| | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
+| tg single | — | 11.4 | — | 9.2 | — | 11.9 |
+| MTP single | — | T27MT1 | — | T27MT1V | — | L27MT1 |
+| np4 aggregate | T27NPP4 | T27NP4 | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
+| MTP + np4 | (np4) | T27MTNP | (np4) | T27MTNPV | (np4) | L27MTNP |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -56,15 +59,16 @@ Decode modes (aggregate t/s, 4 parallel slots where noted; MTP = `--spec 3`):
 | LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
 
-Decode modes (aggregate t/s, 4 parallel slots where noted; the model has no
+Decode modes (aggregate t/s over 4 parallel slots; the model has no
 nextn/MTP head — MTP rows are structurally inapplicable):
 
-| mode | LLM170 hip | LLM170 vulkan | llama.cpp (ROCm 10) |
-|---|---|---|---|
-| tg single | 17.5 | 17.1 | 19.8 |
-| MTP single | — | — | — |
-| np4 aggregate | TFNP4 | TFNP4V | LFNP4 |
-| MTP + np4 | — | — | — |
+| mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
+|---|---|---|---|---|---|---|
+| | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
+| tg single | — | 17.5 | — | 17.1 | — | 19.8 |
+| MTP single | — | — | — | — | — | — |
+| np4 aggregate | TFNPP4 | TFNP4 | TFNPP4V | TFNP4V | LFNPP4 | LFNP4 |
+| MTP + np4 | — | — | — | — | — | — |
 
 Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
