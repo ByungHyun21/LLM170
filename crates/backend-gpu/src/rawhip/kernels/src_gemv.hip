@@ -1002,3 +1002,4 @@ extern "C" __global__ void __launch_bounds__(128) gemm_q8_0_mt16(
         if (t == 0) out[(size_t)ti * n_out + o] = (float)accd;
     }
 }
+

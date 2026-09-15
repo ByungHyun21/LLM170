@@ -197,6 +197,18 @@ with no wall-time change (the GPU stayed busy on the queue).
   attempted. The HTTP aggregate gap vs engine (19 vs 31 t/s) = prefill
   amortization (~4s per 1024-token prompt set) + ramp-down.
 
+### gemm_q8_0_mt t=4 restructure attempts — all neutral (2026-09-17)
+
+The multi-token q8_0 kernel runs 2.2x slower per launch than the t=1 variant on
+the same shape (qkv 415 vs 188us — weights at 64 vs 141GB/s effective), i.e.
+1.8x per-token efficiency at t=4. Three restructures measured neutral in
+interleaved engine A/B (±5ms machine noise): (1) load reordering
+(y-first→w→compute), (2) activation staging in shared memory (16-lane/row w16
+mapping, 14KB smem), (3) 2-rows-per-warp (discarded: HSAIL exception). The
+activation global re-read was NOT the bottleneck; the per-launch regression is
+a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
+were not committed.
+
 ## 2026-09-16~17 session — np cells, WMMA2 attention, correctness fixes
 
 Commits 33e23c2..d364326. All numbers hip/ROCm 10/solo/greedy as before;
