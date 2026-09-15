@@ -372,15 +372,18 @@ fn run_q4_infer(
                     }
                 } else {
                     for &s in &active {
-                        let t = if let Some(k) = dbg_topk {
+                        let d1g = std::env::var_os("LLM170_NO_D1G").is_none();
+                        let t = if !d1g {
                             let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
-                            let mut idx: Vec<usize> = (0..l.len()).collect();
-                            idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
-                            let top: Vec<String> = idx[..k.min(l.len())]
-                                .iter()
-                                .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
-                                .collect();
-                            eprintln!("topk-dec seq{s}: {}", top.join(" "));
+                            if let Some(k) = dbg_topk {
+                                let mut idx: Vec<usize> = (0..l.len()).collect();
+                                idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
+                                let top: Vec<String> = idx[..k.min(l.len())]
+                                    .iter()
+                                    .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
+                                    .collect();
+                                eprintln!("topk-dec seq{s}: {}", top.join(" "));
+                            }
                             llm170_core::model::greedy(&l)
                         } else {
                             eng.decode1_greedy(s, next[s]).map_err(|e| e.to_string())?
