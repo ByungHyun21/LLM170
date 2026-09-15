@@ -1761,3 +1761,41 @@ extern "C" __global__ void __launch_bounds__(256) q4_shexp_da(
         mout[row] += (*s_ptr) * acc;
     }
 }
+
+// f32 무게 멀티토큰 GEMV(plans/74) — q4_gemm_f32_w 의 워프=행 구조에 토큰
+// 누산. 무게 1회 독서로 t=2..8 라우터/PLE 투영(종전 q4_gemm_f32 t판은
+// 17GB/s). 토큰별 산술 순서 = _w 판(레인 부분 float4 체인 → (x+y)+(z+w) →
+// 워프 트리)과 동일.
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_f32_mt(
+        const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+        int n_in, int n_out, int tt) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (o >= n_out) return;
+    const float4* r4 = reinterpret_cast<const float4*>(w + (size_t)o * n_in);
+    const int n4 = n_in >> 2;
+    float4 a[8];
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) { a[ti].x = 0; a[ti].y = 0; a[ti].z = 0; a[ti].w = 0; }
+    for (int k = lane; k < n4; k += 32) {
+        const float4 rv = r4[k];
+        #pragma unroll
+        for (int ti = 0; ti < 8; ti++) {
+            if (ti >= tt) break;
+            const float4 xv = reinterpret_cast<const float4*>(x + (size_t)ti * n_in)[k];
+            a[ti].x += xv.x * rv.x;
+            a[ti].y += xv.y * rv.y;
+            a[ti].z += xv.z * rv.z;
+            a[ti].w += xv.w * rv.w;
+        }
+    }
+    #pragma unroll
+    for (int ti = 0; ti < 8; ti++) {
+        if (ti >= tt) break;
+        float acc = (a[ti].x + a[ti].y) + (a[ti].z + a[ti].w);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_xor_sync(0xffffffffffffffffull, acc, off);
+        if (lane == 0) out[(size_t)ti * n_out + o] = acc;
+    }
+}
