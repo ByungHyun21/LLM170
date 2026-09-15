@@ -179,12 +179,13 @@ with no wall-time change (the GPU stayed busy on the queue).
 
 Prefill (27B, KTRACE over 32 chunks of 16384 tokens, 64.25s kernel total):
 attention `qsa_flash_wk8i` 26.3%, MMQ family 56.6%, `gdn_ar_w_swap` 4.9%.
-MMQ runs at ~14.8 TOPS; llama.cpp's prefill uses its per-arch `J_max` (256 on
-RDNA3.5, `mmq-config-rdna3-5.cuh`) while this engine hardcodes J=128 - a J=256
-instance is not in the shipped `mmq.co`, and that object was extracted from an
-older llama.cpp fatbin (pre-`mmq_args` ABI, commit 6eddde06a); the RDNA3.5
-config data arrives only *after* that ABI change, so J=256 cannot be mixed in
-without rewriting the MMQ launcher against the new ABI. Not attempted.
+MMQ runs at ~14.8 TOPS. **Correction (2026-09-16, later pass): the earlier
+claim that llama uses J=256 on RDNA3.5 was a misread** - the `256` in
+`mmq-config-rdna3-5.cuh` is the `nthreads` field; the J column tops out at
+**128**, identical to this engine's choice. There is no J=256 lever on this
+GPU; the MMQ kernels and tile size are the same code llama runs. The prefill
+gap therefore lives in the remaining 43% (attention + elementwise + quant
+kernels) and whatever scheduling advantage llama's single-graph execution has.
 
 Attention: `wk8i` reaches ~28% of the FP32 peak. Vectorizing its f16 loads
 (uint4 per 8 dims, arithmetically identical) measured neutral (251.9 vs 252.7
