@@ -374,6 +374,63 @@ extern "C" __global__ void gdn_ar_w_swap(float* s, const float* q, const float* 
         s[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
 }
 
+// np 배치 AR (plans/74 N3) — 행(토큰)마다 **다른 시퀀스 상태**를 포인터 테이블로.
+// 행별 산술은 gdn_ar_w 의 t=1 실행과 완전 동일(ssr 적재·저장만 ti 루프 안으로).
+// 종전 np 경로는 행당 1런치(48층×t)였다 — npt4 KTRACE 4.9ms/step.
+extern "C" __global__ void gdn_ar_w_np(void** s_tbl, const float* q, const float* k, const float* v,
+                                   const float* beta_ge, float* out, int d, int k_stride,
+                                   int v_stride, int h_v, int h_k, float scale, int t) {
+    int pair = blockIdx.x;
+    int nwarps = (int)(blockDim.x >> 5);
+    int u = (int)blockIdx.y * nwarps + (int)(threadIdx.x >> 5);
+    if (u >= d) return;
+    int lane = threadIdx.x & 31;
+    for (int ti = 0; ti < t; ti++) {
+        float* s = (float*)s_tbl[ti];
+        int base_s = pair * d * d;
+        float ssr[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            ssr[j] = s[base_s + u * d + ((lane << 2) + j)];  // 전치
+        int h = pair % h_v;
+        int kh = h % h_k;
+        int qk0 = ti * k_stride + kh * d;
+        int v0 = ti * v_stride + h * d;
+        float beta = beta_ge[ti * h_v * 2 + pair * 2];
+        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
+        float part = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            ssr[j] *= g_exp;
+            part += ssr[j] * k[qk0 + (lane << 2) + j];
+        }
+        float sk = part;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
+            sk += pj;
+        }
+        float delta = (v[v0 + u] - sk) * beta;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            ssr[j] += k[qk0 + (lane << 2) + j] * delta;
+        float op = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            op += ssr[j] * q[qk0 + (lane << 2) + j];
+        float otot = op;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
+            otot += pj;
+        }
+        if (lane == 0) out[v0 + u] = otot * scale;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            s[base_s + u * d + ((lane << 2) + j)] = ssr[j];  // 전치
+    }
+}
+
 // ══ AR 청크 스캔 (세션 3 부록 72) — t 직렬을 ch 청크로 병렬화 ══
 // A: 청크 로컬 스캔 (제로 초기) + L_end(lend)/PG(pgb)/P 접두곱(pbuf) 기록.
 extern "C" __global__ void gdn_ar_w(float* s, const float* q, const float* k, const float* v,

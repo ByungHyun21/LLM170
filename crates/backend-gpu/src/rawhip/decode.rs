@@ -2649,6 +2649,15 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
         let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
         self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
+        // _ms 커널(conv) 행 메타 — 행별 그룹 크기 1 (plans/74 N3).
+        if t > 1 {
+            let row_seq: Vec<i32> = seqs.iter().map(|&s| s as i32).collect();
+            let row_pos: Vec<i32> = poss.iter().map(|&p| p as i32).collect();
+            let seg_start: Vec<i32> = (0..t).map(|r| r as i32).collect();
+            let seg_end: Vec<i32> = (0..t).map(|r| (r + 1) as i32).collect();
+            let row_np: Vec<i32> = poss.iter().map(|&p| (p + 1) as i32).collect();
+            self.h2d_i32_ms(&row_seq, &row_pos, &seg_start, &seg_end, &row_np)?;
+        }
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
         let mask = self.consts.get("mask").copied().ok_or("mask")?;
@@ -2669,7 +2678,20 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
-                // conv — per-seq (t=1, 행 슬라이스)
+                // conv — gdn_conv_np 테이블판 1런치 (plans/74 N3; 종전 행당 1런치,
+                // npt4 3.9ms). 산술은 gdn_conv_t(t=1) 과 동일(exp_cr + 링 시프트).
+                if t > 1 && std::env::var_os("LLM170_NO_NPCONV").is_none() {
+                    let row_seq: Vec<i32> = seqs.iter().map(|&s2| s2 as i32).collect();
+                    let mut qp = self.gqkv_t as *mut std::ffi::c_void;
+                    let mut cp = cw as *mut std::ffi::c_void;
+                    let mut sp = self.ms_conv_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
+                    let mut op = self.gconv_t as *mut std::ffi::c_void;
+                    let mut ch = conv_ch as i32;
+                    let mut kk = self.conv_k as i32;
+                    let mut tt = t as i32;
+                    let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
+                    self.ctx.launch3("gdn_conv_np", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                } else {
                 for s in 0..t {
                     let row = unsafe { self.gqkv_t.add(s * conv_ch * 4) };
                     let mut qp = row as *mut std::ffi::c_void;
@@ -2681,6 +2703,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut tt = 1i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
                     self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
+                }
                 }
                 // split3 공유 (행별 요소)
                 {
@@ -2719,7 +2742,27 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
                     self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
                 }
-                // AR — per-seq (t=1 슬라이스)
+                // AR — 행별 상태 포인터 테이블로 1런치 (plans/74 N3; 종전 행당
+                // 1런치×t, npt4 4.9ms). LLM170_NO_NPAR=1 이면 종전 행 슬라이스.
+                if t > 1 && std::env::var_os("LLM170_NO_NPAR").is_none() {
+                    let row_seq: Vec<i32> = seqs.iter().map(|&s2| s2 as i32).collect();
+                    let tbl = self.ms_gdn_ptr(recr_idx, &row_seq)?;
+                    let mut tp = tbl as *mut std::ffi::c_void;
+                    let mut qp = self.gq_t as *mut std::ffi::c_void;
+                    let mut kp = self.gk_t as *mut std::ffi::c_void;
+                    let mut vp = self.gv_t as *mut std::ffi::c_void;
+                    let mut bgp = self.gbg_t as *mut std::ffi::c_void;
+                    let mut op = self.go_t as *mut std::ffi::c_void;
+                    let mut d = self.d_state as i32;
+                    let mut ks = k_len as i32;
+                    let mut vs = v_len as i32;
+                    let mut hv = self.dt_rank as i32;
+                    let mut hk = self.n_group as i32;
+                    let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
+                    let mut tt = t as i32;
+                    let mut args = vec![Self::p(&mut tp), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
+                    self.ctx.launch3("gdn_ar_w_np", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                } else {
                 for s in 0..t {
                     let mut sp3 = self.st_gdn[recr_idx][seqs[s]] as *mut std::ffi::c_void;
                     let mut qp = unsafe { self.gq_t.add(s * k_len * 4) } as *mut std::ffi::c_void;
@@ -2736,6 +2779,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                     let mut tt = 1i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
                     self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
+                }
                 }
                 if std::env::var_os("LLM170_NP_DBG6").is_some() && il == 0 {
                     self.ctx.sync()?;
