@@ -563,6 +563,64 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
     }
 }
 
+    /// greedy 디코드 — 로짓 전사 없이 GPU argmax 로 토큰만(plans/74).
+    /// 구조는 decode1 과 동일, head 판만 갈린다.
+    pub fn decode1_greedy(&mut self, seq: usize, token: u32) -> Result<u32, Q4Error> {
+        if !self.acc.is_some()
+            || self.frame_broken
+            || std::env::var_os("LLM170_FRAME").is_none()
+            || std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true) == false
+        {
+            let l = self.decode1(seq, token)?;
+            return Ok(crate::model::greedy(&l));
+        }
+        if let Some(h) = self.ple_worker.take() {
+            let _ = h.join();
+        }
+        if let Some(slot) = self.ple_next.take() {
+            if let Ok(mut g) = slot.lock() {
+                if g.token == token && !g.emb.is_empty() {
+                    self.ple_consume = Some(vec![std::mem::take(&mut g.emb)]);
+                }
+            }
+        }
+        let acc = self.acc.as_deref().unwrap();
+        if self.frame.is_none() {
+            match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
+                Ok(f) => self.frame = Some(f),
+                Err(e) => {
+                    self.frame_broken = true;
+                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                    let l = self.decode1(seq, token)?;
+                    return Ok(crate::model::greedy(&l));
+                }
+            }
+        }
+        let r = (|| -> Result<u32, Q4Error> {
+            let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
+            let acc = self.acc.as_deref().unwrap();
+            if f.dirty[seq] {
+                f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
+            }
+            let ctx = Ctx { model: &self.model, acc: Some(acc) };
+            super::frame::decode_frame_greedy(acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token)
+        })();
+        match r {
+            Ok(tok) => {
+                self.seqs[seq].pos += 1;
+                Ok(tok)
+            }
+            Err(e) => {
+                self.frame = None;
+                self.frame_broken = true;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# frame-greedy: 디코드 실패 — 폴백 ({e})"));
+                let l = self.decode1(seq, token)?;
+                Ok(crate::model::greedy(&l))
+            }
+        }
+    }
+
     pub fn decode1(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, Q4Error> {
         // 05-2: 직전 스텝이 예측한 토큰의 프리페치 완료 대기 (조인)
         if let Some(h) = self.ple_worker.take() {

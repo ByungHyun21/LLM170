@@ -306,8 +306,9 @@ pub fn slot_loop(
                         }
                     } else {
                         for &i in &active {
-                            if let Ok(logits) = e.decode1(i, slots[i].next) {
-                                slot_step(&mut slots[i], &logits);
+                            match e.decode1_greedy(i, slots[i].next) {
+                                Ok(t) => slot_emit(&mut slots[i], t),
+                                Err(err) => eprintln!("# decode1_greedy 실패({err}) — 이번 회차 건너뜀"),
                             }
                         }
                     }
