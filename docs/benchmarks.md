@@ -281,6 +281,16 @@ non-benchmark paths were exercised end to end:
   coherent caption through the full vision-encode + splice path.
 Flash-Next carries no nextn metadata - MTP is the 27B pair's feature.
 
+### hc down GEMV 256-thread variant: regression, reverted (2026-09-15)
+
+A 256-thread version of gemm_q8_0 (gemm_q8_0_w256, same dot4/tree structure
+but 4x threads per block) measured 12.4 avg vs 13.4 t/s for the original
+64-thread version across 5 interleaved runs (-7.6%). The larger reduction
+tree (3 rounds of shared-memory + syncthreads vs the 64-thread single-round)
+adds more overhead than the memory-level parallelism gain; 320 outputs x 256
+threads may also oversubscribe. Kernel kept in source (registered, unused);
+routing reverted (commit a05ae0e).
+
 ### Flash-Next decode decomposition and the hc path bottleneck (2026-09-15)
 
 FRAME_TIME per-step marks (t=1 decode, ROCm 10, fused shared expert):
