@@ -19,6 +19,13 @@ measurement evidence. Split from `docs/benchmarks.md` when that file grew past
 - Probe and flag usage (`LLM170_*`) is documented in the file that implements
   the flag.
 
+**Organization (2026-09-15)**: `docs/benchmarks.md` now groups results by
+adopted/rejected instead of chronologically (originals preserved in
+`docs/archive/benchmarks-chronological-2026-09-15.md`). These per-file
+records keep their detailed prose; their section titles carry dates and
+outcomes so a grep for "regression"/"reverted"/"not adopted" finds every
+negative result.
+
 **Runtime default (2026-09-14)**: benchmarks and gates run on the TheRock
 ROCm 10.0.0 userspace (`/opt/rocm-10.0.0/install/lib` via `LD_LIBRARY_PATH`,
 soname-compatible, no relink; system 7.2.2 as fallback). Numbers quoted
