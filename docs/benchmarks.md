@@ -198,3 +198,16 @@ at 156-169 GB/s, MoE ids GEMVs 55-72us/call (~180 GB/s per the in-code
 measurement), lm head 3.7ms single call (~100 GB/s). Replacing the head kernel
 with the 16-lane variant is neutral; graph capture/replay (`LLM170_GRAPH=1`)
 is neutral, i.e. launch overhead is not the limiter.
+
+### WMMA attention: offline-hipcc build also slow - closed (2026-09-16)
+
+To test whether the 9.5x-slow WMMA attention was a runtime-JIT (comgr) artifact,
+`qsa_flash_wmma` was extracted verbatim into a standalone translation unit and
+compiled offline with hipcc -O3 --offload-arch=gfx1151 (the `scripts/build_co.py`
+recipe), loaded as a code object that overrides the JIT symbol. Measured on the
+standard 27B pp512 point: **59.5 t/s vs the scalar wk8i path's 375 t/s (6.3x
+slow)**. The compiler is not the variable - this GPU/ROCm stack's WMMA path
+genuinely cannot serve this kernel shape faster than the scalar f32 tiles. The
+27B long-prefill gap (pp16k 0.80x) therefore has no known lever on this stack;
+attention runs at ~28% of the FP32 peak and MMQ is already llama's own kernel
+at llama's own tile size (J=128, the RDNA3.5 maximum).
