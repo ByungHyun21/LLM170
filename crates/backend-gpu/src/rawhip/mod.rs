@@ -1199,9 +1199,8 @@ impl RawCtx {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
-        // plans/74 N3: q5_K 은 워프=행(블록 32, 스트라이드 32레인)이 기본 —
-        // 원판(블록 64) 대비 np4 마이크로벤치 +4.5%, 토큰 A/B 동일.
-        // LLM170_NO_Q5K4W2=1 이면 원판 복귀.
+        // plans/74 N3: q5_K 은 워프=행(블록 32, 스트라이드 32레인)이 기본.
+        // 4워프/블록 판은 -3% 측정(부정, 2026-09-17). LLM170_NO_Q5K4W2=1 원판.
         let w2 = ty == 13 && std::env::var_os("LLM170_NO_Q5K4W2").is_none();
         // q4_K 도 워프=행 기본(인터리브 3회: 30.6/30.0 vs 31.0/31.1/32.2).
         let w2q4 = ty == 12 && std::env::var_os("LLM170_NO_Q4K4W2").is_none();

@@ -218,6 +218,14 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### g4 block-geometry negative (2026-09-17, not landed)
+
+4-warps-per-block q5k4 (128 threads, 4 rows/block, pure per-warp shfl
+reduction — no syncthreads) measured -3% vs the 1-warp-block w2 on the np4
+micro-bench (28.1 vs 29.1 t/s). The GPU scheduler hides latency fine across
+1-warp blocks here; the 123GB/s-at-t=4 gap vs the t=1 kernel's 195 is not a
+block-geometry effect. Removed; w2 stays default.
+
 ## 2026-09-16~17 session — np cells, WMMA2 attention, correctness fixes
 
 Commits 33e23c2..d364326. All numbers hip/ROCm 10/solo/greedy as before;
