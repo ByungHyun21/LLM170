@@ -160,7 +160,15 @@ pub fn slot_loop(
     let mut tick: u64 = 0;
     loop {
         // ① 새 작업 drain — 전 슬롯 점유 시 큐에 잔류 (bounded: http측 503)
-        while let Ok(j) = rx.try_recv() {
+        // 회귀 픽스(2026-09-16): 종전엔 try_recv로 꺼낸 뒤 "슬롯 점유"를 발견하면
+        // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
+        // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
+        // try_recv **앞으로** 옮겨 작업을 큐에 남긴다 — 의도된 원래 계약.
+        loop {
+            if !slots.iter().any(|s| s.job.is_none()) {
+                break;
+            }
+            let Ok(j) = rx.try_recv() else { break; };
             // 접두 캐시 — cached 전체가 새 프롬프트의 접두면 이어서 프리필.
             let prefix_ok = std::env::var_os("LLM170_NO_PREFIX").is_none();
             let pick = (0..n_slots)
