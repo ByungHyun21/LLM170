@@ -228,7 +228,8 @@ were not committed.
 - Matched-protocol references (same client, same 120-token prompt, greedy,
   warmed): llama FN np4 = 30-45 t/s at n=64 and 40-52 at n=128; llama 27B
   np4 = 45-52 at n=128 — their warm runs exceed the previously documented
-  35.1/39.4. Our short-prompt numbers: FN 22.8-23.1, 27B ~26-28. The np4
+  35.1/39.4. Our short-prompt numbers (same protocol): FN 22.8-23.1, 27B 19.5-23.1
+(thermal drift across repeats — median ~22). The np4
   gap is therefore ~2x, rooted in the MMQ-MMA GEMM family (see above) plus
   our serial per-slot prefill scheduling (~4s of wall for 480 tokens).
 - Gate hygiene note: a FAIL observed immediately after a 4-stream bench
