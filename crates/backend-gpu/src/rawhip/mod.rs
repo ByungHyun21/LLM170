@@ -1040,6 +1040,10 @@ impl RawCtx {
         if t == 1 && ty == 13 && std::env::var("LLM170_Q5KV2").as_deref() == Ok("1") {
             return self.gemv_q8_out_v2(xq, w, ty, n_in, n_out, out, xq_w, t);
         }
+        let q8tr = std::env::var_os("LLM170_Q8_TRACE").is_some();
+        if q8tr {
+            eprintln!("# q8tr ty={ty} n_in={n_in} n_out={n_out} t={t}");
+        }
         let mut out_p0 = out as *mut std::ffi::c_void;
         let mut xw_a = xq_w as i32;
         let mut tt_a = t as i32;
@@ -1066,6 +1070,7 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
+            if q8tr { eprintln!("# q8tr->mt16 n_in={n_in} n_out={n_out} t={t}"); }
             return self.launch3(
                 "gemm_q8_0_mt16",
                 n_out.div_ceil(8) as u32,
@@ -1093,6 +1098,7 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
+            if q8tr { eprintln!("# q8tr->mt_w n_in={n_in} n_out={n_out} t={t}"); }
             return self.launch3(
                 "gemm_q8_0_mt_w",
                 1,
@@ -1113,6 +1119,7 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
+            if q8tr { eprintln!("# q8tr->mt64 n_in={n_in} n_out={n_out} t={t}"); }
             return self.launch3(
                 "gemm_q8_0_mt",
                 1,
@@ -1206,6 +1213,7 @@ impl RawCtx {
         }
         let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
         args_v.push(xw_ptr);
+        if q8tr { eprintln!("# q8tr->fallback {kern} n_in={n_in} n_out={n_out} t={t}"); }
         self.launch3(kern, t as u32, gy, gz2, 64, &mut args_v)?;
         Ok(())
     }

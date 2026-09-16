@@ -3491,6 +3491,25 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         .map(|_| ())
     }
 
+    /// 인덱서 k 행 디바이스 적립 — t>1 프리필 단축 경로(항등 선택) 전용.
+    fn qsa_idx_append_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_dim: usize,
+        r: usize,
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(), String> {
+        let ikp = self.fptr(ik)? as *const u8;
+        self.qsa_idx_append(full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps)
+            .map(|_| ())
+    }
+
     fn qsa_host_rebuild(
         &self,
         full_idx: usize,

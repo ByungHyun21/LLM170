@@ -1357,6 +1357,59 @@ fn qsa_frame(
             }
         }
     }
+    // ─── plans/74: 프리필 항등 선택 단축(비트 동일) ───
+    // n_past ≤ idx_top_k + r - 1 이면 호스트 선택도 **전체 블록을 오름차순**으로
+    // 고른다(qsa_select 패스 B: sel_blocks=(0..n_blocks) 그대로 → sort_unstable).
+    // 즉 점수·순위·top-k 가 모두 항등이라 목록을 직접 만들어도 결과가 같다 —
+    // d2h 4회(동기 드레인) + 호스트 점수/정렬(0.8-1.5ms/층)을 건너뛰고
+    // 디바이스 풀(KV·idx)만 적립한다. 실패하면 종전 호스트 경로로 폴백.
+    // 킬스위치 LLM170_QSA_NOID=1.
+    if t > 1
+        && pos0 as usize + t <= hp.idx_top_k + r - 1
+        && std::env::var_os("LLM170_QSA_NOID").is_none()
+    {
+        let pos0u = pos0 as usize;
+        let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        let dev = acc
+            .qsa_kv_dev(full_idx, seq, f.qsa_k, f.qsa_v, t, pos0u, n_kv, hd)
+            .and_then(|(kc, vc)| {
+                acc.qsa_idx_append_dev(
+                    full_idx, seq, f.qsa_ik, t, pos0u, idx_dim, r, &ikw, &f.qsa_cs_idx, hp.eps,
+                )?;
+                // 항등 목록 — 행 i 의 선택 = [0, pos0+i] (오름차순 전체).
+                let mut sel_off: Vec<u32> = vec![0u32; t + 1];
+                for t2 in 0..t {
+                    sel_off[t2 + 1] = sel_off[t2] + (pos0u + t2 + 1) as u32;
+                }
+                let mut sel_idx: Vec<u32> = vec![0u32; sel_off[t] as usize];
+                let mut o = 0usize;
+                for t2 in 0..t {
+                    for j in 0..(pos0u + t2 + 1) {
+                        sel_idx[o] = j as u32;
+                        o += 1;
+                    }
+                }
+                acc.qsa_attention_dev_res(
+                    f.qsa_q, kc, vc, &sel_idx, &sel_off, kq_scale,
+                    n_head, n_kv, hd, t, f.qsa_attn,
+                )
+            });
+        match dev {
+            Ok(()) => {
+                seq_st.qsa_host_stale = true;
+                if qtm {
+                    eprintln!("# qsa-frame L{il} t={t} identity-select={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
+                }
+                acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
+                    .map_err(Q4Error::Io)?;
+                return Ok(());
+            }
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# qsa-frame: 항등 선택 단축 실패 — 호스트 경로 ({e})"));
+            }
+        }
+    }
     // ─── 프리필(t>1) 진입: 호스트 캐시 재구축(디코드가 갱신을 건너뛴 경우) ───
     if t > 1 && seq_st.qsa_host_stale {
         let pos = pos0 as usize;

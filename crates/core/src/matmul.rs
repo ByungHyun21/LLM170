@@ -451,6 +451,26 @@ pub trait Accelerator: FrameState + Send + Sync {
         Ok(())
     }
 
+    /// 인덱서 k 행을 **디바이스 버퍼에서 직접** 적립(블록 키 갱신 포함).
+    /// t>1 프리필 단축 경로 전용 — 기본 미지원(호스트 경로 폴백).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_idx_append_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_dim: usize,
+        r: usize,
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(), String> {
+        let _ = (full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps);
+        Err("qsa_idx_append_dev 미지원".into())
+    }
+
     /// plans/73: 디바이스 풀 → 호스트 캐시 재구축(디코드가 호스트 갱신을 건너뛴
     /// 뒤 프리필/폴백 진입 시 1회). kv_k/kv_v는 [pos*kv_row], idx_k는
     /// [pos*idx_dim], bk는 [(pos/r)*idx_dim]까지 채운다.

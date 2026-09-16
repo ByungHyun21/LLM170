@@ -157,6 +157,8 @@ pub fn slot_loop(
     const EOS: u32 = 248044;
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
     let mut tick: u64 = 0;
+    let (mut n_dec, mut n_pf) = (0u64, 0u64);
+    let (mut ms_dec, mut ms_pf) = (0f64, 0f64);
     let npw = std::env::var_os("LLM170_WALL_TIME").is_some();
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
@@ -216,14 +218,17 @@ pub fn slot_loop(
             }
         }
         tick += 1;
+        let _it0 = std::time::Instant::now();
 
         // ② 디코드 우선 — prefill 완료 슬롯 전부
         let active: Vec<usize> = (0..n_slots)
             .filter(|&i| slots[i].job.is_some() && slots[i].prefilled == slots[i].job.as_ref().unwrap().tokens.len())
             .collect();
         let mut decoded = false;
+        let mut dec_ms = 0f64;
         if !active.is_empty() {
             decoded = true;
+            let _dt = std::time::Instant::now();
             match &mut eng {
                 Engine::Q35(e) => {
                     // 스펙 슬롯 분리 — spec_step 경로 (plans/21).
@@ -324,6 +329,7 @@ pub fn slot_loop(
                     }
                 }
             }
+            dec_ms = _dt.elapsed().as_secs_f64() * 1e3;
             // 완료 슬롯 정리 — 결과 전송·반환
             for &i in &active {
                 finish_slot(&mut slots[i], &mut eng, i, EOS);
@@ -344,6 +350,7 @@ pub fn slot_loop(
                 })
                 .min_by_key(|&i| slots[i].touch);
             if let Some(i) = pf {
+                let _pft = std::time::Instant::now();
                 let chunk = 512usize;
                 // plans/74: Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
                 // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
@@ -360,6 +367,8 @@ pub fn slot_loop(
                 if npw {
                     eprintln!("[wall] prefill slot{i} {start}tok done @{}s", t0w.elapsed().as_secs_f64());
                 }
+                n_pf += 1;
+                ms_pf += _pft.elapsed().as_secs_f64() * 1e3;
                 if let Ok(t) = logits {
                     slots[i].prefilled = start;
                     if start == slots[i].job.as_ref().unwrap().tokens.len() {
@@ -370,6 +379,17 @@ pub fn slot_loop(
             }
         }
 
+        if decoded {
+            n_dec += 1;
+            ms_dec += dec_ms;
+            if std::env::var_os("LLM170_SRV_TIME").is_some() && n_dec % 32 == 0 {
+                eprintln!(
+                    "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms",
+                    n_dec, ms_dec / n_dec as f64, n_pf,
+                    if n_pf > 0 { ms_pf / n_pf as f64 } else { 0.0 }
+                );
+            }
+        }
         // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출
         let busy = slots.iter().any(|s| s.job.is_some());
         if !busy {
