@@ -334,9 +334,17 @@ impl Engine4 {
             .unwrap_or(cap0)
             .clamp(16, 4096);   // 상한은 frame_t_max_cap이 결정(적응형)
         // 프레임 상태가 권위적이면(직전 디코드) CPU 사본을 GPU에서 갱신 —
-        // 이후 값 경로 prefill이 정합 상태에서 시작한다.
+        // 값 경로 prefill이 정합 상태에서 시작하기 위함. 프레임 프리필(기본)은
+        // 디바이스 상태를 그대로 쓰므로 이 풀백이 데드 워크다 — 슬롯당 수십 회의
+        // 소형 D2H(2026-09-17, np 서버 TTFT/프리필 간극 RCA). 아래 값 경로
+        // 직전으로 이동했다.
+        let frame_prefill_on = self.acc.is_some()
+            && !self.frame_broken
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        let need_cpu_pullback = !frame_prefill_on;
         if let Some(f) = &self.frame {
-            if !f.dirty[seq] {
+            if !f.dirty[seq] && need_cpu_pullback {
                 if let Some(acc) = self.acc.as_deref() {
                     let st = &mut self.seqs[seq];
                     for (ri, h) in f.st_gdn[seq].iter().enumerate() {
@@ -395,6 +403,24 @@ impl Engine4 {
             }
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
+        // 값 경로 전용 풀백(프레임 경로 미사용 시에만).
+        if !need_cpu_pullback {
+            if let Some(f) = &self.frame {
+                if !f.dirty[seq] {
+                    if let Some(acc) = self.acc.as_deref() {
+                        let st = &mut self.seqs[seq];
+                        for (ri, h) in f.st_gdn[seq].iter().enumerate() {
+                            let mut t = vec![0.0f32; st.gdn_s[ri].len()];
+                            acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
+                            st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
+                        }
+                        for (ri, h) in f.st_conv[seq].iter().enumerate() {
+                            acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
+                        }
+                    }
+                }
+            }
+        }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
@@ -430,21 +456,7 @@ impl Engine4 {
             .unwrap_or(cap0)
             .clamp(16, 4096)
             .min(frame_t_max_cap(self.acc.as_deref()));
-        if let Some(f) = &self.frame {
-            if !f.dirty[seq] {
-                if let Some(acc) = self.acc.as_deref() {
-                    let st = &mut self.seqs[seq];
-                    for (ri, h) in f.st_gdn[seq].iter().enumerate() {
-                        let mut t = vec![0.0f32; st.gdn_s[ri].len()];
-                        acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
-                        st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
-                    }
-                    for (ri, h) in f.st_conv[seq].iter().enumerate() {
-                        acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
-                    }
-                }
-            }
-        }
+        // 프레임 경로(이 함수의 주경로)는 CPU 상태 불필요 — 풀백 생략(데드 워크).
         if self.frame.is_none() {
             match super::frame::Frame4::new(self.acc.as_deref().unwrap(), &self.model, &self.seqs, frame_t_max(self.acc.as_deref())) {
                 Ok(f) => self.frame = Some(f),
