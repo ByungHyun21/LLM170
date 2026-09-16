@@ -218,6 +218,29 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### WMMA tile GEMM for np4 q5_K — attempted, negative (2026-09-17)
+
+Motivated by the llama source audit: their np4 throughput (77-88ms/4-row
+step on 27B = 203GB/s effective, above our dot4 instruction roofline) comes
+from the MMQ **MMA data layout** (quant streamed once, dequantized into
+SRAM/registers, matrix-core accumulation). Three iterations of a
+`gemm_q5k_wmma` tile kernel (16x16 WMMA per the probed raw-builtin ABI,
+J=16 tokens padded from t):
+
+- v1 full smem staging: 59 GB/s — 4 warps shared one sA buffer (clobbered)
+  and the 256-half row stride is a 16-way bank conflict.
+- v1+stride pad + vectorized fragment loads: 24.8 t/s on the np4 micro.
+- v2 register dequant (ABI half-warp row duplication), shared B smem:
+  26.6 t/s — f32->f16 conversion is quarter-rate VALU, dominating.
+- v3 integer-f16 bit composition (v<<10, exact for 0..31) + per-sub-block
+  scale/min folded into the C fragment in f32: **27.7 t/s vs dot4 30.0**.
+
+The v3 kernel is ~98GB/s effective — latency-bound on the serial 20-chunk
+per-warp K chain with 2 syncthreads each, despite an ALU ceiling near
+380GB/s. Closing the remaining gap needs double-buffering and split-K
+(latency hiding), i.e. a full MMQ-class kernel project. Removed; dot4 path
+stays default (bit-exact gates unaffected).
+
 ### np4 step launch-count decomposition (2026-09-17)
 
 KTRACE on the FN np4 step: **3084 kernel launches**, GAPS 14.7ms (~4.75us
