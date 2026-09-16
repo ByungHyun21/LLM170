@@ -582,7 +582,7 @@ impl Q4Acc {
     /// 프레임 op 런치 헬퍼 — gx/gy/gz + 32/64/128/256 스레드.
     fn kop(
         &self,
-        kern: &str,
+        kern: &'static str,
         gx: u32,
         gy: u32,
         gz: u32,

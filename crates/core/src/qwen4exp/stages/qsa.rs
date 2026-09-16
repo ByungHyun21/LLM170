@@ -373,7 +373,6 @@ pub fn qsa_cpu_attn_rows(
     out
 }
 
-    #[allow(unused_assignments)] // 진단 코드의 중간 변수
     pub fn qsa_layer(
         ctx: &Ctx,
         seq: &mut SeqState4,
@@ -461,7 +460,7 @@ pub fn qsa_cpu_attn_rows(
         } else {
             vec![Vec::new(); n_tok]
         };
-        let mut cpu_attn = false;   // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함)
+        // GPU 어텐션 실패 시 CPU 폴백 (q4acc t>128 결함) — 아래 gpu_attn 판정 하나로 결정된다.
 
         // 블록 키 캐시는 행마다 clone하지 않고 지역 버퍼로 승격한다(핫 루프 복사 제거).
         // plans/67 2b(후반): 선택부를 추출본 qsa_select에 위임 — 캐시 적립(Pass A)·
@@ -528,7 +527,7 @@ pub fn qsa_cpu_attn_rows(
             }
         }
         // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(폴백 경로).
-        if !(gpu_attn && !cpu_attn) {
+        if !gpu_attn {
             let (ckv, cvv) = (&seq.kv_k[full_idx], &seq.kv_v[full_idx]);
             for t in 0..t_len {
                 let n_past = (pos0 as usize) + t + 1;
@@ -612,7 +611,6 @@ pub fn qsa_cpu_attn_rows(
                         // 폴백은 실제로 CPU 재계산을 해야 한다 — 이전 구현은
                         // 행을 빈 채로 두어 12개 QSA 층의 어텐션이 조용히
                         // 누락됐다(2026-09-13 발견: 프레임==값 자가일치 통과).
-                        cpu_attn = true;
                         for (t, row) in attn_all.iter_mut().enumerate() {
                             let n_past = (pos0 as usize) + t + 1;
                             let mask_t =

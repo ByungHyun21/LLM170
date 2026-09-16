@@ -33,7 +33,6 @@ pub fn subsum_check() -> Result<String, String> {
 
 /// gdn-check — GDN 커널군 (plans/19) GPU↔CPU 상호검증.
 /// split3·conv_t·beta_g·norm_gated·ar — 각 커널 독립 LCG 입력·CPU 미러 대조.
-#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn gdn_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
 use ash::vk;
@@ -574,7 +573,6 @@ use ash::vk;
                 for i in 0..d {
                     st[base_s + i * d + 0..base_s + i * d + d].iter_mut().for_each(|x| *x *= g);
                 }
-                let mut sk = 0.0f64;
                 for u in 0..d {
                     let mut acc = 0.0f64;
                     for i in 0..d {
@@ -582,19 +580,18 @@ use ash::vk;
                     }
                     // 주의: rawhip 스레드 구조와 달리 여기 u=열, i=kdim 순으로 합 —
                     // 부동 합 순서 차이 허용 오차로 처리
-                    sk = acc;
+                    let sk = acc;
                     let delta = (v[v0 + u] as f64 - sk) * beta as f64;
                     for i in 0..d {
                         st[base_s + i * d + u] += (k[qk0 + i] * delta as f32) as f32;
                     }
                 }
-                let mut otot = 0.0f64;
                 for u in 0..d {
                     let mut acc = 0.0f64;
                     for i in 0..d {
                         acc += st[base_s + i * d + u] as f64 * q[qk0 + i] as f64;
                     }
-                    otot = acc;
+                    let otot = acc;
                     c[v0 + u] = (otot * scale as f64) as f32;
                 }
             }

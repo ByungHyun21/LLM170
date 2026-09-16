@@ -936,7 +936,7 @@ pub fn q5_1_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result
     let x = vec![0x01u8; xbytes];
     ctx.h2d(wdev, &w)?;
     ctx.h2d(xdev, &x)?;
-    let launch = |kern: &str, gx: u32, block: u32| -> Result<(), String> {
+    let launch = |kern: &'static str, gx: u32, block: u32| -> Result<(), String> {
         let (mut xp, mut wp, mut pp, mut op) =
             (xdev, wdev, part, odev);
         let (mut ni, mut no, mut xw, mut tt) = (n_in as i32, n_out as i32, xq_w as i32, rows as i32);
@@ -1189,7 +1189,7 @@ pub fn wc_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let o1 = ctx.alloc(t * n_out * 4)?;
     let o2 = ctx.alloc(t * n_out * 4)?;
     let gx = n_out.div_ceil(64) as u32;
-    let launch = |kern: &str, wp2: *mut u8, out: *mut u8| -> Result<(), String> {
+    let launch = |kern: &'static str, wp2: *mut u8, out: *mut u8| -> Result<(), String> {
         let mut xqp = xq as *mut c_void;
         let mut w2 = wp2 as *mut c_void;
         let mut op = out as *mut c_void;
@@ -1238,7 +1238,7 @@ pub fn wc_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         }
     }
     // 처리량 — 각 20회
-    let bench = |kern: &str, wp2: *mut u8, out: *mut u8| -> Result<f64, String> {
+    let bench = |kern: &'static str, wp2: *mut u8, out: *mut u8| -> Result<f64, String> {
         let reps = 20;
         ctx.sync()?;
         let t0 = std::time::Instant::now();
@@ -1563,7 +1563,7 @@ fn wmma_probe_both() -> Result<(bool, String), String> {
 /// 합성 어텐션 검증: qsa_flash_wmma 를 작은 단일 케이스로 돌려 **CPU 기준**과 비교한다.
 /// 디코드(t=1) GQA 어텐션 v2 검증·계측: 기존 qsa_flash_gqa 와 출력을 대조하고
 /// n_past 별로 두 커널의 런치 시간을 잰다. 모델 구성(n_head=24, n_kv=4, hd=256)을 쓴다.
-#[allow(unused_assignments)] // 진단 코드의 중간 변수
+#[allow(unused_assignments)] // kp/vp 는 런치 인자로 넘긴 **주소**가 읽는 값 (raw 포인터 경유)
 pub fn gqa_bench() -> Result<String, String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
@@ -1741,7 +1741,6 @@ pub fn gqa_bench() -> Result<String, String> {
 }
 
 /// part 규약: seg 별 acc=Σ e_d·v (m,s 는 러닝 최대/합). 첫 불일치 위치를 보고한다.
-#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn wmma_attn_check() -> Result<String, String> {
     use std::ffi::c_void;
     let ctx = RawCtx::new()?;
@@ -1871,7 +1870,7 @@ pub fn wmma_attn_check() -> Result<String, String> {
     // 진단 상세: 행0 헤드0 세그0 의 acc 앞 4개 / m / s (ours vs ref)
     let b0 = 0usize;
     let (gm, gs) = (got[b0 + hd], got[b0 + hd + 1]);
-    let mut det = String::new();
+    let det;
     {
         let row = 0usize;
         let hh = 0usize;
@@ -2290,7 +2289,7 @@ pub fn roof_test() -> Result<String, String> {
 
 
 /// MMQ 포트 A/B — bt vs mm (각 미러).
-#[allow(unused_assignments)] // 진단 코드의 중간 변수
+#[allow(unused_assignments)] // na0/sg4 는 런치 인자로 넘긴 **주소**가 읽는 값 (raw 포인터 경유)
 pub fn launch_probe() -> Result<String, String> {
     let ctx = RawCtx::new()?;
     // 디코드 소형 커널의 실제 런치 비용 (트레이스 페어링 무관, 직접 계측).

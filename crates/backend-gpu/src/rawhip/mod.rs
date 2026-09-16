@@ -31,11 +31,6 @@ pub fn co_loaded(bit: u8) -> bool {
 }
 
 
-fn name_leak(n: &str) -> &'static str {
-    // launch3 호출부의 name은 리터럴 — 그대로 반환 (비-리터럴 경로는 트레이스 스킵 허용)
-    unsafe { std::mem::transmute::<&str, &'static str>(n) }
-}
-
 pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
 pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
 /// MMQ mul_mat_q 동적 smem 상한 설정 캐시 — 런치마다 드라이버 호출하지 않도록.
@@ -711,7 +706,7 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &self,
-        name: &str,
+        name: &'static str,
         gx: u32,
         gy: u32,
         block: u32,
@@ -729,7 +724,7 @@ impl RawCtx {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
@@ -738,7 +733,7 @@ impl RawCtx {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
                 }
             }
         }
@@ -750,7 +745,7 @@ impl RawCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn launch3(
         &self,
-        name: &str,
+        name: &'static str,
         gx: u32,
         gy: u32,
         gz: u32,
@@ -774,7 +769,7 @@ impl RawCtx {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
@@ -783,7 +778,7 @@ impl RawCtx {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
                 }
             }
         }
@@ -792,7 +787,7 @@ impl RawCtx {
 
     /// 사이드 스트림 발사 (비동기 — join2로 합류)
     /// 동적 shared 64KB 런치 (부록82) — 커널당 1회 속성 설정.
-    pub fn launch3_dyn(&self, name: &str, gx: u32, gy: u32, gz: u32, block: u32, smem: u32, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+    pub fn launch3_dyn(&self, name: &'static str, gx: u32, gy: u32, gz: u32, block: u32, smem: u32, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
         }
@@ -821,7 +816,7 @@ impl RawCtx {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, smem, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3_dyn")?;
@@ -830,7 +825,7 @@ impl RawCtx {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
                 }
             }
         }
@@ -839,7 +834,7 @@ impl RawCtx {
 
     pub fn launch3s(
         &self,
-        name: &str,
+        name: &'static str,
         gx: u32,
         gy: u32,
         gz: u32,
@@ -855,7 +850,7 @@ impl RawCtx {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream2);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev0 as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
@@ -864,7 +859,7 @@ impl RawCtx {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream2);
-                    g.as_mut().unwrap().push(KtraceEv(name_leak(name), ev as usize, gy));
+                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
                 }
             }
         }

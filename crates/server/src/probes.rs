@@ -335,7 +335,6 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
 /// llm170 check <model.gguf> [--quick] [--backend cpu|gpu]
 /// debug 빌드 검증 경로 — ① 텐서 디양자화 스캔(NaN/Inf) ② GPU↔CPU GEMM
 /// 상호검증 ③ 장문 청크 스모크(NaN 가드). RCA 도구 통합 (2026-09-01).
-#[allow(unused_assignments)] // 진단 코드의 중간 변수
 pub fn run_check(args: &[String]) -> ExitCode {
     
     let mut path: Option<&str> = None;
@@ -358,7 +357,6 @@ pub fn run_check(args: &[String]) -> ExitCode {
     eprintln!("# check: {path} backend={backend} quick={quick}");
 
     // ① 텐서 스캔 — 각 텐서 첫 행 디양자화해 NaN/Inf 검출
-    let mut n_scan = 0usize;
     let scan = std::thread::spawn({
         let p = model_path.clone();
         move || -> Result<(usize, usize), String> {
@@ -388,7 +386,6 @@ pub fn run_check(args: &[String]) -> ExitCode {
     });
     match scan.join() {
         Ok(Ok((n, bad))) => {
-            n_scan = n;
             eprintln!("# ① 텐서 스캔: {n}개 중 비정상 {bad}");
             if bad > 0 {
                 return ExitCode::FAILURE;
@@ -400,7 +397,6 @@ pub fn run_check(args: &[String]) -> ExitCode {
         }
         Err(_) => return ExitCode::FAILURE,
     }
-    let _ = n_scan;
 
     // ② GPU↔CPU GEMM 상호검증 (gpu 경로만) — 대표 텐서 t∈{1,64,1024}
     // (② GPU↔CPU GEMM 검증 — cubecl 제거로 rawhip-check가 대체)

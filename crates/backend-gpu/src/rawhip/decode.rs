@@ -477,7 +477,7 @@ impl DecodeState {
         self.ctx.launch3(kern, 1, gy, gz, 64, &mut args)
     }
 
-    fn ew_l(&self, name: &str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+    fn ew_l(&self, name: &'static str, n: usize, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
         self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
     }
     fn p<T>(v: &mut T) -> *mut std::ffi::c_void {

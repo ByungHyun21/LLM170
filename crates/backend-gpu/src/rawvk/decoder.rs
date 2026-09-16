@@ -490,7 +490,6 @@ const T_MAX: usize = 512;   // plans/41: 단일 패스 프리필 (가중 1회 �
 impl DecoderState {
     /// 초기화 — 가중치(carveout)+상수(GTT) 업로드, 상태 0.
     #[allow(clippy::too_many_arguments)]
-    #[allow(unused_assignments)] // 진단 코드의 중간 변수
     pub fn new<'a>(
         mut ctx: VkCtx,
         weights: Vec<(&'a str, &'a [u8], u32, usize, usize)>,
@@ -1261,7 +1260,6 @@ impl DecoderState {
     }
 
     /// 타일(coopmat) 경로 — 프리필 전용. plans/32.
-    #[allow(unused_assignments)] // 진단 코드의 중간 변수
     #[allow(unreachable_code)] // 마지막 타일 경로가 무조건 return (2026-09-14 경고 정리)
     fn gemv_tile(&mut self, xq: vk::Buffer, wkey: &str, out: vk::Buffer, t: usize, bar: bool) -> Result<(), String> {
         let (wbufs, ty, ni, no) = self.w.get(wkey).cloned().ok_or(format!("가중치 없음: {wkey}"))?;
@@ -1404,15 +1402,12 @@ impl DecoderState {
                     if split {
                         let gxh = gx_ms.div_ceil(2);
                         let mut ro = 0u32;
-                        let mut first = true;
                         while ro < gx_ms * 64 {
                             let g = (gx_ms - ro / 64).min(gxh);
                             let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, ro, tb as u32]);
                             let fin = last && ro + g * 64 >= gx_ms * 64;
                             self.run_pipe_b(nm, spv, nkb, 24, &binds, &push, g, 1, 1, fin)?;
                             ro += g * 64;
-                            first = false;
-                            let _ = first;
                         }
                     } else {
                         // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
