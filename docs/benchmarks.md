@@ -277,6 +277,17 @@ parallel-K variant is blocked by the smem-exchange corruption or the
 global-plane fault. Axis closed for this deadline; production GEMM remains
 dot4.
 
+### Ported MMQ at t=4 measured (2026-09-17, not adopted)
+
+The tree already carries llama's mul_mat_q<q4_K/q5_K,128> as a CO object
+(prefill path, t>=32 gate). A temporary t=4 bypass measured it on the np4
+micro-bench: **11.3-11.7 t/s vs dot4's 30.0** (2.6x slower). Our port is
+the J=128 tile instantiation; llama's runtime selects J per batch shape
+from the RDNA3.5 config tables (J=16 for small ne11). Closing the np4 gap
+via MMQ therefore requires porting the tuned small-J instantiations plus
+their launch configs - and even at llama's ~200GB/s effective rate the
+cell stays short of their warm reference. Axis closed.
+
 ### Prefill CPU-state pullback elided for the frame path (10136ae, 2026-09-17)
 
 The per-prefill-call device-to-host pullback of GDN/conv states (dozens of
