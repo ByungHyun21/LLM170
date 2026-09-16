@@ -1077,6 +1077,33 @@ impl RawCtx {
                 &mut args,
             );
         }
+        // plans/74 (2026-09-16): 멀티토큰 q8_0 은 **워프=행 판**(gemm_q8_0_mt_w)이
+        // 기본 — n_sub>32 에서 종전 64레인 판 대비 +40..65% 실측(마이크로벤치
+        // 117→190GB/s @ n_sub=80, 119→180 @ n_sub=64). 산술은 정수 사슬 분리
+        // (결합법칙 — 값 불변) + 레인별 f32 사슬/ f64 32레인 트리(mt16 계열과
+        // 동일 정밀도 클래스). 킬스위치 LLM170_Q8MTW=0.
+        if t >= 2 && t <= 8 && ty == 8 && n_in / 32 > 32
+            && std::env::var("LLM170_Q8MTW").as_deref() != Ok("0")
+        {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+                &mut tt_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3(
+                "gemm_q8_0_mt_w",
+                1,
+                n_out.min(65535) as u32,
+                n_out.div_ceil(65535) as u32,
+                32,
+                &mut args,
+            );
+        }
         if t >= 2 && t <= 8 && ty == 8 && std::env::var("LLM170_Q8MT").as_deref() != Ok("0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
