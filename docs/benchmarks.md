@@ -218,6 +218,32 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### WMMA tile GEMM round 2 — correct at 28.3 but below dot4 (2026-09-17, not landed)
+
+Second campaign on `gemm_q5k_wmma` (raw w32 builtin, probed ABI), fixed from
+first-principles debugging with a host-side CPU reference harness:
+
+- **v<<10 f16 bit-trick is invalid**: f16 integer encoding is not a single
+  shift (binades). Denormal bits=v encoding (v*2^-24) is flushed to zero by
+  the WMMA unit. Fixed via a 32-entry f16 LUT in smem (exact, 1 LDS/value).
+- **B-fragment must be row-major** per the wmma2 operand audit (lane L holds
+  row L%16's 16 consecutive k-values for BOTH operands; D = A·B^T).
+- **NaN root cause**: an intermediate xf16 staging buffer path (converter +
+  scratch) produced NaN outputs; reading f32 activations directly in-kernel
+  is correct.
+- **Cross-warp tile sharing corrupts**: any configuration where multiple
+  warps work the SAME 16-row tile (split-K with smem partials, or even
+  warp0-only reduction reads) yields nondeterministic garbage — while the
+  same code with per-warp tiles, a dummy second __syncthreads, or smem LUT
+  sharing is bit-stable. Root cause not isolated (suspect w32-WMMA +
+  block-level scheduling on this ROCm build); avoided by block-per-tile.
+- Terminal correct kernel: 64-thread blocks (2 warps, distinct tiles),
+  serial-K per warp, LUT A, f32-direct B, per-sub-block f32 scale/min fold:
+  **28.3 t/s np4 micro vs dot4 30.0** (0.8485 vs 0.853 on the CPU-verified
+  row, deterministic across runs). No win -> removed. The split-K latency
+  prize (the earlier 34-36 t/s runs were the corrupted kernel) remains
+  unreachable until the cross-warp corruption is root-caused.
+
 ### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
 
 - `prefill_greedy` (f947146): the Q4 server prefill returned the full 152k
