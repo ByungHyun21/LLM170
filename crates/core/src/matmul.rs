@@ -40,7 +40,11 @@ impl<'a> Weight<'a> {
 
 /// 가속기(구현체는 backend-gpu) — 런타임 주입. 없으면 CPU 경로.
 /// w 는 mmap 바이트 참조: 구현체는 첫 호출 시 데이터 포인터 키로 업로드 캐시.
-pub trait Accelerator: FrameState + Send + Sync {
+/// 그래프 캡처/재생 — 미지원 백엔드는 Err(드라이버가 폴백).
+///
+/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
+pub trait GraphCapture: Send + Sync {
     /// 그래프 캡처 시작/종료·재생 — 미지원 백엔드는 Err (드라이버가 폴백).
     fn graph_capture_begin(&self) -> Result<(), String> {
         Err("graph capture: 미지원".into())
@@ -58,57 +62,87 @@ pub trait Accelerator: FrameState + Send + Sync {
     fn capture_mark(&self, _tag: &str) -> Result<(), String> {
         Ok(())
     }
+}
 
-    /// KTRACE 덤프+재시작(q4acc 등 백엔드 훅) — 진단용 기본 no-op.
-    fn ktrace_tick(&self) {}
+/// 양자화 matmul 계열과 동기 프리미티브.
+///
+/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
+pub trait MatmulHost: Send + Sync {
 
-    /// 시퀀스 상태 초기화(슬롯 반납) — 가속기가 들고 있는 시퀀스별 상주 상태
-    /// (예: PLE n-gram 링)을 제거한다. 기본 no-op.
-    fn acc_reset_seq(&self, _seq: usize) {}
-
-    /// 프레임 logits [t][vocab]의 행별 argmax — GPU 판정 후 토큰만 회수
-    /// (np greedy: vocab×t 플로트 전사 회피). 동률 시 최저 인덱스(CPU greedy와
-    /// 동일 의미). 미구현 백엔드는 Err (호출부 폴백).
-    fn frame_argmax_rows(
-        &self,
-        _logits: u64,
-        _t: usize,
-        _vocab: usize,
-    ) -> Result<Vec<u32>, String> {
-        Err("frame_argmax_rows: 미지원".into())
-    }
-
-    /// np 행별 conv — qkv/out은 [t][ch] 연속, states는 행(시퀀스)별 상태
-    /// 핸들. gdn_conv(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
-    fn frame_gdn_conv_np(
-        &self,
-        _qkv: u64,
-        _out: u64,
-        _states: &[u64],
-        _cw: u64,
-        _ch: usize,
-        _k: usize,
-    ) -> Result<(), String> {
-        Err("frame_gdn_conv_np: 미지원".into())
-    }
-
-    /// np 행별 AR — q/k/v/beta_ge/out은 [t][·] 연속, states는 행별 상태
-    /// 핸들. gdn_ar_w_swap(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
+    /// xs 행 순서 = expert_ids 순 (스택 인덱스와 무관).
     #[allow(clippy::too_many_arguments)]
-    fn frame_gdn_ar_np(
+    fn moe_down(
         &self,
-        _q: u64,
-        _k: u64,
-        _v: u64,
-        _beta_ge: u64,
-        _out: u64,
-        _states: &[u64],
-        _h_k: usize,
-        _h_v: usize,
-        _d: usize,
+        _xs: &[Vec<f32>],
+        _ws: &Weight,
+        _expert_ids: &[u32],
+        _n_expert_stack: usize,
+        _outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
-        Err("frame_gdn_ar_np: 미지원".into())
+        Err("moe_down: 미지원".into())
     }
+    /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
+    /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
+    fn barrier(&self) {}
+
+    /// outs[t][o] = Σ_i xs[t][i]·W[o,i]
+    fn matmul_batch(
+        &self,
+        xs: &[Vec<f32>],
+        w: &Weight,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String>;
+    /// out[o] = Σ_i x[i]·W[o,i]
+    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
+    /// 디바이스 총 메모리(바이트). 미지원/CPU면 0 — 적응형 버퍼 상한 결정에 쓴다.
+    fn total_mem_bytes(&self) -> u64 {
+        0
+    }
+
+    /// 전문가 down처럼 입력이 가중치마다 다른 1행 짝: outs[i][o] = xs[i]·W_i[o].
+    /// 기본 = 개별 실행. GPU 구현은 런치 배치 + 단일 동기화로 파이프라이닝.
+    fn matmul_paired(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        if ws.len() != xs.len() || ws.len() != outs.len() {
+            return Err(format!("matmul_paired: 형상 불일치 ws={} xs={} outs={}", ws.len(), xs.len(), outs.len()));
+        }
+        for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
+            let mut tmp = vec![vec![0.0f32; w.n_out as usize]; 1];
+            self.matmul_batch(std::slice::from_ref(x), w, &mut tmp)?;
+            o.copy_from_slice(&tmp[0]);
+        }
+        Ok(())
+    }
+
+    /// 같은 입력 xs를 먹는 프로젝션 그룹: outs[i][t][o] = Σ xs[t]·W_i[o]. 기본 = 개별 실행.
+    /// GPU 구현은 x 업로드 1회 + 런치 배치 + 단일 동기화로 파이프라이닝.
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        if ws.len() != outs.len() {
+            return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
+        }
+        for (w, out) in ws.iter().zip(outs.iter_mut()) {
+            self.matmul_batch(xs, w, out)?;
+        }
+        Ok(())
+    }
+}
+
+/// 값 경로 elementwise/GDN/셰이프 op.
+///
+/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
+pub trait EwOps: Send + Sync {
 
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn rms_norm(
@@ -142,20 +176,6 @@ pub trait Accelerator: FrameState + Send + Sync {
         _outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         Err("silu_mul: 미지원".into())
-    }
-
-    /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
-    /// xs 행 순서 = expert_ids 순 (스택 인덱스와 무관).
-    #[allow(clippy::too_many_arguments)]
-    fn moe_down(
-        &self,
-        _xs: &[Vec<f32>],
-        _ws: &Weight,
-        _expert_ids: &[u32],
-        _n_expert_stack: usize,
-        _outs: &mut [Vec<f32>],
-    ) -> Result<(), String> {
-        Err("moe_down: 미지원".into())
     }
 
     /// GDN AR 단일 토큰 상태 갱신 — 미구현 백엔드는 Err (호출부 CPU 폴백).
@@ -233,23 +253,57 @@ pub trait Accelerator: FrameState + Send + Sync {
     ) -> Result<(), String> {
         Err("gdn_chunk: 미지원".into())
     }
-    /// 큐 완결 동기화 — 풀 버퍼 재사용 전 비행 중 연산 종료 확정.
-    /// read_one가 커널 완결을 보장하지 않는 결함(2026-09-01 실측) 대응.
-    fn barrier(&self) {}
 
-    /// outs[t][o] = Σ_i xs[t][i]·W[o,i]
-    fn matmul_batch(
-        &self,
-        xs: &[Vec<f32>],
-        w: &Weight,
-        outs: &mut [Vec<f32>],
-    ) -> Result<(), String>;
-    /// out[o] = Σ_i x[i]·W[o,i]
-    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String>;
-    /// 디바이스 총 메모리(바이트). 미지원/CPU면 0 — 적응형 버퍼 상한 결정에 쓴다.
-    fn total_mem_bytes(&self) -> u64 {
-        0
+    /// plans/72: 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
+    /// down+sigmoid·axpy(1런치). 기존 8런치를 대체.
+    fn shexp_gu(
+        &self, _x: u64, _wg: &Weight, _wu: &Weight, _h: u64,
+        _n_in: usize, _n_hidden: usize,
+    ) -> Result<(), String> {
+        Err("shexp_gu: 이 가속기는 미지원".into())
     }
+    fn shexp_da(
+        &self, _h: u64, _wd: &Weight, _s: u64, _mout: u64,
+        _n_in: usize, _n_hidden: usize,
+    ) -> Result<(), String> {
+        Err("shexp_da: 이 가속기는 미지원".into())
+    }
+
+    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
+    /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
+    /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
+    #[allow(clippy::too_many_arguments)]
+    fn ple_math_dev(
+        &self,
+        _res: u64,
+        _key: u64,
+        _value: u64,
+        _nk: &[f32],
+        _nq: &[f32],
+        _nc: &[f32],
+        _conv_w: &[f32],
+        _gated: u64,
+        _conv_out: u64,
+        _gate_out: u64,
+        _seq: usize,
+        _t: usize,
+        _eps: f32,
+        _n_embd: usize,
+        _hc: usize,
+        _kern: usize,
+        _dil: usize,
+        _hist: usize,
+        _host_ring: &[f32],
+    ) -> Result<(), String> {
+        Err("ple_math_dev: 이 가속기는 미지원".into())
+    }
+}
+
+/// QSA(인덱서·선택·KV 상주) 어텐션 계열.
+///
+/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
+pub trait QsaOps: Send + Sync {
 
     /// QSA 마스크드 밀집 GQA (GPU 전용 — 기본 미지원).
     #[allow(clippy::too_many_arguments)]
@@ -269,37 +323,6 @@ pub trait Accelerator: FrameState + Send + Sync {
         Err("qsa_attention: 이 가속기는 미지원".into())
     }
 
-    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
-    /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
-    /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
-    #[allow(clippy::too_many_arguments)]
-    /// plans/73(np): 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
-    /// 등록해 새 핸들을 반환한다. np 배치 디코드가 per-seq 상태 op(conv/AR/
-    /// QSA 선택·rope·어텐션)에 행 슬라이스를 그대로 넘기기 위해서다.
-    /// 기존 메서드·커널은 무변경(핸들 = 포인터이므로 그대로 소비된다).
-    fn frame_slice(&self, _h: u64, _off_elems: usize, _len: usize) -> Result<u64, String> {
-        Err("frame_slice: 이 가속기는 미지원".into())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn frame_qk_norm_rope(
-        &self,
-        _q: u64,
-        _k: u64,
-        _q_norm: &[f32],
-        _k_norm: &[f32],
-        _cs: &[f32],
-        _eps: f32,
-        _pos0: usize,
-        _n_head: usize,
-        _n_kv: usize,
-        _hd: usize,
-        _n_rot: usize,
-        _t: usize,
-    ) -> Result<(), String> {
-        Err("frame_qk_norm_rope: 이 가속기는 미지원".into())
-    }
-
     /// plans/67 3단계: QSA KV 캐시 **디바이스 상주화** — (full_idx, seq) 풀에
     /// k/v 행(mm_group 출력 버퍼, 이미 norm·rope 완료)을 D2D append하고 풀
     /// 핸들을 반환한다. 어텐션이 이 풀을 직접 읽으면 매 층 매 스텝의 캐시
@@ -317,21 +340,6 @@ pub trait Accelerator: FrameState + Send + Sync {
         _hd: usize,
     ) -> Result<(u64, u64), String> {
         Err("qsa_kv_dev: 이 가속기는 미지원".into())
-    }
-
-    /// plans/72: 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
-    /// down+sigmoid·axpy(1런치). 기존 8런치를 대체.
-    fn shexp_gu(
-        &self, _x: u64, _wg: &Weight, _wu: &Weight, _h: u64,
-        _n_in: usize, _n_hidden: usize,
-    ) -> Result<(), String> {
-        Err("shexp_gu: 이 가속기는 미지원".into())
-    }
-    fn shexp_da(
-        &self, _h: u64, _wd: &Weight, _s: u64, _mout: u64,
-        _n_in: usize, _n_hidden: usize,
-    ) -> Result<(), String> {
-        Err("shexp_da: 이 가속기는 미지원".into())
     }
 
     /// 진단: 상주 풀 내용이 호스트 캐시와 비트一致하는지 검증(plans/67 3단계 디버그).
@@ -374,35 +382,6 @@ pub trait Accelerator: FrameState + Send + Sync {
         _list_len: usize,
     ) -> Result<(Vec<u32>, Vec<u32>), String> {
         Err("qsa_sel_readback: 이 가속기는 미지원".into())
-    }
-
-    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
-    /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
-    /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
-    #[allow(clippy::too_many_arguments)]
-    fn ple_math_dev(
-        &self,
-        _res: u64,
-        _key: u64,
-        _value: u64,
-        _nk: &[f32],
-        _nq: &[f32],
-        _nc: &[f32],
-        _conv_w: &[f32],
-        _gated: u64,
-        _conv_out: u64,
-        _gate_out: u64,
-        _seq: usize,
-        _t: usize,
-        _eps: f32,
-        _n_embd: usize,
-        _hc: usize,
-        _kern: usize,
-        _dil: usize,
-        _hist: usize,
-        _host_ring: &[f32],
-    ) -> Result<(), String> {
-        Err("ple_math_dev: 이 가속기는 미지원".into())
     }
 
     /// plans/73: QSA 인덱서 선택의 **디바이스판** (디코드 t=1). iq/ik가 프레임
@@ -552,43 +531,95 @@ pub trait Accelerator: FrameState + Send + Sync {
     ) -> Result<Vec<f32>, String> {
         Err("qsa_attention_sel: 이 가속기는 미지원".into())
     }
+}
 
-    /// 전문가 down처럼 입력이 가중치마다 다른 1행 짝: outs[i][o] = xs[i]·W_i[o].
-    /// 기본 = 개별 실행. GPU 구현은 런치 배치 + 단일 동기화로 파이프라이닝.
-    fn matmul_paired(
+/// 프레임 버퍼·프레임 op·프레임 GEMM — 상태는 FrameState 승계.
+///
+/// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
+/// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
+pub trait FrameHost: Send + Sync {
+
+    /// KTRACE 덤프+재시작(q4acc 등 백엔드 훅) — 진단용 기본 no-op.
+    fn ktrace_tick(&self) {}
+
+    /// 시퀀스 상태 초기화(슬롯 반납) — 가속기가 들고 있는 시퀀스별 상주 상태
+    /// (예: PLE n-gram 링)을 제거한다. 기본 no-op.
+    fn acc_reset_seq(&self, _seq: usize) {}
+
+    /// 프레임 logits [t][vocab]의 행별 argmax — GPU 판정 후 토큰만 회수
+    /// (np greedy: vocab×t 플로트 전사 회피). 동률 시 최저 인덱스(CPU greedy와
+    /// 동일 의미). 미구현 백엔드는 Err (호출부 폴백).
+    fn frame_argmax_rows(
         &self,
-        xs: &[Vec<f32>],
-        ws: &[Weight],
-        outs: &mut [Vec<f32>],
-    ) -> Result<(), String> {
-        if ws.len() != xs.len() || ws.len() != outs.len() {
-            return Err(format!("matmul_paired: 형상 불일치 ws={} xs={} outs={}", ws.len(), xs.len(), outs.len()));
-        }
-        for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
-            let mut tmp = vec![vec![0.0f32; w.n_out as usize]; 1];
-            self.matmul_batch(std::slice::from_ref(x), w, &mut tmp)?;
-            o.copy_from_slice(&tmp[0]);
-        }
-        Ok(())
+        _logits: u64,
+        _t: usize,
+        _vocab: usize,
+    ) -> Result<Vec<u32>, String> {
+        Err("frame_argmax_rows: 미지원".into())
     }
 
-    /// 같은 입력 xs를 먹는 프로젝션 그룹: outs[i][t][o] = Σ xs[t]·W_i[o]. 기본 = 개별 실행.
-    /// GPU 구현은 x 업로드 1회 + 런치 배치 + 단일 동기화로 파이프라이닝.
-    fn matmul_group(
+    /// np 행별 conv — qkv/out은 [t][ch] 연속, states는 행(시퀀스)별 상태
+    /// 핸들. gdn_conv(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    fn frame_gdn_conv_np(
         &self,
-        xs: &[Vec<f32>],
-        ws: &[Weight],
-        outs: &mut [Vec<Vec<f32>>],
+        _qkv: u64,
+        _out: u64,
+        _states: &[u64],
+        _cw: u64,
+        _ch: usize,
+        _k: usize,
     ) -> Result<(), String> {
-        if ws.len() != outs.len() {
-            return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
-        }
-        for (w, out) in ws.iter().zip(outs.iter_mut()) {
-            self.matmul_batch(xs, w, out)?;
-        }
-        Ok(())
+        Err("frame_gdn_conv_np: 미지원".into())
     }
-    // ─── 프레임(활성화 GPU 상주) — 층 전체 상주 P2-4 (plans/gpu-frame.md) ───
+
+    /// np 행별 AR — q/k/v/beta_ge/out은 [t][·] 연속, states는 행별 상태
+    /// 핸들. gdn_ar_w_swap(t=1) 산술 그대로 1런치 (plans/74 N2). 미구현은 Err.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar_np(
+        &self,
+        _q: u64,
+        _k: u64,
+        _v: u64,
+        _beta_ge: u64,
+        _out: u64,
+        _states: &[u64],
+        _h_k: usize,
+        _h_v: usize,
+        _d: usize,
+    ) -> Result<(), String> {
+        Err("frame_gdn_ar_np: 미지원".into())
+    }
+
+    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
+    /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
+    /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
+    #[allow(clippy::too_many_arguments)]
+    /// plans/73(np): 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
+    /// 등록해 새 핸들을 반환한다. np 배치 디코드가 per-seq 상태 op(conv/AR/
+    /// QSA 선택·rope·어텐션)에 행 슬라이스를 그대로 넘기기 위해서다.
+    /// 기존 메서드·커널은 무변경(핸들 = 포인터이므로 그대로 소비된다).
+    fn frame_slice(&self, _h: u64, _off_elems: usize, _len: usize) -> Result<u64, String> {
+        Err("frame_slice: 이 가속기는 미지원".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame_qk_norm_rope(
+        &self,
+        _q: u64,
+        _k: u64,
+        _q_norm: &[f32],
+        _k_norm: &[f32],
+        _cs: &[f32],
+        _eps: f32,
+        _pos0: usize,
+        _n_head: usize,
+        _n_kv: usize,
+        _hd: usize,
+        _n_rot: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        Err("frame_qk_norm_rope: 이 가속기는 미지원".into())
+    }
     /// 기본 미지원(Err) — 프레임 경로는 구현 가속기에서만 사용하며, 값 반환
     /// 경로(위 matmul 계열)와 병행해 CPU golden 대조가 가능하다.
 
@@ -633,6 +664,20 @@ pub trait Accelerator: FrameState + Send + Sync {
     fn frame_mm_q8(&self, _xq: u64, _xd: u64, _w: &Weight, _out: u64, _n: usize) -> Result<(), String> {
         Err("frame_mm_q8: 미지원".into())
     }
+}
+
+/// GPU 가속기 합성 트레이트 — capability 서브트레이트의 합집합(plans/75 P1).
+///
+/// 호출부(`&dyn Accelerator`)는 종전 시그니처 그대로다. 구현체는 서브트레이트만
+/// 구현하면 되므로(블랭킷) 백엔드가 필요한 capability 만 갖출 수 있다.
+pub trait Accelerator:
+    FrameState + GraphCapture + MatmulHost + EwOps + QsaOps + FrameHost + Send + Sync
+{
+}
+
+impl<T> Accelerator for T where
+    T: FrameState + GraphCapture + MatmulHost + EwOps + QsaOps + FrameHost + Send + Sync
+{
 }
 
 /// 프레임 연산 식별 — 백엔드 커널 세트(backend-gpu/src/ew.rs)와 1:1.

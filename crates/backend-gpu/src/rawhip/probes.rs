@@ -825,7 +825,7 @@ pub fn f16_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<
 /// 합성 q4_K 텐서로 커널 변형별 실효 대역을 잰다(plans/65 하한 분석의 입력).
 pub fn q4k_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<String, String> {
     use crate::rawhip::q4acc::Q4Acc;
-    use llm170_core::matmul::Accelerator;
+    use llm170_core::matmul::MatmulHost;
     let mut seed = 0x243F_6A88_85A3_08D3u64;
     let mut lcg = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -868,7 +868,7 @@ pub fn q4k_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<
 /// (`dot_q4k_q8`)와 직접 대조한다. 인덱스 매핑 버그를 값 수준에서 드러낸다.
 pub fn q4k_micro() -> Result<String, String> {
     use crate::rawhip::q4acc::Q4Acc;
-    use llm170_core::matmul::Accelerator;
+    use llm170_core::matmul::MatmulHost;
     let (n_out, n_in, t) = (16usize, 256usize, 16usize);
     // 합성 q4_K 블록: d=1.0, dmin=0.5, 6비트 스케일 패턴, 결정적 니블
     let mut blk = vec![0u8; 144];

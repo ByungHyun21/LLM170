@@ -2892,113 +2892,7 @@ impl Q4Acc {
     }
 }
 
-impl llm170_core::matmul::Accelerator for Q4Acc {
-
-    /// np 행별 conv 1런치 (plans/74 N2) — gdn_conv(t=1) 산술, 상태는 행
-    /// 포인터 테이블. qkv/out은 [t][ch] 연속 프레임 버퍼.
-    fn frame_gdn_conv_np(
-        &self,
-        qkv: u64,
-        out: u64,
-        states: &[u64],
-        cw: u64,
-        ch: usize,
-        k: usize,
-    ) -> Result<(), String> {
-        let t = states.len();
-        if t == 0 {
-            return Ok(());
-        }
-        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
-        for &h in states {
-            ptrs.push(self.fptr(h)? as usize);
-        }
-        let tbl = self.ctx.scratch(t * 8)?;
-        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
-        let (mut q, mut c, mut s_, mut o_) = (
-            self.fptr(qkv)?,
-            self.fptr(cw)?,
-            tbl as *mut std::ffi::c_void,
-            self.fptr(out)?,
-        );
-        let (mut chh, mut kk, mut tt) = (ch as i32, k as i32, t as i32);
-        self.kop(
-            "gdn_conv_np",
-            (ch as u32).div_ceil(64),
-            t as u32,
-            1,
-            64,
-            &mut cargs!(&mut q, &mut c, &mut s_, &mut o_, &mut chh, &mut kk, &mut tt),
-        )
-    }
-    /// np 행별 AR 1런치 (plans/74 N2) — gdn_ar_w_swap(t=1) 산술(scale=1,
-    /// q는 L2Rows+Scale 로 선스케일), 상태는 행 포인터 테이블.
-    #[allow(clippy::too_many_arguments)]
-    fn frame_gdn_ar_np(
-        &self,
-        q: u64,
-        k: u64,
-        v: u64,
-        beta_ge: u64,
-        out: u64,
-        states: &[u64],
-        h_k: usize,
-        h_v: usize,
-        d: usize,
-    ) -> Result<(), String> {
-        let t = states.len();
-        if t == 0 {
-            return Ok(());
-        }
-        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
-        for &h in states {
-            ptrs.push(self.fptr(h)? as usize);
-        }
-        let tbl = self.ctx.scratch(t * 8)?;
-        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
-        let (mut sp, mut qp, mut kp, mut vp, mut bp, mut op_) = (
-            tbl as *mut std::ffi::c_void,
-            self.fptr(q)?,
-            self.fptr(k)?,
-            self.fptr(v)?,
-            self.fptr(beta_ge)?,
-            self.fptr(out)?,
-        );
-        let (mut dd, mut ks, mut vs, mut hv, mut hk, mut sc, mut tt) = (
-            d as i32,
-            (h_k * d) as i32,
-            (h_v * d) as i32,
-            h_v as i32,
-            h_k as i32,
-            1.0f32,
-            t as i32,
-        );
-        // gx=h_v(페어 축 — 커널의 blockIdx.x), gy=d(u 축). 27B rawhip 판과
-        // 동일 순서(2026-09-16 실수로 (d,h_v)로 바꿔써 GPU 메모리 폴트).
-        self.ctx.launch3(
-            "gdn_ar_w_np",
-            h_v as u32,
-            d as u32,
-            1,
-            32,
-            &mut cargs!(&mut sp, &mut qp, &mut kp, &mut vp, &mut bp, &mut op_, &mut dd, &mut ks, &mut vs, &mut hv, &mut hk, &mut sc, &mut tt),
-        )
-    }
-    /// plans/73(np): 프레임 버퍼 행 뷰 — 배치 디코드의 per-seq 상태 op용.
-    fn frame_slice(&self, h: u64, off_elems: usize, len: usize) -> Result<u64, String> {
-        let mut v = self.frames.lock().map_err(|e| e.to_string())?;
-        let idx = (h.checked_sub(1).ok_or("frame 핸들 0")?) as usize;
-        let (base, cap) = *v
-            .get(idx)
-            .ok_or_else(|| format!("frame 핸들 없음: {h}"))?;
-        let need = (off_elems + len) * 4;
-        if need > cap {
-            return Err(format!("frame_slice 범위 초과: need {need} > cap {cap}"));
-        }
-        let ptr = unsafe { base.add(off_elems * 4) };
-        v.push((ptr, len * 4));
-        Ok(v.len() as u64)
-    }
+impl llm170_core::matmul::GraphCapture for Q4Acc {
 
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
         crate::rawhip::capture_mark(self.ctx.stream, tag)
@@ -3012,6 +2906,9 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
     fn graph_replay(&self, on: bool) -> Result<(), String> {
         crate::rawhip::graph_replay(on)
     }
+}
+
+impl llm170_core::matmul::MatmulHost for Q4Acc {
 
     fn barrier(&self) {
         unsafe {
@@ -3072,113 +2969,128 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         Ok(())
     }
 
-    fn frame_qk_norm_rope(
+    fn matmul_paired(
         &self,
-        q: u64,
-        k: u64,
-        q_norm: &[f32],
-        k_norm: &[f32],
-        cs: &[f32],
-        eps: f32,
-        pos0: usize,
-        n_head: usize,
-        n_kv: usize,
-        hd: usize,
-        n_rot: usize,
-        t: usize,
+        xs: &[Vec<f32>],
+        ws: &[llm170_core::matmul::Weight<'_>],
+        outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
-        // 상수 3개(qn/kn/cs) — plans/73: 매 호출 h2d(+sync)가 스텝당 36회의
-        // 동기를 만들었다. **키는 (ptr,len)** — 내용 해시는 층마다 값이 달라
-        // 단일 슬롯 캐시가 매 층 미스했고(24KB+2KB 동기 복사 ×12층 = 40ms/스텝),
-        // 프레임이 헤드 타일을 1회 만들어 상주시키므로 포인터가 곧 신원이다.
-        // (2026-09-16: LLM170_Q4_TIME 계측 — qsa.mm+rope 3.4ms/층의 전부가 이 복사였다)
-        let (qnd, knd, csd) = {
-            let qnd = self.upload_map(&self.qn_map, "qn_t", q_norm)?;
-            let knd = self.upload_map(&self.kn_map, "kn_t", k_norm)?;
-            let qh = q_norm.as_ptr() as u64;
-            let kh = k_norm.as_ptr() as u64;
-            let _ = (qh, kh);
-            let cskey = (cs.as_ptr() as usize, cs.len());
-            let mut c = (self.cst.lock().map_err(|e| e.to_string())?, self.cst_cache.lock().map_err(|e| e.to_string())?);
-            if *c.1 != cskey || c.0.ptr.is_null() {
-                c.0.ensure(&self.ctx, cs.len().max(1) * 4)?;
-                self.ctx.h2d(c.0.ptr, bytemuck::cast_slice(cs))?;
-                *c.1 = cskey;
-            }
-            (qnd, knd, c.0.ptr)
-        };
-        let mut qp = self.fptr(q)? as *mut std::ffi::c_void;
-        let mut kp = self.fptr(k)? as *mut std::ffi::c_void;
-        let mut qwp = qnd as *mut std::ffi::c_void;
-        let mut kwp = knd as *mut std::ffi::c_void;
-        let mut csp = csd as *mut std::ffi::c_void;
-        // kq_scale은 이 커널의 decode 판은 k에 구워 넣지만(kqs=self.kq_scale),
-        // QSA 프레임 경로는 **k를 무척도(1.0)로 둔다** — QSA KV 캐시 규약이
-        // 무척도 k이고 qsa_attn_sel6가 q·k에 kq_scale을 곱하기 때문. 초기 구현은
-        // 0.0을 넘겨 k를 전부 0으로 만드는 잠복 결함이었음(미호출 경로라 미발견,
-        // 2026-09-14 plans/67 2c 연결 시 발견·수정).
-        let mut kq = 1.0f32;
-        let mut ep = eps;
-        let mut pp = pos0 as i32;
-        let mut nh = n_head as i32;
-        let mut nk = n_kv as i32;
-        let mut h = hd as i32;
-        let mut nr = n_rot as i32;
-        let rows = n_head + n_kv;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut qp) as *mut _ as *mut std::ffi::c_void,
-            (&mut kp) as *mut _ as *mut std::ffi::c_void,
-            (&mut qwp) as *mut _ as *mut std::ffi::c_void,
-            (&mut kwp) as *mut _ as *mut std::ffi::c_void,
-            (&mut csp) as *mut _ as *mut std::ffi::c_void,
-            (&mut ep) as *mut _ as *mut std::ffi::c_void,
-            (&mut kq) as *mut _ as *mut std::ffi::c_void,
-            (&mut pp) as *mut _ as *mut std::ffi::c_void,
-            (&mut nh) as *mut _ as *mut std::ffi::c_void,
-            (&mut nk) as *mut _ as *mut std::ffi::c_void,
-            (&mut h) as *mut _ as *mut std::ffi::c_void,
-            (&mut nr) as *mut _ as *mut std::ffi::c_void,
-        ];
-        self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)
-    }
-
-    fn qsa_attention_dev(
-        &self,
-        q: u64,
-        ck: &[f32],
-        cv: &[f32],
-        sel_idx: &[u32],
-        sel_off: &[u32],
-        kq_scale: f32,
-        n_head: usize,
-        n_kv: usize,
-        hd: usize,
-        t: usize,
-        out: u64,
-    ) -> Result<(), String> {
-        // t=1은 위치 분할판(flash-decoding형) — 디바이스 q·출력판이 같은 커널
-        // 쌍을 쓴다. 규약은 호스트 판(qsa_attention_sel)과 동일: LLM170_QSA_SPLIT=0
-        // 이면 비분할 sel6/sel4로 돌아간다.
-        if t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0") {
-            self.qsa_attn_sel4s_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
-        } else {
-            self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        if ws.len() != xs.len() || ws.len() != outs.len() {
+            return Err(format!(
+                "matmul_paired: 형상 불일치 ws={} xs={} outs={}",
+                ws.len(),
+                xs.len(),
+                outs.len()
+            ));
         }
+        for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
+            let one = [x.clone()];
+            let mut oo = [std::mem::take(o)];
+            self.batch_into(&one, &mut oo, w, 0)?;
+            *o = std::mem::take(&mut oo[0]);
+        }
+        Ok(())
     }
 
-    fn qsa_kv_dev(
+    /// MoE 전문가 스택 배치 — ids로 전문가를 묶어 그룹별 런치.
+    /// ids가 가리키는 전문가 슬라이스는 스택에서 연속이므로 바이트 오프셋만
+    /// 옮기면 기존 GEMV 커널이 그대로 성립한다(mul_mat_id의 오프셋 형태).
+    fn moe_down(
         &self,
-        full_idx: usize,
-        seq: usize,
-        k: u64,
-        v: u64,
-        t: usize,
-        pos0: usize,
-        n_kv: usize,
-        hd: usize,
-    ) -> Result<(u64, u64), String> {
-        self.qsa_kv_dev_impl(full_idx, seq, k, v, t, pos0, n_kv, hd)
+        xs: &[Vec<f32>],
+        ws: &llm170_core::matmul::Weight<'_>,
+        expert_ids: &[u32],
+        n_expert_stack: usize,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let t = xs.len();
+        if t != expert_ids.len() || t != outs.len() {
+            return Err(format!(
+                "moe_down: 형상 불일치 xs={} ids={} outs={}",
+                t,
+                expert_ids.len(),
+                outs.len()
+            ));
+        }
+        if t == 0 {
+            return Ok(());
+        }
+        let per_expert = ws.data.len() / n_expert_stack.max(1);
+        let n_in = ws.n_in as usize;
+        // 3D 전문가 스택은 n_out = 전문가수×전문가당 행으로 온다 — 런치·출력
+        // 버퍼는 전문가당 행 기준이다(mul_mat_id와 동일한 해석).
+        let n_out = ws.n_out as usize / n_expert_stack.max(1);
+        let (w_dev, w_f32) = self.dev_weight(ws)?;
+        // 활성 업로드 + 양자화 1회 (전문가 공통)
+        let (xdev_f32, xq_buf, xq_w, t) = self.prepare_x(xs, n_in, w_f32)?;
+        let mut yflat = vec![0.0f32; t * n_out];
+        let ydev = {
+            let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
+            yb.ensure(&self.ctx, t * n_out * 4)?
+        };
+        // 전문가 순 그룹화 (2026-09-13): ids는 확률순이라 연속 런이 1행씩
+        // 흩어진다(프레임 실측 t=512·k=10 ≈4000런치/층). 카운팅 정렬로 묶어
+        // 런치 수를 전문가 수 수준으로 줄인다. x 행은 순열 gather로 모으고,
+        // 결과 행 순서는 d2h 후 호스트 산란으로 복원한다(가중합이 원래 행
+        // 순서를 요구 — 호스트 비용은 perm 인덱싱뿐).
+        let ne = n_expert_stack.max(1);
+        let mut off = vec![0usize; ne + 1];
+        for &e in expert_ids {
+            off[(e as usize).min(ne - 1) + 1] += 1;
+        }
+        for e in 0..ne {
+            off[e + 1] += off[e];
+        }
+        let mut cur = off[..ne].to_vec();
+        let mut perm = vec![0u32; t];
+        for (i, &e) in expert_ids.iter().enumerate() {
+            let e = (e as usize).min(ne - 1);
+            let p = cur[e];
+            perm[p] = i as u32;
+            cur[e] += 1;
+        }
+        let row_u32 = if w_f32 { n_in } else { xq_w };
+        let xbase = if w_f32 { xdev_f32 } else { xq_buf };
+        let xg = {
+            let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * row_u32 * 4)?
+        };
+        self.rows_permute(xbase, &perm, xg, row_u32, t)?;
+        for e in 0..ne {
+            let rows = off[e + 1] - off[e];
+            if rows == 0 {
+                continue;
+            }
+            let start = off[e];
+            let xsrc = unsafe { xg.add(start * row_u32 * 4) };
+            let wsrc = unsafe { w_dev.add(e * per_expert) };
+            let dst = unsafe { ydev.add(start * n_out * 4) };
+            if w_f32 {
+                self.launch_gemm_f32(xsrc, wsrc, n_in, n_out, rows, dst)?;
+            } else {
+                self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, rows, dst)?;
+            }
+        }
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
+        for (g, v) in yflat.chunks_exact(n_out).enumerate() {
+            outs[perm[g] as usize].copy_from_slice(v);
+        }
+        Ok(())
     }
+
+    /// QSA 마스크드 밀집 GQA (값 경로 브리지) — f32 캐시.
+    fn total_mem_bytes(&self) -> u64 {
+        let (mut f, mut t) = (0usize, 0usize);
+        unsafe {
+            if hip::hipMemGetInfo(&mut f, &mut t) != hip::hipError_t_hipSuccess {
+                return 0;
+            }
+        }
+        t as u64
+    }
+}
+
+impl llm170_core::matmul::EwOps for Q4Acc {
 
     fn shexp_gu(
         &self, x: u64, wg: &llm170_core::matmul::Weight, wu: &llm170_core::matmul::Weight,
@@ -3225,6 +3137,209 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         ];
         // n_in=2560, warp당 1행 → 2560 워프 = 320블록(8워프/블록)
         self.ctx.launch3("q4_shexp_da", n_in.div_ceil(8) as u32, 1, 1, 256, &mut args)
+    }
+
+    fn ple_math_dev(
+        &self,
+        res: u64,
+        key: u64,
+        value: u64,
+        nk: &[f32],
+        nq: &[f32],
+        nc: &[f32],
+        conv_w: &[f32],
+        gated: u64,
+        conv_out: u64,
+        gate_out: u64,
+        seq: usize,
+        t: usize,
+        eps: f32,
+        n_embd: usize,
+        hc: usize,
+        kern: usize,
+        dil: usize,
+        hist: usize,
+        host_ring: &[f32],
+    ) -> Result<(), String> {
+        if t != 1 {
+            return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
+        }
+        let hc_dim = hc * n_embd;
+        let ring_bytes = hist * hc_dim * 4;
+        // 링 풀 + 워터마크(되감기면 호스트 링으로 리프레시).
+        let rewind = {
+            let mut wm = self.ple_ring_pos.lock().map_err(|e| e.to_string())?;
+            let w = wm.entry(seq).or_insert(0);
+            let rw = *w > t; // pos0=0 재시작(벤치 워밍업 등)
+            *w = t;          // t=1: 이번 토큰까지 유효
+            rw
+        };
+        let ring = {
+            let mut m = self.ple_ring.lock().map_err(|e| e.to_string())?;
+            let g = m.entry(seq).or_insert_with(|| GBuf::new("ple_ring"));
+            // 주의: ensure 가 ptr 을 세우므로 최초 판정은 ensure **전**에.
+            let fresh = g.ptr.is_null();
+            g.ensure(&self.ctx, ring_bytes)?;
+            if fresh || rewind {
+                // 최초/되감기: 호스트 링(정합 상태)으로 초기화 — 동기 h2d 1회.
+                self.ctx.h2d(g.ptr, bytemuck::cast_slice(host_ring))?;
+            }
+            g.ptr
+        };
+        let (resp, keyp, valp, gp, cop, gop) = (
+            self.fptr(res)?,
+            self.fptr(key)?,
+            self.fptr(value)?,
+            self.fptr(gated)?,
+            self.fptr(conv_out)?,
+            self.fptr(gate_out)?,
+        );
+        let nk_d = self.upload_hashed(&self.ple_nk, nk)?;
+        let nq_d = self.upload_hashed(&self.ple_nq, nq)?;
+        let nc_d = self.upload_hashed(&self.ple_nc, nc)?;
+        let cw_d = self.upload_hashed(&self.ple_cw, conv_w)?;
+        // (1) gate + 방송 + 그룹 norm — 워프당 (t,s), 레인 0 실행.
+        {
+            let (mut rp, mut kp, mut vp) = (
+                resp as *mut std::ffi::c_void,
+                keyp as *mut std::ffi::c_void,
+                valp as *mut std::ffi::c_void,
+            );
+            let (mut nk_, mut nq_, mut nc_) = (
+                nk_d as *mut std::ffi::c_void,
+                nq_d as *mut std::ffi::c_void,
+                nc_d as *mut std::ffi::c_void,
+            );
+            let (mut gp_, mut gop_) = (gp as *mut std::ffi::c_void, gop as *mut std::ffi::c_void);
+            let (mut e, mut ne, mut hcc, mut tt) =
+                (eps, n_embd as i32, hc as i32, t as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut rp) as *mut _ as *mut std::ffi::c_void,
+                (&mut kp) as *mut _ as *mut std::ffi::c_void,
+                (&mut vp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nk_) as *mut _ as *mut std::ffi::c_void,
+                (&mut nq_) as *mut _ as *mut std::ffi::c_void,
+                (&mut nc_) as *mut _ as *mut std::ffi::c_void,
+                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
+                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut e) as *mut _ as *mut std::ffi::c_void,
+                (&mut ne) as *mut _ as *mut std::ffi::c_void,
+                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_gate",
+                hc.div_ceil(8) as u32,
+                t as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // (2) dilated conv + silu + 링 갱신.
+        {
+            let (mut gp_, mut cw_, mut ring_, mut cop_) = (
+                gp as *mut std::ffi::c_void,
+                cw_d as *mut std::ffi::c_void,
+                ring as *mut std::ffi::c_void,
+                cop as *mut std::ffi::c_void,
+            );
+            let (mut hd, mut tt, mut k2, mut d2, mut h2) = (
+                hc_dim as i32,
+                t as i32,
+                kern as i32,
+                dil as i32,
+                hist as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cw_) as *mut _ as *mut std::ffi::c_void,
+                (&mut ring_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut hd) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut k2) as *mut _ as *mut std::ffi::c_void,
+                (&mut d2) as *mut _ as *mut std::ffi::c_void,
+                (&mut h2) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_conv",
+                hc_dim.div_ceil(256) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        // (3) 잔차.
+        {
+            let (mut rp, mut vp, mut gop_, mut cop_) = (
+                resp as *mut std::ffi::c_void,
+                valp as *mut std::ffi::c_void,
+                gop as *mut std::ffi::c_void,
+                cop as *mut std::ffi::c_void,
+            );
+            let (mut ne, mut hcc, mut tt) = (n_embd as i32, hc as i32, t as i32);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut rp) as *mut _ as *mut std::ffi::c_void,
+                (&mut vp) as *mut _ as *mut std::ffi::c_void,
+                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
+                (&mut ne) as *mut _ as *mut std::ffi::c_void,
+                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_ple_residual",
+                n_embd.div_ceil(256) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl llm170_core::matmul::QsaOps for Q4Acc {
+
+    fn qsa_attention_dev(
+        &self,
+        q: u64,
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        // t=1은 위치 분할판(flash-decoding형) — 디바이스 q·출력판이 같은 커널
+        // 쌍을 쓴다. 규약은 호스트 판(qsa_attention_sel)과 동일: LLM170_QSA_SPLIT=0
+        // 이면 비분할 sel6/sel4로 돌아간다.
+        if t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0") {
+            self.qsa_attn_sel4s_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        } else {
+            self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        }
+    }
+
+    fn qsa_kv_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        k: u64,
+        v: u64,
+        t: usize,
+        pos0: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Result<(u64, u64), String> {
+        self.qsa_kv_dev_impl(full_idx, seq, k, v, t, pos0, n_kv, hd)
     }
 
     fn qsa_kv_check(
@@ -3668,288 +3783,6 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         Ok((idx, off))
     }
 
-    fn ple_math_dev(
-        &self,
-        res: u64,
-        key: u64,
-        value: u64,
-        nk: &[f32],
-        nq: &[f32],
-        nc: &[f32],
-        conv_w: &[f32],
-        gated: u64,
-        conv_out: u64,
-        gate_out: u64,
-        seq: usize,
-        t: usize,
-        eps: f32,
-        n_embd: usize,
-        hc: usize,
-        kern: usize,
-        dil: usize,
-        hist: usize,
-        host_ring: &[f32],
-    ) -> Result<(), String> {
-        if t != 1 {
-            return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
-        }
-        let hc_dim = hc * n_embd;
-        let ring_bytes = hist * hc_dim * 4;
-        // 링 풀 + 워터마크(되감기면 호스트 링으로 리프레시).
-        let rewind = {
-            let mut wm = self.ple_ring_pos.lock().map_err(|e| e.to_string())?;
-            let w = wm.entry(seq).or_insert(0);
-            let rw = *w > t; // pos0=0 재시작(벤치 워밍업 등)
-            *w = t;          // t=1: 이번 토큰까지 유효
-            rw
-        };
-        let ring = {
-            let mut m = self.ple_ring.lock().map_err(|e| e.to_string())?;
-            let g = m.entry(seq).or_insert_with(|| GBuf::new("ple_ring"));
-            // 주의: ensure 가 ptr 을 세우므로 최초 판정은 ensure **전**에.
-            let fresh = g.ptr.is_null();
-            g.ensure(&self.ctx, ring_bytes)?;
-            if fresh || rewind {
-                // 최초/되감기: 호스트 링(정합 상태)으로 초기화 — 동기 h2d 1회.
-                self.ctx.h2d(g.ptr, bytemuck::cast_slice(host_ring))?;
-            }
-            g.ptr
-        };
-        let (resp, keyp, valp, gp, cop, gop) = (
-            self.fptr(res)?,
-            self.fptr(key)?,
-            self.fptr(value)?,
-            self.fptr(gated)?,
-            self.fptr(conv_out)?,
-            self.fptr(gate_out)?,
-        );
-        let nk_d = self.upload_hashed(&self.ple_nk, nk)?;
-        let nq_d = self.upload_hashed(&self.ple_nq, nq)?;
-        let nc_d = self.upload_hashed(&self.ple_nc, nc)?;
-        let cw_d = self.upload_hashed(&self.ple_cw, conv_w)?;
-        // (1) gate + 방송 + 그룹 norm — 워프당 (t,s), 레인 0 실행.
-        {
-            let (mut rp, mut kp, mut vp) = (
-                resp as *mut std::ffi::c_void,
-                keyp as *mut std::ffi::c_void,
-                valp as *mut std::ffi::c_void,
-            );
-            let (mut nk_, mut nq_, mut nc_) = (
-                nk_d as *mut std::ffi::c_void,
-                nq_d as *mut std::ffi::c_void,
-                nc_d as *mut std::ffi::c_void,
-            );
-            let (mut gp_, mut gop_) = (gp as *mut std::ffi::c_void, gop as *mut std::ffi::c_void);
-            let (mut e, mut ne, mut hcc, mut tt) =
-                (eps, n_embd as i32, hc as i32, t as i32);
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                (&mut rp) as *mut _ as *mut std::ffi::c_void,
-                (&mut kp) as *mut _ as *mut std::ffi::c_void,
-                (&mut vp) as *mut _ as *mut std::ffi::c_void,
-                (&mut nk_) as *mut _ as *mut std::ffi::c_void,
-                (&mut nq_) as *mut _ as *mut std::ffi::c_void,
-                (&mut nc_) as *mut _ as *mut std::ffi::c_void,
-                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
-                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
-                (&mut e) as *mut _ as *mut std::ffi::c_void,
-                (&mut ne) as *mut _ as *mut std::ffi::c_void,
-                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
-                (&mut tt) as *mut _ as *mut std::ffi::c_void,
-            ];
-            self.ctx.launch3(
-                "q4_ple_gate",
-                hc.div_ceil(8) as u32,
-                t as u32,
-                1,
-                256,
-                &mut args,
-            )?;
-        }
-        // (2) dilated conv + silu + 링 갱신.
-        {
-            let (mut gp_, mut cw_, mut ring_, mut cop_) = (
-                gp as *mut std::ffi::c_void,
-                cw_d as *mut std::ffi::c_void,
-                ring as *mut std::ffi::c_void,
-                cop as *mut std::ffi::c_void,
-            );
-            let (mut hd, mut tt, mut k2, mut d2, mut h2) = (
-                hc_dim as i32,
-                t as i32,
-                kern as i32,
-                dil as i32,
-                hist as i32,
-            );
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                (&mut gp_) as *mut _ as *mut std::ffi::c_void,
-                (&mut cw_) as *mut _ as *mut std::ffi::c_void,
-                (&mut ring_) as *mut _ as *mut std::ffi::c_void,
-                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
-                (&mut hd) as *mut _ as *mut std::ffi::c_void,
-                (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                (&mut k2) as *mut _ as *mut std::ffi::c_void,
-                (&mut d2) as *mut _ as *mut std::ffi::c_void,
-                (&mut h2) as *mut _ as *mut std::ffi::c_void,
-            ];
-            self.ctx.launch3(
-                "q4_ple_conv",
-                hc_dim.div_ceil(256) as u32,
-                1,
-                1,
-                256,
-                &mut args,
-            )?;
-        }
-        // (3) 잔차.
-        {
-            let (mut rp, mut vp, mut gop_, mut cop_) = (
-                resp as *mut std::ffi::c_void,
-                valp as *mut std::ffi::c_void,
-                gop as *mut std::ffi::c_void,
-                cop as *mut std::ffi::c_void,
-            );
-            let (mut ne, mut hcc, mut tt) = (n_embd as i32, hc as i32, t as i32);
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                (&mut rp) as *mut _ as *mut std::ffi::c_void,
-                (&mut vp) as *mut _ as *mut std::ffi::c_void,
-                (&mut gop_) as *mut _ as *mut std::ffi::c_void,
-                (&mut cop_) as *mut _ as *mut std::ffi::c_void,
-                (&mut ne) as *mut _ as *mut std::ffi::c_void,
-                (&mut hcc) as *mut _ as *mut std::ffi::c_void,
-                (&mut tt) as *mut _ as *mut std::ffi::c_void,
-            ];
-            self.ctx.launch3(
-                "q4_ple_residual",
-                n_embd.div_ceil(256) as u32,
-                1,
-                1,
-                256,
-                &mut args,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn matmul_paired(
-        &self,
-        xs: &[Vec<f32>],
-        ws: &[llm170_core::matmul::Weight<'_>],
-        outs: &mut [Vec<f32>],
-    ) -> Result<(), String> {
-        if ws.len() != xs.len() || ws.len() != outs.len() {
-            return Err(format!(
-                "matmul_paired: 형상 불일치 ws={} xs={} outs={}",
-                ws.len(),
-                xs.len(),
-                outs.len()
-            ));
-        }
-        for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
-            let one = [x.clone()];
-            let mut oo = [std::mem::take(o)];
-            self.batch_into(&one, &mut oo, w, 0)?;
-            *o = std::mem::take(&mut oo[0]);
-        }
-        Ok(())
-    }
-
-    /// MoE 전문가 스택 배치 — ids로 전문가를 묶어 그룹별 런치.
-    /// ids가 가리키는 전문가 슬라이스는 스택에서 연속이므로 바이트 오프셋만
-    /// 옮기면 기존 GEMV 커널이 그대로 성립한다(mul_mat_id의 오프셋 형태).
-    fn moe_down(
-        &self,
-        xs: &[Vec<f32>],
-        ws: &llm170_core::matmul::Weight<'_>,
-        expert_ids: &[u32],
-        n_expert_stack: usize,
-        outs: &mut [Vec<f32>],
-    ) -> Result<(), String> {
-        let t = xs.len();
-        if t != expert_ids.len() || t != outs.len() {
-            return Err(format!(
-                "moe_down: 형상 불일치 xs={} ids={} outs={}",
-                t,
-                expert_ids.len(),
-                outs.len()
-            ));
-        }
-        if t == 0 {
-            return Ok(());
-        }
-        let per_expert = ws.data.len() / n_expert_stack.max(1);
-        let n_in = ws.n_in as usize;
-        // 3D 전문가 스택은 n_out = 전문가수×전문가당 행으로 온다 — 런치·출력
-        // 버퍼는 전문가당 행 기준이다(mul_mat_id와 동일한 해석).
-        let n_out = ws.n_out as usize / n_expert_stack.max(1);
-        let (w_dev, w_f32) = self.dev_weight(ws)?;
-        // 활성 업로드 + 양자화 1회 (전문가 공통)
-        let (xdev_f32, xq_buf, xq_w, t) = self.prepare_x(xs, n_in, w_f32)?;
-        let mut yflat = vec![0.0f32; t * n_out];
-        let ydev = {
-            let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
-            yb.ensure(&self.ctx, t * n_out * 4)?
-        };
-        // 전문가 순 그룹화 (2026-09-13): ids는 확률순이라 연속 런이 1행씩
-        // 흩어진다(프레임 실측 t=512·k=10 ≈4000런치/층). 카운팅 정렬로 묶어
-        // 런치 수를 전문가 수 수준으로 줄인다. x 행은 순열 gather로 모으고,
-        // 결과 행 순서는 d2h 후 호스트 산란으로 복원한다(가중합이 원래 행
-        // 순서를 요구 — 호스트 비용은 perm 인덱싱뿐).
-        let ne = n_expert_stack.max(1);
-        let mut off = vec![0usize; ne + 1];
-        for &e in expert_ids {
-            off[(e as usize).min(ne - 1) + 1] += 1;
-        }
-        for e in 0..ne {
-            off[e + 1] += off[e];
-        }
-        let mut cur = off[..ne].to_vec();
-        let mut perm = vec![0u32; t];
-        for (i, &e) in expert_ids.iter().enumerate() {
-            let e = (e as usize).min(ne - 1);
-            let p = cur[e];
-            perm[p] = i as u32;
-            cur[e] += 1;
-        }
-        let row_u32 = if w_f32 { n_in } else { xq_w };
-        let xbase = if w_f32 { xdev_f32 } else { xq_buf };
-        let xg = {
-            let mut g = self.xperm.lock().map_err(|e| e.to_string())?;
-            g.ensure(&self.ctx, t * row_u32 * 4)?
-        };
-        self.rows_permute(xbase, &perm, xg, row_u32, t)?;
-        for e in 0..ne {
-            let rows = off[e + 1] - off[e];
-            if rows == 0 {
-                continue;
-            }
-            let start = off[e];
-            let xsrc = unsafe { xg.add(start * row_u32 * 4) };
-            let wsrc = unsafe { w_dev.add(e * per_expert) };
-            let dst = unsafe { ydev.add(start * n_out * 4) };
-            if w_f32 {
-                self.launch_gemm_f32(xsrc, wsrc, n_in, n_out, rows, dst)?;
-            } else {
-                self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, rows, dst)?;
-            }
-        }
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut yflat), ydev)?;
-        for (g, v) in yflat.chunks_exact(n_out).enumerate() {
-            outs[perm[g] as usize].copy_from_slice(v);
-        }
-        Ok(())
-    }
-
-    /// QSA 마스크드 밀집 GQA (값 경로 브리지) — f32 캐시.
-    fn total_mem_bytes(&self) -> u64 {
-        let (mut f, mut t) = (0usize, 0usize);
-        unsafe {
-            if hip::hipMemGetInfo(&mut f, &mut t) != hip::hipError_t_hipSuccess {
-                return 0;
-            }
-        }
-        t as u64
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention(
         &self,
@@ -4016,6 +3849,185 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
         } else {
             self.qsa_attn_sel4_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t)
         }
+    }
+}
+
+impl llm170_core::matmul::FrameHost for Q4Acc {
+
+    /// np 행별 conv 1런치 (plans/74 N2) — gdn_conv(t=1) 산술, 상태는 행
+    /// 포인터 테이블. qkv/out은 [t][ch] 연속 프레임 버퍼.
+    fn frame_gdn_conv_np(
+        &self,
+        qkv: u64,
+        out: u64,
+        states: &[u64],
+        cw: u64,
+        ch: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        let t = states.len();
+        if t == 0 {
+            return Ok(());
+        }
+        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
+        for &h in states {
+            ptrs.push(self.fptr(h)? as usize);
+        }
+        let tbl = self.ctx.scratch(t * 8)?;
+        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        let (mut q, mut c, mut s_, mut o_) = (
+            self.fptr(qkv)?,
+            self.fptr(cw)?,
+            tbl as *mut std::ffi::c_void,
+            self.fptr(out)?,
+        );
+        let (mut chh, mut kk, mut tt) = (ch as i32, k as i32, t as i32);
+        self.kop(
+            "gdn_conv_np",
+            (ch as u32).div_ceil(64),
+            t as u32,
+            1,
+            64,
+            &mut cargs!(&mut q, &mut c, &mut s_, &mut o_, &mut chh, &mut kk, &mut tt),
+        )
+    }
+    /// np 행별 AR 1런치 (plans/74 N2) — gdn_ar_w_swap(t=1) 산술(scale=1,
+    /// q는 L2Rows+Scale 로 선스케일), 상태는 행 포인터 테이블.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar_np(
+        &self,
+        q: u64,
+        k: u64,
+        v: u64,
+        beta_ge: u64,
+        out: u64,
+        states: &[u64],
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        let t = states.len();
+        if t == 0 {
+            return Ok(());
+        }
+        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
+        for &h in states {
+            ptrs.push(self.fptr(h)? as usize);
+        }
+        let tbl = self.ctx.scratch(t * 8)?;
+        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        let (mut sp, mut qp, mut kp, mut vp, mut bp, mut op_) = (
+            tbl as *mut std::ffi::c_void,
+            self.fptr(q)?,
+            self.fptr(k)?,
+            self.fptr(v)?,
+            self.fptr(beta_ge)?,
+            self.fptr(out)?,
+        );
+        let (mut dd, mut ks, mut vs, mut hv, mut hk, mut sc, mut tt) = (
+            d as i32,
+            (h_k * d) as i32,
+            (h_v * d) as i32,
+            h_v as i32,
+            h_k as i32,
+            1.0f32,
+            t as i32,
+        );
+        // gx=h_v(페어 축 — 커널의 blockIdx.x), gy=d(u 축). 27B rawhip 판과
+        // 동일 순서(2026-09-16 실수로 (d,h_v)로 바꿔써 GPU 메모리 폴트).
+        self.ctx.launch3(
+            "gdn_ar_w_np",
+            h_v as u32,
+            d as u32,
+            1,
+            32,
+            &mut cargs!(&mut sp, &mut qp, &mut kp, &mut vp, &mut bp, &mut op_, &mut dd, &mut ks, &mut vs, &mut hv, &mut hk, &mut sc, &mut tt),
+        )
+    }
+    /// plans/73(np): 프레임 버퍼 행 뷰 — 배치 디코드의 per-seq 상태 op용.
+    fn frame_slice(&self, h: u64, off_elems: usize, len: usize) -> Result<u64, String> {
+        let mut v = self.frames.lock().map_err(|e| e.to_string())?;
+        let idx = (h.checked_sub(1).ok_or("frame 핸들 0")?) as usize;
+        let (base, cap) = *v
+            .get(idx)
+            .ok_or_else(|| format!("frame 핸들 없음: {h}"))?;
+        let need = (off_elems + len) * 4;
+        if need > cap {
+            return Err(format!("frame_slice 범위 초과: need {need} > cap {cap}"));
+        }
+        let ptr = unsafe { base.add(off_elems * 4) };
+        v.push((ptr, len * 4));
+        Ok(v.len() as u64)
+    }
+
+    fn frame_qk_norm_rope(
+        &self,
+        q: u64,
+        k: u64,
+        q_norm: &[f32],
+        k_norm: &[f32],
+        cs: &[f32],
+        eps: f32,
+        pos0: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        n_rot: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        // 상수 3개(qn/kn/cs) — plans/73: 매 호출 h2d(+sync)가 스텝당 36회의
+        // 동기를 만들었다. **키는 (ptr,len)** — 내용 해시는 층마다 값이 달라
+        // 단일 슬롯 캐시가 매 층 미스했고(24KB+2KB 동기 복사 ×12층 = 40ms/스텝),
+        // 프레임이 헤드 타일을 1회 만들어 상주시키므로 포인터가 곧 신원이다.
+        // (2026-09-16: LLM170_Q4_TIME 계측 — qsa.mm+rope 3.4ms/층의 전부가 이 복사였다)
+        let (qnd, knd, csd) = {
+            let qnd = self.upload_map(&self.qn_map, "qn_t", q_norm)?;
+            let knd = self.upload_map(&self.kn_map, "kn_t", k_norm)?;
+            let qh = q_norm.as_ptr() as u64;
+            let kh = k_norm.as_ptr() as u64;
+            let _ = (qh, kh);
+            let cskey = (cs.as_ptr() as usize, cs.len());
+            let mut c = (self.cst.lock().map_err(|e| e.to_string())?, self.cst_cache.lock().map_err(|e| e.to_string())?);
+            if *c.1 != cskey || c.0.ptr.is_null() {
+                c.0.ensure(&self.ctx, cs.len().max(1) * 4)?;
+                self.ctx.h2d(c.0.ptr, bytemuck::cast_slice(cs))?;
+                *c.1 = cskey;
+            }
+            (qnd, knd, c.0.ptr)
+        };
+        let mut qp = self.fptr(q)? as *mut std::ffi::c_void;
+        let mut kp = self.fptr(k)? as *mut std::ffi::c_void;
+        let mut qwp = qnd as *mut std::ffi::c_void;
+        let mut kwp = knd as *mut std::ffi::c_void;
+        let mut csp = csd as *mut std::ffi::c_void;
+        // kq_scale은 이 커널의 decode 판은 k에 구워 넣지만(kqs=self.kq_scale),
+        // QSA 프레임 경로는 **k를 무척도(1.0)로 둔다** — QSA KV 캐시 규약이
+        // 무척도 k이고 qsa_attn_sel6가 q·k에 kq_scale을 곱하기 때문. 초기 구현은
+        // 0.0을 넘겨 k를 전부 0으로 만드는 잠복 결함이었음(미호출 경로라 미발견,
+        // 2026-09-14 plans/67 2c 연결 시 발견·수정).
+        let mut kq = 1.0f32;
+        let mut ep = eps;
+        let mut pp = pos0 as i32;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut nr = n_rot as i32;
+        let rows = n_head + n_kv;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut qp) as *mut _ as *mut std::ffi::c_void,
+            (&mut kp) as *mut _ as *mut std::ffi::c_void,
+            (&mut qwp) as *mut _ as *mut std::ffi::c_void,
+            (&mut kwp) as *mut _ as *mut std::ffi::c_void,
+            (&mut csp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ep) as *mut _ as *mut std::ffi::c_void,
+            (&mut kq) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut nr) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)
     }
 
     // ─── 프레임(활성화 GPU 상주) — plans/64 P1 ───
@@ -4392,6 +4404,7 @@ impl llm170_core::matmul::Accelerator for Q4Acc {
     }
 }
 
+
 /// FNV-1a f32 슬라이스 해시 — 상수 업로드 캐시 키(plans/73).
 fn fnv_hash(data: &[f32]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -4432,7 +4445,7 @@ pub fn new_acc_with_sources(
 /// q5_1 커널 마이크로 검증 — 합성 블록 1개(d=1.0, m=-0.5, q=i%32)로
 /// GPU ↔ CPU 레인 미러를 원소 수준에서 대조한다 (`q4-acc-check micro`).
 pub fn micro_check() -> Result<String, String> {
-    use llm170_core::matmul::Accelerator;
+    use llm170_core::matmul::MatmulHost;
     let n = 32usize;
     let mut bytes = vec![0u8; 24];
     bytes[0] = 0x00;
@@ -4549,7 +4562,7 @@ pub fn ple_gate_check() -> Result<String, String> {
 }
 
 pub fn ar_check_t(t: usize) -> Result<String, String> {
-    use llm170_core::matmul::{Accelerator, FrameState};
+    use llm170_core::matmul::{FrameHost, FrameState};
     let (n_group, dt_rank, d) = (16usize, 48usize, 128usize);
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut lcg = || {
@@ -4762,7 +4775,7 @@ pub fn qsa_check(t: usize, n_past: usize) -> Result<String, String> {
 /// `q4-hc-check [t] [n] [hc]` — 프레임 HC op(HcGateMean/HcCombine) 격리 검증.
 /// 합성 입력으로 GPU ↔ CPU 미러를 대조하고, 폴트 여부를 직접 보고한다.
 pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
-    use llm170_core::matmul::{Accelerator, FrameOp, FrameState};
+    use llm170_core::matmul::{FrameHost, FrameOp, FrameState};
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -4834,7 +4847,7 @@ pub fn check_tensor(
     t: usize,
     rows_max: usize,
 ) -> Result<String, String> {
-    use llm170_core::matmul::Accelerator;
+    use llm170_core::matmul::MatmulHost;
     let m = llm170_core::qwen4exp::Model4::load(model).map_err(|e| e.to_string())?;
     let w = m
         .w(tensor)

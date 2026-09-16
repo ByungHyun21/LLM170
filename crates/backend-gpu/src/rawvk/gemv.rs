@@ -5,7 +5,7 @@
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
-use llm170_core::matmul::{Accelerator, Weight};
+use llm170_core::matmul::{MatmulHost, Weight};
 use llm170_gguf::GgmlType;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -466,7 +466,12 @@ impl VkAcc {
     }
 }
 
-impl Accelerator for VkAcc {
+// 미지원 capability — 모든 메서드가 기본(Err) 구현이라 빈 impl 로 충분하다.
+impl llm170_core::matmul::GraphCapture for VkAcc {}
+impl llm170_core::matmul::QsaOps for VkAcc {}
+impl llm170_core::matmul::FrameHost for VkAcc {}
+
+impl llm170_core::matmul::MatmulHost for VkAcc {
     fn matmul_batch(
         &self,
         xs: &[Vec<f32>],
@@ -562,6 +567,17 @@ impl Accelerator for VkAcc {
         Ok(())
     }
 
+    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
+        let xs = vec![x.to_vec()];
+        let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
+        self.matmul_batch(&xs, w, &mut tmp)?;
+        out.copy_from_slice(&tmp[0]);
+        Ok(())
+    }
+}
+
+impl llm170_core::matmul::EwOps for VkAcc {
+
     fn rms_norm(
         &self,
         xs: &[Vec<f32>],
@@ -591,15 +607,8 @@ impl Accelerator for VkAcc {
     ) -> Result<(), String> {
         self.ffn_chain_gpu(xs, gate_w, up_w, down_w, xs_out)
     }
-
-    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
-        let xs = vec![x.to_vec()];
-        let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
-        self.matmul_batch(&xs, w, &mut tmp)?;
-        out.copy_from_slice(&tmp[0]);
-        Ok(())
-    }
 }
+
 
 /// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
