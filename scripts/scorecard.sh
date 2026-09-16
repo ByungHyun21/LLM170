@@ -10,8 +10,8 @@ export ROCBLAS_TENSILE_LIBPATH=/opt/rocm-10.0.0/install/lib/rocblas/library
 
 M27=/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
 MFN=/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
-LB=/home/yoon/local_llm/llama.cpp/build/bin/llama-bench
-LBFN=/home/yoon/local_llm-runtimes/qwen4exp/build-ab/bin/llama-bench
+LB=/home/yoon/local_llm/llama.cpp-master/build/bin/llama-bench
+LBFN=/home/yoon/local_llm/llama.cpp-pr27311/build/bin/llama-bench
 WHICH=${1:-all}
 
 run_ours() {
@@ -28,10 +28,12 @@ run_ours() {
 
 run_llama() {
   local name=$1 model=$2 bench=$3; shift 3
-  timeout 3600 "$bench" -m "$model" -ngl all -p 512,4096,16384 -n 0 -r 1 2>/dev/null \
+  local extra=""
+  [[ "$name" == "FN" ]] && extra="-ot per_layer_token_embd=CPU --load-mode mmap"
+  timeout 3600 "$bench" -m "$model" -ngl all $extra -p 512,4096,16384 -n 0 -r 1 2>/dev/null \
     | sed "s/^/[llama $name] /"
   for ctx in 4096 16384; do
-    timeout 3600 "$bench" -m "$model" -ngl all -p 512 -n 128 -d $ctx -r 1 2>/dev/null \
+    timeout 3600 "$bench" -m "$model" -ngl all $extra -p 512 -n 128 -d $ctx -r 1 2>/dev/null \
       | sed "s/^/[llama $name tg@$ctx] /"
   done
 }

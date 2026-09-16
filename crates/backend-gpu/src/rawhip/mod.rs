@@ -4,6 +4,11 @@
 //! core 미러(dot_row_w4a8_*_lane)와 동일 연산열 — to_bits 검증 게이트.
 #![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
+pub mod graph;
+pub mod ktrace;
+pub use graph::*;
+pub use ktrace::*;
+
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -31,13 +36,11 @@ pub fn co_loaded(bit: u8) -> bool {
 }
 
 
-pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
-pub static KTRACE: std::sync::Mutex<Option<Vec<KtraceEv>>> = std::sync::Mutex::new(None);
 /// MMQ mul_mat_q 동적 smem 상한 설정 캐시 — 런치마다 드라이버 호출하지 않도록.
 /// (hipFuncSetAttribute는 커널 로드 갱신을 유발할 수 있어 GEMM마다 부르면 손해)
 static MMQ_SMEM_SET: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(usize, i32)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
+pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())
     } else {
@@ -45,233 +48,23 @@ fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     }
 }
 
-static AOUT_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn aout_dumped() -> bool {
-    let r = AOUT_DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst);
-    !r
-}
 
-pub fn ktrace_on() { *KTRACE.lock().unwrap() = Some(Vec::new()); }
 
 // ── 프레임 그래프 캡처(디코드 스텝) ────────────────────────────────────────
 // 스텝 내 호스트 왕복(capture_mark)을 경계로 스트림 캡처를 세그먼트로 끊어
 // 그래프로 굳히고, 재생 시에는 런치 함수가 즉시 반환되어 커널이 그래프에서
 // 실행된다(런치 ~3천 회/스텝 → 세그먼트 수 회). 프로세스 전역 — CLI는 가속기
 // 1개, 재생은 스텝 단위 단일 스레드라 전역으로 충분하다.
-pub enum GraphMode {
-    Off,
-    Capture { segs: Vec<hip::hipGraph_t>, open: bool },
-    Replay { execs: Vec<hip::hipGraphExec_t>, idx: usize },
-}
 // SAFETY: 그래프 핸들은 디바이스 객체 — HIP 런타임이 직렬화하며, 재생은 스텝
 // 단위로 단일 스레드에서만 일어난다.
 unsafe impl Send for GraphMode {}
-pub static GRAPH: std::sync::Mutex<GraphMode> = std::sync::Mutex::new(GraphMode::Off);
-pub static GRAPH_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static NOLAUNCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-#[inline]
-pub fn nolaunch_on() -> bool {
-    *NOLAUNCH.get_or_init(|| std::env::var_os("LLM170_NOLAUNCH").is_some())
-}
 
 /// 캡처 시작 — BeginCapture는 **첫 마크에서** 건다. 마크 이전 구간(임베딩 h2d 등
 /// 캡처 불가 연산)을 캡처 밖에 두기 위해서다.
-pub fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
-    *GRAPH.lock().map_err(|e| e.to_string())? =
-        GraphMode::Capture { segs: Vec::new(), open: false };
-    Ok(())
-}
 
 /// 캡처 종료 — 마지막 세그먼트를 닫고 전부 instantiate, 재생 모드로 전환.
-pub fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
-    let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
-    let GraphMode::Capture { segs, open } = &mut *g else {
-        return Err("graph_capture_end: 캡처 중이 아님".into());
-    };
-    let mut segs = std::mem::take(segs);
-    if *open {
-        unsafe {
-            let mut gr: hip::hipGraph_t = std::ptr::null_mut();
-            ck(hip::hipStreamEndCapture(stream, &mut gr), "EndCapture")?;
-            segs.push(gr);
-        }
-        *open = false;
-    }
-    let mut execs = Vec::with_capacity(segs.len());
-    for g0 in &segs {
-        unsafe {
-            let mut ex: hip::hipGraphExec_t = std::ptr::null_mut();
-            ck(hip::hipGraphInstantiate(&mut ex, *g0, std::ptr::null_mut(), std::ptr::null_mut(), 0), "GraphInstantiate")?;
-            execs.push(ex);
-        }
-    }
-    eprintln!("# graph: 세그먼트 {}개 캡처·인스턴스화", execs.len());
-    *g = GraphMode::Replay { execs, idx: 0 };
-    Ok(())
-}
 
 /// 재생 모드 진입/이탈 — 진입 시 런치 함수가 커널 발사를 건너뛴다(그래프가 실행).
-pub fn graph_replay(on: bool) -> Result<(), String> {
-    if on {
-        let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
-        if let GraphMode::Replay { idx, .. } = &mut *g {
-            *idx = 0;
-        }
-    }
-    GRAPH_SKIP.store(on, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
-}
-
-/// 세그먼트 경계 — 호스트 왕복 직전에 호출. 캡처 중이면 현재 세그먼트를 닫고
-/// 다음을 열고, 재생 중이면 앞 세그먼트 그래프를 발사한다.
-#[inline]
-fn is_end(tag: &str) -> bool {
-    tag.ends_with("_in")
-}
-
-pub fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), String> {
-    let dbg = std::env::var_os("LLM170_GRAPH_DEBUG").is_some();
-    let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
-    match &mut *g {
-        GraphMode::Off => Ok(()),
-        // 규약: `*_in` = 호스트 왕복 *직전* → 현재 세그먼트 종료(그래프 굳힘).
-        //       `*_out` = 왕복 *직후* → 다음 세그먼트 시작. 왕복 구간(d2h/h2d)은
-        //       어느 그래프에도 들어가지 않는다(캡처 불가 연산).
-        GraphMode::Capture { segs, open } => unsafe {
-            if is_end(tag) {
-                if *open {
-                    let mut gr: hip::hipGraph_t = std::ptr::null_mut();
-                    let r = hip::hipStreamEndCapture(stream, &mut gr);
-                    if r != hip::hipError_t_hipSuccess {
-                        return Err(format!("EndCapture 실패({r:?}) tag={tag} seg={}", segs.len()));
-                    }
-                    segs.push(gr);
-                    *open = false;
-                    if dbg {
-                        eprintln!("# graph-mark {tag} 종료 (seg {})", segs.len());
-                    }
-                }
-            } else if !*open {
-                let r = hip::hipStreamBeginCapture(stream, hip::hipStreamCaptureMode_hipStreamCaptureModeThreadLocal);
-                if r != hip::hipError_t_hipSuccess {
-                    return Err(format!("BeginCapture 실패({r:?}) tag={tag}"));
-                }
-                *open = true;
-                if dbg {
-                    eprintln!("# graph-mark {tag} 시작 (seg {})", segs.len());
-                }
-            }
-            Ok(())
-        },
-        GraphMode::Replay { execs, idx } => {
-            // 세그먼트는 `*_in`(종료) 지점에서 발사된다 — 그 그래프가 직전 구간.
-            if is_end(tag) && *idx < execs.len() {
-                unsafe { ck(hip::hipGraphLaunch(execs[*idx], stream), "GraphLaunch")?; }
-                *idx += 1;
-            }
-            Ok(())
-        }
-    }
-}
-pub fn ktrace_dump() -> String {
-    let mut g = KTRACE.lock().unwrap();
-    // ktrace_on 없이 호출되면(스펙 경로 등) 빈 문자열 — 과거 unwrap 패닉
-    let Some(slot) = g.as_mut() else { return String::new() };
-    let evs = std::mem::take(slot);
-    // 이벤트 핸들 정리 — 파괴하지 않으면 hipEvent 풀이 고갈되어(런치당 2개 생성,
-    // 13k 런치) 이후 생성이 실패하고 트레이스에서 통째로 누락된다(2026-09-14 규명).
-    struct Evs(Vec<KtraceEv>);
-    impl Drop for Evs {
-        fn drop(&mut self) {
-            unsafe {
-                for e in &self.0 {
-                    let _ = hip::hipEventDestroy(e.1 as *mut _);
-                }
-            }
-        }
-    }
-    let _evs_guard = Evs(evs);
-    let evs = &_evs_guard.0;
-    let mut out = String::new();
-    // 쌍 결합: 연속 동일 (name, gy) 두 이벤트가 start/end
-    let mut sums: std::collections::HashMap<(&str, u32), (f64, u32)> = std::collections::HashMap::new();
-    let mut total = 0.0f64;
-    let mut gaps = 0.0f64;
-    // 쌍은 **고정 stride-2**다: 런치마다 (start, end)를 정확히 2개 기록한다.
-    // 종전 휴리스틱("연속 같은 (name,gy) = 쌍")은 같은 커널이 연속 런치될 때
-    // end→start를 한 쌍으로 묶어 합계를 통째로 어긋나게 했다 — 배치 형상에서
-    // 흔하고, 27B pp512에서 합계 366ms 대 벽 1,409ms(4배 과소)로 나타났다
-    // (2026-09-14 규명). 갭도 같은 순회에서 end(k) → start(k+1)로 잰다.
-    let npair = evs.len() / 2;
-    unsafe {
-        for k in 0..npair {
-            let (st, en) = (&evs[2 * k], &evs[2 * k + 1]);
-            // 짝이 어긋난 런치(다른 커널과 섞임)면 방어적으로 건너뛴다.
-            if st.0 != en.0 || st.2 != en.2 {
-                continue;
-            }
-            let mut ms = 0f32;
-            if hip::hipEventElapsedTime(&mut ms, st.1 as *mut _, en.1 as *mut _) == hip::hipError_t_hipSuccess {
-                let ent = sums.entry((st.0, st.2)).or_insert((0.0, 0));
-                ent.0 += ms as f64;
-                ent.1 += 1;
-                total += ms as f64;
-            }
-            if k + 1 < npair {
-                let nst = &evs[2 * (k + 1)];
-                let mut gm = 0f32;
-                if hip::hipEventElapsedTime(&mut gm, en.1 as *mut _, nst.1 as *mut _) == hip::hipError_t_hipSuccess {
-                    gaps += gm as f64;
-                }
-            }
-        }
-        // 런치 갭: end(N)→start(N+1) 같은 스트림 상 연속
-        let mut gap_by_pred: std::collections::HashMap<&str, (f64, u32)> = std::collections::HashMap::new();
-        let mut gap_tot = 0.0f64;
-        let mut prev_end: Option<(usize, &str)> = None;
-        for k in 0..evs.len()/2 {
-            let (st, en) = (&evs[2*k], &evs[2*k+1]);
-            if let Some((pe, pn)) = prev_end {
-                let mut ms = 0f32;
-                if hip::hipEventElapsedTime(&mut ms, pe as *mut _, st.1 as *mut _) == hip::hipError_t_hipSuccess && ms > 0.0 {
-                    let e2 = gap_by_pred.entry(pn).or_insert((0.0, 0));
-                    e2.0 += ms as f64; e2.1 += 1;
-                    gap_tot += ms as f64;
-                }
-            }
-            prev_end = Some((en.1, en.0));
-        }
-        // 런치 **순서** 덤프 (LLM170_KTRACE_SEQ=N): 갭의 주인은 전임자가 아니라
-        // (2026-09-14: 이 덤프로 MoE 묶음이 gather → gate GEMM → scatter → up GEMM …
-        //  순서임을 확인해 그룹화 호스트 경로를 특정했다)
-        // **후속 op의 호스트 비용**이므로(갭이 후속에 따라 달라진다), 순서를 봐야
-        // 어떤 op인지 특정된다.
-        if let Ok(v) = std::env::var("LLM170_KTRACE_SEQ") {
-            let n: usize = v.parse().unwrap_or(64);
-            for k in 0..npair.min(n) {
-                let (st, en) = (&evs[2 * k], &evs[2 * k + 1]);
-                let mut sms = 0f32;
-                let _ = hip::hipEventElapsedTime(&mut sms, st.1 as *mut _, en.1 as *mut _);
-                out.push_str(&format!("# seq {k:4} {:<28} gy={:<6} {:8.3}ms\n", st.0, st.2, sms));
-            }
-        }
-        for e in evs.iter() { hip::hipEventDestroy(e.1 as *mut _); }
-        out.push_str(&format!("LAUNCH GAPS total {:.1}ms\n", gap_tot));
-        let mut gv: Vec<_> = gap_by_pred.iter().collect();
-        gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-        for (n, (ms, c)) in gv.iter().take(12) {
-            out.push_str(&format!("  after {:26} {:8.1}ms x{:4}\n", n, ms, c));
-        }
-    }
-    let mut v: Vec<_> = sums.iter().collect();
-    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-    for ((n, gy), (ms, cnt)) in v.iter().take(40) {
-        out.push_str(&format!("{:30} gy={:4} {:9.3}ms x{:4}\n", n, gy, ms, cnt));
-    }
-    out.push_str(&format!("TOTAL {:.1}ms GAPS {:.1}ms\n", total, gaps));
-    out
-}
 
 /// 컴파일된 커널 실행기.
 pub struct RawCtx {
