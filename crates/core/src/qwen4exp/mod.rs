@@ -11,7 +11,6 @@
 //! - PLE(blk.1): n-gram 해시(호스트 u64) → 16행×160 gather → key/value → sgn√|s| 게이트
 //!   → 4스트림 방송 → dilated(3) depthwise conv(4) → 잔차 2경로. 테이블 26.8GiB mmap 오프로드.
 //! - 4-split GGUF: part1=메타 전용, parts2-4가 텐서 1224개 분산 보관.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 pub mod frame;
 pub mod layers;
@@ -121,26 +120,6 @@ pub struct PartMap {
     pub data_offset: u64,
     pub tensors: Vec<llm170_gguf::TensorInfo>,
     pub mmap: Mmap,
-}
-
-/// File::open 대기 버전 — mmap 핸들 열기도 윈도우 대기.
-fn open_file_wait(path: &Path) -> Result<std::fs::File, Q4Error> {
-    let wait: u64 = std::env::var("LLM170_OPEN_WAIT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
-    loop {
-        match std::fs::File::open(path) {
-            Ok(f) => return Ok(f),
-            Err(e) => {
-                if wait == 0 || std::time::Instant::now() >= deadline {
-                    return Err(Q4Error::Io(e.to_string()));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-            }
-        }
-    }
 }
 
 impl Model4 {

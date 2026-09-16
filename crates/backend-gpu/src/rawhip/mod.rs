@@ -280,7 +280,6 @@ pub fn ktrace_dump() -> String {
 
 /// 컴파일된 커널 실행기.
 pub struct RawCtx {
-    module: hip::hipModule_t,
     fns: HashMap<&'static str, hip::hipFunction_t>,
     stream: hip::hipStream_t,
     stream2: hip::hipStream_t,
@@ -303,7 +302,6 @@ pub struct RawCtx {
     /// f16 경로 xq 버퍼 (size, ptr).
     mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
     scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
-    cursors: std::sync::Mutex<HashMap<usize, usize>>,
     /// D2H 핀 스테이징 (필요시 성장, 해제 없음 — ADR-0014).
     /// pageable 버퍼로의 hipMemcpyAsync D2H는 슬로패스(1MB에 ~90ms,
     /// 2026-09-05 tg RCA) — 핀 버퍼 경유로 원소복사.
@@ -485,14 +483,14 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
-            Ok(RawCtx { module, fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            Ok(RawCtx { fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             allocs: std::sync::Mutex::new(Vec::new()),
             ar_cache: std::sync::Mutex::new(None),
             mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
             canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
-            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), cursors: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())), pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())) })
+            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())), pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())) })
         }
     }
 

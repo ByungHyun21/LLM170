@@ -1,5 +1,4 @@
 //! rawvk — Vulkan 백엔드 (plans/12). 모듈 루트.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 pub mod context;
 pub mod decoder;

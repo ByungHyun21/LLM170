@@ -1,7 +1,6 @@
 //! 탐욕 최장일치 토크나이저 (근사 — 자기일관 검증용).
 //! llama.cpp의 BPE pre-tokenizer·병합 순서와 일치하지 않음:
 //! 서버 자체의 /tokenize→생성→판정 루프가 자기일관이면 매트릭스 유효.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use llm170_gguf::GgufFile;
 use std::collections::HashMap;
@@ -23,22 +22,6 @@ impl Tokenizer {
             index: HashMap::new(),
             c2b: HashMap::new(),
         }
-    }
-
-    /// GPT-2 bytes_to_unicode 역표 (llama.cpp ggml과 동일 방식).
-    fn byte_table() -> HashMap<char, u8> {
-        let mut c2b = HashMap::new();
-        let mut n = 0u32;
-        for b in 0u32..256 {
-            let printable =
-                (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
-            let c = if printable { b } else { 256 + n };
-            if !printable {
-                n += 1;
-            }
-            c2b.insert(char::from_u32(c).unwrap(), b as u8);
-        }
-        c2b
     }
 
     pub fn load(path: &Path, part2: Option<&Path>) -> Result<Self, String> {

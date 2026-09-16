@@ -1,6 +1,5 @@
 //! qsa(인덩서 top-k 게이트드 GQA) 스테이지 — Engine4에서 분리 (리팩토링 P1, 2026-09-01).
 //! 수치 경로 불변 — 이동만. Ctx 기반 백엔드 독립 (CPU/GPU 동일 코드).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::super::Q4Error;
 use super::Ctx;

@@ -153,7 +153,6 @@ pub struct DecoderState {
     conv_ch: usize,
     k_len: usize,
     v_len: usize,
-    ctx_len: usize,
     eps: f32,
     kq_scale: f32,
     max_ssbo: usize,
@@ -197,7 +196,6 @@ pub struct DecoderState {
     b_fup: VkBuf,
     b_fglu: VkBuf,
     b_fdown: VkBuf,
-    b_out: VkBuf, // [t][n_embd] 결과 다운로드
     b_lg: VkBuf,  // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
     b_ams: VkBuf, // argmax 스테이지1 스크래치 [2*256] u32
     b_xf16: VkBuf, // f16-B 활성 [T_MAX*n] f16
@@ -698,7 +696,7 @@ impl DecoderState {
         let max_ssbo0 = ctx.max_ssbo;
         let (b_xs, b_xn, b_xq_n, b_xq_f, b_xq_g, b_gqkv, b_gconv, b_gq, b_gk, b_gv,
              b_gb, b_ga, b_gbg, b_gz, b_go, b_ggated, b_aq, b_ak, b_av, b_aout,
-             b_gout, b_fgate, b_fup, b_fglu, b_fdown, b_out, b_am) = {
+             b_gout, b_fgate, b_fup, b_fglu, b_fdown, b_am) = {
             // plans/43: 활성 버퍼는 디바이스 힙(캐브아웃)에 — 종전 GTT(시스템 RAM)는
             // 타일이 K블록마다 활성 타일을 읽을 때 대역 병목(가중의 수 배 트래픽).
             // 캐브아웃도 HOST_VISIBLE|COHERENT라 CPU 업로드 경로는 그대로 동작.
@@ -714,7 +712,7 @@ impl DecoderState {
                 a(T_MAX * hp.d_inner)?, a(T_MAX * n_head * 2 * hd)?,
                 a(T_MAX * n_kv * hd)?, a(T_MAX * n_kv * hd)?, a(T_MAX * n_head * hd)?,
                 a(T_MAX * n)?, a(T_MAX * hp.n_ff)?, a(T_MAX * hp.n_ff)?,
-                a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(T_MAX * n)?, a(8)?,
+                a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(8)?,
             )
         };
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
@@ -891,7 +889,6 @@ impl DecoderState {
             conv_ch,
             k_len,
             v_len,
-            ctx_len,
             eps: hp.eps,
             kq_scale: 1.0 / (hd as f32).sqrt(),
             kv_k,
@@ -926,7 +923,6 @@ impl DecoderState {
             b_fup,
             b_fglu,
             b_fdown,
-            b_out,
             b_lg,
             b_ams,
             b_xf16,

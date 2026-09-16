@@ -3,7 +3,6 @@
 //! ggml 텐서 레이아웃: W [ne0=n_in, ne1=n_out] 행 우선 — out[o] = Σ_i x[i]·W[o,i].
 //! ADR-0005: GPU 커널이 아닌 CPU 참조 경로. FMA 없는 mul+add (x86-64 기본 타깃은
 //! auto-FMA가 없어 자동으로 성립; target-feature 변경 시 재검토 필요 — 주석 유지).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use llm170_gguf::GgmlType;
 use llm170_profiler::profile_span;
@@ -1223,11 +1222,6 @@ pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
             h.join().unwrap();
         }
     });
-}
-
-/// w4a8 폴백용: 블록 1개 f32 디양자화 (미지원 타입).
-fn dequant_row_f32(ty: GgmlType, blk: &[u8], out: &mut [f32], n: u64) {
-    crate::quant::dequant_row(ty, blk, 0, n, out);
 }
 
 /// 단일 벡터 x에 대한 복수 가중치 내적 — thread::scope 1회로 스폰 오버헤드 제거.

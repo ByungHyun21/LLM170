@@ -187,34 +187,6 @@ impl Clip {
         Ok(out)
     }
 
-    /// GEMM: out[o] = Σ_i x[i]·W[o][i] + b — W f32 [rows][ni].
-    fn mm_bias(x: &[f32], w: &[f32], b: Option<&[f32]>, ni: usize, out: &mut [f32]) {
-        let n_out = out.len();
-        let nth = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(32);
-        if n_out >= 256 && nth > 1 {
-            let csize = n_out.div_ceil(nth);
-            std::thread::scope(|sc| {
-                let mut off = 0usize;
-                let mut hs = Vec::new();
-                for ch in out.chunks_mut(csize) {
-                    let coff = off;
-                    off += ch.len();
-                    hs.push(sc.spawn(move || {
-                        for (j, ov) in ch.iter_mut().enumerate() {
-                            let o = coff + j;
-                            *ov = Self::dot_bias(x, &w[o * ni..(o + 1) * ni], b.map(|bb| bb[o]));
-                        }
-                    }));
-                }
-                for h in hs { let _ = h.join(); }
-            });
-            return;
-        }
-        for (o, ov) in out.iter_mut().enumerate() {
-            *ov = Self::dot_bias(x, &w[o * ni..(o + 1) * ni], b.map(|bb| bb[o]));
-        }
-    }
-
     /// 배치 GEMM: out[t][o] = Σ x[t][i]·W[o][i] + b — (토큰×행) 청크 병렬.
     fn mm_bias_batch(x: &[Vec<f32>], w: &[f32], b: &[f32], ni: usize, out: &mut [Vec<f32>]) {
         let n_out = out[0].len();
@@ -262,25 +234,6 @@ impl Clip {
         });
     }
 
-    fn dot_bias(x: &[f32], row: &[f32], bias: Option<f32>) -> f32 {
-        let ni = row.len();
-        let mut s = bias.unwrap_or(0.0) as f64;
-        let mut i = 0;
-        while i + 8 <= ni {
-            s += f64::from(x[i]) * f64::from(row[i]) + f64::from(x[i + 1]) * f64::from(row[i + 1]);
-            s += f64::from(x[i + 2]) * f64::from(row[i + 2]) + f64::from(x[i + 3]) * f64::from(row[i + 3]);
-            s += f64::from(x[i + 4]) * f64::from(row[i + 4]) + f64::from(x[i + 5]) * f64::from(row[i + 5]);
-            s += f64::from(x[i + 6]) * f64::from(row[i + 6]) + f64::from(x[i + 7]) * f64::from(row[i + 7]);
-            i += 8;
-        }
-        while i < ni {
-            s += f64::from(x[i]) * f64::from(row[i]);
-            i += 1;
-        }
-        s as f32
-    }
-
-    /// 토큰 범위 attention (스레드 단위) — toks: 처리할 토큰 인덱스 목록.
     fn attn_range(
         qkv: &[Vec<f32>],
         toks: &[usize],

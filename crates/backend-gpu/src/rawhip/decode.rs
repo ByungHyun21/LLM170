@@ -12,7 +12,6 @@
 //!   스켈레톤")는 **배치 런치에서 신뢰 불가**하다(벽시계 1,409ms와 모순).
 //!   LLM170_PP_PROF 마크는 이 raw 경로 전용이고(프레임 경로는 무출력),
 //!   trace 섹션의 95.8ms는 계측기 자신의 hipEventCreate 비용이다.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use cubecl_hip_sys as hip;
 use super::RawCtx;
@@ -3414,24 +3413,6 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
         self.ctx.h2d(self.ms_ptrbuf, bytemuck::cast_slice(&raw))?;
         Ok(self.ms_ptrbuf)
-    }
-
-    fn ms_kvk_ptr(&self, il: usize, row_seq: &[i32]) -> Result<*mut u8, String> {
-        self.ms_kvk_ptr_to(il, row_seq, self.ms_ptrbuf)
-    }
-
-    fn ms_kvk_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
-        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_k16[il][sq as usize]).collect();
-        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
-        self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
-        Ok(dst)
-    }
-
-    fn ms_kvv_ptr_to(&self, il: usize, row_seq: &[i32], dst: *mut u8) -> Result<*mut u8, String> {
-        let tbl: Vec<*mut u8> = row_seq.iter().map(|&sq| self.kv_v16[il][sq as usize]).collect();
-        let raw: Vec<usize> = tbl.iter().map(|&p| p as usize).collect();
-        self.ctx.h2d(dst, bytemuck::cast_slice(&raw))?;
-        Ok(dst)
     }
 
     /// 시퀀스 상태 제로화 (서버 슬롯 반환) — GDN/conv만 (KV는 위치 색인).

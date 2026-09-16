@@ -2,7 +2,6 @@
 //! LLM170_GPU_RUNTIME=vulkan 시 주입, GDN/프레임은 CPU 폴백 (트레이트 Err).
 //! 구조: 파이프라인·버퍼·가중치는 전부 지연 초기화 캐시, dispatch 헬퍼가
 //! SSBO 바인딩+push+발사를 일원화 (M4b 확장 지점).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
@@ -108,20 +107,6 @@ impl VkAcc {
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
         Ok(p)
-    }
-
-    /// 배치 모드용 — p.ds 대신 fresh 세트에 바인딩해 반환 (세트 재사용 하저드:
-    /// 녹화된 커맨드가 세트 객체를 참조 — 마지막 바인딩으로 전부 덮임).
-    fn bind_ds(&self, ctx: &mut VkCtx, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
-        if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
-            ctx.batch_dsl.set(Some((p.dsl, p.pool)));
-            let ds = ctx.fresh_ds(bufs.len() as u32)?;
-            ctx.bind_bufs(ds, bufs);
-            Ok(ds)
-        } else {
-            ctx.bind_bufs(p.ds, bufs);
-            Ok(p.ds)
-        }
     }
 
     /// ktab(iq4nl)·grid3s 테이블 + 더미 버퍼 — 최초 1회 업로드.

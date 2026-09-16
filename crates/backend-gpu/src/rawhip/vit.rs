@@ -1,6 +1,5 @@
 //! CLIP ViT GPU 실행기 (plans/17) — mmproj 가중치 f32 업로드 1회, 커널 파이프라인.
 //! 산술은 core::clip (CPU) 미러 — 검증: 행별 최대오차.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawhip::RawCtx;
 use std::collections::HashMap;
@@ -13,7 +12,6 @@ pub struct Vit {
     n_ff: usize,
     n_blk: usize,
     eps: f32,
-    patch: usize,
     /// 가중치 f32 행major — 이름 → (ptr, rows, ni)
     w: HashMap<String, (*mut u8, usize, usize)>,
     // 버퍼
@@ -43,7 +41,6 @@ impl Vit {
         n_ff: usize,
         n_blk: usize,
         eps: f32,
-        patch: usize,
         t_max: usize,
     ) -> Result<Self, String> {
         let mut w = HashMap::new();
@@ -62,7 +59,6 @@ impl Vit {
             n_ff,
             n_blk,
             eps,
-            patch,
             w,
             b_x: a(t_max * n_embd)?,
             b_xn: a(t_max * n_embd)?,

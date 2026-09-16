@@ -2,7 +2,6 @@
 //! 본체는 backend-gpu(rawhip 프로브 fn, rawvk check fn)에 있고 여기는
 //! 인자 파싱+호출만. 결론난 A/B 하니스(batch-abtest·tree-test·q6k-abtest·
 //! exp-ab)는 2026-09-08 폐기.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use std::process::ExitCode;
 

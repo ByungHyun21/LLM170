@@ -3,7 +3,6 @@
 //! 게이트: LLM170_FRAME35=1 (기본 off — 검증 통과 후 전환).
 //! 수치 계약: 값 경로(model/layers.rs)와 동일 순서 — 잔차는 AxpyScaled(s=1)로
 //! xs += out·1.0 (x·1.0 ≡ x, f32 비트 불변).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::{Engine, ModelError};
 use crate::matmul::{Accelerator, FrameOp, FrameState};
@@ -45,8 +44,6 @@ pub struct Frame35 {
     aq: u64,       // q+gate [n_head·2·hd]
     ak: u64,       // k [n_kv·hd]
     av: u64,       // v [n_kv·hd]
-    aqrow: u64,    // q‖gate 인터리브 [n_head·2·hd]
-    akstg: u64,    // k 행 스테이징 (CPU rms·rope 결과 → 캐시 append)
     aout: u64,     // 어텐션 출력 [n_head·hd]
     cs: u64,       // rope cos/sin [ctx][half][2]
     mask: u64,     // u32 [ctx] 전체 가시
@@ -104,8 +101,6 @@ impl Frame35 {
             aq: a(hp.n_head * 2 * hp.head_dim)?,
             ak: a(hp.n_kv * hp.head_dim)?,
             av: a(hp.n_kv * hp.head_dim)?,
-            aqrow: a(hp.n_head * 2 * hp.head_dim)?,
-            akstg: a(hp.n_kv * hp.head_dim)?,
             aout: a(hp.n_head * hp.head_dim)?,
             cs: a(ctx_frames * (hp.n_rot / 2) * 2)?,
             mask: a(ctx_frames)?,

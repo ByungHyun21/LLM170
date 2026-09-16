@@ -14,7 +14,6 @@
 //!
 //! 토크나이저는 탐욕 최장일치 근사 — 자기일관(self-consistent) 검증용.
 //! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 
 use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
@@ -47,15 +46,6 @@ pub fn serve(addr: &str, req: InferRequest, backend: BackendSel) -> Result<(), S
         });
     }
     Ok(())
-}
-
-pub struct Job {
-    pub tokens: Vec<u32>,
-    pub n_predict: usize,
-    /// true면 상태 리셋 후 prefill (무상태 HTTP 요청의 기본).
-    pub fresh: bool,
-    /// 토큰별 진행 채널 — 스트리밍 모드에서 생성 즉시 SSE 전송 (2026-09-01).
-    pub progress: Option<std::sync::mpsc::Sender<u32>>,
 }
 
 pub type TokOut = InferResult;

@@ -2,7 +2,6 @@
 //!
 //! - gguf-dump: 모델 구조·양자화 믹스 덤프 (무게 미로딩)
 //! - infer: qwen35 CPU 참조 추론 (greedy). 토큰 id 입력 — 토크나이저는 후속 단계.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 mod bench;
 mod engine;
@@ -407,47 +406,6 @@ fn cmd_w4a8_check(args: &[String]) -> ExitCode {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::model::Engine) {
-    // 이 시점 eng는 &Engine 차입 — piece는 model 접근
-    println!(
-        "{{\"seq\":{},\"pos\":{},\"token\":{},\"text\":{}}}",
-        seq,
-        pos,
-        token,
-        json_escape(&eng.piece(token))
-    );
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
     s.split(',').map(|t| t.trim().parse::<u32>()).collect()
 }
@@ -456,6 +414,7 @@ fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
 fn parse_ids_ref(s: &str) -> Option<Vec<u32>> {
     parse_ids(s).ok()
 }
+
 
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");

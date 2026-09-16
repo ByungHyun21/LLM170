@@ -108,7 +108,7 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
                     let tw0 = std::time::Instant::now();
                     let ctx = std::sync::Arc::new(llm170_backend_gpu::rawhip::RawCtx::new()?);
                     let vit = llm170_backend_gpu::rawhip::vit::Vit::new(
-                        ctx.clone(), weights, n_embd, n_head, n_ff, n_blk, eps, 16, tmax,
+                        ctx.clone(), weights, n_embd, n_head, n_ff, n_blk, eps, tmax,
                     )?;
                     eprintln!("# vit weights+upload {:.1}s", tw0.elapsed().as_secs_f64());
                     vit_cache = Some((ctx, std::sync::Arc::new(vit), tmax));

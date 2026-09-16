@@ -169,11 +169,6 @@ impl Engine4 {
         self
     }
 
-    /// 지원 — np 디코드도 seq별 1토큰씩 처리, 상태 격리 자명)
-    fn forward(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
-        self.forward_timed(seq, tokens, None)
-    }
-
     fn forward_timed(
         &mut self,
         seq: usize,
@@ -938,27 +933,12 @@ fn hc_combine(res_hc: &mut [Vec<f32>], out: &[Vec<f32>], inject: &[Vec<f32>], hc
     }
 }
 
-fn n_embd_dim(hp: &Hparams4) -> usize {
-    hp.n_embd
-}
-
 fn init_timings() -> Option<Q4Timings> {
     if std::env::var_os("LLM170_Q4_TIME").is_some() {
         Some(Q4Timings::default())
     } else {
         None
     }
-}
-
-fn dequant_row_into(
-    _m: &Model4,
-    ty: llm170_gguf::GgmlType,
-    data: &[u8],
-    row: u32,
-    n: usize,
-    out: &mut [f32],
-) {
-    crate::quant::dequant_row(ty, data, row as u64, n as u64, out);
 }
 
 #[cfg(test)]

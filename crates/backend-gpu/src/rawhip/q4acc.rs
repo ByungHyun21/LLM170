@@ -116,8 +116,6 @@ pub struct Q4Acc {
     /// 컨텍스트 길이(엔진이 주입). KV 풀을 이 크기로 선할당한다.
     ctx_len: std::sync::atomic::AtomicUsize,
     /// plans/67 2a: q/k norm·cs(로프 테이블) 상수용 소형 풀.
-    qn: std::sync::Mutex<GBuf>,
-    kn: std::sync::Mutex<GBuf>,
     cst: std::sync::Mutex<GBuf>,
     /// QSA KV 상주 풀 [(full_idx, seq)] → (k, v) — plans/67 3단계.
     qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf)>>,
@@ -340,8 +338,6 @@ impl Q4Acc {
             qsp: std::sync::Mutex::new(GBuf::new("qsp")),
             ybuf: std::sync::Mutex::new(Vec::new()),
             ctx_len: std::sync::atomic::AtomicUsize::new(0),
-            qn: std::sync::Mutex::new(GBuf::new("qn")),
-            kn: std::sync::Mutex::new(GBuf::new("kn")),
             cst: std::sync::Mutex::new(GBuf::new("cst")),
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
