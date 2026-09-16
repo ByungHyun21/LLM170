@@ -277,6 +277,15 @@ parallel-K variant is blocked by the smem-exchange corruption or the
 global-plane fault. Axis closed for this deadline; production GEMM remains
 dot4.
 
+### Prefill CPU-state pullback elided for the frame path (10136ae, 2026-09-17)
+
+The per-prefill-call device-to-host pullback of GDN/conv states (dozens of
+small D2H roundtrips) exists so the *value-path* fallback starts from
+authoritative state; the default frame prefill consumes device state
+directly and never reads the CPU copy — pure dead work. Gated to the value
+path only. Warm np4 22.2-23.9 t/s (baseline 22.8-23.1), per-slot prefill
+spacing 1.55 -> 1.22s; both gates PASS.
+
 ### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
 
 - `prefill_greedy` (f947146): the Q4 server prefill returned the full 152k
