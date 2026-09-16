@@ -218,6 +218,23 @@ activation global re-read was NOT the bottleneck; the per-launch regression is
 a stable characteristic of this kernel family at t=4 on gfx1151. Experiments
 were not committed.
 
+### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
+
+- `prefill_greedy` (f947146): the Q4 server prefill returned the full 152k
+  vocab logits per chunk (608KB pageable D2H, slow-path tens of ms) only for
+  the host to argmax it; now reuses frame_forward_greedy's GPU argmax (8B).
+  HTTP aggregate impact is within machine noise (~1%) but the transfer is
+  mechanically eliminated.
+- Matched-protocol references (same client, same 120-token prompt, greedy,
+  warmed): llama FN np4 = 30-45 t/s at n=64 and 40-52 at n=128; llama 27B
+  np4 = 45-52 at n=128 — their warm runs exceed the previously documented
+  35.1/39.4. Our short-prompt numbers: FN 22.8-23.1, 27B ~26-28. The np4
+  gap is therefore ~2x, rooted in the MMQ-MMA GEMM family (see above) plus
+  our serial per-slot prefill scheduling (~4s of wall for 480 tokens).
+- Gate hygiene note: a FAIL observed immediately after a 4-stream bench
+  session was machine thermal/UMA state — the identical binary PASSes on a
+  quiet machine (both clean and patched trees). Run gates cold.
+
 ### WMMA tile GEMM for np4 q5_K — attempted, negative (2026-09-17)
 
 Motivated by the llama source audit: their np4 throughput (77-88ms/4-row
