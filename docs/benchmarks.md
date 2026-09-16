@@ -547,3 +547,84 @@ arithmetic, gate-verified bit-identical, clearer code). The 27B np4 engine gap
 (~130 vs ~110 ms) is therefore not g4-code slack; closing it needs either
 fewer dot4s per weight (packed multi-token dot4 does not exist on this ISA)
 or a different batched kernel family.
+
+## 2026-09-17/18 session — multi-token q8 GEMV rewrite, prefill selection shortcut
+
+Measured by this session (solo, ROCm 10, greedy, warm; A/B interleaved where it
+mattered). Nine commits, all gate-verified (27B/FN bit-identical streams) with
+`cargo test` 12/12 and 0 build warnings.
+
+### Adopted
+
+1. **`gemm_q8_0_mt_w`** (cc 3b40e3 + cedc217) — the t=2..8 q8_0 GEMV (FN np/MTP
+   verify) rebuilt as warp-per-row with **branchless weight loads** and a
+   paired-chain reduction that is **bit-identical** to the old 64-lane kernel
+   (lane l keeps accA = lane l's chain and accB = lane l+32's chain, then
+   f64-add + the same 32-lane tree). Root cause of the old kernel's cost, read
+   off the ISA: the `al ? w[..] : (a>>16)|(b<<16)` weight load made the
+   compiler emit `s_waitcnt vmcnt(0)` **after every load** — memory-level
+   parallelism gone (a pure-load probe with the same access pattern reaches
+   233 GB/s; that kernel ran at 117 GB/s). Micro-benchmark (445 MB, DRAM):
+   150-186 -> 220 GB/s. End-to-end: **FN np4 25.03 -> 29.16 t/s (+16.5 %)**,
+   measured back-to-back with `LLM170_Q8MTW=0` on the same protocol.
+2. **Prefill identity-selection shortcut** (8090726) — for
+   `n_past <= idx_top_k + r - 1` the QSA indexer provably selects *every* block
+   in ascending order (`qsa_select` pass B keeps `(0..n_blocks)` and sorts
+   ascending), so the per-layer iq/ik/k/v d2h (4 sync copies) plus the host
+   scoring/ranking can be skipped and the identity list built directly. New
+   `Accelerator::qsa_idx_append_dev` keeps the device pools current. FN pp128
+   841 -> 736-789 ms; gate stream unchanged (the 208-token gate prompt enters
+   this path). Kill switch `LLM170_QSA_NOID=1`.
+
+### Measured and rejected
+
+- **Prefill f32 GEMM reroute** (`q4_gemm_f32_m` tile -> 8-token chunks of
+  `q4_gemm_f32_mt`): the tile kernel is scalar + uncoalesced (each lane reads a
+  different weight *row*; 32 cache lines per warp-load) and burns ~158 ms per
+  128-token chunk, but rerouting measured **neutral** end-to-end (pp512
+  261 vs 270 t/s) — it hides behind dependent work, matching the 2026-09-13
+  note. Reverted.
+- **Batched multi-slot prefill** (one frame pass over several slots' chunks):
+  implemented (segment conv/AR kernels `gdn_conv_np_k`/`gdn_ar_w_np_k`,
+  per-slot QSA slices + identity lists, per-slot PLE bridge, per-slot head
+  rows, server wiring) and **reverted before commit** — a single-slot run was
+  token-exact against the gate, but R>=2 produced wrong streams, and the
+  cross-check reference itself showed row-dependent divergence for identical
+  prompts, so the feature could not be validated inside the window. The
+  mechanism (llama batches all slots into one ubatch: one `mul_mat_id` reads
+  each expert once — `llama-batch.cpp`/`mmq.cu` audit) remains the top
+  structural item: FN np4 pays 4x the MoE expert traffic because each slot's
+  120-token chunk already touches ~all 512 experts (per-chunk expert traffic is
+  ~constant from ~120 tokens up).
+
+### Scorecard movement vs llama.cpp (this session)
+
+| cell | before | after | llama (re-measured) |
+|---|---|---|---|
+| FN np4 (4x128 tok, ctx 8192/slot) | 25.03 | **29.16** | 42.99 |
+| FN pp128 | 841 ms | 736-789 ms | — |
+| 27B np4 | 26.3 | unchanged | 35.1 |
+
+### MTP spec == greedy: near-tie divergence documented (pre-existing)
+
+`infer --spec 3` reproduces greedy exactly on three natural prompts (5, 8 and
+19 tokens) and diverges on the 208-token Korean gate prompt at token 4
+(16 -> 23) and token 14. Reproduced identically with the pre-session kernel
+(`LLM170_Q8MTW=0`), so it is not a product of this session's changes: the
+verify path's logits differ from the single-token path in the last bits and
+this prompt sits on a flat distribution (ADR-0012 near-tie class). Logged here
+as an open item rather than re-verified.
+
+### Measurement tooling added
+
+- `scripts/bench_np.py` — np concurrent aggregate with a mandatory warm-up
+  phase (the first pass after server start costs 20-30 s of NVMe-backed weight
+  upload; cold numbers are not comparable).
+- `scripts/np_decompose.py` — separates (prefill + fixed) from per-step cost by
+  regressing wall over `n_predict`; used to show llama FN = 1.94 s + 72.6 ms/step
+  vs ours 4.15 s + ~90 ms/step at np4.
+- `scripts/scorecard.sh` — matched pp/tg scorecard for both models/engines with
+  the ROCm 10 userspace and rocBLAS Tensile paths pinned.
+- `scripts/verify_np_self.py` — np-batch vs sequential self-consistency (3/4
+  identical at HEAD; seq1's 3-token divergence is present with the pre-session
+  kernel too).
