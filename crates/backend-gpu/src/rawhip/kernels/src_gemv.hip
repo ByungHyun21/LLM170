@@ -677,18 +677,54 @@ extern "C" __global__ void __launch_bounds__(64) gemm_q8_0_mt(
     }
 }
 
-// 멀티토큰 q8_0 GEMV — **워프=행(32레인)** (2026-09-16 plans/74). 종전 mt(64레인
-// 블록, 레인 l=서브블록 l+64m)는 (a) n_sub=80 에서 두 번째 반복에 16레인만
-// 활동(62.5%)하고 (b) 무게 8워드를 `al ? w[..] : (a>>16)|(b<<16)` 삼항으로 적재해
-// 컴파일러가 **적재마다 s_waitcnt vmcnt(0)** 직렬화를 넣었다(실측: DRAM 115GB/s,
-// 순수 적재 프로브 233GB/s). 마이크로벤치 대조(2026-09-16, 501MB qkv 형상):
-// 종전 117GB/s → 본 판 190GB/s(단일토큰 판 190과 동일), n_sub=128 218GB/s.
-// 처방: (1) 워프=행으로 레인 효율 100%(n_sub≥32), (2) 무게 9워드 **무조건 적재** 후
-// cndmask 선택(분기 제거 → 적재 파이프라이닝), (3) 토큰별 정수 dot 사슬을 4개로 분리
-// (정수 가산은 결합법칙 성립 → 값 불변, ILP 4배), (4) 토큰 루프 안에서 무게 워드는
-// 레지스터 재사용(가중 1회 독서).
-// 환원: 레인별 f32 사슬(sb 오름차순) → f64 32레인 shfl 트리 — gemm_q8_0_w 계열과
-// 동일 정밀도 클래스(np 경로 전용, 단일토큰 게이트 경로는 종전 커널 유지).
+// 멀티토큰 q8_0 GEMV — **워프=행(32레인), 종전 64레인 판과 비트 동일** (plans/74).
+// 종전 gemm_q8_0_mt(64레인/행, 레인 l=서브블록 l+64m)의 실측 결함 두 가지:
+// (a) 무게 8워드를 `al ? w[..] : (a>>16)|(b<<16)` 삼항으로 적재해 컴파일러가
+// **적재마다 s_waitcnt vmcnt(0)** 를 끼워 넣었다 — ISA 로 확인, 메모리 수준
+// 병렬성 소멸(동일 접근 패턴의 순수 적재 프로브는 233GB/s 인데 커널은 117GB/s).
+// (b) n_sub=80 에서 두 번째 반복에 16/64 레인만 활동(62.5%).
+// 처방: 워프=행으로 레인 효율을 올리고(레인 l = 서브블록 l+32m), 무게 9워드를
+// **무조건 적재**한 뒤 cndmask 로 선택한다(분기 제거 → 적재 파이프라이닝).
+//
+// **비트 동일 유지**: 32레인 판이 종전 64레인 판의 레인 l(하위 32)과 레인 l+32
+// (상위 32)의 누적을 각각 독립 f32 사슬 accA/accB 로 유지한다. 종전 판의
+// 서브블록 배정은 레인 j = sb j+64m 이므로, accA 는 sb = l+64m, accB 는
+// sb = l+32+64m 를 오름차순으로 누적한다 — 종전 레인별 체인과 동일.
+// 환원도 동일: (double)accA + (double)accB 가 종전의 sh32 교환 후 f64 가산과
+// 같은 값이고, 이어지는 32레인 shfl_down 트리(16,8,4,2,1)도 동일 순서다.
+// 정수 dot 사슬은 4개로 분리(정수 가산은 결합법칙 — 값 불변, ILP 4배).
+// 무게 워드는 토큰 루프 밖에서 1회만 만들고 레지스터로 재사용(가중 1회 독서).
+// 서브블록 1개를 tt개 토큰에 대해 누적하는 인라인 헬퍼 — 호출부에서 인라인되어
+// acc 배열이 정적 레지스터로 남는다(포인터 경유 금지).
+DEV void mtw_sb(const unsigned* w, const unsigned* xq, int xq_w, int row_base,
+                int dbase, int sb, int tt, float (&acc)[8]) {
+    const int wb = row_base + sb * 34;
+    const float d = f16w(w, wb);
+    const int wq = wb >> 2;
+    const unsigned al = (wb & 3) == 2;
+    unsigned A[9];
+    #pragma unroll
+    for (int k = 0; k < 9; k++) A[k] = w[wq + k];
+    unsigned wv[8];
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const unsigned mis = (A[k] >> 16) | (A[k+1] << 16);
+        wv[k] = al ? A[k+1] : mis;
+    }
+    const int xw = sb << 3;
+    for (int ti = 0; ti < tt; ti++) {
+        const unsigned* xr = xq + (size_t)ti * xq_w;
+        const unsigned y0 = xr[xw],   y1 = xr[xw+1], y2 = xr[xw+2], y3 = xr[xw+3];
+        const unsigned y4 = xr[xw+4], y5 = xr[xw+5], y6 = xr[xw+6], y7 = xr[xw+7];
+        int s0 = dot4(wv[0], y0, 0), s1 = dot4(wv[1], y1, 0);
+        int s2 = dot4(wv[2], y2, 0), s3 = dot4(wv[3], y3, 0);
+        s0 = dot4(wv[4], y4, s0); s1 = dot4(wv[5], y5, s1);
+        s2 = dot4(wv[6], y6, s2); s3 = dot4(wv[7], y7, s3);
+        const float yd = __uint_as_float(xr[dbase + sb]);
+        acc[ti] += yd * d * (float)((s0 + s1) + (s2 + s3));
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(32) gemm_q8_0_mt_w(
         const unsigned* xq, const unsigned* w, double* part, float* out,
         int n_in, int n_out, int xq_w, int tt) {
@@ -699,40 +735,19 @@ extern "C" __global__ void __launch_bounds__(32) gemm_q8_0_mt_w(
     const int n_sub = n_in >> 5;
     const int row_base = o * n_sub * 34;
     const int dbase = n_in >> 2;
-    float acc[8];
+    float accA[8], accB[8];
     #pragma unroll
-    for (int ti = 0; ti < 8; ti++) acc[ti] = 0.0f;
-    for (int sb = l; sb < n_sub; sb += 32) {
-        const int wb = row_base + sb * 34;
-        const float d = f16w(w, wb);
-        const int wq = wb >> 2;
-        const unsigned al = (wb & 3) == 2;
-        unsigned A[9];
-        #pragma unroll
-        for (int k = 0; k < 9; k++) A[k] = w[wq + k];
-        unsigned wv[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            const unsigned mis = (A[k] >> 16) | (A[k+1] << 16);
-            wv[k] = al ? A[k+1] : mis;
-        }
-        const int xw = sb << 3;
-        for (int ti = 0; ti < tt; ti++) {
-            const unsigned* xr = xq + (size_t)ti * xq_w;
-            const unsigned y0 = xr[xw],   y1 = xr[xw+1], y2 = xr[xw+2], y3 = xr[xw+3];
-            const unsigned y4 = xr[xw+4], y5 = xr[xw+5], y6 = xr[xw+6], y7 = xr[xw+7];
-            int s0 = dot4(wv[0], y0, 0), s1 = dot4(wv[1], y1, 0);
-            int s2 = dot4(wv[2], y2, 0), s3 = dot4(wv[3], y3, 0);
-            s0 = dot4(wv[4], y4, s0); s1 = dot4(wv[5], y5, s1);
-            s2 = dot4(wv[6], y6, s2); s3 = dot4(wv[7], y7, s3);
-            const float yd = __uint_as_float(xr[dbase + sb]);
-            acc[ti] += yd * d * (float)((s0 + s1) + (s2 + s3));
-        }
+    for (int ti = 0; ti < 8; ti++) { accA[ti] = 0.0f; accB[ti] = 0.0f; }
+    for (int m = 0; (l + (m << 6)) < n_sub; m++) {
+        const int sbA = l + (m << 6);        // 종전 64레인 판의 레인 l
+        mtw_sb(w, xq, xq_w, row_base, dbase, sbA, tt, accA);
+        const int sbB = sbA + 32;            // 종전 64레인 판의 레인 l+32
+        if (sbB < n_sub) mtw_sb(w, xq, xq_w, row_base, dbase, sbB, tt, accB);
     }
     #pragma unroll
     for (int ti = 0; ti < 8; ti++) {
         if (ti >= tt) break;
-        double accd = (double)acc[ti];
+        double accd = (double)accA[ti] + (double)accB[ti];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
