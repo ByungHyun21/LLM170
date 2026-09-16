@@ -202,6 +202,10 @@ reference-exact 24/24, cargo suite 10/10.
 
 ## ADR-0016 — Local cubecl-runtime vendor patch: memory sweep disabled (2026-09-01)
 
+> **SUPERSEDED by ADR-0018 (2026-09-05)** — cubecl was removed from the
+> dependency graph; there is no `vendor/` tree and no `[patch]` section any
+> more. Kept for the RCA record only.
+
 **Context**: even after ADR-0014 removed every free path, intermittent
 `Memory page N doesn't exist` faults and libamdhip64 access violations at
 fixed instruction pointers kept firing on allocation-heavy runs. Root cause

@@ -40,7 +40,7 @@ qwen4exp is structured as stage modules (`core/src/qwen4exp/stages/`):
 `Ctx { model, acc }` (+ `&mut SeqState4` for stateful stages), with dispatch
 variants for same-input projection groups and per-expert paired rows.
 `Engine4` retains forward/prefill chunking/decode timing only. GPU memory is
-owned exclusively by the buffer arena (`backend-gpu/src/buffers.rs`,
+owned exclusively by the buffer arena (`backend-gpu/src/rawhip/mod.rs`,
 ADR-0014): weights live in `WeightStore` behind a `WRef` enum that makes
 host-fallback misuse unrepresentable, and `ScratchPool` retains every
 transient upload — nothing is ever freed (VRAM bounded by accounting, not

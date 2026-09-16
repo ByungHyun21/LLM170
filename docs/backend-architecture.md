@@ -19,6 +19,11 @@ two independent GPU backends plus a CPU reference path. All three produce
 
 ## Kernel contract
 
+- **FFI surface**: the only external GPU dependency is the HIP *binding*
+  crate (`cubecl-hip-sys`, pulled under its published package name) — raw
+  `libamdhip64`/`hiprtc` declarations, no runtime, no compiler, no kernels
+  from a third party. All kernels, dispatch and scheduling are this
+  repository's own Rust/HIP source (AGENTS.md: no external GPU libraries).
 - Quantized matmul kernels mirror `dot_row_w4a8_*` in `crates/core/src/quant.rs`
   (integer `isum` per 32-element block; scales applied per block). Integer
   arithmetic is exact, so default-path outputs match the CPU reference to
