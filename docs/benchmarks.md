@@ -266,12 +266,16 @@ corruption trigger: **shared-tile full-K per warp with direct writes is
 correct and deterministic** (0.8485 vs dot4 0.853) — the corruptor is
 specifically the shared-memory partial exchange (sC write/read across
 warps). A v9 design replacing smem with global per-warp planes plus a
-fixed-order reduce kernel was implemented (offline CO), but hit an
-unresolved host-address fault in the launch plumbing within the debugging
-budget; removed. Net result across four sub-campaigns: the correct serial-K
-WMMA form tops out at 28.3 vs dot4 30.0 on this GPU, and every parallel-K
-variant is blocked by the smem-exchange corruption or its replacement's
-plumbing. Axis closed for this deadline; the production GEMM remains dot4.
+fixed-order reduce kernel was implemented (offline CO) and bisected to the wire:
+7-arg passing and an unused 7th parameter are fault-free, while enabling the
+global-plane partial writes alone faults (host-range write, grid/workgroup
+verified correct). The fault reproduces with the parameter in first or last
+position and under both compiler stacks; root cause unresolved within the
+debugging budget. Net result across four sub-campaigns: the correct
+serial-K WMMA form tops out at 28.3 vs dot4 30.0 on this GPU, and every
+parallel-K variant is blocked by the smem-exchange corruption or the
+global-plane fault. Axis closed for this deadline; production GEMM remains
+dot4.
 
 ### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
 
