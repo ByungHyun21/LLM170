@@ -259,6 +259,20 @@ writes, leaving a divergent __syncthreads (UB). Axis closed: serial-K
 correct form measures 28.3 vs dot4 30.0 (no win); the split-K speed prize
 (34-36) stays locked behind this root cause.
 
+### WMMA axis final close: global-plane split-K attempted (2026-09-17)
+
+After exonerating the compiler stacks, a test matrix isolated the cross-warp
+corruption trigger: **shared-tile full-K per warp with direct writes is
+correct and deterministic** (0.8485 vs dot4 0.853) — the corruptor is
+specifically the shared-memory partial exchange (sC write/read across
+warps). A v9 design replacing smem with global per-warp planes plus a
+fixed-order reduce kernel was implemented (offline CO), but hit an
+unresolved host-address fault in the launch plumbing within the debugging
+budget; removed. Net result across four sub-campaigns: the correct serial-K
+WMMA form tops out at 28.3 vs dot4 30.0 on this GPU, and every parallel-K
+variant is blocked by the smem-exchange corruption or its replacement's
+plumbing. Axis closed for this deadline; the production GEMM remains dot4.
+
 ### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
 
 - `prefill_greedy` (f947146): the Q4 server prefill returned the full 152k
