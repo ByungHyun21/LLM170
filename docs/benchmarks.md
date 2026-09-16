@@ -244,6 +244,21 @@ first-principles debugging with a host-side CPU reference harness:
   prize (the earlier 34-36 t/s runs were the corrupted kernel) remains
   unreachable until the cross-warp corruption is root-caused.
 
+### WMMA split-K corruption: compiler-stack exoneration (2026-09-17)
+
+The cross-warp split-K corruption (multiple warps sharing one 16-row tile)
+reproduces BIT-FOR-BIT in class under the offline hipcc -O3 codegen path
+(CO object loaded via the LLM170_CO5_PATH override) as under the runtime
+hipRTC/comgr JIT: nondeterministic, magnitude-corrupted outputs while the
+identical source in serial-K per-warp-tile form is correct and
+deterministic. Both compiler stacks producing the same corruption
+exonerates comgr and points at either a residual design subtlety or a
+w32-WMMA hardware/driver scheduling constraint on gfx1151. The v6b
+warp0-only-read variant is separately explained by DCE removing idle-warp
+writes, leaving a divergent __syncthreads (UB). Axis closed: serial-K
+correct form measures 28.3 vs dot4 30.0 (no win); the split-K speed prize
+(34-36) stays locked behind this root cause.
+
 ### Server prefill greedy + protocol-corrected np4 references (2026-09-17)
 
 - `prefill_greedy` (f947146): the Q4 server prefill returned the full 152k
