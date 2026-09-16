@@ -411,6 +411,68 @@ impl Engine4 {
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
 
+    /// greedy 프리필 — 마지막 토큰 로짓 전사(어휘 152k×4B pageable D2H,
+    /// 슬로패스 수십 ms) 대신 GPU argmax 로 토큰만 회수(plans/74, np 서버).
+    /// 프레임 경로 판만 갈리며 값 폴백은 종전 prefill+greedy 와 동일.
+    pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, Q4Error> {
+        let frame_on = self.acc.is_some()
+            && !self.frame_broken
+            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        if !frame_on {
+            let l = self.prefill(seq, tokens)?;
+            return Ok(crate::model::greedy(&l));
+        }
+        let cap0 = frame_t_max_cap(self.acc.as_deref());
+        let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(cap0)
+            .clamp(16, 4096)
+            .min(frame_t_max_cap(self.acc.as_deref()));
+        if let Some(f) = &self.frame {
+            if !f.dirty[seq] {
+                if let Some(acc) = self.acc.as_deref() {
+                    let st = &mut self.seqs[seq];
+                    for (ri, h) in f.st_gdn[seq].iter().enumerate() {
+                        let mut t = vec![0.0f32; st.gdn_s[ri].len()];
+                        acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
+                        st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
+                    }
+                    for (ri, h) in f.st_conv[seq].iter().enumerate() {
+                        acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
+                    }
+                }
+            }
+        }
+        if self.frame.is_none() {
+            match super::frame::Frame4::new(self.acc.as_deref().unwrap(), &self.model, &self.seqs, frame_t_max(self.acc.as_deref())) {
+                Ok(f) => self.frame = Some(f),
+                Err(e) => {
+                    self.frame_broken = true;
+                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                    let l = self.prefill(seq, tokens)?;
+                    return Ok(crate::model::greedy(&l));
+                }
+            }
+        }
+        let acc = self.acc.as_deref().unwrap();
+        let f = self.frame.as_mut().unwrap();
+        let mut last = 0u32;
+        for ch in tokens.chunks(chunk) {
+            if f.dirty[seq] {
+                f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
+            }
+            let ctx = Ctx { model: &self.model, acc: Some(acc) };
+            last = super::frame::frame_forward_greedy(
+                acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, ch,
+            )?;
+            self.seqs[seq].pos += ch.len() as u32;
+            f.dirty[seq] = false;
+        }
+        Ok(last)
+    }
+
     /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
     /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 + PLE 프리페치 조인·소비.
     /// plans/73(np): 다중 시퀀스 배치 디코드 — 무게 스트리밍 공유(t=seqs.len()).

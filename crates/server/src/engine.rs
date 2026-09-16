@@ -346,22 +346,24 @@ pub fn slot_loop(
                 .min_by_key(|&i| slots[i].touch);
             if let Some(i) = pf {
                 let chunk = 512usize;
+                // plans/74: Q4(FN)는 prefill_greedy — 청크마다 어휘 152k
+                // 로짓 pageable D2H(슬로패스 수십 ms) 대신 GPU argmax 8B 회수.
+                // Q35(27B)는 종전 전사 경로(원시 프리필 내부 d2h).
                 let (start, logits) = {
                     let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> = slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
-                    let r: Result<Vec<f32>, String> = match &mut eng {
-                        Engine::Q35(e) => e.prefill(i, &part).map_err(|e| e.to_string()),
-                        Engine::Q4(e) => e.prefill(i, &part).map_err(|e| e.to_string()),
+                    let r: Result<u32, String> = match &mut eng {
+                        Engine::Q35(e) => e.prefill(i, &part).map(|l| llm170_core::model::greedy(&l)).map_err(|e| e.to_string()),
+                        Engine::Q4(e) => e.prefill_greedy(i, &part).map_err(|e| e.to_string()),
                     };
                     (end, r)
                 };
                 if npw {
                     eprintln!("[wall] prefill slot{i} {start}tok done @{}s", t0w.elapsed().as_secs_f64());
                 }
-                if let Ok(l) = logits {
+                if let Ok(t) = logits {
                     slots[i].prefilled = start;
                     if start == slots[i].job.as_ref().unwrap().tokens.len() {
-                        let t = llm170_core::model::greedy(&l);
                         slot_emit(&mut slots[i], t);
                     }
                 }
