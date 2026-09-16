@@ -35,12 +35,14 @@ failed with ERROR_DEVICE_LOST under the Vulkan driver at that shape.
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
-| LLM170 hip | **374** | 324 | 253 | 11.1 | 11.5 |
+| LLM170 hip | **374** | 325-333 | 292-296 | 11.0-11.6 | 10.8-11.5 |
 | LLM170 vulkan | — | 150 | — | 9.2 | — |
 | llama.cpp (ROCm 10) | 347 | **342** | **317** | **11.6** | **11.9** |
 
-(Measured 2026-09-16 on the current hip build, greedy, natural-text prompt, pp512
-prompt / ctx 4096 (tg@4k) and 16384 (tg@16k).)
+(Measured 2026-09-16/17 on the current hip build, greedy, natural-text prompt,
+pp512 prompt / ctx 4096 (tg@4k) and 16384 (tg@16k). Session gains: pp16384
+253 -> 292-296 via raw-WMMA prefill attention (wmma2/v2); tg@4k via
+selection top-k sort resizing and 16-lane small-shape GEMVs.)
 
 Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
 `--spec 3`). MTP does not change prefill — the np4 pp aggregate applies
@@ -57,10 +59,17 @@ unchanged under MTP+np4:
 Conditions for the filled 2026-09-16 cells: HIP, ROCm 10, greedy, natural-text
 prompt, same host. np cells are 4 concurrent HTTP completions (128 tokens each,
 short shared prompt, ctx 8192/slot) measured back-to-back on both engines:
-**LLM170 np4 25.3-26.8 vs llama-server 35.1 t/s (0.72-0.76x)** — llama's 4-row
-batch step costs 1.30x its single-token step, ours ~1.6x after the 2026-09-16
-session (GPU argmax, gqa2d attention, batched conv/AR, warp-per-row g4). MTP = `--spec 3` with the gguf's
-own nextn head (acceptance 4/4 per cycle, token-identical to greedy).
+**LLM170 np4 25.3-26.8 (long-prompt protocol) / 19.5-23.1 (short-prompt) vs
+llama-server 35.1 / 45-52 t/s** — llama's 4-row batch step costs 1.30x its
+single-token step, ours ~1.6x after the 2026-09-16 session (GPU argmax, gqa2d
+attention, batched conv/AR, warp-per-row g4). 2026-09-17 protocol-matched
+re-measurement (same client/prompt/greedy, warmed) showed llama's warm runs
+exceed the earlier reference; the residual gap is attributed to their
+MMQ-MMA GEMM family (matrix-core accumulation) plus our serial per-slot
+prefill scheduling — see docs/benchmarks.md for the full decomposition,
+including the WMMA tile-GEMM campaign that confirmed dot4-GEMV superiority
+on this GPU. MTP = `--spec 3` with the gguf's own nextn head (acceptance
+4/4 per cycle, token-identical to greedy).
 
 llama's np4+MTP 15.5 t/s reference is from the **older** llama build (ROCm
 7.2.2 era, 11.75k-token slots); the current build exposes no flag to engage the
@@ -92,8 +101,10 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | np4 aggregate | — | **21.0-22.5** | TFNPP4V | TFNP4V | — | **39.4** |
 | MTP + np4 | — | — | — | — | — | — |
 
-(Flash-Next np4, measured 2026-09-16 same-host/same-prompt HTTP 4-way:
-**LLM170 18.5-19.2 t/s aggregate** vs **llama-server 39.4 t/s** (0.47-0.49x).
+(Flash-Next np4, measured 2026-09-16/17 same-host/same-prompt HTTP 4-way:
+**LLM170 21.0-23.9 t/s aggregate** (2026-09-17 build: batched MoE, f32
+multi-token projection, greedy prefill, CPU-state pullback elision) vs
+**llama-server 39.4-52 t/s** (protocol-matched warm range 40-52).
 The frame batches np decode (2026-09-16): weight-streaming GEMMs run once for
 all rows — a new multi-token q8_0 GEMV (`gemm_q8_0_mt`, one weight-row read,
 per-token accumulation, bit-identical arithmetic) removed the per-row weight
