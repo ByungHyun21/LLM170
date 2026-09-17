@@ -645,24 +645,34 @@ natural-text prompt, n_predict 128, `cache_prompt=false`) with
 
 | cell | LLM170 hip | llama.cpp | ratio |
 |---|---|---|---|
-| pp512 | **356.8** | 344.0 | 1.04 |
-| pp4096 | **335.5** | 333.6 | 1.01 |
-| pp16384 | 293.0 | **296.4** | 0.99 |
-| tg128 (512-tok prompt) | 11.59-11.64 | — | — |
-| tg128 @ 4096 | 10.95-11.49 | **11.67** | 0.94-0.98 |
-| tg128 @ 16384 | 10.72 | **11.21** | 0.96 |
+| pp512 | **356.8-359.5** | 344.0 | 1.04 |
+| pp4096 | **335.5-336.9** | 333.6 | 1.01 |
+| pp16384 | 293.0-293.1 | **296.4** | 0.99 |
+| tg128 (512-tok prompt) | 11.49-11.64 | — | — |
+| tg128, 4096-tok prompt | 10.95-11.49 | **11.67** | 0.94-0.98 |
+| tg128, 16384-tok prompt | 10.72 | **11.21** | 0.96 |
 | np4 aggregate | 20.85 | **26.04** | 0.80 |
+
+Re-verified at session end (2026-09-17, all session commits applied): 27B
+pp512 359.5 / pp4096 336.9 / pp16384 293.08 / tg128 11.60 (4k and 16k-alloc),
+gates PASS, `cargo test` 16/16, 0 build warnings.
 
 ### Qwen3.8-Flash-Next (Q4_K_XL)
 
 | cell | LLM170 hip | llama.cpp | ratio |
 |---|---|---|---|
-| pp512 | **252.3** | 245.2 | 1.03 |
-| pp4096 | **268.9** | 259.6 | 1.04 |
-| pp16384 | **239.5** | ~229 | 1.05 |
-| tg128 (512-tok prompt) | 18.56 | **20.23** | 0.92 |
-| tg128 @ 4160 | 17.19 | **17.79** | 0.97 |
+| pp512 | **221.4-252.3** | 245.2 | 0.90-1.03 |
+| pp4096 | **268.9-274.9** | 259.6 | 1.04-1.06 |
+| pp16384 | **239.5-246.1** | ~229 | 1.05-1.07 |
+| tg128 (512-tok prompt) | 18.42-18.56 | **20.23** | 0.91-0.92 |
+| tg128, 4160-tok prompt | 17.19 | **17.79** | 0.97 |
 | np4 aggregate | 24.94 | **41.07** | 0.61 |
+
+The pp512 cell is the first measurement after the 104 GiB model load, so it
+carries a cold page-cache penalty in some runs (221.4 cold vs 252.3 warm on the
+identical binary) — all other cells are warmed. Re-verified at session end:
+FN pp512 221.4 (cold) / pp4096 274.9 / pp16384 246.1 / tg128 18.42 (4k) 18.37
+(16k-alloc), FN gate PASS.
 
 Notes:
 - The pp cells are wins on both models at every measured length.
