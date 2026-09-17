@@ -699,17 +699,26 @@ Notes:
    path: 27B ≈ 0.85 s each (compute-bound: 5.6 TMAC at 6.6 TMAC/s ≈ 22% of
    peak, a 208-row batch is too short to saturate) = ~3.4 s; FN ≈ 1.0-1.7 s each
    (weight-read-bound: one full 104 GiB model read per chunk) = 4-6.8 s.
-   Accounting at np4/128 tokens: 27B wall 24.5 s = 3.4 prefill + 18.0 decode;
-   FN wall 20.5 s = ~5 prefill + 13.4 decode (the FN's live t=4 step is
-   95-115 ms, i.e. already equal to llama's 97 ms/step — its entire np4 gap is
-   the prefill). llama.cpp hides prefill inside the batched decode step (mixed
+   Live wall traces (`LLM170_WALL_TIME`, no KTRACE) with per-slot accounting:
+   27B = 4.6 s prefill + 128 x 0.14 s decode; FN = 4 x ~1.0-1.4 s prefill +
+   128 x 0.09 s decode. The prefill cost is dominated by a *fixed* per-request
+   full-weight pass, not by prompt length: shrinking the FN prompt from 208 to
+   8 tokens changes the np4 aggregate by only 8% (29.2 -> 31.6 t/s at that
+   moment's machine state), while the warm 208-token prefill measures 0.99-1.51 s
+   per slot. llama.cpp hides prefill inside its batched decode step (mixed
    batch), so its np4 equals its pure 4-row decode rate.
-   Ceiling if the 4 prefills were fused into one multi-sequence chunked forward:
-   np4 ≈ 0.86-0.93 on both models. That needs a multi-seq batch where each
-   sequence contributes multiple *chained* tokens (row_seq threading through
-   GDN conv/AR, QSA selection/KV append, per-row rope), which is the deferred
-   project in plans/73 — chunking the prefill into 32-row verify batches instead
-   would re-read the full weight set per chunk (FN: 104 GiB x 17) and lose.
+   Our decode steps are already at or better than llama's (FN live t=4
+   91-93 ms vs its 97 ms; 27B 141 ms vs its 153.6 ms), so the whole np4 gap is
+   that fixed prefill.
+   Upper bound if the prefill were made free (overlapped, or fused into one
+   multi-sequence chunked forward): 27B ≈ 0.99-1.09, FN ≈ 0.95-1.07 — i.e. a
+   near-tie at best at the measured variance, which is why neither path was
+   taken this session. Both need multi-seq *chained* prefill support (row_seq
+   threading through GDN conv/AR, QSA selection/KV append, per-row rope — the
+   deferred project in plans/73), or dual-stream execution with a full second
+   t-batch scratch set plus a stream selector; chunking the prefill into 32-row
+   verify batches instead re-reads the full weight set per chunk (FN: 104 GiB x
+   17) and loses.
 3. Host overhead is not the problem: with `LLM170_NOLAUNCH=1` a whole np step
    costs 3.0 ms of host time; KTRACE `GAPS` is 4-9 ms.
 
