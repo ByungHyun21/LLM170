@@ -269,14 +269,19 @@ impl VkCtx {
                     .get()
                     .map(|(d, _)| d)
                     .ok_or("fresh_ds: 배치 컨텍스트 없음")?;
+                // 상한 4096은 27B 장문맥(≥8192토큰) 프리필에서 소진됐다 — 풀이
+                // 고갈되면 세트 할당이 실패하고 이어서 제출이 ERROR_DEVICE_LOST로
+                // 죽는다(2026-09-17 실측: pp4096 149 t/s 정상 / pp8192 device lost,
+                // 청크 크기와 무관). 스토리지 디스크립터는 세트당 ~수십 바이트라
+                // 65536으로 올려도 비용이 무시할 수준이다.
                 let pool_sizes = [vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(12 * 4096)];
+                    .descriptor_count(12 * 65536)];
                 let pool = self
                     .device
                     .create_descriptor_pool(
                         &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(4096)
+                            .max_sets(65536)
                             .pool_sizes(&pool_sizes)
                             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
                         None,
