@@ -164,12 +164,14 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
                         llm170_backend_gpu::rawhip::ktrace_on();
                     }
+                    // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
+                    next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
+                    // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
+                    // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
                     if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
                         eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
                         kt_done = true;
                     }
-                    // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
-                    next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
                     n_gen += 1;
                     step += 1;
                     if next == eos {
