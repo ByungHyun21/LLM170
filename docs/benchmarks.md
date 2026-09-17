@@ -657,6 +657,26 @@ Re-verified at session end (2026-09-17, all session commits applied): 27B
 pp512 359.5 / pp4096 336.9 / pp16384 293.08 / tg128 11.60 (4k and 16k-alloc),
 gates PASS, `cargo test` 16/16, 0 build warnings.
 
+**Final re-run after the last commits** (same script, later in the day, machine
+under many hours of sustained benchmarking):
+
+| cell | ours (2 runs) | llama.cpp | ratio |
+|---|---|---|---|
+| 27B pp512 | 322.5-359.5 | 344.0 | 0.94-1.05 |
+| 27B pp4096 | 324.7-336.9 | 333.6 | 0.97-1.01 |
+| 27B pp16384 | 293.1-294.3 | 296.4 | 0.99 |
+| 27B tg128 | 11.58-11.60 | 11.67 / 11.21 (4k/16k) | 0.99 / 1.03 |
+| FN pp512 | 221.4-252.3 | 245.2 | 0.90-1.03 |
+| FN pp4096 | 269.9-274.9 | 259.6 | 1.04-1.06 |
+| FN pp16384 | 244.7-246.1 | ~229 | 1.07 |
+| FN tg128 | 18.42-18.47 | 20.23 (208-tok) / 17.79 (4160-tok) | 0.91 / 1.04 |
+
+The first cell of each model (pp512) is the measurement taken right after the
+100+ GiB model load, so it carries the cold page-cache penalty; the spread above
+(0.90-1.05) is that effect plus multi-hour thermal drift, not a code change —
+the same binary produced both ends. tg and pp4096/pp16384 are stable across
+runs.
+
 ### Qwen3.8-Flash-Next (Q4_K_XL)
 
 | cell | LLM170 hip | llama.cpp | ratio |
