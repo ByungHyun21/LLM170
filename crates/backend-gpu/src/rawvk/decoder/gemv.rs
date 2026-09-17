@@ -320,107 +320,40 @@ impl DecoderState {
             binds.push(xq);
             binds.push(out);
             let gx = (no as u32).div_ceil(128);
-            // tile_llm (plans/39): llama mul_mm 구조 직역 — f16vec2 shmem 15.4KB → 4 WG/CU
-            // tile_ms2 (plans/40): llama m-warptile 지오메트리 + 비트-병렬 q5_K 언팩
-            if ty == 13 && std::env::var("LLM170_TILE_MS2").map(|v| v == "1").unwrap_or(false) {
-                let gx_ms2 = (no as u32).div_ceil(64);
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
-                    let last = tb + 64 >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b("tile_ms2", TILE_MS2_SPV, 10, 16, &binds, &push, gx_ms2, 1, 1, last)?;
-                }
-                return Ok(());
-            }
-            // tile_msALL (plans/40): 전 타입 ms 골격 (iq3s 제외) — WG() 제거·가드 제거·64행 WG
-            // plans/40: ms 패밀리 기본 경로 승격 — verify 22/3, pp64 140→177.
-            // 옵트아웃: LLM170_TILE_MSALL=0 (구 패밀리 복귀).
-            let msall = std::env::var("LLM170_TILE_MSALL").map(|v| v != "0").unwrap_or(true);
-            // 타입별 옵트인 (바이섹트): LLM170_TILE_MS_TYPES="q5,q8,xs,..." — MSALL 대체
-            let ms_types: Option<Vec<u32>> = std::env::var("LLM170_TILE_MS_TYPES").ok().map(|s| {
-                s.split(',').filter_map(|t| match t.trim() {
-                    "q5" => Some(13u32),
-                    "q4" => Some(12),
-                    "q6" => Some(14),
-                    "q3" => Some(11),
-                    "q8" => Some(8),
-                    "nl" => Some(20),
-                    "xs" => Some(0),   // 와일드카드 else-브랜치
-                    _ => None,
-                }).collect()
-            });
-            let ms_on = |t: u32, wildcard: bool| -> bool {
-                if msall { return true; }
-                match &ms_types {
-                    Some(v) => v.contains(&t) || (wildcard && v.contains(&0)),
-                    None => false,
-                }
-            };
-            // plans/40: MS128=ffn — 병렬 attention 그룹 외 FFN만 BN=128 (가중 1회 판독).
-            // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
-            let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
-            let ms128ffn = ms128mode == "split" || ms128mode == "ffn" && wkey.contains("ffn");
-            let gy_on2 = std::env::var("LLM170_VK_GY2").map(|v| v == "1").unwrap_or(false);  // plans/40: 옵트인 (기본 꺼짐)
-            // plans/43: gy 활성 판정을 arm 선택 전에 확정 (종전 조건 반전 버그:
-            // GY=0이어도 tile_ms4gy가 선택되고 tb 루프가 잘못된 그리드로 디스패치됨)
-            let gy_on = std::env::var("LLM170_VK_GY").map(|v| v != "0").unwrap_or(true);
-            // plans/43: 전 타입 BN=128 (가중 판독 절반) — 옵트인
-            // plans/43: 전 타입 BN=128 — t>=128에서만 (t<128은 128폭 낭비).
-            // 기본 활성, LLM170_TILE_BN128=0 킬스위치.
-            let bn128_on = t >= 128
-                && std::env::var("LLM170_TILE_BN128").map(|v| v != "0").unwrap_or(true);
+            // tile_msALL (plans/40): 전 타입 ms 골격 — 기본 경로 승격(verify 22/3, pp64
+            // 140→177). plans/79 B2: MSALL/MS_TYPES 바이섹트·MS128 모드(1/ffn/split)·
+            // GY/GY2 옵트는 종결 실험 게이트로 폐기 — 기본 디스패치 확정.
+            let bn128_on = t >= 128;
             let ms_spv: Option<(&str, &[u8], u32)> = match ty {
-                13 if ms_on(13, false) => {
+                13 => {
                     if bn128_on {
                         Some(("tile_ms128", TILE_MS128_SPV, 10))
-                    } else if gy_on {
-                        Some(("tile_ms4gy", TILE_MS4GY_SPV, 10))
-                    } else if ms128mode == "1" || ms128ffn {
-                        Some(("tile_ms128", TILE_MS128_SPV, 10))
                     } else {
-                        Some(("tile_ms4", TILE_MS4_SPV, 10))
+                        Some(("tile_ms4gy", TILE_MS4GY_SPV, 10))
                     }
                 }
-                12 if ms_on(12, false) && bn128_on => Some(("tile_q4k128", TILE_Q4K128_SPV, 10)),
-                14 if ms_on(14, false) && bn128_on => Some(("tile_q6k128", TILE_Q6K128_SPV, 10)),
-                11 if ms_on(11, false) && bn128_on => Some(("tile_q3k128", TILE_Q3K128_SPV, 10)),
-                8 if ms_on(8, false) && bn128_on => Some(("tile_q8128", TILE_Q8128_SPV, 10)),
-                20 if ms_on(20, false) && bn128_on => Some(("tile_nl128", TILE_NL128_SPV, 11)),
-                _ if ms_on(0, true) && ty != 21 && bn128_on => Some(("tile_xs128", TILE_XS128_SPV, 11)),
-                12 if ms_on(12, false) && gy_on2 => Some(("tile_q4kmgy", TILE_Q4KMGY_SPV, 10)),
-                14 if ms_on(14, false) && gy_on2 => Some(("tile_q6kmgy", TILE_Q6KMGY_SPV, 10)),
-                11 if ms_on(11, false) && gy_on2 => Some(("tile_q3kmgy", TILE_Q3KMGY_SPV, 10)),
-                8 if ms_on(8, false) && gy_on2 => Some(("tile_q8mgy", TILE_Q8MGY_SPV, 10)),
-                20 if ms_on(20, false) && gy_on2 => Some(("tile_nlmgy", TILE_NLMGY_SPV, 11)),
-                _ if ms_on(0, true) && ty != 21 && gy_on2 => Some(("tile_xsmgy", TILE_XSMGY_SPV, 11)),
-                12 if ms_on(12, false) => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
-                14 if ms_on(14, false) => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
-                11 if ms_on(11, false) => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
-                8 if ms_on(8, false) => Some(("tile_q8ms", TILE_Q8MS_SPV, 10)),
-                20 if ms_on(20, false) => Some(("tile_nlms", TILE_NLMS_SPV, 11)),
-                _ if ms_on(0, true) && ty != 21 => Some(("tile_xsms", TILE_XSMS_SPV, 11)),
+                12 if bn128_on => Some(("tile_q4k128", TILE_Q4K128_SPV, 10)),
+                14 if bn128_on => Some(("tile_q6k128", TILE_Q6K128_SPV, 10)),
+                11 if bn128_on => Some(("tile_q3k128", TILE_Q3K128_SPV, 10)),
+                8 if bn128_on => Some(("tile_q8128", TILE_Q8128_SPV, 10)),
+                20 if bn128_on => Some(("tile_nl128", TILE_NL128_SPV, 11)),
+                _ if ty != 21 && bn128_on => Some(("tile_xs128", TILE_XS128_SPV, 11)),
+                12 => Some(("tile_q4kms", TILE_Q4KMS_SPV, 10)),
+                14 => Some(("tile_q6kms", TILE_Q6KMS_SPV, 10)),
+                11 => Some(("tile_q3kms", TILE_Q3KMS_SPV, 10)),
+                8 => Some(("tile_q8ms", TILE_Q8MS_SPV, 10)),
+                20 => Some(("tile_nlms", TILE_NLMS_SPV, 11)),
+                _ if ty != 21 => Some(("tile_xsms", TILE_XSMS_SPV, 11)),
                 _ => None,
             };
             if let Some((nm, spv, nkb)) = ms_spv {
                 if nkb == 11 {
                     binds.push(self.ktab.buf);   // xs/nl LUT (구경로와 동일)
                 }
-                let step: usize = if bn128_on || ((ms128mode != "0" && (ms128mode == "1" || ms128mode == "ffn" && wkey.contains("ffn"))) && ty == 13) { 128 } else { 64 };
+                let step: usize = if bn128_on { 128 } else { 64 };
                 let gx_ms = (no as u32).div_ceil(64);
-                // plans/40: ms128 반그리드 분할 — 팻커널 CU 독점 완화 (인터리브 회복).
-                // MS128=split: 절반씩 2회. GPU합 -120ms/청크는 유지하며 큐 혼합 허용.
-                let split = ms128mode == "split" && ty == 13;
-                let (gy_nm, gy_spv, gy_nkb): (&str, &[u8], u32) = match ty {
-                    13 => ("tile_ms4gy", TILE_MS4GY_SPV, 10),
-                    12 => ("tile_q4kmgy", TILE_Q4KMGY_SPV, 10),
-                    14 => ("tile_q6kmgy", TILE_Q6KMGY_SPV, 10),
-                    11 => ("tile_q3kmgy", TILE_Q3KMGY_SPV, 10),
-                    8 => ("tile_q8mgy", TILE_Q8MGY_SPV, 10),
-                    20 => ("tile_nlmgy", TILE_NLMGY_SPV, 11),
-                    _ => ("tile_xsmgy", TILE_XSMGY_SPV, 11),
-                };
-                let _ms256_on = ty == 13 && std::env::var("LLM170_TILE_MS256").map(|v| v == "1").unwrap_or(false);
-                let use_gy = ((ty == 13 && gy_on) || (ty != 13 && ty != 21 && gy_on2)) && !bn128_on;
+                // plans/40 gy: q5_K t<128은 토큰 슬래브를 gy로 병렬 (tile_ms4gy).
+                let use_gy = ty == 13 && !bn128_on;
                 if use_gy {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용.
                     // plans/42: GYGRP=n이면 n토큰 그룹으로 분할 디스패치 (예: 128 → gy=2,
@@ -433,7 +366,7 @@ impl DecoderState {
                         let gy = (gt as u32).div_ceil(64);
                         let last = g0 + grp >= t && bar;
                         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, 64u32, g0 as u32]);
-                        self.run_pipe_b(gy_nm, gy_spv, gy_nkb, 20, &binds, &push,
+                        self.run_pipe_b("tile_ms4gy", TILE_MS4GY_SPV, 10, 20, &binds, &push,
                             gy, nrows, 1, last)?;
                     }
                     return Ok(());
@@ -441,48 +374,15 @@ impl DecoderState {
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
                     let last = tb + step >= t && bar;
-                    if split {
-                        let gxh = gx_ms.div_ceil(2);
-                        let mut ro = 0u32;
-                        while ro < gx_ms * 64 {
-                            let g = (gx_ms - ro / 64).min(gxh);
-                            let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, ro, tb as u32]);
-                            let fin = last && ro + g * 64 >= gx_ms * 64;
-                            self.run_pipe_b(nm, spv, nkb, 24, &binds, &push, g, 1, 1, fin)?;
-                            ro += g * 64;
-                        }
+                    // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
+                    // ms128 계열은 row_off까지 6필드 (pb=24)
+                    let ms128fam2 = nm.ends_with("128");
+                    let (push, pb) = if ms128fam2 {
+                        (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32, tb as u32]), 24)
                     } else {
-                        // plans/41 슬래브 토큰 기저 — 커널이 tok_base..tok_base+nt를 처리
-                        // ms128 계열은 row_off까지 6필드 (pb=24)
-                        let ms128fam2 = nm.ends_with("128");
-                        let (push, pb) = if ms128fam2 {
-                            (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, 0u32, tb as u32]), 24)
-                        } else {
-                            (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]), 20)
-                        };
-                        self.run_pipe_b(nm, spv, nkb, pb, &binds, &push, gx_ms, 1, 1, last)?;
-                    }
-                }
-                return Ok(());
-            }
-            // tile_ms4 (plans/40): ms2 + WG() 제거 + MMA 가드 제거 — 단일 청크 직인덱스 63.7GB/s
-            if ty == 13 && std::env::var("LLM170_TILE_MS4").map(|v| v == "1").unwrap_or(false) {
-                let gx_ms4 = (no as u32).div_ceil(64);
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
-                    let last = tb + 64 >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]);
-                    self.run_pipe_b("tile_ms4", TILE_MS4_SPV, 10, 20, &binds, &push, gx_ms4, 1, 1, last)?;
-                }
-                return Ok(());
-            }
-            // tile128w (plans/39): 256스레드 WMITER=2 → 2 WG/CU 점유
-            if ty == 13 && std::env::var("LLM170_TILE_W").map(|v| v == "1").unwrap_or(false) {
-                for tb in (0..t).step_by(128) {
-                    let nt = (t - tb).min(128) as u32;
-                    let last = tb + 128 >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b("tile128w", TILE128W_SPV, 10, 16, &binds, &push, gx, 1, 1, last)?;
+                        (Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt, tb as u32]), 20)
+                    };
+                    self.run_pipe_b(nm, spv, nkb, pb, &binds, &push, gx_ms, 1, 1, last)?;
                 }
                 return Ok(());
             }

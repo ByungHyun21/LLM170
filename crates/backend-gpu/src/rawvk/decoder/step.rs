@@ -7,7 +7,6 @@ impl DecoderState {
     /// t=1 단일 스텝 본체 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     /// 로짓은 b_lg에만 남는다 (전사는 step() 래퍼).
     pub(super) fn step_core(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<(), String> {
-        let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), n);
@@ -18,7 +17,7 @@ impl DecoderState {
         let v_len = self.v_len;
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
         let vk_t0 = std::time::Instant::now();
-        if !noba { self.ctx.begin_batch()?; };
+        self.ctx.begin_batch()?;
         let _tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
@@ -238,7 +237,7 @@ impl DecoderState {
         // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).
         let tw_head1 = std::time::Instant::now();
         self.gemv_w(self.b_xn.buf, self.b_xq_n.buf, "output.weight", self.b_lg.buf, 1, n)?;
-        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        self.ctx.end_batch_wait()?;
         self.ctx.ts_report();
         if std::env::var_os("LLM170_DBG_WALL").is_some() {
             eprintln!("[step] head+wait={:.2}ms step총={:.2}ms",
@@ -303,7 +302,6 @@ impl DecoderState {
     /// 아니면 마지막 행만 (b_lg). emb는 [t][n_embd].
     pub fn step_batch(&mut self, seq: usize, pos0: usize, emb: &[f32], all_logits: bool) -> Result<Vec<f32>, String> {
         let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
-        let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
         let _vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
         let t = emb.len() / n;
@@ -324,7 +322,7 @@ impl DecoderState {
             let s0: f64 = x.iter().map(|&v| v as f64).sum();
             eprintln!("#  SB upload t={t} xs0={s0:.4}");
         }
-        if !noba { self.ctx.begin_batch()?; };
+        self.ctx.begin_batch()?;
         let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
@@ -584,7 +582,7 @@ impl DecoderState {
             self.dbg_drain_ms = 0.0;
             eprintln!("#  rec t={t} span={:.1}ms drain={:.1}ms", tw_rec.elapsed().as_secs_f64() * 1e3, d);
         }
-        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        self.ctx.end_batch_wait()?;
         self.ctx.ts_report();
         if all_logits {
             let mut out = vec![0f32; t * self.n_vocab];
@@ -618,9 +616,9 @@ impl DecoderState {
                 self.b_xn.ptr.add((t - 1) * n * 4) as *const f32,
                 self.m_e.ptr as *mut f32, n);
         }
-        if !noba { self.ctx.begin_batch()?; };
+        self.ctx.begin_batch()?;
         self.gemv_w(self.m_e.buf, self.m_xq.buf, "output.weight", self.b_lg.buf, 1, n)?;
-        if !noba { self.ctx.end_batch_wait()?; } else { self.ctx.flush2()?; };
+        self.ctx.end_batch_wait()?;
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
         Ok(logits)
