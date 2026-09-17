@@ -61,11 +61,11 @@ the model's required `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`.
 tg here is single-stream over the HTTP server (llama-bench cannot load this
 split model): 208-token prompt, 128 generated, same client for both.
 
-| backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
-|---|---|---|---|---|---|
-| LLM170 hip | **221.4**-252.3 | **268.9**-274.9 | **239.5**-246.1 | 18.42-18.56 | 18.37 |
-| LLM170 vulkan | — | 271 | 240 | 17.1 | 16.7 |
-| llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **20.23** | 17.79 (@4k) |
+| backend | pp512 | pp4096 | pp16384 | tg128 single |
+|---|---|---|---|---|
+| LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 |
+| LLM170 vulkan | — | 271 | 240 | 17.1 |
+| llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
 
 np4 prefill aggregate (same convention as the 27B table above).
 
