@@ -9,6 +9,10 @@
 //! (값 경로 ~600회). 나머지는 HIP_LAUNCH_BLOCKING 런치 (~350회).
 
 use super::layers::SeqState4;
+
+mod diag;
+pub use diag::stage_skipped;
+use diag::{dbg, ftime_on, ftime_report, frame_ck, sync_mark};
 use super::stages::{self, Ctx};
 use super::{Hparams4, Model4, Q4Error};
 use crate::matmul::{Accelerator, FrameOp, FrameState};
@@ -393,116 +397,7 @@ fn fs_begin(acc: &dyn Accelerator, t: usize) {
     fs.frame_begin(t);
 }
 
-// 스테이지 동기 마커 (LLM170_FRAME_SYNC=1) — 스티키 폴트의 발생 지점을
-// 즉시 드러낸다(폴트는 다음 API 호출에서야 보고된다).
-thread_local! {
-    /// 스테이지 누적 시간 — (마지막 경계 시각, [(접미사, us, 호출수)]).
-    static FT: std::cell::RefCell<(std::time::Instant, Vec<(String, u64, u64)>)> =
-        std::cell::RefCell::new((std::time::Instant::now(), Vec::new()));
-}
 
-/// 프레임 스테이지 시간 계측 (LLM170_FRAME_TIME=1). sync_mark가 만드는 경계
-/// 에서만 측정한다 — 프레임 op는 비동기라 호출 시간만으로는 GPU 시간이 안 나온다.
-fn ftime_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLM170_FRAME_TIME").is_some())
-}
-
-/// 진단용 스테이지 스킵(LLM170_STAGE_SKIP="qsa,gdn,moe") — 비용 분해 전용.
-pub fn stage_skipped(name: &str) -> bool {
-    std::env::var("LLM170_STAGE_SKIP")
-        .map(|v| v.split(',').any(|x| x.trim() == name))
-        .unwrap_or(false)
-}
-
-/// 진단용 프레임 체크섬 — `LLM170_NP_CHECKSUM=1`. np·단일·배치 경로 공용.
-/// 버퍼 앞 t·n개를 전부 읽어 합과 행 표본(첫·중간·마지막 행의 첫 원소)을
-/// 보고한다. 청크 크기가 다른 두 실행에서 "같은 층·같은 단계·같은 토큰 수"를
-/// 맞대어 첫 발산 지점을 찾는 용도 — 합만으로는 상쇄로 가려질 수 있어 행
-/// 표본을 함께 낸다. 기본 꺼짐(1회 판독).
-fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &str) {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_CHECKSUM").is_some());
-    if !*ON {
-        return;
-    }
-    let mut v = vec![0.0f32; n * t];
-    if acc.frame_read(h, &mut v).is_ok() {
-        let s: f64 = v.iter().map(|&x| x as f64).sum();
-        let mid = v[(t / 2) * n];
-        let last = v[(t - 1) * n];
-        eprintln!(
-            "[npck] {tag} t={t} sum={s:.6} v0={:.6} mid0={mid:.6} last0={last:.6}",
-            v[0]
-        );
-    }
-}
-
-fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
-    match (ftime_on(), std::env::var_os("LLM170_FRAME_SYNC").is_some()) {
-        (false, false) => return Ok(()),
-        (ft, sync) => {
-            // 1원소 판독 = 동기 + 폴트 보고 (barrier는 오류를 삼킨다).
-            let mut v = [0.0f32; 1];
-            acc.frame_read(h, &mut v)
-                .map_err(|e| Q4Error::Io(format!("fsync {tag}: {e}")))?;
-            if ft {
-                FT.with(|s| {
-                    let mut s = s.borrow_mut();
-                    let dt = s.0.elapsed().as_micros() as u64;
-                    s.0 = std::time::Instant::now();
-                    let key = tag.rsplit('.').next().unwrap_or(tag).to_string();
-                    match s.1.iter_mut().find(|e| e.0 == key) {
-                        Some(e) => {
-                            e.1 += dt;
-                            e.2 += 1;
-                        }
-                        None => s.1.push((key, dt, 1)),
-                    }
-                });
-            }
-            if sync {
-                eprintln!("# fsync {tag}");
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 청크/스텝 단위 리포트 — 누적이 있으면 한 줄 출력 후 초기화.
-/// (디코드 t=1도 찍는다: 프리필과 달리 동기 지점이 많아 누적-지연 왜곡이 없다.)
-fn ftime_report(_t: usize) {
-    if !ftime_on() {
-        return;
-    }
-    FT.with(|s| {
-        let mut s = s.borrow_mut();
-        if !s.1.is_empty() {
-            s.1.sort_by_key(|b| std::cmp::Reverse(b.1));
-            let mut line = String::from("# frame-time(t) ");
-            for (k, us, n) in s.1.iter() {
-                line.push_str(&format!("{k}={:.1}ms×{n} ", *us as f64 / 1e3));
-            }
-            eprintln!("{line}");
-            s.1.clear();
-        }
-        s.0 = std::time::Instant::now();
-    });
-}
-
-/// 단계 덤프 (LLM170_Q4_DBG=1) — 값 경로와 같은 양을 찍어 대조한다.
-fn dbg(tag: &str, acc: &dyn Accelerator, h: u64, n: usize) {
-    if std::env::var_os("LLM170_Q4_DBG").is_none() {
-        return;
-    }
-    let mut v = vec![0.0f32; n];
-    if acc.frame_read(h, &mut v).is_err() {
-        return;
-    }
-    let s: f64 = v.iter().map(|&x| x as f64).sum();
-    let mx = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    eprintln!("# fdbg {tag}: sum={s:.6} max={mx:.6} v0..3={:?}", &v[..3.min(n)]);
-}
 
 /// 프레임 forward — t토큰 (t=1 디코드도 이 경로; decode_frame이 래퍼).
 /// 포워드 종료 방식 — 비동기 프리필은 head 커널까지만 발행하고 리드백을 미룬다.
