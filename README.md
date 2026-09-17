@@ -36,12 +36,14 @@ Matched scorecard, 2026-09-17, same host and session.
 | llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
 
 np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
+Protocol: 4 concurrent prefill-only requests (`n_predict=1`), per-slot disjoint
+prompts (no prefix-cache reuse), `LLM170_SLOTS=4` / `-np 4`, same host/session.
 
-| backend | np4 pp aggregate |
-|---|---|
-| LLM170 hip | **374** |
-| LLM170 vulkan | — |
-| llama.cpp (ROCm 10) | — |
+| backend | 512-token prompts | 2048-token prompts |
+|---|---|---|
+| LLM170 hip | **123.5** | **320.9** |
+| LLM170 vulkan | 33.5 | 197.9 |
+| llama.cpp (ROCm 10) | 188.5 | 226.5 |
 
 Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 (`LLM170_SLOTS=4` / `llama-server -np 4` are required for the np4 rows).
@@ -67,13 +69,13 @@ split model): 208-token prompt, 128 generated, same client for both.
 | LLM170 vulkan | 252.3 | 268.7 | — | 18.02 |
 | llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
 
-np4 prefill aggregate (same convention as the 27B table above).
+np4 prefill aggregate (same convention and protocol as the 27B table above).
 
-| backend | np4 pp aggregate |
-|---|---|
-| LLM170 hip | — |
-| LLM170 vulkan | — |
-| llama.cpp (ROCm 10) | — |
+| backend | 512-token prompts | 2048-token prompts |
+|---|---|---|
+| LLM170 hip | **38.4** | **248.4** |
+| LLM170 vulkan | 41.7 | 247.7 |
+| llama.cpp (ROCm 10) | 19.5 | 51.5 |
 
 Decode modes: aggregate t/s over 4 parallel slots; the model has no nextn/MTP
 head, so the MTP rows are structurally inapplicable.
