@@ -58,6 +58,8 @@ Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 
 Matched scorecard, 2026-09-17; llama ran the `qwen4exp build-ab` build with
 the model's required `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`.
+tg here is single-stream over the HTTP server (llama-bench cannot load this
+split model): 208-token prompt, 128 generated, same client for both.
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
@@ -79,9 +81,9 @@ head, so the MTP rows are structurally inapplicable.
 | mode | tg agg | tg agg | tg agg |
 |---|---|---|---|
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
-| tg single | **18.56** (ctx 4k) / **18.35** (ctx 16k) | 17.1 | **20.23** / 17.79 |
+| tg single | **16.84** | 17.1 | **18.06** |
 | MTP single | — | — | — |
-| np4 aggregate | **35.70** | — | **41.13** |
+| np4 aggregate | **35.70** | — | **41.13**-41.65 |
 | MTP + np4 | — | — | — |
 
 ### Vision (mmproj), 27B — 2026-09-17
