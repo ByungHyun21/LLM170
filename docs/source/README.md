@@ -7,7 +7,7 @@ measurement evidence. Split from `docs/benchmarks.md` when that file grew past
 ## Conventions
 
 - Paths mirror the source tree exactly:
-  `crates/backend-gpu/src/rawhip/q4acc.rs` → `backend-gpu/rawhip/q4acc.md`
+  `crates/backend-gpu/src/rawhip/q4acc/value.rs` → `backend-gpu/rawhip/q4acc/value.md`
 - Each document states the source file path at the top.
 - **Numbers and tables are preserved verbatim** when moved. No new summaries
   or interpretations.
@@ -35,7 +35,7 @@ before this date were measured on 7.2.2 unless noted.
 
 | Document | Source | Contents |
 |---|---|---|
-| `backend-gpu/rawhip/q4acc.md` | q4acc.rs | QSA attention (split, 6-head), MoE grouping, Q4_K MMQ tiles, f16 dequant, prefill GEMM |
+| `backend-gpu/rawhip/q4acc/*.md` | q4acc/ (mod/value/moe/qsa) | QSA attention (split, 6-head), MoE grouping, Q4_K MMQ tiles, f16 dequant, prefill GEMM, staging/upload RCA |
 | `backend-gpu/rawhip/mod.md` | mod.rs | KTRACE event pairing, launch-order dump, instrumentation notes |
 | `backend-gpu/rawhip/decode.md` | decode.rs | 27B decode/prefill decomposition, GDN |
 | `core/qwen4exp/stages/qsa.md` | stages/qsa.rs | Stage timers, cost breakdown |
