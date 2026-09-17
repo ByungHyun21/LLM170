@@ -692,10 +692,26 @@ Notes:
 3. Host overhead is not the problem: with `LLM170_NOLAUNCH=1` a whole np step
    costs 3.0 ms of host time; KTRACE `GAPS` is 4-9 ms.
 
-### MTP (27B, `--spec 3`)
+### MTP (27B) — carried-cap defect fixed 2026-09-17
 
-Acceptance is 1-3 drafts/cycle on the gate prompt (verify accepts the matching
-prefix, `gpu-verify ... am=[...] acc_n=N`), i.e. the batched verify works; the
-spec/non-spec stream divergence at token 4 (16 -> 23) is the documented
-ADR-0012 near-tie class (reproduced on the pre-session kernel) and is not a
-regression. MTP speed is bounded by the same t=4 verify cost as np4.
+`--spec k` was *slower* than plain greedy (8.02 vs 11.6 t/s at k=3) and had been
+attributed to machine state. The real cause is a design defect, found by
+correlating `gpu-verify` cycle dumps with `LLM170_SPEC_TIMING`:
+
+- The single-sequence verify batch is `[carried..., last, drafts...]`, where
+  `carried` holds rows whose GDN state is still uncommitted (a partial
+  acceptance restores the snapshot and re-runs them in the *next* batch).
+- `carried` therefore grows by the kept prefix on every partial acceptance.
+  With the old cap of 16 the batch grew to 17 rows, so each cycle re-executed
+  O(carried) rows to emit 1-2 tokens: per-cycle `[sp] step total` 212-311 ms.
+
+Fix: cap `carried` at `1 + k + 4` (env-tunable `LLM170_SPEC_CAPX`). Sweep at
+k=2 (repeat-verified at tg128): capx 0 = 6.7, 2 = 11.2, **4 = 15.4**, 8 = 13.15
+t/s — committing too eagerly costs a full extra forward, so 4 is the balance
+point. Result: **spec2 = 15.4 t/s vs plain 11.6 (+33%)**, and the spec stream is
+now token-identical to greedy on the gate prompt (k=2). k=3 remains below plain
+(9.25) because the draft chain plus a 4-row verify does not pay for the extra
+draft at this acceptance rate.
+
+MTP speed is otherwise bounded by the same batched (t>=4) verify cost as np4:
+`[vv] raw_verify` is 126-182 ms for a 4-row batch vs 86 ms for a t=1 step.
