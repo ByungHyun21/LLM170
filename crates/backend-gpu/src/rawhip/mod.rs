@@ -16,8 +16,9 @@ pub mod q4acc;
 pub mod vit;
 
 /// 로드된 오프라인 타일 코드오브젝트 패밀리 (임베딩 or LLM170_CO*_PATH
-/// 오버라이드). RawCtx::new 완료 후 불변. 타일 발사 게이트는 env가 아니라
-/// 이 비트를 본다 — 무환경 기본 성능 = 튜닝 성능.
+/// 오버라이드). RawCtx.co_fam 필드 — RawCtx::new 완료 후 불변(plans/78 R4:
+/// 전역 static → 인스턴스 필드, 인스턴스별 로딩 반영). 타일 발사 게이트는
+/// env가 아니라 이 비트를 본다 — 무환경 기본 성능 = 튜닝 성능.
 pub const CO_J128: u8 = 1; // w32b.co: *_j128 계열 (t≤128)
 pub const CO_V4: u8 = 2; // v4all.co: *_v4 + *_wm 4종
 pub const CO_ODD: u8 = 4; // odd_all.co: nl/q3k/iq3s v4 (plans/04)
@@ -26,11 +27,6 @@ pub const CO_MMQ2: u8 = 16; // mmq2.co: gemm_f16_v4 (deq-f16 경로)
 pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
 pub const CO_MMQ8: u8 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/71)
 pub const CO_QY: u8 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
-static CO_FAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-pub fn co_loaded(bit: u8) -> bool {
-    CO_FAM.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
-}
 
 
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {

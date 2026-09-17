@@ -15,7 +15,7 @@
 
 use cubecl_hip_sys as hip;
 use super::RawCtx;
-use super::{co_loaded, CO_MMQ, CO_MMQ2, CO_MMQ3, probes};
+use super::{CO_MMQ, CO_MMQ2, CO_MMQ3, probes};
 use llm170_core::matmul::Weight;
 
 /// 디코드 상주 상태 — 스텝마다 재사용, 해제 없음.
@@ -445,7 +445,12 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     }
 
     fn tile_big_chunk(&self) -> bool {
-        super::co_loaded(super::CO_J128)
+        // 미초기화면 알 수 없다 — 원래 전역 비트 기준으로 초기화 후에만 호출된다.
+        self.st
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|ds| ds.ctx.co_loaded(super::CO_J128)))
+            .unwrap_or(false)
     }
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
@@ -620,11 +625,11 @@ impl DecodeState {
             if (((only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
                 || ((ty == 8 && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none())))
                 && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
-                && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
+                && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                         return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
             // q6_K: dequant→f16 v4 타일 (llama dequant+MFMA 경로 대응, 부록42)
-            if ty == 14 && t >= 32 && super::co_loaded(super::CO_MMQ2)
+            if ty == 14 && t >= 32 && self.ctx.co_loaded(super::CO_MMQ2)
                 && std::env::var_os("LLM170_DEQ16").is_some() {
                 return self.ctx.gemm_f16_q6(y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
@@ -679,11 +684,11 @@ impl DecodeState {
         }
         // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
         let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
-            && super::co_loaded(super::CO_ODD) && t >= 32
+            && self.ctx.co_loaded(super::CO_ODD) && t >= 32
             && matches!(ty, 20 | 11 | 21);
         // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
         let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && std::env::var_os("LLM170_EXACT").is_none()
-            && super::co_loaded(super::CO_J128);
+            && self.ctx.co_loaded(super::CO_J128);
         if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
@@ -695,7 +700,7 @@ impl DecodeState {
     /// mm_b_s의 MMQ판 — side stream에서 quant+mul_mat_q (부록48).
     fn mm_b2_s(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         if matches!(ty, 12 | 13 | 23) && t >= 32 && std::env::var_os("LLM170_NO_MMQ").is_none() && std::env::var_os("LLM170_NO_MMQ_S").is_none()
-            && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
+            && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
             return self.ctx.gemm_mmq_s(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
         }
         self.mm_b_s(xq, xq_w, wp, ty, n_in, n_out, out, t)

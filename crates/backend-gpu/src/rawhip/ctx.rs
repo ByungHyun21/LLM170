@@ -4,15 +4,16 @@
 use crate::rawhip::ck;
 use crate::rawhip::{GRAPH_SKIP, KTRACE, KtraceEv};
 use crate::rawhip::nolaunch_on;
-use crate::rawhip::co_loaded;
 use crate::rawhip::kernels;
-use crate::rawhip::{CO_FAM, CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
+use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
 use std::ffi::CString;
 
 pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
+    /// 로드된 코드오브젝트 패밀리 비트(CO_* 상수) — new() 완료 후 불변 (plans/78 R4).
+    pub(crate) co_fam: std::sync::atomic::AtomicU8,
     pub(crate) stream: hip::hipStream_t,
     pub(crate) stream2: hip::hipStream_t,
     /// 프리필 전용 스트림 페어 — 프레임 경로(launch3s + join2/side_wait_main)를
@@ -70,6 +71,11 @@ struct TileLaunch {
 
 
 impl RawCtx {
+    /// 코드오브젝트 패밀리 로드 비트 질의 (plans/78 R4 — 전역 static 승계).
+    pub fn co_loaded(&self, bit: u8) -> bool {
+        self.co_fam.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+    }
+
     pub fn new() -> Result<Self, String> {
         unsafe {
             ck(hip::hipSetDevice(0), "hipSetDevice")?;
@@ -134,6 +140,7 @@ impl RawCtx {
             // 기본: 바이너리 임베딩(crates/.../co/*.co, gfx1151 빌드).
             // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
             // LLM170_NO_CO: 전부 생략 (hipRTC wm/mm + GEMV 폴백 측정용).
+            let mut fam_bits = 0u8;
             if std::env::var_os("LLM170_NO_CO").is_none() {
                 let slots: &[(u8, &str, &[u8], &[&str])] = &[
                     (
@@ -214,7 +221,7 @@ impl RawCtx {
                             loaded |= bit;
                         }
                     }
-                    CO_FAM.fetch_or(loaded, std::sync::atomic::Ordering::Relaxed);
+                    fam_bits |= loaded;
                 }
             }
 
@@ -226,7 +233,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream3), "StreamCreate3")?;
             let mut stream4: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream4), "StreamCreate4")?;
-            Ok(RawCtx { fns, stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            Ok(RawCtx { fns, co_fam: std::sync::atomic::AtomicU8::new(fam_bits), stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             allocs: std::sync::Mutex::new(Vec::new()),
@@ -1136,14 +1143,14 @@ impl RawCtx {
 
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
-            && co_loaded(CO_J128) && t > 64;
+            && self.co_loaded(CO_J128) && t > 64;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
 
     /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
     fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = std::env::var_os("LLM170_EXACT").is_none()
-            && co_loaded(CO_J128);
+            && self.co_loaded(CO_J128);
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
 
@@ -1152,7 +1159,7 @@ impl RawCtx {
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
         }
-        let (v4, odd) = (co_loaded(CO_V4), co_loaded(CO_ODD));
+        let (v4, odd) = (self.co_loaded(CO_V4), self.co_loaded(CO_ODD));
         let kern: &'static str = match ty {
             13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },

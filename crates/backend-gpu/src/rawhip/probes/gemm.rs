@@ -1125,7 +1125,7 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.h2d(xq, bytemuck::cast_slice(&xq_h))?;
     let out = ctx.alloc(n_out * 4 * t)?;
     // wm 상한 64 + bench GEMV 그리드 부적합: 128-커널 계열 미로드면 에러
-    let (v4, j128f, odd) = (co_loaded(CO_V4), co_loaded(CO_J128), co_loaded(CO_ODD));
+    let (v4, j128f, odd) = (ctx.co_loaded(CO_V4), ctx.co_loaded(CO_J128), ctx.co_loaded(CO_ODD));
     let big_ok = match w.ty {
         llm170_gguf::GgmlType::Q5K | llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Iq4Xs
             => v4 || j128f,
