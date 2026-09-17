@@ -51,7 +51,7 @@ Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
 | tg single | 11.5-11.6 (4k) / 11.6 (16k) | 9.2 | 11.67 / 11.21 |
 | MTP single | **15.4** (k=2) / 9.3 (k=3) | 9.2 (no MTP) | ~12 (MTP, old build) |
-| np4 aggregate | **20.85** | — | **26.04** |
+| np4 aggregate | **26.67** | — | **25.22** |
 | MTP + np4 | **20.4** | — | 15.5 *(old build)* |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
@@ -81,7 +81,7 @@ head, so the MTP rows are structurally inapplicable.
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
 | tg single | **18.56** (ctx 4k) / **18.35** (ctx 16k) | 17.1 | **20.23** / 17.79 |
 | MTP single | — | — | — |
-| np4 aggregate | **24.94** | — | **41.07** |
+| np4 aggregate | **35.70** | — | **41.13** |
 | MTP + np4 | — | — | — |
 
 ### Vision (mmproj), 27B — 2026-09-17
