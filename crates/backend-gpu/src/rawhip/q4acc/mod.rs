@@ -500,9 +500,8 @@ fn fnv_hash(data: &[f32]) -> u64 {
 /// 프레임 op 인자 벡터 — 로컬 변수의 주소를 c_void로.
 macro_rules! cargs {
     ($($e:expr),+ $(,)?) => {{
-        let mut v: Vec<*mut std::ffi::c_void> = Vec::new();
-        $( v.push($e as *mut _ as *mut std::ffi::c_void); )+
-        v
+        // plans/78 R8: vec! 전개 — push 방식은 clippy vec_init_then_push 지점.
+        vec![$($e as *mut _ as *mut std::ffi::c_void),+]
     }};
 }
 

@@ -223,7 +223,7 @@ use ash::vk;
         let ishsb = ctx.alloc_host(640 * 256 * 4)?;
         let _faccsb = ctx.alloc_host(640 * 256 * 4)?;
         // 센티넬 프리필 — 커널이 실제 쓴 영역 검증
-        unsafe { std::ptr::write_bytes(ishsb.ptr as *mut u8, 0xAB, 640 * 256 * 4); }
+        unsafe { std::ptr::write_bytes(ishsb.ptr, 0xAB, 640 * 256 * 4); }
         let (dsl, pl, dp, _ds, pipe) = ctx.pipeline(
             include_bytes!("spv/gemm_i8.spv"), 16, 16,
         )?;

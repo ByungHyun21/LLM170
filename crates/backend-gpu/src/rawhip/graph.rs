@@ -4,6 +4,8 @@
 use crate::rawhip::hip;
 use crate::rawhip::ck;
 
+/// # Safety
+/// 호출부는 단일 스텝 스레드에서만 호출한다(그래프 캡처 경계 규약, mod.rs 참조).
 pub unsafe fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), String> {
     let dbg = std::env::var_os("LLM170_GRAPH_DEBUG").is_some();
     let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
@@ -61,6 +63,8 @@ pub fn graph_abort() {
     GRAPH_SKIP.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// # Safety
+/// 재생 스위치 — 캡처 완료 후 단일 스텝 스레드에서만 호출한다.
 pub unsafe fn graph_replay(on: bool) -> Result<(), String> {
     if on {
         let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
@@ -72,6 +76,8 @@ pub unsafe fn graph_replay(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// # Safety
+/// 캡처 세션 진행 중(하나라도 capture_mark 후)에만 호출 가능 — 스트림 상태 규약.
 pub unsafe fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
     let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
     let GraphMode::Capture { segs, open } = &mut *g else {
@@ -99,6 +105,8 @@ pub unsafe fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> 
     Ok(())
 }
 
+/// # Safety
+/// 캡처 세션 시작 — 단일 스텝 스레드에서만 호출한다(재생과 교차 금지).
 pub unsafe fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
     *GRAPH.lock().map_err(|e| e.to_string())? =
         GraphMode::Capture { segs: Vec::new(), open: false };

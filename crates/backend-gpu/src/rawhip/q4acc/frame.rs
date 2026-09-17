@@ -652,7 +652,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 let mut g = self.gxp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * xq_w * 4)?
             };
-            self.rows_permute_dev(xq as *mut u8, perm_pad_d as *mut u8, xgp, xq_w, rows_pad)?;
+            self.rows_permute_dev(xq, perm_pad_d as *mut u8, xgp, xq_w, rows_pad)?;
             let ygp = {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * n_out * 4)?

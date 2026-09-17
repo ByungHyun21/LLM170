@@ -87,7 +87,7 @@ impl Q4Acc {
             g.ensure(&self.ctx, n * 4)?
         };
         self.ctx.h2d(pd, bytemuck::cast_slice(perm))?;
-        self.rows_permute_dev(src, pd as *mut u8, dst, row_u32, n)
+        self.rows_permute_dev(src, pd, dst, row_u32, n)
     }
 
     /// 디바이스 순열판 — 순열이 이미 GPU에 있으면 h2d/동기 없이 런치만 한다.

@@ -26,7 +26,7 @@ use llm170_profiler::profile_span;
         ctx: &Ctx,
         seq: &mut SeqState4,
         il: usize,
-        res_hc: &mut Vec<Vec<f32>>,
+        res_hc: &mut [Vec<f32>],
         rows: &[u32],
         prefetched: Option<Vec<Vec<f32>>>,
     ) -> Result<(), Q4Error> {

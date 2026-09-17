@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::usage_err;
+use std::path::Path;
 
 pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut prompts: Vec<Vec<u32>> = Vec::new();
@@ -291,7 +292,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
 
 /// qwen4exp 추론 — Engine4 (시퀀스별 prefill/decode1).
 fn run_q4_infer(
-    model_path: &PathBuf,
+    model_path: &Path,
     prompts: &[Vec<u32>],
     n_predict: usize,
     ctx: usize,

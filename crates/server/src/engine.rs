@@ -68,8 +68,8 @@ pub struct InferResult {
 pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub enum Engine {
-    Q35(llm170_core::qwen35::Engine),
-    Q4(llm170_core::qwen4exp::layers::Engine4),
+    Q35(Box<llm170_core::qwen35::Engine>),
+    Q4(Box<llm170_core::qwen4exp::layers::Engine4>),
 }
 
 /// 슬롯 스케줄러 (04) — llama.cpp 규칙 1:1: 디코드 우선, 잔여 예산만
@@ -268,7 +268,7 @@ pub fn slot_loop(
                         // 서버 np4 spec 12.1 vs 비스펙 22.6 t/s agg).
                         let kmin = spec_slots
                             .iter()
-                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.min(8).max(1))
+                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8))
                             .min()
                             .unwrap_or(1);
                         let mut done_spec: Vec<usize> = Vec::new();
@@ -291,7 +291,7 @@ pub fn slot_loop(
                             }
                         }
                         for &i in spec_slots.iter().filter(|&i| !done_spec.contains(i)) {
-                            let k = slots[i].job.as_ref().unwrap().spec_k.min(8).max(1);
+                            let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
                             let next = slots[i].next;
                             let cap = slots[i].job.as_ref().unwrap().n_predict;
                             if let Ok((acc, _tf)) = e.spec_step(i, next, k) {
@@ -580,7 +580,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
                 }
             }
         }
-        Engine::Q4(eng)
+        Engine::Q4(Box::new(eng))
     } else {
         let m = load_q35_retry(&req.model);
         let mut eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
@@ -612,7 +612,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             }
         }
         let _ = &backend;
-        Engine::Q35(eng)
+        Engine::Q35(Box::new(eng))
     }
 }
 

@@ -440,9 +440,7 @@ impl Engine {
                         rope_head(&mut qh, pos, n_rot, hp.rope_base);
                         qrow[h * 2 * hd..h * 2 * hd + hd].copy_from_slice(&qh);
                         let gb = h * 2 * hd + hd;
-                        for i in 0..hd {
-                            qrow[gb + i] = qg[row][gb + i];
-                        }
+                        qrow[gb..(hd + gb)].copy_from_slice(&qg[row][gb..(hd + gb)]);
                     }
                     gpu_qrow = Some(qrow);
                     continue;

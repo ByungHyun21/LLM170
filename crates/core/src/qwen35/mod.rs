@@ -592,8 +592,8 @@ impl Engine {
         // 원시 HIP 디코드 (t=1 단일) — LLM170_RAWHIP=1, 최우선 게이트.
         if tokens.len() == 1
             && seq_ids.len() == 1
-            && self.raw_decode.is_some()
             && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && let Some(rd) = self.raw_decode.as_ref()
         {
             let seq = seq_ids[0];
             let token = tokens[0];
@@ -601,7 +601,6 @@ impl Engine {
             let embd = self.model.wchk("token_embd.weight")?;
             let mut row = vec![0.0f32; n];
             crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
-            let rd = self.raw_decode.as_ref().unwrap();
             let pos = self.seqs[seq].pos as usize;
             let mut h_t = Vec::new();
             let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {

@@ -728,7 +728,7 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     }
     let hist: Vec<String> = {
         let mut v: Vec<(i64, usize)> = ulp_hist.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|b| std::cmp::Reverse(b.1));
         v.iter().take(4).map(|(u, c)| format!("{c}x{u}ulp")).collect()
     };
     let ia = outs[0].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
@@ -1146,6 +1146,7 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
 
 /// vk-tile-check — 타일(coopmat f16) 커널 vs CPU 디양자화 GEMM 검증 (plans/38 A2).
 /// f16 스테이징 품질계약: maxrel 허용치 ~2e-2 (근접 아닌 구조 오류 검출 목적).
+#[allow(clippy::if_same_then_else)] // 진단 A/B: 커널(spv)은 분기마다 다르고 gx 산식만 우연히 동일
 pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
     let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
@@ -1594,7 +1595,7 @@ pub fn mmv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     unsafe { std::ptr::copy_nonoverlapping(yf.as_ptr() as *const u8, bb.ptr, n_in * t * 4) };
     ctxg.unmap(&mut bb)?;
     let db = ctxg.alloc_host(n_out * t * 4)?;
-    unsafe { std::ptr::write_bytes(db.ptr as *mut u8, 0, n_out * t * 4) };
+    unsafe { std::ptr::write_bytes(db.ptr, 0, n_out * t * 4) };
     // F0/F1 dummy
     let mut fb = ctxg.alloc_host(64)?;
     ctxg.unmap(&mut fb)?;

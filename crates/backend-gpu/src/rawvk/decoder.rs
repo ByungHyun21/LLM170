@@ -1310,7 +1310,7 @@ impl DecoderState {
             // plans/40: MS128=ffn — 병렬 attention 그룹 외 FFN만 BN=128 (가중 1회 판독).
             // 고립 +47% vs 엔진 -12% 모순의 가설: 병렬 nobar 그룹 내 고VGPR 팻커널 상호방해.
             let ms128mode = std::env::var("LLM170_TILE_MS128").unwrap_or_default();
-            let ms128ffn = (ms128mode == "ffn" || ms128mode == "split") && wkey.contains("ffn") || ms128mode == "split";
+            let ms128ffn = ms128mode == "split" || ms128mode == "ffn" && wkey.contains("ffn");
             let gy_on2 = std::env::var("LLM170_VK_GY2").map(|v| v == "1").unwrap_or(false);  // plans/40: 옵트인 (기본 꺼짐)
             // plans/43: gy 활성 판정을 arm 선택 전에 확정 (종전 조건 반전 버그:
             // GY=0이어도 tile_ms4gy가 선택되고 tb 루프가 잘못된 그리드로 디스패치됨)

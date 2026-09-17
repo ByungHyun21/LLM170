@@ -419,7 +419,7 @@ impl Q4Acc {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(64);
-                (list_len / 32).clamp(1, cap.max(1).min(512))
+                (list_len / 32).clamp(1, cap.clamp(1, 512))
             } else {
                 1
             };
@@ -441,7 +441,7 @@ impl Q4Acc {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(64);
-            let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+            let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
             let mut q_p = qdev as *mut std::ffi::c_void;
             let mut k_p = ckp as *mut std::ffi::c_void;
             let mut v_p = cvp as *mut std::ffi::c_void;
@@ -647,7 +647,7 @@ impl Q4Acc {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+        let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let (qdev, kdev, vdev, sdev, ofdev, pdev, odev) = {
             let mut a = self.qs.lock().map_err(|e| e.to_string())?;
             let qdev = a.ensure(&self.ctx, q.len().max(1) * 4)?;
@@ -767,7 +767,7 @@ impl Q4Acc {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+        let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let (kdev, vdev, sdev, ofdev, pdev) = {
             let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
                 * n_kv.max(1) * hd.max(1);
@@ -1334,7 +1334,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let n_splits: usize = (list_len / 32).clamp(1, cap.max(1).min(512));
+        let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let pdev = {
             let mut g = self.qsp.lock().map_err(|e| e.to_string())?;
             g.ensure(&self.ctx, n_head * n_splits * 32 * 10 * 4)?

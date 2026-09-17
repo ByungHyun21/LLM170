@@ -184,7 +184,7 @@ fn chunk_size_state_divergence() {
         acc.frame_write(a_in, &xin).expect("write A");
         acc.frame_write(b_in, &xin).expect("write B");
         acc.frame_begin(NTOK);
-        acc.frame_mm_group(a_in, &[wk.clone(), wz.clone(), wb.clone(), wa.clone()],
+        acc.frame_mm_group(a_in, &[wk, wz, wb, wa],
             &[a_out, az, aba, aba], NTOK).expect("mm_group 1×t");
         let mut oa = vec![0.0f32; NTOK * conv_ch];
         acc.frame_read(a_out, &mut oa).expect("read A");
@@ -198,7 +198,7 @@ fn chunk_size_state_divergence() {
             let z2 = acc.frame_slice(bz, off * n, 16 * n).expect("z band");
             let b2 = acc.frame_slice(bba, off * hp.dt_rank, 16 * hp.dt_rank).expect("b band");
             acc.frame_begin(16);
-            acc.frame_mm_group(i2, &[wk.clone(), wz.clone(), wb.clone(), wa.clone()],
+            acc.frame_mm_group(i2, &[wk, wz, wb, wa],
                 &[o2, z2, b2, b2], 16).expect("mm_group band");
         }
         let mut ob = vec![0.0f32; NTOK * conv_ch];

@@ -172,10 +172,10 @@ gmark("betag", &mut marks);
                         let nc = t.div_ceil(CH);
                         let nc_max = self.b_t_max.div_ceil(CH);
                         // ffn 버퍼 별칭 (AR은 층 내 ffn 이전 — 라이프타임 무충돌)
-                        let mut sstart = self.fgate_t as *mut u8;
-                        let mut pbuf = self.fup_t as *mut u8;
-                        let mut pgb = self.fglu_t as *mut u8;
-                        let mut lend = (self.fglu_t as *mut u8).wrapping_add(262144);
+                        let mut sstart = self.fgate_t;
+                        let mut pbuf = self.fup_t;
+                        let mut pgb = self.fglu_t;
+                        let mut lend = self.fglu_t.wrapping_add(262144);
                         let _ = nc_max;
                         let mut chi = CH as i32;
                         let mut ca: Vec<*mut std::ffi::c_void> = args.clone();
@@ -544,7 +544,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         }
         // head — 마지막 토큰만
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
-        let last = unsafe { self.xs_t.add((t - 1) * n * 4) } as *mut u8;
+        let last = unsafe { self.xs_t.add((t - 1) * n * 4) };
         {
             let mut xp = last as *mut std::ffi::c_void;
             let mut pp = self.p64 as *mut std::ffi::c_void;

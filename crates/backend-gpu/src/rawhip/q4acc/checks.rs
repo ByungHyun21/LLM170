@@ -30,7 +30,7 @@ pub fn micro_check() -> Result<String, String> {
     let w = llm170_core::matmul::Weight { data: &bytes, ty: GgmlType::Q5_1, n_in: n as u64, n_out: 1 };
     let acc = Q4Acc::new()?;
     let mut gpu = vec![vec![0.0f32; 1]];
-    acc.matmul_batch(&[x.clone()], &w, &mut gpu)?;
+    acc.matmul_batch(std::slice::from_ref(&x), &w, &mut gpu)?;
     let y = llm170_core::quant::quantize_row_q8_ref(&x);
     let cpu = llm170_core::quant::dot_row_w4a8_q5_1_lane(&bytes, n as u64, &y);
     Ok(format!(

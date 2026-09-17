@@ -478,7 +478,7 @@ fn ftime_report(_t: usize) {
     FT.with(|s| {
         let mut s = s.borrow_mut();
         if !s.1.is_empty() {
-            s.1.sort_by(|a, b| b.1.cmp(&a.1));
+            s.1.sort_by_key(|b| std::cmp::Reverse(b.1));
             let mut line = String::from("# frame-time(t) ");
             for (k, us, n) in s.1.iter() {
                 line.push_str(&format!("{k}={:.1}ms×{n} ", *us as f64 / 1e3));

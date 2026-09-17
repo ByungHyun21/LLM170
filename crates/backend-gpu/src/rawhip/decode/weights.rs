@@ -882,8 +882,8 @@ impl DecodeState {
                 && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                 // 실험(부록 74): 디코드 GEMV를 mmq 타일로 — f32 직행, 별도 quant 불요.
                 self.rms(self.xs, pw, self.xn, n)?;
-                self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
-                self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
+                self.mm_b2(self.xn, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
+                self.mm_b2(self.xn, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
             } else if env_on("LLM170_DECODE_PAIRS") {
                 self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;

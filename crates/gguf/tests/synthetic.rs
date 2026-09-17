@@ -4,9 +4,6 @@ use llm170_gguf::{GgmlType, GgufFile, Value};
 use std::io::Write;
 use std::path::PathBuf;
 
-fn push_u16(v: &mut Vec<u8>, x: u16) {
-    v.extend_from_slice(&x.to_le_bytes());
-}
 fn push_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
 }

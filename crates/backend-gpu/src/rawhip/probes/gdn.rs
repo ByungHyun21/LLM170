@@ -11,7 +11,7 @@
 pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize) -> Result<String, String> {
     use super::q4acc::Q4Acc;
     use llm170_core::matmul::{FrameHost, FrameState};
-    if per == 0 || t % per != 0 || t == per {
+    if per == 0 || !t.is_multiple_of(per) || t == per {
         return Err(format!("인자: t={t} per={per} (t % per == 0 && t != per)"));
     }
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -97,7 +97,7 @@ pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize)
 pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<String, String> {
     use super::q4acc::Q4Acc;
     use llm170_core::matmul::{FrameHost, FrameOp, FrameState};
-    if per == 0 || t % per != 0 || t == per || per < k - 1 {
+    if per == 0 || !t.is_multiple_of(per) || t == per || per < k - 1 {
         return Err(format!("인자: t={t} per={per} k={k}"));
     }
     let mut seed = 0x243f_6a88_85a3_08d3u64;

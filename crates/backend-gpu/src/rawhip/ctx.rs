@@ -1281,7 +1281,7 @@ impl RawCtx {
             if let Some(&p) = c.get(&key) { p }
             else {
                 let blocks = n_in.div_ceil(256);   // 256요소 슈퍼블록 격자(부분 허용)
-                let p = self.alloc(n_out * n_in * 2)? as *mut u8;
+                let p = self.alloc(n_out * n_in * 2)?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
                     let mut a2 = p as *mut std::ffi::c_void;
@@ -1301,7 +1301,7 @@ impl RawCtx {
         let tr = t.div_ceil(128) * 128;   // 커널의 128 단위 사분면 경계 (범위 밖 쓰기 방지)
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
         let xq_p = if xq.0 < xq_w * tr {
-            let p = self.alloc(xq_w * tr * 4)? as *mut u8;
+            let p = self.alloc(xq_w * tr * 4)?;
             *xq = (xq_w * tr, p);
             p
         } else { xq.1 };
@@ -1335,6 +1335,7 @@ impl RawCtx {
         if env_on("LLM170_DEQ_DUMP") {
             self.sync().ok();
             let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
+            #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
             let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
             let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
             eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
@@ -1364,7 +1365,7 @@ impl RawCtx {
             if let Some(&p) = c.get(&key) { p }
             else {
                 let _blocks = n_in / 256;
-                let p = self.alloc(n_out * n_in * 2)? as *mut u8;
+                let p = self.alloc(n_out * n_in * 2)?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
                     let mut a2 = p as *mut std::ffi::c_void;
@@ -1386,7 +1387,7 @@ impl RawCtx {
         let tr = t.div_ceil(128) * 128;
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
         let xq_p = if xq.0 < xq_w * tr {
-            let p = self.alloc(xq_w * tr * 4)? as *mut u8;
+            let p = self.alloc(xq_w * tr * 4)?;
             *xq = (xq_w * tr, p);
             p
         } else { xq.1 };
@@ -1420,6 +1421,7 @@ impl RawCtx {
         if env_on("LLM170_DEQ_DUMP") {
             self.sync().ok();
             let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
+            #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
             let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
             let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
             eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
@@ -1459,7 +1461,7 @@ impl RawCtx {
             if let Some(&p2) = c.get(&key) { p2 }
             else {
                 let blocks2 = n_in / 256;
-                let p2 = self.alloc(n_out * blocks2 * 210)? as *mut u8;
+                let p2 = self.alloc(n_out * blocks2 * 210)?;
                 let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
@@ -1472,6 +1474,7 @@ impl RawCtx {
                 if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
+                    #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
                     let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
                     eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
                 }
@@ -1490,7 +1493,7 @@ impl RawCtx {
             let mut sc = self.mmq_y.lock().map_err(|e| e.to_string())?;
             if sc.0 < need {
                 if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
-                sc.1 = self.alloc(need)? as *mut u8;
+                sc.1 = self.alloc(need)?;
                 sc.0 = need;
             }
             sc.1
@@ -1648,7 +1651,7 @@ impl RawCtx {
             if let Some(&p2) = c.get(&key) { p2 }
             else {
                 let blocks2 = n_in / 256;
-                let p2 = self.alloc(n_out * blocks2 * 210)? as *mut u8;
+                let p2 = self.alloc(n_out * blocks2 * 210)?;
                 let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
@@ -1661,6 +1664,7 @@ impl RawCtx {
                 if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
+                    #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
                     let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
                     eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
                 }
@@ -1676,7 +1680,7 @@ impl RawCtx {
             let mut sc = self.mmq_y_s.lock().map_err(|e| e.to_string())?;
             if sc.0 < need {
                 if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
-                sc.1 = self.alloc(need)? as *mut u8;
+                sc.1 = self.alloc(need)?;
                 sc.0 = need;
             }
             sc.1

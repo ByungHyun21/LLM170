@@ -133,11 +133,10 @@ fn main() -> ExitCode {
         let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
-            if model.is_none() {
-                if let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--")) {
+            if model.is_none()
+                && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--")) {
                     model = Some(p.clone());
                 }
-            }
         }
         if let Some(mp) = model
             && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {

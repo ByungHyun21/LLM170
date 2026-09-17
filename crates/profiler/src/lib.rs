@@ -72,7 +72,7 @@ mod imp {
             a.max_ns = a.max_ns.max(*ns);
         }
         let mut rows: Vec<(&'static str, &Aggregate)> = agg.iter().map(|(k, v)| (*k, v)).collect();
-        rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns));
+        rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_ns));
 
         let mut out = String::from("=== llm170 profile ===\n");
         out.push_str(&format!(

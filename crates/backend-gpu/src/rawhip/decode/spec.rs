@@ -395,7 +395,7 @@ impl DecodeState {
         self.ctx.quant_q8_b(self.mtp_b_cat, self.mtp_b_xq2, 2 * n, xq2_w, t)?;
         let (we, te, nie, noe) = self.w("blk.64.nextn.eh_proj.weight")?;
         self.mm_b2(
-            self.mtp_b_cat as *mut u8, self.mtp_b_xq2, xq2_w, we, te, nie, noe,
+            self.mtp_b_cat, self.mtp_b_xq2, xq2_w, we, te, nie, noe,
             self.mtp_b_cur, t,
         )?;
         mark("eh_proj", &mut cp);
@@ -406,12 +406,12 @@ impl DecodeState {
         // q 투영은 attention(=종료 청크)에서만 필요 — KV는 k/v만 적립한다.
         let (wq, tq, niq, noq) = self.w("blk.64.attn_q.weight")?;
         if with_head {
-            self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wq, tq, niq, noq, self.aq_t, t)?;
+            self.mm_b2(self.mtp_b_e, self.mtp_b_xqn, xq_n, wq, tq, niq, noq, self.aq_t, t)?;
         }
         let (wk, tk, nik, nok) = self.w("blk.64.attn_k.weight")?;
-        self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wk, tk, nik, nok, self.ak_t, t)?;
+        self.mm_b2(self.mtp_b_e, self.mtp_b_xqn, xq_n, wk, tk, nik, nok, self.ak_t, t)?;
         let (wv, tv, niv, nov) = self.w("blk.64.attn_v.weight")?;
-        self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wv, tv, niv, nov, self.av_t, t)?;
+        self.mm_b2(self.mtp_b_e, self.mtp_b_xqn, xq_n, wv, tv, niv, nov, self.av_t, t)?;
         mark("qkv", &mut cp);
         // ④ q/k norm+rope (배치, pos+y) + KV 적립 + flash (배치)
         let qn = *self.consts.get("blk.64.attn_q_norm").ok_or("qn")?;
@@ -509,9 +509,9 @@ impl DecodeState {
         // ⑤⑥ KV-only: 마지막 행만 (앞 행들의 wo/FFN 출력은 아무도 쓰지 않는다)
         let nrow_ffn = if full { t } else { 1 };
         let coff = if full { 0 } else { (t - 1) * n };
-        let cur_p = unsafe { self.mtp_b_cur.add(coff * 4) } as *mut u8;
-        let aout_p = unsafe { self.aout_t.add(ooff * 4) } as *mut u8;
-        let gout_p = unsafe { self.gout_t.add(coff * 4) } as *mut u8;
+        let cur_p = unsafe { self.mtp_b_cur.add(coff * 4) };
+        let aout_p = unsafe { self.aout_t.add(ooff * 4) };
+        let gout_p = unsafe { self.gout_t.add(coff * 4) };
         // ⑤ attn_output + 잔차
         self.ctx.quant_q8_b(aout_p, self.mtp_b_xqn, n_head * hd, xq_sg, nrow_ffn)?;
         let (wo, two, nio, noo) = self.w("blk.64.attn_output.weight")?;
@@ -525,9 +525,9 @@ impl DecodeState {
         self.rms_rows(cur_p, pn, self.mtp_b_e, n, nrow_ffn)?;
         self.ctx.quant_q8_b(self.mtp_b_e, self.mtp_b_xqn, n, xq_n, nrow_ffn)?;
         let (wg, tg, nig, nog) = self.w("blk.64.ffn_gate.weight")?;
-        self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wg, tg, nig, nog, self.fgate_t, nrow_ffn)?;
+        self.mm_b2(self.mtp_b_e, self.mtp_b_xqn, xq_n, wg, tg, nig, nog, self.fgate_t, nrow_ffn)?;
         let (wu, tu, niu, nou) = self.w("blk.64.ffn_up.weight")?;
-        self.mm_b2(self.mtp_b_e as *mut u8, self.mtp_b_xqn, xq_n, wu, tu, niu, nou, self.fup_t, nrow_ffn)?;
+        self.mm_b2(self.mtp_b_e, self.mtp_b_xqn, xq_n, wu, tu, niu, nou, self.fup_t, nrow_ffn)?;
         {
             let mut gp = self.fgate_t as *mut std::ffi::c_void;
             let mut up = self.fup_t as *mut std::ffi::c_void;
@@ -543,7 +543,7 @@ impl DecodeState {
         self.ctx.quant_q8_b(self.fglu_t, self.mtp_b_xq2, self.n_ff, xq_sf, nrow_ffn)?;
         let (wd, td, nid, nod) = self.w("blk.64.ffn_down.weight")?;
         self.mm_b2(
-            self.fglu_t as *mut u8, self.mtp_b_xq2, xq_sf, wd, td, nid, nod,
+            self.fglu_t, self.mtp_b_xq2, xq_sf, wd, td, nid, nod,
             self.fdown_t, nrow_ffn,
         )?;
         self.axpy(cur_p, self.fdown_t, n * nrow_ffn)?;

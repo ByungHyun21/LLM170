@@ -104,6 +104,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     let weights = clip.vit_weights()?;
                     let n_ff = clip.n_ff();
                     let tw0 = std::time::Instant::now();
+                    #[allow(clippy::arc_with_non_send_sync)] // vl 단일스레드 경로 — HIP 런타임 직렬화(Q4Acc unsafe Send/Sync와 동일 계약)
                     let ctx = std::sync::Arc::new(llm170_backend_gpu::rawhip::RawCtx::new()?);
                     let vit = llm170_backend_gpu::rawhip::vit::Vit::new(
                         ctx.clone(), weights, n_embd, n_head, n_ff, n_blk, eps, tmax,

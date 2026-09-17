@@ -158,9 +158,7 @@ fn gdn_chunk_head(
                 }
             }
             let dbase = i * d;
-            for dv in 0..d {
-                d_out[dbase + dv] = oi[dv];
-            }
+            d_out[dbase..(d + dbase)].copy_from_slice(&oi[..d]);
             // 전진 대입: d_i = rhs_i − Σ_{j<i} A[i,j]·d_j
             for j in 0..i {
                 let dot: f32 = (0..d).map(|s2| kp[i * d + s2] * kp[j * d + s2]).sum();

@@ -1193,7 +1193,7 @@ pub fn mm_bench() -> Result<String, String> {
     ctx.sync()?;
     let dt2 = t0.elapsed().as_secs_f64() / reps as f64;
     // 순수 런치 CPU 비용: 그리드 1x1 소형 발사 (GPU 즉시 완료) 100회
-    let (mut sxa, mut swa, mut soa) = (xq as *mut u8, wd as *mut u8, out as *mut u8);
+    let (mut sxa, mut swa, mut soa) = (xq, wd, out);
     let (mut sni, mut sno, mut sxw, mut stt) = (n_in as i32, n_out as i32, xq_w as i32, t as i32);
     let mut sargs: Vec<*mut std::ffi::c_void> = vec![
         (&mut sxa) as *mut _ as *mut std::ffi::c_void,
