@@ -1002,3 +1002,26 @@ configuration for large t on this model — the win has to come from tuning the
 tile kernels for large t (or from chunking that keeps t in the tuned range),
 not from switching families. Recorded with the measured numbers so the next
 pass starts from data.
+
+### Final scorecard after the refactoring pass (2026-09-17/18)
+
+Re-run at HEAD after the P0-P3 renames, the clippy cleanup and the reverted
+experiments (same host, solo, `scripts/scorecard.sh ours`):
+
+| cell | ours | llama.cpp | ratio |
+|---|---|---|---|
+| 27B pp512 | **373.3** | 344.0 | 1.09 |
+| 27B pp4096 | 313.2 | 333.6 | 0.94 |
+| 27B pp16384 | 288.7 | 296.4 | 0.97 |
+| 27B tg128 @4k / @16k | 11.37 / **11.58** | 11.67 / 11.21 | 0.97 / 1.03 |
+| FN pp512 | 240.4 | 245.2 | 0.98 |
+| FN pp4096 | **274.6** | 259.6 | 1.06 |
+| FN pp16384 | **245.2** | ~229 | 1.07 |
+| FN tg128 @4k / @16k | 18.55 / 18.60 | 20.23 (208-tok) / 17.79 (4160-tok) | 0.92 / 1.04 |
+
+Compared with the pre-refactor runs this is inside the established run-to-run
+band (the same binary moves 5-10% between runs on this APU), i.e. the
+refactoring is performance-neutral, and pp512 for the 27B set a new best. The
+remaining losses are the two Flash-Next cells analysed above (np4 = serialized
+prefill with a 1.2x-faster batched decode, tg = a t=1 kernel-level gap) plus the
+27B pp4096/pp16384 cells that sit inside the noise band.
