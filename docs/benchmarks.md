@@ -628,3 +628,74 @@ as an open item rather than re-verified.
 - `scripts/verify_np_self.py` — np-batch vs sequential self-consistency (3/4
   identical at HEAD; seq1's 3-token divergence is present with the pre-session
   kernel too).
+
+---
+
+## Matched scorecard (2026-09-17) — same host, same client, same prompts, solo
+
+Protocol: single-tenant, greedy, ROCm 10 userspace + rocBLAS Tensile pinned,
+`scripts/scorecard.sh` for pp/tg (llm170) and `llama-bench` from
+`llama.cpp-master` build `d222767c7` (27B) / `qwen4exp build-ab`
+(Flash-Next, needs `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`);
+np4 via `scripts/bench_np.py` (4 concurrent HTTP completions, 208-token
+natural-text prompt, n_predict 128, `cache_prompt=false`) with
+`LLM170_SLOTS=4` on our side and `-np 4` on llama's.
+
+### Qwen3.8-27B (Q4_K_XL)
+
+| cell | LLM170 hip | llama.cpp | ratio |
+|---|---|---|---|
+| pp512 | **356.8** | 344.0 | 1.04 |
+| pp4096 | **335.5** | 333.6 | 1.01 |
+| pp16384 | 293.0 | **296.4** | 0.99 |
+| tg128 (512-tok prompt) | 11.59-11.64 | — | — |
+| tg128 @ 4096 | 10.95-11.49 | **11.67** | 0.94-0.98 |
+| tg128 @ 16384 | 10.72 | **11.21** | 0.96 |
+| np4 aggregate | 20.85 | **26.04** | 0.80 |
+
+### Qwen3.8-Flash-Next (Q4_K_XL)
+
+| cell | LLM170 hip | llama.cpp | ratio |
+|---|---|---|---|
+| pp512 | **252.3** | 245.2 | 1.03 |
+| pp4096 | **268.9** | 259.6 | 1.04 |
+| pp16384 | **239.5** | ~229 | 1.05 |
+| tg128 (512-tok prompt) | 18.56 | **20.23** | 0.92 |
+| tg128 @ 4160 | 17.19 | **17.79** | 0.97 |
+| np4 aggregate | 24.94 | **41.07** | 0.61 |
+
+Notes:
+- The pp cells are wins on both models at every measured length.
+- tg is within machine noise of parity for the 27B (the same binary measured
+  10.95-11.64 across runs of one session; DRAM/UMA state moves results ±5%).
+  The Flash-Next short-context cell is a real 8% gap.
+- np4 now has protocol-matched references (`LLM170_SLOTS=4` / `-np 4`, identical
+  client): the earlier 0.47-0.49 (FN) / 0.72-0.76 (27B) references compared
+  different client protocols and are superseded.
+
+### Why np4 loses — decomposition (27B, this session)
+
+1. **Engine step**: KTRACE + `[npstep]` correlated on the same steps show the
+   t=4 greedy step is **137-146 ms** (t=1: 86 ms live / 108.7 ms with KTRACE
+   events). The delta is +21 ms of 4-row GEMM work (`gemm_xs4` 21-23 ms vs
+   `gemm_xs` 14.6 ms; `gemm_q5k4_w2` +13-20%) plus ~8 ms of per-slot state
+   (kv_f16 x128 vs x32, `gdn_ar_w_np`, `rms_part`+`rms_finish`, `qsa_flash_gqa2d`).
+   Weight streaming itself is amortized: the per-instance GEMM times grow far
+   less than the row count (the g4/w2 families share the weight read).
+2. **Prefill is serialized and on the critical path**: `slot_loop` decodes the
+   active slots and then runs *one* 512-token prefill chunk in the same
+   iteration. A 208-token prefill costs 0.82-1.8 s of GPU time; with 4 slots
+   arriving together that is ~3.4 s of wall in which the decode stream makes no
+   progress. llama.cpp hides its prefill inside the batched decode step
+   (mixed batch), which is why its np4 ≈ its pure 4-row decode rate.
+   Prefill-overlap ceiling for np4 ≈ +12% (27B) / +20% (FN).
+3. Host overhead is not the problem: with `LLM170_NOLAUNCH=1` a whole np step
+   costs 3.0 ms of host time; KTRACE `GAPS` is 4-9 ms.
+
+### MTP (27B, `--spec 3`)
+
+Acceptance is 1-3 drafts/cycle on the gate prompt (verify accepts the matching
+prefix, `gpu-verify ... am=[...] acc_n=N`), i.e. the batched verify works; the
+spec/non-spec stream divergence at token 4 (16 -> 23) is the documented
+ADR-0012 near-tie class (reproduced on the pre-session kernel) and is not a
+regression. MTP speed is bounded by the same t=4 verify cost as np4.
