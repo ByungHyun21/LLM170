@@ -45,17 +45,27 @@ pp512/pp4096/pp16384 prompts, tg128 at 4k/16k KV depth. tg is inside the
 session's own noise band: the identical binary measured 10.95-11.64 t/s at 4k
 across runs, so the tg cells are a near-tie rather than a stable gap.)
 
+np4 prefill aggregate — 4 slots each prefilling a 512-token prompt
+concurrently, prompt tokens/s (the only cell where the pp columns below would
+apply, so it is quoted separately):
+
+| backend | np4 pp aggregate |
+|---|---|
+| LLM170 hip | **374** |
+| LLM170 vulkan | — (not measured) |
+| llama.cpp (ROCm 10) | — (not measured) |
+
 Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
-`--spec 3`). MTP does not change prefill — the np4 pp aggregate applies
+`--spec 3`). MTP does not change prefill — the np4 pp aggregate above applies
 unchanged under MTP+np4:
 
-| mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
-|---|---|---|---|---|---|---|
-| | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | 11.5 (4k) / 10.7 (16k) | — | 9.2 | — | 11.67 / 11.21 |
-| MTP single | — | **15.4** (k=2) / 9.3 (k=3) | — | 9.2 (no MTP) | — | ~12 (MTP, old build) |
-| np4 aggregate | 374 (pp512) | **20.85** | T27NPP4V | T27NP4V | L27NPP4 | **26.04** |
-| MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 *(old build)* |
+| mode | tg agg | tg agg | tg agg |
+|---|---|---|---|
+| | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
+| tg single | 11.5 (4k) / 10.6 (16k) | 9.2 | 11.67 / 11.21 |
+| MTP single | **15.4** (k=2) / 9.3 (k=3) | 9.2 (no MTP) | ~12 (MTP, old build) |
+| np4 aggregate | **20.85** | — | **26.04** |
+| MTP + np4 | **20.4** | — | 15.5 *(old build)* |
 
 np cells require **4 slots on both sides** (`LLM170_SLOTS=4` /
 `llama-server -np 4`; both engines default to a single slot, in which case
@@ -92,16 +102,25 @@ timings on the `qwen4exp build-ab` build with the model's required
 measured length; the short-context tg cell is an 8% gap, the 4k one is inside
 noise.)
 
+np4 prefill aggregate — same convention as the 27B table above (4 slots,
+concurrent prefill, prompt tokens/s):
+
+| backend | np4 pp aggregate |
+|---|---|
+| LLM170 hip | — (not measured) |
+| LLM170 vulkan | — |
+| llama.cpp (ROCm 10) | — |
+
 Decode modes (aggregate t/s over 4 parallel slots; the model has no
 nextn/MTP head — MTP rows are structurally inapplicable):
 
-| mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
-|---|---|---|---|---|---|---|
-| | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | **18.56** (ctx 4k) / **18.35** (ctx 16k) | — | 17.1 | — | **20.23** / 17.79 |
-| MTP single | — | — | — | — | — | — |
-| np4 aggregate | — | **24.94** | TFNPP4V | TFNP4V | — | **41.07** |
-| MTP + np4 | — | — | — | — | — | — |
+| mode | tg agg | tg agg | tg agg |
+|---|---|---|---|
+| | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
+| tg single | **18.56** (ctx 4k) / **18.35** (ctx 16k) | 17.1 | **20.23** / 17.79 |
+| MTP single | — | — | — |
+| np4 aggregate | **24.94** | — | **41.07** |
+| MTP + np4 | — | — | — |
 
 (Flash-Next np4, measured 2026-09-16/17 same-host/same-prompt HTTP 4-way:
 **LLM170 21.0-23.9 t/s aggregate** (2026-09-17 build: batched MoE, f32
