@@ -780,3 +780,21 @@ so a graph cannot remove them; cutting them would need fewer kernels.
 `graph_abort` was added to the `GraphCapture` capability and called on any
 frame->value fallback: without it the backend stays in Replay mode and silently
 skips subsequent launches. That is a correctness fix, not a perf change.
+
+### Vision (mmproj) path — matched timing (2026-09-17)
+
+Same image (`source/llama.cpp/tools/mtmd/test-1.jpeg`), same question, greedy,
+`mmproj-F16.gguf` on the 27B. llama: `llama-server -m 27B --mmproj mmproj-F16.gguf
+-ngl 999` (master build), reading `timings` from `/v1/chat/completions`; ours:
+`llm170 vl` phase prints.
+
+| phase | LLM170 | llama.cpp |
+|---|---|---|
+| vision encode + prompt | 1.1 s (vit forward) + 1.2 s (300-token LLM prefill) | 1.62 s for 362 prompt tok @ 223.7 t/s (clip encode folded in) |
+| decode | 48 tok @ ~11.6 t/s (~4.1 s) | 48 tok @ 10.19 t/s (~4.7 s) |
+| total (excl. model loads) | ~6.4 s | ~6.3 s (warm run: 6.27 s) |
+
+So the vision condition is at parity (our ViT forward and the LLM prefill are
+each about as fast as llama's combined clip+prompt phase, and our decode is
+faster). Model loads are excluded on both sides (ours: 14.2 s mmproj upload +
+22.7 s 27B inject, cold).
