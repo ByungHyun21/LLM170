@@ -902,3 +902,30 @@ Flash-Next on Vulkan shows no such degradation (pp512 252.3 / pp4096 268.7 /
 tg128 18.02 t/s — all at hip parity), so the 27B long-prefill regression is
 model-specific to the hybrid GDN+attention prefill path, not a general Vulkan
 GEMM problem.
+
+### Flash-Next prefill overlap — second attempt, also reverted (2026-09-17)
+
+Because the FN's frame path turned out to share no MMQ/raw buffers (only Frame4
+handles plus the size-keyed `scratch()`), a second overlap attempt was built for
+it: a second `Frame4` for the prefill, an `FwdMode::NoReadback` forward, an
+`Engine4::prefill_start/ready/finish` trio and scheduler wiring, with the
+stream-pair selector switched to `AtomicBool` so `RawCtx` stays `Sync` for the
+vision `Arc`.
+
+Two failure modes, both reproduced:
+
+- With the prefill stream pair enabled, the first asynchronous op fails with
+  `hipErrorIllegalAddress` (700) on an `h2d` inside `frame_forward_ex`
+  (`frame_write_u32`), after which the whole HIP context is poisoned and even
+  the decode path fails.
+- With the pair disabled (frame separation + no-readback only, same streams),
+  the request hangs silently — no error, no progress.
+
+Reverted. Combined with the earlier 27B attempt (divergent output when the
+kernels actually ran on the side stream), the conclusion for future work is
+that a frame-path prefill overlap needs a deliberate two-context design, not a
+stream selector bolted onto shared engine state.
+
+The durable parts of the attempt were kept: `pre_pair` is now an `AtomicBool`
+(Sync preserved) and the accumulator's stream helpers exist; the loop debug
+instrumentation was removed.
