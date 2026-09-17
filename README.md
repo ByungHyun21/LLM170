@@ -70,12 +70,13 @@ Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 
 Matched scorecard, 2026-09-17; llama ran the `qwen4exp build-ab` build with
 the model's required `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`.
-tg here is single-stream over the HTTP server (llama-bench cannot load this
-split model): 208-token prompt, 128 generated, same client for both.
+All rows here use the HTTP server for both engines — single stream, 208-token
+prompt, 128 generated, same client, warm-up requests discarded (llama-bench
+cannot load this split model, so HTTP is the only common protocol).
 
 | backend | pp512 | pp4096 | pp16384 | tg128 single |
 |---|---|---|---|---|
-| LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 (CLI 18.55-18.60) |
+| LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 |
 | LLM170 vulkan | 252.3 | 268.7 | 245.9 | 18.02 |
 | llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
 
