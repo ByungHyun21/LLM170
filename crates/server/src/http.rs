@@ -17,6 +17,13 @@
 
 
 use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 기동 준비 완료 플래그 — 기동 워밍업(slot_loop 진입 시) 전에는 /health가 503.
+/// llama-server의 /health가 모델 로드·슬롯 초기화 후에야 200을 주는 것과 같은
+/// 계약이다(2026-09-17: 워밍업 없는 첫 요청이 지연 초기화 raw_init을 뒤집어써
+/// np4 프리필 집계를 2-3x 낮게 만들었다).
+pub static READY: AtomicBool = AtomicBool::new(false);
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -215,7 +222,13 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
             Err(_) => return Ok(()), // 연결 종료
         };
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/health") => resp(&mut stream, 200, "application/json", "{\"status\":\"ok\"}"),
+            ("GET", "/health") => {
+                if READY.load(Ordering::Acquire) {
+                    resp(&mut stream, 200, "application/json", "{\"status\":\"ok\"}")
+                } else {
+                    resp(&mut stream, 503, "application/json", "{\"status\":\"loading\"}")
+                }
+            }
             ("GET", "/v1/models") => resp(
                 &mut stream,
                 200,

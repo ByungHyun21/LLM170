@@ -155,6 +155,33 @@ pub fn slot_loop(
     n_slots: usize,
 ) {
     const EOS: u32 = 248044;
+    // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
+    // 뒤집어쓰지 않도록 여기서 소진하고 상태를 되돌린다. 준비 전에는 /health가
+    // 503이라 클라이언트가 계측을 시작하지 않는다.
+    {
+        let warm: Vec<u32> = vec![1u32; 16];
+        let w: Result<(), String> = match &mut eng {
+            Engine::Q35(e) => e
+                .prefill(0, &warm)
+                .and_then(|l| {
+                    let t = llm170_core::qwen35::greedy(&l);
+                    e.decode_greedy(0, t).map(|_| ())
+                })
+                .map_err(|e| e.to_string()),
+            Engine::Q4(e) => e
+                .prefill(0, &warm)
+                .and_then(|_| e.decode1(0, 1u32).map(|_| ()))
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(err) = w {
+            eprintln!("# warmup 실패(치명 아님): {err}");
+        }
+        match &mut eng {
+            Engine::Q35(e) => e.reset_states(),
+            Engine::Q4(e) => e.reset_states(),
+        }
+    }
+    crate::http::READY.store(true, std::sync::atomic::Ordering::Release);
     let mut slots: Vec<Slot> = (0..n_slots).map(|_| Slot::free()).collect();
     let mut tick: u64 = 0;
     let (mut n_dec, mut n_pf) = (0u64, 0u64);
@@ -349,6 +376,52 @@ pub fn slot_loop(
                         && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
                 })
                 .min_by_key(|&i| slots[i].touch);
+            // 배치 프리필(plans/74 np4) — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
+            // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). 게이트 기본 꺼짐.
+            // 실패하면 아래 슬롯별 경로로 폴백(등가성은 prefill_multi 등가 테스트가 보증).
+            if std::env::var_os("LLM170_PREFILL_BATCH").is_some() {
+                let pend: Vec<usize> = (0..n_slots)
+                    .filter(|&i| {
+                        slots[i].job.is_some()
+                            && slots[i].prefilled < slots[i].job.as_ref().unwrap().tokens.len()
+                    })
+                    .collect();
+                if pend.len() >= 2 {
+                    let per = (512usize / pend.len()).max(16);
+                    let parts: Vec<Vec<u32>> = pend
+                        .iter()
+                        .map(|&i| {
+                            let j = slots[i].job.as_ref().unwrap();
+                            let end = (slots[i].prefilled + per).min(j.tokens.len());
+                            j.tokens[slots[i].prefilled..end].to_vec()
+                        })
+                        .collect();
+                    let uniform = parts.iter().all(|p| p.len() == per) && parts.len() == pend.len();
+                    if uniform {
+                        let flat: Vec<u32> = parts.iter().flatten().copied().collect();
+                        if let Engine::Q4(e) = &mut eng {
+                            match e.prefill_multi(&pend, &flat, per) {
+                                Ok(toks) => {
+                                    for (k, &i) in pend.iter().enumerate() {
+                                        slots[i].prefilled += per;
+                                        let done = slots[i].job.as_ref().is_some_and(|j| {
+                                            slots[i].prefilled == j.tokens.len()
+                                        });
+                                        if done {
+                                            slot_emit(&mut slots[i], toks[k]);
+                                        }
+                                        finish_slot(&mut slots[i], &mut eng, i, EOS);
+                                    }
+                                    n_pf += 1;
+                                    // 이번 회차 프리필 소비 — 슬롯별 경로로 중복 계상 방지.
+                                    continue;
+                                }
+                                Err(err) => eprintln!("# batch-prefill 실패({err}) — 슬롯별 폴백"),
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(i) = pf {
                 let _pft = std::time::Instant::now();
                 let chunk = 512usize;
