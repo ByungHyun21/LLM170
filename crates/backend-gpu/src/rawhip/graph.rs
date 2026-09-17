@@ -53,6 +53,14 @@ fn is_end(tag: &str) -> bool {
     tag.ends_with("_in")
 }
 
+/// 그래프 상태 폐기 — 캡처/재생을 끄고 런치 스킵도 해제한다(경로 전환 시 필수).
+pub fn graph_abort() {
+    if let Ok(mut g) = GRAPH.lock() {
+        *g = GraphMode::Off;
+    }
+    GRAPH_SKIP.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn graph_replay(on: bool) -> Result<(), String> {
     if on {
         let mut g = GRAPH.lock().map_err(|e| e.to_string())?;

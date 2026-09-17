@@ -672,7 +672,57 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
             }
             let ctx = Ctx { model: &self.model, acc: Some(acc) };
-            let r3 = super::frame::decode_frame_greedy(acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token);
+            // 그래프 캡처(LLM170_GRAPH=1) — value 경로와 동일 규약: 스텝0 = 워밍,
+            // 스텝1 = 캡처(결과 폐기 후 같은 토큰 즉시 재생), 스텝2+ = 재생.
+            // 프레임 디코드는 커널 수가 많아(≈1000) 런치 간극이 스텝의 12-18%다 —
+            // 그래프로 굳히면 그 간극이 사라진다(2026-09-17, value 경로 실측 +5.1%).
+            let cap = self.graph_want;
+            let cap_step = cap && self.graph_step == 1;
+            let rep_step = cap && self.graph_step >= 2;
+            if cap_step {
+                if let Err(e) = acc.graph_capture_begin() {
+                    eprintln!("# graph(frame): 캡처 시작 실패 — 정상 경로 ({e})");
+                    self.graph_want = false;
+                }
+            } else if rep_step {
+                if let Err(e) = acc.graph_replay(true) {
+                    eprintln!("# graph(frame): 재생 실패 — 정상 경로 ({e})");
+                    self.graph_want = false;
+                }
+            }
+            let r0 = super::frame::decode_frame_greedy(
+                acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
+            );
+            let r3 = if cap_step {
+                match acc.graph_capture_end() {
+                    Err(e) => {
+                        eprintln!("# graph(frame): 캡처 실패 — 정상 경로 유지 ({e})");
+                        self.graph_want = false;
+                        r0
+                    }
+                    Ok(()) => match acc.graph_replay(true) {
+                        Err(e) => {
+                            eprintln!("# graph(frame): 재생 실패 — 정상 경로 ({e})");
+                            self.graph_want = false;
+                            r0
+                        }
+                        Ok(()) => {
+                            let r1 = super::frame::decode_frame_greedy(
+                                acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
+                            );
+                            let _ = acc.graph_replay(false);
+                            self.graph_step += 1;
+                            r1
+                        }
+                    },
+                }
+            } else {
+                if rep_step {
+                    let _ = acc.graph_replay(false);
+                    self.graph_step += 1;
+                }
+                r0
+            };
             if std::env::var_os("LLM170_KTRACE").is_some() {
                 acc.ktrace_tick();
             }
@@ -684,6 +734,12 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 Ok(tok)
             }
             Err(e) => {
+                // 그래프 상태가 걸린 채 value 경로로 넘어가면 백엔드가 Replay 모드로
+                // 남아 런치를 건너뛴다 — 폴백 시 그래프를 먼저 중단한다.
+                if self.graph_step > 0 {
+                    self.acc.as_deref().map(|a| a.graph_abort());
+                }
+                self.graph_want = false;
                 self.frame = None;
                 self.frame_broken = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();

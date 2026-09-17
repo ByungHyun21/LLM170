@@ -55,6 +55,11 @@ pub trait GraphCapture: Send + Sync {
     fn graph_replay(&self, _on: bool) -> Result<(), String> {
         Err("graph capture: 미지원".into())
     }
+    /// 그래프 중단 — 캡처/재생 상태를 완전히 버리고 정상 런치로 되돌린다.
+    /// 폴백(프레임→value)처럼 실행 경로가 바뀔 때 반드시 호출해야 한다:
+    /// 백엔드가 Replay 모드로 남으면 이후 런치가 조용히 건너뛰어진다.
+    /// 기본 no-op — 그래프 미지원 백엔드는 상태가 없다.
+    fn graph_abort(&self) {}
 
     /// 그래프 캡처 세그먼트 경계 — 스텝 내 호스트 왕복(d2h/h2d) 지점에서 호출된다.
     /// 캡처 구현체는 이 지점에서 현재 세그먼트를 닫고 다음을 연다(재생 시엔 순서대로 발사).

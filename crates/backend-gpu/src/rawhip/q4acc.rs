@@ -2906,6 +2906,9 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
     fn graph_replay(&self, on: bool) -> Result<(), String> {
         crate::rawhip::graph_replay(on)
     }
+    fn graph_abort(&self) {
+        crate::rawhip::graph_abort();
+    }
 }
 
 impl llm170_core::matmul::MatmulHost for Q4Acc {
