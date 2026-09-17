@@ -93,11 +93,11 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
     if arch.as_deref() == Some("qwen4exp") {
         return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend, &gpu_runtime);
     }
-    let engine_res = llm170_core::model::Model::load(&model_path)
+    let engine_res = llm170_core::qwen35::Model::load(&model_path)
         .map_err(|e| e.to_string())
         .and_then(|m| {
             let n = prompts.len();
-            let mut eng = llm170_core::model::Engine::new(m, n, ctx);
+            let mut eng = llm170_core::qwen35::Engine::new(m, n, ctx);
             if spec_k.is_some() {
                 eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성 (plans/22)
             }
@@ -155,7 +155,7 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
             let mut gen_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
             let mut next: Vec<u32> = last_logits
                 .iter()
-                .map(|l| llm170_core::model::greedy(l))
+                .map(|l| llm170_core::qwen35::greedy(l))
                 .collect();
             for s in 0..n {
                 emit(s, prompts[s].len() as u32, next[s], &eng);
@@ -270,7 +270,7 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                     }
                 }
                 for (i, &s) in active.iter().enumerate() {
-                    let t = llm170_core::model::greedy(&logits[i]);
+                    let t = llm170_core::qwen35::greedy(&logits[i]);
                     next[s] = t;
                     pos[s] += 1;
                     emit(s, pos[s], t, &eng);
@@ -340,7 +340,7 @@ fn run_q4_infer(
             let mut next: Vec<u32> = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
-                let t = llm170_core::model::greedy(&l);
+                let t = llm170_core::qwen35::greedy(&l);
                 println!(
                     "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
                     p.len(),
@@ -360,7 +360,7 @@ fn run_q4_infer(
                     let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
                     let ls = eng.decode_batch(&active, &toks).map_err(|e| e.to_string())?;
                     for (row, &s) in active.iter().enumerate() {
-                        let t = llm170_core::model::greedy(&ls[row]);
+                        let t = llm170_core::qwen35::greedy(&ls[row]);
                         next[s] = t;
                         pos[s] += 1;
                         println!(
@@ -384,7 +384,7 @@ fn run_q4_infer(
                                     .collect();
                                 eprintln!("topk-dec seq{s}: {}", top.join(" "));
                             }
-                            llm170_core::model::greedy(&l)
+                            llm170_core::qwen35::greedy(&l)
                         } else {
                             eng.decode1_greedy(s, next[s]).map_err(|e| e.to_string())?
                         };
@@ -413,7 +413,7 @@ fn run_q4_infer(
 }
 
 /// 이 시점 emit — JSONL 1행 출력.
-fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::model::Engine) {
+fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::qwen35::Engine) {
     // 이 시점 eng는 &Engine 차입 — piece는 model 접근
     println!(
         "{{\"seq\":{},\"pos\":{},\"token\":{},\"text\":{}}}",

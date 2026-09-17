@@ -2,7 +2,7 @@
 //! 단일 소스. server/main.rs에서 이관(plans/35 P4): 백엔드 주입
 //! (backend-gpu::{rawhip,rawvk}::inject)과 bench·engine이 공유한다.
 
-use crate::model::Engine;
+use crate::qwen35::Engine;
 
 /// 원시 디코더가 필요한 가중치·상수 이름 목록 (recr/full층별 + MTP).
 pub fn raw_names(eng: &Engine) -> (Vec<String>, Vec<String>) {

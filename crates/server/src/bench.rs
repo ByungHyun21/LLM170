@@ -135,7 +135,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             {
                 let _ = eng.prefill(0, &prompt[..64.min(pp)]).map_err(|e| e.to_string())?;
                 let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
-                let _ = llm170_core::model::greedy(&l);
+                let _ = llm170_core::qwen35::greedy(&l);
             }
             let _ = std::env::var("LLM170_FRAME");
             // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
@@ -153,7 +153,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 if std::env::var_os("LLM170_KTRACE").is_some() {
                     eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
                 }
-                let mut next = llm170_core::model::greedy(&l);
+                let mut next = llm170_core::qwen35::greedy(&l);
                 // TG — 프레임 경로는 decode1 내부 분기
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
@@ -190,13 +190,13 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 ));
             }
         } else {
-            let m = llm170_core::model::Model::load(&model_path)
+            let m = llm170_core::qwen35::Model::load(&model_path)
                 .map_err(|e| e.to_string())?;
             let bench_np0: usize = std::env::var("LLM170_BENCH_NP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1);
-            let mut eng = llm170_core::model::Engine::new(m, bench_np0, ctx);
+            let mut eng = llm170_core::qwen35::Engine::new(m, bench_np0, ctx);
             if spec_k > 0 {
                 eng.mtp_wanted = true;
             }
@@ -235,14 +235,14 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             {
                 let _ = eng.prefill(0, &prompt[..64.min(pp)]).map_err(|e| e.to_string())?;
                 let l = eng.decode(&[0], &[1u32]).map_err(|e| e.to_string())?;
-                let _ = llm170_core::model::greedy(&l[0]);
+                let _ = llm170_core::qwen35::greedy(&l[0]);
             }
             for r in 0..reps {
                 eng.reset_states();
                 let t0 = Instant::now();
                 let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-                let mut next = llm170_core::model::greedy(&l);
+                let mut next = llm170_core::qwen35::greedy(&l);
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut fwd = 0usize;
@@ -252,7 +252,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                     .unwrap_or(1);
                 if spec_k > 0 && has_mtp && bench_np > 1 {
                     // np×spec 병합 (plans/18) — n seq 동일 프롬프트
-                    let mut nexts: Vec<u32> = vec![llm170_core::model::greedy(&l); bench_np];
+                    let mut nexts: Vec<u32> = vec![llm170_core::qwen35::greedy(&l); bench_np];
                     let mut done: Vec<usize> = vec![0; bench_np];
                     let mut total_gen = 0usize;
                     while total_gen < tg * bench_np {

@@ -275,7 +275,7 @@ pub fn mm_batch_bench() -> Result<String, String> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
     let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
     let w = model.w(&tname).ok_or("tensor 없음")?;
     let ctx = RawCtx::new()?;
     let n_in = w.n_in as usize;
@@ -315,7 +315,7 @@ pub fn mm_tile_bench() -> Result<String, String> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
     let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
     let w = model.w(&tname).ok_or("tensor 없음")?;
     let ctx = RawCtx::new()?;
     let n_in = w.n_in as usize;
@@ -1081,7 +1081,7 @@ fn half_f32(bits: u16) -> f32 {
 pub fn wc_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::ffi::c_void;
     let t = t.clamp(1, 64);
-    let model = llm170_core::model::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("tensor 없음")?;
     let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
     if w.ty != llm170_gguf::GgmlType::Q5K && !is_xs {
@@ -2450,7 +2450,7 @@ pub fn mm_bench() -> Result<String, String> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
     let tname = args.get(3).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-    let model = llm170_core::model::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
     let w = model.w(&tname).ok_or("tensor 없음")?;
     let ctx = RawCtx::new()?;
     let n_in = w.n_in as usize;
@@ -2639,7 +2639,7 @@ pub fn dims_of(path: &str, names: &[&str]) -> String {
 /// 진단: q6_K GEMV ↔ GPU 스칼라 기준 대조. 두 커널이 같은 가중 버퍼·같은 활성을
 /// 서로 다른 코드로 소비한다 — 커널 인덱싱 오류와 호스트 인자 문제를 분리한다.
 pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("tensor 없음")?;
     if w.ty != llm170_gguf::GgmlType::Q6K {
         return Err(format!("q6k-ref: q6_K 전용 (ty={:?})", w.ty));

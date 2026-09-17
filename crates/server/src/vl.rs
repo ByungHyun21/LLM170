@@ -162,14 +162,14 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
         all_vis.push(vis);
     }
     // 3) LLM
-    let m = match llm170_core::model::Model::load(&model) {
+    let m = match llm170_core::qwen35::Model::load(&model) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("model: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let mut eng = llm170_core::model::Engine::new(m, n_img, ctx);
+    let mut eng = llm170_core::qwen35::Engine::new(m, n_img, ctx);
     if spec_k > 0 {
         eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성
     }
@@ -203,7 +203,7 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
     let mut finished = vec![false; n_img];
     let mut gen_toks: Vec<Vec<u32>> = vec![Vec::new(); n_img];
     let mut texts: Vec<String> = vec![String::new(); n_img];
-    let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::model::greedy(l)).collect();
+    let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::qwen35::greedy(l)).collect();
     // 시퀀스별 유효 프롬프트 길이 (마커 1 → vis 행수 치환) — JSONL pos 기준.
     let base_len: Vec<usize> = (0..n_img)
         .map(|s| prompt.len() - 1 + all_vis[s].len())
@@ -220,7 +220,7 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
         }
         gen_toks[s].push(next[s]);
     }
-    let emit = |s: usize, t: u32, eng: &llm170_core::model::Engine, texts: &mut Vec<String>| {
+    let emit = |s: usize, t: u32, eng: &llm170_core::qwen35::Engine, texts: &mut Vec<String>| {
         if t != eos {
             texts[s].push_str(&eng.piece(t));
         }
@@ -292,7 +292,7 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
                 let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
                 let logits = eng.decode(&active, &toks).map_err(|e| e.to_string())?;
                 for (i, &s) in active.iter().enumerate() {
-                    let t = llm170_core::model::greedy(&logits[i]);
+                    let t = llm170_core::qwen35::greedy(&logits[i]);
                     next[s] = t;
                     emit(s, t, &eng, &mut texts);
                     println!(

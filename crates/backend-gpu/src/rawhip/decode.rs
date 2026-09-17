@@ -1,5 +1,5 @@
 //! 원시 HIP 디코드 실행기 — 1토큰 스텝을 원시 런치열로 구성 (2026-09-03).
-//! frame35의 op 순서를 그대로 옮기되 cubecl 프레임(op당 블로킹 제출)을
+//! frame(qwen35)의 op 순서를 그대로 옮기되 cubecl 프레임(op당 블로킹 제출)을
 //! 대체: 영속 버퍼 + 비동기 런치 + 마지막 1회 동기. 수치는 커널 검증
 //! 게이트(rawhip-check·미러)를 통과한 산술과 동일.
 //!
@@ -141,7 +141,7 @@ impl DecodeState {
     /// 모델에서 상주 상태 구축 — 가중치 업로드 1회.
     pub fn new(
         ctx: RawCtx,
-        hp: &llm170_core::model::hparams::Hparams,
+        hp: &llm170_core::qwen35::hparams::Hparams,
         weights: &[(String, Weight<'_>)],
         consts: &[(String, Vec<f32>)],
         n_seqs: usize,
@@ -1103,7 +1103,7 @@ fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: 
 impl llm170_core::matmul::RawDecode for RawDecoder {
     fn raw_init(
         &self,
-        hp: &llm170_core::model::hparams::Hparams,
+        hp: &llm170_core::qwen35::hparams::Hparams,
         weights: &[(String, llm170_core::matmul::Weight<'_>)],
         consts: &[(String, Vec<f32>)],
         n_seqs: usize,
@@ -3655,11 +3655,11 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
 
 /// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.
 /// (plans/28: 단계 타이밍 계측 추가 — 공존 지연 RCA용. server에서 이관 plans/35 P4)
-pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+pub fn inject(eng: &mut llm170_core::qwen35::Engine) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let hp = eng.model.hp.clone();
     let (wnames, cnames): (Vec<String>, Vec<String>) =
-        llm170_core::model::rawinject::raw_names(eng);
+        llm170_core::qwen35::rawinject::raw_names(eng);
     let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
     let t1 = std::time::Instant::now();
     let weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = wnames
@@ -3675,7 +3675,7 @@ pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
         weights.len(),
         weights.iter().map(|(_, w)| w.data.len()).sum::<usize>() as f64 / (1 << 30) as f64
     );
-    let consts = llm170_core::model::rawinject::raw_consts(eng, &cnames);
+    let consts = llm170_core::qwen35::rawinject::raw_consts(eng, &cnames);
     eprintln!("# inject: consts @+{:.1?}", t0.elapsed());
     let rd: std::sync::Arc<RawDecoder> = std::sync::Arc::new(RawDecoder::new());
     use llm170_core::matmul::RawDecode;

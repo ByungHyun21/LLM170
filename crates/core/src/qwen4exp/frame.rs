@@ -447,6 +447,17 @@ fn dbg(tag: &str, acc: &dyn Accelerator, h: u64, n: usize) {
 }
 
 /// 프레임 forward — t토큰 (t=1 디코드도 이 경로; decode_frame이 래퍼).
+/// 포워드 종료 방식 — 비동기 프리필은 head 커널까지만 발행하고 리드백을 미룬다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FwdMode {
+    /// logits 전사(샘플링용).
+    Full,
+    /// GPU argmax 만 회수.
+    Greedy,
+    /// head 커널까지만 — 리드백 없음(호출부가 이벤트 확인 후 argmax).
+    NoReadback,
+}
+
 pub fn frame_forward(
     acc: &dyn Accelerator,
     model: &Model4,
@@ -456,7 +467,7 @@ pub fn frame_forward(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<Vec<f32>, Q4Error> {
-    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, false).map(|(l, _)| l)
+    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, FwdMode::Full).map(|(l, _)| l)
 }
 
 /// greedy 판 — head 후 전사 대신 GPU argmax 로 토큰만 회수(plans/74).
@@ -469,7 +480,7 @@ pub fn frame_forward_greedy(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<u32, Q4Error> {
-    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, true).map(|(_, t)| t.expect("greedy token"))
+    frame_forward_ex(acc, model, ctx, seq, seq_st, f, tokens, FwdMode::Greedy).map(|(_, t)| t.expect("greedy token"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -481,7 +492,7 @@ fn frame_forward_ex(
     seq_st: &mut SeqState4,
     f: &mut Frame4,
     tokens: &[u32],
-    greedy: bool,
+    mode: FwdMode,
 ) -> Result<(Vec<f32>, Option<u32>), Q4Error> {
     let hp: &Hparams4 = &model.hp;
     let (n, hc) = (hp.n_embd, hp.hc);
@@ -738,7 +749,11 @@ fn frame_forward_ex(
         let hin = if t > 1 { f.hin_last } else { f.hin };
         let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
-        if greedy {
+        if mode == FwdMode::NoReadback {
+            ftime_report(t);
+            return Ok((Vec::new(), None));
+        }
+        if mode == FwdMode::Greedy {
             // GPU argmax — vocab×4B 전사·CPU 스캔 회피(plans/74).
             let toks = acc.frame_argmax_rows(f.logits, 1, hp.vocab).map_err(Q4Error::Io)?;
             ftime_report(t);

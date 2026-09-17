@@ -10,7 +10,7 @@ use crate::quant::dequant_row;
 use std::collections::HashMap;
 
 /// 프레임 상주 버퍼 세트 — 스텝마다 재사용, 해제 없음.
-pub struct Frame35 {
+pub struct Frame {
     xs: u64, // 잔차 스트림 [n_embd]
     xn: u64, // norm 출력 [n_embd]
     // GDN 스테이지
@@ -54,7 +54,7 @@ pub struct Frame35 {
     consts: HashMap<String, u64>,
 }
 
-impl Frame35 {
+impl Frame {
     pub fn new(acc: &dyn Accelerator, eng: &Engine) -> Result<Self, ModelError> {
         let hp = &eng.model.hp;
         let n = hp.n_embd;
@@ -71,7 +71,7 @@ impl Frame35 {
         } else {
             eng.seqs[0].kv_k_ref()[0].len() / (hp.n_kv * hp.head_dim)
         };
-        let mut f = Frame35 {
+        let mut f = Frame {
             xs: a(n)?,
             xn: a(n)?,
             gqkv: a(conv_ch)?,
@@ -140,7 +140,7 @@ impl Frame35 {
             f.kv_v.push(vv);
         }
         // 상수 가중치 — 층별 norm·GDN 계수 (qwen4exp Frame4 관례 동일).
-        let put = |f: &mut Frame35, name: &str, v: &[f32]| -> Result<(), ModelError> {
+        let put = |f: &mut Frame, name: &str, v: &[f32]| -> Result<(), ModelError> {
             let h = acc.frame_alloc(v.len()).map_err(ModelError::Accel)?;
             acc.frame_write(h, v).map_err(ModelError::Accel)?;
             f.consts.insert(name.into(), h);
@@ -199,8 +199,8 @@ fn op(acc: &dyn Accelerator, o: FrameOp) -> Result<(), ModelError> {
 impl Engine {
     /// 프레임 디코드 1스텝 (t=1, seq 1개) — logits 반환.
     /// LLM170_FRAME35=1 게이트. 실패 시 Err (묵시 폴백 없음 — 명시적 옵트인).
-    pub fn decode1_frame35(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, ModelError> {
-        let acc = self.acc.clone().ok_or(ModelError::Accel("frame35: 가속기 없음".into()))?;
+    pub fn decode1_frame(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, ModelError> {
+        let acc = self.acc.clone().ok_or(ModelError::Accel("frame: 가속기 없음".into()))?;
         let hp = self.model.hp.clone();
         let _n = hp.n_embd;
         let _k_len = hp.n_group * hp.d_state;
@@ -208,20 +208,20 @@ impl Engine {
         let _conv_ch = hp.conv_ch();
         let _eps = hp.eps;
 
-        if self.frame35.is_none() {
-            let f0 = Frame35::new(acc.as_ref(), self)?;
-            self.frame35 = Some(f0);
+        if self.frame.is_none() {
+            let f0 = Frame::new(acc.as_ref(), self)?;
+            self.frame = Some(f0);
         }
         // take/put — 프레임 차입과 self 차입(가중치·attn 브리지) 분리.
-        let mut f = self.frame35.take().expect("frame35");
-        let r = Engine::frame35_step(&mut f, self, &acc, seq, token);
-        self.frame35 = Some(f);
+        let mut f = self.frame.take().expect("frame");
+        let r = Engine::frame_step(&mut f, self, &acc, seq, token);
+        self.frame = Some(f);
         r
     }
 
     /// 프레임 스텝 본체 — f와 eng 차입 분리 (take/put 패턴).
-    fn frame35_step(
-        f: &mut Frame35,
+    fn frame_step(
+        f: &mut Frame,
         eng: &mut Engine,
         acc: &std::sync::Arc<dyn Accelerator>,
         seq: usize,
@@ -233,9 +233,9 @@ impl Engine {
         let v_len = hp.dt_rank * hp.d_state;
         let conv_ch = hp.conv_ch();
         let eps = hp.eps;
-        if !eng.frame35_clean[seq] {
+        if !eng.frame_clean[seq] {
             f.sync_states(acc.as_ref(), eng, seq)?;
-            eng.frame35_clean[seq] = true;
+            eng.frame_clean[seq] = true;
         }
 
         // 0) 임베딩 — CPU dequant → 기록
@@ -306,12 +306,12 @@ impl Engine {
                 let pos = eng.seqs[seq].pos as usize;
                 let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
                 if pos >= 2048 {
-                    return Err(ModelError::Accel("frame35: ctx 2048 초과 (cs/캐시 상한)".into()));
+                    return Err(ModelError::Accel("frame: ctx 2048 초과 (cs/캐시 상한)".into()));
                 }
                 let pos = eng.seqs[seq].pos as usize;
                 let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
                 if pos >= 2048 {
-                    return Err(ModelError::Accel("frame35: ctx 2048 초과".into()));
+                    return Err(ModelError::Accel("frame: ctx 2048 초과".into()));
                 }
                 let pos = eng.seqs[seq].pos as usize;
                 let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);

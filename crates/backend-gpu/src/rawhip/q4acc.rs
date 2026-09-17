@@ -2909,6 +2909,18 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
     fn graph_abort(&self) {
         crate::rawhip::graph_abort();
     }
+    fn pre_pair(&self, on: bool) {
+        self.ctx.pre_pair.set(on);
+    }
+    fn pre_mark(&self) -> Result<(), String> {
+        self.ctx.pre_mark()
+    }
+    fn pre_ready(&self) -> bool {
+        self.ctx.pre_ready()
+    }
+    fn pre_join(&self) -> Result<(), String> {
+        self.ctx.pre_join()
+    }
 }
 
 impl llm170_core::matmul::MatmulHost for Q4Acc {

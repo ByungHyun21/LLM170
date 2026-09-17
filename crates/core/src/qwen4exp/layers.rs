@@ -442,7 +442,7 @@ impl Engine4 {
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         if !frame_on {
             let l = self.prefill(seq, tokens)?;
-            return Ok(crate::model::greedy(&l));
+            return Ok(crate::qwen35::greedy(&l));
         }
         let cap0 = frame_t_max_cap(self.acc.as_deref());
         let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
@@ -459,7 +459,7 @@ impl Engine4 {
                     self.frame_broken = true;
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                     let l = self.prefill(seq, tokens)?;
-                    return Ok(crate::model::greedy(&l));
+                    return Ok(crate::qwen35::greedy(&l));
                 }
             }
         }
@@ -562,7 +562,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         let mut out = Vec::with_capacity(seqs.len());
         for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
             let lg = self.decode1(s, tk)?;
-            out.push(crate::model::greedy(&lg));
+            out.push(crate::qwen35::greedy(&lg));
         }
         return Ok(out);
     }
@@ -574,7 +574,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         && std::env::var("LLM170_NP_GREEDY").map(|v| v != "0").unwrap_or(true);
     if !frame_on {
         let lg = self.decode_batch(seqs, tokens)?;
-        return Ok(lg.iter().map(|l| crate::model::greedy(l)).collect());
+        return Ok(lg.iter().map(|l| crate::qwen35::greedy(l)).collect());
     }
     if let Some(h) = self.ple_worker.take() {
         let _ = h.join();
@@ -625,7 +625,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             let mut out = Vec::with_capacity(seqs.len());
             for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
                 let lg = self.decode1(s, tk)?;
-                out.push(crate::model::greedy(&lg));
+                out.push(crate::qwen35::greedy(&lg));
             }
             Ok(out)
         }
@@ -641,7 +641,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             || std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true) == false
         {
             let l = self.decode1(seq, token)?;
-            return Ok(crate::model::greedy(&l));
+            return Ok(crate::qwen35::greedy(&l));
         }
         if let Some(h) = self.ple_worker.take() {
             let _ = h.join();
@@ -661,7 +661,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                     self.frame_broken = true;
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                     let l = self.decode1(seq, token)?;
-                    return Ok(crate::model::greedy(&l));
+                    return Ok(crate::qwen35::greedy(&l));
                 }
             }
         }
@@ -745,7 +745,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# frame-greedy: 디코드 실패 — 폴백 ({e})"));
                 let l = self.decode1(seq, token)?;
-                Ok(crate::model::greedy(&l))
+                Ok(crate::qwen35::greedy(&l))
             }
         }
     }
@@ -886,7 +886,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             Ok(v) => v,
             Err(_) => return,
         };
-        let next_tok = crate::model::greedy(logits);
+        let next_tok = crate::qwen35::greedy(logits);
         let hp_ngram = self.model.hp.ple_ngram;
         let hist = self.seqs[seq].ple_hist.clone();
         let hist_valid = self.seqs[seq].ple_next_pos == self.seqs[seq].pos;
@@ -1017,7 +1017,7 @@ mod forward_tests {
         let l1 = eng.prefill(0, &toks).expect("prefill");
         assert_eq!(l1.len(), hp.vocab);
         assert!(l1.iter().all(|v| v.is_finite()), "logits 비유한");
-        let t1 = crate::model::greedy(&l1);
+        let t1 = crate::qwen35::greedy(&l1);
         assert!(t1 < hp.vocab as u32);
         let l2 = eng.decode1(0, t1).expect("decode");
         assert!(l2.iter().all(|v| v.is_finite()));
@@ -1025,7 +1025,7 @@ mod forward_tests {
         let m2 = Model4::load(std::path::Path::new(MODEL)).expect("load2");
         let mut e2 = Engine4::new(m2, 1, 128);
         let l1b = e2.prefill(0, &toks).expect("prefill2");
-        let t1b = crate::model::greedy(&l1b);
+        let t1b = crate::qwen35::greedy(&l1b);
         assert_eq!((t1, t1b), (t1, t1), "greedy 불일치");
         assert!((l1[0] - l1b[0]).abs() < 1e-6 || true);
     }

@@ -55,6 +55,20 @@ pub trait GraphCapture: Send + Sync {
     fn graph_replay(&self, _on: bool) -> Result<(), String> {
         Err("graph capture: 미지원".into())
     }
+    /// 비동기 프리필용 스트림 페어 전환 — on 이면 이후 발행이 프리필 전용
+    /// 스트림 쌍(메인+사이드)으로 간다. 미지원 백엔드는 no-op.
+    fn pre_pair(&self, _on: bool) {}
+    /// 프리필 완료 이벤트 기록 / 비블로킹 확인 / 메인 합류.
+    fn pre_mark(&self) -> Result<(), String> {
+        Err("pre_mark: 미지원".into())
+    }
+    fn pre_ready(&self) -> bool {
+        false
+    }
+    fn pre_join(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// 그래프 중단 — 캡처/재생 상태를 완전히 버리고 정상 런치로 되돌린다.
     /// 폴백(프레임→value)처럼 실행 경로가 바뀔 때 반드시 호출해야 한다:
     /// 백엔드가 Replay 모드로 남으면 이후 런치가 조용히 건너뛰어진다.
@@ -842,9 +856,9 @@ pub fn mm_group(
     xs: &[Vec<f32>],
     ws: &[Weight],
     outs: &mut [Vec<Vec<f32>>],
-) -> Result<(), crate::model::ModelError> {
+) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
-        Some(a) => a.matmul_group(xs, ws, outs).map_err(crate::model::ModelError::Accel),
+        Some(a) => a.matmul_group(xs, ws, outs).map_err(crate::qwen35::ModelError::Accel),
         None => {
             for (w, out) in ws.iter().zip(outs.iter_mut()) {
                 matmul_batch(xs, w, out);
@@ -862,11 +876,11 @@ pub fn mm_batch(
     xs: &[Vec<f32>],
     w: &Weight,
     outs: &mut [Vec<f32>],
-) -> Result<(), crate::model::ModelError> {
+) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
         Some(a) => a
             .matmul_batch(xs, w, outs)
-            .map_err(crate::model::ModelError::Accel),
+            .map_err(crate::qwen35::ModelError::Accel),
         None => Ok(matmul_batch(xs, w, outs)),
     }
 }
@@ -877,9 +891,9 @@ pub fn mm(
     x: &[f32],
     w: &Weight,
     out: &mut [f32],
-) -> Result<(), crate::model::ModelError> {
+) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
-        Some(a) => a.matmul(x, w, out).map_err(crate::model::ModelError::Accel),
+        Some(a) => a.matmul(x, w, out).map_err(crate::qwen35::ModelError::Accel),
         None => Ok(matmul(x, w, out)),
     }
 }
@@ -898,7 +912,7 @@ pub trait RawDecode: Send + Sync {
     /// 상태 초기화 (가중치·상수 업로드 1회) — wnames는 필요 텐서명.
     fn raw_init(
         &self,
-        hp: &crate::model::hparams::Hparams,
+        hp: &crate::qwen35::hparams::Hparams,
         weights: &[(String, Weight<'_>)],
         consts: &[(String, Vec<f32>)],
         n_seqs: usize,

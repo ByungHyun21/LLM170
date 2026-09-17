@@ -68,7 +68,7 @@ pub struct InferResult {
 pub static SPEC_K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub enum Engine {
-    Q35(llm170_core::model::Engine),
+    Q35(llm170_core::qwen35::Engine),
     Q4(llm170_core::qwen4exp::layers::Engine4),
 }
 
@@ -121,9 +121,9 @@ fn load_q4_retry(p: &std::path::Path) -> llm170_core::qwen4exp::Model4 {
 }
 
 /// qwen35 로드 재시도 — 동일.
-fn load_q35_retry(p: &std::path::Path) -> llm170_core::model::Model {
+fn load_q35_retry(p: &std::path::Path) -> llm170_core::qwen35::Model {
     for i in 0..5 {
-        match llm170_core::model::Model::load(p) {
+        match llm170_core::qwen35::Model::load(p) {
             Ok(m) => return m,
             Err(e) => {
                 eprintln!("# qwen35 로드 재시도 {}/5: {e}", i + 1);
@@ -369,7 +369,7 @@ pub fn slot_loop(
                     let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> = slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
                     let r: Result<u32, String> = match &mut eng {
-                        Engine::Q35(e) => e.prefill(i, &part).map(|l| llm170_core::model::greedy(&l)).map_err(|e| e.to_string()),
+                        Engine::Q35(e) => e.prefill(i, &part).map(|l| llm170_core::qwen35::greedy(&l)).map_err(|e| e.to_string()),
                         Engine::Q4(e) => e.prefill_greedy(i, &part).map_err(|e| e.to_string()),
                     };
                     (end, r)
@@ -523,7 +523,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         Engine::Q4(eng)
     } else {
         let m = load_q35_retry(&req.model);
-        let mut eng = llm170_core::model::Engine::new(m, n_slots, req.ctx);
+        let mut eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
         // serve --spec — 스펙 의도일 때만 MTP prefill 훅 활성 (plans/22).
         if SPEC_K.get().copied().unwrap_or(0) > 0 {
             eng.mtp_wanted = true;

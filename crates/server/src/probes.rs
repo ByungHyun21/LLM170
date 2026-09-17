@@ -198,7 +198,7 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
         eprintln!("usage: llm170 rawhip-check <file> <tensor>");
         return ExitCode::from(2);
     }
-    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+    let model = match llm170_core::qwen35::Model::load(std::path::Path::new(&args[0])) {
         Ok(m) => m,
         Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
     };

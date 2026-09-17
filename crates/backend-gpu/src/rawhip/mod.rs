@@ -71,6 +71,12 @@ pub struct RawCtx {
     fns: HashMap<&'static str, hip::hipFunction_t>,
     stream: hip::hipStream_t,
     stream2: hip::hipStream_t,
+    /// 프리필 전용 스트림 페어 — 프레임 경로(launch3s + join2/side_wait_main)를
+    /// 디코드와 겹쳐 돌리기 위한 별도 쌍(plans/74 np4 겹치기).
+    stream3: hip::hipStream_t,
+    stream4: hip::hipStream_t,
+    pub pre_pair: std::cell::Cell<bool>,
+    pre_ev: std::sync::Mutex<Option<hip::hipEvent_t>>,
     /// 크기별 스크래치 풀 — 해제 없는 재사용 (호출마다 신규 할당이
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
     /// MMQ 전용 y 버퍼 (size, ptr) — 풀 충돌 격리.
@@ -89,7 +95,7 @@ pub struct RawCtx {
     canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
     mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
-    scratch: std::sync::Mutex<HashMap<usize, Vec<*mut u8>>>,
+    scratch: std::sync::Mutex<HashMap<(usize, usize), Vec<*mut u8>>>,
     /// D2H 핀 스테이징 (필요시 성장, 해제 없음 — ADR-0014).
     /// pageable 버퍼로의 hipMemcpyAsync D2H는 슬로패스(1MB에 ~90ms,
     /// 2026-09-05 tg RCA) — 핀 버퍼 경유로 원소복사.
@@ -271,7 +277,11 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream2), "StreamCreate2")?;
-            Ok(RawCtx { fns, stream, stream2, mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            let mut stream3: hip::hipStream_t = std::ptr::null_mut();
+            ck(hip::hipStreamCreate(&mut stream3), "StreamCreate3")?;
+            let mut stream4: hip::hipStream_t = std::ptr::null_mut();
+            ck(hip::hipStreamCreate(&mut stream4), "StreamCreate4")?;
+            Ok(RawCtx { fns, stream, stream2, stream3, stream4, pre_pair: std::cell::Cell::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             allocs: std::sync::Mutex::new(Vec::new()),
@@ -287,7 +297,7 @@ impl RawCtx {
     /// 메모리 고갈→illegal address (2026-09-03 RCA).
     pub fn scratch(&self, bytes: usize) -> Result<*mut u8, String> {
         let mut sc = self.scratch.lock().map_err(|e| e.to_string())?;
-        let v = sc.entry(bytes).or_default();
+        let v = sc.entry((self.pre_pair.get() as usize, bytes)).or_default();
         if v.is_empty() {
             let p = self.alloc(bytes)?;
             v.push(p);
@@ -295,6 +305,46 @@ impl RawCtx {
         Ok(v[0])
     }
 
+
+    /// 현재 메인 스트림 — 프리필 페어면 stream3.
+    #[inline]
+    pub fn cur_stream(&self) -> hip::hipStream_t {
+        if self.pre_pair.get() { self.stream3 } else { self.stream }
+    }
+
+    /// 현재 사이드 스트림(launch3s / join2 / side_wait_main 대상).
+    #[inline]
+    pub fn cur_side(&self) -> hip::hipStream_t {
+        if self.pre_pair.get() { self.stream4 } else { self.stream2 }
+    }
+
+    /// 프리필 완료 이벤트 기록(현재 사이드) / 비블로킹 확인 / 메인 합류.
+    pub fn pre_mark(&self) -> Result<(), String> {
+        let mut g = self.pre_ev.lock().map_err(|e| e.to_string())?;
+        unsafe {
+            if g.is_none() {
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                ck(hip::hipEventCreateWithFlags(&mut ev, 0), "pre-ev")?;
+                *g = Some(ev);
+            }
+            ck(hip::hipEventRecord(g.unwrap(), self.cur_side()), "pre-ev-rec")?;
+        }
+        Ok(())
+    }
+    pub fn pre_ready(&self) -> bool {
+        let Ok(g) = self.pre_ev.lock() else { return false };
+        match *g {
+            None => false,
+            Some(ev) => unsafe { hip::hipEventQuery(ev) == hip::hipError_t_hipSuccess },
+        }
+    }
+    pub fn pre_join(&self) -> Result<(), String> {
+        let g = self.pre_ev.lock().map_err(|e| e.to_string())?;
+        if let Some(ev) = *g {
+            unsafe { ck(hip::hipStreamWaitEvent(self.stream, ev, 0), "pre-join")?; }
+        }
+        Ok(())
+    }
 
     /// 영속 디바이스 할당 (해제 없음).
     pub fn alloc(&self, bytes: usize) -> Result<*mut u8, String> {
@@ -520,7 +570,7 @@ impl RawCtx {
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
             if let Ok(mut g) = KTRACE.lock() {
                 if g.is_some() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
@@ -565,7 +615,7 @@ impl RawCtx {
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
             if let Ok(mut g) = KTRACE.lock() {
                 if g.is_some() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
@@ -642,16 +692,16 @@ impl RawCtx {
                 if g.is_some() {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
-                    hip::hipEventRecord(ev0, self.stream2);
+                    hip::hipEventRecord(ev0, self.cur_side());
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
+            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_side(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
             if let Ok(mut g) = KTRACE.lock() {
                 if g.is_some() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.stream2);
+                    hip::hipEventRecord(ev, self.cur_side());
                     g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
                 }
             }
@@ -663,8 +713,8 @@ impl RawCtx {
         unsafe {
             let mut ev: hip::hipEvent_t = std::ptr::null_mut();
             ck(hip::hipEventCreateWithFlags(&mut ev, 0), "evCreate")?;
-            ck(hip::hipEventRecord(ev, self.stream2), "evRecord")?;
-            ck(hip::hipStreamWaitEvent(self.stream, ev, 0), "evWait")?;
+            ck(hip::hipEventRecord(ev, self.cur_side()), "evRecord")?;
+            ck(hip::hipStreamWaitEvent(self.cur_stream(), ev, 0), "evWait")?;
             ck(hip::hipEventDestroy(ev), "evDestroy")?;
         }
         Ok(())

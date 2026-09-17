@@ -13,8 +13,8 @@ pub mod prefill;
 pub mod rawinject;
 pub mod spec;
 mod layers;
-pub(crate) mod frame35;
-pub use frame35::Frame35;
+pub(crate) mod frame;
+pub use frame::Frame;
 
 use hparams::Hparams;
 use llm170_gguf::GgufFile;
@@ -272,12 +272,12 @@ pub struct Engine {
     pub raw_decode: Option<std::sync::Arc<dyn crate::matmul::RawDecode>>,
     /// token_embd 원시 복사 캐시 (spec 토큰 행 디양자화용 — 매 스텝 to_vec 폭주 방지).
     pub embd_cache: Option<(llm170_gguf::GgmlType, std::sync::Arc<Vec<u8>>)>,
-    pub frame35: Option<Frame35>,
+    pub frame: Option<Frame>,
     /// MTP 스펙 의도 — true일 때만 prefill/decode 훅 활성 (미사용 시
     /// 훅 비용으로 prefill 3배 저하 방지, 2026-09-04 계측).
     pub mtp_wanted: bool,
     /// 시퀀스별 프레임 상태 유효 플래그 — 값 경로 실행(prefill 등)마다 무효화.
-    pub(crate) frame35_clean: Vec<bool>,
+    pub(crate) frame_clean: Vec<bool>,
 }
 
 impl Engine {
@@ -291,9 +291,9 @@ impl Engine {
         Engine {
             raw_decode: None,
             embd_cache: None,
-            frame35: None,
+            frame: None,
             mtp_wanted: false,
-            frame35_clean: vec![false; n_seqs],
+            frame_clean: vec![false; n_seqs],
             model,
             seqs,
             acc: None,
@@ -393,7 +393,7 @@ impl Engine {
         let mut recr_idx = 0usize;
         // 값 경로 실행 — 프레임 GPU 상태는 CPU 상태와 어긋나 무효화.
         for s in seq_ids {
-            self.frame35_clean[*s] = false;
+            self.frame_clean[*s] = false;
         }
         // 가속기 아크 복제 — self 차입 충돌 없이 층 내부까지 전달
         let acc = self.acc.clone();
@@ -571,7 +571,7 @@ impl Engine {
                             self.mtp_step(sid, batch[s][t], &prev_h, (pos0 + t) as u32, wl)?;
                         prev_h.copy_from_slice(&h_t);
                         if wl {
-                            let _am = crate::model::greedy(&lg);
+                            let _am = crate::qwen35::greedy(&lg);
                             self.seqs[sid].mtp_draft_logits = lg;
                             self.seqs[sid].mtp_h_next = hn;
                         }
@@ -637,7 +637,7 @@ impl Engine {
             && self.acc.is_some()
             && std::env::var("LLM170_FRAME35").is_ok_and(|v| v != "0")
         {
-            let logits = self.decode1_frame35(seq_ids[0], tokens[0])?;
+            let logits = self.decode1_frame(seq_ids[0], tokens[0])?;
             self.seqs[seq_ids[0]].pos += 1;
             return Ok(vec![logits]);
         }
@@ -721,7 +721,7 @@ impl Engine {
         let Some(rd) = self.raw_decode.as_ref() else {
             // 폴백: 일반 decode + greedy
             let logits = self.decode(&[seq], &[token])?;
-            return Ok(crate::model::greedy(&logits[0]));
+            return Ok(crate::qwen35::greedy(&logits[0]));
         };
         let n = self.model.hp.n_embd;
         let tw0 = std::time::Instant::now();

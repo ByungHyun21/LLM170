@@ -612,7 +612,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
 
 /// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let wref = &w;
@@ -743,7 +743,7 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
 
 /// 부록87: llama matmul_q5_k_f16.spv 직접 로드 격리 측정 (t≥2 프리필 GEMM).
 pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
@@ -959,7 +959,7 @@ pub fn sdot_probe() -> Result<String, String> {
 /// vk-gemv8-check — gemv8 패밀리(llama mul_mat_vec 포트, f32 직결) 검증+타이밍.
 pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let is_xs = w.ty == llm170_gguf::GgmlType::Iq4Xs;
@@ -1149,7 +1149,7 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
 /// f16 스테이징 품질계약: maxrel 허용치 ~2e-2 (근접 아닌 구조 오류 검출 목적).
 pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
@@ -1457,7 +1457,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
 
 /// dbg-q3 (plans/40) — tile_q3kms 디코드를 행 0 전원소 덤프해 CPU 진실과 대조.
 pub fn q3_dbg(path: &str, tname: &str) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
@@ -1526,7 +1526,7 @@ eprintln!("[wide] k352..383 gpu: {:?}", &outs[352..384]);
 
 /// dbg-q3b (plans/40) — gemv8_q3b 디코드 원소 덤프 ↔ CPU 진실.
 pub fn q3b_dbg(path: &str, tname: &str) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;
@@ -1565,7 +1565,7 @@ pub fn q3b_dbg(path: &str, tname: &str) -> Result<String, String> {
 /// 스펙 {BLOCK 64, NUM_ROWS 2, COLS 1} + full_subgroups(강제 wave64) —
 /// llama RADV 설정 직역. B=f32 [t][K], D=f32 [t][M].
 pub fn mmv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
-    let model = llm170_core::model::Model::load(std::path::Path::new(path))
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("텐서 없음")?;
     let n_in = w.n_in as usize;

@@ -348,7 +348,7 @@ fn cmd_w4a8_check(args: &[String]) -> ExitCode {
         eprintln!("usage: llm170 w4a8-check <file> <tensor> [t] [rows]");
         return ExitCode::from(2);
     }
-    let model = match llm170_core::model::Model::load(std::path::Path::new(&args[0])) {
+    let model = match llm170_core::qwen35::Model::load(std::path::Path::new(&args[0])) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {e}");

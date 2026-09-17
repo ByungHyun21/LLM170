@@ -235,7 +235,7 @@ unsafe impl Sync for DecoderState {}
 impl llm170_core::matmul::RawDecode for VkDecoder {
     fn raw_init(
         &self,
-        hp: &llm170_core::model::hparams::Hparams,
+        hp: &llm170_core::qwen35::hparams::Hparams,
         weights: &[(String, llm170_core::matmul::Weight<'_>)],
         consts: &[(String, Vec<f32>)],
         n_seqs: usize,
@@ -494,7 +494,7 @@ impl DecoderState {
         mut ctx: VkCtx,
         weights: Vec<(&'a str, &'a [u8], u32, usize, usize)>,
         consts: Vec<(String, Vec<f32>)>,
-        hp: &llm170_core::model::hparams::Hparams,
+        hp: &llm170_core::qwen35::hparams::Hparams,
         is_recr: Vec<bool>,
         n_seqs: usize,
         ctx_len: usize,
@@ -2495,22 +2495,22 @@ impl DecoderState {
     }
 }
 
-fn n_group_len(hp: &llm170_core::model::hparams::Hparams) -> usize {
+fn n_group_len(hp: &llm170_core::qwen35::hparams::Hparams) -> usize {
     hp.n_group * hp.d_state
 }
 
 /// Engine에 VkDecoder 주입 — raw_names/raw_consts 기반 (server에서 이관, plans/35 P4).
-pub fn inject(eng: &mut llm170_core::model::Engine) -> Result<(), String> {
+pub fn inject(eng: &mut llm170_core::qwen35::Engine) -> Result<(), String> {
     use llm170_core::matmul::RawDecode;
     let hp = eng.model.hp.clone();
     let is_recr: Vec<bool> = (0..hp.n_layer).map(|il| eng.model.is_recr(il)).collect();
-    let (wnames, cnames) = llm170_core::model::rawinject::raw_names(eng);
+    let (wnames, cnames) = llm170_core::qwen35::rawinject::raw_names(eng);
     let mut weights: Vec<(String, llm170_core::matmul::Weight<'_>)> = Vec::new();
     for n in &wnames {
         let w = eng.model.wchk(n).map_err(|e| e.to_string())?;
         weights.push((n.clone(), w));
     }
-    let mut consts = llm170_core::model::rawinject::raw_consts(eng, &cnames);
+    let mut consts = llm170_core::qwen35::rawinject::raw_consts(eng, &cnames);
     // plans/38 A4: qsa_flash가 인과 루프 상한으로 자체 마스킹 — ctx² 마스크
     // 상수(8k=256MB) 업로드·상주 폐지.
     consts.retain(|(k, _)| k != "mask");
