@@ -851,3 +851,27 @@ The fix is three lines (empty request line = EOF -> `Err`, handler returns).
 Verified: idle server now accrues 0 CPU ticks in 20 s; gates bit-exact; tests
 16/16; np4 token streams identical to before the fix. The bench-CLI pp/tg cells
 never used HTTP, which is why they were unaffected.
+
+### Final matched numbers after the EOF fix (2026-09-17)
+
+Re-measured with the handler-spin fix in place, same client, same 208-token
+prompt, 4 slots (ours `LLM170_SLOTS=4`, llama `-np 4`):
+
+| cell | LLM170 | llama.cpp | ratio |
+|---|---|---|---|
+| 27B np4 | **26.67** | 25.22 | **1.06** |
+| FN np4 | 35.70 | 41.13-41.65 | 0.86 |
+| FN tg single (HTTP) | 16.84 | 18.06 | 0.93 |
+
+The FN np4 decomposition is now clean at the engine level: live t=4 step
+77.5-80.6 ms for ours (llama's 4-row step works out to ~97 ms from its 41.13
+aggregate), i.e. **our batched decode is 1.2x faster than theirs** — the entire
+remaining FN np4 gap is the 4x ~1.1 s serialized prefill (~4.5 s of the 14.3 s
+wall). If that prefill were absorbed into the decode steps the way llama's
+mixed batch does, the cell would land near 1.2x. Doing so needs either
+multi-sequence chained prefill rows (plans/73 deferred project) or true
+dual-stream overlap, and the latter was attempted and reverted (above) because
+the shared-resource surface is wider than the t-batch set: `scratch()` is
+size-keyed, and `mmq_y`/`mmq_y_s`/`mmq_y2` hand out a buffer pointer whose lock
+is released before the kernel launch, so two paths launching MMQ kernels
+concurrently would clobber each other's y buffer.
