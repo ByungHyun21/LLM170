@@ -29,6 +29,31 @@ pub const CO_MMQ8: u8 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/
 pub const CO_QY: u8 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
 
 
+
+/// 1회 판독 env 게이트 캐시 (plans/78 R7) — 핫패스(런치·스텝당)의 var_os
+/// 반복 조회를 제거한다. 프로세스 내 env 변경은 main 초기화에서만 일어나고
+/// (set_var 2곳, 모두 엔진 기동 전) 이후 불변이므로 첫 판독 캐시가 안전하다.
+pub(crate) fn env_on(name: &'static str) -> bool {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, bool>>> =
+        std::sync::OnceLock::new();
+    *C.get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(name)
+        .or_insert_with(|| std::env::var_os(name).is_some())
+}
+
+/// env_on의 값 비교판 — `LLM170_X=v` 형태의 옵트인 게이트.
+pub(crate) fn env_eq(name: &'static str, val: &str) -> bool {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(&'static str, String), bool>>> =
+        std::sync::OnceLock::new();
+    *C.get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry((name, val.to_string()))
+        .or_insert_with(|| std::env::var(name).as_deref() == Ok(val))
+}
+
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())

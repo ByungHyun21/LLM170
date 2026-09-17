@@ -1,6 +1,7 @@
 //! decode MTP/spec — 드래프트·검증 배치 (plans/78 R2).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl DecodeState {
     /// 정규화된 h(공유 head norm 적용됨) → GPU head GEMV + argmax — MTP draft 토큰.
@@ -29,10 +30,10 @@ impl DecodeState {
         let n = self.n_embd;
         let t_b0 = std::time::Instant::now();
         self.step_batch(seq, pos0, emb)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[vb] trunk t={t}: {:.1}ms", t_b0.elapsed().as_secs_f64() * 1e3);
         }
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] step_batch ok"); }
+        if env_on("LLM170_SPEC_DBG") { eprintln!("[vb] step_batch ok"); }
         // head: 전 행 rms → quant → output 타일 → 행별 argmax
         let t_r0 = std::time::Instant::now();
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
@@ -41,11 +42,11 @@ impl DecodeState {
         let xq_sn = n / 4 + n / 32 + n / 16;
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[vb] head prep: {:.1}ms", t_r0.elapsed().as_secs_f64() * 1e3);
         }
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head tile t={t} ty={th} no={noh}"); }
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_DBG") { eprintln!("[vb] head tile t={t} ty={th} no={noh}"); }
+        if env_on("LLM170_SPEC_TIMING") {
             let t_s0 = std::time::Instant::now();
             self.ctx.sync()?;
             eprintln!("[vb] trunk drain: {:.1}ms", t_s0.elapsed().as_secs_f64() * 1e3);
@@ -78,18 +79,18 @@ impl DecodeState {
             self.logits_all,
         )?;
         }
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             self.ctx.sync()?;
             eprintln!("[vb] head mm t={t}: {:.1}ms", t_h0.elapsed().as_secs_f64() * 1e3);
         }
         self.ctx.sync()?;
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() { eprintln!("[vb] head ok"); }
+        if env_on("LLM170_SPEC_DBG") { eprintln!("[vb] head ok"); }
         self.ctx.sync()?;
         let _t_a0 = std::time::Instant::now();
         argmaxes.clear();
         // GPU argmax — t×vocab 플로트 d2h + CPU 스캔 제거 (2026-09-15, plans/74 N1).
         // LLM170_MS_LOGITS 진단은 전사 경로를 유지한다.
-        if std::env::var_os("LLM170_MS_LOGITS").is_some() {
+        if env_on("LLM170_MS_LOGITS") {
             let mut all_buf = vec![0f32; t * noh];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
             for ti in 0..t {
@@ -102,7 +103,7 @@ impl DecodeState {
         } else {
             argmaxes.extend(self.argmax_rows(self.logits_all, t, noh)?);
         }
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[vb] argmax={:.1}ms", _t_a0.elapsed().as_secs_f64() * 1e3);
         }
 
@@ -135,7 +136,7 @@ impl DecodeState {
         let cat_h = unsafe { self.mtp_cat.add(n * 4) };
         self.rms(h_gpu, hn, cat_h, n)?;
         // eh_proj [2n → n]
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if env_on("LLM170_MTP_STAGE") {
             self.ctx.sync()?;
             let mut v = vec![0f32; 2 * n];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.mtp_cat)?;
@@ -143,9 +144,9 @@ impl DecodeState {
             eprintln!("[g] cat e0={:.6} e1={:.6} esum={:.4} | h0={:.6} h1={:.6} hsum={:.4}", a[0], a[1], a.iter().map(|&x| x as f64).sum::<f64>(), b[0], b[1], b.iter().map(|&x| x as f64).sum::<f64>());
         }
         self.quant(self.mtp_cat, self.mtp_xq2, 2 * n)?;
-        if std::env::var_os("LLM170_MTP_DBG").is_some() { self.ctx.sync()?; eprintln!("[mtp] quant2 ok"); }
+        if env_on("LLM170_MTP_DBG") { self.ctx.sync()?; eprintln!("[mtp] quant2 ok"); }
         let (we, te, nie, noe) = self.w("blk.64.nextn.eh_proj.weight")?;
-        if std::env::var_os("LLM170_MTP_DBG").is_some() {
+        if env_on("LLM170_MTP_DBG") {
             eprintln!("[mtp] eh_proj ty={te} ni={nie} no={noe} w={we:p} xq2={:p} cur={:p} cat={:p}", self.mtp_xq2, self.mtp_cur, self.mtp_cat);
         }
         // RCA 대상: gemv_q8_out 경로가 ni=10240에서만 700 — 직접 launch는 동일 파라미터로
@@ -186,7 +187,7 @@ impl DecodeState {
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut xv).as_mut(), self.mtp_xq2)?;
             std::fs::write(format!("{pref}.xq.u32"), bytemuck::cast_slice(&xv)).map_err(|e| e.to_string())?;
         }
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if env_on("LLM170_MTP_STAGE") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.mtp_cur)?;
@@ -253,7 +254,7 @@ impl DecodeState {
         self.quant(self.mtp_ao, self.mtp_xq, n_ao)?;
         let (wo, two, nio, noo) = self.w("blk.64.attn_output.weight")?;
         self.mm_direct(self.mtp_xq, wo, two, nio, noo, self.gout)?;
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if env_on("LLM170_MTP_STAGE") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.gout)?;
@@ -280,14 +281,14 @@ impl DecodeState {
         let (wd, td, nid, nod) = self.w("blk.64.ffn_down.weight")?;
         self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
         self.axpy(self.mtp_cur, self.fdown, n)?;
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if env_on("LLM170_MTP_STAGE") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.mtp_cur)?;
             eprintln!("[g] ff sum={:.5} x0={:.5}", v.iter().map(|&x| x as f64).sum::<f64>(), v[0]);
         }
         if !with_head {
-            if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+            if env_on("LLM170_SPEC_TIMING") {
                 eprintln!("[mt] step(nohead)={:.2}ms", t0s.elapsed().as_secs_f64() * 1e3);
             }
             return Ok(None);
@@ -297,7 +298,7 @@ impl DecodeState {
         self.rms(self.mtp_cur, shn, self.mtp_e, n)?;
         let _t0h = std::time::Instant::now();
         let am = self.head_argmax_gpu(self.mtp_e)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[mt] head={:.2}ms", t0s.elapsed().as_secs_f64() * 1e3);
         }
         Ok(Some(am))
@@ -315,7 +316,7 @@ impl DecodeState {
         pos0: usize,
         with_head: bool,
     ) -> Result<u32, String> {
-        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[xf] mtp_prefill_batch");
         }
         if !self.mtp_on {
@@ -333,7 +334,7 @@ impl DecodeState {
         let xq_sg = n_ao / 4 + n_ao / 32 + n_ao / 16;
         let mask = self.consts.get("mask").copied().ok_or("mask")?;
         let t_mtp = std::time::Instant::now();
-        let mtp_time = std::env::var_os("LLM170_MTP_TIMING").is_some();
+        let mtp_time = env_on("LLM170_MTP_TIMING");
         let mark = |label: &str, last: &mut std::time::Instant| {
             if mtp_time {
                 self.ctx.sync().ok();
@@ -344,7 +345,7 @@ impl DecodeState {
         let mut cp = std::time::Instant::now();
         // KV-only 프리필 제어: 프롬프트 행의 attention/wo/FFN 출력은 쓰이지 않는다
         // (헤드는 마지막 행, 체인은 디코드 h 사용). LLM170_MTP_FULL=1이면 전행.
-        let full = std::env::var_os("LLM170_MTP_FULL").is_some();
+        let full = env_on("LLM170_MTP_FULL");
         let qstride = n_head * 2 * hd;
         let ostride = n_head * hd;
         let nrow_attn = if full { t } else { 1 };
@@ -605,7 +606,7 @@ impl DecodeState {
         self.quant(x, self.mtp_xq, n)?;
         let (wo, to, nio, noo) = self.w("output.weight")?;
         self.mm_into(self.mtp_xq, wo, to, nio, noo, self.logits)?;
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if env_on("LLM170_MTP_STAGE") {
             self.ctx.sync()?;
             let mut v = vec![0f32; 8];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.logits)?;
@@ -638,7 +639,7 @@ impl DecodeState {
         argmaxes: &mut Vec<u32>,
         h_all: &mut Vec<f32>,
     ) -> Result<(), String> {
-        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[xf] verify_batch_ms t={} seqs={:?} poss={:?} gs={:?}", emb.len() / self.n_embd, seqs, poss, group_starts);
         }
         let t = emb.len() / self.n_embd;
@@ -926,7 +927,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
         )?;
         argmaxes.clear();
         // GPU argmax — t×vocab 전사 회피 (plans/74 N1). MS_LOGITS 진단만 전사.
-        if std::env::var_os("LLM170_MS_LOGITS").is_some() {
+        if env_on("LLM170_MS_LOGITS") {
             let mut all_buf = vec![0f32; t * noh];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut all_buf).as_mut(), self.logits_all)?;
             for ti in 0..t {

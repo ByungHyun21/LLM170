@@ -17,6 +17,7 @@ use cubecl_hip_sys as hip;
 use llm170_gguf::GgmlType;
 
 use super::{ck, RawCtx};
+use crate::rawhip::env_on;
 
 /// 용도별 성장형 디바이스 버퍼 (해제 없음 — ADR-0014).
 struct GBuf {
@@ -32,7 +33,7 @@ impl GBuf {
 
     fn ensure(&mut self, ctx: &RawCtx, bytes: usize) -> Result<*mut u8, String> {
         if bytes > self.bytes {
-            if std::env::var_os("LLM170_Q4ACC_STATS").is_some() {
+            if env_on("LLM170_Q4ACC_STATS") {
                 eprintln!("# q4acc: {} 확장 {} → {} B", self.name, self.bytes, bytes);
             }
             self.ptr = ctx.alloc(bytes)?;
@@ -403,7 +404,7 @@ impl Q4Acc {
         }
         self.wbytes
             .fetch_add(w.data.len(), std::sync::atomic::Ordering::Relaxed);
-        if std::env::var_os("LLM170_Q4ACC_STATS").is_some() && w.data.len() >= (1 << 20) {
+        if env_on("LLM170_Q4ACC_STATS") && w.data.len() >= (1 << 20) {
             let total = self.wbytes.load(std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "# q4acc: 업로드 {:.1} MiB ({:.1} ms → {:.0} MB/s, 누적 {:.2} GiB)",

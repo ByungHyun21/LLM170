@@ -1,6 +1,7 @@
 //! decode 무게 상주화 — 업로드·레이아웃 준비 (decode/mod.rs에서 이동, plans/78 R2).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl DecodeState {
     fn a(ctx: &RawCtx, bytes: usize) -> Result<*mut u8, String> {
@@ -379,7 +380,7 @@ impl DecodeState {
     }
     /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
     fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        if !n.is_multiple_of(1024) || std::env::var_os("LLM170_RMSQ_SPLIT").is_some() {
+        if !n.is_multiple_of(1024) || env_on("LLM170_RMSQ_SPLIT") {
             self.rms(x, w, self.xn, n)?;
             return self.quant(self.xn, xq, n);
         }
@@ -422,20 +423,20 @@ impl DecodeState {
             return false;
         }
         let only = std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok());
-        if std::env::var_os("LLM170_NO_MMQ").is_some() && only.is_none() {
+        if env_on("LLM170_NO_MMQ") && only.is_none() {
             return false;
         }
         if let Some(m) = only
             && m & (1u32 << (ty - 12)) == 0 {
                 return false;
             }
-        if ty == 14 && std::env::var_os("LLM170_NO_Q6MMQ").is_some() {
+        if ty == 14 && env_on("LLM170_NO_Q6MMQ") {
             // q6_K 킬스위치: 타일 경로(활성 q8 소비). DEQ16만 f32 직소비.
-            return std::env::var_os("LLM170_DEQ16").is_some()
+            return env_on("LLM170_DEQ16")
                 && t >= 32
                 && self.ctx.co_loaded(super::CO_MMQ2);
         }
-        (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
+        (t >= 32 || (t == 1 && env_on("LLM170_Q1MMQ")))
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
     }
 
@@ -456,7 +457,7 @@ impl DecodeState {
                 .get(n)
                 .is_some_and(|&(_, ty, _, _)| self.mmq_used(ty, t) && self.mmq_used_s(ty, t))
         });
-        if std::env::var_os("LLM170_QSKIP_DBG").is_some() {
+        if env_on("LLM170_QSKIP_DBG") {
             eprintln!("# qskip t={t} n={} -> {r}", names.len());
         }
         r
@@ -474,7 +475,7 @@ impl DecodeState {
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
         for il in 0..self.n_layer {
-            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+            if env_on("LLM170_RAWHIP_TRACE") {
                 eprintln!("# rawhip: layer {il} (recr={})", self.is_recr[il]);
             }
             // pre-norm + quant
@@ -491,7 +492,7 @@ impl DecodeState {
                 // q8듀얼시 qkv/gate를 건너뛰었다 (부록90).
                 if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
-                } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
+                } else if env_on("LLM170_DECODE_PAIRS") {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
                     self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
@@ -502,7 +503,7 @@ impl DecodeState {
                 }
                 if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
                     self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
-                } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
+                } else if env_on("LLM170_DECODE_PAIRS") {
                     self.ctx.side_wait_main()?;
                     self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
                     self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
@@ -583,7 +584,7 @@ impl DecodeState {
                     args.push(Self::p(&mut t1));
                     self.ctx.launch3("gdn_ar_w", n_pairs as u32, self.d_state as u32, 1, 32, &mut args)?;
                 }
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; v_len];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.go)?;
@@ -639,7 +640,7 @@ impl DecodeState {
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
                 self.mm_into(self.xq_g, wp, ty, ni, no, self.gout)?;
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; n];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.gout)?;
@@ -648,13 +649,13 @@ impl DecodeState {
                 }
                 recr_idx += 1;
             } else {
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
                     self.ctx.sync()?;
                     let mut hn = vec![0f32; n];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hn).as_mut(), self.xn)?;
                     eprintln!("#  A3dbg xn[0..6]={:?}", &hn[0..6]);
                     // 결정적 A/B: 이 xn으로 호스트 미러 av[0] 계산
-                    if il == 3 && std::env::var_os("LLM170_RAWHIP_HOSTAB").is_some() {
+                    if il == 3 && env_on("LLM170_RAWHIP_HOSTAB") {
                         let (wp, ty, _ni, _no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
                         let mut wrow = vec![0u8; (5120 / 256) * 176];
                         self.ctx.d2h(&mut wrow, wp)?;
@@ -675,13 +676,13 @@ impl DecodeState {
                 // q/k/v mm
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.aq)?;
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  aq ok"); }
+                if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  aq ok"); }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.ak)?;
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  ak ok"); }
+                if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  ak ok"); }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.av)?;
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  av ok"); }
+                if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  av ok"); }
                 // q/k norm+rope (in-place)
                 let qn = *self.consts.get(&format!("blk.{il}.attn_q_norm")).ok_or("qn")?;
                 let kn = *self.consts.get(&format!("blk.{il}.attn_k_norm")).ok_or("kn")?;
@@ -702,10 +703,10 @@ impl DecodeState {
                     let rows = n_head + n_kv;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
                     self.ctx.launch("qk_norm_rope", rows as u32, 1, 32, &mut args)?;
-                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  qk_norm ok"); }
+                    if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  qk_norm ok"); }
                 }
                 // KV append
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
                     self.ctx.sync()?;
                     let mut hk = vec![0f32; n_kv * hd];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hk).as_mut(), self.ak)?;
@@ -749,7 +750,7 @@ impl DecodeState {
                     let gx = n_past.div_ceil(64) as u32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut mp), Self::p(&mut scp), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                     self.ctx.launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
-                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  score ok"); }
+                    if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  score ok"); }
                 }
                 // mix
                 {
@@ -768,7 +769,7 @@ impl DecodeState {
                     let gx = hd.div_ceil(64) as u32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut scp), Self::p(&mut cvp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                     self.ctx.launch3("qsa_mix2", gx, n_head as u32, 1, 64, &mut args)?;
-                    if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() { self.ctx.sync()?; eprintln!("#  mix ok"); }
+                    if env_on("LLM170_RAWHIP_TRACE") { self.ctx.sync()?; eprintln!("#  mix ok"); }
                 }
                 }
                 // t=1 fused flash (score/mix2 대체)
@@ -811,7 +812,7 @@ impl DecodeState {
                         // v2 기본(2026-09-12): 워프가 키 4개를 전담해 감축을 워프 안에서 끝낸다.
                         // gqa-bench 실측 3314키 292.9 -> 171.5us (1.71x), 최대상대차 5.1e-7.
                         // LLM170_NO_GQA2=1 이면 종전 커널로 복귀.
-                        let gqa2 = std::env::var_os("LLM170_NO_GQA2").is_none();
+                        let gqa2 = !env_on("LLM170_NO_GQA2");
                         // v_dot2(f16 KV) 경로가 기본: QK 에 셔플이 없다 (gqa-bench 3314 175.9→106.9us)
                         let gqa2d = gqa2;
                         if gqa2d {
@@ -848,7 +849,7 @@ impl DecodeState {
                         self.ctx.launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
                     }
                 }
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 3 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; n_head * hd];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut ho).as_mut(), self.aout)?;
@@ -865,7 +866,7 @@ impl DecodeState {
             }
             // 잔차
             self.axpy(self.xs, self.gout, n)?;
-            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+            if env_on("LLM170_RAWHIP_TRACE") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs)?;
@@ -877,13 +878,13 @@ impl DecodeState {
             self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            if std::env::var_os("LLM170_Q1MMQ").is_some() && matches!(tg | tu, 12 | 13 | 14 | 23)
+            if env_on("LLM170_Q1MMQ") && matches!(tg | tu, 12 | 13 | 14 | 23)
                 && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                 // 실험(부록 74): 디코드 GEMV를 mmq 타일로 — f32 직행, 별도 quant 불요.
                 self.rms(self.xs, pw, self.xn, n)?;
                 self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
                 self.mm_b2(self.xn as *mut u8, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
-            } else if std::env::var_os("LLM170_DECODE_PAIRS").is_some() {
+            } else if env_on("LLM170_DECODE_PAIRS") {
                 self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
                 self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
@@ -911,15 +912,15 @@ impl DecodeState {
                 self.quant(self.fglu, self.xq_f, self.n_ff)?;
             }
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
-            if std::env::var_os("LLM170_DOWN_PROF").is_some() { self.ctx.sync()?; }
+            if env_on("LLM170_DOWN_PROF") { self.ctx.sync()?; }
             let __td = std::time::Instant::now();
             self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
-            if std::env::var_os("LLM170_DOWN_PROF").is_some() {
+            if env_on("LLM170_DOWN_PROF") {
                 self.ctx.sync()?;
                 eprintln!("# down ty={td} no={nod} {:.3}ms", __td.elapsed().as_secs_f64() * 1e3);
             }
             self.axpy(self.xs, self.fdown, n)?;
-            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+            if env_on("LLM170_RAWHIP_TRACE") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs)?;
@@ -933,7 +934,7 @@ impl DecodeState {
         self.quant(self.xn, self.xq_n, n)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         self.mm_into(self.xq_n, wh, th, nih, noh, self.logits)?;
-        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+        if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!("step gpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(Vec::new()) // logits 상주

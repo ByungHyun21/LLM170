@@ -1,6 +1,7 @@
 //! q4acc 값 경로 — GEMM/GEMV 런치 기계 + MatmulHost·EwOps (plans/78 R1).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl Q4Acc {
 
@@ -30,7 +31,7 @@ impl Q4Acc {
         let ty = ggml_id(w.ty);
         if t >= 32
             && matches!(ty, 12 | 13 | 14 | 23)
-            && std::env::var_os("LLM170_Q4_MMQ").is_some()
+            && env_on("LLM170_Q4_MMQ")
             && self.ctx.gemm_mmq(ty, x as *const u8, wd, n_in, n_out, t, out).is_ok()
         {
             return Ok(());
@@ -74,11 +75,11 @@ impl Q4Acc {
         // 기본은 여전히 끈 상태다: 이득이 아니라 속도 근거로 옵트인 유지.
         if ty == ggml_id(GgmlType::Q4K)
             && t >= 16
-            && (std::env::var_os("LLM170_Q4K_MMQ").is_some()
-                || std::env::var_os("LLM170_Q4K_OUTS").is_some())
+            && (env_on("LLM170_Q4K_MMQ")
+                || env_on("LLM170_Q4K_OUTS"))
         {
             // 행-배치 타일(plans/65) — 가중치 디퀀트를 행 루프 밖으로.
-            if std::env::var_os("LLM170_Q4K_Y").is_some() {
+            if env_on("LLM170_Q4K_Y") {
                 let rpt: usize = std::env::var("LLM170_Q4K_YRPT")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -115,7 +116,7 @@ impl Q4Acc {
                 );
             }
             // x-스테이징 타일(plans/65) — 출력별 x 재독 제거. 로직·순서는 _m과 동일.
-            if std::env::var_os("LLM170_Q4K_X").is_some() {
+            if env_on("LLM170_Q4K_X") {
                 let mut xq_p = xq as *mut std::ffi::c_void;
                 let mut w_p = w as *mut std::ffi::c_void;
                 let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
@@ -227,7 +228,7 @@ impl Q4Acc {
             // greedy 스트림이 동일하다 — llama.cpp/vLLM과 같은 허용 오차 계약.
             // 비트 동일 판은 LLM170_Q5_1_EXACT=1로 복귀.
             let mmq = t >= 16
-                && std::env::var_os("LLM170_Q5_1_EXACT").is_none()
+                && !env_on("LLM170_Q5_1_EXACT")
                 && ty == ggml_id(GgmlType::Q5_1);
             let kern = match (mmq, tiled) {
                 (true, _) => "q4_gemm_q5_1_m",
@@ -273,7 +274,7 @@ impl Q4Acc {
         // t≥16: MMQ 타일 우선 — 단 **128토큰 이하로 쪼개서** 호출한다.
         // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다
         // (2026-09-12 실측: t=129 폴트, t=128 정상, GEMV 경로는 비트 동일).
-        if t >= 16 && std::env::var_os("LLM170_Q4_NO_TILE").is_none() {
+        if t >= 16 && !env_on("LLM170_Q4_NO_TILE") {
             // j128/v4 계열(=8/12/13/14/23)은 사분면 지원 — 그 외 타입만 128씩 분할.
             let tq_mode = matches!(
                 ty,
@@ -293,7 +294,7 @@ impl Q4Acc {
                     .ctx
                     .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
                 {
-                    if std::env::var_os("LLM170_Q4_DBG").is_some() {
+                    if env_on("LLM170_Q4_DBG") {
                         use std::sync::Mutex;
                         use std::sync::OnceLock;
                         static SEEN: OnceLock<Mutex<Vec<(u32, usize, usize, usize)>>> = OnceLock::new();
@@ -471,7 +472,7 @@ impl Q4Acc {
     ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
-        let tt = std::env::var_os("LLM170_Q4ACC_TIME").is_some();
+        let tt = env_on("LLM170_Q4ACC_TIME");
 
         let t_up = std::time::Instant::now();
         let (w_dev, w_f32) = self.dev_weight(w)?;
@@ -480,7 +481,7 @@ impl Q4Acc {
         let ydev = {
             let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
             // f16 경로는 128 사분면 경계까지 쓰므로 여유를 둔다(행 < t 만 사용).
-            let need = if std::env::var_os("LLM170_F16_ACC").is_some() {
+            let need = if env_on("LLM170_F16_ACC") {
                 t.div_ceil(128) * 128 * n_out * 4
             } else {
                 t * n_out * 4
@@ -524,14 +525,14 @@ impl Q4Acc {
             let ty0 = ggml_id(w.ty);
             if t >= 32
                 && ty0 == 8
-                && std::env::var_os("LLM170_F16_ACC").is_some()
+                && env_on("LLM170_F16_ACC")
                 && self
                     .ctx
                     .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
                     .is_ok()
             {
                 // 임시 진단: LLM170_F16_DBG=1 이면 호출 직후 동기화해 실패 지점을 명명한다.
-                if std::env::var_os("LLM170_F16_DBG").is_some() {
+                if env_on("LLM170_F16_DBG") {
                     self.ctx.sync().map_err(|e| format!("f16 sync [{n_in}x{n_out}] t={t}: {e}"))?;
                     eprintln!("f16-deq OK [{n_in}x{n_out}] t={t}");
                 }

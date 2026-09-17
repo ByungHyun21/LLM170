@@ -9,6 +9,7 @@ use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, C
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
 use std::ffi::CString;
+use crate::rawhip::{env_on, env_eq};
 
 pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
@@ -104,7 +105,7 @@ impl RawCtx {
             // 효과: tg +1.0%, pp +0.55%, judge 16/19 -> 17/19 (llama와 더 가까움).
             // LLM170_EXACTEXP=1이면 glibc 비트일치 f64 경로 복원.
             let ofast = CString::new("-DLLM170_FASTEXP").unwrap();
-            let fastexp = std::env::var_os("LLM170_EXACTEXP").is_none();
+            let fastexp = !env_on("LLM170_EXACTEXP");
             let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr(), o5.as_ptr()];
             if fastexp { opts.push(ofast.as_ptr()); }
             let rs = hip::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_mut_ptr());
@@ -141,7 +142,7 @@ impl RawCtx {
             // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
             // LLM170_NO_CO: 전부 생략 (hipRTC wm/mm + GEMV 폴백 측정용).
             let mut fam_bits = 0u8;
-            if std::env::var_os("LLM170_NO_CO").is_none() {
+            if !env_on("LLM170_NO_CO") {
                 let slots: &[(u8, &str, &[u8], &[&str])] = &[
                     (
                         CO_V4,
@@ -357,11 +358,11 @@ impl RawCtx {
             // 크기만으로도 부족했다(2026-09-14). 백트레이스는 강제로 잡는다
             // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
-            if std::env::var_os("LLM170_H2D_TRACE").is_some() {
+            if env_on("LLM170_H2D_TRACE") {
                 eprintln!("# h2d {}B dst={dst:p} q0={:?}", src.len(), &src[..src.len().min(2)]);
             }
             // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
-            if std::env::var_os("LLM170_MEMDBG").is_some() && src.len() >= (1 << 20) {
+            if env_on("LLM170_MEMDBG") && src.len() >= (1 << 20) {
                 let (mut fb, mut tb) = (0usize, 0usize);
                 let _ = hip::hipMemGetInfo(&mut fb, &mut tb);
                 eprintln!("# memdbg before {tag}: free={}MB/{}MB", fb / 1048576, tb / 1048576);
@@ -543,7 +544,7 @@ impl RawCtx {
         gz: u32,
         block: u32,
         args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), String> {        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+    ) -> Result<(), String> {        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[lbt] {name} gx={gx} gy={gy} gz={gz}");
         }
 
@@ -551,7 +552,7 @@ impl RawCtx {
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
         }
-        if std::env::var_os("LLM170_KT_NAMES").is_some() {
+        if env_on("LLM170_KT_NAMES") {
             eprintln!("# KT3 {name} gy={gy}");
         }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
@@ -818,10 +819,10 @@ impl RawCtx {
             ],
         };
         // plans/73: vdr=2 판(v2)은 측정 역행(10.83 vs 11.35 t/s) — 옵트인 자산.
-        if t == 1 && ty == 13 && std::env::var("LLM170_Q5KV2").as_deref() == Ok("1") {
+        if t == 1 && ty == 13 && env_eq("LLM170_Q5KV2", "1") {
             return self.gemv_q8_out_v2(xq, w, ty, n_in, n_out, out, xq_w, t);
         }
-        let q8tr = std::env::var_os("LLM170_Q8_TRACE").is_some();
+        let q8tr = env_on("LLM170_Q8_TRACE");
         if q8tr {
             eprintln!("# q8tr ty={ty} n_in={n_in} n_out={n_out} t={t}");
         }
@@ -839,7 +840,7 @@ impl RawCtx {
         // mt(64레인)은 이 형상에서 레인 효율 15%(np t=4 182us/호출 실측).
         // 킬스위치 LLM170_Q8MT16=0.
         if (2..=8).contains(&t) && ty == 8 && n_in / 32 <= 32
-            && std::env::var("LLM170_Q8MT16").as_deref() != Ok("0")
+            && !env_eq("LLM170_Q8MT16", "0")
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -867,7 +868,7 @@ impl RawCtx {
         // (결합법칙 — 값 불변) + 레인별 f32 사슬/ f64 32레인 트리(mt16 계열과
         // 동일 정밀도 클래스). 킬스위치 LLM170_Q8MTW=0.
         if (2..=8).contains(&t) && ty == 8 && n_in / 32 > 32
-            && std::env::var("LLM170_Q8MTW").as_deref() != Ok("0")
+            && !env_eq("LLM170_Q8MTW", "0")
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -889,7 +890,7 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if (2..=8).contains(&t) && ty == 8 && std::env::var("LLM170_Q8MT").as_deref() != Ok("0") {
+        if (2..=8).contains(&t) && ty == 8 && !env_eq("LLM170_Q8MT", "0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -915,8 +916,8 @@ impl RawCtx {
         // 따라서 **기본은 종전 커널**, 실험판은 옵트인(LLM170_Q8W4=1 / Q8W16=1).
         if t == 1
             && ty == 8
-            && (std::env::var("LLM170_Q8W4").as_deref() == Ok("1")
-                || std::env::var("LLM170_Q8W16").as_deref() == Ok("1"))
+            && (env_eq("LLM170_Q8W4", "1")
+                || env_eq("LLM170_Q8W16", "1"))
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -927,7 +928,7 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
             ];
-            let alt = std::env::var("LLM170_Q8W16").as_deref() == Ok("1");
+            let alt = env_eq("LLM170_Q8W16", "1");
             return self.launch3(
                 if alt { "gemm_q8_0_w16" } else { "gemm_q8_0_w4" },
                 n_out.div_ceil(8) as u32,
@@ -939,16 +940,16 @@ impl RawCtx {
         }
         // 실험(2026-09-16): 워프판(32레인/행)을 n_sub>32 형상까지 확대 —
         // n_sub=80에서 레인 효율 83% vs 종전 62.5%. LLM170_Q8W_ALL=1로 옵트인.
-        let w_all = t == 1 && ty == 8 && std::env::var("LLM170_Q8W_ALL").as_deref() == Ok("1");
+        let w_all = t == 1 && ty == 8 && env_eq("LLM170_Q8W_ALL", "1");
         // 소형 n_sub(≤32) 구간은 w16(16레인/행, 레인 효율 62.5-100% vs 워프판
         // 31%)으로 — FN tg128 17.2 → 18.0 t/s (+4.8%, 2026-09-16 실측, 게이트 동일).
         // 킬스위치 LLM170_Q8W16_SMALL=0.
         if t == 1
             && ty == 8
             && (n_in / 32 <= 32
-                || (n_out >= 32768 && std::env::var("LLM170_Q8W16_HEAD").as_deref() == Ok("1")))
-            && (std::env::var("LLM170_Q8W16_SMALL").as_deref() != Ok("0")
-                || std::env::var("LLM170_Q8W16_HEAD").as_deref() == Ok("1"))
+                || (n_out >= 32768 && env_eq("LLM170_Q8W16_HEAD", "1")))
+            && (!env_eq("LLM170_Q8W16_SMALL", "0")
+                || env_eq("LLM170_Q8W16_HEAD", "1"))
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -968,7 +969,7 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && std::env::var("LLM170_Q8W").as_deref() != Ok("0") {
+        if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && !env_eq("LLM170_Q8W", "0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -1048,7 +1049,7 @@ impl RawCtx {
         args.push(&mut no as *mut _ as *mut std::ffi::c_void);
         args.push(&mut xw as *mut _ as *mut std::ffi::c_void);
         args.push(&mut tt as *mut _ as *mut std::ffi::c_void);
-        if w2 && std::env::var_os("LLM170_G4_TRACE").is_some() {
+        if w2 && env_on("LLM170_G4_TRACE") {
             eprintln!("[g4w2] n_in={n_in} n_out={n_out} t={t} gy={gy} gz={gz}");
         }
         let blk: u32 = if w2 || w2q4 { 32 } else { 64 };
@@ -1142,14 +1143,14 @@ impl RawCtx {
     }
 
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
-        let j128 = std::env::var_os("LLM170_EXACT").is_none()
+        let j128 = !env_on("LLM170_EXACT")
             && self.co_loaded(CO_J128) && t > 64;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
 
     /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
     fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
-        let j128 = std::env::var_os("LLM170_EXACT").is_none()
+        let j128 = !env_on("LLM170_EXACT")
             && self.co_loaded(CO_J128);
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
     }
@@ -1161,17 +1162,17 @@ impl RawCtx {
         }
         let (v4, odd) = (self.co_loaded(CO_V4), self.co_loaded(CO_ODD));
         let kern: &'static str = match ty {
-            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if j128 { "gemm_q6k_j128" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if v4 && std::env::var_os("LLM170_XS_V4U").is_some() { "gemm_xs_v4u" } else if std::env::var_os("LLM170_XS_MM").is_some() { "gemm_xs_mm" } else if v4 && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_v4" } else if std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
-            20 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
-            11 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
-            21 => if odd && std::env::var_os("LLM170_EXACT").is_none() && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
+            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if j128 { "gemm_q6k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if v4 && env_on("LLM170_XS_V4U") { "gemm_xs_v4u" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && t >= 32 { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            20 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
+            11 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
+            21 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
             8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
-        if std::env::var_os("LLM170_TILE_SHAPES").is_some() {
+        if env_on("LLM170_TILE_SHAPES") {
             use std::sync::Mutex;
             use std::sync::OnceLock;
             static SEEN: OnceLock<Mutex<Vec<(String, usize, usize, usize)>>> = OnceLock::new();
@@ -1239,7 +1240,7 @@ impl RawCtx {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         let r = self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args);
-        if std::env::var_os("LLM170_TILE_PROF").is_some() {
+        if env_on("LLM170_TILE_PROF") {
             self.sync().ok();
             let ti = std::time::Instant::now();
             self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args).ok();
@@ -1331,7 +1332,7 @@ impl RawCtx {
                   &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
               ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
             }
-        if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
+        if env_on("LLM170_DEQ_DUMP") {
             self.sync().ok();
             let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
             let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
@@ -1416,7 +1417,7 @@ impl RawCtx {
                   &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
               ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
             }
-        if std::env::var_os("LLM170_DEQ_DUMP").is_some() {
+        if env_on("LLM170_DEQ_DUMP") {
             self.sync().ok();
             let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
             let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
@@ -1437,7 +1438,7 @@ impl RawCtx {
         // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
         let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
-        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let sym = match ty {
             12 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type12ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
             13 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type13ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
@@ -1452,7 +1453,7 @@ impl RawCtx {
         // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
         // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
         // LLM170_Q6RQ=1로만 복원.
-        let w_eff = if ty == 14 && std::env::var_os("LLM170_Q6RQ").is_some() {
+        let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
             if let Some(&p2) = c.get(&key) { p2 }
@@ -1468,7 +1469,7 @@ impl RawCtx {
                     let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
                     ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
                 }
-                if std::env::var_os("LLM170_RQ_DUMP").is_some() {
+                if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
                     let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
@@ -1564,14 +1565,14 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
         // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
         let qk: usize = if ty == 8 { 32 } else { 256 };
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
-        let j_now: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let j_now: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let mut ntx_fd = fd3(t.div_ceil(j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;
@@ -1613,7 +1614,7 @@ impl RawCtx {
             self.ktr_mark(tag, t as u32);
             ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, t.div_ceil(128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
             self.ktr_mark(tag, t as u32);
-        if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
+        if env_on("LLM170_MMQ_ARGS") {
             eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
                 n_out.div_ceil(128), t.div_ceil(128), n_in / 256, n_out, n_out);
         }
@@ -1627,7 +1628,7 @@ impl RawCtx {
         // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
         let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
             .ok_or("mmq quant 없음")?;
-        let _j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let _j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let sym = match ty {
             12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
             13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
@@ -1641,7 +1642,7 @@ impl RawCtx {
         // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
         // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
         // LLM170_Q6RQ=1로만 복원.
-        let w_eff = if ty == 14 && std::env::var_os("LLM170_Q6RQ").is_some() {
+        let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
             if let Some(&p2) = c.get(&key) { p2 }
@@ -1657,7 +1658,7 @@ impl RawCtx {
                     let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
                     ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
                 }
-                if std::env::var_os("LLM170_RQ_DUMP").is_some() {
+                if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
                     let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
@@ -1699,14 +1700,14 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
         // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
         let qk: usize = if ty == 8 { 32 } else { 256 };
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
-        let j_now: usize = if std::env::var_os("LLM170_MMQ64").is_some() { 64 } else { 128 };
+        let j_now: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let mut ntx_fd = fd3(t.div_ceil(j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;
@@ -1739,7 +1740,7 @@ impl RawCtx {
                 ntx_fd.as_mut_ptr() as *mut _,
             ];
             ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, t.div_ceil(128) as u32, 1, 32, 8, 1, smem as u32, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
-        if std::env::var_os("LLM170_MMQ_ARGS").is_some() {
+        if env_on("LLM170_MMQ_ARGS") {
             eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
                 n_out.div_ceil(128), t.div_ceil(128), n_in / 256, n_out, n_out);
         }

@@ -3,6 +3,7 @@
 
 use crate::rawhip::RawCtx;
 use std::collections::HashMap;
+use crate::rawhip::env_on;
 
 pub struct Vit {
     ctx: std::sync::Arc<RawCtx>,
@@ -80,7 +81,7 @@ impl Vit {
     }
 
     fn time_stage(&self, label: &str, t0: &std::time::Instant) {
-        if std::env::var_os("LLM170_VIT_TIME").is_some() {
+        if env_on("LLM170_VIT_TIME") {
             let _ = self.ctx.sync();
             eprintln!("[vtime] {label} +{:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -145,7 +146,7 @@ impl Vit {
         let tmark = std::time::Instant::now();
         let mut tlast = tmark;
         for il in 0..self.n_blk {
-            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+            if il == 1 && env_on("LLM170_VIT_TIME") {
                 self.time_stage("L0 total", &tlast);
                 tlast = std::time::Instant::now();
             }
@@ -156,7 +157,7 @@ impl Vit {
             let (wq, rows, ni) = self.wt(&format!("v.blk.{il}.attn_qkv.weight"))?;
             let bq = self.wt(&format!("v.blk.{il}.attn_qkv.bias"))?.0;
             self.gemm(self.b_xn, wq, bq, ni, rows, self.b_qkv, t)?;
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+            if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut v = vec![0f32; t * n];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_xn)?;
@@ -179,7 +180,7 @@ impl Vit {
                 ];
                 self.ctx.launch3("vit_rope", t as u32, nh as u32, 1, 32, &mut args)?;
             }
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+            if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut q = vec![0f32; 8];
                 let base = unsafe { self.b_qkv.add(0) };
@@ -190,7 +191,7 @@ impl Vit {
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut k).as_mut(), unsafe { self.b_qkv.add(n * 4) })?;
                 eprintln!("[vit] L0 roped k0..3={:?}", &k);
             }
-            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+            if il == 1 && env_on("LLM170_VIT_TIME") {
                 self.time_stage("L: ln1+qkv+rope", &tlast);
                 tlast = std::time::Instant::now();
             }
@@ -221,7 +222,7 @@ impl Vit {
                 ];
                 self.ctx.launch3("flash_vit", t as u32, nh as u32, 1, 256, &mut args)?;
             }
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
+            if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut a = vec![0f32; 8];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut a).as_mut(), self.b_attn)?;
@@ -232,7 +233,7 @@ impl Vit {
                 };
                 eprintln!("[vit] L0 attn sum={asum:.4} a0..7={:?}", &a);
             }
-            if il == 1 && std::env::var_os("LLM170_VIT_TIME").is_some() {
+            if il == 1 && env_on("LLM170_VIT_TIME") {
                 self.time_stage("L: attention", &tlast);
                 tlast = std::time::Instant::now();
             }
@@ -258,7 +259,7 @@ impl Vit {
             self.gemm(self.b_mid, dw, db, dni, drows, self.b_proj, t)?;
             self.axpy(self.b_x, self.b_proj, t * n)?;
         }
-        if std::env::var_os("LLM170_VIT_TIME").is_some() {
+        if env_on("LLM170_VIT_TIME") {
             self.time_stage("L: ffn+residual (last)", &tlast);
         }
         // post_ln → merger: [t/4][4n] pack → mm0 gelu → mm2

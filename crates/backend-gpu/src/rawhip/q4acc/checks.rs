@@ -1,6 +1,7 @@
 //! q4acc 검증 — GPU↔CPU 미러 체크 서브커맨드 (plans/78 R1).
 
 use super::*;
+use crate::rawhip::env_on;
 
 /// q5_1 커널 마이크로 검증 — 합성 블록 1개(d=1.0, m=-0.5, q=i%32)로
 /// GPU ↔ CPU 레인 미러를 원소 수준에서 대조한다 (`q4-acc-check micro`).
@@ -482,7 +483,7 @@ pub fn check_tensor(
             n += 1;
         }
     }
-    if std::env::var_os("LLM170_Q4ACC_ROWDBG").is_some() {
+    if env_on("LLM170_Q4ACC_ROWDBG") {
         for &ri in &[0usize, 1, 2, 127, 128, 129, 130, 199, 200, 201, 255] {
             if ri >= gpu.len() {
                 continue;
@@ -495,7 +496,7 @@ pub fn check_tensor(
             eprintln!("# row {ri}: maxerr={m:.5}");
         }
     }
-    if std::env::var_os("LLM170_Q4ACC_DBG").is_some() {
+    if env_on("LLM170_Q4ACC_DBG") {
         eprintln!("# gpu[0][..8] = {:?}", &gpu[0][..8]);
         eprintln!("# cpu[0][..8] = {:?}", &cpu[0][..8]);
     }

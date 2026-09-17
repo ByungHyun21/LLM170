@@ -1,11 +1,12 @@
 //! q4acc MoE — 전문가 그룹화·순열 (q4acc/mod.rs 에서 이동, plans/78 R1).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl Q4Acc {
     /// 진단(LLM170_MOE_HASH): moe 최종 출력(out) 해시 — DEV/HOST 경로 비교용.
     pub(super) fn moe_hash_check(&self, tag: &str, op: *mut u8, rows: usize, n_out: usize) -> Result<(), String> {
-        if std::env::var_os("LLM170_MOE_HASH").is_none() {
+        if !env_on("LLM170_MOE_HASH") {
             return Ok(());
         }
         // out의 행 수는 토큰 수(t) — rows는 t·k_sel이므로 rows/k_sel… 대신

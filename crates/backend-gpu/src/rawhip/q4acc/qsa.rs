@@ -1,6 +1,7 @@
 //! q4acc QSA — 인덱서 어텐션 raw 내부 + QsaOps (plans/78 R1).
 
 use super::*;
+use crate::rawhip::{env_on, env_eq};
 
 impl Q4Acc {
     /// q4_qsa_attn_sel 런치 본체 — 선택 목록(오름차순 위치)만 순회한다.
@@ -160,7 +161,7 @@ impl Q4Acc {
         // 게이트를 레지스터에서 빼면 qr[6][8]+acc[6][8]=96으로 4헤드판과 같은
         // 예산이라 K/V 행 재독이 6회 -> 4회로 준다(프리필 어텐션이 대역폭 바운드:
         // t=2048 콜당 ~34GB/236GB/s ~= 실측 101ms). 12의 배수가 아니면 4헤드판.
-        let use6 = n_head.is_multiple_of(12) && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        let use6 = n_head.is_multiple_of(12) && !env_eq("LLM170_QSA_H6", "0");
         let (kern, gy) = if use6 {
             ("q4_qsa_attn_sel6", (n_head / 12) as u32)
         } else {
@@ -402,7 +403,7 @@ impl Q4Acc {
         t: usize,
         out: u64,
     ) -> Result<(), String> {
-        let use_split = t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0");
+        let use_split = t == 1 && !env_eq("LLM170_QSA_SPLIT", "0");
         let (sdev, ofdev, pdev) = {
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
@@ -921,7 +922,7 @@ impl Q4Acc {
         )?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
-        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+        if env_on("LLM170_Q4_DBG") {
             let bad = out.iter().filter(|v| !v.is_finite()).count();
             let badq = q.iter().filter(|v| !v.is_finite()).count();
             eprintln!("# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}", out.len());
@@ -949,7 +950,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         // t=1은 위치 분할판(flash-decoding형) — 디바이스 q·출력판이 같은 커널
         // 쌍을 쓴다. 규약은 호스트 판(qsa_attention_sel)과 동일: LLM170_QSA_SPLIT=0
         // 이면 비분할 sel6/sel4로 돌아간다.
-        if t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0") {
+        if t == 1 && !env_eq("LLM170_QSA_SPLIT", "0") {
             self.qsa_attn_sel4s_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
         } else {
             self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
@@ -1135,7 +1136,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             let ofdev = e2.ensure(&self.ctx, 2 * 4)? as u64;
             (sdev, ofdev)
         };
-        if n_blocks > 0 && n_blocks <= 4096 && std::env::var("LLM170_QSA_TOPK").as_deref() != Ok("0")
+        if n_blocks > 0 && n_blocks <= 4096 && !env_eq("LLM170_QSA_TOPK", "0")
         {
             // 비토닉 단일 블록판 — rank+expand 콤보 대비 ~20×(0.228 → ~0.01ms).
             let (mut sp, mut si, mut so) = (
@@ -1326,7 +1327,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
     ) -> Result<(), String> {
         // sel 버퍼가 이미 디바이스에 있다 — 업로드 없이 qsa_attn_res와 동일한
         // 커널 쌍(t=1 분할 우선)을 발사한다.
-        if t != 1 || std::env::var("LLM170_QSA_SPLIT").as_deref() == Ok("0") {
+        if t != 1 || env_eq("LLM170_QSA_SPLIT", "0") {
             return Err(format!("qsa_attention_dev_sel: t={t} 비분할은 미지원"));
         }
         let cap = std::env::var("LLM170_QSA_SPLITS")
@@ -1430,7 +1431,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         // 폴백을 유발했지만 호출자(qsa.rs)의 Err 경로가 CPU 재계산 없이 **빈
         // 어텐션 행**을 반환해 어텐션 자체가 누락됐다(양 경로 동일 → 자가일치
         // 검사가 통과). 유일한 강제 폴백: LLM170_QSA_CPU=1.
-        if std::env::var_os("LLM170_QSA_CPU").is_some() {
+        if env_on("LLM170_QSA_CPU") {
             return Err(format!("q4acc: qsa_attention t={t} CPU 강제(LLM170_QSA_CPU)"));
         }
         self.qsa_attn_raw(q, ck, cv, mask, kq_scale, n_past, n_head, n_kv, hd, t)
@@ -1450,7 +1451,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         hd: usize,
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        if std::env::var_os("LLM170_QSA_CPU").is_some() {
+        if env_on("LLM170_QSA_CPU") {
             return Err(format!("q4acc: qsa_attention_sel t={t} CPU 강제"));
         }
         // 4헤드-퍼-워프판은 K/V 행을 4헤드가 공유한다(트래픽 1/4) — 프리필에서
@@ -1467,7 +1468,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         // t=1 분할판은 기본 ON이다(장문맥 디코드 142.5 -> 124.4 ms/스텝 = -12.7%,
         // diverse 스트림 완전 동일, 단문맥 무회귀). 비트 동일 경로 복귀는
         // LLM170_QSA_SPLIT=0, 분할 상한은 LLM170_QSA_SPLITS(기본 64, 목록/32로 적응).
-        if t == 1 && std::env::var("LLM170_QSA_SPLIT").as_deref() != Ok("0") {
+        if t == 1 && !env_eq("LLM170_QSA_SPLIT", "0") {
             // 위치 분할(flash-decoding형) — 지연 바운드인 t=1을 (split, 헤드묶음)
             // 그리드로 펼친다. 부분 소프트맥스를 2차 커널이 병합하므로 합산
             // 순서가 달라진다(greedy 스트림 동일성으로 검증, 비트 동일 아님).

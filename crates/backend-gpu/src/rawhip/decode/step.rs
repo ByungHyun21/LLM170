@@ -1,6 +1,7 @@
 //! decode 스텝 — 단일 시퀀스 prefill 배치 스텝 (plans/78 R2).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl DecodeState {
     /// 프리필 배치 스텝 — t 토큰 (emb: [t][n_embd], pos0..pos0+t-1), 마지막 logits.
@@ -8,13 +9,13 @@ impl DecodeState {
     /// conv/AR/KV/qsa 순차·토큰 의존 — 토큰 루프. 산술은 step()과 토큰당 동일열.
     #[allow(clippy::too_many_lines)]
     pub fn step_batch(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
-        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[xf] step_batch");
         }
         let t = emb.len() / self.n_embd;
         debug_assert!(t >= 1 && t <= self.b_t_max);
         let n = self.n_embd;
-        let prof = std::env::var_os("LLM170_PP_PROF").is_some();
+        let prof = env_on("LLM170_PP_PROF");
         let t0w = std::time::Instant::now();
         let mut marks: Vec<(String, hip::hipEvent_t)> = Vec::new();
         let gmark = |lab: &str, marks: &mut Vec<(String, hip::hipEvent_t)>| {
@@ -128,7 +129,7 @@ gmark("gdn_mm", &mut marks);
                     let mut d = self.d_state as i32;
                     let mut ng = self.n_group as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut ep), Self::p(&mut sc), Self::p(&mut d), Self::p(&mut ng)];
-                    let l2k = if std::env::var_os("LLM170_EXACT").is_some() { "l2_rows2_scale" } else { "l2_rows2_scale_w" };
+                    let l2k = if env_on("LLM170_EXACT") { "l2_rows2_scale" } else { "l2_rows2_scale_w" };
                     self.ctx.launch3(l2k, (2 * self.n_group) as u32, t as u32, 1, 32, &mut args)?;
                 }
 gmark("split+l2", &mut marks);
@@ -161,9 +162,9 @@ gmark("betag", &mut marks);
                     let mut asc = 1.0f32 / (self.d_state as f32).sqrt();
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut sp3), Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut vp), Self::p(&mut bgp), Self::p(&mut op), Self::p(&mut d), Self::p(&mut ks), Self::p(&mut vs), Self::p(&mut hv), Self::p(&mut hk), Self::p(&mut asc), Self::p(&mut tt)];
-                    if std::env::var_os("LLM170_EXACT").is_some() || std::env::var_os("LLM170_AR_T").is_some() {
+                    if env_on("LLM170_EXACT") || env_on("LLM170_AR_T") {
                         self.ctx.launch3("gdn_ar_t", self.dt_rank as u32, (self.d_state / 64) as u32, 1, 64, &mut args)?;
-                    } else if t >= 128 && self.d_state == 128 && std::env::var_os("LLM170_ARCHUNK").is_some() {
+                    } else if t >= 128 && self.d_state == 128 && env_on("LLM170_ARCHUNK") {
                         // 청크 스캔 (부록 72): A(로컬)→B(캐리)→C(보정)
                         const CH: usize = 64;
                         let npair = self.dt_rank;
@@ -195,7 +196,7 @@ gmark("betag", &mut marks);
                             Self::p(&mut bnp),
                         ];
                         self.ctx.launch3("gdn_ar_chunk_c2", npair as u32, nc as u32, 1, d as u32, &mut cc)?;
-                    } else if std::env::var_os("LLM170_ARSM").is_some() && self.d_state == 128 {
+                    } else if env_on("LLM170_ARSM") && self.d_state == 128 {
                         // 부록82: smem 스테이징 AR (k/q 128중 재독 제거)
                         self.ctx.launch3("gdn_ar_sm", self.dt_rank as u32, 2, 1, 64, &mut args)?;
                     } else {
@@ -206,7 +207,7 @@ gmark("betag", &mut marks);
                 if il == 0 {
                     self.trace_rows("tr_go", self.go_t, v_len, t)?;
                 }
-                if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                     self.ctx.sync()?;
                     let mut hq = vec![0f32; k_len * t];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq).as_mut(), self.gq_t)?;
@@ -383,7 +384,7 @@ gmark("attn", &mut marks);
                             // 갭 12s'로 위장한 게 이 어텐션 커널 시간이었다.
                             if wk
                                 && hd == 256
-                                && std::env::var_os("LLM170_WK_WMMA").is_some()
+                                && env_on("LLM170_WK_WMMA")
                                 && super::probes::wmma_ok()
                             {
                                 // WMMA 타일 판(기본): Q_in_reg + Q 버퍼를 K/V 로 재사용. 공유 32768B.
@@ -412,15 +413,15 @@ gmark("attn", &mut marks);
                             // 프롬프트 최대 2326토큰은 wk8i 클래스 유지). 폭 넓은 채택은
                             // llama 참조 재수집 후 재판정 과제. LLM170_NO_WMMA2=1
                             // 이면 전 구간 wk8i.
-                            if std::env::var_os("LLM170_NO_WMMA2").is_none()
+                            if !env_on("LLM170_NO_WMMA2")
                                 && np_ > 2560 {
-                                let v2k = std::env::var_os("LLM170_NO_WMMA2V2").is_none();
+                                let v2k = !env_on("LLM170_NO_WMMA2V2");
                                 self.ctx.launch3(if v2k { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, t.div_ceil(16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
-                            } else if std::env::var_os("LLM170_WK8D").is_some() {
+                            } else if env_on("LLM170_WK8D") {
                                 self.ctx.launch3("qsa_flash_wk8d", t.div_ceil(8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            } else if std::env::var_os("LLM170_NO_WK8I").is_none() {
+                            } else if !env_on("LLM170_NO_WK8I") {
                                 self.ctx.launch3("qsa_flash_wk8i", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            } else if std::env::var_os("LLM170_NO_WK8").is_none() {
+                            } else if !env_on("LLM170_NO_WK8") {
                                 self.ctx.launch3("qsa_flash_wk8", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else {
                                 self.ctx.launch3("qsa_flash_wk16", t.div_ceil(16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
@@ -471,7 +472,7 @@ gmark("ffn_quant", &mut marks);
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
             let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
             let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
-            if std::env::var_os("LLM170_PP_PAIRS").is_none() {
+            if !env_on("LLM170_PP_PAIRS") {
                 // 기본: 직렬 — 2스트림 페어는 join2(이벤트) 오버헤드가 이득을 넘는다
                 // (2026-09-12 A/B: 직렬 +0.75%, LLM170_PP_PAIRS=1로 페어 복원).
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
@@ -507,14 +508,14 @@ gmark("ffn_up", &mut marks);
                 self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
             }
 gmark("ffn_silu", &mut marks);
-            if std::env::var_os("LLM170_DUMP_XQN").is_some() && il == 0 {
+            if env_on("LLM170_DUMP_XQN") && il == 0 {
                 self.ctx.sync()?;
                 let mut bytes = vec![0u8; xq_sn * 4 * t];
                 self.ctx.d2h(bytes.as_mut_slice(), self.xq_n_t)?;
                 let _ = std::fs::write(std::env::var_os("LLM170_DUMP_XQN").unwrap(), &bytes);
                 eprintln!("#  xq_n_t dumped: {} words", xq_sn * t);
             }
-            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() && il == 0 {
+            if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                 self.ctx.sync()?;
                 let mut hf = vec![0f32; self.n_ff * t];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut hf).as_mut(), self.fgate_t)?;
@@ -532,7 +533,7 @@ gmark("ffn_quant2", &mut marks);
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
 self.axpy(self.xs_t, self.fdown_t, n * t)?;
             gmark("ffn", &mut marks);
-            if std::env::var_os("LLM170_RAWHIP_TRACE").is_some() {
+            if env_on("LLM170_RAWHIP_TRACE") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n * t];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs_t)?;

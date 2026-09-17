@@ -17,6 +17,7 @@ use cubecl_hip_sys as hip;
 use super::RawCtx;
 use super::{CO_MMQ, CO_MMQ2, CO_MMQ3, probes};
 use llm170_core::matmul::Weight;
+use crate::rawhip::{env_on, env_eq};
 
 /// 디코드 상주 상태 — 스텝마다 재사용, 해제 없음.
 /// 원시 포인터는 단일 GPU 컨텍스트 소유 — Mutex 직렬화 하 Send 안전.
@@ -159,7 +160,7 @@ impl RawDecoder {
 /// plans/78 R6: NO_FLASH/GQA/GQA2/GQA2D 커널 스위치는 폐기 — 이 함수는
 /// KV 덤프 진단(weights.rs)을 위해서만 남고, NO_GQA2D=1이 f32 KV를 복원한다.
 fn legacy_f32() -> bool {
-    std::env::var_os("LLM170_NO_GQA2D").is_some()
+    env_on("LLM170_NO_GQA2D")
 }
 
 fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: usize, n: usize) -> Result<(), String> {
@@ -193,18 +194,18 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
-        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
+        if env_on("LLM170_KTRACE") { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         let r = ds.read_logits();
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             eprintln!("{}", crate::rawhip::ktrace_dump());
         }
         if let (Some(path), Ok(v)) = (std::env::var_os("LLM170_DUMP_LOGITS"), r.as_ref()) {
             let _ = std::fs::write(&path, bytemuck::cast_slice(v));
         }
-        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+        if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!("batch({} tok) wall={:.1}ms", emb.len() / ds.n_embd, t0.elapsed().as_secs_f64() * 1e3);
         }
                 r
@@ -228,12 +229,12 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         emb: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let t0 = std::time::Instant::now();
-        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
+        if env_on("LLM170_KTRACE") { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         // 진단: 프리필 후 MTP KV가 채워졌는지 (비영 검사)
-        if std::env::var_os("LLM170_DUMP_MTPKV").is_some() {
+        if env_on("LLM170_DUMP_MTPKV") {
             let nw = 4096usize; // 앞 16KB
             let mut kv = vec![0f32; nw];
             if let Some(buf) = ds.mtp_kv_k.get(seq).copied() {
@@ -253,10 +254,10 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let last_row = unsafe { ds.xs_t.add((t - 1) * ds.n_embd * 4) };
         ds.ctx.d2h(bytemuck::cast_slice_mut(&mut h_last).as_mut(), last_row)?;
         let r = ds.read_logits();
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             eprintln!("{}", crate::rawhip::ktrace_dump());
         }
-        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+        if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!("batch_h({} tok) wall={:.1}ms", t, t0.elapsed().as_secs_f64() * 1e3);
         }
                 Ok((r?, h_last))
@@ -289,7 +290,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         let t_rv0 = std::time::Instant::now();
         ds.verify_batch(seq, pos0, emb, argmaxes)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[rv] verify_batch={:.1}ms", t_rv0.elapsed().as_secs_f64() * 1e3);
         }
         // 행별 최종 hidden export (MTP 상태 진행용) — xs_t에 step_batch 결과 잔존
@@ -299,7 +300,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         let t_h0 = std::time::Instant::now();
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+        if env_on("LLM170_SPEC_TIMING") {
             eprintln!("[rv] h_all d2h={:.1}ms", t_h0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(())
@@ -329,9 +330,9 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<Vec<f32>>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
+        if env_on("LLM170_KTRACE") { crate::rawhip::ktrace_on(); }
         let r = ds.step_batch_np(seqs, poss, emb);
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             eprintln!("{}", crate::rawhip::ktrace_dump());
         }
         r
@@ -368,11 +369,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<u32>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             crate::rawhip::ktrace_on();
         }
         let r = ds.step_batch_np_greedy(seqs, poss, emb);
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             eprintln!("{}", crate::rawhip::ktrace_dump());
         }
         r
@@ -454,16 +455,16 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
-        if std::env::var_os("LLM170_KTRACE").is_some() { crate::rawhip::ktrace_on(); }
+        if env_on("LLM170_KTRACE") { crate::rawhip::ktrace_on(); }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
         ds.step(seq, pos)?;
         let r = ds.read_logits();
-        if std::env::var_os("LLM170_KTRACE").is_some() {
+        if env_on("LLM170_KTRACE") {
             eprintln!("{}", crate::rawhip::ktrace_dump());
         }
-        if std::env::var_os("LLM170_RAWHIP_TIMING").is_some() {
+        if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!("step cpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         r
@@ -616,20 +617,20 @@ impl DecodeState {
     /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
         let only = { let _t = std::time::Instant::now(); std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok()) };
-        if std::env::var_os("LLM170_NO_MMQ").is_none() || only.is_some() {
+        if !env_on("LLM170_NO_MMQ") || only.is_some() {
             // plans/73 우선순위 수정: && 가 || 보다 먼저 결합해 좌변(K계열)이
             // t 게이트·CO 검사를 **우회**했다 — step_batch 의 verify(t=4~16)가
             // 전부 MMQ 로 돌아 296ms/4행 (3.9x, 무계약)을 낸 근원. 게이트가
             // 양쪽 분기 모두에 적용되도록 괄호 명시.
             if (((only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
-                || ((ty == 8 && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none())))
-                && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
+                || ((ty == 8 && env_eq("LLM170_Q8MMQ", "1")) && (ty != 14 || !env_on("LLM170_NO_Q6MMQ"))))
+                && (t >= 32 || (t == 1 && env_on("LLM170_Q1MMQ")))
                 && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
                         return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
             // q6_K: dequant→f16 v4 타일 (llama dequant+MFMA 경로 대응, 부록42)
             if ty == 14 && t >= 32 && self.ctx.co_loaded(super::CO_MMQ2)
-                && std::env::var_os("LLM170_DEQ16").is_some() {
+                && env_on("LLM170_DEQ16") {
                 return self.ctx.gemm_f16_q6(y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
             }
         }
@@ -638,7 +639,7 @@ impl DecodeState {
 
     /// plans/28 디버그: 버퍼의 행별 L1 노름 덤프 (지연 게이트) — 수치 오염 행 탐지.
     fn trace_rows(&self, label: &str, ptr: *const u8, row_f32: usize, t: usize) -> Result<(), String> {
-        if std::env::var_os("LLM170_MS_TRACE").is_none() {
+        if !env_on("LLM170_MS_TRACE") {
             return Ok(());
         }
         let mut buf = vec![0f32; row_f32 * t];
@@ -678,15 +679,15 @@ impl DecodeState {
             );
         }
         // q5_K v2 (부록76): vdr=2 그리드-스트라이드 — 자체 스트림 (비트계약 아님)
-        if ty == 13 && t == 1 && std::env::var_os("LLM170_Q5V2").is_some() {
+        if ty == 13 && t == 1 && env_on("LLM170_Q5V2") {
             return self.ctx.gemv_q8_out_v2(xq as *const u8, wp as *const u8, ty, n_in, n_out, out, xq_w, t);
         }
         // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
-        let odd_v4 = std::env::var_os("LLM170_EXACT").is_none()
+        let odd_v4 = !env_on("LLM170_EXACT")
             && self.ctx.co_loaded(super::CO_ODD) && t >= 32
             && matches!(ty, 20 | 11 | 21);
         // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
-        let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && std::env::var_os("LLM170_EXACT").is_none()
+        let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && !env_on("LLM170_EXACT")
             && self.ctx.co_loaded(super::CO_J128);
         if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)

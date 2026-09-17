@@ -1,6 +1,7 @@
 //! decode np — 멀티슬롯 배치 디코드 스텝 (plans/78 R2).
 
 use super::*;
+use crate::rawhip::env_on;
 
 impl DecodeState {
     /// np 배치 디코드 — GEMM/요소커널은 t=n_seqs 행 공유, 상태커널(conv/AR/rope/KV/flash)은
@@ -32,7 +33,7 @@ impl DecodeState {
         emb: &[f32],
         greedy: bool,
     ) -> Result<(Vec<Vec<f32>>, Vec<u32>), String> {
-        if std::env::var_os("LLM170_LAUNCH_BT").is_some() {
+        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[xf] step_batch_np");
         }
         let t = seqs.len();
@@ -180,9 +181,9 @@ impl DecodeState {
                     self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, self.d_state as u32, 1, 32, &mut args)?;
                 }
                 }
-                if std::env::var_os("LLM170_NP_DBG6").is_some() && il == 0 {
+                if env_on("LLM170_NP_DBG6") && il == 0 {
                     self.ctx.sync()?;
-                    if std::env::var_os("LLM170_NP_DBG7").is_some() {
+                    if env_on("LLM170_NP_DBG7") {
                         let mut hq2 = vec![0f32; conv_ch * t];
                         self.ctx.d2h(bytemuck::cast_slice_mut(&mut hq2).as_mut(), self.gqkv_t)?;
                         let mut hc = vec![0f32; conv_ch * t];
@@ -362,7 +363,7 @@ impl DecodeState {
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
-            if std::env::var_os("LLM170_NP_DBG3").is_some() && il % 8 == 0 {
+            if env_on("LLM170_NP_DBG3") && il % 8 == 0 {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n * t];
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv).as_mut(), self.xs_t)?;
@@ -424,7 +425,7 @@ impl DecodeState {
             }
             (out, Vec::new())
         };
-        if std::env::var_os("LLM170_NP_TIME").is_some() {
+        if env_on("LLM170_NP_TIME") {
             eprintln!("[npstep] t={t} greedy={greedy} {:.1}ms", np_t0.elapsed().as_secs_f64() * 1e3);
         }
         Ok((out, toks))

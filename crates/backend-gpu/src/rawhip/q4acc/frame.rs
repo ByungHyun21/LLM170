@@ -1,6 +1,7 @@
 //! q4acc 프레임 — FrameState·FrameHost (활성 상주 디코드, plans/78 R1).
 
 use super::*;
+use crate::rawhip::{env_on, env_eq};
 
 impl llm170_core::matmul::FrameState for Q4Acc {
     fn set_ctx_len(&self, n: usize) {
@@ -46,7 +47,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let mut sc = 1.0f32;
         // t토큰 순차 재귀 — 커널 내부 ti 루프가 상태를 이어간다(1런치).
         let mut tt = self.t_cur() as i32;
-        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+        if env_on("LLM170_Q4_DBG") {
             eprintln!(
                 "# ar-args s={:?} q={:?} k={:?} v={:?} bg={:?} out={:?} d={dd} ks={ks} vs={vs} hv={hv} hk={hk}",
                 sp as usize, qp as usize, kp as usize, vp as usize, bp as usize, op_ as usize
@@ -109,7 +110,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         n_expert_stack: usize,
         k_sel: usize,
     ) -> Result<(), String> {
-        let tm = std::env::var_os("LLM170_MOE_TIME").is_some();
+        let tm = env_on("LLM170_MOE_TIME");
         let t0 = std::time::Instant::now();
         let mut lap = t0;
         let phase = |name: &str, lap: &mut std::time::Instant| {
@@ -161,7 +162,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q4K
             && !f32w
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+            && !env_on("LLM170_MOE_GROUPED")
         {
             let idp = self.fptr(ids)?;
             // K-분할: 타일 40블록(=1/CU)이던 점유율을 ksplit배로. 부분합은 part에
@@ -238,8 +239,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
-            && std::env::var("LLM170_Q5W").as_deref() != Ok("0")
+            && !env_on("LLM170_MOE_GROUPED")
+            && !env_eq("LLM170_Q5W", "0")
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
@@ -278,8 +279,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
-            && std::env::var("LLM170_Q8IDS").as_deref() != Ok("0")
+            && !env_on("LLM170_MOE_GROUPED")
+            && !env_eq("LLM170_Q8IDS", "0")
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
@@ -302,7 +303,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
                 (&mut ew) as *mut _ as *mut std::ffi::c_void,
             ];
-            if std::env::var_os("LLM170_Q8IDS_DBG").is_some() {
+            if env_on("LLM170_Q8IDS_DBG") {
                 eprintln!("# q8ids launch n_in={n_in} n_out={n_out} rows={rows} per_expert={per_expert}");
             }
             self.ctx.launch3(
@@ -353,8 +354,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // (패딩/비패딩 gather·scatter·폴백 오프셋)를 전면 교정했으나
                 // 잔여 발산(16토큰 중 마지막 1개 플립)과 진단 동기화 시에만
                 // 재현되는 폴백 행 수 오염이 남아 기본 경로는 유지한다.
-                let pf_exp = std::env::var("LLM170_MOE_GROUP_PF").as_deref() == Ok("1");
-                if std::env::var("LLM170_MOE_GROUP_DEV").as_deref() != Ok("0")
+                let pf_exp = env_eq("LLM170_MOE_GROUP_PF", "1");
+                if !env_eq("LLM170_MOE_GROUP_DEV", "0")
                     && (self.t_cur() == 1 || pf_exp)
                     && ne <= 512
                     && rows > 0
@@ -387,7 +388,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         (ppd, ipd, txd, offd, rpd)
                     };
                     self.moe_group_dev(ids, ne, rows, offd, pd, ivd, rxd, ppd, ipd, txd, rpd, bound)?;
-                    if std::env::var_os("LLM170_MOE_GCHECK").is_some() {
+                    if env_on("LLM170_MOE_GCHECK") {
                         // 진단: 디바이스 테이블과 호스트 재계산을 비교(첫 불일치 지점 출력).
                         self.ctx.sync().map_err(|e| e.to_string())?;
                         let mut dev_off = vec![0i32; ne + 2];
@@ -437,9 +438,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
                     // 호스트 경로와 같은 순서 조건을 만들어 순서 효과를 검정한다.
                     // 이분법: 비동기 예약 자체를 건너뛴다(폴백은 동기 d2h로).
-                    let pinned_off = if std::env::var_os("LLM170_MOE_GROUP_NOD2H").is_some() {
+                    let pinned_off = if env_on("LLM170_MOE_GROUP_NOD2H") {
                         std::ptr::null_mut()
-                    } else if std::env::var_os("LLM170_MOE_GROUP_SYNC").is_some() {
+                    } else if env_on("LLM170_MOE_GROUP_SYNC") {
                         let buf = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
                         self.ctx.d2h_wait()?;
                         buf
@@ -541,7 +542,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     let txd = c.ensure(&self.ctx, (rows_pad / 16).max(1) * 4)? as u64;
                     (ppd, ipd, txd)
                 };
-                if std::env::var_os("LLM170_GE5_DBG").is_some() {
+                if env_on("LLM170_GE5_DBG") {
                     eprintln!(
                         "# ge5 rows={rows} rows_pad={rows_pad} ne={ne} ppd={ppd} ipd={ipd} txd={txd} \
 perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
@@ -615,7 +616,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             // o-행 하나에 16전문가 가중치가 필요해 공유 버퍼로 표현 불가, 시도 후 복원).
             // 워프-퍼-행 재설계도 q5_1의 6워드 슈퍼블록 입도 때문에 3배가 한계였다.
             // 즉 6ms는 Q5_1 레이아웃 고유 비용이다.
-            if self.t_cur() == 1 && std::env::var_os("LLM170_MOE_GROUPED").is_none() {
+            if self.t_cur() == 1 && !env_on("LLM170_MOE_GROUPED") {
                 let idp = self.fptr(ids)?;
                 let mut x_p = xq as *mut std::ffi::c_void;
                 let mut w_p = wd as *mut std::ffi::c_void;
@@ -730,7 +731,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 use std::sync::Mutex;
                 use std::sync::OnceLock;
                 static SEEN: OnceLock<Mutex<Vec<(usize, usize, usize)>>> = OnceLock::new();
-                if std::env::var_os("LLM170_Q4_DBG").is_some() {
+                if env_on("LLM170_Q4_DBG") {
                     let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
                     if let Ok(mut v) = seen.lock() {
                         let key = (n_in, n_out, rows);
@@ -784,7 +785,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             let _ = &b;
             let rows_pad_dev = b[ne + 1].max(0) as usize;
             let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
-            if std::env::var_os("LLM170_MOE_BCHECK").is_some() {
+            if env_on("LLM170_MOE_BCHECK") {
                 // b(pinned off) 무결성 — r 오염(gemm_q5k gx=1.04억)의 원본 관찰.
                 let mut mono_ok = true;
                 for i in 0..ne {
@@ -1166,7 +1167,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         if ws.iter().all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w) && !f32w {
             // llama MMQ 우선(옵트인) — 같은 입력을 여러 커널이 공유하는 그룹이라
             // 항목별로 MMQ 가능 타입이면 MMQ를 쓰고 나머지는 기존 타일로 간다.
-            let mmq_on = t >= 32 && std::env::var_os("LLM170_Q4_MMQ").is_some();
+            let mmq_on = t >= 32 && env_on("LLM170_Q4_MMQ");
             let (xq, xq_w) = if mmq_on {
                 (std::ptr::null_mut(), 0usize)
             } else {
@@ -1194,7 +1195,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         for (w, o) in ws.iter().zip(outs) {
             let op = self.fptr(*o)?;
             if w.ty == GgmlType::Q8_0 && t >= 32
-                && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")
+                && env_eq("LLM170_Q8MMQ", "1")
             {
                 let (wd, _) = self.dev_weight(w)?;
                 self.ctx
@@ -1232,7 +1233,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 let rows = w_reps * self.t_cur();
                 // plans/73: 융합 판은 측정 역행(16.78→16.28 t/s) — 옵트인 자산.
                 // 워프=행의 320-원소 직렬 f32 체인이 part/finish 의 병렬 2런치보다 느리다.
-                if rows <= 32 && std::env::var_os("LLM170_RMSSMALL").is_some() {
+                if rows <= 32 && env_on("LLM170_RMSSMALL") {
                     let mut xa = xp;
                     let mut wa = wp;
                     let mut op_ = self.fptr(out)?;
