@@ -975,3 +975,27 @@ So the suspect is the recorded work's *GPU execution* growing with the KV
 position (or a per-context-token dispatch loop), not the attention kernel and
 not host bookkeeping. `LLM170_VKD_STAGE` and the DBG_WALL instrumentation are
 in the tree for the next pass.
+
+#### Vulkan 27B long-prefill — the kernel responsible (2026-09-17)
+
+A full `LLM170_VK_TS` dump at pp1024 shows the growth concentrated in one
+kernel family. First chunk (t=64): `tile_ms4gy` 159 ms total over 191
+dispatches (0.82 ms each). A later chunk (t=512): **`tile_ms128` 2529 ms over
+764 dispatches (3.31 ms each)** — the whole chunk's extra time.
+
+So the slow chunk is not a leak or a host-side loop; it is the BN=128 tile
+family, which trades weight-read traffic for 32x larger workgroups (128 rows vs
+4) and loses badly at t=512 on this iGPU:
+
+| path | pp4096 |
+|---|---|
+| default (`LLM170_TILE_BN128` on, t>=128) | 147.6 t/s |
+| `LLM170_TILE_BN128=0` (ms4gy tiles) | 127.8 t/s |
+| `LLM170_TILE_MSALL=0` (64-token chunks, old family) | 122.3 t/s |
+
+All three are far below the t=64 chunk's own rate (284 ms for 64 tokens =
+4.4 ms/token => ~226 t/s equivalent), i.e. the Vulkan prefill path has no good
+configuration for large t on this model — the win has to come from tuning the
+tile kernels for large t (or from chunking that keeps t in the tuned range),
+not from switching families. Recorded with the measured numbers so the next
+pass starts from data.
