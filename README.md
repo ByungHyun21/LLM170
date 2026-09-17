@@ -32,7 +32,7 @@ Matched scorecard, 2026-09-17, same host and session.
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
 | LLM170 hip | **356.8**-359.5 | **335.5**-336.9 | 293.0-294.3 | 11.5-11.6 | 11.6 |
-| LLM170 vulkan | — | 150 | — | 9.2 | — |
+| LLM170 vulkan | 316.7 | 147.6 | — | 11.26 | 11.26 |
 | llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
 
 np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
@@ -49,8 +49,8 @@ Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 | mode | tg agg | tg agg | tg agg |
 |---|---|---|---|
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
-| tg single | 11.5-11.6 (4k) / 11.6 (16k) | 9.2 | 11.67 / 11.21 |
-| MTP single | **15.4** (k=2) / 9.3 (k=3) | 9.2 (no MTP) | ~12 (MTP, old build) |
+| tg single | 11.5-11.6 (4k) / 11.6 (16k) | 11.26 | 11.67 / 11.21 |
+| MTP single | **15.4** (k=2) / 9.3 (k=3) | 11.3 (no MTP) | ~12 (MTP, old build) |
 | np4 aggregate | **26.67** | — | **25.22** |
 | MTP + np4 | **20.4** | — | 15.5 *(old build)* |
 
@@ -64,7 +64,7 @@ split model): 208-token prompt, 128 generated, same client for both.
 | backend | pp512 | pp4096 | pp16384 | tg128 single |
 |---|---|---|---|---|
 | LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 |
-| LLM170 vulkan | — | 271 | 240 | 17.1 |
+| LLM170 vulkan | 252.3 | 268.7 | — | 18.02 |
 | llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
 
 np4 prefill aggregate (same convention as the 27B table above).

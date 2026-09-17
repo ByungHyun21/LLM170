@@ -875,3 +875,30 @@ the shared-resource surface is wider than the t-batch set: `scratch()` is
 size-keyed, and `mmq_y`/`mmq_y_s`/`mmq_y2` hand out a buffer pointer whose lock
 is released before the kernel launch, so two paths launching MMQ kernels
 concurrently would clobber each other's y buffer.
+
+### Vulkan backend, re-measured 2026-09-17
+
+The README's vulkan rows were from the pre-port build; current measurements
+(27B, solo, greedy):
+
+| cell | LLM170 vulkan | LLM170 hip | ratio |
+|---|---|---|---|
+| pp512 | 316.7-321.5 | ~357 | 0.89 |
+| pp1024 / pp2048 | 269.7 / 210.6 | — | — |
+| pp4096 | 147.6 | 336.9 | 0.44 |
+| tg128 (4k / 16k alloc) | 11.26 / 11.26 | 11.6 | 0.97 |
+
+So decode is at hip parity, short prefill is close, and the long prefill is the
+outlier: the rate falls smoothly with context (321 -> 270 -> 211 -> 148 t/s),
+i.e. some component costs O(t) per token. `LLM170_VK_TS=1` shows per-chunk GPU
+totals exploding (472 ms for the first chunk vs 7.5-8.1 s for later chunks, 2757
+dispatches) while the GPU is otherwise far from saturated. Skipping the
+attention kernel entirely (`LLM170_VK_ATTN=1`) changes nothing (145.6 -> 145.1
+t/s at pp4096), so the cost is not the flash attention kernel — it is elsewhere
+in the long-context prefill path (KV handling or the per-chunk tiled GEMM
+scheduling) and remains open.
+
+Flash-Next on Vulkan shows no such degradation (pp512 252.3 / pp4096 268.7 /
+tg128 18.02 t/s — all at hip parity), so the 27B long-prefill regression is
+model-specific to the hybrid GDN+attention prefill path, not a general Vulkan
+GEMM problem.
