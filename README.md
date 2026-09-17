@@ -69,7 +69,7 @@ split model): 208-token prompt, 128 generated, same client for both.
 | backend | pp512 | pp4096 | pp16384 | tg128 single |
 |---|---|---|---|---|
 | LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 (CLI 18.55-18.60) |
-| LLM170 vulkan | 252.3 | 268.7 | — | 18.02 |
+| LLM170 vulkan | 252.3 | 268.7 | 245.9 | 18.02 |
 | llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
 
 np4 prefill aggregate (same convention and protocol as the 27B table above).
