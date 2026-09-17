@@ -38,7 +38,9 @@ Matched scorecard, 2026-09-17, same host and session.
 Vulkan's 27B pp16384 is `n/a`: the run aborts with `ERROR_DEVICE_LOST`
 (radv: "The CS has been cancelled because the context is lost"). The Flash-Next
 16k prefill on Vulkan completes normally (245.9), so this is a 27B long-context
-Vulkan limit, not a general backend failure.
+Vulkan limit, not a general backend failure. `MTP + np4` on Vulkan is likewise
+`n/a`: `serve --spec k` with `--gpu-runtime vulkan` loads the model and then
+stops responding before its slots come up (the HIP path is fine).
 
 np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
 Protocol: **one server at a time** (concurrent servers contend and halve the
@@ -61,8 +63,8 @@ Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
 | tg single | 11.5-11.6 (4k) / 11.6 (16k) | 11.26 | 11.67 / 11.21 |
 | MTP single | **15.4** (k=2) / 9.3 (k=3) | 11.3 (no MTP) | ~12 (MTP, old build) |
-| np4 aggregate | **26.67** | — | **25.22** |
-| MTP + np4 | **20.4** | — | 15.5 *(old build)* |
+| np4 aggregate | **26.67** | 9.98 | **25.22** |
+| MTP + np4 | **20.4** | n/a | 15.5 *(old build)* |
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -93,7 +95,7 @@ head, so the MTP rows are structurally inapplicable.
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
 | tg single | **16.84** | 17.1 | **18.06** |
 | MTP single | — | — | — |
-| np4 aggregate | **35.70** | — | **41.13**-41.65 |
+| np4 aggregate | **35.70** | 34.02 | **41.13**-41.65 |
 | MTP + np4 | — | — | — |
 
 ### Vision (mmproj), 27B — 2026-09-17
