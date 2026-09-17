@@ -10,5 +10,10 @@ llm170-profiler = { path = "../profiler" }
 memmap2 = "0.9"
 libc = "0.2"
 
+# 테스트 전용 — qwen4exp 프레임(다중 시퀀스 프리필 등가성)은 GPU 가속기
+# (rawhip Q4Acc)가 있어야 돌므로 여기서만 역참조한다(dev-의존 순환 허용).
+[dev-dependencies]
+llm170-backend-gpu = { path = "../backend-gpu" }
+
 [lints]
 workspace = true

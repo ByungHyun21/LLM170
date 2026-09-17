@@ -4056,7 +4056,11 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
         let p = self.ctx.alloc((len.max(4)) * 4)?;
         let mut v = self.frames.lock().map_err(|e| e.to_string())?;
-        v.push((p, len));
+        // cap은 **바이트**다 — frame_slice가 need=(off+len)*4와 비교하고 슬라이스
+        // 핸들도 len*4로 적는다. 종전엔 원소 수를 적어 슬라이스 상한이 실제
+        // 버퍼의 1/4행이었다(np 1행 뷰는 안 걸렸고 다중 프리필 행 대역이 걸림,
+        // 2026-09-17). 검사만 완화되므로 기존 경로는 불변.
+        v.push((p, len * 4));
         Ok(v.len() as u64)
     }
 
