@@ -1,4 +1,8 @@
-# `crates/backend-gpu/src/rawhip/decode.rs` — measurement record
+# `crates/backend-gpu/src/rawhip/decode/mod.rs` — measurement record
+
+> **Split (2026-09-17, plans/78 R2)**: `decode.rs` became the `decode/` module
+> directory (mod/weights/step/spec/np). Sections below cover all of them;
+> numbers verbatim.
 
 ## Index (2026-09-15 regroup)
 

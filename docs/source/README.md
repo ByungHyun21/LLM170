@@ -37,7 +37,7 @@ before this date were measured on 7.2.2 unless noted.
 |---|---|---|
 | `backend-gpu/rawhip/q4acc/*.md` | q4acc/ (mod/value/moe/qsa) | QSA attention (split, 6-head), MoE grouping, Q4_K MMQ tiles, f16 dequant, prefill GEMM, staging/upload RCA |
 | `backend-gpu/rawhip/mod.md` | mod.rs | KTRACE event pairing, launch-order dump, instrumentation notes |
-| `backend-gpu/rawhip/decode.md` | decode.rs | 27B decode/prefill decomposition, GDN |
+| `backend-gpu/rawhip/decode/mod.md` | decode/ | 27B decode/prefill decomposition, GDN |
 | `core/qwen4exp/stages/qsa.md` | stages/qsa.rs | Stage timers, cost breakdown |
 
 ## Verification gates
