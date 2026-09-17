@@ -415,6 +415,29 @@ pub fn stage_skipped(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 진단용 프레임 체크섬 — `LLM170_NP_CHECKSUM=1`. np·단일·배치 경로 공용.
+/// 버퍼 앞 t·n개를 전부 읽어 합과 행 표본(첫·중간·마지막 행의 첫 원소)을
+/// 보고한다. 청크 크기가 다른 두 실행에서 "같은 층·같은 단계·같은 토큰 수"를
+/// 맞대어 첫 발산 지점을 찾는 용도 — 합만으로는 상쇄로 가려질 수 있어 행
+/// 표본을 함께 낸다. 기본 꺼짐(1회 판독).
+fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &str) {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_CHECKSUM").is_some());
+    if !*ON {
+        return;
+    }
+    let mut v = vec![0.0f32; n * t];
+    if acc.frame_read(h, &mut v).is_ok() {
+        let s: f64 = v.iter().map(|&x| x as f64).sum();
+        let mid = v[(t / 2) * n];
+        let last = v[(t - 1) * n];
+        eprintln!(
+            "[npck] {tag} t={t} sum={s:.6} v0={:.6} mid0={mid:.6} last0={last:.6}",
+            v[0]
+        );
+    }
+}
+
 fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
     match (ftime_on(), std::env::var_os("LLM170_FRAME_SYNC").is_some()) {
         (false, false) => return Ok(()),
@@ -570,12 +593,15 @@ fn frame_forward_ex(
         if trace {
             eprintln!("# frame layer {il} t={t} (ple={} recr={})", hp.is_ple(il), hp.is_recr(il));
         }
+        if il < 4 {
+            frame_ck(acc, f.res_hc, n, t, &format!("L{il}.res_in"));
+        }
         // 1) PLE (blk.1) — plans/73: 디코드(t=1)는 디바이스 경로. 해시/gather는
         //    스텝 초에 호스트가 끝냈고(GPU 무의존), key/value 투영은 프레임 GEMM,
         //    gate/conv/잔차는 ple_math_dev 의 3커널 — 동기 d2h/h2d 왕복과
         //    CPU mm_batch 투영 2회([2560→10240])가 사라진다(4.5-11ms/step).
         //    폴백/프리필(t>1)은 기존 호스트 브리지. LLM170_PLE_HOST=1 강제.
-        if hp.is_ple(il) {
+        if hp.is_ple(il) && !stage_skipped("ple") {
             let mut ple_dev_done = false;
             if t == 1 && std::env::var_os("LLM170_PLE_HOST").is_none() {
                 let heads = hp.ple_heads_per_ngram * 2;
@@ -700,6 +726,9 @@ fn frame_forward_ex(
         // 2) hc attn mix
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_attn"), f.mix)?;
+        if il < 4 {
+            frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
+        }
         if il == 0 {
             dbg("res_hc", acc, f.res_hc, hc * n * t);
         }
@@ -710,6 +739,9 @@ fn frame_forward_ex(
                 // 진단용: GDN 단계 생략(출력 무효) — 디코드 스텝 비용 분해.
             } else {
             gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t)?;
+            if il < 4 {
+                frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.gdn"));
+            }
             }
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -751,6 +783,9 @@ fn frame_forward_ex(
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
+            if il < 4 {
+                frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.qsa"));
+            }
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
         }
 
@@ -762,12 +797,16 @@ fn frame_forward_ex(
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
+        if il < 4 {
+            frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
+        }
         
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
         if il == 0 {
         }
     }
+    frame_ck(acc, f.res_hc, n, t, "head.res");
 
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
     {
@@ -2088,6 +2127,9 @@ fn gdn_frame(
             .map_err(Q4Error::Io)?;
     }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
+    if il < 4 {
+        frame_ck(acc, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
+    }
     // β/e^g
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
@@ -2095,10 +2137,16 @@ fn gdn_frame(
         op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
     }
     sync_mark(acc, "gdn.betag", f.gbg)?;
+    if il < 4 {
+        frame_ck(acc, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
+    }
     // conv + ring
     let cw = f.consts[&format!("blk.{il}.conv_w")];
     if !stage_skipped("gdn.conv") {
         op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: t })?;
+        if il < 4 {
+            frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
+        }
     }
     sync_mark(acc, "gdn.conv", f.gconv)?;
     // q/k/v 분할 (토큰 배치 = split3) + l2 + q·scale
@@ -2118,6 +2166,9 @@ fn gdn_frame(
     if !stage_skipped("gdn.ar") {
         fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
             .map_err(Q4Error::Io)?;
+        if il < 4 {
+            frame_ck(acc, f.go, v_len, t, &format!("L{il}.gdn_ar"));
+        }
     }
     sync_mark(acc, "gdn.ar", f.go)?;
     if std::env::var_os("LLM170_NP_DBG").is_some() && il == 0 {

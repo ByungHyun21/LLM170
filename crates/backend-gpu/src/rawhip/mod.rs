@@ -346,3 +346,23 @@ mod micro_tests {
     }
 }
 
+
+#[cfg(test)]
+mod gdn_t_invariance_tests {
+    /// GDN AR의 t 불변성 — 같은 시퀀스를 여러 청크 크기로 흘려 상태·출력을 대조.
+    /// 실패(불일치)는 곧 "프리필 결과가 청크 크기에 의존"이라는 뜻이다.
+    #[test]
+    fn gdn_ar_t_invariance() {
+        for (t, per) in [(64usize, 16usize), (64, 32), (128, 16), (192, 16), (192, 64), (208, 16), (208, 64)] {
+            match crate::rawhip::probes::gdn_ar_invariance(t, per, 16, 48, 128) {
+                Ok(s) => eprintln!("# {s}"),
+                Err(e) => eprintln!("# [gdn-ar-inv] t={t} per={per}: {e}"),
+            }
+            // conv: ch = 2*k_len + v_len = 2*16*128 + 48*128 = 10240, k = 4
+            match crate::rawhip::probes::gdn_conv_invariance(t, per, 10240, 4) {
+                Ok(s) => eprintln!("# {s}"),
+                Err(e) => eprintln!("# [gdn-conv-inv] t={t} per={per}: {e}"),
+            }
+        }
+    }
+}
