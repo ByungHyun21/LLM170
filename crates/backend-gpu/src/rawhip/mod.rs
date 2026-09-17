@@ -68,7 +68,8 @@ pub struct RawCtx {
     /// 디코드와 겹쳐 돌리기 위한 별도 쌍(plans/74 np4 겹치기).
     stream3: hip::hipStream_t,
     stream4: hip::hipStream_t,
-    pub pre_pair: std::cell::Cell<bool>,
+    /// AtomicBool: RawCtx 는 VL 경로에서 Arc 로 공유되므로 Cell 은 Sync 를 깬다.
+    pub pre_pair: std::sync::atomic::AtomicBool,
     pre_ev: std::sync::Mutex<Option<hip::hipEvent_t>>,
     /// 크기별 스크래치 풀 — 해제 없는 재사용 (호출마다 신규 할당이
     /// 메모리 고갈→illegal address 유발, 2026-09-03 RCA).
@@ -274,7 +275,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream3), "StreamCreate3")?;
             let mut stream4: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream4), "StreamCreate4")?;
-            Ok(RawCtx { fns, stream, stream2, stream3, stream4, pre_pair: std::cell::Cell::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            Ok(RawCtx { fns, stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             allocs: std::sync::Mutex::new(Vec::new()),
@@ -290,7 +291,7 @@ impl RawCtx {
     /// 메모리 고갈→illegal address (2026-09-03 RCA).
     pub fn scratch(&self, bytes: usize) -> Result<*mut u8, String> {
         let mut sc = self.scratch.lock().map_err(|e| e.to_string())?;
-        let v = sc.entry((self.pre_pair.get() as usize, bytes)).or_default();
+        let v = sc.entry((self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) as usize, bytes)).or_default();
         if v.is_empty() {
             let p = self.alloc(bytes)?;
             v.push(p);
@@ -302,13 +303,13 @@ impl RawCtx {
     /// 현재 메인 스트림 — 프리필 페어면 stream3.
     #[inline]
     pub fn cur_stream(&self) -> hip::hipStream_t {
-        if self.pre_pair.get() { self.stream3 } else { self.stream }
+        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) { self.stream3 } else { self.stream }
     }
 
     /// 현재 사이드 스트림(launch3s / join2 / side_wait_main 대상).
     #[inline]
     pub fn cur_side(&self) -> hip::hipStream_t {
-        if self.pre_pair.get() { self.stream4 } else { self.stream2 }
+        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) { self.stream4 } else { self.stream2 }
     }
 
     /// 프리필 완료 이벤트 기록(현재 사이드) / 비블로킹 확인 / 메인 합류.

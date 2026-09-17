@@ -162,17 +162,7 @@ pub fn slot_loop(
     let npw = std::env::var_os("LLM170_WALL_TIME").is_some();
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
-    let mut iters: u64 = 0;
-    let it_dbg = |i: u64, busy: bool, decoded: bool, pend: bool| {
-        if std::env::var_os("LLM170_LOOP_DBG").is_some() && (i < 4 || i.is_multiple_of(200_000)) {
-            eprintln!("# loop-dbg: iters={i} busy={busy} decoded={decoded} pending={pend}");
-        }
-    };
     loop {
-        iters += 1;
-        if std::env::var_os("LLM170_LOOP_DBG").is_some() && iters < 4 {
-            eprintln!("# loop-dbg: enter iters={iters}");
-        }
         if npw {
             let now = std::time::Instant::now();
             let dt = last_wt.elapsed().as_secs_f64();
@@ -402,7 +392,6 @@ pub fn slot_loop(
         }
         // 유휴 시 차단 수신 — 종료(송신자 전 소멸) 시 루프 탈출
         let busy = slots.iter().any(|s| s.job.is_some());
-        it_dbg(iters, busy, decoded, pending_prefill);
         if !busy {
             match rx.recv() {
                 Ok(j) => {

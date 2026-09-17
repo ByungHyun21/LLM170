@@ -2912,7 +2912,7 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
         crate::rawhip::graph_abort();
     }
     fn pre_pair(&self, on: bool) {
-        self.ctx.pre_pair.set(on);
+        self.ctx.pre_pair.store(on, std::sync::atomic::Ordering::Relaxed);
     }
     fn pre_mark(&self) -> Result<(), String> {
         self.ctx.pre_mark()
