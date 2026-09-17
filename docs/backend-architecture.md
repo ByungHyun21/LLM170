@@ -123,7 +123,7 @@ host-side: the VkAcc design runs GDN (49 recurrent layers: conv, AR, norm-gated)
 full attention softmax on the CPU, plus per-op activation upload/readback.
 
 The GDN/attention GPU residency is what the HIP backend already implements
-(rawhip decode.rs kernels); porting that kernel family to SPIR-V is the known path to
+(rawhip `decode/` kernels); porting that kernel family to SPIR-V is the known path to
 parity — tracked as plans/19 phase 2. On a healthy host the CPU-side share shrinks
 several-fold; today's host ran ~7 h of continuous compute and its CPU-side engine
 measured 10-180x slower than at session start (cores parked at 2.0 GHz).

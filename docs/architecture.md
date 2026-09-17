@@ -49,7 +49,7 @@ by frees). `llm170 check` runs the three-stage verification path
 in debug or release builds.
 
 Decode residency: qwen4exp decodes through a GPU-resident **frame**
-(`core/src/qwen4exp/frame.rs`, default on — ADR-0017): activations live in
+(`core/src/qwen4exp/frame/mod.rs`, default on — ADR-0017): activations live in
 device buffers for the whole step, kernels chain by handle (hc → GDN → MoE →
 head), per-sequence handle sets support parallel decode, and the PLE hash
 (host) plus QSA attention (value bridge) are the only per-step crossings
