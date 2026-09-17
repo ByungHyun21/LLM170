@@ -129,9 +129,9 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 }
             }
             let eos = eng.model.eos;
-            // 워밍업 1회 (스크래치 풀·가속기 warm)
+            // 워밍업 1회 — 측정 형상과 동일하게(plans/79, llama-bench 정합).
             {
-                let _ = eng.prefill(0, &prompt[..64.min(pp)]).map_err(|e| e.to_string())?;
+                let _ = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
                 let _ = llm170_core::qwen35::greedy(&l);
             }
@@ -226,10 +226,14 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         } else {
             let m = llm170_core::qwen35::Model::load(&model_path)
                 .map_err(|e| e.to_string())?;
-            let bench_np0: usize = std::env::var("LLM170_BENCH_NP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
+            // plans/79: --np 플래그가 qwen35 집계도 지휘하게 통일 — 종전엔
+            // LLM170_BENCH_NP env만 읽어 --np 4가 무시됐다(측정 도구 결함).
+            let bench_np0 = np_slots.max(
+                std::env::var("LLM170_BENCH_NP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1),
+            );
             let mut eng = llm170_core::qwen35::Engine::new(m, bench_np0, ctx);
             if spec_k > 0 {
                 eng.mtp_wanted = true;
@@ -265,9 +269,10 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             } else {
                 String::new()
             };
-            // 워밍업
+            // 워밍업 — llama-bench 프로토콜 정합(plans/79): 측정 전 동일 형상을
+            // 1회 흘린다(64토큰만 데우던 종전 방식은 콜드 상태에서 ours만 불리).
             {
-                let _ = eng.prefill(0, &prompt[..64.min(pp)]).map_err(|e| e.to_string())?;
+                let _ = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let l = eng.decode(&[0], &[1u32]).map_err(|e| e.to_string())?;
                 let _ = llm170_core::qwen35::greedy(&l[0]);
             }
@@ -280,10 +285,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut fwd = 0usize;
-                let bench_np: usize = std::env::var("LLM170_BENCH_NP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1);
+                let bench_np = bench_np0;
                 if bench_np > 1 {
                     // np **프리필 집계** —슬롯별 분리 프롬프트(프리픽스 캐시
                     // 공유 배제), 전 슬롯 워밍업 1회(계측 제외), 슬롯 순차
@@ -308,6 +310,35 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     lines.push(format!(
                         "pp{pp} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg ({total} tok, disjoint)",
                         total as f64 / (el / 1e3)
+                    ));
+                }
+                if bench_np > 1 && spec_k == 0 {
+                    // plans/79: np 디코드 집계(qwen4exp 판 미러) — 전 슬롯 프리필은
+                    // 계측 제외, 슬롯 순차 t=1 디코드로 tg·np 토큰 생성.
+                    let prompts: Vec<Vec<u32>> = (0..bench_np)
+                        .map(|s2| lcg_prompt(pp, 0x9e37_79b9_u64.wrapping_add((s2 as u64 + 1) * 0x9e37_79b9)))
+                        .collect();
+                    eng.reset_states();
+                    for s2 in 0..bench_np {
+                        let _ = eng.prefill(s2, &prompts[s2]).map_err(|e| e.to_string())?;
+                    }
+                    let seqs: Vec<usize> = (0..bench_np).collect();
+                    let mut next: Vec<u32> = vec![1u32; bench_np];
+                    let mut n_gen = 0usize;
+                    let t_np = Instant::now();
+                    for _ in 0..tg {
+                        // 서버 슬롯 루프와 동일한 다중 시퀀스 배치 디코드(decode) —
+                        // 순차 decode1은 np 집계 프로토콜이 아니다(4배 느림).
+                        let lg = eng.decode(&seqs, &next).map_err(|e| e.to_string())?;
+                        for s2 in 0..bench_np {
+                            next[s2] = llm170_core::qwen35::greedy(&lg[s2]);
+                            n_gen += 1;
+                        }
+                    }
+                    let el = t_np.elapsed().as_secs_f64() * 1e3;
+                    lines.push(format!(
+                        "np{bench_np}-tg{tg} | rep{r} | {el:8.1} ms | {:7.2} t/s aggregate (gen {n_gen})",
+                        n_gen as f64 / (el / 1e3)
                     ));
                 }
                 if spec_k > 0 && has_mtp && bench_np > 1 {

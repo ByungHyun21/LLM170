@@ -7,7 +7,37 @@ paths). The chronological originals were moved to
 `docs/archive/benchmarks-chronological-2026-09-15.md` — nothing was
 deleted, only regrouped here.
 
-## Current scorecard (2026-09-15, ROCm 10 userspace, greedy, solo)
+## Current scorecard (2026-09-18, CLI-to-CLI: `llm170 bench` vs `llama-bench`)
+
+Protocol change (user decision 2026-09-18): README numbers are internal-bench
+measurements only — `llm170 bench` for ours, `llama-bench` for llama.cpp, one
+full-shape warm-up before each measurement (llama-bench parity; the old
+64-token warm-up understated our first-in-session pp512 by up to 20%).
+Flash-Next llama rows require the qwen4exp-capable local build
+(`/home/yoon/local_llm/llama.cpp` @2cc83c6f4, `build-ab2`,
+`-ot per_layer_token_embd=CPU --load-mode mmap`); master's llama-bench
+rejects the `qwen4exp` architecture. llama-bench has no multi-slot mode, so
+llama np4 columns remain HTTP (`scripts/bench_np.py`) and are marked (HTTP†)
+in the README — ours are engine-API `bench --np 4` rows.
+
+Session values are in the README tables (2026-09-18). Notables: 27B pp512
+ours 367-370 vs llama 340; FN all cells ahead (pp4096 275-278 vs 210,
+tg@16k 18.5 vs 13.9); 27B np4-tg engine batched 32.1 (supersedes the HTTP
+26.67 — the prior bench tool measured sequentially); MTP+np4 engine merged
+path 6.5-6.8 (pre-refactor main measures the same; the prior 20.4 HTTP
+figure is a different protocol/session).
+
+### Tool fixes that made the CLI scorecard possible (2026-09-18, plans/79)
+
+- `bench --np` now drives the qwen35 aggregate too (it previously read only
+  `LLM170_BENCH_NP`, so `--np 4` was silently ignored for 27B).
+- qwen35 np decode aggregate added (multi-seq batched `decode`, matching the
+  server slot loop — sequential decode1 was 4× slower and not the protocol).
+- Full-shape warm-up in both model branches (llama-bench parity).
+- `scripts/scorecard.sh`: `-ngl all` → `-ngl 99` (master llama-bench rejects
+  the literal).
+
+## Prior scorecard (2026-09-15, ROCm 10 userspace, greedy, solo) — superseded by the CLI scorecard above
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 

@@ -30,10 +30,10 @@ run_llama() {
   local name=$1 model=$2 bench=$3; shift 3
   local extra=""
   [[ "$name" == "FN" ]] && extra="-ot per_layer_token_embd=CPU --load-mode mmap"
-  timeout 3600 "$bench" -m "$model" -ngl all $extra -p 512,4096,16384 -n 0 -r 1 2>/dev/null \
+  timeout 3600 "$bench" -m "$model" -ngl 99 $extra -p 512,4096,16384 -n 0 -r 1 2>/dev/null \
     | sed "s/^/[llama $name] /"
   for ctx in 4096 16384; do
-    timeout 3600 "$bench" -m "$model" -ngl all $extra -p 512 -n 128 -d $ctx -r 1 2>/dev/null \
+    timeout 3600 "$bench" -m "$model" -ngl 99 $extra -p 512 -n 128 -d $ctx -r 1 2>/dev/null \
       | sed "s/^/[llama $name tg@$ctx] /"
   done
 }

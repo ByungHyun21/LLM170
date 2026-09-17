@@ -10,9 +10,13 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 
 ## Benchmarks
 
-All rows are solo, greedy; `llm170` numbers are ROCm 10 userspace with the
-rocBLAS Tensile path pinned, llama.cpp is the master build (d222767c7) unless
-noted. Full conditions and history: [docs/benchmarks.md](docs/benchmarks.md).
+All rows are solo, greedy, **CLI-to-CLI**: `llm170 bench` vs `llama-bench`,
+same host and session (2026-09-18), one full-shape warm-up run before each
+measurement (matching llama-bench's built-in warm-up). `llm170` numbers are
+ROCm 10 userspace with the rocBLAS Tensile path pinned. llama.cpp is the
+master build (d222767c7) unless noted; Flash-Next rows use a qwen4exp-capable
+local build (2cc83c6f4) since master's llama-bench rejects the `qwen4exp`
+architecture. Full conditions and history: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### CMP 170HX (GA100) — benchmark in preparation
 
@@ -27,77 +31,74 @@ Greedy, single-tenant, same GGUF, t/s; `—` = not measured.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
-Matched scorecard, 2026-09-17, same host and session.
-
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
-| LLM170 hip | **356.8**-373.3 | **313.2**-336.9 | 288.7-294.3 | 11.4-11.6 | 11.6 |
-| LLM170 vulkan | 316.7 | 147.6 | n/a | 11.26 | 11.26 |
-| llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
+| LLM170 hip | **367-370** | 326-337 | 290-296 | 11.52 | **11.53** |
+| LLM170 vulkan | 318 | 145 | n/a | 11.26 | 11.30 |
+| llama.cpp (ROCm 10) | 340 | **335** | **297** | **11.65** | 11.21 |
 
 Vulkan's 27B pp16384 is `n/a`: the run aborts with `ERROR_DEVICE_LOST`
 (radv: "The CS has been cancelled because the context is lost"). The Flash-Next
-16k prefill on Vulkan completes normally (245.9), so this is a 27B long-context
+16k prefill on Vulkan completes normally (243), so this is a 27B long-context
 Vulkan limit, not a general backend failure. `MTP + np4` on Vulkan is likewise
 `n/a`: `serve --spec k` with `--gpu-runtime vulkan` loads the model and then
 stops responding before its slots come up (the HIP path is fine).
 
-np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
-Protocol: **one server at a time** (concurrent servers contend and halve the
-numbers), warm-up requests discarded (lazy `raw_init` otherwise lands inside the
-measurement), per-slot **disjoint** prompts (no prefix-cache reuse),
-`LLM170_SLOTS=4` / `-np 4`, `n_predict=1`, ctx 8192 (llama's 27B 2048-token row
-ran at ctx 16384 — its per-slot ctx), same host/session.
+np4 aggregate — `llm170 bench --np 4` (engine slot loop, disjoint prompts,
+prefill excluded from tg timing; 4 slots, ctx 8192).
 
-| backend | 512-token prompts | 2048-token prompts |
-|---|---|---|
-| LLM170 hip | **316.2** | **320.2** |
-| LLM170 vulkan | 278.1 | 200.7 |
-| llama.cpp (ROCm 10) | 188.5 | 226.5 |
-
-Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
-(`LLM170_SLOTS=4` / `llama-server -np 4` are required for the np4 rows).
-
-| mode | tg agg | tg agg | tg agg |
+| backend | pp512 agg | pp2048 agg | tg128 agg |
 |---|---|---|---|
-| | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
-| tg single | 11.5-11.6 (4k) / 11.6 (16k) | 11.26 | 11.67 / 11.21 |
-| MTP single | **15.4** (k=2) / 9.3 (k=3) | 11.3 (no MTP) | ~12 (MTP, old build) |
-| np4 aggregate | **26.67** | 9.98 | **25.22** |
-| MTP + np4 | **20.4** | n/a | 15.5 *(old build)* |
+| LLM170 hip | **352.9** | **331.8** | **32.1** |
+| LLM170 vulkan | 305.4 | 200.4 | 10.6 |
+| llama.cpp (ROCm 10) | 188.5 | 226.5 | 25.2 |
+
+† llama's np4 rows are the prior HTTP measurements (`llama-server -np 4`,
+`scripts/bench_np.py`): llama-bench has no multi-slot mode, so no CLI
+equivalent exists. All LLM170 np4 rows above are engine-API bench rows.
+
+Decode modes (27B; aggregate t/s over 4 slots):
+
+| mode | LLM170 hip | LLM170 vulkan | llama.cpp (ROCm 10) |
+|---|---|---|---|
+| tg single | 11.5 | 11.26-11.30 | 11.65 / 11.21 (@4k/@16k) |
+| MTP single | 14.4 (k=2) / 8.3 (k=3) | — | ~12 *(MTP, old build)* |
+| np4 aggregate | **32.1** | 10.6 | **25.2** *(HTTP†)* |
+| MTP + np4 | 6.5-6.8 | n/a | 15.5 *(old build, HTTP†)* |
+
+(MTP rows via `bench --spec k`; MTP+np4 is the engine merged spec×np path —
+`spec_step_multi`. The prior 20.4 HTTP figure for MTP+np4 came from a
+different protocol/session; the CLI engine path measures 6.5-6.8, and the
+pre-refactor main build measures the same, so it is the current engine truth.
+k=3 drafts are largely rejected in this workload — see docs/benchmarks.md.)
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-Matched scorecard, 2026-09-17; llama ran the `qwen4exp build-ab` build with
-the model's required `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`.
-All rows here use the HTTP server for both engines — single stream, 208-token
-prompt, 128 generated, same client, warm-up requests discarded (llama-bench
-cannot load this split model, so HTTP is the only common protocol).
+llama-bench runs with the model's required
+`-ot per_layer_token_embd=CPU --load-mode mmap` on the qwen4exp-capable build
+(2cc83c6f4); master cannot load this architecture.
 
-| backend | pp512 | pp4096 | pp16384 | tg128 single |
-|---|---|---|---|---|
-| LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 16.84 |
-| LLM170 vulkan | 252.3 | 268.7 | 245.9 | 18.02 |
-| llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **18.06** |
+| backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|
+| LLM170 hip | **253-275** | **275-278** | **244-249** | **18.60** | **18.54** |
+| LLM170 vulkan | 237 | 277 | 243 | 18.49 | — |
+| llama.cpp (ROCm 10) | 222 | 210 | 200 | 17.43 | 13.88 |
 
-np4 prefill aggregate (same convention and protocol as the 27B table above).
+np4 aggregate — `llm170 bench --np 4` (same convention as the 27B table).
 
-| backend | 512-token prompts | 2048-token prompts |
-|---|---|---|
-| LLM170 hip | **246.7** | **249.9** |
-| LLM170 vulkan | 247.5 | 250.3 |
-| llama.cpp (ROCm 10) | 20.6 | 229.8 |
-
-Decode modes: aggregate t/s over 4 parallel slots; the model has no nextn/MTP
-head, so the MTP rows are structurally inapplicable.
-
-| mode | tg agg | tg agg | tg agg |
+| backend | pp512 agg | pp2048 agg | tg128 agg |
 |---|---|---|---|
-| | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
-| tg single | **16.84** | 17.1 | **18.06** |
-| MTP single | — | — | — |
-| np4 aggregate | **35.70** | 34.02 | **41.13**-41.65 |
-| MTP + np4 | — | — | — |
+| LLM170 hip | **248-250** | **287-288** | 18.2-18.8 |
+| LLM170 vulkan | 248.1 | 285.1 | 18.6 |
+| llama.cpp (ROCm 10) | 20.6 | 229.8 | **41.1-41.7** *(HTTP†)* |
+
+Decode modes (FN; the model has no nextn/MTP head, so MTP rows are
+structurally inapplicable):
+
+| mode | LLM170 hip | LLM170 vulkan | llama.cpp (ROCm 10) |
+|---|---|---|---|
+| tg single | 18.5-18.6 | 18.49 | 17.43 / 13.88 (@4k/@16k) |
+| np4 aggregate | 18.2-18.8 | 18.6 | 41.1-41.7 *(HTTP†)* |
 
 ### Vision (mmproj), 27B — 2026-09-17
 
