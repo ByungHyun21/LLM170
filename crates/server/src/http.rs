@@ -60,6 +60,12 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    // EOF(keep-alive 연결이 끊긴 경우) — 종전엔 빈 요청으로 파싱돼 404 응답을
+    // 무한히 재전송하는 스핀이 됐다(닫힌 소켓 read 는 즉시 0 반환): 유휴 서버가
+    // 코어 하나를 태우고 system time 이 2/3 를 차지했다(2026-09-17 실측).
+    if line.is_empty() {
+        return Err("eof".into());
+    }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();

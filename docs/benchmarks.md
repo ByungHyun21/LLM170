@@ -829,3 +829,25 @@ exhaustive resource audit of every `ctx` allocation plus an explicit
 cross-stream protocol, and the payoff ceiling measured earlier is ~0.95-1.09
 (i.e. parity at best), so it does not obviously beat the mixed-batch prefill
 (deferred project in plans/73) as the way to close np4.
+
+### HTTP handler EOF spin — fixed 2026-09-17 (np4 cells were understated)
+
+`read_request` parsed a closed keep-alive connection as an *empty* request
+(`method=""`, `path="/"`), so the handler loop answered 404 and read again — and
+a read on a closed socket returns 0 immediately, so the thread spun forever,
+one per disconnected client (Health probes, curl, and every bench client leave
+one). Measured on the CPU backend: an idle server burned 95-100% CPU, two thirds
+of it system time in `write()` on the dead socket.
+
+Because those spinner threads steal CPU *and memory bandwidth* (shared with the
+GPU on this APU), every HTTP-path benchmark ran with a permanent core thief:
+
+| cell | before fix | after fix | llama.cpp (re-measured) | ratio |
+|---|---|---|---|---|
+| 27B np4 | 20.85 | **26.67** | 25.22 | 0.80 -> **1.06** |
+| FN np4 | 24.94 | **35.70** | 41.13 | 0.61 -> **0.87** |
+
+The fix is three lines (empty request line = EOF -> `Err`, handler returns).
+Verified: idle server now accrues 0 CPU ticks in 20 s; gates bit-exact; tests
+16/16; np4 token streams identical to before the fix. The bench-CLI pp/tg cells
+never used HTTP, which is why they were unaffected.
