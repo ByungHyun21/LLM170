@@ -798,3 +798,34 @@ So the vision condition is at parity (our ViT forward and the LLM prefill are
 each about as fast as llama's combined clip+prompt phase, and our decode is
 faster). Model loads are excluded on both sides (ours: 14.2 s mmproj upload +
 22.7 s 27B inject, cold).
+
+### Attempted and reverted: dual-stream prefill overlap (2026-09-17)
+
+Since the whole np4 gap is the serialized prefill, the obvious fix is to run it
+concurrently with the decode. A full implementation was built and measured:
+
+- `RawCtx.cur_stream()` selector: `launch`/`launch3`/`launch3_dyn`/`h2d`/`d2h`/
+  `sync` route to a side stream while a prefill mode flag is set; `scratch()`
+  keys its cache by (side, bytes).
+- A prefill-exclusive copy of the 27 t-batch buffers plus `p64` and `logits`
+  (`pre_swap()` swaps all pairs around the `step_batch` issue — kernel args are
+  captured at issue time, so the two paths would write disjoint memory).
+- Raw + Engine + scheduler plumbing: `raw_prefill_start/ready/finish`
+  (event-based, non-blocking poll) and a `slot_loop` path that launches the
+  prefill asynchronously and finishes it when the event completes, plus
+  `pre_join()` (stream-wait) for cross-stream visibility.
+
+Result: **reverted.** With the prefill actually routed to the side stream the
+np4 output diverges from the synchronous path (148 of 192 tokens, different
+token streams), i.e. some shared resource is still being touched concurrently —
+not the t-batch set (swapped), so candidates are the pinned D2H staging buffer,
+the KV/GDN state's cross-stream visibility, or a buffer outside the audited set.
+An earlier build that did *not* route the kernels (only the event) produced
+token-identical output — so the divergence appears exactly when execution
+actually overlaps.
+
+Conclusion for future work: the overlap is not a small change. It needs an
+exhaustive resource audit of every `ctx` allocation plus an explicit
+cross-stream protocol, and the payoff ceiling measured earlier is ~0.95-1.09
+(i.e. parity at best), so it does not obviously beat the mixed-batch prefill
+(deferred project in plans/73) as the way to close np4.
