@@ -3,7 +3,6 @@
 //!
 //! 배선 근거: qwen4exp.cpp build_hc_mix/combine/build_qsa_top_k/build_attn_qsa/
 //! build_ple + llama-graph.cpp build_moe_ffn (2026-08-30 판). 수치는 f32 참조.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use super::{Hparams4, Model4, Q4Error};
 use super::stages::{self, Ctx};

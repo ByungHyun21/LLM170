@@ -2,7 +2,6 @@
 //! hipRTC로 임베디드 HIP C++ 소스를 컴파일하고 hipModuleLaunchKernel로
 //! 실행. 버퍼는 영속 아레나(해제 없음, ADR-0014 동일 규칙). 커널 산술은
 //! core 미러(dot_row_w4a8_*_lane)와 동일 연산열 — to_bits 검증 게이트.
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 pub mod graph;
 pub mod ktrace;
@@ -34,10 +33,6 @@ pub fn co_loaded(bit: u8) -> bool {
 }
 
 
-/// MMQ mul_mat_q 동적 smem 상한 설정 캐시 — 런치마다 드라이버 호출하지 않도록.
-/// (hipFuncSetAttribute는 커널 로드 갱신을 유발할 수 있어 GEMM마다 부르면 손해)
-static MMQ_SMEM_SET: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(usize, i32)>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())

@@ -1,7 +1,6 @@
 //! VkDecoder — GDN/어텐션 GPU 상주 디코드 (plans/19 2단계).
 //! 커널 8종은 gdn-check ★ 검증 완료. 기존 gemv/quant/rms/silu SPIR-V 재사용.
 //! rawhip DecodeState 대칭 — 배치 모드(단일 제출+배리어).
-#![allow(dead_code)] // 프론트 정리(2026-09-14): 레거시·진단 경로 보존
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
@@ -36,7 +35,6 @@ const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
 const GDN_AR4_SPV: &[u8] = include_bytes!("spv/gdn_ar4.spv");
 const GDN_AR8_SPV: &[u8] = include_bytes!("spv/gdn_ar8.spv");
 const NORM_GATED_SPV: &[u8] = include_bytes!("spv/norm_gated.spv");
-const QK_ROPE_SPV: &[u8] = include_bytes!("spv/qk_rope.spv");
 const QK_ROPE2_SPV: &[u8] = include_bytes!("spv/qk_rope2.spv");
 const KV_APPEND_SPV: &[u8] = include_bytes!("spv/kv_append.spv");
 const QSA_FLASH_SPV: &[u8] = include_bytes!("spv/qsa_flash.spv");
@@ -47,7 +45,6 @@ const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
 const TILE_XS_SPV: &[u8] = include_bytes!("spv/tile_xs.spv");
 const TILE_Q8_SPV: &[u8] = include_bytes!("spv/tile_q8.spv");
 const TILE_Q4K_SPV: &[u8] = include_bytes!("spv/tile_q4k.spv");
-const TILE_Q3K_SPV: &[u8] = include_bytes!("spv/tile_q3k.spv");
 const GEMM_I8_SPV: &[u8] = include_bytes!("spv/gemm_i8.spv");
 const QUANT_B8_SPV: &[u8] = include_bytes!("spv/quant_b8.spv");
 const QUANT_B8V2_SPV: &[u8] = include_bytes!("spv/quant_b8v2.spv");
@@ -73,7 +70,6 @@ const TILE_Q3KMGY_SPV: &[u8] = include_bytes!("spv/tile_q3kmgy.spv");
 const TILE_Q8MGY_SPV: &[u8] = include_bytes!("spv/tile_q8mgy.spv");
 const TILE_XSMGY_SPV: &[u8] = include_bytes!("spv/tile_xsmgy.spv");
 const TILE_NLMGY_SPV: &[u8] = include_bytes!("spv/tile_nlmgy.spv");
-const Q4K_MGY_SPV: &[u8] = include_bytes!("spv/tile_q4kmgy.spv");
 const TILE_Q4KMS_SPV: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 const TILE_Q6KMS_SPV: &[u8] = include_bytes!("spv/tile_q6kms.spv");
 const TILE_Q3KMS_SPV: &[u8] = include_bytes!("spv/tile_q3kms.spv");
@@ -958,9 +954,6 @@ impl DecoderState {
         })
     }
 
-    fn k_group_len(&self) -> usize {
-        self.k_len
-    }
 
     /// 파이프라인 지연 생성 캐시.
     fn pipe(&mut self, name: &'static str, spv: &[u8], n_buf: u32, pb: u32) -> Result<&Pipes, String> {

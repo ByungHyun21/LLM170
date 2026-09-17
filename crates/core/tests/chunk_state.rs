@@ -155,7 +155,6 @@ fn chunk_size_state_divergence() {
     // ── 밀집 GEMM(frame_mm_group)의 t 불변성 — 실제 무게로 직접 판정 ──
     // conv 상태 = 이 GEMM 출력의 마지막 행 복사이므로, 상태가 갈리면 여기가 원인이다.
     {
-        use llm170_core::matmul::{Accelerator, FrameHost};
         let n = hp.n_embd;
         let wk = m.w4("blk.0.attn_qkv.weight").expect("wqkv");
         let wz = m.w4("blk.0.attn_gate.weight").expect("wz");
