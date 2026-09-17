@@ -6,22 +6,21 @@ use std::process::ExitCode;
 
 use crate::usage_err;
 
-pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
-    let mut model: Option<PathBuf> = None;
+pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut n_predict = 32usize;
     let mut ctx = 4096usize;
-    let mut backend = "cpu".to_string();
-    let mut gpu_runtime = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
+    let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
+    let gpu_runtime = ma
+        .gpu_runtime
+        .clone()
+        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .unwrap_or_else(|| "hip".into());
     let mut spec_k: Option<usize> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--model" => match it.next() {
-                Some(v) => model = Some(PathBuf::from(v)),
-                None => return usage_err("--model requires a path"),
-            },
             "--prompt-tokens" => match it.next() {
                 Some(v) => match parse_ids(v) {
                     Ok(ids) if !ids.is_empty() => prompts.push(ids),
@@ -38,16 +37,6 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                 Some(n) => ctx = n,
                 None => return usage_err("--ctx requires a number"),
             },
-            "--backend" => match it.next() {
-                Some(v) if v == "cpu" || v == "gpu" => backend = v.clone(),
-                Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
-                None => return usage_err("--backend requires cpu|gpu"),
-            },
-            "--gpu-runtime" => match it.next() {
-                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.clone(),
-                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
-                None => return usage_err("--gpu-runtime requires hip|vulkan"),
-            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) if (1..=8).contains(&k) => spec_k = Some(k),
                 _ => return usage_err("--spec requires k in 1..=8"),
@@ -56,7 +45,7 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
         }
     }
 
-    let Some(model_path) = model else {
+    let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
         return usage_err("--model required");
     };
     if prompts.is_empty() {

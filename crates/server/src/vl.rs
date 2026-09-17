@@ -7,13 +7,12 @@ use std::process::ExitCode;
 use crate::{parse_ids_ref, usage_err};
 
 /// vl — mmproj 비전 인코딩 + LLM 스플라이스 추론 (plans/16).
-pub fn cmd_vl(args: &[String]) -> ExitCode {
-    let mut model: Option<PathBuf> = None;
+pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut mmproj: Option<PathBuf> = None;
     let mut images: Vec<PathBuf> = Vec::new();
     let mut n_predict = 48usize;
     let mut ctx = 4096usize;
-    let mut backend = "gpu".to_string();
+    let backend = ma.backend.clone().unwrap_or_else(|| "gpu".into());
     let mut spec_k = 0usize;
     // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
     // vision_end 뒤 — 기본(미지정)은 기존 하드코딩 프롬프트와 동일.
@@ -22,7 +21,6 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--model" => model = it.next().map(PathBuf::from),
             "--mmproj" => mmproj = it.next().map(PathBuf::from),
             "--image" => {
                 if let Some(p) = it.next() {
@@ -31,7 +29,6 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
             }
             "--n-predict" => n_predict = it.next().and_then(|v| v.parse().ok()).unwrap_or(48),
             "--ctx" => ctx = it.next().and_then(|v| v.parse().ok()).unwrap_or(4096),
-            "--backend" => backend = it.next().cloned().unwrap_or_else(|| "gpu".into()),
             "--spec" => spec_k = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--prefix-tokens" => match it.next().map(String::as_str).and_then(parse_ids_ref) {
                 Some(v) => prefix_ids = v,
@@ -44,6 +41,7 @@ pub fn cmd_vl(args: &[String]) -> ExitCode {
             _ => {}
         }
     }
+    let model = ma.model.clone().map(PathBuf::from);
     let (model, mmproj) = match (model, mmproj) {
         (Some(m), Some(p)) => (m, p),
         _ => {

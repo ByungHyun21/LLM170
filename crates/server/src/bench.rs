@@ -4,7 +4,6 @@
 //! 토큰은 수제 LCG(seed 0x1234_5678, 관례) — rand 금지. 워밍업 1회 + reps 회 측정.
 //! qwen35(MTP --spec 포함)·qwen4exp(--frame 포함) 양쪽 대응.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -13,23 +12,22 @@ fn usage_err_bench(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-pub fn cmd_bench(args: &[String]) -> ExitCode {
-    let mut model: Option<PathBuf> = None;
+pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut pp = 512usize;
     let mut tg = 128usize;
     let mut reps = 1usize;
     let mut ctx = 4096usize;
-    let mut backend = "cpu".to_string();
-    let mut gpu_runtime = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
+    let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
+    let gpu_runtime = ma
+        .gpu_runtime
+        .clone()
+        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     let mut np_slots = 1usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--model" => match it.next() {
-                Some(v) => model = Some(PathBuf::from(v)),
-                None => return usage_err_bench("--model requires a path"),
-            },
             "--pp" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(v) => pp = v.clamp(8, 65536),
                 None => return usage_err_bench("--pp requires a number"),
@@ -46,16 +44,6 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 Some(v) => ctx = v,
                 None => return usage_err_bench("--ctx requires a number"),
             },
-            "--backend" => match it.next() {
-                Some(v) if v == "cpu" || v == "gpu" => backend = v.clone(),
-                Some(v) => return usage_err_bench(&format!("--backend: cpu|gpu (got {v})")),
-                None => return usage_err_bench("--backend requires cpu|gpu"),
-            },
-            "--gpu-runtime" => match it.next() {
-                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.clone(),
-                Some(v) => return usage_err_bench(&format!("--gpu-runtime: hip|vulkan (got {v})")),
-                None => return usage_err_bench("--gpu-runtime requires hip|vulkan"),
-            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) if (1..=8).contains(&k) => spec_k = k,
                 _ => return usage_err_bench("--spec requires k in 1..=8"),
@@ -69,7 +57,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
             other => return usage_err_bench(&format!("unknown flag: {other}")),
         }
     }
-    let Some(model_path): Option<std::path::PathBuf> = model else {
+    let Some(model_path): Option<std::path::PathBuf> = ma.model.clone().map(std::path::PathBuf::from) else {
         return usage_err_bench("--model required");
     };
     if pp + tg + 16 >= ctx {

@@ -58,41 +58,86 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
 "#;
 
 
+/// 모델 적재 서브커맨드 공용 인자 (plans/78 R5) — main에서 1회 파싱해
+/// 사전 리소스 가드와 serve/infer/vl/bench가 같은 값을 본다(이중 파싱 제거).
+/// `--flag value`와 `--flag=value` 양형 지원. `rest`는 공용 플래그(값 포함)를
+/// 제외한 나머지 인자 — trio 서브커맨드의 개별 플래그 파싱에 그대로 쓴다.
+/// probes/check는従来대로 원본 args를 받는다(자체 파싱 보존).
+pub(crate) struct ModelArgs {
+    pub model: Option<String>,
+    pub backend: Option<String>,
+    pub gpu_runtime: Option<String>,
+    pub rest: Vec<String>,
+}
+
+fn common_value(args: &[String], i: &mut usize, inline: &Option<String>) -> String {
+    match inline {
+        Some(v) => v.clone(),
+        None => {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_default()
+        }
+    }
+}
+
+pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
+    let mut ma = ModelArgs { model: None, backend: None, gpu_runtime: None, rest: Vec::new() };
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (a, None),
+        };
+        match name {
+            "--model" => ma.model = Some(common_value(args, &mut i, &inline)),
+            "--backend" => {
+                let v = common_value(args, &mut i, &inline);
+                if v != "cpu" && v != "gpu" {
+                    return Err(format!("--backend: cpu|gpu (got {v})"));
+                }
+                ma.backend = Some(v);
+            }
+            "--gpu-runtime" => {
+                let v = common_value(args, &mut i, &inline);
+                if v != "hip" && v != "vulkan" {
+                    return Err(format!("--gpu-runtime: hip|vulkan (got {v})"));
+                }
+                ma.gpu_runtime = Some(v);
+            }
+            _ => ma.rest.push(a.to_string()),
+        }
+        i += 1;
+    }
+    Ok(ma)
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.
+    let ma = match parse_model_args(&args[1..]) {
+        Ok(ma) => ma,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // 사전 리소스 가드(2026-09-16): 이중 적재로 호스트가 먹통되는 사고 방지.
     // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)를 커버한다:
     //   - --model <v> / --model=<v> (serve·infer·vl·bench)
     //   - check의 첫 비플래그 위치인자 (모델 경로)
-    //   - GPU 판정: --backend gpu|=<v>, --gpu-runtime*; check는 기본이 gpu.
+    //   - GPU 판정: --backend gpu, --gpu-runtime; check는 기본이 gpu.
     {
-        let args: Vec<String> = std::env::args().collect();
-        let sub = args.get(1).map(String::as_str);
-        let mut model: Option<String> = None;
-        let mut gpu = false;
-        let mut i = 2;
-        while i < args.len() {
-            let a = &args[i];
-            if let Some(v) = a.strip_prefix("--model=") {
-                model = Some(v.to_string());
-            } else if a == "--model" {
-                if let Some(v) = args.get(i + 1) {
-                    model = Some(v.clone());
-                }
-            } else if let Some(v) = a.strip_prefix("--backend=") {
-                gpu = gpu || v == "gpu";
-            } else if a == "--backend" {
-                if args.get(i + 1).is_some_and(|v| v == "gpu") {
-                    gpu = true;
-                }
-            } else if a.starts_with("--gpu-runtime") {
-                gpu = true;
-            } else if sub == Some("check") && !a.starts_with("--") && model.is_none() {
-                model = Some(a.clone());
-            }
-            i += 1;
-        }
+        let sub = args.first().map(String::as_str);
+        let mut model = ma.model.clone();
+        let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
+            if model.is_none() {
+                if let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--")) {
+                    model = Some(p.clone());
+                }
+            }
         }
         if let Some(mp) = model
             && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {
@@ -109,7 +154,6 @@ fn main() -> ExitCode {
     }
     let _ = log::set_logger(&EL);
     log::set_max_level(log::LevelFilter::Error);
-    let args: Vec<String> = std::env::args().skip(1).collect();
     // OOM 킬러 지정 희생자 (실측 2026-09-01): 초대형 mmap(total-vm 150GB+)이
     // badness 최상위로 뽑혀 런·세션이 함께 죽는다. 스스로 adj=1000을 걸어
     // 런만 희생되게 한다 (무권한으로는 보호 불가 — 우선순위 이동만 가능).
@@ -130,11 +174,11 @@ fn main() -> ExitCode {
         }
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
-        Some("infer") => infer::cmd_infer(&args[1..]),
-        Some("serve") => cmd_serve(&args[1..]),
+        Some("infer") => infer::cmd_infer(&ma.rest, &ma),
+        Some("serve") => cmd_serve(&ma.rest, &ma),
         Some("rawhip-check") => probes::run("rawhip-check", &args[1..]).unwrap(),
-        Some("vl") => vl::cmd_vl(&args[1..]),
-        Some("bench") => bench::cmd_bench(&args[1..]),
+        Some("vl") => vl::cmd_vl(&ma.rest, &ma),
+        Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("check") => probes::run_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
@@ -150,20 +194,15 @@ fn main() -> ExitCode {
 }
 
 /// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
-fn cmd_serve(args: &[String]) -> ExitCode {
-    let mut model: Option<PathBuf> = None;
+fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut spec_k = 0usize;
     let mut ctx = 4096usize;
-    let mut backend = "cpu".to_string();
-    let mut gpu_runtime = String::new();
+    let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
+    let gpu_runtime = ma.gpu_runtime.clone().unwrap_or_default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--model" => match it.next() {
-                Some(v) => model = Some(PathBuf::from(v)),
-                None => return usage_err("--model requires a path"),
-            },
             "--port" => match it.next().and_then(|v| v.parse().ok()) {
                 Some(p) => port = p,
                 None => return usage_err("--port requires a number"),
@@ -172,24 +211,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 Some(c) => ctx = c,
                 None => return usage_err("--ctx requires a number"),
             },
-            "--backend" => match it.next() {
-                Some(v) if v == "cpu" || v == "gpu" => backend = v.clone(),
-                Some(v) => return usage_err(&format!("--backend: cpu|gpu (got {v})")),
-                None => return usage_err("--backend requires cpu|gpu"),
-            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) => spec_k = k.min(8),
                 None => return usage_err("--spec requires k in 1..=8"),
             },
-            "--gpu-runtime" => match it.next().map(String::as_str) {
-                Some(v) if v == "hip" || v == "vulkan" => gpu_runtime = v.to_string(),
-                Some(v) => return usage_err(&format!("--gpu-runtime: hip|vulkan (got {v})")),
-                None => return usage_err("--gpu-runtime requires hip|vulkan"),
-            },
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
-    let Some(model_path) = model else { return usage_err("--model required") };
+    let Some(model_path) = ma.model.clone().map(PathBuf::from) else { return usage_err("--model required") };
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
