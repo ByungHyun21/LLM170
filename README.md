@@ -45,7 +45,7 @@ ran at ctx 16384 — its per-slot ctx), same host/session.
 | backend | 512-token prompts | 2048-token prompts |
 |---|---|---|
 | LLM170 hip | **316.2** | **320.2** |
-| LLM170 vulkan | — | — |
+| LLM170 vulkan | 278.1 | 200.7 |
 | llama.cpp (ROCm 10) | 188.5 | 226.5 |
 
 Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
@@ -77,7 +77,7 @@ np4 prefill aggregate (same convention and protocol as the 27B table above).
 | backend | 512-token prompts | 2048-token prompts |
 |---|---|---|
 | LLM170 hip | **246.7** | **249.9** |
-| LLM170 vulkan | — | — |
+| LLM170 vulkan | 247.5 | 250.3 |
 | llama.cpp (ROCm 10) | 20.6 | 229.8 |
 
 Decode modes: aggregate t/s over 4 parallel slots; the model has no nextn/MTP
