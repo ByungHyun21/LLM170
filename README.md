@@ -35,14 +35,15 @@ failed with ERROR_DEVICE_LOST under the Vulkan driver at that shape.
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
-| LLM170 hip | **374** | 325-333 | 292-296 | 11.0-11.6 | 10.8-11.5 |
+| LLM170 hip | **356.8** | **335.5** | 293.0 | 11.5 | 10.7 |
 | LLM170 vulkan | — | 150 | — | 9.2 | — |
-| llama.cpp (ROCm 10) | 347 | **342** | **317** | **11.6** | **11.9** |
+| llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
 
-(Measured 2026-09-16/17 on the current hip build, greedy, natural-text prompt,
-pp512 prompt / ctx 4096 (tg@4k) and 16384 (tg@16k). Session gains: pp16384
-253 -> 292-296 via raw-WMMA prefill attention (wmma2/v2); tg@4k via
-selection top-k sort resizing and 16-lane small-shape GEMVs.)
+(Matched-protocol scorecard measured 2026-09-17 on this host — solo, same
+session, `scripts/scorecard.sh` for ours and `llama-bench` for the reference:
+pp512/pp4096/pp16384 prompts, tg128 at 4k/16k KV depth. tg is inside the
+session's own noise band: the identical binary measured 10.95-11.64 t/s at 4k
+across runs, so the tg cells are a near-tie rather than a stable gap.)
 
 Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
 `--spec 3`). MTP does not change prefill — the np4 pp aggregate applies
@@ -51,25 +52,23 @@ unchanged under MTP+np4:
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | 11.3-11.6 (4k) / 10.8-11.5 (16k) | — | 9.2 | — | 11.6 / 11.9 |
-| MTP single | — | **14.3** | — | 9.2 (no MTP) | — | ~12 (MTP, old build) |
-| np4 aggregate | 374 (pp512) | **25.1** | T27NPP4V | T27NP4V | L27NPP4 | L27NP4 |
+| tg single | — | 11.5 (4k) / 10.7 (16k) | — | 9.2 | — | 11.67 / 11.21 |
+| MTP single | — | **15.4** (k=2) / 9.3 (k=3) | — | 9.2 (no MTP) | — | ~12 (MTP, old build) |
+| np4 aggregate | 374 (pp512) | **20.85** | T27NPP4V | T27NP4V | L27NPP4 | **26.04** |
 | MTP + np4 | (np4) | **20.4** | — | — | (np4) | 15.5 *(old build)* |
 
-Conditions for the filled 2026-09-16 cells: HIP, ROCm 10, greedy, natural-text
-prompt, same host. np cells are 4 concurrent HTTP completions (128 tokens each,
-short shared prompt, ctx 8192/slot) measured back-to-back on both engines:
-**LLM170 np4 25.3-26.8 (long-prompt protocol) / 19.5-23.1 (short-prompt) vs
-llama-server 35.1 / 45-52 t/s** — llama's 4-row batch step costs 1.30x its
-single-token step, ours ~1.6x after the 2026-09-16 session (GPU argmax, gqa2d
-attention, batched conv/AR, warp-per-row g4). 2026-09-17 protocol-matched
-re-measurement (same client/prompt/greedy, warmed) showed llama's warm runs
-exceed the earlier reference; the residual gap is attributed to their
-MMQ-MMA GEMM family (matrix-core accumulation) plus our serial per-slot
-prefill scheduling — see docs/benchmarks.md for the full decomposition,
-including the WMMA tile-GEMM campaign that confirmed dot4-GEMV superiority
-on this GPU. MTP = `--spec 3` with the gguf's own nextn head (acceptance
-4/4 per cycle, token-identical to greedy).
+np cells require **4 slots on both sides** (`LLM170_SLOTS=4` /
+`llama-server -np 4`; both engines default to a single slot, in which case
+concurrent requests queue and aggregate ≈ single/4). Matched protocol
+(2026-09-17, `scripts/bench_np.py`, 4 concurrent 128-token completions, same
+208-token prompt, greedy, warmed): **LLM170 20.85 vs llama-server 26.04**.
+Decomposition (see docs/benchmarks.md): the t=4 engine step is 137-146 ms
+(t=1: 86 ms) — +21 ms of 4-row GEMM plus ~8 ms of per-slot state, with the
+weight read amortized across rows — and the 512-token prefill chunk is
+serialized on the critical path (~3.4 s per round of 4 requests) because our
+scheduler has no mixed prefill+decode batch, which is how llama hides its
+prefill. MTP = `--spec 3` with the gguf's own nextn head (batched GPU verify;
+acceptance 1-3 drafts/cycle on the gate prompt).
 
 llama's np4+MTP 15.5 t/s reference is from the **older** llama build (ROCm
 7.2.2 era, 11.75k-token slots); the current build exposes no flag to engage the
@@ -81,14 +80,17 @@ MTP+np4 20.4 is 0.58x — aggregate throughput favors llama; single-stream MTP
 
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-| backend | pp4096 | pp16384 | tg128@4k | tg128@16k |
-|---|---|---|---|---|
-| LLM170 hip | **264** | **241** | 18.3-18.7 | 16.8-17.5 |
-| LLM170 vulkan | 271 | 240 | 17.1 | 16.7 |
-| llama.cpp (ROCm 10) | 237 | 229 | **20.2** | **20.0** |
+| backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
+|---|---|---|---|---|---|
+| LLM170 hip | **252.3** | **268.9** | **239.5** | 18.56 | 18.35 |
+| LLM170 vulkan | — | 271 | 240 | 17.1 | 16.7 |
+| llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **20.23** | 17.79 (@4k) |
 
-(Decode cells re-measured 2026-09-16: 16-lane/row GEMV for small shapes,
-17.2 -> 18.0 t/s at the standard point, gate stream identical.)
+(Matched 2026-09-17: ours via `scripts/scorecard.sh`; llama via its server
+timings on the `qwen4exp build-ab` build with the model's required
+`-ot per_layer_token_embd=CPU --load-mode mmap -fit off`. Prefill wins at every
+measured length; the short-context tg cell is an 8% gap, the 4k one is inside
+noise.)
 
 Decode modes (aggregate t/s over 4 parallel slots; the model has no
 nextn/MTP head — MTP rows are structurally inapplicable):
@@ -96,9 +98,9 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | mode | pp agg | tg agg | pp agg | tg agg | pp agg | tg agg |
 |---|---|---|---|---|---|---|
 | | **LLM170 hip** | | **LLM170 vulkan** | | **llama.cpp (ROCm 10)** | |
-| tg single | — | **18.3-18.7** (ctx 4k) / **16.8-17.5** (ctx 16k) | — | 17.1 | — | 19.8 / 20.0 |
+| tg single | — | **18.56** (ctx 4k) / **18.35** (ctx 16k) | — | 17.1 | — | **20.23** / 17.79 |
 | MTP single | — | — | — | — | — | — |
-| np4 aggregate | — | **21.0-22.5** | TFNPP4V | TFNP4V | — | **39.4** |
+| np4 aggregate | — | **24.94** | TFNPP4V | TFNP4V | — | **41.07** |
 | MTP + np4 | — | — | — | — | — | — |
 
 (Flash-Next np4, measured 2026-09-16/17 same-host/same-prompt HTTP 4-way:
