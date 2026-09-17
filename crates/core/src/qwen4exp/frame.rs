@@ -1318,6 +1318,10 @@ fn frame_forward_np_ex(
             moe_frame(acc, model, f, il, n, t)?;
         } else {
             moe_frame_np(acc, model, f, il, n, seqs)?;
+            // moe_frame_np는 per-seq 구간에서 t_cur를 1로 내리고 seqs.len()으로
+            // 되돌린다(자기 안에서 t를 모른다). 헤드의 RmsRows/HcGateMean은
+            // t_cur로 행 수를 유추하므로 여기서 실제 행 수 t로 복원해야 한다.
+            fs_begin(acc, t);
         }
         sync_mark(acc, &format!("np{il}.moe"), f.mout)?;
         if il < 4 { ck(acc, f.mout, 64, &format!("L{il}.moe")); }
@@ -2240,7 +2244,10 @@ fn moe_frame_np(
         acc.shexp_da(f.shglu, &shd_w, f.msgate, mout_row, n, n_ff)
             .map_err(Q4Error::Io)?;
     }
-    fs_begin(acc, seqs.len()); // 공유 구간 복귀
+    // per-seq 구간을 벗어났다는 표시 — 정확한 행 수는 호출자만 알므로
+    // (프레임 진입 t) 이 함수는 1을 남기고 호출자가 t로 다시 세운다.
+    // 종전 seqs.len()은 행 수가 아니라 시퀀스 수라 헤드를 오도할 수 있었다.
+    fs_begin(acc, 1);
     Ok(())
 }
 
