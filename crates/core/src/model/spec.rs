@@ -614,9 +614,19 @@ impl Engine {
         // carried = 직전 부분수용에서 GDN이 미확정인 행 — 같은 토큰·같은 위치 재실행
         // (결정론적 커널 → 동일 결과, KV는 동일값 재기입). 재실행 배치를 대체한다.
         let mut carried: Vec<u32> = std::mem::take(&mut self.seqs[seq].gdn_carried);
-        // carried 상한 — 초과 시 GDN 커밋 배치(헤드 무의미하지만 간단)로 소화 후 청소.
-        // 전체수용이 드문 높은 k에서 배치 무한 증식 방지 (롤백 재실행의 분할 상환).
-        if carried.len() + 1 + k > 16 {
+        // carried 상한 — 초과 시 GDN 커밋 배치로 소화 후 청소(2026-09-17 재조정).
+        // carried 는 부분수용마다 누적되므로 상한이 크면 검증 배치가 17행까지 자라
+        // 매 사이클 재실행 비용이 O(누적)이 된다 — 종전 상한 16 에서 스펙이 8.02 t/s
+        // (비스펙 11.6)로 *느려졌던* 원인. 상한 스윕(k=2, 27B pp512/tg64):
+        // capx=0 6.7 / 2 11.2 / 4 13.0 / 8 13.7 t/s — 커밋 배치 자체도 전량 forward 라
+        // 너무 잦으면 손해. tg128 2회 반복 A/B 로 4 = 15.4, 8 = 13.15 t/s 확정(재현
+        // 가능) → 4 를 기본으로 한다 (비스펙 11.6 대비 +33%).
+        // LLM170_SPEC_CAPX 로 재정의 가능(진단용).
+        let cap_extra: usize = std::env::var("LLM170_SPEC_CAPX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        if carried.len() + 1 + k > 1 + k + cap_extra {
             let n_c = self.model.hp.n_embd;
             let (embd_ty_c, embd_arc_c) = self.embd_cache.as_ref().unwrap().clone();
             let mut crows: Vec<f32> = Vec::with_capacity(carried.len() * n_c);
