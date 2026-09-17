@@ -929,3 +929,28 @@ stream selector bolted onto shared engine state.
 The durable parts of the attempt were kept: `pre_pair` is now an `AtomicBool`
 (Sync preserved) and the accumulator's stream helpers exist; the loop debug
 instrumentation was removed.
+
+#### Vulkan 27B long-prefill: per-chunk wall (2026-09-17)
+
+`LLM170_DBG_WALL=1` prints the wall of each `step_batch` chunk at pp2048:
+
+| chunk | tokens | wall |
+|---|---|---|
+| 1 | 64 | 284.6 ms |
+| 2 | 512 | 1601.0 ms |
+| 3 | 512 | 2193.0 ms |
+| 4 | 512 | 2750.0 ms |
+| 5 | 512 | 3116.2 ms |
+
+The per-chunk wall grows ~590 ms per 512-token chunk, i.e. some per-token cost
+is proportional to the *context* (O(t) per chunk -> O(t^2) total), while the
+same-size chunks should cost the same. Flash-Next on Vulkan — different
+architecture (MoE + QSA) — shows no such growth, so it is specific to the 27B
+hybrid GDN + attention path. The `LLM170_VK_TS` profile of the first chunk is
+clean (tiled GEMMs, `tile_ms4gy` 155 ms of the 472 ms GPU total), while later
+chunks show `gemv8_*` kernels and a GPU total far above the sum of the listed
+dispatches (7478 ms total vs ~150 ms listed), i.e. mostly host/submission gaps
+rather than kernel time. Skipping the attention (`LLM170_VK_ATTN=1`) does not
+change the pp4096 rate (145.6 -> 145.1 t/s), so the growth is not in the flash
+attention kernel. Next step for this axis: instrument `step_batch`'s stages at
+pp2048 and find which stage's wall grows with the KV position.
