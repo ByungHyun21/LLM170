@@ -254,7 +254,13 @@ impl DecodeState {
         let b_ak_t = bs(t_max * n_kv * hd * 4);
         let b_av_t = bs(t_max * n_kv * hd * 4);
         let b_aout_t = bs(t_max * hp.n_head * hp.head_dim * 4);
-        let b_scores_t = bs(t_max * hp.n_head * ctx_len * 4);
+        // np/spec 배치 scores 버퍼 — 행 수 상한은 **배치**(n_seqs×(k+1) ≤ 40,
+        // 아래 b_logits_all 주석)이지 프리필 청크가 아니다. 종전엔 t_max(=
+        // LLM170_CHUNK, 기본 512)로 잡아 ctx에 곱해져 ctx 32768에서 4.3GB
+        // 단일 할당이 됐고 서버 init이 사실상 멈췄다(2026-09-17 실측:
+        // ctx 8192 준비 13.3s → ctx 32768 209s에도 미완). 64행 상한은 코드
+        // 자체의 문서화된 한계와 같다.
+        let b_scores_t = bs(t_max.min(64) * hp.n_head * ctx_len * 4);
         // 최대 64행 — carried 재실행 행 포함 (np8×k4=40)
         let b_logits_all = ctx.alloc(hp.vocab * 4 * 64).map_err(|e| e.to_string())?;
         // GDN 상태 스냅샷 (spec 부분수용 롤백용) — recr 전층 (gdn_s + conv) × seq
