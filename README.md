@@ -32,8 +32,13 @@ Matched scorecard, 2026-09-17, same host and session.
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
 | LLM170 hip | **356.8**-373.3 | **313.2**-336.9 | 288.7-294.3 | 11.4-11.6 | 11.6 |
-| LLM170 vulkan | 316.7 | 147.6 | — | 11.26 | 11.26 |
+| LLM170 vulkan | 316.7 | 147.6 | n/a | 11.26 | 11.26 |
 | llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
+
+Vulkan's 27B pp16384 is `n/a`: the run aborts with `ERROR_DEVICE_LOST`
+(radv: "The CS has been cancelled because the context is lost"). The Flash-Next
+16k prefill on Vulkan completes normally (245.9), so this is a 27B long-context
+Vulkan limit, not a general backend failure.
 
 np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
 Protocol: **one server at a time** (concurrent servers contend and halve the
