@@ -745,3 +745,18 @@ draft at this acceptance rate.
 
 MTP speed is otherwise bounded by the same batched (t>=4) verify cost as np4:
 `[vv] raw_verify` is 126-182 ms for a 4-row batch vs 86 ms for a t=1 step.
+
+### HIP graph capture on the frame path (2026-09-17)
+
+The frame decode path (`decode1_greedy`) calls `capture_mark` at its host-bridge
+boundaries but had no capture/replay wiring — only the value path (`decode1`)
+did. Wiring the same protocol into the frame branch is bit-exact (gate-prompt
+token stream identical with and without `LLM170_GRAPH=1`) but **performance-
+neutral**: FN tg128 17.87 -> 17.89 t/s, while the value path gains 5.1%
+(16.11 -> 16.93). The frame path's inter-kernel gaps (KTRACE 7-16 ms of a
+~54 ms live step) are therefore GPU-side ramp/dependency, not host dispatch,
+so a graph cannot remove them; cutting them would need fewer kernels.
+
+`graph_abort` was added to the `GraphCapture` capability and called on any
+frame->value fallback: without it the backend stays in Replay mode and silently
+skips subsequent launches. That is a correctness fix, not a perf change.
