@@ -204,7 +204,7 @@ impl Q4Acc {
         }
         if ty == ggml_id(GgmlType::Q5_1) {
             // 타일 판은 출력 4개/블록 — 그리드도 4로 나눈다.
-            let tiled = std::env::var_os("LLM170_NO_Q5_1_T").is_none();
+            let tiled = true; // plans/78 R6: NO_Q5_1_T 폐기 — 타일 판 확정
             let outs_per_block = if tiled { 4usize } else { 1 };
             let nblk = n_out.div_ceil(outs_per_block);
             let gy = nblk.min(65535) as u32;
@@ -372,7 +372,7 @@ impl Q4Acc {
         }
         // plans/73: t=1은 워프-퍼-출력판 — 저출력(hc inject [10240→4])·라우터
         // 형상에서 원판 대비 3-6×. 누산 재배열 편차는 게이트로 검증.
-        if t == 1 && n_in.is_multiple_of(4) && std::env::var("LLM170_F32W").as_deref() != Ok("0") {
+        if t == 1 && n_in.is_multiple_of(4) { // plans/78 R6: F32W 폐기 — f32 직독 기본
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -391,7 +391,7 @@ impl Q4Acc {
         }
         // plans/74: t=2..8 은 멀티토큰 워프판(무게 1회 독서) — 종전 t판은
         // np 라우터/PLE 투영에서 17GB/s였다. LLM170_NO_F32MT=1 복귀.
-        if (2..=8).contains(&t) && n_in.is_multiple_of(4) && std::env::var_os("LLM170_NO_F32MT").is_none() {
+        if (2..=8).contains(&t) && n_in.is_multiple_of(4) {
             let mut tt = t as i32;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,

@@ -155,12 +155,11 @@ impl RawDecoder {
 
 /// f32 KV → f16 미러 변환 (디코드 어텐션의 v_dot2 경로 전제).
 /// off·n 단위는 원소 수. 같은 스트림에 넣으므로 이후 커널이 순서대로 본다.
-/// f32 KV 원본이 필요한 경로(디코드 폴백)인지. 기본 경로는 f16 미러만 쓴다.
+/// f32 KV 원본이 필요한 경로(덤프 진단)인지. 기본 경로는 f16 미러만 쓴다.
+/// plans/78 R6: NO_FLASH/GQA/GQA2/GQA2D 커널 스위치는 폐기 — 이 함수는
+/// KV 덤프 진단(weights.rs)을 위해서만 남고, NO_GQA2D=1이 f32 KV를 복원한다.
 fn legacy_f32() -> bool {
-    std::env::var_os("LLM170_NO_FLASH").is_some()
-        || std::env::var_os("LLM170_NO_GQA").is_some()
-        || std::env::var_os("LLM170_NO_GQA2").is_some()
-        || std::env::var_os("LLM170_NO_GQA2D").is_some()
+    std::env::var_os("LLM170_NO_GQA2D").is_some()
 }
 
 fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: usize, n: usize) -> Result<(), String> {
@@ -664,7 +663,7 @@ impl DecodeState {
         // 독서로 토큰별 독립 누산. LLM170_NO_G4=1로 끔.
         if (2..=4).contains(&t)
             && matches!(ty, 12 | 13 | 14 | 23)
-            && std::env::var_os("LLM170_NO_G4").is_none()
+           
         {
             return self.ctx.gemm_g4(
                 ty,
@@ -689,7 +688,7 @@ impl DecodeState {
         // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
         let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && std::env::var_os("LLM170_EXACT").is_none()
             && self.ctx.co_loaded(super::CO_J128);
-        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) && std::env::var_os("LLM170_NO_TILE").is_none() {
+        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) {
             // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
             return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
         }
@@ -699,7 +698,7 @@ impl DecodeState {
     #[allow(clippy::too_many_arguments)]
     /// mm_b_s의 MMQ판 — side stream에서 quant+mul_mat_q (부록48).
     fn mm_b2_s(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        if matches!(ty, 12 | 13 | 23) && t >= 32 && std::env::var_os("LLM170_NO_MMQ").is_none() && std::env::var_os("LLM170_NO_MMQ_S").is_none()
+        if matches!(ty, 12 | 13 | 23) && t >= 32
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
             return self.ctx.gemm_mmq_s(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
         }

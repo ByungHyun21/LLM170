@@ -444,8 +444,8 @@ impl DecodeState {
     fn mmq_used_s(&self, ty: u32, t: usize) -> bool {
         matches!(ty, 12 | 13 | 23)
             && t >= 32
-            && std::env::var_os("LLM170_NO_MMQ").is_none()
-            && std::env::var_os("LLM170_NO_MMQ_S").is_none()
+           
+           
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
     }
 
@@ -560,7 +560,7 @@ impl DecodeState {
                     let mut nh = self.dt_rank as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank, &mut args)?;
+                    self.ew_l("gdn_beta_g_f32", self.dt_rank, &mut args)?;
                 }
                 // AR
                 {
@@ -634,7 +634,7 @@ impl DecodeState {
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, 1, 32, &mut args)?;
+                    self.ctx.launch("norm_gated_silu_f32", self.dt_rank as u32, 1, 32, &mut args)?;
                     self.quant(self.ggated, self.xq_g, self.d_inner)?;
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
@@ -731,7 +731,7 @@ impl DecodeState {
                 kv_to_f16(&self.ctx, self.av, self.kv_v16[full_idx][seq], 0, dpos, n_kv * hd)?;
                 // score
                 let mask = *self.consts.get("mask").ok_or("mask")?;
-                let flash1 = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
+                let flash1 = hd <= 256;
                 if !flash1 {
                 {
                     let n_past = pos + 1;
@@ -772,7 +772,7 @@ impl DecodeState {
                 }
                 }
                 // t=1 fused flash (score/mix2 대체)
-                if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
+                if hd <= 256 {
                     let mut qp = self.aq as *mut std::ffi::c_void;
                     let mut ckp = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
                     let mut cvp = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
@@ -787,7 +787,7 @@ impl DecodeState {
                     let mut p0 = pos as i32;
                     // GQA 공유 커널은 세그먼트 수와 무관하게 우월 — 단문(ctx<512)에서도
                     // 평문 qsa_flash 대신 사용한다 (gq=1이면 종전과 동일 산술).
-                    let gqa_ok = std::env::var_os("LLM170_NO_GQA").is_none() && hd <= 256 && n_head % n_kv == 0;
+                    let gqa_ok = hd <= 256 && n_head % n_kv == 0;
                     if gqa_ok || np_ > (std::env::var("LLM170_T1SEG").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(512)) {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
@@ -813,7 +813,7 @@ impl DecodeState {
                         // LLM170_NO_GQA2=1 이면 종전 커널로 복귀.
                         let gqa2 = std::env::var_os("LLM170_NO_GQA2").is_none();
                         // v_dot2(f16 KV) 경로가 기본: QK 에 셔플이 없다 (gqa-bench 3314 175.9→106.9us)
-                        let gqa2d = gqa2 && std::env::var_os("LLM170_NO_GQA2D").is_none();
+                        let gqa2d = gqa2;
                         if gqa2d {
                             // f16 미러 + v_dot2: 인자 순서는 gqa2 와 같고 K/V 만 half 버퍼
                             let mut k16 = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;

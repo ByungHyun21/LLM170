@@ -79,7 +79,7 @@ impl DecodeState {
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
                 // conv — gdn_conv_np 테이블판 1런치 (plans/74 N3; 종전 행당 1런치,
                 // npt4 3.9ms). 산술은 gdn_conv_t(t=1) 과 동일(exp_cr + 링 시프트).
-                if t > 1 && std::env::var_os("LLM170_NO_NPCONV").is_none() {
+                if t > 1 {
                     let row_seq: Vec<i32> = seqs.iter().map(|&s2| s2 as i32).collect();
                     let mut qp = self.gqkv_t as *mut std::ffi::c_void;
                     let mut cp = cw as *mut std::ffi::c_void;
@@ -139,11 +139,11 @@ impl DecodeState {
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
+                    self.ew_l("gdn_beta_g_f32", self.dt_rank * t, &mut args)?;
                 }
                 // AR — 행별 상태 포인터 테이블로 1런치 (plans/74 N3; 종전 행당
                 // 1런치×t, npt4 4.9ms). LLM170_NO_NPAR=1 이면 종전 행 슬라이스.
-                if t > 1 && std::env::var_os("LLM170_NO_NPAR").is_none() {
+                if t > 1 {
                     let row_seq: Vec<i32> = seqs.iter().map(|&s2| s2 as i32).collect();
                     let tbl = self.ms_gdn_ptr(recr_idx, &row_seq)?;
                     let mut tp = tbl as *mut std::ffi::c_void;
@@ -217,7 +217,7 @@ impl DecodeState {
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3("norm_gated_silu_f32", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
@@ -276,11 +276,7 @@ impl DecodeState {
                     // 20.4ms/step 였다. t=1 디코드 경로와 동일 gqa2d(v_dot2
                     // f16) + merge — sg 세그먼트 병렬. part 스크래치는 행별
                     // 분할(공유 충돌 회피). LLM170_NO_NPGQA=1 이면 종전 판.
-                    let np_gqa = std::env::var_os("LLM170_NO_NPGQA").is_none()
-                        && std::env::var_os("LLM170_NO_FLASH").is_none()
-                        && std::env::var_os("LLM170_NO_GQA2D").is_none()
-                        && hd <= 256
-                        && n_head % n_kv == 0;
+                    let np_gqa = hd <= 256 && n_head % n_kv == 0;
                     if np_gqa {
                         let sg = ((pos + 1) / 64).clamp(32, 256);
                         let nseg = (pos + 1).div_ceil(sg).max(1);
@@ -358,7 +354,7 @@ impl DecodeState {
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
+                self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
             }
             if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
                 self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
@@ -388,7 +384,7 @@ impl DecodeState {
         // (1.04GB q6_K 헤드를 j128 타일로 읽어 29.7ms/스텝, 실측).
         if (2..=4).contains(&t)
             && th == 14
-            && std::env::var_os("LLM170_NO_G4").is_none()
+           
         {
             self.ctx.gemm_g4(
                 th,

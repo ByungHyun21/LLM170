@@ -90,7 +90,7 @@ gmark("gdn_mm", &mut marks);
                     let mut tt = t as i32;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt)];
                     if t >= self.conv_k - 1 {
-                        self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_conv_t2_f32" } else { "gdn_conv_t2" }, conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                        self.ctx.launch3("gdn_conv_t2_f32", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
                         let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
                         let mut sp2 = self.st_conv[recr_idx][seq] as *mut std::ffi::c_void;
                         let mut ch2 = conv_ch as i32;
@@ -142,7 +142,7 @@ gmark("split+l2", &mut marks);
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
+                    self.ew_l("gdn_beta_g_f32", self.dt_rank * t, &mut args)?;
                 }
 gmark("betag", &mut marks);
                 // AR 배치 (pair 블록 × t 내부 순차)
@@ -200,13 +200,7 @@ gmark("betag", &mut marks);
                         self.ctx.launch3("gdn_ar_sm", self.dt_rank as u32, 2, 1, 64, &mut args)?;
                     } else {
                         // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
-                        if std::env::var_os("LLM170_NO_ARSWAP").is_none() {
-                            self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
-                        } else {
-                            // 8워프/블록 (워프당 1열) — 블록 수 1/8
-                            let uw = 8u32;
-                            self.ctx.launch3("gdn_ar_w", self.dt_rank as u32, (self.d_state as u32).div_ceil(uw), 1, 32 * uw, &mut args)?;
-                        }
+                        self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
                     }
                 }
                 if il == 0 {
@@ -235,7 +229,7 @@ gmark("trace", &mut marks);
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3("norm_gated_silu_f32", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
 gmark("gdn", &mut marks);
 gmark("normg", &mut marks);
@@ -306,7 +300,7 @@ gmark("attn", &mut marks);
                 // 초과 p는 마스크→-3e38→w=0 기여로 원소 산술열 불변)
                 {
                     // flash 시 기존 score/mix2 스킵 (이중실행 방지)
-                    let flash_only = std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256;
+                    let flash_only = hd <= 256;
                     if !flash_only {
                     let np_max = (pos0 + t) as i32;
                     let sstr = self.ctx_len as i32;
@@ -345,7 +339,7 @@ gmark("attn", &mut marks);
                     }
                 }
                 // qsa fused flash: score+softmax+mix 단일 패스 (maxrel 1e-6 검증, 스트림★)
-                if std::env::var_os("LLM170_NO_FLASH").is_none() && hd <= 256 {
+                if hd <= 256 {
                     let mut qp = self.aq_t as *mut std::ffi::c_void;
                     let mut ckp = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
                     let mut cvp = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
@@ -360,7 +354,7 @@ gmark("attn", &mut marks);
                     let mut p0 = pos0 as i32;
                     // 분할 flash 기본 ON (2026-09-05: pp512 +5 — 청크 2-4의 np 성장
                     // 구간 병렬화; LLM170_NO_QSA_SPLIT으로 원경로)
-                    if std::env::var_os("LLM170_NO_QSA_SPLIT").is_none() && np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
+                    if np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
                         // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
                         // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 줄어든다.
                         let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize).max(64);
@@ -373,11 +367,11 @@ gmark("attn", &mut marks);
                         // q4 다중화 기본: ck/cv 1회 로드로 t 4행 공유 (레지스터 여유 내 최대 배율)
                         // wk는 t>8(프리필) 전용 — 소형 배치(검증 t<=8)는 디코드와 같은
                         // split4q4를 써서 spec/greedy 계약을 구조적으로 만든다.
-                        let wk = t > 8 && std::env::var_os("LLM170_NO_WKFLASH").is_none();
+                        let wk = t > 8;
                         // hd=256 프리필은 16레인/행 판이 기본 (판정기 17/19 유지).
                         // 3회 평균 pp3314 303.7 vs 종전 299.9 (+1.3%, 구동 잡음 ±1.5%).
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
-                        let wk16 = wk && hd == 256 && std::env::var_os("LLM170_NO_WK16").is_none();
+                        let wk16 = wk && hd == 256;
                         if wk16 {
                             // WMMA 타일 판은 **옵트인**(LLM170_WK_WMMA=1)으로 강등
                             // (2026-09-14, plans/69): 이 기기의 ROCm/HIP 빌드에서
@@ -510,7 +504,7 @@ gmark("ffn_up", &mut marks);
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
+                self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
             }
 gmark("ffn_silu", &mut marks);
             if std::env::var_os("LLM170_DUMP_XQN").is_some() && il == 0 {

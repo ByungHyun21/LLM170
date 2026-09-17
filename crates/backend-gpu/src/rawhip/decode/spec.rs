@@ -467,9 +467,7 @@ impl DecodeState {
             let mut tl = nrow_attn as i32;
             let mut ss = self.ctx_len as i32;
             let mut p0 = (pos0 + t - nrow_attn) as i32;
-            if std::env::var_os("LLM170_NO_QSA_SPLIT").is_none()
-                && np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128)
-            {
+            if np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
                 let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(64);
                 let nseg = (pos0 + t).div_ceil(sg);
                 let part = self.ctx.scratch(nrow_attn * n_head * nseg * (hd + 2) * 4)?;
@@ -481,7 +479,7 @@ impl DecodeState {
                     Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0),
                     Self::p(&mut sg_a),
                 ];
-                let wk = nrow_attn > 8 && std::env::var_os("LLM170_NO_WKFLASH").is_none();
+                let wk = nrow_attn > 8;
                 let (kn2, gx) = if wk { ("qsa_flash_wk", (nrow_attn.div_ceil(32)) as u32) } else { ("qsa_flash_split4q4", (nrow_attn.div_ceil(4)) as u32) };
                 self.ctx.launch3(kn2, gx, n_head as u32, nseg as u32, 256, &mut args)?;
                 let mut margs = vec![
@@ -536,7 +534,7 @@ impl DecodeState {
             let mut na = (self.n_ff * nrow_ffn) as i32;
             let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
             self.ew_l(
-                if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" },
+                "silu_mul_f32",
                 self.n_ff * nrow_ffn,
                 &mut args,
             )?;
@@ -712,7 +710,7 @@ impl DecodeState {
                     let mut rs = self.ms_rowseq as *mut std::ffi::c_void;
                     let mut sg = self.ms_segstart as *mut std::ffi::c_void;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut cp), Self::p(&mut sp), Self::p(&mut op), Self::p(&mut ch), Self::p(&mut kk), Self::p(&mut tt), Self::p(&mut rs), Self::p(&mut sg)];
-                    self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_conv_t2_ms_f32" } else { "gdn_conv_t2_ms" }, conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+                    self.ctx.launch3("gdn_conv_t2_ms_f32", conv_ch.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
                     let mut qp2 = self.gqkv_t as *mut std::ffi::c_void;
                     let mut sp2 = self.ms_conv_ptr(recr_idx, &row_seq)? as *mut std::ffi::c_void;
                     let mut ch2 = conv_ch as i32;
@@ -761,7 +759,7 @@ impl DecodeState {
                     let mut nh = (self.dt_rank * t) as i32;
                     let mut dr = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut bp), Self::p(&mut ap), Self::p(&mut dp), Self::p(&mut sp2), Self::p(&mut bgp), Self::p(&mut nh), Self::p(&mut dr)];
-                    self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "gdn_beta_g_f32" } else { "gdn_beta_g" }, self.dt_rank * t, &mut args)?;
+                    self.ew_l("gdn_beta_g_f32", self.dt_rank * t, &mut args)?;
                 }
                                 // AR — per-seq 슬라이스 (gdn_ar_w_ms 비대칭 RCA 회피 — 트렁크 검증 커널 재사용)
                 for gi in 0..group_starts.len() {
@@ -797,7 +795,7 @@ impl DecodeState {
                     let mut d = self.d_state as i32;
                     let mut nh = self.dt_rank as i32;
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
-                    self.ctx.launch3(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "norm_gated_silu_f32" } else { "norm_gated_silu" }, self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3("norm_gated_silu_f32", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
                 self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
@@ -901,7 +899,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 let mut op = self.fglu_t as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
-                self.ew_l(if std::env::var("LLM170_F32SILU").as_deref() != Ok("0") { "silu_mul_f32" } else { "silu_mul" }, self.n_ff * t, &mut args)?;
+                self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
             }
             if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
                 self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
