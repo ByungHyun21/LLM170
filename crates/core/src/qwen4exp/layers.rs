@@ -525,8 +525,7 @@ impl Engine4 {
         let frame_on = self.acc.is_some()
             && !self.frame_broken
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
-            && std::env::var_os("LLM170_NO_NP_BATCH").is_none();
+            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
         if !frame_on {
             let mut out = Vec::with_capacity(seqs.len());
             for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
@@ -600,7 +599,6 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         && !self.frame_broken
         && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
         && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
-        && std::env::var_os("LLM170_NO_NP_BATCH").is_none()
         && std::env::var("LLM170_NP_GREEDY").map(|v| v != "0").unwrap_or(true);
     if !frame_on {
         let lg = self.decode_batch(seqs, tokens)?;

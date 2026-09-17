@@ -196,9 +196,6 @@ gmark("betag", &mut marks);
                             Self::p(&mut bnp),
                         ];
                         self.ctx.launch3("gdn_ar_chunk_c2", npair as u32, nc as u32, 1, d as u32, &mut cc)?;
-                    } else if env_on("LLM170_ARSM") && self.d_state == 128 {
-                        // 부록82: smem 스테이징 AR (k/q 128중 재독 제거)
-                        self.ctx.launch3("gdn_ar_sm", self.dt_rank as u32, 2, 1, 64, &mut args)?;
                     } else {
                         // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
                         self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
@@ -374,58 +371,14 @@ gmark("attn", &mut marks);
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
                         let wk16 = wk && hd == 256;
                         if wk16 {
-                            // WMMA 타일 판은 **옵트인**(LLM170_WK_WMMA=1)으로 강등
-                            // (2026-09-14, plans/69): 이 기기의 ROCm/HIP 빌드에서
-                            // wmma_ok() 프로브는 통과하지만 실측이 파탄이다 —
-                            // pp512 38.2 t/s vs wk8 364.2 t/s(**9.5×**). 커널이
-                            // 에뮬레이션/스필 경로로 떨어지는 것으로 추정(원인은
-                            // 미상 — VK 시대 기록 361.3과 같은 수치를 냈던 판이다).
-                            // launch3_dyn이 KTRACE 이벤트를 안 남겨 'kv_f16 뒤
-                            // 갭 12s'로 위장한 게 이 어텐션 커널 시간이었다.
-                            if wk
-                                && hd == 256
-                                && env_on("LLM170_WK_WMMA")
-                                && super::probes::wmma_ok()
-                            {
-                                // WMMA 타일 판(기본): Q_in_reg + Q 버퍼를 K/V 로 재사용. 공유 32768B.
-                                // pp512 361.3 / pp3314 329.2 vs 스칼라 360.2 / 324.7 (2026-09-12).
-                                // 산술이 f16 누적이라 스칼라와 다른데, 토큰 동일성은 600토큰
-                                // 다중 청크에서 확인했고 커널 정확성은 wmma-attn-check 가 보증한다.
-                                // LLM170_NO_WK_WMMA=1 이면 wk8 로 복귀.
-                                self.ctx.launch3_dyn("qsa_flash_wmma", t.div_ceil(64) as u32, n_head as u32, nseg as u32, 256, 32768, &mut args)?;
+                            // plans/79 C: WK_WMMA(옵트인 강등, plans/69 — 이 기기 실측
+                            // 파탄 9.5×)·WK8D·NO_WMMA2/V2·NO_WK8I/WK8 실험 게이트 폐기.
+                            // 확정 체인: 장문(np>2560)은 wmma2v2(plans/74 N4, f16 Q/P
+                            // 클래스 — 표준 검증면 ctx≤8k는 바이트 불변), 그 외 wk8i.
+                            if np_ > 2560 {
+                                self.ctx.launch3("qsa_flash_wmma2v2", t.div_ceil(16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
                             } else {
-                            // hd=256 프리필은 8레인/행 판(셔플 3단)이 기본 — wk16 대비 페어 +2.3%.
-                            // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
-                            // `llm170 attn-check` 로 보증된다(사용자 결정 2026-09-12).
-                            // LLM170_NO_WK8=1 이면 wk16(4단)으로 복귀.
-                            // plans/73: v_dot2 판은 **옵트인**(LLM170_WK8D=1). QK 는
-                            // 4× 빨라지지만 PV(스레드=dim × 8쿼리)가 스칼라 f32 FMA 로
-                            // 병목을 넘어가 실측 역행 — wk8i 253 vs wk8d 234 t/s@pp16k.
-                            // 구조 교훈(PV/기록의 8쿼리 전부 규약, 완전마스크 타일의
-                            // e=0)은 커널 주석에 남긴다. WMMA급 해법이 다음 과제.
-                            // plans/74 N4: raw-builtin WMMA(w32) 판 — ABI 는
-                            // wmma2-map2 프로브로 확정, wmma2-attn-check PASS.
-                            // f16 Q/P 산술 클래스라 평탄분포 아그맥스를 흔든다(실측:
-                            // 2302토큰 프롬프트 스트림 분기, 첫 플립 참조갭 2.07nat
-                            // → 근접티 ε=1.5 밖). 표준 검증면(게이트·verify·MTP·VL,
-                            // 모두 ctx≤8k)은 바이트 불변을 유지하고 **n_past>8192
-                            // 장문 프리필에만** 적용한다(pp16k +11%; 임계 2560 — 검증
-                            // 프롬프트 최대 2326토큰은 wk8i 클래스 유지). 폭 넓은 채택은
-                            // llama 참조 재수집 후 재판정 과제. LLM170_NO_WMMA2=1
-                            // 이면 전 구간 wk8i.
-                            if !env_on("LLM170_NO_WMMA2")
-                                && np_ > 2560 {
-                                let v2k = !env_on("LLM170_NO_WMMA2V2");
-                                self.ctx.launch3(if v2k { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, t.div_ceil(16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
-                            } else if env_on("LLM170_WK8D") {
-                                self.ctx.launch3("qsa_flash_wk8d", t.div_ceil(8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            } else if !env_on("LLM170_NO_WK8I") {
                                 self.ctx.launch3("qsa_flash_wk8i", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            } else if !env_on("LLM170_NO_WK8") {
-                                self.ctx.launch3("qsa_flash_wk8", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            } else {
-                                self.ctx.launch3("qsa_flash_wk16", t.div_ceil(16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
-                            }
                             }
                         } else {
                             let (kn, gx) = if wk { ("qsa_flash_wk", t.div_ceil(32) as u32) } else { ("qsa_flash_split4q4", t.div_ceil(4) as u32) };

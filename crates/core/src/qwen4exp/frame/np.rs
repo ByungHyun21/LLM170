@@ -109,7 +109,6 @@ pub(super) fn gdn_frame_np(
     // qkv/gconv는 [t][ch] 연속 프레임 버퍼라 정본 핸들 직접.
     let conv_states: Vec<u64> = seqs.iter().map(|&sq| f.st_conv[sq][ri]).collect();
     if seqs.len() > 1
-        && std::env::var_os("LLM170_NO_NPCONV").is_none()
         && acc
             .frame_gdn_conv_np(f.gqkv, f.gconv, &conv_states, cw, conv_ch, hp.conv_k)
             .is_ok()
@@ -139,7 +138,6 @@ pub(super) fn gdn_frame_np(
     let ar_states: Vec<u64> = seqs.iter().map(|&sq| f.st_gdn[sq][ri]).collect();
     let fs: &dyn FrameState = acc;
     if seqs.len() > 1
-        && std::env::var_os("LLM170_NO_NPAR").is_none()
         && acc
             .frame_gdn_ar_np(f.gq, f.gk, f.gv, f.gbg, f.go, &ar_states, hp.n_group, hp.dt_rank, hp.d_state)
             .is_ok()
@@ -391,8 +389,8 @@ pub(super) fn frame_forward_np_ex(
         // plans/74: np 기본 배치 MoE — direct-ids 커널이 rows<=64 에서도
         // 돌아가므로 t·k_sel=40행 1회 GEMM(행별 루프 대비 런치 1/4, 점유율 4배,
         // 산술 비트동일 — q4_moe_scatter 합산순서 = q4_moe_weighted_sum).
-        // LLM170_NO_MOE_NPB=1 이면 행별로 복귀.
-        if t > 1 && std::env::var_os("LLM170_NO_MOE_NPB").is_none() {
+        // plans/79 C: NO_MOE_NPB 폐기 — t>1 배치 MoE 확정(행별 t=1은 아래 폴백).
+        if t > 1 {
             moe_frame(acc, model, f, il, n, t)?;
         } else {
             moe_frame_np(acc, model, f, il, n, seqs)?;

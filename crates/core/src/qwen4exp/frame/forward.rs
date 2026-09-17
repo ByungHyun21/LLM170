@@ -960,7 +960,7 @@ pub(super) fn moe_frame(
         // plans/72: t=1은 융합 2런치(gate+up+silu → down+sigmoid·axpy).
         // 기존 8런치(quant×2+gemv×3+sigmoid+silu+axpy)가 19.4ms/step의
         // 지배 항이었다 — 런치 오버헤프 지배(유효 대역폭 1.5GB/s).
-        if t == 1 && std::env::var_os("LLM170_NO_SHEXP_FUSED").is_none() {
+        if t == 1 {
             op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
             acc.shexp_gu(f.mix, &shg_w, &shu_w, f.shglu, n, n_ff)
                 .map_err(Q4Error::Io)?;

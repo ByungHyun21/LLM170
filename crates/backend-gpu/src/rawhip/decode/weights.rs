@@ -423,21 +423,11 @@ impl DecodeState {
             return false;
         }
         let only = std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok());
-        if env_on("LLM170_NO_MMQ") && only.is_none() {
-            return false;
-        }
         if let Some(m) = only
             && m & (1u32 << (ty - 12)) == 0 {
                 return false;
             }
-        if ty == 14 && env_on("LLM170_NO_Q6MMQ") {
-            // q6_K 킬스위치: 타일 경로(활성 q8 소비). DEQ16만 f32 직소비.
-            return env_on("LLM170_DEQ16")
-                && t >= 32
-                && self.ctx.co_loaded(super::CO_MMQ2);
-        }
-        (t >= 32 || (t == 1 && env_on("LLM170_Q1MMQ")))
-            && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
+        t >= 32 && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
     }
 
     /// 사이드 스트림(mm_b2_s → gemm_mmq_s)의 f32 직소비 여부 — 조건 미러.
@@ -878,13 +868,7 @@ impl DecodeState {
             self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            if env_on("LLM170_Q1MMQ") && matches!(tg | tu, 12 | 13 | 14 | 23)
-                && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
-                // 실험(부록 74): 디코드 GEMV를 mmq 타일로 — f32 직행, 별도 quant 불요.
-                self.rms(self.xs, pw, self.xn, n)?;
-                self.mm_b2(self.xn, self.xq_n, n / 4 + n / 32 + n / 16, wg, tg, nig, nog, self.fgate, 1)?;
-                self.mm_b2(self.xn, self.xq_n, n / 4 + n / 32 + n / 16, wu, tu, niu, nou, self.fup, 1)?;
-            } else if env_on("LLM170_DECODE_PAIRS") {
+            if env_on("LLM170_DECODE_PAIRS") {
                 self.ctx.side_wait_main()?;
                 self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
                 self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;

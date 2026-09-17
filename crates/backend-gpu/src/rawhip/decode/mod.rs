@@ -15,9 +15,9 @@
 
 use cubecl_hip_sys as hip;
 use super::RawCtx;
-use super::{CO_MMQ, CO_MMQ2, CO_MMQ3, probes};
+use super::{CO_MMQ, CO_MMQ2, CO_MMQ3};
 use llm170_core::matmul::Weight;
-use crate::rawhip::{env_on, env_eq};
+use crate::rawhip::env_on;
 
 /// 디코드 상주 상태 — 스텝마다 재사용, 해제 없음.
 /// 원시 포인터는 단일 GPU 컨텍스트 소유 — Mutex 직렬화 하 Send 안전.
@@ -616,23 +616,17 @@ impl DecodeState {
     #[allow(clippy::too_many_arguments)]
     /// mm_b의 f32 병행판 — q4_K/q5_K MMQ 경로 (하니스 검증 plans/27 부록5·14).
     fn mm_b2(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        let only = { let _t = std::time::Instant::now(); std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok()) };
-        if !env_on("LLM170_NO_MMQ") || only.is_some() {
-            // plans/73 우선순위 수정: && 가 || 보다 먼저 결합해 좌변(K계열)이
-            // t 게이트·CO 검사를 **우회**했다 — step_batch 의 verify(t=4~16)가
-            // 전부 MMQ 로 돌아 296ms/4행 (3.9x, 무계약)을 낸 근원. 게이트가
-            // 양쪽 분기 모두에 적용되도록 괄호 명시.
-            if (((only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
-                || ((ty == 8 && env_eq("LLM170_Q8MMQ", "1")) && (ty != 14 || !env_on("LLM170_NO_Q6MMQ"))))
-                && (t >= 32 || (t == 1 && env_on("LLM170_Q1MMQ")))
-                && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
-                        return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
-            }
-            // q6_K: dequant→f16 v4 타일 (llama dequant+MFMA 경로 대응, 부록42)
-            if ty == 14 && t >= 32 && self.ctx.co_loaded(super::CO_MMQ2)
-                && env_on("LLM170_DEQ16") {
-                return self.ctx.gemm_f16_q6(y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
-            }
+        // 진단: LLM170_MMQ_ONLY=타입 비트마스크 — MMQ 바이섹트(q4=1<<0, q5=1<<1,
+        // q6=1<<2, iq4xs=1<<11). plans/79 C: NO_MMQ·Q8MMQ·Q1MMQ·DEQ16 실험 게이트
+        // 폐기 — K계열 MMQ(t≥32·CO 로드)가 확정 경로다.
+        // plans/73 우선순위 수정 계승: t 게이트·CO 검사는 분기 공통 적용.
+        let only = std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok());
+        if (only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0))
+            && matches!(ty, 12 | 13 | 14 | 23)
+            && t >= 32
+            && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
+        {
+            return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
         }
         self.mm_b(xq, xq_w, wp, ty, n_in, n_out, out, t)
     }
