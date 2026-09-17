@@ -246,6 +246,9 @@ non-frame path; real model tg16 0.43 -> 2.87 t/s (6.7x) — see
 [benchmarks.md](benchmarks.md). qwen35 has no frame yet; the same pattern
 extends (all its layer kernels already exist on GPU).
 
+> **Update (2026-09-18)**: `frame.rs` is now the `frame/` module tree
+> (`mod/forward/np/multi/diag`, plans/78 R9 + plans/79 A).
+
 ## ADR-0018 — cubecl removed; raw HIP + raw Vulkan backends (2026-09-05)
 
 **Context**: cubecl's HIP runtime wedged on faults and its WGSL path could
@@ -331,3 +334,10 @@ attention is now bandwidth-bound (~221 GB/s effective), so the next lever
 there is KV quantization, not kernel structure. The f16 KV mirror also halves
 the KV footprint per sequence, which is the configuration the RAM/SSD
 offloading work will build on.
+
+> **Update (2026-09-18, plans/79 C)**: the attention-chain kill-switches
+> (`NO_WK_WMMA`, `NO_WMMA2/V2`, `WK8D`, `NO_WK8I`, `NO_WK8`) were pruned —
+> the defaults (wmma2v2 for np>2560, else wk8i) are unconditional, and
+> `LLM170_NO_GQA2D` survives only as the f32-KV dump diagnostic.
+> `qsa_flash_wmma` itself stays an opt-in experiment (demoted in plans/69
+> after the 9.5× regression on this device).

@@ -24,7 +24,7 @@ graphs with a runtime-injectable `Accelerator`. `llm170 infer --backend gpu`
 offloads every weight projection (GDN qkv/gate/beta/alpha/out, attention
 q/k/v/wo, FFN gate/up/down, output head) to quantized GEMM kernels in
 `crates/backend-gpu`; weights are uploaded once and stay resident on the
-device. The element-wise kernel set (`backend-gpu/src/ew.rs` — norms with
+device. The element-wise kernel set (HIP family asset `rawhip/kernels/src_ew.hip` — norms with
 f64 sequential accumulation, activations, RoPE, top-k routing, GDN
 conv/beta/softplus), the GDN AR decode kernel and the single-launch chunked
 GDN prefill kernel, grouped MoE GEMM (prefill and batched down-projection),
@@ -40,8 +40,8 @@ qwen4exp is structured as stage modules (`core/src/qwen4exp/stages/`):
 `Ctx { model, acc }` (+ `&mut SeqState4` for stateful stages), with dispatch
 variants for same-input projection groups and per-expert paired rows.
 `Engine4` retains forward/prefill chunking/decode timing only. GPU memory is
-owned exclusively by the buffer arena (`backend-gpu/src/rawhip/mod.rs`,
-ADR-0014): weights live in `WeightStore` behind a `WRef` enum that makes
+owned exclusively by the buffer arena (`GBuf` in `rawhip/q4acc/mod.rs` plus
+the RawCtx scratch pools, ADR-0014): weights live in `WeightStore` behind a `WRef` enum that makes
 host-fallback misuse unrepresentable, and `ScratchPool` retains every
 transient upload — nothing is ever freed (VRAM bounded by accounting, not
 by frees). `llm170 check` runs the three-stage verification path

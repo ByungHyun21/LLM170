@@ -58,7 +58,7 @@ forward pass.
 
 ## GEMV routing (rawvk, 2026-09-08)
 
-Type-driven, one table (decoder.rs `gemv_w`):
+Type-driven, one table (`decoder/gemv.rs` `gemv_w`):
 
 | Condition | Path |
 |---|---|
@@ -95,21 +95,14 @@ porting constraints discovered on RADV/gfx1151:
   independent fragment variables;
 - weights >128MB must be split across multiple SSBO bindings.
 
-## Performance (Qwen3.8-27B UD-Q4_K_XL, see benchmarks.md for full table)
+## Performance (see README / benchmarks.md for the current CLI scorecard)
 
-| | HIP | Vulkan | CPU |
-|---|---|---|---|
-| decode tg24 | 10.4 t/s | 10.4 t/s | 9.9 t/s |
-| prefill pp64 | 163-169 t/s | ~128 t/s | ~128 t/s |
-
-Vulkan backend on the same machine (after the attention rewrite, 2026-09-12): pp512 320 t/s,
-tg32 11.44 t/s — 0.91× / 1.00× of llama.cpp Vulkan (350.8 / 11.48). The HIP
-backend on the same build: pp512 364 t/s, tg32 11.6 t/s (1.03× / 1.01× of
-llama-bench ROCm, CLI-to-CLI). The gap analysis and the full
+The current matched scorecard (`llm170 bench` vs `llama-bench`, same session)
+lives in the README and docs/benchmarks.md. Historical reference points:
+after the 2026-09-12 attention rewrite, Vulkan read pp512 320 t/s, tg32
+11.44 t/s (0.91×/1.00× of llama.cpp Vulkan) and HIP pp512 364 t/s, tg32
+11.6 t/s (1.03×/1.01× of llama-bench ROCm) — the gap analysis and the full
 falsification log (14 hypotheses, all measured) is in benchmarks.md.
-
-Vulkan prefill is bounded by the CPU-side attention/GDN layers (the matmul
-offload itself saturates); porting those is the next backend milestone.
 
 
 ## Vulkan performance path (2026-09-05)
@@ -217,11 +210,11 @@ forward pass; the reference caption is restored exactly.
 
 Zero-config by default: tensor types are dispatched automatically from the
 GGUF (kernel selection is type-driven, as in llama.cpp) and the standard
-models run with no environment variables (verified end-to-end). The
-2026-09-08 prune (ADR-0019) removed the concluded-experiment gates
-(139 → 122 distinct `LLM170_*` names by grep, comments included); the
-remainder are operational
-switches (GPU_RUNTIME, SLOTS, W4A8, chunk sizes), verification references
-(EXACT), active-plan opt-ins (VK_I8ON for plans/23, VK_TILE/VKD_BATCH for
-the f16-prefill acceptance decision), and diagnostics (traces, ktime,
-layer bisectors).
+models run with no environment variables (verified end-to-end). The env
+surface has been pruned repeatedly under ADR-0019 — 2026-09-08: 139 → 122;
+plans/75 P4 + plans/78 R6/R7 + plans/79 C: → 291 distinct names
+(`docs/configuration.md`, auto-generated), with hot-path reads served from a
+one-shot cache (`rawhip::env_on`). The remainder are operational switches
+(GPU_RUNTIME, SLOTS, W4A8, FRAME), verification references (EXACT), kept
+opt-ins (G8/NOTILE/VKD_BATCH kill-switches, VK_I8ON, MMQ_ONLY bisector),
+and diagnostics (traces, ktime, layer bisectors).

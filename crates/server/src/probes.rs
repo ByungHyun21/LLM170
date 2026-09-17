@@ -411,7 +411,6 @@ pub fn run_check(args: &[String]) -> ExitCode {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
         cmd.args(["infer", "--model", path, "--prompt-tokens", &toks.join(","), "--n-predict", "2", "--ctx", "2048", "--backend", &backend])
             .env("LLM170_Q4_TRACE", "1")
-            .env("LLM170_W_CAP_GB", "16")
             .stdout(std::process::Stdio::null());
         let st = cmd.status();
         match st {

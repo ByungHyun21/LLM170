@@ -46,5 +46,5 @@ before this date were measured on 7.2.2 unless noted.
 |---|---|---|
 | Flash-Next | `scripts/gate-flash-next.sh` | 208-token Korean prompt stream identical |
 | 27B | `scripts/gate-27b.sh` | 208-token Korean prompt stream identical |
-| Tests | `cargo test --release --workspace` | 12/12 |
+| Tests | `cargo test --release --workspace` | 19/19 |
 | Build | `cargo build --release` | 0 warnings |
