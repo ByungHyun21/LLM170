@@ -10,9 +10,9 @@ No llama.cpp. No ggml. No C/C++ toolchain. Every layer of the stack — GGUF par
 
 ## Benchmarks
 
-Qwen3.8-27B (hybrid GDN + full attention), greedy, single-tenant `llm170 bench`.
-Numbers are only ever quoted with their conditions — full tables and history in
-[docs/benchmarks.md](docs/benchmarks.md).
+All rows are solo, greedy; `llm170` numbers are ROCm 10 userspace with the
+rocBLAS Tensile path pinned, llama.cpp is the master build (d222767c7) unless
+noted. Full conditions and history: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### CMP 170HX (GA100) — benchmark in preparation
 
@@ -23,41 +23,28 @@ Numbers are only ever quoted with their conditions — full tables and history i
 
 ### Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151)
 
-Greedy, single-tenant solo runs, same GGUF, t/s; unmeasured cells are blank.
-Session gains (2026-09-15, hip): Flash-Next tg 13.40 → 17.5 (+31%, short ctx)
-and 11.3 → 16.8 (+49%, 16k) — QSA indexer selection and PLE moved onto the GPU,
-five warp-per-row GEMV kernels, bit-identical bitonic top-k; all gate streams
-unchanged. The vulkan rows reflect the pre-port path for 27B (the current
-optimization set is hip-only) and the Vulkan-era Flash-Next work; "—" cells
-failed with ERROR_DEVICE_LOST under the Vulkan driver at that shape.
+Greedy, single-tenant, same GGUF, t/s; `—` = not measured.
 
 #### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
+Matched scorecard, 2026-09-17, same host and session.
+
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
-| LLM170 hip | **356.8-359.5** | **335.5-336.9** | 293.0 | 11.5-11.6 | 11.60 |
+| LLM170 hip | **356.8**-359.5 | **335.5**-336.9 | 293.0-294.3 | 11.5-11.6 | 11.6 |
 | LLM170 vulkan | — | 150 | — | 9.2 | — |
 | llama.cpp (ROCm 10) | 344.0 | 333.6 | **296.4** | **11.67** | **11.21** |
 
-(Matched-protocol scorecard measured 2026-09-17 on this host — solo, same
-session, `scripts/scorecard.sh` for ours and `llama-bench` for the reference:
-pp512/pp4096/pp16384 prompts, tg128 at 4k/16k KV depth. tg is inside the
-session's own noise band: the identical binary measured 10.95-11.64 t/s at 4k
-across runs, so the tg cells are a near-tie rather than a stable gap.)
-
-np4 prefill aggregate — 4 slots each prefilling a 512-token prompt
-concurrently, prompt tokens/s (the only cell where the pp columns below would
-apply, so it is quoted separately):
+np4 prefill aggregate (4 slots prefilling concurrently, prompt tokens/s).
 
 | backend | np4 pp aggregate |
 |---|---|
 | LLM170 hip | **374** |
-| LLM170 vulkan | — (not measured) |
-| llama.cpp (ROCm 10) | — (not measured) |
+| LLM170 vulkan | — |
+| llama.cpp (ROCm 10) | — |
 
-Decode modes (aggregate t/s over 4 parallel slots where noted; MTP =
-`--spec 3`). MTP does not change prefill — the np4 pp aggregate above applies
-unchanged under MTP+np4:
+Decode modes: aggregate t/s over 4 parallel slots; MTP = `--spec 3`
+(`LLM170_SLOTS=4` / `llama-server -np 4` are required for the np4 rows).
 
 | mode | tg agg | tg agg | tg agg |
 |---|---|---|---|
@@ -67,52 +54,27 @@ unchanged under MTP+np4:
 | np4 aggregate | **20.85** | — | **26.04** |
 | MTP + np4 | **20.4** | — | 15.5 *(old build)* |
 
-np cells require **4 slots on both sides** (`LLM170_SLOTS=4` /
-`llama-server -np 4`; both engines default to a single slot, in which case
-concurrent requests queue and aggregate ≈ single/4). Matched protocol
-(2026-09-17, `scripts/bench_np.py`, 4 concurrent 128-token completions, same
-208-token prompt, greedy, warmed): **LLM170 20.85 vs llama-server 26.04**.
-Decomposition (see docs/benchmarks.md): the t=4 engine step is 137-146 ms
-(t=1: 86 ms) — +21 ms of 4-row GEMM plus ~8 ms of per-slot state, with the
-weight read amortized across rows — and the 512-token prefill chunk is
-serialized on the critical path (~3.4 s per round of 4 requests) because our
-scheduler has no mixed prefill+decode batch, which is how llama hides its
-prefill. MTP = `--spec 3` with the gguf's own nextn head (batched GPU verify;
-acceptance 1-3 drafts/cycle on the gate prompt).
-
-llama's np4+MTP 15.5 t/s reference is from the **older** llama build (ROCm
-7.2.2 era, 11.75k-token slots); the current build exposes no flag to engage the
-embedded nextn draft (verified in --help and server logs — no draft is loaded),
-so that cell cannot be re-measured here and the 1.32x ratio below compares
-against a stale reference. Against the current build's plain np4 (35.1), our
-MTP+np4 20.4 is 0.58x — aggregate throughput favors llama; single-stream MTP
-(14.3 vs 11.9 plain) favors us.
-
 #### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
+
+Matched scorecard, 2026-09-17; llama ran the `qwen4exp build-ab` build with
+the model's required `-ot per_layer_token_embd=CPU --load-mode mmap -fit off`.
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k | tg128@16k |
 |---|---|---|---|---|---|
-| LLM170 hip | **221.4**-252.3 | **268.9-274.9** | **239.5-246.1** | 18.42-18.56 | 18.37 |
+| LLM170 hip | **221.4**-252.3 | **268.9**-274.9 | **239.5**-246.1 | 18.42-18.56 | 18.37 |
 | LLM170 vulkan | — | 271 | 240 | 17.1 | 16.7 |
 | llama.cpp (ROCm 10) | 245.2 | 259.6 | ~229 | **20.23** | 17.79 (@4k) |
 
-(Matched 2026-09-17: ours via `scripts/scorecard.sh`; llama via its server
-timings on the `qwen4exp build-ab` build with the model's required
-`-ot per_layer_token_embd=CPU --load-mode mmap -fit off`. Prefill wins at every
-measured length; the short-context tg cell is an 8% gap, the 4k one is inside
-noise.)
-
-np4 prefill aggregate — same convention as the 27B table above (4 slots,
-concurrent prefill, prompt tokens/s):
+np4 prefill aggregate (same convention as the 27B table above).
 
 | backend | np4 pp aggregate |
 |---|---|
-| LLM170 hip | — (not measured) |
+| LLM170 hip | — |
 | LLM170 vulkan | — |
 | llama.cpp (ROCm 10) | — |
 
-Decode modes (aggregate t/s over 4 parallel slots; the model has no
-nextn/MTP head — MTP rows are structurally inapplicable):
+Decode modes: aggregate t/s over 4 parallel slots; the model has no nextn/MTP
+head, so the MTP rows are structurally inapplicable.
 
 | mode | tg agg | tg agg | tg agg |
 |---|---|---|---|
@@ -122,22 +84,15 @@ nextn/MTP head — MTP rows are structurally inapplicable):
 | np4 aggregate | **24.94** | — | **41.07** |
 | MTP + np4 | — | — | — |
 
-(Flash-Next np4, measured 2026-09-16/17 same-host/same-prompt HTTP 4-way:
-**LLM170 21.0-23.9 t/s aggregate** (2026-09-17 build: batched MoE, f32
-multi-token projection, greedy prefill, CPU-state pullback elision) vs
-**llama-server 39.4-52 t/s** (protocol-matched warm range 40-52).
-The frame batches np decode (2026-09-16): weight-streaming GEMMs run once for
-all rows — a new multi-token q8_0 GEMV (`gemm_q8_0_mt`, one weight-row read,
-per-token accumulation, bit-identical arithmetic) removed the per-row weight
-re-read — while per-sequence state (GDN conv ring, AR, QSA rope/selection/KV,
-PLE) runs per row at t=1 through row views. np4 output is token-identical to
-sequential decoding (52/52 verified; np2 shows one documented near-tie flip,
-logit gap 0.13). The remaining gap is structural: rows pick different experts
-(diverse prompts share almost none), so the MoE weight traffic is irreducibly
-per-row — dedup would only pay under identical-prompt routing, i.e. the
-benchmark condition itself, which is not optimized for on principle.)
+### Vision (mmproj), 27B — 2026-09-17
 
-Full analysis: [docs/benchmarks.md](docs/benchmarks.md).
+Same image and question, greedy; model loads excluded.
+
+| phase | LLM170 | llama.cpp |
+|---|---|---|
+| vision encode + LLM prefill | 1.1 s (vit) + 1.2 s (300 tok) | 1.62 s (362 tok, clip folded in) |
+| decode 48 tok | ~11.6 t/s | 10.19 t/s |
+| total | ~6.4 s | ~6.3 s |
 
 ### Recent improvements (2026-09-16/17)
 
