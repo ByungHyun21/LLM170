@@ -62,7 +62,7 @@ unchanged under MTP+np4:
 | mode | tg agg | tg agg | tg agg |
 |---|---|---|---|
 | | **LLM170 hip** | **LLM170 vulkan** | **llama.cpp (ROCm 10)** |
-| tg single | 11.5 (4k) / 10.6 (16k) | 9.2 | 11.67 / 11.21 |
+| tg single | 11.5-11.6 (4k) / 11.6 (16k) | 9.2 | 11.67 / 11.21 |
 | MTP single | **15.4** (k=2) / 9.3 (k=3) | 9.2 (no MTP) | ~12 (MTP, old build) |
 | np4 aggregate | **20.85** | — | **26.04** |
 | MTP + np4 | **20.4** | — | 15.5 *(old build)* |
