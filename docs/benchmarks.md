@@ -992,6 +992,9 @@ family, which trades weight-read traffic for 32x larger workgroups (128 rows vs
 | default (`LLM170_TILE_BN128` on, t>=128) | 147.6 t/s |
 | `LLM170_TILE_BN128=0` (ms4gy tiles) | 127.8 t/s |
 | `LLM170_TILE_MSALL=0` (64-token chunks, old family) | 122.3 t/s |
+| `LLM170_TILE_MS128=ffn` (BN=128 only for FFN) | 146.4 t/s |
+| `LLM170_TILE_MS128=split` | 145.6 t/s |
+| `LLM170_TILE_MS128=1` | 147.1 t/s |
 
 All three are far below the t=64 chunk's own rate (284 ms for 64 tokens =
 4.4 ms/token => ~226 t/s equivalent), i.e. the Vulkan prefill path has no good
