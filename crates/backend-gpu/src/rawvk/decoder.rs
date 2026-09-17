@@ -1982,7 +1982,16 @@ impl DecoderState {
         let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
+        let vkd_stage = std::env::var_os("LLM170_VKD_STAGE").is_some();
+        let mut il_t = std::time::Instant::now();
         for il in 0..self.n_layer {
+            if vkd_stage {
+                // 직전 레이어 시간 출력(루프 끝을 몰라도 되는 형태) 후 리셋.
+                if il > 0 {
+                    eprintln!("# vkd L{} {:.1}ms", il - 1, il_t.elapsed().as_secs_f64() * 1e3);
+                }
+                il_t = std::time::Instant::now();
+            }
             // ── attn_norm — 0층만 (이후 fdown addrms 융합). xq는 gemv_stage 지연 양자화.
             if il == 0 {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());

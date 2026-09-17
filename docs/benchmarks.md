@@ -954,3 +954,24 @@ rather than kernel time. Skipping the attention (`LLM170_VK_ATTN=1`) does not
 change the pp4096 rate (145.6 -> 145.1 t/s), so the growth is not in the flash
 attention kernel. Next step for this axis: instrument `step_batch`'s stages at
 pp2048 and find which stage's wall grows with the KV position.
+
+#### Vulkan 27B long-prefill — further probes (2026-09-17)
+
+Three probes narrowed it further:
+
+- **Attention ruled out**: with `LLM170_VK_ATTN=1` (only the qkv GEMV runs) the
+  per-chunk growth persists unchanged (1601 -> 2159 -> 2709 -> 3289 ms at
+  pp2048, i.e. the same ~520-590 ms per chunk), so it is not the flash kernel.
+- **Not a cross-call leak**: `--reps 2` shows the second prefill restarting at
+  1658 ms and regrowing (2312 / 2815 / 3186), so it is context-proportional
+  *within* one prefill, not accumulated state.
+- **Layer loop is recording-only**: `LLM170_VKD_STAGE=1` (new: prints the wall
+  of each layer in `step_batch`) shows ~0.0-0.1 ms per layer — the batched path
+  just records dispatches and the cost lands in the flush, and the dispatch
+  count itself grows with the context (1265 for the first chunk vs 2757 for a
+  later one, i.e. ~+1 dispatch per context token).
+
+So the suspect is the recorded work's *GPU execution* growing with the KV
+position (or a per-context-token dispatch loop), not the attention kernel and
+not host bookkeeping. `LLM170_VKD_STAGE` and the DBG_WALL instrumentation are
+in the tree for the next pass.
