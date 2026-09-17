@@ -90,8 +90,8 @@ impl Engine {
         // 값 스타일(업/다운로드). LLM170_GDN_CPU=1 또는 어느 단계 실패 시 CPU 전체 폴백.
         let mut gated = vec![vec![0.0f32; d_inner]; n_tok];
         let mut gpu_done = false;
-        if t_len == 1 && n_seqs == 1 && std::env::var_os("LLM170_GDN_CPU").is_none() {
-            if let Some(acc_ref) = acc.as_deref() {
+        if t_len == 1 && n_seqs == 1 && std::env::var_os("LLM170_GDN_CPU").is_none()
+            && let Some(acc_ref) = acc.as_deref() {
                 let mut conv_out = vec![0.0f32; conv_ch];
                 let st = &mut self.seqs[seq_ids[0]].conv[recr_idx];
                 if acc_ref
@@ -144,7 +144,6 @@ impl Engine {
                     }
                 }
             }
-        }
         if !gpu_done {
             {
                 profile_span!("cpu::gdn_conv");
@@ -227,8 +226,8 @@ impl Engine {
                 } else {
                     // GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
                     let mut done = false;
-                    if std::env::var_os("LLM170_GDN_CPU").is_none() {
-                        if let Some(acc_ref) = acc.as_deref() {
+                    if std::env::var_os("LLM170_GDN_CPU").is_none()
+                        && let Some(acc_ref) = acc.as_deref() {
                             let flat_st: &mut [f32] = st;
                             if acc_ref
                                 .gdn_chunk(
@@ -249,7 +248,6 @@ impl Engine {
                                 done = true;
                             }
                         }
-                    }
                     if !done {
                         crate::gdn::gdn_chunk_seq(
                             &q_all[r0 * k_len..r1 * k_len],
@@ -330,7 +328,7 @@ impl Engine {
                 .fold(0.0f32, |a, v| a.max(v.abs()));
             let (mut mi, mut mv) = (0usize, f32::NEG_INFINITY);
             for (r, row) in out.iter().enumerate() {
-                for (_c, v) in row.iter().enumerate() {
+                for v in row.iter() {
                     if v.abs() > mv {
                         mv = v.abs();
                         mi = r;
@@ -507,8 +505,8 @@ impl Engine {
                 attn_all[row] = attn_out;
             }
         }
-        if let Some(qrow) = gpu_qrow.as_ref() {
-            if let Some(acc_ref) = acc.as_deref() {
+        if let Some(qrow) = gpu_qrow.as_ref()
+            && let Some(acc_ref) = acc.as_deref() {
                 let seq = &self.seqs[seq_ids[0]];
                 let n_past = seq.pos as usize + 1;
                 let ck = &seq.kv_k[full_idx][..n_past * n_kv * hd];
@@ -522,7 +520,6 @@ impl Engine {
                     gpu_done = true;
                 }
             }
-        }
         if gpu_qrow.is_some() && !gpu_done {
             // GPU 시도 실패 → CPU 재계산 (row 0, t=1)
             let pos = self.seqs[seq_ids[0]].pos;

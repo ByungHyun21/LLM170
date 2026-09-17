@@ -716,8 +716,7 @@ fn frame_forward_ex(
         }
 
         // 4) hc ffn mix + MoE
-        if il == 0 {
-        }
+        
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
         if il == 0 {
@@ -725,8 +724,7 @@ fn frame_forward_ex(
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
-        if il == 0 {
-        }
+        
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
         if il == 0 {
@@ -777,8 +775,6 @@ fn frame_forward_ex(
         Ok((logits, None))
     }
 }
-
-/// 프레임 디코드 1스텝 — Engine4::decode1에서 호출.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // plans/73(np): 다중 시퀀스 배치 디코드 (2026-09-16)
@@ -1380,7 +1376,7 @@ fn qsa_frame(
     // 디바이스 풀(KV·idx)만 적립한다. 실패하면 종전 호스트 경로로 폴백.
     // 킬스위치 LLM170_QSA_NOID=1.
     if t > 1
-        && pos0 as usize + t <= hp.idx_top_k + r - 1
+        && pos0 as usize + t < hp.idx_top_k + r
         && std::env::var_os("LLM170_QSA_NOID").is_none()
     {
         let pos0u = pos0 as usize;
@@ -1509,11 +1505,10 @@ fn qsa_frame(
     };
     let ck = &seq_st.kv_k[full_idx][..kn_max];
     let cv = &seq_st.kv_v[full_idx][..kn_max];
-    if std::env::var_os("LLM170_QSA_RESCHECK").is_some() && !seq_st.qsa_host_stale {
-        if let Err(e) = acc.qsa_kv_check(full_idx, seq, ck, cv) {
+    if std::env::var_os("LLM170_QSA_RESCHECK").is_some() && !seq_st.qsa_host_stale
+        && let Err(e) = acc.qsa_kv_check(full_idx, seq, ck, cv) {
             eprintln!("# qsa-rescheck L{il} t={t} pos0={pos0}: {e}");
         }
-    }
     let attn = res.or_else(|e2| {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| eprintln!("# qsa-frame: 상주 풀 미사용 — 업로드 경로 ({e2})"));

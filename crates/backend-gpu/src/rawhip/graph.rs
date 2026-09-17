@@ -4,7 +4,7 @@
 use crate::rawhip::hip;
 use crate::rawhip::ck;
 
-pub fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), String> {
+pub unsafe fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), String> {
     let dbg = std::env::var_os("LLM170_GRAPH_DEBUG").is_some();
     let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
     match &mut *g {
@@ -61,7 +61,7 @@ pub fn graph_abort() {
     GRAPH_SKIP.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn graph_replay(on: bool) -> Result<(), String> {
+pub unsafe fn graph_replay(on: bool) -> Result<(), String> {
     if on {
         let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
         if let GraphMode::Replay { idx, .. } = &mut *g {
@@ -72,7 +72,7 @@ pub fn graph_replay(on: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
+pub unsafe fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
     let mut g = GRAPH.lock().map_err(|e| e.to_string())?;
     let GraphMode::Capture { segs, open } = &mut *g else {
         return Err("graph_capture_end: 캡처 중이 아님".into());
@@ -99,7 +99,7 @@ pub fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> {
     Ok(())
 }
 
-pub fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
+pub unsafe fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
     *GRAPH.lock().map_err(|e| e.to_string())? =
         GraphMode::Capture { segs: Vec::new(), open: false };
     Ok(())

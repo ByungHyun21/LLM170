@@ -125,7 +125,7 @@ pub struct PartMap {
 impl Model4 {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let g1 = GgufFile::open(path)?;
-        if g1.kv_str("general.architecture").as_deref() != Some("qwen4exp") {
+        if g1.kv_str("general.architecture") != Some("qwen4exp") {
             return Err("not a qwen4exp model".into());
         }
         let split_count = g1.kv_u64("split.count").unwrap_or(1) as u32;
@@ -368,6 +368,34 @@ impl Model4 {
     }
 }
 
+/// 순수 PLE 행 gather — 테이블 바이트·타입만 받는 standalone (프리페치
+/// 스레드가 Model4 없이 재사용). 본체와 동일 디양자화 순서.
+pub fn ple_gather_parts(
+    data: &[u8],
+    ty: llm170_gguf::GgmlType,
+    hd: usize,
+    rows: &[u32],
+    out: &mut [f32],
+) {
+    let (blck, bsize) = ty.block_info();
+    for (hi, &row) in rows.iter().enumerate() {
+        let base = row as u64 * hd as u64;
+        let byte_off = base / blck * bsize;
+        let mut tmp = [0.0f32; 512];
+        let n_blocks = (hd as u64).div_ceil(blck) as usize;
+        for b in 0..n_blocks {
+            dequant_row(
+                ty,
+                &data[byte_off as usize + b * bsize as usize..],
+                0,
+                blck,
+                &mut tmp[b * blck as usize..(b + 1) * blck as usize],
+            );
+        }
+        out[hi * hd..(hi + 1) * hd].copy_from_slice(&tmp[..hd]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,43 +429,15 @@ mod tests {
         assert_eq!(ple.ty, llm170_gguf::GgmlType::Iq4Nl);
         // PLE gather: 행 3개 — 유한값·결정성
         let mut out = vec![0.0f32; 3 * hp.ple_head_dim];
-        m.ple_gather(&[0, 1, 1_000_000], &mut out);
+        m.ple_gather(&[0, 1, 1_000_000], &mut out).expect("ple_gather");
         assert!(out.iter().all(|v| v.is_finite()));
         let mut out2 = out.clone();
-        m.ple_gather(&[0, 1, 1_000_000], &mut out2);
+        m.ple_gather(&[0, 1, 1_000_000], &mut out2).expect("ple_gather");
         assert_eq!(out, out2, "gather 결정성");
         // 전문가 슬라이스: 형상 [640, 2560]
         let e0 = m.expert_w("blk.0.ffn_up_exps.weight", 0).expect("expert");
         assert_eq!((e0.n_in, e0.n_out), (2560, 640));
         let e511 = m.expert_w("blk.0.ffn_up_exps.weight", 511).expect("expert 511");
         assert_eq!((e511.n_in, e511.n_out), (2560, 640));
-    }
-}
-
-/// 순수 PLE 행 gather — 테이블 바이트·타입만 받는 standalone (프리페치
-/// 스레드가 Model4 없이 재사용). 본체와 동일 디양자화 순서.
-pub fn ple_gather_parts(
-    data: &[u8],
-    ty: llm170_gguf::GgmlType,
-    hd: usize,
-    rows: &[u32],
-    out: &mut [f32],
-) {
-    let (blck, bsize) = ty.block_info();
-    for (hi, &row) in rows.iter().enumerate() {
-        let base = row as u64 * hd as u64;
-        let byte_off = base / blck * bsize;
-        let mut tmp = [0.0f32; 512];
-        let n_blocks = (hd as u64).div_ceil(blck) as usize;
-        for b in 0..n_blocks {
-            dequant_row(
-                ty,
-                &data[byte_off as usize + b * bsize as usize..],
-                0,
-                blck,
-                &mut tmp[b * blck as usize..(b + 1) * blck as usize],
-            );
-        }
-        out[hi * hd..(hi + 1) * hd].copy_from_slice(&tmp[..hd]);
     }
 }

@@ -452,7 +452,7 @@ impl Q4Acc {
         const CH: usize = 8 << 20;
         let base = data.as_ptr() as usize;
         let n = data.len();
-        if base % 4096 != 0 || n < (4 << 20) {
+        if !base.is_multiple_of(4096) || n < (4 << 20) {
             Self::advise(base & !4095, ((base & 4095) + n + 4095) & !4095, libc::MADV_WILLNEED);
             return self.ctx.h2d(dst, data);
         }
@@ -910,7 +910,7 @@ impl Q4Acc {
         }
         // plans/73: t=1은 워프-퍼-출력판 — 저출력(hc inject [10240→4])·라우터
         // 형상에서 원판 대비 3-6×. 누산 재배열 편차는 게이트로 검증.
-        if t == 1 && n_in % 4 == 0 && std::env::var("LLM170_F32W").as_deref() != Ok("0") {
+        if t == 1 && n_in.is_multiple_of(4) && std::env::var("LLM170_F32W").as_deref() != Ok("0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -929,7 +929,7 @@ impl Q4Acc {
         }
         // plans/74: t=2..8 은 멀티토큰 워프판(무게 1회 독서) — 종전 t판은
         // np 라우터/PLE 투영에서 17GB/s였다. LLM170_NO_F32MT=1 복귀.
-        if t >= 2 && t <= 8 && n_in % 4 == 0 && std::env::var_os("LLM170_NO_F32MT").is_none() {
+        if (2..=8).contains(&t) && n_in.is_multiple_of(4) && std::env::var_os("LLM170_NO_F32MT").is_none() {
             let mut tt = t as i32;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
@@ -1565,7 +1565,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 } else {
                 // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                 // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
-                crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in")?;
+                unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in") }?;
                 let mut lp = std::time::Instant::now();
                 let idp = self.fptr(ids)?;
                 let mut idv = vec![0u32; rows];
@@ -1666,7 +1666,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     let ms = lp.elapsed().as_secs_f64() * 1e3;
                     if ms >= 0.05 { eprintln!("# moe-miss h2d={ms:.2}ms"); }
                 }
-                crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out")?;
+                unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out") }?;
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                 *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
                     perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, rows_pad_d: 0, off_d: 0, pinned_off: std::ptr::null_mut(), off: off.clone() });
@@ -2124,7 +2124,7 @@ impl Q4Acc {
         // 게이트를 레지스터에서 빼면 qr[6][8]+acc[6][8]=96으로 4헤드판과 같은
         // 예산이라 K/V 행 재독이 6회 -> 4회로 준다(프리필 어텐션이 대역폭 바운드:
         // t=2048 콜당 ~34GB/236GB/s ~= 실측 101ms). 12의 배수가 아니면 4헤드판.
-        let use6 = n_head % 12 == 0 && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
+        let use6 = n_head.is_multiple_of(12) && std::env::var("LLM170_QSA_H6").as_deref() != Ok("0");
         let (kern, gy) = if use6 {
             ("q4_qsa_attn_sel6", (n_head / 12) as u32)
         } else {
@@ -2462,7 +2462,9 @@ impl Q4Acc {
             return Ok(());
         }
         // 비분할 — t>3은 sel4(K/V 4헤드 공유), t≤3은 sel. 상동 사유.
-        let use6 = false && n_head % 12 == 0;
+        // use6(12헤드 6분할)는 비활성 — 위 사유로 sel4/sel 판을 쓴다.
+        let use6 = false;
+        let _ = n_head;
         let mut q_p = qdev as *mut std::ffi::c_void;
         let mut o_p = odev as *mut std::ffi::c_void;
         let mut k_p = ckp as *mut std::ffi::c_void;
@@ -2895,16 +2897,16 @@ impl Q4Acc {
 impl llm170_core::matmul::GraphCapture for Q4Acc {
 
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
-        crate::rawhip::capture_mark(self.ctx.stream, tag)
+        unsafe { crate::rawhip::capture_mark(self.ctx.stream, tag) }
     }
     fn graph_capture_begin(&self) -> Result<(), String> {
-        crate::rawhip::graph_capture_begin(self.ctx.stream)
+        unsafe { crate::rawhip::graph_capture_begin(self.ctx.stream) }
     }
     fn graph_capture_end(&self) -> Result<(), String> {
-        crate::rawhip::graph_capture_end(self.ctx.stream)
+        unsafe { crate::rawhip::graph_capture_end(self.ctx.stream) }
     }
     fn graph_replay(&self, on: bool) -> Result<(), String> {
-        crate::rawhip::graph_replay(on)
+        unsafe { crate::rawhip::graph_replay(on) }
     }
     fn graph_abort(&self) {
         crate::rawhip::graph_abort();

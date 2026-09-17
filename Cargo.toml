@@ -16,3 +16,14 @@ edition = "2024"
 # 배포 빌드. 프로파일러 계측은 debug_assertions 기반이라 release에서 zero-cost.
 # (성능 튜닝 단계에서 lto/codegen-units 조정 여부 재검토)
 
+[workspace.lints.clippy]
+# 커널 런치·수치 미러 코드의 구조적 특성상 유지하는 허용 목록 (plans/75 P5, 2026-09-17).
+# - too_many_arguments: HIP/GLSL 런치 인자·커널 인자 미러는 인자 수가 규격이다.
+# - needless_range_loop: 수치 커널은 인덱스 산술이 가독성·비트대응에 유리하다.
+# - type_complexity: 커널 인자 튜플·콜백 시그니처.
+# - excessive_precision / approx_constant: 비트 동일 리터럴(참조 미러) 의도.
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+excessive_precision = "allow"
+approx_constant = "allow"

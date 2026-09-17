@@ -338,9 +338,9 @@ impl Engine4 {
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         let need_cpu_pullback = !frame_prefill_on;
-        if let Some(f) = &self.frame {
-            if !f.dirty[seq] && need_cpu_pullback {
-                if let Some(acc) = self.acc.as_deref() {
+        if let Some(f) = &self.frame
+            && !f.dirty[seq] && need_cpu_pullback
+                && let Some(acc) = self.acc.as_deref() {
                     let st = &mut self.seqs[seq];
                     for (ri, h) in f.st_gdn[seq].iter().enumerate() {
                         // 프레임 상태는 전치 레이아웃(AR 커널 규약) — CPU로 되돌린다.
@@ -352,8 +352,6 @@ impl Engine4 {
                         acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
                     }
                 }
-            }
-        }
         // 프레임(디바이스 상주) 프리필 — 기본 on (끄기: LLM170_FRAME_PREFILL=0).
         // 토큰 계약 검증: 230@512·300@128(3청크)·512 모두 값 경로와 일치.
         // pp512 36.8 t/s = 값 경로(11.2)의 3.3배.
@@ -399,10 +397,10 @@ impl Engine4 {
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
         // 값 경로 전용 풀백(프레임 경로 미사용 시에만).
-        if !need_cpu_pullback {
-            if let Some(f) = &self.frame {
-                if !f.dirty[seq] {
-                    if let Some(acc) = self.acc.as_deref() {
+        if !need_cpu_pullback
+            && let Some(f) = &self.frame
+                && !f.dirty[seq]
+                    && let Some(acc) = self.acc.as_deref() {
                         let st = &mut self.seqs[seq];
                         for (ri, h) in f.st_gdn[seq].iter().enumerate() {
                             let mut t = vec![0.0f32; st.gdn_s[ri].len()];
@@ -413,9 +411,6 @@ impl Engine4 {
                             acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
                         }
                     }
-                }
-            }
-        }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
@@ -635,10 +630,10 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
     /// greedy 디코드 — 로짓 전사 없이 GPU argmax 로 토큰만(plans/74).
     /// 구조는 decode1 과 동일, head 판만 갈린다.
     pub fn decode1_greedy(&mut self, seq: usize, token: u32) -> Result<u32, Q4Error> {
-        if !self.acc.is_some()
+        if self.acc.is_none()
             || self.frame_broken
             || std::env::var_os("LLM170_FRAME").is_none()
-            || std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true) == false
+            || !std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
         {
             let l = self.decode1(seq, token)?;
             return Ok(crate::qwen35::greedy(&l));
@@ -646,13 +641,11 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         if let Some(h) = self.ple_worker.take() {
             let _ = h.join();
         }
-        if let Some(slot) = self.ple_next.take() {
-            if let Ok(mut g) = slot.lock() {
-                if g.token == token && !g.emb.is_empty() {
+        if let Some(slot) = self.ple_next.take()
+            && let Ok(mut g) = slot.lock()
+                && g.token == token && !g.emb.is_empty() {
                     self.ple_consume = Some(vec![std::mem::take(&mut g.emb)]);
                 }
-            }
-        }
         let acc = self.acc.as_deref().unwrap();
         if self.frame.is_none() {
             match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
@@ -684,12 +677,11 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                     eprintln!("# graph(frame): 캡처 시작 실패 — 정상 경로 ({e})");
                     self.graph_want = false;
                 }
-            } else if rep_step {
-                if let Err(e) = acc.graph_replay(true) {
+            } else if rep_step
+                && let Err(e) = acc.graph_replay(true) {
                     eprintln!("# graph(frame): 재생 실패 — 정상 경로 ({e})");
                     self.graph_want = false;
                 }
-            }
             let r0 = super::frame::decode_frame_greedy(
                 acc, &self.model, &ctx, seq, &mut self.seqs[seq], f, token,
             );
@@ -736,9 +728,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             Err(e) => {
                 // 그래프 상태가 걸린 채 value 경로로 넘어가면 백엔드가 Replay 모드로
                 // 남아 런치를 건너뛴다 — 폴백 시 그래프를 먼저 중단한다.
-                if self.graph_step > 0 {
-                    self.acc.as_deref().map(|a| a.graph_abort());
-                }
+                if self.graph_step > 0
+                    && let Some(a) = self.acc.as_deref() { a.graph_abort() }
                 self.graph_want = false;
                 self.frame = None;
                 self.frame_broken = true;
@@ -756,13 +747,11 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             let _ = h.join();
         }
         // 예측 토큰 == 실제 입력 토큰이면 소비 대기로 스태시
-        if let Some(slot) = self.ple_next.take() {
-            if let Ok(mut g) = slot.lock() {
-                if g.token == token && !g.emb.is_empty() {
+        if let Some(slot) = self.ple_next.take()
+            && let Ok(mut g) = slot.lock()
+                && g.token == token && !g.emb.is_empty() {
                     self.ple_consume = Some(vec![std::mem::take(&mut g.emb)]);
                 }
-            }
-        }
         // 프레임 기본 ON(2026-09-02) — 상주 불가 시 1회 재시도 후 value 경로로
         // 영구 폴백. 게이트 실패는 mm 오류(호스트 폴백 가중치)로 첫 스텝 초반에
         // 발생해 상태 오염 전에 중단된다.
@@ -805,12 +794,11 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                     eprintln!("# graph: 캡처 시작 실패 — 정상 경로 ({e})");
                     self.graph_want = false;
                 }
-            } else if rep_step {
-                if let Err(e) = acc.graph_replay(true) {
+            } else if rep_step
+                && let Err(e) = acc.graph_replay(true) {
                     eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
                     self.graph_want = false;
                 }
-            }
             let mut run_step = || -> Result<Vec<f32>, Q4Error> {
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
@@ -1026,7 +1014,9 @@ mod forward_tests {
         let mut e2 = Engine4::new(m2, 1, 128);
         let l1b = e2.prefill(0, &toks).expect("prefill2");
         let t1b = crate::qwen35::greedy(&l1b);
-        assert_eq!((t1, t1b), (t1, t1), "greedy 불일치");
-        assert!((l1[0] - l1b[0]).abs() < 1e-6 || true);
+        assert_eq!(t1, t1b, "greedy 불일치");
+        // 결정성: 같은 입력 → 같은 로짓(첫 값 기준). `|| true` 로 항상 통과하던
+        // 죽은 단언을 살렸다(2026-09-17 clippy 발견).
+        assert!((l1[0] - l1b[0]).abs() < 1e-6, "logit 비결정성: {} vs {}", l1[0], l1b[0]);
     }
 }

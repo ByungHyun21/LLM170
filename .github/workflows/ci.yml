@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build (release)
+        run: cargo build --workspace --release
+      - name: Clippy — correctness/suspicious are hard errors
+        # Style lints are report-only for now (kernel-arity/numeric-mirror code
+        # keeps a curated allow list in [workspace.lints.clippy]); the two
+        # correctness groups must stay at zero — they have caught real defects
+        # (a dead `assert!(... || true)`, an always-disabled cache flag).
+        # `arc_with_non_send_sync` is excepted: RawCtx holds device handles and is
+        # not Sync, but the only Arc use is the single-threaded vision path
+        # (shared ownership, never cross-thread).
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious -A clippy::arc_with_non_send_sync
+      - name: Tests (CPU-only)
+        # Real-model tests skip when the GGUF is absent (real_models.rs 관례).
+        run: cargo test --workspace --release

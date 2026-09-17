@@ -51,7 +51,7 @@ fn qwen35_27b_ud_q4_k_xl() {
 
     // 텐서 구조 (실측 866개)
     assert_eq!(f.tensors.len(), 866);
-    let n_blk = f
+    let _n_blk = f
         .tensors
         .iter()
         .filter(|t| t.name.starts_with("blk."))

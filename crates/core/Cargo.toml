@@ -9,3 +9,6 @@ llm170-gguf = { path = "../gguf" }
 llm170-profiler = { path = "../profiler" }
 memmap2 = "0.9"
 libc = "0.2"
+
+[lints]
+workspace = true

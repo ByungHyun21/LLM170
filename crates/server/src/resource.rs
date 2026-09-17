@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn refuses_double_resident() {
         // 다른 서버가 상주해 VRAM~=0, 호스트~=5GiB 남은 이중 적재 사고 조건.
-        assert!(check(103_700 * (1 << 20), Some(1 * GIB), Some(5 * GIB)).is_err());
+        assert!(check(103_700 * (1 << 20), Some(GIB), Some(5 * GIB)).is_err());
     }
 
     #[test]

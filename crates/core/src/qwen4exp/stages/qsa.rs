@@ -546,8 +546,8 @@ pub fn qsa_cpu_attn_rows(
         }
         // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
         // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
-        if gpu_attn {
-            if let Some(acc) = ctx.acc.as_deref() {
+        if gpu_attn
+            && let Some(acc) = ctx.acc {
                 if tm {
                     eprintln!("# qsa-stage passB={:.1}ms", t_lap.elapsed().as_secs_f64() * 1e3);
                     t_lap = std::time::Instant::now();
@@ -618,7 +618,7 @@ pub fn qsa_cpu_attn_rows(
                             let q_t = qg[t].clone();
                             let mut attn_out = std::mem::take(row);
                             cpu_attn_row(
-                                &mut attn_out, &q_t, &mask_t, n_past, &ck, &cv,
+                                &mut attn_out, &q_t, &mask_t, n_past, ck, cv,
                                 n_head, n_kv, hd, kq_scale,
                             );
                             *row = attn_out;
@@ -626,7 +626,6 @@ pub fn qsa_cpu_attn_rows(
                     }
                 }
             }
-        }
         ctx.mm_batch(&attn_all, &wo, &mut out)?;
         if tm {
             eprintln!(

@@ -138,7 +138,7 @@ impl VkAcc {
         let key = w.data.as_ptr() as usize;
         {
             let mut wc = self.wcache.lock();
-            if !wc.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = wc.entry(key) {
                 let ch = ctx.max_ssbo; // plans/29: 균일 청크 — 크기는 push(chunk_words)로 전달
                 let total = w.data.len();
                 let mut bufs = Vec::new();
@@ -151,7 +151,7 @@ impl VkAcc {
                     bufs.push(b);
                     off += n;
                 }
-                wc.insert(key, bufs);
+                e.insert(bufs);
             }
         }
         let bufs: Vec<vk::Buffer> = {
@@ -664,11 +664,10 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
                 if word != gpu[b * 8 + wi] {
                     qdiff += 1;
                 }
-                let sd: u32 = (0..4).map(|k| ((gpu[b * 8 + wi] >> (8 * k)) & 0xFF).count_ones().min(1) * 0).sum();
-                let _ = sd;
+                // sd(서브바이트 차분 카운트)는 진단 전용으로 제거됨(2026-09-17).
                 let bytes: i32 = (0..4)
                     .map(|k| ((gpu[b * 8 + wi] >> (8 * k)) & 0xFF) as i32)
-                    .fold(0i32, |a, v| a + (((v << 24) as i32) >> 24));
+                    .fold(0i32, |a, v| a + ((v << 24) >> 24));
                 if wi < 4 {
                     s0 = s0.wrapping_add(bytes as u32);
                 } else {
@@ -1284,23 +1283,23 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
     let gx = if std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 63) / 64
+        (n_out as u32).div_ceil(64)
     } else if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 63) / 64
+        (n_out as u32).div_ceil(64)
     } else if (std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 63) / 64   // tile_ms6: WG당 64행
+        (n_out as u32).div_ceil(64)   // tile_ms6: WG당 64행
     } else if spv_name.starts_with("tile_ms128") && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 63) / 64   // tile_ms128 계열: WG당 64행 × 128토큰
+        (n_out as u32).div_ceil(64)   // tile_ms128 계열: WG당 64행 × 128토큰
     } else if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
-        (n_out as u32 + 63) / 64   // tile_ms: WG당 64행
+        (n_out as u32).div_ceil(64)   // tile_ms: WG당 64행
     } else if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 31) / 32   // tile_s32b: WG당 32행
+        (n_out as u32).div_ceil(32)   // tile_s32b: WG당 32행
     } else if std::env::var("LLM170_TILE_S32").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 31) / 32   // tile_s32: WG당 32행
+        (n_out as u32).div_ceil(32)   // tile_s32: WG당 32행
     } else if std::env::var_os("LLM170_TILE_V2").is_some() && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32 + 63) / 64   // tile128v2: WG당 64행
+        (n_out as u32).div_ceil(64)   // tile128v2: WG당 64행
     } else {
-        (n_out as u32 + 127) / 128
+        (n_out as u32).div_ceil(128)
     };
     let t0 = Instant::now();
     if ms4gy {

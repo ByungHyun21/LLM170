@@ -94,12 +94,11 @@ fn main() -> ExitCode {
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
         }
-        if let Some(mp) = model {
-            if let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {
+        if let Some(mp) = model
+            && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
-        }
     }
     // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
     struct EL;
@@ -125,19 +124,18 @@ fn main() -> ExitCode {
         // SAFETY: main 스레드 초기화 경로 — 다른 스레드 시작 전
         unsafe { std::env::set_var("LLM170_FRAME", "1") };
     }
-    if let Some(cmd) = args.first().map(String::as_str) {
-        if let Some(code) = probes::run(cmd, &args[1..]) {
+    if let Some(cmd) = args.first().map(String::as_str)
+        && let Some(code) = probes::run(cmd, &args[1..]) {
             return code;
         }
-    }
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => infer::cmd_infer(&args[1..]),
-        Some("serve") => return cmd_serve(&args[1..]),
-        Some("rawhip-check") => return probes::run("rawhip-check", &args[1..]).unwrap(),
-        Some("vl") => return vl::cmd_vl(&args[1..]),
-        Some("bench") => return bench::cmd_bench(&args[1..]),
-        Some("check") => return probes::run_check(&args[1..]),
+        Some("serve") => cmd_serve(&args[1..]),
+        Some("rawhip-check") => probes::run("rawhip-check", &args[1..]).unwrap(),
+        Some("vl") => vl::cmd_vl(&args[1..]),
+        Some("bench") => bench::cmd_bench(&args[1..]),
+        Some("check") => probes::run_check(&args[1..]),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -225,7 +223,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     if tok.is_none() {
         eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작)");
     }
-    let _ = engine::TOKENIZER.set(tok.unwrap_or_else(|| tokenize::Tokenizer::empty()));
+    let _ = engine::TOKENIZER.set(tok.unwrap_or_else(tokenize::Tokenizer::empty));
     let req = engine::InferRequest { model: model_path, ctx };
     let sel = if backend == "gpu" {
         if gpu_runtime.is_empty() {

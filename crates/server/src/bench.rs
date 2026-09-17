@@ -56,7 +56,7 @@ pub fn cmd_bench(args: &[String]) -> ExitCode {
                 None => return usage_err_bench("--gpu-runtime requires hip|vulkan"),
             },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(k) if k >= 1 && k <= 8 => spec_k = k,
+                Some(k) if (1..=8).contains(&k) => spec_k = k,
                 _ => return usage_err_bench("--spec requires k in 1..=8"),
             },
             other => return usage_err_bench(&format!("unknown flag: {other}")),

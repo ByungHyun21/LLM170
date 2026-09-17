@@ -33,7 +33,7 @@ pub fn gdn_chunk_seq(
 ) {
     profile_span!("cpu::gdn_chunk");
     let d = q.len() / (h_k * t_len); // d_state (kdim == vdim)
-    debug_assert!(q.len() % (h_k * t_len) == 0);
+    debug_assert!(q.len().is_multiple_of(h_k * t_len));
     let v_stride = h_v * d;
     let mut local_outs: Vec<Vec<f32>> = vec![vec![0.0f32; t_len * d]; h_v];
     {

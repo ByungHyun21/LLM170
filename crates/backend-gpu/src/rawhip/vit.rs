@@ -109,8 +109,8 @@ impl Vit {
         ];
         let gx = t.div_ceil(32) as u32;
         let gy = n_out.div_ceil(8) as u32;
-        let gz = gy.div_ceil(65535) as u32;
-        self.ctx.launch3("gemm_f32t", gx, gy.min(65535) as u32, gz, 256, &mut args)
+        let gz = gy.div_ceil(65535);
+        self.ctx.launch3("gemm_f32t", gx, gy.min(65535), gz, 256, &mut args)
     }
 
     /// toks: merge-major [t][n_embd] (conv+pos+bias 적용된 입력), yx: [t][2].

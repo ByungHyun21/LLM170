@@ -40,9 +40,8 @@ impl Engine {
     }
 
     /// 시퀀스 prefill: 전체 토큰 적립 + 마지막 logits.
-
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
-        let n = self.model.hp.n_embd as usize;
+        let n = self.model.hp.n_embd;
         // 제자리 borrow. 과거(훅 루프 &mut self 공존 회피)에는 token_embd 전체
         // to_vec(636MB)을 매 호출마다 복사해 pp에 고정 ~170ms를 더했음.
         // 훅은 prefill_rows(embd 스코프 밖)에 있으므로 borrow 충돌 없음.
@@ -98,7 +97,7 @@ impl Engine {
                 && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
-                let _n = self.model.hp.n_embd as usize;
+                let _n = self.model.hp.n_embd;
                 let mut pos = self.seqs[seq].pos as usize;
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
                 // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,

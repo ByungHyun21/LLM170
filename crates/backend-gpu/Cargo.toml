@@ -13,3 +13,6 @@ ash = "0.38.0"
 parking_lot = "0.12.5"
 half = "2.7.1"
 libc = "0.2"
+
+[lints]
+workspace = true

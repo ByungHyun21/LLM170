@@ -345,7 +345,7 @@ impl DecodeState {
             logits: b_logits, xq_n: b_xqn, xq_f: b_xqf, xq_g: b_xqg,
             aq: b_aq, ak: b_ak, av: b_av, aout: b_aout,
             scores: b_scores, p64: b_p64,
-            one, consts: c, weights: wmap, ktab2: kt, n_vocab: hp.vocab as usize, n_vocab_set: true,
+            one, consts: c, weights: wmap, ktab2: kt, n_vocab: hp.vocab, n_vocab_set: true,
             b_t_max: t_max,
             xs_t: b_xs_t, xn_t: b_xn_t, xq_n_t: b_xq_n_t,
             gqkv_t: b_gqkv_t, gz_t: b_gz_t, gb_t: b_gb_t, ga_t: b_ga_t, gbg_t: b_gbg_t,
@@ -504,7 +504,7 @@ impl DecodeState {
     }
     /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
     fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        if n % 1024 != 0 || std::env::var_os("LLM170_RMSQ_SPLIT").is_some() {
+        if !n.is_multiple_of(1024) || std::env::var_os("LLM170_RMSQ_SPLIT").is_some() {
             self.rms(x, w, self.xn, n)?;
             return self.quant(self.xn, xq, n);
         }
@@ -550,11 +550,10 @@ impl DecodeState {
         if std::env::var_os("LLM170_NO_MMQ").is_some() && only.is_none() {
             return false;
         }
-        if let Some(m) = only {
-            if m & (1u32 << (ty - 12)) == 0 {
+        if let Some(m) = only
+            && m & (1u32 << (ty - 12)) == 0 {
                 return false;
             }
-        }
         if ty == 14 && std::env::var_os("LLM170_NO_Q6MMQ").is_some() {
             // q6_K 킬스위치: 타일 경로(활성 q8 소비). DEQ16만 f32 직소비.
             return std::env::var_os("LLM170_DEQ16").is_some()
@@ -580,7 +579,7 @@ impl DecodeState {
         let r = names.iter().all(|n| {
             self.weights
                 .get(n)
-                .map_or(false, |&(_, ty, _, _)| self.mmq_used(ty, t) && self.mmq_used_s(ty, t))
+                .is_some_and(|&(_, ty, _, _)| self.mmq_used(ty, t) && self.mmq_used_s(ty, t))
         });
         if std::env::var_os("LLM170_QSKIP_DBG").is_some() {
             eprintln!("# qskip t={t} n={} -> {r}", names.len());
@@ -740,7 +739,7 @@ impl DecodeState {
                 }
                 // norm_gated silu + quant 융합 (행=d_state, 플랫 xq 인덱싱)
                 let snorm = *self.consts.get(&format!("blk.{il}.ssm_norm")).ok_or("ssm_norm")?;
-                if self.d_state % 32 == 0 && self.d_inner % 1024 == 0 {
+                if self.d_state.is_multiple_of(32) && self.d_inner.is_multiple_of(1024) {
                     let mut op = self.go as *mut std::ffi::c_void;
                     let mut zp = self.gz as *mut std::ffi::c_void;
                     let mut wp = snorm as *mut std::ffi::c_void;
@@ -924,8 +923,8 @@ impl DecodeState {
                         // 256+ 로 충분히 병렬. 단문맥(sg=32 구간)은 수치 순서 불변.
                         let sg = std::env::var("LLM170_T1SG").ok().and_then(|v| v.parse().ok())
                             .unwrap_or_else(|| ((pos + 1) / 64).clamp(32, 256));
-                        let nseg = ((pos + 1) + sg - 1) / sg;
-                        let part = self.ctx.scratch(1 * n_head * nseg * (hd + 2) * 4)?;
+                        let nseg = (pos + 1).div_ceil(sg);
+                        let part = self.ctx.scratch(n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
                         let mut sg_a = sg as i32;
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut pp2), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0), Self::p(&mut sg_a)];
@@ -1019,7 +1018,7 @@ impl DecodeState {
                 self.mm_into(self.xq_n, wu, tu, niu, nou, self.fup)?;
             }
             // silu_mul+quant 융합 (t=1, n_ff%2048==0) — 동일 산술열
-            if self.n_ff % 2048 == 0 {
+            if self.n_ff.is_multiple_of(2048) {
                 let mut gp = self.fgate as *mut std::ffi::c_void;
                 let mut up = self.fup as *mut std::ffi::c_void;
                 let mut qp = self.xq_f as *mut std::ffi::c_void;
@@ -1072,6 +1071,12 @@ pub struct RawDecoder {
     st: std::sync::Mutex<Option<DecodeState>>,
 }
 
+impl Default for RawDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RawDecoder {
     pub fn new() -> Self {
         RawDecoder { st: std::sync::Mutex::new(None) }
@@ -1097,7 +1102,7 @@ fn kv_to_f16(ctx: &RawCtx, src: *mut u8, dst: *mut u8, src_off: usize, dst_off: 
         &mut dp as *mut _ as *mut std::ffi::c_void,
         &mut nn as *mut _ as *mut std::ffi::c_void,
     ];
-    ctx.launch3("kv_f16", ((n + 1023) / 1024) as u32, 1, 1, 256, &mut args)
+    ctx.launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)
 }
 
 impl llm170_core::matmul::RawDecode for RawDecoder {
@@ -1165,7 +1170,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
             if let Some(buf) = ds.mtp_kv_k.get(seq).copied() {
                 let _ = ds.ctx.d2h(bytemuck::cast_slice_mut(&mut kv).as_mut(), buf);
             }
-            let h = (pos0 + emb.len() / ds.n_embd) as usize;
+            let h = pos0 + emb.len() / ds.n_embd;
             eprintln!(
                 "# mtpkv seq={seq} pos0={pos0} rows={h} first16KB: nonzero={} max={:.4}",
                 kv.iter().filter(|v| **v != 0.0).count(),
@@ -1756,7 +1761,7 @@ gmark("attn", &mut marks);
                         // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
                         // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 줄어든다.
                         let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize).max(64);
-                        let nseg = (pos0 + t + sg - 1) / sg;
+                        let nseg = (pos0 + t).div_ceil(sg);
                         // part: [t][n_head][nseg][hd+2]
                         let part = self.ctx.scratch(t * n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
@@ -1789,7 +1794,7 @@ gmark("attn", &mut marks);
                                 // 산술이 f16 누적이라 스칼라와 다른데, 토큰 동일성은 600토큰
                                 // 다중 청크에서 확인했고 커널 정확성은 wmma-attn-check 가 보증한다.
                                 // LLM170_NO_WK_WMMA=1 이면 wk8 로 복귀.
-                                self.ctx.launch3_dyn("qsa_flash_wmma", ((t + 63) / 64) as u32, n_head as u32, nseg as u32, 256, 32768, &mut args)?;
+                                self.ctx.launch3_dyn("qsa_flash_wmma", t.div_ceil(64) as u32, n_head as u32, nseg as u32, 256, 32768, &mut args)?;
                             } else {
                             // hd=256 프리필은 8레인/행 판(셔플 3단)이 기본 — wk16 대비 페어 +2.3%.
                             // 산술(트리 깊이)이 달라 장문 궤적이 갈리지만 커널 정확성은
@@ -1813,32 +1818,31 @@ gmark("attn", &mut marks);
                             if std::env::var_os("LLM170_NO_WMMA2").is_none()
                                 && np_ > 2560 {
                                 let v2k = std::env::var_os("LLM170_NO_WMMA2V2").is_none();
-                                self.ctx.launch3(if v2k { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+                                self.ctx.launch3(if v2k { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, t.div_ceil(16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
                             } else if std::env::var_os("LLM170_WK8D").is_some() {
-                                self.ctx.launch3("qsa_flash_wk8d", ((t + 7) / 8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                                self.ctx.launch3("qsa_flash_wk8d", t.div_ceil(8) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else if std::env::var_os("LLM170_NO_WK8I").is_none() {
-                                self.ctx.launch3("qsa_flash_wk8i", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                                self.ctx.launch3("qsa_flash_wk8i", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else if std::env::var_os("LLM170_NO_WK8").is_none() {
-                                self.ctx.launch3("qsa_flash_wk8", ((t + 31) / 32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                                self.ctx.launch3("qsa_flash_wk8", t.div_ceil(32) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             } else {
-                                self.ctx.launch3("qsa_flash_wk16", ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
+                                self.ctx.launch3("qsa_flash_wk16", t.div_ceil(16) as u32, n_head as u32, nseg as u32, 256, &mut args)?;
                             }
                             }
                         } else {
-                            let (kn, gx) = if wk { ("qsa_flash_wk", ((t + 31) / 32) as u32) } else { ("qsa_flash_split4q4", ((t + 3) / 4) as u32) };
+                            let (kn, gx) = if wk { ("qsa_flash_wk", t.div_ceil(32) as u32) } else { ("qsa_flash_split4q4", t.div_ceil(4) as u32) };
                             self.ctx.launch3(kn, gx, n_head as u32, nseg as u32, 256, &mut args)?;
                         }
                         let mut margs = vec![Self::p(&mut qp), Self::p(&mut pp2), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut sg_a)];
                         self.ctx.launch3("qsa_flash_merge", t as u32, n_head as u32, 1, 256, &mut margs)?;
-                        if let Some(path) = std::env::var_os("LLM170_ATTN_DUMP") {
-                            if full_idx == 0 {
+                        if let Some(path) = std::env::var_os("LLM170_ATTN_DUMP")
+                            && full_idx == 0 {
                                 self.ctx.sync().ok();
                                 let mut v = vec![0f32; t * n_head * hd];
                                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.aout_t)?;
                                 std::fs::write(&path, bytemuck::cast_slice(&v)).ok();
                                 eprintln!("# attn-dump L0 t={t} n_head={n_head} hd={hd}");
                             }
-                        }
                     } else {
                         let mut args = vec![Self::p(&mut qp), Self::p(&mut ckp), Self::p(&mut cvp), Self::p(&mut mp), Self::p(&mut op), Self::p(&mut np_), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut tl), Self::p(&mut ss), Self::p(&mut p0)];
                         self.ctx.launch3("qsa_flash", t as u32, n_head as u32, 1, 256, &mut args)?;
@@ -1942,7 +1946,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
         }
         // head — 마지막 토큰만
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
-        let last = unsafe { self.xs_t.offset(((t - 1) * n * 4) as isize) } as *mut u8;
+        let last = unsafe { self.xs_t.add((t - 1) * n * 4) } as *mut u8;
         {
             let mut xp = last as *mut std::ffi::c_void;
             let mut pp = self.p64 as *mut std::ffi::c_void;
@@ -2463,7 +2467,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
                 && np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128)
             {
                 let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).max(64);
-                let nseg = (pos0 + t + sg - 1) / sg;
+                let nseg = (pos0 + t).div_ceil(sg);
                 let part = self.ctx.scratch(nrow_attn * n_head * nseg * (hd + 2) * 4)?;
                 let mut pp2 = part as *mut std::ffi::c_void;
                 let mut sg_a = sg as i32;
@@ -3036,7 +3040,7 @@ self.axpy(self.xs_t, self.fdown_t, n * t)?;
             let mut out = Vec::with_capacity(t);
             let mut row = vec![0f32; noh];
             for s in 0..t {
-                let src = unsafe { self.logits_all.offset((s * noh * 4) as isize) } as *const u8;
+                let src = unsafe { self.logits_all.add(s * noh * 4) } as *const u8;
                 self.ctx.d2h(bytemuck::cast_slice_mut(&mut row).as_mut(), src)?;
                 out.push(row.clone());
             }
@@ -3563,7 +3567,7 @@ self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
             // t 게이트·CO 검사를 **우회**했다 — step_batch 의 verify(t=4~16)가
             // 전부 MMQ 로 돌아 296ms/4행 (3.9x, 무계약)을 낸 근원. 게이트가
             // 양쪽 분기 모두에 적용되도록 괄호 명시.
-            if (((only.is_none() || only.map_or(false, |m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
+            if (((only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0)) && matches!(ty, 12 | 13 | 14 | 23))
                 || ((ty == 8 && std::env::var("LLM170_Q8MMQ").as_deref() == Ok("1")) && (ty != 14 || std::env::var_os("LLM170_NO_Q6MMQ").is_none())))
                 && (t >= 32 || (t == 1 && std::env::var_os("LLM170_Q1MMQ").is_some()))
                 && super::co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {

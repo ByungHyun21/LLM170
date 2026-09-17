@@ -56,9 +56,10 @@ pub fn exp_cr(x: f32) -> f32 {
     if xd < -103.97 {
         return 0.0;
     }
-    const LN2_HI: f64 = 6.93147180369123816490e-01;
-    const LN2_LO: f64 = 1.90821492927058770002e-10;
-    const INV_LN2: f64 = 1.44269504088896338700e+00;
+    const LN2_HI: f64 = 6.931_471_803_691_238e-1;
+    const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
+    // log2(e) — std 상수와 비트 동일(참조 미러 값 보존).
+    const INV_LN2: f64 = std::f64::consts::LOG2_E;
     let kd = (xd * INV_LN2).round_ties_even();
     let k = kd as i64;
     let mut r = (-kd).mul_add(LN2_HI, xd);
@@ -109,8 +110,8 @@ pub fn ln_cr(v: f64) -> f64 {
     q = q.mul_add(t2, 1.0);
     // ln(v) = ln(m) + k·ln2 — 2단 ln2 (LN2_HI + LN2_LO) fma 합
     let lnm = 2.0 * t * q;
-    const LN2_HI: f64 = 6.93147180369123816490e-01;
-    const LN2_LO: f64 = 1.90821492927058770002e-10;
+    const LN2_HI: f64 = 6.931_471_803_691_238e-1;
+    const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
     let kh = (k as f64) * LN2_HI;
     let kl = (k as f64) * LN2_LO;
     let s1 = lnm + kh;

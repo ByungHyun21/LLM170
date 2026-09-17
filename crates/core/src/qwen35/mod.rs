@@ -112,10 +112,10 @@ impl Model {
         };
 
         // 정합성: d_inner = dt_rank × head_v_dim, head_v_dim == d_state (delta-net-base assert)
-        if d_inner % dt_rank != 0 || d_inner / dt_rank != d_state {
+        if !d_inner.is_multiple_of(dt_rank) || d_inner / dt_rank != d_state {
             return Err(ModelError::BadHparam("d_inner/dt_rank != d_state").into());
         }
-        if hp.n_head % hp.n_kv != 0 {
+        if !hp.n_head.is_multiple_of(hp.n_kv) {
             return Err(ModelError::BadHparam("n_head % n_kv != 0").into());
         }
 

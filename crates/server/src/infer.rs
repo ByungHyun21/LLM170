@@ -49,7 +49,7 @@ pub(crate) fn cmd_infer(args: &[String]) -> ExitCode {
                 None => return usage_err("--gpu-runtime requires hip|vulkan"),
             },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(k) if k >= 1 && k <= 8 => spec_k = Some(k),
+                Some(k) if (1..=8).contains(&k) => spec_k = Some(k),
                 _ => return usage_err("--spec requires k in 1..=8"),
             },
             other => return usage_err(&format!("unknown flag: {other}")),

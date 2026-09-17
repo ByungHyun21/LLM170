@@ -30,7 +30,7 @@ fn cin_base(ky: usize, kx: usize, ps: usize) -> usize {
 
 fn gelu(x: f32) -> f32 {
     const A: f32 = 0.044715;
-    const SQ2OPI: f32 = 0.797_884_56;
+    const SQ2OPI: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (SQ2OPI * x * (1.0 + A * x * x)).tanh())
 }
 

@@ -576,7 +576,7 @@ impl Engine {
             let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
             let embd_data: &Vec<u8> = &embd_arc;
             let mut trow = vec![0.0f32; n_e];
-            crate::quant::dequant_row(embd_ty, &embd_data, last_token as u64, n_e as u64, &mut trow);
+            crate::quant::dequant_row(embd_ty, embd_data, last_token as u64, n_e as u64, &mut trow);
             let pending = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
             let t_d0 = std::time::Instant::now();
             let (d0, _) = rd
@@ -593,7 +593,7 @@ impl Engine {
                 let dpos = (base_pos + drafts.len() as u32 - 1) as usize;
                 let tc = std::time::Instant::now();
                 let mut trow = vec![0.0f32; n_e];
-                crate::quant::dequant_row(embd_ty, &embd_data, tok as u64, n_e as u64, &mut trow);
+                crate::quant::dequant_row(embd_ty, embd_data, tok as u64, n_e as u64, &mut trow);
                 let td = std::time::Instant::now();
                 let d = rd.mtp_step_chain(seq, &trow, dpos).map_err(ModelError::Accel)?;
                 if std::env::var_os("LLM170_SPEC_TIMING").is_some() {

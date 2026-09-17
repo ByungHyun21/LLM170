@@ -641,7 +641,6 @@ pub trait FrameHost: Send + Sync {
     }
     /// 기본 미지원(Err) — 프레임 경로는 구현 가속기에서만 사용하며, 값 반환
     /// 경로(위 matmul 계열)와 병행해 CPU golden 대조가 가능하다.
-
     /// 프레임 버퍼 할당 — u64는 가속기 레지스트리 토큰 (해제는 frame_free).
     fn frame_alloc(&self, _len: usize) -> Result<u64, String> {
         Err("frame_alloc: 미지원".into())
@@ -881,7 +880,10 @@ pub fn mm_batch(
         Some(a) => a
             .matmul_batch(xs, w, outs)
             .map_err(crate::qwen35::ModelError::Accel),
-        None => Ok(matmul_batch(xs, w, outs)),
+        None => {
+            matmul_batch(xs, w, outs);
+            Ok(())
+        },
     }
 }
 
@@ -894,7 +896,10 @@ pub fn mm(
 ) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
         Some(a) => a.matmul(x, w, out).map_err(crate::qwen35::ModelError::Accel),
-        None => Ok(matmul(x, w, out)),
+        None => {
+            matmul(x, w, out);
+            Ok(())
+        },
     }
 }
 

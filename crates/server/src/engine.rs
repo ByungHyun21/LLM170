@@ -164,7 +164,7 @@ pub fn slot_loop(
     let mut last_wt = std::time::Instant::now();
     let mut iters: u64 = 0;
     let it_dbg = |i: u64, busy: bool, decoded: bool, pend: bool| {
-        if std::env::var_os("LLM170_LOOP_DBG").is_some() && (i < 4 || i % 200_000 == 0) {
+        if std::env::var_os("LLM170_LOOP_DBG").is_some() && (i < 4 || i.is_multiple_of(200_000)) {
             eprintln!("# loop-dbg: iters={i} busy={busy} decoded={decoded} pending={pend}");
         }
     };
@@ -448,14 +448,12 @@ fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;
-    if let Some(j) = &s.job {
-        if let Some(p) = &j.progress {
-            if p.send(t).is_err() {
+    if let Some(j) = &s.job
+        && let Some(p) = &j.progress
+            && p.send(t).is_err() {
                 // SSE 수신자 소멸(클라이언트 절단) — 즉시 취소 표시
                 s.cancelled = true;
             }
-        }
-    }
 }
 
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {

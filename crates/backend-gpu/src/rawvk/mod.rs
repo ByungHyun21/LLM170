@@ -273,7 +273,7 @@ use ash::vk;
         for m in 0..16usize {
             let mut s = 0i32;
             for k in 0..32usize {
-                s += w8[m * n_in + k] as i32 * b8[0 * n_in + k] as i32;
+                s += w8[m * n_in + k] as i32 * b8[k] as i32;
             }
             if iv[m * 16] != s {
                 _iok = false;
@@ -494,7 +494,7 @@ use ash::vk;
             c[h * 2 + 1] = (sp * sa[h0]).exp();
         }
         let maxd = r.iter().zip(c.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let mrel = r.iter().zip(c.iter()).map(|(x, y)| ((x - y) / y.abs().max(1e-6) as f32).abs()).fold(0.0f32, f32::max);
+        let mrel = r.iter().zip(c.iter()).map(|(x, y)| ((x - y) / y.abs().max(1e-6)).abs()).fold(0.0f32, f32::max);
         lines.push(format!("gdn_beta_g: max|D|={maxd:.2e} mrel={mrel:.2e} {}", if mrel < 1e-4 { "★" } else { "MISMATCH" }));
     }
 
@@ -571,7 +571,7 @@ use ash::vk;
                 // ssr *= g; sk = Σ k·s ; delta; s += k·delta; out = Σ q·s
                 // g는 (pair, ti)당 1회 — 전 행 적용 후 u 순회
                 for i in 0..d {
-                    st[base_s + i * d + 0..base_s + i * d + d].iter_mut().for_each(|x| *x *= g);
+                    st[base_s + i * d..base_s + i * d + d].iter_mut().for_each(|x| *x *= g);
                 }
                 for u in 0..d {
                     let mut acc = 0.0f64;
@@ -583,7 +583,7 @@ use ash::vk;
                     let sk = acc;
                     let delta = (v[v0 + u] as f64 - sk) * beta as f64;
                     for i in 0..d {
-                        st[base_s + i * d + u] += (k[qk0 + i] * delta as f32) as f32;
+                        st[base_s + i * d + u] += k[qk0 + i] * delta as f32;
                     }
                 }
                 for u in 0..d {

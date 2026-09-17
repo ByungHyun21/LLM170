@@ -51,7 +51,7 @@ use llm170_profiler::profile_span;
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let sel = &idx[..n_used];
             let mut wsum: f32 = sel.iter().map(|&e| logits[e]).sum();
-            wsum = wsum.max(6.103515625e-5);
+            wsum = wsum.max(6.103_515_6e-5);
             for &e in sel {
                 let w = logits[e] / wsum;
                 if w != 0.0 {
@@ -118,15 +118,14 @@ use llm170_profiler::profile_span;
                 // CMP 40GB+ 또는 LRU 스트리밍 도입시).
                 let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
                     && std::env::var_os("LLM170_MOE_CPU").is_none();
-                if batch_on {
-                    if let Some(acc) = ctx.acc {
+                if batch_on
+                    && let Some(acc) = ctx.acc {
                         let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
                         let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();
                         if acc.moe_down(&gate_y[..n_sel], &stack, &ids, n_exp, &mut eos).is_ok() {
                             batched = true;
                         }
                     }
-                }
                 // mm_paired 폴백은 batch_on과 무관하게 항상 대기 — ed89e84가
                 // 이 블록을 if batch_on 내부로 잘못 중첩해 기본(t=1 fast) 경로의
                 // 라우팅 전문가 기여가 0이던 회귀 (2026-09-01 프레임 대조로 발견).
@@ -182,15 +181,15 @@ use llm170_profiler::profile_span;
         // 페어 정렬은 토큰 메이저·전문가 오름차순(전문가별 경로의 토큰별 누산
         // 순서와 동일). 경로 선택은 위 batch_on.
         let mut grouped_done = false;
-        if batch_on {
-            if let Some(acc) = ctx.acc {
+        if batch_on
+            && let Some(acc) = ctx.acc {
                 let mut pairs: Vec<(usize, usize, f32)> = Vec::with_capacity(t * n_used);
                 for e in 0..n_exp {
                     for &(ti, w) in &by_expert[e] {
                         pairs.push((ti, e, w));
                     }
                 }
-                pairs.sort_by(|&a, &b| (a.0, a.1).cmp(&(b.0, b.1)));
+                pairs.sort_by_key(|&a| (a.0, a.1));
                 let np_ = pairs.len();
                 let ids: Vec<u32> = pairs.iter().map(|&(_, e, _)| e as u32).collect();
                 let xp: Vec<Vec<f32>> = pairs.iter().map(|&(ti, _, _)| xs[ti].clone()).collect();
@@ -224,7 +223,6 @@ use llm170_profiler::profile_span;
                     }
                 }
             }
-        }
         if !grouped_done {
         for e in 0..n_exp {
             let list = &by_expert[e];

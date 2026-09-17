@@ -507,15 +507,15 @@ pub fn dot_q4k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
         let (d2, mm2) = (d * sc2 as f32, min * m2 as f32);
         let mut isum1 = 0i64;
         let mut isum2 = 0i64;
-        let qsum1: i64;
-        let qsum2: i64;
+        
+        
         for l in 0..32 {
             let q = qs[it * 32 + l];
             isum1 += (q & 0xF) as i64 * y_el(y, it * 64 + l);
             isum2 += (q >> 4) as i64 * y_el(y, it * 64 + 32 + l);
         }
-        qsum1 = (0..32).map(|l| y_el(y, it * 64 + l)).sum();
-        qsum2 = (0..32).map(|l| y_el(y, it * 64 + 32 + l)).sum();
+        let qsum1: i64 = (0..32).map(|l| y_el(y, it * 64 + l)).sum();
+        let qsum2: i64 = (0..32).map(|l| y_el(y, it * 64 + 32 + l)).sum();
         let (yd1, yd2) = (y[2 * it].d, y[2 * it + 1].d);
         sum += yd1 * (d1 * isum1 as f32 - mm1 * qsum1 as f32);
         sum += yd2 * (d2 * isum2 as f32 - mm2 * qsum2 as f32);
@@ -566,7 +566,7 @@ pub fn dot_q6k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     let sc: Vec<i8> = w[192..208].iter().map(|&b| b as i8).collect();
     let mut sum = 0.0f32;
     // 누적을 스케일별 i64로 모아 한 번에 조합
-    let mut acc = vec![0i64; 16];
+    let mut acc = [0i64; 16];
     for h in 0..2 {
         for l in 0..32 {
             let is = h * 8 + l / 16;
@@ -772,107 +772,6 @@ pub fn dot_row_w4a8(ty: GgmlType, data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         acc += v;
     }
     acc
-}
-
-#[cfg(test)]
-mod w4a8_tests {
-    use super::*;
-
-    /// q5_1 산술 정밀 검증 — f32 디퀀트 기준 vs dot_q5_1_q8 vs 레인 미러.
-    /// (m 항을 반드시 포함: d=1.0, m=−0.5 f16 고정, 4블록 = 128원소)
-    #[test]
-    fn q5_1_block_exact() {
-        let mut seed = 0x5A5A_1234u64;
-        let mut lcg = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (seed >> 33) as u32
-        };
-        let n = 128usize;
-        let mut bytes = vec![0u8; (n / 32) * 24];
-        for b in bytes.iter_mut() {
-            *b = (lcg() & 0xFF) as u8;
-        }
-        for blk in bytes.chunks_mut(24) {
-            // d = 1.0 (f16 0x3C00), m = -0.5 (f16 0xB800)
-            blk[0] = 0x00;
-            blk[1] = 0x3C;
-            blk[2] = 0x00;
-            blk[3] = 0xB8;
-        }
-        let x: Vec<f32> = (0..n).map(|_| ((lcg() >> 8) as f32 / (1u32 << 24) as f32) - 0.5).collect();
-        let y = quantize_row_q8_ref(&x);
-        // 기준: f32 디퀀트 × q8 재구성 (측정 대상 산술만 남긴다)
-        let mut wv = vec![0.0f32; n];
-        dequant_row(GgmlType::Q5_1, &bytes, 0, n as u64, &mut wv);
-        let mut want = 0.0f64;
-        for i in 0..n {
-            want += (wv[i] as f64) * (y[i / 32].d as f64) * (y[i / 32].qs[i % 32] as f64);
-        }
-        // 블록 단위 미러(전 블록 합)와 레인 미러가 f32 디퀀트 기준과 일치해야 한다
-        let mut got_block = 0.0f64;
-        for b in 0..n / 32 {
-            got_block += dot_q5_1_q8(&bytes[b * 24..b * 24 + 24], &y[b..b + 1]) as f64;
-        }
-        let got_lane = dot_row_w4a8_q5_1_lane(&bytes, n as u64, &y) as f64;
-        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-3);
-        assert!(rel(got_block, want) < 1e-4, "block {got_block} vs {want}");
-        assert!(rel(got_lane, want) < 1e-4, "lane {got_lane} vs {want}");
-    }
-
-    /// 각 타입: 임의 블록 바이트 → f32 dequant 내적 vs dot_*_q8 — 상대오차 < 1.5e-2
-    /// (q8 활성 양자화 오차가 유일한 차이원).
-    #[test]
-    fn w4a8_dots_match_f32() {
-        let mut seed = 170u64;
-        let mut lcg = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (seed >> 33) as u32
-        };
-        // 임의 x (f32) → q8 양자화 → 재구성 y_f 를 f32 기준으로 삼으면
-        // 차이는 오직 (a) 블록별 정수그룹화 (b) q8 양자화 0 — 아니, f32 기준은
-        // 원본 x와 y 재구성을 같이 쓴다: w_f32[i]·x[i] vs dot(q8(x)) — q8 오차 포함.
-        let cases: Vec<(GgmlType, usize)> = vec![
-            (GgmlType::Q4K, 144), (GgmlType::Q5K, 176), (GgmlType::Q6K, 210),
-            (GgmlType::Q3K, 110), (GgmlType::Q8_0, 34), (GgmlType::Iq4Xs, 136),
-            (GgmlType::Iq4Nl, 18), (GgmlType::Iq3S, 110),
-        ];
-        for (ty, bsize) in cases {
-            let blck = ty.blck_size() as usize;
-            let n = blck * 4; // 4블록
-            let mut bytes = vec![0u8; n / blck * bsize];
-            for b in bytes.iter_mut() {
-                *b = (lcg() & 0xFF) as u8;
-            }
-            // d 필드가 극단적(0/ff)이면 값이 퇴화 — 스케일 바이트만 온화하게
-            for (bi, blk) in bytes.chunks_mut(bsize).enumerate() {
-                let _ = bi;
-                match ty {
-                    GgmlType::Q4K | GgmlType::Q5K => {
-                        blk[0] = 0x30; blk[1] = 0x10; blk[2] = 0x28; blk[3] = 0x10;
-                    }
-                    GgmlType::Q6K => { blk[208] = 0x50; blk[209] = 0x11; }
-                    GgmlType::Q3K => { blk[108] = 0x40; blk[109] = 0x11; }
-                    GgmlType::Q8_0 => { blk[0] = 0x50; blk[1] = 0x11; }
-                    GgmlType::Iq4Xs | GgmlType::Iq4Nl => { blk[0] = 0x50; blk[1] = 0x11; }
-                    GgmlType::Iq3S => { blk[0] = 0x50; blk[1] = 0x11; }
-                    _ => {}
-                }
-            }
-            let x: Vec<f32> = (0..n).map(|_| (lcg() as f32 / 2147483648.0) - 0.5).collect();
-            let y = quantize_row_q8_ref(&x);
-            let mut wf = vec![0.0f32; n];
-            for b in 0..n / blck {
-                dequant_row(ty, &bytes[b * bsize..], 0, blck as u64, &mut wf[b * blck..(b + 1) * blck]);
-            }
-            let f32_dot: f32 = x.iter().zip(wf.iter()).map(|(a, b)| a * b).sum();
-            let w4a8 = dot_row_w4a8(ty, &bytes, n as u64, &y);
-            let rel = (f32_dot - w4a8).abs() / f32_dot.abs().max(1.0);
-            assert!(
-                rel < 5e-2,
-                "{ty:?}: f32={f32_dot:.5} w4a8={w4a8:.5} rel={rel:.4}"
-            );
-        }
-    }
 }
 
 /// W4A8 레인 미러(q3_K) — GPU gemm_q8i_q3k와 동일 구조. 16요소 하프블록
@@ -1162,7 +1061,7 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
                 isum += (((nib as i64) | (hi2 << 4)) - 32) * y_el(y, elem);
             }
             let pos = src;
-            let yd = y[(blk * 8 + h * 4 + pos) as usize].d;
+            let yd = y[blk * 8 + h * 4 + pos].d;
             acc += yd * d * sc as f32 * isum as f32;
         }
         lane[l] = acc as f64;
@@ -1326,7 +1225,7 @@ pub fn dot_row_w4a8_q6k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         }
         let qsum: i64 = (0..16).map(|jj| y_el(y, blk * 256 + h * 128 + src * 32 + p2 * 16 + jj)).sum();
         isum -= 32 * qsum;
-        let yd = y[(blk * 8 + h * 4 + src) as usize].d;
+        let yd = y[blk * 8 + h * 4 + src].d;
         acc += yd * (d * sc as f32) * isum as f32;
     }
     acc
@@ -1364,4 +1263,105 @@ fn ktab2_word(b: usize) -> u32 {
     let lo = KVALUES_IQ4NL[b & 0xF] as u8 as u32;
     let hi = KVALUES_IQ4NL[b >> 4] as u8 as u32;
     lo | (hi << 8)
+}
+
+#[cfg(test)]
+mod w4a8_tests {
+    use super::*;
+
+    /// q5_1 산술 정밀 검증 — f32 디퀀트 기준 vs dot_q5_1_q8 vs 레인 미러.
+    /// (m 항을 반드시 포함: d=1.0, m=−0.5 f16 고정, 4블록 = 128원소)
+    #[test]
+    fn q5_1_block_exact() {
+        let mut seed = 0x5A5A_1234u64;
+        let mut lcg = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as u32
+        };
+        let n = 128usize;
+        let mut bytes = vec![0u8; (n / 32) * 24];
+        for b in bytes.iter_mut() {
+            *b = (lcg() & 0xFF) as u8;
+        }
+        for blk in bytes.chunks_mut(24) {
+            // d = 1.0 (f16 0x3C00), m = -0.5 (f16 0xB800)
+            blk[0] = 0x00;
+            blk[1] = 0x3C;
+            blk[2] = 0x00;
+            blk[3] = 0xB8;
+        }
+        let x: Vec<f32> = (0..n).map(|_| ((lcg() >> 8) as f32 / (1u32 << 24) as f32) - 0.5).collect();
+        let y = quantize_row_q8_ref(&x);
+        // 기준: f32 디퀀트 × q8 재구성 (측정 대상 산술만 남긴다)
+        let mut wv = vec![0.0f32; n];
+        dequant_row(GgmlType::Q5_1, &bytes, 0, n as u64, &mut wv);
+        let mut want = 0.0f64;
+        for i in 0..n {
+            want += (wv[i] as f64) * (y[i / 32].d as f64) * (y[i / 32].qs[i % 32] as f64);
+        }
+        // 블록 단위 미러(전 블록 합)와 레인 미러가 f32 디퀀트 기준과 일치해야 한다
+        let mut got_block = 0.0f64;
+        for b in 0..n / 32 {
+            got_block += dot_q5_1_q8(&bytes[b * 24..b * 24 + 24], &y[b..b + 1]) as f64;
+        }
+        let got_lane = dot_row_w4a8_q5_1_lane(&bytes, n as u64, &y) as f64;
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-3);
+        assert!(rel(got_block, want) < 1e-4, "block {got_block} vs {want}");
+        assert!(rel(got_lane, want) < 1e-4, "lane {got_lane} vs {want}");
+    }
+
+    /// 각 타입: 임의 블록 바이트 → f32 dequant 내적 vs dot_*_q8 — 상대오차 < 1.5e-2
+    /// (q8 활성 양자화 오차가 유일한 차이원).
+    #[test]
+    fn w4a8_dots_match_f32() {
+        let mut seed = 170u64;
+        let mut lcg = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as u32
+        };
+        // 임의 x (f32) → q8 양자화 → 재구성 y_f 를 f32 기준으로 삼으면
+        // 차이는 오직 (a) 블록별 정수그룹화 (b) q8 양자화 0 — 아니, f32 기준은
+        // 원본 x와 y 재구성을 같이 쓴다: w_f32[i]·x[i] vs dot(q8(x)) — q8 오차 포함.
+        let cases: Vec<(GgmlType, usize)> = vec![
+            (GgmlType::Q4K, 144), (GgmlType::Q5K, 176), (GgmlType::Q6K, 210),
+            (GgmlType::Q3K, 110), (GgmlType::Q8_0, 34), (GgmlType::Iq4Xs, 136),
+            (GgmlType::Iq4Nl, 18), (GgmlType::Iq3S, 110),
+        ];
+        for (ty, bsize) in cases {
+            let blck = ty.blck_size() as usize;
+            let n = blck * 4; // 4블록
+            let mut bytes = vec![0u8; n / blck * bsize];
+            for b in bytes.iter_mut() {
+                *b = (lcg() & 0xFF) as u8;
+            }
+            // d 필드가 극단적(0/ff)이면 값이 퇴화 — 스케일 바이트만 온화하게
+            for (bi, blk) in bytes.chunks_mut(bsize).enumerate() {
+                let _ = bi;
+                match ty {
+                    GgmlType::Q4K | GgmlType::Q5K => {
+                        blk[0] = 0x30; blk[1] = 0x10; blk[2] = 0x28; blk[3] = 0x10;
+                    }
+                    GgmlType::Q6K => { blk[208] = 0x50; blk[209] = 0x11; }
+                    GgmlType::Q3K => { blk[108] = 0x40; blk[109] = 0x11; }
+                    GgmlType::Q8_0 => { blk[0] = 0x50; blk[1] = 0x11; }
+                    GgmlType::Iq4Xs | GgmlType::Iq4Nl => { blk[0] = 0x50; blk[1] = 0x11; }
+                    GgmlType::Iq3S => { blk[0] = 0x50; blk[1] = 0x11; }
+                    _ => {}
+                }
+            }
+            let x: Vec<f32> = (0..n).map(|_| (lcg() as f32 / 2147483648.0) - 0.5).collect();
+            let y = quantize_row_q8_ref(&x);
+            let mut wf = vec![0.0f32; n];
+            for b in 0..n / blck {
+                dequant_row(ty, &bytes[b * bsize..], 0, blck as u64, &mut wf[b * blck..(b + 1) * blck]);
+            }
+            let f32_dot: f32 = x.iter().zip(wf.iter()).map(|(a, b)| a * b).sum();
+            let w4a8 = dot_row_w4a8(ty, &bytes, n as u64, &y);
+            let rel = (f32_dot - w4a8).abs() / f32_dot.abs().max(1.0);
+            assert!(
+                rel < 5e-2,
+                "{ty:?}: f32={f32_dot:.5} w4a8={w4a8:.5} rel={rel:.4}"
+            );
+        }
+    }
 }

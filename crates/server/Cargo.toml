@@ -17,3 +17,6 @@ llm170-backend-gpu = { path = "../backend-gpu" }
 log = "0.4"
 bytemuck = "1"
 image = { version = "0.25.10", features = ["jpeg", "png"] }
+
+[lints]
+workspace = true

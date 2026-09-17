@@ -680,7 +680,7 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             // 원-핫 x(j)의 출력값 × 127 = 짝지어진 열 → x가 어디로 가는지 값으로 읽힌다.
             let mut wl = vec![0u8; n_out * (n_in / 32) * 34];
             for sb in 0..n_in / 32 {
-                let blk2 = &mut wl[(0 * (n_in / 32) + sb) * 34..][..34];
+                let blk2 = &mut wl[sb * 34..][..34];
                 blk2[0] = 0x00;
                 // d = 1/127 ≈ 0x1C04? → 대신 d=1 로 두고 q 값 자체를 라벨로 쓴다(출력=q).
                 blk2[1] = 0x3C;
@@ -789,7 +789,7 @@ pub fn f16_bench(rows: usize, n_in: usize, n_out: usize, reps: usize) -> Result<
             ];
             let e = hip::hipModuleLaunchKernel(
                 fm,
-                ((n_out + 127) / 128) as u32,
+                n_out.div_ceil(128) as u32,
                 1,
                 rows.div_ceil(128) as u32,
                 256,
@@ -1099,15 +1099,15 @@ pub fn wc_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     // 진단: 디퀀트 커널 값 검증 — CPU 대조 (xs만, o=0 앞 8원소)
     if is_xs && std::env::var_os("LLM170_WC_CPUCHK").is_some() {
         ctx.sync()?;
-        let mut ac_host = vec![0u16; n_in.min(64) as usize];
+        let mut ac_host = vec![0u16; n_in.min(64)];
         ctx.d2h(unsafe { std::slice::from_raw_parts_mut(ac_host.as_mut_ptr() as *mut u8, ac_host.len() * 2) }, ac)?;
         let f16v = |bits: u16| half_f32(bits);
         let wq = w.data;
-        let blocks = n_in >> 8;
+        let _blocks = n_in >> 8; // 진단용(현재 미사용) — 2026-09-17 clippy
         let mut cpu = vec![0f32; 8];
         for (sb2, cv) in cpu.iter_mut().enumerate() {
             let ib = sb2 & 7;
-            let wb = 0usize * blocks * 136 + (sb2 >> 3) * 136;
+            let wb = (sb2 >> 3) * 136;
             let wqf = wb >> 2;
             let w0 = u32::from_le_bytes([wq[wqf*4], wq[wqf*4+1], wq[wqf*4+2], wq[wqf*4+3]]);
             let d = f16v((w0 & 0xFFFF) as u16);
@@ -1375,11 +1375,10 @@ pub fn wmma2_map() -> Result<String, String> {
             e[r * 16 + k] = half::f16::from_f32(1.0).to_bits();
             let c = dump(ad as usize, bd as usize, &e, &ident)?;
             for idx in 0..256usize {
-                if c[idx] == 1.0 {
-                    if amap[idx].0 == -1 || amap[idx] == (r as i32, k as i32) {
+                if c[idx] == 1.0
+                    && (amap[idx].0 == -1 || amap[idx] == (r as i32, k as i32)) {
                         amap[idx] = (r as i32, k as i32);
                     }
-                }
             }
         }
     }
@@ -1390,11 +1389,10 @@ pub fn wmma2_map() -> Result<String, String> {
             e[kk * 16 + j] = half::f16::from_f32(1.0).to_bits();
             let c = dump(ad as usize, bd as usize, &ident, &e)?;
             for idx in 0..256usize {
-                if c[idx] == 1.0 {
-                    if bmap[idx].0 == -1 || bmap[idx] == (kk as i32, j as i32) {
+                if c[idx] == 1.0
+                    && (bmap[idx].0 == -1 || bmap[idx] == (kk as i32, j as i32)) {
                         bmap[idx] = (kk as i32, j as i32);
                     }
-                }
             }
         }
     }
@@ -1609,7 +1607,7 @@ pub fn gqa_bench() -> Result<String, String> {
         a.push(&mut sp as *mut _ as *mut c_void);
         a.push(&mut dp as *mut _ as *mut c_void);
         a.push(&mut nn as *mut _ as *mut c_void);
-        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        let nblk = kk.len().div_ceil(1024) as u32;
         ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
         let mut sp2 = vd as *mut c_void;
         let mut dp2 = v16 as *mut c_void;
@@ -1748,7 +1746,7 @@ pub fn wmma_attn_check() -> Result<String, String> {
     // 후반 청크 재현: pos0>0, n_past>t (실제 모델이 NaN 을 낸 구성)
     let (t, pos0, seg, sstride, ctx_len) = (64usize, 32usize, 16usize, 256usize, 256usize);
     let n_past = 96usize;
-    let nseg = (pos0 + t + seg - 1) / seg;   // 4
+    let nseg = (pos0 + t).div_ceil(seg);   // 4
     let qv: Vec<f32> = (0..t * n_head * 2 * hd)
         .map(|i| (((i * 1103515245 + 12345) % 200) as f32 - 100.0) * 5e-3)
         .collect();
@@ -1780,7 +1778,7 @@ pub fn wmma_attn_check() -> Result<String, String> {
         let mut nn = kk.len() as i32;
         let mut a: Vec<*mut c_void> = vec![&mut sp as *mut _ as *mut c_void,
             &mut dp as *mut _ as *mut c_void, &mut nn as *mut _ as *mut c_void];
-        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        let nblk = kk.len().div_ceil(1024) as u32;
         ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
         let mut sp2 = vd as *mut c_void;
         let mut dp2 = vh as *mut c_void;
@@ -1912,7 +1910,7 @@ pub fn wmma2_attn_check() -> Result<String, String> {
     } else {
         (64usize, 32usize, 16usize, 256usize, 96usize)
     };
-    let nseg = (n_past + seg - 1) / seg;
+    let nseg = n_past.div_ceil(seg);
     let qv: Vec<f32> = (0..t * n_head * 2 * hd)
         .map(|i| (((i * 1103515245 + 12345) % 200) as f32 - 100.0) * 5e-3)
         .collect();
@@ -1946,7 +1944,7 @@ pub fn wmma2_attn_check() -> Result<String, String> {
             &mut dp as *mut _ as *mut c_void,
             &mut nn as *mut _ as *mut c_void,
         ];
-        let nblk = ((kk.len() + 1023) / 1024) as u32;
+        let nblk = kk.len().div_ceil(1024) as u32;
         ctx.launch3("kv_f16", nblk, 1, 1, 256, &mut a)?;
     }
     let mut qp = qd as *mut c_void;
@@ -1972,7 +1970,7 @@ pub fn wmma2_attn_check() -> Result<String, String> {
         (&mut sg) as *mut _ as *mut c_void,
     ];
     let v2 = std::env::var_os("LLM170_WMMA2V2").is_some();
-    ctx.launch3(if v2 { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, ((t + 15) / 16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
+    ctx.launch3(if v2 { "qsa_flash_wmma2v2" } else { "qsa_flash_wmma2" }, t.div_ceil(16) as u32, n_head as u32, nseg as u32, 64, &mut args)?;
     ctx.sync()?;
     let mut got = vec![0f32; t * n_head * nseg * (hd + 2)];
     ctx.d2h(bytemuck::cast_slice_mut(&mut got).as_mut(), pd)?;
@@ -2121,7 +2119,7 @@ pub fn attn_check() -> Result<String, String> {
     let (n_head, n_kv, hd) = (24usize, 4usize, 256usize);
     let (t, pos0, seg, sstride, ctx_len) = (512usize, 1536usize, 128usize, 2048usize, 2048usize);
     let n_past = pos0 + t;
-    let nseg = (n_past + seg - 1) / seg;
+    let nseg = n_past.div_ceil(seg);
     // 입력: 결정적 의사난수(양 커널에 동일)
     let qv: Vec<f32> = (0..t * n_head * 2 * hd)
         .map(|i| (((i * 1103515245 + 12345) % 2000) as f32 - 1000.0) * 1e-3)
@@ -2148,7 +2146,7 @@ pub fn attn_check() -> Result<String, String> {
     ctx.h2d(vd, bytemuck::cast_slice(&kv_v))?;
     ctx.h2d(md, bytemuck::cast_slice(&mask))?;
     let mut out = String::new();
-    for (name, gx) in [("qsa_flash_wk16", (t + 15) / 16), ("qsa_flash_wk8", (t + 31) / 32)] {
+    for (name, gx) in [("qsa_flash_wk16", t.div_ceil(16)), ("qsa_flash_wk8", t.div_ceil(32))] {
         let mut qp = qd as *mut c_void;
         let mut kp = kd as *mut c_void;
         let mut vp = vd as *mut c_void;

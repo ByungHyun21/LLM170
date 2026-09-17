@@ -196,16 +196,14 @@ impl GgmlType {
     /// 정상 GGUF는 ne[0] % blck == 0 — 아니면 None (손상 파일 감지).
     pub fn nbytes(self, ne: &[u64; 4]) -> Option<u64> {
         let (blck, size) = self.block_info();
-        if ne[0] % blck != 0 {
+        if !ne[0].is_multiple_of(blck) {
             return None;
         }
         let blocks0 = ne[0] / blck;
-        Some(
-            blocks0
+        blocks0
                 .checked_mul(size)?
                 .checked_mul(ne[1])?
                 .checked_mul(ne[2])?
-                .checked_mul(ne[3])?,
-        )
+                .checked_mul(ne[3])
     }
 }
