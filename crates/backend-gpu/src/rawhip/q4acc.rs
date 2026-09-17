@@ -542,6 +542,25 @@ impl Q4Acc {
             .ok_or_else(|| format!("frame 핸들 없음: {h}"))
     }
 
+    /// 핸들의 바이트 용량(frame_alloc·frame_slice가 적어 둔 cap).
+    /// 판독/기입이 이걸 넘으면 **조용한 OOB**였다 — 이웃 버퍼 내용을 읽거나
+    /// 덮어쓰고도 에러가 없어 디버깅을 오도한다(2026-09-17). 명시 에러로 바꾼다.
+    fn fcap(&self, h: u64) -> Result<usize, String> {
+        let v = self.frames.lock().map_err(|e| e.to_string())?;
+        v.get((h.checked_sub(1).ok_or("frame 핸들 0")?) as usize)
+            .map(|(_, cap)| *cap)
+            .ok_or_else(|| format!("frame 핸들 없음: {h}"))
+    }
+
+    /// 판독/기입 공통 경계 검사.
+    fn fchk(&self, h: u64, bytes: usize, what: &str) -> Result<(), String> {
+        let cap = self.fcap(h)?;
+        if bytes > cap {
+            return Err(format!("{what} 범위 초과: need {bytes}B > cap {cap}B (핸들 {h})"));
+        }
+        Ok(())
+    }
+
 
     /// 프레임 활성 q8 준비 — x(프레임 f32) → xq 스크래치. (xq, xq_w)
     fn frame_quant(&self, x: *mut u8, n_in: usize, t: usize) -> Result<(*mut u8, usize), String> {
@@ -4070,16 +4089,19 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
     }
 
     fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
+        self.fchk(h, data.len() * 4, "frame_write")?;
         let p = self.fptr(h)?;
         self.ctx.h2d(p, bytemuck::cast_slice(data))
     }
 
     fn frame_write_u32(&self, h: u64, data: &[u32]) -> Result<(), String> {
+        self.fchk(h, data.len() * 4, "frame_write_u32")?;
         let p = self.fptr(h)?;
         self.ctx.h2d(p, bytemuck::cast_slice(data))
     }
 
     fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
+        self.fchk(h, out.len() * 4, "frame_read")?;
         let p = self.fptr(h)?;
         // 동기 hipMemcpy — 공유 핀 스테이징(d2h 헬퍼)의 재사용 상태에 의존하지
         // 않는다. 프레임 판독은 스텝당 몇 회뿐이라 동기 경로 비용이 무의미하다.
