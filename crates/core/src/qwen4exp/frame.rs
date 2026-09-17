@@ -594,7 +594,7 @@ fn frame_forward_ex(
             eprintln!("# frame layer {il} t={t} (ple={} recr={})", hp.is_ple(il), hp.is_recr(il));
         }
         if il < 4 {
-            frame_ck(acc, f.res_hc, n, t, &format!("L{il}.res_in"));
+            frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
         // 1) PLE (blk.1) — plans/73: 디코드(t=1)는 디바이스 경로. 해시/gather는
         //    스텝 초에 호스트가 끝냈고(GPU 무의존), key/value 투영은 프레임 GEMM,
@@ -806,7 +806,7 @@ fn frame_forward_ex(
         if il == 0 {
         }
     }
-    frame_ck(acc, f.res_hc, n, t, "head.res");
+    frame_ck(acc, f.res_hc, hc * n, t, "head.res");
 
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
     {
@@ -2172,6 +2172,10 @@ fn gdn_frame(
             .map_err(Q4Error::Io)?;
         if il < 4 {
             frame_ck(acc, f.go, v_len, t, &format!("L{il}.gdn_ar"));
+            // 이월 상태(carry) — conv 링과 AR 상태가 청크 간 동일하게 유지되는지.
+            // 입력이 모두 비트 동일한데 AR 출력이 갈리는 경우 이 둘이 유일한 미지수다.
+            frame_ck(acc, f.st_conv[seq][ri], (hp.conv_k - 1) * conv_ch, 1, &format!("L{il}.st_conv"));
+            frame_ck(acc, f.st_gdn[seq][ri], hp.dt_rank * hp.d_state * hp.d_state, 1, &format!("L{il}.st_gdn"));
         }
     }
     sync_mark(acc, "gdn.ar", f.go)?;

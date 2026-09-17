@@ -475,6 +475,42 @@ impl Engine4 {
         Ok(last)
     }
 
+    /// 다중 시퀀스 청크 프리필 — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
+    /// 처리해 무게 패스를 공유한다(plans/74 np4; 슬롯별 프리필이 4회 무게를 읽던 것).
+    /// 실패 시 호출부가 슬롯별 `prefill_greedy` 로 폴백한다.
+    pub fn prefill_multi(
+        &mut self,
+        seqs: &[usize],
+        tokens: &[u32],
+        per_seq: usize,
+    ) -> Result<Vec<u32>, Q4Error> {
+        let acc = self.acc.clone().ok_or(Q4Error::Io("prefill_multi: 가속기 없음".into()))?;
+        if tokens.len() != seqs.len() * per_seq || seqs.len() < 2 {
+            return Err(Q4Error::Io("prefill_multi: 계약 위반".into()));
+        }
+        if self.frame.is_none() {
+            let f = super::frame::Frame4::new(
+                acc.as_ref(), &self.model, &self.seqs, frame_t_max(Some(acc.as_ref())),
+            )?;
+            self.frame = Some(f);
+        }
+        let f = self.frame.as_mut().unwrap();
+        // 상태 동기화 — 슬롯별 prefill_greedy 와 동일 규칙.
+        for &sq in seqs {
+            if f.dirty[sq] {
+                f.sync_states(acc.as_ref(), sq, &self.seqs[sq], self.model.hp.d_state)?;
+            }
+        }
+        let ctx = Ctx { model: &self.model, acc: Some(acc.as_ref()) };
+        let toks = super::frame::frame_forward_prefill_multi(
+            acc.as_ref(), &self.model, &ctx, seqs, &mut self.seqs, f, tokens, per_seq,
+        )?;
+        for &sq in seqs {
+            f.dirty[sq] = false;
+        }
+        Ok(toks)
+    }
+
     /// 디코드 1토큰 — LLM170_FRAME=1이면 프레임 경로 (활성화 GPU 상주).
     /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 + PLE 프리페치 조인·소비.
     /// plans/73(np): 다중 시퀀스 배치 디코드 — 무게 스트리밍 공유(t=seqs.len()).
