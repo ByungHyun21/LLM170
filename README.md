@@ -94,27 +94,6 @@ Same image and question, greedy; model loads excluded.
 | decode 48 tok | ~11.6 t/s | 10.19 t/s |
 | total | ~6.4 s | ~6.3 s |
 
-### Recent improvements (2026-09-16/17)
-
-- **MTP is no longer slower than plain decode.** The speculative verify batch's
-  carry-forward was capped at 16 rows, so a partial acceptance grew the verify
-  batch to 17 rows and every cycle re-executed O(carry) rows — `--spec 3`
-  measured 8.02 t/s against 11.6 t/s plain. Capping the carry at `1 + k + 4`
-  gives **spec2 = 15.4 t/s (+33% over plain)** with the spec stream
-  token-identical to greedy (k=2) and both gates bit-exact.
-- **Batched decode steps now match or beat llama.cpp's**: Flash-Next live t=4
-  step 91-93 ms vs its 97 ms; 27B 141 ms vs its 153.6 ms (this is why the
-  remaining np4 gap is the per-request prefill weight pass, not the batch
-  kernel — see docs/benchmarks.md).
-- **Structural cleanup**: `Accelerator`'s 51-method surface split into five
-  capability traits (GraphCapture / MatmulHost / EwOps / QsaOps / FrameHost)
-  with zero call-site changes; `rawhip/mod.rs` split into `graph.rs` +
-  `ktrace.rs`; 26 dead items and 7 unreferenced shaders removed; `cargo build`
-  is warning-free and `cargo test` is 16/16.
-- Matched-protocol scorecard redone (same host, same client, same prompts,
-  `LLM170_SLOTS=4` vs `-np 4` for np): **prefill wins on both models at every
-  measured length** and tg is at/near parity.
-
 ## Safety: pre-load resource guard
 
 Before any subcommand loads a model, the engine compares the model's size
