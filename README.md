@@ -13,7 +13,9 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full cond
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **367-370** | 326-337 | 290-296 | 11.52 |
-| llama.cpp (ROCm 10) | 340 | **335** | **297** | **11.65** |
+| LLM170 vulkan | 318 | 145 | n/a | 11.26 |
+| llama.cpp hip | 340 | **335** | **297** | **11.65** |
+| llama.cpp vulkan | 343 | 318 | — | 12.05 |
 
 | mode (hip) | t/s |
 |---|---|
@@ -22,11 +24,12 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full cond
 | np4 aggregate | **32.1** |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
-
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **253-275** | **275-278** | **244-249** | **18.60** |
-| llama.cpp (ROCm 10) | 222 | 210 | 200 | 17.43 |
+| LLM170 vulkan | 237 | 277 | 243 | 18.49 |
+| llama.cpp hip | 222 | 210 | 200 | 17.43 |
+| llama.cpp vulkan | 230 | — | — | **22.98** |
 
 | mode (hip) | t/s | llama.cpp |
 |---|---|---|
