@@ -79,6 +79,8 @@ pub struct SlotJob {
     pub n_predict: usize,
     /// MTP 스펙 k (0=off) — serve --spec.
     pub spec_k: usize,
+    /// 샘플링 파라미터 (기본 greedy — None이면 GPU argmax 경로 유지).
+    pub sampler: Option<llm170_core::sampler::SamplerParams>,
     /// 조기 종료 토큰 (EOS + 채팅 템플릿 종결자).
     pub stops: Vec<u32>,
     /// 토큰별 SSE 스트림 채널.
@@ -97,11 +99,13 @@ struct Slot {
     cancelled: bool,
     /// 접두 캐시 — 상태가 구워진 전체 토큰열 (요청 간 유지, plans/24).
     cached: Vec<u32>,
+    /// 슬롯별 샘플러 (요청에서 생성, 토큰마다 상태 갱신).
+    sampler: Option<llm170_core::sampler::Sampler>,
 }
 
 impl Slot {
     fn free() -> Self {
-        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0, cancelled: false, cached: Vec::new() }
+        Slot { job: None, prefilled: 0, next: 0, generated: 0, tokens: Vec::new(), touch: 0, cancelled: false, cached: Vec::new(), sampler: None }
     }
 }
 
@@ -144,6 +148,38 @@ fn open_with_retry(p: &std::path::Path) -> Option<llm170_gguf::GgufFile> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     None
+}
+/// 슬롯 로짓 → 토큰: 활성 샘플러면 sample, 아니면 greedy (동률 최저 인덱스).
+fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
+    match &mut s.sampler {
+        Some(sm) if !sm.is_greedy() => sm.sample(logits),
+        _ => llm170_core::qwen35::greedy(logits),
+    }
+}
+
+/// Q35 np 디코드 — 샘플링 슬롯 포함시 logits 경로(decode), 아니면 GPU argmax 판.
+fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[usize]) {
+    let toks: Vec<u32> = seqs.iter().map(|&i| slots[i].next).collect();
+    if seqs.iter().any(|&i| slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy())) {
+        match e.decode(seqs, &toks) {
+            Ok(rows) => {
+                for (row, &i) in seqs.iter().enumerate() {
+                    let t = pick(&mut slots[i], &rows[row]);
+                    slot_emit(&mut slots[i], t);
+                }
+            }
+            Err(err) => eprintln!("# decode 실패({err}) — 이번 회차 건너뜀"),
+        }
+    } else {
+        match e.decode_np_greedy(seqs, &toks) {
+            Ok(toks) => {
+                for (row, &i) in seqs.iter().enumerate() {
+                    slot_emit(&mut slots[i], toks[row]);
+                }
+            }
+            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
+        }
+    }
 }
 
 /// 연속 배칭 루프 (04-2). 매 반복: ① 큐 drain → LRU 가용 슬롯 배정
@@ -198,7 +234,6 @@ pub fn slot_loop(
             }
             last_wt = now;
         }
-        // ① 새 작업 drain — 전 슬롯 점유 시 큐에 잔류 (bounded: http측 503)
         // 회귀 픽스(2026-09-16): 종전엔 try_recv로 꺼낸 뒤 "슬롯 점유"를 발견하면
         // break했다 — 꺼낸 작업이 그대로 버려져(송신측 drop → 수신측 즉시 Err)
         // 동시 요청이 빈 응랍으로 소실됐다(4동시 중 여럿 drop 실측). 점유 검사를
@@ -226,6 +261,15 @@ pub fn slot_loop(
                 eng.reset_seq(i);
             }
             let prev_cached = std::mem::take(&mut slots[i].cached);
+            let mut sampler_new = j
+                .sampler
+                .clone()
+                .map(llm170_core::sampler::Sampler::new);
+            // 프롬프트 토큰으로 패널티 히스토리 시드 (첫 토큰부터 반영)
+            if let Some(sm) = &mut sampler_new
+                && !sm.is_greedy() {
+                    sm.push_tokens(j.tokens.iter().copied());
+                }
             slots[i] = Slot {
                 job: Some(j),
                 prefilled: reuse,
@@ -235,6 +279,7 @@ pub fn slot_loop(
                 touch: tick,
                 cancelled: false,
                 cached: prev_cached,
+                sampler: sampler_new,
             };
             if std::env::var_os("LLM170_SLOT_DBG").is_some() {
                 eprintln!("# slot-dbg: job assigned to slot{i} reuse={reuse}");
@@ -256,11 +301,15 @@ pub fn slot_loop(
         if !active.is_empty() {
             decoded = true;
             let _dt = std::time::Instant::now();
+            // 샘플링 활성 슬롯 — logits 경로 필요 (GPU argmax 판은 토큰만 회수).
+            // greedy 기본은 종전 최적 경로 유지 (게이트 무변화).
+            let sampling = |s: &Slot| s.sampler.as_ref().is_some_and(|sm| !sm.is_greedy());
             match &mut eng {
                 Engine::Q35(e) => {
-                    // 스펙 슬롯 분리 — spec_step 경로 (plans/21).
+                    // 스펙 슬롯 분리 — spec_step 경로 (plans/21). 샘플링 슬롯은
+                    // 스펙 제외(스펙 검증은 greedy 판정 전제) — 일반 디코드로.
                     let spec_slots: Vec<usize> = active.iter().copied()
-                        .filter(|&i| slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0))
+                        .filter(|&i| slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0) && !sampling(&slots[i]))
                         .collect();
                     if !spec_slots.is_empty() && e.has_mtp() && e.raw_decode.is_some() {
                         // np×spec 병합 (plans/18): 스펙 슬롯 2개 이상이면 한 배치로 검증.
@@ -309,34 +358,28 @@ pub fn slot_loop(
                         let plain: Vec<usize> = active.iter().copied()
                             .filter(|&i| !spec_slots.contains(&i)).collect();
                         if !plain.is_empty() {
-                            let toks: Vec<u32> = plain.iter().map(|&i| slots[i].next).collect();
-                            let seqs: Vec<usize> = plain.clone();
-                            match e.decode_np_greedy(&seqs, &toks) {
-                                Ok(toks) => {
-                                    for (row, &i) in plain.iter().enumerate() {
-                                        slot_emit(&mut slots[i], toks[row]);
-                                    }
-                                }
-                                Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
+                            q35_decode(e, &mut slots, &plain);
                         }
-                    }
                     } else {
-                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-                        let seqs: Vec<usize> = active.clone();
-                        match e.decode_np_greedy(&seqs, &toks) {
-                            Ok(toks) => {
-                                for (row, &i) in active.iter().enumerate() {
-                                    slot_emit(&mut slots[i], toks[row]);
-                                }
-                            }
-                            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
-                        }
+                        q35_decode(e, &mut slots, &active);
                     }
                 }
                 Engine::Q4(e) => {
                     // plans/73(np): 활성 2+ 슬롯은 배치 디코드(무게 스트리밍 공유).
                     // 실패 시 decode_batch 내부가 순차 decode1로 폴백한다.
-                    if active.len() > 1 {
+                    // 샘플링 슬롯 포함시 logits 판으로.
+                    if active.iter().any(|&i| sampling(&slots[i])) {
+                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+                        match e.decode_batch(&active, &toks) {
+                            Ok(rows) => {
+                                for (row, &i) in active.iter().enumerate() {
+                                    let t = pick(&mut slots[i], &rows[row]);
+                                    slot_emit(&mut slots[i], t);
+                                }
+                            }
+                            Err(err) => eprintln!("# batch 실패({err}) — 이번 회차 건너뜀"),
+                        }
+                    } else if active.len() > 1 {
                         let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
                         match e.decode_batch_greedy(&active, &toks) {
                             Ok(toks) => {
@@ -348,9 +391,19 @@ pub fn slot_loop(
                         }
                     } else {
                         for &i in &active {
-                            match e.decode1_greedy(i, slots[i].next) {
-                                Ok(t) => slot_emit(&mut slots[i], t),
-                                Err(err) => eprintln!("# decode1_greedy 실패({err}) — 이번 회차 건너뜀"),
+                            if sampling(&slots[i]) {
+                                match e.decode1(i, slots[i].next) {
+                                    Ok(l) => {
+                                        let t = pick(&mut slots[i], &l);
+                                        slot_emit(&mut slots[i], t);
+                                    }
+                                    Err(err) => eprintln!("# decode1 실패({err}) — 이번 회차 건너뜀"),
+                                }
+                            } else {
+                                match e.decode1_greedy(i, slots[i].next) {
+                                    Ok(t) => slot_emit(&mut slots[i], t),
+                                    Err(err) => eprintln!("# decode1_greedy 실패({err}) — 이번 회차 건너뜀"),
+                                }
                             }
                         }
                     }
@@ -431,9 +484,27 @@ pub fn slot_loop(
                 let (start, logits) = {
                     let end = (slots[i].prefilled + chunk).min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> = slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
+                    // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
+                    // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
+                    let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
                     let r: Result<u32, String> = match &mut eng {
-                        Engine::Q35(e) => e.prefill(i, &part).map(|l| llm170_core::qwen35::greedy(&l)).map_err(|e| e.to_string()),
-                        Engine::Q4(e) => e.prefill_greedy(i, &part).map_err(|e| e.to_string()),
+                        Engine::Q35(e) => e
+                            .prefill(i, &part)
+                            .map(|l| {
+                                if samp {
+                                    pick(&mut slots[i], &l)
+                                } else {
+                                    llm170_core::qwen35::greedy(&l)
+                                }
+                            })
+                            .map_err(|e| e.to_string()),
+                        Engine::Q4(e) => {
+                            if samp {
+                                e.prefill(i, &part).map(|l| pick(&mut slots[i], &l)).map_err(|e| e.to_string())
+                            } else {
+                                e.prefill_greedy(i, &part).map_err(|e| e.to_string())
+                            }
+                        }
                     };
                     (end, r)
                 };
@@ -490,6 +561,14 @@ pub fn slot_loop(
                         eprintln!("# prefix-cache: slot0 reuse {reuse}토큰");
                     }
                     let prev = std::mem::take(&mut slots[0].cached);
+                    let mut sampler_new = j
+                        .sampler
+                        .clone()
+                        .map(llm170_core::sampler::Sampler::new);
+                    if let Some(sm) = &mut sampler_new
+                        && !sm.is_greedy() {
+                            sm.push_tokens(j.tokens.iter().copied());
+                        }
                     slots[0] = Slot {
                         job: Some(j),
                         prefilled: reuse,
@@ -499,6 +578,7 @@ pub fn slot_loop(
                         touch: tick,
                         cancelled: false,
                         cached: prev,
+                        sampler: sampler_new,
                     };
                 }
                 Err(_) => break,
@@ -510,6 +590,9 @@ fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;
+    if let Some(sm) = &mut s.sampler {
+        sm.push_tokens([t]);
+    }
     if let Some(j) = &s.job
         && let Some(p) = &j.progress
             && p.send(t).is_err() {

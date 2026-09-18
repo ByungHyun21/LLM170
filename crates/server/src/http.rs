@@ -215,6 +215,27 @@ fn jmessages_content(body: &str) -> String {
     out
 }
 
+/// 요청 본문에서 샘플링 파라미터 추출 — 미지정시 None (greedy, 종전 동작).
+/// OpenAI 파라미터 명칭: temperature·top_k·top_p·min_p·repeat_penalty·seed.
+fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerParams> {
+    let temperature = jnum(body, "temperature").unwrap_or(0.0) as f32;
+    let top_k = jnum(body, "top_k").unwrap_or(0.0).max(0.0) as usize;
+    let top_p = jnum(body, "top_p").unwrap_or(1.0) as f32;
+    let min_p = jnum(body, "min_p").unwrap_or(0.0) as f32;
+    let repeat_penalty = jnum(body, "repeat_penalty").unwrap_or(1.0) as f32;
+    let seed = jnum(body, "seed").unwrap_or(0.0) as u64;
+    let p = llm170_core::sampler::SamplerParams {
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repeat_penalty,
+        seed,
+        ..Default::default()
+    };
+    if !p.is_greedy() { Some(p) } else { None }
+}
+
 fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Result<(), String> {
     loop {
         let req = match read_request(&mut stream) {
@@ -257,21 +278,21 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                         continue;
                     }
                 };
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, req.path.contains("chat"), Vec::new());
+                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, req.path.contains("chat"), Vec::new(), parse_sampler(&req.body));
             }
             ("POST", "/v1/chat/completions") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0)).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
                 let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![248046]);
+                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![248046], parse_sampler(&req.body));
             }
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
                 let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit_anthropic(&mut stream, tx.clone(), ids, n_predict, stream_mode);
+                run_and_emit_anthropic(&mut stream, tx.clone(), ids, n_predict, stream_mode, parse_sampler(&req.body));
             }
             _ => resp(&mut stream, 404, "application/json", "{\"error\":\"not found\"}"),
         }
@@ -290,6 +311,7 @@ fn run_and_emit(
     stream_mode: bool,
     chat: bool,
     stops: Vec<u32>,
+    sampler: Option<llm170_core::sampler::SamplerParams>,
 ) {
     // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
     // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
@@ -309,6 +331,7 @@ fn run_and_emit(
         tokens: ids,
         n_predict,
         spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
+        sampler,
         stops,
         progress: stream_mode.then_some(ptx),
         out: otx,
@@ -359,6 +382,7 @@ fn run_and_emit_anthropic(
     ids: Vec<u32>,
     n_predict: usize,
     stream_mode: bool,
+    sampler: Option<llm170_core::sampler::SamplerParams>,
 ) {
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
     let (ptx, prx) = std::sync::mpsc::channel::<u32>();
@@ -366,6 +390,7 @@ fn run_and_emit_anthropic(
         tokens: ids,
         n_predict,
         spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
+        sampler,
         stops: vec![248046],
         progress: stream_mode.then_some(ptx),
         out: otx,

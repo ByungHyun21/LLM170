@@ -3,6 +3,7 @@
 pub mod gdn;
 pub mod matmul;
 pub mod qwen35;
+pub mod sampler;
 pub mod qwen4exp;
 pub mod clip;
 pub mod clip_preproc;
