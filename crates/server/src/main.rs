@@ -10,6 +10,7 @@ mod probes;
 mod resource;
 mod http;
 mod tokenize;
+mod unicode_data;
 mod vl;
 
 use std::path::PathBuf;
@@ -128,7 +129,8 @@ fn main() -> ExitCode {
     //   - --model <v> / --model=<v> (serve·infer·vl·bench)
     //   - check의 첫 비플래그 위치인자 (모델 경로)
     //   - GPU 판정: --backend gpu, --gpu-runtime; check는 기본이 gpu.
-    {
+    // gguf-dump·tokenize는 메타데이터만 읽는다(무게 미적재) — 가드 제외.
+    if !matches!(args.first().map(String::as_str), Some("gguf-dump") | Some("tokenize")) {
         let sub = args.first().map(String::as_str);
         let mut model = ma.model.clone();
         let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
@@ -180,6 +182,7 @@ fn main() -> ExitCode {
         Some("vl") => vl::cmd_vl(&ma.rest, &ma),
         Some("bench") => bench::cmd_bench(&ma.rest, &ma),
         Some("check") => probes::run_check(&args[1..]),
+        Some("tokenize") => cmd_tokenize(&ma),
         Some("w4a8-check") => cmd_w4a8_check(&args[1..]),
         Some("dequant") => cmd_dequant(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -270,6 +273,56 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `llm170 tokenize --model <gguf> [--no-special] (--text <s> | --file <f> | --stdin)`
+/// llama-tokenize 대응 출력 `[id, ...]` — plans/83 A 검증·디버깅용.
+fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
+    let Some(model) = ma.model.clone() else {
+        eprintln!("error: --model required");
+        return ExitCode::from(2);
+    };
+    let model_path = PathBuf::from(model);
+    // part1 메타 → 실패시 part2 (serve와 동일 규칙)
+    let part2 = {
+        let stem = model_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.contains("-00001-of-") {
+            Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
+        } else {
+            None
+        }
+    };
+    let tok = match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: tokenizer load: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let no_special = ma.rest.iter().any(|a| a == "--no-special");
+    let text = if let Some(i) = ma.rest.iter().position(|a| a == "--text") {
+        ma.rest.get(i + 1).cloned().unwrap_or_default()
+    } else if let Some(i) = ma.rest.iter().position(|a| a == "--file") {
+        let p = ma.rest.get(i + 1).cloned().unwrap_or_default();
+        match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: read {p}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("error: stdin read");
+            return ExitCode::FAILURE;
+        }
+        buf
+    };
+    let ids = tok.encode_opts(&text, !no_special);
+    println!("[{}]", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "));
+    ExitCode::SUCCESS
 }
 
 fn cmd_gguf_dump(args: &[String]) -> ExitCode {
