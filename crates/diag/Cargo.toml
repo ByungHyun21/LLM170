@@ -1,0 +1,11 @@
+[package]
+name = "llm170-diag"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# profiler span 게이트 — backend-gpu(core)의 profile feature와 동일 이름.
+profile = []
+
+[dependencies]

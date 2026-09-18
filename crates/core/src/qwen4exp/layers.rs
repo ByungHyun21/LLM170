@@ -275,13 +275,18 @@ impl Engine4 {
             if trace {
                 nan_guard(&mix2, "hc_ffn_mix", il);
                 // 값 폭발 추적 — max|x| (Inf 직전 값도 is_finite 통과)
-                let mx = mix2
+                let _mx = mix2
                     .iter()
                     .flat_map(|r| r.iter())
                     .fold(0.0f32, |a, &v| if v.abs() > a { v.abs() } else { a });
-                eprintln!("# layer {il} hc_ffn_mix max|x|={mx:.3e} t={t_len}");
             }
             let ffn_out = stage!(moe, stages::moe_ffn(&ctx, il, &mix2)?);
+            if llm170_diag::fp::enabled() {
+                llm170_diag::fp::fp_record(
+                    &format!("L{il}.ffn_out"),
+                    &ffn_out.iter().flat_map(|r| r.iter()).copied().collect::<Vec<_>>(),
+                );
+            }
             if trace {
                 nan_guard(&ffn_out, "moe_out", il);
             }

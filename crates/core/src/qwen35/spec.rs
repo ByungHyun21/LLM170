@@ -293,6 +293,7 @@ impl Engine {
         let mut t_draft = std::time::Duration::ZERO;
         let mut t_commit = std::time::Duration::ZERO;
         let mut t_verify = std::time::Duration::ZERO;
+        #[allow(unused_assignments)]
         let mut t_state = std::time::Duration::ZERO;
         let t_cyc = std::time::Instant::now();
 
@@ -463,7 +464,7 @@ impl Engine {
             }
         }
         // ── 시퀀스별 수용 판정 (신규 세그먼트: next+drafts)
-        let mut all_full = true;
+        let mut _all_full = true;
         let mut results: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
         let mut new_kept: Vec<usize> = Vec::with_capacity(n_seq); // next+matched drafts 수
         for si in 0..n_seq {
@@ -483,7 +484,7 @@ impl Engine {
                 let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { am.len() };
                 accepted.push(am[g1 - 1]); // 보너스 (마지막 행)
             } else {
-                all_full = false;
+                _all_full = false;
             }
             // kept new rows = next + matched drafts (보너스 제외)
             let matched = if full { drafts.len() } else { accepted.len().saturating_sub(1) };
@@ -497,7 +498,7 @@ impl Engine {
         // 해 verify 배치를 12→59행까지 부풀렸다(6.78 t/s의 주원인).
         let mut seq_full: Vec<bool> = Vec::with_capacity(n_seq);
         {
-            let mut all_full = true;
+            let mut _all_full = true;
             for si in 0..n_seq {
                 let g0 = group_starts[si];
                 let next_off = carried[si].len();
@@ -507,10 +508,10 @@ impl Engine {
                 });
                 seq_full.push(full);
                 if !full {
-                    all_full = false;
+                    _all_full = false;
                 }
             }
-            if all_full {
+            if _all_full {
                 for si in 0..n_seq {
                     self.seqs[seqs[si]].gdn_carried = Vec::new();
                 }

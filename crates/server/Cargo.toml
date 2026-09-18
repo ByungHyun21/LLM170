@@ -8,6 +8,7 @@ name = "llm170"
 path = "src/main.rs"
 
 [dependencies]
+llm170-diag = { path = "../diag" }
 half = "2"
 memmap2 = "0.9"
 llm170-gguf = { path = "../gguf" }

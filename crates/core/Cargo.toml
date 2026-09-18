@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+llm170-diag = { path = "../diag" }
 image = { version = "0.25.10", features = ["jpeg", "png"] }
 llm170-gguf = { path = "../gguf" }
 llm170-profiler = { path = "../profiler" }

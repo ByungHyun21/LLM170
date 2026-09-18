@@ -85,6 +85,25 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t_b = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64usize);
             llm170_backend_gpu::rawhip::q4acc::mm_row_check(std::path::Path::new(&path), &tn, t_a, t_b)
         }
+        "diag" => {
+            // plans/82: 지문 비교 — `llm170 diag diff <A> <B>`
+            if args.first().map(String::as_str) == Some("diff") {
+                let (pa, pb) = match (args.get(1), args.get(2)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Some({
+                        eprintln!("사용법: llm170 diag diff <A> <B>");
+                        ExitCode::FAILURE
+                    }),
+                };
+                match llm170_diag::fp_diff(pa, pb) {
+                    Ok(r) if r.mismatch_count == 0 => Ok(format!("{r}")),
+                    Ok(r) => Ok(format!("{r}\nDIVERGENCE DETECTED")),
+                    Err(e) => Err(e),
+                }
+            } else {
+                Err("diag: 하위커맨드 diff <A> <B> 만 지원".into())
+            }
+        }
         "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
         "wc-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf".into());

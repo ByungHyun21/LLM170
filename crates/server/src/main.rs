@@ -113,6 +113,7 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 }
 
 fn main() -> ExitCode {
+    llm170_diag::fp::init_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.
     let ma = match parse_model_args(&args[1..]) {

@@ -499,10 +499,15 @@ dependencies = [
  "image",
  "libc",
  "llm170-backend-gpu",
+ "llm170-diag",
  "llm170-gguf",
  "llm170-profiler",
  "memmap2",
 ]
+
+[[package]]
+name = "llm170-diag"
+version = "0.1.0"
 
 [[package]]
 name = "llm170-gguf"
@@ -524,6 +529,7 @@ dependencies = [
  "image",
  "llm170-backend-gpu",
  "llm170-core",
+ "llm170-diag",
  "llm170-gguf",
  "llm170-profiler",
  "log",
