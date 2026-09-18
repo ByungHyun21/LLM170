@@ -88,9 +88,9 @@ np4 aggregate — `llm170 bench --np 4` (same convention as the 27B table).
 
 | backend | pp512 agg | pp2048 agg | tg128 agg |
 |---|---|---|---|
-| LLM170 hip | **248-250** | **287-288** | 18.2-18.8 |
+| LLM170 hip | **248-250** | **287-288** | **45.9** |
 | LLM170 vulkan | 248.1 | 285.1 | 18.6 |
-| llama.cpp (ROCm 10) | 20.6 | 229.8 | **41.1-41.7** *(HTTP†)* |
+| llama.cpp (ROCm 10) | 20.6 | 229.8 | 41.1-41.7 *(HTTP†)* |
 
 Decode modes (FN; the model has no nextn/MTP head, so MTP rows are
 structurally inapplicable):
@@ -98,7 +98,7 @@ structurally inapplicable):
 | mode | LLM170 hip | LLM170 vulkan | llama.cpp (ROCm 10) |
 |---|---|---|---|
 | tg single | 18.5-18.6 | 18.49 | 17.43 / 13.88 (@4k/@16k) |
-| np4 aggregate | 18.2-18.8 | 18.6 | 41.1-41.7 *(HTTP†)* |
+| np4 aggregate | **45.9** | 18.6 | 41.1-41.7 *(HTTP†)* |
 
 ### Vision (mmproj), 27B — 2026-09-17
 
