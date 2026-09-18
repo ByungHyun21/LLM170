@@ -21,8 +21,7 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full cond
 |---|---|---|---|---|
 | tg single | 11.5 | 11.26 | 11.65 | 12.05 |
 | MTP single (k=2) | **14.4** | — | ~12 | — |
-| np4 aggregate | **32.1** | 10.6 | 25.2 *(HTTP†)* | — |
-| MTP + np4 | 6.5-6.8 | n/a | 15.5 *(HTTP†)* | — |
+| MTP + np4 | 7.2 | n/a | 15.5 *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
