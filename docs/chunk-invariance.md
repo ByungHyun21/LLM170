@@ -6,10 +6,8 @@ closed — an early row cannot depend on later tokens — so any difference
 between chunk sizes is a defect, not a tolerance.
 
 This note records how we verify that property in this codebase, what the
-verification cleared, and what remains open. It exists because a
-user-visible failure (Flash-Next output degrading into repetition at
-`LLM170_Q4_CHUNK=64`, independent of prompt content) traced back to a
-violation of this contract rather than to a broken kernel.
+verification cleared, what remains open, and the current state of the
+investigation (2026-09-18, plans/80).
 
 ## Rule
 
@@ -32,47 +30,78 @@ violation of this contract rather than to a broken kernel.
    and compare generated tokens. Cheap, but only sensitive when the model is
    in a contractive regime — use a real prompt.
 2. **Frame checkpoints.** `LLM170_NP_CHECKSUM=1` prints, per layer and stage,
-   `sum/v0/mid0/last0` samples of the resident frame buffers
-   (`frame_ck`). Because `last0` is always the last row of the current call,
-   two chunkings can be compared at a common token boundary.
-3. **Kernel micro-probes.** `rawhip::probes::gdn_ar_invariance` and
-   `gdn_conv_invariance` feed a synthetic sequence to the GDN AR / conv ops
-   as one `t`-row call and as `T/per` row-band calls, then compare both the
-   carried state and the output. No model, no weights, seconds to run. These
-   are the decisive tests: they isolate a kernel from the frame's
-   orchestration.
+   `sum/v0/mid0/last0` samples of the resident frame buffers (`frame_ck`).
+   `LLM170_NP_ROWS=<tags>` additionally dumps per-row bit samples, and
+   `LLM170_NP_ROW0FULL=1` dumps the first 8 rows of each tagged buffer in
+   full (hex bits). Because `last0` is always the last row of the current
+   call, two chunkings can be compared at a common token boundary.
+3. **Kernel micro-probes.** `rawhip::probes::gdn_ar_invariance` /
+   `gdn_conv_invariance` (synthetic sequence, no model), `llm170 moe-row-check`
+   and `llm170 mm-row-check` (real weights; run the same input rows through
+   two row counts and bit-compare the shared rows).
 
-## What the probes cleared (2026-09-17)
+## What the probes cleared (2026-09-17/18)
 
-- GDN AR: state and output bit-identical across `t`/`per` combinations up to
-  `t=208` — 0 differing elements.
-- GDN conv (`gdn_conv_t2` + `gdn_conv_state` two-launch form): ring and
-  output bit-identical across the same combinations.
-- Dense projection `frame_mm_group` with real weights (qkv/z/beta/alpha of
-  layer 0): bit-identical for `1×64` vs `4×16`.
+- GDN AR / GDN conv kernels: state and output bit-identical across `t`/`per`
+  combinations (sequential per-row recursion; association order fixed).
+- Dense projections `frame_mm`/`frame_mm_group` (Q8_0, F32 tested): every
+  element of the shared rows bit-identical between t=16 and t=64 launches
+  (`mm-row-check`).
+- Expert stack GEMMs `frame_moe_gemm` (Q4K gate/up, Q5_1 down): bit-identical
+  shared rows at rows 160 vs 640, including collision-heavy ids
+  (`moe-row-check`).
+- MoeTop10 / gather / scatter / quant_q8: row-local, deterministic kernels.
 
-So the row-count dependence observed in the frame path is **not** in those
-kernels' arithmetic.
+## Current state of the defect (2026-09-18)
 
-## Open leads (as of 2026-09-17)
+Two distinct phenomena remain; the catastrophic collapse is **not** a race.
 
-- The frame path shows cross-call sensitivity: adding unrelated verification
-  blocks to a harness changes later runs' results. That points at cached,
-  geometry-keyed machinery in the frame rather than at arithmetic, e.g. the
-  lazily created row-view tables (`ensure_np_views`, `ensure_pre_views`) and
-  the size-keyed scratch pool in `rawctx`.
-- `moe_frame_np` restores the ambient row count to the *sequence* count, not
-  to the token count. It is currently masked by the caller restoring `t`
-  right after, but it is the kind of implicit state this document warns
-  about; prefer passing the row count explicitly.
+### 1. Catastrophic collapse — deterministic, multi-chunk only
+
+`LLM170_Q4_CHUNK=63/64` on a 208-token prompt collapses into repetition.
+Facts established on a verified-neutral build:
+
+- A **single** t=64 call is clean: on a 64-token prompt, chunk=64 and
+  chunk=512 (both one call, t=64) produce bit-identical checksums and the
+  normal stream. The chunk *value* does not leak into the frame path by
+  itself.
+- The collapse requires the **multi-call structure** (64,64,64,16).
+- `LLM170_FRAME_SYNC=1` (a device drain after every frame stage) does **not**
+  fix the collapse — it is not an async-ordering race.
+- The GDN/AR state carry between calls was re-verified bit-identical by the
+  kernel probes.
+
+### 2. Micro-divergence at equal inputs — timing/geometry sensitive
+
+On a 64-token prompt, comparing a t=16 first call against a t=64 single call
+(same first 16 tokens): every input of layer 2's MoE is **bit-identical**
+(mixf/mxsel full rows, ids, weights), yet the gate-GEMM output row 0 differs
+in all 640 elements (~1e-3 relative) — while the same GEMM in isolation is
+provably row-count invariant. Whether the divergence appears depends on
+
+- whether checkpoint reads (`LLM170_NP_CHECKSUM`) are enabled, and
+- whether `HIP_LAUNCH_BLOCKING=1` is set (both together: fully identical),
+
+which is characteristic of a memory-level defect (out-of-bounds read/write
+into a neighboring frame buffer) whose visibility depends on buffer geometry
+(`t_max` = chunk when `LLM170_Q4_CHUNK` is set) and pipeline timing, not of
+kernel arithmetic.
+
+Next step: matched-call state comparison — run the 208-token prompt at
+chunk=64 and compare the device state after call k against the state after
+the equivalent single call on the same token prefix; the first call whose
+end state diverges brackets the defect.
 
 ## Reproduction
 
 ```sh
-# same prompt, two chunk sizes, Flash-Next — 64 collapses into repetition
+# collapse (multi-chunk): 208-token Korean prompt, chunk 63/64
 LLM170_Q4_CHUNK=64  llm170 infer --model <fn.gguf> --prompt-tokens <ids> --n-predict 16 ...
-LLM170_Q4_CHUNK=512 llm170 infer --model <fn.gguf> --prompt-tokens <ids> --n-predict 16 ...
+LLM170_Q4_CHUNK=512 llm170 infer ...   # normal stream
 
-# kernel-level invariance (seconds, no model)
+# single-call t=64 is clean: 64-token prompt, chunk 64 vs 512 → identical
+# kernel-level invariance (seconds):
 cargo test --release -p llm170-backend-gpu --lib -- --nocapture gdn_ar_t_invariance
+llm170 moe-row-check <model> blk.0.ffn_gate_exps.weight 16 64
+llm170 mm-row-check   <model> blk.0.attn_qkv.weight 16 64
 ```

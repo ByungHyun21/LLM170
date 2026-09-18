@@ -746,6 +746,35 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     }
                 }
             }
+            if env_on("LLM170_MOE_DUMP") {
+                // 진단(plans/80): GEMM 입력 x(원본 f32)와 xq(양자화) 해시를
+                // 같이 찍는다 — x가 같은데 xq가 다르면 quant/캐시, x부터 다르면
+                // 상류가 범인.
+                self.ctx.sync().map_err(|e| e.to_string())?;
+                let mut rx = vec![0u32; rows];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut rx), rowexp_d as *const u8)?;
+                let nrows = rows.min(64);
+                let mut xh = vec![0u32; nrows * 4];
+                for r in 0..nrows {
+                    self.ctx.d2h(
+                        bytemuck::cast_slice_mut(&mut xh[r * 4..r * 4 + 4]),
+                        unsafe { xp.add(r * n_in * 4) } as *const u8,
+                    )?;
+                }
+                let mut xqw = vec![0u32; nrows * 4];
+                for r in 0..nrows {
+                    self.ctx.d2h(
+                        bytemuck::cast_slice_mut(&mut xqw[r * 4..r * 4 + 4]),
+                        unsafe { xsrc0.add(r * xq_w * 4) } as *const u8,
+                    )?;
+                }
+                eprintln!(
+                    "# moedump rows={rows} rowexp[:8]={:?} x64_sum={:016x} xq64_sum={:016x}",
+                    &rx[..rx.len().min(8)],
+                    xh.iter().fold(0u64, |a, &w| a.wrapping_add(w as u64)),
+                    xqw.iter().fold(0u64, |a, &w| a.wrapping_add(w as u64))
+                );
+            }
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
                 n_out.div_ceil(16) as u32,

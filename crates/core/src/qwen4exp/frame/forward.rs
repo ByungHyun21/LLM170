@@ -290,6 +290,9 @@ pub(super) fn frame_forward_ex(
         // 4) hc ffn mix + MoE
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
+        if il < 4 {
+            frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
+        }
         if il == 0 {
             dbg("mix2", acc, f.mix, n * t);
         }
@@ -922,6 +925,10 @@ pub(super) fn moe_frame(
         op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
     }
     sync_mark(acc, "moe.top10", f.mids)?;
+    if il < 4 {
+        frame_ck(acc, f.mids, k_sel, t, &format!("L{il}.mids"));
+        frame_ck(acc, f.mwt, k_sel, t, &format!("L{il}.mwt"));
+    }
     let fs: &dyn FrameState = acc;
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
@@ -941,8 +948,14 @@ pub(super) fn moe_frame(
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
         sync_mark(acc, "moe.gather", f.mxsel)?;
+        if il < 4 {
+            frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
+        }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
+        if il < 4 {
+            frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
+        }
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: t * k_sel * n_ff })?;
@@ -953,6 +966,9 @@ pub(super) fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
+        if il < 4 {
+            frame_ck(acc, f.mout, n, t, &format!("L{il}.moe_sc"));
+        }
     if !stage_skipped("moe.shared") {
         let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
         let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;

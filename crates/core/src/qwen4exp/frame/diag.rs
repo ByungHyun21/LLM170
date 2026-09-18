@@ -34,9 +34,17 @@ pub fn stage_skipped(name: &str) -> bool {
 pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &str) {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_CHECKSUM").is_some());
+    // 행 덤프 모드 — LLM170_NP_ROWS="L1.gdn_ar,L2.moe_sc" 로 지정 태그의
+    // 매 행 첫 원소를 출력한다. 청크 경계 행 정렬 비교(어느 행부터 갈리는지)용.
+    static ROWS: std::sync::LazyLock<Option<Vec<String>>> = std::sync::LazyLock::new(|| {
+        std::env::var("LLM170_NP_ROWS").ok().map(|v| {
+            v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>()
+        })
+    });
     if !*ON {
         return;
     }
+    let rows_on = ROWS.as_ref().is_some_and(|r| r.iter().any(|x| x == tag));
     let mut v = vec![0.0f32; n * t];
     if acc.frame_read(h, &mut v).is_ok() {
         let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -46,6 +54,38 @@ pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &
             "[npck] {tag} t={t} sum={s:.6} v0={:.6} mid0={mid:.6} last0={last:.6}",
             v[0]
         );
+        if rows_on {
+            let cap = t.min(720);
+            // 행당 4표본(첫·둘째·100번째·끝 원소) — 요소 축 커버리지.
+            let e1 = 1.min(n.saturating_sub(1));
+            let e2 = 100.min(n.saturating_sub(1));
+            let e3 = n.saturating_sub(1);
+            let vals: Vec<String> = (0..cap)
+                .map(|r| {
+                    let b = r * n;
+                    format!(
+                        "{:08x},{:08x},{:08x},{:08x}",
+                        v[b].to_bits(),
+                        v[b + e1].to_bits(),
+                        v[b + e2].to_bits(),
+                        v[b + e3].to_bits()
+                    )
+                })
+                .collect();
+            eprintln!("[nprd] {tag} t={t} n={n} {}", vals.join(" "));
+        }
+        if rows_on && std::env::var_os("LLM170_NP_ROW0FULL").is_some() {
+            // 앞 8행 전체(≤2560원소) 비트 덤프 — 어느 행·어느 요소부터 갈리는지.
+            let full = n.min(2560);
+            let rows_n = t.min(8);
+            for r in 0..rows_n {
+                let vals: Vec<String> = v[r * n..r * n + full]
+                    .iter()
+                    .map(|x| format!("{:08x}", x.to_bits()))
+                    .collect();
+                eprintln!("[npr0] {tag} r={r} n={n} {}", vals.join(" "));
+            }
+        }
     }
 }
 

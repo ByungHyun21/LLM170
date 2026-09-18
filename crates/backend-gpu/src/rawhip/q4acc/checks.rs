@@ -508,3 +508,145 @@ pub fn check_tensor(
         100.0 * bit_eq as f64 / n as f64
     ))
 }
+
+/// `moe-row-check <model> <tensor> [t_a] [t_b]` — 전문가 스택 GEMM(frame_moe_gemm)
+/// 의 행 수 불변성 프로브. 동일 x·ids 앞부분(rows_a = t_a·k_sel)을 t_a와 t_b
+/// 두 호출로 계산해 공유 행의 출력을 비트 대조한다. 청크 불변성 결함(plans/80)
+/// 의 발원지 특정용 — GEMM이 행 수에 무관하면 bit_eq=전부.
+pub fn moe_row_check(
+    model: &std::path::Path,
+    tensor: &str,
+    t_a: usize,
+    t_b: usize,
+) -> Result<String, String> {
+    use llm170_core::matmul::{FrameHost, FrameState};
+    let m = llm170_core::qwen4exp::Model4::load(model).map_err(|e| e.to_string())?;
+    let hp = &m.hp;
+    let w = m.w(tensor).ok_or_else(|| format!("텐서 없음: {tensor}"))?;
+    let n_in = w.n_in as usize;
+    let k_sel = hp.n_expert_used;
+    let ne = hp.n_expert;
+    let n_out = (w.n_out as usize) / ne;
+    let (rows_a, rows_b) = (t_a * k_sel, t_b * k_sel);
+    if rows_a == 0 || rows_b < rows_a {
+        return Err(format!("moe-row-check: t_b·k_sel({rows_b}) >= t_a·k_sel({rows_a}) 필요"));
+    }
+    // 결정적 입력 (LCG, ±0.5) — ids는 [0, ne) 균등.
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let x: Vec<f32> = (0..rows_b * n_in).map(|_| lcg()).collect();
+    // 충돌-중심 ids — 실제 라우팅(토큰×k_sel 픽)은 같은 전문가가 여러 번 뽑힌다.
+    // 초기판(준정렬 ids)은 그룹화 충돌 경로를 못 덮었다(2026-09-18 재현).
+    let ids: Vec<u32> = (0..rows_b).map(|i| ((i % 37) as u32) % ne as u32).collect();
+    let acc = Q4Acc::new()?;
+    let hx = acc.frame_alloc(rows_b * n_in)?;
+    let hids = acc.frame_alloc(rows_b)?;
+    let hoa = acc.frame_alloc(rows_a * n_out)?;
+    let hob = acc.frame_alloc(rows_b * n_out)?;
+    acc.frame_write(hx, &x)?;
+    acc.frame_write_u32(hids, &ids)?;
+    let ws = llm170_core::matmul::Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out };
+    acc.frame_begin(t_a);
+    acc.frame_moe_gemm(hx, &ws, hids, hoa, ne, k_sel)?;
+    acc.frame_begin(t_b);
+    acc.frame_moe_gemm(hx, &ws, hids, hob, ne, k_sel)?;
+    let mut oa = vec![0.0f32; rows_a * n_out];
+    let mut ob = vec![0.0f32; rows_b * n_out];
+    acc.frame_read(hoa, &mut oa)?;
+    acc.frame_read(hob, &mut ob)?;
+    let (mut max_abs, mut bit_eq, mut first) = (0.0f64, 0usize, None);
+    for r in 0..rows_a {
+        for c in 0..n_out {
+            let i = r * n_out + c;
+            let (a, b) = (oa[i], ob[i]);
+            if a.to_bits() == b.to_bits() {
+                bit_eq += 1;
+            } else if first.is_none() {
+                first = Some((r, c, a, b));
+            }
+            max_abs = max_abs.max((a - b).abs() as f64);
+        }
+    }
+    let n = rows_a * n_out;
+    let mut s = format!(
+        "moe-row-check {tensor} ty={:?} rows {rows_a} vs {rows_b} (t {t_a} vs {t_b}): bit_eq={bit_eq}/{n}",
+        w.ty
+    );
+    if let Some((r, c, a, b)) = first {
+        s.push_str(&format!(" max_abs={max_abs:.3e} FIRST-DIFF row={r} col={c} a={a:.6e} b={b:.6e}"));
+    } else {
+        s.push_str(" — 완전 비트 동일");
+    }
+    Ok(s)
+}
+
+/// `mm-row-check <model> <tensor> [t_a] [t_b]` — 밀도 GEMM(frame_mm)의 행 수
+/// 불변성 프로브. 동일 x 앞 t_a행을 t_a/t_b 두 호출로 계산해 비트 대조.
+/// route/qkv 등 frame_mm_group이 쓰는 계열(plans/80 청크 불변성).
+pub fn mm_row_check(
+    model: &std::path::Path,
+    tensor: &str,
+    t_a: usize,
+    t_b: usize,
+) -> Result<String, String> {
+    use llm170_core::matmul::{FrameHost, FrameState};
+    let m = llm170_core::qwen4exp::Model4::load(model).map_err(|e| e.to_string())?;
+    let w = m.w(tensor).ok_or_else(|| format!("텐서 없음: {tensor}"))?;
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    if t_b <= t_a || t_a == 0 {
+        return Err(format!("mm-row-check: t_b({t_b}) > t_a({t_a}) > 0 필요"));
+    }
+    let mut seed = 0xD1B5_4A32_D192_ED5u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+    };
+    let x: Vec<f32> = (0..t_b * n_in).map(|_| lcg()).collect();
+    let acc = Q4Acc::new()?;
+    let hx = acc.frame_alloc(t_b * n_in)?;
+    let hoa = acc.frame_alloc(t_a * n_out)?;
+    let hob = acc.frame_alloc(t_b * n_out)?;
+    acc.frame_write(hx, &x)?;
+    let ws = llm170_core::matmul::Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out };
+    acc.frame_begin(t_a);
+    acc.frame_mm(hx, &ws, hoa, t_a)?;
+    acc.frame_begin(t_b);
+    acc.frame_mm(hx, &ws, hob, t_b)?;
+    let mut oa = vec![0.0f32; t_a * n_out];
+    let mut ob = vec![0.0f32; t_b * n_out];
+    acc.frame_read(hoa, &mut oa)?;
+    acc.frame_read(hob, &mut ob)?;
+    let (mut max_ulp, mut bit_eq, mut first) = (0i64, 0usize, None);
+    for r in 0..t_a {
+        for c in 0..n_out {
+            let i = r * n_out + c;
+            let (a, b) = (oa[i], ob[i]);
+            if a.to_bits() == b.to_bits() {
+                bit_eq += 1;
+            } else {
+                let ulp = (a.to_bits() as i64 - b.to_bits() as i64).abs();
+                max_ulp = max_ulp.max(ulp);
+                if first.is_none() {
+                    first = Some((r, c, a, b, ulp));
+                }
+            }
+        }
+    }
+    let n = t_a * n_out;
+    let mut s = format!(
+        "mm-row-check {tensor} ty={:?} [{n_out}x{n_in}] t {t_a} vs {t_b}: bit_eq={bit_eq}/{n}",
+        w.ty
+    );
+    if let Some((r, c, a, b, ulp)) = first {
+        s.push_str(&format!(
+            " max_ulp={max_ulp} FIRST-DIFF row={r} col={c} a={a:.7e} b={b:.7e} ulp={ulp}"
+        ));
+    } else {
+        s.push_str(" — 완전 비트 동일");
+    }
+    Ok(s)
+}
