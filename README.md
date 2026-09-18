@@ -14,14 +14,15 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full cond
 |---|---|---|---|---|
 | LLM170 hip | **367-370** | 326-337 | 290-296 | 11.52 |
 | LLM170 vulkan | 318 | 145 | n/a | 11.26 |
-| llama.cpp hip | 340 | **335** | **297** | **11.65** |
-| llama.cpp vulkan | 343 | 318 | — | 12.05 |
+| llama.cpp hip | 340 | **335** | **297** | 11.65 |
+| llama.cpp vulkan | 343 | 318 | — | **12.05** |
 
-| mode (hip) | t/s |
-|---|---|
-| tg single | 11.5 |
-| MTP single (k=2) | 14.4 |
-| np4 aggregate | **32.1** |
+| mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
+|---|---|---|---|---|
+| tg single | 11.5 | 11.26 | 11.65 | 12.05 |
+| MTP single (k=2) | **14.4** | — | ~12 | — |
+| np4 aggregate | **32.1** | 10.6 | 25.2 *(HTTP†)* | — |
+| MTP + np4 | 6.5-6.8 | n/a | 15.5 *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
@@ -31,10 +32,10 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full cond
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan | 230 | — | — | **22.98** |
 
-| mode (hip) | t/s | llama.cpp |
-|---|---|---|
-| tg single | 18.6 | 17.4 |
-| np4 aggregate | **45.9** | 41.1 |
+| mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
+|---|---|---|---|---|
+| tg single | **18.60** | 18.49 | 17.43 | 22.98 |
+| np4 aggregate | **45.9** | 18.6 | 41.1 *(HTTP†)* | — |
 
 ## Build & run
 
