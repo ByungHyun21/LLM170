@@ -289,6 +289,12 @@ impl Engine {
             self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
         }
         let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
+        let tm_on = std::env::var_os("LLM170_SPEC_TIME").is_some();
+        let mut t_draft = std::time::Duration::ZERO;
+        let mut t_commit = std::time::Duration::ZERO;
+        let mut t_verify = std::time::Duration::ZERO;
+        let mut t_state = std::time::Duration::ZERO;
+        let t_cyc = std::time::Instant::now();
 
         // ── 시퀀스별 draft 체인
         let mut all_drafts: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
@@ -317,6 +323,9 @@ impl Engine {
                 }
                 all_drafts.push(drafts);
             }
+        }
+        if tm_on {
+            t_draft = t_cyc.elapsed();
         }
 
         // ── 배치 조립: [s0: carried+next+drafts | ...] — carried 포함 그룹 위치 = pos - carried
@@ -390,6 +399,9 @@ impl Engine {
         let mut rows: Vec<f32> = Vec::new();
         let mut group_starts = Vec::with_capacity(n_seq);
         let mut group_pos: Vec<usize> = Vec::with_capacity(n_seq); // 그룹 첫 행 위치
+        if tm_on {
+            t_commit = t_cyc.elapsed() - t_draft;
+        }
         for si in 0..n_seq {
             group_starts.push(rows.len() / n_e);
             let pos0 = self.seqs[seqs[si]].pos as usize - carried[si].len();
@@ -401,6 +413,9 @@ impl Engine {
             }
         }
         rd.gdn_snapshot().map_err(ModelError::Accel)?;
+        if tm_on {
+            t_commit = t_cyc.elapsed() - t_draft;
+        }
         let mut am: Vec<u32> = Vec::new();
         let mut h_all: Vec<f32> = Vec::new();
         if std::env::var_os("LLM170_MS_SEQ").is_some() {
@@ -418,8 +433,12 @@ impl Engine {
                 h_all.extend_from_slice(&h2);
             }
         } else {
+            let t_v0 = std::time::Instant::now();
             rd.verify_batch_ms(seqs, &group_pos, &group_starts, &rows, &mut am, &mut h_all)
                 .map_err(ModelError::Accel)?;
+            if tm_on {
+                t_verify += t_v0.elapsed();
+            }
         }
         if std::env::var_os("LLM170_SPEC_DBG").is_some() {
             eprintln!("  [msV] groups={group_starts:?}");
@@ -521,6 +540,19 @@ impl Engine {
                 prev_h.copy_from_slice(&h_all[(g0 + r) * n_e..(g0 + r + 1) * n_e]);
             }
             self.seqs[seqs[si]].mtp_pending_h = prev_h;
+        }
+        if tm_on {
+            t_state = t_cyc.elapsed() - t_draft - t_commit - t_verify;
+            eprintln!(
+                "[specT] cyc={:6.1}ms draft={:6.1} commit={:6.1} verify={:6.1} state={:6.1} rows={} kept={:?}",
+                t_cyc.elapsed().as_secs_f64() * 1e3,
+                t_draft.as_secs_f64() * 1e3,
+                t_commit.as_secs_f64() * 1e3,
+                t_verify.as_secs_f64() * 1e3,
+                t_state.as_secs_f64() * 1e3,
+                rows.len() / n_e,
+                new_kept
+            );
         }
         Ok(results)
     }
