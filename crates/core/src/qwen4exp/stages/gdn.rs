@@ -5,7 +5,7 @@ use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
 use crate::ops::{l2_norm, rms_norm, sigmoid, silu, softplus};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
     /// GDN층 — qwen35와 동일 모듈, 차이: z-gate가 sigmoid.
     pub fn gdn_layer(

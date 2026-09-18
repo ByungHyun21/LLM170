@@ -317,7 +317,7 @@ pub(super) fn frame_forward_np_ex(
         Vec::new()
     };
 
-    let ck_on = std::env::var_os("LLM170_NP_CHECKSUM").is_some();
+    let ck_on = llm170_diag::dump::opts().checksum;
     let ck = |acc: &dyn Accelerator, h: u64, n2: usize, tag: &str| {
         if !ck_on { return; }
         let mut v = vec![0.0f32; n2];

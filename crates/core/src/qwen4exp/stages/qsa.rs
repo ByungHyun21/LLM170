@@ -5,7 +5,7 @@ use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
 use crate::ops::{rms_norm, rope_head, sigmoid};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
     /// 토큰 1개의 CPU 마스크드 GQA + 게이트 — 루프 본문과 GPU 실패 폴백이 공용.
     /// 수치 경로는 원문 그대로(이동만).

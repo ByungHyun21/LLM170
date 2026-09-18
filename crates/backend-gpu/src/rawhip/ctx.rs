@@ -2,7 +2,7 @@
 //! plans/75 P2.2: mod.rs 에서 기계적 이동(내용 무변경).
 
 use crate::rawhip::ck;
-use crate::rawhip::{GRAPH_SKIP, KTRACE, KtraceEv};
+use crate::rawhip::{GRAPH_SKIP, KtraceEv};
 use crate::rawhip::nolaunch_on;
 use crate::rawhip::kernels;
 use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
@@ -486,8 +486,7 @@ impl RawCtx {
 
     /// KTRACE 전용 이벤트 마커 — launch3를 거치지 않는 직접 런치 경로용.
     fn ktr_mark(&self, name: &'static str, gy: u32) {
-        if let Ok(mut g) = KTRACE.lock()
-            && g.is_some() {
+        if let Some(mut g) = crate::rawhip::ktrace_active() {
                 let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                 unsafe {
                     hip::hipEventCreateWithFlags(&mut ev, 0);
@@ -514,16 +513,14 @@ impl RawCtx {
         }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
@@ -557,16 +554,14 @@ impl RawCtx {
         }
         let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
@@ -602,16 +597,14 @@ impl RawCtx {
             // KTRACE 이벤트 짝 — launch3와 동일(2026-09-14 plans/69: 이 기록이
             // 없어 qsa_flash_wmma의 실행 시간이 'kv_f16 뒤 갭 12s'로 위장,
             // 8.4× 프리필 격차의 원인 파악을 하루 종일 돌렸다).
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.stream);
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, smem, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3_dyn")?;
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.stream);
@@ -634,16 +627,14 @@ impl RawCtx {
         unsafe {
             // KTRACE 훅 — 프레임 경로의 dense GEMM이 전부 이 경로(stream2)를 쓴다.
             // 훅이 없어 프레임 트레이스에서 통째로 누락되던 버그(2026-09-14).
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev0, 0);
                     hip::hipEventRecord(ev0, self.cur_side());
                     g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
                 }
             ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_side(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
-            if let Ok(mut g) = KTRACE.lock()
-                && g.is_some() {
+            if let Some(mut g) = crate::rawhip::ktrace_active() {
                     let mut ev: hip::hipEvent_t = std::ptr::null_mut();
                     hip::hipEventCreateWithFlags(&mut ev, 0);
                     hip::hipEventRecord(ev, self.cur_side());

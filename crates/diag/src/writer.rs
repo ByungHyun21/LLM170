@@ -64,13 +64,24 @@ pub fn seq_dump(evs: &[Ev], max: usize) -> String {
     out
 }
 
+
+/// 통합 덤프 — 집계 테이블 + 갭 + (LLM170_KTRACE_SEQ=N 지정시) 순차 목록.
+/// 백엔드 어댑터(ktrace 등)의 단일 호출 프론트엔드.
+pub fn dump(evs: &[Ev], dropped: u64) -> String {
+    let mut out = table(evs, dropped);
+    if let Ok(v) = std::env::var("LLM170_KTRACE_SEQ") {
+        let n: usize = v.parse().unwrap_or(64);
+        out.push_str(&seq_dump(evs, n));
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::trace::Ev;
 
     fn ev(name: &'static str, lane: u32, dur: f64, gap: Option<f64>) -> Ev {
-        Ev { name, lane, dur_ms: dur, gap_next_ms: gap, seq_ms: 0.0 }
+        Ev { name, lane, start_ms: 0.0, dur_ms: dur, gap_next_ms: gap, seq_ms: 0.0 }
     }
 
     #[test]

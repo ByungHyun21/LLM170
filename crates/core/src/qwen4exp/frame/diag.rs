@@ -26,34 +26,28 @@ pub fn stage_skipped(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 진단용 프레임 체크섬 — `LLM170_NP_CHECKSUM=1`. np·단일·배치 경로 공용.
+/// 진단용 프레임 체크섬 — `LLM170_DUMP=...,checksum`. np·단일·배치 경로 공용.
 /// 버퍼 앞 t·n개를 전부 읽어 합과 행 표본(첫·중간·마지막 행의 첫 원소)을
 /// 보고한다. 청크 크기가 다른 두 실행에서 "같은 층·같은 단계·같은 토큰 수"를
 /// 맞대어 첫 발산 지점을 찾는 용도 — 합만으로는 상쇄로 가려질 수 있어 행
 /// 표본을 함께 낸다. 기본 꺼짐(1회 판독).
 pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &str) {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_CHECKSUM").is_some());
-    // 행 덤프 모드 — LLM170_NP_ROWS="L1.gdn_ar,L2.moe_sc" 로 지정 태그의
-    // 매 행 첫 원소를 출력한다. 청크 경계 행 정렬 비교(어느 행부터 갈리는지)용.
-    static ROWS: std::sync::LazyLock<Option<Vec<String>>> = std::sync::LazyLock::new(|| {
-        std::env::var("LLM170_NP_ROWS").ok().map(|v| {
-            v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>()
-        })
-    });
-    if !*ON {
+    let o = llm170_diag::dump::opts();
+    if !o.checksum && !o.row_on(tag) {
         return;
     }
-    let rows_on = ROWS.as_ref().is_some_and(|r| r.iter().any(|x| x == tag));
+    let rows_on = o.row_on(tag);
     let mut v = vec![0.0f32; n * t];
     if acc.frame_read(h, &mut v).is_ok() {
-        let s: f64 = v.iter().map(|&x| x as f64).sum();
-        let mid = v[(t / 2) * n];
-        let last = v[(t - 1) * n];
-        eprintln!(
-            "[npck] {tag} t={t} sum={s:.6} v0={:.6} mid0={mid:.6} last0={last:.6}",
-            v[0]
-        );
+        if o.checksum {
+            let s: f64 = v.iter().map(|&x| x as f64).sum();
+            let mid = v[(t / 2) * n];
+            let last = v[(t - 1) * n];
+            eprintln!(
+                "[npck] {tag} t={t} sum={s:.6} v0={:.6} mid0={mid:.6} last0={last:.6}",
+                v[0]
+            );
+        }
         if rows_on {
             let cap = t.min(720);
             // 행당 4표본(첫·둘째·100번째·끝 원소) — 요소 축 커버리지.
@@ -74,7 +68,7 @@ pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &
                 .collect();
             eprintln!("[nprd] {tag} t={t} n={n} {}", vals.join(" "));
         }
-        if rows_on && std::env::var_os("LLM170_NP_ROW0FULL").is_some() {
+        if rows_on && o.row0full {
             let full = n.min(2560);
             let rows_n = t.min(16);
             for r in 0..rows_n {
@@ -88,11 +82,11 @@ pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &
     }
 }
 
-/// 진단용 버퍼 FNV 해시 — `LLM170_NP_BUFHASH=1`. 앞 len 원소의 비트를
+/// 진단용 버퍼 FNV 해시 — `LLM170_DUMP=...,bufhash`. 앞 len 원소의 비트를
 /// 해시해 한 줄로 찍는다. 층 경계마다 전 버퍼를 찍어 첫 오염 버퍼를
 /// 찾는 용도(plans/80 §A — 메모리 결함 추적).
 pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
-    if !super::diag::bufhash_on() || len == 0 {
+    if !llm170_diag::dump::opts().bufhash || len == 0 {
         return;
     }
     let mut v = vec![0.0f32; len];
@@ -104,12 +98,6 @@ pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
         }
         eprintln!("[npbh] {tag} len={len} h={x:016x}");
     }
-}
-
-pub(super) fn bufhash_on() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_BUFHASH").is_some());
-    *ON
 }
 
 pub(super) fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {

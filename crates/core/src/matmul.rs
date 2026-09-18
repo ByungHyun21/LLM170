@@ -5,7 +5,7 @@
 //! auto-FMA가 없어 자동으로 성립; target-feature 변경 시 재검토 필요 — 주석 유지).
 
 use llm170_gguf::GgmlType;
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
 /// mmap 상의 무게 텐서 참조.
 #[derive(Clone, Copy)]

@@ -94,7 +94,7 @@ pub(super) fn frame_forward_ex(
         if il < 4 {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
-        if diag::bufhash_on() {
+        if llm170_diag::dump::opts().bufhash {
             // 앞 min(t,16)행만 해시 — 서로 다른 t 실행에서 공유 접두 행을
             // 맞대기 위한 캡(plans/80 §A).
             let rows16 = t.min(16);

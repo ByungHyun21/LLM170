@@ -75,11 +75,13 @@ bit-identity standard.
 1. **Token stream, CLI level.** Run the same prompt at several chunk sizes
    and compare generated tokens. Cheap, but only sensitive when the model is
    in a contractive regime — use a real prompt.
-2. **Frame checkpoints.** `LLM170_NP_CHECKSUM=1` prints per layer/stage
-   samples (`frame_ck`). `LLM170_NP_ROWS=<tags>` adds per-row bit samples;
-   `LLM170_NP_ROW0FULL=1` dumps the first rows of tagged buffers in full
-   (hex bits). `LLM170_NP_BUFHASH=1` FNV-hashes the valid region of every
-   frame buffer at each layer boundary.
+2. **Frame checkpoints.** `LLM170_DUMP` keys (single frontend):
+   `checksum` prints per layer/stage samples (`frame_ck`), `rows:<tags>`
+   (tags separated by `;`) adds per-row bit samples, `row0full` dumps the
+   first rows of tagged buffers in full (hex bits), `bufhash` FNV-hashes
+   the valid region of every frame buffer at each layer boundary, `moe`
+   hashes MoE grouped-GEMM inputs. Example:
+   `LLM170_DUMP="checksum,rows:L1.ple_hash;L2.moe_sc,bufhash"`.
 3. **Kernel micro-probes.** `rawhip::probes::gdn_ar_invariance`,
    `gdn_conv_invariance` (synthetic, no model); `llm170 moe-row-check` /
    `mm-row-check` (real weights, two row counts, shared rows bit-compared).

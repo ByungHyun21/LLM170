@@ -4,7 +4,7 @@
 use super::super::Q4Error;
 use super::Ctx;
 use crate::ops::{sigmoid, silu};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
     /// MoE FFN — top-10 라우팅(softmax→정규화) + shared(sigmoid 게이트).
     /// MoE FFN — 토큰-전문가 그룬핑 배치: 라우터는 전 토큰 배치, 각 전문가는

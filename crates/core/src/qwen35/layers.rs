@@ -4,7 +4,7 @@
 use super::{Engine, ModelError, span_block};
 use crate::matmul::{mm_batch, mm_group};
 use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 impl Engine {
     /// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.
     pub(super) fn gdn_layer(

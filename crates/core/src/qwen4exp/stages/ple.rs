@@ -5,7 +5,7 @@ use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
 use crate::ops::{rms_norm, sigmoid, silu};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
     /// PLE 블록 — 해시 gather→key/value→게이트→방송→dilated conv→잔차 2경로.
     /// 순수 gather 래퍼 — 스레드에서 쓰기 위한 별칭(ple_gather_parts는 Sync).

@@ -18,7 +18,7 @@ pub use frame::Frame;
 
 use hparams::Hparams;
 use llm170_gguf::GgufFile;
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 use memmap2::Mmap;
 
 use crate::matmul::{Weight, mm, mm_batch, mm_group};
@@ -56,7 +56,7 @@ pub struct Model {
 
 macro_rules! span_block {
     ($name:literal, $body:block) => {{
-        llm170_profiler::profile_span!($name);
+        llm170_diag::profile_span!($name);
         $body
     }};
 }

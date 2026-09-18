@@ -142,7 +142,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     .filter(|(xp0, r0, g0, _, _)| (*xp0, *r0, *g0) == key)
                     .map(|(_, _, _, q, w)| (*q as *mut u8, *w))
             };
-            if env_on("LLM170_MOE_DUMP") {
+            if llm170_diag::dump::opts().moe {
                 let c = self.quant_cache.lock().map_err(|e| e.to_string())?;
                 let (h, ck) = match c.as_ref() {
                     Some((xp0, r0, g0, _, _)) => (
@@ -761,7 +761,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     }
                 }
             }
-            if env_on("LLM170_MOE_DUMP") {
+            if llm170_diag::dump::opts().moe {
                 // 진단(plans/80): GEMM의 숨은 입력(xq 전체·rowexp·perm)을
                 // FNV 해시로 비교한다. mxsel/ids가 같은데 이들이 다르면
                 // quant/그룹화 산출물이 오염된 것(버퍼 결함).

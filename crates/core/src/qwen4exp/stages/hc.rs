@@ -4,7 +4,7 @@
 use super::super::Q4Error;
 use super::Ctx;
 use crate::ops::{rms_norm, sigmoid, silu};
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
     /// grouped RMSNorm + 저랭크 게이트 + 스트림 평균 + inject.
     /// kind = "attn"|"ffn" → blk.{il}.hc_{kind}_{norm,down,up,inject}.weight

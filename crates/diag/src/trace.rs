@@ -12,10 +12,12 @@ pub struct Ev {
     pub name: &'static str,
     /// lane(그리드-y 등 병렬 축 식별자)
     pub lane: u32,
+    /// 절대 시작 시각(ms) — 첫 이벤트 기준 0. 어댑터가 채운다.
+    pub start_ms: f64,
     pub dur_ms: f64,
-    /// 다음 이벤트까지의 갭(ms) — dump 시 채운다(None = 마지막).
+    /// 다음 이벤트까지의 갭(ms) — resolve 시 계산(None = 마지막).
     pub gap_next_ms: Option<f64>,
-    /// 시작부터의 순차 시각(ms) — dump 시 채운다.
+    /// 시작부터의 순차 시각(ms) — resolve 시 계산.
     pub seq_ms: f64,
 }
 
@@ -64,10 +66,26 @@ pub fn push(ev: Ev) {
         }
     }
 }
+/// 절대 시작 시각 기반 갭/순차 계산 — 어댑터가 start_ms를 채운 뒤 호출.
+/// 갭은 end(k)→start(k+1)로 잰 뒤 **전임자 이벤트에 귀속**한다
+/// (갭의 주인은 후속 op의 호스트 비용이므로).
+pub fn resolve(evs: &mut [Ev]) {
+    if evs.is_empty() {
+        return;
+    }
+    let t0 = evs[0].start_ms;
+    for i in 0..evs.len() {
+        evs[i].seq_ms = evs[i].start_ms - t0;
+        if i + 1 < evs.len() {
+            let gap = (evs[i + 1].start_ms - (evs[i].start_ms + evs[i].dur_ms)).max(0.0);
+            evs[i].gap_next_ms = Some(gap);
+        } else {
+            evs[i].gap_next_ms = None;
+        }
+    }
+}
 
 /// 캡처된 이벤트 소비 + 갭/순차 시각 계산 — dump 시 1회 호출.
-/// 갭은 end(k)→start(k+1)이 아니라 **전임자 이름 기준**으로 귀속한다
-/// (갭의 주인은 후속 op의 호스트 비용이므로).
 pub fn take() -> (Vec<Ev>, u64) {
     capture_end();
     let dropped = DROPPED.load(Ordering::Relaxed);
@@ -75,15 +93,7 @@ pub fn take() -> (Vec<Ev>, u64) {
         Ok(mut s) => std::mem::take(&mut *s),
         Err(_) => Vec::new(),
     };
-    // 순차 시각 + 갭
-    let mut t_acc = 0.0f64;
-    for i in 0..evs.len() {
-        evs[i].seq_ms = t_acc;
-        t_acc += evs[i].dur_ms;
-        if i + 1 < evs.len() {
-            evs[i].gap_next_ms = Some(0.0); // TODO: 백엔드가 절대 시각 제공 시 계산
-        }
-    }
+    resolve(&mut evs);
     (evs, dropped)
 }
 
@@ -132,7 +142,7 @@ mod tests {
     #[test]
     fn capture_off_push_noop() {
         assert!(!capture_on());
-        push(Ev { name: "x", lane: 1, dur_ms: 1.0, gap_next_ms: None, seq_ms: 0.0 });
+        push(Ev { name: "x", lane: 1, start_ms: 0.0, dur_ms: 1.0, gap_next_ms: None, seq_ms: 0.0 });
         let (evs, _) = take();
         assert!(evs.is_empty(), "off 상태 push는 무시돼야 한다");
     }
@@ -140,21 +150,23 @@ mod tests {
     #[test]
     fn seq_and_take() {
         capture_begin();
-        push(Ev { name: "a", lane: 1, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 });
-        push(Ev { name: "b", lane: 2, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 });
+        push(Ev { name: "a", lane: 1, start_ms: 0.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 });
+        push(Ev { name: "b", lane: 2, start_ms: 12.0, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 });
         let (evs, dropped) = take();
         assert_eq!(evs.len(), 2);
         assert_eq!(dropped, 0);
         assert_eq!(evs[0].seq_ms, 0.0);
-        assert_eq!(evs[1].seq_ms, 10.0);
+        assert_eq!(evs[1].seq_ms, 12.0);
+        // 갭: b 시작(12) − (a 시작 0 + dur 10) = 2ms, 전임자 a에 귀속
+        assert_eq!(evs[0].gap_next_ms, Some(2.0));
     }
 
     #[test]
     fn summarize_sorted() {
         let evs = vec![
-            Ev { name: "b", lane: 1, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 },
-            Ev { name: "a", lane: 1, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
-            Ev { name: "a", lane: 1, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
+            Ev { name: "b", lane: 1, start_ms: 0.0, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 },
+            Ev { name: "a", lane: 1, start_ms: 5.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
+            Ev { name: "a", lane: 1, start_ms: 15.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
         ];
         let s = summarize(&evs);
         assert_eq!(s[0].0, "a");

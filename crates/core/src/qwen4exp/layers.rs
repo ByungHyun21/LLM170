@@ -9,7 +9,7 @@ use super::stages::{self, Ctx};
 use crate::matmul::Accelerator;
 use crate::ops::sigmoid;
 use crate::quant::dequant_row;
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
 /// 시퀀스 상태 — GDN S/conv, QSA KV+인덱서 캐시, PLE conv 히스토리·n-gram 히스토리.
 pub struct SeqState4 {

@@ -13,7 +13,7 @@
 //!
 //! 상태 S[kdim, vdim] — 두 경로 동일 레이아웃.
 
-use llm170_profiler::profile_span;
+use llm170_diag::profile_span;
 
 pub const CS: usize = 64; // chunk size (비-KDA: 64)
 
