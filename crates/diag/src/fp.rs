@@ -66,6 +66,15 @@ pub fn fp_record(stage: &str, data: &[f32]) {
                 "{stage}\t{hash:016x}\t{max_abs:.6e}\t{}",
                 first_nonfinite.map_or(-1, |i| i as i64)
             );
+            // NaN guard: 첫 비순수 발견 시 경고 (LLM170_FP_NAN=1이면 exit).
+            if let Some(idx) = first_nonfinite {
+                eprintln!(
+                    "diag::fp: NaN/Inf at stage '{stage}' index {idx}"
+                );
+                if std::env::var_os("LLM170_FP_NAN").is_some() {
+                    std::process::exit(101);
+                }
+            }
         }
     }
 }
