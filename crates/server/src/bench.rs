@@ -212,9 +212,11 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 let mut next: Vec<u32> = vec![1u32; np_slots];
                 let t1 = Instant::now();
                 for _ in 0..tg {
-                    for s in 0..np_slots {
-                        next[s] = eng.decode1_greedy(s, next[s]).map_err(|e| e.to_string())?;
-                    }
+                    // plans/80-B: 배치 프레임 디코드(decode_batch_greedy) —
+                    // t=n_slots 행의 단일 forward로 무게 패스 공유. 종전 순차
+                    // decode1_greedy는 슬롯당 53ms×4=212ms/step였다.
+                    next = eng.decode_batch_greedy(&(0..np_slots).collect::<Vec<_>>(), &next)
+                        .map_err(|e| e.to_string())?;
                 }
                 let ms = t1.elapsed().as_secs_f64() * 1e3;
                 let n_tok = np_slots * tg;
