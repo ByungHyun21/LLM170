@@ -84,6 +84,39 @@ bit-identity standard.
    `gdn_conv_invariance` (synthetic, no model); `llm170 moe-row-check` /
    `mm-row-check` (real weights, two row counts, shared rows bit-compared).
 
+## Automated checker (2026-09-18, plans/83 C)
+
+```sh
+# single command, both architectures, prompt = token ids or text (BPE):
+llm170 diag chunk-check <model.gguf> "some real prompt text" 16 63 64 512
+llm170 diag chunk-check <model.gguf> 386,18,15,15 16 64 --backend cpu
+```
+
+Verdicts per size: `bits-identical` (exact), `near-tie` (argmax preserved,
+max|Δ| < 1e-3 — the row-count residual axis), `FAIL` otherwise. Reference
+is a single un-chunked prefill.
+
+### Open defects the checker found (2026-09-18)
+
+1. **qwen35 GPU state leak across `reset_seq`** — running the *identical*
+   prefill twice on the same slot (or on a fresh second slot) diverges:
+   first repeat bit-identical, second repeat max|Δ| ≈ 9.6, third ≈ 12.1,
+   deterministic across processes and slot ids. Repro:
+   `llm170 diag chunk-check <27b.gguf> "<20+ token text>" 512 512 512`.
+   GDN S-state and conv ring are zeroed by `reset_seq_state`; the KV
+   tables are position-indexed (not cleared) — attention masks to
+   `pos0+t`, so the leak lives elsewhere (suspect: residual per-seq or
+   shared scratch consumed before write). Affects HTTP serve slot reuse:
+   the second distinct request on a reused slot sees contaminated logits.
+2. **Flash-Next GPU chunk16 collapse** — `chunk63`/`chunk64` are
+   bits-identical to the single-chunk reference (plans/80 fix verified),
+   but `chunk16` diverges max|Δ| ≈ 10.7 and drives argmax to EOS. The
+   plans/80 fix verified CPU chunk16 ≡ chunk512; the GPU frame path at
+   t=16 remains chunk-dependent.
+
+Both are pre-existing; the checker is the permanent regression fence for
+them.
+
 ## Reproduction
 
 ```sh

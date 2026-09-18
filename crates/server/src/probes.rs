@@ -90,18 +90,22 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             if args.first().map(String::as_str) == Some("diff") {
                 let (pa, pb) = match (args.get(1), args.get(2)) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => return Some({
+                    _ => {
                         eprintln!("사용법: llm170 diag diff <A> <B>");
-                        ExitCode::FAILURE
-                    }),
+                        return Some(ExitCode::FAILURE);
+                    }
                 };
                 match llm170_diag::fp_diff(pa, pb) {
                     Ok(r) if r.mismatch_count == 0 => Ok(format!("{r}")),
                     Ok(r) => Ok(format!("{r}\nDIVERGENCE DETECTED")),
                     Err(e) => Err(e),
                 }
+            }
+            // plans/83 C3: 청크 불변성 자동 검증 — `llm170 diag chunk-check <model> <prompt> [sizes...]`
+            else if args.first().map(String::as_str) == Some("chunk-check") {
+                return Some(cmd_chunk_check(&args[1..]));
             } else {
-                Err("diag: 하위커맨드 diff <A> <B> 만 지원".into())
+                Err("diag: 하위커맨드 diff <A> <B> | chunk-check <model> <prompt> [sizes...]".into())
             }
         }
         "mm-bench2" => llm170_backend_gpu::rawhip::mm_bench(),
@@ -222,8 +226,173 @@ fn special(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 }
             }
         }
+
         "rawhip-check" => Some(cmd_rawhip_check(args)),
         _ => None,
+    }
+}
+
+/// `llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]`
+/// 청크 불변성 자동 검증 (plans/83 C3, docs/chunk-invariance.md 계약).
+///
+/// 프롬프트를 단일 호출(기준)과 각 청크 크기로 프리필해 최종 logits를 비교:
+/// - bits 동일 → PASS
+/// - argmax 동일 && max|Δ| < 1e-3 → PASS(near-tie, GPU 행 수 의존 잔여 축)
+/// - 그 외 → FAIL
+/// prompt: "1,2,3" 형태면 토큰 id, 아니면 텍스트(BPE 인코딩 — plans/83 A).
+fn cmd_chunk_check(args: &[String]) -> ExitCode {
+    let usage = "사용법: llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]";
+    let Some(model) = args.first() else {
+        eprintln!("{usage}");
+        return ExitCode::FAILURE;
+    };
+    let Some(prompt) = args.get(1) else {
+        eprintln!("{usage}");
+        return ExitCode::FAILURE;
+    };
+    let backend_cpu = args.iter().any(|a| a == "--backend" && args.iter().any(|b| b == "cpu"))
+        || args.iter().any(|a| a == "--backend=cpu");
+    let sizes: Vec<usize> = args[2..]
+        .iter()
+        .filter_map(|a| a.parse::<usize>().ok())
+        .filter(|&s| s > 0)
+        .collect();
+    let sizes = if sizes.is_empty() { vec![16, 63, 64, 512] } else { sizes };
+
+    // 프롬프트 파싱 — 숫자/콤마 전용이면 토큰 id, 아니면 텍스트
+    let ids: Vec<u32> = if prompt.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b' ')
+        && prompt.contains(',')
+    {
+        prompt.split(',').filter_map(|t| t.trim().parse().ok()).collect()
+    } else {
+        let p = std::path::PathBuf::from(model);
+        let stem = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let part2 = if stem.contains("-00001-of-") {
+            Some(p.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
+        } else {
+            None
+        };
+        match crate::tokenize::Tokenizer::load(&p, part2.as_deref()) {
+            Ok(t) => t.encode(prompt),
+            Err(e) => {
+                eprintln!("error: tokenizer: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if ids.is_empty() {
+        eprintln!("error: 빈 프롬프트");
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "# chunk-check: {}토큰, sizes={:?}, backend={}",
+        ids.len(),
+        sizes,
+        if backend_cpu { "cpu" } else { "gpu" }
+    );
+
+    let path = std::path::PathBuf::from(model);
+    let arch = llm170_gguf::GgufFile::open(&path)
+        .ok()
+        .and_then(|g| g.arch().map(|s| s.to_string()));
+    let ctx = ids.len() * 2 + 64;
+    let (ref_l, runs): (Vec<f32>, Vec<(usize, Vec<f32>)>) = match arch.as_deref() {
+        Some("qwen4exp") => {
+            let res = llm170_core::qwen4exp::Model4::load(&path).map_err(|e| e.to_string()).and_then(|m| {
+                let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
+                if !backend_cpu && !crate::engine::q4_gpu_env_off() {
+                    let sources = eng.model.part_sources();
+                    match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
+                        Ok(acc) => {
+                            eng = eng.with_acc(acc);
+                        }
+                        Err(e) => return Err(format!("GPU 가속기 생성 실패 — {e} (--backend cpu 로 회피)")),
+                    }
+                }
+                // 기준: 단일 청크(프롬프트 전체)
+                unsafe { std::env::set_var("LLM170_Q4_CHUNK", format!("{}", ids.len().max(1))) };
+                let r = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
+                eng.reset_seq(0);
+                let mut runs = Vec::new();
+                for &sz in &sizes {
+                    unsafe { std::env::set_var("LLM170_Q4_CHUNK", format!("{sz}")) };
+                    let l = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
+                    eng.reset_states();
+                    runs.push((sz, l));
+                }
+                Ok((r, runs))
+            });
+            match res {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => {
+            // qwen35 (및 기본) — 호출부 청킹
+            let res = llm170_core::qwen35::Model::load(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|m| {
+                    let cc_seq: usize = std::env::var("LLM170_CC_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let mut eng = llm170_core::qwen35::Engine::new(m, (cc_seq + 1).max(1), ctx);
+                    if !backend_cpu
+                        && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+                    {
+                        let _ = llm170_backend_gpu::inject_rawhip(&mut eng);
+                    }
+                    let r = eng.prefill(0, &ids).map_err(|e| e.to_string())?;
+                    eng.reset_seq(cc_seq);
+                    let mut runs = Vec::new();
+                    for &sz in &sizes {
+                        let mut last = None;
+                        for ch in ids.chunks(sz) {
+                            last = Some(eng.prefill(cc_seq, ch).map_err(|e| e.to_string())?);
+                        }
+                        eng.reset_states();
+                        runs.push((sz, last.expect("청크 1개 이상")));
+                    }
+                    Ok((r, runs))
+                });
+            match res {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    let ref_tok = llm170_core::qwen35::greedy(&ref_l);
+    println!("reference: {} logits, argmax={ref_tok}", ref_l.len());
+    let mut all_pass = true;
+    for (sz, l) in &runs {
+        let maxd = l
+            .iter()
+            .zip(ref_l.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let tok = llm170_core::qwen35::greedy(l);
+        let (verdict, why) = if maxd == 0.0 {
+            ("PASS", "bits-identical".to_string())
+        } else if tok == ref_tok && maxd < 1e-3 {
+            ("PASS", format!("near-tie max|Δ|={maxd:.3e} (행 수 의존 잔여축 — docs/chunk-invariance.md)"))
+        } else {
+            all_pass = false;
+            (
+                "FAIL",
+                format!("max|Δ|={maxd:.3e} argmax {tok}≠{ref_tok}"),
+            )
+        };
+        println!("  chunk {sz:5}: {verdict} — {why}");
+    }
+    if all_pass {
+        ExitCode::SUCCESS
+    } else {
+        println!("chunk-check: FAIL — 청크 불변성 위반 (docs/chunk-invariance.md)");
+        ExitCode::FAILURE
     }
 }
 
