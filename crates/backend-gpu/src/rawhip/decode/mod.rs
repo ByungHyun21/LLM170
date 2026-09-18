@@ -408,6 +408,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_restore()
     }
 
+
+    fn gdn_restore_seq(&self, seq: usize, n_seqs: usize) -> Result<(), String> {
+        let guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("raw_decode: 미초기화")?.gdn_restore_seq(seq, n_seqs)
+    }
     fn mtp_head_argmax(&self, h_normed: &[f32]) -> Result<u32, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
@@ -521,6 +526,26 @@ impl DecodeState {
             for b in v.iter() {
                 self.copy(self.gdn_snap, *b, off, 0, conv_len)?;
                 off += conv_len;
+            }
+        }
+        Ok(())
+    }
+
+    /// 선택적 per-seq 복원 — 부분수용 시 전체가 아닌 해당 seq만 되돌린다.
+    /// gdn_snap 레이아웃: [gdn: layer×seq][conv: layer×seq] (선형).
+    pub fn gdn_restore_seq(&self, seq: usize, n_seqs: usize) -> Result<(), String> {
+        let (gdn_len, conv_len) = (self.gdn_len(), self.conv_len());
+        let total_gdn = self.st_gdn.len() * n_seqs * gdn_len;
+        for (r, v) in self.st_gdn.iter().enumerate() {
+            if seq < v.len() {
+                let off = (r * n_seqs + seq) * gdn_len;
+                self.copy(self.gdn_snap, v[seq], off, 0, gdn_len)?;
+            }
+        }
+        for (r, v) in self.st_conv.iter().enumerate() {
+            if seq < v.len() {
+                let off = total_gdn + (r * n_seqs + seq) * conv_len;
+                self.copy(self.gdn_snap, v[seq], off, 0, conv_len)?;
             }
         }
         Ok(())

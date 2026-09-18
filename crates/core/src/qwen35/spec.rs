@@ -491,23 +491,65 @@ impl Engine {
             results.push(accepted);
         }
 
-        // ── 상태 갱신
-        if all_full {
+        // ── 상태 갱신 — 선택적 복원(plans/80 §C): 부분수용 seq만 되돌리고
+        // 전수용 seq는 verify가 이미 올바르게 진행한 상태를 유지한다.
+        // 종전 전체 복원은 한 seq의 부분수용이 모든 seq의 carried를 자라게
+        // 해 verify 배치를 12→59행까지 부풀렸다(6.78 t/s의 주원인).
+        let mut seq_full: Vec<bool> = Vec::with_capacity(n_seq);
+        {
+            let mut all_full = true;
             for si in 0..n_seq {
-                self.seqs[seqs[si]].gdn_carried = Vec::new();
-            }
-        } else {
-            rd.gdn_restore().map_err(ModelError::Accel)?;
-            for si in 0..n_seq {
-                let seq = seqs[si];
-                let mut c = carried[si].clone();
-                // 유지 신규 행 토큰: next + matched drafts
-                let matched = new_kept[si] - 1;
-                c.push(nexts[si]);
-                for j in 0..matched {
-                    c.push(all_drafts[si][j]);
+                let g0 = group_starts[si];
+                let next_off = carried[si].len();
+                let drafts = &all_drafts[si];
+                let full = drafts.iter().enumerate().all(|(j, &d)| {
+                    am[g0 + next_off + j] == d && am[g0 + next_off + j] != eos
+                });
+                seq_full.push(full);
+                if !full {
+                    all_full = false;
                 }
-                self.seqs[seq].gdn_carried = c;
+            }
+            if all_full {
+                for si in 0..n_seq {
+                    self.seqs[seqs[si]].gdn_carried = Vec::new();
+                }
+            } else {
+                for si in 0..n_seq {
+                    if seq_full[si] {
+                        // 전수용 — verify 상태 유지, carried 소멸
+                        self.seqs[seqs[si]].gdn_carried = Vec::new();
+                    } else {
+                        // 부분수용 — 이 seq만 복원
+                        rd.gdn_restore_seq(seqs[si], self.seqs.len())
+                            .map_err(ModelError::Accel)?;
+                        let seq = seqs[si];
+                        let mut c = carried[si].clone();
+                        let matched = new_kept[si] - 1;
+                        c.push(nexts[si]);
+                        for j in 0..matched {
+                            c.push(all_drafts[si][j]);
+                        }
+                        // per-seq carried 상한(plans/80 §C): 4행 초과 시 즉시
+                        // 커밋 — verify 배치가 자라는 것을 막는다. 단일 스트림의
+                        // SPEC_CAPX=4와 동일 기준.
+                        if c.len() > 4 {
+                            let pos0 = self.seqs[seq].pos as usize - carried[si].len();
+                            let mut crows = Vec::with_capacity(c.len() * n_e);
+                            for &tk in &c {
+                                let mut r = vec![0.0f32; n_e];
+                                crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
+                                crows.extend(r);
+                            }
+                            let mut cam = Vec::new();
+                            let mut ch_all = Vec::new();
+                            rd.raw_verify(seq, pos0, &crows, &mut cam, &mut ch_all)
+                                .map_err(ModelError::Accel)?;
+                            c = Vec::new();
+                        }
+                        self.seqs[seqs[si]].gdn_carried = c;
+                    }
+                }
             }
         }
         for si in 0..n_seq {

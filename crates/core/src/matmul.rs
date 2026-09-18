@@ -1068,6 +1068,10 @@ pub trait RawDecode: Send + Sync {
     fn gdn_restore(&self) -> Result<(), String> {
         Err("gdn_restore: 미지원".into())
     }
+    /// 선택적 per-seq 복원 — 부분수용 시 해당 seq만 되돌린다(plans/80 §C).
+    fn gdn_restore_seq(&self, _seq: usize, _n_seqs: usize) -> Result<(), String> {
+        Err("gdn_restore_seq: 미지원".into())
+    }
 
     /// 시퀀스 상태 초기화 (서버 슬롯 반환 시) — GDN/conv 상주 상태 제로화.
     /// KV는 위치 색인이라 미제로 무해 (p ≤ pos만 판독). 기본 no-op.
