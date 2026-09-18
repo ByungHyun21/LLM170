@@ -5,9 +5,8 @@ processing it in one pass. Everything before the last chunk is causally
 closed — an early row cannot depend on later tokens — so any difference
 between chunk sizes is a defect, not a tolerance.
 
-This note records how we verify that property in this codebase, what the
-verification cleared, what remains open, and the current state of the
-investigation (2026-09-18, plans/80).
+This note records the contract, how we verify it, and the defect that was
+found and fixed on 2026-09-18 (plans/80 §A).
 
 ## Rule
 
@@ -23,83 +22,79 @@ investigation (2026-09-18, plans/80).
   prompt, not synthetic ids: random-looking prompts sit in a chaotic regime
   where any arithmetic difference amplifies and every chunk size looks
   "different".
+- **A host-side bridge that keeps sequence history must serve boundary
+  lookbacks from the call-start snapshot, never from state it has already
+  mutated within the call.** This is the bug class that produced the defect
+  below; llama.cpp avoids the surface structurally by computing the n-gram
+  in-graph for the whole batch.
+
+## The defect (2026-09-18): PLE n-gram lookback read live history
+
+**Symptom**: `LLM170_Q4_CHUNK=63/64` Flash-Next prefill collapsed into
+repetition on real prompts; other chunk sizes produced mutually different
+streams; the value path (pure CPU, no GPU at all) was chunk-dependent too,
+which ruled out every backend/kernel theory.
+
+**Root cause** (`stages/ple.rs::ple_hash`): the boundary lookback for the
+trigram of the first tokens of a chunk indexed the *live* history vector,
+into which the current call had already pushed its own tokens. For chunked
+calls the trigram of chunk token 1 hashed the just-pushed chunk token 0
+instead of the true predecessor from the previous chunk. A single unchunked
+call never takes that branch, so single-call results were correct and every
+chunking silently disagreed with them — at chunk boundaries only, amplified
+chaotically through 48 layers.
+
+**Fix**: read boundary lookbacks from the call-start snapshot `hist0`
+(kept immutable), while the live vector continues to accumulate the state
+to carry out. One indexing change plus one `clone()`.
+
+**Verification ladder used to find it** (kept as permanent assets):
+
+1. Kernel-level row-count invariance probes (`llm170 moe-row-check`,
+   `llm170 mm-row-check` with real weights) — proved all GEMM families
+   bit-invariant across t; cleared the entire GPU layer early.
+2. Same-config runs are bit-deterministic; `HIP_LAUNCH_BLOCKING` and
+   per-stage drains change nothing — ruled out races.
+3. The pure-CPU value path (`--backend cpu`) reproduced the divergence —
+   moved the defect out of every GPU/backend surface.
+4. Stage-skip bisect on the CPU path (`LLM170_STAGE_SKIP=ple` → chunk16 ≡
+   chunk512) — isolated PLE.
+5. Per-sub-stage hashes + row dumps of `ple_hash` outputs pinned the wrong
+   trigram at chunk-boundary tokens.
+
+**After the fix**: pure CPU chunk16 ≡ chunk512 exactly; GPU chunk63 ≡
+chunk64 exactly; chunk 61/62/128/2048 reproduce the gate baseline stream;
+no chunk size collapses. A residual, much smaller axis remains: different
+chunk sizes can flip near-tie tokens (~1 token in 10 on adversarial
+prompts) because batched GPU GEMM dispatch differs by row count — the
+project's near-tie adjudication standard applies there, not the
+bit-identity standard.
 
 ## Verification: three layers
 
 1. **Token stream, CLI level.** Run the same prompt at several chunk sizes
    and compare generated tokens. Cheap, but only sensitive when the model is
    in a contractive regime — use a real prompt.
-2. **Frame checkpoints.** `LLM170_NP_CHECKSUM=1` prints, per layer and stage,
-   `sum/v0/mid0/last0` samples of the resident frame buffers (`frame_ck`).
-   `LLM170_NP_ROWS=<tags>` additionally dumps per-row bit samples, and
-   `LLM170_NP_ROW0FULL=1` dumps the first 8 rows of each tagged buffer in
-   full (hex bits). Because `last0` is always the last row of the current
-   call, two chunkings can be compared at a common token boundary.
-3. **Kernel micro-probes.** `rawhip::probes::gdn_ar_invariance` /
-   `gdn_conv_invariance` (synthetic sequence, no model), `llm170 moe-row-check`
-   and `llm170 mm-row-check` (real weights; run the same input rows through
-   two row counts and bit-compare the shared rows).
-
-## What the probes cleared (2026-09-17/18)
-
-- GDN AR / GDN conv kernels: state and output bit-identical across `t`/`per`
-  combinations (sequential per-row recursion; association order fixed).
-- Dense projections `frame_mm`/`frame_mm_group` (Q8_0, F32 tested): every
-  element of the shared rows bit-identical between t=16 and t=64 launches
-  (`mm-row-check`).
-- Expert stack GEMMs `frame_moe_gemm` (Q4K gate/up, Q5_1 down): bit-identical
-  shared rows at rows 160 vs 640, including collision-heavy ids
-  (`moe-row-check`).
-- MoeTop10 / gather / scatter / quant_q8: row-local, deterministic kernels.
-
-## Current state of the defect (2026-09-18)
-
-Two distinct phenomena remain; the catastrophic collapse is **not** a race.
-
-### 1. Catastrophic collapse — deterministic, multi-chunk only
-
-`LLM170_Q4_CHUNK=63/64` on a 208-token prompt collapses into repetition.
-Facts established on a verified-neutral build:
-
-- A **single** t=64 call is clean: on a 64-token prompt, chunk=64 and
-  chunk=512 (both one call, t=64) produce bit-identical checksums and the
-  normal stream. The chunk *value* does not leak into the frame path by
-  itself.
-- The collapse requires the **multi-call structure** (64,64,64,16).
-- `LLM170_FRAME_SYNC=1` (a device drain after every frame stage) does **not**
-  fix the collapse — it is not an async-ordering race.
-- The GDN/AR state carry between calls was re-verified bit-identical by the
-  kernel probes.
-
-### 2. Micro-divergence at equal inputs — timing/geometry sensitive
-
-On a 64-token prompt, comparing a t=16 first call against a t=64 single call
-(same first 16 tokens): every input of layer 2's MoE is **bit-identical**
-(mixf/mxsel full rows, ids, weights), yet the gate-GEMM output row 0 differs
-in all 640 elements (~1e-3 relative) — while the same GEMM in isolation is
-provably row-count invariant. Whether the divergence appears depends on
-
-- whether checkpoint reads (`LLM170_NP_CHECKSUM`) are enabled, and
-- whether `HIP_LAUNCH_BLOCKING=1` is set (both together: fully identical),
-
-which is characteristic of a memory-level defect (out-of-bounds read/write
-into a neighboring frame buffer) whose visibility depends on buffer geometry
-(`t_max` = chunk when `LLM170_Q4_CHUNK` is set) and pipeline timing, not of
-kernel arithmetic.
-
-Next step: matched-call state comparison — run the 208-token prompt at
-chunk=64 and compare the device state after call k against the state after
-the equivalent single call on the same token prefix; the first call whose
-end state diverges brackets the defect.
+2. **Frame checkpoints.** `LLM170_NP_CHECKSUM=1` prints per layer/stage
+   samples (`frame_ck`). `LLM170_NP_ROWS=<tags>` adds per-row bit samples;
+   `LLM170_NP_ROW0FULL=1` dumps the first rows of tagged buffers in full
+   (hex bits). `LLM170_NP_BUFHASH=1` FNV-hashes the valid region of every
+   frame buffer at each layer boundary.
+3. **Kernel micro-probes.** `rawhip::probes::gdn_ar_invariance`,
+   `gdn_conv_invariance` (synthetic, no model); `llm170 moe-row-check` /
+   `mm-row-check` (real weights, two row counts, shared rows bit-compared).
 
 ## Reproduction
 
 ```sh
-# collapse (multi-chunk): 208-token Korean prompt, chunk 63/64
+# collapse (before fix) / clean stream (after fix): 208-token Korean prompt
 LLM170_Q4_CHUNK=64  llm170 infer --model <fn.gguf> --prompt-tokens <ids> --n-predict 16 ...
-LLM170_Q4_CHUNK=512 llm170 infer ...   # normal stream
+LLM170_Q4_CHUNK=512 llm170 infer ...   # reference
 
-# single-call t=64 is clean: 64-token prompt, chunk 64 vs 512 → identical
+# pure-CPU chunk invariance (fastest end-to-end check, no GPU):
+LLM170_Q4_CHUNK=16  llm170 infer --backend cpu ...
+LLM170_Q4_CHUNK=512 llm170 infer --backend cpu ...   # streams must match
+
 # kernel-level invariance (seconds):
 cargo test --release -p llm170-backend-gpu --lib -- --nocapture gdn_ar_t_invariance
 llm170 moe-row-check <model> blk.0.ffn_gate_exps.weight 16 64

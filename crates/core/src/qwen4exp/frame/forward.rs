@@ -94,6 +94,26 @@ pub(super) fn frame_forward_ex(
         if il < 4 {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
+        if diag::bufhash_on() {
+            // 앞 min(t,16)행만 해시 — 서로 다른 t 실행에서 공유 접두 행을
+            // 맞대기 위한 캡(plans/80 §A).
+            let rows16 = t.min(16);
+            let (k_sel, n_ff) = (hp.n_expert_used, hp.n_ff_exp);
+            buf_hash(acc, f.res_hc, hc * n * rows16, &format!("L{il}B.res_hc"));
+            buf_hash(acc, f.mix, n * rows16, &format!("L{il}B.mix"));
+            buf_hash(acc, f.gqkv, conv_ch * rows16, &format!("L{il}B.gqkv"));
+            buf_hash(acc, f.gbg, hp.dt_rank * 2 * rows16, &format!("L{il}B.gbg"));
+            buf_hash(acc, f.gconv, conv_ch * rows16, &format!("L{il}B.gconv"));
+            buf_hash(acc, f.go, v_len * rows16, &format!("L{il}B.go"));
+            buf_hash(acc, f.ffn_out, n * rows16, &format!("L{il}B.ffn_out"));
+            buf_hash(acc, f.mroute, hp.n_expert * rows16, &format!("L{il}B.mroute"));
+            buf_hash(acc, f.mids, k_sel * rows16, &format!("L{il}B.mids"));
+            buf_hash(acc, f.mwt, k_sel * rows16, &format!("L{il}B.mwt"));
+            buf_hash(acc, f.mxsel, n * k_sel * rows16, &format!("L{il}B.mxsel"));
+            buf_hash(acc, f.mgu, n_ff * k_sel * rows16, &format!("L{il}B.mgu"));
+            buf_hash(acc, f.my, n_ff * k_sel * rows16, &format!("L{il}B.my"));
+            buf_hash(acc, f.mout, n * rows16, &format!("L{il}B.mout"));
+        }
         // 1) PLE (blk.1) — plans/73: 디코드(t=1)는 디바이스 경로. 해시/gather는
         //    스텝 초에 호스트가 끝냈고(GPU 무의존), key/value 투영은 프레임 GEMM,
         //    gate/conv/잔차는 ple_math_dev 의 3커널 — 동기 d2h/h2d 왕복과
@@ -947,9 +967,10 @@ pub(super) fn moe_frame(
     } else {
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
-        sync_mark(acc, "moe.gather", f.mxsel)?;
-        if il < 4 {
-            frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
+        if std::env::var_os("LLM170_MOE_GATHER2").is_some() {
+            // 진단(plans/80): gather 2회 — 멱등 쓰기라 결과 불변이어야 한다.
+            // 2회째에 x가 바르게 되면 첫 쓰기가 찢어진 것, 그대로면 이웃 오염.
+            fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;

@@ -142,6 +142,21 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     .filter(|(xp0, r0, g0, _, _)| (*xp0, *r0, *g0) == key)
                     .map(|(_, _, _, q, w)| (*q as *mut u8, *w))
             };
+            if env_on("LLM170_MOE_DUMP") {
+                let c = self.quant_cache.lock().map_err(|e| e.to_string())?;
+                let (h, ck) = match c.as_ref() {
+                    Some((xp0, r0, g0, _, _)) => (
+                        (*xp0, *r0, *g0) == key,
+                        format!("({xp0:#x},{r0},{g0})"),
+                    ),
+                    None => (false, "empty".into()),
+                };
+                eprintln!(
+                    "# qcache key=({:#x},{rows},{gen_q}) {} cached={ck}",
+                    xp as usize,
+                    if h { "HIT" } else { "MISS" }
+                );
+            }
             match hit {
                 Some(v) => v,
                 None => {
@@ -747,32 +762,32 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 }
             }
             if env_on("LLM170_MOE_DUMP") {
-                // 진단(plans/80): GEMM 입력 x(원본 f32)와 xq(양자화) 해시를
-                // 같이 찍는다 — x가 같은데 xq가 다르면 quant/캐시, x부터 다르면
-                // 상류가 범인.
+                // 진단(plans/80): GEMM의 숨은 입력(xq 전체·rowexp·perm)을
+                // FNV 해시로 비교한다. mxsel/ids가 같은데 이들이 다르면
+                // quant/그룹화 산출물이 오염된 것(버퍼 결함).
                 self.ctx.sync().map_err(|e| e.to_string())?;
-                let mut rx = vec![0u32; rows];
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut rx), rowexp_d as *const u8)?;
-                let nrows = rows.min(64);
-                let mut xh = vec![0u32; nrows * 4];
-                for r in 0..nrows {
-                    self.ctx.d2h(
-                        bytemuck::cast_slice_mut(&mut xh[r * 4..r * 4 + 4]),
-                        unsafe { xp.add(r * n_in * 4) } as *const u8,
-                    )?;
-                }
-                let mut xqw = vec![0u32; nrows * 4];
-                for r in 0..nrows {
-                    self.ctx.d2h(
-                        bytemuck::cast_slice_mut(&mut xqw[r * 4..r * 4 + 4]),
-                        unsafe { xsrc0.add(r * xq_w * 4) } as *const u8,
-                    )?;
-                }
+                let fnv = |b: &[u32]| -> u64 {
+                    b.iter().fold(0xcbf29ce484222325u64, |a, &w| {
+                        a.wrapping_mul(0x100000001b3) ^ (w as u64)
+                    })
+                };
+                let mut xqf = vec![0u32; rows.min(160) * xq_w];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut xqf), xsrc0 as *const u8)?;
+                let mut xf = vec![0u32; rows.min(160) * n_in];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut xf), xp as *const u8)?;
+                let mut rxf = vec![0u32; rows];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut rxf), rowexp_d as *const u8)?;
+                let mut pmf = vec![0u32; rows];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut pmf), perm_d as *const u8)?;
+                let mut ivf = vec![0u32; rows];
+                self.ctx.d2h(bytemuck::cast_slice_mut(&mut ivf), inv_d as *const u8)?;
                 eprintln!(
-                    "# moedump rows={rows} rowexp[:8]={:?} x64_sum={:016x} xq64_sum={:016x}",
-                    &rx[..rx.len().min(8)],
-                    xh.iter().fold(0u64, |a, &w| a.wrapping_add(w as u64)),
-                    xqw.iter().fold(0u64, |a, &w| a.wrapping_add(w as u64))
+                    "# moedump rows={rows} x_h={:016x} xq_h={:016x} rx_h={:016x} pm_h={:016x} iv_h={:016x}",
+                    fnv(&xf),
+                    fnv(&xqf),
+                    fnv(&rxf),
+                    fnv(&pmf),
+                    fnv(&ivf)
                 );
             }
             self.ctx.launch3(

@@ -241,22 +241,31 @@ impl Engine4 {
             if trace {
                 eprintln!("q4 layer {il} t={t_len}");
             }
-            if hp.is_ple(il) {
+            if hp.is_ple(il) && !super::frame::stage_skipped("ple") {
                 // 05-2 프리페치 소비 — decode1이 stash한 emb (t=1 전용.
                 // 프리필 전량 선적재(05-3)는 chunk 경계 행 불일치로 보류 — 주석 참조).
                 let pre = if t_len == 1 { self.ple_consume.take() } else { None };
                 stage!(ple, stages::ple_block(&ctx, seq_st, il, &mut res_hc, &ple_rows, pre)?);
             }
-            let (mix, inject) = stage!(hc, stages::hc_mix(&ctx, il, "attn", &res_hc)?);
-            let attn_out = if hp.is_recr(il) {
+        let (mix, inject) = stage!(hc, stages::hc_mix(&ctx, il, "attn", &res_hc)?);
+        let attn_out = if hp.is_recr(il) {
+            if super::frame::stage_skipped("gdn") {
+                // 진단용: GDN 생략(출력 무효) — 청크 의존 축 분리(plans/80).
+                recr_idx += 1;
+                vec![vec![0.0f32; n_embd]; t_len]
+            } else {
                 let o = stage!(gdn, stages::gdn_layer(&ctx, seq_st, il, &mix, t_len, recr_idx)?);
                 recr_idx += 1;
                 o
-            } else {
-                let o = stage!(qsa, stages::qsa_layer(&ctx, seq_st, il, &mix, t_len, full_idx)?);
-                full_idx += 1;
-                o
-            };
+            }
+        } else if super::frame::stage_skipped("qsa") {
+            full_idx += 1;
+            vec![vec![0.0f32; n_embd]; t_len]
+        } else {
+            let o = stage!(qsa, stages::qsa_layer(&ctx, seq_st, il, &mix, t_len, full_idx)?);
+            full_idx += 1;
+            o
+        };
             if trace {
                 nan_guard(&attn_out, if hp.is_recr(il) { "gdn_out" } else { "qsa_out" }, il);
             }

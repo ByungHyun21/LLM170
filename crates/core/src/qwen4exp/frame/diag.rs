@@ -75,9 +75,8 @@ pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &
             eprintln!("[nprd] {tag} t={t} n={n} {}", vals.join(" "));
         }
         if rows_on && std::env::var_os("LLM170_NP_ROW0FULL").is_some() {
-            // 앞 8행 전체(≤2560원소) 비트 덤프 — 어느 행·어느 요소부터 갈리는지.
             let full = n.min(2560);
-            let rows_n = t.min(8);
+            let rows_n = t.min(16);
             for r in 0..rows_n {
                 let vals: Vec<String> = v[r * n..r * n + full]
                     .iter()
@@ -87,6 +86,30 @@ pub(super) fn frame_ck(acc: &dyn Accelerator, h: u64, n: usize, t: usize, tag: &
             }
         }
     }
+}
+
+/// 진단용 버퍼 FNV 해시 — `LLM170_NP_BUFHASH=1`. 앞 len 원소의 비트를
+/// 해시해 한 줄로 찍는다. 층 경계마다 전 버퍼를 찍어 첫 오염 버퍼를
+/// 찾는 용도(plans/80 §A — 메모리 결함 추적).
+pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
+    if !super::diag::bufhash_on() || len == 0 {
+        return;
+    }
+    let mut v = vec![0.0f32; len];
+    if acc.frame_read(h, &mut v).is_ok() {
+        let mut x = 0xcbf29ce484222325u64;
+        for f in &v {
+            x ^= f.to_bits() as u64;
+            x = x.wrapping_mul(0x100000001b3);
+        }
+        eprintln!("[npbh] {tag} len={len} h={x:016x}");
+    }
+}
+
+pub(super) fn bufhash_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LLM170_NP_BUFHASH").is_some());
+    *ON
 }
 
 pub(super) fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {

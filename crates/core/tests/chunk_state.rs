@@ -166,7 +166,10 @@ fn chunk_size_state_divergence() {
             acc.frame_alloc(NTOK * n).expect("in"),
             acc.frame_alloc(NTOK * n).expect("in2"),
         );
-        let (az, bz) = (acc.frame_alloc(NTOK * n).expect("z"), acc.frame_alloc(NTOK * n).expect("z2"));
+        let (az, bz) = (
+            acc.frame_alloc(NTOK * wz.n_out as usize).expect("z"),
+            acc.frame_alloc(NTOK * wz.n_out as usize).expect("z2"),
+        );
         let (aba, bba) = (
             acc.frame_alloc(NTOK * hp.dt_rank).expect("b"),
             acc.frame_alloc(NTOK * hp.dt_rank).expect("b2"),

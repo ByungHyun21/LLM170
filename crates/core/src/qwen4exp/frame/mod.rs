@@ -15,7 +15,7 @@ mod forward;
 mod multi;
 mod np;
 
-use diag::{dbg, ftime_on, ftime_report, frame_ck, sync_mark};
+use diag::{buf_hash, dbg, ftime_on, ftime_report, frame_ck, sync_mark};
 
 pub use diag::stage_skipped;
 pub use forward::*;

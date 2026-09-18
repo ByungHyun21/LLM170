@@ -115,6 +115,9 @@ use llm170_profiler::profile_span;
                 t_m0.elapsed().as_secs_f64() * 1e3
             );
         }
+        ple_stage_hash("emb", &emb);
+        ple_stage_hash("key", &key);
+        ple_stage_hash("value", &value);
 
         let mut gated_hist: Vec<Vec<f32>> = vec![Vec::new(); t];
         {
@@ -179,6 +182,7 @@ use llm170_profiler::profile_span;
                 base += take;
             }
         });
+        ple_stage_hash("gated", &gated_hist);
         }
 
         // dilated depthwise conv (kern 4, dil 3, hist 9) — 시퀀스 상태 이용
@@ -222,6 +226,7 @@ use llm170_profiler::profile_span;
                 base += take;
             }
         });
+        ple_stage_hash("conv", &conv_out);
         // 상태 갱신: 마지막 hist 열
         for j in 0..hist {
             let src = &padded[t + j];
@@ -277,15 +282,39 @@ use llm170_profiler::profile_span;
         Ok(())
     }
 
+    /// 진단(plans/80): ple_block 하위 스테이지 산출물 FNV 해시 — 청크 불변
+    /// 결함의 하위 스테이지 특정용. `LLM170_PLE_DUMP=1`.
+    fn ple_stage_hash(tag: &str, rows: &[Vec<f32>]) {
+        if std::env::var_os("LLM170_PLE_DUMP").is_none() {
+            return;
+        }
+        let mut h = [0xcbf29ce484222325u64; 4];
+        for (i, r) in rows.iter().enumerate().take(64) {
+            let w = i / 16;
+            for v in r.iter() {
+                h[w] = h[w].wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64);
+            }
+        }
+        eprintln!(
+            "[pleh] {tag} n={} h1={:016x} h2={:016x} h3={:016x} h4={:016x}",
+            rows.len(), h[0], h[1], h[2], h[3]
+        );
+    }
     /// PLE n-gram 해시 — 호스트 u64 (ctx[s]=직전 s토큰, EOS 절단).
     pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
+        if std::env::var_os("LLM170_PLE_DUMP").is_some() {
+            eprintln!(
+                "[plehash] pos={} next_pos={} hist={:?} hist_valid={}",
+                seq.pos, seq.ple_next_pos, seq.ple_hist, seq.ple_next_pos == seq.pos
+            );
+        }
         let hp = ctx.model.hp.clone();
         let ngram = hp.ple_ngram;
         let heads = hp.ple_heads_per_ngram * 2; // bigram+trigram = 16
         let eos = hp.ple_eos;
         let hist0: Vec<u32> = seq.ple_hist.clone();
         let hist_valid = seq.ple_next_pos == seq.pos;
-        let mut hist: Vec<u32> = if hist_valid { hist0 } else { vec![eos; ngram - 1] };
+        let mut hist: Vec<u32> = if hist_valid { hist0.clone() } else { vec![eos; ngram - 1] };
         let mut rows = Vec::with_capacity(tokens.len() * heads);
         for (i, &tok) in tokens.iter().enumerate() {
             let mut ctx = vec![tok as u64; ngram];
@@ -295,10 +324,14 @@ use llm170_profiler::profile_span;
                 let prev: u64 = if j >= 0 {
                     tokens[j as usize] as u64
                 } else {
+                    // 청크 경계 lookback은 **호출 시작 스냅샷**(hist0)에서 읽는다.
+                    // 라이브 hist엔 이번 호출의 토큰이 이미 push되어 있어, 경계
+                    // 토큰의 trigram이 잘못된 선행 토큰을 참조한다(2026-09-18,
+                    // plans/80 — 청크 불변성 결함의 뿌리).
                     let back = s as i64 - i as i64;
-                    let k = hist.len() as i64 - back;
-                    if k >= 0 && (k as usize) < hist.len() {
-                        hist[k as usize] as u64
+                    let k = hist0.len() as i64 - back;
+                    if k >= 0 && (k as usize) < hist0.len() {
+                        hist0[k as usize] as u64
                     } else {
                         eos as u64
                     }
@@ -325,6 +358,13 @@ use llm170_profiler::profile_span;
             if hist.len() > ngram - 1 {
                 let cut = hist.len() - (ngram - 1);
                 hist.drain(..cut);
+            }
+        }
+        if std::env::var_os("LLM170_PLE_DUMP").is_some() {
+            eprintln!("[plerows] {:?}", &rows[..rows.len().min(3 * heads)]);
+            if rows.len() > 16 * heads {
+                let w: Vec<u32> = rows[16 * heads..16 * heads + 3 * heads].to_vec();
+                eprintln!("[plerows16] {w:?}");
             }
         }
         seq.ple_hist = hist;
