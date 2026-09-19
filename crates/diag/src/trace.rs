@@ -139,16 +139,16 @@ pub fn gap_by_pred(evs: &[Ev]) -> Vec<(String, f64, u32)> {
 mod tests {
     use super::*;
 
+    /// CAPTURE 전역 상태 테스트 — 병렬 실행 시 상호 간섭하므로 단일 순차 테스트로.
     #[test]
-    fn capture_off_push_noop() {
+    fn capture_lifecycle_and_take() {
+        // off 상태 push는 무시
+        capture_end();
         assert!(!capture_on());
         push(Ev { name: "x", lane: 1, start_ms: 0.0, dur_ms: 1.0, gap_next_ms: None, seq_ms: 0.0 });
         let (evs, _) = take();
         assert!(evs.is_empty(), "off 상태 push는 무시돼야 한다");
-    }
-
-    #[test]
-    fn seq_and_take() {
+        // on 상태: 순차 시각·갭 귀속
         capture_begin();
         push(Ev { name: "a", lane: 1, start_ms: 0.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 });
         push(Ev { name: "b", lane: 2, start_ms: 12.0, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 });
