@@ -1081,3 +1081,103 @@ extern "C" __global__ void __launch_bounds__(128) gemm_q8_0_mt16(
     }
 }
 
+
+// plans/83 D2: f32 듀얼 GEMV(t=1) — 같은 x를 쓰는 인접 f32 가중 2개를 1런치로.
+// 워프-퍼-출력 기하는 q4_gemm_f32_w와 동일(연속 출력 공간을 그대로 이어붙임) →
+// 행별 산술·축소 순서 동일, 비트 불변.
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_f32_w2(
+        const float* __restrict__ x, const float* __restrict__ w1, float* __restrict__ out1,
+        const float* __restrict__ w2, float* __restrict__ out2,
+        int n_in, int no1, int no2) {
+    const int o = (int)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const float* w; float* out; int oi;
+    if (o < no1) { w = w1; out = out1; oi = o; }
+    else if (o < no1 + no2) { w = w2; out = out2; oi = o - no1; }
+    else return;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const float4* r4 = reinterpret_cast<const float4*>(w + (size_t)oi * n_in);
+    const int n4 = n_in >> 2;
+    float4 a = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = lane; k < n4; k += 32) {
+        const float4 xv = x4[k];
+        const float4 rv = r4[k];
+        a.x += xv.x * rv.x; a.y += xv.y * rv.y; a.z += xv.z * rv.z; a.w += xv.w * rv.w;
+    }
+    float acc = (a.x + a.y) + (a.z + a.w);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffffffffffull, acc, off);
+    if (lane == 0) out[oi] = acc;
+}
+
+// plans/83 D2: 혼합 듀얼(q8_0 + f32, t=1) — 블록 파티션으로 q8 행은 원판
+// gemm_q8_0의 64스레드 판을, f32 행은 q4_gemm_f32_w의 워프 판을 그대로
+// 실행한다. 두 경로 모두 소스 커널과 행별 산술 동일 → 비트 불변.
+// hc 그룹 [down(q8_0,320), inject(f32,4)] 등 혼합 인접쌍용.
+extern "C" __global__ void __launch_bounds__(256) gemm_mix_dual(
+        const unsigned* __restrict__ xq, const unsigned* __restrict__ w8, float* __restrict__ out8, int no8,
+        const float* __restrict__ xf, const float* __restrict__ w4, float* __restrict__ out4, int no4,
+        int n_in, int xq_w) {
+    if ((int)blockIdx.x < no8) {
+        if (threadIdx.x >= 64) return;
+        // ── gemm_q8_0 판 (o = blockIdx.x) ──
+        const int o = (int)blockIdx.x;
+        int l = threadIdx.x;
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + 63 - l) >> 6;
+        int row_base = o * n_sub * 34;
+        float acc = 0.0f;
+        for (int m = 0; m < cnt; m++) {
+            int sb = l + (m << 6);
+            int wb = row_base + sb * 34;
+            float d = f16w(w8, wb);
+            int xw2 = (sb << 5) >> 2;
+            unsigned y0 = xq[xw2], y1 = xq[xw2+1], y2 = xq[xw2+2], y3 = xq[xw2+3];
+            unsigned y4 = xq[xw2+4], y5 = xq[xw2+5], y6 = xq[xw2+6], y7 = xq[xw2+7];
+            int wq = wb >> 2;
+            bool al = (wb & 3) == 2;
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qv;
+                if (al) qv = w8[wq + 1 + k];
+                else qv = (w8[wq + k] >> 16) | (w8[wq + k + 1] << 16);
+                unsigned yv = k==0?y0:k==1?y1:k==2?y2:k==3?y3:k==4?y4:k==5?y5:k==6?y6:y7;
+                isum = dot4(qv, yv, isum);
+            }
+            float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
+            acc += yd * d * (float)isum;
+        }
+        __shared__ double sh32[32];
+        double accd = (double)acc;
+        if (l >= 32) sh32[l - 32] = accd;
+        __syncthreads();
+        if (l < 32) {
+            accd += sh32[l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+            if (l == 0) out8[o] = (float)accd;
+        }
+        return;
+    }
+    // ── q4_gemm_f32_w 판 (워프-퍼-출력) ──
+    const int o4 = ((int)blockIdx.x - no8) * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (o4 >= no4) return;
+    const float4* x4 = reinterpret_cast<const float4*>(xf);
+    const float4* r4 = reinterpret_cast<const float4*>(w4 + (size_t)o4 * n_in);
+    const int n4 = n_in >> 2;
+    float4 a = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = lane; k < n4; k += 32) {
+        const float4 xv = x4[k];
+        const float4 rv = r4[k];
+        a.x += xv.x * rv.x; a.y += xv.y * rv.y; a.z += xv.z * rv.z; a.w += xv.w * rv.w;
+    }
+    float acc = (a.x + a.y) + (a.z + a.w);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffffffffffull, acc, off);
+    if (lane == 0) out4[o4] = acc;
+}

@@ -1263,9 +1263,50 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         // 혼합 패밀리 그룹(GDN [q8,q8,f32,f32] 등) — t=1에서 인접 q8_0 쌍을
         // 듀얼로 융합(plans/83 D2). 첫 분기의 동일-패밀리 조건에 걸리지 않는
         // 그룹의 q8_0 쌍도 같은 이득을 받는다. 비트 불변(행 산술 동일).
+        // plans/83 D2(계속): f32 인접쌍(β/α)은 f32 듀얼로, (q8,f32) 인접쌍
+        // (hc down+inject)은 혼합 듀얼로 — 각 1런치. 행 산술은 소스 커널과
+        // 동일 → 비트 불변.
+        let f32fam = |ty: GgmlType| matches!(ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
+        let dual_any = t == 1 && std::env::var_os("LLM170_NO_DUAL").is_none();
         let mut idx = 0usize;
         while idx < ws.len() {
             let w = &ws[idx];
+            if dual_any && idx + 1 < ws.len() && ws[idx + 1].n_in == w.n_in {
+                let a8 = w.ty == GgmlType::Q8_0;
+                let b8 = ws[idx + 1].ty == GgmlType::Q8_0;
+                let af = f32fam(w.ty);
+                let bf = f32fam(ws[idx + 1].ty);
+                if a8 && b8 {
+                    let (wd1, _) = self.dev_weight(w)?;
+                    let (wd2, _) = self.dev_weight(&ws[idx + 1])?;
+                    let o1 = self.fptr(outs[idx])?;
+                    let o2 = self.fptr(outs[idx + 1])?;
+                    let (xq, _xw) = self.frame_quant(xp, w.n_in as usize, t)?;
+                    self.gemm_q8_dual(xq, wd1, w.n_out as usize, o1, wd2, ws[idx + 1].n_out as usize, o2, w.n_in as usize)?;
+                    idx += 2;
+                    continue;
+                }
+                if af && bf {
+                    let (wd1, _) = self.dev_weight(w)?;
+                    let (wd2, _) = self.dev_weight(&ws[idx + 1])?;
+                    let o1 = self.fptr(outs[idx])?;
+                    let o2 = self.fptr(outs[idx + 1])?;
+                    self.gemm_f32_dual(xp as *const u8, wd1, w.n_out as usize, o1, wd2, ws[idx + 1].n_out as usize, o2, w.n_in as usize)?;
+                    idx += 2;
+                    continue;
+                }
+                if a8 && bf {
+                    let (wd1, _) = self.dev_weight(w)?;
+                    let (wd2, _) = self.dev_weight(&ws[idx + 1])?;
+                    let o1 = self.fptr(outs[idx])?;
+                    let o2 = self.fptr(outs[idx + 1])?;
+                    let ni = w.n_in as usize;
+                    let (xq, _xw) = self.frame_quant(xp, ni, t)?;
+                    self.gemm_mix_dual(xq, wd1, w.n_out as usize, o1, xp as u64, wd2, ws[idx + 1].n_out as usize, o2, ni)?;
+                    idx += 2;
+                    continue;
+                }
+            }
             if t == 1
                 && w.ty == GgmlType::Q8_0
                 && idx + 1 < ws.len()
