@@ -438,3 +438,18 @@ named kernel (qsa_flash_wmma v1) is probe-only and its plans/69 spill was
 superseded by the wmma2/wmma2v2 line (plans/74). pp16384 290-296 stands at
 127% of llama hip (229); the 310 stretch exceeds llama and belongs to the
 GEMM campaign (mmq family), not attention.
+
+## 2026-09-19 (5) — plans/83 D2: bandwidth anomaly pinned as the real target
+
+With LLM170_GRAPH=1 + KTRACE the decode step's kernel-execution sum is
+~56ms (gaps ~9ms under instrumentation) — the step is kernel-execution
+bound. Necessary activated bytes/step (10/512 experts + dense trunk + QSA
++ hc + head) compute to ~5GB, i.e. ~20ms at 240GB/s — the step runs ~3x
+above the weight-read roofline. llama-vk's 23.22 t/s implies ~10-13GB/step
+at achievable APU bandwidth, also above the naive roofline but 25% under
+us. Prime suspect: memory placement — our 58GB VRAM / 45GB GTT split makes
+GTT-resident layers run at GTT read throughput, while RADV (uma:1) may
+serve the whole model from one pool. Next campaign entry: per-layer step
+time vs weight residency (VRAM vs GTT), then placement/tiling to close the
+3x anomaly. This supersedes the "coopmat tiles" framing: the gap is
+bandwidth placement, not matrix-core throughput.
