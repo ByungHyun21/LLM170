@@ -505,3 +505,15 @@ entry must start from co-design, not naive fusion. Complete avenue ledger
 for this session: 7 falsifications, 1 landed win (pair fusion +1.8%,
 bit-identical), campaign spec + tools in tree. The >=23 target transfers
 to the occupancy campaign with all evidence attached.
+
+## 2026-09-19 (10) — plans/83 D2: pair tier maxed at 18.01 t/s
+
+Corrected attribution: the earlier +1.8% was PLE-only — the GDN group
+[q8 qkv, q8 gate, f32 beta, f32 alpha] is mixed-family and bypassed the
+same-family branch where the dual lived. Wiring pair fusion into the
+per-weight (mixed) loop landed the intended qkv+gate fusion: FN tg32
+17.73 → 18.01 t/s (session total 17.41 → 18.01, +3.5%, bit-identical,
+three gates PASS, pp512 unaffected at 253 t/s). The census's gy=12800
+dual = QSA q+k (12288+512). Remaining pair-tier residue (~24 launches:
+QSA v, indexer bf16 pairs) is worth <1%; the tier is closed. Everything
+beyond this is the hc dependent-chain cascade campaign.
