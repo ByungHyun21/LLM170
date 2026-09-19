@@ -556,3 +556,12 @@ FN gate PASS. Not default: the shared dispatcher has no model scoping and
 the reduction-order change flips a 27B near-tie (token 5, measured).
 Default adoption requires splitting the dispatch by model/frame path —
 noted as a small follow-up for the campaign.
+
+## 2026-09-19 (14) — plans/83 D2: warp-variant gain is marginal; session values
+
+Variance measurement (3x tg32, no env): 18.18/18.12/18.10 — run noise
+±0.08. The Q8W_SMALLN "+0.8%" (18.25) is ~2x noise, real but marginal;
+combined with the 27B near-tie break it stays opt-in. Final session
+ledger for D2: five landed bit-stable increments (17.41 → 18.10 default,
+18.25 opt-in, +4-4.8%), twelve falsifications, all tools in tree. The
+23 t/s target requires the mega-kernel occupancy redesign.
