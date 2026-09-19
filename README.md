@@ -6,35 +6,50 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
+Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 close). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
-| backend | pp512 | pp4096 | pp16384 | tg128@4k |
-|---|---|---|---|---|
-| LLM170 hip | **367-370** | 326-337 | 290-296 | 11.52 |
-| LLM170 vulkan | 318 | 232 | 174.5 (8k) | 11.26 |
-| llama.cpp hip | 340 | **335** | **297** | 11.65 |
-| llama.cpp vulkan | 343 | 318 | — | **12.05** |
+| backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
+|---|---|---|---|---|---|
+| LLM170 hip | **363** | 319 | — | 292 | 11.53 |
+| LLM170 vulkan | 341 | 231 | 174.5 | n/a | 11.13 |
+| llama.cpp hip | 340 | **335** | — | **297** | 11.65 |
+| llama.cpp vulkan | 343 | 318 | — | — | **12.05** |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | 11.5 | 11.26 | 11.65 | 12.05 |
+| tg single | 11.5 | 11.13 | 11.65 | 12.05 |
 | MTP single (k=2) | **14.4** | — | ~12 | — |
 | MTP + np4 | 7.2 | n/a | 15.5 *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
+
+No Vulkan backend for qwen4exp (plans/64 §7); all rows are HIP.
+Decode +4% from plans/83 launch-fusion work (17.41 → 18.10 baseline).
+
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 hip | **253-275** | **275-278** | **244-249** | **18.60** |
-| LLM170 vulkan | 237 | 277 | 243 | 18.49 |
+| LLM170 hip | **231-275** | **276** | **246** | **18.10-18.43** |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
-| llama.cpp vulkan | 230 | — | — | **22.98** |
+| llama.cpp vulkan (coopmat) | 230 | — | — | **23.22** |
 
-| mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
-|---|---|---|---|---|
-| tg single | **18.60** | 18.49 | 17.43 | 22.98 |
-| np4 aggregate | **45.9** | 18.6 | 41.1 *(HTTP†)* | — |
+| mode | LLM170 hip | llama hip |
+|---|---|---|
+| tg single | **18.10-18.43** | 17.43 |
+| np4 aggregate | **45.9** | 41.1 *(HTTP†)* |
+
+### Quality (2026-09-19)
+
+- Tokenizer: 100% llama.cpp token-for-token match — 86 corpus files ×
+  special on/off, 398,177 tokens, both models (`scripts/verify_tok.py`).
+- Greedy gates: 27B hip / 27B vulkan / FN hip all PASS
+  (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
+- Sampling: seed-reproducible, temp→0 = argmax; temperature / top_k /
+  top_p / min_p / repeat_penalty / seed on all completion endpoints.
+- Generation: Korean Q&A over HTTP answers correctly (e.g. "서울") with
+  coherent `<think>` reasoning; chunk invariance fenced by
+  `llm170 diag chunk-check`.
 
 ## Build & run
 
