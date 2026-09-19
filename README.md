@@ -12,10 +12,10 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
-| LLM170 hip | **363** | 319 | — | 292 | 11.53 |
-| LLM170 vulkan | 341 | 231 | 174.5 | n/a | 11.13 |
-| llama.cpp hip | 340 | **335** | — | **297** | 11.65 |
-| llama.cpp vulkan | 343 | 318 | — | — | **12.05** |
+| LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
+| LLM170 vulkan | 341 | 231 | 174.5 | 116.8 | 11.13 |
+| llama.cpp hip | 340 | 318-335 | 317 | 293-297 | 11.65 |
+| llama.cpp vulkan | 343 | 318 | 301 | 273 | **12.05** |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
@@ -30,9 +30,9 @@ Decode +4% from plans/83 launch-fusion work (17.41 → 18.10 baseline).
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
-| LLM170 hip | **231-275** | **276** | **246** | **18.10-18.43** |
+| LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
-| llama.cpp vulkan (coopmat) | 230 | — | — | **23.22** |
+| llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
