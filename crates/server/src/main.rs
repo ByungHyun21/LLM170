@@ -360,9 +360,9 @@ fn cmd_gguf_dump(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    llm170_profiler::reset();
+    llm170_diag::span::reset();
     let f = {
-        llm170_profiler::profile_span!("cli::gguf-dump::total");
+        llm170_diag::profile_span!("cli::gguf-dump::total");
         let f = match llm170_gguf::GgufFile::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -375,7 +375,7 @@ fn cmd_gguf_dump(args: &[String]) -> ExitCode {
     };
     drop(f);
 
-    if let Some(rep) = llm170_profiler::report() {
+    if let Some(rep) = llm170_diag::span::report() {
         eprint!("\n{rep}");
     }
     ExitCode::SUCCESS

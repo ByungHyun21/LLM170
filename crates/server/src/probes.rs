@@ -121,6 +121,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
+        "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-mmq-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());

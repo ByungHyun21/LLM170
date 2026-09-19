@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-llm170-profiler = { path = "../profiler" }
+llm170-diag = { path = "../diag" }
 
 [lints]
 workspace = true

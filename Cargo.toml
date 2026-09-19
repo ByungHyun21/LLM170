@@ -4,7 +4,6 @@ members = [
     "crates/core",
     "crates/diag",
     "crates/gguf",
-    "crates/profiler",
     "crates/server",
     "crates/backend-gpu",
 ]
