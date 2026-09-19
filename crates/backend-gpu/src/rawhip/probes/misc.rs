@@ -206,6 +206,79 @@ pub fn bw_test() -> Result<String, String> {
     Ok(format!("bw_probe: {:.1}us -> {:.0} GB/s (checksum={})", dt * 1e6, bytes as f64 / dt / 1e9, r[63] as u32))
 }
 
+/// 배치별 읽기 대역폭 프로브 (plans/83 D2) — 같은 bw_probe 커널로
+/// ① VRAM 커브아웃 여유 상태, ② hipMallocHost(GTT 핀) 버퍼,
+/// ③ VRAM을 채운 뒤의 hipMalloc(GTT 스펠) 버퍰를 각각 읽는다.
+/// APU에서 무게 초과분(103GB 중 ~45GB)이 어느 속도로 읽히는지 직접 측정.
+pub fn bw_place_test() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    // 스트리밍 판독(배치 무관 DRAM BW): 행 121KB × 17408행 = 2.1GB — L2(32MB)를
+    // 65배 초과해 재독 캐시 효과를 제거한다. bsize=6056(=176×34.4→정수).
+    let (n_in, n_out, bsize) = (5120usize, 17408usize, 6056usize);
+    let bytes = n_out * (n_in / 256) * bsize; // ≈ 2.1 GiB
+    let part = ctx.scratch(n_out * 64 * 8)?;
+    let mut out = String::new();
+
+    let n_q = (bytes / 8) as u64;
+    let run = |w: *mut u8, label: &str, out: &mut String| -> Result<(), String> {
+        let mut wp = w as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut nq = n_q;
+        let mut args = vec![
+            (&mut wp) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut nq) as *mut u64 as *mut std::ffi::c_void,
+        ];
+        // 페이지 커밋 + 영-페이지 중복 제거(ROCm 지연 커밋 회피)
+        unsafe { crate::rawhip::ck(hip::hipMemset(w as *mut std::ffi::c_void, 0x5A, bytes), "memset")?; }
+        ctx.launch("bw_stream", 4096, 1, 256, &mut args)?;
+        ctx.sync()?;
+        let reps = 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            ctx.launch("bw_stream", 4096, 1, 256, &mut args)?;
+        }
+        ctx.sync()?;
+        let dt = t0.elapsed().as_secs_f64() / reps as f64;
+        out.push_str(&format!(
+            "  {label}: {:.0}us → {:.0} GB/s\n",
+            dt * 1e6,
+            bytes as f64 / dt / 1e9
+        ));
+        Ok(())
+    };
+
+    // ① 여유 VRAM 내 hipMalloc
+    let w1 = ctx.alloc(bytes)?;
+    // 더미 패턴 기록 (읽기 최적화 방해 없음 — XOR 체크섬만 소비)
+    run(w1, "hipMalloc (VRAM 여유)", &mut out)?;
+
+    // ② hipMallocHost — GTT 핀 (호스트 매핑, coherent)
+    let mut wh: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe {
+        let r = hip::hipMallocHost(&mut wh, bytes);
+        if r != hip::hipError_t_hipSuccess {
+            out.push_str(&format!("  hipMallocHost 실패: {r:?}\n"));
+        } else {
+            run(wh as *mut u8, "hipMallocHost (GTT 핀)", &mut out)?;
+        }
+    }
+
+    // ③ VRAM을 거의 채운 뒤 hipMalloc — 스펠 판정
+    let (free, _total) = gpu_mem_free().unwrap_or((0, 0));
+    let chunk = 1usize << 30; // 1 GiB
+    let mut _guard = 0;
+    while free as usize > (_guard + 2) * chunk + (2 << 30) && _guard < 64 {
+        match ctx.alloc(chunk) {
+            Ok(_p) => _guard += 1,
+            Err(_) => break,
+        }
+    }
+    let w3 = ctx.alloc(bytes)?;
+    run(w3, "hipMalloc (VRAM 포화 후)", &mut out)?;
+    Ok(format!("bw-place ({bytes}B 버퍼, 프로브 30회 평균):\n{out}"))
+}
+
 /// 가드용 최소 VRAM 조회 (2026-09-16) — 컨텍스트 없이 런타임 질의만.
 /// 성공 시 (free, total) 바이트.
 pub fn gpu_mem_free() -> Option<(u64, u64)> {

@@ -453,3 +453,19 @@ serve the whole model from one pool. Next campaign entry: per-layer step
 time vs weight residency (VRAM vs GTT), then placement/tiling to close the
 3x anomaly. This supersedes the "coopmat tiles" framing: the gap is
 bandwidth placement, not matrix-core throughput.
+
+## 2026-09-19 (6) — plans/83 D2: placement hypothesis falsified; occupancy starvation pinned
+
+New probe `llm170 bw-place` (streaming 2.1GiB grid-stride read, memset-
+committed, new `bw_stream` kernel — the old `bw_probe` is a sparse pattern
+emulator touching ~320B/row and only measures cache): hipMalloc (VRAM
+spare) 244 GB/s, hipMallocHost (GTT pinned) 239 GB/s, hipMalloc after
+VRAM saturation 245 GB/s. **All memory placements stream at DDR5 peak —
+there is no GTT penalty**, and ROCm silently spills hipMalloc past VRAM at
+full speed. Combined with earlier findings (host skeleton 2.2ms/step,
+kernel-exec sum = wall): the decode step's low effective bandwidth lives
+in the kernels' shape occupancy — ~500 dense/hc/GDN GEMV launches per step
+at gy=320-10240 blocks x 64 threads underoccupy the 64-CU GPU (20-40K
+threads resident). Campaign direction: fuse the per-layer small GEMVs
+(hc/GDN projections) into fewer wider launches. The probe stays as the
+placement/BW ground-truth tool.

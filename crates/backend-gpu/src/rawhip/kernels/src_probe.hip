@@ -240,3 +240,18 @@ extern "C" __global__ void wmma2_dump(const __fp16* A, const __fp16* B, float* C
     #pragma unroll
     for (int l = 0; l < 8; l++) C[lane * 8 + l] = d[l];
 }
+
+// plans/83 D2: 진 스트리밍 판독 프로브 — grid-stride로 전 버퍼를 64B씩 소비.
+// 배치(VRAM 커브아웃 vs GTT)별 DRAM 대역폭 직접 측정용. bw_probe는 희소
+// 패턴 에뮬레이터(행당 320B)라 절대 BW가 안 나온다.
+extern "C" __global__ void __launch_bounds__(256) bw_stream(
+        const unsigned long long* w, double* part, unsigned long long n_q) {
+    unsigned long long i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 8;
+    unsigned long long acc = 0;
+    const unsigned long long stride = (size_t)gridDim.x * blockDim.x * 8;
+    for (; i + 7 < n_q; i += stride) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) acc ^= w[i + k];
+    }
+    if (acc == 0xdeadbeefdeadbeefULL) part[0] = 1.0; // 반드시 소비
+}
