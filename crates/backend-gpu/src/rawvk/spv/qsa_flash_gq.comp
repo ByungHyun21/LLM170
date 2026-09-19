@@ -1,0 +1,151 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+// qsa_flash_gq (plans/83 D) — 프리필 GQA 다중쿼리 flash. qsa_flash 의 확장:
+// WG 하나가 (행 R개 × kv헤드의 gq 쿼리헤드) = 12쿼리를 맡아 K/V 타일을
+// 1회만 읽는다 — 어텐션 트래픽이 1/12 로 내려가 장문 프리필(pp4096)의
+// O(N²) 지연이 사라진다 (rawhip qsa_flash_gqa 계열의 VK 미러).
+//   grid (ceil(t/R), nk), 256스레드 (PV는 tid < hd).
+//   QK: 레인=키, 워프=32차원 슬라이스 — 쿼리 j 루프로 sp 재사용.
+//   softmax: 쿼리별 러닝 m/s 온라인 갱신(워프0 셔플 축약).
+//   PV: 스레드=차원 — V는 쿼리 12개가 같은 레지스터값을 재사용.
+// 인과성은 쿼리별 상한(p < pos0+row+1) 마스크.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Q { float q[]; };     // [t][n_head*2hd]
+layout(binding = 1) readonly buffer Ck { float ck[]; };   // [ctx][n_kv*hd]
+layout(binding = 2) readonly buffer Cv { float cv[]; };   // [ctx][n_kv*hd]
+layout(binding = 3) buffer O { float o[]; };              // [t][n_head*hd]
+layout(push_constant) uniform PC {
+    int pos0; int nh; int nk; int hd; int t;
+} pc;
+
+const int KT = 32;                 // 키 타일 크기
+const int KS = 257;                // shared 행 스트라이드 — 257 mod 32 = 1 → 뱅크 무충돌
+const int R = 4;                   // WG당 쿼리 행
+const int GQMAX = 6;              // 쿼리헤드/kv헤드 상한 (27B GQA 24/4=6)
+const int NQMAX = R * GQMAX;      // 24쿼리 — 공유 메모리 예산(64KB LDS) 한계권
+
+shared float ks[KT][KS];           // K 타일. V는 PV에서 직접(코얼레스).
+shared float qsh[NQMAX][256];      // 쿼리 벡터 [j][d] (hd=256)
+shared float sp[8][33];            // 워프별 QK 부분합
+shared float pf[NQMAX][KT];        // 타일 확률
+shared float resc[NQMAX];          // PV 재스케일 계수
+shared float mrun[NQMAX];          // 러닝 최대
+shared float srun[NQMAX];          // 러닝 합
+
+void main() {
+    int rb = int(gl_WorkGroupID.x) * R;
+    int kvh = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationIndex);
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    int hd = pc.hd;
+    int gq = pc.nh / pc.nk;
+    int rows = min(R, pc.t - rb);
+    int nq = rows * gq;
+    int h0 = kvh * gq;
+    int vstride = pc.nk * hd;
+    int kvb = kvh * hd;
+    int npmax = min(pc.pos0 + rb + rows, pc.pos0 + pc.t);
+
+    if (gq > GQMAX) return;         // 배열 크기 계약 — 상위 GQA는 구 판으로
+
+    // Q·게이트 스테이징 — [j = r*gq + h][d]
+    for (int i = tid; i < nq * hd; i += 256) {
+        int j = i / hd;
+        int d = i - j * hd;
+        int row = rb + j / gq;
+        int h = h0 + (j - (j / gq) * gq);
+        int qb = row * pc.nh * 2 * hd + h * 2 * hd;
+        qsh[j][d] = q[qb + d];
+    }
+    for (int j = 0; j < nq; j++) {
+        mrun[j] = -3.4028235e38;
+        srun[j] = 0.0;
+        resc[j] = 1.0;
+    }
+    float acc[NQMAX];
+    for (int j = 0; j < nq; j++) acc[j] = 0.0;
+    barrier();
+
+    for (int p0 = 0; p0 < npmax; p0 += KT) {
+        // ── 1) K 타일 → shared (d 연속 = 코얼레스, 범위 밖 클램프)
+        if (tid < hd) {
+            for (int r = 0; r < KT; r++) {
+                int p = min(p0 + r, npmax - 1);
+                ks[r][tid] = ck[p * vstride + kvb + tid];
+            }
+        } else {
+            for (int r = 0; r < KT; r++) ks[r][tid] = 0.0;
+        }
+        barrier();
+
+        // ── 2) QK+softmax — 쿼리 루프. 레인=키, 워프=32차원 슬라이스(8fma/스레드).
+        // sp는 j마다 소비되므로(per-j interleaving) 루프 안의 순서가 계약이다.
+        for (int j = 0; j < nq; j++) {
+            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            for (int i = 0; i < 8; i++) {
+                int d = wid * 32 + i * 4;
+                if (d + 3 < hd) {
+                    a0 = fma(qsh[j][d], ks[lane][d], a0);
+                    a1 = fma(qsh[j][d + 1], ks[lane][d + 1], a1);
+                    a2 = fma(qsh[j][d + 2], ks[lane][d + 2], a2);
+                    a3 = fma(qsh[j][d + 3], ks[lane][d + 3], a3);
+                }
+            }
+            sp[wid][lane] = (a0 + a1) + (a2 + a3);
+            barrier();
+            if (wid == 0) {
+                float y = 0.0;
+                for (int w = 0; w < 8; w++) y += sp[w][lane];
+                int row = rb + j / gq;
+                float d2 = (p0 + lane < pc.pos0 + row + 1) ? y : -3.4028235e38;
+                float mx = d2;
+                for (int off = 16; off > 0; off >>= 1)
+                    mx = max(mx, subgroupShuffleDown(mx, off));
+                // 짧은 np 쿼리의 전부-마스크 타일: mn=-inf → NaN 방지 유한 바닥.
+                float mn = max(subgroupBroadcastFirst(mx), -3.0e37);
+                float e = exp(d2 - mn);
+                float es = e;
+                for (int off = 16; off > 0; off >>= 1)
+                    es += subgroupShuffleDown(es, off);
+                if (lane == 0) {
+                    if (mn > -1.0e37) {
+                        float r2 = exp(mrun[j] - mn);
+                        srun[j] = srun[j] * r2 + es;
+                        mrun[j] = mn;
+                        resc[j] = r2;
+                    } else {
+                        resc[j] = 1.0;
+                    }
+                }
+                pf[j][lane] = e;
+            }
+            barrier();
+        }
+
+        barrier();
+
+        if (tid < hd) {
+            int kv = min(KT, npmax - p0);
+            for (int j = 0; j < nq; j++) acc[j] *= resc[j];
+            for (int k = 0; k < KT; k++) {
+                if (k < kv) {
+                    float v = cv[(p0 + k) * vstride + kvb + tid];
+                    for (int j = 0; j < nq; j++)
+                        acc[j] = fma(pf[j][k], v, acc[j]);
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid >= hd) return;
+    for (int j = 0; j < nq; j++) {
+        int row = rb + j / gq;
+        int h = h0 + (j - (j / gq) * gq);
+        int qb = row * pc.nh * 2 * hd + h * 2 * hd;
+        float g = 1.0 / (1.0 + exp(-q[qb + hd + tid]));
+        o[(row * pc.nh + h) * hd + tid] = acc[j] * (1.0 / srun[j]) * g;
+    }
+}

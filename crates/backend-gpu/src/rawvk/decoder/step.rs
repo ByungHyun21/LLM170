@@ -534,8 +534,15 @@ impl DecoderState {
                             (n_kv * hd).div_ceil(64) as u32, t as u32, 1)?;
                     }
                 }
-                // flash — grid (t, n_head), np = pos0+행+1
-                {
+                // flash — 프리필(t≥2, GQA ≤6:1)은 다중쿼리 판(plans/83 D):
+                // K/V 타일을 24쿼리가 공유해 장문 프리필(pp4096) 어텐션 트래픽·
+                // 지연을 1/24로 줄인다. 폴백(구 판)은 LLM170_VK_NOGQ=1.
+                if t >= 2 && !kv8 && n_head / n_kv.max(1) <= 6 && std::env::var_os("LLM170_VK_NOGQ").is_none() {
+                    let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, t as u32]);
+                    self.run_pipe("qsa_flash_gq", QSA_FLASH_GQ_SPV, 4, 20,
+                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                        &push, (t as u32).div_ceil(4), n_kv as u32, 1)?;
+                } else {
                     let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32]);
                     if kv8 {
                         self.run_pipe("qsa_flash_q8", QSA_FLASH_Q8_SPV, 4, 16,
@@ -545,6 +552,7 @@ impl DecoderState {
                         self.run_pipe("qsa_flash", QSA_FLASH_SPV, 4, 16,
                             &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
                             &push, t as u32, n_head as u32, 1)?;
+
                     }
                 }
                 self.gemv_w(self.b_aout.buf, self.b_xq_g.buf, &format!("blk.{il}.attn_output.weight"), self.b_gout.buf, t, n_head * hd)?;

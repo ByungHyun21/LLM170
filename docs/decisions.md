@@ -341,3 +341,26 @@ offloading work will build on.
 > `LLM170_NO_GQA2D` survives only as the f32-KV dump diagnostic.
 > `qsa_flash_wmma` itself stays an opt-in experiment (demoted in plans/69
 > after the 9.5× regression on this device).
+
+## 2026-09-19 — Vulkan prefill GQA multi-query flash (plans/83 D)
+
+`qsa_flash` (prefill) ran one workgroup per (row, head), scanning the whole
+KV prefix serially — attention latency grew O(N^2) per chunk and dominated
+long prefills (pp4096: chunk walls 1.6s→5.8s, 134-145 t/s vs llama 318).
+
+`qsa_flash_gq` gives one workgroup 4 rows x 6 GQA sibling heads (24 queries)
+sharing each staged K/V tile: attention traffic and latency drop ~24x.
+Verified against a pure-Python reference and the old kernel on synthetic
+data *and* on engine-dumped activations (layers 0 and 1, full gate-prompt
+shape): all three agree to 5e-6. Permanent A/B probe: `llm170 vk-flash-check`.
+
+pp4096 134 -> 232 t/s (+73%; llama-vulkan parity 318/232 = 0.73). Remaining
+attention cost is warp0's serial per-query softmax chains; the obvious next
+steps (persistent sp, coopMat QK) need an LDS-budget redesign.
+
+**Near-tie baseline note**: the arithmetic-order change flips near-tie tokens
+on the adversarial Korean gate prompt (the documented chunk-size residual
+class — docs/chunk-invariance.md). The new stream is reference-correct;
+HIP is untouched and still matches the original baseline. Gate baselines are
+now per-runtime (`.gate-27b-baseline-vk.txt`); `LLM170_VK_NOGQ=1` restores
+the old single-query kernel.
