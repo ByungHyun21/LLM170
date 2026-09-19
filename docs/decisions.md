@@ -494,3 +494,14 @@ Pair-fusion cannot touch these (no shared-input independence); the next
 tier is stage-cascade fusion (one kernel per hc norm→mean→combine chain,
 replicating exact arithmetic order for bit-identity), a dedicated campaign
 with the fp/gate verification ladder already in tree.
+
+## 2026-09-19 (9) — plans/83 D2: session close-out
+
+Graph replay re-verified working under KTRACE (launch suppression during
+replay confirmed; end-to-end +1% stands). The cascade-fusion tier carries
+a measured-negative precedent (plans/73 rms_small: 16.78→16.28 t/s — the
+320-element serial f32 chain lost to the 2-launch parallel), so tier-2
+entry must start from co-design, not naive fusion. Complete avenue ledger
+for this session: 7 falsifications, 1 landed win (pair fusion +1.8%,
+bit-identical), campaign spec + tools in tree. The >=23 target transfers
+to the occupancy campaign with all evidence attached.
