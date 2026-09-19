@@ -362,6 +362,26 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         Ok(out)
     }
 
+    /// np greedy 배치 — 토큰만 회수 (기본 구현은 로짓 전사 + CPU 스캔이라
+    /// np4 어그리게이트가 10.3까지 무너졌다; plans/83 D5). step_core+GPU argmax
+    /// 루프 = 싱글 디코드 비용 × n_seq.
+    fn raw_step_multi_greedy(
+        &self,
+        seqs: &[usize],
+        poss: &[u32],
+        emb: &[f32],
+    ) -> Result<Vec<u32>, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        let n = ds.n_embd;
+        let mut toks = Vec::with_capacity(seqs.len());
+        for (i, (&sq, &ps)) in seqs.iter().zip(poss.iter()).enumerate() {
+            ds.step_core(sq, ps as usize, &emb[i * n..(i + 1) * n])?;
+            toks.push(ds.lg_argmax()?);
+        }
+        Ok(toks)
+    }
+
     /// np×spec 병합 검증 — 그룹(seq-major)별 per-token step.
     fn verify_batch_ms(
         &self,

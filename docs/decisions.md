@@ -377,3 +377,15 @@ dense-GEMV family (`gemm_q8_0`, incl. gy=10240 calls) dominating the step,
 with the t>=16 tile path already bypassing it — the t=1 GEMV and the MoE
 grouped GEMMs are the campaign targets. Recorded here so the next plan
 starts from the correct premise.
+
+## 2026-09-19 — plans/83 D5: 27B np4 vulkan tg root cause
+
+np4 aggregate 10.3 t/s vs hip 32.1: the VkDecoder runs the np step as
+n_seq sequential single-slot passes (each ~89ms = the single-decode cost),
+so the aggregate is single-stream rate with no weight-pass sharing. The
+default-trait path also transfers full logits per slot; the new
+`raw_step_multi_greedy` override recovers tokens via the GPU argmax
+(no 608KB d2h per slot) — kept, but it is not the bottleneck. Reaching
+hip-level np needs a true multi-sequence batched `step_batch` (per-row KV
+append to different seq buffers + per-row attention over per-seq KV),
+a dedicated kernel-path campaign.
