@@ -56,6 +56,45 @@ impl Q4Acc {
     }
 
     /// GEMV/GEMM 1런치 — xq는 이미 업로드·양자화된 활성 포인터.
+    /// q8_0 듀얼 GEMV (t=1) — 같은 xq를 쓰는 인접 2 가중을 1런치로.
+    /// gemm_q8_0_dual의 행 산술은 원판 gemm_q8_0과 동일(비트 불변).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gemm_q8_dual(
+        &self,
+        xq: *mut u8,
+        w1: *mut u8,
+        no1: usize,
+        out1: *mut u8,
+        w2: *mut u8,
+        no2: usize,
+        out2: *mut u8,
+        ni: usize,
+    ) -> Result<(), String> {
+        let gy = (no1 + no2).min(65535) as u32;
+        let gz = (no1 + no2).div_ceil(65535) as u32;
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w1p = w1 as *mut std::ffi::c_void;
+        let mut w2p = w2 as *mut std::ffi::c_void;
+        let mut o1 = out1 as *mut std::ffi::c_void;
+        let mut o2 = out2 as *mut std::ffi::c_void;
+        let mut ni_a = ni as i32;
+        let mut no1a = no1 as i32;
+        let mut no2a = no2 as i32;
+        let mut xw = (ni / 4 + ni / 32 + ni / 16) as i32;
+        let mut args = vec![
+            (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w1p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w2p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o1) as *mut _ as *mut std::ffi::c_void,
+            (&mut o2) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni_a) as *mut _ as *mut std::ffi::c_void,
+            (&mut no1a) as *mut _ as *mut std::ffi::c_void,
+            (&mut no2a) as *mut _ as *mut std::ffi::c_void,
+            (&mut xw) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("gemm_q8_0_dual", 1, gy, gz, 64, &mut args)
+    }
+
     pub(super) fn launch_gemm(
         &self,
         ty: u32,
