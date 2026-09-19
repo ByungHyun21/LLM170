@@ -179,7 +179,7 @@ fn align_up(v: u64, align: u64) -> u64 {
 impl GgufFile {
     /// 파일을 열어 헤더+메타+텐서 정보까지만 파싱 (무게 미로딩).
     pub fn open(path: &Path) -> Result<Self> {
-        llm170_profiler::profile_span!("gguf::open");
+        llm170_diag::profile_span!("gguf::open");
         let file = std::fs::File::open(path)?;
         let file_size = file.metadata()?.len();
         let mut r = BufReader::new(file);

@@ -59,7 +59,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         ));
     }
 
-    llm170_profiler::reset();
+    llm170_diag::span::reset();
     let t_start = std::time::Instant::now();
     // 아키텍처 판별 → qwen4exp 전용 엔진 분기.
     // ENOENT 윈도우 대기 (LLM170_OPEN_WAIT_SECS) — 판별 실패시 재시도.
@@ -284,7 +284,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-    if let Some(rep) = llm170_profiler::report() {
+    if let Some(rep) = llm170_diag::span::report() {
         eprint!("\n{rep}");
     }
     ExitCode::SUCCESS

@@ -487,8 +487,8 @@ dependencies = [
  "hanzo-cubecl-hip-sys",
  "libc",
  "llm170-core",
+ "llm170-diag",
  "llm170-gguf",
- "llm170-profiler",
  "parking_lot",
 ]
 
@@ -501,7 +501,6 @@ dependencies = [
  "llm170-backend-gpu",
  "llm170-diag",
  "llm170-gguf",
- "llm170-profiler",
  "memmap2",
 ]
 
@@ -513,12 +512,8 @@ version = "0.1.0"
 name = "llm170-gguf"
 version = "0.1.0"
 dependencies = [
- "llm170-profiler",
+ "llm170-diag",
 ]
-
-[[package]]
-name = "llm170-profiler"
-version = "0.1.0"
 
 [[package]]
 name = "llm170-server"
@@ -531,7 +526,6 @@ dependencies = [
  "llm170-core",
  "llm170-diag",
  "llm170-gguf",
- "llm170-profiler",
  "log",
  "memmap2",
 ]
