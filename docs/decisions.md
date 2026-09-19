@@ -389,3 +389,14 @@ default-trait path also transfers full logits per slot; the new
 hip-level np needs a true multi-sequence batched `step_batch` (per-row KV
 append to different seq buffers + per-row attention over per-seq KV),
 a dedicated kernel-path campaign.
+
+## 2026-09-19 — plans/83 E disposition: WMMA spill target is not in the production path
+
+`qsa_flash_wmma` (the plans/69 6-9.5x spill kernel) is invoked only from
+`rawhip::probes::attn`; the production long-context (np>2560) prefill
+attention is `qsa_flash_wmma2v2` (plans/74 N4, 64-thread, built from the
+wmma2 probe ABI work). Current pp16384 hip = 290-296 t/s = 97-99% of
+llama.cpp's 297; the plan's >=310 target exceeds llama itself. A pp16k
+KTRACE window attributes the residual cost to the mmq GEMM family
+(mmq_q5k/xs/q4k/q6k ~75% of kernel time), not WMMA attention. Further
+pp16k gains live in the GEMM campaign, not fragment liveness.
