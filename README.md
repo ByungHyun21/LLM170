@@ -6,14 +6,14 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-18). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
+Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **367-370** | 326-337 | 290-296 | 11.52 |
-| LLM170 vulkan | 318 | 145 | n/a | 11.26 |
+| LLM170 vulkan | 318 | 232 | 174.5 (8k) | 11.26 |
 | llama.cpp hip | 340 | **335** | **297** | 11.65 |
 | llama.cpp vulkan | 343 | 318 | — | **12.05** |
 
