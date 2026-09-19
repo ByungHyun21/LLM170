@@ -469,3 +469,17 @@ at gy=320-10240 blocks x 64 threads underoccupy the 64-CU GPU (20-40K
 threads resident). Campaign direction: fuse the per-layer small GEMVs
 (hc/GDN projections) into fewer wider launches. The probe stays as the
 placement/BW ground-truth tool.
+
+## 2026-09-19 (7) — plans/83 D2: stream-parallel shortcut blocked, fusion campaign scoped
+
+The last cheap avenue — overlapping the independent latency-bound GEMVs on
+side streams (bit-identical, no op changes) — is blocked by the shared MMQ
+y-buffer hazard (docs/benchmarks.md known limitations: concurrent MMQ
+paths clobber each other's y). The complete falsification chain for the
+decode gap now reads: coopmat throughput (no vk path; hip step-time parity
+with llama), memory placement (bw-place: 240 GB/s all pools), host cost
+(2.2ms/step skeleton), launch gaps (kernel sum = wall; graphs +1%), KV
+traffic (ctx-invariant). What remains: ~500 small-output GEMV launches per
+step run occupancy-starved and latency-bound. The campaign = per-layer
+projection fusion with scratch partitioning. All measurement tools are in
+tree (bw-place, stage-skip subtraction, NOLAUNCH skeleton, KTRACE).
