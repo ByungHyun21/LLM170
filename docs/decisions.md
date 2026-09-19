@@ -534,3 +534,16 @@ activation (ensured at frame_begin, t=1 sized n_in/4+n_in/32 words);
 the pair at t==1 with LLM170_NO_SILUQ kill switch. Expected +0.5-1%
 (18.10 → ~18.2). The identical pattern applies to HcGateMean+group-quant
 (mix needs BOTH f32 and xq outputs — dual-write variant, ~60 launches).
+
+## 2026-09-19 (12) — plans/83 D2: SiluDivQuant implemented, measured zero, reverted
+
+Implemented the decisions.md-(11) slice end-to-end (silu_quant_q8 kernel
+with exact exp_cr silu + quant_q8 arithmetic, FrameOp variant, one-shot
+pointer-keyed quant memo, hc t=1 wiring): bit-identical (FN gate PASS
+after fixing the memo to key on the resolved pointer). Measured: tg32
+1768.2 ms — IDENTICAL to the pre-fusion wall time. The 96 quant
+micro-launches were fully hidden in the pipeline; eliminating them gains
+nothing. This closes the micro-launch-elimination hypothesis: the decode
+step's remaining cost is GEMV execution occupancy, full stop. Reverted
+per the no-weightless-complexity rule; the negative result stands as the
+campaign's cleanest falsification yet.
