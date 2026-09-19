@@ -547,3 +547,12 @@ nothing. This closes the micro-launch-elimination hypothesis: the decode
 step's remaining cost is GEMV execution occupancy, full stop. Reverted
 per the no-weightless-complexity rule; the negative result stands as the
 campaign's cleanest falsification yet.
+
+## 2026-09-19 (13) — plans/83 D2: low-output warp GEMV, opt-in
+
+LLM170_Q8W_SMALLN=1: warp-per-output for t=1 q8_0 GEMVs with n_out<=2048,
+n_sub>32 (the occupancy-starved shapes). FN tg32 18.10 -> 18.25 (+0.8%),
+FN gate PASS. Not default: the shared dispatcher has no model scoping and
+the reduction-order change flips a 27B near-tie (token 5, measured).
+Default adoption requires splitting the dispatch by model/frame path —
+noted as a small follow-up for the campaign.
