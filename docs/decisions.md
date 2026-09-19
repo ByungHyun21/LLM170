@@ -427,3 +427,14 @@ Graph replay (LLM170_GRAPH=1) lands +1% (17.59).
 E: the named spill kernel is not in the production path (probe-only); our
 pp16384 hip 290-296 already exceeds llama hip (229) by 27%. Both items'
 numeric targets are re-scoped as campaign goals in the follow-up list.
+
+## 2026-09-19 (4) — plans/83 E closed: production WMMA A/B
+
+Direct A/B at pp16384 hip (threshold override via temporary env, reverted):
+`qsa_flash_wmma2v2` active = **290.91 t/s**; forced wk8i fallback (scalar/
+dp4a family) = **242.05 t/s**. The production WMMA path is 20% faster than
+its fallback — no spill regression exists in the shipping chain. The plan's
+named kernel (qsa_flash_wmma v1) is probe-only and its plans/69 spill was
+superseded by the wmma2/wmma2v2 line (plans/74). pp16384 290-296 stands at
+127% of llama hip (229); the 310 stretch exceeds llama and belongs to the
+GEMM campaign (mmq family), not attention.
