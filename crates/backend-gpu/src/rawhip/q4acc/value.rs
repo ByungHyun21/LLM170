@@ -95,6 +95,84 @@ impl Q4Acc {
         self.ctx.launch3("gemm_q8_0_dual", 1, gy, gz, 64, &mut args)
     }
 
+    /// f32 듀얼 GEMV (t=1) — 같은 f32 활성을 쓰는 인접 2 가중을 1런치로.
+    /// q4_gemm_f32_w2의 워프-퍼-출력 기하 = 원판과 동일 → 비트 불변.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gemm_f32_dual(
+        &self,
+        xf: *const u8,
+        w1: *mut u8,
+        no1: usize,
+        out1: *mut u8,
+        w2: *mut u8,
+        no2: usize,
+        out2: *mut u8,
+        ni: usize,
+    ) -> Result<(), String> {
+        let gy = (no1 + no2).div_ceil(8) as u32;
+        let mut x_p = xf as *mut std::ffi::c_void;
+        let mut w1p = w1 as *mut std::ffi::c_void;
+        let mut o1 = out1 as *mut std::ffi::c_void;
+        let mut w2p = w2 as *mut std::ffi::c_void;
+        let mut o2 = out2 as *mut std::ffi::c_void;
+        let mut ni_a = ni as i32;
+        let mut no1a = no1 as i32;
+        let mut no2a = no2 as i32;
+        let mut args = vec![
+            (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w1p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o1) as *mut _ as *mut std::ffi::c_void,
+            (&mut w2p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o2) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni_a) as *mut _ as *mut std::ffi::c_void,
+            (&mut no1a) as *mut _ as *mut std::ffi::c_void,
+            (&mut no2a) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("q4_gemm_f32_w2", gy, 1, 1, 256, &mut args)
+    }
+
+    /// 혼합 듀얼 GEMV (t=1) — (q8_0, f32) 인접쌍을 1런치로.
+    /// 블록 파티션: 전반은 gemm_q8_0 판, 후반은 q4_gemm_f32_w 판 → 비트 불변.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gemm_mix_dual(
+        &self,
+        xq: *mut u8,
+        w8: *mut u8,
+        no8: usize,
+        out8: *mut u8,
+        xf: u64,
+        w4: *mut u8,
+        no4: usize,
+        out4: *mut u8,
+        ni: usize,
+    ) -> Result<(), String> {
+        let gy = (no8 + no4.div_ceil(8)) as u32;
+        let xqw = ni / 4 + ni / 32 + ni / 16;
+        let mut xq_p = xq as *mut std::ffi::c_void;
+        let mut w8p = w8 as *mut std::ffi::c_void;
+        let mut o8 = out8 as *mut std::ffi::c_void;
+        let mut no8a = no8 as i32;
+        let mut xf_p = xf as *mut std::ffi::c_void;  // f32 원활성 (프레임 핸들)
+        let mut w4p = w4 as *mut std::ffi::c_void;
+        let mut o4 = out4 as *mut std::ffi::c_void;
+        let mut no4a = no4 as i32;
+        let mut ni_a = ni as i32;
+        let mut xw = xqw as i32;
+        let mut args = vec![
+            (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w8p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o8) as *mut _ as *mut std::ffi::c_void,
+            (&mut no8a) as *mut _ as *mut std::ffi::c_void,
+            (&mut xf_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w4p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o4) as *mut _ as *mut std::ffi::c_void,
+            (&mut no4a) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni_a) as *mut _ as *mut std::ffi::c_void,
+            (&mut xw) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3("gemm_mix_dual", gy, 1, 1, 256, &mut args)
+    }
+
     pub(super) fn launch_gemm(
         &self,
         ty: u32,
