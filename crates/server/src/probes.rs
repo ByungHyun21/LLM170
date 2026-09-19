@@ -180,6 +180,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
         "bw-test" => llm170_backend_gpu::rawhip::bw_test(),
+        "bw-place" => llm170_backend_gpu::rawhip::bw_place_test(),
         "dp4a-test" => llm170_backend_gpu::rawhip::dp4a_test(),
         "iq3s-probe" => llm170_backend_gpu::rawhip::iq3s_probe(),
         "qk-check" => llm170_backend_gpu::rawhip::qk_check(),
