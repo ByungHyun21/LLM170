@@ -517,3 +517,20 @@ three gates PASS, pp512 unaffected at 253 t/s). The census's gy=12800
 dual = QSA q+k (12288+512). Remaining pair-tier residue (~24 launches:
 QSA v, indexer bf16 pairs) is worth <1%; the tier is closed. Everything
 beyond this is the hc dependent-chain cascade campaign.
+
+## 2026-09-19 (11) — plans/83 D2: SiluDivQuant slice spec (next-session ready)
+
+The remaining cheap slice, fully designed: fuse the hc `SiluDiv+quant`
+pair (96 launches/step) into one `silu_quant_q8` kernel. lo is
+single-consumer (up-GEMM only — verified), q4_silu_div math is
+`v=x/div; v/(1+exp_cr(-v))` (note: custom exp_cr), and quant_q8's
+32-block amax/round can run on the silu'd register values — bit-identical
+by construction. CLEAN wiring (avoid the stateful fxq-scratch shortcut
+evaluated and rejected this session): (a) new trait method
+`frame_gemm_xq(xq_handle, w, out, t)` with default Err + Q4Acc impl
+calling launch_gemm; (b) a dedicated Frame4 buffer for the quantized
+activation (ensured at frame_begin, t=1 sized n_in/4+n_in/32 words);
+(c) FrameOp::SiluDivQuant writing that buffer; hc_mix_frame branches to
+the pair at t==1 with LLM170_NO_SILUQ kill switch. Expected +0.5-1%
+(18.10 → ~18.2). The identical pattern applies to HcGateMean+group-quant
+(mix needs BOTH f32 and xq outputs — dual-write variant, ~60 launches).
