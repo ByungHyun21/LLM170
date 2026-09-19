@@ -400,3 +400,14 @@ llama.cpp's 297; the plan's >=310 target exceeds llama itself. A pp16k
 KTRACE window attributes the residual cost to the mmq GEMM family
 (mmq_q5k/xs/q4k/q6k ~75% of kernel time), not WMMA attention. Further
 pp16k gains live in the GEMM campaign, not fragment liveness.
+
+## 2026-09-19 (2) — plans/83 D2 decode-step subtraction profile
+
+Stage-skip subtraction on FN hip tg32 @4k ctx (32 steps, wall 1841.6ms =
+57.5ms/step): GDN 682.5ms (21.3ms/step, 37%), QSA attention 310ms (9.7,
+17%), MoE 192.6ms (6.0, 10%); remainder ~20ms/step (hc, PLE, norms, head,
+host). The 2026-09-16 warp-variant experiment re-measured: Q8W_ALL=1 is
+-4.4% end-to-end (16.64 vs 17.41 t/s) — the opt-in gate is correct.
+Reaching 23 t/s needs ~14ms/step off GDN+attention+remainder jointly; no
+single-kernel smoking gun. Next campaign entry points: the four GDN GEMV
+shapes (qkv/gate/beta/alpha at t=1) and the ~20ms non-attributed residual.
