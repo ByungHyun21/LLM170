@@ -1055,3 +1055,9 @@ refactoring is performance-neutral, and pp512 for the 27B set a new best. The
 remaining losses are the two Flash-Next cells analysed above (np4 = serialized
 prefill with a 1.2x-faster batched decode, tg = a t=1 kernel-level gap) plus the
 27B pp4096/pp16384 cells that sit inside the noise band.
+
+## Vulkan pp8192 (2026-09-19, plans/83 D3)
+
+Re-tested after the 65536-set descriptor pool (190c2df) and the GQA
+multi-query flash: `pp8192 ctx12288` completes at 174.5 t/s with no
+ERROR_DEVICE_LOST. The historical device-lost repro is resolved.
