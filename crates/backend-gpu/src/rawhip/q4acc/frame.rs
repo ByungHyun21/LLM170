@@ -1260,8 +1260,30 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         }
         // plans/71: q8_0 가중치 + t>=32는 MMQ(int8 dp4a) — f32 활성을 직접 받아
         // 자체 양자화. 종전 j128 타일 대비 측정 이득은 벤치로 검증.
-        for (w, o) in ws.iter().zip(outs) {
-            let op = self.fptr(*o)?;
+        // 혼합 패밀리 그룹(GDN [q8,q8,f32,f32] 등) — t=1에서 인접 q8_0 쌍을
+        // 듀얼로 융합(plans/83 D2). 첫 분기의 동일-패밀리 조건에 걸리지 않는
+        // 그룹의 q8_0 쌍도 같은 이득을 받는다. 비트 불변(행 산술 동일).
+        let mut idx = 0usize;
+        while idx < ws.len() {
+            let w = &ws[idx];
+            if t == 1
+                && w.ty == GgmlType::Q8_0
+                && idx + 1 < ws.len()
+                && ws[idx + 1].ty == GgmlType::Q8_0
+                && ws[idx + 1].n_in == w.n_in
+                && std::env::var_os("LLM170_NO_DUAL").is_none()
+            {
+                let (wd1, _) = self.dev_weight(w)?;
+                let (wd2, _) = self.dev_weight(&ws[idx + 1])?;
+                let o1 = self.fptr(outs[idx])?;
+                let o2 = self.fptr(outs[idx + 1])?;
+                let (xq, xq_w) = self.frame_quant(xp, w.n_in as usize, t)?;
+                let _ = xq_w;
+                self.gemm_q8_dual(xq, wd1, w.n_out as usize, o1, wd2, ws[idx + 1].n_out as usize, o2, w.n_in as usize)?;
+                idx += 2;
+                continue;
+            }
+            let op = self.fptr(outs[idx])?;
             if w.ty == GgmlType::Q8_0 && t >= 32
                 && env_eq("LLM170_Q8MMQ", "1")
             {
@@ -1269,9 +1291,11 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 self.ctx
                     .gemm_mmq(8, xp as *const u8, wd, w.n_in as usize, w.n_out as usize, t, op)
                     .map_err(|e| format!("q8mmq: {e}"))?;
+                idx += 1;
                 continue;
             }
             self.frame_gemm(xp, w, op, t)?;
+            idx += 1;
         }
         Ok(())
     }
