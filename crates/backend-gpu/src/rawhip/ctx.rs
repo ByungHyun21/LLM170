@@ -960,6 +960,24 @@ impl RawCtx {
                 &mut args,
             );
         }
+        // plans/83 D2: 저출력 GEMV(hc down 등 n_out ≤ 2048, n_sub > 32)는
+        // 워프판이 유리 — FN tg32 18.10 → 18.25 (+0.8%). 단 축소 순서가
+        // 달라 27B 게이트 타이를 뒤집는다(토큰5 실측) — 전역 디스패처라 모델
+        // 구분이 없어 옵트인으로만 둔다. 기본 적용은 형상 스코프 분리 후.
+        if t == 1 && ty == 8 && n_out <= 2048 && n_in / 32 > 32
+            && env_eq("LLM170_Q8W_SMALLN", "1")
+        {
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mut xq_p as *mut _ as *mut std::ffi::c_void,
+                &mut w_p as *mut _ as *mut std::ffi::c_void,
+                &mut part_p as *mut _ as *mut std::ffi::c_void,
+                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
+                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
+                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
+                &mut xw_a as *mut _ as *mut std::ffi::c_void,
+            ];
+            return self.launch3("gemm_q8_0_w", n_out.div_ceil(8) as u32, 1, 1, 256, &mut args);
+        }
         if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && !env_eq("LLM170_Q8W", "0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
