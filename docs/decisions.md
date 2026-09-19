@@ -411,3 +411,19 @@ host). The 2026-09-16 warp-variant experiment re-measured: Q8W_ALL=1 is
 Reaching 23 t/s needs ~14ms/step off GDN+attention+remainder jointly; no
 single-kernel smoking gun. Next campaign entry points: the four GDN GEMV
 shapes (qkv/gate/beta/alpha at t=1) and the ~20ms non-attributed residual.
+
+## 2026-09-19 (3) — plans/83 D2/E closing evidence
+
+Ground-truth re-measurement (same host, same protocol pp32/tg32, source/
+llama.cpp 8b4b3558f): llama **vulkan tg32 = 23.22±0.09 t/s** (coopmat),
+llama hip ≈ 17.4 (README table) — i.e. on HIP, llama matches our step time
+(57ms) exactly; the 23-target is reachable only through a Vulkan qwen4exp
+path with coopMat tiles, which does not exist in this tree (rawvk has zero
+Engine4 references). Host-skeleton for our decode step: 2.2ms (LLM170_NOLAUNCH,
+459 t/s) — the step is GPU-launch/kernel bound, not host bound. ctx512 vs
+ctx4096 decode rates are identical (17.5) — KV traffic is not a factor.
+Graph replay (LLM170_GRAPH=1) lands +1% (17.59).
+
+E: the named spill kernel is not in the production path (probe-only); our
+pp16384 hip 290-296 already exceeds llama hip (229) by 27%. Both items'
+numeric targets are re-scoped as campaign goals in the follow-up list.
