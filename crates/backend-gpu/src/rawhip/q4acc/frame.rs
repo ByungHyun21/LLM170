@@ -1217,20 +1217,44 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
             } else {
                 self.frame_quant(xp, ws[0].n_in as usize, t)?
             };
-            for (w, o) in ws.iter().zip(outs) {
-                let (wd, _) = self.dev_weight(w)?;
-                let op = self.fptr(*o)?;
+            // plans/83 D2: t=1 디코드에서 그룹 내 q8_0 인접쌍을 듀얼 커널로
+            // 융합 — 런치 수 절반, 블록 수 합산(점유 개선). dual 커널의 행
+            // 산술은 원판 gemm_q8_0과 동일 트리 → 비트 불변.
+            let dual_ok = t == 1 && !mmq_on && std::env::var_os("LLM170_NO_DUAL").is_none();
+            let mut idx = 0usize;
+            while idx < ws.len() {
+                let w = &ws[idx];
                 let ty = ggml_id(w.ty);
+                if dual_ok
+                    && ty == 8
+                    && idx + 1 < ws.len()
+                    && ggml_id(ws[idx + 1].ty) == 8
+                {
+                    let (wd1, _) = self.dev_weight(w)?;
+                    let (wd2, _) = self.dev_weight(&ws[idx + 1])?;
+                    let o1 = self.fptr(outs[idx])?;
+                    let o2 = self.fptr(outs[idx + 1])?;
+                    let n_in = w.n_in as usize;
+                    let no1 = w.n_out as usize;
+                    let no2 = ws[idx + 1].n_out as usize;
+                    self.gemm_q8_dual(xq, wd1, no1, o1, wd2, no2, o2, n_in)?;
+                    idx += 2;
+                    continue;
+                }
+                let (wd, _) = self.dev_weight(w)?;
+                let op = self.fptr(outs[idx])?;
                 let n_in = w.n_in as usize;
                 let n_out = w.n_out as usize;
                 if mmq_on && matches!(ty, 12 | 13 | 14 | 23)
                     && self.ctx.gemm_mmq(ty, xp as *const u8, wd, n_in, n_out, t, op).is_ok()
                 {
+                    idx += 1;
                     continue;
                 }
                 // f16 경로 미검증(위 frame_gemm 주석 참조) — 배선 보류.
                 let (xqi, xwi) = if mmq_on { self.frame_quant(xp, n_in, t)? } else { (xq, xq_w) };
                 self.launch_gemm(ty, xqi, wd, n_in, n_out, xwi, t, op)?;
+                idx += 1;
             }
             return Ok(());
         }
