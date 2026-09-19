@@ -483,3 +483,14 @@ traffic (ctx-invariant). What remains: ~500 small-output GEMV launches per
 step run occupancy-starved and latency-bound. The campaign = per-layer
 projection fusion with scratch partitioning. All measurement tools are in
 tree (bw-place, stage-skip subtraction, NOLAUNCH skeleton, KTRACE).
+
+## 2026-09-19 (8) — plans/83 D2: pair-fusion tier complete
+
+Post-fusion KTRACE census (1320 launches traced): the q8_0 dual fusion is
+live (gemm_q8_0_dual gy=12800). The remaining small-kernel sea is the hc
+machinery's DEPENDENT elementwise chain — rms_part x97, hc_gate_mean x97,
+hc_combine x96, quant_q8 x96 — each stage feeding the next within a layer.
+Pair-fusion cannot touch these (no shared-input independence); the next
+tier is stage-cascade fusion (one kernel per hc norm→mean→combine chain,
+replicating exact arithmetic order for bit-identity), a dedicated campaign
+with the fp/gate verification ladder already in tree.
