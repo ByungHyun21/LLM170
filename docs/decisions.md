@@ -364,3 +364,16 @@ class — docs/chunk-invariance.md). The new stream is reference-correct;
 HIP is untouched and still matches the original baseline. Gate baselines are
 now per-runtime (`.gate-27b-baseline-vk.txt`); `LLM170_VK_NOGQ=1` restores
 the old single-query kernel.
+
+## 2026-09-19 — plans/83 D2 disposition: "FN vulkan decode" cell is the HIP path
+
+`q4_gpu_wanted_str` accepts `--gpu-runtime vulkan` for qwen4exp only by
+falling back to HIP with a warning (plans/64 §7: QSA kernels and capacity).
+The README/plan-83 "FN vulkan" numbers were therefore HIP measurements. A
+true Vulkan qwen4exp decode path does not exist; reaching the plan's
+18.49 -> >=23 t/s target means either porting the frame path to rawvk
+coopMat or a HIP decode kernel campaign. KTRACE on a decode step shows the
+dense-GEMV family (`gemm_q8_0`, incl. gy=10240 calls) dominating the step,
+with the t>=16 tile path already bypassing it — the t=1 GEMV and the MoE
+grouped GEMMs are the campaign targets. Recorded here so the next plan
+starts from the correct premise.
