@@ -888,3 +888,29 @@ Next instrumentation: dump the hc_attn-half intermediates at L0 (before
 the ffn half overwrites them) — one site marker in hc_mix_frame for
 kind="attn" at il==0 — expected to expose the first differing GEMM
 output directly.
+
+## 2026-09-20 (13) — E.2 ROOT CAUSE ISOLATED: two dispatch axes, now single-kernel precise (plans/84 E.2)
+
+Attention-half site markers (hc_attn xn/lo/inj/gate/mix at L0-L2) closed
+the observation gap and produced the complete causal chain, verified
+with the synced instrument:
+
+- **Unpinned**: the first differing output is the hc_attn down
+  projection (q8_0) — identical rms input, t=16 takes the GEMV family,
+  t>64 the j128 tile family (attn_lo DIFF, attn_inj/xn same because the
+  f32 inject and rms are row-invariant). Everything downstream (gate,
+  mix, GDN, MoE, mout, residual) inherits the drift.
+- **Pinned (large-t family forced)**: L0-L2 attention halves, ffn
+  halves, router, and shared-expert inputs are all bit-identical — the
+  divergence moves to a single new entry: **the grouped MoE gate GEMM
+  (mgu)** at L2 (mxsel/mids/mwt all identical, mgu differs between a
+  rows=160 and a rows=2080 call). The grouped per-expert 16-row-padded
+  tiles are row-count dependent — the last axis.
+
+The pin now ships as an opt-in (`LLM170_Q4_PF_PIN=1`, default off —
+default-path numerics unchanged, gates green) so the fence
+investigation and the eventual grouped-kernel fix can proceed without
+re-baselining anything until chunk-check passes. Landing order for the
+fix: make the grouped GEMM row-invariant (or pin its dispatch), then
+enable the pin by default, re-record the FN gate under the
+chunk-invariance contract.

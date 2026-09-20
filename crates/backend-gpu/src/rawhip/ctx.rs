@@ -1178,6 +1178,12 @@ impl RawCtx {
     }
 
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
+        // plans/84 E.2: 프리필 핀 중 large-t 패밀리(j128 강제 + big — odd(v4)는
+        // big만 본다). 진입점: hc down(q8_0)의 t 키 GEMV/j128 갈림.
+        if !env_on("LLM170_EXACT") && PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+            let j128 = self.co_loaded(CO_J128);
+            return self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, true);
+        }
         let j128 = !env_on("LLM170_EXACT")
             && self.co_loaded(CO_J128) && t > 64;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
