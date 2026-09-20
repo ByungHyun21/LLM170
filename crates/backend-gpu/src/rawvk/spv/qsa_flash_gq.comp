@@ -28,7 +28,6 @@ const int NQMAX = R * GQMAX;      // 24쿼리 — 공유 메모리 예산(64KB L
 
 shared float ks[KT][KS];           // K 타일. V는 PV에서 직접(코얼레스).
 shared float qsh[NQMAX][256];      // 쿼리 벡터 [j][d] (hd=256)
-shared float sp[8][33];            // 워프별 QK 부분합
 shared float pf[NQMAX][KT];        // 타일 확률
 shared float resc[NQMAX];          // PV 재스케일 계수
 shared float mrun[NQMAX];          // 러닝 최대
@@ -81,25 +80,23 @@ void main() {
         }
         barrier();
 
-        // ── 2) QK+softmax — 쿼리 루프. 레인=키, 워프=32차원 슬라이스(8fma/스레드).
-        // sp는 j마다 소비되므로(per-j interleaving) 루프 안의 순서가 계약이다.
-        for (int j = 0; j < nq; j++) {
-            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-            for (int i = 0; i < 8; i++) {
-                int d = wid * 32 + i * 4;
-                if (d + 3 < hd) {
+        // ── 2) QK+softmax (plans/84 D) — warp=쿼리 롤링: 레인=키, 차원은
+        // 레인 내 직렬 fma. 구판의 sp 공유 스테이징+워프0 직렬 softmax 체인을
+        // 제거 — 8워프가 서로 다른 j를 병행 처리하고 softmax(m/s 갱신 포함)도
+        // in-warp 셔플로 완결한다. 축소 순서가 구판과 달라 vk-flash-check와
+        // vk 게이트 베이스라인이 펜스다.
+        for (int j0 = 0; j0 < nq; j0 += 8) {
+            int j = j0 + wid;
+            if (j < nq) {
+                int row = rb + j / gq;
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                for (int d = 0; d + 3 < hd; d += 4) {
                     a0 = fma(qsh[j][d], ks[lane][d], a0);
                     a1 = fma(qsh[j][d + 1], ks[lane][d + 1], a1);
                     a2 = fma(qsh[j][d + 2], ks[lane][d + 2], a2);
                     a3 = fma(qsh[j][d + 3], ks[lane][d + 3], a3);
                 }
-            }
-            sp[wid][lane] = (a0 + a1) + (a2 + a3);
-            barrier();
-            if (wid == 0) {
-                float y = 0.0;
-                for (int w = 0; w < 8; w++) y += sp[w][lane];
-                int row = rb + j / gq;
+                float y = (a0 + a1) + (a2 + a3);
                 float d2 = (p0 + lane < pc.pos0 + row + 1) ? y : -3.4028235e38;
                 float mx = d2;
                 for (int off = 16; off > 0; off >>= 1)
@@ -110,6 +107,7 @@ void main() {
                 float es = e;
                 for (int off = 16; off > 0; off >>= 1)
                     es += subgroupShuffleDown(es, off);
+                pf[j][lane] = e;
                 if (lane == 0) {
                     if (mn > -1.0e37) {
                         float r2 = exp(mrun[j] - mn);
@@ -120,11 +118,8 @@ void main() {
                         resc[j] = 1.0;
                     }
                 }
-                pf[j][lane] = e;
             }
-            barrier();
         }
-
         barrier();
 
         if (tid < hd) {

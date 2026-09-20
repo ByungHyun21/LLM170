@@ -599,3 +599,26 @@ Verification: 208-token prompt at chunk sizes 4/8/16/63/128/512 and
 three identical 512 repeats all bits-identical; 9-token prompt at sizes
 1-7 bits-identical; fresh-slot variant clean; gate-27b stream unchanged;
 mmq-row-check / tile-row-check added as kernel-level fences.
+
+## 2026-09-20 (2) — qsa_flash_gq warp-per-query softmax; 27B vk pp16k +24% (plans/84 D+E3)
+
+The prefill GQA flash kernel staged QK partials in shared memory
+(sp[8][33]) and ran the whole softmax chain (cross-warp sum, max, exp,
+running m/s update) serially in warp 0 for each of the 24 queries per
+workgroup. Redesign: warp-per-query rolling — each lane owns one key and
+reduces the full head dimension serially; the eight warps process eight
+different queries concurrently and complete softmax, including the
+running max/sum bookkeeping, with in-warp shuffles. The sp array and the
+serial chain are gone; the LDS budget is unchanged (still ~61KB).
+
+Reduction order changes: vk-flash-check PASS (max|D| 6.1e-6 vs the f32
+reference, same class as the previous kernel) and the 27B vulkan gate
+stream is unchanged against the recorded baseline.
+
+27B vulkan prefill: pp4096 233 -> 255 t/s (+9.5%), pp8192 174 -> 202
+(+16%), pp16384 116 -> 143 (+24%). The fitted attention-quadratic term
+drops 30% (0.357 -> 0.251 us/token^2); the linear term is unchanged.
+The plans/84 E3 investigation (pp16k slowdown) is explained by the
+quadratic attention cost of the serial-chain kernel: time fits
+T = 2.8-2.9 ms/token linear + 0.26-0.36 us/token^2 quadratic with no
+other superlinear component — not a leak or scheduling defect.
