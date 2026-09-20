@@ -985,3 +985,19 @@ drains (async h2d/d2h_issue on stream2+, or a pool alias). Next
 session: trace every writer of the fxq buffer between L1-down-quant and
 L2-gate-quant (canary hash around each candidate) — the defect is now
 one buffer and one call window wide.
+
+## 2026-09-20 (17) — E.2 final localization: the race sits in the L2 gate quant window (plans/84 E.2)
+
+Input-side probe (`[nxh]`, hashes the quant input mxsel at every
+quant-miss under LLM170_E2PERM): in the same synced run the L2 gate
+quant input is bit-identical and the first divergence is L2's mglu
+(silu of the gate/up outputs) — while in the minimal-sync run the L2
+gate quant OUTPUT (xg) differs. The defect therefore sits in the window
+between the L2 gather and the gate GEMM: the quant of mxsel (or its
+consumption) is timing-dependent, syncs mask it, and everything
+downstream inherits. All probes agree; the mechanism (which async op
+the sync drains) is the only remaining unknown — writer-trace on the
+fxq/mxsel buffers in that window is the next and final step. E.2
+investigation state: defect class identified (producer ordering),
+epicenter one call window, masking sync characterized, all probes
+committed and reproducible via LLM170_Q4_PF_PIN=1 LLM170_E2PERM=1.
