@@ -1,0 +1,17 @@
+#version 450
+// plans/84 B — MoE 가중합: out[tok*n+j] = Σ_k wt[tok*k+k]·ys[(tok*k+k)*n+j].
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Ys { float ys[]; };
+layout(binding = 1) readonly buffer Wt { float wt[]; };
+layout(binding = 2) buffer Out { float o[]; };
+layout(push_constant) uniform PC { uint n; uint k; uint total; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.total) return;
+    uint tok = j / pc.n;
+    uint c = j % pc.n;
+    float acc = 0.0;
+    for (uint kk = 0u; kk < pc.k; kk++)
+        acc += wt[tok * pc.k + kk] * ys[(tok * pc.k + kk) * pc.n + c];
+    o[j] = acc;
+}

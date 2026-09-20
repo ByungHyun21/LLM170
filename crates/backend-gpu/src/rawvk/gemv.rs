@@ -24,6 +24,11 @@ const SCALE_SPV: &[u8] = include_bytes!("spv/scale.spv");
 const COPY_ROWS_SPV: &[u8] = include_bytes!("spv/copy_rows.spv");
 const BCAST_ROWS_SPV: &[u8] = include_bytes!("spv/bcast_rows.spv");
 const AXPY_T_SPV: &[u8] = include_bytes!("spv/axpy_scaled_t.spv");
+/// plans/84 B — MoE 프레임 ops.
+const MOE_TOP10_SPV: &[u8] = include_bytes!("spv/moe_top10.spv");
+const PERMUTE_SPV: &[u8] = include_bytes!("spv/permute_rows.spv");
+const PERMUTE_U32_SPV: &[u8] = include_bytes!("spv/permute_rows_u32.spv");
+const MOE_WSUM_SPV: &[u8] = include_bytes!("spv/moe_wsum.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -38,6 +43,10 @@ enum Slot {
     CopyRows,
     BcastRows,
     AxpyT,
+    MoeTop10,
+    PermuteF32,
+    PermuteU32,
+    MoeWsum,
     Quant,
     Rms,
     Silu,
@@ -62,6 +71,8 @@ pub struct VkAcc {
     gobufs: Mutex<Vec<Option<VkBuf>>>,
     /// plans/84 B — 프레임 버퍼 레지스트리 (핸들 → 상주 버퍼; host-visible).
     framebufs: Mutex<HashMap<u64, VkBuf>>,
+    /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
+    moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
 }
@@ -109,6 +120,7 @@ impl VkAcc {
             ffnbufs: Mutex::new(None),
             gobufs: Mutex::new(Vec::new()),
             framebufs: Mutex::new(HashMap::new()),
+            moebufs: Mutex::new(None),
             frame_next: std::sync::atomic::AtomicU64::new(1),
             frame_t: std::sync::atomic::AtomicUsize::new(1),
         })
@@ -129,6 +141,10 @@ impl VkAcc {
             Slot::CopyRows => (COPY_ROWS_SPV, 2, 12), // 3×u32
             Slot::BcastRows => (BCAST_ROWS_SPV, 2, 8),// 2×u32
             Slot::AxpyT => (AXPY_T_SPV, 3, 8),        // 2×u32
+            Slot::MoeTop10 => (MOE_TOP10_SPV, 3, 8),  // 2×u32
+            Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
+            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 8),
+            Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
@@ -288,6 +304,45 @@ impl VkAcc {
             ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
         }
         Ok(())
+    }
+
+    /// plans/84 B — 오프셋 지원 GEMV: MoE 전문가 슬라이스(xq 행 구간, 가중
+    /// 전문가 오프셋, out 행 구간). 산술은 gemv_run과 동일 커널.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_run_off(
+        &self,
+        ctx: &mut VkCtx,
+        wbufs: &[vk::Buffer],
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        ty: u32,
+        t: usize,
+        xq_buf: vk::Buffer,
+        out_buf: vk::Buffer,
+        xq_off: u64,
+        out_off: u64,
+        w_off: u64,
+    ) -> Result<(), String> {
+        let (kb, gb, dbuf) = self.ensure_shared(ctx)?;
+        let p = self.pipeline(ctx, Slot::Gemv)?;
+        let mut binds: Vec<(vk::Buffer, u64)> = wbufs
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| (b, if i == 0 { w_off } else { 0 }))
+            .collect();
+        while binds.len() < 8 {
+            binds.push((dbuf, 0));
+        }
+        binds.push((xq_buf, xq_off));
+        binds.push((out_buf, out_off));
+        binds.push((kb, 0));
+        binds.push((gb, 0));
+        let ds2 = p.ds;
+        ctx.bind_bufs_off(ds2, &binds);
+        let chunk_words = (ctx.max_ssbo / 4) as u32;
+        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32, chunk_words]);
+        ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
 
     /// xs(f32) 업로드 → quant_q8 → xq 버퍼 (값 버퍼 자동 성장).
@@ -549,9 +604,132 @@ impl llm170_core::matmul::FrameState for VkAcc {
     fn frame_begin(&self, t: usize) {
         self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// 상주 MoE GEMM — plans/84 B 슬라이스: 호스트 그룹화(hip 폴백과 동일
+    /// 구조) + 디바이스 게더/전문가별 GEMV/스캐터. vk GEMV는 단일 판이라
+    /// 전문가별 행수가 패밀리를 갈라놓지 않는다(청크 불변성 안전).
+    fn frame_moe_gemm(
+        &self,
+        x: u64,
+        w: &Weight,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+        k_sel: usize,
+    ) -> Result<(), String> {
+        let n_in = w.n_in as usize;
+        let n_out = w.n_out as usize;
+        let t = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+        let rows = t * k_sel;
+        let ne = n_expert_stack;
+        let ty = vk_ty(w.ty).ok_or("vk frame_moe_gemm: 타입 미지원")?;
+        // 1) ids 판독(호스트 그룹화) — off/perm/inv 구축.
+        let idv: Vec<u32> = {
+            {
+                let mut c = self.ctx.lock();
+                if c.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = c.end_batch_wait();
+                }
+            }
+            let g = self.framebufs.lock();
+            let b = g.get(&ids).ok_or("vk moe: ids 핸들 없음")?;
+            unsafe { std::slice::from_raw_parts(b.ptr as *const u32, rows) }.to_vec()
+        };
+        let mut off = vec![0usize; ne + 1];
+        for &e in &idv {
+            off[(e as usize).min(ne - 1) + 1] += 1;
+        }
+        for e in 0..ne {
+            off[e + 1] += off[e];
+        }
+        let mut cur = off[..ne].to_vec();
+        let mut perm = vec![0u32; rows];
+        for (i, &e) in idv.iter().enumerate() {
+            let e = (e as usize).min(ne - 1);
+            perm[cur[e]] = i as u32;
+            cur[e] += 1;
+        }
+        let mut inv = vec![0u32; rows];
+        for (p_, &orig) in perm.iter().enumerate() {
+            inv[orig as usize] = p_ as u32;
+        }
+        let mut ctx = self.ctx.lock();
+        let xb = self.fbuf(x)?;
+        let ob = self.fbuf(out)?;
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq = self.value_buf(&mut ctx, &self.xbuf, rows * xq_w * 4)?;
+        // 2) quant (프레임 f32 → 디바이스 xq)
+        {
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
+            let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+        }
+        // 3) MoE 스크래치 (perm u32, xg u32, iv u32, yg f32) — 필요시 성장.
+        let need_xg = rows * xq_w * 4;
+        let need_yg = rows * n_out * 4;
+        {
+            let mut g = self.moebufs.lock();
+            let ok = g.as_ref().map(|(pm, xg, iv, yg)| {
+                pm.bytes >= rows * 4 && xg.bytes >= need_xg && iv.bytes >= rows * 4 && yg.bytes >= need_yg
+            }).unwrap_or(false);
+            if !ok {
+                let pm = ctx.alloc((rows * 4).max(1 << 16))?;
+                let xg = ctx.alloc(need_xg.max(1 << 16))?;
+                let iv = ctx.alloc((rows * 4).max(1 << 16))?;
+                let yg = ctx.alloc(need_yg.max(1 << 16))?;
+                *g = Some((pm, xg, iv, yg));
+            }
+        }
+        let (pmb, xgb, ivb, ygb) = {
+            let g = self.moebufs.lock();
+            let r = g.as_ref().unwrap();
+            (r.0.buf, r.1.buf, r.2.buf, r.3.buf)
+        };
+        unsafe {
+            let g = self.moebufs.lock();
+            let r = g.as_ref().unwrap();
+            std::ptr::copy_nonoverlapping(perm.as_ptr(), r.0.ptr as *mut u32, rows);
+            std::ptr::copy_nonoverlapping(inv.as_ptr(), r.2.ptr as *mut u32, rows);
+        }
+        // 4) 게더: xg[p] = xq[perm[p]] (u32 행)
+        {
+            let p = self.pipeline(&mut ctx, Slot::PermuteU32)?;
+            let ds2 = ctx.bind_ds(&p, &[xq, pmb, xgb])?;
+            let push = push_u32s(&[xq_w as u32, rows as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+        }
+        // 5) 전문가별 GEMV — xg/yg 슬라이스 + 가중 전문가 오프셋.
+        let wbufs = self.weight_bufs(&mut ctx, w)?;
+        let per_expert = w.data.len() / ne;
+        for e in 0..ne {
+            let r = off[e + 1] - off[e];
+            if r == 0 {
+                continue;
+            }
+            let xq_off = (off[e] * xq_w * 4) as u64;
+            let out_off = (off[e] * n_out * 4) as u64;
+            let w_off = (e * per_expert) as u64;
+            self.gemv_run_off(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, r, xgb, ygb, xq_off, out_off, w_off)?;
+        }
+        // 6) 스캐터: out[inv^{-1}] — inv는 원본행→순열위치: out[i] = yg[inv[i]].
+        {
+            let p = self.pipeline(&mut ctx, Slot::PermuteF32)?;
+            let ds2 = ctx.bind_ds(&p, &[ygb, ivb, ob])?;
+            let push = push_u32s(&[n_out as u32, rows as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+        }
+        Ok(())
+    }
 }
 
 impl llm170_core::matmul::FrameHost for VkAcc {
+    /// plans/84 B: 프레임 op군이 부분 구현(엘리먼트와이스+MoE) — 완성 전에는
+    /// 옵트인(LLM170_VK_FRAME=1)일 때만 엔진이 프레임 경로에 들어온다.
+    fn frame_capable(&self) -> bool {
+        std::env::var_os("LLM170_VK_FRAME").is_some()
+    }
+
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
     /// 값경로 버퍼와 동일 정책(plans/29).
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
@@ -684,6 +862,21 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let push = push_u32s(&[n as u32, pp as u32]);
                     ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
                 }
+            }
+            O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+                let (rb, ib, wb) = (self.fbuf(route)?, self.fbuf(ids)?, self.fbuf(wt)?);
+                let p = self.pipeline(&mut ctx, Slot::MoeTop10)?;
+                let ds2 = ctx.bind_ds(&p, &[rb, ib, wb])?;
+                let push = push_u32s(&[n_exp as u32, k_sel as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, t_cur as u32, 1, 1)?;
+            }
+            O::MoeWeightedSum { ys, wt, out, k, n } => {
+                let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::MoeWsum)?;
+                let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
+                let total = n * t_cur;
+                let push = push_u32s(&[n as u32, k as u32, total as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
             }
             ref other => return Err(format!("vk frame_op: 미지원 {other:?}")),
         }
@@ -2126,6 +2319,78 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         report.push_str(&format!("frame_mm max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
         acc.frame_free(xh)?; acc.frame_free(oh)?;
     }
+    // ── 9) MoE: top10 → 그룹 GEMM → 가중합 (게이트 가중, k=10) ──
+    {
+        use llm170_core::matmul::{FrameHost, FrameState};
+        let k = 10usize;
+        // FN 게이트 가중은 q4_K 스택(대부분 층) — 스택 텐서 하나로 검증.
+        let wg = match &model {
+            AnyModel::Q4(m) => m.w4("blk.0.ffn_gate_exps.weight").map_err(|e| e.to_string())?,
+            AnyModel::Q35(m) => m.w("blk.0.ffn_gate.weight").ok_or("텐서 없음")?,
+        };
+        let n_in_m = wg.n_in as usize;
+        let n_out_m = wg.n_out as usize;
+        let ne = match &model {
+            AnyModel::Q4(_) => 512usize,
+            AnyModel::Q35(_) => 1usize,
+        };
+        if ne == 512 {
+            let route: Vec<f32> = (0..t * ne).map(|_| lcg() * 4.0).collect();
+            let mxs: Vec<Vec<f32>> = (0..t * k).map(|_| (0..n_in_m).map(|_| lcg()).collect()).collect();
+            let rh = acc.frame_alloc(t * ne)?;
+            let idh = acc.frame_alloc(t * k)?;
+            let wth = acc.frame_alloc(t * k)?;
+            let mxh = acc.frame_alloc(t * k * n_in_m)?;
+            let mgh = acc.frame_alloc(t * k * n_out_m)?;
+            let outh = acc.frame_alloc(t * n_out_m)?;
+            acc.frame_write(rh, &route)?;
+            let mut flat2 = Vec::with_capacity(t * k * n_in_m);
+            for row in &mxs { flat2.extend_from_slice(row); }
+            acc.frame_write(mxh, &flat2)?;
+            acc.frame_op(&llm170_core::matmul::FrameOp::MoeTop10 { route: rh, ids: idh, wt: wth, n_exp: ne, k_sel: k })?;
+            let mut ids_g = vec![0u32; t * k];
+            {
+                acc.frame_sync();
+                let g = acc_frame_ptr(&acc, idh);
+                unsafe { std::ptr::copy_nonoverlapping(g as *const u32, ids_g.as_mut_ptr(), t * k) };
+            }
+            acc.frame_moe_gemm(mxh, &wg, idh, mgh, ne, k)?;
+            acc.frame_op(&llm170_core::matmul::FrameOp::MoeWeightedSum { ys: mgh, wt: wth, out: outh, k, n: n_out_m })?;
+            let mut got = vec![0f32; t * n_out_m];
+            acc.frame_read(outh, &mut got)?;
+            // CPU 기준: softmax top-k + 디양자화 내적 + 가중합
+            let mut mx = 0f64;
+            for tok in 0..t {
+                let r = &route[tok * ne..(tok + 1) * ne];
+                let m = r.iter().cloned().fold(f32::MIN, f32::max);
+                let ps: Vec<f32> = r.iter().map(|&v| (v - m).exp()).collect();
+                let zs: f32 = ps.iter().sum();
+                let mut idx: Vec<usize> = (0..ne).collect();
+                idx.sort_by(|&a, &b| ps[b].partial_cmp(&ps[a]).unwrap().then(a.cmp(&b)));
+                let sel: Vec<usize> = idx[..k].to_vec();
+                let wsel: Vec<f32> = sel.iter().map(|&e| ps[e] / zs).collect();
+                let wsum: f32 = wsel.iter().sum::<f32>().max(6.103515625e-5);
+                for (j, &e) in sel.iter().enumerate() {
+                    if ids_g[tok * k + j] as usize != e { mx = mx.max(1.0); }
+                }
+                let per_exp = n_out_m / ne;
+                let mut ref_row = vec![0f32; n_in_m];
+                for j in 0..per_exp.min(8) {
+                    let mut acc2 = 0f64;
+                    for (ki, &e) in sel.iter().enumerate() {
+                        llm170_core::quant::dequant_row(wg.ty, wg.data, (e * per_exp + j) as u64, n_in_m as u64, &mut ref_row);
+                        let dot: f32 = ref_row.iter().zip(mxs[tok * k + ki].iter()).map(|(a, b)| a * b).sum();
+                        acc2 += dot as f64 * (wsel[ki] / wsum) as f64;
+                    }
+                    mx = mx.max((got[tok * n_out_m + j] as f64 - acc2).abs().max(0.0));
+                }
+            }
+            let ok = mx < 3e-2;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| MoE(k={k}) max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
+            for h in [rh, idh, wth, mxh, mgh, outh] { acc.frame_free(h)?; }
+        }
+    }
     let _ = t0;
     Ok(format!(
         "vk-frame-check({tname}, t={t}): {} — {} ({} 실패)",
@@ -2133,4 +2398,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         report,
         fails
     ))
+}
+
+/// 프레임 버퍼 원시 포인터(프로브 내부용).
+fn acc_frame_ptr(acc: &VkAcc, h: u64) -> *mut u8 {
+    acc.framebufs.lock().get(&h).map(|b| b.ptr).unwrap_or(std::ptr::null_mut())
 }

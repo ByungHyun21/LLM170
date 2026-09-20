@@ -923,6 +923,34 @@ impl VkCtx {
 
     /// 바인딩용 ds — 배치 모드는 fresh 세트 (세트 재사용 하저드:
     /// 녹화된 커맨드가 세트 객체를 참조 — 마지막 바인딩으로 전부 덮임).
+    /// 오프셋 바인딩 — plans/84 B: MoE 전문가별 슬라이스(xq/yg 행 구간).
+    /// 비배치 경로 전용(배치 ds 캐시 키에 오프셋이 없다).
+    pub fn bind_bufs_off(&self, ds: vk::DescriptorSet, bufs: &[(vk::Buffer, u64)]) {
+        unsafe {
+            let infos: Vec<vk::DescriptorBufferInfo> = bufs
+                .iter()
+                .map(|&(b, off)| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(b)
+                        .offset(off)
+                        .range(vk::WHOLE_SIZE)
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            self.device.update_descriptor_sets(&writes, &[]);
+        }
+    }
+
     pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
             let key = (

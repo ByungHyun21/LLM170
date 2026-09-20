@@ -1,0 +1,81 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+// plans/84 B — MoE 라우팅: 행별 softmax + top-k 선택 + 가중 정규화.
+// hip q4_moe_top10_m과 동일 의미(softmax(zs 정규화 전) → 내림차순 k개,
+// 동률은 낮은 전문가 인덱스, 가중 = p/zs 후 wsum 정규화). 워크그룹=토큰.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Rt { float rt[]; };
+layout(binding = 1) buffer Ids { uint ids[]; };
+layout(binding = 2) buffer Wt { float wt[]; };
+layout(push_constant) uniform PC { uint n_exp; uint k_sel; } pc;
+shared float sh[1024];
+shared float bmax[64];
+shared uint bidx[64];
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint u = gl_LocalInvocationID.x;
+    uint ne = pc.n_exp;
+    if (u >= 64u || ne > 1024u) return;
+    float mx = -3.4028235e38;
+    for (uint e = u; e < ne; e += 64u) mx = max(mx, rt[tok * ne + e]);
+    bmax[u] = mx;
+    barrier();
+    if (u == 0u) {
+        float m = -3.4028235e38;
+        for (int i = 0; i < 64; i++) m = max(m, bmax[i]);
+        bmax[0] = m;
+    }
+    barrier();
+    float gmx = bmax[0];
+    float zs = 0.0;
+    for (uint e = u; e < ne; e += 64u) {
+        float p = exp(rt[tok * ne + e] - gmx);
+        sh[e] = p;
+        zs += p;
+    }
+    // zs 전체 감산(워크그룹)
+    bmax[u] = zs;
+    barrier();
+    if (u == 0u) {
+        float s = 0.0;
+        for (int i = 0; i < 64; i++) s += bmax[i];
+        bmax[0] = s;
+    }
+    barrier();
+    float gzs = bmax[0];
+    // top-k: 라운드마다 미사용 최대(동률 낮은 인덱스) 선택 — 순차 규칙이라
+    // 결정적. 라운드 k_sel(≤32) × 64레인 감산.
+    uint k = pc.k_sel;
+    float wsum = 0.0;
+    float wk[32];
+    for (uint r = 0u; r < k; r++) {
+        float best = -3.4028235e38;
+        uint bi = 0xffffffffu;
+        for (uint e = u; e < ne; e += 64u) {
+            float p = sh[e];
+            if (p > best && p > 0.0) { best = p; bi = e; }  // p>0: 미사용 마커
+        }
+        bmax[u] = best; bidx[u] = bi;
+        barrier();
+        if (u == 0u) {
+            float bb = -3.4028235e38; uint ii = 0xffffffffu;
+            for (int i = 0; i < 64; i++) {
+                if (bmax[i] > bb) { bb = bmax[i]; ii = bidx[i]; }
+            }
+            bmax[0] = bb; bidx[0] = ii;
+        }
+        barrier();
+        float wbest = bmax[0]; uint widx = bidx[0];
+        if (widx != 0xffffffffu) {
+            sh[widx] = -1.0;   // 소진
+            float wv = wbest / gzs;
+            ids[tok * k + r] = widx;
+            wt[tok * k + r] = wv;
+            if (u == 0u) { wk[r] = wv; wsum += wv; }
+        } else if (u == 0u) { ids[tok * k + r] = 0u; wt[tok * k + r] = 0.0; wk[r] = 0.0; }
+        barrier();
+    }
+    if (u != 0u) return;
+    wsum = max(wsum, 6.103515625e-5);
+    for (uint j = 0u; j < k; j++) wt[tok * k + j] = wk[j] / wsum;
+}

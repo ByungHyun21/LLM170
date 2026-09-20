@@ -348,6 +348,7 @@ impl Engine4 {
         // 직전으로 이동했다.
         let frame_prefill_on = self.acc.is_some()
             && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         let need_cpu_pullback = !frame_prefill_on;
@@ -370,6 +371,7 @@ impl Engine4 {
         // pp512 36.8 t/s = 값 경로(11.2)의 3.3배.
         let frame_on = self.acc.is_some()
             && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         // 프레임 버퍼(t_max)보다 큰 청크는 범위를 넘는다 — 프레임 경로는 청크를 묶는다.
@@ -446,6 +448,7 @@ impl Engine4 {
     pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, Q4Error> {
         let frame_on = self.acc.is_some()
             && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
         if !frame_on {
@@ -538,6 +541,7 @@ impl Engine4 {
         }
         let frame_on = self.acc.is_some()
             && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
         if !frame_on {
