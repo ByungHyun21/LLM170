@@ -82,6 +82,7 @@ void main() {
                   : pc.ty == 20u ? (n_in >> 5) * 18
                   : pc.ty == 11u ? blocks * 110
                   : pc.ty == 21u ? blocks * 110
+                  : pc.ty == 7u  ? (n_in >> 5) * 24
                   : blocks * 136;
     wr0 = (uint(int(o)) * uint(row_bytes)) >> 2u;
     uint wr1 = (uint(int(o)) * uint(row_bytes) + uint(row_bytes) + 3u) >> 2u;
@@ -259,6 +260,40 @@ void main() {
             }
             float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
             acc += yd * d * float(isum);
+        }
+    } else if (pc.ty == 7u) {    // q5_1 (plans/84 B — FN MoE 전문가 질량)
+        int n_sub = n_in >> 5;
+        int cnt = (n_sub + NTI - 1 - int(l)) / NTI;
+        int row_base = int(o) * n_sub * 24;
+        for (int m = 0; m < cnt; m++) {
+            int sb = int(l) + (m * NTI);
+            int wq = (row_base + sb * 24) >> 2;      // 블록 = 6 워드: [d|m][qh][qs×4]
+            vec2 dm = unpackHalf2x16(WGS(wq));
+            float d = dm.x, mm = dm.y;
+            uint qh = WGS(wq + 1);
+            uint q2 = WGS(wq + 2), q3 = WGS(wq + 3), q4 = WGS(wq + 4), q5 = WGS(wq + 5);
+            int xw = (sb << 5) >> 2;
+            int isum = 0;
+            // 원소 i의 5비트 = qh 비트 i. 워드 k(원소 4k..4k+3)는 연속 4비트
+            // 4k..4k+3을 바이트 레인 0..3으로 확산(deq_q5_1 xh0/xh1 미러 —
+            // 초판의 0x01010101 스트라이드 판독은 q5_K 배치용이라 틀렸다).
+            #define Q51_EXPAND(qh_, sh_) \
+                ((((qh_ >> uint(sh_)) & 1u)) | ((((qh_ >> uint(sh_ + 1)) & 1u)) << 8) \
+               | ((((qh_ >> uint(sh_ + 2)) & 1u)) << 16) | ((((qh_ >> uint(sh_ + 3)) & 1u)) << 24))
+            // 원소 0..15: lo nibble | 5비트
+            isum = dot4(((q2 & 0x0F0F0F0Fu) | (Q51_EXPAND(qh,  0) << 4)), xq[base + uint(xw + 0)], isum);
+            isum = dot4(((q3 & 0x0F0F0F0Fu) | (Q51_EXPAND(qh,  4) << 4)), xq[base + uint(xw + 1)], isum);
+            isum = dot4(((q4 & 0x0F0F0F0Fu) | (Q51_EXPAND(qh,  8) << 4)), xq[base + uint(xw + 2)], isum);
+            isum = dot4(((q5 & 0x0F0F0F0Fu) | (Q51_EXPAND(qh, 12) << 4)), xq[base + uint(xw + 3)], isum);
+            // 원소 16..31: hi nibble | 5비트(16..31)
+            isum = dot4((((q2 >> 4) & 0x0F0F0F0Fu) | (Q51_EXPAND(qh, 16) << 4)), xq[base + uint(xw + 4)], isum);
+            isum = dot4((((q3 >> 4) & 0x0F0F0F0Fu) | (Q51_EXPAND(qh, 20) << 4)), xq[base + uint(xw + 5)], isum);
+            isum = dot4((((q4 >> 4) & 0x0F0F0F0Fu) | (Q51_EXPAND(qh, 24) << 4)), xq[base + uint(xw + 6)], isum);
+            isum = dot4((((q5 >> 4) & 0x0F0F0F0Fu) | (Q51_EXPAND(qh, 28) << 4)), xq[base + uint(xw + 7)], isum);
+            int qsb = (n_in >> 2) + (n_in >> 5);
+            int qsum = int(xq[base + uint(qsb + (sb << 1))]) + int(xq[base + uint(qsb + (sb << 1) + 1)]);
+            float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+            acc += yd * fma(d, float(isum), mm * float(qsum));   // dot_q5_1_q8 미러
         }
     } else if (pc.ty == 20u) {   // iq4_nl — ktab2 룩업
         int n_sub = n_in >> 5;
