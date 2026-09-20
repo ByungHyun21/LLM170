@@ -133,6 +133,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
+        "hca-repro" => llm170_backend_gpu::rawhip::hca_repro(),
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-mmq-check" => {
