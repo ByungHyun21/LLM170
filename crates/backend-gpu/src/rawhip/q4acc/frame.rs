@@ -171,6 +171,16 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 Some(v) => v,
                 None => {
                     let (q, w) = self.frame_quant(xp, n_in, rows)?;
+                    if std::env::var_os("LLM170_QHIST").is_some() {
+                        // plans/84 E.2: 양자화 mxsel(xq) 직접 해시 — 게이트 GEMM
+                        // 입력이 f32(mxsel)==인데 mgu가 상이한지 분리.
+                        self.ctx.sync().map_err(|e| e.to_string())?;
+                        let nw = rows.min(160) * w;
+                        let mut xqv = vec![0u32; nw];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut xqv), q)?;
+                        let h = xqv.iter().fold(0xcbf29ce484222325u64, |a, &u| a.wrapping_mul(0x100000001b3) ^ (u as u64));
+                        eprintln!("[nqh] rows={rows} n_in={n_in} xq_h={h:016x}");
+                    }
                     let mut c = self.quant_cache.lock().map_err(|e| e.to_string())?;
                     *c = Some((key.0, key.1, key.2, q as u64, w));
                     (q, w)
