@@ -914,3 +914,25 @@ re-baselining anything until chunk-check passes. Landing order for the
 fix: make the grouped GEMM row-invariant (or pin its dispatch), then
 enable the pin by default, re-record the FN gate under the
 chunk-invariance contract.
+
+## 2026-09-20 (14) — E.2: the divergence is a mid-layer transient (two buffers, converges by layer boundary) (plans/84 E.2)
+
+The built-in `LLM170_DUMP=moe` hash diagnostics (plans/80 asset, first
+production use) sharpen the picture further under the opt-in pin: the
+gathered MoE input (f32 x_h and quantized xq_h of mxsel) differs
+between chunkings at the L2 gate/up GEMM call sites — while the same
+buffers hash EQUAL at the layer-boundary dumps, with device
+synchronization at every read. Two buffers (mxsel and its source mix)
+now show the same signature: different mid-call, equal post-layer.
+
+Values that genuinely differ at a consumer's call site and equal one
+layer later, under synced reads, mean a producer ordering defect in the
+frame pipeline (a later kernel rewrites the buffer with the convergent
+value after the consumer already read the divergent one) rather than a
+pure arithmetic-family issue. Candidate mechanism: the hc-ffn mix /
+moe-gather handoff inside moe_frame reading a buffer whose final write
+for the layer has not been sequenced before the gather (host-grouping
+h2d on the main stream vs gather/permutation kernels, or the quant
+cache serving a stale generation). Next session should trace the exact
+write sequence on f.mix between HcGateMean and the gather — the
+transient signature narrows the search to that window.
