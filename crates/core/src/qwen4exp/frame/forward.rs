@@ -1058,6 +1058,11 @@ pub(super) fn moe_frame(
                 .map_err(Q4Error::Io)?;
             op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
             acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
+            if il <= 2 && llm170_diag::dump::opts().bufhash {
+                buf_hash(acc, f.shg, n_ff * t.min(16), &format!("L{il}A.shg"));
+                buf_hash(acc, f.shout, n_ff * t.min(16), &format!("L{il}A.shout"));
+                buf_hash(acc, f.msgate, t.min(16), &format!("L{il}A.msgate"));
+            }
             op(acc, FrameOp::AxpyScaled { y: f.mout, x: f.shout, s: f.msgate, n: n * t })?;
         }
     }
