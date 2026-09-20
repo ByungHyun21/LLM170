@@ -785,3 +785,34 @@ amplified chaotically. The fix is the same prefill family pin, applied
 to the q4acc frame dispatch; chunk-check FN 16/63/64 is the fence. The
 bufhash dump now also hashes the hc intermediates (lo/inj/gate) and the
 PLE buffers for the next session's localization.
+
+## 2026-09-20 (9) — FN chunk divergence: pin attempted and withdrawn; full RCA map (plans/84 E.2)
+
+The qwen35 prefill family pin was ported to the q4acc frame path
+(`frame_begin` sets PREFILL_PIN for t>1; `tile_core` forces the large-t
+family). Result: chunk-check divergence shrinks (3.46 -> 2.16 max|d|)
+but does not close, AND the default FN gate stream flips — the frame
+prefill's default path itself uses small-t pieces (t_max cap), so the
+pin changes production numerics without fixing the fence. A partial fix
+that breaks the greedy-unchanged principle is worse than none: the pin
+was withdrawn (gates green again); the finer bufhash markers
+(res_attn/res_ffn/site-level inputs + row-split) stay as diagnostics.
+
+Complete hypothesis ledger for the residual divergence (all tested):
+- PLE skip: still fails. NO_TILE: both sides change. MOE_GROUPED forced:
+  still fails (1.94). q5_1 mmq gate: both sides >=16. Tile family pin:
+  partial (2.16) + gate flip -> withdrawn.
+- Site-level bufhash paradox: f.mout hashed at the hc-ffn-combine call
+  site differs between chunkings while every stage-level hash (mout,
+  inj, res) matches and the same buffer matches again one layer later —
+  the classic signature of either a read racing an in-flight async
+  write (frame_read is a null-stream hipMemcpy against custom-stream
+  pipelines) or a real ordering gap in the frame MoE/shared-expert
+  pipeline. Resolving that is the next concrete step: audit stream
+  ordering (pre_pair/stream3/4 + dual-tile side stream) around
+  AxpyScaled/hc_combine, or make buf_hash device-synchronize first to
+  de-noise the instrument.
+
+The Vulkan value path remains chunk-exact, so the CPU stage graph and
+all carried state are proven good; the defect is confined to the q4acc
+frame pipeline.
