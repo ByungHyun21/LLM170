@@ -565,3 +565,37 @@ combined with the 27B near-tie break it stays opt-in. Final session
 ledger for D2: five landed bit-stable increments (17.41 → 18.10 default,
 18.25 opt-in, +4-4.8%), twelve falsifications, all tools in tree. The
 23 t/s target requires the mega-kernel occupancy redesign.
+
+## 2026-09-20 (1) — qwen35 GPU reset-state and chunk-invariance fixes (plans/84 A)
+
+Two correctness defects fixed on the qwen35 HIP path, both fenced by
+`llm170 diag chunk-check`:
+
+1. **Reset-state leak.** `Engine::reset_states` replaced only the CPU
+   `SeqState`s; the GPU-resident GDN S-state and conv ring (raw decoder)
+   stayed dirty, so the second conversation on a reused slot prefilled
+   from the previous conversation's state (identical-prefill repeats
+   diverged max|d| ~ 14, deterministic). `reset_states` now calls
+   `raw_reset` for every slot and invalidates `frame_clean`, matching
+   what `reset_seq` already did per-slot.
+2. **Chunked-prefill non-invariance.** With the leak fixed, the checker
+   showed *any* multi-call GPU prefill diverging from the single-call
+   reference (max|d| 0.25-1.2 with argmax flips; the CPU path was
+   invariant). Stage-level bitwise dumps localized the cause to
+   kernel-family dispatch keyed on the row count t: g4 (t=2-4), tile
+   _mm (<32) vs _wm (>=32) vs j128 (>64), MMQ (>=32), q8_0 GEMV (<=64),
+   flash single-pass (np<=128) vs split, serial vs side-stream gate, mt
+   GEMV variants (t=2-8), and t=1 prefill calls routed through the decode
+   path. Each family is individually deterministic and row-invariant
+   (probed bit-exact across t), but families disagree with each other by
+   ulps, and the difference amplifies chaotically across layers. Fix: a
+   prefill family pin — `step_batch` sets `DecodeState::pin_prefill` (+
+   a module-level `PREFILL_PIN` for ctx-level gates) for the duration of
+   the call, forcing the large-t family at every dispatch point; decode,
+   np and spec paths keep their existing dispatch. Single-token prefill
+   calls now use the batch path too.
+
+Verification: 208-token prompt at chunk sizes 4/8/16/63/128/512 and
+three identical 512 repeats all bits-identical; 9-token prompt at sizes
+1-7 bits-identical; fresh-slot variant clean; gate-27b stream unchanged;
+mmq-row-check / tile-row-check added as kernel-level fences.

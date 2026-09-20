@@ -14,6 +14,19 @@ impl DecodeState {
         }
         let t = emb.len() / self.n_embd;
         debug_assert!(t >= 1 && t <= self.b_t_max);
+        // 프리필 패밀리 핀 (plans/84 A): 이 호출 전체에서 GEMM 커널 패밀리를
+        // t 무관 large-t 패밀리로 고정 — 호출 분할(청크)에 무관한 비트 결과.
+        // Drop 가드: 조기 return 포함 전 경로에서 해제.
+        self.pin_prefill.set(true);
+        crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
+        struct PinGuard<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for PinGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+                crate::rawhip::ctx::PREFILL_PIN.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _pin_guard = PinGuard(&self.pin_prefill);
         let n = self.n_embd;
         let prof = env_on("LLM170_PP_PROF");
         let t0w = std::time::Instant::now();
@@ -55,9 +68,12 @@ gmark("norm", &mut marks);
             if self.is_recr[il] {
                 // 2스트림: qkv+beta(주) ‖ gate+alpha(사이드) — 4독립 GEMM
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_qkv.weight"))?;
-                let qkv_tile = matches!(ty, 12 | 13 | 14 | 23) && t > 64;
+                // 프리필 핀(plans/84 A): 사이드/직렬 분기도 t 무관 통일 —
+                // gemm_mmq(직렬)와 gemm_mmq_s(사이드)의 결과가 어긋나 t≤64 조각이
+                // 발산했다. 핀 시 항상 large-t 분기(사이드)를 쓴다.
+                let qkv_tile = matches!(ty, 12 | 13 | 14 | 23) && (t > 64 || self.pin_prefill.get());
                 let (wg2, tg2, nig2, nog2) = self.w(&format!("blk.{il}.attn_gate.weight"))?;
-                let gate_tile = matches!(tg2, 12 | 13 | 14 | 23) && t > 64;
+                let gate_tile = matches!(tg2, 12 | 13 | 14 | 23) && (t > 64 || self.pin_prefill.get());
                 let (wb2, tb2, nib2, nob2) = self.w(&format!("blk.{il}.ssm_beta.weight"))?;
                 let (wa2, ta2, nia2, noa2) = self.w(&format!("blk.{il}.ssm_alpha.weight"))?;
                 if qkv_tile && gate_tile {
@@ -75,6 +91,11 @@ gmark("norm", &mut marks);
                     self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wb2, tb2, nib2, nob2, self.gb_t, t)?;
                     self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wa2, ta2, nia2, noa2, self.ga_t, t)?;
                 }
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_gqkv"), self.gqkv_t, no, t)?; }
+            if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_gz"), self.gz_t, nog2, t)?; }
+                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_gb"), self.gb_t, self.dt_rank, t)?; }
+                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_ga"), self.ga_t, self.dt_rank, t)?; }
+
                 let cw = *self.consts.get(&format!("blk.{il}.conv_w")).ok_or("conv_w")?;
                 let dtb = *self.consts.get(&format!("blk.{il}.dt_bias")).ok_or("dtb")?;
                 let ssa = *self.consts.get(&format!("blk.{il}.ssm_a")).ok_or("ssa")?;
@@ -103,8 +124,14 @@ gmark("gdn_mm", &mut marks);
                         self.ctx.launch3("gdn_conv_t", conv_ch as u32, 1, 1, 32, &mut args)?;
                     }
                 }
-                if il == 0 {
-                    self.trace_rows("tr_gconv", self.gconv_t, conv_ch, t)?;
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_gconv"), self.gconv_t, conv_ch, t)?; }
+
+                if il == self.trace_il() && std::env::var_os("LLM170_MS_DUMP").is_some() {
+                    let ring_len = (self.conv_k - 1) * self.conv_ch;
+                    let mut ring = vec![0f32; ring_len];
+                    let _ = self.ctx.d2h(bytemuck::cast_slice_mut(&mut ring), self.st_conv[recr_idx][seq]);
+                    let p = std::path::Path::new(&std::env::var_os("LLM170_MS_DUMP").unwrap()).join("tr4_ring.f32");
+                    let _ = std::fs::write(p, bytemuck::cast_slice(&ring));
                 }
                 // split3 전체 배치 (요소별)
                 {
@@ -198,12 +225,18 @@ gmark("betag", &mut marks);
                         self.ctx.launch3("gdn_ar_chunk_c2", npair as u32, nc as u32, 1, d as u32, &mut cc)?;
                     } else {
                         // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
+                        if il == self.trace_il() && std::env::var_os("LLM170_MS_DUMP").is_some() {
+                            let gl = self.dt_rank * self.d_state * self.d_state;
+                            let mut st = vec![0f32; gl];
+                            let _ = self.ctx.d2h(bytemuck::cast_slice_mut(&mut st), self.st_gdn[recr_idx][seq]);
+                            let p = std::path::Path::new(&std::env::var_os("LLM170_MS_DUMP").unwrap()).join("tr4_sstate_in.f32");
+                            let _ = std::fs::write(p, bytemuck::cast_slice(&st));
+                        }
                         self.ctx.launch3("gdn_ar_w_swap", self.d_state as u32, self.dt_rank as u32, 1, 32, &mut args)?;
                     }
                 }
-                if il == 0 {
-                    self.trace_rows("tr_go", self.go_t, v_len, t)?;
-                }
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_go"), self.go_t, v_len, t)?; }
+
                 if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                     self.ctx.sync()?;
                     let mut hq = vec![0f32; k_len * t];
@@ -229,15 +262,21 @@ gmark("trace", &mut marks);
                     let mut args = vec![Self::p(&mut op), Self::p(&mut zp), Self::p(&mut wp), Self::p(&mut outp), Self::p(&mut ep), Self::p(&mut d), Self::p(&mut nh)];
                     self.ctx.launch3("norm_gated_silu_f32", self.dt_rank as u32, t as u32, 1, 32, &mut args)?;
                 }
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_ggated"), self.ggated_t, self.d_inner, t)?; }
+
 gmark("gdn", &mut marks);
 gmark("normg", &mut marks);
                 // out proj 배치
                 if !self.grp_mmq(&[format!("blk.{il}.ssm_out.weight")], t) {
                     self.ctx.quant_q8_b(self.ggated_t, self.xq_g_t, self.d_inner, xq_sg, t)?;
                 }
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_xqg"), self.xq_g_t, xq_sg, t)?; }
+
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
 gmark("outproj", &mut marks);
                 self.mm_b2(self.ggated_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                                if il <= self.trace_il() && self.tracing() { self.trace_rows(&format!("tr{il}_gout"), self.gout_t, self.n_embd, t)?; }
+
                 recr_idx += 1;
 } else {
 gmark("attn", &mut marks);
@@ -263,9 +302,12 @@ gmark("attn", &mut marks);
                     let mut nk = n_kv as i32;
                     let mut h = hd as i32;
                     let mut nr = n_rot as i32;
-                    let rows = n_head + n_kv;
                     let mut args = vec![Self::p(&mut qp), Self::p(&mut kp), Self::p(&mut qwp), Self::p(&mut kwp), Self::p(&mut csp), Self::p(&mut ep), Self::p(&mut kq), Self::p(&mut pp), Self::p(&mut nh), Self::p(&mut nk), Self::p(&mut h), Self::p(&mut nr)];
-                    self.ctx.launch3("qk_norm_rope", rows as u32, t as u32, 1, 32, &mut args)?;
+                    self.ctx.launch3("qk_norm_rope", (n_head + n_kv) as u32, t as u32, 1, 32, &mut args)?;
+                }
+                if il == 3 {
+                    self.trace_rows("tr3_aq_rope", self.aq_t, n_head * hd, t)?;
+                    self.trace_rows("tr3_ak", self.ak_t, n_kv * hd, t)?;
                 }
                 // KV append 배치 (gy=t)
                 {
@@ -352,7 +394,10 @@ gmark("attn", &mut marks);
                     let mut p0 = pos0 as i32;
                     // 분할 flash 기본 ON (2026-09-05: pp512 +5 — 청크 2-4의 np 성장
                     // 구간 병렬화; LLM170_NO_QSA_SPLIT으로 원경로)
-                    if np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128) {
+                    // 프리필 핀(plans/84 A): flash 패밀리도 통일 — np≤128 단일패스와
+                    // np>128 split의 환원 순서가 어긋나 청크 경계 수치가 갈린다.
+                    if np_ > std::env::var("LLM170_QSA_TH").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(128)
+                        || self.pin_prefill.get() {
                         // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
                         // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 줄어든다.
                         let sg = std::env::var("LLM170_QSA_SEG").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize).max(64);
@@ -365,7 +410,7 @@ gmark("attn", &mut marks);
                         // q4 다중화 기본: ck/cv 1회 로드로 t 4행 공유 (레지스터 여유 내 최대 배율)
                         // wk는 t>8(프리필) 전용 — 소형 배치(검증 t<=8)는 디코드와 같은
                         // split4q4를 써서 spec/greedy 계약을 구조적으로 만든다.
-                        let wk = t > 8;
+                        let wk = t > 8 || self.pin_prefill.get();
                         // hd=256 프리필은 16레인/행 판이 기본 (판정기 17/19 유지).
                         // 3회 평균 pp3314 303.7 vs 종전 299.9 (+1.3%, 구동 잡음 ±1.5%).
                         // LLM170_NO_WK16=1 이면 종전 32레인 판으로 복귀.
@@ -399,15 +444,24 @@ gmark("attn", &mut marks);
                         self.ctx.launch3("qsa_flash", t as u32, n_head as u32, 1, 256, &mut args)?;
                     }
                 }
+                if il == 3 {
+                    self.trace_rows("tr3_aout", self.aout_t, n_head * hd, t)?;
+                }
                 // wo 배치
                 if !self.grp_mmq(&[format!("blk.{il}.attn_output.weight")], t) {
                     self.ctx.quant_q8_b(self.aout_t, self.xq_g_t, n_head * hd, xq_sg, t)?;
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_output.weight"))?;
                 self.mm_b2(self.aout_t, self.xq_g_t, xq_sg, wp, ty, ni, no, self.gout_t, t)?;
+                if il == 3 {
+                    self.trace_rows("tr3_gout", self.gout_t, self.n_embd, t)?;
+                }
                 full_idx += 1;
             }
 self.axpy(self.xs_t, self.gout_t, n * t)?;
+            if il == 3 {
+                self.trace_rows("tr3_xs", self.xs_t, self.n_embd, t)?;
+            }
             gmark("proj", &mut marks);
             // FFN 배치
             let pw = *self.consts.get(&format!("blk.{il}.post_norm")).ok_or("post_norm")?;
@@ -423,8 +477,8 @@ gmark("ffn_quant", &mut marks);
             // 2스트림: gate(사이드) ‖ up(주) — 독립 GEMM, 출력버퍼 분리
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && t > 64;
-            let up_tile = matches!(tu, 12 | 13 | 14 | 23) && t > 64;
+            let gate_tile = matches!(tg, 12 | 13 | 14 | 23) && (t > 64 || self.pin_prefill.get());
+            let up_tile = matches!(tu, 12 | 13 | 14 | 23) && (t > 64 || self.pin_prefill.get());
             if !env_on("LLM170_PP_PAIRS") {
                 // 기본: 직렬 — 2스트림 페어는 join2(이벤트) 오버헤드가 이득을 넘는다
                 // (2026-09-12 A/B: 직렬 +0.75%, LLM170_PP_PAIRS=1로 페어 복원).
@@ -446,12 +500,12 @@ gmark("ffn_quant", &mut marks);
                 self.mm_b2_s(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
                 self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
                 self.ctx.join2()?;
-            } else {
-                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wg, tg, nig, nog, self.fgate_t, t)?;
-                self.mm_b2(self.xn_t, self.xq_n_t, xq_sn, wu, tu, niu, nou, self.fup_t, t)?;
+            }
+            if il <= self.trace_il() {
+                self.trace_rows(&format!("tr{il}_fgate"), self.fgate_t, self.n_ff, t)?;
+                self.trace_rows(&format!("tr{il}_fup"), self.fup_t, self.n_ff, t)?;
             }
 gmark("ffn_gate", &mut marks);
-gmark("ffn_up", &mut marks);
             {
                 let mut gp = self.fgate_t as *mut std::ffi::c_void;
                 let mut up = self.fup_t as *mut std::ffi::c_void;
@@ -459,6 +513,9 @@ gmark("ffn_up", &mut marks);
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![Self::p(&mut gp), Self::p(&mut up), Self::p(&mut op), Self::p(&mut na)];
                 self.ew_l("silu_mul_f32", self.n_ff * t, &mut args)?;
+            }
+            if il <= self.trace_il() {
+                self.trace_rows(&format!("tr{il}_fglu"), self.fglu_t, self.n_ff, t)?;
             }
 gmark("ffn_silu", &mut marks);
             if env_on("LLM170_DUMP_XQN") && il == 0 {
@@ -478,13 +535,27 @@ gmark("ffn_silu", &mut marks);
                 let bl = hl.iter().filter(|v| v.is_nan() || v.is_infinite()).count();
                 eprintln!("#  F0 fgate nan/inf {bg} | fglu nan/inf {bl}");
             }
+            if il == 0 {
+                self.trace_rows("tr_xqf", self.xq_f_t, xq_sf, t)?;
+            }
             if !self.grp_mmq(&[format!("blk.{il}.ffn_down.weight")], t) {
                 self.ctx.quant_q8_b(self.fglu_t, self.xq_f_t, self.n_ff, xq_sf, t)?;
             }
-gmark("ffn_quant2", &mut marks);
+            if il == 0 {
+                self.trace_rows("tr_xqf2", self.xq_f_t, xq_sf, t)?;
+            }
             let (wd, td, nid, nod) = self.w(&format!("blk.{il}.ffn_down.weight"))?;
             self.mm_b2(self.fglu_t, self.xq_f_t, xq_sf, wd, td, nid, nod, self.fdown_t, t)?;
+            if il == 0 {
+                self.trace_rows("tr_fdown", self.fdown_t, self.n_embd, t)?;
+            }
+            if il == 3 {
+                self.trace_rows("tr3_fdown", self.fdown_t, self.n_embd, t)?;
+            }
 self.axpy(self.xs_t, self.fdown_t, n * t)?;
+            if il == 3 {
+                self.trace_rows("tr3_xs2", self.xs_t, self.n_embd, t)?;
+            }
             gmark("ffn", &mut marks);
             if env_on("LLM170_RAWHIP_TRACE") {
                 self.ctx.sync()?;

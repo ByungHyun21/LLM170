@@ -265,6 +265,7 @@ impl DecodeState {
             hd: hp.head_dim, n_rot: hp.n_rot, eps: hp.eps, d_inner, n_group: hp.n_group,
             dt_rank: hp.dt_rank, d_state: hp.d_state, conv_k: hp.conv_k, conv_ch,
             k_len, v_len, ctx_len, kq_scale: hp.kq_scale(), is_recr,
+            pin_prefill: std::cell::Cell::new(false),
         };
         Ok(ds)
     }
@@ -426,17 +427,15 @@ impl DecodeState {
         if let Some(m) = only
             && m & (1u32 << (ty - 12)) == 0 {
                 return false;
-            }
-        t >= 32 && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
+        }
+        (t >= 32 || self.pin_prefill.get()) && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
     }
 
     /// 사이드 스트림(mm_b2_s → gemm_mmq_s)의 f32 직소비 여부 — 조건 미러.
     /// (gemm_mmq_s는 ty14를 다루지 않는다.)
     fn mmq_used_s(&self, ty: u32, t: usize) -> bool {
         matches!(ty, 12 | 13 | 23)
-            && t >= 32
-           
-           
+            && (t >= 32 || self.pin_prefill.get())
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
     }
 

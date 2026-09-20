@@ -98,26 +98,39 @@ Verdicts per size: `bits-identical` (exact), `near-tie` (argmax preserved,
 max|Δ| < 1e-3 — the row-count residual axis), `FAIL` otherwise. Reference
 is a single un-chunked prefill.
 
-### Open defects the checker found (2026-09-18)
+### Defects found by the checker — status (2026-09-20, plans/84 A)
 
-1. **qwen35 GPU state leak across `reset_seq`** — running the *identical*
-   prefill twice on the same slot (or on a fresh second slot) diverges:
-   first repeat bit-identical, second repeat max|Δ| ≈ 9.6, third ≈ 12.1,
-   deterministic across processes and slot ids. Repro:
-   `llm170 diag chunk-check <27b.gguf> "<20+ token text>" 512 512 512`.
-   GDN S-state and conv ring are zeroed by `reset_seq_state`; the KV
-   tables are position-indexed (not cleared) — attention masks to
-   `pos0+t`, so the leak lives elsewhere (suspect: residual per-seq or
-   shared scratch consumed before write). Affects HTTP serve slot reuse:
-   the second distinct request on a reused slot sees contaminated logits.
-2. **Flash-Next GPU chunk16 collapse** — `chunk63`/`chunk64` are
-   bits-identical to the single-chunk reference (plans/80 fix verified),
-   but `chunk16` diverges max|Δ| ≈ 10.7 and drives argmax to EOS. The
-   plans/80 fix verified CPU chunk16 ≡ chunk512; the GPU frame path at
-   t=16 remains chunk-dependent.
-
-Both are pre-existing; the checker is the permanent regression fence for
-them.
+1. **qwen35 GPU state leak across resets — FIXED.** Two independent
+   defects:
+   - `Engine::reset_states` replaced only the CPU `SeqState`s; the
+     GPU-resident GDN S-state / conv ring live in the raw decoder and
+     were left dirty, so the next prefill on that slot started from the
+     previous conversation's state (second identical prefill diverged
+     max|Δ| ≈ 14). `reset_states` now zeroes the raw decoder state for
+     every slot (mirroring `reset_seq`) and invalidates `frame_clean`.
+   - **Chunked prefill was not bit-invariant under any split.** After the
+     leak fix the checker exposed that *every* multi-call prefill on the
+     GPU diverged (max|Δ| 0.25–1.2, argmax flips) while the CPU path was
+     invariant. Root cause: kernel-family selection keyed on the row
+     count `t` (g4 for t=2–4, tile `_mm` < 32, MMQ/tile `_wm` ≥ 32,
+     j128 tile > 64, q8_0 GEMV ≤ 64, flash single-pass np ≤ 128 vs split
+     wk8i, serial vs side-stream gate, mt-variant GEMV for t=2–8, and
+     t=1 prefill calls routed through the decode path). The families are
+     individually deterministic and row-invariant, but they disagree with
+     *each other* by a few ulps, and the chunked-vs-single difference
+     amplifies chaotically through the layers. Fix: `step_batch` (the
+     prefill entry) now sets a **prefill family pin** that forces the
+     large-t family for every dispatch decision above, for all `t` —
+     decode (`raw_step`), np and spec paths keep their own dispatch.
+     Single-token prefill calls also route through the batch path.
+   Verification: `llm170 diag chunk-check <27B> <208tok> 4 8 16 63 128
+   512` and `512 512 512` (repeat) all **bits-identical**; 9-token prompt
+   at sizes 1–7 bits-identical; fresh-slot variant (`LLM170_CC_SEQ=1`)
+   clean; `gate-27b.sh` stream unchanged. New kernel-level fences:
+   `llm170 mmq-row-check <model> <tensor> <t1> <t2>` and
+   `llm170 tile-row-check ...` compare shared rows bit-exactly across two
+   batch sizes (MMQ q4/q5/q6/iq4_xs, j128 tile, v4 tile all invariant).
+2. **Flash-Next GPU chunk16 collapse** — open (qwen4exp frame path).
 
 ## Reproduction
 
