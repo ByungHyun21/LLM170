@@ -113,6 +113,17 @@ pub(super) fn frame_forward_ex(
             buf_hash(acc, f.mgu, n_ff * k_sel * rows16, &format!("L{il}B.mgu"));
             buf_hash(acc, f.my, n_ff * k_sel * rows16, &format!("L{il}B.my"));
             buf_hash(acc, f.mout, n * rows16, &format!("L{il}B.mout"));
+            // plans/84 E.2: hc 중간체·PLE 버퍼 — 발산 국소화용.
+            buf_hash(acc, f.lo, f.lo_len * rows16, &format!("L{il}B.lo"));
+            buf_hash(acc, f.inj, hc * rows16, &format!("L{il}B.inj"));
+            buf_hash(acc, f.gate, hc * n * rows16, &format!("L{il}B.gate"));
+            if hp.is_ple(il) {
+                buf_hash(acc, f.ple_key, hc * n * rows16, &format!("L{il}B.ple_key"));
+                buf_hash(acc, f.ple_value, n * rows16, &format!("L{il}B.ple_value"));
+                buf_hash(acc, f.ple_gated, hc * n * rows16, &format!("L{il}B.ple_gated"));
+                buf_hash(acc, f.ple_conv_out, hc * n * rows16, &format!("L{il}B.ple_conv_out"));
+                buf_hash(acc, f.ple_gate, hc * rows16, &format!("L{il}B.ple_gate"));
+            }
         }
         // 1) PLE (blk.1) — plans/73: 디코드(t=1)는 디바이스 경로. 해시/gather는
         //    스텝 초에 호스트가 끝냈고(GPU 무의존), key/value 투영은 프레임 GEMM,

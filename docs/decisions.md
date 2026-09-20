@@ -760,3 +760,28 @@ Verification:
 The fast Vulkan path (frame port: hc/GDN/QSA-indexer/MoE-route/PLE as
 resident FrameHost ops, coopMat tile plates incl. q5_1) remains the
 multi-session core of plans/84 B; the entry map in plans/84 is updated.
+
+## 2026-09-20 (8) — FN chunk divergence bisect: PLE exonerated, multi-family t-dispatch (plans/84 E.2)
+
+Three bisect facts on the Flash-Next HIP frame-path chunk divergence
+(chunk-check 16/63/64 FAIL vs the single-chunk reference):
+
+1. **PLE is not the (sole) source**: `LLM170_STAGE_SKIP=ple` still fails
+   (max|d| 3.46), despite the bufhash first-diff sitting at the blk.1
+   residual (the earlier suspicion from the L1B.res_hc dump position).
+2. **Disabling the tile path changes both sides**: `LLM170_Q4_NO_TILE=1`
+   fails with a degraded reference (argmax 271 vs 17374) — several
+   t-keyed kernel families differ between t=16 and t=208 calls, so
+   single-switch bisects cannot isolate one culprit.
+3. **The Vulkan value path is chunk-invariant** (Q4_CHUNK 16 == 512
+   exactly, entry (7)) — the CPU stage math and all carried state are
+   correct; the divergence is confined to the q4acc frame path's
+   t-dependent dispatch (launch_gemm t>=16 tile/q5_1_m gates, t==1
+   duals, MoE grouped paths).
+
+This is the same defect class the qwen35 prefill had (entry (1)):
+families are individually row-invariant but disagree with each other,
+amplified chaotically. The fix is the same prefill family pin, applied
+to the q4acc frame dispatch; chunk-check FN 16/63/64 is the fence. The
+bufhash dump now also hashes the hc intermediates (lo/inj/gate) and the
+PLE buffers for the next session's localization.
