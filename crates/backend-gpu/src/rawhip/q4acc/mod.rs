@@ -193,6 +193,8 @@ impl Q4Acc {
     /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
     pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
         let ctx = RawCtx::new()?;
+        // plans/84 E1: q4acc는 Flash-Next(qwen4exp) 전용 — 디스패처 스코프 지정.
+        ctx.set_scope(crate::rawhip::SCOPE_FLASHNEXT);
         let ktab2 = {
             let p = ctx.alloc(1024)?;
             let kt: Vec<u32> = llm170_core::ktab2_packed();
