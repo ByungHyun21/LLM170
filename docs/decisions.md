@@ -1093,3 +1093,32 @@ Fence: `vk-frame-check <file> <tensor>` (arch-aware) — RmsRows(w_reps=2)
 All four gates pass. Remaining for the FN frame path: MoE ops
 (top10/gather/scatter/weighted-sum + grouped GEMM), hc/GDN/QSA/PLE
 stages, then chunk-check + perf.
+
+## 2026-09-21 (21) — Vulkan frame MoE: top10, grouped per-expert GEMV, weighted-sum; frame capability gate; vk baseline corrected (plans/84 B)
+
+Second frame slice: MoeTop10 (workgroup-parallel softmax + deterministic
+descending top-k, ties to the lower expert — same semantics as hip
+q4_moe_top10_m), frame_moe_gemm (host grouping like the hip fallback,
+device gather via u32 row permute, per-expert gemv_run_off with
+descriptor-offset bindings, scatter by inverse permutation), and
+MoeWeightedSum. Offset binding (VkCtx::bind_bufs_off) enables expert
+slices of xq/yg/weight without extra buffers; the vk GEMV is a single
+family, so per-expert row counts cannot split arithmetic the way the
+hip fallback did (ledger (18) class).
+
+FrameHost gained `frame_capable()` (default true); VkAcc returns
+LLM170_VK_FRAME=1-gated so the partially implemented frame op set
+cannot break the default engine flow (a partial FrameHost otherwise
+sends the whole FN vk forward into "frame_mm_group: 타입 미지원" —
+the f32 inject weight — instead of the value path).
+
+Baseline correction discovered while validating: the FN vk gate
+baseline recorded on 2026-09-20 captured a hip-class run (real vk
+value-path runs take ~145 s vs hip ~45 s for the 208+16 gate prompt
+and produce the value-path stream `16 19 ...`, not `16 23 ...`).
+Re-recorded with the real vk path after verifying determinism
+(two identical runs) and that the rms w_reps change is innocent
+(reverting it changes nothing). vk-frame-check now covers the full
+MoE chain (top10 → grouped GEMM → weighted-sum): max|D|=6.28e-4 vs
+CPU. All four gates pass. Remaining for frame-capable-by-default:
+hc/GDN/QSA/PLE stages + PLE streaming.

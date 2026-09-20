@@ -1,0 +1,15 @@
+#version 450
+// plans/84 B — 행 순열(게더): dst[p*row + i] = src[perm[p]*row + i] (f32).
+// 워크그룹(256) = 행 1개, 스레드 i는 row를 stride 순회.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Src { float s[]; };
+layout(binding = 1) readonly buffer Pm { uint perm[]; };
+layout(binding = 2) buffer Dst { float d[]; };
+layout(push_constant) uniform PC { uint row; uint rows; } pc;
+void main() {
+    uint p = gl_WorkGroupID.x;
+    if (p >= pc.rows) return;
+    uint src_row = perm[p];
+    for (uint i = gl_LocalInvocationID.x; i < pc.row; i += 256u)
+        d[p * pc.row + i] = s[src_row * pc.row + i];
+}

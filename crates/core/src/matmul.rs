@@ -558,6 +558,12 @@ pub trait QsaOps: Send + Sync {
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait FrameHost: Send + Sync {
 
+    /// 프레임 경로 완전성 — false면 엔진이 프레임 진입을 건너뛴다(값경로).
+    /// 부분 구현 백엔드(plans/84 B vk)가 완성 전 기본 경로를 깨지 않게 한다.
+    fn frame_capable(&self) -> bool {
+        true
+    }
+
     /// KTRACE 덤프+재시작(q4acc 등 백엔드 훅) — 진단용 기본 no-op.
     fn ktrace_tick(&self) {}
 
