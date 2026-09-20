@@ -1061,3 +1061,17 @@ prefill with a 1.2x-faster batched decode, tg = a t=1 kernel-level gap) plus the
 Re-tested after the 65536-set descriptor pool (190c2df) and the GQA
 multi-query flash: `pp8192 ctx12288` completes at 174.5 t/s with no
 ERROR_DEVICE_LOST. The historical device-lost repro is resolved.
+
+## 2026-09-20 (plans/84) — qwen35 chunk-invariance fixed; vk flash +24% pp16k
+
+- qwen35 HIP prefill is now bit-invariant across every chunk size
+  (4..512 and identical repeats; was: any multi-call prefill diverged
+  max|d| 0.25-1.4 with argmax flips). Reset-state slot-reuse leak fixed
+  (second conversation on a reused slot read the previous GDN state).
+- 27B vulkan prefill after the qsa_flash_gq warp-per-query rework:
+  pp4096 233 -> 255 t/s, pp8192 174 -> 202, pp16384 116 -> 143 (+24%);
+  attention-quadratic coefficient -30%; gate stream unchanged.
+- Flash-Next HIP: Q8W_SMALLN default-on via dispatcher model scoping,
+  tg128 18.83 t/s, gates unchanged. hipGraph replay measured
+  numerically-identical but performance-neutral on the frame decode —
+  its 11.3ms step gaps are host-side dispatch, not launch latency.
