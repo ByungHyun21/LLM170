@@ -10,6 +10,16 @@ impl llm170_core::matmul::FrameState for Q4Acc {
 
     fn frame_begin(&self, t: usize) {
         self.cur_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+        // plans/84 E.2 — 프리필(t>1) 패밀리 핀(옵트인 LLM170_Q4_PF_PIN=1).
+        // 진입점 확정: hc_attn down(q8_0)이 t=16 GEMV ↔ t>64 j128 타일로
+        // 갈라 동일 xn에 다른 lo(attn_lo DIFF/inj same). 핀 시 L0-L2 attn/ffn
+        // 전 단계 비트 일치 — 잔여 발산은 그룹 MoE 게이트 GEMM(mgu)로 이동.
+        // 기본 OFF: 기본 경로 수치 불변(게이트 원칙), 펜스 조사용.
+        if t > 1 && std::env::var_os("LLM170_Q4_PF_PIN").is_some() {
+            crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::rawhip::ctx::PREFILL_PIN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// GDN AR (프레임) — qwen35 raw 디코더와 동일 커널(gdn_ar_w_swap).

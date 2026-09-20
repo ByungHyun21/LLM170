@@ -824,19 +824,33 @@ pub(super) fn hc_mix_frame(
     t: usize,
 ) -> Result<(), Q4Error> {
     let w_norm = f.consts[&format!("blk.{il}.hc_{kind}_norm")];
+    // plans/84 E.2: 어텐션 반쪽(lo/inj/gate)은 ffn 반쪽이 덮어써 계측 사각지대 —
+    // il==0 attn에서 즉시 해시해 첫 상이 GEMM 출력을 직접 노출한다.
+    let mark_attn = il <= 2 && kind == "attn";
     op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.xn, eps, n, w_reps: hc })?;
     sync_mark(acc, "hc.rms", f.xn)?;
     let w_down = model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
     let w_inject = model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
     acc.frame_mm_group(f.xn, &[w_down, w_inject], &[f.lo, f.inj], t)
         .map_err(Q4Error::Io)?;
+    if mark_attn && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.xn, hc * n * t.min(16), &format!("L{il}C.attn_xn"));
+        buf_hash(acc, f.lo, f.lo_len * t.min(16), &format!("L{il}C.attn_lo"));
+        buf_hash(acc, f.inj, hc * t.min(16), &format!("L{il}C.attn_inj"));
+    }
     sync_mark(acc, "hc.down", f.lo)?;
     op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len * t })?;
     sync_mark(acc, "hc.silu", f.lo)?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
     acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
+    if mark_attn && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.gate, hc * n * t.min(16), &format!("L{il}C.attn_gate"));
+    }
     sync_mark(acc, "hc.up", f.gate)?;
     op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n })?;
+    if mark_attn && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}C.attn_mix"));
+    }
     sync_mark(acc, "hc.gate", f.mix)?;
     Ok(())
 }
