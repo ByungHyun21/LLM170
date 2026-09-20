@@ -842,3 +842,30 @@ fix, blocked on the gate-flip question (default path uses small-t
 pieces; landing the pin requires re-baselining the FN gate under the
 chunk-invariance contract, which only makes sense once the fence
 actually passes).
+
+## 2026-09-20 (11) — E.2 settled: reads deterministic; MoE mout differs from L0 (shared-add/tile axis) (plans/84 E.2)
+
+Triple-read discriminator at the hc-ffn-combine site (mout read twice
+back-to-back and again after the combine kernel): all three reads are
+bit-identical within each run at every layer — the reads are
+deterministic, the combine does not write mout, and there is no async
+artifact. The buffer genuinely differs between the t=16 chain and the
+t=208 single pass at **every layer from L0** (hash-level; the drift
+sits beyond the first 8 elements of row 0, consistent with the earlier
+value sampling).
+
+Combined with the stage hashes: the grouped-expert outputs (my, mwt,
+mids, mxsel, mgu) all match — the divergence enters at mout, i.e. the
+**scatter/shared-expert add boundary**. Unpinned, the shared-expert
+GEMMs run through the t-keyed tile families (mm/wm/j128), which is the
+component the family pin removes; with the pin active L0-L1 mout match
+and the residual re-emerges at L2 (the layer before the first QSA
+layer). The remaining suspects at L2+ are the QSA-layer feedback into
+the residual (its attention kernels are t>3 sel4 — same family for 16
+and 208, but its indexer/top-k list build is per-chunk) and any
+sub-hash-threshold route drift flipping a late expert.
+
+The chunk-invariance epicenter is now single-buffer precise: f.mout.
+Next session enters at the shared-expert add (shg/shu/shd GEMM dispatch
+under pin) and the L2 route chain, with the discriminator available as
+`LLM170_DUMP=bufhash` site markers.

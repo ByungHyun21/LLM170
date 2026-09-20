@@ -341,10 +341,14 @@ pub(super) fn frame_forward_ex(
             buf_hash(acc, f.res_hc, hc * n * t.min(16), &format!("L{il}A.res_pre_ffn"));
             buf_hash(acc, f.mout, n * t.min(16), &format!("L{il}A.mout_site"));
             buf_hash(acc, f.inj, hc * t.min(16), &format!("L{il}A.inj_site"));
+            // 결정적 판별: 같은 순간 2회 판독 + 결합 직후 재판독 — 커널이 mout을
+            // 쓰는지/판독이 비결정인지/진짜 값 차이인지 분리.
+            buf_hash(acc, f.mout, n * t.min(16), &format!("L{il}A.mout_reread"));
         }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
         if il <= 4 && llm170_diag::dump::opts().bufhash {
             // plans/84 E.2: ffn combine 직후 + 행 반분(0-7/8-15) — 경계 행 패턴 식별
+            buf_hash(acc, f.mout, n * t.min(16), &format!("L{il}A.mout_postcombine"));
             buf_hash(acc, f.res_hc, hc * n * t.min(16), &format!("L{il}A.res_ffn"));
             if t >= 16 {
                 buf_hash(acc, f.res_hc, hc * n * 8, &format!("L{il}A.res_ffn_lo"));
