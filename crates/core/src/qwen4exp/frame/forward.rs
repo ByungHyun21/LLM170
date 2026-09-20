@@ -503,6 +503,11 @@ pub(super) fn qsa_frame(
     if qtm { eprintln!("# qsa-frame L{il} t={t} proj-mm={:.2}ms", t_mm.elapsed().as_secs_f64()*1e3); }
     let t_rp = std::time::Instant::now();
     sync_mark(acc, "qsa.mm_group", b.q)?;
+    if il == 3 && llm170_diag::dump::opts().bufhash {
+        // plans/84 E.2: QSA 내부 이분 — 첫 상이 서브옵을 노출한다.
+        buf_hash(acc, b.q, (n_head * 2 * hd) * t.min(16), "L3Q.proj_q");
+        buf_hash(acc, b.iq, idx_dim * hp.idx_heads * t.min(16), "L3Q.proj_iq");
+    }
     // 2) q/k norm+rope in-place — 커널 산술은 호스트 rms_norm(sq_sum 32세그먼트
     //    f64)+rope_head(f64 회전)와 동일열(비트 동일 기대).
     let pos0 = seq_st.pos;
@@ -518,6 +523,10 @@ pub(super) fn qsa_frame(
     .map_err(Q4Error::Io)?;
     if qtm { eprintln!("# qsa-frame L{il} t={t} rope={:.2}ms", t_rp.elapsed().as_secs_f64()*1e3); }
     sync_mark(acc, "qsa.qkrope", b.k)?;
+    if il == 3 && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, b.q, (n_head * 2 * hd) * t.min(16), "L3Q.rope_q");
+        buf_hash(acc, b.k, (n_kv * hd) * t.min(16), "L3Q.rope_k");
+    }
     if qtm {
         eprintln!("# qsa-frame L{il} t={t} mm+rope={:.2}ms", t_qsa.elapsed().as_secs_f64() * 1e3);
         lap = std::time::Instant::now();
