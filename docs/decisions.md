@@ -816,3 +816,29 @@ Complete hypothesis ledger for the residual divergence (all tested):
 The Vulkan value path remains chunk-exact, so the CPU stage graph and
 all carried state are proven good; the defect is confined to the q4acc
 frame pipeline.
+
+## 2026-09-20 (10) — E.2 instrument hardened; drift profile measured (plans/84 E.2)
+
+The bufhash instrument now device-synchronizes before every read
+(`FrameHost::frame_sync`, default no-op; Q4Acc = ctx sync) and can dump
+first-8-element bit values (`LLM170_DUMP_E2VALS=1`). This de-noised the
+earlier mout "paradox" partially and produced the drift profile:
+
+- With the family pin active (still withdrawn — see (9)), all stage
+  hashes match through L2 and the first hash divergence sits at the
+  hc-ffn-combine site read of f.mout; element sampling shows the drift
+  is real but sub-8-element there, growing to visible last-bit
+  differences (~1e-4 relative) by L9-L10 (L9B.lo/inj/gate onward).
+- Without the pin the divergence enters earlier (hc up-projection gate
+  at L0) — the pin demonstrably removes the tile-family component.
+
+Remaining puzzle recorded honestly: f.mout hashed at the combine call
+site differs while the same buffer hashed one dump later matches — with
+device-synchronized reads. Whether that is a dump-interleaving artifact
+of the multi-pass log or a genuine write between the two points is
+unresolved; the drift itself is real and the MoE-output / hc-combine
+boundary is the measured epicenter. The pin remains the proven partial
+fix, blocked on the gate-flip question (default path uses small-t
+pieces; landing the pin requires re-baselining the FN gate under the
+chunk-invariance contract, which only makes sense once the fence
+actually passes).

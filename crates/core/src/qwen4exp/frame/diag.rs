@@ -90,7 +90,11 @@ pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
         return;
     }
     let mut v = vec![0.0f32; len];
+    acc.frame_sync();   // plans/84 E.2: 커스텀 스트림 미완결 쓰기 경합 제거
     if acc.frame_read(h, &mut v).is_ok() {
+        if std::env::var_os("LLM170_DUMP_E2VALS").is_some() && v.len() >= 8 {
+            eprintln!("[npbv] {tag} first8={:x?}", v[..8].iter().map(|f| f.to_bits()).collect::<Vec<_>>());
+        }
         let mut x = 0xcbf29ce484222325u64;
         for f in &v {
             x ^= f.to_bits() as u64;
