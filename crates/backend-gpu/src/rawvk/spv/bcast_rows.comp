@@ -1,0 +1,11 @@
+#version 450
+// plans/84 B — bcast_rows: dst[r*n + j] = src[j] (r < rows).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Src { float s[]; };
+layout(std430, binding = 1) buffer Dst { float d[]; };
+layout(push_constant) uniform PC { uint n; uint rows; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    for (uint r = 0; r < pc.rows; r++) d[r * pc.n + j] = s[j];
+}

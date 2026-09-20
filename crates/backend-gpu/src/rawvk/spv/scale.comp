@@ -1,0 +1,10 @@
+#version 450
+// plans/84 B — scale: y[j] = y[j] * s (in-place, push 스칼라).
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Ybuf { float y[]; };
+layout(push_constant) uniform PC { uint n; float s; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    y[j] *= pc.s;
+}

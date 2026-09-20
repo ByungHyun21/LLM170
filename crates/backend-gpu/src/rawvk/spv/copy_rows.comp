@@ -1,0 +1,12 @@
+#version 450
+// plans/84 B — vk 프레임 경로 유틸 셰이더 4종 (단일 파일 아님, 각 컴파일):
+// 이 파일은 copy_rows: dst[dst_off+j] = src[src_off+j] (j<n).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Src { float s[]; };
+layout(std430, binding = 1) buffer Dst { float d[]; };
+layout(push_constant) uniform PC { uint n; int src_off; int dst_off; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    d[pc.dst_off + int(j)] = s[pc.src_off + int(j)];
+}

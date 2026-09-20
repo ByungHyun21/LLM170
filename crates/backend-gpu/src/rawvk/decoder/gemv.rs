@@ -583,9 +583,11 @@ impl DecoderState {
     pub(super) fn rms(&mut self, src: vk::Buffer, wkey: &str, out: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
         let wbuf = self.consts.get(wkey).cloned().ok_or(format!("상수 없음: {wkey}"))?;
         let eps = self.eps;
-        let mut push = Self::push_u32s(&[n as u32, t as u32]);
+        // plans/84 B: rms 셰이더에 w_reps 필드 추가(프레임 경로) — 디코더는 1로
+        // 고정(산술 불변), push 16B로 맞춘다.
+        let mut push = Self::push_u32s(&[n as u32, t as u32, 1u32]);
         push.extend_from_slice(&eps.to_le_bytes());
-        self.run_pipe("rms", crate::rawvk::gemv::RMS_SPV, 3, 12,
+        self.run_pipe("rms", crate::rawvk::gemv::RMS_SPV, 3, 16,
             &[src, wbuf.buf, out], &push, t as u32, 1, 1)
     }
 

@@ -18,6 +18,12 @@ pub const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
 pub const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
+/// plans/84 B — vk 프레임 경로 유틸 셰이더군.
+const SILU_DIV_SPV: &[u8] = include_bytes!("spv/silu_div.spv");
+const SCALE_SPV: &[u8] = include_bytes!("spv/scale.spv");
+const COPY_ROWS_SPV: &[u8] = include_bytes!("spv/copy_rows.spv");
+const BCAST_ROWS_SPV: &[u8] = include_bytes!("spv/bcast_rows.spv");
+const AXPY_T_SPV: &[u8] = include_bytes!("spv/axpy_scaled_t.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -27,6 +33,11 @@ enum Slot {
     Tile128,
     /// plans/84 B: q5_1 타일판(tile128_q51) — FN 다운 질량(25.2GiB) 프리필.
     Tile128Q51,
+    SiluDiv,
+    Scale,
+    CopyRows,
+    BcastRows,
+    AxpyT,
     Quant,
     Rms,
     Silu,
@@ -49,6 +60,10 @@ pub struct VkAcc {
     ffnbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
     /// 그룹 배칭 가중별 출력 슬롯 (plans/19)
     gobufs: Mutex<Vec<Option<VkBuf>>>,
+    /// plans/84 B — 프레임 버퍼 레지스트리 (핸들 → 상주 버퍼; host-visible).
+    framebufs: Mutex<HashMap<u64, VkBuf>>,
+    frame_next: std::sync::atomic::AtomicU64,
+    frame_t: std::sync::atomic::AtomicUsize,
 }
 
 fn vk_ty(ty: GgmlType) -> Option<u32> {
@@ -93,6 +108,9 @@ impl VkAcc {
             rbufs: Mutex::new(None),
             ffnbufs: Mutex::new(None),
             gobufs: Mutex::new(Vec::new()),
+            framebufs: Mutex::new(HashMap::new()),
+            frame_next: std::sync::atomic::AtomicU64::new(1),
+            frame_t: std::sync::atomic::AtomicUsize::new(1),
         })
     }
 
@@ -106,8 +124,13 @@ impl VkAcc {
             Slot::Gemv => (GEMV_SPV, 12, 24u32),
             Slot::Tile128 => (TILE128_SPV, 10, 16),
             Slot::Tile128Q51 => (TILE128_Q51_SPV, 10, 24),
+            Slot::SiluDiv => (SILU_DIV_SPV, 1, 8),    // u32 + f32
+            Slot::Scale => (SCALE_SPV, 1, 8),         // u32 + f32
+            Slot::CopyRows => (COPY_ROWS_SPV, 2, 12), // 3×u32
+            Slot::BcastRows => (BCAST_ROWS_SPV, 2, 8),// 2×u32
+            Slot::AxpyT => (AXPY_T_SPV, 3, 8),        // 2×u32
             Slot::Quant => (QUANT_SPV, 2, 12),
-            Slot::Rms => (RMS_SPV, 3, 12),
+            Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
@@ -320,7 +343,6 @@ impl VkAcc {
     }
 }
 
-impl llm170_core::matmul::FrameState for VkAcc {}
 unsafe impl Send for VkAcc {}
 unsafe impl Sync for VkAcc {}
 
@@ -360,7 +382,7 @@ impl VkAcc {
         };
         let p = self.pipeline(&mut ctx, Slot::Rms)?;
         let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
-        let mut push = push_u32s(&[n as u32, t as u32]);
+        let mut push = push_u32s(&[n as u32, t as u32, 1u32]);
         push.extend_from_slice(&eps.to_le_bytes());
         ctx.run(p.pl, ds2, p.pipe, &push, t as u32, 1, 1)?;
         let host = {
@@ -511,7 +533,163 @@ impl VkAcc {
 // 미지원 capability — 모든 메서드가 기본(Err) 구현이라 빈 impl 로 충분하다.
 impl llm170_core::matmul::GraphCapture for VkAcc {}
 impl llm170_core::matmul::QsaOps for VkAcc {}
-impl llm170_core::matmul::FrameHost for VkAcc {}
+
+impl VkAcc {
+    /// 프레임 핸들 → 상주 버퍼 (없으면 Err).
+    fn fbuf(&self, h: u64) -> Result<vk::Buffer, String> {
+        self.framebufs
+            .lock()
+            .get(&h)
+            .map(|b| b.buf)
+            .ok_or_else(|| format!("vk 프레임 핸들 없음: {h}"))
+    }
+}
+
+impl llm170_core::matmul::FrameState for VkAcc {
+    fn frame_begin(&self, t: usize) {
+        self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl llm170_core::matmul::FrameHost for VkAcc {
+    /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
+    /// 값경로 버퍼와 동일 정책(plans/29).
+    fn frame_alloc(&self, len: usize) -> Result<u64, String> {
+        let mut ctx = self.ctx.lock();
+        let b = ctx.alloc_host(len * 4)?;
+        let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.framebufs.lock().insert(h, b);
+        Ok(h)
+    }
+    fn frame_free(&self, h: u64) -> Result<(), String> {
+        self.framebufs.lock().remove(&h);
+        Ok(())
+    }
+    fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
+        let (ptr, _) = {
+            let g = self.framebufs.lock();
+            let b = g.get(&h).ok_or("vk frame_write: 핸들 없음")?;
+            (b.ptr, std::marker::PhantomData::<()>)
+        };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len()) };
+        Ok(())
+    }
+    fn frame_write_u32(&self, h: u64, data: &[u32]) -> Result<(), String> {
+        let ptr = self.framebufs.lock().get(&h).ok_or("vk frame_write_u32: 핸들 없음")?.ptr;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u32, data.len()) };
+        Ok(())
+    }
+    fn frame_sync(&self) {
+        // 비배치 run()은 호출마다 제출+펜스 대기(동기) — 추가 대기 불필요.
+        // 배치 모드(값경로 begin_batch)에서만 플러시한다.
+        let mut ctx = self.ctx.lock();
+        if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = ctx.end_batch_wait();
+        }
+    }
+    fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
+        self.frame_sync();
+        let ptr = self.framebufs.lock().get(&h).ok_or("vk frame_read: 핸들 없음")?.ptr;
+        unsafe { std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), out.len()) };
+        Ok(())
+    }
+    /// 상주 GEMM: 프레임 f32 버퍼 → (디바이스) quant → gemv. 업/다운 없음.
+    fn frame_mm(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
+        self.frame_mm_group(x, std::slice::from_ref(w), &[out], t)
+    }
+    fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+        let n_in = ws[0].n_in as usize;
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let mut ctx = self.ctx.lock();
+        let xb = self.fbuf(x)?;
+        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+        // 디바이스 quant: 프레임 f32 버퍼를 직접 소비 (호스트 경유 없음).
+        {
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
+            let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
+        }
+        for (wi, w) in ws.iter().enumerate() {
+            let ty = vk_ty(w.ty).ok_or("vk frame_mm_group: 타입 미지원")?;
+            let n_out = w.n_out as usize;
+            let ob = self.fbuf(outs[wi])?;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+        }
+        Ok(())
+    }
+    fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
+        use llm170_core::matmul::FrameOp as O;
+        let t_cur = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ctx = self.ctx.lock();
+        match *op {
+            O::RmsRows { x, w, out, eps, n, w_reps } => {
+                let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
+                let rows = w_reps * t_cur;
+                let p = self.pipeline(&mut ctx, Slot::Rms)?;
+                let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
+                let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+            }
+            O::SiluDiv { t, div, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::SiluDiv)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let mut push = push_u32s(&[n as u32]);
+                push.extend_from_slice(&div.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::SiluMul { g, u, out, n } => {
+                let (gb, ub, ob) = (self.fbuf(g)?, self.fbuf(u)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::Silu)?;
+                let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
+                let push = push_u32s(&[n as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::Scale { t, s, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::Scale)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let mut push = push_u32s(&[n as u32]);
+                push.extend_from_slice(&s.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::CopyRows { src, dst, src_off, dst_off, n } => {
+                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
+                let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
+                let push = push_u32s(&[n as u32, src_off as u32, dst_off as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::BcastRows { src, dst, n, rows } => {
+                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
+                let p = self.pipeline(&mut ctx, Slot::BcastRows)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
+                let push = push_u32s(&[n as u32, rows as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::AxpyScaled { y, x, s, n } => {
+                let (yb, xb, sb) = (self.fbuf(y)?, self.fbuf(x)?, self.fbuf(s)?);
+                if t_cur <= 1 {
+                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?; // pp=n → s[0]와 동일
+                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
+                    let push = push_u32s(&[n as u32, n as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                } else {
+                    let pp = n / t_cur;
+                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?;
+                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
+                    let push = push_u32s(&[n as u32, pp as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                }
+            }
+            ref other => return Err(format!("vk frame_op: 미지원 {other:?}")),
+        }
+        Ok(())
+    }
+}
 
 impl llm170_core::matmul::MatmulHost for VkAcc {
     fn matmul_batch(
@@ -1738,5 +1916,221 @@ pub fn mmv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     Ok(format!(
         "mmv({tname}) t={t}: {dt:.4}ms · maxrel={maxrel:.4} · {:.1}GB/s",
         w.data.len() as f64 / dt / 1e9
+    ))
+}
+
+/// vk-frame-check — plans/84 B: 프레임 코어(버퍼 레지스트리+엘리먼트와이스+
+/// 상주 GEMM)의 CPU 대조 검증. 각 op를 LCG 데이터로 실행해 판독 비교.
+pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
+    use std::time::Instant;
+    enum AnyModel {
+        Q35(llm170_core::qwen35::Model),
+        Q4(llm170_core::qwen4exp::Model4),
+    }
+    let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(path))
+        .ok()
+        .and_then(|g| g.arch().map(|a| a == "qwen4exp"))
+        .unwrap_or(false);
+    let model = if is_q4 {
+        AnyModel::Q4(
+            llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        AnyModel::Q35(
+            llm170_core::qwen35::Model::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let w = match &model {
+        AnyModel::Q35(m) => m.w(tname).ok_or("텐서 없음")?,
+        AnyModel::Q4(m) => m.w4(tname).map_err(|e| e.to_string())?,
+    };
+    let n_in = w.n_in as usize;
+    let n_out = w.n_out as usize;
+    let acc = VkAcc::new()?;
+    let t = 3usize;
+    let mut seed = 0x5deece66u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
+    let mut fails = 0usize;
+    let mut report = String::new();
+    let t0 = Instant::now();
+    use llm170_core::matmul::FrameState;
+    acc.frame_begin(t);
+
+    // ── 1) RmsRows (w_reps=2) ──
+    {
+        let n = 64usize;
+        let reps = 2usize;
+        let xh = acc.frame_alloc(n * reps * t)?;
+        let wh = acc.frame_alloc(n * reps)?;
+        let oh = acc.frame_alloc(n * reps * t)?;
+        // hip 규약: 입력 x도 reps*t행 (res_hc는 hc 반복 레이아웃).
+        let mut x = Vec::with_capacity(n * reps * t);
+        for _ in 0..reps * t {
+            x.extend((0..n).map(|_| lcg()));
+        }
+        let wv: Vec<f32> = (0..n * reps).map(|_| lcg()).collect();
+        acc.frame_write(xh, &x)?;
+        acc.frame_write(wh, &wv)?;
+        use llm170_core::matmul::FrameHost;
+        acc.frame_op(&llm170_core::matmul::FrameOp::RmsRows {
+            x: xh, w: wh, out: oh, eps: 1e-5, n, w_reps: reps,
+        })?;
+        let mut got = vec![0f32; n * reps * t];
+        acc.frame_read(oh, &mut got)?;
+        let mut mx = 0f64;
+        for row in 0..reps * t {
+            let s: f64 = (0..n).map(|i| (x[row * n + i] as f64).powi(2)).sum();
+            let inv = 1.0 / (s / n as f64 + 1e-5).sqrt();
+            for i in 0..n {
+                let exp = (x[row * n + i] as f64) * inv * wv[(row % reps) * n + i] as f64;
+                mx = mx.max((got[row * n + i] as f64 - exp).abs());
+            }
+        }
+        let ok = mx < 5e-5;
+        if !ok { fails += 1; }
+        report.push_str(&format!("RmsRows(w_reps={reps}) max|D|={mx:.2e} {} | ", if ok { "OK" } else { "FAIL" }));
+        acc.frame_free(xh)?; acc.frame_free(wh)?; acc.frame_free(oh)?;
+    }
+    // ── 2) SiluDiv / 3) SiluMul / 4) Scale ──
+    {
+        let n = 256usize;
+        let a: Vec<f32> = (0..n).map(|_| lcg()).collect();
+        let b: Vec<f32> = (0..n).map(|_| lcg()).collect();
+        let ah = acc.frame_alloc(n)?;
+        let bh = acc.frame_alloc(n)?;
+        let oh = acc.frame_alloc(n)?;
+        acc.frame_write(ah, &a)?;
+        acc.frame_write(bh, &b)?;
+        use llm170_core::matmul::FrameHost;
+        acc.frame_op(&llm170_core::matmul::FrameOp::SiluDiv { t: ah, div: 320.0, n })?;
+        let mut got = vec![0f32; n];
+        acc.frame_read(ah, &mut got)?;
+        let mut mx = 0f64;
+        for i in 0..n {
+            let exp = (a[i] / (1.0 + (-a[i] as f32).exp())) as f64 / 320.0;
+            mx = mx.max((got[i] as f64 - exp).abs());
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("SiluDiv max|D|={mx:.2e} {} | ", if ok { "OK" } else { "FAIL" }));
+
+        acc.frame_write(ah, &a)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::SiluMul { g: ah, u: bh, out: oh, n })?;
+        acc.frame_read(oh, &mut got)?;
+        mx = 0.0;
+        for i in 0..n {
+            let exp = (a[i] / (1.0 + (-a[i] as f32).exp())) as f64 * b[i] as f64;
+            mx = mx.max((got[i] as f64 - exp).abs());
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("SiluMul max|D|={mx:.2e} {} | ", if ok { "OK" } else { "FAIL" }));
+
+        acc.frame_write(ah, &a)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::Scale { t: ah, s: 0.5, n })?;
+        acc.frame_read(ah, &mut got)?;
+        mx = 0.0;
+        for i in 0..n {
+            mx = mx.max((got[i] as f64 - a[i] as f64 * 0.5).abs());
+        }
+        let ok = mx < 1e-7;
+        if !ok { fails += 1; }
+        report.push_str(&format!("Scale max|D|={mx:.2e} {} | ", if ok { "OK" } else { "FAIL" }));
+        acc.frame_free(ah)?; acc.frame_free(bh)?; acc.frame_free(oh)?;
+    }
+    // ── 5) CopyRows / 6) BcastRows / 7) AxpyScaled(t) ──
+    {
+        let n = 100usize;
+        let src: Vec<f32> = (0..n).map(|_| lcg()).collect();
+        let sh = acc.frame_alloc(n)?;
+        let dh = acc.frame_alloc(2 * n)?;
+        acc.frame_write(sh, &src)?;
+        use llm170_core::matmul::FrameHost;
+        acc.frame_op(&llm170_core::matmul::FrameOp::CopyRows { src: sh, dst: dh, src_off: 7, dst_off: n + 3, n: n - 10 })?;
+        let mut got = vec![0f32; 2 * n];
+        acc.frame_read(dh, &mut got)?;
+        let mut ok = true;
+        for i in 0..(n - 10) {
+            if (got[n + 3 + i] - src[7 + i]).abs() > 1e-7 { ok = false; break; }
+        }
+        if !ok { fails += 1; }
+        report.push_str(&format!("CopyRows {} | ", if ok { "OK" } else { "FAIL" }));
+
+        let bh2 = acc.frame_alloc(n * t)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::BcastRows { src: sh, dst: bh2, n, rows: t })?;
+        acc.frame_read(bh2, &mut got)?;
+        let _ = &mut got;
+        let mut got2 = vec![0f32; n * t];
+        acc.frame_read(bh2, &mut got2)?;
+        ok = true;
+        for r in 0..t {
+            for i in 0..n {
+                if (got2[r * n + i] - src[i]).abs() > 1e-7 { ok = false; }
+            }
+        }
+        if !ok { fails += 1; }
+        report.push_str(&format!("BcastRows {} | ", if ok { "OK" } else { "FAIL" }));
+
+        let per = 32usize;
+        let y: Vec<f32> = (0..t * per).map(|_| lcg()).collect();
+        let xx: Vec<f32> = (0..t * per).map(|_| lcg()).collect();
+        let ss: Vec<f32> = (0..t).map(|_| lcg()).collect();
+        let yh = acc.frame_alloc(t * per)?;
+        let xh2 = acc.frame_alloc(t * per)?;
+        let ssh = acc.frame_alloc(t)?;
+        acc.frame_write(yh, &y)?;
+        acc.frame_write(xh2, &xx)?;
+        acc.frame_write(ssh, &ss)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::AxpyScaled { y: yh, x: xh2, s: ssh, n: t * per })?;
+        let mut got3 = vec![0f32; t * per];
+        acc.frame_read(yh, &mut got3)?;
+        let mut mx = 0f64;
+        for j in 0..t * per {
+            let exp = y[j] as f64 + xx[j] as f64 * ss[j / per] as f64;
+            mx = mx.max((got3[j] as f64 - exp).abs());
+        }
+        let aok = mx < 1e-6;
+        if !aok { fails += 1; }
+        report.push_str(&format!("AxpyScaled(t={t}) max|D|={mx:.2e} {}", if aok { "OK" } else { "FAIL" }));
+        acc.frame_free(sh)?; acc.frame_free(dh)?; acc.frame_free(bh2)?;
+        acc.frame_free(yh)?; acc.frame_free(xh2)?; acc.frame_free(ssh)?;
+    }
+    // ── 8) frame_mm — 상주 quant+GEMM vs CPU 디양자화 내적 ──
+    {
+        let xh = acc.frame_alloc(n_in * t)?;
+        let oh = acc.frame_alloc(n_out * t)?;
+        let mut flat = Vec::with_capacity(n_in * t);
+        for row in &xs { flat.extend_from_slice(row); }
+        acc.frame_write(xh, &flat)?;
+        use llm170_core::matmul::FrameHost;
+        acc.frame_mm(xh, &w, oh, t)?;
+        let mut got = vec![0f32; n_out * t];
+        acc.frame_read(oh, &mut got)?;
+        let mut mx = 0f64;
+        let mut ref_row = vec![0f32; n_in];
+        for (j, x) in xs.iter().enumerate() {
+            for r in 0..n_out.min(16) {
+                llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
+                let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+                mx = mx.max((dot as f64 - got[j * n_out + r] as f64).abs());
+            }
+        }
+        let ok = mx < 5e-3;
+        if !ok { fails += 1; }
+        report.push_str(&format!("frame_mm max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
+        acc.frame_free(xh)?; acc.frame_free(oh)?;
+    }
+    let _ = t0;
+    Ok(format!(
+        "vk-frame-check({tname}, t={t}): {} — {} ({} 실패)",
+        if fails == 0 { "PASS" } else { "FAIL" },
+        report,
+        fails
     ))
 }

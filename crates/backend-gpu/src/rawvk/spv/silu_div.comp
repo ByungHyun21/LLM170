@@ -1,0 +1,13 @@
+#version 450
+// plans/84 B — vk 프레임 경로 SiluDiv: t[j] = silu(t[j]) / div (in-place).
+// 산술은 hip silu_div와 동일열 (exp f32).
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Tbuf { float v[]; };
+layout(push_constant) uniform PC { uint n; float div; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    float x = v[j];
+    float s = x / (1.0 + exp(-x));
+    v[j] = s / pc.div;
+}

@@ -1067,3 +1067,29 @@ recreate the family-split chunk divergence fixed in ledger (18)).
 Perf on the FN vk value path (208-token prefill): 43.0-44.1 s →
 42.3-42.5 s (~3%), consistent with the path being host-staging bound.
 All four gates (FN/27B × hip/vk) pass.
+
+## 2026-09-21 (20) — Vulkan frame core: buffer registry, elementwise FrameOps, resident frame_mm (plans/84 B)
+
+First slice of the FN frame port on Vulkan: VkAcc now implements
+FrameState (frame_begin + a handle registry of host-visible frame
+buffers with direct write/read) and the FrameHost core:
+
+- frame_mm/frame_mm_group: device-resident quant (the frame f32 buffer
+  feeds the quant shader directly — no host roundtrip) then gemv_run
+  per weight, writing into frame buffers.
+- FrameOps: RmsRows (rms.comp gained a w_reps field, hip
+  rms_finish convention — weight indexed w[(row % w_reps)*n + i];
+  w_reps=1 keeps the old arithmetic), SiluDiv, SiluMul, Scale,
+  CopyRows, BcastRows, AxpyScaled (per-token scale variant).
+
+Two integration traps found and fixed: push-constant sizes must match
+the registered range exactly (over-sized ranges on 8/12-byte pushes
+crash the driver), and the q35 VkDecoder shares RMS_SPV — its launch
+was updated to the 16-byte [n, t, w_reps=1, eps] push (caught by the
+27B vk gate going degenerate; stash-bisect isolated the shader).
+
+Fence: `vk-frame-check <file> <tensor>` (arch-aware) — RmsRows(w_reps=2)
+7.1e-8, elementwise ≤1.6e-8, frame_mm 9.2e-4 vs CPU dequant.
+All four gates pass. Remaining for the FN frame path: MoE ops
+(top10/gather/scatter/weighted-sum + grouped GEMM), hc/GDN/QSA/PLE
+stages, then chunk-check + perf.
