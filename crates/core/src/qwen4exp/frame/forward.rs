@@ -826,7 +826,7 @@ pub(super) fn hc_mix_frame(
     let w_norm = f.consts[&format!("blk.{il}.hc_{kind}_norm")];
     // plans/84 E.2: 어텐션 반쪽(lo/inj/gate)은 ffn 반쪽이 덮어써 계측 사각지대 —
     // il==0 attn에서 즉시 해시해 첫 상이 GEMM 출력을 직접 노출한다.
-    let mark_attn = il <= 2 && kind == "attn";
+    let mark_attn = il <= 3 && kind == "attn";
     op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.xn, eps, n, w_reps: hc })?;
     sync_mark(acc, "hc.rms", f.xn)?;
     let w_down = model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
@@ -1012,6 +1012,11 @@ pub(super) fn moe_frame(
     } else {
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
+        if il <= 3 && llm170_diag::dump::opts().bufhash {
+            // plans/84 E.2: gather 시점 mix/mxsel — 과도 현상의 소스 분리.
+            buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}D.mix_at_gather"));
+            buf_hash(acc, f.mxsel, n * k_sel * t.min(16), &format!("L{il}D.mxsel_after_gather"));
+        }
         if std::env::var_os("LLM170_MOE_GATHER2").is_some() {
             // 진단(plans/80): gather 2회 — 멱등 쓰기라 결과 불변이어야 한다.
             // 2회째에 x가 바르게 되면 첫 쓰기가 찢어진 것, 그대로면 이웃 오염.

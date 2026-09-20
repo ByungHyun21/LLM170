@@ -936,3 +936,28 @@ h2d on the main stream vs gather/permutation kernels, or the quant
 cache serving a stale generation). Next session should trace the exact
 write sequence on f.mix between HcGateMean and the gather — the
 transient signature narrows the search to that window.
+
+## 2026-09-20 (15) — E.2 smoking gun: MoE GEMM inputs bit-identical, outputs differ (plans/84 E.2)
+
+`LLM170_QHIST=1` (new probe: FNV hash of the quantized activation at
+every MoE quant-miss) closes the chain under the opt-in pin:
+
+- Layers 0-1: gate and down quantized inputs hash-identical between
+  the t=208 single pass and the t=16 chain (and every buffer hash
+  matches end to end).
+- **L2 gate quantized input (n_in=2560): IDENTICAL** (83ea8fe1... both
+  runs) — yet L2's gate GEMM output (mgu) differs.
+- **L2 down quantized input (n_in=640): differs** — downstream of mgu.
+
+So with bit-identical quantized input, identical weights, and the
+row-local ge kernel, the grouped MoE GEMM chain (quant -> permute/gather
+-> q4_gemm_q4k_ge -> inverse scatter) produces different outputs
+between a rows=160 and a rows=2080 invocation. The defect is inside the
+grouped machinery — permutation tables, gather/scatter, or the kernel's
+row guard — not in any upstream arithmetic.
+
+Next session enters with a standalone reproduction: same weights, same
+xq, rows=160 vs 2080 through frame_moe_gemm (q4_K, n_in=2560), bisect
+permute/gemm/scatter by hashing xg and yg in the permuted domain.
+Recipe: LLM170_Q4_PF_PIN=1 LLM170_QHIST=1, layer 2, first divergence
+at the fifth quant-miss.
