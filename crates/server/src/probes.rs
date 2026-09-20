@@ -171,6 +171,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_up.weight".into());
             llm170_backend_gpu::rawvk::gemv::q3_dbg(&path, &tn)
         }
+        "vk-frame-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_down_shexp.weight".into());
+            llm170_backend_gpu::rawvk::gemv::frame_check(&path, &tn)
+        }
         "vk-tile-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_down.weight".into());

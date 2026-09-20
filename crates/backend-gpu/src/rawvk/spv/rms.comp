@@ -8,7 +8,7 @@ layout(binding = 0) readonly buffer Xbuf { float x[]; };
 layout(binding = 1) readonly buffer Wbuf { float wv[]; };
 layout(binding = 2) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n; uint t; float eps;
+    uint n; uint t; uint w_reps; float eps;
 } pc;
 
 shared double seg[32];
@@ -43,6 +43,9 @@ void main() {
     barrier();
     if (uint(lo) < n) {
         int hi = min(lo + chunk, int(n));
-        for (int i = lo; i < hi; i++) outv[xb + i] = x[xb + i] * invs * wv[i];
+        // plans/84 B: w_reps — hip rms_finish와 동일 규약, w[(row % w_reps)*n + i].
+        // w_reps=1이면 기존 산술과 동일(값경로 불변).
+        int wbase = int((row % max(pc.w_reps, 1u)) * pc.n);
+        for (int i = lo; i < hi; i++) outv[xb + i] = x[xb + i] * invs * wv[wbase + i];
     }
 }

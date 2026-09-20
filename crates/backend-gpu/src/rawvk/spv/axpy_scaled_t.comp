@@ -1,0 +1,13 @@
+#version 450
+// plans/84 B — axpy_scaled_t: y[j] += x[j] * s[j / pp] (토큰별 스케일).
+// hip q4_axpy_scaled_t와 동일열 — s는 [t] 버퍼, pp = 토큰당 원소 수.
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Ybuf { float y[]; };
+layout(binding = 1) readonly buffer Xbuf { float x[]; };
+layout(binding = 2) readonly buffer Sbuf { float s[]; };
+layout(push_constant) uniform PC { uint n; uint pp; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    y[j] += x[j] * s[j / pc.pp];
+}
