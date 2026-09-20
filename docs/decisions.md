@@ -961,3 +961,27 @@ xq, rows=160 vs 2080 through frame_moe_gemm (q4_K, n_in=2560), bisect
 permute/gemm/scatter by hashing xg and yg in the permuted domain.
 Recipe: LLM170_Q4_PF_PIN=1 LLM170_QHIST=1, layer 2, first divergence
 at the fifth quant-miss.
+
+## 2026-09-20 (16) — E.2: ge machinery exonerated; the quant output itself is sync-placement-dependent (plans/84 E.2)
+
+Permuted-domain bisect (`LLM170_E2PERM`, new probe hashing xg before and
+yg after q4_gemm_q4k_ge at each original row's permuted position;
+MoeGroup now caches the host inverse permutation for it):
+
+- L0 and L1 gate/up chains: xg AND yg bit-identical between the t=208
+  single pass and the t=16 chain — the permute/gemm/scatter machinery
+  is exact on identical input.
+- L2 gate: xg (the permuted copy of the quantized mxsel) already
+  differs — c0c4d7d9 vs 3388ec6c in a minimal-sync run. But the same
+  quant hashed IDENTICAL in a run with a device sync right after each
+  quant (LLM170_QHIST, ledger (15)).
+
+Conclusion: the quant kernel's OUTPUT for L2's gate differs depending
+on whether an intervening device-wide sync occurred — a producer
+ordering defect in the quant input chain (fxq-pool reuse, gather, or an
+async op completing late), not arithmetic. Static stream analysis shows
+all kernels on one stream, so the defect lives in something the sync
+drains (async h2d/d2h_issue on stream2+, or a pool alias). Next
+session: trace every writer of the fxq buffer between L1-down-quant and
+L2-gate-quant (canary hash around each candidate) — the defect is now
+one buffer and one call window wide.
