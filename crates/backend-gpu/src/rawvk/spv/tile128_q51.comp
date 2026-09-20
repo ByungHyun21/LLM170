@@ -1,0 +1,150 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// q5_1 128행 타일 (plans/84 B): tile128_q5k 판의 q5_1 변형. 22B 블록
+// (d,m f16 + qh 4B + ql 16B, 32원소 = **24B** — ggml-common.h block_q5_1 열)은 워드 정렬이 아니므로 바이트 단위
+// 판독(WGB)으로 조립한다 — 산술은 llama mul_mat_vec_q5_1과 동일열
+// (gemv3 ty=7 참조): w = d*(lo + 16*hi5) + m.
+// LDS/드레인/루프 구조는 q5_K 판과 동일(T_MAX=128, 64토큰 서브배치).
+layout(local_size_x = 512) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint t; uint tok_base; uint wsh;
+} pc;
+
+uint WG(uint idx) {
+    // plans/84 B: 청크 크기를 push(wsh=log2(words/chunk))로 — FN 전문가
+    // 스택(577MB)은 25비트 고정 청킹(134MB)을 넘는다. 잔여 청크의 경계
+    // 밖 읽기는 robustBufferAccess(0)로 정의됨(실데이터 행은 n_out 내).
+    uint c = idx >> pc.wsh;
+    uint o = idx & ((1u << pc.wsh) - 1u);
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+// plans/84 B: 바이트 판독 — q5_1 블록(22B)이 워드 경계를 걸친다.
+uint WGB(uint b) {
+    uint w = WG(b >> 2u);
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+shared float16_t A16[128][68];
+shared float16_t B16[128][68];
+shared float16_t Ctmp[128][65];
+
+void stage_a(int sb, int colb, bool live, int row0, int nrow, int blocks, int tid) {
+    int r = int(tid >> 2);              // 행 0..127
+    int kc = int(tid & 3) * 8;          // k 오프셋 0/8/16/24
+    int row = row0 + r;
+    if (live && row < nrow + row0) {
+        uint bo = uint((row * blocks + sb) * 24);
+        float d = unpackHalf2x16(WGB(bo) | (WGB(bo + 1u) << 8u)).x;
+        float m = unpackHalf2x16(WGB(bo + 2u) | (WGB(bo + 3u) << 8u)).x;
+        for (int e = 0; e < 8; e++) {
+            int j = kc + e;
+            // 니블 순서 = llama interleaved-by-16(deq_q5_1/gemv3/hip 동일열):
+            // 원소 j<16 = qs 바이트 j 하위 니블, j>=16 = 바이트 j-16 상위 니블.
+            // 5비트 = qh 비트 j(원소 전체에 걸쳐 순차).
+            uint qlb = WGB(bo + 8u + uint(j & 15));
+            uint nib = (j < 16) ? (qlb & 0xFu) : ((qlb >> 4u) & 0xFu);
+            uint hi5 = (WGB(bo + 4u + uint(j >> 3)) >> uint(j & 7)) & 1u;
+            float wv = float(nib) + (hi5 != 0u ? 16.0 : 0.0);
+            A16[r][colb + j] = float16_t(wv * d + m);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+void stage_b(int sb, int colb, bool live, int nt, int tid, int n_in) {
+    int e0 = int(tid) * 8;
+    int ti2 = e0 >> 5;
+    int k2 = e0 & 31;
+    if (live && ti2 < nt) {
+        uint base = (pc.tok_base + uint(ti2)) * pc.xq_w;
+        int xw = (sb << 5) >> 2;
+        float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+        for (int e = 0; e < 8; e++) {
+            uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
+            int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
+            B16[ti2][colb + k2 + e] = float16_t(float(b) * yd);
+        }
+    } else if (ti2 < 128) {
+        for (int e = 0; e < 8; e++) B16[ti2][colb + k2 + e] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int blocks = n_in >> 5;   // q5_1: 32원소/블록
+    int row0 = int(bid) * 128;
+    int nt = int(min(pc.t, 128u));
+    int nrow = int(min(128u, pc.n_out - uint(row0)));
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    for (int i = 0; i < 8; i++)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb += 2) {
+        stage_a(sb, 0, true, row0, nrow, blocks, int(tid));
+        stage_b(sb, 0, true, nt, int(tid), n_in);
+        bool live2 = sb + 1 < n_sub;
+        stage_a(sb + 1, 32, live2, row0, nrow, blocks, int(tid));
+        stage_b(sb + 1, 32, live2, nt, int(tid), n_in);
+        barrier();
+        for (int ks = 0; ks < 4; ks++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+            coopMatLoad(fa, A16[sg << 4], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+            for (int fb = 0; fb < 8; fb++) {
+                if (nt > fb * 16) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+                    coopMatLoad(fbb, B16[fb * 16], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[fb] = coopMatMulAdd(fa, fbb, acc[fb]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (int hf = 0; hf < 2; hf++) {
+        int tq = hf * 4;
+        for (int i = 0; i < 4; i++) {
+            if (nt > (tq + i) * 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> hf16 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[tq + i]);
+                coopMatStore(hf16, Ctmp[sg << 4], i * 16, 65, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+        int ncols = min(nt - hf * 64, 64);
+        for (int i = int(tid); i < nrow * ncols; i += 512) {
+            int r = i / ncols;
+            int ti = i % ncols;
+            outv[(pc.tok_base + uint(hf * 64 + ti)) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+        }
+        barrier();
+    }
+}

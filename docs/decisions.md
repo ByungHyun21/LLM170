@@ -1037,3 +1037,33 @@ under the chunk-invariance contract. Perf: 208+32 wall 42.3-42.5s vs
 42.1-42.5s unpinned (noise). Investigation probes (E2PERM/E2IDS/E2BR/
 TBSYNC/nxh/nxv, MoeGroup.inv_host) removed; L3Q bufhash markers kept
 in the established dump vocabulary.
+
+## 2026-09-21 (19) — Vulkan q5_1 coopMat tile plate (plans/84 B)
+
+`tile128_q51.comp`: the q5_K 128-row coopMat plate specialized for
+q5_1 (the FN expert-down mass, 600 MB/tensor × 48 layers). Three
+corrections were needed on the way, each caught by the vk-tile-check
+fence (now arch-aware so it loads multipart Flash-Next):
+
+- Block stride is 24 B (d,m f16 + qh 4 B + qs 16 B), and the nibble
+  order is llama's interleaved-by-16: element j<16 reads the low
+  nibble of qs byte j, j>=16 the high nibble of byte j-16; the 5th bit
+  is qh bit j. deq_q5_1, gemv3 ty=7, and the hip kernels all use this
+  order; a sequential-pair misread still produced plausible-looking
+  values — only the reference cross-check caught it.
+- Big-tensor addressing: WG() chunking now takes the chunk capacity
+  from the push constant (wsh) instead of the hardcoded 25-bit split —
+  600 MB stacks exceed 134 MB chunks. Residual chunk over-reads are
+  covered by robustBufferAccess.
+- The plate's push is 6 fields [n_in,n_out,xq_w,nt,tok_base,wsh]
+  (24 B): tok_base fixes sub-128-token slabs (the q5_K plate's 4-field
+  push cannot express token offsets for t>64).
+
+Verified: blk.0/blk.3 ffn_down_exps at t=2/64/128 — maxrel 0.9e-3 to
+1.7e-3 (f16-staging contract), 0 tokens over 2%. Wired opt-in via
+LLM170_VK_TILE_Q51=1 (default off: the f16 tile is a different
+precision class than the GEMV path, and a t>=2-only default would
+recreate the family-split chunk divergence fixed in ledger (18)).
+Perf on the FN vk value path (208-token prefill): 43.0-44.1 s →
+42.3-42.5 s (~3%), consistent with the path being host-staging bound.
+All four gates (FN/27B × hip/vk) pass.

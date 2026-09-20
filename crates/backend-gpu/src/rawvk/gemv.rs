@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 pub const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
 const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
+/// plans/84 B: q5_1 타일판 — 22B 블록 바이트 조립(WGB), 산술은 gemv3 ty=7과 동일열.
+const TILE128_Q51_SPV: &[u8] = include_bytes!("spv/tile128_q51.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
@@ -23,6 +25,8 @@ pub const SILU_SPV: &[u8] = include_bytes!("spv/silu_mul.spv");
 enum Slot {
     Gemv,
     Tile128,
+    /// plans/84 B: q5_1 타일판(tile128_q51) — FN 다운 질량(25.2GiB) 프리필.
+    Tile128Q51,
     Quant,
     Rms,
     Silu,
@@ -101,6 +105,7 @@ impl VkAcc {
         let (spv, n_buf, pb) = match slot {
             Slot::Gemv => (GEMV_SPV, 12, 24u32),
             Slot::Tile128 => (TILE128_SPV, 10, 16),
+            Slot::Tile128Q51 => (TILE128_Q51_SPV, 10, 24),
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 12),
             Slot::Silu => (SILU_SPV, 3, 4),
@@ -207,9 +212,10 @@ impl VkAcc {
         t: usize,
         xq_buf: vk::Buffer,
         out_buf: vk::Buffer,
+        slot: Slot,
     ) -> Result<(), String> {
         let (_, _, dbuf) = self.ensure_shared(ctx)?;
-        let p = self.pipeline(ctx, Slot::Tile128)?;
+        let p = self.pipeline(ctx, slot)?;
         let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
         while binds.len() < 8 {
             binds.push(dbuf);
@@ -221,6 +227,41 @@ impl VkAcc {
         for tb in (0..t).step_by(64) {
             let nt = (t - tb).min(64) as u32;
             let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt]);
+            ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
+        }
+        Ok(())
+    }
+
+    /// plans/84 B: q5_1 타일판 런처 — 128토큰 슬래브, push 5필드
+    /// [n_in,n_out,xq_w,nt,tok_base]. (tile128_run의 4필드 push는 t>64
+    /// 슬래브 오프셋을 표현 못 한다 — 여기서 바로잡는다.)
+    fn tile128_q51_run(
+        &self,
+        ctx: &mut VkCtx,
+        wbufs: &[vk::Buffer],
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        xq_buf: vk::Buffer,
+        out_buf: vk::Buffer,
+    ) -> Result<(), String> {
+        let (_, _, dbuf) = self.ensure_shared(ctx)?;
+        let p = self.pipeline(ctx, Slot::Tile128Q51)?;
+        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
+        while binds.len() < 8 {
+            binds.push(dbuf);
+        }
+        binds.push(xq_buf);
+        binds.push(out_buf);
+        let ds2 = ctx.bind_ds(&p, &binds)?;
+        let gx = (n_out + 127) as u32 / 128;
+        // 청크 용량 = max_ssbo 바이트(워드 log2) — WG() 분할 규약.
+        let cw = (ctx.max_ssbo / 4) as u32;
+        let wsh = 31u32 - cw.next_power_of_two().leading_zeros();
+        for tb in (0..t).step_by(128) {
+            let nt = (t - tb).min(128) as u32;
+            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32, wsh]);
             ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
         }
         Ok(())
@@ -497,7 +538,15 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let wbufs = self.weight_bufs(&mut ctx, w)?;
         // 128행 타일 (q5_K, t≥2, env) — f16 fast 경로
         if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
-            self.tile128_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob)?;
+            self.tile128_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob, Slot::Tile128)?;
+            self.download_out(outs, n_out, t);
+            return Ok(());
+        }
+        // plans/84 B: q5_1 타일판 — FN 다운 질량 프리필(옵트인, f16 타일이라
+        // GEMV와는 다른 정밀도 클래스: t<2와 t>=2 패밀리 갈림을 막으려 기본
+        // 끔 — LLM170_VK_TILE_Q51=1).
+        if ty == 7 && t >= 2 && std::env::var_os("LLM170_VK_TILE_Q51").is_some() {
+            self.tile128_q51_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob)?;
             self.download_out(outs, n_out, t);
             return Ok(());
         }
@@ -1171,9 +1220,30 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
 #[allow(clippy::if_same_then_else)] // 진단 A/B: 커널(spv)은 분기마다 다르고 gx 산식만 우연히 동일
 pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
-    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
-        .map_err(|e| e.to_string())?;
-    let w = model.w(tname).ok_or("텐서 없음")?;
+    // plans/84 B: arch 판별 후 단일 로드(vk-gemv-check와 동일 패턴) — FN 멀티파트 지원.
+    enum AnyModel {
+        Q35(llm170_core::qwen35::Model),
+        Q4(llm170_core::qwen4exp::Model4),
+    }
+    let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(path))
+        .ok()
+        .and_then(|g| g.arch().map(|a| a == "qwen4exp"))
+        .unwrap_or(false);
+    let model = if is_q4 {
+        AnyModel::Q4(
+            llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        AnyModel::Q35(
+            llm170_core::qwen35::Model::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let w = match &model {
+        AnyModel::Q35(m) => m.w(tname).ok_or("텐서 없음")?,
+        AnyModel::Q4(m) => m.w4(tname).map_err(|e| e.to_string())?,
+    };
     let n_in = w.n_in as usize;
     let n_out = w.n_out as usize;
     let ms4gy = std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K;
@@ -1225,6 +1295,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_DS").map(|v| v=="1").unwrap_or(false) => ("tile128_ds.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q5_1 => ("tile128_q51.spv", 10u32, 0u8), // plans/84 B: 전용 런치(t_below)
         llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),
         llm170_gguf::GgmlType::Q6K => ("tile_q6k.spv", 10, 0),
         llm170_gguf::GgmlType::Q3K => ("tile_q3k.spv", 10, 0),
@@ -1288,7 +1359,8 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let slab: usize = if bn128spv { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
         || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
-    let pb: u32 = if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
+    let q51fam = w.ty == llm170_gguf::GgmlType::Q5_1;   // plans/84 B: 6필드 push(24B)
+    let pb: u32 = if q51fam { 24 } else if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
     let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
     let _ = (dsl, pool);
@@ -1341,7 +1413,14 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         // → 실제로는 아래 outs 재판독이 이 run 결과를 본다.
         let _ = t;
     }
-    if gy2 {
+    if q51fam {
+        // plans/84 B: q5_1 타일판 — 128토큰 슬래브 + tok_base + 청크 wsh(엔진과 동일 규약).
+        for tb in (0..t).step_by(128) {
+            let nt = (t - tb).min(128) as u32;
+            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32, cw_log2]);
+            ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+        }
+    } else if gy2 {
         let gy = (t as u32).div_ceil(64);
         let push = mpush(64, 0);
         ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
