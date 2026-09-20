@@ -29,6 +29,20 @@ const MOE_TOP10_SPV: &[u8] = include_bytes!("spv/moe_top10.spv");
 const PERMUTE_SPV: &[u8] = include_bytes!("spv/permute_rows.spv");
 const PERMUTE_U32_SPV: &[u8] = include_bytes!("spv/permute_rows_u32.spv");
 const MOE_WSUM_SPV: &[u8] = include_bytes!("spv/moe_wsum.spv");
+/// plans/84 B — 어텐션 반쪽 프레임 ops.
+const HC_GATE_MEAN_SPV: &[u8] = include_bytes!("spv/hc_gate_mean.spv");
+const HC_COMBINE_SPV: &[u8] = include_bytes!("spv/hc_combine.spv");
+const NORM_GATED_SIG_SPV: &[u8] = include_bytes!("spv/norm_gated_sig.spv");
+const GDN_BETA_G_SPV: &[u8] = include_bytes!("spv/gdn_beta_g.spv");
+const EW_SIGMOID_SPV: &[u8] = include_bytes!("spv/ew_sigmoid.spv");
+const SPLIT3_SPV: &[u8] = include_bytes!("spv/split3.spv");
+const GDN_CONV_T2_SPV: &[u8] = include_bytes!("spv/gdn_conv_t2.spv");
+const GDN_CONV_ST_SPV: &[u8] = include_bytes!("spv/fn_gdn_conv_state.spv");
+const GDN_CONV_SEQ_SPV: &[u8] = include_bytes!("spv/gdn_conv_seq.spv");
+const L2_ROWS_SPV: &[u8] = include_bytes!("spv/l2_rows.spv");
+const L2_ROWS2_SPV: &[u8] = include_bytes!("spv/l2_rows2_scale.spv");
+/// q35 VkDecoder의 GDN AR 판 재사용(plans/84 B 프레임 frame_gdn_ar).
+const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -47,6 +61,18 @@ enum Slot {
     PermuteF32,
     PermuteU32,
     MoeWsum,
+    HcGateMean,
+    HcCombine,
+    NormGatedSig,
+    GdnBetaG,
+    EwSigmoid,
+    Split3,
+    GdnConvT2,
+    GdnConvState,
+    GdnConvSeq,
+    L2Rows,
+    L2Rows2Scale,
+    GdnAr,
     Quant,
     Rms,
     Silu,
@@ -145,6 +171,18 @@ impl VkAcc {
             Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
             Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 8),
             Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
+            Slot::HcGateMean => (HC_GATE_MEAN_SPV, 3, 12),
+            Slot::HcCombine => (HC_COMBINE_SPV, 3, 12),
+            Slot::NormGatedSig => (NORM_GATED_SIG_SPV, 4, 16),  // u32,u32,f32
+            Slot::GdnBetaG => (GDN_BETA_G_SPV, 5, 8),
+            Slot::EwSigmoid => (EW_SIGMOID_SPV, 1, 4),
+            Slot::Split3 => (SPLIT3_SPV, 4, 12),      // 기존 q35 값경로 판 재사용
+            Slot::GdnConvT2 => (GDN_CONV_T2_SPV, 4, 12),
+            Slot::GdnConvState => (GDN_CONV_ST_SPV, 2, 12),
+            Slot::GdnConvSeq => (GDN_CONV_SEQ_SPV, 4, 12),
+            Slot::L2Rows => (L2_ROWS_SPV, 1, 12),          // u32 + f32
+            Slot::L2Rows2Scale => (L2_ROWS2_SPV, 2, 24),   // u32,u32,f32,f32
+            Slot::GdnAr => (GDN_AR_SPV, 6, 28),             // q35 판 재사용
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
@@ -605,6 +643,68 @@ impl llm170_core::matmul::FrameState for VkAcc {
         self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// GDN AR (프레임) — q35 판(gdn_ar.spv) 재사용. q는 1/√d 스케일 완료
+    /// 가정(scale=1.0), 순차 t 토큰 — 청크 불변(이전 입력만 의존).
+    #[allow(clippy::too_many_arguments)]
+    fn frame_gdn_ar(
+        &self,
+        q_scaled: u64,
+        k: u64,
+        v: u64,
+        beta_ge: u64,
+        states: u64,
+        out: u64,
+        n_seqs: usize,
+        h_k: usize,
+        h_v: usize,
+        d: usize,
+    ) -> Result<(), String> {
+        if n_seqs != 1 {
+            return Err("vk frame_gdn_ar: np 미지원".into());
+        }
+        let t = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ctx = self.ctx.lock();
+        let (sb, qb, kb, vb, bb, ob) = (
+            self.fbuf(states)?, self.fbuf(q_scaled)?, self.fbuf(k)?,
+            self.fbuf(v)?, self.fbuf(beta_ge)?, self.fbuf(out)?,
+        );
+        let p = self.pipeline(&mut ctx, Slot::GdnAr)?;
+        let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
+        let mut push = push_u32s(&[d as u32, (h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32]);
+        push.extend_from_slice(&1.0f32.to_le_bytes());
+        push.extend_from_slice(&(t as u32).to_le_bytes());
+        ctx.run(p.pl, ds2, p.pipe, &push, h_k as u32, d as u32, 1)
+    }
+
+    /// MoE 게더 — mix 행을 k_sel 만큼 복제(BcastRows 판 재사용, 산술 동일).
+    fn frame_moe_gather(
+        &self,
+        mix: u64,
+        xsel: u64,
+        n: usize,
+        k_sel: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        use llm170_core::matmul::FrameHost;
+        self.frame_op(&llm170_core::matmul::FrameOp::BcastRows {
+            src: mix, dst: xsel, n, rows: k_sel * t,
+        })
+    }
+
+    /// MoE 스캐터(가중합) — MoeWeightedSum 판 재사용(산술 동일).
+    fn frame_moe_scatter(
+        &self,
+        ys: u64,
+        wt: u64,
+        out: u64,
+        k_sel: usize,
+        n: usize,
+        _t: usize,
+    ) -> Result<(), String> {
+        use llm170_core::matmul::FrameHost;
+        self.frame_op(&llm170_core::matmul::FrameOp::MoeWeightedSum { ys, wt, out, k: k_sel, n })
+    }
+
     /// 상주 MoE GEMM — plans/84 B 슬라이스: 호스트 그룹화(hip 폴백과 동일
     /// 구조) + 디바이스 게더/전문가별 GEMV/스캐터. vk GEMV는 단일 판이라
     /// 전문가별 행수가 패밀리를 갈라놓지 않는다(청크 불변성 안전).
@@ -788,8 +888,41 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
         }
+        let mut xs: Vec<Vec<f32>> = Vec::new();
+        let mut need_pullback = false;
+        for w in ws {
+            if vk_ty(w.ty).is_none() {
+                need_pullback = true;
+                break;
+            }
+        }
+        if need_pullback {
+            // plans/84 B: 미지원 타입(f32 inject 등)은 값경로 폴백 — 프레임 f32를
+            // 판독해 MatmulHost(CPU 포함)로 계산하고 out에 기록한다.
+            drop(ctx);
+            let mut flat = vec![0f32; t * n_in];
+            self.frame_read(x, &mut flat)?;
+            for ti in 0..t {
+                xs.push(flat[ti * n_in..(ti + 1) * n_in].to_vec());
+            }
+            for (wi, w) in ws.iter().enumerate() {
+                let mut outs_v = vec![vec![0f32; w.n_out as usize]; t];
+                if vk_ty(w.ty).is_some() {
+                    // 지원 타입도 여기선 일괄 값경로(호모지니어스 경로 유지)
+                    self.matmul_batch(&xs, w, &mut outs_v)?;
+                } else {
+                    llm170_core::matmul::matmul_batch(&xs, w, &mut outs_v);
+                }
+                let mut flat_out = Vec::with_capacity(t * w.n_out as usize);
+                for row in &outs_v {
+                    flat_out.extend_from_slice(row);
+                }
+                self.frame_write(outs[wi], &flat_out)?;
+            }
+            return Ok(());
+        }
         for (wi, w) in ws.iter().enumerate() {
-            let ty = vk_ty(w.ty).ok_or("vk frame_mm_group: 타입 미지원")?;
+            let ty = vk_ty(w.ty).unwrap();
             let n_out = w.n_out as usize;
             let ob = self.fbuf(outs[wi])?;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
@@ -861,6 +994,92 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
                     let push = push_u32s(&[n as u32, pp as u32]);
                     ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                }
+            }
+            O::HcGateMean { xn, gate, out, hc, n } => {
+                let (xb, gb, ob) = (self.fbuf(xn)?, self.fbuf(gate)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
+                let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
+                let total = n * t_cur;
+                let push = push_u32s(&[hc as u32, n as u32, total as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(128), 1, 1)?;
+            }
+            O::HcCombine { res, out, inj, hc, n, total: _ } => {
+                let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
+                let p = self.pipeline(&mut ctx, Slot::HcCombine)?;
+                let ds2 = ctx.bind_ds(&p, &[rb, ob, ib])?;
+                let tn = n * t_cur;
+                let push = push_u32s(&[hc as u32, n as u32, tn as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (tn as u32).div_ceil(128), 1, 1)?;
+            }
+            O::NormGated { o, z, w, out, eps, d, n_h } => {
+                let (ob, zb, wb, ub) = (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::NormGatedSig)?;
+                let ds2 = ctx.bind_ds(&p, &[ob, zb, wb, ub])?;
+                let mut push = push_u32s(&[d as u32, n_h as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n_h * t_cur) as u32, 1, 1)?;
+            }
+            O::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
+                let (bb, ab, db, sb, gb) = (self.fbuf(b)?, self.fbuf(a)?, self.fbuf(dtb)?, self.fbuf(sa)?, self.fbuf(bg)?);
+                let p = self.pipeline(&mut ctx, Slot::GdnBetaG)?;
+                let ds2 = ctx.bind_ds(&p, &[bb, ab, db, sb, gb])?;
+                let dr = n_h / t_cur.max(1);
+                let push = push_u32s(&[n_h as u32, dr as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(128), 1, 1)?;
+            }
+            O::Sigmoid { t, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::EwSigmoid)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let push = push_u32s(&[n as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
+                let (sb, a0, a1, a2) = (self.fbuf(src)?, self.fbuf(d0)?, self.fbuf(d1)?, self.fbuf(d2)?);
+                let p = self.pipeline(&mut ctx, Slot::Split3)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, a0, a1, a2])?;
+                let push = push_u32s(&[n0 as u32, n1 as u32, n2 as u32]);
+                let total = (n0 + n1 + n2) * t_cur;
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(64), 1, 1)?;
+            }
+            O::L2Rows { x, eps, d, n } => {
+                let xb = self.fbuf(x)?;
+                let p = self.pipeline(&mut ctx, Slot::L2Rows)?;
+                let ds2 = ctx.bind_ds(&p, &[xb])?;
+                let mut push = push_u32s(&[d as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                let rows = (n / d).max(1);
+                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+            }
+            O::L2Rows2Scale { q, k, eps, scale, d, n_group } => {
+                let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
+                let p = self.pipeline(&mut ctx, Slot::L2Rows2Scale)?;
+                let ds2 = ctx.bind_ds(&p, &[qb, kb])?;
+                let mut push = push_u32s(&[d as u32, n_group as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                push.extend_from_slice(&scale.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, n_group as u32, 1, 1)?;
+            }
+            O::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
+                let (qb, cb, sb, ob) = (self.fbuf(qkv)?, self.fbuf(cw)?, self.fbuf(state)?, self.fbuf(out)?);
+                let binds3 = [qb, cb, sb, ob];
+                if t_len >= k - 1 {
+                    // 병렬 청크판 + 상태 갱신 2런치 (hip과 동일 구조)
+                    let p = self.pipeline(&mut ctx, Slot::GdnConvT2)?;
+                    let ds2 = ctx.bind_ds(&p, &binds3)?;
+                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), t_len as u32, 1)?;
+                    let p2 = self.pipeline(&mut ctx, Slot::GdnConvState)?;
+                    let ds3 = ctx.bind_ds(&p2, &[qb, sb])?;
+                    let push2 = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p2.pl, ds3, p2.pipe, &push2, (k - 1) as u32, (ch as u32).div_ceil(64), 1)?;
+                } else {
+                    // 짧은 꼬리: 순차판 (상태 회전 포함)
+                    let p = self.pipeline(&mut ctx, Slot::GdnConvSeq)?;
+                    let ds2 = ctx.bind_ds(&p, &binds3)?;
+                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), 1, 1)?;
                 }
             }
             O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
@@ -2390,6 +2609,154 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             report.push_str(&format!("| MoE(k={k}) max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
             for h in [rh, idh, wth, mxh, mgh, outh] { acc.frame_free(h)?; }
         }
+    }
+    // ── 10) 어텐션 반쪽: HcGateMean/HcCombine/NormGated/GdnBetaG/Sigmoid/Split3 ──
+    {
+        use llm170_core::matmul::FrameHost;
+        let n = 48usize;
+        let hc = 4usize;
+        // HcGateMean
+        let xn: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+        let gate: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+        let xnh = acc.frame_alloc(t * hc * n)?;
+        let gth = acc.frame_alloc(t * hc * n)?;
+        let mkh = acc.frame_alloc(t * n)?;
+        acc.frame_write(xnh, &xn)?;
+        acc.frame_write(gth, &gate)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::HcGateMean { xn: xnh, gate: gth, out: mkh, hc, n })?;
+        let mut got = vec![0f32; t * n];
+        acc.frame_read(mkh, &mut got)?;
+        let mut mx = 0f64;
+        for ti in 0..t {
+            for i in 0..n {
+                let mut exp = 0f64;
+                for s in 0..hc {
+                    let k = (ti * hc + s) * n + i;
+                    exp += xn[k] as f64 * (1.0 / (1.0 + (-gate[k] as f64).exp()));
+                }
+                mx = mx.max((got[ti * n + i] as f64 - exp / hc as f64).abs());
+            }
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| HcGateMean {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+
+        // HcCombine — res 초기화 후 += 검증
+        let res0: Vec<f32> = (0..t * hc * n).map(|_| lcg()).collect();
+        let resh = acc.frame_alloc(t * hc * n)?;
+        let inj: Vec<f32> = (0..t * hc).map(|_| lcg() * 2.0).collect();
+        let ijh = acc.frame_alloc(t * hc)?;
+        acc.frame_write(resh, &res0)?;
+        acc.frame_write(ijh, &inj)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::HcCombine { res: resh, out: mkh, inj: ijh, hc, n, total: 0 })?;
+        let mut resg = vec![0f32; t * hc * n];
+        acc.frame_read(resh, &mut resg)?;
+        mx = 0.0;
+        for ti in 0..t {
+            for i in 0..n {
+                for s in 0..hc {
+                    let g = 2.0 / (1.0 + (-(inj[ti * hc + s] as f64) / hc as f64).exp());
+                    let exp = res0[(ti * hc + s) * n + i] as f64 + got[ti * n + i] as f64 * g;
+                    mx = mx.max((resg[(ti * hc + s) * n + i] as f64 - exp).abs());
+                }
+            }
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| HcCombine {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+
+        // NormGated(sigmoid) — d=32, n_h=3
+        let d = 32usize;
+        let nh = 3usize;
+        let o3: Vec<f32> = (0..t * nh * d).map(|_| lcg()).collect();
+        let z3: Vec<f32> = (0..t * nh * d).map(|_| lcg()).collect();
+        let w3: Vec<f32> = (0..nh * d).map(|_| lcg()).collect();
+        let o3h = acc.frame_alloc(t * nh * d)?;
+        let z3h = acc.frame_alloc(t * nh * d)?;
+        let w3h = acc.frame_alloc(nh * d)?;
+        let n3h = acc.frame_alloc(t * nh * d)?;
+        acc.frame_write(o3h, &o3)?;
+        acc.frame_write(z3h, &z3)?;
+        acc.frame_write(w3h, &w3)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::NormGated { o: o3h, z: z3h, w: w3h, out: n3h, eps: 1e-5, d, n_h: nh })?;
+        let mut ng = vec![0f32; t * nh * d];
+        acc.frame_read(n3h, &mut ng)?;
+        mx = 0.0;
+        for row in 0..t * nh {
+            let s: f64 = (0..d).map(|i| (o3[row * d + i] as f64).powi(2)).sum();
+            let inv = 1.0 / (s / d as f64 + 1e-5).sqrt();
+            for i in 0..d {
+                let exp = o3[row * d + i] as f64 * inv * w3[(row % nh) * d + i] as f64 * (1.0 / (1.0 + (-z3[row * d + i] as f64).exp()));
+                mx = mx.max((ng[row * d + i] as f64 - exp).abs());
+            }
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| NormGated {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+
+        // GdnBetaG — dt_rank=6, n_h=6·t
+        let dr = 6usize;
+        let nh2 = dr * t;
+        let b2: Vec<f32> = (0..nh2).map(|_| lcg()).collect();
+        let a2: Vec<f32> = (0..nh2).map(|_| lcg()).collect();
+        let dtb: Vec<f32> = (0..dr).map(|_| lcg()).collect();
+        let sa: Vec<f32> = (0..dr).map(|_| lcg()).collect();
+        let (b2h, a2h, dth, sah, bgh) = (acc.frame_alloc(nh2)?, acc.frame_alloc(nh2)?, acc.frame_alloc(dr)?, acc.frame_alloc(dr)?, acc.frame_alloc(nh2 * 2)?);
+        acc.frame_write(b2h, &b2)?;
+        acc.frame_write(a2h, &a2)?;
+        acc.frame_write(dth, &dtb)?;
+        acc.frame_write(sah, &sa)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::GdnBetaG { b: b2h, a: a2h, dtb: dth, sa: sah, bg: bgh, n_h: nh2 })?;
+        let mut bgv = vec![0f32; nh2 * 2];
+        acc.frame_read(bgh, &mut bgv)?;
+        mx = 0.0;
+        for h in 0..nh2 {
+            let h0 = h % dr;
+            let e0 = 1.0 / (1.0 + (-b2[h] as f64).exp());
+            let x = (a2[h] as f64 + dtb[h0] as f64).min(80.0);
+            let sp = (1.0 + x.exp()).ln();
+            let e1 = (sp * sa[h0] as f64).exp();
+            mx = mx.max((bgv[h * 2] as f64 - e0).abs() + (bgv[h * 2 + 1] as f64 - e1).abs());
+        }
+        let ok = mx < 5e-6;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| GdnBetaG {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+
+        // Sigmoid + Split3
+        let v4: Vec<f32> = (0..128).map(|_| lcg() * 3.0).collect();
+        let v4h = acc.frame_alloc(128)?;
+        acc.frame_write(v4h, &v4)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::Sigmoid { t: v4h, n: 128 })?;
+        let mut sv = vec![0f32; 128];
+        acc.frame_read(v4h, &mut sv)?;
+        mx = 0.0;
+        for j in 0..128 { mx = mx.max((sv[j] as f64 - (1.0 / (1.0 + (-v4[j] as f64).exp()))).abs()); }
+        let ok = mx < 5e-7;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| Sigmoid {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+
+        let (n0, n1, n2) = (10usize, 6usize, 8usize);
+        let tot = n0 + n1 + n2;
+        let s3: Vec<f32> = (0..t * tot).map(|_| lcg()).collect();
+        let s3h = acc.frame_alloc(t * tot)?;
+        let (d0h, d1h, d2h) = (acc.frame_alloc(t * n0)?, acc.frame_alloc(t * n1)?, acc.frame_alloc(t * n2)?);
+        acc.frame_write(s3h, &s3)?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::Split3 { src: s3h, d0: d0h, d1: d1h, d2: d2h, n0, n1, n2 })?;
+        let mut g0 = vec![0f32; t * n0];
+        let mut g1 = vec![0f32; t * n1];
+        let mut g2 = vec![0f32; t * n2];
+        acc.frame_read(d0h, &mut g0)?;
+        acc.frame_read(d1h, &mut g1)?;
+        acc.frame_read(d2h, &mut g2)?;
+        let mut ok = true;
+        for ti in 0..t {
+            for j in 0..n0 { if (g0[ti * n0 + j] - s3[ti * tot + j]).abs() > 1e-7 { ok = false; } }
+            for j in 0..n1 { if (g1[ti * n1 + j] - s3[ti * tot + n0 + j]).abs() > 1e-7 { ok = false; } }
+            for j in 0..n2 { if (g2[ti * n2 + j] - s3[ti * tot + n0 + n1 + j]).abs() > 1e-7 { ok = false; } }
+        }
+        if !ok { fails += 1; }
+        report.push_str(&format!("| Split3 {}", if ok { "OK" } else { "FAIL" }));
+        for h in [xnh, gth, mkh, resh, ijh, o3h, z3h, w3h, n3h, b2h, a2h, dth, sah, bgh, v4h, s3h, d0h, d1h, d2h] { acc.frame_free(h)?; }
     }
     let _ = t0;
     Ok(format!(

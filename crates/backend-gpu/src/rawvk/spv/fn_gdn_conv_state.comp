@@ -1,0 +1,13 @@
+#version 450
+// plans/84 B — FN 프레임 GdnConv(t≥k-1) 후 링 갱신 (hip gdn_conv_state 동일열).
+// 원본 q35 판(gdn_conv_state)과 달리 폴백 없음 — 호출부가 t≥k-1을 보장.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };
+layout(binding = 1) buffer St { float st[]; };
+layout(push_constant) uniform PC { uint ch; uint k; uint t; } pc;
+void main() {
+    uint j = gl_WorkGroupID.x;                 // 0..k-2
+    uint c = gl_GlobalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    if (c >= pc.ch || j >= pc.k - 1u) return;
+    st[j * pc.ch + c] = qkv[(pc.t - (pc.k - 1u) + j) * pc.ch + c];
+}

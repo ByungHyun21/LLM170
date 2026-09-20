@@ -1,0 +1,10 @@
+#version 450
+// plans/84 B — Sigmoid: t[j] = σ(t[j]) (in-place).
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Tb { float v[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    v[j] = 1.0 / (1.0 + exp(-v[j]));
+}
