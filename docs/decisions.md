@@ -1151,3 +1151,18 @@ of 6-10 GiB; hip allocates these fine, RADV does not). Remaining for
 frame-capable-by-default: split/large-frame budgeting on vk, the QSA
 half (qk_norm_rope, indexer top-k, attention via the qsa_flash_gq
 plate), PLE. All four gates pass.
+
+## 2026-09-21 (23) — vk frame end-to-end status: ctx-1024 passes allocations; QSA attention is the functional gap (plans/84 B)
+
+Instrumented alloc_host failures (>1 GiB) with a backtrace and ran the
+opt-in frame path (LLM170_VK_FRAME=1) at descending ctx: at ctx 1024
+no allocation fails and the forward proceeds through hc, GDN, MoE and
+the QSA indexer, reaching "qsa_attention_sel: 이 가속기는 미지원" —
+the engine falls back to a CPU QSA recompute (too slow to finish in
+400 s). So the remaining functional gap for the vk frame path is the
+QSA attention triple (indexer top-k selection, kv append, attention
+over the selected set — the q35 decoder already has a
+qsa_flash_gq-based attention plate to reuse). The >4 GiB single
+allocations seen at ctx 2048+ remain a separate budget item (sizes
+6.7-10.9 GiB do not match any single frame buffer in Frame4::new —
+weight-chunk suspicion, backtrace hook is in place to pin it).

@@ -382,6 +382,11 @@ impl VkCtx {
         self.mem_ty = self.mem_ty_host;
         let r = self.alloc(bytes);
         self.mem_ty = saved;
+        if r.is_err() && bytes > (1 << 30) {
+            // plans/84 B 진단: 대형 프레임 버퍼의 실패 원인 판별용.
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("# alloc_host {bytes}B 실패 — 백트레이스:\n{bt}");
+        }
         r
     }
 
