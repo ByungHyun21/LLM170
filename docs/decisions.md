@@ -622,3 +622,33 @@ The plans/84 E3 investigation (pp16k slowdown) is explained by the
 quadratic attention cost of the serial-chain kernel: time fits
 T = 2.8-2.9 ms/token linear + 0.26-0.36 us/token^2 quadratic with no
 other superlinear component — not a leak or scheduling defect.
+
+## 2026-09-20 (3) — FN t=1 decode occupancy analysis; graph replay null result (plans/84 C)
+
+KTRACE breakdown of the Flash-Next frame decode step (53.2ms kernels +
+11.3ms gaps, ~830 launches): gemm_q8_0_dual 9.3ms, MoE expert GEMMs
+(ge_ids/w_ids) 8.3ms, hc mix_dual 4.8ms (108 launches), gemm_q8_0
+4.2ms, output head 3.5ms, w16 up-matvecs 2.5ms (97), activation quants
+2.0ms (304 launches), f32 duals 2.0ms, PLE/shexp 2.2ms.
+
+Two findings bound the next step:
+1. **hipGraph replay is numerically identical but gives zero speedup**
+   (LLM170_GRAPH=1: gate stream unchanged, tg128 18.83 -> 18.84 t/s).
+   The 11.3ms "gaps" are therefore host-side dispatch work between the
+   capture segments (MoE routing round-trips, per-op frame dispatch),
+   not launch latency — kernel-count fusion alone cannot reclaim them.
+2. The small-kernel tail is real but bounded: hc mix_dual moves ~330MB
+   per step (1.3ms at streaming rate) but costs 4.8ms; the w16
+   up-matvecs cost 2.5ms for ~320MB and the 304 activation quants 2.0ms
+   for negligible bytes — ~6ms of small-grid tail latency in total.
+
+Design for the plans/84 C stair (layer-wise hc/GDN projection fusion):
+fold the per-site sequence rms(norm) -> quant -> dual(down+inject) ->
+silu -> up -> gate+mean (5 launches) into two kernels — (A) fused
+rms+quant+down+inject with silu at store, (B) up+gate+stream-mean
+reading the inv_rms scalars A stashed — cutting ~190 launches and the
+xn/lo round-trips per step, worth an estimated 10-12% tg at the
+measured tail cost. Arithmetic-order changes are expected (gate
+re-baseline under the near-tie standard). The 2026-09-13 rms_small
+fusion regression precedent (16.78 -> 16.28 t/s) applies: measure
+per-kernel, not just end-to-end, before adopting.
