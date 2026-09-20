@@ -15,6 +15,7 @@ pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
     /// 로드된 코드오브젝트 패밀리 비트(CO_* 상수) — new() 완료 후 불변 (plans/78 R4).
     pub(crate) co_fam: std::sync::atomic::AtomicU8,
+    pub(crate) scope: std::sync::atomic::AtomicU8,
     pub(crate) stream: hip::hipStream_t,
     pub(crate) stream2: hip::hipStream_t,
     /// 프리필 전용 스트림 페어 — 프레임 경로(launch3s + join2/side_wait_main)를
@@ -76,8 +77,22 @@ struct TileLaunch {
 /// 핀 중에는 large-t 패밀리로 통일한다.
 pub(crate) static PREFILL_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 디스패처 모델 스코프 (plans/84 E1) — 전역 디스패처의 패밀리 기본값을
+/// 모델별로 분리: 27B(qwen35) 게이트 타이를 뒤집는 저출력 warp GEMV를
+/// Flash-Next(qwen4exp/q4acc)에서만 기본 적용하기 위함.
+pub const SCOPE_QWEN35: u8 = 0;
+pub const SCOPE_FLASHNEXT: u8 = 1;
+
 impl RawCtx {
     /// 코드오브젝트 패밀리 로드 비트 질의 (plans/78 R4 — 전역 static 승계).
+    /// 모델 스코프 지정 (q4acc 초기화 시 FlashNext).
+    pub fn set_scope(&self, s: u8) {
+        self.scope.store(s, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn scope_is_flashnext(&self) -> bool {
+        self.scope.load(std::sync::atomic::Ordering::Relaxed) == SCOPE_FLASHNEXT
+    }
+
     pub fn co_loaded(&self, bit: u8) -> bool {
         self.co_fam.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
     }
@@ -239,7 +254,7 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream3), "StreamCreate3")?;
             let mut stream4: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream4), "StreamCreate4")?;
-            Ok(RawCtx { fns, co_fam: std::sync::atomic::AtomicU8::new(fam_bits), stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            Ok(RawCtx { scope: std::sync::atomic::AtomicU8::new(SCOPE_QWEN35), fns, co_fam: std::sync::atomic::AtomicU8::new(fam_bits), stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
             mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
             f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             allocs: std::sync::Mutex::new(Vec::new()),
@@ -972,8 +987,11 @@ impl RawCtx {
         // 워프판이 유리 — FN tg32 18.10 → 18.25 (+0.8%). 단 축소 순서가
         // 달라 27B 게이트 타이를 뒤집는다(토큰5 실측) — 전역 디스패처라 모델
         // 구분이 없어 옵트인으로만 둔다. 기본 적용은 형상 스코프 분리 후.
+        // plans/84 E1: 모델 스코프 분리 — Flash-Next 기본 적용(FN tg +0.8%,
+        // 게이트 통과), qwen35는 옵트인(타이 플립 방지). 킬스위치 =0.
         if t == 1 && ty == 8 && n_out <= 2048 && n_in / 32 > 32
-            && env_eq("LLM170_Q8W_SMALLN", "1")
+            && (env_eq("LLM170_Q8W_SMALLN", "1")
+                || (self.scope_is_flashnext() && !env_eq("LLM170_Q8W_SMALLN", "0")))
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
