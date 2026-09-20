@@ -116,7 +116,16 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             // plans/64 P1: GPU는 --backend gpu 명시 시에만. 주입 실패는 실패로
             // 승격한다 (cubecl 제거 후 CPU 폴백 수치가 GPU로 오인된 이력).
             let want_gpu = crate::engine::q4_gpu_wanted_str(&backend, &gpu_runtime);
-            if want_gpu {
+            if want_gpu && crate::engine::q4_vk_runtime_str(&gpu_runtime) {
+                // plans/84 B — Vulkan 값경로(VkAcc). 프레임 미구현 → 값 경로.
+                match llm170_backend_gpu::new_q4_acc_vk() {
+                    Ok(acc) => {
+                        eng = eng.with_acc(acc);
+                        eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else if want_gpu {
                 match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                     Ok(acc) => {
                         eng = eng.with_acc(acc);

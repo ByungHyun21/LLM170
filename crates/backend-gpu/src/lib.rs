@@ -9,6 +9,12 @@ pub mod rawvk;
 
 pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
 pub use rawhip::q4acc::{new_acc as new_q4_acc, new_acc_with_sources as new_q4_acc_with_sources};
+/// plans/84 B — qwen4exp Vulkan 값경로 가속기(VkAcc, MatmulHost 전담).
+/// 프레임(FrameHost)은 미구현 → Engine4는 값 경로로 동작(호스트 스테이징).
+pub fn new_q4_acc_vk() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
+    let acc = rawvk::gemv::VkAcc::new()?;
+    Ok(std::sync::Arc::new(acc))
+}
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawhip::probes::gpu_mem_free;
 pub use rawvk::decoder::inject as inject_rawvk;

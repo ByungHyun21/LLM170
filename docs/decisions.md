@@ -732,3 +732,31 @@ both PASS (argmax preserved, maxrel ~5e-3 — same tolerance class as the
 existing types on this probe). The 27B vulkan gate is unchanged after
 the shader recompile. Tile/coopmat q5_1 (prefill plates) remains open —
 the GEMV path serves all t meanwhile.
+
+## 2026-09-20 (7) — qwen4exp runs on Vulkan: value-path wiring + vk baseline (plans/84 B, slice 2)
+
+`--gpu-runtime vulkan` now selects a real Vulkan path for Flash-Next:
+`new_q4_acc_vk()` attaches VkAcc (the rawvk value-path accelerator) to
+Engine4. VkAcc implements the MatmulHost composite only — FrameState/
+FrameHost are empty — so the engine runs the CPU stage graph with every
+GEMV staged through Vulkan (quant on device, gemv3 per weight, download).
+All FN weight types are now covered (q5_1 was the gap, entry (6)).
+
+Verification:
+- 23-token smoke: vk stream identical to the HIP frame path (9 tokens).
+- Chunk invariance: LLM170_Q4_CHUNK=16 == 512 exactly on vk — the value
+  path chains PLE/GDN/KV state correctly across chunk boundaries (the
+  HIP frame path fails this today, plans/84 E.2).
+- Per-type fences: vk-gemv-check PASS on the FN stacked-expert tensors.
+- 208-token gate stream diverges from HIP frame at token 4 (reduction-
+  order drift of the lane-strided gemv3 accumulation, ~5e-3 rel per dot
+  vs CPU — same class as every vk value-path type); recorded as the
+  first FN Vulkan baseline (`scripts/gate-flash-baseline-vk.txt`, gate
+  PASS against it).
+- True value-path speed: tg 0.54 t/s, pp64 51.9 — host-staging bound as
+  expected; the earlier pp512/tg16 numbers printed by bench were the HIP
+  frame path (bench now routes the vk runtime correctly).
+
+The fast Vulkan path (frame port: hc/GDN/QSA-indexer/MoE-route/PLE as
+resident FrameHost ops, coopMat tile plates incl. q5_1) remains the
+multi-session core of plans/84 B; the entry map in plans/84 is updated.
