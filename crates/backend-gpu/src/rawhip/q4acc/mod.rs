@@ -49,8 +49,6 @@ impl GBuf {
 struct MoeGroup {
     generation: u64,
     rows: usize,
-    /// plans/84 E.2 계측: 원본 행 → 순열 위치 (호스트 사본, 진단 전용).
-    inv_host: Vec<u32>,
     perm_d: u64,
     inv_d: u64,
     rowexp_d: u64,   // 행→전문가 (순열 후 순서) — 그룹 GEMM용

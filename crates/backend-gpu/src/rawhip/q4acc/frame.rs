@@ -10,12 +10,19 @@ impl llm170_core::matmul::FrameState for Q4Acc {
 
     fn frame_begin(&self, t: usize) {
         self.cur_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
-        // plans/84 E.2 — 프리필(t>1) 패밀리 핀(옵트인 LLM170_Q4_PF_PIN=1).
-        // 진입점 확정: hc_attn down(q8_0)이 t=16 GEMV ↔ t>64 j128 타일로
-        // 갈라 동일 xn에 다른 lo(attn_lo DIFF/inj same). 핀 시 L0-L2 attn/ffn
-        // 전 단계 비트 일치 — 잔여 발산은 그룹 MoE 게이트 GEMM(mgu)로 이동.
-        // 기본 OFF: 기본 경로 수치 불변(게이트 원칙), 펜스 조사용.
-        if t > 1 && std::env::var_os("LLM170_Q4_PF_PIN").is_some() {
+        // plans/84 A/E.2 — 프리필(t>1) 패밀리 핀. 두 결함을 묶는다: (1) hc_attn
+        // down(q8_0)의 t=16 GEMV ↔ t>64 j128 타일 갈림(원장 (12)), (2) MoE
+        // 폴백의 전문가별 행수 r이 t 키로 쓰여 r>=16 타일/r<16 GEMV로 갈라
+        // 같은 (토큰,전문가) 계산이 청킹별로 다른 패밀리 산술을 쓰는 것(원장
+        // (18), value.rs launch_gemm 참조). 핀 + 타일 강제로 청크 16..512 전부
+        // 비트 동일(chunk-check 3종 PASS, 2026-09-21). 기본 ON; 끄려면
+        // LLM170_Q4_PF_PIN=0.
+        let pin = match std::env::var("LLM170_Q4_PF_PIN").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => true,
+        };
+        if t > 1 && pin {
             crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
         } else {
             crate::rawhip::ctx::PREFILL_PIN.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -171,16 +178,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 Some(v) => v,
                 None => {
                     let (q, w) = self.frame_quant(xp, n_in, rows)?;
-                    if std::env::var_os("LLM170_E2PERM").is_some() {
-                        // plans/84 E.2: quant 입력(mxsel f32) 해시 — 같은 런에서
-                        // 출력(xg)과 분리. 입력 상이 → gather/mix 과도, 입력 동일·
-                        // 출력 상이 → quant 커널/버퍼.
-                        self.ctx.sync().map_err(|e| e.to_string())?;
-                        let mut xb = vec![0f32; rows.min(160) * n_in];
-                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut xb), xp)?;
-                        let h = xb.iter().fold(0xcbf29ce484222325u64, |a, &v| a.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64));
-                        eprintln!("[nxh] rows={rows} n_in={n_in} mxsel_h={h:016x}");
-                    }
                     if std::env::var_os("LLM170_QHIST").is_some() {
                         // plans/84 E.2: 양자화 mxsel(xq) 직접 해시 — 게이트 GEMM
                         // 입력이 f32(mxsel)==인데 mgu가 상이한지 분리.
@@ -370,12 +367,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
                 .filter(|g| g.generation == generation && g.rows == rows)
-                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d, g.pinned_off, g.inv_host.clone()))
+                .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d, g.pinned_off))
         };
         if tm {
             eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
         }
-        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, rows_pad_d, off, off_d, pinned_off, _inv_host_dbg) = match hit {
+        let (perm_d, inv_d, rowexp_d, perm_pad_d, inv_pad_d, tilexp_d, rows_pad, rows_pad_d, off, off_d, pinned_off) = match hit {
             Some(v) => v,
             None => {
                 // t=1(디코드): 그룹화를 GPU에서 한다. 호스트 왕복(동기 d2h + 테이블
@@ -495,11 +492,11 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     };
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
-                        generation, rows, inv_host: Vec::new(), perm_d: pd, inv_d: ivd, rowexp_d: rxd,
+                        generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
                         perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd,
                         rows_pad: bound, rows_pad_d: rpd, off_d: offd, pinned_off, off: Vec::new(),
                     });
-                    (pd, ivd, rxd, ppd, ipd, txd, bound, rpd, Vec::new(), offd, pinned_off, Vec::new())
+                    (pd, ivd, rxd, ppd, ipd, txd, bound, rpd, Vec::new(), offd, pinned_off)
                 } else {
                 // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                 // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
@@ -606,9 +603,9 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 }
                 unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out") }?;
                 let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
-                *c = Some(MoeGroup { generation, rows, inv_host: inv.clone(), perm_d: pd, inv_d: ivd, rowexp_d: rxd,
+                *c = Some(MoeGroup { generation, rows, perm_d: pd, inv_d: ivd, rowexp_d: rxd,
                     perm_pad_d: ppd, inv_pad_d: ipd, tilexp_d: txd, rows_pad, rows_pad_d: 0, off_d: 0, pinned_off: std::ptr::null_mut(), off: off.clone() });
-                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, 0u64, off, 0u64, std::ptr::null_mut(), inv.clone())
+                (pd, ivd, rxd, ppd, ipd, txd, rows_pad, 0u64, off, 0u64, std::ptr::null_mut())
                 }
             }
         };
@@ -820,24 +817,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                     fnv(&ivf)
                 );
             }
-            if std::env::var_os("LLM170_E2PERM").is_some() && !pad_layout && _inv_host_dbg.len() == rows {
-                // plans/84 E.2: 순열 도메인 이분 — 원본 행 i의 위치 inv[i]에서 xg를
-                // 판독해 해시(xq 원본과 동일해야 함). 다음 yg(ge 출력)도 같은 위치에서.
-                self.ctx.sync().map_err(|e| e.to_string())?;
-                let take = rows.min(160);
-                let mut xh = 0xcbf29ce484222325u64;
-                let mut yh = 0xcbf29ce484222325u64;
-                for i in 0..take {
-                    let p = _inv_host_dbg[i] as usize;
-                    let mut row = vec![0u32; row_u32];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut row), unsafe { xg.add(p * row_u32 * 4) })?;
-                    for w in &row { xh = xh.wrapping_mul(0x100000001b3) ^ (*w as u64); }
-                    let mut yrow = vec![0f32; n_out];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut yrow), unsafe { yg.add(p * n_out * 4) })?;
-                    for v in &yrow { yh = yh.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64); }
-                }
-                eprintln!("[nperm] rows={rows} n_in={n_in} xg_h={xh:016x} (ge 전)");
-            }
             self.ctx.launch3(
                 "q4_gemm_q4k_ge",
                 n_out.div_ceil(16) as u32,
@@ -846,18 +825,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 256,
                 &mut args,
             )?;
-            if std::env::var_os("LLM170_E2PERM").is_some() && !pad_layout && _inv_host_dbg.len() == rows {
-                self.ctx.sync().map_err(|e| e.to_string())?;
-                let take = rows.min(160);
-                let mut yh = 0xcbf29ce484222325u64;
-                for i in 0..take {
-                    let p = _inv_host_dbg[i] as usize;
-                    let mut yrow = vec![0f32; n_out];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut yrow), unsafe { yg.add(p * n_out * 4) })?;
-                    for v in &yrow { yh = yh.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64); }
-                }
-                eprintln!("[nperm] rows={rows} n_in={n_in} yg_h={yh:016x} (ge 후)");
-            }
             let scat = if pad_layout { inv_pad_d } else { inv_d };
             self.rows_permute_dev(yg, scat as *mut u8, op_, n_out, rows)?;
             phase("scatter", &mut lap);

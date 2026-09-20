@@ -1001,3 +1001,39 @@ fxq/mxsel buffers in that window is the next and final step. E.2
 investigation state: defect class identified (producer ordering),
 epicenter one call window, masking sync characterized, all probes
 committed and reproducible via LLM170_Q4_PF_PIN=1 LLM170_E2PERM=1.
+
+## 2026-09-21 (18) — E.2 root cause found and fixed: MoE fallback family split by per-expert row count; prefill pin now default (plans/84 E.2)
+
+Chain of evidence that closed the nine-step hunt:
+
+- Same-domain probes: router logits and top-10 ids bit-identical at
+  L0-L2 for every chunk; first divergence enters at L2's MoE *output*.
+- Branch probe: per-layer expert weight types are mixed (UD-Q4_K_XL) —
+  gate/up are Q4_K or Q5_K per layer, down is Q5_1/Q8_0. The Q4_K
+  grouped ge machinery is exact (L0/L1 bit-identical). L2's gate/up are
+  Q5_K → they run the *fallback* path (per-expert GEMM launches).
+- The fallback passes each expert's row count `r` as `t` to
+  `launch_gemm`, whose family split `t >= 16 → tile, t < 16 → GEMV`
+  depends on `r`. `r` depends on chunking (same expert: r≈40 in a
+  208-token chunk, r≈1-3 in a 16-token chunk), so the same
+  (token, expert) product used different kernel arithmetic per
+  chunking — the ~1ulp family difference (ledger (5)) amplified through
+  45 layers into the observed 2.1 max|Δ|. The PREFILL_PIN did not cover
+  this threshold. All earlier "sync-masking" readings were line
+  attribution errors: Q4_K-only dumps skip Q5_K/Q8_0 layers.
+
+Fix (`launch_gemm`): while the prefill pin is active, the tile branch
+is taken for **every** t (the pin fixes the tile family to j128+large,
+making per-row arithmetic independent of t). Decode (t=1, pin off)
+keeps the GEMV path. The pin is now **default ON** (LLM170_Q4_PF_PIN=0
+to disable), completing plans/84 E.2: chunk-check 16/63/64/128/512 all
+bits-identical with no env vars.
+
+Validation of the changed default stream: the pinned hip output's
+first 8 tokens exactly match the independent Vulkan implementation's
+baseline (the old mixed-family hip output diverged from it at token
+4) — the pinned path is the more correct one. FN hip gate re-recorded
+under the chunk-invariance contract. Perf: 208+32 wall 42.3-42.5s vs
+42.1-42.5s unpinned (noise). Investigation probes (E2PERM/E2IDS/E2BR/
+TBSYNC/nxh/nxv, MoeGroup.inv_host) removed; L3Q bufhash markers kept
+in the established dump vocabulary.
