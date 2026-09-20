@@ -869,3 +869,22 @@ The chunk-invariance epicenter is now single-buffer precise: f.mout.
 Next session enters at the shared-expert add (shg/shu/shd GEMM dispatch
 under pin) and the L2 route chain, with the discriminator available as
 `LLM170_DUMP=bufhash` site markers.
+
+## 2026-09-20 (12) — E.2: drift is present in the FIRST observable hc-mix output (plans/84 E.2)
+
+Shared-expert site dumps (shg/shout/msgate) show every shared-add input
+carries a ~1e-4 relative drift between chunkings from L0 onward
+(msgate 3e8e362e vs 3e8e4a41 class), and the first hc-ffn mix output
+(L1-top) already drifts in row 0 element 0 — the earlier "mout
+epicenter" is inherited, not local. All site-hashed intermediates of
+the ffn half (lo/inj/gate/res) match, which means the drift enters
+upstream of them: the attention half of L0. Its intermediates (hc_attn
+mix/lo/inj/gate, GDN qkv) are overwritten by the ffn half before any
+dump point — invisible to the current instrument. The GDN projections
+run through the same t-keyed tile dispatch (unpinned), consistent with
+the tile-family pin moving the first visible divergence deeper.
+
+Next instrumentation: dump the hc_attn-half intermediates at L0 (before
+the ffn half overwrites them) — one site marker in hc_mix_frame for
+kind="attn" at il==0 — expected to expose the first differing GEMM
+output directly.
