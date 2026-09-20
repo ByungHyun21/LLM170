@@ -171,6 +171,16 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 Some(v) => v,
                 None => {
                     let (q, w) = self.frame_quant(xp, n_in, rows)?;
+                    if std::env::var_os("LLM170_E2PERM").is_some() {
+                        // plans/84 E.2: quant 입력(mxsel f32) 해시 — 같은 런에서
+                        // 출력(xg)과 분리. 입력 상이 → gather/mix 과도, 입력 동일·
+                        // 출력 상이 → quant 커널/버퍼.
+                        self.ctx.sync().map_err(|e| e.to_string())?;
+                        let mut xb = vec![0f32; rows.min(160) * n_in];
+                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut xb), xp)?;
+                        let h = xb.iter().fold(0xcbf29ce484222325u64, |a, &v| a.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64));
+                        eprintln!("[nxh] rows={rows} n_in={n_in} mxsel_h={h:016x}");
+                    }
                     if std::env::var_os("LLM170_QHIST").is_some() {
                         // plans/84 E.2: 양자화 mxsel(xq) 직접 해시 — 게이트 GEMM
                         // 입력이 f32(mxsel)==인데 mgu가 상이한지 분리.
