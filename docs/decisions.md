@@ -652,3 +652,36 @@ measured tail cost. Arithmetic-order changes are expected (gate
 re-baseline under the near-tie standard). The 2026-09-13 rms_small
 fusion regression precedent (16.78 -> 16.28 t/s) applies: measure
 per-kernel, not just end-to-end, before adopting.
+
+## 2026-09-20 (4) — hc_mix fused kernel attempt: reverted on an unresolved device fault (plans/84 C)
+
+The designed 2-kernel hc_mix fusion (rms+down+inject+silu | up+gate+mean,
+t=1) was implemented and wired behind a capability method with automatic
+fallback. The kernel reproducibly hard-faults (HSA memory fault ~2.7GB
+from the frame buffers, attributed to q4_hc_a) and the implementation was
+reverted; both gates pass on the reverted tree.
+
+Bisect ladder (all configurations rebuilt via hipRTC each time):
+- Fully empty kernel: clean launch, no fault.
+- rms (thread-0 serial or barrier loop) + writer that stores xn WITHOUT
+  the rms scale: no fault. Same config reading the rms scale into the
+  store: fault.
+- Full kernel (rms+writer+down+inject): fault.
+- Down branch with activations hard-zeroed — i.e. only weight reads
+  (f16w + q8 word loads), dot4 chain, tree64 reduce live: still faults.
+  Inject branch disabled: still faults.
+- Every array bound was audited repeatedly; the dot4/f16w/tree64
+  sequences are textually identical to the production gemm_mix_dual q8
+  side, and the 2-6-byte tail overread of the last q8 block is the same
+  pattern every existing GEMV uses.
+
+What is ruled out: launch geometry/args (empty kernel runs), barrier
+divergence (uniformized), double-precision math (removed), dynamic
+indexing of the scale array (constant-select tried), helper-function
+indirection (inlined), use of shared vs register scale, and value-range
+effects of the activations (inputs hard-zeroed and it still faults).
+Next session should build a minimal standalone repro (probe kernel with
+a 64-thread block doing q8 word loads + __ockl_sdot4 + tree64 after a
+barrier) to decide between a code-generation fault on gfx1151 and
+something in the launch path for this kernel shape. The fusion design
+and its ~2-4ms/step ceiling stand (entry 2026-09-20 (3)).
