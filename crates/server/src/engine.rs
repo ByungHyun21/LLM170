@@ -34,7 +34,7 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
         BackendSel::Cpu => false,
         BackendSel::Gpu => true,
         BackendSel::GpuRuntime(r) => {
-            if r != "hip" {
+            if r != "hip" && r != "vulkan" {
                 eprintln!(
                     "# qwen4exp: --gpu-runtime {r}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
                 );
@@ -42,6 +42,11 @@ pub fn q4_gpu_wanted(backend: &BackendSel) -> bool {
             true
         }
     }
+}
+
+/// qwen4exp의 vulkan 런타임 선택 여부 (plans/84 B — 값경로 VkAcc).
+pub fn q4_vk_runtime(backend: &BackendSel) -> bool {
+    matches!(backend, BackendSel::GpuRuntime(r) if r == "vulkan")
 }
 
 /// qwen4exp GPU 요청 판정 — CLI 문자열판 (infer/bench).
@@ -52,12 +57,17 @@ pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
     if backend != "gpu" {
         return false;
     }
-    if runtime != "hip" {
+    if runtime != "hip" && runtime != "vulkan" {
         eprintln!(
             "# qwen4exp: --gpu-runtime {runtime}은 미지원(QSA 커널·용량) — HIP로 진행 (plans/64 §7)"
         );
     }
     true
+}
+
+/// CLI 문자열판 vulkan 선택 (plans/84 B).
+pub fn q4_vk_runtime_str(runtime: &str) -> bool {
+    runtime == "vulkan"
 }
 
 pub struct InferResult {
@@ -649,6 +659,21 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         // qwen4exp GPU 경로 (rawhip 값 경로) — plans/64 P1. 기본 CPU(정확성
         // 기준); --backend gpu / --gpu-runtime hip일 때만 상주 가속기를 붙인다.
         let want_gpu = q4_gpu_wanted(&backend);
+        if want_gpu && q4_vk_runtime(&backend) {
+            // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
+            // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
+            match llm170_backend_gpu::new_q4_acc_vk() {
+                Ok(acc) => {
+                    eng = eng.with_acc(acc);
+                    eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B 슬라이스2)");
+                }
+                Err(e) => {
+                    eprintln!("error: qwen4exp Vulkan 가속기 생성 실패 — {e}");
+                    eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
+                }
+            }
+            return Engine::Q4(Box::new(eng));
+        }
         if want_gpu {
             match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
                 Ok(acc) => {
