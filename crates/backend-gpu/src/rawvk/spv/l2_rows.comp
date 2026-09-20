@@ -1,0 +1,30 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+// plans/84 B — L2Rows: 행별 정규화 x *= 1/max(sqrt(Σx²), eps) (hip q4_l2_rows 동일열).
+layout(local_size_x = 64) in;
+layout(binding = 0) buffer Xb { float x[]; };
+layout(push_constant) uniform PC { uint d; float eps; } pc;
+shared double seg[64];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint u = gl_LocalInvocationID.x;
+    uint d = pc.d;
+    int chunk = int((d + 63u) >> 6u);
+    int lo = int(u) * chunk;
+    int xb = int(row * d);
+    float part = 0.0;
+    if (uint(lo) < d) {
+        int hi = min(lo + chunk, int(d));
+        for (int i = lo; i < hi; i++) { float v = x[xb + i]; part += v * v; }
+    }
+    seg[u] = double(part);
+    barrier();
+    if (u == 0u) {
+        double sum = 0.0lf;
+        for (int j = 0; j < 64; j++) if (uint(j * chunk) < d) sum += seg[j];
+        seg[0] = sum;
+    }
+    barrier();
+    float s = 1.0 / max(float(sqrt(seg[0])), pc.eps);
+    for (uint i = u; i < d; i += 64u) x[xb + int(i)] *= s;
+}

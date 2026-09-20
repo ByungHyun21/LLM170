@@ -1,0 +1,40 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+// plans/84 B — L2Rows2Scale: q·scale, k·1 정규화 (hip l2_rows2_scale 동일열 —
+// 순차 f64 합). 워크그룹 = (헤드쌍) 행.
+layout(local_size_x = 64) in;
+shared double red[128];
+layout(binding = 0) buffer Qb { float q[]; };
+layout(binding = 1) buffer Kb { float k[]; };
+layout(push_constant) uniform PC { uint d; uint n_group; float eps; float scale; } pc;
+void main() {
+    uint g = gl_WorkGroupID.x;   // 그룹(행쌍)
+    uint u = gl_LocalInvocationID.x;
+    uint d = pc.d;
+    uint qrow = g * 2u;
+    uint krow = g * 2u + 1u;
+    // 순차 f64 — 64레인 분할 후 f64 결합(hip 판과 같은 정밀도 클래스).
+    double sq = 0.0lf;
+    double sk = 0.0lf;
+    for (uint i = u; i < d; i += 64u) {
+        float vq = q[qrow * d + i];
+        float vk = k[krow * d + i];
+        sq += double(vq * vq);
+        sk += double(vk * vk);
+    }
+    // 워크그룹 결합
+    red[u] = sq; red[64u + u] = sk;
+    barrier();
+    if (u == 0u) {
+        double a = 0.0lf, b = 0.0lf;
+        for (int j = 0; j < 64; j++) { a += red[j]; b += red[64 + j]; }
+        red[0] = a; red[1] = b;
+    }
+    barrier();
+    float nq = 1.0 / max(float(sqrt(red[0])), pc.eps);
+    float nk = 1.0 / max(float(sqrt(red[1])), pc.eps);
+    for (uint i = u; i < d; i += 64u) {
+        q[qrow * d + i] *= nq * pc.scale;
+        k[krow * d + i] *= nk;
+    }
+}

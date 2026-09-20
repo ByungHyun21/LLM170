@@ -1,0 +1,20 @@
+#version 450
+// plans/84 B — HcGateMean: out[ti·n+i] = Σ_s xn[..]·σ(-gate[..]) / hc.
+// hip q4_hc_gate_mean 동일열.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Xn { float xn[]; };
+layout(binding = 1) readonly buffer Gt { float gate[]; };
+layout(binding = 2) buffer Ob { float outv[]; };
+layout(push_constant) uniform PC { uint hc; uint n; uint total; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) return;
+    uint ti = i / pc.n;
+    uint ii = i % pc.n;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.hc; s++) {
+        uint k = ti * pc.hc * pc.n + s * pc.n + ii;
+        acc += xn[k] * (1.0 / (1.0 + exp(-gate[k])));
+    }
+    outv[i] = acc / float(pc.hc);
+}

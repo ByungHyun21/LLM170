@@ -1,0 +1,21 @@
+#version 450
+// plans/84 B — GdnConv 병렬 청크판(hip gdn_conv_t2 동일열): (c×ti) 병렬,
+// 인과 conv는 이전 입력만 참조 — 청크 내 의존 없음. 상태 갱신은 별도 판.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };
+layout(binding = 1) readonly buffer Cw { float cw[]; };
+layout(binding = 2) readonly buffer St { float state[]; };
+layout(binding = 3) buffer Ou { float outv[]; };
+layout(push_constant) uniform PC { uint ch; uint k; uint t; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint ti = gl_WorkGroupID.y;
+    if (c >= pc.ch || ti >= pc.t) return;
+    float sum = cw[c * pc.k + (pc.k - 1u)] * qkv[ti * pc.ch + c];
+    for (uint j = 0u; j < pc.k - 1u; j++) {
+        int pos = int(ti) - int(pc.k - 1u) + int(j);
+        float xv = pos >= 0 ? qkv[uint(pos) * pc.ch + c] : state[(uint(pos) + pc.k - 1u) * pc.ch + c];
+        sum += cw[c * pc.k + j] * xv;
+    }
+    outv[ti * pc.ch + c] = sum / (1.0 + exp(-sum));
+}

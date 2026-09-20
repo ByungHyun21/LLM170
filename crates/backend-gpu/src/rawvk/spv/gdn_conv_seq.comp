@@ -1,0 +1,22 @@
+#version 450
+// plans/84 B — 짧은 꼬리(t<k-1) 순차판(hip gdn_conv_t 동일열): c×64스레드,
+// 레인0이 t 순회. 상태 회전 포함.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };
+layout(binding = 1) readonly buffer Cw { float cw[]; };
+layout(binding = 2) buffer St { float state[]; };
+layout(binding = 3) buffer Ou { float outv[]; };
+layout(push_constant) uniform PC { uint ch; uint k; uint t; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint u = gl_LocalInvocationID.x;
+    if (u != 0u || c >= pc.ch) return;
+    for (uint ti = 0u; ti < pc.t; ti++) {
+        float sum = cw[c * pc.k + (pc.k - 1u)] * qkv[ti * pc.ch + c];
+        for (uint j = 0u; j < pc.k - 1u; j++) sum += cw[c * pc.k + j] * state[j * pc.ch + c];
+        float oc = sum / (1.0 + exp(-sum));
+        for (uint j = 0u; j + 2u < pc.k; j++) state[j * pc.ch + c] = state[(j + 1u) * pc.ch + c];
+        state[(pc.k - 2u) * pc.ch + c] = qkv[ti * pc.ch + c];
+        outv[ti * pc.ch + c] = oc;
+    }
+}

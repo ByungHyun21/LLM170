@@ -1122,3 +1122,32 @@ Re-recorded with the real vk path after verifying determinism
 MoE chain (top10 → grouped GEMM → weighted-sum): max|D|=6.28e-4 vs
 CPU. All four gates pass. Remaining for frame-capable-by-default:
 hc/GDN/QSA/PLE stages + PLE streaming.
+
+## 2026-09-21 (22) — Vulkan frame attention half: hc/GDN ops, L2, frame_gdn_ar; FN shader-namespace collision fixed (plans/84 B)
+
+Third frame slice — the GDN/hc half of the FN layer now runs as frame
+ops: HcGateMean, HcCombine, NormGated(sigmoid), GdnBetaG, Sigmoid,
+Split3 (reusing the q35 value-path plate), L2Rows(+2Scale, f64
+reduction class), GdnConv (parallel chunk plate + ring-state update +
+sequential tail), and FrameState::frame_gdn_ar reusing the q35
+gdn_ar.spv plate (sequential over t — chunk-invariant by causality).
+frame_mm_group gained a value-path pullback for unsupported weight
+types (the f32 inject) so the hc half completes end to end.
+vk-frame-check covers all of them (<=1.6e-7 vs CPU mirrors).
+
+Two collisions found the hard way: my gdn_conv_state/gdn_beta_g
+shaders overwrote EXISTING q35 decoder shaders — the 27B vk gate went
+degenerate (reproducible; the original conv-state plate uses a 1-D
+grid with a negative-index fallback mine lacked). Fixed by restoring
+the originals and renaming the FN variants (fn_gdn_conv_state; beta_g
+was numerically identical but also restored for cleanliness). Lesson
+recorded: the spv directory is a shared namespace — new backends get
+fresh names.
+
+End-to-end status: with LLM170_VK_FRAME=1 the FN forward now proceeds
+through hc, GDN, MoE and reaches the tail allocations, then hits the
+Vulkan per-allocation memory ceiling (single ctx-scaled frame buffers
+of 6-10 GiB; hip allocates these fine, RADV does not). Remaining for
+frame-capable-by-default: split/large-frame budgeting on vk, the QSA
+half (qk_norm_rope, indexer top-k, attention via the qsa_flash_gq
+plate), PLE. All four gates pass.
