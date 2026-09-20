@@ -658,6 +658,9 @@ pub trait FrameHost: Send + Sync {
         Err("frame_write: 미지원".into())
     }
     /// 프레임 버퍼 → 호스트 판독 (동기 — forward 종료 1회가 설계상 목표).
+    /// 진단 판독 전 전체 동기 — buf_hash 계측이 커스텀 스트림 파이프라인의
+    /// 미완결 쓰기를 읽는 경합을 없앤다(plans/84 E.2 mout 역설 교정).
+    fn frame_sync(&self) {}
     fn frame_read(&self, _h: u64, _out: &mut [f32]) -> Result<(), String> {
         Err("frame_read: 미지원".into())
     }
