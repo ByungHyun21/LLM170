@@ -274,6 +274,9 @@ pub(super) fn frame_forward_ex(
             }
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
+            if il <= 4 && llm170_diag::dump::opts().bufhash {
+                buf_hash(acc, f.res_hc, hc * n * t.min(16), &format!("L{il}A.res_attn"));
+            }
             sync_mark(acc, &format!("L{il}.gdn_combine"), f.res_hc)?;
         } else {
             // QSA — plans/67 2c: 디바이스 상주 경로 우선. 투영·norm·rope·어텐션·
@@ -333,7 +336,20 @@ pub(super) fn frame_forward_ex(
             frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
         }
         
+        if il <= 4 && llm170_diag::dump::opts().bufhash {
+            // plans/84 E.2: ffn combine 직전 3입력 + res 스냅샷
+            buf_hash(acc, f.res_hc, hc * n * t.min(16), &format!("L{il}A.res_pre_ffn"));
+            buf_hash(acc, f.mout, n * t.min(16), &format!("L{il}A.mout_site"));
+            buf_hash(acc, f.inj, hc * t.min(16), &format!("L{il}A.inj_site"));
+        }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
+        if il <= 4 && llm170_diag::dump::opts().bufhash {
+            // plans/84 E.2: ffn combine 직후 + 행 반분(0-7/8-15) — 경계 행 패턴 식별
+            buf_hash(acc, f.res_hc, hc * n * t.min(16), &format!("L{il}A.res_ffn"));
+            if t >= 16 {
+                buf_hash(acc, f.res_hc, hc * n * 8, &format!("L{il}A.res_ffn_lo"));
+            }
+        }
         sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
         if il == 0 {
         }
