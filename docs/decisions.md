@@ -713,3 +713,22 @@ loss of replacement kernels. A winning C needs equal-or-better kernels
 launch savings), which is tuning work, not arithmetic work. Fused
 implementation reverted; `hca-repro` stays as the diagnostic that closed
 the question. Both gates pass on the reverted tree.
+
+## 2026-09-20 (6) — Vulkan q5_1 GEMV: Flash-Next MoE-down mass enabled (plans/84 B, slice 1)
+
+The Vulkan value-path GEMV (gemv3 uber-shader) had no q5_1 branch —
+25.2GiB of Flash-Next MoE expert-down weights (docs/models/qwen4exp.md
+type mix: MoE gate/up q4_K covered, down q5_1 not). Added ty=7 to gemv3
+with the dot_q5_1_q8 mirror: 6-word block [d|m f16 pair][qh u32][qs x4],
+low/high nibble words for elements 0-15/16-31, and the 5th-bit gather
+expanding four consecutive qh bits into byte lanes (the q5_K-style
+0x01010101 stride mask is for its interleaved layout and was wrong here —
+first cut MISMATCHed, fixed by the expansion).
+
+`vk-gemv-check` now auto-detects the qwen4exp architecture (arch string)
+and loads via Model4, so the FN multi-part model's tensors can be probed
+directly: blk.0/blk.3 ffn_down_exps (q5_1, 629MB stacked-expert tensors)
+both PASS (argmax preserved, maxrel ~5e-3 — same tolerance class as the
+existing types on this probe). The 27B vulkan gate is unchanged after
+the shader recompile. Tile/coopmat q5_1 (prefill plates) remains open —
+the GEMV path serves all t meanwhile.

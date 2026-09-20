@@ -50,6 +50,7 @@ pub struct VkAcc {
 fn vk_ty(ty: GgmlType) -> Option<u32> {
     match ty {
         GgmlType::Q5K => Some(13),
+        GgmlType::Q5_1 => Some(7),
         GgmlType::Q4K => Some(12),
         GgmlType::Q6K => Some(14),
         GgmlType::Iq4Xs => Some(23),
@@ -612,9 +613,30 @@ impl llm170_core::matmul::EwOps for VkAcc {
 
 /// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
-    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path))
-        .map_err(|e| e.to_string())?;
-    let w = model.w(tname).ok_or("텐서 없음")?;
+    // plans/84 B: qwen4exp(Flash-Next, 멀티파트) 폴백 — arch 판별 후 단일 로드.
+    enum AnyModel {
+        Q35(llm170_core::qwen35::Model),
+        Q4(llm170_core::qwen4exp::Model4),
+    }
+    let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(path))
+        .ok()
+        .and_then(|g| g.arch().map(|a| a == "qwen4exp"))
+        .unwrap_or(false);
+    let model = if is_q4 {
+        AnyModel::Q4(
+            llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        AnyModel::Q35(
+            llm170_core::qwen35::Model::load(std::path::Path::new(path))
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let w = match &model {
+        AnyModel::Q35(m) => m.w(tname).ok_or("텐서 없음")?,
+        AnyModel::Q4(m) => m.w4(tname).map_err(|e| e.to_string())?,
+    };
     let wref = &w;
     let n_in = w.n_in as usize;
     let acc = VkAcc::new()?;
