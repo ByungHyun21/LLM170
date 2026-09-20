@@ -133,6 +133,10 @@ pub struct DecodeState {
     pub ctx_len: usize,
     pub kq_scale: f32,
     pub is_recr: Vec<bool>,
+    /// (plans/84 A: 청크 불변성. GEMM 패밀리마다 환원 순서가 달라 t 임계
+    /// 2-4/32/64에서 스위치되면 같은 행이 청크 크기에 따라 다른 값을
+    /// 냈다. 디코드/np/spec 경로는 기존 디스패치 유지).
+    pub pin_prefill: std::cell::Cell<bool>,
 }
 
 
@@ -648,7 +652,7 @@ impl DecodeState {
         let only = std::env::var("LLM170_MMQ_ONLY").ok().and_then(|v| v.parse::<u32>().ok());
         if (only.is_none() || only.is_some_and(|m| m & (1u32 << (ty - 12)) != 0))
             && matches!(ty, 12 | 13 | 14 | 23)
-            && t >= 32
+            && (t >= 32 || self.pin_prefill.get())
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3)
         {
             return self.ctx.gemm_mmq(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
@@ -656,34 +660,64 @@ impl DecodeState {
         self.mm_b(xq, xq_w, wp, ty, n_in, n_out, out, t)
     }
 
+    /// MS_DUMP/TRACE 추적 대상 층 (기본 4 — plans/84 A 청크 불변성 디버그).
+    fn trace_il(&self) -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("LLM170_MS_IL").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+        })
+    }
+
+    /// 트레이스/덤프 활성 여부(캐시) — trace_rows 조기 반환 전 format! 비용 차단.
+    fn tracing(&self) -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            env_on("LLM170_MS_TRACE") || std::env::var_os("LLM170_MS_DUMP").is_some()
+        })
+    }
+
     /// plans/28 디버그: 버퍼의 행별 L1 노름 덤프 (지연 게이트) — 수치 오염 행 탐지.
     fn trace_rows(&self, label: &str, ptr: *const u8, row_f32: usize, t: usize) -> Result<(), String> {
-        if !env_on("LLM170_MS_TRACE") {
+        if !env_on("LLM170_MS_TRACE") && std::env::var_os("LLM170_MS_DUMP").is_none() {
             return Ok(());
         }
         let mut buf = vec![0f32; row_f32 * t];
         self.ctx.sync()?;
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut buf).as_mut(), ptr)?;
-        let norms: Vec<String> = (0..t)
-            .map(|r| {
-                let s: f64 = buf[r * row_f32..(r + 1) * row_f32]
-                    .iter()
-                    .map(|&v| v.abs() as f64)
-                    .sum();
-                format!("{s:.3}")
-            })
-            .collect();
-        eprintln!("[mst] {label}: {}", norms.join(" "));
+        if let Some(dir) = std::env::var_os("LLM170_MS_DUMP") {
+            // plans/84 A: 스테이지 버퍼 원본 비트 덤프 — 청크 A/B 비트 비교용.
+            // 호출 시퀀스 번호 병기: 내부 청킹의 콜별 파일 보존.
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::path::Path::new(&dir).join(format!("{label}.{seq:04}.f32"));
+            std::fs::write(p, bytemuck::cast_slice(&buf)).ok();
+        }
+        if env_on("LLM170_MS_TRACE") {
+            let norms: Vec<String> = (0..t)
+                .map(|r| {
+                    let s: f64 = buf[r * row_f32..(r + 1) * row_f32]
+                        .iter()
+                        .map(|&v| v.abs() as f64)
+                        .sum();
+                    format!("{s:.6}")
+                })
+                .collect();
+            eprintln!("[mst] {label}: {}", norms.join(" "));
+        }
         Ok(())
     }
 
     fn mm_b(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        let pin = self.pin_prefill.get();
         // np 소형 배치(t=2..4): 4-토큰 GEMV — 타일은 128열 고정이라 t=4에서
         // 124열을 낭비한다(t=4 0.34ms vs t=128 0.83ms, 동일 가중). 가중 1회
         // 독서로 토큰별 독립 누산. LLM170_NO_G4=1로 끔.
-        if (2..=4).contains(&t)
+        // 프리필 핀(plans/84 A) 시 g4/q5v2 스킵 — 환원 순서가 large-t 패밀리와
+        // 달라 청크 경계 수치가 갈린다.
+        if !pin
+            && (2..=4).contains(&t)
             && matches!(ty, 12 | 13 | 14 | 23)
-           
+
         {
             return self.ctx.gemm_g4(
                 ty,
@@ -698,37 +732,48 @@ impl DecodeState {
             );
         }
         // q5_K v2 (부록76): vdr=2 그리드-스트라이드 — 자체 스트림 (비트계약 아님)
-        if ty == 13 && t == 1 && env_on("LLM170_Q5V2") {
+        if !pin && ty == 13 && t == 1 && env_on("LLM170_Q5V2") {
             return self.ctx.gemv_q8_out_v2(xq as *const u8, wp as *const u8, ty, n_in, n_out, out, xq_w, t);
         }
-        // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만
+        // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만 (핀: 전 t)
         let odd_v4 = !env_on("LLM170_EXACT")
-            && self.ctx.co_loaded(super::CO_ODD) && t >= 32
+            && self.ctx.co_loaded(super::CO_ODD) && (t >= 32 || pin)
             && matches!(ty, 20 | 11 | 21);
-        // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거
-        let q8t = ty == 8 && t > 64 && (n_out >= 128 || t >= 256) && !env_on("LLM170_EXACT")
-            && self.ctx.co_loaded(super::CO_J128);
-        if (matches!(ty, 12 | 13 | 14 | 23) && t > 1 || odd_v4 || q8t) {
-            // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터)
-            return self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out);
+        // q8_0 타일 (j128): 소형 GEMV 토큰당 재독 제거 (핀: n_out>=128이면 전 t)
+        let q8t = ty == 8
+            && !env_on("LLM170_EXACT")
+            && self.ctx.co_loaded(super::CO_J128)
+            && ((t > 64 && (n_out >= 128 || t >= 256)) || (pin && n_out >= 128));
+        if (matches!(ty, 12 | 13 | 14 | 23) && (t > 1 || pin) || odd_v4 || q8t) {
+            // 타일 경로 — 가중 1회 독서 (블록=1행, TT 토큰 레지스터).
+            // 핀 시 large-t 패밀리(j128/v4) 고정 — t 무관 동일 산술.
+            return if pin {
+                self.ctx.gemm_tile_pin(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
+            } else {
+                self.ctx.gemm_tile(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
+            };
         }
         self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, xq_w, t)
+    }
+    /// mm_b 사이드 스트림판 — 타일형만 (비타일은 주 스트림 사용).
+    /// 핀 시 large-t 패밀리 고정(mm↔j128 스위치가 청크 불변을 깨뜨렸다 — plans/84 A).
+    fn mm_b_s(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
+        if self.pin_prefill.get() {
+            self.ctx.gemm_tile_pin_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
+        } else {
+            self.ctx.gemm_tile_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
+        }
     }
     /// mm_b 사이드 스트림판 — 타일형만 (비타일은 주 스트림 사용)
     #[allow(clippy::too_many_arguments)]
     /// mm_b_s의 MMQ판 — side stream에서 quant+mul_mat_q (부록48).
     fn mm_b2_s(&self, y_f32: *mut u8, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        if matches!(ty, 12 | 13 | 23) && t >= 32
+        if matches!(ty, 12 | 13 | 23) && (t >= 32 || self.pin_prefill.get())
             && self.ctx.co_loaded(super::CO_MMQ | super::CO_MMQ2 | super::CO_MMQ3) {
             return self.ctx.gemm_mmq_s(ty, y_f32 as *const u8, wp as *const u8, n_in, n_out, t, out);
         }
         self.mm_b_s(xq, xq_w, wp, ty, n_in, n_out, out, t)
     }
-
-    fn mm_b_s(&self, xq: *mut u8, xq_w: usize, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8, t: usize) -> Result<(), String> {
-        self.ctx.gemm_tile_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, xq_w, t, out)
-    }
-
 }
 
 /// Engine에 원시 HIP 디코더 주입 — 필요 가중치·상수 전체를 백엔드로.

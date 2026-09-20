@@ -1083,6 +1083,161 @@ pub fn launch_probe() -> Result<String, String> {
     Ok(format!("launch-probe: {n}회 런치 cpu={:.3}ms/회 (동기 포함 wall={:.3}ms/회)", cpu.as_secs_f64()*1e3/n as f64, wall.as_secs_f64()*1e3/n as f64))
 }
 
+/// plans/84 A — MMQ(gemm_mmq) 교차-t 행 불변 검증: 동일 활성 앞 t1행을
+/// t=t1과 t=t2 두 번 계산해 공유 행을 비트 비교한다. 청크 불변성의
+/// GEMM 축 펜스 (chunk-check의 커널 레벨 격리용).
+pub fn mmq_row_check(path: &str, tname: &str, t1: usize, t2: usize) -> Result<String, String> {
+    if t1 == 0 || t2 < t1 {
+        return Err("mmq-row-check: 0 < t1 <= t2 필요".into());
+    }
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("tensor 없음")?;
+    let ty = w.ty as u32;
+    if !matches!(ty, 8 | 12 | 13 | 14 | 23) {
+        return Err(format!("mmq-row-check: MMQ 타입 아님 (ty={ty})"));
+    }
+    let ctx = RawCtx::new()?;
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xf: Vec<f32> = (0..t2 * n_in).map(|_| lcg()).collect();
+    let xfd = ctx.alloc(xf.len() * 4)?;
+    ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+    let o1 = ctx.alloc(t1 * n_out * 4)?;
+    let o2 = ctx.alloc(t2 * n_out * 4)?;
+    // 워밍(1회) 후 순차 2회 — 캐시·스트림 상태 차단
+    ctx.gemm_mmq(ty, xfd as *const u8, wd, n_in, n_out, t1, o1)?;
+    ctx.sync()?;
+    ctx.gemm_mmq(ty, xfd as *const u8, wd, n_in, n_out, t1, o1)?;
+    ctx.gemm_mmq(ty, xfd as *const u8, wd, n_in, n_out, t2, o2)?;
+    ctx.sync()?;
+    let mut v1 = vec![0f32; t1 * n_out];
+    let mut v2 = vec![0f32; t2 * n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut v1), o1)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut v2), o2)?;
+    let mut mism = 0usize;
+    let mut maxd = 0f32;
+    let mut first: Option<(usize, usize, u32, u32)> = None;
+    for r in 0..t1 {
+        for c in 0..n_out {
+            let (a, b) = (v1[r * n_out + c], v2[r * n_out + c]);
+            if a.to_bits() != b.to_bits() {
+                mism += 1;
+                maxd = maxd.max((a - b).abs());
+                if first.is_none() {
+                    first = Some((r, c, a.to_bits(), b.to_bits()));
+                }
+            }
+        }
+    }
+    let verdict = if mism == 0 { "PASS" } else { "FAIL" };
+    let mut s = format!(
+        "mmq-row-check {tname} ty={ty} t={t1} vs {t2}: {verdict} — {mism}/{} 원소 상이, max|Δ|={maxd:.3e}",
+        t1 * n_out
+    );
+    if let Some((r, c, a, b)) = first {
+        s.push_str(&format!("\n  첫 불일치 [{r}][{c}]: {a:#010x} vs {b:#010x} ({:+.6} vs {:+.6})", v1[r * n_out + c], v2[r * n_out + c]));
+    }
+    Ok(s)
+}
+
+/// plans/84 A — 타일 핀 패밀리(gemm_tile_pin: j128/v4/wm)의 교차-t 행 불변 검증.
+/// 프리필 핀 경로(ssm_out q8_0 j128, ffn_down iq4_nl v4 등)의 펜스.
+pub fn tile_row_check(path: &str, tname: &str, t1: usize, t2: usize) -> Result<String, String> {
+    if t1 == 0 || t2 < t1 {
+        return Err("tile-row-check: 0 < t1 <= t2 필요".into());
+    }
+    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("tensor 없음")?;
+    let ty = w.ty as u32;
+    let ctx = RawCtx::new()?;
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let kt: Vec<u32> = llm170_core::ktab2_packed();
+    let ktd = ctx.alloc(kt.len() * 4)?;
+    ctx.h2d(ktd, bytemuck::cast_slice(&kt))?;
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xf: Vec<f32> = (0..t2 * n_in).map(|_| lcg()).collect();
+    let xfd = ctx.alloc(xf.len() * 4)?;
+    ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+    // 활성 q8 인코딩 — quant_q8 배치(행 단위)
+    let xq_w = n_in / 4 + n_in / 32 + n_in / 16; // 엔진 quant_q8_b 배치 스트라이드(정렬 여유 포함)
+    // LLM170_TRC_XQ: 엔진 덤프(tr_xqg.f32)를 활성 버퍼로 직접 사용 —
+    // 엔진 맥락 재현 (plans/84 A).
+    let dump_path = std::env::var_os("LLM170_TRC_XQ");
+    let (xq, t2) = if let Some(p) = dump_path {
+        let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+        let rows = bytes.len() / (xq_w * 4);
+        if rows < t2 { return Err(format!("dump 행 부족: {rows} < {t2}")); }
+        let buf = ctx.alloc(bytes.len())?;
+        ctx.h2d(buf, &bytes)?;
+        (buf, t2)
+    } else {
+        let xq = ctx.alloc(t2 * xq_w * 4)?;
+        for ti in 0..t2 {
+            let row = unsafe { xfd.add(ti * n_in * 4) };
+            let dst = unsafe { xq.add(ti * xq_w * 4) };
+            ctx.quant_q8(row, dst, n_in)?;
+        }
+        (xq, t2)
+    };
+    let _ = &xfd;
+    let o1 = ctx.alloc(t1 * n_out * 4)?;
+    let o2 = ctx.alloc(t2 * n_out * 4)?;
+    // 센티넬: t2>128이면 128 넘은 행이 실제로 기록되는지 검증 (plans/84 A).
+    let nan_fill = vec![f32::NAN.to_bits().to_le_bytes(); (t2 * n_out).max(1)];
+    let flat: Vec<u8> = nan_fill.iter().flat_map(|b| b.iter().copied()).collect();
+    ctx.h2d(o2, &flat)?;
+    ctx.gemm_tile_pin(xq as *const u8, wd, ktd, ty, n_in, n_out, xq_w, t1, o1)?;
+    // 엔진 조건 재현: t1 넘은 xq 행을 호출 이력마다 다른 값(스크래치 잔존)으로
+    // 덮어쓴 뒤 t2 런치 — 부분 타일의 스테일 판독이 유효 행을 오염시키는지.
+    if t2 > t1 {
+        let junk: Vec<u8> = (0..(t2 - t1) * xq_w * 4).map(|i| (i as u8).wrapping_mul(31)).collect();
+        ctx.h2d(unsafe { xq.add(t1 * xq_w * 4) }, &junk)?;
+    }
+    ctx.gemm_tile_pin(xq as *const u8, wd, ktd, ty, n_in, n_out, xq_w, t2, o2)?;
+    ctx.sync()?;
+    let mut v1 = vec![0f32; t1 * n_out];
+    let mut v2 = vec![0f32; t2 * n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut v1), o1)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut v2), o2)?;
+    let mut mism = 0usize;
+    let mut maxd = 0f32;
+    let mut first: Option<(usize, usize)> = None;
+    for r in 0..t1 {
+        for c in 0..n_out {
+            let (a, b) = (v1[r * n_out + c], v2[r * n_out + c]);
+            if a.to_bits() != b.to_bits() {
+                mism += 1;
+                maxd = maxd.max((a - b).abs());
+                if first.is_none() {
+                    first = Some((r, c));
+                }
+            }
+        }
+    }
+    let verdict = if mism == 0 { "PASS" } else { "FAIL" };
+    let mut s = format!(
+        "tile-row-check(pin) {tname} ty={ty} t={t1} vs {t2}: {verdict} — {mism}/{} 상이, max|Δ|={maxd:.3e}",
+        t1 * n_out
+    );
+    if t2 > 128 {
+        let unwritten = v2[128 * n_out..].iter().filter(|v| v.is_nan()).count();
+        s.push_str(&format!("\n  센티넬: t2>128 중 미기록(NaN 잔존) {unwritten}/{} 원소", (t2 - 128) * n_out));
+    }
+    Ok(s)
+}
+
 pub fn mm_bench() -> Result<String, String> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(2).cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());

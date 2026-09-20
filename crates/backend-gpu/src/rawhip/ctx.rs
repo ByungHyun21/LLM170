@@ -71,6 +71,11 @@ struct TileLaunch {
 }
 
 
+/// 프리필 패밀리 핀 (plans/84 A) — step_batch 진입~종료 사이 true.
+/// t 2..8 GEMV mt 변형·flash wk 게이트가 패밀리를 갈라 청크 불변을 깨뜨리므로
+/// 핀 중에는 large-t 패밀리로 통일한다.
+pub(crate) static PREFILL_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl RawCtx {
     /// 코드오브젝트 패밀리 로드 비트 질의 (plans/78 R4 — 전역 static 승계).
     pub fn co_loaded(&self, bit: u8) -> bool {
@@ -832,6 +837,7 @@ impl RawCtx {
         // 킬스위치 LLM170_Q8MT16=0.
         if (2..=8).contains(&t) && ty == 8 && n_in / 32 <= 32
             && !env_eq("LLM170_Q8MT16", "0")
+            && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -860,6 +866,7 @@ impl RawCtx {
         // 동일 정밀도 클래스). 킬스위치 LLM170_Q8MTW=0.
         if (2..=8).contains(&t) && ty == 8 && n_in / 32 > 32
             && !env_eq("LLM170_Q8MTW", "0")
+            && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -881,7 +888,8 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if (2..=8).contains(&t) && ty == 8 && !env_eq("LLM170_Q8MT", "0") {
+        if (2..=8).contains(&t) && ty == 8 && !env_eq("LLM170_Q8MT", "0")
+            && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed) {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -1154,30 +1162,40 @@ impl RawCtx {
     fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = !env_on("LLM170_EXACT")
             && self.co_loaded(CO_J128) && t > 64;
-        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
+        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
 
     /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
     fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
         let j128 = !env_on("LLM170_EXACT")
             && self.co_loaded(CO_J128);
-        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128)
+        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
 
-    fn tile_core_inner(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8, j128: bool) -> Result<TileLaunch, String> {
+    /// 프리필 핀판 (plans/84 A) — j128 강제 + large-t 패밀리(wm/v4) 고정.
+    /// 청크 불변성: 같은 텐서는 t에 무관하게 항상 동일 커널 산술을 쓴다.
+    fn tile_core_pin(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
+        let j128 = !env_on("LLM170_EXACT")
+            && self.co_loaded(CO_J128);
+        self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, true)
+    }
+
+    fn tile_core_inner(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8, j128: bool, large_t: bool) -> Result<TileLaunch, String> {
         // wm·mm 상한 64: t>64 무CO는 유효 커널 없음 — 침묵 오답 대신 에러
+        // (핀판은 j128 강제 — large-t 패밀리가 곧 j128/v4이므로 무CO면 에러가 정당)
         if t > 64 && !j128 {
             return Err(format!("타일 미지원: t={t}는 CO 사전컴파일(j128/v4) 필요"));
         }
+        let big = t >= 32 || large_t;
         let (v4, odd) = (self.co_loaded(CO_V4), self.co_loaded(CO_ODD));
         let kern: &'static str = match ty {
-            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if j128 { "gemm_q6k_j128" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if v4 && env_on("LLM170_XS_V4U") { "gemm_xs_v4u" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && t >= 32 { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && t >= 32 { "gemm_xs_wm" } else { "gemm_xs_mm" },
-            20 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
-            11 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
-            21 => if odd && !env_on("LLM170_EXACT") && t >= 32 { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
+            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
+            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
+            14 => if j128 { "gemm_q6k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            23 => if j128 { "gemm_xs_j128" } else if v4 && env_on("LLM170_XS_V4U") { "gemm_xs_v4u" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && big { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && big { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            20 => if odd && !env_on("LLM170_EXACT") && big { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
+            11 => if odd && !env_on("LLM170_EXACT") && big { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
+            21 => if odd && !env_on("LLM170_EXACT") && big { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
             8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
@@ -1257,6 +1275,20 @@ impl RawCtx {
             eprintln!("tileprof ty={ty} {n_in}x{n_out} t={t} kern={} {:.3}ms", l.kern, ti.elapsed().as_secs_f64()*1e3);
         }
         r
+    }
+
+    /// gemm_tile의 프리필 핀판 — large-t 패밀리 고정 (plans/84 A, 청크 불변성).
+    pub fn gemm_tile_pin(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut l = self.tile_core_pin(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
+        let mut args = Self::tile_args(&mut l);
+        self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
+    }
+
+    /// gemm_tile_s의 프리필 핀판 — large-t 패밀리 고정·사이드 스트림 (plans/84 A).
+    pub fn gemm_tile_pin_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+        let mut l = self.tile_core_pin(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
+        let mut args = Self::tile_args(&mut l);
+        self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
     /// 커널 속성 조회 — (레지스터, 로컬 바이트, 최대 스레드). 점유율 진단용.

@@ -310,6 +310,11 @@ impl Engine {
     }
     /// 시퀀스 상태 전체 초기화 (무상태 HTTP 서버용) — mmap은 유지.
     /// ctx는 기존 KV 용량에서 역산 (첫 kv_k 길이).
+    ///
+    /// GPU 상주 상태(GDN S/conv 링)도 전 슬롯 영점화 — 2026-09-20 plans/84 A:
+    /// CPU SeqState만 교체하면 raw 프리필이 이전 대화의 더러운 초기 상태를
+    /// 읽어 두 번째 동일 프리필부터 logits이 발산했다 (chunk-check 재현:
+    /// 1회째 bits-identical, 2회째 max|Δ|≈14). reset_seq은 이미 raw_reset.
     pub fn reset_states(&mut self) {
         let n_kv = self.model.hp.n_kv;
         let hd = self.model.hp.head_dim;
@@ -318,8 +323,15 @@ impl Engine {
             .first()
             .and_then(|s| s.kv_k.first().map(|k| k.len() / (n_kv * hd)))
             .unwrap_or(4096);
+        if let Some(rd) = self.raw_decode.as_ref() {
+            for seq in 0..self.seqs.len() {
+                let _ = rd.raw_reset(seq);
+            }
+        }
         for i in 0..self.seqs.len() {
             self.seqs[i] = SeqState::new(&self.model, ctx);
+            // GPU 프레임 상태는 새 SeqState와 어긋남 — 재구축 유도 (qwen4exp reset_states와 동일 원칙).
+            self.frame_clean[i] = false;
         }
     }
 

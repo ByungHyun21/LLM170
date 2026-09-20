@@ -92,9 +92,14 @@ impl Engine {
             || (self.raw_decode.is_some()
                 && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true))
         {
+            // plans/84 A: 단일 토큰 prefill 호출(청크 꼬리 t=1)도 배치 경로로 —
+            // decode 경로는 GEMM 패밀리가 달라 청크 불변성이 깨진다.
+            // 핀(step_batch)이 large-t 패밀리로 통일하므로 t=1도 비트 일치.
             let use_batch = std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
                 && std::env::var_os("LLM170_T1_PREFILL").is_none()
-                && (tokens.len() > 1 || std::env::var_os("LLM170_FORCE_BATCH").is_some());
+                && (tokens.len() > 1
+                    || std::env::var_os("LLM170_FORCE_BATCH").is_some()
+                    || self.raw_decode.is_some());
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
                 let _n = self.model.hp.n_embd;
