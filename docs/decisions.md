@@ -685,3 +685,31 @@ a 64-thread block doing q8 word loads + __ockl_sdot4 + tree64 after a
 barrier) to decide between a code-generation fault on gfx1151 and
 something in the launch path for this kernel shape. The fusion design
 and its ~2-4ms/step ceiling stand (entry 2026-09-20 (3)).
+
+## 2026-09-20 (5) — hc_mix fusion: fault root-caused (arg order); fusion loses to tuned plates (plans/84 C, final)
+
+The mystery fault from entry (4) is solved: the kernel argument list was
+pushed as (..., eps, n, hc, r) against a signature of (..., n, hc, r,
+eps) — the kernel received n=0/hc=2560 and wrote invr[2559] off a
+register array, wild-addressing ~2.7GB out. The `llm170 hca-repro` probe
+(now a permanent asset, standalone synthetic buffers, 8 clean runs)
+isolated this in seconds where engine bisects took a minute each; it
+reproduced the fault bit-for-bit and validated the fix.
+
+With the arg order fixed the 2-kernel fusion ran fault-free and its
+greedy stream was IDENTICAL to the gate baseline (the arithmetic
+reproduction of rms/quant/dot chains is bit-exact). But performance:
+fused tg128 14.24 t/s vs 19.37 baseline (-27%) — every down block
+re-quantized the whole activation row (320x duplication). A 3-kernel
+restructure (quant once into a global xq buffer, down reads it) reached
+17.82 t/s (-8%) with a remaining numerics bug in the xq consumption,
+still below baseline.
+
+Conclusion recorded: launch-count fusion alone cannot win here — the
+production mix_dual/w16 plates are individually tuned and the ~5 saved
+launches per hc site (~2ms/step ceiling) are smaller than the throughput
+loss of replacement kernels. A winning C needs equal-or-better kernels
+(e.g. reuse the w16 plate for `up`, fuse only rms+quant which is pure
+launch savings), which is tuning work, not arithmetic work. Fused
+implementation reverted; `hca-repro` stays as the diagnostic that closed
+the question. Both gates pass on the reverted tree.

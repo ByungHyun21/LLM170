@@ -460,3 +460,52 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
         &va[..4.min(n_out)], &vb[..4.min(n_out)]
     ))
 }
+
+/// plans/84 C — q4_hc_a 폴트 최소 재현: 합성 버퍼로 커널 A 형상을 단독 실행.
+/// 폴트 재현 시 코드젠/커널 문제, 무폴트 시 엔진 맥락(프레임 버퍼/B 후속) 문제.
+pub fn hca_repro() -> Result<String, String> {
+    let ctx = RawCtx::new()?;
+    let (n, hc, r): (usize, usize, usize) = (2560, 4, 320);
+    let total = hc * n;
+    let n_sub = total / 32;
+    let mut seed = 0x9e37_79b9u64;
+    let mut lcg = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / 2147483648.0) - 1.0
+    };
+    let res: Vec<f32> = (0..total).map(|_| lcg()).collect();
+    let wnorm: Vec<f32> = (0..total).map(|_| 1.0 + lcg() * 0.1).collect();
+    let wdown: Vec<u8> = (0..r * n_sub * 34).map(|i| (i as u8).wrapping_mul(7)).collect();
+    let winj: Vec<f32> = (0..hc * total).map(|_| lcg()).collect();
+    let (mut rp, mut np_, mut wd, mut wi) = (ctx.alloc(total * 4)?, ctx.alloc(total * 4)?, ctx.alloc(wdown.len() + 4096)?, ctx.alloc(winj.len() * 4)?);  // +4KB 슬랙: 꼬리 초과판독 이론
+    let (mut lp, mut jp, mut xp) = (ctx.alloc(r * 4)?, ctx.alloc(hc * 4)?, ctx.alloc(total * 4)?);
+    ctx.h2d(rp, bytemuck::cast_slice(&res))?;
+    ctx.h2d(np_, bytemuck::cast_slice(&wnorm))?;
+    ctx.h2d(wd, &wdown)?;
+    ctx.h2d(wi, bytemuck::cast_slice(&winj))?;
+    let (mut n_a, mut hc_a, mut r_a) = (n as i32, hc as i32, r as i32);
+    let mut eps = 1e-5f32;
+    let grid = (r + hc + total / 64) as u32;
+    for it in 0..8 {
+        let mut a: Vec<*mut std::ffi::c_void> = vec![
+            &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut np_ as *mut _ as *mut std::ffi::c_void,
+            &mut wd as *mut _ as *mut std::ffi::c_void,
+            &mut wi as *mut _ as *mut std::ffi::c_void,
+            &mut lp as *mut _ as *mut std::ffi::c_void,
+            &mut jp as *mut _ as *mut std::ffi::c_void,
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut n_a as *mut _ as *mut std::ffi::c_void,
+            &mut hc_a as *mut _ as *mut std::ffi::c_void,
+            &mut r_a as *mut _ as *mut std::ffi::c_void,
+            &mut eps as *mut _ as *mut std::ffi::c_void,
+        ];
+        ctx.launch3("q4_hca_repro", grid, 1, 1, 64, &mut a)?;
+        ctx.sync()?;   // 매 이터레이션 동기 — 폴트 즉시 노출
+        eprintln!("[hca-repro] iter {it} ok");
+    }
+    let mut lo_out = vec![0f32; r];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut lo_out), lp)?;
+    let nonz = lo_out.iter().filter(|v| **v != 0.0).count();
+    Ok(format!("hca-repro: 8회 실행 무폴트, lo nonzero {nonz}/{r}"))
+}

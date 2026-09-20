@@ -255,3 +255,115 @@ extern "C" __global__ void __launch_bounds__(256) bw_stream(
     }
     if (acc == 0xdeadbeefdeadbeefULL) part[0] = 1.0; // 반드시 소비
 }
+
+// ── plans/84 C: q4_hc_a 폴트 최소 재현 (2026-09-20) ──
+// 엔진 밖에서 커널 A의 형상(64스레드·rms·writer·down q8판독+dot4+tree64·inject)을
+// 합성 버퍼로 재현 — 코드젠 결함 vs 런치 경로 판정용.
+extern "C" __global__ void q4_hca_repro(
+        const float* __restrict__ res, const float* __restrict__ wnorm,
+        const unsigned char* __restrict__ wdown, const float* __restrict__ winj,
+        float* __restrict__ lo, float* __restrict__ inj, float* __restrict__ xn,
+        int n, int hc, int r, float eps) {
+    const int o = blockIdx.x;
+    const int l = threadIdx.x;
+    const int total = hc * n;
+    const int n_sub = total >> 5;
+    __shared__ float part[64];
+    float invr[8];
+    for (int s = 0; s < hc; s++) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) { float dv = res[(size_t)s * n + i]; sum += dv * dv; }
+        invr[s] = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    if (o >= r + hc) {
+        int base = (o - r - hc) << 6;
+        int idx = base + l;
+        if (idx < total) {
+            int s = idx / n;
+            float iv = s == 0 ? invr[0] : s == 1 ? invr[1] : s == 2 ? invr[2] : invr[3];
+            xn[idx] = res[idx] * iv * wnorm[idx];
+        }
+        return;
+    }
+    if (o < r) {
+        int cnt = (n_sub + 63 - l) >> 6;
+        int row_base = o * n_sub * 34;
+        const unsigned* w8 = (const unsigned*)wdown;
+        float acc = 0.0f;
+        for (int m = 0; m < cnt; m++) {
+            int sb = l + (m << 6);
+            int wb = row_base + sb * 34;
+            float d = f16w(w8, wb);
+            float vs[32];
+            float amax = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                float v0 = res[(sb << 5) + w * 4 + 0] * invr[(sb<<5)/n];
+                float v1 = res[(sb << 5) + w * 4 + 1] * invr[(sb<<5)/n];
+                float v2 = res[(sb << 5) + w * 4 + 2] * invr[(sb<<5)/n];
+                float v3 = res[(sb << 5) + w * 4 + 3] * invr[(sb<<5)/n];
+                vs[w*4+0]=v0; vs[w*4+1]=v1; vs[w*4+2]=v2; vs[w*4+3]=v3;
+                amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))));
+            }
+            float dq = amax / 127.0f;
+            float id = dq != 0.0f ? 1.0f / dq : 0.0f;
+            unsigned yv[8];
+            #pragma unroll
+            for (int wi = 0; wi < 8; wi++) {
+                float c0, c1, c2, c3;
+                float xv0 = vs[wi*4+0]*id, xv1 = vs[wi*4+1]*id, xv2 = vs[wi*4+2]*id, xv3 = vs[wi*4+3]*id;
+                float r0 = xv0 >= 0.0f ? (float)(int)(xv0 + 0.5f) : -((float)(int)(0.5f - xv0));
+                float r1 = xv1 >= 0.0f ? (float)(int)(xv1 + 0.5f) : -((float)(int)(0.5f - xv1));
+                float r2 = xv2 >= 0.0f ? (float)(int)(xv2 + 0.5f) : -((float)(int)(0.5f - xv2));
+                float r3 = xv3 >= 0.0f ? (float)(int)(xv3 + 0.5f) : -((float)(int)(0.5f - xv3));
+                c0 = r0 > 127.0f ? 127.0f : (r0 < -127.0f ? -127.0f : r0);
+                c1 = r1 > 127.0f ? 127.0f : (r1 < -127.0f ? -127.0f : r1);
+                c2 = r2 > 127.0f ? 127.0f : (r2 < -127.0f ? -127.0f : r2);
+                c3 = r3 > 127.0f ? 127.0f : (r3 < -127.0f ? -127.0f : r3);
+                yv[wi] = ((((unsigned)(int)c0)&0xFFu)) | ((((unsigned)(int)c1)&0xFFu)<<8)
+                       | ((((unsigned)(int)c2)&0xFFu)<<16) | ((((unsigned)(int)c3)&0xFFu)<<24);
+            }
+            float yd = dq;
+            int wq = wb >> 2;
+            bool al = (wb & 3) == 2;
+            int isum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qv;
+                if (al) qv = w8[wq + 1 + k];
+                else qv = (w8[wq + k] >> 16) | (w8[wq + k + 1] << 16);
+                isum = dot4(qv, yv[k], isum);
+            }
+            acc += yd * d * (float)isum;
+        }
+        __shared__ double sh32a[32];
+        double accd = (double)acc;
+        if (l >= 32) sh32a[l - 32] = accd;
+        __syncthreads();
+        if (l < 32) {
+            accd += sh32a[l];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                accd += __shfl_down_sync(0xffffffffffffffffull, accd, off);
+            if (l == 0) lo[o] = (float)accd;
+        }
+        return;
+    }
+    if (l < 32) {
+        const int s = o - r;
+        const float4* r4 = reinterpret_cast<const float4*>(winj + (size_t)s * (size_t)total);
+        float4 a = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = l; k < (total >> 2); k += 32) {
+            float4 rv = r4[k];
+            int base = k << 2;
+            float x0 = res[base] * invr[base / n];
+            a.x += x0 * rv.x;
+        }
+        float acc2 = (a.x + a.y) + (a.z + a.w);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc2 += __shfl_xor_sync(0xffffffffffffffffull, acc2, off);
+        if (l == 0) inj[s] = acc2;
+    }
+}
