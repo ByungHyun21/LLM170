@@ -518,7 +518,7 @@ pub fn new_acc_with_sources(
     parts: Vec<(usize, usize, std::path::PathBuf)>,
 ) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
     if std::env::var("LLM170_GPU_RUNTIME").as_deref() == Ok("vulkan") {
-        return crate::new_q4_acc_vk();
+        return crate::new_q4_acc_vk_with_sources(parts);
     }
     let a = Q4Acc::new_with_sources(parts)?;
     eprintln!(

@@ -104,8 +104,17 @@ enum Slot {
     Silu,
 }
 
+/// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
+/// pread 스테이징으로 수행한다(hip staged_upload 미러).
+struct PartSource {
+    base: usize,
+    len: usize,
+    file: std::fs::File,
+}
+
 pub struct VkAcc {
     ctx: Mutex<VkCtx>,
+    sources: Vec<PartSource>,
     pipes: Mutex<HashMap<Slot, Pipes>>,
     /// 가중치 캐시 (데이터 포인터 → 상주 청크들)
     wcache: Mutex<HashMap<(usize, usize), Vec<VkBuf>>>,
@@ -177,13 +186,25 @@ fn push_u32s(vals: &[u32]) -> Vec<u8> {
 const FRAME_POOL_CAP: usize = 64 << 20;
 impl VkAcc {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_sources(Vec::new())
+    }
+
+    /// 파트 소스 지정판 — `Model4::part_sources()` (plans/86 §6).
+    pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
         llm170_diag::alloc::set_on(llm170_diag::dump::opts().alloc);
+        let sources = parts
+            .into_iter()
+            .filter_map(|(base, len, path)| {
+                std::fs::File::open(&path).ok().map(|file| PartSource { base, len, file })
+            })
+            .collect();
         let ctx = VkCtx::new()?;
         if !ctx.coop_matrix {
             eprintln!("rawvk: coop matrix 미지원 (타일 경로 M3에서 필요)");
         }
         Ok(Self {
             ctx: Mutex::new(ctx),
+            sources,
             pipes: Mutex::new(HashMap::new()),
             wcache: Mutex::new(HashMap::new()),
             tables: Mutex::new(None),
@@ -297,10 +318,26 @@ impl VkAcc {
                 let total = w.data.len();
                 let mut bufs = Vec::new();
                 let mut off = 0usize;
+                // plans/86 §6 — pread 스테이징: 알려진 파트 범위면 mmap 폴트
+                // (4KB 랜덤, 20-180 MB/s) 대신 파일에서 8MiB 순차 pread로
+                // 매핑 버퍼에 직접 채운다(실측 ~1.2 GB/s). 아니면 memcpy 폴백.
+                let src = self.sources.iter().find(|s| {
+                    let p = w.data.as_ptr() as usize;
+                    p >= s.base && p.checked_add(total).is_some_and(|e| e <= s.base + s.len)
+                });
                 while off < total {
                     let n = ch.min(total - off);
                     let mut b = ctx.alloc(n)?;
-                    unsafe { std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n) };
+                    let r = match src {
+                        Some(s) => staged_fill(&s.file, b.ptr, (w.data.as_ptr() as usize - s.base) as u64 + off as u64, n),
+                        None => unsafe {
+                            std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
+                            Ok(())
+                        },
+                    };
+                    if let Err(e) = r {
+                        return Err(format!("가중 스테이징: {e}"));
+                    }
                     ctx.unmap(&mut b)?; // WC 매핑 즉시 해제 — op당 동기 비용 방지
                     bufs.push(b);
                     off += n;
@@ -4357,6 +4394,28 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         report,
         fails
     ))
+}
+
+/// plans/86 §6 — 8MiB 순차 pread로 매핑 버퍼 채우기 (hip staged_upload 미러).
+fn staged_fill(
+    file: &std::fs::File,
+    dst: *mut u8,
+    mut off: u64,
+    len: usize,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    const CH: usize = 8 << 20;
+    let mut done = 0usize;
+    while done < len {
+        let n = CH.min(len - done);
+        unsafe {
+            file.read_exact_at(std::slice::from_raw_parts_mut(dst.add(done), n), off)
+                .map_err(|e| format!("pread {off}: {e}"))?;
+        }
+        done += n;
+        off += n as u64;
+    }
+    Ok(())
 }
 
 /// 프레임 버퍼 원시 포인터(프로브 내부용).
