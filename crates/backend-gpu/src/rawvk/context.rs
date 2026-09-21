@@ -103,6 +103,9 @@ impl VkCtx {
             if exts
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::pipeline_robustness::NAME))
+                && std::env::var("LLM170_VK_NOROBUST").as_deref() != Ok("1")
+                // plans/87 §1 — OOB 접근이 실제 폴트로 터지게 하는 개발 스위치
+                // (기본 robustness는 클램프로 조용히 넘긴다 — 폴트 프로브용).
             {
                 pipeline_robustness = true;
             }
@@ -139,9 +142,15 @@ impl VkCtx {
             let mut v11 = vk::PhysicalDeviceVulkan11Features::default()
                 .storage_buffer16_bit_access(true)
                 .shader_draw_parameters(true);
+            // plans/87 §1 — 버퍼 VA 원장(폴트 매처). 쿼리 전용이지만 활성화가
+            // RADV 할당 경로를 바꿀 수 있어 게이트 4종 재검증이 완료 판정.
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+                .buffer_device_address(true);
             let mut coopfeat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
                 .cooperative_matrix(true);
-            let mut feats = vk::PhysicalDeviceFeatures2::default().push_next(&mut v11);
+            let mut feats = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut v11)
+                .push_next(&mut v12);
             let mut prfeat = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default()
                 .pipeline_robustness(true);
             if pipeline_robustness {
@@ -403,12 +412,19 @@ impl VkCtx {
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
     /// bytes는 max_ssbo 이하 권장 (초과 시 호출부에서 청크 분할).
     pub fn alloc(&mut self, bytes: usize) -> Result<VkBuf, String> {
-        llm170_diag::alloc::record(site::current(), bytes);
+        let site = site::current();
         let r = self.alloc_inner(bytes);
         if r.is_err() && bytes > (1 << 30) {
             // plans/84 B 진단: 대형 버퍼(가중 청크/프레임) 실패 원인 판별.
             let bt = std::backtrace::Backtrace::force_capture();
             eprintln!("# alloc {bytes}B 실패 — 백트레이스:\n{bt}");
+        }
+        // plans/87 §1 — 성공 시 VA 포함 기록(폴트 매처 원장).
+        if let Ok(b) = r.as_ref() {
+            let va = self.buffer_va(b.buf);
+            llm170_diag::alloc::record_va(site, bytes, va, va.saturating_add(bytes as u64));
+        } else {
+            llm170_diag::alloc::record(site, bytes);
         }
         r
     }
@@ -771,6 +787,13 @@ impl VkCtx {
         gy: u32,
         gz: u32,
     ) -> Result<(), String> {
+        // plans/87 §2/§3 — 진동 + op 태그(와치독 링·ts 라벨).
+        llm170_diag::alloc::HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tag = crate::rawvk::context::site::tag();
+        llm170_diag::watchdog::record_op(tag);
+        if let Some(ts) = &self.ts {
+            ts.labels.borrow_mut().push(tag.to_string());
+        }
         unsafe {
             if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
                 self.device
@@ -855,6 +878,12 @@ impl VkCtx {
         }
     }
 
+
+    /// plans/87 §1 — 버퍼 디바이스 주소(폴트 매처 원장용).
+    pub fn buffer_va(&self, b: vk::Buffer) -> u64 {
+        let ai = vk::BufferDeviceAddressInfo::default().buffer(b);
+        unsafe { self.device.get_buffer_device_address(&ai) }
+    }
 
     /// 쿼리풀 타임스탬프 1개 기록 (ts 활성 시).
     fn ts_stamp(&self, cb: vk::CommandBuffer, stage: vk::PipelineStageFlags) {
@@ -1003,11 +1032,23 @@ impl VkCtx {
 
 /// plans/86 §5 — 할당 사이트 태그(스레드 로컬 스코프). diag 원장이
 /// 어느 서브시스템이 예산을 쓰는지 구분한다. 기본 "misc".
+/// plans/87 §2/§3 — op 태그(와치독 링·슬롯 타임 라벨)도 함께 산다.
 pub mod site {
     use std::cell::Cell;
 
     thread_local! {
         static CUR: Cell<&'static str> = const { Cell::new("misc") };
+        static TAG: Cell<&'static str> = const { Cell::new("op?") };
+    }
+
+    /// 직전 pipeline() 조회의 op 태그 — run() 경로가 와치독/타임스탬프에
+    /// 기록한다. 호출부는 VkAcc::pipeline(슬롯 이름 공급).
+    pub fn set_tag(t: &'static str) {
+        TAG.with(|c| c.set(t));
+    }
+
+    pub fn tag() -> &'static str {
+        TAG.with(|c| c.get())
     }
 
     /// 스코프 가드 — 지정 사이트로 전환, 드롭 시 복원.
