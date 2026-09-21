@@ -54,6 +54,17 @@ uint WG(uint idx) {
     return w7c[o];
 }
 
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
 // kvalues_iq4nl (xs·nl 공용 LUT)
 int KVAL(int nib) {
     const int kv[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
@@ -90,7 +101,18 @@ void main() {
     uint64_t wbase = uint64_t(ids[r]) * uint64_t(pc.per_expert) + uint64_t(o) * uint64_t(row_bytes);
     wr0 = uint(wbase >> 2u);
     uint wr1 = uint((wbase + uint64_t(row_bytes) + 3u) >> 2u);
-    for (uint wi = wr0 + l; wi < wr1; wi += NT) sh[wi - wr0] = WG(wi);
+    // plans/88 P2 — 행 로컬 리졸버 상승: 행(≤수KB)은 최대 1 청크 경계만
+    // 가로지른다 — 청크 산술을 행당 1회로 하고 워드당 분기만 남긴다.
+    {
+        uint c0 = wr0 / pc.chunk_words;
+        uint lim = (c0 + 1u) * pc.chunk_words;
+        if (wr1 <= lim) {
+            uint o0 = wr0 - c0 * pc.chunk_words;
+            for (uint wi = l; wi < (wr1 - wr0); wi += NT) sh[wi] = Wsel(c0, o0 + wi);
+        } else {
+            for (uint wi = wr0 + l; wi < wr1; wi += NT) sh[wi - wr0] = WG(wi);
+        }
+    }
     barrier();
 
     float acc = 0.0;

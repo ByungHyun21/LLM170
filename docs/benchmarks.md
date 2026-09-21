@@ -1075,3 +1075,27 @@ ERROR_DEVICE_LOST. The historical device-lost repro is resolved.
   tg128 18.83 t/s, gates unchanged. hipGraph replay measured
   numerically-identical but performance-neutral on the frame decode —
   its 11.3ms step gaps are host-side dispatch, not launch latency.
+
+## 2026-09-22 (plans/88) — FN Vulkan MoE: direct-ids + grouped tiles
+
+Solo, greedy, same conditions as the tables above. The plans/88 work
+replaced the decode MoE orchestration (ids d2h + host grouping +
+512-expert loop) with a device direct-ids GEMV, batched the frame
+step (2548 -> 6 submits/step), moved f32/BF16 group members onto the
+GPU, and gave prefill a device-grouped 16x16 tile GEMM plus K-sliced
+dense tiles (the token-loop gemv re-read ran at ~5GB/s).
+
+| FN metric | before | after |
+|---|---|---|
+| pp512 (ctx 20480) | 10.4 t/s | 60.1 t/s |
+| pp4096 (ctx 20480) | 10.2 t/s | 54.7 t/s |
+| tg128@4k | 2.25 t/s | 7.15 t/s |
+
+Correctness: MoE tile outputs bit-identical to the direct-ids and
+legacy per-expert paths (element-wise cross-check at 2100 rows);
+chunk fence 16/63/64 bits-identical on vulkan; FAILAT abort-point
+independence 0/1/12/24/47; ledger 77.0 GiB, untracked 0. The vk gate
+baseline was re-recorded per the 86 §8 procedure: the dense-prefill
+tile changes the reduction class, cross-justified via ckdiff
+(ulp-cascade) and by the new stream matching the hip runtime's
+current tie resolution 9 tokens deep.
