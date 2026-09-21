@@ -139,6 +139,8 @@ pub struct VkAcc {
     qk_consts: Mutex<HashMap<(usize, usize), VkBuf>>,
     /// plans/86 §4 — QSA 업로드 판 스크래치 (ck, cv, sel_idx, sel_off) — 성장 재할당.
     qsa_up_bufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
+    /// plans/86 §4 — idx_append ikw 고정 스크래시(호출부가 매번 새 Vec).
+    qsa_ikw: Mutex<Option<VkBuf>>,
     qsa_ctx: std::sync::atomic::AtomicUsize,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
@@ -199,6 +201,7 @@ impl VkAcc {
             argmax_bufs: Mutex::new(None),
             qk_consts: Mutex::new(HashMap::new()),
             qsa_up_bufs: Mutex::new(None),
+            qsa_ikw: Mutex::new(None),
             qsa_pools: Mutex::new(HashMap::new()),
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
@@ -824,12 +827,19 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let b0 = pos0 / r;
         let b1 = (pos0 + t) / r;
         if b1 > b0 {
-            // ikw/cs 상수 업로드(호스트 f32 — 호출마다 작음) + 블록키 갱신.
-            let ikw_b = ctx.alloc_host(ikw.len() * 4)?;
+            // plans/86 §4 — 상수 업로드 캐시: cs 전체 표는 (ptr,len) 키로 1회
+            // (셰이더 cs 인덱싱이 절대 pos 기반이라 접두 복사 불필요), ikw 는
+            // 호출부가 매번 새 Vec을 만들어 고정 스크래치에 복사(512B).
+            // 종전 매호출 alloc_host 두 개는 블록 완성마다 GTT에 누출했다.
+            let cs_b = self.qk_const(&mut ctx, cs_idx)?;
+            let ikw_b = {
+                let mut g = self.qsa_ikw.lock();
+                if !g.as_ref().is_some_and(|b| b.bytes >= ikw.len() * 4) {
+                    *g = Some(ctx.alloc_host((ikw.len() * 4).max(4096))?);
+                }
+                g.as_ref().unwrap().clone()
+            };
             unsafe { std::ptr::copy_nonoverlapping(ikw.as_ptr(), ikw_b.ptr as *mut f32, ikw.len()) };
-            let cs_len = (b1 * r) * (idx_dim / 2) * 2;
-            let cs_b = ctx.alloc_host(cs_len * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(cs_idx[..cs_len].as_ptr(), cs_b.ptr as *mut f32, cs_len) };
             let p2 = self.pipeline(&mut ctx, Slot::FnIdxBk)?;
             let ds2 = ctx.bind_ds(&p2, &[ikb, bkb, ikw_b.buf, cs_b.buf])?;
             // plans/85 §2: 셰이더 PC는 선언순 {eps, b0, r, idx_dim} — 종전
@@ -1153,6 +1163,19 @@ impl llm170_core::matmul::QsaOps for VkAcc {
 }
 
 impl VkAcc {
+    /// plans/86 §2/§4 — (ptr,len) 키 상수 상주 업로드. 프레임이 테이블 Vec을
+    /// 스텝 간 유지하므로 포인터가 곧 신원(호출부가 새 Vec을 만들면 미스).
+    fn qk_const(&self, ctx: &mut VkCtx, v: &[f32]) -> Result<VkBuf, String> {
+        let key = (v.as_ptr() as usize, v.len());
+        if let Some(b) = self.qk_consts.lock().get(&key) {
+            return Ok(b.clone());
+        }
+        let b = ctx.alloc_host(v.len().max(1) * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr as *mut f32, v.len()) };
+        self.qk_consts.lock().insert(key, b.clone());
+        Ok(b)
+    }
+
     /// plans/86 §4 — sel_idx/sel_off 업로드 스크래치(성장 재할당, 매호출 alloc 회피).
     fn qsa_sel_scratch(&self, ctx: &mut VkCtx, si: usize, so: usize) -> Result<(VkBuf, VkBuf), String> {
         let mut g = self.qsa_up_bufs.lock();
@@ -1473,20 +1496,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             return Err(format!("vk frame_qk_norm_rope: hd={hd} (≤256 전용)"));
         }
         let mut ctx = self.ctx.lock();
-        // 상자 상수 업로드 — GTT(alloc_host)는 일관성 코히런트라 매핑 유지.
-        let mut up = |m: &Mutex<HashMap<(usize, usize), VkBuf>>, v: &[f32]| -> Result<VkBuf, String> {
-            let key = (v.as_ptr() as usize, v.len());
-            if let Some(b) = m.lock().get(&key) {
-                return Ok(b.clone());
-            }
-            let b = ctx.alloc_host(v.len().max(1) * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr as *mut f32, v.len()) };
-            m.lock().insert(key, b.clone());
-            Ok(b)
-        };
-        let qnb = up(&self.qk_consts, q_norm)?;
-        let knb = up(&self.qk_consts, k_norm)?;
-        let csb = up(&self.qk_consts, cs)?;
+        let qnb = self.qk_const(&mut ctx, q_norm)?;
+        let knb = self.qk_const(&mut ctx, k_norm)?;
+        let csb = self.qk_const(&mut ctx, cs)?;
         let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
         let p = self.pipeline(&mut ctx, Slot::FnQkNormRope)?;
         let ds2 = ctx.bind_ds(&p, &[qb, kb, qnb.buf, knb.buf, csb.buf])?;
