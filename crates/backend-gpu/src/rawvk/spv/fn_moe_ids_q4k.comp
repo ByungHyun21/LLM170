@@ -1,0 +1,125 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// MoE direct-ids GEMM — q4_K (plans/88 P1). hip q4_gemm_q4k_ge_ids 직역:
+// 그리드 (⌈n_out/16⌉, ⌈rows/16⌉, ksplit), 16×16 스레드 — 스레드당 (o,r) full-K.
+// 커널이 ids[r]을 직접 읽어 가중 베이스 = e·per_expert 를 산출한다(호스트
+// 그룹화·gather·scatter 소거). ksplit>1이면 부분합을 part(f64)에 남기고
+// fn_moe_ids_reduce 가 k 오름차순으로 합산(결정적).
+// 산술: hip ge열과 동일 표현식 — dot4는 정수(순서 무관), 부동 acc 순서는
+// it/sIdx 오름차순 직렬. 가중 청크 분산 읽기(WG)는 gemv3 규약.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Ids { uint ids[]; };
+layout(binding = 9) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 10) buffer Part { double part[]; };
+layout(binding = 11) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint rows; uint per_expert_bytes;
+    uint chunk_words; uint xq_w;
+} pc;
+
+uint WG(uint idx) {
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+void main() {
+    int ox = int(gl_LocalInvocationID.x);
+    int rx = int(gl_LocalInvocationID.y);
+    int o = int(gl_WorkGroupID.x) * 16 + ox;
+    int r = int(gl_WorkGroupID.y) * 16 + rx;
+    if (o >= int(pc.n_out) || r >= int(pc.rows)) return;
+    int n_in = int(pc.n_in);
+    int n_super = n_in >> 8;
+    uint e = ids[uint(r)];
+    // 가중 행 베이스(바이트) — 전문가 스택 전체가 청크 버퍼에 상주하므로
+    // 디스크립터 오프셋 정렬 문제가 없다(86 §4 교훈 회피).
+    uint64_t wbase = uint64_t(e) * uint64_t(pc.per_expert_bytes)
+                   + uint64_t(o) * uint64_t(n_super * 144);
+    uint xr0 = uint(r) * pc.xq_w;
+    uint xw_base = uint(n_in >> 2);
+    const uint ones = 0x01010101u;
+    int ksplit = int(gl_NumWorkGroups.z);
+    int s0 = int((uint64_t(n_super) * gl_WorkGroupID.z) / uint64_t(ksplit));
+    int s1 = int((uint64_t(n_super) * (gl_WorkGroupID.z + 1u)) / uint64_t(ksplit));
+    float acc = 0.0;
+    for (int sIdx = s0; sIdx < s1; sIdx++) {
+        uint wq = uint((wbase + uint64_t(sIdx) * 144u) >> 2);
+        vec2 dd = unpackHalf2x16(WG(wq));
+        float d = dd.x, dmin = dd.y;
+        uint sc0 = WG(wq + 1u), sc1 = WG(wq + 2u), sc2 = WG(wq + 3u);
+        for (int it = 0; it < 4; it++) {
+            uint q[8];
+            for (int m = 0; m < 8; m++) q[m] = WG(wq + 4u + uint(it * 8 + m));
+            int j1 = 2 * it;
+            int j2 = 2 * it + 1;
+            uint r1 = uint(j1 & 3) * 8u;
+            uint r2 = uint(j2 & 3) * 8u;
+            uint b1_j  = j1 < 4 ? (sc0 >> r1) & 0xFFu : (sc1 >> r1) & 0xFFu;
+            uint b1_j4 = j1 < 4 ? (sc1 >> r1) & 0xFFu : (sc2 >> r1) & 0xFFu;
+            uint b1_jm4 = (sc0 >> r1) & 0xFFu;
+            uint s1v, m1v;
+            if (j1 < 4) { s1v = b1_j & 63u; m1v = b1_j4 & 63u; }
+            else {
+                s1v = (b1_j4 & 0xFu) | ((b1_jm4 >> 6) << 4);
+                m1v = (b1_j4 >> 4) | ((b1_j >> 6) << 4);
+            }
+            uint b2_j  = j2 < 4 ? (sc0 >> r2) & 0xFFu : (sc1 >> r2) & 0xFFu;
+            uint b2_j4 = j2 < 4 ? (sc1 >> r2) & 0xFFu : (sc2 >> r2) & 0xFFu;
+            uint b2_jm4 = (sc0 >> r2) & 0xFFu;
+            uint s2v, m2v;
+            if (j2 < 4) { s2v = b2_j & 63u; m2v = b2_j4 & 63u; }
+            else {
+                s2v = (b2_j4 & 0xFu) | ((b2_jm4 >> 6) << 4);
+                m2v = (b2_j4 >> 4) | ((b2_j >> 6) << 4);
+            }
+            // x1 = xr + sIdx*64 + it*16 (워드), x2 = x1 + 8 — hip ge와 동일 배치.
+            uint x1w = xr0 + uint(sIdx * 64 + it * 16);
+            uint x2w = x1w + 8u;
+            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            for (int m = 0; m < 8; m++) {
+                uint y1 = xq[x1w + uint(m)];
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
+                qs1 += dot4(ones, y1, 0);
+                uint y2 = xq[x2w + uint(m)];
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                qs2 += dot4(ones, y2, 0);
+            }
+            float yd1 = uintBitsToFloat(xq[xw_base + uint(sIdx * 8 + 2 * it)]);
+            float yd2 = uintBitsToFloat(xq[xw_base + uint(sIdx * 8 + 2 * it + 1)]);
+            acc += yd1 * (d * float(s1v) * float(il1) - dmin * float(m1v) * float(qs1));
+            acc += yd2 * (d * float(s2v) * float(il2) - dmin * float(m2v) * float(qs2));
+        }
+    }
+    if (ksplit > 1) {
+        part[(uint(r) * pc.n_out + uint(o)) * uint(ksplit) + gl_WorkGroupID.z] = double(acc);
+    } else {
+        outv[uint(r) * pc.n_out + uint(o)] = acc;
+    }
+}
