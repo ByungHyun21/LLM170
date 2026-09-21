@@ -25,6 +25,8 @@ pub struct DumpOpts {
     pub moe: bool,
     /// alloc — GPU 버퍼 할당 원장(plans/86 §5).
     pub alloc: bool,
+    /// vaddr — 할당 tsv(VA 범위) 증분 기록(plans/87 §1).
+    pub vaddr: bool,
 }
 
 impl DumpOpts {
@@ -53,6 +55,9 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
             o.checksum = true;
         } else if key == "alloc" {
             o.alloc = true;
+        } else if key == "vaddr" {
+            o.alloc = true;
+            o.vaddr = true;
         }
     }
     o

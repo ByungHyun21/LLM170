@@ -11,6 +11,7 @@ pub mod fp;
 pub mod span;
 pub mod dump;
 pub mod alloc;
+pub mod watchdog;
 
 pub use trace::Ev;
 pub use trace::capture_on;
