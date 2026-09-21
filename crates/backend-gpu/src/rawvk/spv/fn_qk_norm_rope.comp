@@ -1,0 +1,76 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+// plans/86 §2 — QSA q/k norm+rope in-place (hip qk_norm_rope 동일열).
+// 워크그룹 32스레드 = (행, 토큰) 1개. 행 r0 < n_head 는 q(레이아웃
+// [t][n_head·2hd], q‖gate 인터리브 — 헤드 폭 2hd 중 앞 hd만 q), 나머지는
+// k([t][n_kv·hd]). norm 가중은 헤드별 타일(qw[r0·hd..]) — 공유 [hd] 원본을
+// 올리면 OOB(85 함정). f32 부분합 32개 → f64 순차합(호스트 ops.rs rms_norm
+// 동일 순서), 로프 회전 f64. k에는 kq_scale(=1.0, QSA 무척도 규약)을 구운다.
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer Qbuf { float xq[]; };
+layout(binding = 1) buffer Kbuf { float xk[]; };
+layout(binding = 2) readonly buffer Qw { float qw[]; };
+layout(binding = 3) readonly buffer Kw { float kw[]; };
+layout(binding = 4) readonly buffer Cs { float cs[]; };
+layout(push_constant) uniform PC {
+    float eps; float kqs; int pos; int n_head; int n_kv; int hd; int n_rot;
+} pc;
+shared float sh_part[32];
+shared float sh_v[32][8];
+void main() {
+    int r0 = int(gl_WorkGroupID.x);
+    int u = int(gl_LocalInvocationID.x);
+    int y = int(gl_WorkGroupID.y);
+    if (r0 >= pc.n_head + pc.n_kv) return;
+    bool is_q = r0 < pc.n_head;
+    int half_ = pc.n_rot >> 1;
+    int csbase = (pc.pos + y) * half_ * 2;
+    int row_base = is_q ? y * (pc.n_head * 2 * pc.hd) + r0 * 2 * pc.hd
+                        : y * (pc.n_kv * pc.hd) + (r0 - pc.n_head) * pc.hd;
+    int chunk = (pc.hd + 31) >> 5;
+    float mypart = 0.0;
+    int lo = u * chunk;
+    int hi = min(lo + chunk, pc.hd);
+    for (int i = lo; i < hi; i++) {
+        float dv = is_q ? xq[row_base + i] : xk[row_base + i];
+        mypart += dv * dv;
+    }
+    sh_part[u] = mypart;
+    barrier();
+    double sum = 0.0lf;
+    for (int uu = 0; uu < 32; uu++) sum += double(sh_part[uu]);
+    float scale = 1.0 / float(sqrt(sum / double(pc.hd) + double(pc.eps)));
+    int per = (pc.hd + 31) / 32;   // 레인당 원소 수(스테이징 폭과 동일 산술)
+    const float wbase = is_q ? 1.0 : pc.kqs;
+    for (int j = 0; j < per; j++) {
+        int i = u + j * 32;
+        if (i < pc.hd) {
+            float v = (is_q ? xq[row_base + i] : xk[row_base + i]) * scale;
+            v *= is_q ? qw[r0 * pc.hd + i] : kw[(r0 - pc.n_head) * pc.hd + i];
+            v *= wbase;
+            sh_v[u][j] = v;
+        }
+    }
+    barrier();
+    // 스테이징 → 버퍼 기입(로프 직전 전원 가시).
+    for (int j = 0; j < per; j++) {
+        int i = u + j * 32;
+        if (i < pc.hd) {
+            if (is_q) xq[row_base + i] = sh_v[u][j];
+            else xk[row_base + i] = sh_v[u][j];
+        }
+    }
+    barrier();
+    for (int p = u; p < half_; p += 32) {
+        double c = double(cs[csbase + p * 2]);
+        double sf = double(cs[csbase + p * 2 + 1]);
+        int a = row_base + p, b = a + half_;
+        double x0, x1;
+        if (is_q) { x0 = double(xq[a]); x1 = double(xq[b]); }
+        else { x0 = double(xk[a]); x1 = double(xk[b]); }
+        float ra = float(x0 * c - x1 * sf);
+        float rb = float(x0 * sf + x1 * c);
+        if (is_q) { xq[a] = ra; xq[b] = rb; }
+        else { xk[a] = ra; xk[b] = rb; }
+    }
+}
