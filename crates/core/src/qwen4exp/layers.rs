@@ -685,6 +685,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             || self.frame_broken
             || std::env::var_os("LLM170_FRAME").is_none()
             || !std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
+            || !self.acc.as_ref().is_some_and(|a| a.frame_capable())
         {
             let l = self.decode1(seq, token)?;
             return Ok(crate::qwen35::greedy(&l));
@@ -808,6 +809,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         // 발생해 상태 오염 전에 중단된다.
         let frame_on = self.acc.is_some()
             && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
         let frame_try = if frame_on {

@@ -1,0 +1,32 @@
+#version 450
+// plans/85 §2 — 블록 점수(hip q4_idx_score 동일열): 스레드당 블록 1개.
+// 헤드별 4누산 도트 (d0+d1)+(d2+d3), relu 가산. iqr은 [t][heads][dim]
+// (t=1 디코드 — qh = h*idx_dim).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Iqr { float iqr[]; };
+layout(binding = 1) readonly buffer Bk { float bk[]; };
+layout(binding = 2) buffer Scr { float scores[]; };
+layout(push_constant) uniform PC {
+    uint n_blocks; uint idx_heads; uint idx_dim;
+} pc;
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.n_blocks) return;
+    uint pk = b * pc.idx_dim;
+    float score = 0.0;
+    for (uint h = 0u; h < pc.idx_heads; h++) {
+        uint qh = h * pc.idx_dim;
+        float d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+        uint i2 = 0u;
+        for (; i2 + 4u <= pc.idx_dim; i2 += 4u) {
+            d0 += iqr[qh + i2] * bk[pk + i2];
+            d1 += iqr[qh + i2 + 1u] * bk[pk + i2 + 1u];
+            d2 += iqr[qh + i2 + 2u] * bk[pk + i2 + 2u];
+            d3 += iqr[qh + i2 + 3u] * bk[pk + i2 + 3u];
+        }
+        for (; i2 < pc.idx_dim; i2++) d0 += iqr[qh + i2] * bk[pk + i2];
+        float dot = (d0 + d1) + (d2 + d3);
+        if (dot > 0.0) score += dot;
+    }
+    scores[b] = score;
+}

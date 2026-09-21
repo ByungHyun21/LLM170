@@ -48,6 +48,13 @@ const FN_GDN_AR_SWAP_SPV: &[u8] = include_bytes!("spv/fn_gdn_ar_swap.spv");
 /// plans/84 B — FN QSA: 선택 어텐션 + 인덱서 블록키 갱신.
 const FN_QSA_ATTN_SEL_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel.spv");
 const FN_IDX_BK_SPV: &[u8] = include_bytes!("spv/fn_idx_bk_update.spv");
+/// plans/85 §2 — FN QSA 디코드 선택: q norm+rope → 블록 점수 → 순위 → 전개.
+const FN_IDX_Q_ROPE_SPV: &[u8] = include_bytes!("spv/fn_idx_q_rope.spv");
+const FN_IDX_SCORE_SPV: &[u8] = include_bytes!("spv/fn_idx_score.spv");
+const FN_IDX_RANK_SPV: &[u8] = include_bytes!("spv/fn_idx_rank.spv");
+const FN_IDX_EXPAND_SPV: &[u8] = include_bytes!("spv/fn_idx_expand.spv");
+/// plans/85 §2 — 프레임 로짓 행별 GPU argmax(동률 최저 인덱스).
+const FN_ARGMAX_ROWS_SPV: &[u8] = include_bytes!("spv/fn_argmax_rows.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -81,8 +88,15 @@ enum Slot {
     FnGdnArSwap,
     FnQsaAttnSel,
     FnIdxBk,
+    /// plans/85 §2 — QSA 디코드 선택 체인(q_rope/score/rank/expand).
+    FnIdxQRope,
+    FnIdxScore,
+    FnIdxRank,
+    FnIdxExpand,
     Quant,
     Rms,
+    /// plans/85 §2 — 프레임 로짓 행별 argmax(2단계).
+    FnArgmaxRows,
     Silu,
 }
 
@@ -109,6 +123,10 @@ pub struct VkAcc {
     /// 종전 frame_free는 종료까지 누출 — 디코드 스텝 스크래치(shexp 등)가
     /// 매층·매스텝 할당되므로 상한 내에서 재활용한다.
     frame_pool: Mutex<Vec<VkBuf>>,
+    /// plans/85 §2 — QSA 디코드 선택 스크래치 (iqr, scr, flg, iqw, cs, sdev, ofdev).
+    qsa_sel_bufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf, VkBuf)>>,
+    /// plans/85 §2 — 프레임 argmax 스크래치 (sc, out).
+    argmax_bufs: Mutex<Option<(VkBuf, VkBuf)>>,
     /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
     /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
@@ -118,6 +136,10 @@ pub struct VkAcc {
     frame_t: std::sync::atomic::AtomicUsize,
 }
 
+/// 빈 VkBuf 자리표 — 풀 엔트리 지연 생성용.
+fn vkbuf_null() -> VkBuf {
+    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() }
+}
 fn vk_ty(ty: GgmlType) -> Option<u32> {
     match ty {
         GgmlType::Q5K => Some(13),
@@ -164,7 +186,9 @@ impl VkAcc {
             gobufs: Mutex::new(Vec::new()),
             framebufs: Mutex::new(HashMap::new()),
             frame_pool: Mutex::new(Vec::new()),
+            qsa_sel_bufs: Mutex::new(None),
             moebufs: Mutex::new(None),
+            argmax_bufs: Mutex::new(None),
             qsa_pools: Mutex::new(HashMap::new()),
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
@@ -189,7 +213,6 @@ impl VkAcc {
             Slot::AxpyT => (AXPY_T_SPV, 3, 8),        // 2×u32
             Slot::MoeTop10 => (MOE_TOP10_SPV, 3, 8),  // 2×u32
             Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
-            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 12),  // row_src,row_dst,rows
             Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
             Slot::MoeGatherRows => (MOE_GATHER_SPV, 2, 12),
             Slot::HcGateMean => (HC_GATE_MEAN_SPV, 3, 12),
@@ -205,7 +228,13 @@ impl VkAcc {
             Slot::L2Rows2Scale => (L2_ROWS2_SPV, 2, 24),   // u32,u32,f32,f32
             Slot::FnGdnArSwap => (FN_GDN_AR_SWAP_SPV, 6, 28),
             Slot::FnQsaAttnSel => (FN_QSA_ATTN_SEL_SPV, 6, 24),
+            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 12),  // row_src,row_dst,rows
+            Slot::FnIdxScore => (FN_IDX_SCORE_SPV, 3, 12), // 3×u32
             Slot::FnIdxBk => (FN_IDX_BK_SPV, 4, 20),         // f32 + 3×u32
+            Slot::FnIdxQRope => (FN_IDX_Q_ROPE_SPV, 4, 8),    // f32 + u32
+            Slot::FnIdxRank => (FN_IDX_RANK_SPV, 2, 8),      // 2×u32
+            Slot::FnIdxExpand => (FN_IDX_EXPAND_SPV, 3, 16), // 4×u32
+            Slot::FnArgmaxRows => (FN_ARGMAX_ROWS_SPV, 3, 12), // 3×u32
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
@@ -742,11 +771,17 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let nb_max = ctx_len / r + 1;
         {
             let mut m = self.qsa_pools.lock();
-            let w = &mut m.get_mut(&(full_idx, seq)).map(|e| e.4).unwrap_or(0);
-            if pos0 > *w {
-                return Err(format!("vk qsa_idx_append: 워터마크 구멍 w={w} pos0={pos0}"));
+            // plans/85 §2: entry()로 생성+실제 갱신 — 종전 `&mut get_mut().map()
+            // .unwrap_or(0)`는 임시값에 써서 워터마크가 영구 반영되지 않았고
+            // (kv_dev가 대신 갱신해 온 것), 엔트리 없으면 아래 get_mut().unwrap()
+            // 이 패닉했다(np 디코드: sel_dev가 kv_dev보다 먼저 append 호출).
+            let e = m
+                .entry((full_idx, seq))
+                .or_insert_with(|| (vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null(), 0));
+            if pos0 > e.4 {
+                return Err(format!("vk qsa_idx_append: 워터마크 구멍 w={} pos0={pos0}", e.4));
             }
-            *w = pos0 + t;
+            e.4 = pos0 + t;
         }
         // idx_k 풀은 kv 풀과 별도 용량 — 필요시 성장(간단 재할당).
         let mut ctx = self.ctx.lock();
@@ -783,8 +818,11 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             unsafe { std::ptr::copy_nonoverlapping(cs_idx[..cs_len].as_ptr(), cs_b.ptr as *mut f32, cs_len) };
             let p2 = self.pipeline(&mut ctx, Slot::FnIdxBk)?;
             let ds2 = ctx.bind_ds(&p2, &[ikb, bkb, ikw_b.buf, cs_b.buf])?;
-            let mut push = push_u32s(&[b0 as u32, r as u32, idx_dim as u32]);
-            push.extend_from_slice(&eps.to_le_bytes());
+            // plans/85 §2: 셰이더 PC는 선언순 {eps, b0, r, idx_dim} — 종전
+            // [b0,r,idx_dim,eps]는 멤버가 전부 어긋나 idx_dim≠128 조기복귀로
+            // 블록키가 한 번도 갱신되지 않았다(항등 선택이라 프리필은 무영향).
+            let mut push = eps.to_le_bytes().to_vec();
+            push.extend_from_slice(&push_u32s(&[b0 as u32, r as u32, idx_dim as u32]));
             ctx.run(p2.pl, ds2, p2.pipe, &push, (b1 - b0) as u32, 1, 1)?;
         }
         Ok(())
@@ -832,6 +870,188 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         Ok(())
     }
 
+    /// plans/85 §2 — 디코드(t=1) 선택의 디바이스판: ik 적립+블록키 갱신(기존
+    /// qsa_idx_append_dev) → iq norm+rope → 블록 점수 → 순위 → 목록 전개.
+    /// 산술은 hip qsa_sel_dev와 동일열(f64 순차 rms, f64 회전, 4누산 도트,
+    /// 정수 순위) — 선택 목록이 호스트 top-k와 비트 일치.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        iq: u64,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_heads: usize,
+        idx_dim: usize,
+        r: usize,
+        idx_top_k: usize,
+        iqw: &[f32],
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        if t != 1 {
+            return Err(format!("vk qsa_sel_dev: t={t} (디코드 전용)"));
+        }
+        if r == 0 {
+            return Err("vk qsa_sel_dev: r=0".into());
+        }
+        if idx_dim != 128 {
+            return Err(format!("vk qsa_sel_dev: idx_dim={idx_dim} (128 전용)"));
+        }
+        let n_past = pos0 + t;
+        let n_blocks = n_past / r;
+        // (1) ik 적립 + 완성 블록 키 — 기존 구현(워터마크 규약 공유).
+        self.qsa_idx_append_dev(full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
+        // n_sel 산술은 stages::qsa_select 패스 B와 동일(정수 — 무동기).
+        let tail_start = n_blocks * r;
+        let tail_cnt = n_past - tail_start;
+        let width = n_past.min(idx_top_k + r - 1);
+        let n_sel = ((width - tail_cnt) / r).min(n_blocks);
+        let list_len = n_sel * r + tail_cnt;
+        let iqr_bytes = t * idx_heads * idx_dim * 4;
+        let scr_bytes = n_blocks.max(1) * 4;
+        let sd_bytes = list_len.max(1) * 4;
+        let mut ctx = self.ctx.lock();
+        // 스크래치 — 필요시 성장 재할당(매 호출 alloc_host 누출 회피).
+        {
+            let mut g = self.qsa_sel_bufs.lock();
+            let need = match g.as_ref() {
+                None => true,
+                Some(b) => {
+                    b.0.bytes < iqr_bytes
+                        || b.1.bytes < scr_bytes
+                        || b.2.bytes < scr_bytes
+                        || b.3.bytes < iqw.len() * 4
+                        || b.4.bytes < idx_dim * 4
+                        || b.5.bytes < sd_bytes
+                }
+            };
+            if need {
+                *g = Some((
+                    ctx.alloc_host(iqr_bytes.max(1 << 16))?,
+                    ctx.alloc_host(scr_bytes.max(4096))?,
+                    ctx.alloc_host(scr_bytes.max(4096))?,
+                    ctx.alloc_host((iqw.len() * 4).max(4096))?,
+                    ctx.alloc_host((idx_dim * 4).max(1 << 16))?,
+                    ctx.alloc_host(sd_bytes.max(1 << 16))?,
+                    ctx.alloc_host(8)?,
+                ));
+            }
+        }
+        let (iqr, scr, flg, iqwb, csb, sdev, ofdev) = {
+            let g = self.qsa_sel_bufs.lock();
+            let b = g.as_ref().unwrap();
+            (b.0.clone(), b.1.clone(), b.2.clone(), b.3.clone(), b.4.clone(), b.5.clone(), b.6.clone())
+        };
+        // 호스트 상수(매 호출 소량) — iqw 전체, cs는 pos0행 idx_dim.
+        unsafe {
+            std::ptr::copy_nonoverlapping(iqw.as_ptr(), iqwb.ptr as *mut f32, iqw.len());
+            std::ptr::copy_nonoverlapping(
+                cs_idx[pos0 * idx_dim..].as_ptr(),
+                csb.ptr as *mut f32,
+                idx_dim,
+            );
+        }
+        // (2) iq norm+rope — 워크그룹 = (헤드, 토큰), 32스레드.
+        let iqb = self.fbuf(iq)?;
+        {
+            // PC 선언순 {eps, idx_dim} — cs 인덱싱은 업로드 상대(행 y).
+            let p = self.pipeline(&mut ctx, Slot::FnIdxQRope)?;
+            let ds = ctx.bind_ds(&p, &[iqb, iqr.buf, iqwb.buf, csb.buf])?;
+            let mut push = eps.to_le_bytes().to_vec();
+            push.extend_from_slice(&push_u32s(&[idx_dim as u32]));
+            ctx.run(p.pl, ds, p.pipe, &push, idx_heads as u32, t as u32, 1)?;
+        }
+        let bkb = {
+            let m = self.qsa_pools.lock();
+            m.get(&(full_idx, seq))
+                .map(|e| e.3.buf)
+                .ok_or("vk qsa_sel_dev: bk 풀 없음")?
+        };
+        if n_blocks > 0 {
+            // (3) 블록 점수 — 스레드당 블록.
+            let p = self.pipeline(&mut ctx, Slot::FnIdxScore)?;
+            let ds = ctx.bind_ds(&p, &[iqr.buf, bkb, scr.buf])?;
+            let push = push_u32s(&[n_blocks as u32, idx_heads as u32, idx_dim as u32]);
+            ctx.run(p.pl, ds, p.pipe, &push, (n_blocks as u32).div_ceil(256), 1, 1)?;
+            // (4) 순위 — 결정적 top-k(점수 내림, 인덱스 오름).
+            let p = self.pipeline(&mut ctx, Slot::FnIdxRank)?;
+            let ds = ctx.bind_ds(&p, &[scr.buf, flg.buf])?;
+            let push = push_u32s(&[n_blocks as u32, n_sel as u32]);
+            ctx.run(p.pl, ds, p.pipe, &push, (n_blocks as u32).div_ceil(256), 1, 1)?;
+        }
+        // (5) 목록 전개 — 단일 워크그룹(무공유메모리 판).
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnIdxExpand)?;
+            let ds = ctx.bind_ds(&p, &[flg.buf, sdev.buf, ofdev.buf])?;
+            let push = push_u32s(&[n_blocks as u32, n_sel as u32, r as u32, n_past as u32]);
+            ctx.run(p.pl, ds, p.pipe, &push, 1, 1, 1)?;
+        }
+        Ok((sdev.buf.as_raw(), ofdev.buf.as_raw(), list_len))
+    }
+
+    /// plans/73 SELCHECK 진단 — qsa_sel_dev가 만든 목록을 호스트로 내린다.
+    fn qsa_sel_readback(
+        &self,
+        sel_idx: u64,
+        sel_off: u64,
+        list_len: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), String> {
+        {
+            let mut c = self.ctx.lock();
+            if c.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = c.end_batch_wait();
+            }
+        }
+        let g = self.qsa_sel_bufs.lock();
+        let b = g.as_ref().ok_or("vk qsa_sel_readback: 스크래치 없음")?;
+        if b.5.buf.as_raw() != sel_idx as u64 || b.6.buf.as_raw() != sel_off as u64 {
+            return Err("vk qsa_sel_readback: 핸들 불일치(스크래치 재성장)".into());
+        }
+        let mut si = vec![0u32; list_len];
+        unsafe { std::ptr::copy_nonoverlapping(b.5.ptr as *const u32, si.as_mut_ptr(), list_len) };
+        let mut so = vec![0u32; 2];
+        unsafe { std::ptr::copy_nonoverlapping(b.6.ptr as *const u32, so.as_mut_ptr(), 2) };
+        Ok((si, so))
+    }
+
+    /// plans/85 §2 — sel 목록이 디바이스에 있는 상주판 어텐션(업로드 없음,
+    /// fn_qsa_attn_sel 그대로 — grid (t, n_head), t=1).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev_sel(
+        &self,
+        q: u64,
+        ck: u64,
+        cv: u64,
+        sel_idx: u64,
+        sel_off: u64,
+        _list_len: usize,
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        if hd != 256 {
+            return Err(format!("vk qsa_attention_dev_sel: hd={hd} 미지원"));
+        }
+        let mut ctx = self.ctx.lock();
+        let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
+        let cb = vk::Buffer::from_raw(ck as u64);
+        let vb = vk::Buffer::from_raw(cv as u64);
+        let sib = vk::Buffer::from_raw(sel_idx as u64);
+        let sob = vk::Buffer::from_raw(sel_off as u64);
+        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
+        let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, sib, sob, ob])?;
+        let mut push = kq_scale.to_le_bytes().to_vec();
+        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
+        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+    }
+
     /// 선택 목록 어텐션 — fn_qsa_attn_sel 판(hd=256).
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention_dev_res(
@@ -861,8 +1081,8 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         unsafe { std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len()) };
         let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
         let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, si_b.buf, so_b.buf, ob])?;
-        let mut push = push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]);
-        push.extend_from_slice(&kq_scale.to_le_bytes());
+        let mut push = kq_scale.to_le_bytes().to_vec();
+        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
         ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
     }
 }
@@ -882,6 +1102,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
     fn frame_begin(&self, t: usize) {
         self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
     }
+
 
     fn set_ctx_len(&self, n: usize) {
         self.qsa_ctx.store(n, std::sync::atomic::Ordering::Relaxed);
@@ -1093,10 +1314,59 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     fn frame_capable(&self) -> bool {
         std::env::var_os("LLM170_VK_FRAME").is_some()
     }
+    /// plans/85 §2 — 프레임 로짓 행별 argmax: fn_argmax_rows 2단 판.
+    /// 동률 최저 인덱스 — CPU greedy_from과 동일 의미. 미구현이면 greedy
+    /// 디코드 전체가 값경로 재연산으로 폴백했다(np/forward/multi 공통).
+    fn frame_argmax_rows(&self, logits: u64, t: usize, vocab: usize) -> Result<Vec<u32>, String> {
+        let lb = self.fbuf(logits)?;
+        // WG당 256스레드×8원소 = 2048. stage1은 1워크그룹(256) 축소 — n_wg ≤ 256.
+        let n_wg = vocab.div_ceil(2048);
+        if n_wg > 256 || vocab == 0 || t == 0 {
+            return Err(format!("vk frame_argmax_rows: 형상 초과 n_wg={n_wg} vocab={vocab} t={t}"));
+        }
+        let sc_bytes = 2 * n_wg * t * 4;
+        let out_bytes = t * 4;
+        let mut ctx = self.ctx.lock();
+        {
+            let mut g = self.argmax_bufs.lock();
+            let need = match g.as_ref() {
+                None => true,
+                Some(b) => b.0.bytes < sc_bytes || b.1.bytes < out_bytes,
+            };
+            if need {
+                *g = Some((
+                    ctx.alloc_host(sc_bytes.max(1 << 16))?,
+                    ctx.alloc_host(out_bytes.max(4096))?,
+                ));
+            }
+        }
+        let (scb, ob) = {
+            let g = self.argmax_bufs.lock();
+            let b = g.as_ref().unwrap();
+            (b.0.clone(), b.1.clone())
+        };
+        let p = self.pipeline(&mut ctx, Slot::FnArgmaxRows)?;
+        let ds = ctx.bind_ds(&p, &[lb, scb.buf, ob.buf])?;
+        let push0 = push_u32s(&[vocab as u32, 0u32, n_wg as u32]);
+        ctx.run(p.pl, ds, p.pipe, &push0, n_wg as u32, t as u32, 1)?;
+        let push1 = push_u32s(&[0u32, 1u32, n_wg as u32]);
+        ctx.run(p.pl, ds, p.pipe, &push1, 1, t as u32, 1)?;
+        // 비배치 run은 동기 — 안전한 직접 판독.
+        let mut out = vec![0u32; t];
+        unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const u32, out.as_mut_ptr(), t) };
+        Ok(out)
+    }
 
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
     /// 값경로 버퍼와 동일 정책(plans/29).
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
+        if std::env::var_os("LLM170_VK_POOL").is_some_and(|v| v == "0") {
+            let mut ctx = self.ctx.lock();
+            let b = ctx.alloc_host(len * 4)?;
+            let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.framebufs.lock().insert(h, b);
+            return Ok(h);
+        }
         let need = len * 4;
         // 풀에서 최소 적합 버퍼 재활용 (할당 syscall·vk 객체 회피).
         let recycled = {
@@ -1546,6 +1816,9 @@ impl llm170_core::matmul::EwOps for VkAcc {
         &self, x: u64, wg: &Weight, wu: &Weight, h: u64,
         _n_in: usize, n_hidden: usize,
     ) -> Result<(), String> {
+        if std::env::var_os("LLM170_VK_SHEXP").is_some_and(|v| v == "0") {
+            return Err("shexp_gu: 진단 킬스위치".into());
+        }
         let gh = self.frame_alloc(n_hidden)?;
         let uh = self.frame_alloc(n_hidden)?;
         let r = self
@@ -3421,6 +3694,258 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 let ok = mb < 1e-6;
                 if !ok { fails += 1; }
                 report.push_str(&format!("| GdnBetaGChunk {mb:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            }
+            // ── 14) QSA 디코드 선택(qsa_sel_dev) — 호스트 top-k 비트 일치 ──
+            // 풀 사전 적립(append) + 디코드 1토큰 선택. 호스트 참조는 셰이더와
+            // 동일 산술열(f64 순차 rms, f64 회전, 4누산 도트, 정수 순위).
+            {
+                use llm170_core::matmul::{FrameState as _, QsaOps as _};
+                let (ih, dm, r, top_k) = (16usize, 128usize, 128usize, 512usize);
+                let n_bulk = 1024usize;
+                let n_past = n_bulk + 1;
+                let eps = 1e-5f32;
+                let full = 900usize;
+                let acc5 = VkAcc::new()?;
+                acc5.set_ctx_len(n_past);
+                let mut s3 = 0x5a5au64;
+                let mut lcg = || {
+                    s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (s3 >> 33) as f32 / 2147483648.0 - 0.5
+                };
+                let ik_all: Vec<f32> = (0..n_past * dm).map(|_| lcg()).collect();
+                let iq1: Vec<f32> = (0..ih * dm).map(|_| lcg()).collect();
+                let iqw: Vec<f32> = (0..dm).map(|_| 0.5 + lcg().abs()).collect();
+                let ikw: Vec<f32> = (0..dm).map(|_| 0.5 + lcg().abs()).collect();
+                let cs: Vec<f32> = (0..n_past * dm).map(|_| lcg()).collect();
+                // (a) 풀 사전 적립 — 행 0..n_bulk.
+                {
+                    let ikh = acc5.frame_alloc(n_bulk * dm)?;
+                    acc5.frame_write(ikh, &ik_all[..n_bulk * dm])?;
+                    acc5.qsa_idx_append_dev(full, 0, ikh, n_bulk, 0, dm, r, &ikw, &cs, eps)
+                        .map_err(|e| e.to_string())?;
+                    acc5.frame_free(ikh)?;
+                }
+                // (b) 디코드 토큰 — qsa_sel_dev가 마지막 행 적립+블록키까지.
+                let (sd, od, list_len) = {
+                    let ikh = acc5.frame_alloc(dm)?;
+                    acc5.frame_write(ikh, &ik_all[n_bulk * dm..])?;
+                    let iqh = acc5.frame_alloc(ih * dm)?;
+                    acc5.frame_write(iqh, &iq1)?;
+                    let out = acc5
+                        .qsa_sel_dev(full, 0, iqh, ikh, 1, n_bulk, ih, dm, r, top_k, &iqw, &ikw, &cs, eps)
+                        .map_err(|e| e.to_string())?;
+                    acc5.frame_free(ikh)?;
+                    acc5.frame_free(iqh)?;
+                    out
+                };
+                // (c) 호스트 참조.
+                let n_blocks = n_past / r;
+                let rms_scale = |parts: &[f32; 32]| -> f32 {
+                    let mut sum = 0f64;
+                    for uu in 0..32 {
+                        sum += parts[uu] as f64;
+                    }
+                    1.0f32 / (sum / dm as f64 + eps as f64).sqrt() as f32
+                };
+                let rope = |v: &mut [f32], csrow: &[f32]| {
+                    let half = dm / 2;
+                    for p in 0..half {
+                        let c = csrow[p * 2] as f64;
+                        let sf = csrow[p * 2 + 1] as f64;
+                        let (x0, x1) = (v[p] as f64, v[p + half] as f64);
+                        v[p] = (x0 * c - x1 * sf) as f32;
+                        v[p + half] = (x0 * sf + x1 * c) as f32;
+                    }
+                };
+                let mut bk = vec![0f32; n_blocks * dm];
+                for b in 0..n_blocks {
+                    let mut pvs = [[0f32; 4]; 32];
+                    let mut parts = [0f32; 32];
+                    for u in 0..32 {
+                        for j in 0..r {
+                            let row = &ik_all[(b * r + j) * dm..][..dm];
+                            for k in 0..4 {
+                                pvs[u][k] += row[u * 4 + k];
+                            }
+                        }
+                        for k in 0..4 {
+                            pvs[u][k] /= r as f32;
+                        }
+                        parts[u] = pvs[u][0] * pvs[u][0]
+                            + pvs[u][1] * pvs[u][1]
+                            + pvs[u][2] * pvs[u][2]
+                            + pvs[u][3] * pvs[u][3];
+                    }
+                    let scale = rms_scale(&parts);
+                    let out = &mut bk[b * dm..][..dm];
+                    for u in 0..32 {
+                        for k in 0..4 {
+                            out[u * 4 + k] = pvs[u][k] * scale * ikw[u * 4 + k];
+                        }
+                    }
+                    rope(out, &cs[(b * r) * dm..]);
+                }
+                let mut iqr = vec![0f32; ih * dm];
+                {
+                    for h in 0..ih {
+                        let mut parts = [0f32; 32];
+                        let row = &iq1[h * dm..(h + 1) * dm];
+                        for u in 0..32 {
+                            let mut mp = 0f32;
+                            for k in 0..4 {
+                                let dv = row[u * 4 + k];
+                                mp += dv * dv;
+                            }
+                            parts[u] = mp;
+                        }
+                        let scale = rms_scale(&parts);
+                        for u in 0..32 {
+                            for k in 0..4 {
+                                iqr[h * dm + u * 4 + k] = row[u * 4 + k] * scale * iqw[u * 4 + k];
+                            }
+                        }
+                        rope(&mut iqr[h * dm..][..dm], &cs[n_bulk * dm..]);
+                    }
+                }
+                let mut scores = vec![0f32; n_blocks];
+                for b in 0..n_blocks {
+                    let mut sc = 0f32;
+                    for h in 0..ih {
+                        let (mut d0, mut d1, mut d2, mut d3) = (0f32, 0f32, 0f32, 0f32);
+                        let qh = &iqr[h * dm..(h + 1) * dm];
+                        let pk = &bk[b * dm..(b + 1) * dm];
+                        let mut i2 = 0usize;
+                        while i2 + 4 <= dm {
+                            d0 += qh[i2] * pk[i2];
+                            d1 += qh[i2 + 1] * pk[i2 + 1];
+                            d2 += qh[i2 + 2] * pk[i2 + 2];
+                            d3 += qh[i2 + 3] * pk[i2 + 3];
+                            i2 += 4;
+                        }
+                        let dot = (d0 + d1) + (d2 + d3);
+                        if dot > 0.0 {
+                            sc += dot;
+                        }
+                    }
+                    scores[b] = sc;
+                }
+                let tail_start = n_blocks * r;
+                let tail_cnt = n_past - tail_start;
+                let width = n_past.min(top_k + r - 1);
+                let n_sel = ((width - tail_cnt) / r).min(n_blocks);
+                let mut h_idx = Vec::with_capacity(n_sel * r + tail_cnt);
+                let mut sel: Vec<usize> = (0..n_blocks)
+                    .filter(|&b| {
+                        let sb = scores[b];
+                        (0..n_blocks)
+                            .filter(|&b2| {
+                                let s2 = scores[b2];
+                                s2 > sb || (s2 == sb && b2 < b)
+                            })
+                            .count()
+                            < n_sel
+                    })
+                    .collect();
+                sel.sort_unstable();
+                for &b in &sel {
+                    for j in 0..r {
+                        h_idx.push((b * r + j) as u32);
+                    }
+                }
+                for j in 0..tail_cnt {
+                    h_idx.push((tail_start + j) as u32);
+                }
+                let h_off = vec![0u32, (n_sel * r + tail_cnt) as u32];
+                let dev_scores: Vec<f32> = {
+                    let g = acc5.qsa_sel_bufs.lock();
+                    let b = g.as_ref().unwrap();
+                    (0..n_blocks)
+                        .map(|i| unsafe { *(b.1.ptr.add(i * 4) as *const f32) })
+                        .collect()
+                };
+                eprintln!("[qsel] host_scores={:?}", &scores[..n_blocks.min(8)]);
+                eprintln!("[qsel] dev_scores={:?}", &dev_scores[..n_blocks.min(8)]);
+                // (d) 대조 — 목록 전체 비트 일치.
+                let (d_idx, d_off) = acc5.qsa_sel_readback(sd, od, list_len).map_err(|e| e.to_string())?;
+                let ok = list_len == h_idx.len() && d_idx == h_idx && d_off == h_off;
+                eprintln!(
+                    "[qsel] n_blocks={n_blocks} n_sel={n_sel} list={list_len} host_sel={:?}",
+                    sel
+                );
+                if !ok {
+                    fails += 1;
+                }
+                report.push_str(&format!(
+                    "| QsaSelDev list={list_len} {}",
+                    if ok { "OK" } else { "FAIL" }
+                ));
+            }
+            // ── 15) shexp_gu/shexp_da — 디코드 t=1 융합 vs CPU 디양자화 참조 ──
+            // (qwen4exp 전용 — q35는 SKIP)
+            if let AnyModel::Q4(m4) = &model {
+                use llm170_core::matmul::EwOps as _;
+                let il: usize = tname
+                    .strip_prefix("blk.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let wg = m4.w4(&format!("blk.{il}.ffn_gate_shexp.weight")).map_err(|e| e.to_string())?;
+                let wu = m4.w4(&format!("blk.{il}.ffn_up_shexp.weight")).map_err(|e| e.to_string())?;
+                let wd = m4.w4(&format!("blk.{il}.ffn_down_shexp.weight")).map_err(|e| e.to_string())?;
+                let (n1, n2) = (wg.n_in as usize, wg.n_out as usize);
+                let x: Vec<f32> = (0..n1).map(|_| lcg()).collect();
+                let m0: Vec<f32> = (0..n1).map(|_| lcg()).collect();
+                let s_val = 0.7f32;
+                let xh = acc.frame_alloc(n1)?;
+                let hh = acc.frame_alloc(n2)?;
+                let mh = acc.frame_alloc(n1)?;
+                let sh = acc.frame_alloc(1)?;
+                acc.frame_write(xh, &x)?;
+                acc.frame_write(mh, &m0)?;
+                acc.frame_write(sh, &[s_val])?;
+                acc.frame_begin(1); // AxpyT t=1 판
+                acc.shexp_gu(xh, &wg, &wu, hh, n1, n2).map_err(|e| e.to_string())?;
+                acc.shexp_da(hh, &wd, sh, mh, n1, n2).map_err(|e| e.to_string())?;
+                let mut hgot = vec![0f32; n2];
+                acc.frame_read(hh, &mut hgot)?;
+                let mut mgot = vec![0f32; n1];
+                acc.frame_read(mh, &mut mgot)?;
+                // CPU 참조 — 디양자화 내적 + silu + sigmoid·axpy.
+                let mut grow = vec![0f32; n1];
+                let mut urow = vec![0f32; n1];
+                let mut href = vec![0f32; n2];
+                for m in 0..n2 {
+                    llm170_core::quant::dequant_row(wg.ty, wg.data, m as u64, n1 as u64, &mut grow);
+                    llm170_core::quant::dequant_row(wu.ty, wu.data, m as u64, n1 as u64, &mut urow);
+                    let g: f32 = grow.iter().zip(&x).map(|(a, b)| a * b).sum();
+                    let u: f32 = urow.iter().zip(&x).map(|(a, b)| a * b).sum();
+                    href[m] = (g / (1.0 + (-g).exp())) * u;
+                }
+                let mut hmx = 0f64;
+                for m in 0..n2.min(256) {
+                    hmx = hmx.max((href[m] as f64 - hgot[m] as f64).abs());
+                }
+                let mut drow = vec![0f32; n2];
+                let mut mmx = 0f64;
+                for i in 0..n1.min(256) {
+                    llm170_core::quant::dequant_row(wd.ty, wd.data, i as u64, n2 as u64, &mut drow);
+                    let dh: f32 = drow.iter().zip(&href).map(|(a, b)| a * b).sum();
+                    let mref = m0[i] + s_val * dh;
+                    mmx = mmx.max((mref as f64 - mgot[i] as f64).abs());
+                }
+                eprintln!("[shexp] h max|D|={hmx:.3e} mout max|D|={mmx:.3e}");
+                let ok = hmx < 5e-2 && mmx < 1e-1;
+                if !ok {
+                    fails += 1;
+                }
+                report.push_str(&format!(
+                    "| Shexp h={hmx:.1e} mout={mmx:.1e} {}",
+                    if ok { "OK" } else { "FAIL" }
+                ));
+                acc.frame_free(xh)?;
+                acc.frame_free(hh)?;
+                acc.frame_free(mh)?;
+                acc.frame_free(sh)?;
             }
         }
     }
