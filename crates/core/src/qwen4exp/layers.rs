@@ -517,10 +517,21 @@ impl Engine4 {
                 f.sync_states(acc.as_ref(), sq, &self.seqs[sq], self.model.hp.d_state)?;
             }
         }
+        // plans/86 §3 — 트랜잭션: 호출부가 슬롯별 prefill_greedy 로 폴백하므로
+        // 시도 전 상태를 스냅샷해 Err 시 복원한다.
+        let ple0: Vec<_> = seqs.iter().map(|&s| super::frame::ple_snap(&self.seqs[s])).collect();
         let ctx = Ctx { model: &self.model, acc: Some(acc.as_ref()) };
-        let toks = super::frame::frame_forward_prefill_multi(
+        let toks = match super::frame::frame_forward_prefill_multi(
             acc.as_ref(), &self.model, &ctx, seqs, &mut self.seqs, f, tokens, per_seq,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                for (snap, &sq) in ple0.into_iter().zip(seqs.iter()) {
+                    super::frame::ple_restore(&mut self.seqs[sq], snap);
+                }
+                return Err(e);
+            }
+        };
         for &sq in seqs {
             f.dirty[sq] = false;
         }
@@ -567,6 +578,8 @@ impl Engine4 {
                 }
             }
         }
+        // plans/86 §3 — 트랜잭션 스냅샷(전 시퀀스).
+        let ple0: Vec<_> = seqs.iter().map(|&s| super::frame::ple_snap(&self.seqs[s])).collect();
         let r = (|| -> Result<Vec<Vec<f32>>, Q4Error> {
             let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
             let acc = self.acc.as_deref().unwrap();
@@ -586,10 +599,12 @@ impl Engine4 {
                     self.seqs[s].pos += 1;
                 }
                 Ok(ls)
+        }
+        Err(e) => {
+            self.frame = None;
+            for (snap, &s) in ple0.into_iter().zip(seqs.iter()) {
+                super::frame::ple_restore(&mut self.seqs[s], snap);
             }
-            Err(e) => {
-                // 배치 경로 실패 — 프레임 폐기 후 순차 폴백(상태 무결성 우선)
-                self.frame = None;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# frame-np: 배치 디코드 실패 — 순차 폴백 ({e})"));
                 let mut out = Vec::with_capacity(seqs.len());
@@ -637,6 +652,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             }
         }
     }
+    // plans/86 §3 — 트랜잭션 스냅샷(전 시퀀스).
+    let ple0: Vec<_> = seqs.iter().map(|&s| super::frame::ple_snap(&self.seqs[s])).collect();
     let r = (|| -> Result<Vec<u32>, Q4Error> {
         let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
         let acc = self.acc.as_deref().unwrap();
@@ -666,6 +683,9 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         }
         Err(e) => {
             self.frame = None;
+            for (snap, &s) in ple0.into_iter().zip(seqs.iter()) {
+                super::frame::ple_restore(&mut self.seqs[s], snap);
+            }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("# frame-np-greedy: 배치 실패 — 순차 폴백 ({e})"));
             let mut out = Vec::with_capacity(seqs.len());
@@ -710,6 +730,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 }
             }
         }
+        // plans/86 §3 — 트랜잭션 스냅샷(폴백 시 복원).
+        let ple0 = super::frame::ple_snap(&self.seqs[seq]);
         let r = (|| -> Result<u32, Q4Error> {
             let f = self.frame.as_mut().ok_or_else(|| Q4Error::Io("frame 없음".into()))?;
             let acc = self.acc.as_deref().unwrap();
@@ -785,6 +807,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 self.graph_want = false;
                 self.frame = None;
                 self.frame_broken = true;
+                super::frame::ple_restore(&mut self.seqs[seq], ple0);
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# frame-greedy: 디코드 실패 — 폴백 ({e})"));
                 let l = self.decode1(seq, token)?;
@@ -852,6 +875,9 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                     eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
                     self.graph_want = false;
                 }
+            // plans/86 §3 — 트랜잭션: 시도 전 PLE 상태 스냅샷, Err 시 복원 후
+            // 값경로 폴백(이중 진화 방지).
+            let ple0 = super::frame::ple_snap(&self.seqs[seq]);
             let mut run_step = || -> Result<Vec<f32>, Q4Error> {
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
@@ -895,6 +921,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 Err(e) => {
                     self.frame = None;
                     self.frame_broken = true;
+                    super::frame::ple_restore(&mut self.seqs[seq], ple0);
                     eprintln!("# frame: 디코드 실패 — value 경로 폴백 ({e})");
                     let mut tm = init_timings();
                     self.forward_timed(seq, &[token], tm.as_mut())?

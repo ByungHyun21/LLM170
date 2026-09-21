@@ -91,6 +91,15 @@ pub(super) fn frame_forward_ex(
         if trace {
             eprintln!("# frame layer {il} t={t} (ple={} recr={})", hp.is_ple(il), hp.is_recr(il));
         }
+        // plans/86 §3 — 인위적 실패 주입(디코드 t=1만): 트랜잭션 폴백 검증용.
+        if t == 1
+            && std::env::var("LLM170_FRAME_FAILAT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .is_some_and(|n| n == il)
+        {
+            return Err(Q4Error::Io(format!("frame_failat: 주입 L{il}")));
+        }
         if il < 4 {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
