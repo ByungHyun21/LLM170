@@ -48,6 +48,8 @@ const FN_GDN_AR_SWAP_SPV: &[u8] = include_bytes!("spv/fn_gdn_ar_swap.spv");
 /// plans/84 B — FN QSA: 선택 어텐션 + 인덱서 블록키 갱신.
 const FN_QSA_ATTN_SEL_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel.spv");
 const FN_IDX_BK_SPV: &[u8] = include_bytes!("spv/fn_idx_bk_update.spv");
+/// plans/86 §2 — QSA q/k norm+rope (qk_norm_rope 동일열).
+const FN_QK_NORM_ROPE_SPV: &[u8] = include_bytes!("spv/fn_qk_norm_rope.spv");
 /// plans/85 §2 — FN QSA 디코드 선택: q norm+rope → 블록 점수 → 순위 → 전개.
 const FN_IDX_Q_ROPE_SPV: &[u8] = include_bytes!("spv/fn_idx_q_rope.spv");
 const FN_IDX_SCORE_SPV: &[u8] = include_bytes!("spv/fn_idx_score.spv");
@@ -90,6 +92,8 @@ enum Slot {
     FnIdxBk,
     /// plans/85 §2 — QSA 디코드 선택 체인(q_rope/score/rank/expand).
     FnIdxQRope,
+    /// plans/86 §2 — QSA q/k norm+rope.
+    FnQkNormRope,
     FnIdxScore,
     FnIdxRank,
     FnIdxExpand,
@@ -131,6 +135,8 @@ pub struct VkAcc {
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
     /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
     qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
+    /// plans/86 §2 — qk_norm_rope 상수(qn/kn/cs 타일) (ptr,len) 키 상주.
+    qk_consts: Mutex<HashMap<(usize, usize), VkBuf>>,
     qsa_ctx: std::sync::atomic::AtomicUsize,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
@@ -189,6 +195,7 @@ impl VkAcc {
             qsa_sel_bufs: Mutex::new(None),
             moebufs: Mutex::new(None),
             argmax_bufs: Mutex::new(None),
+            qk_consts: Mutex::new(HashMap::new()),
             qsa_pools: Mutex::new(HashMap::new()),
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
@@ -232,6 +239,7 @@ impl VkAcc {
             Slot::FnIdxScore => (FN_IDX_SCORE_SPV, 3, 12), // 3×u32
             Slot::FnIdxBk => (FN_IDX_BK_SPV, 4, 20),         // f32 + 3×u32
             Slot::FnIdxQRope => (FN_IDX_Q_ROPE_SPV, 4, 8),    // f32 + u32
+            Slot::FnQkNormRope => (FN_QK_NORM_ROPE_SPV, 5, 28), // 2×f32 + 5×u32
             Slot::FnIdxRank => (FN_IDX_RANK_SPV, 2, 8),      // 2×u32
             Slot::FnIdxExpand => (FN_IDX_EXPAND_SPV, 3, 16), // 4×u32
             Slot::FnArgmaxRows => (FN_ARGMAX_ROWS_SPV, 3, 12), // 3×u32
@@ -1371,6 +1379,56 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         let mut out = vec![0u32; t];
         unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const u32, out.as_mut_ptr(), t) };
         Ok(out)
+    }
+
+    /// plans/86 §2 — QSA q/k norm+rope in-place (hip qk_norm_rope 동일열).
+    /// 상수(qn/kn 헤드 타일, cs 테이블)는 (ptr,len) 키로 1회 업로드 상주 —
+    /// 프레임이 타일 Vec을 스텝 간 유지하므로 포인터가 곧 신원이다(hip 교훈).
+    /// kq_scale=1.0(QSA 무척도 k 규약). hd ≤ 256(공유 스테이징 폭).
+    #[allow(clippy::too_many_arguments)]
+    fn frame_qk_norm_rope(
+        &self,
+        q: u64,
+        k: u64,
+        q_norm: &[f32],
+        k_norm: &[f32],
+        cs: &[f32],
+        eps: f32,
+        pos0: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        n_rot: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        if hd > 256 {
+            return Err(format!("vk frame_qk_norm_rope: hd={hd} (≤256 전용)"));
+        }
+        let mut ctx = self.ctx.lock();
+        // 상자 상수 업로드 — GTT(alloc_host)는 일관성 코히런트라 매핑 유지.
+        let mut up = |m: &Mutex<HashMap<(usize, usize), VkBuf>>, v: &[f32]| -> Result<VkBuf, String> {
+            let key = (v.as_ptr() as usize, v.len());
+            if let Some(b) = m.lock().get(&key) {
+                return Ok(b.clone());
+            }
+            let b = ctx.alloc_host(v.len().max(1) * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr as *mut f32, v.len()) };
+            m.lock().insert(key, b.clone());
+            Ok(b)
+        };
+        let qnb = up(&self.qk_consts, q_norm)?;
+        let knb = up(&self.qk_consts, k_norm)?;
+        let csb = up(&self.qk_consts, cs)?;
+        let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
+        let p = self.pipeline(&mut ctx, Slot::FnQkNormRope)?;
+        let ds2 = ctx.bind_ds(&p, &[qb, kb, qnb.buf, knb.buf, csb.buf])?;
+        // PC 선언순: eps, kqs, pos, n_head, n_kv, hd, n_rot.
+        let mut push = eps.to_le_bytes().to_vec();
+        push.extend_from_slice(&1.0f32.to_le_bytes());
+        push.extend_from_slice(&push_u32s(&[
+            pos0 as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32,
+        ]));
+        ctx.run(p.pl, ds2, p.pipe, &push, (n_head + n_kv) as u32, t as u32, 1)
     }
 
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
