@@ -1,0 +1,31 @@
+#version 450
+// plans/85 §2 — 선택 목록 전개(hip q4_idx_expand의 무공유메모리 변형):
+// 단일 워크그룹. 스레드 b는 selflag[0..b) 직렬 카운트로 슬롯 산출 후
+// 블록 위치 r개 발행, 테일 이어 붙임. sel_off = {0, n_sel*r + tail_cnt}.
+// 공유 34KB(hip 판)를 쓰지 않아 shared 상한과 무관.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Fl { uint selflag[]; };
+layout(binding = 1) buffer Si { uint sel_idx[]; };
+layout(binding = 2) buffer So { uint sel_off[]; };
+layout(push_constant) uniform PC {
+    uint n_blocks; uint n_sel; uint r; uint n_past;
+} pc;
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint b = tid; b < pc.n_blocks; b += 256u) {
+        if (selflag[b] == 0u) continue;
+        uint o = 0u;
+        for (uint b2 = 0u; b2 < b; b2++) o += selflag[b2];
+        uint base = o * pc.r;
+        for (uint j = 0u; j < pc.r; j++) sel_idx[base + j] = b * pc.r + j;
+    }
+    uint tail_start = (pc.n_past / pc.r) * pc.r;
+    uint tail_cnt = pc.n_past - tail_start;
+    for (uint j = tid; j < tail_cnt; j += 256u) {
+        sel_idx[pc.n_sel * pc.r + j] = tail_start + j;
+    }
+    if (tid == 0u) {
+        sel_off[0] = 0u;
+        sel_off[1] = pc.n_sel * pc.r + tail_cnt;
+    }
+}

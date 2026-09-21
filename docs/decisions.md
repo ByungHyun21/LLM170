@@ -1292,3 +1292,67 @@ this APU — mmap fault-path uploads at 20-180 MB/s for 78 GB, and the
 page cache (competing with VRAM in unified memory) rarely survives
 between runs; sequential pre-warm reads run at ~2.5 GB/s. Weight
 preload via the pread staging path is a standing improvement item.
+
+## 2026-09-21 (29) — vk decode shexp landed; QSA selection chain verified; two latent bugs found in the engine/frame path (plans/85 §1-§2)
+
+Follow-up to (28) on branch vk85-shexp.
+
+**Shexp (§1) landed and verified.** shexp_gu/shexp_da for VkAcc are
+composed from the existing tested primitives (frame_mm_group quant-once
++ gemv, SiluMul, AxpyScaled) with scratch pre-allocated before any ctx
+lock — the deadlock trap cannot occur by construction. Numeric check
+added to vk-frame-check section 15 (CPU dequant reference): h max|D|=
+2.3e-4, mout 6.7e-5. Decode n-predict 8 completes with no deadlock and
+no DEVICE_LOST, and the 16/63/64 chunk fence stays bits-identical.
+
+**The real root cause of the (28) DEVICE_LOST was not shexp.** The CLI
+injects LLM170_FRAME=1 by default, and decode1/decode1_greedy attempted
+the frame path gated only by that env — not by frame_capable() (prefill
+does check it). On vk without LLM170_VK_FRAME this runs value-prefill +
+frame-decode with a freshly constructed Frame4 (all state buffers
+uninitialized); with shexp enabled the step progresses past the old
+abort point into an op that faults the GPUVM (PERMISSION_FAULTS, context
+lost). Reproduced on both the §1 binary and HEAD+shexp; bisected via
+kill-switches (LLM170_VK_SHEXP=0 / LLM170_VK_POOL=0) to shexp exposure,
+not the new frame-buffer recycle pool. Fix: decode1 and decode1_greedy
+now also require frame_capable() — the default (non-VK_FRAME) path is a
+clean value decode again, identical first tokens to HEAD.
+
+**Frame buffer recycle pool.** VkBuf has no Drop; the old frame_free
+leaked every buffer for process lifetime — unbounded for per-step decode
+scratch. frame_alloc/frame_free now recycle through a 64 MiB pool
+(smallest-fit; surplus beyond the cap retains the old behavior).
+
+**QSA decode selection (§2) implemented and unit-verified.** New
+shaders fn_idx_q_rope/score/rank/expand (hip q4_idx_* arithmetic order:
+f64 sequential rms, f64 rotation, 4-accumulator dot, integer rank) plus
+qsa_sel_dev/qsa_attention_dev_sel/qsa_sel_readback for VkAcc and
+frame_argmax_rows (multi-row argmax2 variant, ties→lowest index).
+vk-frame-check section 14 builds a 1025-position synthetic pool and
+compares the device list against a host mirror: scores agree to 7 digits
+and the selection list is bit-identical.
+
+**Two latent bugs fixed on the way.** (1) qsa_idx_append_dev's watermark
+update wrote a temporary (`&mut get_mut().map().unwrap_or(0)`) — the
+stored watermark never moved (kv_dev masked it) and a missing pool entry
+panicked on unwrap; now entry()-created and really updated. (2) Push
+constants whose GLSL block leads with a float (fn_idx_bk_update,
+fn_qsa_attn_sel) were pushed in the reverse order — fn_idx_bk always
+early-returned on idx_dim≠128, so block keys were never computed on vk
+(invisible: prefill used the identity-selection shortcut). All pushes
+now follow the declaration order (eps/kq_scale first). The q_rope cs
+table is uploaded per decode position and indexed row-relative;
+absolute indexing read out of bounds and robustness zero-filled iqr.
+
+**New blocker documented (pre-existing).** With LLM170_VK_FRAME=1 the
+frame decode step now runs to completion (argmax included) but its
+logits are wrong (divergent tokens after the first). Every QSA layer
+still host-bridges because frame_qk_norm_rope is unimplemented for
+vk, so the corruption sits in the t=1 device path (GDN/MoE/head or
+state sync) — it was never observable before because the step always
+aborted at shexp/argmax and the output was discarded. End-to-end §2
+acceptance ("decode without fallback") is blocked on this; the selection
+chain itself is verified at the op level.
+
+Gates: all four green at the branch tip; vk frame chunk fence 16/63/64
+bits-identical (see plans/85 update).

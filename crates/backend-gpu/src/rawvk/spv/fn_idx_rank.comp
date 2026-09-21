@@ -1,0 +1,22 @@
+#version 450
+// plans/85 §2 — 결정적 top-k 순위(hip q4_idx_rank 동일열): 스레드당 블록.
+// rank(b) = (s2 > sb) || (s2 == sb && b2 < b) 인 b2 수 — (점수 내림,
+// 인덱스 오름) 순서와 정확히 동일한 상위 n_sel 집합. 정수 산술이라
+// 순서 무관.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Scr { float scores[]; };
+layout(binding = 1) buffer Fl { uint selflag[]; };
+layout(push_constant) uniform PC {
+    uint n_blocks; uint n_sel;
+} pc;
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.n_blocks) return;
+    float sb = scores[b];
+    int rank = 0;
+    for (uint b2 = 0u; b2 < pc.n_blocks; b2++) {
+        float s2 = scores[b2];
+        if (s2 > sb || (s2 == sb && b2 < b)) rank++;
+    }
+    selflag[b] = (uint(rank) < pc.n_sel) ? 1u : 0u;
+}

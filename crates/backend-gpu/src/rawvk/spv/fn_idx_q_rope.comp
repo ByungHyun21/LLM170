@@ -1,0 +1,53 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+// plans/85 §2 — FN QSA 인덱서 q norm+rope (hip q4_idx_q_rope 동일열,
+// idx_dim=128). 워크그룹 32스레드 = (헤드,토큰) 1개: 레인 u가 원소 4u..4u+3.
+// f32 부분합 32개를 f64 순차합(호스트 ops.rs rms_norm과 동일 순서), iqw 가중,
+// 로프 회전은 f64(호스트/hip과 동일 — 선택 목록 비트 일치 유지). 짝은 16레인
+// 거리(원소 p ↔ p+64). cs 업로드는 pos0행부터 t행 — 인덱싱은 업로드 상대
+// (행 y 기준. 절대 pos0 오프셋은 OOB 판독이 robustness 0을 돌려 iqr=0).
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer Iq { float iq[]; };
+layout(binding = 1) buffer Iqr { float iqr[]; };
+layout(binding = 2) readonly buffer Iw { float iqw[]; };
+layout(binding = 3) readonly buffer Cs { float cs[]; };
+layout(push_constant) uniform PC {
+    float eps; uint idx_dim;
+} pc;
+shared float sh_part[32];
+shared float sh_nm[32][4];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint y = gl_WorkGroupID.y;
+    uint u = gl_LocalInvocationID.x;
+    if (pc.idx_dim != 128u) return;
+    uint off = (y * gl_NumWorkGroups.x + h) * pc.idx_dim;
+    float mypart = 0.0;
+    for (uint k = 0u; k < 4u; k++) {
+        float dv = iq[off + u * 4u + k];
+        mypart += dv * dv;
+    }
+    sh_part[u] = mypart;
+    barrier();
+    double sum = 0.0lf;
+    for (int uu = 0; uu < 32; uu++) sum += double(sh_part[uu]);
+    float scale = 1.0 / float(sqrt(sum / double(pc.idx_dim) + double(pc.eps)));
+    for (uint k = 0u; k < 4u; k++) {
+        sh_nm[u][k] = iq[off + u * 4u + k] * scale * iqw[u * 4u + k];
+    }
+    barrier();
+    uint half_ = pc.idx_dim >> 1u;
+    uint csbase = y * half_ * 2u;
+    for (uint k = 0u; k < 4u; k++) {
+        uint i = u * 4u + k;
+        float other = sh_nm[(u + 16u) % 32u][k];
+        uint p = (i < half_) ? i : (i - half_);
+        double c = double(cs[csbase + p * 2u]);
+        double sf = double(cs[csbase + p * 2u + 1u]);
+        if (i < half_) {
+            iqr[off + i] = float(double(sh_nm[u][k]) * c - double(other) * sf);
+        } else {
+            iqr[off + i] = float(double(other) * sf + double(sh_nm[u][k]) * c);
+        }
+    }
+}
