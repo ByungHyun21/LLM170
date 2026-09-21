@@ -1,0 +1,119 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// 밀집 GEMM 타일 — q8_0 (plans/88 P2). 프리필(t≥2) 밀집 투영용: gemv3의
+// t-루프 재판독(실측 ~5GB/s) 대신 16×16 타일 + K-슬라이스 협동 스테이징.
+// 가중 16행×SLICE바이트를 LDS에 옮겨 청크 분해(정수 나눗셈)를 슬라이스당
+// 16회로 상환 — 임의 n_in(K-슬라이스 루프) 대응, LDS ≤ 8KB로 점유율 유지.
+// 산술: fn_moe_ids ty=8 열과 동일 표현식(f16 d·슬라이딩 qv·dot4·yd 스케일),
+// 스레드 full-K 직렬 누산.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint chunk_words; uint xq_w; uint t;
+} pc;
+
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+// K-슬라이스: 56블록(1792입력) — 16행 × ~1.9KB ≈ 30.5KB(LDS 64KB 내, 2WG/CU).
+// 초판 128블록은 16행×4.35KB=69.6KB로 LDS 한도 초과 — 파이프라인이 깨져
+// GPU 정지(프로세스 SIGKILL)로 나타났다(스테이징만 켜진 변형은 컴파일러
+// 최적화로 sh 절반이 죽어 우연히 통과).
+const uint SLICE_BLOCKS = 56u;
+
+shared uint sh[16 * 480];   // 슬라이스 워드 상한 (2+56·34+3)>>2 = 479 + 여유
+
+void main() {
+    int ox = int(gl_LocalInvocationID.x);
+    int rx = int(gl_LocalInvocationID.y);
+    int o = int(gl_WorkGroupID.x) * 16 + ox;
+    uint r0 = gl_WorkGroupID.y * 16u;
+    int tid = int(gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x);
+    if (r0 >= pc.t) return;   // 블록 균일 조기탈출(o 가드는 계산 시)
+    uint n_sub = pc.n_in >> 5;
+    uint row_bytes = n_sub * 34u;
+    uint n_slices = (n_sub + SLICE_BLOCKS - 1u) / SLICE_BLOCKS;
+    uint r = r0 + uint(rx);
+    if (r >= pc.t) { rx = -1; }   // 계산 스킵 플래그(스테이징·배리어는 참여)
+    uint xr0 = r * pc.xq_w;
+    float acc = 0.0;
+    for (uint sl = 0u; sl < n_slices; sl++) {
+        uint b0 = sl * SLICE_BLOCKS;
+        uint nb = min(SLICE_BLOCKS, n_sub - b0);
+        uint slice_words = (2u + nb * 34u + 3u) >> 2;   // mis(≤2) 여유
+        // 협동 스테이징: 16 o행 × 슬라이스 워드. 행 기저 청크 산술 행당 1회.
+        for (uint row = 0u; row < 16u; row++) {
+            uint orow = gl_WorkGroupID.x * 16u + row;
+            if (orow >= pc.n_out) break;
+            uint64_t wbase = uint64_t(orow) * uint64_t(row_bytes) + uint64_t(b0) * 34u;
+            uint w0 = uint(wbase >> 2);
+            uint c0 = w0 / pc.chunk_words;
+            uint lim = (c0 + 1u) * pc.chunk_words;
+            uint srow = row * slice_words;
+            for (uint col = uint(tid); col < slice_words; col += 256u) {
+                uint wi = w0 + col;
+                sh[srow + col] = wi < lim
+                    ? Wsel(c0, wi - c0 * pc.chunk_words)
+                    : Wsel(c0 + 1u, wi - (c0 + 1u) * pc.chunk_words);
+            }
+        }
+        barrier();
+        if (rx >= 0) {
+            uint srow = uint(ox) * slice_words;   // 가중 행은 출력열(ox) — 토큰행(rx)아님
+            // 행 기저 워드 어긋남(짝수 n_sub=0, 홀수면 행 패리티로 2) —
+            // 워드0 기준 상대 바이트 오프셋에 가산.
+            uint mis = (row_bytes & 3u) == 0u ? 0u
+                     : (((gl_WorkGroupID.x * 16u + uint(rx)) & 1u) * 2u);
+            uint sb0 = b0;
+            uint sb1 = b0 + nb;
+            for (uint sb = sb0; sb < sb1; sb++) {
+                uint bi = mis + (sb - b0) * 34u;
+                float d = unpackHalf2x16(sh[srow + (bi >> 2)] >> ((bi & 3u) * 8u)).x;
+                uint xw = xr0 + ((sb << 5) >> 2);
+                uint wq = srow + (bi >> 2);
+                bool al = ((bi & 3u) == 2u);
+                int isum = 0;
+                for (int k = 0; k < 8; k++) {
+                    uint qv = al ? sh[wq + 1u + uint(k)]
+                                 : ((sh[wq + uint(k)] >> 16) | (sh[wq + uint(k) + 1u] << 16));
+                    uint yv = xq[xw + uint(k)];
+                    isum = dot4(qv, yv, isum);
+                }
+                float yd = uintBitsToFloat(xq[xr0 + (pc.n_in >> 2) + sb]);
+                acc += yd * d * float(isum);
+            }
+        }
+        barrier();
+    }
+    if (rx >= 0 && o < int(pc.n_out)) {
+        outv[r * pc.n_out + uint(o)] = acc;
+    }
+}
