@@ -356,7 +356,18 @@ fn cmd_chunk_check(args: &[String]) -> ExitCode {
                 let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, ctx);
                 if !backend_cpu && !crate::engine::q4_gpu_env_off() {
                     let sources = eng.model.part_sources();
-                    match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
+                    // plans/88 — 런타임 존중: LLM170_GPU_RUNTIME=vulkan 이면 vk
+                    // 프레임 경로의 청크 펜스를 잴 수 있다(종전 hip 고정이라
+                    // vk 변경의 펜스 검증이 불가했다).
+                    let vk = std::env::var("LLM170_GPU_RUNTIME")
+                        .map(|v| v == "vulkan")
+                        .unwrap_or(false);
+                    let r = if vk {
+                        llm170_backend_gpu::new_q4_acc_vk_with_sources(sources)
+                    } else {
+                        llm170_backend_gpu::new_q4_acc_with_sources(sources)
+                    };
+                    match r {
                         Ok(acc) => {
                             eng = eng.with_acc(acc);
                         }
