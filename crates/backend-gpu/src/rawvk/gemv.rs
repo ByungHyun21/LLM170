@@ -57,12 +57,11 @@ const FN_IDX_RANK_SPV: &[u8] = include_bytes!("spv/fn_idx_rank.spv");
 const FN_IDX_EXPAND_SPV: &[u8] = include_bytes!("spv/fn_idx_expand.spv");
 /// plans/85 §2 — 프레임 로짓 행별 GPU argmax(동률 최저 인덱스).
 const FN_ARGMAX_ROWS_SPV: &[u8] = include_bytes!("spv/fn_argmax_rows.spv");
-/// plans/88 P1 — MoE direct-ids GEMM군 (hip q4_gemm_q4k_ge_ids·
-/// q4_gemm_q5_1_w_ids·gemm_q8_0_ids 직역) + K-분할 환원.
-const FN_MOE_IDS_Q4K_SPV: &[u8] = include_bytes!("spv/fn_moe_ids_q4k.spv");
-const FN_MOE_IDS_Q51_SPV: &[u8] = include_bytes!("spv/fn_moe_ids_q51.spv");
-const FN_MOE_IDS_Q8_SPV: &[u8] = include_bytes!("spv/fn_moe_ids_q8.spv");
-const FN_MOE_IDS_REDUCE_SPV: &[u8] = include_bytes!("spv/fn_moe_ids_reduce.spv");
+/// plans/88 P1 — f32/BF16 밀집 GEMV(mm_group F32·BF16 멤버 — 값폴백 소거).
+const FN_MM_F32_SPV: &[u8] = include_bytes!("spv/fn_mm_f32.spv");
+/// plans/88 P1 — MoE direct-ids GEMV: gemv3의 ids 구동판(그리드 (n_out, rows),
+/// 워크그룹=행, ids[r]로 전문가 베이스 산출). 행 산술은 gemv3와 비트 동일.
+const FN_MOE_IDS_SPV: &[u8] = include_bytes!("spv/fn_moe_ids.spv");
 
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
@@ -109,12 +108,10 @@ enum Slot {
     /// plans/85 §2 — 프레임 로짓 행별 argmax(2단계).
     FnArgmaxRows,
     Silu,
-    /// plans/88 P1 — MoE direct-ids GEMM(q4_K 16×16타일+K분할 / q5_1·q8_0 워프=행).
-    FnMoeIdsQ4K,
-    FnMoeIdsQ51,
-    FnMoeIdsQ8,
-    /// plans/88 P1 — direct-ids K-분할 부분합 환원(f64, k 오름차순).
-    FnMoeIdsReduce,
+    /// plans/88 P1 — MoE direct-ids GEMV(전 타입, gemv3 파생).
+    FnMoeIds,
+    /// plans/88 P1 — f32/BF16 밀집 GEMV.
+    FnMmf32,
 }
 
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
@@ -155,8 +152,6 @@ pub struct VkAcc {
     argmax_bufs: Mutex<Option<(VkBuf, VkBuf)>>,
     /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
-    /// plans/88 P1 — direct-ids q4_K K-분할 부분합(f64) 스크래치.
-    moe_ids_part: Mutex<Option<VkBuf>>,
      /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
      qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
     /// plans/86 §2 — qk_norm_rope 상수(qn/kn/cs 타일) (ptr,len) 키 상주.
@@ -168,6 +163,8 @@ pub struct VkAcc {
     qsa_ctx: std::sync::atomic::AtomicUsize,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
+    /// plans/88 P1 — 프레임 스텝 배치 활성(값경로 미참조 게이트).
+    frame_step_batch: std::sync::atomic::AtomicBool,
 }
 
 /// 빈 VkBuf 자리표 — 풀 엔트리 지연 생성용.
@@ -226,12 +223,10 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnIdxRank => "idx_rank",
         Slot::FnIdxExpand => "idx_expand",
         Slot::FnQkNormRope => "qk_norm_rope",
-         Slot::Quant => "quant",
-         Slot::FnArgmaxRows => "argmax_rows",
-        Slot::FnMoeIdsQ4K => "moe_ids_q4k",
-        Slot::FnMoeIdsQ51 => "moe_ids_q51",
-        Slot::FnMoeIdsQ8 => "moe_ids_q8",
-        Slot::FnMoeIdsReduce => "moe_ids_reduce",
+        Slot::Quant => "quant",
+        Slot::FnArgmaxRows => "argmax_rows",
+        Slot::FnMoeIds => "moe_ids",
+        Slot::FnMmf32 => "mm_f32",
      }
  }
 
@@ -280,9 +275,8 @@ impl VkAcc {
             gobufs: Mutex::new(Vec::new()),
             framebufs: Mutex::new(HashMap::new()),
             frame_pool: Mutex::new(Vec::new()),
-            qsa_sel_bufs: Mutex::new(None),
             moebufs: Mutex::new(None),
-            moe_ids_part: Mutex::new(None),
+            qsa_sel_bufs: Mutex::new(None),
             argmax_bufs: Mutex::new(None),
             qk_consts: Mutex::new(HashMap::new()),
             qsa_up_bufs: Mutex::new(None),
@@ -291,6 +285,7 @@ impl VkAcc {
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
             frame_t: std::sync::atomic::AtomicUsize::new(1),
+            frame_step_batch: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -334,15 +329,13 @@ impl VkAcc {
             Slot::FnQkNormRope => (FN_QK_NORM_ROPE_SPV, 5, 28), // 2×f32 + 5×u32
             Slot::FnIdxRank => (FN_IDX_RANK_SPV, 2, 8),      // 2×u32
             Slot::FnIdxExpand => (FN_IDX_EXPAND_SPV, 3, 16), // 4×u32
-             Slot::FnArgmaxRows => (FN_ARGMAX_ROWS_SPV, 3, 12), // 3×u32
-             Slot::Quant => (QUANT_SPV, 2, 12),
-             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
-             Slot::Silu => (SILU_SPV, 3, 4),
-            Slot::FnMoeIdsQ4K => (FN_MOE_IDS_Q4K_SPV, 12, 24), // 8W+ids+xq+part+out
-            Slot::FnMoeIdsQ51 => (FN_MOE_IDS_Q51_SPV, 11, 24), // 8W+ids+xq+out
-            Slot::FnMoeIdsQ8 => (FN_MOE_IDS_Q8_SPV, 11, 24),
-            Slot::FnMoeIdsReduce => (FN_MOE_IDS_REDUCE_SPV, 2, 8), // 2×u32
-         };
+            Slot::FnArgmaxRows => (FN_ARGMAX_ROWS_SPV, 3, 12), // 3×u32
+            Slot::Quant => (QUANT_SPV, 2, 12),
+            Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
+            Slot::Silu => (SILU_SPV, 3, 4),
+            Slot::FnMoeIds => (FN_MOE_IDS_SPV, 13, 28), // 8W+xq+out+ktab+grid+ids
+            Slot::FnMmf32 => (FN_MM_F32_SPV, 10, 20),    // 8W+x(f32)+out
+        };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
         Ok(p)
@@ -1322,6 +1315,15 @@ impl VkAcc {
 impl llm170_core::matmul::FrameState for VkAcc {
     fn frame_begin(&self, t: usize) {
         self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+        // plans/88 P1 — 스텝 수준 배치: 패스 전체를 세그먼트 최소 제출로 묶는다.
+        // 비배치 run은 발사마다 제출+펜스 대기라 디코드 스텝(~2500발사)이
+        // 호스트 간극에 지배됐다(실측 제출 2548/스텝). 스텝 도중 브리지의
+        // frame_read가 플러시하면 프레임 op 진입마다 재개(frame_resume_batch).
+        // 값경로는 이 게이트를 보지 않아 배치 상태가 새지 않는다.
+        if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
+            self.frame_step_batch.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.ctx.lock().begin_batch();
+        }
     }
 
 
@@ -1350,6 +1352,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         }
         let t = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
         let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
         let (sb, qb, kb, vb, bb, ob) = (
             self.fbuf(states)?, self.fbuf(q_scaled)?, self.fbuf(k)?,
             self.fbuf(v)?, self.fbuf(beta_ge)?, self.fbuf(out)?,
@@ -1415,6 +1418,70 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let t = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
         let rows = t * k_sel;
         let ty = vk_ty(w.ty).ok_or("vk frame_moe_gemm: 타입 미지원")?;
+        let mut ctx = self.ctx.lock();
+        let xb = self.fbuf(x)?;
+        let ob = self.fbuf(out)?;
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq = self.value_buf(&mut ctx, &self.xbuf, rows * xq_w * 4)?;
+        // 2) quant (프레임 f32 → 디바이스 xq)
+        {
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
+            let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+        }
+        // 2b) direct-ids (plans/88 P1) — t=1·rows≤64: fn_moe_ids(gemv3 파생)
+        // 그리드 (n_out, rows), 워크그룹=행 — 커널이 ids[r]을 직접 판독해 가중
+        // 베이스 = ids[r]·per_expert 를 산출한다. ids d2h(동기 드레인)·호스트
+        // 그룹화·perm/inv 업로드·게더·전문가 루프·스캐터 전부 소거(B1).
+        // 산술은 종전 전문가별 gemv3 경로와 출력 요소당 비트 동일(레인 부담·
+        // 감축 동일) — 토큰 스트림 불변 계약. 강제 스위치 LLM170_MOE_GROUPED=1.
+        // 초판의 hip 16×16타일 직역은 이 vk에서 점유율 부족(160WG, 실측
+        // 10GB/s vs hip 180GB/s)으로 폐기 — K-분할은 레인 분할(256)이 담당.
+        if rows > 0
+            && (t == 1 || rows <= 64)
+            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
+            && matches!(
+                w.ty,
+                GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q5_1 | GgmlType::Q8_0
+            )
+        {
+        if std::env::var_os("LLM170_MOE_IDS_DBG").is_some() {
+            eprintln!("[moeids] ty={ty} rows={rows} t={t} n_in={n_in} n_out={n_out}");
+        }
+            let idb = self.fbuf(ids)?;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            let per_expert = w.data.len() / ne;
+            let (kb, gb, dbuf) = self.ensure_shared(&mut ctx)?;
+            let chunk_words = (ctx.max_ssbo / 4) as u32;
+            let p = self.pipeline(&mut ctx, Slot::FnMoeIds)?;
+            // PC 선언순: n_in, n_out, xq_w, ty, rows, per_expert, chunk_words.
+            let push = push_u32s(&[
+                n_in as u32,
+                n_out as u32,
+                xq_w as u32,
+                ty,
+                rows as u32,
+                per_expert as u32,
+                chunk_words,
+            ]);
+            // 바인딩순: W0..7, xq, out, ktab, grid3s, ids.
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(xq);
+            binds.push(ob);
+            binds.push(kb);
+            binds.push(gb);
+            binds.push(idb);
+            let ds2 = ctx.bind_ds(&p, &binds)?;
+            ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, rows as u32, 1)?;
+            return Ok(());
+        }
+        // 1) ids 판독(호스트 그룹화) — direct-ids 가 걸러준 프리필 대량행만.
+        // 가드를 내린 뒤 d2h 드레인(d2h 블록이 스스로 ctx 를 잡는다).
+        drop(ctx);
         // 1) ids 판독(호스트 그룹화) — off/perm/inv 구축.
         let idv: Vec<u32> = {
             {
@@ -1446,106 +1513,6 @@ impl llm170_core::matmul::FrameState for VkAcc {
             inv[orig as usize] = p_ as u32;
         }
         let mut ctx = self.ctx.lock();
-        let xb = self.fbuf(x)?;
-        let ob = self.fbuf(out)?;
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-        let xq = self.value_buf(&mut ctx, &self.xbuf, rows * xq_w * 4)?;
-        // 2) quant (프레임 f32 → 디바이스 xq)
-        {
-            let p = self.pipeline(&mut ctx, Slot::Quant)?;
-            let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
-            let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
-            ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
-        }
-        // 2b) direct-ids (plans/88 P1) — t=1·rows≤64: 커널이 ids[r]을 직접
-        // 판독해 가중 베이스 = e·per_expert 를 산출한다. ids d2h(동기 드레인)·
-        // 호스트 그룹화·perm/inv 업로드·게더·전문히 루프·스캐터 전부 소거
-        // — 디코드 t=1 의 오케스트레이션 병목(B1) 제거. 산술은 hip
-        // ge_ids/w_ids/q8_ids 열 직역(dot4 정수·부동 직렬 누산 동일 표현식).
-        // 강제 스위치: LLM170_MOE_GROUPED=1 (A/B), K분할: LLM170_VK_MOE_KSPLIT.
-        if rows > 0
-            && (t == 1 || rows <= 64)
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
-            && match w.ty {
-                GgmlType::Q4K => true,
-                GgmlType::Q5_1 | GgmlType::Q8_0 => n_in / 32 <= 32,
-                _ => false,
-            }
-        {
-            let idb = self.fbuf(ids)?;
-            let wbufs = self.weight_bufs(&mut ctx, w)?;
-            let per_expert = w.data.len() / ne;
-            let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
-            let chunk_words = (ctx.max_ssbo / 4) as u32;
-            let push = push_u32s(&[
-                n_in as u32, n_out as u32, rows as u32, per_expert as u32,
-                chunk_words, xq_w as u32,
-            ]);
-            let batching = std::env::var_os("LLM170_VK_NOBATCH").is_none();
-            if batching {
-                ctx.begin_batch()?;
-            }
-            match w.ty {
-                GgmlType::Q4K => {
-                    let ksplit: u32 = std::env::var("LLM170_VK_MOE_KSPLIT")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(4)
-                        .clamp(1, 8);
-                    let need = rows * n_out * ksplit as usize * 8;
-                    let part = {
-                        let mut g = self.moe_ids_part.lock();
-                        if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                            *g = Some(crate::rawvk::context::site::scope("moe_ids_part", || {
-                                ctx.alloc(need.max(1 << 16))
-                            })?);
-                        }
-                        g.as_ref().unwrap().buf
-                    };
-                    let p = self.pipeline(&mut ctx, Slot::FnMoeIdsQ4K)?;
-                    let mut binds: Vec<vk::Buffer> = wbufs.clone();
-                    while binds.len() < 8 {
-                        binds.push(dbuf);
-                    }
-                    binds.push(idb);
-                    binds.push(xq);
-                    binds.push(part);
-                    binds.push(ob);
-                    let ds2 = ctx.bind_ds(&p, &binds)?;
-                    ctx.run(
-                        p.pl, ds2, p.pipe, &push,
-                        n_out.div_ceil(16) as u32, rows.div_ceil(16) as u32, ksplit,
-                    )?;
-                    if ksplit > 1 {
-                        let pr = self.pipeline(&mut ctx, Slot::FnMoeIdsReduce)?;
-                        let ds3 = ctx.bind_ds(&pr, &[part, ob])?;
-                        let push2 = push_u32s(&[(rows * n_out) as u32, ksplit]);
-                        ctx.run(
-                            pr.pl, ds3, pr.pipe, &push2,
-                            (rows * n_out).div_ceil(256) as u32, 1, 1,
-                        )?;
-                    }
-                }
-                GgmlType::Q5_1 | GgmlType::Q8_0 => {
-                    let slot = if w.ty == GgmlType::Q5_1 { Slot::FnMoeIdsQ51 } else { Slot::FnMoeIdsQ8 };
-                    let p = self.pipeline(&mut ctx, slot)?;
-                    let mut binds: Vec<vk::Buffer> = wbufs.clone();
-                    while binds.len() < 8 {
-                        binds.push(dbuf);
-                    }
-                    binds.push(idb);
-                    binds.push(xq);
-                    binds.push(ob);
-                    let ds2 = ctx.bind_ds(&p, &binds)?;
-                    ctx.run(p.pl, ds2, p.pipe, &push, n_out.div_ceil(8) as u32, rows as u32, 1)?;
-                }
-                _ => unreachable!("direct-ids 게이트에서 거름"),
-            }
-            if batching {
-                ctx.end_batch_wait()?;
-            }
-            return Ok(());
-        }
         // 3) MoE 스크래치 (perm u32, xg u32, iv u32, yg f32) — 필요시 성장.
         // xg 행 스트라이드는 16B 정렬로 패딩 — 전문가별 디스크립터 오프셋이
         // minStorageBufferOffsetAlignment를 만족해야 한다(down n_in=640의
@@ -1641,6 +1608,15 @@ impl llm170_core::matmul::FrameState for VkAcc {
 }
 
 impl VkAcc {
+    /// plans/88 P1 — 프레임 op 진입 시 배치 재개(플러시 후 세그먼트 재결합).
+    fn frame_resume_batch(&self, ctx: &mut VkCtx) {
+        if self.frame_step_batch.load(std::sync::atomic::Ordering::Relaxed)
+            && !ctx.batching.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = ctx.begin_batch();
+        }
+    }
+
     /// plans/87 §3 — 슬롯별 GPU 시간 집계 덤프(LLM170_VK_TS=1 로 풀 생성).
     /// 엔진의 ktrace 틱 지점(디코드 스텝/프리필 종료)에서 호출된다.
     pub fn ts_tick(&self) {
@@ -1673,6 +1649,11 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         let sc_bytes = 2 * n_wg * t * 4;
         let out_bytes = t * 4;
         let mut ctx = self.ctx.lock();
+        // plans/88 P1 — 스텝 배치 플러시: 아래 2런치는 비배치 동기 실행 후
+        // 호스트가 ob.ptr 을 직접 판독한다. 녹화만 된 커맨드를 먼저 실행.
+        if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.end_batch_wait()?;
+        }
         {
             let mut g = self.argmax_bufs.lock();
             let need = match g.as_ref() {
@@ -1826,24 +1807,40 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         let n_in = ws[0].n_in as usize;
         let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
         let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
         let xb = self.fbuf(x)?;
-        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
-        // 디바이스 quant: 프레임 f32 버퍼를 직접 소비 (호스트 경유 없음).
-        {
+        // plans/88 P1 — F32·BF16 멤버는 fn_mm_f32 가 프레임 f32 를 직접 소비.
+        // 양자 멤버가 있을 때만 quant 를 돌린다(순수 f32 그룹의 스텝 낭비 제거).
+        let dense_ty = |ty: llm170_gguf::GgmlType| -> Option<u32> {
+            match ty {
+                llm170_gguf::GgmlType::F32 => Some(0u32),
+                llm170_gguf::GgmlType::Bf16 => Some(1u32),
+                _ => None,
+            }
+        };
+        let has_quant = ws.iter().any(|w| vk_ty(w.ty).is_some());
+        let xq = if has_quant {
+            let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
-        }
+            xq
+        } else {
+            vk::Buffer::null()
+        };
         let mut xs: Vec<Vec<f32>> = Vec::new();
         let mut need_pullback = false;
         for w in ws {
-            if vk_ty(w.ty).is_none() {
+            if vk_ty(w.ty).is_none() && dense_ty(w.ty).is_none() {
                 need_pullback = true;
                 break;
             }
         }
         if need_pullback {
+            if std::env::var_os("LLM170_VK_PULLDBG").is_some() {
+                eprintln!("[pull] n_in={n_in} tys={:?}", ws.iter().map(|w| format!("{:?}", w.ty)).collect::<Vec<_>>());
+            }
             // plans/84 B: 미지원 타입(f32 inject 등)은 값경로 폴백 — 프레임 f32를
             // 판독해 MatmulHost(CPU 포함)로 계산하고 out에 기록한다.
             drop(ctx);
@@ -1869,11 +1866,32 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             return Ok(());
         }
         for (wi, w) in ws.iter().enumerate() {
-            let ty = vk_ty(w.ty).unwrap();
             let n_out = w.n_out as usize;
             let ob = self.fbuf(outs[wi])?;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
-            self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+            match vk_ty(w.ty) {
+                Some(ty) => {
+                    self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+                }
+                None => {
+                    // plans/88 P1 — f32/BF16 밀식 GEMV(값폴백 소거).
+                    let dty = dense_ty(w.ty).unwrap();
+                    let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+                    let p = self.pipeline(&mut ctx, Slot::FnMmf32)?;
+                    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+                    while binds.len() < 8 {
+                        binds.push(dbuf);
+                    }
+                    binds.push(xb);
+                    binds.push(ob);
+                    let ds2 = ctx.bind_ds(&p, &binds)?;
+                    let push = push_u32s(&[
+                        n_in as u32, n_out as u32, t as u32, dty,
+                        (ctx.max_ssbo / 4) as u32,
+                    ]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, t as u32, 1)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1881,6 +1899,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         use llm170_core::matmul::FrameOp as O;
         let t_cur = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
         let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
         match *op {
             O::RmsRows { x, w, out, eps, n, w_reps } => {
                 let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
@@ -3600,7 +3619,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                         let dot: f32 = ref_row.iter().zip(mxs[tok * k + ki].iter()).map(|(a, b)| a * b).sum();
                         acc2 += dot as f64 * (wsel[ki] / wsum) as f64;
                     }
-                    mx = mx.max((got[tok * n_out_m + j] as f64 - acc2).abs().max(0.0));
+                    if std::env::var_os("LLM170_DBG_9A").is_some() && tok == 0 && j < 4 {
+                        eprintln!("[9a] tok={tok} j={j} got={:.6} ref={:.6}", got[tok * n_out_m + j], acc2);
+                    }
                 }
             }
             let ok = mx < 3e-2;

@@ -392,6 +392,9 @@ pub(super) fn frame_forward_ex(
         if mode == FwdMode::Greedy {
             // GPU argmax — vocab×4B 전사·CPU 스캔 회피(plans/74).
             let toks = acc.frame_argmax_rows(f.logits, 1, hp.vocab).map_err(Q4Error::Io)?;
+            // plans/88 — 그리디 판독도 ktrace 틱: [ts] 프로파일이 디코드 스텝을
+            // 잡지 못했다(프리필 종료 틱만 관측). 그리디 반환 직전에 틱한다.
+            acc.ktrace_tick();
             ftime_report(t);
             return Ok((Vec::new(), Some(toks[0])));
         }

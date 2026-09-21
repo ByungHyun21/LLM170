@@ -1,0 +1,76 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// f32/BF16 밀집 GEMV (plans/88 P1) — 프레임 mm_group 의 F32·BF16 멤버용.
+// 그리드 (n_out, t), 워크그룹=출력행, 256레인 스트라이드 도트.
+// 종전 이 경로는 값폴백(frame_read 동기 플러시 + CPU/값경로 matmul +
+// frame_write)로 스텝당 ~290회의 제출 강제 + mm_group 134ms 벽시간의
+// 주범이었다. 축소는 gemv3 규약(레인 f32 부분합 → 서브그룹 f64 합산 →
+// 런타임 서브그룹수 트리) — W4A8 군과 동일 감축 클래스.
+layout(local_size_x = 256) in;
+const uint NT = 256u;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { float xv[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint ty; uint chunk_words;
+} pc;
+
+shared double shd[8];
+
+uint WG(uint idx) {
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+void main() {
+    uint l = gl_LocalInvocationID.x;
+    uint o = gl_WorkGroupID.x;
+    uint r = gl_WorkGroupID.y;
+    if (o >= pc.n_out || r >= pc.t) return;
+    int n_in = int(pc.n_in);
+    // 행 베이스(워드): f32 = n_in 워드, bf16 = n_in/2 워드(짝수 보장).
+    uint row_w = pc.ty == 0u ? pc.n_in : (pc.n_in >> 1);
+    uint base = o * row_w;
+    uint xbase = r * pc.n_in;
+    float acc = 0.0;
+    if (pc.ty == 0u) {
+        for (int i = int(l); i < n_in; i += int(NT)) {
+            acc += uintBitsToFloat(WG(base + uint(i))) * xv[xbase + uint(i)];
+        }
+    } else {
+        for (int i = int(l); i < n_in; i += int(NT)) {
+            uint wi = base + (uint(i) >> 1);
+            uint wword = WG(wi);
+            // 원소 i의 bf16: 짝수 인덱스=하프 lo, 홀수=hi.
+            uint h = (i & 1) == 0 ? (wword & 0xFFFFu) : (wword >> 16);
+            acc += uintBitsToFloat(h << 16) * xv[xbase + uint(i)];
+        }
+    }
+    double sub = subgroupAdd(double(acc));
+    uint sgid = gl_SubgroupInvocationID;
+    if (sgid == 0u) shd[gl_SubgroupID] = sub;
+    barrier();
+    uint ns = gl_NumSubgroups;
+    for (uint stride = ns >> 1u; stride > 0u; stride >>= 1u) {
+        if (l < stride) shd[l] += shd[l + stride];
+        barrier();
+    }
+    if (l == 0u) outv[r * pc.n_out + o] = float(shd[0]);
+}

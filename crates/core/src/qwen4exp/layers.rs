@@ -529,6 +529,8 @@ impl Engine4 {
                 for (snap, &sq) in ple0.into_iter().zip(seqs.iter()) {
                     super::frame::ple_restore(&mut self.seqs[sq], snap);
                 }
+                // plans/88 P1 — 스텝 배치 잔류 플러시(녹화 커맨드 실행 보장).
+                if let Some(a) = self.acc.as_deref() { a.frame_sync(); }
                 return Err(e);
             }
         };
@@ -604,6 +606,8 @@ impl Engine4 {
             self.frame = None;
             for (snap, &s) in ple0.into_iter().zip(seqs.iter()) {
                 super::frame::ple_restore(&mut self.seqs[s], snap);
+                // plans/88 P1 — 스텝 배치 잔류 플러시(녹화 커맨드 실행 보장).
+                if let Some(a) = self.acc.as_deref() { a.frame_sync(); }
             }
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# frame-np: 배치 디코드 실패 — 순차 폴백 ({e})"));
@@ -685,6 +689,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
             self.frame = None;
             for (snap, &s) in ple0.into_iter().zip(seqs.iter()) {
                 super::frame::ple_restore(&mut self.seqs[s], snap);
+                // plans/88 P1 — 스텝 배치 잔류 플러시(녹화 커맨드 실행 보장).
+                if let Some(a) = self.acc.as_deref() { a.frame_sync(); }
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("# frame-np-greedy: 배치 실패 — 순차 폴백 ({e})"));
@@ -808,6 +814,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                 self.frame = None;
                 self.frame_broken = true;
                 super::frame::ple_restore(&mut self.seqs[seq], ple0);
+                // plans/88 P1 — 스텝 배치 잔류 플러시(녹화 커맨드 실행 보장).
+                if let Some(a) = self.acc.as_deref() { a.frame_sync(); }
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# frame-greedy: 디코드 실패 — 폴백 ({e})"));
                 let l = self.decode1(seq, token)?;
@@ -922,6 +930,8 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
                     self.frame = None;
                     self.frame_broken = true;
                     super::frame::ple_restore(&mut self.seqs[seq], ple0);
+                    // plans/88 P1 — 스텝 배치 잔류 플러시(녹화 커맨드 실행 보장).
+                    if let Some(a) = self.acc.as_deref() { a.frame_sync(); }
                     eprintln!("# frame: 디코드 실패 — value 경로 폴백 ({e})");
                     let mut tm = init_timings();
                     self.forward_timed(seq, &[token], tm.as_mut())?
