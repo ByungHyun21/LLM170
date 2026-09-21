@@ -1,0 +1,98 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// MoE direct-ids GEMM — q5_1 (plans/88 P1). hip q4_gemm_q5_1_w_ids 직역:
+// 워프=행(256스레드=8워프), 그리드 (⌈n_out/8⌉, rows). 레인이 서브블록 l,
+// l+32…을 맡아 6워드(24B) 슈퍼블록을 읽는다 — q5_1 행 전체를 병합 판독.
+// 합산은 순서 보존: 레인 0이 sb 오름차순 직렬 가산(n_sub ≤ 32 런치 조건).
+// 환원은 공유메모리 직렬 가산 — 서브그룹 연산을 쓰지 않는다(이 기기
+// 서브그룹은 64폭이라 32레인 가정의 broadcast가 그룹 쌍을 같은 값으로
+// 접게 한다; 초판 실측 결함: 짝수 출력행만 유효).
+// 산술: hip w_ids열과 동일 표현식(dot4 정수, acc 부동 직렬).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Ids { uint ids[]; };
+layout(binding = 9) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 10) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint rows; uint per_expert_bytes;
+    uint chunk_words; uint xq_w;
+} pc;
+
+shared float shacc[256];
+
+uint WG(uint idx) {
+    uint c = idx / pc.chunk_words;
+    uint o = idx - c * pc.chunk_words;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+void main() {
+    int warp = int(gl_LocalInvocationID.x >> 5u);
+    int lane = int(gl_LocalInvocationID.x & 31u);
+    int o = int(gl_WorkGroupID.x) * 8 + warp;
+    int r = int(gl_WorkGroupID.y);
+    if (o >= int(pc.n_out) || r >= int(pc.rows)) return;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    // q5_1 행 = n_sub × 24B = n_sub × 6워드 (4B 정렬 보장).
+    uint64_t wrow = uint64_t(ids[uint(r)]) * uint64_t(pc.per_expert_bytes)
+                  + uint64_t(o) * uint64_t(n_sub) * 24u;
+    uint xr0 = uint(r) * pc.xq_w;
+    const uint ones = 0x01010101u;
+    float acc = 0.0;
+    for (int sb = lane; sb < n_sub; sb += 32) {
+        uint wb = uint(wrow >> 2) + uint(sb * 6);
+        vec2 dm2 = unpackHalf2x16(WG(wb));
+        float d = dm2.x, mn = dm2.y;
+        uint qh = WG(wb + 1u);
+        uint qsw0 = WG(wb + 2u), qsw1 = WG(wb + 3u);
+        uint qsw2 = WG(wb + 4u), qsw3 = WG(wb + 5u);
+        uint xw = xr0 + uint((sb << 5) >> 2);
+        int s_lo = 0, s_hi = 0, s1 = 0;
+        for (int k = 0; k < 8; k++) {
+            uint qs4 = (k & 3) == 0 ? qsw0 : (k & 3) == 1 ? qsw1 : (k & 3) == 2 ? qsw2 : qsw3;
+            uint nib = (k < 4) ? (qs4 & 0x0F0F0F0Fu) : ((qs4 >> 4) & 0x0F0F0F0Fu);
+            uint hb = (qh >> (4 * k)) & 0xFu;
+            uint hb_p = (hb & 1u) << 4 | (hb & 2u) << 11 | (hb & 4u) << 18 | (hb & 8u) << 25;
+            uint y = xq[xw + uint(k)];
+            s_lo += dot4(nib, y, 0);
+            s_hi += dot4(hb_p, y, 0);
+            s1 += dot4(ones, y, 0);
+        }
+        float yd = uintBitsToFloat(xq[xr0 + uint((n_in >> 2) + sb)]);
+        acc += yd * (d * float(s_lo + s_hi) + mn * float(s1));
+    }
+    // 순서 보존 환원(hip w_ids와 동일): 각 32레인 그룹의 부분합을 공유에
+    // 두고 레인 0이 sb 오름차순 f32 직렬 가산.
+    shacc[gl_LocalInvocationID.x] = acc;
+    barrier();
+    float sum = 0.0;
+    int gbase = warp * 32;
+    for (int sb2 = 0; sb2 < n_sub; sb2++) sum += shacc[gbase + sb2];
+    if (lane == 0) outv[uint(r) * pc.n_out + uint(o)] = sum;
+}
