@@ -50,6 +50,9 @@ pub struct VkCtx {
     pub ts: Option<TsProf>,
     pub ts_period_val: f64,
     pub nobar_next: std::cell::Cell<bool>,
+    /// plans/88 P1 — 제출(큐 submit) 횟수 카운터: 스텝 배치가 실제로 묶고
+    /// 있는지 [ts] 보고에 노출. 비배치 run 1회 = 제출 1회.
+    pub submits: std::cell::Cell<u64>,
 }
 
 /// VK_QUERY_POOL 타임스탬프 프로파일러 — 디스패치별 GPU 시간 (호스트 ktime의
@@ -246,7 +249,8 @@ impl VkCtx {
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
-                batching: std::sync::atomic::AtomicBool::new(false),
+            batching: std::sync::atomic::AtomicBool::new(false),
+            submits: std::cell::Cell::new(0),
                 ds_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
                 batch_dsl: std::cell::Cell::new(None),
                 batch_pool: std::cell::Cell::new(None),
@@ -324,6 +328,11 @@ impl VkCtx {
 
     /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
     pub fn begin_batch(&mut self) -> Result<(), String> {
+        // plans/88 P1 — 멱등: 이미 배치 중이면 재시작하지 않는다(녹화 중이던
+        // 커맨드 유지). 스텝 수준 배치와 경로 내부 begin_batch의 중첩용.
+        if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         unsafe {
             self.device
                 .reset_command_buffer(
@@ -351,6 +360,7 @@ impl VkCtx {
             let cbs = [self.cmdbuf2];
             let si = vk::SubmitInfo::default().command_buffers(&cbs);
             self.device.queue_submit(self.queue, &[si], self.fence).map_err(|e| format!("제출2: {e:?}"))?;
+            self.submits.set(self.submits.get() + 1);
             self.device.wait_for_fences(&[self.fence], true, u64::MAX).map_err(|e| format!("대기2: {e:?}"))?;
             if let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
@@ -364,6 +374,10 @@ impl VkCtx {
 
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
+        if std::env::var_os("LLM170_VK_FLUSHDBG").is_some() {
+            eprintln!("[flush] op={}\n{}", crate::rawvk::context::site::tag(),
+                std::backtrace::Backtrace::force_capture());
+        }
         self.batching.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             self.device
@@ -868,6 +882,7 @@ impl VkCtx {
                 // 제출 전까지 재사용 불가 — 배치 세션 동안 별도 2차 버퍼 사용.
                 return Ok(());
             }
+            self.submits.set(self.submits.get() + 1);
             self.device
                 .queue_submit(self.queue, &[si], self.fence)
                 .map_err(|e| format!("제출: {e:?}"))?;
@@ -933,9 +948,11 @@ impl VkCtx {
                 e.1 += 1;
                 tot += dt;
             }
+            let ns = self.submits.get();
+            eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
+            self.submits.set(0);
             let mut v: Vec<_> = agg.into_iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-            eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {})", labels.len());
             for (k, (e, c)) in v.iter().take(24) {
                 eprintln!("[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회)", k, e / *c as f64);
             }
