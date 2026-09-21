@@ -6,7 +6,7 @@
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
 use ash::vk::Handle as _VkHandle;
-use llm170_core::matmul::{MatmulHost, Weight};
+use llm170_core::matmul::{FrameHost as _, MatmulHost, Weight};
 use llm170_gguf::GgmlType;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -105,6 +105,10 @@ pub struct VkAcc {
     gobufs: Mutex<Vec<Option<VkBuf>>>,
     /// plans/84 B — 프레임 버퍼 레지스트리 (핸들 → 상주 버퍼; host-visible).
     framebufs: Mutex<HashMap<u64, VkBuf>>,
+    /// plans/85 §1 — 해제된 프레임 버퍼 재활용 풀. VkBuf는 파괴자가 없어
+    /// 종전 frame_free는 종료까지 누출 — 디코드 스텝 스크래치(shexp 등)가
+    /// 매층·매스텝 할당되므로 상한 내에서 재활용한다.
+    frame_pool: Mutex<Vec<VkBuf>>,
     /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
     /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
@@ -137,6 +141,8 @@ fn push_u32s(vals: &[u32]) -> Vec<u8> {
     v
 }
 
+/// 프레임 재활용 풀 상한(바이트) — 초과 해제분은 종전대로 보류(파괴 없음).
+const FRAME_POOL_CAP: usize = 64 << 20;
 impl VkAcc {
     pub fn new() -> Result<Self, String> {
         let ctx = VkCtx::new()?;
@@ -157,6 +163,7 @@ impl VkAcc {
             ffnbufs: Mutex::new(None),
             gobufs: Mutex::new(Vec::new()),
             framebufs: Mutex::new(HashMap::new()),
+            frame_pool: Mutex::new(Vec::new()),
             moebufs: Mutex::new(None),
             qsa_pools: Mutex::new(HashMap::new()),
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
@@ -1090,14 +1097,38 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
     /// 값경로 버퍼와 동일 정책(plans/29).
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
-        let mut ctx = self.ctx.lock();
-        let b = ctx.alloc_host(len * 4)?;
+        let need = len * 4;
+        // 풀에서 최소 적합 버퍼 재활용 (할당 syscall·vk 객체 회피).
+        let recycled = {
+            let mut pool = self.frame_pool.lock();
+            pool.iter()
+                .enumerate()
+                .filter(|(_, b)| b.bytes >= need)
+                .min_by_key(|(_, b)| b.bytes)
+                .map(|(i, _)| i)
+                .map(|i| pool.swap_remove(i))
+        };
+        let b = match recycled {
+            Some(b) => b,
+            None => {
+                let mut ctx = self.ctx.lock();
+                ctx.alloc_host(need)?
+            }
+        };
         let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.framebufs.lock().insert(h, b);
         Ok(h)
     }
     fn frame_free(&self, h: u64) -> Result<(), String> {
-        self.framebufs.lock().remove(&h);
+        let b = self.framebufs.lock().remove(&h);
+        if let Some(b) = b {
+            let mut pool = self.frame_pool.lock();
+            let total: usize = pool.iter().map(|b| b.bytes).sum();
+            if total + b.bytes <= FRAME_POOL_CAP {
+                pool.push(b);
+            }
+            // 상한 초과분은 종전대로 보류(파괴 없음) — 풀이 총량을 막는다.
+        }
         Ok(())
     }
     fn frame_write(&self, h: u64, data: &[f32]) -> Result<(), String> {
@@ -1505,6 +1536,49 @@ impl llm170_core::matmul::EwOps for VkAcc {
         xs_out: &mut [Vec<f32>],
     ) -> Result<(), String> {
         self.ffn_chain_gpu(xs, gate_w, up_w, down_w, xs_out)
+    }
+
+    /// plans/85 §1 — 디코드(t=1) shared expert gate+up: quant 1회 → gemv 2회
+    /// → SiluMul. 스크래치 gh/uh는 풀 기반 frame_alloc/frame_free.
+    /// frame_mm_group/frame_op가 각자 ctx를 잠그므로 여기엔 중첩 잠금이
+    /// 없다(직전 시도의 self-deadlock 원인 — ctx.lock 보유 중 frame_alloc).
+    fn shexp_gu(
+        &self, x: u64, wg: &Weight, wu: &Weight, h: u64,
+        _n_in: usize, n_hidden: usize,
+    ) -> Result<(), String> {
+        let gh = self.frame_alloc(n_hidden)?;
+        let uh = self.frame_alloc(n_hidden)?;
+        let r = self
+            .frame_mm_group(x, &[*wg, *wu], &[gh, uh], 1)
+            .and_then(|_| {
+                self.frame_op(&llm170_core::matmul::FrameOp::SiluMul {
+                    g: gh, u: uh, out: h, n: n_hidden,
+                })
+            });
+        let _ = self.frame_free(gh);
+        let _ = self.frame_free(uh);
+        r
+    }
+
+    /// plans/85 §1 — 디코드(t=1) shared expert down+가산: gemv 1회 →
+    /// mout += σ·dh (AxpyScaled — t=1이라 s[0] 판독과 정합).
+    fn shexp_da(
+        &self, h: u64, wd: &Weight, s: u64, mout: u64,
+        n_in: usize, _n_hidden: usize,
+    ) -> Result<(), String> {
+        if self.frame_t.load(std::sync::atomic::Ordering::Relaxed) != 1 {
+            return Err("shexp_da: t=1 전용 (frame_t≠1)".into());
+        }
+        let dh = self.frame_alloc(n_in)?;
+        let r = self
+            .frame_mm_group(h, &[*wd], &[dh], 1)
+            .and_then(|_| {
+                self.frame_op(&llm170_core::matmul::FrameOp::AxpyScaled {
+                    y: mout, x: dh, s, n: n_in,
+                })
+            });
+        let _ = self.frame_free(dh);
+        r
     }
 }
 
