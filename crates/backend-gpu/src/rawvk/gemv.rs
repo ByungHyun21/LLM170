@@ -389,8 +389,16 @@ impl VkAcc {
         binds.push((out_buf, out_off));
         binds.push((kb, 0));
         binds.push((gb, 0));
-        let ds2 = p.ds;
-        ctx.bind_bufs_off(ds2, &binds);
+        // 배치 모드: 녹화 중 p.ds 재기입은 불법 — 전문가별 신규 세트(배치 풀,
+        // end_batch_wait에서 일괄 해제). 비배치는 그대로 전용 세트.
+        let ds2 = if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            let ds = ctx.fresh_ds_for(&p, 11)?;
+            ctx.bind_bufs_off(ds, &binds);
+            ds
+        } else {
+            ctx.bind_bufs_off(p.ds, &binds);
+            p.ds
+        };
         let chunk_words = (ctx.max_ssbo / 4) as u32;
         let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32, chunk_words]);
         ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
@@ -976,6 +984,13 @@ impl llm170_core::matmul::FrameState for VkAcc {
             std::ptr::copy_nonoverlapping(perm.as_ptr(), r.0.ptr as *mut u32, rows);
             std::ptr::copy_nonoverlapping(inv.as_ptr(), r.2.ptr as *mut u32, rows);
         }
+        // plans/84 B: 게더→전문가별 GEMV→스캐터를 배치 세션으로 — 비배치
+        // run은 매 발사마다 제출+펜스 대기라 전문가 수만큼 동기가 걸린다
+        // (프레임 경로 2.9배 열세의 주원인). 1회 제출로 묶는다.
+        let batching = std::env::var_os("LLM170_VK_NOBATCH").is_none();
+        if batching {
+            ctx.begin_batch()?;
+        }
         // 4) 게더: xg[p] = xq[perm[p]] (u32 행)
         {
             let p = self.pipeline(&mut ctx, Slot::PermuteU32)?;
@@ -1002,6 +1017,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let ds2 = ctx.bind_ds(&p, &[ygb, ivb, ob])?;
             let push = push_u32s(&[n_out as u32, rows as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+        }
+        if batching {
+            ctx.end_batch_wait()?;
         }
         Ok(())
     }

@@ -260,6 +260,13 @@ impl VkCtx {
     }
 
     /// 배치용 fresh descriptor set — 전용 대형 풀 (op당 1세트, 제출 후 전량 해제).
+    /// plans/84 B: 지정 파이프라인 레이아웃으로 신규 세트 — fresh_ds가 직전
+    /// batch_dsl(다른 레이아웃일 수 있음)를 쓰는 함정 회피.
+    pub fn fresh_ds_for(&mut self, p: &Pipes, n_buf: u32) -> Result<vk::DescriptorSet, String> {
+        self.batch_dsl.set(Some((p.dsl, p.pool)));
+        self.fresh_ds(n_buf)
+    }
+
     pub fn fresh_ds(&mut self, _n_buf: u32) -> Result<vk::DescriptorSet, String> {
         unsafe {
             // 전용 배치 풀 지연 생성 (세트 256·버퍼 12×256)
