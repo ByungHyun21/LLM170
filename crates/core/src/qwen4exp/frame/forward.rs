@@ -860,6 +860,59 @@ pub(super) fn hc_mix_frame(
     if mark_attn && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}C.attn_mix"));
     }
+    // plans/86 §1 — t=1 hc mix 절대 대조(임시 진단): 디바이스 체인을 op별로
+    // 판독해 CPU 참조(stages/hc.rs 동일 산술)와 맞댄다. 첫 발산 op 특정용.
+    if t == 1 && il == 0 && kind == "attn" && std::env::var_os("LLM170_MIX_CHECK").is_some() {
+        let mut res = vec![0.0f32; hc * n];
+        acc.frame_read(f.res_hc, &mut res).map_err(Q4Error::Io)?;
+        let mut dxn = vec![0.0f32; hc * n];
+        let mut dlo = vec![0.0f32; f.lo_len];
+        let mut dinj = vec![0.0f32; hc];
+        let mut dgate = vec![0.0f32; hc * n];
+        let mut dmix = vec![0.0f32; n];
+        acc.frame_read(f.xn, &mut dxn).map_err(Q4Error::Io)?;
+        acc.frame_read(f.lo, &mut dlo).map_err(Q4Error::Io)?;
+        acc.frame_read(f.inj, &mut dinj).map_err(Q4Error::Io)?;
+        acc.frame_read(f.gate, &mut dgate).map_err(Q4Error::Io)?;
+        acc.frame_read(f.mix, &mut dmix).map_err(Q4Error::Io)?;
+        // CPU 참조 — stages/hc.rs hc_mix와 동일 산술(순수 CPU matmul).
+        let w_norm = model.f32_vec4(&format!("blk.{il}.hc_{kind}_norm.weight"))?;
+        let mut hxn = vec![0.0f32; hc * n];
+        for s in 0..hc {
+            let head = &res[s * n..(s + 1) * n];
+            hxn[s * n..(s + 1) * n]
+                .copy_from_slice(&crate::ops::rms_norm(head, &w_norm[s * n..(s + 1) * n], eps));
+        }
+        let w_down = model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
+        let mut hlo = vec![0.0f32; w_down.n_out as usize];
+        crate::matmul::matmul(&hxn, &w_down, &mut hlo);
+        let mut hinj = vec![0.0f32; hc];
+        let w_inject = model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;
+        crate::matmul::matmul(&hxn, &w_inject, &mut hinj);
+        for v in hlo.iter_mut() {
+            *v = crate::ops::silu(*v / hc as f32);
+        }
+        let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
+        let mut hgate = vec![0.0f32; hc * n];
+        crate::matmul::matmul(&hlo, &w_up, &mut hgate);
+        let mut hmix = vec![0.0f32; n];
+        for i in 0..n {
+            let mut m = 0.0f32;
+            for s in 0..hc {
+                let k = s * n + i;
+                m += hxn[k] * crate::ops::sigmoid(hgate[k]);
+            }
+            hmix[i] = m / hc as f32;
+        }
+        let md = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        eprintln!(
+            "# mix-check L{il} {kind}: rms={:.3e} lo={:.3e} inj={:.3e} gate={:.3e} mix={:.3e} (hlo0={:.5} dlo0={:.5} hinj0={:.5} dinj0={:.5})",
+            md(&dxn, &hxn), md(&dlo, &hlo), md(&dinj, &hinj), md(&dgate, &hgate), md(&dmix, &hmix),
+            hlo[0], dlo[0], hinj[0], dinj[0],
+        );
+    }
     sync_mark(acc, "hc.gate", f.mix)?;
     Ok(())
 }

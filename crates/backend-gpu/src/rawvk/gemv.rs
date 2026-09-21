@@ -3030,8 +3030,11 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         let mut got = vec![0f32; n];
         acc.frame_read(ah, &mut got)?;
         let mut mx = 0f64;
+        // CPU 참조(stages/hc.rs)와 동일: silu(x/div). (구 검증식 silu(x)/div 는
+        // 셰이더와 같은 잘못을 새겨넣고 있었다 — plans/86 §1.)
         for i in 0..n {
-            let exp = (a[i] / (1.0 + (-a[i] as f32).exp())) as f64 / 320.0;
+            let x = a[i] / 320.0f32;
+            let exp = (x / (1.0 + (-x).exp())) as f64;
             mx = mx.max((got[i] as f64 - exp).abs());
         }
         let ok = mx < 5e-6;
