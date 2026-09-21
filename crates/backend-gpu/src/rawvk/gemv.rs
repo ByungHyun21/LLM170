@@ -3967,6 +3967,234 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 acc.frame_free(sh)?;
             }
         }
+        // ── 16) GdnConv 절대 대조(t=1 순차판) — CPU 링 산술과 직접 비교 ──
+        // (plans/86 §1: §12는 청크 불변성만 — t<k-1 순차 커널은 커버 밖이었다)
+        {
+            use llm170_core::matmul::FrameHost as _FH3;
+            let (ch, ck, steps) = (48usize, 4usize, 3usize);
+            let mut s4 = 0x51ceu64;
+            let mut lc4 = move || {
+                s4 = s4.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s4 >> 33) as f32 / 2147483648.0 - 0.5
+            };
+            let cw: Vec<f32> = (0..ch * ck).map(|_| lc4()).collect();
+            let mut st: Vec<f32> = (0..(ck - 1) * ch).map(|_| lc4()).collect();
+            let qkv: Vec<f32> = (0..steps * ch).map(|_| lc4()).collect();
+            let src = acc.frame_alloc(steps * ch)?;
+            let cwb = acc.frame_alloc(ch * ck)?;
+            let stb = acc.frame_alloc((ck - 1) * ch)?;
+            let inb = acc.frame_alloc(ch)?;
+            let ob = acc.frame_alloc(ch)?;
+            acc.frame_write(src, &qkv)?;
+            acc.frame_write(cwb, &cw)?;
+            acc.frame_write(stb, &st)?;
+            acc.frame_begin(1);
+            let mut mo = 0f64;
+            for t in 0..steps {
+                acc.frame_op(&llm170_core::matmul::FrameOp::CopyRows {
+                    src, dst: inb, src_off: t * ch, dst_off: 0, n: ch,
+                })?;
+                acc.frame_op(&llm170_core::matmul::FrameOp::GdnConv {
+                    qkv: inb, cw: cwb, state: stb, out: ob, ch, k: ck, t_len: 1,
+                })?;
+                let mut got = vec![0f32; ch];
+                acc.frame_read(ob, &mut got)?;
+                // CPU 참조 — stages/gdn.rs conv 산술 동일열(상태도 진화).
+                for c in 0..ch {
+                    let mut sum = cw[c * ck + (ck - 1)] * qkv[t * ch + c];
+                    for j in 0..ck - 1 {
+                        sum += cw[c * ck + j] * st[j * ch + c];
+                    }
+                    let out_c = sum / (1.0 + (-sum).exp());
+                    for j in 0..ck - 2 {
+                        st[j * ch + c] = st[(j + 1) * ch + c];
+                    }
+                    st[(ck - 2) * ch + c] = qkv[t * ch + c];
+                    mo = mo.max((got[c] as f64 - out_c as f64).abs());
+                }
+            }
+            let mut stf = vec![0f32; (ck - 1) * ch];
+            acc.frame_read(stb, &mut stf)?;
+            let mut ms = 0f64;
+            for i in 0..st.len() {
+                ms = ms.max((stf[i] as f64 - st[i] as f64).abs());
+            }
+            eprintln!("[gcvabs] out={mo:.1e} st={ms:.1e}");
+            let ok = mo < 1e-6 && ms < 1e-6;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| GdnConvT1 out={mo:.1e} st={ms:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            for h in [src, cwb, stb, inb, ob] { acc.frame_free(h)?; }
+        }
+        // ── 17) GDN AR 절대 대조(t=1) — 전치 상태 + CPU 미러 ──
+        {
+            use llm170_core::matmul::FrameState as _FS3;
+            let (hk, hv, d) = (2usize, 4usize, 128usize);
+            let (ks, vs) = (hk * d, hv * d);
+            let mut s5 = 0x600du64;
+            let mut lc5 = move || {
+                s5 = s5.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s5 >> 33) as f32 / 2147483648.0 - 0.5
+            };
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let qs: Vec<f32> = (0..ks).map(|_| lc5() * scale).collect();
+            let kk: Vec<f32> = (0..ks).map(|_| lc5()).collect();
+            let vv: Vec<f32> = (0..vs).map(|_| lc5()).collect();
+            let beta: Vec<f32> = (0..hv).map(|_| 0.4 + 0.4 * lc5()).collect();
+            let g: Vec<f32> = (0..hv).map(|_| lc5() * 0.2).collect();
+            let mut bg = vec![0f32; hv * 2];
+            for h in 0..hv {
+                bg[h * 2] = beta[h];
+                bg[h * 2 + 1] = g[h].exp();
+            }
+            let mut st = vec![0f32; hv * d * d];
+            for x in st.iter_mut() { *x = lc5() * 0.05; }
+            // CPU 미러(사전 스케일 q) — gdn.rs gdn_ar_batch 산술 동일열.
+            let st_in = st.clone();
+            let mut st_cpu = st_in.clone();
+            let mut o_cpu = vec![0f32; vs];
+            for h in 0..hv {
+                let kh = h % hk;
+                let (qb, kb, vb) = (&qs[kh * d..kh * d + d], &kk[kh * d..kh * d + d], &vv[h * d..h * d + d]);
+                let s = &mut st_cpu[h * d * d..(h + 1) * d * d];
+                let mut sk = vec![0f32; d];
+                for kdim in 0..d {
+                    for dv in 0..d {
+                        let e = &mut s[kdim * d + dv];
+                        *e *= bg[h * 2 + 1];
+                        sk[dv] += *e * kb[kdim];
+                    }
+                }
+                for dv in 0..d {
+                    let delta = (vb[dv] - sk[dv]) * beta[h];
+                    for kdim in 0..d {
+                        s[kdim * d + dv] += kb[kdim] * delta;
+                    }
+                }
+                for dv in 0..d {
+                    let mut o = 0f32;
+                    for kdim in 0..d {
+                        o += s[kdim * d + dv] * qb[kdim];
+                    }
+                    o_cpu[h * d + dv] = o;
+                }
+            }
+            // 디바이스: 전치 상태 업로드 → AR → 판독 역전치.
+            let tr = |v: &[f32]| -> Vec<f32> {
+                let mut o = vec![0f32; v.len()];
+                for (cb, b) in v.chunks(d * d).enumerate() {
+                    let base = cb * d * d;
+                    for kd in 0..d {
+                        for dv in 0..d {
+                            o[base + dv * d + kd] = b[kd * d + dv];
+                        }
+                    }
+                }
+                o
+            };
+            let qh = acc.frame_alloc(ks)?;
+            let kh2 = acc.frame_alloc(ks)?;
+            let vh = acc.frame_alloc(vs)?;
+            let bh = acc.frame_alloc(hv * 2)?;
+            let sh = acc.frame_alloc(hv * d * d)?;
+            let oh = acc.frame_alloc(vs)?;
+            acc.frame_write(qh, &qs)?;
+            acc.frame_write(kh2, &kk)?;
+            acc.frame_write(vh, &vv)?;
+            acc.frame_write(bh, &bg)?;
+            acc.frame_write(sh, &tr(&st_in))?;
+            acc.frame_begin(1);
+            acc.frame_gdn_ar(qh, kh2, vh, bh, sh, oh, 1, hk, hv, d)?;
+            let mut og = vec![0f32; vs];
+            acc.frame_read(oh, &mut og)?;
+            let mut sg = vec![0f32; hv * d * d];
+            acc.frame_read(sh, &mut sg)?;
+            let sg = tr(&sg); // 역전치 — CPU 레이아웃으로
+            let mut mo = 0f64;
+            let mut ms = 0f64;
+            for i in 0..vs { mo = mo.max((og[i] as f64 - o_cpu[i] as f64).abs()); }
+            for i in 0..st_cpu.len() { ms = ms.max((sg[i] as f64 - st_cpu[i] as f64).abs()); }
+            eprintln!("[gnarabs] out={mo:.1e} st={ms:.1e}");
+            let ok = mo < 1e-4 && ms < 1e-4;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| GdnART1 out={mo:.1e} st={ms:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            for h in [qh, kh2, vh, bh, sh, oh] { acc.frame_free(h)?; }
+        }
+        // ── 18) 헤드 체인 절대 대조(t=1) — 실가중 output_hc + output GEMM ──
+        if let AnyModel::Q4(m4) = &model {
+            use llm170_core::matmul::FrameHost as _FH4;
+            let hp = &m4.hp;
+            let (n, hc) = (hp.n_embd, hp.hc);
+            let w_norm = m4.f32_vec4("output_hc_norm.weight").map_err(|e| e.to_string())?;
+            let w_down = m4.w4("output_hc_down.weight").map_err(|e| e.to_string())?;
+            let w_up = m4.w4("output_hc_up.weight").map_err(|e| e.to_string())?;
+            let w_out = m4.w4("output.weight").map_err(|e| e.to_string())?;
+            let mut s6 = 0x7a11u64;
+            let mut lc6 = move || {
+                s6 = s6.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s6 >> 33) as f32 / 2147483648.0 - 0.5
+            };
+            // res: 모든 스트림 동일(엔진 임베딩 방송을 미러) — norm 검증에 충분.
+            let row: Vec<f32> = (0..n).map(|_| lc6()).collect();
+            let mut res = vec![0f32; hc * n];
+            for s in 0..hc {
+                res[s * n..(s + 1) * n].copy_from_slice(&row);
+            }
+            let wn = acc.frame_alloc(hc * n)?;
+            acc.frame_write(wn, &w_norm)?;
+            let rh = acc.frame_alloc(hc * n)?;
+            let xnh = acc.frame_alloc(hc * n)?;
+            let loh = acc.frame_alloc(w_down.n_out as usize)?;
+            let gah = acc.frame_alloc(hc * n)?;
+            let hih = acc.frame_alloc(n)?;
+            let lgh = acc.frame_alloc(16)?;
+            acc.frame_write(rh, &res)?;
+            acc.frame_begin(1);
+            acc.frame_op(&llm170_core::matmul::FrameOp::RmsRows {
+                x: rh, w: wn, out: xnh, eps: hp.eps, n, w_reps: hc,
+            })?;
+            acc.frame_mm(xnh, &w_down, loh, 1)?;
+            acc.frame_op(&llm170_core::matmul::FrameOp::SiluDiv {
+                t: loh, div: hc as f32, n: w_down.n_out as usize,
+            })?;
+            acc.frame_mm(loh, &w_up, gah, 1)?;
+            acc.frame_op(&llm170_core::matmul::FrameOp::HcGateMean {
+                xn: xnh, gate: gah, out: hih, hc, n,
+            })?;
+            acc.frame_mm(hih, &w_out, lgh, 1)?;
+            let mut lg = vec![0f32; 16];
+            acc.frame_read(lgh, &mut lg)?;
+            // CPU 참조 — forward.rs 헤드 산술 동일열.
+            let mut hxn = vec![0f32; hc * n];
+            for s in 0..hc {
+                let nn = llm170_core::ops::rms_norm(&row, &w_norm[s * n..(s + 1) * n], hp.eps);
+                hxn[s * n..(s + 1) * n].copy_from_slice(&nn);
+            }
+            let mut hlo = vec![0f32; w_down.n_out as usize];
+            llm170_core::matmul::matmul(&hxn, &w_down, &mut hlo);
+            for v in hlo.iter_mut() { *v = llm170_core::ops::silu(*v / hc as f32); }
+            let mut hgate = vec![0f32; hc * n];
+            llm170_core::matmul::matmul(&hlo, &w_up, &mut hgate);
+            let mut hin = vec![0f32; n];
+            for i in 0..n {
+                let mut m = 0f32;
+                for s in 0..hc {
+                    let k = s * n + i;
+                    m += hxn[k] * (1.0 / (1.0 + (-hgate[k]).exp()));
+                }
+                hin[i] = m / hc as f32;
+            }
+            let mut hlg = vec![0f32; 16];
+            llm170_core::matmul::matmul(&hin, &w_out, &mut hlg);
+            let mut mx = 0f64;
+            for i in 0..16 { mx = mx.max((lg[i] as f64 - hlg[i] as f64).abs()); }
+            let scale = hlg.iter().fold(0f32, |a, &v| a.max(v.abs())) as f64;
+            eprintln!("[headabs] max|D|={mx:.3e} (scale={scale:.1})");
+            // 3연속 W4A8 GEMM + silu 증폭 — logit-diff.sh 의 MMA 클래스(maxrel<3e-2)와 동일 기준.
+            let ok = mx / scale.max(1.0) < 3e-2;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| HeadChain {mx:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            for h in [wn, rh, xnh, loh, gah, hih, lgh] { acc.frame_free(h)?; }
+        }
     }
     let _ = t0;
     Ok(format!(
