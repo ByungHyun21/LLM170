@@ -1191,3 +1191,21 @@ QSA selection (qsa_sel_dev) land. All four gates pass;
 vk-frame-check MoE chain re-verified against the per-expert width
 contract (probe updated; the earlier pass was reading stacked-stride
 aliases).
+
+## 2026-09-21 (25) — vk frame MoE launch batching; fresh-set layout trap (plans/84 B)
+
+frame_moe_gemm now wraps gather → per-expert GEMVs → scatter in a
+batch session (one submit). Trap found: under batching the per-expert
+path must allocate a FRESH descriptor set per expert — rebinding a
+recorded set between dispatches is illegal — and fresh_ds picks up
+whatever layout was last registered on the batch context; the gather
+pipeline's 3-binding layout then backed the GEMV's 11-binding set and
+segfaulted. Fixed with VkCtx::fresh_ds_for(&Pipes) which pins the
+layout. End-to-end frame run: 128.5 s → 122.2 s (~5%); the dominant
+remaining cost is the per-layer host grouping (ids readback + table
+build × 3 MoE GEMMs × 48 layers = ~144 sync points) — the same
+motivation as hip's device-group path (its own negative-result history
+in ledger (5) applies: device grouping only pays once down is
+covered too). Frame capability stays opt-in until that lands; the
+value path remains the default vk route. All four gates + the full
+vk-frame-check suite pass.
