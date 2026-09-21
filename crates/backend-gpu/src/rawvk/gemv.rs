@@ -104,7 +104,7 @@ pub struct VkAcc {
     ctx: Mutex<VkCtx>,
     pipes: Mutex<HashMap<Slot, Pipes>>,
     /// 가중치 캐시 (데이터 포인터 → 상주 청크들)
-    wcache: Mutex<HashMap<usize, Vec<VkBuf>>>,
+    wcache: Mutex<HashMap<(usize, usize), Vec<VkBuf>>>,
     tables: Mutex<Option<(VkBuf, VkBuf)>>,
     dummy: Mutex<Option<VkBuf>>,
     // 값-경로 버퍼 (필요시 성장)
@@ -268,9 +268,12 @@ impl VkAcc {
         Ok((a.buf, b.buf, self.dummy.lock().as_ref().unwrap().buf))
     }
 
-    /// 가중치 상주 (ptr 키 — mmap 안정) — 128MB 청크 (RADV maxStorageBufferRange).
+    /// 가중치 상주 ((ptr,len) 키 — mmap 안정) — max_ssbo 청크.
+    /// plans/86 §1b: ptr 단독 키는 같은 기저의 슬라이스 뷰(전문가 1개분)과
+    /// 전체 스택을 혼동한다 — 값경로 프리필이 적재한 1전문가 버퍼를 프레임
+    /// MoE가 오프셋 재결합하면 GPUVM PERMISSION 폴트. (ptr,len)으로 구분.
     fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
-        let key = w.data.as_ptr() as usize;
+        let key = (w.data.as_ptr() as usize, w.data.len());
         {
             let mut wc = self.wcache.lock();
             if let std::collections::hash_map::Entry::Vacant(e) = wc.entry(key) {
@@ -1284,6 +1287,19 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 5) 전문가별 GEMV — xg/yg 슬라이스 + 가중 전문가 오프셋.
         let wbufs = self.weight_bufs(&mut ctx, w)?;
         let per_expert = w.data.len() / ne;
+        // plans/86 §1b 진단 — 전문가 오프셋/청크 기하 (LLM170_MOE_SYNC=1).
+        if std::env::var_os("LLM170_MOE_SYNC").is_some() {
+            let sizes: Vec<usize> = {
+                let wc = self.wcache.lock();
+                wc.get(&(w.data.as_ptr() as usize, w.data.len()))
+                    .map(|bs| bs.iter().map(|b| b.bytes).collect())
+                    .unwrap_or_default()
+            };
+            eprintln!(
+                "# moe-geom ty={ty} ne={ne} per_expert={per_expert} chunks={} sizes={sizes:?} max_ssbo={} ids={idv:?}",
+                wbufs.len(), ctx.max_ssbo,
+            );
+        }
         for e in 0..ne {
             let r = off[e + 1] - off[e];
             if r == 0 {
