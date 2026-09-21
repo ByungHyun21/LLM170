@@ -23,6 +23,8 @@ pub struct DumpOpts {
     pub row0full: bool,
     pub bufhash: bool,
     pub moe: bool,
+    /// alloc — GPU 버퍼 할당 원장(plans/86 §5).
+    pub alloc: bool,
 }
 
 impl DumpOpts {
@@ -49,6 +51,8 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
             o.moe = true;
         } else if key == "checksum" {
             o.checksum = true;
+        } else if key == "alloc" {
+            o.alloc = true;
         }
     }
     o

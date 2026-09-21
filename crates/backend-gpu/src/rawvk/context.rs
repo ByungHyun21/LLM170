@@ -389,6 +389,9 @@ impl VkCtx {
         self.mem_ty = self.mem_ty_host;
         let r = self.alloc(bytes);
         self.mem_ty = saved;
+        if r.is_err() {
+            llm170_diag::alloc::report();
+        }
         if r.is_err() && bytes > (1 << 30) {
             // plans/84 B 진단: 대형 프레임 버퍼의 실패 원인 판별용.
             let bt = std::backtrace::Backtrace::force_capture();
@@ -400,6 +403,7 @@ impl VkCtx {
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
     /// bytes는 max_ssbo 이하 권장 (초과 시 호출부에서 청크 분할).
     pub fn alloc(&mut self, bytes: usize) -> Result<VkBuf, String> {
+        llm170_diag::alloc::record(site::current(), bytes);
         let r = self.alloc_inner(bytes);
         if r.is_err() && bytes > (1 << 30) {
             // plans/84 B 진단: 대형 버퍼(가중 청크/프레임) 실패 원인 판별.
@@ -993,5 +997,36 @@ impl VkCtx {
             self.bind_bufs(p.ds, bufs);
             Ok(p.ds)
         }
+    }
+}
+
+
+/// plans/86 §5 — 할당 사이트 태그(스레드 로컬 스코프). diag 원장이
+/// 어느 서브시스템이 예산을 쓰는지 구분한다. 기본 "misc".
+pub mod site {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CUR: Cell<&'static str> = const { Cell::new("misc") };
+    }
+
+    /// 스코프 가드 — 지정 사이트로 전환, 드롭 시 복원.
+    pub fn scope<F, R>(name: &'static str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        struct Restore(&'static str);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CUR.with(|c| c.set(self.0));
+            }
+        }
+        let prev = CUR.with(|c| c.replace(name));
+        let _r = Restore(prev);
+        f()
+    }
+
+    pub fn current() -> &'static str {
+        CUR.with(|c| c.get())
     }
 }
