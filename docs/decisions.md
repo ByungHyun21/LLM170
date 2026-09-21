@@ -1356,3 +1356,66 @@ chain itself is verified at the op level.
 
 Gates: all four green at the branch tip; vk frame chunk fence 16/63/64
 bits-identical (see plans/85 update).
+
+## (30) Vulkan frame pipeline completed — default ON
+
+**Correctness chain.** The t=1 frame decode logit contamination
+(blocker of plans/86 §1) was two independent kernel defects, found by
+per-op shadow checks (hip-vs-vk layer checksums, then an engine-side
+absolute CPU diff over the hc attn mix):
+- `silu_div.comp` computed silu(x)/div; every reference (CPU stages,
+  hip q4_silu_div) is silu(x/div). The hc low-rank `lo` collapsed to
+  ~0 in every layer, crushing the logit scale (top logit 6.2 vs 19.9).
+  The old frame_check §3 reference enshrined the same wrong formula.
+- `gdn_conv_seq.comp` (the t<k-1 decode path) gated 63 of 64 lanes and
+  ran a (ch/64)-sized grid — only 1/64 channels of the causal conv
+  were computed. Mirrored hip's channel=thread mapping.
+
+With both fixed, the VK_FRAME greedy 16-token stream equals the hip
+gate baseline (last token the documented 0.27nat tie).
+
+**GPUVM fault on fresh-Frame4 decode** (§1b): the weight cache was
+keyed by data pointer alone; value-prefill per-expert slice views share
+the base pointer with the full expert stacks, so the frame MoE GEMM
+offset-bound expert slices on a 1-expert buffer and faulted. Cache key
+is now (ptr, len).
+
+**QSA fully on device** (§2): fn_qk_norm_rope.comp ports hip
+qk_norm_rope (32-segment f32 partials -> f64 sequential sum, f64 rope,
+per-head tiled norm weights, k baked with kq_scale=1). No value-bridge
+fallback remains; device selection lists are bit-identical to host
+(SELCHECK, 8 steps x 24 layers).
+
+**Transactional fallback** (§3): decode/prefill frame attempts snapshot
+PLE state (hist, next_pos, conv ring) and restore it before the value
+fallback — ple_hash re-entry used to see a broken hist_valid and
+double-advance the ring, giving abort-point-dependent fallback tokens.
+LLM170_FRAME_FAILAT=<layer> injects failures for the acceptance test:
+every abort layer reproduces the pure value-path tokens. This also
+exposed a panic (mask_from_list indexing an empty slice) reachable
+whenever QSA pools have watermark holes (e.g. value prefill + fresh
+frame); fixed, and the missing upload-path qsa_attention_dev was
+implemented for VkAcc (cached scratch).
+
+**Allocation ledger + MoE scratch leak** (§5): LLM170_DUMP=alloc tags
+every GPU buffer allocation by site. It identified the pp4096 OOM:
+moebufs' all-four-must-fit growth never stabilized across gate/down
+size classes, reallocating 33.6GiB over one pp4096 run and overflowing
+the carve-out. Per-component growth: 79.8MiB total.
+
+**Cold start** (§6): weight uploads stage via sequential 8MiB preads
+from the part files (~1.2GB/s) instead of demand-paging the mmap
+(20-180MB/s). Cold-cache FN gate: 110.6s (< 3min criterion).
+
+**PLE stays host-bridged** (§7 review): the iq4_nl PLE table is
+26.8GiB; current residency is 77.1GiB (75.9 weights) of the 96GiB
+carve-out — device residency does not fit.
+
+**Default flip** (§8): frame_capable() now defaults ON
+(LLM170_VK_FRAME=0 kills). Justified by pp2048 +135%, pp4096 +158%,
+tg128 5.2x over the value path, with gates 4/4, vk-frame-check (incl.
+new absolute GdnConvT1/GdnART1/HeadChain sections) and the chunk fence
+16/63/64 bits-identical re-verified after the flip. The vk gate
+baseline was re-recorded: the frame sequence equals the canonical hip
+baseline embedded in the gate script (the live hip recording had
+drifted on this machine).
