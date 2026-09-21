@@ -9,8 +9,9 @@ layout(binding = 3) buffer Ou { float outv[]; };
 layout(push_constant) uniform PC { uint ch; uint k; uint t; } pc;
 void main() {
     uint c = gl_GlobalInvocationID.x;
-    uint u = gl_LocalInvocationID.x;
-    if (u != 0u || c >= pc.ch) return;
+    // hip gdn_conv/gdn_conv_t 와 동일 매핑: 채널=스레드(64레인 전부 활성).
+    // 구판의 "레인0만 t 순회 + grid ch/64" 는 채널 1/64만 계산했다(plans/86 §1).
+    if (c >= pc.ch) return;
     for (uint ti = 0u; ti < pc.t; ti++) {
         float sum = cw[c * pc.k + (pc.k - 1u)] * qkv[ti * pc.ch + c];
         for (uint j = 0u; j < pc.k - 1u; j++) sum += cw[c * pc.k + j] * state[j * pc.ch + c];

@@ -7,7 +7,6 @@ layout(push_constant) uniform PC { uint n; float div; } pc;
 void main() {
     uint j = gl_GlobalInvocationID.x;
     if (j >= pc.n) return;
-    float x = v[j];
-    float s = x / (1.0 + exp(-x));
-    v[j] = s / pc.div;
+    float x = v[j] / pc.div;
+    v[j] = x / (1.0 + exp(-x));
 }
