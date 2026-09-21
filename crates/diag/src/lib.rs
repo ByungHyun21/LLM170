@@ -10,6 +10,7 @@ pub mod flag;
 pub mod fp;
 pub mod span;
 pub mod dump;
+pub mod alloc;
 
 pub use trace::Ev;
 pub use trace::capture_on;
