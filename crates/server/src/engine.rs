@@ -662,7 +662,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         if want_gpu && q4_vk_runtime(&backend) {
             // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
             // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
-            match llm170_backend_gpu::new_q4_acc_vk() {
+            match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
                 Ok(acc) => {
                     eng = eng.with_acc(acc);
                     eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B 슬라이스2)");

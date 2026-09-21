@@ -309,7 +309,7 @@ fn run_q4_infer(
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
             if want_gpu && crate::engine::q4_vk_runtime_str(gpu_runtime) {
                 // plans/84 B — Vulkan 값경로(VkAcc). 프레임 미구현 → 값 경로.
-                match llm170_backend_gpu::new_q4_acc_vk() {
+                match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
                     Ok(acc) => {
                         eng = eng.with_acc(acc);
                         eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");

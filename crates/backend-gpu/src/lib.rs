@@ -15,6 +15,14 @@ pub fn new_q4_acc_vk() -> Result<std::sync::Arc<dyn llm170_core::matmul::Acceler
     let acc = rawvk::gemv::VkAcc::new()?;
     Ok(std::sync::Arc::new(acc))
 }
+/// plans/86 §6 — 파트 소스 지정판: 대형 가중 업로드가 mmap 폴트(20-180 MB/s)
+/// 대신 pread 스테이징(~1.2 GB/s)을 쓴다(hip staged_upload 미러).
+pub fn new_q4_acc_vk_with_sources(
+    parts: Vec<(usize, usize, std::path::PathBuf)>,
+) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
+    let acc = rawvk::gemv::VkAcc::new_with_sources(parts)?;
+    Ok(std::sync::Arc::new(acc))
+}
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawhip::probes::gpu_mem_free;
 pub use rawvk::decoder::inject as inject_rawvk;
