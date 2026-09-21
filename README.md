@@ -25,16 +25,16 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-Vulkan qwen4exp is back (plans/86): a device-resident frame pipeline
-(prefill + decode, QSA selection chain on device, pread-staged weight
-uploads) now runs by default — kill switch `LLM170_VK_FRAME=0`. The VK
-row (2026-09-21) is 2.3-5.2× the VK value path it replaced; absolute
-parity with HIP prefill is future work (grouped tile GEMM).
+Vulkan qwen4exp runs a device-resident frame pipeline (plans/86, 88):
+prefill + decode on device, direct-ids decode MoE, step-level
+batching (6 submits/step), device-grouped tile GEMMs, pread-staged
+weight uploads. Kill switch `LLM170_VK_FRAME=0`.
+
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
-| LLM170 vulkan (frame) | 10.7 | 10.2 | — | 2.25 |
+| LLM170 vulkan (frame) | 60.1 | 54.7 | — | 7.15 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
