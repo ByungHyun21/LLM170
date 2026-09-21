@@ -1,0 +1,101 @@
+#version 450
+
+// MoE 디바이스 그룹화 (plans/88 P2) — hip q4_moe_group_t1의 프리필 확장판.
+// 단일 블록 256스레드로 ids → off/perm/inv/rowexp/perm_pad/inv_pad/rows_pad
+// 전체를 1런치로 뺀다(호스트 ids d2h·정렬·h2d 3회 왕복 소거 — llama.cpp
+// count_experts 구조). 16행 패딩 도메인: 타일=전문가 규약(q4_gemm_*_ge 계열).
+//
+// 순열 결정성: 전문가 내부 순서는 공유 atomicAdd 경쟁으로 비결정적이다 —
+// 그러나 GEMM은 행별 독립 내적이고 산란은 inv로 원래 행을 찾으므로 최종
+// 결과는 순서와 무관하게 동일(청크 불변성 보존). hip판의 안정 카운팅은
+// 호스트 테이블과의 비트 대조(gcheck)용이지 결과 보존에 필요하지 않다.
+//
+// shared 예산: 513+513+513+512 int + 패딩 없음 — 8.2KB.
+layout(local_size_x = 256) in;
+const uint NT = 256u;
+layout(binding = 0) readonly buffer Ids { uint ids[]; };
+layout(binding = 1) buffer Offbuf { uint offv[]; };      // [ne+1]
+layout(binding = 2) buffer Rpbuf { uint rows_pad_out[]; };  // [2] 진단 여유
+layout(binding = 3) buffer Txbuf { uint tilexp[]; };      // [bound/16 + 1]
+layout(binding = 4) buffer Pmbuf { uint perm[]; };        // [rows] 비패딩
+layout(binding = 5) buffer Ivbuf { uint inv[]; };         // [rows]
+layout(binding = 6) buffer Ivpbuf { uint inv_pad[]; };    // [rows]
+layout(binding = 7) buffer Rxbuf { uint rowexp[]; };      // [bound] 패딩 도메인
+layout(binding = 8) buffer Ppdbuf { uint perm_pad[]; };   // [bound]
+layout(push_constant) uniform PC { uint ne; uint rows; uint bound; } pc;
+
+shared int cnt[513];
+shared int off_[513];
+shared int off_pad[513];
+shared int cur[512];
+shared int rows_pad_sh;
+
+void main() {
+    uint l = gl_LocalInvocationID.x;
+    if (pc.ne > 512u) return;
+    for (uint e = l; e <= pc.ne; e += NT) { cnt[e] = 0; off_[e] = 0; off_pad[e] = 0; }
+    if (l < 512u) cur[l] = 0;
+    barrier();
+    for (uint i = l; i < pc.rows; i += NT) {
+        uint e = min(ids[i], pc.ne - 1u);
+        atomicAdd(cnt[e], 1);
+    }
+    barrier();
+    if (l == 0u) {
+        int acc = 0, accp = 0;
+        for (uint e = 0; e < pc.ne; e++) {
+            off_[e] = acc;
+            acc += cnt[e];
+            off_pad[e] = accp;
+            accp += (cnt[e] + 15) / 16 * 16;
+        }
+        off_[pc.ne] = acc;
+        off_pad[pc.ne] = accp;
+        rows_pad_sh = accp < 16 ? 16 : accp;
+        offv[pc.ne] = uint(acc);
+    }
+    barrier();
+    uint rp = uint(rows_pad_sh);
+    if (l == 0u) {
+        rows_pad_out[0] = rp;
+    }
+    for (uint e = l; e < pc.ne; e += NT) {
+        cur[e] = off_[e];
+        offv[e] = uint(off_[e]);
+    }
+    barrier();
+    for (uint i = l; i < pc.rows; i += NT) {
+        uint e = min(ids[i], pc.ne - 1u);
+        int p = atomicAdd(cur[e], 1);
+        perm[p] = i;
+        inv[i] = uint(p);
+        rowexp[p] = e;
+    }
+    barrier();
+    // 패딩 도메인 병렬 충전: pd의 전문가 = off_pad 상한탐색(9단).
+    for (uint pd = l; pd < pc.bound; pd += NT) {
+        uint e;
+        if (pd < rp) {
+            uint lo = 0u, hi = pc.ne;     // 마지막 e: off_pad[e] <= pd
+            while (lo + 1u < hi) {
+                uint mid = (lo + hi) >> 1u;
+                if (uint(off_pad[mid]) <= pd) lo = mid; else hi = mid;
+            }
+            e = lo;
+        } else {
+            e = 0u;                       // [rp, bound) 제로필(게더가 인덱스 0행을 읽게)
+        }
+        if ((pd & 15u) == 0u && pd < rp) tilexp[pd >> 4u] = e;
+        if (pd == 0u) rows_pad_out[1] = rp;   // 진단: 이중 기록
+        rowexp[pd] = e;
+        uint i = pd - uint(off_pad[e]);
+        uint r = uint(off_[e + 1] - off_[e]);
+        if (pd < rp && i < r) {
+            uint src = perm[uint(off_[e]) + i];
+            perm_pad[pd] = src;
+            inv_pad[src] = pd;
+        } else {
+            perm_pad[pd] = 0u;
+        }
+    }
+}

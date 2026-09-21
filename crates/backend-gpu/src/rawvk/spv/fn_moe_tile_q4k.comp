@@ -1,0 +1,148 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// MoE 그룹 타일 GEMM — q4_K (plans/88 P2). hip q4_gemm_q4k_ge 직역 +
+// 공유 스테이징: 패딩 도메인은 타일=전문가라 16 출력행의 가중치를 블록이
+// 협동 적재해 WG() 청크 분해(정수 나눗셈)를 행 기저 2회로 상환한다.
+// 그리드 (⌈n_out/16⌉, ⌈bound/16⌉) — 상한 발사, r ≥ *rows_pad 조기탈출
+// (hip 동일). x는 패딩 도메인 게더(xg)를 r행으로 읽고, 행별 산술은
+// 스레드 full-K 직렬(hip ge와 동일 표현식: dot4 정수, acc 부동 직렬).
+// 게이트: n_in ≤ 4096 (shared 16행×576워드 = 36KB).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };    // 원본 행 도메인(간접)
+layout(binding = 9) buffer Yg { float outv[]; };           // 패딩 도메인 출력
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; }; // [1]
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; }; // 패딩→원본 행
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+// mode=0: MoE 패딩 도메인(rowexp 전문가·perm_pad 간접 x). mode=1: 밀집 직접
+// (전문가 0, x행 = r 그대로) — 프리필 밀집 GEMV(gemv3 t-루프, 실측 ~5GB/s)의
+// 타일 대체. rows 상한은 mode1에서 n_out 타일 y그리드가 t/16.
+
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+// 타일 16출력행 분량 — n_in ≤ 4096 기준 16×576워드 = 36KB.
+shared uint sh[16 * 576];
+
+void main() {
+    int ox = int(gl_LocalInvocationID.x);
+    int rx = int(gl_LocalInvocationID.y);
+    int o = int(gl_WorkGroupID.x) * 16 + ox;
+    uint r0 = gl_WorkGroupID.y * 16u;
+    uint rp = pc.mode == 1u ? pc.rows : rows_pad[0];
+    uint n_in = pc.n_in;
+    uint n_super = n_in >> 8;
+    uint row_words = n_super * 36u;
+    int tid = int(gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x);
+    if (r0 >= rp) return;   // 타일 전체가 상한 넘음 — 블록 균일 조기탈출(배리어 없음)
+    uint e = pc.mode == 1u ? 0u : rowexp[r0];
+    // 협동 스테이징: 행 우선 순회(행 기저 청크 산술은 행당 1회).
+    for (uint row = 0u; row < 16u; row++) {
+        uint orow = gl_WorkGroupID.x * 16u + row;
+        if (orow >= pc.n_out) break;
+        uint64_t wbase = uint64_t(e) * uint64_t(pc.per_expert_bytes)
+                       + uint64_t(orow) * uint64_t(row_words) * 4u;
+        uint w0 = uint(wbase >> 2);
+        uint c0 = w0 / pc.chunk_words;
+        uint lim = (c0 + 1u) * pc.chunk_words;
+        uint srow = row * row_words;
+        for (uint col = uint(tid); col < row_words; col += 256u) {
+            uint wi = w0 + col;
+            sh[srow + col] = wi < lim
+                ? Wsel(c0, wi - c0 * pc.chunk_words)
+                : Wsel(c0 + 1u, wi - (c0 + 1u) * pc.chunk_words);
+        }
+    }
+    barrier();
+    int r = int(r0) + rx;
+    if (o < int(pc.n_out) && uint(r) < rp) {
+        uint xr0 = (pc.mode == 1u ? uint(r) : perm_pad[uint(r)]) * pc.xq_w;
+        uint xw_base = n_in >> 2;
+        const uint ones = 0x01010101u;
+        uint srow = uint(ox) * row_words;   // 가중 행은 출력열(ox)
+        float acc = 0.0;
+        for (uint sIdx = 0u; sIdx < n_super; sIdx++) {
+            uint wq = srow + sIdx * 36u;
+            vec2 dd = unpackHalf2x16(sh[wq]);
+            float d = dd.x, dmin = dd.y;
+            uint sc0 = sh[wq + 1u], sc1 = sh[wq + 2u], sc2 = sh[wq + 3u];
+            for (int it = 0; it < 4; it++) {
+                uint qq[8];
+                for (int m = 0; m < 8; m++) qq[m] = sh[wq + 4u + uint(it * 8 + m)];
+                int j1 = 2 * it;
+                int j2 = 2 * it + 1;
+                uint r1 = uint(j1 & 3) * 8u;
+                uint r2 = uint(j2 & 3) * 8u;
+                uint b1_j  = j1 < 4 ? (sc0 >> r1) & 0xFFu : (sc1 >> r1) & 0xFFu;
+                uint b1_j4 = j1 < 4 ? (sc1 >> r1) & 0xFFu : (sc2 >> r1) & 0xFFu;
+                uint b1_jm4 = (sc0 >> r1) & 0xFFu;
+                uint s1v, m1v;
+                if (j1 < 4) { s1v = b1_j & 63u; m1v = b1_j4 & 63u; }
+                else {
+                    s1v = (b1_j4 & 0xFu) | ((b1_jm4 >> 6) << 4);
+                    m1v = (b1_j4 >> 4) | ((b1_j >> 6) << 4);
+                }
+                uint b2_j  = j2 < 4 ? (sc0 >> r2) & 0xFFu : (sc1 >> r2) & 0xFFu;
+                uint b2_j4 = j2 < 4 ? (sc1 >> r2) & 0xFFu : (sc2 >> r2) & 0xFFu;
+                uint b2_jm4 = (sc0 >> r2) & 0xFFu;
+                uint s2v, m2v;
+                if (j2 < 4) { s2v = b2_j & 63u; m2v = b2_j4 & 63u; }
+                else {
+                    s2v = (b2_j4 & 0xFu) | ((b2_jm4 >> 6) << 4);
+                    m2v = (b2_j4 >> 4) | ((b2_j >> 6) << 4);
+                }
+                uint x1w = xr0 + sIdx * 64u + uint(it * 16);
+                uint x2w = x1w + 8u;
+                int il1 = 0, il2 = 0;
+                for (int m = 0; m < 8; m++) {
+                    uint y1 = xq[x1w + uint(m)];
+                    il1 += dot4(qq[m] & 0x0F0F0F0Fu, y1, 0);
+                    uint y2 = xq[x2w + uint(m)];
+                    il2 += dot4((qq[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                }
+                // 부동 표현식은 gemv3 계열과 동일형(2항 분리 가산 + 저장합) —
+                // hip ge형(내부 차감 단일곱)은 반올림 클래스가 갈라진다.
+                int qsb = int(n_in >> 2) + int(n_in >> 5);
+                uint jg1 = sIdx * 8u + uint(2 * it);      // 전역 서브블록 인덱스
+                int qsum1 = int(xq[xr0 + uint(qsb) + jg1 * 2u]) + int(xq[xr0 + uint(qsb) + jg1 * 2u + 1u]);
+                int qsum2 = int(xq[xr0 + uint(qsb) + jg1 * 2u + 2u]) + int(xq[xr0 + uint(qsb) + jg1 * 2u + 3u]);
+                float yd1 = uintBitsToFloat(xq[xr0 + xw_base + sIdx * 8u + uint(2 * it)]);
+                float yd2 = uintBitsToFloat(xq[xr0 + xw_base + sIdx * 8u + uint(2 * it + 1)]);
+                acc += yd1 * (d * float(s1v)) * float(il1);
+                acc -= yd1 * (dmin * float(m1v)) * float(qsum1);
+                acc += yd2 * (d * float(s2v)) * float(il2);
+                acc -= yd2 * (dmin * float(m2v)) * float(qsum2);
+            }
+        }
+        outv[uint(r) * pc.n_out + uint(o)] = acc;
+    }
+}

@@ -57,6 +57,11 @@ const FN_IDX_RANK_SPV: &[u8] = include_bytes!("spv/fn_idx_rank.spv");
 const FN_IDX_EXPAND_SPV: &[u8] = include_bytes!("spv/fn_idx_expand.spv");
 /// plans/85 §2 — 프레임 로짓 행별 GPU argmax(동률 최저 인덱스).
 const FN_ARGMAX_ROWS_SPV: &[u8] = include_bytes!("spv/fn_argmax_rows.spv");
+/// plans/88 P2 — MoE 그룹 프리필: 디바이스 그룹화·q4_K/q5_1 타일·융합 산란.
+const FN_MOE_GROUP_SPV: &[u8] = include_bytes!("spv/fn_moe_group.spv");
+const FN_MOE_TILE_Q4K_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k.spv");
+const FN_MOE_TILE_Q51_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51.spv");
+const FN_TILE_Q8_SPV: &[u8] = include_bytes!("spv/fn_tile_q8.spv");
 /// plans/88 P1 — f32/BF16 밀집 GEMV(mm_group F32·BF16 멤버 — 값폴백 소거).
 const FN_MM_F32_SPV: &[u8] = include_bytes!("spv/fn_mm_f32.spv");
 /// plans/88 P1 — MoE direct-ids GEMV: gemv3의 ids 구동판(그리드 (n_out, rows),
@@ -112,6 +117,13 @@ enum Slot {
     FnMoeIds,
     /// plans/88 P1 — f32/BF16 밀집 GEMV.
     FnMmf32,
+    /// plans/88 P2 — MoE 디바이스 그룹화(단일 블록).
+    FnMoeGroup,
+    /// plans/88 P2 — q4_K/q5_1 그룹 타일 GEMM(패딩 도메인).
+    FnMoeTileQ4K,
+    FnMoeTileQ51,
+    /// plans/88 P2 — q8_0 밀집 프리필 타일(K-슬라이스 스테이징).
+    FnTileQ8,
 }
 
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
@@ -133,6 +145,10 @@ pub struct VkAcc {
     // 값-경로 버퍼 (필요시 성장)
     xfbuf: Mutex<Option<VkBuf>>,
     xbuf: Mutex<Option<VkBuf>>,
+    /// plans/88 P2 — 프레임 quant 출력(디바이스 로컬). gemv3/타일의 xq 재판독은
+    /// n_out배 증폭이라 GTT(host-visible)에서 3-4GB/s에 갇혔다 — L2 캐시가
+    /// 동작하는 디바이스 메모리로 보낸다(값경로 xbuf 는 호스트 스테이징용 유지).
+    xq_dev: Mutex<Option<VkBuf>>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -165,6 +181,28 @@ pub struct VkAcc {
     frame_t: std::sync::atomic::AtomicUsize,
     /// plans/88 P1 — 프레임 스텝 배치 활성(값경로 미참조 게이트).
     frame_step_batch: std::sync::atomic::AtomicBool,
+    /// plans/88 P2 — MoE 라우팅 세대(MoeTop10마다 증가 — 그룹화 캐시 키).
+    moe_gen: std::sync::atomic::AtomicU64,
+    /// plans/88 P2 — 그룹화 캐시: 같은 세대의 3개 GEMM이 테이블을 공유.
+    moe_grp: Mutex<Option<MoeGrp>>,
+}
+
+/// plans/88 P2 — MoE 그룹화 상주 자산(디바이스 테이블 + 스크래치).
+struct MoeGrp {
+    generation: u64,
+    rows: usize,
+    ids_h: u64,
+    bound: usize,
+    off: VkBuf,
+    rows_pad: VkBuf,
+    tilexp: VkBuf,
+    perm: VkBuf,
+    inv: VkBuf,
+    inv_pad: VkBuf,
+    rowexp: VkBuf,
+    perm_pad: VkBuf,
+    yg: VkBuf,
+    yg_rows: usize,
 }
 
 /// 빈 VkBuf 자리표 — 풀 엔트리 지연 생성용.
@@ -227,6 +265,10 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnArgmaxRows => "argmax_rows",
         Slot::FnMoeIds => "moe_ids",
         Slot::FnMmf32 => "mm_f32",
+        Slot::FnMoeGroup => "moe_group",
+        Slot::FnMoeTileQ4K => "moe_tile_q4k",
+        Slot::FnMoeTileQ51 => "moe_tile_q51",
+        Slot::FnTileQ8 => "tile_q8",
      }
  }
 
@@ -268,6 +310,7 @@ impl VkAcc {
             dummy: Mutex::new(None),
             xfbuf: Mutex::new(None),
             xbuf: Mutex::new(None),
+            xq_dev: Mutex::new(None),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
             rbufs: Mutex::new(None),
@@ -286,6 +329,8 @@ impl VkAcc {
             frame_next: std::sync::atomic::AtomicU64::new(1),
             frame_t: std::sync::atomic::AtomicUsize::new(1),
             frame_step_batch: std::sync::atomic::AtomicBool::new(false),
+            moe_gen: std::sync::atomic::AtomicU64::new(0),
+            moe_grp: Mutex::new(None),
         })
     }
 
@@ -335,6 +380,10 @@ impl VkAcc {
             Slot::Silu => (SILU_SPV, 3, 4),
             Slot::FnMoeIds => (FN_MOE_IDS_SPV, 13, 28), // 8W+xq+out+ktab+grid+ids
             Slot::FnMmf32 => (FN_MM_F32_SPV, 10, 20),    // 8W+x(f32)+out
+            Slot::FnMoeGroup => (FN_MOE_GROUP_SPV, 9, 12),        // 3×u32
+            Slot::FnMoeTileQ4K => (FN_MOE_TILE_Q4K_SPV, 13, 28),  // 8W+xq+yg+rowexp+rp+perm_pad +mode+rows
+            Slot::FnMoeTileQ51 => (FN_MOE_TILE_Q51_SPV, 13, 28),  // +mode+rows
+            Slot::FnTileQ8 => (FN_TILE_Q8_SPV, 10, 20),  // 8W+xq+out
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -1422,7 +1471,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let xb = self.fbuf(x)?;
         let ob = self.fbuf(out)?;
         let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
-        let xq = self.value_buf(&mut ctx, &self.xbuf, rows * xq_w * 4)?;
+        let xq = self.xq_dev_buf(&mut ctx, rows * xq_w * 4)?;
         // 2) quant (프레임 f32 → 디바이스 xq)
         {
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
@@ -1477,6 +1526,178 @@ impl llm170_core::matmul::FrameState for VkAcc {
             binds.push(idb);
             let ds2 = ctx.bind_ds(&p, &binds)?;
             ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, rows as u32, 1)?;
+            return Ok(());
+        }
+        // 2c) 그룹 타일 (plans/88 P2) — 프리필 대량행: 디바이스 그룹화(세대
+        // 캐시 — 같은 라우팅의 3개 GEMM이 테이블 공유) + 16×16 타일(패딩
+        // 도메인, 타일=전문가, x는 perm_pad 간접 판독 — 게더 패스 불필요) +
+        // inv_pad 산란. 호스트 ids 왕복·512 전문가 루프 전부 소거(B2).
+        // 산술: hip ge/w_ids 열과 동일 표현식 — 프리필 클래스 재기록 대상.
+        // 강제 스위치: LLM170_MOE_TILE=0 (구 호스트 그룹화 경로).
+        let tile_ok = rows > 0
+            && std::env::var_os("LLM170_MOE_TILE").map(|v| v != "0").unwrap_or(true)
+            && match w.ty {
+                GgmlType::Q4K => n_in <= 4096,
+                GgmlType::Q5_1 => n_in <= 2048,
+                _ => false,
+            };
+        if tile_ok {
+            let idb = self.fbuf(ids)?;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            let per_expert = w.data.len() / ne;
+            let bound = rows + 16 * ne;
+            let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+            let chunk_words = (ctx.max_ssbo / 4) as u32;
+            let generation = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
+            let hit = {
+                let g = self.moe_grp.lock();
+                g.as_ref().is_some_and(|g| g.generation == generation && g.rows == rows && g.ids_h == ids)
+            };
+            if !hit {
+                // 테이블 성장(단일 상한 bound — 그룹 커널이 [rp,bound)를 0채움).
+                crate::rawvk::context::site::scope("moe_grp", || -> Result<(), String> {
+                    let mut g = self.moe_grp.lock();
+                    let e = g.get_or_insert_with(|| MoeGrp {
+                        generation: 0, rows: 0, ids_h: 0, bound: 0,
+                        off: vkbuf_null(), rows_pad: vkbuf_null(), tilexp: vkbuf_null(),
+                        perm: vkbuf_null(), inv: vkbuf_null(), inv_pad: vkbuf_null(),
+                        rowexp: vkbuf_null(), perm_pad: vkbuf_null(),
+                        yg: vkbuf_null(), yg_rows: 0,
+                    });
+                    if e.bound < bound {
+                        e.rowexp = ctx.alloc_host(bound * 4)?;
+                        e.perm_pad = ctx.alloc_host(bound * 4)?;
+                        e.tilexp = ctx.alloc_host((bound / 16 + 1) * 4)?;
+                    }
+                    if e.rows < rows {
+                        e.perm = ctx.alloc_host(rows * 4)?;
+                        e.inv = ctx.alloc_host(rows * 4)?;
+                        e.inv_pad = ctx.alloc_host(rows * 4)?;
+                    }
+                    e.off = ctx.alloc_host((ne + 1) * 4)?;
+                    e.rows_pad = ctx.alloc_host(8)?;
+                    Ok(())
+                })?;
+                let pg = self.pipeline(&mut ctx, Slot::FnMoeGroup)?;
+                let (ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb) = {
+                    let g = self.moe_grp.lock();
+                    let g = g.as_ref().unwrap();
+                    // 바인딩순 = 셰이더 선언순: off, rows_pad, tilexp, perm, inv,
+                    // inv_pad, rowexp, perm_pad (초판이 inv 를 건너뛰어 전부 어긋남).
+                    (g.off.buf, g.rows_pad.buf, g.tilexp.buf, g.perm.buf, g.inv.buf, g.inv_pad.buf, g.rowexp.buf, g.perm_pad.buf)
+                };
+                let dsg = ctx.bind_ds(&pg, &[idb, ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
+                let push = push_u32s(&[ne as u32, rows as u32, bound as u32]);
+                ctx.run(pg.pl, dsg, pg.pipe, &push, 1, 1, 1)?;
+                {
+                    let mut g = self.moe_grp.lock();
+                    let gi = g.as_mut().unwrap();
+                    gi.generation = generation;
+                    gi.rows = rows;
+                    gi.ids_h = ids;
+                    gi.bound = gi.bound.max(bound);
+                }
+                if std::env::var_os("LLM170_MOE_GCHECK").is_some() {
+                    // 진단: 그룹 테이블 불변식 검증(전문가 내 순서는 atomic이라
+                    // 비결정 — 순서 무관 불변식으로 판정).
+                    ctx.end_batch_wait()?;
+                    let idv: Vec<u32> = {
+                        let g = self.framebufs.lock();
+                        let b = g.get(&ids).ok_or("ids 핸들 없음")?;
+                        unsafe { std::slice::from_raw_parts(b.ptr as *const u32, rows) }.to_vec()
+                    };
+                    let gg = self.moe_grp.lock();
+                    let gg = gg.as_ref().unwrap();
+                    let rd = |b: &VkBuf, n: usize| unsafe {
+                        std::slice::from_raw_parts(b.ptr as *const u32, n)
+                    };
+                    let dev_perm_pad = rd(&gg.perm_pad, bound);
+                    let dev_inv_pad = rd(&gg.inv_pad, rows);
+                    let dev_rowexp = rd(&gg.rowexp, bound);
+                    let mut hoff = vec![0usize; ne + 1];
+                    for &e in &idv { hoff[(e as usize).min(ne - 1) + 1] += 1; }
+                    for e in 0..ne { hoff[e + 1] += hoff[e]; }
+                    let mut hpoff = vec![0usize; ne + 1];
+                    for e in 0..ne { hpoff[e + 1] = hpoff[e] + (hoff[e + 1] - hoff[e]).div_ceil(16) * 16; }
+                    let rows_pad = hpoff[ne].max(16);
+                    let rp_dev = unsafe { std::slice::from_raw_parts(gg.rows_pad.ptr as *const u32, 2) }[0] as usize;
+                    let rp_dbg = unsafe { std::slice::from_raw_parts(gg.rows_pad.ptr as *const u32, 2) };
+                    let mut bad = 0usize;
+                    let mut seen = vec![false; rows];
+                    if rp_dev != rows_pad {
+                        eprintln!("[gcheck] rows_pad dev={rp_dev} host={rows_pad} dbg1={}", rp_dbg[1]);
+                        bad += 1;
+                    }
+                    for pd in 0..rows_pad {
+                        let e = dev_rowexp[pd] as usize;
+                        if e >= ne || !(hpoff[e]..hpoff[e + 1]).contains(&pd) {
+                            if bad < 6 { eprintln!("[gcheck] rowexp[{pd}]={e} 세그 불일치"); }
+                            bad += 1;
+                            continue;
+                        }
+                        let i = pd - hpoff[e];
+                        let r = hoff[e + 1] - hoff[e];
+                        let src = dev_perm_pad[pd] as usize;
+                        if i < r {
+                            if src >= rows || idv[src] as usize != e {
+                                if bad < 6 { eprintln!("[gcheck] perm_pad[{pd}]={src} 전문가 불일치(e={e})"); }
+                                bad += 1;
+                            } else if seen[src] {
+                                if bad < 6 { eprintln!("[gcheck] perm_pad[{pd}]={src} 중복"); }
+                                bad += 1;
+                            } else {
+                                seen[src] = true;
+                            }
+                            if dev_inv_pad[src] as usize != pd {
+                                if bad < 10 { eprintln!("[gcheck] inv_pad[{src}]={} != pd={pd}", dev_inv_pad[src]); }
+                                bad += 1;
+                            }
+                        } else if src != 0 {
+                            if bad < 6 { eprintln!("[gcheck] 패딩 perm_pad[{pd}]={src} != 0"); }
+                            bad += 1;
+                        }
+                    }
+                    let miss = seen.iter().filter(|s| !**s).count();
+                    if miss > 0 && bad < 10 {
+                        eprintln!("[gcheck] 커버 누락 {miss}행");
+                    }
+                    let dev_off2 = rd(&gg.off, ne + 1);
+                    eprintln!("[gcheck] rows={rows} rows_pad={rows_pad} bad={bad} miss={miss} off[ne]={} off[0..3]={:?} rowexp[0..6]={:?} perm_pad[0..6]={:?}",
+                        dev_off2[ne], &dev_off2[..3], &dev_rowexp[..6], &dev_perm_pad[..6]);
+                }
+            }
+            let (rxb, rpb, ppb, ivb, ygb) = {
+                let mut g = self.moe_grp.lock();
+                let gi = g.as_mut().unwrap();
+                let need_yg = gi.bound * n_out * 4;
+                if gi.yg.bytes < need_yg {
+                    gi.yg = crate::rawvk::context::site::scope("moe_grp", || ctx.alloc(need_yg))?;
+                    gi.yg_rows = gi.bound;
+                }
+                (gi.rowexp.buf, gi.rows_pad.buf, gi.perm_pad.buf, gi.inv_pad.buf, gi.yg.buf)
+            };
+            let p = self.pipeline(&mut ctx, if w.ty == GgmlType::Q4K { Slot::FnMoeTileQ4K } else { Slot::FnMoeTileQ51 })?;
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(xq);
+            binds.push(ygb);
+            binds.push(rxb);
+            binds.push(rpb);
+            binds.push(ppb);
+            let ds2 = ctx.bind_ds(&p, &binds)?;
+            // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
+            let push = push_u32s(&[
+                n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, 0u32,
+                rows as u32,
+            ]);
+            ctx.run(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32, 1)?;
+            // 산란: out[i] = yg[inv_pad[i]] (행 순서 복원 — SiluMul/wsum 소비).
+            let ps = self.pipeline(&mut ctx, Slot::PermuteF32)?;
+            let dss = ctx.bind_ds(&ps, &[ygb, ivb, ob])?;
+            let push = push_u32s(&[n_out as u32, rows as u32]);
+            ctx.run(ps.pl, dss, ps.pipe, &push, rows as u32, 1, 1)?;
             return Ok(());
         }
         // 1) ids 판독(호스트 그룹화) — direct-ids 가 걸러준 프리필 대량행만.
@@ -1608,6 +1829,15 @@ impl llm170_core::matmul::FrameState for VkAcc {
 }
 
 impl VkAcc {
+    /// plans/88 P2 — 프레임 quant 출력용 디바이스 로컬 버퍼(성장 재할당).
+    fn xq_dev_buf(&self, ctx: &mut VkCtx, need: usize) -> Result<vk::Buffer, String> {
+        let mut g = self.xq_dev.lock();
+        if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+            *g = Some(crate::rawvk::context::site::scope("xq_dev", || ctx.alloc(need.max(1 << 20)))?);
+        }
+        Ok(g.as_ref().unwrap().buf)
+    }
+
     /// plans/88 P1 — 프레임 op 진입 시 배치 재개(플러시 후 세그먼트 재결합).
     fn frame_resume_batch(&self, ctx: &mut VkCtx) {
         if self.frame_step_batch.load(std::sync::atomic::Ordering::Relaxed)
@@ -1820,7 +2050,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         };
         let has_quant = ws.iter().any(|w| vk_ty(w.ty).is_some());
         let xq = if has_quant {
-            let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+            let xq = self.xq_dev_buf(&mut ctx, t * xq_w * 4)?;
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
@@ -1871,6 +2101,57 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             let wbufs = self.weight_bufs(&mut ctx, w)?;
             match vk_ty(w.ty) {
                 Some(ty) => {
+                    if std::env::var_os("LLM170_VK_MMDBG").is_some() {
+                        eprintln!("[mm] ty={ty} n_in={n_in} n_out={n_out} t={t} bytes={}", w.data.len());
+                    }
+                    // plans/88 P2 — 프리필(t≥2) 밀집 타일: gemv3 t-루프는
+                    // 실측 ~5GB/s(gemv 6.6s/208tok). 타일(K-슬라이스 스테이징)로
+                    // 대체 — 산술 클래스는 동일 표현식·스레드 직렬 누산.
+                    // 스위치: LLM170_VK_DTILE=0 이면 종전 gemv.
+                    let dense_tile = t >= 2
+                        && std::env::var_os("LLM170_VK_DTILE").map(|v| v != "0").unwrap_or(true)
+                        && match w.ty {
+                            GgmlType::Q8_0 => true,
+                            GgmlType::Q4K => n_in <= 4096,
+                            GgmlType::Q5_1 => n_in <= 2048,
+                            _ => false,
+                        };
+                    if dense_tile {
+                        let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+                        let chunk_words = (ctx.max_ssbo / 4) as u32;
+                        let mut binds: Vec<vk::Buffer> = wbufs.clone();
+                        while binds.len() < 8 {
+                            binds.push(dbuf);
+                        }
+                        binds.push(xq);
+                        binds.push(ob);
+                        match w.ty {
+                            GgmlType::Q8_0 => {
+                                let p = self.pipeline(&mut ctx, Slot::FnTileQ8)?;
+                                let ds2 = ctx.bind_ds(&p, &binds)?;
+                                // PC: n_in, n_out, chunk_words, xq_w, t.
+                                let push = push_u32s(&[
+                                    n_in as u32, n_out as u32, chunk_words, xq_w as u32, t as u32,
+                                ]);
+                                ctx.run(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, t.div_ceil(16) as u32, 1)?;
+                            }
+                            _ => {
+                                let slot = if w.ty == GgmlType::Q4K { Slot::FnMoeTileQ4K } else { Slot::FnMoeTileQ51 };
+                                let p = self.pipeline(&mut ctx, slot)?;
+                                let mut b2 = binds.clone();
+                                b2.push(dbuf); // rowexp
+                                b2.push(dbuf); // rows_pad
+                                b2.push(dbuf); // perm_pad
+                                let ds2 = ctx.bind_ds(&p, &b2)?;
+                                // PC: n_in, n_out, per_expert(0), chunk_words, xq_w, mode=1, t.
+                                let push = push_u32s(&[
+                                    n_in as u32, n_out as u32, 0u32, chunk_words, xq_w as u32, 1u32, t as u32,
+                                ]);
+                                ctx.run(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, t.div_ceil(16) as u32, 1)?;
+                            }
+                        }
+                        continue;
+                    }
                     self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
                 }
                 None => {
@@ -2056,6 +2337,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let ds2 = ctx.bind_ds(&p, &[rb, ib, wb])?;
                 let push = push_u32s(&[n_exp as u32, k_sel as u32]);
                 ctx.run(p.pl, ds2, p.pipe, &push, t_cur as u32, 1, 1)?;
+                // plans/88 P2 — 라우팅 세대 증가: 그룹화 캐시 무효화 키.
+                self.moe_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             O::MoeWeightedSum { ys, wt, out, k, n } => {
                 let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
@@ -3547,6 +3830,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             for r in 0..n_out.min(16) {
                 llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
                 let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+                if std::env::var_os("LLM170_DBG_8").is_some() && j == 0 && r < 6 {
+                    eprintln!("[8] r={r} got={:.6} ref={:.6}", got[j * n_out + r], dot);
+                }
                 mx = mx.max((dot as f64 - got[j * n_out + r] as f64).abs());
             }
         }
@@ -3554,6 +3840,42 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         if !ok { fails += 1; }
         report.push_str(&format!("frame_mm max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
         acc.frame_free(xh)?; acc.frame_free(oh)?;
+    }
+    // ── 8b) frame_mm q4_K 밀집 (plans/88 P2): mode-1 타일 산술 분리 검증 —
+    //    그룹화(perm/rowexp) 없이 타일 커널 자체의 CPU 대조. ──
+    {
+        use llm170_core::matmul::FrameHost;
+        if let AnyModel::Q4(m) = &model {
+            if let Ok(w4k) = m.w4("blk.0.ffn_gate_shexp.weight") {
+                let ni = w4k.n_in as usize;
+                let no = w4k.n_out as usize;
+                let xs4: Vec<Vec<f32>> = (0..t).map(|_| (0..ni).map(|_| lcg()).collect()).collect();
+                let xh = acc.frame_alloc(ni * t)?;
+                let oh = acc.frame_alloc(no * t)?;
+                let mut flat = Vec::with_capacity(ni * t);
+                for row in &xs4 { flat.extend_from_slice(row); }
+                acc.frame_write(xh, &flat)?;
+                acc.frame_mm(xh, &w4k, oh, t)?;
+                let mut got = vec![0f32; no * t];
+                acc.frame_read(oh, &mut got)?;
+                let mut mx = 0f64;
+                let mut ref_row = vec![0f32; ni];
+                for (j, x) in xs4.iter().enumerate() {
+                    for r in 0..no.min(12) {
+                        llm170_core::quant::dequant_row(w4k.ty, w4k.data, r as u64, ni as u64, &mut ref_row);
+                        let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+                        if std::env::var_os("LLM170_DBG_8B").is_some() && j == 0 && r < 4 {
+                            eprintln!("[8b] r={r} got={:.6} ref={:.6}", got[j * no + r], dot);
+                        }
+                        mx = mx.max((dot as f64 - got[j * no + r] as f64).abs());
+                    }
+                }
+                let ok = mx < 5e-3;
+                if !ok { fails += 1; }
+                report.push_str(&format!("| frame_mm-q4k max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
+                acc.frame_free(xh)?; acc.frame_free(oh)?;
+            }
+        }
     }
     // ── 9) MoE: top10 → 그룹 GEMM → 가중합 (게이트 가중, k=10) ──
     {
@@ -3702,6 +4024,72 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             let ok = mx < 3e-2;
             if !ok { fails += 1; }
             report.push_str(&format!("| MoE-down-ids(k={k}) max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
+            for h in [rh, idh, wth, mxh, mgh] { acc.frame_free(h)?; }
+        }
+    }
+    // ── 9c) MoE 타일 대량행 (plans/88 P2): t=210·k=10 → rows=2100 — 디바이스
+    //    그룹화+타일 경로의 CPU 대조. 소형(§9 t=3)은 direct-ids만 지나가
+    //    않으므로 대량 행이 필요하다. ──
+    {
+        use llm170_core::matmul::{FrameHost, FrameState};
+        if let AnyModel::Q4(_) = &model {
+            let k = 10usize;
+            let ne = 512usize;
+            let t2 = std::env::var("LLM170_T2").ok().and_then(|v| v.parse().ok()).unwrap_or(210usize);
+            let wg = match &model {
+                AnyModel::Q4(m) => m.w4("blk.0.ffn_gate_exps.weight").map_err(|e| e.to_string())?,
+                AnyModel::Q35(_) => unreachable!(),
+            };
+            let n_in_m = wg.n_in as usize;
+            let n_out_m = wg.n_out as usize / ne;
+            // t2토큰 × ne 라우트 — 균등 랜덤이면 대부분의 전문가가 비게 되어
+            // rows=2100이 희소 행을 만든다(실측 결함 재현 조건).
+            let route: Vec<f32> = (0..t2 * ne).map(|_| lcg() * 4.0).collect();
+            let mxs: Vec<Vec<f32>> = (0..t2 * k).map(|_| (0..n_in_m).map(|_| lcg()).collect()).collect();
+            let rh = acc.frame_alloc(t2 * ne)?;
+            let idh = acc.frame_alloc(t2 * k)?;
+            let wth = acc.frame_alloc(t2 * k)?;
+            let mxh = acc.frame_alloc(t2 * k * n_in_m)?;
+            let mgh = acc.frame_alloc(t2 * k * n_out_m)?;
+            acc.frame_write(rh, &route)?;
+            let mut flat = Vec::with_capacity(t2 * k * n_in_m);
+            for row in &mxs { flat.extend_from_slice(row); }
+            acc.frame_write(mxh, &flat)?;
+            acc.frame_begin(t2);
+            acc.frame_op(&llm170_core::matmul::FrameOp::MoeTop10 {
+                route: rh, ids: idh, wt: wth, n_exp: ne, k_sel: k,
+            })?;
+            acc.frame_moe_gemm(mxh, &wg, idh, mgh, ne, k)?;
+            acc.frame_begin(t);
+            let mut got = vec![0f32; t2 * k * n_out_m];
+            acc.frame_read(mgh, &mut got)?;
+            let mut ids_g = vec![0u32; t2 * k];
+            {
+                acc.frame_sync();
+                let g = acc_frame_ptr(&acc, idh);
+                unsafe { std::ptr::copy_nonoverlapping(g as *const u32, ids_g.as_mut_ptr(), t2 * k) };
+            }
+            // CPU 참조: (토큰,슬롯) 행별 디양자 내적 — 순열과 무관하게 행 자체가 맞는지.
+            let mut mx = 0f64;
+            let mut ref_row = vec![0f32; n_in_m];
+            for row in 0..t2 * k {
+                let e = ids_g[row] as usize;
+                for j in 0..n_out_m.min(4) {
+                    llm170_core::quant::dequant_row(wg.ty, wg.data, (e * n_out_m + j) as u64, n_in_m as u64, &mut ref_row);
+                    let dot: f32 = ref_row.iter().zip(mxs[row].iter()).map(|(a, b)| a * b).sum();
+                    let d = (got[row * n_out_m + j] as f64 - dot as f64).abs();
+                    if std::env::var_os("LLM170_DBG_9C3").is_some() && d > 5e-3 && row < 40 {
+                        eprintln!("[9c3] row={row} e={e} j={j} got={:.6} ref={:.6} d={d:.4}", got[row * n_out_m + j], dot);
+                    }
+                    if std::env::var_os("LLM170_DBG_9C2").is_some() && row < 210 {
+                        eprintln!("[9c] row={row} e={e} j={j} got={:.6} ref={:.6}", got[row * n_out_m + j], dot);
+                    }
+                    mx = mx.max(d);
+                }
+            }
+            let ok = mx < 3e-2;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| MoE-tile-2100 max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
             for h in [rh, idh, wth, mxh, mgh] { acc.frame_free(h)?; }
         }
     }

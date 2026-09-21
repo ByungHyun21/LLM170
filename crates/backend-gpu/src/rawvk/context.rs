@@ -935,7 +935,7 @@ impl VkCtx {
         } else {
             let labels = ts.labels.borrow();
             let per = self.ts_period_val;
-            let mut agg: std::collections::HashMap<&str, (f64, usize)> = std::collections::HashMap::new();
+            let mut agg: std::collections::HashMap<&str, (f64, usize, f64)> = std::collections::HashMap::new();
             let mut tot = 0.0f64;
             for (k, lbl) in labels.iter().enumerate() {
                 let a = 2 * k;
@@ -943,9 +943,10 @@ impl VkCtx {
                     break;
                 }
                 let dt = (buf[a + 1] - buf[a]) as f64 * per / 1e6; // ms
-                let e = agg.entry(lbl.as_str()).or_insert((0.0, 0));
+                let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
                 e.0 += dt;
                 e.1 += 1;
+                e.2 = e.2.max(dt);
                 tot += dt;
             }
             let ns = self.submits.get();
@@ -953,8 +954,8 @@ impl VkCtx {
             self.submits.set(0);
             let mut v: Vec<_> = agg.into_iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
-            for (k, (e, c)) in v.iter().take(24) {
-                eprintln!("[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회)", k, e / *c as f64);
+            for (k, (e, c, mx)) in v.iter().take(24) {
+                eprintln!("[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회, max {mx:6.3}ms)", k, e / *c as f64);
             }
         }
         ts.n.set(0);
