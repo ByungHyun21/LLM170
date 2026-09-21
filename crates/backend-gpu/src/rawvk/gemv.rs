@@ -177,6 +177,7 @@ fn push_u32s(vals: &[u32]) -> Vec<u8> {
 const FRAME_POOL_CAP: usize = 64 << 20;
 impl VkAcc {
     pub fn new() -> Result<Self, String> {
+        llm170_diag::alloc::set_on(llm170_diag::dump::opts().alloc);
         let ctx = VkCtx::new()?;
         if !ctx.coop_matrix {
             eprintln!("rawvk: coop matrix 미지원 (타일 경로 M3에서 필요)");
@@ -288,6 +289,7 @@ impl VkAcc {
     /// MoE가 오프셋 재결합하면 GPUVM PERMISSION 폴트. (ptr,len)으로 구분.
     fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
         let key = (w.data.as_ptr() as usize, w.data.len());
+        crate::rawvk::context::site::scope("weight", || {
         {
             let mut wc = self.wcache.lock();
             if let std::collections::hash_map::Entry::Vacant(e) = wc.entry(key) {
@@ -306,14 +308,15 @@ impl VkAcc {
                 e.insert(bufs);
             }
         }
-        let bufs: Vec<vk::Buffer> = {
-            let wc = self.wcache.lock();
-            wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
-        };
-        if bufs.len() > 8 {
-            return Err(format!("가중 청크 {}개 > 8 슬롯 (M2 한계)", bufs.len()));
-        }
-        Ok(bufs)
+            let bufs: Vec<vk::Buffer> = {
+                let wc = self.wcache.lock();
+                wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
+            };
+            if bufs.len() > 8 {
+                return Err(format!("가중 청크 {}개 > 8 슬롯 (M2 한계)", bufs.len()));
+            }
+            Ok(bufs)
+        })
     }
 
     /// GEMV 1회 발사: 가중 청크(8) + xq + out + ktab + grid = 12 바인딩.
@@ -473,7 +476,7 @@ impl VkAcc {
             let mut xf = self.xfbuf.lock();
             let need = t * n_in * 4;
             if !xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                *xf = Some(ctx.alloc_host(need.max(1 << 21))?);
+                *xf = Some(crate::rawvk::context::site::scope("value_stage", || ctx.alloc_host(need.max(1 << 21)))?);
             }
             let b = xf.as_ref().unwrap();
             for (ti, row) in xs.iter().enumerate() {
@@ -498,7 +501,7 @@ impl VkAcc {
     fn value_buf(&self, ctx: &mut VkCtx, slot: &Mutex<Option<VkBuf>>, need: usize) -> Result<vk::Buffer, String> {
         let mut g = slot.lock();
         if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-            *g = Some(ctx.alloc_host(need.max(1 << 21))?);
+            *g = Some(crate::rawvk::context::site::scope("value_stage", || ctx.alloc_host(need.max(1 << 21)))?);
         }
         Ok(g.as_ref().unwrap().buf)
     }
@@ -807,10 +810,10 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let mut m = self.qsa_pools.lock();
             let e = m.get_mut(&(full_idx, seq)).unwrap();
             if e.2.bytes < need.0 {
-                e.2 = ctx.alloc_host(need.0)?;
+                e.2 = crate::rawvk::context::site::scope("qsa_pool", || ctx.alloc_host(need.0))?;
             }
             if e.3.bytes < need.1 {
-                e.3 = ctx.alloc_host(need.1)?;
+                e.3 = crate::rawvk::context::site::scope("qsa_pool", || ctx.alloc_host(need.1))?;
             }
         }
         let (ikb, bkb) = {
@@ -835,7 +838,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let ikw_b = {
                 let mut g = self.qsa_ikw.lock();
                 if !g.as_ref().is_some_and(|b| b.bytes >= ikw.len() * 4) {
-                    *g = Some(ctx.alloc_host((ikw.len() * 4).max(4096))?);
+                    *g = Some(crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host((ikw.len() * 4).max(4096)))?);
                 }
                 g.as_ref().unwrap().clone()
             };
@@ -954,7 +957,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                 }
             };
             if need {
-                *g = Some((
+                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
                     ctx.alloc_host(iqr_bytes.max(1 << 16))?,
                     ctx.alloc_host(scr_bytes.max(4096))?,
                     ctx.alloc_host(scr_bytes.max(4096))?,
@@ -962,7 +965,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                     ctx.alloc_host((idx_dim * 4).max(1 << 16))?,
                     ctx.alloc_host(sd_bytes.max(1 << 16))?,
                     ctx.alloc_host(8)?,
-                ));
+                )))?);
             }
         }
         let (iqr, scr, flg, iqwb, csb, sdev, ofdev) = {
@@ -1140,8 +1143,10 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let mut g = self.qsa_up_bufs.lock();
             let ok = g.as_ref().is_some_and(|b| b.0.bytes >= ck.len() * 4 && b.1.bytes >= cv.len() * 4);
             if !ok {
-                let kb = ctx.alloc_host((ck.len() * 4).max(1 << 16))?;
-                let vb = ctx.alloc_host((cv.len() * 4).max(1 << 16))?;
+                let (kb, vb) = crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
+                    ctx.alloc_host((ck.len() * 4).max(1 << 16))?,
+                    ctx.alloc_host((cv.len() * 4).max(1 << 16))?,
+                )))?;
                 let (_, _, old_si, old_so) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
                 *g = Some((kb, vb, old_si, old_so));
             }
@@ -1170,7 +1175,7 @@ impl VkAcc {
         if let Some(b) = self.qk_consts.lock().get(&key) {
             return Ok(b.clone());
         }
-        let b = ctx.alloc_host(v.len().max(1) * 4)?;
+        let b = crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host(v.len().max(1) * 4))?;
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr as *mut f32, v.len()) };
         self.qk_consts.lock().insert(key, b.clone());
         Ok(b)
@@ -1182,8 +1187,10 @@ impl VkAcc {
         let ok = g.as_ref().is_some_and(|b| b.2.bytes >= si * 4 && b.3.bytes >= so * 4);
         if !ok {
             let (old_ck, old_cv, _, _) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
-            let sib = ctx.alloc_host((si * 4).max(1 << 16))?;
-            let sob = ctx.alloc_host((so * 4).max(1 << 16))?;
+            let (sib, sob) = crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
+                ctx.alloc_host((si * 4).max(1 << 16))?,
+                ctx.alloc_host((so * 4).max(1 << 16))?,
+            )))?;
             *g = Some((old_ck, old_cv, sib, sob));
         }
         let b = g.as_ref().unwrap();
@@ -1347,16 +1354,25 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let need_yg = rows * n_out * 4;
         {
             let mut g = self.moebufs.lock();
-            let ok = g.as_ref().map(|(pm, xg, iv, yg)| {
-                pm.bytes >= rows * 4 && xg.bytes >= need_xg && iv.bytes >= rows * 4 && yg.bytes >= need_yg
-            }).unwrap_or(false);
-            if !ok {
-                let pm = ctx.alloc((rows * 4).max(1 << 16))?;
-                let xg = ctx.alloc(need_xg.max(1 << 16))?;
-                let iv = ctx.alloc((rows * 4).max(1 << 16))?;
-                let yg = ctx.alloc(need_yg.max(1 << 16))?;
-                *g = Some((pm, xg, iv, yg));
-            }
+            // plans/86 §5 — 컴포넌트별 성장. 종전 전부-만족 검사는 gate(yg 52MB)와
+            // down(yg 210MB)이 크기 계급을 달리해 매호출 4버퍼 재할당 → 48층×3gemm×
+            // 청크마다 누적(pp4096 실측 33.6GiB, 카브아웃 오버플로→GTT 전이→OOM).
+            let e = g.get_or_insert_with(|| (vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
+            crate::rawvk::context::site::scope("moe_scratch", || -> Result<(), String> {
+                if e.0.bytes < rows * 4 {
+                    e.0 = ctx.alloc((rows * 4).max(1 << 16))?;
+                }
+                if e.1.bytes < need_xg {
+                    e.1 = ctx.alloc(need_xg.max(1 << 16))?;
+                }
+                if e.2.bytes < rows * 4 {
+                    e.2 = ctx.alloc((rows * 4).max(1 << 16))?;
+                }
+                if e.3.bytes < need_yg {
+                    e.3 = ctx.alloc(need_yg.max(1 << 16))?;
+                }
+                Ok(())
+            })?;
         }
         let (pmb, xgb, ivb, ygb) = {
             let g = self.moebufs.lock();
@@ -1449,10 +1465,10 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 Some(b) => b.0.bytes < sc_bytes || b.1.bytes < out_bytes,
             };
             if need {
-                *g = Some((
+                *g = Some(crate::rawvk::context::site::scope("argmax", || Ok::<_, String>((
                     ctx.alloc_host(sc_bytes.max(1 << 16))?,
                     ctx.alloc_host(out_bytes.max(4096))?,
-                ));
+                )))?);
             }
         }
         let (scb, ob) = {
@@ -1516,7 +1532,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
         if std::env::var_os("LLM170_VK_POOL").is_some_and(|v| v == "0") {
             let mut ctx = self.ctx.lock();
-            let b = ctx.alloc_host(len * 4)?;
+            let b = crate::rawvk::context::site::scope("frame", || ctx.alloc_host(len * 4))?;
             let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.framebufs.lock().insert(h, b);
             return Ok(h);
@@ -1536,7 +1552,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             Some(b) => b,
             None => {
                 let mut ctx = self.ctx.lock();
-                ctx.alloc_host(need)?
+                crate::rawvk::context::site::scope("frame", || ctx.alloc_host(need))?
             }
         };
         let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
