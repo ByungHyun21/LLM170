@@ -399,6 +399,37 @@ impl Frame4 {
     }
 }
 
+/// plans/86 §3 — 프레임 시도 트랜잭션 스냅샷.
+///
+/// 프레임 디코드 시도는 실패 직전까지 호스트 상태를 부분 진화시킨다:
+/// `ple_hash`는 hist/next_pos 를, `ple_block`은 conv 링을 진화시킨다. 실패 후
+/// 값경로 폴백이 같은 스텝을 처음부터 재계산하면 이중 진화가 된다 — 특히
+/// ple_hash 재실행은 `hist_valid`가 이미 깨져(eos 패딩 히스토리) 잘못된
+/// n-gram 행을 낸다(85 실측: 중단 지점별 폴백 토큰 66/18/14078 분기).
+///
+/// pos 는 시도 중 불변(성공 후 호출부가 진행), QSA kv/idx 캐시는 pos 인덱스
+/// 쓰기라 동일 스텝 재실행에 멱등 — 스냅샷 대상에서 제외. GPU 상주 상태는
+/// 폴백과 함께 프레임이 폐기되므로 무관.
+pub struct PleSnap {
+    hist: Vec<u32>,
+    next_pos: u32,
+    conv: Vec<f32>,
+}
+
+pub fn ple_snap(st: &SeqState4) -> PleSnap {
+    PleSnap {
+        hist: st.ple_hist.clone(),
+        next_pos: st.ple_next_pos,
+        conv: st.ple_conv.clone(),
+    }
+}
+
+pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
+    st.ple_hist = s.hist;
+    st.ple_next_pos = s.next_pos;
+    st.ple_conv = s.conv;
+}
+
 /// 프레임 스텝 시작 알림 — 버퍼는 t_max 크기이므로 op 커널이 토큰 수를
 /// 버퍼 길이에서 유도할 수 없다. 명시적으로 전달한다.
 fn fs_begin(acc: &dyn Accelerator, t: usize) {

@@ -137,6 +137,8 @@ pub struct VkAcc {
     qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
     /// plans/86 §2 — qk_norm_rope 상수(qn/kn/cs 타일) (ptr,len) 키 상주.
     qk_consts: Mutex<HashMap<(usize, usize), VkBuf>>,
+    /// plans/86 §4 — QSA 업로드 판 스크래치 (ck, cv, sel_idx, sel_off) — 성장 재할당.
+    qsa_up_bufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
     qsa_ctx: std::sync::atomic::AtomicUsize,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
@@ -196,6 +198,7 @@ impl VkAcc {
             moebufs: Mutex::new(None),
             argmax_bufs: Mutex::new(None),
             qk_consts: Mutex::new(HashMap::new()),
+            qsa_up_bufs: Mutex::new(None),
             qsa_pools: Mutex::new(HashMap::new()),
             qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
@@ -1086,12 +1089,63 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
         let cb = vk::Buffer::from_raw(ck as u64);
         let vb = vk::Buffer::from_raw(cv as u64);
-        let si_b = ctx.alloc_host(sel_idx.len() * 4)?;
-        unsafe { std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len()) };
-        let so_b = ctx.alloc_host(sel_off.len() * 4)?;
-        unsafe { std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len()) };
+        // plans/86 §4 — sel 스크래치 캐시(종전 매호출 alloc_host 누출).
+        let (si_b, so_b) = self.qsa_sel_scratch(&mut ctx, sel_idx.len(), sel_off.len())?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
+            std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
+        }
         let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
         let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, si_b.buf, so_b.buf, ob])?;
+        let mut push = kq_scale.to_le_bytes().to_vec();
+        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
+        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+    }
+
+    /// 업로드 판 어텐션 — 호스트 ck/cv 를 스크래치에 올려 동일 커널(plans/86 §3:
+    /// §2 이후 프레임 폴백 꼬리가 이 경로를 요구한다 — 종전 미구현으로 CPU 폴백,
+    /// 그 폴백의 mask_from_list(&[]) 가 패닉이었다).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev(
+        &self,
+        q: u64,
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        if hd != 256 {
+            return Err(format!("vk qsa_attention_dev: hd={hd} 미지원"));
+        }
+        let mut ctx = self.ctx.lock();
+        let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
+        let (si_b, so_b) = self.qsa_sel_scratch(&mut ctx, sel_idx.len(), sel_off.len())?;
+        let (ckb, cvb) = {
+            let mut g = self.qsa_up_bufs.lock();
+            let ok = g.as_ref().is_some_and(|b| b.0.bytes >= ck.len() * 4 && b.1.bytes >= cv.len() * 4);
+            if !ok {
+                let kb = ctx.alloc_host((ck.len() * 4).max(1 << 16))?;
+                let vb = ctx.alloc_host((cv.len() * 4).max(1 << 16))?;
+                let (_, _, old_si, old_so) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
+                *g = Some((kb, vb, old_si, old_so));
+            }
+            let b = g.as_ref().unwrap();
+            (b.0.clone(), b.1.clone())
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(ck.as_ptr(), ckb.ptr as *mut f32, ck.len());
+            std::ptr::copy_nonoverlapping(cv.as_ptr(), cvb.ptr as *mut f32, cv.len());
+            std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
+            std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
+        }
+        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
+        let ds2 = ctx.bind_ds(&p, &[qb, ckb.buf, cvb.buf, si_b.buf, so_b.buf, ob])?;
         let mut push = kq_scale.to_le_bytes().to_vec();
         push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
         ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
@@ -1099,6 +1153,20 @@ impl llm170_core::matmul::QsaOps for VkAcc {
 }
 
 impl VkAcc {
+    /// plans/86 §4 — sel_idx/sel_off 업로드 스크래치(성장 재할당, 매호출 alloc 회피).
+    fn qsa_sel_scratch(&self, ctx: &mut VkCtx, si: usize, so: usize) -> Result<(VkBuf, VkBuf), String> {
+        let mut g = self.qsa_up_bufs.lock();
+        let ok = g.as_ref().is_some_and(|b| b.2.bytes >= si * 4 && b.3.bytes >= so * 4);
+        if !ok {
+            let (old_ck, old_cv, _, _) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
+            let sib = ctx.alloc_host((si * 4).max(1 << 16))?;
+            let sob = ctx.alloc_host((so * 4).max(1 << 16))?;
+            *g = Some((old_ck, old_cv, sib, sob));
+        }
+        let b = g.as_ref().unwrap();
+        Ok((b.2.clone(), b.3.clone()))
+    }
+
     /// 프레임 핸들 → 상주 버퍼 (없으면 Err).
     fn fbuf(&self, h: u64) -> Result<vk::Buffer, String> {
         self.framebufs

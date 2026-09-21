@@ -73,7 +73,7 @@ fn mask_from_list(
     t: usize,
     n_past: usize,
 ) -> Vec<bool> {
-    if !mask_all[t].is_empty() {
+    if mask_all.get(t).is_some_and(|m| !m.is_empty()) {
         return mask_all[t].clone();
     }
     let mut m = vec![false; n_past];
