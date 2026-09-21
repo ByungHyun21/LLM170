@@ -1479,8 +1479,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
 impl llm170_core::matmul::FrameHost for VkAcc {
     /// plans/84 B: 프레임 op군이 부분 구현(엘리먼트와이스+MoE) — 완성 전에는
     /// 옵트인(LLM170_VK_FRAME=1)일 때만 엔진이 프레임 경로에 들어온다.
+    /// plans/86 §8 — 프레임 경로 완성(§1 정확성·§2 QSA 디바이스화·§5 성능) 후
+    /// 기본 ON. 킬스위치 LLM170_VK_FRAME=0.
     fn frame_capable(&self) -> bool {
-        std::env::var_os("LLM170_VK_FRAME").is_some()
+        std::env::var("LLM170_VK_FRAME").map(|v| v != "0").unwrap_or(true)
     }
     /// plans/85 §2 — 프레임 로짓 행별 argmax: fn_argmax_rows 2단 판.
     /// 동률 최저 인덱스 — CPU greedy_from과 동일 의미. 미구현이면 greedy
