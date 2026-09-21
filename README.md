@@ -25,12 +25,16 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-No Vulkan backend for qwen4exp (plans/64 §7); all rows are HIP.
-Decode +4% from plans/83 launch-fusion work (17.41 → 18.10 baseline).
+Vulkan qwen4exp is back (plans/86): a device-resident frame pipeline
+(prefill + decode, QSA selection chain on device, pread-staged weight
+uploads) now runs by default — kill switch `LLM170_VK_FRAME=0`. The VK
+row (2026-09-21) is 2.3-5.2× the VK value path it replaced; absolute
+parity with HIP prefill is future work (grouped tile GEMM).
 
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
+| LLM170 vulkan (frame) | 10.7 | 10.2 | — | 2.25 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
@@ -39,12 +43,10 @@ Decode +4% from plans/83 launch-fusion work (17.41 → 18.10 baseline).
 | tg single | **18.10-18.43** | 17.43 |
 | np4 aggregate | **45.9** | 41.1 *(HTTP†)* |
 
-### Quality (2026-09-19)
-
+- Greedy gates: 27B hip / 27B vulkan / FN hip / FN vulkan all PASS
+  (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
 - Tokenizer: 100% llama.cpp token-for-token match — 86 corpus files ×
   special on/off, 398,177 tokens, both models (`scripts/verify_tok.py`).
-- Greedy gates: 27B hip / 27B vulkan / FN hip all PASS
-  (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
 - Sampling: seed-reproducible, temp→0 = argmax; temperature / top_k /
   top_p / min_p / repeat_penalty / seed on all completion endpoints.
 - Generation: Korean Q&A over HTTP answers correctly (e.g. "서울") with
