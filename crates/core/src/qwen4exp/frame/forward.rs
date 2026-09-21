@@ -920,6 +920,9 @@ pub(super) fn gdn_frame(
     let cw = f.consts[&format!("blk.{il}.conv_w")];
     if !stage_skipped("gdn.conv") {
         op(acc, FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][ri], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: t })?;
+        if il == 0 && llm170_diag::dump::opts().bufhash {
+            buf_hash(acc, f.gconv, conv_ch * t.min(16), "G0.conv");
+        }
         if il < 4 {
             frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
         }
@@ -934,6 +937,11 @@ pub(super) fn gdn_frame(
         op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
     }
     sync_mark(acc, "gdn.l2scale", f.gq)?;
+    if il == 0 && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.gq, k_len * t.min(16), "G0.gq");
+        buf_hash(acc, f.gk, k_len * t.min(16), "G0.gk");
+        buf_hash(acc, f.gbg, hp.dt_rank * 2 * t.min(16), "G0.bgb");
+    }
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
     if il == 0 {
@@ -951,6 +959,9 @@ pub(super) fn gdn_frame(
         }
     }
     sync_mark(acc, "gdn.ar", f.go)?;
+    if il == 0 && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.go, v_len * t.min(16), "G0.go");
+    }
     if std::env::var_os("LLM170_NP_DBG").is_some() && il == 0 {
         let mut v = vec![0.0f32; v_len];
         if acc.frame_read(f.go, &mut v).is_ok() {
@@ -963,6 +974,9 @@ pub(super) fn gdn_frame(
         op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
     }
     sync_mark(acc, "gdn.normgated", f.ggated)?;
+    if il == 0 && llm170_diag::dump::opts().bufhash {
+        buf_hash(acc, f.ggated, hp.d_state * hp.dt_rank * t.min(16), "G0.ng");
+    }
     let wout = model.w4(&format!("blk.{il}.ssm_out.weight"))?;
     if !stage_skipped("gdn.out") {
         acc.frame_mm(f.ggated, &wout, f.ffn_out, t).map_err(Q4Error::Io)?;

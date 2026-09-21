@@ -1209,3 +1209,38 @@ in ledger (5) applies: device grouping only pays once down is
 covered too). Frame capability stays opt-in until that lands; the
 value path remains the default vk route. All four gates + the full
 vk-frame-check suite pass.
+
+## 2026-09-21 (26) — vk frame chunk-invariance hunt: two real bugs fixed, one residual isolated (plans/84 B)
+
+Ran the chunk-invariance fence on the opt-in vk frame path
+(LLM170_GPU_RUNTIME=vulkan now switches the diagnostic accelerator
+factory too) and hunted the divergence with the E.2 methodology —
+stage checksums, bufhash markers, and per-op isolation fences added
+to vk-frame-check (GdnARchunk, GdnConvChunk, GdnBetaGChunk at real
+shapes, and a chunked MoE gate/down comparison with proper per-chunk
+route/mx staging).
+
+Fixed, each independently verified:
+- GdnBetaG launched with n_h/128 workgroups against a 64-thread
+  plate — half the rows unwritten; which rows depended on the chunk
+  size, corrupting bg and everything downstream. (An earlier
+  isolation "pass" at tiny shapes hid it; the d>=128 layout
+  requirement of the AR plate also surfaced — the state row is
+  kdim=128 wide, so d<128 makes u-rows overlap and race.)
+- frame_moe_gemm sized its scratch by the stacked n_out (expert
+  width x 512) — the 6-10 GiB "memory ceiling" of ledger (23) was
+  entirely this; divided out, the frame path fits at full ctx.
+Also landed: qsa_host_rebuild (host-visible pools), xg stride
+padded to 16B for descriptor-offset alignment, G0.* bufhash markers
+inside the GDN frame, and the swap-layout AR plate rebuilt.
+
+Verified bit-identical across chunkings in isolation: gate GEMM,
+down GEMM (64 vs 4x16 with real stacked weights), GDN AR (state and
+outputs), GDN conv (ring and outputs), beta-g at the real dt_rank.
+In the full run the markers now agree through all 48 layers for the
+first tokens, the reference produces a sane stream (argmax matches
+across chunkings), but a late-token residual remains: at L0 the
+token-207 MoE output differs (inputs mids/mwt/mixf all bit-identical,
+and every isolated component invariant) — max|D| 5.3 on final
+logits. Status recorded for the next session; the frame path stays
+opt-in so production paths are unaffected. All four gates pass.

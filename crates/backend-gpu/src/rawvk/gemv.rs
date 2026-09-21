@@ -42,8 +42,8 @@ const GDN_CONV_ST_SPV: &[u8] = include_bytes!("spv/fn_gdn_conv_state.spv");
 const GDN_CONV_SEQ_SPV: &[u8] = include_bytes!("spv/gdn_conv_seq.spv");
 const L2_ROWS_SPV: &[u8] = include_bytes!("spv/l2_rows.spv");
 const L2_ROWS2_SPV: &[u8] = include_bytes!("spv/l2_rows2_scale.spv");
-/// q35 VkDecoder의 GDN AR 판 재사용(plans/84 B 프레임 frame_gdn_ar).
-const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
+/// plans/84 B — FN GDN AR: 전치 상태(gdn_ar_w_swap 동일열).
+const FN_GDN_AR_SWAP_SPV: &[u8] = include_bytes!("spv/fn_gdn_ar_swap.spv");
 /// plans/84 B — FN QSA: 선택 어텐션 + 인덱서 블록키 갱신.
 const FN_QSA_ATTN_SEL_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel.spv");
 const FN_IDX_BK_SPV: &[u8] = include_bytes!("spv/fn_idx_bk_update.spv");
@@ -76,7 +76,7 @@ enum Slot {
     GdnConvSeq,
     L2Rows,
     L2Rows2Scale,
-    GdnAr,
+    FnGdnArSwap,
     FnQsaAttnSel,
     FnIdxBk,
     Quant,
@@ -180,7 +180,7 @@ impl VkAcc {
             Slot::AxpyT => (AXPY_T_SPV, 3, 8),        // 2×u32
             Slot::MoeTop10 => (MOE_TOP10_SPV, 3, 8),  // 2×u32
             Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
-            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 8),
+            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 12),  // row_src,row_dst,rows
             Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
             Slot::HcGateMean => (HC_GATE_MEAN_SPV, 3, 12),
             Slot::HcCombine => (HC_COMBINE_SPV, 3, 12),
@@ -193,7 +193,7 @@ impl VkAcc {
             Slot::GdnConvSeq => (GDN_CONV_SEQ_SPV, 4, 12),
             Slot::L2Rows => (L2_ROWS_SPV, 1, 12),          // u32 + f32
             Slot::L2Rows2Scale => (L2_ROWS2_SPV, 2, 24),   // u32,u32,f32,f32
-            Slot::GdnAr => (GDN_AR_SPV, 6, 28),             // q35 판 재사용
+            Slot::FnGdnArSwap => (FN_GDN_AR_SWAP_SPV, 6, 28),
             Slot::FnQsaAttnSel => (FN_QSA_ATTN_SEL_SPV, 6, 24),
             Slot::FnIdxBk => (FN_IDX_BK_SPV, 4, 20),         // f32 + 3×u32
             Slot::Quant => (QUANT_SPV, 2, 12),
@@ -687,8 +687,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         if need_grow {
             let mut m = self.qsa_pools.lock();
             let e = m.get_mut(&(full_idx, seq)).unwrap();
-            e.0 = ctx.alloc(bytes)?;
-            e.1 = ctx.alloc(bytes)?;
+            // plans/84 B: 호스트 가시 — qsa_host_rebuild가 직접 판독한다.
+            e.0 = ctx.alloc_host(bytes)?;
+            e.1 = ctx.alloc_host(bytes)?;
         }
         let (kb, vb) = {
             let m = self.qsa_pools.lock();
@@ -744,10 +745,10 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let mut m = self.qsa_pools.lock();
             let e = m.get_mut(&(full_idx, seq)).unwrap();
             if e.2.bytes < need.0 {
-                e.2 = ctx.alloc(need.0)?;
+                e.2 = ctx.alloc_host(need.0)?;
             }
             if e.3.bytes < need.1 {
-                e.3 = ctx.alloc(need.1)?;
+                e.3 = ctx.alloc_host(need.1)?;
             }
         }
         let (ikb, bkb) = {
@@ -776,6 +777,48 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             push.extend_from_slice(&eps.to_le_bytes());
             ctx.run(p2.pl, ds2, p2.pipe, &push, (b1 - b0) as u32, 1, 1)?;
         }
+        Ok(())
+    }
+
+    /// 디바이스 풀 → 호스트 캐시 재구축 — 프리필이 디코딩을 건너뛴 뒤 값
+    /// 경로 호스트 선택이 필요할 때 1회. 풀 내용을 그대로 내린다.
+    fn qsa_host_rebuild(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        pos: usize,
+        kv_row: usize,
+        kv_k: &mut [f32],
+        kv_v: &mut [f32],
+        idx_k: &mut [f32],
+        bk: &mut [f32],
+        r: usize,
+        idx_dim: usize,
+    ) -> Result<(), String> {
+        let _ = pos;
+        let m = self.qsa_pools.lock();
+        let Some(e) = m.get(&(full_idx, seq)) else {
+            return Err("vk qsa_host_rebuild: 풀 없음".into());
+        };
+        if e.0.bytes < kv_k.len() * 4 || e.2.bytes < idx_k.len() * 4 {
+            return Err("vk qsa_host_rebuild: 풀 용량 부족".into());
+        }
+        // 풀은 호스트 가시(alloc_host) — 프레임 동기 후 직접 판독.
+        {
+            let mut c = self.ctx.lock();
+            if c.batching.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = c.end_batch_wait();
+            }
+        }
+        let kv_floats = kv_k.len();
+        unsafe {
+            std::ptr::copy_nonoverlapping(e.0.ptr as *const f32, kv_k.as_mut_ptr(), kv_floats);
+            std::ptr::copy_nonoverlapping(e.1.ptr as *const f32, kv_v.as_mut_ptr(), kv_v.len());
+            std::ptr::copy_nonoverlapping(e.2.ptr as *const f32, idx_k.as_mut_ptr(), idx_k.len());
+            let nb = (pos + r - 1) / r;
+            std::ptr::copy_nonoverlapping(e.3.ptr as *const f32, bk.as_mut_ptr(), (nb * idx_dim).min(bk.len()));
+        }
+        let _ = kv_row;
         Ok(())
     }
 
@@ -859,12 +902,14 @@ impl llm170_core::matmul::FrameState for VkAcc {
             self.fbuf(states)?, self.fbuf(q_scaled)?, self.fbuf(k)?,
             self.fbuf(v)?, self.fbuf(beta_ge)?, self.fbuf(out)?,
         );
-        let p = self.pipeline(&mut ctx, Slot::GdnAr)?;
+        // plans/84 B: FN 상태는 전치 레이아웃(hip gdn_ar_w_swap과 동일 규약) —
+        // grid (d, h_v), 상태 s[pair·d·d + u·d + …].
+        let p = self.pipeline(&mut ctx, Slot::FnGdnArSwap)?;
         let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
         let mut push = push_u32s(&[d as u32, (h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32]);
         push.extend_from_slice(&1.0f32.to_le_bytes());
         push.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, ds2, p.pipe, &push, h_k as u32, d as u32, 1)
+        ctx.run(p.pl, ds2, p.pipe, &push, d as u32, h_v as u32, 1)
     }
 
     /// MoE 게더 — mix 행을 k_sel 만큼 복제(BcastRows 판 재사용, 산술 동일).
@@ -958,7 +1003,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
             ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
         }
         // 3) MoE 스크래치 (perm u32, xg u32, iv u32, yg f32) — 필요시 성장.
-        let need_xg = rows * xq_w * 4;
+        // xg 행 스트라이드는 16B 정렬로 패딩 — 전문가별 디스크립터 오프셋이
+        // minStorageBufferOffsetAlignment를 만족해야 한다(down n_in=640의
+        // 760B 행은 8 mod 16 → 미정렬 오프셋에서 오염 판독).
+        let xq_w_pad = (xq_w + 3) & !3;
+        let need_xg = rows * xq_w_pad * 4;
         let need_yg = rows * n_out * 4;
         {
             let mut g = self.moebufs.lock();
@@ -991,11 +1040,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
         if batching {
             ctx.begin_batch()?;
         }
-        // 4) 게더: xg[p] = xq[perm[p]] (u32 행)
+        // 4) 게더: xg[p] = xq[perm[p]] (u32 행, dst 스트라이드 = 패딩)
         {
             let p = self.pipeline(&mut ctx, Slot::PermuteU32)?;
             let ds2 = ctx.bind_ds(&p, &[xq, pmb, xgb])?;
-            let push = push_u32s(&[xq_w as u32, rows as u32]);
+            let push = push_u32s(&[xq_w as u32, xq_w_pad as u32, rows as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
         }
         // 5) 전문가별 GEMV — xg/yg 슬라이스 + 가중 전문가 오프셋.
@@ -1006,10 +1055,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
             if r == 0 {
                 continue;
             }
-            let xq_off = (off[e] * xq_w * 4) as u64;
+            let xq_off = (off[e] * xq_w_pad * 4) as u64;
             let out_off = (off[e] * n_out * 4) as u64;
             let w_off = (e * per_expert) as u64;
-            self.gemv_run_off(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, r, xgb, ygb, xq_off, out_off, w_off)?;
+            self.gemv_run_off(&mut ctx, &wbufs, n_in, n_out, xq_w_pad, ty, r, xgb, ygb, xq_off, out_off, w_off)?;
         }
         // 6) 스캐터: out[inv^{-1}] — inv는 원본행→순열위치: out[i] = yg[inv[i]].
         {
@@ -1228,7 +1277,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let ds2 = ctx.bind_ds(&p, &[bb, ab, db, sb, gb])?;
                 let dr = n_h / t_cur.max(1);
                 let push = push_u32s(&[n_h as u32, dr as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(128), 1, 1)?;
+                // 판은 64스레드 — 128로 나누면 절반이 미기입된다(청크 크기별
+                // 커버리지가 달라져 청크 불변성 위반의 원인이었다).
+                ctx.run(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(64), 1, 1)?;
             }
             O::Sigmoid { t, n } => {
                 let tb = self.fbuf(t)?;
@@ -2960,6 +3011,297 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         if !ok { fails += 1; }
         report.push_str(&format!("| Split3 {}", if ok { "OK" } else { "FAIL" }));
         for h in [xnh, gth, mkh, resh, ijh, o3h, z3h, w3h, n3h, b2h, a2h, dth, sah, bgh, v4h, s3h, d0h, d1h, d2h] { acc.frame_free(h)?; }
+    }
+    // ── 11) GDN AR 청크 불변성 — 단일 t=8 대 2×t=4, 최종 상태·출력 비교 ──
+    {
+        use llm170_core::matmul::FrameHost as _FH;
+        use llm170_core::matmul::FrameState as _FS;
+        let hv = 4usize;
+        let hk = 2usize;
+        // 커널 레이아웃: 상태 u행 = kdim 128(32레인×4) — d≥128 필수(hip 규약).
+        let d = 128usize;
+        let (ks, vs) = (hk * d, hv * d);
+        let full = 8usize;
+        let mut s2 = 0xabcdu64;
+        let mut lc2 = move || {
+            s2 = s2.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s2 >> 33) as f32 / 2147483648.0 - 0.5
+        };
+        let q8: Vec<f32> = (0..full * ks).map(|_| lc2()).collect();
+        let k8: Vec<f32> = (0..full * ks).map(|_| lc2()).collect();
+        let v8: Vec<f32> = (0..full * vs).map(|_| lc2()).collect();
+        let bg8: Vec<f32> = (0..full * hv * 2).map(|_| lc2()).collect();
+        let st0: Vec<f32> = (0..hv * d * d).map(|_| lc2() * 0.1).collect();
+        // limit: 처리할 프리픽스 토큰 수. chunk: 청크 크기.
+        let run_case = |chunk: usize, limit: usize| -> Result<(Vec<f32>, Vec<f32>), String> {
+            let acc2 = VkAcc::new()?;
+            acc2.set_ctx_len(64);
+            let qh = acc2.frame_alloc(full * ks)?;
+            let kh = acc2.frame_alloc(full * ks)?;
+            let vh = acc2.frame_alloc(full * vs)?;
+            let bh = acc2.frame_alloc(full * hv * 2)?;
+            let sh = acc2.frame_alloc(hv * d * d)?;
+            acc2.frame_write(qh, &q8)?;
+            acc2.frame_write(kh, &k8)?;
+            acc2.frame_write(vh, &v8)?;
+            acc2.frame_write(bh, &bg8)?;
+            acc2.frame_write(sh, &st0)?;
+            let mut got = vec![0f32; limit * vs];
+            for p0 in (0..limit).step_by(chunk) {
+                let tt = chunk.min(limit - p0);
+                // 슬라이스 입력 버퍼 (q/k/v/bg의 [p0, p0+tt))
+                let qs = acc2.frame_alloc(tt * ks)?;
+                let ksb = acc2.frame_alloc(tt * ks)?;
+                let vsb = acc2.frame_alloc(tt * vs)?;
+                let bsb = acc2.frame_alloc(tt * hv * 2)?;
+                let osb = acc2.frame_alloc(tt * vs)?;
+                acc2.frame_write(qs, &q8[p0 * ks..(p0 + tt) * ks])?;
+                acc2.frame_write(ksb, &k8[p0 * ks..(p0 + tt) * ks])?;
+                acc2.frame_write(vsb, &v8[p0 * vs..(p0 + tt) * vs])?;
+                acc2.frame_write(bsb, &bg8[p0 * hv * 2..(p0 + tt) * hv * 2])?;
+                acc2.frame_begin(tt);
+                acc2.frame_gdn_ar(qs, ksb, vsb, bsb, sh, osb, 1, hk, hv, d)?;
+                let mut part = vec![0f32; tt * vs];
+                acc2.frame_read(osb, &mut part)?;
+                got[p0 * vs..(p0 + tt) * vs].copy_from_slice(&part);
+                for h in [qs, ksb, vsb, bsb, osb] { acc2.frame_free(h)?; }
+            }
+            let mut stf = vec![0f32; hv * d * d];
+            acc2.frame_read(sh, &mut stf)?;
+            Ok((got, stf))
+        };
+        // t=1 결정론
+        let (_a, s0a) = run_case(1, 1).map_err(|e| e.to_string())?;
+        let (_b, s0b) = run_case(1, 1).map_err(|e| e.to_string())?;
+        let mut m0 = 0f64;
+        for i in 0..s0a.len() { m0 = m0.max((s0a[i] as f64 - s0b[i] as f64).abs()); }
+        eprintln!("[gnar] t=1 상태 결정론={m0:.1e}");
+        // t=8 결정론 + 청크 불변
+        // ── 12b) MoE 청크 불변성 — 동일 64토큰, 1호출 vs 4×16 호출 ──
+        {
+            use llm170_core::matmul::FrameHost as _FH2;
+            use llm170_core::matmul::FrameState as _FS2;
+            let k10 = 10usize;
+            let tt = 64usize;
+            let route64: Vec<f32> = {
+                let mut s3 = 0xc0deu64;
+                (0..tt * 512).map(|_| { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((s3 >> 33) as f32 / 2147483648.0 - 0.5) * 4.0 }).collect()
+            };
+            // down 경로도 같은 시험 — n_in=640(행 760B, 패딩 대상).
+            let wg2 = match &model {
+                AnyModel::Q4(m) => m.w4("blk.0.ffn_down_exps.weight").map_err(|e| e.to_string())?,
+                AnyModel::Q35(m) => m.w("blk.0.ffn_down.weight").ok_or("텐서 없음")?,
+            };
+            let n_g = wg2.n_in as usize;
+            let per_out = wg2.n_out as usize / 512;
+            let mx_rows: Vec<f32> = {
+                let mut s3 = 0x5a5au64;
+                (0..tt * n_g).map(|_| { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s3 >> 33) as f32 / 2147483648.0 - 0.5 }).collect()
+            };
+            let wd_rows: Vec<f32> = Vec::new();
+            let run_moe = |chunk: usize| -> Result<Vec<f32>, String> {
+                let acc5 = VkAcc::new()?;
+                let mxh = acc5.frame_alloc(tt * k10 * n_g)?;
+                let rh = acc5.frame_alloc(tt * 512)?;
+                let idh = acc5.frame_alloc(tt * k10)?;
+                let wth = acc5.frame_alloc(tt * k10)?;
+                let outh = acc5.frame_alloc(tt * k10 * per_out)?;
+                // mxsel: 토큰별 10슬롯 동일 입력(토큰 t의 행 = mx_rows[t])
+                acc5.frame_write(rh, &route64)?;
+                let mut out = vec![0f32; tt * per_out];
+                for p0 in (0..tt).step_by(chunk) {
+                    let c = chunk.min(tt - p0);
+                    // 청크 라우트를 [0, c·512)에 적립 — 엔진이 mroute를 청크행으로
+                    // 다시 쓰는 것과 동일 규약.
+                    let mut rbuf = vec![0f32; c * 512];
+                    rbuf.copy_from_slice(&route64[p0 * 512..(p0 + c) * 512]);
+                    // rh는 프레임 버퍼 — 청크 라우트를 앞 c행에 기록(호스트 직접)
+                    {
+                        let g = acc5.framebufs.lock();
+                        let b = g.get(&rh).unwrap();
+                        unsafe { std::ptr::copy_nonoverlapping(rbuf.as_ptr(), b.ptr as *mut f32, rbuf.len()) };
+                    }
+                    // 청크 mx를 [0, c·k10·n_g)에 적립(엔진의 mxsel 규약).
+                    {
+                        let g = acc5.framebufs.lock();
+                        let b = g.get(&mxh).unwrap();
+                        unsafe {
+                            for t2 in 0..c {
+                                for s in 0..k10 {
+                                    std::ptr::copy_nonoverlapping(
+                                        mx_rows[(p0 + t2) * n_g..].as_ptr(),
+                                        b.ptr.add(((t2 * k10 + s) * n_g * 4) as usize) as *mut f32,
+                                        n_g);
+                                }
+                            }
+                        }
+                    }
+                    acc5.frame_begin(c);
+                    acc5.frame_op(&llm170_core::matmul::FrameOp::MoeTop10 { route: rh, ids: idh, wt: wth, n_exp: 512, k_sel: k10 })?;
+                    acc5.frame_moe_gemm(mxh, &wg2, idh, outh, 512, k10)?;
+                    // 게이트 출력만 비교(가중합/스캐터 생략 — gemm 자체 검증).
+                    // 취하는 것: 각 토큰의 슬롯0 행(k10행 중 첫 행) — 토큰별 대표.
+                    let mut part = vec![0f32; c * k10 * per_out];
+                    acc5.frame_read(outh, &mut part)?;
+                    for t2 in 0..c {
+                        let src = t2 * k10 * per_out;
+                        out[(p0 + t2) * per_out..(p0 + t2 + 1) * per_out]
+                            .copy_from_slice(&part[src..src + per_out]);
+                    }
+                }
+                let _ = wd_rows;
+                Ok(out)
+            };
+            let m1 = run_moe(64).map_err(|e| e.to_string())?;
+            let m2 = run_moe(16).map_err(|e| e.to_string())?;
+            let mut mm = 0f64;
+            for i in 0..m1.len() { mm = mm.max((m1[i] as f64 - m2[i] as f64).abs()); }
+            eprintln!("[moech] 게이트 GEMM 청크 불변 max|D|={mm:.1e}");
+        }
+        let (o1, s1) = run_case(8, 8).map_err(|e| e.to_string())?;
+        let (o1b, s1b) = run_case(8, 8).map_err(|e| e.to_string())?;
+        let (o2, s2v) = run_case(4, 8).map_err(|e| e.to_string())?;
+        let mut mo = 0f64;
+        for i in 0..o1.len() { mo = mo.max((o1[i] as f64 - o2[i] as f64).abs()); }
+        let mut ms = 0f64;
+        for i in 0..s1.len() { ms = ms.max((s1[i] as f64 - s2v[i] as f64).abs()); }
+        let mut md = 0f64;
+        for i in 0..o1.len() { md = md.max((o1[i] as f64 - o1b[i] as f64).abs()); }
+        let mut mds = 0f64;
+        for i in 0..s1.len() { mds = mds.max((s1[i] as f64 - s1b[i] as f64).abs()); }
+        eprintln!("[gnar] t=8 결정론 out={md:.1e} st={mds:.1e}");
+        let mut first_diff = None;
+        let mut ndiff = 0usize;
+        for i in 0..s1.len() {
+            if s1[i] != s1b[i] { ndiff += 1; if first_diff.is_none() { first_diff = Some(i); } }
+        }
+        eprintln!("[gnar] 첫 상이 idx={:?} 상이={ndiff}/{}", first_diff, s1.len());
+        let ok = mo < 1e-5 && ms < 1e-5;
+        if !ok { fails += 1; }
+        report.push_str(&format!("| GdnARchunk(t1={m0:.0e}) out={mo:.1e} st={ms:.1e} {}", if ok { "OK" } else { "FAIL" }));
+        // ── 12) GdnConv 청크 불변성 — conv 링 상태 + 출력 ──
+        {
+            let ch = 48usize;
+            let ck = 4usize;
+            let conv_total = 8usize;
+            let qkv8: Vec<f32> = (0..conv_total * ch).map(|_| {
+                s2 = 0u64.wrapping_add(0); // (클로저 이동으로 새 랜덤은 불가 — 상수 시드 재사용)
+                0.0
+            }).collect();
+            let _ = qkv8;
+            let conv_src: Vec<f32> = {
+                let mut s3 = 0xfeedu64;
+                (0..conv_total * ch).map(|_| {
+                    s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (s3 >> 33) as f32 / 2147483648.0 - 0.5
+                }).collect()
+            };
+            let cw: Vec<f32> = {
+                let mut s3 = 0xbeefu64;
+                (0..ch * ck).map(|_| {
+                    s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (s3 >> 33) as f32 / 2147483648.0 - 0.5
+                }).collect()
+            };
+            let st0c: Vec<f32> = {
+                let mut s3 = 0x1234u64;
+                (0..(ck - 1) * ch).map(|_| {
+                    s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (s3 >> 33) as f32 / 2147483648.0 - 0.5
+                }).collect()
+            };
+            let run_conv = |chunk: usize| -> Result<(Vec<f32>, Vec<f32>), String> {
+                let acc3 = VkAcc::new()?;
+                let src = acc3.frame_alloc(conv_total * ch)?;
+                let cwb = acc3.frame_alloc(ch * ck)?;
+                let stb = acc3.frame_alloc((ck - 1) * ch)?;
+                acc3.frame_write(src, &conv_src)?;
+                acc3.frame_write(cwb, &cw)?;
+                acc3.frame_write(stb, &st0c)?;
+                let mut out = vec![0f32; conv_total * ch];
+                for p0 in (0..conv_total).step_by(chunk) {
+                    let tt = chunk.min(conv_total - p0);
+                    let inb = acc3.frame_alloc(tt * ch)?;
+                    let ob = acc3.frame_alloc(tt * ch)?;
+                    acc3.frame_write(inb, &conv_src[p0 * ch..(p0 + tt) * ch])?;
+                    acc3.frame_begin(tt);
+                    acc3.frame_op(&llm170_core::matmul::FrameOp::GdnConv {
+                        qkv: inb, cw: cwb, state: stb, out: ob, ch, k: ck, t_len: tt,
+                    })?;
+                    let mut part = vec![0f32; tt * ch];
+                    acc3.frame_read(ob, &mut part)?;
+                    out[p0 * ch..(p0 + tt) * ch].copy_from_slice(&part);
+                    acc3.frame_free(inb)?;
+                    acc3.frame_free(ob)?;
+                }
+                let mut stf = vec![0f32; (ck - 1) * ch];
+                acc3.frame_read(stb, &mut stf)?;
+                Ok((out, stf))
+            };
+            let (c1, k1) = run_conv(8).map_err(|e| e.to_string())?;
+            let (c2, k2) = run_conv(4).map_err(|e| e.to_string())?;
+            let (_c3, k3) = run_conv(8).map_err(|e| e.to_string())?;
+            let mut mo = 0f64;
+            for i in 0..c1.len() { mo = mo.max((c1[i] as f64 - c2[i] as f64).abs()); }
+            let mut ms = 0f64;
+            for i in 0..k1.len() { ms = ms.max((k1[i] as f64 - k2[i] as f64).abs()); }
+            let mut mdet = 0f64;
+            for i in 0..k1.len() { mdet = mdet.max((k1[i] as f64 - k3[i] as f64).abs()); }
+            eprintln!("[gcv] conv out={mo:.1e} st={ms:.1e} 결정론 st={mdet:.1e}");
+            let ok = mo < 1e-6 && ms < 1e-6;
+            if !ok { fails += 1; }
+            report.push_str(&format!("| GdnConvChunk out={mo:.1e} st={ms:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            // ── 13) GdnBetaG 청크 불변성 (실측 형상 dr=48) ──
+            {
+                let dr = 48usize;
+                let tot = 64usize;
+                let (bsrc, asrc): (Vec<f32>, Vec<f32>) = {
+                    let mut s3 = 0x9999u64;
+                    let mut f1 = || { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s3 >> 33) as f32 / 2147483648.0 - 0.5 };
+                    ((0..dr * tot).map(|_| f1()).collect(), (0..dr * tot).map(|_| f1()).collect())
+                };
+                let dtbv: Vec<f32> = {
+                    let mut s3 = 0x8888u64;
+                    (0..dr).map(|_| { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s3 >> 33) as f32 / 2147483648.0 - 0.5 }).collect()
+                };
+                let sav: Vec<f32> = {
+                    let mut s3 = 0x7777u64;
+                    (0..dr).map(|_| { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s3 >> 33) as f32 / 2147483648.0 - 0.5 }).collect()
+                };
+                let run_bg = |chunk: usize| -> Result<Vec<f32>, String> {
+                    let acc4 = VkAcc::new()?;
+                    let mut out = vec![0f32; dr * 2 * tot];
+                    // 공유 dtb/sa 상수
+                    let dth = acc4.frame_alloc(dr)?;
+                    let sah = acc4.frame_alloc(dr)?;
+                    acc4.frame_write(dth, &dtbv)?;
+                    acc4.frame_write(sah, &sav)?;
+                    for p0 in (0..tot).step_by(chunk) {
+                        let tt = chunk.min(tot - p0);
+                        let bh = acc4.frame_alloc(dr * tt)?;
+                        let ah = acc4.frame_alloc(dr * tt)?;
+                        let gh = acc4.frame_alloc(dr * tt * 2)?;
+                        acc4.frame_write(bh, &bsrc[p0 * dr..(p0 + tt) * dr])?;
+                        acc4.frame_write(ah, &asrc[p0 * dr..(p0 + tt) * dr])?;
+                        acc4.frame_begin(tt);
+                        acc4.frame_op(&llm170_core::matmul::FrameOp::GdnBetaG { b: bh, a: ah, dtb: dth, sa: sah, bg: gh, n_h: dr * tt })?;
+                        let mut part = vec![0f32; dr * 2 * tt];
+                        acc4.frame_read(gh, &mut part)?;
+                        out[p0 * dr * 2..(p0 + tt) * dr * 2].copy_from_slice(&part);
+                        acc4.frame_free(bh)?; acc4.frame_free(ah)?; acc4.frame_free(gh)?;
+                    }
+                    Ok(out)
+                };
+                let g1 = run_bg(64).map_err(|e| e.to_string())?;
+                let g2 = run_bg(16).map_err(|e| e.to_string())?;
+                let mut mb = 0f64;
+                for i in 0..g1.len() { mb = mb.max((g1[i] as f64 - g2[i] as f64).abs()); }
+                eprintln!("[gbg] chunk64 vs chunk16 max|D|={mb:.1e}");
+                let ok = mb < 1e-6;
+                if !ok { fails += 1; }
+                report.push_str(&format!("| GdnBetaGChunk {mb:.1e} {}", if ok { "OK" } else { "FAIL" }));
+            }
+        }
     }
     let _ = t0;
     Ok(format!(

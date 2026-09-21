@@ -513,9 +513,13 @@ pub fn new_acc() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>,
 }
 
 /// 파트 소스 지정판 — 서버 배선이 `Model4::part_sources()`를 넘긴다.
+/// LLM170_GPU_RUNTIME=vulkan이면 VkAcc(plans/84 B — 진단 경로 포함 전역 스위치).
 pub fn new_acc_with_sources(
     parts: Vec<(usize, usize, std::path::PathBuf)>,
 ) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
+    if std::env::var("LLM170_GPU_RUNTIME").as_deref() == Ok("vulkan") {
+        return crate::new_q4_acc_vk();
+    }
     let a = Q4Acc::new_with_sources(parts)?;
     eprintln!(
         "# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)"

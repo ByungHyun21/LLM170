@@ -1,0 +1,62 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// plans/84 B — FN GDN AR (hip gdn_ar_w_swap 동일열): 전치 상태
+// s[pair·d·d + u·d + lane·4+j], grid (d, h_v), 32레인 = kdim 4개/레인,
+// 토큰 순차 재귀(상태 레지스터 유지 → 청크 경계에서 이어짐).
+// q는 1/√d 스케일 완료 가정(scale=1.0).
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer S { float s[]; };
+layout(binding = 1) readonly buffer Q { float q[]; };
+layout(binding = 2) readonly buffer K { float k[]; };
+layout(binding = 3) readonly buffer V { float v[]; };
+layout(binding = 4) readonly buffer Bg { float bg[]; };   // [t][hv*2] (β,e^g)
+layout(binding = 5) buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t;
+} pc;
+void main() {
+    int u = int(gl_WorkGroupID.x);          // 축스왑: u블록 인접 → L2 국소성
+    int pair = int(gl_WorkGroupID.y);
+    int lane = int(gl_SubgroupInvocationID) & 31;   // 서브그룹 하위 32레인 사용
+    int base_s = pair * pc.d * pc.d;
+    float ssr0 = s[base_s + u * pc.d + ((lane << 2) + 0)];
+    float ssr1 = s[base_s + u * pc.d + ((lane << 2) + 1)];
+    float ssr2 = s[base_s + u * pc.d + ((lane << 2) + 2)];
+    float ssr3 = s[base_s + u * pc.d + ((lane << 2) + 3)];
+    for (int ti = 0; ti < pc.t; ti++) {
+        int h = pair % pc.hv;
+        int kh = h % pc.hk;
+        int qk0 = ti * pc.ks + kh * pc.d;
+        int v0 = ti * pc.vs + h * pc.d;
+        float beta = bg[ti * pc.hv * 2 + pair * 2];
+        float g_exp = bg[ti * pc.hv * 2 + pair * 2 + 1];
+        ssr0 *= g_exp; ssr1 *= g_exp; ssr2 *= g_exp; ssr3 *= g_exp;
+        float k0 = k[qk0 + ((lane << 2) + 0)];
+        float k1 = k[qk0 + ((lane << 2) + 1)];
+        float k2 = k[qk0 + ((lane << 2) + 2)];
+        float k3 = k[qk0 + ((lane << 2) + 3)];
+        float part = ssr0 * k0 + ssr1 * k1 + ssr2 * k2 + ssr3 * k3;
+        float sk = part;
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = subgroupShuffleXor(sk, off);
+            sk += pj;
+        }
+        float delta = (v[v0 + u] - sk) * beta;
+        ssr0 += k0 * delta; ssr1 += k1 * delta; ssr2 += k2 * delta; ssr3 += k3 * delta;
+        float op = ssr0 * q[qk0 + ((lane << 2) + 0)]
+                 + ssr1 * q[qk0 + ((lane << 2) + 1)]
+                 + ssr2 * q[qk0 + ((lane << 2) + 2)]
+                 + ssr3 * q[qk0 + ((lane << 2) + 3)];
+        float otot = op;
+        for (int off = 1; off < 32; off <<= 1) {
+            float pj = subgroupShuffleXor(otot, off);
+            otot += pj;
+        }
+        if (lane == 0) o[v0 + u] = otot * pc.scale;
+    }
+    s[base_s + u * pc.d + ((lane << 2) + 0)] = ssr0;
+    s[base_s + u * pc.d + ((lane << 2) + 1)] = ssr1;
+    s[base_s + u * pc.d + ((lane << 2) + 2)] = ssr2;
+    s[base_s + u * pc.d + ((lane << 2) + 3)] = ssr3;
+}
