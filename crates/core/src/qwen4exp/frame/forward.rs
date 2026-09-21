@@ -1079,15 +1079,22 @@ pub(super) fn moe_frame(
     let w_down = model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
     if t == 1 {
         // 디코드: mix를 k_sel행 브로드캐스트 — 전용 커널 1런치(기존 k_sel런치).
+        let msync = std::env::var_os("LLM170_MOE_SYNC").is_some();
         op(acc, FrameOp::BcastRows { src: f.mix, dst: f.mxsel, n, rows: k_sel })?;
+        if msync { sync_mark(acc, "d.bcast", f.mxsel)?; }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
+        if msync { sync_mark(acc, "d.gemm.gate", f.mgu)?; }
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
+        if msync { sync_mark(acc, "d.gemm.up", f.mup)?; }
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: k_sel * n_ff })?;
+        if msync { sync_mark(acc, "d.silumul", f.mglu)?; }
         fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
+        if msync { sync_mark(acc, "d.gemm.down", f.my)?; }
         op(acc, FrameOp::MoeWeightedSum { ys: f.my, wt: f.mwt, out: f.mout, k: k_sel, n })?;
+        if msync { sync_mark(acc, "d.wsum", f.mout)?; }
     } else {
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
