@@ -1,0 +1,17 @@
+#version 450
+// plans/84 B — MoE (토큰,전문가) 페어 게더: dst[(ti·k+s)·n+j] = src[ti·n+j].
+// hip q4_moe_gather 동일열. BcastRows(1행 방송)와 달리 토큰 스트라이드.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Src { float s[]; };
+layout(binding = 1) buffer Dst { float d[]; };
+layout(push_constant) uniform PC { uint n; uint k; uint t; } pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.n) return;
+    for (uint ti = 0u; ti < pc.t; ti++) {
+        float v = s[ti * pc.n + j];
+        for (uint kk = 0u; kk < pc.k; kk++) {
+            d[(ti * pc.k + kk) * pc.n + j] = v;
+        }
+    }
+}

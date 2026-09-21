@@ -30,6 +30,7 @@ const MOE_TOP10_SPV: &[u8] = include_bytes!("spv/moe_top10.spv");
 const PERMUTE_SPV: &[u8] = include_bytes!("spv/permute_rows.spv");
 const PERMUTE_U32_SPV: &[u8] = include_bytes!("spv/permute_rows_u32.spv");
 const MOE_WSUM_SPV: &[u8] = include_bytes!("spv/moe_wsum.spv");
+const MOE_GATHER_SPV: &[u8] = include_bytes!("spv/moe_gather.spv");
 /// plans/84 B — 어텐션 반쪽 프레임 ops.
 const HC_GATE_MEAN_SPV: &[u8] = include_bytes!("spv/hc_gate_mean.spv");
 const HC_COMBINE_SPV: &[u8] = include_bytes!("spv/hc_combine.spv");
@@ -65,6 +66,7 @@ enum Slot {
     PermuteF32,
     PermuteU32,
     MoeWsum,
+    MoeGatherRows,
     HcGateMean,
     HcCombine,
     NormGatedSig,
@@ -182,6 +184,7 @@ impl VkAcc {
             Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
             Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 12),  // row_src,row_dst,rows
             Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
+            Slot::MoeGatherRows => (MOE_GATHER_SPV, 2, 12),
             Slot::HcGateMean => (HC_GATE_MEAN_SPV, 3, 12),
             Slot::HcCombine => (HC_COMBINE_SPV, 3, 12),
             Slot::NormGatedSig => (NORM_GATED_SIG_SPV, 4, 16),  // u32,u32,f32
@@ -912,7 +915,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
         ctx.run(p.pl, ds2, p.pipe, &push, d as u32, h_v as u32, 1)
     }
 
-    /// MoE 게더 — mix 행을 k_sel 만큼 복제(BcastRows 판 재사용, 산술 동일).
+    /// MoE 게더 — (토큰,전문가) 페어: xsel[(ti·k+s)·n] = mix[ti·n]
+    /// (토큰 스트라이드 게더 — BcastRows 재사용은 1행 방송이라 틀렸다).
     fn frame_moe_gather(
         &self,
         mix: u64,
@@ -921,10 +925,12 @@ impl llm170_core::matmul::FrameState for VkAcc {
         k_sel: usize,
         t: usize,
     ) -> Result<(), String> {
-        use llm170_core::matmul::FrameHost;
-        self.frame_op(&llm170_core::matmul::FrameOp::BcastRows {
-            src: mix, dst: xsel, n, rows: k_sel * t,
-        })
+        let mut ctx = self.ctx.lock();
+        let (sb, db) = (self.fbuf(mix)?, self.fbuf(xsel)?);
+        let p = self.pipeline(&mut ctx, Slot::MoeGatherRows)?;
+        let ds2 = ctx.bind_ds(&p, &[sb, db])?;
+        let push = push_u32s(&[n as u32, k_sel as u32, t as u32]);
+        ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(128), 1, 1)
     }
 
     /// MoE 스캐터(가중합) — MoeWeightedSum 판 재사용(산술 동일).
@@ -3157,6 +3163,47 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             let mut mm = 0f64;
             for i in 0..m1.len() { mm = mm.max((m1[i] as f64 - m2[i] as f64).abs()); }
             eprintln!("[moech] 게이트 GEMM 청크 불변 max|D|={mm:.1e}");
+            // ── 12c) f32 라우터 폴백 그룹 청크 불변성 — 실제 ffn_gate_inp ──
+            {
+                use llm170_core::matmul::FrameHost as _FH3;
+                let wr = match &model {
+                    AnyModel::Q4(m) => m.w4("blk.0.ffn_gate_inp.weight").map_err(|e| e.to_string())?,
+                    AnyModel::Q35(m) => m.w("blk.0.ffn_gate.weight").ok_or("텐서 없음")?,
+                };
+                let nr = wr.n_in as usize;
+                let nout_r = wr.n_out as usize;
+                let mixr: Vec<f32> = {
+                    let mut s3 = 0xfeedfaceu64;
+                    (0..64 * nr).map(|_| { s3 = s3.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (s3 >> 33) as f32 / 2147483648.0 - 0.5 }).collect()
+                };
+                let run_r = |chunk: usize| -> Result<Vec<f32>, String> {
+                    let acc6 = VkAcc::new()?;
+                    let xh = acc6.frame_alloc(64 * nr)?;
+                    let oh = acc6.frame_alloc(64 * nout_r)?;
+                    acc6.frame_write(xh, &mixr)?;
+                    let mut out = vec![0f32; 64 * nout_r];
+                    for p0 in (0..64).step_by(chunk) {
+                        let c = chunk.min(64 - p0);
+                        // 청크 입력을 [0, c·nr)에 적립
+                        {
+                            let g = acc6.framebufs.lock();
+                            let b = g.get(&xh).unwrap();
+                            unsafe { std::ptr::copy_nonoverlapping(mixr[p0 * nr..].as_ptr(), b.ptr as *mut f32, c * nr) };
+                        }
+                        acc6.frame_begin(c);
+                        acc6.frame_mm_group(xh, std::slice::from_ref(&wr), std::slice::from_ref(&oh), c)?;
+                        let mut part = vec![0f32; c * nout_r];
+                        acc6.frame_read(oh, &mut part)?;
+                        out[p0 * nout_r..(p0 + c) * nout_r].copy_from_slice(&part);
+                    }
+                    Ok(out)
+                };
+                let r1 = run_r(64).map_err(|e| e.to_string())?;
+                let r2 = run_r(16).map_err(|e| e.to_string())?;
+                let mut mr = 0f64;
+                for i in 0..r1.len() { mr = mr.max((r1[i] as f64 - r2[i] as f64).abs()); }
+                eprintln!("[rtech] f32 라우터 폴백 청크 불변 max|D|={mr:.1e}");
+            }
         }
         let (o1, s1) = run_case(8, 8).map_err(|e| e.to_string())?;
         let (o1b, s1b) = run_case(8, 8).map_err(|e| e.to_string())?;

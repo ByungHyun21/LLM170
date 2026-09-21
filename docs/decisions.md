@@ -1244,3 +1244,29 @@ token-207 MoE output differs (inputs mids/mwt/mixf all bit-identical,
 and every isolated component invariant) — max|D| 5.3 on final
 logits. Status recorded for the next session; the frame path stays
 opt-in so production paths are unaffected. All four gates pass.
+
+## 2026-09-21 (27) — root cause of the vk frame residual: token-strided gather; chunk-invariance achieved (plans/84 B)
+
+The late-token residual of ledger (26) is closed. Direct hashes of
+mxsel/mids/mgu at the last prefill token showed the gathered MoE
+input diverging while its source (mix) was bit-identical:
+frame_moe_gather had reused the BcastRows plate, which broadcasts a
+SINGLE source row to t*k slots — the engine contract is a
+token-strided gather, xsel[(ti*k+s)*n] = mix[ti*n]. Both chunkings
+computed the same wrong broadcast for chunk 1 (which is why the
+first-16-token markers agreed), and diverged from the second chunk
+on, exactly the observed signature. New moe_gather.comp implements
+the strided gather (hip q4_moe_gather semantics).
+
+With the fix the vk frame path passes the chunk-invariance fence:
+chunk-check 16/63/64 bits-identical (LLM170_VK_FRAME=1,
+LLM170_GPU_RUNTIME=vulkan), completing the numerics leg of the B
+verification. vk-frame-check full suite passes (including the
+GdnAR/GdnConv/GdnBetaG chunk isolation fences and the chunked MoE
+gate/down + f32-router comparisons, all bit-identical), and all four
+production gates stay green. Measurement at ctx 8192 (208+16):
+frame 154.4 s vs value path 155.4 s — parity at long context (the
+frame's device-resident state offsets its per-layer host grouping;
+at ctx 1024 the value path still leads). The frame path remains
+opt-in; remaining B items are performance work (device-side MoE
+grouping, decode-side qsa_sel_dev) and PLE.

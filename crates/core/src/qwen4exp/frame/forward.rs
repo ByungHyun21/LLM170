@@ -1008,6 +1008,9 @@ pub(super) fn moe_frame(
     acc.frame_mm_group(f.mix, &[w_route, w_route_sh], &[f.mroute, f.msgate], t)
         .map_err(Q4Error::Io)?;
     sync_mark(acc, "moe.route", f.mroute)?;
+    if il == 0 {
+        frame_ck(acc, f.mroute, hp.n_expert, t, "L0.mroute");
+    }
     let _ = stage_skipped("moe.route");
     if !stage_skipped("moe.top10") {
         op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
@@ -1044,6 +1047,10 @@ pub(super) fn moe_frame(
             // 진단(plans/80): gather 2회 — 멱등 쓰기라 결과 불변이어야 한다.
             // 2회째에 x가 바르게 되면 첫 쓰기가 찢어진 것, 그대로면 이웃 오염.
             fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
+        }
+        if il < 4 {
+            frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
+            frame_ck(acc, f.mids, 1, t * k_sel, &format!("L{il}.mids_u32"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
