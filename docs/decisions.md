@@ -1419,3 +1419,67 @@ new absolute GdnConvT1/GdnART1/HeadChain sections) and the chunk fence
 baseline was re-recorded: the frame sequence equals the canonical hip
 baseline embedded in the gate script (the live hip recording had
 drifted on this machine).
+
+## (31) Vulkan MoE: direct-ids decode + grouped tiles — plans/88
+
+**Decode orchestration (B1)**: `fn_moe_ids.comp` is gemv3 given an
+ids binding — grid (n_out, rows), each workgroup computes one (row,
+output) with the expert base `ids[r]·per_expert` resolved in-kernel.
+The ids d2h drain, host grouping, perm/inv uploads, gather,
+512-expert launch loop and scatter are gone. Per-element arithmetic
+is bit-identical to the per-expert gemv3 path (same lane split, f64
+subgroupAdd, subgroup tree).
+
+**Step-level batching**: the new [ts] submit counter (LLM170_VK_TS
+reports submits per segment) measured 2548 submits per decode step —
+each non-batched run is submit+fence-wait. frame_begin opens a batch;
+frame ops re-open it after mid-step flushes (PLE/QSA host bridges);
+the value path never consults the gate (frame_step_batch), so leaked
+batch state cannot corrupt its synchronous downloads. Fallback entry
+points flush explicitly. Submits per step: 6.
+
+**f32/BF16 dense GEMV** (`fn_mm_f32.comp`): the F32/BF16 members of
+frame_mm_group groups forced the whole group through the value
+pullback (sync-flush + CPU matmul + writeback) 291 times per step.
+The kernel consumes the frame f32 buffer directly; quantization is
+skipped for all-dense groups. Pullbacks: 0.
+
+**Grouped prefill (B2)**: `fn_moe_group.comp` builds the 16-row
+padding domain entirely on device (one 256-thread launch;
+within-expert order is atomically nondeterministic but per-row
+outputs are order-independent, so the chunk fence is unaffected).
+`fn_moe_tile_q4k/q51.comp`: 16x16 tiles, tile=expert, cooperative
+LDS staging (chunk resolver amortized to 2 divisions per row), x read
+indirectly via perm_pad — the gather pass disappears. A generation
+cache lets a layer's 3 GEMMs share the tables. The tile's float
+expressions are aligned with the gemv3 class — outputs are
+bit-identical to the direct-ids path (frame-check 9c cross-compares
+all three MoE paths element-wise).
+
+**Dense prefill tiles**: gemv3's token-loop re-reads ran at ~5GB/s
+(6.6s of a 208-token prefill). `fn_tile_q8.comp` (K-sliced LDS
+staging, any n_in) and mode-1 of the moe tiles replace it for t>=2.
+The reduction order is a new class: gate re-recorded per the §8
+precedent after cross-justification (MoE paths bit-identical, ckdiff
+shows ulp-cascade, and the new stream matches the hip runtime's
+current tie resolution 9 tokens deep).
+
+**Hardware lessons**: 64-wide Vulkan subgroups broke 32-lane
+reduction assumptions (shared-memory reductions now); a 70KB shared
+array silently exceeded the 64KB LDS budget and hung the device
+(SIGKILL, no vk error) — tile staging is sized against the budget;
+`rowexp`/d-section reads must be row-based (the 9c check at 2100
+rows catches both the binding-order shift and the row-0 d-section
+bug that small-row tests miss).
+
+**Numbers** (FN Q4_K_XL, vulkan, solo): pp512@20k 10.4 -> 60.1 t/s,
+pp4096 10.2 -> 54.7 (5.4x), tg128@4k 2.25 -> 7.15 (3.2x). Decode
+step: 6 submits, 116ms GPU (dense gemv 64ms near BW, moe_ids 33ms vs
+a 6.5ms BW floor), ~25ms host (PLE host bridge). The plans/88 tg 8+
+expectation stops at 7.15: after removing the orchestration the
+decode GPU floor itself is 116ms. Identified follow-ups: port
+ple_math_dev (3 kernels, ~8ms/step, note exp() ulp class), and a
+higher-occupancy decode MoE shape. P3 (coopmat q4_K, 200+ challenge)
+not taken per its own gate; P4 (QSA prefill tile) skipped — QSA
+attention is below the top-13 slots of the re-profile; P5 (dense
+GEMM re-evaluation) was subsumed by the dense tiles.

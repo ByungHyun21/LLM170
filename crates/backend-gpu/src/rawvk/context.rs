@@ -375,8 +375,7 @@ impl VkCtx {
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
         if std::env::var_os("LLM170_VK_FLUSHDBG").is_some() {
-            eprintln!("[flush] op={}\n{}", crate::rawvk::context::site::tag(),
-                std::backtrace::Backtrace::force_capture());
+            eprintln!("[flush] op={}", crate::rawvk::context::site::tag());
         }
         self.batching.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
