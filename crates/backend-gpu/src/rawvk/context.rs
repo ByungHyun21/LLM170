@@ -393,6 +393,16 @@ impl VkCtx {
     /// 버퍼 할당 — 자체 디바이스 메모리 + 매핑 (호스트 포인터 동반).
     /// bytes는 max_ssbo 이하 권장 (초과 시 호출부에서 청크 분할).
     pub fn alloc(&mut self, bytes: usize) -> Result<VkBuf, String> {
+        let r = self.alloc_inner(bytes);
+        if r.is_err() && bytes > (1 << 30) {
+            // plans/84 B 진단: 대형 버퍼(가중 청크/프레임) 실패 원인 판별.
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("# alloc {bytes}B 실패 — 백트레이스:\n{bt}");
+        }
+        r
+    }
+
+    fn alloc_inner(&mut self, bytes: usize) -> Result<VkBuf, String> {
         unsafe {
             let bci = vk::BufferCreateInfo::default()
                 .size(bytes as u64)

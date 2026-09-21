@@ -1166,3 +1166,28 @@ qsa_flash_gq-based attention plate to reuse). The >4 GiB single
 allocations seen at ctx 2048+ remain a separate budget item (sizes
 6.7-10.9 GiB do not match any single frame buffer in Frame4::new —
 weight-chunk suspicion, backtrace hook is in place to pin it).
+
+## 2026-09-21 (24) — vk frame path runs FN end to end: QSA triple + the stacked-n_out scratch bug (plans/84 B)
+
+QsaOps for VkAcc: resident pools per (layer, seq) with hip-equivalent
+watermark rules (sequential append / prefix rewind), device-to-device
+kv and indexer appends (copy plate), block-key update
+(fn_idx_bk_update — r-row mean, f64 rms, weight, rope via the cs
+table), and the selection-list attention (fn_qsa_attn_sel — subgroup
+64 = one (token, head), lane covers 4 of hd=256, online softmax with
+correction, sigmoid gate on output; walks only the selected
+positions). set_ctx_len feeds the pool capacity.
+
+The backtrace hook (23) pinned the 6-10 GiB "memory ceiling": all of
+it was one bug — frame_moe_gemm sized its scratch by the STACKED
+n_out (per-expert width x 512 experts), asking for 10.9 GiB in a
+single buffer. With n_out divided by the expert count the whole frame
+path fits, and with LLM170_VK_FRAME=1 the FN forward now completes
+end to end at ctx 8192 (208+2 tokens, 128.5 s, coherent output). The
+frame path is ~2.9x slower than the vk value path for now (per-expert
+GEMV launches without batching + per-layer host grouping) —
+frame_capable stays opt-in until launch batching and the decode-side
+QSA selection (qsa_sel_dev) land. All four gates pass;
+vk-frame-check MoE chain re-verified against the per-expert width
+contract (probe updated; the earlier pass was reading stacked-stride
+aliases).

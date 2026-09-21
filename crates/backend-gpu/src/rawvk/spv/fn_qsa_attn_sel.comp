@@ -1,0 +1,67 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// plans/84 B — FN QSA 선택 어텐션(hip q4_qsa_attn_sel 동일열, hd=256).
+// AMD 서브그룹 64 = 1 (토큰,헤드): 레인이 4원소(64×4=256)씩 담당,
+// subgroupAdd로 QK 도트, 온라인 softmax(보정 갱신), 출력 σ(게이트) 곱.
+// q 레이아웃 [t][n_head][2·hd] (q‖gate 인터리브), 선택 목록만 순회.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qb { float q[]; };
+layout(binding = 1) readonly buffer Ck { float ck[]; };
+layout(binding = 2) readonly buffer Cv { float cv[]; };
+layout(binding = 3) readonly buffer Si { uint sel_idx[]; };
+layout(binding = 4) readonly buffer So { uint sel_off[]; };
+layout(binding = 5) buffer Ob { float o[]; };
+layout(push_constant) uniform PC {
+    float kq_scale; uint n_head; uint n_kv; uint hd; uint t;
+} pc;
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint lane = gl_SubgroupInvocationID;
+    if (tok >= pc.t || h >= pc.n_head || pc.hd != 256u) return;
+    uint kvh = h / (pc.n_head / max(pc.n_kv, 1u));
+    uint q0 = (tok * pc.n_head + h) * 2u * pc.hd;
+    float qr0 = q[q0 + lane * 4u + 0u];
+    float qr1 = q[q0 + lane * 4u + 1u];
+    float qr2 = q[q0 + lane * 4u + 2u];
+    float qr3 = q[q0 + lane * 4u + 3u];
+    float g0 = q[q0 + pc.hd + lane * 4u + 0u];
+    float g1 = q[q0 + pc.hd + lane * 4u + 1u];
+    float g2 = q[q0 + pc.hd + lane * 4u + 2u];
+    float g3 = q[q0 + pc.hd + lane * 4u + 3u];
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    const float NEG = -3.4028235e38;
+    float mrun = NEG;
+    float lrun = 0.0;
+    uint j0 = sel_off[tok];
+    uint j1 = sel_off[tok + 1u];
+    for (uint j = j0; j < j1; j++) {
+        uint p = sel_idx[j];
+        uint k0 = p * pc.n_kv * pc.hd + kvh * pc.hd;
+        float d = qr0 * ck[k0 + lane * 4u + 0u]
+                + qr1 * ck[k0 + lane * 4u + 1u]
+                + qr2 * ck[k0 + lane * 4u + 2u]
+                + qr3 * ck[k0 + lane * 4u + 3u];
+        float s = subgroupAdd(d) * pc.kq_scale;
+        if (s > mrun) {
+            float corr = (mrun <= NEG) ? 0.0 : exp(mrun - s);
+            a0 *= corr; a1 *= corr; a2 *= corr; a3 *= corr;
+            lrun *= corr;
+            mrun = s;
+        }
+        float e = exp(s - mrun);
+        lrun += e;
+        uint v0 = p * pc.n_kv * pc.hd + kvh * pc.hd;
+        a0 += e * cv[v0 + lane * 4u + 0u];
+        a1 += e * cv[v0 + lane * 4u + 1u];
+        a2 += e * cv[v0 + lane * 4u + 2u];
+        a3 += e * cv[v0 + lane * 4u + 3u];
+    }
+    float inv_l = (lrun > 0.0) ? 1.0 / lrun : 0.0;
+    uint o0 = (tok * pc.n_head + h) * pc.hd;
+    o[o0 + lane * 4u + 0u] = a0 * inv_l * (1.0 / (1.0 + exp(-g0)));
+    o[o0 + lane * 4u + 1u] = a1 * inv_l * (1.0 / (1.0 + exp(-g1)));
+    o[o0 + lane * 4u + 2u] = a2 * inv_l * (1.0 / (1.0 + exp(-g2)));
+    o[o0 + lane * 4u + 3u] = a3 * inv_l * (1.0 / (1.0 + exp(-g3)));
+}

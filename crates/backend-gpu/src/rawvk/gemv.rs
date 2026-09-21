@@ -5,6 +5,7 @@
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
+use ash::vk::Handle as _VkHandle;
 use llm170_core::matmul::{MatmulHost, Weight};
 use llm170_gguf::GgmlType;
 use parking_lot::Mutex;
@@ -43,6 +44,9 @@ const L2_ROWS_SPV: &[u8] = include_bytes!("spv/l2_rows.spv");
 const L2_ROWS2_SPV: &[u8] = include_bytes!("spv/l2_rows2_scale.spv");
 /// q35 VkDecoder의 GDN AR 판 재사용(plans/84 B 프레임 frame_gdn_ar).
 const GDN_AR_SPV: &[u8] = include_bytes!("spv/gdn_ar.spv");
+/// plans/84 B — FN QSA: 선택 어텐션 + 인덱서 블록키 갱신.
+const FN_QSA_ATTN_SEL_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel.spv");
+const FN_IDX_BK_SPV: &[u8] = include_bytes!("spv/fn_idx_bk_update.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -73,6 +77,8 @@ enum Slot {
     L2Rows,
     L2Rows2Scale,
     GdnAr,
+    FnQsaAttnSel,
+    FnIdxBk,
     Quant,
     Rms,
     Silu,
@@ -99,6 +105,9 @@ pub struct VkAcc {
     framebufs: Mutex<HashMap<u64, VkBuf>>,
     /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
+    /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
+    qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
+    qsa_ctx: std::sync::atomic::AtomicUsize,
     frame_next: std::sync::atomic::AtomicU64,
     frame_t: std::sync::atomic::AtomicUsize,
 }
@@ -147,6 +156,8 @@ impl VkAcc {
             gobufs: Mutex::new(Vec::new()),
             framebufs: Mutex::new(HashMap::new()),
             moebufs: Mutex::new(None),
+            qsa_pools: Mutex::new(HashMap::new()),
+            qsa_ctx: std::sync::atomic::AtomicUsize::new(0),
             frame_next: std::sync::atomic::AtomicU64::new(1),
             frame_t: std::sync::atomic::AtomicUsize::new(1),
         })
@@ -183,6 +194,8 @@ impl VkAcc {
             Slot::L2Rows => (L2_ROWS_SPV, 1, 12),          // u32 + f32
             Slot::L2Rows2Scale => (L2_ROWS2_SPV, 2, 24),   // u32,u32,f32,f32
             Slot::GdnAr => (GDN_AR_SPV, 6, 28),             // q35 판 재사용
+            Slot::FnQsaAttnSel => (FN_QSA_ATTN_SEL_SPV, 6, 24),
+            Slot::FnIdxBk => (FN_IDX_BK_SPV, 4, 20),         // f32 + 3×u32
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
@@ -625,7 +638,173 @@ impl VkAcc {
 
 // 미지원 capability — 모든 메서드가 기본(Err) 구현이라 빈 impl 로 충분하다.
 impl llm170_core::matmul::GraphCapture for VkAcc {}
-impl llm170_core::matmul::QsaOps for VkAcc {}
+impl llm170_core::matmul::QsaOps for VkAcc {
+    /// 상주 KV 풀 — 워터마크 규약은 hip과 동일(순차 적립/접두어 되감기 허용).
+    /// 적립은 디바이스 간 복사(copy_rows 판) — 프레임 k/v 버퍼에서 풀로.
+    fn qsa_kv_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        k: u64,
+        v: u64,
+        t: usize,
+        pos0: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Result<(u64, u64), String> {
+        let ctx_len = self.qsa_ctx.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx_len == 0 {
+            return Err("vk qsa_kv_dev: ctx_len 미주입".into());
+        }
+        let bytes = ctx_len * n_kv * hd * 4;
+        let need_grow;
+        {
+            let mut m = self.qsa_pools.lock();
+            let e = m.entry((full_idx, seq)).or_insert_with(|| {
+                (
+                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
+                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
+                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
+                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
+                    0,
+                )
+            });
+            if pos0 > e.4 {
+                return Err(format!("vk qsa_kv_dev: 워터마크 구멍 w={} pos0={pos0}", e.4));
+            }
+            e.4 = pos0 + t;
+            need_grow = e.0.bytes < bytes;
+        }
+        let mut ctx = self.ctx.lock();
+        if need_grow {
+            let mut m = self.qsa_pools.lock();
+            let e = m.get_mut(&(full_idx, seq)).unwrap();
+            e.0 = ctx.alloc(bytes)?;
+            e.1 = ctx.alloc(bytes)?;
+        }
+        let (kb, vb) = {
+            let m = self.qsa_pools.lock();
+            let e = m.get(&(full_idx, seq)).unwrap();
+            (e.0.buf, e.1.buf)
+        };
+        let ksrc = self.fbuf(k)?;
+        let vsrc = self.fbuf(v)?;
+        let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
+        let n_f = t * n_kv * hd;
+        let soff = (pos0 * n_kv * hd) as u32;
+        let ds_k = ctx.bind_ds(&p, &[ksrc, kb])?;
+        ctx.run(p.pl, ds_k, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        let ds_v = ctx.bind_ds(&p, &[vsrc, vb])?;
+        ctx.run(p.pl, ds_v, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        Ok((kb.as_raw(), vb.as_raw()))
+    }
+
+    /// 상주 인덱서 풀 — ik 적립 + 완성 블록의 블록키(norm+rope) 갱신.
+    fn qsa_idx_append_dev(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_dim: usize,
+        r: usize,
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(), String> {
+        if r == 0 || idx_dim != 128 {
+            return Err(format!("vk qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"));
+        }
+        let ctx_len = self.qsa_ctx.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx_len == 0 {
+            return Err("vk qsa_idx_append: ctx_len 미주입".into());
+        }
+        let nb_max = ctx_len / r + 1;
+        {
+            let mut m = self.qsa_pools.lock();
+            let w = &mut m.get_mut(&(full_idx, seq)).map(|e| e.4).unwrap_or(0);
+            if pos0 > *w {
+                return Err(format!("vk qsa_idx_append: 워터마크 구멍 w={w} pos0={pos0}"));
+            }
+            *w = pos0 + t;
+        }
+        // idx_k 풀은 kv 풀과 별도 용량 — 필요시 성장(간단 재할당).
+        let mut ctx = self.ctx.lock();
+        let need = (ctx_len * idx_dim * 4, nb_max * idx_dim * 4);
+        {
+            let mut m = self.qsa_pools.lock();
+            let e = m.get_mut(&(full_idx, seq)).unwrap();
+            if e.2.bytes < need.0 {
+                e.2 = ctx.alloc(need.0)?;
+            }
+            if e.3.bytes < need.1 {
+                e.3 = ctx.alloc(need.1)?;
+            }
+        }
+        let (ikb, bkb) = {
+            let m = self.qsa_pools.lock();
+            let e = m.get(&(full_idx, seq)).unwrap();
+            (e.2.buf, e.3.buf)
+        };
+        let iksrc = self.fbuf(ik)?;
+        let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
+        let n_f = t * idx_dim;
+        let soff = (pos0 * idx_dim) as u32;
+        let ds = ctx.bind_ds(&p, &[iksrc, ikb])?;
+        ctx.run(p.pl, ds, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        let b0 = pos0 / r;
+        let b1 = (pos0 + t) / r;
+        if b1 > b0 {
+            // ikw/cs 상수 업로드(호스트 f32 — 호출마다 작음) + 블록키 갱신.
+            let ikw_b = ctx.alloc_host(ikw.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(ikw.as_ptr(), ikw_b.ptr as *mut f32, ikw.len()) };
+            let cs_len = (b1 * r) * (idx_dim / 2) * 2;
+            let cs_b = ctx.alloc_host(cs_len * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(cs_idx[..cs_len].as_ptr(), cs_b.ptr as *mut f32, cs_len) };
+            let p2 = self.pipeline(&mut ctx, Slot::FnIdxBk)?;
+            let ds2 = ctx.bind_ds(&p2, &[ikb, bkb, ikw_b.buf, cs_b.buf])?;
+            let mut push = push_u32s(&[b0 as u32, r as u32, idx_dim as u32]);
+            push.extend_from_slice(&eps.to_le_bytes());
+            ctx.run(p2.pl, ds2, p2.pipe, &push, (b1 - b0) as u32, 1, 1)?;
+        }
+        Ok(())
+    }
+
+    /// 선택 목록 어텐션 — fn_qsa_attn_sel 판(hd=256).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_attention_dev_res(
+        &self,
+        q: u64,
+        ck: u64,
+        cv: u64,
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+        out: u64,
+    ) -> Result<(), String> {
+        if hd != 256 {
+            return Err(format!("vk qsa_attention_dev_res: hd={hd} 미지원"));
+        }
+        let mut ctx = self.ctx.lock();
+        let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
+        let cb = vk::Buffer::from_raw(ck as u64);
+        let vb = vk::Buffer::from_raw(cv as u64);
+        let si_b = ctx.alloc_host(sel_idx.len() * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len()) };
+        let so_b = ctx.alloc_host(sel_off.len() * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len()) };
+        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
+        let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, si_b.buf, so_b.buf, ob])?;
+        let mut push = push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]);
+        push.extend_from_slice(&kq_scale.to_le_bytes());
+        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+    }
+}
 
 impl VkAcc {
     /// 프레임 핸들 → 상주 버퍼 (없으면 Err).
@@ -641,6 +820,10 @@ impl VkAcc {
 impl llm170_core::matmul::FrameState for VkAcc {
     fn frame_begin(&self, t: usize) {
         self.frame_t.store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_ctx_len(&self, n: usize) {
+        self.qsa_ctx.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// GDN AR (프레임) — q35 판(gdn_ar.spv) 재사용. q는 1/√d 스케일 완료
@@ -718,10 +901,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
         k_sel: usize,
     ) -> Result<(), String> {
         let n_in = w.n_in as usize;
-        let n_out = w.n_out as usize;
+        let ne = n_expert_stack.max(1);
+        // 스택 텐서: w.n_out = 전문가당 n_out × ne — GEMM은 전문가당 폭만 쓴다.
+        let n_out = w.n_out as usize / ne;
         let t = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
         let rows = t * k_sel;
-        let ne = n_expert_stack;
         let ty = vk_ty(w.ty).ok_or("vk frame_moe_gemm: 타입 미지원")?;
         // 1) ids 판독(호스트 그룹화) — off/perm/inv 구축.
         let idv: Vec<u32> = {
@@ -2548,11 +2732,12 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             AnyModel::Q35(m) => m.w("blk.0.ffn_gate.weight").ok_or("텐서 없음")?,
         };
         let n_in_m = wg.n_in as usize;
-        let n_out_m = wg.n_out as usize;
         let ne = match &model {
             AnyModel::Q4(_) => 512usize,
             AnyModel::Q35(_) => 1usize,
         };
+        // 스택 텐서: 전문가당 폭만 출력에 쓴다(frame_moe_gemm 규약).
+        let n_out_m = wg.n_out as usize / ne;
         if ne == 512 {
             let route: Vec<f32> = (0..t * ne).map(|_| lcg() * 4.0).collect();
             let mxs: Vec<Vec<f32>> = (0..t * k).map(|_| (0..n_in_m).map(|_| lcg()).collect()).collect();
@@ -2592,7 +2777,7 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 for (j, &e) in sel.iter().enumerate() {
                     if ids_g[tok * k + j] as usize != e { mx = mx.max(1.0); }
                 }
-                let per_exp = n_out_m / ne;
+                let per_exp = n_out_m;
                 let mut ref_row = vec![0f32; n_in_m];
                 for j in 0..per_exp.min(8) {
                     let mut acc2 = 0f64;
