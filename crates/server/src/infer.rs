@@ -401,6 +401,9 @@ fn run_q4_infer(
                     }
                 }
             }
+            if llm170_diag::dump::opts().alloc {
+                llm170_diag::alloc::report();
+            }
             eprintln!(
                 "# done(q4): {n} seqs, gen per seq: {n_predict} (elapsed {:.1?})",
                 t_start.elapsed()

@@ -399,6 +399,7 @@ pub(super) fn frame_forward_ex(
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
         ftime_report(t);
+        acc.ktrace_tick();
         if ftime_on() {
             eprintln!("# frame-total t={t} {:.1}ms", t_call.elapsed().as_secs_f64() * 1e3);
         }

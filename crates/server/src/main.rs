@@ -115,6 +115,10 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 }
 
 fn main() -> ExitCode {
+    // plans/87 §2 — 와치독(스텔 보고·옵션 FAIL 자결).
+    if let Some(v) = std::env::var("LLM170_WATCHDOG").ok().and_then(|v| v.parse::<u64>().ok()) {
+        llm170_diag::watchdog::spawn(v, std::env::var_os("LLM170_WATCHDOG_FAIL").is_some());
+    }
     llm170_diag::fp::init_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.

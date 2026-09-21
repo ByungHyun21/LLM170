@@ -174,6 +174,48 @@ fn vk_ty(ty: GgmlType) -> Option<u32> {
     }
 }
 
+/// plans/87 §2/§3 — 슬롯 → op 태그(와치독 링·ts 라벨).
+fn slot_name(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Gemv => "gemv",
+        Slot::Tile128 => "tile128_q5k",
+        Slot::Tile128Q51 => "tile128_q51",
+        Slot::SiluDiv => "silu_div",
+        Slot::Scale => "scale",
+        Slot::CopyRows => "copy_rows",
+        Slot::BcastRows => "bcast_rows",
+        Slot::AxpyT => "axpy_t",
+        Slot::Rms => "rms",
+        Slot::Silu => "silu_mul",
+        Slot::EwSigmoid => "sigmoid",
+        Slot::HcGateMean => "hc_gate_mean",
+        Slot::HcCombine => "hc_combine",
+        Slot::NormGatedSig => "norm_gated",
+        Slot::GdnBetaG => "gdn_beta_g",
+        Slot::Split3 => "split3",
+        Slot::L2Rows => "l2_rows",
+        Slot::L2Rows2Scale => "l2_rows2_scale",
+        Slot::FnGdnArSwap => "gdn_ar_swap",
+        Slot::FnQsaAttnSel => "qsa_attn_sel",
+        Slot::PermuteU32 => "permute_u32",
+        Slot::PermuteF32 => "permute_f32",
+        Slot::MoeTop10 => "moe_top10",
+        Slot::MoeWsum => "moe_wsum",
+        Slot::MoeGatherRows => "moe_gather",
+        Slot::GdnConvT2 => "gdn_conv_t2",
+        Slot::GdnConvState => "gdn_conv_state",
+        Slot::GdnConvSeq => "gdn_conv_seq",
+        Slot::FnIdxScore => "idx_score",
+        Slot::FnIdxBk => "idx_bk_update",
+        Slot::FnIdxQRope => "idx_q_rope",
+        Slot::FnIdxRank => "idx_rank",
+        Slot::FnIdxExpand => "idx_expand",
+        Slot::FnQkNormRope => "qk_norm_rope",
+        Slot::Quant => "quant",
+        Slot::FnArgmaxRows => "argmax_rows",
+    }
+}
+
 fn push_u32s(vals: &[u32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(vals.len() * 4);
     for x in vals {
@@ -192,6 +234,7 @@ impl VkAcc {
     /// 파트 소스 지정판 — `Model4::part_sources()` (plans/86 §6).
     pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
         llm170_diag::alloc::set_on(llm170_diag::dump::opts().alloc);
+        llm170_diag::alloc::set_vaddr(llm170_diag::dump::opts().vaddr);
         let sources = parts
             .into_iter()
             .filter_map(|(base, len, path)| {
@@ -234,6 +277,7 @@ impl VkAcc {
     // ─── 지연 초기화 공용 자원 ───
 
     fn pipeline(&self, ctx: &mut VkCtx, slot: Slot) -> Result<Pipes, String> {
+        crate::rawvk::context::site::set_tag(slot_name(slot));
         if let Some(&p) = self.pipes.lock().get(&slot) {
             return Ok(p);
         }
@@ -309,7 +353,14 @@ impl VkAcc {
     /// 전체 스택을 혼동한다 — 값경로 프리필이 적재한 1전문가 버퍼를 프레임
     /// MoE가 오프셋 재결합하면 GPUVM PERMISSION 폴트. (ptr,len)으로 구분.
     fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
-        let key = (w.data.as_ptr() as usize, w.data.len());
+        // plans/87 §1 — 회귀 재현 스위치: 구형 ptr 단독 키. 값경로 프리필의
+        // 전문가 뷰(1전문가분)과 전체 스택이 같은 키로 충돌해 프레임 MoE가
+        // 오프셋 재결합 → 실제 GPUVM 폴트(86 §1b 사건). 폴트 매처 검증용.
+        let key = if std::env::var("LLM170_WCACHE_PTRKEY").as_deref() == Ok("1") {
+            (w.data.as_ptr() as usize, 0)
+        } else {
+            (w.data.as_ptr() as usize, w.data.len())
+        };
         crate::rawvk::context::site::scope("weight", || {
         {
             let mut wc = self.wcache.lock();
@@ -1476,7 +1527,19 @@ impl llm170_core::matmul::FrameState for VkAcc {
     }
 }
 
+impl VkAcc {
+    /// plans/87 §3 — 슬롯별 GPU 시간 집계 덤프(LLM170_VK_TS=1 로 풀 생성).
+    /// 엔진의 ktrace 틱 지점(디코드 스텝/프리필 종료)에서 호출된다.
+    pub fn ts_tick(&self) {
+        let mut ctx = self.ctx.lock();
+        ctx.ts_report();
+    }
+}
+
 impl llm170_core::matmul::FrameHost for VkAcc {
+    fn ktrace_tick(&self) {
+        self.ts_tick();
+    }
     /// plans/84 B: 프레임 op군이 부분 구현(엘리먼트와이스+MoE) — 완성 전에는
     /// 옵트인(LLM170_VK_FRAME=1)일 때만 엔진이 프레임 경로에 들어온다.
     /// plans/86 §8 — 프레임 경로 완성(§1 정확성·§2 QSA 디바이스화·§5 성능) 후
@@ -1600,6 +1663,10 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     }
     fn frame_free(&self, h: u64) -> Result<(), String> {
         let b = self.framebufs.lock().remove(&h);
+        if let Some(b) = &b {
+            // plans/87 §4 — 풀 반납 기록(사이트별 재사용 재고).
+            llm170_diag::alloc::recycle("frame", b.bytes);
+        }
         if let Some(b) = b {
             let mut pool = self.frame_pool.lock();
             let total: usize = pool.iter().map(|b| b.bytes).sum();
@@ -4395,6 +4462,30 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         if fails == 0 { "PASS" } else { "FAIL" },
         report,
         fails
+    ))
+}
+
+/// plans/87 §1 — 의도적 GPUVM 폴트 프로브: 실제 결함 패턴(디스크립터
+/// 오프셋이 버퍼 끝 너머 — pipeline robustness가 주소 자체를 못 구한다)으로
+/// 폴트를 유발해 RADV 주소 → va-lookup 체인을 검증한다. DEVICE_LOST가 정상.
+pub fn fault_probe() -> Result<String, String> {
+    let acc = VkAcc::new()?;
+    llm170_diag::alloc::set_on(true);
+    llm170_diag::alloc::set_vaddr(true);
+    let mut ctx = acc.ctx.lock();
+    let b = ctx.alloc_host(4096)?; // 원장 기록(VA 포함)
+    let p = acc.pipeline(&mut ctx, Slot::Scale)?;
+    let ds = ctx.fresh_ds_for(&p, 1)?;
+    // 실효 패턴: 12-바인딩 gemv 파이프라인에 1개만 바인딩 — 미바인딩
+    // 디스크립터(3..11)를 커널이 읽는다. 오프셋 초과는 RADV가 빈 범위로
+    // 클램프해 폴트가 안 나는 것을 실측했다(정렬 무관).
+    let _ = ds;
+    let ds2 = ctx.bind_ds(&p, &[b.buf])?;
+    let push = push_u32s(&[32u32, 32u32, 8u32, 8u32, 1u32, 1024u32]);
+    let r = ctx.run(p.pl, ds2, p.pipe, &push, 1, 1, 1);
+    let tsv = llm170_diag::alloc::tsv_path().unwrap_or_else(|| "(없음)".into());
+    Ok(format!(
+        "발사 결과: {r:?} (Err=DEVICE_LOST 정상) — tsv: {tsv} 에서 RADV 폴트 주소를 va-lookup 하라"
     ))
 }
 
