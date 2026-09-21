@@ -1270,3 +1270,25 @@ frame's device-resident state offsets its per-layer host grouping;
 at ctx 1024 the value path still leads). The frame path remains
 opt-in; remaining B items are performance work (device-side MoE
 grouping, decode-side qsa_sel_dev) and PLE.
+
+## 2026-09-21 (28) — session close: shexp decode work reverted; four gates green at HEAD (plans/84 B)
+
+Attempted the decode shared-expert pair (shexp_gu/shexp_da as EwOps
+for VkAcc). Two findings before reverting the (uncommitted) work:
+- Self-deadlock: calling frame_alloc while holding the ctx lock
+  (parking_lot is non-reentrant) hung the FN vk gate at VRAM 31% /
+  GPU 0% indefinitely — fix is allocating frame scratch before
+  taking the lock (applied, then reverted with the rest).
+- After the deadlock fix the decode still dies with
+  `제출: ERROR_DEVICE_LOST` (reproduced twice; prefill passes). Root
+  cause not yet isolated — suspicion: frame_free destroying in-flight
+  buffers, batching-mode descriptor sets, or lingering device
+  poisoning from the deadlock era (needs a clean-GPU recheck).
+The change was reverted to keep HEAD at the fully-verified state
+(all four gates pass, chunk fence bits-identical); both findings and
+the full implementation recipe are carried into the follow-up plan.
+Also confirmed this session: the FN vk cold start takes 5-10+ min on
+this APU — mmap fault-path uploads at 20-180 MB/s for 78 GB, and the
+page cache (competing with VRAM in unified memory) rarely survives
+between runs; sequential pre-warm reads run at ~2.5 GB/s. Weight
+preload via the pread staging path is a standing improvement item.
