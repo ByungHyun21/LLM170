@@ -108,16 +108,18 @@ fn bad_magic_rejected() {
 }
 
 #[test]
-fn truncation_detected_on_read() {
+fn truncated_data_rejected_at_open() {
     let path = tmp("trunc");
     write_sample(&path, 1152);
     let full = std::fs::read(&path).unwrap();
-    // 데이터 섹션 일부만 남기고 자르기 — 헤더는 유효하므로 open 은 성공해야 정상.
-    // 극단적으로 헤더 중간에서 자르면 io 에러.
+    // 데이터 섹션 일부만 남기고 자르기 — 헤더는 유효. plans/90 A3부터 open 이
+    // 텐서 범위 검증(TensorOutOfBounds)으로 절단을 거부한다(구계약: read 시점 감지).
     std::fs::write(&path, &full[..full.len() / 4]).unwrap();
-    // 헤더(훨씬 짧음)는 그대로므로 여전히 파싱 가능 — 위치 계산만 하는 파서의 의도된 동작.
-    let f = GgufFile::open(&path).unwrap();
-    assert_eq!(f.tensors.len(), 1);
+    let err = GgufFile::open(&path).unwrap_err();
+    assert!(
+        matches!(err, llm170_gguf::GgufError::TensorOutOfBounds { .. }),
+        "{err}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
