@@ -89,6 +89,9 @@ const GEMV8T_Q6_SPV: &[u8] = include_bytes!("../spv/gemv8t_q6.spv");
 const GEMV8T_Q3_SPV: &[u8] = include_bytes!("../spv/gemv8t_q3.spv");
 const GEMV8T_Q8_SPV: &[u8] = include_bytes!("../spv/gemv8t_q8.spv");
 const GEMV8T_XS_SPV: &[u8] = include_bytes!("../spv/gemv8t_xs.spv");
+/// plans/91 P2 — MTP 프리필 배치 유틸(rawhip row_shift_gather/cat2_rows 미러).
+const ROW_SHIFT_GATHER_SPV: &[u8] = include_bytes!("../spv/row_shift_gather.spv");
+const CAT2_ROWS_SPV: &[u8] = include_bytes!("../spv/cat2_rows.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -235,6 +238,15 @@ pub struct DecoderState {
     qsb: VkBuf,  // [T_MAX][n_sub_max] i32
     ishs: VkBuf, // [640][256] i32 — coopMatStore SSBO (workgroup별)
     faccs: VkBuf, // [640][256] f32
+    // ── plans/91 P2 — MTP 프리필 배치 버퍼 (blk.64 t행 1패스, T_MAX 상한).
+    m_be: VkBuf,    // [T][n] 토큰 임베딩 선반입 / hnorm 임시
+    m_bcur: VkBuf,  // [T][n] MTP hidden
+    m_bhs: VkBuf,   // [T][n] h_shift (디바이스 조립)
+    m_bcat: VkBuf,  // [T][2n] enorm‖hnorm
+    m_bxq2: VkBuf,  // [T][xq(2n)]
+    m_bxqn: VkBuf,  // [T][xq(n)]
+    m_bxqf: VkBuf,  // [T][xq(n_ff)]
+    m_prefetched: std::sync::atomic::AtomicBool,
     // ── plans/91 P0 — np 배치: 상태 주소 테이블([그룹][슬롯] u64, 생성 후
     // 불변)·행별 pos/slot 맵(스텝당 호스트 기입)·greedy 행별 argmax 스크래치.
     np_conv_tbl: VkBuf,
@@ -466,6 +478,38 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
         ds.mtp_step_g(seq, tok_emb, false, h, pos, false)?;
         Ok(())
+    }
+
+    /// MTP 임베딩 선반입 (plans/91 P2) — m_be 매핑 ptr 직접 기입.
+    /// hip의 사이드 스트림 h2d 중첩은 없다(동기 기입) — 프리필 청크당
+    /// 수 ms 수준, 원장에 기록.
+    fn mtp_upload_tok_emb(&self, tok_flat: &[f32]) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tok_flat.as_ptr(),
+                ds.m_be.ptr as *mut f32,
+                tok_flat.len().min(T_MAX * ds.n_embd),
+            );
+        }
+        ds.m_prefetched.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// MTP 프리필 배치 (plans/91 P2) — blk.64 t행 1패스(KV-only 최적화).
+    fn mtp_prefill_batch(
+        &self,
+        seq: usize,
+        tok_embs: &[f32],
+        carry_h: &[f32],
+        t: usize,
+        pos0: usize,
+        with_head: bool,
+    ) -> Result<u32, String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        ds.mtp_prefill_batch_ex(seq, tok_embs, carry_h, t, pos0, with_head)
     }
 
     /// 시퀀스 상태 제로화 (서버 슬롯 반환) — 매핑 ptr 직접 (GPU 유휴 보장).

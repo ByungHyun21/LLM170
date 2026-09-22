@@ -1,0 +1,17 @@
+#version 450
+// row_shift_gather (plans/91 P2) — MTP 프리필 h_shift 조립(디바이스):
+// dst[r][j] = r==0 ? carry[j] : src[(r-1)][j]. 호스트 왕복 2·t·n·4B 제거
+// (rawhip row_shift_gather 미러). grid (⌈n·t/256⌉), 256스레드.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Src { float src[]; };   // [t][n] 본체 hidden
+layout(binding = 1) readonly buffer Carry { float carry[]; }; // [n]
+layout(binding = 2) buffer Dst { float dst[]; };            // [t][n]
+layout(push_constant) uniform PC { int n; int t; } pc;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    int total = pc.n * pc.t;
+    if (i >= total) return;
+    int r = i / pc.n;
+    int j = i - r * pc.n;
+    dst[i] = r == 0 ? carry[j] : src[i - pc.n];
+}
