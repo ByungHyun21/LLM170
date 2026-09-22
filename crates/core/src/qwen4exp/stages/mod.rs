@@ -88,4 +88,3 @@ impl Ctx<'_> {
     }
 }
 
-// SeqState4 재수출 — 스테이지 시그니처에서 super::SeqState4로 접근.

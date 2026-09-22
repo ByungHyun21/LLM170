@@ -173,7 +173,6 @@ pub(super) fn gdn_frame_np(
 pub(super) fn qsa_frame_np(
     acc: &dyn Accelerator,
     model: &Model4,
-    ctx: &Ctx,
     seq_sts: &mut [SeqState4],
     seqs: &[usize],
     f: &mut Frame4,
@@ -234,7 +233,6 @@ pub(super) fn qsa_frame_np(
     fs_begin(acc, t); // 공유 구간 복귀
     acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
         .map_err(Q4Error::Io)?;
-    let _ = ctx;
     Ok(())
 }
 
@@ -374,7 +372,7 @@ pub(super) fn frame_forward_np_ex(
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
         } else {
-            qsa_frame_np(acc, model, ctx, seq_sts, seqs, f, il, t, full_idx)?;
+            qsa_frame_np(acc, model, seq_sts, seqs, f, il, t, full_idx)?;
             if il < 4 { ck(acc, f.ffn_out, 64, &format!("L{il}.qsa")); }
             sync_mark(acc, &format!("np{il}.qsa"), f.ffn_out)?;
             full_idx += 1;

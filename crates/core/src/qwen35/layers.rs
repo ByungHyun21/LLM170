@@ -379,13 +379,11 @@ impl Engine {
         if il == 3 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
             eprintln!("  A3dbg normed[0..6]={:?}", &xs[0][0..6]);
             if let Some(qb) = crate::quant::quantize_row_q8_ref(&xs[0]).first() {
-                let w0 = qb.qs.iter().take(4).fold(0u32, |a, &v| a | ((v as u8 as u32) << (8 * (a.count_ones() as usize % 4))));
                 let mut word = 0u32;
                 for (i, b) in qb.qs.iter().take(4).enumerate() {
                     word |= (*b as u8 as u32) << (8 * i);
                 }
                 eprintln!("  A3dbg cpu q word0={word:#010x} d={:e} q[0..6]={:?}", qb.d, qb.qs.iter().take(6).collect::<Vec<_>>());
-                let _ = w0;
             }
         }
         // q·k·v 동일 입력 xs — 1그룹 배치

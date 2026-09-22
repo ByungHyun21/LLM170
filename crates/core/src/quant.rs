@@ -1335,8 +1335,7 @@ mod w4a8_tests {
                 *b = (lcg() & 0xFF) as u8;
             }
             // d 필드가 극단적(0/ff)이면 값이 퇴화 — 스케일 바이트만 온화하게
-            for (bi, blk) in bytes.chunks_mut(bsize).enumerate() {
-                let _ = bi;
+            for blk in bytes.chunks_mut(bsize) {
                 match ty {
                     GgmlType::Q4K | GgmlType::Q5K => {
                         blk[0] = 0x30; blk[1] = 0x10; blk[2] = 0x28; blk[3] = 0x10;

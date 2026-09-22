@@ -157,3 +157,20 @@ pub fn rope_head(head: &mut [f32], pos: u32, n_rot: usize, base: f32) {
         head[p + half] = (x0 * sf + x1 * cf) as f32;
     }
 }
+
+/// RoPE cos/sin 테이블 [ctx][n_rot/2][2] — `rope_head`와 동일 θ 산술.
+/// θ_p = base^(−2p/n_rot), (pos·θ_p)의 cos·sin 쌍. 3벌 복제 통합
+/// (qwen35 hparams·qwen4exp frame qsa/qsa_idx, plans/90 A1 D5) — 값 동일.
+pub fn rope_cs_table(n_rot: usize, base: f32, ctx: usize) -> Vec<f32> {
+    let half = n_rot / 2;
+    let mut cs = vec![0.0f32; ctx * half * 2];
+    for pos in 0..ctx {
+        for pp in 0..half {
+            let theta = base.powf(-(2.0 * pp as f32) / n_rot as f32);
+            let angle = pos as f32 * theta;
+            cs[pos * half * 2 + pp * 2] = angle.cos();
+            cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
+        }
+    }
+    cs
+}
