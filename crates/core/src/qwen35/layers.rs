@@ -5,6 +5,56 @@ use super::{Engine, ModelError, span_block};
 use crate::matmul::{mm_batch, mm_group};
 use crate::ops::{l2_norm, rms_norm, rope_head, sigmoid, silu, softplus};
 use llm170_diag::profile_span;
+
+/// qwen35 단일 헤드 어텐션 — 점수→exp_cr 소프트맥스→가중합→게이트(plans/90 B4 D2).
+/// 본체 t-루프와 GPU 실패 폴백 재계산이 공유 — 연산 순서·exp 선택(exp_cr) 불변.
+#[allow(clippy::too_many_arguments)]
+fn attn_head(
+    qh: &[f32],
+    gate: &[f32],
+    cache_k: &[f32],
+    cache_v: &[f32],
+    n_past: usize,
+    kvh: usize,
+    n_kv: usize,
+    hd: usize,
+    kq_scale: f32,
+    out: &mut [f32],
+) {
+    let mut scores = vec![0.0f32; n_past];
+    let mut maxv = f32::NEG_INFINITY;
+    for (p, sc) in scores.iter_mut().enumerate() {
+        let b = p * n_kv * hd + kvh * hd;
+        let mut d = 0.0f32;
+        for i in 0..hd {
+            d += qh[i] * cache_k[b + i];
+        }
+        *sc = d * kq_scale;
+        maxv = maxv.max(*sc);
+    }
+    let mut sum = 0.0f32;
+    for sc in scores.iter_mut() {
+        *sc = crate::ops::exp_cr(*sc - maxv);
+        sum += *sc;
+    }
+    for sc in scores.iter_mut() {
+        *sc /= sum;
+    }
+    for p in 0..n_past {
+        let w = scores[p];
+        if w == 0.0 {
+            continue;
+        }
+        let b = p * n_kv * hd + kvh * hd;
+        for i in 0..hd {
+            out[i] += w * cache_v[b + i];
+        }
+    }
+    for i in 0..hd {
+        out[i] *= sigmoid(gate[i]);
+    }
+}
+
 impl Engine {
     /// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.
     pub(super) fn gdn_layer(
@@ -205,23 +255,7 @@ impl Engine {
                         dt_rank,
                     );
                     if il == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
-                        // t_len 무관 마지막 행 기준 (per-token VkD 대조용)
-                        let last = r1 - 1;
-                        let sumo: f64 = o_all[last * v_len..(last + 1) * v_len].iter().map(|&v| v as f64).sum();
-                        let _sumq: f64 = q_all[r0 * k_len..r1 * k_len].iter().map(|&v| v as f64).sum();
-                        let mut xco: u64 = 0; let mut xcq: u64 = 0;
-                        for &v in &o_all[r0 * v_len..r1 * v_len] { xco ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        for &v in &q_all[r0 * k_len..r1 * k_len] { xcq ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        eprintln!("  G0dbg o_all sum={sumo:.6} xor={xco:016x} q_all xor={xcq:016x}");
-                        let mut xck: u64 = 0; let mut xcv: u64 = 0; let mut xcb: u64 = 0; let mut xcg: u64 = 0;
-                        for &v in &k_all[r0 * k_len..r1 * k_len] { xck ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        for &v in &v_all[r0 * v_len..r1 * v_len] { xcv ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        for &v in &beta_all[r0 * dt_rank..r1 * dt_rank] { xcb ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        for &v in &g_all[r0 * dt_rank..r1 * dt_rank] { xcg ^= (v.to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        eprintln!("  G0dbg k_all xor={xck:016x} v_all xor={xcv:016x} beta xor={xcb:016x} g_all xor={xcg:016x}");
-                        let mut xce: u64 = 0;
-                        for &v in &g_all[r0 * dt_rank..r1 * dt_rank] { xce ^= (crate::ops::exp_cr(v).to_bits() as u64).wrapping_mul(0x9E3779B97F4A7C15); }
-                        eprintln!("  G0dbg exp_cr(g) xor={xce:016x}");
+                        super::diag::g0_gdn(r0, r1, &o_all, &q_all, &k_all, &v_all, &beta_all, &g_all, v_len, k_len, dt_rank);
                     }
                 } else {
                     // GPU 청크 (03 §3.1) — 값 스타일, 실패 시 CPU 청크.
@@ -377,14 +411,7 @@ impl Engine {
             .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
 
         if il == 3 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
-            eprintln!("  A3dbg normed[0..6]={:?}", &xs[0][0..6]);
-            if let Some(qb) = crate::quant::quantize_row_q8_ref(&xs[0]).first() {
-                let mut word = 0u32;
-                for (i, b) in qb.qs.iter().take(4).enumerate() {
-                    word |= (*b as u8 as u32) << (8 * i);
-                }
-                eprintln!("  A3dbg cpu q word0={word:#010x} d={:e} q[0..6]={:?}", qb.d, qb.qs.iter().take(6).collect::<Vec<_>>());
-            }
+            super::diag::a3_normed(&xs[0]);
         }
         // q·k·v 동일 입력 xs — 1그룹 배치
         let mut group: [Vec<Vec<f32>>; 3] = [
@@ -446,56 +473,18 @@ impl Engine {
                 let mut attn_out = std::mem::take(&mut attn_all[row]);
                 let dbg3 = il == 3 && t == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
                 if dbg3 {
-                    let b0 = (pos as usize) * n_kv * hd;
-                    eprintln!("  A3dbg pos{pos} cache_k[b0..4]={:?} cache_k[0..4]={:?}", &cache_k[b0..b0 + 4], &cache_k[0..4]);
-                    eprintln!("  A3dbg cache_v[0..4]={:?}", &cache_v[b0..b0 + 4]);
-                    eprintln!("  A3dbg gate h0 [0..4]={:?}", &qg[row][hd..hd + 4]);
-                    eprintln!("  A3dbg sigmoid(g)={:?}", (0..4).map(|i| sigmoid(qg[row][hd + i])).collect::<Vec<_>>());
+                    super::diag::a3_cache(pos as usize, pos as usize * n_kv * hd, &cache_k, &cache_v, &qg[row], hd);
                 }
                 for h in 0..n_head {
                     let src = qg[row][h * 2 * hd..h * 2 * hd + hd].to_vec();
                     let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
                     rope_head(&mut qh, pos, n_rot, hp.rope_base);
                     let kvh = h / (n_head / n_kv);
-                    let n_past = pos as usize + 1;
-                    let mut scores = vec![0.0f32; n_past];
-                    let mut maxv = f32::NEG_INFINITY;
-                    for (p, sc) in scores.iter_mut().enumerate() {
-                        let b = p * n_kv * hd + kvh * hd;
-                        let mut d = 0.0f32;
-                        for i in 0..hd {
-                            d += qh[i] * cache_k[b + i];
-                        }
-                        *sc = d * kq_scale;
-                        maxv = maxv.max(*sc);
-                    }
-                    let mut sum = 0.0f32;
-                    for sc in scores.iter_mut() {
-                        *sc = crate::ops::exp_cr(*sc - maxv);
-                        sum += *sc;
-                    }
-                    for sc in scores.iter_mut() {
-                        *sc /= sum;
-                    }
                     let ob = h * hd;
-                    for p in 0..n_past {
-                        let w = scores[p];
-                        if w == 0.0 {
-                            continue;
-                        }
-                        let b = p * n_kv * hd + kvh * hd;
-                        for i in 0..hd {
-                            attn_out[ob + i] += w * cache_v[b + i];
-                        }
-                    }
-                    // q‖gate 인접 인터리브: gate at h*2*hd + hd
                     let gb = h * 2 * hd + hd;
-                    for i in 0..hd {
-                        attn_out[ob + i] *= sigmoid(qg[row][gb + i]);
-                    }
+                    attn_head(&qh, &qg[row][gb..gb + hd], &cache_k, &cache_v, pos as usize + 1, kvh, n_kv, hd, kq_scale, &mut attn_out[ob..ob + hd]);
                     if dbg3 && h == 0 {
-                        let sumsc: f64 = scores.iter().map(|&v| v as f64).sum();
-                        eprintln!("  A3dbg h0 scores_sum={sumsc:.6} n_past={} attn_out[0..4]={:?}", n_past, &attn_out[0..4]);
+                        eprintln!("  A3dbg h0 attn_out[0..4]={:?}", &attn_out[0..4]);
                     }
                 }
                 attn_all[row] = attn_out;
@@ -530,41 +519,9 @@ impl Engine {
                 let mut qh = rms_norm(&src, &q_norm_w, hp.eps);
                 rope_head(&mut qh, pos, n_rot, hp.rope_base);
                 let kvh = h / (n_head / n_kv);
-                let n_past = pos as usize + 1;
-                let mut scores = vec![0.0f32; n_past];
-                let mut maxv = f32::NEG_INFINITY;
-                for (p, sc) in scores.iter_mut().enumerate() {
-                    let b = p * n_kv * hd + kvh * hd;
-                    let mut d = 0.0f32;
-                    for i in 0..hd {
-                        d += qh[i] * cache_k[b + i];
-                    }
-                    *sc = d * kq_scale;
-                    maxv = maxv.max(*sc);
-                }
-                let mut sum = 0.0f32;
-                for sc in scores.iter_mut() {
-                    *sc = crate::ops::exp_cr(*sc - maxv);
-                    sum += *sc;
-                }
-                for sc in scores.iter_mut() {
-                    *sc /= sum;
-                }
                 let ob = h * hd;
-                for p in 0..n_past {
-                    let w = scores[p];
-                    if w == 0.0 {
-                        continue;
-                    }
-                    let b = p * n_kv * hd + kvh * hd;
-                    for i in 0..hd {
-                        attn_out[ob + i] += w * cache_v[b + i];
-                    }
-                }
                 let gb = h * 2 * hd + hd;
-                for i in 0..hd {
-                    attn_out[ob + i] *= sigmoid(qg[0][gb + i]);
-                }
+                attn_head(&qh, &qg[0][gb..gb + hd], cache_k, cache_v, pos as usize + 1, kvh, n_kv, hd, kq_scale, &mut attn_out[ob..ob + hd]);
             }
             attn_all[0] = attn_out;
         }

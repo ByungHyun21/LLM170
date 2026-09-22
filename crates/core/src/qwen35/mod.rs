@@ -8,6 +8,7 @@
 //! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
+mod diag;
 pub mod hparams;
 pub mod prefill;
 pub mod rawinject;
