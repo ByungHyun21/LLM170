@@ -13,14 +13,15 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
 | LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
-| LLM170 vulkan | **336.9** | — | — | 145.9 | 11.4-12 |
+| LLM170 vulkan | **336.9** | 257.9 | 203.5 | 145.9 | 11.61 |
 | llama.cpp hip | 340 | 318-335 | 317 | 293-297 | 11.65 |
 | llama.cpp vulkan | 343 | 318 | 301 | 273 | **12.05** |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | 11.5 | 11.13 | 11.65 | 12.05 |
-| MTP single (k=2) | **14.4** | — | ~12 | — |
+| tg single | 11.5 | 11.61 | 11.65 | 12.05 |
+| np4 aggregate | 32.1 | 11.44 | 15.5 *(HTTP†)* | — |
+| MTP single (k=2) | **14.4** | 미구현(백엔드) | ~12 | — |
 | MTP + np4 | 7.2 | n/a | 15.5 *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
