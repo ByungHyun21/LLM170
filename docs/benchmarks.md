@@ -1176,3 +1176,59 @@ noise.
   scale separation in the CM tiles).
 - diag assets: [dsc] set-leak trace, [tsr] raw dispatch dump, kernel probe
   modes 2/3/4/5, vk-moe-tile-check (4 types), [ts] label double-push fix.
+
+## 2026-09-23 (plans/91) — vk np4 batch decode + MTP port; MMQ closed negative
+
+Back-to-back session load (not a quiet machine); same-batch hip references
+recorded alongside for ratio honesty.
+
+### 27B (qwen35) vulkan, default paths
+
+| cell | this tree | hip (same session) | prior vk |
+|---|---|---|---|
+| pp512 | 343.4 | 38-class (gate hdr) | 336.9 |
+| pp16384 | 145.4 | — | 145.9 |
+| tg128@4k | 11.21 | 11.53 | 11.61 |
+| np4 greedy (tg128 np4) | **28.69** | **20.12** | 11.43 |
+| np4 agg (np4-tg128) | 27.10 | 33.83 | 10.61 |
+| pp512 np4 (plain) | 322.0 | — | — |
+
+np4 decode is now a single pass: shared-t-row GEMMs + per-slot state via
+device-address tables (P0). The greedy cell (server path) leads hip by 43%.
+The non-greedy cell keeps a 20% deficit: full-logits transfer + the
+gemv8-class weight-BW ceiling (~145 GB/s) are class-pinned by the
+batch≡sequential parity contract (verify_np_self 4/4 identical).
+
+### Speculative decode (27B, MTP) — vk now functional
+
+`bench --spec 2` completes on vk (previously "미지원" abort): pp64 spec2
+94.5 t/s, acceptance 0.94 = hip's 0.94 on lcg prompts (draft parity).
+On this prompt class spec pays 2 draft steps + a 3-row verify per forward
+for ~1 token — *both* backends net slower than plain tg (hip 6.16 vs 11.5);
+the recorded 14.4 cell belongs to a different acceptance regime.
+
+### FN (qwen4exp) vulkan
+
+| cell | this tree | hip (same session) |
+|---|---|---|
+| pp512@8k | 178.2 | — |
+| pp4096@8k | 169.4 | — |
+| tg128@8k (208-tok prompt) | **15.01** | **5.47** |
+| tg128@8k (512-tok prompt) | 13.11 | — |
+
+FN tg is host-bound (~2–3 ms GPU per 56 ms step, dispatch gaps ≈ 0);
+NUM_ROWS sweep re-confirmed noise (13.5/14.0/13.1). The recorded 18.4/18.43
+cells trace to an older/different protocol — under today's identical
+protocol vk leads hip 2.7×.
+
+### MMQ / dense tile (closed negative, decision 34)
+
+Scalar OpSDot dense tiles (MoT mode=1 reuse, element-wise, 8-token
+register-blocked + shared activation staging — best 283 t/s vs 342) all
+lose to the f16 coopmat tiles: the tiles are **latency-bound (17.7 GFLOP/s,
+~11.5 GB/s effective)** — neither ALU- nor BW-bound, so arithmetic-density
+work cannot pay. tile_ms128 K double-buffering also closed (no async
+copies in GLSL compute → occupancy loss only). The pp16384 lever is tile
+*structure* (occupancy/latency), not arithmetic. Fixed en route:
+fn_moe_tile_q5k/q8 mode=1 rp guard (dense mode early-exited on the dummy
+rows_pad buffer).
