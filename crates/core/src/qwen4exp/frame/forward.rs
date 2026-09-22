@@ -668,6 +668,46 @@ pub(super) fn qsa_frame(
             }
         }
     }
+    // ─── plans/89 재개: 프리필 다중 토큰 디바이스 선택 — d2h 4회(배치
+    // 플러시)와 호스트 점수/정렬을 전부 소거. 실패 시 종전 호스트 경로.
+    // 스위치 LLM170_QSA_NODEVSEL=1, 검증 LLM170_QSA_DEVCHECK(호스트 병행).
+    if t > 1 && std::env::var_os("LLM170_QSA_NODEVSEL").is_none() {
+        let ikw3 = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
+        let iqw3 = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
+        let devsel = acc.qsa_sel_dev_mt(
+            full_idx, seq, b.iq, b.ik, t, pos0 as usize,
+            hp.idx_heads, hp.idx_dim, r, hp.idx_top_k,
+            &iqw3, &ikw3, &f.qsa_cs_idx, hp.eps,
+        );
+        match devsel {
+            Ok((sd, od, _llen)) => {
+                let attn = acc
+                    .qsa_kv_dev(full_idx, seq, b.k, b.v, t, pos0 as usize, n_kv, hd)
+                    .and_then(|(kc, vc)| {
+                        acc.qsa_attention_dev_sel(
+                            b.q, kc, vc, sd, od, _llen, kq_scale,
+                            n_head, n_kv, hd, t, b.attn,
+                        )
+                    });
+                if let Err(e) = attn {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| eprintln!("# qsa-frame: 디바이스 선택 어텐션 실패 — 호스트 경로 ({e})"));
+                } else {
+                    seq_st.qsa_host_stale = true;
+                    if qtm {
+                        eprintln!("# qsa-frame L{il} t={t} devsel={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
+                    }
+                    acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
+                        .map_err(Q4Error::Io)?;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# qsa-frame: 다중 토큰 디바이스 선택 폴백 — 호스트 경로 ({e})"));
+            }
+        }
+    }
     // ─── 프리필(t>1) 진입: 호스트 캐시 재구축(디코드가 갱신을 건너뛴 경우) ───
     if t > 1 && seq_st.qsa_host_stale {
         let pos = pos0 as usize;
