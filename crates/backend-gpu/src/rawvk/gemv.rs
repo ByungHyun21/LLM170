@@ -1844,7 +1844,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // (차후 판 추가). 킬스위치 LLM170_VK_MOECM=0.
             let use_cm = w.ty == GgmlType::Q4K
                 && wbufs.len() == 1
-                && std::env::var("LLM170_VK_MOECM").map(|v| v == "1").unwrap_or(false);
+                && std::env::var("LLM170_VK_MOECM").map(|v| v != "0").unwrap_or(true);
             let p = self.pipeline(
                 &mut ctx,
                 if use_cm {
@@ -1870,7 +1870,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let ds2 = ctx.bind_ds(&p, &binds)?;
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
-                n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, 0u32,
+                n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32,
+                std::env::var("LLM170_MTC_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32),
                 rows as u32,
             ]);
             let (gx, gy) = if use_cm {
@@ -3234,6 +3235,7 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     let want = match mode {
         "q8_0" => llm170_gguf::GgmlType::Q8_0,
         "q5_K" => llm170_gguf::GgmlType::Q5K,
+        "q4_K" => llm170_gguf::GgmlType::Q4K,
         _ => return Ok("moe-tile-check: 모드 q8_0|q5_K".into()),
     };
     // 해당 타입의 첫 스택 탐색(down 우선, q5_K는 gate/up에만 존재).
@@ -3261,16 +3263,17 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     let n_in_d = wd.n_in as usize;
     let n_out_d = wd.n_out as usize / ne;
     let acc = VkAcc::new()?;
-    let t = 130usize;                       // rows=1300 > 64 → 타일 경로 강제
+    let t = std::env::var("LLM170_MTC_T").ok().and_then(|v| v.parse().ok()).unwrap_or(130usize);
     let k = 10usize;
     let mut lcg = 987654321u64;
     let mut lcgf = || {
         lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((lcg >> 33) as f32 / 4294967296.0) - 0.5
     };
-    let route: Vec<f32> = (0..ne).map(|_| lcgf() * 4.0).collect();
+    let route0: Vec<f32> = (0..ne).map(|_| lcgf() * 4.0).collect();
+    let route: Vec<f32> = (0..t).flat_map(|_| route0.iter().copied()).collect();
     let xs: Vec<Vec<f32>> = (0..t * k).map(|_| (0..n_in_d).map(|_| lcgf()).collect()).collect();
-    let rh = acc.frame_alloc(ne)?;
+    let rh = acc.frame_alloc(t * ne)?;
     let idh = acc.frame_alloc(t * k)?;
     let wth = acc.frame_alloc(t * k)?;
     let mxh = acc.frame_alloc(t * k * n_in_d)?;
@@ -3321,6 +3324,34 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
             checked += 1;
         }
     }
+        if std::env::var_os("LLM170_MTC_DBG").is_some() {
+            for rr in 0..sel.len().min(12) {
+                let ee = sel[rr];
+                let mut s2 = 0f64;
+                let mut rr_row = vec![0f32; n_in_d];
+                llm170_core::quant::dequant_row(wd.ty, wd.data, (ee * n_out_d) as u64, n_in_d as u64, &mut rr_row);
+                for (a, b) in rr_row.iter().zip(xs[rr].iter()) {
+                    s2 += *a as f64 * *b as f64;
+                }
+                eprintln!("[mtc] row={rr} e={ee} got={:.5} ref={:.5}", got[rr * n_out_d], s2);
+            }
+        }
+        if std::env::var_os("LLM170_MTC_DBG").is_some() {
+            for rr in 0..sel.len().min(10) {
+                let ee = sel[rr];
+                let per = wd.data.len() / 512;
+                let off = ee * per;
+                let dBits = u16::from_le_bytes([wd.data[off], wd.data[off + 1]]);
+                let e10 = ((dBits >> 10) & 0x1F) as i32;
+                let m10 = (dBits & 0x3FF) as f32;
+                let dv = if e10 == 0 {
+                    m10 * 2f32.powi(-24)
+                } else {
+                    ((1024.0 + m10) * 2f32.powi(e10 - 25))
+                } * if dBits & 0x8000 != 0 { -1.0 } else { 1.0 };
+                eprintln!("[mtcD] row={rr} e={ee} dBits={dBits:#06x} d={dv:.3e}");
+            }
+        }
     Ok(format!(
         "moe-tile-check({mode} blk.{il} down {n_out_d}x{n_in_d}, rows={}): max|D|={mx:.3e} bad={bad}/{checked} {}",
         t * k,
