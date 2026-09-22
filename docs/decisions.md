@@ -1601,3 +1601,18 @@ Benchmarks (quiet machine): FN vk pp512 131.8 -> ~180, pp4096 128.5 -> 178.6,
 pp16384 118.5 -> 158.6, tg128 15.2 -> 17.9 (hip: 231-275 / 276 / 18.4).
 27B vk pp512 336.9, pp16384 145.9 (hip 292 — dominated by the tile_ms128
 family, the remaining major lever).
+
+### (32f) s8 cooperative matrix on RADV gfx1151: emulated, 2.3x slower (plans/89 s8mmq, 2026-09-22d)
+
+tile_q8128i (coopmat<int8> A/B, int32 accumulate, per-32k-block d·yd drain)
+is numerically validated — maxrel 5.6e-3 vs CPU (activation-quantization
+class, twice as precise as the f16-staged tile, 0/128 tokens over 2%) — but
+RADV lowers s8 cooperative matrices to scalar emulation: checker bench
+0.925ms/dispatch (36GB/s) vs the f16 tile's 0.396ms (84GB/s). The integer
+route is therefore closed on this stack for dense tiles (the OpSDot scalar
+patcher remains the fast integer-dot mechanism — it wins in the MoE tile
+where per-thread register blocking is shallow). Kernel parked as an opt-in
+(LLM170_TILE_I8=1) for hardware with native s8 MMA. Debugging note: the first
+draft covered only 32 of 64 A-rows (4 threads/row instead of 2), and the
+uninitialized shared-memory half produced -inf outputs — caught by
+vk-tile-check in 0.3s.
