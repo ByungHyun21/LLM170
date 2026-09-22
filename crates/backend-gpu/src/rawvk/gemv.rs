@@ -12,9 +12,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 
 pub const GEMV_SPV: &[u8] = include_bytes!("spv/gemv3.spv");
-const TILE128_SPV: &[u8] = include_bytes!("spv/tile128_q5k.spv");
-/// plans/84 B: q5_1 타일판 — 22B 블록 바이트 조립(WGB), 산술은 gemv3 ty=7과 동일열.
-const TILE128_Q51_SPV: &[u8] = include_bytes!("spv/tile128_q51.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("spv/quant_q8.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("spv/rms.spv");
@@ -122,9 +119,7 @@ const FN_QSA_ATTN_SEL_MH_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel_mh.spv
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Slot {
     Gemv,
-    Tile128,
-    /// plans/84 B: q5_1 타일판(tile128_q51) — FN 다운 질량(25.2GiB) 프리필.
-    Tile128Q51,
+
     SiluDiv,
     Scale,
     CopyRows,
@@ -315,8 +310,7 @@ fn vk_ty(ty: GgmlType) -> Option<u32> {
 fn slot_name(slot: Slot) -> &'static str {
     match slot {
         Slot::Gemv => "gemv",
-        Slot::Tile128 => "tile128_q5k",
-        Slot::Tile128Q51 => "tile128_q51",
+
         Slot::SiluDiv => "silu_div",
         Slot::Scale => "scale",
         Slot::CopyRows => "copy_rows",
@@ -457,8 +451,7 @@ impl VkAcc {
         }
         let (spv, n_buf, pb) = match slot {
             Slot::Gemv => (GEMV_SPV, 12, 24u32),
-            Slot::Tile128 => (TILE128_SPV, 10, 16),
-            Slot::Tile128Q51 => (TILE128_Q51_SPV, 10, 24),
+
             Slot::SiluDiv => (SILU_DIV_SPV, 1, 8),    // u32 + f32
             Slot::Scale => (SCALE_SPV, 1, 8),         // u32 + f32
             Slot::CopyRows => (COPY_ROWS_SPV, 2, 12), // 3×u32
@@ -683,71 +676,6 @@ impl VkAcc {
         ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
 
-    /// 128행 coopmat 타일 (q5_K, t≥2) — f16 스테이징, maxrel ~4.9e-4 (HIP v4급).
-    fn tile128_run(
-        &self,
-        ctx: &mut VkCtx,
-        wbufs: &[vk::Buffer],
-        n_in: usize,
-        n_out: usize,
-        xq_w: usize,
-        t: usize,
-        xq_buf: vk::Buffer,
-        out_buf: vk::Buffer,
-        slot: Slot,
-    ) -> Result<(), String> {
-        let (_, _, dbuf) = self.ensure_shared(ctx)?;
-        let p = self.pipeline(ctx, slot)?;
-        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
-        while binds.len() < 8 {
-            binds.push(dbuf);
-        }
-        binds.push(xq_buf);
-        binds.push(out_buf);
-        let ds2 = ctx.bind_ds(&p, &binds)?;
-        let gx = (n_out + 127) as u32 / 128;
-        for tb in (0..t).step_by(64) {
-            let nt = (t - tb).min(64) as u32;
-            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt]);
-            ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
-        }
-        Ok(())
-    }
-
-    /// plans/84 B: q5_1 타일판 런처 — 128토큰 슬래브, push 5필드
-    /// [n_in,n_out,xq_w,nt,tok_base]. (tile128_run의 4필드 push는 t>64
-    /// 슬래브 오프셋을 표현 못 한다 — 여기서 바로잡는다.)
-    fn tile128_q51_run(
-        &self,
-        ctx: &mut VkCtx,
-        wbufs: &[vk::Buffer],
-        n_in: usize,
-        n_out: usize,
-        xq_w: usize,
-        t: usize,
-        xq_buf: vk::Buffer,
-        out_buf: vk::Buffer,
-    ) -> Result<(), String> {
-        let (_, _, dbuf) = self.ensure_shared(ctx)?;
-        let p = self.pipeline(ctx, Slot::Tile128Q51)?;
-        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
-        while binds.len() < 8 {
-            binds.push(dbuf);
-        }
-        binds.push(xq_buf);
-        binds.push(out_buf);
-        let ds2 = ctx.bind_ds(&p, &binds)?;
-        let gx = (n_out + 127) as u32 / 128;
-        // 청크 용량 = max_ssbo 바이트(워드 log2) — WG() 분할 규약.
-        let cw = (ctx.max_ssbo / 4) as u32;
-        let wsh = 31u32 - cw.next_power_of_two().leading_zeros();
-        for tb in (0..t).step_by(128) {
-            let nt = (t - tb).min(128) as u32;
-            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32, wsh]);
-            ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
-        }
-        Ok(())
-    }
 
     /// plans/84 B — 오프셋 지원 GEMV: MoE 전문가 슬라이스(xq 행 구간, 가중
     /// 전문가 오프셋, out 행 구간). 산술은 gemv_run과 동일 커널.
@@ -996,11 +924,12 @@ impl VkAcc {
             let push = push_u32s(&[n0 as u32, t as u32, xq0_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
         }
-        // 2) gate/up GEMV (같은 xq0) — 상주 출력
+        // 2) gate/up GEMV (같은 xq0) — 상주 출력.
+        // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로: gemv3 t-루프는
+        // 512토큰 프리필에서 ~50ms/디스패치(직렬 t). 레이아웃 동일
+        // (outv[tok*n_out+row]). 킬스위치 LLM170_VK_FFNCH=0.
         for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
-            let ty = vk_ty(w.ty).ok_or("ffn 타입 미지원")?;
-            let wbufs = self.weight_bufs(&mut ctx, w)?;
-            self.gemv_run(&mut ctx, &wbufs, n0, w.n_out as usize, xq0_w, ty, t, bq0, obuf)?;
+            self.ffn_tile_or_gemv(&mut ctx, w, n0, xq0_w, t, bq0, obuf)?;
         }
         // 3) silu_mul 상주 (bfg, bfu → bglu)
         {
@@ -1020,9 +949,7 @@ impl VkAcc {
         }
         // 5) down GEMV
         {
-            let ty = vk_ty(down_w.ty).ok_or("ffn down 타입 미지원")?;
-            let wbufs = self.weight_bufs(&mut ctx, down_w)?;
-            self.gemv_run(&mut ctx, &wbufs, n_ff, down_w.n_out as usize, xq1_w, ty, t, bq1, bob)?;
+            self.ffn_tile_or_gemv(&mut ctx, down_w, n_ff, xq1_w, t, bq1, bob)?;
         }
         // 6) 일괄 제출·대기 → 다운로드 1회
         if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
@@ -1033,6 +960,61 @@ impl VkAcc {
             xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);
         }
         Ok(())
+    }
+
+    /// ffn_chain GEMV — t≥2 q8_0/q4_K는 coopmat 타일(tile_q8128/q4k128 계열)
+    /// 로, 그 외는 종전 gemv3. true=타일 경로 사용.
+    fn ffn_tile_or_gemv(
+        &self,
+        ctx: &mut VkCtx,
+        w: &Weight,
+        n_in: usize,
+        xq_w: usize,
+        t: usize,
+        xq: vk::Buffer,
+        ob: vk::Buffer,
+    ) -> Result<bool, String> {
+        let n_out = w.n_out as usize;
+        let wbufs = self.weight_bufs(ctx, w)?;
+        let use_tile = t >= 2
+            && std::env::var_os("LLM170_VK_FFNCH").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
+            && wbufs.len() == 1
+            && vk_ty(w.ty).is_some();
+        if !use_tile {
+            let ty = vk_ty(w.ty).ok_or("ffn 타입 미지원")?;
+            self.gemv_run(ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+            return Ok(false);
+        }
+        let (_, _, dbuf) = self.ensure_shared(ctx)?;
+        let mut binds: Vec<vk::Buffer> = wbufs.clone();
+        while binds.len() < 8 {
+            binds.push(dbuf);
+        }
+        binds.push(xq);
+        binds.push(ob);
+        let big = t >= 128;
+        let slot = match (w.ty, big) {
+            (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,
+            (GgmlType::Q8_0, false) => Slot::TileQ8msCm,
+            (_, true) => Slot::TileQ4k128Cm,
+            (_, false) => Slot::TileQ4kmsCm,
+        };
+        let step = if big { 128usize } else { 64 };
+        let p = self.pipeline(ctx, slot)?;
+        let ds2 = ctx.bind_ds(&p, &binds)?;
+        let gx = (n_out as u32).div_ceil(64);
+        for tb in (0..t).step_by(step) {
+            let nt = (t - tb).min(step) as u32;
+            let push = if big {
+                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, 0, tb as u32])
+            } else {
+                push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32])
+            };
+            ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
+        }
+        Ok(true)
     }
 }
 
@@ -2853,17 +2835,42 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
         self.quant_upload(&mut ctx, xs, n_in, xq)?;
         let wbufs = self.weight_bufs(&mut ctx, w)?;
-        // 128행 타일 (q5_K, t≥2, env) — f16 fast 경로
-        if ty == 13 && t >= 2 && std::env::var_os("LLM170_VK_TILE").is_some() {
-            self.tile128_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob, Slot::Tile128)?;
-            self.download_out(outs, n_out, t);
-            return Ok(());
-        }
-        // plans/84 B: q5_1 타일판 — FN 다운 질량 프리필(옵트인, f16 타일이라
-        // GEMV와는 다른 정밀도 클래스: t<2와 t>=2 패밀리 갈림을 막으려 기본
-        // 끔 — LLM170_VK_TILE_Q51=1).
-        if ty == 7 && t >= 2 && std::env::var_os("LLM170_VK_TILE_Q51").is_some() {
-            self.tile128_q51_run(&mut ctx, &wbufs, n_in, n_out, xq_w, t, xq, ob)?;
+        // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로(dense_mm와 동일
+        // 판·동일 수치 클래스). gemv3 t-루프는 512토큰에서 ~50ms 직렬.
+        // 킬스위치 LLM170_VK_MBTILE=0.
+        if t >= 2
+            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
+            && wbufs.len() == 1
+            && std::env::var_os("LLM170_VK_MBTILE").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+        {
+            let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(xq);
+            binds.push(ob);
+            let big = t >= 128;
+            let slot = match (w.ty, big) {
+                (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,
+                (GgmlType::Q8_0, false) => Slot::TileQ8msCm,
+                (_, true) => Slot::TileQ4k128Cm,
+                (_, false) => Slot::TileQ4kmsCm,
+            };
+            let step = if big { 128usize } else { 64 };
+            let p = self.pipeline(&mut ctx, slot)?;
+            let ds2 = ctx.bind_ds(&p, &binds)?;
+            let gx = (n_out as u32).div_ceil(64);
+            for tb in (0..t).step_by(step) {
+                let nt = (t - tb).min(step) as u32;
+                let push = if big {
+                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, 0, tb as u32])
+                } else {
+                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32])
+                };
+                ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
+            }
             self.download_out(outs, n_out, t);
             return Ok(());
         }
