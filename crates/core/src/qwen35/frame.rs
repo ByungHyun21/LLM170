@@ -113,12 +113,10 @@ impl Frame {
         acc.frame_write(f.one, &[1.0f32]).map_err(ModelError::Accel)?;
         // 어텐션(P1): cs 테이블·마스크·KV 캐시 — CPU rope_head과 동일 값.
         {
-            let (n_kv, hd) = (hp.n_kv, hp.head_dim);
             let cs = hp.rope_cs(ctx_frames);
             acc.frame_write(f.cs, &cs).map_err(ModelError::Accel)?;
             let masks: Vec<u32> = vec![1u32; ctx_frames];
             acc.frame_write_u32(f.mask, &masks).map_err(ModelError::Accel)?;
-            let _ = (n_kv, hd);
         }
         for _ in 0..eng.seqs.len() {
             let mut gdn = Vec::with_capacity(n_recr);

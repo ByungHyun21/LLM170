@@ -66,7 +66,6 @@ impl Engine {
             });
             rows
         };
-        let _ = n;
         self.prefill_rows(seq, tokens, &cache)
     }
 
@@ -160,8 +159,7 @@ impl Engine {
                 self.seqs[seq].pos = pos as u32;
                 return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
             }
-            for (ti, &t) in tokens.iter().enumerate() {
-                let _ = ti;
+            for &t in tokens {
                 let logits = self.decode(&[seq], &[t])?;
                 last = Some(logits.into_iter().next().unwrap());
             }
