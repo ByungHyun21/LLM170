@@ -65,12 +65,6 @@ struct MoeGroup {
     off: Vec<usize>,
 }
 
-/// 무게 파일 소스 — mmap 베이스 주소 범위 + 파일 핸들 (staged pread 업로드용).
-struct Source {
-    base: usize,
-    len: usize,
-    file: std::fs::File,
-}
 
 /// per-op 시간 누적 (LLM170_Q4ACC_TIME=1) — (업로드, 양자화, 런치, d2h, 호출수)
 #[derive(Default)]
@@ -92,7 +86,7 @@ pub struct Q4Acc {
     wbytes: std::sync::atomic::AtomicUsize,
     time: std::sync::Mutex<AccTime>,
     /// 모델 파트 파일 — 있으면 업로드가 mmap 폴트 대신 pread 스테이징을 쓴다.
-    sources: Vec<Source>,
+    sources: Vec<crate::common::parts::PartSource>,
     stage: std::sync::Mutex<Vec<u8>>,
     /// 프레임 버퍼 레지스트리 — 핸들 = 인덱스+1 (해제 없음, ADR-0014).
     frames: std::sync::Mutex<Vec<(*mut u8, usize)>>,
@@ -204,7 +198,7 @@ impl Q4Acc {
         let mut sources = Vec::with_capacity(parts.len());
         for (base, len, path) in parts {
             match std::fs::File::open(&path) {
-                Ok(file) => sources.push(Source { base, len, file }),
+                Ok(file) => sources.push(crate::common::parts::PartSource { base, len, file }),
                 Err(e) => eprintln!("# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})", path.display()),
             }
         }
@@ -318,11 +312,10 @@ impl Q4Acc {
     /// 실측: mmap 폴트 20-180 MB/s vs 버퍼드 pread 1.2 GB/s (같은 파일).
     fn staged_upload(&self, dst: *mut u8, ptr: usize, len: usize) -> Option<Result<(), String>> {
         use std::os::unix::fs::FileExt;
-        let src = self
+        let (src, mut off) = self
             .sources
             .iter()
-            .find(|s| ptr >= s.base && ptr.checked_add(len).map(|e| e <= s.base + s.len).unwrap_or(false))?;
-        let mut off = (ptr - src.base) as u64;
+            .find_map(|s| s.covers(ptr, len).map(|o| (s, o)))?;
         let result = (|| -> Result<(), String> {
             const CH: usize = 8 << 20;
             let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
