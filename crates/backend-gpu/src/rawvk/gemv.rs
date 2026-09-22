@@ -97,6 +97,10 @@ const FN_MOE_TILE_Q8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q8.spv");
 const FN_MOE_TILE_Q5K_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q5k.spv");
 /// plans/89 P1.1d — MoE q5_1 coopmat 타일(q4k_cm 동일 골격).
 const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_cm.spv");
+/// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
+const FN_PLE_GATE_SPV: &[u8] = include_bytes!("spv/fn_ple_gate.spv");
+const FN_PLE_CONV_SPV: &[u8] = include_bytes!("spv/fn_ple_conv.spv");
+const FN_PLE_RES_SPV: &[u8] = include_bytes!("spv/fn_ple_res.spv");
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +178,10 @@ enum Slot {
     FnMoeTileQ5k,
     /// plans/89 P1.1d — MoE q5_1 coopmat 타일.
     FnMoeTileQ51Cm,
+    /// plans/89 P1.4 — PLE gate/conv/residual.
+    FnPleGate,
+    FnPleConv,
+    FnPleRes,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -234,6 +242,10 @@ pub struct VkAcc {
     moe_gen: std::sync::atomic::AtomicU64,
     /// plans/88 P2 — 그룹화 캐시: 같은 세대의 3개 GEMM이 테이블을 공유.
     moe_grp: Mutex<Option<MoeGrp>>,
+    /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크 t).
+    ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
+    /// plans/89 P1.4 — PLE 상수 캐시: (ptr,len) → 버퍼(모델 가중 뷰라 안정).
+    ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
 }
 
 /// plans/88 P2 — MoE 그룹화 상주 자산(디바이스 테이블 + 스크래치).
@@ -322,6 +334,9 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeIds => "moe_ids",
         Slot::FnMmf32 => "mm_f32",
         Slot::FnMoeIds2 => "moe_ids2",
+        Slot::FnPleGate => "ple_gate",
+        Slot::FnPleConv => "ple_conv",
+        Slot::FnPleRes => "ple_res",
         Slot::FnMoeIds51 => "moe_ids51",
         Slot::FnMoeGroup => "moe_group",
         Slot::FnMoeTileQ4K => "moe_tile_q4k",
@@ -394,6 +409,8 @@ impl VkAcc {
             frame_step_batch: std::sync::atomic::AtomicBool::new(false),
             moe_gen: std::sync::atomic::AtomicU64::new(0),
             moe_grp: Mutex::new(None),
+            ple_rings: Mutex::new(std::collections::HashMap::new()),
+            ple_consts: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -453,6 +470,9 @@ impl VkAcc {
             Slot::FnMoeTileQ51 => (FN_MOE_TILE_Q51_SPV, 13, 28),  // +mode+rows
             Slot::FnTileQ8 => (FN_TILE_Q8_SPV, 10, 20),  // 8W+xq+out
             Slot::FnTileF32 => (FN_TILE_F32_SPV, 10, 20),    // 8W+x(f32)+out
+            Slot::FnPleGate => (FN_PLE_GATE_SPV, 8, 16),   // res,key,val,nk,nq,nc,gated,gate
+            Slot::FnPleConv => (FN_PLE_CONV_SPV, 4, 20),   // gated,cw,ring,conv
+            Slot::FnPleRes => (FN_PLE_RES_SPV, 4, 12),     // res,val,gate,conv
             Slot::TileQ8128Cm => (TILE_Q8128_SPV2, 10, 24),
             Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
             Slot::TileQ4k128Cm => (TILE_Q4K128_SPV2, 10, 24),
@@ -2806,6 +2826,112 @@ impl llm170_core::matmul::EwOps for VkAcc {
             });
         let _ = self.frame_free(dh);
         r
+    }
+
+    /// plans/89 P1.4 — PLE 수학 디바이스판(디코드 t=1): hip q4_ple_* 3커널의
+    /// VkAcc 발사. 링/워터마크·상수 캐시 (ptr,len) 동일 규약. 프리필(t>1)은
+    /// Err → 엔진이 종전 호스트 브리지로.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_math_dev(
+        &self,
+        res: u64,
+        key: u64,
+        value: u64,
+        nk: &[f32],
+        nq: &[f32],
+        nc: &[f32],
+        conv_w: &[f32],
+        gated: u64,
+        conv_out: u64,
+        gate_out: u64,
+        seq: usize,
+        t: usize,
+        eps: f32,
+        n_embd: usize,
+        hc: usize,
+        kern: usize,
+        dil: usize,
+        hist: usize,
+        host_ring: &[f32],
+    ) -> Result<(), String> {
+        if t != 1 {
+            return Err("ple_math_dev: t=1 전용".into());
+        }
+        let hc_dim = hc * n_embd;
+        let ring_bytes = hist * hc_dim * 4;
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        // 링 + 워터마크(되감기면 호스트 링으로 리프레시).
+        let rewind;
+        let ringb;
+        {
+            let mut m = self.ple_rings.lock();
+            let e = m.entry(seq).or_insert_with(|| (vkbuf_null(), 0));
+            rewind = e.1 > t || e.0.ptr.is_null();
+            e.1 = t;
+            if e.0.ptr.is_null() {
+                e.0 = ctx.alloc_host(ring_bytes)?;
+            }
+            if rewind {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        host_ring.as_ptr() as *const u8,
+                        e.0.ptr,
+                        hist * hc_dim * 4,
+                    );
+                }
+            }
+            ringb = e.0.buf;
+        }
+        // 상수 캐시 — 모델 가중 뷰(ptr,len 안정).
+        let upload = |ctx: &mut VkCtx, s: &[f32]| -> Result<vk::Buffer, String> {
+            let key = (s.as_ptr() as usize, s.len());
+            let mut c = self.ple_consts.lock();
+            if let Some(b) = c.get(&key) {
+                return Ok(b.buf);
+            }
+            let b = ctx.alloc_host(s.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(s.as_ptr() as *const u8, b.ptr, s.len() * 4) };
+            let buf = b.buf;
+            c.insert(key, b);
+            Ok(buf)
+        };
+        let nkb = upload(&mut ctx, nk)?;
+        let nqb = upload(&mut ctx, nq)?;
+        let ncb = upload(&mut ctx, nc)?;
+        let cwb = upload(&mut ctx, conv_w)?;
+        let rb = self.fbuf(res)?;
+        let kb = self.fbuf(key)?;
+        let vb = self.fbuf(value)?;
+        let gb = self.fbuf(gated)?;
+        let cob = self.fbuf(conv_out)?;
+        let gob = self.fbuf(gate_out)?;
+        // (1) gate+방송+그룹 norm.
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnPleGate)?;
+            let ds2 = ctx.bind_ds(&p, &[rb, kb, vb, nkb, nqb, ncb, gb, gob])?;
+            let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
+            let mut p16 = eps.to_le_bytes().to_vec();
+            p16.extend_from_slice(&push);
+            ctx.run(p.pl, ds2, p.pipe, &p16, hc.div_ceil(8) as u32, t as u32, 1)?;
+        }
+        // (2) dilated conv + silu + 링 갱신.
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnPleConv)?;
+            let ds2 = ctx.bind_ds(&p, &[gb, cwb, ringb, cob])?;
+            let push = push_u32s(&[
+                hc_dim as u32, t as u32, kern as u32, dil as u32, hist as u32,
+            ]);
+            ctx.run(p.pl, ds2, p.pipe, &push, hc_dim.div_ceil(256) as u32, 1, 1)?;
+        }
+        // (3) 잔차.
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnPleRes)?;
+            let ds2 = ctx.bind_ds(&p, &[rb, vb, gob, cob])?;
+            let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
+            ctx.run(p.pl, ds2, p.pipe, &push, n_embd.div_ceil(256) as u32, 1, 1)?;
+        }
+        Ok(())
     }
 }
 
