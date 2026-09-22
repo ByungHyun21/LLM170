@@ -1,0 +1,53 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// mm_f32b (plans/89 P0.2) — f32/BF16 디코드 GEMV. fn_mm_f32은 256스레드 풀
+// f64 트리(512WG 지연바운드, [ts] ~12ms/step = 0.4GB/s급) — 64스레드
+// 서브그룹Add 판으로 교체. WG=출력행(grid x)×토큰(grid y), 레인 vec4(f32)/
+// vec2(bf16) 스트라이드. 프리필(t≥16)은 fn_mm_f32 유지(P1.2에서 t-타일링).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Wbuf { uint wu[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint dty; uint chunk_words;
+} pc;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint row = gl_WorkGroupID.x;
+    const uint xbase = tok * pc.n_in;
+    const uint wbase = row * (pc.dty == 0u ? pc.n_in : pc.n_in / 2u);
+    float acc = 0.0;
+    if (pc.dty == 0u) {
+        // f32: 레인당 4원소(vec4) 스트라이드 256.
+        uint c = 4u * tid;
+        for (; c + 3u < pc.n_in; c += 256u) {
+            const vec4 w = vec4(
+                uintBitsToFloat(wu[wbase + c]),
+                uintBitsToFloat(wu[wbase + c + 1u]),
+                uintBitsToFloat(wu[wbase + c + 2u]),
+                uintBitsToFloat(wu[wbase + c + 3u]));
+            const vec4 x = vec4(
+                xa[xbase + c], xa[xbase + c + 1u], xa[xbase + c + 2u], xa[xbase + c + 3u]);
+            acc += dot(w, x);
+        }
+        for (; c < pc.n_in; c++) {
+            acc += uintBitsToFloat(wu[wbase + c]) * xa[xbase + c];
+        }
+    } else {
+        // BF16: 워드당 2원소 — 레인 1워드(vec2) 스트라이드 128.
+        const uint nw = pc.n_in / 2u;
+        for (uint w = tid; w < nw; w += 128u) {
+            const vec2 wp = unpackHalf2x16(wu[wbase + w]);
+            const uint c = 2u * w;
+            acc += wp.x * xa[xbase + c] + wp.y * xa[xbase + c + 1u];
+        }
+    }
+    const float r = subgroupAdd(acc);
+    if (tid == 0u) {
+        outv[tok * pc.n_out + row] = r;
+    }
+}
