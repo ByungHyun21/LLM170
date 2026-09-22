@@ -770,12 +770,6 @@ impl Detok {
     }
 }
 
-pub fn piece_plain(tok: u32) -> String {
-    TOKENIZER
-        .get()
-        .map(|t| t.piece(tok))
-        .unwrap_or_default()
-}
 
 /// 글로벌 토크나이저 (serve 시 1회 적재).
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();

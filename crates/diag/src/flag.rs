@@ -37,31 +37,6 @@ pub fn env_on(name: &str) -> bool {
     v
 }
 
-/// 값과 함께 등록 (진단용 설명 포함).
-pub fn env_on_desc(name: &str, desc: &'static str) -> bool {
-    let v = env_on(name);
-    if let Ok(mut r) = registry().lock() {
-        if let Some(info) = r.get_mut(name) {
-            info.desc = desc;
-        }
-    }
-    v
-}
-
-/// 등록된 전체 변수 목록 — `llm170 diag env` 출력용.
-pub fn list() -> Vec<(String, bool, &'static str)> {
-    match registry().lock() {
-        Ok(r) => {
-            let mut v: Vec<_> = r
-                .iter()
-                .map(|(k, info)| (k.clone(), info.value, info.desc))
-                .collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0));
-            v
-        }
-        Err(_) => Vec::new(),
-    }
-}
 
 #[cfg(test)]
 mod tests {
