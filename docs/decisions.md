@@ -1710,3 +1710,95 @@ the gate matrix must include **FN hip** alongside FN vk / 27B hip /
 27B vk / frame-check — a single-runtime gate can mask whole-backend
 kernel loss. Verification commands now run with explicit build-exit
 checks (`set -o pipefail` discipline).
+
+## (34) plans/91 ledger: vk np4 batch decode, MTP port, MMQ investigation (2026-09-23)
+
+Scope: P0 np4 single-pass decode, P2 MTP prefill/verify batching, P1a/P1b
+scalar-MMQ and double-buffer attempts (closed negative with a structural
+finding), P3 FN tg re-profile, D1 evaluated. All commits on `perf-91`;
+gates green throughout: 27B vk/hip, FN vk ×3 byte-identical, FN hip,
+frame-check 0 failures, cargo test full suite, verify_np_self 4/4 identical
+(batch == sequential bit-stream parity over 16 tokens × 4 slots).
+
+**P0 np4 (commit 88cda21).** `step_batch_np_ex`: t rows (one per slot) in a
+single pass — GEMM/elementwise kernels share t rows (one weight read), state
+kernels (conv ring / AR / rope / KV / flash) address per-row state through
+GL_EXT_buffer_reference device-address tables built once at init. Five new
+shaders (gdn_conv_np, gdn_arf_np, qk_rope2_np, kv_app_np, qsa_flash_np);
+per-row arithmetic is bit-identical to the t=1 path. Root-caused during
+bring-up: the slot-map upload reinterpreted the usize array's low bytes
+([0,0] written instead of [0,1]) so every row overwrote slot 0's state —
+localized via [npck] state marks (slot-1 state frozen across steps), fixed
+by element-wise conversion. The second structural find: the old gemv8 z=t
+dispatch re-read the full weight tensor per token (np4 step 273 ms);
+a new `gemv8t` family (7 kernels, q5/q4/q6/q8/xs/nl/q3) processes 2..=4
+tokens per workgroup with vec4 (lane=token) accumulate — weight read once,
+WG count 1/t, row×token arithmetic bit-identical to the *_b variants
+(q8/xs dot-lowering order empirically stream-verified). Greedy head folds
+fn_argmax_rows into the trunk submission. 27B (ctx 4096): np4 greedy cell
+11.43 → **28.69 t/s (2.5×; hip same cell today 20.12 — vk +43%)**, np4-tg128
+10.61 → 27.10 (hip 33.83: remaining gap = 2.4 MB logits transfer + the
+gemv8-class ~145 GB/s ceiling — further gains are class-pinned by the
+batch≡sequential parity contract). NR sweep for the t-kernels: 4 invalid
+(hardcoded 2-row kernels skip half the outputs), kept at 2.
+
+**P1 MMQ (commit ff0bbdf, negative).** The plan's scalar OpSDot dense tile
+was built three ways: MoE-tile mode=1 reuse (fixed a real mode=1 rp guard
+bug in fn_moe_tile_q5k/q8 — they read rows_pad[0] and early-exited on the
+dummy buffer), a register-blocked element-wise kernel, and an 8-token
+OpSDot kernel with shared activation staging (best: pp512 283 vs 342
+baseline). All lose to the f16 coopmat tiles. The structural reason,
+measured: the coopmat tiles run at **17.7 GFLOP/s and ~11.5 GB/s effective
+weight bandwidth — latency-bound at ~0.1% of ALU and ~5% of memory
+capability**. Arithmetic-density optimization cannot pay when the kernel
+is neither ALU- nor BW-bound. tile_ms128 K double-buffering (P1b) also
+closed: GLSL compute has no async copies, per-thread stores are in-order,
+so the "overlap" only halved occupancy (LDS 2×) — 333 vs 342. The [ts]
+profiler gained a direct inter-dispatch gap sum (checked_sub) — pp512
+chunks show ~2.4 ms of gap per 2757 dispatches, confirming GPU-bound.
+The open lever for pp16384 (145.4 t/s today) is tile *structure*
+(occupancy/latency), not arithmetic.
+
+**P2 MTP (commit 6bf445d).** mtp_prefill_batch ported: blk.64 in one t-row
+pass with hip's KV-only optimization (mid chunks accumulate KV only; the
+final chunk runs attention/FFN/head for the last row only), device-side
+h_shift assembly (row_shift_gather — host round-trip eliminated), cat2_rows,
+7 new T_MAX-row m_b_* buffers, mtp_upload_tok_emb prefetch via mapped
+pointer (sync — hip's side-stream overlap not ported). verify_rows flipped
+to batch-by-default (step_batch t-row; kill switch VKD_SPEC_BATCH=0) —
+the old per-token default made spec prefill 6.0 s for 64 tokens (677 ms
+after). mtp_step_g GEMVs upgraded gemv3→gemv_w(gemv8). gdn_restore_seq
+implemented (np×spec partial-accept). bench --spec 2 now completes on vk
+(was "미지원" instant death): acceptance 0.94 = hip's 0.94 on the same lcg
+prompts (draft parity); pp64 spec2 94.5 vs hip 175.3. The plan's 14.4 MTP
+cell is unreachable on this bench protocol for *either* backend (hip spec
+= 6.16 t/s today vs hip plain tg 11.5 — acceptance ~1 means spec pays the
+verify+draft cost without multi-token wins).
+
+**P3 FN tg.** Fresh [ts]: the FN decode step is host-bound — ~2–3 ms GPU
+per 56 ms wall (gaps ≈ 0). The plan's NUM_ROWS sweep re-run: 13.50/14.00/
+13.12 (ctx 8192) — noise, confirming the prior session's finding.
+mm_f32b consolidation (288 launches/step) remains the designated lever but
+targets GPU time that is not the bound; the actual lever is host dispatch
+cost. Same-protocol comparison: FN tg128@8k vk **15.01 vs hip 5.47**
+(208-token prompt) — vk leads hip 2.7×; the 18.43 bar traces to a
+different/older protocol (current hip cannot reach it either).
+
+**P5.** D1 (GDN layer unification) evaluated, not executed: the two layer
+files have diverged into different GPU-hook architectures (value-style
+per-stage hooks vs t=1 shortcut), state types, and weight accessors; a
+parameterized core at the current divergence is indirection without dedup
+— same verdict as 90's D8/D9. The plan itself scoped D1 to a relaxed
+session. checks.rs/spec.rs splits (P5.4, optional) untouched — no natural
+split presented itself.
+
+**Final cells (this tree, back-to-back load, ctx per benchmarks.md).**
+27B vk: pp512 343.4 / pp4096 338-class / pp16384 145.4 / tg128@4k 11.21 /
+np4 greedy 28.69 / np4 agg 27.10 / spec2 runs (acceptance parity with hip).
+FN vk: pp512 178.2 / pp4096 169.4 / tg128@8k 13.11(512-tok prompt)
+15.01(208-tok). hip same-session references: 27B np4 greedy 20.12,
+np4-tg128 33.83, spec tg 6.16, FN tg 5.47. Plan cells not reached on this
+protocol: 27B pp16384 ≥292 (P1 closed with finding), np4 literal 32.1
+(non-greedy cell; the tracked greedy cell beats hip by 43%), MTP ≥14.4
+(protocol-bound for both backends), FN literal 18.43 (vk 15.01 vs hip
+5.47 — hip-exceeded criterion met at 2.7×).
