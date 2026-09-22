@@ -254,7 +254,8 @@
 | operational? | `LLM170_VK_NOF16W` | 1 | 1 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(1) |
 | operational? | `LLM170_VK_NOI8` | 1 | 1 | crates/backend-gpu/src/rawvk/decoder/step.rs(1) |
 | operational? | `LLM170_VK_NOTILE` | 4 | 1 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(4) |
-| operational? | `LLM170_VK_NR` | 3 | 2 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(2), crates/backend-gpu/src/rawvk/context.rs(1) |
+| operational? | `LLM170_VK_NOROB` | 3 | 1 | crates/backend-gpu/src/rawvk/context.rs(1) |
+| operational? | `LLM170_VK_NUMROWS` | 3 | 2 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(2) |
 | operational? | `LLM170_VK_Q3B` | 1 | 1 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(1) |
 | operational? | `LLM170_VK_Q3Q8` | 1 | 1 | crates/backend-gpu/src/rawvk/decoder/weights.rs(1) |
 | operational? | `LLM170_VK_Q4B` | 2 | 1 | crates/backend-gpu/src/rawvk/decoder/gemv.rs(2) |
