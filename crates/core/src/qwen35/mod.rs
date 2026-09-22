@@ -13,7 +13,7 @@ pub mod hparams;
 pub mod prefill;
 pub mod rawinject;
 pub mod spec;
-mod layers;
+pub mod stages;
 pub(crate) mod frame;
 pub use frame::Frame;
 
@@ -427,12 +427,13 @@ impl Engine {
                 }
             }
 
+            let ctx = stages::Ctx { model: &self.model, acc: &self.acc };
             let attn_out = if self.model.is_recr(il) {
-                let o = self.gdn_layer(il, &xs, seq_ids, t_len, recr_idx)?;
+                let o = stages::gdn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, recr_idx)?;
                 recr_idx += 1;
                 o
             } else {
-                let o = self.attn_layer(il, &xs, seq_ids, t_len, full_idx)?;
+                let o = stages::attn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, full_idx)?;
                 full_idx += 1;
                 o
             };
