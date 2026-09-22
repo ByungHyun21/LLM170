@@ -1213,11 +1213,12 @@ the recorded 14.4 cell belongs to a different acceptance regime.
 |---|---|---|
 | pp512@8k | 178.2 | — |
 | pp4096@8k | 169.4 | — |
-| tg128@8k (208-tok prompt) | **15.01** | **5.47** |
+| tg128@8k (208-tok prompt) | **15.24** | **5.47** |
 | tg128@8k (512-tok prompt) | 13.11 | — |
 
 FN tg is host-bound (~2–3 ms GPU per 56 ms step, dispatch gaps ≈ 0);
-NUM_ROWS sweep re-confirmed noise (13.5/14.0/13.1). The recorded 18.4/18.43
+NUM_ROWS sweep re-confirmed noise (13.5/14.0/13.1). mm_f32b grouped into
+per-layer single launches (bit-identical): +1.5%. The recorded 18.4/18.43
 cells trace to an older/different protocol — under today's identical
 protocol vk leads hip 2.7×.
 
