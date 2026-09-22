@@ -1,17 +1,15 @@
 #version 450
 // plans/84 B — MoE (토큰,전문가) 페어 게더: dst[(ti·k+s)·n+j] = src[ti·n+j].
-// hip q4_moe_gather 동일열. BcastRows(1행 방송)와 달리 토큰 스트라이드.
-layout(local_size_x = 128) in;
+// plans/89 P1.2 — 완전 병렬화: 구판은 grid x만(n=2560스레드)이 t·k 루프를
+// 스레드당 직렬로 돌려 52MB를 20WG가 썼다. (열, 4행블록) 2차원 그리드로
+// 원소당 1스레드. 그리드 (⌈n/128⌉, ⌈t·k/4⌉).
+layout(local_size_x = 128, local_size_y = 4) in;
 layout(binding = 0) readonly buffer Src { float s[]; };
 layout(binding = 1) buffer Dst { float d[]; };
 layout(push_constant) uniform PC { uint n; uint k; uint t; } pc;
 void main() {
-    uint j = gl_GlobalInvocationID.x;
-    if (j >= pc.n) return;
-    for (uint ti = 0u; ti < pc.t; ti++) {
-        float v = s[ti * pc.n + j];
-        for (uint kk = 0u; kk < pc.k; kk++) {
-            d[(ti * pc.k + kk) * pc.n + j] = v;
-        }
-    }
+    const uint j = gl_GlobalInvocationID.x;
+    const uint rb = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.y;
+    if (j >= pc.n || rb >= pc.t * pc.k) return;
+    d[rb * pc.n + j] = s[(rb / pc.k) * pc.n + j];
 }
