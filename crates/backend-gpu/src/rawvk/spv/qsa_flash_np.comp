@@ -1,0 +1,118 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// qsa_flash_np (plans/91 P0) — qsa_flash의 np 판: 행(슬롯)별 K/V 캐시를
+// 디바이스 주소 테이블로, pos도 행별 테이블. 행별 산술은 qsa_flash와 완전
+// 동일(마스크 폐지, 루프 상한 np=pos+1). grid (t, n_head), 256스레드.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Q { float q[]; };        // [t][n_head*2hd]
+layout(binding = 1) readonly buffer Ktbl { uint64_t ktbl[]; }; // [n_full][n_seqs]
+layout(binding = 2) readonly buffer Vtbl { uint64_t vtbl[]; }; // [n_full][n_seqs]
+layout(binding = 3) readonly buffer Pos { uint pos[]; };      // [t]
+layout(binding = 4) readonly buffer Slot { uint slot[]; };    // [t]
+layout(binding = 5) buffer O { float o[]; };                  // [t][n_head*hd]
+layout(push_constant) uniform PC {
+    int nh; int nk; int hd; int fi; int ns;
+} pc;
+layout(buffer_reference, std430) buffer KvBlk { float kv[]; };
+
+const int KT = 32;                 // 키 타일 크기
+const int KS = 257;                // shared 행 스트라이드 — 257 mod 32 = 1 → 뱅크 무충돌
+shared float ks[KT][KS];           // K 타일. V는 전역 코얼레스(tid 연속)로 직접 읽는다
+shared float sp[8][33];            // 워프별 QK 부분합 (패딩 33 = 뱅크 무충돌)
+shared float pf[KT];               // 타일 확률 — 워프0이 채우고 PV 스레드가 읽는다
+shared float resc;                 // exp(m_old - mn) — PV 재스케일 계수
+shared float ssum;                 // 최종 정규화용 러닝 합
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    int h = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationIndex);
+    int lane = tid & 31;
+    int wid = tid >> 5;
+    bool act = tid < pc.hd;
+    int hd = pc.hd;
+    int kvh = h / (pc.nh / pc.nk);
+    int p0_ = int(pos[uint(row)]);
+    int np = p0_ + 1;
+    int vstride = pc.nk * hd;
+    int kvb = kvh * hd;
+    int qb = row * pc.nh * 2 * hd + h * 2 * hd;
+    KvBlk ck = KvBlk(ktbl[uint(pc.fi * pc.ns) + slot[uint(row)]]);
+    KvBlk cv = KvBlk(vtbl[uint(pc.fi * pc.ns) + slot[uint(row)]]);
+
+    // Q 32차원 슬라이스를 레지스터로 — 타일 루프에서 shared 브로드캐스트 제거.
+    float qr[32];
+    for (int i = 0; i < 32; i++) {
+        int d = wid * 32 + i;
+        if (d < hd) qr[i] = q[qb + d]; else qr[i] = 0.0;
+    }
+
+    float mrun = -3.4028235e38;
+    float srun = 0.0;
+    float acc = 0.0;
+
+    for (int pt = 0; pt < np; pt += KT) {
+        // ── 1) K 타일 → shared (d 방향 연속 = 코얼레스). 범위 밖 행은 마지막 행으로
+        //       클램프 — 그 키는 아래 -inf 마스크가 제거하므로 값은 무관하다.
+        if (act) {
+            for (int r = 0; r < KT; r++) {
+                int p = min(pt + r, np - 1);
+                ks[r][tid] = ck.kv[uint(p) * uint(vstride) + uint(kvb + tid)];
+            }
+        } else {
+            for (int r = 0; r < KT; r++) ks[r][tid] = 0.0;
+        }
+        barrier();
+
+        // ── 2) QK — 레인 = 키(lane), 워프 = 32차원 슬라이스. 셔플 없음.
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        for (int i = 0; i < 8; i++) {
+            int d = wid * 32 + i * 4;
+            a0 = fma(qr[i * 4], ks[lane][d], a0);
+            a1 = fma(qr[i * 4 + 1], ks[lane][d + 1], a1);
+            a2 = fma(qr[i * 4 + 2], ks[lane][d + 2], a2);
+            a3 = fma(qr[i * 4 + 3], ks[lane][d + 3], a3);
+        }
+        sp[wid][lane] = (a0 + a1) + (a2 + a3);
+        barrier();
+
+        // ── 3) 타일 softmax — 워프0이 셔플 축약 1회 (키마다가 아니다)
+        if (wid == 0) {
+            float y = 0.0;
+            for (int w = 0; w < 8; w++) y += sp[w][lane];
+            float d = (pt + lane < np) ? y : -3.4028235e38;
+            float mx = d;
+            for (int off = 16; off > 0; off >>= 1)
+                mx = max(mx, subgroupShuffleDown(mx, off));
+            float mn = subgroupBroadcastFirst(mx);
+            float e = exp(d - mn);
+            float es = e;
+            for (int off = 16; off > 0; off >>= 1)
+                es += subgroupShuffleDown(es, off);
+            if (lane == 0) {
+                float r = exp(mrun - mn);
+                srun = srun * r + es;
+                resc = r;
+                ssum = srun;
+                mrun = mn;
+            }
+            pf[lane] = e;
+        }
+        barrier();
+
+        // ── 4) PV — 스레드 = 차원. 확률은 shared, 재스케일은 타일당 1회.
+        if (act) {
+            acc *= resc;
+            int kv = min(KT, np - pt);
+            for (int k = 0; k < kv; k++)
+                acc = fma(pf[k], cv.kv[uint(pt + k) * uint(vstride) + uint(kvb + tid)], acc);
+        }
+    }
+    if (!act) return;
+    float g = 1.0 / (1.0 + exp(-q[qb + hd + tid]));
+    o[(row * pc.nh + h) * pc.hd + tid] = acc * (1.0 / ssum) * g;
+}

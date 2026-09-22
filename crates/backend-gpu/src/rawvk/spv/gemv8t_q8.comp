@@ -1,0 +1,78 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8t_q8 (plans/91 P0) — gemv8_q8b 의 np 배치판(가중 1회 판독, 그리드 z=1).
+// 행×토큰 산술은 gemv8_q8b 와 비트 동일(col0-스트라이드·어셈블리·dot 순서 보존).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0u { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+vec4 unpk8f(uint x) {
+    return vec4(
+        float(int(x & 0xFFu) << 24 >> 24),
+        float(int((x >> 8) & 0xFFu) << 24 >> 24),
+        float(int((x >> 16) & 0xFFu) << 24 >> 24),
+        float(int(x >> 24) << 24 >> 24));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    vec4 accv[2];
+    for (uint n2 = 0u; n2 < 2u; n2++) accv[n2] = vec4(0.0);
+    const uint n_in = pc.n_in;
+    // 블록 수/행 — 34B 비정렬: 워드 인덱스 산출 후 d 2B 조립
+    const uint KPIT = 64u * 8u;   // 512 k/iter
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;   // 행 절대 k 기저
+            const uint blk = col / 32u;
+            const uint bbase = blk * 34u;
+            const uint rem = col & 31u;                        // 블록 내 원소 (8 정렬)
+            const uint wd = bbase + 2u + rem;
+            const uint w0 = w0u[wd >> 2];
+            const uint w1 = w0u[(wd >> 2) + 1u];
+            const uint sh = (wd & 3u) * 8u;
+            const uint v0b = (w0 >> sh) | (sh != 0u ? (w1 << (32u - sh)) : 0u);
+            const uint w2 = w0u[(wd >> 2) + 2u];
+            const uint v1b = (w1 >> sh) | (sh != 0u ? (w2 << (32u - sh)) : 0u);
+            // d f16 @ bbase (2B)
+            const uint dw = w0u[bbase >> 2];
+            const uint dsh = (bbase & 3u) * 8u;
+            uint db = (dw >> dsh) & 0xFFFFu;
+            if (dsh >= 24u) {
+                db = ((dw >> dsh) | (w0u[(bbase >> 2) + 1u] << 8u)) & 0xFFFFu;
+            }
+            const float d = unpackHalf2x16(db).x;
+            const vec4 wv0 = unpk8f(v0b);
+            const vec4 wv1 = unpk8f(v1b);
+            // vec4 레인=토큰 — 8곱 좌결합 체인(dot 저하 순서 경험적 검증).
+            #define BV8(off) vec4(xa[0u * pc.n_in + col0 + (off)], xa[1u * pc.n_in + col0 + (off)], xa[2u * pc.n_in + col0 + (off)], xa[3u * pc.n_in + col0 + (off)])
+            const vec4 r = vec4(d) * (BV8(0u) * vec4(wv0.x) + BV8(1u) * vec4(wv0.y) + BV8(2u) * vec4(wv0.z) + BV8(3u) * vec4(wv0.w)
+                                    + BV8(4u) * vec4(wv1.x) + BV8(5u) * vec4(wv1.y) + BV8(6u) * vec4(wv1.z) + BV8(7u) * vec4(wv1.w));
+            accv[n] += r;
+        }
+    }
+    const vec4 r0 = subgroupAdd(accv[0]);
+    const vec4 r1 = num_rows > 1u ? subgroupAdd(accv[1]) : vec4(0.0);
+    if (tid == 0u) {
+        [[unroll]] for (uint tk = 0u; tk < 4u; tk++) {
+            if (tk >= pc.t) continue;
+            outv[tk * pc.n_out + first_row] = r0[tk];
+            if (num_rows > 1u) outv[tk * pc.n_out + first_row + 1u] = r1[tk];
+        }
+    }
+}
