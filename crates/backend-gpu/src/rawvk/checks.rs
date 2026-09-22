@@ -2,7 +2,7 @@
 //! `llm170 vk-*-check` 계열 CLI가 호출하는 CPU 대조 검증 — 프로덕션 경로와 무관.
 //! 이동 원칙: 본문 불변(gemv.rs 시절 바이트 동일).
 
-use super::gemv::{push_u32s, Slot, VkAcc, xq_words};
+use super::vkacc::{push_u32s, Slot, VkAcc, xq_words};
 use ash::vk;
 use llm170_core::matmul::MatmulHost as _;
 
