@@ -1,0 +1,156 @@
+; (조립 후 OpSDot 패치: scripts/patch — Ubuntu spirv-tools 2025.1~rc1이
+;  PackedVectorFormat 텍스트 그래머를 거부해 OpIAdd+Nop 자리표로 조립하고
+;  바이너리에서 0x115E0006(OpSDot wc6) + format 0 로 교체한다.)
+; 시스템 glslc/glslang(2023.8/15.1)이 GL_EXT_integer_dot_product를 지원하지
+; 않아 어셈블리로 직접 작성. 과거 sdot_probe(plans/33, 어셈블리 패치)는
+; "커널 문맥에서 0 반환" 결함이 있었다 — 결정적 차이: 이번엔 VkCtx가
+; Vulkan13Features.shader_integer_dot_product를 활성화한다(context.rs).
+;   w[0]=a w[1]=b (입력)  w[2]=iters 회 의존 dot 결과(감쇠)  w[3]=단일 dot(비영 검증)
+;   pc.mode 0=OpSDot / 1=스칼라 에뮬레이션(gemv3 dot4 동일 4회 i8 mul-add)
+; 빌드: spirv-as --target-env vulkan1.3 idot_probe.spvasm -o idot_probe.spv
+               OpCapability Shader
+               OpCapability DotProduct
+               OpCapability DotProductInput4x8BitPacked
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %buf %pc
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %arr_u ArrayStride 4
+               OpMemberDecorate %struct 0 Offset 0
+               OpDecorate %struct Block
+               OpDecorate %buf Binding 0
+               OpDecorate %buf DescriptorSet 0
+               OpMemberDecorate %pcs 0 Offset 0
+               OpMemberDecorate %pcs 1 Offset 4
+               OpDecorate %pcs Block
+       %void = OpTypeVoid
+       %func = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+     %arr_u = OpTypeRuntimeArray %uint
+    %struct = OpTypeStruct %arr_u
+       %pcs = OpTypeStruct %uint %uint
+    %ptr_sb_u = OpTypePointer StorageBuffer %uint
+    %ptr_sb_st = OpTypePointer StorageBuffer %struct
+    %ptr_pc_st = OpTypePointer PushConstant %pcs
+        %buf = OpVariable %ptr_sb_st StorageBuffer
+         %pc = OpVariable %ptr_pc_st PushConstant
+    %ptr_fn_u = OpTypePointer Function %uint
+    %ptr_fn_i = OpTypePointer Function %int
+        %pc_u = OpTypePointer PushConstant %uint
+     %uint_0 = OpConstant %uint 0
+    %fn_ii = OpTypeFunction %int %int %int
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+     %uint_8 = OpConstant %uint 8
+    %uint_16 = OpConstant %uint 16
+    %uint_24 = OpConstant %uint 24
+  %uint_255 = OpConstant %uint 255
+%main = OpFunction %void None %func
+%m_l = OpLabel
+        %iv = OpVariable %ptr_fn_u Function
+        %av = OpVariable %ptr_fn_i Function
+   %mode_p = OpAccessChain %pc_u %pc %uint_0
+  %iters_p = OpAccessChain %pc_u %pc %uint_1
+      %mode = OpLoad %uint %mode_p
+     %iters = OpLoad %uint %iters_p
+       %a_p = OpAccessChain %ptr_sb_u %buf %uint_0 %uint_0
+       %b_p = OpAccessChain %ptr_sb_u %buf %uint_0 %uint_1
+         %a = OpLoad %uint %a_p
+         %b = OpLoad %uint %b_p
+        %ai = OpBitcast %int %a
+        %bi = OpBitcast %int %b
+      %isn = OpIEqual %bool %mode %uint_0
+; 단일 dot — 모드별 결과 (비영 검증, CPU 기준 495)
+     %nd_s = OpIAdd %int %ai %bi
+               OpNop
+     %em_s = OpFunctionCall %int %dotemu %ai %bi
+    %sel_s = OpSelect %int %isn %nd_s %em_s
+      %r3u = OpBitcast %uint %sel_s
+       %w3 = OpAccessChain %ptr_sb_u %buf %uint_0 %uint_3
+               OpStore %w3 %r3u
+; 의존 루프 — 1레인만 유효(레이턴시 측정), 회수는 push로 상한.
+               OpStore %iv %uint_0
+               OpStore %av %ai
+               OpBranch %lp_h
+     %lp_h = OpLabel
+               OpLoopMerge %lp_e %lp_c None
+               OpBranch %lp_b
+     %lp_b = OpLabel
+        %ac = OpLoad %int %av
+     %nd_l = OpIAdd %int %ac %bi
+               OpNop
+     %em_l = OpFunctionCall %int %dotemu %ac %bi
+    %sel_l = OpSelect %int %isn %nd_l %em_l
+               OpStore %av %sel_l
+       %il = OpLoad %uint %iv
+        %in = OpIAdd %uint %il %uint_1
+               OpStore %iv %in
+               OpBranch %lp_c
+     %lp_c = OpLabel
+        %il2 = OpLoad %uint %iv
+        %go = OpULessThan %bool %il2 %iters
+               OpBranchConditional %go %lp_h %lp_e
+     %lp_e = OpLabel
+       %fin = OpLoad %int %av
+       %r2u = OpBitcast %uint %fin
+        %w2 = OpAccessChain %ptr_sb_u %buf %uint_0 %uint_2
+               OpStore %w2 %r2u
+               OpReturn
+               OpFunctionEnd
+; dotemu(a_i, b_i) = Σ_{k<4} sext8(a,k)·sext8(b,k) — gemv3 dot4와 동일 산술.
+   %dotemu = OpFunction %int None %fn_ii
+       %pa = OpFunctionParameter %int
+       %pb = OpFunctionParameter %int
+      %e_l = OpLabel
+       %au = OpBitcast %uint %pa
+       %bu = OpBitcast %uint %pb
+      %a1r = OpShiftRightLogical %uint %au %uint_8
+      %a2r = OpShiftRightLogical %uint %au %uint_16
+      %a3r = OpShiftRightLogical %uint %au %uint_24
+      %b1r = OpShiftRightLogical %uint %bu %uint_8
+      %b2r = OpShiftRightLogical %uint %bu %uint_16
+      %b3r = OpShiftRightLogical %uint %bu %uint_24
+      %a0u = OpBitwiseAnd %uint %au %uint_255
+      %a1u = OpBitwiseAnd %uint %a1r %uint_255
+      %a2u = OpBitwiseAnd %uint %a2r %uint_255
+      %a3u = OpBitwiseAnd %uint %a3r %uint_255
+      %b0u = OpBitwiseAnd %uint %bu %uint_255
+      %b1u = OpBitwiseAnd %uint %b1r %uint_255
+      %b2u = OpBitwiseAnd %uint %b2r %uint_255
+      %b3u = OpBitwiseAnd %uint %b3r %uint_255
+      %a0l = OpShiftLeftLogical %uint %a0u %uint_24
+      %a1l = OpShiftLeftLogical %uint %a1u %uint_24
+      %a2l = OpShiftLeftLogical %uint %a2u %uint_24
+      %a3l = OpShiftLeftLogical %uint %a3u %uint_24
+      %b0l = OpShiftLeftLogical %uint %b0u %uint_24
+      %b1l = OpShiftLeftLogical %uint %b1u %uint_24
+      %b2l = OpShiftLeftLogical %uint %b2u %uint_24
+      %b3l = OpShiftLeftLogical %uint %b3u %uint_24
+      %a0i = OpBitcast %int %a0l
+      %a1i = OpBitcast %int %a1l
+      %a2i = OpBitcast %int %a2l
+      %a3i = OpBitcast %int %a3l
+      %b0i = OpBitcast %int %b0l
+      %b1i = OpBitcast %int %b1l
+      %b2i = OpBitcast %int %b2l
+      %b3i = OpBitcast %int %b3l
+      %a0s = OpShiftRightArithmetic %int %a0i %uint_24
+      %a1s = OpShiftRightArithmetic %int %a1i %uint_24
+      %a2s = OpShiftRightArithmetic %int %a2i %uint_24
+      %a3s = OpShiftRightArithmetic %int %a3i %uint_24
+      %b0s = OpShiftRightArithmetic %int %b0i %uint_24
+      %b1s = OpShiftRightArithmetic %int %b1i %uint_24
+      %b2s = OpShiftRightArithmetic %int %b2i %uint_24
+      %b3s = OpShiftRightArithmetic %int %b3i %uint_24
+       %p0 = OpIMul %int %a0s %b0s
+       %p1 = OpIMul %int %a1s %b1s
+       %p2 = OpIMul %int %a2s %b2s
+       %p3 = OpIMul %int %a3s %b3s
+      %s01 = OpIAdd %int %p0 %p1
+      %s23 = OpIAdd %int %p2 %p3
+      %sum = OpIAdd %int %s01 %s23
+               OpReturnValue %sum
+               OpFunctionEnd
