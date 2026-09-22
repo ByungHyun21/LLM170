@@ -3,6 +3,7 @@
 //! 구조: 파이프라인·버퍼·가중치는 전부 지연 초기화 캐시, dispatch 헬퍼가
 //! SSBO 바인딩+push+발사를 일원화 (M4b 확장 지점).
 
+use crate::common::parts::PartSource;
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use ash::vk;
 use ash::vk::Handle as _VkHandle;
@@ -98,14 +99,11 @@ const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51_cm.
 /// 경쟁 가설의 정면 검증이자 스칼라 대비 생산 후보).
 const FN_MOE_TILE_Q51_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51_sg1.spv");
 /// plans/89 재개 — q4_K CM 1-서브그룹 판(엔진 결정적 — q51_sg1로 판명).
-const FN_MOE_TILE_Q4K_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1.spv");
 /// plans/89 재개 — q4_K 8-서브블록 스테이징 판(반복/장벽 q51_sg1과 동일).
-const FN_MOE_TILE_Q4K_SG8_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg8.spv");
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
 const FN_IDX_SCORE_MT_SPV: &[u8] = include_bytes!("../spv/fn_idx_score_mt.spv");
 const FN_IDX_TOPK_MT_SPV: &[u8] = include_bytes!("../spv/fn_idx_topk_mt.spv");
 /// plans/89 재개 — q4_K sg1 스케일-캐시 판(레지스터 압박 가설).
-const FN_MOE_TILE_Q4K_SG1SC_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1sc.spv");
 /// plans/89 재개 — q4_K K-병렬 스칼라 타일(서브그룹 16슬라이스 — ALU 16× 절감).
 const FN_MOE_TILE_Q4K_KP_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_kp.spv");
 /// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
@@ -193,23 +191,13 @@ pub(crate) enum Slot {
     FnMoeTileQ51Sg1,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
-    FnMoeTileQ4kSg1,
-    FnMoeTileQ4kSg8,
     FnIdxScoreMt,
     FnIdxTopkMt,
-    FnMoeTileQ4kSg1sc,
     FnMoeTileQ4kKp,
     FnPleConv,
     FnPleRes,
     /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
     FnQsaAttnSelMh,
-}
-/// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
-/// pread 스테이징으로 수행한다(hip staged_upload 미러).
-struct PartSource {
-    base: usize,
-    len: usize,
-    file: std::fs::File,
 }
 
 pub struct VkAcc {
@@ -314,77 +302,83 @@ pub(crate) fn xq_words(n: usize) -> usize {
     n / 4 + n / 32 + n / 16
 }
 
+/// 슬롯 테이블 — (슬롯, 진단명, SPV, SSBO 수, push 상수 바이트).
+/// plans/90 B2: enum·slot_name·pipeline 3곳 전수 match 를 단일 테이블로.
+/// 신규 커널 추가 = enum 변이체 1줄 + 이 표 1행.
+const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
+    (Slot::Gemv, "gemv", GEMV_SPV, 12, 24),
+    (Slot::SiluDiv, "silu_div", SILU_DIV_SPV, 1, 8),
+    (Slot::Scale, "scale", SCALE_SPV, 1, 8),
+    (Slot::CopyRows, "copy_rows", COPY_ROWS_SPV, 2, 12),
+    (Slot::BcastRows, "bcast_rows", BCAST_ROWS_SPV, 2, 8),
+    (Slot::AxpyT, "axpy_t", AXPY_T_SPV, 3, 8),
+    (Slot::MoeTop10, "moe_top10", MOE_TOP10_SPV, 3, 8),
+    (Slot::PermuteF32, "permute_f32", PERMUTE_SPV, 3, 8),
+    (Slot::MoeWsum, "moe_wsum", MOE_WSUM_SPV, 3, 12),
+    (Slot::MoeGatherRows, "moe_gather", MOE_GATHER_SPV, 2, 12),
+    (Slot::HcGateMean, "hc_gate_mean", HC_GATE_MEAN_SPV, 3, 12),
+    (Slot::HcCombine, "hc_combine", HC_COMBINE_SPV, 3, 12),
+    (Slot::NormGatedSig, "norm_gated", NORM_GATED_SIG_SPV, 4, 16),
+    (Slot::GdnBetaG, "gdn_beta_g", GDN_BETA_G_SPV, 5, 8),
+    (Slot::EwSigmoid, "sigmoid", EW_SIGMOID_SPV, 1, 4),
+    (Slot::Split3, "split3", SPLIT3_SPV, 4, 12),
+    (Slot::GdnConvT2, "gdn_conv_t2", GDN_CONV_T2_SPV, 4, 12),
+    (Slot::GdnConvState, "gdn_conv_state", GDN_CONV_ST_SPV, 2, 12),
+    (Slot::GdnConvSeq, "gdn_conv_seq", GDN_CONV_SEQ_SPV, 4, 12),
+    (Slot::L2Rows, "l2_rows", L2_ROWS_SPV, 1, 12),
+    (Slot::L2Rows2Scale, "l2_rows2_scale", L2_ROWS2_SPV, 2, 24),
+    (Slot::FnGdnArSwap, "gdn_ar_swap", FN_GDN_AR_SWAP_SPV, 6, 28),
+    (Slot::FnQsaAttnSel, "qsa_attn_sel", FN_QSA_ATTN_SEL_SPV, 6, 24),
+    (Slot::PermuteU32, "permute_u32", PERMUTE_U32_SPV, 3, 12),
+    (Slot::FnIdxScore, "idx_score", FN_IDX_SCORE_SPV, 3, 12),
+    (Slot::FnIdxBk, "idx_bk_update", FN_IDX_BK_SPV, 4, 20),
+    (Slot::FnIdxQRope, "idx_q_rope", FN_IDX_Q_ROPE_SPV, 4, 8),
+    (Slot::FnQkNormRope, "qk_norm_rope", FN_QK_NORM_ROPE_SPV, 5, 28),
+    (Slot::FnIdxRank, "idx_rank", FN_IDX_RANK_SPV, 2, 8),
+    (Slot::FnIdxExpand, "idx_expand", FN_IDX_EXPAND_SPV, 3, 16),
+    (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
+    (Slot::Quant, "quant", QUANT_SPV, 2, 12),
+    (Slot::Rms, "rms", RMS_SPV, 3, 16),
+    (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
+    (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
+    (Slot::Gemv8Q4B, "gemv8_q4b", GEMV8_Q4B_SPV, 10, 24),
+    (Slot::MmF32b, "mm_f32b", MM_F32B_SPV, 10, 20),
+    (Slot::FnMoeIds, "moe_ids", FN_MOE_IDS_SPV, 13, 28),
+    (Slot::FnMoeIds2, "moe_ids2", FN_MOE_IDS2_SPV, 11, 24),
+    (Slot::FnMoeIds51, "moe_ids51", FN_MOE_IDS51_SPV, 11, 24),
+    (Slot::FnMmf32, "mm_f32", FN_MM_F32_SPV, 10, 20),
+    (Slot::FnMoeGroup, "moe_group", FN_MOE_GROUP_SPV, 9, 12),
+    (Slot::FnMoeTileQ4K, "moe_tile_q4k", FN_MOE_TILE_Q4K_SPV, 13, 28),
+    (Slot::FnMoeTileQ51, "moe_tile_q51", FN_MOE_TILE_Q51_SPV, 13, 28),
+    (Slot::FnTileQ8, "tile_q8", FN_TILE_Q8_SPV, 10, 20),
+    (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
+    (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
+    (Slot::FnPleConv, "ple_conv", FN_PLE_CONV_SPV, 4, 20),
+    (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
+    (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
+    (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
+    (Slot::TileQ8msCm, "tile_q8ms", TILE_Q8MS_SPV2, 10, 20),
+    (Slot::TileQ4k128Cm, "tile_q4k128", TILE_Q4K128_SPV2, 10, 24),
+    (Slot::TileQ4kmsCm, "tile_q4kms", TILE_Q4KMS_SPV2, 10, 20),
+    (Slot::FnMoeTileQ4kCm, "moe_tile_q4k_cm", FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
+    (Slot::FnMoeTileQ8, "moe_tile_q8", FN_MOE_TILE_Q8_SPV, 13, 28),
+    (Slot::FnMoeTileQ5k, "moe_tile_q5k", FN_MOE_TILE_Q5K_SPV, 13, 28),
+    (Slot::FnMoeTileQ51Cm, "moe_tile_q51_cm", FN_MOE_TILE_Q51_CM_SPV, 13, 28),
+    (Slot::FnMoeTileQ51Sg1, "moe_tile_q51_sg1", FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
+    (Slot::FnIdxScoreMt, "idx_score_mt", FN_IDX_SCORE_MT_SPV, 3, 20),
+    (Slot::FnIdxTopkMt, "idx_topk_mt", FN_IDX_TOPK_MT_SPV, 3, 20),
+    (Slot::FnMoeTileQ4kKp, "moe_tile_q4k_kp", FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
+];
+
+fn slot_spec(slot: Slot) -> (&'static [u8], u32, u32) {
+    let (_, _, spv, n, pb) = SLOTS.iter().find(|(s, ..)| *s == slot).expect("SLOTS 미등록 슬롯");
+    (spv, *n, *pb)
+}
+
 /// plans/87 §2/§3 — 슬롯 → op 태그(와치독 링·ts 라벨).
 fn slot_name(slot: Slot) -> &'static str {
-    match slot {
-        Slot::Gemv => "gemv",
-
-        Slot::SiluDiv => "silu_div",
-        Slot::Scale => "scale",
-        Slot::CopyRows => "copy_rows",
-        Slot::BcastRows => "bcast_rows",
-        Slot::AxpyT => "axpy_t",
-        Slot::Rms => "rms",
-        Slot::Silu => "silu_mul",
-        Slot::EwSigmoid => "sigmoid",
-        Slot::HcGateMean => "hc_gate_mean",
-        Slot::HcCombine => "hc_combine",
-        Slot::NormGatedSig => "norm_gated",
-        Slot::GdnBetaG => "gdn_beta_g",
-        Slot::Split3 => "split3",
-        Slot::L2Rows => "l2_rows",
-        Slot::L2Rows2Scale => "l2_rows2_scale",
-        Slot::FnGdnArSwap => "gdn_ar_swap",
-        Slot::FnQsaAttnSel => "qsa_attn_sel",
-        Slot::PermuteU32 => "permute_u32",
-        Slot::PermuteF32 => "permute_f32",
-        Slot::MoeTop10 => "moe_top10",
-        Slot::MoeWsum => "moe_wsum",
-        Slot::MoeGatherRows => "moe_gather",
-        Slot::GdnConvT2 => "gdn_conv_t2",
-        Slot::GdnConvState => "gdn_conv_state",
-        Slot::GdnConvSeq => "gdn_conv_seq",
-        Slot::FnIdxScore => "idx_score",
-        Slot::FnIdxBk => "idx_bk_update",
-        Slot::FnIdxQRope => "idx_q_rope",
-        Slot::FnIdxRank => "idx_rank",
-        Slot::FnIdxExpand => "idx_expand",
-        Slot::FnQkNormRope => "qk_norm_rope",
-        Slot::Quant => "quant",
-        Slot::FnArgmaxRows => "argmax_rows",
-        Slot::Gemv8Q8B => "gemv8_q8b",
-        Slot::Gemv8Q4B => "gemv8_q4b",
-        Slot::MmF32b => "mm_f32b",
-        Slot::TileQ8128Cm => "tile_q8128",
-        Slot::TileQ8msCm => "tile_q8ms",
-        Slot::TileQ4k128Cm => "tile_q4k128",
-        Slot::TileQ4kmsCm => "tile_q4kms",
-        Slot::FnMoeIds => "moe_ids",
-        Slot::FnMmf32 => "mm_f32",
-        Slot::FnMoeIds2 => "moe_ids2",
-        Slot::FnPleGate => "ple_gate",
-        Slot::FnQsaAttnSelMh => "qsa_attn_sel_mh",
-        Slot::FnPleConv => "ple_conv",
-        Slot::FnPleRes => "ple_res",
-        Slot::FnMoeIds51 => "moe_ids51",
-        Slot::FnMoeGroup => "moe_group",
-        Slot::FnMoeTileQ4K => "moe_tile_q4k",
-        Slot::FnTileF32 => "tile_f32",
-        Slot::FnMoeTileQ8 => "moe_tile_q8",
-        Slot::FnMoeTileQ5k => "moe_tile_q5k",
-        Slot::FnMoeTileQ51Cm => "moe_tile_q51_cm",
-        Slot::FnMoeTileQ51Sg1 => "moe_tile_q51_sg1",
-        Slot::FnMoeTileQ4kSg1 => "moe_tile_q4k_sg1",
-        Slot::FnMoeTileQ4kSg8 => "moe_tile_q4k_sg8",
-        Slot::FnIdxScoreMt => "idx_score_mt",
-        Slot::FnIdxTopkMt => "idx_topk_mt",
-        Slot::FnMoeTileQ4kSg1sc => "moe_tile_q4k_sg1sc",
-        Slot::FnMoeTileQ4kKp => "moe_tile_q4k_kp",
-        Slot::FnMoeTileQ51 => "moe_tile_q51",
-        Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
-        Slot::FnTileQ8 => "tile_q8",
-     }
- }
+    SLOTS.iter().find(|(s, ..)| *s == slot).expect("SLOTS 미등록 슬롯").1
+}
 
 pub(crate) fn push_u32s(vals: &[u32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(vals.len() * 4);
@@ -457,74 +451,7 @@ impl VkAcc {
         if let Some(&p) = self.pipes.lock().get(&slot) {
             return Ok(p);
         }
-        let (spv, n_buf, pb) = match slot {
-            Slot::Gemv => (GEMV_SPV, 12, 24u32),
-
-            Slot::SiluDiv => (SILU_DIV_SPV, 1, 8),    // u32 + f32
-            Slot::Scale => (SCALE_SPV, 1, 8),         // u32 + f32
-            Slot::CopyRows => (COPY_ROWS_SPV, 2, 12), // 3×u32
-            Slot::BcastRows => (BCAST_ROWS_SPV, 2, 8),// 2×u32
-            Slot::AxpyT => (AXPY_T_SPV, 3, 8),        // 2×u32
-            Slot::MoeTop10 => (MOE_TOP10_SPV, 3, 8),  // 2×u32
-            Slot::PermuteF32 => (PERMUTE_SPV, 3, 8),  // 2×u32
-            Slot::MoeWsum => (MOE_WSUM_SPV, 3, 12),   // 3×u32
-            Slot::MoeGatherRows => (MOE_GATHER_SPV, 2, 12),
-            Slot::HcGateMean => (HC_GATE_MEAN_SPV, 3, 12),
-            Slot::HcCombine => (HC_COMBINE_SPV, 3, 12),
-            Slot::NormGatedSig => (NORM_GATED_SIG_SPV, 4, 16),  // u32,u32,f32
-            Slot::GdnBetaG => (GDN_BETA_G_SPV, 5, 8),
-            Slot::EwSigmoid => (EW_SIGMOID_SPV, 1, 4),
-            Slot::Split3 => (SPLIT3_SPV, 4, 12),      // 기존 q35 값경로 판 재사용
-            Slot::GdnConvT2 => (GDN_CONV_T2_SPV, 4, 12),
-            Slot::GdnConvState => (GDN_CONV_ST_SPV, 2, 12),
-            Slot::GdnConvSeq => (GDN_CONV_SEQ_SPV, 4, 12),
-            Slot::L2Rows => (L2_ROWS_SPV, 1, 12),          // u32 + f32
-            Slot::L2Rows2Scale => (L2_ROWS2_SPV, 2, 24),   // u32,u32,f32,f32
-            Slot::FnGdnArSwap => (FN_GDN_AR_SWAP_SPV, 6, 28),
-            Slot::FnQsaAttnSel => (FN_QSA_ATTN_SEL_SPV, 6, 24),
-            Slot::PermuteU32 => (PERMUTE_U32_SPV, 3, 12),  // row_src,row_dst,rows
-            Slot::FnIdxScore => (FN_IDX_SCORE_SPV, 3, 12), // 3×u32
-            Slot::FnIdxBk => (FN_IDX_BK_SPV, 4, 20),         // f32 + 3×u32
-            Slot::FnIdxQRope => (FN_IDX_Q_ROPE_SPV, 4, 8),    // f32 + u32
-            Slot::FnQkNormRope => (FN_QK_NORM_ROPE_SPV, 5, 28), // 2×f32 + 5×u32
-            Slot::FnIdxRank => (FN_IDX_RANK_SPV, 2, 8),      // 2×u32
-            Slot::FnIdxExpand => (FN_IDX_EXPAND_SPV, 3, 16), // 4×u32
-            Slot::FnArgmaxRows => (FN_ARGMAX_ROWS_SPV, 3, 12), // 3×u32
-            Slot::Quant => (QUANT_SPV, 2, 12),
-            Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
-            Slot::Silu => (SILU_SPV, 3, 4),
-            Slot::Gemv8Q8B => (GEMV8_Q8B_SPV, 10, 24),  // 8W+x(f32)+out (W0만 사용)
-            Slot::Gemv8Q4B => (GEMV8_Q4B_SPV, 10, 24),
-            Slot::MmF32b => (MM_F32B_SPV, 10, 20),      // 8W+x(f32)+out
-            Slot::FnMoeIds => (FN_MOE_IDS_SPV, 13, 28), // 8W+xq+out+ktab+grid+ids
-            Slot::FnMoeIds2 => (FN_MOE_IDS2_SPV, 11, 24),   // 8W+x(f32)+out+ids
-            Slot::FnMoeIds51 => (FN_MOE_IDS51_SPV, 11, 24),
-            Slot::FnMmf32 => (FN_MM_F32_SPV, 10, 20),    // 8W+x(f32)+out
-            Slot::FnMoeGroup => (FN_MOE_GROUP_SPV, 9, 12),        // 3×u32
-            Slot::FnMoeTileQ4K => (FN_MOE_TILE_Q4K_SPV, 13, 28),  // 8W+xq+yg+rowexp+rp+perm_pad +mode+rows
-            Slot::FnMoeTileQ51 => (FN_MOE_TILE_Q51_SPV, 13, 28),  // +mode+rows
-            Slot::FnTileQ8 => (FN_TILE_Q8_SPV, 10, 20),  // 8W+xq+out
-            Slot::FnTileF32 => (FN_TILE_F32_SPV, 10, 20),    // 8W+x(f32)+out
-            Slot::FnPleGate => (FN_PLE_GATE_SPV, 8, 16),   // res,key,val,nk,nq,nc,gated,gate
-            Slot::FnPleConv => (FN_PLE_CONV_SPV, 4, 20),   // gated,cw,ring,conv
-            Slot::FnQsaAttnSelMh => (FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
-            Slot::FnPleRes => (FN_PLE_RES_SPV, 4, 12),     // res,val,gate,conv
-            Slot::TileQ8128Cm => (TILE_Q8128_SPV2, 10, 24),
-            Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
-            Slot::TileQ4k128Cm => (TILE_Q4K128_SPV2, 10, 24),
-            Slot::TileQ4kmsCm => (TILE_Q4KMS_SPV2, 10, 20),
-            Slot::FnMoeTileQ4kCm => (FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
-            Slot::FnMoeTileQ8 => (FN_MOE_TILE_Q8_SPV, 13, 28),
-            Slot::FnMoeTileQ5k => (FN_MOE_TILE_Q5K_SPV, 13, 28),
-            Slot::FnMoeTileQ51Cm => (FN_MOE_TILE_Q51_CM_SPV, 13, 28),
-            Slot::FnMoeTileQ51Sg1 => (FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
-            Slot::FnMoeTileQ4kSg1 => (FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
-            Slot::FnMoeTileQ4kSg8 => (FN_MOE_TILE_Q4K_SG8_SPV, 13, 28),
-            Slot::FnIdxScoreMt => (FN_IDX_SCORE_MT_SPV, 3, 20),
-            Slot::FnIdxTopkMt => (FN_IDX_TOPK_MT_SPV, 3, 20),
-            Slot::FnMoeTileQ4kSg1sc => (FN_MOE_TILE_Q4K_SG1SC_SPV, 13, 28),
-            Slot::FnMoeTileQ4kKp => (FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
-        };
+        let (spv, n_buf, pb) = slot_spec(slot);
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
         Ok(p)
@@ -608,15 +535,16 @@ impl VkAcc {
                 // plans/86 §6 — pread 스테이징: 알려진 파트 범위면 mmap 폴트
                 // (4KB 랜덤, 20-180 MB/s) 대신 파일에서 8MiB 순차 pread로
                 // 매핑 버퍼에 직접 채운다(실측 ~1.2 GB/s). 아니면 memcpy 폴백.
-                let src = self.sources.iter().find(|s| {
-                    let p = w.data.as_ptr() as usize;
-                    p >= s.base && p.checked_add(total).is_some_and(|e| e <= s.base + s.len)
-                });
+                let base = w.data.as_ptr() as usize;
+                let src = self
+                    .sources
+                    .iter()
+                    .find_map(|s| s.covers(base, total).map(|o| (s, o)));
                 while off < total {
                     let n = ch.min(total - off);
                     let mut b = ctx.alloc(n)?;
                     let r = match src {
-                        Some(s) => staged_fill(&s.file, b.ptr, (w.data.as_ptr() as usize - s.base) as u64 + off as u64, n),
+                        Some((s, o)) => crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n),
                         None => unsafe {
                             std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
                             Ok(())
@@ -786,25 +714,4 @@ mod matmul;
 mod ple;
 mod qsa;
 
-/// plans/86 §6 — 8MiB 순차 pread로 매핑 버퍼 채우기 (hip staged_upload 미러).
-pub(crate) fn staged_fill(
-    file: &std::fs::File,
-    dst: *mut u8,
-    mut off: u64,
-    len: usize,
-) -> Result<(), String> {
-    use std::os::unix::fs::FileExt;
-    const CH: usize = 8 << 20;
-    let mut done = 0usize;
-    while done < len {
-        let n = CH.min(len - done);
-        unsafe {
-            file.read_exact_at(std::slice::from_raw_parts_mut(dst.add(done), n), off)
-                .map_err(|e| format!("pread {off}: {e}"))?;
-        }
-        done += n;
-        off += n as u64;
-    }
-    Ok(())
-}
 
