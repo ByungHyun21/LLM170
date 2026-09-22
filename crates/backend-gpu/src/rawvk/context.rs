@@ -467,7 +467,8 @@ impl VkCtx {
                 .usage(
                     vk::BufferUsageFlags::STORAGE_BUFFER
                         | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST,
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let buf = self

@@ -24,9 +24,9 @@ P.add_argument("--n", type=int, default=24)
 P.add_argument("--ctx", type=int, default=4096)
 P.add_argument("--np", type=int, default=4)
 P.add_argument("--prompt-file", default=None, help="콤마 구분 토큰 id (기본: 내장 4종)")
+P.add_argument("--runtime", default=os.environ.get("VK_NP_RUNTIME", "hip"), choices=["hip", "vulkan"])
 P.add_argument("--env", action="append", default=[], help="추가 환경변수 KEY=VAL")
 A = P.parse_args()
-
 GATE = ("386,18,15,15,643,20,20,19586,5876,8058,4144,67,21,7307,22,20,23,24902,17,16,23,"
         "386,18,66,19,386,17,24,19,24902,16,16,19586,66,21,65,23,1692,22,22,19,4144,341,15,11")
 
@@ -51,7 +51,7 @@ for kv in A.env:
 
 def run(seqs):
     cmd = [A.bin, "infer", "--model", A.model, "--n-predict", str(A.n),
-           "--ctx", str(A.ctx), "--backend", "gpu"] + ["--gpu-runtime", "hip"]
+           "--ctx", str(A.ctx), "--backend", "gpu", "--gpu-runtime", A.runtime]
     for s in seqs:
         cmd += ["--prompt-tokens", ",".join(str(t) for t in s)]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
