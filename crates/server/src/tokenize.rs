@@ -79,10 +79,9 @@ impl Tokenizer {
             .map(GgufFile::open)
             .transpose()
             .map_err(|e| e.to_string())?
+            && has_tokens(&g2)
         {
-            if has_tokens(&g2) {
-                return Self::from_gguf(&g2);
-            }
+            return Self::from_gguf(&g2);
         }
         Ok(Tokenizer::empty())
     }
@@ -154,8 +153,8 @@ impl Tokenizer {
             }
         }
         // 파티션 순서 = 본문 길이 내림차순 (llama.cpp cache_special_tokens 정렬)
-        special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        special_user.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        special.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        special_user.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         // GPT-2 bytes_to_unicode 정/역표 (기존 구현과 동일)
         let mut c2b: HashMap<char, u8> = HashMap::new();
@@ -263,10 +262,10 @@ impl Tokenizer {
                     i += best;
                 }
                 _ => {
-                    if i < bytes.len() {
-                        if let Some(&id) = self.greedy_index.get(&bytes[i..i + 1]) {
-                            out.push(id);
-                        }
+                    if i < bytes.len()
+                        && let Some(&id) = self.greedy_index.get(&bytes[i..i + 1])
+                    {
+                        out.push(id);
                     }
                     i += 1;
                 }
@@ -287,7 +286,7 @@ impl Tokenizer {
             self.special_user.iter().collect()
         };
         let mut ordered: Vec<&(String, u32)> = all;
-        ordered.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        ordered.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         for (stext, sid) in ordered {
             if stext.is_empty() {
                 continue;
@@ -347,11 +346,11 @@ impl Tokenizer {
             }
             soff.push(enc.len());
             let eb = enc.as_bytes();
-            if self.ignore_merges {
-                if let Some(&id) = self.text_to_id.get(eb) {
-                    out.push(id);
-                    continue;
-                }
+            if self.ignore_merges
+                && let Some(&id) = self.text_to_id.get(eb)
+            {
+                out.push(id);
+                continue;
             }
             // 심볼 (start, len) — 초기 1심볼 = 인코딩 문자 1개
             let mut syms: Vec<(usize, usize)> =
@@ -526,10 +525,7 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
             }
             if pos + 2 < end {
                 let nn = tolower(cpts[pos + 2]);
-                if (nxt == 0x72 && nn == 0x65)
-                    || (nxt == 0x76 && nn == 0x65)
-                    || (nxt == 0x6C && nn == 0x6C)
-                {
+                if (matches!(nxt, 0x72 | 0x76) && nn == 0x65) || (nxt == 0x6C && nn == 0x6C) {
                     add(&mut segs, &mut prev_end, pos + 3);
                     pos += 3;
                     continue;
@@ -538,15 +534,15 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
         }
 
         // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+  (qwen2: \p{L}+)
-        if cpt != 0x0D && cpt != 0x0A && flags & F_NUMBER == 0 {
-            if is_lm(pos) || is_lm(pos + 1) {
+        if cpt != 0x0D && cpt != 0x0A && flags & F_NUMBER == 0
+            && (is_lm(pos) || is_lm(pos + 1))
+        {
+            pos += 1;
+            while is_lm(pos) {
                 pos += 1;
-                while is_lm(pos) {
-                    pos += 1;
-                }
-                add(&mut segs, &mut prev_end, pos);
-                continue;
             }
+            add(&mut segs, &mut prev_end, pos);
+            continue;
         }
 
         // \p{N}

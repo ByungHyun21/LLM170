@@ -31,10 +31,10 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
 
     // 갭 집계 (전임자 이름별)
     let mut gap_by: HashMap<&'static str, (f64, u32)> = HashMap::new();
-    for w in 0..evs.len().saturating_sub(1) {
-        let g = evs[w].gap_next_ms.unwrap_or(0.0);
+    for ev in &evs[..evs.len().saturating_sub(1)] {
+        let g = ev.gap_next_ms.unwrap_or(0.0);
         if g > 0.0 {
-            let e = gap_by.entry(evs[w].name).or_insert((0.0, 0));
+            let e = gap_by.entry(ev.name).or_insert((0.0, 0));
             e.0 += g;
             e.1 += 1;
         }

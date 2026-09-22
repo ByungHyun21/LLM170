@@ -9,6 +9,8 @@ use llm170_core::matmul::MatmulHost as _;
 /// vk-gemv-check — VkAcc matmul vs CPU W4A8 미러 단일 텐서 검증 + 타이밍.
 pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     // plans/84 B: qwen4exp(Flash-Next, 멀티파트) 폴백 — arch 판별 후 단일 로드.
+    // 진단 전용 값 semantic — 박싱 없이 값 소유(체커 1회 로드).
+    #[allow(clippy::large_enum_variant)]
     enum AnyModel {
         Q35(llm170_core::qwen35::Model),
         Q4(llm170_core::qwen4exp::Model4),
@@ -329,12 +331,6 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
 pub fn ft32_check(path: &str) -> Result<String, String> {
     use llm170_core::matmul::FrameState as _FS;
     use llm170_core::matmul::FrameHost as _FH;
-    let is_q4 = llm170_gguf::GgufFile::open(std::path::Path::new(path))
-        .ok()
-        .and_then(|g| g.arch().map(|a| a == "qwen4exp"))
-        .unwrap_or(false);
-    if !is_q4 {
-    }
     let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w4("blk.0.ffn_gate_inp.weight").map_err(|e| e.to_string())?;
@@ -451,11 +447,11 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
             continue;
         }
         for nm in &names {
-            if let Ok(w) = model.w4(&format!("blk.{il}.{nm}.weight")) {
-                if w.ty == want {
-                    found = Some((il, w));
-                    break;
-                }
+            if let Ok(w) = model.w4(&format!("blk.{il}.{nm}.weight"))
+                && w.ty == want
+            {
+                found = Some((il, w));
+                break;
             }
         }
         if found.is_some() {
@@ -981,6 +977,8 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
 pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     use std::time::Instant;
     // plans/84 B: arch 판별 후 단일 로드(vk-gemv-check와 동일 패턴) — FN 멀티파트 지원.
+    // 진단 전용 값 semantic — 박싱 없이 값 소유(체커 1회 로드).
+    #[allow(clippy::large_enum_variant)]
     enum AnyModel {
         Q35(llm170_core::qwen35::Model),
         Q4(llm170_core::qwen4exp::Model4),
@@ -1459,6 +1457,8 @@ pub fn mmv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
 /// 상주 GEMM)의 CPU 대조 검증. 각 op를 LCG 데이터로 실행해 판독 비교.
 pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
     use std::time::Instant;
+    // 진단 전용 값 semantic — 박싱 없이 값 소유(체커 1회 로드).
+    #[allow(clippy::large_enum_variant)]
     enum AnyModel {
         Q35(llm170_core::qwen35::Model),
         Q4(llm170_core::qwen4exp::Model4),
@@ -1564,7 +1564,7 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         acc.frame_read(oh, &mut got)?;
         mx = 0.0;
         for i in 0..n {
-            let exp = (a[i] / (1.0 + (-a[i] as f32).exp())) as f64 * b[i] as f64;
+            let exp = (a[i] / (1.0 + (-a[i]).exp())) as f64 * b[i] as f64;
             mx = mx.max((got[i] as f64 - exp).abs());
         }
         let ok = mx < 5e-6;
@@ -1672,8 +1672,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
     //    그룹화(perm/rowexp) 없이 타일 커널 자체의 CPU 대조. ──
     {
         use llm170_core::matmul::FrameHost;
-        if let AnyModel::Q4(m) = &model {
-            if let Ok(w4k) = m.w4("blk.0.ffn_gate_shexp.weight") {
+        if let AnyModel::Q4(m) = &model
+            && let Ok(w4k) = m.w4("blk.0.ffn_gate_shexp.weight")
+        {
                 let ni = w4k.n_in as usize;
                 let no = w4k.n_out as usize;
                 let xs4: Vec<Vec<f32>> = (0..t).map(|_| (0..ni).map(|_| lcg()).collect()).collect();
@@ -1702,7 +1703,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 report.push_str(&format!("| frame_mm-q4k max|D|={mx:.2e} {}", if ok { "OK" } else { "FAIL" }));
                 acc.frame_free(xh)?; acc.frame_free(oh)?;
             }
-        }
     }
     // ── 9) MoE: top10 → 그룹 GEMM → 가중합 (게이트 가중, k=10) ──
     {
@@ -2190,7 +2190,7 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                                 for s in 0..k10 {
                                     std::ptr::copy_nonoverlapping(
                                         mx_rows[(p0 + t2) * n_g..].as_ptr(),
-                                        b.ptr.add(((t2 * k10 + s) * n_g * 4) as usize) as *mut f32,
+                                        b.ptr.add((t2 * k10 + s) * n_g * 4) as *mut f32,
                                         n_g);
                                 }
                             }

@@ -600,7 +600,7 @@ pub fn mm_row_check(
     if t_b <= t_a || t_a == 0 {
         return Err(format!("mm-row-check: t_b({t_b}) > t_a({t_a}) > 0 필요"));
     }
-    let mut seed = 0xD1B5_4A32_D192_ED5u64;
+    let mut seed = 0x0D1B_54A3_2D19_2ED5u64;
     let mut lcg = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5

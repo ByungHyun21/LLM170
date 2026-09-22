@@ -80,7 +80,7 @@ impl Q4Acc {
         let mut ni_a = ni as i32;
         let mut no1a = no1 as i32;
         let mut no2a = no2 as i32;
-        let mut xw = (ni / 4 + ni / 32 + ni / 16) as i32;
+        let mut xw = crate::rawhip::q4acc::xq_words(ni) as i32;
         let mut args = vec![
             (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
             (&mut w1p) as *mut _ as *mut std::ffi::c_void,
@@ -147,7 +147,7 @@ impl Q4Acc {
         ni: usize,
     ) -> Result<(), String> {
         let gy = (no8 + no4.div_ceil(8)) as u32;
-        let xqw = ni / 4 + ni / 32 + ni / 16;
+        let xqw = crate::rawhip::q4acc::xq_words(ni);
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut w8p = w8 as *mut std::ffi::c_void;
         let mut o8 = out8 as *mut std::ffi::c_void;

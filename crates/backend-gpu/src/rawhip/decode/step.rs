@@ -40,9 +40,9 @@ impl DecodeState {
         };
         let (k_len, v_len, conv_ch) = (self.k_len, self.v_len, self.conv_ch);
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
-        let xq_sn = n / 4 + n / 32 + n / 16;
-        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
-        let xq_sg = self.d_inner / 4 + self.d_inner / 32 + self.d_inner / 16;
+        let xq_sn = crate::rawhip::q4acc::xq_words(n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(self.n_ff);
+        let xq_sg = crate::rawhip::q4acc::xq_words(self.d_inner);
         self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
         let cs = *self.consts.get("cs").ok_or("cs")?;
         let mask = *self.consts.get("mask").ok_or("mask")?;
