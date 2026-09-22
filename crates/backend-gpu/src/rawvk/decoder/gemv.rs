@@ -187,8 +187,8 @@ impl DecoderState {
         // 단일 청크 typed 뷰 — 143→225GB/s. LLM170_VK_Q5B=0 옵트아웃.
         if std::env::var("LLM170_VK_Q5B").map(|v| v == "0").unwrap_or(true) {
             // plans/46: NUM_ROWS 실험 — llama GCN은 rm_kq=4. t=1이 지연 바운드(f16 2배
-            // 바이트에 -1.8%뿐)이므로 행/WG 증가로 ILP 상향. 기본 2, LLM170_VK_NR로 변경.
-            let nr: u32 = std::env::var("LLM170_VK_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            // 바이트에 -1.8%뿐)이므로 행/WG 증가로 ILP 상향. 기본 2, LLM170_VK_NUMROWS로 변경.
+            let nr: u32 = std::env::var("LLM170_VK_NUMROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             let nr = nr.clamp(1, 4);
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);
             return self.run_pipe_b("gemv8_q5b", GEMV8_Q5B_SPV, 10, 24, &binds, &push,
