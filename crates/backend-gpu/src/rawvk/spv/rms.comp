@@ -2,7 +2,9 @@
 #extension GL_KHR_shader_subgroup_basic : require
 
 // rms_norm — HIP rms_part/rms_finish 통합 포트 (f32 세그먼트 누산 + f64 결합).
-// 워크그룹 = 행 1개, 32레인 세그먼트 — CPU sq_sum 미러와 동일 순서.
+// plans/89: 인터리브 로드(레인 u = 원소 i*32+u) — 종전 레인 연속 세그먼트는
+// 인접 레인 주소가 320B 떨어져 트랜잭션 32배 낭비(실측 8GB/s). 산술 클래스
+// 동일(f32 부분합 + 순서 보장 f64 결합), 분할만 변경 — §8 재기록 대상.
 layout(local_size_x = 32) in;
 layout(binding = 0) readonly buffer Xbuf { float x[]; };
 layout(binding = 1) readonly buffer Wbuf { float wv[]; };
@@ -19,14 +21,13 @@ void main() {
     uint u = gl_LocalInvocationID.x;
     uint n = pc.n;
     if (row >= pc.t) return;
-    int chunk = int((n + 31u) >> 5u);
-    int lo = int(u) * chunk;
     int xb = int(row * n);
+    int steps = int((n + 31u) >> 5u);
     float acc = 0.0;
-    if (uint(lo) < n) {
-        int hi = min(lo + chunk, int(n));
-        for (int i = lo; i < hi; i++) {
-            float dv = x[xb + i];
+    for (int i = 0; i < steps; i++) {
+        int k = i * 32 + int(u);
+        if (uint(k) < n) {
+            float dv = x[xb + k];
             acc += dv * dv;
         }
     }
@@ -34,18 +35,17 @@ void main() {
     barrier();
     if (u == 0u) {
         double sum = 0.0lf;
-        for (int u2 = 0; u2 < 32; u2++) {
-            if (uint(u2 * chunk) < n) sum += seg[u2];
-        }
+        for (int u2 = 0; u2 < 32; u2++) sum += seg[u2];
         float scale32 = float(sqrt(sum / double(n) + double(pc.eps)));
         invs = 1.0 / scale32;
     }
     barrier();
-    if (uint(lo) < n) {
-        int hi = min(lo + chunk, int(n));
-        // plans/84 B: w_reps — hip rms_finish와 동일 규약, w[(row % w_reps)*n + i].
-        // w_reps=1이면 기존 산술과 동일(값경로 불변).
-        int wbase = int((row % max(pc.w_reps, 1u)) * pc.n);
-        for (int i = lo; i < hi; i++) outv[xb + i] = x[xb + i] * invs * wv[wbase + i];
+    // plans/84 B: w_reps — hip rms_finish와 동일 규약, w[(row % w_reps)*n + i].
+    // w_reps=1이면 기존 산술과 동일(값경로 불변).
+    int wbase = int((row % max(pc.w_reps, 1u)) * pc.n);
+    float iv = invs;
+    for (int i = 0; i < steps; i++) {
+        int k = i * 32 + int(u);
+        if (uint(k) < n) outv[xb + k] = x[xb + k] * iv * wv[wbase + k];
     }
 }
