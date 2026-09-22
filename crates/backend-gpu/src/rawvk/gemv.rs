@@ -107,6 +107,10 @@ const FN_MOE_TILE_Q4K_SG8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_sg8.s
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
 const FN_IDX_SCORE_MT_SPV: &[u8] = include_bytes!("spv/fn_idx_score_mt.spv");
 const FN_IDX_TOPK_MT_SPV: &[u8] = include_bytes!("spv/fn_idx_topk_mt.spv");
+/// plans/89 재개 — q4_K sg1 스케일-캐시 판(레지스터 압박 가설).
+const FN_MOE_TILE_Q4K_SG1SC_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_sg1sc.spv");
+/// plans/89 재개 — q4_K K-병렬 스칼라 타일(서브그룹 16슬라이스 — ALU 16× 절감).
+const FN_MOE_TILE_Q4K_KP_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_kp.spv");
 /// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("spv/fn_ple_conv.spv");
@@ -198,6 +202,8 @@ enum Slot {
     FnMoeTileQ4kSg8,
     FnIdxScoreMt,
     FnIdxTopkMt,
+    FnMoeTileQ4kSg1sc,
+    FnMoeTileQ4kKp,
     FnPleConv,
     FnPleRes,
     /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
@@ -370,6 +376,8 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeTileQ4kSg8 => "moe_tile_q4k_sg8",
         Slot::FnIdxScoreMt => "idx_score_mt",
         Slot::FnIdxTopkMt => "idx_topk_mt",
+        Slot::FnMoeTileQ4kSg1sc => "moe_tile_q4k_sg1sc",
+        Slot::FnMoeTileQ4kKp => "moe_tile_q4k_kp",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
         Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
@@ -513,6 +521,8 @@ impl VkAcc {
             Slot::FnMoeTileQ4kSg8 => (FN_MOE_TILE_Q4K_SG8_SPV, 13, 28),
             Slot::FnIdxScoreMt => (FN_IDX_SCORE_MT_SPV, 3, 20),
             Slot::FnIdxTopkMt => (FN_IDX_TOPK_MT_SPV, 3, 20),
+            Slot::FnMoeTileQ4kSg1sc => (FN_MOE_TILE_Q4K_SG1SC_SPV, 13, 28),
+            Slot::FnMoeTileQ4kKp => (FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -2042,6 +2052,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let q4k_cm = cm_on
                 && std::env::var("LLM170_VK_Q4KCM").map(|v| v != "0").unwrap_or(true);
             let slot = match (w.ty, q4k_cm) {
+                (GgmlType::Q4K, _k) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KKP").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kKp,
+                (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG1SC").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1sc,
                 (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG8").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg8,
                 (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG1").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1,
                 (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
@@ -2072,7 +2084,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 std::env::var("LLM170_MTC_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32),
                 rows as u32,
             ]);
-            let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSg8) {
+            let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
+                (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
+            } else if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSg8 | Slot::FnMoeTileQ4kSg1sc) {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             } else if cm_on {
                 (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
@@ -3649,6 +3663,19 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
                 eprintln!("[mtc] row={rr} e={ee} got={:.5} ref={:.5}", got[rr * n_out_d], s2);
             }
         }
+        if std::env::var_os("LLM170_MTC_DBG2").is_some() {
+            for (r2, &e2) in sel.iter().enumerate() {
+                for j2 in 0..n_out_d.min(6) {
+                    let mut rr2 = vec![0f32; n_in_d];
+                    llm170_core::quant::dequant_row(wd.ty, wd.data, (e2 * n_out_d + j2) as u64, n_in_d as u64, &mut rr2);
+                    let dot2: f32 = rr2.iter().zip(xs[r2].iter()).map(|(a, b)| a * b).sum();
+                    let d2 = (got[r2 * n_out_d + j2] as f64 - dot2 as f64).abs();
+                    if d2 > 2e-2 {
+                        eprintln!("[mtc2] row={r2} e={e2} j={j2} got={:.5} ref={:.5}", got[r2 * n_out_d + j2], dot2);
+                    }
+                }
+            }
+        }
         if std::env::var_os("LLM170_MTC_DBG").is_some() {
             for rr in 0..sel.len().min(10) {
                 let ee = sel[rr];
@@ -3663,6 +3690,12 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
                     (1024.0 + m10) * 2f32.powi(e10 - 25)
                 } * if d_bits & 0x8000 != 0 { -1.0 } else { 1.0 };
                 eprintln!("[mtcD] row={rr} e={ee} dBits={d_bits:#06x} d={dv:.3e}");
+                for jj in 1..6usize {
+                    let row_b = (n_in_d / 256) * 144;
+                    let off2 = off + jj * row_b;
+                    let db2 = u16::from_le_bytes([wd.data[off2], wd.data[off2 + 1]]);
+                    eprintln!("[mtcD]   j={jj} lo={:#04x}", db2 & 0xFF);
+                }
             }
         }
     Ok(format!(
