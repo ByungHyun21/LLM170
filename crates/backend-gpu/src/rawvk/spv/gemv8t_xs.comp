@@ -1,0 +1,91 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8t_xs (plans/91 P0) — gemv8_xsb 의 np 배치판(가중 1회 판독, 그리드 z=1).
+// 행×토큰 산술은 gemv8_xsb 와 비트 동일(col0-스트라이드·LUT·dot 순서 보존).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Ktab { uint kt[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+shared uint skt[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < 256u; i += 64u) skt[i] = kt[i];
+    barrier();
+    const uint first_row = 2u * gl_WorkGroupID.y;
+    uint num_rows = 2u;
+    if (first_row + 2u > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint n_in = pc.n_in;
+    vec4 accv[2];
+    for (uint n2 = 0u; n2 < 2u; n2++) accv[n2] = vec4(0.0);
+    const uint KPIT = 64u * 8u;
+    for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint col = (first_row + n) * n_in + col0;
+            const uint blk = col >> 8;               // 256 원소 블록
+            const uint bb = blk * 136u;              // 바이트 기저
+            const uint rel = col & 31u;              // 서브블록 내 위치 (8의 배수)
+            const uint sub = (col >> 5) & 7u;
+            const bool hi = rel >= 16u;
+            const uint bbase = bb + 8u + sub * 16u + (rel & 15u);  // qs 바이트 기저
+            // 4바이트 u32 조립 (비정렬)
+            const uint wi = bbase >> 2;
+            const uint sh = (bbase & 3u) * 8u;
+            const uint wa = w0u[wi];
+            const uint wb = w0u[wi + 1u];
+            const uint wq = (wa >> sh) | (sh != 0u ? (wb << (32u - sh)) : 0u);
+            const uint nib = (wq >> (hi ? 4u : 0u)) & 0x0F0F0F0Fu;
+            // 헤더: d + (sl, sh) → dl
+            const uint hw = w0u[bb >> 2];
+            const float d = unpackHalf2x16(hw & 0xFFFFu).x;
+            const uint shh = (hw >> 16u) & 0xFFFFu;
+            const uint lsw = w0u[(bb >> 2) + 1u];
+            const uint slb = (lsw >> (8u * (sub >> 1))) & 0xFFu;
+            const int ls = int((slb >> (4u * (sub & 1u))) & 0xFu) | (int((shh >> (2u * sub)) & 3u) << 4);
+            const float dl = d * float(ls - 32);
+            // 4니블 → LUT (kt[nib] 하위바이트 = NL 부호값)
+            const vec4 vs = vec4(
+                float(int(skt[nib & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib >> 8) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib >> 16) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[nib >> 24] & 0xFFu) << 24 >> 24));
+            // 나머지 4원소: 다음 4바이트 (rel+4)
+            const uint wi2 = wi + 1u;
+            const uint wc = w0u[wi2 + 1u];
+            const uint wq2 = (wb >> sh) | (sh != 0u ? (wc << (32u - sh)) : 0u);
+            const uint nib2 = (wq2 >> (hi ? 4u : 0u)) & 0x0F0F0F0Fu;
+            const vec4 vs2 = vec4(
+                float(int(skt[nib2 & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib2 >> 8) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[(nib2 >> 16) & 0xFFu] & 0xFFu) << 24 >> 24),
+                float(int(skt[nib2 >> 24] & 0xFFu) << 24 >> 24));
+            // vec4 레인=토큰 — 8곱 좌결합 체인(dot 저하 순서 경험적 검증).
+            #define BV8(off) vec4(xa[0u * pc.n_in + col0 + (off)], xa[1u * pc.n_in + col0 + (off)], xa[2u * pc.n_in + col0 + (off)], xa[3u * pc.n_in + col0 + (off)])
+            const vec4 r = vec4(dl) * (BV8(0u) * vec4(vs.x) + BV8(1u) * vec4(vs.y) + BV8(2u) * vec4(vs.z) + BV8(3u) * vec4(vs.w)
+                                     + BV8(4u) * vec4(vs2.x) + BV8(5u) * vec4(vs2.y) + BV8(6u) * vec4(vs2.z) + BV8(7u) * vec4(vs2.w));
+            accv[n] += r;
+        }
+    }
+    const vec4 r0 = subgroupAdd(accv[0]);
+    const vec4 r1 = num_rows > 1u ? subgroupAdd(accv[1]) : vec4(0.0);
+    if (tid == 0u) {
+        [[unroll]] for (uint tk = 0u; tk < 4u; tk++) {
+            if (tk >= pc.t) continue;
+            outv[tk * pc.n_out + first_row] = r0[tk];
+            if (num_rows > 1u) outv[tk * pc.n_out + first_row + 1u] = r1[tk];
+        }
+    }
+}

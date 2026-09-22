@@ -1,0 +1,29 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// gdn_conv_np (plans/91 P0) — np 배치 conv: 행(슬롯)별 링 상태를 디바이스 주소
+// 테이블로. 산술은 gdn_conv_t의 t=1 실행과 행별 동일(링 판독·시프트·push,
+// silu=sum/(1+exp(-sum)) — vk t=1 경로 클래스. rawhip gdn_conv_np 미러).
+// grid (ceil(ch/64), t) — rawhip과 동일 기하.
+// tbl: [n_recr][n_seqs] 상태 주소, slot: [t] 행→슬롯 맵 (호스트 스텝당 갱신).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Qkv { float qkv[]; };    // [t][ch]
+layout(binding = 1) readonly buffer Cw { float cw[]; };      // [ch][k]
+layout(binding = 2) readonly buffer Tbl { uint64_t tbl[]; }; // [n_recr][n_seqs]
+layout(binding = 3) buffer Out { float outv[]; };            // [t][ch]
+layout(binding = 4) readonly buffer Slot { uint slot[]; };   // [t]
+layout(push_constant) uniform PC { int ch; int k; int t; int li; int ns; } pc;
+layout(buffer_reference, std430) buffer StBlk { float st[]; };
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    int ti = int(gl_WorkGroupID.y);
+    if (c >= pc.ch || ti >= pc.t) return;
+    StBlk s = StBlk(tbl[uint(pc.li * pc.ns) + slot[uint(ti)]]);
+    float row = qkv[ti * pc.ch + c];
+    float sum = cw[c * pc.k + (pc.k - 1)] * row;
+    for (int j = 0; j < pc.k - 1; j++) sum += cw[c * pc.k + j] * s.st[j * pc.ch + c];
+    float oc = sum / (1.0 + exp(-sum));
+    for (int j = 0; j < pc.k - 2; j++) s.st[j * pc.ch + c] = s.st[(j + 1) * pc.ch + c];
+    s.st[(pc.k - 2) * pc.ch + c] = row;
+    outv[ti * pc.ch + c] = oc;
+}

@@ -54,7 +54,8 @@ const FN_IDX_SCORE_SPV: &[u8] = include_bytes!("../spv/fn_idx_score.spv");
 const FN_IDX_RANK_SPV: &[u8] = include_bytes!("../spv/fn_idx_rank.spv");
 const FN_IDX_EXPAND_SPV: &[u8] = include_bytes!("../spv/fn_idx_expand.spv");
 /// plans/85 §2 — 프레임 로짓 행별 GPU argmax(동률 최저 인덱스).
-const FN_ARGMAX_ROWS_SPV: &[u8] = include_bytes!("../spv/fn_argmax_rows.spv");
+/// plans/91 P0 — 디코더 np greedy에서도 재사용 (pub 승격).
+pub const FN_ARGMAX_ROWS_SPV: &[u8] = include_bytes!("../spv/fn_argmax_rows.spv");
 /// plans/88 P2 — MoE 그룹 프리필: 디바이스 그룹화·q4_K/q5_1 타일·융합 산란.
 const FN_MOE_GROUP_SPV: &[u8] = include_bytes!("../spv/fn_moe_group.spv");
 const FN_MOE_TILE_Q4K_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k.spv");

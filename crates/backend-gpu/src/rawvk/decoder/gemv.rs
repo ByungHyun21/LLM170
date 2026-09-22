@@ -96,7 +96,26 @@ impl DecoderState {
         } else if ty == 21 {
             binds.push(self.grid3s.buf);   // IQ3S_GRID 512워드 (iq4_nl ktab과 별개)
         }
-        // nlb (plans/46) — IQ4_NL 전용 (구 폴백 대체, t=1 스테디 ~2.8ms/토큰 절감).
+        // 가중 1회 판독·WG 수 1/t(종전 z=t는 토큰당 가중 전량 재판독 —
+        // np4 스텝이 가중 대역폭 붕괴로 273ms까지 늘어난 주벚, 실측).
+        // 산술은 각 *_b 판과 행×토큰 비트 동일. LLM170_VK_NPT=0 옵트아웃.
+        if (2..=4).contains(&t) && std::env::var("LLM170_VK_NPT").map(|v| v != "0").unwrap_or(true) {
+            let (nm, spv, nkb): (&str, &[u8], u32) = match ty {
+                13 => ("gemv8t_q5", GEMV8T_Q5_SPV, 10),
+                12 => ("gemv8t_q4", GEMV8T_Q4_SPV, 10),
+                20 => ("gemv8t_nl", GEMV8T_NL_SPV, 10),
+                11 => ("gemv8t_q3", GEMV8T_Q3_SPV, 10),
+                14 => ("gemv8t_q6", GEMV8T_Q6_SPV, 10),
+                8 => ("gemv8t_q8", GEMV8T_Q8_SPV, 10),
+                23 => ("gemv8t_xs", GEMV8T_XS_SPV, 11),
+                _ => ("", &[][..], 0),
+            };
+            if !nm.is_empty() {
+                let nr_t: u32 = std::env::var("LLM170_VK_NPT_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4);
+                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr_t]);
+                return self.run_pipe_b(nm, spv, nkb, 24, &binds, &push, 1, no.div_ceil(nr_t as usize) as u32, 1, bar);
+            }
+        }
         if ty == 20 && std::env::var("LLM170_VK_NLB").map(|v| v == "0").unwrap_or(true) {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b("gemv8_nlb", GEMV8_NLB_SPV, 10, 24, &binds, &push,
@@ -187,7 +206,6 @@ impl DecoderState {
         // 단일 청크 typed 뷰 — 143→225GB/s. LLM170_VK_Q5B=0 옵트아웃.
         if std::env::var("LLM170_VK_Q5B").map(|v| v == "0").unwrap_or(true) {
             // plans/46: NUM_ROWS 실험 — llama GCN은 rm_kq=4. t=1이 지연 바운드(f16 2배
-            // 바이트에 -1.8%뿐)이므로 행/WG 증가로 ILP 상향. 기본 2, LLM170_VK_NUMROWS로 변경.
             let nr: u32 = std::env::var("LLM170_VK_NUMROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             let nr = nr.clamp(1, 4);
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);

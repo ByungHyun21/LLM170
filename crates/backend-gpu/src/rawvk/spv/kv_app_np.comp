@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// kv_app_np (plans/91 P0) — kv_append의 np 판: 행(슬롯)별 KV 캐시를 디바이스
+// 주소 테이블로, pos도 행별 테이블. 산술은 kv_append와 동일(원소 복사).
+// grid (n/64, t).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Src { float src[]; };        // [t][n]
+layout(binding = 1) readonly buffer Tbl { uint64_t tbl[]; };     // [n_full][n_seqs]
+layout(binding = 2) readonly buffer Pos { uint pos[]; };         // [t]
+layout(binding = 3) readonly buffer Slot { uint slot[]; };       // [t]
+layout(push_constant) uniform PC { int n; int fi; int ns; } pc;
+layout(buffer_reference, std430) buffer DstBlk { float dst[]; };
+void main() {
+    int j = int(gl_GlobalInvocationID.x);
+    if (j >= pc.n) return;
+    int row = int(gl_WorkGroupID.y);
+    DstBlk d = DstBlk(tbl[uint(pc.fi * pc.ns) + slot[uint(row)]]);
+    d.dst[uint(pos[uint(row)]) * uint(pc.n) + uint(j)] = src[row * pc.n + j];
+}
