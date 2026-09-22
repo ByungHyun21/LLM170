@@ -2,6 +2,7 @@
 
 pub mod context;
 pub mod decoder;
+pub mod checks;
 pub mod gemv;
 pub mod flashcheck;
 
