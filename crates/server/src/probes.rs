@@ -166,7 +166,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
-        "hca-repro" => llm170_backend_gpu::rawhip::hca_repro(),
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-mmq-check" => {
@@ -228,21 +227,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "subsum-check" => llm170_backend_gpu::rawvk::subsum_check(),
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
-        "roof-test" => llm170_backend_gpu::rawhip::roof_test(),
-        "wmma-check" => llm170_backend_gpu::rawhip::wmma_check(),
-        "wmma2-check" => llm170_backend_gpu::rawhip::wmma2_check(),
-        "wmma2-map" => llm170_backend_gpu::rawhip::wmma2_map(),
-        "wmma2-map2" => llm170_backend_gpu::rawhip::wmma2_map2(),
-        "wmma2-attn-check" => llm170_backend_gpu::rawhip::wmma2_attn_check(),
-        "attn-check" => llm170_backend_gpu::rawhip::attn_check(),
-        "wmma-check-ldm" => llm170_backend_gpu::rawhip::wmma_check_ldm(),
-        "wmma-check-pv" => llm170_backend_gpu::rawhip::wmma_check_pv(),
-        "wmma-attn-check" => llm170_backend_gpu::rawhip::wmma_attn_check(),
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
         "bw-test" => llm170_backend_gpu::rawhip::bw_test(),
-        "bw-place" => llm170_backend_gpu::rawhip::bw_place_test(),
         "dp4a-test" => llm170_backend_gpu::rawhip::dp4a_test(),
         "iq3s-probe" => llm170_backend_gpu::rawhip::iq3s_probe(),
         "qk-check" => llm170_backend_gpu::rawhip::qk_check(),
