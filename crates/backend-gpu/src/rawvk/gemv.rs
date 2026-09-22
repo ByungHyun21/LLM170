@@ -1898,9 +1898,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // 스케일 분리 + f32 드레인). 킬스위치 LLM170_VK_MOECM=0.
             let cm_on = wbufs.len() == 1
                 && std::env::var("LLM170_VK_MOECM").map(|v| v == "1").unwrap_or(false);
-            let slot = match (w.ty, cm_on) {
+            let q4k_cm = cm_on
+                && std::env::var("LLM170_VK_Q4KCM").map(|v| v != "0").unwrap_or(true);
+            let slot = match (w.ty, q4k_cm) {
                 (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
-                (GgmlType::Q5_1, _q51cm) if std::env::var("LLM170_VK_Q51CM").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ51Cm,
+                (GgmlType::Q5_1, _q51cm) if cm_on && std::env::var("LLM170_VK_Q51CM").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Cm,
                 (GgmlType::Q4K, _) => Slot::FnMoeTileQ4K,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
                 (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
@@ -3401,7 +3403,13 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     } else {
         vec!["ffn_down_exps", "ffn_gate_exps"]
     };
+    let il_only = std::env::var("LLM170_MTC_IL").ok().and_then(|v| v.parse::<usize>().ok());
     for il in 0..48 {
+        if let Some(want_il) = il_only
+            && il != want_il
+        {
+            continue;
+        }
         for nm in &names {
             if let Ok(w) = model.w4(&format!("blk.{il}.{nm}.weight")) {
                 if w.ty == want {
@@ -3512,6 +3520,95 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
         "moe-tile-check({mode} blk.{il} down {n_out_d}x{n_in_d}, rows={}): max|D|={mx:.3e} bad={bad}/{checked} {}",
         t * k,
         if bad == 0 { "★" } else { "✗" }
+    ))
+}
+
+/// vk-moe-cm-race (plans/89 재개) — 엔진 패턴 재현: t=512 청크 내 N"레이어"
+/// × (MoeTop10 → ids 공유 GEMM 3회[게이트/업/다운]) + 첫 레이어 배치 중간
+/// frame_read 플러시(PLE 브리지 모방). 게이트 출력을 CPU와 대조해 체크 판
+/// (1회 GEMM 결정적)과 엔진(간헐 발산)의 차이를 국소화한다.
+pub fn moe_cm_race_check() -> Result<String, String> {
+    use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
+    let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let wg = model.w4("blk.0.ffn_gate_exps.weight").map_err(|e| e.to_string())?;
+    let wu = model.w4("blk.0.ffn_up_exps.weight").map_err(|e| e.to_string())?;
+    let wdd = model.w4("blk.0.ffn_down_exps.weight").map_err(|e| e.to_string())?;
+    let ne = 512usize;
+    let k = 10usize;
+    let n_in = wg.n_in as usize;
+    let n_out = wg.n_out as usize / ne;
+    let acc = VkAcc::new()?;
+    let t = std::env::var("LLM170_RACE_T").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize);
+    let layers = std::env::var("LLM170_RACE_L").ok().and_then(|v| v.parse().ok()).unwrap_or(12usize);
+    let mut lcg = 0xC0FFEEu64;
+    let mut lcgf = || {
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((lcg >> 33) as f32 / 4294967296.0) - 0.5
+    };
+    let xg: Vec<Vec<f32>> = (0..t * k).map(|_| (0..n_in).map(|_| lcgf()).collect()).collect();
+    let rh = acc.frame_alloc(t * ne)?;
+    let idh = acc.frame_alloc(t * k)?;
+    let wth = acc.frame_alloc(t * k)?;
+    let mxh = acc.frame_alloc(t * k * n_in)?;
+    let mgh = acc.frame_alloc(t * k * n_out)?;
+    let muh = acc.frame_alloc(t * k * n_out)?;
+    let mdh = acc.frame_alloc(t * k * (wdd.n_out as usize / ne))?;
+    let mut flat = Vec::with_capacity(t * k * n_in);
+    for row in &xg {
+        flat.extend_from_slice(row);
+    }
+    acc.frame_write(mxh, &flat)?;
+    let mut worst = 0f64;
+    let mut bad_layers = 0usize;
+    let mut ref_row = vec![0f32; n_in];
+    for l in 0..layers {
+        let route: Vec<f32> = (0..t * ne).map(|_| lcgf() * 4.0).collect();
+        acc.frame_write(rh, &route)?;
+        acc.frame_begin(t);
+        acc.frame_op(&llm170_core::matmul::FrameOp::MoeTop10 { route: rh, ids: idh, wt: wth, n_exp: ne, k_sel: k })?;
+        acc.frame_moe_gemm(mxh, &wg, idh, mgh, ne, k)?;
+        acc.frame_moe_gemm(mxh, &wu, idh, muh, ne, k)?;
+        acc.frame_moe_gemm(mxh, &wdd, idh, mdh, ne, k)?;
+        if l == 0 {
+            let mut probe = vec![0f32; 64];
+            acc.frame_read(mgh, &mut probe)?;
+        }
+        acc.frame_begin(t);
+        let mut got = vec![0f32; t * k * n_out];
+        acc.frame_read(mgh, &mut got)?;
+        let ids_ref = {
+            let mut probe = vec![0u32; t * k];
+            acc.frame_sync();
+            let g = acc_frame_ptr(&acc, idh);
+            unsafe { std::ptr::copy_nonoverlapping(g as *const u32, probe.as_mut_ptr(), t * k) };
+            probe
+        };
+        let mut lmx = 0f64;
+        for r in 0..(t * k).min(64) {
+            let e = ids_ref[r] as usize;
+            for j in 0..n_out.min(4) {
+                llm170_core::quant::dequant_row(wg.ty, wg.data, (e * n_out + j) as u64, n_in as u64, &mut ref_row);
+                let dot: f32 = ref_row.iter().zip(xg[r].iter()).map(|(a, b)| a * b).sum();
+                let d = (got[r * n_out + j] as f64 - dot as f64).abs();
+                lmx = lmx.max(d);
+            }
+        }
+        if lmx > 2e-2 {
+            bad_layers += 1;
+        }
+        worst = worst.max(lmx);
+        if std::env::var_os("LLM170_RACE_DBG").is_some() {
+            eprintln!("[race] L{l} max|D|={lmx:.3e}");
+        }
+    }
+    for h in [rh, idh, wth, mxh, mgh, muh, mdh] {
+        let _ = acc.frame_free(h);
+    }
+    Ok(format!(
+        "moe-cm-race(engine-pattern t={t} x{layers}): worst={worst:.3e} bad_layers={bad_layers} {}",
+        if bad_layers == 0 { "★" } else { "✗" }
     ))
 }
 
