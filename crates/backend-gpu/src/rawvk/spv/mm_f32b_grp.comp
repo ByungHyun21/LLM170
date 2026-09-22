@@ -1,0 +1,86 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// mm_f32b_grp (plans/91 P3) — f32/BF16 디코드 GEMV 그룹판: 한 프레임
+// mm_group의 f32 가중 k개(≤8)를 단일 런치로. 행별 산술은 mm_f32b와 비트
+// 동일(동일 레인 vec4/vec2 스트라이드·subgroupAdd). 출력은 행별 디바이스
+// 주소 테이블(PhysicalStorageBuffer)로 분산 기입.
+// info 레이아웃(u32 SSBO 32워드): [0..16) out_addr k개(u64 LE),
+// [16..24) n_out, [24..32) w_stride(원소/행: f32=n_in, bf16=n_in/2).
+// grid (Σ n_out, t), 64스레드.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0[]; };
+layout(binding = 1) readonly buffer W1 { uint w1[]; };
+layout(binding = 2) readonly buffer W2 { uint w2[]; };
+layout(binding = 3) readonly buffer W3 { uint w3[]; };
+layout(binding = 4) readonly buffer W4 { uint w4[]; };
+layout(binding = 5) readonly buffer W5 { uint w5[]; };
+layout(binding = 6) readonly buffer W6 { uint w6[]; };
+layout(binding = 7) readonly buffer W7 { uint w7[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) readonly buffer Info { uint info[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint t; uint dty; uint k;
+} pc;
+
+layout(buffer_reference, std430) buffer OutBlk { float outv[]; };
+
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0[o];
+    if (c == 1u) return w1[o];
+    if (c == 2u) return w2[o];
+    if (c == 3u) return w3[o];
+    if (c == 4u) return w4[o];
+    if (c == 5u) return w5[o];
+    if (c == 6u) return w6[o];
+    return w7[o];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.y;
+    uint row = gl_WorkGroupID.x;
+    // 행 → (가중 i, 로컬 행) — k ≤ 8 prefix 스캔.
+    uint i = 0u;
+    while (i < pc.k && row >= info[16u + i]) {
+        row -= info[16u + i];
+        i++;
+    }
+    if (i >= pc.k) return;
+    const uint n_out_i = info[16u + i];
+    const uint wstride = info[24u + i];
+    const uint xbase = tok * pc.n_in;
+    const uint wbase = row * wstride;
+    float acc = 0.0;
+    if (pc.dty == 0u) {
+        uint c = 4u * tid;
+        for (; c + 3u < pc.n_in; c += 256u) {
+            const vec4 w = vec4(
+                uintBitsToFloat(Wsel(i, wbase + c)),
+                uintBitsToFloat(Wsel(i, wbase + c + 1u)),
+                uintBitsToFloat(Wsel(i, wbase + c + 2u)),
+                uintBitsToFloat(Wsel(i, wbase + c + 3u)));
+            const vec4 x = vec4(
+                xa[xbase + c], xa[xbase + c + 1u], xa[xbase + c + 2u], xa[xbase + c + 3u]);
+            acc += dot(w, x);
+        }
+        for (; c < pc.n_in; c++) {
+            acc += uintBitsToFloat(Wsel(i, wbase + c)) * xa[xbase + c];
+        }
+    } else {
+        const uint nw = pc.n_in / 2u;
+        for (uint w = tid; w < nw; w += 128u) {
+            const vec2 wp = unpackHalf2x16(Wsel(i, wbase + w));
+            const uint c = 2u * w;
+            acc += wp.x * xa[xbase + c] + wp.y * xa[xbase + c + 1u];
+        }
+    }
+    const float r = subgroupAdd(acc);
+    if (tid == 0u) {
+        OutBlk ob = OutBlk(uint64_t(info[2u * i]) | (uint64_t(info[2u * i + 1u]) << 32u));
+        ob.outv[tok * n_out_i + row] = r;
+    }
+}

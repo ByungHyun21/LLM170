@@ -206,6 +206,73 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         } else {
             vk::Buffer::null()
         };
+        let mut mmgrp_skip: Vec<bool> = vec![false; ws.len()];
+        if t < 16
+            && std::env::var("LLM170_VK_MMBGRP").map(|v| v != "0").unwrap_or(true)
+            && !ws.is_empty()
+            && ws.len() <= 8
+        {
+            let dty0 = dense_ty(ws[0].ty);
+            let single_chunk: Vec<bool> = ws
+                .iter()
+                .map(|w| self.weight_bufs(&mut ctx, w).map(|b| b.len() == 1).unwrap_or(false))
+                .collect();
+            let groupable = dty0.is_some()
+                && ws.iter().enumerate().all(|(wi, w)| {
+                    dense_ty(w.ty) == dty0
+                        && w.n_in as usize == n_in
+                        && single_chunk[wi]
+                });
+            // 혼합 그룹: f32 멤버만 부분 그룹화(양자 멤버는 기존 경로).
+            let (use_group, gw_idx): (bool, Vec<usize>) = if groupable {
+                (true, (0..ws.len()).collect())
+            } else if dty0.is_some() {
+                let sub: Vec<usize> = ws
+                    .iter()
+                    .enumerate()
+                    .filter(|(wi, w)| dense_ty(w.ty) == dty0 && w.n_in as usize == n_in && single_chunk[*wi])
+                    .map(|(wi, _)| wi)
+                    .collect();
+                (sub.len() >= 2, sub)
+            } else {
+                (false, Vec::new())
+            };
+            if use_group {
+                for &wi in &gw_idx {
+                    mmgrp_skip[wi] = true;
+                }
+                let ibuf = self.ensure_grp_info(&mut ctx)?;
+                let mut info = [0u32; 32];
+                let mut binds: Vec<vk::Buffer> = Vec::with_capacity(10);
+                let mut total_rows = 0u32;
+                for (gi, &wi) in gw_idx.iter().enumerate() {
+                    let w = &ws[wi];
+                    let ob = self.fbuf(outs[wi])?;
+                    let a = ctx.buffer_va(ob);
+                    info[2 * gi] = a as u32;
+                    info[2 * gi + 1] = (a >> 32) as u32;
+                    info[16 + gi] = w.n_out as u32;
+                    info[24 + gi] = if dty0 == Some(0) { n_in } else { n_in / 2 } as u32;
+                    total_rows += w.n_out as u32;
+                    let wbufs = self.weight_bufs(&mut ctx, w)?;
+                    binds.push(wbufs[0]);
+                }
+                while binds.len() < 8 {
+                    binds.push(binds[0]);
+                }
+                binds.push(xb);
+                binds.push(ibuf.buf);
+                unsafe {
+                    let ip = ibuf.ptr as *mut u32;
+                    std::ptr::copy_nonoverlapping(info.as_ptr(), ip, 32);
+                }
+                let _ = &ibuf;
+                let p = self.pipeline(&mut ctx, Slot::MmF32bGrp)?;
+                let ds2 = ctx.bind_ds(&p, &binds)?;
+                let push = push_u32s(&[n_in as u32, t as u32, dty0.unwrap(), gw_idx.len() as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, total_rows, t as u32, 1)?;
+            }
+        }
         let mut xs: Vec<Vec<f32>> = Vec::new();
         let mut need_pullback = false;
         for w in ws {
@@ -243,6 +310,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             return Ok(());
         }
         for (wi, w) in ws.iter().enumerate() {
+            if mmgrp_skip[wi] {
+                continue;
+            }
             let n_out = w.n_out as usize;
             let ob = self.fbuf(outs[wi])?;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
