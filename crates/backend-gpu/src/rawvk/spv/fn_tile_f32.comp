@@ -1,0 +1,66 @@
+#version 450
+
+// fn_tile_f32 (plans/89 P1.2) — f32/BF16 밀집 프리필 타일. fn_mm_f32은 그리드
+// (n_out, t)라 가중 행을 토큰마다 재판독한다(라우터 f32 [512,2560] t=512 →
+// 2.6GB, [ts] 841ms/2청크). fn_tile_q8의 K-슬라이스 스테이징 구조에 f32 MAC을
+// 얹는다: 16행×K-슬라이스를 LDS에 협동 적재, 스레드 (ox,rx)는 슬라이스 내
+// 직렬 누산 — 가중 1회 판독, 활성 1회 판독. BF16(dty=1)은 워드 2원소 전개.
+// 그리드 (⌈n_out/16⌉, ⌈t/16⌉). 주의: barrier 전 조기 return 금지(비균일
+// 분기 = UB) — 경계 스레드는 스토어 가드로만 배제한다.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint dty; uint words_per_row;
+} pc;
+
+// K-슬라이스 512워드 — LDS 16행×512 = 32KB.
+#define SLICE_W 512u
+
+shared uint sh[16 * SLICE_W];
+
+void main() {
+    const uint ox = gl_LocalInvocationID.x;
+    const uint rx = gl_LocalInvocationID.y;
+    const uint o0 = gl_WorkGroupID.x * 16u;
+    const uint tid = gl_LocalInvocationID.y * 16u + ox;
+    const uint r = gl_WorkGroupID.y * 16u + rx;
+    const uint n_words = pc.dty == 0u ? pc.n_in : pc.n_in / 2u;
+    const bool live = o0 + ox < pc.n_out;
+    float acc = 0.0;
+    for (uint s0 = 0u; s0 < n_words; s0 += SLICE_W) {
+        const uint lim = min(SLICE_W, n_words - s0);
+        // 협동 스테이징: 행 우선(연속 워드) — 커널당 가중 1회 판독.
+        for (uint e = tid; e < 16u * lim; e += 256u) {
+            const uint row = e / lim;
+            const uint col = e - row * lim;
+            if (o0 + row < pc.n_out) {
+                sh[row * SLICE_W + col] = w0u[(o0 + row) * pc.words_per_row + s0 + col];
+            }
+        }
+        barrier();
+        if (live && r < pc.t) {
+            const uint xbase = r * pc.n_in;
+            if (pc.dty == 0u) {
+                for (uint c = 0u; c < lim; c++) {
+                    acc += uintBitsToFloat(sh[ox * SLICE_W + c]) * xa[xbase + s0 + c];
+                }
+            } else {
+                for (uint c = 0u; c < lim; c++) {
+                    const vec2 wp = unpackHalf2x16(sh[ox * SLICE_W + c]);
+                    const uint k = (s0 + c) * 2u;
+                    if (k + 1u < pc.n_in) {
+                        acc += wp.x * xa[xbase + k] + wp.y * xa[xbase + k + 1u];
+                    } else if (k < pc.n_in) {
+                        acc += wp.x * xa[xbase + k];
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (live && r < pc.t) {
+        outv[r * pc.n_out + o0 + ox] = acc;
+    }
+}
