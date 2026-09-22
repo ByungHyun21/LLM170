@@ -101,6 +101,8 @@ const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_cm.spv
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("spv/fn_ple_conv.spv");
 const FN_PLE_RES_SPV: &[u8] = include_bytes!("spv/fn_ple_res.spv");
+/// plans/89 P0.4 — QSA 선택 어텐션 멀티헤드(WG=tok×kv헤드, K/V 12× 절감).
+const FN_QSA_ATTN_SEL_MH_SPV: &[u8] = include_bytes!("spv/fn_qsa_attn_sel_mh.spv");
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,6 +184,8 @@ enum Slot {
     FnPleGate,
     FnPleConv,
     FnPleRes,
+    /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
+    FnQsaAttnSelMh,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -335,6 +339,7 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMmf32 => "mm_f32",
         Slot::FnMoeIds2 => "moe_ids2",
         Slot::FnPleGate => "ple_gate",
+        Slot::FnQsaAttnSelMh => "qsa_attn_sel_mh",
         Slot::FnPleConv => "ple_conv",
         Slot::FnPleRes => "ple_res",
         Slot::FnMoeIds51 => "moe_ids51",
@@ -472,6 +477,7 @@ impl VkAcc {
             Slot::FnTileF32 => (FN_TILE_F32_SPV, 10, 20),    // 8W+x(f32)+out
             Slot::FnPleGate => (FN_PLE_GATE_SPV, 8, 16),   // res,key,val,nk,nq,nc,gated,gate
             Slot::FnPleConv => (FN_PLE_CONV_SPV, 4, 20),   // gated,cw,ring,conv
+            Slot::FnQsaAttnSelMh => (FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
             Slot::FnPleRes => (FN_PLE_RES_SPV, 4, 12),     // res,val,gate,conv
             Slot::TileQ8128Cm => (TILE_Q8128_SPV2, 10, 24),
             Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
@@ -1363,11 +1369,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let vb = vk::Buffer::from_raw(cv as u64);
         let sib = vk::Buffer::from_raw(sel_idx as u64);
         let sob = vk::Buffer::from_raw(sel_off as u64);
-        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
-        let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, sib, sob, ob])?;
-        let mut push = kq_scale.to_le_bytes().to_vec();
-        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
-        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+        self.qsa_attn_sel_run(&mut ctx, qb, cb, vb, sib, sob, ob, kq_scale, n_head, n_kv, hd, t)
     }
 
     /// 선택 목록 어텐션 — fn_qsa_attn_sel 판(hd=256).
@@ -1399,11 +1401,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
             std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
         }
-        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
-        let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, si_b.buf, so_b.buf, ob])?;
-        let mut push = kq_scale.to_le_bytes().to_vec();
-        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
-        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+        self.qsa_attn_sel_run(&mut ctx, qb, cb, vb, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t)
     }
 
     /// 업로드 판 어텐션 — 호스트 ck/cv 를 스크래치에 올려 동일 커널(plans/86 §3:
@@ -1450,11 +1448,41 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
             std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
         }
-        let p = self.pipeline(&mut ctx, Slot::FnQsaAttnSel)?;
-        let ds2 = ctx.bind_ds(&p, &[qb, ckb.buf, cvb.buf, si_b.buf, so_b.buf, ob])?;
+        self.qsa_attn_sel_run(&mut ctx, qb, ckb.buf, cvb.buf, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t)
+    }
+}
+
+impl VkAcc {
+    /// plans/89 P0.4 — 선택 어텐션 발사: (n_head/n_kv)%4==0 이면 멀티헤드 판
+    /// (grid (t, n_kv), 256스레드=4sg×헤드 — K/V 판독 12× 절감, 헤드별 산술
+    /// 판과 동일). 킬스위치 LLM170_VK_QSAMH=0.
+    fn qsa_attn_sel_run(
+        &self,
+        ctx: &mut VkCtx,
+        qb: vk::Buffer,
+        cb: vk::Buffer,
+        vb: vk::Buffer,
+        sib: vk::Buffer,
+        sob: vk::Buffer,
+        ob: vk::Buffer,
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let mh = n_kv >= 1
+            && n_head % n_kv == 0
+            && (n_head / n_kv) % 4 == 0
+            && hd == 256
+            && std::env::var("LLM170_VK_QSAMH").map(|v| v != "0").unwrap_or(true);
+        let slot = if mh { Slot::FnQsaAttnSelMh } else { Slot::FnQsaAttnSel };
+        let p = self.pipeline(ctx, slot)?;
+        let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, sib, sob, ob])?;
         let mut push = kq_scale.to_le_bytes().to_vec();
         push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
-        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, n_head as u32, 1)
+        let gy = if mh { n_kv as u32 } else { n_head as u32 };
+        ctx.run(p.pl, ds2, p.pipe, &push, t as u32, gy, 1)
     }
 }
 
