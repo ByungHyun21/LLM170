@@ -34,10 +34,8 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                     0,
                 )
             });
-            if pos0 > e.4 {
-                return Err(format!("vk qsa_kv_dev: 워터마크 구멍 w={} pos0={pos0}", e.4));
-            }
-            e.4 = pos0 + t;
+            crate::common::qsa::wm_advance(&mut e.4, pos0, t)
+                .map_err(|e2| format!("vk qsa_kv_dev: {e2}"))?;
             need_grow = e.0.bytes < bytes;
         }
         let mut ctx = self.ctx.lock();
@@ -96,10 +94,8 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let e = m
                 .entry((full_idx, seq))
                 .or_insert_with(|| (vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null(), 0));
-            if pos0 > e.4 {
-                return Err(format!("vk qsa_idx_append: 워터마크 구멍 w={} pos0={pos0}", e.4));
-            }
-            e.4 = pos0 + t;
+            crate::common::qsa::wm_advance(&mut e.4, pos0, t)
+                .map_err(|e2| format!("vk qsa_idx_append: {e2}"))?;
         }
         // idx_k 풀은 kv 풀과 별도 용량 — 필요시 성장(간단 재할당).
         let mut ctx = self.ctx.lock();

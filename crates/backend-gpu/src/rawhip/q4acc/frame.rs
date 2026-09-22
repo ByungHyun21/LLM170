@@ -366,7 +366,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let hit = {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
-                .filter(|g| g.generation == generation && g.rows == rows)
+                .filter(|g| crate::common::moe::cache_hit(g.generation, generation, g.rows, rows, true))
                 .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d, g.pinned_off))
         };
         if tm {

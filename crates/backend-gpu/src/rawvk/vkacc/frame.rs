@@ -244,7 +244,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let generation = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
             let hit = {
                 let g = self.moe_grp.lock();
-                g.as_ref().is_some_and(|g| g.generation == generation && g.rows == rows && g.ids_h == ids)
+                g.as_ref().is_some_and(|g| crate::common::moe::cache_hit(g.generation, generation, g.rows, rows, g.ids_h == ids))
             };
             if !hit {
                 // 테이블 성장(단일 상한 bound — 그룹 커널이 [rp,bound)를 0채움).
