@@ -1,0 +1,24 @@
+#version 450
+
+// fn_ple_res (plans/89 P1.4) — hip q4_ple_residual 포트.
+// res[s·n+i] += value[i]·gate + conv_out[s·n+i] — 호스트 식 그대로.
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer ResB { float res[]; };
+layout(binding = 1) readonly buffer ValB { float value[]; };
+layout(binding = 2) readonly buffer GateB { float gate_out[]; };
+layout(binding = 3) readonly buffer ConvB { float conv_out[]; };
+layout(push_constant) uniform PC {
+    uint n_embd; uint hc; uint t;
+} pc;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= int(pc.n_embd)) return;
+    for (uint ti = 0u; ti < pc.t; ti++) {
+        float v = value[ti * pc.n_embd + uint(i)];
+        for (uint s = 0u; s < pc.hc; s++) {
+            uint idx = ti * pc.hc * pc.n_embd + s * pc.n_embd + uint(i);
+            res[idx] += v * gate_out[ti * pc.hc + s] + conv_out[idx];
+        }
+    }
+}

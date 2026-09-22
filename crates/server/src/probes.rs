@@ -182,11 +182,20 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawvk::gemv::gemv_check(&path, &tn, t)
         }
         "vk-sdot-probe" => llm170_backend_gpu::rawvk::gemv::sdot_probe(),
+        "vk-idot-probe" => llm170_backend_gpu::rawvk::gemv::idot_probe(),
         "vk-gemv8-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ssm_out.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
             llm170_backend_gpu::rawvk::gemv::gemv8_check(&path, &tn, t)
+        }
+        "vk-ft32-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            llm170_backend_gpu::rawvk::gemv::ft32_check(&path)
+        }
+        "vk-moe-tile-check" => {
+            let mode = args.first().cloned().unwrap_or_else(|| "q8_0".into());
+            llm170_backend_gpu::rawvk::gemv::moe_tile_type_check(&mode)
         }
         "mmv-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
