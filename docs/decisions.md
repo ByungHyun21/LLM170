@@ -1616,3 +1616,63 @@ where per-thread register blocking is shallow). Kernel parked as an opt-in
 draft covered only 32 of 64 A-rows (4 threads/row instead of 2), and the
 uninitialized shared-memory half produced -inf outputs — caught by
 vk-tile-check in 0.3s.
+
+### (33) refactor-90 ledger: numerics-frozen debt cleanup, module split, shared contracts (plans/90, 2026-09-22)
+
+Scope: full-repo refactor executed as nine gated commits on `refactor-90`,
+under the freeze rule (ops.rs/quant.rs canon moved-never-reordered; every
+unit: release build 0-warnings, cargo test, FN/27B gates byte-identical).
+
+**Phase A (dead code & debt)**: `matmul_multi` (0 callers) and 14 `let _ =`
+dummies removed; `qwen35::greedy` re-exported from `matmul::greedy_from`
+(bit-identical lowest-index tie); rope cos/sin tables unified into
+`ops::rope_cs_table` (3 copies, identical arithmetic); the 6-way
+`frame_on` gate and 2-way GPU pullback loops unified into `Engine4`
+methods. One semantic fix surfaced: `decode1_greedy` treated
+`LLM170_FRAME=0` as *set* (frame path stayed on) while the other five
+sites honored the kill switch — the unified gate now honors `=0`
+everywhere (default configs unaffected). The vk `MoeGrp.off/rows_pad`
+per-generation reallocation leak is fixed with capacity guards; the group
+kernel fully rewrites all outputs each `!hit`, so cross-generation buffer
+reuse is content-safe. Probe kernels left production hipRTC SRC
+(dot_roof/mfma_roof/bw_stream/q4_hca_repro, wmma_probe family, wmma2 v1,
+wk8d) with their NAMES rows, CLI probes, and (previously) 2MB committed
+spvtool binary; gguf gained open-time tensor-bounds and split.no<count
+validation (one test re-pinned from "detected at read" to "rejected at
+open" — the new intended contract).
+
+**Phase B (structure)**: gemv.rs (6,126 lines) split — 2,962-line checker
+family into `rawvk/checks.rs` (pure move), the rest into
+`vkacc/{mod,dispatch,qsa,frame,matmul,ple}` (largest module now 816
+lines); Slot/name/SPV/pipeline quadruple-match collapsed into one
+`SLOTS` table (new kernel = enum variant + 1 row); 31 concluded shader
+pairs archived to `spv/archive/` (kept: Q4KKP, q51_sg1, tile_ms4,
+mmv_llm, sdot/idot probes — all verified live by include_bytes or
+fs-read); `LLM170_VK_NR` polysemy resolved (NOROB / NUMROWS); hip↔vk
+neutral `common/` layer shared where safe (pread part staging,
+QSA watermark rule, MoE grouping contract + cache-hit) with the
+no-share rule made explicit (kernel arithmetic/dispatch/f16 mirrors stay
+per-backend for bit contracts); core helpers D4 (hc_mix inject-optional),
+D6 (PLE gate stashed once — inputs proven identical), D7 (grouped_rms),
+D2 (qwen35 attention head math shared by main loop and GPU-failure
+fallback, exp_cr selection preserved); `qsa_idx_append_host` default
+flipped Ok(())→Err (silent non-append was a lie that produced watermark
+holes); qwen35 layers migrated to the stages/Ctx pattern; PLE_CHECK
+shadow and G0/A3 dumps isolated into diag modules; MOE_GROUPED retired,
+VKD_BATCH spec-opt-in renamed VKD_SPEC_BATCH, frame env gate cached via
+OnceLock (2 env reads/decode step removed).
+
+**Verification**: all gates green on the final tree — FN vk gate 3×
+byte-identical, 27B hip gate PASS, vk-frame-check PASS, cargo test full
+suite. One intermittent mid-stream divergence (1 in 11 consecutive FN
+runs, same binary, under back-to-back model-load heat/page-cache
+pressure; 10/11 identical including 5 reruns after cooldown, main 3/3)
+was investigated to ground: the A2 buffer-reuse was cleared by shader
+analysis (full rewrite per launch), leaving thermal/UMA-state
+nondeterminism as the standing hypothesis — recorded here because the
+atomicAdd permutation order in fn_moe_group is nondeterministic **by
+design** (output order-independence argument documented in the shader
+header and common/moe.rs). D8/D9 (silu_mul_rows/embd_rows) were skipped:
+the scout-era duplication no longer exists (single occurrence each; a
+helper would be indirection without dedup). plans/91 consumes the Slot
+table directly (P1a) and the checks/vkacc split (P2).
