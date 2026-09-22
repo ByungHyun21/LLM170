@@ -37,6 +37,28 @@ figure is a different protocol/session).
 - `scripts/scorecard.sh`: `-ngl all` → `-ngl 99` (master llama-bench rejects
   the literal).
 
+## Vulkan compute campaign (2026-09-22, plans/89 — engine bench, solo)
+
+### Qwen3.8-Flash-Next (Q4_K_XL) — vk vs session start
+
+| cell | session start | now | hip | llama vk |
+|---|---|---|---|---|
+| pp512@20k | 60.1 | ~180 | 231-275 | 234 |
+| pp4096@20k | 54.7 | 178.6 | 276 | 347 |
+| pp16384@20k | — | 158.6 | 246 | 332 |
+| tg128@8k | 7.51 | 17.9 | 18.4 | 23.2 |
+
+### Qwen3.8-27B (UD-Q4_K_XL)
+
+| cell | vk now | hip | llama vk |
+|---|---|---|---|
+| pp512@20k | 336.9 | — | 343 |
+| pp16384@20k | 145.9 | 292 | 273 |
+
+(27B pp16384 is bounded by the f16 tile_ms128 family — [ts] profile:
+tile_ms128 21.6s, tile_q8128 15.6s, tile_xs128 10.7s per pp2048@4k. Integer
+s8-coopmat or OpSDot-class rewrites of those tiles are the next lever.)
+
 ## Prior scorecard (2026-09-15, ROCm 10 userspace, greedy, solo) — superseded by the CLI scorecard above
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)

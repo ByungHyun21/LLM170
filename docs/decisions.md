@@ -1567,3 +1567,37 @@ Verification: chunk-check 3000-token — the device path chunk (512) is
 bits-identical; the 208-chunk deviation (0.381, argmax equal) reproduces
 the HOST path signature exactly (pre-existing FN non-invariance). pp4096
 121.6 -> 128.5; pp16384@20k first-measured 118.5.
+
+### (32e) OpSDot binary patcher + coalesced rms + dense tile routing (plans/89, 2026-09-22c)
+
+**OpSDot production patcher.** Ubuntu spirv-tools 2025.1 SAIL rejects the
+`PackedVectorFormat4x8Bit` literal, so GLSL cannot target integer dot products
+directly. `scripts/patch_sdot.py` compiles a sentinel kernel (sdot4p: four
+split multiplies), locates the chain in `spirv-dis` text, and rewrites the
+SPIR-V words in place: final IAdd(5w) -> OpSDot(opcode 4450, 6w, format=0),
+dead extraction instructions -> word-count-preserving OpNop tiles, plus
+DotProduct/DotProductInput4x8BitPacked capabilities. Unwrap rule learned the
+hard way: ShiftRight always passes, BitwiseAnd only when masked by constant
+255; the packing mask (0x0F0F0F0F) is opaque and its result is the dot
+operand (patching through it read raw high nibbles — max|D| 52). Zero sites
+patched = hard fail (unpatched sentinel reads the top byte unsigned).
+fn_moe_tile_q4k: 3078ms -> 635ms per pp512 bench (4.85x), arithmetic
+bit-identical to the previous dot4 (signed byte sext). Build order:
+build_spv.py then patch_sdot.py — rebuilding the .comp re-runs the patch.
+
+**rms coalescing.** The rms kernel gave each lane a contiguous 320B segment,
+so adjacent lanes were 320B apart — 32x transaction waste, 8GB/s. Interleaved
+loads (lane u takes element i*32+u) cut 2.58ms -> 0.33ms per dispatch (same
+class: f32 partial sums + ordered f64 combine; only the partition changed).
+The stream coincidentally returned to the session-open token sequence.
+
+**Dense tile routing completion.** ffn_chain_gpu and matmul_batch still fed
+t>=2 q8_0/q4_K through the serial gemv3 t-loop (~50ms/dispatch at t=512);
+routed to the same coopmat tiles dense_mm uses (same numeric class as P1.1a,
+dead Tile128/Tile128Q51 plumbing removed). Two §8 baseline re-records
+(f16-staging class change, then rms partition flip-back).
+
+Benchmarks (quiet machine): FN vk pp512 131.8 -> ~180, pp4096 128.5 -> 178.6,
+pp16384 118.5 -> 158.6, tg128 15.2 -> 17.9 (hip: 231-275 / 276 / 18.4).
+27B vk pp512 336.9, pp16384 145.9 (hip 292 — dominated by the tile_ms128
+family, the remaining major lever).

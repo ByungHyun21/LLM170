@@ -13,7 +13,7 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
 | LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
-| LLM170 vulkan | **344** | 231 | 174.5 | 116.8 | 11.44 |
+| LLM170 vulkan | **336.9** | — | — | 145.9 | 11.4-12 |
 | llama.cpp hip | 340 | 318-335 | 317 | 293-297 | 11.65 |
 | llama.cpp vulkan | 343 | 318 | 301 | 273 | **12.05** |
 
@@ -27,21 +27,24 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 
 Vulkan qwen4exp runs a device-resident frame pipeline (plans/86-89):
 prefill + decode on device, llama-dmmv decode GEMV family, coopmat dense
-prefill tiles, device MoE tiles (q5_1 down coopmat sg1), PLE math on device (bit-identical to
+prefill tiles, device MoE tiles (q5_1 down coopmat sg1 default, q4_K tile
+with OpSDot integer-dot binary patching), PLE math on device (bit-identical to
 host), step-level batching, pread-staged weight uploads. Kill switch
 `LLM170_VK_FRAME=0`; MoE coopmat tiles opt-in `LLM170_VK_MOECM=1`
 (nondeterminism under investigation — see docs/decisions.md (32)).
 
 
-| backend | pp512 | pp4096 | pp16384 | tg128@4k |
+| backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
-| LLM170 vulkan (frame) | 131.8 | 128.5 | 118.5 | 15.2 |
+| LLM170 hip | **231-275** | 276 | 246 | **18.4** |
+| LLM170 vulkan (frame) | 179-190 | 178.6 | 158.6 | 17.9 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
-Opt-in `LLM170_VK_MOECM=1` reaches 205 pp512 (subgroup-scheduling
-nondeterminism on this RADV build — see docs/decisions.md (32c)).
+Session 2026-09-22 (plans/89): OpSDot q4_K MoE tile (4.85x), rms coalescing
+(8x/dispatch), dense tile routing completion — FN pp512 131.8 -> ~180. The
+remaining gap is the f16 tile_ms128 family (27B large-t prefill) and decode
+dmmv depth (llama vk 23.2).
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
