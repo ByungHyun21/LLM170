@@ -1676,3 +1676,19 @@ header and common/moe.rs). D8/D9 (silu_mul_rows/embd_rows) were skipped:
 the scout-era duplication no longer exists (single occurrence each; a
 helper would be indirection without dedup). plans/91 consumes the Slot
 table directly (P1a) and the checks/vkacc split (P2).
+
+**Flake follow-up (post-merge audit)**: the 1-in-11 divergence was
+investigated to ground: 12-run back-to-back stress with
+`LLM170_DUMP=checksum` (897 [npck] stage marks per run — one-run
+localization capability verified for any recurrence; harness kept at
+`scripts/stress-flake-repro.sh`) plus 11 earlier re-runs = 23 consecutive
+byte-identical runs post-event. Audit cleared every suspect: `off` is
+write-only on the tile path; tile kernels read only fully-rewritten
+tables; the kv-append no-barrier group is closed by a single barrier
+whose first scope covers both writes; the default q51_sg1 tile is
+single-workgroup barrier-synchronized (deterministic MMA per element).
+Two hardenings landed: the vk MoE tile gate now carries the hip-side
+`ne <= 512` guard (the group shader's shared-array cap silently skips
+table writes above it — unreachable with 512-expert models, but stale
+buffer consumption if ever reached), and the flake remains classified
+environment-correlated until a recurrence provides checksums.
