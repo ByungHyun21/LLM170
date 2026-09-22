@@ -4,6 +4,7 @@
 //! 커널 산술은 core 미러(dot_row_w4a8_*_lane)와 토큰당 동일 연산열 — to_bits 검증 게이트.
 //! 비트계약: raw-HIP greedy 스트림 ≡ CPU W4A8 참조 엔진 (12+64토큰 교차검증).
 
+pub mod common;
 pub mod rawhip;
 pub mod rawvk;
 

@@ -736,7 +736,7 @@ impl VkCtx {
                 .device
                 .create_shader_module(&smci, None)
                 .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
-            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NR").is_some();
+            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NOROB").is_some();
             let mut rci = vk::PipelineRobustnessCreateInfoEXT::default()
                 .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
                 .uniform_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)

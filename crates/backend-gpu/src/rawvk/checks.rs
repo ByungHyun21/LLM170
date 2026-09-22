@@ -1014,21 +1014,12 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         return Err("tile 검증 t는 1..=128 (MS4GY/GY2/MSALL는 512까지)".into());
     }
     let (spv_name, n_kb, extra) = match w.ty {
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) => ("tile_ms128v2.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="3").unwrap_or(false) => ("tile_ms128s18.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false) => ("tile_ms128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if msall => ("tile_ms4.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q4K if msall && gy2 => ("tile_q4kmgy.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q6K if msall && gy2 => ("tile_q6kmgy.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q3K if msall && gy2 => ("tile_q3kmgy.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q8_0 if msall && gy2 => ("tile_q8mgy.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Iq4Xs if msall && gy2 => ("tile_xsmgy.spv", 11u32, 1u8),
-        llm170_gguf::GgmlType::Iq4Nl if msall && gy2 => ("tile_nlmgy.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q4K if bn128 => ("tile_q4k128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q6K if bn128 => ("tile_q6k128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q3K if bn128 => ("tile_q3k128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q8_0 if bn128 => ("tile_q8128.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q8_0 if std::env::var("LLM170_TILE_I8").map(|v| v=="1").unwrap_or(false) => ("tile_q8128i.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Iq4Xs if bn128 => ("tile_xs128.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Iq4Nl if bn128 => ("tile_nl128.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
@@ -1037,41 +1028,21 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q8_0 if msall => ("tile_q8ms.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Iq4Xs if msall => ("tile_xsms.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Iq4Nl if msall => ("tile_nlms.spv", 11u32, 1u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_LLM").map(|v| v=="1").unwrap_or(false) => ("tile_llm.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_S32").map(|v| v=="1").unwrap_or(false) => ("tile_s32.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) => ("tile_s32b.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) => ("tile_ms.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false) => ("tile_ms_f16b.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) => ("tile_ms2.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) => ("tile_ms3.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) => ("tile_ms4gy.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) => ("tile_ms8.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) => ("tile_ms7.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false) => ("tile_ms6.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) => ("tile_ms4.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false) => ("tile_ms5.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_NOOPT").map(|v| v=="1").unwrap_or(false) => ("tile128_noopt.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_W").map(|v| v=="1").unwrap_or(false) => ("tile128w.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_OCC").map(|v| v=="1").unwrap_or(false) => ("tile128o.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var("LLM170_TILE_DS").map(|v| v=="1").unwrap_or(false) => ("tile128_ds.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5K if std::env::var_os("LLM170_TILE_V2").is_some() => ("tile128v2.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q5K => ("tile128_q5k.spv", 10u32, 0u8),
-        llm170_gguf::GgmlType::Q5_1 => ("tile128_q51.spv", 10u32, 0u8), // plans/84 B: 전용 런치(t_below)
         llm170_gguf::GgmlType::Q4K => ("tile_q4k.spv", 10, 0),
         llm170_gguf::GgmlType::Q6K => ("tile_q6k.spv", 10, 0),
-        llm170_gguf::GgmlType::Q3K => ("tile_q3k.spv", 10, 0),
         llm170_gguf::GgmlType::Q8_0 => ("tile_q8.spv", 10, 0),
         llm170_gguf::GgmlType::Iq4Xs => ("tile_xs.spv", 11, 1),   // ktab
         llm170_gguf::GgmlType::Iq4Nl => ("tile_nl.spv", 11, 1),    // ktab
         llm170_gguf::GgmlType::Iq3S => ("tile_iq3s.spv", 11, 2),   // grid3s
         _ => return Err("tile 검증 불가 타입".into()),
     };
-    let i8tile = std::env::var("LLM170_TILE_I8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q8_0;
-    let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall
-        || (std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K)
-        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false)
-        || i8tile;
-        let acc = VkAcc::new()?;
+    let is_128 = w.ty == llm170_gguf::GgmlType::Q5K || msall
+        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+    let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
     let mut lcg = || {
@@ -1081,20 +1052,12 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     // xq 양자화 (GPU quant — 비트 검증 완료 경로)
     let xq_w = xq_words(n_in);
-    let msf16b = std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false);
-    let mut xqb = if std::env::var_os("LLM170_TILE_BDEV").is_some() {
+    let xqb = if std::env::var_os("LLM170_TILE_BDEV").is_some() {
         ctx.alloc((t * xq_w * 4).max(t * n_in * 2))?
     } else {
         ctx.alloc_host((t * xq_w * 4).max(t * n_in * 2))?
     };
-    if msf16b {
-        let mut hb: Vec<u16> = Vec::with_capacity(t * n_in);
-        for row in &xs { for &v in row { hb.push(hf(v)); } }
-        unsafe { std::ptr::copy_nonoverlapping(hb.as_ptr() as *const u8, xqb.ptr, t * n_in * 2) };
-        ctx.unmap(&mut xqb)?;
-    } else {
-        acc.quant_upload(&mut ctx, &xs, n_in, xqb.buf)?;
-    }
+    acc.quant_upload(&mut ctx, &xs, n_in, xqb.buf)?;
     let ob = ctx.alloc_host(t * n_out * 4)?;
     // 가중 업로드
     let total = w.data.len();
@@ -1116,12 +1079,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
-    let bn128spv = spv_name.ends_with("128.spv") || spv_name.starts_with("tile_ms128s") || i8tile;
+    let bn128spv = spv_name.ends_with("128.spv");
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv")
         || spv_name == "tile_ms4.spv" || bn128spv;
     let slab: usize = if bn128spv { 128 } else { 64 };
-    let ms128fam_any = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
-        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+    let ms128fam_any = std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
     let q51fam = w.ty == llm170_gguf::GgmlType::Q5_1;   // plans/84 B: 6필드 push(24B)
     let pb: u32 = if q51fam { 24 } else if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
     let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
@@ -1141,23 +1103,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let cw_log2 = 31u32 - cw.leading_zeros();
     let cw_mask = cw - 1;
     let gx = if std::env::var("LLM170_TILE_MS4GY").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(64)
-    } else if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(64)
-    } else if (std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(64)   // tile_ms6/ms7: WG당 64행
+        (n_out as u32).div_ceil(64)   // tile_ms4gy: WG당 64행
     } else if spv_name.starts_with("tile_ms128") && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32).div_ceil(64)   // tile_ms128 계열: WG당 64행 × 128토큰
-    } else if i8tile {
-        (n_out as u32).div_ceil(64)   // tile_q8128i: WG당 64행 × 128토큰
-    } else if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
-        (n_out as u32).div_ceil(64)   // tile_ms: WG당 64행
-    } else if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(32)   // tile_s32b: WG당 32행
-    } else if std::env::var("LLM170_TILE_S32").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(32)   // tile_s32: WG당 32행
-    } else if std::env::var_os("LLM170_TILE_V2").is_some() && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(64)   // tile128v2: WG당 64행
+    } else if msall || (std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K) {
+        (n_out as u32).div_ceil(64)   // tile_ms4(msall): WG당 64행
     } else {
         (n_out as u32).div_ceil(128)
     };
@@ -1190,8 +1140,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         let push = mpush(64, 0);
         ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
     } else if is_128 && !ms4gy {
-        let ms128fam = std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false)
-            || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+        let ms128fam = std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         if is_msfam {
             // ms 패밀리: t>슬래브는 분할 (tok_base로 전 토큰 커버; ms256 = 128토큰 슬래브)
             for tb in (0..t).step_by(slab) {
