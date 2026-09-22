@@ -1483,3 +1483,51 @@ higher-occupancy decode MoE shape. P3 (coopmat q4_K, 200+ challenge)
 not taken per its own gate; P4 (QSA prefill tile) skipped — QSA
 attention is below the top-13 slots of the re-profile; P5 (dense
 GEMM re-evaluation) was subsumed by the dense tiles.
+
+## (32) Vulkan compute campaign — plans/89 (decode dmmv, prefill tiles, PLE device)
+
+**Decode (P0)**: the frame path's dense GEMV/MoE GEMV families moved to
+llama-dmmv geometry (64-thread, 2-row WG, f32-activation direct, subgroup
+f32 add) — gemv3 256-thread/W4A8/f64-tree class replaced per the §8
+precedent (element checks vs full-precision CPU dequant at 1e-7..1e-3,
+ckdiff ulp-cascade, determinism 2x, baseline re-recorded). FN tg 7.15 →
+15.1 (step 133 → 64.5ms; [ts] gemv 77ms → q8b 26ms, moe_ids 33 → ~8ms,
+mm_f32 12 → 4).
+
+**Prefill (P1)**: dense q8_0/q4_K prefill now dispatches the decoder's
+coopmat ms/128 tile family; MoE q8_0/q5_K roles got 16x16 scalar tiles
+(partial-superblock-safe — down n_in=640 is 2.5 superblocks); fn_tile_f32
+kills the router's weight-per-token re-read; moe_gather is elementwise
+parallel. FN pp512 60 → 103.6, pp4096 54.7 → 95.0.
+
+**MoE coopmat tiles (q4_K/q5_1)**: expert-block geometry (16-row expert
+block x 128 output cols), f16_exact subnormal-safe decode, row-max-d
+scale separation, f32 drain. Numbers verified 1.1-2.3e-3 bad=0 incl
+20k-row multi-block; pp512 205 t/s measured. **Parked default-OFF**: an
+engine-context-only intermittent nondeterminism (bufhash first divergence
+at L4A.mout; check-harness deterministic 6/6) — consistent with the
+tile128v2 RADV-coopmat precedent. memoryBarrierShared did not resolve.
+
+**PLE device port**: fn_ple_gate/conv/res reproduce exp_cr_exact (f64
+Horner) and the 32-chunk rms combine instruction-for-instruction — the
+gate stream is BIT-UNCHANGED vs the host bridge (the port's design goal),
+PLE_CHECK shadow pass, mid-step flush eliminated.
+
+**Traps found (diag-first)**: WG()'s hardcoded `idx >> 25` chunk split is
+a 128MB-chunk-era relic — stack word addresses above 2^25 silently read
+the dummy w1c binding (expert >= ~150 in a 472MB stack → exact-zero
+blocks). A boundary-repair edit had dropped VkAcc::pipeline's cache
+insert — every dispatch created a fresh pipeline+DSL+pool, exhausting
+the descriptor pool at the 128-step bench; found via the new [dsc]
+miss-trace, fixed, pool budget also raised 4x. The decoder's run_pipe_b
+double-pushed ts labels (own push + run()'s tag push) — 27B decode
+attribution was scrambled into 'op?' (85ms/step blind); fixed via
+set_tag, revealing the decode is at the GEMV BW floor (the plans/79-era
+rms 21ms/quant 11ms premise was stale).
+
+**27B**: pp512 344 (llama vk 343 parity), tg 11.44 (llama 12.05).
+Remaining axes (plans/89 residue): MoE-CM nondeterminism root cause
+(+100 t/s pp at stake), QSA prefill device selection (needs a bitonic
+topk per token — the serial rank/expand kernels are decode-only), 27B
+large-t tile family (llama int-dot MMQ needs the spirv-as pipeline —
+GLSL integer-dot is unsupported by the system glslc/glslang).
