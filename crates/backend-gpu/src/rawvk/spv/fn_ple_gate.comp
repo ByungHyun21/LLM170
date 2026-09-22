@@ -1,0 +1,127 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// fn_ple_gate (plans/89 P1.4) — hip q4_ple_gate의 GLSL 포트(비트 동일 목표).
+// (토큰, 스트림)당: k_n=rms(key[s])·nk, q_n=rms(res[s])·nq → dot(오름차순 f32
+// 직렬) → /sqrt(n) → σ(±sqrt|·|)(exp_cr_exact f64 호너) → gate. gated =
+// value·gate → rms → ·nc. rms는 32청크 f32 부분합 + f64 결합(ple_rms_scale
+// 동일). 워프 lane0만 실행(hip 동일 기하) — 배리어 없음.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer ResB { float res[]; };
+layout(binding = 1) readonly buffer KeyB { float key[]; };
+layout(binding = 2) readonly buffer ValB { float value[]; };
+layout(binding = 3) readonly buffer NkB { float nk[]; };
+layout(binding = 4) readonly buffer NqB { float nq[]; };
+layout(binding = 5) readonly buffer NcB { float nc[]; };
+layout(binding = 6) buffer GatedB { float gated[]; };
+layout(binding = 7) buffer GateB { float gate_out[]; };
+layout(push_constant) uniform PC {
+    float eps; uint n_embd; uint hc; uint t;
+} pc;
+
+float exp_cr_exact(float xf) {
+    double x = double(xf);
+    if (x > 88.72) return uintBitsToFloat(0x7f800000u);
+    if (x < -103.97) return 0.0;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double INV_LN2 = 1.44269504088896338700e+00;
+    double kd = roundEven(x * INV_LN2);
+    int k = int(kd);
+    double r = fma(-kd, LN2_HI, x);
+    r = fma(-kd, LN2_LO, r);
+    double p = 1.0 / 1307674368000.0;
+    p = fma(p, r, 1.0 / 479001600.0);
+    p = fma(p, r, 1.0 / 39916800.0);
+    p = fma(p, r, 1.0 / 3628800.0);
+    p = fma(p, r, 1.0 / 362880.0);
+    p = fma(p, r, 1.0 / 40320.0);
+    p = fma(p, r, 1.0 / 5040.0);
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    if (k > 127) return uintBitsToFloat(0x7f800000u);
+    if (k < -126) return 0.0;
+    uint64_t eb = (uint64_t(k + 1023)) << 52;
+    double scale = uint64BitsToDouble(eb);
+    return float(p * scale);
+}
+
+
+float ple_rms_scale(const float x[10240]) {
+    // 호출부가 인덱스 기반으로 읽게 수정 — GLSL 배열 인수 제약으로
+    // 아래 main에서 직접 인라인한다(이 선언은 미사용).
+    return 0.0;
+}
+
+void main() {
+    int s = int(gl_WorkGroupID.x * 8u + (gl_LocalInvocationID.x >> 5u));
+    int ti = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x & 31u);
+    uint n = pc.n_embd;
+    if (s >= int(pc.hc) || ti >= int(pc.t) || lane != 0) return;
+    uint kbase = uint(ti) * pc.hc * n + uint(s) * n;
+    uint rbase = kbase;
+    float sk, sq;
+    {
+        int chunk = int(n + 31u) >> 5;
+        float parts[32];
+        for (int u = 0; u < 32; u++) {
+            float acc = 0.0;
+            int lo = u * chunk;
+            int hi = min(lo + chunk, int(n));
+            for (int i = lo; i < hi; i++) { float dv = key[kbase + uint(i)]; acc += dv * dv; }
+            parts[u] = acc;
+        }
+        double sum = 0.0;
+        for (int u = 0; u < 32; u++) sum += double(parts[u]);
+        sk = 1.0 / float(sqrt(sum / double(n) + double(pc.eps)));
+    }
+    {
+        int chunk = int(n + 31u) >> 5;
+        float parts[32];
+        for (int u = 0; u < 32; u++) {
+            float acc = 0.0;
+            int lo = u * chunk;
+            int hi = min(lo + chunk, int(n));
+            for (int i = lo; i < hi; i++) { float dv = res[rbase + uint(i)]; acc += dv * dv; }
+            parts[u] = acc;
+        }
+        double sum = 0.0;
+        for (int u = 0; u < 32; u++) sum += double(parts[u]);
+        sq = 1.0 / float(sqrt(sum / double(n) + double(pc.eps)));
+    }
+    uint nks = uint(s) * n;
+    float dotv = 0.0;
+    for (uint i = 0u; i < n; i++) {
+        float a = (key[kbase + i] * sk) * nk[nks + i];
+        float b = (res[rbase + i] * sq) * nq[nks + i];
+        dotv += a * b;
+    }
+    dotv /= sqrt(float(n));
+    float mag = max(abs(dotv), 1e-6);
+    float g = 1.0 / (1.0 + exp_cr_exact(dotv >= 0.0 ? -sqrt(mag) : sqrt(mag)));
+    gate_out[uint(ti) * pc.hc + uint(s)] = g;
+    uint vbase = uint(ti) * n;
+    for (uint i = 0u; i < n; i++) gated[kbase + i] = value[vbase + i] * g;
+    float sg;
+    {
+        int chunk = int(n + 31u) >> 5;
+        float parts[32];
+        for (int u = 0; u < 32; u++) {
+            float acc = 0.0;
+            int lo = u * chunk;
+            int hi = min(lo + chunk, int(n));
+            for (int i = lo; i < hi; i++) { float dv = gated[kbase + uint(i)]; acc += dv * dv; }
+            parts[u] = acc;
+        }
+        double sum = 0.0;
+        for (int u = 0; u < 32; u++) sum += double(parts[u]);
+        sg = 1.0 / float(sqrt(sum / double(n) + double(pc.eps)));
+    }
+    for (uint i = 0u; i < n; i++) gated[kbase + i] = gated[kbase + i] * sg * nc[nks + i];
+}
