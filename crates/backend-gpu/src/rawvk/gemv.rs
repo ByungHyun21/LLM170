@@ -97,6 +97,11 @@ const FN_MOE_TILE_Q8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q8.spv");
 const FN_MOE_TILE_Q5K_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q5k.spv");
 /// plans/89 P1.1d — MoE q5_1 coopmat 타일(q4k_cm 동일 골격).
 const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_cm.spv");
+/// plans/89 재개 — q5_1 CM 1-서브그룹 판(64스레드 — tile128v2식 서브그룹 간
+/// 경쟁 가설의 정면 검증이자 스칼라 대비 생산 후보).
+const FN_MOE_TILE_Q51_SG1_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_sg1.spv");
+/// plans/89 재개 — q4_K CM 1-서브그룹 판(엔진 결정적 — q51_sg1로 판명).
+const FN_MOE_TILE_Q4K_SG1_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_sg1.spv");
 /// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("spv/fn_ple_conv.spv");
@@ -180,8 +185,11 @@ enum Slot {
     FnMoeTileQ5k,
     /// plans/89 P1.1d — MoE q5_1 coopmat 타일.
     FnMoeTileQ51Cm,
+    /// plans/89 재개 — q5_1 CM 1-서브그룹 판(경쟁 판별·후보 생산판).
+    FnMoeTileQ51Sg1,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
+    FnMoeTileQ4kSg1,
     FnPleConv,
     FnPleRes,
     /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
@@ -349,6 +357,8 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeTileQ8 => "moe_tile_q8",
         Slot::FnMoeTileQ5k => "moe_tile_q5k",
         Slot::FnMoeTileQ51Cm => "moe_tile_q51_cm",
+        Slot::FnMoeTileQ51Sg1 => "moe_tile_q51_sg1",
+        Slot::FnMoeTileQ4kSg1 => "moe_tile_q4k_sg1",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
         Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
@@ -487,6 +497,8 @@ impl VkAcc {
             Slot::FnMoeTileQ8 => (FN_MOE_TILE_Q8_SPV, 13, 28),
             Slot::FnMoeTileQ5k => (FN_MOE_TILE_Q5K_SPV, 13, 28),
             Slot::FnMoeTileQ51Cm => (FN_MOE_TILE_Q51_CM_SPV, 13, 28),
+            Slot::FnMoeTileQ51Sg1 => (FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
+            Slot::FnMoeTileQ4kSg1 => (FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -1901,7 +1913,12 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let q4k_cm = cm_on
                 && std::env::var("LLM170_VK_Q4KCM").map(|v| v != "0").unwrap_or(true);
             let slot = match (w.ty, q4k_cm) {
+                (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG1").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1,
                 (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
+                // plans/89 재개: q51_sg1은 엔진 결정적 실측(5회 4동일+타이 1) —
+                // 기본 경로로 승격(종전 스칼라는 킬스위치 LLM170_VK_Q51SG1=0).
+                // 8sg판(q51_cm)과 q4k_sg1은 엔진 비결정 — 옵트인만.
+                (GgmlType::Q5_1, _sg) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q51SG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Sg1,
                 (GgmlType::Q5_1, _q51cm) if cm_on && std::env::var("LLM170_VK_Q51CM").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Cm,
                 (GgmlType::Q4K, _) => Slot::FnMoeTileQ4K,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
@@ -1925,7 +1942,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 std::env::var("LLM170_MTC_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32),
                 rows as u32,
             ]);
-            let (gx, gy) = if cm_on {
+            let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1) {
+                (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
+            } else if cm_on {
                 (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
             } else {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
