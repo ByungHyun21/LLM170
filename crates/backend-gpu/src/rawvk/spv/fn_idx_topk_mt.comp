@@ -1,0 +1,111 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// fn_idx_topk_mt (plans/89 재개) — 토큰별 비토닉 top-k + 목록 전개.
+// hip q4_idx_topk의 t행 판: grid (1, t), 256스레드, shared u64[4096].
+// 키 = (순서보존 score_u32 << 32) | (0xFFFFFFFF − 블록인덱스) — 내림차순
+// 정렬로 점수 내림·동점 낮은 인덱스(디코드 rank 커널 타이 규약과 동일).
+// 선택 블록 오름차순 재정렬 → 전개(블록 r행 + 테일) — qsa_sel_list와 동일
+// 구성. sel_off[tok]/[tok+1]은 산술 오프셋(호스트 무동기). nb ≤ 4096 한계
+// (초과 시 호스트 폴백 — 러스트 게이트).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Sc { float sc[]; };      // [t][nb_cap]
+layout(binding = 1) buffer Si { uint sel_idx[]; };           // 평탄 목록
+layout(binding = 2) buffer So { uint sel_off[]; };           // [t+1]
+layout(push_constant) uniform PC {
+    uint pos0; uint t; uint r; uint top_k; uint nb_cap;
+} pc;
+
+shared uint64_t sh[4096];
+shared uint sel_ids[512];
+
+// tok의 선택 블록 수·목록 오프셋(산술 — qsa_select/qsa_sel_list 동일식).
+void counts(uint tok, uint r, uint top_k, uint pos0, out uint n_sel, out uint tail_cnt, out uint off) {
+    uint n_past = pos0 + tok + 1u;
+    uint nb = n_past / r;
+    uint tail_start = nb * r;
+    tail_cnt = n_past - tail_start;
+    uint width = min(n_past, top_k + r - 1u);
+    n_sel = min((width - tail_cnt) / r, nb);
+    off = 0u;
+    for (uint u = 0u; u < tok; u++) {
+        uint np2 = pos0 + u + 1u;
+        uint nb2 = np2 / r;
+        uint tc2 = np2 - nb2 * r;
+        uint w2 = min(np2, top_k + r - 1u);
+        uint ns2 = min((w2 - tc2) / r, nb2);
+        off += ns2 * r + tc2;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint n_past = pc.pos0 + tok + 1u;
+    uint nb = n_past / pc.r;
+    uint n_sel; uint tail_cnt; uint off;
+    counts(tok, pc.r, pc.top_k, pc.pos0, n_sel, tail_cnt, off);
+    uint sbase = tok * pc.nb_cap;
+    // f32 → 순서보존 u32 + 인덱스 반전(타이: 낮은 인덱스 우선).
+    for (uint b = tid; b < nb; b += 256u) {
+        uint u = floatBitsToUint(sc[sbase + b]);
+        u = (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+        sh[b] = (uint64_t(u) << 32) | uint64_t(0xFFFFFFFFu - b);
+    }
+    uint npad = 2u;
+    while (npad < nb) npad <<= 1;
+    for (uint b = nb + tid; b < npad; b += 256u) sh[b] = 0ul;
+    barrier();
+    for (uint k = 2u; k <= npad; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            for (uint i = tid; i < npad; i += 256u) {
+                uint l = i ^ j;
+                if (l > i) {
+                    uint64_t a = sh[i];
+                    uint64_t b2 = sh[l];
+                    bool sw = ((i & k) == 0u) ? (a < b2) : (a > b2);
+                    if (sw) { sh[i] = b2; sh[l] = a; }
+                }
+            }
+            barrier();
+        }
+    }
+    // 상위 n_sel 추출(내림) → 오름차순 재정렬.
+    for (uint k2 = tid; k2 < n_sel; k2 += 256u) {
+        sel_ids[k2] = 0xFFFFFFFFu - uint(sh[k2] & 0xFFFFFFFFul);
+    }
+    uint np = 2u;
+    while (np < n_sel) np <<= 1;
+    for (uint k2 = n_sel + tid; k2 < np; k2 += 256u) sel_ids[k2] = 0xFFFFFFFFu;
+    barrier();
+    for (uint k = 2u; k <= np; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            for (uint i = tid; i < np; i += 256u) {
+                uint l = i ^ j;
+                if (l > i) {
+                    uint a = sel_ids[i];
+                    uint b2 = sel_ids[l];
+                    bool sw = ((i & k) == 0u) ? (a > b2) : (a < b2);
+                    if (sw) { sel_ids[i] = b2; sel_ids[l] = a; }
+                }
+            }
+            barrier();
+        }
+    }
+    // 전개: 블록 r행 + 테일.
+    uint tail_start = nb * pc.r;
+    for (uint k2 = tid; k2 < n_sel; k2 += 256u) {
+        uint b3 = sel_ids[k2];
+        uint o = off + k2 * pc.r;
+        for (uint j2 = 0u; j2 < pc.r; j2++) {
+            sel_idx[o + j2] = b3 * pc.r + j2;
+        }
+    }
+    for (uint j2 = tid; j2 < tail_cnt; j2 += 256u) {
+        sel_idx[off + n_sel * pc.r + j2] = tail_start + j2;
+    }
+    if (tid == 0u) {
+        sel_off[tok] = off;
+        sel_off[tok + 1u] = off + n_sel * pc.r + tail_cnt;
+    }
+}

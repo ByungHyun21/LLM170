@@ -429,6 +429,32 @@ pub trait QsaOps: Send + Sync {
         Err("qsa_sel_dev: 이 가속기는 미지원".into())
     }
 
+    /// plans/89 재개: QSA 선택의 **프리필 다중 토큰 디바이스판** — iq/ik가
+    /// 프레임 버퍼에 있을 때 (적립+블록키) → q_rope → 토큰별 점수 → 토큰별
+    /// 비토닉 top-k → 평탄 목록+sel_off까지 전부 커널. 호스트 d2h 4회
+    /// (배치 플러시)와 CPU 점수/정렬을 소거. 반환은 qsa_sel_dev 동일.
+    /// nb > 4096(문맥 ~16k+)은 Err — 호스트 폴백.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_dev_mt(
+        &self,
+        _full_idx: usize,
+        _seq: usize,
+        _iq: u64,
+        _ik: u64,
+        _t: usize,
+        _pos0: usize,
+        _idx_heads: usize,
+        _idx_dim: usize,
+        _r: usize,
+        _idx_top_k: usize,
+        _iqw: &[f32],
+        _ikw: &[f32],
+        _cs_idx: &[f32],
+        _eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        Err("qsa_sel_dev_mt: 이 가속기는 미지원".into())
+    }
+
     /// plans/73: 프리필(t>1)이 호스트 선택 후 **디바이스 idx 풀만** 갱신 — ik 청크
     /// h2d 적립 + 완성 블록의 블록키 재계산. 이후 디코드의 qsa_sel_dev가
     /// 풀을 이어 쓴다.
