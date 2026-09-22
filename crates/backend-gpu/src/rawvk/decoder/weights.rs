@@ -282,7 +282,6 @@ impl DecoderState {
         let m_bcat = ah(T_MAX * 2 * n)?;
         let m_bxq2 = ah(T_MAX * xq_2n)?;
         let m_bxqn = ah(T_MAX * xq_sn)?;
-        let m_bxqf = ah(T_MAX * xq_sf)?;
         let m_prefetched = std::sync::atomic::AtomicBool::new(false);
         let b_lg = ah(n_vocab)?;
         let b_ams = ah(512)?;   // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
@@ -490,7 +489,6 @@ impl DecoderState {
             m_bcat,
             m_bxq2,
             m_bxqn,
-            m_bxqf,
             m_prefetched,
             m_kv_k: mkk,
             m_kv_v: mvv,
