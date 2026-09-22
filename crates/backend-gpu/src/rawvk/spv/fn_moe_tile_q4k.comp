@@ -40,14 +40,16 @@ uint Wsel(uint c, uint o) {
     return w7c[o];
 }
 
-int dot4(uint a, uint b, int c) {
-    int r = c;
-    for (int i = 0; i < 4; i++) {
-        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
-        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
-        r += av * bv;
-    }
-    return r;
+// sdot4 센티넬(plans/89 재개): 이 4분해곱 사슬은 scripts/patch_sdot.py 가
+// spirv-dis 텍스트에서 OpSDot(packed i8x4) 1명령으로 치환한다 — 치환 후
+// 산술은 종전 dot4(부호있는 바이트 sext 내적)와 비트 동일. 미치환 소스는
+// 상위바이트가 무부호로 읽혀 오차(패치 필수 — 패처가 치환수 0이면 실패).
+int sdot4p(uint a, uint b) {
+    int p0 = int(a & 0xFFu) * int(b & 0xFFu);
+    int p1 = int((a >> 8) & 0xFFu) * int((b >> 8) & 0xFFu);
+    int p2 = int((a >> 16) & 0xFFu) * int((b >> 16) & 0xFFu);
+    int p3 = int(a >> 24) * int(b >> 24);
+    return (p0 + p1) + (p2 + p3);
 }
 
 // 타일 16출력행 분량 — n_in ≤ 4096 기준 16×576워드 = 36KB.
@@ -125,9 +127,9 @@ void main() {
                 int il1 = 0, il2 = 0;
                 for (int m = 0; m < 8; m++) {
                     uint y1 = xq[x1w + uint(m)];
-                    il1 += dot4(qq[m] & 0x0F0F0F0Fu, y1, 0);
+                    il1 += sdot4p(qq[m] & 0x0F0F0F0Fu, y1);
                     uint y2 = xq[x2w + uint(m)];
-                    il2 += dot4((qq[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                    il2 += sdot4p((qq[m] >> 4) & 0x0F0F0F0Fu, y2);
                 }
                 // 부동 표현식은 gemv3 계열과 동일형(2항 분리 가산 + 저장합) —
                 // hip ge형(내부 차감 단일곱)은 반올림 클래스가 갈라진다.
