@@ -66,7 +66,7 @@ impl DecoderState {
 
     /// quant: [t][n] f32 → xq (q8 레이아웃).
     pub(super) fn quant(&mut self, src: vk::Buffer, xq: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
-        let xq_w = n / 4 + n / 32 + n / 16;
+        let xq_w = crate::rawvk::gemv::xq_words(n);
         let push = Self::push_u32s(&[n as u32, t as u32, xq_w as u32]);
         self.run_pipe("quant", crate::rawvk::gemv::QUANT_SPV, 2, 12,
             &[src, xq], &push, (n / 32 + 63) as u32 / 64, t as u32, 1)
@@ -276,7 +276,7 @@ impl DecoderState {
             let xq_w = no; // 자리표시 — 아래에서 ni 기반 재계산
             let _ = xq_w;
             let ni_f = self.w.get(wkey).map(|e| e.2).unwrap_or(0);
-            let xq_wf = ni_f / 4 + ni_f / 32 + ni_f / 16;
+            let xq_wf = crate::rawvk::gemv::xq_words(ni_f);
             let fbuf = self.f16w.get(wkey).cloned().unwrap();
             let gx = (no as u32).div_ceil(128);
             for tb in (0..t).step_by(128) {
@@ -308,7 +308,7 @@ impl DecoderState {
         // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
         // 실측 pp512 11.18→17.45 t/s (+56%). 옵트인 LLM170_VK_TILE=1.
         {
-            let xq_w = ni / 4 + ni / 32 + ni / 16;
+            let xq_w = crate::rawvk::gemv::xq_words(ni);
             let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
             while binds.len() < 8 {
                 binds.push(self.dummy.buf);
@@ -469,7 +469,7 @@ impl DecoderState {
         if self.ktime || self.ctx.ts.is_some() {
             *self.kkey.borrow_mut() = Some(format!("gemv:ty{ty}:{wkey}"));
         }
-        let xq_w = ni / 4 + ni / 32 + ni / 16;
+        let xq_w = crate::rawvk::gemv::xq_words(ni);
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
             binds.push(self.dummy.buf);

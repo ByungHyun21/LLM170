@@ -275,6 +275,8 @@ struct MoeGrp {
     rows: usize,
     ids_h: u64,
     bound: usize,
+    /// off에 할당된 전문가 수(성장 가드 — 세대 무관 재사용).
+    off_n: usize,
     off: VkBuf,
     rows_pad: VkBuf,
     tilexp: VkBuf,
@@ -304,6 +306,12 @@ fn vk_ty(ty: GgmlType) -> Option<u32> {
         GgmlType::Iq3S => Some(21),
         _ => None,
     }
+}
+
+/// q8_0 양자화 활성 워드 수 — quant 커널 스트라이드(정렬 여유 포함).
+/// 복제 산식 통합(plans/90 A2): rawhip q4acc::xq_words 와 동일식.
+pub(crate) fn xq_words(n: usize) -> usize {
+    n / 4 + n / 32 + n / 16
 }
 
 /// plans/87 §2/§3 — 슬롯 → op 태그(와치독 링·ts 라벨).
@@ -588,14 +596,7 @@ impl VkAcc {
     /// 전체 스택을 혼동한다 — 값경로 프리필이 적재한 1전문가 버퍼를 프레임
     /// MoE가 오프셋 재결합하면 GPUVM PERMISSION 폴트. (ptr,len)으로 구분.
     fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
-        // plans/87 §1 — 회귀 재현 스위치: 구형 ptr 단독 키. 값경로 프리필의
-        // 전문가 뷰(1전문가분)과 전체 스택이 같은 키로 충돌해 프레임 MoE가
-        // 오프셋 재결합 → 실제 GPUVM 폴트(86 §1b 사건). 폴트 매처 검증용.
-        let key = if std::env::var("LLM170_WCACHE_PTRKEY").as_deref() == Ok("1") {
-            (w.data.as_ptr() as usize, 0)
-        } else {
-            (w.data.as_ptr() as usize, w.data.len())
-        };
+        let key = (w.data.as_ptr() as usize, w.data.len());
         crate::rawvk::context::site::scope("weight", || {
         {
             let mut wc = self.wcache.lock();
@@ -753,7 +754,7 @@ impl VkAcc {
         let xfbuf = self.xfbuf.lock().as_ref().unwrap().buf;
         let p = self.pipeline(ctx, Slot::Quant)?;
         let ds2 = ctx.bind_ds(&p, &[xfbuf, xq_buf])?;
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
         ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)
     }
@@ -891,8 +892,8 @@ impl VkAcc {
         let t = xs.len();
         let n0 = gate_w.n_in as usize; // n_embd
         let n_ff = gate_w.n_out as usize;
-        let xq0_w = n0 / 4 + n0 / 32 + n0 / 16;
-        let xq1_w = n_ff / 4 + n_ff / 32 + n_ff / 16;
+        let xq0_w = xq_words(n0);
+        let xq1_w = xq_words(n_ff);
         let mut ctx = self.ctx.lock();
         // 체인 버퍼 (고정 용량 — 모델 최대 기준)
         let (xbf, bq0, bfg, bfu, bglu, bq1, bob, xf_ptr, ob_ptr) = {
@@ -1769,7 +1770,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let mut ctx = self.ctx.lock();
         let xb = self.fbuf(x)?;
         let ob = self.fbuf(out)?;
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         // plans/89 P1.2 — ids dmmv 판이 이 호출을 가져갈 거면 xq 양자화 자체가
         // 불필요(f32 직결). 아래 조건은 ids2 분기와 동일해야 한다.
         let ids2_takes = rows > 0
@@ -1880,7 +1881,6 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 도메인, 타일=전문가, x는 perm_pad 간접 판독 — 게더 패스 불필요) +
         // inv_pad 산란. 호스트 ids 왕복·512 전문가 루프 전부 소거(B2).
         // 산술: hip ge/w_ids 열과 동일 표현식 — 프리필 클래스 재기록 대상.
-        // 강제 스위치: LLM170_MOE_TILE=0 (구 호스트 그룹화 경로).
         let tile_ok = rows > 0
             && match w.ty {
                 GgmlType::Q4K => n_in <= 4096,
@@ -1908,7 +1908,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 crate::rawvk::context::site::scope("moe_grp", || -> Result<(), String> {
                     let mut g = self.moe_grp.lock();
                     let e = g.get_or_insert_with(|| MoeGrp {
-                        generation: 0, rows: 0, ids_h: 0, bound: 0,
+                        generation: 0, rows: 0, ids_h: 0, bound: 0, off_n: 0,
                         off: vkbuf_null(), rows_pad: vkbuf_null(), tilexp: vkbuf_null(),
                         perm: vkbuf_null(), inv: vkbuf_null(), inv_pad: vkbuf_null(),
                         rowexp: vkbuf_null(), perm_pad: vkbuf_null(),
@@ -1924,8 +1924,16 @@ impl llm170_core::matmul::FrameState for VkAcc {
                         e.inv = ctx.alloc_host(rows * 4)?;
                         e.inv_pad = ctx.alloc_host(rows * 4)?;
                     }
-                    e.off = ctx.alloc_host((ne + 1) * 4)?;
-                    e.rows_pad = ctx.alloc_host(8)?;
+                    // off/rows_pad 도 bound/rows 와 동일 성장 가드 — MoeTop10가
+                    // 매 스텝 moe_gen 을 올려 !hit 이 항상 참이 되므로, 무가드
+                    // 재할당은 세대마다 구 버퍼를 누수시킨다(90 A2 실측 누수).
+                    if e.off_n < ne + 1 {
+                        e.off = ctx.alloc_host((ne + 1) * 4)?;
+                        e.off_n = ne + 1;
+                    }
+                    if e.rows_pad.bytes == 0 {
+                        e.rows_pad = ctx.alloc_host(8)?;
+                    }
                     Ok(())
                 })?;
                 let pg = self.pipeline(&mut ctx, Slot::FnMoeGroup)?;
@@ -2063,7 +2071,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
                 n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32,
-                std::env::var("LLM170_MTC_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32),
+                0u32, // mode — 실험 파생 잔여(90 A2): 프로덕션 항상 0
                 rows as u32,
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
@@ -2418,7 +2426,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     }
     fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
         let n_in = ws[0].n_in as usize;
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
         self.frame_resume_batch(&mut ctx);
         let xb = self.fbuf(x)?;
@@ -2829,7 +2837,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         if std::env::var_os("LLM170_VK_MBDBG").is_some() {
             eprintln!("[mb] ty={:?} n_in={} n_out={} t={}", w.ty, w.n_in, w.n_out, t);
         }
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
         let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
         let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
@@ -2896,7 +2904,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         }
         let n_in = ws[0].n_in as usize;
         let t = xs.len();
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
         let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
         self.quant_upload(&mut ctx, xs, n_in, xq)?;
@@ -3174,7 +3182,7 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         };
         let xrow: Vec<f32> = (0..n_in).map(|_| lcg2()).collect();
         let mut ctxg = acc.ctx.lock();
-        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+        let xq_w = xq_words(n_in);
         let xqb = ctxg.alloc_host(xq_w * 4)?;
         acc.quant_upload(&mut ctxg, std::slice::from_ref(&xrow), n_in, xqb.buf)?;
         let gpu: &[u32] =
@@ -4210,7 +4218,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     };
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
     // xq 양자화 (GPU quant — 비트 검증 완료 경로)
-    let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
+    let xq_w = xq_words(n_in);
     let msf16b = std::env::var("LLM170_TILE_MSF16B").map(|v| v=="1").unwrap_or(false);
     let mut xqb = if std::env::var_os("LLM170_TILE_BDEV").is_some() {
         ctx.alloc((t * xq_w * 4).max(t * n_in * 2))?
