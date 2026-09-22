@@ -823,11 +823,9 @@ pub(super) fn qsa_frame(
     // 6) wo 투영 — 어텐션 출력을 디바이스에서 ffn_out으로(왕복 0).
     if qtm {
         eprintln!("# qsa-frame L{il} t={t} attn={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
-        lap = std::time::Instant::now();
     }
     acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
         .map_err(Q4Error::Io)?;
-    let _ = &mut lap;
     Ok(())
 }
 
@@ -1117,7 +1115,6 @@ pub(super) fn moe_frame(
     if il == 0 {
         frame_ck(acc, f.mroute, hp.n_expert, t, "L0.mroute");
     }
-    let _ = stage_skipped("moe.route");
     if !stage_skipped("moe.top10") {
         op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
     }
