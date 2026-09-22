@@ -92,6 +92,9 @@ const TILE_Q4KMS_SPV2: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 
 /// plans/89 P1.1b — MoE 그룹 프리필 q4_K coopmat 타일(f16 스테이징).
 const FN_MOE_TILE_Q4K_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_cm.spv");
+/// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일(레거시 전문가 루프 대체).
+const FN_MOE_TILE_Q8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q8.spv");
+const FN_MOE_TILE_Q5K_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q5k.spv");
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,6 +167,9 @@ enum Slot {
     TileQ4kmsCm,
     /// plans/89 P1.1b — MoE q4_K coopmat 타일.
     FnMoeTileQ4kCm,
+    /// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일.
+    FnMoeTileQ8,
+    FnMoeTileQ5k,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -316,6 +322,8 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeGroup => "moe_group",
         Slot::FnMoeTileQ4K => "moe_tile_q4k",
         Slot::FnTileF32 => "tile_f32",
+        Slot::FnMoeTileQ8 => "moe_tile_q8",
+        Slot::FnMoeTileQ5k => "moe_tile_q5k",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
         Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
@@ -444,7 +452,9 @@ impl VkAcc {
             Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
             Slot::TileQ4k128Cm => (TILE_Q4K128_SPV2, 10, 24),
             Slot::TileQ4kmsCm => (TILE_Q4KMS_SPV2, 10, 20),
-            Slot::FnMoeTileQ4kCm => (FN_MOE_TILE_Q4K_CM_SPV, 13, 28),  // 8W+xq+yg+rowexp+rp+perm_pad
+            Slot::FnMoeTileQ4kCm => (FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
+            Slot::FnMoeTileQ8 => (FN_MOE_TILE_Q8_SPV, 13, 28),
+            Slot::FnMoeTileQ5k => (FN_MOE_TILE_Q5K_SPV, 13, 28),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -585,6 +595,9 @@ impl VkAcc {
         xq_buf: vk::Buffer,
         out_buf: vk::Buffer,
     ) -> Result<(), String> {
+        if std::env::var_os("LLM170_VK_GVDBG").is_some() {
+            eprintln!("[gv] ty={ty} n_in={n_in} n_out={n_out} t={t}");
+        }
         let (kb, gb, dbuf) = self.ensure_shared(ctx)?;
         let p = self.pipeline(ctx, Slot::Gemv)?;
         let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
@@ -1682,10 +1695,13 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 산술: hip ge/w_ids 열과 동일 표현식 — 프리필 클래스 재기록 대상.
         // 강제 스위치: LLM170_MOE_TILE=0 (구 호스트 그룹화 경로).
         let tile_ok = rows > 0
-            && std::env::var_os("LLM170_MOE_TILE").map(|v| v != "0").unwrap_or(true)
             && match w.ty {
                 GgmlType::Q4K => n_in <= 4096,
                 GgmlType::Q5_1 => n_in <= 2048,
+                // plans/89 P1.1c — q8_0/q5_K MoE 역할(UD-Q4_K_XL 혼합)도 타일로:
+                // 레거시 512-전문가 gemv3 루프([ts] gemv 1101ms/청크) 소거.
+                GgmlType::Q8_0 => n_in <= 4096,
+                GgmlType::Q5K => n_in <= 4096,
                 _ => false,
             };
         if tile_ok {
@@ -1833,10 +1849,13 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 &mut ctx,
                 if use_cm {
                     Slot::FnMoeTileQ4kCm
-                } else if w.ty == GgmlType::Q4K {
-                    Slot::FnMoeTileQ4K
                 } else {
-                    Slot::FnMoeTileQ51
+                    match w.ty {
+                        GgmlType::Q4K => Slot::FnMoeTileQ4K,
+                        GgmlType::Q5_1 => Slot::FnMoeTileQ51,
+                        GgmlType::Q8_0 => Slot::FnMoeTileQ8,
+                        _ => Slot::FnMoeTileQ5k,
+                    }
                 },
             )?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -3140,6 +3159,7 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
     acc.frame_write(xh, &flat)?;
     acc.frame_begin(t);
     acc.frame_mm_group(xh, std::slice::from_ref(&w), std::slice::from_ref(&oh), t)?;
+
     let mut got = vec![0f32; t * n_out];
     acc.frame_read(oh, &mut got)?;
     let _ = acc.frame_free(xh);
@@ -3163,8 +3183,8 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
     }
     // 혼합 그룹(q8 down + f32 inject, n_out=4 극단 shape) — 실엔진 hc 믹스.
     let wd = model.w4("blk.0.hc_attn_down.weight").map_err(|e| e.to_string())?;
-    let wi = model.w4("blk.0.hc_attn_inject.weight").map_err(|e| e.to_string())?;
     let n2 = wd.n_in as usize;
+    let wi = model.w4("blk.0.hc_attn_inject.weight").map_err(|e| e.to_string())?;
     let xs2: Vec<Vec<f32>> = (0..t).map(|_| (0..n2).map(|_| lcgf()).collect()).collect();
     let mut flat2 = Vec::with_capacity(t * n2);
     for r in &xs2 {
@@ -3201,6 +3221,110 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
         if bad == 0 { "★" } else { "✗" },
         wi.n_out, wi.n_in,
         if bad2 == 0 { "★" } else { "✗" }
+    ))
+}
+
+/// vk-moe-tile-check <mode> (plans/89 P1.1c) — q8_0/q5_K MoE 타일의 CPU 대조.
+/// 모드("q8_0"|"q5_K")에 해당하는 첫 레이어의 down/gate 스택 텐서로 검증.
+pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
+    use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
+    let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let want = match mode {
+        "q8_0" => llm170_gguf::GgmlType::Q8_0,
+        "q5_K" => llm170_gguf::GgmlType::Q5K,
+        _ => return Ok("moe-tile-check: 모드 q8_0|q5_K".into()),
+    };
+    // 해당 타입의 첫 스택 탐색(down 우선, q5_K는 gate/up에만 존재).
+    let mut found = None;
+    let names = if mode == "q5_K" {
+        vec!["ffn_gate_exps", "ffn_up_exps"]
+    } else {
+        vec!["ffn_down_exps", "ffn_gate_exps"]
+    };
+    for il in 0..48 {
+        for nm in &names {
+            if let Ok(w) = model.w4(&format!("blk.{il}.{nm}.weight")) {
+                if w.ty == want {
+                    found = Some((il, w));
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let (il, wd) = found.ok_or("해당 타입 스택 없음")?;
+    let ne = 512usize;
+    let n_in_d = wd.n_in as usize;
+    let n_out_d = wd.n_out as usize / ne;
+    let acc = VkAcc::new()?;
+    let t = 130usize;                       // rows=1300 > 64 → 타일 경로 강제
+    let k = 10usize;
+    let mut lcg = 987654321u64;
+    let mut lcgf = || {
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((lcg >> 33) as f32 / 4294967296.0) - 0.5
+    };
+    let route: Vec<f32> = (0..ne).map(|_| lcgf() * 4.0).collect();
+    let xs: Vec<Vec<f32>> = (0..t * k).map(|_| (0..n_in_d).map(|_| lcgf()).collect()).collect();
+    let rh = acc.frame_alloc(ne)?;
+    let idh = acc.frame_alloc(t * k)?;
+    let wth = acc.frame_alloc(t * k)?;
+    let mxh = acc.frame_alloc(t * k * n_in_d)?;
+    let mgh = acc.frame_alloc(t * k * n_out_d)?;
+    acc.frame_write(rh, &route)?;
+    let mut flat = Vec::with_capacity(t * k * n_in_d);
+    for row in &xs {
+        flat.extend_from_slice(row);
+    }
+    acc.frame_write(mxh, &flat)?;
+    acc.frame_begin(t);
+    acc.frame_op(&llm170_core::matmul::FrameOp::MoeTop10 { route: rh, ids: idh, wt: wth, n_exp: ne, k_sel: k })?;
+    let mut ids_g = vec![0u32; t * k];
+    {
+        acc.frame_sync();
+        let g = acc_frame_ptr(&acc, idh);
+        unsafe { std::ptr::copy_nonoverlapping(g as *const u32, ids_g.as_mut_ptr(), t * k) };
+    }
+    acc.frame_moe_gemm(mxh, &wd, idh, mgh, ne, k)?;
+    acc.frame_begin(t);
+    let mut got = vec![0f32; t * k * n_out_d];
+    acc.frame_read(mgh, &mut got)?;
+    for h in [rh, idh, wth, mxh, mgh] {
+        let _ = acc.frame_free(h);
+    }
+    // CPU 참조 — ids 순행, 전expert 행 디양자화 내적.
+    let m = route.iter().cloned().fold(f32::MIN, f32::max);
+    let ps: Vec<f32> = route.iter().map(|&v| (v - m).exp()).collect();
+    let mut idx: Vec<usize> = (0..ne).collect();
+    idx.sort_by(|&a, &b| ps[b].partial_cmp(&ps[a]).unwrap().then(a.cmp(&b)));
+    let sel: Vec<usize> = idx[..k].to_vec();
+    let mut mx = 0f64;
+    let mut bad = 0usize;
+    let mut ref_row = vec![0f32; n_in_d];
+    let mut checked = 0usize;
+    for (r, &e) in sel.iter().enumerate() {
+        if ids_g[r] as usize != e {
+            mx = mx.max(1.0);
+        }
+        for j in 0..n_out_d.min(6) {
+            llm170_core::quant::dequant_row(wd.ty, wd.data, (e * n_out_d + j) as u64, n_in_d as u64, &mut ref_row);
+            let dot: f32 = ref_row.iter().zip(xs[r].iter()).map(|(a, b)| a * b).sum();
+            let d = (got[r * n_out_d + j] as f64 - dot as f64).abs();
+            if d > 2e-2 {
+                bad += 1;
+            }
+            mx = mx.max(d);
+            checked += 1;
+        }
+    }
+    Ok(format!(
+        "moe-tile-check({mode} blk.{il} down {n_out_d}x{n_in_d}, rows={}): max|D|={mx:.3e} bad={bad}/{checked} {}",
+        t * k,
+        if bad == 0 { "★" } else { "✗" }
     ))
 }
 
