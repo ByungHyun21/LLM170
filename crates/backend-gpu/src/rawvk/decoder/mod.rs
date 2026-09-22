@@ -245,7 +245,6 @@ pub struct DecoderState {
     m_bcat: VkBuf,  // [T][2n] enorm‖hnorm
     m_bxq2: VkBuf,  // [T][xq(2n)]
     m_bxqn: VkBuf,  // [T][xq(n)]
-    m_bxqf: VkBuf,  // [T][xq(n_ff)]
     m_prefetched: std::sync::atomic::AtomicBool,
     // ── plans/91 P0 — np 배치: 상태 주소 테이블([그룹][슬롯] u64, 생성 후
     // 불변)·행별 pos/slot 맵(스텝당 호스트 기입)·greedy 행별 argmax 스크래치.
@@ -527,6 +526,11 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         Ok(())
     }
 
+    /// per-seq GDN/conv 복원 (np×spec 부분수용).
+    fn gdn_restore_seq(&self, seq: usize, _n_seqs: usize) -> Result<(), String> {
+        let mut guard = self.st.lock().map_err(|e| e.to_string())?;
+        guard.as_mut().ok_or("vkdecoder: 미초기화")?.restore_seq_states(seq)
+    }
     /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백).
     fn gdn_snapshot(&self) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;

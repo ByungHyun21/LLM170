@@ -337,4 +337,28 @@ impl DecoderState {
         }
         Ok(())
     }
+
+    /// per-seq 복원 (np×spec 부분수용) — 해당 슬롯 행만. rawhip
+    /// gdn_restore_seq 대칭(스냅샷 레이아웃 [r][s] 동일).
+    pub(super) fn restore_seq_states(&mut self, seq: usize) -> Result<(), String> {
+        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ctx.end_batch_wait()?;
+        }
+        let gl = self.dt_rank * self.d_state * self.d_state;
+        let cl = (self.conv_k - 1) * self.conv_ch;
+        for (r, rows) in self.st_gdn.iter().enumerate() {
+            let stride = rows.len();
+            if seq < stride {
+                let snap = self.snap_gdn[r * stride + seq].clone();
+                if snap.len() == gl {
+                    unsafe { std::ptr::copy_nonoverlapping(snap.as_ptr(), rows[seq].ptr as *mut f32, gl) };
+                }
+                let snapc = self.snap_conv[r * stride + seq].clone();
+                if snapc.len() == cl {
+                    unsafe { std::ptr::copy_nonoverlapping(snapc.as_ptr(), self.st_conv[r][seq].ptr as *mut f32, cl) };
+                }
+            }
+        }
+        Ok(())
+    }
 }
