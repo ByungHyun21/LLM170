@@ -96,7 +96,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 // WG 청크 수정으로 llama 패리티 확보(19f68bc). VkAcc 복원:
                 // LLM170_VK_ACC=1.
                 if std::env::var_os("LLM170_VK_ACC").is_some() {
-                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                         Ok(acc) => {
                             eng = eng.with_acc(std::sync::Arc::new(acc));
                             eprintln!("# backend: gpu (vulkan VkAcc)");

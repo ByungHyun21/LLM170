@@ -14,7 +14,7 @@ pub use rawhip::q4acc::new_acc_with_sources as new_q4_acc_with_sources;
 pub fn new_q4_acc_vk_with_sources(
     parts: Vec<(usize, usize, std::path::PathBuf)>,
 ) -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
-    let acc = rawvk::gemv::VkAcc::new_with_sources(parts)?;
+    let acc = rawvk::vkacc::VkAcc::new_with_sources(parts)?;
     Ok(std::sync::Arc::new(acc))
 }
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};

@@ -204,9 +204,9 @@ impl DecoderState {
             st_conv.push(cv);
         }
 
-        let xq_sn = crate::rawvk::gemv::xq_words(n);
-        let xq_sf = crate::rawvk::gemv::xq_words(hp.n_ff);
-        let xq_sg = crate::rawvk::gemv::xq_words(hp.d_inner);
+        let xq_sn = crate::rawvk::vkacc::xq_words(n);
+        let xq_sf = crate::rawvk::vkacc::xq_words(hp.n_ff);
+        let xq_sg = crate::rawvk::vkacc::xq_words(hp.d_inner);
         let max_ssbo0 = ctx.max_ssbo;
         let (b_xs, b_xn, b_xq_n, b_xq_f, b_xq_g, b_gqkv, b_gconv, b_gq, b_gk, b_gv,
              b_gb, b_ga, b_gbg, b_gz, b_go, b_ggated, b_aq, b_ak, b_av, b_aout,
@@ -242,7 +242,7 @@ impl DecoderState {
                 mvv.push(v);
             }
         }
-        let xq_2n = crate::rawvk::gemv::xq_words(2 * n);
+        let xq_2n = crate::rawvk::vkacc::xq_words(2 * n);
         let mut ah = |sz: usize| -> Result<VkBuf, String> {
             ctx.alloc_host(sz.max(1) * 4).map_err(|e| e.to_string())
         };

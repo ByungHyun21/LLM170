@@ -252,7 +252,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             if gpu_runtime == "vulkan" {
                 // plans/29: VkDecoder 기본 (VkAcc는 LLM170_VK_ACC=1로 복원).
                 if std::env::var_os("LLM170_VK_ACC").is_some() {
-                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                         Ok(acc) => {
                             eng = eng.with_acc(std::sync::Arc::new(acc));
                             eprintln!("# backend: gpu (vulkan VkAcc)");
