@@ -83,6 +83,12 @@ const FN_MOE_IDS51_SPV: &[u8] = include_bytes!("spv/fn_moe_ids51.spv");
 
 /// plans/89 P1.2 — f32/BF16 밀집 프리필 타일(fn_mm_f32 가중 t-재판독 소거).
 const FN_TILE_F32_SPV: &[u8] = include_bytes!("spv/fn_tile_f32.spv");
+/// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
+/// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
+const TILE_Q8128_SPV2: &[u8] = include_bytes!("spv/tile_q8128.spv");
+const TILE_Q8MS_SPV2: &[u8] = include_bytes!("spv/tile_q8ms.spv");
+const TILE_Q4K128_SPV2: &[u8] = include_bytes!("spv/tile_q4k128.spv");
+const TILE_Q4KMS_SPV2: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
@@ -149,6 +155,11 @@ enum Slot {
     FnMoeIds51,
     /// plans/89 P1.2 — f32/BF16 밀집 프리필 타일.
     FnTileF32,
+    /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder 판 재사용).
+    TileQ8128Cm,
+    TileQ8msCm,
+    TileQ4k128Cm,
+    TileQ4kmsCm,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -290,6 +301,10 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::Gemv8Q8B => "gemv8_q8b",
         Slot::Gemv8Q4B => "gemv8_q4b",
         Slot::MmF32b => "mm_f32b",
+        Slot::TileQ8128Cm => "tile_q8128",
+        Slot::TileQ8msCm => "tile_q8ms",
+        Slot::TileQ4k128Cm => "tile_q4k128",
+        Slot::TileQ4kmsCm => "tile_q4kms",
         Slot::FnMoeIds => "moe_ids",
         Slot::FnMmf32 => "mm_f32",
         Slot::FnMoeIds2 => "moe_ids2",
@@ -420,6 +435,10 @@ impl VkAcc {
             Slot::FnMoeTileQ51 => (FN_MOE_TILE_Q51_SPV, 13, 28),  // +mode+rows
             Slot::FnTileQ8 => (FN_TILE_Q8_SPV, 10, 20),  // 8W+xq+out
             Slot::FnTileF32 => (FN_TILE_F32_SPV, 10, 20),    // 8W+x(f32)+out
+            Slot::TileQ8128Cm => (TILE_Q8128_SPV2, 10, 24),
+            Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
+            Slot::TileQ4k128Cm => (TILE_Q4K128_SPV2, 10, 24),
+            Slot::TileQ4kmsCm => (TILE_Q4KMS_SPV2, 10, 20),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -2257,6 +2276,36 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         }
                         binds.push(xq);
                         binds.push(ob);
+                        // plans/89 P1.1 — coopmat 타일 우선(q8_0/q4_K 밀집):
+                        // decoder ms/128 패밀리(f16 coopMatMulAdd) 직접 재사용.
+                        // 스칼라 K-슬라이스 타일은 ALU 바운드([ts] tile_q8
+                        // 2818ms/청크). 킬스위치 LLM170_VK_CM=0.
+                        if std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+                            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
+                            && wbufs.len() == 1
+                        {
+                            let big = t >= 128;
+                            let slot = match (w.ty, big) {
+                                (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,
+                                (GgmlType::Q8_0, false) => Slot::TileQ8msCm,
+                                (_, true) => Slot::TileQ4k128Cm,
+                                (_, false) => Slot::TileQ4kmsCm,
+                            };
+                            let step = if big { 128usize } else { 64 };
+                            let p = self.pipeline(&mut ctx, slot)?;
+                            let ds2 = ctx.bind_ds(&p, &binds)?;
+                            let gx = (n_out as u32).div_ceil(64);
+                            for tb in (0..t).step_by(step) {
+                                let nt = (t - tb).min(step) as u32;
+                                let push = if big {
+                                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, 0, tb as u32])
+                                } else {
+                                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32])
+                                };
+                                ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
+                            }
+                            continue;
+                        }
                         match w.ty {
                             GgmlType::Q8_0 => {
                                 let p = self.pipeline(&mut ctx, Slot::FnTileQ8)?;
