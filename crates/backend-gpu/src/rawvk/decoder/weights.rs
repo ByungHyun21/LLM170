@@ -275,6 +275,15 @@ impl DecoderState {
         let m_cur = ah(n)?;
         let m_xq = ah(xq_sn)?;
         let m_h = ah(n)?;
+        // plans/91 P2 — MTP 프리필 배치 버퍼 (T_MAX행).
+        let m_be = ah(T_MAX * n)?;
+        let m_bcur = ah(T_MAX * n)?;
+        let m_bhs = ah(T_MAX * n)?;
+        let m_bcat = ah(T_MAX * 2 * n)?;
+        let m_bxq2 = ah(T_MAX * xq_2n)?;
+        let m_bxqn = ah(T_MAX * xq_sn)?;
+        let m_bxqf = ah(T_MAX * xq_sf)?;
+        let m_prefetched = std::sync::atomic::AtomicBool::new(false);
         let b_lg = ah(n_vocab)?;
         let b_ams = ah(512)?;   // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
         let b_xf16 = ah(T_MAX * n * 2)?;   // f16-B 활성 (plans/46, 요소수 T_MAX*n)
@@ -475,6 +484,14 @@ impl DecoderState {
             m_cur,
             m_xq,
             m_h,
+            m_be,
+            m_bcur,
+            m_bhs,
+            m_bcat,
+            m_bxq2,
+            m_bxqn,
+            m_bxqf,
+            m_prefetched,
             m_kv_k: mkk,
             m_kv_v: mvv,
             snap_gdn: vec![Vec::new(); n_recr * n_seqs],
