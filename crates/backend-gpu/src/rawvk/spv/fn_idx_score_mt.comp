@@ -1,0 +1,34 @@
+#version 450
+
+// fn_idx_score_mt (plans/89 재개 — QSA 프리필 디바이스 선택) — 다중 토큰
+// 블록 점수. fn_idx_score의 t행 판: grid (⌈nb_max/256⌉, t), 스레드=블록.
+// 토큰 tok는 자신의 nb_tok=(pos0+tok+1)/r 까지만 점수화(이후 블록은 상위
+// topk에서 배제 — 청크 말 풀 갱신과 정합). 점수 = Σ_h relu(qr·bk) —
+// 기존 fn_idx_score와 동일 산식.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Qr { float qr[]; };      // [t][heads·dim]
+layout(binding = 1) readonly buffer Bk { float bk[]; };      // [nb_cap][dim]
+layout(binding = 2) buffer Sc { float sc[]; };               // [t][nb_cap]
+layout(push_constant) uniform PC {
+    uint pos0; uint r; uint heads; uint dim; uint nb_cap;
+} pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint n_past = pc.pos0 + tok + 1u;
+    uint nb_tok = n_past / pc.r;
+    if (b >= nb_tok) return;
+    uint qbase = tok * pc.heads * pc.dim;
+    uint bbase = b * pc.dim;
+    float acc = 0.0;
+    for (uint h = 0u; h < pc.heads; h++) {
+        float d = 0.0;
+        uint qb = qbase + h * pc.dim;
+        for (uint i = 0u; i < pc.dim; i++) {
+            d += qr[qb + i] * bk[bbase + i];
+        }
+        if (d > 0.0) acc += d;
+    }
+    sc[tok * pc.nb_cap + b] = acc;
+}
