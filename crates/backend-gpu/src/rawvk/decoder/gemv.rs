@@ -39,11 +39,7 @@ impl DecoderState {
             }
         }
         self.ctx.nobar_next.set(!bar);
-        if let Some(ts) = &self.ctx.ts
-            && ts.n.get() + 2 <= 8192 {
-                let key = self.kkey.borrow_mut().take().unwrap_or_else(|| name.to_string());
-                ts.labels.borrow_mut().push(key);
-            }
+        crate::rawvk::context::site::set_tag(name);
         let p = *self.pipe(name, spv, n_buf, pb)?;
         let ds = self.ctx.bind_ds(&p, bufs)?;
         let r = self.ctx.run(p.pl, ds, p.pipe, push, gx, gy, gz);
