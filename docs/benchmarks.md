@@ -1109,9 +1109,9 @@ Solo, greedy, same conditions as the tables above. Default-path numbers
 
 | cell | plans/88 close | plans/89 | ratio |
 |---|---|---|---|
-| pp512 (ctx 20480) | 60.1 | **103.6** | 1.72x |
-| pp4096 (ctx 20480) | 54.7 | **95.0** | 1.74x |
-| tg128@8k | 7.15 | **15.1** | 2.11x |
+| pp512 (ctx 20480) | 60.1 | **131.8** | 2.19x |
+| pp4096 (ctx 20480) | 54.7 | **121.6** | 2.22x |
+| tg128@8k | 7.15 | **15.2** | 2.13x |
 
 With the MoE coopmat tiles opted in (`LLM170_VK_MOECM=1 LLM170_VK_Q51CM=1`)
 pp512 reaches **205 t/s** — but an engine-context-only intermittent

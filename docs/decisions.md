@@ -1544,3 +1544,15 @@ conditions. Isolated harnesses (engine-pattern 3-GEMM x N layers, t-sweep
 bound) are all deterministic — no reproduction outside the full graph.
 Default stays OFF (deterministic greedy outranks +100 t/s). Toolkit:
 vk-moe-cm-race, LLM170_MTC_IL, LLM170_VK_Q4KCM/Q51CM split knobs.
+
+### (32c) MoE coopmat nondeterminism resolved to shape: sg1 stable (plans/89, 2026-09-23b)
+
+The 1-subgroup (64-thread) q5_1 tile is engine-stable — 8/8 gate runs
+bit-identical to the SCALAR baseline stream (argmax absorbs the f16
+rounding; no re-record required) — while the 8-sg q51_cm and both q4_K
+variants (8-sg and 1-sg) stay nondeterministic in-engine (4-6 runs, all
+distinct, degenerate loops included). The race is subgroup-scheduling
+shape-dependent (tile128v2 precedent): q51_sg1's short K loop (n_sub=20)
+with 1 MMA chain is stable; q4k's 40-iteration loop is not, even at 1 sg.
+Shipped: q5_1 down -> sg1 default (LLM170_VK_Q51SG1=0 kill switch); q4_K
+scalar default. FN vk pp512 102.8 -> 131.8, pp4096 95.0 -> 121.6.

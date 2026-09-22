@@ -27,7 +27,7 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 c
 
 Vulkan qwen4exp runs a device-resident frame pipeline (plans/86-89):
 prefill + decode on device, llama-dmmv decode GEMV family, coopmat dense
-prefill tiles, device MoE tiles, PLE math on device (bit-identical to
+prefill tiles, device MoE tiles (q5_1 down coopmat sg1), PLE math on device (bit-identical to
 host), step-level batching, pread-staged weight uploads. Kill switch
 `LLM170_VK_FRAME=0`; MoE coopmat tiles opt-in `LLM170_VK_MOECM=1`
 (nondeterminism under investigation — see docs/decisions.md (32)).
@@ -36,12 +36,12 @@ host), step-level batching, pread-staged weight uploads. Kill switch
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
-| LLM170 vulkan (frame) | 103.6 (205*) | 95.0 | — | 15.1 |
+| LLM170 vulkan (frame) | 131.8 | 121.6 | — | 15.2 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
-*205 = MoE coopmat tiles opted in (`LLM170_VK_MOECM=1 LLM170_VK_Q51CM=1`);
-default path is 103.6 pending a nondeterminism root cause.
+Opt-in `LLM170_VK_MOECM=1` reaches 205 pp512 (subgroup-scheduling
+nondeterminism on this RADV build — see docs/decisions.md (32c)).
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
