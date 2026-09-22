@@ -164,7 +164,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 };
                 if blk != 0 {
                     let idb = self.fbuf(ids)?;
-                    let per_expert = w.data.len() / ne;
+                    // ne 는 호출부에서 max(1) 보장 — 0이면 계약 위반 데이터.
+                    let per_expert = w.data.len().checked_div(ne).expect("moe: ne=0");
                     let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
                     let p = self.pipeline(&mut ctx, slot)?;
                     let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -180,7 +181,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                         n_in as u32,
                         n_out as u32,
                         rows as u32,
-                        (per_expert / blk) as u32,
+                        per_expert.checked_div(blk).expect("moe: blk=0") as u32,
                         0,
                         2,
                     ]);

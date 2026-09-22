@@ -59,8 +59,9 @@ pub fn fp_record(stage: &str, data: &[f32]) {
             first_nonfinite = Some(i);
         }
     }
-    if let Ok(mut guard) = writer().lock() {
-        if let Some(f) = guard.as_mut() {
+    if let Ok(mut guard) = writer().lock()
+        && let Some(f) = guard.as_mut()
+    {
             let _ = writeln!(
                 f,
                 "{stage}\t{hash:016x}\t{max_abs:.6e}\t{}",
@@ -76,7 +77,6 @@ pub fn fp_record(stage: &str, data: &[f32]) {
                 }
             }
         }
-    }
 }
 
 /// 두 지문 파일 비교 — 최초 불일치 스테이지 반환.

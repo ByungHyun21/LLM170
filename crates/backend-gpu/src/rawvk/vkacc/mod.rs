@@ -544,7 +544,7 @@ impl VkAcc {
                     let n = ch.min(total - off);
                     let mut b = ctx.alloc(n)?;
                     let r = match src {
-                        Some((s, o)) => crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n),
+                        Some((s, o)) => unsafe { crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n) },
                         None => unsafe {
                             std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
                             Ok(())

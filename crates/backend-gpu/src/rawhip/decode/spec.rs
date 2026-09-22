@@ -39,7 +39,7 @@ impl DecodeState {
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
             self.ctx.mmq_y_bump();  // 부록81: xn_t 재기 → quant_y 캐시 무효화
-        let xq_sn = n / 4 + n / 32 + n / 16;
+        let xq_sn = crate::rawhip::q4acc::xq_words(n);
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
         if env_on("LLM170_SPEC_TIMING") {
@@ -182,7 +182,7 @@ impl DecodeState {
             let mut we2 = vec![0u32; 64];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut we2).as_mut(), unsafe { we.add(off_end) })?;
             std::fs::write(format!("{pref}.wend.u32"), bytemuck::cast_slice(&we2)).map_err(|e| e.to_string())?;
-            let xq_words = 2 * n / 4 + 2 * n / 32 + 2 * n / 16;
+            let xq_words = crate::rawhip::q4acc::xq_words(2 * n);
             let mut xv = vec![0u32; xq_words];
             self.ctx.d2h(bytemuck::cast_slice_mut(&mut xv).as_mut(), self.mtp_xq2)?;
             std::fs::write(format!("{pref}.xq.u32"), bytemuck::cast_slice(&xv)).map_err(|e| e.to_string())?;
@@ -327,11 +327,11 @@ impl DecodeState {
         if t == 0 || t > self.t_max_mtp {
             return Err(format!("mtp_prefill_batch: t={t} 범위 밖"));
         }
-        let xq2_w = 2 * n / 4 + 2 * n / 32 + 2 * n / 16;
-        let xq_n = n / 4 + n / 32 + n / 16;
-        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
+        let xq2_w = crate::rawhip::q4acc::xq_words(2 * n);
+        let xq_n = crate::rawhip::q4acc::xq_words(n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(self.n_ff);
         let n_ao = n_head * hd; // attn_output 입력 길이
-        let xq_sg = n_ao / 4 + n_ao / 32 + n_ao / 16;
+        let xq_sg = crate::rawhip::q4acc::xq_words(n_ao);
         let mask = self.consts.get("mask").copied().ok_or("mask")?;
         let t_mtp = std::time::Instant::now();
         let mtp_time = env_on("LLM170_MTP_TIMING");
@@ -652,9 +652,9 @@ impl DecodeState {
         let k_len = self.k_len;
         let v_len = self.v_len;
         let d_inner = self.d_inner;
-        let xq_sn = n / 4 + n / 32 + n / 16;
-        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
-        let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
+        let xq_sn = crate::rawhip::q4acc::xq_words(n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(self.n_ff);
+        let xq_sg = crate::rawhip::q4acc::xq_words(d_inner);
 
         // 행 메타데이터 (호스트 조립 → 소형 업로드)
         let mut row_seq = vec![0i32; t];

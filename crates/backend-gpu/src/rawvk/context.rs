@@ -136,8 +136,7 @@ impl VkCtx {
             // 하드웨어 v_dot4_i32_i8) 지원. Vulkan 1.3 코어 기능 — 쿼리해 지원
             // 시에만 활성(미지원 장치 생성 실패 방지, coop 패턴과 동일).
             let mut v13sup = vk::PhysicalDeviceVulkan13Features::default();
-            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13sup);
-            let _ = instance.get_physical_device_features2(physical, &mut f2);
+            let _f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13sup);
             let idot = v13sup.shader_integer_dot_product != 0;
 
             let qfams = instance.get_physical_device_queue_family_properties(physical);
@@ -1058,7 +1057,7 @@ thread_local! {
             }
             let n = DSC_MISS.with(|c| c.replace(c.get() + 1));
             if std::env::var_os("LLM170_VK_DSC").is_some() {
-                if n % 8192 == 0 {
+                if n.is_multiple_of(8192) {
                     eprintln!("[dsc] miss #{} cache {}", n, self.ds_cache.borrow().len());
                 }
                 if (200..260).contains(&n) {

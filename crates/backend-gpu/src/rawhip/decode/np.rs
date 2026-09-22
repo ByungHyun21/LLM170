@@ -45,9 +45,9 @@ impl DecodeState {
         // q/k 행 = n_group·d_state, v 행 = dt_rank·d_state(=d_inner).
         let (conv_ch, k_len, v_len) = (self.conv_ch, self.k_len, self.v_len);
         let d_inner = self.d_inner;
-        let xq_sn = n / 4 + n / 32 + n / 16;
-        let xq_sf = self.n_ff / 4 + self.n_ff / 32 + self.n_ff / 16;
-        let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
+        let xq_sn = crate::rawhip::q4acc::xq_words(n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(self.n_ff);
+        let xq_sg = crate::rawhip::q4acc::xq_words(d_inner);
         self.ctx.h2d(self.xs_t, bytemuck::cast_slice(emb))?;
         // _ms 커널(conv) 행 메타 — 행별 그룹 크기 1 (plans/74 N3).
         if t > 1 {

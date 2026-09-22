@@ -145,7 +145,7 @@ pub(crate) fn attn_layer(
                 let mut attn_out = std::mem::take(&mut attn_all[row]);
                 let dbg3 = il == 3 && t == 0 && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
                 if dbg3 {
-                    crate::qwen35::diag::a3_cache(pos as usize, pos as usize * n_kv * hd, &cache_k, &cache_v, &qg[row], hd);
+                    crate::qwen35::diag::a3_cache(pos as usize, pos as usize * n_kv * hd, cache_k, cache_v, &qg[row], hd);
                 }
                 for h in 0..n_head {
                     let src = qg[row][h * 2 * hd..h * 2 * hd + hd].to_vec();
@@ -154,7 +154,7 @@ pub(crate) fn attn_layer(
                     let kvh = h / (n_head / n_kv);
                     let ob = h * hd;
                     let gb = h * 2 * hd + hd;
-                    attn_head(&qh, &qg[row][gb..gb + hd], &cache_k, &cache_v, pos as usize + 1, kvh, n_kv, hd, kq_scale, &mut attn_out[ob..ob + hd]);
+                    attn_head(&qh, &qg[row][gb..gb + hd], cache_k, cache_v, pos as usize + 1, kvh, n_kv, hd, kq_scale, &mut attn_out[ob..ob + hd]);
                     if dbg3 && h == 0 {
                         eprintln!("  A3dbg h0 attn_out[0..4]={:?}", &attn_out[0..4]);
                     }

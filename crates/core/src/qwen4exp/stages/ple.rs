@@ -141,8 +141,8 @@ use llm170_diag::profile_span;
                     for ((i, out), gout) in head.iter_mut().enumerate().zip(ghead.iter_mut()) {
                         let ti = b + i;
             // grouped norm key / query — 감마는 전체 [hc_dim] 폭
-            let k_n = super::hc::grouped_rms(&key[ti], &n_key, hc, n_embd, hp.eps);
-            let q_n = super::hc::grouped_rms(&res_hc_v[ti], &n_query, hc, n_embd, hp.eps);
+            let k_n = super::hc::grouped_rms(&key[ti], n_key, hc, n_embd, hp.eps);
+            let q_n = super::hc::grouped_rms(&res_hc_v[ti], n_query, hc, n_embd, hp.eps);
             // per-stream s = Σ key·query / √n_embd → sigmoid(sgn·√|s|)
             let mut gate = vec![0.0f32; hc];
             for s in 0..hc {
@@ -161,7 +161,7 @@ use llm170_diag::profile_span;
                     gated[s * n_embd + i] = value[ti][i] * gate[s];
                 }
             }
-            let normalized = super::hc::grouped_rms(&gated, &n_conv, hc, n_embd, hp.eps);
+            let normalized = super::hc::grouped_rms(&gated, n_conv, hc, n_embd, hp.eps);
                         *gout = gate;
                         *out = normalized;
                     }
