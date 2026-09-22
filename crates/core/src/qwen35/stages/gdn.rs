@@ -4,7 +4,7 @@
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
 use crate::matmul::{mm_batch, mm_group};
-use crate::ops::{l2_norm, rms_norm, silu, softplus, sigmoid};
+use crate::ops::{l2_norm, silu, softplus, sigmoid};
 use llm170_diag::profile_span;
 
     /// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.
@@ -264,17 +264,18 @@ pub(crate) fn gdn_layer(
         // norm_gated: rms_norm(core)·silu(z) per head → ssm_out (GPU 경로가 이미 채움)
         if !gpu_done {
             profile_span!("cpu::gdn_normgated");
-            for t in 0..n_tok {
-                for h in 0..dt_rank {
-                    let b0 = t * v_len + h * d_state;
-                    let head: Vec<f32> = o_all[b0..b0 + d_state].to_vec();
-                    let n = rms_norm(&head, &ssm_norm_w, hp.eps);
-                    let zb = h * d_state;
-                    for i in 0..d_state {
-                        gated[t][zb + i] = n[i] * silu(z[t][zb + i]);
-                    }
-                }
-            }
+            crate::gdn_norm::gdn_norm_gated(
+                crate::gdn_norm::GdnGate::Silu,
+                &o_all,
+                &z,
+                &ssm_norm_w,
+                hp.eps,
+                n_tok,
+                dt_rank,
+                d_state,
+                v_len,
+                &mut gated,
+            );
         }
         if dbg0 {
             let mg = gated
