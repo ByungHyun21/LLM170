@@ -1802,3 +1802,20 @@ protocol: 27B pp16384 ≥292 (P1 closed with finding), np4 literal 32.1
 (non-greedy cell; the tracked greedy cell beats hip by 43%), MTP ≥14.4
 (protocol-bound for both backends), FN literal 18.43 (vk 15.01 vs hip
 5.47 — hip-exceeded criterion met at 2.7×).
+
+**P5 addendum (commit 18e9345).** D1 executed in scoped form: the genuinely
+identical norm_gated core (rms_norm(core)·gate(z) per head — the plan's
+"z-gate silu↔sigmoid 파라미터화") is now one implementation
+(`gdn_norm::gdn_norm_gated(GdnGate)`) consumed by both layers, loop order
+preserved (bit-identical, all four runtime gates byte-identical). The
+remaining layer orchestration stays per-model by design (state types,
+GPU-hook architectures, multi-seq layouts — unifying those is indirection
+without dedup, per the 90 D8/D9 precedent).
+
+**P3 addendum (commit 37aa084).** mm_f32b micro-burst consolidation landed
+as `mm_f32b_grp` (one launch per f32/BF16 subset of a frame mm_group,
+≤8 weights, per-row output via device-address table; mixed quant+f32 groups
+take the f32 subset). FN tg128@8k 15.01 → 15.24 t/s; FN gate stream
+unchanged (bit-identical row arithmetic). The measured correction to the
+P3 diagnosis: mm_f32b's 288 launches were only ~2–4 ms of GPU time — the
+step's real GPU mass is gemv8_q8b (24 ms of genuine weight reads).
