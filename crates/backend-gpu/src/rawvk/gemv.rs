@@ -2052,7 +2052,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let q4k_cm = cm_on
                 && std::env::var("LLM170_VK_Q4KCM").map(|v| v != "0").unwrap_or(true);
             let slot = match (w.ty, q4k_cm) {
-                (GgmlType::Q4K, _k) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KKP").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kKp,
+                (GgmlType::Q4K, _k) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KKP").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kKp,
                 (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG1SC").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1sc,
                 (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG8").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg8,
                 (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KSG1").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1,
