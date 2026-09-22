@@ -146,6 +146,19 @@ fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
         .min(cap)
 }
 
+/// 프레임 환경 게이트(캐시) — LLM170_FRAME!=0 && {PREFILL,DECODE}!=0.
+fn frame_env_on(decode: bool) -> bool {
+    static PRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static DEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lk = if decode { &DEC } else { &PRE };
+    *lk.get_or_init(|| {
+        std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var(if decode { "LLM170_FRAME_DECODE" } else { "LLM170_FRAME_PREFILL" })
+                .map(|v| v != "0")
+                .unwrap_or(true)
+    })
+}
+
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
@@ -166,6 +179,42 @@ impl Engine4 {
         }
         self.acc = Some(acc);
         self
+    }
+
+    /// 프레임(디바이스 상주) 경로 활성 게이트 — 6벌 복제 통합(plans/90 A1 D10).
+    /// decode=false → LLM170_FRAME_PREFILL, true → LLM170_FRAME_DECODE
+    /// (둘 다 기본 on). 조건 순서·의미는 기존 인라인 판과 동일.
+    /// 환경 판독은 기동 후 불변 전제로 1회 캐시(90 B5 — 스텝당 env::var 제거).
+    fn frame_on(&self, decode: bool) -> bool {
+        self.acc.is_some()
+            && !self.frame_broken
+            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
+            && frame_env_on(decode)
+    }
+
+    /// 프레임 GPU 상태 → CPU 사본 풀백(값 경로 진입 전 정합화, plans/90 A1 D12).
+    /// gdn은 전치 레이아웃(AR 커널 규약) 역변환 포함.
+    /// 프레임 없음·가속기 없음·dirty(CPU가 권위)면 no-op.
+    fn frame_pullback_cpu(&mut self, seq: usize) -> Result<(), Q4Error> {
+        let Some(acc) = self.acc.as_deref() else { return Ok(()) };
+        let (gdn, conv) = {
+            let Some(f) = self.frame.as_ref() else { return Ok(()) };
+            if f.dirty[seq] {
+                return Ok(());
+            }
+            (f.st_gdn[seq].clone(), f.st_conv[seq].clone())
+        };
+        let st = &mut self.seqs[seq];
+        let d_state = self.model.hp.d_state;
+        for (ri, h) in gdn.iter().enumerate() {
+            let mut t = vec![0.0f32; st.gdn_s[ri].len()];
+            acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
+            st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, d_state);
+        }
+        for (ri, h) in conv.iter().enumerate() {
+            acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
+        }
+        Ok(())
     }
 
     fn forward_timed(
@@ -299,7 +348,6 @@ impl Engine4 {
         let wout = self.model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         let mut logits = vec![0.0f32; wout.n_out as usize];
         stage!(head, ctx.mm(&last, &wout, &mut logits)?);
-        let _ = hc_dim;
         Ok(logits)
     }
 
@@ -346,34 +394,15 @@ impl Engine4 {
         // 디바이스 상태를 그대로 쓰므로 이 풀백이 데드 워크다 — 슬롯당 수십 회의
         // 소형 D2H(2026-09-17, np 서버 TTFT/프리필 간극 RCA). 아래 값 경로
         // 직전으로 이동했다.
-        let frame_prefill_on = self.acc.is_some()
-            && !self.frame_broken
-            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        let frame_prefill_on = self.frame_on(false);
         let need_cpu_pullback = !frame_prefill_on;
-        if let Some(f) = &self.frame
-            && !f.dirty[seq] && need_cpu_pullback
-                && let Some(acc) = self.acc.as_deref() {
-                    let st = &mut self.seqs[seq];
-                    for (ri, h) in f.st_gdn[seq].iter().enumerate() {
-                        // 프레임 상태는 전치 레이아웃(AR 커널 규약) — CPU로 되돌린다.
-                        let mut t = vec![0.0f32; st.gdn_s[ri].len()];
-                        acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
-                        st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
-                    }
-                    for (ri, h) in f.st_conv[seq].iter().enumerate() {
-                        acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
-                    }
-                }
+        if need_cpu_pullback {
+            self.frame_pullback_cpu(seq)?;
+        }
         // 프레임(디바이스 상주) 프리필 — 기본 on (끄기: LLM170_FRAME_PREFILL=0).
         // 토큰 계약 검증: 230@512·300@128(3청크)·512 모두 값 경로와 일치.
         // pp512 36.8 t/s = 값 경로(11.2)의 3.3배.
-        let frame_on = self.acc.is_some()
-            && !self.frame_broken
-            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        let frame_on = frame_prefill_on;
         // 프레임 버퍼(t_max)보다 큰 청크는 범위를 넘는다 — 프레임 경로는 청크를 묶는다.
         let chunk = if frame_on { chunk.min(frame_t_max_cap(self.acc.as_deref())) } else { chunk };
         if frame_on {
@@ -412,20 +441,9 @@ impl Engine4 {
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
         // 값 경로 전용 풀백(프레임 경로 미사용 시에만).
-        if !need_cpu_pullback
-            && let Some(f) = &self.frame
-                && !f.dirty[seq]
-                    && let Some(acc) = self.acc.as_deref() {
-                        let st = &mut self.seqs[seq];
-                        for (ri, h) in f.st_gdn[seq].iter().enumerate() {
-                            let mut t = vec![0.0f32; st.gdn_s[ri].len()];
-                            acc.frame_read(*h, &mut t).map_err(Q4Error::Io)?;
-                            st.gdn_s[ri] = super::frame::Frame4::transpose_pairs(&t, self.model.hp.d_state);
-                        }
-                        for (ri, h) in f.st_conv[seq].iter().enumerate() {
-                            acc.frame_read(*h, &mut st.conv[ri]).map_err(Q4Error::Io)?;
-                        }
-                    }
+        if !need_cpu_pullback {
+            self.frame_pullback_cpu(seq)?;
+        }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
             let mut tm = init_timings();
@@ -446,11 +464,7 @@ impl Engine4 {
     /// 슬로패스 수십 ms) 대신 GPU argmax 로 토큰만 회수(plans/74, np 서버).
     /// 프레임 경로 판만 갈리며 값 폴백은 종전 prefill+greedy 와 동일.
     pub fn prefill_greedy(&mut self, seq: usize, tokens: &[u32]) -> Result<u32, Q4Error> {
-        let frame_on = self.acc.is_some()
-            && !self.frame_broken
-            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_PREFILL").map(|v| v != "0").unwrap_or(true);
+        let frame_on = self.frame_on(false);
         if !frame_on {
             let l = self.prefill(seq, tokens)?;
             return Ok(crate::qwen35::greedy(&l));
@@ -552,11 +566,7 @@ impl Engine4 {
             }
             return Ok(out);
         }
-        let frame_on = self.acc.is_some()
-            && !self.frame_broken
-            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
+        let frame_on = self.frame_on(true);
         if !frame_on {
             let mut out = Vec::with_capacity(seqs.len());
             for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
@@ -707,12 +717,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
     /// greedy 디코드 — 로짓 전사 없이 GPU argmax 로 토큰만(plans/74).
     /// 구조는 decode1 과 동일, head 판만 갈린다.
     pub fn decode1_greedy(&mut self, seq: usize, token: u32) -> Result<u32, Q4Error> {
-        if self.acc.is_none()
-            || self.frame_broken
-            || std::env::var_os("LLM170_FRAME").is_none()
-            || !std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true)
-            || !self.acc.as_ref().is_some_and(|a| a.frame_capable())
-        {
+        if !self.frame_on(true) {
             let l = self.decode1(seq, token)?;
             return Ok(crate::qwen35::greedy(&l));
         }
@@ -838,11 +843,7 @@ pub fn decode_batch_greedy(&mut self, seqs: &[usize], tokens: &[u32]) -> Result<
         // 프레임 기본 ON(2026-09-02) — 상주 불가 시 1회 재시도 후 value 경로로
         // 영구 폴백. 게이트 실패는 mm 오류(호스트 폴백 가중치)로 첫 스텝 초반에
         // 발생해 상태 오염 전에 중단된다.
-        let frame_on = self.acc.is_some()
-            && !self.frame_broken
-            && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_DECODE").map(|v| v != "0").unwrap_or(true);
+        let frame_on = self.frame_on(true);
         let frame_try = if frame_on {
             let acc = self.acc.as_deref().unwrap();
             if self.frame.is_none() {

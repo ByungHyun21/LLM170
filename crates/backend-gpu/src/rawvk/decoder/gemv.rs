@@ -66,9 +66,9 @@ impl DecoderState {
 
     /// quant: [t][n] f32 → xq (q8 레이아웃).
     pub(super) fn quant(&mut self, src: vk::Buffer, xq: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
-        let xq_w = n / 4 + n / 32 + n / 16;
+        let xq_w = crate::rawvk::vkacc::xq_words(n);
         let push = Self::push_u32s(&[n as u32, t as u32, xq_w as u32]);
-        self.run_pipe("quant", crate::rawvk::gemv::QUANT_SPV, 2, 12,
+        self.run_pipe("quant", crate::rawvk::vkacc::QUANT_SPV, 2, 12,
             &[src, xq], &push, (n / 32 + 63) as u32 / 64, t as u32, 1)
     }
 
@@ -187,8 +187,8 @@ impl DecoderState {
         // 단일 청크 typed 뷰 — 143→225GB/s. LLM170_VK_Q5B=0 옵트아웃.
         if std::env::var("LLM170_VK_Q5B").map(|v| v == "0").unwrap_or(true) {
             // plans/46: NUM_ROWS 실험 — llama GCN은 rm_kq=4. t=1이 지연 바운드(f16 2배
-            // 바이트에 -1.8%뿐)이므로 행/WG 증가로 ILP 상향. 기본 2, LLM170_VK_NR로 변경.
-            let nr: u32 = std::env::var("LLM170_VK_NR").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            // 바이트에 -1.8%뿐)이므로 행/WG 증가로 ILP 상향. 기본 2, LLM170_VK_NUMROWS로 변경.
+            let nr: u32 = std::env::var("LLM170_VK_NUMROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             let nr = nr.clamp(1, 4);
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);
             return self.run_pipe_b("gemv8_q5b", GEMV8_Q5B_SPV, 10, 24, &binds, &push,
@@ -276,7 +276,7 @@ impl DecoderState {
             let xq_w = no; // 자리표시 — 아래에서 ni 기반 재계산
             let _ = xq_w;
             let ni_f = self.w.get(wkey).map(|e| e.2).unwrap_or(0);
-            let xq_wf = ni_f / 4 + ni_f / 32 + ni_f / 16;
+            let xq_wf = crate::rawvk::vkacc::xq_words(ni_f);
             let fbuf = self.f16w.get(wkey).cloned().unwrap();
             let gx = (no as u32).div_ceil(128);
             for tb in (0..t).step_by(128) {
@@ -308,7 +308,7 @@ impl DecoderState {
         // 프리필 전용(t≥TILE_MIN)이면 spec 검증 배치(t≤5)와 무관 — 불변식 유지.
         // 실측 pp512 11.18→17.45 t/s (+56%). 옵트인 LLM170_VK_TILE=1.
         {
-            let xq_w = ni / 4 + ni / 32 + ni / 16;
+            let xq_w = crate::rawvk::vkacc::xq_words(ni);
             let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
             while binds.len() < 8 {
                 binds.push(self.dummy.buf);
@@ -469,7 +469,7 @@ impl DecoderState {
         if self.ktime || self.ctx.ts.is_some() {
             *self.kkey.borrow_mut() = Some(format!("gemv:ty{ty}:{wkey}"));
         }
-        let xq_w = ni / 4 + ni / 32 + ni / 16;
+        let xq_w = crate::rawvk::vkacc::xq_words(ni);
         let mut binds: Vec<vk::Buffer> = wbufs.iter().map(|b| b.buf).collect();
         while binds.len() < 8 {
             binds.push(self.dummy.buf);
@@ -482,7 +482,7 @@ impl DecoderState {
         // 단일 청크면 전체/4 → c 항상 0.
         let chunk_words = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
         let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, ty, t as u32, chunk_words]);
-        self.run_pipe_b("gemv", crate::rawvk::gemv::GEMV_SPV, 12, 24, &binds, &push, no as u32, 1, 1, bar)
+        self.run_pipe_b("gemv", crate::rawvk::vkacc::GEMV_SPV, 12, 24, &binds, &push, no as u32, 1, 1, bar)
     }
 
     /// v2 (mlx식) — per-row 스케일: quant_b8v2 + gemm_i8v2. LLM170_VK_I8=2.
@@ -583,7 +583,7 @@ impl DecoderState {
         // 고정(산술 불변), push 16B로 맞춘다.
         let mut push = Self::push_u32s(&[n as u32, t as u32, 1u32]);
         push.extend_from_slice(&eps.to_le_bytes());
-        self.run_pipe("rms", crate::rawvk::gemv::RMS_SPV, 3, 16,
+        self.run_pipe("rms", crate::rawvk::vkacc::RMS_SPV, 3, 16,
             &[src, wbuf.buf, out], &push, t as u32, 1, 1)
     }
 
@@ -611,7 +611,7 @@ impl DecoderState {
     /// silu_mul g·u.
     pub(super) fn silu_mul(&mut self, g: vk::Buffer, u: vk::Buffer, o: vk::Buffer, total: usize) -> Result<(), String> {
         let push = (total as u32).to_le_bytes().to_vec();
-        self.run_pipe("silu", crate::rawvk::gemv::SILU_SPV, 3, 4,
+        self.run_pipe("silu", crate::rawvk::vkacc::SILU_SPV, 3, 4,
             &[g, u, o], &push, total.div_ceil(256) as u32, 1, 1)
     }
 

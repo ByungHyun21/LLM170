@@ -137,9 +137,9 @@ impl DecoderState {
         argmaxes: &mut Vec<u32>,
         h_all: &mut Vec<f32>,
     ) -> Result<Vec<f32>, String> {
-        // 배치 검증 — LLM170_VKD_BATCH=1 명시 옵트인만 (기본 per-token:
+        // 배치 검증 — LLM170_VKD_SPEC_BATCH=1 명시 옵트인만 (기본 per-token:
         // gemv8 t≥2 검증 배치는 기지 간헐 레이스의 의심 트리거 — plans/36 §8).
-        if std::env::var("LLM170_VKD_BATCH").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("LLM170_VKD_SPEC_BATCH").map(|v| v == "1").unwrap_or(false) {
             let n = self.n_embd;
             let mut last = Vec::new();
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {

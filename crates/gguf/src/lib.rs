@@ -262,7 +262,7 @@ impl GgufFile {
 
         let data_offset = align_up(rd.pos, alignment as u64);
 
-        Ok(GgufFile {
+        let gf = GgufFile {
             path: path.to_path_buf(),
             file_size,
             version,
@@ -270,7 +270,33 @@ impl GgufFile {
             data_offset,
             kv,
             tensors,
-        })
+        };
+        gf.validate_bounds()?;
+        Ok(gf)
+    }
+
+    /// 파싱 직후 파일 무결성 검증 (plans/90 A3):
+    /// 1) 모든 텐서 데이터가 [data_offset, file_size] 안에 있는지.
+    /// 2) split 메타가 있으면 no < count.
+    fn validate_bounds(&self) -> Result<()> {
+        for t in &self.tensors {
+            let Some(nb) = t.nbytes() else { continue };
+            let end = self.data_offset + t.offset + nb;
+            if end > self.file_size {
+                return Err(GgufError::TensorOutOfBounds {
+                    name: t.name.clone(),
+                    end,
+                    size: self.file_size,
+                });
+            }
+        }
+        if let (Some(no), Some(count)) =
+            (self.kv_u64("split.no"), self.kv_u64("split.count"))
+            && no >= count
+        {
+            return Err(GgufError::SplitNoOutOfBounds { no, count });
+        }
+        Ok(())
     }
 
     pub fn kv(&self, key: &str) -> Option<&Value> {

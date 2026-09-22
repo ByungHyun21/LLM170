@@ -112,8 +112,6 @@ impl DecoderState {
                         &[self.b_go.buf, self.b_gz.buf, sn.buf, self.b_ggated.buf],
                         &push, dt_rank as u32, 1, 1)?;
                 }
-                let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
-                let _ = xq_sg;
                 }
                 if gskip & 4 == 0 {
                     self.gemv_w(self.b_ggated.buf, self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1, d_inner)?;
@@ -288,9 +286,9 @@ impl DecoderState {
         let push1 = Self::push_u32s(&[n_wg as u32, 1u32]);
         let binds = [self.b_lg.buf, self.b_ams.buf, self.b_am.buf];
         self.ctx.begin_batch()?;
-        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+        self.run_pipe_b("argmax2", crate::rawvk::vkacc::ARGMAX2_SPV, 3, 8,
             &binds, &push0, n_wg as u32, 1, 1, true)?;
-        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+        self.run_pipe_b("argmax2", crate::rawvk::vkacc::ARGMAX2_SPV, 3, 8,
             &binds, &push1, 1, 1, 1, true)?;
         self.ctx.end_batch_wait()?;
         Ok(unsafe { *(self.b_am.ptr as *const u32) })

@@ -204,7 +204,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         if (self.t_cur() == 1 || rows <= 64)
             && ws.ty == GgmlType::Q4K
             && !f32w
-            && !env_on("LLM170_MOE_GROUPED")
         {
             let idp = self.fptr(ids)?;
             // K-분할: 타일 40블록(=1/CU)이던 점유율을 ksplit배로. 부분합은 part에
@@ -281,7 +280,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && !env_on("LLM170_MOE_GROUPED")
             && !env_eq("LLM170_Q5W", "0")
         {
             let idp = self.fptr(ids)?;
@@ -321,7 +319,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && !env_on("LLM170_MOE_GROUPED")
             && !env_eq("LLM170_Q8IDS", "0")
         {
             let idp = self.fptr(ids)?;
@@ -366,7 +363,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let hit = {
             let c = self.moe_group.lock().map_err(|e| e.to_string())?;
             c.as_ref()
-                .filter(|g| g.generation == generation && g.rows == rows)
+                .filter(|g| crate::common::moe::cache_hit(g.generation, generation, g.rows, rows, true))
                 .map(|g| (g.perm_d, g.inv_d, g.rowexp_d, g.perm_pad_d, g.inv_pad_d, g.tilexp_d, g.rows_pad, g.rows_pad_d, g.off.clone(), g.off_d, g.pinned_off))
         };
         if tm {
@@ -658,7 +655,7 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             // o-행 하나에 16전문가 가중치가 필요해 공유 버퍼로 표현 불가, 시도 후 복원).
             // 워프-퍼-행 재설계도 q5_1의 6워드 슈퍼블록 입도 때문에 3배가 한계였다.
             // 즉 6ms는 Q5_1 레이아웃 고유 비용이다.
-            if self.t_cur() == 1 && !env_on("LLM170_MOE_GROUPED") {
+            if self.t_cur() == 1 {
                 let idp = self.fptr(ids)?;
                 let mut x_p = xq as *mut std::ffi::c_void;
                 let mut w_p = wd as *mut std::ffi::c_void;

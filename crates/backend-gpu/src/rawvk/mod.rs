@@ -2,7 +2,8 @@
 
 pub mod context;
 pub mod decoder;
-pub mod gemv;
+pub mod checks;
+pub mod vkacc;
 pub mod flashcheck;
 
 use context::VkCtx;

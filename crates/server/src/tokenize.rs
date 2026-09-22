@@ -220,9 +220,6 @@ impl Tokenizer {
             .unwrap_or_default()
     }
 
-    pub fn piece(&self, tok: u32) -> String {
-        String::from_utf8_lossy(&self.piece_bytes(tok)).into_owned()
-    }
 
     /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {

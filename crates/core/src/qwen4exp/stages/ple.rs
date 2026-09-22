@@ -4,7 +4,7 @@
 use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
-use crate::ops::{rms_norm, sigmoid, silu};
+use crate::ops::{sigmoid, silu};
 use llm170_diag::profile_span;
 
     /// PLE 블록 — 해시 gather→key/value→게이트→방송→dilated conv→잔차 2경로.
@@ -120,37 +120,29 @@ use llm170_diag::profile_span;
         ple_stage_hash("value", &value);
 
         let mut gated_hist: Vec<Vec<f32>> = vec![Vec::new(); t];
+        let mut gates_hist: Vec<Vec<f32>> = vec![Vec::new(); t];
         {
         let res_hc_ro: &[Vec<f32>] = res_hc;
         std::thread::scope(|sc| {
             let mut rest: &mut [Vec<f32>] = &mut gated_hist;
+            let mut grest: &mut [Vec<f32>] = &mut gates_hist;
             let mut base = 0usize;
             while base < t {
                 let take = per.min(t - base);
                 let (head, tail) = rest.split_at_mut(take);
                 rest = tail;
+                let (ghead, gtail) = grest.split_at_mut(take);
+                grest = gtail;
                 let b = base;
                 let (key, value) = (&key, &value);
                 let (n_key, n_query, n_conv) = (&n_key, &n_query, &n_conv);
                 let (res_hc_v, hp) = (res_hc_ro, &hp);
                 sc.spawn(move || {
-                    for (i, out) in head.iter_mut().enumerate() {
+                    for ((i, out), gout) in head.iter_mut().enumerate().zip(ghead.iter_mut()) {
                         let ti = b + i;
             // grouped norm key / query — 감마는 전체 [hc_dim] 폭
-            let mut k_n = vec![0.0f32; key[ti].len().max(hc_dim)];
-            let kl = key[ti].len();
-            debug_assert!(kl == hc_dim);
-            for s in 0..hc {
-                let head = key[ti][s * n_embd..(s + 1) * n_embd].to_vec();
-                k_n[s * n_embd..(s + 1) * n_embd]
-                    .copy_from_slice(&rms_norm(&head, &n_key[s * n_embd..(s + 1) * n_embd], hp.eps));
-            }
-            let mut q_n = vec![0.0f32; hc_dim];
-            for s in 0..hc {
-                let head = res_hc_v[ti][s * n_embd..(s + 1) * n_embd].to_vec();
-                q_n[s * n_embd..(s + 1) * n_embd]
-                    .copy_from_slice(&rms_norm(&head, &n_query[s * n_embd..(s + 1) * n_embd], hp.eps));
-            }
+            let k_n = super::hc::grouped_rms(&key[ti], &n_key, hc, n_embd, hp.eps);
+            let q_n = super::hc::grouped_rms(&res_hc_v[ti], &n_query, hc, n_embd, hp.eps);
             // per-stream s = Σ key·query / √n_embd → sigmoid(sgn·√|s|)
             let mut gate = vec![0.0f32; hc];
             for s in 0..hc {
@@ -169,13 +161,8 @@ use llm170_diag::profile_span;
                     gated[s * n_embd + i] = value[ti][i] * gate[s];
                 }
             }
-            let mut normalized = vec![0.0f32; hc_dim];
-            for s in 0..hc {
-                let head = gated[s * n_embd..(s + 1) * n_embd].to_vec();
-                normalized[s * n_embd..(s + 1) * n_embd].copy_from_slice(
-                    &rms_norm(&head, &n_conv[s * n_embd..(s + 1) * n_embd], hp.eps),
-                );
-            }
+            let normalized = super::hc::grouped_rms(&gated, &n_conv, hc, n_embd, hp.eps);
+                        *gout = gate;
                         *out = normalized;
                     }
                 });
@@ -244,32 +231,15 @@ use llm170_diag::profile_span;
                 let (head, tail) = rest.split_at_mut(take);
                 rest = tail;
                 let b = base;
-                let (key, value, conv_out) = (&key, &value, &conv_out);
-                let (n_key, n_query, hp) = (&n_key, &n_query, &hp);
+                let (value, conv_out, gates) = (&value, &conv_out, &gates_hist);
                 sc.spawn(move || {
                     for (i, row) in head.iter_mut().enumerate() {
             let ti = b + i;
-            // 게이트 재계산 (결정적 동일값)
-            let mut k_n = vec![0.0f32; hc_dim];
+            // 게이트 재사용(plans/90 B4 D6) — 1차 패스에서 스태시. 입력이
+            // 원본 res_hc(잔차 accumulation 전)로 동일하므로 결정적 동일값.
+            let gate = &gates[ti];
             for s in 0..hc {
-                let head = key[ti][s * n_embd..(s + 1) * n_embd].to_vec();
-                k_n[s * n_embd..(s + 1) * n_embd]
-                    .copy_from_slice(&rms_norm(&head, &n_key[s * n_embd..(s + 1) * n_embd], hp.eps));
-            }
-            let mut q_n = vec![0.0f32; hc_dim];
-            for s in 0..hc {
-                let head = row[s * n_embd..(s + 1) * n_embd].to_vec();
-                q_n[s * n_embd..(s + 1) * n_embd]
-                    .copy_from_slice(&rms_norm(&head, &n_query[s * n_embd..(s + 1) * n_embd], hp.eps));
-            }
-            for s in 0..hc {
-                let mut dot = 0.0f32;
-                for i in 0..n_embd {
-                    dot += k_n[s * n_embd + i] * q_n[s * n_embd + i];
-                }
-                dot /= (n_embd as f32).sqrt();
-                let mag = dot.abs().max(1e-6).sqrt();
-                let g = sigmoid(if dot >= 0.0 { mag } else { -mag });
+                let g = gate[s];
                 for i in 0..n_embd {
                     row[s * n_embd + i] += value[ti][i] * g + conv_out[ti][s * n_embd + i];
                 }
