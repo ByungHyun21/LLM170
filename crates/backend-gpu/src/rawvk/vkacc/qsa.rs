@@ -131,7 +131,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let cs_b = self.qk_const(&mut ctx, cs_idx)?;
             let ikw_b = {
                 let mut g = self.qsa_ikw.lock();
-                if !g.as_ref().is_some_and(|b| b.bytes >= ikw.len() * 4) {
+                if g.as_ref().is_none_or(|b| b.bytes < ikw.len() * 4) {
                     *g = Some(crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host((ikw.len() * 4).max(4096)))?);
                 }
                 g.as_ref().unwrap().clone()
@@ -184,7 +184,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(e.0.ptr as *const f32, kv_k.as_mut_ptr(), kv_floats);
             std::ptr::copy_nonoverlapping(e.1.ptr as *const f32, kv_v.as_mut_ptr(), kv_v.len());
             std::ptr::copy_nonoverlapping(e.2.ptr as *const f32, idx_k.as_mut_ptr(), idx_k.len());
-            let nb = (pos + r - 1) / r;
+            let nb = pos.div_ceil(r);
             std::ptr::copy_nonoverlapping(e.3.ptr as *const f32, bk.as_mut_ptr(), (nb * idx_dim).min(bk.len()));
         }
         let _ = kv_row;
@@ -329,7 +329,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         }
         let g = self.qsa_sel_bufs.lock();
         let b = g.as_ref().ok_or("vk qsa_sel_readback: 스크래치 없음")?;
-        if b.5.buf.as_raw() != sel_idx as u64 || b.6.buf.as_raw() != sel_off as u64 {
+        if b.5.buf.as_raw() != sel_idx || b.6.buf.as_raw() != sel_off {
             return Err("vk qsa_sel_readback: 핸들 불일치(스크래치 재성장)".into());
         }
         let mut si = vec![0u32; list_len];
@@ -477,10 +477,10 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         }
         let mut ctx = self.ctx.lock();
         let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
-        let cb = vk::Buffer::from_raw(ck as u64);
-        let vb = vk::Buffer::from_raw(cv as u64);
-        let sib = vk::Buffer::from_raw(sel_idx as u64);
-        let sob = vk::Buffer::from_raw(sel_off as u64);
+        let cb = vk::Buffer::from_raw(ck);
+        let vb = vk::Buffer::from_raw(cv);
+        let sib = vk::Buffer::from_raw(sel_idx);
+        let sob = vk::Buffer::from_raw(sel_off);
         self.qsa_attn_sel_run(&mut ctx, qb, cb, vb, sib, sob, ob, kq_scale, n_head, n_kv, hd, t)
     }
 
@@ -505,8 +505,8 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         }
         let mut ctx = self.ctx.lock();
         let (qb, ob) = (self.fbuf(q)?, self.fbuf(out)?);
-        let cb = vk::Buffer::from_raw(ck as u64);
-        let vb = vk::Buffer::from_raw(cv as u64);
+        let cb = vk::Buffer::from_raw(ck);
+        let vb = vk::Buffer::from_raw(cv);
         // plans/86 §4 — sel 스크래치 캐시(종전 매호출 alloc_host 누출).
         let (si_b, so_b) = self.qsa_sel_scratch(&mut ctx, sel_idx.len(), sel_off.len())?;
         unsafe {
@@ -584,8 +584,8 @@ impl VkAcc {
         t: usize,
     ) -> Result<(), String> {
         let mh = n_kv >= 1
-            && n_head % n_kv == 0
-            && (n_head / n_kv) % 4 == 0
+            && n_head.is_multiple_of(n_kv)
+            && (n_head / n_kv).is_multiple_of(4)
             && hd == 256
             && std::env::var("LLM170_VK_QSAMH").map(|v| v != "0").unwrap_or(true);
         let slot = if mh { Slot::FnQsaAttnSelMh } else { Slot::FnQsaAttnSel };

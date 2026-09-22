@@ -742,7 +742,7 @@ impl RawCtx {
             23 | 20 => args_v.insert(4, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
             _ => args_v.insert(3, &mut out_p0 as *mut _ as *mut std::ffi::c_void),
         }
-        let mut xw_a = (n_in / 4 + n_in / 32 + n_in / 16) as i32;
+        let mut xw_a = crate::rawhip::q4acc::xq_words(n_in) as i32;
         args_v.push(&mut xw_a as *mut _ as *mut std::ffi::c_void);
         self.launch3(kern, 1, gy, gz, 64, &mut args_v)?;
         let mut res = vec![0f32; n_out];
@@ -1822,7 +1822,7 @@ impl RawCtx {
     /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
     /// 버퍼 크기 (n/4 + n/32)·4 바이트 필요.
     pub fn quant_q8(&self, x: *const u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        self.quant_q8_b(x, xq, n, n / 4 + n / 32 + n / 16, 1)
+        self.quant_q8_b(x, xq, n, crate::rawhip::q4acc::xq_words(n), 1)
     }
 
     /// 배치 양자화 — t토큰 [t][n] → [t][xq_w 워드].

@@ -78,8 +78,7 @@ pub fn ktrace_dump() -> String {
 pub fn ktrace_on() { *KTRACE.lock() = Some(Vec::new()); }
 
 pub fn aout_dumped() -> bool {
-    let r = AOUT_DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst);
-    r
+    AOUT_DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 static AOUT_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

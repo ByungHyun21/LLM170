@@ -291,6 +291,7 @@ fn special(cmd: &str, args: &[String]) -> Option<ExitCode> {
 /// - bits 동일 → PASS
 /// - argmax 동일 && max|Δ| < 1e-3 → PASS(near-tie, GPU 행 수 의존 잔여 축)
 /// - 그 외 → FAIL
+///
 /// prompt: "1,2,3" 형태면 토큰 id, 아니면 텍스트(BPE 인코딩 — plans/83 A).
 fn cmd_chunk_check(args: &[String]) -> ExitCode {
     let usage = "사용법: llm170 diag chunk-check <model> <prompt> [sizes...] [--backend cpu]";

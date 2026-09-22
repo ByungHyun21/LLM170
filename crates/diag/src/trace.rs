@@ -118,10 +118,10 @@ pub fn gap_by_pred(evs: &[Ev]) -> Vec<(String, f64, u32)> {
     use std::collections::HashMap;
     let mut m: HashMap<&'static str, (f64, u32)> = HashMap::new();
     let mut gap_tot = 0.0f64;
-    for w in 0..evs.len().saturating_sub(1) {
-        let g = evs[w].gap_next_ms.unwrap_or(0.0);
+    for ev in &evs[..evs.len().saturating_sub(1)] {
+        let g = ev.gap_next_ms.unwrap_or(0.0);
         if g > 0.0 {
-            let e = m.entry(evs[w].name).or_insert((0.0, 0));
+            let e = m.entry(ev.name).or_insert((0.0, 0));
             e.0 += g;
             e.1 += 1;
             gap_tot += g;

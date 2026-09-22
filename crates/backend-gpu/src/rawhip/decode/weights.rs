@@ -96,9 +96,9 @@ impl DecodeState {
         let t_max = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse::<usize>().ok())
             .map(|c| if c > 128 { 512 } else { 128 }).unwrap_or(512);
         let (n_kv, hd) = (hp.n_kv, hp.head_dim);
-        let xq_sn = n / 4 + n / 32 + n / 16;
-        let xq_sf = n_ff / 4 + n_ff / 32 + n_ff / 16;
-        let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
+        let xq_sn = crate::rawhip::q4acc::xq_words(n);
+        let xq_sf = crate::rawhip::q4acc::xq_words(n_ff);
+        let xq_sg = crate::rawhip::q4acc::xq_words(d_inner);
         let b_xs_t = bs(t_max * n * 4);
         let b_xn_t = bs(t_max * n * 4);
         let b_xq_n_t = bs(t_max * xq_sn * 4);
@@ -143,8 +143,8 @@ impl DecodeState {
         let n_ao = hp.n_head * hp.head_dim; // wo 입력 (6144 > n)
         let b_ms_meta = ctx.alloc(320 * 4).map_err(|e| e.to_string())?; // i32 5×64
         let b_ms_ptr = ctx.alloc(64 * 8 * 2).map_err(|e| e.to_string())?; // K/V 테이블 2×64행
-        let b_mtp_xq_sz = (n_ao / 4 + n_ao / 32 + n_ao / 16) * 4;
-        let b_mtp_xq2_sz = (2 * n / 4 + 2 * n / 32 + 2 * n / 16) * 4;
+        let b_mtp_xq_sz = (crate::rawhip::q4acc::xq_words(n_ao)) * 4;
+        let b_mtp_xq2_sz = (crate::rawhip::q4acc::xq_words(2 * n)) * 4;
         let mut v_mtp_k16: Vec<*mut u8> = Vec::new();
         let mut v_mtp_v16: Vec<*mut u8> = Vec::new();
         let (mut v_mtp_k, mut v_mtp_v, b_mtp_cat, b_mtp_cur, b_mtp_qkv, b_mtp_ao, b_mtp_e, b_mtp_h, b_mtp_xq, b_mtp_xq2) = if mtp_on {
@@ -176,7 +176,7 @@ impl DecodeState {
         };
         // 배치 MTP용 q8 폭 — n(정규화 입력)과 n_head*hd(attn_output 입력) 중 큰 쪽.
         let b_xq_m = n.max(hp.n_head * hp.head_dim);
-        let b_xq_n_sz = (b_xq_m / 4 + b_xq_m / 32 + b_xq_m / 16) * 4;
+        let b_xq_n_sz = (crate::rawhip::q4acc::xq_words(b_xq_m)) * 4;
         let (b_mtp_be, b_mtp_bhs, b_mtp_bcat, b_mtp_bcur, b_mtp_bxqn, b_mtp_bxq2) = if mtp_on {
             (
                 ctx.alloc(t_max * n * 4).map_err(|e| e.to_string())?,
@@ -187,7 +187,7 @@ impl DecodeState {
                 ctx.alloc(t_max * {
                     // eh_proj(2n)와 ffn_down 입력(n_ff) 중 큰 쪽
                     let l = (2 * n).max(hp.n_ff);
-                    (l / 4 + l / 32 + l / 16) * 4
+                    (crate::rawhip::q4acc::xq_words(l)) * 4
                 }).map_err(|e| e.to_string())?,
             )
         } else {
@@ -209,7 +209,7 @@ impl DecodeState {
         let (b_ggated, b_gout) = (bs(d_inner * 4), bs(n * 4));
         let (b_fgate, b_fup, b_fglu, b_fdown) = (bs(n_ff * 4), bs(n_ff * 4), bs(n_ff * 4), bs(n * 4));
         let b_logits = bs(hp.vocab * 4);
-        let (b_xqn, b_xqf, b_xqg) = (bs((n / 4 + n / 32 + n / 16) * 4), bs((n_ff / 4 + n_ff / 32 + n_ff / 16) * 4), bs((g6 / 4 + g6 / 32 + g6 / 16) * 4));
+        let (b_xqn, b_xqf, b_xqg) = (bs((crate::rawhip::q4acc::xq_words(n)) * 4), bs((crate::rawhip::q4acc::xq_words(n_ff)) * 4), bs((crate::rawhip::q4acc::xq_words(g6)) * 4));
         let (b_aq, b_ak, b_av) = (bs(hp.n_head * 2 * hp.head_dim * 4), bs(hp.n_kv * hp.head_dim * 4), bs(hp.n_kv * hp.head_dim * 4));
         let (b_aout, b_scores, b_p64) = (bs(hp.n_head * hp.head_dim * 4), bs(hp.n_head * ctx_len * 4), bs(max_rows * 32 * 8));
         let ds = DecodeState {
@@ -275,7 +275,7 @@ impl DecodeState {
     /// GEMV를 상주 out에 직접 기록 (gemv_q8의 내부 out을 복사 없이 쓰기 위해
     /// out 포인터를 받는 변형이 필요 — 현재는 gemv 후 d2h→h2d. 최적화 후술.)
     pub(super) fn mm_into(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
-        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
+        self.ctx.gemv_q8_out(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, crate::rawhip::q4acc::xq_words(n_in), 1)
     }
     /// 듀얼 텐서 q5_K GEMV — 같은 xq·같은 포맷 독립 2 GEMV를 1런치로.
     #[allow(clippy::too_many_arguments)]
@@ -291,7 +291,7 @@ impl DecodeState {
         let mut ni_a = ni as i32;
         let mut no1a = no1 as i32;
         let mut no2a = no2 as i32;
-        let mut xw = (ni / 4 + ni / 32 + ni / 16) as i32;
+        let mut xw = (crate::rawhip::q4acc::xq_words(ni)) as i32;
         let mut args = vec![
             Self::p(&mut xq_p), Self::p(&mut w1p), Self::p(&mut w2p), Self::p(&mut o1), Self::p(&mut o2),
             Self::p(&mut ni_a), Self::p(&mut no1a), Self::p(&mut no2a), Self::p(&mut xw),
@@ -309,7 +309,7 @@ impl DecodeState {
         let mut ni = n_in as i32;
         let mut n1 = no1 as i32;
         let mut n2 = no2 as i32;
-        let mut xw = (n_in / 4 + n_in / 32 + n_in / 16) as i32;
+        let mut xw = (crate::rawhip::q4acc::xq_words(n_in)) as i32;
         let mut args = vec![
             &mut xp as *mut _ as *mut std::ffi::c_void,
             &mut w1p as *mut _ as *mut std::ffi::c_void,
@@ -329,7 +329,7 @@ impl DecodeState {
 
     /// 사이드 스트림 GEMV — side_wait_main 선행 + join2 후속이 계약.
     fn mm_into_s(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
-        self.ctx.gemv_q8_out_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, n_in / 4 + n_in / 32 + n_in / 16, 1)
+        self.ctx.gemv_q8_out_s(xq as *const u8, wp as *const u8, self.ktab2 as *const u8, ty, n_in, n_out, out, crate::rawhip::q4acc::xq_words(n_in), 1)
     }
     /// gemv_q8_out과 동일 인자를 직접 launch — q6k/q4k/q5k/q8 단일행.
     pub(super) fn mm_direct(&self, xq: *mut u8, wp: *mut u8, ty: u32, n_in: usize, n_out: usize, out: *mut u8) -> Result<(), String> {
@@ -346,7 +346,7 @@ impl DecodeState {
         let mut op = out as *mut std::ffi::c_void;
         let mut ni_a = n_in as i32;
         let mut no_a = n_out as i32;
-        let mut xw_a = (n_in / 4 + n_in / 32 + n_in / 16) as i32;
+        let mut xw_a = (crate::rawhip::q4acc::xq_words(n_in)) as i32;
         let mut args = vec![Self::p(&mut xp), Self::p(&mut wp2), Self::p(&mut pp),
             Self::p(&mut op), Self::p(&mut ni_a), Self::p(&mut no_a), Self::p(&mut xw_a)];
         let gy = n_out.min(65535) as u32;
@@ -657,7 +657,7 @@ impl DecodeState {
                         };
                         eprintln!("#  A3dbg host-mirror av[0]={mv:e} d={:e} d_bits={:#x}", y[0].d, y[0].d.to_bits());
                     }
-                    let mut hq8 = vec![0u8; (n / 4 + n / 32 + n / 16) * 4];
+                    let mut hq8 = vec![0u8; (crate::rawhip::q4acc::xq_words(n)) * 4];
                     self.ctx.d2h(&mut hq8, self.xq_n)?;
                     let w0 = u32::from_le_bytes([hq8[0], hq8[1], hq8[2], hq8[3]]);
                     eprintln!("#  A3dbg xq_n word0={w0:#010x} d0={:e}", f32::from_bits(u32::from_le_bytes([hq8[n], hq8[n+1], hq8[n+2], hq8[n+3]])));
