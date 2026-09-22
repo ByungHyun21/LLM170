@@ -286,9 +286,9 @@ impl DecoderState {
         let push1 = Self::push_u32s(&[n_wg as u32, 1u32]);
         let binds = [self.b_lg.buf, self.b_ams.buf, self.b_am.buf];
         self.ctx.begin_batch()?;
-        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+        self.run_pipe_b("argmax2", crate::rawvk::vkacc::ARGMAX2_SPV, 3, 8,
             &binds, &push0, n_wg as u32, 1, 1, true)?;
-        self.run_pipe_b("argmax2", crate::rawvk::gemv::ARGMAX2_SPV, 3, 8,
+        self.run_pipe_b("argmax2", crate::rawvk::vkacc::ARGMAX2_SPV, 3, 8,
             &binds, &push1, 1, 1, 1, true)?;
         self.ctx.end_batch_wait()?;
         Ok(unsafe { *(self.b_am.ptr as *const u32) })
