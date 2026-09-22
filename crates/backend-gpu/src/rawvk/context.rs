@@ -29,6 +29,8 @@ pub struct VkCtx {
     pub fence: vk::Fence,
     pub coop_matrix: bool,
     pub coop_f16_f32: bool,
+    /// shader_integer_dot_product 활성 — GLSL dotPacked4x8EXT 사용 가능.
+    pub idot: bool,
     pub max_ssbo: usize,
     pub mem_ty: u32,
     /// GTT(캐시 host-visible) 타입 — 스크래치용.
@@ -131,6 +133,14 @@ impl VkCtx {
                 });
             }
 
+            // plans/89 P0.1 — GL_EXT_integer_dot_product(dotPacked4x8EXT =
+            // 하드웨어 v_dot4_i32_i8) 지원. Vulkan 1.3 코어 기능 — 쿼리해 지원
+            // 시에만 활성(미지원 장치 생성 실패 방지, coop 패턴과 동일).
+            let mut v13sup = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13sup);
+            let _ = instance.get_physical_device_features2(physical, &mut f2);
+            let idot = v13sup.shader_integer_dot_product != 0;
+
             let qfams = instance.get_physical_device_queue_family_properties(physical);
             let qf = qfams
                 .iter()
@@ -154,6 +164,8 @@ impl VkCtx {
             let mut feats = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut v11)
                 .push_next(&mut v12);
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
+                .shader_integer_dot_product(true);
             let mut prfeat = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default()
                 .pipeline_robustness(true);
             if pipeline_robustness {
@@ -161,6 +173,9 @@ impl VkCtx {
             }
             if coop_matrix {
                 feats = feats.push_next(&mut coopfeat);
+            }
+            if idot {
+                feats = feats.push_next(&mut v13);
             }
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qf)
@@ -246,6 +261,7 @@ impl VkCtx {
                 coop_matrix,
                 pipeline_robustness,
                 coop_f16_f32,
+                idot,
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
