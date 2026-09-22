@@ -49,15 +49,22 @@ figure is a different protocol/session).
 | tg128@8k | 7.51 | 17.9 | 18.4 | 23.2 |
 
 ### Qwen3.8-27B (UD-Q4_K_XL)
-
 | cell | vk now | hip | llama vk |
 |---|---|---|---|
-| pp512@20k | 336.9 | — | 343 |
+| pp512@20k | 336.9 | 363 | 343 |
+| pp4096@20k | 257.9 | 319 | 318 |
+| pp8192@20k | 203.5 | 315 | 301 |
 | pp16384@20k | 145.9 | 292 | 273 |
+| tg128@4k | 11.61 | 11.53 | 12.05 |
+| np4 agg (plain) | 11.44 | 32.1 | 15.5 *(HTTP†)* |
 
-(27B pp16384 is bounded by the f16 tile_ms128 family — [ts] profile:
-tile_ms128 21.6s, tile_q8128 15.6s, tile_xs128 10.7s per pp2048@4k. Integer
-s8-coopmat or OpSDot-class rewrites of those tiles are the next lever.)
+(MTP on the Vulkan accelerator backend is unimplemented —
+`mtp_prefill_batch: 미지원(백엔드)`; the "—" cells in earlier snapshots were
+unmeasured, not failures. 27B pp16384 is bounded by the f16 tile_ms128
+family — [ts] profile: tile_ms128 21.6s, tile_q8128 15.6s, tile_xs128 10.7s
+per pp2048@4k. Integer s8-coopmat rewrites are closed on this stack (RADV
+emulates s8 coopmat, 2.3x slower — see docs/decisions.md (32f)); the next
+lever is an OpSDot scalar MMQ tile family with register blocking.)
 
 ## Prior scorecard (2026-09-15, ROCm 10 userspace, greedy, solo) — superseded by the CLI scorecard above
 
