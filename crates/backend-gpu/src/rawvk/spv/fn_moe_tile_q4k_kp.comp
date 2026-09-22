@@ -1,0 +1,168 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// fn_moe_tile_q4k_kp (plans/89 재개) — q4_K MoE 그룹 프리필의 K-병렬 스칼라
+// 타일. 스칼라 16×16판(전 K 직렬, ALU 바운드 3078ms/청크)을 서브그룹 K-분할
+// 로: WG = 64레인 = 4출력(ox4) × 16 K-슬라이스(ks16), grid (⌈n_out/4⌉, bound)
+// — 패딩행 1개당 WG, 클러스터 차원은 K. 레인은
+// 유닛 u=(슈퍼블록×4+it) ≡ ks16 (mod 16) 만 취급(슬라이스 내 오름차순) 후
+// shuffleXor 트리(1,2,4,8 — 16레인 클러스터 내) 결합 — ALU 16× 절감.
+// 순수 스칼라 GLSL(coopmat 무관 — 드라이버 비결정 축 회피).
+// 내부 산식은 fn_moe_tile_q4k와 행별 동일(dot4 전개 포함) — 환산 클래스만
+// 슬라이스+트리 결합으로 변경(ckdiff·재기록 절차, 원장 31 전례).
+// LDS: 4출력행 × (n_super·36)워드 ≤ 4×468 = 7.5KB(n_in ≤ 13056).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+int dot4(uint a, uint b, int c) {
+    int r = c;
+    for (int i = 0; i < 4; i++) {
+        int av = (int((a >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        int bv = (int((b >> (8u * uint(i))) & 0xFFu) << 24) >> 24;
+        r += av * bv;
+    }
+    return r;
+}
+
+shared uint sh[4 * 468];
+shared float sh_acc[4][16];
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint tid = gl_LocalInvocationID.x;
+    uint ox4 = lane >> 4;                  // 4출력 선택(클러스터)
+    uint ks16 = lane & 15u;                // K-슬라이스(클러스터 차원)
+    int n_in = int(pc.n_in);
+    uint n_super = uint(n_in) >> 8;
+    uint row_words = n_super * 36u;
+    int row0 = int(gl_WorkGroupID.x) * 4;
+    uint r0 = gl_WorkGroupID.y * 16u;      // 전문가 16행 블록
+    uint rp = rows_pad[0];
+    if (r0 >= rp) return;
+    uint e = pc.mode == 1u ? 0u : rowexp[r0];
+    uint nrow4 = min(4u, pc.n_out - uint(row0));
+    int o = row0 + int(ox4);
+    // 협동 스테이징: 4행(진행 중단 없이 상한 컬럼 루프).
+    {
+        for (uint row = 0u; row < nrow4; row++) {
+            uint orow = uint(row0) + row;
+            uint64_t wbase = uint64_t(e) * uint64_t(pc.per_expert_bytes)
+                           + uint64_t(orow) * uint64_t(row_words) * 4u;
+            uint w0 = uint(wbase >> 2);
+            uint c0 = w0 / pc.chunk_words;
+            uint lim = (c0 + 1u) * pc.chunk_words;
+            for (uint col = tid; col < row_words; col += 64u) {
+                uint wi = w0 + col;
+                sh[row * row_words + col] = wi < lim
+                    ? Wsel(c0, wi - c0 * pc.chunk_words)
+                    : Wsel(c0 + 1u, wi - (c0 + 1u) * pc.chunk_words);
+            }
+        }
+        barrier();
+    }
+    // r 루프: 16패딩행 순회 — 가중 스테이징 1회를 16행이 공유.
+    for (uint r = r0; r < min(r0 + 16u, rp); r++) {
+    if (pc.mode == 6u) {
+        if (ks16 == 0u && o < int(pc.n_out)) {
+            outv[r * pc.n_out + uint(o)] = float(sh[ox4 * row_words] & 0xFFu);
+        }
+        continue;
+    }
+    float acc = 0.0;
+    if (o < int(pc.n_out)) {
+        uint xr0 = (pc.mode == 1u ? r : perm_pad[r]) * pc.xq_w;
+        uint xw_base = n_in >> 2;
+        uint srow = ox4 * row_words;
+        for (uint sIdx = 0u; sIdx < n_super; sIdx++) {
+            uint wq = srow + sIdx * 36u;
+            vec2 dd = unpackHalf2x16(sh[wq]);
+            float d = dd.x, dmin = dd.y;
+            uint sc0 = sh[wq + 1u], sc1 = sh[wq + 2u], sc2 = sh[wq + 3u];
+            for (int it = 0; it < 4; it++) {
+                uint u = sIdx * 4u + uint(it);
+                if ((u & 15u) != ks16) continue;
+                uint qq[8];
+                for (int m = 0; m < 8; m++) qq[m] = sh[wq + 4u + uint(it * 8 + m)];
+                int j1 = 2 * it;
+                int j2 = 2 * it + 1;
+                uint r1 = uint(j1 & 3) * 8u;
+                uint r2 = uint(j2 & 3) * 8u;
+                uint b1_j  = j1 < 4 ? (sc0 >> r1) & 0xFFu : (sc1 >> r1) & 0xFFu;
+                uint b1_j4 = j1 < 4 ? (sc1 >> r1) & 0xFFu : (sc2 >> r1) & 0xFFu;
+                uint b1_jm4 = (sc0 >> r1) & 0xFFu;
+                uint s1v, m1v;
+                if (j1 < 4) { s1v = b1_j & 63u; m1v = b1_j4 & 63u; }
+                else {
+                    s1v = (b1_j4 & 0xFu) | ((b1_jm4 >> 6) << 4);
+                    m1v = (b1_j4 >> 4) | ((b1_j >> 6) << 4);
+                }
+                uint b2_j  = j2 < 4 ? (sc0 >> r2) & 0xFFu : (sc1 >> r2) & 0xFFu;
+                uint b2_j4 = j2 < 4 ? (sc1 >> r2) & 0xFFu : (sc2 >> r2) & 0xFFu;
+                uint b2_jm4 = (sc0 >> r2) & 0xFFu;
+                uint s2v, m2v;
+                if (j2 < 4) { s2v = b2_j & 63u; m2v = b2_j4 & 63u; }
+                else {
+                    s2v = (b2_j4 & 0xFu) | ((b2_jm4 >> 6) << 4);
+                    m2v = (b2_j4 >> 4) | ((b2_j >> 6) << 4);
+                }
+                uint x1w = xr0 + sIdx * 64u + uint(it * 16);
+                uint x2w = x1w + 8u;
+                int il1 = 0, il2 = 0;
+                for (int m = 0; m < 8; m++) {
+                    uint y1 = xq[x1w + uint(m)];
+                    il1 += dot4(qq[m] & 0x0F0F0F0Fu, y1, 0);
+                    uint y2 = xq[x2w + uint(m)];
+                    il2 += dot4((qq[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
+                }
+                int qsb = int(n_in >> 2) + int(n_in >> 5);
+                uint jg1 = sIdx * 8u + uint(2 * it);
+                int qsum1 = int(xq[xr0 + uint(qsb) + jg1 * 2u]) + int(xq[xr0 + uint(qsb) + jg1 * 2u + 1u]);
+                int qsum2 = int(xq[xr0 + uint(qsb) + jg1 * 2u + 2u]) + int(xq[xr0 + uint(qsb) + jg1 * 2u + 3u]);
+                float yd1 = uintBitsToFloat(xq[xr0 + xw_base + sIdx * 8u + uint(2 * it)]);
+                float yd2 = uintBitsToFloat(xq[xr0 + xw_base + sIdx * 8u + uint(2 * it + 1)]);
+                acc += yd1 * (d * float(s1v)) * float(il1);
+                acc -= yd1 * (dmin * float(m1v)) * float(qsum1);
+                acc += yd2 * (d * float(s2v)) * float(il2);
+                acc -= yd2 * (dmin * float(m2v)) * float(qsum2);
+            }
+        }
+    }
+    // 16 K-슬라이스 결합 — 공유메모리(서브그룹 경계 무관, 결정적 순차합).
+    sh_acc[ox4][ks16] = acc;
+    barrier();
+    if (ks16 == 0u && o < int(pc.n_out)) {
+        float t = 0.0;
+        for (uint k2 = 0u; k2 < 16u; k2++) t += sh_acc[ox4][k2];
+        outv[r * pc.n_out + uint(o)] = t;
+    }
+    barrier();
+    }
+}
