@@ -181,60 +181,8 @@ pub(super) fn frame_forward_ex(
                 match r {
                     Ok(()) => {
                         ple_dev_done = true;
-                        let check = std::env::var_os("LLM170_PLE_CHECK").is_some();
-                        if check {
-                            // 그림자: PLE 이전 값(토큰 임베딩 방송)에서 호스트 재계산해
-                            // 디바이스 결과와 비교. 호스트 링도 갱신(스텝 흐름 유지).
-                            let pre_capture_ref = &pre_capture;
-                            let mut rows2: Vec<Vec<f32>> = vec![pre_capture.clone()];
-                            stages::ple_block(ctx, seq_st, il, &mut rows2, &ple_rows, Some(vec![emb.clone()]))?;
-                            let host: Vec<f32> = rows2.concat();
-                            let mut r2 = vec![0.0f32; hc * n];
-                            let mut dkey = vec![0.0f32; hc * n];
-                            let mut dval = vec![0.0f32; n];
-                            acc.frame_read(f.ple_key, &mut dkey).map_err(Q4Error::Io)?;
-                            acc.frame_read(f.ple_value, &mut dval).map_err(Q4Error::Io)?;
-                            let mut hkey = vec![vec![0.0f32; hc * n]; 1];
-                            let w_key2 = model.w4(&format!("blk.{il}.ple_key.weight"))?;
-                            let w_value2 = model.w4(&format!("blk.{il}.ple_value.weight"))?;
-                            ctx.mm_batch(&[emb.clone()], &w_key2, &mut hkey)?;
-                            let mut hval = vec![vec![0.0f32; n]; 1];
-                            ctx.mm_batch(&[emb.clone()], &w_value2, &mut hval)?;
-                            let mk = dkey.iter().zip(hkey[0].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                            let mv = dval.iter().zip(hval[0].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                            let mut dgate = vec![0.0f32; hc];
-                            let mut dgated = vec![0.0f32; hc * n];
-                            acc.frame_read(f.ple_gate, &mut dgate).map_err(Q4Error::Io)?;
-                            acc.frame_read(f.ple_gated, &mut dgated).map_err(Q4Error::Io)?;
-                            // 호스트 게이트 재계산(ple_block 잔차부와 동일식)
-                            let mut hgate = vec![0.0f32; hc];
-                            for s in 0..hc {
-                                let kk = &hkey[0][s * n..(s + 1) * n];
-                                let kn = crate::ops::rms_norm(kk, &nk[s * n..(s + 1) * n], hp.eps);
-                                let qq = &pre_capture_ref[s * n..(s + 1) * n];
-                                let qn = crate::ops::rms_norm(qq, &nq[s * n..(s + 1) * n], hp.eps);
-                                let mut dot = 0.0f32;
-                                for i in 0..n { dot += kn[i] * qn[i]; }
-                                dot /= (n as f32).sqrt();
-                                let mag = dot.abs().max(1e-6).sqrt();
-                                hgate[s] = crate::ops::sigmoid(if dot >= 0.0 { mag } else { -mag });
-                            }
-                            eprintln!("# ple-check lens nk={} nq={} nc={} pre.len={} key.len={}", nk.len(), nq.len(), nc.len(), pre_capture_ref.len(), hkey[0].len());
-                            let mg = dgate.iter().zip(hgate.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                            eprintln!("# ple-check gate dev={:?} host={:?} max={mg:.3e}", dgate.iter().map(|x| (x*1e4).round()/1e4).collect::<Vec<_>>(), hgate.iter().map(|x| (x*1e4).round()/1e4).collect::<Vec<_>>());
-                            eprintln!("# ple-check key max|d-h|={mk:.3e} value max|d-h|={mv:.3e}");
-                            acc.frame_read(f.res_hc, &mut r2).map_err(Q4Error::Io)?;
-                            let mut md = 0.0f32;
-                            let mut at = 0usize;
-                            for (i, (a, b)) in r2.iter().zip(host.iter()).enumerate() {
-                                let d = (a - b).abs();
-                                if d > md { md = d; at = i; }
-                            }
-                            eprintln!(
-                                "# ple-check pos={} max|dev-host|={md:.3e} at={at} (dev={:.4} host={:.4})",
-                                seq_st.pos, r2[at.min(r2.len() - 1)], host[at.min(host.len() - 1)]
-                            );
-                            seq_st.qsa_host_stale = false;
+                        if std::env::var_os("LLM170_PLE_CHECK").is_some() {
+                            super::diag::ple_check_shadow(acc, f, ctx, model, seq_st, il, &emb, &ple_rows, &pre_capture, hc, n, t)?;
                         }
                     }
                     Err(e) => {
@@ -823,11 +771,9 @@ pub(super) fn qsa_frame(
     // 6) wo 투영 — 어텐션 출력을 디바이스에서 ffn_out으로(왕복 0).
     if qtm {
         eprintln!("# qsa-frame L{il} t={t} attn={:.2}ms", lap.elapsed().as_secs_f64() * 1e3);
-        lap = std::time::Instant::now();
     }
     acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
         .map_err(Q4Error::Io)?;
-    let _ = &mut lap;
     Ok(())
 }
 
@@ -1117,7 +1063,6 @@ pub(super) fn moe_frame(
     if il == 0 {
         frame_ck(acc, f.mroute, hp.n_expert, t, "L0.mroute");
     }
-    let _ = stage_skipped("moe.route");
     if !stage_skipped("moe.top10") {
         op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
     }

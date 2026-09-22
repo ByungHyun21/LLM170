@@ -20,7 +20,6 @@ impl<'a> Weight<'a> {
     /// 텐서 전체를 f32 벡터로 펼침 (ne0-빠른 행 우선: 요소 (i, j) @ j*n_in+i).
     pub fn dequant_f32_vec(&self) -> Vec<f32> {
         let n = self.n_in * self.n_out;
-        let (blck, bsize) = self.ty.block_info();
         let rows = self.n_out;
         let mut v = vec![0.0f32; n as usize];
         for r in 0..rows {
@@ -33,7 +32,6 @@ impl<'a> Weight<'a> {
                 &mut v[s..s + self.n_in as usize],
             );
         }
-        let _ = (blck, bsize);
         v
     }
 }
@@ -472,7 +470,10 @@ pub trait QsaOps: Send + Sync {
         _cs_idx: &[f32],
         _eps: f32,
     ) -> Result<(), String> {
-        Ok(())
+        // 계약 일관화(90 B4): 기본구현의 조용한 Ok(())는 "적립했다"고 거짓
+        // 보고해 이후 디코드 풀 판돉이 구멍(워터마크 불일치)을 만든다 —
+        // 미구현은 Err로 명시하고 호출부가 호스트 경로를 유지하게 한다.
+        Err("qsa_idx_append_host: 미지원".into())
     }
 
     /// 인덱서 k 행을 **디바이스 버퍼에서 직접** 적립(블록 키 갱신 포함).
@@ -480,18 +481,17 @@ pub trait QsaOps: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn qsa_idx_append_dev(
         &self,
-        full_idx: usize,
-        seq: usize,
-        ik: u64,
-        t: usize,
-        pos0: usize,
-        idx_dim: usize,
-        r: usize,
-        ikw: &[f32],
-        cs_idx: &[f32],
-        eps: f32,
+        _full_idx: usize,
+        _seq: usize,
+        _ik: u64,
+        _t: usize,
+        _pos0: usize,
+        _idx_dim: usize,
+        _r: usize,
+        _ikw: &[f32],
+        _cs_idx: &[f32],
+        _eps: f32,
     ) -> Result<(), String> {
-        let _ = (full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps);
         Err("qsa_idx_append_dev 미지원".into())
     }
 
@@ -1123,11 +1123,7 @@ pub trait RawDecode: Send + Sync {
     }
     /// 프리필 배치 — emb [t][n], 마지막 토큰 logits.
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
-        let n = emb.len();
         let mut last = None;
-        for ti in 0..(n / 512) {
-            let _ = ti;
-        }
         for ch in emb.chunks(512) {
             last = Some(self.raw_step(seq, pos0, ch)?);
         }
@@ -1147,7 +1143,7 @@ pub fn w4a8_enabled() -> bool {
 pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
     matches!(
         ty,
-        llm170_gguf::GgmlType::Iq4Xs
+            | llm170_gguf::GgmlType::Iq4Xs
             | llm170_gguf::GgmlType::Iq3S
             | llm170_gguf::GgmlType::Q3K
             | llm170_gguf::GgmlType::Q4K
@@ -1350,83 +1346,6 @@ pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
             h.join().unwrap();
         }
     });
-}
-
-/// 단일 벡터 x에 대한 복수 가중치 내적 — thread::scope 1회로 스폰 오버헤드 제거.
-/// qwen4exp 디코드: MoE 전문가(10×2+1)·HC(3)마다 개별 matmul 대신 사용.
-/// outs[i][o] = Σ_j x[j]·W_i[o,j].
-pub fn matmul_multi(x: &[f32], ws: &[Weight], outs: &mut [Vec<f32>]) {
-    profile_span!("cpu::matmul_multi");
-    debug_assert_eq!(ws.len(), outs.len());
-    let offsets: Vec<usize> = ws
-        .iter()
-        .scan(0usize, |acc, w| {
-            let o = *acc;
-            *acc += w.n_out as usize;
-            Some(o)
-        })
-        .collect();
-    let total: usize = ws.iter().map(|w| w.n_out as usize).sum();
-    let nt = n_threads().max(1).min(total.max(1));
-    // 행 단위 워크 스틸링: AtomicU64 클레임 — 스레드 간 정적 분할 불필요,
-    // 쓰기 경쟁 없음(각 행은 한 스레드만). outs 행 소유권은 unsafe 없이
-    // split_at_mut 트리 대신 포인터 유사 안전 패턴: 각 (wi,row)는 유일.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let next = AtomicU64::new(0);
-    let results: std::sync::Mutex<Vec<(usize, usize, f32)>> = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _t in 0..nt {
-            let next_ref = &next;
-            let offsets_ref = offsets.as_slice();
-            // 각 스레드가 서로 다른 (wi,row)만 씀 — 쓰기 안전성은 클레임 유일성으로 보장.
-            // 안전하게 만들기 위해 outs를 스레드 수로 열 우선 분할하는 대신,
-            // 전역 행 인덱스 클레임 → 쓰기 대상 슬라이스를 unsafe 없이 얻기 위해
-            // std::cell::UnsafeCell 회피: 쓰기는 메인 스레드가 결과 버퍼에 모아두고
-            // 조인 후 분산. 간단·안전: 계산만 병렬, 기록은 직렬.
-            let results_ref = &results;
-            handles.push(scope.spawn(move || {
-                let mut scratch: Vec<f32> = Vec::new();
-                let mut local: Vec<(usize, usize, f32)> = Vec::new();
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed) as usize;
-                    if idx >= total {
-                        break;
-                    }
-                    let mut wi = 0usize;
-                    while wi < ws.len() && idx >= offsets_ref[wi] + ws[wi].n_out as usize {
-                        wi += 1;
-                    }
-                    if wi >= ws.len() {
-                        break;
-                    }
-                    let row = idx - offsets_ref[wi];
-                    let w = &ws[wi];
-                    let n_in = w.n_in as usize;
-                    if scratch.len() != n_in {
-                        scratch = vec![0.0f32; n_in];
-                    }
-                    let blocks = n_in / w.ty.blck_size() as usize;
-                    let base = row * blocks * w.ty.type_size() as usize;
-                    crate::quant::dequant_row(w.ty, &w.data[base..], 0, w.n_in, &mut scratch);
-                    let mut acc = 0.0f32;
-                    for i in 0..n_in {
-                        acc += x[i] * scratch[i];
-                    }
-                    local.push((wi, row, acc));
-                }
-                results_ref.lock().unwrap().extend(local);
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-    });
-    // 조인 후 기록 (클레임 유일성으로 중복 없음)
-    let results = results.into_inner().unwrap();
-    for (wi, row, v) in results {
-        outs[wi][row] = v;
-    }
 }
 
 /// logits → argmax (greedy와 동일 의미, 트레이트 기본구현용).

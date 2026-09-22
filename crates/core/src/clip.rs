@@ -61,7 +61,6 @@ impl Clip {
         // (find_tensor는 개별 조회 가능하지만 전목록이 필요)
         let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
         Self::collect_tensors(&mut f, &mut tensors, &mut data_offset)?;
-        let _ = &g;
         Ok(Self {
             file: f,
             data_offset,

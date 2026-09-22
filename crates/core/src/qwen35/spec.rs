@@ -270,13 +270,11 @@ impl Engine {
         if seqs.len() > per.max(1) {
             let mut out: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
             for c in seqs.chunks(per.max(1)) {
-                let i0 = out.len();
                 let ns: Vec<u32> = {
                     let base = seqs.iter().position(|&x| x == c[0]).unwrap_or(0);
                     (0..c.len()).map(|i| nexts[base + i]).collect()
                 };
                 out.extend(self.spec_step_multi(c, &ns, k)?);
-                let _ = i0;
             }
             return Ok(out);
         }
@@ -560,19 +558,9 @@ impl Engine {
             let kept = carried[si].len() + new_kept[si];
             let base = group_pos[si];
             let mut prev_h = self.seqs[seqs[si]].mtp_pending_h.clone();
-            let _trow = vec![0.0f32; n_e];
             for r in carried[si].len()..kept {
-                // 행 r 토큰 = carried면 carried[r], else next/drafts
-                let tok = if r < carried[si].len() {
-                    carried[si][r]
-                } else if r == carried[si].len() {
-                    nexts[si]
-                } else {
-                    all_drafts[si][r - carried[si].len() - 1]
-                };
                 let h_prev = prev_h.clone();
                 let row = &rows[(g0 + r) * n_e..(g0 + r + 1) * n_e];
-                let _ = tok;
                 // draft0 행(next)은 이미 mtp_step_gpu가 처리 — r == carried.len() 스킵
                 if r == carried[si].len() {
                     prev_h.copy_from_slice(&h_all[(g0 + r) * n_e..(g0 + r + 1) * n_e]);

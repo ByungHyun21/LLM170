@@ -704,7 +704,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             };
             if vulkan {
                 if std::env::var_os("LLM170_VK_ACC").is_some() {
-                    match llm170_backend_gpu::rawvk::gemv::VkAcc::new() {
+                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                         Ok(acc) => {
                             eng = eng.with_acc(std::sync::Arc::new(acc));
                             eprintln!("# backend: gpu (vulkan VkAcc)");
@@ -770,12 +770,6 @@ impl Detok {
     }
 }
 
-pub fn piece_plain(tok: u32) -> String {
-    TOKENIZER
-        .get()
-        .map(|t| t.piece(tok))
-        .unwrap_or_default()
-}
 
 /// 글로벌 토크나이저 (serve 시 1회 적재).
 pub static TOKENIZER: std::sync::OnceLock<crate::tokenize::Tokenizer> = std::sync::OnceLock::new();
