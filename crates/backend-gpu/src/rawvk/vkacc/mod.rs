@@ -74,6 +74,8 @@ const GEMV8_Q4B_SPV: &[u8] = include_bytes!("../spv/gemv8_q4b.spv");
 /// plans/89 P0.2 — f32/BF16 디코드 GEMV(라우터·sh-gate): fn_mm_f32(256스레드
 /// f64 트리, 512WG 지연바운드 — 실측 ~0.4GB/s급)의 64스레드 서브그룹Add 판.
 const MM_F32B_SPV: &[u8] = include_bytes!("../spv/mm_f32b.spv");
+/// plans/91 P3 — f32/BF16 디코드 GEMV 그룹판(행별 mm_f32b 비트 동일).
+const MM_F32B_GRP_SPV: &[u8] = include_bytes!("../spv/mm_f32b_grp.spv");
 /// plans/89 P0.3 — MoE direct-ids 디코드: llama dmmv 기하(64스레드·2행·
 /// 서브그룹Add)에 ids 간접을 얹은 판. q4_K은 q4b 파생, q5_1은 신규(FN down
 /// 질량). f32 활성 직결 — MoE quant 스킵, 산술 클래스는 gemv8 전환과 동열.
@@ -169,6 +171,7 @@ pub(crate) enum Slot {
     Gemv8Q4B,
     /// plans/89 P0.2 — f32/BF16 디코드 GEMV 64스레드 판.
     MmF32b,
+    MmF32bGrp,
     /// plans/88 P2 — q8_0 밀집 프리필 타일(K-슬라이스 스테이징).
     FnTileQ8,
     /// plans/89 P0.3 — MoE direct-ids dmmv 판(q4_K/q5_1).
@@ -208,6 +211,8 @@ pub struct VkAcc {
     /// 가중치 캐시 (데이터 포인터 → 상주 청크들)
     wcache: Mutex<HashMap<(usize, usize), Vec<VkBuf>>>,
     tables: Mutex<Option<(VkBuf, VkBuf)>>,
+    /// plans/91 P3 — mm_f32b_grp 정보 버퍼.
+    grp_info: Mutex<Option<VkBuf>>,
     dummy: Mutex<Option<VkBuf>>,
     // 값-경로 버퍼 (필요시 성장)
     xfbuf: Mutex<Option<VkBuf>>,
@@ -344,6 +349,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
     (Slot::Gemv8Q4B, "gemv8_q4b", GEMV8_Q4B_SPV, 10, 24),
     (Slot::MmF32b, "mm_f32b", MM_F32B_SPV, 10, 20),
+    (Slot::MmF32bGrp, "mm_f32b_grp", MM_F32B_GRP_SPV, 10, 16),
     (Slot::FnMoeIds, "moe_ids", FN_MOE_IDS_SPV, 13, 28),
     (Slot::FnMoeIds2, "moe_ids2", FN_MOE_IDS2_SPV, 11, 24),
     (Slot::FnMoeIds51, "moe_ids51", FN_MOE_IDS51_SPV, 11, 24),
@@ -416,6 +422,7 @@ impl VkAcc {
             pipes: Mutex::new(HashMap::new()),
             wcache: Mutex::new(HashMap::new()),
             tables: Mutex::new(None),
+            grp_info: Mutex::new(None),
             dummy: Mutex::new(None),
             xfbuf: Mutex::new(None),
             xbuf: Mutex::new(None),
@@ -456,6 +463,16 @@ impl VkAcc {
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
         Ok(p)
+    }
+
+    /// plans/91 P3 — mm_f32b_grp 정보 버퍼(u32 32워드) — 최초 1회 할당.
+    fn ensure_grp_info(&self, ctx: &mut VkCtx) -> Result<VkBuf, String> {
+        if self.grp_info.lock().is_none() {
+            let b = ctx.alloc_host(128)?;
+            *self.grp_info.lock() = Some(b);
+        }
+        let g = self.grp_info.lock();
+        Ok(g.as_ref().expect("grp_info").clone())
     }
 
     /// ktab(iq4nl)·grid3s 테이블 + 더미 버퍼 — 최초 1회 업로드.
