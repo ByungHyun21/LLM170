@@ -68,8 +68,7 @@ pub struct TsProf {
 impl VkCtx {
     /// 타임스탬프 주기(ns) — 프로파일러 없으면 None.
     pub fn ts_period(&self) -> Option<f64> {
-        let p = self.ts.as_ref()?;
-        let _ = &p;
+        self.ts.as_ref()?;
         Some(self.ts_period_val)
     }
 }

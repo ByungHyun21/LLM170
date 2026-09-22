@@ -112,8 +112,6 @@ impl DecoderState {
                         &[self.b_go.buf, self.b_gz.buf, sn.buf, self.b_ggated.buf],
                         &push, dt_rank as u32, 1, 1)?;
                 }
-                let xq_sg = d_inner / 4 + d_inner / 32 + d_inner / 16;
-                let _ = xq_sg;
                 }
                 if gskip & 4 == 0 {
                     self.gemv_w(self.b_ggated.buf, self.b_xq_g.buf, &format!("blk.{il}.ssm_out.weight"), self.b_gout.buf, 1, d_inner)?;
