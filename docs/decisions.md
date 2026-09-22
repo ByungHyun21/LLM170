@@ -1531,3 +1531,16 @@ Remaining axes (plans/89 residue): MoE-CM nondeterminism root cause
 topk per token — the serial rank/expand kernels are decode-only), 27B
 large-t tile family (llama int-dot MMQ needs the spirv-as pipeline —
 GLSL integer-dot is unsupported by the system glslc/glslang).
+
+### (32b) MoE-CM nondeterminism — race verdict (plans/89 resume, 2026-09-23)
+
+The 12-run stream histogram (identical binary, gate prompt) yields 10
+distinct streams incl. degenerate repetition loops — a finite tie-variant
+set is ruled out; combined with bit-level mout divergence under identical
+inputs (bufhash, varying first layer), this is a genuine data race in the
+coopmat MoE tiles that only manifests under engine working-set/occupancy
+conditions. Isolated harnesses (engine-pattern 3-GEMM x N layers, t-sweep
+46..512, late-layer scans blk.1..47, PLE-bridge skip, dmin-weighted scale
+bound) are all deterministic — no reproduction outside the full graph.
+Default stays OFF (deterministic greedy outranks +100 t/s). Toolkit:
+vk-moe-cm-race, LLM170_MTC_IL, LLM170_VK_Q4KCM/Q51CM split knobs.
