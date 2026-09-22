@@ -506,7 +506,6 @@ impl Engine {
                     mm_batch(&acc, &gate_y, &down_w, &mut xs)?;
                 });
             }
-            let _ = &gate_y;
             for t in 0..n_tok {
                 for i in 0..n_embd {
                     xs[t][i] += ffn_residual[t][i];
@@ -763,14 +762,6 @@ impl Engine {
 
 }
 
-pub fn greedy(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > bv {
-            bv = v;
-            best = i;
-        }
-    }
-    best as u32
-}
+/// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).
+/// 구현 중복 제거(plans/90 A1 D3): 단일 구현 재수출.
+pub use crate::matmul::greedy_from as greedy;
