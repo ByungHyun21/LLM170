@@ -8,13 +8,7 @@ pub mod rawhip;
 pub mod rawvk;
 
 pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
-pub use rawhip::q4acc::{new_acc as new_q4_acc, new_acc_with_sources as new_q4_acc_with_sources};
-/// plans/84 B — qwen4exp Vulkan 값경로 가속기(VkAcc, MatmulHost 전담).
-/// 프레임(FrameHost)은 미구현 → Engine4는 값 경로로 동작(호스트 스테이징).
-pub fn new_q4_acc_vk() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
-    let acc = rawvk::gemv::VkAcc::new()?;
-    Ok(std::sync::Arc::new(acc))
-}
+pub use rawhip::q4acc::new_acc_with_sources as new_q4_acc_with_sources;
 /// plans/86 §6 — 파트 소스 지정판: 대형 가중 업로드가 mmap 폴트(20-180 MB/s)
 /// 대신 pread 스테이징(~1.2 GB/s)을 쓴다(hip staged_upload 미러).
 pub fn new_q4_acc_vk_with_sources(
