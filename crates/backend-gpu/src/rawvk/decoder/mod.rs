@@ -74,6 +74,21 @@ const TILE_Q8MS_SPV: &[u8] = include_bytes!("../spv/tile_q8ms.spv");
 const TILE_XSMS_SPV: &[u8] = include_bytes!("../spv/tile_xsms.spv");
 const TILE_NLMS_SPV: &[u8] = include_bytes!("../spv/tile_nlms.spv");
 const TILE_MS128_SPV: &[u8] = include_bytes!("../spv/tile_ms128.spv");
+/// plans/91 P0 — np 배치 디코드: 행별 상태(링/AR/KV) 디바이스 주소 테이블 패밀리.
+const GDN_CONV_NP_SPV: &[u8] = include_bytes!("../spv/gdn_conv_np.spv");
+const GDN_ARF_NP_SPV: &[u8] = include_bytes!("../spv/gdn_arf_np.spv");
+const QK_ROPE2_NP_SPV: &[u8] = include_bytes!("../spv/qk_rope2_np.spv");
+const KV_APP_NP_SPV: &[u8] = include_bytes!("../spv/kv_app_np.spv");
+const QSA_FLASH_NP_SPV: &[u8] = include_bytes!("../spv/qsa_flash_np.spv");
+/// plans/91 P0 — np 배치 dmmv: WG가 t토큰 전체(가중 1회 판독). gemv8_*b 와
+/// 행×토큰 비트 동일.
+const GEMV8T_Q5_SPV: &[u8] = include_bytes!("../spv/gemv8t_q5.spv");
+const GEMV8T_Q4_SPV: &[u8] = include_bytes!("../spv/gemv8t_q4.spv");
+const GEMV8T_NL_SPV: &[u8] = include_bytes!("../spv/gemv8t_nl.spv");
+const GEMV8T_Q6_SPV: &[u8] = include_bytes!("../spv/gemv8t_q6.spv");
+const GEMV8T_Q3_SPV: &[u8] = include_bytes!("../spv/gemv8t_q3.spv");
+const GEMV8T_Q8_SPV: &[u8] = include_bytes!("../spv/gemv8t_q8.spv");
+const GEMV8T_XS_SPV: &[u8] = include_bytes!("../spv/gemv8t_xs.spv");
 
 /// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
@@ -220,6 +235,16 @@ pub struct DecoderState {
     qsb: VkBuf,  // [T_MAX][n_sub_max] i32
     ishs: VkBuf, // [640][256] i32 — coopMatStore SSBO (workgroup별)
     faccs: VkBuf, // [640][256] f32
+    // ── plans/91 P0 — np 배치: 상태 주소 테이블([그룹][슬롯] u64, 생성 후
+    // 불변)·행별 pos/slot 맵(스텝당 호스트 기입)·greedy 행별 argmax 스크래치.
+    np_conv_tbl: VkBuf,
+    np_gdn_tbl: VkBuf,
+    np_kvk_tbl: VkBuf,
+    np_kv_v_tbl: VkBuf,
+    np_pos: VkBuf,   // [n_seqs] u32 — 행 pos
+    np_slot: VkBuf,  // [n_seqs] u32 — 행→슬롯
+    b_amsc: VkBuf,   // [2*am_wg*T_MAX] u32 — 행별 argmax 스테이지1
+    b_amr: VkBuf,    // [T_MAX] u32 — 행별 argmax 결과
 }
 
 unsafe impl Send for DecoderState {}
@@ -345,7 +370,9 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         Ok(())
     }
 
-    /// np 배치 디코드 — seq별 순차 step (스트림 = 싱글 경로와 동일).
+    /// np 배치 디코드 (plans/91 P0) — t행 단일 패스 (무게 1회 판독, 상태커널은
+    /// 행별 상태 주소 테이블). 종전 seq별 순차 step 루프는 t배 비용이었다.
+    /// 행별 산술은 순차 루프와 비트 동일 (step_batch_np_ex 문서 참조).
     fn raw_step_multi(
         &self,
         seqs: &[usize],
@@ -354,17 +381,10 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     ) -> Result<Vec<Vec<f32>>, String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
-        let n = ds.n_embd;
-        let mut out = Vec::with_capacity(seqs.len());
-        for (i, (&sq, &ps)) in seqs.iter().zip(poss.iter()).enumerate() {
-            out.push(ds.step(sq, ps as usize, &emb[i * n..(i + 1) * n])?);
-        }
-        Ok(out)
+        ds.step_batch_np_ex(seqs, poss, emb, false).map(|(l, _)| l)
     }
 
-    /// np greedy 배치 — 토큰만 회수 (기본 구현은 로짓 전사 + CPU 스캔이라
-    /// np4 어그리게이트가 10.3까지 무너졌다; plans/83 D5). step_core+GPU argmax
-    /// 루프 = 싱글 디코드 비용 × n_seq.
+    /// np greedy 배치 — GPU 행별 argmax로 토큰만 회수 (로짓 전사 회피).
     fn raw_step_multi_greedy(
         &self,
         seqs: &[usize],
@@ -373,13 +393,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     ) -> Result<Vec<u32>, String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
-        let n = ds.n_embd;
-        let mut toks = Vec::with_capacity(seqs.len());
-        for (i, (&sq, &ps)) in seqs.iter().zip(poss.iter()).enumerate() {
-            ds.step_core(sq, ps as usize, &emb[i * n..(i + 1) * n])?;
-            toks.push(ds.lg_argmax()?);
-        }
-        Ok(toks)
+        ds.step_batch_np_ex(seqs, poss, emb, true).map(|(_, t)| t)
     }
 
     /// np×spec 병합 검증 — 그룹(seq-major)별 per-token step.

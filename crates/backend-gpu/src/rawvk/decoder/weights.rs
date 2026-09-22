@@ -203,6 +203,29 @@ impl DecoderState {
             st_gdn.push(gd);
             st_conv.push(cv);
         }
+        // plans/91 P0 — np 배치 상태 주소 테이블 ([그룹][슬롯] u64). 디바이스
+        let mut np_mk_tbl = |rows: &[Vec<VkBuf>]| -> Result<VkBuf, String> {
+        // GL_EXT_buffer_reference 로 행별 상태를 직접 주소 지정한다.
+            let mut v = Vec::with_capacity(rows.len() * n_seqs);
+            for row in rows {
+                for b in row {
+                    v.push(ctx.buffer_va(b.buf));
+                }
+            }
+            let t = ctx.alloc_host(v.len() * 8)?;
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, t.ptr, v.len() * 8) };
+            Ok(t)
+        };
+        let np_conv_tbl = np_mk_tbl(&st_conv)?;
+        let np_gdn_tbl = np_mk_tbl(&st_gdn)?;
+        let np_kvk_tbl = np_mk_tbl(&kv_k)?;
+        let np_kv_v_tbl = np_mk_tbl(&kv_v)?;
+        let np_pos = ctx.alloc_host(n_seqs.max(1) * 4)?;
+        let np_slot = ctx.alloc_host(n_seqs.max(1) * 4)?;
+        // np greedy 행별 argmax(fn_argmax_rows 2단계) 스크래치.
+        let am_wg = n_vocab.div_ceil(256 * 8);
+        let b_amsc = ctx.alloc_host(2 * am_wg * T_MAX * 4)?;
+        let b_amr = ctx.alloc_host(T_MAX * 4)?;
 
         let xq_sn = crate::rawvk::vkacc::xq_words(n);
         let xq_sf = crate::rawvk::vkacc::xq_words(hp.n_ff);
@@ -460,6 +483,14 @@ impl DecoderState {
             i8w,
             wsr: wsr_map,
             b8,
+            np_conv_tbl,
+            np_gdn_tbl,
+            np_kvk_tbl,
+            np_kv_v_tbl,
+            np_pos,
+            np_slot,
+            b_amsc,
+            b_amr,
             ydb,
             qsb,
             ishs,

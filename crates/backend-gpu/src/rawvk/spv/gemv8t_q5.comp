@@ -1,0 +1,133 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// gemv8t_q5 (plans/91 P0) — gemv8_q5b 의 np 배치판: 워크그룹이 t토큰 전체를
+// 처리한다 (그리드 z=1 — 종전 z=t는 토큰당 가중 전량 재판독 + WG 수 t배로
+// 디스패치 드레인이 지연의 주벚이었다, [ts]/LAYERS 바이섹트 실측).
+// 행×토큰 산술은 gemv8_q5b 의 해당 (행,토큰) 실행과 비트 동일 — 블록 i-스트라이드,
+// fma 체인, 축산 순서 모두 보존. 가중 언팩은 토큰 루프 밖(1회).
+// 레지스터: acc[nrows][T8] — t ≤ 8 (np 슬롯 상한).
+layout(local_size_x = 64) in;
+struct Blk {
+    f16vec2 dm;
+    uint16_t scales[6];
+    uint16_t qh[16];
+    uint16_t qs[64];
+};
+layout(binding = 0) readonly buffer AP16S { Blk ablk[]; };
+
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint cw_log2; uint cw_mask; uint rpf;
+} pc;
+
+uvec4 unpk8(uint x) {
+    return uvec4(x & 0xFFu, (x >> 8) & 0xFFu, (x >> 16) & 0xFFu, x >> 24);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nrows = min(uint(pc.rpf), 4u);
+    const uint first_row = nrows * gl_WorkGroupID.y;
+    uint num_rows = nrows;
+    if (first_row + nrows > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint num_blocks_per_row = pc.n_in / 256u;
+    const uint it_size = 64u / 16u;   // 4
+    const uint itid = tid % 16u;
+    const uint ix = tid / 16u;
+    const uint il = itid / 4u;
+    const uint ir = itid - 4u * il;
+    const uint v_im = il / 2u;
+    const uint v_in = il % 2u;
+    const uint l0 = 4u * ir + 2u * v_in;
+    const uint q_offset = 32u * v_im + l0;
+    const uint y_offset = 64u * v_im + l0;
+    vec4 accv[4];
+    for (uint n = 0u; n < 4u; n++) accv[n] = vec4(0.0);
+
+    for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        [[unroll]] for (uint n = 0u; n < 4u; n++) {
+            if (n >= num_rows) break;
+            const uint ib = (first_row + n) * num_blocks_per_row + i;
+            const vec2 dm = vec2(ablk[ib].dm);
+            const uint s0 = uint(ablk[ib].scales[v_im]);
+            const uint s4 = uint(ablk[ib].scales[v_im + 2u]);
+            const uint s8 = uint(ablk[ib].scales[v_im + 4u]);
+            const uint s_0_4_l = (s4 << 16) | s0;
+            const uint s_0_4_h = (s_0_4_l & 0xC0C0C0C0u) >> 2;
+            const uvec4 s_l4 = unpk8(s_0_4_l & 0x3F3F3F3Fu);
+            const uvec4 s_84 = unpk8((((s8 << 12) | s8) & 0x0F0F0F0Fu) | s_0_4_h);
+            const float sc0 = float(s_l4.x), sc1 = float(s_l4.y), sc2 = float(s_l4.z), sc3 = float(s_l4.w);
+            const float sc4 = float(s_84.x), sc5 = float(s_84.y), sc6 = float(s_84.z), sc7 = float(s_84.w);
+            const uint q_a = uint(ablk[ib].qs[q_offset / 2u]) | (uint(ablk[ib].qs[q_offset / 2u + 8u]) << 16);
+            const uint q_b = uint(ablk[ib].qs[q_offset / 2u + 32u]) | (uint(ablk[ib].qs[q_offset / 2u + 40u]) << 16);
+            uint a_lo = q_a & 0x0F0F0F0Fu;
+            uint a_hi = (q_a >> 4) & 0x0F0F0F0Fu;
+            uint b_lo = q_b & 0x0F0F0F0Fu;
+            uint b_hi = (q_b >> 4) & 0x0F0F0F0Fu;
+            const uint qh = uint(ablk[ib].qh[l0 / 2u]) | (uint(ablk[ib].qh[l0 / 2u + 8u]) << 16);
+            a_lo += ((qh >> (2u * v_im)) & 0x01010101u) << 4;
+            a_hi += ((qh >> (2u * v_im)) & 0x02020202u) << 3;
+            b_lo += (qh >> (2u * v_im)) & 0x10101010u;
+            b_hi += ((qh >> (2u * v_im)) & 0x20202020u) >> 1;
+            const uvec4 v_a_lo = unpk8(a_lo), v_a_hi = unpk8(a_hi), v_b_lo = unpk8(b_lo), v_b_hi = unpk8(b_hi);
+            const float q0 = float(v_a_lo.x), q1 = float(v_a_lo.y), q2 = float(v_a_lo.z), q3 = float(v_a_lo.w);
+            const float q4 = float(v_a_hi.x), q5 = float(v_a_hi.y), q6 = float(v_a_hi.z), q7 = float(v_a_hi.w);
+            const float q8 = float(v_b_lo.x), q9 = float(v_b_lo.y), q10 = float(v_b_lo.z), q11 = float(v_b_lo.w);
+            const float q12 = float(v_b_hi.x), q13 = float(v_b_hi.y), q14 = float(v_b_hi.z), q15 = float(v_b_hi.w);
+            // vec4 레인=토큰 — 성분별 산술은 해당 토큰의 스칼라 체인과 비트 동일.
+            const uint yb0 = i * 256u + y_offset;
+            #define BYV(off) vec4(xa[0u * pc.n_in + yb0 + (off)], xa[1u * pc.n_in + yb0 + (off)], xa[2u * pc.n_in + yb0 + (off)], xa[3u * pc.n_in + yb0 + (off)])
+            const vec4 by0 = BYV(0u);
+            const vec4 by1 = BYV(1u);
+            const vec4 by2 = BYV(16u);
+            const vec4 by3 = BYV(17u);
+            const vec4 by4 = BYV(32u);
+            const vec4 by5 = BYV(33u);
+            const vec4 by6 = BYV(48u);
+            const vec4 by7 = BYV(49u);
+            const vec4 by8 = BYV(128u);
+            const vec4 by9 = BYV(129u);
+            const vec4 by10v = BYV(144u);
+            const vec4 by11 = BYV(145u);
+            const vec4 by12 = BYV(160u);
+            const vec4 by13 = BYV(161u);
+            const vec4 by14 = BYV(176u);
+            const vec4 by15 = BYV(177u);
+            const vec4 sx = fma(by0, vec4(q0), fma(by1, vec4(q1), fma(by2, vec4(q2), by3 * vec4(q3))));
+            const vec4 sy = fma(by4, vec4(q4), fma(by5, vec4(q5), fma(by6, vec4(q6), by7 * vec4(q7))));
+            const vec4 sz = fma(by8, vec4(q8), fma(by9, vec4(q9), fma(by10v, vec4(q10), by11 * vec4(q11))));
+            const vec4 sw = fma(by12, vec4(q12), fma(by13, vec4(q13), fma(by14, vec4(q14), by15 * vec4(q15))));
+            const vec4 smin =
+                fma(by0 + by1 + by2 + by3, vec4(sc2),
+                fma(by4 + by5 + by6 + by7, vec4(sc3),
+                fma(by8 + by9 + by10v + by11, vec4(sc6),
+                    (by12 + by13 + by14 + by15) * vec4(sc7))));
+            const vec4 r = vec4(dm.x) * fma(sx, vec4(sc0), fma(sy, vec4(sc1), fma(sz, vec4(sc4), sw * vec4(sc5)))) - vec4(dm.y) * smin;
+            accv[n] += r;
+        }
+    }
+    // 축소: WG = 1 웨이브64 서브그룹 — 행×토큰별 subgroupAdd (원판과 동일 원리).
+    const vec4 r0 = subgroupAdd(accv[0]);
+    const vec4 r1 = num_rows > 1u ? subgroupAdd(accv[1]) : vec4(0.0);
+    const vec4 r2 = num_rows > 2u ? subgroupAdd(accv[2]) : vec4(0.0);
+    const vec4 r3 = num_rows > 3u ? subgroupAdd(accv[3]) : vec4(0.0);
+    if (tid == 0u) {
+        [[unroll]] for (uint tk = 0u; tk < 4u; tk++) {
+            if (tk >= pc.t) continue;
+            outv[tk * pc.n_out + first_row] = r0[tk];
+            if (num_rows > 1u) outv[tk * pc.n_out + first_row + 1u] = r1[tk];
+            if (num_rows > 2u) outv[tk * pc.n_out + first_row + 2u] = r2[tk];
+            if (num_rows > 3u) outv[tk * pc.n_out + first_row + 3u] = r3[tk];
+        }
+    }
+}
