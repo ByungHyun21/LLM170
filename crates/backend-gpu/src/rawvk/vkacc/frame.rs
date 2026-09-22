@@ -223,7 +223,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 도메인, 타일=전문가, x는 perm_pad 간접 판독 — 게더 패스 불필요) +
         // inv_pad 산란. 호스트 ids 왕복·512 전문가 루프 전부 소거(B2).
         // 산술: hip ge/w_ids 열과 동일 표현식 — 프리필 클래스 재기록 대상.
+        // fn_moe_group 셰이더 공유 배열 한계(ne ≤ 512) — 초과 모델은 조기복귀로
+        // 테이블 미기록 상태가 되므로 호스트에서 차단(현행 512-전문가 무영향).
         let tile_ok = rows > 0
+            && ne <= 512
             && match w.ty {
                 GgmlType::Q4K => n_in <= 4096,
                 GgmlType::Q5_1 => n_in <= 2048,
