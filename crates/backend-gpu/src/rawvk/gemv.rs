@@ -104,6 +104,9 @@ const FN_MOE_TILE_Q51_SG1_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_sg1.s
 const FN_MOE_TILE_Q4K_SG1_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_sg1.spv");
 /// plans/89 재개 — q4_K 8-서브블록 스테이징 판(반복/장벽 q51_sg1과 동일).
 const FN_MOE_TILE_Q4K_SG8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_sg8.spv");
+/// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
+const FN_IDX_SCORE_MT_SPV: &[u8] = include_bytes!("spv/fn_idx_score_mt.spv");
+const FN_IDX_TOPK_MT_SPV: &[u8] = include_bytes!("spv/fn_idx_topk_mt.spv");
 /// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("spv/fn_ple_conv.spv");
@@ -193,6 +196,8 @@ enum Slot {
     FnPleGate,
     FnMoeTileQ4kSg1,
     FnMoeTileQ4kSg8,
+    FnIdxScoreMt,
+    FnIdxTopkMt,
     FnPleConv,
     FnPleRes,
     /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
@@ -363,6 +368,8 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeTileQ51Sg1 => "moe_tile_q51_sg1",
         Slot::FnMoeTileQ4kSg1 => "moe_tile_q4k_sg1",
         Slot::FnMoeTileQ4kSg8 => "moe_tile_q4k_sg8",
+        Slot::FnIdxScoreMt => "idx_score_mt",
+        Slot::FnIdxTopkMt => "idx_topk_mt",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
         Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
@@ -504,6 +511,8 @@ impl VkAcc {
             Slot::FnMoeTileQ51Sg1 => (FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
             Slot::FnMoeTileQ4kSg1 => (FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
             Slot::FnMoeTileQ4kSg8 => (FN_MOE_TILE_Q4K_SG8_SPV, 13, 28),
+            Slot::FnIdxScoreMt => (FN_IDX_SCORE_MT_SPV, 3, 20),
+            Slot::FnIdxTopkMt => (FN_IDX_TOPK_MT_SPV, 3, 20),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -1357,6 +1366,121 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let mut so = vec![0u32; 2];
         unsafe { std::ptr::copy_nonoverlapping(b.6.ptr as *const u32, so.as_mut_ptr(), 2) };
         Ok((si, so))
+    }
+
+    /// plans/89 재개 — 프리필 다중 토큰 디바이스 선택: (적립+블록키) →
+    /// q_rope(t행) → 점수(t×nb) → 토큰별 비토닉 top-k → 평탄 목록+sel_off.
+    /// 호스트 d2h 4회(플러시)와 CPU 점수/정렬 소거. nb ≤ 4096.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_dev_mt(
+        &self,
+        full_idx: usize,
+        seq: usize,
+        iq: u64,
+        ik: u64,
+        t: usize,
+        pos0: usize,
+        idx_heads: usize,
+        idx_dim: usize,
+        r: usize,
+        idx_top_k: usize,
+        iqw: &[f32],
+        ikw: &[f32],
+        cs_idx: &[f32],
+        eps: f32,
+    ) -> Result<(u64, u64, usize), String> {
+        if r == 0 || idx_dim != 128 {
+            return Err(format!("vk qsa_sel_dev_mt: r={r} idx_dim={idx_dim}"));
+        }
+        let nb_cap = (pos0 + t) / r;
+        if nb_cap > 4096 {
+            return Err(format!("vk qsa_sel_dev_mt: nb={nb_cap} > 4096 (호스트 폴백)"));
+        }
+        // 목록 총길이 — 산술(qsa_sel_list 동일식, 무동기).
+        let mut list_len = 0usize;
+        for tok in 0..t {
+            let n_past = pos0 + tok + 1;
+            let nb = n_past / r;
+            let tail = n_past - nb * r;
+            let width = n_past.min(idx_top_k + r - 1);
+            let ns = ((width - tail) / r).min(nb);
+            list_len += ns * r + tail;
+        }
+        self.qsa_idx_append_dev(full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
+        let iqr_bytes = t * idx_heads * idx_dim * 4;
+        let scr_bytes = t * nb_cap.max(1) * 4;
+        let cs_bytes = t * (idx_dim / 2) * 2 * 4;
+        let sd_bytes = list_len.max(1) * 4;
+        let of_bytes = (t + 1) * 4;
+        let mut ctx = self.ctx.lock();
+        {
+            let mut g = self.qsa_sel_bufs.lock();
+            let need = match g.as_ref() {
+                None => true,
+                Some(b) => {
+                    b.0.bytes < iqr_bytes
+                        || b.1.bytes < scr_bytes
+                        || b.4.bytes < cs_bytes
+                        || b.5.bytes < sd_bytes
+                        || b.6.bytes < of_bytes
+                }
+            };
+            if need {
+                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
+                    ctx.alloc_host(iqr_bytes.max(1 << 16))?,
+                    ctx.alloc_host(scr_bytes.max(4096))?,
+                    ctx.alloc_host(4096)?,
+                    ctx.alloc_host((iqw.len() * 4).max(4096))?,
+                    ctx.alloc_host(cs_bytes.max(1 << 16))?,
+                    ctx.alloc_host(sd_bytes.max(1 << 16))?,
+                    ctx.alloc_host(of_bytes.max(4096))?,
+                )))?);
+            }
+        }
+        let (iqr, scr, _flg, iqwb, csb, sdev, ofdev) = {
+            let g = self.qsa_sel_bufs.lock();
+            let b = g.as_ref().unwrap();
+            (b.0.clone(), b.1.clone(), b.2.clone(), b.3.clone(), b.4.clone(), b.5.clone(), b.6.clone())
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(iqw.as_ptr(), iqwb.ptr as *mut f32, iqw.len());
+            std::ptr::copy_nonoverlapping(
+                cs_idx[pos0 * idx_dim..].as_ptr(),
+                csb.ptr as *mut f32,
+                t * idx_dim,
+            );
+        }
+        let iqb = self.fbuf(iq)?;
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnIdxQRope)?;
+            let ds = ctx.bind_ds(&p, &[iqb, iqr.buf, iqwb.buf, csb.buf])?;
+            let mut push = eps.to_le_bytes().to_vec();
+            push.extend_from_slice(&push_u32s(&[idx_dim as u32]));
+            ctx.run(p.pl, ds, p.pipe, &push, idx_heads as u32, t as u32, 1)?;
+        }
+        let bkb = {
+            let m = self.qsa_pools.lock();
+            m.get(&(full_idx, seq))
+                .map(|e| e.3.buf)
+                .ok_or("vk qsa_sel_dev_mt: bk 풀 없음")?
+        };
+        if nb_cap > 0 {
+            let p = self.pipeline(&mut ctx, Slot::FnIdxScoreMt)?;
+            let ds = ctx.bind_ds(&p, &[iqr.buf, bkb, scr.buf])?;
+            let push = push_u32s(&[
+                pos0 as u32, r as u32, idx_heads as u32, idx_dim as u32, nb_cap as u32,
+            ]);
+            ctx.run(p.pl, ds, p.pipe, &push, nb_cap.div_ceil(256) as u32, t as u32, 1)?;
+        }
+        {
+            let p = self.pipeline(&mut ctx, Slot::FnIdxTopkMt)?;
+            let ds = ctx.bind_ds(&p, &[scr.buf, sdev.buf, ofdev.buf])?;
+            let push = push_u32s(&[
+                pos0 as u32, t as u32, r as u32, idx_top_k as u32, nb_cap as u32,
+            ]);
+            ctx.run(p.pl, ds, p.pipe, &push, 1, t as u32, 1)?;
+        }
+        Ok((sdev.buf.as_raw(), ofdev.buf.as_raw(), list_len))
     }
 
     /// plans/85 §2 — sel 목록이 디바이스에 있는 상주판 어텐션(업로드 없음,
