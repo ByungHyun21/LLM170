@@ -205,12 +205,8 @@ impl Q4Acc {
         {
             let mut wm = self.qsa_kv_pos.lock().map_err(|e| e.to_string())?;
             let w = wm.entry((full_idx, seq)).or_insert(0);
-            if pos0 > *w {
-                return Err(format!(
-                    "qsa_kv_dev: 워터마크 구멍 w={w} pos0={pos0} — 업로드 경로로 폴백"
-                ));
-            }
-            *w = pos0 + t;
+            crate::common::qsa::wm_advance(w, pos0, t)
+                .map_err(|e| format!("qsa_kv_dev: {e}"))?;
         }
         let mut m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
         let ent = m
@@ -259,10 +255,8 @@ impl Q4Acc {
         {
             let mut wm = self.qsa_idx_pos.lock().map_err(|e| e.to_string())?;
             let w = wm.entry((full_idx, seq)).or_insert(0);
-            if pos0 > *w {
-                return Err(format!("qsa_idx_append: 워터마크 구멍 w={w} pos0={pos0}"));
-            }
-            *w = pos0 + t;
+            crate::common::qsa::wm_advance(w, pos0, t)
+                .map_err(|e| format!("qsa_idx_append: {e}"))?;
         }
         let nb_max = ctx_len / r + 1;
         let (idxk_p, bk_p) = {

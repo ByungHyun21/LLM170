@@ -68,8 +68,7 @@ pub struct TsProf {
 impl VkCtx {
     /// 타임스탬프 주기(ns) — 프로파일러 없으면 None.
     pub fn ts_period(&self) -> Option<f64> {
-        let p = self.ts.as_ref()?;
-        let _ = &p;
+        self.ts.as_ref()?;
         Some(self.ts_period_val)
     }
 }
@@ -737,7 +736,7 @@ impl VkCtx {
                 .device
                 .create_shader_module(&smci, None)
                 .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
-            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NR").is_some();
+            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NOROB").is_some();
             let mut rci = vk::PipelineRobustnessCreateInfoEXT::default()
                 .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
                 .uniform_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)

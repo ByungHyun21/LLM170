@@ -236,6 +236,9 @@ fn parse_sampler(body: &str) -> Option<llm170_core::sampler::SamplerParams> {
     if !p.is_greedy() { Some(p) } else { None }
 }
 
+/// qwen 어휘 <end_of_turn> — chat/anthropic 조기 정지 토큰 (EOS 248044와 구분).
+const STOP_EOT: u32 = 248046;
+
 fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Result<(), String> {
     loop {
         let req = match read_request(&mut stream) {
@@ -285,7 +288,7 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                 let stream_mode = jbool(&req.body, "stream");
                 let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![248046], parse_sampler(&req.body));
+                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![STOP_EOT], parse_sampler(&req.body));
             }
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
@@ -391,7 +394,7 @@ fn run_and_emit_anthropic(
         n_predict,
         spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
         sampler,
-        stops: vec![248046],
+        stops: vec![STOP_EOT],
         progress: stream_mode.then_some(ptx),
         out: otx,
     };
@@ -420,29 +423,13 @@ fn run_and_emit_anthropic(
     while let Ok(r) = orx.recv() {
         all.extend(r.tokens);
     }
-    if !stream_mode {
-        let mut det = crate::engine::Detok::new();
-        let text: String = all.iter().map(|&t| det.push(t)).collect();
-        let esc = json_esc(&text);
-        resp(
-            stream,
-            200,
-            "application/json",
-            &format!("{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"end_turn\"}}"),
-        );
-        return;
-    }
-    resp_sse_open(stream);
-    sse(stream, "message_start", "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}");
-    for t in &all {
-        let p = crate::engine::piece_plain(*t);
-        let esc = p.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
-        sse(
-            stream,
-            "content_block_delta",
-            &format!("{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"),
-        );
-    }
-    sse(stream, "message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}");
-    sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
+    let mut det = crate::engine::Detok::new();
+    let text: String = all.iter().map(|&t| det.push(t)).collect();
+    let esc = json_esc(&text);
+    resp(
+        stream,
+        200,
+        "application/json",
+        &format!("{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"end_turn\"}}"),
+    );
 }

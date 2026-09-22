@@ -166,83 +166,71 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
-        "hca-repro" => llm170_backend_gpu::rawhip::hca_repro(),
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-mmq-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/tmp/model_link.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(512usize);
-            llm170_backend_gpu::rawvk::gemv::vk_mmq_check(&path, &tn, t)
+            llm170_backend_gpu::rawvk::checks::vk_mmq_check(&path, &tn, t)
         }
         "vk-gemv-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.attn_gate.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
-            llm170_backend_gpu::rawvk::gemv::gemv_check(&path, &tn, t)
+            llm170_backend_gpu::rawvk::checks::gemv_check(&path, &tn, t)
         }
-        "vk-sdot-probe" => llm170_backend_gpu::rawvk::gemv::sdot_probe(),
-        "vk-idot-probe" => llm170_backend_gpu::rawvk::gemv::idot_probe(),
+        "vk-sdot-probe" => llm170_backend_gpu::rawvk::checks::sdot_probe(),
+        "vk-idot-probe" => llm170_backend_gpu::rawvk::checks::idot_probe(),
         "vk-gemv8-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ssm_out.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
-            llm170_backend_gpu::rawvk::gemv::gemv8_check(&path, &tn, t)
+            llm170_backend_gpu::rawvk::checks::gemv8_check(&path, &tn, t)
         }
         "vk-ft32-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
-            llm170_backend_gpu::rawvk::gemv::ft32_check(&path)
+            llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
         "vk-moe-tile-check" => {
             let mode = args.first().cloned().unwrap_or_else(|| "q8_0".into());
-            llm170_backend_gpu::rawvk::gemv::moe_tile_type_check(&mode)
+            llm170_backend_gpu::rawvk::checks::moe_tile_type_check(&mode)
         }
-        "vk-moe-cm-race" => llm170_backend_gpu::rawvk::gemv::moe_cm_race_check(),
+        "vk-moe-cm-race" => llm170_backend_gpu::rawvk::checks::moe_cm_race_check(),
         "mmv-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.1.attn_qkv.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1usize);
-            llm170_backend_gpu::rawvk::gemv::mmv_check(&path, &tn, t)
+            llm170_backend_gpu::rawvk::checks::mmv_check(&path, &tn, t)
         }
         "dbg-q3b" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_up.weight".into());
-            llm170_backend_gpu::rawvk::gemv::q3b_dbg(&path, &tn)
+            llm170_backend_gpu::rawvk::checks::q3b_dbg(&path, &tn)
         }
         "dbg-q3" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_up.weight".into());
-            llm170_backend_gpu::rawvk::gemv::q3_dbg(&path, &tn)
+            llm170_backend_gpu::rawvk::checks::q3_dbg(&path, &tn)
         }
         "vk-frame-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_down_shexp.weight".into());
-            llm170_backend_gpu::rawvk::gemv::frame_check(&path, &tn)
+            llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
         }
         "vk-tile-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.0.ffn_down.weight".into());
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(32);
-            llm170_backend_gpu::rawvk::gemv::tile_check(&path, &tn, t)
+            llm170_backend_gpu::rawvk::checks::tile_check(&path, &tn, t)
         }
         "subsum-check" => llm170_backend_gpu::rawvk::subsum_check(),
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
-        "roof-test" => llm170_backend_gpu::rawhip::roof_test(),
-        "wmma-check" => llm170_backend_gpu::rawhip::wmma_check(),
-        "wmma2-check" => llm170_backend_gpu::rawhip::wmma2_check(),
-        "wmma2-map" => llm170_backend_gpu::rawhip::wmma2_map(),
-        "wmma2-map2" => llm170_backend_gpu::rawhip::wmma2_map2(),
-        "wmma2-attn-check" => llm170_backend_gpu::rawhip::wmma2_attn_check(),
-        "attn-check" => llm170_backend_gpu::rawhip::attn_check(),
-        "wmma-check-ldm" => llm170_backend_gpu::rawhip::wmma_check_ldm(),
-        "wmma-check-pv" => llm170_backend_gpu::rawhip::wmma_check_pv(),
-        "wmma-attn-check" => llm170_backend_gpu::rawhip::wmma_attn_check(),
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
         "bw-test" => llm170_backend_gpu::rawhip::bw_test(),
-        "bw-place" => llm170_backend_gpu::rawhip::bw_place_test(),
         "dp4a-test" => llm170_backend_gpu::rawhip::dp4a_test(),
         "iq3s-probe" => llm170_backend_gpu::rawhip::iq3s_probe(),
         "qk-check" => llm170_backend_gpu::rawhip::qk_check(),
@@ -782,7 +770,7 @@ fn cmd_va_lookup(tsv: &str, addr: &str) -> ExitCode {
 
 /// plans/87 §1 — 의도적 GPUVM 폴트(디스크립터 오프셋 OOB) 유발.
 fn cmd_vk_fault_probe() -> ExitCode {
-    match llm170_backend_gpu::rawvk::gemv::fault_probe() {
+    match llm170_backend_gpu::rawvk::checks::fault_probe() {
         Ok(msg) => {
             println!("# fault-probe: {msg}");
             ExitCode::SUCCESS

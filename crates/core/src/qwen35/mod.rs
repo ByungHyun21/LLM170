@@ -8,11 +8,12 @@
 //! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
+mod diag;
 pub mod hparams;
 pub mod prefill;
 pub mod rawinject;
 pub mod spec;
-mod layers;
+pub mod stages;
 pub(crate) mod frame;
 pub use frame::Frame;
 
@@ -426,12 +427,13 @@ impl Engine {
                 }
             }
 
+            let ctx = stages::Ctx { model: &self.model, acc: &self.acc };
             let attn_out = if self.model.is_recr(il) {
-                let o = self.gdn_layer(il, &xs, seq_ids, t_len, recr_idx)?;
+                let o = stages::gdn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, recr_idx)?;
                 recr_idx += 1;
                 o
             } else {
-                let o = self.attn_layer(il, &xs, seq_ids, t_len, full_idx)?;
+                let o = stages::attn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, full_idx)?;
                 full_idx += 1;
                 o
             };
@@ -506,7 +508,6 @@ impl Engine {
                     mm_batch(&acc, &gate_y, &down_w, &mut xs)?;
                 });
             }
-            let _ = &gate_y;
             for t in 0..n_tok {
                 for i in 0..n_embd {
                     xs[t][i] += ffn_residual[t][i];
@@ -763,14 +764,6 @@ impl Engine {
 
 }
 
-pub fn greedy(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > bv {
-            bv = v;
-            best = i;
-        }
-    }
-    best as u32
-}
+/// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).
+/// 구현 중복 제거(plans/90 A1 D3): 단일 구현 재수출.
+pub use crate::matmul::greedy_from as greedy;
