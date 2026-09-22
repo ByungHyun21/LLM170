@@ -1,0 +1,141 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fn_moe_tile_q51_sg1 (plans/89 재개) — q5_1 MoE coopmat 타일의 1-서브그룹
+// 판(64스레드, WG=16출력열×16전문가행). tile128v2 전례(서브그룹 간 coopmat
+// 경쟁)의 정면 검증용: 이 판이 엔진에서 결정적이면 8sg판의 경쟁은 서브그룹
+// 스케줄링에 국소화되고, 이 판 자체가 스칼라(860ms/청크) 대비 생산 대체가
+// 된다(coopmat MMA 유지, LDS 5.6KB → 고점유). 산술·스케일 계약은
+// fn_moe_tile_q51_cm과 동일.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+shared float16_t A16[16][68];
+shared float16_t B16[16][68];
+shared float CtmpF[16][17];
+shared float scale_row[16];
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+// A 스테이징: 64스레드 = 16행 × 4청크(8원소). w = (d·v + m)/scale_row[r].
+void stage_a(int sb, int colb, int row0, int nrow, uint ebase, uint row_words, int tid) {
+    int r = int(tid >> 2);
+    int kc = int(tid & 3) * 8;
+    int row = row0 + r;
+    if (row < row0 + nrow) {
+        uint wq = ebase + uint(row) * row_words + uint(sb) * 6u;
+        float d = f16_exact(w0c[wq] & 0xFFFFu);
+        float m = f16_exact(w0c[wq] >> 16);
+        float inv = 1.0 / scale_row[r];
+        uint qh = w0c[wq + 1u];
+        for (int e = 0; e < 8; e++) {
+            int l = kc + e;
+            uint qs_w = w0c[wq + 2u + uint((l & 15) >> 2)];
+            uint b = (qs_w >> uint(((l & 15) & 3) * 8)) & 0xFFu;
+            uint nib = (l < 16) ? (b & 0xFu) : (b >> 4);
+            uint qhbit = (qh >> uint(l)) & 1u;
+            float v = float(nib | (qhbit << 4));
+            A16[r][colb + l] = float16_t((d * v + m) * inv);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+// B 스테이징: 동일 매핑(rb = tid>>2, k2 = (tid&3)*8, 8원소 연속).
+void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
+    int rb = int(tid >> 2);
+    int k2 = int(tid & 3) * 8;
+    if (live && rb < nt16) {
+        uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+        int xw = sb << 3;
+        float yd = uintBitsToFloat(xq[base + uint((int(pc.n_in) >> 2) + sb)]);
+        for (int e = 0; e < 8; e++) {
+            uint wv = xq[base + uint(xw + ((k2 + e) >> 2))];
+            int b = int((wv >> uint(((k2 + e) & 3) * 8)) & 0xFFu) << 24 >> 24;
+            B16[rb][colb + k2 + e] = float16_t(float(b) * yd);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) B16[rb][colb + k2 + e] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tidy = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;      // 0..63
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 16;               // 출력 16열/WG
+    int nrow = int(min(16u, pc.n_out - uint(row0)));
+    int r0e = int(tidy) * 16;
+    uint rp = rows_pad[0];
+    if (uint(r0e) >= rp) return;
+    uint e = rowexp[uint(r0e)];
+    int nt16 = int(min(16u, rp - uint(r0e)));
+    uint row_words = uint(n_sub) * 6u;
+    uint ebase = e * (pc.per_expert_bytes >> 2);
+
+    // 프리패스: 16행 스케일 = max(31|d|, |m|).
+    {
+        for (int i = int(tid); i < nrow; i += 64) {
+            uint wq = ebase + uint(row0 + i) * row_words;
+            float mx = 1e-30;
+            for (uint s = 0u; s < uint(n_sub); s++) {
+                float d = abs(f16_exact(w0c[wq + s * 6u] & 0xFFFFu));
+                float m = abs(f16_exact(w0c[wq + s * 6u] >> 16));
+                mx = max(mx, max(31.0 * d, m));
+            }
+            scale_row[i] = mx;
+        }
+        barrier();
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb += 2) {
+        stage_a(sb, 0, row0, nrow, ebase, row_words, int(tid));
+        stage_b(sb, 0, true, nt16, int(tid), r0e);
+        bool live2 = sb + 1 < n_sub;
+        stage_a(sb + 1, 32, row0, nrow, ebase, row_words, int(tid));
+        stage_b(sb + 1, 32, live2, nt16, int(tid), r0e);
+        memoryBarrierShared();
+        barrier();
+        for (int ks = 0; ks < 4; ks++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+            coopMatLoad(fa, A16[0], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+            coopMatLoad(fbb, B16[0], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+            acc = coopMatMulAdd(fa, fbb, acc);
+        }
+        barrier();
+    }
+
+    coopMatStore(acc, CtmpF[0], 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+    memoryBarrierShared();
+    barrier();
+    for (int i = int(tid); i < nrow * nt16; i += 64) {
+        int r = i / nt16;
+        int rb = i - r * nt16;
+        outv[uint(r0e + rb) * pc.n_out + uint(row0 + r)] = CtmpF[r][rb] * scale_row[r];
+    }
+}
