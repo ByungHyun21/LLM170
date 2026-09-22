@@ -1,0 +1,162 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// tile_q8128i (plans/89 s8mmq) — q8_0 정수 MMQ 타일: coopmat<int8>×2 →
+// int32 어큐뮬레이터, 32k 블록 드레인(d·yd). 기존 tile_q8128(f16 스테이징+
+// f16 드레인 Ctmp) 대비:
+//   - A/B 스테이지 = 원시 바이트 복사(디양자화 FMA 없음)
+//   - 내적 s32 정확(정수 mma), 블록합만 f32 — 수치 클래스 상향(더 정확)
+//   - 골격/바인딩/푸시(tile_q8128과 동일 10바인딩, [n_in,n_out,xq_w,t,row_off,
+//     tok_base]) — 드롭인 교체.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint xq_w; uint t; uint row_off; uint tok_base;
+} pc;
+
+#define BK 32
+#define BM 64
+#define BN 128
+
+// 단일 청크 직인덱스 (엔진 ch_eff=텐서 next_pow2 → 항상 1청크)
+#define WG(idx) w0c[idx]
+
+// int8 스테이징: 64행×32k = 2KB / 128토큰×32k = 4KB.
+shared int8_t buf_a[BM * BK];
+shared int8_t buf_b[BN * BK];
+shared float dA[BM];      // 행별 d (현재 블록)
+shared float ydB[BN];     // 토큰별 yd (현재 블록)
+shared int32_t stmp[2][256]; // s32 타일 드레인 (서브그룹별)
+
+// A: q8_0 블록 34B = [d f16][32 i8]. 64행×32바이트 = 2KB
+// → 128스레드 = 2스레드/행(16바이트씩). dA는 반0 담당이 추출.
+void load_a(uint k0, int row0, int nrow, int blocks, uint tid) {
+    int r = int(tid) >> 1;             // 행 0..63 (2스레드/행)
+    int qw = int(tid) & 1;             // 바이트 반 0/1
+    int row = row0 + r;
+    uint sb = k0 >> 5;
+    if (row >= nrow + row0) {
+        for (int b = 0; b < 32; b++) buf_a[r * BK + b] = int8_t(0);
+        if (qw == 0u) dA[r] = 0.0;
+        return;
+    }
+    int rowb = row * blocks * 34 + int(sb) * 34;   // 바이트 오프셋
+    if (qw == 0u) {
+        uint wd = WG(uint(rowb >> 2));
+        dA[r] = unpackHalf2x16(wd >> uint((rowb & 3) * 8)).x;
+    }
+    // qs 32B @+2 — 비정렬 병합: 반 qw는 바이트 16qw..16qw+15 (4+1워드)
+    uint qb = uint(rowb + 2) + uint(qw) * 16u;
+    uint wq0 = qb >> 2;
+    uint rem = qb & 3u;
+    uint wv[5];
+    for (int i = 0; i < 5; i++) wv[i] = WG(wq0 + uint(i));
+    uint sh = rem * 8u;           // 0/8/16/24
+    for (int j = 0; j < 4; j++) {
+        uint m = (sh == 0u) ? wv[j] : (wv[j] >> sh) | (wv[j + 1] << (32u - sh));
+        buf_a[r * BK + qw * 16 + j * 4 + 0] = int8_t(int(m & 0xFFu) << 24 >> 24);
+        buf_a[r * BK + qw * 16 + j * 4 + 1] = int8_t(int((m >> 8) & 0xFFu) << 24 >> 24);
+        buf_a[r * BK + qw * 16 + j * 4 + 2] = int8_t(int((m >> 16) & 0xFFu) << 24 >> 24);
+        buf_a[r * BK + qw * 16 + j * 4 + 3] = int8_t(int((m >> 24) & 0xFFu) << 24 >> 24);
+    }
+}
+
+// B: 활성 q8 원시 바이트 + yd. 스레드당 1토큰(32바이트).
+void load_b(uint k0, int nt, uint tid, int n_in) {
+    int ti2 = int(tid);
+    if (ti2 >= nt) {
+        for (int e = 0; e < 32; e++) buf_b[ti2 * BK + e] = int8_t(0);
+        ydB[ti2] = 0.0;
+        return;
+    }
+    uint base = uint(pc.tok_base + uint(ti2)) * pc.xq_w;
+    uint xw = k0 >> 2;
+    ydB[ti2] = uintBitsToFloat(xq[base + uint((n_in >> 2) + (k0 >> 5))]);
+    for (int w = 0; w < 8; w++) {
+        uint wv = xq[base + xw + uint(w)];
+        buf_b[ti2 * BK + w * 4 + 0] = int8_t(int((wv) & 0xFFu) << 24 >> 24);
+        buf_b[ti2 * BK + w * 4 + 1] = int8_t(int((wv >> 8) & 0xFFu) << 24 >> 24);
+        buf_b[ti2 * BK + w * 4 + 2] = int8_t(int((wv >> 16) & 0xFFu) << 24 >> 24);
+        buf_b[ti2 * BK + w * 4 + 3] = int8_t(int((wv >> 24) & 0xFFu) << 24 >> 24);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;   // 0..127
+    uint sg = gl_SubgroupID;            // 0..1 (wave64)
+    int n_in = int(pc.n_in);
+    int nkb = n_in >> 5;
+    int blocks = n_in >> 5;             // q8_0: 32k 블록
+    int row0 = int(pc.row_off) + int(bid) * BM;
+    int nt = int(min(pc.t, BN));
+    int nrow = int(min(BM, pc.n_out - uint(row0)));
+    int tbase = int(sg) * 64;
+    uint lane = gl_SubgroupInvocationID; // wave64: 0..63
+
+    // 누산: 워프당 4행슬래브 × 4토큰슬래브. 타일당 256원소/64레인 = 레인 4원소.
+    float pfac[4][4][4];
+    for (int a = 0; a < 4; a++)
+        for (int b2 = 0; b2 < 4; b2++)
+            for (int c = 0; c < 4; c++) pfac[a][b2][c] = 0.0;
+
+    for (uint kb = 0; kb < uint(nkb); kb++) {
+        load_a(kb * 32u, row0, nrow, blocks, tid);
+        load_b(kb * 32u, nt, tid, n_in);
+        barrier();
+        for (uint wm = 0; wm < 4; wm++) {
+            for (uint wn = 0; wn < 4; wn++) {
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+                for (uint ks = 0; ks < 2; ks++) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                    coopMatLoad(ma, buf_a, (wm * 16) * BK + ks * 16, BK, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(mb, buf_b, (tbase + wn * 16) * BK + ks * 16, BK, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc = coopMatMulAdd(ma, mb, acc);
+                }
+                coopMatStore(acc, stmp[sg], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupBarrier();
+                // 레인 소유 원소 4개: e = lane*4 + i (16×16 행우선)
+                for (int i = 0; i < 4; i++) {
+                    int e = int(lane) * 4 + i;
+                    int r = e >> 4;
+                    int c = e & 15;
+                    float dy = dA[wm * 16 + r] * ydB[tbase + wn * 16 + c];
+                    pfac[wm][wn][i] += dy * float(stmp[sg][e]);
+                }
+                subgroupBarrier();
+            }
+        }
+        barrier();
+    }
+
+    // 드레인: 소유 레인이 직접 기록 (f32 — f16 Ctmp 경유 없음).
+    for (int wm = 0; wm < 4; wm++) {
+        for (int wn = 0; wn < 4; wn++) {
+            for (int i = 0; i < 4; i++) {
+                int e = int(lane) * 4 + i;
+                int r = e >> 4;
+                int c = e & 15;
+                int row = row0 + wm * 16 + r;
+                int tok = tbase + wn * 16 + c;
+                if (row < row0 + nrow && tok < nt) {
+                    outv[uint(pc.tok_base + uint(tok)) * pc.n_out + uint(row)] = pfac[wm][wn][i];
+                }
+            }
+        }
+    }
+}
