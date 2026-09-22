@@ -1,0 +1,15 @@
+#version 450
+// cat2_rows (plans/91 P2) — MTP 프리필 cat: dst[r] = e[r] ‖ h[r] ([t][2n]).
+// rawhip cat2_rows 미러. grid (⌈n/256⌉, t), 256스레드.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer E { float e[]; };   // [t][n]
+layout(binding = 1) readonly buffer H { float h[]; };   // [t][n]
+layout(binding = 2) buffer Dst { float dst[]; };        // [t][2n]
+layout(push_constant) uniform PC { int n; int t; } pc;
+void main() {
+    int j = int(gl_GlobalInvocationID.x);
+    if (j >= pc.n) return;
+    int r = int(gl_WorkGroupID.y);
+    dst[r * 2 * pc.n + j] = e[r * pc.n + j];
+    dst[r * 2 * pc.n + pc.n + j] = h[r * pc.n + j];
+}
