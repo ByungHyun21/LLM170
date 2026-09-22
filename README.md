@@ -36,7 +36,7 @@ host), step-level batching, pread-staged weight uploads. Kill switch
 | backend | pp512 | pp4096 | pp16384 | tg128@4k |
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.10-18.43** |
-| LLM170 vulkan (frame) | 131.8 | 121.6 | — | 15.2 |
+| LLM170 vulkan (frame) | 131.8 | 128.5 | 118.5 | 15.2 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
