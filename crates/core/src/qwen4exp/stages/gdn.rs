@@ -4,7 +4,7 @@
 use super::super::Q4Error;
 use super::Ctx;
 use super::super::layers::SeqState4;
-use crate::ops::{l2_norm, rms_norm, sigmoid, silu, softplus};
+use crate::ops::{l2_norm, sigmoid, silu, softplus};
 use llm170_diag::profile_span;
 
     /// GDN층 — qwen35와 동일 모듈, 차이: z-gate가 sigmoid.
@@ -160,16 +160,18 @@ use llm170_diag::profile_span;
         }
         // norm_gated: rms·sigmoid(z) — qwen35(silu)와의 유일 차이
         let mut gated = vec![vec![0.0f32; d_inner]; n_tok];
-        for t in 0..n_tok {
-            for h in 0..dt_rank {
-                let b0 = t * v_len + h * d_state;
-                let head: Vec<f32> = o_all[b0..b0 + d_state].to_vec();
-                let n = rms_norm(&head, &ssm_norm_w, hp.eps);
-                for i in 0..d_state {
-                    gated[t][h * d_state + i] = n[i] * sigmoid(z[t][h * d_state + i]);
-                }
-            }
-        }
+        crate::gdn_norm::gdn_norm_gated(
+            crate::gdn_norm::GdnGate::Sigmoid,
+            &o_all,
+            &z,
+            &ssm_norm_w,
+            hp.eps,
+            n_tok,
+            dt_rank,
+            d_state,
+            v_len,
+            &mut gated,
+        );
         let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
         ctx.mm_batch(&gated, &wout, &mut out)?;
         Ok(out)
