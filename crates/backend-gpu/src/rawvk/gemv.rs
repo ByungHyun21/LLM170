@@ -95,6 +95,8 @@ const FN_MOE_TILE_Q4K_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_cm.spv
 /// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일(레거시 전문가 루프 대체).
 const FN_MOE_TILE_Q8_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q8.spv");
 const FN_MOE_TILE_Q5K_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q5k.spv");
+/// plans/89 P1.1d — MoE q5_1 coopmat 타일(q4k_cm 동일 골격).
+const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q51_cm.spv");
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -170,6 +172,8 @@ enum Slot {
     /// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일.
     FnMoeTileQ8,
     FnMoeTileQ5k,
+    /// plans/89 P1.1d — MoE q5_1 coopmat 타일.
+    FnMoeTileQ51Cm,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -324,6 +328,7 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnTileF32 => "tile_f32",
         Slot::FnMoeTileQ8 => "moe_tile_q8",
         Slot::FnMoeTileQ5k => "moe_tile_q5k",
+        Slot::FnMoeTileQ51Cm => "moe_tile_q51_cm",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
         Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
@@ -455,6 +460,7 @@ impl VkAcc {
             Slot::FnMoeTileQ4kCm => (FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
             Slot::FnMoeTileQ8 => (FN_MOE_TILE_Q8_SPV, 13, 28),
             Slot::FnMoeTileQ5k => (FN_MOE_TILE_Q5K_SPV, 13, 28),
+            Slot::FnMoeTileQ51Cm => (FN_MOE_TILE_Q51_CM_SPV, 13, 28),
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -1839,25 +1845,20 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 }
                 (gi.rowexp.buf, gi.rows_pad.buf, gi.perm_pad.buf, gi.inv_pad.buf, gi.yg.buf)
             };
-            // plans/89 P1.1b — q4_K coopmat 타일 우선: 스칼라 16×16 판([ts]
-            // 1602ms/청크) 대신 f16 coopMatMulAdd 128행 판. q5_1은 스칼라 유지
-            // (차후 판 추가). 킬스위치 LLM170_VK_MOECM=0.
-            let use_cm = w.ty == GgmlType::Q4K
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_MOECM").map(|v| v != "0").unwrap_or(true);
-            let p = self.pipeline(
-                &mut ctx,
-                if use_cm {
-                    Slot::FnMoeTileQ4kCm
-                } else {
-                    match w.ty {
-                        GgmlType::Q4K => Slot::FnMoeTileQ4K,
-                        GgmlType::Q5_1 => Slot::FnMoeTileQ51,
-                        GgmlType::Q8_0 => Slot::FnMoeTileQ8,
-                        _ => Slot::FnMoeTileQ5k,
-                    }
-                },
-            )?;
+            // plans/89 P1.1b/d — coopmat 타일 우선(q4_K/q5_1): 스칼라 16×16 판
+            // 대신 f16 coopMatMulAdd 전문가-블록 판(WG() 25비트 함정 제거판,
+            // 스케일 분리 + f32 드레인). 킬스위치 LLM170_VK_MOECM=0.
+            let cm_on = wbufs.len() == 1
+                && std::env::var("LLM170_VK_MOECM").map(|v| v == "1").unwrap_or(false);
+            let slot = match (w.ty, cm_on) {
+                (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
+                (GgmlType::Q5_1, _q51cm) if std::env::var("LLM170_VK_Q51CM").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ51Cm,
+                (GgmlType::Q4K, _) => Slot::FnMoeTileQ4K,
+                (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
+                (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
+                _ => Slot::FnMoeTileQ5k,
+            };
+            let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             while binds.len() < 8 {
                 binds.push(dbuf);
@@ -1874,7 +1875,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 std::env::var("LLM170_MTC_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0u32),
                 rows as u32,
             ]);
-            let (gx, gy) = if use_cm {
+            let (gx, gy) = if cm_on {
                 (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
             } else {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
@@ -3236,7 +3237,8 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
         "q8_0" => llm170_gguf::GgmlType::Q8_0,
         "q5_K" => llm170_gguf::GgmlType::Q5K,
         "q4_K" => llm170_gguf::GgmlType::Q4K,
-        _ => return Ok("moe-tile-check: 모드 q8_0|q5_K".into()),
+        "q5_1" => llm170_gguf::GgmlType::Q5_1,
+        _ => return Ok("moe-tile-check: 모드 q8_0|q5_K|q4_K|q5_1".into()),
     };
     // 해당 타입의 첫 스택 탐색(down 우선, q5_K는 gate/up에만 존재).
     let mut found = None;
@@ -3341,15 +3343,15 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
                 let ee = sel[rr];
                 let per = wd.data.len() / 512;
                 let off = ee * per;
-                let dBits = u16::from_le_bytes([wd.data[off], wd.data[off + 1]]);
-                let e10 = ((dBits >> 10) & 0x1F) as i32;
-                let m10 = (dBits & 0x3FF) as f32;
+                let d_bits = u16::from_le_bytes([wd.data[off], wd.data[off + 1]]);
+                let e10 = ((d_bits >> 10) & 0x1F) as i32;
+                let m10 = (d_bits & 0x3FF) as f32;
                 let dv = if e10 == 0 {
                     m10 * 2f32.powi(-24)
                 } else {
-                    ((1024.0 + m10) * 2f32.powi(e10 - 25))
-                } * if dBits & 0x8000 != 0 { -1.0 } else { 1.0 };
-                eprintln!("[mtcD] row={rr} e={ee} dBits={dBits:#06x} d={dv:.3e}");
+                    (1024.0 + m10) * 2f32.powi(e10 - 25)
+                } * if d_bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+                eprintln!("[mtcD] row={rr} e={ee} dBits={d_bits:#06x} d={dv:.3e}");
             }
         }
     Ok(format!(
