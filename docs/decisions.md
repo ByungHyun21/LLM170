@@ -1556,3 +1556,14 @@ shape-dependent (tile128v2 precedent): q51_sg1's short K loop (n_sub=20)
 with 1 MMA chain is stable; q4k's 40-iteration loop is not, even at 1 sg.
 Shipped: q5_1 down -> sg1 default (LLM170_VK_Q51SG1=0 kill switch); q4_K
 scalar default. FN vk pp512 102.8 -> 131.8, pp4096 95.0 -> 121.6.
+
+### (32d) QSA prefill device selection — multi-token kernels (plans/89 P1.3)
+
+fn_idx_score_mt + fn_idx_topk_mt (per-token bitonic over shared u64 keys,
+ties to lower index per the decode rank contract; arithmetic sel_off — no
+readback) replace the prefill host selection for chunks past the identity
+window: the 4 frame_read flushes and the CPU score/sort loop are gone.
+Verification: chunk-check 3000-token — the device path chunk (512) is
+bits-identical; the 208-chunk deviation (0.381, argmax equal) reproduces
+the HOST path signature exactly (pre-existing FN non-invariance). pp4096
+121.6 -> 128.5; pp16384@20k first-measured 118.5.
