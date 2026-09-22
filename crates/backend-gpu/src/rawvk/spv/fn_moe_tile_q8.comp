@@ -48,7 +48,7 @@ void main() {
     int rx = int(gl_LocalInvocationID.y);
     int o = int(gl_WorkGroupID.x) * 16 + ox;
     uint r0 = gl_WorkGroupID.y * 16u;
-    uint rp = rows_pad[0];
+    uint rp = pc.mode == 1u ? pc.rows : rows_pad[0];
     if (r0 >= rp) return;
     uint e = pc.mode == 1u ? 0u : rowexp[r0];
     uint n_in = pc.n_in;
