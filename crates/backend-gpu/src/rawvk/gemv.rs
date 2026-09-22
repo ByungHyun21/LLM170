@@ -67,6 +67,19 @@ const FN_MM_F32_SPV: &[u8] = include_bytes!("spv/fn_mm_f32.spv");
 /// plans/88 P1 — MoE direct-ids GEMV: gemv3의 ids 구동판(그리드 (n_out, rows),
 /// 워크그룹=행, ids[r]로 전문가 베이스 산출). 행 산술은 gemv3와 비트 동일.
 const FN_MOE_IDS_SPV: &[u8] = include_bytes!("spv/fn_moe_ids.spv");
+/// plans/89 P0.2 — 디코드 밀집 GEMV: decoder gemv8 패밀리(llama dmmv 포트)를
+/// VkAcc(프레임)에서도 직접 발사. f32 활성 직결(quant 스킵)이라 W4A8 경로와
+/// 산술 클래스가 다르다 — ckdiff·게이트 재기록 절차로 수용(원장 31 전례).
+const GEMV8_Q8B_SPV: &[u8] = include_bytes!("spv/gemv8_q8b.spv");
+const GEMV8_Q4B_SPV: &[u8] = include_bytes!("spv/gemv8_q4b.spv");
+/// plans/89 P0.2 — f32/BF16 디코드 GEMV(라우터·sh-gate): fn_mm_f32(256스레드
+/// f64 트리, 512WG 지연바운드 — 실측 ~0.4GB/s급)의 64스레드 서브그룹Add 판.
+const MM_F32B_SPV: &[u8] = include_bytes!("spv/mm_f32b.spv");
+/// plans/89 P0.3 — MoE direct-ids 디코드: llama dmmv 기하(64스레드·2행·
+/// 서브그룹Add)에 ids 간접을 얹은 판. q4_K은 q4b 파생, q5_1은 신규(FN down
+/// 질량). f32 활성 직결 — MoE quant 스킵, 산술 클래스는 gemv8 전환과 동열.
+const FN_MOE_IDS2_SPV: &[u8] = include_bytes!("spv/fn_moe_ids2.spv");
+const FN_MOE_IDS51_SPV: &[u8] = include_bytes!("spv/fn_moe_ids51.spv");
 
 
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
@@ -122,8 +135,16 @@ enum Slot {
     /// plans/88 P2 — q4_K/q5_1 그룹 타일 GEMM(패딩 도메인).
     FnMoeTileQ4K,
     FnMoeTileQ51,
+    /// plans/89 P0.2 — 디코드 밀집 GEMV(llama dmmv 포트 재사용).
+    Gemv8Q8B,
+    Gemv8Q4B,
+    /// plans/89 P0.2 — f32/BF16 디코드 GEMV 64스레드 판.
+    MmF32b,
     /// plans/88 P2 — q8_0 밀집 프리필 타일(K-슬라이스 스테이징).
     FnTileQ8,
+    /// plans/89 P0.3 — MoE direct-ids dmmv 판(q4_K/q5_1).
+    FnMoeIds2,
+    FnMoeIds51,
 }
 
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
@@ -263,8 +284,13 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnQkNormRope => "qk_norm_rope",
         Slot::Quant => "quant",
         Slot::FnArgmaxRows => "argmax_rows",
+        Slot::Gemv8Q8B => "gemv8_q8b",
+        Slot::Gemv8Q4B => "gemv8_q4b",
+        Slot::MmF32b => "mm_f32b",
         Slot::FnMoeIds => "moe_ids",
         Slot::FnMmf32 => "mm_f32",
+        Slot::FnMoeIds2 => "moe_ids2",
+        Slot::FnMoeIds51 => "moe_ids51",
         Slot::FnMoeGroup => "moe_group",
         Slot::FnMoeTileQ4K => "moe_tile_q4k",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
@@ -378,7 +404,12 @@ impl VkAcc {
             Slot::Quant => (QUANT_SPV, 2, 12),
             Slot::Rms => (RMS_SPV, 3, 16),   // plans/84 B: w_reps 추가(기본 1 = 종전 산술)
             Slot::Silu => (SILU_SPV, 3, 4),
+            Slot::Gemv8Q8B => (GEMV8_Q8B_SPV, 10, 24),  // 8W+x(f32)+out (W0만 사용)
+            Slot::Gemv8Q4B => (GEMV8_Q4B_SPV, 10, 24),
+            Slot::MmF32b => (MM_F32B_SPV, 10, 20),      // 8W+x(f32)+out
             Slot::FnMoeIds => (FN_MOE_IDS_SPV, 13, 28), // 8W+xq+out+ktab+grid+ids
+            Slot::FnMoeIds2 => (FN_MOE_IDS2_SPV, 11, 24),   // 8W+x(f32)+out+ids
+            Slot::FnMoeIds51 => (FN_MOE_IDS51_SPV, 11, 24),
             Slot::FnMmf32 => (FN_MM_F32_SPV, 10, 20),    // 8W+x(f32)+out
             Slot::FnMoeGroup => (FN_MOE_GROUP_SPV, 9, 12),        // 3×u32
             Slot::FnMoeTileQ4K => (FN_MOE_TILE_Q4K_SPV, 13, 28),  // 8W+xq+yg+rowexp+rp+perm_pad +mode+rows
@@ -412,6 +443,43 @@ impl VkAcc {
         let t = self.tables.lock();
         let (a, b) = t.as_ref().unwrap();
         Ok((a.buf, b.buf, self.dummy.lock().as_ref().unwrap().buf))
+    }
+
+    /// plans/89 P0.2 — 디코드(t<16) 밀집 GEMV: llama dmmv 포트(q8b/q4b)를
+    /// 프레임 f32 활성 버퍼에 직결. 64스레드 2행 WG·서브그룹Add — 27B 경로
+    /// 실측 272-329GB/s. 절대 인덱싱이라 단일 청크 가중만(이 장치 max_ssbo
+    /// 4GiB — FN 밀집 전부 단일 청크). 미해당 타입은 false 반환(호출부 폴백).
+    fn gemv8_dense(
+        &self,
+        ctx: &mut VkCtx,
+        wbufs: &[vk::Buffer],
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        ty: u32,
+        xb: vk::Buffer,
+        ob: vk::Buffer,
+    ) -> Result<bool, String> {
+        if wbufs.len() != 1 || t >= 16 {
+            return Ok(false);
+        }
+        let slot = match ty {
+            8 => Slot::Gemv8Q8B,
+            12 => Slot::Gemv8Q4B,
+            _ => return Ok(false),
+        };
+        let (_, _, dbuf) = self.ensure_shared(ctx)?;
+        let p = self.pipeline(ctx, slot)?;
+        let mut binds: Vec<vk::Buffer> = wbufs.to_vec();
+        while binds.len() < 8 {
+            binds.push(dbuf);
+        }
+        binds.push(xb);
+        binds.push(ob);
+        let ds2 = ctx.bind_ds(&p, &binds)?;
+        let push = push_u32s(&[n_in as u32, n_out as u32, t as u32, 0, 0, 2]);
+        ctx.run(p.pl, ds2, p.pipe, &push, 1, n_out.div_ceil(2) as u32, t as u32)?;
+        Ok(true)
     }
 
     /// 가중치 상주 ((ptr,len) 키 — mmap 안정) — max_ssbo 청크.
@@ -1498,6 +1566,45 @@ impl llm170_core::matmul::FrameState for VkAcc {
         if std::env::var_os("LLM170_MOE_IDS_DBG").is_some() {
             eprintln!("[moeids] ty={ty} rows={rows} t={t} n_in={n_in} n_out={n_out}");
         }
+            // plans/89 P0.3 — ids dmmv 판 우선: llama dmmv 기하(64스레드·2행·
+            // 서브그룹Add) + ids 간접, f32 활성 직결(MoE quant 불필요).
+            // [ts] 기준선 moe_ids 30ms/step(43GB/s) — q8b급 150GB/s 기대.
+            // 킬스위치 LLM170_MOE_IDS2=0(종전 fn_moe_ids).
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            if std::env::var("LLM170_MOE_IDS2").map(|v| v != "0").unwrap_or(true)
+                && wbufs.len() == 1
+            {
+                let (slot, blk) = match w.ty {
+                    GgmlType::Q4K => (Slot::FnMoeIds2, 144usize),
+                    GgmlType::Q5_1 => (Slot::FnMoeIds51, 24),
+                    _ => (Slot::FnMoeIds, 0),
+                };
+                if blk != 0 {
+                    let idb = self.fbuf(ids)?;
+                    let per_expert = w.data.len() / ne;
+                    let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+                    let p = self.pipeline(&mut ctx, slot)?;
+                    let mut binds: Vec<vk::Buffer> = wbufs.clone();
+                    while binds.len() < 8 {
+                        binds.push(dbuf);
+                    }
+                    binds.push(xb);
+                    binds.push(ob);
+                    binds.push(idb);
+                    let ds2 = ctx.bind_ds(&p, &binds)?;
+                    // PC: n_in, n_out, rows, per_expert_blks, cw(0), rpf(2).
+                    let push = push_u32s(&[
+                        n_in as u32,
+                        n_out as u32,
+                        rows as u32,
+                        (per_expert / blk) as u32,
+                        0,
+                        2,
+                    ]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, 1, n_out.div_ceil(2) as u32, rows as u32)?;
+                    return Ok(());
+                }
+            }
             let idb = self.fbuf(ids)?;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
             let per_expert = w.data.len() / ne;
@@ -2108,6 +2215,16 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     // 실측 ~5GB/s(gemv 6.6s/208tok). 타일(K-슬라이스 스테이징)로
                     // 대체 — 산술 클래스는 동일 표현식·스레드 직렬 누산.
                     // 스위치: LLM170_VK_DTILE=0 이면 종전 gemv.
+                    // plans/89 P0.2 — 디코드(t<16) 밀집 GEMV를 llama dmmv
+                    // 포트(q8b/q4b)로: f32 활성 직결(quant 불필요), 64스레드
+                    // 2행 WG. [ts] 기준선 gemv 77ms/step — 272-329GB/s급으로
+                    // 기대. 킬스위치 LLM170_VK_G8=0(종전 quant+gemv3).
+                    if t < 16
+                        && std::env::var("LLM170_VK_G8").map(|v| v != "0").unwrap_or(true)
+                        && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)?
+                    {
+                        continue;
+                    }
                     let dense_tile = t >= 2
                         && std::env::var_os("LLM170_VK_DTILE").map(|v| v != "0").unwrap_or(true)
                         && match w.ty {
@@ -2158,7 +2275,17 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     // plans/88 P1 — f32/BF16 밀식 GEMV(값폴백 소거).
                     let dty = dense_ty(w.ty).unwrap();
                     let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
-                    let p = self.pipeline(&mut ctx, Slot::FnMmf32)?;
+                    // plans/89 P0.2 — 디코드(t<16)는 64스레드 판(mm_f32b):
+                    // fn_mm_f32 256스레드 f64 트리는 512WG 지연바운드
+                    // ([ts] 12ms/step = 0.4GB/s급). 킬스위치 LLM170_VK_MMB=0.
+                    let slot = if t < 16 && wbufs.len() == 1
+                        && std::env::var("LLM170_VK_MMB").map(|v| v != "0").unwrap_or(true)
+                    {
+                        Slot::MmF32b
+                    } else {
+                        Slot::FnMmf32
+                    };
+                    let p = self.pipeline(&mut ctx, slot)?;
                     let mut binds: Vec<vk::Buffer> = wbufs.clone();
                     while binds.len() < 8 {
                         binds.push(dbuf);
@@ -4008,6 +4135,8 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                         let dot: f32 = ref_row.iter().zip(mxs[tok * k + ki].iter()).map(|(a, b)| a * b).sum();
                         acc2 += dot as f64 * (wsel[ki] / wsum) as f64;
                     }
+                    let d = (got[tok * n_out_m + j] as f64 - acc2).abs();
+                    mx = mx.max(d);
                     if std::env::var_os("LLM170_DBG_9A").is_some() && tok == 0 && j < 4 {
                         eprintln!("[9a] tok={tok} j={j} got={:.6} ref={:.6}", got[tok * n_out_m + j], acc2);
                     }
@@ -4086,6 +4215,8 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                             dot
                         );
                     }
+                    let d = (got[r * n_out_d + j] as f64 - dot as f64).abs();
+                    mx = mx.max(d);
                 }
             }
             let ok = mx < 3e-2;

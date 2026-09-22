@@ -1,0 +1,79 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// fn_moe_ids51 (plans/89 P0.3) — MoE direct-ids 디코드 GEMM, q5_1(FN down 질량).
+// gemv8 골격(레인 8원소 스트라이드 512, 2행/WG, 서브그룹Add) + ids 간접.
+// 블록 24B: [d f16][m f16][qh 4B][qs 16B] — core deq_q5_1과 동일 배치:
+// 원소 0-15 = qs 바이트 0-15 로우니블, 원소 16-31 = 하이니블, 5번째 비트 =
+// qh 비트 i (원소 i). w = d·v + m — 원소별 fma 2-누산(acc_q, acc_m) 드레인.
+// 레인 8원소는 16 경계를 넘지 않는다(8정렬) → 로우/하이 절반 균일.
+// 바인딩: 0 = 전문가 스택, 8 = f32 활성 [rows][n_in], 9 = out, 10 = ids.
+layout(local_size_x = 64) in;
+struct Blk51 {
+    f16vec2 dm;
+    uint qh;
+    uint16_t qs[8];
+};
+layout(binding = 0) readonly buffer AP51 { Blk51 ablk[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Ids { uint ids[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint rows; uint per_expert_blks; uint cw; uint rpf;
+} pc;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.z;
+    if (r >= pc.rows) return;
+    const uint nrows = 2u;
+    const uint first_row = nrows * gl_WorkGroupID.y;
+    uint num_rows = nrows;
+    if (first_row + nrows > pc.n_out) {
+        if (first_row >= pc.n_out) return;
+        num_rows = pc.n_out - first_row;
+    }
+    const uint eblk = ids[r] * pc.per_expert_blks;
+    const uint ybase = r * pc.n_in;
+    float t0 = 0.0, t1 = 0.0;
+    for (uint col0 = 8u * tid; col0 + 8u <= pc.n_in; col0 += 512u) {
+        float xw[8];
+        float sx = 0.0;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            xw[j] = xa[ybase + col0 + j];
+            sx += xw[j];
+        }
+        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+            if (n >= num_rows) break;
+            const uint blk = eblk + (first_row + n) * (pc.n_in / 32u) + col0 / 32u;
+            const vec2 dm = vec2(ablk[blk].dm);
+            const uint rem = col0 & 31u;
+            const uint b0 = rem >= 16u ? (rem - 16u) : rem;
+            const bool hi = rem >= 16u;
+            const uint k = b0 / 2u;
+            const uint qa = uint(ablk[blk].qs[k]) | (uint(ablk[blk].qs[k + 1u]) << 16);
+            const uint qb = uint(ablk[blk].qs[k + 2u]) | (uint(ablk[blk].qs[k + 3u]) << 16);
+            const uint qh8 = (ablk[blk].qh >> rem) & 0xFFu;
+            float aq = 0.0;
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                const uint bytev = ((j < 4u ? qa : qb) >> (8u * (j & 3u))) & 0xFFu;
+                const uint vq = (hi ? (bytev >> 4) : (bytev & 0xFu))
+                              | (((qh8 >> j) & 1u) << 4);
+                aq = fma(float(vq), xw[j], aq);
+            }
+            const float rr = dm.x * aq + dm.y * sx;
+            if (n == 0u) t0 += rr; else t1 += rr;
+        }
+    }
+    const float r0 = subgroupAdd(t0);
+    const float r1 = subgroupAdd(t1);
+    if (tid == 0u) {
+        if (num_rows > 0u) outv[r * pc.n_out + first_row] = r0;
+        if (num_rows > 1u) outv[r * pc.n_out + first_row + 1u] = r1;
+    }
+}
