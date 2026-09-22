@@ -14,4 +14,3 @@ pub use attn::*;
 pub use gemm::*;
 pub use gdn::*;
 pub use misc::*;
-pub use wmma::*;

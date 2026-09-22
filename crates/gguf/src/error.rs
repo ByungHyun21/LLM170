@@ -24,6 +24,17 @@ pub enum GgufError {
         len: u64,
         max: u64,
     },
+    /// 텐서 데이터 [data_offset+offset, +nbytes)가 파일 크기를 초과 — 손상/절단.
+    TensorOutOfBounds {
+        name: String,
+        end: u64,
+        size: u64,
+    },
+    /// split.no ≥ split.count — 파트 번호가 범위 밖(손상 메타).
+    SplitNoOutOfBounds {
+        no: u64,
+        count: u64,
+    },
     TensorCountTooLarge(u64),
 }
 
@@ -38,7 +49,13 @@ impl fmt::Display for GgufError {
             }
             Self::BadMetadataType(t) => write!(f, "invalid metadata value type {t}"),
             Self::BadArrayType(t) => write!(f, "array element type {t} invalid"),
-            Self::BadUtf8(e) => write!(f, "invalid utf-8 string: {e}"),
+            Self::BadUtf8(e) => write!(f, "invalid utf8 string: {e}"),
+            Self::TensorOutOfBounds { name, end, size } => {
+                write!(f, "tensor '{name}' data [{end}-nbytes, {end}) exceeds file size {size}")
+            }
+            Self::SplitNoOutOfBounds { no, count } => {
+                write!(f, "split.no {no} >= split.count {count}")
+            }
             Self::EmptyKey => write!(f, "empty metadata key"),
             Self::DuplicateKey(k) => write!(f, "duplicate metadata key '{k}'"),
             Self::BadAlignment(a) => write!(f, "alignment {a} not a power of 2 / zero"),
