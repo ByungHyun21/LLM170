@@ -5,20 +5,13 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-// fn_moe_tile_q4k_cm (plans/89 P1.1b) — MoE 그룹 프리필 q4_K coopmat 타일.
-// 기하: 타일 = (전문가 16행 패딩블록) × (출력 128열) — 패딩 도메인이 16행
-// 전문가 정렬(fn_moe_group)이므로 블록 내 전문가 균일(rowexp[r0e]).
-//
-// 수치(plans/89 diag로 확정한 계약):
-// · q4_K d/dmin이 f16 서브노멀(<2^-14)인 전문가는 네이티브 f16 변환이
-//   0으로 플러시되어 블록 전체가 0이 된다(진단 mode 5). → 행-최대 |d| 스케일
-//   분리: A16에는 w/scale_row(≤~10³, f16 정상역)를 스테이징하고 드레인에서
-//   acc·scale_row(f32). d 자체는 f16을 거치지 않는다(비트 분해 정확 판독).
-// · 누산 C는 f32 coopMatStore 직접 저장(f16 Ctmp 경유는 큰 C에서 오버플로).
-// · B = q8 정수 × yd(f16) — 활성 yd는 실데이터에서 정상역(실측).
-//
-// 진단 프로브(pc.mode): 2=가중 원시 바이트, 3=활성 원시 바이트.
-// 그리드 (⌈n_out/128⌉, ⌈bound/16⌉), 512스레드 = 8sg × 16행.
+// fn_moe_tile_q51_cm (plans/89 P1.1d) — MoE 그룹 프리필 q5_1 coopmat 타일.
+// fn_moe_tile_q4k_cm과 동일 기하(전문가 16행블록 × 128출력열)·동일 수치 계약
+// (f16_exact 서브노멀 판독, 행 스케일 분리, f32 드레인, w0c 직접 판독 —
+// WG() 25비트 청크 함정 회피). q5_1 블록 24B: [d f16][m f16][qh 4B][qs 16B],
+// 원소 l: nib = l<16 ? qs[l]&0xF : qs[l]>>4, 5번째비트 = qh>>l&1,
+// w = d·(nib|qhbit<<4) + m. 스케일 = 블록별 max(31|d|,|m|)의 행 최대.
+// 진단 프로브(pc.mode): 2=가중, 3=활성 원시 바이트.
 layout(local_size_x = 512) in;
 layout(binding = 0) readonly buffer W0 { uint w0c[]; };
 layout(binding = 1) readonly buffer W1 { uint w1c[]; };
@@ -42,20 +35,7 @@ shared float16_t B16[16][68];
 shared float CtmpF[128][17];
 shared float scale_row[128];
 
-uint WG(uint idx) {
-    uint c = idx >> 25u;
-    uint o = idx & 0x1FFFFFFu;
-    if (c == 0u) return w0c[o];
-    if (c == 1u) return w1c[o];
-    if (c == 2u) return w2c[o];
-    if (c == 3u) return w3c[o];
-    if (c == 4u) return w4c[o];
-    if (c == 5u) return w5c[o];
-    if (c == 6u) return w6c[o];
-    return w7c[o];
-}
-
-// f16 비트 → f32 정확 변환(서브노멀 m×2^-24 포함).
+// f16 비트 → f32 정확 변환(서브노멀 포함).
 float f16_exact(uint bits) {
     float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
     uint e = (bits >> 10) & 0x1Fu;
@@ -64,39 +44,27 @@ float f16_exact(uint bits) {
     return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
 }
 
-// q4_K 32원소 서브블록 디양자화(core deq_q4_k 동일 배치)를 스케일 분리형으로:
-// A16 = (d·s·nib − dmin·m)/scale_row[r].
+// q5_1 32원소 블록 디양자화(스케일 분리형): A16 = (d·v + m)/scale_row[r].
 void stage_a(int sb, int colb, int row0, int nrow, uint ebase, uint row_words, int tid) {
     int r = int(tid >> 2);
     int kc = int(tid & 3) * 8;
     int row = row0 + r;
     if (row < row0 + nrow) {
-        uint wq = ebase + uint(row) * row_words + uint(sb >> 3) * 36u;
+        uint wq = ebase + uint(row) * row_words + uint(sb) * 6u;
         float d = f16_exact(w0c[wq] & 0xFFFFu);
-        float dmin = f16_exact(w0c[wq] >> 16);
+        float m = f16_exact(w0c[wq] >> 16);
         float inv = 1.0 / scale_row[r];
-        int it = (sb >> 1) & 3;
-        int hilo = sb & 1;
-        int sj = it * 2 + hilo;
-        uint s_v, m_v;
-        if (sj < 4) {
-            s_v = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 63u;
-            uint mb = sj + 4;
-            m_v = (w0c[wq + 1u + uint(mb >> 2)] >> uint((mb & 3) * 8)) & 63u;
-        } else {
-            uint sb_lo = (w0c[wq + 1u + uint((sj + 4) >> 2)] >> uint(((sj + 4) & 3) * 8)) & 0xFFu;
-            uint sb_jm4 = (w0c[wq + 1u + uint((sj - 4) >> 2)] >> uint(((sj - 4) & 3) * 8)) & 0xFFu;
-            uint sb_j = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 0xFFu;
-            s_v = (sb_lo & 0xFu) | ((sb_jm4 >> 6) << 4);
-            m_v = (sb_lo >> 4) | ((sb_j >> 6) << 4);
-        }
-        float ds0 = d * float(s_v) * inv;
-        float ds1 = dmin * float(m_v) * inv;
+        uint qh = w0c[wq + 1u];             // 바이트 4..7 = qh 비트 l ↔ 원소 l
         for (int e = 0; e < 8; e++) {
             int l = kc + e;
-            uint qv = w0c[wq + 4u + uint((it * 32 + l) >> 2)];
-            uint nib = (qv >> uint((((it * 32 + l) & 3) * 8) + (hilo << 2))) & 0xFu;
-            A16[r][colb + l] = float16_t(float(nib) * ds0 - ds1);
+            // qs 16바이트(워드 2..5): 원소 l<16 = 바이트 l 로우니블,
+            // l≥16 = 바이트 l-16 하이니블(core deq_q5_1 동일).
+            uint qs_w = w0c[wq + 2u + uint((l & 15) >> 2)];
+            uint b = (qs_w >> uint(((l & 15) & 3) * 8)) & 0xFFu;
+            uint nib = (l < 16) ? (b & 0xFu) : (b >> 4);
+            uint qhbit = (qh >> uint(l)) & 1u;
+            float v = float(nib | (qhbit << 4));
+            A16[r][colb + l] = float16_t((d * v + m) * inv);
         }
     } else {
         for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
@@ -125,7 +93,7 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint sg = gl_SubgroupID;
     int n_in = int(pc.n_in);
-    int n_sub = n_in >> 5;
+    int n_sub = n_in >> 5;                 // 32원소 블록 수
     int row0 = int(bid) * 128;
     int nrow = int(min(128u, pc.n_out - uint(row0)));
     int r0e = int(tidy) * 16;
@@ -133,21 +101,10 @@ void main() {
     if (uint(r0e) >= rp) return;
     uint e = rowexp[uint(r0e)];
     int nt16 = int(min(16u, rp - uint(r0e)));
-    uint row_words = uint(n_in >> 8) * 36u;
+    uint row_words = uint(n_sub) * 6u;
     uint ebase = e * (pc.per_expert_bytes >> 2);
-    if (pc.mode == 5u) {
-        uint w5 = w0c[ebase + uint(row0) * row_words];
-        if (tid == 0) {
-            outv[uint(r0e) * pc.n_out + uint(row0)] = float(w5 & 0xFFu);
-            outv[uint(r0e) * pc.n_out + uint(row0) + 1u] = float((w5 >> 8) & 0xFFu);
-            outv[uint(r0e) * pc.n_out + uint(row0) + 2u] = float((w5 >> 16) & 0xFFu);
-            outv[uint(r0e) * pc.n_out + uint(row0) + 3u] = float(w5 >> 24);
-        }
-        return;
-    }
 
     if (pc.mode >= 2u) {
-        // 진단 프로브: 2=가중, 3=활성 원시 바이트.
         for (int i = int(tid); i < nrow * nt16; i += 512) {
             int r = i / nt16;
             int rb = i - r * nt16;
@@ -159,14 +116,15 @@ void main() {
         return;
     }
 
-    // 프리패스: 행별 최대 |d| — 스케일 분리(d 서브노멀 계약).
+    // 프리패스: 행별 스케일 = max 블록 max(31|d|, |m|).
     {
         for (int i = int(tid); i < nrow; i += 512) {
             uint wq = ebase + uint(row0 + i) * row_words;
             float mx = 1e-30;
-            for (uint s = 0u; s < (uint(n_in) >> 8); s++) {
-                uint w0 = w0c[wq + s * 36u];
-                mx = max(mx, abs(f16_exact(w0 & 0xFFFFu)));
+            for (uint s = 0u; s < uint(n_sub); s++) {
+                float d = abs(f16_exact(w0c[wq + s * 6u] & 0xFFFFu));
+                float m = abs(f16_exact(w0c[wq + s * 6u] >> 16));
+                mx = max(mx, max(31.0 * d, m));
             }
             scale_row[i] = mx;
         }
@@ -194,7 +152,6 @@ void main() {
         barrier();
     }
 
-    // 드레인: f32 acc 직접 저장 → yg ×scale_row.
     coopMatStore(acc, CtmpF[sg << 4], 0, 17, gl_CooperativeMatrixLayoutRowMajor);
     memoryBarrierShared();
     barrier();
