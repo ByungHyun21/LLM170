@@ -45,7 +45,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
   rawhip-check <file> <tensor>   HIP GEMV ↔ CPU 미러 to_bits 검증
   gpu-raw-probe [iters]          원시 런치 오버헤드
   dims <file> [tensor...]        텐서 차원 조회
-  mm-bench2 | mm-bench | mm-tile | launch-probe | roof-test | bw-test | dp4a-test
+  mm-bench2 | mm-bench | mm-tile | launch-probe | bw-test | dp4a-test
   tty-probe [file]               타입별 텐서 수·용량 집계
   vk-check                       Vulkan 장치·coopmat·axpy 스모크
   vk-gemv-check <file> <tensor> [t]   엔진 경로(quant+gemv3) GEMV 검증

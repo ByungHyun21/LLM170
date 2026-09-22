@@ -244,39 +244,18 @@ impl Frame4 {
                     .and_then(|s| s.kv_k.first())
                     .map(|k| k.len() / (hp.n_kv.max(1) * hp.head_dim.max(1)))
                     .unwrap_or(8192);
-                // Hparams4에 rope_cs 헬퍼가 없어 로컬 빌드 — 산술은
-                // model/hparams.rs rope_cs(=ops::rope_head)와 동일 값을 쓴다.
-                let (half, base) = (hp.n_rot / 2, hp.rope_base);
-                let mut cs = vec![0.0f32; ctx_n * half * 2];
-                for pos in 0..ctx_n {
-                    for pp in 0..half {
-                        let theta = base.powf(-(2.0 * pp as f32) / hp.n_rot as f32);
-                        let angle = pos as f32 * theta;
-                        cs[pos * half * 2 + pp * 2] = angle.cos();
-                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
-                    }
-                }
-                cs
+                // 산술은 ops::rope_cs_table 단일 소스(plans/90 A1 D5).
+                crate::ops::rope_cs_table(hp.n_rot, hp.rope_base, ctx_n)
             },
             qsa_cs_idx: {
-                // 인덱서 로프 — rope_head(pos, n_rot=idx_dim, base)와 동일 값을
-                // 쓴다(디바이스 q4_idx_q_rope/bk_update가 소비, plans/73).
+                // 인덱서 로프 — n_rot=idx_dim 판(디바이스 q4_idx_q_rope/
+                // bk_update가 소비, plans/73).
                 let ctx_n = seqs
                     .first()
                     .and_then(|s| s.idx_k.first())
                     .map(|k| k.len() / hp.idx_dim.max(1))
                     .unwrap_or(8192);
-                let (half, base) = (hp.idx_dim / 2, hp.rope_base);
-                let mut cs = vec![0.0f32; ctx_n * half * 2];
-                for pos in 0..ctx_n {
-                    for pp in 0..half {
-                        let theta = base.powf(-(2.0 * pp as f32) / hp.idx_dim as f32);
-                        let angle = pos as f32 * theta;
-                        cs[pos * half * 2 + pp * 2] = angle.cos();
-                        cs[pos * half * 2 + pp * 2 + 1] = angle.sin();
-                    }
-                }
-                cs
+                crate::ops::rope_cs_table(hp.idx_dim, hp.rope_base, ctx_n)
             },
             qsa_qn_t: {
                 // 헤드 타일: qk_norm_rope 커널이 qw[r0·hd..] 형태로 읽는다.
