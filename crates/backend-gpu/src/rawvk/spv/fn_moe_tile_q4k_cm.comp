@@ -159,20 +159,24 @@ void main() {
         return;
     }
 
-    // 프리패스: 행별 최대 |d| — 스케일 분리(d 서브노멀 계약).
+    // 프리패스: 행별 가중 상한 스케일 — plans/89 재개. dmin ≫ d 레이어에서
+    // 구판 max|d| 정규화는 A16 = (d·s·nib − dmin·m)/scale 이 f16 오버플로
+    // (±65k)를 침범했다(엔진 간헐 붕괴; 하네스 블록0 데이터는 미발).
+    // scale = 63·max_sb(15|d|+|dmin|) → A16 ∈ [−63, 63] 보장(q5_1판 동일 논리).
     {
         for (int i = int(tid); i < nrow; i += 512) {
             uint wq = ebase + uint(row0 + i) * row_words;
             float mx = 1e-30;
             for (uint s = 0u; s < (uint(n_in) >> 8); s++) {
                 uint w0 = w0c[wq + s * 36u];
-                mx = max(mx, abs(f16_exact(w0 & 0xFFFFu)));
+                float dd = abs(f16_exact(w0 & 0xFFFFu));
+                float dm = abs(f16_exact(w0 >> 16));
+                mx = max(mx, 15.0 * dd + dm);
             }
-            scale_row[i] = mx;
+            scale_row[i] = 63.0 * mx;
         }
         barrier();
     }
-
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
