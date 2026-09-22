@@ -1099,3 +1099,51 @@ baseline was re-recorded per the 86 §8 procedure: the dense-prefill
 tile changes the reduction class, cross-justified via ckdiff
 (ulp-cascade) and by the new stream matching the hip runtime's
 current tie resolution 9 tokens deep.
+
+## 2026-09-22 (plans/89) — Vulkan compute campaign: decode dmmv, dense/MoE prefill tiles, PLE device
+
+Solo, greedy, same conditions as the tables above. Default-path numbers
+(all gates PASS; deterministic greedy verified 2x on the final tree).
+
+### FN (qwen4exp) vulkan, default paths
+
+| cell | plans/88 close | plans/89 | ratio |
+|---|---|---|---|
+| pp512 (ctx 20480) | 60.1 | **103.6** | 1.72x |
+| pp4096 (ctx 20480) | 54.7 | **95.0** | 1.74x |
+| tg128@8k | 7.15 | **15.1** | 2.11x |
+
+With the MoE coopmat tiles opted in (`LLM170_VK_MOECM=1 LLM170_VK_Q51CM=1`)
+pp512 reaches **205 t/s** — but an engine-context-only intermittent
+nondeterminism (first divergence localized to L4A.mout by bufhash bisect;
+checks stay deterministic 6/6 incl. 20k-row multi-block cases) keeps them
+off the default until root-caused (details in plans/89 + ledger 32).
+
+### 27B (qwen35) vulkan
+
+pp512 **344** (llama vk 343 — parity), tg128@8k **11.44** (llama 12.05).
+Decode step decomposition after the ts-label double-push fix (ledger 32):
+GEMV-BW engine floor — q5b 50ms-sum/step of 137ms-sum across 900
+dispatches; the plans/89-era rms 21ms/quant 11ms premise was stale
+(addrms 5.1ms after the plans/46 revision). LLM170_VK_NR 2/3/4 sweep:
+noise.
+
+### What landed (12 commits, branch vk89-idot)
+
+- Decode: llama-dmmv ports for dense GEMV (q8b/q4b) + f32/BF16 mm_f32b +
+  MoE direct-ids dmmv (ids2/ids51) — f32-activation direct, quant skipped;
+  step 133 -> 64.5ms. QSA selected-attention multi-head plate (K/V 12x).
+- Prefill: dense coopmat tiles (decoder ms/128 family reuse, tile_q8
+  2818ms -> tile_q8128 412ms per chunk), fn_tile_f32 (router weight
+  re-read x512 eliminated), parallel moe_gather, MoE q8_0/q5_K scalar
+  tiles (legacy 512-expert gemv3 loop, 1101ms/chunk, eliminated).
+- PLE math device port (gate/conv/residual) — exp_cr_exact f64 Horner +
+  32-chunk rms reproduced instruction-for-instruction: gate stream
+  BIT-UNCHANGED vs the host bridge.
+- Root causes found via the diag chain: WG() 25-bit chunk split silently
+  zeroing stack addresses above 2^25 words (expert >= ~150); pipeline()
+  cache insert loss -> per-dispatch pipeline creation -> descriptor pool
+  exhaustion; f16 subnormal flush on q4_K d/dmin (f16_exact + row-max-d
+  scale separation in the CM tiles).
+- diag assets: [dsc] set-leak trace, [tsr] raw dispatch dump, kernel probe
+  modes 2/3/4/5, vk-moe-tile-check (4 types), [ts] label double-push fix.

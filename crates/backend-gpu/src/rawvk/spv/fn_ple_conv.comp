@@ -1,0 +1,68 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// fn_ple_conv (plans/89 P1.4) — hip q4_ple_conv 포트(비트 동일 목표).
+// dilated depthwise conv(kern=4, dil=3, hist=9) + silu(exp_cr_exact) + 링 갱신.
+// 스레드 = 채널 c(hc_dim), t 직렬. ring은 [hist][hc_dim] 상주.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer GatedB { float gated[]; };
+layout(binding = 1) readonly buffer CwB { float conv_w[]; };
+layout(binding = 2) buffer RingB { float ring[]; };
+layout(binding = 3) buffer ConvB { float conv_out[]; };
+layout(push_constant) uniform PC {
+    uint hc_dim; uint t; uint kern; uint dil; uint hist;
+} pc;
+
+float exp_cr_exact(float xf) {
+    double x = double(xf);
+    if (x > 88.72) return uintBitsToFloat(0x7f800000u);
+    if (x < -103.97) return 0.0;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double INV_LN2 = 1.44269504088896338700e+00;
+    double kd = roundEven(x * INV_LN2);
+    int k = int(kd);
+    double r = fma(-kd, LN2_HI, x);
+    r = fma(-kd, LN2_LO, r);
+    double p = 1.0 / 1307674368000.0;
+    p = fma(p, r, 1.0 / 479001600.0);
+    p = fma(p, r, 1.0 / 39916800.0);
+    p = fma(p, r, 1.0 / 3628800.0);
+    p = fma(p, r, 1.0 / 362880.0);
+    p = fma(p, r, 1.0 / 40320.0);
+    p = fma(p, r, 1.0 / 5040.0);
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    if (k > 127) return uintBitsToFloat(0x7f800000u);
+    if (k < -126) return 0.0;
+    uint64_t eb = (uint64_t(k + 1023)) << 52;
+    return float(p * uint64BitsToDouble(eb));
+}
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    if (c >= int(pc.hc_dim)) return;
+    for (uint ti = 0u; ti < pc.t; ti++) {
+        float acc = 0.0;
+        for (uint k = 0u; k < pc.kern; k++) {
+            int start = int(pc.hist + ti - (pc.kern - 1u - k) * pc.dil);
+            float v;
+            if (start >= int(pc.hist)) v = gated[uint(start - int(pc.hist)) * pc.hc_dim + uint(c)];
+            else v = ring[uint(start) * pc.hc_dim + uint(c)];
+            acc += conv_w[uint(c) * pc.kern + k] * v;
+        }
+        conv_out[ti * pc.hc_dim + uint(c)] = acc / (1.0 + exp_cr_exact(-acc));
+    }
+    for (uint j = 0u; j < pc.hist; j++) {
+        int src_col = int(pc.t + j);
+        float v;
+        if (src_col >= int(pc.hist)) v = gated[uint(src_col - int(pc.hist)) * pc.hc_dim + uint(c)];
+        else v = ring[uint(src_col) * pc.hc_dim + uint(c)];
+        ring[uint(j) * pc.hc_dim + uint(c)] = v;
+    }
+}

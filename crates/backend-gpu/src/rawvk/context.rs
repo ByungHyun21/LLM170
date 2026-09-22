@@ -29,6 +29,8 @@ pub struct VkCtx {
     pub fence: vk::Fence,
     pub coop_matrix: bool,
     pub coop_f16_f32: bool,
+    /// shader_integer_dot_product 활성 — GLSL dotPacked4x8EXT 사용 가능.
+    pub idot: bool,
     pub max_ssbo: usize,
     pub mem_ty: u32,
     /// GTT(캐시 host-visible) 타입 — 스크래치용.
@@ -131,6 +133,14 @@ impl VkCtx {
                 });
             }
 
+            // plans/89 P0.1 — GL_EXT_integer_dot_product(dotPacked4x8EXT =
+            // 하드웨어 v_dot4_i32_i8) 지원. Vulkan 1.3 코어 기능 — 쿼리해 지원
+            // 시에만 활성(미지원 장치 생성 실패 방지, coop 패턴과 동일).
+            let mut v13sup = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13sup);
+            let _ = instance.get_physical_device_features2(physical, &mut f2);
+            let idot = v13sup.shader_integer_dot_product != 0;
+
             let qfams = instance.get_physical_device_queue_family_properties(physical);
             let qf = qfams
                 .iter()
@@ -154,6 +164,8 @@ impl VkCtx {
             let mut feats = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut v11)
                 .push_next(&mut v12);
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
+                .shader_integer_dot_product(true);
             let mut prfeat = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default()
                 .pipeline_robustness(true);
             if pipeline_robustness {
@@ -161,6 +173,9 @@ impl VkCtx {
             }
             if coop_matrix {
                 feats = feats.push_next(&mut coopfeat);
+            }
+            if idot {
+                feats = feats.push_next(&mut v13);
             }
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qf)
@@ -246,6 +261,7 @@ impl VkCtx {
                 coop_matrix,
                 pipeline_robustness,
                 coop_f16_f32,
+                idot,
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
@@ -294,9 +310,13 @@ impl VkCtx {
                 // 죽는다(2026-09-17 실측: pp4096 149 t/s 정상 / pp8192 device lost,
                 // 청크 크기와 무관). 스토리지 디스크립터는 세트당 ~수십 바이트라
                 // 65536으로 올려도 비용이 무시할 수준이다.
+                // plans/89: MoE 타일 13바인딩 세트 + 스텝당 유니크 조합 증가로
+                // 65536이 128스텝 벤치에서 고갈(OUT_OF_POOL_MEMORY) — 4배 상향.
+                // 세트 수명은 ds_cache 영속 가정(스텝 간 키 반복) — 장기
+                // 세션 회수(eviction)는 후속 과제.
                 let pool_sizes = [vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(12 * 65536)];
+                    .descriptor_count(16 * 262144)];
                 let pool = self
                     .device
                     .create_descriptor_pool(
@@ -945,7 +965,9 @@ impl VkCtx {
                 let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
                 e.0 += dt;
                 e.1 += 1;
-                e.2 = e.2.max(dt);
+                if std::env::var_os("LLM170_VK_TS_RAW").is_some() && dt > 0.3 {
+                    eprintln!("[tsr] {k:5} {lbl:20} {dt:8.3}ms");
+                }
                 tot += dt;
             }
             let ns = self.submits.get();
@@ -1023,6 +1045,9 @@ impl VkCtx {
         }
     }
 
+thread_local! {
+    static DSC_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
     pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
             let key = (
@@ -1031,6 +1056,15 @@ impl VkCtx {
             );
             if let Some(&ds) = self.ds_cache.borrow().get(&key) {
                 return Ok(ds);
+            }
+            let n = DSC_MISS.with(|c| c.replace(c.get() + 1));
+            if std::env::var_os("LLM170_VK_DSC").is_some() {
+                if n % 8192 == 0 {
+                    eprintln!("[dsc] miss #{} cache {}", n, self.ds_cache.borrow().len());
+                }
+                if (200..260).contains(&n) {
+                    eprintln!("[dsc{}] {} dsl={:x}", n, crate::rawvk::context::site::tag(), p.dsl.as_raw());
+                }
             }
             self.batch_dsl.set(Some((p.dsl, p.pool)));
             let ds = self.fresh_ds(bufs.len() as u32)?;
@@ -1044,6 +1078,10 @@ impl VkCtx {
             Ok(p.ds)
         }
     }
+}
+
+thread_local! {
+    static DSC_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 

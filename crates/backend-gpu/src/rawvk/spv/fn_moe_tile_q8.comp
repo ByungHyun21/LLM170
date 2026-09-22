@@ -1,0 +1,105 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+// fn_moe_tile_q8 (plans/89 P1.1c) — MoE 그룹 프리필 q8_0 16×16 스칼라 타일.
+// FN UD-Q4_K_XL의 down 역할 일부가 q8_0 — 종전 tile_ok 미포함으로 레거시
+// 512-전문가 gemv3 루프([ts] gemv 1101ms/청크)로 떨어졌다. fn_moe_tile_q4k
+// 골격(패딩 도메인 간접) + q8_0 디양자화(d f16 + 32 i8, 34B/32원소,
+// 슈퍼블록 272B=68워드 정렬). 부분 슈퍼블록(n_in=640) 지원 — 블록 기준
+// 방문·스테이징 상한은 행 잔여 바이트. 산술: 요소급 f32 직렬(신규 클래스).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Yg { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+uint Wsel(uint c, uint o) {
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+// 16출력행 × 68워드(슈퍼블록) = 4.25KB.
+shared uint sh[16 * 68];
+
+uint byte_at(uint wi, uint b) {
+    return (sh[wi + (b >> 2)] >> uint((b & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    int ox = int(gl_LocalInvocationID.x);
+    int rx = int(gl_LocalInvocationID.y);
+    int o = int(gl_WorkGroupID.x) * 16 + ox;
+    uint r0 = gl_WorkGroupID.y * 16u;
+    uint rp = rows_pad[0];
+    if (r0 >= rp) return;
+    uint e = pc.mode == 1u ? 0u : rowexp[r0];
+    uint n_in = pc.n_in;
+    uint n_blocks = n_in >> 5;
+    uint n_super = (n_blocks + 7u) >> 3;   // 부분 슈퍼블록 포함(640=2.5 등)
+    uint row_bytes = n_blocks * 34u;
+    int tid = int(gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x);
+    uint r = r0 + uint(rx);
+    uint xr0 = (pc.mode == 1u ? r : perm_pad[r]) * pc.xq_w;
+    uint xw_base = n_in >> 2;
+    float acc = 0.0;
+    for (uint sIdx = 0u; sIdx < n_super; sIdx++) {
+        // 협동 스테이징: 16행 × min(68, 잔여워드).
+        for (uint row = 0u; row < 16u; row++) {
+            uint orow = gl_WorkGroupID.x * 16u + row;
+            if (orow >= pc.n_out) break;
+            uint64_t wbase = uint64_t(e) * uint64_t(pc.per_expert_bytes)
+                           + uint64_t(orow) * uint64_t(row_bytes) + uint64_t(sIdx) * 272u;
+            uint w0 = uint(wbase >> 2);
+            uint c0 = w0 / pc.chunk_words;
+            uint lim = (c0 + 1u) * pc.chunk_words;
+            uint srow = row * 68u;
+            uint wavail = uint(row_bytes - sIdx * 272u + 3u) >> 2;
+            for (uint col = uint(tid); col < min(68u, wavail); col += 256u) {
+                uint wi = w0 + col;
+                sh[srow + col] = wi < lim
+                    ? Wsel(c0, wi - c0 * pc.chunk_words)
+                    : Wsel(c0 + 1u, wi - (c0 + 1u) * pc.chunk_words);
+            }
+        }
+        barrier();
+        if (o < int(pc.n_out) && r < rp) {
+            uint srow = uint(ox) * 68u;
+            for (uint bi = 0u; bi < 8u; bi++) {          // 32원소 블록(슈퍼블록 내)
+                uint gb = sIdx * 8u + bi;
+                if (gb >= n_blocks) break;
+                float d = unpackHalf2x16(sh[srow + (bi * 34u >> 2)] >> uint((bi * 34u & 3u) * 8u)).x;
+                float yd = uintBitsToFloat(xq[xr0 + xw_base + gb]);
+                for (uint j = 0u; j < 32u; j++) {
+                    uint qb = byte_at(srow, 2u + bi * 34u + j);   // i8 (부호)
+                    int b = int(qb) << 24 >> 24;
+                    uint xw = xr0 + ((gb * 32u + j) >> 2);
+                    uint xb = (xq[xw] >> uint(((gb * 32u + j) & 3u) * 8u)) & 0xFFu;
+                    int bs = int(xb) << 24 >> 24;
+                    acc += (d * float(b)) * (yd * float(bs));
+                }
+            }
+        }
+        barrier();
+    }
+    if (o < int(pc.n_out) && r < rp) {
+        outv[r * pc.n_out + uint(o)] = acc;
+    }
+}
