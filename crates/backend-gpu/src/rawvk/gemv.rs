@@ -90,6 +90,8 @@ const TILE_Q8MS_SPV2: &[u8] = include_bytes!("spv/tile_q8ms.spv");
 const TILE_Q4K128_SPV2: &[u8] = include_bytes!("spv/tile_q4k128.spv");
 const TILE_Q4KMS_SPV2: &[u8] = include_bytes!("spv/tile_q4kms.spv");
 
+/// plans/89 P1.1b — MoE 그룹 프리필 q4_K coopmat 타일(f16 스테이징).
+const FN_MOE_TILE_Q4K_CM_SPV: &[u8] = include_bytes!("spv/fn_moe_tile_q4k_cm.spv");
 /// 파이프라인 세트 (vk 핸들은 복사 가능).
 /// 지연 파이프라인 슬롯.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,6 +162,8 @@ enum Slot {
     TileQ8msCm,
     TileQ4k128Cm,
     TileQ4kmsCm,
+    /// plans/89 P1.1b — MoE q4_K coopmat 타일.
+    FnMoeTileQ4kCm,
 }
 /// plans/86 §6 — 모델 파트 파일 (mmap 범위 + 핸들). 대형 가중 업로드를
 /// pread 스테이징으로 수행한다(hip staged_upload 미러).
@@ -313,6 +317,7 @@ fn slot_name(slot: Slot) -> &'static str {
         Slot::FnMoeTileQ4K => "moe_tile_q4k",
         Slot::FnTileF32 => "tile_f32",
         Slot::FnMoeTileQ51 => "moe_tile_q51",
+        Slot::FnMoeTileQ4kCm => "moe_tile_q4k_cm",
         Slot::FnTileQ8 => "tile_q8",
      }
  }
@@ -439,6 +444,7 @@ impl VkAcc {
             Slot::TileQ8msCm => (TILE_Q8MS_SPV2, 10, 20),
             Slot::TileQ4k128Cm => (TILE_Q4K128_SPV2, 10, 24),
             Slot::TileQ4kmsCm => (TILE_Q4KMS_SPV2, 10, 20),
+            Slot::FnMoeTileQ4kCm => (FN_MOE_TILE_Q4K_CM_SPV, 13, 28),  // 8W+xq+yg+rowexp+rp+perm_pad
         };
         let p = ctx.pipeline_pipes(spv, n_buf, pb)?;
         self.pipes.lock().insert(slot, p);
@@ -1817,7 +1823,22 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 }
                 (gi.rowexp.buf, gi.rows_pad.buf, gi.perm_pad.buf, gi.inv_pad.buf, gi.yg.buf)
             };
-            let p = self.pipeline(&mut ctx, if w.ty == GgmlType::Q4K { Slot::FnMoeTileQ4K } else { Slot::FnMoeTileQ51 })?;
+            // plans/89 P1.1b — q4_K coopmat 타일 우선: 스칼라 16×16 판([ts]
+            // 1602ms/청크) 대신 f16 coopMatMulAdd 128행 판. q5_1은 스칼라 유지
+            // (차후 판 추가). 킬스위치 LLM170_VK_MOECM=0.
+            let use_cm = w.ty == GgmlType::Q4K
+                && wbufs.len() == 1
+                && std::env::var("LLM170_VK_MOECM").map(|v| v == "1").unwrap_or(false);
+            let p = self.pipeline(
+                &mut ctx,
+                if use_cm {
+                    Slot::FnMoeTileQ4kCm
+                } else if w.ty == GgmlType::Q4K {
+                    Slot::FnMoeTileQ4K
+                } else {
+                    Slot::FnMoeTileQ51
+                },
+            )?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             while binds.len() < 8 {
                 binds.push(dbuf);
@@ -1833,7 +1854,12 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, 0u32,
                 rows as u32,
             ]);
-            ctx.run(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32, 1)?;
+            let (gx, gy) = if use_cm {
+                (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
+            } else {
+                (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
+            };
+            ctx.run(p.pl, ds2, p.pipe, &push, gx, gy, 1)?;
             // 산란: out[i] = yg[inv_pad[i]] (행 순서 복원 — SiluMul/wsum 소비).
             let ps = self.pipeline(&mut ctx, Slot::PermuteF32)?;
             let dss = ctx.bind_ds(&ps, &[ygb, ivb, ob])?;
