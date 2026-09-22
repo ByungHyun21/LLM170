@@ -4158,6 +4158,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Q6K if bn128 => ("tile_q6k128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q3K if bn128 => ("tile_q3k128.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Q8_0 if bn128 => ("tile_q8128.spv", 10u32, 0u8),
+        llm170_gguf::GgmlType::Q8_0 if std::env::var("LLM170_TILE_I8").map(|v| v=="1").unwrap_or(false) => ("tile_q8128i.spv", 10u32, 0u8),
         llm170_gguf::GgmlType::Iq4Xs if bn128 => ("tile_xs128.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Iq4Nl if bn128 => ("tile_nl128.spv", 11u32, 1u8),
         llm170_gguf::GgmlType::Q4K if msall => ("tile_q4kms.spv", 10u32, 0u8),
@@ -4195,9 +4196,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         llm170_gguf::GgmlType::Iq3S => ("tile_iq3s.spv", 11, 2),   // grid3s
         _ => return Err("tile 검증 불가 타입".into()),
     };
+    let i8tile = std::env::var("LLM170_TILE_I8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q8_0;
     let is_128 = (w.ty == llm170_gguf::GgmlType::Q5K && std::env::var_os("LLM170_TILE_V2").is_none()) || msall
         || (std::env::var("LLM170_TILE_MS128V2").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K)
-        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
+        || std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false)
+        || i8tile;
         let acc = VkAcc::new()?;
     let mut ctx = acc.ctx.lock();
     let mut seed = 0x5deece66u64;
@@ -4243,7 +4246,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let spv = std::fs::read(format!("crates/backend-gpu/src/rawvk/spv/{spv_name}"))
         .map_err(|e| e.to_string())?;
     // plans/41: ms 패밀리는 push 5필드 [n_in,n_out,xq_w,t,tok_base] (pb=20)
-    let bn128spv = spv_name.ends_with("128.spv") || spv_name.starts_with("tile_ms128s");
+    let bn128spv = spv_name.ends_with("128.spv") || spv_name.starts_with("tile_ms128s") || i8tile;
     let is_msfam = spv_name.ends_with("ms.spv") || spv_name.ends_with("mgy.spv")
         || spv_name == "tile_ms4.spv" || bn128spv;
     let slab: usize = if bn128spv { 128 } else { 64 };
@@ -4272,9 +4275,11 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     } else if std::env::var("LLM170_TILE_MS8").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32).div_ceil(64)
     } else if (std::env::var("LLM170_TILE_MS7").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS6").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K {
-        (n_out as u32).div_ceil(64)   // tile_ms6: WG당 64행
+        (n_out as u32).div_ceil(64)   // tile_ms6/ms7: WG당 64행
     } else if spv_name.starts_with("tile_ms128") && w.ty == llm170_gguf::GgmlType::Q5K {
         (n_out as u32).div_ceil(64)   // tile_ms128 계열: WG당 64행 × 128토큰
+    } else if i8tile {
+        (n_out as u32).div_ceil(64)   // tile_q8128i: WG당 64행 × 128토큰
     } else if msall || ((std::env::var("LLM170_TILE_MS").map(|v| v=="1").unwrap_or(false) || msf16b || std::env::var("LLM170_TILE_MS2").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS3").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS4").map(|v| v=="1").unwrap_or(false) || std::env::var("LLM170_TILE_MS5").map(|v| v=="1").unwrap_or(false)) && w.ty == llm170_gguf::GgmlType::Q5K) {
         (n_out as u32).div_ceil(64)   // tile_ms: WG당 64행
     } else if std::env::var("LLM170_TILE_S32B").map(|v| v=="1").unwrap_or(false) && w.ty == llm170_gguf::GgmlType::Q5K {
