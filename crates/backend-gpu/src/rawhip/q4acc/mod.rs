@@ -507,10 +507,6 @@ macro_rules! cargs {
     }};
 }
 
-/// Engine4에 주입할 가속기 생성 — 실패 시 호출부가 CPU로 폴백(경고).
-pub fn new_acc() -> Result<std::sync::Arc<dyn llm170_core::matmul::Accelerator>, String> {
-    new_acc_with_sources(Vec::new())
-}
 
 /// 파트 소스 지정판 — 서버 배선이 `Model4::part_sources()`를 넘긴다.
 /// LLM170_GPU_RUNTIME=vulkan이면 VkAcc(plans/84 B — 진단 경로 포함 전역 스위치).

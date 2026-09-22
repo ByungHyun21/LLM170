@@ -206,79 +206,6 @@ pub fn bw_test() -> Result<String, String> {
     Ok(format!("bw_probe: {:.1}us -> {:.0} GB/s (checksum={})", dt * 1e6, bytes as f64 / dt / 1e9, r[63] as u32))
 }
 
-/// 배치별 읽기 대역폭 프로브 (plans/83 D2) — 같은 bw_probe 커널로
-/// ① VRAM 커브아웃 여유 상태, ② hipMallocHost(GTT 핀) 버퍼,
-/// ③ VRAM을 채운 뒤의 hipMalloc(GTT 스펠) 버퍰를 각각 읽는다.
-/// APU에서 무게 초과분(103GB 중 ~45GB)이 어느 속도로 읽히는지 직접 측정.
-pub fn bw_place_test() -> Result<String, String> {
-    let ctx = RawCtx::new()?;
-    // 스트리밍 판독(배치 무관 DRAM BW): 행 121KB × 17408행 = 2.1GB — L2(32MB)를
-    // 65배 초과해 재독 캐시 효과를 제거한다. bsize=6056(=176×34.4→정수).
-    let (n_in, n_out, bsize) = (5120usize, 17408usize, 6056usize);
-    let bytes = n_out * (n_in / 256) * bsize; // ≈ 2.1 GiB
-    let part = ctx.scratch(n_out * 64 * 8)?;
-    let mut out = String::new();
-
-    let n_q = (bytes / 8) as u64;
-    let run = |w: *mut u8, label: &str, out: &mut String| -> Result<(), String> {
-        let mut wp = w as *mut std::ffi::c_void;
-        let mut pp = part as *mut std::ffi::c_void;
-        let mut nq = n_q;
-        let mut args = vec![
-            (&mut wp) as *mut _ as *mut std::ffi::c_void,
-            (&mut pp) as *mut _ as *mut std::ffi::c_void,
-            (&mut nq) as *mut u64 as *mut std::ffi::c_void,
-        ];
-        // 페이지 커밋 + 영-페이지 중복 제거(ROCm 지연 커밋 회피)
-        unsafe { crate::rawhip::ck(hip::hipMemset(w as *mut std::ffi::c_void, 0x5A, bytes), "memset")?; }
-        ctx.launch("bw_stream", 4096, 1, 256, &mut args)?;
-        ctx.sync()?;
-        let reps = 5;
-        let t0 = std::time::Instant::now();
-        for _ in 0..reps {
-            ctx.launch("bw_stream", 4096, 1, 256, &mut args)?;
-        }
-        ctx.sync()?;
-        let dt = t0.elapsed().as_secs_f64() / reps as f64;
-        out.push_str(&format!(
-            "  {label}: {:.0}us → {:.0} GB/s\n",
-            dt * 1e6,
-            bytes as f64 / dt / 1e9
-        ));
-        Ok(())
-    };
-
-    // ① 여유 VRAM 내 hipMalloc
-    let w1 = ctx.alloc(bytes)?;
-    // 더미 패턴 기록 (읽기 최적화 방해 없음 — XOR 체크섬만 소비)
-    run(w1, "hipMalloc (VRAM 여유)", &mut out)?;
-
-    // ② hipMallocHost — GTT 핀 (호스트 매핑, coherent)
-    let mut wh: *mut std::ffi::c_void = std::ptr::null_mut();
-    unsafe {
-        let r = hip::hipMallocHost(&mut wh, bytes);
-        if r != hip::hipError_t_hipSuccess {
-            out.push_str(&format!("  hipMallocHost 실패: {r:?}\n"));
-        } else {
-            run(wh as *mut u8, "hipMallocHost (GTT 핀)", &mut out)?;
-        }
-    }
-
-    // ③ VRAM을 거의 채운 뒤 hipMalloc — 스펠 판정
-    let (free, _total) = gpu_mem_free().unwrap_or((0, 0));
-    let chunk = 1usize << 30; // 1 GiB
-    let mut _guard = 0;
-    while free as usize > (_guard + 2) * chunk + (2 << 30) && _guard < 64 {
-        match ctx.alloc(chunk) {
-            Ok(_p) => _guard += 1,
-            Err(_) => break,
-        }
-    }
-    let w3 = ctx.alloc(bytes)?;
-    run(w3, "hipMalloc (VRAM 포화 후)", &mut out)?;
-    Ok(format!("bw-place ({bytes}B 버퍼, 프로브 30회 평균):\n{out}"))
-}
-
 /// 가드용 최소 VRAM 조회 (2026-09-16) — 컨텍스트 없이 런타임 질의만.
 /// 성공 시 (free, total) 바이트.
 pub fn gpu_mem_free() -> Option<(u64, u64)> {
@@ -327,10 +254,9 @@ pub fn device_report(ctx: &RawCtx) -> String {
         }
     }
     format!(
-        "# device: {name} | mem free={:.1}GiB total={:.1}GiB | h2d={h2d:.1}GB/s d2h={d2h:.1}GB/s | wmma={}",
+        "# device: {name} | mem free={:.1}GiB total={:.1}GiB | h2d={h2d:.1}GB/s d2h={d2h:.1}GB/s",
         free as f64 / (1u64 << 30) as f64,
-        total as f64 / (1u64 << 30) as f64,
-        if wmma_ok() { "ok" } else { "none" }
+        total as f64 / (1u64 << 30) as f64
     )
 }
 
@@ -461,51 +387,3 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
     ))
 }
 
-/// plans/84 C — q4_hc_a 폴트 최소 재현: 합성 버퍼로 커널 A 형상을 단독 실행.
-/// 폴트 재현 시 코드젠/커널 문제, 무폴트 시 엔진 맥락(프레임 버퍼/B 후속) 문제.
-pub fn hca_repro() -> Result<String, String> {
-    let ctx = RawCtx::new()?;
-    let (n, hc, r): (usize, usize, usize) = (2560, 4, 320);
-    let total = hc * n;
-    let n_sub = total / 32;
-    let mut seed = 0x9e37_79b9u64;
-    let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((seed >> 33) as f32 / 2147483648.0) - 1.0
-    };
-    let res: Vec<f32> = (0..total).map(|_| lcg()).collect();
-    let wnorm: Vec<f32> = (0..total).map(|_| 1.0 + lcg() * 0.1).collect();
-    let wdown: Vec<u8> = (0..r * n_sub * 34).map(|i| (i as u8).wrapping_mul(7)).collect();
-    let winj: Vec<f32> = (0..hc * total).map(|_| lcg()).collect();
-    let (mut rp, mut np_, mut wd, mut wi) = (ctx.alloc(total * 4)?, ctx.alloc(total * 4)?, ctx.alloc(wdown.len() + 4096)?, ctx.alloc(winj.len() * 4)?);  // +4KB 슬랙: 꼬리 초과판독 이론
-    let (mut lp, mut jp, mut xp) = (ctx.alloc(r * 4)?, ctx.alloc(hc * 4)?, ctx.alloc(total * 4)?);
-    ctx.h2d(rp, bytemuck::cast_slice(&res))?;
-    ctx.h2d(np_, bytemuck::cast_slice(&wnorm))?;
-    ctx.h2d(wd, &wdown)?;
-    ctx.h2d(wi, bytemuck::cast_slice(&winj))?;
-    let (mut n_a, mut hc_a, mut r_a) = (n as i32, hc as i32, r as i32);
-    let mut eps = 1e-5f32;
-    let grid = (r + hc + total / 64) as u32;
-    for it in 0..8 {
-        let mut a: Vec<*mut std::ffi::c_void> = vec![
-            &mut rp as *mut _ as *mut std::ffi::c_void,
-            &mut np_ as *mut _ as *mut std::ffi::c_void,
-            &mut wd as *mut _ as *mut std::ffi::c_void,
-            &mut wi as *mut _ as *mut std::ffi::c_void,
-            &mut lp as *mut _ as *mut std::ffi::c_void,
-            &mut jp as *mut _ as *mut std::ffi::c_void,
-            &mut xp as *mut _ as *mut std::ffi::c_void,
-            &mut n_a as *mut _ as *mut std::ffi::c_void,
-            &mut hc_a as *mut _ as *mut std::ffi::c_void,
-            &mut r_a as *mut _ as *mut std::ffi::c_void,
-            &mut eps as *mut _ as *mut std::ffi::c_void,
-        ];
-        ctx.launch3("q4_hca_repro", grid, 1, 1, 64, &mut a)?;
-        ctx.sync()?;   // 매 이터레이션 동기 — 폴트 즉시 노출
-        eprintln!("[hca-repro] iter {it} ok");
-    }
-    let mut lo_out = vec![0f32; r];
-    ctx.d2h(bytemuck::cast_slice_mut(&mut lo_out), lp)?;
-    let nonz = lo_out.iter().filter(|v| **v != 0.0).count();
-    Ok(format!("hca-repro: 8회 실행 무폴트, lo nonzero {nonz}/{r}"))
-}
