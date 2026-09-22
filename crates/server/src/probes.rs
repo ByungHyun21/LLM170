@@ -197,6 +197,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let mode = args.first().cloned().unwrap_or_else(|| "q8_0".into());
             llm170_backend_gpu::rawvk::gemv::moe_tile_type_check(&mode)
         }
+        "vk-moe-cm-race" => llm170_backend_gpu::rawvk::gemv::moe_cm_race_check(),
         "mmv-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.1.attn_qkv.weight".into());
