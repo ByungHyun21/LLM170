@@ -119,7 +119,6 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let ids2_takes = rows > 0
             && (t == 1 || rows <= 64)
             && std::env::var("LLM170_MOE_IDS2").map(|v| v != "0").unwrap_or(true)
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
             && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
         let xq = if ids2_takes {
             vk::Buffer::null()
@@ -136,12 +135,12 @@ impl llm170_core::matmul::FrameState for VkAcc {
         // 베이스 = ids[r]·per_expert 를 산출한다. ids d2h(동기 드레인)·호스트
         // 그룹화·perm/inv 업로드·게더·전문가 루프·스캐터 전부 소거(B1).
         // 산술은 종전 전문가별 gemv3 경로와 출력 요소당 비트 동일(레인 부담·
-        // 감축 동일) — 토큰 스트림 불변 계약. 강제 스위치 LLM170_MOE_GROUPED=1.
+        // 감축 동일) — 토큰 스트림 불변 계약. (구 호스트 그룹화 강제 스위치
+        // LLM170_MOE_GROUPED 는 90-B5 폐기 — 기본경로와 수치 동일 확인.)
         // 초판의 hip 16×16타일 직역은 이 vk에서 점유율 부족(160WG, 실측
         // 10GB/s vs hip 180GB/s)으로 폐기 — K-분할은 레인 분할(256)이 담당.
         if rows > 0
             && (t == 1 || rows <= 64)
-            && std::env::var_os("LLM170_MOE_GROUPED").is_none()
             && matches!(
                 w.ty,
                 GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q5_1 | GgmlType::Q8_0

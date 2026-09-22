@@ -146,6 +146,19 @@ fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
         .min(cap)
 }
 
+/// 프레임 환경 게이트(캐시) — LLM170_FRAME!=0 && {PREFILL,DECODE}!=0.
+fn frame_env_on(decode: bool) -> bool {
+    static PRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static DEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lk = if decode { &DEC } else { &PRE };
+    *lk.get_or_init(|| {
+        std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
+            && std::env::var(if decode { "LLM170_FRAME_DECODE" } else { "LLM170_FRAME_PREFILL" })
+                .map(|v| v != "0")
+                .unwrap_or(true)
+    })
+}
+
 impl Engine4 {
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs).map(|_| SeqState4::new(&model.hp, ctx)).collect();
@@ -171,14 +184,12 @@ impl Engine4 {
     /// 프레임(디바이스 상주) 경로 활성 게이트 — 6벌 복제 통합(plans/90 A1 D10).
     /// decode=false → LLM170_FRAME_PREFILL, true → LLM170_FRAME_DECODE
     /// (둘 다 기본 on). 조건 순서·의미는 기존 인라인 판과 동일.
+    /// 환경 판독은 기동 후 불변 전제로 1회 캐시(90 B5 — 스텝당 env::var 제거).
     fn frame_on(&self, decode: bool) -> bool {
         self.acc.is_some()
             && !self.frame_broken
             && self.acc.as_ref().is_some_and(|a| a.frame_capable())
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var(if decode { "LLM170_FRAME_DECODE" } else { "LLM170_FRAME_PREFILL" })
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && frame_env_on(decode)
     }
 
     /// 프레임 GPU 상태 → CPU 사본 풀백(값 경로 진입 전 정합화, plans/90 A1 D12).
