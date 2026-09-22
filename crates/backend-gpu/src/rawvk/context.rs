@@ -961,6 +961,14 @@ impl VkCtx {
                     break;
                 }
                 let dt = (buf[a + 1] - buf[a]) as f64 * per / 1e6; // ms
+                // plans/91 P1: 디스패치 간 공백(직전 bottom → 다음 top) — 베리어
+                // 드레인/런치 지연의 직접 계량. 마지막 디스패치는 제외.
+                if a + 3 < n {
+                    if let Some(gap_t) = buf[a + 2].checked_sub(buf[a + 1]) {
+                        let gap = gap_t as f64 * per / 1e6;
+                        GAP_SUM.with(|g| g.set(g.get() + gap));
+                    }
+                }
                 let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
                 e.0 += dt;
                 e.1 += 1;
@@ -969,6 +977,8 @@ impl VkCtx {
                 }
                 tot += dt;
             }
+            let gsum = GAP_SUM.with(|g| g.replace(0.0));
+            eprintln!("[ts] 공백합 {gsum:.1}ms");
             let ns = self.submits.get();
             eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
             self.submits.set(0);
@@ -1077,6 +1087,10 @@ thread_local! {
             Ok(p.ds)
         }
     }
+}
+
+thread_local! {
+    static GAP_SUM: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 thread_local! {
