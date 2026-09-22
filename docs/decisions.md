@@ -1692,3 +1692,21 @@ Two hardenings landed: the vk MoE tile gate now carries the hip-side
 table writes above it — unreachable with 512-expert models, but stale
 buffer consumption if ever reached), and the flake remains classified
 environment-correlated until a recurrence provides checksums.
+
+**A3 NAMES regression (caught post-merge)**: the hip NAMES table rewrite
+intended to drop 12 probe kernels but silently dropped 34 — including
+production kernels (`q4_shexp_gu/da` FN decode GEMVs, `argmax64`, the
+`gemm_*_{mm,wm,wc}` families, vit/ms kernels). NAMES is a string table,
+so the compiler cannot catch omissions; failures surface at runtime
+GetFunction. The 27B hip gate stayed green by luck (its CPU argmax
+fallback is deterministically stream-identical) while FN hip diverged
+deterministically — caught only when the FN hip cell was run for the
+first time this session, during final both-runtime gating of the
+follow-up cleanup. Bisect initially mispointed (a stale-binary hazard:
+`cargo build | tail -1 && gate` masks build failures); strict
+build-verified bisect plus launch-site audit localized it. All 23
+restored; FN hip + 27B hip green again. Protocol change going forward:
+the gate matrix must include **FN hip** alongside FN vk / 27B hip /
+27B vk / frame-check — a single-runtime gate can mask whole-backend
+kernel loss. Verification commands now run with explicit build-exit
+checks (`set -o pipefail` discipline).

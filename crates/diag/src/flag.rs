@@ -22,10 +22,10 @@ fn registry() -> &'static Mutex<HashMap<String, FlagInfo>> {
 /// 캐시 키는 환경변수명 그대로. 첫 호출 시 1회 판독 후 고정.
 pub fn env_on(name: &str) -> bool {
     // 캐시 조회
-    if let Ok(r) = registry().lock() {
-        if let Some(info) = r.get(name) {
-            return info.value;
-        }
+    if let Ok(r) = registry().lock()
+        && let Some(info) = r.get(name)
+    {
+        return info.value;
     }
     // 첫 판독
     let v = std::env::var_os(name).is_some();
