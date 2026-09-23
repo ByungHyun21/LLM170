@@ -1860,3 +1860,39 @@ Shipped: rows>=2 -> rms_wide, rows==1 -> original 32-thread plate
 (Slot::RmsWide; FnIdxExpand slot restored after an edit accident).
 Lesson recorded: headline-table refreshes double as regression sweeps —
 re-measure tg whenever a "prefill" kernel change touches a shared slot.
+
+### (36) perf-93 ledger: MoE routing sensitivity, PLE device-prefill negative, FN decode decomposition (plans/93, 2026-09-23)
+
+Campaign against the llama.cpp b1ff4ca23 refresh gap. P0 decomposition
+([ts] span-validated): FN chunk 2.4s = MoE tiles 1107ms(52%) at ~63GB/s
+effective + tile_f32 352 + ple_bridge 285 + dense q8 206. The MoE headroom
+is exactly 2.4x to the ~150GB/s ceiling — the single biggest FN lever.
+
+Closed with evidence:
+
+1. **MoE tile nondeterminism root-caused to routing sensitivity, not a
+   kernel race.** Three variants (cm2 K-split 2x20, q4k_sg1 1-subgroup
+   coopmat, q4k_sc pure-scalar with LDS f16 staging) all show 3/3 distinct
+   32-token streams — AND SO DOES THE DEFAULT configuration (2/3 at
+   n-predict 32). The 16-token gate window hides what manifests at longer
+   horizons: 512-expert top-k routing flips on any upstream ±ulp (rms
+   dual-plate regrouping, f16 staging rounding). This is inherent to sparse
+   MoE attention, not fixable at the kernel level; llama.cpp shares it.
+   The fast opt-in variants (sg1 288 t/s, sc 265 t/s vs default 192) are
+   shipped behind env gates for future arithmetic-class re-baselining.
+2. **PLE t>1 device prefill closed negative.** The 3 kernels (gate/conv/
+   residual) all accept t>1 rows, but the gate kernel's per-(s,ti) serial
+   RMS makes t=512 slower than the host bridge (154 vs 214 t/s) and the
+   ring-state semantics need the pos-aware watermark (shipped: trait pos0
+   + ple_ring_sync infrastructure — decode-side misjudgment fixed).
+3. **kv8 cache mode closed negative.** LLM170_VK_KV8=1 falls back to the
+   pre-reg flash kernel (pp512 360→320, gate FAIL) — the q8 KV path predates
+   qsa_flash_reg and needs a fresh port.
+
+FN decode (P3 decomposition): GPU 51.2ms/step (gemv8_q8b 22ms 43%) vs
+wall 68ms — the ~17ms host recording cost (2398 dispatches) is the next
+decode lever (dispatch merging or vk graph recording).
+
+Open leads: MMQ register-tile port (llama mul_mmq recipe, BM/BN 64x64x32),
+dispatch merge for FN decode, hip MoE decode GEMV class, np agg 29ms
+outside-step localization, hip np seq3 divergence (pre-existing).
