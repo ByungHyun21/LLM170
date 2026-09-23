@@ -612,7 +612,15 @@ impl DecoderState {
         // 고정(산술 불변), push 16B로 맞춘다.
         let mut push = Self::push_u32s(&[n as u32, t as u32, 1u32]);
         push.extend_from_slice(&eps.to_le_bytes());
-        self.run_pipe("rms", crate::rawvk::vkacc::RMS_SPV, 3, 16,
+        // plans/92 P4.1: 대형 t(프리필)는 256스레드 판, 소형은 32스레드 원판 —
+        // t=1에서 wide 판은 WG 지연이 손해(실측 tg 11.21 vs 10.92).
+        let wide = t >= 2;   // 판별자=행 수: 1행(디코드)은 WG 지연, 다행은 병렬도
+        let (nm, spv) = if wide {
+            ("rms_wide", crate::rawvk::vkacc::RMS_WIDE_SPV)
+        } else {
+            ("rms", crate::rawvk::vkacc::RMS_SPV)
+        };
+        self.run_pipe(nm, spv, 3, 16,
             &[src, wbuf.buf, out], &push, t as u32, 1, 1)
     }
 

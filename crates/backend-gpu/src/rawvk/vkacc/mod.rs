@@ -16,6 +16,7 @@ pub const GEMV_SPV: &[u8] = include_bytes!("../spv/gemv3.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("../spv/quant_q8.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("../spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("../spv/rms.spv");
+pub const RMS_WIDE_SPV: &[u8] = include_bytes!("../spv/rms_wide.spv");
 pub const SILU_SPV: &[u8] = include_bytes!("../spv/silu_mul.spv");
 /// plans/84 B — vk 프레임 경로 유틸 셰이더군.
 const SILU_DIV_SPV: &[u8] = include_bytes!("../spv/silu_div.spv");
@@ -154,6 +155,9 @@ pub(crate) enum Slot {
     FnIdxExpand,
     Quant,
     Rms,
+    /// plans/92 P4.1 — 256스레드/행 판(대형 t). 디코드(t=1)는 32스레드 원판이
+    /// 우수(실측 tg 11.21 vs 10.92 — WG 지연 dominated).
+    RmsWide,
     /// plans/85 §2 — 프레임 로짓 행별 argmax(2단계).
     FnArgmaxRows,
     Silu,
@@ -342,9 +346,10 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnQkNormRope, "qk_norm_rope", FN_QK_NORM_ROPE_SPV, 5, 28),
     (Slot::FnIdxRank, "idx_rank", FN_IDX_RANK_SPV, 2, 8),
     (Slot::FnIdxExpand, "idx_expand", FN_IDX_EXPAND_SPV, 3, 16),
+    (Slot::Rms, "rms", RMS_SPV, 3, 16),
+    (Slot::RmsWide, "rms_wide", RMS_WIDE_SPV, 3, 16),
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
-    (Slot::Rms, "rms", RMS_SPV, 3, 16),
     (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
     (Slot::Gemv8Q4B, "gemv8_q4b", GEMV8_Q4B_SPV, 10, 24),
