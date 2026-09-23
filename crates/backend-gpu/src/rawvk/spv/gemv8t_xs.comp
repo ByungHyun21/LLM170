@@ -21,18 +21,19 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     for (uint i = tid; i < 256u; i += 64u) skt[i] = kt[i];
     barrier();
-    const uint first_row = 2u * gl_WorkGroupID.y;
-    uint num_rows = 2u;
-    if (first_row + 2u > pc.n_out) {
+    const uint nrows = min(uint(pc.rpf), 4u);   // plans/92 P6: rpf=4 정식 지원
+    const uint first_row = nrows * gl_WorkGroupID.y;
+    uint num_rows = nrows;
+    if (first_row + nrows > pc.n_out) {
         if (first_row >= pc.n_out) return;
         num_rows = pc.n_out - first_row;
     }
     const uint n_in = pc.n_in;
-    vec4 accv[2];
-    for (uint n2 = 0u; n2 < 2u; n2++) accv[n2] = vec4(0.0);
+    vec4 accv[4];
+    for (uint n2 = 0u; n2 < 4u; n2++) accv[n2] = vec4(0.0);
     const uint KPIT = 64u * 8u;
     for (uint col0 = 8u * tid; col0 < n_in; col0 += KPIT) {
-        [[unroll]] for (uint n = 0u; n < 2u; n++) {
+        [[unroll]] for (uint n = 0u; n < 4u; n++) {
             if (n >= num_rows) break;
             const uint col = (first_row + n) * n_in + col0;
             const uint blk = col >> 8;               // 256 원소 블록
@@ -81,11 +82,15 @@ void main() {
     }
     const vec4 r0 = subgroupAdd(accv[0]);
     const vec4 r1 = num_rows > 1u ? subgroupAdd(accv[1]) : vec4(0.0);
+    const vec4 r2 = num_rows > 2u ? subgroupAdd(accv[2]) : vec4(0.0);
+    const vec4 r3 = num_rows > 3u ? subgroupAdd(accv[3]) : vec4(0.0);
     if (tid == 0u) {
         [[unroll]] for (uint tk = 0u; tk < 4u; tk++) {
             if (tk >= pc.t) continue;
             outv[tk * pc.n_out + first_row] = r0[tk];
             if (num_rows > 1u) outv[tk * pc.n_out + first_row + 1u] = r1[tk];
+            if (num_rows > 2u) outv[tk * pc.n_out + first_row + 2u] = r2[tk];
+            if (num_rows > 3u) outv[tk * pc.n_out + first_row + 3u] = r3[tk];
         }
     }
 }
