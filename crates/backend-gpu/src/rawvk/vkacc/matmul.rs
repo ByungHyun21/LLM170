@@ -479,7 +479,10 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             O::RmsRows { x, w, out, eps, n, w_reps } => {
                 let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
                 let rows = w_reps * t_cur;
-                let p = self.pipeline(&mut ctx, Slot::Rms)?;
+                // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
+                // 32스레드 원판(산술 그대로, 실측 우위).
+                let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
+                let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());

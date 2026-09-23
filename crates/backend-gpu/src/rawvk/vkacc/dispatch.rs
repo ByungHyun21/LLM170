@@ -36,7 +36,7 @@ impl VkAcc {
             let r = b.as_ref().unwrap();
             (r.0.buf, r.1.buf, r.2.buf)
         };
-        let p = self.pipeline(&mut ctx, Slot::Rms)?;
+        let p = self.pipeline(&mut ctx, if t >= 2 { Slot::RmsWide } else { Slot::Rms })?;
         let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
         let mut push = push_u32s(&[n as u32, t as u32, 1u32]);
         push.extend_from_slice(&eps.to_le_bytes());
