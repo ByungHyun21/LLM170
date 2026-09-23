@@ -109,8 +109,12 @@ impl Engine {
                 let ch_sz = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse().ok())
                     .unwrap_or(if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() { 512 } else { 64 });
                 let n_chunks = cache.len().div_ceil(ch_sz).max(1);
+                // plans/92 P2: 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
+                let pfck = std::env::var_os("LLM170_PFCK").is_some();
                 for (ci, ch) in cache.chunks(ch_sz).enumerate() {
+                    let pf_t0 = std::time::Instant::now();
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
+                    let pf_flat = pf_t0.elapsed().as_secs_f64() * 1e3;
                     let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
                         let n_e = self.model.hp.n_embd;
                         // 임베딩 선반입: 사이드 스트림 async h2d를 메인 프리필과 중첩
@@ -149,6 +153,10 @@ impl Engine {
                     } else {
                         rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?
                     };
+                    if pfck {
+                        eprintln!("[pfck] ci={ci} t={} flat={pf_flat:.1}ms wall={:.1}ms",
+                            ch.len(), pf_t0.elapsed().as_secs_f64() * 1e3);
+                    }
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
                         let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                         eprintln!("logits(batch): max={m:.4} argmax={}", greedy(&logits));

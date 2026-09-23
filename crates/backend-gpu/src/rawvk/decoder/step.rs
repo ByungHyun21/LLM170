@@ -339,9 +339,14 @@ impl DecoderState {
         let conv_ch = self.conv_ch;
         let k_len = self.k_len;
         let v_len = self.v_len;
+        // plans/92 P2: [pfck] 업로드·제출대기·헤드·판독 4분해 (LLM170_PFCK=1).
+        let pfck = std::env::var_os("LLM170_PFCK").is_some();
+        let pf_up0 = std::time::Instant::now();
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
         }
+        let pf_up = pf_up0.elapsed().as_secs_f64() * 1e3;
+        let pf_gpu0 = std::time::Instant::now();
         if std::env::var_os("LLM170_VKD_TRACE").is_some() {
             let mut x = vec![0f32; 64];
             unsafe { std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, x.as_mut_ptr(), 64) };
@@ -618,11 +623,8 @@ impl DecoderState {
         }
         self.ctx.end_batch_wait()?;
         self.ctx.ts_report();
-        if all_logits {
-            let mut out = vec![0f32; t * self.n_vocab];
-            unsafe { std::ptr::copy_nonoverlapping(self.b_lg_t.ptr as *const f32, out.as_mut_ptr(), t * self.n_vocab) };
-            return Ok(out);
-        }
+        let pf_gpu = pf_gpu0.elapsed().as_secs_f64() * 1e3;
+        let pf_head0 = std::time::Instant::now();
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
@@ -653,8 +655,14 @@ impl DecoderState {
         self.ctx.begin_batch()?;
         self.gemv_w(self.m_e.buf, self.m_xq.buf, "output.weight", self.b_lg.buf, 1, n)?;
         self.ctx.end_batch_wait()?;
+        let pf_head = pf_head0.elapsed().as_secs_f64() * 1e3;
+        let pf_rd0 = std::time::Instant::now();
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
+        if pfck {
+            eprintln!("[pfck] step_batch t={t} up={pf_up:.1}ms gpu+wait={pf_gpu:.1}ms head={pf_head:.1}ms rd={:.1}ms",
+                pf_rd0.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(logits)
     }
 
