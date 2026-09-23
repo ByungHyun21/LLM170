@@ -1329,3 +1329,30 @@ cooled reps. README headline cells now carry observed ranges; treat
 single-rep deltas under ~10% as noise unless bisected. Cooled reference
 points (post dual-plate): 27B vk pp512 364.5 / tg 11.2 / np4 greedy 33.5;
 FN vk pp512 192 / tg128@8k 14.6.
+
+## llama.cpp refresh (2026-09-23, b1ff4ca23) — upstream FN prefill transformed
+
+`source/llama.cpp` fast-forwarded 2026-09-15 -> 2026-09-23 (153 commits;
+tip is literally "vulkan: add IQ4_XS MMQ/MMV matmul kernels"). Fresh
+llama-bench builds from that tree (hip: ROCm 7.2.2 / gfx1151, GGML_HIP_GRAPHS
++MMQ_MFMA+NO_VMM as before; vulkan: plain). FN protocol updated to current
+CLI: `-ot per_layer_token_embd=CPU`, flash-attn default (auto), default
+load mode — the old `-lm mmap` HANGS at load on this 4-part model with the
+new master, and `-fit off` no longer exists (it meant flash-attn off).
+
+| llama.cpp | pp512 | pp4096 | pp16384 | tg128 |
+|---|---|---|---|---|
+| 27B hip | 356-359 | 337 | **312** | 11.7 |
+| 27B vulkan | 333 | 319 | 278 | 12.0 |
+| FN hip | 490-520 | 478 | 415 | 21.2 |
+| FN vulkan | 506 | 488 | **433** | **23.6** |
+
+vs the 2026-08/09-19 references: 27B pp16384 +5% (293->312 hip), tg flat
+(an in-battery 8-9.5 tg reading right after 16k prefill runs was thermal —
+isolated re-runs give 11.7-12.0 on old and new binaries alike). FN is a
+different world: llama pp512 222-234 -> 490-520, pp16384 246/332 -> 415/433.
+The delta is upstream (qwen4exp path maturity + flash-attn auto + MoE
+batching), not our machine. Consequence for us: the FN frame pipeline is
+now ~2.3x behind llama on prefill; the MoE-cm race and decode dmmv depth
+are the blockers on our side. 27B: we hold pp16384 parity territory with
+hip (231 vs 312 llama now ahead), pp512 near-parity, tg ~7% behind llama vk.
