@@ -44,6 +44,7 @@ const QK_ROPE2_SPV: &[u8] = include_bytes!("../spv/qk_rope2.spv");
 const KV_APPEND_SPV: &[u8] = include_bytes!("../spv/kv_append.spv");
 pub const QSA_FLASH_SPV: &[u8] = include_bytes!("../spv/qsa_flash.spv");
 pub const QSA_FLASH_GQ_SPV: &[u8] = include_bytes!("../spv/qsa_flash_gq.spv");
+pub const QSA_FLASH_REG_SPV: &[u8] = include_bytes!("../spv/qsa_flash_reg.spv");
 const KV_APPEND_Q8_SPV: &[u8] = include_bytes!("../spv/kv_append_q8.spv");
 const QSA_FLASH_Q8_SPV: &[u8] = include_bytes!("../spv/qsa_flash_q8.spv");
 const COPY_OFF_SPV: &[u8] = include_bytes!("../spv/copy_off.spv");

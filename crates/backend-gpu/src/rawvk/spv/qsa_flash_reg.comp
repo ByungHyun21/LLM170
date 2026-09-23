@@ -1,0 +1,75 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// qsa_flash_reg (plans/92 P3) — hip qsa_flash_wk16 구조의 vk 이식.
+// 종전 qsa_flash_gq는 Q/K 스테이징에 LDS 61KB/WG → 점유 1WG/CU, 타일마다
+// 2배리어 — 장문 프리필 어텐션이 npmax에 선형 지연(pp4096 청크 1.45→2.4s,
+// pp16384 주벚). 여기서는 Q를 레지스터(레인당 16 dim), K/V를 글로벌 직독
+// (16레인×16dim 코얼레스), LDS·배리어 0 → 점유 8WG/CU급.
+//   그리드 (⌈t/16⌉, n_head), 256스레드 = 8 "워프"(tid>>5) × 2행 = 16행/WG.
+//   감산: 16레인 xor 나비(8..1) — 32레인 파티션 내에 머물러 wave64 안전.
+//   루프 상한은 WG 균등(셔플 수렴 계약), 행별 인과는 그룹 내 균등 가드.
+//   온라인 softmax m/s는 행의 16레인이 동일값 복제(xor 후 균등).
+// 산술은 qsa_flash_gq와 동일 수학(스케일은 qk_rope2에서 q에 사전 적립,
+// 게이트 sigmoid는 드레인에서) — 축산 순서만 달라 vk-flash-check로 검증.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Q { float q[]; };     // [t][n_head*2hd] (q‖gate)
+layout(binding = 1) readonly buffer Ck { float ck[]; };   // [ctx][n_kv*hd]
+layout(binding = 2) readonly buffer Cv { float cv[]; };   // [ctx][n_kv*hd]
+layout(binding = 3) buffer O { float o[]; };              // [t][n_head*hd]
+layout(push_constant) uniform PC {
+    int pos0; int nh; int nk; int hd; int t;
+} pc;
+
+void main() {
+    if (pc.hd != 256) return;       // 계약: hd=256 (그 외는 호스트가 구 판으로)
+    int q0 = int(gl_WorkGroupID.x) * 16;
+    int h = int(gl_WorkGroupID.y);
+    if (q0 >= pc.t || h >= pc.nh) return;
+    int nq = min(16, pc.t - q0);
+    int tid = int(gl_LocalInvocationIndex);
+    int lane = tid & 31;
+    int wid = tid >> 5;             // 0..7
+    int grp = lane >> 4;            // 워프 내 행 슬롯 (0/1)
+    int own = lane & 15;            // 16레인 그룹 내 담당 dim 블록
+    int r = wid * 2 + grp;
+    bool real = r < nq;             // 셔플 전원 참여 — 계산은 하되 저장만 막는다
+    int rf = real ? r : 0;
+    int gq = pc.nh / pc.nk;
+    int kvh = h / gq;
+    int kb0 = kvh * 256 + own * 16;
+    int row = q0 + rf;
+    int qb = (row * pc.nh + h) * 2 * 256 + own * 16;
+    float qv[16];
+    for (int j = 0; j < 16; j++) qv[j] = q[qb + j];
+    float gv[16];
+    for (int j = 0; j < 16; j++) gv[j] = q[qb + 256 + j];
+    float m = -3.4028235e38;
+    float s = 0.0;
+    float acc[16];
+    for (int j = 0; j < 16; j++) acc[j] = 0.0;
+    int vstride = pc.nk * 256;
+    int npmax = pc.pos0 + q0 + nq;
+    for (int k = 0; k < npmax; k++) {
+        int kb = k * vstride + kb0;
+        float pr = 0.0;
+        for (int j = 0; j < 16; j++) pr = fma(qv[j], ck[kb + j], pr);
+        for (int off = 8; off > 0; off >>= 1)
+            pr += subgroupShuffleXor(pr, off);
+        if (real && k < pc.pos0 + q0 + rf + 1) {
+            float gm = max(m, pr);
+            float e_m = exp(m - gm);
+            float e_d = exp(pr - gm);
+            s = s * e_m + e_d;
+            m = gm;
+            int vb = k * vstride + kb0;
+            for (int j = 0; j < 16; j++) acc[j] = acc[j] * e_m + e_d * cv[vb + j];
+        }
+    }
+    if (!real) return;
+    float inv_s = 1.0 / s;
+    int ob = ((q0 + r) * pc.nh + h) * 256 + own * 16;
+    for (int j = 0; j < 16; j++)
+        o[ob + j] = acc[j] * inv_s / (1.0 + exp(-gv[j]));
+}
