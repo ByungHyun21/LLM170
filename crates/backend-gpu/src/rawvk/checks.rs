@@ -1083,7 +1083,7 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     let slab: usize = if bn128spv { 128 } else { 64 };
     let ms128fam_any = std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
     let q51fam = w.ty == llm170_gguf::GgmlType::Q5_1;   // plans/84 B: 6필드 push(24B)
-    let pb: u32 = if q51fam { 24 } else if bn128spv || ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
+    let pb: u32 = if q51fam { 24 } else if ms128fam_any { 24 } else if is_msfam { 20 } else if is_128 { 16 } else { 24 };
     let mpush = |tt: u32, base: u32| push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, tt, base]);
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, n_kb, pb)?;
     let _ = (dsl, pool);
@@ -1140,15 +1140,18 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     } else if is_128 && !ms4gy {
         let ms128fam = std::env::var("LLM170_TILE_MS128").map(|v| v=="1").unwrap_or(false);
         if is_msfam {
-            // ms 패밀리: t>슬래브는 분할 (tok_base로 전 토큰 커버; ms256 = 128토큰 슬래브)
-            for tb in (0..t).step_by(slab) {
-                let nt = (t - tb).min(slab) as u32;
-                let push = if bn128spv {
-                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, 0u32, tb as u32])
-                } else {
-                    mpush(nt, tb as u32)
-                };
-                ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+            if bn128spv {
+                // plans/92 P1: 128 패밀리 단일 디스패치(슬래브 x, 행 y) —
+                // 커널이 tok_base=wg.x*BN·꼬리 nt 유도(push t=전체).
+                let gys = (t as u32).div_ceil(128);
+                ctx.run(pl, ds, pipe, &mpush(t as u32, 0), gys, gx, 1)?;
+            } else {
+                // ms(64) 패밀리: t>슬래브는 분할 (tok_base로 전 토큰 커버)
+                for tb in (0..t).step_by(slab) {
+                    let nt = (t - tb).min(slab) as u32;
+                    let push = mpush(nt, tb as u32);
+                    ctx.run(pl, ds, pipe, &push, gx, 1, 1)?;
+                }
             }
         } else {
             let push = if ms128fam {
@@ -1181,6 +1184,10 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
                 let gy = (t as u32).div_ceil(64);
                 let push = mpush(64, 0);
                 ctx.run(pl, ds, pipe, &push, gy, gx, 1)?;
+            } else if is_msfam && bn128spv {
+                // plans/92 P1: 128 패밀리 단일 디스패치 (엔진과 동일)
+                let gys = (t as u32).div_ceil(128);
+                ctx.run(pl, ds, pipe, &mpush(t as u32, 0), gys, gx, 1)?;
             } else if is_msfam && t > slab {
                 // 순차 슬래브 (엔진 비-gy 경로와 동일 형태): tok_base=tb로 전 토큰 커버
                 for tb in (0..t).step_by(slab) {
