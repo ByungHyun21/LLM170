@@ -638,6 +638,13 @@ impl DecoderState {
         let pf_wait = pf_w0.elapsed().as_secs_f64() * 1e3;
         self.ctx.ts_report();
         let pf_head0 = std::time::Instant::now();
+        if all_logits {
+            // 전 행 로짓 [t][n_vocab] (verify·MTP 프리필 소비) — 단일 행 head
+            // 폴백은 !all_logits 경로만.
+            let mut out = vec![0f32; t * self.n_vocab];
+            unsafe { std::ptr::copy_nonoverlapping(self.b_lg_t.ptr as *const f32, out.as_mut_ptr(), t * self.n_vocab) };
+            return Ok(out);
+        }
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
