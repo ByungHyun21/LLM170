@@ -430,7 +430,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         && wbufs.len() == 1
                         && std::env::var("LLM170_VK_FT32").map(|v| v != "0").unwrap_or(true)
                     {
-                        let p = self.pipeline(&mut ctx, Slot::FnTileF32)?;
+                        // plans/93: t≥64는 와이드 토큰판(64/WG) — 가중 재판독 4× 절감.
+                        let f32_slot = if t >= 64 { Slot::FnTileF32W } else { Slot::FnTileF32 };
+                        let p = self.pipeline(&mut ctx, f32_slot)?;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {
                             binds.push(dbuf);
@@ -442,7 +444,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         let push = push_u32s(&[
                             n_in as u32, n_out as u32, t as u32, dty, wpr as u32,
                         ]);
-                        ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1)?;
+                        let gy = if t >= 64 { (t as u32).div_ceil(64) } else { (t as u32).div_ceil(16) };
+                        ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), gy, 1)?;
                         continue;
                     }
                     let slot = if t < 16 && wbufs.len() == 1
