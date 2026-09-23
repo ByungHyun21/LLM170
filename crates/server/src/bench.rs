@@ -428,14 +428,23 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                         }
                     }
                 } else if bench_np > 1 {
-                    // np 집계(스펙 없음) — 종전엔 seq0만 디코드해 np 셀을 못 채웠다.
-                    // llama-server np4 슬롯과 동일 조건으로 전 슬롯에 같은 프롬프트를
-                    // 프리필한 뒤(집계 시간 제외) 배치 디코드로 tg*bench_np 생성.
-                    for s in 1..bench_np {
-                        eng.prefill(s, &prompt).map_err(|e| e.to_string())?;
+                    // np 집계(스펙 없음) — llama-server np4 슬롯과 동일 조건으로
+                    // 전 슬롯에 같은 프롬프트를 프리필한 뒤(집계 시간 제외)
+                    // 배치 디코드로 tg*bench_np 생성.
+                    // P7.1(plans/92): 셀 진입 전 전 슬롯 리셋+재프리필 — 종전엔
+                    // pp·np-tg 셀의 캐리오버 상태 위에 슬롯1..3만 append
+                    // 프리필하고 슬롯0 pp의 stale 토큰으로 시드해 슬롯0 스트림이
+                    // 갈림 → 부분 EOS → act.retain t=4→2 축소(측정 결함).
+                    eng.reset_states();
+                    let mut next_fresh = next;
+                    for s in 0..bench_np {
+                        let l = eng.prefill(s, &prompt).map_err(|e| e.to_string())?;
+                        if s == 0 {
+                            next_fresh = llm170_core::qwen35::greedy(&l);
+                        }
                     }
                     let t_np = Instant::now();
-                    let mut nexts: Vec<u32> = vec![next; bench_np];
+                    let mut nexts: Vec<u32> = vec![next_fresh; bench_np];
                     let mut act: Vec<usize> = (0..bench_np).collect();
                     while n_gen < tg * bench_np {
                         let ns: Vec<u32> = act.iter().map(|&s| nexts[s]).collect();
