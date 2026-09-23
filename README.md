@@ -16,12 +16,12 @@ ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md
 |---|---|---|---|---|---|
 | LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
 | LLM170 vulkan | **360-365** | 302 | 273 | **231** | 11.2 |
-| llama.cpp hip | 340 | 318-335 | 317 | 293-297 | 11.65 |
-| llama.cpp vulkan | 343 | 318 | 301 | 273 | **12.05** |
+| llama.cpp hip | 356-359 | 337 | — | **312** | 11.7 |
+| llama.cpp vulkan | 333 | 319 | — | 278 | 12.0 |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | 11.5 | 11.2 | 11.65 | 12.05 |
+| tg single | 11.5 | 11.2 | 11.7 | 12.0 |
 | np4 greedy (GPU argmax) | 33.2 | **33.5** | — | — |
 | np4 full-logits | **30.6** | 27.4 | 15.5 *(HTTP†)* | — |
 | MTP single (k=2) | **14.4** | 2.5 *(spec2 구현·수용률 미조정)* | ~12 | — |
@@ -43,15 +43,20 @@ docs/decisions.md (32b)/(32c), repro: `scripts/moecm-repro.sh`).
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.4** |
 | LLM170 vulkan (frame) | 192-223 | 198-213 | 166 | 14.7 |
-| llama.cpp hip | 222 | 210 | 200 | 17.43 |
-| llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
+| llama.cpp hip | 490-520 | 478 | 415 | 21.2 |
+| llama.cpp vulkan | 506 | 488 | **433** | **23.6** |
 
 Session 2026-09-22 (plans/89): OpSDot q4_K MoE tile (4.85x), rms coalescing
 (8x/dispatch), dense tile routing completion — FN pp512 131.8 -> ~180.
 Session 2026-09-23 (plans/92): register-resident prefill flash
 (qsa_flash_reg — LDS/barrier-free; +59% on 27B pp16384), multi-row rms
 wide plate, tile128 single dispatch — FN vk pp512 ~180 -> 192-223.
-Remaining gap: the MoE coopmat race and decode dmmv depth (llama vk 23.2).
+
+llama.cpp refreshed 2026-09-23 (b1ff4ca23; was 2026-08 builds): upstream
+qwen4exp prefill matured — FN llama pp jumped 222-234 -> 490-520
+(flash-attn auto + MoE batching; today's tip lands IQ4_XS MMQ/MMV on
+Vulkan), 27B pp16384 +5%. Our FN frame pipeline is now the chase side
+(~2.3x behind llama pp); MoE-cm race and decode dmmv remain the blockers.
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
