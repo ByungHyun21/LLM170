@@ -398,7 +398,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // 8sg판(q51_cm)과 q4k_sg1은 엔진 비결정 — 옵트인만.
                 (GgmlType::Q5_1, _sg) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q51SG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Sg1,
                 (GgmlType::Q5_1, _q51cm) if cm_on && std::env::var("LLM170_VK_Q51CM").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Cm,
-                (GgmlType::Q4K, _) => Slot::FnMoeTileQ4K,
+                // plans/93: q4k_sc는 올바른 그리드에서 179 t/s — 기본(192)보다
+                // 느려 승격 철회(LDS 스테이징 배리어 오버헤드 > 디양자화 절감).
+                // 이전 opt-in 265 t/s는 cm_on 그리드(n_out/128) 불일치로
+                // 7/8 출력이 미기록인 무효 측정이었다.
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
                 (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
                 _ => Slot::FnMoeTileQ5k,
