@@ -389,6 +389,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 && std::env::var("LLM170_VK_Q4KCM").map(|v| v != "0").unwrap_or(true);
             let slot = match (w.ty, q4k_cm) {
                 (GgmlType::Q4K, _k) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KKP").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kKp,
+                (GgmlType::Q4K, true) if std::env::var("LLM170_VK_Q4KCM").map(|v| v == "2").unwrap_or(false) => Slot::FnMoeTileQ4kCm2,
                 (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
                 // plans/89 재개: q51_sg1은 엔진 결정적 실측(5회 4동일+타이 1) —
                 // 기본 경로로 승격(종전 스칼라는 킬스위치 LLM170_VK_Q51SG1=0).
