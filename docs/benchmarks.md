@@ -1312,3 +1312,20 @@ Closed negative / blocked:
   GEMV class, not the dense duals. np4 agg 27.05 vs greedy 33.48: in-step
   time is equal (119ms); ~29ms/step remains outside step_batch_np (host
   logits path) — next-session lead.
+
+### plans/92 follow-up (same day): rms dual plate + measurement spread
+
+The 256-thread rms plate regressed single-row decode (t=1): the lone
+workgroup's reduction latency dominated — tg128@4k 11.21 -> 10.92, bisected
+to the rms kernel alone (5d3fae5 baseline vs HEAD, single-variable revert).
+Shipped as a dual plate: rows >= 2 dispatch rms_wide (256 threads/row),
+rows == 1 keeps the original 32-thread plate (arithmetic and latency
+unchanged). tg restored to 11.22 with all gates PASS.
+
+Single-rep cells on this APU carry a larger spread than earlier sessions
+assumed: consecutive FN vk pp512 samples under sustained load ran
+222.9 -> 214 -> 196 -> 192 (thermal), and 27B vk pp512 360-365 across
+cooled reps. README headline cells now carry observed ranges; treat
+single-rep deltas under ~10% as noise unless bisected. Cooled reference
+points (post dual-plate): 27B vk pp512 364.5 / tg 11.2 / np4 greedy 33.5;
+FN vk pp512 192 / tg128@8k 14.6.
