@@ -967,6 +967,17 @@ impl VkCtx {
                     if let Some(gap_t) = buf[a + 2].checked_sub(buf[a + 1]) {
                         let gap = gap_t as f64 * per / 1e6;
                         GAP_SUM.with(|g| g.set(g.get() + gap));
+                        if gap > 0.05 {
+                            // plans/92 — 공백을 선행 커널 라벨로 귀속(상위 표).
+                            let ge = GAP_BY.with(|m| {
+                                let mut m = m.borrow_mut();
+                                let e2 = m.entry(lbl.to_string()).or_insert((0.0f64, 0usize));
+                                e2.0 += gap;
+                                e2.1 += 1;
+                                e2.clone()
+                            });
+                            let _ = ge;
+                        }
                     }
                 }
                 let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
@@ -979,6 +990,16 @@ impl VkCtx {
             }
             let gsum = GAP_SUM.with(|g| g.replace(0.0));
             eprintln!("[ts] 공백합 {gsum:.1}ms");
+            {
+                let mut gv: Vec<_> = GAP_BY.with(|m| m.borrow().iter().map(|(k2, v2)| (k2.clone(), *v2)).collect());
+                gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+                for (k2, (e2, c2)) in gv.iter().take(8) {
+                    if *e2 > 0.5 {
+                        eprintln!("[ts] 공백↑ {:30} {e2:9.1}ms ({}회, {:.3}ms/회)", k2, c2, e2 / *c2 as f64);
+                    }
+                }
+                GAP_BY.with(|m| m.borrow_mut().clear());
+            }
             let ns = self.submits.get();
             eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
             self.submits.set(0);
@@ -1091,6 +1112,10 @@ thread_local! {
 
 thread_local! {
     static GAP_SUM: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+thread_local! {
+    static GAP_BY: std::cell::RefCell<std::collections::HashMap<String, (f64, usize)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 thread_local! {
