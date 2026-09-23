@@ -1,0 +1,87 @@
+#version 450
+
+// fn_tile_f32_w (plans/93) — f32/BF16 밀집 프리필 타일(와이드 토큰판).
+// fn_tile_f32은 토큰 블록이 16이라 t=512에서 같은 가중을 32회 재판독한다
+// (hc down: 32 × 335MB = 10.7GB/레이어). 이 판은 토큰 블록을 64로 확대,
+// 스레드당 4토큰 × 1출력 = 4독립 누산기로 가중 재판독 8회(4× 절감).
+// 산술: 동일 f32 MAC 순서(출력별 직렬 k-루프) — 비트 불변.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) readonly buffer W0 { uint w0u[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t; uint dty; uint words_per_row;
+} pc;
+
+#define SLICE_W 512u
+#define T_PER_THREAD 4u   // 스레드당 토큰 수 — 토큰 블록 = 16*4 = 64
+
+shared uint sh[16 * SLICE_W];
+
+void main() {
+    const uint ox = gl_LocalInvocationID.x;
+    const uint rx = gl_LocalInvocationID.y;
+    const uint o0 = gl_WorkGroupID.x * 16u;
+    const uint tid = gl_LocalInvocationID.y * 16u + ox;
+    const uint r_base = gl_WorkGroupID.y * 16u * T_PER_THREAD + rx * T_PER_THREAD;
+    const uint n_words = pc.dty == 0u ? pc.n_in : pc.n_in / 2u;
+    const bool live = o0 + ox < pc.n_out;
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    for (uint s0 = 0u; s0 < n_words; s0 += SLICE_W) {
+        const uint lim = min(SLICE_W, n_words - s0);
+        for (uint e = tid; e < 16u * lim; e += 256u) {
+            const uint row = e / lim;
+            const uint col = e - row * lim;
+            if (o0 + row < pc.n_out) {
+                sh[row * SLICE_W + col] = w0u[(o0 + row) * pc.words_per_row + s0 + col];
+            }
+        }
+        barrier();
+        if (live) {
+            // 4토큰 × 이 출력행 — 독립 누산기로 레이턴시 하이딩.
+            if (pc.dty == 0u) {
+                for (uint c = 0u; c < lim; c++) {
+                    const float w = uintBitsToFloat(sh[ox * SLICE_W + c]);
+                    const uint k = s0 + c;
+                    if (r_base < pc.t)       acc0 += w * xa[(r_base) * pc.n_in + k];
+                    if (r_base + 1u < pc.t)  acc1 += w * xa[(r_base + 1u) * pc.n_in + k];
+                    if (r_base + 2u < pc.t)  acc2 += w * xa[(r_base + 2u) * pc.n_in + k];
+                    if (r_base + 3u < pc.t)  acc3 += w * xa[(r_base + 3u) * pc.n_in + k];
+                }
+            } else {
+                for (uint c = 0u; c < lim; c++) {
+                    const vec2 wp = unpackHalf2x16(sh[ox * SLICE_W + c]);
+                    const uint k = (s0 + c) * 2u;
+                    // BF16: 2 f16 per word
+                    if (r_base < pc.t) {
+                        const uint xb = r_base * pc.n_in;
+                        if (k + 1u < pc.n_in) acc0 += wp.x * xa[xb + k] + wp.y * xa[xb + k + 1u];
+                        else if (k < pc.n_in) acc0 += wp.x * xa[xb + k];
+                    }
+                    if (r_base + 1u < pc.t) {
+                        const uint xb = (r_base + 1u) * pc.n_in;
+                        if (k + 1u < pc.n_in) acc1 += wp.x * xa[xb + k] + wp.y * xa[xb + k + 1u];
+                        else if (k < pc.n_in) acc1 += wp.x * xa[xb + k];
+                    }
+                    if (r_base + 2u < pc.t) {
+                        const uint xb = (r_base + 2u) * pc.n_in;
+                        if (k + 1u < pc.n_in) acc2 += wp.x * xa[xb + k] + wp.y * xa[xb + k + 1u];
+                        else if (k < pc.n_in) acc2 += wp.x * xa[xb + k];
+                    }
+                    if (r_base + 3u < pc.t) {
+                        const uint xb = (r_base + 3u) * pc.n_in;
+                        if (k + 1u < pc.n_in) acc3 += wp.x * xa[xb + k] + wp.y * xa[xb + k + 1u];
+                        else if (k < pc.n_in) acc3 += wp.x * xa[xb + k];
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (live) {
+        if (r_base < pc.t)       outv[(r_base) * pc.n_out + o0 + ox] = acc0;
+        if (r_base + 1u < pc.t)  outv[(r_base + 1u) * pc.n_out + o0 + ox] = acc1;
+        if (r_base + 2u < pc.t)  outv[(r_base + 2u) * pc.n_out + o0 + ox] = acc2;
+        if (r_base + 3u < pc.t)  outv[(r_base + 3u) * pc.n_out + o0 + ox] = acc3;
+    }
+}
