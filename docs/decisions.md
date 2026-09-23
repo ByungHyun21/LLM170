@@ -1896,3 +1896,27 @@ decode lever (dispatch merging or vk graph recording).
 Open leads: MMQ register-tile port (llama mul_mmq recipe, BM/BN 64x64x32),
 dispatch merge for FN decode, hip MoE decode GEMV class, np agg 29ms
 outside-step localization, hip np seq3 divergence (pre-existing).
+
+### (37) perf-93 close: q4k_sg1 MoE promotion +32% FN pp, hip np4 34.7, dispatch geometry fix (plans/93, 2026-09-23)
+
+The actionable optimization from the P0 decomposition: promote the q4_K
+1-subgroup coopmat MoE tile to default. Shipped behind kill switch
+LLM170_VK_Q4KSG1=0.
+
+Critical fix en route: the opt-in speed measurements (sg1 288, sc 265 t/s)
+were INVALID — the cm_on dispatch path used gx=n_out/128 while the sg1/sc
+kernels are designed for 16 columns/WG (gx=n_out/16). 7/8 of the output
+was uninitialized garbage. The dispatch now routes sg1/sc/Q51Sg1 through
+a dedicated 16-column branch.
+
+Real speeds at correct geometry (FN vk pp512, same thermal state):
+default(scalar) 160 → sg1 224 t/s (+40%) → shipped as default gives
+211 t/s (+32% over the thermal-adjusted 160 baseline).
+
+hip np4 greedy with the P5.1 constant-residency fix: **34.69 t/s** —
+exceeds the plans/92 target of 34. vk np4: 33.30 (mmap dequant).
+
+Final state: gates 4/4 PASS, cargo test all ok, 0 build warnings.
+FN vk: pp512 211 · pp4096 209 · tg128 14.2 · (llama: 506/488/23.6)
+27B vk: pp512 347-365 · pp16384 231 · tg 11.2 · np4 33.3
+hip: np4 greedy 34.7
