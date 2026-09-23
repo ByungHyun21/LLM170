@@ -1920,3 +1920,20 @@ Final state: gates 4/4 PASS, cargo test all ok, 0 build warnings.
 FN vk: pp512 211 · pp4096 209 · tg128 14.2 · (llama: 506/488/23.6)
 27B vk: pp512 347-365 · pp16384 231 · tg 11.2 · np4 33.3
 hip: np4 greedy 34.7
+
+### (37b) GPU hang from sg1 at long-context MoE — safety guard shipped (plans/93, 2026-09-23)
+
+The q4k_sg1 MoE tile (promoted to default in (37)) causes a GPU device
+hang at pp16384 contexts (bound = 163840 expert-rows). The hang persists
+after process termination — the Vulkan device enters a permanent fault
+state requiring a driver reset or reboot. Root cause unknown (possibly
+RADV emulated-coopmat with very large grid y-dimensions, or VRAM
+exhaustion from the MoE scratch buffer).
+
+Safety guard: sg1 selection now requires rows <= 8192; larger MoE groups
+fall back to the old scalar tile. pp512-4096 are unaffected (verified
+before the hang). The hang was discovered during pp16384 measurement —
+all previously reported numbers remain valid (measured on a healthy GPU).
+
+Recovery procedure for future sessions: `sudo rmmod amdgpu && sudo modprobe
+amdgpu` or system reboot.
