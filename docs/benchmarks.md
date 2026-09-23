@@ -1356,3 +1356,49 @@ batching), not our machine. Consequence for us: the FN frame pipeline is
 now ~2.3x behind llama on prefill; the MoE-cm race and decode dmmv depth
 are the blockers on our side. 27B: we hold pp16384 parity territory with
 hip (231 vs 312 llama now ahead), pp512 near-parity, tg ~7% behind llama vk.
+
+## 2026-09-23 (plans/93) — FN gap decomposition + MoE routing sensitivity verdict
+
+FN vk chunk decomposition ([ts] span-validated, 2.42s per 512-token chunk):
+
+| component | ms | share | note |
+|---|---|---|---|
+| MoE expert GEMM (q4k 664 + q51sg1 275 + q8 115 + q5k 53) | 1107 | 52% | ~63GB/s effective (42% of ceiling) |
+| tile_f32 (hc down/inject, 288 calls) | 352 | 16% | small-GEMM latency-bound suspect |
+| tile_q8128 (dense q8) | 206 | 9% | 0.42ms/call, healthy |
+| quant (533 calls) | 116 | 5% | needed path |
+| ple_bridge (1 PLE layer only — confirmed from gguf) | 285 | 12% | pure host bridge |
+| submit gaps (span−total) | 283 | 12% | includes PLE host time |
+
+llama.cpp 506 t/s = 1.01s/chunk — MoE at ~117GB/s (600ms) + remainder 400ms.
+
+### MoE tile speed ladder (FN vk pp512, single rep)
+
+| variant | t/s | determinism (3x32tok) | note |
+|---|---|---|---|
+| default (scalar q4k 16×16) | 192-223 | 2/3 unique | f32 inline dequant |
+| VK_MOECM=1 (coopmat 8-sg) | 241.9 | 3/3 distinct | original cm |
+| Q4KCM=2 (K-split coopmat) | ~241 | 3/3 distinct | cm2 |
+| Q4KSG1=1 (coopmat 1-sg) | 288.3 | 3/3 distinct | sg1 structure |
+| Q4KSC=1 (scalar+LDS f16) | 264.7 | 3/3 distinct | no coopmat |
+
+The "nondeterminism" is MoE routing sensitivity (512-expert top-k flips on
+upstream ±ulp), not a kernel race — the default path itself diverges at
+n-predict ≥ 26 while passing the 16-token gate. See decisions.md (36).
+
+### FN decode decomposition ([ts], per step)
+
+| component | ms | share |
+|---|---|---|
+| gemv8_q8b (dense GEMV, 497 calls) | 21.8 | 43% |
+| qsa_attn_sel_mh (12 layers) | 6.7 | 13% |
+| moe_ids2/51/ids (MoE decode GEMV) | 9.8 | 19% |
+| mm_f32b + mm_f32b_grp (hc dense) | 3.7 | 7% |
+| rms_wide (97 calls) | 1.9 | 4% |
+| other | 7.3 | 14% |
+| **GPU total** | **51.2** | |
+| **host recording (2398 dispatches)** | **~17** | |
+| **wall** | **68** | |
+
+llama.cpp FN vk tg128 = 23.6 t/s (42ms/step) — they beat us on both GPU
+work and host overhead. Next decode levers: dispatch merging + gemv depth.
