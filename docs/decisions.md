@@ -1937,3 +1937,28 @@ all previously reported numbers remain valid (measured on a healthy GPU).
 
 Recovery procedure for future sessions: `sudo rmmod amdgpu && sudo modprobe
 amdgpu` or system reboot.
+
+### (38) perf-93 final: FN pp 500 target — not achievable with current architecture (2026-09-23)
+
+Exhaustive kernel optimization campaign. dotPacked4x8EXT (hardware int8
+dot) was enabled by building glslang from main (Ubuntu Noble's shaderc
+2023.8 lacks GL_EXT_integer_dot_product). The hardware dot product
+compiled and executed correctly (gate PASS) but produced NO speedup
+(216 t/s ≈ manual extraction 235 ≈ coopmat 238) — the bottleneck is
+UMA memory bandwidth, not compute.
+
+GPU work decomposition (1993ms/chunk): MoE 860ms (81GB/s, 78% of
+theoretical), non-MoE 1133ms. llama achieves ~1000ms total. The 2× gap
+is in non-MoE operations (1133 vs ~414ms) — a consequence of 2774
+individual dispatches vs llama's single computation graph.
+
+Path to 500 (requires all three):
+1. Vulkan secondary command buffer reuse (264ms gap elimination)
+2. PLE t>1 correctness fix (285ms bridge removal)
+3. Non-MoE kernel optimization (f32/q8128/attention ~700ms reduction)
+Even with all three: ~750ms GPU + ~0 gap → ~680 t/s theoretical, but
+each requires substantial engineering beyond kernel tweaks.
+
+The 500 target remains open. Recommended next step: prototype Vulkan
+command buffer recording/replay for the FN chunk (eliminates per-dispatch
+overhead and enables single-submit execution).
