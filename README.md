@@ -6,46 +6,52 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-19, plans/83 close). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
+Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-23, plans/92;
+single-rep numbers carry a ±5-10% thermal / page-cache spread on this APU —
+ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
 | LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
-| LLM170 vulkan | **336.9** | 257.9 | 203.5 | 145.9 | 11.61 |
+| LLM170 vulkan | **360-365** | 302 | 273 | **231** | 11.2 |
 | llama.cpp hip | 340 | 318-335 | 317 | 293-297 | 11.65 |
 | llama.cpp vulkan | 343 | 318 | 301 | 273 | **12.05** |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | 11.5 | 11.61 | 11.65 | 12.05 |
-| np4 aggregate | 32.1 | 11.44 | 15.5 *(HTTP†)* | — |
-| MTP single (k=2) | **14.4** | 미구현(백엔드) | ~12 | — |
+| tg single | 11.5 | 11.2 | 11.65 | 12.05 |
+| np4 greedy (GPU argmax) | 33.2 | **33.5** | — | — |
+| np4 full-logits | **30.6** | 27.4 | 15.5 *(HTTP†)* | — |
+| MTP single (k=2) | **14.4** | 2.5 *(spec2 구현·수용률 미조정)* | ~12 | — |
 | MTP + np4 | 7.2 | n/a | 15.5 *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
 Vulkan qwen4exp runs a device-resident frame pipeline (plans/86-89):
 prefill + decode on device, llama-dmmv decode GEMV family, coopmat dense
-prefill tiles, device MoE tiles (q5_1 down coopmat sg1 default, q4_K tile
-with OpSDot integer-dot binary patching), PLE math on device (bit-identical to
-host), step-level batching, pread-staged weight uploads. Kill switch
-`LLM170_VK_FRAME=0`; MoE coopmat tiles opt-in `LLM170_VK_MOECM=1`
-(nondeterminism under investigation — see docs/decisions.md (32)).
+prefill tiles, device MoE tiles (q5_1 down coopmat sg1 default, q4_K scalar
+tile — the coopmat variant is race-blocked, see below), PLE math on device
+(bit-identical to host), step-level batching, pread-staged weight uploads.
+Kill switch `LLM170_VK_FRAME=0`; MoE coopmat tiles opt-in
+`LLM170_VK_MOECM=1` (RADV subgroup-scheduling race, q4_K 1-sg included —
+docs/decisions.md (32b)/(32c), repro: `scripts/moecm-repro.sh`).
 
 
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
 | LLM170 hip | **231-275** | 276 | 246 | **18.4** |
-| LLM170 vulkan (frame) | 179-190 | 178.6 | 158.6 | 17.9 |
+| LLM170 vulkan (frame) | 192-223 | 198-213 | 166 | 14.7 |
 | llama.cpp hip | 222 | 210 | 200 | 17.43 |
 | llama.cpp vulkan (coopmat) | 234 | **347** | **332** | **23.22** |
 
 Session 2026-09-22 (plans/89): OpSDot q4_K MoE tile (4.85x), rms coalescing
-(8x/dispatch), dense tile routing completion — FN pp512 131.8 -> ~180. The
-remaining gap is the f16 tile_ms128 family (27B large-t prefill) and decode
-dmmv depth (llama vk 23.2).
+(8x/dispatch), dense tile routing completion — FN pp512 131.8 -> ~180.
+Session 2026-09-23 (plans/92): register-resident prefill flash
+(qsa_flash_reg — LDS/barrier-free; +59% on 27B pp16384), multi-row rms
+wide plate, tile128 single dispatch — FN vk pp512 ~180 -> 192-223.
+Remaining gap: the MoE coopmat race and decode dmmv depth (llama vk 23.2).
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|

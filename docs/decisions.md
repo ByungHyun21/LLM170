@@ -1846,3 +1846,17 @@ step_batch_np; hip np batch-vs-sequential seq3 divergence (pre-existing
 at 5d3fae5, same tokens); FN PLE prefill host bridge (t>1
 ple_math_dev gated by ring-state authority — needs pos-aware rewind or
 engine ring readback design).
+
+### (35b) rms dual plate — the wide-plate decode regression, caught and bisected (plans/92 follow-up, 2026-09-23)
+
+The P4.1 256-thread rms was shipped as a single plate; the README refresh
+battery exposed a 2.6% tg regression (11.21 -> 10.92, three consistent
+reps). Single-variable bisect against 5d3fae5 isolated the rms kernel:
+at rows==1 the wide workgroup's serial f64 combine + barriers are
+latency-dominated. Discriminator is row count, not element count — an
+element-count threshold (>=256K) silently dropped small-n multi-row FN
+calls back to the slow plate (pp512 214 vs 222 mid-session reference).
+Shipped: rows>=2 -> rms_wide, rows==1 -> original 32-thread plate
+(Slot::RmsWide; FnIdxExpand slot restored after an edit accident).
+Lesson recorded: headline-table refreshes double as regression sweeps —
+re-measure tg whenever a "prefill" kernel change touches a shared slot.
