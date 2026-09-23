@@ -127,9 +127,11 @@ pub struct Q4Acc {
     qsa_iqr: std::sync::Mutex<GBuf>,
     qsa_scr: std::sync::Mutex<GBuf>,
     qsa_selflag: std::sync::Mutex<GBuf>,
-    /// 인덱저 상수(콘텐츠 해시로 1회 업로드 캐시).
-    qsa_iqw: std::sync::Mutex<(u64, GBuf)>,
-    qsa_ikw: std::sync::Mutex<(u64, GBuf)>,
+    /// 인덱서 상수(내용 해시 키 맵) — plans/92 P5: 단일 슬롯은 층별 가중이
+    /// 달라 매층 해시 미스 → 동기 h2d가 직전 큐(bk_update 포함) 드레인을
+    /// 기다려 2.55ms×12층 교착. 층별 상주로 전환.
+    qsa_iqw: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    qsa_ikw: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     qsa_csidx: std::sync::Mutex<(usize, usize, GBuf)>,
     /// qk_norm_rope 상수 업로드 캐시 — **(ptr,len) 키 맵**.
     /// 단일 슬롯이던 시절엔 층마다 타일이 달라 매 층 미스 → 24KB+2KB 동기 복사
@@ -140,11 +142,11 @@ pub struct Q4Acc {
     /// plans/73: PLE conv 링 상주 상태 [seq] + 워터마크(접두 되감기 검출).
     ple_ring: std::sync::Mutex<std::collections::HashMap<usize, GBuf>>,
     ple_ring_pos: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
-    /// PLE norm/conv 상수(콘텐츠 해시 1회 업로드).
-    ple_nk: std::sync::Mutex<(u64, GBuf)>,
-    ple_nq: std::sync::Mutex<(u64, GBuf)>,
-    ple_nc: std::sync::Mutex<(u64, GBuf)>,
-    ple_cw: std::sync::Mutex<(u64, GBuf)>,
+    /// PLE norm/conv 상수(내용 해시 키 맵) — qsa_iqw와 동일 이유로 층별 상주.
+    ple_nk: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    ple_nq: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    ple_nc: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    ple_cw: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -233,16 +235,16 @@ impl Q4Acc {
             qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idx_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_iqr: std::sync::Mutex::new(GBuf::new("qsa_iqr")),
-            ple_ring: std::sync::Mutex::new(std::collections::HashMap::new()),
-            ple_ring_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
-            ple_nk: std::sync::Mutex::new((0, GBuf::new("ple_nk"))),
-            ple_nq: std::sync::Mutex::new((0, GBuf::new("ple_nq"))),
-            ple_nc: std::sync::Mutex::new((0, GBuf::new("ple_nc"))),
-            ple_cw: std::sync::Mutex::new((0, GBuf::new("ple_cw"))),
             qsa_scr: std::sync::Mutex::new(GBuf::new("qsa_scr")),
             qsa_selflag: std::sync::Mutex::new(GBuf::new("qsa_selflag")),
-            qsa_iqw: std::sync::Mutex::new((0, GBuf::new("qsa_iqw"))),
-            qsa_ikw: std::sync::Mutex::new((0, GBuf::new("qsa_ikw"))),
+            ple_ring: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_ring_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_nk: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_nq: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_nc: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_cw: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_iqw: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qsa_ikw: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_csidx: std::sync::Mutex::new((0, 0, GBuf::new("qsa_csidx"))),
             qn_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             kn_map: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -479,17 +481,6 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
     fn pre_join(&self) -> Result<(), String> {
         self.ctx.pre_join()
     }
-}
-
-
-/// FNV-1a f32 슬라이스 해시 — 상수 업로드 캐시 키(plans/73).
-fn fnv_hash(data: &[f32]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &v in data {
-        h ^= v.to_bits() as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// 프레임 op 인자 벡터 — 로컬 변수의 주소를 c_void로.

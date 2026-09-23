@@ -984,10 +984,10 @@ impl llm170_core::matmul::EwOps for Q4Acc {
             self.fptr(conv_out)?,
             self.fptr(gate_out)?,
         );
-        let nk_d = self.upload_hashed(&self.ple_nk, nk)?;
-        let nq_d = self.upload_hashed(&self.ple_nq, nq)?;
-        let nc_d = self.upload_hashed(&self.ple_nc, nc)?;
-        let cw_d = self.upload_hashed(&self.ple_cw, conv_w)?;
+        let nk_d = self.upload_map(&self.ple_nk, "ple_nk", nk)?;
+        let nq_d = self.upload_map(&self.ple_nq, "ple_nq", nq)?;
+        let nc_d = self.upload_map(&self.ple_nc, "ple_nc", nc)?;
+        let cw_d = self.upload_map(&self.ple_cw, "ple_cw", conv_w)?;
         // (1) gate + 방송 + 그룹 norm — 워프당 (t,s), 레인 0 실행.
         {
             let (mut rp, mut kp, mut vp) = (

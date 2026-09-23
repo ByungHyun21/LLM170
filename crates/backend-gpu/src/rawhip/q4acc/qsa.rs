@@ -288,7 +288,7 @@ impl Q4Acc {
         let b0 = pos0 / r;
         let b1 = (pos0 + t) / r;
         if b1 > b0 {
-            let ikw_d = self.upload_hashed(&self.qsa_ikw, ikw)?;
+            let ikw_d = self.upload_map(&self.qsa_ikw, "qsa_ikw", ikw)?;
             let cs_d = self.upload_by_ptr(&self.qsa_csidx, cs_idx)?;
             let (mut ikp, mut bkp, mut iw, mut cp) = (
                 idxk_p as *mut std::ffi::c_void,
@@ -313,20 +313,6 @@ impl Q4Acc {
         }
         Ok((idxk_p, bk_p))
     }
-
-    /// 소형 상수 업로드 캐시 — 내용 FNV 해시가 같으면 재업로드 생략(매 스텝
-    /// h2d+sync를 낳던 qn/kn/iqw/ikw 류 제거). 반환 = 디바이스 포인터.
-    pub(super) fn upload_hashed(&self, slot: &std::sync::Mutex<(u64, GBuf)>, data: &[f32]) -> Result<*mut u8, String> {
-        let h = fnv_hash(data);
-        let mut g = slot.lock().map_err(|e| e.to_string())?;
-        if g.0 != h || g.1.ptr.is_null() {
-            g.1.ensure(&self.ctx, data.len().max(1) * 4)?;
-            self.ctx.h2d(g.1.ptr, bytemuck::cast_slice(data))?;
-            g.0 = h;
-        }
-        Ok(g.1.ptr)
-    }
-
     /// (ptr,len) 키 다중 엔트리 업로드 캐시 — 층별로 다른 상수를 상주시킨다.
     /// 단일 슬롯이면 층마다 미스해 매층 동기 h2d가 발생한다(실측 3.4ms/층).
     pub(super) fn upload_map(
@@ -1057,7 +1043,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             let mut g = self.qsa_iqr.lock().map_err(|e| e.to_string())?;
             g.ensure(&self.ctx, t * idx_heads * idx_dim * 4)?
         };
-        let iqw_d = self.upload_hashed(&self.qsa_iqw, iqw)?;
+        let iqw_d = self.upload_map(&self.qsa_iqw, "qsa_iqw", iqw)?;
         let cs_d = self.upload_by_ptr(&self.qsa_csidx, cs_idx)?;
         {
             let (mut qp, mut op, mut iw, mut cp) = (
