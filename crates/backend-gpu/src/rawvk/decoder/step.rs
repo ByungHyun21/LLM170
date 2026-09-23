@@ -569,10 +569,21 @@ impl DecoderState {
                 // K/V 타일을 24쿼리가 공유해 장문 프리필(pp4096) 어텐션 트래픽·
                 // 지연을 1/24로 줄인다. 폴백(구 판)은 LLM170_VK_NOGQ=1.
                 if t >= 2 && !kv8 && n_head / n_kv.max(1) <= 6 && std::env::var_os("LLM170_VK_NOGQ").is_none() {
-                    let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, t as u32]);
-                    self.run_pipe("qsa_flash_gq", QSA_FLASH_GQ_SPV, 4, 20,
-                        &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
-                        &push, (t as u32).div_ceil(4), n_kv as u32, 1)?;
+                    // plans/92 P3: 레지스터 상주판(qsa_flash_reg) — hip wk16 구조
+                    // 이식(LDS·배리어 0, 점유 8WG/CU급). 종전 gq는 LDS 61KB/WG로
+                    // 점유 1WG/CU — 장문 프리필 어텐션이 npmax 선형 지연의 주벚.
+                    // hd≠256·킬스위치(LLM170_VK_NOREG=1)는 gq로.
+                    if hd == 256 && std::env::var("LLM170_VK_NOREG").map(|v| v != "1").unwrap_or(true) {
+                        let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, t as u32]);
+                        self.run_pipe("qsa_flash_reg", QSA_FLASH_REG_SPV, 4, 20,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, (t as u32).div_ceil(16), n_head as u32, 1)?;
+                    } else {
+                        let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32, t as u32]);
+                        self.run_pipe("qsa_flash_gq", QSA_FLASH_GQ_SPV, 4, 20,
+                            &[self.b_aq.buf, self.kv_k[full_idx][seq].buf, self.kv_v[full_idx][seq].buf, self.b_aout.buf],
+                            &push, (t as u32).div_ceil(4), n_kv as u32, 1)?;
+                    }
                 } else {
                     let push = Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32]);
                     if kv8 {
@@ -621,9 +632,11 @@ impl DecoderState {
             self.dbg_drain_ms = 0.0;
             eprintln!("#  rec t={t} span={:.1}ms drain={:.1}ms", tw_rec.elapsed().as_secs_f64() * 1e3, d);
         }
+        let pf_rec = pf_gpu0.elapsed().as_secs_f64() * 1e3;
+        let pf_w0 = std::time::Instant::now();
         self.ctx.end_batch_wait()?;
+        let pf_wait = pf_w0.elapsed().as_secs_f64() * 1e3;
         self.ctx.ts_report();
-        let pf_gpu = pf_gpu0.elapsed().as_secs_f64() * 1e3;
         let pf_head0 = std::time::Instant::now();
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
@@ -660,7 +673,7 @@ impl DecoderState {
         let mut logits = vec![0f32; self.n_vocab];
         unsafe { std::ptr::copy_nonoverlapping(self.b_lg.ptr as *const f32, logits.as_mut_ptr(), self.n_vocab) };
         if pfck {
-            eprintln!("[pfck] step_batch t={t} up={pf_up:.1}ms gpu+wait={pf_gpu:.1}ms head={pf_head:.1}ms rd={:.1}ms",
+            eprintln!("[pfck] step_batch t={t} up={pf_up:.1}ms rec={pf_rec:.1}ms wait={pf_wait:.1}ms head={pf_head:.1}ms rd={:.1}ms",
                 pf_rd0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(logits)
@@ -900,9 +913,16 @@ impl DecoderState {
             unsafe { std::ptr::copy_nonoverlapping(self.b_amr.ptr as *const u32, toks.as_mut_ptr(), t) };
             return Ok((Vec::new(), toks));
         }
-        let mut all = vec![0f32; t * self.n_vocab];
-        unsafe { std::ptr::copy_nonoverlapping(self.b_lg_t.ptr as *const f32, all.as_mut_ptr(), t * self.n_vocab) };
-        Ok((all.chunks(self.n_vocab).map(|r| r.to_vec()).collect(), Vec::new()))
+        // plans/92 P6.4: 중간 flat 2.4MB + 행별 재복사 폐지 — 행 버퍼로 직복사.
+        let mut rows: Vec<Vec<f32>> = (0..t).map(|_| vec![0f32; self.n_vocab]).collect();
+        for (i, r) in rows.iter_mut().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.b_lg_t.ptr.add(i * self.n_vocab * 4) as *const f32,
+                    r.as_mut_ptr(), self.n_vocab)
+            };
+        }
+        Ok((rows, Vec::new()))
     }
     /// plans/91 P0 — [npck] 스테이지 마크: 배치-순차 대조용 행 합 덤프.
     fn npck_mark(&mut self, tag: &str, il: usize, b: &VkBuf, row: usize, len: usize) {
