@@ -385,6 +385,17 @@ impl DecoderState {
                     }
                     return Ok(());
                 }
+                // plans/92 P1: 128 패밀리 단일 디스패치 — 토큰 슬래브를 x축으로
+                // 병렬화(tok_base=wg.x*BN, 꼬리 nt는 커널 유도). 종전 for tb
+                // 순차 디스패치는 슬래브마다 전 가중을 재판독했다(t=512 → 4배,
+                // pp16384 2배 열위의 원인). 슬래브 최속 스케줄로 동일 행블록의
+                // 후속 슬래브 WG가 L2에 상주하는 가중 타일을 재사용한다.
+                if nm.ends_with("128") {
+                    let gys = (t as u32).div_ceil(128);
+                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, t as u32, 0u32]);
+                    self.run_pipe_b(nm, spv, nkb, 20, &binds, &push, gys, gx_ms, 1, bar)?;
+                    return Ok(());
+                }
                 for tb in (0..t).step_by(step) {
                     let nt = (t - tb).min(step) as u32;
                     let last = tb + step >= t && bar;
