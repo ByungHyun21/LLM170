@@ -98,6 +98,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         conv_out: u64,
         gate_out: u64,
         seq: usize,
+        pos0: usize,
         t: usize,
         eps: f32,
         n_embd: usize,
@@ -107,21 +108,20 @@ impl llm170_core::matmul::EwOps for VkAcc {
         hist: usize,
         host_ring: &[f32],
     ) -> Result<(), String> {
-        if t != 1 {
-            return Err("ple_math_dev: t=1 전용".into());
-        }
+        // plans/93 P2: t=1 게이트 해제 — 3커널(gate/conv/residual)은 모두 t행
+        // 처리 가능(92 코드 확인). 링 워터마크를 pos 기반으로 전환해
+        // 프리필(t=512)→디코드(t=1) 전환을 롤백으로 오판하던 결함 제거.
         let hc_dim = hc * n_embd;
         let ring_bytes = hist * hc_dim * 4;
         let mut ctx = self.ctx.lock();
         self.frame_resume_batch(&mut ctx);
-        // 링 + 워터마크(되감기면 호스트 링으로 리프레시).
         let rewind;
         let ringb;
         {
             let mut m = self.ple_rings.lock();
             let e = m.entry(seq).or_insert_with(|| (vkbuf_null(), 0));
-            rewind = e.1 > t || e.0.ptr.is_null();
-            e.1 = t;
+            rewind = pos0 < e.1 || e.0.ptr.is_null();   // 역방향 또는 최초
+            e.1 = pos0 + t;
             if e.0.ptr.is_null() {
                 e.0 = ctx.alloc_host(ring_bytes)?;
             }
@@ -183,6 +183,19 @@ impl llm170_core::matmul::EwOps for VkAcc {
             let ds2 = ctx.bind_ds(&p, &[rb, vb, gob, cob])?;
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, n_embd.div_ceil(256) as u32, 1, 1)?;
+        }
+        Ok(())
+    }
+
+    /// plans/93 P2 — 디바이스 링 → 엔진 CPU 상태 재동기(GPU 유휴 시점 전제).
+    fn ple_ring_sync(&self, seq: usize, ring_out: &mut [f32]) -> Result<(), String> {
+        let m = self.ple_rings.lock();   // parking_lot 계열 — Result 아님
+        let Some((b, _)) = m.get(&seq) else {
+            return Err("ple_ring_sync: 링 없음".into());
+        };
+        let n = ring_out.len().min(b.bytes / 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.ptr as *const f32, ring_out.as_mut_ptr(), n);
         }
         Ok(())
     }

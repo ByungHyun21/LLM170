@@ -349,7 +349,8 @@ pub(super) fn frame_forward_np_ex(
                     .map_err(Q4Error::Io)?;
                 acc.ple_math_dev(
                     vv.res_hc[row], f.ple_key, f.ple_value, &nk, &nq, &nc, &cw,
-                    f.ple_gated, f.ple_conv_out, f.ple_gate, sq, 1, hp.eps,
+                    f.ple_gated, f.ple_conv_out, f.ple_gate, sq,
+                    seq_sts[sq].pos as usize, 1, hp.eps,
                     n, hc, hp.ple_conv_k, hp.ple_ngram,
                     (hp.ple_conv_k - 1) * hp.ple_ngram, &seq_sts[sq].ple_conv,
                 )

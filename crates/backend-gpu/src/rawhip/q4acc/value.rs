@@ -942,6 +942,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         conv_out: u64,
         gate_out: u64,
         seq: usize,
+        pos0: usize,
         t: usize,
         eps: f32,
         n_embd: usize,
@@ -951,6 +952,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         hist: usize,
         host_ring: &[f32],
     ) -> Result<(), String> {
+        let _ = pos0;   // hip 은 디코드 전용 게이트 유지(plans/93 P2 vk 우선)
         if t != 1 {
             return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
         }

@@ -57,6 +57,8 @@ pub(super) fn frame_forward_ex(
     let conv_ch = 2 * k_len + v_len;
     let eps = hp.eps;
     let t = tokens.len();
+    // plans/93 P2: PLE pos 기반 워터마크용 — 이 청크 시작 위치.
+    let pos0 = seq_st.pos as usize;
     fs_begin(acc, t);
 
     // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
@@ -85,6 +87,8 @@ pub(super) fn frame_forward_ex(
 
     let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
     let t_call = std::time::Instant::now();
+    // plans/93 P2: 디바이스 PLE 실행 플래그 — 반환 직전 링 재동기 판정.
+    let mut ple_dev = false;
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
     for il in 0..hp.n_layer {
@@ -141,11 +145,15 @@ pub(super) fn frame_forward_ex(
         //    폴백/프리필(t>1)은 기존 호스트 브리지. LLM170_PLE_HOST=1 강제.
         if hp.is_ple(il) && !stage_skipped("ple") {
             let mut ple_dev_done = false;
+            // plans/93 P2: t>1 디바이스 PLE은 부정 종결(원장 (36)) — gate/conv/res
+            // 커널이 t=1 튜닝(순차 rms·conv)이라 t=512에서 호스트 브리지보다
+            // 느리고(154 vs 214 t/s) 스트림이 결정적으로 상이(값 오류 의심,
+            // PLE_CHECK 그림자로 미국소화). 디코드(t=1)만 디바이스 경로.
             if t == 1 && std::env::var_os("LLM170_PLE_HOST").is_none() {
                 let heads = hp.ple_heads_per_ngram * 2;
-                let emb_w = heads * hp.ple_head_dim;
+                let emb_w = heads * hp.ple_head_dim * t;
                 let mut emb = vec![0.0f32; emb_w];
-                if ple_rows.len() == heads {
+                if ple_rows.len() == heads * t {
                     if let Err(e) = ctx.model.ple_gather(&ple_rows, &mut emb) {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})"));
@@ -173,7 +181,7 @@ pub(super) fn frame_forward_ex(
                     .and_then(|_| {
                         acc.ple_math_dev(
                             f.res_hc, f.ple_key, f.ple_value, &nk, &nq, &nc, &cw,
-                            f.ple_gated, f.ple_conv_out, f.ple_gate, seq, t, hp.eps,
+                            f.ple_gated, f.ple_conv_out, f.ple_gate, seq, pos0, t, hp.eps,
                             n, hc, hp.ple_conv_k, hp.ple_ngram,
                             (hp.ple_conv_k - 1) * hp.ple_ngram, &seq_st.ple_conv,
                         )
@@ -181,6 +189,7 @@ pub(super) fn frame_forward_ex(
                 match r {
                     Ok(()) => {
                         ple_dev_done = true;
+                        ple_dev = true;
                         if std::env::var_os("LLM170_PLE_CHECK").is_some() {
                             super::diag::ple_check_shadow(acc, f, ctx, model, seq_st, il, &emb, &ple_rows, &pre_capture, hc, n, t)?;
                         }
@@ -340,6 +349,16 @@ pub(super) fn frame_forward_ex(
         if mode == FwdMode::Greedy {
             // GPU argmax — vocab×4B 전사·CPU 스캔 회피(plans/74).
             let toks = acc.frame_argmax_rows(f.logits, 1, hp.vocab).map_err(Q4Error::Io)?;
+            // plans/93 P2: GPU 유휴(판독 완료) — 디바이스 링을 CPU 상태로 재동기.
+            if ple_dev {
+                let hist = (hp.ple_conv_k - 1) * hp.ple_ngram;
+                let mut ring = vec![0.0f32; hist * hc * n];
+                if acc.ple_ring_sync(seq, &mut ring).is_ok()
+                    && ring.len() == seq_st.ple_conv.len()
+                {
+                    seq_st.ple_conv.copy_from_slice(&ring);
+                }
+            }
             // plans/88 — 그리디 판독도 ktrace 틱: [ts] 프로파일이 디코드 스텝을
             // 잡지 못했다(프리필 종료 틱만 관측). 그리디 반환 직전에 틱한다.
             acc.ktrace_tick();
@@ -349,6 +368,17 @@ pub(super) fn frame_forward_ex(
         let mut logits = vec![0.0f32; hp.vocab];
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
+        // plans/93 P2: 판독으로 GPU 유휴 — 디바이스 링 CPU 재동기(프리필 t>1
+        // 포함: 폴백·스냅샷·롤백의 ple_conv 정합 유지).
+        if ple_dev {
+            let hist = (hp.ple_conv_k - 1) * hp.ple_ngram;
+            let mut ring = vec![0.0f32; hist * hc * n];
+            if acc.ple_ring_sync(seq, &mut ring).is_ok()
+                && ring.len() == seq_st.ple_conv.len()
+            {
+                seq_st.ple_conv.copy_from_slice(&ring);
+            }
+        }
         ftime_report(t);
         acc.ktrace_tick();
         if ftime_on() {
