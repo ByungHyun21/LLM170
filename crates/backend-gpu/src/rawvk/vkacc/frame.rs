@@ -398,10 +398,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // 8sg판(q51_cm)과 q4k_sg1은 엔진 비결정 — 옵트인만.
                 (GgmlType::Q5_1, _sg) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q51SG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Sg1,
                 (GgmlType::Q5_1, _q51cm) if cm_on && std::env::var("LLM170_VK_Q51CM").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Cm,
-                // plans/93: q4k_sc는 올바른 그리드에서 179 t/s — 기본(192)보다
-                // 느려 승격 철회(LDS 스테이징 배리어 오버헤드 > 디양자화 절감).
-                // 이전 opt-in 265 t/s는 cm_on 그리드(n_out/128) 불일치로
-                // 7/8 출력이 미기록인 무효 측정이었다.
+                // plans/93: q4k_sg1(coopmat 1-sg, 224 t/s) 기본 승격 — 구 스칼라
+                // (160 t/s) 대비 +40%. 라우팅 민감도는 기본 경로와 동일(원장 36).
+                // 킬스위치 LLM170_VK_Q4KSG1=0.
+                (GgmlType::Q4K, _) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kSg1,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
                 (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
                 _ => Slot::FnMoeTileQ5k,
@@ -425,7 +425,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ51Sg1) {
+            } else if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSc) {
+                // plans/93: 16열/WG 판 — cm_on 그리드(n_out/128)와 별개.
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             } else if cm_on {
                 (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
