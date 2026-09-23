@@ -1,0 +1,125 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// fn_ple_gate_mt (plans/93) — PLE gate 병렬판: 워프(32레인)가 (s,ti)를 공동 처리.
+// 구판은 lane 0만 실행(t=1 튜닝) — t>1 프리필에서 hc×t개 조합이 순차 처리되어
+// 285ms 브리지의 원인. 이 판은 32레인이 나누어 처리 + subgroupAdd 축소.
+// 산술: 구판과 동일 수학(f32 부분합 → f64 결합 → 순서는 레인 스트라이드로
+// 변경 ±ulp — 구판 lane0-순차와 동일 클래스의 재배치).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer ResB { float res[]; };
+layout(binding = 1) readonly buffer KeyB { float key[]; };
+layout(binding = 2) readonly buffer ValB { float value[]; };
+layout(binding = 3) readonly buffer NkB { float nk[]; };
+layout(binding = 4) readonly buffer NqB { float nq[]; };
+layout(binding = 5) readonly buffer NcB { float nc[]; };
+layout(binding = 6) buffer GatedB { float gated[]; };
+layout(binding = 7) buffer GateB { float gate_out[]; };
+layout(push_constant) uniform PC {
+    float eps; uint n_embd; uint hc; uint t;
+} pc;
+
+float exp_cr_exact(float xf) {
+    double x = double(xf);
+    if (x > 88.72) return uintBitsToFloat(0x7f800000u);
+    if (x < -103.97) return 0.0;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double INV_LN2 = 1.44269504088896338700e+00;
+    double kd = roundEven(x * INV_LN2);
+    int k = int(kd);
+    double r = fma(-kd, LN2_HI, x);
+    r = fma(-kd, LN2_LO, r);
+    double p = 1.0 / 1307674368000.0;
+    p = fma(p, r, 1.0 / 479001600.0);
+    p = fma(p, r, 1.0 / 39916800.0);
+    p = fma(p, r, 1.0 / 3628800.0);
+    p = fma(p, r, 1.0 / 362880.0);
+    p = fma(p, r, 1.0 / 40320.0);
+    p = fma(p, r, 1.0 / 5040.0);
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    if (k > 127) return uintBitsToFloat(0x7f800000u);
+    if (k < -126) return 0.0;
+    uint64_t eb = (uint64_t(k + 1023)) << 52;
+    double scale = uint64BitsToDouble(eb);
+    return float(p * scale);
+}
+
+void main() {
+    // 서브그룹(워프)별 (s,ti) — 8서브그룹 = 8개 s값.
+    int s = int(gl_WorkGroupID.x * 8u + gl_SubgroupID);
+    int ti = int(gl_WorkGroupID.y);
+    uint lane = gl_SubgroupInvocationID;
+    uint n = pc.n_embd;
+    if (s >= int(pc.hc) || ti >= int(pc.t)) return;
+
+    uint kbase = uint(ti) * pc.hc * n + uint(s) * n;
+    uint rbase = kbase;
+    uint nks = uint(s) * n;
+    uint vbase = uint(ti) * n;
+    uint per = n / 32u;   // 레인당 원소 수 (n=2560 → 80)
+
+    // ── RMS(key) — 레인 스트라이드 f32 부분합 + subgroupAdd + f64 보정.
+    float ksq_part = 0.0;
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        float dv = key[kbase + i];
+        ksq_part += dv * dv;
+    }
+    double ksq_d = double(subgroupAdd(ksq_part));
+    float sk = 1.0 / float(sqrt(ksq_d / double(n) + double(pc.eps)));
+
+    // ── RMS(res) — 동일 구조.
+    float rsq_part = 0.0;
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        float dv = res[rbase + i];
+        rsq_part += dv * dv;
+    }
+    double rsq_d = double(subgroupAdd(rsq_part));
+    float sq = 1.0 / float(sqrt(rsq_d / double(n) + double(pc.eps)));
+
+    // ── dot: (key*sk*nk) · (res*sq*nq) — 레인 스트라이드 + subgroupAdd.
+    float dot_part = 0.0;
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        float a = (key[kbase + i] * sk) * nk[nks + i];
+        float b = (res[rbase + i] * sq) * nq[nks + i];
+        dot_part += a * b;
+    }
+    float dotv = subgroupAdd(dot_part);
+    dotv /= sqrt(float(n));
+
+    // ── gate — 레인 0만 기록 (스칼라).
+    float mag = max(abs(dotv), 1e-6);
+    float g = 1.0 / (1.0 + exp_cr_exact(dotv >= 0.0 ? -sqrt(mag) : sqrt(mag)));
+    if (lane == 0u) {
+        gate_out[uint(ti) * pc.hc + uint(s)] = g;
+    }
+
+    // ── gated = value * gate — 레인 분산 쓰기.
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        gated[kbase + i] = value[vbase + i] * g;
+    }
+    subgroupBarrier();
+
+    // ── RMS(gated) — 레인 스트라이드 + subgroupAdd.
+    float gsq_part = 0.0;
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        float dv = gated[kbase + i];
+        gsq_part += dv * dv;
+    }
+    double gsq_d = double(subgroupAdd(gsq_part));
+    float sg = 1.0 / float(sqrt(gsq_d / double(n) + double(pc.eps)));
+
+    // ── gated *= sg * nc — 레인 분산.
+    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+        gated[kbase + i] = gated[kbase + i] * sg * nc[nks + i];
+    }
+}
