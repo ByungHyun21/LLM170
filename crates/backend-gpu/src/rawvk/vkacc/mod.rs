@@ -104,6 +104,10 @@ const FN_MOE_TILE_Q51_CM_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51_cm.
 /// plans/89 재개 — q5_1 CM 1-서브그룹 판(64스레드 — tile128v2식 서브그룹 간
 /// 경쟁 가설의 정면 검증이자 스칼라 대비 생산 후보).
 const FN_MOE_TILE_Q51_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51_sg1.spv");
+/// plans/93 P1 — q4_K 1-sg coopmat 타일(q51_sg1 안정 구조 + q4_K 디양자화).
+const FN_MOE_TILE_Q4K_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1.spv");
+/// plans/93 P1 — q4_K 순수 스칼라 타일(coopmat 폐지, LDS 스테이징 유지).
+const FN_MOE_TILE_Q4K_SC_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sc.spv");
 /// plans/89 재개 — q4_K CM 1-서브그룹 판(엔진 결정적 — q51_sg1로 판명).
 /// plans/89 재개 — q4_K 8-서브블록 스테이징 판(반복/장벽 q51_sg1과 동일).
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
@@ -200,6 +204,8 @@ pub(crate) enum Slot {
     FnMoeTileQ51Cm,
     /// plans/89 재개 — q5_1 CM 1-서브그룹 판(경쟁 판별·후보 생산판).
     FnMoeTileQ51Sg1,
+    FnMoeTileQ4kSg1,
+    FnMoeTileQ4kSc,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
     FnIdxScoreMt,
@@ -381,6 +387,8 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ5k, "moe_tile_q5k", FN_MOE_TILE_Q5K_SPV, 13, 28),
     (Slot::FnMoeTileQ51Cm, "moe_tile_q51_cm", FN_MOE_TILE_Q51_CM_SPV, 13, 28),
     (Slot::FnMoeTileQ51Sg1, "moe_tile_q51_sg1", FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kSg1, "moe_tile_q4k_sg1", FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
     (Slot::FnIdxScoreMt, "idx_score_mt", FN_IDX_SCORE_MT_SPV, 3, 20),
     (Slot::FnIdxTopkMt, "idx_topk_mt", FN_IDX_TOPK_MT_SPV, 3, 20),
     (Slot::FnMoeTileQ4kKp, "moe_tile_q4k_kp", FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
