@@ -145,10 +145,8 @@ pub(super) fn frame_forward_ex(
         //    폴백/프리필(t>1)은 기존 호스트 브리지. LLM170_PLE_HOST=1 강제.
         if hp.is_ple(il) && !stage_skipped("ple") {
             let mut ple_dev_done = false;
-            // plans/93 P2: t>1 디바이스 PLE은 부정 종결(원장 (36)) — gate/conv/res
-            // 커널이 t=1 튜닝(순차 rms·conv)이라 t=512에서 호스트 브리지보다
-            // 느리고(154 vs 214 t/s) 스트림이 결정적으로 상이(값 오류 의심,
-            // PLE_CHECK 그림자로 미국소화). 디코드(t=1)만 디바이스 경로.
+            // plans/93: t>1 디바이스 PLE — 병렬 gate로도 값 오류 지속(원장 36).
+            // conv/res의 t>1 링/잔차 경로에 별도 결함 추정. t=1만 디바이스.
             if t == 1 && std::env::var_os("LLM170_PLE_HOST").is_none() {
                 let heads = hp.ple_heads_per_ngram * 2;
                 let emb_w = heads * hp.ple_head_dim * t;
