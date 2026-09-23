@@ -400,8 +400,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (GgmlType::Q5_1, _q51cm) if cm_on && std::env::var("LLM170_VK_Q51CM").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ51Cm,
                 // plans/93: q4k_sg1(coopmat 1-sg, 224 t/s) 기본 승격 — 구 스칼라
                 // (160 t/s) 대비 +40%. 라우팅 민감도는 기본 경로와 동일(원장 36).
+                // 안전장치: bound > 8192(pp16384급)에서는 GPU 행업 관측 — 구 스칼라로.
                 // 킬스위치 LLM170_VK_Q4KSG1=0.
-                (GgmlType::Q4K, _) if wbufs.len() == 1 && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kSg1,
+                (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
+                    && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kSg1,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
                 (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
                 _ => Slot::FnMoeTileQ5k,
