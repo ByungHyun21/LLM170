@@ -94,6 +94,8 @@ const TILE_Q4KMS_SPV2: &[u8] = include_bytes!("../spv/tile_q4kms.spv");
 
 /// plans/89 P1.1b — MoE 그룹 프리필 q4_K coopmat 타일(f16 스테이징).
 const FN_MOE_TILE_Q4K_CM_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_cm.spv");
+/// plans/93 P1 — q4k_cm K-분할 실험판(비결정성 체인-길이 가설 검증).
+const FN_MOE_TILE_Q4K_CM2_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_cm2.spv");
 /// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일(레거시 전문가 루프 대체).
 const FN_MOE_TILE_Q8_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q8.spv");
 const FN_MOE_TILE_Q5K_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q5k.spv");
@@ -190,6 +192,7 @@ pub(crate) enum Slot {
     TileQ4kmsCm,
     /// plans/89 P1.1b — MoE q4_K coopmat 타일.
     FnMoeTileQ4kCm,
+    FnMoeTileQ4kCm2,
     /// plans/89 P1.1c — MoE q8_0/q5_K 스칼라 타일.
     FnMoeTileQ8,
     FnMoeTileQ5k,
@@ -373,6 +376,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::TileQ4k128Cm, "tile_q4k128", TILE_Q4K128_SPV2, 10, 20),
     (Slot::TileQ4kmsCm, "tile_q4kms", TILE_Q4KMS_SPV2, 10, 20),
     (Slot::FnMoeTileQ4kCm, "moe_tile_q4k_cm", FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kCm2, "moe_tile_q4k_cm2", FN_MOE_TILE_Q4K_CM2_SPV, 13, 28),
     (Slot::FnMoeTileQ8, "moe_tile_q8", FN_MOE_TILE_Q8_SPV, 13, 28),
     (Slot::FnMoeTileQ5k, "moe_tile_q5k", FN_MOE_TILE_Q5K_SPV, 13, 28),
     (Slot::FnMoeTileQ51Cm, "moe_tile_q51_cm", FN_MOE_TILE_Q51_CM_SPV, 13, 28),
