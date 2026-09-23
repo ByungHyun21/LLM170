@@ -3,6 +3,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_integer_dot_product : require
 
 // fn_moe_tile_q4k_mmq (plans/93) — llama mul_mmq 스타일 q4_K MoE 타일.
 // BM=64 × BN=64 × BK=32. 256스레드. 스레드당 TM=4행 × TN=4열 = 16출력.
@@ -156,13 +157,7 @@ void main() {
             for (int cc = 0; cc < 4; cc++) {
                 int qsum = 0;
                 for (int w = 0; w < 8; w++) {
-                    int a_word = regA[cr][w];
-                    int b_word = regB[cc][w];
-                    // 4바이트 manual dot
-                    qsum += ((a_word) & 0xFF) * ((b_word) & 0xFF);
-                    qsum += ((a_word >> 8) & 0xFF) * ((b_word >> 8) & 0xFF);
-                    qsum += ((a_word >> 16) & 0xFF) * ((b_word >> 16) & 0xFF);
-                    qsum += ((a_word >> 24) & 0xFF) * ((b_word >> 24) & 0xFF);
+                    qsum += dotPacked4x8EXT(regA[cr][w], regB[cc][w]);
                 }
                 // k-블록 스케일: d_B * (d*sc * Σ(nib*b) - d*m * Σ(b))
                 sums[cr * 4 + cc] += regBd[cc] * (regAd[cr] * float(qsum) - regAm[cr] * regBsum[cc]);
