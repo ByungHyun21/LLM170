@@ -1233,3 +1233,82 @@ copies in GLSL compute → occupancy loss only). The pp16384 lever is tile
 *structure* (occupancy/latency), not arithmetic. Fixed en route:
 fn_moe_tile_q5k/q8 mode=1 rp guard (dense mode early-exited on the dummy
 rows_pad buffer).
+
+## 2026-09-23 (plans/92) — cross-backend campaign: prefill flash/rms restructuring, hip constant residency, np protocol repair
+
+Branch `perf-92`. All gates PASS (4/4 runtimes; FN vk shows the documented
+1692<->24902 near-tie variant), tile checks byte-stable, cargo test 35/35
+standalone (an earlier chunk_state OOM was a GPU-contention artifact,
+reproduced only with a concurrent bench holding VRAM).
+
+| cell (vk unless noted) | plans/92 open | now | delta |
+|---|---|---|---|
+| 27B pp512 | 343 | **360.2** | +5% |
+| 27B pp4096 | 258 (same-session pre-P3) | **302.1** | +17% |
+| 27B pp16384 | 145.4 | **231.0** | +59% |
+| 27B tg128@4k | 11.21 | 10.95 | noise-band |
+| 27B np4 greedy | 28.69 | **33.48** | +17% |
+| 27B np4 agg | 27.10 | 27.05 | flat |
+| 27B np4 greedy (hip) | 19.9 (protocol-flawed) | **33.20** | cell repaired |
+| FN pp512 | 178.2 | **222.9** | +25% |
+| FN pp4096 | 169.4 | **213.1** | +26% |
+| FN tg128 (hip) | 5.51 | 5.71 | +4% |
+
+What landed:
+
+- **P7.1 np greedy bench cell repair** — the cell inherited slot-0 state from
+  the pp/np-tg cells (stale seed token, append-prefill onto dirty KV),
+  splitting slot 0's stream and shrinking the batch via EOS eviction. The hip
+  "19.9" was a protocol artifact: reset+re-prefill of all slots yields
+  33.20, consistent with hip's non-greedy 30.62.
+- **P1 tile128 single dispatch** — the 7 128-token tile kernels derived
+  tok_base from a push constant and were dispatched as ceil(t/128) sequential
+  launches, re-reading the full weight matrix per slab (4x at t=512). Now
+  tok_base = wg.x*BN in-kernel, one dispatch (ceil(t/128), ceil(n_out/64)).
+  Arithmetic per (row-block, slab) unchanged — tile checks maxrel unchanged,
+  gates byte-identical. Modest gains: the L2 reuse assumption only partially
+  materializes at these shapes.
+- **P3 qsa_flash_reg (the big lever)** — the prefill flash (qsa_flash_gq)
+  staged Q/K in 61KB LDS/WG -> 1 WG/CU occupancy + two barriers per 32-key
+  tile; attention cost scaled linearly with context (pp4096 chunk 1.45s ->
+  2.4s). New kernel ports the hip qsa_flash_wk16 structure: Q in registers
+  (16 dims/lane), K/V streamed coalesced from global, zero LDS/barriers,
+  uniform loop bound for shuffle convergence. 27B pp16384 145.4 -> 231.0.
+- **P4.1 rms 256 threads/row** — 32 threads/row is 16K threads at t=512
+  (2.7 GB/s measured class, FN chunk rms 261ms). Regrouped to 256 chains +
+  the same ordered f64 combine. FN pp512 178 -> 223.
+- **P2 premise disproven (diagnostics)** — [pfck] shows rec=1.8ms /
+  wait=1437ms per 512-token chunk: the "580ms unattributed host boundary"
+  was an artifact of the [ts] per-slot sum overcounting (sum 2353ms vs wall
+  1490ms). The reporter now prints the first-to-last stamp span alongside
+  the sum. pp512 is GPU-execution-bound; long-context growth is attention
+  (handled by P3).
+- **P5.1 hip per-layer constant residency** — the qsa_iqw/ikw and
+  ple_nk/nq/nc/cw single-slot hash caches missed per layer (12 layers
+  alternate contents), and the sync h2d blocked on the queued work drain
+  (the 2.55ms x12 post-bk_update stall). Switched to the content-hash
+  multi-entry upload_map (qn_map precedent). FN hip gate PASS, tg +4%.
+- **P6** — gemv8t q4/q6/q8/q3/nl/xs promoted to real 4-row support
+  (rpf=4 via LLM170_VK_NPT_NR; default 2 unchanged — measured neutral at
+  t=4); np non-greedy logits readback double-copy removed; np decode
+  token_embd 2.5GB to_vec cache replaced by per-row mmap dequant (RAM
+  residency removed, agg-cell timing contamination gone). verify_np_self
+  vk 4/4; hip 2/4 — pre-existing (reproduced at 5d3fae5, same divergent
+  tokens), documented not introduced here.
+
+Closed negative / blocked:
+
+- **MoE coopmat promotion (P4.3)** — reproduced the plans/89 nondeterminism
+  3/3 distinct streams (degenerate loops included) with the current tree;
+  per ledger (32b)/(32c) this is a RADV subgroup-scheduling race in the
+  q4_K tiles (1-sg included). Stays opt-in; scripts/moecm-repro.sh shipped.
+- **hip dual warp-plate GEMV (P5.2)** — gemm_q8_0_dual_w (warp-per-row over
+  both outputs, gemm_q8_0_w arithmetic) regressed the FN hip gate and tg
+  (5.71 -> 5.56): the warp plate's advantage is scoped to n_sub<=32 shapes,
+  outside the FN dense-GEMV shapes. Reverted fully.
+- **Remaining target gaps** — 27B pp512>=450 assumed the (disproven) P2
+  boundary; pp16384>=295 needs flash at f16-KV class or beyond; FN pp
+  targets are gated on the MoE-cm race; hip FN tg>=12 needs the MoE decode
+  GEMV class, not the dense duals. np4 agg 27.05 vs greedy 33.48: in-step
+  time is equal (119ms); ~29ms/step remains outside step_batch_np (host
+  logits path) — next-session lead.
