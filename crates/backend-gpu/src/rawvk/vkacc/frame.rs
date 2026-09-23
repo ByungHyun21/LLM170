@@ -122,6 +122,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
         let xq = if ids2_takes {
             vk::Buffer::null()
+        } else if std::env::var("LLM170_VK_Q4KSG1F").map(|v| v == "1").unwrap_or(false) {
+            // plans/93: sg1f은 f32 직결 — quant 스킵, f32 버퍼를 그대로 패스.
+            xb
         } else {
             let xq = self.xq_dev_buf(&mut ctx, rows * xq_w * 4)?;
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
@@ -403,6 +406,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // 안전장치: bound > 8192(pp16384급)에서는 GPU 행업 관측 — 구 스칼라로.
                 // 킬스위치 LLM170_VK_Q4KSG1=0.
                 (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
+                    && std::env::var("LLM170_VK_Q4KSG1F").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1f,
+                (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
                     && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kSg1,
                 (GgmlType::Q4K, _) if wbufs.len() == 1
                     && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kMmq,
@@ -431,7 +436,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
                 (n_out.div_ceil(64) as u32, bound.div_ceil(64) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSc) {
+            } else if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSc | Slot::FnMoeTileQ4kSg1f) {
                 // plans/93: 16열/WG 판 — cm_on 그리드(n_out/128)와 별개.
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             } else if cm_on {

@@ -1,0 +1,152 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fn_moe_tile_q4k_sg1_f32 (plans/93) — q4k_sg1 의 f32 직결판.
+// 핵심 변경: stage_b가 q8 버퍼(xq)를 읽지 않고 원본 f32 활성(xa)을 직접 읽어
+// f16으로 스테이징. quant 커널 디스패치(144회/청크)와 xq 중간 버퍼 완전 소거.
+// 산술: q8 양자화→역양자화 왕복이 f16 직접 변환으로 대체 — 정밀도는
+// q8 경유보다 향상(왜곡 없음), 기존 f16 스테이징 정밀도와 동일 클래스.
+// 기하·스케일 계약은 q4k_sg1과 동일(16출력×16전문가행, coopmat 1-sg).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 8) readonly buffer Xa { float xa[]; };  // f32 활성 [rows][n_in]
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+shared float16_t A16[16][68];
+shared float16_t B16[16][68];
+shared float CtmpF[16][17];
+shared float scale_row[16];
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+// q4_K A 스테이징(q4k_sg1과 동일).
+void stage_a(int sb, int colb, int row0, int nrow, uint ebase, uint row_words, int tid) {
+    int r = int(tid >> 2);
+    int kc = int(tid & 3) * 8;
+    int row = row0 + r;
+    if (row < row0 + nrow) {
+        uint wq = ebase + uint(row) * row_words + uint(sb >> 3) * 36u;
+        float d = f16_exact(w0c[wq] & 0xFFFFu);
+        float dmin = f16_exact(w0c[wq] >> 16);
+        float inv = 1.0 / scale_row[r];
+        int it = (sb >> 1) & 3;
+        int hilo = sb & 1;
+        int sj = it * 2 + hilo;
+        uint s_v, m_v;
+        if (sj < 4) {
+            s_v = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 63u;
+            uint mb = sj + 4;
+            m_v = (w0c[wq + 1u + uint(mb >> 2)] >> uint((mb & 3) * 8)) & 63u;
+        } else {
+            uint sb_lo = (w0c[wq + 1u + uint((sj + 4) >> 2)] >> uint(((sj + 4) & 3) * 8)) & 0xFFu;
+            uint sb_jm4 = (w0c[wq + 1u + uint((sj - 4) >> 2)] >> uint(((sj - 4) & 3) * 8)) & 0xFFu;
+            uint sb_j = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 0xFFu;
+            s_v = (sb_lo & 0xFu) | ((sb_jm4 >> 6) << 4);
+            m_v = (sb_lo >> 4) | ((sb_j >> 6) << 4);
+        }
+        float ds0 = d * float(s_v) * inv;
+        float ds1 = dmin * float(m_v) * inv;
+        for (int e = 0; e < 8; e++) {
+            int l = kc + e;
+            uint qv = w0c[wq + 4u + uint((it * 32 + l) >> 2)];
+            uint nib = (qv >> uint((((it * 32 + l) & 3) * 8) + (hilo << 2))) & 0xFu;
+            A16[r][colb + l] = float16_t(float(nib) * ds0 - ds1);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+// B 스테이징: f32 활성을 직접 읽어 f16으로 — q8 왕복 없음.
+void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
+    int rb = int(tid >> 2);
+    int k2 = int(tid & 3) * 8;
+    if (live && rb < nt16) {
+        // perm_pad는 활성 행 인덱스 — f32 버퍼에서 직접 판독.
+        uint row = perm_pad[uint(r0e + rb)];
+        int k_off = sb * 32 + k2;
+        for (int e = 0; e < 8; e++) {
+            B16[rb][colb + k2 + e] = float16_t(xa[row * pc.n_in + uint(k_off + e)]);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) B16[rb][colb + k2 + e] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tidy = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 16;
+    int nrow = int(min(16u, pc.n_out - uint(row0)));
+    int r0e = int(tidy) * 16;
+    uint rp = rows_pad[0];
+    if (uint(r0e) >= rp) return;
+    uint e = rowexp[uint(r0e)];
+    int nt16 = int(min(16u, rp - uint(r0e)));
+    uint row_words = uint(n_in >> 8) * 36u;
+    uint ebase = e * (pc.per_expert_bytes >> 2);
+
+    // 프리패스: 16행 스케일.
+    {
+        for (int i = int(tid); i < nrow; i += 64) {
+            uint wq = ebase + uint(row0 + i) * row_words;
+            float mx = 1e-30;
+            for (uint s = 0u; s < (uint(n_in) >> 8); s++) {
+                uint w0 = w0c[wq + s * 36u];
+                float dd = abs(f16_exact(w0 & 0xFFFFu));
+                float dm = abs(f16_exact(w0 >> 16));
+                mx = max(mx, 15.0 * dd + dm);
+            }
+            scale_row[i] = 63.0 * mx;
+        }
+        barrier();
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (int sb = 0; sb < n_sub; sb += 2) {
+        stage_a(sb, 0, row0, nrow, ebase, row_words, int(tid));
+        stage_b(sb, 0, true, nt16, int(tid), r0e);
+        bool live2 = sb + 1 < n_sub;
+        stage_a(sb + 1, 32, row0, nrow, ebase, row_words, int(tid));
+        stage_b(sb + 1, 32, live2, nt16, int(tid), r0e);
+        memoryBarrierShared();
+        barrier();
+        for (int ks = 0; ks < 4; ks++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+            coopMatLoad(fa, A16[0], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+            coopMatLoad(fbb, B16[0], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+            acc = coopMatMulAdd(fa, fbb, acc);
+        }
+        barrier();
+    }
+
+    coopMatStore(acc, CtmpF[0], 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+    memoryBarrierShared();
+    barrier();
+    for (int i = int(tid); i < nrow * nt16; i += 64) {
+        int r = i / nt16;
+        int rb = i - r * nt16;
+        outv[uint(r0e + rb) * pc.n_out + uint(row0 + r)] = CtmpF[r][rb] * scale_row[r];
+    }
+}
