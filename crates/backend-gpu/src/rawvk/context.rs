@@ -1000,8 +1000,13 @@ impl VkCtx {
                 }
                 GAP_BY.with(|m| m.borrow_mut().clear());
             }
+            // plans/92 P2 사후: 총계가 wall을 초과한 사례(pp512 2353ms vs 1490ms)가
+            // 있었다 — 스팬(첫~끝 스탬프)을 병기해 집계/페어링 결함을 즉시 드러낸다.
+            let span_ms = if n >= 2 {
+                (buf[n - 1].saturating_sub(buf[0])) as f64 * per / 1e6
+            } else { 0.0 };
             let ns = self.submits.get();
-            eprintln!("[ts] GPU 총 {tot:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
+            eprintln!("[ts] GPU 총 {tot:.1}ms · 스팬 {span_ms:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
             self.submits.set(0);
             let mut v: Vec<_> = agg.into_iter().collect();
             v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
