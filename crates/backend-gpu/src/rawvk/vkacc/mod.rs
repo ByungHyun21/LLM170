@@ -108,6 +108,8 @@ const FN_MOE_TILE_Q51_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51_sg
 const FN_MOE_TILE_Q4K_SG1_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1.spv");
 /// plans/93 P1 — q4_K 순수 스칼라 타일(coopmat 폐지, LDS 스테이징 유지).
 const FN_MOE_TILE_Q4K_SC_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sc.spv");
+/// plans/93 — q4_K MMQ(int8 dot) MoE 타일(BM=64×BN=64).
+const FN_MOE_TILE_Q4K_MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_mmq.spv");
 /// plans/89 재개 — q4_K CM 1-서브그룹 판(엔진 결정적 — q51_sg1로 판명).
 /// plans/89 재개 — q4_K 8-서브블록 스테이징 판(반복/장벽 q51_sg1과 동일).
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
@@ -117,6 +119,8 @@ const FN_IDX_TOPK_MT_SPV: &[u8] = include_bytes!("../spv/fn_idx_topk_mt.spv");
 /// plans/89 재개 — q4_K K-병렬 스칼라 타일(서브그룹 16슬라이스 — ALU 16× 절감).
 const FN_MOE_TILE_Q4K_KP_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_kp.spv");
 /// plans/89 P1.4 — PLE 수학 디바이스 3커널(hip q4_ple_* 포트, 비트 동일 목표).
+/// plans/93 — PLE gate 병렬판(t>1 프리필용).
+const FN_PLE_GATE_MT_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate_mt.spv");
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("../spv/fn_ple_conv.spv");
 const FN_PLE_RES_SPV: &[u8] = include_bytes!("../spv/fn_ple_res.spv");
@@ -206,8 +210,10 @@ pub(crate) enum Slot {
     FnMoeTileQ51Sg1,
     FnMoeTileQ4kSg1,
     FnMoeTileQ4kSc,
+    FnMoeTileQ4kMmq,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
+    FnPleGateMt,
     FnIdxScoreMt,
     FnIdxTopkMt,
     FnMoeTileQ4kKp,
@@ -374,6 +380,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileQ8, "tile_q8", FN_TILE_Q8_SPV, 10, 20),
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
+    (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
     (Slot::FnPleConv, "ple_conv", FN_PLE_CONV_SPV, 4, 20),
     (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
     (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
@@ -389,6 +396,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ51Sg1, "moe_tile_q51_sg1", FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
     (Slot::FnMoeTileQ4kSg1, "moe_tile_q4k_sg1", FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
     (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kMmq, "moe_tile_q4k_mmq", FN_MOE_TILE_Q4K_MMQ_SPV, 13, 28),
     (Slot::FnIdxScoreMt, "idx_score_mt", FN_IDX_SCORE_MT_SPV, 3, 20),
     (Slot::FnIdxTopkMt, "idx_topk_mt", FN_IDX_TOPK_MT_SPV, 3, 20),
     (Slot::FnMoeTileQ4kKp, "moe_tile_q4k_kp", FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
