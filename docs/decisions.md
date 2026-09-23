@@ -1962,3 +1962,19 @@ each requires substantial engineering beyond kernel tweaks.
 The 500 target remains open. Recommended next step: prototype Vulkan
 command buffer recording/replay for the FN chunk (eliminates per-dispatch
 overhead and enables single-submit execution).
+
+### (38b) Wide-K sg1 experiment — barrier hypothesis also negative (2026-09-23)
+
+Increased sg1 K-staging from 2 to 4 sub-blocks (half the barriers per WG,
+LDS 4.4→8.4KB). Result: 209 t/s — SLIGHTLY WORSE than original (215).
+Larger staging reduces occupancy and increases per-barrier wait time.
+
+Six kernel approaches now tested, all converging to 210-220 t/s:
+sg1(coopmat 1-sg) / cm2(K-split) / sc(scalar+LDS) / MMQ(manual int8) /
+MMQ(dotPacked4x8EXT) / sg1-wideK(4-block staging).
+
+Conclusion: the MoE tile kernel is NOT the bottleneck. The bottleneck is
+the TOTAL GPU work (1993ms vs llama ~1010ms) spread across all 2774
+dispatches. Achieving 500 requires reducing total GPU work by ~50%,
+which means matching llama's per-operation efficiency across the entire
+pipeline — not optimizing any single kernel.
