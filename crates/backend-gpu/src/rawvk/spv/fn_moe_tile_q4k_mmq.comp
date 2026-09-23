@@ -1,0 +1,184 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fn_moe_tile_q4k_mmq (plans/93) — llama mul_mmq 스타일 q4_K MoE 타일.
+// BM=64 × BN=64 × BK=32. 256스레드. 스레드당 TM=4행 × TN=4열 = 16출력.
+// 핵심: 가중 니블을 int8로, 활성 q8을 int8으로 스테이징 → int32 dot →
+// k-블록별 f32 스케일 적용 → f32 누산(결정적 고정 순서).
+// 스케일: w = (nib - 8)*d*sc + d*m → Σ(w*x) = Σ_sb [d_B*(d*sc*Σ(nib*b) - d*m*Σ(b))]
+//   여기서 Σ(nib*b)는 이 k-블록의 int dot, Σ(b)는 이 k-블록의 활성 int8 합.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+// packed int8: 4값 per uint — sA[r][w] 하위니블부터 4니블(0-15), sB[rb][w] 4 int8.
+shared uint sA[64][8];         // 가중 니블 packed (each byte = 0-15)
+shared uint sB[64][8];         // 활성 q8 packed (each byte = signed int8)
+shared float sAd[64];          // 이 k-블록의 d*sc (per A row)
+shared float sAm[64];          // 이 k-블록의 d*m (per A row)
+shared float sBd[64];          // 이 k-블록의 활성 d
+shared float sBsum[64];        // 이 k-블록의 활성 Σ(int8)
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tidy = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 64;
+    int nrow = int(min(64u, pc.n_out - uint(row0)));
+    int r0e = int(tidy) * 64;
+    uint rp = rows_pad[0];
+    if (uint(r0e) >= rp) return;
+    uint e = rowexp[uint(r0e)];
+    int nt64 = int(min(64u, rp - uint(r0e)));
+    uint row_words = uint(n_in >> 8) * 36u;
+    uint ebase = e * (pc.per_expert_bytes >> 2);
+
+    // 스레드 매핑: thread_r = tid/16 (0..15), thread_c = tid%16 (0..15).
+    // 출력: (thread_r*4+cr, thread_c*4+cc) — 64×64 커버 ✓.
+    uint thread_r = tid >> 4;
+    uint thread_c = tid & 15u;
+
+    float sums[16];
+    for (int i = 0; i < 16; i++) sums[i] = 0.0;
+
+    for (int sb = 0; sb < n_sub; sb++) {
+        // ── A 스테이징: q4_K → packed 니블 + 스케일. 256스레드 = 64행 × 4워드.
+        {
+            int r = int(tid >> 2);         // 0..63
+            int kw = int(tid & 3);         // 워드 인덱스 0..7의 1/4 (8니블 단위)
+            int row = row0 + r;
+            if (row < row0 + nrow) {
+                uint wq = ebase + uint(row) * row_words + uint(sb >> 3) * 36u;
+                float d = f16_exact(w0c[wq] & 0xFFFFu);
+                float dmin = f16_exact(w0c[wq] >> 16);
+                int it = (sb >> 1) & 3;
+                int hilo = sb & 1;
+                int sj = it * 2 + hilo;
+                uint s_v, m_v;
+                if (sj < 4) {
+                    s_v = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 63u;
+                    m_v = (w0c[wq + 1u + uint((sj + 4) >> 2)] >> uint(((sj + 4) & 3) * 8)) & 63u;
+                } else {
+                    uint sb_lo = (w0c[wq + 1u + uint((sj + 4) >> 2)] >> uint(((sj + 4) & 3) * 8)) & 0xFFu;
+                    uint sb_jm4 = (w0c[wq + 1u + uint((sj - 4) >> 2)] >> uint(((sj - 4) & 3) * 8)) & 0xFFu;
+                    uint sb_j = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 0xFFu;
+                    s_v = (sb_lo & 0xFu) | ((sb_jm4 >> 6) << 4);
+                    m_v = (sb_lo >> 4) | ((sb_j >> 6) << 4);
+                }
+                if (kw == 0) {
+                    sAd[r] = d * float(s_v);
+                    sAm[r] = dmin * float(m_v);
+                }
+                // 8니블을 1 uint로 패킹 (각 바이트 = 0-15)
+                uint packed = 0u;
+                int nib_base = kw * 8;
+                for (int e2 = 0; e2 < 8; e2++) {
+                    int l = nib_base + e2;
+                    uint ql_word = w0c[wq + 4u + uint((it * 32 + l) >> 2)];
+                    uint nib = (ql_word >> uint((((it * 32 + l) & 3) * 8) + (hilo << 2) + ((l & 7) * 4))) & 0xFu;
+                    packed |= nib << uint(e2 * 8);
+                }
+                sA[r][kw] = packed;
+            } else {
+                if (kw == 0) { sAd[r] = 0.0; sAm[r] = 0.0; }
+                sA[r][kw] = 0u;
+            }
+        }
+        // ── B 스테이징: q8 활성 → packed int8 + 스케일.
+        {
+            int rb = int(tid >> 2);
+            int kw = int(tid & 3);
+            if (rb < nt64) {
+                uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+                int xw = sb << 3;
+                float yd = uintBitsToFloat(xq[base + uint((n_in >> 2) + sb)]);
+                int bsum = 0;
+                uint packed = 0u;
+                for (int e2 = 0; e2 < 8; e2++) {
+                    uint wv = xq[base + uint(xw + ((kw * 8 + e2) >> 2))];
+                    int b = int((wv >> uint(((kw * 8 + e2) & 3) * 8)) & 0xFFu) << 24 >> 24;
+                    packed |= uint(b & 0xFFu) << uint(e2 * 8);
+                    bsum += b;
+                }
+                sB[rb][kw] = packed;
+                if (kw == 0) {
+                    sBd[rb] = yd;
+                    sBsum[rb] = float(bsum);
+                }
+            } else {
+                sB[rb][kw] = 0u;
+                if (kw == 0) { sBd[rb] = 0.0; sBsum[rb] = 0.0; }
+            }
+        }
+        memoryBarrierShared();
+        barrier();
+
+        // ── 레지스터 캐시: 이 스레드의 TM=4행 × TN=4열에 필요한 데이터.
+        int regA[4][8];  // packed 니블 워드
+        float regAd[4], regAm[4];
+        int regB[4][8];  // packed q8 워드
+        float regBd[4], regBsum[4];
+        for (int cr = 0; cr < 4; cr++) {
+            int ar = int(thread_r * 4u + uint(cr));
+            regAd[cr] = sAd[ar];
+            regAm[cr] = sAm[ar];
+            for (int w = 0; w < 8; w++) regA[cr][w] = int(sA[ar][w]);
+        }
+        for (int cc = 0; cc < 4; cc++) {
+            int bc = int(thread_c * 4u + uint(cc));
+            regBd[cc] = sBd[bc];
+            regBsum[cc] = sBsum[bc];
+            for (int w = 0; w < 8; w++) regB[cc][w] = int(sB[bc][w]);
+        }
+
+        // ── MMA: TM×TN=16출력. 각 출력 = 32원소 int8 dot → per-block 스케일.
+        for (int cr = 0; cr < 4; cr++) {
+            for (int cc = 0; cc < 4; cc++) {
+                int qsum = 0;
+                for (int w = 0; w < 8; w++) {
+                    int a_word = regA[cr][w];
+                    int b_word = regB[cc][w];
+                    // 4바이트 manual dot
+                    qsum += ((a_word) & 0xFF) * ((b_word) & 0xFF);
+                    qsum += ((a_word >> 8) & 0xFF) * ((b_word >> 8) & 0xFF);
+                    qsum += ((a_word >> 16) & 0xFF) * ((b_word >> 16) & 0xFF);
+                    qsum += ((a_word >> 24) & 0xFF) * ((b_word >> 24) & 0xFF);
+                }
+                // k-블록 스케일: d_B * (d*sc * Σ(nib*b) - d*m * Σ(b))
+                sums[cr * 4 + cc] += regBd[cc] * (regAd[cr] * float(qsum) - regAm[cr] * regBsum[cc]);
+            }
+        }
+        barrier();
+    }
+
+    // ── 드레인.
+    for (int cr = 0; cr < 4; cr++) {
+        int ar = int(thread_r * 4u + uint(cr));
+        if (ar >= nrow) break;
+        for (int cc = 0; cc < 4; cc++) {
+            int bc = int(thread_c * 4u + uint(cc));
+            if (bc >= nt64) break;
+            outv[uint(r0e + bc) * pc.n_out + uint(row0 + ar)] = sums[cr * 4 + cc];
+        }
+    }
+}

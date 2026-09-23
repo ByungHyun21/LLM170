@@ -161,7 +161,9 @@ impl llm170_core::matmul::EwOps for VkAcc {
         let gob = self.fbuf(gate_out)?;
         // (1) gate+방송+그룹 norm.
         {
-            let p = self.pipeline(&mut ctx, Slot::FnPleGate)?;
+            // plans/93: t>1은 병렬판(워프 협업 RMS/dot) — 구판은 lane0 순차.
+            let gate_slot = if t > 1 { Slot::FnPleGateMt } else { Slot::FnPleGate };
+            let p = self.pipeline(&mut ctx, gate_slot)?;
             let ds2 = ctx.bind_ds(&p, &[rb, kb, vb, nkb, nqb, ncb, gb, gob])?;
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
             let mut p16 = eps.to_le_bytes().to_vec();
