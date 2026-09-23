@@ -2,10 +2,13 @@
 #extension GL_KHR_shader_subgroup_basic : require
 
 // rms_norm — HIP rms_part/rms_finish 통합 포트 (f32 세그먼트 누산 + f64 결합).
-// plans/89: 인터리브 로드(레인 u = 원소 i*32+u) — 종전 레인 연속 세그먼트는
-// 인접 레인 주소가 320B 떨어져 트랜잭션 32배 낭비(실측 8GB/s). 산술 클래스
-// 동일(f32 부분합 + 순서 보장 f64 결합), 분할만 변경 — §8 재기록 대상.
-layout(local_size_x = 32) in;
+// plans/89: 인터리브 로드(레인 u = 원소 i*W+u) — 레인 연속 세그면 인접 레인
+// 주소가 멀어 트랜잭션 낭비(실측 8GB/s).
+// plans/92 P4: 32→256스레드/행 — t=512 프리필에서 32스레드판은 16K스레드로
+// 과소 병렬이라 2.7GB/s급(FN 청크 rms 261ms, [ts] FRAME_TIME). 축산
+// 그룹화만 변경(f32 부분합 체인 32→256, f64 순서 결합은 유지) — 값은
+// CPU 미러와 ±ulp, vk-frame-check·게이트로 검증.
+layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer Xbuf { float x[]; };
 layout(binding = 1) readonly buffer Wbuf { float wv[]; };
 layout(binding = 2) buffer Obuf { float outv[]; };
@@ -13,7 +16,7 @@ layout(push_constant) uniform PC {
     uint n; uint t; uint w_reps; float eps;
 } pc;
 
-shared double seg[32];
+shared double seg[256];
 shared float invs;
 
 void main() {
@@ -22,10 +25,10 @@ void main() {
     uint n = pc.n;
     if (row >= pc.t) return;
     int xb = int(row * n);
-    int steps = int((n + 31u) >> 5u);
+    int steps = int((n + 255u) >> 8u);
     float acc = 0.0;
     for (int i = 0; i < steps; i++) {
-        int k = i * 32 + int(u);
+        int k = i * 256 + int(u);
         if (uint(k) < n) {
             float dv = x[xb + k];
             acc += dv * dv;
@@ -35,7 +38,7 @@ void main() {
     barrier();
     if (u == 0u) {
         double sum = 0.0lf;
-        for (int u2 = 0; u2 < 32; u2++) sum += seg[u2];
+        for (int u2 = 0; u2 < 256; u2++) sum += seg[u2];
         float scale32 = float(sqrt(sum / double(n) + double(pc.eps)));
         invs = 1.0 / scale32;
     }
@@ -45,7 +48,7 @@ void main() {
     int wbase = int((row % max(pc.w_reps, 1u)) * pc.n);
     float iv = invs;
     for (int i = 0; i < steps; i++) {
-        int k = i * 32 + int(u);
+        int k = i * 256 + int(u);
         if (uint(k) < n) outv[xb + k] = x[xb + k] * iv * wv[wbase + k];
     }
 }
