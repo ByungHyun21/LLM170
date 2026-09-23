@@ -303,6 +303,9 @@ pub trait EwOps: Send + Sync {
         _conv_out: u64,
         _gate_out: u64,
         _seq: usize,
+        // plans/93 P2: pos 기반 워터마크(역방향 감지). t>1 프리필 디바이스화의
+        // 핵심 — t 기반 판정은 프리필(512)→디코드(1) 전환을 롤백으로 오판했다.
+        _pos0: usize,
         _t: usize,
         _eps: f32,
         _n_embd: usize,
@@ -313,6 +316,12 @@ pub trait EwOps: Send + Sync {
         _host_ring: &[f32],
     ) -> Result<(), String> {
         Err("ple_math_dev: 이 가속기는 미지원".into())
+    }
+
+    /// plans/93 P2 — 디바이스 링 상태 판독(GPU 유휴 시점 호출 전제).
+    /// 프리필 디바이스화 후 엔진 CPU 상태(seq_st.ple_conv) 재동기용.
+    fn ple_ring_sync(&self, _seq: usize, _ring_out: &mut [f32]) -> Result<(), String> {
+        Err("ple_ring_sync: 이 가속기는 미지원".into())
     }
 }
 
