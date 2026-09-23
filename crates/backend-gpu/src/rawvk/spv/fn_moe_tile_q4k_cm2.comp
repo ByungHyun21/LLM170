@@ -1,0 +1,189 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// fn_moe_tile_q4k_cm2 (plans/93 P1) — q4k_cm 의 K-분할 실험판.
+// 가설: RADV 에뮬레이트 coopmat(gfx1151, 원장 32f)의 긴 누산 체인(160 MMA)이
+// 엔진 비결정성 트리거(32b/32c — q51_sg1 n_sub=20 안정 vs q4k 40루프 불안).
+// 누산을 절반씩 2체인으로 분할, 드레인에서 f32 스레드 가산.
+// 산술: cm판 대비 절반 경계에서의 f32 재결합만 추가(±ulp 재배치).
+// 기하·스케일 분리·드레인 계약은 q4k_cm 과 동일.
+layout(local_size_x = 512) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 1) readonly buffer W1 { uint w1c[]; };
+layout(binding = 2) readonly buffer W2 { uint w2c[]; };
+layout(binding = 3) readonly buffer W3 { uint w3c[]; };
+layout(binding = 4) readonly buffer W4 { uint w4c[]; };
+layout(binding = 5) readonly buffer W5 { uint w5c[]; };
+layout(binding = 6) readonly buffer W6 { uint w6c[]; };
+layout(binding = 7) readonly buffer W7 { uint w7c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
+layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
+} pc;
+
+shared float16_t A16[128][68];
+shared float16_t B16[16][68];
+shared float CtmpF[128][34];   // [0..16]=전반, [17..33]=후반 (스트라이드 34)
+shared float scale_row[128];
+
+uint WG(uint idx) {
+    uint c = idx >> 25u;
+    uint o = idx & 0x1FFFFFFu;
+    if (c == 0u) return w0c[o];
+    if (c == 1u) return w1c[o];
+    if (c == 2u) return w2c[o];
+    if (c == 3u) return w3c[o];
+    if (c == 4u) return w4c[o];
+    if (c == 5u) return w5c[o];
+    if (c == 6u) return w6c[o];
+    return w7c[o];
+}
+
+// f16 비트 → f32 정확 변환(서브노멀 포함).
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+void stage_a(int sb, int colb, int row0, int nrow, uint ebase, uint row_words, int tid) {
+    int r = int(tid >> 2);
+    int kc = int(tid & 3) * 8;
+    int row = row0 + r;
+    if (row < row0 + nrow) {
+        uint wq = ebase + uint(row) * row_words + uint(sb >> 3) * 36u;
+        float d = f16_exact(w0c[wq] & 0xFFFFu);
+        float dmin = f16_exact(w0c[wq] >> 16);
+        float inv = 1.0 / scale_row[r];
+        int it = (sb >> 1) & 3;
+        int hilo = sb & 1;
+        int sj = it * 2 + hilo;
+        uint s_v, m_v;
+        if (sj < 4) {
+            s_v = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 63u;
+            uint mb = sj + 4;
+            m_v = (w0c[wq + 1u + uint(mb >> 2)] >> uint((mb & 3) * 8)) & 63u;
+        } else {
+            uint sb_lo = (w0c[wq + 1u + uint((sj + 4) >> 2)] >> uint(((sj + 4) & 3) * 8)) & 0xFFu;
+            uint sb_jm4 = (w0c[wq + 1u + uint((sj - 4) >> 2)] >> uint(((sj - 4) & 3) * 8)) & 0xFFu;
+            uint sb_j = (w0c[wq + 1u + uint(sj >> 2)] >> uint((sj & 3) * 8)) & 0xFFu;
+            s_v = (sb_lo & 0xFu) | ((sb_jm4 >> 6) << 4);
+            m_v = (sb_lo >> 4) | ((sb_j >> 6) << 4);
+        }
+        float ds0 = d * float(s_v) * inv;
+        float ds1 = dmin * float(m_v) * inv;
+        for (int e = 0; e < 8; e++) {
+            int l = kc + e;
+            uint qv = w0c[wq + 4u + uint((it * 32 + l) >> 2)];
+            uint nib = (qv >> uint((((it * 32 + l) & 3) * 8) + (hilo << 2))) & 0xFu;
+            A16[r][colb + l] = float16_t(float(nib) * ds0 - ds1);
+        }
+    } else {
+        for (int e = 0; e < 8; e++) A16[r][colb + kc + e] = float16_t(0.0);
+    }
+}
+
+void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
+    int rb = int(tid >> 5);
+    int k2 = int(tid & 31);
+    if (live && rb < nt16) {
+        uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+        int xw = sb << 3;
+        float yd = uintBitsToFloat(xq[base + uint((int(pc.n_in) >> 2) + sb)]);
+        uint wv = xq[base + uint(xw + (k2 >> 2))];
+        int b = int((wv >> uint((k2 & 3) * 8)) & 0xFFu) << 24 >> 24;
+        B16[rb][colb + k2] = float16_t(float(b) * yd);
+    } else {
+        B16[rb][colb + k2] = float16_t(0.0);
+    }
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint tidy = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 128;
+    int nrow = int(min(128u, pc.n_out - uint(row0)));
+    int r0e = int(tidy) * 16;
+    uint rp = rows_pad[0];
+    if (uint(r0e) >= rp) return;
+    uint e = rowexp[uint(r0e)];
+    int nt16 = int(min(16u, rp - uint(r0e)));
+    uint row_words = uint(n_in >> 8) * 36u;
+    uint ebase = e * (pc.per_expert_bytes >> 2);
+    if (pc.mode >= 2u) return;   // 진단 프로브는 cm 원판 사용
+
+    // 행별 가중 상한 스케일(q4k_cm 동일 논리).
+    {
+        for (int i = int(tid); i < nrow; i += 512) {
+            uint wq = ebase + uint(row0 + i) * row_words;
+            float mx = 1e-30;
+            for (uint s = 0u; s < (uint(n_in) >> 8); s++) {
+                uint w0 = w0c[wq + s * 36u];
+                float dd = abs(f16_exact(w0 & 0xFFFFu));
+                float dm = abs(f16_exact(w0 >> 16));
+                mx = max(mx, 15.0 * dd + dm);
+            }
+            scale_row[i] = 63.0 * mx;
+        }
+        barrier();
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    int half_sub = ((n_sub + 1) >> 1) & ~1;   // 짝수 정렬(sb 2단계)
+    for (int hf = 0; hf < 2; hf++) {
+        int sb_lo = hf * half_sub;
+        int sb_hi = min(n_sub, sb_lo + half_sub);
+        for (int sb = sb_lo; sb < sb_hi; sb += 2) {
+            stage_a(sb, 0, row0, nrow, ebase, row_words, int(tid));
+            stage_b(sb, 0, true, nt16, int(tid), r0e);
+            bool live2 = sb + 1 < sb_hi;
+            stage_a(sb + 1, 32, row0, nrow, ebase, row_words, int(tid));
+            stage_b(sb + 1, 32, live2, nt16, int(tid), r0e);
+            memoryBarrierShared();
+            barrier();
+            for (int ks = 0; ks < 4; ks++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa;
+                coopMatLoad(fa, A16[sg << 4], ks * 16, 68, gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fbb;
+                coopMatLoad(fbb, B16[0], ks * 16, 68, gl_CooperativeMatrixLayoutColumnMajor);
+                if (hf == 0) {
+                    acc = coopMatMulAdd(fa, fbb, acc);
+                } else {
+                    acc2 = coopMatMulAdd(fa, fbb, acc2);
+                }
+            }
+            barrier();
+        }
+    }
+
+    // 드레인: 두 체인을 CtmpF 좌/우 열에 f32 저장 후 스레드 가산 → yg×scale.
+    coopMatStore(acc, CtmpF[sg << 4], 0, 34, gl_CooperativeMatrixLayoutRowMajor);
+    memoryBarrierShared();
+    barrier();
+    coopMatStore(acc2, CtmpF[sg << 4], 17, 34, gl_CooperativeMatrixLayoutRowMajor);
+    memoryBarrierShared();
+    barrier();
+    for (int i = int(tid); i < nrow * nt16; i += 512) {
+        int r = i / nt16;
+        int rb = i - r * nt16;
+        outv[uint(r0e + rb) * pc.n_out + uint(row0 + r)] =
+            (CtmpF[r][rb] + CtmpF[r][17 + rb]) * scale_row[r];
+    }
+}
