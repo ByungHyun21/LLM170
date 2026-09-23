@@ -31,7 +31,7 @@ uvec4 unpk8(uint x) {
 
 shared float sccache[2][4][16];
 uint csel = 0u;
-float accv[2][4];
+float accv[4][4];
 
 void calc_superblock(const uint bbase, const uint itid, const uint ix,
                      const uint ql_offset, const uint qh_offset, const uint s_offset,
@@ -39,7 +39,7 @@ void calc_superblock(const uint bbase, const uint itid, const uint ix,
                      const uint first_row, const uint num_rows, const bool all_threads,
                      const uint tk) {
     const uint y_idx = bbase + i * 256u + y_offset;
-    [[unroll]] for (uint n = 0u; n < 2u; n++) {
+    [[unroll]] for (uint n = 0u; n < 4u; n++) {
         if (n >= num_rows) break;
         csel ^= 1u;
         const uint ib = (first_row + n) * num_blocks + i;
@@ -86,9 +86,10 @@ void calc_superblock(const uint bbase, const uint itid, const uint ix,
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint first_row = 2u * gl_WorkGroupID.y;
-    uint num_rows = 2u;
-    if (first_row + 2u > pc.n_out) {
+    const uint nrows = min(uint(pc.rpf), 4u);   // plans/92 P6: rpf=4 정식 지원
+    const uint first_row = nrows * gl_WorkGroupID.y;
+    uint num_rows = nrows;
+    if (first_row + nrows > pc.n_out) {
         if (first_row >= pc.n_out) return;
         num_rows = pc.n_out - first_row;
     }
@@ -103,7 +104,7 @@ void main() {
     const uint qh_offset = 32u * v_im + l0;
     const uint s_offset = 8u * v_im + is;
     const uint y_offset = 128u * v_im + l0;
-    [[unroll]] for (uint n = 0u; n < 2u; n++)
+    [[unroll]] for (uint n = 0u; n < 4u; n++)
         [[unroll]] for (uint tk = 0u; tk < 4u; tk++) accv[n][tk] = 0.0;
 
     const uint it_size = 4u;
@@ -122,9 +123,13 @@ void main() {
         if (tk >= pc.t) continue;
         const float r0 = subgroupAdd(accv[0][tk]);
         const float r1 = num_rows > 1u ? subgroupAdd(accv[1][tk]) : 0.0;
+        const float r2 = num_rows > 2u ? subgroupAdd(accv[2][tk]) : 0.0;
+        const float r3 = num_rows > 3u ? subgroupAdd(accv[3][tk]) : 0.0;
         if (tid == 0u) {
             outv[tk * pc.n_out + first_row] = r0;
             if (num_rows > 1u) outv[tk * pc.n_out + first_row + 1u] = r1;
+            if (num_rows > 2u) outv[tk * pc.n_out + first_row + 2u] = r2;
+            if (num_rows > 3u) outv[tk * pc.n_out + first_row + 3u] = r3;
         }
     }
 }
