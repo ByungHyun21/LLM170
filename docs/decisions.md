@@ -1819,3 +1819,30 @@ take the f32 subset). FN tg128@8k 15.01 → 15.24 t/s; FN gate stream
 unchanged (bit-identical row arithmetic). The measured correction to the
 P3 diagnosis: mm_f32b's 288 launches were only ~2–4 ms of GPU time — the
 step's real GPU mass is gemv8_q8b (24 ms of genuine weight reads).
+
+### (35) perf-92 ledger: flash/rms restructuring, constant residency, protocol repair (plans/92, 2026-09-23)
+
+Five verified wins: tile128 single-dispatch (arithmetic-preserving, L2
+partial), qsa_flash_reg register-resident prefill flash (hip wk16
+structure; the gq plate's 61KB LDS/WG pinned occupancy to 1 WG/CU —
+attention was the real long-ctx growth, not the "chunk boundary"),
+rms 256 threads/row, hip per-layer constant upload maps (the 2.55ms x12
+post-q4_idx_bk_update stall was a hash-slot thrash sync-drain, not a
+deadlock), np bench/greedy protocol repairs + token_embd mmap dequant
+(2.5GB resident copy removed).
+
+Two diagnostics corrections with evidence: (a) the plans/92 survey's
+"580ms unattributed host boundary" was an [ts] aggregation artifact —
+[pfck] rec/wait split shows 1.8ms/1437ms; the [ts] reporter now prints
+the stamp span to make such overcounts self-evident; (b) the hip np
+greedy "19.9" cell was a bench-protocol flaw (slot-0 carryover ->
+partial EOS -> act.retain t=4->2); repaired cell reads 33.20.
+
+Closed negative: MoE-cm default promotion (race reproduced 3/3, per
+(32b)/(32c) RADV subgroup scheduling); hip dual warp-plate q8 GEMV
+(n_sub-scoped advantage, gate+perf regressed, fully reverted). Open
+leads with owners' evidence: np agg host-side 29ms/step outside
+step_batch_np; hip np batch-vs-sequential seq3 divergence (pre-existing
+at 5d3fae5, same tokens); FN PLE prefill host bridge (t>1
+ple_math_dev gated by ring-state authority — needs pos-aware rewind or
+engine ring readback design).
