@@ -2,6 +2,37 @@
 
 use super::*;
 
+
+/// plans/93 — F32 바이트 → GGUF Q8_0 (f16 스케일 + 32×i8, 34B/블록).
+/// tile_q8128 커널이 기대하는 표준 레이아웃. 꼬리 블록 남은 원소는 0 패딩.
+fn f32_to_q8_0_bytes(data: &[u8], n_elem: usize) -> Vec<u8> {
+    let xf: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_elem) };
+    let blocks = n_elem.div_ceil(32);
+    let mut out = Vec::with_capacity(blocks * 34);
+    for b in 0..blocks {
+        let lo = b * 32;
+        let hi = (lo + 32).min(n_elem);
+        let mut amax = 0.0f32;
+        for &v in &xf[lo..hi] {
+            amax = amax.max(v.abs());
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        // f16 인코딩 (ggml 규약: round-to-nearest-even 비트 절단)
+        let dbits = d.to_bits();
+        let f16 = (((dbits >> 16) as u32 & 0x8000)
+            | (((dbits >> 23) as u32 & 0xFF).saturating_sub(112) as u32) << 10
+            | ((dbits >> 13) as u32 & 0x3FF)) as u16;
+        out.extend_from_slice(&f16.to_le_bytes());
+        let mut pad = [0i8; 32];
+        for (j, &v) in xf[lo..hi].iter().enumerate() {
+            pad[j] = ((v * id).round()).clamp(-127.0, 127.0) as i8;
+        }
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(pad.as_ptr() as *const u8, 32) });
+    }
+    out
+}
+
 impl llm170_core::matmul::FrameHost for VkAcc {
     fn ktrace_tick(&self) {
         self.ts_tick();
@@ -181,6 +212,36 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         self.frame_mm_group(x, std::slice::from_ref(w), &[out], t)
     }
     fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+        // plans/93: F32 가중 → Q8_0 로드 시 변환(env 게이트 LLM170_F32Q8=1).
+        // tile_f32 347ms → tile_q8128 경로(~115ms): 가중 판독 4× 절감.
+        // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
+        let do_f32q8 = std::env::var("LLM170_F32Q8").map(|v| v == "1").unwrap_or(false)
+            && ws.iter().any(|w| w.ty == llm170_gguf::GgmlType::F32);
+        let conv_owned: Vec<Vec<u8>> = if do_f32q8 {
+            ws.iter()
+                .map(|w| {
+                    if w.ty == llm170_gguf::GgmlType::F32 {
+                        f32_to_q8_0_bytes(w.data, (w.n_in * w.n_out) as usize)
+                    } else {
+                        Vec::new() // 비-F32: 원본 사용 표시
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let rebuilt: Vec<Weight> = conv_owned
+            .iter()
+            .zip(ws.iter())
+            .map(|(c, w)| {
+                if c.is_empty() {
+                    Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out }
+                } else {
+                    Weight { data: c.as_slice(), ty: llm170_gguf::GgmlType::Q8_0, n_in: w.n_in, n_out: w.n_out }
+                }
+            })
+            .collect();
+        let ws: &[Weight] = if do_f32q8 { &rebuilt } else { ws };
         let n_in = ws[0].n_in as usize;
         let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
