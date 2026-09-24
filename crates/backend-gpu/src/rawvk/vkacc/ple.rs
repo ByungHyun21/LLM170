@@ -189,6 +189,56 @@ impl llm170_core::matmul::EwOps for VkAcc {
         Ok(())
     }
 
+
+    /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL 테이블).
+    /// CPU MT 59ms(t=512) → GPU ~0.3ms. 테이블은 wcache(283MB)로 1회 상주.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gather_dev(
+        &self,
+        table_key: usize,      // 테이블 ptr (캐시 키)
+        table: &[u8],          // 테이블 원본 바이트
+        rows: &[u32],          // 수집할 행 (heads*t)
+        out: u64,              // 출력 프레임 핸들
+        hd: usize,             // ple_head_dim
+    ) -> Result<(), String> {
+        let nrows = rows.len();
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        // 테이블 업로드(1회) — weight_bufs 재사용 대신 경량 전용 캐시.
+        let tbl = {
+            let key = (table_key, table.len());
+            let mut c = self.ple_consts.lock();
+            if let Some(b) = c.get(&key) {
+                b.buf
+            } else {
+                let b = ctx.alloc_host(table.len())?;
+                unsafe { std::ptr::copy_nonoverlapping(table.as_ptr(), b.ptr, table.len()) };
+                let buf = b.buf;
+                c.insert(key, b);
+                buf
+            }
+        };
+        // rows 업로드 — 매 청크. 
+        let rb = {
+            let key = (rows.as_ptr() as usize, 0);
+            let mut c = self.ple_consts.lock();
+            c.remove(&key);  // 이전 것 제거
+            let b = ctx.alloc_host(rows.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(rows.as_ptr() as *const u8, b.ptr, rows.len() * 4) };
+            let buf = b.buf;
+            c.insert(key, b);
+            buf
+        };
+        let ob = self.fbuf(out)?;
+        let p = self.pipeline(&mut ctx, Slot::FnPleGather)?;
+        let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
+        let push = push_u32s(&[hd as u32, nrows as u32]);
+        let blocks_per_row = (hd + 31) / 32;
+        let total = nrows * blocks_per_row;
+        ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
+        Ok(())
+    }
+
     /// plans/93 P2 — 디바이스 링 → 엔진 CPU 상태 재동기(GPU 유휴 시점 전제).
     fn ple_ring_sync(&self, seq: usize, ring_out: &mut [f32]) -> Result<(), String> {
         let m = self.ple_rings.lock();   // parking_lot 계열 — Result 아님
