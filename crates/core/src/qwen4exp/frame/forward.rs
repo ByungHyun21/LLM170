@@ -147,15 +147,55 @@ pub(super) fn frame_forward_ex(
             let mut ple_dev_done = false;
             // plans/93: t>1 디바이스 PLE — 병렬 gate로도 값 오류 지속(원장 36).
             // conv/res의 t>1 링/잔차 경로에 별도 결함 추정. t=1만 디바이스.
-            if t == 1 && std::env::var_os("LLM170_PLE_HOST").is_none() {
+            if std::env::var_os("LLM170_PLE_HOST").is_none() {
                 let heads = hp.ple_heads_per_ngram * 2;
                 let emb_w = heads * hp.ple_head_dim * t;
                 let mut emb = vec![0.0f32; emb_w];
                 if ple_rows.len() == heads * t {
-                    if let Err(e) = ctx.model.ple_gather(&ple_rows, &mut emb) {
+                    let _pg0 = std::time::Instant::now();
+                    // plans/93: 멀티스레드 gather — ple_block과 동일 병렬화.
+                    // 싱글스레드 ple_gather는 693ms(t=512), 8스레드로 ~90ms.
+                    let gather_mt = |_emb: &mut [f32]| -> Result<(), Q4Error> {
+                        let (tptr, tlen, tty, thd) = ctx.model.ple_table_view()?;
+                        let tdata: &[u8] =
+                            unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
+                        let nt = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                            .min(t)
+                            .min(32);
+                        let per = t.div_ceil(nt);
+                        let emb_w = heads * hp.ple_head_dim;
+                        let rows = &ple_rows;
+                        std::thread::scope(|sc| {
+                            let mut rest: &mut [f32] = _emb;
+                            let mut base = 0usize;
+                            while base < t {
+                                let take = per.min(t - base);
+                                let (head, tail) = rest.split_at_mut(take * emb_w);
+                                rest = tail;
+                                let b = base;
+                                sc.spawn(move || {
+                                    for i in 0..take {
+                                        let r = &rows[(b + i) * heads..(b + i + 1) * heads];
+                                        crate::qwen4exp::ple_gather_parts(
+                                            tdata, tty, thd, r,
+                                            &mut head[i * emb_w..(i + 1) * emb_w],
+                                        );
+                                    }
+                                });
+                                base += take;
+                            }
+                        });
+                        Ok(())
+                    };
+                    if let Err(e) = gather_mt(&mut emb) {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})"));
                     } else {
+                    if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                        eprintln!("# ple-gather t={t} elapsed={:.1}ms", _pg0.elapsed().as_secs_f64()*1e3);
+                    }
                     let mut pre_capture = Vec::new();
                     if std::env::var_os("LLM170_PLE_CHECK").is_some() {
                         // 그림자용 PLE 직전 res_hc(레이어 0 출력) 판독 — 동기 1회.
@@ -168,6 +208,7 @@ pub(super) fn frame_forward_ex(
                 let nq = model.f32_vec4(&format!("blk.{il}.ple_norm_query.weight"))?;
                 let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
                 let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
+                let _pd0 = std::time::Instant::now();
                 let r = acc
                     .frame_write(f.ple_emb, &emb)
                     .map_err(|e| e.to_string())
@@ -184,10 +225,16 @@ pub(super) fn frame_forward_ex(
                             (hp.ple_conv_k - 1) * hp.ple_ngram, &seq_st.ple_conv,
                         )
                     });
+                if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                    eprintln!("# ple-dev-sec L{il} t={t} elapsed={:.1}ms", _pd0.elapsed().as_secs_f64()*1e3);
+                }
                 match r {
                     Ok(()) => {
                         ple_dev_done = true;
                         ple_dev = true;
+                        if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                            eprintln!("# ple-dev OK L{il} t={t}");
+                        }
                         if std::env::var_os("LLM170_PLE_CHECK").is_some() {
                             super::diag::ple_check_shadow(acc, f, ctx, model, seq_st, il, &emb, &ple_rows, &pre_capture, hc, n, t)?;
                         }
