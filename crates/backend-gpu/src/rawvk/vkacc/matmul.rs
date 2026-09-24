@@ -217,20 +217,31 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
         let do_f32q8 = std::env::var("LLM170_F32Q8").map(|v| v == "1").unwrap_or(false)
             && ws.iter().any(|w| w.ty == llm170_gguf::GgmlType::F32);
-        let conv_owned: Vec<Vec<u8>> = if do_f32q8 {
+        // plans/93: 변환 캐시 — 가중(ptr,len)마다 1회 변환, 이후 Arc 클론.
+        // 소유권: Arc<Vec<u8>>가 살아있는 동안 슬라이스 유효 (conv_arcs가 보유).
+        let conv_arcs: Vec<std::sync::Arc<Vec<u8>>> = if do_f32q8 {
+            let mut cache = self.f32q8_cache.lock();
             ws.iter()
                 .map(|w| {
-                    if w.ty == llm170_gguf::GgmlType::F32 {
-                        f32_to_q8_0_bytes(w.data, (w.n_in * w.n_out) as usize)
-                    } else {
-                        Vec::new() // 비-F32: 원본 사용 표시
+                    if w.ty != llm170_gguf::GgmlType::F32 {
+                        return std::sync::Arc::new(Vec::new());
                     }
+                    let key = (w.data.as_ptr() as usize, w.data.len());
+                    cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(f32_to_q8_0_bytes(
+                                w.data,
+                                (w.n_in * w.n_out) as usize,
+                            ))
+                        })
+                        .clone()
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        let rebuilt: Vec<Weight> = conv_owned
+        let rebuilt: Vec<Weight> = conv_arcs
             .iter()
             .zip(ws.iter())
             .map(|(c, w)| {
