@@ -1,0 +1,5 @@
+=== 통합 재시도 Fri Sep 25 02:36:46 AM KST 2026 ===
+[F32Q8] t=7 성공 (시도 3)
+[F32Q8] pp512:
+Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf[gpu:vulkan] | pp512 gpu | rep0 |   1890.7 ms |  270.80 t/s
+=== 종료 Fri Sep 25 02:38:02 AM KST 2026 ===
