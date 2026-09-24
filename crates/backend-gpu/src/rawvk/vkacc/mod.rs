@@ -288,6 +288,8 @@ pub struct VkAcc {
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크 t).
     /// plans/93: MoE gate→up 배리어 스킵 — 독립 GEMM 병렬 실행.
     pub(crate) moe_nobar: std::sync::atomic::AtomicBool,
+    /// plans/93: F32→Q8_0 변환 캐시(가중 ptr, len 키) — 청크마다 재변환 방지.
+    pub(crate) f32q8_cache: Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
     /// plans/89 P1.4 — PLE 상수 캐시: (ptr,len) → 버퍼(모델 가중 뷰라 안정).
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
@@ -488,6 +490,7 @@ impl VkAcc {
             moe_gen: std::sync::atomic::AtomicU64::new(0),
             moe_grp: Mutex::new(None),
             moe_nobar: std::sync::atomic::AtomicBool::new(false),
+            f32q8_cache: Mutex::new(std::collections::HashMap::new()),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
         })
