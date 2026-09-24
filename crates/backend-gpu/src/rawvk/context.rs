@@ -52,6 +52,10 @@ pub struct VkCtx {
     pub ts: Option<TsProf>,
     pub ts_period_val: f64,
     pub nobar_next: std::cell::Cell<bool>,
+    /// plans/93: 커맨드 버퍼 재생 모드 — true면 begin_batch/run을 스킵하고 end_batch_wait만 제출.
+    pub replay_mode: std::cell::Cell<bool>,
+    /// plans/93: 커맨드 버퍼 녹화 완료 플래그(재생 모드 진입 판정).
+    pub batch_recorded: std::cell::Cell<bool>,
     /// plans/88 P1 — 제출(큐 submit) 횟수 카운터: 스텝 배치가 실제로 묶고
     /// 있는지 [ts] 보고에 노출. 비배치 run 1회 = 제출 1회.
     pub submits: std::cell::Cell<u64>,
@@ -272,6 +276,8 @@ impl VkCtx {
                 ts,
                 ts_period_val,
                 nobar_next: std::cell::Cell::new(false),
+                replay_mode: std::cell::Cell::new(false),
+                batch_recorded: std::cell::Cell::new(false),
             })
         }
     }
@@ -346,6 +352,18 @@ impl VkCtx {
 
     /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
     pub fn begin_batch(&mut self) -> Result<(), String> {
+        // plans/93: 재생 모드 — 이미 녹화된 커맨드 버퍼를 재제출(스킵).
+        if self.replay_mode.get() {
+            return Ok(());
+        }
+        // plans/93: 녹화 완료 버퍼 재생(옵트인) — 첫 청크 이후 스킵.
+        // 청크 간 파라미터 불변(FN 프리필: pos 무관 커널 99.6%).
+        if std::env::var("LLM170_VK_REPLAY").map(|v| v == "1").unwrap_or(false)
+            && self.batch_recorded.get()
+        {
+            self.replay_mode.set(true);
+            return Ok(());
+        }
         // plans/88 P1 — 멱등: 이미 배치 중이면 재시작하지 않는다(녹화 중이던
         // 커맨드 유지). 스텝 수준 배치와 경로 내부 begin_batch의 중첩용.
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
@@ -362,7 +380,7 @@ impl VkCtx {
                 .begin_command_buffer(
                     self.cmdbuf2,
                     &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                        // plans/93: ONE_TIME_SUBMIT 제거 — 재생 모드에서 재제출 가능.
                 )
                 .map_err(|e| format!("시작2: {e:?}"))?;
         }
@@ -377,9 +395,13 @@ impl VkCtx {
             self.device.reset_fences(&[self.fence]).map_err(|e| format!("펜스: {e:?}"))?;
             let cbs = [self.cmdbuf2];
             let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            let _sub0 = std::time::Instant::now();
             self.device.queue_submit(self.queue, &[si], self.fence).map_err(|e| format!("제출2: {e:?}"))?;
+            SUBMIT_US.with(|c| c.set(c.get() + _sub0.elapsed().as_micros() as u64));
+            let _wt0 = std::time::Instant::now();
             self.submits.set(self.submits.get() + 1);
             self.device.wait_for_fences(&[self.fence], true, u64::MAX).map_err(|e| format!("대기2: {e:?}"))?;
+            WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
             if let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
                 if !sets.is_empty() {
@@ -392,30 +414,55 @@ impl VkCtx {
 
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
+        if std::env::var_os("LLM170_VK_RUNTIME").is_some() {
+            RUN_US.with(|c| {
+                let us = c.get();
+                let n = RUN_N.with(|c| c.get());
+                if n > 0 {
+                    let wus = WAIT_US.with(|c| c.replace(0));
+                    let sus = SUBMIT_US.with(|c| c.replace(0));
+                    eprintln!("[run-time] 녹화 {us}µs/{n}회={:.1}µs/회 제출={sus}µs 대기={wus}µs", us as f64 / n as f64);
+                    c.set(0);
+                    RUN_N.with(|c| c.set(0));
+                }
+            });
+        }
         if std::env::var_os("LLM170_VK_FLUSHDBG").is_some() {
             eprintln!("[flush] op={}", crate::rawvk::context::site::tag());
         }
+        let replaying = self.replay_mode.get();
         self.batching.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            self.device
-                .end_command_buffer(self.cmdbuf2)
-                .map_err(|e| format!("종료2: {e:?}"))?;
+            if !replaying {
+                self.device
+                    .end_command_buffer(self.cmdbuf2)
+                    .map_err(|e| format!("종료2: {e:?}"))?;
+                self.batch_recorded.set(true);
+            } else {
+                self.replay_mode.set(false);  // 재생 완료 → 다음 호출에서 재판정
+            }
             self.device
                 .reset_fences(&[self.fence])
                 .map_err(|e| format!("펜스 리셋: {e:?}"))?;
             let cbs = [self.cmdbuf2];
             let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            let _sub0 = std::time::Instant::now();
             self.device
                 .queue_submit(self.queue, &[si], self.fence)
                 .map_err(|e| format!("제출2: {e:?}"))?;
+            SUBMIT_US.with(|c| c.set(c.get() + _sub0.elapsed().as_micros() as u64));
+            let _wt0 = std::time::Instant::now();
             self.device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .map_err(|e| format!("대기2: {e:?}"))?;
-            // 배치 세트 전량 해제 (풀 재사용)
-            if let Some((_, pool)) = self.batch_pool.get() {
-                let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
-                if !sets.is_empty() {
-                    let _ = self.device.free_descriptor_sets(pool, &sets);
+            WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
+            // 배치 세트 전량 해제 (풀 재사용) — 재생 모드에서는 참조 유지.
+            if !replaying {
+                if let Some((_, pool)) = self.batch_pool.get() {
+                    let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
+                    if !sets.is_empty() {
+                        let _ = self.device.free_descriptor_sets(pool, &sets);
+                    }
                 }
             }
         }
@@ -827,6 +874,10 @@ impl VkCtx {
             ts.labels.borrow_mut().push(tag.to_string());
         }
         unsafe {
+            // plans/93: 재생 모드 — 이미 녹화됨, 커맨드 버퍼 쓰기 스킵.
+            if self.replay_mode.get() {
+                return Ok(());
+            }
             if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
                 self.device
                     .reset_command_buffer(
@@ -847,6 +898,7 @@ impl VkCtx {
             } else {
                 self.cmdbuf
             };
+            let _t0 = std::time::Instant::now();
             self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipe);
             self.device.cmd_bind_descriptor_sets(
                 cb,
@@ -885,6 +937,8 @@ impl VkCtx {
                 );
             }
             self.ts_stamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+            RUN_US.with(|c| c.set(c.get() + _t0.elapsed().as_micros() as u64));
+            RUN_N.with(|c| c.set(c.get() + 1));
             if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
                 self.device
                     .end_command_buffer(self.cmdbuf)
@@ -1083,6 +1137,13 @@ impl VkCtx {
 thread_local! {
     static DSC_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+thread_local! {
+    /// plans/93: run() 순수 녹화 시간 누적(µs) — 호스트 병목 국소화.
+    pub static RUN_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static RUN_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static SUBMIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
     pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
             let key = (
@@ -1125,6 +1186,13 @@ thread_local! {
 
 thread_local! {
     static DSC_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    /// plans/93: run() 순수 녹화 시간 누적(µs) — 호스트 병목 국소화.
+    pub static RUN_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static RUN_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static SUBMIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 
