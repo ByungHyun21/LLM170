@@ -1,0 +1,65 @@
+#version 450
+
+// fn_ple_gather (plans/93) — PLE 임베딩 테이블(IQ4_NL) GPU gather.
+// CPU MT gather 59ms(t=512) → GPU 수백 µs. 테이블은 weight_bufs로 상주.
+// IQ4_NL 블록: 32원소, 18바이트 = f16 d(2B) + qs(16B, 4bit LUT 인덱스).
+// y[j] = d·kvalues[qs[j]&0xF] (j<16), y[16+j] = d·kvalues[qs[j]>>4].
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer RowsB { uint rows[]; };
+layout(binding = 1) readonly buffer TableB { uint w[]; };
+layout(binding = 2) writeonly buffer EmbB { float emb[]; };
+layout(push_constant) uniform PC {
+    uint hd;        // 행 원소수 (ple_head_dim)
+    uint nrows;     // 총 행수 (heads*t)
+} pc;
+
+const float kv[16] = float[16](
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+    1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
+);
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint blocks_per_row = (pc.hd + 31u) / 32u;
+    uint row = gid / blocks_per_row;
+    uint blk = gid % blocks_per_row;
+    if (row >= pc.nrows) return;
+    uint src = rows[row];
+    // 블록 바이트 오프셋 = (src*blocks_per_row + blk) * 18
+    uint boff = (src * blocks_per_row + blk) * 18u;
+    uint wbase = boff >> 2;
+    uint shift = (boff & 3u) * 8u;
+    uint a = w[wbase];
+    uint b = w[wbase + 1u];
+    // f16 d가 바이트 경계에 걸림 — 2바이트 조립.
+    float d = f16_exact(shift == 0u ? (a & 0xFFFFu)
+                                    : ((a >> shift) | (b << (32u - shift))) & 0xFFFFu);
+    // qs 16바이트 = boff+2부터 연속. 5-워드 판독 후 시프트 조립.
+    uint qoff = boff + 2u;
+    uint qw = qoff >> 2;
+    uint qs = (qoff & 3u) * 8u;
+    uint q0 = w[qw], q1 = w[qw+1u], q2 = w[qw+2u], q3 = w[qw+3u], q4 = w[qw+4u];
+    uint b0 = (q0 >> qs) | (qs > 0u ? (q1 << (32u - qs)) : 0u);
+    uint b1 = (q1 >> qs) | (qs > 0u ? (q2 << (32u - qs)) : 0u);
+    uint b2 = (q2 >> qs) | (qs > 0u ? (q3 << (32u - qs)) : 0u);
+    uint b3 = (q3 >> qs) | (qs > 0u ? (q4 << (32u - qs)) : 0u);
+    uint obase = row * pc.hd + blk * 32u;
+    // j=0..15: lo니블→y[j], hi니블→y[16+j]
+    for (uint j = 0u; j < 16u; j++) {
+        uint q;
+        if (j < 4u) q = (b0 >> (j*8u)) & 0xFFu;
+        else if (j < 8u) q = (b1 >> ((j-4u)*8u)) & 0xFFu;
+        else if (j < 12u) q = (b2 >> ((j-8u)*8u)) & 0xFFu;
+        else q = (b3 >> ((j-12u)*8u)) & 0xFFu;
+        emb[obase + j] = kv[q & 0xFu] * d;
+        emb[obase + 16u + j] = kv[q >> 4u] * d;
+    }
+}

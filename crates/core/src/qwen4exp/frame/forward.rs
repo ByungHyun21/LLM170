@@ -153,6 +153,29 @@ pub(super) fn frame_forward_ex(
                 let mut emb = vec![0.0f32; emb_w];
                 if ple_rows.len() == heads * t {
                     let _pg0 = std::time::Instant::now();
+                    // plans/93: GPU gather 우선 — IQ4_NL 테이블 상주 + 커널.
+                    // CPU MT(59ms) 대비 ~200×. 폴백은 CPU MT.
+                    let gpu_gather_ok = if std::env::var_os("LLM170_PLE_GGPU").is_none() {
+                        false
+                    } else {
+                        match (|| -> Result<(), Q4Error> {
+                            let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
+                            let tdata: &[u8] = unsafe {
+                                std::slice::from_raw_parts(tptr as *const u8, tlen)
+                            };
+                            acc.ple_gather_dev(tptr, tdata, &ple_rows, f.ple_emb, thd)
+                                .map_err(Q4Error::Io)
+                        })() {
+                            Ok(()) => true,
+                            Err(e) => {
+                                static ONCE: std::sync::Once = std::sync::Once::new();
+                                ONCE.call_once(|| {
+                                    eprintln!("# ple-ggpu: 실패 — CPU MT 폴백 ({e})")
+                                });
+                                false
+                            }
+                        }
+                    };
                     // plans/93: 멀티스레드 gather — ple_block과 동일 병렬화.
                     // 싱글스레드 ple_gather는 693ms(t=512), 8스레드로 ~90ms.
                     let gather_mt = |_emb: &mut [f32]| -> Result<(), Q4Error> {
@@ -189,7 +212,9 @@ pub(super) fn frame_forward_ex(
                         });
                         Ok(())
                     };
-                    if let Err(e) = gather_mt(&mut emb) {
+                    if gpu_gather_ok {
+                        // GPU가 f.ple_emb를 채움 — CPU emb 스킵.
+                    } else if let Err(e) = gather_mt(&mut emb) {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})"));
                     } else {
@@ -209,9 +234,11 @@ pub(super) fn frame_forward_ex(
                 let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
                 let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
                 let _pd0 = std::time::Instant::now();
-                let r = acc
-                    .frame_write(f.ple_emb, &emb)
-                    .map_err(|e| e.to_string())
+                let r = if gpu_gather_ok {
+                    Ok(())
+                } else {
+                    acc.frame_write(f.ple_emb, &emb).map_err(|e| e.to_string())
+                }
                     .and_then(|_| {
                         acc.frame_mm_group(
                             f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], t,
