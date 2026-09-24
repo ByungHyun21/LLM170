@@ -2028,3 +2028,11 @@ class: Vk object lifetime misuse in the F32→Q8_0 re-route (descriptor/buffer
 reuse), manifesting inside the driver. F32Q8 stays env-gated (default off);
 repro + fix tracked as the open thread in plans/94 — requires model access
 (blocked on fsck).
+
+Resolution (post-fsck, same night): the gate_mt fix holds under real load —
+gate-flash-next 3/3 bit-identical (prefill t=208 exercises device PLE t>1),
+and the device-PLE prefill lever flipped from the earlier negative (154 t/s,
+gate mismatch) to **+10.8%**: pp512 vk 257.23 t/s (device PLE) vs 231.97
+(host bridge). The RADV segfault did not reproduce in 10/10 F32Q8 t=7 runs
+on current HEAD; the crashing build (8c0437b, uncached conversion) is
+superseded by the cached variant — evidence retained, urgency downgraded.
