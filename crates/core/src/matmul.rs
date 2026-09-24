@@ -290,6 +290,18 @@ pub trait EwOps: Send + Sync {
     /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
     /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
     #[allow(clippy::too_many_arguments)]
+    /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL).
+    fn ple_gather_dev(
+        &self,
+        _table_key: usize,
+        _table: &[u8],
+        _rows: &[u32],
+        _out: u64,
+        _hd: usize,
+    ) -> Result<(), String> {
+        Err("ple_gather_dev: 미지원".into())
+    }
+
     fn ple_math_dev(
         &self,
         _res: u64,
