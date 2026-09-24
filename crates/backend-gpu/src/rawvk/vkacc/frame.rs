@@ -445,6 +445,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             };
             ctx.run(p.pl, ds2, p.pipe, &push, gx, gy, 1)?;
+            // plans/93: gate→up 독립 병렬화 — 이 타일이 gate이면 다음(up) 배리어 스킵.
+            if self.moe_nobar.load(std::sync::atomic::Ordering::Relaxed) {
+                ctx.nobar_next.set(true);
+                self.moe_nobar.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             // 산란: out[i] = yg[inv_pad[i]] (행 순서 복원 — SiluMul/wsum 소비).
             let ps = self.pipeline(&mut ctx, Slot::PermuteF32)?;
             let dss = ctx.bind_ds(&ps, &[ygb, ivb, ob])?;
