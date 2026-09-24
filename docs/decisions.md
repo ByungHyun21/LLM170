@@ -1978,3 +1978,42 @@ the TOTAL GPU work (1993ms vs llama ~1010ms) spread across all 2774
 dispatches. Achieving 500 requires reducing total GPU work by ~50%,
 which means matching llama's per-operation efficiency across the entire
 pipeline — not optimizing any single kernel.
+
+### (39) PLE gate_mt shared-memory race — found, fixed, and the ring-carve FS hypothesis falsified (plans/94, 2026-09-25)
+
+The t>1 device-PLE value error (ledger 36, "persists even with the parallel
+gate") was localized by differential analysis of the three PLE kernels against
+the CPU `ple_block` mirror: `fn_ple_conv` and `fn_ple_res` are bounds-exact
+and arithmetically faithful; `fn_ple_gate_mt` had two defects.
+
+1. **Shared-memory consume-reuse race (R1).** After `wg_reduce()`, every wave
+   reads `red[0]` (the reduction result) with no barrier before the next
+   reduction's partials overwrite `red[0]`. Wave 0 can finish its next strided
+   partial-sum loop and clobber `red[0]` before waves 1..3 read it, corrupting
+   `sk`/`sq` and cascading into the gate value `g` used by the residual term
+   `res += value*g + conv_out` (RMS normalization cancels uniform `g` scale in
+   `gated`, but NOT in the residual, so the error surfaces downstream). On an
+   idle GPU the synthetic probe ran 512 reps deterministically — the race needs
+   real-load wave skew, which matches the intermittent real-run failures.
+2. **SSBO write-read round-trip (R2).** `gated` was written, `barrier()`ed,
+   and re-read; GLSL `barrier()` only orders WorkgroupMemory, not storage
+   buffers.
+
+Fix: consume-barriers after each `red[0]` read, and `gated` restructured to be
+register-held (`gv = value*g` feeds the sum-of-squares reduction directly;
+the buffer is written once at the end). Bit-identical arithmetic order, one
+fewer global read+write pass per row.
+
+Verification: new `vk-ple-mt-check` probe (model-free, synthetic LCG inputs,
+two chunks t=13→5 exercising device ring carry): per-stage robust error
+counts all zero (max |Δ| ≤ 1.9e-6 across gated/gate/conv/res/ring), 512/512
+reps bit-deterministic. Lesson: a max-relative-error statistic over
+near-zero elements (first probe version reported 8e-2) is misleading; use
+`|Δ| > 1e-4·(1+|ref|)` significance counts instead.
+
+Separately, the "ring in host-visible system RAM lets a conv OOB reach the
+page cache" theory behind the carve relocation was falsified by the ringfix
+run: with the ring in carve, one pp512 run still flipped the model file to
+ENOENT. Carve placement is retained as defense-in-depth only; the ENOENT
+correlation is not explained by ring placement (FS metadata damage itself
+remains the open suspect — see docs/fs-corruption-incident-2026-09-25.md).
