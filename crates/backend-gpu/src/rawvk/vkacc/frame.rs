@@ -416,7 +416,13 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
                     && std::env::var("LLM170_VK_Q4KSG1F").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1f,
                 (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
-                    && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kSg1,
+                    && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => {
+                        if std::env::var("LLM170_VK_Q4KSG2").map(|v| v == "1").unwrap_or(false) {
+                            Slot::FnMoeTileQ4kSg2
+                        } else {
+                            Slot::FnMoeTileQ4kSg1
+                        }
+                    }
                 (GgmlType::Q4K, _) if wbufs.len() == 1
                     && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kMmq,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
@@ -444,6 +450,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
                 (n_out.div_ceil(64) as u32, bound.div_ceil(64) as u32)
+            } else if matches!(slot, Slot::FnMoeTileQ4kSg2) {
+                // plans/93 sg2: 32행/WG — 가중치 판독 절반.
+                (n_out.div_ceil(16) as u32, bound.div_ceil(32) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ51Sg1 | Slot::FnMoeTileQ4kSg1 | Slot::FnMoeTileQ4kSc | Slot::FnMoeTileQ4kSg1f) {
                 // plans/93: 16열/WG 판 — cm_on 그리드(n_out/128)와 별개.
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
