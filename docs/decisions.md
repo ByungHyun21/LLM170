@@ -2017,3 +2017,14 @@ run: with the ring in carve, one pp512 run still flipped the model file to
 ENOENT. Carve placement is retained as defense-in-depth only; the ENOENT
 correlation is not explained by ring placement (FS metadata damage itself
 remains the open suspect — see docs/fs-corruption-incident-2026-09-25.md).
+
+Follow-up evidence (same night, kernel log): two `llm170` segfaults at
+02:36:56/02:37:06 inside `libvulkan_radeon.so` at the identical IP offset
+(`+0x2672e5`, error 6 — write to unmapped memory), both during opt-in
+`LLM170_F32Q8=1` t=7 infer runs (attempts 1-2 of the combo retry; attempt 3
+succeeded — nondeterministic). These predate the FS flap (patient bench at
+02:27 was clean), so the crash is code-level and FS-independent. Prime suspect
+class: Vk object lifetime misuse in the F32→Q8_0 re-route (descriptor/buffer
+reuse), manifesting inside the driver. F32Q8 stays env-gated (default off);
+repro + fix tracked as the open thread in plans/94 — requires model access
+(blocked on fsck).
