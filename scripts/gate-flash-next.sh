@@ -31,6 +31,8 @@ PROMPT="386,18,15,15,643,20,20,19586,5876,8058,4144,67,21,7307,22,20,23,24902,17
 BASE_FILE=scripts/.gate-flash-baseline$([[ "$RUNTIME" == vulkan ]] && echo -vk || echo "").txt
 
 [[ -f "$MODEL" ]] || { echo "모델 없음: $MODEL (LLM170_MFLASH로 지정)"; exit 2; }
+# plans/93: FS 프리플라이트 — inode 손상(벤치마크 I/O + GPU fault 유발) 재발 방지.
+"$(dirname "$0")/fs-preflight.sh" "$MODEL" --strict || exit 2
 
 if [[ "${1:-}" == "--record" ]]; then
     ./target/release/llm170 infer --model "$MODEL" --prompt-tokens "$PROMPT" \
