@@ -85,6 +85,10 @@ void main() {
     red[lid] = ksq_part;
     wg_reduce();
     float sk = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
+    // plans/94 R1: red[0] 소비(위 판독) 완료를 전 웨이브가 확인한 뒤에만
+    // red 슬롯 재사용 — 소비-재사용 사이 배리어 없으면 wave0이 다음 축소
+    // 부분합을 red[0]에 먼저 써서 늦은 웨이브의 sk/sq를 오염(간헐 값 오류).
+    barrier();
 
     // ── RMS(res) — 동일 구조.
     float rsq_part = 0.0;
@@ -95,6 +99,7 @@ void main() {
     red[lid] = rsq_part;
     wg_reduce();
     float sq = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
+    barrier();
 
     // ── dot: (key*sk*nk) · (res*sq*nq) — 스트라이드 + 공유 트리.
     float dot_part = 0.0;
@@ -106,6 +111,7 @@ void main() {
     red[lid] = dot_part;
     wg_reduce();
     float dotv = red[0] / sqrt(float(n));
+    barrier();
 
     // ── gate — 레인 0만 기록 (스칼라).
     float mag = max(abs(dotv), 1e-6);
@@ -114,24 +120,22 @@ void main() {
         gate_out[uint(ti) * pc.hc + uint(s)] = g;
     }
 
-    // ── gated = value * gate — 스트라이드 분산 쓰기.
-    for (uint i = lid; i < n; i += 256u) {
-        gated[kbase + i] = value[vbase + i] * g;
-    }
-    barrier();
-
-    // ── RMS(gated) — 스트라이드 + 공유 트리.
+    // ── plans/94 R2: gated를 전역 왕복(write→barrier→read) 대신 레지스터 보유.
+    // GLSL barrier()는 WorkgroupMemory만 순서 보장 — SSBO 재판독은
+    // memoryBarrierBuffer 의존이었음. gv=value·g를 레지스터에서 직접 제곱합
+    // 축소하면 위험 자체가 사라지고 전역 판독 1회·기록 1회로 절감.
+    // 산술은 기존과 비트 동일: 부분합 순서(스트라이드 i=lid..n)·최종 결합
+    // ((value·g)·sg)·nc 그대로.
     float gsq_part = 0.0;
     for (uint i = lid; i < n; i += 256u) {
-        float dv = gated[kbase + i];
-        gsq_part += dv * dv;
+        float gv = value[vbase + i] * g;
+        gsq_part += gv * gv;
     }
     red[lid] = gsq_part;
     wg_reduce();
     float sg = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
 
-    // ── gated *= sg * nc — 스트라이드 분산.
     for (uint i = lid; i < n; i += 256u) {
-        gated[kbase + i] = gated[kbase + i] * sg * nc[nks + i];
+        gated[kbase + i] = value[vbase + i] * g * sg * nc[nks + i];
     }
 }

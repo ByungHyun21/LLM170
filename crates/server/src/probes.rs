@@ -197,6 +197,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawvk::checks::moe_tile_type_check(&mode)
         }
         "vk-moe-cm-race" => llm170_backend_gpu::rawvk::checks::moe_cm_race_check(),
+        "vk-ple-mt-check" => {
+            let reps = args.first().and_then(|v| v.parse().ok()).unwrap_or(64usize);
+            llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
+        }
         "mmv-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
             let tn = args.get(1).cloned().unwrap_or_else(|| "blk.1.attn_qkv.weight".into());

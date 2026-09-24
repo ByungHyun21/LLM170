@@ -145,8 +145,9 @@ pub(super) fn frame_forward_ex(
         //    폴백/프리필(t>1)은 기존 호스트 브리지. LLM170_PLE_HOST=1 강제.
         if hp.is_ple(il) && !stage_skipped("ple") {
             let mut ple_dev_done = false;
-            // plans/93: t>1 디바이스 PLE — 병렬 gate로도 값 오류 지속(원장 36).
-            // conv/res의 t>1 링/잔차 경로에 별도 결함 추정. t=1만 디바이스.
+            // plans/94 판정: t>1 값 오류의 원인은 gate_mt 공유메모리 레이스
+            // (red[0] 소비-재사용 배리어 부재) — conv/res는 합성 체인 프로브로
+            // 무죄(전 단계 ≤1.9e-6). 수리 완료, t>1 포함 전 t 디바이스 경로.
             if std::env::var_os("LLM170_PLE_HOST").is_none() {
                 let heads = hp.ple_heads_per_ngram * 2;
                 let emb_w = heads * hp.ple_head_dim * t;
