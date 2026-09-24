@@ -302,7 +302,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     (g.off.buf, g.rows_pad.buf, g.tilexp.buf, g.perm.buf, g.inv.buf, g.inv_pad.buf, g.rowexp.buf, g.perm_pad.buf)
                 };
                 let dsg = ctx.bind_ds(&pg, &[idb, ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
-                let push = push_u32s(&[ne as u32, rows as u32, bound as u32]);
+                // plans/93 sg2: 32행/WG 판은 전문가 패딩도 32배수여야 경계 정렬.
+                    let padmul: u32 = if std::env::var("LLM170_VK_Q4KSG2").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
+                    let push = push_u32s(&[ne as u32, rows as u32, bound as u32, padmul]);
                 ctx.run(pg.pl, dsg, pg.pipe, &push, 1, 1, 1)?;
                 {
                     let mut g = self.moe_grp.lock();
