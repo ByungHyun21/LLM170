@@ -22,7 +22,7 @@ layout(binding = 5) buffer Ivbuf { uint inv[]; };         // [rows]
 layout(binding = 6) buffer Ivpbuf { uint inv_pad[]; };    // [rows]
 layout(binding = 7) buffer Rxbuf { uint rowexp[]; };      // [bound] 패딩 도메인
 layout(binding = 8) buffer Ppdbuf { uint perm_pad[]; };   // [bound]
-layout(push_constant) uniform PC { uint ne; uint rows; uint bound; } pc;
+layout(push_constant) uniform PC { uint ne; uint rows; uint bound; uint padmul; } pc;
 
 shared int cnt[513];
 shared int off_[513];
@@ -47,7 +47,8 @@ void main() {
             off_[e] = acc;
             acc += cnt[e];
             off_pad[e] = accp;
-            accp += (cnt[e] + 15) / 16 * 16;
+            int pm = int(pc.padmul == 0u ? 16u : pc.padmul);
+            accp += (cnt[e] + pm - 1) / pm * pm;
         }
         off_[pc.ne] = acc;
         off_pad[pc.ne] = accp;
