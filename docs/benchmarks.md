@@ -1402,3 +1402,17 @@ n-predict ≥ 26 while passing the 16-token gate. See decisions.md (36).
 
 llama.cpp FN vk tg128 = 23.6 t/s (42ms/step) — they beat us on both GPU
 work and host overhead. Next decode levers: dispatch merging + gemv depth.
+
+### FN pp512 — device PLE t>1 unlocked (plans/94 race fix, 2026-09-25)
+
+The gate_mt shared-memory race fix (decisions.md 39) flips the device-PLE
+prefill lever from negative to positive:
+
+| config | pp512 vk | notes |
+|---|---|---|
+| host PLE bridge (`LLM170_PLE_HOST=1`) | 231.97 t/s | pre-fix status quo |
+| device PLE t>1 (default) | **257.23 t/s** | +10.8%, gate 3/3 bit-identical |
+
+Before the fix, t>1 device PLE measured 154 t/s with gate mismatch (ledger
+(36)/(38), commit c30d242 revert). Same-path reference points: VK_MOECM=1
+241.9, F32Q8 combo 270.80.
