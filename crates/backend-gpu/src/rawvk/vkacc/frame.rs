@@ -1,6 +1,6 @@
 //! vkacc::frame — FrameState — 프레임 버퍼/op 디스패치. (plans/90 B1b: gemv.rs 순수 이동)
 
-use std::sync::atomic::{AtomicU64, Ordering};
+
 thread_local! {
     static MOE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MOE_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
