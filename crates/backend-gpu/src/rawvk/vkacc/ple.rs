@@ -123,10 +123,11 @@ impl llm170_core::matmul::EwOps for VkAcc {
             rewind = pos0 < e.1 || e.0.ptr.is_null();   // 역방향 또는 최초
             e.1 = pos0 + t;
             if e.0.ptr.is_null() {
-                // plans/93: 링은 carve에 배치 — GPU(conv 커널)가 쓰는 버퍼를
-                // 시스템 RAM(alloc_host)에 두면 OOB 시 페이지캐시/파일시스템
-                // 메타데이터까지 침범(ENOENT 무음 손상 관측). llama.cpp 원칙:
-                // GPU 쓰기 버퍼는 carve만. alloc도 HOST_VISIBLE라 CPU 접근 동일.
+                // plans/93: GPU가 쓰는 링은 carve 배치(llama.cpp 원칙 — 시스템
+                // RAM의 GPU 쓰기 버퍼는 OOB 시 커널 메모리 침범 위험).
+                // 참고: "carve 배치가 ENOENT 무음 손상을 막는다" 가설은
+                // 2026-09-25 03:36 ringfix 검증으로 기각(carve에서도 재발) —
+                // 방어 목적으로만 유지. alloc도 HOST_VISIBLE라 CPU 접근 동일.
                 e.0 = ctx.alloc(ring_bytes)?;
             }
             if rewind {
