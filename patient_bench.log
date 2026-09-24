@@ -1,0 +1,6 @@
+=== 인내 벤치 시작 Fri Sep 25 02:27:40 AM KST 2026 ===
+pp512 (시도 1): Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf[gpu:vulkan] | pp512 gpu | rep0 |   1985.3 ms |  257.89 t/s
+fs-preflight: OK (10/10)
+== diverse 게이트 (ctx 8192, n-predict 16, vulkan) ==
+PASS: 17374 66 16 19 386 17 69 22 4144 66 15 15 4144 66 15 15 24902
+=== 완료 Fri Sep 25 02:28:41 AM KST 2026 ===
