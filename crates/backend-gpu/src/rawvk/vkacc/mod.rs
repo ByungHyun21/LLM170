@@ -282,6 +282,8 @@ pub struct VkAcc {
     /// plans/88 P2 — 그룹화 캐시: 같은 세대의 3개 GEMM이 테이블을 공유.
     moe_grp: Mutex<Option<MoeGrp>>,
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크 t).
+    /// plans/93: MoE gate→up 배리어 스킵 — 독립 GEMM 병렬 실행.
+    pub(crate) moe_nobar: std::sync::atomic::AtomicBool,
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
     /// plans/89 P1.4 — PLE 상수 캐시: (ptr,len) → 버퍼(모델 가중 뷰라 안정).
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
@@ -479,6 +481,7 @@ impl VkAcc {
             frame_step_batch: std::sync::atomic::AtomicBool::new(false),
             moe_gen: std::sync::atomic::AtomicU64::new(0),
             moe_grp: Mutex::new(None),
+            moe_nobar: std::sync::atomic::AtomicBool::new(false),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
         })
