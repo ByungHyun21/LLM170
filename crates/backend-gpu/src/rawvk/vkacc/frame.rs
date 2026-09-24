@@ -303,7 +303,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 };
                 let dsg = ctx.bind_ds(&pg, &[idb, ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
                 // plans/93 sg2: 32행/WG 판은 전문가 패딩도 32배수여야 경계 정렬.
-                    let padmul: u32 = if std::env::var("LLM170_VK_Q4KSG2").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
+                    let padmul: u32 = if std::env::var("LLM170_VK_PAD32").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
                     let push = push_u32s(&[ne as u32, rows as u32, bound as u32, padmul]);
                 ctx.run(pg.pl, dsg, pg.pipe, &push, 1, 1, 1)?;
                 {
@@ -337,7 +337,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     let mut hpoff = vec![0usize; ne + 1];
                     // plans/93 sg2: 32행/WG 판은 전문가 경계가 32 배수여야 —
                     // WG가 두 전문가를 가로지르면 rowexp[0]의 가중치로 오계산.
-                    let padmul = if std::env::var("LLM170_VK_Q4KSG2").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
+                    let padmul = if std::env::var("LLM170_VK_PAD32").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
                     for e in 0..ne { hpoff[e + 1] = hpoff[e] + (hoff[e + 1] - hoff[e]).div_ceil(padmul) * padmul; }
                     let rows_pad = hpoff[ne].max(16);
                     let rp_dev = unsafe { std::slice::from_raw_parts(gg.rows_pad.ptr as *const u32, 2) }[0] as usize;
