@@ -60,6 +60,24 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let Some(model_path): Option<std::path::PathBuf> = ma.model.clone().map(std::path::PathBuf::from) else {
         return usage_err_bench("--model required");
     };
+    // plans/93: FS 프리플라이트 — inode 플래핑(대형 mmap 벤치마크 + GPU fault
+    // 이력으로 유발된 무음 손상) 감지. 3회 연속 open 실패 시 즉시 중단해
+    // 손상 상태에서의 추가 I/O를 막는다.
+    {
+        let mut flaky = 0;
+        for _ in 0..3 {
+            match std::fs::File::open(&model_path) {
+                Ok(_) => {}
+                Err(_) => flaky += 1,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        if flaky == 3 {
+            eprintln!("오류: 모델 파일 열기 불안정(inode 손상 의심) — fs-preflight 실패.");
+            eprintln!("  복구: sudo touch /forcefsck && sudo reboot");
+            return ExitCode::FAILURE;
+        }
+    }
     if pp + tg + 16 >= ctx {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
