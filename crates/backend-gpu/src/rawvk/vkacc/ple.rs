@@ -168,7 +168,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
             let mut p16 = eps.to_le_bytes().to_vec();
             p16.extend_from_slice(&push);
-            ctx.run(p.pl, ds2, p.pipe, &p16, hc.div_ceil(8) as u32, t as u32, 1)?;
+            ctx.run(p.pl, ds2, p.pipe, &p16, hc as u32, t as u32, 1)?;
         }
         // (2) dilated conv + silu + 링 갱신.
         {

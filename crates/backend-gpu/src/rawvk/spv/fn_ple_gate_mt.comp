@@ -1,14 +1,10 @@
 #version 450
 #extension GL_ARB_gpu_shader_int64 : enable
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_ballot : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 
-// fn_ple_gate_mt (plans/93) — PLE gate 병렬판: 워프(32레인)가 (s,ti)를 공동 처리.
-// 구판은 lane 0만 실행(t=1 튜닝) — t>1 프리필에서 hc×t개 조합이 순차 처리되어
-// 285ms 브리지의 원인. 이 판은 32레인이 나누어 처리 + subgroupAdd 축소.
-// 산술: 구판과 동일 수학(f32 부분합 → f64 결합 → 순서는 레인 스트라이드로
-// 변경 ±ulp — 구판 lane0-순차와 동일 클래스의 재배치).
+// fn_ple_gate_mt (plans/93 개정판) — PLE gate 병렬: 워크그룹(256스레드)이
+// (s,ti)를 공동 처리. 서브그룹 연산 금지 — AMD wave64에서 lane 32..63이
+// 경계 외 판독하던 원판 결함(subgroupSize=32 가정) 제거. 공유메모리
+// 트리 축소(f32) → f64 결합으로 원판 정밀도 클래스 유지.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer ResB { float res[]; };
 layout(binding = 1) readonly buffer KeyB { float key[]; };
@@ -21,6 +17,8 @@ layout(binding = 7) buffer GateB { float gate_out[]; };
 layout(push_constant) uniform PC {
     float eps; uint n_embd; uint hc; uint t;
 } pc;
+
+shared float red[256];
 
 float exp_cr_exact(float xf) {
     double x = double(xf);
@@ -54,11 +52,22 @@ float exp_cr_exact(float xf) {
     return float(p * scale);
 }
 
+// 공유메모리 트리 축소 후 red[0] = Σ red[i] (f32 트리 순서).
+void wg_reduce() {
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (gl_LocalInvocationID.x < stride) {
+            red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + stride];
+        }
+        barrier();
+    }
+}
+
 void main() {
-    // 서브그룹(워프)별 (s,ti) — 8서브그룹 = 8개 s값.
-    int s = int(gl_WorkGroupID.x * 8u + gl_SubgroupID);
+    // 워크그룹 = (s, ti) 1개 — 서브그룹 크기 무관.
+    int s = int(gl_WorkGroupID.x);
     int ti = int(gl_WorkGroupID.y);
-    uint lane = gl_SubgroupInvocationID;
+    uint lid = gl_LocalInvocationID.x;
     uint n = pc.n_embd;
     if (s >= int(pc.hc) || ti >= int(pc.t)) return;
 
@@ -66,60 +75,63 @@ void main() {
     uint rbase = kbase;
     uint nks = uint(s) * n;
     uint vbase = uint(ti) * n;
-    uint per = n / 32u;   // 레인당 원소 수 (n=2560 → 80)
 
-    // ── RMS(key) — 레인 스트라이드 f32 부분합 + subgroupAdd + f64 보정.
+    // ── RMS(key): 스트라이드 f32 부분합 → 공유 트리 → f64 보정.
     float ksq_part = 0.0;
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    for (uint i = lid; i < n; i += 256u) {
         float dv = key[kbase + i];
         ksq_part += dv * dv;
     }
-    double ksq_d = double(subgroupAdd(ksq_part));
-    float sk = 1.0 / float(sqrt(ksq_d / double(n) + double(pc.eps)));
+    red[lid] = ksq_part;
+    wg_reduce();
+    float sk = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
 
     // ── RMS(res) — 동일 구조.
     float rsq_part = 0.0;
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    for (uint i = lid; i < n; i += 256u) {
         float dv = res[rbase + i];
         rsq_part += dv * dv;
     }
-    double rsq_d = double(subgroupAdd(rsq_part));
-    float sq = 1.0 / float(sqrt(rsq_d / double(n) + double(pc.eps)));
+    red[lid] = rsq_part;
+    wg_reduce();
+    float sq = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
 
-    // ── dot: (key*sk*nk) · (res*sq*nq) — 레인 스트라이드 + subgroupAdd.
+    // ── dot: (key*sk*nk) · (res*sq*nq) — 스트라이드 + 공유 트리.
     float dot_part = 0.0;
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    for (uint i = lid; i < n; i += 256u) {
         float a = (key[kbase + i] * sk) * nk[nks + i];
         float b = (res[rbase + i] * sq) * nq[nks + i];
         dot_part += a * b;
     }
-    float dotv = subgroupAdd(dot_part);
-    dotv /= sqrt(float(n));
+    red[lid] = dot_part;
+    wg_reduce();
+    float dotv = red[0] / sqrt(float(n));
 
     // ── gate — 레인 0만 기록 (스칼라).
     float mag = max(abs(dotv), 1e-6);
     float g = 1.0 / (1.0 + exp_cr_exact(dotv >= 0.0 ? -sqrt(mag) : sqrt(mag)));
-    if (lane == 0u) {
+    if (lid == 0u) {
         gate_out[uint(ti) * pc.hc + uint(s)] = g;
     }
 
-    // ── gated = value * gate — 레인 분산 쓰기.
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    // ── gated = value * gate — 스트라이드 분산 쓰기.
+    for (uint i = lid; i < n; i += 256u) {
         gated[kbase + i] = value[vbase + i] * g;
     }
-    subgroupBarrier();
+    barrier();
 
-    // ── RMS(gated) — 레인 스트라이드 + subgroupAdd.
+    // ── RMS(gated) — 스트라이드 + 공유 트리.
     float gsq_part = 0.0;
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    for (uint i = lid; i < n; i += 256u) {
         float dv = gated[kbase + i];
         gsq_part += dv * dv;
     }
-    double gsq_d = double(subgroupAdd(gsq_part));
-    float sg = 1.0 / float(sqrt(gsq_d / double(n) + double(pc.eps)));
+    red[lid] = gsq_part;
+    wg_reduce();
+    float sg = 1.0 / float(sqrt(double(red[0]) / double(n) + double(pc.eps)));
 
-    // ── gated *= sg * nc — 레인 분산.
-    for (uint i = lane * per; i < (lane + 1u) * per; i++) {
+    // ── gated *= sg * nc — 스트라이드 분산.
+    for (uint i = lid; i < n; i += 256u) {
         gated[kbase + i] = gated[kbase + i] * sg * nc[nks + i];
     }
 }
