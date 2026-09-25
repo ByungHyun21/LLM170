@@ -503,6 +503,29 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         && std::env::var("LLM170_VK_FT32").map(|v| v != "0").unwrap_or(true)
                     {
                         // plans/93: tile_f32_w는 실측 역행(558ms vs 352ms) — 원판 유지.
+                        // plans/95 P1 — 스키니 f32(n_out ≤ 512): tile_f32는
+                        // n_out=4(hc down)에서 WG 32개·활성 128스레드로 점유
+                        // 붕괴 → K-분할판 f32s가 pp512 290 t/s(+27%). 단, 축소
+                        // 순서 변경이 로짓 0.2-0.35nat 드리프트(근접타이 아님,
+                        // 게이트 3/3 FAIL) — opt-in. §8 판정 원장 (40).
+                        if dty == 0
+                            && n_out <= 512
+                            && std::env::var("LLM170_VK_FT32S").map(|v| v == "1").unwrap_or(false)
+                        {
+                            let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
+                            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+                            while binds.len() < 8 {
+                                binds.push(dbuf);
+                            }
+                            binds.push(xb);
+                            binds.push(ob);
+                            let ds2 = ctx.bind_ds(&p, &binds)?;
+                            let push = push_u32s(&[
+                                n_in as u32, n_out as u32, t as u32, dty, n_in as u32,
+                            ]);
+                            ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1)?;
+                            continue;
+                        }
                         let p = self.pipeline(&mut ctx, Slot::FnTileF32)?;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {
@@ -516,6 +539,16 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                             n_in as u32, n_out as u32, t as u32, dty, wpr as u32,
                         ]);
                         ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1)?;
+                        // plans/95 계측(1회성): tile_f32 형상 수집 — 76MiB f32·bf16
+                        // 텐서에 359.6ms/청크의 원인 국소화.
+                        if std::env::var_os("LLM170_FT32_TRACE").is_some() {
+                            static N: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 12 {
+                                eprintln!("[ft32] #{n} dty={dty} n_in={n_in} n_out={n_out} t={t}");
+                            }
+                        }
                         continue;
                     }
                     let slot = if t < 16 && wbufs.len() == 1

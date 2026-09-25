@@ -2036,3 +2036,30 @@ gate mismatch) to **+10.8%**: pp512 vk 257.23 t/s (device PLE) vs 231.97
 (host bridge). The RADV segfault did not reproduce in 10/10 F32Q8 t=7 runs
 on current HEAD; the crashing build (8c0437b, uncached conversion) is
 superseded by the cached variant — evidence retained, urgency downgraded.
+
+### (40) Skinny f32 GEMM (tile_f32s) — 3.3× on the worst dispatches, but output-visible arithmetic change keeps it opt-in (plans/95, 2026-09-25)
+
+Fresh chunk decomposition (post gate_mt fix) showed `tile_f32` at 359.6ms/chunk
+across 288 dispatches over tensors totaling only ~76 MiB — 0.85 GB/s. Shape
+trace (`LLM170_FT32_TRACE`): every dispatch is one of six skinny patterns per
+layer — `10240→4` (hc down, ×2), `2560→48` (indexer, ×2), `2560→512` (MoE
+router), `2560→1`. The `(⌈n_out/16⌉, ⌈t/16⌉)` grid collapses to 32 workgroups
+(128 live threads) at n_out=4.
+
+New kernel `fn_tile_f32s`: WG = 16 outputs × 16 tokens, 256 threads split as
+(16 K-split lanes × 16 token lanes), x staged in LDS, weights streamed per
+K-chunk, per-output reduction in a fixed deterministic order. Checker
+(`vk-ft32-check`, f64 reference): max|Δ| ≤ 8.7e-7 on router and 4×10240
+inject shapes. pp512: **290.0 t/s vs 228 default (+27%)**.
+
+However the reduction-order change (K-split vs serial) drifts prefill top-3
+logits by 0.20–0.35 nat versus the serial-accumulation baseline, and the
+16-token gate failed 3/3 (divergence at generated token 9). This is NOT a
+near-tie per the §8 procedure — the drift is a large fraction of typical
+top-2 gaps, so the kernel ships opt-in (`LLM170_VK_FT32S=1`); the default
+path stays bit-stable (gate re-verified PASS 3/3 after flipping to opt-in).
+Notably the K-split kernel is *closer* to the f64 reference than the serial
+baseline — the pinned stream encodes the old kernel's own accumulation error.
+Follow-up (plans/95 P1b): a bit-exact fast variant (identical serial order,
+fixed occupancy) would recover the speedup on the default path; the original
+kernel's ~300× gap from ideal on n_out=4 dispatches is not yet explained.
