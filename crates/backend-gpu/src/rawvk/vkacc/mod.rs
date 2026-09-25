@@ -332,6 +332,9 @@ pub struct VkAcc {
     pub(crate) f32q8_cache: Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
     /// plans/95 P3a — q8_0 릴레이아웃 업로드 캐시: (가중 ptr,len) → VkBuf.
     pub(crate) q8r_bufs: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
+    /// plans/96 G3 — MoE gate+up 연속 쌍의 quant 전용 슬롯: (x,n_in,rows) 키.
+    /// 전용 버퍼(타 quant 불가침) + 두 엔진 호출 사이 무연산 — 세대 불필요.
+    pub(crate) moe_xq_pair: Mutex<Option<(u64, usize, usize, VkBuf)>>,
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크).
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
@@ -536,6 +539,7 @@ impl VkAcc {
             moe_grp: Mutex::new(None),
             moe_nobar: std::sync::atomic::AtomicBool::new(false),
             q8r_bufs: Mutex::new(std::collections::HashMap::new()),
+            moe_xq_pair: Mutex::new(None),
             f32q8_cache: Mutex::new(std::collections::HashMap::new()),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),

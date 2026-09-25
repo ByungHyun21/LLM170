@@ -104,7 +104,7 @@ pub(super) fn frame_forward_ex(
         {
             return Err(Q4Error::Io(format!("frame_failat: 주입 L{il}")));
         }
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
         if llm170_diag::dump::opts().bufhash {
@@ -294,7 +294,7 @@ pub(super) fn frame_forward_ex(
         // 2) hc attn mix
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_attn"), f.mix)?;
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
         }
         if il == 0 {
@@ -307,7 +307,7 @@ pub(super) fn frame_forward_ex(
                 // 진단용: GDN 단계 생략(출력 무효) — 디코드 스텝 비용 분해.
             } else {
             gdn_frame(acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t)?;
-            if il < 4 {
+            if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
                 frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.gdn"));
             }
             }
@@ -354,7 +354,7 @@ pub(super) fn frame_forward_ex(
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
-            if il < 4 {
+            if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
                 frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.qsa"));
             }
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -363,7 +363,7 @@ pub(super) fn frame_forward_ex(
         // 4) hc ffn mix + MoE
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
         }
         if il == 0 {
@@ -371,7 +371,7 @@ pub(super) fn frame_forward_ex(
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
         }
         
@@ -1058,7 +1058,7 @@ pub(super) fn gdn_frame(
             .map_err(Q4Error::Io)?;
     }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
-    if il < 4 {
+    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
         frame_ck(acc, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
     }
     // β/e^g
@@ -1068,7 +1068,7 @@ pub(super) fn gdn_frame(
         op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
     }
     sync_mark(acc, "gdn.betag", f.gbg)?;
-    if il < 4 {
+    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
         frame_ck(acc, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
     }
     // conv + ring
@@ -1078,7 +1078,7 @@ pub(super) fn gdn_frame(
         if il == 0 && llm170_diag::dump::opts().bufhash {
             buf_hash(acc, f.gconv, conv_ch * t.min(16), "G0.conv");
         }
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
         }
     }
@@ -1105,7 +1105,7 @@ pub(super) fn gdn_frame(
     if !stage_skipped("gdn.ar") {
         fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][ri], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
             .map_err(Q4Error::Io)?;
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.go, v_len, t, &format!("L{il}.gdn_ar"));
             // 이월 상태(carry) — conv 링과 AR 상태가 청크 간 동일하게 유지되는지.
             // 입력이 모두 비트 동일한데 AR 출력이 갈리는 경우 이 둘이 유일한 미지수다.
@@ -1170,7 +1170,7 @@ pub(super) fn moe_frame(
         op(acc, FrameOp::MoeTop10 { route: f.mroute, ids: f.mids, wt: f.mwt, n_exp: hp.n_expert, k_sel })?;
     }
     sync_mark(acc, "moe.top10", f.mids)?;
-    if il < 4 {
+    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
         frame_ck(acc, f.mids, k_sel, t, &format!("L{il}.mids"));
         frame_ck(acc, f.mwt, k_sel, t, &format!("L{il}.mwt"));
     }
@@ -1209,13 +1209,13 @@ pub(super) fn moe_frame(
             // 2회째에 x가 바르게 되면 첫 쓰기가 찢어진 것, 그대로면 이웃 오염.
             fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
         }
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
             frame_ck(acc, f.mids, 1, t * k_sel, &format!("L{il}.mids_u32"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
@@ -1228,7 +1228,7 @@ pub(super) fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
-        if il < 4 {
+        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mout, n, t, &format!("L{il}.moe_sc"));
         }
     if !stage_skipped("moe.shared") {
