@@ -1604,3 +1604,14 @@ extraction ALU that sank MMQ v1-v4) is infeasible: the q4_K stacks are
 41.5GB; scale expansion alone adds +18.5GB against ~16-21GB free GTT.
 Session arc final: **225 → 358-362 t/s (+61%)**, GPU 2033→1357ms (−33%),
 52 commits, 7 MMQ negatives + 3 promotions fully mapped in the ledger.
+
+### BN=64 structural barrier (plans/96 close, 2026-09-25)
+
+llama's remaining MoE edge (~117GB/s vs our ~80) requires BN=64 token
+amortization of weight staging. Our expert-padded (16-row) row domain makes
+BN=64 physically impossible at pp512 (each expert = exactly one 16-row band
+of 10 real rows); widening padding to 64 quadruples quant (45→180ms) and
+gather traffic. Only llama-style exact row-list routing enables it — an
+architectural rework of moe_group + tile row addressing. Host gap remeasured
+at only ~60ms (4%): graph integration alone caps at +4%; BN=64 is the real
+final lever. Session final: 225→**346-362 t/s (+55%)**.
