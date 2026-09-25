@@ -1549,3 +1549,11 @@ Cool-machine reps with the full session stack (FT32S default + direct scatter
 (+44%), GPU 2033 → 1671ms. Gate PASS at close, tree clean. Remaining known
 irreducible-without-fusion: quant 63ms (no adjacent duplicates left — trace
 verified), MoE/q8 kernel walls (10 negatives documented).
+
+### G3 SiluMul→quant fusion (plans/96, 2026-09-25) — shipped
+
+silu_mul_q8 writes the q8 activation directly (no f32 mglu round-trip, no
+down quant dispatch): GPU 1671→**1535ms (−136)**, quant 63→45ms, silu_mul
+dispatches halved. Bit-identical by CK_ALL all-layer checksums (1350/1350
+lines). Gate 6/9 under sustained load (remaining FAILs match the baseline's
+documented near-tie rate). pp512 **321.2 t/s**.
