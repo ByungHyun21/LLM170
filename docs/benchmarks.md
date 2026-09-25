@@ -1580,3 +1580,10 @@ the 64×16 tile geometry with dual nib/hi dot chains). Baseline re-recorded
 (int8-exact per precedent; first re-record accidentally captured the legacy
 path — corrected). Gate 6/7 (one near-tie). GPU 1416→**1357ms**, pp512
 **362.2 t/s**. Kill switch `LLM170_VK_Q51MOE=0`.
+
+### q4_K MMQ v4 block-cached staging (plans/96, 2026-09-25) — negative
+
+Per-256-block scale caching + one-shot A staging: 8.38ms/dispatch vs v3's
+6.5 and sg1's 5.45 — the 64-word LDS block per row increases pressure and
+loses. Sixth q4_K MMQ negative; sg1 remains optimal (env-gated experiment
+path retained).
