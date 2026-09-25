@@ -1680,3 +1680,12 @@ global loads (k/q/v/βg per token) were latency-bound. Rotating software
 pipeline (issue ti+1 loads before ti's two shuffle reductions):
 63.5→55.4ms, bit-identical (CK_ALL checksums), gate 3/3. GPU 1303ms,
 pp512 **367.8 t/s**.
+
+### Session-final GPU breakdown (1300ms, plans/96 close)
+
+moe_tile_q4k_mmq 481 · tile_q8128 196 · moe_tile_q51mmq 173 · tile_f32s 73 ·
+gdn_ar_swap 53(prefetched) · quant 49 · tile_f32 33 · q8mmq 33 · rms 26 ·
+gemv8 26 · hc_mean 23 · q5kmmq 19 — MMQ family now 706ms (54% of GPU), all
+four stacks live-skipped int8. Remaining big rocks: q4k_mmq MMA scalar
+chains (405ms of dots — TM/BN restructures exhausted, 9 variants), dense
+q8128 (coopmat, 3 MMQ negatives). pp512 session-final **367.8 t/s (+64%)**.
