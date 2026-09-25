@@ -21,6 +21,7 @@ shared uint sA[64][8];
 shared float sAd[64];
 shared uint sB[16][8];
 shared float sBd[16];
+shared int sLive;  // plans/96: 밴드 내 실제(센티널 아닌) 행 수
 
 // sdot4p 센티널 — OpSDot 치환(패처 실패 시 종료).
 int sdot4p(uint a, uint b) {
@@ -70,6 +71,13 @@ void main() {
         }
         // ── B: 16행 × 8워드 — 스레드 분담.
         {
+            if (tid == 0u) {
+                int live = 0;
+                for (int q = 0; q < 16; q++) {
+                    if (r0e + q < int(rp) && perm_pad[uint(r0e + q)] != 0xFFFFFFFFu) live = q + 1;
+                }
+                sLive = live;
+            }
             for (int i = int(tid); i < 16 * 8; i += 64) {
                 int rb = i >> 3;
                 int p = i & 7;
@@ -95,7 +103,7 @@ void main() {
             int ra[8];
             for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][p]);
             float ad = sAd[tr];
-            for (int c = 0; c < 16; c++) {
+            for (int c = 0; c < sLive; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)
                 int qsum = 0;
                 for (int p = 0; p < 8; p++) {
                     qsum += sdot4p(uint(ra[p]), sB[c][p]);
