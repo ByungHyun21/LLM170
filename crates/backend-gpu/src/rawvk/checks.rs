@@ -392,6 +392,9 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
     acc.frame_mm_group(xh2, &[wd, wi], &[od, oi], t)?;
     let mut gi = vec![0f32; t * wi.n_out as usize];
     acc.frame_read(oi, &mut gi)?;
+    // plans/95: q8 down(q8mmq 경로) 판독 — 해제 전에 읽는다.
+    let mut gd = vec![0f32; t * wd.n_out as usize];
+    acc.frame_read(od, &mut gd)?;
     let _ = (acc.frame_free(xh2), acc.frame_free(od), acc.frame_free(oi));
     let wi_f = wi.data.as_ptr() as *const f32;
     let nin_i = wi.n_in as usize;
@@ -410,11 +413,37 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
             mx2 = mx2.max(d);
         }
     }
+    // q8_0 down(q8mmq 경로 — env LLM170_VK_Q8MMQ=1일 때 fn_tile_q8mmq) 검증.
+    let mut mx3 = 0f64;
+    let mut bad3 = 0usize;
+    if std::env::var_os("LLM170_Q8_DBG").is_some() {
+        for j in 0..4usize {
+            let mut rr = vec![0f32; n2];
+            llm170_core::quant::dequant_row(wd.ty, wd.data, j as u64, n2 as u64, &mut rr);
+            let dot: f32 = rr.iter().zip(xs2[0].iter()).map(|(a, b)| a * b).sum();
+            eprintln!("[q8dbg] r=0 j={j} got={:.5} ref={:.5}", gd[j], dot);
+        }
+    }
+    for r in 0..t {
+        for j in 0..wd.n_out as usize {
+            let mut rr = vec![0f32; n2];
+            llm170_core::quant::dequant_row(wd.ty, wd.data, (j) as u64, n2 as u64, &mut rr);
+            let dot: f32 = rr.iter().zip(xs2[r].iter()).map(|(a, b)| a * b).sum();
+            let d = (gd[r * wd.n_out as usize + j] as f64 - dot as f64).abs();
+            if d > 2e-2 {
+                bad3 += 1;
+            }
+            mx3 = mx3.max(d);
+        }
+    }
+    // 요약 행에 q8 결과 추가.
     Ok(format!(
-        "ft32-check: router max|D|={mx:.3e} bad={bad} {} | inject(f32 {}x{}) max|D|={mx2:.3e} bad={bad2} {}",
+        "ft32-check: router max|D|={mx:.3e} bad={bad} {} | inject(f32 {}x{}) max|D|={mx2:.3e} bad={bad2} {} | q8down({}x{}) max|D|={mx3:.3e} bad={bad3} {}",
         if bad == 0 { "★" } else { "✗" },
         wi.n_out, wi.n_in,
-        if bad2 == 0 { "★" } else { "✗" }
+        if bad2 == 0 { "★" } else { "✗" },
+        wd.n_out, wd.n_in,
+        if bad3 == 0 { "★" } else { "✗" }
     ))
 }
 
