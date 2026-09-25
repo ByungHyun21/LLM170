@@ -127,15 +127,17 @@ if (p == 0) {
             for (int p = 0; p < 16; p++) ra[p] = int(sA[tr][p]);
             float ad = sAd[tr], am = sAm[tr];
             for (int c = 0; c < live_cnt; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)(37.5% ALU)
-                // plans/96: 2누산기 트리(정수 exact).
-                int qa = sdot4p(uint(ra[0]), sB[c][0]) + sdot4p(uint(ra[2]), sB[c][2])
-                       + sdot4p(uint(ra[4]), sB[c][4]) + sdot4p(uint(ra[6]), sB[c][6])
-                       + sdot4p(uint(ra[8]), sB[c][0]) + sdot4p(uint(ra[10]), sB[c][2])
-                       + sdot4p(uint(ra[12]), sB[c][4]) + sdot4p(uint(ra[14]), sB[c][6]);
-                int qb = sdot4p(uint(ra[1]), sB[c][1]) + sdot4p(uint(ra[3]), sB[c][3])
-                       + sdot4p(uint(ra[5]), sB[c][5]) + sdot4p(uint(ra[7]), sB[c][7])
-                       + sdot4p(uint(ra[9]), sB[c][1]) + sdot4p(uint(ra[11]), sB[c][3])
-                       + sdot4p(uint(ra[13]), sB[c][5]) + sdot4p(uint(ra[15]), sB[c][7]);
+                // plans/96: B 선적재 + 2누산기(정수 exact).
+                uint b0 = sB[c][0], b1 = sB[c][1], b2 = sB[c][2], b3 = sB[c][3];
+                uint b4 = sB[c][4], b5 = sB[c][5], b6 = sB[c][6], b7 = sB[c][7];
+                int qa = sdot4p(uint(ra[0]), b0) + sdot4p(uint(ra[2]), b2)
+                       + sdot4p(uint(ra[4]), b4) + sdot4p(uint(ra[6]), b6)
+                       + sdot4p(uint(ra[8]), b0) + sdot4p(uint(ra[10]), b2)
+                       + sdot4p(uint(ra[12]), b4) + sdot4p(uint(ra[14]), b6);
+                int qb = sdot4p(uint(ra[1]), b1) + sdot4p(uint(ra[3]), b3)
+                       + sdot4p(uint(ra[5]), b5) + sdot4p(uint(ra[7]), b7)
+                       + sdot4p(uint(ra[9]), b1) + sdot4p(uint(ra[11]), b3)
+                       + sdot4p(uint(ra[13]), b5) + sdot4p(uint(ra[15]), b7);
                 int qsum = qa + qb;
                                 acc[c] += sBd[c] * (ad * float(qsum) + am * sBsum[c]);
             }
