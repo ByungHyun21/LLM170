@@ -1532,3 +1532,12 @@ measured redundancy lives in GEMM outputs, outside the single-writer contract.
 Quant-dedup is only reachable by absorbing quant into consumer GEMMs (G3
 proper). Reverted; tree at clean HEAD (gate PASS/FAIL/PASS under sustained
 thermal load — the documented near-tie nondeterminism class, unrelated).
+
+### G3 MoE gate+up quant pair slot (plans/96, 2026-09-25) — shipped
+
+Dedicated-buffer slot reusing the gate quant for the consecutive up call
+(prefill-only, t≥2): quant 128.6→63.2ms, GPU 1707→1671ms, −48 dispatches.
+Debug trail: prefill proven bit-clean by all-layer checksums
+(`LLM170_CK_ALL`); divergence isolated to decode q8-stack layers (t=1 slot
+fire) and excluded by the prefill guard. Gate 3/3 PASS; kill switch
+`LLM170_VK_MOEXQ=0`.
