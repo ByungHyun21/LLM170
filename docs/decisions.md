@@ -2063,3 +2063,42 @@ baseline — the pinned stream encodes the old kernel's own accumulation error.
 Follow-up (plans/95 P1b): a bit-exact fast variant (identical serial order,
 fixed occupancy) would recover the speedup on the default path; the original
 kernel's ~300× gap from ideal on n_out=4 dispatches is not yet explained.
+
+### (41) perf-95 ledger: skinny-f32 win, two MMQ negatives, and the MoE bandwidth wall (plans/95, 2026-09-25)
+
+Session pursuing FN pp512 → 500 (llama vk 506). Fresh decomposition after the
+gate_mt fix: MoE 990ms · tile_f32 359.6 · q8128 204 · quant 128.6 · tail ~300
+· host ~150-204 (GPU total 2033ms).
+
+**tile_f32s (shipped, opt-in `LLM170_VK_FT32S=1`)**: the 288 skinny-f32
+dispatches (n_out = 1/4/48/512, 76 MiB of weights, 0.85 GB/s from grid
+collapse) drop to 118ms via a 16-lane K-split tile → pp512 **290.0 t/s
+(+27%)**. Gate fails 3/3 (0.20-0.35 nat top-3 drift — not a near-tie), and
+`LLM170_VK_FT32S_MAX=48` (router excluded) still fails: the drift is not
+localized to one shape class. The K-split kernel is *closer* to the f64
+reference than the serial baseline — the pinned stream encodes the old
+accumulation order. Default stays bit-stable; a bit-exact variant (P1b)
+requires explaining the original kernel's ~300× gap from ideal at n_out=4.
+
+**q4_K MoE MMQ v2 (negative)**: faithful llama-mul_mmq rewrite (1-load
+nibble staging, block-local scale indexing — the v1 kernel read garbage past
+block 0; band tile 64×16 to respect the 16-row expert-uniform padding).
+Checker-exact (2.45e-3, same class as sg1) but 731ms vs sg1 543ms in [ts]:
+scalar OpSDot chains do not beat coopmat f16 MMA at 16-row MoE granularity.
+
+**q8_0 dense MMQ (negative)**: lossless word-aligned relayout (unit-tested
+roundtrip) + direct int8 dot. Gate PASSED (int8-exact arithmetic matches the
+pinned stream) but 202 vs 225 t/s — the per-sub-block barrier pipeline is
+shallower than coopmat's. Both negative results point the same way: the
+remaining q8128/MoE gaps are pipeline-depth problems, not arithmetic-class
+problems. Also: a 3-buffer descriptor row for a kernel using bindings 8/9
+left them unbound — wrong values plus intermittent RADV segfaults at
+`libvulkan_radeon+0x2672e5`, the same signature as the F32Q8 crashes in
+(39). n_buf must cover the highest binding index + 1.
+
+**Wall status**: MoE expert tiles hold at ~74 GB/s across seven kernel
+approaches; dense q8 at ~25 GB/s across two. Stacked best-case with today's
+architecture ≈ 350-380 t/s. Reaching 500 requires breaking the per-dispatch
+pipeline-depth ceiling (multi-sub-block staging, fused quant+GEMM) rather
+than more arithmetic-class swaps. Best measured: **290 t/s opt-in** (default
+225, gate-green).
