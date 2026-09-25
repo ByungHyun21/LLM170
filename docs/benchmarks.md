@@ -1451,3 +1451,11 @@ arithmetic swaps. See decisions.md (40)(41).
 188.6 t/s (gate PASS, checker identical) — barrier count was not the
 bottleneck; scalar OpSDot MMA throughput is. Third confirmation that dense
 tiles on this stack favor emulated coopmat f16 over scalar int8 dot.
+
+### sg1 K-depth 4-sb probe (plans/95 P2' gate, 2026-09-25)
+
+Gate 3/3 PASS (no race at doubled MMA chain) but 214.8 t/s (−6% vs 229-232
+baseline) — reverted. Fourth consistent negative: barrier/K-depth is not the
+bottleneck on any path (q8mmq 4-sb, sg1 4-sb both regressed). The remaining
+MoE gap vs llama is not reachable by geometry tuning of our kernels; it
+requires their packed-B quant layout + whole-graph execution.
