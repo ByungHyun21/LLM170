@@ -1689,3 +1689,8 @@ gemv8 26 · hc_mean 23 · q5kmmq 19 — MMQ family now 706ms (54% of GPU), all
 four stacks live-skipped int8. Remaining big rocks: q4k_mmq MMA scalar
 chains (405ms of dots — TM/BN restructures exhausted, 9 variants), dense
 q8128 (coopmat, 3 MMQ negatives). pp512 session-final **367.8 t/s (+64%)**.
+
+### Late-session rep (plans/96, 2026-09-25 18:00)
+
+Cool-machine rep1: pp512 **373.9 t/s** — session arc 225 → **374 peak**
+(+66%). Gate PASS, tree clean at 967a684.
