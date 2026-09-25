@@ -96,7 +96,8 @@ void main() {
             perm_pad[pd] = src;
             inv_pad[src] = pd;
         } else {
-            perm_pad[pd] = 0u;
+            // plans/96 G2: 패딩 센티널 — 타일 드레인 직접산란 가드용.
+            perm_pad[pd] = 0xFFFFFFFFu;
         }
     }
 }
