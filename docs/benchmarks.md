@@ -1541,3 +1541,11 @@ Debug trail: prefill proven bit-clean by all-layer checksums
 (`LLM170_CK_ALL`); divergence isolated to decode q8-stack layers (t=1 slot
 fire) and excluded by the prefill guard. Gate 3/3 PASS; kill switch
 `LLM170_VK_MOEXQ=0`.
+
+### 300 milestone (plans/96, 2026-09-25 session close)
+
+Cool-machine reps with the full session stack (FT32S default + direct scatter
++ quant pair slot): pp512 **301.7 / 323.1 t/s** — session arc 225 → 323
+(+44%), GPU 2033 → 1671ms. Gate PASS at close, tree clean. Remaining known
+irreducible-without-fusion: quant 63ms (no adjacent duplicates left — trace
+verified), MoE/q8 kernel walls (10 negatives documented).
