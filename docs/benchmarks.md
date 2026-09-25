@@ -1571,3 +1571,12 @@ pp512 **340.5 t/s**. Kill switch `LLM170_VK_Q8MOE=0`.
 q5_K-stack MoE downs: scalar 29ms → int8 MMQ 9.7ms per dispatch (58→19ms
 total). Checker PASS; baseline re-recorded per precedent (int8-exact), gate
 3/3. GPU 1448→1416ms, pp512 **348.4 t/s**. Kill switch `LLM170_VK_Q5KMOE=0`.
+
+### q5_1 MoE MMQ (plans/96 G3, 2026-09-25) — shipped
+
+q5_1 MoE downs: coopmat f16 6.2ms → int8 MMQ 5.06ms per dispatch
+(267→218ms total, first MMQ to beat the coopmat family on its own turf —
+the 64×16 tile geometry with dual nib/hi dot chains). Baseline re-recorded
+(int8-exact per precedent; first re-record accidentally captured the legacy
+path — corrected). Gate 6/7 (one near-tie). GPU 1416→**1357ms**, pp512
+**362.2 t/s**. Kill switch `LLM170_VK_Q51MOE=0`.
