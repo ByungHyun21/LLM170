@@ -1431,3 +1431,17 @@ New K-split kernel `fn_tile_f32s` (opt-in `LLM170_VK_FT32S=1`):
 Reduction-order change drifts top-3 prefill logits 0.20–0.35 nat → gate
 fails (not a near-tie), so the default path stays bit-stable; see
 decisions.md (40). Device PLE (plans/94) included in both numbers.
+
+### FN pp — plans/95 session close (2026-09-25)
+
+| config | pp512 | pp4096 | gate |
+|---|---|---|---|
+| default | 225-231 | 226.24 | PASS 3/3 |
+| `LLM170_VK_FT32S=1` (skinny-f32 K-split) | **275.1-290.0** | — | FAIL (0.2-0.35 nat drift, non-local) |
+| `LLM170_VK_Q4KSG1=0 LLM170_VK_Q4KMMQ=1` | 233.5 ([ts] MoE slower) | — | FAIL (class) |
+| `LLM170_VK_Q8MMQ=1` | 202.0 | — | PASS (int8-exact) |
+
+Two MMQ rewrites validated correct but performance-negative; MoE wall at
+~74 GB/s across seven approaches, dense q8 at ~25 GB/s across two. Path to
+500 = pipeline-depth work (multi-sub-block staging, quant+GEMM fusion), not
+arithmetic swaps. See decisions.md (40)(41).
