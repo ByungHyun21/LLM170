@@ -680,11 +680,48 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
             }
             O::SiluMul { g, u, out, n } => {
+                self.last_silu_out
+                    .store(out, std::sync::atomic::Ordering::Relaxed);
                 let (gb, ub, ob) = (self.fbuf(g)?, self.fbuf(u)?, self.fbuf(out)?);
-                let p = self.pipeline(&mut ctx, Slot::Silu)?;
-                let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
-                let push = push_u32s(&[n as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                // plans/96 G3 — down 직결 융합: glu로 학습된 출력이면 silu+quant를
+                // xq에 직접 기록(쌍 슬롯 fill) — f32 mglu 왕복·down quant 폐지.
+                // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
+                let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+                let glu = *self.moe_glu.lock();
+                let fused = t_now >= 2
+                    && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
+                    && std::env::var("LLM170_VK_SILUQ")
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                if fused {
+                    let (_, n_in) = glu.unwrap();
+                    let rows = n / n_in;
+                    let xq_w = xq_words(n_in);
+                    let p = self.pipeline(&mut ctx, Slot::SiluMulQ8)?;
+                    let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
+                    let tgt = {
+                        let mut sl = self.moe_xq_pair.lock();
+                        let need = rows * xq_w * 4;
+                        let ok = sl
+                            .as_ref()
+                            .is_some_and(|v| (v.3.bytes as usize) >= need);
+                        if !ok {
+                            *sl = Some((0, 0, 0, ctx.alloc(need)?));
+                        }
+                        let v = sl.as_mut().unwrap();
+                        v.0 = out;
+                        v.1 = n_in;
+                        v.2 = rows;
+                        v.3.buf
+                    };
+                    let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
+                    ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+                } else {
+                    let p = self.pipeline(&mut ctx, Slot::Silu)?;
+                    let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
+                    let push = push_u32s(&[n as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                }
             }
             O::Scale { t, s, n } => {
                 let tb = self.fbuf(t)?;
