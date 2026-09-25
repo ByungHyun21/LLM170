@@ -1672,3 +1672,11 @@ v5 (64×16, live-skip, hoisted) is the optimum of this family on the stack.
 The MMQ-v5 promotion benefits long-context too (pp4096 336 ≈ pp512 — the
 live-skip scales with band count). GPU 2033→~1300ms. All four MoE stacks on
 int8 MMQ; ledger (39)-(41) + plans/94-96 carry the full evidence chain.
+
+### gdn_ar_swap token prefetch (plans/96, 2026-09-25) — shipped
+
+The AR chain ran at 3.5µs/token = 180× its arithmetic cost — dependent
+global loads (k/q/v/βg per token) were latency-bound. Rotating software
+pipeline (issue ti+1 loads before ti's two shuffle reductions):
+63.5→55.4ms, bit-identical (CK_ALL checksums), gate 3/3. GPU 1303ms,
+pp512 **367.8 t/s**.
