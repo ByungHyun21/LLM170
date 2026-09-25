@@ -556,15 +556,17 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         // plans/93: tile_f32_w는 실측 역행(558ms vs 352ms) — 원판 유지.
                         // plans/95 P1 — 스키니 f32(n_out ≤ 512): tile_f32는
                         // n_out=4(hc down)에서 WG 32개·활성 128스레드로 점유
-                        // 붕괴 → K-분할판 f32s가 pp512 290 t/s(+27%). 단, 축소
-                        // 순서 변경이 로짓 0.2-0.35nat 드리프트(근접타이 아님,
-                        // 게이트 3/3 FAIL) — opt-in. §8 판정 원장 (40).
+                        // 붕괴 → K-분할판 f32s pp512 290 t/s(+27%).
+                        // §8 판정(원장 40): 로짓 0.2-0.35nat 드리프트(근접타이
+                        // 아님) — 사용자 승인으로 기준 스트림 재기록 후 기본
+                        // 승격(2026-09-25, f64 참조에 더 근사·llama.cpp와 동일
+                        // 클래스의 실행치 양자화). 킬스위치 =0.
                         if dty == 0
                             && n_out <= std::env::var("LLM170_VK_FT32S_MAX")
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(512)
-                            && std::env::var("LLM170_VK_FT32S").map(|v| v == "1").unwrap_or(false)
+                            && std::env::var("LLM170_VK_FT32S").map(|v| v != "0").unwrap_or(true)
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
