@@ -148,10 +148,17 @@ void main() {
             for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][q * 8 + p]);
             float ad = sAd[tr][q], am = sAm[tr][q];
             for (int c = 0; c < live_cnt; c++) {  // plans/96 v5: 실제 행만 MMA
-                int qsum = 0;
-                for (int p = 0; p < 8; p++) {
-                    qsum += sdot4p(uint(ra[p]), sB[c][q * 8 + p]);
-                }
+                // plans/96: 2누산기 트리 — 정수 덧셈 결합 순서 무관(exact),
+                // 의존 체인 8→4. 비트 불변(정수).
+                int q0 = sdot4p(uint(ra[0]), sB[c][q * 8])
+                       + sdot4p(uint(ra[2]), sB[c][q * 8 + 2])
+                       + sdot4p(uint(ra[4]), sB[c][q * 8 + 4])
+                       + sdot4p(uint(ra[6]), sB[c][q * 8 + 6]);
+                int q1 = sdot4p(uint(ra[1]), sB[c][q * 8 + 1])
+                       + sdot4p(uint(ra[3]), sB[c][q * 8 + 3])
+                       + sdot4p(uint(ra[5]), sB[c][q * 8 + 5])
+                       + sdot4p(uint(ra[7]), sB[c][q * 8 + 7]);
+                int qsum = q0 + q1;
                 acc[c] += sBd[c][q] * (ad * float(qsum) - am * sBsum[c][q]);
             }
         }
