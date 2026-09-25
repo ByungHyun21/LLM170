@@ -1596,3 +1596,11 @@ re-reads for t=512, while coopmat's 128-token slab amortizes weights.
 Scalar MMQ needs large token tiles to compete on dense, where its chains
 then lose to coopmat (prior q8mmq 64×64 result). Seventh MMQ negative;
 dense q8128 stands. Env-gated experiment retained.
+
+### Session close — memory wall closes the q4_K relayout axis (2026-09-25)
+
+The one remaining q4_K idea (scale-expanded relayout to eliminate the
+extraction ALU that sank MMQ v1-v4) is infeasible: the q4_K stacks are
+41.5GB; scale expansion alone adds +18.5GB against ~16-21GB free GTT.
+Session arc final: **225 → 358-362 t/s (+61%)**, GPU 2033→1357ms (−33%),
+52 commits, 7 MMQ negatives + 3 promotions fully mapped in the ledger.
