@@ -1702,3 +1702,10 @@ recomputing byte sums in staging (sBw LDS writes + 8 adds in MMA). Reading
 the precomputed qs0+qs1 instead eliminates sBw entirely: q4k 481.5→469.2ms,
 GPU ~1270ms, bit-identical (CK_ALL), gate 3/3, pp512 **382.8 t/s** (new
 session peak).
+
+### tile_q8128 q8r relayout (plans/96, 2026-09-25) — negative, reverted
+
+Routing the dense q8128 weights through the lossless q8r relayout (aligned
+1-load words, checker 0.000e0): 201.4 vs 195.7ms — no win; the unaligned
+merge amortizes against the f16-conversion ALU, and the relayout doubles
+dense-weight residency (raw carve + q8r GTT). Reverted.
