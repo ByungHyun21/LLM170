@@ -1465,3 +1465,10 @@ requires their packed-B quant layout + whole-graph execution.
 Gate baseline re-recorded to the f64-closer f32s stream; default pp512
 **268.6 t/s** (band 268-290, +16% over the serial baseline). Kill switch
 `LLM170_VK_FT32S=0` restores the legacy stream.
+
+### MMQ v3 single-wave geometry (plans/95 P2′ stage 1, 2026-09-25)
+
+64-thread WG (1×wave64, no cross-wave barriers) + BK_STEP=4: checker PASS,
+pp512 249.6 (with FT32S default) vs 268.6 sg1 — MoE tile 614 vs 543ms.
+Fifth confirmation: emulated coopmat f16 stays optimal for MoE on this
+stack. Remaining P2′ delta (packed-B quant layout) is the only untried axis.
