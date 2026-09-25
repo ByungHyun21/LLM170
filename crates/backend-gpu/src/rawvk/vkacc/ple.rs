@@ -195,6 +195,18 @@ impl llm170_core::matmul::EwOps for VkAcc {
     }
 
 
+    /// plans/97 — pos==0 상태 GPU zero-fill(gdn+conv).
+    fn frame_zero_states(&self, gdn: &[u64], conv: &[u64]) -> Result<(), String> {
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        let g = self.framebufs.lock();
+        for h in gdn.iter().chain(conv.iter()) {
+            let b = g.get(h).ok_or_else(|| format!("vk frame_zero: 핸들 없음: {h}"))?;
+            ctx.fill_zero_batch(b.buf, b.bytes)?;
+        }
+        Ok(())
+    }
+
     /// plans/97 — token_embd(Q8_0) gather + hc 방송. 테이블 1회 상주.
     fn emb_q8_gather_dev(
         &self,

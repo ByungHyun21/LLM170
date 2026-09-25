@@ -366,6 +366,22 @@ impl Frame4 {
         st: &SeqState4,
         d_state: usize,
     ) -> Result<(), Q4Error> {
+        // plans/97: pos==0이면 상태는 전부 영 — CPU 전사(측정 39-46ms) 대신
+        // GPU zero-fill(수십 µs). 킬: LLM170_VK_ZSYNC=0.
+        let zsync = st.pos == 0
+            && std::env::var("LLM170_VK_ZSYNC").map(|v| v != "0").unwrap_or(true);
+        if zsync {
+            let hs: Vec<u64> = self.st_gdn[seq]
+                .iter()
+                .chain(self.st_conv[seq].iter())
+                .copied()
+                .collect();
+            if acc.frame_zero_states(&hs, &[]).is_ok() {
+                self.dirty[seq] = false;
+                return Ok(());
+            }
+        }
+        let _st0 = std::time::Instant::now();
         for (ri, h) in self.st_gdn[seq].iter().enumerate() {
             let t = Self::transpose_pairs(&st.gdn_s[ri], d_state);
             acc.frame_write(*h, &t).map_err(Q4Error::Io)?;
