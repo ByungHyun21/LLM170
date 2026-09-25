@@ -115,7 +115,7 @@ void main() {
                 int p = w & 7;
                 int sb = sb0 + q;
                 if (rb < nt && q < lim) {
-                    uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+                    uint base = ((perm_pad[uint(r0e + rb)] == 0xFFFFFFFFu) ? 0u : perm_pad[uint(r0e + rb)]) * pc.xq_w;
                     uint wv = xq[base + uint(sb * 8 + p)];
                     sB[rb][w] = wv;
                     int ws = int(wv);
@@ -156,7 +156,10 @@ void main() {
     if (tr < nrow) {
         for (int c = 0; c < 16; c++) {
             if (c < nt) {
-                outv[uint(r0e + c) * pc.n_out + uint(row0 + tr)] = acc[c];
+                uint pr2 = perm_pad[uint(r0e + c)];
+            if (pr2 != 0xFFFFFFFFu) {
+                outv[pr2 * pc.n_out + uint(row0 + tr)] = acc[c];
+            }
             }
         }
     }

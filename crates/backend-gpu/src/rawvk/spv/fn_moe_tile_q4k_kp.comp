@@ -98,7 +98,7 @@ void main() {
     }
     float acc = 0.0;
     if (o < int(pc.n_out)) {
-        uint xr0 = (pc.mode == 1u ? r : perm_pad[r]) * pc.xq_w;
+        uint xr0 = ((pc.mode == 1u ? r : (perm_pad[r] == 0xFFFFFFFFu ? 0u : perm_pad[r]))) * pc.xq_w;
         uint xw_base = n_in >> 2;
         uint srow = ox4 * row_words;
         for (uint sIdx = 0u; sIdx < n_super; sIdx++) {

@@ -57,7 +57,8 @@ void main() {
     uint row_bytes = n_blocks * 34u;
     int tid = int(gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x);
     uint r = r0 + uint(rx);
-    uint xr0 = (pc.mode == 1u ? r : perm_pad[r]) * pc.xq_w;
+    uint pr_ = pc.mode == 1u ? r : perm_pad[r];
+    uint xr0 = (pr_ == 0xFFFFFFFFu ? 0u : pr_) * pc.xq_w;
     uint xw_base = n_in >> 2;
     float acc = 0.0;
     for (uint sIdx = 0u; sIdx < n_super; sIdx++) {
@@ -100,6 +101,9 @@ void main() {
         barrier();
     }
     if (o < int(pc.n_out) && r < rp) {
-        outv[r * pc.n_out + uint(o)] = acc;
+        // plans/96 G2: 직접산란(mode=1 밀집 도메인은 원래 그대로).
+        if (pc.mode == 1u || pr_ != 0xFFFFFFFFu) {
+            outv[pr_ * pc.n_out + uint(o)] = acc;
+        }
     }
 }
