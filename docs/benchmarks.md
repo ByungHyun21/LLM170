@@ -1654,3 +1654,9 @@ hoisting of the live count (removing 20 barriers/dispatch): **5.13ms vs sg1's
 5.43** — the emulated-coopmat stronghold finally falls. All four MoE stacks now
 run int8 MMQ. Baseline re-recorded (int8-exact precedent), gate 3/3 PASS,
 GPU ~1300ms, pp512 **365.5 t/s**.
+
+### q4_K MMQ v6 BM=128 (plans/96, 2026-09-25) — negative, reverted
+
+Doubling weight rows per WG (thread handles 2 rows): 13.3ms/dispatch vs v5's
+5.1 — doubled LDS (18KB+) collapses occupancy. Ninth q4_K variant negative;
+v5 (64×16, live-skip, hoisted) is the optimum of this family on the stack.
