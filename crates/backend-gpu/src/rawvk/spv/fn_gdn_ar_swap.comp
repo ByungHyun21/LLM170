@@ -5,6 +5,8 @@
 // s[pair·d·d + u·d + lane·4+j], grid (d, h_v), 32레인 = kdim 4개/레인,
 // 토큰 순차 재귀(상태 레지스터 유지 → 청크 경계에서 이어짐).
 // q는 1/√d 스케일 완료 가정(scale=1.0).
+// plans/96: 다음 토큰 k/q/v/βg 프리페치 — 리덕션 셔플이 로드 레이턴시
+// 를 덮는 회전 파이프라인(실측 3.5µs/tok = 로드 레이턴시 바운드).
 layout(local_size_x = 32) in;
 layout(binding = 0) buffer S { float s[]; };
 layout(binding = 1) readonly buffer Q { float q[]; };
@@ -20,43 +22,67 @@ void main() {
     int pair = int(gl_WorkGroupID.y);
     int lane = int(gl_SubgroupInvocationID) & 31;   // 서브그룹 하위 32레인 사용
     int base_s = pair * pc.d * pc.d;
-    float ssr0 = s[base_s + u * pc.d + ((lane << 2) + 0)];
-    float ssr1 = s[base_s + u * pc.d + ((lane << 2) + 1)];
-    float ssr2 = s[base_s + u * pc.d + ((lane << 2) + 2)];
-    float ssr3 = s[base_s + u * pc.d + ((lane << 2) + 3)];
+    float ssr0 = s[base_s + pc.d * u + ((lane << 2) + 0)];
+    float ssr1 = s[base_s + pc.d * u + ((lane << 2) + 1)];
+    float ssr2 = s[base_s + pc.d * u + ((lane << 2) + 2)];
+    float ssr3 = s[base_s + pc.d * u + ((lane << 2) + 3)];
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    // 토큰 0 선로드.
+    int ad = (lane << 2);
+    float K0 = k[pc.ks * 0 + kh * pc.d + ad + 0];
+    float K1 = k[pc.ks * 0 + kh * pc.d + ad + 1];
+    float K2 = k[pc.ks * 0 + kh * pc.d + ad + 2];
+    float K3 = k[pc.ks * 0 + kh * pc.d + ad + 3];
+    float Q0 = q[pc.ks * 0 + kh * pc.d + ad + 0];
+    float Q1 = q[pc.ks * 0 + kh * pc.d + ad + 1];
+    float Q2 = q[pc.ks * 0 + kh * pc.d + ad + 2];
+    float Q3 = q[pc.ks * 0 + kh * pc.d + ad + 3];
+    float Vv = v[pc.vs * 0 + pc.d * pair + u];
+    float Be = bg[pc.hv * 2 * 0 + pair * 2];
+    float Ge = bg[pc.hv * 2 * 0 + pair * 2 + 1];
     for (int ti = 0; ti < pc.t; ti++) {
-        int h = pair % pc.hv;
-        int kh = h % pc.hk;
-        int qk0 = ti * pc.ks + kh * pc.d;
-        int v0 = ti * pc.vs + h * pc.d;
-        float beta = bg[ti * pc.hv * 2 + pair * 2];
-        float g_exp = bg[ti * pc.hv * 2 + pair * 2 + 1];
-        ssr0 *= g_exp; ssr1 *= g_exp; ssr2 *= g_exp; ssr3 *= g_exp;
-        float k0 = k[qk0 + ((lane << 2) + 0)];
-        float k1 = k[qk0 + ((lane << 2) + 1)];
-        float k2 = k[qk0 + ((lane << 2) + 2)];
-        float k3 = k[qk0 + ((lane << 2) + 3)];
-        float part = ssr0 * k0 + ssr1 * k1 + ssr2 * k2 + ssr3 * k3;
+        // 다음 토큰 프리페치 — 주소는 ti+1에만 의존(리덕션과 병렬).
+        int tn = ti + 1;
+        bool more = tn < pc.t;
+        int qk1 = pc.ks * tn + kh * pc.d + ad;
+        int v1 = pc.vs * tn + pc.d * pair + u;
+        int b1 = pc.hv * 2 * tn + pair * 2;
+        float nK0 = more ? k[qk1 + 0] : 0.0;
+        float nK1 = more ? k[qk1 + 1] : 0.0;
+        float nK2 = more ? k[qk1 + 2] : 0.0;
+        float nK3 = more ? k[qk1 + 3] : 0.0;
+        float nQ0 = more ? q[qk1 + 0] : 0.0;
+        float nQ1 = more ? q[qk1 + 1] : 0.0;
+        float nQ2 = more ? q[qk1 + 2] : 0.0;
+        float nQ3 = more ? q[qk1 + 3] : 0.0;
+        float nV = more ? v[v1] : 0.0;
+        float nB = more ? bg[b1] : 0.0;
+        float nG = more ? bg[b1 + 1] : 0.0;
+        // 현재 토큰 계산(셔플 리덕션 2회 = 로드 커버).
+        ssr0 *= Ge; ssr1 *= Ge; ssr2 *= Ge; ssr3 *= Ge;
+        float part = ssr0 * K0 + ssr1 * K1 + ssr2 * K2 + ssr3 * K3;
         float sk = part;
         for (int off = 1; off < 32; off <<= 1) {
             float pj = subgroupShuffleXor(sk, off);
             sk += pj;
         }
-        float delta = (v[v0 + u] - sk) * beta;
-        ssr0 += k0 * delta; ssr1 += k1 * delta; ssr2 += k2 * delta; ssr3 += k3 * delta;
-        float op = ssr0 * q[qk0 + ((lane << 2) + 0)]
-                 + ssr1 * q[qk0 + ((lane << 2) + 1)]
-                 + ssr2 * q[qk0 + ((lane << 2) + 2)]
-                 + ssr3 * q[qk0 + ((lane << 2) + 3)];
+        float delta = (Vv - sk) * Be;
+        ssr0 += K0 * delta; ssr1 += K1 * delta; ssr2 += K2 * delta; ssr3 += K3 * delta;
+        float op = ssr0 * Q0 + ssr1 * Q1 + ssr2 * Q2 + ssr3 * Q3;
         float otot = op;
         for (int off = 1; off < 32; off <<= 1) {
             float pj = subgroupShuffleXor(otot, off);
             otot += pj;
         }
-        if (lane == 0) o[v0 + u] = otot * pc.scale;
+        if (lane == 0) o[pc.vs * ti + pc.d * pair + u] = otot * pc.scale;
+        // 회전.
+        K0 = nK0; K1 = nK1; K2 = nK2; K3 = nK3;
+        Q0 = nQ0; Q1 = nQ1; Q2 = nQ2; Q3 = nQ3;
+        Vv = nV; Be = nB; Ge = nG;
     }
-    s[base_s + u * pc.d + ((lane << 2) + 0)] = ssr0;
-    s[base_s + u * pc.d + ((lane << 2) + 1)] = ssr1;
-    s[base_s + u * pc.d + ((lane << 2) + 2)] = ssr2;
-    s[base_s + u * pc.d + ((lane << 2) + 3)] = ssr3;
+    s[base_s + pc.d * u + ((lane << 2) + 0)] = ssr0;
+    s[base_s + pc.d * u + ((lane << 2) + 1)] = ssr1;
+    s[base_s + pc.d * u + ((lane << 2) + 2)] = ssr2;
+    s[base_s + pc.d * u + ((lane << 2) + 3)] = ssr3;
 }
