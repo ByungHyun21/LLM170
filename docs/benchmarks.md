@@ -1490,3 +1490,11 @@ delta is first-chunk pipeline compilation. **Default steady-state = ~286
 t/s** (warm), and the earlier "host gap ~150-190ms" was mostly cold-rep
 artifact; the warm host gap is ~40ms. llm170 bench should quote warm reps
 for steady-state comparisons (llama-bench also warms up).
+
+### quant v2 (plans/95, 2026-09-25) — negative, reverted
+
+Word-per-thread remap with LDS group reductions: gate 3/3 PASS (bit-identical
+by construction and confirmed) but 281.0 vs 288.2 warm — v1's per-block serial
+scan is already L1/ILP-efficient. Seventh kernel-level negative. Platform
+landmines recorded: no early-return before barriers; vec4 SSBO views on frame
+buffers misbehave (scalar loads correct).
