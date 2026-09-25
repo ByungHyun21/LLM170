@@ -1627,3 +1627,11 @@ per-byte gap vs llama on the q4_K stack is the emulated-coopmat vs their
 pipeline difference that six MMQ attempts could not close on this driver.
 The exact row-list rework would only enable BN>10 — which is 100% padding
 at this batch size. **Lever closed as structurally void.**
+
+### HIP current state (plans/96 close, 2026-09-25)
+
+hip FN pp512 today: 265.4 / 276.1 t/s (reps) — the session's fusion/MMQ stack
+is vkacc-specific, so hip sits at its own baseline. **vk (346-362) now leads
+hip by ~28%** — the backends flipped during plans/94-96. Porting the fusion
+stack to rawhip/q4acc is the (multi-week) path to raising the hip column;
+near-term, vk is the FN prefill backend of record.
