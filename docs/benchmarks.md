@@ -1587,3 +1587,12 @@ Per-256-block scale caching + one-shot A staging: 8.38ms/dispatch vs v3's
 6.5 and sg1's 5.45 — the 64-word LDS block per row increases pressure and
 loses. Sixth q4_K MMQ negative; sg1 remains optimal (env-gated experiment
 path retained).
+
+### Dense q8 MMQ in q51mmq geometry (fn_tile_q8d, plans/96, 2026-09-25) — negative
+
+The winning MoE geometry (1-wave, 64×16 tiles) transplanted to dense q8:
+649.6ms vs tile_q8128's 206ms — the 16-token band forces ~32× weight
+re-reads for t=512, while coopmat's 128-token slab amortizes weights.
+Scalar MMQ needs large token tiles to compete on dense, where its chains
+then lose to coopmat (prior q8mmq 64×64 result). Seventh MMQ negative;
+dense q8128 stands. Env-gated experiment retained.
