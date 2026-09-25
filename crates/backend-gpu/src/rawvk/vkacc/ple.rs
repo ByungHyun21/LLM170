@@ -195,6 +195,57 @@ impl llm170_core::matmul::EwOps for VkAcc {
     }
 
 
+    /// plans/97 — token_embd(Q8_0) gather + hc 방송. 테이블 1회 상주.
+    fn emb_q8_gather_dev(
+        &self,
+        table_key: usize,
+        table: &[u8],
+        tokens: &[u32],
+        out: u64,
+        n: usize,
+        hc: usize,
+    ) -> Result<(), String> {
+        if n % 32 != 0 {
+            return Err("emb_q8g: n%32 != 0".into());
+        }
+        let t = tokens.len();
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        // 테이블 상주(1회) — ple_consts 캐시 재사용.
+        let tbl = {
+            let key = (table_key, table.len());
+            let mut c = self.ple_consts.lock();
+            if let Some(b) = c.get(&key) {
+                b.buf
+            } else {
+                let b = ctx.alloc_host(table.len())?;
+                unsafe { std::ptr::copy_nonoverlapping(table.as_ptr(), b.ptr, table.len()) };
+                let buf = b.buf;
+                c.insert(key, b);
+                buf
+            }
+        };
+        // 토큰 id 업로드 — 매 청크(직전 것 교체).
+        let rb = {
+            let key = (tokens.as_ptr() as usize, 1);
+            let mut c = self.ple_consts.lock();
+            c.remove(&key);
+            let b = ctx.alloc_host(tokens.len() * 4)?;
+            unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr() as *const u8, b.ptr, tokens.len() * 4) };
+            let buf = b.buf;
+            c.insert(key, b);
+            buf
+        };
+        let ob = self.fbuf(out)?;
+        let p = self.pipeline(&mut ctx, Slot::EmbQ8G)?;
+        let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
+        let bpr = n / 32;
+        let push = push_u32s(&[n as u32, t as u32, hc as u32, bpr as u32]);
+        let total = t * bpr;
+        ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
+        Ok(())
+    }
+
     /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL 테이블).
     /// CPU MT 59ms(t=512) → GPU ~0.3ms. 테이블은 wcache(283MB)로 1회 상주.
     #[allow(clippy::too_many_arguments)]

@@ -165,6 +165,7 @@ const FN_MOE_TILE_Q4K_KP_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_kp.
 /// plans/93 — PLE gate 병렬판(t>1 프리필용).
 const FN_PLE_GATE_MT_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate_mt.spv");
 const FN_PLE_GATHER_SPV: &[u8] = include_bytes!("../spv/fn_ple_gather.spv");
+const FN_EMB_Q8G_SPV: &[u8] = include_bytes!("../spv/fn_emb_q8g.spv");
 const FN_MOE_TILE_Q4K_SG2_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg2.spv");
 const FN_PLE_GATE_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate.spv");
 const FN_PLE_CONV_SPV: &[u8] = include_bytes!("../spv/fn_ple_conv.spv");
@@ -277,6 +278,8 @@ pub(crate) enum Slot {
     FnPleGate,
     FnPleGateMt,
     FnPleGather,
+    /// plans/97 — token_embd(Q8_0) gather + hc 방송.
+    EmbQ8G,
     FnMoeTileQ4kSg2,
     FnIdxScoreMt,
     FnIdxTopkMt,
@@ -463,6 +466,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
     (Slot::FnPleGather, "ple_gather", FN_PLE_GATHER_SPV, 3, 16),
+    (Slot::EmbQ8G, "emb_q8g", FN_EMB_Q8G_SPV, 3, 16),
     (Slot::FnMoeTileQ4kSg2, "moe_tile_q4k_sg2", FN_MOE_TILE_Q4K_SG2_SPV, 6, 16),
     (Slot::FnPleConv, "ple_conv", FN_PLE_CONV_SPV, 4, 20),
     (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),

@@ -63,19 +63,51 @@ pub(super) fn frame_forward_ex(
 
     // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
     {
+        let emb_t0 = std::time::Instant::now();
         let embd = model
             .w("token_embd.weight")
             .ok_or(Q4Error::MissingTensor("token_embd".into()))?;
-        let mut row = vec![0.0f32; n];
-        let mut r = vec![0.0f32; t * hc * n];
-        for (ti, &tok) in tokens.iter().enumerate() {
-            dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
-            for s in 0..hc {
-                r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
+        // plans/97: Q8_0 임베딩은 GPU gather(킬: LLM170_VK_EMBQ8=0).
+        // CPU 디퀀트는 측정 rep에서 콜드 54ms(GPU 유휴) — 커널은 수백 µs.
+        let mut gpu_ok = false;
+        if embd.ty == llm170_gguf::GgmlType::Q8_0
+            && std::env::var("LLM170_VK_EMBQ8").map(|v| v != "0").unwrap_or(true)
+        {
+            gpu_ok = (|| -> Result<(), Q4Error> {
+                acc.emb_q8_gather_dev(
+                    embd.data.as_ptr() as usize,
+                    embd.data,
+                    tokens,
+                    f.res_hc,
+                    n,
+                    hc,
+                )
+                .map_err(Q4Error::Io)
+            })()
+            .is_ok();
+            if !gpu_ok {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("# emb-q8g: 실패 — CPU 폴백"));
             }
         }
-        acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
-        acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
+        if gpu_ok {
+            acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
+        } else {
+            let mut row = vec![0.0f32; n];
+            let mut r = vec![0.0f32; t * hc * n];
+            for (ti, &tok) in tokens.iter().enumerate() {
+                dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
+                for s in 0..hc {
+                    r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
+                }
+            }
+            let emb_cpu_ms = emb_t0.elapsed().as_secs_f64() * 1e3;
+            acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+            acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
+            if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+                eprintln!("# emb t={t} hc={hc} ty={:?} cpu={emb_cpu_ms:.1}ms upload {:.1}ms", (embd.ty as u32), emb_t0.elapsed().as_secs_f64() * 1e3 - emb_cpu_ms);
+            }
+        }
     }
 
     // PLE n-gram 행 (호스트 해시)
