@@ -1515,3 +1515,11 @@ sentinel 0xFFFFFFFF + clamps across 13 tile kernels): permute_f32 dispatches
 144→0, GPU 1733→1707ms, dispatch count 2776→2632. Checkers 4/4 modes PASS,
 gate 7/8 (one failure in the documented engine nondeterminism class, 5
 consecutive re-runs PASS). Kill switch `LLM170_VK_DSCAT=0`.
+
+### G3-lite rms xq slot (plans/96, 2026-09-25) — reverted (unresolved)
+
+Dedicated xq slot for the RmsRows output cut quant 128.6→48.8ms in [ts], but
+the gate failed 3/3 even after fixing same-handle rewrites (f.xn is written
+twice per layer) — a second content-mismatch path remains unidentified
+(kill-switch OFF → PASS, isolating the slot). Reverted; debugging steps
+recorded in plans/96.
