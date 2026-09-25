@@ -1728,3 +1728,10 @@ f32 at 4B/elem per consumer — wins only with exactly 1 consumer, but the
 real MoE path has 2 (gate+up share xq via the pair slot) and dense has 2-3.
 The 49ms quant IS the minimal-pass representation. Lever closed
 (arithmetic, no build needed).
+
+### MMQ dot tree-split (plans/96, 2026-09-25) — shipped
+
+The compiler would not reassociate the sdot accumulation across the function
+boundary — 8-deep serial add chains. Manual 2-accumulator trees (integer-
+exact, bit-identical): q4k 469→453, q51 182→167, GPU ~1250ms, gate 3/3,
+pp512 **391.3 t/s** (new peak).
