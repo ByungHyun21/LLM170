@@ -477,7 +477,15 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 w0_override = Some(b);
                 per_expert_push = n_out * (n_in + (n_in / 32) * 4);
             }
-            let slot = if w0_override.is_some() {
+            if w.ty == GgmlType::Q5K
+                && wbufs.len() == 1
+                && std::env::var("LLM170_VK_Q5KMOE").map(|v| v != "0").unwrap_or(true)
+            {
+                w0_override = Some(vk::Buffer::null()); // 마커 — 실바인딩은 원본
+            }
+            let slot = if w.ty == GgmlType::Q5K && w0_override.is_some() {
+                Slot::FnMoeTileQ5kmmq
+            } else if w0_override.is_some() {
                 Slot::FnMoeTileQ8mmq
             } else {
                 match (w.ty, q4k_cm) {
@@ -515,10 +523,14 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             if let Some(b) = w0_override {
-                binds[0] = b;
+                if b != vk::Buffer::null() {
+                    binds[0] = b;
+                }
             }
             if let Some(b) = w0_override {
-                binds[0] = b;
+                if b != vk::Buffer::null() {
+                    binds[0] = b;
+                }
             }
             while binds.len() < 8 {
                 binds.push(dbuf);
@@ -533,6 +545,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     | Slot::FnMoeTileQ5k
                     | Slot::FnMoeTileQ4kMmq
                     | Slot::FnMoeTileQ8mmq
+                    | Slot::FnMoeTileQ5kmmq
             ) && std::env::var("LLM170_VK_DSCAT").map(|v| v != "0").unwrap_or(true);
             binds.push(xq);
             binds.push(if direct { ob } else { ygb });
@@ -552,7 +565,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // plans/95 v2: 64가중행 × 16할당행 타일 — 16행 밴드가
                 // moe_group 균일-전문가 보증 단위.
                 (n_out.div_ceil(64) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ8mmq) {
+            } else if matches!(slot, Slot::FnMoeTileQ8mmq | Slot::FnMoeTileQ5kmmq) {
                 (n_out.div_ceil(64) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kSg2) {
                 // plans/93 sg2: 32행/WG — 가중치 판독 절반.

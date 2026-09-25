@@ -150,6 +150,7 @@ const FN_MOE_TILE_Q4K_SC_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sc.
 const FN_MOE_TILE_Q4K_SG1F_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1f.spv");
 const FN_MOE_TILE_Q4K_MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_mmq.spv");
 const FN_MOE_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q8mmq.spv");
+const FN_MOE_TILE_Q5KMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q5kmmq.spv");
 /// plans/89 재개 — q4_K CM 1-서브그룹 판(엔진 결정적 — q51_sg1로 판명).
 /// plans/89 재개 — q4_K 8-서브블록 스테이징 판(반복/장벽 q51_sg1과 동일).
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
@@ -263,6 +264,8 @@ pub(crate) enum Slot {
     FnMoeTileQ4kMmq,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
+    /// plans/96 G3 — q5_K MoE 전문가 int8 MMQ 타일.
+    FnMoeTileQ5kmmq,
     FnMoeTileQ4kSg1f,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
@@ -472,6 +475,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
     (Slot::FnMoeTileQ4kMmq, "moe_tile_q4k_mmq", FN_MOE_TILE_Q4K_MMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ8mmq, "moe_tile_q8mmq", FN_MOE_TILE_Q8MMQ_SPV, 13, 28),
+    (Slot::FnMoeTileQ5kmmq, "moe_tile_q5kmmq", FN_MOE_TILE_Q5KMMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ4kSg1f, "moe_tile_q4k_sg1f", FN_MOE_TILE_Q4K_SG1F_SPV, 13, 28),
     (Slot::FnIdxScoreMt, "idx_score_mt", FN_IDX_SCORE_MT_SPV, 3, 20),
     (Slot::FnIdxTopkMt, "idx_topk_mt", FN_IDX_TOPK_MT_SPV, 3, 20),
