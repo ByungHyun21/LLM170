@@ -2102,3 +2102,12 @@ architecture ≈ 350-380 t/s. Reaching 500 requires breaking the per-dispatch
 pipeline-depth ceiling (multi-sub-block staging, fused quant+GEMM) rather
 than more arithmetic-class swaps. Best measured: **290 t/s opt-in** (default
 225, gate-green).
+
+P1b follow-up (fn_tile_f32e): a bit-exact variant (thread-per-output, identical
+multiplicands and serial order, no staging) passed the gate 3/3 and matched the
+checker to the digit — and measured 181.7 t/s (−21%). This closes the open
+question: the original tile_f32 was never staging-bound; the serial-order
+semantics itself (10k-long dependent f32 chains per output) is the cost. The
+f32s speedup is inseparable from its reordering, so recovering +27% on the
+default path would require re-recording the gate baseline against the
+f64-closer f32s stream — a deliberate policy decision, not a kernel fix.
