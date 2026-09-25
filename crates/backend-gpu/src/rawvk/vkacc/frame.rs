@@ -146,7 +146,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let hit_on = pair_env == "1"; // =2: fill만(이분법 진단)
             let mut hit: Option<vk::Buffer> = None;
             if pair_on && hit_on {
-                let mut sl = self.moe_xq_pair.lock();
+                let sl = self.moe_xq_pair.lock();
                 if let Some((hx, hn, hr, b)) = sl.as_ref() {
                     if *hx == x && *hn == n_in && *hr == rows && (b.bytes as usize) >= rows * xq_w * 4 {
                         hit = Some(b.buf);
@@ -175,6 +175,15 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     };
                     let ds2 = ctx.bind_ds(&p, &[xb, tgt])?;
                     ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+                    // plans/96 G3 — 직전 SiluMul 출력이 이 x면 glu로 학습
+                    // (다음 층부터 silu+quant 융합).
+                    if self
+                        .last_silu_out
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == x
+                    {
+                        *self.moe_glu.lock() = Some((x, n_in));
+                    }
                     tgt
                 }
             }
