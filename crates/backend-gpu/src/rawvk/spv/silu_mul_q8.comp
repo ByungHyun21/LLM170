@@ -1,0 +1,61 @@
+#version 450
+
+// silu_mul_q8 (plans/96 G3) — SiluMul + quant_q8 융합.
+// out = silu(g)·u 를 f32 버퍼 왕복 없이 xq 레이아웃(qs|d|s0s1)에 직접 기록.
+// 산술 계약 — silu_mul.comp와 quant_q8.comp의 식을 그대로:
+//   v = (g/(1+exp(-g)))·u            (silu_mul 원식)
+//   amax/d/id/round/clamp/합 — quant_q8 원식 (f-리터럴, round-half-away)
+// 값은 레지스터 경유(메모리 경유와 동일한 f32 비트) → 체인과 비트 동일.
+// 1스레드=1블록(32원소) — quant v1의 검증 기하 그대로.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Gbuf { float g[]; };
+layout(binding = 1) readonly buffer Ubuf { float u[]; };
+layout(binding = 2) buffer Qbuf { uint xq[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint t; uint xq_w;
+} pc;
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    uint lb = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x; // 행 내 블록
+    uint nblk = pc.n_in >> 5;
+    if (lb >= nblk) return;
+    uint base = tok * pc.n_in;
+    uint qbase = tok * pc.xq_w;
+    uint nwords = pc.n_in >> 2;
+    int b = int(lb) << 5;
+
+    // 32원소 silu·mul + amax.
+    float vv[32];
+    float amax = 0.0;
+    for (int i = 0; i < 32; i++) {
+        float gv = g[base + uint(b + i)];
+        float v = (gv / (1.0 + exp(-gv))) * u[base + uint(b + i)];
+        vv[i] = v;
+        amax = max(amax, abs(v));
+    }
+    // f-리터럴 필수 — f64 승격 방지(quant_q8 주석 동일).
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint qs0 = 0u, qs1 = 0u;
+    for (int wi = 0; wi < 8; wi++) {
+        uint word = 0u;
+        for (int k = 0; k < 4; k++) {
+            float xv = vv[wi * 4 + k] * id;
+            float r = xv >= 0.0 ? float(int(xv + 0.5)) : -float(int(0.5 - xv));
+            float c = clamp(r, -127.0, 127.0);
+            word |= (uint(int(c)) & 0xFFu) << uint(k * 8);
+        }
+        xq[qbase + lb * 8u + uint(wi)] = word;
+        uint sd = 0u;
+        for (int k = 0; k < 4; k++) {
+            int bytev = int((word >> uint(8 * k)) & 0xFFu) << 24 >> 24;
+            sd += uint(bytev);
+        }
+        if (wi < 4) qs0 += sd; else qs1 += sd;
+    }
+    xq[qbase + nwords + lb] = floatBitsToUint(d);
+    uint qsb = pc.n_in / 4u + pc.n_in / 32u;
+    xq[qbase + qsb + lb * 2u] = qs0;
+    xq[qbase + qsb + lb * 2u + 1u] = qs1;
+}

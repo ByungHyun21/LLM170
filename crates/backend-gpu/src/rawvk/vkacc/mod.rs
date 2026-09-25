@@ -18,6 +18,7 @@ pub const ARGMAX2_SPV: &[u8] = include_bytes!("../spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("../spv/rms.spv");
 pub const RMS_WIDE_SPV: &[u8] = include_bytes!("../spv/rms_wide.spv");
 pub const SILU_SPV: &[u8] = include_bytes!("../spv/silu_mul.spv");
+pub const SILU_Q8_SPV: &[u8] = include_bytes!("../spv/silu_mul_q8.spv");
 /// plans/84 B — vk 프레임 경로 유틸 셰이더군.
 const SILU_DIV_SPV: &[u8] = include_bytes!("../spv/silu_div.spv");
 const SCALE_SPV: &[u8] = include_bytes!("../spv/scale.spv");
@@ -216,6 +217,8 @@ pub(crate) enum Slot {
     /// plans/85 §2 — 프레임 로짓 행별 argmax(2단계).
     FnArgmaxRows,
     Silu,
+    /// plans/96 G3 — SiluMul+quant 융합(프리필 MoE down 직결).
+    SiluMulQ8,
     /// plans/88 P1 — MoE direct-ids GEMV(전 타입, gemv3 파생).
     FnMoeIds,
     /// plans/88 P1 — f32/BF16 밀집 GEMV.
@@ -332,6 +335,9 @@ pub struct VkAcc {
     pub(crate) f32q8_cache: Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
     /// plans/95 P3a — q8_0 릴레이아웃 업로드 캐시: (가중 ptr,len) → VkBuf.
     pub(crate) q8r_bufs: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
+    /// plans/96 G3 — SiluMul 출력(mglu)→down 융합 학습: (핸들, n_in).
+    pub(crate) moe_glu: Mutex<Option<(u64, usize)>>,
+    pub(crate) last_silu_out: std::sync::atomic::AtomicU64,
     /// plans/96 G3 — MoE gate+up 연속 쌍의 quant 전용 슬롯: (x,n_in,rows) 키.
     /// 전용 버퍼(타 quant 불가침) + 두 엔진 호출 사이 무연산 — 세대 불필요.
     pub(crate) moe_xq_pair: Mutex<Option<(u64, usize, usize, VkBuf)>>,
@@ -424,6 +430,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
     (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
+    (Slot::SiluMulQ8, "silu_mul_q8", SILU_Q8_SPV, 3, 16),
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
     (Slot::Gemv8Q4B, "gemv8_q4b", GEMV8_Q4B_SPV, 10, 24),
     (Slot::MmF32b, "mm_f32b", MM_F32B_SPV, 10, 20),
@@ -540,6 +547,8 @@ impl VkAcc {
             moe_nobar: std::sync::atomic::AtomicBool::new(false),
             q8r_bufs: Mutex::new(std::collections::HashMap::new()),
             moe_xq_pair: Mutex::new(None),
+            moe_glu: Mutex::new(None),
+            last_silu_out: std::sync::atomic::AtomicU64::new(0),
             f32q8_cache: Mutex::new(std::collections::HashMap::new()),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
