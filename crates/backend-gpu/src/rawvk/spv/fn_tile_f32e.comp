@@ -1,0 +1,32 @@
+#version 450
+
+// fn_tile_f32e (plans/95 P1b) — 스키니 f32 밀집 GEMM, 비트 동일 고속판.
+// 원판 fn_tile_f32의 산술을 원소·순서까지 동일하게 보존: 각 출력 (o,t)의
+// 점적은 슬라이스 s0 승순 × 슬라이스 내 c 승순 직렬 f32 누산 — 원판 MAC
+// 루프와 같은 곱·같은 순서 → 비트 동일(스테이징은 값 복사일 뿐).
+// 원판의 병목(스테이징 패스·슬라이스당 배리어 2회·16×16 WG의 죽은 레인)
+// 제거: 스레드 = 출력 1개, w·x를 전역에서 직접 스트리밍(행 L2 상주,
+// 인접 스레드 동일 w 행 브로드캐스트). dty=0(f32) 전용.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer W0 { float w0[]; };
+layout(binding = 8) readonly buffer Xbuf { float xa[]; };
+layout(binding = 9) buffer Obuf { float outv[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint t;
+} pc;
+
+void main() {
+    // 평탄 출력 매핑: e = tid + wg*256 → (o = e / t, r = e % t).
+    // r 우선 — 인접 스레드가 같은 w 행(브로드캐스트)·연속 x(코얼레스).
+    uint e = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (e >= pc.n_out * pc.t) return;
+    uint o = e / pc.t;
+    uint r = e - o * pc.t;
+    uint wb = o * pc.n_in;
+    uint xb = r * pc.n_in;
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.n_in; k++) {
+        acc += w0[wb + k] * xa[xb + k];
+    }
+    outv[r * pc.n_out + o] = acc;
+}
