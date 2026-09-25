@@ -69,6 +69,14 @@ void main() {
     float acc[16];
     for (int c = 0; c < 16; c++) acc[c] = 0.0;
 
+    // plans/96: 밴드 실제 행 수(루프 불변) — 1회 계산.
+    int live_cnt = 0;
+    for (int q2 = 0; q2 < 16; q2++) {
+        if (r0e + q2 < int(rp) && perm_pad[uint(r0e + q2)] != 0xFFFFFFFFu) live_cnt = q2 + 1;
+    }
+    sLive = live_cnt;
+    barrier();
+
     for (int sb0 = 0; sb0 < n_sub; sb0 += 4) {
         int lim = min(4, n_sub - sb0);
         // ── A 스테이징: 64행 × 4sb — 스레드 tr이 자기 행 4블록 분량 담당.
@@ -109,14 +117,7 @@ void main() {
         }
         // ── B 스테이징: 16행 × 4sb — 스레드 0..63이 워드 분담(16×32=512).
         {
-            if (tid == 0u) {
-                int live = 0;
-                for (int q2 = 0; q2 < 16; q2++) {
-                    if (r0e + q2 < int(rp) && perm_pad[uint(r0e + q2)] != 0xFFFFFFFFu) live = q2 + 1;
-                }
-                sLive = live;
-            }
-            for (int i = int(tid); i < 16 * 32; i += 64) {
+            for (int i = int(tid); i < live_cnt * 32; i += 64) {  // plans/96: 실제 행만 스테이징
                 int rb = i >> 5;
                 int w = i & 31;
                 int q = w >> 3;
@@ -148,7 +149,7 @@ void main() {
             int ra[8];
             for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][q * 8 + p]);
             float ad = sAd[tr][q], am = sAm[tr][q];
-            for (int c = 0; c < sLive; c++) {  // plans/96 v5: 실제 행만 MMA
+            for (int c = 0; c < live_cnt; c++) {  // plans/96 v5: 실제 행만 MMA
                 int qsum = 0;
                 for (int p = 0; p < 8; p++) {
                     qsum += sdot4p(uint(ra[p]), sB[c][q * 8 + p]);
