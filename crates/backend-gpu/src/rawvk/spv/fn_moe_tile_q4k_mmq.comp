@@ -1,11 +1,12 @@
 #version 450
 
-// fn_moe_tile_q4k_mmq v4 (plans/96 G3) — q4_K MoE MMQ, 블록 단위 스케일 캐싱.
-// v3(614ms vs sg1 543)의 개선: 외부 루프를 256-블록으로 — 8 sb의
-// (d·sc, dmin·m) 스케일과 qs 워드 64개를 블록당 1회 스테이징, 내부 8 MMA
-// 라운드는 A 재스테이징 없이 진행(스케일 추출 ALU 1/8, A LDS 왕복 동일).
-// 산술은 v3과 동일(dot_q4k_q8 구조, sb 승순). q51mmq 승리 기하(1-wave
-// 64스레드 × 64가중행 × 16할당행) 유지. sdot4p→OpSDot. 직접산란 드레인.
+// fn_moe_tile_q4k_mmq v5 (plans/96) — v3 기하 + 라이브-행 MMA 스킵 — 1-wave 기하 실험.
+// v2(256스레드·2배리어/sb)의 4경로 부정 후 마지막 미시험 축: **64스레드
+// = wave64 1개** — 웨이브 간 배리어 소거, BK_STEP=4(배리어 1회/4sb).
+// 타일 64가중행 × 16할당행(16행 밴드 = moe_group 균일-전문가 단위 유지).
+// 스레드 = 가중행 1개 × 16열. 산술 계약은 v2와 동일(dot_q4k_q8 구조,
+// sb 승순·정수 exact) — 게이트/체커 판정은 v2 전례와 동일 기대.
+// A는 LDS 협동 스테이징(코얼레스), B는 LDS + Σb 바이트합.
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly buffer W0 { uint w0c[]; };
 layout(binding = 8) readonly buffer Xq { uint xq[]; };
@@ -17,12 +18,13 @@ layout(push_constant) uniform PC {
     uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
 } pc;
 
-shared uint sA[64][64];       // 블록 전체 8sb × 8워드
-shared float sAd[64][8];
-shared float sAm[64][8];
-shared uint sB[16][8];
-shared float sBd[16];
-shared int sBw[16][8];
+shared uint sA[64][36];        // 4sb×8워드 + 상위 4칸은 스케일 팩 공간 재사용
+shared float sAd[64][4];
+shared float sAm[64][4];
+shared uint sB[16][32];
+shared float sBd[16][4];
+shared int sBw[16][32];   // 워드별 바이트합(단일 기록자 — 누적 레이스 폐지)
+shared int sLive;         // plans/96 v5: 밴드 실제 행 수
 
 float f16_exact(uint bits) {
     float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
@@ -32,6 +34,7 @@ float f16_exact(uint bits) {
     return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
 }
 
+// sdot4p 센티널 — OpSDot 치환(패처 실패 시 종료).
 int sdot4p(uint a, uint b) {
     int p0 = int(a & 0xFFu) * int(b & 0xFFu);
     int p1 = int((a >> 8) & 0xFFu) * int((b >> 8) & 0xFFu);
@@ -40,40 +43,45 @@ int sdot4p(uint a, uint b) {
     return (p0 + p1) + (p2 + p3);
 }
 
+// 블록 워드 wq의 scales 12B에서 i번째 바이트.
 uint sbyte(uint wq, int i) {
     return (w0c[wq + 1u + uint(i >> 2)] >> uint((i & 3) * 8)) & 0xFFu;
 }
 
 void main() {
     uint bid = gl_WorkGroupID.x;
-    uint tidy = gl_WorkGroupID.y;
+    uint tidy = gl_WorkGroupID.y;   // 16행 밴드
     uint tid = gl_LocalInvocationID.x;
     int n_in = int(pc.n_in);
-    int n_blk = n_in >> 8;
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 64;
+    int nrow = int(min(64u, pc.n_out - uint(row0)));
     int r0e = int(tidy) * 16;
     uint rp = rows_pad[0];
     if (uint(r0e) >= rp) return;
     uint e = rowexp[uint(r0e)];
     int nt = int(min(16u, rp - uint(r0e)));
-    int row0 = int(bid) * 64;
-    int nrow = int(min(64u, pc.n_out - uint(row0)));
     uint row_words = uint(n_in >> 8) * 36u;
     uint ebase = e * (pc.per_expert_bytes >> 2);
     uint qw = uint(n_in >> 2);
 
-    int tr = int(tid);
+    int tr = int(tid);             // 가중행 = 스레드
     float acc[16];
     for (int c = 0; c < 16; c++) acc[c] = 0.0;
 
-    for (int blk = 0; blk < n_blk; blk++) {
-        // ── A: 블록 전체(8sb) 1회 스테이징 — 스케일 추출 포함.
+    for (int sb0 = 0; sb0 < n_sub; sb0 += 4) {
+        int lim = min(4, n_sub - sb0);
+        // ── A 스테이징: 64행 × 4sb — 스레드 tr이 자기 행 4블록 분량 담당.
         {
             int row = row0 + tr;
             if (row < row0 + nrow) {
-                uint wq = ebase + uint(row) * row_words + uint(blk) * 36u;
-                float d = f16_exact(w0c[wq] & 0xFFFFu);
-                float dmin = f16_exact(w0c[wq] >> 16);
-                for (int j = 0; j < 8; j++) {
+                uint wq4 = ebase + uint(row) * row_words + uint(sb0 >> 3) * 36u;
+                for (int q = 0; q < lim; q++) {
+                    int sb = sb0 + q;
+                    uint wq = wq4; // (sb>>3)==(sb0>>3) 성립: 4|블록경계(8)
+                    float d = f16_exact(w0c[wq] & 0xFFFFu);
+                    float dmin = f16_exact(w0c[wq] >> 16);
+                    int j = sb & 7;
                     uint s_v, m_v;
                     if (j < 4) {
                         s_v = sbyte(wq, j) & 63u;
@@ -83,74 +91,82 @@ void main() {
                         s_v = (b_p4 & 0xFu) | ((sbyte(wq, j - 4) >> 6) << 4);
                         m_v = (b_p4 >> 4) | ((sbyte(wq, j) >> 6) << 4);
                     }
-                    sAd[tr][j] = d * float(s_v);
-                    sAm[tr][j] = dmin * float(m_v);
-                    uint qbase = wq + 4u + uint((j >> 1) * 8);
-                    bool hi = (j & 1) != 0;
+                    sAd[tr][q] = d * float(s_v);
+                    sAm[tr][q] = dmin * float(m_v);
+                    uint qbase = wq + 4u + uint(((sb & 7) >> 1) * 8);
+                    bool hi = (sb & 1) != 0;
                     for (int p = 0; p < 8; p++) {
                         uint w = w0c[qbase + uint(p)];
-                        sA[tr][j * 8 + p] = hi ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
+                        sA[tr][q * 8 + p] = hi ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
                     }
                 }
             } else {
-                for (int j = 0; j < 8; j++) {
-                    sAd[tr][j] = 0.0; sAm[tr][j] = 0.0;
-                    for (int p = 0; p < 8; p++) sA[tr][j * 8 + p] = 0u;
+                for (int q = 0; q < 4; q++) {
+                    sAd[tr][q] = 0.0; sAm[tr][q] = 0.0;
+                    for (int p = 0; p < 8; p++) sA[tr][q * 8 + p] = 0u;
                 }
             }
         }
-        // ── 내부 8 sb 라운드: B만 재스테이징.
-        for (int j = 0; j < 8; j++) {
-            int sb = blk * 8 + j;
-            {
-                for (int i = int(tid); i < 16 * 8; i += 64) {
-                    int rb = i >> 3;
-                    int p = i & 7;
-                    if (rb < nt) {
-                        uint pr_ = perm_pad[uint(r0e + rb)];
-                        uint base = (pr_ == 0xFFFFFFFFu ? 0u : pr_) * pc.xq_w;
-                        uint wv = xq[base + uint(sb * 8 + p)];
-                        sB[rb][p] = wv;
-                        int ws = int(wv);
-                        sBw[rb][p] = ((ws << 24) >> 24) + ((ws << 16) >> 24)
-                                   + ((ws << 8) >> 24) + (ws >> 24);
-                        if (p == 0) {
-                            sBd[rb] = uintBitsToFloat(xq[base + qw + uint(sb)]);
-                        }
-                    } else {
-                        sB[rb][p] = 0u;
-                        sBw[rb][p] = 0;
-                        if (p == 0) sBd[rb] = 0.0;
+        // ── B 스테이징: 16행 × 4sb — 스레드 0..63이 워드 분담(16×32=512).
+        {
+            if (tid == 0u) {
+                int live = 0;
+                for (int q2 = 0; q2 < 16; q2++) {
+                    if (r0e + q2 < int(rp) && perm_pad[uint(r0e + q2)] != 0xFFFFFFFFu) live = q2 + 1;
+                }
+                sLive = live;
+            }
+            for (int i = int(tid); i < 16 * 32; i += 64) {
+                int rb = i >> 5;
+                int w = i & 31;
+                int q = w >> 3;
+                int p = w & 7;
+                int sb = sb0 + q;
+                if (rb < nt && q < lim) {
+                    uint pr_ = perm_pad[uint(r0e + rb)];
+                    uint base = (pr_ == 0xFFFFFFFFu ? 0u : pr_) * pc.xq_w;
+                    uint wv = xq[base + uint(sb * 8 + p)];
+                    sB[rb][w] = wv;
+                    int ws = int(wv);
+                    sBw[rb][w] = ((ws << 24) >> 24) + ((ws << 16) >> 24)
+                               + ((ws << 8) >> 24) + (ws >> 24);
+                    if (p == 0) {
+                        sBd[rb][q] = uintBitsToFloat(xq[base + qw + uint(sb)]);
                     }
+                } else {
+                    sB[rb][w] = 0u;
+                    sBw[rb][w] = 0;
+                    if (p == 0) { sBd[rb][q] = 0.0; }
                 }
             }
-            memoryBarrierShared();
-            barrier();
-            {
-                int ra0 = j * 8;
-                float ad = sAd[tr][j], am = sAm[tr][j];
-                for (int c = 0; c < 16; c++) {
-                    int qsum = 0;
-                    for (int p = 0; p < 8; p++) {
-                        qsum += sdot4p(sA[tr][ra0 + p], sB[c][p]);
-                    }
-                    int bs = sBw[c][0] + sBw[c][1] + sBw[c][2] + sBw[c][3]
-                           + sBw[c][4] + sBw[c][5] + sBw[c][6] + sBw[c][7];
-                    acc[c] += sBd[c] * (ad * float(qsum) - am * float(bs));
-                }
-            }
-            barrier();
         }
+        memoryBarrierShared();
+        barrier();
+
+        // ── MMA: 스레드 tr — 자기 가중행 × 16열, sb 승순.
+        for (int q = 0; q < lim; q++) {
+            int ra[8];
+            for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][q * 8 + p]);
+            float ad = sAd[tr][q], am = sAm[tr][q];
+            for (int c = 0; c < sLive; c++) {  // plans/96 v5: 실제 행만 MMA
+                int qsum = 0;
+                for (int p = 0; p < 8; p++) {
+                    qsum += sdot4p(uint(ra[p]), sB[c][q * 8 + p]);
+                }
+                int bs = sBw[c][q * 8] + sBw[c][q * 8 + 1] + sBw[c][q * 8 + 2] + sBw[c][q * 8 + 3]
+                     + sBw[c][q * 8 + 4] + sBw[c][q * 8 + 5] + sBw[c][q * 8 + 6] + sBw[c][q * 8 + 7];
+                acc[c] += sBd[c][q] * (ad * float(qsum) - am * float(bs));
+            }
+        }
+        barrier();
     }
 
-    // ── 드레인: 직접산란.
+    // ── 드레인: 직접산란(G2 계약 — 원본 행 위치, 센티널 가드).
     if (tr < nrow) {
-        for (int c = 0; c < 16; c++) {
-            if (c < nt) {
-                uint pr2 = perm_pad[uint(r0e + c)];
-                if (pr2 != 0xFFFFFFFFu) {
-                    outv[pr2 * pc.n_out + uint(row0 + tr)] = acc[c];
-                }
+        for (int c = 0; c < nt; c++) {
+            uint pr2 = perm_pad[uint(r0e + c)];
+            if (pr2 != 0xFFFFFFFFu) {
+                outv[pr2 * pc.n_out + uint(row0 + tr)] = acc[c];
             }
         }
     }
