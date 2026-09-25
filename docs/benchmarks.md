@@ -1735,3 +1735,9 @@ The compiler would not reassociate the sdot accumulation across the function
 boundary — 8-deep serial add chains. Manual 2-accumulator trees (integer-
 exact, bit-identical): q4k 469→453, q51 182→167, GPU ~1250ms, gate 3/3,
 pp512 **391.3 t/s** (new peak).
+
+### tile_f32s MAC tree-split (plans/96, 2026-09-25) — negative, reverted
+
+2-accumulator FMA chains (32→16 deep): 73.3→71.7ms — within noise. Unlike
+the MMQ integer dots, the f32 MAC is bandwidth/LDS-bound, not
+latency-bound; a class change for no measurable win. Reverted.
