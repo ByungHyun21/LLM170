@@ -1482,3 +1482,11 @@ the doubled register pressure cost more. Sixth kernel-level negative. Every
 per-kernel axis on this stack is now measured: sg1/coopmat/q8128 are locally
 optimal; the remaining gap to llama 506 lives in graph-level structure
 (quant+GEMM fusion, single-graph execution, host chunk phases).
+
+### Warm-state correction (plans/95 close, 2026-09-25)
+
+`--reps 3`: rep0 271.3 / rep1 **288.2** / rep2 285.3 — the ~110ms rep0
+delta is first-chunk pipeline compilation. **Default steady-state = ~286
+t/s** (warm), and the earlier "host gap ~150-190ms" was mostly cold-rep
+artifact; the warm host gap is ~40ms. llm170 bench should quote warm reps
+for steady-state comparisons (llama-bench also warms up).
