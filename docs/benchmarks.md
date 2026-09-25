@@ -1761,3 +1761,9 @@ levers, 17 documented negatives, gate chain bit-stable throughout.
 LDS loads hoisted into registers before the dot tree (the in-argument
 indexing serialized them): q51 167→162ms, GPU ~1240-1254ms band,
 bit-identical (CK_ALL), gate 3/3.
+
+### q8/q5k B-preload + 4-tree (plans/96, 2026-09-25) — shipped
+
+Same pattern as q4k/q51 (integer-exact, bit-identical, CK_ALL clean,
+gate 3/3). All four MMQ kernels now use register-preloaded B words with
+depth-optimal accumulator trees.
