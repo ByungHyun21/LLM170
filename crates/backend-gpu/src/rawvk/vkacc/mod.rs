@@ -120,6 +120,8 @@ pub(crate) fn q8_0_relayout(data: &[u8], n_in: usize, n_out: usize) -> Vec<u8> {
 }
 /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일(A·B 동일 레이아웃 직접 내적).
 const FN_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_tile_q8mmq.spv");
+/// plans/95 P1b — 스키니 f32 비트 동일 고속판(직렬 순서 보존 직접 스트리밍).
+const FN_TILE_F32E_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32e.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
@@ -203,6 +205,8 @@ pub(crate) enum Slot {
     FnIdxExpand,
     Quant,
     FnTileF32s,
+    /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
+    FnTileF32e,
     /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
     FnTileQ8mmq,
     Rms,
@@ -432,6 +436,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
     (Slot::FnTileF32s, "tile_f32s", FN_TILE_F32S_SPV, 10, 20),
+    (Slot::FnTileF32e, "tile_f32e", FN_TILE_F32E_SPV, 10, 12),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
