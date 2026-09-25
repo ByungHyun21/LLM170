@@ -1523,3 +1523,12 @@ the gate failed 3/3 even after fixing same-handle rewrites (f.xn is written
 twice per layer) — a second content-mismatch path remains unidentified
 (kill-switch OFF → PASS, isolating the slot). Reverted; debugging steps
 recorded in plans/96.
+
+### G3-lite final verdict (plans/96, 2026-09-25)
+
+Third instrumented attempt (per-handle slot map): 291 fills, **0 hits —
+structurally impossible**. The rms output has exactly one quant consumer; the
+measured redundancy lives in GEMM outputs, outside the single-writer contract.
+Quant-dedup is only reachable by absorbing quant into consumer GEMMs (G3
+proper). Reverted; tree at clean HEAD (gate PASS/FAIL/PASS under sustained
+thermal load — the documented near-tie nondeterminism class, unrelated).
