@@ -1694,3 +1694,11 @@ q8128 (coopmat, 3 MMQ negatives). pp512 session-final **367.8 t/s (+64%)**.
 
 Cool-machine rep1: pp512 **373.9 t/s** — session arc 225 → **374 peak**
 (+66%). Gate PASS, tree clean at 967a684.
+
+### MMQ precomputed-sum readback (plans/96, 2026-09-25) — shipped
+
+quant_q8 already writes per-32-block sums into xq; the MMQ kernels were
+recomputing byte sums in staging (sBw LDS writes + 8 adds in MMA). Reading
+the precomputed qs0+qs1 instead eliminates sBw entirely: q4k 481.5→469.2ms,
+GPU ~1270ms, bit-identical (CK_ALL), gate 3/3, pp512 **382.8 t/s** (new
+session peak).
