@@ -1445,3 +1445,9 @@ Two MMQ rewrites validated correct but performance-negative; MoE wall at
 ~74 GB/s across seven approaches, dense q8 at ~25 GB/s across two. Path to
 500 = pipeline-depth work (multi-sub-block staging, quant+GEMM fusion), not
 arithmetic swaps. See decisions.md (40)(41).
+
+### q8mmq 4-sb batching (plans/95 follow-up, 2026-09-25)
+
+188.6 t/s (gate PASS, checker identical) — barrier count was not the
+bottleneck; scalar OpSDot MMA throughput is. Third confirmation that dense
+tiles on this stack favor emulated coopmat f16 over scalar int8 dot.
