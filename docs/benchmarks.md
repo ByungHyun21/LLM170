@@ -1755,3 +1755,9 @@ pp512 reps (warm): **397.4 / 390.5 t/s** — the 400 line is crossed in-band.
 pp4096: 356.1 (long-context also at session-best). Session arc final:
 225 → **~397 t/s (+77%)**, GPU 2033→1247ms (−39%), 91 commits, 13 shipped
 levers, 17 documented negatives, gate chain bit-stable throughout.
+
+### MMQ B-word register preload (plans/96, 2026-09-25) — shipped
+
+LDS loads hoisted into registers before the dot tree (the in-argument
+indexing serialized them): q51 167→162ms, GPU ~1240-1254ms band,
+bit-identical (CK_ALL), gate 3/3.
