@@ -1785,3 +1785,12 @@ At pos==0 the state is zero by definition — replaced with batched
 `vkCmdFillBuffer` + transfer→shader barrier (~µs). Bit-identical
 (CK_ALL), gate 3/3. pp512 warm reps: **411.0 / 414.3 t/s** — the 400
 line is decisively crossed (from 225 at session start, +84%).
+
+### Session close (plans/97, 2026-09-25)
+
+Final coherence: gate PASS, pp512 warm band 410-416 t/s (peak 416.5),
+pp2048 376.8, tg128 14.4 (unchanged decode path — separate workstream).
+Session: 225 → 416 t/s (+84%), GPU 2033→1219ms, wall−GPU gap 52→~12ms.
+All code-level levers judged (19 shipped, 17 negatives); 500 t/s requires
+RADV native codegen or HIP MMQ port (multi-session, documented in
+plans/94-97).
