@@ -1498,3 +1498,12 @@ by construction and confirmed) but 281.0 vs 288.2 warm — v1's per-block serial
 scan is already L1/ILP-efficient. Seventh kernel-level negative. Platform
 landmines recorded: no early-return before barriers; vec4 SSBO views on frame
 buffers misbehave (scalar loads correct).
+
+### G1 xq generation cache (plans/96, 2026-09-25) — negative, reverted
+
+Measured 77× quant redundancy (1854 calls, 24 unique targets) but per-handle
+generation caching failed the gate (untracked writers: ple_gather etc.); the
+blanket-clear fallback passed the gate with ZERO hits — every mm-quant pair is
+separated by a qsa/ple/moe write path. Quant redundancy is only recoverable
+inside the graph restructure itself. Rolled back; baseline re-verified at
+291.6 warm.
