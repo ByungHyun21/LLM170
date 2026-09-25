@@ -2111,3 +2111,11 @@ semantics itself (10k-long dependent f32 chains per output) is the cost. The
 f32s speedup is inseparable from its reordering, so recovering +27% on the
 default path would require re-recording the gate baseline against the
 f64-closer f32s stream — a deliberate policy decision, not a kernel fix.
+
+### (42) pp512 wall−GPU 갭의 진인은 상태 재전송이었다 (2026-09-25, plans/97)
+
+측정 rep마다 sync_states가 gdn+conv 상태를 CPU에서 전사(39-46ms, 매핑
+메모리 쓰기 특성상 대역폠 이하) — [ts] GPU 스팬 밖(첫 커널 전)이라 스팬
+디버그로는 보이지 않았다. pf-sync 호스트 계측(FRAME_TIME)으로 국소화,
+pos==0에서 상태가 영임을 이용해 GPU zero-fill로 대체. 학습: **호스트 측
+계측과 GPU 스팬 계측은 상보** — 갭 분석은 둘 다 있어야 끝난다.
