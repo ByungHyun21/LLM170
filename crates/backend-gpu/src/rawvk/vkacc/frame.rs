@@ -439,8 +439,18 @@ impl llm170_core::matmul::FrameState for VkAcc {
             while binds.len() < 8 {
                 binds.push(dbuf);
             }
+            // plans/96 G2: 직접산란 타일(기본 4종+v3)은 출력을 ob에 직접 —
+            // 스캐터(permute_f32) 폐지. 레거시 슬롯은 종전 yg+스캐터.
+            let direct = matches!(
+                slot,
+                Slot::FnMoeTileQ4kSg1
+                    | Slot::FnMoeTileQ51Sg1
+                    | Slot::FnMoeTileQ8
+                    | Slot::FnMoeTileQ5k
+                    | Slot::FnMoeTileQ4kMmq
+            ) && std::env::var("LLM170_VK_DSCAT").map(|v| v != "0").unwrap_or(true);
             binds.push(xq);
-            binds.push(ygb);
+            binds.push(if direct { ob } else { ygb });
             binds.push(rxb);
             binds.push(rpb);
             binds.push(ppb);
@@ -473,6 +483,10 @@ impl llm170_core::matmul::FrameState for VkAcc {
             if self.moe_nobar.load(std::sync::atomic::Ordering::Relaxed) {
                 ctx.nobar_next.set(true);
                 self.moe_nobar.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if direct {
+                // plans/96 G2: 드레인이 perm 맵으로 원본 행에 직접 기록 — 폐지.
+                return Ok(());
             }
             // 산란: out[i] = yg[inv_pad[i]] (행 순서 복원 — SiluMul/wsum 소비).
             let ps = self.pipeline(&mut ctx, Slot::PermuteF32)?;

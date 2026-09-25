@@ -76,7 +76,7 @@ void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
     int rb = int(tid >> 5);
     int k2 = int(tid & 31);
     if (live && rb < nt16) {
-        uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+        uint base = ((perm_pad[uint(r0e + rb)] == 0xFFFFFFFFu) ? 0u : perm_pad[uint(r0e + rb)]) * pc.xq_w;
         int xw = sb << 3;
         float yd = uintBitsToFloat(xq[base + uint((int(pc.n_in) >> 2) + sb)]);
         uint wv = xq[base + uint(xw + (k2 >> 2))];
@@ -110,7 +110,7 @@ void main() {
             int rb = i - r * nt16;
             float v = pc.mode == 2u
                 ? float(w0c[ebase + uint(row0 + r) * row_words] & 0xFFu)
-                : float(xq[perm_pad[uint(r0e + rb)] * pc.xq_w] & 0xFFu);
+                : float(xq[((perm_pad[uint(r0e + rb)] == 0xFFFFFFFFu) ? 0u : perm_pad[uint(r0e + rb)]) * pc.xq_w] & 0xFFu);
             outv[uint(r0e + rb) * pc.n_out + uint(row0 + r)] = v;
         }
         return;

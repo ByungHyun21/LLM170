@@ -80,6 +80,7 @@ void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
     if (live && rb < nt16) {
         // perm_pad는 활성 행 인덱스 — f32 버퍼에서 직접 판독.
         uint row = perm_pad[uint(r0e + rb)];
+        if (row == 0xFFFFFFFFu) row = 0u;
         int k_off = sb * 32 + k2;
         for (int e = 0; e < 8; e++) {
             B16[rb][colb + k2 + e] = float16_t(xa[row * pc.n_in + uint(k_off + e)]);
