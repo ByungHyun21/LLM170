@@ -1615,3 +1615,15 @@ gather traffic. Only llama-style exact row-list routing enables it — an
 architectural rework of moe_group + tile row addressing. Host gap remeasured
 at only ~60ms (4%): graph integration alone caps at +4%; BN=64 is the real
 final lever. Session final: 225→**346-362 t/s (+55%)**.
+
+### BN=64 verdict correction (plans/96, 2026-09-25)
+
+Re-analysis: at pp512 each expert has ~10 real rows = exactly one 16-band,
+and that band stages the expert's full weights ONCE — q4_K weight traffic is
+already 1× (512.9ms / 41.5GB = 81GB/s). llama's BN=64 amortizes MMA per
+staged A, not weight reads; on padding waste we are BETTER (10/16 live vs
+their 10/64), and per-32 dot counts are identical (8). The remaining ~25%
+per-byte gap vs llama on the q4_K stack is the emulated-coopmat vs their
+pipeline difference that six MMQ attempts could not close on this driver.
+The exact row-list rework would only enable BN>10 — which is 100% padding
+at this batch size. **Lever closed as structurally void.**
