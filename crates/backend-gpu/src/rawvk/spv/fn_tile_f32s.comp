@@ -10,6 +10,7 @@
 // (원장 §8 — 게이트 3회로 판정). dty=0(f32) 전용.
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer W0 { float w0[]; };
+layout(binding = 1) readonly buffer W0u { uint w0u[]; };  // BF16 뷰(dty=1)
 layout(binding = 8) readonly buffer Xbuf { float xa[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
@@ -48,22 +49,46 @@ void main() {
         // ── MAC: 이 스레드의 K 청크 [ks*32, ks*32+32) × 16출력.
         if (lim == 512u) {
             const uint c0 = ks * 32u;
-            for (uint o = 0u; o < 16u; o++) {
-                if (o0 + o >= pc.n_out) break;
-                const uint wb = (o0 + o) * pc.n_in + s0 + c0;
-                float a = acc[o];
-                for (uint c = 0u; c < 32u; c++) {
-                    a += w0[wb + c] * shx[tx][c0 + c];
+            if (pc.dty == 0u) {
+                for (uint o = 0u; o < 16u; o++) {
+                    if (o0 + o >= pc.n_out) break;
+                    const uint wb = (o0 + o) * pc.n_in + s0 + c0;
+                    float a = acc[o];
+                    for (uint c = 0u; c < 32u; c++) {
+                        a += w0[wb + c] * shx[tx][c0 + c];
+                    }
+                    acc[o] = a;
                 }
-                acc[o] = a;
+            } else {
+                // plans/96: BF16 — 워드당 2원소. c0=ks*32는 2의 배수(32k)이므로
+                // 청크는 항상 워드 정렬: 워드 인덱스 (s0+c0)>>1 부터 16워드.
+                for (uint o = 0u; o < 16u; o++) {
+                    if (o0 + o >= pc.n_out) break;
+                    const uint wb = (o0 + o) * (pc.n_in >> 1) + ((s0 + c0) >> 1);
+                    float a = acc[o];
+                    for (uint hw = 0u; hw < 16u; hw++) {
+                        vec2 wp = unpackHalf2x16(w0u[wb + hw]);
+                        a += wp.x * shx[tx][c0 + hw * 2u];
+                        a += wp.y * shx[tx][c0 + hw * 2u + 1u];
+                    }
+                    acc[o] = a;
+                }
             }
         } else {
-            // 꼬리 슬라이스 — 청크 경계 가드.
+            // 꼬리 슬라이스 — 청크 경계 가드. n_in은 2의 배수(BF16 워드 정렬
+            // — 실형상 2560). 요소 단위 루프로 경계 처리.
             for (uint o = 0u; o < 16u; o++) {
                 if (o0 + o >= pc.n_out) break;
                 float a = acc[o];
                 for (uint c = ks * 32u; c < min((ks + 1u) * 32u, lim); c++) {
-                    a += w0[(o0 + o) * pc.n_in + s0 + c] * shx[tx][c];
+                    float wv;
+                    if (pc.dty == 0u) {
+                        wv = w0[(o0 + o) * pc.n_in + s0 + c];
+                    } else {
+                        uint w2 = w0u[(o0 + o) * (pc.n_in >> 1) + ((s0 + c) >> 1)];
+                        wv = unpackHalf2x16((c & 1u) == 0u ? w2 : (w2 >> 16)).x;
+                    }
+                    a += wv * shx[tx][c];
                 }
                 acc[o] = a;
             }
