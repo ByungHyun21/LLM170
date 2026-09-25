@@ -1565,3 +1565,9 @@ total) — now an int8 MMQ with the lossless q8r relayout: 6.2ms each
 (31ms total, **−90ms**). Baseline re-recorded per the approved precedent
 (int8-exact class, llama.cpp-identical approach); gate 3/3 PASS,
 pp512 **340.5 t/s**. Kill switch `LLM170_VK_Q8MOE=0`.
+
+### q5_K MoE MMQ (plans/96 G3, 2026-09-25) — shipped
+
+q5_K-stack MoE downs: scalar 29ms → int8 MMQ 9.7ms per dispatch (58→19ms
+total). Checker PASS; baseline re-recorded per precedent (int8-exact), gate
+3/3. GPU 1448→1416ms, pp512 **348.4 t/s**. Kill switch `LLM170_VK_Q5KMOE=0`.
