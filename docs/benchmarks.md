@@ -1767,3 +1767,12 @@ bit-identical (CK_ALL), gate 3/3.
 Same pattern as q4k/q51 (integer-exact, bit-identical, CK_ALL clean,
 gate 3/3). All four MMQ kernels now use register-preloaded B words with
 depth-optimal accumulator trees.
+
+### GPU embedding gather (plans/97, 2026-09-25) — shipped
+
+`fn_emb_q8g`: Q8_0 token_embd gather + hyper-connection broadcast on GPU
+(bit-identical to CPU dequant, CK_ALL clean, gate 3/3). Replaces a
+cold-rep 54ms CPU dequant + 20MB upload; GPU 1249→1219ms (−30, upload
+path gone). Wall-neutral in bench: a ~90ms host-side serialization
+(frame-loop sync points) caps overlap — recorded as the next lever with
+[run-time] wait stats as the entry point.
