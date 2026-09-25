@@ -87,6 +87,8 @@ const FN_MOE_IDS51_SPV: &[u8] = include_bytes!("../spv/fn_moe_ids51.spv");
 /// plans/93 — f32 타일 와이드 토큰판(64토큰/WG, 가중 재판독 4× 절감).
 const FN_TILE_F32_W_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32_w.spv");
 const FN_TILE_F32_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32.spv");
+/// plans/95 P1 — 스키니 f32 타일(K-분할, 점유 붕괴 해소).
+const FN_TILE_F32S_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
@@ -199,6 +201,8 @@ pub(crate) enum Slot {
     /// plans/89 P1.2 — f32/BF16 밀집 프리필 타일.
     FnTileF32,
     FnTileF32W,
+    /// plans/95 P1 — 스키니 f32 밀집 타일(n_out ≤ 512, K-분할 16).
+    FnTileF32s,
     /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder 판 재사용).
     TileQ8128Cm,
     TileQ8msCm,
@@ -393,6 +397,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileQ8, "tile_q8", FN_TILE_Q8_SPV, 10, 20),
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
+    (Slot::FnTileF32s, "tile_f32s", FN_TILE_F32S_SPV, 10, 20),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
     (Slot::FnPleGather, "ple_gather", FN_PLE_GATHER_SPV, 3, 16),
