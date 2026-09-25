@@ -1557,3 +1557,11 @@ down quant dispatch): GPU 1671→**1535ms (−136)**, quant 63→45ms, silu_mul
 dispatches halved. Bit-identical by CK_ALL all-layer checksums (1350/1350
 lines). Gate 6/9 under sustained load (remaining FAILs match the baseline's
 documented near-tie rate). pp512 **321.2 t/s**.
+
+### q8_0 MoE MMQ (plans/96 G3, 2026-09-25) — shipped
+
+The 5 q8_0-stack MoE downs ran the legacy scalar tile at 24ms each (121ms
+total) — now an int8 MMQ with the lossless q8r relayout: 6.2ms each
+(31ms total, **−90ms**). Baseline re-recorded per the approved precedent
+(int8-exact class, llama.cpp-identical approach); gate 3/3 PASS,
+pp512 **340.5 t/s**. Kill switch `LLM170_VK_Q8MOE=0`.
