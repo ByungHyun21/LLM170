@@ -421,8 +421,12 @@ impl Engine4 {
             let acc = self.acc.as_deref().unwrap();
             let mut last = None;
             for ch in tokens.chunks(chunk) {
+                let _sync_t0 = std::time::Instant::now();
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
+                }
+                if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+                    eprintln!("# pf-sync {:.1}ms", _sync_t0.elapsed().as_secs_f64() * 1e3);
                 }
                 let ctx = Ctx { model: &self.model, acc: Some(acc) };
                 let logits = super::frame::frame_forward(
