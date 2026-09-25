@@ -89,6 +89,37 @@ const FN_TILE_F32_W_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32_w.spv");
 const FN_TILE_F32_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32.spv");
 /// plans/95 P1 — 스키니 f32 타일(K-분할, 점유 붕괴 해소).
 const FN_TILE_F32S_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s.spv");
+/// plans/95 P3a — q8_0 34B블록(d f16 + 32×i8) → xq 동일 레이아웃 무손실
+/// 릴레이아웃: 행당 [n_in 바이트 i8][n_in/32 f32 d]. 값·스케일 불변
+/// (f16→f32 확장은 정확). fn_tile_q8mmq의 A측 포맷.
+pub(crate) fn q8_0_relayout(data: &[u8], n_in: usize, n_out: usize) -> Vec<u8> {
+    let n_blocks = n_in / 32;
+    let row_bytes = n_in + n_blocks * 4;
+    let mut out = vec![0u8; n_out * row_bytes];
+    let f16 = |bits: u16| -> f32 {
+        let s = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+        let e = ((bits >> 10) & 0x1F) as i32;
+        let m = (bits & 0x3FF) as f32;
+        if e == 0 {
+            s * m * 5.960464477539063e-8
+        } else {
+            s * (1024.0 + m) * 2f32.powi(e - 25)
+        }
+    };
+    for r in 0..n_out {
+        let src = r * n_blocks * 34;
+        let dst = r * row_bytes;
+        for b in 0..n_blocks {
+            let sb = src + b * 34;
+            let d = f16(u16::from_le_bytes([data[sb], data[sb + 1]]));
+            out[dst + n_in + b * 4..dst + n_in + b * 4 + 4].copy_from_slice(&d.to_le_bytes());
+            out[dst + b * 32..dst + b * 32 + 32].copy_from_slice(&data[sb + 2..sb + 34]);
+        }
+    }
+    out
+}
+/// plans/95 P3a — q8_0 밀집 int8 MMQ 타일(A·B 동일 레이아웃 직접 내적).
+const FN_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_tile_q8mmq.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
@@ -171,6 +202,9 @@ pub(crate) enum Slot {
     FnIdxRank,
     FnIdxExpand,
     Quant,
+    FnTileF32s,
+    /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
+    FnTileQ8mmq,
     Rms,
     /// plans/92 P4.1 — 256스레드/행 판(대형 t). 디코드(t=1)는 32스레드 원판이
     /// 우수(실측 tg 11.21 vs 10.92 — WG 지연 dominated).
@@ -201,8 +235,6 @@ pub(crate) enum Slot {
     /// plans/89 P1.2 — f32/BF16 밀집 프리필 타일.
     FnTileF32,
     FnTileF32W,
-    /// plans/95 P1 — 스키니 f32 밀집 타일(n_out ≤ 512, K-분할 16).
-    FnTileF32s,
     /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder 판 재사용).
     TileQ8128Cm,
     TileQ8msCm,
@@ -294,8 +326,10 @@ pub struct VkAcc {
     pub(crate) moe_nobar: std::sync::atomic::AtomicBool,
     /// plans/93: F32→Q8_0 변환 캐시(가중 ptr, len 키) — 청크마다 재변환 방지.
     pub(crate) f32q8_cache: Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
+    /// plans/95 P3a — q8_0 릴레이아웃 업로드 캐시: (가중 ptr,len) → VkBuf.
+    pub(crate) q8r_bufs: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
+    /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크).
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
-    /// plans/89 P1.4 — PLE 상수 캐시: (ptr,len) → 버퍼(모델 가중 뷰라 안정).
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
 }
 
@@ -398,6 +432,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
     (Slot::FnTileF32s, "tile_f32s", FN_TILE_F32S_SPV, 10, 20),
+    (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
     (Slot::FnPleGather, "ple_gather", FN_PLE_GATHER_SPV, 3, 16),
@@ -495,6 +530,7 @@ impl VkAcc {
             moe_gen: std::sync::atomic::AtomicU64::new(0),
             moe_grp: Mutex::new(None),
             moe_nobar: std::sync::atomic::AtomicBool::new(false),
+            q8r_bufs: Mutex::new(std::collections::HashMap::new()),
             f32q8_cache: Mutex::new(std::collections::HashMap::new()),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
@@ -782,3 +818,41 @@ mod ple;
 mod qsa;
 
 
+
+#[cfg(test)]
+mod q8r_tests {
+    /// plans/95 P3a — 릴레이아웃 무손실 검증: 합성 q8_0 블록 ↔ 재조립 정합.
+    #[test]
+    fn q8_relayout_roundtrip() {
+        let n_in = 10240usize;
+        let n_out = 4usize;
+        let n_blocks = n_in / 32;
+        let mut raw = vec![0u8; n_out * n_blocks * 34];
+        let mut lcg = 0xfeedu64;
+        let mut nxt = || { lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1); lcg >> 33 };
+        for r in 0..n_out {
+            for b in 0..n_blocks {
+                let o = r * n_blocks * 34 + b * 34;
+                // 스케일: 0.5 고정(f16 비트 0x3800) — 값 검증 단순화.
+                raw[o] = 0x00; raw[o + 1] = 0x38;
+                for i in 0..32 {
+                    raw[o + 2 + i] = (nxt() & 0xFF) as u8;
+                }
+            }
+        }
+        let rel = super::q8_0_relayout(&raw, n_in, n_out);
+        let row_bytes = n_in + n_blocks * 4;
+        assert_eq!(rel.len(), n_out * row_bytes);
+        for r in 0..n_out {
+            for b in 0..n_blocks {
+                // i8 원소 순서·값 불변.
+                for i in 0..32 {
+                    assert_eq!(rel[r * row_bytes + b * 32 + i], raw[r * n_blocks * 34 + b * 34 + 2 + i], "r{r} b{b} i{i}");
+                }
+                // 스케일 f32 = 0.5.
+                let d = f32::from_le_bytes(rel[r * row_bytes + n_in + b * 4..][..4].try_into().unwrap());
+                assert_eq!(d, 0.5, "scale r{r} b{b}");
+            }
+        }
+    }
+}
