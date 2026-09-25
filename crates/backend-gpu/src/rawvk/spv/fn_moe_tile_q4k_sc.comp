@@ -74,7 +74,7 @@ void stage_b(int sb, int colb, bool live, int nt16, int tid, int r0e) {
     int rb = int(tid >> 2);
     int k2 = int(tid & 3) * 8;
     if (live && rb < nt16) {
-        uint base = perm_pad[uint(r0e + rb)] * pc.xq_w;
+        uint base = ((perm_pad[uint(r0e + rb)] == 0xFFFFFFFFu) ? 0u : perm_pad[uint(r0e + rb)]) * pc.xq_w;
         int xw = sb << 3;
         float yd = uintBitsToFloat(xq[base + uint((int(pc.n_in) >> 2) + sb)]);
         for (int e = 0; e < 8; e++) {
