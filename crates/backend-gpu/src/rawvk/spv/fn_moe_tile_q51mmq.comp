@@ -62,6 +62,14 @@ void main() {
     float acc[16];
     for (int c = 0; c < 16; c++) acc[c] = 0.0;
 
+    // plans/96: 밴드 실제 행 수(루프 불변) — 1회 계산.
+    int live_cnt = 0;
+    for (int q2 = 0; q2 < 16; q2++) {
+        if (r0e + q2 < int(rp) && perm_pad[uint(r0e + q2)] != 0xFFFFFFFFu) live_cnt = q2 + 1;
+    }
+    sLive = live_cnt;
+    barrier();
+
     for (int sb = 0; sb < n_sub; sb++) {
         // ── A: q5_1 → [nib 4워드][hi 4워드] + (d, mn).
         {
@@ -89,14 +97,7 @@ void main() {
         }
         // ── B: 16행 × 8워드 + 바이트합.
         {
-            if (tid == 0u) {
-                int live = 0;
-                for (int q = 0; q < 16; q++) {
-                    if (r0e + q < int(rp) && perm_pad[uint(r0e + q)] != 0xFFFFFFFFu) live = q + 1;
-                }
-                sLive = live;
-            }
-            for (int i = int(tid); i < 16 * 8; i += 64) {
+            for (int i = int(tid); i < live_cnt * 8; i += 64) {  // plans/96: 실제 행만
                 int rb = i >> 3;
                 int p = i & 7;
                 if (rb < nt) {
@@ -125,7 +126,7 @@ void main() {
             int ra[16];
             for (int p = 0; p < 16; p++) ra[p] = int(sA[tr][p]);
             float ad = sAd[tr], am = sAm[tr];
-            for (int c = 0; c < sLive; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)(37.5% ALU)
+            for (int c = 0; c < live_cnt; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)(37.5% ALU)
                 int qsum = 0;
                 for (int p = 0; p < 8; p++) {
                     qsum += sdot4p(uint(ra[p]), sB[c][p]);

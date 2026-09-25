@@ -514,15 +514,17 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
                     && std::env::var("LLM170_VK_Q4KSG1F").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kSg1f,
                 (GgmlType::Q4K, _) if wbufs.len() == 1 && rows <= 8192
-                    && std::env::var("LLM170_VK_Q4KSG1").map(|v| v != "0").unwrap_or(true) => {
+                    && std::env::var("LLM170_VK_Q4KSG1").map(|v| v == "1").unwrap_or(false) => {
                         if std::env::var("LLM170_VK_Q4KSG2").map(|v| v == "1").unwrap_or(false) {
                             Slot::FnMoeTileQ4kSg2
                         } else {
                             Slot::FnMoeTileQ4kSg1
                         }
                     }
+                // plans/96: q4_K MMQ v5(라이브 스킵+호이스티드) 승격 — 5.13ms
+                // vs sg1 5.43(8차 시험 첫 승리). 킬스위치 =0 → sg1(옵트인 =1).
                 (GgmlType::Q4K, _) if wbufs.len() == 1
-                    && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v == "1").unwrap_or(false) => Slot::FnMoeTileQ4kMmq,
+                    && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kMmq,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
                 (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
                 _ => Slot::FnMoeTileQ5k,

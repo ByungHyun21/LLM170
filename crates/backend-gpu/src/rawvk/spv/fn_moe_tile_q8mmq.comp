@@ -54,6 +54,14 @@ void main() {
     float acc[16];
     for (int c = 0; c < 16; c++) acc[c] = 0.0;
 
+    // plans/96: 밴드 실제 행 수(루프 불변) — 1회 계산.
+    int live_cnt = 0;
+    for (int q2 = 0; q2 < 16; q2++) {
+        if (r0e + q2 < int(rp) && perm_pad[uint(r0e + q2)] != 0xFFFFFFFFu) live_cnt = q2 + 1;
+    }
+    sLive = live_cnt;
+    barrier();
+
     for (int sb = 0; sb < n_sub; sb++) {
         // ── A: q8r 직판독 — 니블 전개 없음.
         {
@@ -71,14 +79,7 @@ void main() {
         }
         // ── B: 16행 × 8워드 — 스레드 분담.
         {
-            if (tid == 0u) {
-                int live = 0;
-                for (int q = 0; q < 16; q++) {
-                    if (r0e + q < int(rp) && perm_pad[uint(r0e + q)] != 0xFFFFFFFFu) live = q + 1;
-                }
-                sLive = live;
-            }
-            for (int i = int(tid); i < 16 * 8; i += 64) {
+            for (int i = int(tid); i < live_cnt * 8; i += 64) {  // plans/96: 실제 행만
                 int rb = i >> 3;
                 int p = i & 7;
                 int sbi = sb;
@@ -103,7 +104,7 @@ void main() {
             int ra[8];
             for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][p]);
             float ad = sAd[tr];
-            for (int c = 0; c < sLive; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)
+            for (int c = 0; c < live_cnt; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)
                 int qsum = 0;
                 for (int p = 0; p < 8; p++) {
                     qsum += sdot4p(uint(ra[p]), sB[c][p]);
