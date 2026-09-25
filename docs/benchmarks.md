@@ -1507,3 +1507,11 @@ blanket-clear fallback passed the gate with ZERO hits — every mm-quant pair is
 separated by a qsa/ple/moe write path. Quant redundancy is only recoverable
 inside the graph restructure itself. Rolled back; baseline re-verified at
 291.6 warm.
+
+### G2 direct scatter fold (plans/96, 2026-09-25) — shipped
+
+MoE tile drains now write original rows directly via the perm map (padding
+sentinel 0xFFFFFFFF + clamps across 13 tile kernels): permute_f32 dispatches
+144→0, GPU 1733→1707ms, dispatch count 2776→2632. Checkers 4/4 modes PASS,
+gate 7/8 (one failure in the documented engine nondeterminism class, 5
+consecutive re-runs PASS). Kill switch `LLM170_VK_DSCAT=0`.
