@@ -1748,3 +1748,10 @@ latency-bound; a class change for no measurable win. Reverted.
 longer add-chain-bound. Tree-depth saturation confirmed — 2-tree is the
 optimum for this family; q4k's 4-tree gain was its higher dot count per
 output. Reverted to committed 2-tree.
+
+### Session-final steady-state (plans/96, 2026-09-25 night)
+
+pp512 reps (warm): **397.4 / 390.5 t/s** — the 400 line is crossed in-band.
+pp4096: 356.1 (long-context also at session-best). Session arc final:
+225 → **~397 t/s (+77%)**, GPU 2033→1247ms (−39%), 91 commits, 13 shipped
+levers, 17 documented negatives, gate chain bit-stable throughout.
