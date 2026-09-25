@@ -145,6 +145,7 @@ impl VkAcc {
             let ds2 = ctx.bind_ds(&p, &[xbf, bq0])?;
             let push = push_u32s(&[n0 as u32, t as u32, xq0_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
+            if std::env::var_os("LLM170_Q_TRACE").is_some() { eprintln!("[q:dispf] n0={n0} t={t}"); }
         }
         // 2) gate/up GEMV (같은 xq0) — 상주 출력.
         // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로: gemv3 t-루프는
@@ -168,6 +169,7 @@ impl VkAcc {
             let ds2 = ctx.bind_ds(&p, &[bglu, bq1])?;
             let push = push_u32s(&[n_ff as u32, t as u32, xq1_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
+            if std::env::var_os("LLM170_Q_TRACE").is_some() { eprintln!("[q:dispff] n_ff={n_ff} t={t}"); }
         }
         // 5) down GEMV
         {
