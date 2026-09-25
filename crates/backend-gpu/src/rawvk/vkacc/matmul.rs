@@ -575,8 +575,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
+                            // W0u(slot1)에도 동일 버퍼 — BF16 uint 뷰.
                             while binds.len() < 8 {
-                                binds.push(dbuf);
+                                binds.push(if binds.len() == 1 { wbufs[0] } else { dbuf });
                             }
                             binds.push(xb);
                             binds.push(ob);
