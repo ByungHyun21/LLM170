@@ -147,10 +147,14 @@ if (p == 0) {
             for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][p]);
             float ad = sAd[tr], am = sAm[tr];
             for (int c = 0; c < live_cnt; c++) {  // plans/96: 실제 행만 MMA(패딩 스킵)
-                int qsum = 0;
-                for (int p = 0; p < 8; p++) {
-                    qsum += sdot4p(uint(ra[p]), sB[c][p]);
-                }
+                // plans/96: B 선적재 + 4-트리(정수 exact).
+                uint bw0 = sB[c][0], bw1 = sB[c][1], bw2 = sB[c][2], bw3 = sB[c][3];
+                uint bw4 = sB[c][4], bw5 = sB[c][5], bw6 = sB[c][6], bw7 = sB[c][7];
+                int t0 = sdot4p(uint(ra[0]), bw0) + sdot4p(uint(ra[4]), bw4);
+                int t1 = sdot4p(uint(ra[1]), bw1) + sdot4p(uint(ra[5]), bw5);
+                int t2 = sdot4p(uint(ra[2]), bw2) + sdot4p(uint(ra[6]), bw6);
+                int t3 = sdot4p(uint(ra[3]), bw3) + sdot4p(uint(ra[7]), bw7);
+                int qsum = (t0 + t1) + (t2 + t3);
                                 acc[c] += sBd[c] * (ad * float(qsum) - am * sBsum[c]);
             }
         }
