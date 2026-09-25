@@ -1802,3 +1802,13 @@ same band as default. The historical 347→115ms win applied when tile_f32
 dominated; today tile_f32 is only 33ms, so the conversion is moot.
 Default stays off. Also judged: rms_wide→hc_gate_mean fusion is
 structurally impossible (GEMMs sit between them in the op chain).
+
+### RADV 26.1.7 → 26.2.3 driver event (2026-09-25)
+
+System mesa upgraded to 26.2.3 (kisak). Measured on 26.2.3: pp512
+409/414 t/s — same band as 26.1.7 (410-416): **no codegen gain** for the
+MMQ/coopmat paths (OpSDot still scalar-emulated). Numerics: f32 FMA
+contraction changed → 1159/1350 layer checksums diverge (gdn/attention
+chains), gate stream mismatches. Tile checkers stay ★. Decision: perf
+neutral → no reason to chase 26.2; stream re-record only if the system
+stays on 26.2.3 (driver-dependent f32 contraction = arithmetic class).
