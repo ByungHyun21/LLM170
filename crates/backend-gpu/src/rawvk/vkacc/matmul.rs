@@ -417,6 +417,48 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         };
                     if dense_tile {
                         let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+                        // plans/95 P3a — q8_0 밀집 MMQ: A·B 동일 레이아웃 int8
+                        // 직접 내적(니블 전개 없음). 가중은 업로드 시 무손실
+                        // 릴레이아웃(q8r 캐시, 1회). tile_q8128(coopmat f16,
+                        // 25GB/s) 대체. 킬스위치 구조 — opt-in =1.
+                        if t >= 2
+                            && w.ty == GgmlType::Q8_0
+                            && std::env::var("LLM170_VK_Q8MMQ").map(|v| v == "1").unwrap_or(false)
+                        {
+                            let key = (w.data.as_ptr() as usize, w.data.len());
+                            let w8 = {
+                                let mut c = self.q8r_bufs.lock();
+                                if let Some(b) = c.get(&key) {
+                                    b.buf
+                                } else {
+                                    let bytes =
+                                        q8_0_relayout(w.data, n_in, w.n_out as usize);
+                                    let b = ctx.alloc_host(bytes.len())?;
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            bytes.as_ptr(),
+                                            b.ptr,
+                                            bytes.len(),
+                                        )
+                                    };
+                                    let buf = b.buf;
+                                    c.insert(key, b);
+                                    buf
+                                }
+                            };
+                            let p = self.pipeline(&mut ctx, Slot::FnTileQ8mmq)?;
+                            let mut binds: Vec<vk::Buffer> = vec![w8];
+                            while binds.len() < 8 {
+                                binds.push(dbuf);
+                            }
+                            binds.push(xq);
+                            binds.push(ob);
+                            let ds2 = ctx.bind_ds(&p, &binds)?;
+                            let push =
+                                push_u32s(&[n_in as u32, n_out as u32, t as u32, xq_w as u32]);
+                            ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(64), (t as u32).div_ceil(64), 1)?;
+                            continue;
+                        }
                         let chunk_words = (ctx.max_ssbo / 4) as u32;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {
@@ -457,6 +499,15 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                                     ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
                                 }
                             }
+                        // plans/95 P3 계측: q8128 형상 수집(1회성).
+                        if std::env::var_os("LLM170_Q8_TRACE").is_some() {
+                            static N8: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let n = N8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 12 {
+                                eprintln!("[q8128] #{n} n_in={n_in} n_out={n_out} t={t} big={big}");
+                            }
+                        }
                             continue;
                         }
                         match w.ty {
@@ -509,7 +560,10 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         // 순서 변경이 로짓 0.2-0.35nat 드리프트(근접타이 아님,
                         // 게이트 3/3 FAIL) — opt-in. §8 판정 원장 (40).
                         if dty == 0
-                            && n_out <= 512
+                            && n_out <= std::env::var("LLM170_VK_FT32S_MAX")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(512)
                             && std::env::var("LLM170_VK_FT32S").map(|v| v == "1").unwrap_or(false)
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
