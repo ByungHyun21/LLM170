@@ -1794,3 +1794,11 @@ Session: 225 → 416 t/s (+84%), GPU 2033→1219ms, wall−GPU gap 52→~12ms.
 All code-level levers judged (19 shipped, 17 negatives); 500 t/s requires
 RADV native codegen or HIP MMQ port (multi-session, documented in
 plans/94-97).
+
+### F32Q8 opt-in re-measure (plans/97 close, 2026-09-25) — neutral
+
+LLM170_F32Q8=1 (f32 weights → q8_0 for tile paths): 412.9/401.9 t/s —
+same band as default. The historical 347→115ms win applied when tile_f32
+dominated; today tile_f32 is only 33ms, so the conversion is moot.
+Default stays off. Also judged: rms_wide→hc_gate_mean fusion is
+structurally impossible (GEMMs sit between them in the op chain).
