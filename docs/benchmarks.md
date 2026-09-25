@@ -1718,3 +1718,13 @@ All MoE stacks on int8 MMQ; engine bit-stable at each promotion (CK_ALL
 checksum chain). Next-session levers documented in plans/96: quant GEMM
 internalization (§8), MMQ B-word LDS reduction, RADV coopmat nativeness as
 the final gate to 500.
+
+### Quant GEMM-internalization arithmetic verdict (plans/96 close)
+
+Fusing quant into consumer GEMMs (bit-identical per-block quantization) is a
+memory-traffic LOSS for every real shape: current pipeline costs 5B/elem
+(quant pass) + 1B/elem per consumer on the GEMM's B-read; fused re-reads
+f32 at 4B/elem per consumer — wins only with exactly 1 consumer, but the
+real MoE path has 2 (gate+up share xq via the pair slot) and dense has 2-3.
+The 49ms quant IS the minimal-pass representation. Lever closed
+(arithmetic, no build needed).
