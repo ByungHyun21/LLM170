@@ -1741,3 +1741,10 @@ pp512 **391.3 t/s** (new peak).
 2-accumulator FMA chains (32→16 deep): 73.3→71.7ms — within noise. Unlike
 the MMQ integer dots, the f32 MAC is bandwidth/LDS-bound, not
 latency-bound; a class change for no measurable win. Reverted.
+
+### q51 deeper tree (plans/96, 2026-09-25) — neutral, reverted
+
+4-tree on q51mmq (167.0→167.4ms): after the 2-tree, the q51 MMA is no
+longer add-chain-bound. Tree-depth saturation confirmed — 2-tree is the
+optimum for this family; q4k's 4-tree gain was its higher dot count per
+output. Reverted to committed 2-tree.
