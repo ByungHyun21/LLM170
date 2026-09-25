@@ -1776,3 +1776,12 @@ cold-rep 54ms CPU dequant + 20MB upload; GPU 1249→1219ms (−30, upload
 path gone). Wall-neutral in bench: a ~90ms host-side serialization
 (frame-loop sync points) caps overlap — recorded as the next lever with
 [run-time] wait stats as the entry point.
+
+### GPU state zero-fill at pos==0 (plans/97, 2026-09-25) — shipped
+
+Root-caused the wall−GPU gap: every fresh prefill paid 39-46ms uploading
+the (all-zero) gdn+conv state through CPU (`pf-sync` instrumentation).
+At pos==0 the state is zero by definition — replaced with batched
+`vkCmdFillBuffer` + transfer→shader barrier (~µs). Bit-identical
+(CK_ALL), gate 3/3. pp512 warm reps: **411.0 / 414.3 t/s** — the 400
+line is decisively crossed (from 225 at session start, +84%).
