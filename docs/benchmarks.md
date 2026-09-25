@@ -1812,3 +1812,11 @@ contraction changed → 1159/1350 layer checksums diverge (gdn/attention
 chains), gate stream mismatches. Tile checkers stay ★. Decision: perf
 neutral → no reason to chase 26.2; stream re-record only if the system
 stays on 26.2.3 (driver-dependent f32 contraction = arithmetic class).
+
+### Gate stream re-record on RADV 26.2.3 (2026-09-25)
+
+System now resident on mesa 26.2.3 (user system upgrade; perf identical
+408-416 t/s band). The driver's changed f32 FMA contraction is an
+arithmetic-class change → gate stream re-recorded (`--record`, precedent
+for class changes). Gate 3/3 PASS on the new stream. Baseline files
+updated; 26.1.7-era streams remain in git history.
