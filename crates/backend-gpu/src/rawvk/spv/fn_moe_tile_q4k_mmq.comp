@@ -23,7 +23,7 @@ shared float sAd[64][4];
 shared float sAm[64][4];
 shared uint sB[16][32];
 shared float sBd[16][4];
-shared int sBw[16][32];   // 워드별 바이트합(단일 기록자 — 누적 레이스 폐지)
+shared float sBsum[16][4]; // plans/96: quant 사전계산합 판독 — sBw 폐지
 shared int sLive;         // plans/96 v5: 밴드 실제 행 수
 
 float f16_exact(uint bits) {
@@ -126,18 +126,16 @@ void main() {
                 if (rb < nt && q < lim) {
                     uint pr_ = perm_pad[uint(r0e + rb)];
                     uint base = (pr_ == 0xFFFFFFFFu ? 0u : pr_) * pc.xq_w;
-                    uint wv = xq[base + uint(sb * 8 + p)];
-                    sB[rb][w] = wv;
-                    int ws = int(wv);
-                    sBw[rb][w] = ((ws << 24) >> 24) + ((ws << 16) >> 24)
-                               + ((ws << 8) >> 24) + (ws >> 24);
+                    sB[rb][w] = xq[base + uint(sb * 8 + p)];
                     if (p == 0) {
                         sBd[rb][q] = uintBitsToFloat(xq[base + qw + uint(sb)]);
+                        uint qsb = qw + (uint(n_in) >> 5);
+                        sBsum[rb][q] = float(int(xq[base + qsb + uint(sb * 2)])
+                                          + int(xq[base + qsb + uint(sb * 2) + 1u]));
                     }
                 } else {
                     sB[rb][w] = 0u;
-                    sBw[rb][w] = 0;
-                    if (p == 0) { sBd[rb][q] = 0.0; }
+                    if (p == 0) { sBd[rb][q] = 0.0; sBsum[rb][q] = 0.0; }
                 }
             }
         }
@@ -154,9 +152,7 @@ void main() {
                 for (int p = 0; p < 8; p++) {
                     qsum += sdot4p(uint(ra[p]), sB[c][q * 8 + p]);
                 }
-                int bs = sBw[c][q * 8] + sBw[c][q * 8 + 1] + sBw[c][q * 8 + 2] + sBw[c][q * 8 + 3]
-                     + sBw[c][q * 8 + 4] + sBw[c][q * 8 + 5] + sBw[c][q * 8 + 6] + sBw[c][q * 8 + 7];
-                acc[c] += sBd[c][q] * (ad * float(qsum) - am * float(bs));
+                acc[c] += sBd[c][q] * (ad * float(qsum) - am * sBsum[c][q]);
             }
         }
         barrier();
