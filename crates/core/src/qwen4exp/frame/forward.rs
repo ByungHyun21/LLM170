@@ -475,7 +475,11 @@ pub(super) fn frame_forward_ex(
         }
         let mut logits = vec![0.0f32; hp.vocab];
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
+        let _lt0 = std::time::Instant::now();
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
+        if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+            eprintln!("# logits-d2h {:.1}ms (vocab {})", _lt0.elapsed().as_secs_f64() * 1e3, hp.vocab);
+        }
         // plans/93 P2: 판독으로 GPU 유휴 — 디바이스 링 CPU 재동기(프리필 t>1
         // 포함: 폴백·스냅샷·롤백의 ple_conv 정합 유지).
         if ple_dev {
