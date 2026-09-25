@@ -1635,3 +1635,14 @@ is vkacc-specific, so hip sits at its own baseline. **vk (346-362) now leads
 hip by ~28%** — the backends flipped during plans/94-96. Porting the fusion
 stack to rawhip/q4acc is the (multi-week) path to raising the hip column;
 near-term, vk is the FN prefill backend of record.
+
+### MMQ live-row MMA skip (plans/96, 2026-09-25) — shipped
+
+Decomposition experiment (pp 512/384/256) fit sg1 perfectly to
+1.52ms fixed weight staging + 0.00766ms/token MMA — 72% of sg1 is MMA, and
+~6 of 16 band columns are sentinel padding (37.5% pure waste). The scalar
+MMQ family now skips dead columns via a computed live-row count:
+q51mmq 233.5→205.7ms etc. (**−30ms**). q4_K MMQ v5 (with the same skip,
+sentinel clamp, and a G2-contract drain fix that had silently broken the
+env path) reached 5.84ms/dispatch — still 7% behind sg1 (5.43); seventh
+attempt, sg1 confirmed. Gate 3/3, pp512 **355.1 t/s**.
