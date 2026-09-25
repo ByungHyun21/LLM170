@@ -1472,3 +1472,13 @@ Gate baseline re-recorded to the f64-closer f32s stream; default pp512
 pp512 249.6 (with FT32S default) vs 268.6 sg1 — MoE tile 614 vs 543ms.
 Fifth confirmation: emulated coopmat f16 stays optimal for MoE on this
 stack. Remaining P2′ delta (packed-B quant layout) is the only untried axis.
+
+### q8128 two-slab restructure (plans/95, 2026-09-25) — negative, rolled back
+
+Confirmed structurally: the big path re-reads row-block weights per 128-token
+slab (4× at t=512) — but the 2-slab inner restructure regressed to 241.1 t/s
+(vs 271) AND flipped the gate stream: L2 was already absorbing the re-reads;
+the doubled register pressure cost more. Sixth kernel-level negative. Every
+per-kernel axis on this stack is now measured: sg1/coopmat/q8128 are locally
+optimal; the remaining gap to llama 506 lives in graph-level structure
+(quant+GEMM fusion, single-graph execution, host chunk phases).
