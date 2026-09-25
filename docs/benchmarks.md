@@ -1660,3 +1660,15 @@ GPU ~1300ms, pp512 **365.5 t/s**.
 Doubling weight rows per WG (thread handles 2 rows): 13.3ms/dispatch vs v5's
 5.1 — doubled LDS (18KB+) collapses occupancy. Ninth q4_K variant negative;
 v5 (64×16, live-skip, hoisted) is the optimum of this family on the stack.
+
+### Session-final full picture (plans/96, 2026-09-25)
+
+| metric | session start | final |
+|---|---|---|
+| pp512 | 225 | **340-366** (band, +55-62%) |
+| pp4096 | — | 335.6 |
+| tg128 | — | 14.6 |
+
+The MMQ-v5 promotion benefits long-context too (pp4096 336 ≈ pp512 — the
+live-skip scales with band count). GPU 2033→~1300ms. All four MoE stacks on
+int8 MMQ; ledger (39)-(41) + plans/94-96 carry the full evidence chain.
