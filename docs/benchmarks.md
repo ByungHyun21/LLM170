@@ -1646,3 +1646,11 @@ q51mmq 233.5→205.7ms etc. (**−30ms**). q4_K MMQ v5 (with the same skip,
 sentinel clamp, and a G2-contract drain fix that had silently broken the
 env path) reached 5.84ms/dispatch — still 7% behind sg1 (5.43); seventh
 attempt, sg1 confirmed. Gate 3/3, pp512 **355.1 t/s**.
+
+### q4_K MMQ v5 PROMOTED (plans/96, 2026-09-25) — the 8th attempt wins
+
+v3 geometry + live-row MMA skip + live-limited B staging + loop-invariant
+hoisting of the live count (removing 20 barriers/dispatch): **5.13ms vs sg1's
+5.43** — the emulated-coopmat stronghold finally falls. All four MoE stacks now
+run int8 MMQ. Baseline re-recorded (int8-exact precedent), gate 3/3 PASS,
+GPU ~1300ms, pp512 **365.5 t/s**.
