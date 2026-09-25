@@ -1459,3 +1459,9 @@ baseline) — reverted. Fourth consistent negative: barrier/K-depth is not the
 bottleneck on any path (q8mmq 4-sb, sg1 4-sb both regressed). The remaining
 MoE gap vs llama is not reachable by geometry tuning of our kernels; it
 requires their packed-B quant layout + whole-graph execution.
+
+### FT32S default promotion (plans/95, user-approved 2026-09-25)
+
+Gate baseline re-recorded to the f64-closer f32s stream; default pp512
+**268.6 t/s** (band 268-290, +16% over the serial baseline). Kill switch
+`LLM170_VK_FT32S=0` restores the legacy stream.
