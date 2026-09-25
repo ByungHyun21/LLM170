@@ -1709,3 +1709,12 @@ Routing the dense q8128 weights through the lossless q8r relayout (aligned
 1-load words, checker 0.000e0): 201.4 vs 195.7ms — no win; the unaligned
 merge amortizes against the f16-conversion ALU, and the relayout doubles
 dense-weight residency (raw carve + q8r GTT). Reverted.
+
+### Session close — final rep (plans/96, 2026-09-25 evening)
+
+pp512 **383.5 t/s** (cool rep1). Session arc: 225 → **383.5 (+71%)**, GPU
+2033→~1270ms (−38%), 80 commits, 14 documented negatives + 11 shipped levers.
+All MoE stacks on int8 MMQ; engine bit-stable at each promotion (CK_ALL
+checksum chain). Next-session levers documented in plans/96: quant GEMM
+internalization (§8), MMQ B-word LDS reduction, RADV coopmat nativeness as
+the final gate to 500.
