@@ -290,6 +290,11 @@ pub trait EwOps: Send + Sync {
     /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
     /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
     #[allow(clippy::too_many_arguments)]
+    /// plans/97 — pos==0 상태의 GPU zero-fill(gdn+conv). 실패 시 CPU 업로드 폴백.
+    fn frame_zero_states(&self, _gdn: &[u64], _conv: &[u64]) -> Result<(), String> {
+        Err("frame_zero_states: 미지원".into())
+    }
+
     /// plans/97 — token_embd(Q8_0) gather + hc 방송 GPU 오프로드.
     #[allow(clippy::too_many_arguments)]
     fn emb_q8_gather_dev(

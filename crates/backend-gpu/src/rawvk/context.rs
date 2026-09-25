@@ -412,6 +412,30 @@ impl VkCtx {
         Ok(())
     }
 
+    /// plans/97 — 상태 버퍼 zero-fill(배치 녹화 중 전제). 전송→셰이더 배리어 동반.
+    pub fn fill_zero_batch(&self, buf: vk::Buffer, bytes: usize) -> Result<(), String> {
+        if !self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("fill_zero_batch: 비배치".into());
+        }
+        unsafe {
+            let cb = self.cmdbuf2;
+            self.device.cmd_fill_buffer(cb, buf, 0, bytes as u64, 0u32);
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[bar],
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
         if std::env::var_os("LLM170_VK_RUNTIME").is_some() {

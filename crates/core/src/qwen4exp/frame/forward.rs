@@ -59,6 +59,9 @@ pub(super) fn frame_forward_ex(
     let t = tokens.len();
     // plans/93 P2: PLE pos 기반 워터마크용 — 이 청크 시작 위치.
     let pos0 = seq_st.pos as usize;
+    if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+        eprintln!("# ff-entry t={t}");
+    }
     fs_begin(acc, t);
 
     // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
@@ -483,6 +486,9 @@ pub(super) fn frame_forward_ex(
             {
                 seq_st.ple_conv.copy_from_slice(&ring);
             }
+        }
+        if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+            eprintln!("# ff-pre-logits");
         }
         ftime_report(t);
         acc.ktrace_tick();
