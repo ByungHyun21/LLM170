@@ -423,7 +423,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         // 25GB/s) 대체. 킬스위치 구조 — opt-in =1.
                         if t >= 2
                             && w.ty == GgmlType::Q8_0
-                            && std::env::var("LLM170_VK_Q8MMQ").map(|v| v == "1").unwrap_or(false)
+                            && (std::env::var("LLM170_VK_Q8D").map(|v| v == "1").unwrap_or(false)
+                                || std::env::var("LLM170_VK_Q8MMQ").map(|v| v == "1").unwrap_or(false))
                         {
                             let key = (w.data.as_ptr() as usize, w.data.len());
                             let w8 = {
@@ -446,7 +447,11 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                                     buf
                                 }
                             };
-                            let p = self.pipeline(&mut ctx, Slot::FnTileQ8mmq)?;
+                            let use_d = std::env::var("LLM170_VK_Q8D").map(|v| v == "1").unwrap_or(false);
+                            let p = self.pipeline(
+                                &mut ctx,
+                                if use_d { Slot::FnTileQ8d } else { Slot::FnTileQ8mmq },
+                            )?;
                             let mut binds: Vec<vk::Buffer> = vec![w8];
                             while binds.len() < 8 {
                                 binds.push(dbuf);
@@ -456,7 +461,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                             let ds2 = ctx.bind_ds(&p, &binds)?;
                             let push =
                                 push_u32s(&[n_in as u32, n_out as u32, t as u32, xq_w as u32]);
-                            ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(64), (t as u32).div_ceil(64), 1)?;
+                            ctx.run(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(64), (t as u32).div_ceil(if use_d { 16 } else { 64 }), 1)?;
                             continue;
                         }
                         let chunk_words = (ctx.max_ssbo / 4) as u32;
