@@ -454,7 +454,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
-                (n_out.div_ceil(64) as u32, bound.div_ceil(64) as u32)
+                // plans/95 v2: 64가중행 × 16할당행 타일 — 16행 밴드가
+                // moe_group 균일-전문가 보증 단위.
+                (n_out.div_ceil(64) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kSg2) {
                 // plans/93 sg2: 32행/WG — 가중치 판독 절반.
                 (n_out.div_ceil(16) as u32, bound.div_ceil(32) as u32)
