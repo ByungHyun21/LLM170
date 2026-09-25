@@ -1416,3 +1416,18 @@ prefill lever from negative to positive:
 Before the fix, t>1 device PLE measured 154 t/s with gate mismatch (ledger
 (36)/(38), commit c30d242 revert). Same-path reference points: VK_MOECM=1
 241.9, F32Q8 combo 270.80.
+
+### FN pp512 — skinny f32 GEMM tile_f32s, opt-in (plans/95 P1, 2026-09-25)
+
+`tile_f32` spent 359.6ms/chunk on 288 skinny dispatches (n_out = 1/4/48/512,
+~76 MiB of weights total — 0.85 GB/s; grid collapsed to 32 WGs at n_out=4).
+New K-split kernel `fn_tile_f32s` (opt-in `LLM170_VK_FT32S=1`):
+
+| config | pp512 vk |
+|---|---|
+| default (serial tile_f32) | 228 |
+| `LLM170_VK_FT32S=1` | **271.9–290.0** (+19–27%) |
+
+Reduction-order change drifts top-3 prefill logits 0.20–0.35 nat → gate
+fails (not a near-tie), so the default path stays bit-stable; see
+decisions.md (40). Device PLE (plans/94) included in both numbers.

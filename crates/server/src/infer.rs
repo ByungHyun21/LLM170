@@ -342,6 +342,15 @@ fn run_q4_infer(
             let mut next: Vec<u32> = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
+                if let Some(k) = dbg_topk {
+                    let mut idx: Vec<usize> = (0..l.len()).collect();
+                    idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
+                    let top: Vec<String> = idx[..k.min(l.len())]
+                        .iter()
+                        .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
+                        .collect();
+                    eprintln!("topk-pf seq{s}: {}", top.join(" "));
+                }
                 let t = llm170_core::qwen35::greedy(&l);
                 println!(
                     "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
