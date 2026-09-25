@@ -134,12 +134,50 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // plans/93: sg1f은 f32 직결 — quant 스킵, f32 버퍼를 그대로 패스.
             xb
         } else {
-            let xq = self.xq_dev_buf(&mut ctx, rows * xq_w * 4)?;
-            let p = self.pipeline(&mut ctx, Slot::Quant)?;
-            let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
-            let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
-            ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
-            xq
+            // plans/96 G3 — gate+up 연속 쌍: 같은 (x,n_in,rows)의 재양자화를
+            // 전용 버퍼 슬롯으로 회수. 두 엔진 호출 사이 어떤 op/quant도
+            // 없고 전용 버퍼는 타 quant가 덮어쓰지 못함 — 히트는 안전.
+            // 킬스위치 LLM170_VK_MOEXQ=0.
+            let pair_env = std::env::var("LLM170_VK_MOEXQ").unwrap_or_else(|_| "1".into());
+            // plans/96: 프리필(t≥2) 전용 — 전층 체크섬으로 프리필 정합 실측
+            // 확정. 디코드 q8스택 경로(t=1)에서의 미세 발산(원장 종결 기록)
+            // 을 원천 차단.
+            let pair_on = pair_env != "0" && t >= 2;
+            let hit_on = pair_env == "1"; // =2: fill만(이분법 진단)
+            let mut hit: Option<vk::Buffer> = None;
+            if pair_on && hit_on {
+                let mut sl = self.moe_xq_pair.lock();
+                if let Some((hx, hn, hr, b)) = sl.as_ref() {
+                    if *hx == x && *hn == n_in && *hr == rows && (b.bytes as usize) >= rows * xq_w * 4 {
+                        hit = Some(b.buf);
+                    }
+                }
+            }
+            match hit {
+                Some(b) => b,
+                None => {
+                    let p = self.pipeline(&mut ctx, Slot::Quant)?;
+                    let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
+                    let tgt = if pair_on {
+                        let mut sl = self.moe_xq_pair.lock();
+                        let need = rows * xq_w * 4;
+                        let ok = sl.as_ref().is_some_and(|v| (v.3.bytes as usize) >= need);
+                        if !ok {
+                            *sl = Some((x, n_in, rows, ctx.alloc(need)?));
+                        } else if let Some(v) = sl.as_mut() {
+                            v.0 = x;
+                            v.1 = n_in;
+                            v.2 = rows;
+                        }
+                        sl.as_ref().unwrap().3.buf
+                    } else {
+                        self.xq_dev_buf(&mut ctx, rows * xq_w * 4)?
+                    };
+                    let ds2 = ctx.bind_ds(&p, &[xb, tgt])?;
+                    ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+                    tgt
+                }
+            }
         };
         // 2b) direct-ids (plans/88 P1) — t=1·rows≤64: fn_moe_ids(gemv3 파생)
         // 그리드 (n_out, rows), 워크그룹=행 — 커널이 ids[r]을 직접 판독해 가중
