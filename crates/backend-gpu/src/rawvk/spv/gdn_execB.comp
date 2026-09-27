@@ -1,0 +1,96 @@
+#version 450
+
+// gdn_execB (plans/100 v3) — 대입+출력+상태(u-와이드, 경량).
+// sC/sQ0는 execA가 글로벌 기록. 이 커널은 스캔 산술 그대로:
+// z_τ = c_τ − Σ L·z_σ (C단계) → o = q0 + Σ w·z → 상태 rank-C 갱신.
+layout(local_size_x = 64) in;
+layout(binding = 0) buffer S { float s[]; };
+layout(binding = 1) readonly buffer K { float k[]; };
+layout(binding = 2) readonly buffer Lbuf { float lin[]; };
+layout(binding = 3) readonly buffer Wbuf { float win[]; };
+layout(binding = 4) readonly buffer Gbuf { float gin[]; };
+layout(binding = 5) readonly buffer Cbuf { float cin[]; };
+layout(binding = 6) readonly buffer Q0Buf { float q0in[]; };
+layout(binding = 7) buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    int ks; int vs; int hv; int hk; int t; int chunk0; int csize; float scale;
+} pc;
+
+const int C = 32;
+const int BV = 64;
+shared float sZ[C * BV];
+shared float sC[C * BV];
+shared float sQ0[C * BV];
+shared float sG[C];
+
+void main() {
+    int chunk = int(gl_WorkGroupID.x);
+    int pair = int(gl_WorkGroupID.y);
+    int ublk = int(gl_WorkGroupID.z);
+    int u0 = ublk * BV;
+    int tid = int(gl_LocalInvocationID.x);
+    int u = tid;
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int t0 = pc.chunk0 + chunk * pc.csize;
+    int cs = min(pc.csize, pc.t - t0);
+    int d = 128;
+    if (cs <= 0) return;
+    int base_s = pair * d * d;
+    int ob = (chunk * pc.hv + pair) * C * BV;
+
+    // 스테이징(글로벌 → LDS).
+    for (int i = tid; i < cs * BV; i += BV) {
+        sC[i] = cin[ob + i];
+        sQ0[i] = q0in[ob + i];
+    }
+    for (int i = tid; i < cs; i += BV) sG[i] = gin[chunk * 2 * C + i];
+    barrier();
+
+    // ── 전방대입(u-와이드) — z_0 = c_0 먼저.
+    sZ[u] = sC[u];
+    memoryBarrierShared();
+    barrier();
+    for (int tau = 1; tau < cs; tau++) {
+        float acc = 0.0;
+        for (int sig = 0; sig < tau; sig++) {
+            acc += lin[chunk * C * C + tau * C + sig] * sZ[sig * BV + u];
+        }
+        sZ[tau * BV + u] = sC[tau * BV + u] - acc;
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // ── 출력 o_t[u] = q0 + Σ_{σ≤t} w·z.
+    for (int tt = 0; tt < cs; tt++) {
+        int ti = t0 + tt;
+        float acc = sQ0[tt * BV + u];
+        for (int sig = 0; sig <= tt; sig++) {
+            acc += win[chunk * C * C + tt * C + sig] * sZ[sig * BV + u];
+        }
+        o[pc.vs * ti + d * pair + (u0 + u)] = acc * pc.scale;
+    }
+
+    // ── 상태 갱신 S^C = G_{cs-1}·S⁰ + Σ (G_{cs-1}/G_σ)·K_σ·z_σ[u].
+    {
+        float glast = sG[cs - 1];
+        for (int j = 0; j < d; j += 4) {
+            float n0 = glast * s[base_s + (u0 + u) * d + j];
+            float n1 = glast * s[base_s + (u0 + u) * d + j + 1];
+            float n2 = glast * s[base_s + (u0 + u) * d + j + 2];
+            float n3 = glast * s[base_s + (u0 + u) * d + j + 3];
+            for (int sig = 0; sig < cs; sig++) {
+                float cf = (glast / sG[sig]) * sZ[sig * BV + u];
+                int ti = t0 + sig;
+                n0 += k[pc.ks * ti + kh * d + j] * cf;
+                n1 += k[pc.ks * ti + kh * d + j + 1] * cf;
+                n2 += k[pc.ks * ti + kh * d + j + 2] * cf;
+                n3 += k[pc.ks * ti + kh * d + j + 3] * cf;
+            }
+            s[base_s + (u0 + u) * d + j] = n0;
+            s[base_s + (u0 + u) * d + j + 1] = n1;
+            s[base_s + (u0 + u) * d + j + 2] = n2;
+            s[base_s + (u0 + u) * d + j + 3] = n3;
+        }
+    }
+}

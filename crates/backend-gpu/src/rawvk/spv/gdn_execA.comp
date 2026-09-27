@@ -1,0 +1,53 @@
+#version 450
+
+// gdn_execA (plans/100 v3) — (τ,u) 셀-병렬 닷 단계.
+// v2 병목(스레드당 32닷 직렬) 해결: 스레드당 1닷. grid.z = 셀블록.
+// sC[τ,u] = Be_τ·(V_τ[u] − G_τ·⟨K_τ,S⁰_u⟩), sQ0[τ,u] = G_τ·⟨Q_τ,S⁰_u⟩.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer S { float s[]; };
+layout(binding = 1) readonly buffer Q { float q[]; };
+layout(binding = 2) readonly buffer K { float k[]; };
+layout(binding = 3) readonly buffer V { float v[]; };
+layout(binding = 4) readonly buffer Gbuf { float gin[]; };
+layout(binding = 5) buffer Cbuf { float cout[]; };    // [chunk][pair][C*BV]
+layout(binding = 6) buffer Q0Buf { float q0out[]; };  // 동일 형상
+layout(push_constant) uniform PC {
+    int ks; int vs; int hv; int hk; int t; int chunk0; int csize;
+} pc;
+
+const int C = 32;
+const int BV = 64;
+
+void main() {
+    int chunk = int(gl_WorkGroupID.x);
+    int pair = int(gl_WorkGroupID.y);
+    int blk = int(gl_WorkGroupID.z);
+    int tid = int(gl_LocalInvocationID.x);
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int t0 = pc.chunk0 + chunk * pc.csize;
+    int cs = min(pc.csize, pc.t - t0);
+    int d = 128;
+    if (cs <= 0) return;
+    int base_s = pair * d * d;
+
+    // 이 WG의 셀 범위: blk*64 + tid → (tau, u).
+    int cell = blk * 64 + tid;
+    int tau = cell / BV;
+    int u = cell % BV;
+    if (tau >= cs) return;
+    int ti = t0 + tau;
+    float be = gin[chunk * 2 * C + C + tau];
+    float g = gin[chunk * 2 * C + tau];
+
+    float sk0 = 0.0;
+    float sq0 = 0.0;
+    for (int j = 0; j < d; j++) {
+        float sv = s[base_s + u * d + j];
+        sk0 += k[pc.ks * ti + kh * d + j] * sv;
+        sq0 += q[pc.ks * ti + kh * d + j] * sv;
+    }
+    int ob = (chunk * pc.hv + pair) * C * BV;
+    cout[ob + tau * BV + u] = be * (v[pc.vs * ti + d * pair + u] - g * sk0);
+    q0out[ob + tau * BV + u] = g * sq0;
+}
