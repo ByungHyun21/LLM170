@@ -36,6 +36,12 @@ const MOE_GATHER_SPV: &[u8] = include_bytes!("../spv/moe_gather.spv");
 /// plans/84 B — 어텐션 반쪽 프레임 ops.
 const HC_GATE_MEAN_SPV: &[u8] = include_bytes!("../spv/hc_gate_mean.spv");
 const HC_COMBINE_SPV: &[u8] = include_bytes!("../spv/hc_combine.spv");
+const HC_COMBINE_F16_SPV: &[u8] = include_bytes!("../spv/hc_combine_f16.spv");
+const RMS_WIDE_F16_SPV: &[u8] = include_bytes!("../spv/rms_wide_f16.spv");
+const FN_PLE_GATE_F16_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate_f16.spv");
+const FN_PLE_GATE_MT_F16_SPV: &[u8] = include_bytes!("../spv/fn_ple_gate_mt_f16.spv");
+const FN_PLE_RES_F16_SPV: &[u8] = include_bytes!("../spv/fn_ple_res_f16.spv");
+const FN_EMB_Q8G_F16_SPV: &[u8] = include_bytes!("../spv/fn_emb_q8g_f16.spv");
 const NORM_GATED_SIG_SPV: &[u8] = include_bytes!("../spv/norm_gated_sig.spv");
 const GDN_BETA_G_SPV: &[u8] = include_bytes!("../spv/gdn_beta_g.spv");
 const EW_SIGMOID_SPV: &[u8] = include_bytes!("../spv/ew_sigmoid.spv");
@@ -201,6 +207,7 @@ pub(crate) enum Slot {
     MoeGatherRows,
     HcGateMean,
     HcCombine,
+    HcCombineF16,
     NormGatedSig,
     GdnBetaG,
     EwSigmoid,
@@ -239,6 +246,7 @@ pub(crate) enum Slot {
     /// plans/92 P4.1 — 256스레드/행 판(대형 t). 디코드(t=1)는 32스레드 원판이
     /// 우수(실측 tg 11.21 vs 10.92 — WG 지연 dominated).
     RmsWide,
+    RmsWideF16,
     /// plans/85 §2 — 프레임 로짓 행별 argmax(2단계).
     FnArgmaxRows,
     Silu,
@@ -303,15 +311,19 @@ pub(crate) enum Slot {
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
     FnPleGateMt,
+    FnPleGateF16,
+    FnPleGateMtF16,
     FnPleGather,
     /// plans/97 — token_embd(Q8_0) gather + hc 방송.
     EmbQ8G,
+    EmbQ8GF16,
     FnMoeTileQ4kSg2,
     FnIdxScoreMt,
     FnIdxTopkMt,
     FnMoeTileQ4kKp,
     FnPleConv,
     FnPleRes,
+    FnPleResF16,
     /// plans/89 P0.4 — QSA 어텐션 멀티헤드 판.
     FnQsaAttnSelMh,
 }
@@ -452,6 +464,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::MoeGatherRows, "moe_gather", MOE_GATHER_SPV, 2, 12),
     (Slot::HcGateMean, "hc_gate_mean", HC_GATE_MEAN_SPV, 3, 16),
     (Slot::HcCombine, "hc_combine", HC_COMBINE_SPV, 3, 12),
+    (Slot::HcCombineF16, "hc_combine_f16", HC_COMBINE_F16_SPV, 3, 12),
     (Slot::NormGatedSig, "norm_gated", NORM_GATED_SIG_SPV, 4, 16),
     (Slot::GdnBetaG, "gdn_beta_g", GDN_BETA_G_SPV, 5, 8),
     (Slot::EwSigmoid, "sigmoid", EW_SIGMOID_SPV, 1, 4),
@@ -477,6 +490,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnIdxExpand, "idx_expand", FN_IDX_EXPAND_SPV, 3, 16),
     (Slot::Rms, "rms", RMS_SPV, 3, 16),
     (Slot::RmsWide, "rms_wide", RMS_WIDE_SPV, 3, 16),
+    (Slot::RmsWideF16, "rms_wide_f16", RMS_WIDE_F16_SPV, 3, 20),
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
     (Slot::QuantS8, "quant_s8", QUANT_S8_SPV, 2, 12),
@@ -501,13 +515,17 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32e, "tile_f32e", FN_TILE_F32E_SPV, 10, 12),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
+    (Slot::FnPleGateF16, "ple_gate_f16", FN_PLE_GATE_F16_SPV, 8, 16),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
+    (Slot::FnPleGateMtF16, "ple_gate_mt_f16", FN_PLE_GATE_MT_F16_SPV, 8, 16),
     (Slot::FnPleGather, "ple_gather", FN_PLE_GATHER_SPV, 3, 16),
     (Slot::EmbQ8G, "emb_q8g", FN_EMB_Q8G_SPV, 3, 16),
+    (Slot::EmbQ8GF16, "emb_q8g_f16", FN_EMB_Q8G_F16_SPV, 3, 16),
     (Slot::FnMoeTileQ4kSg2, "moe_tile_q4k_sg2", FN_MOE_TILE_Q4K_SG2_SPV, 6, 16),
     (Slot::FnPleConv, "ple_conv", FN_PLE_CONV_SPV, 4, 20),
     (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
     (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
+    (Slot::FnPleResF16, "ple_res_f16", FN_PLE_RES_F16_SPV, 4, 12),
     (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
     (Slot::TileQ8ks, "tile_q8ks", TILE_Q8KS_SPV, 11, 24),
     (Slot::FnKsred, "ksred", FN_KSRED_SPV, 2, 8),

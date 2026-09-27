@@ -167,7 +167,14 @@ impl llm170_core::matmul::EwOps for VkAcc {
         // (1) gate+방송+그룹 norm.
         {
             // plans/93: t>1은 병렬판(워프 협업 RMS/dot) — 구판은 lane0 순차.
-            let gate_slot = if t > 1 { Slot::FnPleGateMt } else { Slot::FnPleGate };
+            // plans/103: res_hc f16 버스 — 게이트 변형 슬롯(f32 쌍둥이 불변).
+            let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+            let gate_slot = match (t > 1, resf16) {
+                (true, false) => Slot::FnPleGateMt,
+                (true, true) => Slot::FnPleGateMtF16,
+                (false, false) => Slot::FnPleGate,
+                (false, true) => Slot::FnPleGateF16,
+            };
             let p = self.pipeline(&mut ctx, gate_slot)?;
             let ds2 = ctx.bind_ds(&p, &[rb, kb, vb, nkb, nqb, ncb, gb, gob])?;
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
@@ -186,7 +193,10 @@ impl llm170_core::matmul::EwOps for VkAcc {
         }
         // (3) 잔차.
         {
-            let p = self.pipeline(&mut ctx, Slot::FnPleRes)?;
+            // plans/103: res_hc f16 버스 — 잔차 RMW 변형 슬롯(페어 소유).
+            let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+            let slot = if resf16 { Slot::FnPleResF16 } else { Slot::FnPleRes };
+            let p = self.pipeline(&mut ctx, slot)?;
             let ds2 = ctx.bind_ds(&p, &[rb, vb, gob, cob])?;
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, n_embd.div_ceil(256) as u32, 1, 1)?;
@@ -249,9 +259,12 @@ impl llm170_core::matmul::EwOps for VkAcc {
             buf
         };
         let ob = self.fbuf(out)?;
-        let p = self.pipeline(&mut ctx, Slot::EmbQ8G)?;
-        let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
         let bpr = n / 32;
+        // plans/103: res_hc f16 버스 — 초기 기입 변형(블록 내 쌍팩).
+        let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+        let slot = if resf16 { Slot::EmbQ8GF16 } else { Slot::EmbQ8G };
+        let p = self.pipeline(&mut ctx, slot)?;
+        let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
         let push = push_u32s(&[n as u32, t as u32, hc as u32, bpr as u32]);
         let total = t * bpr;
         ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
