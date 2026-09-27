@@ -3659,11 +3659,7 @@ pub fn cm8_probe() -> Result<String, String> {
         let v: Vec<i32> = unsafe { std::slice::from_raw_parts(vb.ptr as *const i32, nwg * 256) }.to_vec();
         let bad = v.iter().filter(|&&d| d != 0).count();
         eprintln!("[cm8-mw] {nwg}WG 전체 판정: 불일치 {}/{} ({:.1}%)", bad, nwg * 256, 100.0 * bad as f64 / (nwg as f64 * 256.0));
-        if nwg >= 2 {
-            eprintln!("[cm8-mw] wg0 diff[0..8] = {:?} · wg1 diff[0..4] = {:?}", &v[..8], &v[256..260]);
-        } else {
-            eprintln!("[cm8-mw] wg0 diff[0..8] = {:?}", &v[..8]);
-        }
+        eprintln!("[cm8-mw] wg0 전체 16 = {:?}", &v[..16]);
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
     }
     if std::env::var_os("LLM170_CM8_VERIFY").is_some() {
