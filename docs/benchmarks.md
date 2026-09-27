@@ -1911,3 +1911,15 @@ RADV 26.3+. Same driver-family root as the llama cm1 pipeline segfault.
 Warm band has drifted up through the session as the driver's shader cache
 matured: latest 5-rep window hit **421.6 t/s** (1214.4 ms wall) — new
 session peak, confirming the 410-420 band as steady state.
+
+### quant LDS-staging variant (plans/99 tail, 2026-09-27 late) — negative
+
+Hypothesis: quant_q8's per-thread 128B-strided reads (12.5% nominal
+bandwidth) leave 7× on the table. Built quant_q8s: cooperative coalesced
+LDS staging → per-thread compute from shared. Result: 0.516 vs 0.465
+ms/call (+11% slower) — the WG's 8KB region is contiguous so L1/L2
+already absorbs the round-robin stride; the LDS roundtrip + barrier
+overhead exceeds the gain. Reverted to opt-in (`LLM170_VK_QS8=1`).
+Prefill bit-identical (checksum), decode nondeterminism pre-existing
+(moe scatter atomic, ledger). Lesson: strided-per-thread ≠ uncoalesced
+when the WG footprint is contiguous and fits L2.

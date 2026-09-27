@@ -156,7 +156,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
             match hit {
                 Some(b) => b,
                 None => {
-                    let p = self.pipeline(&mut ctx, Slot::Quant)?;
+                    let qs8 = std::env::var("LLM170_VK_QS8").map(|v| v == "1").unwrap_or(false); // 부정: +11% 지연
+                    let p = self.pipeline(&mut ctx, if qs8 { Slot::QuantS8 } else { Slot::Quant })?;
                     let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
                     let tgt = if pair_on {
                         let mut sl = self.moe_xq_pair.lock();
