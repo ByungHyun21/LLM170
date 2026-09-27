@@ -1973,3 +1973,8 @@ per-token serial cost (4 FMA + 10 shuffles) is fully latency-hidden by
 128×h_v independent (u, pair) workgroups — it is the structurally
 optimal form for this recurrence on this geometry. Five-direction
 verdict complete. pp4096: 358.8 t/s (long-context band holds).
+
+### New session peak (2026-09-27 late)
+
+**424.6 t/s** (1205.8 ms) — cache maturation continues: 410→416→421→422→424.
+Session peak now **+89%** over baseline.
