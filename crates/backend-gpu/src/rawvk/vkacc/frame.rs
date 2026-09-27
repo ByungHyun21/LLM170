@@ -523,6 +523,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     }
                 // plans/96: q4_K MMQ v5(라이브 스킵+호이스티드) 승격 — 5.13ms
                 // vs sg1 5.43(8차 시험 첫 승리). 킬스위치 =0 → sg1(옵트인 =1).
+                // plans/99: INT8 coopmat(u8×i8→i32, RADV 26.2.3) — 21-25 TMAC/s.
+                (GgmlType::Q4K, _) if wbufs.len() == 1
+                    && std::env::var("LLM170_VK_Q4CM8").map(|v| v != "0").unwrap_or(false) => Slot::FnMoeTileQ4kCm8,
                 (GgmlType::Q4K, _) if wbufs.len() == 1
                     && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kMmq,
                 (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
@@ -554,6 +557,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     | Slot::FnMoeTileQ8
                     | Slot::FnMoeTileQ5k
                     | Slot::FnMoeTileQ4kMmq
+                    | Slot::FnMoeTileQ4kCm8
                     | Slot::FnMoeTileQ8mmq
                     | Slot::FnMoeTileQ5kmmq
                     | Slot::FnMoeTileQ51mmq
@@ -572,6 +576,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
+            } else if matches!(slot, Slot::FnMoeTileQ4kCm8) {
+                // plans/99: 32가중행(서브그룹2×16) × 16할당행.
+                (n_out.div_ceil(32) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
                 // plans/95 v2: 64가중행 × 16할당행 타일 — 16행 밴드가
                 // moe_group 균일-전문가 보증 단위.
