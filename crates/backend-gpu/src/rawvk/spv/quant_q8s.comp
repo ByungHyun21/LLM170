@@ -1,0 +1,69 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+// quant_q8s (plans/99 테일 최적화) — LDS 협동 스테이징 판.
+// 종래 quant_q8: 스레드=블록(32원소) 소유 → i-루프마다 스레드 간
+// 128B 스트라이드 글로벌 판독 = 대역폭 ~12.5%(실측 110µs vs 이론 15µs).
+// v2: WG(64스레드)가 2048원소를 스레드-연속(코얼레스드)으로 LDS에 적재 후
+// 각 스레드가 자기 블록을 LDS에서 처리. 산술(amax/round/clamp/pack/
+// 사전계산합)은 종래와 **문자 동일** — 비트 불변 목표.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Xbuf { float x[]; };
+layout(binding = 1) buffer Qbuf { uint xq[]; };
+layout(push_constant) uniform PC {
+    uint n_in; uint t; uint xq_w;
+} pc;
+
+shared float sh[64][32];
+
+void main() {
+    uint tok = gl_WorkGroupID.y;
+    uint wg0 = gl_WorkGroupID.x * 64u;          // 이 WG 첫 블록
+    uint lb = wg0 + gl_LocalInvocationID.x;     // 스레드 소유 블록
+    uint nblk = pc.n_in >> 5;
+    bool live = lb < nblk;  // barrier 앞 early-return 금지(비균일 흐름 UB)
+    uint base = tok * pc.n_in;
+
+    // ── 협동 스테이징: 스레드-연속 코얼레스드(라운드 r×4원소).
+    // WG 영역 원소 [wg0*32, wg0*32+2048) — 경계는 원소 가드.
+    for (uint r = 0; r < 8u; r++) {
+        uint e = r * 256u + gl_LocalInvocationID.x * 4u;
+        uint g = wg0 * 32u + e;
+        uint bi = e >> 5, bj = e & 31u;
+        sh[bi][bj]     = (g < pc.n_in) ? x[base + g] : 0.0;
+        sh[bi][bj + 1u] = (g + 1u < pc.n_in) ? x[base + g + 1u] : 0.0;
+        sh[bi][bj + 2u] = (g + 2u < pc.n_in) ? x[base + g + 2u] : 0.0;
+        sh[bi][bj + 3u] = (g + 3u < pc.n_in) ? x[base + g + 3u] : 0.0;
+    }
+    barrier();
+
+    // ── 이하 종래 quant_q8 산술(LDS 판독으로만 치환).
+    if (!live) return;  // 스테이징·배리어 참여 후에만 탈출.
+    uint qbase = tok * pc.xq_w;
+    uint nwords = pc.n_in >> 2;
+    float amax = 0.0;
+    for (int i = 0; i < 32; i++) amax = max(amax, abs(sh[gl_LocalInvocationID.x][i]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint qs0 = 0u, qs1 = 0u;
+    for (int wi = 0; wi < 8; wi++) {
+        uint word = 0u;
+        for (int k = 0; k < 4; k++) {
+            float xv = sh[gl_LocalInvocationID.x][wi * 4 + k] * id;
+            float r = xv >= 0.0 ? float(int(xv + 0.5)) : -float(int(0.5 - xv));
+            float c = clamp(r, -127.0, 127.0);
+            word |= (uint(int(c)) & 0xFFu) << uint(k * 8);
+        }
+        xq[qbase + lb * 8u + uint(wi)] = word;
+        uint sd = 0u;
+        for (int k = 0; k < 4; k++) {
+            int bytev = int((word >> uint(8 * k)) & 0xFFu) << 24 >> 24;
+            sd += uint(bytev);
+        }
+        if (wi < 4) qs0 += sd; else qs1 += sd;
+    }
+    xq[qbase + nwords + lb] = floatBitsToUint(d);
+    uint qsb = pc.n_in / 4u + pc.n_in / 32u;
+    xq[qbase + qsb + lb * 2u] = qs0;
+    xq[qbase + qsb + lb * 2u + 1u] = qs1;
+}
