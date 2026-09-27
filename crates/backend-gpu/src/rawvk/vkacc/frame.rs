@@ -163,7 +163,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let mut push = push_u32s(&[d as u32, (h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32]);
         push.extend_from_slice(&1.0f32.to_le_bytes());
         push.extend_from_slice(&(t as u32).to_le_bytes());
-        ctx.run(p.pl, ds2, p.pipe, &push, d as u32, h_v as u32, 1)
+        // plans/99 u폴딩×2 — WG당 상태행 2개(로드 절반·ILP 2배).
+        ctx.run(p.pl, ds2, p.pipe, &push, (d / 2) as u32, h_v as u32, 1)
     }
 
     /// MoE 게더 — (토큰,전문가) 페어: xsel[(ti·k+s)·n] = mix[ti·n]
