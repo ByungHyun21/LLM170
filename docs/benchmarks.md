@@ -1951,3 +1951,9 @@ Rotating 2-token prefetch: 52.5 vs 51.5ms (+2%) — register pressure
 is the optimum. GDN axis now has four measured verdicts (chunked v1/v2,
 reduction interleave, prefetch depth) — the scan kernel is a converged
 design on this hardware.
+
+### q8128 pair-fusion analysis (2026-09-27 close)
+
+Shape census: #2/#3 (2560→10240, 2560→6144) share input x, but weight
+reads dominate (139MB vs 2.8MB activations) — fusion upside <1%.
+q8128 is weight-bandwidth bound; axis closed.
