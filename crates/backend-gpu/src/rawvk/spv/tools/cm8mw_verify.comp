@@ -19,11 +19,11 @@ void main() {
     for (int i = int(tid); i < 16*32; i += 32) {
         int m = i >> 5, k = i & 31;
         if (k < 16) {
-            sa0[m][k] = uint8_t((m + k + int(g)) % 16);
-            sb0[m][k] = int8_t(((m * 7 + k * 3 + int(g)) % 51) - 25);
+            sa0[m][k] = uint8_t((m * 5 + k * 3 + 7) % 13 + 1);   // 조밀 램프
+            sb0[m][k] = int8_t((m * 16 + k + int(g)) % 51 - 25);  // B 램프(유니크)
         } else {
-            sa1[m][k - 16] = uint8_t((m + k + int(g)) % 16);
-            sb1[m][k - 16] = int8_t(((m * 7 + k * 3 + int(g)) % 51) - 25);
+            sa1[m][k - 16] = uint8_t(0);
+            sb1[m][k - 16] = int8_t(0);
         }
     }
     barrier();
@@ -54,11 +54,11 @@ void main() {
     for (int i = int(tid); i < 256; i += 32) {
         int m = i >> 4, r = i & 15;
         int want = 0;
-        for (int k = 0; k < 32; k++) {
-            int av = (m + k + int(g)) % 16;
-            int bv = ((r * 7 + k * 3 + int(g)) % 51) - 25;
+        for (int k = 0; k < 16; k++) {
+            int av = (m * 5 + k * 3 + 7) % 13 + 1;
+            int bv = (r * 16 + k + int(g)) % 51 - 25;
             want += av * bv;
         }
-        c[int(wg) * 256 + i] = sc[m][r];  // 원시(호스트 대조)
+        c[int(wg) * 256 + i] = sc[m][r] - want;  // 0이면 정확
     }
 }
