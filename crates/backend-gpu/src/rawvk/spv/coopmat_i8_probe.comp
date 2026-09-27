@@ -8,7 +8,7 @@
 // coopmat_i8_probe (plans/99) — INT8 coopmat(u8×i8→i32) 네이티브 판정.
 // RADV 26.2.3이 i8 coopmat 12종 노출 — f16 에뮬(74GB/s)과 달리 네이티브
 // WMMA(v_wmma_i32_iu8)면 MMQ 2-4배 직결. R회 누산 반복으로 처리량 측정.
-layout(local_size_x = 64) in;
+layout(local_size_x = 32) in;
 layout(binding = 0) readonly buffer Abuf { uint8_t a[]; };
 layout(binding = 1) readonly buffer Bbuf { int8_t b[]; };
 layout(binding = 2) buffer Cbuf { int c[]; };
