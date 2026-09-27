@@ -253,7 +253,12 @@ pub fn frame_forward_prefill_multi(
                 r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
             }
         }
-        acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+        // plans/103: res_hc f16 버스 — CPU 기입 팩.
+        if super::res_f16_on() {
+            acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r)).map_err(Q4Error::Io)?;
+        } else {
+            acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+        }
         acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
     }
 

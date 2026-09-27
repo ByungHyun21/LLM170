@@ -105,7 +105,12 @@ pub(super) fn frame_forward_ex(
                 }
             }
             let emb_cpu_ms = emb_t0.elapsed().as_secs_f64() * 1e3;
-            acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+            // plans/103: res_hc f16 버스 — CPU 폴백 기입도 팩.
+            if super::res_f16_on() {
+                acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r)).map_err(Q4Error::Io)?;
+            } else {
+                acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
+            }
             acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
             if std::env::var_os("LLM170_FRAME_TIME").is_some() {
                 eprintln!("# emb t={t} hc={hc} ty={:?} cpu={emb_cpu_ms:.1}ms upload {:.1}ms", (embd.ty as u32), emb_t0.elapsed().as_secs_f64() * 1e3 - emb_cpu_ms);
@@ -316,11 +321,25 @@ pub(super) fn frame_forward_ex(
             if !ple_dev_done {
                 let mut r = vec![0.0f32; t * hc * n];
                 acc.capture_mark("ple_in").map_err(Q4Error::Io)?;
-                acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
+                // plans/103: f16 버스 — 워드 판독(비트 보존) 후 언팩.
+                if super::res_f16_on() {
+                    let words = t * hc * n / 2;
+                    let mut w = vec![0.0f32; words];
+                    acc.frame_read(f.res_hc, &mut w).map_err(Q4Error::Io)?;
+                    let bits: Vec<u32> = w.iter().map(|f| f.to_bits()).collect();
+                    let un = super::unpack_f16_pairs(&bits, t * hc * n);
+                    r.copy_from_slice(&un);
+                } else {
+                    acc.frame_read(f.res_hc, &mut r).map_err(Q4Error::Io)?;
+                }
                 let mut rows: Vec<Vec<f32>> = r.chunks_exact(hc * n).map(|c| c.to_vec()).collect();
                 stages::ple_block(ctx, seq_st, il, &mut rows, &ple_rows, None)?;
                 let flat: Vec<f32> = rows.concat();
-                acc.frame_write(f.res_hc, &flat).map_err(Q4Error::Io)?;
+                if super::res_f16_on() {
+                    acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&flat)).map_err(Q4Error::Io)?;
+                } else {
+                    acc.frame_write(f.res_hc, &flat).map_err(Q4Error::Io)?;
+                }
                 acc.capture_mark("ple_out").map_err(Q4Error::Io)?;
                 sync_mark(acc, "hc.ple_bridge", f.res_hc)?;
             }

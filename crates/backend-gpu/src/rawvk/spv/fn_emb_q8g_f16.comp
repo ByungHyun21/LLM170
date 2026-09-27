@@ -1,0 +1,76 @@
+#version 450
+
+// fn_emb_q8g (plans/97) — token_embd(Q8_0) GPU gather + hc 방송.
+// CPU 디퀀트(t=512 콜드 54ms, GPU 유휴) → GPU 수백 µs. ple_gather(plans/93)
+// 의 Q8_0·hc-방송판. 테이블은 1회 상주(ple_consts 캐시 재사용).
+// Q8_0 블록: 34B = f16 d(2B) + qs(32B int8). y[j] = d·q8[j] — CPU
+// dequant_row q8_0와 동일 스칼라 곱(비트 동일).
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer IdsB { uint ids[]; };
+layout(binding = 1) readonly buffer TableB { uint w[]; };
+layout(binding = 2) writeonly buffer OutB { uint outw[]; };  // plans/103: packed f16 res_hc
+layout(push_constant) uniform PC {
+    uint n;         // 행 원소수 (n_embd)
+    uint t;         // 토큰 수
+    uint hc;        // 하이퍼커넥션 스트림 수
+    uint bpr;       // 행당 Q8_0 블록 수 (n/32)
+} pc;
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint ti = gid / pc.bpr;
+    uint blk = gid % pc.bpr;
+    if (ti >= pc.t) return;
+    uint src = ids[ti];
+    // 블록 바이트 오프셋 = (src*bpr + blk) * 34
+    uint boff = (src * pc.bpr + blk) * 34u;
+    uint wbase = boff >> 2;
+    uint shift = (boff & 3u) * 8u;   // 0 또는 16(34=2 mod 4)
+    uint a = w[wbase];
+    uint b = w[wbase + 1u];
+    float d = f16_exact(shift == 0u ? (a & 0xFFFFu)
+                                    : ((a >> shift) | (b << (32u - shift))) & 0xFFFFu);
+    // qs 32바이트 = boff+2부터 연속 — 8-워드+α 판독 후 시프트 조립.
+    uint qoff = boff + 2u;
+    uint qw = qoff >> 2;
+    uint qs = (qoff & 3u) * 8u;
+    uint q0 = w[qw], q1 = w[qw+1u], q2 = w[qw+2u], q3 = w[qw+3u];
+    uint q4 = w[qw+4u], q5 = w[qw+5u], q6 = w[qw+6u], q7 = w[qw+7u];
+    uint q8w = w[qw+8u];
+    uint b0 = (q0 >> qs) | (qs > 0u ? (q1 << (32u - qs)) : 0u);
+    uint b1 = (q1 >> qs) | (qs > 0u ? (q2 << (32u - qs)) : 0u);
+    uint b2 = (q2 >> qs) | (qs > 0u ? (q3 << (32u - qs)) : 0u);
+    uint b3 = (q3 >> qs) | (qs > 0u ? (q4 << (32u - qs)) : 0u);
+    uint b4 = (q4 >> qs) | (qs > 0u ? (q5 << (32u - qs)) : 0u);
+    uint b5 = (q5 >> qs) | (qs > 0u ? (q6 << (32u - qs)) : 0u);
+    uint b6 = (q6 >> qs) | (qs > 0u ? (q7 << (32u - qs)) : 0u);
+    uint b7 = (q7 >> qs) | (qs > 0u ? (q8w << (32u - qs)) : 0u);
+    // 32 int8(부호!) → f32·d, hc 스트림 방송. CPU deq_q8_0: q as i8 as f32 * d.
+    float y[32];
+    for (uint j = 0u; j < 4u; j++) {
+        y[j]       = float(int((b0 >> (j*8u)) & 0xFFu) - int(((b0 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[4u + j]  = float(int((b1 >> (j*8u)) & 0xFFu) - int(((b1 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[8u + j]  = float(int((b2 >> (j*8u)) & 0xFFu) - int(((b2 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[12u + j] = float(int((b3 >> (j*8u)) & 0xFFu) - int(((b3 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[16u + j] = float(int((b4 >> (j*8u)) & 0xFFu) - int(((b4 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[20u + j] = float(int((b5 >> (j*8u)) & 0xFFu) - int(((b5 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[24u + j] = float(int((b6 >> (j*8u)) & 0xFFu) - int(((b6 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+        y[28u + j] = float(int((b7 >> (j*8u)) & 0xFFu) - int(((b7 >> (j*8u)) & 0x80u) != 0u ? 256 : 0)) * d;
+    }
+    for (uint s = 0u; s < pc.hc; s++) {
+        uint obase = ti * pc.hc * pc.n + s * pc.n + blk * 32u;
+        // plans/103 f16 변형 — blk 32정렬이라 (j,j+1) 쌍이 블록 내 머무름.
+        uint wb = obase >> 1u;
+        for (uint j = 0u; j < 32u; j += 2u) {
+            outw[wb + (j >> 1u)] = packHalf2x16(vec2(y[j], y[j + 1u]));
+        }
+    }
+}

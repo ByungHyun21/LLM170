@@ -425,6 +425,93 @@ pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
     st.ple_conv = s.conv;
 }
 
+/// plans/103 — res_hc f16 버스 옵트인(원자 스위치: 전 기입/판독이 동시 전환).
+pub(crate) fn res_f16_on() -> bool {
+    std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false)
+}
+
+/// f32 → f16 비트(반올림 짝수) — half 의존 없는 국소 변환(호스트 폴백 전용).
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xFF) as i32;
+    let man = x & 0x007F_FFFF;
+    if exp == 255 {
+        return sign | 0x7C00 | u16::from(man != 0);
+    }
+    let e2 = exp - 112;
+    if e2 >= 31 {
+        return sign | 0x7C00;
+    }
+    if e2 <= 0 {
+        if e2 < -10 {
+            return sign;
+        }
+        let mant = man | 0x0080_0000;
+        let shift = (14 - e2) as u32;
+        let mut m = mant >> shift;
+        let rem = mant & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rem > half || (rem == half && (m & 1) == 1) {
+            m += 1;
+        }
+        return sign | (m as u16 & 0x7FFF);
+    }
+    let mut h = ((e2 as u32) << 10) | (man >> 13);
+    let rem = man & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// f16 쌍팩 — plans/103 res_hc 기입(호스트 경로: CPU 임베딩 폴백 등).
+pub(crate) fn pack_f16_pairs(v: &[f32]) -> Vec<u32> {
+    v.chunks_exact(2)
+        .map(|c| (f32_to_f16_bits(c[0]) as u32) | ((f32_to_f16_bits(c[1]) as u32) << 16))
+        .collect()
+}
+
+/// f16 쌍언팩 — plans/103 res_hc 판독(호스트 브리지 폴백).
+pub(crate) fn unpack_f16_pairs(w: &[u32], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for &word in w.iter() {
+        for half in 0..2 {
+            if out.len() == n {
+                break;
+            }
+            let bits = ((word >> (16 * half)) & 0xFFFF) as u16;
+            out.push(f16_bits_to_f32(bits));
+        }
+    }
+    out
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1F) as i32;
+    let man = (h & 0x3FF) as u32;
+    let bits = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            // 비정규 → 정규화
+            let mut m = man;
+            let mut k = 0i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                k += 1;
+            }
+            sign | (((113 - k) as u32) << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7F80_0000 | (man << 13)
+    } else {
+        sign | ((exp + 112) as u32) << 23 | (man << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// 프레임 스텝 시작 알림 — 버퍼는 t_max 크기이므로 op 커널이 토큰 수를
 /// 버퍼 길이에서 유도할 수 없다. 명시적으로 전달한다.
 fn fs_begin(acc: &dyn Accelerator, t: usize) {
