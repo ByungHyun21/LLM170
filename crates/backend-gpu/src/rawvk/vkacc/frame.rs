@@ -58,6 +58,23 @@ impl llm170_core::matmul::FrameState for VkAcc {
         );
         // plans/84 B: FN 상태는 전치 레이아웃(hip gdn_ar_w_swap과 동일 규약) —
         // grid (d, h_v), 상태 s[pair·d·d + u·d + …].
+        // plans/100: 청크 병렬(WY) — 옵트인 LLM170_VK_GDNCH=1(클래스 변경).
+        if std::env::var("LLM170_VK_GDNCH").map(|v| v == "1").unwrap_or(false) {
+            let p = self.pipeline(&mut ctx, Slot::FnGdnChunk)?;
+            let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
+            let csize = 64usize;
+            let nchunks = t.div_ceil(csize);
+            for c in 0..nchunks {
+                let cs = csize.min(t - c * csize);
+                let mut push = push_u32s(&[d as u32, (h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32]);
+                push.extend_from_slice(&1.0f32.to_le_bytes());
+                push.extend_from_slice(&(t as u32).to_le_bytes());
+                push.extend_from_slice(&((c * csize) as u32).to_le_bytes());
+                push.extend_from_slice(&(cs as u32).to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, 1, h_v as u32, (d.div_ceil(64)) as u32)?;
+            }
+            return Ok(());
+        }
         let p = self.pipeline(&mut ctx, Slot::FnGdnArSwap)?;
         let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
         let mut push = push_u32s(&[d as u32, (h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32]);
