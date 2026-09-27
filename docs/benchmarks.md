@@ -1943,3 +1943,11 @@ start concurrently (3 interleaved shuffles per step). Measured 50.6 vs
 51.5ms — within noise: the kernel is load-latency bound (per its own
 history), not reduction-ILP bound. Reverted (avoids the summation-order
 class change for no gain).
+
+### GDN prefetch depth-2 (plans/100 v3-lite2) — negative
+
+Rotating 2-token prefetch: 52.5 vs 51.5ms (+2%) — register pressure
+(22 extra live registers) offsets the latency cover. Depth-1 rotation
+is the optimum. GDN axis now has four measured verdicts (chunked v1/v2,
+reduction interleave, prefetch depth) — the scan kernel is a converged
+design on this hardware.
