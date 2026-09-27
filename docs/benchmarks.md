@@ -1870,3 +1870,16 @@ was conservative; the controlled number closes the port avenue definitively
 — our MMQ is the fastest known implementation of this GEMM class on this
 device, across 4 independent verifications (9 geometry variants, 2 compiler
 stacks, 2 driver generations, and now the llama kernel itself).
+
+### llama cm1 variant — RADV pipeline-creation segfault (plans/98, 2026-09-27)
+
+`matmul_id_subgroup_quant_f32_cm1.spv` (the coopmat variant that could
+plausibly explain the 506 t/s reference): device reports
+`coop_matrix=true coop_f16xf16_f32=true` (vk-check), but this shader
+segfaults the process inside pipeline creation on RADV 26.2.3 — with
+spec-constant creation, with binary-patched constants, and with or
+without REQUIRE_FULL_SUBGROUPS. spirv-val passes; suspicion: entry-point
+interface lists a Private variable (`coopmat_stage`). Recorded as a
+driver-level blocker; revisit on the next RADV generation. The non-cm
+variant (measured 4.7× slower than ours) bounds the loss: even if cm1
+were 2× faster than non-cm, it would still trail q4k_mmq v5.
