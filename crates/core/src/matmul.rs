@@ -744,6 +744,10 @@ pub trait FrameHost: Send + Sync {
     fn frame_mm_group(&self, _x: u64, _ws: &[Weight], _outs: &[u64], _t: usize) -> Result<(), String> {
         Err("frame_mm_group: 미지원".into())
     }
+    /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축 전용).
+    fn frame_mm_hout(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
+        self.frame_mm(x, w, out, t)
+    }
     /// 상주 elementwise/RoPE/인덱서 연산 — 커널 선택은 FrameOp 변형.
     fn frame_op(&self, _op: &FrameOp) -> Result<(), String> {
         Err("frame_op: 미지원".into())
@@ -803,7 +807,7 @@ pub enum FrameOp {
         hd: usize, n_rot: usize,
     },
     /// hc 게이트 적용 + 스트림 평균 (hc는 나눗셈 피수로 사용).
-    HcGateMean { xn: u64, gate: u64, out: u64, hc: usize, n: usize },
+    HcGateMean { xn: u64, gate: u64, out: u64, hc: usize, n: usize, h16: bool },
     /// hc combine: res += out·(2·σ(inj/hc)).
     HcCombine { res: u64, out: u64, inj: u64, hc: usize, n: usize, total: usize },
     /// GDN β/e^g 사전계산: bg[h·2]=σ(b), bg[h·2+1]=e^(softplus(a+dtb)·sa).
