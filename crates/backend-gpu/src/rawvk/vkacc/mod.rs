@@ -132,6 +132,8 @@ const FN_TILE_F32E_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32e.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
+const TILE_Q8KS_SPV: &[u8] = include_bytes!("../spv/tile_q8ks.spv");
+const FN_KSRED_SPV: &[u8] = include_bytes!("../spv/fn_ksred.spv");
 const TILE_Q8MS_SPV2: &[u8] = include_bytes!("../spv/tile_q8ms.spv");
 const TILE_Q4K128_SPV2: &[u8] = include_bytes!("../spv/tile_q4k128.spv");
 const TILE_Q4KMS_SPV2: &[u8] = include_bytes!("../spv/tile_q4kms.spv");
@@ -285,6 +287,8 @@ pub(crate) enum Slot {
     /// plans/99 — q4_K INT8 coopmat(u8×i8) 판.
     FnMoeTileQ4kCm8,
     FnMoeTileQ4kCm8b,
+    TileQ8ks,
+    FnKsred,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
     /// plans/96 G3 — q5_K MoE 전문가 int8 MMQ 타일.
@@ -328,6 +332,7 @@ pub struct VkAcc {
     /// 동작하는 디바이스 메모리로 보낸다(값경로 xbuf 는 호스트 스테이징용 유지).
     xq_dev: Mutex<Option<VkBuf>>,
     cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
+    ks_scratch: Mutex<Option<VkBuf>>,
     gdn_ch_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -500,6 +505,8 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
     (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
     (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
+    (Slot::TileQ8ks, "tile_q8ks", TILE_Q8KS_SPV, 11, 24),
+    (Slot::FnKsred, "ksred", FN_KSRED_SPV, 2, 8),
     (Slot::TileQ8msCm, "tile_q8ms", TILE_Q8MS_SPV2, 10, 20),
     (Slot::TileQ4k128Cm, "tile_q4k128", TILE_Q4K128_SPV2, 10, 20),
     (Slot::TileQ4kmsCm, "tile_q4kms", TILE_Q4KMS_SPV2, 10, 20),
@@ -575,6 +582,7 @@ impl VkAcc {
             xbuf: Mutex::new(None),
             xq_dev: Mutex::new(None),
             cm8_scratch: Mutex::new((None, None, None)),
+            ks_scratch: Mutex::new(None),
             gdn_ch_scratch: Mutex::new((None, None, None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),

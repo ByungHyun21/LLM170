@@ -874,6 +874,42 @@ impl VkAcc {
                                 // 종전 순차 t/128 디스패치의 슬래브별 전 가중
                                 // 재판독 폐지.
                                 let gys = (t as u32).div_ceil(128);
+                                // plans/102: 스키니(n_out≤512) q8_0 → K-분할판.
+                                // 점유 붕괴(WG 20개·6GB/s) 치유 — z=K슬라이스.
+                                let skinny = w.ty == GgmlType::Q8_0
+                                    && n_out <= std::env::var("LLM170_VK_Q8K_MAX")
+                                        .ok().and_then(|v| v.parse::<usize>().ok())
+                                        .unwrap_or(0)
+                                    && t >= 128
+                                    && !hout
+                                    && std::env::var("LLM170_VK_Q8K")
+                                        .map(|v| v != "0").unwrap_or(true);
+                                if skinny {
+                                    let ks: u32 = ((n_in.div_ceil(256) as u32) / 8).clamp(2, 8);
+                                    let need = ks as usize * t * n_out * 4;
+                                    let scr = {
+                                        let mut g = self.ks_scratch.lock();
+                                        if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+                                            g.as_ref().unwrap().buf
+                                        } else {
+                                            let b = ctx.alloc(need)?;
+                                            *g = Some(b);
+                                            g.as_ref().unwrap().buf
+                                        }
+                                    };
+                                    binds.push(scr);
+                                    let p2 = self.pipeline(&mut ctx, Slot::TileQ8ks)?;
+                                    let ds3 = ctx.bind_ds(&p2, &binds)?;
+                                    let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, ks]);
+                                    ctx.run(p2.pl, ds3, p2.pipe, &push, gys, gx, ks)?;
+                                    // 축소: out = Σ_s 부분합(결정론 순서).
+                                    let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
+                                    let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
+                                    let n_tot = (t * n_out) as u32;
+                                    let pushr = push_u32s(&[n_tot, ks]);
+                                    ctx.run(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1)?;
+                                    continue;
+                                }
                                 // plans/101 P1: hout=1 → outv packed f16(HC gate 축).
                                 let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, u32::from(hout)]);
                                 ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
