@@ -72,9 +72,9 @@ void main() {
     // 동시성에서 부정확(RADV 비결정성)하여 연산 원소만 SSBO 슬롯으로.
     uint wgslot = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 1024u;
 #define A0(i) sc8[wgslot + uint(i)]
-#define A1(i) sc8[wgslot + 256u + uint(i)]
+#define A1(i) sc8[wgslot + ((pc.mode == 13u) ? 1024u : 256u) + uint(i)]
 #define B0(i) sc8i[wgslot + uint(i)]
-#define B1(i) sc8i[wgslot + 256u + uint(i)]
+#define B1(i) sc8i[wgslot + ((pc.mode == 13u) ? 1024u : 256u) + uint(i)]
 
     int live_cnt = 0;
     if (band_live) {
@@ -85,6 +85,8 @@ void main() {
     for (int i = int(tid); i < 16 * 16; i += 32) {
         sAccF[i >> 4][i & 15] = 0.0;
     }
+    if (pc.mode == 8u && tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u)
+        outv[99] = -1.0;
     barrier();
 
     coopmat<uint8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma0, ma1;
@@ -179,23 +181,214 @@ void main() {
             }
         }
         memoryBarrierShared();
-        memoryBarrierBuffer();
         barrier();
 
         // ── MMA(coopmat) — WG=서브그룹1, K32 = 16×2 타일.
         acc32 = coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
-        if (pc.mode != 2u) {
-            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        if (pc.mode == 7u) {
+            // plans/99 격리: coopmat 대신 스칼라 dot(스테이징·스케일 동일).
+            // 레인 i가 (m,r)=(i>>4, i&15)+(i+32)... 8셀 — 스케일 루프 배분과 동일.
+            for (int i8 = 0; i8 < 8; i8++) {
+                int idx = int(tid) * 8 + i8;
+                int m = idx >> 4, r = idx & 15;
+                int qsum = 0;
+                for (int k = 0; k < 16; k++) {
+                    qsum += int(A0(m * 16 + k)) * int(B0(r * 16 + k));
+                    qsum += int(A1(m * 16 + k)) * int(B1(r * 16 + k));
+                }
+                scw[wgslot / 4u + uint(m * 16 + r)] = qsum;
+            }
+        } else if (pc.mode == 14u) {
+            // plans/99: ma0 변수에 +256 오프셋 — 변수 vs 오프셋 격리.
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) outv[250] = 780.0;
+            if (sb == 0) {
+            coopMatLoad(ma0, sc8, wgslot + 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot + 256u, 16, gl_CooperativeMatrixLayoutColumnMajor);
             acc32 = coopMatMulAdd(ma0, mb0, acc32);
-        }
-        if (pc.mode != 3u) {
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+                int bad = 0;
+                for (int m2 = 0; m2 < 16; m2++)
+                    for (int r2 = 0; r2 < 16; r2++) {
+                        int qs = 0;
+                        for (int k = 0; k < 16; k++)
+                            qs += int(A1(m2 * 16 + k)) * int(B1(r2 * 16 + k));
+                        if (scw[wgslot / 4u + uint(m2 * 16 + r2)] != qs) bad++;
+                    }
+                outv[100] = float(bad);
+            }
+            }
+            return;
+        } else if (pc.mode == 13u) {
+            // plans/99: 오프셋 4배 가설 — 타일1 스테이징/로드 양쪽 1024로.
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) outv[250] = 779.0;
+            if (sb == 0) {
+            coopMatLoad(ma1, sc8, wgslot + 1024u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb1, sc8i, wgslot + 1024u, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma1, mb1, acc32);
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+                int bad = 0;
+                for (int m2 = 0; m2 < 16; m2++)
+                    for (int r2 = 0; r2 < 16; r2++) {
+                        int qs = 0;
+                        for (int k = 0; k < 16; k++)
+                            qs += int(sc8[wgslot + 1024u + uint(m2 * 16 + k)]) * int(sc8i[wgslot + 1024u + uint(r2 * 16 + k)]);
+                        if (scw[wgslot / 4u + uint(m2 * 16 + r2)] != qs) bad++;
+                    }
+                outv[100] = float(bad);
+            }
+            }
+            return;
+        } else if (pc.mode == 12u) {
+            // plans/99: 타일1 단독(wgslot+256) — 오프셋/체인 격리.
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) outv[250] = 778.0;
+            if (sb == 0) {
             coopMatLoad(ma1, sc8, wgslot + 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(mb1, sc8i, wgslot + 256u, 16, gl_CooperativeMatrixLayoutColumnMajor);
             acc32 = coopMatMulAdd(ma1, mb1, acc32);
-        }
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+                int bad = 0;
+                for (int m2 = 0; m2 < 16; m2++)
+                    for (int r2 = 0; r2 < 16; r2++) {
+                        int qs = 0;
+                        for (int k = 0; k < 16; k++)
+                            qs += int(A1(m2 * 16 + k)) * int(B1(r2 * 16 + k));
+                        if (scw[wgslot / 4u + uint(m2 * 16 + r2)] != qs) bad++;
+                    }
+                outv[100] = float(bad);
+            }
+            }
+            return;
+        } else if (pc.mode == 11u) {
+            // plans/99: 단일 타일0만 — 체인/단일 격리.
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) outv[250] = 777.0;
+            if (sb == 0) {
+            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma0, mb0, acc32);
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+                int bad = 0;
+                for (int m2 = 0; m2 < 16; m2++)
+                    for (int r2 = 0; r2 < 16; r2++) {
+                        int qs = 0;
+                        for (int k = 0; k < 16; k++)
+                            qs += int(A0(m2 * 16 + k)) * int(B0(r2 * 16 + k));
+                        if (scw[wgslot / 4u + uint(m2 * 16 + r2)] != qs) bad++;
+                    }
+                outv[100] = float(bad);
+                for (int q = 0; q < 16; q++) outv[168 + q] = float(scw[wgslot / 4u + uint(q)]);
+            }
+            }
+            return;
+        } else if (pc.mode == 10u) {
+            // plans/99: A를 항등으로 → C[0][r] = B_tile(0,r) = B(r,0) 판독.
+            if (gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && tid == 0u) {
+                for (int m = 0; m < 16; m++)
+                    for (int k = 0; k < 16; k++) {
+                        A0(m * 16 + k) = uint8_t(m == k ? 1 : 0);
+                        A1(m * 16 + k) = uint8_t(0);
+                    }
+            }
+            memoryBarrierBuffer();
+            barrier();
+            if (sb == 0) {
+            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma0, mb0, acc32);
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u)
+                for (int q = 0; q < 16; q++) outv[200 + q] = float(scw[wgslot / 4u + uint(q)]);
+            }
+            return;
+        } else if (pc.mode == 9u) {
+            // plans/99: B를 항등으로 → C = coopmat이 읽은 A 오퍼런드 판독.
+            if (gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && tid == 0u) {
+                for (int r = 0; r < 16; r++)
+                    for (int k = 0; k < 16; k++)
+                        B0(r * 16 + k) = int8_t(r == k ? 1 : 0);
+            }
+            memoryBarrierBuffer();
+            barrier();
+            if (sb == 0) {
+            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma0, mb0, acc32);
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u)
+                for (int q = 0; q < 16; q++) outv[200 + q] = float(scw[wgslot / 4u + uint(q)]);
+            }
+            return;
+        } else if (pc.mode == 8u) {
+            // plans/99 in-situ 자기검증: coopmat 결과를 즉석 스칼라와 비교.
+            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma0, mb0, acc32);
+            coopMatLoad(ma1, sc8, wgslot + 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb1, sc8i, wgslot + 256u, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma1, mb1, acc32);
+            coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            memoryBarrierBuffer();
+            barrier();
+            // 스칼라 재계산·불일치 카운트 → outv[100](WG0만).
+            if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+                if (sb > 0 && outv[99] < 0.0 && true) { } // 자리표시
+                int bad = 0;
+                for (int m2 = 0; m2 < 16; m2++)
+                    for (int r2 = 0; r2 < 16; r2++) {
+                        int qs = 0;
+                        for (int k = 0; k < 16; k++) {
+                            qs += int(A0(m2 * 16 + k)) * int(B0(r2 * 16 + k));
+                            qs += int(A1(m2 * 16 + k)) * int(B1(r2 * 16 + k));
+                        }
+                        if (scw[wgslot / 4u + uint(m2 * 16 + r2)] != qs) bad++;
+                    }
+                outv[100] = float(bad);
+                if (sb == 0) outv[98] = float(bad);
+                if (bad > 0 && outv[99] < 0.0) outv[99] = float(sb);
+                outv[101] = float(gl_SubgroupSize);
+                outv[102] = float(gl_NumSubgroups);
+                outv[103] = float(gl_SubgroupInvocationID);
+                // outv[104..]: 전체 16바이트×4 + scw 행0.
+                for (int q = 0; q < 16; q++) {
+                    outv[104 + q] = float(A0(q));
+                    outv[120 + q] = float(A1(q));
+                    outv[136 + q] = float(B0(q));
+                    outv[152 + q] = float(B1(q));
+                    outv[168 + q] = float(scw[wgslot / 4u + uint(q)]);
+                    outv[184 + q] = float(B0(q * 16));  // B(r,0) 열
+                }
+            }
+            return;
+        } else {
+        // plans/99 병발 수정: 이 RADV에서 두 번째 coopmat<UseA/UseB> 객체
+        // (ma1/mb1)의 로드가 오염됨 — 오프셋 무관, 변수 자체. ma0/mb0 재사용.
+        coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        acc32 = coopMatMulAdd(ma0, mb0, acc32);
+        coopMatLoad(ma0, sc8, wgslot + 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb0, sc8i, wgslot + 256u, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        acc32 = coopMatMulAdd(ma0, mb0, acc32);
         coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        // plans/99: scw는 SSBO — 읽어들이려면 Buffer 배리어 필수(Shared만으론
+        // 비결정론 레이스: got가 실행마다 변동했음).
         memoryBarrierShared();
+        memoryBarrierBuffer();
         barrier();
         // ── 스케일: 레인당 8원소.
         for (int i = 0; i < 8; i++) {
@@ -204,6 +397,8 @@ void main() {
             int r = idx & 15;
             sAccF[m][r] += sBd[r] * (sAd[m] * float(scw[wgslot / 4u + uint(m * 16 + r)]) - sAm[m] * sBsum[r]);
         }
+        memoryBarrierShared();
+        memoryBarrierBuffer();
         barrier();
     }
 
