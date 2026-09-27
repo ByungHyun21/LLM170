@@ -538,6 +538,30 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     if std::env::var_os("LLM170_VK_Q4CM8DBG").is_some() {
         eprintln!("[cm8-k] sAd={} sAm={} sBd={} sBsum={} qsum00={} au8={} accF00={} bi800={} sAd0={} sAd40={}",
             got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8], got[9]);
+        // sb0 A/B 덤프 대조: 커널 값으로 qsum/sBsum 재현.
+        {
+            let a: Vec<f32> = got[10..26].to_vec();
+            let a2: Vec<f32> = got[26..42].to_vec();
+            let b: Vec<f32> = got[42..58].to_vec();
+            let b2: Vec<f32> = got[58..74].to_vec();
+            let mut qs = 0f64; let mut bsum = 0f64;
+            for i in 0..16 {
+                qs += (a[i] as f64) * (b[i] as f64);
+                qs += (a2[i] as f64) * (b2[i] as f64);
+                bsum += b[i] as f64 + b2[i] as f64;
+            }
+            eprintln!("[cm8-k] sb0 재현 qsum={qs:.0} sBsum={bsum:.0} (커널 mode1은 sb79값)");
+            // CPU 니블 대조: e0의 row0 sb0 — deq_q4_k 구조(qs[16..] lo=짝 sb).
+            {
+                let e0 = ids_g[0] as usize;
+                let bs = 144usize;
+                let blk = e0 * n_out_d * bs;  // row 0
+                let qs_off = blk + 16;        // qs 시작(블록 내 sb0=첫 32바이트의 lo)
+                let nib: Vec<u8> = (0..32).map(|i| wd.data[qs_off + i] & 0xF).collect();
+                eprintln!("[cm8-k] 커널 A nib = {:?}", &a[..8]);
+                eprintln!("[cm8-k] CPU  A nib = {:?}", &nib[..8]);
+            }
+        }
         // CPU 대조: 밴드0 전문가의 row0 sb0/sb40 d·sc.
         {
             let e0 = ids_g[0] as usize;
@@ -3633,27 +3657,22 @@ pub fn cm8_probe() -> Result<String, String> {
         let dummy = ctx.alloc_host(1024)?;
         let dummy2 = ctx.alloc_host(1024)?;
         unsafe { std::ptr::write_bytes(dummy.ptr, 0, 1024); std::ptr::write_bytes(dummy2.ptr, 0, 1024); }
-        // A 직독 프로브: A[m][k] = m*17+k(유니크), B[r][k] = 1 iff k==9.
-        // C[m][r] = A'[m][9] — 유니크값으로 A'의 열 출처 즉시 식별.
+        // 다중-r 프로브: A[0][k]=1(k<16 타일a), B[r][9]=r+1 → C[0][r]=r+1 기대.
         unsafe {
             std::ptr::write_bytes(dummy.ptr, 0, 1024);
             std::ptr::write_bytes(dummy2.ptr, 0, 1024);
-            for m in 0..16usize {
-                for k in 0..32usize {
-                    *(dummy.ptr.add(m * 32 + k) as *mut u8) = (m * 17 + k) as u8;
-                }
+            for k in 0..16usize {
+                *(dummy.ptr.add(k) as *mut u8) = 1;
             }
-            for k in 0..32usize {
-                *(dummy2.ptr.add(k) as *mut i8) = if k == 25 { 1 } else { 0 };  // 타일2 k=25
+            for r in 0..16usize {
+                *(dummy2.ptr.add(r * 32 + 9) as *mut i8) = (r + 1) as i8;
             }
         }
         ctx.bind_bufs(ds2, &[dummy.buf, dummy2.buf, vb.buf]);
         let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
         let diffs: Vec<i32> = unsafe { std::slice::from_raw_parts(vb.ptr as *const i32, 256) }.to_vec();
         let bad = diffs.iter().filter(|&&d| d != 0).count();
-        let col0: Vec<i32> = (0..16).map(|m| diffs[m * 16]).collect();
-        eprintln!("[cm8-verify] 열0(=A'[m][9]) {:?} · 기대 [9,26,43,60,77,94,111,128,145,162,179,196,213,230,247,8]", col0);
-        eprintln!("[cm8-verify] 전체 생략");
+        eprintln!("[cm8-verify] 행0 {:?} · 기대 [1,2,3,...,16]", &diffs[..16]);
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
     }
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 3, 0)?;
