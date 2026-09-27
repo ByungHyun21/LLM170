@@ -3217,3 +3217,242 @@ pub fn ple_mt_check(reps: usize) -> Result<String, String> {
 fn acc_frame_ptr(acc: &VkAcc, h: u64) -> *mut u8 {
     acc.framebufs.lock().get(&h).map(|b| b.ptr).unwrap_or(std::ptr::null_mut())
 }
+
+/// vk-llama-mmq (plans/98) — llama mul_mm MULMAT_QUANT+MUL_MAT_ID 포팅 프로브.
+/// q4_K 다운 스택에 대해: ids[8][t] 슬롯-메이저 라우팅 + counts → llama 커널
+/// 디스패치(MmTypeA=12 패치 spv) → CPU 디퀀트 내적 대조 + 소형 벤치.
+pub fn llama_mmq_check() -> Result<String, String> {
+    use llm170_core::quant::dequant_row;
+    let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let mut found = None;
+    for il in 0..48 {
+        for nm in ["ffn_down_exps", "ffn_gate_exps"] {
+            if let Ok(w) = model.w4(&format!("blk.{il}.{nm}.weight"))
+                && w.ty == llm170_gguf::GgmlType::Q4K
+            {
+                found = Some((il, nm.to_string(), w));
+                break;
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let (il, nm, wd) = found.ok_or("q4_K 스택 없음")?;
+    eprintln!("[lmmq] L{il} {nm} ty={:?} len={}", wd.ty, wd.data.len());
+    let ne = 512usize;
+    let k_sel = 8usize;
+    let n_in = wd.n_in as usize;
+    let m_per = wd.n_out as usize / ne;
+    let t = std::env::var("LLM170_LMMQ_T").ok().and_then(|v| v.parse().ok()).unwrap_or(64usize);
+    let plain = std::env::var_os("LLM170_LMMQ_PLAIN").is_some();
+    let pre = std::env::var_os("LLM170_LMMQ_PRE").is_some();
+    let f32a = std::env::var_os("LLM170_LMMQ_F32A").is_some();
+    let spv = std::fs::read(if f32a {
+        "crates/backend-gpu/src/rawvk/spv/llama_mm_f32A_plain.spv"
+    } else if pre {
+        "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_idq.spv"
+    } else if plain {
+        "crates/backend-gpu/src/rawvk/spv/llama_mm_q4k_plain.spv"
+    } else {
+        "crates/backend-gpu/src/rawvk/spv/llama_mmidq_q4k_f32.spv"
+    })
+    .map_err(|e| e.to_string())?;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    eprintln!("[lmmq] acc ok");
+    // B: 활성 f32 [t][K].
+    let mut lcg = 987654321u64;
+    let mut lcgf = || {
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((lcg >> 33) as f32 / 4294967296.0) - 0.5
+    };
+    let bflat: Vec<f32> = (0..t * n_in).map(|_| lcgf()).collect();
+    let bb = if pre {
+        // 프리빌트 f16판: B를 f16(행중심, 동일 레이아웃)으로.
+        let bh: Vec<half::f16> = bflat.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b = ctx.alloc_host(t * n_in * 2)?;
+        unsafe { std::ptr::copy_nonoverlapping(bh.as_ptr() as *const u8, b.ptr, t * n_in * 2) };
+        b
+    } else {
+        let b = ctx.alloc_host(t * n_in * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(bflat.as_ptr() as *const u8, b.ptr, t * n_in * 4) };
+        b
+    };
+    // A: f32a는 밀집 f32, 아니면 q4_K 스택.
+    let mut a_lcg = 4242424242424242u64;
+    let ab = if f32a {
+        let mut a_lcgf = || {
+            a_lcg = a_lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((a_lcg >> 33) as f32 / 4294967296.0) - 0.5
+        };
+        let a: Vec<f32> = (0..m_per * n_in).map(|_| a_lcgf()).collect();
+        let b = ctx.alloc_host(m_per * n_in * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(a.as_ptr() as *const u8, b.ptr, m_per * n_in * 4) };
+        b
+    } else {
+        let _ = &mut a_lcg;
+        ctx.alloc_host(wd.data.len())?
+    };
+    // ids: [k_sel][t] i32(토큰별 8개 상이 전문가), counts[ne].
+    let mut ids = vec![0i32; k_sel * t];
+    let mut counts = vec![0i32; ne];
+    if std::env::var_os("LLM170_LMMQ_DBG").is_some() {
+        // 디버그: 전 전문가 만석 — 조기 반환 경로 배제.
+        counts.fill((t) as i32);
+    }
+    let mut taken = vec![false; ne];
+    for i in 0..t {
+        taken.fill(false);
+        let mut j = 0usize;
+        while j < k_sel {
+            let e = ((lcgf().abs() * 9.0 + 1.0) as usize + i * 7 + j) % ne;
+            if !taken[e] {
+                taken[e] = true;
+                ids[j * t + i] = e as i32;
+                counts[e] += 1;
+                j += 1;
+            }
+        }
+    }
+    let ib = ctx.alloc_host(ids.len() * 4)?;
+    unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr() as *const u8, ib.ptr, ids.len() * 4) };
+    let cb = ctx.alloc_host(counts.len() * 4)?;
+    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr() as *const u8, cb.ptr, counts.len() * 4) };
+    // D: [t][k_sel][m_per] f32.
+    let db = ctx.alloc_host(t * k_sel * m_per * 4)?;
+    unsafe { std::ptr::write_bytes(db.ptr as *mut u8, 0x7f, t * k_sel * m_per * 4) };
+    // 디바이스 생존 판별 — 트리비얼 라이터.
+    {
+        let src = b"#version 450
+layout(local_size_x=64) in;
+layout(binding=0) buffer W { uint x[]; };
+void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
+        let _ = std::fs::write("/tmp/lmmq_alive.comp", &src[..]);
+        let ok = std::process::Command::new("python3")
+            .args(["scripts/build_spv.py", "/tmp/lmmq_alive.comp", "/tmp/lmmq_alive.spv"])
+            .status().map(|s| s.success()).unwrap_or(false);
+        eprintln!("[lmmq] alive build ok={ok}");
+        if ok {
+            let spv2 = std::fs::read("/tmp/lmmq_alive.spv").unwrap();
+            let vb = ctx.alloc_host(256).unwrap();
+            unsafe { std::ptr::write_bytes(vb.ptr, 0, 256) };
+            if let Ok((_d2, p2, _o2, ds2, pipe2)) = ctx.pipeline(&spv2, 1, 4) {
+                ctx.bind_bufs(ds2, &[vb.buf]);
+                let _ = ctx.run(p2, ds2, pipe2, &1u32.to_le_bytes(), 1, 1, 1);
+                let _ = ctx.end_batch_wait();
+                let v = unsafe { *(vb.ptr as *const u32) };
+                eprintln!("[lmmq] alive probe = {v:#x} (0xdeadbeef면 디바이스 생존)");
+                unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
+            }
+        }
+    }
+    eprintln!("[lmmq] bufs ok, pipeline...");
+    let (dsl, pl, pool, ds, pipe) = if plain || f32a {
+        ctx.pipeline(&spv, 3, 16 * 4)?
+    } else {
+        ctx.pipeline(&spv, 5, 15 * 4)?
+    };
+    eprintln!("[lmmq] pipeline ok");
+    let _ = (dsl, pool);
+    if plain || f32a {
+        ctx.bind_bufs(ds, &[ab.buf, bb.buf, db.buf]);
+    } else {
+        ctx.bind_bufs(ds, &[ab.buf, bb.buf, db.buf, ib.buf, cb.buf]);
+    }
+    // PC(id): M, N, K, sa, sb, sd, bsa, bsb, bsd, nei0, nei1, nbi1, ne11, n_exp, hoist
+    // PC(평판): M, N, K, sa, sb, sd, bsa, bsb, bsd, base_wg_z, num_batches, k_split, ne02, ne12, b2, b3
+    let push: Vec<u32> = if plain || f32a {
+        vec![
+            m_per as u32, t as u32, n_in as u32,
+            n_in as u32, n_in as u32, m_per as u32,
+            (n_in * m_per) as u32, (n_in * t) as u32, (m_per * t) as u32,
+            0, 1, n_in as u32, 1, 1, 1, 1,
+        ]
+    } else {
+        vec![
+            m_per as u32, (k_sel * t) as u32, n_in as u32,
+            n_in as u32, n_in as u32, m_per as u32,
+            (n_in * m_per) as u32, (n_in * t) as u32, (m_per * k_sel) as u32,
+            k_sel as u32, t as u32, k_sel as u32, t as u32, ne as u32, 0,
+        ]
+    };
+    let mut pbytes = Vec::with_capacity(60);
+    for v in &push {
+        pbytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let gx_lim = std::env::var("LLM170_LMMQ_GX").ok().and_then(|v| v.parse().ok());
+    let gy_lim = std::env::var("LLM170_LMMQ_GY").ok().and_then(|v| v.parse().ok());
+    let (gx, gy, gz) = if plain || f32a {
+        (gx_lim.unwrap_or((m_per as u32).div_ceil(64)), gy_lim.unwrap_or((t as u32).div_ceil(64)), 1u32)
+    } else {
+        ((m_per as u32).div_ceil(64), (t as u32).div_ceil(64), ne as u32)
+    };
+    eprintln!("[lmmq] run gx={gx} gy={gy} gz={gz} plain={plain}");
+    if std::env::var_os("LLM170_LMMQ_SKIP").is_none() {
+        ctx.run(pl, ds, pipe, &pbytes, gx, gy, gz)?;
+    }
+    eprintln!("[lmmq] run ok(동기 run — 내부 대기 완료)");
+    // 판독 + CPU 대조(행별 64샘플).
+    eprintln!("[lmmq] reading...");
+    let got: Vec<f32> = unsafe {
+        let mut v = vec![0f32; t * k_sel * m_per];
+        std::ptr::copy_nonoverlapping(db.ptr as *const f32, v.as_mut_ptr(), v.len());
+        v
+    };
+    eprintln!("[lmmq] got len {}", got.len());
+    let mut ref_row = vec![0.0f32; n_in];
+    let mut mx = 0f64;
+    let mut bad = 0usize;
+    let mut n_checked = 0usize;
+    for i in 0..t {
+        for j in 0..if plain { 1 } else { k_sel } {
+            let e = if plain { 0 } else { ids[j * t + i] as usize };
+            for r in 0..m_per.min(64) {
+                if f32a {
+                    let mut st = 4242424242424242u64;
+                    let mut step = |st: &mut u64| {
+                        *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        ((*st >> 33) as f32 / 4294967296.0) - 0.5
+                    };
+                    for _ in 0..r * n_in {
+                        let _ = step(&mut st);
+                    }
+                    for c in 0..n_in {
+                        ref_row[c] = step(&mut st);
+                    }
+                } else {
+                    dequant_row(wd.ty, wd.data, (e * m_per + r) as u64, n_in as u64, &mut ref_row);
+                }
+                let mut dot = 0f32;
+                for c in 0..n_in {
+                    dot += ref_row[c] * bflat[i * n_in + c];
+                }
+                let g = got[(i * k_sel + j) * m_per + r];
+                let d = (g - dot).abs();
+                let rel = (d / dot.abs().max(1e-3)) as f64;
+                if rel > mx { mx = rel; }
+                if rel > 2e-2 { bad += 1; }
+                n_checked += 1;
+            }
+        }
+    }
+    eprintln!("[lmmq] check done mx={mx} bad={bad}");
+    // 소형 벤치(따뜻한 5회).
+    let reps = 5u32;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        ctx.run(pl, ds, pipe, &pbytes, gx, gy, gz)?;
+    }
+    let per_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+    unsafe {
+        ctx.device.destroy_pipeline(pipe, None);
+        ctx.device.destroy_pipeline_layout(pl, None);
+    }
+    Ok(format!(
+        "llama-mmq(L{il} {nm} q4_K {m_per}x{n_in} E={ne} t={t}): max|relD|={mx:.3e} bad={bad}/{n_checked} · {per_ms:.2}ms/회 {}",
+        if bad == 0 { "★" } else { "✗" }
+    ))
+}
