@@ -21,7 +21,11 @@ void main() {
         coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
     coopMatLoad(ma, a, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(mb, b, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+    #ifdef CM8_IDENT
+    const uint R = 1u;
+#else
     const uint R = 1024u;
+#endif
     for (uint i = 0; i < R; i++) {
         acc = coopMatMulAdd(ma, mb, acc);
     }
