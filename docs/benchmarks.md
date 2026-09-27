@@ -1957,3 +1957,9 @@ design on this hardware.
 Shape census: #2/#3 (2560→10240, 2560→6144) share input x, but weight
 reads dominate (139MB vs 2.8MB activations) — fusion upside <1%.
 q8128 is weight-bandwidth bound; axis closed.
+
+### Session-peak drift continues (2026-09-27 late-night)
+
+**422.2 t/s** (1212.8 ms) — the warm band keeps inching up as the RADV
+shader/pipeline cache matures: 410→416→421→422 across the session.
+Session peak now +88% over the 225 baseline.
