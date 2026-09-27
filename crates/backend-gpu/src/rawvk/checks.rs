@@ -3272,9 +3272,12 @@ pub fn llama_mmq_check() -> Result<String, String> {
     let plain = std::env::var_os("LLM170_LMMQ_PLAIN").is_some();
     let pre = std::env::var_os("LLM170_LMMQ_PRE").is_some();
     let pt = std::env::var_os("LLM170_LMMQ_PT").is_some();
+    let sg = std::env::var_os("LLM170_LMMQ_SG").is_some();
     let f32a = std::env::var_os("LLM170_LMMQ_F32A").is_some();
     let mm32 = std::env::var_os("LLM170_LMMQ_MM32").is_some();
-    let spv = std::fs::read(if pt {
+    let spv = std::fs::read(if sg {
+        "crates/backend-gpu/src/rawvk/spv/llama_sgq_cm1.spv"
+    } else if pt {
         "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_idq4k.spv"
     } else if mm32 {
         "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_mmf32.spv"
@@ -3421,7 +3424,16 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
             32, 32, 2, 4, 2, 1, 32,
             1, 12,
         ];
-        ctx.pipeline_spec(&spv, 5, 15 * 4, &spec)?
+        if sg {
+            let spec15: Vec<u32> = vec![
+                256, 128, 64, 32,
+                32, 32, 2, 4, 2, 1, 32,
+                1, 12, 0, 0,
+            ];
+            ctx.pipeline_spec_fg(&spv, 5, 15 * 4, &spec15, true)?
+        } else {
+            ctx.pipeline_spec(&spv, 5, 15 * 4, &spec)?
+        }
     } else {
         ctx.pipeline(&spv, 5, 15 * 4)?
     };
