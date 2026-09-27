@@ -1905,3 +1905,9 @@ pattern-lucky. The 22 TMAC/s hardware unit exists and is proven; kernel
 convergence is impossible on this driver generation. All probe/checker/
 kernel assets preserved (opt-in `LLM170_VK_Q4CM8=1`). Re-evaluate on
 RADV 26.3+. Same driver-family root as the llama cm1 pipeline segfault.
+
+### Session-peak drift (2026-09-27 late)
+
+Warm band has drifted up through the session as the driver's shader cache
+matured: latest 5-rep window hit **421.6 t/s** (1214.4 ms wall) — new
+session peak, confirming the 410-420 band as steady state.
