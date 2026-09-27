@@ -571,9 +571,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
                 n_in as u32, n_out as u32, per_expert_push as u32, chunk_words, xq_w as u32,
-                if slot == Slot::FnMoeTileQ4kCm8
-                    && std::env::var("LLM170_VK_Q4CM8DBG").is_ok()
-                { 1u32 } else { 0u32 },
+                if slot == Slot::FnMoeTileQ4kCm8 {
+                    std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)
+                } else { 0u32 },
                 rows as u32,
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {

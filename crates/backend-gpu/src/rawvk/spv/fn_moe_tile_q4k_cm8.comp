@@ -81,9 +81,10 @@ void main() {
     coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc32;
 
     float sAdSb0 = 0.0; float sAdSb40 = 0.0;
+    int sDumpA0 = -1;
     for (int sb = 0; sb < n_sub; sb++) {
         if (pc.mode == 1u && tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
-            if (sb == 0) sAdSb0 = sAd[0];
+            if (sb == 0) { sAdSb0 = sAd[0]; sDumpA0 = 1; }
             if (sb == 40) sAdSb40 = sAd[0];
         }
         // ── A 스테이징: 니블→u8. 스레드가 (m, 워드) 분담(16×8=128 → 4회).
@@ -96,15 +97,21 @@ void main() {
                 uint qbase = wq4 + 4u + uint(((sb & 7) >> 1) * 8);
                 bool hi = (sb & 1) != 0;
                 uint w = w0c[qbase + uint(p)];
+                // plans/99 수정: 마스크된 워드의 '바이트'가 곧 니블값(0..15).
+                // (w>>4j)&0xF 이중 추출이 was 버그 — 0 교대 패턴의 원인).
                 w = hi ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
-                sAu8a[m][p * 4 + 0] = uint8_t(w & 0xFu);
-                sAu8a[m][p * 4 + 1] = uint8_t((w >> 4) & 0xFu);
-                sAu8a[m][p * 4 + 2] = uint8_t((w >> 8) & 0xFu);
-                sAu8a[m][p * 4 + 3] = uint8_t((w >> 12) & 0xFu);
-                sAu8b[m][p * 4 + 0] = uint8_t((w >> 16) & 0xFu);
-                sAu8b[m][p * 4 + 1] = uint8_t((w >> 20) & 0xFu);
-                sAu8b[m][p * 4 + 2] = uint8_t((w >> 24) & 0xFu);
-                sAu8b[m][p * 4 + 3] = uint8_t((w >> 28) & 0xFu);
+                if (p < 4) {
+                    sAu8a[m][p * 4 + 0] = uint8_t(w & 0xFFu);
+                    sAu8a[m][p * 4 + 1] = uint8_t((w >> 8) & 0xFFu);
+                    sAu8a[m][p * 4 + 2] = uint8_t((w >> 16) & 0xFFu);
+                    sAu8a[m][p * 4 + 3] = uint8_t((w >> 24) & 0xFFu);
+                } else {
+                    int q4 = p - 4;
+                    sAu8b[m][q4 * 4 + 0] = uint8_t(w & 0xFFu);
+                    sAu8b[m][q4 * 4 + 1] = uint8_t((w >> 8) & 0xFFu);
+                    sAu8b[m][q4 * 4 + 2] = uint8_t((w >> 16) & 0xFFu);
+                    sAu8b[m][q4 * 4 + 3] = uint8_t((w >> 24) & 0xFFu);
+                }
                 if (p == 0) {
                     float d = f16_exact(w0c[wq4] & 0xFFFFu);
                     float dmin = f16_exact(w0c[wq4] >> 16);
@@ -165,12 +172,16 @@ void main() {
 
         // ── MMA(coopmat) — WG=서브그룹1, K32 = 16×2 타일.
         acc32 = coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
-        coopMatLoad(ma0, sAu8a[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(mb0, sBi8a[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
-        acc32 = coopMatMulAdd(ma0, mb0, acc32);
-        coopMatLoad(ma1, sAu8b[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(mb1, sBi8b[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
-        acc32 = coopMatMulAdd(ma1, mb1, acc32);
+        if (pc.mode != 2u) {
+            coopMatLoad(ma0, sAu8a[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sBi8a[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma0, mb0, acc32);
+        }
+        if (pc.mode != 3u) {
+            coopMatLoad(ma1, sAu8b[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb1, sBi8b[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            acc32 = coopMatMulAdd(ma1, mb1, acc32);
+        }
         coopMatStore(acc32, sAcc32[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
         // ── 스케일: 레인당 8원소.
@@ -187,6 +198,15 @@ void main() {
     if (pc.mode == 1u) {
         if (tid == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
             outv[8] = sAdSb0; outv[9] = sAdSb40;
+            // sb=0 덤프: A 니블 32 + B 바이트 32 (outv[10..74]).
+            if (sDumpA0 >= 0) {
+                for (int i = 0; i < 16; i++) {
+                    outv[10 + i] = float(sAu8a[0][i]);
+                    outv[26 + i] = float(sAu8b[0][i]);
+                    outv[42 + i] = float(sBi8a[0][i]);
+                    outv[58 + i] = float(sBi8b[0][i]);
+                }
+            }
             outv[0] = sAd[0]; outv[1] = sAm[0];
             outv[2] = sBd[0]; outv[3] = sBsum[0];
             outv[4] = float(sAcc32[0][0]);
