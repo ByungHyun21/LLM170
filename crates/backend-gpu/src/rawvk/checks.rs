@@ -535,6 +535,24 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     acc.frame_begin(t);
     let mut got = vec![0f32; t * k * n_out_d];
     acc.frame_read(mgh, &mut got)?;
+    if std::env::var_os("LLM170_VK_Q4CM8DBG").is_some() {
+        eprintln!("[cm8-k] sAd={} sAm={} sBd={} sBsum={} qsum00={} au8={} accF00={} bi800={} sAd0={} sAd40={}",
+            got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8], got[9]);
+        // CPU 대조: 밴드0 전문가의 row0 sb0/sb40 d·sc.
+        {
+            let e0 = ids_g[0] as usize;
+            let row_words = (n_in_d >> 8) * 36;
+            for sb in [0usize, 40] {
+                let wq4 = e0 * row_words + sb / 8 * row_words / 10;
+                let _ = wq4;
+            }
+            let bs = 144usize; // q4_K 블록 바이트
+            let blk0 = e0 * n_out_d * bs; // row0 block0
+            let d = f32::from_le_bytes([wd.data[blk0], wd.data[blk0+1], 0, 0]);
+            let _ = d;
+            eprintln!("[cm8-k] CPU row0 blk0 raw d bytes {:?} m bytes {:?}", &wd.data[blk0..blk0+2], &wd.data[blk0+2..blk0+4]);
+        }
+    }
     for h in [rh, idh, wth, mxh, mgh] {
         let _ = acc.frame_free(h);
     }
@@ -3615,16 +3633,27 @@ pub fn cm8_probe() -> Result<String, String> {
         let dummy = ctx.alloc_host(1024)?;
         let dummy2 = ctx.alloc_host(1024)?;
         unsafe { std::ptr::write_bytes(dummy.ptr, 0, 1024); std::ptr::write_bytes(dummy2.ptr, 0, 1024); }
-        // 기저: A[3][5]=1, B[7][11]=1 (5≠11 → 올바르면 전 0).
+        // A 직독 프로브: A[m][k] = m*17+k(유니크), B[r][k] = 1 iff k==9.
+        // C[m][r] = A'[m][9] — 유니크값으로 A'의 열 출처 즉시 식별.
         unsafe {
-            *(dummy.ptr.add(3 * 32 + 5) as *mut u8) = 1;
-            *(dummy2.ptr.add(7 * 32 + 11) as *mut i8) = 1;
+            std::ptr::write_bytes(dummy.ptr, 0, 1024);
+            std::ptr::write_bytes(dummy2.ptr, 0, 1024);
+            for m in 0..16usize {
+                for k in 0..32usize {
+                    *(dummy.ptr.add(m * 32 + k) as *mut u8) = (m * 17 + k) as u8;
+                }
+            }
+            for k in 0..32usize {
+                *(dummy2.ptr.add(k) as *mut i8) = if k == 25 { 1 } else { 0 };  // 타일2 k=25
+            }
         }
         ctx.bind_bufs(ds2, &[dummy.buf, dummy2.buf, vb.buf]);
         let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
         let diffs: Vec<i32> = unsafe { std::slice::from_raw_parts(vb.ptr as *const i32, 256) }.to_vec();
         let bad = diffs.iter().filter(|&&d| d != 0).count();
-        eprintln!("[cm8-verify] 전체 {:?}", &diffs[..256]);
+        let col0: Vec<i32> = (0..16).map(|m| diffs[m * 16]).collect();
+        eprintln!("[cm8-verify] 열0(=A'[m][9]) {:?} · 기대 [9,26,43,60,77,94,111,128,145,162,179,196,213,230,247,8]", col0);
+        eprintln!("[cm8-verify] 전체 생략");
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
     }
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 3, 0)?;
