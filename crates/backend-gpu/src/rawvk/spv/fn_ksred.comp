@@ -1,0 +1,13 @@
+#version 450
+// plans/102 — K-분할 부분합 축소: out[c] = Σ_s scr[s·N + c] (결정론 순서).
+layout(local_size_x = 128) in;
+layout(binding = 0) buffer Ob { float outv[]; };
+layout(binding = 1) readonly buffer Sc { float scr[]; };
+layout(push_constant) uniform PC { uint n; uint ks; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.n) return;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.ks; s++) acc += scr[s * pc.n + c];
+    outv[c] = acc;
+}
