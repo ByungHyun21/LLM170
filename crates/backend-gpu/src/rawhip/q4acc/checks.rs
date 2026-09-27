@@ -360,7 +360,7 @@ pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
     acc.frame_write(hout, &out)?;
     acc.frame_write(hinj, &inj)?;
     acc.frame_begin(t);
-    acc.frame_op(&FrameOp::HcGateMean { xn: hxn, gate: hgate, out: hmix, hc, n })?;
+    acc.frame_op(&FrameOp::HcGateMean { xn: hxn, gate: hgate, out: hmix, hc, n, h16: false })?;
     acc.frame_op(&FrameOp::HcCombine { res: hres, out: hout, inj: hinj, hc, n, total: hc * n * t })?;
     let mut mix_gpu = vec![0.0f32; t * n];
     acc.frame_read(hmix, &mut mix_gpu)?;

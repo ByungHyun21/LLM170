@@ -231,7 +231,7 @@ impl VkAcc {
         if big {
             // plans/92 P1: 단일 디스패치(슬래브 x, 행 y) — 커널 유도 tok_base.
             let gys = (t as u32).div_ceil(128);
-            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32]);
+            let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, 0u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
         } else {
             for tb in (0..t).step_by(64) {

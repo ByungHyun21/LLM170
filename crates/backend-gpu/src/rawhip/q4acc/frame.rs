@@ -1464,7 +1464,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 let mut nn = n as i32;
                 self.kop("copy_rows", (n as u32).div_ceil(128), 1, 1, 128, &mut cargs!(&mut sp, &mut dp, &mut so, &mut dfo, &mut nn))
             }
-            O::HcGateMean { xn, gate, out, hc, n } => {
+            O::HcGateMean { xn, gate, out, hc, n, h16: _ } => {
                 let (mut xp, mut gp, mut op_) = (self.fptr(xn)?, self.fptr(gate)?, self.fptr(out)?);
                 let total = n * self.t_cur();
                 let mut h = hc as i32;
