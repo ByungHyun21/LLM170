@@ -15,6 +15,7 @@ use std::collections::HashMap;
 pub const GEMV_SPV: &[u8] = include_bytes!("../spv/gemv3.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("../spv/quant_q8.spv");
 const QUANT_S8_SPV: &[u8] = include_bytes!("../spv/quant_q8s.spv");
+const QUANT_F16IN_SPV: &[u8] = include_bytes!("../spv/quant_q8h.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("../spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("../spv/rms.spv");
 pub const RMS_WIDE_SPV: &[u8] = include_bytes!("../spv/rms_wide.spv");
@@ -288,6 +289,7 @@ pub(crate) enum Slot {
     FnMoeTileQ4kCm8,
     FnMoeTileQ4kCm8b,
     TileQ8ks,
+    QuantF16in,
     FnKsred,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
@@ -333,6 +335,7 @@ pub struct VkAcc {
     xq_dev: Mutex<Option<VkBuf>>,
     cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     ks_scratch: Mutex<Option<VkBuf>>,
+    f16bufs: Mutex<std::collections::HashSet<u64>>,
     gdn_ch_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -477,6 +480,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
     (Slot::QuantS8, "quant_s8", QUANT_S8_SPV, 2, 12),
+    (Slot::QuantF16in, "quant_f16in", QUANT_F16IN_SPV, 2, 12),
     (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
     (Slot::SiluMulQ8, "silu_mul_q8", SILU_Q8_SPV, 3, 16),
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
@@ -583,6 +587,7 @@ impl VkAcc {
             xq_dev: Mutex::new(None),
             cm8_scratch: Mutex::new((None, None, None)),
             ks_scratch: Mutex::new(None),
+            f16bufs: Mutex::new(std::collections::HashSet::new()),
             gdn_ch_scratch: Mutex::new((None, None, None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
