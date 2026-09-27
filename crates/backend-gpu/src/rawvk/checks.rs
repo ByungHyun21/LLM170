@@ -3425,12 +3425,8 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
             1, 12,
         ];
         if sg {
-            let spec15: Vec<u32> = vec![
-                256, 128, 64, 32,
-                32, 32, 2, 4, 2, 1, 32,
-                1, 12, 0, 0,
-            ];
-            ctx.pipeline_spec_fg(&spv, 5, 15 * 4, &spec15, true)?
+            // 바이너리 패치판(스펙 불필요) — 풀서브그룹 플래그는 RADV 크래시 우려로 OFF.
+            ctx.pipeline(&spv, 5, 15 * 4)?
         } else {
             ctx.pipeline_spec(&spv, 5, 15 * 4, &spec)?
         }
