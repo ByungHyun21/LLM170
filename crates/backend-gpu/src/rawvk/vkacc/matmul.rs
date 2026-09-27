@@ -233,16 +233,22 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let rows = w_reps * t_cur;
                 // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
                 // 32스레드 원판(산술 그대로, 실측 우위).
-                let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
-                // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장 옵트인.
-                let h16 = slot == Slot::RmsWide && w_reps > 1
+                let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+                let slot = if rows >= 2 {
+                    if resf16 { Slot::RmsWideF16 } else { Slot::RmsWide }
+                } else {
+                    Slot::Rms
+                };
+                // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장(기본 ON).
+                // plans/103: res_hc 입력 f16은 별도 변형 슬롯(f32 쌍둥이 불변).
+                let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16) && w_reps > 1
                     && std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true);
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());
-                push.extend_from_slice(&u32::from(h16).to_le_bytes());
-                if h16 {
+                push.extend_from_slice(&u32::from(out16).to_le_bytes());
+                if out16 {
                     self.f16bufs.lock().insert(out);
                 } else {
                     self.f16bufs.lock().remove(&out);
@@ -351,11 +357,14 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             }
             O::HcCombine { res, out, inj, hc, n, total: _ } => {
                 let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
-                let p = self.pipeline(&mut ctx, Slot::HcCombine)?;
-                let ds2 = ctx.bind_ds(&p, &[rb, ob, ib])?;
                 let tn = n * t_cur;
+                // plans/103: res_hc f16 버스 — RMW 변형 슬롯(페어 소유).
+                let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+                let slot = if resf16 { Slot::HcCombineF16 } else { Slot::HcCombine };
+                let p2 = self.pipeline(&mut ctx, slot)?;
+                let ds3 = ctx.bind_ds(&p2, &[rb, ob, ib])?;
                 let push = push_u32s(&[hc as u32, n as u32, tn as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (tn as u32).div_ceil(128), 1, 1)?;
+                ctx.run(p2.pl, ds3, p2.pipe, &push, (tn as u32).div_ceil(128), 1, 1)?;
             }
             O::NormGated { o, z, w, out, eps, d, n_h } => {
                 let (ob, zb, wb, ub) = (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);

@@ -1,17 +1,32 @@
 #version 450
 // plans/84 B — HcCombine: res[ti·hc·n + s·n + i] += out[ti·n+i]·2σ(inj[ti·hc+s]/hc).
+// plans/103: f16m=1이면 res_hc는 packed f16 — 짝수 ii 스레드가 (ii,ii+1) 단일
+// 워드 읽기-수정-기록(워드 소유 단일 스레드 — 경합 없음, 산술은 f32 승격).
 layout(local_size_x = 128) in;
-layout(binding = 0) buffer Res { float res[]; };
+layout(binding = 0) buffer ResB { uint resw[]; };
 layout(binding = 1) readonly buffer Ou { float outv[]; };
 layout(binding = 2) readonly buffer Ij { float inj[]; };
-layout(push_constant) uniform PC { uint hc; uint n; uint total; } pc;  // total = n·t
+layout(push_constant) uniform PC { uint hc; uint n; uint total; uint f16m; } pc;  // total = n·t
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.total) return;
     uint ti = i / pc.n;
     uint ii = i % pc.n;
+    if (pc.f16m == 1u) {
+        if ((ii & 1u) == 1u) return;   // 홀수 원소는 짝 파트너가 처리
+        for (uint s = 0u; s < pc.hc; s++) {
+            float g = 2.0 / (1.0 + exp(-inj[ti * pc.hc + s] / float(pc.hc)));
+            uint wi = (ti * pc.hc * pc.n + s * pc.n + ii) >> 1u;
+            vec2 h = unpackHalf2x16(resw[wi]);
+            float a0 = outv[i] * g;
+            float a1 = outv[i + 1u] * g;
+            resw[wi] = packHalf2x16(vec2(h.x + a0, h.y + a1));
+        }
+        return;
+    }
     for (uint s = 0u; s < pc.hc; s++) {
         float g = 2.0 / (1.0 + exp(-inj[ti * pc.hc + s] / float(pc.hc)));
-        res[ti * pc.hc * pc.n + s * pc.n + ii] += outv[i] * g;
+        uint k = ti * pc.hc * pc.n + s * pc.n + ii;
+        resw[k] = floatBitsToUint(uintBitsToFloat(resw[k]) + outv[i] * g);
     }
 }
