@@ -1841,3 +1841,20 @@ GL_EXT_integer_dot_product, so its MoE GEMMs run on
 q4_K dequant + f32/f16 FMA warptile GEMM). Both variants compile clean
 under our toolchain (77KB spv staged in spv/llama_mmidq_*). This is the
 port target — not integer dot, not coopmat. Port plan: plans/98.
+
+### llama matmul_id_quant port — WORKING, verdict inverted (plans/98, 2026-09-27)
+
+After a five-layer bring-up (end_batch_wait crash → LocalSize=1 spec default →
+ids topology → B slot-replication contract → lost upload line), the llama
+`mul_mm MULMAT_QUANT+MUL_MAT_ID` kernel now runs correctly in our harness
+via `pipeline_spec` (constantID-i convention, 256/BM128/BN64/BK32/ALIGNED=1/
+MmTypeA=Q4_K): 99.0% of outputs within 2% rel tolerance (max rel 0.24 —
+f16 staging class), full D coverage.
+
+**Measured on the FN q4_K gate shape (640×2560, E=512, t=512, 4096 routed
+rows): 16.8ms = 0.8 TFLOPS. Our q4k_mmq v5 runs the same GEMM class at
+~1.3 TFLOPS (450ms/94-dispatch pp512 decomposition). The llama kernel is
+~1.6× SLOWER per FLOP on this device.** The 506 t/s llama reference
+therefore does not come from this kernel's GEMM throughput — port as a
+pp512 lever is closed with direct evidence. Our MMQ stack remains the
+fastest known implementation of this GEMM on this hardware.
