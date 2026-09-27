@@ -571,14 +571,16 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
                 n_in as u32, n_out as u32, per_expert_push as u32, chunk_words, xq_w as u32,
-                0u32, // mode — 실험 파생 잔여(90 A2): 프로덕션 항상 0
+                if slot == Slot::FnMoeTileQ4kCm8
+                    && std::env::var("LLM170_VK_Q4CM8DBG").is_ok()
+                { 1u32 } else { 0u32 },
                 rows as u32,
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kCm8) {
-                // plans/99: 32가중행(서브그룹2×16) × 16할당행.
-                (n_out.div_ceil(32) as u32, bound.div_ceil(16) as u32)
+                // plans/99: 16가중행(서브그룹1·coopmat 16×16) × 16할당행.
+                (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
                 // plans/95 v2: 64가중행 × 16할당행 타일 — 16행 밴드가
                 // moe_group 균일-전문가 보증 단위.
