@@ -3242,6 +3242,8 @@ pub fn llama_mmq_check() -> Result<String, String> {
     }
     let (il, nm, wd) = found.ok_or("q4_K 스택 없음")?;
     eprintln!("[lmmq] L{il} {nm} ty={:?} len={}", wd.ty, wd.data.len());
+    let nz = wd.data.iter().position(|&b| b != 0).unwrap_or(wd.data.len());
+    eprintln!("[lmmq] wd.data first-nonzero at {nz}; [0..16]={:?}", &wd.data[..16.min(wd.data.len())]);
     let ne = 512usize;
     let k_sel = 8usize;
     let n_in = wd.n_in as usize;
@@ -3307,8 +3309,32 @@ pub fn llama_mmq_check() -> Result<String, String> {
         b
     } else {
         let _ = &mut a_lcg;
-        ctx.alloc_host(wd.data.len())?
+        let b = ctx.alloc_host(wd.data.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(wd.data.as_ptr(), b.ptr, wd.data.len()) };
+        b
     };
+    if std::env::var_os("LLM170_LMMQ_BINDPROBE").is_some() {
+        let spv2 = std::fs::read("/tmp/probe.spv").unwrap();
+        let pb = ctx.alloc_host(64).unwrap();
+        let (_d2, p2, _o2, ds2, pipe2) = ctx.pipeline(&spv2, 3, 0).unwrap();
+        ctx.bind_bufs(ds2, &[ab.buf, bb.buf, pb.buf]);
+        let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
+        let v = unsafe { std::slice::from_raw_parts(pb.ptr as *const f32, 4) };
+        eprintln!("[lmmq] bindprobe b[0..2]={:?} a[0..2]=({:#x},{:#x})", &v[..2], v[2] as u32, v[3] as u32);
+        // A 원본 직독: 호스트 ptr과 GPU 판독 대조.
+        let ah0 = unsafe { std::slice::from_raw_parts(ab.ptr as *const u32, 4) };
+        eprintln!("[lmmq] A host ptr [0..4] = {ah0:?}");
+        if let Ok(spv3) = std::fs::read("/tmp/probe2.spv") {
+            let pb3 = ctx.alloc_host(64).unwrap();
+            let (_d3, p3, _o3, ds3, pipe3) = ctx.pipeline(&spv3, 2, 0).unwrap();
+            ctx.bind_bufs(ds3, &[ab.buf, pb3.buf]);
+            let _ = ctx.run(p3, ds3, pipe3, &[], 1, 1, 1);
+            let v3 = unsafe { std::slice::from_raw_parts(pb3.ptr as *const f32, 5) };
+            eprintln!("[lmmq] A gpu-read [0..4, 1M] = {:?}", &v3[..5]);
+            unsafe { ctx.device.destroy_pipeline(pipe3, None); ctx.device.destroy_pipeline_layout(p3, None); }
+        }
+        unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
+    }
     // ids: [k_sel][t] i32(토큰별 8개 상이 전문가), counts[ne].
     // GGML ids [ne0=8][t]: 토큰-메이저(ids[tk*8 + slot]) — plans/98 #3.
     let mut ids = vec![0i32; k_sel * t];
@@ -3364,8 +3390,18 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         }
     }
     eprintln!("[lmmq] bufs ok, pipeline...");
+    let use_spec = !plain && !f32a && !mm32 && std::env::var("LLM170_LMMQ_PSPEC").map(|v| v != "0").unwrap_or(true);
     let (dsl, pl, pool, ds, pipe) = if plain || f32a || mm32 {
         ctx.pipeline(&spv, 3, 16 * 4)?
+    } else if use_spec {
+        // plans/98: llama 규약 — spec[i]=constantID i. BM/BN/BK는 배열 크기로
+        // 파이프라인 시점 확정(스칼라 s판: 256스레드·BM128·BN64·BK32).
+        let spec: Vec<u32> = vec![
+            256, 128, 64, 32,
+            32, 32, 2, 4, 2, 1, 32,
+            1, 12,
+        ];
+        ctx.pipeline_spec(&spv, 5, 15 * 4, &spec)?
     } else {
         ctx.pipeline(&spv, 5, 15 * 4)?
     };
@@ -3424,7 +3460,7 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
     if std::env::var_os("LLM170_LMMQ_DUMP").is_some() {
         eprintln!("[lmmq] push-view D[0..12] = {:?}", &got[..12.min(got.len())]);
         eprintln!("[lmmq] dbg3 cache/sums D[16..20] = {:?}", &got[16..20.min(got.len())]);
-        eprintln!("[lmmq] dbg4 raw/dm/rowids D[20..28] = {:?}", &got[20..28.min(got.len())]);
+        eprintln!("[lmmq] dbg4 raw/dm/rowids D[20..30] = {:?}", &got[20..30.min(got.len())]);
         let written = got.iter().filter(|&&v| v != 3.3961514e38).count();
         eprintln!("[lmmq] written(non-pattern) = {}/{}", written, got.len());
         let nonzero = got.iter().filter(|&&v| v != 0.0 && v != 3.3961514e38).count();
