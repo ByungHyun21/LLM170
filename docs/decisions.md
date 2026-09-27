@@ -2257,3 +2257,13 @@ quant f16-입력 변형(quant_f16은 변환기일 뿐 — 신규) + f16버퍼 �
 (Mutex<HashSet<u64>>: RmsRows[w_reps>1] 삽입 → quant/HcGateMean 참조) +
 HcGateMean xn 플래그 비트. HCF16과 동일 옵트인 패턴·게이트 --record
 전례. 세션 컨텍스트 소진으로 본 세션 마감 — 다음 세션 즉시 착수점.
+
+### (57) P2(xn축 f16) 실장 — quant −39%·hc_gate_mean −69% (2026-09-27 심야7)
+
+rms_wide 쌍팩 f16 드레인 + quant_q8h(f16입력, 산술 문자 동일) +
+HcGateMean xn 비트 + f16버퍼 레지스트리(HashSet — RmsRows[w_reps>1]
+삽입, quant/게이트 판정). 옵트인 통합: HCF16=1 → GPU 총 1223→1195.3ms
+(−28ms) · quant 48→29.2(−39%) · hc_gate_mean 22.9→7.0(−69%) ·
+rms_wide 27→23.9. pp512 425.6. P1+P2 합산 실효 −28ms — 예상(−60)의
+절반이나 축 실측 확정. 승격은 게이트 --record(산술 클래스: xn f16
+사전반올림) — 사용자 전례 대기.

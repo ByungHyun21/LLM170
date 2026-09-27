@@ -234,10 +234,19 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
                 // 32스레드 원판(산술 그대로, 실측 우위).
                 let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
+                // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장 옵트인.
+                let h16 = slot == Slot::RmsWide && w_reps > 1
+                    && std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false);
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());
+                push.extend_from_slice(&u32::from(h16).to_le_bytes());
+                if h16 {
+                    self.f16bufs.lock().insert(out);
+                } else {
+                    self.f16bufs.lock().remove(&out);
+                }
                 ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
             }
             O::SiluDiv { t, div, n } => {
@@ -334,7 +343,10 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
                 let total = n * t_cur;
-                let push = push_u32s(&[hc as u32, n as u32, total as u32, u32::from(h16)]);
+                // plans/101 P2: bit1 = xn f16(레지스트리 판정).
+                let xn16 = self.f16bufs.lock().contains(&xn);
+                let flags = u32::from(h16) | (u32::from(xn16) << 1);
+                let push = push_u32s(&[hc as u32, n as u32, total as u32, flags]);
                 ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(128), 1, 1)?;
             }
             O::HcCombine { res, out, inj, hc, n, total: _ } => {
@@ -644,7 +656,9 @@ impl VkAcc {
         let has_quant = ws.iter().any(|w| vk_ty(w.ty).is_some());
         let xq = if has_quant {
             let xq = self.xq_dev_buf(&mut ctx, t * xq_w * 4)?;
-            let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            // plans/101 P2: f16 저장 xn 입력 → f16 판 quant(동일 산술).
+            let src16 = self.f16bufs.lock().contains(&x);
+            let p = self.pipeline(&mut ctx, if src16 { Slot::QuantF16in } else { Slot::Quant })?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
             ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)?;
