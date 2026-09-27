@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 pub const GEMV_SPV: &[u8] = include_bytes!("../spv/gemv3.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("../spv/quant_q8.spv");
+const QUANT_S8_SPV: &[u8] = include_bytes!("../spv/quant_q8s.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("../spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("../spv/rms.spv");
 pub const RMS_WIDE_SPV: &[u8] = include_bytes!("../spv/rms_wide.spv");
@@ -211,6 +212,8 @@ pub(crate) enum Slot {
     FnIdxRank,
     FnIdxExpand,
     Quant,
+    /// plans/99 테일 — LDS 협동 스테이징 코얼레스드 quant.
+    QuantS8,
     FnTileF32s,
     /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
     FnTileF32e,
@@ -448,6 +451,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::RmsWide, "rms_wide", RMS_WIDE_SPV, 3, 16),
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
+    (Slot::QuantS8, "quant_s8", QUANT_S8_SPV, 2, 12),
     (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
     (Slot::SiluMulQ8, "silu_mul_q8", SILU_Q8_SPV, 3, 16),
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
