@@ -1963,3 +1963,13 @@ q8128 is weight-bandwidth bound; axis closed.
 **422.2 t/s** (1212.8 ms) — the warm band keeps inching up as the RADV
 shader/pipeline cache matures: 410→416→421→422 across the session.
 Session peak now +88% over the 225 baseline.
+
+### GDN axis closed at theoretical level (plans/100 final, 2026-09-27)
+
+v3 (cell-parallel dots via execA): dots successfully parallelized (45ms
+vs 92 embedded) but total 180ms — the 32-step barrier-separated
+substitution × 16 chunks (512 WG barriers) dominates. The scan's tiny
+per-token serial cost (4 FMA + 10 shuffles) is fully latency-hidden by
+128×h_v independent (u, pair) workgroups — it is the structurally
+optimal form for this recurrence on this geometry. Five-direction
+verdict complete. pp4096: 358.8 t/s (long-context band holds).
