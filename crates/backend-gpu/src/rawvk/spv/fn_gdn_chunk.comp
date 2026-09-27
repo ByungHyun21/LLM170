@@ -1,0 +1,152 @@
+#version 450
+
+// fn_gdn_chunk (plans/100) — GDN AR 청크 병렬(WY 표현) 1판.
+// fn_gdn_ar_swap의 순차 스캔(2.8µs/tok·셔플 리덕션 바운드)을
+//   1) u무관 사전계산(L, w, 감쇠)
+//   2) C단계 전방대입(d_v-와이드 SAXPY — 셔플 0)
+//   3) 출력/상태 조립
+// 로 분해. 수학 유도는 plans/100 참조. 클래스 변경(수렴 순서) —
+// 체커·게이트 재기록 전례 적용. 킬: LLM170_VK_GDNCH=0.
+//
+// grid: (chunk, h_v, d_v/BV). WG = BV 스레드(u행 1:1) + 협동 사전계산.
+// 청크 간 상태 순차는 호출부가 chunk 그리드를 순차 디스패치(향후
+// 단일 커널 루프로 통합 가능 — 1판은 외부 순차).
+layout(local_size_x = 64) in;
+layout(binding = 0) buffer S { float s[]; };          // 상태 [pair][dv][dk] (전치행 u 주요)
+layout(binding = 1) readonly buffer Q { float q[]; }; // [t][hk*dk]
+layout(binding = 2) readonly buffer K { float k[]; };
+layout(binding = 3) readonly buffer V { float v[]; }; // [t][hv*dv]
+layout(binding = 4) readonly buffer Bg { float bg[]; }; // [t][hv*2] (β,e^g)
+layout(binding = 5) buffer O { float o[]; };          // [t][hv*dv]
+layout(push_constant) uniform PC {
+    int d; int ks; int vs; int hv; int hk; float scale; int t;
+    int chunk0;   // 이 디스패치의 청크 시작 토큰
+    int csize;    // 청크 크기(마지막 청크 < C)
+} pc;
+
+const int C = 64;           // 최대 청크
+const int BV = 64;          // u행 수/WG(스레드 수와 일치)
+
+shared float sG[C];         // 감쇠 접두 g_t
+shared float sBe[C];
+shared float sL[C * C];     // 강하삼각 L[tau*C+sigma]
+shared float sW[C * C];     // w[t,sigma]
+shared float sZ[C * BV];    // 전방대입 결과
+// v1 슬림: K/Q/V/S⁰는 글로벌 직판독(L2) — LDS 161KB>64KB 초과 수정.
+// 접근 헬퍼(u0는 WG z에서 유도, j는 d_k 인덱스).
+float gK(int r, int j, int kh) { return k[pc.ks * (pc.chunk0 + int(gl_WorkGroupID.x) * pc.csize + r) + kh * pc.d + j]; }
+float gQ(int r, int j, int kh) { return q[pc.ks * (pc.chunk0 + int(gl_WorkGroupID.x) * pc.csize + r) + kh * pc.d + j]; }
+float gV(int r, int u, int pair) { return v[pc.vs * (pc.chunk0 + int(gl_WorkGroupID.x) * pc.csize + r) + pc.d * pair + u]; }
+
+void main() {
+    int chunk = int(gl_WorkGroupID.x);
+    int pair = int(gl_WorkGroupID.y);
+    int ublk = int(gl_WorkGroupID.z);
+    int u0 = ublk * BV;
+    int tid = int(gl_LocalInvocationID.x);
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int t0 = pc.chunk0 + chunk * pc.csize;
+    int cs = min(pc.csize, pc.t - t0);
+    if (cs <= 0) return;
+
+    // ── 1) 감쇠 접두 — 순차 곱이라 스레드 0이 전담(경합 방지).
+    if (tid == 0) {
+        float acc = 1.0;
+        for (int i = 0; i < cs; i++) {
+            int ti = t0 + i;
+            sBe[i] = bg[pc.hv * 2 * ti + pair * 2];
+            acc *= bg[pc.hv * 2 * ti + pair * 2 + 1];
+            sG[i] = acc;  // 포함 접두 G_i = Π_{τ≤i} Ge_τ — 스캔은 감쇠-후-피드백.
+        }
+    }
+    barrier();
+
+    int base_s = pair * pc.d * pc.d;
+    barrier();
+
+    // ── 3) L[τ,σ] = Be_τ·(g_{τ-1}/g_σ)·⟨K_τ,K_σ⟩ (σ<τ) — 코얼레스 닷.
+    for (int idx = tid; idx < cs * cs; idx += BV) {
+        int tau = idx / cs, sig = idx % cs;
+        if (sig < tau) {
+            float dot = 0.0;
+            for (int j = 0; j < pc.d; j++) dot += gK(tau, j, kh) * gK(sig, j, kh);
+            sL[tau * C + sig] = sBe[tau] * (sG[tau] / sG[sig]) * dot;
+        } else {
+            sL[tau * C + sig] = 0.0;
+        }
+    }
+    // w[t,σ] = (g_t/g_σ)·⟨Q_t,K_σ⟩ (σ≤t)
+    for (int idx = tid; idx < cs * cs; idx += BV) {
+        int tt = idx / cs, sig = idx % cs;
+        if (sig <= tt) {
+            float dot = 0.0;
+            for (int j = 0; j < pc.d; j++) dot += gQ(tt, j, kh) * gK(sig, j, kh);
+            sW[tt * C + sig] = (sG[tt] / sG[sig]) * dot;
+        } else {
+            sW[tt * C + sig] = 0.0;
+        }
+    }
+    barrier();
+
+    // ── 4) 우변 c_τ[u] = Be_τ·(V_τ[u] − g_{τ-1}·⟨K_τ, S⁰_u⟩) — 스레드=u.
+    //    (스레드 = u행 — sZ를 c로 재사용)
+    {
+        int u = tid;
+        for (int tau = 0; tau < cs; tau++) {
+            float sk0 = 0.0;
+            for (int j = 0; j < pc.d; j++) sk0 += gK(tau, j, kh) * s[base_s + (u0 + u) * pc.d + j];
+            sZ[tau * BV + u] = sBe[tau] * (gV(tau, u0 + u, pair) - sG[tau] * sk0);
+        }
+    }
+    barrier();
+
+    // ── 5) 전방대입 z_τ = c_τ − Σ_{σ<τ} L[τ,σ]·z_σ — C단계, u-와이드.
+    for (int tau = 1; tau < cs; tau++) {
+        // 스레드 u: z[tau][u] -= Σ_σ L[tau,σ]·z[σ][u]
+        int u = tid;
+        float acc = 0.0;
+        for (int sig = 0; sig < tau; sig++) {
+            acc += sL[tau * C + sig] * sZ[sig * BV + u];
+        }
+        sZ[tau * BV + u] -= acc;
+        memoryBarrierShared();
+        barrier();  // 다음 tau가 이 tau의 z 읽음 — WG 전체 동기
+    }
+
+    // ── 6) 출력 o_t[u] = g_t·⟨Q_t,S⁰_u⟩ + Σ_{σ≤t} w·z_σ[u].
+    {
+        int u = tid;
+        for (int tt = 0; tt < cs; tt++) {
+            float q0 = 0.0;
+            for (int j = 0; j < pc.d; j++) q0 += gQ(tt, j, kh) * s[base_s + (u0 + u) * pc.d + j];
+            float acc = sG[tt] * q0;
+            for (int sig = 0; sig <= tt; sig++) {
+                acc += sW[tt * C + sig] * sZ[sig * BV + u];
+            }
+            o[pc.vs * (t0 + tt) + pc.d * pair + (u0 + u)] = acc * pc.scale;
+        }
+    }
+    // ── 7) 상태 갱신 S^C = g_{cs-1}·S⁰ + Σ_σ (g_{cs-1}/g_σ)·K_σ·z_σ[u].
+    {
+        int u = tid;
+        float glast = sG[cs - 1];
+        for (int j = 0; j < pc.d; j += 4) {
+            float n0 = glast * s[base_s + (u0 + u) * pc.d + j];
+            float n1 = glast * s[base_s + (u0 + u) * pc.d + j + 1];
+            float n2 = glast * s[base_s + (u0 + u) * pc.d + j + 2];
+            float n3 = glast * s[base_s + (u0 + u) * pc.d + j + 3];
+            for (int sig = 0; sig < cs; sig++) {
+                float cf = (glast / sG[sig]) * sZ[sig * BV + u];
+                n0 += gK(sig, j, kh) * cf;
+                n1 += gK(sig, j + 1, kh) * cf;
+                n2 += gK(sig, j + 2, kh) * cf;
+                n3 += gK(sig, j + 3, kh) * cf;
+            }
+            s[base_s + (u0 + u) * pc.d + j] = n0;
+            s[base_s + (u0 + u) * pc.d + j + 1] = n1;
+            s[base_s + (u0 + u) * pc.d + j + 2] = n2;
+            s[base_s + (u0 + u) * pc.d + j + 3] = n3;
+        }
+    }
+}
