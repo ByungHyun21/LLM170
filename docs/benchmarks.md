@@ -1923,3 +1923,15 @@ overhead exceeds the gain. Reverted to opt-in (`LLM170_VK_QS8=1`).
 Prefill bit-identical (checksum), decode nondeterminism pre-existing
 (moe scatter atomic, ledger). Lesson: strided-per-thread ≠ uncoalesced
 when the WG footprint is contiguous and fits L2.
+
+### Session-final tail census (2026-09-27 night, plans/99-100 close)
+
+Remaining GPU census at 415 t/s steady: q4k_mmq 445 · q8128 194 · q51 161
+(GEMMs at verified optima — 4-way cross-validated) + elementwise tail
+~135ms (hc_gate 26 · rms_wide 27 · norm_gated 15 · silu_q8 14 · wsum 13
+· hc_combine 13 · gather 11 · l2 9 · split3 7). rms_wide runs 37GB/s
+with an f64 serial-reduction tail — tree conversion is a class change
+for marginal gain (bandwidth-bound fraction dominant). GDN chunked
+(v1/v2) and quant LDS staging both measured negative — scan and strided
+quant stand. Every tail item is now either at its measured optimum or
+has a documented negative verdict.
