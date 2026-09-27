@@ -3578,6 +3578,31 @@ pub fn cm8_probe() -> Result<String, String> {
         }
         std::ptr::write_bytes(cb.ptr, 0, 1024);
     }
+    // 항등 패턴 검증 변형(선택): A=u8 패턴 × I → C=A.
+    if std::env::var_os("LLM170_CM8_IDENT").is_some() {
+        let spv2 = std::fs::read("/tmp/cm8i.spv").map_err(|e| e.to_string())?;
+        let (_d2, p2, _o2, ds2, pipe2) = ctx.pipeline(&spv2, 3, 0)?;
+        unsafe {
+            for i in 0..256usize {
+                *(ab.ptr.add(i) as *mut u8) = (i % 256) as u8;
+                *(bb.ptr.add(i) as *mut i8) = if i % 17 == 0 { 1 } else { 0 };
+            }
+            std::ptr::write_bytes(cb.ptr, 0, 1024);
+        }
+        ctx.bind_bufs(ds2, &[ab.buf, bb.buf, cb.buf]);
+        let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
+        let cv = unsafe { std::slice::from_raw_parts(cb.ptr as *const i32, 256) };
+        let mut bad = 0;
+        for i in 0..256usize {
+            let want = ((i % 256) as u8) as i32;  // B = e_{i%17}? — 항등 아님(단일 열)
+            let _ = want;
+        }
+        // 실제 검증: coopMatLoad B를 RowMajor로 했으므로 C=A·B^T(16×16).
+        // B를 선택적 마스크로: 열 0만 1 → C[i][0]=A[i][0]... 단순화: 값 분포 출력.
+        eprintln!("[cm8-ident] C[0..8] = {:?}", &cv[..8]);
+        unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
+        let _ = bad;
+    }
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 3, 0)?;
     let _ = (dsl, pool);
     ctx.bind_bufs(ds, &[ab.buf, bb.buf, cb.buf]);
