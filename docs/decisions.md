@@ -2249,3 +2249,11 @@ BM32·BN64 축소 = 0.552ms **역행**(가중·xq 재판독 폭증이 점유 이
 (유효 타일 단독 ~0.3ms·12GB/s). 진짜 대형 레버는 **xn 축 f16 저장
 (plans/101 P2)**: rms_wide 출력을 f16으로 → hc_down quant 판독 절반 +
 hc_gate_mean xn 판독 절반. 스키니 타일 자체는 잔여 이득 작음 판정.
+
+### (56) P2(xn축 f16) 착수 전 분해 — 세션 마감 (2026-09-27 심야6 종)
+
+P2 범위 확정: rms_wide 쌍팩 f16 드레인(52번 라인 스칼라→페어 재구조) +
+quant f16-입력 변형(quant_f16은 변환기일 뿐 — 신규) + f16버퍼 레지스트리
+(Mutex<HashSet<u64>>: RmsRows[w_reps>1] 삽입 → quant/HcGateMean 참조) +
+HcGateMean xn 플래그 비트. HCF16과 동일 옵트인 패턴·게이트 --record
+전례. 세션 컨텍스트 소진으로 본 세션 마감 — 다음 세션 즉시 착수점.
