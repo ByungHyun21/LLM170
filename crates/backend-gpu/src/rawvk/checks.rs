@@ -3276,15 +3276,22 @@ pub fn llama_mmq_check() -> Result<String, String> {
         ((lcg >> 33) as f32 / 4294967296.0) - 0.5
     };
     let bflat: Vec<f32> = (0..t * n_in).map(|_| lcgf()).collect();
+    // plans/98: id판 B 계약 = [token][slot][K] 슬롯 복제 —
+    // load_b: idx = token*(bsb) + slot*(sb) + k (bsb=K*ne11, ne11=8).
+    let mut brep: Vec<f32> = Vec::with_capacity(t * k_sel * n_in);
+    for i in 0..t {
+        for _ in 0..k_sel {
+            brep.extend_from_slice(&bflat[i * n_in..(i + 1) * n_in]);
+        }
+    }
     let bb = if pre {
-        // 프리빌트 f16판: B를 f16(행중심, 동일 레이아웃)으로.
-        let bh: Vec<half::f16> = bflat.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let b = ctx.alloc_host(t * n_in * 2)?;
-        unsafe { std::ptr::copy_nonoverlapping(bh.as_ptr() as *const u8, b.ptr, t * n_in * 2) };
+        let bh: Vec<half::f16> = brep.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b = ctx.alloc_host(brep.len() * 2)?;
+        unsafe { std::ptr::copy_nonoverlapping(bh.as_ptr() as *const u8, b.ptr, brep.len() * 2) };
         b
     } else {
-        let b = ctx.alloc_host(t * n_in * 4)?;
-        unsafe { std::ptr::copy_nonoverlapping(bflat.as_ptr() as *const u8, b.ptr, t * n_in * 4) };
+        let b = ctx.alloc_host(brep.len() * 4)?;
+        unsafe { std::ptr::copy_nonoverlapping(brep.as_ptr() as *const u8, b.ptr, brep.len() * 4) };
         b
     };
     // A: f32a는 밀집 f32, 아니면 q4_K 스택.
@@ -3303,11 +3310,12 @@ pub fn llama_mmq_check() -> Result<String, String> {
         ctx.alloc_host(wd.data.len())?
     };
     // ids: [k_sel][t] i32(토큰별 8개 상이 전문가), counts[ne].
+    // GGML ids [ne0=8][t]: 토큰-메이저(ids[tk*8 + slot]) — plans/98 #3.
     let mut ids = vec![0i32; k_sel * t];
     let mut counts = vec![0i32; ne];
     if std::env::var_os("LLM170_LMMQ_DBG").is_some() {
         // 디버그: 전 전문가 만석 — 조기 반환 경로 배제.
-        counts.fill((t) as i32);
+        counts.fill(t as i32);
     }
     let mut taken = vec![false; ne];
     for i in 0..t {
@@ -3317,7 +3325,7 @@ pub fn llama_mmq_check() -> Result<String, String> {
             let e = ((lcgf().abs() * 9.0 + 1.0) as usize + i * 7 + j) % ne;
             if !taken[e] {
                 taken[e] = true;
-                ids[j * t + i] = e as i32;
+                ids[i * k_sel + j] = e as i32;
                 counts[e] += 1;
                 j += 1;
             }
@@ -3381,8 +3389,8 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         vec![
             m_per as u32, (k_sel * t) as u32, n_in as u32,
             n_in as u32, n_in as u32, m_per as u32,
-            (n_in * m_per) as u32, (n_in * t) as u32, (m_per * k_sel) as u32,
-            k_sel as u32, t as u32, k_sel as u32, t as u32, ne as u32, 0,
+            (n_in * m_per) as u32, (n_in * k_sel) as u32, (m_per * k_sel) as u32,
+            k_sel as u32, t as u32, k_sel as u32, k_sel as u32, ne as u32, 0,
         ]
     };
     let mut pbytes = Vec::with_capacity(64);
@@ -3398,7 +3406,7 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
     let (gx, gy, gz) = if plain || f32a || mm32 {
         (gx_lim.unwrap_or((m_per as u32).div_ceil(64)), gy_lim.unwrap_or((t as u32).div_ceil(64)), 1u32)
     } else {
-        ((m_per as u32).div_ceil(64), (t as u32).div_ceil(64), ne as u32)
+        ((m_per as u32).div_ceil(32), (t as u32).div_ceil(64), ne as u32)
     };
     eprintln!("[lmmq] run gx={gx} gy={gy} gz={gz} plain={plain} push={:?}", push.iter().map(|v| *v as i64).collect::<Vec<_>>());
     if std::env::var_os("LLM170_LMMQ_SKIP").is_none() {
@@ -3439,7 +3447,7 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
     let mut n_checked = 0usize;
     for i in 0..t {
         for j in 0..if plain || mm32 { 1 } else { k_sel } {
-            let e = if plain || mm32 { 0 } else { ids[j * t + i] as usize };
+            let e = if plain || mm32 { 0 } else { ids[i * k_sel + j] as usize };
             for r in 0..m_per.min(64) {
                 if f32a || mm32 {
                     let mut st = 4242424242424242u64;
