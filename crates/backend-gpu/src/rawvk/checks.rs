@@ -3406,7 +3406,7 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
     let (gx, gy, gz) = if plain || f32a || mm32 {
         (gx_lim.unwrap_or((m_per as u32).div_ceil(64)), gy_lim.unwrap_or((t as u32).div_ceil(64)), 1u32)
     } else {
-        ((m_per as u32).div_ceil(32), (t as u32).div_ceil(64), ne as u32)
+        ((m_per as u32).div_ceil(128), (t as u32).div_ceil(64), ne as u32)
     };
     eprintln!("[lmmq] run gx={gx} gy={gy} gz={gz} plain={plain} push={:?}", push.iter().map(|v| *v as i64).collect::<Vec<_>>());
     if std::env::var_os("LLM170_LMMQ_SKIP").is_none() {
@@ -3423,6 +3423,8 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
     eprintln!("[lmmq] got len {}", got.len());
     if std::env::var_os("LLM170_LMMQ_DUMP").is_some() {
         eprintln!("[lmmq] push-view D[0..12] = {:?}", &got[..12.min(got.len())]);
+        eprintln!("[lmmq] dbg3 cache/sums D[16..20] = {:?}", &got[16..20.min(got.len())]);
+        eprintln!("[lmmq] dbg4 raw/dm/rowids D[20..28] = {:?}", &got[20..28.min(got.len())]);
         let written = got.iter().filter(|&&v| v != 3.3961514e38).count();
         eprintln!("[lmmq] written(non-pattern) = {}/{}", written, got.len());
         let nonzero = got.iter().filter(|&&v| v != 0.0 && v != 3.3961514e38).count();
