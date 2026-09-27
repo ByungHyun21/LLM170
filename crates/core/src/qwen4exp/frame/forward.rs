@@ -442,8 +442,12 @@ pub(super) fn frame_forward_ex(
         acc.frame_mm(f.hxn, &w_down, f.hlo, t).map_err(Q4Error::Io)?;
         op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len * t })?;
         let w_up = model.w4("output_hc_up.weight")?;
+        if std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false) && t >= 128 {
+        acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
+    } else {
         acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
-        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n })?;
+    }
+        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false)) && t >= 128 })?;
         if t > 1 {
             op(acc, FrameOp::CopyRows { src: f.hin, dst: f.hin_last, src_off: (t - 1) * n, dst_off: 0, n })?;
         }
@@ -995,12 +999,16 @@ pub(super) fn hc_mix_frame(
     op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len * t })?;
     sync_mark(acc, "hc.silu", f.lo)?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
-    acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
+    if std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false) && t >= 128 {
+        acc.frame_mm_hout(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
+    } else {
+        acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
+    }
     if mark_attn && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.gate, hc * n * t.min(16), &format!("L{il}C.attn_gate"));
     }
     sync_mark(acc, "hc.up", f.gate)?;
-    op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n })?;
+    op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false)) && t >= 128 })?;
     if mark_attn && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}C.attn_mix"));
     }
