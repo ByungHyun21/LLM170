@@ -607,6 +607,10 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     }
         if std::env::var_os("LLM170_MTC_DBG").is_some() {
             let gi = |i: usize| got[i] as i32;
+            if std::env::var_os("LLM170_VK_Q4CM8B").is_some() {
+                eprintln!("[cm8b-insitu] 그룹별 bad = [{}, {}, {}, {}]",
+                    got[100], got[101], got[102], got[103]);
+            }
             if got.len() > 216 {
                 eprintln!("[insitu-AB] 200..216 = {:?}", (200..216).map(gi).collect::<Vec<_>>());
             }
