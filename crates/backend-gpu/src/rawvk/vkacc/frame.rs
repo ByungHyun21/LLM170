@@ -669,19 +669,21 @@ impl llm170_core::matmul::FrameState for VkAcc {
             binds.push(rpb);
             binds.push(ppb);
             if slot == Slot::FnMoeTileQ4kCm8 {
-                // plans/99: 타일 SSBO 스크래치 — WG당 1KB(u8) + 512B(i8).
+                // plans/99: 타일 SSBO 스크래치 — WG당 1KB(u8)·1KB(i8)·1KB(acc).
                 // (shared 소스 coopmat 로드가 다중 WG 동시성에서 부정확.)
+                // 주소 지정이 wgslot=wg·1024 1024-스트라이드이므로 i8도 1KB/WG
+                // 필수 — 512B 할당 시 WG 절반이 OOB 기록으로 scw를 오염시킴.
                 let n_wg = (n_out.div_ceil(16) * bound.div_ceil(16)) as usize;
                 let (au, ai, aw) = {
                     let mut g = self.cm8_scratch.lock();
                     if g.0.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
-                        && g.1.as_ref().map(|b| b.bytes >= n_wg * 512).unwrap_or(false)
+                        && g.1.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
                         && g.2.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
                     {
                         (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
                     } else {
                         let u = ctx.alloc(n_wg * 1024)?;
-                        let i = ctx.alloc(n_wg * 512)?;
+                        let i = ctx.alloc(n_wg * 1024)?;
                         let w = ctx.alloc(n_wg * 1024)?;
                         *g = (Some(u), Some(i), Some(w));
                         (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
@@ -696,7 +698,9 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let push = push_u32s(&[
                 n_in as u32, n_out as u32, per_expert_push as u32, chunk_words, xq_w as u32,
                 if slot == Slot::FnMoeTileQ4kCm8 {
-                    std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0)
+                    { let m = std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                      if std::env::var_os("LLM170_MTC_DBG").is_some() { eprintln!("[cm8-push] mode={m}"); }
+                      m }
                 } else { 0u32 },
                 rows as u32,
             ]);

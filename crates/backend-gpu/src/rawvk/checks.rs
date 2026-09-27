@@ -606,6 +606,21 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
         }
     }
         if std::env::var_os("LLM170_MTC_DBG").is_some() {
+            let gi = |i: usize| got[i] as i32;
+            if got.len() > 216 {
+                eprintln!("[insitu-AB] 200..216 = {:?}", (200..216).map(gi).collect::<Vec<_>>());
+            }
+            eprintln!("[insitu] bad(마지막)={} sb0_bad={} 첫불일치sb={} sg={}/{} A0={:?}",
+                got[100], got[98], got[99], got[101], got[102],
+                (104..120).map(gi).collect::<Vec<_>>());
+            eprintln!("[insitu] A1={:?}", (120..136).map(gi).collect::<Vec<_>>());
+            eprintln!("[insitu] B0={:?}", (136..152).map(gi).collect::<Vec<_>>());
+            eprintln!("[insitu] B1={:?}", (152..168).map(gi).collect::<Vec<_>>());
+            if got.len() > 200 { eprintln!("[insitu] B(r,0)열={:?}", (184..200).map(gi).collect::<Vec<_>>()); }
+            if got.len() > 251 { eprintln!("[insitu] 마커250={} scw168={:?}", got[250], (168..184).map(gi).collect::<Vec<_>>()); }
+            eprintln!("[insitu] scw={:?}", (168..184).map(gi).collect::<Vec<_>>());
+            let scalar: i32 = (0..16).map(|k| gi(104+k) * gi(136+k) + gi(120+k) * gi(152+k)).sum();
+            eprintln!("[insitu] C[0][0] 스칼라={} coopmat={}", scalar, gi(168));
             for rr in 0..sel.len().min(12) {
                 let ee = sel[rr];
                 let mut s2 = 0f64;
@@ -3644,6 +3659,30 @@ pub fn cm8_probe() -> Result<String, String> {
         eprintln!("[cm8-ident] C[0..8] = {:?}", &cv[..8]);
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
         let _ = bad;
+    }
+    if std::env::var_os("LLM170_CM8_SSBO").is_some() {
+        // plans/99: u8 SSBO coopMatLoad stride 해석 판정 — shared 대비.
+        let spv2 = std::fs::read("/tmp/cm8ssbo.spv").map_err(|e| e.to_string())?;
+        let (_d2, p2, _o2, ds2, pipe2) = ctx.pipeline(&spv2, 3, 0)?;
+        let ngx: usize = std::env::var("CM8_SSGX").ok().and_then(|v| v.parse().ok()).unwrap_or(160);
+        let ngy: usize = std::env::var("CM8_SSGY").ok().and_then(|v| v.parse().ok()).unwrap_or(82);
+        let nwg = ngx * ngy;
+        let ab2 = ctx.alloc_host(nwg * 1024 + 1024)?;
+        let bb2 = ctx.alloc_host(nwg * 1024 + 1024)?;
+        let cb2 = ctx.alloc_host(nwg * 1024 + 1024)?;
+        unsafe {
+            std::ptr::write_bytes(ab2.ptr, 0x55, nwg * 2048);
+            std::ptr::write_bytes(bb2.ptr, 0, nwg * 2048);
+            std::ptr::write_bytes(cb2.ptr, 0, nwg * 2048);
+        }
+        ctx.bind_bufs(ds2, &[ab2.buf, bb2.buf, cb2.buf]);
+        let _ = ctx.run(p2, ds2, pipe2, &[], ngx as u32, ngy as u32, 1);
+        let v: Vec<i32> = unsafe { std::slice::from_raw_parts(cb2.ptr as *const i32, nwg * 256) }.to_vec();
+        let bad_s = v.iter().filter(|&&d| d != 0).count();
+        eprintln!("[cm8-ssbo] 2D({ngx}x{ngy}) wgslot/4 스토어 판정 불일치 {}/{}",
+            bad_s, nwg * 256);
+        eprintln!("[cm8-ssbo] wg0 diffs[:8] = {:?}", &v[..8]);
+        unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
     }
     if std::env::var_os("LLM170_CM8_MW").is_some() {
         let spv2 = std::fs::read("/tmp/cm8mw.spv").map_err(|e| e.to_string())?;
