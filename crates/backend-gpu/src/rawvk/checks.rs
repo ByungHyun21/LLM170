@@ -2054,7 +2054,7 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         let mkh = acc.frame_alloc(t * n)?;
         acc.frame_write(xnh, &xn)?;
         acc.frame_write(gth, &gate)?;
-        acc.frame_op(&llm170_core::matmul::FrameOp::HcGateMean { xn: xnh, gate: gth, out: mkh, hc, n })?;
+        acc.frame_op(&llm170_core::matmul::FrameOp::HcGateMean { xn: xnh, gate: gth, out: mkh, hc, n, h16: false })?;
         let mut got = vec![0f32; t * n];
         acc.frame_read(mkh, &mut got)?;
         let mut mx = 0f64;
@@ -2963,7 +2963,7 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             })?;
             acc.frame_mm(loh, &w_up, gah, 1)?;
             acc.frame_op(&llm170_core::matmul::FrameOp::HcGateMean {
-                xn: xnh, gate: gah, out: hih, hc, n,
+                xn: xnh, gate: gah, out: hih, hc, n, h16: false,
             })?;
             acc.frame_mm(hih, &w_out, lgh, 1)?;
             let mut lg = vec![0f32; 16];

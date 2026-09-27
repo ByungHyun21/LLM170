@@ -24,7 +24,7 @@ layout(binding = 7) readonly buffer W7 { uint w7c[]; };
 layout(binding = 8) readonly buffer Xbuf { uint xq[]; };
 layout(binding = 9) buffer Obuf { float outv[]; };
 layout(push_constant) uniform PC {
-    uint n_in; uint n_out; uint xq_w; uint t; uint row_off;
+    uint n_in; uint n_out; uint xq_w; uint t; uint row_off; uint out_mode;
 } pc;
 
 #define BK 32
@@ -153,10 +153,23 @@ void main() {
         }
         barrier();
         int ncols = min(nt - q * 16, 16);
-        for (int i = int(tid); i < nrow * ncols; i += 128) {
-            int r = i / ncols;
-            int ti = i % ncols;
-            outv[uint(tok_base + q * 16 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+        if (pc.out_mode == 1u) {
+            // plans/101 P1: packed f16 — 인접 2열(r, r+1)을 한 스레드가
+            // 단일 워드 팩 기록(셀 k = 워드 k>>1, lo=k&1) — RMW 경합 없음.
+            // 전제: row0 짝수·nrow 짝수(64 타일 기하 항상 성립).
+            for (int i = int(tid); i < (nrow / 2) * ncols; i += 128) {
+                int r = (i / ncols) * 2;
+                int ti = i % ncols;
+                uint cell = (uint(tok_base + q * 16 + ti) * pc.n_out + uint(row0 + r));
+                outv[cell >> 1] = uintBitsToFloat(
+                    packHalf2x16(vec2(Ctmp[r][ti], Ctmp[r + 1][ti])));
+            }
+        } else {
+            for (int i = int(tid); i < nrow * ncols; i += 128) {
+                int r = i / ncols;
+                int ti = i % ncols;
+                outv[uint(tok_base + q * 16 + ti) * pc.n_out + uint(row0 + r)] = float(Ctmp[r][ti]);
+            }
         }
         barrier();
     }

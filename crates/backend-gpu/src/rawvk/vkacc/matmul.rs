@@ -211,7 +211,381 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     fn frame_mm(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
         self.frame_mm_group(x, std::slice::from_ref(w), &[out], t)
     }
+    /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축). 전제: q8_0 단일청크
+    /// ·t≥128(큰 타일 판) — 위반 시 에러.
+    fn frame_mm_hout(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
+        if w.ty != GgmlType::Q8_0 || t < 128 {
+            return Err("frame_mm_hout: q8_0·t≥128 전용".into());
+        }
+        self.frame_mm_group_ex(x, std::slice::from_ref(w), &[out], t, true)
+    }
     fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+        self.frame_mm_group_ex(x, ws, outs, t, false)
+    }
+    fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
+        use llm170_core::matmul::FrameOp as O;
+        let t_cur = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        match *op {
+            O::RmsRows { x, w, out, eps, n, w_reps } => {
+                let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
+                let rows = w_reps * t_cur;
+                // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
+                // 32스레드 원판(산술 그대로, 실측 우위).
+                let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
+                let p = self.pipeline(&mut ctx, slot)?;
+                let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
+                let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+            }
+            O::SiluDiv { t, div, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::SiluDiv)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let mut push = push_u32s(&[n as u32]);
+                push.extend_from_slice(&div.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::SiluMul { g, u, out, n } => {
+                self.last_silu_out
+                    .store(out, std::sync::atomic::Ordering::Relaxed);
+                let (gb, ub, ob) = (self.fbuf(g)?, self.fbuf(u)?, self.fbuf(out)?);
+                // plans/96 G3 — down 직결 융합: glu로 학습된 출력이면 silu+quant를
+                // xq에 직접 기록(쌍 슬롯 fill) — f32 mglu 왕복·down quant 폐지.
+                // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
+                let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
+                let glu = *self.moe_glu.lock();
+                let fused = t_now >= 2
+                    && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
+                    && std::env::var("LLM170_VK_SILUQ")
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                if fused {
+                    let (_, n_in) = glu.unwrap();
+                    let rows = n / n_in;
+                    let xq_w = xq_words(n_in);
+                    let p = self.pipeline(&mut ctx, Slot::SiluMulQ8)?;
+                    let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
+                    let tgt = {
+                        let mut sl = self.moe_xq_pair.lock();
+                        let need = rows * xq_w * 4;
+                        let ok = sl
+                            .as_ref()
+                            .is_some_and(|v| (v.3.bytes as usize) >= need);
+                        if !ok {
+                            *sl = Some((0, 0, 0, ctx.alloc(need)?));
+                        }
+                        let v = sl.as_mut().unwrap();
+                        v.0 = out;
+                        v.1 = n_in;
+                        v.2 = rows;
+                        v.3.buf
+                    };
+                    let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
+                    ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
+                } else {
+                    let p = self.pipeline(&mut ctx, Slot::Silu)?;
+                    let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
+                    let push = push_u32s(&[n as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                }
+            }
+            O::Scale { t, s, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::Scale)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let mut push = push_u32s(&[n as u32]);
+                push.extend_from_slice(&s.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::CopyRows { src, dst, src_off, dst_off, n } => {
+                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
+                let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
+                let push = push_u32s(&[n as u32, src_off as u32, dst_off as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::BcastRows { src, dst, n, rows } => {
+                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
+                let p = self.pipeline(&mut ctx, Slot::BcastRows)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
+                let push = push_u32s(&[n as u32, rows as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::AxpyScaled { y, x, s, n } => {
+                let (yb, xb, sb) = (self.fbuf(y)?, self.fbuf(x)?, self.fbuf(s)?);
+                if t_cur <= 1 {
+                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?; // pp=n → s[0]와 동일
+                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
+                    let push = push_u32s(&[n as u32, n as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                } else {
+                    let pp = n / t_cur;
+                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?;
+                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
+                    let push = push_u32s(&[n as u32, pp as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+                }
+            }
+            O::HcGateMean { xn, gate, out, hc, n, h16 } => {
+                let (xb, gb, ob) = (self.fbuf(xn)?, self.fbuf(gate)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
+                let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
+                let total = n * t_cur;
+                let push = push_u32s(&[hc as u32, n as u32, total as u32, u32::from(h16)]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(128), 1, 1)?;
+            }
+            O::HcCombine { res, out, inj, hc, n, total: _ } => {
+                let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
+                let p = self.pipeline(&mut ctx, Slot::HcCombine)?;
+                let ds2 = ctx.bind_ds(&p, &[rb, ob, ib])?;
+                let tn = n * t_cur;
+                let push = push_u32s(&[hc as u32, n as u32, tn as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (tn as u32).div_ceil(128), 1, 1)?;
+            }
+            O::NormGated { o, z, w, out, eps, d, n_h } => {
+                let (ob, zb, wb, ub) = (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::NormGatedSig)?;
+                let ds2 = ctx.bind_ds(&p, &[ob, zb, wb, ub])?;
+                let mut push = push_u32s(&[d as u32, n_h as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, (n_h * t_cur) as u32, 1, 1)?;
+            }
+            O::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
+                let (bb, ab, db, sb, gb) = (self.fbuf(b)?, self.fbuf(a)?, self.fbuf(dtb)?, self.fbuf(sa)?, self.fbuf(bg)?);
+                let p = self.pipeline(&mut ctx, Slot::GdnBetaG)?;
+                let ds2 = ctx.bind_ds(&p, &[bb, ab, db, sb, gb])?;
+                let dr = n_h / t_cur.max(1);
+                let push = push_u32s(&[n_h as u32, dr as u32]);
+                // 판은 64스레드 — 128로 나누면 절반이 미기입된다(청크 크기별
+                // 커버리지가 달라져 청크 불변성 위반의 원인이었다).
+                ctx.run(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(64), 1, 1)?;
+            }
+            O::Sigmoid { t, n } => {
+                let tb = self.fbuf(t)?;
+                let p = self.pipeline(&mut ctx, Slot::EwSigmoid)?;
+                let ds2 = ctx.bind_ds(&p, &[tb])?;
+                let push = push_u32s(&[n as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
+            }
+            O::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
+                let (sb, a0, a1, a2) = (self.fbuf(src)?, self.fbuf(d0)?, self.fbuf(d1)?, self.fbuf(d2)?);
+                let p = self.pipeline(&mut ctx, Slot::Split3)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, a0, a1, a2])?;
+                let push = push_u32s(&[n0 as u32, n1 as u32, n2 as u32]);
+                let total = (n0 + n1 + n2) * t_cur;
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(64), 1, 1)?;
+            }
+            O::L2Rows { x, eps, d, n } => {
+                let xb = self.fbuf(x)?;
+                let p = self.pipeline(&mut ctx, Slot::L2Rows)?;
+                let ds2 = ctx.bind_ds(&p, &[xb])?;
+                let mut push = push_u32s(&[d as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                let rows = (n / d).max(1);
+                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
+            }
+            O::L2Rows2Scale { q, k, eps, scale, d, n_group } => {
+                let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
+                let p = self.pipeline(&mut ctx, Slot::L2Rows2Scale)?;
+                let ds2 = ctx.bind_ds(&p, &[qb, kb])?;
+                let mut push = push_u32s(&[d as u32, n_group as u32]);
+                push.extend_from_slice(&eps.to_le_bytes());
+                push.extend_from_slice(&scale.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, n_group as u32, 1, 1)?;
+            }
+            O::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
+                let (qb, cb, sb, ob) = (self.fbuf(qkv)?, self.fbuf(cw)?, self.fbuf(state)?, self.fbuf(out)?);
+                let binds3 = [qb, cb, sb, ob];
+                if t_len >= k - 1 {
+                    // 병렬 청크판 + 상태 갱신 2런치 (hip과 동일 구조)
+                    let p = self.pipeline(&mut ctx, Slot::GdnConvT2)?;
+                    let ds2 = ctx.bind_ds(&p, &binds3)?;
+                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), t_len as u32, 1)?;
+                    let p2 = self.pipeline(&mut ctx, Slot::GdnConvState)?;
+                    let ds3 = ctx.bind_ds(&p2, &[qb, sb])?;
+                    let push2 = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p2.pl, ds3, p2.pipe, &push2, (k - 1) as u32, (ch as u32).div_ceil(64), 1)?;
+                } else {
+                    // 짧은 꼬리: 순차판 (상태 회전 포함)
+                    let p = self.pipeline(&mut ctx, Slot::GdnConvSeq)?;
+                    let ds2 = ctx.bind_ds(&p, &binds3)?;
+                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), 1, 1)?;
+                }
+            }
+            O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+                let (rb, ib, wb) = (self.fbuf(route)?, self.fbuf(ids)?, self.fbuf(wt)?);
+                let p = self.pipeline(&mut ctx, Slot::MoeTop10)?;
+                let ds2 = ctx.bind_ds(&p, &[rb, ib, wb])?;
+                let push = push_u32s(&[n_exp as u32, k_sel as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, t_cur as u32, 1, 1)?;
+                // plans/88 P2 — 라우팅 세대 증가: 그룹화 캐시 무효화 키.
+                self.moe_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            O::MoeWeightedSum { ys, wt, out, k, n } => {
+                let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
+                let p = self.pipeline(&mut ctx, Slot::MoeWsum)?;
+                let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
+                let total = n * t_cur;
+                let push = push_u32s(&[n as u32, k as u32, total as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
+            }
+            ref other => return Err(format!("vk frame_op: 미지원 {other:?}")),
+        }
+        Ok(())
+    }
+}
+
+impl llm170_core::matmul::MatmulHost for VkAcc {
+    fn matmul_batch(
+        &self,
+        xs: &[Vec<f32>],
+        w: &Weight,
+        outs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        let ty = match vk_ty(w.ty) {
+            Some(t) => t,
+            None => {
+                llm170_core::matmul::matmul_batch(xs, w, outs);
+                return Ok(());
+            }
+        };
+        let n_in = w.n_in as usize;
+        let n_out = w.n_out as usize;
+        let t = xs.len();
+        if std::env::var_os("LLM170_VK_MBDBG").is_some() {
+            eprintln!("[mb] ty={:?} n_in={} n_out={} t={}", w.ty, w.n_in, w.n_out, t);
+        }
+        let xq_w = xq_words(n_in);
+        let mut ctx = self.ctx.lock();
+        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+        let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
+        self.quant_upload(&mut ctx, xs, n_in, xq)?;
+        let wbufs = self.weight_bufs(&mut ctx, w)?;
+        // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로(dense_mm와 동일
+        // 판·동일 수치 클래스). gemv3 t-루프는 512토큰에서 ~50ms 직렬.
+        // 킬스위치 LLM170_VK_MBTILE=0.
+        if t >= 2
+            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
+            && wbufs.len() == 1
+            && std::env::var_os("LLM170_VK_MBTILE").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+        {
+            let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
+            let mut binds: Vec<vk::Buffer> = wbufs.clone();
+            while binds.len() < 8 {
+                binds.push(dbuf);
+            }
+            binds.push(xq);
+            binds.push(ob);
+            let big = t >= 128;
+            let slot = match (w.ty, big) {
+                (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,
+                (GgmlType::Q8_0, false) => Slot::TileQ8msCm,
+                (_, true) => Slot::TileQ4k128Cm,
+                (_, false) => Slot::TileQ4kmsCm,
+            };
+            let p = self.pipeline(&mut ctx, slot)?;
+            let ds2 = ctx.bind_ds(&p, &binds)?;
+            let gx = (n_out as u32).div_ceil(64);
+            if big {
+                // plans/92 P1: 단일 디스패치(슬래브 x, 행 y) — 커널 유도 tok_base.
+                let gys = (t as u32).div_ceil(128);
+                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, 0u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
+            } else {
+                for tb in (0..t).step_by(64) {
+                    let nt = (t - tb).min(64) as u32;
+                    let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32]);
+                    ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
+                }
+            }
+            self.download_out(outs, n_out, t);
+            return Ok(());
+        }
+        self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+        self.download_out(outs, n_out, t);
+        Ok(())
+    }
+
+    /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
+    fn matmul_group(
+        &self,
+        xs: &[Vec<f32>],
+        ws: &[Weight],
+        outs: &mut [Vec<Vec<f32>>],
+    ) -> Result<(), String> {
+        if ws.iter().any(|w| vk_ty(w.ty).is_none())
+            || ws.iter().any(|w| w.n_in != ws[0].n_in)
+        {
+            for (w, out) in ws.iter().zip(outs.iter_mut()) {
+                self.matmul_batch(xs, w, out)?;
+            }
+            return Ok(());
+        }
+        let n_in = ws[0].n_in as usize;
+        let t = xs.len();
+        let xq_w = xq_words(n_in);
+        let mut ctx = self.ctx.lock();
+        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
+        self.quant_upload(&mut ctx, xs, n_in, xq)?;
+        // 배치: 모든 가중 GEMV 녹화 → 단일 제출 → 일괄 다운로드 (plans/19)
+        let do_batch = std::env::var_os("LLM170_VK_NOBATCH").is_none();
+        if do_batch {
+            ctx.begin_batch()?;
+        }
+        let mut hosts: Vec<(*mut u8, usize, usize)> = Vec::with_capacity(ws.len()); // (ptr, n_out, ti스트라이드)
+        for (wi, w) in ws.iter().enumerate() {
+            let ty = vk_ty(w.ty).unwrap();
+            let n_out = w.n_out as usize;
+            let wbufs = self.weight_bufs(&mut ctx, w)?;
+            // 가중별 독립 출력 버퍼 (그룹 세션 슬롯)
+            let ob = {
+                let mut g = self.gobufs.lock();
+                while g.len() <= wi {
+                    g.push(None);
+                }
+                if g[wi].as_ref().map(|b| b.bytes >= t * n_out * 4).unwrap_or(false) {
+                    g[wi].as_ref().unwrap().buf
+                } else {
+                    let b = ctx.alloc_host(t * n_out * 4)?;
+                    let buf = b.buf;
+                    g[wi] = Some(b);
+                    buf
+                }
+            };
+            self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
+            let ptr = self.gobufs.lock()[wi].as_ref().unwrap().ptr;
+            hosts.push((ptr, n_out, wi));
+        }
+        if do_batch {
+            ctx.end_batch_wait()?;
+        }
+        for (ptr, n_out, wi) in hosts {
+            let host = unsafe { std::slice::from_raw_parts(ptr as *const f32, t * n_out) };
+            for ti in 0..t {
+                outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
+            }
+        }
+        Ok(())
+    }
+
+    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
+        let xs = vec![x.to_vec()];
+        let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
+        self.matmul_batch(&xs, w, &mut tmp)?;
+        out.copy_from_slice(&tmp[0]);
+        Ok(())
+    }
+}
+
+impl VkAcc {
+    /// plans/101 P1 — hout 플래그 확장 그룹 GEMM(트레이트 외부).
+    fn frame_mm_group_ex(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize, hout: bool) -> Result<(), String> {
         // plans/93: F32 가중 → Q8_0 로드 시 변환(env 게이트 LLM170_F32Q8=1).
         // tile_f32 347ms → tile_q8128 경로(~115ms): 가중 판독 4× 절감.
         // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
@@ -500,7 +874,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                                 // 종전 순차 t/128 디스패치의 슬래브별 전 가중
                                 // 재판독 폐지.
                                 let gys = (t as u32).div_ceil(128);
-                                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32]);
+                                // plans/101 P1: hout=1 → outv packed f16(HC gate 축).
+                                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, u32::from(hout)]);
                                 ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
                             } else {
                                 for tb in (0..t).step_by(64) {
@@ -662,365 +1037,6 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 }
             }
         }
-        Ok(())
-    }
-    fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
-        use llm170_core::matmul::FrameOp as O;
-        let t_cur = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
-        let mut ctx = self.ctx.lock();
-        self.frame_resume_batch(&mut ctx);
-        match *op {
-            O::RmsRows { x, w, out, eps, n, w_reps } => {
-                let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
-                let rows = w_reps * t_cur;
-                // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
-                // 32스레드 원판(산술 그대로, 실측 우위).
-                let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
-                let p = self.pipeline(&mut ctx, slot)?;
-                let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
-                let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
-                push.extend_from_slice(&eps.to_le_bytes());
-                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
-            }
-            O::SiluDiv { t, div, n } => {
-                let tb = self.fbuf(t)?;
-                let p = self.pipeline(&mut ctx, Slot::SiluDiv)?;
-                let ds2 = ctx.bind_ds(&p, &[tb])?;
-                let mut push = push_u32s(&[n as u32]);
-                push.extend_from_slice(&div.to_le_bytes());
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-            }
-            O::SiluMul { g, u, out, n } => {
-                self.last_silu_out
-                    .store(out, std::sync::atomic::Ordering::Relaxed);
-                let (gb, ub, ob) = (self.fbuf(g)?, self.fbuf(u)?, self.fbuf(out)?);
-                // plans/96 G3 — down 직결 융합: glu로 학습된 출력이면 silu+quant를
-                // xq에 직접 기록(쌍 슬롯 fill) — f32 mglu 왕복·down quant 폐지.
-                // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
-                let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
-                let glu = *self.moe_glu.lock();
-                let fused = t_now >= 2
-                    && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
-                    && std::env::var("LLM170_VK_SILUQ")
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
-                if fused {
-                    let (_, n_in) = glu.unwrap();
-                    let rows = n / n_in;
-                    let xq_w = xq_words(n_in);
-                    let p = self.pipeline(&mut ctx, Slot::SiluMulQ8)?;
-                    let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
-                    let tgt = {
-                        let mut sl = self.moe_xq_pair.lock();
-                        let need = rows * xq_w * 4;
-                        let ok = sl
-                            .as_ref()
-                            .is_some_and(|v| (v.3.bytes as usize) >= need);
-                        if !ok {
-                            *sl = Some((0, 0, 0, ctx.alloc(need)?));
-                        }
-                        let v = sl.as_mut().unwrap();
-                        v.0 = out;
-                        v.1 = n_in;
-                        v.2 = rows;
-                        v.3.buf
-                    };
-                    let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
-                    ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1)?;
-                } else {
-                    let p = self.pipeline(&mut ctx, Slot::Silu)?;
-                    let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
-                    let push = push_u32s(&[n as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-                }
-            }
-            O::Scale { t, s, n } => {
-                let tb = self.fbuf(t)?;
-                let p = self.pipeline(&mut ctx, Slot::Scale)?;
-                let ds2 = ctx.bind_ds(&p, &[tb])?;
-                let mut push = push_u32s(&[n as u32]);
-                push.extend_from_slice(&s.to_le_bytes());
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-            }
-            O::CopyRows { src, dst, src_off, dst_off, n } => {
-                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
-                let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
-                let push = push_u32s(&[n as u32, src_off as u32, dst_off as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-            }
-            O::BcastRows { src, dst, n, rows } => {
-                let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
-                let p = self.pipeline(&mut ctx, Slot::BcastRows)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, db])?;
-                let push = push_u32s(&[n as u32, rows as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-            }
-            O::AxpyScaled { y, x, s, n } => {
-                let (yb, xb, sb) = (self.fbuf(y)?, self.fbuf(x)?, self.fbuf(s)?);
-                if t_cur <= 1 {
-                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?; // pp=n → s[0]와 동일
-                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
-                    let push = push_u32s(&[n as u32, n as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-                } else {
-                    let pp = n / t_cur;
-                    let p = self.pipeline(&mut ctx, Slot::AxpyT)?;
-                    let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
-                    let push = push_u32s(&[n as u32, pp as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-                }
-            }
-            O::HcGateMean { xn, gate, out, hc, n } => {
-                let (xb, gb, ob) = (self.fbuf(xn)?, self.fbuf(gate)?, self.fbuf(out)?);
-                let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
-                let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
-                let total = n * t_cur;
-                let push = push_u32s(&[hc as u32, n as u32, total as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(128), 1, 1)?;
-            }
-            O::HcCombine { res, out, inj, hc, n, total: _ } => {
-                let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
-                let p = self.pipeline(&mut ctx, Slot::HcCombine)?;
-                let ds2 = ctx.bind_ds(&p, &[rb, ob, ib])?;
-                let tn = n * t_cur;
-                let push = push_u32s(&[hc as u32, n as u32, tn as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (tn as u32).div_ceil(128), 1, 1)?;
-            }
-            O::NormGated { o, z, w, out, eps, d, n_h } => {
-                let (ob, zb, wb, ub) = (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);
-                let p = self.pipeline(&mut ctx, Slot::NormGatedSig)?;
-                let ds2 = ctx.bind_ds(&p, &[ob, zb, wb, ub])?;
-                let mut push = push_u32s(&[d as u32, n_h as u32]);
-                push.extend_from_slice(&eps.to_le_bytes());
-                ctx.run(p.pl, ds2, p.pipe, &push, (n_h * t_cur) as u32, 1, 1)?;
-            }
-            O::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
-                let (bb, ab, db, sb, gb) = (self.fbuf(b)?, self.fbuf(a)?, self.fbuf(dtb)?, self.fbuf(sa)?, self.fbuf(bg)?);
-                let p = self.pipeline(&mut ctx, Slot::GdnBetaG)?;
-                let ds2 = ctx.bind_ds(&p, &[bb, ab, db, sb, gb])?;
-                let dr = n_h / t_cur.max(1);
-                let push = push_u32s(&[n_h as u32, dr as u32]);
-                // 판은 64스레드 — 128로 나누면 절반이 미기입된다(청크 크기별
-                // 커버리지가 달라져 청크 불변성 위반의 원인이었다).
-                ctx.run(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(64), 1, 1)?;
-            }
-            O::Sigmoid { t, n } => {
-                let tb = self.fbuf(t)?;
-                let p = self.pipeline(&mut ctx, Slot::EwSigmoid)?;
-                let ds2 = ctx.bind_ds(&p, &[tb])?;
-                let push = push_u32s(&[n as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1)?;
-            }
-            O::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
-                let (sb, a0, a1, a2) = (self.fbuf(src)?, self.fbuf(d0)?, self.fbuf(d1)?, self.fbuf(d2)?);
-                let p = self.pipeline(&mut ctx, Slot::Split3)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, a0, a1, a2])?;
-                let push = push_u32s(&[n0 as u32, n1 as u32, n2 as u32]);
-                let total = (n0 + n1 + n2) * t_cur;
-                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(64), 1, 1)?;
-            }
-            O::L2Rows { x, eps, d, n } => {
-                let xb = self.fbuf(x)?;
-                let p = self.pipeline(&mut ctx, Slot::L2Rows)?;
-                let ds2 = ctx.bind_ds(&p, &[xb])?;
-                let mut push = push_u32s(&[d as u32]);
-                push.extend_from_slice(&eps.to_le_bytes());
-                let rows = (n / d).max(1);
-                ctx.run(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1)?;
-            }
-            O::L2Rows2Scale { q, k, eps, scale, d, n_group } => {
-                let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
-                let p = self.pipeline(&mut ctx, Slot::L2Rows2Scale)?;
-                let ds2 = ctx.bind_ds(&p, &[qb, kb])?;
-                let mut push = push_u32s(&[d as u32, n_group as u32]);
-                push.extend_from_slice(&eps.to_le_bytes());
-                push.extend_from_slice(&scale.to_le_bytes());
-                ctx.run(p.pl, ds2, p.pipe, &push, n_group as u32, 1, 1)?;
-            }
-            O::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
-                let (qb, cb, sb, ob) = (self.fbuf(qkv)?, self.fbuf(cw)?, self.fbuf(state)?, self.fbuf(out)?);
-                let binds3 = [qb, cb, sb, ob];
-                if t_len >= k - 1 {
-                    // 병렬 청크판 + 상태 갱신 2런치 (hip과 동일 구조)
-                    let p = self.pipeline(&mut ctx, Slot::GdnConvT2)?;
-                    let ds2 = ctx.bind_ds(&p, &binds3)?;
-                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), t_len as u32, 1)?;
-                    let p2 = self.pipeline(&mut ctx, Slot::GdnConvState)?;
-                    let ds3 = ctx.bind_ds(&p2, &[qb, sb])?;
-                    let push2 = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run(p2.pl, ds3, p2.pipe, &push2, (k - 1) as u32, (ch as u32).div_ceil(64), 1)?;
-                } else {
-                    // 짧은 꼬리: 순차판 (상태 회전 포함)
-                    let p = self.pipeline(&mut ctx, Slot::GdnConvSeq)?;
-                    let ds2 = ctx.bind_ds(&p, &binds3)?;
-                    let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), 1, 1)?;
-                }
-            }
-            O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
-                let (rb, ib, wb) = (self.fbuf(route)?, self.fbuf(ids)?, self.fbuf(wt)?);
-                let p = self.pipeline(&mut ctx, Slot::MoeTop10)?;
-                let ds2 = ctx.bind_ds(&p, &[rb, ib, wb])?;
-                let push = push_u32s(&[n_exp as u32, k_sel as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, t_cur as u32, 1, 1)?;
-                // plans/88 P2 — 라우팅 세대 증가: 그룹화 캐시 무효화 키.
-                self.moe_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            O::MoeWeightedSum { ys, wt, out, k, n } => {
-                let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
-                let p = self.pipeline(&mut ctx, Slot::MoeWsum)?;
-                let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
-                let total = n * t_cur;
-                let push = push_u32s(&[n as u32, k as u32, total as u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
-            }
-            ref other => return Err(format!("vk frame_op: 미지원 {other:?}")),
-        }
-        Ok(())
-    }
-}
-
-impl llm170_core::matmul::MatmulHost for VkAcc {
-    fn matmul_batch(
-        &self,
-        xs: &[Vec<f32>],
-        w: &Weight,
-        outs: &mut [Vec<f32>],
-    ) -> Result<(), String> {
-        let ty = match vk_ty(w.ty) {
-            Some(t) => t,
-            None => {
-                llm170_core::matmul::matmul_batch(xs, w, outs);
-                return Ok(());
-            }
-        };
-        let n_in = w.n_in as usize;
-        let n_out = w.n_out as usize;
-        let t = xs.len();
-        if std::env::var_os("LLM170_VK_MBDBG").is_some() {
-            eprintln!("[mb] ty={:?} n_in={} n_out={} t={}", w.ty, w.n_in, w.n_out, t);
-        }
-        let xq_w = xq_words(n_in);
-        let mut ctx = self.ctx.lock();
-        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
-        let ob = self.value_buf(&mut ctx, &self.obuf, t * n_out * 4)?;
-        self.quant_upload(&mut ctx, xs, n_in, xq)?;
-        let wbufs = self.weight_bufs(&mut ctx, w)?;
-        // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로(dense_mm와 동일
-        // 판·동일 수치 클래스). gemv3 t-루프는 512토큰에서 ~50ms 직렬.
-        // 킬스위치 LLM170_VK_MBTILE=0.
-        if t >= 2
-            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
-            && wbufs.len() == 1
-            && std::env::var_os("LLM170_VK_MBTILE").map(|v| v != "0").unwrap_or(true)
-            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
-        {
-            let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
-            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            while binds.len() < 8 {
-                binds.push(dbuf);
-            }
-            binds.push(xq);
-            binds.push(ob);
-            let big = t >= 128;
-            let slot = match (w.ty, big) {
-                (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,
-                (GgmlType::Q8_0, false) => Slot::TileQ8msCm,
-                (_, true) => Slot::TileQ4k128Cm,
-                (_, false) => Slot::TileQ4kmsCm,
-            };
-            let p = self.pipeline(&mut ctx, slot)?;
-            let ds2 = ctx.bind_ds(&p, &binds)?;
-            let gx = (n_out as u32).div_ceil(64);
-            if big {
-                // plans/92 P1: 단일 디스패치(슬래브 x, 행 y) — 커널 유도 tok_base.
-                let gys = (t as u32).div_ceil(128);
-                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32]);
-                ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
-            } else {
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
-                    let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32]);
-                    ctx.run(p.pl, ds2, p.pipe, &push, gx, 1, 1)?;
-                }
-            }
-            self.download_out(outs, n_out, t);
-            return Ok(());
-        }
-        self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
-        self.download_out(outs, n_out, t);
-        Ok(())
-    }
-
-    /// 같은 입력 그룹: 업로드+양자화 1회 → GEMV 각각 → 개별 다운로드.
-    fn matmul_group(
-        &self,
-        xs: &[Vec<f32>],
-        ws: &[Weight],
-        outs: &mut [Vec<Vec<f32>>],
-    ) -> Result<(), String> {
-        if ws.iter().any(|w| vk_ty(w.ty).is_none())
-            || ws.iter().any(|w| w.n_in != ws[0].n_in)
-        {
-            for (w, out) in ws.iter().zip(outs.iter_mut()) {
-                self.matmul_batch(xs, w, out)?;
-            }
-            return Ok(());
-        }
-        let n_in = ws[0].n_in as usize;
-        let t = xs.len();
-        let xq_w = xq_words(n_in);
-        let mut ctx = self.ctx.lock();
-        let xq = self.value_buf(&mut ctx, &self.xbuf, t * xq_w * 4)?;
-        self.quant_upload(&mut ctx, xs, n_in, xq)?;
-        // 배치: 모든 가중 GEMV 녹화 → 단일 제출 → 일괄 다운로드 (plans/19)
-        let do_batch = std::env::var_os("LLM170_VK_NOBATCH").is_none();
-        if do_batch {
-            ctx.begin_batch()?;
-        }
-        let mut hosts: Vec<(*mut u8, usize, usize)> = Vec::with_capacity(ws.len()); // (ptr, n_out, ti스트라이드)
-        for (wi, w) in ws.iter().enumerate() {
-            let ty = vk_ty(w.ty).unwrap();
-            let n_out = w.n_out as usize;
-            let wbufs = self.weight_bufs(&mut ctx, w)?;
-            // 가중별 독립 출력 버퍼 (그룹 세션 슬롯)
-            let ob = {
-                let mut g = self.gobufs.lock();
-                while g.len() <= wi {
-                    g.push(None);
-                }
-                if g[wi].as_ref().map(|b| b.bytes >= t * n_out * 4).unwrap_or(false) {
-                    g[wi].as_ref().unwrap().buf
-                } else {
-                    let b = ctx.alloc_host(t * n_out * 4)?;
-                    let buf = b.buf;
-                    g[wi] = Some(b);
-                    buf
-                }
-            };
-            self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
-            let ptr = self.gobufs.lock()[wi].as_ref().unwrap().ptr;
-            hosts.push((ptr, n_out, wi));
-        }
-        if do_batch {
-            ctx.end_batch_wait()?;
-        }
-        for (ptr, n_out, wi) in hosts {
-            let host = unsafe { std::slice::from_raw_parts(ptr as *const f32, t * n_out) };
-            for ti in 0..t {
-                outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
-            }
-        }
-        Ok(())
-    }
-
-    fn matmul(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), String> {
-        let xs = vec![x.to_vec()];
-        let mut tmp = vec![vec![0.0f32; w.n_out as usize]];
-        self.matmul_batch(&xs, w, &mut tmp)?;
-        out.copy_from_slice(&tmp[0]);
         Ok(())
     }
 }
