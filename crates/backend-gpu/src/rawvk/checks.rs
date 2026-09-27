@@ -3603,6 +3603,30 @@ pub fn cm8_probe() -> Result<String, String> {
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
         let _ = bad;
     }
+    if std::env::var_os("LLM170_CM8_VERIFY").is_some() {
+        let spv2 = std::fs::read(if std::env::var_os("LLM170_CM8_T2").is_some() {
+            "/tmp/cm8v2.spv"
+        } else {
+            "/tmp/cm8v.spv"
+        }).map_err(|e| e.to_string())?;
+        let (_d2, p2, _o2, ds2, pipe2) = ctx.pipeline(&spv2, 3, 0)?;
+        let vb = ctx.alloc_host(1024)?;
+        unsafe { std::ptr::write_bytes(vb.ptr, 0, 1024) };
+        let dummy = ctx.alloc_host(1024)?;
+        let dummy2 = ctx.alloc_host(1024)?;
+        unsafe { std::ptr::write_bytes(dummy.ptr, 0, 1024); std::ptr::write_bytes(dummy2.ptr, 0, 1024); }
+        // 기저: A[3][5]=1, B[7][11]=1 (5≠11 → 올바르면 전 0).
+        unsafe {
+            *(dummy.ptr.add(3 * 32 + 5) as *mut u8) = 1;
+            *(dummy2.ptr.add(7 * 32 + 11) as *mut i8) = 1;
+        }
+        ctx.bind_bufs(ds2, &[dummy.buf, dummy2.buf, vb.buf]);
+        let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
+        let diffs: Vec<i32> = unsafe { std::slice::from_raw_parts(vb.ptr as *const i32, 256) }.to_vec();
+        let bad = diffs.iter().filter(|&&d| d != 0).count();
+        eprintln!("[cm8-verify] 전체 {:?}", &diffs[..256]);
+        unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
+    }
     let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 3, 0)?;
     let _ = (dsl, pool);
     ctx.bind_bufs(ds, &[ab.buf, bb.buf, cb.buf]);

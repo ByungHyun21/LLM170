@@ -149,6 +149,7 @@ const FN_MOE_TILE_Q4K_SC_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sc.
 /// plans/93 — q4_K MMQ(int8 dot) MoE 타일(BM=64×BN=64).
 const FN_MOE_TILE_Q4K_SG1F_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_sg1f.spv");
 const FN_MOE_TILE_Q4K_MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_mmq.spv");
+const FN_MOE_TILE_Q4K_CM8_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_cm8.spv");
 const FN_MOE_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q8mmq.spv");
 const FN_MOE_TILE_Q5KMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q5kmmq.spv");
 const FN_MOE_TILE_Q51MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51mmq.spv");
@@ -265,6 +266,8 @@ pub(crate) enum Slot {
     FnMoeTileQ4kSg1,
     FnMoeTileQ4kSc,
     FnMoeTileQ4kMmq,
+    /// plans/99 — q4_K INT8 coopmat(u8×i8) 판.
+    FnMoeTileQ4kCm8,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
     /// plans/96 G3 — q5_K MoE 전문가 int8 MMQ 타일.
@@ -484,6 +487,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ4kSg1, "moe_tile_q4k_sg1", FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
     (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
     (Slot::FnMoeTileQ4kMmq, "moe_tile_q4k_mmq", FN_MOE_TILE_Q4K_MMQ_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kCm8, "moe_tile_q4k_cm8", FN_MOE_TILE_Q4K_CM8_SPV, 13, 28),
     (Slot::FnMoeTileQ8mmq, "moe_tile_q8mmq", FN_MOE_TILE_Q8MMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ5kmmq, "moe_tile_q5kmmq", FN_MOE_TILE_Q5KMMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ51mmq, "moe_tile_q51mmq", FN_MOE_TILE_Q51MMQ_SPV, 13, 28),
