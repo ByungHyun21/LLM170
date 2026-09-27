@@ -1883,3 +1883,13 @@ interface lists a Private variable (`coopmat_stage`). Recorded as a
 driver-level blocker; revisit on the next RADV generation. The non-cm
 variant (measured 4.7× slower than ours) bounds the loss: even if cm1
 were 2× faster than non-cm, it would still trail q4k_mmq v5.
+
+### INT8 cooperative matrix discovered — 21-25 TMAC/s (plans/99, 2026-09-27)
+
+RADV 26.2.3 exposes 12 int8 coopmat types (u8×i8→i32 etc. — absent in
+26.1.7; unlocked by the driver upgrade). `vk-cm8-probe`: 16×16×16
+coopMatMulAdd(u8,i8) at **21.8 TMAC/s** (25.5 at 8192 WGs, linear
+scaling, sane accumulation). This is ~16× our scalar-dot MMQ throughput.
+The f16-emulation verdict (74GB/s) does not apply — this is a different,
+apparently native WMMA path. Design for porting the MMQ MMA core onto
+int8 coopmat: plans/99.
