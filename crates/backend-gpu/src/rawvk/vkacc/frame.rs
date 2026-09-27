@@ -58,6 +58,42 @@ impl llm170_core::matmul::FrameState for VkAcc {
         );
         // plans/84 B: FN 상태는 전치 레이아웃(hip gdn_ar_w_swap과 동일 규약) —
         // grid (d, h_v), 상태 s[pair·d·d + u·d + …].
+        // plans/100 v2: 2-커널(L/W 사전계산 + 실행) — 옵트인 GDNCH=2.
+        if std::env::var("LLM170_VK_GDNCH").map(|v| v == "2").unwrap_or(false) {
+            let csize = 32usize;
+            let nchunks = t.div_ceil(csize);
+            // 스크래치: L[W][C*C] + W[W][C*C] + G[W][2C] — 성장형.
+            let nsc = nchunks * h_v;
+            let (lb, wb, gb) = {
+                let mut g = self.gdn_ch_scratch.lock();
+                let need = nsc * 32 * 32;
+                if g.0.as_ref().map(|b| b.bytes >= need * 4).unwrap_or(false) {
+                    (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
+                } else {
+                    let a = ctx.alloc(need * 4)?;
+                    let b = ctx.alloc(need * 4)?;
+                    let c = ctx.alloc(nsc * 2 * 32 * 4)?;
+                    *g = (Some(a), Some(b), Some(c));
+                    (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
+                }
+            };
+            // (A) L/W — grid(청크, pair).
+            {
+                let p = self.pipeline(&mut ctx, Slot::GdnLw)?;
+                let ds2 = ctx.bind_ds(&p, &[qb, kb, bb, lb, wb, gb])?;
+                let push = push_u32s(&[(h_k * d) as u32, h_v as u32, h_k as u32, t as u32, 0u32, csize as u32]);
+                ctx.run(p.pl, ds2, p.pipe, &push, nchunks as u32, h_v as u32, 1)?;
+            }
+            // (B) 실행 — grid(청크, pair, d/64).
+            {
+                let p = self.pipeline(&mut ctx, Slot::GdnExec)?;
+                let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, lb, wb, gb, ob])?;
+                let mut push = push_u32s(&[(h_k * d) as u32, (h_v * d) as u32, h_v as u32, h_k as u32, t as u32, 0u32, csize as u32]);
+                push.extend_from_slice(&1.0f32.to_le_bytes());
+                ctx.run(p.pl, ds2, p.pipe, &push, nchunks as u32, h_v as u32, (d.div_ceil(64)) as u32)?;
+            }
+            return Ok(());
+        }
         // plans/100: 청크 병렬(WY) — 옵트인 LLM170_VK_GDNCH=1(클래스 변경).
         if std::env::var("LLM170_VK_GDNCH").map(|v| v == "1").unwrap_or(false) {
             let p = self.pipeline(&mut ctx, Slot::FnGdnChunk)?;

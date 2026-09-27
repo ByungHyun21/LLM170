@@ -47,6 +47,8 @@ const L2_ROWS2_SPV: &[u8] = include_bytes!("../spv/l2_rows2_scale.spv");
 /// plans/84 B — FN GDN AR: 전치 상태(gdn_ar_w_swap 동일열).
 const FN_GDN_AR_SWAP_SPV: &[u8] = include_bytes!("../spv/fn_gdn_ar_swap.spv");
 const FN_GDN_CHUNK_SPV: &[u8] = include_bytes!("../spv/fn_gdn_chunk.spv");
+const GDN_LW_SPV: &[u8] = include_bytes!("../spv/gdn_lw.spv");
+const GDN_EXEC_SPV: &[u8] = include_bytes!("../spv/gdn_exec.spv");
 /// plans/84 B — FN QSA: 선택 어텐션 + 인덱서 블록키 갱신.
 const FN_QSA_ATTN_SEL_SPV: &[u8] = include_bytes!("../spv/fn_qsa_attn_sel.spv");
 const FN_IDX_BK_SPV: &[u8] = include_bytes!("../spv/fn_idx_bk_update.spv");
@@ -205,6 +207,9 @@ pub(crate) enum Slot {
     FnGdnArSwap,
     /// plans/100 — GDN 청크 병렬(WY).
     FnGdnChunk,
+    /// plans/100 v2 — L/W 사전계산 + 실행 분리.
+    GdnLw,
+    GdnExec,
     FnQsaAttnSel,
     FnIdxBk,
     /// plans/85 §2 — QSA 디코드 선택 체인(q_rope/score/rank/expand).
@@ -317,6 +322,7 @@ pub struct VkAcc {
     /// 동작하는 디바이스 메모리로 보낸다(값경로 xbuf 는 호스트 스테이징용 유지).
     xq_dev: Mutex<Option<VkBuf>>,
     cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
+    gdn_ch_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -443,6 +449,8 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::L2Rows2Scale, "l2_rows2_scale", L2_ROWS2_SPV, 2, 24),
     (Slot::FnGdnArSwap, "gdn_ar_swap", FN_GDN_AR_SWAP_SPV, 6, 28),
     (Slot::FnGdnChunk, "gdn_chunk", FN_GDN_CHUNK_SPV, 6, 40),
+    (Slot::GdnLw, "gdn_lw", GDN_LW_SPV, 6, 24),
+    (Slot::GdnExec, "gdn_exec", GDN_EXEC_SPV, 8, 36),
     (Slot::FnQsaAttnSel, "qsa_attn_sel", FN_QSA_ATTN_SEL_SPV, 6, 24),
     (Slot::PermuteU32, "permute_u32", PERMUTE_U32_SPV, 3, 12),
     (Slot::FnIdxScore, "idx_score", FN_IDX_SCORE_SPV, 3, 12),
@@ -558,6 +566,7 @@ impl VkAcc {
             xbuf: Mutex::new(None),
             xq_dev: Mutex::new(None),
             cm8_scratch: Mutex::new((None, None, None)),
+            gdn_ch_scratch: Mutex::new((None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
             rbufs: Mutex::new(None),

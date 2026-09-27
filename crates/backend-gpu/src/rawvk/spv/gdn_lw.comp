@@ -1,0 +1,70 @@
+#version 450
+
+// fn_gdn_lw (plans/100 v2-A) — 청크의 L/W 사전계산(u무관, 1 WG/청크).
+// v1의 44× 지연 원인(원소마다 gK 글로벌 재판독) 제거: K/Q를 LDS에
+// 1회 스테이징 후 C²·d 닷을 LDS에서 수행. L/W는 글로벌 스크래치 기록.
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer K { float k[]; };
+layout(binding = 2) readonly buffer Bg { float bg[]; };
+layout(binding = 3) buffer Lbuf { float lout[]; };   // [chunk][C*C]
+layout(binding = 4) buffer Wbuf { float wout[]; };   // [chunk][C*C]
+layout(binding = 5) buffer Gbuf { float gout[]; };   // [chunk][C] (감쇠 접두)
+layout(push_constant) uniform PC {
+    int ks; int hv; int hk; int t; int chunk0; int csize;
+} pc;
+
+const int C = 32;  // LDS 한계 — 64→32(gdn_lw 64.5KB 초과 수정)
+shared float sK[C * 128];
+shared float sQ[C * 128];
+shared float sG[C];
+shared float sBe[C];
+
+void main() {
+    int chunk = int(gl_WorkGroupID.x);
+    int pair = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int h = pair % pc.hv;
+    int kh = h % pc.hk;
+    int t0 = pc.chunk0 + chunk * pc.csize;
+    int cs = min(pc.csize, pc.t - t0);
+    int d = 128;  // v2 고정(FN d=128) — 일반화는 필요시.
+    if (cs <= 0) return;
+
+    // 감쇠 접두(포함) + K/Q 스테이징(코얼레스드).
+    if (tid == 0) {
+        float acc = 1.0;
+        for (int i = 0; i < cs; i++) {
+            int ti = t0 + i;
+            sBe[i] = bg[pc.hv * 2 * ti + pair * 2];
+            acc *= bg[pc.hv * 2 * ti + pair * 2 + 1];
+            sG[i] = acc;
+        }
+    }
+    for (int i = tid; i < cs * d; i += 128) {
+        int r = i / d, j = i % d;
+        sK[r * 128 + j] = k[pc.ks * (t0 + r) + kh * d + j];
+        sQ[r * 128 + j] = q[pc.ks * (t0 + r) + kh * d + j];
+    }
+    barrier();
+    // 감쇠/β 글로벌 기록(실행 커널이 재사용).
+    for (int i = tid; i < cs; i += 128) {
+        gout[chunk * 2 * C + i] = sG[i];
+        gout[chunk * 2 * C + C + i] = sBe[i];
+    }
+    // L[τ,σ] = Be_τ·(G_τ/G_σ)·⟨K_τ,K_σ⟩ (σ<τ) + W[t,σ]=(G_t/G_σ)⟨Q_t,K_σ⟩ (σ≤t).
+    // 각 스레드가 (τ,σ) 쌍 분담 — 두 닷을 한 번의 j-루프로 병행.
+    for (int idx = tid; idx < cs * cs; idx += 128) {
+        int tau = idx / cs, sig = idx % cs;
+        float dk = 0.0, dq = 0.0;
+        for (int j = 0; j < d; j++) {
+            float kv = sK[tau * 128 + j];
+            float sv = sK[sig * 128 + j];
+            dk += kv * sv;
+            dq += sQ[tau * 128 + j] * sv;
+        }
+        float ratio = sG[tau] / sG[sig];
+        lout[chunk * C * C + tau * C + sig] = (sig < tau) ? sBe[tau] * ratio * dk : 0.0;
+        wout[chunk * C * C + tau * C + sig] = (sig <= tau) ? ratio * dq : 0.0;
+    }
+}
