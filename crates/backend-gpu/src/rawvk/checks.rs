@@ -3560,3 +3560,42 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         if bad == 0 { "★" } else { "✗" }
     ))
 }
+
+/// vk-cm8-probe (plans/99) — INT8 coopmat(u8×i8→i32) 네이티브 처리량 판정.
+/// WG당 16×16×16 MMA × R회(=1024) — 스팬 시간으로 MAC/s 산출.
+pub fn cm8_probe() -> Result<String, String> {
+    let spv = std::fs::read("crates/backend-gpu/src/rawvk/spv/coopmat_i8_probe.spv")
+        .map_err(|e| e.to_string())?;
+    let acc = VkAcc::new()?;
+    let mut ctx = acc.ctx.lock();
+    let ab = ctx.alloc_host(256)?;
+    let bb = ctx.alloc_host(256)?;
+    let cb = ctx.alloc_host(1024)?;
+    unsafe {
+        for i in 0..256usize {
+            *(ab.ptr.add(i) as *mut u8) = (i % 256) as u8;
+            *(bb.ptr.add(i) as *mut i8) = ((i % 251) as i8).wrapping_sub(125);
+        }
+        std::ptr::write_bytes(cb.ptr, 0, 1024);
+    }
+    let (dsl, pl, pool, ds, pipe) = ctx.pipeline(&spv, 3, 0)?;
+    let _ = (dsl, pool);
+    ctx.bind_bufs(ds, &[ab.buf, bb.buf, cb.buf]);
+    let wgs: u32 = std::env::var("LLM170_CM8_WG").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    // 웜업 + 측정 5회.
+    for _ in 0..2 {
+        let _ = ctx.run(pl, ds, pipe, &[], wgs, 1, 1);
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..5 {
+        let _ = ctx.run(pl, ds, pipe, &[], wgs, 1, 1);
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / 5.0;
+    let r = 1024u64;
+    let macs = wgs as u64 * r * 16 * 16 * 16;
+    let mtps = macs as f64 / (ms / 1e3) / 1e12;
+    let c0 = unsafe { *(cb.ptr as *const i32) };
+    Ok(format!(
+        "cm8-probe: {wgs}WG × 1024MMA · {ms:.3}ms · {mtps:.2} TMAC/s · c[0]={c0} (u8×i8 coopmat 경로)"
+    ))
+}
