@@ -236,7 +236,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let slot = if rows >= 2 { Slot::RmsWide } else { Slot::Rms };
                 // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장 옵트인.
                 let h16 = slot == Slot::RmsWide && w_reps > 1
-                    && std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false);
+                    && std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true);
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
