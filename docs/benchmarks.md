@@ -1893,3 +1893,15 @@ scaling, sane accumulation). This is ~16× our scalar-dot MMQ throughput.
 The f16-emulation verdict (74GB/s) does not apply — this is a different,
 apparently native WMMA path. Design for porting the MMQ MMA core onto
 int8 coopmat: plans/99.
+
+### i8 coopmat final verdict (plans/99, 2026-09-27 night)
+
+Full-element verification with random patterns: the RADV 26.2.3
+coopMatLoad(u8/i8) implementation is **non-conformant** — recovered
+operand matrices exceed u8 range, no single element-mapping hypothesis
+fits, shared-memory sources return zeros under concurrency. Earlier
+probe passes (identity/single-basis/symmetric patterns) were
+pattern-lucky. The 22 TMAC/s hardware unit exists and is proven; kernel
+convergence is impossible on this driver generation. All probe/checker/
+kernel assets preserved (opt-in `LLM170_VK_Q4CM8=1`). Re-evaluate on
+RADV 26.3+. Same driver-family root as the llama cm1 pipeline segfault.
