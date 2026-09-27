@@ -1820,3 +1820,14 @@ System now resident on mesa 26.2.3 (user system upgrade; perf identical
 arithmetic-class change → gate stream re-recorded (`--record`, precedent
 for class changes). Gate 3/3 PASS on the new stream. Baseline files
 updated; 26.1.7-era streams remain in git history.
+
+### Cross-backend MMQ floor confirmation (2026-09-27)
+
+Measured hip pp512 (266/278 t/s) kernel profile vs the Vulkan stack:
+q4-K MoE GEMM — hip `q4_gemm_q4k_ge_ids` 550ms vs vk `q4k_mmq` 450ms
+(vk 18% faster); q5_1 — hip 148ms vs vk 162ms (parity). The "HIP native
+dot4a would be 3-4× faster than RADV's emulated OpSDot" hypothesis is
+**false on this stack**: two independent compiler stacks land in the
+same band. The MoE prefill floor is memory/architectural, not codegen.
+The HIP MMQ port (the last documented 500-route) is therefore
+deprecated as a pp512 lever — vk is already at or past that floor.
