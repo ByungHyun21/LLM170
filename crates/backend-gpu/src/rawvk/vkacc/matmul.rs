@@ -489,6 +489,11 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                             let p = self.pipeline(&mut ctx, slot)?;
                             let ds2 = ctx.bind_ds(&p, &binds)?;
                             let gx = (n_out as u32).div_ceil(64);
+                            if std::env::var_os("LLM170_T8_LOG").is_some() {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static N: AtomicU64 = AtomicU64::new(0);
+                                eprintln!("[t8log] #{:?} ty={:?} n_in={n_in} n_out={n_out} t={t}", N.fetch_add(1, Ordering::Relaxed), w.ty);
+                            }
                             if big {
                                 // plans/92 P1: 128 패밀리 단일 디스패치(슬래브 x,
                                 // 행 y) — 커널이 tok_base=wg.x*BN·꼬리 nt 유도.
