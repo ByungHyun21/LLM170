@@ -1831,3 +1831,13 @@ dot4a would be 3-4× faster than RADV's emulated OpSDot" hypothesis is
 same band. The MoE prefill floor is memory/architectural, not codegen.
 The HIP MMQ port (the last documented 500-route) is therefore
 deprecated as a pp512 lever — vk is already at or past that floor.
+
+### llama 506 t/s engine identified (plans/98, 2026-09-27)
+
+Decisive source-level finding: the reference llama.cpp build has NO
+mul_mmq (integer-dot) shaders — system shaderc lacks
+GL_EXT_integer_dot_product, so its MoE GEMMs run on
+`matmul_id_quant_{f16,f32}` (runtime-dispatch MULMAT_QUANT kernel:
+q4_K dequant + f32/f16 FMA warptile GEMM). Both variants compile clean
+under our toolchain (77KB spv staged in spv/llama_mmidq_*). This is the
+port target — not integer dot, not coopmat. Port plan: plans/98.
