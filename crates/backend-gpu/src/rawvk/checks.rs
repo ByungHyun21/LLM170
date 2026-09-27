@@ -3249,8 +3249,14 @@ pub fn llama_mmq_check() -> Result<String, String> {
     let t = std::env::var("LLM170_LMMQ_T").ok().and_then(|v| v.parse().ok()).unwrap_or(64usize);
     let plain = std::env::var_os("LLM170_LMMQ_PLAIN").is_some();
     let pre = std::env::var_os("LLM170_LMMQ_PRE").is_some();
+    let pt = std::env::var_os("LLM170_LMMQ_PT").is_some();
     let f32a = std::env::var_os("LLM170_LMMQ_F32A").is_some();
-    let spv = std::fs::read(if f32a {
+    let mm32 = std::env::var_os("LLM170_LMMQ_MM32").is_some();
+    let spv = std::fs::read(if pt {
+        "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_idq4k.spv"
+    } else if mm32 {
+        "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_mmf32.spv"
+    } else if f32a {
         "crates/backend-gpu/src/rawvk/spv/llama_mm_f32A_plain.spv"
     } else if pre {
         "crates/backend-gpu/src/rawvk/spv/llama_prebuilt_idq.spv"
@@ -3283,7 +3289,7 @@ pub fn llama_mmq_check() -> Result<String, String> {
     };
     // A: f32a는 밀집 f32, 아니면 q4_K 스택.
     let mut a_lcg = 4242424242424242u64;
-    let ab = if f32a {
+    let ab = if f32a || mm32 {
         let mut a_lcgf = || {
             a_lcg = a_lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((a_lcg >> 33) as f32 / 4294967296.0) - 0.5
@@ -3350,21 +3356,21 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         }
     }
     eprintln!("[lmmq] bufs ok, pipeline...");
-    let (dsl, pl, pool, ds, pipe) = if plain || f32a {
+    let (dsl, pl, pool, ds, pipe) = if plain || f32a || mm32 {
         ctx.pipeline(&spv, 3, 16 * 4)?
     } else {
         ctx.pipeline(&spv, 5, 15 * 4)?
     };
     eprintln!("[lmmq] pipeline ok");
     let _ = (dsl, pool);
-    if plain || f32a {
+    if plain || f32a || mm32 {
         ctx.bind_bufs(ds, &[ab.buf, bb.buf, db.buf]);
     } else {
         ctx.bind_bufs(ds, &[ab.buf, bb.buf, db.buf, ib.buf, cb.buf]);
     }
     // PC(id): M, N, K, sa, sb, sd, bsa, bsb, bsd, nei0, nei1, nbi1, ne11, n_exp, hoist
     // PC(평판): M, N, K, sa, sb, sd, bsa, bsb, bsd, base_wg_z, num_batches, k_split, ne02, ne12, b2, b3
-    let push: Vec<u32> = if plain || f32a {
+    let push: Vec<u32> = if plain || f32a || mm32 {
         vec![
             m_per as u32, t as u32, n_in as u32,
             n_in as u32, n_in as u32, m_per as u32,
@@ -3379,18 +3385,22 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
             k_sel as u32, t as u32, k_sel as u32, t as u32, ne as u32, 0,
         ]
     };
-    let mut pbytes = Vec::with_capacity(60);
-    for v in &push {
-        pbytes.extend_from_slice(&v.to_le_bytes());
+    let mut pbytes = Vec::with_capacity(64);
+    for (bi, v) in push.iter().enumerate() {
+        let mut w = *v;
+        if std::env::var_os("LLM170_LMMQ_SENT").is_some() && bi < 4 {
+            w = [11u32, 22, 33, 44][bi];
+        }
+        pbytes.extend_from_slice(&w.to_le_bytes());
     }
     let gx_lim = std::env::var("LLM170_LMMQ_GX").ok().and_then(|v| v.parse().ok());
     let gy_lim = std::env::var("LLM170_LMMQ_GY").ok().and_then(|v| v.parse().ok());
-    let (gx, gy, gz) = if plain || f32a {
+    let (gx, gy, gz) = if plain || f32a || mm32 {
         (gx_lim.unwrap_or((m_per as u32).div_ceil(64)), gy_lim.unwrap_or((t as u32).div_ceil(64)), 1u32)
     } else {
         ((m_per as u32).div_ceil(64), (t as u32).div_ceil(64), ne as u32)
     };
-    eprintln!("[lmmq] run gx={gx} gy={gy} gz={gz} plain={plain}");
+    eprintln!("[lmmq] run gx={gx} gy={gy} gz={gz} plain={plain} push={:?}", push.iter().map(|v| *v as i64).collect::<Vec<_>>());
     if std::env::var_os("LLM170_LMMQ_SKIP").is_none() {
         ctx.run(pl, ds, pipe, &pbytes, gx, gy, gz)?;
     }
@@ -3403,15 +3413,35 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         v
     };
     eprintln!("[lmmq] got len {}", got.len());
+    if std::env::var_os("LLM170_LMMQ_DUMP").is_some() {
+        eprintln!("[lmmq] push-view D[0..12] = {:?}", &got[..12.min(got.len())]);
+        let written = got.iter().filter(|&&v| v != 3.3961514e38).count();
+        eprintln!("[lmmq] written(non-pattern) = {}/{}", written, got.len());
+        let nonzero = got.iter().filter(|&&v| v != 0.0 && v != 3.3961514e38).count();
+        eprintln!("[lmmq] nonzero-nonpattern = {nonzero}");
+        for (gi, &v) in got.iter().enumerate() {
+            if v != 0.0 && v != 3.3961514e38 && gi % m_per < 8 {
+                eprintln!("[lmmq] D[{gi}] = {v}");
+            }
+            if gi > 4000 { break; }
+        }
+        for i in 0..2 {
+            for j in 0..1 {
+                eprintln!("[lmmq] D[{i}][{j}] {:?}",
+                    &got[(i * k_sel + j) * m_per..(i * k_sel + j) * m_per + 8]);
+            }
+        }
+        eprintln!("[lmmq] ref sample: b0·a0..");
+    }
     let mut ref_row = vec![0.0f32; n_in];
     let mut mx = 0f64;
     let mut bad = 0usize;
     let mut n_checked = 0usize;
     for i in 0..t {
-        for j in 0..if plain { 1 } else { k_sel } {
-            let e = if plain { 0 } else { ids[j * t + i] as usize };
+        for j in 0..if plain || mm32 { 1 } else { k_sel } {
+            let e = if plain || mm32 { 0 } else { ids[j * t + i] as usize };
             for r in 0..m_per.min(64) {
-                if f32a {
+                if f32a || mm32 {
                     let mut st = 4242424242424242u64;
                     let mut step = |st: &mut u64| {
                         *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
