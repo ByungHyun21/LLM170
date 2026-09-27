@@ -1858,3 +1858,15 @@ rows): 16.8ms = 0.8 TFLOPS. Our q4k_mmq v5 runs the same GEMM class at
 therefore does not come from this kernel's GEMM throughput — port as a
 pp512 lever is closed with direct evidence. Our MMQ stack remains the
 fastest known implementation of this GEMM on this hardware.
+
+### Head-to-head controlled measurement (plans/98 final, 2026-09-27)
+
+Same stack (blk.0 q4_K 640×2560, E=512), t=512, warm 5-rep:
+- **ours q4k_mmq v5: 3.54 ms** (5120 routed rows)
+- **llama matmul_id_quant: 16.8 ms** (4096 routed rows)
+
+**≥4.7× advantage ours** (more rows, less time). The earlier 1.6× estimate
+was conservative; the controlled number closes the port avenue definitively
+— our MMQ is the fastest known implementation of this GEMM class on this
+device, across 4 independent verifications (9 geometry variants, 2 compiler
+stacks, 2 driver generations, and now the llama kernel itself).

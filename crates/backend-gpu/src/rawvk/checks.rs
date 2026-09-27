@@ -522,6 +522,16 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
         unsafe { std::ptr::copy_nonoverlapping(g as *const u32, ids_g.as_mut_ptr(), t * k) };
     }
     acc.frame_moe_gemm(mxh, &wd, idh, mgh, ne, k)?;
+    // plans/98 통제 비교: 동일 형상 웜 5회 타이밍(llama 체커와 대칭).
+    {
+        let n = 5u32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = acc.frame_moe_gemm(mxh, &wd, idh, mgh, ne, k);
+        }
+        acc.frame_sync();
+        eprintln!("[mtc-timing] q4_K t={t}: {:.2}ms/회", t0.elapsed().as_secs_f64() * 1e3 / f64::from(n));
+    }
     acc.frame_begin(t);
     let mut got = vec![0f32; t * k * n_out_d];
     acc.frame_read(mgh, &mut got)?;
@@ -1858,6 +1868,16 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 unsafe { std::ptr::copy_nonoverlapping(g as *const u32, ids_g.as_mut_ptr(), k) };
             }
             acc.frame_moe_gemm(mxh, &wd, idh, mgh, ne, k)?;
+    // plans/98 통제 비교: 동일 형상 웜 5회 타이밍(llama 체커와 대칭).
+    {
+        let n = 5u32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = acc.frame_moe_gemm(mxh, &wd, idh, mgh, ne, k);
+        }
+        acc.frame_sync();
+        eprintln!("[mtc-timing] q4_K t={t}: {:.2}ms/회", t0.elapsed().as_secs_f64() * 1e3 / f64::from(n));
+    }
             acc.frame_begin(t);
             let mut got = vec![0f32; k * n_out_d];
             acc.frame_read(mgh, &mut got)?;
