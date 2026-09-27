@@ -626,6 +626,8 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // vs sg1 5.43(8차 시험 첫 승리). 킬스위치 =0 → sg1(옵트인 =1).
                 // plans/99: INT8 coopmat(u8×i8→i32, RADV 26.2.3) — 21-25 TMAC/s.
                 (GgmlType::Q4K, _) if wbufs.len() == 1
+                    && std::env::var("LLM170_VK_Q4CM8B").map(|v| v != "0").unwrap_or(false) => Slot::FnMoeTileQ4kCm8b,
+                (GgmlType::Q4K, _) if wbufs.len() == 1
                     && std::env::var("LLM170_VK_Q4CM8").map(|v| v != "0").unwrap_or(false) => Slot::FnMoeTileQ4kCm8,
                 (GgmlType::Q4K, _) if wbufs.len() == 1
                     && std::env::var("LLM170_VK_Q4KMMQ").map(|v| v != "0").unwrap_or(true) => Slot::FnMoeTileQ4kMmq,
@@ -659,6 +661,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     | Slot::FnMoeTileQ5k
                     | Slot::FnMoeTileQ4kMmq
                     | Slot::FnMoeTileQ4kCm8
+                    | Slot::FnMoeTileQ4kCm8b
                     | Slot::FnMoeTileQ8mmq
                     | Slot::FnMoeTileQ5kmmq
                     | Slot::FnMoeTileQ51mmq
@@ -668,23 +671,28 @@ impl llm170_core::matmul::FrameState for VkAcc {
             binds.push(rxb);
             binds.push(rpb);
             binds.push(ppb);
-            if slot == Slot::FnMoeTileQ4kCm8 {
-                // plans/99: 타일 SSBO 스크래치 — WG당 1KB(u8)·1KB(i8)·1KB(acc).
+            if matches!(slot, Slot::FnMoeTileQ4kCm8 | Slot::FnMoeTileQ4kCm8b) {
+                // plans/99: 타일 SSBO 스크래치 — cm8: WG당 1KB×3 · cm8b: 2KB/2KB/2KB.
                 // (shared 소스 coopmat 로드가 다중 WG 동시성에서 부정확.)
                 // 주소 지정이 wgslot=wg·1024 1024-스트라이드이므로 i8도 1KB/WG
                 // 필수 — 512B 할당 시 WG 절반이 OOB 기록으로 scw를 오염시킴.
+                // cm8: wgslot 1024-스트라이드(u8 1KB·i8 1KB) · cm8b: 2048-스트라이드.
+                let per_wg: usize = if matches!(slot, Slot::FnMoeTileQ4kCm8b) { 2048 } else { 1024 };
                 let n_wg = (n_out.div_ceil(16) * bound.div_ceil(16)) as usize;
                 let (au, ai, aw) = {
                     let mut g = self.cm8_scratch.lock();
-                    if g.0.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
-                        && g.1.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
-                        && g.2.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
+                    let w_need = if matches!(slot, Slot::FnMoeTileQ4kCm8b) { n_wg * 4096 } else { n_wg * per_wg };
+                    if g.0.as_ref().map(|b| b.bytes >= n_wg * per_wg).unwrap_or(false)
+                        && g.1.as_ref().map(|b| b.bytes >= n_wg * per_wg).unwrap_or(false)
+                        && g.2.as_ref().map(|b| b.bytes >= w_need).unwrap_or(false)
                     {
                         (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
                     } else {
-                        let u = ctx.alloc(n_wg * 1024)?;
-                        let i = ctx.alloc(n_wg * 1024)?;
-                        let w = ctx.alloc(n_wg * 1024)?;
+                        // cm8b acc 스토어: 4그룹×256i32 = 4096B/WG 필수.
+                        let w_bytes = if matches!(slot, Slot::FnMoeTileQ4kCm8b) { 4096 } else { per_wg };
+                        let u = ctx.alloc(n_wg * per_wg)?;
+                        let i = ctx.alloc(n_wg * per_wg)?;
+                        let w = ctx.alloc(n_wg * w_bytes)?;
                         *g = (Some(u), Some(i), Some(w));
                         (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
                     }
@@ -697,7 +705,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
                 n_in as u32, n_out as u32, per_expert_push as u32, chunk_words, xq_w as u32,
-                if slot == Slot::FnMoeTileQ4kCm8 {
+                if matches!(slot, Slot::FnMoeTileQ4kCm8 | Slot::FnMoeTileQ4kCm8b) {
                     { let m = std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                       if std::env::var_os("LLM170_MTC_DBG").is_some() { eprintln!("[cm8-push] mode={m}"); }
                       m }
@@ -706,6 +714,11 @@ impl llm170_core::matmul::FrameState for VkAcc {
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
                 (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
+            } else if matches!(slot, Slot::FnMoeTileQ4kCm8b) {
+                // plans/99 cm8b: 64가중행(타일4) × 16할당행 — v5 기하.
+                // (이분법 스위치: CM8B_G16=1 → 그룹0만 유효한 gx/16)
+                let gx16 = std::env::var("LLM170_CM8B_G16").map(|v| v == "1").unwrap_or(false);
+                ((if gx16 { n_out.div_ceil(16) } else { n_out.div_ceil(64) }) as u32, bound.div_ceil(16) as u32)
             } else if matches!(slot, Slot::FnMoeTileQ4kCm8) {
                 // plans/99: 16가중행(서브그룹1·coopmat 16×16) × 16할당행.
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
