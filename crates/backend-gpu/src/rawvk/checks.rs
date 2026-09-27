@@ -449,6 +449,38 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
 
 /// vk-moe-tile-check <mode> (plans/89 P1.1c) — q8_0/q5_K MoE 타일의 CPU 대조.
 /// 모드("q8_0"|"q5_K")에 해당하는 첫 레이어의 down/gate 스택 텐서로 검증.
+/// plans/102 diag — 밀집 q8_0 타일(tile_q8128) 형상별 타이밍: 실효 GB/s 측정.
+pub fn dense_tile_time(tname: &str, t: usize) -> Result<String, String> {
+    use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
+    let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = model.w4(tname).map_err(|e| e.to_string())?;
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let acc = VkAcc::new()?;
+    let xh = acc.frame_alloc(t * n_in)?;
+    let oh = acc.frame_alloc(t * n_out)?;
+    let xs: Vec<f32> = (0..t * n_in).map(|i| ((i as f32 * 0.37) % 1.0) - 0.5).collect();
+    acc.frame_write(xh, &xs)?;
+    acc.frame_begin(t);
+    acc.frame_mm(xh, &w, oh, t)?;
+    let n = 5u32;
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        acc.frame_mm(xh, &w, oh, t)?;
+    }
+    acc.frame_sync();
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+    // 트래픽 근사: 가중(1회 스트림) + 활성 xq 판독 + f32 출력.
+    let wbytes = (n_in * n_out) as f64 * 0.344;
+    let ab = (t * n_in) as f64 * 0.344 + (t * n_out) as f64 * 4.0;
+    let gbs = (wbytes + ab) / (ms * 1e6);
+    let (wmb, amb) = (wbytes / 1e6, ab / 1e6);
+    Ok(format!(
+        "dense-tile({tname} {n_in}x{n_out} t={t}): {ms:.3}ms · 가중 {wmb:.2}MB·액티 {amb:.2}MB · ~{gbs:.0}GB/s"
+    ))
+}
+
 pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
     let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";

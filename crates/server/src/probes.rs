@@ -192,6 +192,11 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
             llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
+        "vk-dense-tile" => {
+            let tname = args.first().cloned().unwrap_or_else(|| "blk.0.hc_attn_up.weight".into());
+            let t = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(512usize);
+            llm170_backend_gpu::rawvk::checks::dense_tile_time(&tname, t)
+        }
         "vk-moe-tile-check" => {
             let mode = args.first().cloned().unwrap_or_else(|| "q8_0".into());
             llm170_backend_gpu::rawvk::checks::moe_tile_type_check(&mode)
