@@ -197,6 +197,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawvk::checks::moe_tile_type_check(&mode)
         }
         "vk-llama-mmq" => llm170_backend_gpu::rawvk::checks::llama_mmq_check(),
+        "vk-cm8-probe" => llm170_backend_gpu::rawvk::checks::cm8_probe(),
         "vk-moe-cm-race" => llm170_backend_gpu::rawvk::checks::moe_cm_race_check(),
         "vk-ple-mt-check" => {
             let reps = args.first().and_then(|v| v.parse().ok()).unwrap_or(64usize);
