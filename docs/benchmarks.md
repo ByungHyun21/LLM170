@@ -1935,3 +1935,11 @@ for marginal gain (bandwidth-bound fraction dominant). GDN chunked
 (v1/v2) and quant LDS staging both measured negative — scan and strided
 quant stand. Every tail item is now either at its measured optimum or
 has a documented negative verdict.
+
+### GDN scan reduction interleave (plans/100 v3-lite, 2026-09-27) — neutral
+
+o = ⟨S_dec,Q⟩ + δ·⟨K,Q⟩ decomposition allows both subgroup reductions to
+start concurrently (3 interleaved shuffles per step). Measured 50.6 vs
+51.5ms — within noise: the kernel is load-latency bound (per its own
+history), not reduction-ILP bound. Reverted (avoids the summation-order
+class change for no gain).
