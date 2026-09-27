@@ -310,6 +310,7 @@ pub struct VkAcc {
     /// n_out배 증폭이라 GTT(host-visible)에서 3-4GB/s에 갇혔다 — L2 캐시가
     /// 동작하는 디바이스 메모리로 보낸다(값경로 xbuf 는 호스트 스테이징용 유지).
     xq_dev: Mutex<Option<VkBuf>>,
+    cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -487,7 +488,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ4kSg1, "moe_tile_q4k_sg1", FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
     (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
     (Slot::FnMoeTileQ4kMmq, "moe_tile_q4k_mmq", FN_MOE_TILE_Q4K_MMQ_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kCm8, "moe_tile_q4k_cm8", FN_MOE_TILE_Q4K_CM8_SPV, 13, 28),
+    (Slot::FnMoeTileQ4kCm8, "moe_tile_q4k_cm8", FN_MOE_TILE_Q4K_CM8_SPV, 16, 28),
     (Slot::FnMoeTileQ8mmq, "moe_tile_q8mmq", FN_MOE_TILE_Q8MMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ5kmmq, "moe_tile_q5kmmq", FN_MOE_TILE_Q5KMMQ_SPV, 13, 28),
     (Slot::FnMoeTileQ51mmq, "moe_tile_q51mmq", FN_MOE_TILE_Q51MMQ_SPV, 13, 28),
@@ -548,6 +549,7 @@ impl VkAcc {
             xfbuf: Mutex::new(None),
             xbuf: Mutex::new(None),
             xq_dev: Mutex::new(None),
+            cm8_scratch: Mutex::new((None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
             rbufs: Mutex::new(None),

@@ -567,6 +567,29 @@ impl llm170_core::matmul::FrameState for VkAcc {
             binds.push(rxb);
             binds.push(rpb);
             binds.push(ppb);
+            if slot == Slot::FnMoeTileQ4kCm8 {
+                // plans/99: 타일 SSBO 스크래치 — WG당 1KB(u8) + 512B(i8).
+                // (shared 소스 coopmat 로드가 다중 WG 동시성에서 부정확.)
+                let n_wg = (n_out.div_ceil(16) * bound.div_ceil(16)) as usize;
+                let (au, ai, aw) = {
+                    let mut g = self.cm8_scratch.lock();
+                    if g.0.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
+                        && g.1.as_ref().map(|b| b.bytes >= n_wg * 512).unwrap_or(false)
+                        && g.2.as_ref().map(|b| b.bytes >= n_wg * 1024).unwrap_or(false)
+                    {
+                        (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
+                    } else {
+                        let u = ctx.alloc(n_wg * 1024)?;
+                        let i = ctx.alloc(n_wg * 512)?;
+                        let w = ctx.alloc(n_wg * 1024)?;
+                        *g = (Some(u), Some(i), Some(w));
+                        (g.0.as_ref().unwrap().buf, g.1.as_ref().unwrap().buf, g.2.as_ref().unwrap().buf)
+                    }
+                };
+                binds.push(au);
+                binds.push(ai);
+                binds.push(aw);
+            }
             let ds2 = ctx.bind_ds(&p, &binds)?;
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[

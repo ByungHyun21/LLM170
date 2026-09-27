@@ -21,19 +21,23 @@ layout(binding = 9) buffer Obuf { float outv[]; };
 layout(binding = 10) readonly buffer Rx { uint rowexp[]; };
 layout(binding = 11) readonly buffer Rp { uint rows_pad[]; };
 layout(binding = 12) readonly buffer Pp { uint perm_pad[]; };
+layout(binding = 13) buffer Cm8Scratch { uint8_t sc8[]; };
+layout(binding = 14) buffer Cm8ScratchI { int8_t sc8i[]; };
+layout(binding = 15) buffer Cm8ScratchW { int scw[]; };
 layout(push_constant) uniform PC {
     uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words; uint xq_w; uint mode; uint rows;
 } pc;
 
-shared uint8_t sAu8a[16][16];  // sb 타일1(k 0..16): q 니블→u8
-shared uint8_t sAu8b[16][16];  // sb 타일2(k 16..32)
+// plans/99: 타일 원소는 SSBO 스크래치(WG 슬롯) — RADV에서 shared 소스
+// coopmat 로드가 다중 WG 동시성下 부정확(비결정적). 스케일류만 shared.
+// WG 슬롯 레이아웃: [A타일1 256][A타일2 256][B타일1 256][B타일2 256] = 1KB.
 shared float sAd[16];
 shared float sAm[16];
-shared int8_t sBi8a[16][16];   // sb 타일1(xq i8)
-shared int8_t sBi8b[16][16];   // sb 타일2
+
 shared float sBd[16];
 shared float sBsum[16];
-shared int sAcc32[16][16];     // qsum 스토어
+// sAcc32 → SSBO 스크래치(WG 슬롯 + 512B, i32 128개×2타일 병렬 불가 — 256개).
+#define ACC32(i) scw[wgslot/4u + uint(i)]  // wgslot은 바이트 — /4로 i32 기준
 shared float sAccF[16][16];    // f32 최종 누산
 
 float f16_exact(uint bits) {
@@ -64,6 +68,13 @@ void main() {
     uint row_words = uint(n_in >> 8) * 36u;
     uint ebase = e * (pc.per_expert_bytes >> 2);
     uint qw = uint(n_in >> 2);
+    // plans/99: 타일 SSBO 스크래치 뷰 — shared 소스 coopmat 로드가 다중 WG
+    // 동시성에서 부정확(RADV 비결정성)하여 연산 원소만 SSBO 슬롯으로.
+    uint wgslot = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 1024u;
+#define A0(i) sc8[wgslot + uint(i)]
+#define A1(i) sc8[wgslot + 256u + uint(i)]
+#define B0(i) sc8i[wgslot + uint(i)]
+#define B1(i) sc8i[wgslot + 256u + uint(i)]
 
     int live_cnt = 0;
     if (band_live) {
@@ -101,16 +112,16 @@ void main() {
                 // (w>>4j)&0xF 이중 추출이 was 버그 — 0 교대 패턴의 원인).
                 w = hi ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
                 if (p < 4) {
-                    sAu8a[m][p * 4 + 0] = uint8_t(w & 0xFFu);
-                    sAu8a[m][p * 4 + 1] = uint8_t((w >> 8) & 0xFFu);
-                    sAu8a[m][p * 4 + 2] = uint8_t((w >> 16) & 0xFFu);
-                    sAu8a[m][p * 4 + 3] = uint8_t((w >> 24) & 0xFFu);
+                    A0(m * 16 + p * 4 + 0) = uint8_t(w & 0xFFu);
+                    A0(m * 16 + p * 4 + 1) = uint8_t((w >> 8) & 0xFFu);
+                    A0(m * 16 + p * 4 + 2) = uint8_t((w >> 16) & 0xFFu);
+                    A0(m * 16 + p * 4 + 3) = uint8_t((w >> 24) & 0xFFu);
                 } else {
                     int q4 = p - 4;
-                    sAu8b[m][q4 * 4 + 0] = uint8_t(w & 0xFFu);
-                    sAu8b[m][q4 * 4 + 1] = uint8_t((w >> 8) & 0xFFu);
-                    sAu8b[m][q4 * 4 + 2] = uint8_t((w >> 16) & 0xFFu);
-                    sAu8b[m][q4 * 4 + 3] = uint8_t((w >> 24) & 0xFFu);
+                    A1(m * 16 + q4 * 4 + 0) = uint8_t(w & 0xFFu);
+                    A1(m * 16 + q4 * 4 + 1) = uint8_t((w >> 8) & 0xFFu);
+                    A1(m * 16 + q4 * 4 + 2) = uint8_t((w >> 16) & 0xFFu);
+                    A1(m * 16 + q4 * 4 + 3) = uint8_t((w >> 24) & 0xFFu);
                 }
                 if (p == 0) {
                     float d = f16_exact(w0c[wq4] & 0xFFFFu);
@@ -130,8 +141,8 @@ void main() {
                 }
             } else {
                 for (int b = 0; b < 4; b++) {
-                    sAu8a[m][p * 4 + b] = uint8_t(0);
-                    sAu8b[m][p * 4 + b] = uint8_t(0);
+                    A0(m * 16 + p * 4 + b) = uint8_t(0);
+                    A1(m * 16 + p * 4 + b) = uint8_t(0);
                 }
                 if (p == 0) { sAd[m] = 0.0; sAm[m] = 0.0; }
             }
@@ -144,15 +155,15 @@ void main() {
                 uint pr_ = perm_pad[uint(r0e + rb)];
                 uint base = (pr_ == 0xFFFFFFFFu ? 0u : pr_) * pc.xq_w;
                 uint w = xq[base + uint(sb * 8 + p)];
-                sBi8a[rb][p * 4 + 0] = int8_t(w & 0xFFu);
-                sBi8a[rb][p * 4 + 1] = int8_t((w >> 8) & 0xFFu);
-                sBi8a[rb][p * 4 + 2] = int8_t((w >> 16) & 0xFFu);
-                sBi8a[rb][p * 4 + 3] = int8_t(w >> 24);
+                B0(rb * 16 + p * 4 + 0) = int8_t(w & 0xFFu);
+                B0(rb * 16 + p * 4 + 1) = int8_t((w >> 8) & 0xFFu);
+                B0(rb * 16 + p * 4 + 2) = int8_t((w >> 16) & 0xFFu);
+                B0(rb * 16 + p * 4 + 3) = int8_t(w >> 24);
                 uint w2 = xq[base + uint(sb * 8 + 4u + p)];
-                sBi8b[rb][p * 4 + 0] = int8_t(w2 & 0xFFu);
-                sBi8b[rb][p * 4 + 1] = int8_t((w2 >> 8) & 0xFFu);
-                sBi8b[rb][p * 4 + 2] = int8_t((w2 >> 16) & 0xFFu);
-                sBi8b[rb][p * 4 + 3] = int8_t(w2 >> 24);
+                B1(rb * 16 + p * 4 + 0) = int8_t(w2 & 0xFFu);
+                B1(rb * 16 + p * 4 + 1) = int8_t((w2 >> 8) & 0xFFu);
+                B1(rb * 16 + p * 4 + 2) = int8_t((w2 >> 16) & 0xFFu);
+                B1(rb * 16 + p * 4 + 3) = int8_t(w2 >> 24);
                 if (p == 0) {
                     sBd[rb] = uintBitsToFloat(xq[base + qw + uint(sb)]);
                     uint qsb = qw + (uint(n_in) >> 5);
@@ -161,35 +172,37 @@ void main() {
                 }
             } else {
                 for (int b = 0; b < 4; b++) {
-                    sBi8a[rb][p * 4 + b] = int8_t(0);
-                    sBi8b[rb][p * 4 + b] = int8_t(0);
+                    B0(rb * 16 + p * 4 + b) = int8_t(0);
+                    B1(rb * 16 + p * 4 + b) = int8_t(0);
                 }
                 if (p == 0) { sBd[rb] = 0.0; sBsum[rb] = 0.0; }
             }
         }
         memoryBarrierShared();
+        memoryBarrierBuffer();
         barrier();
 
         // ── MMA(coopmat) — WG=서브그룹1, K32 = 16×2 타일.
         acc32 = coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
         if (pc.mode != 2u) {
-            coopMatLoad(ma0, sAu8a[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(mb0, sBi8a[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(ma0, sc8, wgslot, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb0, sc8i, wgslot, 16, gl_CooperativeMatrixLayoutColumnMajor);
             acc32 = coopMatMulAdd(ma0, mb0, acc32);
         }
         if (pc.mode != 3u) {
-            coopMatLoad(ma1, sAu8b[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(mb1, sBi8b[0], 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(ma1, sc8, wgslot + 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mb1, sc8i, wgslot + 256u, 16, gl_CooperativeMatrixLayoutColumnMajor);
             acc32 = coopMatMulAdd(ma1, mb1, acc32);
         }
-        coopMatStore(acc32, sAcc32[0], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc32, scw, wgslot / 4u, 16, gl_CooperativeMatrixLayoutRowMajor);
+        memoryBarrierShared();
         barrier();
         // ── 스케일: 레인당 8원소.
         for (int i = 0; i < 8; i++) {
             int idx = int(tid) * 8 + i;
             int m = idx >> 4;
             int r = idx & 15;
-            sAccF[m][r] += sBd[r] * (sAd[m] * float(sAcc32[m][r]) - sAm[m] * sBsum[r]);
+            sAccF[m][r] += sBd[r] * (sAd[m] * float(scw[wgslot / 4u + uint(m * 16 + r)]) - sAm[m] * sBsum[r]);
         }
         barrier();
     }
@@ -201,18 +214,18 @@ void main() {
             // sb=0 덤프: A 니블 32 + B 바이트 32 (outv[10..74]).
             if (sDumpA0 >= 0) {
                 for (int i = 0; i < 16; i++) {
-                    outv[10 + i] = float(sAu8a[0][i]);
-                    outv[26 + i] = float(sAu8b[0][i]);
-                    outv[42 + i] = float(sBi8a[0][i]);
-                    outv[58 + i] = float(sBi8b[0][i]);
+                    outv[10 + i] = float(A0(i));
+                    outv[26 + i] = float(A1(i));
+                    outv[42 + i] = float(B0(i));
+                    outv[58 + i] = float(B1(i));
                 }
             }
             outv[0] = sAd[0]; outv[1] = sAm[0];
             outv[2] = sBd[0]; outv[3] = sBsum[0];
-            outv[4] = float(sAcc32[0][0]);
-            outv[5] = sAu8a[0][0] + sAu8a[0][15];  // u8 산출
+            outv[4] = float(scw[wgslot / 4u]);
+            outv[5] = float(A0(0)) + float(A0(15));  // u8 산출
             outv[6] = sAccF[0][0];
-            outv[7] = float(sBi8a[0][0]);
+            outv[7] = float(B0(0));
         }
         return;
     }
