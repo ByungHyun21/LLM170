@@ -1978,3 +1978,11 @@ verdict complete. pp4096: 358.8 t/s (long-context band holds).
 
 **424.6 t/s** (1205.8 ms) — cache maturation continues: 410→416→421→422→424.
 Session peak now **+89%** over baseline.
+
+### 2026-09-27 심야 — coopmat 재개방 아크(원장 46-48)
+
+- 게이트 PASS · pp512 **415.3 t/s**(기본 v5 경로) · HEAD `cm8b 커밋 후`
+- i8 coopmat 판정 뒤집힘: 원시 프리미티브 완전 준수(4096WG 0% 불일치)
+- cm8/cm8b MMQ ★ 정확화 — 단 v5 대비 14~43배 열세(SSBO 왕복 bound)
+  - 타일 타이밍: v5 0.91ms · cm8 38.95ms · cm8b 13.12ms
+- 세션 피크 424.6 t/s 유지 · 밴드 406-415
