@@ -56,6 +56,9 @@ pub struct VkCtx {
     pub replay_mode: std::cell::Cell<bool>,
     /// plans/93: 커맨드 버퍼 녹화 완료 플래그(재생 모드 진입 판정).
     pub batch_recorded: std::cell::Cell<bool>,
+    /// 107 W1.5-2 — 스텝 타임라인: 배치 녹화 시작 시각(프레임 경계
+    /// 갭 = 녹화·제출·대기 분해 계측).
+    pub batch_t0: std::cell::Cell<Option<std::time::Instant>>,
     /// plans/88 P1 — 제출(큐 submit) 횟수 카운터: 스텝 배치가 실제로 묶고
     /// 있는지 [ts] 보고에 노출. 비배치 run 1회 = 제출 1회.
     pub submits: std::cell::Cell<u64>,
@@ -288,6 +291,7 @@ impl VkCtx {
                 nobar_next: std::cell::Cell::new(false),
                 replay_mode: std::cell::Cell::new(false),
                 batch_recorded: std::cell::Cell::new(false),
+                batch_t0: std::cell::Cell::new(None),
                 since_r: std::cell::RefCell::new(std::collections::HashSet::new()),
                 since_w: std::cell::RefCell::new(std::collections::HashSet::new()),
                 dep_unknown: std::cell::Cell::new(false),
@@ -443,6 +447,7 @@ impl VkCtx {
         }
         self.batching
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.batch_t0.set(Some(std::time::Instant::now()));
         // plans/104 — 배치 간 프로브 상태 승계 방지.
         self.since_r.borrow_mut().clear();
         self.since_w.borrow_mut().clear();
@@ -555,6 +560,16 @@ impl VkCtx {
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .map_err(|e| format!("대기2: {e:?}"))?;
             WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
+            // 107 W1.5-2 — 스텝 타임라인: 프레임 경계 갭 분해(VK_TS 게이팅).
+            // ts 슬롯표는 커널 내부만 보임 — 여기가 호스트 녹화·대기 가시점.
+            if self.ts.is_some()
+                && let Some(t0) = self.batch_t0.take()
+            {
+                let ops = RUN_N.with(|c| c.replace(0));
+                let rec = _sub0.duration_since(t0).as_secs_f64() * 1e3;
+                let wait = _wt0.elapsed().as_secs_f64() * 1e3;
+                eprintln!("[stepT] ops={ops} rec={rec:.2}ms wait={wait:.2}ms");
+            }
             // 배치 세트 전량 해제 (풀 재사용) — 재생 모드에서는 참조 유지.
             if !replaying && let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
