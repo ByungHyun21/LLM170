@@ -266,7 +266,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 break;
             };
             // 접두 캐시 — cached 전체가 새 프롬프트의 접두면 이어서 프리필.
-            let prefix_ok = llm170_diag::flag::on("LLM170_NO_PREFIX") == false;
+            let prefix_ok = !llm170_diag::flag::on("LLM170_NO_PREFIX");
             let pick = (0..n_slots)
                 .filter(|&i| slots[i].job.is_none())
                 .map(|i| {
@@ -600,7 +600,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         .zip(j.tokens.iter())
                         .take_while(|(a, b)| a == b)
                         .count();
-                    let reuse = if llm170_diag::flag::on("LLM170_NO_PREFIX") == false
+                    let reuse = if !llm170_diag::flag::on("LLM170_NO_PREFIX")
                         && l > 0
                         && l == slots[0].cached.len()
                         && j.tokens.len() > l
@@ -679,7 +679,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             }
             let mut full = j.tokens.clone();
             full.extend(toks);
-            if llm170_diag::flag::on("LLM170_NO_PREFIX") == false {
+            if !llm170_diag::flag::on("LLM170_NO_PREFIX") {
                 s.cached = full;
             } else {
                 eng.reset_seq(i);
