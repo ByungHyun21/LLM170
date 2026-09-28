@@ -67,7 +67,7 @@ cargo build --release
 cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --gpu-runtime hip
 
 # HTTP server (OpenAI-compatible)
-cargo run --release -- serve --model <model.gguf> --port 8080 --backend gpu
+cargo run --release -- serve --model <model.gguf> --port 8080 --slots 4 --backend gpu   # --slots N: continuous batching (default 1)
 
 # Benchmark
 cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --np 4 --gpu-runtime hip
