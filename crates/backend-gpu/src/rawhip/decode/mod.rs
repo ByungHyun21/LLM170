@@ -343,8 +343,8 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<Vec<f32>>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        let r = ds.step_batch_np(seqs, poss, emb);
-        r
+
+        ds.step_batch_np(seqs, poss, emb)
     }
 
     fn mtp_step_chain(&self, seq: usize, tok_emb: &[f32], pos: usize) -> Result<u32, String> {
@@ -378,8 +378,8 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<u32>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        let r = ds.step_batch_np_greedy(seqs, poss, emb);
-        r
+
+        ds.step_batch_np_greedy(seqs, poss, emb)
     }
 
     fn mtp_step_gpu(

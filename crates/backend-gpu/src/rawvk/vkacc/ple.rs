@@ -248,7 +248,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         n: usize,
         hc: usize,
     ) -> Result<(), String> {
-        if n % 32 != 0 {
+        if !n.is_multiple_of(32) {
             return Err("emb_q8g: n%32 != 0".into());
         }
         let t = tokens.len();
@@ -343,7 +343,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         let p = self.pipeline(&mut ctx, Slot::FnPleGather)?;
         let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
         let push = push_u32s(&[hd as u32, nrows as u32]);
-        let blocks_per_row = (hd + 31) / 32;
+        let blocks_per_row = hd.div_ceil(32);
         let total = nrows * blocks_per_row;
         ctx.run(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1)?;
         Ok(())

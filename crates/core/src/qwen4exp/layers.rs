@@ -93,7 +93,6 @@ pub struct PlePrefetched {
     pub emb: Vec<f32>,
 }
 
-
 /// 프레임 버퍼의 토큰 상한 — 프리필 청크와 동일(디코드 t=1 포함).
 /// 512 상한: t_max 버퍼는 청크에 비례하고(≈0.8 GB @512), 1024는 실측
 /// hipMalloc OOM이었다. 값 경로 청크(1024)와 독립.
@@ -219,11 +218,7 @@ impl Engine4 {
         Ok(())
     }
 
-    fn forward_timed(
-        &mut self,
-        seq: usize,
-        tokens: &[u32],
-    ) -> Result<Vec<f32>, Q4Error> {
+    fn forward_timed(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
         profile_span!("q4::forward");
         macro_rules! stage {
             ($field:ident, $body:expr) => {
@@ -791,7 +786,7 @@ impl Engine4 {
                 model: &self.model,
                 acc: Some(acc),
             };
-            let r2 = super::frame::frame_forward_np_greedy(
+            super::frame::frame_forward_np_greedy(
                 acc,
                 &self.model,
                 &ctx,
@@ -799,8 +794,7 @@ impl Engine4 {
                 &mut self.seqs,
                 f,
                 tokens,
-            );
-            r2
+            )
         })();
         if std::env::var_os("LLM170_NP_TIME").is_some() {
             eprintln!(
@@ -906,7 +900,7 @@ impl Engine4 {
                 f,
                 token,
             );
-            let r3 = if cap_step {
+            if cap_step {
                 match acc.graph_capture_end() {
                     Err(e) => {
                         eprintln!("# graph(frame): 캡처 실패 — 정상 경로 유지 ({e})");
@@ -941,8 +935,7 @@ impl Engine4 {
                     self.graph_step += 1;
                 }
                 r0
-            };
-            r3
+            }
         })();
         match r {
             Ok(tok) => {
@@ -1242,7 +1235,6 @@ fn hc_combine(res_hc: &mut [Vec<f32>], out: &[Vec<f32>], inject: &[Vec<f32>], hc
         }
     }
 }
-
 
 #[cfg(test)]
 mod forward_tests {
