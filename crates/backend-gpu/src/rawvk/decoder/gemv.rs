@@ -55,13 +55,12 @@ impl DecoderState {
         if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.split_ctr += 1;
             if self.split_ctr
-                >= std::env::var("LLM170_VK_SPLIT")
-                    .ok()
+                >= llm170_diag::flag::val("LLM170_VK_SPLIT")
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2048)
             {
                 self.split_ctr = 0;
-                if std::env::var_os("LLM170_DBG_REC").is_some() {
+                if llm170_diag::flag::on("LLM170_DBG_REC") {
                     let td = std::time::Instant::now();
                     self.ctx.end_batch_wait()?;
                     self.dbg_drain_ms += td.elapsed().as_secs_f64() * 1e3;
@@ -150,7 +149,7 @@ impl DecoderState {
         t: usize,
         bar: bool,
     ) -> Result<(), String> {
-        if std::env::var_os("LLM170_DBG_G8").is_some() {
+        if llm170_diag::flag::on("LLM170_DBG_G8") {
             eprintln!("[dbg_g8] t={t} {wkey}");
         }
         let (wbufs, ty, ni, no) = self
@@ -184,11 +183,7 @@ impl DecoderState {
         // 가중 1회 판독·WG 수 1/t(종전 z=t는 토큰당 가중 전량 재판독 —
         // np4 스텝이 가중 대역폭 붕괴로 273ms까지 늘어난 주벚, 실측).
         // 산술은 각 *_b 판과 행×토큰 비트 동일. LLM170_VK_NPT=0 옵트아웃.
-        if (2..=4).contains(&t)
-            && std::env::var("LLM170_VK_NPT")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        {
+        if (2..=4).contains(&t) && llm170_diag::flag::ne0("LLM170_VK_NPT") {
             let (nm, spv, nkb): (&str, &[u8], u32) = match ty {
                 13 => ("gemv8t_q5", GEMV8T_Q5_SPV, 10),
                 12 => ("gemv8t_q4", GEMV8T_Q4_SPV, 10),
@@ -509,9 +504,7 @@ impl DecoderState {
         // 사용, 가중 WG당 1회 판독(그리드 z=토큰블록×8 — 서로 다른 z가 같은 행을
         // 동시에 읽어 L2 병합). coopmat 타일 대신 gemv8 접근의 f32 누산.
         if t >= 2
-            && std::env::var("LLM170_VK_Q5N")
-                .map(|v| v == "1")
-                .unwrap_or(false)
+            && llm170_diag::flag::eq1("LLM170_VK_Q5N")
             && let Some((wbufs2, ty2, ni2, no2)) = self.w.get(wkey).cloned()
             && ty2 == 13
         {
@@ -538,9 +531,7 @@ impl DecoderState {
         }
         // plans/46 f16-B: q5 프리필을 f16 활성 직독 타일로 (quant f16화 + load_b 직독).
         if t >= 16
-            && std::env::var("LLM170_VK_F16B")
-                .map(|v| v == "1")
-                .unwrap_or(false)
+            && llm170_diag::flag::eq1("LLM170_VK_F16B")
             && let Some((wbufs2, ty2, ni2, _no2)) = self.w.get(wkey).cloned()
             && ty2 == 13
         {
@@ -599,10 +590,10 @@ impl DecoderState {
             .get(wkey)
             .cloned()
             .ok_or(format!("가중치 없음: {wkey}"))?;
-        if std::env::var_os("LLM170_DBG_TILE").is_some() {
+        if llm170_diag::flag::on("LLM170_DBG_TILE") {
             eprintln!("[dbg_tile] t={t} ty={ty} no={no} {wkey}");
         }
-        let tile_min: usize = if std::env::var_os("LLM170_VK_TILE1").is_some() {
+        let tile_min: usize = if llm170_diag::flag::on("LLM170_VK_TILE1") {
             1
         } else {
             16
@@ -671,7 +662,7 @@ impl DecoderState {
             .get(wkey)
             .cloned()
             .ok_or(format!("가중치 없음: {wkey}"))?;
-        if std::env::var_os("LLM170_VK_SHAPES").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_SHAPES") {
             eprintln!(
                 "[shape] {wkey} ty={ty} ni={ni} no={no} gx={}",
                 no.div_ceil(128)
@@ -795,11 +786,7 @@ impl DecoderState {
                 return Ok(());
             }
             // tile128o (점유 변형, plans/39): 64토큰/1-sb/LDS 29.7KB → 2 WG/CU
-            if ty == 13
-                && std::env::var("LLM170_TILE_OCC")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-            {
+            if ty == 13 && llm170_diag::flag::eq1("LLM170_TILE_OCC") {
                 for tb in (0..t).step_by(64) {
                     let nt = (t - tb).min(64) as u32;
                     let last = tb + 64 >= t && bar;
@@ -1142,8 +1129,8 @@ impl DecoderState {
         t: usize,
         jobs: &[(String, vk::Buffer, vk::Buffer)],
     ) -> Result<(), String> {
-        let g8 = t < 16 && std::env::var("LLM170_G8").map(|v| v != "0").unwrap_or(true);
-        let i8_on = t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some();
+        let g8 = t < 16 && llm170_diag::flag::ne0("LLM170_G8");
+        let i8_on = t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON");
         let v2 = std::env::var("LLM170_VK_I8")
             .map(|v| v == "2")
             .unwrap_or(false);

@@ -25,9 +25,7 @@ impl DecoderState {
         let conv_len = (conv_k - 1) * conv_ch;
         // plans/30 q3q8 옵트인: 소유 사본 재팩을 먼저 수행하고 모든 소비자는
         // 최종 뷰(weights_final)를 본다 (기본 경로는 mmap 빌림 그대로 — 클론 0).
-        let q3q8 = std::env::var("LLM170_VK_Q3Q8")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let q3q8 = llm170_diag::flag::eq1("LLM170_VK_Q3Q8");
         let mut weights_owned: Option<Vec<(String, Vec<u8>, u32, usize, usize)>> = if q3q8 {
             Some(
                 weights
@@ -98,9 +96,7 @@ impl DecoderState {
         // f16 사전 디양자화 캐시 (plans/39) — 데이터 복제 없음(대여만):
         // 디양자화를 가중 업로드 루프 앞에서 수행 (RCA: .cloned() 전체복제가
         // 30Gi 호스트 RAM을 초과해 OOM·세션 사망의 원인이었음).
-        let f16w_on = std::env::var("LLM170_VK_F16W")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let f16w_on = llm170_diag::flag::eq1("LLM170_VK_F16W");
         let f16w_max = std::env::var("LLM170_VK_F16W_MAX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
@@ -207,9 +203,7 @@ impl DecoderState {
 
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
-        let kv8 = std::env::var("LLM170_VK_KV8")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let kv_store: usize = if kv8 { kv_len / 32 * 34 } else { kv_len * 4 };
         let zeros_kv = vec![0u8; kv_store];
         let mut kv_k = Vec::with_capacity(n_full);
@@ -517,7 +511,7 @@ impl DecoderState {
             ctx,
             max_ssbo: max_ssbo0,
             ktimes: std::collections::HashMap::new(),
-            ktime: std::env::var_os("LLM170_VK_KTIME").is_some(),
+            ktime: llm170_diag::flag::on("LLM170_VK_KTIME"),
             dbg_drain_ms: 0.0,
             kkey: std::cell::RefCell::new(None),
             w,

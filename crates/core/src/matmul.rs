@@ -900,7 +900,6 @@ pub enum FrameOp {
         out: u64,
         hc: usize,
         n: usize,
-
     },
     /// hc combine: res += out·(2·σ(inj/hc)).
     HcCombine {

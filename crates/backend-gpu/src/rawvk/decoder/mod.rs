@@ -317,9 +317,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     /// 정확(tokens 불변 실측)하고 가중 판독이 1회로 줄어 빠름 — 512 승인.
     /// 구 패밀리 옵트아웃(MSALL=0) 시에는 64 유지.
     fn tile_big_chunk(&self) -> bool {
-        std::env::var("LLM170_TILE_MSALL")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        llm170_diag::flag::ne0("LLM170_TILE_MSALL")
     }
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
@@ -344,7 +342,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
             let tw = std::time::Instant::now();
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);
-            if std::env::var_os("LLM170_DBG_WALL").is_some() {
+            if llm170_diag::flag::on("LLM170_DBG_WALL") {
                 eprintln!(
                     "#  batch t={} wall={:.1}ms",
                     ch.len() / n,
@@ -648,10 +646,7 @@ pub fn inject(eng: &mut llm170_core::qwen35::Engine) -> Result<(), String> {
     eng.raw_decode = Some(rd);
     // plans/40: 가중은 이제 VRAM에만 상주 — mmap 클린 페이지를 커널에 반납해
     // 호스트 RSS를 emb/소형 상수 수준으로. LLM170_VK_KEEPW=1이면 유지(CPU 디버그).
-    if std::env::var("LLM170_VK_KEEPW")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if llm170_diag::flag::eq1("LLM170_VK_KEEPW") {
         eprintln!("[vk] 가중 mmap 페이지 유지 (LLM170_VK_KEEPW=1)");
     } else {
         let t0 = std::time::Instant::now();

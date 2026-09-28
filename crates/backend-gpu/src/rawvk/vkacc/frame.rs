@@ -231,10 +231,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             return Ok(());
         }
         // plans/100: 청크 병렬(WY) — 옵트인 LLM170_VK_GDNCH=1(클래스 변경).
-        if std::env::var("LLM170_VK_GDNCH")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
+        if llm170_diag::flag::eq1("LLM170_VK_GDNCH") {
             let p = self.pipeline(&mut ctx, Slot::FnGdnChunk)?;
             let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
             let csize = 64usize;
@@ -423,17 +420,13 @@ impl VkAcc {
         let xq_w = xq_words(n_in);
         // plans/89 P1.2 — ids dmmv 판이 이 호출을 가져갈 거면 xq 양자화 자체가
         // 불필요(f32 직결). 아래 조건은 ids2 분기와 동일해야 한다.
-        let ids2_takes = rows > 0
-            && (t == 1 || rows <= 64)
-            && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
+        let ids2_takes =
+            rows > 0 && (t == 1 || rows <= 64) && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
         // plans/105(원장 80): 팩 등록 히트 — 상위 정량 스킵(llmmq가 팩 소비).
         let pack_skip_quant = w.ty == GgmlType::Q4K && self.packbufs.lock().0.contains_key(&x);
         let xq = if ids2_takes || pack_skip_quant {
             vk::Buffer::null()
-        } else if std::env::var("LLM170_VK_Q4KSG1F")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
+        } else if llm170_diag::flag::eq1("LLM170_VK_Q4KSG1F") {
             // plans/93: sg1f은 f32 직결 — quant 스킵, f32 버퍼를 그대로 패스.
             xb
         } else {
@@ -520,7 +513,7 @@ impl VkAcc {
                 GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q5_1 | GgmlType::Q8_0
             )
         {
-            if std::env::var_os("LLM170_MOE_IDS_DBG").is_some() {
+            if llm170_diag::flag::on("LLM170_MOE_IDS_DBG") {
                 eprintln!("[moeids] ty={ty} rows={rows} t={t} n_in={n_in} n_out={n_out}");
             }
             // plans/89 P0.3 — ids dmmv 판 우선: llama dmmv 기하(64스레드·2행·
@@ -699,10 +692,7 @@ impl VkAcc {
                 };
                 let dsg = ctx.bind_ds(&pg, &[idb, ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
                 // plans/93 sg2: 32행/WG 판은 전문가 패딩도 32배수여야 경계 정렬.
-                let padmul: u32 = if std::env::var("LLM170_VK_PAD32")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
+                let padmul: u32 = if llm170_diag::flag::eq1("LLM170_VK_PAD32") {
                     32
                 } else {
                     16
@@ -727,7 +717,7 @@ impl VkAcc {
                     gi.ids_h = ids;
                     gi.bound = gi.bound.max(bound);
                 }
-                if std::env::var_os("LLM170_MOE_GCHECK").is_some() {
+                if llm170_diag::flag::on("LLM170_MOE_GCHECK") {
                     // 진단: 그룹 테이블 불변식 검증(전문가 내 순서는 atomic이라
                     // 비결정 — 순서 무관 불변식으로 판정).
                     ctx.end_batch_wait()?;
@@ -754,10 +744,7 @@ impl VkAcc {
                     let mut hpoff = vec![0usize; ne + 1];
                     // plans/93 sg2: 32행/WG 판은 전문가 경계가 32 배수여야 —
                     // WG가 두 전문가를 가로지르면 rowexp[0]의 가중치로 오계산.
-                    let padmul = if std::env::var("LLM170_VK_PAD32")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                    {
+                    let padmul = if llm170_diag::flag::eq1("LLM170_VK_PAD32") {
                         32
                     } else {
                         16
@@ -959,16 +946,12 @@ impl VkAcc {
             }
             // plans/96 G2: 직접산란 타일(기본 4종+v3)은 출력을 ob에 직접 —
             // 스캐터(permute_f32) 폐지. 레거시 슬롯은 종전 yg+스캐터.
-            let direct = matches!(
-                slot,
-                    | Slot::FnMoeTileQ51Sg1
-                    | Slot::FnMoeTileQ8
-                    | Slot::FnMoeTileQ5k
-                    | Slot::FnMoeTileQ4kMmq
-                    | Slot::FnMoeTileQ8mmq
-                    | Slot::FnMoeTileQ5kmmq
-                    | Slot::FnMoeTileQ51mmq
-            );
+            let direct = matches!(slot, |Slot::FnMoeTileQ51Sg1| Slot::FnMoeTileQ8
+                | Slot::FnMoeTileQ5k
+                | Slot::FnMoeTileQ4kMmq
+                | Slot::FnMoeTileQ8mmq
+                | Slot::FnMoeTileQ5kmmq
+                | Slot::FnMoeTileQ51mmq);
             binds.push(xq);
             binds.push(if direct { ob } else { ygb });
             binds.push(rxb);
@@ -1127,7 +1110,7 @@ impl VkAcc {
         let wbufs = self.weight_bufs(&mut ctx, w)?;
         let per_expert = w.data.len() / ne;
         // plans/86 §1b 진단 — 전문가 오프셋/청크 기하 (LLM170_MOE_SYNC=1).
-        if std::env::var_os("LLM170_MOE_SYNC").is_some() {
+        if llm170_diag::flag::on("LLM170_MOE_SYNC") {
             let sizes: Vec<usize> = {
                 let wc = self.wcache.lock();
                 wc.get(&(w.data.as_ptr() as usize, w.data.len()))

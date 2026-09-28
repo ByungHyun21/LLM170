@@ -41,9 +41,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     /// plans/86 §8 — 프레임 경로 완성(§1 정확성·§2 QSA 디바이스화·§5 성능) 후
     /// 기본 ON. 킬스위치 LLM170_VK_FRAME=0.
     fn frame_capable(&self) -> bool {
-        std::env::var("LLM170_VK_FRAME")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        llm170_diag::flag::ne0("LLM170_VK_FRAME")
     }
     /// plans/85 §2 — 프레임 로짓 행별 argmax: fn_argmax_rows 2단 판.
     /// 동률 최저 인덱스 — CPU greedy_from과 동일 의미. 미구현이면 greedy
@@ -274,9 +272,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let rows = w_reps * t_cur;
                 // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
                 // 32스레드 원판(산술 그대로, 실측 우위).
-                let resf16 = std::env::var("LLM170_VK_RESF16")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+                let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
                 let slot = if rows >= 2 {
                     if resf16 {
                         Slot::RmsWideF16
@@ -335,9 +331,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let glu = *self.moe_glu.lock();
                 let fused = t_now >= 2
                     && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
-                    && std::env::var("LLM170_VK_SILUQ")
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
+                    && llm170_diag::flag::ne0("LLM170_VK_SILUQ");
                 if fused {
                     let (_, n_in) = glu.unwrap();
                     let rows = n / n_in;
@@ -522,9 +516,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
                 let tn = n * t_cur;
                 // plans/103: res_hc f16 버스 — RMW 변형 슬롯(페어 소유).
-                let resf16 = std::env::var("LLM170_VK_RESF16")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+                let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
                 let slot = if resf16 {
                     Slot::HcCombineF16
                 } else {
@@ -819,7 +811,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
         let t = xs.len();
-        if std::env::var_os("LLM170_VK_MBDBG").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_MBDBG") {
             eprintln!(
                 "[mb] ty={:?} n_in={} n_out={} t={}",
                 w.ty, w.n_in, w.n_out, t
@@ -840,9 +832,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
             && std::env::var_os("LLM170_VK_MBTILE")
                 .map(|v| v != "0")
                 .unwrap_or(true)
-            && std::env::var("LLM170_VK_CM")
-                .map(|v| v != "0")
-                .unwrap_or(true)
+            && llm170_diag::flag::ne0("LLM170_VK_CM")
         {
             let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -969,9 +959,7 @@ impl VkAcc {
         // plans/93: F32 가중 → Q8_0 로드 시 변환(env 게이트 LLM170_F32Q8=1).
         // tile_f32 347ms → tile_q8128 경로(~115ms): 가중 판독 4× 절감.
         // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
-        let do_f32q8 = std::env::var("LLM170_F32Q8")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        let do_f32q8 = llm170_diag::flag::eq1("LLM170_F32Q8")
             && ws.iter().any(|w| w.ty == llm170_gguf::GgmlType::F32);
         // plans/93: 변환 캐시 — 가중(ptr,len)마다 1회 변환, 이후 Arc 클론.
         // 소유권: Arc<Vec<u8>>가 살아있는 동안 슬라이스 유효 (conv_arcs가 보유).
@@ -1040,7 +1028,7 @@ impl VkAcc {
             } else {
                 self.xq_dev_buf(&mut ctx, t * xq_w * 4)?
             };
-                let p = self.pipeline(&mut ctx, Slot::Quant)?;
+            let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
             ctx.run_rw(
@@ -1059,13 +1047,7 @@ impl VkAcc {
             vk::Buffer::null()
         };
         let mut mmgrp_skip: Vec<bool> = vec![false; ws.len()];
-        if t < 16
-            && std::env::var("LLM170_VK_MMBGRP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-            && !ws.is_empty()
-            && ws.len() <= 8
-        {
+        if t < 16 && llm170_diag::flag::ne0("LLM170_VK_MMBGRP") && !ws.is_empty() && ws.len() <= 8 {
             let dty0 = dense_ty(ws[0].ty);
             let single_chunk: Vec<bool> = ws
                 .iter()
@@ -1142,7 +1124,7 @@ impl VkAcc {
         for w in ws {
             if vk_ty(w.ty).is_none() && dense_ty(w.ty).is_none() {
                 need_pullback = true;
-                if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                if llm170_diag::flag::on("LLM170_F32S_TRACE") {
                     eprintln!(
                         "[pullbk] n_in={n_in} ty={:?}",
                         ws.iter().map(|w| w.ty).collect::<Vec<_>>()
@@ -1152,7 +1134,7 @@ impl VkAcc {
             }
         }
         if need_pullback {
-            if std::env::var_os("LLM170_VK_PULLDBG").is_some() {
+            if llm170_diag::flag::on("LLM170_VK_PULLDBG") {
                 eprintln!(
                     "[pull] n_in={n_in} tys={:?}",
                     ws.iter().map(|w| format!("{:?}", w.ty)).collect::<Vec<_>>()
@@ -1191,7 +1173,7 @@ impl VkAcc {
             let wbufs = self.weight_bufs(&mut ctx, w)?;
             match vk_ty(w.ty) {
                 Some(ty) => {
-                    if std::env::var_os("LLM170_VK_MMDBG").is_some() {
+                    if llm170_diag::flag::on("LLM170_VK_MMDBG") {
                         eprintln!(
                             "[mm] ty={ty} n_in={n_in} n_out={n_out} t={t} bytes={}",
                             w.data.len()
@@ -1206,9 +1188,7 @@ impl VkAcc {
                     // 2행 WG. [ts] 기준선 gemv 77ms/step — 272-329GB/s급으로
                     // 기대. 킬스위치 LLM170_VK_G8=0(종전 quant+gemv3).
                     if t < 16
-                        && std::env::var("LLM170_VK_G8")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
+                        && llm170_diag::flag::ne0("LLM170_VK_G8")
                         && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)?
                     {
                         continue;
@@ -1231,12 +1211,8 @@ impl VkAcc {
                         // 25GB/s) 대체. 킬스위치 구조 — opt-in =1.
                         if t >= 2
                             && w.ty == GgmlType::Q8_0
-                            && (std::env::var("LLM170_VK_Q8D")
-                                .map(|v| v == "1")
-                                .unwrap_or(false)
-                                || std::env::var("LLM170_VK_Q8MMQ")
-                                    .map(|v| v == "1")
-                                    .unwrap_or(false))
+                            && (llm170_diag::flag::eq1("LLM170_VK_Q8D")
+                                || llm170_diag::flag::eq1("LLM170_VK_Q8MMQ"))
                         {
                             let key = (w.data.as_ptr() as usize, w.data.len());
                             let w8 = {
@@ -1258,9 +1234,7 @@ impl VkAcc {
                                     buf
                                 }
                             };
-                            let use_d = std::env::var("LLM170_VK_Q8D")
-                                .map(|v| v == "1")
-                                .unwrap_or(false);
+                            let use_d = llm170_diag::flag::eq1("LLM170_VK_Q8D");
                             let p = self.pipeline(
                                 &mut ctx,
                                 if use_d {
@@ -1302,9 +1276,7 @@ impl VkAcc {
                         // decoder ms/128 패밀리(f16 coopMatMulAdd) 직접 재사용.
                         // 스칼라 K-슬라이스 타일은 ALU 바운드([ts] tile_q8
                         // 2818ms/청크). 킬스위치 LLM170_VK_CM=0.
-                        if std::env::var("LLM170_VK_CM")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
+                        if llm170_diag::flag::ne0("LLM170_VK_CM")
                             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
                             && wbufs.len() == 1
                         {
@@ -1318,7 +1290,7 @@ impl VkAcc {
                             let p = self.pipeline(&mut ctx, slot)?;
                             let ds2 = ctx.bind_ds(&p, &binds)?;
                             let gx = (n_out as u32).div_ceil(64);
-                            if std::env::var_os("LLM170_T8_LOG").is_some() {
+                            if llm170_diag::flag::on("LLM170_T8_LOG") {
                                 use std::sync::atomic::{AtomicU64, Ordering};
                                 static N: AtomicU64 = AtomicU64::new(0);
                                 eprintln!(
@@ -1411,9 +1383,7 @@ impl VkAcc {
                                             .unwrap_or(0)
                                     && t >= 128
                                     && !hout
-                                    && std::env::var("LLM170_VK_Q8K")
-                                        .map(|v| v != "0")
-                                        .unwrap_or(true);
+                                    && llm170_diag::flag::ne0("LLM170_VK_Q8K");
                                 if skinny {
                                     let ks: u32 = ((n_in.div_ceil(256) as u32) / 8).clamp(2, 8);
                                     let need = ks as usize * t * n_out * 4;
@@ -1491,7 +1461,7 @@ impl VkAcc {
                                 }
                             }
                             // plans/95 P3 계측: q8128 형상 수집(1회성).
-                            if std::env::var_os("LLM170_Q8_TRACE").is_some() {
+                            if llm170_diag::flag::on("LLM170_Q8_TRACE") {
                                 static N8: std::sync::atomic::AtomicUsize =
                                     std::sync::atomic::AtomicUsize::new(0);
                                 let n = N8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1567,7 +1537,7 @@ impl VkAcc {
                     self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
                 }
                 None => {
-                    if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                    if llm170_diag::flag::on("LLM170_F32S_TRACE") {
                         static NB: std::sync::atomic::AtomicUsize =
                             std::sync::atomic::AtomicUsize::new(0);
                         let n = NB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1587,12 +1557,7 @@ impl VkAcc {
                     // plans/89 P1.2 — f32/BF16 프리필(t≥2) 타일: fn_mm_f32 그리드
                     // (n_out, t)의 가중 t-재판독(라우터 2.6GB/청크) 소거.
                     // 킬스위치 LLM170_VK_FT32=0.
-                    if t >= 2
-                        && wbufs.len() == 1
-                        && std::env::var("LLM170_VK_FT32")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
-                    {
+                    if t >= 2 && wbufs.len() == 1 && llm170_diag::flag::ne0("LLM170_VK_FT32") {
                         // plans/93: tile_f32_w는 실측 역행(558ms vs 352ms) — 원판 유지.
                         // plans/95 P1 — 스키니 f32(n_out ≤ 512): tile_f32는
                         // n_out=4(hc down)에서 WG 32개·활성 128스레드로 점유
@@ -1606,7 +1571,7 @@ impl VkAcc {
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(512)
-                            && std::env::var("LLM170_VK_FT32S").map(|v| v != "0").unwrap_or(true)
+                            && llm170_diag::flag::ne0("LLM170_VK_FT32S")
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -1632,7 +1597,7 @@ impl VkAcc {
                             )?;
                             continue;
                         }
-                        if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                        if llm170_diag::flag::on("LLM170_F32S_TRACE") {
                             static NS: std::sync::atomic::AtomicUsize =
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1664,7 +1629,7 @@ impl VkAcc {
                         )?;
                         // plans/95 계측(1회성): tile_f32 형상 수집 — 76MiB f32·bf16
                         // 텐서에 359.6ms/청크의 원인 국소화.
-                        if std::env::var_os("LLM170_FT32_TRACE").is_some() {
+                        if llm170_diag::flag::on("LLM170_FT32_TRACE") {
                             static N: std::sync::atomic::AtomicUsize =
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1674,16 +1639,12 @@ impl VkAcc {
                         }
                         continue;
                     }
-                    let slot = if t < 16
-                        && wbufs.len() == 1
-                        && std::env::var("LLM170_VK_MMB")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
-                    {
-                        Slot::MmF32b
-                    } else {
-                        Slot::FnMmf32
-                    };
+                    let slot =
+                        if t < 16 && wbufs.len() == 1 && llm170_diag::flag::ne0("LLM170_VK_MMB") {
+                            Slot::MmF32b
+                        } else {
+                            Slot::FnMmf32
+                        };
                     let p = self.pipeline(&mut ctx, slot)?;
                     let mut binds: Vec<vk::Buffer> = wbufs.clone();
                     while binds.len() < 8 {
