@@ -206,70 +206,6 @@ impl Q4Acc {
             && t >= 16
             && (env_on("LLM170_Q4K_MMQ") || env_on("LLM170_Q4K_OUTS"))
         {
-            // 행-배치 타일(plans/65) — 가중치 디퀀트를 행 루프 밖으로.
-            if env_on("LLM170_Q4K_Y") {
-                let rpt: usize = std::env::var("LLM170_Q4K_YRPT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(16);
-                // 커널이 += 누산이므로 출력을 0으로 초기화한다(출력 버퍼는 매
-                // 호출 새로 쓰이는 스크래치라 안전).
-                unsafe {
-                    std::ptr::write_bytes(out as *mut f32, 0, t * n_out);
-                }
-                let mut xq_p = xq as *mut std::ffi::c_void;
-                let mut w_p = w as *mut std::ffi::c_void;
-                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
-                let mut o_p = out as *mut std::ffi::c_void;
-                let (mut ni, mut no, mut xw, mut tt, mut rp) =
-                    (n_in as i32, n_out as i32, xq_w as i32, t as i32, rpt as i32);
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
-                    (&mut no) as *mut _ as *mut std::ffi::c_void,
-                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                    (&mut rp) as *mut _ as *mut std::ffi::c_void,
-                ];
-                return self.ctx.launch3(
-                    "q4_gemm_q4k_y",
-                    n_out.div_ceil(256) as u32,
-                    t.div_ceil(rpt) as u32,
-                    1,
-                    256,
-                    &mut args,
-                );
-            }
-            // x-스테이징 타일(plans/65) — 출력별 x 재독 제거. 로직·순서는 _m과 동일.
-            if env_on("LLM170_Q4K_X") {
-                let mut xq_p = xq as *mut std::ffi::c_void;
-                let mut w_p = w as *mut std::ffi::c_void;
-                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
-                let mut o_p = out as *mut std::ffi::c_void;
-                let (mut ni, mut no, mut xw, mut tt) =
-                    (n_in as i32, n_out as i32, xq_w as i32, t as i32);
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
-                    (&mut no) as *mut _ as *mut std::ffi::c_void,
-                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                ];
-                return self.ctx.launch3(
-                    "q4_gemm_q4k_x",
-                    n_out.div_ceil(16) as u32,
-                    t.div_ceil(16) as u32,
-                    1,
-                    256,
-                    &mut args,
-                );
-            }
             // 형상 스윕용 가변 타일(plans/65) — outs/rows를 env로 지정.
             if let (Ok(outs), Ok(rows)) = (
                 std::env::var("LLM170_Q4K_OUTS").map(|v| v.parse::<usize>()),
@@ -401,7 +337,7 @@ impl Q4Acc {
         // 가중치 대역도 0.3-6 GB/s뿐이라 연산·대역폭 어느 쪽도 아니다 — llama.cpp
         // 대비 프리필 1.33x가 사는 곳이다. 27B가 같은 계열로 19.5 TFLOPS를 내는 것은
         // n_in/n_out이 더 큰 형상(5120x17408)이라 행당 상각이 크기 때문이다.
-        // 같은 형상에서 q4_K MMQ 타일(LLM170_Q4K_MMQ/Y)은 오히려 느렸고(33-34ms),
+        // 같은 형상에서 q4_K MMQ 타일(LLM170_Q4K_MMQ)은 오히려 느렸고(33-34ms),
         // Q6K/Q4_K f16 융합 dequant도 중립이었다. 남은 방향은 그래프당 dequant 캐시.
         // t≥16: MMQ 타일 우선 — 단 **128토큰 이하로 쪼개서** 호출한다.
         // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다

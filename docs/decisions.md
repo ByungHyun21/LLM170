@@ -2824,3 +2824,13 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   ple_mt·fault·idot 프로브 전무상.
 - 검증: 워크스페이스 경고 0·charhash PASS·게이트 2종 PASS·
   vk-frame-check PASS 유지.
+
+### (95) W5 1차 — hip 사중 커널 9종·레거시 옵트인 5분기 삭제 (plans/107, 2026-09-28)
+
+- NAMES 163→154: q4_moe_top10·q4_gdn_ar_w·norm_gated_silu·gdn_ar_sm·
+  gdn_conv_t2_ms·gemm_q8_0_w256 + 인접 3(에이전트 페어링 확인) —
+  등록 전수 무참조 실증 후 위치쌍 src 동반 삭제.
+- LLM170_Q6RQ(2)·Q4K_X/Y/YRPT(3) 옵트인 레거시 분기 삭제 — 기본
+  경로 불변. Q4K_OUTS/ROWS·Q4K_MMQ는 형상 스윕·기본 타일 게이트라
+  보류(W5 계속 판정).
+- 검증: 경고 0·charhash PASS·게이트 2종 PASS.
