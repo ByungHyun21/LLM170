@@ -458,12 +458,11 @@ pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
     st.ple_next_pos = s.next_pos;
     st.ple_conv = s.conv;
 }
-
-/// plans/103 — res_hc f16 버스 옵트인(원자 스위치: 전 기입/판독이 동시 전환).
+/// plans/103 — res_hc f16 버스(원자 스위치: 전 기입/판독 동시 전환).
+/// 107 W2 승격(원장 60·88): 토큰 33/33 f32 동일·피크 432.6 t/s 실증.
+/// 기본 ON — 킬스위치 =0(W2 말기 env 완전 폐지 예정).
 pub(crate) fn res_f16_on() -> bool {
-    std::env::var("LLM170_VK_RESF16")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    llm170_diag::flag::ne0("LLM170_VK_RESF16")
 }
 
 /// f32 → f16 비트(반올림 짝수) — half 의존 없는 국소 변환(호스트 폴백 전용).
