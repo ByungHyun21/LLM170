@@ -625,7 +625,9 @@ impl VkAcc {
             // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
             if w.ty == GgmlType::Q4K
                 && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q4KLL").map(|v| v == "1").unwrap_or(false)
+                // plans/105(원장 76): 기본 ON — 비트동일·pp512 439-466
+                // (mmq 408-441). 킬스위치 =0.
+                && std::env::var("LLM170_VK_Q4KLL").map(|v| v != "0").unwrap_or(true)
             {
                 let (offb, pmb) = {
                     let g = self.moe_grp.lock();

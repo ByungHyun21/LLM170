@@ -39,7 +39,7 @@ layout(push_constant) uniform PC {
 
 // 캐시 — 스칼라 공유배열(구조체 복사는 패처 수렴 규칙을 깬다).
 shared uint  buf_aq[BK_STEP * BM][4];
-shared f16vec2 buf_ad[BK_STEP * BM];
+shared vec2 buf_ad[BK_STEP * BM];
 shared uint  buf_bq[BK_STEP * BN][8];
 shared vec2  buf_bd[BK_STEP * BN];
 shared int shared_eq_cnt;
@@ -121,7 +121,7 @@ void main() {
                         s_v = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
                         m_v = (b_p4 >> 4) | ((b_j >> 6) << 4);
                     }
-                    buf_ad[sq * BM + (int(tid) >> 2)] = f16vec2(float16_t(d * float(s_v)), float16_t(dmin * float(m_v)));
+                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(d * float(s_v), dmin * float(m_v));
                     uint qb2 = wq4 + 4u + uint((j >> 1) * 8u);
                     uint nib2 = (j & 1) != 0 ? 4u : 0u;
                     [[unroll]] for (int w = 0; w < 4; w++) {
@@ -132,7 +132,7 @@ void main() {
                         buf_aq[sq * BM + (int(tid) >> 2)][w] = v0 | (v1 << 4);
                     }
                 } else if (sq < BK_STEP) {
-                    buf_ad[sq * BM + (int(tid) >> 2)] = f16vec2(float16_t(0.0), float16_t(0.0));
+                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(0.0);
                     for (int w = 0; w < 4; w++) buf_aq[sq * BM + (int(tid) >> 2)][w] = 0u;
                 }
                 // 행 16..63은 2패스 — 나머지 행들도 같은 코드가 stride로 커버
@@ -158,7 +158,7 @@ void main() {
                             s_v2 = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
                             m_v2 = (b_p4 >> 4) | ((b_j >> 6) << 4);
                         }
-                        buf_ad[q2 * BM + r2] = f16vec2(float16_t(db * float(s_v2)), float16_t(dminb * float(m_v2)));
+                        buf_ad[q2 * BM + r2] = vec2(db * float(s_v2), dminb * float(m_v2));
                         uint qb3 = wq4b + 4u + uint((j2 >> 1) * 8u);
                         uint nib3 = (j2 & 1) != 0 ? 4u : 0u;
                         [[unroll]] for (int w = 0; w < 4; w++) {
@@ -230,16 +230,20 @@ void main() {
                                     float bs = float(int(xq[base + qsb2 + uint(gb * 2)])
                                                    + int(xq[base + qsb2 + uint(gb * 2) + 1u]));
                                     // A행 글로벌 직독(오라클과 동일 체인)
-                                    uint pl[4];
-                                    [[unroll]] for (uint p2 = 0; p2 < 4; p2++) {
-                                        pl[p2] = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][p2];
-                                    }
-                                    int qsum = 0;
-                                    [[unroll]] for (uint w2 = 0; w2 < 8; w2++) {
-                                        uint qs_a = (pl[w2 >> 1] >> ((w2 & 1u) * 4u)) & 0x0F0F0F0Fu;
-                                        qsum += sdot4p(qs_a, buf_bq[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc][w2]);
-                                    }
-                                    vec2 ad2 = vec2(buf_ad[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr]);
+                                    uint p0 = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][0];
+                                    uint p1 = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][1];
+                                    uint p2 = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][2];
+                                    uint p3 = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][3];
+                                    uint bbase = q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+                                    int qsum = sdot4p((p0      ) & 0x0F0F0F0Fu, buf_bq[bbase][0])
+                                             + sdot4p((p0 >> 4 ) & 0x0F0F0F0Fu, buf_bq[bbase][1])
+                                             + sdot4p((p1      ) & 0x0F0F0F0Fu, buf_bq[bbase][2])
+                                             + sdot4p((p1 >> 4 ) & 0x0F0F0F0Fu, buf_bq[bbase][3])
+                                             + sdot4p((p2      ) & 0x0F0F0F0Fu, buf_bq[bbase][4])
+                                             + sdot4p((p2 >> 4 ) & 0x0F0F0F0Fu, buf_bq[bbase][5])
+                                             + sdot4p((p3      ) & 0x0F0F0F0Fu, buf_bq[bbase][6])
+                                             + sdot4p((p3 >> 4 ) & 0x0F0F0F0Fu, buf_bq[bbase][7]);
+                                    vec2 ad2 = buf_ad[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr];
                                     vec2 bd2 = buf_bd[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc];
                                     sums[sums_idx] += bd2.x * (ad2.x * float(qsum) - ad2.y * bd2.y);
                                 }
