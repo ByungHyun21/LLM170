@@ -2843,3 +2843,13 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
 - 무동작 변경: charhash 15,674라인 일치·게이트 2종 PASS·경고 0.
 - FrameHost 3분할(FrameIo/Gemm/Misc)은 소비 니즈 발생 시(블랭킷
   방식) 후속 — 현재 단일 소비 2백엔드라 선투자 보류 판단.
+
+### (97) W11 1차 — NaN 패닉·exit(101) 제거 (plans/107, 2026-09-28)
+
+- moe top-k 정렬: partial_cmp().unwrap() → total_cmp (NaN 로짓에도
+  결정론 전순서 — finite 경로 순서 불변).
+- 진단 경로 exit(101) 4곳 제거(보고 후 지속) — 서버 전 슬롯 사망
+  계약 종결. layers.rs nan_guard는 람다 조기 return으로.
+- quant.rs unimplemented!는 로드 시점 패닉(허용 분류) — 사전 타입
+  검증은 W6 quant 모듈화와 병행.
+- 검증: charhash PASS·게이트 2종 PASS·경고 0.

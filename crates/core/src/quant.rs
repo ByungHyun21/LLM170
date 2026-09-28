@@ -413,7 +413,8 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
                 );
             }
         }
-        other => unimplemented!("dequant for {other:?}"),
+        // 107 W11: 로드 시점 타입 사전 검증 전까지 초기화 패닉 유지(허용 분류).
+        other => unimplemented!("dequant for {other:?} — 모델 로드 시 타입 검증 필요"),
     }
 }
 
