@@ -38,10 +38,11 @@ layout(push_constant) uniform PC {
 #define WSUBN (WN / WNITER)
 
 // 캐시 — 스칼라 공유배열(구조체 복사는 패처 수렴 규칙을 깬다).
-shared uint  buf_aq[BK_STEP * BM][4];
+shared uint  buf_aq[BK_STEP * BM][8];
 shared vec2  buf_ad[BK_STEP * BM];
 shared uint  buf_bq[BK_STEP * BN][8];
 shared vec2  buf_bd[BK_STEP * BN];
+shared int shared_eq_cnt;
 
 // sdot4p 센티널 — build_spv가 OpSDot로 자동 패치.
 int sdot4p(uint a, uint b) {
@@ -93,107 +94,148 @@ void main() {
 
         for (int g = 0; g < nkb; g += BK_STEP) {
             int lim = min(BK_STEP, nkb - g);
-            // ── A: raw 리팩 — 스레드=행, 4블록×4캐시워드(llama 원식:
-            // 같은 니블 평면의 연속 raw 워드쌍을 (lo)|(hi<<4)로 합성 —
-            // 캐시 바이트당 2원소, 도트에서 평면 재추출).
+            // ── A: W6 — 오라클(검증) 산술로 평면 8워드 스테이징.
             {
-                int row = row0 + int(tid);
-                if (row < row0 + nrow) {
-                    uint wq4 = ebase + uint(row) * row_words + uint(g >> 3) * 36u;
+                int arow = row0 + int(tid);
+                // ── A/B 스테이징(W21) — 행 우선 스레드 재분할(코얼레싱):
+            // A: 스레드 t = (행 t>>2, 블록 t&3) — 4스레드가 같은 행의
+            // 연속 블록 워드열을 판독. B: 스레드 t = (행 t>>2, 블록 t&3).
+            {
+                int srow = row0 + int(tid >> 2);
+                int sq = int(tid & 3u);
+                if (srow < int(pc.n_out) && sq < lim) {
+                    int gb = g + sq;
+                    int j = gb & 7;
+                    uint wq4 = ebase + uint(srow) * row_words + uint(gb >> 3) * 36u;
                     float d = f16x(w0c[wq4] & 0xFFFFu);
                     float dmin = f16x(w0c[wq4] >> 16);
-                    for (int q = 0; q < lim; q++) {
-                        int sb = g + q;
-                        int j = sb & 7;
-                        uint s_v, m_v;
-                        if (j < 4) {
-                            uint b_s = (w0c[wq4 + 1u] >> (uint(j) * 8u)) & 0xFFu;
-                            uint b_m = (w0c[wq4 + 2u] >> (uint(j) * 8u)) & 0xFFu;
-                            s_v = b_s & 63u; m_v = b_m & 63u;
-                        } else {
-                            uint b_p4  = (w0c[wq4 + 3u] >> (uint(j - 4) * 8u)) & 0xFFu;
-                            uint b_j   = (w0c[wq4 + 2u] >> (uint(j - 4) * 8u)) & 0xFFu;
-                            uint b_lo  = (w0c[wq4 + 1u] >> (uint(j - 4) * 8u)) & 0xFFu;
-                            s_v = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
-                            m_v = (b_p4 >> 4) | ((b_j >> 6) << 4);
-                        }
-                        buf_ad[q * BM + int(tid)] = vec2(d * float(s_v), dmin * float(m_v));
-                        uint qbase = wq4 + 4u + uint((j >> 1) * 8u);
-                        uint nib = (j & 1) != 0 ? 4u : 0u;
-                        [[unroll]] for (int w = 0; w < 4; w++) {
-                            uint w0 = w0c[qbase + uint(w * 2)];
-                            uint w1 = w0c[qbase + uint(w * 2 + 1)];
-                            uint v0 = (w0 >> nib) & 0x0F0F0F0Fu;
-                            uint v1 = (w1 >> nib) & 0x0F0F0F0Fu;
-                            buf_aq[q * BM + int(tid)][w] = v0 | (v1 << 4);
-                        }
+                    uint s_v, m_v;
+                    if (j < 4) {
+                        uint b_s = (w0c[wq4 + 1u] >> (uint(j) * 8u)) & 0xFFu;
+                        uint b_m = (w0c[wq4 + 2u] >> (uint(j) * 8u)) & 0xFFu;
+                        s_v = b_s & 63u; m_v = b_m & 63u;
+                    } else {
+                        uint b_p4  = (w0c[wq4 + 3u] >> (uint(j - 4) * 8u)) & 0xFFu;
+                        uint b_j   = (w0c[wq4 + 2u] >> (uint(j - 4) * 8u)) & 0xFFu;
+                        uint b_lo  = (w0c[wq4 + 1u] >> (uint(j - 4) * 8u)) & 0xFFu;
+                        s_v = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
+                        m_v = (b_p4 >> 4) | ((b_j >> 6) << 4);
                     }
-                } else {
-                    for (int q = 0; q < BK_STEP; q++) {
-                        buf_ad[q * BM + int(tid)] = vec2(0.0);
-                        for (int w = 0; w < 4; w++) buf_aq[q * BM + int(tid)][w] = 0u;
+                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(d * float(s_v), dmin * float(m_v));
+                    uint qb2 = wq4 + 4u + uint((j >> 1) * 8u);
+                    bool hi2 = (j & 1) != 0;
+                    [[unroll]] for (int w = 0; w < 8; w++) {
+                        uint wd = w0c[qb2 + uint(w)];
+                        buf_aq[sq * BM + (int(tid) >> 2)][w] = hi2 ? ((wd >> 4) & 0x0F0F0F0Fu) : (wd & 0x0F0F0F0Fu);
+                    }
+                } else if (sq < BK_STEP) {
+                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(0.0);
+                    for (int w = 0; w < 8; w++) buf_aq[sq * BM + (int(tid) >> 2)][w] = 0u;
+                }
+                // 행 16..63은 2패스 — 나머지 행들도 같은 코드가 stride로 커버
+                // 없음: 64스레드/4 = 16행/패스 → 4패스 필요. 간단히 루프:
+                for (int pass = 1; pass < 4; pass++) {
+                    int r2 = int(tid >> 2) + pass * 16;
+                    int q2 = sq;
+                    if (row0 + r2 < int(pc.n_out) && q2 < lim) {
+                        int gb2 = g + q2;
+                        int j2 = gb2 & 7;
+                        uint wq4b = ebase + uint(row0 + r2) * row_words + uint(gb2 >> 3) * 36u;
+                        float db = f16x(w0c[wq4b] & 0xFFFFu);
+                        float dminb = f16x(w0c[wq4b] >> 16);
+                        uint s_v2, m_v2;
+                        if (j2 < 4) {
+                            uint b_s = (w0c[wq4b + 1u] >> (uint(j2) * 8u)) & 0xFFu;
+                            uint b_m = (w0c[wq4b + 2u] >> (uint(j2) * 8u)) & 0xFFu;
+                            s_v2 = b_s & 63u; m_v2 = b_m & 63u;
+                        } else {
+                            uint b_p4  = (w0c[wq4b + 3u] >> (uint(j2 - 4) * 8u)) & 0xFFu;
+                            uint b_j   = (w0c[wq4b + 2u] >> (uint(j2 - 4) * 8u)) & 0xFFu;
+                            uint b_lo  = (w0c[wq4b + 1u] >> (uint(j2 - 4) * 8u)) & 0xFFu;
+                            s_v2 = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
+                            m_v2 = (b_p4 >> 4) | ((b_j >> 6) << 4);
+                        }
+                        buf_ad[q2 * BM + r2] = vec2(db * float(s_v2), dminb * float(m_v2));
+                        uint qb3 = wq4b + 4u + uint((j2 >> 1) * 8u);
+                        bool hi3 = (j2 & 1) != 0;
+                        [[unroll]] for (int w = 0; w < 8; w++) {
+                            uint wd = w0c[qb3 + uint(w)];
+                            buf_aq[q2 * BM + r2][w] = hi3 ? ((wd >> 4) & 0x0F0F0F0Fu) : (wd & 0x0F0F0F0Fu);
+                        }
                     }
                 }
             }
-            // ── B: 토큰 행(live) × 4블록 — 우리 xq 레이아웃.
             {
-                // 64스레드: 행×블록 담당 — 행 = tid/lim 스트라이드.
                 for (int i = int(tid); i < live * BK_STEP; i += 64) {
                     int rb = i / BK_STEP;
                     int q = i % BK_STEP;
                     int sb = g + q;
                     uint pr_ = perm[sg + uint(rb)];
                     uint base = pr_ * pc.xq_w;
-                    // d + Σq(원판 sBsum = u32 2개의 합)
                     float bd = uintBitsToFloat(xq[base + qw + uint(sb)]);
-                    uint qsb = qw + (uint(n_in) >> 5);
-                    float bsum = float(int(xq[base + qsb + uint(sb * 2)])
-                                     + int(xq[base + qsb + uint(sb * 2) + 1u]));
-                    buf_bd[q * BN + rb] = vec2(bd, bsum);
+                    uint qsb2 = qw + (uint(n_in) >> 5);
+                    float bs = float(int(xq[base + qsb2 + uint(sb * 2)])
+                                   + int(xq[base + qsb2 + uint(sb * 2) + 1u]));
+                    buf_bd[q * BN + rb] = vec2(bd, bs);
                     for (int w = 0; w < 8; w++) {
                         buf_bq[q * BN + rb][w] = xq[base + uint(sb * 8 + w)];
                     }
                 }
-                // 여분 B 슬롯 0화(초과 토큰).
                 for (int i = live * BK_STEP + int(tid); i < BK_STEP * BN; i += 64) {
-                    int q = i % BK_STEP;
                     int rb = i / BK_STEP;
+                    int q = i % BK_STEP;
                     buf_bd[q * BN + rb] = vec2(0.0, 0.0);
                     for (int w = 0; w < 8; w++) buf_bq[q * BN + rb][w] = 0u;
                 }
             }
+            memoryBarrierShared();
             barrier();
-
-            // ── MMA — llama 워프 타일 원식.
-            for (int q = 0; q < lim; q++) {
-                // 레지스터 캐시 — 스칼라 복사(SSA 수렴 유지).
-                uint ca_q[WMITER * TM][4];
-                vec2 ca_d[WMITER * TM];
-                [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
-                    [[unroll]] for (uint cr = 0; cr < TM; cr++) {
-                        const uint buf_ib = warp_r * WM + wsir * WSUBM + tiwr * TM + cr;
-                        ca_d[wsir * TM + cr] = buf_ad[q * BM + buf_ib];
-                        [[unroll]] for (uint w = 0; w < 4; w++)
-                            ca_q[wsir * TM + cr][w] = buf_aq[q * BM + buf_ib][w];
+            // 자기검증: MMA 첫 (wsic=0,cc=0,wsir=0,cr=0) 슬롯에서 전 워드 비교 후 eq 반영.
+            {
+                uint arow2 = warp_r * WM + tiwr * TM;
+                for (int q = 0; q < lim; q++) {
+                    int gb = g + q;
+                    int j = gb & 7;
+                    uint wq4 = ebase + uint(row0 + int(arow2)) * row_words + uint(gb >> 3) * 36u;
+                    uint qb3 = wq4 + 4u + uint((j >> 1) * 8u);
+                    bool hi3 = (j & 1) != 0;
+                    for (int w3 = 0; w3 < 8; w3++) {
+                        uint wd3 = w0c[qb3 + w3];
+                        uint g3 = hi3 ? ((wd3 >> 4) & 0x0F0F0F0Fu) : (wd3 & 0x0F0F0F0Fu);
+                        if (buf_aq[q * BM + arow2][w3] != g3) shared_eq_cnt = 1;
                     }
                 }
+            }
+            barrier();
+            for (int q = 0; q < lim; q++) {
+                int gb = g + q;
+                int j = gb & 7;
                 [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
                     [[unroll]] for (uint cc = 0; cc < TN; cc++) {
-                        const uint ib = q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
-                        uint cb_q[8];
-                        vec2 cb_d = buf_bd[ib];
-                        [[unroll]] for (uint w = 0; w < 8; w++) cb_q[w] = uint(buf_bq[ib][w]);
+                        int tok_i = int(warp_c * WN + wsic * WSUBN + tiwc * TN + cc);
                         [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                             [[unroll]] for (uint cr = 0; cr < TM; cr++) {
-                                const uint ai = wsir * TM + cr;
-                                int qsum = 0;
-                                [[unroll]] for (uint iq = 0; iq < 8; iq++) {
-                                    uint qs_a = (ca_q[ai][iq >> 1] >> ((iq & 1u) * 4u)) & 0x0F0F0F0Fu;
-                                    qsum += sdot4p(qs_a, cb_q[iq]);
-                                }
                                 const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
-                                sums[sums_idx] += cb_d.x * ca_d[ai].x * float(qsum)
-                                                - ca_d[ai].y * cb_d.y;
+                                if (tok_i < live) {
+                                    uint pr_ = perm[sg + uint(tok_i)];
+                                    uint base = pr_ * pc.xq_w;
+                                    float bd = uintBitsToFloat(xq[base + qw + uint(gb)]);
+                                    uint qsb2 = qw + (uint(n_in) >> 5);
+                                    float bs = float(int(xq[base + qsb2 + uint(gb * 2)])
+                                                   + int(xq[base + qsb2 + uint(gb * 2) + 1u]));
+                                    // A행 글로벌 직독(오라클과 동일 체인)
+                                    uint pl[8];
+                                    [[unroll]] for (uint p2 = 0; p2 < 8; p2++) {
+                                        pl[p2] = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][p2];
+                                    }
+                                    int qsum = 0;
+                                    [[unroll]] for (uint w2 = 0; w2 < 8; w2++) {
+                                        qsum += sdot4p(pl[w2], buf_bq[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc][w2]);
+                                    }
+                                    vec2 ad2 = buf_ad[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr];
+                                    vec2 bd2 = buf_bd[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc];
+                                    sums[sums_idx] += bd2.x * (ad2.x * float(qsum) - ad2.y * bd2.y);
+                                }
                             }
                         }
                     }
@@ -222,6 +264,7 @@ void main() {
                     }
                 }
             }
+        }
         }
         barrier();
     }
