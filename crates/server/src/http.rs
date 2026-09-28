@@ -27,14 +27,27 @@ pub static READY: AtomicBool = AtomicBool::new(false);
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-pub fn serve(addr: &str, req: InferRequest, backend: BackendSel) -> Result<(), String> {
+pub fn serve(
+    addr: &str,
+    req: InferRequest,
+    backend: BackendSel,
+    slots_flag: Option<usize>,
+) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
     eprintln!("# llm170-server listening on http://{addr}");
-    let slots = std::env::var("LLM170_SLOTS")
+    // 107 P0-9: 슬롯 수 소스 계통 가시화 — 플래그 > env > 기본 1.
+    // 이전엔 env 기본 1이 조용히 직렬 서버를 만들었다(np4 10.5 t/s 정체).
+    let (slots, src) = if let Some(n) = slots_flag {
+        (n.clamp(1, 16), "flag")
+    } else if let Some(n) = std::env::var("LLM170_SLOTS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, 16);
+    {
+        (n.clamp(1, 16), "env LLM170_SLOTS")
+    } else {
+        (1, "default")
+    };
+    eprintln!("# serve: slots={slots} (source: {src}) — 복수 동시 요청 배치 디코드에는 --slots N");
     // 대기열 기본 512(2026-09-16, 사용자 지시): 대기 작업은 토큰 배열+채널뿐인
     // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
     // 503 대신 대기로 흡수한다. LLM170_QUEUE로 재정의 가능.
