@@ -1068,7 +1068,7 @@ impl VkAcc {
                         // 아님) — 사용자 승인으로 기준 스트림 재기록 후 기본
                         // 승격(2026-09-25, f64 참조에 더 근사·llama.cpp와 동일
                         // 클래스의 실행치 양자화). 킬스위치 =0.
-                        if dty == 0
+                        if (dty == 0 || dty == 1 && !self.f16bufs.lock().contains(&x))   // plans/105: bf16 인덱서 투영 편입
                             && n_out <= std::env::var("LLM170_VK_FT32S_MAX")
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
