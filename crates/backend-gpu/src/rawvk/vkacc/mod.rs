@@ -115,6 +115,8 @@ const FN_MOE_TILE_Q51MMQ_H_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51mm
 const FN_MOE_TILE_Q4K_PKS_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_pks.spv");
 /// plans/105 P2 — llama.cpp mul_mmq(MUL_MAT_ID) 포트(BN64 워프타일).
 const FN_MOE_TILE_LLMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_llmmq.spv");
+/// plans/106 — llmmq f16-dm 변형(A 스케일 shmem 1/4 — llama 클래스).
+const FN_MOE_TILE_LLMMQ_H16_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_llmmq_h16.spv");
 /// plans/105 — llmmq의 q5_1 판(다운 GEMM).
 const FN_MOE_TILE_LL51_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_ll51.spv");
 /// plans/105(원장 80) — mxsel 생산 시점 1회 팩 정량(블록당 10워드).
@@ -262,6 +264,7 @@ pub(crate) enum Slot {
     FnMoeTileQ51mmqH,
     FnMoeTileQ4kPks,
     FnMoeTileLlmmq,
+    FnMoeTileLlmmqH16,
     FnMoeTileLl51,
     FnQuantQ8p,
     /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
@@ -550,6 +553,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ51mmqH, "moe_tile_q51mmq_h", FN_MOE_TILE_Q51MMQ_H_SPV, 10, 28),
     (Slot::FnMoeTileQ4kPks, "moe_tile_q4k_pks", FN_MOE_TILE_Q4K_PKS_SPV, 14, 28),
     (Slot::FnMoeTileLlmmq, "moe_tile_llmmq", FN_MOE_TILE_LLMMQ_SPV, 13, 28),
+    (Slot::FnMoeTileLlmmqH16, "moe_tile_llmmq_h16", FN_MOE_TILE_LLMMQ_H16_SPV, 13, 28),
     (Slot::FnMoeTileLl51, "moe_tile_ll51", FN_MOE_TILE_LL51_SPV, 13, 28),
     (Slot::FnQuantQ8p, "quant_q8p", FN_QUANT_Q8P_SPV, 2, 12),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
