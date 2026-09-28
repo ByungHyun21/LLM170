@@ -6,9 +6,7 @@ impl DecoderState {
     /// t=1 단일 스텝 본체 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     /// 로짓은 b_lg에만 남는다 (전사는 step() 래퍼).
     pub(super) fn step_core(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<(), String> {
-        let kv8 = std::env::var("LLM170_VK_KV8")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), n);
         let (dt_rank, d_state, d_inner) = (self.dt_rank, self.d_state, self.d_inner);
@@ -25,7 +23,7 @@ impl DecoderState {
         let layer_cut = std::env::var("LLM170_VK_LAYERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
-        let npck = std::env::var_os("LLM170_VK_NPCK").is_some();
+        let npck = llm170_diag::flag::on("LLM170_VK_NPCK");
         for il in 0..self.n_layer {
             if layer_cut.is_some_and(|c| il >= c) {
                 break;
@@ -105,9 +103,7 @@ impl DecoderState {
                     let ga = self.b_ga.clone();
                     self.npck_mark("ga", il, &ga, 0, 16);
                 }
-                let arf_on = std::env::var("LLM170_VK_ARF")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                let arf_on = llm170_diag::flag::ne0("LLM170_VK_ARF");
                 if arf_on && gskip & 1 == 0 {
                     let dtb2 = self
                         .consts
@@ -292,7 +288,7 @@ impl DecoderState {
                         d_inner,
                     )?;
                 }
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il < 2 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il < 2 {
                     self.ctx.end_batch_wait().ok();
                     self.ctx.begin_batch().ok();
                     let mut v = vec![0f32; n];
@@ -342,7 +338,7 @@ impl DecoderState {
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(4);
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 3 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 3 {
                     let (bufs, tyq, niq, noq) =
                         self.w.get(&format!("blk.{il}.attn_q.weight")).unwrap();
                     let total: usize = bufs.iter().map(|b| b.bytes).sum();
@@ -584,7 +580,7 @@ impl DecoderState {
                 self.npck_mark("L", il, &b, 0, 64);
             }
             // 실험: L0 FFN 직후 attn_q gemv 강제 (층 위치 vs 가중치 분리)
-            if std::env::var_os("LLM170_VK_FORCE_AQ").is_some() && il == 0 {
+            if llm170_diag::flag::on("LLM170_VK_FORCE_AQ") && il == 0 {
                 self.gemv_w(
                     self.b_xn.buf,
                     self.b_xq_n.buf,
@@ -608,7 +604,7 @@ impl DecoderState {
         )?;
         self.ctx.end_batch_wait()?;
         self.ctx.ts_report();
-        if std::env::var_os("LLM170_DBG_WALL").is_some() {
+        if llm170_diag::flag::on("LLM170_DBG_WALL") {
             eprintln!(
                 "[step] head+wait={:.2}ms step총={:.2}ms",
                 tw_head1.elapsed().as_secs_f64() * 1e3,
@@ -628,14 +624,14 @@ impl DecoderState {
             }
             self.ktimes.clear();
         }
-        if std::env::var_os("LLM170_VK_PROF").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_PROF") {
             eprintln!(
                 "[vkprof] step: {:.1}ms (pos {})",
                 vk_t0.elapsed().as_secs_f32() * 1e3,
                 pos
             );
         }
-        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
             let s = |b: &VkBuf, len: usize| -> f64 {
                 let mut x = vec![0f32; len];
                 unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
@@ -717,9 +713,7 @@ impl DecoderState {
         emb: &[f32],
         all_logits: bool,
     ) -> Result<Vec<f32>, String> {
-        let kv8 = std::env::var("LLM170_VK_KV8")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let _vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
         let t = emb.len() / n;
@@ -732,14 +726,14 @@ impl DecoderState {
         let k_len = self.k_len;
         let v_len = self.v_len;
         // plans/92 P2: [pfck] 업로드·제출대기·헤드·판독 4분해 (LLM170_PFCK=1).
-        let pfck = std::env::var_os("LLM170_PFCK").is_some();
+        let pfck = llm170_diag::flag::on("LLM170_PFCK");
         let pf_up0 = std::time::Instant::now();
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
         }
         let pf_up = pf_up0.elapsed().as_secs_f64() * 1e3;
         let pf_gpu0 = std::time::Instant::now();
-        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
             let mut x = vec![0f32; 64];
             unsafe {
                 std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, x.as_mut_ptr(), 64)
@@ -751,7 +745,7 @@ impl DecoderState {
         let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
-        let vkd_stage = std::env::var_os("LLM170_VKD_STAGE").is_some();
+        let vkd_stage = llm170_diag::flag::on("LLM170_VKD_STAGE");
         let mut il_t = std::time::Instant::now();
         for il in 0..self.n_layer {
             if vkd_stage {
@@ -770,7 +764,7 @@ impl DecoderState {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
                 self.rms(xs.buf, "blk.0.attn_norm", xn.buf, n, t)?;
             }
-            if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+            if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                 self.ctx.end_batch_wait().ok();
                 self.ctx.begin_batch().ok();
                 let _x = vec![0f32; 64];
@@ -784,7 +778,7 @@ impl DecoderState {
             if self.is_recr[il] {
                 // plans/30: gemm_i8/quant_b8 경로는 배치 상태를 오염(실측 —
                 // VK_NOI8=1로 재현 해소). LLM170_VK_I8ON=1 옵트인만 사용.
-                if t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some() {
+                if t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON") {
                     self.quant_b8(self.b_xn.buf, n, t)?;
                 }
                 self.gemv_stage(
@@ -813,7 +807,7 @@ impl DecoderState {
                         ),
                     ],
                 )?;
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                     self.ctx.end_batch_wait().ok();
                     self.ctx.begin_batch().ok();
                     let s0: f64 =
@@ -916,7 +910,7 @@ impl DecoderState {
                         )?;
                     }
                 }
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                     self.ctx.end_batch_wait().ok();
                     self.ctx.begin_batch().ok();
                     let s0: f64 =
@@ -927,9 +921,7 @@ impl DecoderState {
                     eprintln!("#  SB post-conv xs0={s0:.4}");
                 }
                 // plans/46: 프리필 융합 AR8 (split3+l2+beta_g 인라인) — 기본.
-                let ar8f_on = std::env::var("LLM170_VK_AR8F")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                let ar8f_on = llm170_diag::flag::ne0("LLM170_VK_AR8F");
                 if ar8f_on {
                     let dtb = self
                         .consts
@@ -993,7 +985,7 @@ impl DecoderState {
                             1,
                         )?;
                     }
-                    if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                         self.ctx.end_batch_wait().ok();
                         self.ctx.begin_batch().ok();
                         let s0: f64 =
@@ -1019,7 +1011,7 @@ impl DecoderState {
                             1,
                         )?;
                     }
-                    if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                         self.ctx.end_batch_wait().ok();
                         self.ctx.begin_batch().ok();
                         let s0: f64 =
@@ -1060,7 +1052,7 @@ impl DecoderState {
                             1,
                         )?;
                     }
-                    if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                         self.ctx.end_batch_wait().ok();
                         self.ctx.begin_batch().ok();
                         let s0: f64 =
@@ -1109,7 +1101,7 @@ impl DecoderState {
                         )?;
                     }
                 } // else (구 체인)
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                     self.ctx.end_batch_wait().ok();
                     self.ctx.begin_batch().ok();
                     let s0: f64 =
@@ -1140,7 +1132,7 @@ impl DecoderState {
                         1,
                     )?;
                 }
-                if std::env::var_os("LLM170_VKD_TRACE").is_some() && il == 0 {
+                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
                     self.ctx.end_batch_wait().ok();
                     self.ctx.begin_batch().ok();
                     let s0: f64 =
@@ -1162,7 +1154,7 @@ impl DecoderState {
             } else {
                 // i8 활성(소비 조건과 동일)일 때만 b8 양자화 — 기본 경로의 dead dispatch 제거
                 if t >= 2
-                    && std::env::var_os("LLM170_VK_I8ON").is_some()
+                    && llm170_diag::flag::on("LLM170_VK_I8ON")
                     && std::env::var_os("LLM170_VK_NOI8").is_none()
                     && self.i8w.contains_key(&format!("blk.{il}.attn_q.weight"))
                 {
@@ -1401,7 +1393,7 @@ impl DecoderState {
                 t,
             )?;
             // FFN — xq는 gemv_stage 지연 양자화
-            if t >= 2 && std::env::var_os("LLM170_VK_I8ON").is_some() {
+            if t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON") {
                 self.quant_b8(self.b_xn.buf, n, t)?;
             }
             self.gemv_stage(
@@ -1443,7 +1435,7 @@ impl DecoderState {
                 format!("blk.{}.attn_norm", il + 1)
             };
             self.addrms(self.b_xs.buf, self.b_fdown.buf, &nkey, self.b_xn.buf, n, t)?;
-            if std::env::var_os("LLM170_VKD_LSUM").is_some() {
+            if llm170_diag::flag::on("LLM170_VKD_LSUM") {
                 // 107 W1: vk 레이스 국소화 — 층별 b_xn 첫 64합(il % MOD).
                 // 판독 직전 배치를 닫았다 재시작(진단 전용 모드).
                 let m = std::env::var("LLM170_VKD_LSUM_MOD")
@@ -1478,7 +1470,7 @@ impl DecoderState {
                 n,
             )?;
         }
-        if std::env::var_os("LLM170_DBG_REC").is_some() {
+        if llm170_diag::flag::on("LLM170_DBG_REC") {
             let d = self.dbg_drain_ms;
             self.dbg_drain_ms = 0.0;
             eprintln!(
@@ -1508,7 +1500,7 @@ impl DecoderState {
                 eprintln!("[ktime] {:22} {:9.1}ms ({}회)", k, e, c);
             }
         }
-        if std::env::var_os("LLM170_VKD_TRACE").is_some() {
+        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
             let s = |b: &VkBuf, len: usize| -> f64 {
                 let mut x = vec![0f32; len];
                 unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
@@ -1583,12 +1575,8 @@ impl DecoderState {
         }
         // 비기본 경로(kv8, ARF 폴백)는 순차 루프 — 계약 동일, np 커널은 기본
         // 경로(arf 융합·f32 KV)만 커버.
-        let kv8 = std::env::var("LLM170_VK_KV8")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let arf_on = std::env::var("LLM170_VK_ARF")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
+        let arf_on = llm170_diag::flag::ne0("LLM170_VK_ARF");
         if kv8 || !arf_on || t == 1 {
             let mut out = Vec::with_capacity(t);
             let mut toks = Vec::with_capacity(t);
@@ -1611,7 +1599,7 @@ impl DecoderState {
         let conv_ch = self.conv_ch;
         let k_len = self.k_len;
         let v_len = self.v_len;
-        let npck = std::env::var_os("LLM170_VK_NPCK").is_some();
+        let npck = llm170_diag::flag::on("LLM170_VK_NPCK");
         if npck {
             let sl: Vec<u32> =
                 unsafe { std::slice::from_raw_parts(self.np_slot.ptr as *const u32, t) }.to_vec();
@@ -2051,7 +2039,7 @@ impl DecoderState {
         }
         let np_t1 = std::time::Instant::now();
         self.ctx.end_batch_wait()?;
-        if std::env::var_os("LLM170_NP_TIME").is_some() {
+        if llm170_diag::flag::on("LLM170_NP_TIME") {
             eprintln!(
                 "[npstep] vk t={t} greedy={greedy} rec={:.1}ms wait={:.1}ms",
                 (np_t1 - np_t0).as_secs_f64() * 1e3,

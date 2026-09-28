@@ -60,7 +60,7 @@ pub(super) fn frame_forward_ex(
     let t = tokens.len();
     // plans/93 P2: PLE pos 기반 워터마크용 — 이 청크 시작 위치.
     let pos0 = seq_st.pos as usize;
-    if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+    if llm170_diag::flag::on("LLM170_FRAME_TIME") {
         eprintln!("# ff-entry t={t}");
     }
     fs_begin(acc, t);
@@ -74,11 +74,7 @@ pub(super) fn frame_forward_ex(
         // plans/97: Q8_0 임베딩은 GPU gather(킬: LLM170_VK_EMBQ8=0).
         // CPU 디퀀트는 측정 rep에서 콜드 54ms(GPU 유휴) — 커널은 수백 µs.
         let mut gpu_ok = false;
-        if embd.ty == llm170_gguf::GgmlType::Q8_0
-            && std::env::var("LLM170_VK_EMBQ8")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        {
+        if embd.ty == llm170_gguf::GgmlType::Q8_0 && llm170_diag::flag::ne0("LLM170_VK_EMBQ8") {
             gpu_ok = (|| -> Result<(), Q4Error> {
                 acc.emb_q8_gather_dev(
                     embd.data.as_ptr() as usize,
@@ -116,7 +112,7 @@ pub(super) fn frame_forward_ex(
                 acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
             }
             acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
-            if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+            if llm170_diag::flag::on("LLM170_FRAME_TIME") {
                 eprintln!(
                     "# emb t={t} hc={hc} ty={:?} cpu={emb_cpu_ms:.1}ms upload {:.1}ms",
                     (embd.ty as u32),
@@ -133,7 +129,7 @@ pub(super) fn frame_forward_ex(
         Vec::new()
     };
 
-    let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+    let trace = llm170_diag::flag::on("LLM170_Q4_TRACE");
     let t_call = std::time::Instant::now();
     // plans/93 P2: 디바이스 PLE 실행 플래그 — 반환 직전 링 재동기 판정.
     let mut ple_dev = false;
@@ -156,7 +152,7 @@ pub(super) fn frame_forward_ex(
         {
             return Err(Q4Error::Io(format!("frame_failat: 주입 L{il}")));
         }
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
         // 107 W10: il=0 스킵 — 진입 전 버퍼(.mix·mids 등)는 아직 한 번도
@@ -294,14 +290,14 @@ pub(super) fn frame_forward_ex(
                             eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})")
                         });
                     } else {
-                        if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                        if llm170_diag::flag::on("LLM170_PLE_TRACE") {
                             eprintln!(
                                 "# ple-gather t={t} elapsed={:.1}ms",
                                 _pg0.elapsed().as_secs_f64() * 1e3
                             );
                         }
                         let mut pre_capture = Vec::new();
-                        if std::env::var_os("LLM170_PLE_CHECK").is_some() {
+                        if llm170_diag::flag::on("LLM170_PLE_CHECK") {
                             // 그림자용 PLE 직전 res_hc(레이어 0 출력) 판독 — 동기 1회.
                             pre_capture = vec![0.0f32; hc * n];
                             acc.frame_read(f.res_hc, &mut pre_capture)
@@ -351,7 +347,7 @@ pub(super) fn frame_forward_ex(
                                 &seq_st.ple_conv,
                             )
                         });
-                        if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                        if llm170_diag::flag::on("LLM170_PLE_TRACE") {
                             eprintln!(
                                 "# ple-dev-sec L{il} t={t} elapsed={:.1}ms",
                                 _pd0.elapsed().as_secs_f64() * 1e3
@@ -361,10 +357,10 @@ pub(super) fn frame_forward_ex(
                             Ok(()) => {
                                 ple_dev_done = true;
                                 ple_dev = true;
-                                if std::env::var_os("LLM170_PLE_TRACE").is_some() {
+                                if llm170_diag::flag::on("LLM170_PLE_TRACE") {
                                     eprintln!("# ple-dev OK L{il} t={t}");
                                 }
-                                if std::env::var_os("LLM170_PLE_CHECK").is_some() {
+                                if llm170_diag::flag::on("LLM170_PLE_CHECK") {
                                     super::diag::ple_check_shadow(
                                         acc,
                                         f,
@@ -425,7 +421,7 @@ pub(super) fn frame_forward_ex(
         // 2) hc attn mix
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_attn"), f.mix)?;
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
         }
         if il == 0 {
@@ -440,7 +436,7 @@ pub(super) fn frame_forward_ex(
                 gdn_frame(
                     acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t,
                 )?;
-                if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+                if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
                     frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.gdn"));
                 }
             }
@@ -478,7 +474,7 @@ pub(super) fn frame_forward_ex(
             {
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             } else {
-                let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
+                let qtm = llm170_diag::flag::on("LLM170_Q4_TIME");
                 let mut ql = std::time::Instant::now();
                 let mut mix_v = vec![0.0f32; t * n];
                 acc.capture_mark("recr_in").map_err(Q4Error::Io)?;
@@ -501,7 +497,7 @@ pub(super) fn frame_forward_ex(
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
-            if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+            if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
                 frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.qsa"));
             }
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -510,7 +506,7 @@ pub(super) fn frame_forward_ex(
         // 4) hc ffn mix + MoE
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
         }
         if il == 0 {
@@ -518,7 +514,7 @@ pub(super) fn frame_forward_ex(
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
         }
 
@@ -586,7 +582,8 @@ pub(super) fn frame_forward_ex(
             },
         )?;
         let w_up = model.w4("output_hc_up.weight")?;
-        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
+        acc.frame_mm(f.hlo, &w_up, f.hgate, t)
+            .map_err(Q4Error::Io)?;
         op(
             acc,
             FrameOp::HcGateMean {
@@ -595,7 +592,6 @@ pub(super) fn frame_forward_ex(
                 out: f.hin,
                 hc,
                 n,
-
             },
         )?;
         if t > 1 {
@@ -643,7 +639,7 @@ pub(super) fn frame_forward_ex(
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         let _lt0 = std::time::Instant::now();
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
-        if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+        if llm170_diag::flag::on("LLM170_FRAME_TIME") {
             eprintln!(
                 "# logits-d2h {:.1}ms (vocab {})",
                 _lt0.elapsed().as_secs_f64() * 1e3,
@@ -659,7 +655,7 @@ pub(super) fn frame_forward_ex(
                 seq_st.ple_conv.copy_from_slice(&ring);
             }
         }
-        if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+        if llm170_diag::flag::on("LLM170_FRAME_TIME") {
             eprintln!("# ff-pre-logits");
         }
         ftime_report(t);
@@ -670,7 +666,7 @@ pub(super) fn frame_forward_ex(
                 t_call.elapsed().as_secs_f64() * 1e3
             );
         }
-        if std::env::var_os("LLM170_Q4_DBG").is_some() {
+        if llm170_diag::flag::on("LLM170_Q4_DBG") {
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             eprintln!(
@@ -755,7 +751,7 @@ pub(super) fn qsa_frame(
     b: &QsaBufs,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
-    let qtm = std::env::var_os("LLM170_Q4_TIME").is_some();
+    let qtm = llm170_diag::flag::on("LLM170_Q4_TIME");
     let t_qsa = std::time::Instant::now();
     let mut lap = t_qsa;
     let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
@@ -897,7 +893,7 @@ pub(super) fn qsa_frame(
             });
         match dev {
             Ok((sd, od, list_len)) => {
-                if std::env::var_os("LLM170_QSA_SELCHECK").is_some() {
+                if llm170_diag::flag::on("LLM170_QSA_SELCHECK") {
                     // 검증 그림자: 동일 입력으로 호스트 선택을 재계산해 목록을
                     // 대조한다. 이 경로는 호스트 캐시도 갱신하므로 stale가 유지
                     // 되지 않는다(프리필 재구축 불필요 — 검증 모드의 부수 효과).
@@ -1139,7 +1135,7 @@ pub(super) fn qsa_frame(
     // 직접 읽는다(매 층 매 스텝의 캐시 재업로드 8k 문맥 32MB 제거).
     // 미지원/실측 실패 시 기존 업로드 경로(qsa_attention_dev)로, 그것도
     // 실패하면 CPU 재계산으로 — 3단 폴백.
-    let res = if std::env::var_os("LLM170_QSA_NORES").is_some() {
+    let res = if llm170_diag::flag::on("LLM170_QSA_NORES") {
         Err("진단: 상주 풀 비활성".to_string())
     } else {
         acc.qsa_kv_dev(full_idx, seq, b.k, b.v, t, pos0 as usize, n_kv, hd)
@@ -1151,7 +1147,7 @@ pub(super) fn qsa_frame(
     };
     let ck = &seq_st.kv_k[full_idx][..kn_max];
     let cv = &seq_st.kv_v[full_idx][..kn_max];
-    if std::env::var_os("LLM170_QSA_RESCHECK").is_some()
+    if llm170_diag::flag::on("LLM170_QSA_RESCHECK")
         && !seq_st.qsa_host_stale
         && let Err(e) = acc.qsa_kv_check(full_idx, seq, ck, cv)
     {
@@ -1310,7 +1306,6 @@ pub(super) fn hc_mix_frame(
             out: f.mix,
             hc,
             n,
-
         },
     )?;
     if mark_attn && llm170_diag::dump::opts().bufhash {
@@ -1318,7 +1313,7 @@ pub(super) fn hc_mix_frame(
     }
     // plans/86 §1 — t=1 hc mix 절대 대조(임시 진단): 디바이스 체인을 op별로
     // 판독해 CPU 참조(stages/hc.rs 동일 산술)와 맞댄다. 첫 발산 op 특정용.
-    if t == 1 && il == 0 && kind == "attn" && std::env::var_os("LLM170_MIX_CHECK").is_some() {
+    if t == 1 && il == 0 && kind == "attn" && llm170_diag::flag::on("LLM170_MIX_CHECK") {
         let mut res = vec![0.0f32; hc * n];
         acc.frame_read(f.res_hc, &mut res).map_err(Q4Error::Io)?;
         let mut dxn = vec![0.0f32; hc * n];
@@ -1435,7 +1430,7 @@ pub(super) fn gdn_frame(
             .map_err(Q4Error::Io)?;
     }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
-    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
         frame_ck(acc, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
     }
     // β/e^g
@@ -1455,7 +1450,7 @@ pub(super) fn gdn_frame(
         )?;
     }
     sync_mark(acc, "gdn.betag", f.gbg)?;
-    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
         frame_ck(acc, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
     }
     // conv + ring
@@ -1476,7 +1471,7 @@ pub(super) fn gdn_frame(
         if il == 0 && llm170_diag::dump::opts().bufhash {
             buf_hash(acc, f.gconv, conv_ch * t.min(16), "G0.conv");
         }
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
         }
     }
@@ -1548,7 +1543,7 @@ pub(super) fn gdn_frame(
             hp.d_state,
         )
         .map_err(Q4Error::Io)?;
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.go, v_len, t, &format!("L{il}.gdn_ar"));
             // 이월 상태(carry) — conv 링과 AR 상태가 청크 간 동일하게 유지되는지.
             // 입력이 모두 비트 동일한데 AR 출력이 갈리는 경우 이 둘이 유일한 미지수다.
@@ -1572,7 +1567,7 @@ pub(super) fn gdn_frame(
     if il == 0 && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.go, v_len * t.min(16), "G0.go");
     }
-    if std::env::var_os("LLM170_NP_DBG").is_some() && il == 0 {
+    if llm170_diag::flag::on("LLM170_NP_DBG") && il == 0 {
         let mut v = vec![0.0f32; v_len];
         if acc.frame_read(f.go, &mut v).is_ok() {
             eprintln!(
@@ -1647,7 +1642,7 @@ pub(super) fn moe_frame(
         )?;
     }
     sync_mark(acc, "moe.top10", f.mids)?;
-    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
         frame_ck(acc, f.mids, k_sel, t, &format!("L{il}.mids"));
         frame_ck(acc, f.mwt, k_sel, t, &format!("L{il}.mwt"));
     }
@@ -1658,7 +1653,7 @@ pub(super) fn moe_frame(
     let mut sh_early = false;
     if t == 1 {
         // 디코드: mix를 k_sel행 브로드캐스트 — 전용 커널 1런치(기존 k_sel런치).
-        let msync = std::env::var_os("LLM170_MOE_SYNC").is_some();
+        let msync = llm170_diag::flag::on("LLM170_MOE_SYNC");
         op(
             acc,
             FrameOp::BcastRows {
@@ -1749,19 +1744,19 @@ pub(super) fn moe_frame(
                 &format!("L{il}D.mxsel_after_gather"),
             );
         }
-        if std::env::var_os("LLM170_MOE_GATHER2").is_some() {
+        if llm170_diag::flag::on("LLM170_MOE_GATHER2") {
             // 진단(plans/80): gather 2회 — 멱등 쓰기라 결과 불변이어야 한다.
             // 2회째에 x가 바르게 되면 첫 쓰기가 찢어진 것, 그대로면 이웃 오염.
             fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t)
                 .map_err(Q4Error::Io)?;
         }
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
             frame_ck(acc, f.mids, 1, t * k_sel, &format!("L{il}.mids_u32"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
-        if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
@@ -1783,7 +1778,7 @@ pub(super) fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
-    if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
+    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
         frame_ck(acc, f.mout, n, t, &format!("L{il}.moe_sc"));
     }
     if !stage_skipped("moe.shared") {

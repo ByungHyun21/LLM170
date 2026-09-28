@@ -16,7 +16,7 @@ thread_local! {
 /// 에서만 측정한다 — 프레임 op는 비동기라 호출 시간만으로는 GPU 시간이 안 나온다.
 pub(super) fn ftime_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLM170_FRAME_TIME").is_some())
+    *ON.get_or_init(|| llm170_diag::flag::on("LLM170_FRAME_TIME"))
 }
 
 /// 진단용 스테이지 스킵(LLM170_STAGE_SKIP="qsa,gdn,moe") — 비용 분해 전용.
@@ -92,7 +92,7 @@ pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
     let mut v = vec![0.0f32; len];
     acc.frame_sync(); // plans/84 E.2: 커스텀 스트림 미완결 쓰기 경합 제거
     if acc.frame_read(h, &mut v).is_ok() {
-        if std::env::var_os("LLM170_DUMP_E2VALS").is_some() && v.len() >= 8 {
+        if llm170_diag::flag::on("LLM170_DUMP_E2VALS") && v.len() >= 8 {
             eprintln!(
                 "[npbv] {tag} first8={:x?}",
                 v[..8].iter().map(|f| f.to_bits()).collect::<Vec<_>>()
@@ -108,7 +108,7 @@ pub(super) fn buf_hash(acc: &dyn Accelerator, h: u64, len: usize, tag: &str) {
 }
 
 pub(super) fn sync_mark(acc: &dyn Accelerator, tag: &str, h: u64) -> Result<(), Q4Error> {
-    match (ftime_on(), std::env::var_os("LLM170_FRAME_SYNC").is_some()) {
+    match (ftime_on(), llm170_diag::flag::on("LLM170_FRAME_SYNC")) {
         (false, false) => return Ok(()),
         (ft, sync) => {
             // 1원소 판독 = 동기 + 폴트 보고 (barrier는 오류를 삼킨다).

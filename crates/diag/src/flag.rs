@@ -17,6 +17,32 @@ fn registry() -> &'static Mutex<HashMap<String, FlagInfo>> {
     static R: OnceLock<Mutex<HashMap<String, FlagInfo>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// 값 맵 — 1회 스냅샷(plans/107 W2). 핫패스 판독 잠금·조회 원자화.
+static VALUES: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
+        .collect()
+});
+
+/// 이름 존재 여부 — `var_os(name).is_some()` 대응(캐시형).
+pub fn on(name: &str) -> bool {
+    VALUES.contains_key(name)
+}
+
+/// `== "1"` 엄격 옵트인 — `var(name).map(|v| v == "1").unwrap_or(false)` 대응.
+pub fn eq1(name: &str) -> bool {
+    VALUES.get(name).is_some_and(|v| v == "1")
+}
+
+/// `!= "0"` 기본 ON — `var(name).map(|v| v != "0").unwrap_or(true)` 대응.
+pub fn ne0(name: &str) -> bool {
+    VALUES.get(name).is_some_and(|v| v != "0")
+}
+
+/// 원시 값 — 수치 파싱 등 특수 호출부용.
+pub fn val(name: &str) -> Option<&str> {
+    VALUES.get(name).map(|v| v.as_str())
+}
 
 /// 환경변수 존재 여부 판독 + 캐시 + 레지스트리 등록.
 /// 캐시 키는 환경변수명 그대로. 첫 호출 시 1회 판독 후 고정.
@@ -28,7 +54,7 @@ pub fn env_on(name: &str) -> bool {
         return info.value;
     }
     // 첫 판독
-    let v = std::env::var_os(name).is_some();
+    let v = on(name);
     // 등록 (기존 등록이 있으면 덮어쓰지 않음 — 진단용)
     if let Ok(mut r) = registry().lock() {
         r.entry(name.to_string())

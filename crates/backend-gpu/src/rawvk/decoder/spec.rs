@@ -109,7 +109,7 @@ impl DecoderState {
         } else {
             self.m_h.buf
         };
-        let noba = std::env::var_os("LLM170_VK_NOBATCH").is_some();
+        let noba = llm170_diag::flag::on("LLM170_VK_NOBATCH");
         if !noba {
             self.ctx.begin_batch()?;
         }
@@ -309,10 +309,7 @@ impl DecoderState {
         // 배치 검증 기본 (plans/91 P2): step_batch t행 == step() 행별 비트 동일
         // (plans/20 계약 + P0 verify_np_self 재확보 — gemv8t 2..4토큰 포함).
         // 킬스위치 LLM170_VKD_SPEC_BATCH=0.
-        if std::env::var("LLM170_VKD_SPEC_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-        {
+        if llm170_diag::flag::ne0("LLM170_VKD_SPEC_BATCH") {
             let n = self.n_embd;
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
                 let t = ch.len() / n;
@@ -320,7 +317,7 @@ impl DecoderState {
                 // 107 W1: all_logits=true는 이제 전사 없이 b_lg_t에 상주
                 // (step_batch 계약 변경 — 유일 소비자가 이 경로다).
                 let _ = self.step_batch(seq, pos0 + off, ch, true)?;
-                if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
+                if llm170_diag::flag::on("LLM170_SPEC_TIMING") {
                     eprintln!(
                         "[vb] step_batch t={t} = {:.1}ms",
                         _tt.elapsed().as_secs_f64() * 1e3
@@ -411,7 +408,7 @@ impl DecoderState {
         if t == 0 || t > T_MAX {
             return Err(format!("mtp_prefill_batch: t={t} 범위 밖"));
         }
-        let mtp_time = std::env::var_os("LLM170_MTP_TIMING").is_some();
+        let mtp_time = llm170_diag::flag::on("LLM170_MTP_TIMING");
         let t0 = std::time::Instant::now();
         // ① 임베딩: 선반입(있으면 그대로, 없으면 업로드) + h_shift 디바이스 조립
         if !self

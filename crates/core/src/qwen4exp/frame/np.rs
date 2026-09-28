@@ -106,7 +106,7 @@ pub(super) fn gdn_frame_np(
     let cw = f.consts[&format!("blk.{il}.conv_w")];
     let vv = f.np_views.as_ref().unwrap();
     // NP 디버그 프로브(2026-09-16): conv/AR 직후 행0 합계
-    let npdbg = std::env::var_os("LLM170_NP_DBG").is_some() && il == 0;
+    let npdbg = llm170_diag::flag::on("LLM170_NP_DBG") && il == 0;
     let psum = |acc: &dyn Accelerator, h: u64, n2: usize, tag: &str| {
         if npdbg {
             let mut v = vec![0.0f32; n2];
@@ -608,7 +608,8 @@ pub(super) fn frame_forward_np_ex(
             },
         )?;
         let w_up = model.w4("output_hc_up.weight")?;
-        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
+        acc.frame_mm(f.hlo, &w_up, f.hgate, t)
+            .map_err(Q4Error::Io)?;
         op(
             acc,
             FrameOp::HcGateMean {
@@ -617,7 +618,6 @@ pub(super) fn frame_forward_np_ex(
                 out: f.hin,
                 hc,
                 n,
-
             },
         )?;
         let wout = model
@@ -635,7 +635,7 @@ pub(super) fn frame_forward_np_ex(
         } else {
             let mut all = vec![0.0f32; hp.vocab * t];
             acc.frame_read(f.logits_t, &mut all).map_err(Q4Error::Io)?;
-            if std::env::var_os("LLM170_NP_DBG").is_some() {
+            if llm170_diag::flag::on("LLM170_NP_DBG") {
                 for r in 0..t {
                     let row = &all[r * hp.vocab..(r + 1) * hp.vocab];
                     let (i1, v1) = row
