@@ -2948,3 +2948,14 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   preflight에 추가해야 계약 결함이 게이트 전에 잡힌다 — W10
   charhash가 hip만 커버하는 간극도 동일(4게이트 확대로 보완).
 - 검증: FN vulkan·FN hip·27B hip·charhash 4게이트 PASS.
+
+### (105) RESF16 백엔드 인지 재승격 — hip ON·vk OFF (plans/107, 2026-09-28)
+
+- **원장 88의 +12.5% 재검증**: 웜키횭 A/B 3reps — ON 243.0 vs OFF
+  233.0 t/s (**+4.3%**, 군 완전 분리). 원 측정의 차이 크기는 콜드
+  컨파운드였으나 이득 자체는 실재(코어 CPU 브리지 업로드 절반).
+- **구조**: res_f16_on() 단일 스위치 — 명시 env 최우선, 없으면
+  set_backend_res_f16()로 엔진 기동 시 지정(build_slots: hip=true,
+  vk=false). vkacc 5개 발화점도 core 스위치로 통합(이중 판독 제거).
+- 검증: 4게이트 PASS(FN vk·FN hip·27B hip·charhash) + hip pp512
+  241.6 t/s 회복 확인.

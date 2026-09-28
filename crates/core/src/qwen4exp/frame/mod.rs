@@ -458,14 +458,23 @@ pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
     st.ple_next_pos = s.next_pos;
     st.ple_conv = s.conv;
 }
-/// plans/103 — res_hc f16 버스(원자 스위치: 전 기입/판독 동시 전환).
-/// 107(원장 104): 승격 철회 — FN **vulkan** 토큰 게이트가 f16 변형
-/// 슬롯에서 발산(hip은 33/33·pp512 +12.5% 실증이었으나 백엔드별 값
-/// 차이). 게이트를 깨는 정밀도 변경은 기본 불가 — 엄격 옵트인으로
-/// 환원, 백엔드 인지 구성(W2 Config) 재승격 과제로.
-pub(crate) fn res_f16_on() -> bool {
-    llm170_diag::flag::eq1("LLM170_VK_RESF16")
+/// plans/103 — res_hc f16 버스(원자 스위치: 전 기입/판독 동시 전전환).
+/// 107(원장 104·105): 백엔드별 기본 — hip ON(웜 A/B +4.3% 실측,
+/// 토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산). 명시 env
+/// (=1/=0)가 최우선, 없으면 엔진 기동 시 지정된 백엔드 기본값.
+pub fn res_f16_on() -> bool {
+    if let Some(v) = llm170_diag::flag::val("LLM170_VK_RESF16") {
+        return v != "0";
+    }
+    BACKEND_RES_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// 엔진 기동 시 백엔드 기본 지정(hip=true, vk=false) — build_slots에서
+/// 가속기 생성 전 1회 호출.
+pub fn set_backend_res_f16(on: bool) {
+    BACKEND_RES_F16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+static BACKEND_RES_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// f32 → f16 비트(반올림 짝수) — half 의존 없는 국소 변환(호스트 폴백 전용).
 pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {

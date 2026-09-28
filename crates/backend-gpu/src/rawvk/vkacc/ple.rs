@@ -180,7 +180,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         {
             // plans/93: t>1은 병렬판(워프 협업 RMS/dot) — 구판은 lane0 순차.
             // plans/103: res_hc f16 버스 — 게이트 변형 슬롯(f32 쌍둥이 불변).
-            let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
+            let resf16 = llm170_core::qwen4exp::frame::res_f16_on();
             let gate_slot = match (t > 1, resf16) {
                 (true, false) => Slot::FnPleGateMt,
                 (true, true) => Slot::FnPleGateMtF16,
@@ -210,7 +210,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         // (3) 잔차.
         {
             // plans/103: res_hc f16 버스 — 잔차 RMW 변형 슬롯(페어 소유).
-            let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
+            let resf16 = llm170_core::qwen4exp::frame::res_f16_on();
             let slot = if resf16 {
                 Slot::FnPleResF16
             } else {
@@ -284,7 +284,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         let ob = self.fbuf(out)?;
         let bpr = n / 32;
         // plans/103: res_hc f16 버스 — 초기 기입 변형(블록 내 쌍팩).
-        let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
+        let resf16 = llm170_core::qwen4exp::frame::res_f16_on();
         let slot = if resf16 {
             Slot::EmbQ8GF16
         } else {
