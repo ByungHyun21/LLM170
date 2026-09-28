@@ -1,7 +1,7 @@
 //! q4acc QSA — 인덱서 어텐션 raw 내부 + QsaOps (plans/78 R1).
 
 use super::*;
-use crate::rawhip::{env_on, env_eq};
+use crate::rawhip::{env_eq, env_on};
 
 impl Q4Acc {
     /// q4_qsa_attn_sel 런치 본체 — 선택 목록(오름차순 위치)만 순회한다.
@@ -24,8 +24,8 @@ impl Q4Acc {
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
             // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
             // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
-                * n_kv.max(1) * hd.max(1);
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
             let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
@@ -114,8 +114,8 @@ impl Q4Acc {
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
             // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
             // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
-                * n_kv.max(1) * hd.max(1);
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
             let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
@@ -167,7 +167,8 @@ impl Q4Acc {
         } else {
             ("q4_qsa_attn_sel4", (n_head / 8) as u32)
         };
-        self.ctx.launch3(kern, t.div_ceil(4) as u32, gy, 1, 256, &mut args)?;
+        self.ctx
+            .launch3(kern, t.div_ceil(4) as u32, gy, 1, 256, &mut args)?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
         Ok(out)
@@ -205,8 +206,7 @@ impl Q4Acc {
         {
             let mut wm = self.qsa_kv_pos.lock().map_err(|e| e.to_string())?;
             let w = wm.entry((full_idx, seq)).or_insert(0);
-            crate::common::qsa::wm_advance(w, pos0, t)
-                .map_err(|e| format!("qsa_kv_dev: {e}"))?;
+            crate::common::qsa::wm_advance(w, pos0, t).map_err(|e| format!("qsa_kv_dev: {e}"))?;
         }
         let mut m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
         let ent = m
@@ -250,7 +250,9 @@ impl Q4Acc {
             return Err("qsa_idx_append: ctx_len 미주입".into());
         }
         if r == 0 || idx_dim != 128 {
-            return Err(format!("qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"));
+            return Err(format!(
+                "qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"
+            ));
         }
         {
             let mut wm = self.qsa_idx_pos.lock().map_err(|e| e.to_string())?;
@@ -296,8 +298,7 @@ impl Q4Acc {
                 ikw_d as *mut std::ffi::c_void,
                 cs_d as *mut std::ffi::c_void,
             );
-            let (mut e, mut bb0, mut rr, mut dd) =
-                (eps, b0 as i32, r as i32, idx_dim as i32);
+            let (mut e, mut bb0, mut rr, mut dd) = (eps, b0 as i32, r as i32, idx_dim as i32);
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut ikp) as *mut _ as *mut std::ffi::c_void,
                 (&mut bkp) as *mut _ as *mut std::ffi::c_void,
@@ -394,7 +395,8 @@ impl Q4Acc {
                     .get(1)
                     .copied()
                     .unwrap_or(0)
-                    .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
+                    .saturating_sub(sel_off.first().copied().unwrap_or(0))
+                    as usize;
                 let cap = std::env::var("LLM170_QSA_SPLITS")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -416,7 +418,8 @@ impl Q4Acc {
                 .get(1)
                 .copied()
                 .unwrap_or(0)
-                .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
+                .saturating_sub(sel_off.first().copied().unwrap_or(0))
+                as usize;
             let cap = std::env::var("LLM170_QSA_SPLITS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -591,8 +594,14 @@ impl Q4Acc {
             self.ctx.launch3(kern, gx, gy, 1, blk, &mut args)?;
         } else {
             // _sel 원본 규격: 블록 16워프=16토큰(워프당 1헤드), gy=n_head.
-            self.ctx
-                .launch3("q4_qsa_attn_sel", t.div_ceil(16) as u32, n_head as u32, 1, 512, &mut args)?;
+            self.ctx.launch3(
+                "q4_qsa_attn_sel",
+                t.div_ceil(16) as u32,
+                n_head as u32,
+                1,
+                512,
+                &mut args,
+            )?;
         }
         Ok(())
     }
@@ -633,8 +642,8 @@ impl Q4Acc {
             let qdev = a.ensure(&self.ctx, q.len().max(1) * 4)?;
             // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
             // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
-                * n_kv.max(1) * hd.max(1);
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
             let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
@@ -749,8 +758,8 @@ impl Q4Acc {
             .unwrap_or(64);
         let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let (kdev, vdev, sdev, ofdev, pdev) = {
-            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
-                * n_kv.max(1) * hd.max(1);
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
             let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
@@ -850,8 +859,8 @@ impl Q4Acc {
             let qdev = a.ensure(&self.ctx, q.len() * 4)?;
             // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
             // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats = self.ctx_len.load(std::sync::atomic::Ordering::Relaxed)
-                * n_kv.max(1) * hd.max(1);
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
             let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
             let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
             let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
@@ -905,14 +914,16 @@ impl Q4Acc {
         if env_on("LLM170_Q4_DBG") {
             let bad = out.iter().filter(|v| !v.is_finite()).count();
             let badq = q.iter().filter(|v| !v.is_finite()).count();
-            eprintln!("# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}", out.len());
+            eprintln!(
+                "# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}",
+                out.len()
+            );
         }
         Ok(out)
     }
 }
 
 impl llm170_core::matmul::QsaOps for Q4Acc {
-
     fn qsa_attention_dev(
         &self,
         q: u64,
@@ -931,9 +942,13 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         // 쌍을 쓴다. 규약은 호스트 판(qsa_attention_sel)과 동일: LLM170_QSA_SPLIT=0
         // 이면 비분할 sel6/sel4로 돌아간다.
         if t == 1 && !env_eq("LLM170_QSA_SPLIT", "0") {
-            self.qsa_attn_sel4s_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+            self.qsa_attn_sel4s_dev_raw(
+                q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out,
+            )
         } else {
-            self.qsa_attn_dev_raw(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+            self.qsa_attn_dev_raw(
+                q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out,
+            )
         }
     }
 
@@ -1003,7 +1018,9 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         t: usize,
         out: u64,
     ) -> Result<(), String> {
-        self.qsa_attn_res(q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out)
+        self.qsa_attn_res(
+            q, ck, cv, sel_idx, sel_off, kq_scale, n_head, n_kv, hd, t, out,
+        )
     }
 
     fn qsa_sel_dev(
@@ -1032,12 +1049,25 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         let n_past = pos0 + t;
         let n_blocks = n_past / r;
         if n_blocks > 8192 {
-            return Err(format!("qsa_sel_dev: n_blocks={n_blocks} > 8192 (expand shared)"));
+            return Err(format!(
+                "qsa_sel_dev: n_blocks={n_blocks} > 8192 (expand shared)"
+            ));
         }
         let iqp = self.fptr(iq)?;
         let ikp = self.fptr(ik)?;
-        let (_idxk_p, bk_p) =
-            self.qsa_idx_append(full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
+        let (_idxk_p, bk_p) = self.qsa_idx_append(
+            full_idx,
+            seq,
+            ikp,
+            &[],
+            t,
+            pos0,
+            idx_dim,
+            r,
+            ikw,
+            cs_idx,
+            eps,
+        )?;
         // (1) iq norm+rope — iqr 스크래치.
         let iqr = {
             let mut g = self.qsa_iqr.lock().map_err(|e| e.to_string())?;
@@ -1052,13 +1082,8 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 iqw_d as *mut std::ffi::c_void,
                 cs_d as *mut std::ffi::c_void,
             );
-            let (mut e, mut pp, mut tt, mut ih, mut dd) = (
-                eps,
-                pos0 as i32,
-                t as i32,
-                idx_heads as i32,
-                idx_dim as i32,
-            );
+            let (mut e, mut pp, mut tt, mut ih, mut dd) =
+                (eps, pos0 as i32, t as i32, idx_heads as i32, idx_dim as i32);
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut qp) as *mut _ as *mut std::ffi::c_void,
                 (&mut op) as *mut _ as *mut std::ffi::c_void,
@@ -1070,8 +1095,14 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 (&mut ih) as *mut _ as *mut std::ffi::c_void,
                 (&mut dd) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx
-                .launch3("q4_idx_q_rope", idx_heads as u32, t as u32, 1, 32, &mut args)?;
+            self.ctx.launch3(
+                "q4_idx_q_rope",
+                idx_heads as u32,
+                t as u32,
+                1,
+                32,
+                &mut args,
+            )?;
         }
         // (2) 블록 점수 — 스레드당 블록.
         let scr = {
@@ -1116,8 +1147,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             let ofdev = e2.ensure(&self.ctx, 2 * 4)? as u64;
             (sdev, ofdev)
         };
-        if n_blocks > 0 && n_blocks <= 4096 && !env_eq("LLM170_QSA_TOPK", "0")
-        {
+        if n_blocks > 0 && n_blocks <= 4096 && !env_eq("LLM170_QSA_TOPK", "0") {
             // 비토닉 단일 블록판 — rank+expand 콤보 대비 ~20×(0.228 → ~0.01ms).
             let (mut sp, mut si, mut so) = (
                 scr as *mut std::ffi::c_void,
@@ -1180,8 +1210,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
                 (&mut rr) as *mut _ as *mut std::ffi::c_void,
                 (&mut np) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx
-                .launch3("q4_idx_expand", 1, 1, 1, 256, &mut args)?;
+            self.ctx.launch3("q4_idx_expand", 1, 1, 1, 256, &mut args)?;
         }
         Ok((sdev, ofdev, list_len))
     }
@@ -1230,8 +1259,20 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         eps: f32,
     ) -> Result<(), String> {
         let ikp = self.fptr(ik)? as *const u8;
-        self.qsa_idx_append(full_idx, seq, ikp, &[], t, pos0, idx_dim, r, ikw, cs_idx, eps)
-            .map(|_| ())
+        self.qsa_idx_append(
+            full_idx,
+            seq,
+            ikp,
+            &[],
+            t,
+            pos0,
+            idx_dim,
+            r,
+            ikw,
+            cs_idx,
+            eps,
+        )
+        .map(|_| ())
     }
 
     fn qsa_host_rebuild(
@@ -1266,8 +1307,14 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             let ent = m
                 .get(&(full_idx, seq))
                 .ok_or("qsa_host_rebuild: kv 풀 없음")?;
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut kv_k[..pos * kv_row]), ent.0.ptr)?;
-            self.ctx.d2h(bytemuck::cast_slice_mut(&mut kv_v[..pos * kv_row]), ent.1.ptr)?;
+            self.ctx.d2h(
+                bytemuck::cast_slice_mut(&mut kv_k[..pos * kv_row]),
+                ent.0.ptr,
+            )?;
+            self.ctx.d2h(
+                bytemuck::cast_slice_mut(&mut kv_v[..pos * kv_row]),
+                ent.1.ptr,
+            )?;
         }
         {
             let m = self.qsa_idxk.lock().map_err(|e| e.to_string())?;
@@ -1412,7 +1459,9 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         // 어텐션 행**을 반환해 어텐션 자체가 누락됐다(양 경로 동일 → 자가일치
         // 검사가 통과). 유일한 강제 폴백: LLM170_QSA_CPU=1.
         if env_on("LLM170_QSA_CPU") {
-            return Err(format!("q4acc: qsa_attention t={t} CPU 강제(LLM170_QSA_CPU)"));
+            return Err(format!(
+                "q4acc: qsa_attention t={t} CPU 강제(LLM170_QSA_CPU)"
+            ));
         }
         self.qsa_attn_raw(q, ck, cv, mask, kq_scale, n_past, n_head, n_kv, hd, t)
     }

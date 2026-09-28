@@ -46,10 +46,7 @@ fn hc_mix_ex(
     let mut inject_all = vec![vec![0.0f32; hc]; t];
     match w_inject {
         Some(wi) => {
-            let mut gi = vec![
-                std::mem::take(&mut lo_all),
-                std::mem::take(&mut inject_all),
-            ];
+            let mut gi = vec![std::mem::take(&mut lo_all), std::mem::take(&mut inject_all)];
             ctx.mm_group(&xn_all, &[*w_down, *wi], &mut gi)?;
             lo_all = std::mem::take(&mut gi[0]);
             inject_all = std::mem::take(&mut gi[1]);
@@ -96,7 +93,9 @@ pub fn hc_mix(
     res_hc: &[Vec<f32>],
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), Q4Error> {
     profile_span!("q4::hc_mix");
-    let w_norm = ctx.model.f32_vec4(&format!("blk.{il}.hc_{kind}_norm.weight"))?;
+    let w_norm = ctx
+        .model
+        .f32_vec4(&format!("blk.{il}.hc_{kind}_norm.weight"))?;
     let w_down = ctx.model.w4(&format!("blk.{il}.hc_{kind}_down.weight"))?;
     let w_up = ctx.model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
     let w_inject = ctx.model.w4(&format!("blk.{il}.hc_{kind}_inject.weight"))?;

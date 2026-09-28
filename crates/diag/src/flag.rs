@@ -37,7 +37,6 @@ pub fn env_on(name: &str) -> bool {
     v
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

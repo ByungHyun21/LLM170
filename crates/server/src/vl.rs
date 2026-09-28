@@ -45,7 +45,9 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let (model, mmproj) = match (model, mmproj) {
         (Some(m), Some(p)) => (m, p),
         _ => {
-            eprintln!("usage: llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...] [--spec k] [--n-predict N]");
+            eprintln!(
+                "usage: llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...] [--spec k] [--n-predict N]"
+            );
             return ExitCode::from(2);
         }
     };
@@ -56,8 +58,8 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     // qwen3.8 VL 템플릿 (서버 /tokenize 확정):
     // <|im_start|>user\n [prefix] <|vision_start|><|image_pad|><|vision_end|> [question]
     // <|im_end|>\n<|im_start|>assistant\n — prefix/question 미지정 시 기존 프롬프트 동일.
-    let question: Vec<u32> = question_ids
-        .unwrap_or_else(|| vec![72240, 411, 2099, 303, 799, 2716, 11316, 13]);
+    let question: Vec<u32> =
+        question_ids.unwrap_or_else(|| vec![72240, 411, 2099, 303, 799, 2716, 11316, 13]);
     let mut prompt: Vec<u32> = Vec::with_capacity(prefix_ids.len() + question.len() + 12);
     prompt.extend_from_slice(&[248045, 846, 198]);
     prompt.extend_from_slice(&prefix_ids);
@@ -75,7 +77,11 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     };
     let n_img = images.len();
     let mut all_vis: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_img);
-    let mut vit_cache: Option<(std::sync::Arc<llm170_backend_gpu::rawhip::RawCtx>, std::sync::Arc<llm170_backend_gpu::rawhip::vit::Vit>, usize)> = None;
+    let mut vit_cache: Option<(
+        std::sync::Arc<llm170_backend_gpu::rawhip::RawCtx>,
+        std::sync::Arc<llm170_backend_gpu::rawhip::vit::Vit>,
+        usize,
+    )> = None;
     for (si, ipath) in images.iter().enumerate() {
         let img = match image::open(ipath) {
             Ok(i) => i.to_rgb8(),
@@ -88,7 +94,14 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         // qwen3vl smart_resize (align 32, 토큰 8..4096) + Pillow bicubic
         let (tw, th) = llm170_core::clip_preproc::smart_resize(iw, ih, 16, 2, 8, 4096);
         let raw = img.as_raw();
-        let rgb8 = llm170_core::clip_preproc::resize_pillow(raw, iw as usize, ih as usize, tw as usize, th as usize, true);
+        let rgb8 = llm170_core::clip_preproc::resize_pillow(
+            raw,
+            iw as usize,
+            ih as usize,
+            tw as usize,
+            th as usize,
+            true,
+        );
         eprintln!("# resize[{si}] {iw}x{ih} -> {tw}x{th}");
         let (tw, th) = (tw as usize, th as usize);
         let mut px = vec![0f32; tw * th * 3];
@@ -104,10 +117,18 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     let weights = clip.vit_weights()?;
                     let n_ff = clip.n_ff();
                     let tw0 = std::time::Instant::now();
-                    #[allow(clippy::arc_with_non_send_sync)] // vl 단일스레드 경로 — HIP 런타임 직렬화(Q4Acc unsafe Send/Sync와 동일 계약)
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    // vl 단일스레드 경로 — HIP 런타임 직렬화(Q4Acc unsafe Send/Sync와 동일 계약)
                     let ctx = std::sync::Arc::new(llm170_backend_gpu::rawhip::RawCtx::new()?);
                     let vit = llm170_backend_gpu::rawhip::vit::Vit::new(
-                        ctx.clone(), weights, n_embd, n_head, n_ff, n_blk, eps, tmax,
+                        ctx.clone(),
+                        weights,
+                        n_embd,
+                        n_head,
+                        n_ff,
+                        n_blk,
+                        eps,
+                        tmax,
                     )?;
                     eprintln!("# vit weights+upload {:.1}s", tw0.elapsed().as_secs_f64());
                     vit_cache = Some((ctx, std::sync::Arc::new(vit), tmax));
@@ -123,7 +144,9 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 let flat = vit.forward(&toks, &yx, pw, ph)?;
                 eprintln!("# vit forward {:.1}s", tf0.elapsed().as_secs_f64());
                 let n_out = flat.len() / 5120;
-                Ok((0..n_out).map(|i| flat[i * 5120..(i + 1) * 5120].to_vec()).collect())
+                Ok((0..n_out)
+                    .map(|i| flat[i * 5120..(i + 1) * 5120].to_vec())
+                    .collect())
             })();
             match v {
                 Ok(rows) => rows,
@@ -147,7 +170,11 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 }
             }
         };
-        eprintln!("# clip[{si}]: {} tokens (총 {:.1}s)", vis.len(), t0.elapsed().as_secs_f64());
+        eprintln!(
+            "# clip[{si}]: {} tokens (총 {:.1}s)",
+            vis.len(),
+            t0.elapsed().as_secs_f64()
+        );
         if std::env::var_os("LLM170_VIS_HASH").is_some() {
             let mut x: u64 = 0x9E3779B97F4A7C15;
             for row in &vis[..vis.len().min(2)] {
@@ -182,7 +209,8 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
             }
         } else {
-            llm170_backend_gpu::rawhip::decode::inject(&mut eng).unwrap_or_else(|e| eprintln!("rawhip: {e}"));
+            llm170_backend_gpu::rawhip::decode::inject(&mut eng)
+                .unwrap_or_else(|e| eprintln!("rawhip: {e}"));
         }
     }
     let eos = 248044u32;
@@ -202,7 +230,10 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut finished = vec![false; n_img];
     let mut gen_toks: Vec<Vec<u32>> = vec![Vec::new(); n_img];
     let mut texts: Vec<String> = vec![String::new(); n_img];
-    let mut next: Vec<u32> = last_logits.iter().map(|l| llm170_core::qwen35::greedy(l)).collect();
+    let mut next: Vec<u32> = last_logits
+        .iter()
+        .map(|l| llm170_core::qwen35::greedy(l))
+        .collect();
     // 시퀀스별 유효 프롬프트 길이 (마커 1 → vis 행수 치환) — JSONL pos 기준.
     let base_len: Vec<usize> = (0..n_img)
         .map(|s| prompt.len() - 1 + all_vis[s].len())
@@ -224,21 +255,28 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             texts[s].push_str(&eng.piece(t));
         }
     };
-    let spec_on = spec_k > 0
-        && eng.has_mtp()
-        && std::env::var_os("LLM170_SPEC_GPU").is_some();
+    let spec_on = spec_k > 0 && eng.has_mtp() && std::env::var_os("LLM170_SPEC_GPU").is_some();
     if spec_k > 0 && !eng.has_mtp() {
         eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
     }
     let gen_res = (|| -> Result<(), String> {
         if spec_on && n_img > 1 {
-            while gen_toks.iter().filter(|g| !g.is_empty()).min_by_key(|g| g.len()).map(|g| g.len()).unwrap_or(0) <= n_predict {
+            while gen_toks
+                .iter()
+                .filter(|g| !g.is_empty())
+                .min_by_key(|g| g.len())
+                .map(|g| g.len())
+                .unwrap_or(0)
+                <= n_predict
+            {
                 let active: Vec<usize> = (0..n_img).filter(|&s| !finished[s]).collect();
                 if active.is_empty() {
                     break;
                 }
                 let nexts: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let acc = eng.spec_step_multi(&active, &nexts, spec_k).map_err(|e| e.to_string())?;
+                let acc = eng
+                    .spec_step_multi(&active, &nexts, spec_k)
+                    .map_err(|e| e.to_string())?;
                 let mut any = false;
                 for (i, &s) in active.iter().enumerate() {
                     for &t in &acc[i] {
@@ -265,7 +303,9 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         } else if spec_on {
             let s = 0usize;
             while gen_toks[s].len() <= n_predict && !finished[s] {
-                let (acc_toks, _tf) = eng.spec_step(s, next[s], spec_k).map_err(|e| e.to_string())?;
+                let (acc_toks, _tf) = eng
+                    .spec_step(s, next[s], spec_k)
+                    .map_err(|e| e.to_string())?;
                 for &t in &acc_toks {
                     if gen_toks[s].len() > n_predict {
                         break;

@@ -81,7 +81,14 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     if arch.as_deref() == Some("qwen4exp") {
-        return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend, &gpu_runtime);
+        return run_q4_infer(
+            &model_path,
+            &prompts,
+            n_predict,
+            ctx,
+            &backend,
+            &gpu_runtime,
+        );
     }
     let engine_res = llm170_core::qwen35::Model::load(&model_path)
         .map_err(|e| e.to_string())
@@ -369,7 +376,9 @@ fn run_q4_infer(
                 // plans/73(np): 활성 2+ 는 배치 디코드(무게 스트리밍 공유).
                 if active.len() > 1 {
                     let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                    let ls = eng.decode_batch(&active, &toks).map_err(|e| e.to_string())?;
+                    let ls = eng
+                        .decode_batch(&active, &toks)
+                        .map_err(|e| e.to_string())?;
                     for (row, &s) in active.iter().enumerate() {
                         let t = llm170_core::qwen35::greedy(&ls[row]);
                         next[s] = t;

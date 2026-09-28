@@ -1,6 +1,5 @@
 //! probes/gdn — GDN t 불변성(청크 결함 진단) (probes.rs에서 이동, plans/78 R3).
 
-
 /// GDN AR(순환 상태 갱신)의 **t 불변성** 프로브 — 무게·모델 불필요, 수 초.
 ///
 /// 같은 가상 시퀀스를 두 방식으로 흘리고 상태·출력을 대조한다:
@@ -8,7 +7,13 @@
 /// 청크 크기에 따라 프리필 결과가 갈리는 결함(2026-09-17: Q4_CHUNK=64에서
 /// Flash-Next 출력 붕괴)의 커널 축 판정용. 상태는 `t_cur`(=frame_begin)로
 /// 행 수를 정하므로 밴드 실행은 호출마다 frame_begin(per)가 필요하다.
-pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize) -> Result<String, String> {
+pub fn gdn_ar_invariance(
+    t: usize,
+    per: usize,
+    h_k: usize,
+    h_v: usize,
+    d: usize,
+) -> Result<String, String> {
     use super::q4acc::Q4Acc;
     use llm170_core::matmul::{FrameHost, FrameState};
     if per == 0 || !t.is_multiple_of(per) || t == per {
@@ -16,7 +21,9 @@ pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize)
     }
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let acc = Q4Acc::new()?;
@@ -35,7 +42,13 @@ pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize)
         (0..t * v_len).map(|_| lcg() * 0.1).collect(),
         // β>0, e^g∈(0,1) 근사 — 실분포 흉내(β=row0, g=row1 교차).
         (0..t * h_v * 2)
-            .map(|i| if i % 2 == 0 { 0.05 + lcg().abs() * 0.05 } else { 0.9 - lcg().abs() * 0.05 })
+            .map(|i| {
+                if i % 2 == 0 {
+                    0.05 + lcg().abs() * 0.05
+                } else {
+                    0.9 - lcg().abs() * 0.05
+                }
+            })
             .collect(),
     );
     acc.frame_write(hn, &q)?;
@@ -73,22 +86,41 @@ pub fn gdn_ar_invariance(t: usize, per: usize, h_k: usize, h_v: usize, d: usize)
     acc.frame_read(hb, &mut sb)?;
     acc.frame_read(hoa, &mut oa)?;
     acc.frame_read(hob, &mut ob)?;
-    let mx = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let mx = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
     // 첫 불일치 요소 — 행·열로 환산해 밴드 경계 문제인지 난수 반올림인지 가른다.
     let first = oa
         .iter()
         .zip(&ob)
         .enumerate()
         .find(|(_, (x, y))| x.to_bits() != y.to_bits())
-        .map(|(i, (x, y))| format!("첫 불일치 out[{i}] (행 {} 열 {}) {x:.6e} vs {y:.6e}", i / v_len, i % v_len));
-    let nbad = oa.iter().zip(&ob).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        .map(|(i, (x, y))| {
+            format!(
+                "첫 불일치 out[{i}] (행 {} 열 {}) {x:.6e} vs {y:.6e}",
+                i / v_len,
+                i % v_len
+            )
+        });
+    let nbad = oa
+        .iter()
+        .zip(&ob)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
     Ok(format!(
         "[gdn-ar-inv] t={t} per={per}: 상태 maxΔ={:.3e} · 출력 maxΔ={:.3e} ({nbad}/{}) {} → {}",
         mx(&sa, &sb),
         mx(&oa, &ob),
         oa.len(),
         first.unwrap_or_else(|| "-".into()),
-        if mx(&sa, &sb) == 0.0 && mx(&oa, &ob) == 0.0 { "t 불변 ✓" } else { "t 의존 ✗" }
+        if mx(&sa, &sb) == 0.0 && mx(&oa, &ob) == 0.0 {
+            "t 불변 ✓"
+        } else {
+            "t 의존 ✗"
+        }
     ))
 }
 
@@ -102,7 +134,9 @@ pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<
     }
     let mut seed = 0x243f_6a88_85a3_08d3u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let acc = Q4Acc::new()?;
@@ -119,10 +153,26 @@ pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<
     let zeros = vec![0.0f32; (k - 1) * ch];
     acc.frame_write(hs, &zeros)?;
     acc.frame_write(hsa, &zeros)?;
-    acc.frame_write(hob, &zeros.iter().cycle().take(t * ch).copied().collect::<Vec<f32>>())?;
+    acc.frame_write(
+        hob,
+        &zeros
+            .iter()
+            .cycle()
+            .take(t * ch)
+            .copied()
+            .collect::<Vec<f32>>(),
+    )?;
     // (가) 1회 t
     acc.frame_begin(t);
-    acc.frame_op(&FrameOp::GdnConv { qkv: hq, cw: hc, state: hs, out: hoa, ch, k, t_len: t })?;
+    acc.frame_op(&FrameOp::GdnConv {
+        qkv: hq,
+        cw: hc,
+        state: hs,
+        out: hoa,
+        ch,
+        k,
+        t_len: t,
+    })?;
     // (나) 밴드 — 상태는 hsa로 이월
     for c in 0..(t / per) {
         let off = c * per;
@@ -131,7 +181,15 @@ pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<
             acc.frame_slice(hob, off * ch, per * ch)?,
         );
         acc.frame_begin(per);
-        acc.frame_op(&FrameOp::GdnConv { qkv: q2, cw: hc, state: hsa, out: o2, ch, k, t_len: per })?;
+        acc.frame_op(&FrameOp::GdnConv {
+            qkv: q2,
+            cw: hc,
+            state: hsa,
+            out: o2,
+            ch,
+            k,
+            t_len: per,
+        })?;
     }
     let mut oa = vec![0.0f32; t * ch];
     let mut ob = vec![0.0f32; t * ch];
@@ -141,8 +199,17 @@ pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<
     acc.frame_read(hob, &mut ob)?;
     acc.frame_read(hs, &mut sa)?;
     acc.frame_read(hsa, &mut sb)?;
-    let mx = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    let nbad = oa.iter().zip(&ob).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let mx = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let nbad = oa
+        .iter()
+        .zip(&ob)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
     let first = oa
         .iter()
         .zip(&ob)
@@ -155,6 +222,10 @@ pub fn gdn_conv_invariance(t: usize, per: usize, ch: usize, k: usize) -> Result<
         mx(&oa, &ob),
         oa.len(),
         first.unwrap_or_else(|| "-".into()),
-        if mx(&sa, &sb) == 0.0 && mx(&oa, &ob) == 0.0 { "t 불변 ✓" } else { "t 의존 ✗" }
+        if mx(&sa, &sb) == 0.0 && mx(&oa, &ob) == 0.0 {
+            "t 불변 ✓"
+        } else {
+            "t 의존 ✗"
+        }
     ))
 }

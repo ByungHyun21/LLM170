@@ -1,8 +1,8 @@
 //! 프레임 그래프 캡처/재생 — 스텝 내 호스트 왕복(capture_mark)을 경계로 스트림 캡처를
 //! 세그먼트로 끊어 그래프로 굳히고, 재생 시에는 런치 함수가 즉시 반환된다.
 
-use crate::rawhip::hip;
 use crate::rawhip::ck;
+use crate::rawhip::hip;
 
 /// # Safety
 /// 호출부는 단일 스텝 스레드에서만 호출한다(그래프 캡처 경계 규약, mod.rs 참조).
@@ -20,7 +20,10 @@ pub unsafe fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), St
                     let mut gr: hip::hipGraph_t = std::ptr::null_mut();
                     let r = hip::hipStreamEndCapture(stream, &mut gr);
                     if r != hip::hipError_t_hipSuccess {
-                        return Err(format!("EndCapture 실패({r:?}) tag={tag} seg={}", segs.len()));
+                        return Err(format!(
+                            "EndCapture 실패({r:?}) tag={tag} seg={}",
+                            segs.len()
+                        ));
                     }
                     segs.push(gr);
                     *open = false;
@@ -29,7 +32,10 @@ pub unsafe fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), St
                     }
                 }
             } else if !*open {
-                let r = hip::hipStreamBeginCapture(stream, hip::hipStreamCaptureMode_hipStreamCaptureModeThreadLocal);
+                let r = hip::hipStreamBeginCapture(
+                    stream,
+                    hip::hipStreamCaptureMode_hipStreamCaptureModeThreadLocal,
+                );
                 if r != hip::hipError_t_hipSuccess {
                     return Err(format!("BeginCapture 실패({r:?}) tag={tag}"));
                 }
@@ -43,7 +49,9 @@ pub unsafe fn capture_mark(stream: hip::hipStream_t, tag: &str) -> Result<(), St
         GraphMode::Replay { execs, idx } => {
             // 세그먼트는 `*_in`(종료) 지점에서 발사된다 — 그 그래프가 직전 구간.
             if is_end(tag) && *idx < execs.len() {
-                unsafe { ck(hip::hipGraphLaunch(execs[*idx], stream), "GraphLaunch")?; }
+                unsafe {
+                    ck(hip::hipGraphLaunch(execs[*idx], stream), "GraphLaunch")?;
+                }
                 *idx += 1;
             }
             Ok(())
@@ -96,7 +104,16 @@ pub unsafe fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> 
     for g0 in &segs {
         unsafe {
             let mut ex: hip::hipGraphExec_t = std::ptr::null_mut();
-            ck(hip::hipGraphInstantiate(&mut ex, *g0, std::ptr::null_mut(), std::ptr::null_mut(), 0), "GraphInstantiate")?;
+            ck(
+                hip::hipGraphInstantiate(
+                    &mut ex,
+                    *g0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                ),
+                "GraphInstantiate",
+            )?;
             execs.push(ex);
         }
     }
@@ -108,8 +125,10 @@ pub unsafe fn graph_capture_end(stream: hip::hipStream_t) -> Result<(), String> 
 /// # Safety
 /// 캡처 세션 시작 — 단일 스텝 스레드에서만 호출한다(재생과 교차 금지).
 pub unsafe fn graph_capture_begin(_stream: hip::hipStream_t) -> Result<(), String> {
-    *GRAPH.lock().map_err(|e| e.to_string())? =
-        GraphMode::Capture { segs: Vec::new(), open: false };
+    *GRAPH.lock().map_err(|e| e.to_string())? = GraphMode::Capture {
+        segs: Vec::new(),
+        open: false,
+    };
     Ok(())
 }
 
@@ -125,7 +144,12 @@ pub static GRAPH: std::sync::Mutex<GraphMode> = std::sync::Mutex::new(GraphMode:
 
 pub enum GraphMode {
     Off,
-    Capture { segs: Vec<hip::hipGraph_t>, open: bool },
-    Replay { execs: Vec<hip::hipGraphExec_t>, idx: usize },
+    Capture {
+        segs: Vec<hip::hipGraph_t>,
+        open: bool,
+    },
+    Replay {
+        execs: Vec<hip::hipGraphExec_t>,
+        idx: usize,
+    },
 }
-

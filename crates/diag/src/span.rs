@@ -34,9 +34,10 @@ mod imp {
         fn drop(&mut self) {
             let elapsed = self.start.elapsed().as_nanos();
             if let Ok(mut reg) = registry().lock()
-                && reg.len() < MAX_EVENTS {
-                    reg.push((self.name, elapsed));
-                }
+                && reg.len() < MAX_EVENTS
+            {
+                reg.push((self.name, elapsed));
+            }
         }
     }
 
