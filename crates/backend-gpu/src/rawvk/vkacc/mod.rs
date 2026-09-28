@@ -884,7 +884,7 @@ impl VkAcc {
         xq_buf: vk::Buffer,
         out_buf: vk::Buffer,
     ) -> Result<(), String> {
-        if std::env::var_os("LLM170_VK_GVDBG").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_GVDBG") {
             eprintln!("[gv] ty={ty} n_in={n_in} n_out={n_out} t={t}");
         }
         let (kb, gb, dbuf) = self.ensure_shared(ctx)?;

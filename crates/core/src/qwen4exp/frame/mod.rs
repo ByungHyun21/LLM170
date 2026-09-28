@@ -28,7 +28,6 @@ use crate::matmul::{Accelerator, FrameOp, FrameState};
 use crate::quant::dequant_row;
 use std::collections::HashMap;
 
-
 /// 프레임 버퍼 집합 — 활성화(스텝 공용) + 상태(시퀀스별) + 상수 가중치.
 /// np 배치 디코드용 행 뷰 핸들 — per-seq 상태 op에 넘긴다(초기화 1회).
 pub struct NpViews {

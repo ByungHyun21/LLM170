@@ -198,7 +198,7 @@ impl VkCtx {
             let queue = device.get_device_queue(qf, 0);
 
             // 타임스탬프 프로파일러 (LLM170_VK_TS=1) — 쿼리풀 8192 스탬프(4096 디스패치)
-            let ts = if std::env::var_os("LLM170_VK_TS").is_some() {
+            let ts = if llm170_diag::flag::on("LLM170_VK_TS") {
                 let qci = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(TS_CAP);
@@ -377,10 +377,7 @@ impl VkCtx {
         }
         unsafe {
             self.device
-                .reset_command_buffer(
-                    self.cmdbuf,
-                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
-                )
+                .reset_command_buffer(self.cmdbuf, vk::CommandBufferResetFlags::RELEASE_RESOURCES)
                 .map_err(|e| format!("리셋: {e:?}"))?;
             self.device
                 .begin_command_buffer(
@@ -424,11 +421,7 @@ impl VkCtx {
         }
         // plans/93: 녹화 완료 버퍼 재생(옵트인) — 첫 청크 이후 스킵.
         // 청크 간 파라미터 불변(FN 프리필: pos 무관 커널 99.6%).
-        if std::env::var("LLM170_VK_REPLAY")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            && self.batch_recorded.get()
-        {
+        if llm170_diag::flag::eq1("LLM170_VK_REPLAY") && self.batch_recorded.get() {
             self.replay_mode.set(true);
             return Ok(());
         }
@@ -516,7 +509,7 @@ impl VkCtx {
 
     /// 배치 종료 — 일괄 제출·대기.
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
-        if std::env::var_os("LLM170_VK_RUNTIME").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_RUNTIME") {
             RUN_US.with(|c| {
                 let us = c.get();
                 let n = RUN_N.with(|c| c.get());
@@ -532,7 +525,7 @@ impl VkCtx {
                 }
             });
         }
-        if std::env::var_os("LLM170_VK_FLUSHDBG").is_some() {
+        if llm170_diag::flag::on("LLM170_VK_FLUSHDBG") {
             eprintln!("[flush] op={}", crate::rawvk::context::site::tag());
         }
         let replaying = self.replay_mode.get();
@@ -933,7 +926,7 @@ impl VkCtx {
                 .device
                 .create_shader_module(&smci, None)
                 .map_err(|e| format!("셰이더 모듈: {e:?}"))?;
-            let nr = self.pipeline_robustness && std::env::var_os("LLM170_VK_NOROB").is_some();
+            let nr = self.pipeline_robustness && llm170_diag::flag::on("LLM170_VK_NOROB");
             let mut rci = vk::PipelineRobustnessCreateInfoEXT::default()
                 .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
                 .uniform_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
@@ -1109,9 +1102,7 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                let elide_on = std::env::var("LLM170_VK_DEPBAR")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                let elide_on = llm170_diag::flag::ne0("LLM170_VK_DEPBAR");
                 let mut need = !elide_on || self.dep_unknown.get();
                 if let Some((rs, ws)) = dep {
                     let sr = self.since_r.borrow();
@@ -1124,7 +1115,7 @@ impl VkCtx {
                 }
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
                 if !need {
-                    if let Ok(only) = std::env::var("LLM170_VK_DEPBAR_ONLY") {
+                    if let Some(only) = llm170_diag::flag::val("LLM170_VK_DEPBAR_ONLY") {
                         if !only.is_empty() && tag != only {
                             need = true;
                         }
@@ -1273,7 +1264,7 @@ impl VkCtx {
                 let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
                 e.0 += dt;
                 e.1 += 1;
-                if std::env::var_os("LLM170_VK_TS_RAW").is_some() && dt > 0.3 {
+                if llm170_diag::flag::on("LLM170_VK_TS_RAW") && dt > 0.3 {
                     eprintln!("[tsr] {k:5} {lbl:20} {dt:8.3}ms");
                 }
                 tot += dt;
@@ -1418,7 +1409,7 @@ impl VkCtx {
                 return Ok(ds);
             }
             let n = DSC_MISS.with(|c| c.replace(c.get() + 1));
-            if std::env::var_os("LLM170_VK_DSC").is_some() {
+            if llm170_diag::flag::on("LLM170_VK_DSC") {
                 if n.is_multiple_of(8192) {
                     eprintln!("[dsc] miss #{} cache {}", n, self.ds_cache.borrow().len());
                 }
