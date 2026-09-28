@@ -368,7 +368,7 @@ impl DecoderState {
                                 gq,
                                 1,
                                 1,
-                                                            )?;
+                            )?;
                             self.run_pipe(
                                 "kv_app_q8",
                                 KV_APPEND_Q8_SPV,
@@ -391,7 +391,7 @@ impl DecoderState {
                                 (n_kv * hd).div_ceil(64) as u32,
                                 1,
                                 1,
-                                                            )?;
+                            )?;
                             self.run_pipe(
                                 "kv_app",
                                 KV_APPEND_SPV,
@@ -987,7 +987,7 @@ impl DecoderState {
                             gq,
                             t as u32,
                             1,
-                                                    )?;
+                        )?;
                         self.run_pipe(
                             "kv_app_q8",
                             KV_APPEND_Q8_SPV,
@@ -1010,7 +1010,7 @@ impl DecoderState {
                             (n_kv * hd).div_ceil(64) as u32,
                             t as u32,
                             1,
-                                                    )?;
+                        )?;
                         self.run_pipe(
                             "kv_app",
                             KV_APPEND_SPV,
@@ -1620,7 +1620,7 @@ impl DecoderState {
                         (n_kv * hd).div_ceil(64) as u32,
                         t as u32,
                         1,
-                                            )?;
+                    )?;
                     let binds_v: Vec<vk::Buffer> = vec![
                         self.b_av.buf,
                         self.np_kv_v_tbl.buf,
