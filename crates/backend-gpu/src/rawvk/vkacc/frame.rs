@@ -632,9 +632,13 @@ impl VkAcc {
                     let g = g.as_ref().unwrap();
                     (g.off.buf, g.perm.buf)   // 컴팩트 도메인 쌍(offv·perm)
                 };
-                let ks: u32 = 4;
+                // Q4KPKS=2: z=1 A-공유+직접산란 — 스크래치 0·원판과 비트 동일.
+                let direct1 = std::env::var("LLM170_VK_Q4KPKS").map(|v| v == "2").unwrap_or(false);
+                let ks: u32 = if direct1 { 1 } else { 4 };
                 let need = ks as usize * bound * n_out * 4;
-                let scr = {
+                let scr = if direct1 {
+                    ob   // plane=0 — 커널의 sc 쓰기가 곧 직접 산란
+                } else {
                     let mut g = self.ks_scratch.lock();
                     if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
                         g.as_ref().unwrap().buf
@@ -657,12 +661,15 @@ impl VkAcc {
                 let ds2 = ctx.bind_ds(&pk, &pbinds)?;
                 let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, ks, bound as u32]);
                 let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
-                ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, ks, &pkrds, &[scr])?;
-                let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
-                let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
-                let n_tot = (bound * n_out) as u32;
-                let pushr = push_u32s(&[n_tot, ks]);
-                ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                let wset: Vec<vk::Buffer> = if direct1 { vec![ob] } else { vec![scr] };
+                ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, ks, &pkrds, &wset)?;
+                if !direct1 {
+                    let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
+                    let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
+                    let n_tot = (bound * n_out) as u32;
+                    let pushr = push_u32s(&[n_tot, ks]);
+                    ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                }
                 return Ok(());
             }
             let slot = if w.ty == GgmlType::Q5K && w0_override.is_some() {
