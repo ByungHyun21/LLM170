@@ -141,6 +141,8 @@ const FN_TILE_F32E_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32e.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
+/// plans/105 P1 — 스키니 q8 coopmat K-분할판(부분합 f32 → FnKsred).
+const TILE_Q8128KS_SPV: &[u8] = include_bytes!("../spv/tile_q8128ks.spv");
 const TILE_Q8KS_SPV: &[u8] = include_bytes!("../spv/tile_q8ks.spv");
 const FN_KSRED_SPV: &[u8] = include_bytes!("../spv/fn_ksred.spv");
 const TILE_Q8MS_SPV2: &[u8] = include_bytes!("../spv/tile_q8ms.spv");
@@ -280,6 +282,7 @@ pub(crate) enum Slot {
     FnTileF32W,
     /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder 판 재사용).
     TileQ8128Cm,
+    TileQ8128Ks,
     TileQ8msCm,
     TileQ4k128Cm,
     TileQ4kmsCm,
@@ -532,6 +535,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
     (Slot::FnPleResF16, "ple_res_f16", FN_PLE_RES_F16_SPV, 4, 12),
     (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
+    (Slot::TileQ8128Ks, "tile_q8128ks", TILE_Q8128KS_SPV, 11, 24),
     (Slot::TileQ8ks, "tile_q8ks", TILE_Q8KS_SPV, 11, 24),
     (Slot::FnKsred, "ksred", FN_KSRED_SPV, 2, 8),
     (Slot::TileQ8msCm, "tile_q8ms", TILE_Q8MS_SPV2, 10, 20),
