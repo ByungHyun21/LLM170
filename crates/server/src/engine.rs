@@ -20,7 +20,7 @@ pub struct InferRequest {
 /// GPU = `--backend gpu` 명시 시에만 (기본은 CPU golden 경로).
 /// `LLM170_Q4_CPU=1` / `LLM170_RAWHIP=0`이면 항상 CPU.
 pub fn q4_gpu_env_off() -> bool {
-    if std::env::var_os("LLM170_Q4_CPU").is_some() {
+    if llm170_diag::flag::on("LLM170_Q4_CPU") {
         return true;
     }
     std::env::var("LLM170_RAWHIP")
@@ -266,7 +266,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 break;
             };
             // 접두 캐시 — cached 전체가 새 프롬프트의 접두면 이어서 프리필.
-            let prefix_ok = std::env::var_os("LLM170_NO_PREFIX").is_none();
+            let prefix_ok = llm170_diag::flag::on("LLM170_NO_PREFIX") == false;
             let pick = (0..n_slots)
                 .filter(|&i| slots[i].job.is_none())
                 .map(|i| {
@@ -476,7 +476,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             // 배치 프리필(plans/74 np4) — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
             // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). 게이트 기본 꺼짐.
             // 실패하면 아래 슬롯별 경로로 폴백(등가성은 prefill_multi 등가 테스트가 보증).
-            if std::env::var_os("LLM170_PREFILL_BATCH").is_some() {
+            if llm170_diag::flag::on("LLM170_PREFILL_BATCH") {
                 let pend: Vec<usize> = (0..n_slots)
                     .filter(|&i| {
                         slots[i].job.is_some()
@@ -600,7 +600,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         .zip(j.tokens.iter())
                         .take_while(|(a, b)| a == b)
                         .count();
-                    let reuse = if std::env::var_os("LLM170_NO_PREFIX").is_none()
+                    let reuse = if llm170_diag::flag::on("LLM170_NO_PREFIX") == false
                         && l > 0
                         && l == slots[0].cached.len()
                         && j.tokens.len() > l
@@ -679,7 +679,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             }
             let mut full = j.tokens.clone();
             full.extend(toks);
-            if std::env::var_os("LLM170_NO_PREFIX").is_none() {
+            if llm170_diag::flag::on("LLM170_NO_PREFIX") == false {
                 s.cached = full;
             } else {
                 eng.reset_seq(i);
@@ -750,7 +750,7 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
                 _ => false,
             };
             if vulkan {
-                if std::env::var_os("LLM170_VK_ACC").is_some() {
+                if llm170_diag::flag::on("LLM170_VK_ACC") {
                     match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                         Ok(acc) => {
                             eng = eng.with_acc(std::sync::Arc::new(acc));
