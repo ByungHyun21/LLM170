@@ -425,9 +425,6 @@ impl VkAcc {
         // 불필요(f32 직결). 아래 조건은 ids2 분기와 동일해야 한다.
         let ids2_takes = rows > 0
             && (t == 1 || rows <= 64)
-            && std::env::var("LLM170_MOE_IDS2")
-                .map(|v| v != "0")
-                .unwrap_or(true)
             && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
         // plans/105(원장 80): 팩 등록 히트 — 상위 정량 스킵(llmmq가 팩 소비).
         let pack_skip_quant = w.ty == GgmlType::Q4K && self.packbufs.lock().0.contains_key(&x);
@@ -529,13 +526,9 @@ impl VkAcc {
             // plans/89 P0.3 — ids dmmv 판 우선: llama dmmv 기하(64스레드·2행·
             // 서브그룹Add) + ids 간접, f32 활성 직결(MoE quant 불필요).
             // [ts] 기준선 moe_ids 30ms/step(43GB/s) — q8b급 150GB/s 기대.
-            // 킬스위치 LLM170_MOE_IDS2=0(종전 fn_moe_ids).
+            // plans/89 P0.3 — ids dmmv 판 우선(승격 기본 — 킬스위치 폐지, 107 W1).
             let wbufs = self.weight_bufs(&mut ctx, w)?;
-            if std::env::var("LLM170_MOE_IDS2")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-                && wbufs.len() == 1
-            {
+            if wbufs.len() == 1 {
                 let (slot, blk) = match w.ty {
                     GgmlType::Q4K => (Slot::FnMoeIds2, 144usize),
                     GgmlType::Q5_1 => (Slot::FnMoeIds51, 24),
@@ -864,12 +857,7 @@ impl VkAcc {
             // q8r 행바이트 기준으로 교체. env LLM170_VK_Q8MOE(기본 on).
             let mut per_expert_push = per_expert;
             let mut w0_override: Option<vk::Buffer> = None;
-            if w.ty == GgmlType::Q8_0
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q8MOE")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
-            {
+            if w.ty == GgmlType::Q8_0 && wbufs.len() == 1 {
                 let key = (w.data.as_ptr() as usize, w.data.len());
                 let mut c = self.q8r_bufs.lock();
                 let b = match c.get(&key) {
@@ -888,20 +876,10 @@ impl VkAcc {
                 w0_override = Some(b);
                 per_expert_push = n_out * (n_in + (n_in / 32) * 4);
             }
-            if w.ty == GgmlType::Q5K
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q5KMOE")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
-            {
+            if w.ty == GgmlType::Q5K && wbufs.len() == 1 {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 실바인딩은 원본
             }
-            if w.ty == GgmlType::Q5_1
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q51MOE")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
-            {
+            if w.ty == GgmlType::Q5_1 && wbufs.len() == 1 {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 원본 바인딩
             }
             // plans/105 P2: llama mul_mmq 포트(옵트인 LLM170_VK_Q4KLL=1) —
@@ -909,9 +887,6 @@ impl VkAcc {
             // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
             let pack_hit = w.ty == GgmlType::Q4K
                 && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q4KLL")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
                 && self.packbufs.lock().0.contains_key(&x);
             if pack_hit {
                 let (offb, pmb) = {
@@ -966,14 +941,7 @@ impl VkAcc {
                 // 승격 기본(mmq 계열·q51_sg1)과 다중중량 스칼라 폴백뿐.
                 match w.ty {
                     GgmlType::Q5_1 => Slot::FnMoeTileQ51Sg1,
-                    GgmlType::Q4K
-                        if wbufs.len() == 1
-                            && std::env::var("LLM170_VK_Q4KMMQ")
-                                .map(|v| v != "0")
-                                .unwrap_or(true) =>
-                    {
-                        Slot::FnMoeTileQ4kMmq
-                    }
+                    GgmlType::Q4K if wbufs.len() == 1 => Slot::FnMoeTileQ4kMmq,
                     GgmlType::Q8_0 => Slot::FnMoeTileQ8,
                     _ => Slot::FnMoeTileQ5k,
                 }
@@ -1000,9 +968,7 @@ impl VkAcc {
                     | Slot::FnMoeTileQ8mmq
                     | Slot::FnMoeTileQ5kmmq
                     | Slot::FnMoeTileQ51mmq
-            ) && std::env::var("LLM170_VK_DSCAT")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            );
             binds.push(xq);
             binds.push(if direct { ob } else { ygb });
             binds.push(rxb);
@@ -1042,13 +1008,8 @@ impl VkAcc {
             ctx.run_rw(p.pl, ds2, p.pipe, &push, gx, gy, 1, &tile_rds, &[tile_out])?;
             // plans/93: gate→up 독립 병렬화 — 이 타일이 gate이면 다음(up) 배리어 스킵.
             if self.moe_nobar.load(std::sync::atomic::Ordering::Relaxed) {
-                // plans/105: 킬스위치(=0) — gate‖up 강제 병행 차단.
-                if std::env::var("LLM170_VK_MOENOBAR")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
-                {
-                    ctx.nobar_next.set(true);
-                }
+                // plans/105: gate‖up 강제 병행(승격 기본 — 킬스위치 폐지).
+                ctx.nobar_next.set(true);
                 self.moe_nobar
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
