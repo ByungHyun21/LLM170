@@ -620,6 +620,51 @@ impl VkAcc {
             {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 원본 바인딩
             }
+            // plans/105 P1: 전문가-주 퍼시스턴트 K-분할(옵트인 LLM170_VK_Q4KPKS=1)
+            // — A 스테이징 전문가당 1회(슈퍼그룹 4청크 공유) + 선형 스크래치
+            // 드레인 → FnKsred 결정론 축소(tile_q8128ks 승격 클래스).
+            if w.ty == GgmlType::Q4K
+                && wbufs.len() == 1
+                && std::env::var("LLM170_VK_Q4KPKS").map(|v| v == "1").unwrap_or(false)
+            {
+                let (offb, pmb) = {
+                    let g = self.moe_grp.lock();
+                    let g = g.as_ref().unwrap();
+                    (g.off.buf, g.perm.buf)   // 컴팩트 도메인 쌍(offv·perm)
+                };
+                let ks: u32 = 4;
+                let need = ks as usize * bound * n_out * 4;
+                let scr = {
+                    let mut g = self.ks_scratch.lock();
+                    if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+                        g.as_ref().unwrap().buf
+                    } else {
+                        let b = ctx.alloc(need)?;
+                        *g = Some(b);
+                        g.as_ref().unwrap().buf
+                    }
+                };
+                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileQ4kPks)?;
+                let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
+                while pbinds.len() < 8 {
+                    pbinds.push(dbuf);
+                }
+                pbinds.push(xq);
+                pbinds.push(scr);
+                pbinds.push(dbuf);   // 슬롯10(미사용 Rp) — null 바인딩 금지
+                pbinds.push(pmb);
+                pbinds.push(offb);
+                let ds2 = ctx.bind_ds(&pk, &pbinds)?;
+                let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, ks, bound as u32]);
+                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
+                ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, ks, &pkrds, &[scr])?;
+                let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
+                let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
+                let n_tot = (bound * n_out) as u32;
+                let pushr = push_u32s(&[n_tot, ks]);
+                ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                return Ok(());
+            }
             let slot = if w.ty == GgmlType::Q5K && w0_override.is_some() {
                 Slot::FnMoeTileQ5kmmq
             } else if w.ty == GgmlType::Q5_1 && w0_override.is_some() {
