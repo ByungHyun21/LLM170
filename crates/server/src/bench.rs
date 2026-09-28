@@ -254,8 +254,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             // plans/79: --np 플래그가 qwen35 집계도 지휘하게 통일 — 종전엔
             // LLM170_BENCH_NP env만 읽어 --np 4가 무시됐다(측정 도구 결함).
             let bench_np0 = np_slots.max(
-                std::env::var("LLM170_BENCH_NP")
-                    .ok()
+                llm170_diag::flag::val("LLM170_BENCH_NP")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1),
             );
