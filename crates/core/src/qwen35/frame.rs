@@ -265,7 +265,11 @@ impl Engine {
             self.frame = Some(f0);
         }
         // take/put — 프레임 차입과 self 차입(가중치·attn 브리지) 분리.
-        let mut f = self.frame.take().expect("frame");
+        let Some(mut f) = self.frame.take() else {
+            // 107 W11: 재진입(프레임 차입 중 경유 재호출)은 프레임 부재 —
+            // 패닉 대신 Err(호출부 폴백 계약).
+            return Err(ModelError::Io("frame reentry".into()));
+        };
         let r = Engine::frame_step(&mut f, self, &acc, seq, token);
         self.frame = Some(f);
         r
