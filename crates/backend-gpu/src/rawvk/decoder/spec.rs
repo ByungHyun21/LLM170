@@ -35,16 +35,46 @@ impl DecoderState {
         )
     }
 
-    /// shared head — 정규화 입력(m_e) → 로짓 argmax (b_lg 매핑 판독 + CPU greedy).
+    /// shared head — 정규화 입력(m_e) → 로짓 → GPU 2단계 argmax(107 W1:
+    /// 종전 b_lg 608KB 매핑 판독 + CPU greedy 폐지 — lg_argmax와 동일 판).
     pub(super) fn head_argmax(&mut self) -> Result<u32, String> {
         let n = self.n_embd;
         self.quant(self.m_e.buf, self.m_xq.buf, n, 1)?;
         self.ctx.begin_batch()?;
         self.gemv(self.m_xq.buf, "output.weight", self.b_lg.buf, 1)?;
+        let nthr = 256usize;
+        let chunk = 8usize;
+        let nv = self.n_vocab;
+        let n_wg = nv.div_ceil(nthr * chunk);
+        let binds = [self.b_lg.buf, self.b_ams.buf, self.b_am.buf];
+        self.run_pipe_b(
+            "argmax2",
+            crate::rawvk::vkacc::ARGMAX2_SPV,
+            3,
+            8,
+            &binds,
+            &Self::push_u32s(&[nv as u32, 0u32]),
+            n_wg as u32,
+            1,
+            1,
+            true,
+        )?;
+        self.run_pipe_b(
+            "argmax2",
+            crate::rawvk::vkacc::ARGMAX2_SPV,
+            3,
+            8,
+            &binds,
+            &Self::push_u32s(&[n_wg as u32, 1u32]),
+            1,
+            1,
+            1,
+            true,
+        )?;
         self.ctx.end_batch_wait()?;
-        let lgr: &[f32] =
-            unsafe { std::slice::from_raw_parts(self.b_lg.ptr as *const f32, self.n_vocab) };
-        Ok(llm170_core::matmul::greedy_from(lgr))
+        let mut tok = 0u32;
+        unsafe { std::ptr::copy_nonoverlapping(self.b_am.ptr as *const u32, &mut tok, 1) };
+        Ok(tok)
     }
 
     /// MTP (blk.64) 1스텝 — rawhip mtp_step_g 산술 미러 (t=1 커널 재사용).
@@ -284,22 +314,59 @@ impl DecoderState {
             .unwrap_or(true)
         {
             let n = self.n_embd;
-            let mut last = Vec::new();
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
                 let t = ch.len() / n;
                 let _tt = std::time::Instant::now();
-                let rows = self.step_batch(seq, pos0 + off, ch, true)?;
+                // 107 W1: all_logits=true는 이제 전사 없이 b_lg_t에 상주
+                // (step_batch 계약 변경 — 유일 소비자가 이 경로다).
+                let _ = self.step_batch(seq, pos0 + off, ch, true)?;
                 if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
                     eprintln!(
                         "[vb] step_batch t={t} = {:.1}ms",
                         _tt.elapsed().as_secs_f64() * 1e3
                     );
                 }
-                for r in 0..t {
-                    argmaxes.push(llm170_core::matmul::greedy_from(
-                        &rows[r * self.n_vocab..(r + 1) * self.n_vocab],
-                    ));
-                }
+                // fn_argmax_rows 2단계 GPU argmax — t×608KB 전사·CPU 스캔 폐지.
+                let nv = self.n_vocab;
+                let n_wg = nv.div_ceil(256 * 8);
+                let push0 = Self::push_u32s(&[nv as u32, 0u32, n_wg as u32]);
+                let push1 = Self::push_u32s(&[nv as u32, 1u32, n_wg as u32]);
+                let binds = [self.b_lg_t.buf, self.b_amsc.buf, self.b_amr.buf];
+                self.ctx.begin_batch()?;
+                self.run_pipe_b(
+                    "fn_argmax_rows",
+                    crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
+                    3,
+                    12,
+                    &binds,
+                    &push0,
+                    n_wg as u32,
+                    t as u32,
+                    1,
+                    true,
+                )?;
+                self.run_pipe_b(
+                    "fn_argmax_rows",
+                    crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
+                    3,
+                    12,
+                    &binds,
+                    &push1,
+                    1,
+                    t as u32,
+                    1,
+                    true,
+                )?;
+                self.ctx.end_batch_wait()?;
+                let mut toks = vec![0u32; t];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.b_amr.ptr as *const u32,
+                        toks.as_mut_ptr(),
+                        t,
+                    )
+                };
+                argmaxes.extend_from_slice(&toks);
                 let mut hv = vec![0f32; t * n];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -309,9 +376,8 @@ impl DecoderState {
                     )
                 };
                 h_all.extend_from_slice(&hv);
-                last = rows[(t - 1) * self.n_vocab..].to_vec();
             }
-            return Ok(last);
+            return Ok(Vec::new());
         }
         let n = self.n_embd;
         let mut last = Vec::new();
@@ -573,83 +639,106 @@ impl DecoderState {
         Ok(am)
     }
 
-    /// GDN/conv 상태 스냅샷 (매핑 ptr 직접 — GPU 유휴 시).
+    /// GDN/conv 상태 스냅샷 — 단일 디바이스 버퍼 D2D 복사(107 W1 spec2 수리).
+    /// 종전 호스트 왕복(매핑 GTT 판독 ~580ms/사이클) 폐지. lazy 1회 할당.
     pub(super) fn snapshot_states(&mut self) -> Result<(), String> {
         if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.ctx.end_batch_wait()?;
         }
-        let gl = self.dt_rank * self.d_state * self.d_state;
-        let cl = (self.conv_k - 1) * self.conv_ch;
-        for (r, rows) in self.st_gdn.iter().enumerate() {
-            let stride = rows.len();
-            for (s, b) in rows.iter().enumerate() {
-                let src: &[f32] = unsafe { std::slice::from_raw_parts(b.ptr as *const f32, gl) };
-                self.snap_gdn[r * stride + s] = src.to_vec();
-                let cs: &[f32] =
-                    unsafe { std::slice::from_raw_parts(self.st_conv[r][s].ptr as *const f32, cl) };
-                self.snap_conv[r * stride + s] = cs.to_vec();
+        let (gl, cl) = (self.gdn_len(), self.conv_len());
+        let mut copies: Vec<(vk::Buffer, u64, vk::Buffer, u64, u64)> = Vec::new();
+        let mut off = 0usize;
+        for rows in self.st_gdn.iter() {
+            for b in rows.iter() {
+                copies.push((b.buf, 0, vk::Buffer::null(), off as u64 * 4, gl as u64 * 4));
+                off += gl;
             }
         }
-        Ok(())
+        for rows in self.st_conv.iter() {
+            for b in rows.iter() {
+                copies.push((b.buf, 0, vk::Buffer::null(), off as u64 * 4, cl as u64 * 4));
+                off += cl;
+            }
+        }
+        let total = off * 4;
+        let snap = match self.gdn_snap.as_ref() {
+            Some(b) if b.bytes >= total => b.buf,
+            _ => {
+                let b = self.ctx.alloc(total)?;
+                let buf = b.buf;
+                self.gdn_snap = Some(b);
+                buf
+            }
+        };
+        for c in copies.iter_mut() {
+            c.2 = snap;
+        }
+        self.ctx.copy_dev(&copies)
     }
 
     pub(super) fn restore_states(&mut self) -> Result<(), String> {
-        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
-            self.ctx.end_batch_wait()?;
-        }
-        let gl = self.dt_rank * self.d_state * self.d_state;
-        let cl = (self.conv_k - 1) * self.conv_ch;
-        for (r, rows) in self.st_gdn.iter().enumerate() {
-            let stride = rows.len();
-            for (s, b) in rows.iter().enumerate() {
-                let snap = self.snap_gdn[r * stride + s].clone();
-                if snap.len() == gl {
-                    unsafe { std::ptr::copy_nonoverlapping(snap.as_ptr(), b.ptr as *mut f32, gl) };
-                }
-                let snapc = self.snap_conv[r * stride + s].clone();
-                if snapc.len() == cl {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            snapc.as_ptr(),
-                            self.st_conv[r][s].ptr as *mut f32,
-                            cl,
-                        )
-                    };
-                }
+        let Some(snap) = self.gdn_snap.clone() else {
+            return Ok(());
+        };
+        let (gl, cl) = (self.gdn_len(), self.conv_len());
+        let mut copies: Vec<(vk::Buffer, u64, vk::Buffer, u64, u64)> = Vec::new();
+        let mut off = 0usize;
+        for rows in self.st_gdn.iter() {
+            for b in rows.iter() {
+                copies.push((snap.buf, off as u64 * 4, b.buf, 0, gl as u64 * 4));
+                off += gl;
             }
         }
-        Ok(())
+        for rows in self.st_conv.iter() {
+            for b in rows.iter() {
+                copies.push((snap.buf, off as u64 * 4, b.buf, 0, cl as u64 * 4));
+                off += cl;
+            }
+        }
+        self.ctx.copy_dev(&copies)
     }
 
-    /// per-seq 복원 (np×spec 부분수용) — 해당 슬롯 행만. rawhip
-    /// gdn_restore_seq 대칭(스냅샷 레이아웃 [r][s] 동일).
+    /// per-seq 복원 (np×spec 부분수용) — 해당 슬롯 행만.
     pub(super) fn restore_seq_states(&mut self, seq: usize) -> Result<(), String> {
-        if self.ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
-            self.ctx.end_batch_wait()?;
-        }
-        let gl = self.dt_rank * self.d_state * self.d_state;
-        let cl = (self.conv_k - 1) * self.conv_ch;
-        for (r, rows) in self.st_gdn.iter().enumerate() {
+        let Some(snap) = self.gdn_snap.clone() else {
+            return Ok(());
+        };
+        let (gl, cl) = (self.gdn_len(), self.conv_len());
+        let mut copies: Vec<(vk::Buffer, u64, vk::Buffer, u64, u64)> = Vec::new();
+        let mut off = 0usize;
+        for rows in self.st_gdn.iter() {
             let stride = rows.len();
             if seq < stride {
-                let snap = self.snap_gdn[r * stride + seq].clone();
-                if snap.len() == gl {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(snap.as_ptr(), rows[seq].ptr as *mut f32, gl)
-                    };
-                }
-                let snapc = self.snap_conv[r * stride + seq].clone();
-                if snapc.len() == cl {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            snapc.as_ptr(),
-                            self.st_conv[r][seq].ptr as *mut f32,
-                            cl,
-                        )
-                    };
-                }
+                copies.push((
+                    snap.buf,
+                    (off + seq * gl) as u64 * 4,
+                    rows[seq].buf,
+                    0,
+                    gl as u64 * 4,
+                ));
             }
+            off += stride * gl;
         }
-        Ok(())
+        for rows in self.st_conv.iter() {
+            let stride = rows.len();
+            if seq < stride {
+                copies.push((
+                    snap.buf,
+                    (off + seq * cl) as u64 * 4,
+                    rows[seq].buf,
+                    0,
+                    cl as u64 * 4,
+                ));
+            }
+            off += stride * cl;
+        }
+        self.ctx.copy_dev(&copies)
+    }
+
+    fn gdn_len(&self) -> usize {
+        self.dt_rank * self.d_state * self.d_state
+    }
+    fn conv_len(&self) -> usize {
+        (self.conv_k - 1) * self.conv_ch
     }
 }

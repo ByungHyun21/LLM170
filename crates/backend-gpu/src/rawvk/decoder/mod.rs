@@ -229,9 +229,10 @@ pub struct DecoderState {
     m_h: VkBuf,   // [n] 호스트 h 업로드
     m_kv_k: Vec<VkBuf>,
     m_kv_v: Vec<VkBuf>,
-    // GDN/conv 스냅샷 (spec 부분수용 롤백) — 매핑 ptr 직접 복사
-    snap_gdn: Vec<Vec<f32>>,
-    snap_conv: Vec<Vec<f32>>,
+    // GDN/conv 스냅샷 (spec 부분수용 롤백) — 단일 디바이스 버퍼 D2D 복사
+    // (107 W1: 종전 호스트 왕복은 사이클당 ~580ms — hip 판과 동일 구조).
+    // 레이아웃 [gdn r×s][conv r×s] 선형(f32) — hip gdn_snap 대칭.
+    gdn_snap: Option<VkBuf>,
     // ── f16 사전 디양자화 가중 캐시 (plans/39) — 프리필 타일 전용
     f16w: HashMap<String, VkBuf>,
     // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
