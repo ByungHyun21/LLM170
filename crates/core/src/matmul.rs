@@ -920,8 +920,12 @@ pub trait FrameState {
 
     /// plans/105(원장 80) — mxsel 생산 직후 1회 팩 정량(블록당 10워드
     /// [qs8][d][Σ]). 등록된 x는 llmmq가 팩 버퍼로 소비.
+    /// 기본 Err: 팩을 소비하는 경로에서 미구현 백엔드가 조용히 Ok를
+    /// 반환하면 llmmq가 스테일 버퍼를 읽는 무결 오염이 된다(107 P0-3,
+    /// 저장소 계약 "조용한 Ok는 거짓 보고"). 팩 불필요 백엔드는 명시
+    /// 오버라이드로 근거를 문서화할 것.
     fn frame_quant_pack(&self, _x: u64, _rows: usize, _n_in: usize) -> Result<(), String> {
-        Ok(())
+        Err("frame_quant_pack: 백엔드 미구현 — 팩 버퍼 미생산".into())
     }
 
     /// MoE ids 구동 배치 GEMM — x 상주, ids 상주(GPU top10 출력 직결).
@@ -1256,7 +1260,15 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
                 llm170_gguf::GgmlType::Q6K => {
                     crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y)
                 }
-                _ => crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, &y),
+                llm170_gguf::GgmlType::Q5_1 => {
+                    crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, &y)
+                }
+                llm170_gguf::GgmlType::Iq4Xs => {
+                    crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, &y)
+                }
+                // w4a8_ty 진입 게이트가 9타입 전부 위 팔로 커버 — 신규 타입
+                // 추가 시 여기서 즉시 패닉(무결 오염 방지 계약).
+                _ => unreachable!("w4a8_ty에 포함됐으나 lane 미구현: {:?}", w.ty),
             };
         }
         return;
@@ -1332,7 +1344,10 @@ pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
                     llm170_gguf::GgmlType::Q5_1 => {
                         crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, y)
                     }
-                    _ => crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y),
+                    llm170_gguf::GgmlType::Iq4Xs => {
+                        crate::quant::dot_row_w4a8_iq4xs_lane(row, w.n_in, y)
+                    }
+                    _ => unreachable!("w4a8_ty에 포함됐으나 lane 미구현: {:?}", w.ty),
                 };
             }
         }
