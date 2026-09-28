@@ -1810,7 +1810,6 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 out,
                 hc,
                 n,
-                h16: _,
             } => {
                 let (mut xp, mut gp, mut op_) = (self.fptr(xn)?, self.fptr(gate)?, self.fptr(out)?);
                 let total = n * self.t_cur();
