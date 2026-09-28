@@ -51,6 +51,8 @@ pub struct RawCtx {
     /// 어느 동기 판독이든 내용을 덮어쓴다(plans/68 12차: b가 실수값으로 오염돼
     /// 폴백 행 수 1.04억 → HIP 700. t=1 프로덕션에도 잠복 경쟁이었다).
     pub(crate) pinned_a: std::sync::Mutex<(usize, *mut u8)>,
+    /// H2D 스테이지 핀 2버퍼(107 W1.5-3) — 업로드 파이프라인 전용.
+    pub(crate) pinned_stage: std::sync::Mutex<(usize, *mut u8)>,
 }
 
 /// 타일 발사 파라미터 (스택 로컬 소유 — args 포인터 유효성 보장).
@@ -315,8 +317,9 @@ impl RawCtx {
                 mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
                 mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())),
                 scratch: std::sync::Mutex::new(HashMap::new()),
-                pinned: std::sync::Mutex::new((0, std::ptr::null_mut())),
                 pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                pinned: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                pinned_stage: std::sync::Mutex::new((0, std::ptr::null_mut())),
             })
         }
     }
@@ -652,6 +655,25 @@ impl RawCtx {
     /// `ev`는 유효한 이벤트 핸들이어야 한다(이 모듈 생성분, 중복 파기 금지).
     pub unsafe fn ev_destroy(ev: hip::hipEvent_t) -> Result<(), String> {
         unsafe { ck(hip::hipEventDestroy(ev), "evDestroy") }
+    }
+
+    /// 핀 스테이지 2버퍼(107 W1.5-3) — async H2D가 pageable 경유
+    /// 스테이징 없이 디바이스로 직행하도록. 반환 (a, b): 실패 시 null.
+    /// 크기는 요청치 이상 보유(성장 재할당). 해제는 Drop이 책임.
+    pub fn pinned_stage2(&self, need: usize) -> Result<(*mut u8, *mut u8), String> {
+        unsafe {
+            let mut pin = self.pinned_stage.lock().map_err(|e| e.to_string())?;
+            if pin.0 < 2 * need {
+                if !pin.1.is_null() {
+                    let _ = hip::hipFreeHost(pin.1 as *mut _);
+                }
+                let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+                ck(hip::hipMallocHost(&mut p, 2 * need), "pinStage")?;
+                *pin = (2 * need, p as *mut u8);
+            }
+            let base = pin.1;
+            Ok((base, base.add(need)))
+        }
     }
 
     ///

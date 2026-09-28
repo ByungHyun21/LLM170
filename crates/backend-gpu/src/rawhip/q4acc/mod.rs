@@ -339,26 +339,37 @@ impl Q4Acc {
     /// 반환 None = 이 포인터가 알려진 파트 밖(폴백 필요).
     /// 실측: mmap 폴트 20-180 MB/s vs 버퍼드 pread 1.2 GB/s (같은 파일).
     fn staged_upload(&self, dst: *mut u8, ptr: usize, len: usize) -> Option<Result<(), String>> {
-        use std::os::unix::fs::FileExt;
         let (src, mut off) = self
             .sources
             .iter()
             .find_map(|s| s.covers(ptr, len).map(|o| (s, o)))?;
         let result = (|| -> Result<(), String> {
+            use std::os::unix::fs::FileExt;
             const CH: usize = 8 << 20;
-            // 107 W1.5-3(원장 99): 이중 스테이지 — pread(청크 k)와
-            // h2d(청크 k-1, 사이드 스트림 async) 중첩. 반쪽 재사용은
-            // 그 반쪽에 기록된 이벤트만 선별 대기(전체 sync2가 아니라
-            // 직전 복사까지 기다려 중첩을 죽이지 않는다). pageable
-            // async H2D가 드라이버 폴백해도 순차 이하로는 안 떨어진다.
+            // 107 W1.5-3(원장 100): 핀 이중 스테이지 — pread(청크 k)와
+            // h2d(청크 k-1, 사이드 스트림 async) 중첩. 핀이면 async H2D가
+            // 드라이버 스테이징 없이 직행(원장 100 pageable 흡수 가설 검증).
+            // 반쪽 재사용은 그 반쪽 이벤트만 선별 대기. 핀 할당 실패 시
+            // pageable Vec 폴백(0511cba 판과 동일 경로).
             let dbl = len > CH;
-            let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
-            let want = if dbl { 2 * CH } else { CH.min(len) };
-            if stage.len() < want {
-                *stage = vec![0u8; want];
-            }
-            // !dbl면 전체를 a로(b는 빈 절반 — hi는 dbl일 때만 교체).
-            let (a, b) = stage.split_at_mut(if dbl { want / 2 } else { want });
+            let ch = CH.min(len);
+            let (pa, pb) = self
+                .ctx
+                .pinned_stage2(ch)
+                .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+            let (a_ptr, b_ptr): (*mut u8, *mut u8) = if pa.is_null() {
+                let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
+                let want = if dbl { 2 * ch } else { ch };
+                if stage.len() < want {
+                    *stage = vec![0u8; want];
+                }
+                // 핵심: Vec 폴백은 lock 가드가 살아있는 동안만 유효 —
+                // 업로드 루프 전체를 이 클로저 안에서 수행한다.
+                let (a, b) = stage.split_at_mut(if dbl { want / 2 } else { want });
+                (a.as_mut_ptr(), b.as_mut_ptr())
+            } else {
+                (pa, pb)
+            };
             let ev = [Self::ev_new()?, Self::ev_new()?];
             let mut recorded = [false, false];
             let mut done = 0usize;
@@ -366,12 +377,13 @@ impl Q4Acc {
             let result = (|| -> Result<(), String> {
                 while done < len {
                     let n = CH.min(len - done);
-                    // 이 반쪽을 쓴 직전 복사(k-2)만 완료 확인 후 pread.
                     if recorded[hi] {
                         Self::ev_wait(ev[hi])?;
                         recorded[hi] = false;
                     }
-                    let half = if hi == 0 { &mut a[..n] } else { &mut b[..n] };
+                    let base = if hi == 0 { a_ptr } else { b_ptr };
+                    // SAFETY: 핀/스테이지 버퍼 [0, n) — 할당 크기 ch ≥ n.
+                    let half = unsafe { std::slice::from_raw_parts_mut(base, n) };
                     src.file
                         .read_exact_at(half, off)
                         .map_err(|e| format!("pread {off}: {e}"))?;
