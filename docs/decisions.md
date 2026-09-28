@@ -360,7 +360,7 @@ steps (persistent sp, coopMat QK) need an LDS-budget redesign.
 
 **Near-tie baseline note**: the arithmetic-order change flips near-tie tokens
 on the adversarial Korean gate prompt (the documented chunk-size residual
-class — docs/chunk-invariance.md). The new stream is reference-correct;
+class — docs/archive/chunk-invariance.md). The new stream is reference-correct;
 HIP is untouched and still matches the original baseline. Gate baselines are
 now per-runtime (`.gate-27b-baseline-vk.txt`); `LLM170_VK_NOGQ=1` restores
 the old single-query kernel.
@@ -2016,7 +2016,7 @@ page cache" theory behind the carve relocation was falsified by the ringfix
 run: with the ring in carve, one pp512 run still flipped the model file to
 ENOENT. Carve placement is retained as defense-in-depth only; the ENOENT
 correlation is not explained by ring placement (FS metadata damage itself
-remains the open suspect — see docs/fs-corruption-incident-2026-09-25.md).
+remains the open suspect — see docs/archive/fs-corruption-incident-2026-09-25.md).
 
 Follow-up evidence (same night, kernel log): two `llm170` segfaults at
 02:36:56/02:37:06 inside `libvulkan_radeon.so` at the identical IP offset
