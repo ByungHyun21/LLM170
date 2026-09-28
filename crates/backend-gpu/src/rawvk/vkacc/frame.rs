@@ -739,7 +739,7 @@ impl VkAcc {
                     { let m = std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                       if std::env::var_os("LLM170_MTC_DBG").is_some() { eprintln!("[cm8-push] mode={m}"); }
                       m }
-                } else if h16 && matches!(slot, Slot::FnMoeTileQ4kMmq) {
+                } else if h16 && matches!(slot, Slot::FnMoeTileQ4kMmq | Slot::FnMoeTileQ51mmq) {
                     // plans/105: 드레인 packed f16 — 실제 타일 경로에서만 등록.
                     self.f16bufs.lock().insert(out);
                     2u32
