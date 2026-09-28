@@ -38,8 +38,8 @@ layout(push_constant) uniform PC {
 #define WSUBN (WN / WNITER)
 
 // 캐시 — 스칼라 공유배열(구조체 복사는 패처 수렴 규칙을 깬다).
-shared uint  buf_aq[BK_STEP * BM][8];
-shared vec2  buf_ad[BK_STEP * BM];
+shared uint  buf_aq[BK_STEP * BM][4];
+shared f16vec2 buf_ad[BK_STEP * BM];
 shared uint  buf_bq[BK_STEP * BN][8];
 shared vec2  buf_bd[BK_STEP * BN];
 shared int shared_eq_cnt;
@@ -121,16 +121,19 @@ void main() {
                         s_v = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
                         m_v = (b_p4 >> 4) | ((b_j >> 6) << 4);
                     }
-                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(d * float(s_v), dmin * float(m_v));
+                    buf_ad[sq * BM + (int(tid) >> 2)] = f16vec2(float16_t(d * float(s_v)), float16_t(dmin * float(m_v)));
                     uint qb2 = wq4 + 4u + uint((j >> 1) * 8u);
-                    bool hi2 = (j & 1) != 0;
-                    [[unroll]] for (int w = 0; w < 8; w++) {
-                        uint wd = w0c[qb2 + uint(w)];
-                        buf_aq[sq * BM + (int(tid) >> 2)][w] = hi2 ? ((wd >> 4) & 0x0F0F0F0Fu) : (wd & 0x0F0F0F0Fu);
+                    uint nib2 = (j & 1) != 0 ? 4u : 0u;
+                    [[unroll]] for (int w = 0; w < 4; w++) {
+                        uint w0 = w0c[qb2 + uint(w * 2)];
+                        uint w1 = w0c[qb2 + uint(w * 2 + 1)];
+                        uint v0 = (w0 >> nib2) & 0x0F0F0F0Fu;
+                        uint v1 = (w1 >> nib2) & 0x0F0F0F0Fu;
+                        buf_aq[sq * BM + (int(tid) >> 2)][w] = v0 | (v1 << 4);
                     }
                 } else if (sq < BK_STEP) {
-                    buf_ad[sq * BM + (int(tid) >> 2)] = vec2(0.0);
-                    for (int w = 0; w < 8; w++) buf_aq[sq * BM + (int(tid) >> 2)][w] = 0u;
+                    buf_ad[sq * BM + (int(tid) >> 2)] = f16vec2(float16_t(0.0), float16_t(0.0));
+                    for (int w = 0; w < 4; w++) buf_aq[sq * BM + (int(tid) >> 2)][w] = 0u;
                 }
                 // 행 16..63은 2패스 — 나머지 행들도 같은 코드가 stride로 커버
                 // 없음: 64스레드/4 = 16행/패스 → 4패스 필요. 간단히 루프:
@@ -155,12 +158,15 @@ void main() {
                             s_v2 = (b_p4 & 0xFu) | ((b_lo >> 6) << 4);
                             m_v2 = (b_p4 >> 4) | ((b_j >> 6) << 4);
                         }
-                        buf_ad[q2 * BM + r2] = vec2(db * float(s_v2), dminb * float(m_v2));
+                        buf_ad[q2 * BM + r2] = f16vec2(float16_t(db * float(s_v2)), float16_t(dminb * float(m_v2)));
                         uint qb3 = wq4b + 4u + uint((j2 >> 1) * 8u);
-                        bool hi3 = (j2 & 1) != 0;
-                        [[unroll]] for (int w = 0; w < 8; w++) {
-                            uint wd = w0c[qb3 + uint(w)];
-                            buf_aq[q2 * BM + r2][w] = hi3 ? ((wd >> 4) & 0x0F0F0F0Fu) : (wd & 0x0F0F0F0Fu);
+                        uint nib3 = (j2 & 1) != 0 ? 4u : 0u;
+                        [[unroll]] for (int w = 0; w < 4; w++) {
+                            uint w0 = w0c[qb3 + uint(w * 2)];
+                            uint w1 = w0c[qb3 + uint(w * 2 + 1)];
+                            uint v0 = (w0 >> nib3) & 0x0F0F0F0Fu;
+                            uint v1 = (w1 >> nib3) & 0x0F0F0F0Fu;
+                            buf_aq[q2 * BM + r2][w] = v0 | (v1 << 4);
                         }
                     }
                 }
@@ -224,15 +230,16 @@ void main() {
                                     float bs = float(int(xq[base + qsb2 + uint(gb * 2)])
                                                    + int(xq[base + qsb2 + uint(gb * 2) + 1u]));
                                     // A행 글로벌 직독(오라클과 동일 체인)
-                                    uint pl[8];
-                                    [[unroll]] for (uint p2 = 0; p2 < 8; p2++) {
+                                    uint pl[4];
+                                    [[unroll]] for (uint p2 = 0; p2 < 4; p2++) {
                                         pl[p2] = buf_aq[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr][p2];
                                     }
                                     int qsum = 0;
                                     [[unroll]] for (uint w2 = 0; w2 < 8; w2++) {
-                                        qsum += sdot4p(pl[w2], buf_bq[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc][w2]);
+                                        uint qs_a = (pl[w2 >> 1] >> ((w2 & 1u) * 4u)) & 0x0F0F0F0Fu;
+                                        qsum += sdot4p(qs_a, buf_bq[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc][w2]);
                                     }
-                                    vec2 ad2 = buf_ad[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr];
+                                    vec2 ad2 = vec2(buf_ad[q * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + cr]);
                                     vec2 bd2 = buf_bd[q * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc];
                                     sums[sums_idx] += bd2.x * (ad2.x * float(qsum) - ad2.y * bd2.y);
                                 }
