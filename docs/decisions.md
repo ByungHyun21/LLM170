@@ -3007,3 +3007,12 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - **검증**: DBUF 게이트 PASS + 기본 4게이트 PASS(비활성 시 무영향).
 - 세트 해제는 wait_pending으로 이동(실행 중 참조 방지). stepT는
   wait=0.00(dbuf)으로 회수 가시화.
+
+  - **프로브 5(종결 판별자, race_qidle 키)**: end_batch_wait의 펜스
+    대기를 vkQueueWaitIdle(가장 강력한 호스트 동기)로 교체해도
+    **4/4 발산** — 펜스 시그널링·제출 순서·호스트 계층 전부 무죄.
+    결론 확정: **단일 커맨드 버퍼 내 인접 디스패치 실행**이 배리어에도
+    불구 비결정(별도 제출은 암묵 직렬화로 결정론). 원장 92의
+    "드라이버/스케줄러 계층" 추정이 판별자로 종결. 코드 수준 조사
+    완전 소진 — RRA 덤프·validation layer(미설치)·RADV 버그리포트가
+    남은 경로. race_qidle·race_nocache·VK_SPLIT(_AT) 프로브 상재.
