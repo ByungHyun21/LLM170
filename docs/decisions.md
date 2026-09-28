@@ -3016,3 +3016,8 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
     "드라이버/스케줄러 계층" 추정이 판별자로 종결. 코드 수준 조사
     완전 소진 — RRA 덤프·validation layer(미설치)·RADV 버그리포트가
     남은 경로. race_qidle·race_nocache·VK_SPLIT(_AT) 프로브 상재.
+
+  - **DBUF 다중 청크 보측**: 8청크(TMAX=256) pp2048 DBUF 364.2 vs
+    363.8 t/s(평택) — 프리필 청크 기록이 head 스킵(원장 107)으로
+    이미 가벼워 중첩 이득 미미. DBUF 효과는 디코드(+3.1%) 확정 —
+    옵트인 유지, 기본 승격은 27B vk 해소 후 재판정.
