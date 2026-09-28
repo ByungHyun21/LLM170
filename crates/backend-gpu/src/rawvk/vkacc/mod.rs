@@ -113,6 +113,8 @@ const FN_MOE_WSUM_H_SPV: &[u8] = include_bytes!("../spv/fn_moe_wsum_h.spv");
 const FN_MOE_TILE_Q51MMQ_H_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51mmq_h.spv");
 /// plans/105 P1 — 전문가-주 퍼시스턴트 K-분할 q4k 타일.
 const FN_MOE_TILE_Q4K_PKS_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_pks.spv");
+/// plans/105 P2 — llama.cpp mul_mmq(MUL_MAT_ID) 포트(BN64 워프타일).
+const FN_MOE_TILE_LLMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_llmmq.spv");
 /// plans/95 P3a — q8_0 34B블록(d f16 + 32×i8) → xq 동일 레이아웃 무손실
 /// 릴레이아웃: 행당 [n_in 바이트 i8][n_in/32 f32 d]. 값·스케일 불변
 /// (f16→f32 확장은 정확). fn_tile_q8mmq의 A측 포맷.
@@ -255,6 +257,7 @@ pub(crate) enum Slot {
     FnMoeWsumH,
     FnMoeTileQ51mmqH,
     FnMoeTileQ4kPks,
+    FnMoeTileLlmmq,
     /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
     FnTileF32e,
     /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
@@ -537,6 +540,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeWsumH, "moe_wsum_h", FN_MOE_WSUM_H_SPV, 3, 16),
     (Slot::FnMoeTileQ51mmqH, "moe_tile_q51mmq_h", FN_MOE_TILE_Q51MMQ_H_SPV, 10, 28),
     (Slot::FnMoeTileQ4kPks, "moe_tile_q4k_pks", FN_MOE_TILE_Q4K_PKS_SPV, 14, 28),
+    (Slot::FnMoeTileLlmmq, "moe_tile_llmmq", FN_MOE_TILE_LLMMQ_SPV, 13, 28),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateF16, "ple_gate_f16", FN_PLE_GATE_F16_SPV, 8, 16),
