@@ -277,7 +277,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
                 let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
                 let glu = *self.moe_glu.lock();
+                let g16 = self.f16bufs.lock().contains(&g);
                 let fused = t_now >= 2
+                    && !g16
                     && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
                     && std::env::var("LLM170_VK_SILUQ")
                         .map(|v| v != "0")
@@ -306,10 +308,26 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
                     ctx.run_rw(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1, &[gb, ub], &[tgt])?;
                 } else {
-                    let p = self.pipeline(&mut ctx, Slot::Silu)?;
-                    let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
-                    let push = push_u32s(&[n as u32]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[gb, ub], &[ob])?;
+                    let g16 = self.f16bufs.lock().contains(&g);
+                    if g16 {
+                        // plans/105: f16 경로는 융합 silu가 돌지 않았다 — pair
+                        // 히트가 스테일 스크래치를 재사용하지 않게 무효화.
+                        if let Some(v) = self.moe_xq_pair.lock().as_mut() {
+                            v.0 = 0;
+                        }
+                    }
+                    let (p, ds2, push) = if g16 {
+                        // plans/105: mgu/mup packed f16 — silu_h 변형(f32 출력).
+                        let p = self.pipeline(&mut ctx, Slot::FnSiluH)?;
+                        let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
+                        (p, ds2, push_u32s(&[n as u32]))
+                    } else {
+                        let p = self.pipeline(&mut ctx, Slot::Silu)?;
+                        let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
+                        (p, ds2, push_u32s(&[n as u32]))
+                    };
+                    let rds: Vec<vk::Buffer> = if g16 { vec![gb, ub] } else { vec![gb, ub] };
+                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (n.div_ceil(2) as u32).div_ceil(256).max((n as u32).div_ceil(256)), 1, 1, &rds, &[ob])?;
                 }
             }
             O::Scale { t, s, n } => {
