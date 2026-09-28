@@ -616,13 +616,11 @@ impl DecodeState {
             let mut ss = self.ctx_len as i32;
             let mut p0 = (pos0 + t - nrow_attn) as i32;
             if np_
-                > std::env::var("LLM170_QSA_TH")
-                    .ok()
+                > llm170_diag::flag::val("LLM170_QSA_TH")
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(128)
             {
-                let sg = std::env::var("LLM170_QSA_SEG")
-                    .ok()
+                let sg = llm170_diag::flag::val("LLM170_QSA_SEG")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(128usize)
                     .max(64);
