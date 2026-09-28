@@ -35,8 +35,10 @@ pub fn eq1(name: &str) -> bool {
 }
 
 /// `!= "0"` 기본 ON — `var(name).map(|v| v != "0").unwrap_or(true)` 대응.
+/// 키 부재 = 기본 ON(true). is_some_and는 부재 시 false를 돌려 기본
+/// ON 게이트 전체를 뒤집는 결함이었다(107 회귀, 원장 104).
 pub fn ne0(name: &str) -> bool {
-    VALUES.get(name).is_some_and(|v| v != "0")
+    VALUES.get(name).is_none_or(|v| v != "0")
 }
 
 /// 원시 값 — 수치 파싱 등 특수 호출부용.
