@@ -623,6 +623,44 @@ impl RawCtx {
         unsafe { ck(hip::hipStreamSynchronize(self.stream), "sync") }
     }
 
+    /// 사이드 스트림 동기화 — staged_upload 이중버퍼 종료 지점용
+    /// (107 W1.5-3: 호스트 스테이지 반납 전 복사 완료 보장).
+    pub fn sync2(&self) -> Result<(), String> {
+        unsafe { ck(hip::hipStreamSynchronize(self.stream2), "sync2") }
+    }
+
+    /// 사이드 스트림 복사 후 이벤트 기록 (이중버퍼 재사용 판정용,
+    /// 107 W1.5-3). 호스트는 ev_sync로 해당 복사만 선별 대기한다.
+    ///
+    /// # Safety
+    /// `ev`는 유효한 이벤트 핸들이어야 한다(이 모듈 생성분).
+    pub unsafe fn ev_record_s2(&self, ev: hip::hipEvent_t) -> Result<(), String> {
+        unsafe { ck(hip::hipEventRecord(ev, self.stream2), "evRecS2") }
+    }
+
+    /// 이벤트 생성/파기/호스트 대기 — 스테이지 반납 직전 확인용.
+    pub fn ev_create() -> Result<hip::hipEvent_t, String> {
+        unsafe {
+            let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+            ck(hip::hipEventCreateWithFlags(&mut ev, 0), "evCreate")?;
+            Ok(ev)
+        }
+    }
+
+    ///
+    /// # Safety
+    /// `ev`는 유효한 이벤트 핸들이어야 한다(이 모듈 생성분, 중복 파기 금지).
+    pub unsafe fn ev_destroy(ev: hip::hipEvent_t) -> Result<(), String> {
+        unsafe { ck(hip::hipEventDestroy(ev), "evDestroy") }
+    }
+
+    ///
+    /// # Safety
+    /// `ev`는 유효한 이벤트 핸들이어야 한다.
+    pub unsafe fn ev_sync(ev: hip::hipEvent_t) -> Result<(), String> {
+        unsafe { ck(hip::hipEventSynchronize(ev), "evSync") }
+    }
+
     /// KTRACE 전용 이벤트 마커 — launch3를 거치지 않는 직접 런치 경로용.
     fn ktr_mark(&self, name: &'static str, gy: u32) {
         if let Some(mut g) = crate::rawhip::ktrace_active() {
