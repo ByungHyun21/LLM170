@@ -724,55 +724,6 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
     acc.frame_begin(t);
     let mut got = vec![0f32; t * k * n_out_d];
     acc.frame_read(mgh, &mut got)?;
-    if std::env::var_os("LLM170_VK_Q4CM8DBG").is_some() {
-        eprintln!(
-            "[cm8-k] sAd={} sAm={} sBd={} sBsum={} qsum00={} au8={} accF00={} bi800={} sAd0={} sAd40={}",
-            got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8], got[9]
-        );
-        // sb0 A/B 덤프 대조: 커널 값으로 qsum/sBsum 재현.
-        {
-            let a: Vec<f32> = got[10..26].to_vec();
-            let a2: Vec<f32> = got[26..42].to_vec();
-            let b: Vec<f32> = got[42..58].to_vec();
-            let b2: Vec<f32> = got[58..74].to_vec();
-            let mut qs = 0f64;
-            let mut bsum = 0f64;
-            for i in 0..16 {
-                qs += (a[i] as f64) * (b[i] as f64);
-                qs += (a2[i] as f64) * (b2[i] as f64);
-                bsum += b[i] as f64 + b2[i] as f64;
-            }
-            eprintln!("[cm8-k] sb0 재현 qsum={qs:.0} sBsum={bsum:.0} (커널 mode1은 sb79값)");
-            // CPU 니블 대조: e0의 row0 sb0 — deq_q4_k 구조(qs[16..] lo=짝 sb).
-            {
-                let e0 = ids_g[0] as usize;
-                let bs = 144usize;
-                let blk = e0 * n_out_d * bs; // row 0
-                let qs_off = blk + 16; // qs 시작(블록 내 sb0=첫 32바이트의 lo)
-                let nib: Vec<u8> = (0..32).map(|i| wd.data[qs_off + i] & 0xF).collect();
-                eprintln!("[cm8-k] 커널 A nib = {:?}", &a[..8]);
-                eprintln!("[cm8-k] CPU  A nib = {:?}", &nib[..8]);
-            }
-        }
-        // CPU 대조: 밴드0 전문가의 row0 sb0/sb40 d·sc.
-        {
-            let e0 = ids_g[0] as usize;
-            let row_words = (n_in_d >> 8) * 36;
-            for sb in [0usize, 40] {
-                let wq4 = e0 * row_words + sb / 8 * row_words / 10;
-                let _ = wq4;
-            }
-            let bs = 144usize; // q4_K 블록 바이트
-            let blk0 = e0 * n_out_d * bs; // row0 block0
-            let d = f32::from_le_bytes([wd.data[blk0], wd.data[blk0 + 1], 0, 0]);
-            let _ = d;
-            eprintln!(
-                "[cm8-k] CPU row0 blk0 raw d bytes {:?} m bytes {:?}",
-                &wd.data[blk0..blk0 + 2],
-                &wd.data[blk0 + 2..blk0 + 4]
-            );
-        }
-    }
     for h in [rh, idh, wth, mxh, mgh] {
         let _ = acc.frame_free(h);
     }
