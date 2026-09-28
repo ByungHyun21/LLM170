@@ -711,7 +711,13 @@ impl VkAcc {
                     (g.off.buf, g.perm.buf)
                 };
                 let (xq_ll, _llbytes) = self.packbufs.lock().0.get(&x).unwrap().clone();
-                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLlmmq)?;
+                // plans/106: f16-dm 변형(옵트인) — shmem A스케일 1/4.
+                let ll_slot = if std::env::var("LLM170_VK_LLMMQH16").map(|v| v == "1").unwrap_or(false) {
+                    Slot::FnMoeTileLlmmqH16
+                } else {
+                    Slot::FnMoeTileLlmmq
+                };
+                let pk = self.pipeline(&mut ctx, ll_slot)?;
                 let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
                 while pbinds.len() < 8 {
                     pbinds.push(dbuf);
