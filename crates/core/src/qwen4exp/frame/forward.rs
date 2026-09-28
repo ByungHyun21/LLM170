@@ -1,6 +1,7 @@
 //! frame/forward — 단일 시퀀스 포워드(디코드·프리필) (plans/79 A).
 
 use super::*;
+use super::diag::ck;
 
 /// 프레임 forward — t토큰 (t=1 디코드도 이 경로; decode_frame이 래퍼).
 /// 포워드 종료 방식 — 비동기 프리필은 head 커널까지만 발행하고 리드백을 미룬다.
@@ -151,9 +152,7 @@ pub(super) fn frame_forward_ex(
         {
             return Err(Q4Error::Io(format!("frame_failat: 주입 L{il}")));
         }
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
-        }
+        ck!(acc, il, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         // 107 W10: il=0 스킵 — 진입 전 버퍼(.mix·mids 등)는 아직 한 번도
         // 안 쓰인 미초기화 메모리라 해시가 할당기 잔재로 흔들린다. il≥1은
         // 전층 산출물이라 결정적(15,067줄 중 단 1줄 wobble 실측 근거).
@@ -380,9 +379,7 @@ pub(super) fn frame_forward_ex(
         // 2) hc attn mix
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_attn"), f.mix)?;
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
-        }
+        ck!(acc, il, f.mix, n, t, &format!("L{il}.mix"));
 
         // 3) attention — GDN 프레임 / QSA 값 브리지
         if hp.is_recr(il) {
@@ -392,9 +389,7 @@ pub(super) fn frame_forward_ex(
                 gdn_frame(
                     acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t,
                 )?;
-                if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-                    frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.gdn"));
-                }
+                ck!(acc, il, f.ffn_out, n, t, &format!("L{il}.gdn"));
             }
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -441,23 +436,17 @@ pub(super) fn frame_forward_ex(
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
-            if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-                frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.qsa"));
-            }
+            ck!(acc, il, f.ffn_out, n, t, &format!("L{il}.qsa"));
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
         }
 
         // 4) hc ffn mix + MoE
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
-        }
+        ck!(acc, il, f.mix, n, t, &format!("L{il}.mixf"));
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
-        }
+        ck!(acc, il, f.mout, n, t, &format!("L{il}.moe"));
 
         if il <= 4 && llm170_diag::dump::opts().bufhash {
             // plans/84 E.2: ffn combine 직전 3입력 + res 스냅샷
@@ -1278,9 +1267,7 @@ pub(super) fn gdn_frame(
             .map_err(Q4Error::Io)?;
     }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
-    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-        frame_ck(acc, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
-    }
+    ck!(acc, il, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
     // β/e^g
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
@@ -1298,9 +1285,7 @@ pub(super) fn gdn_frame(
         )?;
     }
     sync_mark(acc, "gdn.betag", f.gbg)?;
-    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-        frame_ck(acc, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
-    }
+    ck!(acc, il, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
     // conv + ring
     let cw = f.consts[&format!("blk.{il}.conv_w")];
     if !stage_skipped("gdn.conv") {
@@ -1319,9 +1304,7 @@ pub(super) fn gdn_frame(
         if il == 0 && llm170_diag::dump::opts().bufhash {
             buf_hash(acc, f.gconv, conv_ch * t.min(16), "G0.conv");
         }
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
-        }
+        ck!(acc, il, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
     }
     sync_mark(acc, "gdn.conv", f.gconv)?;
     // q/k/v 분할 (토큰 배치 = split3) + l2 + q·scale
@@ -1601,9 +1584,7 @@ pub(super) fn moe_frame(
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
-        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-            frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
-        }
+        ck!(acc, il, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
         op(
@@ -1623,9 +1604,7 @@ pub(super) fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
-    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
-        frame_ck(acc, f.mout, n, t, &format!("L{il}.moe_sc"));
-    }
+    ck!(acc, il, f.mout, n, t, &format!("L{il}.moe_sc"));
     if !stage_skipped("moe.shared") {
         let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
         let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
