@@ -93,30 +93,6 @@ pub struct PlePrefetched {
     pub emb: Vec<f32>,
 }
 
-/// 스테이지별 누적(µs) — LLM170_Q4_TIME=1일 때 prefill/decode 완료 후 보고.
-#[derive(Default)]
-pub struct Q4Timings {
-    pub hc: u64,
-    pub gdn: u64,
-    pub qsa: u64,
-    pub moe: u64,
-    pub ple: u64,
-    pub head: u64,
-}
-
-impl Q4Timings {
-    fn report(&self, tag: &str) {
-        eprintln!(
-            "# q4-timing {tag}: hc={:.0}ms gdn={:.0}ms qsa={:.0}ms moe={:.0}ms ple={:.0}ms head={:.0}ms",
-            self.hc as f64 / 1e3,
-            self.gdn as f64 / 1e3,
-            self.qsa as f64 / 1e3,
-            self.moe as f64 / 1e3,
-            self.ple as f64 / 1e3,
-            self.head as f64 / 1e3
-        );
-    }
-}
 
 /// 프레임 버퍼의 토큰 상한 — 프리필 청크와 동일(디코드 t=1 포함).
 /// 512 상한: t_max 버퍼는 청크에 비례하고(≈0.8 GB @512), 1024는 실측
@@ -247,20 +223,11 @@ impl Engine4 {
         &mut self,
         seq: usize,
         tokens: &[u32],
-        mut tm: Option<&mut Q4Timings>,
     ) -> Result<Vec<f32>, Q4Error> {
         profile_span!("q4::forward");
         macro_rules! stage {
             ($field:ident, $body:expr) => {
-                match &mut tm {
-                    Some(t) => {
-                        let t0 = std::time::Instant::now();
-                        let r = $body;
-                        t.$field += t0.elapsed().as_micros() as u64;
-                        r
-                    }
-                    None => $body,
-                }
+                $body
             };
         }
 
@@ -532,11 +499,7 @@ impl Engine4 {
         }
         let mut last = None;
         for ch in tokens.chunks(chunk) {
-            let mut tm = init_timings();
-            let logits = self.forward_timed(seq, ch, tm.as_mut())?;
-            if let Some(t) = &tm {
-                t.report(&format!("prefill {}tok", ch.len()));
-            }
+            let logits = self.forward_timed(seq, ch)?;
             self.seqs[seq].pos += ch.len() as u32;
             if let Some(f) = &mut self.frame {
                 f.dirty[seq] = true; // 값 경로가 상태를 갱신 — 프레임 재동기 필요
@@ -837,9 +800,6 @@ impl Engine4 {
                 f,
                 tokens,
             );
-            if std::env::var_os("LLM170_KTRACE").is_some() {
-                acc.ktrace_tick();
-            }
             r2
         })();
         if std::env::var_os("LLM170_NP_TIME").is_some() {
@@ -982,9 +942,6 @@ impl Engine4 {
                 }
                 r0
             };
-            if std::env::var_os("LLM170_KTRACE").is_some() {
-                acc.ktrace_tick();
-            }
             r3
         })();
         match r {
@@ -1144,17 +1101,11 @@ impl Engine4 {
                         a.frame_sync();
                     }
                     eprintln!("# frame: 디코드 실패 — value 경로 폴백 ({e})");
-                    let mut tm = init_timings();
-                    self.forward_timed(seq, &[token], tm.as_mut())?
+                    self.forward_timed(seq, &[token])?
                 }
             }
         } else {
-            let mut tm = init_timings();
-            let l = self.forward_timed(seq, &[token], tm.as_mut())?;
-            if let Some(t) = &tm {
-                t.report("decode1");
-            }
-            l
+            self.forward_timed(seq, &[token])?
         };
         self.seqs[seq].pos += 1;
         self.spawn_ple_prefetch(seq, &logits);
@@ -1292,13 +1243,6 @@ fn hc_combine(res_hc: &mut [Vec<f32>], out: &[Vec<f32>], inject: &[Vec<f32>], hc
     }
 }
 
-fn init_timings() -> Option<Q4Timings> {
-    if std::env::var_os("LLM170_Q4_TIME").is_some() {
-        Some(Q4Timings::default())
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod forward_tests {

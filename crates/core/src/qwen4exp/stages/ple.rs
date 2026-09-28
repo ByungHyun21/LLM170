@@ -47,11 +47,6 @@ pub fn ple_block(
         .model
         .f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
     let conv_w = ctx.model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
-    // ── PLE 하위 스테이지 계측 (05-1) — LLM170_Q4_TIME=1:
-    // ple_gather(mmap 랜덤읽기+iq4_nl 디양자화)와 key/value 투영(mm) 분해.
-    // 파이프라인 설계(05-2)의 병목 실측 입력.
-    let tm_on = std::env::var_os("LLM170_Q4_TIME").is_some();
-    let t_g0 = std::time::Instant::now();
 
     // emb gather [t][heads·ple_head_dim]
     let heads = hp.ple_heads_per_ngram * 2; // bigram+trigram = 16
@@ -106,24 +101,12 @@ pub fn ple_block(
             }
             eprintln!("# PLE VERIFY t={t} done");
         }
-        if std::env::var_os("LLM170_Q4_TIME").is_some() {
-            eprintln!("# ple-stage t={t}: prefetch HIT (gather 스킵)");
-        }
     }
-    let t_gather = t_g0.elapsed();
-    let t_m0 = std::time::Instant::now();
     // key/value 프로젝션
     let mut key = vec![vec![0.0f32; w_key.n_out as usize]; t];
     ctx.mm_batch(&emb, &w_key, &mut key)?;
     let mut value = vec![vec![0.0f32; w_value.n_out as usize]; t];
     ctx.mm_batch(&emb, &w_value, &mut value)?;
-    if tm_on {
-        eprintln!(
-            "# ple-stage t={t}: gather={:.1}ms proj={:.1}ms",
-            t_gather.as_secs_f64() * 1e3,
-            t_m0.elapsed().as_secs_f64() * 1e3
-        );
-    }
     ple_stage_hash("emb", &emb);
     ple_stage_hash("key", &key);
     ple_stage_hash("value", &value);

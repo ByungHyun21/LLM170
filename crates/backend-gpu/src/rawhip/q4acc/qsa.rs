@@ -911,14 +911,6 @@ impl Q4Acc {
         )?;
         let mut out = vec![0.0f32; t * n_head * hd];
         self.ctx.d2h(bytemuck::cast_slice_mut(&mut out), odev)?;
-        if env_on("LLM170_Q4_DBG") {
-            let bad = out.iter().filter(|v| !v.is_finite()).count();
-            let badq = q.iter().filter(|v| !v.is_finite()).count();
-            eprintln!(
-                "# qsa_attn t={t} n_past={n_past}: out 비유한={bad}/{} q 비유한={badq}",
-                out.len()
-            );
-        }
         Ok(out)
     }
 }

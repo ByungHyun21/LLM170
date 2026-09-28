@@ -499,18 +499,6 @@ impl Clip {
             }
             let mut qkv = vec![vec![0f32; 3 * n_embd]; n_pos];
             Self::mm_bias_batch(&xn, &qkvw, &qkvb, qkv_ni, &mut qkv);
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                let ssum: f64 = xn[0].iter().map(|&x| x as f64).sum::<f64>()
-                    + xn.iter()
-                        .skip(1)
-                        .map(|r| r.iter().map(|&x| x as f64).sum::<f64>())
-                        .sum::<f64>();
-                eprintln!(
-                    "[cpu] L0 ln1 sum={ssum:.4} x0={:.6} x1={:.6}",
-                    xn[0][0], xn[0][1]
-                );
-                eprintln!("[cpu] L0 qkv q0..7={:?}", &qkv[0][..8]);
-            }
 
             // 비전 rope (q, k) — 토큰별 (y, x)
             let mut coords = vec![(0u32, 0u32); n_pos];
@@ -528,9 +516,6 @@ impl Clip {
                 }
             }
             for t in 0..n_pos {
-                if il == 0 && t == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                    eprintln!("[cpu] L0 pre-rope q0..7={:?}", &qkv[0][..8]);
-                }
                 let (py, px) = coords[t];
                 for part in 0..2 {
                     // 0=q, 1=k — 헤드 순회
@@ -551,10 +536,6 @@ impl Clip {
                 }
             }
 
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                eprintln!("[cpu] L0 roped q0..7={:?}", &qkv[0][..8]);
-                eprintln!("[cpu] L0 roped k0..3={:?}", &qkv[0][n_embd..n_embd + 4]);
-            }
             // MHA (전체 attention, 무마스크)
             let kq_scale = 1.0f32 / (d_head as f32).sqrt();
             let nth = std::thread::available_parallelism()
@@ -583,10 +564,6 @@ impl Clip {
                         off += n;
                     }
                 });
-            }
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                let asum: f64 = attn_out.iter().flatten().map(|&x| x as f64).sum();
-                eprintln!("[cpu] L0 attn sum={asum:.4} a0..7={:?}", &attn_out[0][..8]);
             }
             // attn_out proj + 잔차 (배치)
             let mut aproj = vec![vec![0f32; n_embd]; n_pos];

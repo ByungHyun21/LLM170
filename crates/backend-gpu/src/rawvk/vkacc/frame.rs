@@ -513,9 +513,6 @@ impl VkAcc {
                 GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q5_1 | GgmlType::Q8_0
             )
         {
-            if llm170_diag::flag::on("LLM170_MOE_IDS_DBG") {
-                eprintln!("[moeids] ty={ty} rows={rows} t={t} n_in={n_in} n_out={n_out}");
-            }
             // plans/89 P0.3 — ids dmmv 판 우선: llama dmmv 기하(64스레드·2행·
             // 서브그룹Add) + ids 간접, f32 활성 직결(MoE quant 불필요).
             // [ts] 기준선 moe_ids 30ms/step(43GB/s) — q8b급 150GB/s 기대.

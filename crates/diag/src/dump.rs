@@ -11,7 +11,7 @@
 //! - `rows:<tags>` — 지정 태그의 행별 비트 표본(`[nprd]`, 구 LLM170_NP_ROWS)
 //! - `row0full` — 태그 버퍼 첫 행 전체 헥스(`[npr0]`, 구 LLM170_NP_ROW0FULL)
 //! - `bufhash`  — 버퍼 FNV 해시(`[npbh]`, 구 LLM170_NP_BUFHASH)
-//! - `moe`      — MoE 그룹 GEMM 입력 해시·덤프(구 LLM170_MOE_DUMP)
+//! - `moe`      — MoE 그룹 GEMM 입력 해시·덤프
 //!
 //! 1회 파싱(LazyLock) — 런치패스 비용은 원자 판독 1회.
 
