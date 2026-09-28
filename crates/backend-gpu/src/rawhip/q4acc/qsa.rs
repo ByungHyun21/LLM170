@@ -398,7 +398,7 @@ impl Q4Acc {
                     .saturating_sub(sel_off.first().copied().unwrap_or(0))
                     as usize;
                 let cap = llm170_diag::flag::val("LLM170_QSA_SPLITS")
-                .and_then(|v| v.parse().ok())
+                    .and_then(|v| v.parse().ok())
                     .unwrap_or(64);
                 (list_len / 32).clamp(1, cap.clamp(1, 512))
             } else {
@@ -631,7 +631,7 @@ impl Q4Acc {
             .unwrap_or(0)
             .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
         let cap = llm170_diag::flag::val("LLM170_QSA_SPLITS")
-                .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let (qdev, kdev, vdev, sdev, ofdev, pdev, odev) = {
@@ -750,7 +750,7 @@ impl Q4Acc {
             .unwrap_or(0)
             .saturating_sub(sel_off.first().copied().unwrap_or(0)) as usize;
         let cap = llm170_diag::flag::val("LLM170_QSA_SPLITS")
-                .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let (kdev, vdev, sdev, ofdev, pdev) = {
@@ -1346,7 +1346,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             return Err(format!("qsa_attention_dev_sel: t={t} 비분할은 미지원"));
         }
         let cap = llm170_diag::flag::val("LLM170_QSA_SPLITS")
-                .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
         let pdev = {

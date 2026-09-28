@@ -60,12 +60,10 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     out
 }
 
-
 /// 통합 덤프 — 집계 테이블 + 갭.
 /// 백엔드 어댑터(ktrace 등)의 단일 호출 프론트엔드.
 pub fn dump(evs: &[Ev], dropped: u64) -> String {
-    let out = table(evs, dropped);
-    out
+    table(evs, dropped)
 }
 #[cfg(test)]
 mod tests {

@@ -75,8 +75,8 @@ pub(super) fn frame_forward_ex(
         // CPU 디퀀트는 측정 rep에서 콜드 54ms(GPU 유휴) — 커널은 수백 µs.
         let mut gpu_ok = false;
         if embd.ty == llm170_gguf::GgmlType::Q8_0 && llm170_diag::flag::ne0("LLM170_VK_EMBQ8") {
-            gpu_ok = (|| -> Result<(), Q4Error> {
-                acc.emb_q8_gather_dev(
+            gpu_ok = acc
+                .emb_q8_gather_dev(
                     embd.data.as_ptr() as usize,
                     embd.data,
                     tokens,
@@ -85,8 +85,7 @@ pub(super) fn frame_forward_ex(
                     hc,
                 )
                 .map_err(Q4Error::Io)
-            })()
-            .is_ok();
+                .is_ok();
             if !gpu_ok {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| eprintln!("# emb-q8g: 실패 — CPU 폴백"));
@@ -384,8 +383,6 @@ pub(super) fn frame_forward_ex(
         if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
         }
-        if il == 0 {
-        }
 
         // 3) attention — GDN 프레임 / QSA 값 브리지
         if hp.is_recr(il) {
@@ -456,8 +453,6 @@ pub(super) fn frame_forward_ex(
         if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
         }
-        if il == 0 {
-        }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
         if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
@@ -498,7 +493,6 @@ pub(super) fn frame_forward_ex(
             }
         }
         sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
-        if il == 0 {}
     }
     frame_ck(acc, f.res_hc, hc * n, t, "head.res");
 
@@ -1380,8 +1374,6 @@ pub(super) fn gdn_frame(
     }
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
-    if il == 0 {
-    }
     if !stage_skipped("gdn.ar") {
         fs.frame_gdn_ar(
             f.gq,

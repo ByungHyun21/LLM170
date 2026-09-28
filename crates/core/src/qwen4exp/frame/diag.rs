@@ -152,5 +152,3 @@ pub(super) fn ftime_report(_t: usize) {
         s.0 = std::time::Instant::now();
     });
 }
-
-

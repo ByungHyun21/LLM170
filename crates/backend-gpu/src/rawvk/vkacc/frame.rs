@@ -443,14 +443,13 @@ impl VkAcc {
             let mut hit: Option<vk::Buffer> = None;
             if pair_on && hit_on {
                 let sl = self.moe_xq_pair.lock();
-                if let Some((hx, hn, hr, b)) = sl.as_ref() {
-                    if *hx == x
-                        && *hn == n_in
-                        && *hr == rows
-                        && (b.bytes as usize) >= rows * xq_w * 4
-                    {
-                        hit = Some(b.buf);
-                    }
+                if let Some((hx, hn, hr, b)) = sl.as_ref()
+                    && *hx == x
+                    && *hn == n_in
+                    && *hr == rows
+                    && b.bytes >= rows * xq_w * 4
+                {
+                    hit = Some(b.buf);
                 }
             }
             match hit {
@@ -462,7 +461,7 @@ impl VkAcc {
                     let tgt = if pair_on {
                         let mut sl = self.moe_xq_pair.lock();
                         let need = rows * xq_w * 4;
-                        let ok = sl.as_ref().is_some_and(|v| (v.3.bytes as usize) >= need);
+                        let ok = sl.as_ref().is_some_and(|v| v.3.bytes >= need);
                         if !ok {
                             *sl = Some((x, n_in, rows, ctx.alloc(need)?));
                         } else if let Some(v) = sl.as_mut() {
@@ -878,7 +877,7 @@ impl VkAcc {
                     let g = g.as_ref().unwrap();
                     (g.off.buf, g.perm.buf)
                 };
-                let (xq_ll, _llbytes) = self.packbufs.lock().0.get(&x).unwrap().clone();
+                let (xq_ll, _llbytes) = *self.packbufs.lock().0.get(&x).unwrap();
                 // 107 W1: f16-dm 변형(LLMMQH16) 폐기 — 원장 83 중립 판정.
                 let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLlmmq)?;
                 let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
@@ -933,10 +932,10 @@ impl VkAcc {
 
             let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            if let Some(b) = w0_override {
-                if b != vk::Buffer::null() {
-                    binds[0] = b;
-                }
+            if let Some(b) = w0_override
+                && b != vk::Buffer::null()
+            {
+                binds[0] = b;
             }
             while binds.len() < 8 {
                 binds.push(dbuf);

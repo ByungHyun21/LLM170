@@ -81,7 +81,6 @@ impl Vit {
             .ok_or_else(|| format!("vit weight 없음: {k}"))
     }
 
-
     fn gemm(
         &self,
         x: *mut u8,
