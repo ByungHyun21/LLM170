@@ -417,12 +417,12 @@ pub(super) fn frame_forward_np_ex(
         acc.frame_mm(f.hxn, &w_down, f.hlo, t).map_err(Q4Error::Io)?;
         op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len * t })?;
         let w_up = model.w4("output_hc_up.weight")?;
-        if std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true) && t >= 128 {
+        if std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false) && t >= 128 {
         acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
     } else {
         acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
     }
-        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true)) && t >= 128 })?;
+        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false)) && t >= 128 })?;
         let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(f.hin, &wout, f.logits_t, t).map_err(Q4Error::Io)?;
         let (logits, toks) = if greedy {
