@@ -1260,8 +1260,15 @@ pub(super) fn moe_frame(
             .map_err(Q4Error::Io)?;
         if msync { sync_mark(acc, "d.gemm.up", f.mup)?; }
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: k_sel * n_ff })?;
-        fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
-            .map_err(Q4Error::Io)?;
+        // plans/105(원장 69): my f16 — 선형 경로, 최대 쓰기(52MB/콜).
+        let m16 = std::env::var("LLM170_VK_MOEH16").map(|v| v == "1").unwrap_or(false);
+        if m16 {
+            fs.frame_moe_gemm16(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
+                .map_err(Q4Error::Io)?;
+        } else {
+            fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
+                .map_err(Q4Error::Io)?;
+        }
         if msync { sync_mark(acc, "d.gemm.down", f.my)?; }
         op(acc, FrameOp::MoeWeightedSum { ys: f.my, wt: f.mwt, out: f.mout, k: k_sel, n })?;
         if msync { sync_mark(acc, "d.wsum", f.mout)?; }
@@ -1300,23 +1307,13 @@ pub(super) fn moe_frame(
         }
         // plans/105: gate/up packed f16 중간출력(옵트인 LLM170_VK_MOEH16=1).
         let m16 = std::env::var("LLM170_VK_MOEH16").map(|v| v == "1").unwrap_or(false);
-        if m16 {
-            fs.frame_moe_gemm16(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        } else {
-            fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        }
+        fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
         if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
         }
-        if m16 {
-            fs.frame_moe_gemm16(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        } else {
-            fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        }
+        fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: t * k_sel * n_ff })?;
         fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;

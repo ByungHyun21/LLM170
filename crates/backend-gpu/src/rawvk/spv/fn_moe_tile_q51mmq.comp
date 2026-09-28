@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // fn_moe_tile_q51mmq (plans/96 G3) — q5_1 MoE 전문가 타일 int8 MMQ.
 // q51_sg1(coopmat f16, 6.2ms/회) 대응 MMQ 판 시험. 구 스칼라 원식:
@@ -22,7 +23,8 @@ shared float sAd[64];         // d
 shared float sAm[64];         // mn
 shared uint sB[16][8];
 shared float sBd[16];
-shared int sLive;  // plans/96: 밴드 내 실제(센티널 아닌) 행 수
+shared int sLive;
+shared float shDr[16 * 64];   // plans/105: f16 드레인 전치 버퍼  // plans/96: 밴드 내 실제(센티널 아닌) 행 수
 shared float sBsum[16]; // plans/96: quant 사전계산합 — sBw 폐지
 
 int sdot4p(uint a, uint b) {
@@ -145,8 +147,25 @@ if (p == 0) {
         barrier();
     }
 
-    // ── 드레인: 직접산란.
-    if (tr < nrow) {
+    // ── 드레인: 직접산란. mode=2(plans/105): packed f16 — LDS 전치 후
+    // 짝수 tr이 (tr,tr+1) 워드 팩(선형 경로 — f16 엡실론 클래스).
+    if (pc.mode == 2u) {
+        for (int c = 0; c < 16; c++) {
+            shDr[c * 64 + int(tr)] = (c < nt) ? acc[c] : 0.0;
+        }
+        barrier();
+        if ((tr & 1u) == 0u && tr + 1 < nrow) {
+            for (int c = 0; c < nt; c++) {
+                uint pr2 = perm_pad[uint(r0e + c)];
+                if (pr2 != 0xFFFFFFFFu) {
+                    uint cell = pr2 * pc.n_out + uint(row0 + tr);
+                    outv[cell >> 1] = uintBitsToFloat(packHalf2x16(vec2(
+                        float16_t(shDr[c * 64 + int(tr)]),
+                        float16_t(shDr[c * 64 + int(tr) + 1]))));
+                }
+            }
+        }
+    } else if (tr < nrow) {
         for (int c = 0; c < 16; c++) {
             if (c < nt) {
                 uint pr2 = perm_pad[uint(r0e + c)];

@@ -472,7 +472,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             }
             O::MoeWeightedSum { ys, wt, out, k, n } => {
                 let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
-                let p = self.pipeline(&mut ctx, Slot::MoeWsum)?;
+                let y16 = self.f16bufs.lock().contains(&ys);
+                let p = self.pipeline(&mut ctx, if y16 { Slot::FnMoeWsumH } else { Slot::MoeWsum })?;
                 let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
                 let total = n * t_cur;
                 let push = push_u32s(&[n as u32, k as u32, total as u32]);
