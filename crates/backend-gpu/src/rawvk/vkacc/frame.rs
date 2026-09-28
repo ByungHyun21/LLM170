@@ -620,6 +620,34 @@ impl VkAcc {
             {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 원본 바인딩
             }
+            // plans/105 P2: llama mul_mmq 포트(옵트인 LLM170_VK_Q4KLL=1) —
+            // BN64 워프타일·전문가당 단일 WG(가중 1회 판독). 근거: llama
+            // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
+            if w.ty == GgmlType::Q4K
+                && wbufs.len() == 1
+                && std::env::var("LLM170_VK_Q4KLL").map(|v| v == "1").unwrap_or(false)
+            {
+                let (offb, pmb) = {
+                    let g = self.moe_grp.lock();
+                    let g = g.as_ref().unwrap();
+                    (g.off.buf, g.perm.buf)
+                };
+                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLlmmq)?;
+                let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
+                while pbinds.len() < 8 {
+                    pbinds.push(dbuf);
+                }
+                pbinds.push(xq);       // binding 8
+                pbinds.push(ob);        // binding 9
+                pbinds.push(dbuf);      // binding 10 (커널 미사용 슬롯 패드)
+                pbinds.push(pmb);       // binding 11
+                pbinds.push(offb);      // binding 12
+                let ds2 = ctx.bind_ds(&pk, &pbinds)?;
+                let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, n_expert_stack as u32, 0u32]);
+                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
+                ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, 1, &pkrds, &[ob])?;
+                return Ok(());
+            }
             // plans/105 P1: 전문가-주 퍼시스턴트 K-분할(옵트인 LLM170_VK_Q4KPKS=1)
             // — A 스테이징 전문가당 1회(슈퍼그룹 4청크 공유) + 선형 스크래치
             // 드레인 → FnKsred 결정론 축소(tile_q8128ks 승격 클래스).
