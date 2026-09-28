@@ -2223,6 +2223,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
         report.push_str(&format!("| Split3 {}", if ok { "OK" } else { "FAIL" }));
         for h in [xnh, gth, mkh, resh, ijh, o3h, z3h, w3h, n3h, b2h, a2h, dth, sah, bgh, v4h, s3h, d0h, d1h, d2h] { acc.frame_free(h)?; }
     }
+    // 107 P0-6: §11-14 불변성 체커는 각자 VkAcc를 만들어 쓴다 — 외부 acc를
+    // 여기서 명시 파기해 동시 디바이스 오픈을 줄인다(7 → 최대 2).
+    drop(acc);
     // ── 11) GDN AR 청크 불변성 — 단일 t=8 대 2×t=4, 최종 상태·출력 비교 ──
     {
         use llm170_core::matmul::FrameHost as _FH;
@@ -2738,6 +2741,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                     if ok { "OK" } else { "FAIL" }
                 ));
             }
+            // 107 P0-6: §15+ 는 §1-10 acc와 무관한 신규 버퍼만 쓴다 —
+            // 불변성 체커 디바이스가 닫힌 뒤 재생성.
+            let acc = VkAcc::new()?;
             // ── 15) shexp_gu/shexp_da — 디코드 t=1 융합 vs CPU 디양자화 참조 ──
             // (qwen4exp 전용 — q35는 SKIP)
             if let AnyModel::Q4(m4) = &model {
@@ -2806,6 +2812,9 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 acc.frame_free(sh)?;
             }
         }
+        // 107 P0-6: §15+ 는 §1-10 acc와 무관한 신규 버퍼만 쓴다 — 불변성
+        // 체커 디바이스가 전부 닫힌 지금 재생성(동시 1대 유지).
+        let acc = VkAcc::new()?;
         // ── 16) GdnConv 절대 대조(t=1 순차판) — CPU 링 산술과 직접 비교 ──
         // (plans/86 §1: §12는 청크 불변성만 — t<k-1 순차 커널은 커버 밖이었다)
         {
