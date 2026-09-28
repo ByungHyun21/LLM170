@@ -11,7 +11,9 @@ use llm170_diag::trace::Ev;
 pub fn ktrace_dump() -> String {
     let mut g = KTRACE.lock();
     // ktrace_on 없이 호출되면(스펙 경로 등) 빈 문자열
-    let Some(slot) = g.as_mut() else { return String::new() };
+    let Some(slot) = g.as_mut() else {
+        return String::new();
+    };
     let evs = std::mem::take(slot);
     // 이벤트 핸들 정리 — 파괴하지 않으면 hipEvent 풀이 고갈되어(런치당 2개 생성,
     // 13k 런치) 이후 생성이 실패하고 트레이스에서 통째로 누락된다(2026-09-14 규명).
@@ -44,7 +46,9 @@ pub fn ktrace_dump() -> String {
                 continue;
             }
             let mut dur = 0f32;
-            if hip::hipEventElapsedTime(&mut dur, st.1 as *mut _, en.1 as *mut _) != hip::hipError_t_hipSuccess {
+            if hip::hipEventElapsedTime(&mut dur, st.1 as *mut _, en.1 as *mut _)
+                != hip::hipError_t_hipSuccess
+            {
                 continue;
             }
             out.push(Ev {
@@ -61,7 +65,9 @@ pub fn ktrace_dump() -> String {
                 let nst = &evs[2 * k];
                 if nst.0 == evs[2 * k + 1].0 && nst.2 == evs[2 * k + 1].2 {
                     let mut gm = 0f32;
-                    if hip::hipEventElapsedTime(&mut gm, en.1 as *mut _, nst.1 as *mut _) == hip::hipError_t_hipSuccess {
+                    if hip::hipEventElapsedTime(&mut gm, en.1 as *mut _, nst.1 as *mut _)
+                        == hip::hipError_t_hipSuccess
+                    {
                         t += gm as f64;
                     }
                     break;
@@ -75,14 +81,16 @@ pub fn ktrace_dump() -> String {
     llm170_diag::writer::dump(&evs, 0)
 }
 
-pub fn ktrace_on() { *KTRACE.lock() = Some(Vec::new()); }
+pub fn ktrace_on() {
+    *KTRACE.lock() = Some(Vec::new());
+}
 
 pub fn aout_dumped() -> bool {
     AOUT_DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 static AOUT_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub struct KtraceEv(pub &'static str, pub usize, pub u32);  // name, event, gy
+pub struct KtraceEv(pub &'static str, pub usize, pub u32); // name, event, gy
 pub static KTRACE: parking_lot::Mutex<Option<Vec<KtraceEv>>> = parking_lot::Mutex::new(None);
 
 /// 활성 KTRACE 슬롯 가드 — 런치 훅용. 녹화 중이 아니면 None.

@@ -2,14 +2,14 @@
 //! plans/75 P2.2: mod.rs 에서 기계적 이동(내용 무변경).
 
 use crate::rawhip::ck;
-use crate::rawhip::{GRAPH_SKIP, KtraceEv};
-use crate::rawhip::nolaunch_on;
 use crate::rawhip::kernels;
+use crate::rawhip::nolaunch_on;
 use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
+use crate::rawhip::{GRAPH_SKIP, KtraceEv};
+use crate::rawhip::{env_eq, env_on};
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
 use std::ffi::CString;
-use crate::rawhip::{env_on, env_eq};
 
 pub struct RawCtx {
     pub(crate) fns: HashMap<&'static str, hip::hipFunction_t>,
@@ -38,7 +38,7 @@ pub struct RawCtx {
     /// 원인을 커널 런치로 좁혔다(해제는 하지 않으므로 목록은 영구, 수백 개 수준).
     pub(crate) allocs: std::sync::Mutex<Vec<(usize, usize)>>,
     pub(crate) ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
-    pub(crate) mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>,  // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
+    pub(crate) mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>, // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
     /// q6 정준 재배열 캐시.
     pub(crate) canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
@@ -71,11 +71,11 @@ struct TileLaunch {
     ktab: bool,
 }
 
-
 /// 프리필 패밀리 핀 (plans/84 A) — step_batch 진입~종료 사이 true.
 /// t 2..8 GEMV mt 변형·flash wk 게이트가 패밀리를 갈라 청크 불변을 깨뜨리므로
 /// 핀 중에는 large-t 패밀리로 통일한다.
-pub(crate) static PREFILL_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static PREFILL_PIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 디스패처 모델 스코프 (plans/84 E1) — 전역 디스패처의 패밀리 기본값을
 /// 모델별로 분리: 27B(qwen35) 게이트 타이를 뒤집는 저출력 warp GEMV를
@@ -104,7 +104,14 @@ impl RawCtx {
 
             let src = CString::new(kernels::SRC).unwrap();
             let mut prog: hip::hiprtcProgram = std::ptr::null_mut();
-            let rs = hip::hiprtcCreateProgram(&mut prog, src.as_ptr(), std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut());
+            let rs = hip::hiprtcCreateProgram(
+                &mut prog,
+                src.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 return Err(format!("hiprtcCreateProgram: {rs:?}"));
             }
@@ -126,15 +133,26 @@ impl RawCtx {
             // LLM170_EXACTEXP=1이면 glibc 비트일치 f64 경로 복원.
             let ofast = CString::new("-DLLM170_FASTEXP").unwrap();
             let fastexp = !env_on("LLM170_EXACTEXP");
-            let mut opts = vec![o1.as_ptr(), o2.as_ptr(), o3.as_ptr(), o4.as_ptr(), o5.as_ptr()];
-            if fastexp { opts.push(ofast.as_ptr()); }
+            let mut opts = vec![
+                o1.as_ptr(),
+                o2.as_ptr(),
+                o3.as_ptr(),
+                o4.as_ptr(),
+                o5.as_ptr(),
+            ];
+            if fastexp {
+                opts.push(ofast.as_ptr());
+            }
             let rs = hip::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_mut_ptr());
             if rs != hip::hiprtcResult_HIPRTC_SUCCESS {
                 let mut sz = 0usize;
                 let _ = hip::hiprtcGetProgramLogSize(prog, &mut sz);
                 let mut buf = vec![0i8; sz.max(1)];
                 let _ = hip::hiprtcGetProgramLog(prog, buf.as_mut_ptr());
-                let log = String::from_utf8_lossy(std::slice::from_raw_parts(buf.as_ptr() as *const u8, sz));
+                let log = String::from_utf8_lossy(std::slice::from_raw_parts(
+                    buf.as_ptr() as *const u8,
+                    sz,
+                ));
                 return Err(format!("rawhip 컴파일 실패: {log}"));
             }
             let mut code_sz = 0usize;
@@ -146,15 +164,24 @@ impl RawCtx {
                 return Err("GetCode".into());
             }
             if let Some(path) = std::env::var_os("LLM170_DUMP_MODULE") {
-                let _ = std::fs::write(&path, std::slice::from_raw_parts(code.as_ptr() as *const u8, code_sz));
+                let _ = std::fs::write(
+                    &path,
+                    std::slice::from_raw_parts(code.as_ptr() as *const u8, code_sz),
+                );
             }
             let mut module: hip::hipModule_t = std::ptr::null_mut();
-            ck(hip::hipModuleLoadData(&mut module, code.as_ptr() as *const _), "ModuleLoadData")?;
+            ck(
+                hip::hipModuleLoadData(&mut module, code.as_ptr() as *const _),
+                "ModuleLoadData",
+            )?;
             let mut fns = HashMap::new();
             for name in kernels::NAMES {
                 let cname = CString::new(*name).unwrap();
                 let mut f: hip::hipFunction_t = std::ptr::null_mut();
-                ck(hip::hipModuleGetFunction(&mut f, module, cname.as_ptr()), "GetFunction")?;
+                ck(
+                    hip::hipModuleGetFunction(&mut f, module, cname.as_ptr()),
+                    "GetFunction",
+                )?;
                 fns.insert(*name, f);
             }
             // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등).
@@ -168,8 +195,15 @@ impl RawCtx {
                         CO_V4,
                         "LLM170_CO2_PATH",
                         include_bytes!("co/v4all.co"),
-                        &["gemm_q5k_v4", "gemm_q4k_v4", "gemm_xs_v4",
-                          "gemm_q5k_wm", "gemm_q4k_wm", "gemm_q6k_wm", "gemm_xs_wm"],
+                        &[
+                            "gemm_q5k_v4",
+                            "gemm_q4k_v4",
+                            "gemm_xs_v4",
+                            "gemm_q5k_wm",
+                            "gemm_q4k_wm",
+                            "gemm_q6k_wm",
+                            "gemm_xs_wm",
+                        ],
                     ),
                     (
                         CO_ODD,
@@ -181,12 +215,14 @@ impl RawCtx {
                         CO_MMQ,
                         "LLM170_CO4_PATH",
                         include_bytes!("co/mmq.co"),
-                        &["mmq_quant_y",
-                          "mmq_quant_y_d4",
-                          "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-                          "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                        &[
+                            "mmq_quant_y",
+                            "mmq_quant_y_d4",
+                            "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                            "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                            "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                            "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                        ],
                     ),
                     (
                         CO_MMQ2,
@@ -198,39 +234,53 @@ impl RawCtx {
                         CO_MMQ3,
                         "LLM170_CO6_PATH",
                         include_bytes!("co/mmq3.co"),
-                        &["_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                        &[
+                            "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                        ],
                     ),
                     (
                         CO_MMQ8,
                         "LLM170_CO7_PATH",
                         include_bytes!("co/mmq8.co"),
-                        &["_ZL9mul_mat_qIL9ggml_type8ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"],
+                        &[
+                            "_ZL9mul_mat_qIL9ggml_type8ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                        ],
                     ),
                     (
                         CO_QY,
                         "LLM170_CO8_PATH",
                         include_bytes!("co/quanty_new.co"),
-                        &["_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii",
-                          "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout1ELb0EEvPKfPKiPvllllliii",
-                          "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout2ELb0EEvPKfPKiPvllllliii"],
+                        &[
+                            "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii",
+                            "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout1ELb0EEvPKfPKiPvllllliii",
+                            "_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout2ELb0EEvPKfPKiPvllllliii",
+                        ],
                     ),
                     (
                         CO_J128,
                         "LLM170_CO_PATH",
                         include_bytes!("co/w32b.co"),
-                        &["gemm_q5k_j128", "gemm_q4k_j128", "gemm_q6k_j128",
-                          "gemm_xs_j128", "gemm_q8_j128"],
+                        &[
+                            "gemm_q5k_j128",
+                            "gemm_q4k_j128",
+                            "gemm_q6k_j128",
+                            "gemm_xs_j128",
+                            "gemm_q8_j128",
+                        ],
                     ),
                 ];
                 for (bit, env_key, embedded, names) in slots {
                     let bytes: Vec<u8> = match std::env::var_os(env_key) {
-                        Some(p) => std::fs::read(&p)
-                            .map_err(|e| format!("{env_key} 읽기({p:?}): {e}"))?,
+                        Some(p) => {
+                            std::fs::read(&p).map_err(|e| format!("{env_key} 읽기({p:?}): {e}"))?
+                        }
                         None => embedded.to_vec(),
                     };
                     let mut m: hip::hipModule_t = std::ptr::null_mut();
-                    ck(hip::hipModuleLoadData(&mut m, bytes.as_ptr() as *const _),
-                       &format!("{env_key} ModuleLoadData"))?;
+                    ck(
+                        hip::hipModuleLoadData(&mut m, bytes.as_ptr() as *const _),
+                        &format!("{env_key} ModuleLoadData"),
+                    )?;
                     let mut loaded = 0u8;
                     for name in *names {
                         let cname = CString::new(*name).unwrap();
@@ -254,14 +304,28 @@ impl RawCtx {
             ck(hip::hipStreamCreate(&mut stream3), "StreamCreate3")?;
             let mut stream4: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream4), "StreamCreate4")?;
-            Ok(RawCtx { scope: std::sync::atomic::AtomicU8::new(SCOPE_QWEN35), fns, co_fam: std::sync::atomic::AtomicU8::new(fam_bits), stream, stream2, stream3, stream4, pre_pair: std::sync::atomic::AtomicBool::new(false), pre_ev: std::sync::Mutex::new(None), mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
-            mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
-            f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            allocs: std::sync::Mutex::new(Vec::new()),
-            ar_cache: std::sync::Mutex::new(None),
-            mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
-            canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
-            mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())), scratch: std::sync::Mutex::new(HashMap::new()), pinned: std::sync::Mutex::new((0, std::ptr::null_mut())), pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())) })
+            Ok(RawCtx {
+                scope: std::sync::atomic::AtomicU8::new(SCOPE_QWEN35),
+                fns,
+                co_fam: std::sync::atomic::AtomicU8::new(fam_bits),
+                stream,
+                stream2,
+                stream3,
+                stream4,
+                pre_pair: std::sync::atomic::AtomicBool::new(false),
+                pre_ev: std::sync::Mutex::new(None),
+                mmq_y: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                mmq_y_s: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+                allocs: std::sync::Mutex::new(Vec::new()),
+                ar_cache: std::sync::Mutex::new(None),
+                mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
+                canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
+                mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                scratch: std::sync::Mutex::new(HashMap::new()),
+                pinned: std::sync::Mutex::new((0, std::ptr::null_mut())),
+                pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())),
+            })
         }
     }
 
@@ -270,7 +334,12 @@ impl RawCtx {
     /// 메모리 고갈→illegal address (2026-09-03 RCA).
     pub fn scratch(&self, bytes: usize) -> Result<*mut u8, String> {
         let mut sc = self.scratch.lock().map_err(|e| e.to_string())?;
-        let v = sc.entry((self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) as usize, bytes)).or_default();
+        let v = sc
+            .entry((
+                self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) as usize,
+                bytes,
+            ))
+            .or_default();
         if v.is_empty() {
             let p = self.alloc(bytes)?;
             v.push(p);
@@ -278,17 +347,24 @@ impl RawCtx {
         Ok(v[0])
     }
 
-
     /// 현재 메인 스트림 — 프리필 페어면 stream3.
     #[inline]
     pub fn cur_stream(&self) -> hip::hipStream_t {
-        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) { self.stream3 } else { self.stream }
+        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) {
+            self.stream3
+        } else {
+            self.stream
+        }
     }
 
     /// 현재 사이드 스트림(launch3s / join2 / side_wait_main 대상).
     #[inline]
     pub fn cur_side(&self) -> hip::hipStream_t {
-        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) { self.stream4 } else { self.stream2 }
+        if self.pre_pair.load(std::sync::atomic::Ordering::Relaxed) {
+            self.stream4
+        } else {
+            self.stream2
+        }
     }
 
     /// 프리필 완료 이벤트 기록(현재 사이드) / 비블로킹 확인 / 메인 합류.
@@ -300,12 +376,17 @@ impl RawCtx {
                 ck(hip::hipEventCreateWithFlags(&mut ev, 0), "pre-ev")?;
                 *g = Some(ev);
             }
-            ck(hip::hipEventRecord(g.unwrap(), self.cur_side()), "pre-ev-rec")?;
+            ck(
+                hip::hipEventRecord(g.unwrap(), self.cur_side()),
+                "pre-ev-rec",
+            )?;
         }
         Ok(())
     }
     pub fn pre_ready(&self) -> bool {
-        let Ok(g) = self.pre_ev.lock() else { return false };
+        let Ok(g) = self.pre_ev.lock() else {
+            return false;
+        };
         match *g {
             None => false,
             Some(ev) => unsafe { hip::hipEventQuery(ev) == hip::hipError_t_hipSuccess },
@@ -314,7 +395,9 @@ impl RawCtx {
     pub fn pre_join(&self) -> Result<(), String> {
         let g = self.pre_ev.lock().map_err(|e| e.to_string())?;
         if let Some(ev) = *g {
-            unsafe { ck(hip::hipStreamWaitEvent(self.stream, ev, 0), "pre-join")?; }
+            unsafe {
+                ck(hip::hipStreamWaitEvent(self.stream, ev, 0), "pre-join")?;
+            }
         }
         Ok(())
     }
@@ -324,7 +407,9 @@ impl RawCtx {
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         unsafe {
             let r = hip::hipMalloc(&mut p, bytes);
-            if r != hip::hipError_t_hipSuccess { eprintln!("alloc {bytes}B → {r:?}"); }
+            if r != hip::hipError_t_hipSuccess {
+                eprintln!("alloc {bytes}B → {r:?}");
+            }
             ck(r, "hipMalloc")?;
         }
         if let Ok(mut v) = self.allocs.lock() {
@@ -335,7 +420,9 @@ impl RawCtx {
 
     /// `p`가 살아있는 할당 안인지(그리고 몇 바이트 남았는지) — h2d 실패 진단용.
     fn alloc_span(&self, p: usize, need: usize) -> String {
-        let Ok(v) = self.allocs.lock() else { return "등록부 잠금 실패".into() };
+        let Ok(v) = self.allocs.lock() else {
+            return "등록부 잠금 실패".into();
+        };
         for &(s, e) in v.iter() {
             if p >= s && p < e {
                 return if p + need <= e {
@@ -351,8 +438,16 @@ impl RawCtx {
     /// 사이드 스트림 비동기 h2d — 메인 스트림 작업과 중첩시킨 뒤 join2로 합류.
     pub fn h2d_async_s(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
-            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(),
-                hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream2), "h2d-async-s")
+            ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src.as_ptr() as *const _,
+                    src.len(),
+                    hip::hipMemcpyKind_hipMemcpyHostToDevice,
+                    self.stream2,
+                ),
+                "h2d-async-s",
+            )
         }
     }
 
@@ -360,15 +455,31 @@ impl RawCtx {
     /// 소형 업로드(플레 임베딩 등)용. 동기화 없음(plans/73).
     pub fn h2d_async_m(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
         unsafe {
-            ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(),
-                hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), "h2d-async-m")
+            ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src.as_ptr() as *const _,
+                    src.len(),
+                    hip::hipMemcpyKind_hipMemcpyHostToDevice,
+                    self.stream,
+                ),
+                "h2d-async-m",
+            )
         }
     }
     /// 디바이스→디바이드 복사(메인 스트림) — QSA KV 상주 풀 append용(plans/67 3단계).
     pub fn d2d(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<(), String> {
         unsafe {
-            ck(hip::hipMemcpyAsync(dst as *mut _, src as *const _, bytes,
-                hip::hipMemcpyKind_hipMemcpyDeviceToDevice, self.stream), "d2d")
+            ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src as *const _,
+                    bytes,
+                    hip::hipMemcpyKind_hipMemcpyDeviceToDevice,
+                    self.stream,
+                ),
+                "d2d",
+            )
         }
     }
     pub fn h2d(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
@@ -379,15 +490,32 @@ impl RawCtx {
             // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
             if env_on("LLM170_H2D_TRACE") {
-                eprintln!("# h2d {}B dst={dst:p} q0={:?}", src.len(), &src[..src.len().min(2)]);
+                eprintln!(
+                    "# h2d {}B dst={dst:p} q0={:?}",
+                    src.len(),
+                    &src[..src.len().min(2)]
+                );
             }
             // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
             if env_on("LLM170_MEMDBG") && src.len() >= (1 << 20) {
                 let (mut fb, mut tb) = (0usize, 0usize);
                 let _ = hip::hipMemGetInfo(&mut fb, &mut tb);
-                eprintln!("# memdbg before {tag}: free={}MB/{}MB", fb / 1048576, tb / 1048576);
+                eprintln!(
+                    "# memdbg before {tag}: free={}MB/{}MB",
+                    fb / 1048576,
+                    tb / 1048576
+                );
             }
-            if let Err(e) = ck(hip::hipMemcpyAsync(dst as *mut _, src.as_ptr() as *const _, src.len(), hip::hipMemcpyKind_hipMemcpyHostToDevice, self.stream), &tag) {
+            if let Err(e) = ck(
+                hip::hipMemcpyAsync(
+                    dst as *mut _,
+                    src.as_ptr() as *const _,
+                    src.len(),
+                    hip::hipMemcpyKind_hipMemcpyHostToDevice,
+                    self.stream,
+                ),
+                &tag,
+            ) {
                 // 사후 hipMemGetInfo는 sticky 오류 때문에 0을 돌려준다(확인함) —
                 // 메모리 진단이 필요하면 이 h2d **전에** 조회해야 한다.
                 let span = self.alloc_span(dst as usize, src.len());
@@ -398,10 +526,7 @@ impl RawCtx {
                     .take(4)
                     .map(|l| l.trim().to_string())
                     .collect();
-                return Err(format!(
-                    "{e} | dst {span} | 호출: {}",
-                    frames.join(" <- ")
-                ));
+                return Err(format!("{e} | dst {span} | 호출: {}", frames.join(" <- ")));
             }
             self.sync()
         }
@@ -484,7 +609,16 @@ impl RawCtx {
             }
             if !pin.1.is_null() {
                 let buf = pin.1;
-                ck(hip::hipMemcpyAsync(buf as *mut _, src as *const _, need, hip::hipMemcpyKind_hipMemcpyDeviceToHost, self.stream), "d2h-pin")?;
+                ck(
+                    hip::hipMemcpyAsync(
+                        buf as *mut _,
+                        src as *const _,
+                        need,
+                        hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                        self.stream,
+                    ),
+                    "d2h-pin",
+                )?;
                 ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
                 std::ptr::copy_nonoverlapping(buf, dst.as_mut_ptr(), need);
                 return Ok(());
@@ -507,13 +641,13 @@ impl RawCtx {
     /// KTRACE 전용 이벤트 마커 — launch3를 거치지 않는 직접 런치 경로용.
     fn ktr_mark(&self, name: &'static str, gy: u32) {
         if let Some(mut g) = crate::rawhip::ktrace_active() {
-                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
-                unsafe {
-                    hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.stream);
-                }
-                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+            unsafe {
+                hip::hipEventCreateWithFlags(&mut ev, 0);
+                hip::hipEventRecord(ev, self.stream);
             }
+            g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+        }
     }
 
     /// 커널 런치 — args는 각 인자 값에 대한 포인터 배열 (호출자 슬롯 유지).
@@ -531,25 +665,43 @@ impl RawCtx {
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
         }
-        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        let f = *self
+            .fns
+            .get(name)
+            .ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev0, 0);
-                    hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
-                }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch").map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
+                let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev0, 0);
+                hip::hipEventRecord(ev0, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
+            }
+            ck(
+                hip::hipModuleLaunchKernel(
+                    f,
+                    gx,
+                    gy,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    self.cur_stream(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "launch",
+            )
+            .map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
-                }
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev, 0);
+                hip::hipEventRecord(ev, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            }
         }
         Ok(())
     }
-
 
     /// 3차원 그리드 런치 (qsa용 — gy 추가).
     #[allow(clippy::too_many_arguments)]
@@ -561,10 +713,10 @@ impl RawCtx {
         gz: u32,
         block: u32,
         args: &mut [*mut std::ffi::c_void],
-    ) -> Result<(), String> {        if env_on("LLM170_LAUNCH_BT") {
+    ) -> Result<(), String> {
+        if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[lbt] {name} gx={gx} gy={gy} gz={gz}");
         }
-
 
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
@@ -572,41 +724,76 @@ impl RawCtx {
         if env_on("LLM170_KT_NAMES") {
             eprintln!("# KT3 {name} gy={gy}");
         }
-        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        let f = *self
+            .fns
+            .get(name)
+            .ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev0, 0);
-                    hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
-                }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_stream(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3").map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
+                let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev0, 0);
+                hip::hipEventRecord(ev0, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
+            }
+            ck(
+                hip::hipModuleLaunchKernel(
+                    f,
+                    gx,
+                    gy,
+                    gz,
+                    block,
+                    1,
+                    1,
+                    0,
+                    self.cur_stream(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "launch3",
+            )
+            .map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
-                }
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev, 0);
+                hip::hipEventRecord(ev, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            }
         }
         Ok(())
     }
 
     /// 사이드 스트림 발사 (비동기 — join2로 합류)
     /// 동적 shared 64KB 런치 (부록82) — 커널당 1회 속성 설정.
-    pub fn launch3_dyn(&self, name: &'static str, gx: u32, gy: u32, gz: u32, block: u32, smem: u32, args: &mut [*mut std::ffi::c_void]) -> Result<(), String> {
+    pub fn launch3_dyn(
+        &self,
+        name: &'static str,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        block: u32,
+        smem: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<(), String> {
         if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
             return Ok(());
         }
         use std::collections::HashSet;
         use std::sync::OnceLock;
         static SET: OnceLock<std::sync::Mutex<HashSet<usize>>> = OnceLock::new();
-        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        let f = *self
+            .fns
+            .get(name)
+            .ok_or_else(|| format!("커널 없음: {name}"))?;
         let set = SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
         {
             let mut g = set.lock().map_err(|e| e.to_string())?;
             if g.insert(f as usize) {
                 unsafe {
-                    let r = hip::hipFuncSetAttribute(f as *const std::ffi::c_void, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem as i32);
+                    let r = hip::hipFuncSetAttribute(
+                        f as *const std::ffi::c_void,
+                        hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize,
+                        smem as i32,
+                    );
                     if r != hip::hipError_t_hipSuccess {
                         return Err(format!("smem 속성 실패: {r:?}"));
                     }
@@ -618,18 +805,33 @@ impl RawCtx {
             // 없어 qsa_flash_wmma의 실행 시간이 'kv_f16 뒤 갭 12s'로 위장,
             // 8.4× 프리필 격차의 원인 파악을 하루 종일 돌렸다).
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev0, 0);
-                    hip::hipEventRecord(ev0, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
-                }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, smem, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "launch3_dyn")?;
+                let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev0, 0);
+                hip::hipEventRecord(ev0, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
+            }
+            ck(
+                hip::hipModuleLaunchKernel(
+                    f,
+                    gx,
+                    gy,
+                    gz,
+                    block,
+                    1,
+                    1,
+                    smem,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "launch3_dyn",
+            )?;
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.stream);
-                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
-                }
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev, 0);
+                hip::hipEventRecord(ev, self.stream);
+                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            }
         }
         Ok(())
     }
@@ -643,23 +845,41 @@ impl RawCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
-        let f = *self.fns.get(name).ok_or_else(|| format!("커널 없음: {name}"))?;
+        let f = *self
+            .fns
+            .get(name)
+            .ok_or_else(|| format!("커널 없음: {name}"))?;
         unsafe {
             // KTRACE 훅 — 프레임 경로의 dense GEMM이 전부 이 경로(stream2)를 쓴다.
             // 훅이 없어 프레임 트레이스에서 통째로 누락되던 버그(2026-09-14).
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev0, 0);
-                    hip::hipEventRecord(ev0, self.cur_side());
-                    g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
-                }
-            ck(hip::hipModuleLaunchKernel(f, gx, gy, gz, block, 1, 1, 0, self.cur_side(), args.as_mut_ptr(), std::ptr::null_mut()), "launch3s")?;
+                let mut ev0: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev0, 0);
+                hip::hipEventRecord(ev0, self.cur_side());
+                g.as_mut().unwrap().push(KtraceEv(name, ev0 as usize, gy));
+            }
+            ck(
+                hip::hipModuleLaunchKernel(
+                    f,
+                    gx,
+                    gy,
+                    gz,
+                    block,
+                    1,
+                    1,
+                    0,
+                    self.cur_side(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "launch3s",
+            )?;
             if let Some(mut g) = crate::rawhip::ktrace_active() {
-                    let mut ev: hip::hipEvent_t = std::ptr::null_mut();
-                    hip::hipEventCreateWithFlags(&mut ev, 0);
-                    hip::hipEventRecord(ev, self.cur_side());
-                    g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
-                }
+                let mut ev: hip::hipEvent_t = std::ptr::null_mut();
+                hip::hipEventCreateWithFlags(&mut ev, 0);
+                hip::hipEventRecord(ev, self.cur_side());
+                g.as_mut().unwrap().push(KtraceEv(name, ev as usize, gy));
+            }
         }
         Ok(())
     }
@@ -747,14 +967,27 @@ impl RawCtx {
         self.launch3(kern, 1, gy, gz, 64, &mut args_v)?;
         let mut res = vec![0f32; n_out];
         self.sync()?;
-        self.d2h(bytemuck::cast_slice_mut(&mut res).as_mut(), out as *const u8)?;
+        self.d2h(
+            bytemuck::cast_slice_mut(&mut res).as_mut(),
+            out as *const u8,
+        )?;
         Ok(res)
     }
 
     /// W4A8 GEMV — reduce 결과를 상주 out에 직접 기록 (왕복 제거).
     /// 수치는 gemv_q8과 동일열 (동일 커널·reduce).
     #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8_out_v2(&self, xq: *const u8, w: *const u8, _ty: u32, n_in: usize, n_out: usize, out: *mut u8, xq_w: usize, t: usize) -> Result<(), String> {
+    pub fn gemv_q8_out_v2(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        _ty: u32,
+        n_in: usize,
+        n_out: usize,
+        out: *mut u8,
+        xq_w: usize,
+        t: usize,
+    ) -> Result<(), String> {
         let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
         let mut xq_p = xq as *mut std::ffi::c_void;
@@ -775,7 +1008,22 @@ impl RawCtx {
         ];
         let f = *self.fns.get("gemm_q5k_v2").ok_or("gemm_q5k_v2 없음")?;
         unsafe {
-            ck(hip::hipModuleLaunchKernel(f, t as u32, gy, gz, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "gemm_q5k_v2")?;
+            ck(
+                hip::hipModuleLaunchKernel(
+                    f,
+                    t as u32,
+                    gy,
+                    gz,
+                    64,
+                    1,
+                    1,
+                    0,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "gemm_q5k_v2",
+            )?;
         }
         Ok(())
     }
@@ -850,7 +1098,9 @@ impl RawCtx {
         // plans/74 N2: 소형 n_sub(≤32 — hc up/down=10)는 16레인/행 mt16 판 —
         // mt(64레인)은 이 형상에서 레인 효율 15%(np t=4 182us/호출 실측).
         // 킬스위치 LLM170_Q8MT16=0.
-        if (2..=8).contains(&t) && ty == 8 && n_in / 32 <= 32
+        if (2..=8).contains(&t)
+            && ty == 8
+            && n_in / 32 <= 32
             && !env_eq("LLM170_Q8MT16", "0")
             && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -864,7 +1114,9 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
-            if q8tr { eprintln!("# q8tr->mt16 n_in={n_in} n_out={n_out} t={t}"); }
+            if q8tr {
+                eprintln!("# q8tr->mt16 n_in={n_in} n_out={n_out} t={t}");
+            }
             return self.launch3(
                 "gemm_q8_0_mt16",
                 n_out.div_ceil(8) as u32,
@@ -879,7 +1131,9 @@ impl RawCtx {
         // 117→190GB/s @ n_sub=80, 119→180 @ n_sub=64). 산술은 정수 사슬 분리
         // (결합법칙 — 값 불변) + 레인별 f32 사슬/ f64 32레인 트리(mt16 계열과
         // 동일 정밀도 클래스). 킬스위치 LLM170_Q8MTW=0.
-        if (2..=8).contains(&t) && ty == 8 && n_in / 32 > 32
+        if (2..=8).contains(&t)
+            && ty == 8
+            && n_in / 32 > 32
             && !env_eq("LLM170_Q8MTW", "0")
             && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -893,7 +1147,9 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
-            if q8tr { eprintln!("# q8tr->mt_w n_in={n_in} n_out={n_out} t={t}"); }
+            if q8tr {
+                eprintln!("# q8tr->mt_w n_in={n_in} n_out={n_out} t={t}");
+            }
             return self.launch3(
                 "gemm_q8_0_mt_w",
                 1,
@@ -903,8 +1159,11 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if (2..=8).contains(&t) && ty == 8 && !env_eq("LLM170_Q8MT", "0")
-            && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        if (2..=8).contains(&t)
+            && ty == 8
+            && !env_eq("LLM170_Q8MT", "0")
+            && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -915,7 +1174,9 @@ impl RawCtx {
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
                 &mut tt_a as *mut _ as *mut std::ffi::c_void,
             ];
-            if q8tr { eprintln!("# q8tr->mt64 n_in={n_in} n_out={n_out} t={t}"); }
+            if q8tr {
+                eprintln!("# q8tr->mt64 n_in={n_in} n_out={n_out} t={t}");
+            }
             return self.launch3(
                 "gemm_q8_0_mt",
                 1,
@@ -928,11 +1189,7 @@ impl RawCtx {
         // 실측(2026-09-16): w4(사분면, 비트 동일) -9%, w16(연속 매핑) -7% —
         // 둘 다 레인 효율은 100%지만 종전 64레인 판(coalescing·ILP)이 더 빠르다.
         // 따라서 **기본은 종전 커널**, 실험판은 옵트인(LLM170_Q8W4=1 / Q8W16=1).
-        if t == 1
-            && ty == 8
-            && (env_eq("LLM170_Q8W4", "1")
-                || env_eq("LLM170_Q8W16", "1"))
-        {
+        if t == 1 && ty == 8 && (env_eq("LLM170_Q8W4", "1") || env_eq("LLM170_Q8W16", "1")) {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -960,10 +1217,8 @@ impl RawCtx {
         // 킬스위치 LLM170_Q8W16_SMALL=0.
         if t == 1
             && ty == 8
-            && (n_in / 32 <= 32
-                || (n_out >= 32768 && env_eq("LLM170_Q8W16_HEAD", "1")))
-            && (!env_eq("LLM170_Q8W16_SMALL", "0")
-                || env_eq("LLM170_Q8W16_HEAD", "1"))
+            && (n_in / 32 <= 32 || (n_out >= 32768 && env_eq("LLM170_Q8W16_HEAD", "1")))
+            && (!env_eq("LLM170_Q8W16_SMALL", "0") || env_eq("LLM170_Q8W16_HEAD", "1"))
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
@@ -989,7 +1244,10 @@ impl RawCtx {
         // 구분이 없어 옵트인으로만 둔다. 기본 적용은 형상 스코프 분리 후.
         // plans/84 E1: 모델 스코프 분리 — Flash-Next 기본 적용(FN tg +0.8%,
         // 게이트 통과), qwen35는 옵트인(타이 플립 방지). 킬스위치 =0.
-        if t == 1 && ty == 8 && n_out <= 2048 && n_in / 32 > 32
+        if t == 1
+            && ty == 8
+            && n_out <= 2048
+            && n_in / 32 > 32
             && (env_eq("LLM170_Q8W_SMALLN", "1")
                 || (self.scope_is_flashnext() && !env_eq("LLM170_Q8W_SMALLN", "0")))
         {
@@ -1002,7 +1260,14 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
                 &mut xw_a as *mut _ as *mut std::ffi::c_void,
             ];
-            return self.launch3("gemm_q8_0_w", n_out.div_ceil(8) as u32, 1, 1, 256, &mut args);
+            return self.launch3(
+                "gemm_q8_0_w",
+                n_out.div_ceil(8) as u32,
+                1,
+                1,
+                256,
+                &mut args,
+            );
         }
         if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && !env_eq("LLM170_Q8W", "0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -1030,7 +1295,9 @@ impl RawCtx {
         }
         let xw_ptr = &mut xw_a as *mut _ as *mut std::ffi::c_void;
         args_v.push(xw_ptr);
-        if q8tr { eprintln!("# q8tr->fallback {kern} n_in={n_in} n_out={n_out} t={t}"); }
+        if q8tr {
+            eprintln!("# q8tr->fallback {kern} n_in={n_in} n_out={n_out} t={t}");
+        }
         self.launch3(kern, t as u32, gy, gz2, 64, &mut args_v)?;
         Ok(())
     }
@@ -1056,8 +1323,20 @@ impl RawCtx {
         // q4_K 도 워프=행 기본(인터리브 3회: 30.6/30.0 vs 31.0/31.1/32.2).
         let w2q4 = ty == 12;
         let kern = match ty {
-            12 => if w2q4 { "gemm_q4k4_w2" } else { "gemm_q4k4" },
-            13 => if w2 { "gemm_q5k4_w2" } else { "gemm_q5k4" },
+            12 => {
+                if w2q4 {
+                    "gemm_q4k4_w2"
+                } else {
+                    "gemm_q4k4"
+                }
+            }
+            13 => {
+                if w2 {
+                    "gemm_q5k4_w2"
+                } else {
+                    "gemm_q5k4"
+                }
+            }
             14 => "gemm_q6k4",
             23 => "gemm_xs4",
             _ => return Err(format!("g4 미지원 타입 {ty}")),
@@ -1093,18 +1372,34 @@ impl RawCtx {
 
     /// mmq quant_y 캐시 무효화 (y 원본 재기입 직전 호출 — 부록81).
     pub fn mmq_y_bump(&self) {
-        if let Ok(mut c) = self.mmq_y_cache.lock() { c.0 = c.0.wrapping_add(1); }
+        if let Ok(mut c) = self.mmq_y_cache.lock() {
+            c.0 = c.0.wrapping_add(1);
+        }
     }
 
     /// AR 청크 버퍼 조기 확보 (DecodeState init에서 호출 — 조각화 회피).
-    pub fn ar_chunk_prealloc(&self, npair: usize, d: usize, nc_max: usize, ch: usize) -> Result<(), String> {
+    pub fn ar_chunk_prealloc(
+        &self,
+        npair: usize,
+        d: usize,
+        nc_max: usize,
+        ch: usize,
+    ) -> Result<(), String> {
         self.ar_chunk_bufs(npair, d, nc_max, ch).map(|_| ())
     }
 
     /// AR 청크 스캔 버퍼 (lend/sstart/pgb/pbuf) — b_t_max 기준 1회 할당.
-    pub fn ar_chunk_bufs(&self, npair: usize, d: usize, nc_max: usize, ch: usize) -> Result<(*mut u8, *mut u8, *mut u8, *mut u8), String> {
+    pub fn ar_chunk_bufs(
+        &self,
+        npair: usize,
+        d: usize,
+        nc_max: usize,
+        ch: usize,
+    ) -> Result<(*mut u8, *mut u8, *mut u8, *mut u8), String> {
         let mut g = self.ar_cache.lock().map_err(|e| e.to_string())?;
-        if let Some(b) = *g { return Ok(b); }
+        if let Some(b) = *g {
+            return Ok(b);
+        }
         let lend = self.alloc(npair * d * d * nc_max)?;
         let sstart = self.alloc(npair * d * d * nc_max)?;
         let pgb = self.alloc(npair * d * nc_max)?;
@@ -1177,34 +1472,77 @@ impl RawCtx {
         Ok(())
     }
 
-    fn tile_core(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
+    fn tile_core(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<TileLaunch, String> {
         // plans/84 E.2: 프리필 핀 중 large-t 패밀리(j128 강제 + big — odd(v4)는
         // big만 본다). 진입점: hc down(q8_0)의 t 키 GEMV/j128 갈림.
         if !env_on("LLM170_EXACT") && PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed) {
             let j128 = self.co_loaded(CO_J128);
             return self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, true);
         }
-        let j128 = !env_on("LLM170_EXACT")
-            && self.co_loaded(CO_J128) && t > 64;
+        let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128) && t > 64;
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
 
     /// head 강제판 — j128 타일을 t≤64에서도 (n_out 초대형일 때 이득).
-    fn tile_core_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
-        let j128 = !env_on("LLM170_EXACT")
-            && self.co_loaded(CO_J128);
+    fn tile_core_head(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<TileLaunch, String> {
+        let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128);
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, false)
     }
 
     /// 프리필 핀판 (plans/84 A) — j128 강제 + large-t 패밀리(wm/v4) 고정.
     /// 청크 불변성: 같은 텐서는 t에 무관하게 항상 동일 커널 산술을 쓴다.
-    fn tile_core_pin(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<TileLaunch, String> {
-        let j128 = !env_on("LLM170_EXACT")
-            && self.co_loaded(CO_J128);
+    fn tile_core_pin(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<TileLaunch, String> {
+        let j128 = !env_on("LLM170_EXACT") && self.co_loaded(CO_J128);
         self.tile_core_inner(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out, j128, true)
     }
 
-    fn tile_core_inner(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8, j128: bool, large_t: bool) -> Result<TileLaunch, String> {
+    fn tile_core_inner(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+        j128: bool,
+        large_t: bool,
+    ) -> Result<TileLaunch, String> {
         // wm·mm 상한 64: t>64 무CO는 유효 커널 없음 — 침묵 오답 대신 에러
         // (핀판은 j128 강제 — large-t 패밀리가 곧 j128/v4이므로 무CO면 에러가 정당)
         if t > 64 && !j128 {
@@ -1213,16 +1551,80 @@ impl RawCtx {
         let big = t >= 32 || large_t;
         let (v4, odd) = (self.co_loaded(CO_V4), self.co_loaded(CO_ODD));
         let kern: &'static str = match ty {
-            13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
-            12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
-            14 => if j128 { "gemm_q6k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
+            13 => {
+                if j128 && v4 {
+                    "gemm_q5k_v4"
+                } else if j128 {
+                    "gemm_q5k_j128"
+                } else if !env_on("LLM170_EXACT") && big {
+                    "gemm_q5k_wm"
+                } else {
+                    "gemm_q5k_mm"
+                }
+            }
+            12 => {
+                if j128 && v4 {
+                    "gemm_q4k_v4"
+                } else if j128 {
+                    "gemm_q4k_j128"
+                } else if !env_on("LLM170_EXACT") && big {
+                    "gemm_q4k_wm"
+                } else {
+                    "gemm_q4k_mm"
+                }
+            }
+            14 => {
+                if j128 {
+                    "gemm_q6k_j128"
+                } else if !env_on("LLM170_EXACT") && big {
+                    "gemm_q6k_wm"
+                } else {
+                    "gemm_q6k_mm"
+                }
+            }
             // 107 P0-7: gemm_xs_v4u 분기 삭제 — NAMES·CO 어디에도 미등록,
             // LLM170_XS_V4U=1 도달 시 런치 즉실패하는 죽은 분기였음.
-            23 => if j128 { "gemm_xs_j128" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && big { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && big { "gemm_xs_wm" } else { "gemm_xs_mm" },
-            20 => if odd && !env_on("LLM170_EXACT") && big { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
-            11 => if odd && !env_on("LLM170_EXACT") && big { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
-            21 => if odd && !env_on("LLM170_EXACT") && big { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
-            8 => if j128 { "gemm_q8_j128" } else { return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into()) },
+            23 => {
+                if j128 {
+                    "gemm_xs_j128"
+                } else if env_on("LLM170_XS_MM") {
+                    "gemm_xs_mm"
+                } else if v4 && !env_on("LLM170_EXACT") && big {
+                    "gemm_xs_v4"
+                } else if !env_on("LLM170_EXACT") && big {
+                    "gemm_xs_wm"
+                } else {
+                    "gemm_xs_mm"
+                }
+            }
+            20 => {
+                if odd && !env_on("LLM170_EXACT") && big {
+                    "gemm_nl_v4"
+                } else {
+                    return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into());
+                }
+            }
+            11 => {
+                if odd && !env_on("LLM170_EXACT") && big {
+                    "gemm_q3k_v4"
+                } else {
+                    return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into());
+                }
+            }
+            21 => {
+                if odd && !env_on("LLM170_EXACT") && big {
+                    "gemm_iq3s_v4"
+                } else {
+                    return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into());
+                }
+            }
+            8 => {
+                if j128 {
+                    "gemm_q8_j128"
+                } else {
+                    return Err("타일 미지원 타입 8 (GEMV 경로 사용)".into());
+                }
+            }
             _ => return Err(format!("타일 미지원 타입 {ty}")),
         };
         if env_on("LLM170_TILE_SHAPES") {
@@ -1238,8 +1640,17 @@ impl RawCtx {
                 }
             }
         }
-        let mm = kern.ends_with("_mm") || kern.ends_with("_wm") || kern.ends_with("_j128") || kern.ends_with("_v4");
-        let rows_per_block: usize = if kern.ends_with("_j128") || kern.ends_with("_v4") { 128 } else if mm { 64 } else { 1 };
+        let mm = kern.ends_with("_mm")
+            || kern.ends_with("_wm")
+            || kern.ends_with("_j128")
+            || kern.ends_with("_v4");
+        let rows_per_block: usize = if kern.ends_with("_j128") || kern.ends_with("_v4") {
+            128
+        } else if mm {
+            64
+        } else {
+            1
+        };
         let nblocks = n_out.div_ceil(rows_per_block);
         Ok(TileLaunch {
             kern,
@@ -1283,13 +1694,35 @@ impl RawCtx {
     /// spec verify head 전용 — j128/v4 타일 강제 (가중 1회 독서).
     /// 산술은 동일 W4A8이나 환원 순서가 mm 계열와 달라 스트림 비트계약 대상 아님
     /// (spec 내부 draft↔verify 일관성만 요구).
-    pub fn gemm_tile_head(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile_head(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let mut l = self.tile_core_head(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
-    pub fn gemm_tile(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         let r = self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args);
@@ -1298,20 +1731,46 @@ impl RawCtx {
             let ti = std::time::Instant::now();
             self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args).ok();
             self.sync().ok();
-            eprintln!("tileprof ty={ty} {n_in}x{n_out} t={t} kern={} {:.3}ms", l.kern, ti.elapsed().as_secs_f64()*1e3);
+            eprintln!(
+                "tileprof ty={ty} {n_in}x{n_out} t={t} kern={} {:.3}ms",
+                l.kern,
+                ti.elapsed().as_secs_f64() * 1e3
+            );
         }
         r
     }
 
     /// gemm_tile의 프리필 핀판 — large-t 패밀리 고정 (plans/84 A, 청크 불변성).
-    pub fn gemm_tile_pin(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile_pin(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let mut l = self.tile_core_pin(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
     /// gemm_tile_s의 프리필 핀판 — large-t 패밀리 고정·사이드 스트림 (plans/84 A).
-    pub fn gemm_tile_pin_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile_pin_s(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let mut l = self.tile_core_pin(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
@@ -1330,14 +1789,33 @@ impl RawCtx {
     }
 
     /// gemm_tile의 사이드 스트림판 — 커널 선택·인자 구성은 공용 코어에 위임.
-    pub fn gemm_tile_s(&self, xq: *const u8, w: *const u8, ktab2: *const u8, ty: u32, n_in: usize, n_out: usize, xq_w: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_tile_s(
+        &self,
+        xq: *const u8,
+        w: *const u8,
+        ktab2: *const u8,
+        ty: u32,
+        n_in: usize,
+        n_out: usize,
+        xq_w: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let mut l = self.tile_core(xq, w, ktab2, ty, n_in, n_out, xq_w, t, out)?;
         let mut args = Self::tile_args(&mut l);
         self.launch3s(l.kern, l.gx, 1, l.gz, l.block, &mut args)
     }
 
     /// q6_K → f16 전개 + gemm_f16_v4 (deq-f16 경로, 부록42).
-    pub fn gemm_f16_q6(&self, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_f16_q6(
+        &self,
+        y_f32: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let fns = &self.fns;
         let fq = *fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?;
         let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음")?;
@@ -1345,17 +1823,38 @@ impl RawCtx {
         let key = w as usize;
         let wf16 = {
             let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
-            if let Some(&p) = c.get(&key) { p }
-            else {
-                let blocks = n_in.div_ceil(256);   // 256요소 슈퍼블록 격자(부분 허용)
+            if let Some(&p) = c.get(&key) {
+                p
+            } else {
+                let blocks = n_in.div_ceil(256); // 256요소 슈퍼블록 격자(부분 허용)
                 let p = self.alloc(n_out * n_in * 2)?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
                     let mut a2 = p as *mut std::ffi::c_void;
                     let mut a3 = blocks as i32;
                     let mut a4 = n_out as i32;
-                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
-                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, blocks as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_q6k_f16")?;
+                    let mut args = vec![
+                        &mut a1 as *mut _ as *mut _,
+                        &mut a2 as *mut _ as *mut _,
+                        &mut a3 as *mut _ as *mut _,
+                        &mut a4 as *mut _ as *mut _,
+                    ];
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fq,
+                            n_out as u32,
+                            blocks as u32,
+                            1,
+                            256,
+                            1,
+                            1,
+                            0,
+                            self.stream,
+                            args.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "dequant_q6k_f16",
+                    )?;
                 }
                 c.insert(key, p);
                 p
@@ -1365,23 +1864,46 @@ impl RawCtx {
         // 계열이라 이 레이아웃을 기대한다. 우리 quant_q8(1.375B/원소)을 넣으면
         // 레이아웃이 어긋나 쓰레기 토큰이 나온다(plans/65 §13-14 실측).
         let xq_w = (n_in / 128) * 36;
-        let tr = t.div_ceil(128) * 128;   // 커널의 128 단위 사분면 경계 (범위 밖 쓰기 방지)
+        let tr = t.div_ceil(128) * 128; // 커널의 128 단위 사분면 경계 (범위 밖 쓰기 방지)
         let mut xq = self.mmq_y2.lock().map_err(|e| e.to_string())?;
         let xq_p = if xq.0 < xq_w * tr {
             let p = self.alloc(xq_w * tr * 4)?;
             *xq = (xq_w * tr, p);
             p
-        } else { xq.1 };
+        } else {
+            xq.1
+        };
         unsafe {
             let mut a1 = y_f32 as *mut std::ffi::c_void;
             let mut a2 = xq_p as *mut std::ffi::c_void;
             let mut a3 = n_in as i32;
             let mut a4 = xq_w as i32;
             let mut a5 = t as i32;
-            let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
+            let mut args = vec![
+                &mut a1 as *mut _ as *mut _,
+                &mut a2 as *mut _ as *mut _,
+                &mut a3 as *mut _ as *mut _,
+                &mut a4 as *mut _ as *mut _,
+                &mut a5 as *mut _ as *mut _,
+            ];
             // quant_q8_b: grid(nblk/64, t) block 64 — kernels.rs quant_q8 시그니처 (x, xq, n, xq_w)
             let fq8 = *fns.get("mmq_quant_y").ok_or("mmq_quant_y 없음")?;
-            ck(hip::hipModuleLaunchKernel(fq8, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+            ck(
+                hip::hipModuleLaunchKernel(
+                    fq8,
+                    (n_in / 128) as u32,
+                    t as u32,
+                    1,
+                    32,
+                    1,
+                    1,
+                    0,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "mmq_quant_y",
+            )?;
             let mut b1 = xq_p as *mut std::ffi::c_void;
             let mut b2 = wf16 as *mut std::ffi::c_void;
             let mut b3 = out as *mut std::ffi::c_void;
@@ -1389,35 +1911,100 @@ impl RawCtx {
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
             let mut b7 = tr as i32;
-            let _args2 = [&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            let _args2 = [
+                &mut b1 as *mut _ as *mut _,
+                &mut b2 as *mut _ as *mut _,
+                &mut b3 as *mut _ as *mut _,
+                &mut b4 as *mut _ as *mut _,
+                &mut b5 as *mut _ as *mut _,
+                &mut b6 as *mut _ as *mut _,
+                &mut b7 as *mut _ as *mut _,
+            ];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
-              let mut z1 = xq_p as *mut std::ffi::c_void;
-              let mut z3 = out as *mut std::ffi::c_void;
-              let mut z7 = t.min(128) as i32;
-              let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
-                  &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
-              ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+                let mut z1 = xq_p as *mut std::ffi::c_void;
+                let mut z3 = out as *mut std::ffi::c_void;
+                let mut z7 = t.min(128) as i32;
+                let mut az: Vec<*mut std::ffi::c_void> = vec![
+                    &mut z1 as *mut _ as *mut _,
+                    &mut b2 as *mut _ as *mut _,
+                    &mut z3 as *mut _ as *mut _,
+                    &mut b4 as *mut _ as *mut _,
+                    &mut b5 as *mut _ as *mut _,
+                    &mut b6 as *mut _ as *mut _,
+                    &mut z7 as *mut _ as *mut _,
+                ];
+                ck(
+                    hip::hipModuleLaunchKernel(
+                        fm,
+                        n_out.div_ceil(128) as u32,
+                        1,
+                        (tr / 128) as u32,
+                        256,
+                        1,
+                        1,
+                        0,
+                        self.stream,
+                        az.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    ),
+                    "gemm_f16_v4",
+                )?;
             }
-        if env_on("LLM170_DEQ_DUMP") {
-            self.sync().ok();
-            let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
-            #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-            let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
-            let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
-            eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
-            std::process::exit(0);
-        }
+            if env_on("LLM170_DEQ_DUMP") {
+                self.sync().ok();
+                let _ = std::fs::write(
+                    "/tmp/deq_wf16.f16",
+                    std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2),
+                );
+                #[allow(clippy::unnecessary_cast)]
+                // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
+                let _ = std::fs::write(
+                    "/tmp/deq_w.bin",
+                    std::slice::from_raw_parts(
+                        w as *const u8,
+                        n_out.min(1) * (n_in / 256) * 210 + 210,
+                    ),
+                );
+                let _ = std::fs::write(
+                    "/tmp/deq_xq.bin",
+                    std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4),
+                );
+                eprintln!(
+                    "DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})",
+                    n_out * n_in * 2,
+                    xq_w * t * 4
+                );
+                std::process::exit(0);
+            }
         }
         Ok(())
     }
-    pub fn gemm_f16_deq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_f16_deq(
+        &self,
+        ty: u32,
+        y_f32: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let fns = &self.fns;
         // f16 전개 커널 선택 — 우리 .co의 GEMM이 소비하는 레이아웃으로 전개한다.
         let (fq, _blk_div) = match ty {
-            14 => (*fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?, 1usize),
-            12 => (*fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?, 1),
-            8 => (*fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?, 1),
+            14 => (
+                *fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?,
+                1usize,
+            ),
+            12 => (
+                *fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?,
+                1,
+            ),
+            8 => (
+                *fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?,
+                1,
+            ),
             _ => return Err(format!("f16 경로 미지원 타입 {ty}")),
         };
         let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음")?;
@@ -1429,25 +2016,47 @@ impl RawCtx {
         }
         let wf16 = {
             let mut c = self.f16_cache.lock().map_err(|e| e.to_string())?;
-            if let Some(&p) = c.get(&key) { p }
-            else {
+            if let Some(&p) = c.get(&key) {
+                p
+            } else {
                 let _blocks = n_in / 256;
                 let p = self.alloc(n_out * n_in * 2)?;
                 unsafe {
                     let mut a1 = w as *mut std::ffi::c_void;
                     let mut a2 = p as *mut std::ffi::c_void;
-                    let mut a3 = (n_in / 32) as i32;   // 행당 32블록 수 = 행 스트라이드
+                    let mut a3 = (n_in / 32) as i32; // 행당 32블록 수 = 행 스트라이드
                     let mut a4 = n_out as i32;
-                    let mut a5 = n_in as i32;          // 유효 요소 수(부분 블록 가드)
-                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
-                    ck(hip::hipModuleLaunchKernel(fq, n_out as u32, n_in.div_ceil(256) as u32, 1, 256, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "dequant_f16")?;
+                    let mut a5 = n_in as i32; // 유효 요소 수(부분 블록 가드)
+                    let mut args = vec![
+                        &mut a1 as *mut _ as *mut _,
+                        &mut a2 as *mut _ as *mut _,
+                        &mut a3 as *mut _ as *mut _,
+                        &mut a4 as *mut _ as *mut _,
+                        &mut a5 as *mut _ as *mut _,
+                    ];
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fq,
+                            n_out as u32,
+                            n_in.div_ceil(256) as u32,
+                            1,
+                            256,
+                            1,
+                            1,
+                            0,
+                            self.stream,
+                            args.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "dequant_f16",
+                    )?;
                 }
                 c.insert(key, p);
                 p
             }
         };
         // y: f32 → 우리 xq (quant_q8) — y_f32 에서 직접
-        let xq_w = n_in/4 + n_in/32 + n_in/16;
+        let xq_w = n_in / 4 + n_in / 32 + n_in / 16;
         // 커널은 t를 128 단위 사분면으로 소비하고 드레인도 그 경계까지 쓴다 →
         // 부분 t에서 범위 밖 쓰기가 생긴다. 런치 t를 128 배수로 올려 in-bounds로 만든다
         // (행 < t 만 유효, 호출자가 그만큼만 읽는다).
@@ -1457,17 +2066,40 @@ impl RawCtx {
             let p = self.alloc(xq_w * tr * 4)?;
             *xq = (xq_w * tr, p);
             p
-        } else { xq.1 };
+        } else {
+            xq.1
+        };
         unsafe {
             let mut a1 = y_f32 as *mut std::ffi::c_void;
             let mut a2 = xq_p as *mut std::ffi::c_void;
             let mut a3 = n_in as i32;
             let mut a4 = xq_w as i32;
             let mut a5 = t as i32;
-            let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _, &mut a5 as *mut _ as *mut _];
+            let mut args = vec![
+                &mut a1 as *mut _ as *mut _,
+                &mut a2 as *mut _ as *mut _,
+                &mut a3 as *mut _ as *mut _,
+                &mut a4 as *mut _ as *mut _,
+                &mut a5 as *mut _ as *mut _,
+            ];
             // quant_q8_b: grid(nblk/64, t) block 64 — kernels.rs quant_q8 시그니처 (x, xq, n, xq_w)
             let fq8 = *fns.get("quant_q8").ok_or("quant_q8 없음")?;
-            ck(hip::hipModuleLaunchKernel(fq8, ((n_in/32).div_ceil(64)) as u32, t as u32, 1, 64, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "quant_q8")?;
+            ck(
+                hip::hipModuleLaunchKernel(
+                    fq8,
+                    ((n_in / 32).div_ceil(64)) as u32,
+                    t as u32,
+                    1,
+                    64,
+                    1,
+                    1,
+                    0,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "quant_q8",
+            )?;
             let mut b1 = xq_p as *mut std::ffi::c_void;
             let mut b2 = wf16 as *mut std::ffi::c_void;
             let mut b3 = out as *mut std::ffi::c_void;
@@ -1475,45 +2107,136 @@ impl RawCtx {
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
             let mut b7 = tr as i32;
-            let _args2 = [&mut b1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut b3 as *mut _ as *mut _, &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut b7 as *mut _ as *mut _];
+            let _args2 = [
+                &mut b1 as *mut _ as *mut _,
+                &mut b2 as *mut _ as *mut _,
+                &mut b3 as *mut _ as *mut _,
+                &mut b4 as *mut _ as *mut _,
+                &mut b5 as *mut _ as *mut _,
+                &mut b6 as *mut _ as *mut _,
+                &mut b7 as *mut _ as *mut _,
+            ];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
-              let mut z1 = xq_p as *mut std::ffi::c_void;
-              let mut z3 = out as *mut std::ffi::c_void;
-              let mut z7 = t.min(128) as i32;
-              let mut az: Vec<*mut std::ffi::c_void> = vec![&mut z1 as *mut _ as *mut _, &mut b2 as *mut _ as *mut _, &mut z3 as *mut _ as *mut _,
-                  &mut b4 as *mut _ as *mut _, &mut b5 as *mut _ as *mut _, &mut b6 as *mut _ as *mut _, &mut z7 as *mut _ as *mut _];
-              ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, 1, (tr / 128) as u32, 256, 1, 1, 0, self.stream, az.as_mut_ptr(), std::ptr::null_mut()), "gemm_f16_v4")?;
+                let mut z1 = xq_p as *mut std::ffi::c_void;
+                let mut z3 = out as *mut std::ffi::c_void;
+                let mut z7 = t.min(128) as i32;
+                let mut az: Vec<*mut std::ffi::c_void> = vec![
+                    &mut z1 as *mut _ as *mut _,
+                    &mut b2 as *mut _ as *mut _,
+                    &mut z3 as *mut _ as *mut _,
+                    &mut b4 as *mut _ as *mut _,
+                    &mut b5 as *mut _ as *mut _,
+                    &mut b6 as *mut _ as *mut _,
+                    &mut z7 as *mut _ as *mut _,
+                ];
+                ck(
+                    hip::hipModuleLaunchKernel(
+                        fm,
+                        n_out.div_ceil(128) as u32,
+                        1,
+                        (tr / 128) as u32,
+                        256,
+                        1,
+                        1,
+                        0,
+                        self.stream,
+                        az.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    ),
+                    "gemm_f16_v4",
+                )?;
             }
-        if env_on("LLM170_DEQ_DUMP") {
-            self.sync().ok();
-            let _ = std::fs::write("/tmp/deq_wf16.f16", std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2));
-            #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-            let _ = std::fs::write("/tmp/deq_w.bin", std::slice::from_raw_parts(w as *const u8, n_out.min(1) * (n_in/256) * 210 + 210));
-            let _ = std::fs::write("/tmp/deq_xq.bin", std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4));
-            eprintln!("DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})", n_out*n_in*2, xq_w*t*4);
-            std::process::exit(0);
-        }
+            if env_on("LLM170_DEQ_DUMP") {
+                self.sync().ok();
+                let _ = std::fs::write(
+                    "/tmp/deq_wf16.f16",
+                    std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2),
+                );
+                #[allow(clippy::unnecessary_cast)]
+                // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
+                let _ = std::fs::write(
+                    "/tmp/deq_w.bin",
+                    std::slice::from_raw_parts(
+                        w as *const u8,
+                        n_out.min(1) * (n_in / 256) * 210 + 210,
+                    ),
+                );
+                let _ = std::fs::write(
+                    "/tmp/deq_xq.bin",
+                    std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4),
+                );
+                eprintln!(
+                    "DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})",
+                    n_out * n_in * 2,
+                    xq_w * t * 4
+                );
+                std::process::exit(0);
+            }
         }
         Ok(())
     }
 
     /// llama MMQ (mul_mat_q<q4_K/q5_K,128>) — f32 활성 직양자화 + 원형 런치.
     /// 하니스 검증: q4_K maxrel 6e-4, q5_K maxrel 1.5e-3 (plans/27 부록5·14).
-    pub fn gemm_mmq(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_mmq(
+        &self,
+        ty: u32,
+        y_f32: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let fns = &self.fns;
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
         // DS 레이아웃(mmq.cuh): Q6K/IQ4XS/Q8_0 → D4, Q4K/Q5K → DS4.
         // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
-        let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+        let fq = *fns
+            .get(if matches!(ty, 8 | 14 | 23) {
+                "mmq_quant_y_d4"
+            } else {
+                "mmq_quant_y"
+            })
             .ok_or("mmq quant 없음")?;
         let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let sym = match ty {
-            12 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type12ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
-            13 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type13ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
-            14 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type14ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
-            23 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type23ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
-            8 => { let js = if j == 64 { "64" } else { "128" }; format!("_ZL9mul_mat_qIL9ggml_type8ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_", js) }
+            12 => {
+                let js = if j == 64 { "64" } else { "128" };
+                format!(
+                    "_ZL9mul_mat_qIL9ggml_type12ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                    js
+                )
+            }
+            13 => {
+                let js = if j == 64 { "64" } else { "128" };
+                format!(
+                    "_ZL9mul_mat_qIL9ggml_type13ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                    js
+                )
+            }
+            14 => {
+                let js = if j == 64 { "64" } else { "128" };
+                format!(
+                    "_ZL9mul_mat_qIL9ggml_type14ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                    js
+                )
+            }
+            23 => {
+                let js = if j == 64 { "64" } else { "128" };
+                format!(
+                    "_ZL9mul_mat_qIL9ggml_type23ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                    js
+                )
+            }
+            8 => {
+                let js = if j == 64 { "64" } else { "128" };
+                format!(
+                    "_ZL9mul_mat_qIL9ggml_type8ELi{}ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+                    js
+                )
+            }
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
@@ -1525,8 +2248,9 @@ impl RawCtx {
         let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
-            if let Some(&p2) = c.get(&key) { p2 }
-            else {
+            if let Some(&p2) = c.get(&key) {
+                p2
+            } else {
                 let blocks2 = n_in / 256;
                 let p2 = self.alloc(n_out * blocks2 * 210)?;
                 let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
@@ -1535,20 +2259,47 @@ impl RawCtx {
                     let mut a2 = p2 as *mut std::ffi::c_void;
                     let mut a3 = blocks2 as i32;
                     let mut a4 = n_out as i32;
-                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
-                    ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
+                    let mut args = vec![
+                        &mut a1 as *mut _ as *mut _,
+                        &mut a2 as *mut _ as *mut _,
+                        &mut a3 as *mut _ as *mut _,
+                        &mut a4 as *mut _ as *mut _,
+                    ];
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fqr,
+                            n_out as u32,
+                            blocks2 as u32,
+                            1,
+                            128,
+                            1,
+                            1,
+                            0,
+                            self.stream,
+                            args.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "requant_q6k_canonical",
+                    )?;
                 }
                 if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
-                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
-                    #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
+                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
+                        std::slice::from_raw_parts(p2 as *const u8, 420)
+                    });
+                    #[allow(clippy::unnecessary_cast)]
+                    // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
+                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe {
+                        std::slice::from_raw_parts(w as *const u8, 420)
+                    });
                     eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
                 }
                 c.insert(key, p2);
                 p2
             }
-        } else { w as *mut u8 };
+        } else {
+            w as *mut u8
+        };
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
@@ -1559,7 +2310,9 @@ impl RawCtx {
             let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
             let mut sc = self.mmq_y.lock().map_err(|e| e.to_string())?;
             if sc.0 < need {
-                if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
+                if !sc.1.is_null() {
+                    unsafe { hip::hipFree(sc.1 as *mut _) };
+                }
                 sc.1 = self.alloc(need)?;
                 sc.0 = need;
             }
@@ -1573,7 +2326,12 @@ impl RawCtx {
         let y_key = (y_f32 as usize, (n_in / 128) * t * 144);
         // 회귀 픽스(부록90): 캐시는 메인 yb(mmq_y)만 — 사이드 yb(mmq_y_s)는
         // 별도 버퍼라 히트 시 미초기화 y로 mul_mat_q를 돌렸다 (장문 가비지).
-        let this_is_main = yb == { self.mmq_y.lock().map(|c| c.1).unwrap_or(std::ptr::null_mut()) };
+        let this_is_main = yb == {
+            self.mmq_y
+                .lock()
+                .map(|c| c.1)
+                .unwrap_or(std::ptr::null_mut())
+        };
         // y 재사용 캐시는 비활성(위 사유: 별도 버퍼 히트 시 미초기화 y로 mul_mat_q).
         let cached = false;
         let _ = this_is_main;
@@ -1583,7 +2341,9 @@ impl RawCtx {
                 // (ROCm 10 빌드) — 구형 mmq_quant_y*는 block_q8_1_mmq ABI가 달라
                 // 혼합 시 HIP 700. 인자: (x, ids=null, vy, ne00, s01, s02, s03,
                 // ne0, ne1, ne2, n_expert_used) 그리드 (t, ceil(n_in/512), 1) 128.
-                let fq2 = *self.fns.get("_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii")
+                let fq2 = *self
+                    .fns
+                    .get("_ZL17quantize_mmq_q8_1IL18mmq_q8_1_ds_layout0ELb0EEvPKfPKiPvllllliii")
                     .ok_or("quantize_mmq_q8_1<D4> 없음")?;
                 let mut xp2 = y_f32 as *mut std::ffi::c_void;
                 let mut idsp: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -1612,26 +2372,60 @@ impl RawCtx {
                 // 상위 경로에서 이미 128 정렬(27B/Flash 폭은 전부 128배수).
                 unsafe {
                     let gy = n_in.div_ceil(512) as u32;
-                    ck(hip::hipModuleLaunchKernel(fq2, t as u32, gy, 1, 128, 1, 1, 0, self.stream, q2.as_mut_ptr(), std::ptr::null_mut()), "quantize_mmq_q8_1")?;
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fq2,
+                            t as u32,
+                            gy,
+                            1,
+                            128,
+                            1,
+                            1,
+                            0,
+                            self.stream,
+                            q2.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "quantize_mmq_q8_1",
+                    )?;
                 }
             } else {
-            unsafe {
-                let mut qargs = vec![
-                    &mut ysrc as *mut _ as *mut std::ffi::c_void,
-                    &mut yp as *mut _ as *mut std::ffi::c_void,
-                    &mut nt as *mut _ as *mut std::ffi::c_void,
-                    &mut ni_a as *mut _ as *mut std::ffi::c_void,
-                ];
-                self.ktr_mark("mmq_quant_y", t as u32);
-                ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
-                self.ktr_mark("mmq_quant_y", t as u32);
+                unsafe {
+                    let mut qargs = vec![
+                        &mut ysrc as *mut _ as *mut std::ffi::c_void,
+                        &mut yp as *mut _ as *mut std::ffi::c_void,
+                        &mut nt as *mut _ as *mut std::ffi::c_void,
+                        &mut ni_a as *mut _ as *mut std::ffi::c_void,
+                    ];
+                    self.ktr_mark("mmq_quant_y", t as u32);
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fq,
+                            (n_in / 128) as u32,
+                            t as u32,
+                            1,
+                            32,
+                            1,
+                            1,
+                            0,
+                            self.stream,
+                            qargs.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "mmq_quant_y",
+                    )?;
+                    self.ktr_mark("mmq_quant_y", t as u32);
+                }
             }
+            if let Ok(mut c) = self.mmq_y_cache.lock() {
+                *c = (c.0, y_key.0, y_key.1);
             }
-            if let Ok(mut c) = self.mmq_y_cache.lock() { *c = (c.0, y_key.0, y_key.1); }
         }
         fn fd3(d: u32) -> [u32; 3] {
             let mut l = 0u32;
-            while l < 32 && (1u32 << l) < d { l += 1; }
+            while l < 32 && (1u32 << l) < d {
+                l += 1;
+            }
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
@@ -1659,19 +2453,38 @@ impl RawCtx {
         let mut p_scol = n_out as i32;
         let smem: i32 = (j * 4 + 128 * 76 * 4 + (j * 144).div_ceil(1024) * 1024) as i32;
         unsafe {
-            ck(hip::hipFuncSetAttribute(fm as *const _, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem), "mmq smem attr")?;
+            ck(
+                hip::hipFuncSetAttribute(
+                    fm as *const _,
+                    hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize,
+                    smem,
+                ),
+                "mmq smem attr",
+            )?;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mut ax as *mut _ as *mut _, &mut ay as *mut _ as *mut _,
-                &mut aid as *mut _ as *mut _, &mut aeb as *mut _ as *mut _,
-                &mut adst as *mut _ as *mut _, &mut afx as *mut _ as *mut _,
+                &mut ax as *mut _ as *mut _,
+                &mut ay as *mut _ as *mut _,
+                &mut aid as *mut _ as *mut _,
+                &mut aeb as *mut _ as *mut _,
+                &mut adst as *mut _ as *mut _,
+                &mut afx as *mut _ as *mut _,
                 &mut ays as *mut _ as *mut _,
-                bpn.as_mut_ptr() as *mut _, &mut p_nrows as *mut _ as *mut _,
-                &mut p_ncolsdst as *mut _ as *mut _, &mut p_srow as *mut _ as *mut _,
-                &mut p_ncolsy as *mut _ as *mut _, &mut p_scol as *mut _ as *mut _,
-                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                bpn.as_mut_ptr() as *mut _,
+                &mut p_nrows as *mut _ as *mut _,
+                &mut p_ncolsdst as *mut _ as *mut _,
+                &mut p_srow as *mut _ as *mut _,
+                &mut p_ncolsy as *mut _ as *mut _,
+                &mut p_scol as *mut _ as *mut _,
+                one.as_mut_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
                 ntx_fd.as_mut_ptr() as *mut _,
             ];
             let tag: &'static str = match ty {
@@ -1682,28 +2495,71 @@ impl RawCtx {
                 _ => "mmq_other",
             };
             self.ktr_mark(tag, t as u32);
-            ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, t.div_ceil(128) as u32, 1, 32, 8, 1, smem as u32, self.stream, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
+            ck(
+                hip::hipModuleLaunchKernel(
+                    fm,
+                    n_out.div_ceil(128) as u32,
+                    t.div_ceil(128) as u32,
+                    1,
+                    32,
+                    8,
+                    1,
+                    smem as u32,
+                    self.stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "mul_mat_q",
+            )?;
             self.ktr_mark(tag, t as u32);
-        if env_on("LLM170_MMQ_ARGS") {
-            eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
-                n_out.div_ceil(128), t.div_ceil(128), n_in / 256, n_out, n_out);
-        }
+            if env_on("LLM170_MMQ_ARGS") {
+                eprintln!(
+                    "mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
+                    n_out.div_ceil(128),
+                    t.div_ceil(128),
+                    n_in / 256,
+                    n_out,
+                    n_out
+                );
+            }
         }
         Ok(())
     }
-    pub fn gemm_mmq_s(&self, ty: u32, y_f32: *const u8, w: *const u8, n_in: usize, n_out: usize, t: usize, out: *mut u8) -> Result<(), String> {
+    pub fn gemm_mmq_s(
+        &self,
+        ty: u32,
+        y_f32: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
         let fns = &self.fns;
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
         // DS 레이아웃(mmq.cuh): Q6K/IQ4XS/Q8_0 → D4, Q4K/Q5K → DS4.
         // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
-        let fq = *fns.get(if matches!(ty, 8 | 14 | 23) { "mmq_quant_y_d4" } else { "mmq_quant_y" })
+        let fq = *fns
+            .get(if matches!(ty, 8 | 14 | 23) {
+                "mmq_quant_y_d4"
+            } else {
+                "mmq_quant_y"
+            })
             .ok_or("mmq quant 없음")?;
         let _j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
         let sym = match ty {
-            12 => "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            13 => "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            14 => "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
-            23 => "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_",
+            12 => {
+                "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
+            }
+            13 => {
+                "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
+            }
+            14 => {
+                "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
+            }
+            23 => {
+                "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
+            }
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
@@ -1715,8 +2571,9 @@ impl RawCtx {
         let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
             let key = w as usize ^ 0xdeadbeef;
             let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
-            if let Some(&p2) = c.get(&key) { p2 }
-            else {
+            if let Some(&p2) = c.get(&key) {
+                p2
+            } else {
                 let blocks2 = n_in / 256;
                 let p2 = self.alloc(n_out * blocks2 * 210)?;
                 let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
@@ -1725,20 +2582,47 @@ impl RawCtx {
                     let mut a2 = p2 as *mut std::ffi::c_void;
                     let mut a3 = blocks2 as i32;
                     let mut a4 = n_out as i32;
-                    let mut args = vec![&mut a1 as *mut _ as *mut _, &mut a2 as *mut _ as *mut _, &mut a3 as *mut _ as *mut _, &mut a4 as *mut _ as *mut _];
-                    ck(hip::hipModuleLaunchKernel(fqr, n_out as u32, blocks2 as u32, 1, 128, 1, 1, 0, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "requant_q6k_canonical")?;
+                    let mut args = vec![
+                        &mut a1 as *mut _ as *mut _,
+                        &mut a2 as *mut _ as *mut _,
+                        &mut a3 as *mut _ as *mut _,
+                        &mut a4 as *mut _ as *mut _,
+                    ];
+                    ck(
+                        hip::hipModuleLaunchKernel(
+                            fqr,
+                            n_out as u32,
+                            blocks2 as u32,
+                            1,
+                            128,
+                            1,
+                            1,
+                            0,
+                            self.stream2,
+                            args.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "requant_q6k_canonical",
+                    )?;
                 }
                 if env_on("LLM170_RQ_DUMP") {
                     self.sync().ok();
-                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe { std::slice::from_raw_parts(p2 as *const u8, 420) });
-                    #[allow(clippy::unnecessary_cast)] // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe { std::slice::from_raw_parts(w as *const u8, 420) });
+                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
+                        std::slice::from_raw_parts(p2 as *const u8, 420)
+                    });
+                    #[allow(clippy::unnecessary_cast)]
+                    // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
+                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe {
+                        std::slice::from_raw_parts(w as *const u8, 420)
+                    });
                     eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
                 }
                 c.insert(key, p2);
                 p2
             }
-        } else { w as *mut u8 };
+        } else {
+            w as *mut u8
+        };
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
@@ -1746,7 +2630,9 @@ impl RawCtx {
             let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
             let mut sc = self.mmq_y_s.lock().map_err(|e| e.to_string())?;
             if sc.0 < need {
-                if !sc.1.is_null() { unsafe { hip::hipFree(sc.1 as *mut _) }; }
+                if !sc.1.is_null() {
+                    unsafe { hip::hipFree(sc.1 as *mut _) };
+                }
                 sc.1 = self.alloc(need)?;
                 sc.0 = need;
             }
@@ -1763,11 +2649,28 @@ impl RawCtx {
                 &mut nt as *mut _ as *mut std::ffi::c_void,
                 &mut ni_a as *mut _ as *mut std::ffi::c_void,
             ];
-            ck(hip::hipModuleLaunchKernel(fq, (n_in / 128) as u32, t as u32, 1, 32, 1, 1, 0, self.stream2, qargs.as_mut_ptr(), std::ptr::null_mut()), "mmq_quant_y")?;
+            ck(
+                hip::hipModuleLaunchKernel(
+                    fq,
+                    (n_in / 128) as u32,
+                    t as u32,
+                    1,
+                    32,
+                    1,
+                    1,
+                    0,
+                    self.stream2,
+                    qargs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "mmq_quant_y",
+            )?;
         }
         fn fd3(d: u32) -> [u32; 3] {
             let mut l = 0u32;
-            while l < 32 && (1u32 << l) < d { l += 1; }
+            while l < 32 && (1u32 << l) < d {
+                l += 1;
+            }
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
@@ -1795,30 +2698,69 @@ impl RawCtx {
         let mut p_scol = n_out as i32;
         let smem: i32 = (j * 4 + 128 * 76 * 4 + (j * 144).div_ceil(1024) * 1024) as i32;
         unsafe {
-            ck(hip::hipFuncSetAttribute(fm as *const _, hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize, smem), "mmq smem attr")?;
+            ck(
+                hip::hipFuncSetAttribute(
+                    fm as *const _,
+                    hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize,
+                    smem,
+                ),
+                "mmq smem attr",
+            )?;
             let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mut ax as *mut _ as *mut _, &mut ay as *mut _ as *mut _,
-                &mut aid as *mut _ as *mut _, &mut aeb as *mut _ as *mut _,
-                &mut adst as *mut _ as *mut _, &mut afx as *mut _ as *mut _,
+                &mut ax as *mut _ as *mut _,
+                &mut ay as *mut _ as *mut _,
+                &mut aid as *mut _ as *mut _,
+                &mut aeb as *mut _ as *mut _,
+                &mut adst as *mut _ as *mut _,
+                &mut afx as *mut _ as *mut _,
                 &mut ays as *mut _ as *mut _,
-                bpn.as_mut_ptr() as *mut _, &mut p_nrows as *mut _ as *mut _,
-                &mut p_ncolsdst as *mut _ as *mut _, &mut p_srow as *mut _ as *mut _,
-                &mut p_ncolsy as *mut _ as *mut _, &mut p_scol as *mut _ as *mut _,
-                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _, one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _, z3.as_ptr() as *mut _, z3.as_ptr() as *mut _,
+                bpn.as_mut_ptr() as *mut _,
+                &mut p_nrows as *mut _ as *mut _,
+                &mut p_ncolsdst as *mut _ as *mut _,
+                &mut p_srow as *mut _ as *mut _,
+                &mut p_ncolsy as *mut _ as *mut _,
+                &mut p_scol as *mut _ as *mut _,
+                one.as_mut_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                one.as_mut_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
+                z3.as_ptr() as *mut _,
                 ntx_fd.as_mut_ptr() as *mut _,
             ];
-            ck(hip::hipModuleLaunchKernel(fm, n_out.div_ceil(128) as u32, t.div_ceil(128) as u32, 1, 32, 8, 1, smem as u32, self.stream2, args.as_mut_ptr(), std::ptr::null_mut()), "mul_mat_q")?;
-        if env_on("LLM170_MMQ_ARGS") {
-            eprintln!("mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
-                n_out.div_ceil(128), t.div_ceil(128), n_in / 256, n_out, n_out);
-        }
+            ck(
+                hip::hipModuleLaunchKernel(
+                    fm,
+                    n_out.div_ceil(128) as u32,
+                    t.div_ceil(128) as u32,
+                    1,
+                    32,
+                    8,
+                    1,
+                    smem as u32,
+                    self.stream2,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "mul_mat_q",
+            )?;
+            if env_on("LLM170_MMQ_ARGS") {
+                eprintln!(
+                    "mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
+                    n_out.div_ceil(128),
+                    t.div_ceil(128),
+                    n_in / 256,
+                    n_out,
+                    n_out
+                );
+            }
         }
         Ok(())
     }
-
 
     /// 활성 양자화 — quantize_row_q8_ref 비트 미러. 출력은 xq 하나:
     /// [0..n/4) 워드 + [n/4..n/4+n/32) d 비트(u32 편승 — 저장 경로 단일화).
@@ -1828,7 +2770,14 @@ impl RawCtx {
     }
 
     /// 배치 양자화 — t토큰 [t][n] → [t][xq_w 워드].
-    pub fn quant_q8_b(&self, x: *const u8, xq: *mut u8, n: usize, xq_w: usize, t: usize) -> Result<(), String> {
+    pub fn quant_q8_b(
+        &self,
+        x: *const u8,
+        xq: *mut u8,
+        n: usize,
+        xq_w: usize,
+        t: usize,
+    ) -> Result<(), String> {
         let nblk = n / 32;
         let mut x_p = x as *mut std::ffi::c_void;
         let mut xq_p = xq as *mut std::ffi::c_void;
@@ -1840,6 +2789,13 @@ impl RawCtx {
             &mut n_a as *mut _ as *mut std::ffi::c_void,
             &mut xw as *mut _ as *mut std::ffi::c_void,
         ];
-        self.launch3("quant_q8", nblk.div_ceil(64) as u32, t as u32, 1, 64, &mut args)
+        self.launch3(
+            "quant_q8",
+            nblk.div_ceil(64) as u32,
+            t as u32,
+            1,
+            64,
+            &mut args,
+        )
     }
 }

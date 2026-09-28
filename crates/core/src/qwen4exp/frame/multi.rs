@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// 청크 프리필 행 대역 뷰 — 기하 (n_seq, per_seq)가 바뀔 때만 재생성한다.
 /// frame_slice 핸들은 반납되지 않으므로(ADR-0014) 스텝마다 만들면 테이블이
 /// 무한히 큰다 — 청크 크기 종류 수만큼만 늘어나게 고정한다.
@@ -30,16 +29,17 @@ pub(super) fn ensure_pre_views(
     let kvrow = hp.n_kv * hp.head_dim;
     let iqrow = hp.idx_heads * hp.idx_dim;
     let arow = hp.n_head * hp.head_dim;
-    let mk = |acc: &dyn Accelerator, tag: &str, h: u64, row_len: usize| -> Result<Vec<u64>, Q4Error> {
-        (0..slots)
-            .map(|s| {
-                acc.frame_slice(h, s * per_seq * row_len, per_seq * row_len)
-                    .map_err(|e| {
-                        Q4Error::Io(format!("pre-view {tag} s={s}/{slots} rows={per_seq}: {e}"))
-                    })
-            })
-            .collect()
-    };
+    let mk =
+        |acc: &dyn Accelerator, tag: &str, h: u64, row_len: usize| -> Result<Vec<u64>, Q4Error> {
+            (0..slots)
+                .map(|s| {
+                    acc.frame_slice(h, s * per_seq * row_len, per_seq * row_len)
+                        .map_err(|e| {
+                            Q4Error::Io(format!("pre-view {tag} s={s}/{slots} rows={per_seq}: {e}"))
+                        })
+                })
+                .collect()
+        };
     let v = PreViews {
         slots,
         rows: per_seq,
@@ -75,7 +75,6 @@ pub(super) fn ensure_pre_views(
     f.pre_views = Some(Box::new(v));
     Ok(())
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // plans/76(청크 프리필 배치): 다중 시퀀스 청크 프리필 (2026-09-17)
@@ -125,7 +124,17 @@ pub(super) fn gdn_frame_pre(
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
     if !stage_skipped("gdn.betag") {
-        op(acc, FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank * t })?;
+        op(
+            acc,
+            FrameOp::GdnBetaG {
+                b: f.gb,
+                a: f.ga,
+                dtb,
+                sa: ssa,
+                bg: f.gbg,
+                n_h: hp.dt_rank * t,
+            },
+        )?;
     }
     // 상태 구간 ①: conv 링 + silu — 시퀀스별 사슬(공유 구간은 아래에서 복귀).
     let cw = f.consts[&format!("blk.{il}.conv_w")];
@@ -134,25 +143,62 @@ pub(super) fn gdn_frame_pre(
         let pv = f.pre_views.as_ref().unwrap();
         for (si, &sq) in seqs.iter().enumerate() {
             if !stage_skipped("gdn.conv") {
-                op(acc, FrameOp::GdnConv {
-                    qkv: pv.gqkv[si],
-                    cw,
-                    state: f.st_conv[sq][ri],
-                    out: pv.gconv[si],
-                    ch: conv_ch,
-                    k: hp.conv_k,
-                    t_len: per_seq,
-                })?;
+                op(
+                    acc,
+                    FrameOp::GdnConv {
+                        qkv: pv.gqkv[si],
+                        cw,
+                        state: f.st_conv[sq][ri],
+                        out: pv.gconv[si],
+                        ch: conv_ch,
+                        k: hp.conv_k,
+                        t_len: per_seq,
+                    },
+                )?;
             }
         }
     }
     fs_begin(acc, t);
     if !stage_skipped("gdn.l2") {
-        op(acc, FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
-        op(acc, FrameOp::L2Rows { x: f.gq, eps, d: hp.d_state, n: k_len * t })?;
-        op(acc, FrameOp::L2Rows { x: f.gk, eps, d: hp.d_state, n: k_len * t })?;
+        op(
+            acc,
+            FrameOp::Split3 {
+                src: f.gconv,
+                d0: f.gq,
+                d1: f.gk,
+                d2: f.gv,
+                n0: k_len,
+                n1: k_len,
+                n2: v_len,
+            },
+        )?;
+        op(
+            acc,
+            FrameOp::L2Rows {
+                x: f.gq,
+                eps,
+                d: hp.d_state,
+                n: k_len * t,
+            },
+        )?;
+        op(
+            acc,
+            FrameOp::L2Rows {
+                x: f.gk,
+                eps,
+                d: hp.d_state,
+                n: k_len * t,
+            },
+        )?;
         let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-        op(acc, FrameOp::Scale { t: f.gq, s: scale, n: k_len * t })?;
+        op(
+            acc,
+            FrameOp::Scale {
+                t: f.gq,
+                s: scale,
+                n: k_len * t,
+            },
+        )?;
     }
     // 상태 구간 ②: AR — 시퀀스별 사슬(행 수는 frame_begin이 정한다).
     let fs: &dyn FrameState = acc;
@@ -162,8 +208,16 @@ pub(super) fn gdn_frame_pre(
         for (si, &sq) in seqs.iter().enumerate() {
             if !stage_skipped("gdn.ar") {
                 fs.frame_gdn_ar(
-                    pv.gq[si], pv.gk[si], pv.gv[si], pv.gbg[si], f.st_gdn[sq][ri], pv.go[si],
-                    1, hp.n_group, hp.dt_rank, hp.d_state,
+                    pv.gq[si],
+                    pv.gk[si],
+                    pv.gv[si],
+                    pv.gbg[si],
+                    f.st_gdn[sq][ri],
+                    pv.go[si],
+                    1,
+                    hp.n_group,
+                    hp.dt_rank,
+                    hp.d_state,
                 )
                 .map_err(Q4Error::Io)?;
             }
@@ -172,11 +226,23 @@ pub(super) fn gdn_frame_pre(
     fs_begin(acc, t);
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
     if !stage_skipped("gdn.ng") {
-        op(acc, FrameOp::NormGated { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
+        op(
+            acc,
+            FrameOp::NormGated {
+                o: f.go,
+                z: f.gz,
+                w: snorm,
+                out: f.ggated,
+                eps,
+                d: hp.d_state,
+                n_h: hp.dt_rank,
+            },
+        )?;
     }
     let wout = model.w4(&format!("blk.{il}.ssm_out.weight"))?;
     if !stage_skipped("gdn.out") {
-        acc.frame_mm(f.ggated, &wout, f.ffn_out, t).map_err(Q4Error::Io)?;
+        acc.frame_mm(f.ggated, &wout, f.ffn_out, t)
+            .map_err(Q4Error::Io)?;
     }
     Ok(())
 }
@@ -208,7 +274,10 @@ pub fn frame_forward_prefill_multi(
     tokens: &[u32],
     per_seq: usize,
 ) -> Result<Vec<u32>, Q4Error> {
-    if std::env::var("LLM170_PREFILL_MULTI").map(|v| v == "0").unwrap_or(true) {
+    if std::env::var("LLM170_PREFILL_MULTI")
+        .map(|v| v == "0")
+        .unwrap_or(true)
+    {
         return Err(Q4Error::Io(
             "frame_forward_prefill_multi: 게이트 off (LLM170_PREFILL_MULTI=1 로 켠다)".into(),
         ));
@@ -233,8 +302,14 @@ pub fn frame_forward_prefill_multi(
             f.t_max
         )));
     }
-    if seqs.iter().enumerate().any(|(i, &s)| seqs[..i].contains(&s)) {
-        return Err(Q4Error::Io("frame_forward_prefill_multi: seq 중복(상태 핸들 겹침)".into()));
+    if seqs
+        .iter()
+        .enumerate()
+        .any(|(i, &s)| seqs[..i].contains(&s))
+    {
+        return Err(Q4Error::Io(
+            "frame_forward_prefill_multi: seq 중복(상태 핸들 겹침)".into(),
+        ));
     }
     let t_call = std::time::Instant::now();
     fs_begin(acc, t);
@@ -255,7 +330,8 @@ pub fn frame_forward_prefill_multi(
         }
         // plans/103: res_hc f16 버스 — CPU 기입 팩.
         if super::res_f16_on() {
-            acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r)).map_err(Q4Error::Io)?;
+            acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r))
+                .map_err(Q4Error::Io)?;
         } else {
             acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
         }
@@ -267,7 +343,11 @@ pub fn frame_forward_prefill_multi(
         seqs.iter()
             .enumerate()
             .map(|(si, &sq)| {
-                stages::ple_hash(ctx, &mut seq_sts[sq], &tokens[si * per_seq..(si + 1) * per_seq])
+                stages::ple_hash(
+                    ctx,
+                    &mut seq_sts[sq],
+                    &tokens[si * per_seq..(si + 1) * per_seq],
+                )
             })
             .collect()
     } else {
@@ -302,7 +382,9 @@ pub fn frame_forward_prefill_multi(
         // 3) attention — GDN(공유 1회 + 상태만 seq별) / QSA(seq별 디바이스 경로)
         if hp.is_recr(il) {
             if !stage_skipped("gdn") {
-                gdn_frame_pre(acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t, per_seq)?;
+                gdn_frame_pre(
+                    acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t, per_seq,
+                )?;
             }
             recr_idx += 1;
             sync_mark(acc, &format!("pre{il}.gdn"), f.ffn_out)?;
@@ -323,7 +405,18 @@ pub fn frame_forward_prefill_multi(
                             out: pv.ffn_out[si],
                         }
                     };
-                    qsa_frame(acc, model, ctx, &mut seq_sts[sq], f, il, per_seq, full_idx, sq, &b)?;
+                    qsa_frame(
+                        acc,
+                        model,
+                        ctx,
+                        &mut seq_sts[sq],
+                        f,
+                        il,
+                        per_seq,
+                        full_idx,
+                        sq,
+                        &b,
+                    )?;
                 }
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             }
@@ -345,18 +438,50 @@ pub fn frame_forward_prefill_multi(
     {
         fs_begin(acc, t);
         let w_norm = f.consts["output_hc_norm"];
-        op(acc, FrameOp::RmsRows { x: f.res_hc, w: w_norm, out: f.hxn, eps, n, w_reps: hc })?;
+        op(
+            acc,
+            FrameOp::RmsRows {
+                x: f.res_hc,
+                w: w_norm,
+                out: f.hxn,
+                eps,
+                n,
+                w_reps: hc,
+            },
+        )?;
         let w_down = model.w4("output_hc_down.weight")?;
-        acc.frame_mm(f.hxn, &w_down, f.hlo, t).map_err(Q4Error::Io)?;
-        op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len * t })?;
+        acc.frame_mm(f.hxn, &w_down, f.hlo, t)
+            .map_err(Q4Error::Io)?;
+        op(
+            acc,
+            FrameOp::SiluDiv {
+                t: f.hlo,
+                div: hc as f32,
+                n: f.hlo_len * t,
+            },
+        )?;
         let w_up = model.w4("output_hc_up.weight")?;
         if super::hcf16_enabled() && t >= 128 {
-        acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
-    } else {
-        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
-    }
-        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: super::hcf16_enabled() && t >= 128 })?;
-        let wout = model.w("output.weight").ok_or(Q4Error::MissingTensor("output.weight".into()))?;
+            acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t)
+                .map_err(Q4Error::Io)?;
+        } else {
+            acc.frame_mm(f.hlo, &w_up, f.hgate, t)
+                .map_err(Q4Error::Io)?;
+        }
+        op(
+            acc,
+            FrameOp::HcGateMean {
+                xn: f.hxn,
+                gate: f.hgate,
+                out: f.hin,
+                hc,
+                n,
+                h16: super::hcf16_enabled() && t >= 128,
+            },
+        )?;
+        let wout = model
+            .w("output.weight")
+            .ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         // 마지막 행 판정 — 단일 시퀀스(프리필 t>1)와 같은 t=1 GEMM 경로를 쓴다
         // (np 배치 head의 t행 GEMM과 산술이 다르다 — 프리필 등가성은 이쪽).
         for si in 0..n_seq {
@@ -366,7 +491,9 @@ pub fn frame_forward_prefill_multi(
             };
             acc.frame_mm(hs, &wout, ls, 1).map_err(Q4Error::Io)?;
         }
-        let toks = acc.frame_argmax_rows(f.logits_t, n_seq, hp.vocab).map_err(Q4Error::Io)?;
+        let toks = acc
+            .frame_argmax_rows(f.logits_t, n_seq, hp.vocab)
+            .map_err(Q4Error::Io)?;
         ftime_report(t);
         if ftime_on() {
             eprintln!(

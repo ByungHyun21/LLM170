@@ -4,8 +4,8 @@
 //! ADR-0005: GPU 커널이 아닌 CPU 참조 경로. FMA 없는 mul+add (x86-64 기본 타깃은
 //! auto-FMA가 없어 자동으로 성립; target-feature 변경 시 재검토 필요 — 주석 유지).
 
-use llm170_gguf::GgmlType;
 use llm170_diag::profile_span;
+use llm170_gguf::GgmlType;
 
 /// mmap 상의 무게 텐서 참조.
 #[derive(Clone, Copy)]
@@ -86,7 +86,6 @@ pub trait GraphCapture: Send + Sync {
 /// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait MatmulHost: Send + Sync {
-
     /// MoE 전문가 배치 down — K전문가 1런치. 미구현은 Err (호출부 폴백).
     /// xs 행 순서 = expert_ids 순 (스택 인덱스와 무관).
     #[allow(clippy::too_many_arguments)]
@@ -127,7 +126,12 @@ pub trait MatmulHost: Send + Sync {
         outs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         if ws.len() != xs.len() || ws.len() != outs.len() {
-            return Err(format!("matmul_paired: 형상 불일치 ws={} xs={} outs={}", ws.len(), xs.len(), outs.len()));
+            return Err(format!(
+                "matmul_paired: 형상 불일치 ws={} xs={} outs={}",
+                ws.len(),
+                xs.len(),
+                outs.len()
+            ));
         }
         for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
             let mut tmp = vec![vec![0.0f32; w.n_out as usize]; 1];
@@ -146,7 +150,11 @@ pub trait MatmulHost: Send + Sync {
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), String> {
         if ws.len() != outs.len() {
-            return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
+            return Err(format!(
+                "matmul_group: ws({}) != outs({})",
+                ws.len(),
+                outs.len()
+            ));
         }
         for (w, out) in ws.iter().zip(outs.iter_mut()) {
             self.matmul_batch(xs, w, out)?;
@@ -160,7 +168,6 @@ pub trait MatmulHost: Send + Sync {
 /// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait EwOps: Send + Sync {
-
     /// rms_norm 오프로드 — 미구현 백엔드는 Err (호출부 CPU 폴백).
     fn rms_norm(
         &self,
@@ -274,14 +281,24 @@ pub trait EwOps: Send + Sync {
     /// plans/72: 디코드(t=1) shared expert 융합 — gate+up+silu(1런치),
     /// down+sigmoid·axpy(1런치). 기존 8런치를 대체.
     fn shexp_gu(
-        &self, _x: u64, _wg: &Weight, _wu: &Weight, _h: u64,
-        _n_in: usize, _n_hidden: usize,
+        &self,
+        _x: u64,
+        _wg: &Weight,
+        _wu: &Weight,
+        _h: u64,
+        _n_in: usize,
+        _n_hidden: usize,
     ) -> Result<(), String> {
         Err("shexp_gu: 이 가속기는 미지원".into())
     }
     fn shexp_da(
-        &self, _h: u64, _wd: &Weight, _s: u64, _mout: u64,
-        _n_in: usize, _n_hidden: usize,
+        &self,
+        _h: u64,
+        _wd: &Weight,
+        _s: u64,
+        _mout: u64,
+        _n_in: usize,
+        _n_hidden: usize,
     ) -> Result<(), String> {
         Err("shexp_da: 이 가속기는 미지원".into())
     }
@@ -361,7 +378,6 @@ pub trait EwOps: Send + Sync {
 /// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait QsaOps: Send + Sync {
-
     /// QSA 마스크드 밀집 GQA (GPU 전용 — 기본 미지원).
     #[allow(clippy::too_many_arguments)]
     fn qsa_attention(
@@ -623,7 +639,6 @@ pub trait QsaOps: Send + Sync {
 /// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
 pub trait FrameHost: Send + Sync {
-
     /// 프레임 경로 완전성 — false면 엔진이 프레임 진입을 건너뛴다(값경로).
     /// 부분 구현 백엔드(plans/84 B vk)가 완성 전 기본 경로를 깨지 않게 한다.
     fn frame_capable(&self) -> bool {
@@ -741,12 +756,24 @@ pub trait FrameHost: Send + Sync {
         Err("frame_mm: 미지원".into())
     }
     /// 상주 GEMM 그룹 — 동일 입력 x, 가중치별 out.
-    fn frame_mm_group(&self, _x: u64, _ws: &[Weight], _outs: &[u64], _t: usize) -> Result<(), String> {
+    fn frame_mm_group(
+        &self,
+        _x: u64,
+        _ws: &[Weight],
+        _outs: &[u64],
+        _t: usize,
+    ) -> Result<(), String> {
         Err("frame_mm_group: 미지원".into())
     }
     /// plans/104 — 격리 quant 버퍼 판(공유전문가 병렬 체인). 미지원 백엔드는
     /// 일반 그룹으로 폴백(산술 동일).
-    fn frame_mm_group_sep(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+    fn frame_mm_group_sep(
+        &self,
+        x: u64,
+        ws: &[Weight],
+        outs: &[u64],
+        t: usize,
+    ) -> Result<(), String> {
         self.frame_mm_group(x, ws, outs, t)
     }
     /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축 전용).
@@ -763,7 +790,14 @@ pub trait FrameHost: Send + Sync {
         Err("frame_quant_q8: 미지원".into())
     }
     /// 상주 W4A8 정수 GEMV (iq4_xs·q3_K, t=1) — (xq, xd) 소비.
-    fn frame_mm_q8(&self, _xq: u64, _xd: u64, _w: &Weight, _out: u64, _n: usize) -> Result<(), String> {
+    fn frame_mm_q8(
+        &self,
+        _xq: u64,
+        _xd: u64,
+        _w: &Weight,
+        _out: u64,
+        _n: usize,
+    ) -> Result<(), String> {
         Err("frame_mm_q8: 미지원".into())
     }
 }
@@ -793,54 +827,197 @@ pub enum FrameOp {
     /// in-place sigmoid.
     Sigmoid { t: u64, n: usize },
     /// 행별 RMSNorm (w는 w_reps 반복 — hc 그룹/헤드별).
-    RmsRows { x: u64, w: u64, out: u64, eps: f32, n: usize, w_reps: usize },
+    RmsRows {
+        x: u64,
+        w: u64,
+        out: u64,
+        eps: f32,
+        n: usize,
+        w_reps: usize,
+    },
     /// GDN norm_gated: out = rms(o)·σ(z), w 반복 = 헤드.
-    NormGated { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
+    NormGated {
+        o: u64,
+        z: u64,
+        w: u64,
+        out: u64,
+        eps: f32,
+        d: usize,
+        n_h: usize,
+    },
     /// GDN norm_gated silu 변형 (qwen35): out = rms(o)·silu(z)·w.
-    NormGatedSilu { o: u64, z: u64, w: u64, out: u64, eps: f32, d: usize, n_h: usize },
+    NormGatedSilu {
+        o: u64,
+        z: u64,
+        w: u64,
+        out: u64,
+        eps: f32,
+        d: usize,
+        n_h: usize,
+    },
     /// GDN q/k 헤드별 in-place L2 norm.
     /// n = 처리할 원소 수(행 수 = n/d). 버퍼 길이가 아니라 토큰 수에서 온다.
-    L2Rows { x: u64, eps: f32, d: usize, n: usize },
+    L2Rows {
+        x: u64,
+        eps: f32,
+        d: usize,
+        n: usize,
+    },
     /// conv 출력 3분할 (q/k/v) — 카피 3런치 융합.
-    Split3 { src: u64, d0: u64, d1: u64, d2: u64, n0: usize, n1: usize, n2: usize },
+    Split3 {
+        src: u64,
+        d0: u64,
+        d1: u64,
+        d2: u64,
+        n0: usize,
+        n1: usize,
+        n2: usize,
+    },
     /// L2 이중 행 + q 스케일 융합 (산술 l2_rows+scale 과 동일).
-    L2Rows2Scale { q: u64, k: u64, eps: f32, scale: f32, d: usize, n_group: usize },
+    L2Rows2Scale {
+        q: u64,
+        k: u64,
+        eps: f32,
+        scale: f32,
+        d: usize,
+        n_group: usize,
+    },
     /// 어텐션 q/k 헤드 rms+rope in-place (f64 중간 — 브리지 제거).
     QKNormRope {
-        q: u64, k: u64, qw: u64, kw: u64, cs: u64,
-        eps: f32, kqs: f32, pos: usize, n_head: usize, n_kv: usize,
-        hd: usize, n_rot: usize,
+        q: u64,
+        k: u64,
+        qw: u64,
+        kw: u64,
+        cs: u64,
+        eps: f32,
+        kqs: f32,
+        pos: usize,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        n_rot: usize,
     },
     /// hc 게이트 적용 + 스트림 평균 (hc는 나눗셈 피수로 사용).
-    HcGateMean { xn: u64, gate: u64, out: u64, hc: usize, n: usize, h16: bool },
+    HcGateMean {
+        xn: u64,
+        gate: u64,
+        out: u64,
+        hc: usize,
+        n: usize,
+        h16: bool,
+    },
     /// hc combine: res += out·(2·σ(inj/hc)).
-    HcCombine { res: u64, out: u64, inj: u64, hc: usize, n: usize, total: usize },
+    HcCombine {
+        res: u64,
+        out: u64,
+        inj: u64,
+        hc: usize,
+        n: usize,
+        total: usize,
+    },
     /// GDN β/e^g 사전계산: bg[h·2]=σ(b), bg[h·2+1]=e^(softplus(a+dtb)·sa).
-    GdnBetaG { b: u64, a: u64, dtb: u64, sa: u64, bg: u64, n_h: usize },
+    GdnBetaG {
+        b: u64,
+        a: u64,
+        dtb: u64,
+        sa: u64,
+        bg: u64,
+        n_h: usize,
+    },
     /// GDN conv1d + ring shift + silu (state in-place).
-    GdnConv { qkv: u64, cw: u64, state: u64, out: u64, ch: usize, k: usize, t_len: usize },
+    GdnConv {
+        qkv: u64,
+        cw: u64,
+        state: u64,
+        out: u64,
+        ch: usize,
+        k: usize,
+        t_len: usize,
+    },
     /// MoE route top-k: ids/wt GPU 잔류.
-    MoeTop10 { route: u64, ids: u64, wt: u64, n_exp: usize, k_sel: usize },
+    MoeTop10 {
+        route: u64,
+        ids: u64,
+        wt: u64,
+        n_exp: usize,
+        k_sel: usize,
+    },
     /// NEOX RoPE (cs = [pos_max][half][2] cos,sin 인터리브 테이블).
-    RopeApply { x: u64, cs: u64, pos_base: usize, rows_per_tok: usize, pos_mul: usize, stride: usize, half: usize },
+    RopeApply {
+        x: u64,
+        cs: u64,
+        pos_base: usize,
+        rows_per_tok: usize,
+        pos_mul: usize,
+        stride: usize,
+        half: usize,
+    },
     /// 인덱서 블록키 풀링 (mean of r rows).
-    IdxPool { cache: u64, out: u64, first_block: usize, dim: usize, r: usize },
+    IdxPool {
+        cache: u64,
+        out: u64,
+        first_block: usize,
+        dim: usize,
+        r: usize,
+    },
     /// 인덱서 스코어: Σ_h ReLU(qr·bk).
-    IdxScores { qr: u64, bk: u64, scores: u64, idx_heads: usize, dim: usize },
+    IdxScores {
+        qr: u64,
+        bk: u64,
+        scores: u64,
+        idx_heads: usize,
+        dim: usize,
+    },
     /// qwen35 어텐션 q 프리페어: 헤드 rms·rope·q‖gate 인터리브.
-    AttnQPrep { q: u64, w: u64, cs: u64, out: u64, eps: f32, hd: usize, pos: usize, half: usize },
+    AttnQPrep {
+        q: u64,
+        w: u64,
+        cs: u64,
+        out: u64,
+        eps: f32,
+        hd: usize,
+        pos: usize,
+        half: usize,
+    },
     /// qwen35 어텐션 k 프리페어: kv-헤드 rms·rope → 캐시 pos append.
-    AttnKPrep { k: u64, w: u64, cs: u64, cache: u64, eps: f32, hd: usize, pos: usize, n_kv: usize, half: usize },
+    AttnKPrep {
+        k: u64,
+        w: u64,
+        cs: u64,
+        cache: u64,
+        eps: f32,
+        hd: usize,
+        pos: usize,
+        n_kv: usize,
+        half: usize,
+    },
     /// in-place: v ← v·s (GDN q 사전 스케일).
     Scale { t: u64, s: f32, n: usize },
     /// 행 복사: dst[dst_off..+n] = src[src_off..+n] — 캐시 append 부품.
-    CopyRows { src: u64, dst: u64, src_off: usize, dst_off: usize, n: usize },
+    CopyRows {
+        src: u64,
+        dst: u64,
+        src_off: usize,
+        dst_off: usize,
+        n: usize,
+    },
     /// k_sel행 브로드캐스트 — dst의 모든 행 = src 0행 (MoE t=1 gate/up, 1런치).
-    BcastRows { src: u64, dst: u64, n: usize, rows: usize },
+    BcastRows {
+        src: u64,
+        dst: u64,
+        n: usize,
+        rows: usize,
+    },
     /// MoE shared 가산: y += x·s (s는 1원소 프레임 버퍼).
     AxpyScaled { y: u64, x: u64, s: u64, n: usize },
     /// MoE 전문가 가중 합: out = Σ_e wt[e]·ys[e].
-    MoeWeightedSum { ys: u64, wt: u64, out: u64, k: usize, n: usize },
+    MoeWeightedSum {
+        ys: u64,
+        wt: u64,
+        out: u64,
+        k: usize,
+        n: usize,
+    },
 }
 
 /// 프레임 상태 연산 — 상주 상태(kv/gdn/conv/blk)를 갱신하는 가속기 전용
@@ -965,7 +1142,9 @@ pub fn mm_group(
     outs: &mut [Vec<Vec<f32>>],
 ) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
-        Some(a) => a.matmul_group(xs, ws, outs).map_err(crate::qwen35::ModelError::Accel),
+        Some(a) => a
+            .matmul_group(xs, ws, outs)
+            .map_err(crate::qwen35::ModelError::Accel),
         None => {
             for (w, out) in ws.iter().zip(outs.iter_mut()) {
                 matmul_batch(xs, w, out);
@@ -991,7 +1170,7 @@ pub fn mm_batch(
         None => {
             matmul_batch(xs, w, outs);
             Ok(())
-        },
+        }
     }
 }
 
@@ -1003,11 +1182,13 @@ pub fn mm(
     out: &mut [f32],
 ) -> Result<(), crate::qwen35::ModelError> {
     match acc.as_deref() {
-        Some(a) => a.matmul(x, w, out).map_err(crate::qwen35::ModelError::Accel),
+        Some(a) => a
+            .matmul(x, w, out)
+            .map_err(crate::qwen35::ModelError::Accel),
         None => {
             matmul(x, w, out);
             Ok(())
-        },
+        }
     }
 }
 
@@ -1216,8 +1397,7 @@ pub fn w4a8_enabled() -> bool {
 pub fn w4a8_ty(ty: llm170_gguf::GgmlType) -> bool {
     matches!(
         ty,
-            | llm170_gguf::GgmlType::Iq4Xs
-            | llm170_gguf::GgmlType::Iq3S
+        |llm170_gguf::GgmlType::Iq4Xs| llm170_gguf::GgmlType::Iq3S
             | llm170_gguf::GgmlType::Q3K
             | llm170_gguf::GgmlType::Q4K
             | llm170_gguf::GgmlType::Q5K
@@ -1239,27 +1419,19 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
         for (o, out_o) in out.iter_mut().enumerate() {
             let row = &w.data[o * row_bytes..];
             *out_o = match w.ty {
-                llm170_gguf::GgmlType::Q3K => {
-                    crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y)
-                }
+                llm170_gguf::GgmlType::Q3K => crate::quant::dot_row_w4a8_q3k_lane(row, w.n_in, &y),
                 llm170_gguf::GgmlType::Iq3S => {
                     crate::quant::dot_row_w4a8_iq3s_lane(row, w.n_in, &y)
                 }
-                llm170_gguf::GgmlType::Q4K => {
-                    crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y)
-                }
-                llm170_gguf::GgmlType::Q5K => {
-                    crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y)
-                }
+                llm170_gguf::GgmlType::Q4K => crate::quant::dot_row_w4a8_q4k_lane(row, w.n_in, &y),
+                llm170_gguf::GgmlType::Q5K => crate::quant::dot_row_w4a8_q5k_lane(row, w.n_in, &y),
                 llm170_gguf::GgmlType::Q8_0 => {
                     crate::quant::dot_row_w4a8_q8_0_lane(row, w.n_in, &y)
                 }
                 llm170_gguf::GgmlType::Iq4Nl => {
                     crate::quant::dot_row_w4a8_iq4nl_lane(row, w.n_in, &y)
                 }
-                llm170_gguf::GgmlType::Q6K => {
-                    crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y)
-                }
+                llm170_gguf::GgmlType::Q6K => crate::quant::dot_row_w4a8_q6k_lane(row, w.n_in, &y),
                 llm170_gguf::GgmlType::Q5_1 => {
                     crate::quant::dot_row_w4a8_q5_1_lane(row, w.n_in, &y)
                 }
@@ -1311,7 +1483,10 @@ pub fn matmul(x: &[f32], w: &Weight, out: &mut [f32]) {
 pub fn matmul_batch(xs: &[Vec<f32>], w: &Weight, outs: &mut [Vec<f32>]) {
     // W4A8 (지원 타입) — 행별 레인 미러 정수 내적 (GPU 배치 경로와 동일 비트)
     if w4a8_enabled() && w4a8_ty(w.ty) {
-        let y_all: Vec<_> = xs.iter().map(|r| crate::quant::quantize_row_q8_ref(r)).collect();
+        let y_all: Vec<_> = xs
+            .iter()
+            .map(|r| crate::quant::quantize_row_q8_ref(r))
+            .collect();
         let blck = w.ty.blck_size() as usize;
         let bsize = w.ty.type_size() as usize;
         let row_bytes = (w.n_in as usize / blck) * bsize;
@@ -1436,11 +1611,28 @@ pub fn matmul_w4a8(x: &[f32], w: &Weight, out: &mut [f32]) {
 pub fn greedy_from(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut bv = f32::NEG_INFINITY;
+    let mut snd = (usize::MAX, f32::NEG_INFINITY);
+    let top2 = llm170_diag::dump::opts().top2;
     for (i, &v) in logits.iter().enumerate() {
         if v > bv {
+            snd = (best, bv);
             bv = v;
             best = i;
+        } else if v > snd.1 {
+            snd = (i, v);
         }
+    }
+    if top2 {
+        // 107 W1: 근접타이 마진 원장 — 두 변형의 아그맥스 뒤집힘이 합법
+        // 타이인지(마진 < 엡실론) 판정하는 1회 측정용 계측.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[top2] #{n} best={best}({bv:.4}) 2nd={}({:.4}) margin={:.4}",
+            snd.0,
+            snd.1,
+            bv - snd.1
+        );
     }
     best as u32
 }

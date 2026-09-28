@@ -41,14 +41,14 @@ pub struct Frame {
     logits: u64,
     one: u64, // AxpyScaled용 1.0 스케일 버퍼
     // 어텐션 프레임 (P1) — q/k 프리페어·인터리브·KV 캐시·마스크
-    aq: u64,       // q+gate [n_head·2·hd]
-    ak: u64,       // k [n_kv·hd]
-    av: u64,       // v [n_kv·hd]
-    aout: u64,     // 어텐션 출력 [n_head·hd]
-    cs: u64,       // rope cos/sin [ctx][half][2]
-    mask: u64,     // u32 [ctx] 전체 가시
-    kv_k: Vec<Vec<u64>>, // [seq][full] k 캐시
-    kv_v: Vec<Vec<u64>>, // [seq][full] v 캐시
+    aq: u64,                // q+gate [n_head·2·hd]
+    ak: u64,                // k [n_kv·hd]
+    av: u64,                // v [n_kv·hd]
+    aout: u64,              // 어텐션 출력 [n_head·hd]
+    cs: u64,                // rope cos/sin [ctx][half][2]
+    mask: u64,              // u32 [ctx] 전체 가시
+    kv_k: Vec<Vec<u64>>,    // [seq][full] k 캐시
+    kv_v: Vec<Vec<u64>>,    // [seq][full] v 캐시
     st_conv: Vec<Vec<u64>>, // [seq][recr]
     st_gdn: Vec<Vec<u64>>,  // [seq][recr]
     consts: HashMap<String, u64>,
@@ -110,13 +110,15 @@ impl Frame {
             kv_v: Vec::with_capacity(eng.seqs.len()),
             consts: HashMap::new(),
         };
-        acc.frame_write(f.one, &[1.0f32]).map_err(ModelError::Accel)?;
+        acc.frame_write(f.one, &[1.0f32])
+            .map_err(ModelError::Accel)?;
         // 어텐션(P1): cs 테이블·마스크·KV 캐시 — CPU rope_head과 동일 값.
         {
             let cs = hp.rope_cs(ctx_frames);
             acc.frame_write(f.cs, &cs).map_err(ModelError::Accel)?;
             let masks: Vec<u32> = vec![1u32; ctx_frames];
-            acc.frame_write_u32(f.mask, &masks).map_err(ModelError::Accel)?;
+            acc.frame_write_u32(f.mask, &masks)
+                .map_err(ModelError::Accel)?;
         }
         for _ in 0..eng.seqs.len() {
             let mut gdn = Vec::with_capacity(n_recr);
@@ -145,34 +147,79 @@ impl Frame {
             Ok(())
         };
         for il in 0..hp.n_layer {
-            put(&mut f, &format!("blk.{il}.attn_norm"), &eng.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?)?;
-            put(&mut f, &format!("blk.{il}.post_norm"), &eng.model.f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?)?;
+            put(
+                &mut f,
+                &format!("blk.{il}.attn_norm"),
+                &eng.model.f32_vec(&format!("blk.{il}.attn_norm.weight"))?,
+            )?;
+            put(
+                &mut f,
+                &format!("blk.{il}.post_norm"),
+                &eng.model
+                    .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?,
+            )?;
             if !eng.model.is_recr(il) {
-                put(&mut f, &format!("blk.{il}.attn_q_norm"), &eng.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?)?;
-                put(&mut f, &format!("blk.{il}.attn_k_norm"), &eng.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?)?;
+                put(
+                    &mut f,
+                    &format!("blk.{il}.attn_q_norm"),
+                    &eng.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?,
+                )?;
+                put(
+                    &mut f,
+                    &format!("blk.{il}.attn_k_norm"),
+                    &eng.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?,
+                )?;
             }
             if eng.model.is_recr(il) {
                 // ssm_norm [d_state] 전헤드 공유 — dt_rank 타일 업로드
                 // (norm_gated_rows_silu가 헤드별 슬라이스 인덱싱, 2026-09-01 RCA).
                 let sn = eng.model.f32_vec(&format!("blk.{il}.ssm_norm.weight"))?;
-                let sn_tiled: Vec<f32> = sn.iter().copied().cycle().take(sn.len() * hp.dt_rank).collect();
+                let sn_tiled: Vec<f32> = sn
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(sn.len() * hp.dt_rank)
+                    .collect();
                 put(&mut f, &format!("blk.{il}.ssm_norm"), &sn_tiled)?;
-                put(&mut f, &format!("blk.{il}.dt_bias"), &eng.model.f32_vec(&format!("blk.{il}.ssm_dt.bias"))?)?;
-                put(&mut f, &format!("blk.{il}.ssm_a"), &eng.model.f32_vec(&format!("blk.{il}.ssm_a"))?)?;
-                put(&mut f, &format!("blk.{il}.conv_w"), &eng.model.f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))?)?;
+                put(
+                    &mut f,
+                    &format!("blk.{il}.dt_bias"),
+                    &eng.model.f32_vec(&format!("blk.{il}.ssm_dt.bias"))?,
+                )?;
+                put(
+                    &mut f,
+                    &format!("blk.{il}.ssm_a"),
+                    &eng.model.f32_vec(&format!("blk.{il}.ssm_a"))?,
+                )?;
+                put(
+                    &mut f,
+                    &format!("blk.{il}.conv_w"),
+                    &eng.model.f32_vec(&format!("blk.{il}.ssm_conv1d.weight"))?,
+                )?;
             }
         }
-        put(&mut f, "output_norm", &eng.model.f32_vec("output_norm.weight")?)?;
+        put(
+            &mut f,
+            "output_norm",
+            &eng.model.f32_vec("output_norm.weight")?,
+        )?;
         Ok(f)
     }
 
     /// CPU SeqState의 GDN 상태를 GPU로 재동기 (prefill 직후) — 시퀀스 지정.
-    pub fn sync_states(&mut self, acc: &dyn Accelerator, eng: &Engine, seq: usize) -> Result<(), ModelError> {
+    pub fn sync_states(
+        &mut self,
+        acc: &dyn Accelerator,
+        eng: &Engine,
+        seq: usize,
+    ) -> Result<(), ModelError> {
         for (ri, h) in self.st_gdn[seq].iter().enumerate() {
-            acc.frame_write(*h, &eng.seqs[seq].gdn_s[ri]).map_err(ModelError::Accel)?;
+            acc.frame_write(*h, &eng.seqs[seq].gdn_s[ri])
+                .map_err(ModelError::Accel)?;
         }
         for (ri, h) in self.st_conv[seq].iter().enumerate() {
-            acc.frame_write(*h, &eng.seqs[seq].conv[ri]).map_err(ModelError::Accel)?;
+            acc.frame_write(*h, &eng.seqs[seq].conv[ri])
+                .map_err(ModelError::Accel)?;
         }
         // KV 캐시 — 프리필(값 경로)이 CPU 캐시에 기록한 분 동기 (2026-09-02
         // P1 RCA: 누락 시 첫 디코드부터 가비지 키 판독, 2토큰째 발산).
@@ -180,11 +227,15 @@ impl Frame {
         // 값 경로 qsa_attention_inner의 업로드 곱과 동일 반올림.
         let kqs = eng.model.hp.kq_scale();
         for (fi, h) in self.kv_k[seq].iter().enumerate() {
-            let scaled: Vec<f32> = eng.seqs[seq].kv_k_ref()[fi].iter().map(|v| v * kqs).collect();
+            let scaled: Vec<f32> = eng.seqs[seq].kv_k_ref()[fi]
+                .iter()
+                .map(|v| v * kqs)
+                .collect();
             acc.frame_write(*h, &scaled).map_err(ModelError::Accel)?;
         }
         for (fi, h) in self.kv_v[seq].iter().enumerate() {
-            acc.frame_write(*h, &eng.seqs[seq].kv_v_ref()[fi]).map_err(ModelError::Accel)?;
+            acc.frame_write(*h, &eng.seqs[seq].kv_v_ref()[fi])
+                .map_err(ModelError::Accel)?;
         }
         Ok(())
     }
@@ -198,7 +249,10 @@ impl Engine {
     /// 프레임 디코드 1스텝 (t=1, seq 1개) — logits 반환.
     /// LLM170_FRAME35=1 게이트. 실패 시 Err (묵시 폴백 없음 — 명시적 옵트인).
     pub fn decode1_frame(&mut self, seq: usize, token: u32) -> Result<Vec<f32>, ModelError> {
-        let acc = self.acc.clone().ok_or(ModelError::Accel("frame: 가속기 없음".into()))?;
+        let acc = self
+            .acc
+            .clone()
+            .ok_or(ModelError::Accel("frame: 가속기 없음".into()))?;
         let hp = self.model.hp.clone();
         let _n = hp.n_embd;
         let _k_len = hp.n_group * hp.d_state;
@@ -249,10 +303,21 @@ impl Engine {
         for il in 0..hp.n_layer {
             // 1) pre-norm (+ W4A8 활성 양자화 — in_proj·FFN 공용)
             let w_norm = f.consts[&format!("blk.{il}.attn_norm")];
-            op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: w_norm, out: f.xn, eps, n, w_reps: 1 })?;
+            op(
+                acc.as_ref(),
+                FrameOp::RmsRows {
+                    x: f.xs,
+                    w: w_norm,
+                    out: f.xn,
+                    eps,
+                    n,
+                    w_reps: 1,
+                },
+            )?;
             let q8n = crate::matmul::w4a8_enabled();
             if q8n {
-                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n)
+                    .map_err(ModelError::Accel)?;
             }
 
             // 2) 층 본체 — GDN 프레임 / 어텐션 값 브리지
@@ -261,41 +326,122 @@ impl Engine {
                 let wgate = eng.model.wchk(&format!("blk.{il}.attn_gate.weight"))?;
                 let wb = eng.model.wchk(&format!("blk.{il}.ssm_beta.weight"))?;
                 let wa = eng.model.wchk(&format!("blk.{il}.ssm_alpha.weight"))?;
-                if q8n && crate::matmul::w4a8_ty(wqkv.ty) && crate::matmul::w4a8_ty(wgate.ty) && crate::matmul::w4a8_ty(wb.ty) && crate::matmul::w4a8_ty(wa.ty) {
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wqkv, f.gqkv, n).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wgate, f.gz, n).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wb, f.gb, n).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wa, f.ga, n).map_err(ModelError::Accel)?;
-                } else {
-                    acc.frame_mm_group(f.xn, &[wqkv, wgate, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], 1)
+                if q8n
+                    && crate::matmul::w4a8_ty(wqkv.ty)
+                    && crate::matmul::w4a8_ty(wgate.ty)
+                    && crate::matmul::w4a8_ty(wb.ty)
+                    && crate::matmul::w4a8_ty(wa.ty)
+                {
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wqkv, f.gqkv, n)
                         .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wgate, f.gz, n)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wb, f.gb, n)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wa, f.ga, n)
+                        .map_err(ModelError::Accel)?;
+                } else {
+                    acc.frame_mm_group(
+                        f.xn,
+                        &[wqkv, wgate, wb, wa],
+                        &[f.gqkv, f.gz, f.gb, f.ga],
+                        1,
+                    )
+                    .map_err(ModelError::Accel)?;
                 }
                 // conv + ring
                 let cw = f.consts[&format!("blk.{il}.conv_w")];
-                op(acc.as_ref(), FrameOp::GdnConv { qkv: f.gqkv, cw, state: f.st_conv[seq][recr_idx], out: f.gconv, ch: conv_ch, k: hp.conv_k, t_len: 1 })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::GdnConv {
+                        qkv: f.gqkv,
+                        cw,
+                        state: f.st_conv[seq][recr_idx],
+                        out: f.gconv,
+                        ch: conv_ch,
+                        k: hp.conv_k,
+                        t_len: 1,
+                    },
+                )?;
                 // q/k/v 분할 + l2 + q·scale
                 // 6런치 → 2런치 (split3 + l2²·scale) — 산술 동일
-                op(acc.as_ref(), FrameOp::Split3 { src: f.gconv, d0: f.gq, d1: f.gk, d2: f.gv, n0: k_len, n1: k_len, n2: v_len })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::Split3 {
+                        src: f.gconv,
+                        d0: f.gq,
+                        d1: f.gk,
+                        d2: f.gv,
+                        n0: k_len,
+                        n1: k_len,
+                        n2: v_len,
+                    },
+                )?;
                 let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-                op(acc.as_ref(), FrameOp::L2Rows2Scale { q: f.gq, k: f.gk, eps, scale, d: hp.d_state, n_group: hp.n_group })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::L2Rows2Scale {
+                        q: f.gq,
+                        k: f.gk,
+                        eps,
+                        scale,
+                        d: hp.d_state,
+                        n_group: hp.n_group,
+                    },
+                )?;
                 // β/e^g
                 let dtb = f.consts[&format!("blk.{il}.dt_bias")];
                 let ssa = f.consts[&format!("blk.{il}.ssm_a")];
-                op(acc.as_ref(), FrameOp::GdnBetaG { b: f.gb, a: f.ga, dtb, sa: ssa, bg: f.gbg, n_h: hp.dt_rank })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::GdnBetaG {
+                        b: f.gb,
+                        a: f.ga,
+                        dtb,
+                        sa: ssa,
+                        bg: f.gbg,
+                        n_h: hp.dt_rank,
+                    },
+                )?;
                 // AR 갱신 — 상태 GPU 상주
                 let fs: &dyn FrameState = acc.as_ref();
-                fs.frame_gdn_ar(f.gq, f.gk, f.gv, f.gbg, f.st_gdn[seq][recr_idx], f.go, 1, hp.n_group, hp.dt_rank, hp.d_state)
-                    .map_err(ModelError::Accel)?;
+                fs.frame_gdn_ar(
+                    f.gq,
+                    f.gk,
+                    f.gv,
+                    f.gbg,
+                    f.st_gdn[seq][recr_idx],
+                    f.go,
+                    1,
+                    hp.n_group,
+                    hp.dt_rank,
+                    hp.d_state,
+                )
+                .map_err(ModelError::Accel)?;
                 // norm_gated(silu) + out proj
                 let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
-                op(acc.as_ref(), FrameOp::NormGatedSilu { o: f.go, z: f.gz, w: snorm, out: f.ggated, eps, d: hp.d_state, n_h: hp.dt_rank })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::NormGatedSilu {
+                        o: f.go,
+                        z: f.gz,
+                        w: snorm,
+                        out: f.ggated,
+                        eps,
+                        d: hp.d_state,
+                        n_h: hp.dt_rank,
+                    },
+                )?;
                 let wout = eng.model.wchk(&format!("blk.{il}.ssm_out.weight"))?;
                 let d_inner = hp.dt_rank * hp.d_state;
                 if q8n && crate::matmul::w4a8_ty(wout.ty) {
-                    acc.frame_quant_q8(f.ggated, f.xq_g, f.xd_g, d_inner).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wout, f.gout, d_inner).map_err(ModelError::Accel)?;
+                    acc.frame_quant_q8(f.ggated, f.xq_g, f.xd_g, d_inner)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wout, f.gout, d_inner)
+                        .map_err(ModelError::Accel)?;
                 } else {
-                    acc.frame_mm(f.ggated, &wout, f.gout, 1).map_err(ModelError::Accel)?;
+                    acc.frame_mm(f.ggated, &wout, f.gout, 1)
+                        .map_err(ModelError::Accel)?;
                 }
                 recr_idx += 1;
             } else {
@@ -304,7 +450,9 @@ impl Engine {
                 let pos = eng.seqs[seq].pos as usize;
                 let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
                 if pos >= 2048 {
-                    return Err(ModelError::Accel("frame: ctx 2048 초과 (cs/캐시 상한)".into()));
+                    return Err(ModelError::Accel(
+                        "frame: ctx 2048 초과 (cs/캐시 상한)".into(),
+                    ));
                 }
                 let pos = eng.seqs[seq].pos as usize;
                 let (_n_head, _n_kv, _hd) = (hp.n_head, hp.n_kv, hp.head_dim);
@@ -316,10 +464,17 @@ impl Engine {
                 let wq = eng.model.wchk(&format!("blk.{il}.attn_q.weight"))?;
                 let wk = eng.model.wchk(&format!("blk.{il}.attn_k.weight"))?;
                 let wv = eng.model.wchk(&format!("blk.{il}.attn_v.weight"))?;
-                if q8n && crate::matmul::w4a8_ty(wq.ty) && crate::matmul::w4a8_ty(wk.ty) && crate::matmul::w4a8_ty(wv.ty) {
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wq, f.aq, n).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wk, f.ak, n).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wv, f.av, n).map_err(ModelError::Accel)?;
+                if q8n
+                    && crate::matmul::w4a8_ty(wq.ty)
+                    && crate::matmul::w4a8_ty(wk.ty)
+                    && crate::matmul::w4a8_ty(wv.ty)
+                {
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wq, f.aq, n)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wk, f.ak, n)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_n, f.xd_n, &wv, f.av, n)
+                        .map_err(ModelError::Accel)?;
                 } else {
                     acc.frame_mm_group(f.xn, &[wq, wk, wv], &[f.aq, f.ak, f.av], 1)
                         .map_err(ModelError::Accel)?;
@@ -329,39 +484,108 @@ impl Engine {
                 // 연산열. k는 kq_scale 사전 곱(기존 브리지와 동일 의미).
                 let qn_h = f.consts[&format!("blk.{il}.attn_q_norm")];
                 let kn_h = f.consts[&format!("blk.{il}.attn_k_norm")];
-                op(acc.as_ref(), FrameOp::QKNormRope {
-                    q: f.aq, k: f.ak, qw: qn_h, kw: kn_h, cs: f.cs,
-                    eps, kqs: eng.model.hp.kq_scale(), pos,
-                    n_head, n_kv, hd, n_rot,
-                })?;
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.ak, dst: f.kv_k[seq][full_idx], src_off: 0, dst_off: pos * n_kv * hd, n: n_kv * hd })?;
-                op(acc.as_ref(), FrameOp::CopyRows { src: f.av, dst: f.kv_v[seq][full_idx], src_off: 0, dst_off: pos * n_kv * hd, n: n_kv * hd })?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::QKNormRope {
+                        q: f.aq,
+                        k: f.ak,
+                        qw: qn_h,
+                        kw: kn_h,
+                        cs: f.cs,
+                        eps,
+                        kqs: eng.model.hp.kq_scale(),
+                        pos,
+                        n_head,
+                        n_kv,
+                        hd,
+                        n_rot,
+                    },
+                )?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::CopyRows {
+                        src: f.ak,
+                        dst: f.kv_k[seq][full_idx],
+                        src_off: 0,
+                        dst_off: pos * n_kv * hd,
+                        n: n_kv * hd,
+                    },
+                )?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::CopyRows {
+                        src: f.av,
+                        dst: f.kv_v[seq][full_idx],
+                        src_off: 0,
+                        dst_off: pos * n_kv * hd,
+                        n: n_kv * hd,
+                    },
+                )?;
                 let fs2: &dyn FrameState = acc.as_ref();
-                fs2.frame_qsa_attention(f.aq, f.kv_k[seq][full_idx], f.kv_v[seq][full_idx], f.mask, f.aout, eng.model.hp.kq_scale(), pos + 1, n_head, n_kv, hd, 1)
-                    .map_err(ModelError::Accel)?;
+                fs2.frame_qsa_attention(
+                    f.aq,
+                    f.kv_k[seq][full_idx],
+                    f.kv_v[seq][full_idx],
+                    f.mask,
+                    f.aout,
+                    eng.model.hp.kq_scale(),
+                    pos + 1,
+                    n_head,
+                    n_kv,
+                    hd,
+                    1,
+                )
+                .map_err(ModelError::Accel)?;
                 let wo = eng.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
                 if q8n && crate::matmul::w4a8_ty(wo.ty) {
                     let alen = hp.n_head * hp.head_dim;
-                    acc.frame_quant_q8(f.aout, f.xq_g, f.xd_g, alen).map_err(ModelError::Accel)?;
-                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wo, f.gout, alen).map_err(ModelError::Accel)?;
+                    acc.frame_quant_q8(f.aout, f.xq_g, f.xd_g, alen)
+                        .map_err(ModelError::Accel)?;
+                    acc.frame_mm_q8(f.xq_g, f.xd_g, &wo, f.gout, alen)
+                        .map_err(ModelError::Accel)?;
                 } else {
-                    acc.frame_mm(f.aout, &wo, f.gout, 1).map_err(ModelError::Accel)?;
+                    acc.frame_mm(f.aout, &wo, f.gout, 1)
+                        .map_err(ModelError::Accel)?;
                 }
                 full_idx += 1;
             }
             // 3) 잔차 가산: xs += gout·1.0
-            op(acc.as_ref(), FrameOp::AxpyScaled { y: f.xs, x: f.gout, s: f.one, n })?;
+            op(
+                acc.as_ref(),
+                FrameOp::AxpyScaled {
+                    y: f.xs,
+                    x: f.gout,
+                    s: f.one,
+                    n,
+                },
+            )?;
             if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
                 let mut hv = vec![0.0f32; n];
                 acc.frame_read(f.xs, &mut hv).map_err(ModelError::Accel)?;
                 let m = hv.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-                eprintln!("layer {il:>2} recr={} max|x|={m:.4} head={:.5},{:.5},{:.5},{:.5}",
-                    eng.model.is_recr(il), hv[0], hv[1], hv[2], hv[3]);
+                eprintln!(
+                    "layer {il:>2} recr={} max|x|={m:.4} head={:.5},{:.5},{:.5},{:.5}",
+                    eng.model.is_recr(il),
+                    hv[0],
+                    hv[1],
+                    hv[2],
+                    hv[3]
+                );
             }
 
             // 4) FFN — post_norm → gate/up → silu·u → down → 잔차
             let pw = f.consts[&format!("blk.{il}.post_norm")];
-            op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: pw, out: f.xn, eps, n, w_reps: 1 })?;
+            op(
+                acc.as_ref(),
+                FrameOp::RmsRows {
+                    x: f.xs,
+                    w: pw,
+                    out: f.xn,
+                    eps,
+                    n,
+                    w_reps: 1,
+                },
+            )?;
             let gate_w = eng.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
             let up_w = eng.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
             let down_w = eng.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
@@ -372,34 +596,78 @@ impl Engine {
                 && crate::matmul::w4a8_ty(up_w.ty)
                 && crate::matmul::w4a8_ty(down_w.ty);
             if w4a8 {
-                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
-                acc.frame_mm_q8(f.xq_n, f.xd_n, &gate_w, f.fgate, n).map_err(ModelError::Accel)?;
-                acc.frame_mm_q8(f.xq_n, f.xd_n, &up_w, f.fup, n).map_err(ModelError::Accel)?;
-                op(acc.as_ref(), FrameOp::SiluMul { g: f.fgate, u: f.fup, out: f.fglu, n: hp.n_ff })?;
-                acc.frame_quant_q8(f.fglu, f.xq_f, f.xd_f, hp.n_ff).map_err(ModelError::Accel)?;
-                acc.frame_mm_q8(f.xq_f, f.xd_f, &down_w, f.fdown, hp.n_ff).map_err(ModelError::Accel)?;
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n)
+                    .map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &gate_w, f.fgate, n)
+                    .map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &up_w, f.fup, n)
+                    .map_err(ModelError::Accel)?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::SiluMul {
+                        g: f.fgate,
+                        u: f.fup,
+                        out: f.fglu,
+                        n: hp.n_ff,
+                    },
+                )?;
+                acc.frame_quant_q8(f.fglu, f.xq_f, f.xd_f, hp.n_ff)
+                    .map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_f, f.xd_f, &down_w, f.fdown, hp.n_ff)
+                    .map_err(ModelError::Accel)?;
             } else {
                 acc.frame_mm_group(f.xn, &[gate_w, up_w], &[f.fgate, f.fup], 1)
                     .map_err(ModelError::Accel)?;
-                op(acc.as_ref(), FrameOp::SiluMul { g: f.fgate, u: f.fup, out: f.fglu, n: hp.n_ff })?;
-                acc.frame_mm(f.fglu, &down_w, f.fdown, 1).map_err(ModelError::Accel)?;
+                op(
+                    acc.as_ref(),
+                    FrameOp::SiluMul {
+                        g: f.fgate,
+                        u: f.fup,
+                        out: f.fglu,
+                        n: hp.n_ff,
+                    },
+                )?;
+                acc.frame_mm(f.fglu, &down_w, f.fdown, 1)
+                    .map_err(ModelError::Accel)?;
             }
-            op(acc.as_ref(), FrameOp::AxpyScaled { y: f.xs, x: f.fdown, s: f.one, n })?;
+            op(
+                acc.as_ref(),
+                FrameOp::AxpyScaled {
+                    y: f.xs,
+                    x: f.fdown,
+                    s: f.one,
+                    n,
+                },
+            )?;
         }
 
         // 5) head — output_norm + output GEMM + 판독 (최종 1 sync)
         {
             let wn = f.consts["output_norm"];
-            op(acc.as_ref(), FrameOp::RmsRows { x: f.xs, w: wn, out: f.xn, eps, n, w_reps: 1 })?;
+            op(
+                acc.as_ref(),
+                FrameOp::RmsRows {
+                    x: f.xs,
+                    w: wn,
+                    out: f.xn,
+                    eps,
+                    n,
+                    w_reps: 1,
+                },
+            )?;
             let head = eng.model.wchk("output.weight")?;
             if crate::matmul::w4a8_enabled() && crate::matmul::w4a8_ty(head.ty) {
-                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n).map_err(ModelError::Accel)?;
-                acc.frame_mm_q8(f.xq_n, f.xd_n, &head, f.logits, n).map_err(ModelError::Accel)?;
+                acc.frame_quant_q8(f.xn, f.xq_n, f.xd_n, n)
+                    .map_err(ModelError::Accel)?;
+                acc.frame_mm_q8(f.xq_n, f.xd_n, &head, f.logits, n)
+                    .map_err(ModelError::Accel)?;
             } else {
-                acc.frame_mm(f.xn, &head, f.logits, 1).map_err(ModelError::Accel)?;
+                acc.frame_mm(f.xn, &head, f.logits, 1)
+                    .map_err(ModelError::Accel)?;
             }
             let mut logits = vec![0.0f32; head.n_out as usize];
-            acc.frame_read(f.logits, &mut logits).map_err(ModelError::Accel)?;
+            acc.frame_read(f.logits, &mut logits)
+                .map_err(ModelError::Accel)?;
             // MTP draft용 h_t 스냅샷 — 사용 중일 때만 추가 판독.
             if !eng.seqs[seq].mtp_h.is_empty() {
                 let mut h = vec![0.0f32; n];

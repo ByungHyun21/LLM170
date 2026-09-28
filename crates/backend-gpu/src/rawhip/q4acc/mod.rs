@@ -16,7 +16,7 @@
 use cubecl_hip_sys as hip;
 use llm170_gguf::GgmlType;
 
-use super::{ck, RawCtx};
+use super::{RawCtx, ck};
 use crate::rawhip::env_on;
 
 /// 용도별 성장형 디바이스 버퍼 (해제 없음 — ADR-0014).
@@ -28,7 +28,11 @@ struct GBuf {
 
 impl GBuf {
     const fn new(name: &'static str) -> Self {
-        GBuf { name, bytes: 0, ptr: std::ptr::null_mut() }
+        GBuf {
+            name,
+            bytes: 0,
+            ptr: std::ptr::null_mut(),
+        }
     }
 
     fn ensure(&mut self, ctx: &RawCtx, bytes: usize) -> Result<*mut u8, String> {
@@ -51,7 +55,7 @@ struct MoeGroup {
     rows: usize,
     perm_d: u64,
     inv_d: u64,
-    rowexp_d: u64,   // 행→전문가 (순열 후 순서) — 그룹 GEMM용
+    rowexp_d: u64, // 행→전문가 (순열 후 순서) — 그룹 GEMM용
     perm_pad_d: u64,
     inv_pad_d: u64,
     tilexp_d: u64,
@@ -64,7 +68,6 @@ struct MoeGroup {
     pinned_off: *mut u8,
     off: Vec<usize>,
 }
-
 
 /// per-op 시간 누적 (LLM170_Q4ACC_TIME=1) — (업로드, 양자화, 런치, d2h, 호출수)
 #[derive(Default)]
@@ -181,13 +184,14 @@ fn ggml_id(ty: GgmlType) -> u32 {
 }
 
 impl Q4Acc {
-
     pub fn new() -> Result<Self, String> {
         Self::new_with_sources(Vec::new())
     }
 
     /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
-    pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
+    pub fn new_with_sources(
+        parts: Vec<(usize, usize, std::path::PathBuf)>,
+    ) -> Result<Self, String> {
         let ctx = RawCtx::new()?;
         // plans/84 E1: q4acc는 Flash-Next(qwen4exp) 전용 — 디스패처 스코프 지정.
         ctx.set_scope(crate::rawhip::SCOPE_FLASHNEXT);
@@ -201,7 +205,10 @@ impl Q4Acc {
         for (base, len, path) in parts {
             match std::fs::File::open(&path) {
                 Ok(file) => sources.push(crate::common::parts::PartSource { base, len, file }),
-                Err(e) => eprintln!("# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})", path.display()),
+                Err(e) => eprintln!(
+                    "# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})",
+                    path.display()
+                ),
             }
         }
         Ok(Q4Acc {
@@ -280,7 +287,9 @@ impl Q4Acc {
                     t.quant_ns as f64 / 1e9,
                     t.launch_ns as f64 / 1e9,
                     t.d2h_ns as f64 / 1e9,
-                    (t.upload_ns + t.quant_ns + t.launch_ns + t.d2h_ns) as f64 / 1e6 / t.calls as f64
+                    (t.upload_ns + t.quant_ns + t.launch_ns + t.d2h_ns) as f64
+                        / 1e6
+                        / t.calls as f64
                 );
             }
         }
@@ -327,7 +336,9 @@ impl Q4Acc {
             let mut done = 0usize;
             while done < len {
                 let n = CH.min(len - done);
-                src.file.read_exact_at(&mut stage[..n], off).map_err(|e| format!("pread {off}: {e}"))?;
+                src.file
+                    .read_exact_at(&mut stage[..n], off)
+                    .map_err(|e| format!("pread {off}: {e}"))?;
                 self.ctx.h2d(unsafe { dst.add(done) }, &stage[..n])?;
                 done += n;
                 off += n as u64;
@@ -342,7 +353,11 @@ impl Q4Acc {
         let base = data.as_ptr() as usize;
         let n = data.len();
         if !base.is_multiple_of(4096) || n < (4 << 20) {
-            Self::advise(base & !4095, ((base & 4095) + n + 4095) & !4095, libc::MADV_WILLNEED);
+            Self::advise(
+                base & !4095,
+                ((base & 4095) + n + 4095) & !4095,
+                libc::MADV_WILLNEED,
+            );
             return self.ctx.h2d(dst, data);
         }
         let mut off = 0usize;
@@ -350,9 +365,14 @@ impl Q4Acc {
         while off < n {
             let sz = CH.min(n - off);
             if off + sz < n {
-                Self::advise(base + off + sz, CH.min(n - off - sz), libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL);
+                Self::advise(
+                    base + off + sz,
+                    CH.min(n - off - sz),
+                    libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL,
+                );
             }
-            self.ctx.h2d(unsafe { dst.add(off) }, &data[off..off + sz])?;
+            self.ctx
+                .h2d(unsafe { dst.add(off) }, &data[off..off + sz])?;
             Self::advise(base + off, sz, libc::MADV_DONTNEED);
             off += sz;
         }
@@ -445,15 +465,15 @@ impl Q4Acc {
     fn fchk(&self, h: u64, bytes: usize, what: &str) -> Result<(), String> {
         let cap = self.fcap(h)?;
         if bytes > cap {
-            return Err(format!("{what} 범위 초과: need {bytes}B > cap {cap}B (핸들 {h})"));
+            return Err(format!(
+                "{what} 범위 초과: need {bytes}B > cap {cap}B (핸들 {h})"
+            ));
         }
         Ok(())
     }
-
 }
 
 impl llm170_core::matmul::GraphCapture for Q4Acc {
-
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
         unsafe { crate::rawhip::capture_mark(self.ctx.stream, tag) }
     }
@@ -470,7 +490,9 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
         crate::rawhip::graph_abort();
     }
     fn pre_pair(&self, on: bool) {
-        self.ctx.pre_pair.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.ctx
+            .pre_pair
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     fn pre_mark(&self) -> Result<(), String> {
         self.ctx.pre_mark()
@@ -491,7 +513,6 @@ macro_rules! cargs {
     }};
 }
 
-
 /// 파트 소스 지정판 — 서버 배선이 `Model4::part_sources()`를 넘긴다.
 /// LLM170_GPU_RUNTIME=vulkan이면 VkAcc(plans/84 B — 진단 경로 포함 전역 스위치).
 pub fn new_acc_with_sources(
@@ -501,9 +522,7 @@ pub fn new_acc_with_sources(
         return crate::new_q4_acc_vk_with_sources(parts);
     }
     let a = Q4Acc::new_with_sources(parts)?;
-    eprintln!(
-        "# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)"
-    );
+    eprintln!("# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)");
     eprintln!("{}", crate::rawhip::probes::device_report(&a.ctx));
     Ok(std::sync::Arc::new(a))
 }

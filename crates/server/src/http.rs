@@ -15,7 +15,6 @@
 //! 토크나이저는 탐욕 최장일치 근사 — 자기일관(self-consistent) 검증용.
 //! llama.cpp 토큰 경계와 완전 일치하지 않음 (주석 참조).
 
-
 use crate::engine::{BackendSel, InferRequest, InferResult, SlotJob};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -173,7 +172,9 @@ fn jnum(body: &str, key: &str) -> Option<f64> {
     let i = body.find(&pat)? + pat.len();
     let b = body[i..].trim_start();
     let end = b
-        .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'))
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+        })
         .unwrap_or(b.len());
     b[..end].parse().ok()
 }
@@ -263,7 +264,12 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                 if READY.load(Ordering::Acquire) {
                     resp(&mut stream, 200, "application/json", "{\"status\":\"ok\"}")
                 } else {
-                    resp(&mut stream, 503, "application/json", "{\"status\":\"loading\"}")
+                    resp(
+                        &mut stream,
+                        503,
+                        "application/json",
+                        "{\"status\":\"loading\"}",
+                    )
                 }
             }
             ("GET", "/v1/models") => resp(
@@ -274,12 +280,22 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
             ),
             ("POST", "/tokenize") => {
                 let Some(content) = jstr(&req.body, "content") else {
-                    resp(&mut stream, 400, "application/json", "{\"error\":\"content required\"}");
+                    resp(
+                        &mut stream,
+                        400,
+                        "application/json",
+                        "{\"error\":\"content required\"}",
+                    );
                     continue;
                 };
                 let toks = crate::engine::greedy_encode(&content);
                 let ids: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
-                resp(&mut stream, 200, "application/json", &format!("{{\"tokens\":[{}]}}", ids.join(",")));
+                resp(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &format!("{{\"tokens\":[{}]}}", ids.join(",")),
+                );
             }
             ("POST", "/v1/completions") | ("POST", "/completion") => {
                 let n_predict = jnum(&req.body, "n_predict").unwrap_or(24.0).max(1.0) as usize;
@@ -290,33 +306,74 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                     (Some(v), _) if !v.is_empty() => v,
                     (_, Some(t)) => crate::engine::greedy_encode(&t),
                     _ => {
-                        resp(&mut stream, 400, "application/json", "{\"error\":\"prompt required\"}");
+                        resp(
+                            &mut stream,
+                            400,
+                            "application/json",
+                            "{\"error\":\"prompt required\"}",
+                        );
                         continue;
                     }
                 };
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, req.path.contains("chat"), Vec::new(), parse_sampler(&req.body));
+                run_and_emit(
+                    &mut stream,
+                    tx.clone(),
+                    ids,
+                    n_predict,
+                    stream_mode,
+                    req.path.contains("chat"),
+                    Vec::new(),
+                    parse_sampler(&req.body),
+                );
             }
             ("POST", "/v1/chat/completions") => {
-                let n_predict = jnum(&req.body, "max_tokens").unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0)).max(1.0) as usize;
+                let n_predict = jnum(&req.body, "max_tokens")
+                    .unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0))
+                    .max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
                 let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit(&mut stream, tx.clone(), ids, n_predict, stream_mode, true, vec![STOP_EOT], parse_sampler(&req.body));
+                run_and_emit(
+                    &mut stream,
+                    tx.clone(),
+                    ids,
+                    n_predict,
+                    stream_mode,
+                    true,
+                    vec![STOP_EOT],
+                    parse_sampler(&req.body),
+                );
             }
             ("POST", "/v1/messages") => {
                 let n_predict = jnum(&req.body, "max_tokens").unwrap_or(24.0).max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
                 let text = chat_template(&jmessages_content(&req.body));
                 let ids = crate::engine::greedy_encode(&text);
-                run_and_emit_anthropic(&mut stream, tx.clone(), ids, n_predict, stream_mode, parse_sampler(&req.body));
+                run_and_emit_anthropic(
+                    &mut stream,
+                    tx.clone(),
+                    ids,
+                    n_predict,
+                    stream_mode,
+                    parse_sampler(&req.body),
+                );
             }
-            _ => resp(&mut stream, 404, "application/json", "{\"error\":\"not found\"}"),
+            _ => resp(
+                &mut stream,
+                404,
+                "application/json",
+                "{\"error\":\"not found\"}",
+            ),
         }
     }
 }
 
 fn json_esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn run_and_emit(
@@ -336,9 +393,17 @@ fn run_and_emit(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4096);
     if ids.len() + n_predict + 8 >= ctx {
-        resp(stream, 400, "application/json", &format!(
-            "{{\"error\":\"context too small: prompt {} + n_predict {} >= ctx {}\"}}",
-            ids.len(), n_predict, ctx));
+        resp(
+            stream,
+            400,
+            "application/json",
+            &format!(
+                "{{\"error\":\"context too small: prompt {} + n_predict {} >= ctx {}\"}}",
+                ids.len(),
+                n_predict,
+                ctx
+            ),
+        );
         return;
     }
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
@@ -353,7 +418,12 @@ fn run_and_emit(
         out: otx,
     };
     if tx.try_send(job).is_err() {
-        resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
+        resp(
+            stream,
+            503,
+            "application/json",
+            "{\"error\":\"queue full\"}",
+        );
         return;
     }
     if !stream_mode {
@@ -369,7 +439,10 @@ fn run_and_emit(
             stream,
             200,
             "application/json",
-            &format!("{{\"tokens\":[{}],\"text\":\"{esc}\",\"object\":\"completion\"}}", arr.join(",")),
+            &format!(
+                "{{\"tokens\":[{}],\"text\":\"{esc}\",\"object\":\"completion\"}}",
+                arr.join(",")
+            ),
         );
         return;
     }
@@ -412,23 +485,38 @@ fn run_and_emit_anthropic(
         out: otx,
     };
     if tx.try_send(job).is_err() {
-        resp(stream, 503, "application/json", "{\"error\":\"queue full\"}");
+        resp(
+            stream,
+            503,
+            "application/json",
+            "{\"error\":\"queue full\"}",
+        );
         return;
     }
     if stream_mode {
         resp_sse_open(stream);
-        sse(stream, "message_start", "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}");
+        sse(
+            stream,
+            "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}",
+        );
         let mut det = crate::engine::Detok::new();
         for t in prx {
             let esc = json_esc(&det.push(t));
             sse(
                 stream,
                 "content_block_delta",
-                &format!("{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"),
+                &format!(
+                    "{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"
+                ),
             );
         }
         let _ = orx.recv();
-        sse(stream, "message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}");
+        sse(
+            stream,
+            "message_delta",
+            "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+        );
         sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         return;
     }
@@ -443,6 +531,8 @@ fn run_and_emit_anthropic(
         stream,
         200,
         "application/json",
-        &format!("{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"end_turn\"}}"),
+        &format!(
+            "{{\"id\":\"msg_llm170\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{esc}\"}}],\"stop_reason\":\"end_turn\"}}"
+        ),
     );
 }
