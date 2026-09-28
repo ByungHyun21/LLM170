@@ -396,20 +396,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         n_expert_stack: usize,
         k_sel: usize,
     ) -> Result<(), String> {
-        self.moe_gemm_impl(x, w, ids, out, n_expert_stack, k_sel, false)
-    }
-
-    /// plans/105 — gate/up packed f16 출력 판(드레인 mode=2).
-    fn frame_moe_gemm16(
-        &self,
-        x: u64,
-        w: &Weight,
-        ids: u64,
-        out: u64,
-        n_expert_stack: usize,
-        k_sel: usize,
-    ) -> Result<(), String> {
-        self.moe_gemm_impl(x, w, ids, out, n_expert_stack, k_sel, true)
+        self.moe_gemm_impl(x, w, ids, out, n_expert_stack, k_sel)
     }
 }
 
@@ -422,7 +409,6 @@ impl VkAcc {
         out: u64,
         n_expert_stack: usize,
         k_sel: usize,
-        h16: bool,
     ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let ne = n_expert_stack.max(1);
@@ -1240,17 +1226,7 @@ impl VkAcc {
                     _ => Slot::FnMoeTileQ5k,
                 }
             };
-            // plans/105(원장 72): h16 q51 → 변형 슬롯(인라인 분기는 코드젠
-            // 역행 — 죽은 분기도 레지스터/LDS 압박).
-            let slot = if h16 && slot == Slot::FnMoeTileQ51mmq {
-                self.f16bufs.lock().insert(out);
-                Slot::FnMoeTileQ51mmqH
-            } else {
-                if slot == Slot::FnMoeTileQ51mmq {
-                    self.f16bufs.lock().remove(&out);
-                }
-                slot
-            };
+
             let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             if let Some(b) = w0_override {
@@ -1364,7 +1340,6 @@ impl VkAcc {
                         m
                     }
                 } else {
-                    self.f16bufs.lock().remove(&out);
                     0u32
                 },
                 rows as u32,

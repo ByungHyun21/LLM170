@@ -15,7 +15,6 @@ use std::collections::HashMap;
 pub const GEMV_SPV: &[u8] = include_bytes!("../spv/gemv3.spv");
 pub const QUANT_SPV: &[u8] = include_bytes!("../spv/quant_q8.spv");
 const QUANT_S8_SPV: &[u8] = include_bytes!("../spv/quant_q8s.spv");
-const QUANT_F16IN_SPV: &[u8] = include_bytes!("../spv/quant_q8h.spv");
 pub const ARGMAX2_SPV: &[u8] = include_bytes!("../spv/argmax2.spv");
 pub const RMS_SPV: &[u8] = include_bytes!("../spv/rms.spv");
 pub const RMS_WIDE_SPV: &[u8] = include_bytes!("../spv/rms_wide.spv");
@@ -103,14 +102,6 @@ const FN_TILE_F32_W_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32_w.spv");
 const FN_TILE_F32_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32.spv");
 /// plans/95 P1 — 스키니 f32 타일(K-분할, 점유 붕괴 해소).
 const FN_TILE_F32S_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s.spv");
-/// plans/104 — f32s의 f16 packed 입력 변형(hc inject 결함 수리).
-const FN_TILE_F32S_H_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s_h.spv");
-/// plans/105 — silu_mul의 f16 입력 변형(mgu/mup f16 버스).
-const FN_SILU_H_SPV: &[u8] = include_bytes!("../spv/fn_silu_h.spv");
-/// plans/105 — moe_wsum의 f16 ys 변형(my f16 버스).
-const FN_MOE_WSUM_H_SPV: &[u8] = include_bytes!("../spv/fn_moe_wsum_h.spv");
-/// plans/105 — q51mmq의 f16 드레인 변형 슬롯(my f16 버스).
-const FN_MOE_TILE_Q51MMQ_H_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51mmq_h.spv");
 /// plans/105 P1 — 전문가-주 퍼시스턴트 K-분할 q4k 타일.
 const FN_MOE_TILE_Q4K_PKS_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_pks.spv");
 /// plans/105 P2 — llama.cpp mul_mmq(MUL_MAT_ID) 포트(BN64 워프타일).
@@ -260,10 +251,6 @@ pub(crate) enum Slot {
     /// plans/99 테일 — LDS 협동 스테이징 코얼레스드 quant.
     QuantS8,
     FnTileF32s,
-    FnTileF32sH,
-    FnSiluH,
-    FnMoeWsumH,
-    FnMoeTileQ51mmqH,
     FnMoeTileQ4kPks,
     FnMoeTileLlmmq,
     FnMoeTileLlmmqH16,
@@ -329,7 +316,6 @@ pub(crate) enum Slot {
     FnMoeTileQ4kCm8,
     FnMoeTileQ4kCm8b,
     TileQ8ks,
-    QuantF16in,
     FnKsred,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
@@ -387,7 +373,6 @@ pub struct VkAcc {
         std::collections::HashMap<u64, (vk::Buffer, usize)>,
         Vec<VkBuf>,
     )>,
-    f16bufs: Mutex<std::collections::HashSet<u64>>,
     gdn_ch_scratch: Mutex<(
         Option<VkBuf>,
         Option<VkBuf>,
@@ -564,7 +549,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnArgmaxRows, "argmax_rows", FN_ARGMAX_ROWS_SPV, 3, 12),
     (Slot::Quant, "quant", QUANT_SPV, 2, 12),
     (Slot::QuantS8, "quant_s8", QUANT_S8_SPV, 2, 12),
-    (Slot::QuantF16in, "quant_f16in", QUANT_F16IN_SPV, 2, 12),
     (Slot::Silu, "silu_mul", SILU_SPV, 3, 4),
     (Slot::SiluMulQ8, "silu_mul_q8", SILU_Q8_SPV, 3, 16),
     (Slot::Gemv8Q8B, "gemv8_q8b", GEMV8_Q8B_SPV, 10, 24),
@@ -594,16 +578,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
     (Slot::FnTileF32s, "tile_f32s", FN_TILE_F32S_SPV, 10, 20),
-    (Slot::FnTileF32sH, "tile_f32s_h", FN_TILE_F32S_H_SPV, 10, 20),
-    (Slot::FnSiluH, "silu_h", FN_SILU_H_SPV, 3, 4),
-    (Slot::FnMoeWsumH, "moe_wsum_h", FN_MOE_WSUM_H_SPV, 3, 16),
-    (
-        Slot::FnMoeTileQ51mmqH,
-        "moe_tile_q51mmq_h",
-        FN_MOE_TILE_Q51MMQ_H_SPV,
-        13,
-        28,
-    ),
     (
         Slot::FnMoeTileQ4kPks,
         "moe_tile_q4k_pks",
@@ -859,7 +833,7 @@ impl VkAcc {
             cm8_scratch: Mutex::new((None, None, None)),
             ks_scratch: Mutex::new(None),
             packbufs: Mutex::new((std::collections::HashMap::new(), Vec::new())),
-            f16bufs: Mutex::new(std::collections::HashSet::new()),
+
             gdn_ch_scratch: Mutex::new((None, None, None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
