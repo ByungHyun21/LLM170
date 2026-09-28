@@ -2931,3 +2931,20 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   세션이 (a) 매핑 판독 경로 전수 조사 → (b) frame_read/판독 헬퍼에
   펜스 대기 통합 → (c) 이중화 순서로 진행. [stepT](fa2a9e5)가 회수
   규모 측정기로 준비돼 있음(rec≈2ms/step).
+
+### (104) 회귀 수리 — flag::ne0 부재키 결함 + RESF16 승격 철회 (plans/107, 2026-09-28)
+
+- **발견 계기**: 종결 조건 감사 중 FN vulkan 토큰 게이트 FAIL — main
+  PASS·브랜치 FAIL. 고정 판정 스크립트 bisect → 7704d5a(env 캐시화)
+  → 스냅샷↔라이브 비교 계측으로 2단 범인 분리.
+- **결함 1(ne0)**: `is_some_and`는 키 부재 시 false — 계약
+  `unwrap_or(true)`(기본 ON) 위반. VK_FRAME·EMBQ8·DEPBAR·CM 등 기본
+  ON 게이트 전부가 스냅샷 경로에서 꺼짐. `is_none_or`로 수리.
+- **결함 2(RESF16)**: 승격 검증(원장 88)이 hip만 — FN **vulkan** f16
+  변형 슬롯에서 토큰 발산. 게이트를 깨는 정밀도 변경은 기본 불가
+  규칙에 따라 6개 발화점 전부 옵트인 환원. hip pp512 이득(+12.5%)은
+  백엔드 인지 Config 재승격 과제로 이관(원장 88 참조).
+- **교훈(원장 갱신)**: 캐시형 env 전환은 스냅샷↔라이브 동치 어서션을
+  preflight에 추가해야 계약 결함이 게이트 전에 잡힌다 — W10
+  charhash가 hip만 커버하는 간극도 동일(4게이트 확대로 보완).
+- 검증: FN vulkan·FN hip·27B hip·charhash 4게이트 PASS.
