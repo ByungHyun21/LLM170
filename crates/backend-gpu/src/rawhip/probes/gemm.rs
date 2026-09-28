@@ -120,7 +120,10 @@ pub fn mm_tile_bench() -> Result<String, String> {
                 llm170_gguf::GgmlType::Q5K => llm170_core::quant::dot_row_w4a8_q5k_lane(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q4K => llm170_core::quant::dot_row_w4a8_q4k_lane(row, n_in as u64, &q8s[ti]),
                 llm170_gguf::GgmlType::Q6K => llm170_core::quant::dot_row_w4a8_q6k_lane(row, n_in as u64, &q8s[ti]),
-                _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &q8s[ti]),
+                llm170_gguf::GgmlType::Iq4Xs => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &q8s[ti]),
+                other => {
+                    return Err(format!("mm-tile 미지원 타입 {other:?} — 미러 오계산 방지"));
+                }
             };
             if c.to_bits() != o[ti * n_out + oo].to_bits() {
                 mism += 1;

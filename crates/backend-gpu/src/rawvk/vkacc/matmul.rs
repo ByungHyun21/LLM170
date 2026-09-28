@@ -247,7 +247,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장(기본 ON).
                 // plans/103: res_hc 입력 f16은 별도 변형 슬롯(f32 쌍둥이 불변).
                 let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16) && w_reps > 1
-                    && std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false);
+                    && llm170_core::qwen4exp::frame::hcf16_enabled();
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
