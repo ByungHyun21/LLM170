@@ -112,11 +112,10 @@ impl Engine {
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
                 // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,
                 // 장문600 게이트 chunk128과 비트동일 검증)
-                let ch_sz = std::env::var("LLM170_CHUNK")
-                    .ok()
+                let ch_sz = llm170_diag::flag::val("LLM170_CHUNK")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(
-                        if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() {
+                        if rd.tile_big_chunk() && !llm170_diag::flag::on("LLM170_EXACT") {
                             512
                         } else {
                             64

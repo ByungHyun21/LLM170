@@ -26,7 +26,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -221,6 +221,7 @@ fn main() -> ExitCode {
 /// llm170 serve --model <file> [--port N] [--ctx N] [--slots N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
+    let mut queue: Option<usize> = None;
     let mut slots: Option<usize> = None;
     let mut spec_k = 0usize;
     let mut ctx = 4096usize;
@@ -240,6 +241,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             "--slots" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(s) => slots = Some(s.clamp(1, 16)),
                 None => return usage_err("--slots requires a number in 1..=16"),
+            },
+            "--queue" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(q) => queue = Some(q.max(1)),
+                None => return usage_err("--queue requires a number"),
             },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) => spec_k = k.min(8),
@@ -301,7 +306,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     } else {
         engine::BackendSel::Cpu
     };
-    match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots) {
+    match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
