@@ -999,12 +999,11 @@ impl VkCtx {
             let dep = deps;
             let forced_skip = self.nobar_next.replace(false);
             if batch && !forced_skip && self.opt_bar.replace(false) {
-                // plans/104: 기본 OFF(배리어 항상 — HEAD와 비트 동일). 옵트인
-                // =1. tile_f32s 헤드 스킵이 게이트를 깨뜨리는 원인 미해결
-                // (원장 104 P0b) — 해소 전 승격 불가.
+                // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
+                // +2%). 킬스위치 =0.
                 let elide_on = std::env::var("LLM170_VK_DEPBAR")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
                 let mut need = !elide_on || self.dep_unknown.get();
                 if let Some((rs, ws)) = dep {
                     let sr = self.since_r.borrow();
