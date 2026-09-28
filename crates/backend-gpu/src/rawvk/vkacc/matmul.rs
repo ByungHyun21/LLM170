@@ -912,6 +912,45 @@ impl VkAcc {
                                 // 행 y) — 커널이 tok_base=wg.x*BN·꼬리 nt 유도.
                                 // 종전 순차 t/128 디스패치의 슬래브별 전 가중
                                 // 재판독 폐지.
+                                // plans/105 P1: 스키니 coopmat K-분할판 — 원판
+                                // 타일 형상 유지 + z=K슬라이스(점유 치유).
+                                // 부분합 f32 → FnKsred 결정론 축소. 승격 전
+                                // 드리프트 게이트 전례 적용.
+                                if w.ty == GgmlType::Q8_0
+                                    && t >= 128
+                                    && !hout
+                                    && n_out <= std::env::var("LLM170_VK_Q8KS_MAX")
+                                        .ok().and_then(|v| v.parse::<usize>().ok())
+                                        // plans/105: 기본 512 — 0.28nat 드리프트
+                                        // (f32s 밴드)·skinny −19%·스킵 20스텝 불변.
+                                        // 킬스위치 =0.
+                                        .unwrap_or(512)
+                                {
+                                    let ks: u32 = 8;
+                                    let gys8 = (t as u32).div_ceil(128);
+                                    let need = ks as usize * t * n_out * 4;
+                                    let scr = {
+                                        let mut g = self.ks_scratch.lock();
+                                        if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+                                            g.as_ref().unwrap().buf
+                                        } else {
+                                            let b = ctx.alloc(need)?;
+                                            *g = Some(b);
+                                            g.as_ref().unwrap().buf
+                                        }
+                                    };
+                                    binds.push(scr);
+                                    let pk = self.pipeline(&mut ctx, Slot::TileQ8128Ks)?;
+                                    let dsk = ctx.bind_ds(&pk, &binds)?;
+                                    let pushk = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, ks]);
+                                    ctx.run_rw(pk.pl, dsk, pk.pipe, &pushk, gys8, gx, ks, &binds, &[scr])?;
+                                    let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
+                                    let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
+                                    let n_tot = (t * n_out) as u32;
+                                    let pushr = push_u32s(&[n_tot, ks]);
+                                    ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                                    continue;
+                                }
                                 let gys = (t as u32).div_ceil(128);
                                 // plans/102: 스키니(n_out≤512) q8_0 → K-분할판.
                                 // 점유 붕괴(WG 20개·6GB/s) 치유 — z=K슬라이스.
