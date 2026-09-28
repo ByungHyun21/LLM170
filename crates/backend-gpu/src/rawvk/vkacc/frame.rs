@@ -182,7 +182,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         let p = self.pipeline(&mut ctx, Slot::MoeGatherRows)?;
         let ds2 = ctx.bind_ds(&p, &[sb, db])?;
         let push = push_u32s(&[n as u32, k_sel as u32, t as u32]);
-        ctx.run(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(128), ((t * k_sel) as u32).div_ceil(4), 1)?;
+        ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(128), ((t * k_sel) as u32).div_ceil(4), 1, &[sb], &[db])?;
         Ok(())
     }
 
@@ -454,7 +454,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
                 // plans/93 sg2: 32행/WG 판은 전문가 패딩도 32배수여야 경계 정렬.
                     let padmul: u32 = if std::env::var("LLM170_VK_PAD32").map(|v| v == "1").unwrap_or(false) { 32 } else { 16 };
                     let push = push_u32s(&[ne as u32, rows as u32, bound as u32, padmul]);
-                ctx.run(pg.pl, dsg, pg.pipe, &push, 1, 1, 1)?;
+                ctx.run_rw(pg.pl, dsg, pg.pipe, &push, 1, 1, 1, &[idb], &[ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
                 {
                     let mut g = self.moe_grp.lock();
                     let gi = g.as_mut().unwrap();
@@ -740,7 +740,13 @@ impl llm170_core::matmul::FrameState for VkAcc {
             } else {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             };
-            ctx.run(p.pl, ds2, p.pipe, &push, gx, gy, 1)?;
+            let tile_out = if direct { ob } else { ygb };
+            let mut tile_rds: Vec<vk::Buffer> = binds[..8].to_vec();
+            tile_rds.push(xq);
+            tile_rds.push(rxb);
+            tile_rds.push(rpb);
+            tile_rds.push(ppb);
+            ctx.run_rw(p.pl, ds2, p.pipe, &push, gx, gy, 1, &tile_rds, &[tile_out])?;
             // plans/93: gate→up 독립 병렬화 — 이 타일이 gate이면 다음(up) 배리어 스킵.
             if self.moe_nobar.load(std::sync::atomic::Ordering::Relaxed) {
                 ctx.nobar_next.set(true);
@@ -754,7 +760,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
             let ps = self.pipeline(&mut ctx, Slot::PermuteF32)?;
             let dss = ctx.bind_ds(&ps, &[ygb, ivb, ob])?;
             let push = push_u32s(&[n_out as u32, rows as u32]);
-            ctx.run(ps.pl, dss, ps.pipe, &push, rows as u32, 1, 1)?;
+            ctx.run_rw(ps.pl, dss, ps.pipe, &push, rows as u32, 1, 1, &[ygb, ivb], &[ob])?;
             return Ok(());
         }
         // 1) ids 판독(호스트 그룹화) — direct-ids 가 걸러준 프리필 대량행만.
@@ -891,6 +897,16 @@ impl VkAcc {
         let mut g = self.xq_dev.lock();
         if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
             *g = Some(crate::rawvk::context::site::scope("xq_dev", || ctx.alloc(need.max(1 << 20)))?);
+        }
+        Ok(g.as_ref().unwrap().buf)
+    }
+
+    /// plans/104 — 격리 quant 버퍼(공유전문가 체인): xq_dev 와 독립 —
+    /// RW 추적이 라우팅 GEMM 창과의 합법 병행을 증명할 수 있다.
+    pub(super) fn xq2_dev_buf(&self, ctx: &mut VkCtx, need: usize) -> Result<vk::Buffer, String> {
+        let mut g = self.xq2_dev.lock();
+        if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
+            *g = Some(crate::rawvk::context::site::scope("xq2_dev", || ctx.alloc(need.max(1 << 20)))?);
         }
         Ok(g.as_ref().unwrap().buf)
     }

@@ -345,6 +345,8 @@ pub struct VkAcc {
     /// n_out배 증폭이라 GTT(host-visible)에서 3-4GB/s에 갇혔다 — L2 캐시가
     /// 동작하는 디바이스 메모리로 보낸다(값경로 xbuf 는 호스트 스테이징용 유지).
     xq_dev: Mutex<Option<VkBuf>>,
+    /// plans/104 — 격리 quant 버퍼(공유전문가): 라우팅 xq와 충돌 없는 병렬 체인.
+    xq2_dev: Mutex<Option<VkBuf>>,
     cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     ks_scratch: Mutex<Option<VkBuf>>,
     f16bufs: Mutex<std::collections::HashSet<u64>>,
@@ -603,6 +605,7 @@ impl VkAcc {
             xfbuf: Mutex::new(None),
             xbuf: Mutex::new(None),
             xq_dev: Mutex::new(None),
+            xq2_dev: Mutex::new(None),
             cm8_scratch: Mutex::new((None, None, None)),
             ks_scratch: Mutex::new(None),
             f16bufs: Mutex::new(std::collections::HashSet::new()),

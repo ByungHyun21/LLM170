@@ -2022,3 +2022,13 @@ Session peak now **+89%** over baseline.
 - 슬롯 기여: hc_combine −14.6ms · quant_f16in −6.9ms · rms_wide ±0
 - rms_wide 교훈: 대역폭 절반 효과 없음 — 256스레드 f64 체인 판은
   레이턴시/점유 바닥. 버스 f16의 수혜는 RMW(hc_combine)에 집중.
+
+### 2026-09-27 심야9 — 스케줄링 오버랩 캠페인(plans/104, 원장 61)
+
+- 진단: 공백 0·GPU 총 1182ms — 호스트 무결. MoE 654ms(q51 171GB/s 천장·
+  q4k 103GB/s 커널 열세)·tile_q8128 192.7ms(가중 3.8GB·집계 19.7GB/s —
+  점유/레이턴시 병목)·tile_f32s 77ms.
+- 무배리어 프로브: 스팬 −110ms·441.0 t/s(타이밍 전용, 파손 감수)
+- RW 정밀 배리어 옵트인(DEPBAR=1): 게이트 PASS·스팬 −24ms·**pp512
+  rep1 438.55 t/s** — 기본은 OFF(tile_f32s 스킵 발산 미해결)
+- 공유전문가 재배치+xq2 격리: DEPBAR=0에서도 PASS(산술 불변 확인)
