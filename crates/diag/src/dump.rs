@@ -23,6 +23,8 @@ pub struct DumpOpts {
     pub row0full: bool,
     pub bufhash: bool,
     pub moe: bool,
+    /// top2 — greedy 스텝 상위2 토큰·마진 덤프(근접타이 실증용, 107 W1).
+    pub top2: bool,
     /// alloc — GPU 버퍼 할당 원장(plans/86 §5).
     pub alloc: bool,
     /// vaddr — 할당 tsv(VA 범위) 증분 기록(plans/87 §1).
@@ -44,7 +46,11 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
     for key in v.split(',') {
         let key = key.trim();
         if let Some(tags) = key.strip_prefix("rows:") {
-            o.rows = tags.split(';').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            o.rows = tags
+                .split(';')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
         } else if key == "row0full" {
             o.row0full = true;
         } else if key == "bufhash" {
@@ -53,6 +59,8 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
             o.moe = true;
         } else if key == "checksum" {
             o.checksum = true;
+        } else if key == "top2" {
+            o.top2 = true;
         } else if key == "alloc" {
             o.alloc = true;
         } else if key == "vaddr" {

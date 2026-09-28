@@ -9,8 +9,8 @@
 //! 와치독이 켜졌을 때만 기록해 상시 비용을 없앤다).
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::alloc::HEARTBEAT;
@@ -35,7 +35,10 @@ pub fn record_op(tag: &'static str) {
     }
     let mut g = RING.lock().unwrap_or_else(|e| e.into_inner());
     let q = g.get_or_insert_with(VecDeque::new);
-    q.push_back(OpMark { tag, at: Instant::now() });
+    q.push_back(OpMark {
+        tag,
+        at: Instant::now(),
+    });
     while q.len() > 32 {
         q.pop_front();
     }
@@ -66,7 +69,9 @@ pub fn spawn(sec: u64, fail: bool) {
                 eprintln!(
                     "[watchdog] 스텔 {}s — 마지막 op: {}",
                     since.elapsed().as_secs(),
-                    ring.first().map(|m| m.tag).unwrap_or("(기록 없음 — 로드/CPU 단계)")
+                    ring.first()
+                        .map(|m| m.tag)
+                        .unwrap_or("(기록 없음 — 로드/CPU 단계)")
                 );
                 for (i, m) in ring.iter().enumerate() {
                     eprintln!(

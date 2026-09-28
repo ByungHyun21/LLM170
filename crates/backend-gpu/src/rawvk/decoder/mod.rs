@@ -137,7 +137,10 @@ struct I8W {
 
 /// ishs/faccs 워크그룹 상한 — 전 i8w 텐서의 max(n_out/16).
 fn i8_wg_max(map: &HashMap<String, I8W>) -> usize {
-    map.values().map(|e| e.n_out.div_ceil(16)).max().unwrap_or(1)
+    map.values()
+        .map(|e| e.n_out.div_ceil(16))
+        .max()
+        .unwrap_or(1)
 }
 
 pub struct VkDecoder {
@@ -208,22 +211,22 @@ pub struct DecoderState {
     b_fup: VkBuf,
     b_fglu: VkBuf,
     b_fdown: VkBuf,
-    b_lg: VkBuf,  // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
-    b_ams: VkBuf, // argmax 스테이지1 스크래치 [2*256] u32
+    b_lg: VkBuf,   // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
+    b_ams: VkBuf,  // argmax 스테이지1 스크래치 [2*256] u32
     b_xf16: VkBuf, // f16-B 활성 [T_MAX*n] f16
     b_lg_t: VkBuf, // head 로짓 [T_MAX][n_vocab] — verify 전 행 (plans/20)
-    b_am: VkBuf,  // argmax 8바이트
+    b_am: VkBuf,   // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
     split_ctr: usize,
     // ── MTP (blk.64) — Phase A: 전부 t=1 검증 커널 재사용
     mtp_on: bool,
     n_vocab: usize,
-    m_e: VkBuf,     // [n] 토큰 임베딩 / rms 임시
-    m_cat: VkBuf,   // [2n] enorm‖hnorm
-    m_xq2: VkBuf,   // [2n] q8
-    m_cur: VkBuf,   // [n] MTP hidden
-    m_xq: VkBuf,    // [n] q8
-    m_h: VkBuf,     // [n] 호스트 h 업로드
+    m_e: VkBuf,   // [n] 토큰 임베딩 / rms 임시
+    m_cat: VkBuf, // [2n] enorm‖hnorm
+    m_xq2: VkBuf, // [2n] q8
+    m_cur: VkBuf, // [n] MTP hidden
+    m_xq: VkBuf,  // [n] q8
+    m_h: VkBuf,   // [n] 호스트 h 업로드
     m_kv_k: Vec<VkBuf>,
     m_kv_v: Vec<VkBuf>,
     // GDN/conv 스냅샷 (spec 부분수용 롤백) — 매핑 ptr 직접 복사
@@ -234,18 +237,18 @@ pub struct DecoderState {
     // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
     i8w: HashMap<String, I8W>,
     wsr: HashMap<String, VkBuf>, // v2 행 스케일
-    b8: VkBuf,   // [T_MAX][n_max] i8 활성 매트릭스
-    ydb: VkBuf,  // [T_MAX][n_sub_max] f32
-    qsb: VkBuf,  // [T_MAX][n_sub_max] i32
-    ishs: VkBuf, // [640][256] i32 — coopMatStore SSBO (workgroup별)
-    faccs: VkBuf, // [640][256] f32
+    b8: VkBuf,                   // [T_MAX][n_max] i8 활성 매트릭스
+    ydb: VkBuf,                  // [T_MAX][n_sub_max] f32
+    qsb: VkBuf,                  // [T_MAX][n_sub_max] i32
+    ishs: VkBuf,                 // [640][256] i32 — coopMatStore SSBO (workgroup별)
+    faccs: VkBuf,                // [640][256] f32
     // ── plans/91 P2 — MTP 프리필 배치 버퍼 (blk.64 t행 1패스, T_MAX 상한).
-    m_be: VkBuf,    // [T][n] 토큰 임베딩 선반입 / hnorm 임시
-    m_bcur: VkBuf,  // [T][n] MTP hidden
-    m_bhs: VkBuf,   // [T][n] h_shift (디바이스 조립)
-    m_bcat: VkBuf,  // [T][2n] enorm‖hnorm
-    m_bxq2: VkBuf,  // [T][xq(2n)]
-    m_bxqn: VkBuf,  // [T][xq(n)]
+    m_be: VkBuf,   // [T][n] 토큰 임베딩 선반입 / hnorm 임시
+    m_bcur: VkBuf, // [T][n] MTP hidden
+    m_bhs: VkBuf,  // [T][n] h_shift (디바이스 조립)
+    m_bcat: VkBuf, // [T][2n] enorm‖hnorm
+    m_bxq2: VkBuf, // [T][xq(2n)]
+    m_bxqn: VkBuf, // [T][xq(n)]
     m_prefetched: std::sync::atomic::AtomicBool,
     // ── plans/91 P0 — np 배치: 상태 주소 테이블([그룹][슬롯] u64, 생성 후
     // 불변)·행별 pos/slot 맵(스텝당 호스트 기입)·greedy 행별 argmax 스크래치.
@@ -253,10 +256,10 @@ pub struct DecoderState {
     np_gdn_tbl: VkBuf,
     np_kvk_tbl: VkBuf,
     np_kv_v_tbl: VkBuf,
-    np_pos: VkBuf,   // [n_seqs] u32 — 행 pos
-    np_slot: VkBuf,  // [n_seqs] u32 — 행→슬롯
-    b_amsc: VkBuf,   // [2*am_wg*T_MAX] u32 — 행별 argmax 스테이지1
-    b_amr: VkBuf,    // [T_MAX] u32 — 행별 argmax 결과
+    np_pos: VkBuf,  // [n_seqs] u32 — 행 pos
+    np_slot: VkBuf, // [n_seqs] u32 — 행→슬롯
+    b_amsc: VkBuf,  // [2*am_wg*T_MAX] u32 — 행별 argmax 스테이지1
+    b_amr: VkBuf,   // [T_MAX] u32 — 행별 argmax 결과
 }
 
 unsafe impl Send for DecoderState {}
@@ -277,7 +280,15 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         // (클론이 익명 RAM 17.5GB를 상주시켜 2프로세스 OOM의 직접 원인.)
         let wv: Vec<(&str, &[u8], u32, usize, usize)> = weights
             .iter()
-            .map(|(k, w)| (k.as_str(), w.data, w.ty as u32, w.n_in as usize, w.n_out as usize))
+            .map(|(k, w)| {
+                (
+                    k.as_str(),
+                    w.data,
+                    w.ty as u32,
+                    w.n_in as usize,
+                    w.n_out as usize,
+                )
+            })
             .collect();
         let cv: Vec<(String, Vec<f32>)> = consts.to_vec();
         let ds = DecoderState::new(ctx, wv, cv, hp, is_recr, n_seqs, ctx_len)?;
@@ -305,7 +316,9 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     /// 정확(tokens 불변 실측)하고 가중 판독이 1회로 줄어 빠름 — 512 승인.
     /// 구 패밀리 옵트아웃(MSALL=0) 시에는 64 유지.
     fn tile_big_chunk(&self) -> bool {
-        std::env::var("LLM170_TILE_MSALL").map(|v| v != "0").unwrap_or(true)
+        std::env::var("LLM170_TILE_MSALL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     }
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
@@ -316,7 +329,10 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         // 2026-09-05 디스크립터 세트 재사용 경합으로 판명, 수리 후 재발 없음;
         // 2026-09-08 judge VKD_BATCH+TILE 19/19 — plans/36 P1 종결).
         // LLM170_VKD_BATCH=0 킬스위치.
-        if std::env::var("LLM170_VKD_BATCH").map(|v| v == "0").unwrap_or(false) {
+        if std::env::var("LLM170_VKD_BATCH")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
             let mut last = None;
             for (ti, ch) in emb.chunks(n).enumerate() {
                 last = Some(ds.step(seq, pos0 + ti, ch)?);
@@ -328,7 +344,11 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
             let tw = std::time::Instant::now();
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);
             if std::env::var_os("LLM170_DBG_WALL").is_some() {
-                eprintln!("#  batch t={} wall={:.1}ms", ch.len() / n, tw.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "#  batch t={} wall={:.1}ms",
+                    ch.len() / n,
+                    tw.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
         Ok(last.unwrap_or_default())
@@ -363,7 +383,11 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let lg = ds.verify_rows(seq, pos0, emb, &mut Vec::new(), &mut h_all)?;
         let n = ds.n_embd;
         let t = emb.len() / n;
-        let h_last = if h_all.len() >= t * n { h_all[(t - 1) * n..].to_vec() } else { vec![0f32; n] };
+        let h_last = if h_all.len() >= t * n {
+            h_all[(t - 1) * n..].to_vec()
+        } else {
+            vec![0f32; n]
+        };
         Ok((lg, h_last))
     }
 
@@ -454,7 +478,13 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
             .mtp_step_g(seq, tok_emb, false, h, pos, true)?
             .ok_or("mtp head")?;
         let mut h_next = vec![0f32; ds.n_embd];
-        unsafe { std::ptr::copy_nonoverlapping(ds.m_cur.ptr as *const f32, h_next.as_mut_ptr(), ds.n_embd) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ds.m_cur.ptr as *const f32,
+                h_next.as_mut_ptr(),
+                ds.n_embd,
+            )
+        };
         Ok((am, h_next))
     }
 
@@ -493,7 +523,8 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
                 tok_flat.len().min(T_MAX * ds.n_embd),
             );
         }
-        ds.m_prefetched.store(true, std::sync::atomic::Ordering::SeqCst);
+        ds.m_prefetched
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -530,17 +561,26 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     /// per-seq GDN/conv 복원 (np×spec 부분수용).
     fn gdn_restore_seq(&self, seq: usize, _n_seqs: usize) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
-        guard.as_mut().ok_or("vkdecoder: 미초기화")?.restore_seq_states(seq)
+        guard
+            .as_mut()
+            .ok_or("vkdecoder: 미초기화")?
+            .restore_seq_states(seq)
     }
     /// GDN/conv 상태 스냅샷·복원 (spec 부분수용 롤백).
     fn gdn_snapshot(&self) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
-        guard.as_mut().ok_or("vkdecoder: 미초기화")?.snapshot_states()
+        guard
+            .as_mut()
+            .ok_or("vkdecoder: 미초기화")?
+            .snapshot_states()
     }
 
     fn gdn_restore(&self) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
-        guard.as_mut().ok_or("vkdecoder: 미초기화")?.restore_states()
+        guard
+            .as_mut()
+            .ok_or("vkdecoder: 미초기화")?
+            .restore_states()
     }
 
     /// 정규화 h → head GEMV → argmax (MTP draft).
@@ -548,7 +588,13 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
         let n = ds.n_embd;
-        unsafe { std::ptr::copy_nonoverlapping(h_normed.as_ptr(), ds.m_e.ptr as *mut f32, n.min(h_normed.len())) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                h_normed.as_ptr(),
+                ds.m_e.ptr as *mut f32,
+                n.min(h_normed.len()),
+            )
+        };
         ds.head_argmax()
     }
 }
@@ -567,8 +613,7 @@ impl VkDecoder {
     }
 }
 
-const T_MAX: usize = 512;   // plans/41: 단일 패스 프리필 (가중 1회 판독)
-
+const T_MAX: usize = 512; // plans/41: 단일 패스 프리필 (가중 1회 판독)
 
 fn n_group_len(hp: &llm170_core::qwen35::hparams::Hparams) -> usize {
     hp.n_group * hp.d_state
@@ -590,18 +635,35 @@ pub fn inject(eng: &mut llm170_core::qwen35::Engine) -> Result<(), String> {
     // 상수(8k=256MB) 업로드·상주 폐지.
     consts.retain(|(k, _)| k != "mask");
     let rd: std::sync::Arc<VkDecoder> = std::sync::Arc::new(VkDecoder::new());
-    rd.raw_init(&hp, &weights, &consts, eng.seqs.len(), eng.ctx_len(), is_recr)
-        .map_err(|e| format!("raw_init(vk): {e}"))?;
+    rd.raw_init(
+        &hp,
+        &weights,
+        &consts,
+        eng.seqs.len(),
+        eng.ctx_len(),
+        is_recr,
+    )
+    .map_err(|e| format!("raw_init(vk): {e}"))?;
     eng.raw_decode = Some(rd);
     // plans/40: 가중은 이제 VRAM에만 상주 — mmap 클린 페이지를 커널에 반납해
     // 호스트 RSS를 emb/소형 상수 수준으로. LLM170_VK_KEEPW=1이면 유지(CPU 디버그).
-    if std::env::var("LLM170_VK_KEEPW").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("LLM170_VK_KEEPW")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("[vk] 가중 mmap 페이지 유지 (LLM170_VK_KEEPW=1)");
     } else {
         let t0 = std::time::Instant::now();
-        let freed = eng.model.discard_weight_pages(&["token_embd.weight", "output.weight", "output_norm.weight"]);
+        let freed = eng.model.discard_weight_pages(&[
+            "token_embd.weight",
+            "output.weight",
+            "output_norm.weight",
+        ]);
         eprintln!("[vk] 반납 {:.2}GB", freed as f64 / (1 << 30) as f64);
-        eprintln!("[vk] 가중 mmap 페이지 반납 완료 ({:.1}s)", t0.elapsed().as_secs_f32());
+        eprintln!(
+            "[vk] 가중 mmap 페이지 반납 완료 ({:.1}s)",
+            t0.elapsed().as_secs_f32()
+        );
     }
     Ok(())
 }

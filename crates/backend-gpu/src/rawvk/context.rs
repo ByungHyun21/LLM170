@@ -2,8 +2,8 @@
 //! HIP과 병립: LLM170_GPU_RUNTIME=vulkan일 때만 사용.
 
 use ash::khr;
-use ash::vk::Handle;
 use ash::vk;
+use ash::vk::Handle;
 
 #[derive(Clone)]
 pub struct VkBuf {
@@ -72,7 +72,7 @@ pub struct VkCtx {
 /// 자동분할 귀속 왜곡 대체, llama perftools 대응 — plans/36).
 pub struct TsProf {
     pub pool: vk::QueryPool,
-    pub n: std::cell::Cell<usize>,          // 기록된 타임스탬프 수
+    pub n: std::cell::Cell<usize>, // 기록된 타임스탬프 수
     pub labels: std::cell::RefCell<Vec<String>>,
 }
 
@@ -119,8 +119,8 @@ impl VkCtx {
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::pipeline_robustness::NAME))
                 && std::env::var("LLM170_VK_NOROBUST").as_deref() != Ok("1")
-                // plans/87 §1 — OOB 접근이 실제 폴트로 터지게 하는 개발 스위치
-                // (기본 robustness는 클램프로 조용히 넘긴다 — 폴트 프로브용).
+            // plans/87 §1 — OOB 접근이 실제 폴트로 터지게 하는 개발 스위치
+            // (기본 robustness는 클램프로 조용히 넘긴다 — 폴트 프로브용).
             {
                 pipeline_robustness = true;
             }
@@ -166,15 +166,14 @@ impl VkCtx {
                 .shader_draw_parameters(true);
             // plans/87 §1 — 버퍼 VA 원장(폴트 매처). 쿼리 전용이지만 활성화가
             // RADV 할당 경로를 바꿀 수 있어 게이트 4종 재검증이 완료 판정.
-            let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
-                .buffer_device_address(true);
-            let mut coopfeat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
-                .cooperative_matrix(true);
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+            let mut coopfeat =
+                vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
             let mut feats = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut v11)
                 .push_next(&mut v12);
-            let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
-                .shader_integer_dot_product(true);
+            let mut v13 =
+                vk::PhysicalDeviceVulkan13Features::default().shader_integer_dot_product(true);
             let mut prfeat = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default()
                 .pipeline_robustness(true);
             if pipeline_robustness {
@@ -224,7 +223,12 @@ impl VkCtx {
                 )
                 .map_err(|e| format!("커맨드 풀: {e:?}"))?;
             let cbs = device
-                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2))
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(2),
+                )
                 .map_err(|e| format!("커맨드 버퍼: {e:?}"))?;
             let cmdbuf = cbs[0];
             let cmdbuf2 = cbs[1];
@@ -239,20 +243,19 @@ impl VkCtx {
             let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let ty = (0..mprops.memory_type_count as usize)
                 .find(|&i| {
-                    mprops.memory_types[i].property_flags
+                    mprops.memory_types[i]
+                        .property_flags
                         .contains(hv | vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 })
                 .or_else(|| {
-                    (0..mprops.memory_type_count as usize).find(|&i| {
-                        mprops.memory_types[i].property_flags.contains(hv)
-                    })
+                    (0..mprops.memory_type_count as usize)
+                        .find(|&i| mprops.memory_types[i].property_flags.contains(hv))
                 })
                 .ok_or("host-visible coherent 메모리 타입 없음")? as u32;
             let ty_host = (0..mprops.memory_type_count as usize)
                 .find(|&i| {
                     let f = mprops.memory_types[i].property_flags;
-                    f.contains(hv)
-                        && !f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    f.contains(hv) && !f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 })
                 .unwrap_or(ty as usize) as u32;
 
@@ -274,8 +277,8 @@ impl VkCtx {
                 max_ssbo: props.limits.max_storage_buffer_range as usize,
                 mem_ty: ty,
                 mem_ty_host: ty_host,
-            batching: std::sync::atomic::AtomicBool::new(false),
-            submits: std::cell::Cell::new(0),
+                batching: std::sync::atomic::AtomicBool::new(false),
+                submits: std::cell::Cell::new(0),
                 ds_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
                 batch_dsl: std::cell::Cell::new(None),
                 batch_pool: std::cell::Cell::new(None),
@@ -344,10 +347,7 @@ impl VkCtx {
                     .map_err(|e| format!("배치 풀: {e:?}"))?;
                 self.batch_pool.set(Some((dsl, pool)));
             }
-            let (_, pool) = self
-                .batch_pool
-                .get()
-                .ok_or("fresh_ds: 배치 풀 없음")?;
+            let (_, pool) = self.batch_pool.get().ok_or("fresh_ds: 배치 풀 없음")?;
             let sets = self
                 .device
                 .allocate_descriptor_sets(
@@ -369,7 +369,9 @@ impl VkCtx {
         }
         // plans/93: 녹화 완료 버퍼 재생(옵트인) — 첫 청크 이후 스킵.
         // 청크 간 파라미터 불변(FN 프리필: pos 무관 커널 99.6%).
-        if std::env::var("LLM170_VK_REPLAY").map(|v| v == "1").unwrap_or(false)
+        if std::env::var("LLM170_VK_REPLAY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
             && self.batch_recorded.get()
         {
             self.replay_mode.set(true);
@@ -382,20 +384,17 @@ impl VkCtx {
         }
         unsafe {
             self.device
-                .reset_command_buffer(
-                    self.cmdbuf2,
-                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
-                )
+                .reset_command_buffer(self.cmdbuf2, vk::CommandBufferResetFlags::RELEASE_RESOURCES)
                 .map_err(|e| format!("리셋2: {e:?}"))?;
             self.device
                 .begin_command_buffer(
                     self.cmdbuf2,
-                    &vk::CommandBufferBeginInfo::default()
-                        // plans/93: ONE_TIME_SUBMIT 제거 — 재생 모드에서 재제출 가능.
+                    &vk::CommandBufferBeginInfo::default(), // plans/93: ONE_TIME_SUBMIT 제거 — 재생 모드에서 재제출 가능.
                 )
                 .map_err(|e| format!("시작2: {e:?}"))?;
         }
-        self.batching.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.batching
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // plans/104 — 배치 간 프로브 상태 승계 방지.
         self.since_r.borrow_mut().clear();
         self.since_w.borrow_mut().clear();
@@ -407,16 +406,24 @@ impl VkCtx {
     /// 비배치 모드 플러시 — cmdbuf2 즉시 제출·대기 (NOBATCH 경로).
     pub fn flush2(&mut self) -> Result<(), String> {
         unsafe {
-            self.device.end_command_buffer(self.cmdbuf2).map_err(|e| format!("종료2: {e:?}"))?;
-            self.device.reset_fences(&[self.fence]).map_err(|e| format!("펜스: {e:?}"))?;
+            self.device
+                .end_command_buffer(self.cmdbuf2)
+                .map_err(|e| format!("종료2: {e:?}"))?;
+            self.device
+                .reset_fences(&[self.fence])
+                .map_err(|e| format!("펜스: {e:?}"))?;
             let cbs = [self.cmdbuf2];
             let si = vk::SubmitInfo::default().command_buffers(&cbs);
             let _sub0 = std::time::Instant::now();
-            self.device.queue_submit(self.queue, &[si], self.fence).map_err(|e| format!("제출2: {e:?}"))?;
+            self.device
+                .queue_submit(self.queue, &[si], self.fence)
+                .map_err(|e| format!("제출2: {e:?}"))?;
             SUBMIT_US.with(|c| c.set(c.get() + _sub0.elapsed().as_micros() as u64));
             let _wt0 = std::time::Instant::now();
             self.submits.set(self.submits.get() + 1);
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX).map_err(|e| format!("대기2: {e:?}"))?;
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| format!("대기2: {e:?}"))?;
             WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
             if let Some((_, pool)) = self.batch_pool.get() {
                 let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
@@ -461,7 +468,10 @@ impl VkCtx {
                 if n > 0 {
                     let wus = WAIT_US.with(|c| c.replace(0));
                     let sus = SUBMIT_US.with(|c| c.replace(0));
-                    eprintln!("[run-time] 녹화 {us}µs/{n}회={:.1}µs/회 제출={sus}µs 대기={wus}µs", us as f64 / n as f64);
+                    eprintln!(
+                        "[run-time] 녹화 {us}µs/{n}회={:.1}µs/회 제출={sus}µs 대기={wus}µs",
+                        us as f64 / n as f64
+                    );
                     c.set(0);
                     RUN_N.with(|c| c.set(0));
                 }
@@ -471,7 +481,8 @@ impl VkCtx {
             eprintln!("[flush] op={}", crate::rawvk::context::site::tag());
         }
         let replaying = self.replay_mode.get();
-        self.batching.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.batching
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             if !replaying {
                 self.device
@@ -479,7 +490,7 @@ impl VkCtx {
                     .map_err(|e| format!("종료2: {e:?}"))?;
                 self.batch_recorded.set(true);
             } else {
-                self.replay_mode.set(false);  // 재생 완료 → 다음 호출에서 재판정
+                self.replay_mode.set(false); // 재생 완료 → 다음 호출에서 재판정
             }
             self.device
                 .reset_fences(&[self.fence])
@@ -576,10 +587,14 @@ impl VkCtx {
                 .device
                 .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                 .map_err(|e| format!("맵: {e:?}"))? as *mut u8;
-            Ok(VkBuf { buf, ptr, bytes, mem })
+            Ok(VkBuf {
+                buf,
+                ptr,
+                bytes,
+                mem,
+            })
         }
     }
-
 
     /// 파이프라인 생성 (push constant + N개 SSBO).
     /// 스펙상수 지원 파이프라인 (부록87 — llama mul_mm 로드용).
@@ -590,7 +605,16 @@ impl VkCtx {
         n_buf: u32,
         push_bytes: u32,
         spec: &[u32],
-    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::PipelineLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+            vk::Pipeline,
+        ),
+        String,
+    > {
         self.pipeline_spec_fg(spv, n_buf, push_bytes, spec, false)
     }
 
@@ -602,7 +626,16 @@ impl VkCtx {
         push_bytes: u32,
         spec: &[u32],
         full_subgroups: bool,
-    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::PipelineLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+            vk::Pipeline,
+        ),
+        String,
+    > {
         unsafe {
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
                 .map(|i| {
@@ -663,7 +696,9 @@ impl VkCtx {
             if full_subgroups {
                 stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
             }
-            let pci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
+            let pci = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pl);
             let pipe = self
                 .device
                 .create_compute_pipelines(vk::PipelineCache::null(), &[pci], None)
@@ -700,7 +735,16 @@ impl VkCtx {
         spv: &[u8],
         n_buf: u32,
         push_bytes: u32,
-    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::PipelineLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+            vk::Pipeline,
+        ),
+        String,
+    > {
         unsafe {
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
                 .map(|i| {
@@ -748,7 +792,9 @@ impl VkCtx {
                 .name(c"main")
                 .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
                 .push_next(&mut ssc);
-            let pci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl);
+            let pci = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pl);
             let pipe = self
                 .device
                 .create_compute_pipelines(vk::PipelineCache::null(), &[pci], None)
@@ -784,7 +830,16 @@ impl VkCtx {
         spv: &[u8],
         n_buf: u32,
         push_bytes: u32,
-    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::DescriptorPool, vk::DescriptorSet, vk::Pipeline), String> {
+    ) -> Result<
+        (
+            vk::DescriptorSetLayout,
+            vk::PipelineLayout,
+            vk::DescriptorPool,
+            vk::DescriptorSet,
+            vk::Pipeline,
+        ),
+        String,
+    > {
         unsafe {
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
                 .map(|i| {
@@ -829,12 +884,14 @@ impl VkCtx {
                 .uniform_buffers(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
                 .vertex_inputs(vk::PipelineRobustnessBufferBehaviorEXT::DISABLED)
                 .images(vk::PipelineRobustnessImageBehaviorEXT::DISABLED);
-            let mut pci = vk::ComputePipelineCreateInfo::default().stage(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::COMPUTE)
-                    .module(sm)
-                    .name(c"main"),
-            ).layout(pl);
+            let mut pci = vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(sm)
+                        .name(c"main"),
+                )
+                .layout(pl);
             if nr {
                 pci = pci.push_next(&mut rci);
             }
@@ -972,7 +1029,8 @@ impl VkCtx {
                 self.cmdbuf
             };
             let _t0 = std::time::Instant::now();
-            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipe);
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipe);
             self.device.cmd_bind_descriptor_sets(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
@@ -982,13 +1040,8 @@ impl VkCtx {
                 &[],
             );
             if !push.is_empty() {
-                self.device.cmd_push_constants(
-                    cb,
-                    pl,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    push,
-                );
+                self.device
+                    .cmd_push_constants(cb, pl, vk::ShaderStageFlags::COMPUTE, 0, push);
             }
             // plans/104 — 배치 내 write→read 가시성 배리어. 판정은 머리에서:
             // 직전 디스패치 꼬리의 보류 배리어(opt_bar)를 현 디스패치의
@@ -1092,7 +1145,6 @@ impl VkCtx {
         }
     }
 
-
     /// plans/87 §1 — 버퍼 디바이스 주소(폴트 매처 원장용).
     pub fn buffer_va(&self, b: vk::Buffer) -> u64 {
         let ai = vk::BufferDeviceAddressInfo::default().buffer(b);
@@ -1105,7 +1157,8 @@ impl VkCtx {
             let i = ts.n.get();
             if i + 2 <= TS_CAP as usize {
                 unsafe {
-                    self.device.cmd_write_timestamp(cb, stage, ts.pool, i as u32);
+                    self.device
+                        .cmd_write_timestamp(cb, stage, ts.pool, i as u32);
                 }
                 ts.n.set(i + 1);
             }
@@ -1134,7 +1187,8 @@ impl VkCtx {
         } else {
             let labels = ts.labels.borrow();
             let per = self.ts_period_val;
-            let mut agg: std::collections::HashMap<&str, (f64, usize, f64)> = std::collections::HashMap::new();
+            let mut agg: std::collections::HashMap<&str, (f64, usize, f64)> =
+                std::collections::HashMap::new();
             let mut tot = 0.0f64;
             for (k, lbl) in labels.iter().enumerate() {
                 let a = 2 * k;
@@ -1186,11 +1240,21 @@ impl VkCtx {
                 LAST_LBL.with(|l| l.take());
             });
             {
-                let mut gv: Vec<_> = GAP_BY.with(|m| m.borrow().iter().map(|(k2, v2)| (k2.clone(), *v2)).collect());
-                gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+                let mut gv: Vec<_> = GAP_BY.with(|m| {
+                    m.borrow()
+                        .iter()
+                        .map(|(k2, v2)| (k2.clone(), *v2))
+                        .collect()
+                });
+                gv.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
                 for (k2, (e2, c2)) in gv.iter().take(8) {
                     if *e2 > 0.5 {
-                        eprintln!("[ts] 공백↑ {:30} {e2:9.1}ms ({}회, {:.3}ms/회)", k2, c2, e2 / *c2 as f64);
+                        eprintln!(
+                            "[ts] 공백↑ {:30} {e2:9.1}ms ({}회, {:.3}ms/회)",
+                            k2,
+                            c2,
+                            e2 / *c2 as f64
+                        );
                     }
                 }
                 GAP_BY.with(|m| m.borrow_mut().clear());
@@ -1199,23 +1263,30 @@ impl VkCtx {
             // 있었다 — 스팬(첫~끝 스탬프)을 병기해 집계/페어링 결함을 즉시 드러낸다.
             let span_ms = if n >= 2 {
                 (buf[n - 1].saturating_sub(buf[0])) as f64 * per / 1e6
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             let ns = self.submits.get();
-            eprintln!("[ts] GPU 총 {tot:.1}ms · 스팬 {span_ms:.1}ms (디스패치 {}, 제출 {ns})", labels.len());
+            eprintln!(
+                "[ts] GPU 총 {tot:.1}ms · 스팬 {span_ms:.1}ms (디스패치 {}, 제출 {ns})",
+                labels.len()
+            );
             self.submits.set(0);
             let mut v: Vec<_> = agg.into_iter().collect();
-            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
             for (k, (e, c, mx)) in v.iter().take(24) {
-                eprintln!("[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회, max {mx:6.3}ms)", k, e / *c as f64);
+                eprintln!(
+                    "[ts] {:34} {e:9.2}ms ({c}회, {:6.3}ms/회, max {mx:6.3}ms)",
+                    k,
+                    e / *c as f64
+                );
             }
         }
         ts.n.set(0);
         ts.labels.borrow_mut().clear();
         // 107 P0-5: 스탬프는 TS_CAP(262144)까지 기록되는데 리셋이 8192
         // 고정이면 초과분이 스테일 잔존한다 — 실제 기록량 n 전체를 리셋.
-        unsafe {
-            self.device.reset_query_pool(ts.pool, 0, n as u32)
-        };
+        unsafe { self.device.reset_query_pool(ts.pool, 0, n as u32) };
     }
 }
 impl Drop for VkCtx {
@@ -1243,7 +1314,13 @@ impl VkCtx {
     /// pipeline()의 튜플을 슬롯 구조체로 랩.
     pub fn pipeline_pipes(&self, spv: &[u8], n_buf: u32, push_bytes: u32) -> Result<Pipes, String> {
         let (dsl, pl, dp, ds, pipe) = self.pipeline(spv, n_buf, push_bytes)?;
-        Ok(Pipes { pl, ds, pipe, dsl, pool: dp })
+        Ok(Pipes {
+            pl,
+            ds,
+            pipe,
+            dsl,
+            pool: dp,
+        })
     }
 
     /// 바인딩용 ds — 배치 모드는 fresh 세트 (세트 재사용 하저드:
@@ -1291,7 +1368,12 @@ impl VkCtx {
                     eprintln!("[dsc] miss #{} cache {}", n, self.ds_cache.borrow().len());
                 }
                 if (200..260).contains(&n) {
-                    eprintln!("[dsc{}] {} dsl={:x}", n, crate::rawvk::context::site::tag(), p.dsl.as_raw());
+                    eprintln!(
+                        "[dsc{}] {} dsl={:x}",
+                        n,
+                        crate::rawvk::context::site::tag(),
+                        p.dsl.as_raw()
+                    );
                 }
             }
             self.batch_dsl.set(Some((p.dsl, p.pool)));
@@ -1333,7 +1415,6 @@ thread_local! {
     pub static WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static SUBMIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-
 
 /// plans/86 §5 — 할당 사이트 태그(스레드 로컬 스코프). diag 원장이
 /// 어느 서브시스템이 예산을 쓰는지 구분한다. 기본 "misc".

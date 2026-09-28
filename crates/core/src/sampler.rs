@@ -139,13 +139,18 @@ impl Sampler {
             .collect();
         // ③ top_k — 상위 k개
         if self.params.top_k > 0 && cand.len() > self.params.top_k {
-            cand.select_nth_unstable_by(self.params.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            cand.select_nth_unstable_by(self.params.top_k - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
             cand.truncate(self.params.top_k);
         }
         // 안정 softmax 순서를 위해 내림차순 정렬 (top_p/min_p 누적에 필요)
         cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let max = cand.first().map(|&(_, v)| v).unwrap_or(0.0);
-        let mut probs: Vec<f64> = cand.iter().map(|&(_, v)| ((v - max) as f64).exp()).collect();
+        let mut probs: Vec<f64> = cand
+            .iter()
+            .map(|&(_, v)| ((v - max) as f64).exp())
+            .collect();
         let sum: f64 = probs.iter().sum();
         if sum <= 0.0 || !sum.is_finite() {
             return cand.first().map(|&(i, _)| i).unwrap_or(0);
@@ -228,7 +233,12 @@ mod tests {
 
     #[test]
     fn seed_reproducibility() {
-        let p = SamplerParams { temperature: 1.5, top_p: 0.9, seed: 42, ..Default::default() };
+        let p = SamplerParams {
+            temperature: 1.5,
+            top_p: 0.9,
+            seed: 42,
+            ..Default::default()
+        };
         let l = logits(&[1.0, 2.0, 0.5, 1.7, 0.9]);
         let mut a = Sampler::new(p.clone());
         let mut b = Sampler::new(p);
@@ -236,27 +246,44 @@ mod tests {
         let sb: Vec<u32> = (0..32).map(|_| b.sample(&l)).collect();
         assert_eq!(sa, sb);
         // 다른 시드는 (실질적으로 확률 1로) 다른 스트림
-        let mut c = Sampler::new(SamplerParams { temperature: 1.5, seed: 7, ..Default::default() });
+        let mut c = Sampler::new(SamplerParams {
+            temperature: 1.5,
+            seed: 7,
+            ..Default::default()
+        });
         let sc: Vec<u32> = (0..32).map(|_| c.sample(&l)).collect();
         assert_ne!(sa, sc);
     }
 
     #[test]
     fn temp_zero_converges_argmax() {
-        let mut s = Sampler::new(SamplerParams { temperature: 0.0, seed: 1, ..Default::default() });
+        let mut s = Sampler::new(SamplerParams {
+            temperature: 0.0,
+            seed: 1,
+            ..Default::default()
+        });
         // 온도 0 = greedy — top_p 등 나머지 기본 off
         assert_eq!(s.sample(&logits(&[0.1, 9.0, 2.0])), 1);
     }
 
     #[test]
     fn top_k_one_is_argmax() {
-        let mut s = Sampler::new(SamplerParams { temperature: 1.0, top_k: 1, seed: 3, ..Default::default() });
+        let mut s = Sampler::new(SamplerParams {
+            temperature: 1.0,
+            top_k: 1,
+            seed: 3,
+            ..Default::default()
+        });
         assert_eq!(s.sample(&logits(&[0.1, 9.0, 2.0])), 1);
     }
 
     #[test]
     fn repeat_penalty_suppresses_recent() {
-        let p = SamplerParams { repeat_penalty: 1000.0, temperature: 0.0, ..Default::default() };
+        let p = SamplerParams {
+            repeat_penalty: 1000.0,
+            temperature: 0.0,
+            ..Default::default()
+        };
         // 온도 0이라 greedy지만 패널티가 1번을 억누르면 2번이 승
         let mut s = Sampler::new(p);
         s.push_tokens([1u32]);
@@ -268,7 +295,12 @@ mod tests {
     #[test]
     fn top_p_truncates_tail() {
         // 압도적 1등 — top_p 0.5면 사실상 1번만 생존
-        let mut s = Sampler::new(SamplerParams { temperature: 1.0, top_p: 0.5, seed: 5, ..Default::default() });
+        let mut s = Sampler::new(SamplerParams {
+            temperature: 1.0,
+            top_p: 0.5,
+            seed: 5,
+            ..Default::default()
+        });
         let l = logits(&[0.0, 20.0, 0.0]);
         assert_eq!(s.sample(&l), 1);
     }

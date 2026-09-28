@@ -24,7 +24,11 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     out.push_str(&format!("TOTAL {:.1}ms GAPS {:.1}ms\n", total_ms, gap_tot));
 
     let mut v: Vec<_> = sums.iter().collect();
-    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for ((n, g), (ms, cnt)) in v.iter().take(40) {
         out.push_str(&format!("{:30} gy={:<4} {:9.3}ms x{:4}\n", n, g, ms, cnt));
     }
@@ -41,7 +45,11 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     }
     out.push_str(&format!("LAUNCH GAPS total {:.1}ms\n", gap_tot));
     let mut gv: Vec<_> = gap_by.iter().collect();
-    gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    gv.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for (n, (ms, c)) in gv.iter().take(12) {
         out.push_str(&format!("  after {:26} {:8.1}ms x{:4}\n", n, ms, c));
     }
@@ -64,7 +72,6 @@ pub fn seq_dump(evs: &[Ev], max: usize) -> String {
     out
 }
 
-
 /// 통합 덤프 — 집계 테이블 + 갭 + (LLM170_KTRACE_SEQ=N 지정시) 순차 목록.
 /// 백엔드 어댑터(ktrace 등)의 단일 호출 프론트엔드.
 pub fn dump(evs: &[Ev], dropped: u64) -> String {
@@ -81,7 +88,14 @@ mod tests {
     use crate::trace::Ev;
 
     fn ev(name: &'static str, lane: u32, dur: f64, gap: Option<f64>) -> Ev {
-        Ev { name, lane, start_ms: 0.0, dur_ms: dur, gap_next_ms: gap, seq_ms: 0.0 }
+        Ev {
+            name,
+            lane,
+            start_ms: 0.0,
+            dur_ms: dur,
+            gap_next_ms: gap,
+            seq_ms: 0.0,
+        }
     }
 
     #[test]

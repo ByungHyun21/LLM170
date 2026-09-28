@@ -290,8 +290,7 @@ impl GgufFile {
                 });
             }
         }
-        if let (Some(no), Some(count)) =
-            (self.kv_u64("split.no"), self.kv_u64("split.count"))
+        if let (Some(no), Some(count)) = (self.kv_u64("split.no"), self.kv_u64("split.count"))
             && no >= count
         {
             return Err(GgufError::SplitNoOutOfBounds { no, count });

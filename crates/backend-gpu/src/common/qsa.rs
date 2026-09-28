@@ -17,7 +17,10 @@
 /// 워터마크 갱신 — 구멍이면 Err(호출부 폴백), 아니면 w = pos0 + t.
 pub fn wm_advance(w: &mut usize, pos0: usize, t: usize) -> Result<(), String> {
     if pos0 > *w {
-        return Err(format!("qsa 풀 워터마크 구멍 w={} pos0={pos0} — 업로드 경로로 폴백", w));
+        return Err(format!(
+            "qsa 풀 워터마크 구멍 w={} pos0={pos0} — 업로드 경로로 폴백",
+            w
+        ));
     }
     *w = pos0 + t;
     Ok(())

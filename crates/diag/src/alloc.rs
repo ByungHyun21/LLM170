@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
 
@@ -115,7 +115,8 @@ pub fn recycle(site: &'static str, bytes: usize) {
 /// 이 프로세스의 tsv 경로(vaddr 모드에서 만들어진 경우).
 pub fn tsv_path() -> Option<String> {
     let g = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().map(|_| format!("/tmp/llm170-alloc-{}.tsv", std::process::id()))
+    g.as_ref()
+        .map(|_| format!("/tmp/llm170-alloc-{}.tsv", std::process::id()))
 }
 
 /// 사이트별 요약 — 실패 경로 등에서 호출.
@@ -127,7 +128,11 @@ pub fn report() {
     let Some(l) = g.as_ref() else { return };
     let mut rows: Vec<(&&'static str, &(u64, u64, u64))> = l.sites.iter().collect();
     rows.sort_by_key(|(_, (_, b, _))| std::cmp::Reverse(*b));
-    eprintln!("[alloc] ─ 사이트별 누적 (총 {} ─ {})", format_bytes(l.total), l.sites.len());
+    eprintln!(
+        "[alloc] ─ 사이트별 누적 (총 {} ─ {})",
+        format_bytes(l.total),
+        l.sites.len()
+    );
     for (site, (cnt, sum, rec)) in rows {
         eprintln!(
             "[alloc]   {site:<14} n={cnt:<5} {:>10}  풀반납 {}",
@@ -156,7 +161,9 @@ pub fn report() {
 fn drm_counters() -> (u64, u64) {
     let read = |name: &str| -> u64 {
         let mut best = 0u64;
-        let Ok(rd) = std::fs::read_dir("/sys/class/drm") else { return 0 };
+        let Ok(rd) = std::fs::read_dir("/sys/class/drm") else {
+            return 0;
+        };
         for entry in rd.flatten() {
             let p = entry.path().join("device").join(name);
             if let Ok(s) = std::fs::read_to_string(&p)
@@ -172,7 +179,9 @@ fn drm_counters() -> (u64, u64) {
 
 fn l_total_gib() -> f64 {
     let g = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().map(|l| l.total as f64 / (1 << 30) as f64).unwrap_or(0.0)
+    g.as_ref()
+        .map(|l| l.total as f64 / (1 << 30) as f64)
+        .unwrap_or(0.0)
 }
 
 fn format_bytes(b: u64) -> String {

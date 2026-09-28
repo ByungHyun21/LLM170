@@ -159,7 +159,10 @@ impl Model4 {
             if pi > 0 {
                 // PLE 랜덤 GET_ROWS — 순차 스트리밍과 반대 어드바이스.
                 // 테이블이 이 파트에 있는지 확인해 Random 지정 (run.sh 원형).
-                let has_ple = g.tensors.iter().any(|t| t.name == "per_layer_token_embd.weight");
+                let has_ple = g
+                    .tensors
+                    .iter()
+                    .any(|t| t.name == "per_layer_token_embd.weight");
                 if has_ple {
                     // SAFETY: 어드바이스는 힌트 — 잘못돼도 안전
                     mmap.advise(Advice::Random).ok();
@@ -182,7 +185,12 @@ impl Model4 {
         }
         let vocab = parts
             .iter()
-            .find_map(|p| p.tensors.iter().find(|t| t.name == "token_embd.weight").map(|t| t.ne[1] as usize))
+            .find_map(|p| {
+                p.tensors
+                    .iter()
+                    .find(|t| t.name == "token_embd.weight")
+                    .map(|t| t.ne[1] as usize)
+            })
             .unwrap_or(0);
         let hp = Hparams4 { vocab, ..hp };
         let eos = hp.ple_eos;
@@ -231,8 +239,7 @@ impl Model4 {
         let ple_layers = s32("ple.layers").ok_or(Q4Error::BadMeta("ple.layers"))?;
         let ple_multipliers =
             u64a("ple.layer_multipliers").ok_or(Q4Error::BadMeta("layer_multipliers"))?;
-        let ple_head_offsets =
-            u64a("ple.head_offsets").ok_or(Q4Error::BadMeta("head_offsets"))?;
+        let ple_head_offsets = u64a("ple.head_offsets").ok_or(Q4Error::BadMeta("head_offsets"))?;
         let ple_head_vocab_sizes =
             u64a("ple.head_vocab_sizes").ok_or(Q4Error::BadMeta("head_vocab_sizes"))?;
         let sections = s32("rope.dimension_sections").unwrap_or([11, 11, 10, 0].to_vec());
@@ -263,20 +270,32 @@ impl Model4 {
             n_group: u("ssm.group_count").ok_or(Q4Error::BadMeta("group_count"))? as usize,
             conv_k: u("ssm.conv_kernel").ok_or(Q4Error::BadMeta("conv_kernel"))? as usize,
             n_expert: u("expert_count").ok_or(Q4Error::BadMeta("expert_count"))? as usize,
-            n_expert_used: u("expert_used_count").ok_or(Q4Error::BadMeta("expert_used_count"))? as usize,
-            n_ff_exp: u("expert_feed_forward_length").ok_or(Q4Error::BadMeta("expert_ffn"))? as usize,
-            n_ff_shared: u("expert_shared_feed_forward_length").ok_or(Q4Error::BadMeta("expert_shared_ffn"))? as usize,
+            n_expert_used: u("expert_used_count").ok_or(Q4Error::BadMeta("expert_used_count"))?
+                as usize,
+            n_ff_exp: u("expert_feed_forward_length").ok_or(Q4Error::BadMeta("expert_ffn"))?
+                as usize,
+            n_ff_shared: u("expert_shared_feed_forward_length")
+                .ok_or(Q4Error::BadMeta("expert_shared_ffn"))? as usize,
             hc: u("hyper_connection.count").ok_or(Q4Error::BadMeta("hc.count"))? as usize,
-            hc_low_rank: u("hyper_connection.low_rank").ok_or(Q4Error::BadMeta("hc.low_rank"))? as usize,
-            idx_heads: u("attention.indexer.head_count").ok_or(Q4Error::BadMeta("idx.heads"))? as usize,
+            hc_low_rank: u("hyper_connection.low_rank").ok_or(Q4Error::BadMeta("hc.low_rank"))?
+                as usize,
+            idx_heads: u("attention.indexer.head_count").ok_or(Q4Error::BadMeta("idx.heads"))?
+                as usize,
             idx_dim: u("attention.indexer.key_length").ok_or(Q4Error::BadMeta("idx.dim"))? as usize,
             idx_top_k: u("attention.indexer.top_k").ok_or(Q4Error::BadMeta("idx.top_k"))? as usize,
             compress: compress.into(),
-            ple_layers: ple_layers.iter().map(|&v| v as usize).collect::<Vec<_>>().into(),
+            ple_layers: ple_layers
+                .iter()
+                .map(|&v| v as usize)
+                .collect::<Vec<_>>()
+                .into(),
             ple_ngram: u("ple.ngram_size").ok_or(Q4Error::BadMeta("ngram_size"))? as usize,
-            ple_heads_per_ngram: u("ple.heads_per_ngram").ok_or(Q4Error::BadMeta("heads_per_ngram"))? as usize,
+            ple_heads_per_ngram: u("ple.heads_per_ngram")
+                .ok_or(Q4Error::BadMeta("heads_per_ngram"))?
+                as usize,
             ple_conv_k: u("ple.conv_kernel").ok_or(Q4Error::BadMeta("ple.conv"))? as usize,
-            ple_head_dim: u("embedding_length_per_layer_input").ok_or(Q4Error::BadMeta("per_layer_input"))? as usize,
+            ple_head_dim: u("embedding_length_per_layer_input")
+                .ok_or(Q4Error::BadMeta("per_layer_input"))? as usize,
             ple_multipliers: ple_multipliers.into(),
             ple_head_offsets: ple_head_offsets.into(),
             ple_head_vocab_sizes: ple_head_vocab_sizes.into(),
@@ -300,7 +319,8 @@ impl Model4 {
     }
 
     pub fn w4(&self, name: &str) -> Result<Weight<'_>, Q4Error> {
-        self.w(name).ok_or_else(|| Q4Error::MissingTensor(name.into()))
+        self.w(name)
+            .ok_or_else(|| Q4Error::MissingTensor(name.into()))
     }
 
     /// GPU 사전 적재용 파트 소스 — (mmap 베이스 주소, 길이, 파일 경로).
@@ -320,18 +340,25 @@ impl Model4 {
             return Ok(v.clone());
         }
         let v = self.w4(name)?.dequant_f32_vec();
-        self.f32_cache.borrow_mut().insert(name.to_string(), v.clone());
+        self.f32_cache
+            .borrow_mut()
+            .insert(name.to_string(), v.clone());
         Ok(v)
     }
 
     /// 전문가 스택 3D 텐서 [ff, n_embd, n_expert]의 전문가 e 슬라이스 뷰.
     pub fn expert_w(&self, name: &str, e: usize) -> Result<Weight<'_>, Q4Error> {
-        let (pi, ti) = *self.index.get(name).ok_or_else(|| Q4Error::MissingTensor(name.into()))?;
+        let (pi, ti) = *self
+            .index
+            .get(name)
+            .ok_or_else(|| Q4Error::MissingTensor(name.into()))?;
         let part = &self.parts[pi];
         let t = &part.tensors[ti];
         let (blck, bsize) = t.ty.block_info();
         let per_expert_bytes = (t.ne[0] / blck * bsize) as usize * t.ne[1] as usize;
-        let (start, _end) = t.file_range(part.data_offset).ok_or(Q4Error::BadMeta("expert range"))?;
+        let (start, _end) = t
+            .file_range(part.data_offset)
+            .ok_or(Q4Error::BadMeta("expert range"))?;
         let s = start as usize + e * per_expert_bytes;
         Ok(Weight {
             data: &part.mmap[s..s + per_expert_bytes],
@@ -354,7 +381,12 @@ impl Model4 {
     /// mmap은 엔진 수명과 일치 (스레드 조인을 decode1 시작부에서 보장).
     pub fn ple_table_view(&self) -> Result<(usize, usize, llm170_gguf::GgmlType, usize), Q4Error> {
         let table = self.w4("per_layer_token_embd.weight")?;
-        Ok((table.data.as_ptr() as usize, table.data.len(), table.ty, self.hp.ple_head_dim))
+        Ok((
+            table.data.as_ptr() as usize,
+            table.data.len(),
+            table.ty,
+            self.hp.ple_head_dim,
+        ))
     }
 
     /// 표면형 근사 디토크.
@@ -400,7 +432,8 @@ pub fn ple_gather_parts(
 mod tests {
     use super::*;
 
-    const MODEL: &str = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    const MODEL: &str =
+        "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
     /// 실측 모델 로더 계약: split 4파일 병합·hparams·PLE 행 gather·전문가 슬라이스.
     /// 파일 없으면 skip (real_models.rs 관례).
@@ -412,7 +445,10 @@ mod tests {
         }
         let m = Model4::load(std::path::Path::new(MODEL)).expect("load");
         let hp = &m.hp;
-        assert_eq!((hp.n_layer, hp.n_embd, hp.n_head, hp.n_kv, hp.head_dim), (48, 2560, 24, 2, 256));
+        assert_eq!(
+            (hp.n_layer, hp.n_embd, hp.n_head, hp.n_kv, hp.head_dim),
+            (48, 2560, 24, 2, 256)
+        );
         assert_eq!((hp.n_expert, hp.n_expert_used, hp.n_ff_exp), (512, 10, 640));
         assert_eq!((hp.hc, hp.hc_low_rank), (4, 320));
         assert_eq!((hp.idx_heads, hp.idx_dim, hp.idx_top_k), (4, 128, 2048));
@@ -429,15 +465,19 @@ mod tests {
         assert_eq!(ple.ty, llm170_gguf::GgmlType::Iq4Nl);
         // PLE gather: 행 3개 — 유한값·결정성
         let mut out = vec![0.0f32; 3 * hp.ple_head_dim];
-        m.ple_gather(&[0, 1, 1_000_000], &mut out).expect("ple_gather");
+        m.ple_gather(&[0, 1, 1_000_000], &mut out)
+            .expect("ple_gather");
         assert!(out.iter().all(|v| v.is_finite()));
         let mut out2 = out.clone();
-        m.ple_gather(&[0, 1, 1_000_000], &mut out2).expect("ple_gather");
+        m.ple_gather(&[0, 1, 1_000_000], &mut out2)
+            .expect("ple_gather");
         assert_eq!(out, out2, "gather 결정성");
         // 전문가 슬라이스: 형상 [640, 2560]
         let e0 = m.expert_w("blk.0.ffn_up_exps.weight", 0).expect("expert");
         assert_eq!((e0.n_in, e0.n_out), (2560, 640));
-        let e511 = m.expert_w("blk.0.ffn_up_exps.weight", 511).expect("expert 511");
+        let e511 = m
+            .expert_w("blk.0.ffn_up_exps.weight", 511)
+            .expect("expert 511");
         assert_eq!((e511.n_in, e511.n_out), (2560, 640));
     }
 }

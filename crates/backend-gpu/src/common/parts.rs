@@ -28,7 +28,12 @@ impl PartSource {
 ///
 /// # Safety
 /// `dst`는 `[len]` 바이트 유효 쓰기 영역(호스트 매핑)을 가리켜야 한다.
-pub unsafe fn pread_fill(file: &std::fs::File, dst: *mut u8, mut off: u64, len: usize) -> Result<(), String> {
+pub unsafe fn pread_fill(
+    file: &std::fs::File,
+    dst: *mut u8,
+    mut off: u64,
+    len: usize,
+) -> Result<(), String> {
     const CH: usize = 8 << 20;
     let mut done = 0usize;
     while done < len {

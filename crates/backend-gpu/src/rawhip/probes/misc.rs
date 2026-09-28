@@ -61,7 +61,12 @@ pub fn launch_rate(iters: usize) -> Result<String, String> {
     // 그리드 크기를 바꿔가며 — 프레임의 GEMM은 (64,2560)~164k 블록이다.
     // q4_scale은 j<n 가드가 있어 초과 블록은 즉시 반환한다(안전).
     let mut out = String::new();
-    for (gx, gy, gz) in [(1u32, 1u32, 1u32), (64, 2560, 1), (2048, 1, 1), (65535, 1, 1)] {
+    for (gx, gy, gz) in [
+        (1u32, 1u32, 1u32),
+        (64, 2560, 1),
+        (2048, 1, 1),
+        (65535, 1, 1),
+    ] {
         for _ in 0..32 {
             ctx.launch3("q4_scale", gx, gy, gz, 128, &mut args)?;
         }
@@ -94,13 +99,18 @@ pub fn iq3s_probe() -> Result<String, String> {
         for i in 0..110 {
             wbytes[b * 110 + i] = ((i * 37 + 11 + b * 13) % 251) as u8;
         }
-        if b % 3 == 1 { wbytes[b * 110 + 1] |= 0x80; } // 음수 d
+        if b % 3 == 1 {
+            wbytes[b * 110 + 1] |= 0x80;
+        } // 음수 d
     }
-    wbytes[0] = 0x38; wbytes[1] = 0x53;
+    wbytes[0] = 0x38;
+    wbytes[1] = 0x53;
     let w_d = ctx.alloc(110 * nblk)?;
     ctx.h2d(w_d, &wbytes)?;
     // x 양자화
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 17) as f32 - 8.0) * 0.25).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 17) as f32 - 8.0) * 0.25)
+        .collect();
     let xq = ctx.alloc((k / 4 + k / 32) * 4)?;
     let blocks = llm170_core::quant::quantize_row_q8_ref(&x);
     let mut xq_host: Vec<u32> = Vec::with_capacity(k / 4 + k / 32);
@@ -168,7 +178,10 @@ pub fn dp4a_test() -> Result<String, String> {
     ctx.sync()?;
     let mut r = [0i32; 8];
     ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), od)?;
-    Ok(format!("sdot8={} (3) udot8={} (5) sdot2={} (204) sdot4={} (204) neg={} (-4) lit_mix={} (-538) bc_mix={} (-538) bc_acc={} (462)", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]))
+    Ok(format!(
+        "sdot8={} (3) udot8={} (5) sdot2={} (204) sdot4={} (204) neg={} (-4) lit_mix={} (-538) bc_mix={} (-538) bc_acc={} (462)",
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+    ))
 }
 
 /// 대역폭 상한 프로브 — q5_K ffn_gate 형상 [5120→17408, 176B] 재현.
@@ -203,7 +216,12 @@ pub fn bw_test() -> Result<String, String> {
     let mut r = vec![0f64; 64];
     ctx.d2h(bytemuck::cast_slice_mut(&mut r).as_mut(), part)?;
     let _ = r[0];
-    Ok(format!("bw_probe: {:.1}us -> {:.0} GB/s (checksum={})", dt * 1e6, bytes as f64 / dt / 1e9, r[63] as u32))
+    Ok(format!(
+        "bw_probe: {:.1}us -> {:.0} GB/s (checksum={})",
+        dt * 1e6,
+        bytes as f64 / dt / 1e9,
+        r[63] as u32
+    ))
 }
 
 /// 가드용 최소 VRAM 조회 (2026-09-16) — 컨텍스트 없이 런타임 질의만.
@@ -223,7 +241,9 @@ pub fn device_report(ctx: &RawCtx) -> String {
     let name = unsafe {
         let mut buf = vec![0i8; 256];
         if hip::hipDeviceGetName(buf.as_mut_ptr(), 256, 0) == hip::hipError_t_hipSuccess {
-            std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(buf.as_ptr())
+                .to_string_lossy()
+                .into_owned()
         } else {
             "unknown".to_string()
         }
@@ -231,7 +251,11 @@ pub fn device_report(ctx: &RawCtx) -> String {
     let (free, total) = unsafe {
         let (mut f, mut t) = (0usize, 0usize);
         let e = hip::hipMemGetInfo(&mut f, &mut t);
-        if e == hip::hipError_t_hipSuccess { (f as u64, t as u64) } else { (0, 0) }
+        if e == hip::hipError_t_hipSuccess {
+            (f as u64, t as u64)
+        } else {
+            (0, 0)
+        }
     };
     // 호스트↔디바이스 왕복 64 MiB (pageable) — 오프로딩 비용 신호.
     let n = 64usize << 20;
@@ -264,13 +288,18 @@ pub(super) fn half_f32(bits: u16) -> f32 {
     let s = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((bits >> 10) & 0x1F) as i32 - 15;
     let m = (bits & 0x3FF) as f32;
-    if e == -15 { s * m * 2f32.powi(-24) } else { s * (1.0 + m / 1024.0) * 2f32.powi(e) }
+    if e == -15 {
+        s * m * 2f32.powi(-24)
+    } else {
+        s * (1.0 + m / 1024.0) * 2f32.powi(e)
+    }
 }
 
 /// 텐서 차원 출력 (디버그 보조)
 pub fn dims_of(path: &str, names: &[&str]) -> String {
     let g = match llm170_gguf::GgufFile::open(std::path::Path::new(path)) {
-        Ok(g) => g, Err(e) => return e.to_string(),
+        Ok(g) => g,
+        Err(e) => return e.to_string(),
     };
     let mut s = String::new();
     for n in names {
@@ -284,7 +313,8 @@ pub fn dims_of(path: &str, names: &[&str]) -> String {
 /// 진단: q6_K GEMV ↔ GPU 스칼라 기준 대조. 두 커널이 같은 가중 버퍼·같은 활성을
 /// 서로 다른 코드로 소비한다 — 커널 인덱싱 오류와 호스트 인자 문제를 분리한다.
 pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
-    let model = llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let model =
+        llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     let w = model.w(tname).ok_or("tensor 없음")?;
     if w.ty != llm170_gguf::GgmlType::Q6K {
         return Err(format!("q6k-ref: q6_K 전용 (ty={:?})", w.ty));
@@ -295,15 +325,25 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
     let wd = ctx.alloc(w.data.len())?;
     ctx.h2d(wd, w.data)?;
     let mut seed = 0x9e3779b9u64;
-    let mut lcg = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f32 / 2147483648.0 - 0.5 };
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
     // LLM170_Q6K_EK=k: y = e_k (단위 벡터) → out[o]가 곧 복호된 가중치 W[o][k]
     let x: Vec<f32> = if let Ok(spec) = std::env::var("LLM170_Q6K_EK") {
-        let ks: Vec<usize> = spec.split(',').filter_map(|v| v.trim().parse::<usize>().ok()).collect();
+        let ks: Vec<usize> = spec
+            .split(',')
+            .filter_map(|v| v.trim().parse::<usize>().ok())
+            .collect();
         if ks.is_empty() || ks.iter().any(|&k| k >= n_in) {
             return Err("LLM170_Q6K_EK: 인덱스 범위 밖".into());
         }
         let mut v = vec![0f32; n_in];
-        for &k in ks.iter() { v[k] = 1.0; }
+        for &k in ks.iter() {
+            v[k] = 1.0;
+        }
         v
     } else {
         (0..n_in).map(|_| lcg()).collect()
@@ -342,9 +382,12 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
         let mut no = n_out as i32;
         let mut xw = xq_w as i32;
         let mut args = vec![
-            &mut xp as *mut _ as *mut std::ffi::c_void, &mut wp as *mut _ as *mut std::ffi::c_void,
-            &mut pp as *mut _ as *mut std::ffi::c_void, &mut op as *mut _ as *mut std::ffi::c_void,
-            &mut ni as *mut _ as *mut std::ffi::c_void, &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
             &mut xw as *mut _ as *mut std::ffi::c_void,
         ];
         let gy = n_out.min(65535) as u32;
@@ -359,9 +402,11 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
         let mut ni = n_in as i32;
         let mut no = n_out as i32;
         let mut args = vec![
-            &mut yp as *mut _ as *mut std::ffi::c_void, &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut yp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
             &mut op as *mut _ as *mut std::ffi::c_void,
-            &mut ni as *mut _ as *mut std::ffi::c_void, &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
         ];
         let gx = (n_out as u32).div_ceil(64);
         ctx.launch("q6k_ref_scalar", gx, 1, 64, &mut args)?;
@@ -377,13 +422,15 @@ pub fn q6k_ref_probe(path: &str, tname: &str) -> Result<String, String> {
     for i in 0..n_out {
         let e = (va[i] - vb[i]).abs();
         let r = e / vb[i].abs().max(1e-6);
-        if r > 1e-3 { nbad += 1; }
+        if r > 1e-3 {
+            nbad += 1;
+        }
         max_abs = max_abs.max(e);
         max_rel = max_rel.max(r);
     }
     Ok(format!(
         "[q6k-ref] {tname} n_in={n_in} n_out={n_out}: 불일치 {nbad}/{n_out} max_abs={max_abs:.6} max_rel={max_rel:.3e}\n  엔진[0..4]={:?}\n  기준[0..4]={:?}",
-        &va[..4.min(n_out)], &vb[..4.min(n_out)]
+        &va[..4.min(n_out)],
+        &vb[..4.min(n_out)]
     ))
 }
-

@@ -201,9 +201,9 @@ impl GgmlType {
         }
         let blocks0 = ne[0] / blck;
         blocks0
-                .checked_mul(size)?
-                .checked_mul(ne[1])?
-                .checked_mul(ne[2])?
-                .checked_mul(ne[3])
+            .checked_mul(size)?
+            .checked_mul(ne[1])?
+            .checked_mul(ne[2])?
+            .checked_mul(ne[3])
     }
 }

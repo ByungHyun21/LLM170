@@ -433,7 +433,13 @@ pub struct Q8Block {
 /// 활성 행을 q8 블록으로 양자화 — ggml quantize_row_q8_ref 산술.
 pub fn quantize_row_q8_ref(x: &[f32]) -> Vec<Q8Block> {
     let blocks = x.len().div_ceil(32);
-    let mut out = vec![Q8Block { d: 0.0, qs: [0; 32] }; blocks];
+    let mut out = vec![
+        Q8Block {
+            d: 0.0,
+            qs: [0; 32]
+        };
+        blocks
+    ];
     for (b, o) in out.iter_mut().enumerate() {
         let s = &x[b * 32..(b * 32 + 32).min(x.len())];
         let mut amax = 0.0f32;
@@ -482,7 +488,11 @@ pub fn dot_q5_1_q8(w: &[u8], y: &[Q8Block]) -> f32 {
     let mut s1 = 0i64;
     for j in 0..32usize {
         let byte = w[8 + (j & 15)] as u32;
-        let lo4 = if j < 16 { byte & 0xF } else { (byte >> 4) & 0xF };
+        let lo4 = if j < 16 {
+            byte & 0xF
+        } else {
+            (byte >> 4) & 0xF
+        };
         let hi1 = (qh >> j) & 1;
         let yv = y_el(y, j);
         s_lo += yv * lo4 as i64;
@@ -507,8 +517,7 @@ pub fn dot_q4k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
         let (d2, mm2) = (d * sc2 as f32, min * m2 as f32);
         let mut isum1 = 0i64;
         let mut isum2 = 0i64;
-        
-        
+
         for l in 0..32 {
             let q = qs[it * 32 + l];
             isum1 += (q & 0xF) as i64 * y_el(y, it * 64 + l);
@@ -571,9 +580,12 @@ pub fn dot_q6k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
         for l in 0..32 {
             let is = h * 8 + l / 16;
             let q1 = (((ql[h * 64 + l] & 0xF) | (((qh[h * 32 + l]) & 3) << 4)) as i32 - 32) as i64;
-            let q2 = (((ql[h * 64 + l + 32] & 0xF) | (((qh[h * 32 + l] >> 2) & 3) << 4)) as i32 - 32) as i64;
-            let q3 = (((ql[h * 64 + l] >> 4) | (((qh[h * 32 + l] >> 4) & 3) << 4)) as i32 - 32) as i64;
-            let q4 = (((ql[h * 64 + l + 32] >> 4) | (((qh[h * 32 + l] >> 6) & 3) << 4)) as i32 - 32) as i64;
+            let q2 = (((ql[h * 64 + l + 32] & 0xF) | (((qh[h * 32 + l] >> 2) & 3) << 4)) as i32
+                - 32) as i64;
+            let q3 =
+                (((ql[h * 64 + l] >> 4) | (((qh[h * 32 + l] >> 4) & 3) << 4)) as i32 - 32) as i64;
+            let q4 = (((ql[h * 64 + l + 32] >> 4) | (((qh[h * 32 + l] >> 6) & 3) << 4)) as i32 - 32)
+                as i64;
             acc[is] += q1 * y_el(y, h * 128 + l);
             acc[is + 2] += q2 * y_el(y, h * 128 + 32 + l);
             acc[is + 4] += q3 * y_el(y, h * 128 + 64 + l);
@@ -619,7 +631,11 @@ pub fn dot_q3k_q8(w: &[u8], y: &[Q8Block]) -> f32 {
                 let mut isum = 0i64;
                 for l in 0..16 {
                     let qv = ((q[n * 32 + half * 16 + l] >> (2 * si)) & 3) as i64;
-                    let sub = if hm[half * 16 + l] & (1 << si) != 0 { 0i64 } else { 4i64 };
+                    let sub = if hm[half * 16 + l] & (1 << si) != 0 {
+                        0i64
+                    } else {
+                        4i64
+                    };
                     isum += (qv - sub) * y_el(y, n * 128 + si * 32 + half * 16 + l);
                 }
                 let yd = y[n * 4 + si].d;
@@ -724,8 +740,16 @@ pub fn dot_iq3s_q8(w: &[u8], y: &[Q8Block]) -> f32 {
                 let g2 = grid4(i2);
                 let mut isum = 0i64;
                 for j in 0..4 {
-                    let s1 = if signs[ib * 8 + sec * 4 + l] & KMASK_IQ2XS[j] != 0 { -1i64 } else { 1i64 };
-                    let s2 = if signs[ib * 8 + sec * 4 + l] & KMASK_IQ2XS[4 + j] != 0 { -1i64 } else { 1i64 };
+                    let s1 = if signs[ib * 8 + sec * 4 + l] & KMASK_IQ2XS[j] != 0 {
+                        -1i64
+                    } else {
+                        1i64
+                    };
+                    let s2 = if signs[ib * 8 + sec * 4 + l] & KMASK_IQ2XS[4 + j] != 0 {
+                        -1i64
+                    } else {
+                        1i64
+                    };
                     isum += g1[j] as i64 * s1 * y_el(y, yi + j);
                     isum += g2[j] as i64 * s2 * y_el(y, yi + 4 + j);
                 }
@@ -811,7 +835,11 @@ pub fn dot_row_w4a8_q3k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
             let mut isum = 0i64;
             for j in 0..16 {
                 let qv = ((wb[32 + n * 32 + half * 16 + j] >> (2 * si)) & 3) as i64;
-                let sub = if wb[half * 16 + j] & (1 << si) != 0 { 0i64 } else { 4i64 };
+                let sub = if wb[half * 16 + j] & (1 << si) != 0 {
+                    0i64
+                } else {
+                    4i64
+                };
                 isum += (qv - sub) * y_el(y, h * 16 + j);
             }
             let yd = y[h / 2].d;
@@ -847,7 +875,11 @@ pub fn dot_row_w4a8_q5k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
             let dm = f16(wb, 2);
             let (sc, m_) = scale_min_k4_local(wb, sb % 8);
             let (mut isum, mut qsum) = (0i64, 0i64);
-            let u = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
+            let u = if half == 0 {
+                1u8 << (2 * it)
+            } else {
+                2u8 << (2 * it)
+            };
             for j in 0..32 {
                 let nib = if half == 0 {
                     wb[48 + it * 32 + j] & 0xF
@@ -976,7 +1008,11 @@ pub fn dot_row_w4a8_q5_1_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
             let mut s1 = 0i64;
             for j in 0..32usize {
                 let byte = wb[8 + (j & 15)] as u32;
-                let lo4 = if j < 16 { byte & 0xF } else { (byte >> 4) & 0xF };
+                let lo4 = if j < 16 {
+                    byte & 0xF
+                } else {
+                    (byte >> 4) & 0xF
+                };
                 let hi1 = (qh >> j) & 1;
                 let yv = y_el(y, sb * 32 + j);
                 s_lo += yv * lo4 as i64;
@@ -1053,9 +1089,18 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
                 // 미러·f32 7× 발산 원인이었음.
                 let (nib, hi2) = match src {
                     0 => (wb[h * 64 + ll] & 0xF, (wb[128 + h * 32 + ll] & 3) as i64),
-                    1 => (wb[h * 64 + ll + 32] & 0xF, ((wb[128 + h * 32 + ll] >> 2) & 3) as i64),
-                    2 => (wb[h * 64 + ll] >> 4, ((wb[128 + h * 32 + ll] >> 4) & 3) as i64),
-                    _ => (wb[h * 64 + ll + 32] >> 4, ((wb[128 + h * 32 + ll] >> 6) & 3) as i64),
+                    1 => (
+                        wb[h * 64 + ll + 32] & 0xF,
+                        ((wb[128 + h * 32 + ll] >> 2) & 3) as i64,
+                    ),
+                    2 => (
+                        wb[h * 64 + ll] >> 4,
+                        ((wb[128 + h * 32 + ll] >> 4) & 3) as i64,
+                    ),
+                    _ => (
+                        wb[h * 64 + ll + 32] >> 4,
+                        ((wb[128 + h * 32 + ll] >> 6) & 3) as i64,
+                    ),
                 };
                 let elem = blk * 256 + h * 128 + src * 32 + p * 16 + jj;
                 isum += (((nib as i64) | (hi2 << 4)) - 32) * y_el(y, elem);
@@ -1068,7 +1113,6 @@ pub fn dot_row_w4a8_q6k_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64; 
     }
     lane
 }
-
 
 /// 64레인 환원 — warp 트리 순서 (GPU __shfl_down 16,8,4,2,1 ×2 + 상위 가산).
 /// 비트계약: 커널 환원과 동일 순서.
@@ -1126,8 +1170,8 @@ pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
                         * if sgb & KMASK_IQ2XS[4 + j] != 0 { -1 } else { 1 };
                     let e1 = e0 + j;
                     let e2 = e0 + 4 + j;
-                    isum += (w1 as i64) * y_el(y, sub * 32 + e1)
-                        + (w2 as i64) * y_el(y, sub * 32 + e2);
+                    isum +=
+                        (w1 as i64) * y_el(y, sub * 32 + e1) + (w2 as i64) * y_el(y, sub * 32 + e2);
                 }
             }
             let yd = y[sub].d;
@@ -1137,8 +1181,6 @@ pub fn dot_row_w4a8_iq3s_lane_parts(data: &[u8], k: u64, y: &[Q8Block]) -> [f64;
     }
     lane
 }
-
-
 
 /// MMQ 포트 미러(q5_K) — 파편 q가 서브블록 {sb : sb%4==q} (오름차순) f32
 /// 누산, 4파편 순차 결합 p0+p1+p2+p3 (gemm_q5k_mm와 쌍).
@@ -1153,11 +1195,19 @@ pub fn dot_row_w4a8_q5k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         let d = f16(wb, 0);
         let dm = f16(wb, 2);
         let (sc, m_) = scale_min_k4_local(wb, js);
-        let u = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
+        let u = if half == 0 {
+            1u8 << (2 * it)
+        } else {
+            2u8 << (2 * it)
+        };
         let mut isum = 0i64;
         let mut qsum = 0i64;
         for j in 0..32 {
-            let nib = if half == 0 { wb[48 + it * 32 + j] & 0xF } else { wb[48 + it * 32 + j] >> 4 };
+            let nib = if half == 0 {
+                wb[48 + it * 32 + j] & 0xF
+            } else {
+                wb[48 + it * 32 + j] >> 4
+            };
             let hi2 = if wb[16 + j] & u != 0 { 16i64 } else { 0i64 };
             let yv = y_el(y, sb * 32 + j);
             isum += (nib as i64 + hi2) * yv;
@@ -1185,7 +1235,11 @@ pub fn dot_row_w4a8_q4k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
         let mut isum = 0i64;
         let mut qsum = 0i64;
         for j in 0..32 {
-            let nib = if half == 0 { wb[16 + it * 32 + j] & 0xF } else { wb[16 + it * 32 + j] >> 4 };
+            let nib = if half == 0 {
+                wb[16 + it * 32 + j] & 0xF
+            } else {
+                wb[16 + it * 32 + j] >> 4
+            };
             let yv = y_el(y, sb * 32 + j);
             isum += nib as i64 * yv;
             qsum += yv;
@@ -1215,15 +1269,26 @@ pub fn dot_row_w4a8_q6k_mm(data: &[u8], k: u64, y: &[Q8Block]) -> f32 {
             let l2 = p2 * 16 + jj;
             let (nib, hi2) = match src {
                 0 => (wb[h * 64 + l2] & 0xF, (wb[128 + h * 32 + l2] & 3) as i64),
-                1 => (wb[h * 64 + l2 + 32] & 0xF, ((wb[128 + h * 32 + l2] >> 2) & 3) as i64),
-                2 => (wb[h * 64 + l2] >> 4, ((wb[128 + h * 32 + l2] >> 4) & 3) as i64),
-                _ => (wb[h * 64 + l2 + 32] >> 4, ((wb[128 + h * 32 + l2] >> 6) & 3) as i64),
+                1 => (
+                    wb[h * 64 + l2 + 32] & 0xF,
+                    ((wb[128 + h * 32 + l2] >> 2) & 3) as i64,
+                ),
+                2 => (
+                    wb[h * 64 + l2] >> 4,
+                    ((wb[128 + h * 32 + l2] >> 4) & 3) as i64,
+                ),
+                _ => (
+                    wb[h * 64 + l2 + 32] >> 4,
+                    ((wb[128 + h * 32 + l2] >> 6) & 3) as i64,
+                ),
             };
             let elem = blk * 256 + h * 128 + src * 32 + p2 * 16 + jj;
             // −32는 qsum 경로로 1회 (커널 wvs = nib|hi2<<4, isum -= 32·qst)
             isum += ((nib as i64) | (hi2 << 4)) * y_el(y, elem);
         }
-        let qsum: i64 = (0..16).map(|jj| y_el(y, blk * 256 + h * 128 + src * 32 + p2 * 16 + jj)).sum();
+        let qsum: i64 = (0..16)
+            .map(|jj| y_el(y, blk * 256 + h * 128 + src * 32 + p2 * 16 + jj))
+            .sum();
         isum -= 32 * qsum;
         let yd = y[blk * 8 + h * 4 + src].d;
         acc += yd * (d * sc as f32) * isum as f32;
@@ -1290,7 +1355,9 @@ mod w4a8_tests {
             blk[2] = 0x00;
             blk[3] = 0xB8;
         }
-        let x: Vec<f32> = (0..n).map(|_| ((lcg() >> 8) as f32 / (1u32 << 24) as f32) - 0.5).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|_| ((lcg() >> 8) as f32 / (1u32 << 24) as f32) - 0.5)
+            .collect();
         let y = quantize_row_q8_ref(&x);
         // 기준: f32 디퀀트 × q8 재구성 (측정 대상 산술만 남긴다)
         let mut wv = vec![0.0f32; n];
@@ -1323,9 +1390,14 @@ mod w4a8_tests {
         // 차이는 오직 (a) 블록별 정수그룹화 (b) q8 양자화 0 — 아니, f32 기준은
         // 원본 x와 y 재구성을 같이 쓴다: w_f32[i]·x[i] vs dot(q8(x)) — q8 오차 포함.
         let cases: Vec<(GgmlType, usize)> = vec![
-            (GgmlType::Q4K, 144), (GgmlType::Q5K, 176), (GgmlType::Q6K, 210),
-            (GgmlType::Q3K, 110), (GgmlType::Q8_0, 34), (GgmlType::Iq4Xs, 136),
-            (GgmlType::Iq4Nl, 18), (GgmlType::Iq3S, 110),
+            (GgmlType::Q4K, 144),
+            (GgmlType::Q5K, 176),
+            (GgmlType::Q6K, 210),
+            (GgmlType::Q3K, 110),
+            (GgmlType::Q8_0, 34),
+            (GgmlType::Iq4Xs, 136),
+            (GgmlType::Iq4Nl, 18),
+            (GgmlType::Iq3S, 110),
         ];
         for (ty, bsize) in cases {
             let blck = ty.blck_size() as usize;
@@ -1338,21 +1410,47 @@ mod w4a8_tests {
             for blk in bytes.chunks_mut(bsize) {
                 match ty {
                     GgmlType::Q4K | GgmlType::Q5K => {
-                        blk[0] = 0x30; blk[1] = 0x10; blk[2] = 0x28; blk[3] = 0x10;
+                        blk[0] = 0x30;
+                        blk[1] = 0x10;
+                        blk[2] = 0x28;
+                        blk[3] = 0x10;
                     }
-                    GgmlType::Q6K => { blk[208] = 0x50; blk[209] = 0x11; }
-                    GgmlType::Q3K => { blk[108] = 0x40; blk[109] = 0x11; }
-                    GgmlType::Q8_0 => { blk[0] = 0x50; blk[1] = 0x11; }
-                    GgmlType::Iq4Xs | GgmlType::Iq4Nl => { blk[0] = 0x50; blk[1] = 0x11; }
-                    GgmlType::Iq3S => { blk[0] = 0x50; blk[1] = 0x11; }
+                    GgmlType::Q6K => {
+                        blk[208] = 0x50;
+                        blk[209] = 0x11;
+                    }
+                    GgmlType::Q3K => {
+                        blk[108] = 0x40;
+                        blk[109] = 0x11;
+                    }
+                    GgmlType::Q8_0 => {
+                        blk[0] = 0x50;
+                        blk[1] = 0x11;
+                    }
+                    GgmlType::Iq4Xs | GgmlType::Iq4Nl => {
+                        blk[0] = 0x50;
+                        blk[1] = 0x11;
+                    }
+                    GgmlType::Iq3S => {
+                        blk[0] = 0x50;
+                        blk[1] = 0x11;
+                    }
                     _ => {}
                 }
             }
-            let x: Vec<f32> = (0..n).map(|_| (lcg() as f32 / 2147483648.0) - 0.5).collect();
+            let x: Vec<f32> = (0..n)
+                .map(|_| (lcg() as f32 / 2147483648.0) - 0.5)
+                .collect();
             let y = quantize_row_q8_ref(&x);
             let mut wf = vec![0.0f32; n];
             for b in 0..n / blck {
-                dequant_row(ty, &bytes[b * bsize..], 0, blck as u64, &mut wf[b * blck..(b + 1) * blck]);
+                dequant_row(
+                    ty,
+                    &bytes[b * bsize..],
+                    0,
+                    blck as u64,
+                    &mut wf[b * blck..(b + 1) * blck],
+                );
             }
             let f32_dot: f32 = x.iter().zip(wf.iter()).map(|(a, b)| a * b).sum();
             let w4a8 = dot_row_w4a8(ty, &bytes, n as u64, &y);

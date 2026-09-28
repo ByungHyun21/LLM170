@@ -3,14 +3,12 @@
 //! 정확성을 모델 적재 없이 검증한다. 산술 순서 차이를 감안해 상대 비교.
 
 use crate::rawvk::context::{Pipes, VkCtx};
-use crate::rawvk::decoder::{
-    QSA_FLASH_GQ_SPV, QSA_FLASH_SPV,
-};
+use crate::rawvk::decoder::{QSA_FLASH_GQ_SPV, QSA_FLASH_SPV};
 
-const T: usize = 208;    // 게이트 프롬프트 형상
+const T: usize = 208; // 게이트 프롬프트 형상
 const NH: usize = 24;
 const NK: usize = 4;
-const HD: usize = 256;  // 27B head_dim — 엔진 hparams 일치
+const HD: usize = 256; // 27B head_dim — 엔진 hparams 일치
 const POS0: usize = 0;
 const CTX: usize = 256;
 
@@ -37,8 +35,13 @@ pub fn flash_check() -> Result<String, String> {
         v = load("/tmp/gq_v.f32", (POS0 + T) * NK * HD);
         eprintln!("[flash-check] 파일 입력 모드 — 엔진 활성 덤프 사용");
     } else {
-        for i in 0..q.len() { q[i] = synth(i); }
-        for i in 0..k.len() { k[i] = synth(i + 77); v[i] = synth(i + 1_000_003); }
+        for i in 0..q.len() {
+            q[i] = synth(i);
+        }
+        for i in 0..k.len() {
+            k[i] = synth(i + 77);
+            v[i] = synth(i + 1_000_003);
+        }
     }
     let out_n = T * NH * HD;
     let mut o_old = vec![0f32; out_n];
@@ -55,9 +58,13 @@ pub fn flash_check() -> Result<String, String> {
     }
 
     let push_old: Vec<u8> = [POS0 as u32, NH as u32, NK as u32, HD as u32]
-        .iter().flat_map(|x| x.to_le_bytes()).collect();
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
     let push_new: Vec<u8> = [POS0 as u32, NH as u32, NK as u32, HD as u32, T as u32]
-        .iter().flat_map(|x| x.to_le_bytes()).collect();
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
     let binds = [bq.buf, bk.buf, bv.buf, bo.buf];
 
     // OLD — grid (t, nh)
@@ -71,7 +78,9 @@ pub fn flash_check() -> Result<String, String> {
     // NEW — grid (t, nk) [R=1 판]. o 버퍼를 패턴으로 덮어 쓴 뒤 실행해
     // 미기록 행이 OLD 결과로 남는 참사를 차단한다.
     let p_new: Pipes = ctx.pipeline_pipes(QSA_FLASH_GQ_SPV, 4, 20)?;
-    for x in o_new.iter_mut() { *x = 1e30; }
+    for x in o_new.iter_mut() {
+        *x = 1e30;
+    }
     unsafe { std::ptr::copy_nonoverlapping(o_new.as_ptr() as *const u8, bo.ptr, out_n * 4) };
     ctx.begin_batch()?;
     let ds = ctx.bind_ds(&p_new, &binds)?;
@@ -143,7 +152,9 @@ pub fn flash_check() -> Result<String, String> {
     );
     let tol = 5e-3;
     if md_old > tol {
-        out.push_str(&format!("FAIL: OLD 커널 자체가 참조와 불일치 ({md_old:.3e} > {tol})\n"));
+        out.push_str(&format!(
+            "FAIL: OLD 커널 자체가 참조와 불일치 ({md_old:.3e} > {tol})\n"
+        ));
         return Ok(out);
     }
     if md_new > tol {

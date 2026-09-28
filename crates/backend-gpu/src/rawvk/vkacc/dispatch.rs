@@ -27,7 +27,13 @@ impl VkAcc {
             let b = self.rbufs.lock();
             let (xv, wv, _) = b.as_ref().unwrap();
             for (ti, row) in xs.iter().enumerate() {
-                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xv.ptr.add(ti * n * 4) as *mut f32, n) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        xv.ptr.add(ti * n * 4) as *mut f32,
+                        n,
+                    )
+                };
             }
             unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wv.ptr as *mut f32, n) };
         }
@@ -64,7 +70,11 @@ impl VkAcc {
         let mut ctx = self.ctx.lock();
         {
             let mut b = self.sbufs.lock();
-            if !b.as_ref().map(|(g, _, _)| g.bytes >= total * 4).unwrap_or(false) {
+            if !b
+                .as_ref()
+                .map(|(g, _, _)| g.bytes >= total * 4)
+                .unwrap_or(false)
+            {
                 let g = ctx.alloc_host((total * 4).max(1 << 21))?;
                 let u = ctx.alloc_host((total * 4).max(1 << 21))?;
                 let o = ctx.alloc_host((total * 4).max(1 << 21))?;
@@ -75,10 +85,22 @@ impl VkAcc {
             let b = self.sbufs.lock();
             let (gv, uv, _) = b.as_ref().unwrap();
             for (ti, row) in gs.iter().enumerate() {
-                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), gv.ptr.add(ti * n * 4) as *mut f32, n) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        gv.ptr.add(ti * n * 4) as *mut f32,
+                        n,
+                    )
+                };
             }
             for (ti, row) in us.iter().enumerate() {
-                unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), uv.ptr.add(ti * n * 4) as *mut f32, n) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        uv.ptr.add(ti * n * 4) as *mut f32,
+                        n,
+                    )
+                };
             }
         }
         let (gb, ub, ob) = {
@@ -89,7 +111,15 @@ impl VkAcc {
         let p = self.pipeline(&mut ctx, Slot::Silu)?;
         let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
         let total_u = total as u32;
-        ctx.run(p.pl, ds2, p.pipe, &total_u.to_le_bytes(), total_u.div_ceil(256), 1, 1)?;
+        ctx.run(
+            p.pl,
+            ds2,
+            p.pipe,
+            &total_u.to_le_bytes(),
+            total_u.div_ceil(256),
+            1,
+            1,
+        )?;
         let host = {
             let b = self.sbufs.lock();
             unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, total) }
@@ -130,7 +160,9 @@ impl VkAcc {
                 *b = Some((xf, xq0, fg, fu, glu, xq1, ob));
             }
             let r = b.as_ref().unwrap();
-            (r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf, r.0.ptr, r.6.ptr)
+            (
+                r.0.buf, r.1.buf, r.2.buf, r.3.buf, r.4.buf, r.5.buf, r.6.buf, r.0.ptr, r.6.ptr,
+            )
         };
         // 배치 모드 — 6연산 단일 제출 (plans/19: sync ~0.9ms×5 절감)
         if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
@@ -138,14 +170,26 @@ impl VkAcc {
         }
         // 1) xs 업로드 → quant(n0)
         for (ti, row) in xs.iter().enumerate() {
-            unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0)
+            };
         }
         {
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[xbf, bq0])?;
             let push = push_u32s(&[n0 as u32, t as u32, xq0_w as u32]);
-            ctx.run(p.pl, ds2, p.pipe, &push, ((n0 / 32) + 63) as u32 / 64, t as u32, 1)?;
-            if std::env::var_os("LLM170_Q_TRACE").is_some() { eprintln!("[q:dispf] n0={n0} t={t}"); }
+            ctx.run(
+                p.pl,
+                ds2,
+                p.pipe,
+                &push,
+                ((n0 / 32) + 63) as u32 / 64,
+                t as u32,
+                1,
+            )?;
+            if std::env::var_os("LLM170_Q_TRACE").is_some() {
+                eprintln!("[q:dispf] n0={n0} t={t}");
+            }
         }
         // 2) gate/up GEMV (같은 xq0) — 상주 출력.
         // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로: gemv3 t-루프는
@@ -159,7 +203,15 @@ impl VkAcc {
             let p = self.pipeline(&mut ctx, Slot::Silu)?;
             let ds2 = ctx.bind_ds(&p, &[bfg, bfu, bglu])?;
             let total = (t * n_ff) as u32;
-            ctx.run(p.pl, ds2, p.pipe, &total.to_le_bytes(), total.div_ceil(256), 1, 1)?;
+            ctx.run(
+                p.pl,
+                ds2,
+                p.pipe,
+                &total.to_le_bytes(),
+                total.div_ceil(256),
+                1,
+                1,
+            )?;
         }
         // 4) glu quant(n_ff)
         {
@@ -168,8 +220,18 @@ impl VkAcc {
             let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[bglu, bq1])?;
             let push = push_u32s(&[n_ff as u32, t as u32, xq1_w as u32]);
-            ctx.run(p.pl, ds2, p.pipe, &push, ((n_ff / 32) + 63) as u32 / 64, t as u32, 1)?;
-            if std::env::var_os("LLM170_Q_TRACE").is_some() { eprintln!("[q:dispff] n_ff={n_ff} t={t}"); }
+            ctx.run(
+                p.pl,
+                ds2,
+                p.pipe,
+                &push,
+                ((n_ff / 32) + 63) as u32 / 64,
+                t as u32,
+                1,
+            )?;
+            if std::env::var_os("LLM170_Q_TRACE").is_some() {
+                eprintln!("[q:dispff] n_ff={n_ff} t={t}");
+            }
         }
         // 5) down GEMV
         {
@@ -201,8 +263,12 @@ impl VkAcc {
         let n_out = w.n_out as usize;
         let wbufs = self.weight_bufs(ctx, w)?;
         let use_tile = t >= 2
-            && std::env::var_os("LLM170_VK_FFNCH").map(|v| v != "0").unwrap_or(true)
-            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+            && std::env::var_os("LLM170_VK_FFNCH")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            && std::env::var("LLM170_VK_CM")
+                .map(|v| v != "0")
+                .unwrap_or(true)
             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
             && wbufs.len() == 1
             && vk_ty(w.ty).is_some();

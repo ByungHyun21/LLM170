@@ -2,8 +2,8 @@
 //! 산술은 core::clip (CPU) 미러 — 검증: 행별 최대오차.
 
 use crate::rawhip::RawCtx;
-use std::collections::HashMap;
 use crate::rawhip::env_on;
+use std::collections::HashMap;
 
 pub struct Vit {
     ctx: std::sync::Arc<RawCtx>,
@@ -16,14 +16,14 @@ pub struct Vit {
     /// 가중치 f32 행major — 이름 → (ptr, rows, ni)
     w: HashMap<String, (*mut u8, usize, usize)>,
     // 버퍼
-    b_x: *mut u8,      // [tmax][n_embd]
-    b_xn: *mut u8,     // [tmax][n_embd]
-    b_qkv: *mut u8,    // [tmax][3·n_embd]
-    b_attn: *mut u8,   // [tmax][n_embd]
-    b_proj: *mut u8,   // [tmax][n_embd]
-    b_mid: *mut u8,    // [tmax][n_ff]
-    b_yx: *mut u8,     // [tmax][2] i32
-    b_kvs: *mut u8,    // k/v 스테이징 [2][tmax][n_embd]
+    b_x: *mut u8,    // [tmax][n_embd]
+    b_xn: *mut u8,   // [tmax][n_embd]
+    b_qkv: *mut u8,  // [tmax][3·n_embd]
+    b_attn: *mut u8, // [tmax][n_embd]
+    b_proj: *mut u8, // [tmax][n_embd]
+    b_mid: *mut u8,  // [tmax][n_ff]
+    b_yx: *mut u8,   // [tmax][2] i32
+    b_kvs: *mut u8,  // k/v 스테이징 [2][tmax][n_embd]
     t_max: usize,
 }
 
@@ -51,7 +51,9 @@ impl Vit {
             ctx2.h2d(p, bytemuck::cast_slice(&data))?;
             w.insert(name, (p, rows, ni));
         }
-        let a = |n: usize| -> Result<*mut u8, String> { ctx2.alloc(n.max(1) * 4).map_err(|e| e.to_string()) };
+        let a = |n: usize| -> Result<*mut u8, String> {
+            ctx2.alloc(n.max(1) * 4).map_err(|e| e.to_string())
+        };
         Ok(Self {
             ctx,
             n_embd,
@@ -105,13 +107,19 @@ impl Vit {
         let mut no_a = n_out as i32;
         let mut tt = t as i32;
         let mut args = vec![
-            arg(&mut xp), arg(&mut wp), arg(&mut bp), arg(&mut op),
-            arg(&mut ni_a), arg(&mut no_a), arg(&mut tt),
+            arg(&mut xp),
+            arg(&mut wp),
+            arg(&mut bp),
+            arg(&mut op),
+            arg(&mut ni_a),
+            arg(&mut no_a),
+            arg(&mut tt),
         ];
         let gx = t.div_ceil(32) as u32;
         let gy = n_out.div_ceil(8) as u32;
         let gz = gy.div_ceil(65535);
-        self.ctx.launch3("gemm_f32t", gx, gy.min(65535), gz, 256, &mut args)
+        self.ctx
+            .launch3("gemm_f32t", gx, gy.min(65535), gz, 256, &mut args)
     }
 
     /// toks: merge-major [t][n_embd] (conv+pos+bias 적용된 입력), yx: [t][2].
@@ -140,8 +148,21 @@ impl Vit {
             let mut na = n as i32;
             let mut ss = n as i32;
             let mut tt = t as i32;
-            let mut args = vec![arg(&mut sp), arg(&mut dp), arg(&mut na), arg(&mut ss), arg(&mut tt)];
-            self.ctx.launch3("pack_strided", n.div_ceil(64) as u32, t as u32, 1, 64, &mut args)?;
+            let mut args = vec![
+                arg(&mut sp),
+                arg(&mut dp),
+                arg(&mut na),
+                arg(&mut ss),
+                arg(&mut tt),
+            ];
+            self.ctx.launch3(
+                "pack_strided",
+                n.div_ceil(64) as u32,
+                t as u32,
+                1,
+                64,
+                &mut args,
+            )?;
         }
         let tmark = std::time::Instant::now();
         let mut tlast = tmark;
@@ -160,11 +181,13 @@ impl Vit {
             if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut v = vec![0f32; t * n];
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_xn)?;
+                self.ctx
+                    .d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_xn)?;
                 let ssum: f64 = v.iter().map(|&x| x as f64).sum();
                 eprintln!("[vit] L0 ln1 sum={ssum:.4} x0={:.6} x1={:.6}", v[0], v[1]);
                 let mut q = vec![0f32; 8];
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
+                self.ctx
+                    .d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
                 eprintln!("[vit] L0 qkv q0..7={:?}", &q);
             }
             // rope q (offset 0) · k (offset n)
@@ -176,19 +199,29 @@ impl Vit {
                 let mut tt = t as i32;
                 let mut st = stride as i32;
                 let mut args = vec![
-                    arg(&mut qp), arg(&mut yxp), arg(&mut nh_a), arg(&mut dh_a), arg(&mut tt), arg(&mut st),
+                    arg(&mut qp),
+                    arg(&mut yxp),
+                    arg(&mut nh_a),
+                    arg(&mut dh_a),
+                    arg(&mut tt),
+                    arg(&mut st),
                 ];
-                self.ctx.launch3("vit_rope", t as u32, nh as u32, 1, 32, &mut args)?;
+                self.ctx
+                    .launch3("vit_rope", t as u32, nh as u32, 1, 32, &mut args)?;
             }
             if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut q = vec![0f32; 8];
                 let base = unsafe { self.b_qkv.add(0) };
                 let _ = base;
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
+                self.ctx
+                    .d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
                 eprintln!("[vit] L0 roped q0..7={:?}", &q);
                 let mut k = vec![0f32; 4];
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut k).as_mut(), unsafe { self.b_qkv.add(n * 4) })?;
+                self.ctx
+                    .d2h(bytemuck::cast_slice_mut(&mut k).as_mut(), unsafe {
+                        self.b_qkv.add(n * 4)
+                    })?;
                 eprintln!("[vit] L0 roped k0..3={:?}", &k);
             }
             if il == 1 && env_on("LLM170_VIT_TIME") {
@@ -217,18 +250,27 @@ impl Vit {
                 let mut dh_a = dh as i32;
                 let mut sc = 1.0f32 / (dh as f32).sqrt();
                 let mut args = vec![
-                    arg(&mut q2), arg(&mut k2), arg(&mut v2), arg(&mut o2),
-                    arg(&mut np_), arg(&mut nh_a), arg(&mut dh_a), arg(&mut sc),
+                    arg(&mut q2),
+                    arg(&mut k2),
+                    arg(&mut v2),
+                    arg(&mut o2),
+                    arg(&mut np_),
+                    arg(&mut nh_a),
+                    arg(&mut dh_a),
+                    arg(&mut sc),
                 ];
-                self.ctx.launch3("flash_vit", t as u32, nh as u32, 1, 256, &mut args)?;
+                self.ctx
+                    .launch3("flash_vit", t as u32, nh as u32, 1, 256, &mut args)?;
             }
             if il == 0 && env_on("LLM170_VIT_DBG") {
                 self.ctx.sync()?;
                 let mut a = vec![0f32; 8];
-                self.ctx.d2h(bytemuck::cast_slice_mut(&mut a).as_mut(), self.b_attn)?;
+                self.ctx
+                    .d2h(bytemuck::cast_slice_mut(&mut a).as_mut(), self.b_attn)?;
                 let asum: f64 = {
                     let mut v = vec![0f32; t * n];
-                    self.ctx.d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_attn)?;
+                    self.ctx
+                        .d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_attn)?;
                     v.iter().map(|&x| x as f64).sum()
                 };
                 eprintln!("[vit] L0 attn sum={asum:.4} a0..7={:?}", &a);
@@ -252,7 +294,13 @@ impl Vit {
                 let mut mp = self.b_mid as *mut std::ffi::c_void;
                 let mut na = (self.n_ff * t) as i32;
                 let mut args = vec![arg(&mut mp), arg(&mut na)];
-                self.ctx.launch("gelu_t", (self.n_ff * t).div_ceil(64) as u32, 1, 64, &mut args)?;
+                self.ctx.launch(
+                    "gelu_t",
+                    (self.n_ff * t).div_ceil(64) as u32,
+                    1,
+                    64,
+                    &mut args,
+                )?;
             }
             let (dw, drows, dni) = self.wt(&format!("v.blk.{il}.ffn_down.weight"))?;
             let db = self.wt(&format!("v.blk.{il}.ffn_down.bias"))?.0;
@@ -265,10 +313,14 @@ impl Vit {
         // post_ln → merger: [t/4][4n] pack → mm0 gelu → mm2
         self.ln(self.b_x, "v.post_ln", t)?;
         let n_out_tok = t / 4;
-        let merger_buf = self.ctx.alloc(n_out_tok * 4 * n * 4).map_err(|e| e.to_string())?;
+        let merger_buf = self
+            .ctx
+            .alloc(n_out_tok * 4 * n * 4)
+            .map_err(|e| e.to_string())?;
         // 2×2 pack (연속 4토큰 결합) — 호스트에서 하는 게 간단: d2h b_x → pack → h2d.
         let mut hx = vec![0f32; t * n];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut hx).as_mut(), self.b_x)?;
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut hx).as_mut(), self.b_x)?;
         let mut cat_rows = vec![0f32; n_out_tok * 4 * n];
         for m in 0..n_out_tok {
             for j in 0..4 {
@@ -278,7 +330,10 @@ impl Vit {
         }
         let _ = merger_buf;
         // mid: [t/4][4n] — b_proj(n) 부족, b_mid(n_ff=4304) 부족(4608>4304) → alloc
-        let mid_buf = self.ctx.alloc(n_out_tok * 4 * n * 4).map_err(|e| e.to_string())?;
+        let mid_buf = self
+            .ctx
+            .alloc(n_out_tok * 4 * n * 4)
+            .map_err(|e| e.to_string())?;
         self.ctx.h2d(mid_buf, bytemuck::cast_slice(&cat_rows))?;
         let (m0, m0rows, m0ni) = self.wt("mm.0.weight")?;
         let m0b = self.wt("mm.0.bias")?.0;
@@ -287,14 +342,24 @@ impl Vit {
             let mut mp = merger_buf as *mut std::ffi::c_void;
             let mut na = (n_out_tok * 4 * n) as i32;
             let mut args = vec![arg(&mut mp), arg(&mut na)];
-            self.ctx.launch("gelu_t", (n_out_tok * 4 * n).div_ceil(64) as u32, 1, 64, &mut args)?;
+            self.ctx.launch(
+                "gelu_t",
+                (n_out_tok * 4 * n).div_ceil(64) as u32,
+                1,
+                64,
+                &mut args,
+            )?;
         }
         let (m2, m2rows, m2ni) = self.wt("mm.2.weight")?;
         let m2b = self.wt("mm.2.bias")?.0;
-        let out_buf = self.ctx.alloc(n_out_tok * 5120 * 4).map_err(|e| e.to_string())?;
+        let out_buf = self
+            .ctx
+            .alloc(n_out_tok * 5120 * 4)
+            .map_err(|e| e.to_string())?;
         self.gemm(merger_buf, m2, m2b, m2ni, m2rows, out_buf, n_out_tok)?;
         let mut out = vec![0f32; n_out_tok * 5120];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), out_buf)?;
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut out).as_mut(), out_buf)?;
         Ok(out)
     }
 
@@ -308,8 +373,16 @@ impl Vit {
         let mut na = n as i32;
         let mut ep = self.eps;
         let mut tt = t as i32;
-        let mut args = vec![arg(&mut xp), arg(&mut w2), arg(&mut b2), arg(&mut na), arg(&mut ep), arg(&mut tt)];
-        self.ctx.launch3("layernorm_t", t as u32, 1, 1, 32, &mut args)
+        let mut args = vec![
+            arg(&mut xp),
+            arg(&mut w2),
+            arg(&mut b2),
+            arg(&mut na),
+            arg(&mut ep),
+            arg(&mut tt),
+        ];
+        self.ctx
+            .launch3("layernorm_t", t as u32, 1, 1, 32, &mut args)
     }
 
     fn axpy(&self, y: *mut u8, x: *mut u8, n: usize) -> Result<(), String> {
@@ -320,7 +393,8 @@ impl Vit {
         let mut args = vec![arg(&mut yp), arg(&mut xp), arg(&mut na)];
         // axpy_scaled(y, x, one, n) — one 버퍼는 DecodeState 것과 별도 필요 → 간단 커널 대신
         // gemm 없이: 전용 add 커널 사용
-        self.ctx.launch("add_f32", n.div_ceil(64) as u32, 1, 64, &mut args)
+        self.ctx
+            .launch("add_f32", n.div_ceil(64) as u32, 1, 64, &mut args)
     }
 
     /// src [t][src_stride]에서 [t][n] 팩.
@@ -339,8 +413,21 @@ impl Vit {
         let mut na = n as i32;
         let mut ss = src_stride as i32;
         let mut tt = t as i32;
-        let mut args = vec![arg(&mut sp), arg(&mut dp), arg(&mut na), arg(&mut ss), arg(&mut tt)];
-        self.ctx.launch3("pack_strided", n.div_ceil(64) as u32, t as u32, 1, 64, &mut args)
+        let mut args = vec![
+            arg(&mut sp),
+            arg(&mut dp),
+            arg(&mut na),
+            arg(&mut ss),
+            arg(&mut tt),
+        ];
+        self.ctx.launch3(
+            "pack_strided",
+            n.div_ceil(64) as u32,
+            t as u32,
+            1,
+            64,
+            &mut args,
+        )
     }
 }
 

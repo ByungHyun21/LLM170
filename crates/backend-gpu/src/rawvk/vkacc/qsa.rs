@@ -27,10 +27,30 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let mut m = self.qsa_pools.lock();
             let e = m.entry((full_idx, seq)).or_insert_with(|| {
                 (
-                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
-                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
-                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
-                    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() },
+                    VkBuf {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                        bytes: 0,
+                        mem: vk::DeviceMemory::null(),
+                    },
+                    VkBuf {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                        bytes: 0,
+                        mem: vk::DeviceMemory::null(),
+                    },
+                    VkBuf {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                        bytes: 0,
+                        mem: vk::DeviceMemory::null(),
+                    },
+                    VkBuf {
+                        buf: vk::Buffer::null(),
+                        ptr: std::ptr::null_mut(),
+                        bytes: 0,
+                        mem: vk::DeviceMemory::null(),
+                    },
                     0,
                 )
             });
@@ -57,9 +77,25 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let n_f = t * n_kv * hd;
         let soff = (pos0 * n_kv * hd) as u32;
         let ds_k = ctx.bind_ds(&p, &[ksrc, kb])?;
-        ctx.run(p.pl, ds_k, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        ctx.run(
+            p.pl,
+            ds_k,
+            p.pipe,
+            &push_u32s(&[n_f as u32, 0u32, soff]),
+            (n_f as u32).div_ceil(256),
+            1,
+            1,
+        )?;
         let ds_v = ctx.bind_ds(&p, &[vsrc, vb])?;
-        ctx.run(p.pl, ds_v, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        ctx.run(
+            p.pl,
+            ds_v,
+            p.pipe,
+            &push_u32s(&[n_f as u32, 0u32, soff]),
+            (n_f as u32).div_ceil(256),
+            1,
+            1,
+        )?;
         Ok((kb.as_raw(), vb.as_raw()))
     }
 
@@ -78,7 +114,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         eps: f32,
     ) -> Result<(), String> {
         if r == 0 || idx_dim != 128 {
-            return Err(format!("vk qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"));
+            return Err(format!(
+                "vk qsa_idx_append: 미지원 형상 r={r} idx_dim={idx_dim}"
+            ));
         }
         let ctx_len = self.qsa_ctx.load(std::sync::atomic::Ordering::Relaxed);
         if ctx_len == 0 {
@@ -120,7 +158,15 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let n_f = t * idx_dim;
         let soff = (pos0 * idx_dim) as u32;
         let ds = ctx.bind_ds(&p, &[iksrc, ikb])?;
-        ctx.run(p.pl, ds, p.pipe, &push_u32s(&[n_f as u32, 0u32, soff]), (n_f as u32).div_ceil(256), 1, 1)?;
+        ctx.run(
+            p.pl,
+            ds,
+            p.pipe,
+            &push_u32s(&[n_f as u32, 0u32, soff]),
+            (n_f as u32).div_ceil(256),
+            1,
+            1,
+        )?;
         let b0 = pos0 / r;
         let b1 = (pos0 + t) / r;
         if b1 > b0 {
@@ -132,11 +178,15 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let ikw_b = {
                 let mut g = self.qsa_ikw.lock();
                 if g.as_ref().is_none_or(|b| b.bytes < ikw.len() * 4) {
-                    *g = Some(crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host((ikw.len() * 4).max(4096)))?);
+                    *g = Some(crate::rawvk::context::site::scope("qsa_const", || {
+                        ctx.alloc_host((ikw.len() * 4).max(4096))
+                    })?);
                 }
                 g.as_ref().unwrap().clone()
             };
-            unsafe { std::ptr::copy_nonoverlapping(ikw.as_ptr(), ikw_b.ptr as *mut f32, ikw.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(ikw.as_ptr(), ikw_b.ptr as *mut f32, ikw.len())
+            };
             let p2 = self.pipeline(&mut ctx, Slot::FnIdxBk)?;
             let ds2 = ctx.bind_ds(&p2, &[ikb, bkb, ikw_b.buf, cs_b.buf])?;
             // plans/85 §2: 셰이더 PC는 선언순 {eps, b0, r, idx_dim} — 종전
@@ -185,7 +235,11 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(e.1.ptr as *const f32, kv_v.as_mut_ptr(), kv_v.len());
             std::ptr::copy_nonoverlapping(e.2.ptr as *const f32, idx_k.as_mut_ptr(), idx_k.len());
             let nb = pos.div_ceil(r);
-            std::ptr::copy_nonoverlapping(e.3.ptr as *const f32, bk.as_mut_ptr(), (nb * idx_dim).min(bk.len()));
+            std::ptr::copy_nonoverlapping(
+                e.3.ptr as *const f32,
+                bk.as_mut_ptr(),
+                (nb * idx_dim).min(bk.len()),
+            );
         }
         let _ = kv_row;
         Ok(())
@@ -251,21 +305,31 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                 }
             };
             if need {
-                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
-                    ctx.alloc_host(iqr_bytes.max(1 << 16))?,
-                    ctx.alloc_host(scr_bytes.max(4096))?,
-                    ctx.alloc_host(scr_bytes.max(4096))?,
-                    ctx.alloc_host((iqw.len() * 4).max(4096))?,
-                    ctx.alloc_host((idx_dim * 4).max(1 << 16))?,
-                    ctx.alloc_host(sd_bytes.max(1 << 16))?,
-                    ctx.alloc_host(8)?,
-                )))?);
+                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || {
+                    Ok::<_, String>((
+                        ctx.alloc_host(iqr_bytes.max(1 << 16))?,
+                        ctx.alloc_host(scr_bytes.max(4096))?,
+                        ctx.alloc_host(scr_bytes.max(4096))?,
+                        ctx.alloc_host((iqw.len() * 4).max(4096))?,
+                        ctx.alloc_host((idx_dim * 4).max(1 << 16))?,
+                        ctx.alloc_host(sd_bytes.max(1 << 16))?,
+                        ctx.alloc_host(8)?,
+                    ))
+                })?);
             }
         }
         let (iqr, scr, flg, iqwb, csb, sdev, ofdev) = {
             let g = self.qsa_sel_bufs.lock();
             let b = g.as_ref().unwrap();
-            (b.0.clone(), b.1.clone(), b.2.clone(), b.3.clone(), b.4.clone(), b.5.clone(), b.6.clone())
+            (
+                b.0.clone(),
+                b.1.clone(),
+                b.2.clone(),
+                b.3.clone(),
+                b.4.clone(),
+                b.5.clone(),
+                b.6.clone(),
+            )
         };
         // 호스트 상수(매 호출 소량) — iqw 전체, cs는 pos0행 idx_dim.
         unsafe {
@@ -297,12 +361,28 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let p = self.pipeline(&mut ctx, Slot::FnIdxScore)?;
             let ds = ctx.bind_ds(&p, &[iqr.buf, bkb, scr.buf])?;
             let push = push_u32s(&[n_blocks as u32, idx_heads as u32, idx_dim as u32]);
-            ctx.run(p.pl, ds, p.pipe, &push, (n_blocks as u32).div_ceil(256), 1, 1)?;
+            ctx.run(
+                p.pl,
+                ds,
+                p.pipe,
+                &push,
+                (n_blocks as u32).div_ceil(256),
+                1,
+                1,
+            )?;
             // (4) 순위 — 결정적 top-k(점수 내림, 인덱스 오름).
             let p = self.pipeline(&mut ctx, Slot::FnIdxRank)?;
             let ds = ctx.bind_ds(&p, &[scr.buf, flg.buf])?;
             let push = push_u32s(&[n_blocks as u32, n_sel as u32]);
-            ctx.run(p.pl, ds, p.pipe, &push, (n_blocks as u32).div_ceil(256), 1, 1)?;
+            ctx.run(
+                p.pl,
+                ds,
+                p.pipe,
+                &push,
+                (n_blocks as u32).div_ceil(256),
+                1,
+                1,
+            )?;
         }
         // (5) 목록 전개 — 단일 워크그룹(무공유메모리 판).
         {
@@ -365,7 +445,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         }
         let nb_cap = (pos0 + t) / r;
         if nb_cap > 4096 {
-            return Err(format!("vk qsa_sel_dev_mt: nb={nb_cap} > 4096 (호스트 폴백)"));
+            return Err(format!(
+                "vk qsa_sel_dev_mt: nb={nb_cap} > 4096 (호스트 폴백)"
+            ));
         }
         // 목록 총길이 — 산술(qsa_sel_list 동일식, 무동기).
         let mut list_len = 0usize;
@@ -397,21 +479,31 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                 }
             };
             if need {
-                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
-                    ctx.alloc_host(iqr_bytes.max(1 << 16))?,
-                    ctx.alloc_host(scr_bytes.max(4096))?,
-                    ctx.alloc_host(4096)?,
-                    ctx.alloc_host((iqw.len() * 4).max(4096))?,
-                    ctx.alloc_host(cs_bytes.max(1 << 16))?,
-                    ctx.alloc_host(sd_bytes.max(1 << 16))?,
-                    ctx.alloc_host(of_bytes.max(4096))?,
-                )))?);
+                *g = Some(crate::rawvk::context::site::scope("qsa_sel", || {
+                    Ok::<_, String>((
+                        ctx.alloc_host(iqr_bytes.max(1 << 16))?,
+                        ctx.alloc_host(scr_bytes.max(4096))?,
+                        ctx.alloc_host(4096)?,
+                        ctx.alloc_host((iqw.len() * 4).max(4096))?,
+                        ctx.alloc_host(cs_bytes.max(1 << 16))?,
+                        ctx.alloc_host(sd_bytes.max(1 << 16))?,
+                        ctx.alloc_host(of_bytes.max(4096))?,
+                    ))
+                })?);
             }
         }
         let (iqr, scr, _flg, iqwb, csb, sdev, ofdev) = {
             let g = self.qsa_sel_bufs.lock();
             let b = g.as_ref().unwrap();
-            (b.0.clone(), b.1.clone(), b.2.clone(), b.3.clone(), b.4.clone(), b.5.clone(), b.6.clone())
+            (
+                b.0.clone(),
+                b.1.clone(),
+                b.2.clone(),
+                b.3.clone(),
+                b.4.clone(),
+                b.5.clone(),
+                b.6.clone(),
+            )
         };
         unsafe {
             std::ptr::copy_nonoverlapping(iqw.as_ptr(), iqwb.ptr as *mut f32, iqw.len());
@@ -439,15 +531,31 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             let p = self.pipeline(&mut ctx, Slot::FnIdxScoreMt)?;
             let ds = ctx.bind_ds(&p, &[iqr.buf, bkb, scr.buf])?;
             let push = push_u32s(&[
-                pos0 as u32, r as u32, idx_heads as u32, idx_dim as u32, nb_cap as u32,
+                pos0 as u32,
+                r as u32,
+                idx_heads as u32,
+                idx_dim as u32,
+                nb_cap as u32,
             ]);
-            ctx.run(p.pl, ds, p.pipe, &push, nb_cap.div_ceil(256) as u32, t as u32, 1)?;
+            ctx.run(
+                p.pl,
+                ds,
+                p.pipe,
+                &push,
+                nb_cap.div_ceil(256) as u32,
+                t as u32,
+                1,
+            )?;
         }
         {
             let p = self.pipeline(&mut ctx, Slot::FnIdxTopkMt)?;
             let ds = ctx.bind_ds(&p, &[scr.buf, sdev.buf, ofdev.buf])?;
             let push = push_u32s(&[
-                pos0 as u32, t as u32, r as u32, idx_top_k as u32, nb_cap as u32,
+                pos0 as u32,
+                t as u32,
+                r as u32,
+                idx_top_k as u32,
+                nb_cap as u32,
             ]);
             ctx.run(p.pl, ds, p.pipe, &push, 1, t as u32, 1)?;
         }
@@ -481,7 +589,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let vb = vk::Buffer::from_raw(cv);
         let sib = vk::Buffer::from_raw(sel_idx);
         let sob = vk::Buffer::from_raw(sel_off);
-        self.qsa_attn_sel_run(&mut ctx, qb, cb, vb, sib, sob, ob, kq_scale, n_head, n_kv, hd, t)
+        self.qsa_attn_sel_run(
+            &mut ctx, qb, cb, vb, sib, sob, ob, kq_scale, n_head, n_kv, hd, t,
+        )
     }
 
     /// 선택 목록 어텐션 — fn_qsa_attn_sel 판(hd=256).
@@ -513,7 +623,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
             std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
         }
-        self.qsa_attn_sel_run(&mut ctx, qb, cb, vb, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t)
+        self.qsa_attn_sel_run(
+            &mut ctx, qb, cb, vb, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t,
+        )
     }
 
     /// 업로드 판 어텐션 — 호스트 ck/cv 를 스크래치에 올려 동일 커널(plans/86 §3:
@@ -542,13 +654,19 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let (si_b, so_b) = self.qsa_sel_scratch(&mut ctx, sel_idx.len(), sel_off.len())?;
         let (ckb, cvb) = {
             let mut g = self.qsa_up_bufs.lock();
-            let ok = g.as_ref().is_some_and(|b| b.0.bytes >= ck.len() * 4 && b.1.bytes >= cv.len() * 4);
+            let ok = g
+                .as_ref()
+                .is_some_and(|b| b.0.bytes >= ck.len() * 4 && b.1.bytes >= cv.len() * 4);
             if !ok {
-                let (kb, vb) = crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
-                    ctx.alloc_host((ck.len() * 4).max(1 << 16))?,
-                    ctx.alloc_host((cv.len() * 4).max(1 << 16))?,
-                )))?;
-                let (_, _, old_si, old_so) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
+                let (kb, vb) = crate::rawvk::context::site::scope("qsa_sel", || {
+                    Ok::<_, String>((
+                        ctx.alloc_host((ck.len() * 4).max(1 << 16))?,
+                        ctx.alloc_host((cv.len() * 4).max(1 << 16))?,
+                    ))
+                })?;
+                let (_, _, old_si, old_so) =
+                    g.take()
+                        .unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
                 *g = Some((kb, vb, old_si, old_so));
             }
             let b = g.as_ref().unwrap();
@@ -560,7 +678,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             std::ptr::copy_nonoverlapping(sel_idx.as_ptr(), si_b.ptr as *mut u32, sel_idx.len());
             std::ptr::copy_nonoverlapping(sel_off.as_ptr(), so_b.ptr as *mut u32, sel_off.len());
         }
-        self.qsa_attn_sel_run(&mut ctx, qb, ckb.buf, cvb.buf, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t)
+        self.qsa_attn_sel_run(
+            &mut ctx, qb, ckb.buf, cvb.buf, si_b.buf, so_b.buf, ob, kq_scale, n_head, n_kv, hd, t,
+        )
     }
 }
 
@@ -587,12 +707,23 @@ impl VkAcc {
             && n_head.is_multiple_of(n_kv)
             && (n_head / n_kv).is_multiple_of(4)
             && hd == 256
-            && std::env::var("LLM170_VK_QSAMH").map(|v| v != "0").unwrap_or(true);
-        let slot = if mh { Slot::FnQsaAttnSelMh } else { Slot::FnQsaAttnSel };
+            && std::env::var("LLM170_VK_QSAMH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let slot = if mh {
+            Slot::FnQsaAttnSelMh
+        } else {
+            Slot::FnQsaAttnSel
+        };
         let p = self.pipeline(ctx, slot)?;
         let ds2 = ctx.bind_ds(&p, &[qb, cb, vb, sib, sob, ob])?;
         let mut push = kq_scale.to_le_bytes().to_vec();
-        push.extend_from_slice(&push_u32s(&[n_head as u32, n_kv as u32, hd as u32, t as u32]));
+        push.extend_from_slice(&push_u32s(&[
+            n_head as u32,
+            n_kv as u32,
+            hd as u32,
+            t as u32,
+        ]));
         let gy = if mh { n_kv as u32 } else { n_head as u32 };
         ctx.run(p.pl, ds2, p.pipe, &push, t as u32, gy, 1)
     }
@@ -606,22 +737,34 @@ impl VkAcc {
         if let Some(b) = self.qk_consts.lock().get(&key) {
             return Ok(b.clone());
         }
-        let b = crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host(v.len().max(1) * 4))?;
+        let b =
+            crate::rawvk::context::site::scope("qsa_const", || ctx.alloc_host(v.len().max(1) * 4))?;
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr as *mut f32, v.len()) };
         self.qk_consts.lock().insert(key, b.clone());
         Ok(b)
     }
 
     /// plans/86 §4 — sel_idx/sel_off 업로드 스크래치(성장 재할당, 매호출 alloc 회피).
-    fn qsa_sel_scratch(&self, ctx: &mut VkCtx, si: usize, so: usize) -> Result<(VkBuf, VkBuf), String> {
+    fn qsa_sel_scratch(
+        &self,
+        ctx: &mut VkCtx,
+        si: usize,
+        so: usize,
+    ) -> Result<(VkBuf, VkBuf), String> {
         let mut g = self.qsa_up_bufs.lock();
-        let ok = g.as_ref().is_some_and(|b| b.2.bytes >= si * 4 && b.3.bytes >= so * 4);
+        let ok = g
+            .as_ref()
+            .is_some_and(|b| b.2.bytes >= si * 4 && b.3.bytes >= so * 4);
         if !ok {
-            let (old_ck, old_cv, _, _) = g.take().unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
-            let (sib, sob) = crate::rawvk::context::site::scope("qsa_sel", || Ok::<_, String>((
-                ctx.alloc_host((si * 4).max(1 << 16))?,
-                ctx.alloc_host((so * 4).max(1 << 16))?,
-            )))?;
+            let (old_ck, old_cv, _, _) =
+                g.take()
+                    .unwrap_or((vkbuf_null(), vkbuf_null(), vkbuf_null(), vkbuf_null()));
+            let (sib, sob) = crate::rawvk::context::site::scope("qsa_sel", || {
+                Ok::<_, String>((
+                    ctx.alloc_host((si * 4).max(1 << 16))?,
+                    ctx.alloc_host((so * 4).max(1 << 16))?,
+                ))
+            })?;
             *g = Some((old_ck, old_cv, sib, sob));
         }
         let b = g.as_ref().unwrap();

@@ -25,10 +25,19 @@ impl DecoderState {
         let conv_len = (conv_k - 1) * conv_ch;
         // plans/30 q3q8 옵트인: 소유 사본 재팩을 먼저 수행하고 모든 소비자는
         // 최종 뷰(weights_final)를 본다 (기본 경로는 mmap 빌림 그대로 — 클론 0).
-        let q3q8 = std::env::var("LLM170_VK_Q3Q8").map(|v| v == "1").unwrap_or(false);
+        let q3q8 = std::env::var("LLM170_VK_Q3Q8")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let mut weights_owned: Option<Vec<(String, Vec<u8>, u32, usize, usize)>> = if q3q8 {
-            Some(weights.iter().map(|(k, d, ty, ni, no)| (k.to_string(), d.to_vec(), *ty, *ni, *no)).collect())
-        } else { None };
+            Some(
+                weights
+                    .iter()
+                    .map(|(k, d, ty, ni, no)| (k.to_string(), d.to_vec(), *ty, *ni, *no))
+                    .collect(),
+            )
+        } else {
+            None
+        };
         if let Some(wv) = weights_owned.as_mut() {
             for (_name, data, ty, _ni, _no) in wv.iter_mut() {
                 if *ty != 11 {
@@ -40,7 +49,11 @@ impl DecoderState {
                 for r in 0..rows {
                     llm170_core::quant::dequant_row(
                         llm170_gguf::GgmlType::Q3K,
-                        data, r as u64, k as u64, &mut row);
+                        data,
+                        r as u64,
+                        k as u64,
+                        &mut row,
+                    );
                     for blk in row.chunks(32) {
                         let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
                         let d = amax / 127.0;
@@ -57,11 +70,16 @@ impl DecoderState {
             }
         }
         let weights_final: Vec<(&str, &[u8], u32, usize, usize)> = match &weights_owned {
-            Some(v) => v.iter().map(|(k, d, t, a, b)| (k.as_str(), d.as_slice(), *t, *a, *b)).collect(),
+            Some(v) => v
+                .iter()
+                .map(|(k, d, t, a, b)| (k.as_str(), d.as_slice(), *t, *a, *b))
+                .collect(),
             None => weights.clone(),
         };
         // MTP 탑재·vocab — weights 이동 전 산출.
-        let mtp_on = weights_final.iter().any(|(k, ..)| *k == "blk.64.nextn.eh_proj.weight");
+        let mtp_on = weights_final
+            .iter()
+            .any(|(k, ..)| *k == "blk.64.nextn.eh_proj.weight");
         let n_vocab = weights_final
             .iter()
             .find(|(k, ..)| *k == "output.weight")
@@ -80,8 +98,12 @@ impl DecoderState {
         // f16 사전 디양자화 캐시 (plans/39) — 데이터 복제 없음(대여만):
         // 디양자화를 가중 업로드 루프 앞에서 수행 (RCA: .cloned() 전체복제가
         // 30Gi 호스트 RAM을 초과해 OOM·세션 사망의 원인이었음).
-        let f16w_on = std::env::var("LLM170_VK_F16W").map(|v| v == "1").unwrap_or(false);
-        let f16w_max = std::env::var("LLM170_VK_F16W_MAX").ok().and_then(|v| v.parse::<usize>().ok());
+        let f16w_on = std::env::var("LLM170_VK_F16W")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let f16w_max = std::env::var("LLM170_VK_F16W_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
         let mut f16w: HashMap<String, VkBuf> = HashMap::new();
         if f16w_on {
             let e0 = std::time::Instant::now();
@@ -93,17 +115,21 @@ impl DecoderState {
                 cand.truncate(mx);
             }
             for grp in cand.chunks(8) {
-                let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
+                let outs: std::sync::Mutex<Vec<(String, Vec<u16>)>> =
+                    std::sync::Mutex::new(Vec::new());
                 std::thread::scope(|sc| {
                     for (name, data, ty, ni, no) in grp {
                         let outs = &outs;
                         sc.spawn(move || {
-                            let gty = llm170_gguf::GgmlType::from_u32(*ty).unwrap_or(llm170_gguf::GgmlType::Q5K);
+                            let gty = llm170_gguf::GgmlType::from_u32(*ty)
+                                .unwrap_or(llm170_gguf::GgmlType::Q5K);
                             let (ni, no) = (*ni, *no);
                             let mut buf16 = vec![0u16; ni * no];
                             let mut row = vec![0f32; ni];
                             for r in 0..no {
-                                llm170_core::quant::dequant_row(gty, data, r as u64, ni as u64, &mut row);
+                                llm170_core::quant::dequant_row(
+                                    gty, data, r as u64, ni as u64, &mut row,
+                                );
                                 for (k, &v) in row.iter().enumerate() {
                                     buf16[r * ni + k] = f32_to_f16_bits(v);
                                 }
@@ -115,13 +141,19 @@ impl DecoderState {
                 for (name, buf16) in outs.into_inner().unwrap() {
                     let bytes = buf16.len() * 2;
                     let mut b = ctx.alloc(bytes)?;
-                    unsafe { std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes) };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes)
+                    };
                     ctx.unmap(&mut b)?;
                     f16w.insert(name, b);
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
-            eprintln!("[f16w] 디양자화+업로드 {} 텐서 {}s", f16w.len(), e0.elapsed().as_secs_f32());
+            eprintln!(
+                "[f16w] 디양자화+업로드 {} 텐서 {}s",
+                f16w.len(),
+                e0.elapsed().as_secs_f32()
+            );
         }
         let mut w = HashMap::new();
         for &(name, data, ty, ni, no) in &weights_final {
@@ -129,7 +161,10 @@ impl DecoderState {
             let mut off = 0usize;
             // gemv4 WG() 시프트 산술 — 청크 크기 2의 거듭제곱. 마지막 청크는 실제 크기만
             // 할당: o = idx & mask 는 항상 청크 내 실데이터 오프셋이라 패딩 불필요.
-            let ch_eff = data.len().next_power_of_two().min(1usize << (63 - ctx.max_ssbo.leading_zeros()));
+            let ch_eff = data
+                .len()
+                .next_power_of_two()
+                .min(1usize << (63 - ctx.max_ssbo.leading_zeros()));
             while off < data.len() {
                 let rem = data.len() - off;
                 let sz = ch_eff.min(rem);
@@ -158,7 +193,13 @@ impl DecoderState {
         unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr(), ktab.ptr as *mut u32, 256) };
         ctx.unmap(&mut ktab)?;
         let mut grid3s = ctx.alloc(2048)?;
-        unsafe { std::ptr::copy_nonoverlapping(llm170_core::IQ3S_GRID.as_ptr() as *const u8, grid3s.ptr, 2048) }; // iq3s 512워드 진테이블 (VkAcc ensure_shared 대칭)
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                llm170_core::IQ3S_GRID.as_ptr() as *const u8,
+                grid3s.ptr,
+                2048,
+            )
+        }; // iq3s 512워드 진테이블 (VkAcc ensure_shared 대칭)
         ctx.unmap(&mut grid3s)?;
         let dummy = ctx.alloc(16)?;
         let z16 = [0u8; 16];
@@ -166,7 +207,9 @@ impl DecoderState {
 
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
-        let kv8 = std::env::var("LLM170_VK_KV8").map(|v| v == "1").unwrap_or(false);
+        let kv8 = std::env::var("LLM170_VK_KV8")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let kv_store: usize = if kv8 { kv_len / 32 * 34 } else { kv_len * 4 };
         let zeros_kv = vec![0u8; kv_store];
         let mut kv_k = Vec::with_capacity(n_full);
@@ -205,7 +248,7 @@ impl DecoderState {
         }
         // plans/91 P0 — np 배치 상태 주소 테이블 ([그룹][슬롯] u64). 디바이스
         let mut np_mk_tbl = |rows: &[Vec<VkBuf>]| -> Result<VkBuf, String> {
-        // GL_EXT_buffer_reference 로 행별 상태를 직접 주소 지정한다.
+            // GL_EXT_buffer_reference 로 행별 상태를 직접 주소 지정한다.
             let mut v = Vec::with_capacity(rows.len() * n_seqs);
             for row in rows {
                 for b in row {
@@ -231,9 +274,34 @@ impl DecoderState {
         let xq_sf = crate::rawvk::vkacc::xq_words(hp.n_ff);
         let xq_sg = crate::rawvk::vkacc::xq_words(hp.d_inner);
         let max_ssbo0 = ctx.max_ssbo;
-        let (b_xs, b_xn, b_xq_n, b_xq_f, b_xq_g, b_gqkv, b_gconv, b_gq, b_gk, b_gv,
-             b_gb, b_ga, b_gbg, b_gz, b_go, b_ggated, b_aq, b_ak, b_av, b_aout,
-             b_gout, b_fgate, b_fup, b_fglu, b_fdown, b_am) = {
+        let (
+            b_xs,
+            b_xn,
+            b_xq_n,
+            b_xq_f,
+            b_xq_g,
+            b_gqkv,
+            b_gconv,
+            b_gq,
+            b_gk,
+            b_gv,
+            b_gb,
+            b_ga,
+            b_gbg,
+            b_gz,
+            b_go,
+            b_ggated,
+            b_aq,
+            b_ak,
+            b_av,
+            b_aout,
+            b_gout,
+            b_fgate,
+            b_fup,
+            b_fglu,
+            b_fdown,
+            b_am,
+        ) = {
             // plans/43: 활성 버퍼는 디바이스 힙(캐브아웃)에 — 종전 GTT(시스템 RAM)는
             // 타일이 K블록마다 활성 타일을 읽을 때 대역 병목(가중의 수 배 트래픽).
             // 캐브아웃도 HOST_VISIBLE|COHERENT라 CPU 업로드 경로는 그대로 동작.
@@ -241,15 +309,32 @@ impl DecoderState {
                 ctx.alloc(sz.max(1) * 4).map_err(|e| e.to_string())
             };
             (
-                a(T_MAX * n)?, a(T_MAX * n)?, a(T_MAX * xq_sn)?, a(T_MAX * xq_sf)?,
-                a(T_MAX * xq_sg)?, a(T_MAX * conv_ch)?, a(T_MAX * conv_ch)?,
-                a(T_MAX * k_len)?, a(T_MAX * k_len)?, a(T_MAX * v_len)?,
-                a(T_MAX * hp.dt_rank)?, a(T_MAX * hp.dt_rank)?,
-                a(T_MAX * hp.dt_rank * 2)?, a(T_MAX * hp.d_inner)?, a(T_MAX * v_len)?,
-                a(T_MAX * hp.d_inner)?, a(T_MAX * n_head * 2 * hd)?,
-                a(T_MAX * n_kv * hd)?, a(T_MAX * n_kv * hd)?, a(T_MAX * n_head * hd)?,
-                a(T_MAX * n)?, a(T_MAX * hp.n_ff)?, a(T_MAX * hp.n_ff)?,
-                a(T_MAX * hp.n_ff)?, a(T_MAX * n)?, a(8)?,
+                a(T_MAX * n)?,
+                a(T_MAX * n)?,
+                a(T_MAX * xq_sn)?,
+                a(T_MAX * xq_sf)?,
+                a(T_MAX * xq_sg)?,
+                a(T_MAX * conv_ch)?,
+                a(T_MAX * conv_ch)?,
+                a(T_MAX * k_len)?,
+                a(T_MAX * k_len)?,
+                a(T_MAX * v_len)?,
+                a(T_MAX * hp.dt_rank)?,
+                a(T_MAX * hp.dt_rank)?,
+                a(T_MAX * hp.dt_rank * 2)?,
+                a(T_MAX * hp.d_inner)?,
+                a(T_MAX * v_len)?,
+                a(T_MAX * hp.d_inner)?,
+                a(T_MAX * n_head * 2 * hd)?,
+                a(T_MAX * n_kv * hd)?,
+                a(T_MAX * n_kv * hd)?,
+                a(T_MAX * n_head * hd)?,
+                a(T_MAX * n)?,
+                a(T_MAX * hp.n_ff)?,
+                a(T_MAX * hp.n_ff)?,
+                a(T_MAX * hp.n_ff)?,
+                a(T_MAX * n)?,
+                a(8)?,
             )
         };
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
@@ -284,8 +369,8 @@ impl DecoderState {
         let m_bxqn = ah(T_MAX * xq_sn)?;
         let m_prefetched = std::sync::atomic::AtomicBool::new(false);
         let b_lg = ah(n_vocab)?;
-        let b_ams = ah(512)?;   // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
-        let b_xf16 = ah(T_MAX * n * 2)?;   // f16-B 활성 (plans/46, 요소수 T_MAX*n)
+        let b_ams = ah(512)?; // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
+        let b_xf16 = ah(T_MAX * n * 2)?; // f16-B 활성 (plans/46, 요소수 T_MAX*n)
         let b_lg_t = ah(T_MAX * n_vocab)?;
         // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
         let mut i8w: HashMap<String, I8W> = HashMap::new();
@@ -317,7 +402,11 @@ impl DecoderState {
                                     let (sc, m) = llm170_core::quant::scale_min_k4_local(wb, j);
                                     let it = j / 2;
                                     let half = j % 2;
-                                    let u: u8 = if half == 0 { 1u8 << (2 * it) } else { 2u8 << (2 * it) };
+                                    let u: u8 = if half == 0 {
+                                        1u8 << (2 * it)
+                                    } else {
+                                        2u8 << (2 * it)
+                                    };
                                     let sb = bidx * 8 + j;
                                     wsps[o * n_sub + sb] = d * sc as f32;
                                     wsms[o * n_sub + sb] = dm * m as f32;
@@ -332,19 +421,25 @@ impl DecoderState {
                         }
                     }));
                 }
-                for h in hs { let _ = h.join(); }
+                for h in hs {
+                    let _ = h.join();
+                }
             });
             // carveout + 언맵 — alloc_host(대형)는 i8 coopmatLoad 경로에서
             // 데이터 붕괴 실측 (미니 재현: 소형 carveout ★, 대형 host ✗).
             let wspbuf = {
                 let mut b = ctx.alloc(no * n_sub * 4)?;
-                unsafe { std::ptr::copy_nonoverlapping(wsp.as_ptr(), b.ptr as *mut f32, no * n_sub) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(wsp.as_ptr(), b.ptr as *mut f32, no * n_sub)
+                };
                 ctx.unmap(&mut b)?;
                 b
             };
             let wsmbuf = {
                 let mut b = ctx.alloc(no * n_sub * 4)?;
-                unsafe { std::ptr::copy_nonoverlapping(wsm.as_ptr(), b.ptr as *mut f32, no * n_sub) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(wsm.as_ptr(), b.ptr as *mut f32, no * n_sub)
+                };
                 ctx.unmap(&mut b)?;
                 b
             };
@@ -399,7 +494,16 @@ impl DecoderState {
                 ctx.unmap(&mut b)?;
                 b
             };
-            i8w.insert(name.to_string(), I8W { w: wbuf, wsp: wspbuf, wsm: wsmbuf, n_out: no, n_in: ni });
+            i8w.insert(
+                name.to_string(),
+                I8W {
+                    w: wbuf,
+                    wsp: wspbuf,
+                    wsm: wsmbuf,
+                    n_out: no,
+                    n_in: ni,
+                },
+            );
         }
         let n_max = hp.n_ff.max(n);
         let n_sub_max = n_max / 32;

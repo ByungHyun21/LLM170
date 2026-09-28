@@ -383,9 +383,18 @@ pub struct VkAcc {
     ks_scratch: Mutex<Option<VkBuf>>,
     /// plans/105(원장 80) — 팩 정량 레지스트리: mxsel 핸들 → (buf, bytes).
     /// 성장 시 구버퍼 보유(녹화 중 참조 해제 금지 — 원장 79 사고).
-    packbufs: Mutex<(std::collections::HashMap<u64, (vk::Buffer, usize)>, Vec<VkBuf>)>,
+    packbufs: Mutex<(
+        std::collections::HashMap<u64, (vk::Buffer, usize)>,
+        Vec<VkBuf>,
+    )>,
     f16bufs: Mutex<std::collections::HashSet<u64>>,
-    gdn_ch_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
+    gdn_ch_scratch: Mutex<(
+        Option<VkBuf>,
+        Option<VkBuf>,
+        Option<VkBuf>,
+        Option<VkBuf>,
+        Option<VkBuf>,
+    )>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -405,8 +414,8 @@ pub struct VkAcc {
     argmax_bufs: Mutex<Option<(VkBuf, VkBuf)>>,
     /// plans/84 B — MoE 스크래치 (perm, xg, inv, yg) — 필요시 성장.
     moebufs: Mutex<Option<(VkBuf, VkBuf, VkBuf, VkBuf)>>,
-     /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
-     qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
+    /// plans/84 B — QSA 상주 풀: (층,시퀀스) → (kv_k, kv_v, idx_k, bk) + 워터마크.
+    qsa_pools: Mutex<HashMap<(usize, usize), (VkBuf, VkBuf, VkBuf, VkBuf, usize)>>,
     /// plans/86 §2 — qk_norm_rope 상수(qn/kn/cs 타일) (ptr,len) 키 상주.
     qk_consts: Mutex<HashMap<(usize, usize), VkBuf>>,
     /// plans/86 §4 — QSA 업로드 판 스크래치 (ck, cv, sel_idx, sel_off) — 성장 재할당.
@@ -426,7 +435,8 @@ pub struct VkAcc {
     /// plans/93: MoE gate→up 배리어 스킵 — 독립 GEMM 병렬 실행.
     pub(crate) moe_nobar: std::sync::atomic::AtomicBool,
     /// plans/93: F32→Q8_0 변환 캐시(가중 ptr, len 키) — 청크마다 재변환 방지.
-    pub(crate) f32q8_cache: Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
+    pub(crate) f32q8_cache:
+        Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
     /// plans/95 P3a — q8_0 릴레이아웃 업로드 캐시: (가중 ptr,len) → VkBuf.
     pub(crate) q8r_bufs: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
     /// plans/96 G3 — SiluMul 출력(mglu)→down 융합 학습: (핸들, n_in).
@@ -462,7 +472,12 @@ struct MoeGrp {
 
 /// 빈 VkBuf 자리표 — 풀 엔트리 지연 생성용.
 fn vkbuf_null() -> VkBuf {
-    VkBuf { buf: vk::Buffer::null(), ptr: std::ptr::null_mut(), bytes: 0, mem: vk::DeviceMemory::null() }
+    VkBuf {
+        buf: vk::Buffer::null(),
+        ptr: std::ptr::null_mut(),
+        bytes: 0,
+        mem: vk::DeviceMemory::null(),
+    }
 }
 fn vk_ty(ty: GgmlType) -> Option<u32> {
     match ty {
@@ -501,7 +516,13 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::MoeGatherRows, "moe_gather", MOE_GATHER_SPV, 2, 12),
     (Slot::HcGateMean, "hc_gate_mean", HC_GATE_MEAN_SPV, 3, 16),
     (Slot::HcCombine, "hc_combine", HC_COMBINE_SPV, 3, 12),
-    (Slot::HcCombineF16, "hc_combine_f16", HC_COMBINE_F16_SPV, 3, 12),
+    (
+        Slot::HcCombineF16,
+        "hc_combine_f16",
+        HC_COMBINE_F16_SPV,
+        3,
+        12,
+    ),
     (Slot::NormGatedSig, "norm_gated", NORM_GATED_SIG_SPV, 4, 16),
     (Slot::GdnBetaG, "gdn_beta_g", GDN_BETA_G_SPV, 5, 8),
     (Slot::EwSigmoid, "sigmoid", EW_SIGMOID_SPV, 1, 4),
@@ -517,12 +538,24 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::GdnExec, "gdn_exec", GDN_EXEC_SPV, 8, 36),
     (Slot::GdnExecA, "gdn_execA", GDN_EXEC_A_SPV, 7, 24),
     (Slot::GdnExecB, "gdn_execB", GDN_EXEC_B_SPV, 8, 36),
-    (Slot::FnQsaAttnSel, "qsa_attn_sel", FN_QSA_ATTN_SEL_SPV, 6, 24),
+    (
+        Slot::FnQsaAttnSel,
+        "qsa_attn_sel",
+        FN_QSA_ATTN_SEL_SPV,
+        6,
+        24,
+    ),
     (Slot::PermuteU32, "permute_u32", PERMUTE_U32_SPV, 3, 12),
     (Slot::FnIdxScore, "idx_score", FN_IDX_SCORE_SPV, 3, 12),
     (Slot::FnIdxBk, "idx_bk_update", FN_IDX_BK_SPV, 4, 20),
     (Slot::FnIdxQRope, "idx_q_rope", FN_IDX_Q_ROPE_SPV, 4, 8),
-    (Slot::FnQkNormRope, "qk_norm_rope", FN_QK_NORM_ROPE_SPV, 5, 28),
+    (
+        Slot::FnQkNormRope,
+        "qk_norm_rope",
+        FN_QK_NORM_ROPE_SPV,
+        5,
+        28,
+    ),
     (Slot::FnIdxRank, "idx_rank", FN_IDX_RANK_SPV, 2, 8),
     (Slot::FnIdxExpand, "idx_expand", FN_IDX_EXPAND_SPV, 3, 16),
     (Slot::Rms, "rms", RMS_SPV, 3, 16),
@@ -543,8 +576,20 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeIds51, "moe_ids51", FN_MOE_IDS51_SPV, 11, 24),
     (Slot::FnMmf32, "mm_f32", FN_MM_F32_SPV, 10, 20),
     (Slot::FnMoeGroup, "moe_group", FN_MOE_GROUP_SPV, 9, 12),
-    (Slot::FnMoeTileQ4K, "moe_tile_q4k", FN_MOE_TILE_Q4K_SPV, 13, 28),
-    (Slot::FnMoeTileQ51, "moe_tile_q51", FN_MOE_TILE_Q51_SPV, 13, 28),
+    (
+        Slot::FnMoeTileQ4K,
+        "moe_tile_q4k",
+        FN_MOE_TILE_Q4K_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ51,
+        "moe_tile_q51",
+        FN_MOE_TILE_Q51_SPV,
+        13,
+        28,
+    ),
     (Slot::FnTileQ8, "tile_q8", FN_TILE_Q8_SPV, 10, 20),
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
@@ -552,23 +597,77 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32sH, "tile_f32s_h", FN_TILE_F32S_H_SPV, 10, 20),
     (Slot::FnSiluH, "silu_h", FN_SILU_H_SPV, 3, 4),
     (Slot::FnMoeWsumH, "moe_wsum_h", FN_MOE_WSUM_H_SPV, 3, 16),
-    (Slot::FnMoeTileQ51mmqH, "moe_tile_q51mmq_h", FN_MOE_TILE_Q51MMQ_H_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kPks, "moe_tile_q4k_pks", FN_MOE_TILE_Q4K_PKS_SPV, 14, 28),
-    (Slot::FnMoeTileLlmmq, "moe_tile_llmmq", FN_MOE_TILE_LLMMQ_SPV, 13, 28),
-    (Slot::FnMoeTileLlmmqH16, "moe_tile_llmmq_h16", FN_MOE_TILE_LLMMQ_H16_SPV, 13, 28),
-    (Slot::FnMoeTileLl51, "moe_tile_ll51", FN_MOE_TILE_LL51_SPV, 13, 28),
+    (
+        Slot::FnMoeTileQ51mmqH,
+        "moe_tile_q51mmq_h",
+        FN_MOE_TILE_Q51MMQ_H_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kPks,
+        "moe_tile_q4k_pks",
+        FN_MOE_TILE_Q4K_PKS_SPV,
+        14,
+        28,
+    ),
+    (
+        Slot::FnMoeTileLlmmq,
+        "moe_tile_llmmq",
+        FN_MOE_TILE_LLMMQ_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileLlmmqH16,
+        "moe_tile_llmmq_h16",
+        FN_MOE_TILE_LLMMQ_H16_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileLl51,
+        "moe_tile_ll51",
+        FN_MOE_TILE_LL51_SPV,
+        13,
+        28,
+    ),
     (Slot::FnQuantQ8p, "quant_q8p", FN_QUANT_Q8P_SPV, 2, 12),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
-    (Slot::FnPleGateF16, "ple_gate_f16", FN_PLE_GATE_F16_SPV, 8, 16),
+    (
+        Slot::FnPleGateF16,
+        "ple_gate_f16",
+        FN_PLE_GATE_F16_SPV,
+        8,
+        16,
+    ),
     (Slot::FnPleGateMt, "ple_gate_mt", FN_PLE_GATE_MT_SPV, 8, 16),
-    (Slot::FnPleGateMtF16, "ple_gate_mt_f16", FN_PLE_GATE_MT_F16_SPV, 8, 16),
+    (
+        Slot::FnPleGateMtF16,
+        "ple_gate_mt_f16",
+        FN_PLE_GATE_MT_F16_SPV,
+        8,
+        16,
+    ),
     (Slot::FnPleGather, "ple_gather", FN_PLE_GATHER_SPV, 3, 16),
     (Slot::EmbQ8G, "emb_q8g", FN_EMB_Q8G_SPV, 3, 16),
     (Slot::EmbQ8GF16, "emb_q8g_f16", FN_EMB_Q8G_F16_SPV, 3, 16),
-    (Slot::FnMoeTileQ4kSg2, "moe_tile_q4k_sg2", FN_MOE_TILE_Q4K_SG2_SPV, 6, 16),
+    (
+        Slot::FnMoeTileQ4kSg2,
+        "moe_tile_q4k_sg2",
+        FN_MOE_TILE_Q4K_SG2_SPV,
+        6,
+        16,
+    ),
     (Slot::FnPleConv, "ple_conv", FN_PLE_CONV_SPV, 4, 20),
-    (Slot::FnQsaAttnSelMh, "qsa_attn_sel_mh", FN_QSA_ATTN_SEL_MH_SPV, 6, 20),
+    (
+        Slot::FnQsaAttnSelMh,
+        "qsa_attn_sel_mh",
+        FN_QSA_ATTN_SEL_MH_SPV,
+        6,
+        20,
+    ),
     (Slot::FnPleRes, "ple_res", FN_PLE_RES_SPV, 4, 12),
     (Slot::FnPleResF16, "ple_res_f16", FN_PLE_RES_F16_SPV, 4, 12),
     (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
@@ -578,35 +677,138 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::TileQ8msCm, "tile_q8ms", TILE_Q8MS_SPV2, 10, 20),
     (Slot::TileQ4k128Cm, "tile_q4k128", TILE_Q4K128_SPV2, 10, 20),
     (Slot::TileQ4kmsCm, "tile_q4kms", TILE_Q4KMS_SPV2, 10, 20),
-    (Slot::FnMoeTileQ4kCm, "moe_tile_q4k_cm", FN_MOE_TILE_Q4K_CM_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kCm2, "moe_tile_q4k_cm2", FN_MOE_TILE_Q4K_CM2_SPV, 13, 28),
+    (
+        Slot::FnMoeTileQ4kCm,
+        "moe_tile_q4k_cm",
+        FN_MOE_TILE_Q4K_CM_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kCm2,
+        "moe_tile_q4k_cm2",
+        FN_MOE_TILE_Q4K_CM2_SPV,
+        13,
+        28,
+    ),
     (Slot::FnMoeTileQ8, "moe_tile_q8", FN_MOE_TILE_Q8_SPV, 13, 28),
-    (Slot::FnMoeTileQ5k, "moe_tile_q5k", FN_MOE_TILE_Q5K_SPV, 13, 28),
-    (Slot::FnMoeTileQ51Cm, "moe_tile_q51_cm", FN_MOE_TILE_Q51_CM_SPV, 13, 28),
-    (Slot::FnMoeTileQ51Sg1, "moe_tile_q51_sg1", FN_MOE_TILE_Q51_SG1_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kSg1, "moe_tile_q4k_sg1", FN_MOE_TILE_Q4K_SG1_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kSc, "moe_tile_q4k_sc", FN_MOE_TILE_Q4K_SC_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kMmq, "moe_tile_q4k_mmq", FN_MOE_TILE_Q4K_MMQ_SPV, 13, 28),
-    (Slot::FnMoeTileQ4kCm8, "moe_tile_q4k_cm8", FN_MOE_TILE_Q4K_CM8_SPV, 16, 28),
-    (Slot::FnMoeTileQ4kCm8b, "moe_tile_q4k_cm8b", FN_MOE_TILE_Q4K_CM8B_SPV, 16, 28),
-    (Slot::FnMoeTileQ8mmq, "moe_tile_q8mmq", FN_MOE_TILE_Q8MMQ_SPV, 13, 28),
-    (Slot::FnMoeTileQ5kmmq, "moe_tile_q5kmmq", FN_MOE_TILE_Q5KMMQ_SPV, 13, 28),
-    (Slot::FnMoeTileQ51mmq, "moe_tile_q51mmq", FN_MOE_TILE_Q51MMQ_SPV, 13, 28),
+    (
+        Slot::FnMoeTileQ5k,
+        "moe_tile_q5k",
+        FN_MOE_TILE_Q5K_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ51Cm,
+        "moe_tile_q51_cm",
+        FN_MOE_TILE_Q51_CM_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ51Sg1,
+        "moe_tile_q51_sg1",
+        FN_MOE_TILE_Q51_SG1_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kSg1,
+        "moe_tile_q4k_sg1",
+        FN_MOE_TILE_Q4K_SG1_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kSc,
+        "moe_tile_q4k_sc",
+        FN_MOE_TILE_Q4K_SC_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kMmq,
+        "moe_tile_q4k_mmq",
+        FN_MOE_TILE_Q4K_MMQ_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kCm8,
+        "moe_tile_q4k_cm8",
+        FN_MOE_TILE_Q4K_CM8_SPV,
+        16,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ4kCm8b,
+        "moe_tile_q4k_cm8b",
+        FN_MOE_TILE_Q4K_CM8B_SPV,
+        16,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ8mmq,
+        "moe_tile_q8mmq",
+        FN_MOE_TILE_Q8MMQ_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ5kmmq,
+        "moe_tile_q5kmmq",
+        FN_MOE_TILE_Q5KMMQ_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnMoeTileQ51mmq,
+        "moe_tile_q51mmq",
+        FN_MOE_TILE_Q51MMQ_SPV,
+        13,
+        28,
+    ),
     (Slot::FnTileQ8d, "tile_q8d", FN_TILE_Q8D_SPV, 10, 16),
-    (Slot::FnMoeTileQ4kSg1f, "moe_tile_q4k_sg1f", FN_MOE_TILE_Q4K_SG1F_SPV, 13, 28),
-    (Slot::FnIdxScoreMt, "idx_score_mt", FN_IDX_SCORE_MT_SPV, 3, 20),
+    (
+        Slot::FnMoeTileQ4kSg1f,
+        "moe_tile_q4k_sg1f",
+        FN_MOE_TILE_Q4K_SG1F_SPV,
+        13,
+        28,
+    ),
+    (
+        Slot::FnIdxScoreMt,
+        "idx_score_mt",
+        FN_IDX_SCORE_MT_SPV,
+        3,
+        20,
+    ),
     (Slot::FnIdxTopkMt, "idx_topk_mt", FN_IDX_TOPK_MT_SPV, 3, 20),
-    (Slot::FnMoeTileQ4kKp, "moe_tile_q4k_kp", FN_MOE_TILE_Q4K_KP_SPV, 13, 28),
+    (
+        Slot::FnMoeTileQ4kKp,
+        "moe_tile_q4k_kp",
+        FN_MOE_TILE_Q4K_KP_SPV,
+        13,
+        28,
+    ),
 ];
 
 fn slot_spec(slot: Slot) -> (&'static [u8], u32, u32) {
-    let (_, _, spv, n, pb) = SLOTS.iter().find(|(s, ..)| *s == slot).expect("SLOTS 미등록 슬롯");
+    let (_, _, spv, n, pb) = SLOTS
+        .iter()
+        .find(|(s, ..)| *s == slot)
+        .expect("SLOTS 미등록 슬롯");
     (spv, *n, *pb)
 }
 
 /// plans/87 §2/§3 — 슬롯 → op 태그(와치독 링·ts 라벨).
 fn slot_name(slot: Slot) -> &'static str {
-    SLOTS.iter().find(|(s, ..)| *s == slot).expect("SLOTS 미등록 슬롯").1
+    SLOTS
+        .iter()
+        .find(|(s, ..)| *s == slot)
+        .expect("SLOTS 미등록 슬롯")
+        .1
 }
 
 pub(crate) fn push_u32s(vals: &[u32]) -> Vec<u8> {
@@ -625,13 +827,17 @@ impl VkAcc {
     }
 
     /// 파트 소스 지정판 — `Model4::part_sources()` (plans/86 §6).
-    pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
+    pub fn new_with_sources(
+        parts: Vec<(usize, usize, std::path::PathBuf)>,
+    ) -> Result<Self, String> {
         llm170_diag::alloc::set_on(llm170_diag::dump::opts().alloc);
         llm170_diag::alloc::set_vaddr(llm170_diag::dump::opts().vaddr);
         let sources = parts
             .into_iter()
             .filter_map(|(base, len, path)| {
-                std::fs::File::open(&path).ok().map(|file| PartSource { base, len, file })
+                std::fs::File::open(&path)
+                    .ok()
+                    .map(|file| PartSource { base, len, file })
             })
             .collect();
         let ctx = VkCtx::new()?;
@@ -710,7 +916,10 @@ impl VkAcc {
     }
 
     /// ktab(iq4nl)·grid3s 테이블 + 더미 버퍼 — 최초 1회 업로드.
-    pub(crate) fn ensure_shared(&self, ctx: &mut VkCtx) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer), String> {
+    pub(crate) fn ensure_shared(
+        &self,
+        ctx: &mut VkCtx,
+    ) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer), String> {
         if self.tables.lock().is_none() {
             let kv: Vec<u32> = llm170_core::ktab2_packed();
             let kb = ctx.alloc_host(1024)?;
@@ -766,7 +975,15 @@ impl VkAcc {
         binds.push(ob);
         let ds2 = ctx.bind_ds(&p, &binds)?;
         let push = push_u32s(&[n_in as u32, n_out as u32, t as u32, 0, 0, 2]);
-        ctx.run(p.pl, ds2, p.pipe, &push, 1, n_out.div_ceil(2) as u32, t as u32)?;
+        ctx.run(
+            p.pl,
+            ds2,
+            p.pipe,
+            &push,
+            1,
+            n_out.div_ceil(2) as u32,
+            t as u32,
+        )?;
         Ok(true)
     }
 
@@ -777,41 +994,43 @@ impl VkAcc {
     fn weight_bufs(&self, ctx: &mut VkCtx, w: &Weight) -> Result<Vec<vk::Buffer>, String> {
         let key = (w.data.as_ptr() as usize, w.data.len());
         crate::rawvk::context::site::scope("weight", || {
-        {
-            let mut wc = self.wcache.lock();
-            if let std::collections::hash_map::Entry::Vacant(e) = wc.entry(key) {
-                let ch = ctx.max_ssbo; // plans/29: 균일 청크 — 크기는 push(chunk_words)로 전달
-                let total = w.data.len();
-                let mut bufs = Vec::new();
-                let mut off = 0usize;
-                // plans/86 §6 — pread 스테이징: 알려진 파트 범위면 mmap 폴트
-                // (4KB 랜덤, 20-180 MB/s) 대신 파일에서 8MiB 순차 pread로
-                // 매핑 버퍼에 직접 채운다(실측 ~1.2 GB/s). 아니면 memcpy 폴백.
-                let base = w.data.as_ptr() as usize;
-                let src = self
-                    .sources
-                    .iter()
-                    .find_map(|s| s.covers(base, total).map(|o| (s, o)));
-                while off < total {
-                    let n = ch.min(total - off);
-                    let mut b = ctx.alloc(n)?;
-                    let r = match src {
-                        Some((s, o)) => unsafe { crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n) },
-                        None => unsafe {
-                            std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
-                            Ok(())
-                        },
-                    };
-                    if let Err(e) = r {
-                        return Err(format!("가중 스테이징: {e}"));
+            {
+                let mut wc = self.wcache.lock();
+                if let std::collections::hash_map::Entry::Vacant(e) = wc.entry(key) {
+                    let ch = ctx.max_ssbo; // plans/29: 균일 청크 — 크기는 push(chunk_words)로 전달
+                    let total = w.data.len();
+                    let mut bufs = Vec::new();
+                    let mut off = 0usize;
+                    // plans/86 §6 — pread 스테이징: 알려진 파트 범위면 mmap 폴트
+                    // (4KB 랜덤, 20-180 MB/s) 대신 파일에서 8MiB 순차 pread로
+                    // 매핑 버퍼에 직접 채운다(실측 ~1.2 GB/s). 아니면 memcpy 폴백.
+                    let base = w.data.as_ptr() as usize;
+                    let src = self
+                        .sources
+                        .iter()
+                        .find_map(|s| s.covers(base, total).map(|o| (s, o)));
+                    while off < total {
+                        let n = ch.min(total - off);
+                        let mut b = ctx.alloc(n)?;
+                        let r = match src {
+                            Some((s, o)) => unsafe {
+                                crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n)
+                            },
+                            None => unsafe {
+                                std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
+                                Ok(())
+                            },
+                        };
+                        if let Err(e) = r {
+                            return Err(format!("가중 스테이징: {e}"));
+                        }
+                        ctx.unmap(&mut b)?; // WC 매핑 즉시 해제 — op당 동기 비용 방지
+                        bufs.push(b);
+                        off += n;
                     }
-                    ctx.unmap(&mut b)?; // WC 매핑 즉시 해제 — op당 동기 비용 방지
-                    bufs.push(b);
-                    off += n;
+                    e.insert(bufs);
                 }
-                e.insert(bufs);
             }
-        }
             let bufs: Vec<vk::Buffer> = {
                 let wc = self.wcache.lock();
                 wc.get(&key).unwrap().iter().map(|b| b.buf).collect()
@@ -853,10 +1072,16 @@ impl VkAcc {
         let ds2 = ctx.bind_ds(&p, &binds)?;
         // plans/29: 균일 청크 워드 수 (weight_bufs가 max_ssbo 단위로 분할).
         let chunk_words = (ctx.max_ssbo / 4) as u32;
-        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32, chunk_words]);
+        let push = push_u32s(&[
+            n_in as u32,
+            n_out as u32,
+            xq_w as u32,
+            ty,
+            t as u32,
+            chunk_words,
+        ]);
         ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
-
 
     /// plans/84 B — 오프셋 지원 GEMV: MoE 전문가 슬라이스(xq 행 구간, 가중
     /// 전문가 오프셋, out 행 구간). 산술은 gemv_run과 동일 커널.
@@ -901,7 +1126,14 @@ impl VkAcc {
             p.ds
         };
         let chunk_words = (ctx.max_ssbo / 4) as u32;
-        let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, ty, t as u32, chunk_words]);
+        let push = push_u32s(&[
+            n_in as u32,
+            n_out as u32,
+            xq_w as u32,
+            ty,
+            t as u32,
+            chunk_words,
+        ]);
         ctx.run(p.pl, ds2, p.pipe, &push, n_out as u32, 1, 1)
     }
 
@@ -918,7 +1150,9 @@ impl VkAcc {
             let mut xf = self.xfbuf.lock();
             let need = t * n_in * 4;
             if !xf.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                *xf = Some(crate::rawvk::context::site::scope("value_stage", || ctx.alloc_host(need.max(1 << 21)))?);
+                *xf = Some(crate::rawvk::context::site::scope("value_stage", || {
+                    ctx.alloc_host(need.max(1 << 21))
+                })?);
             }
             let b = xf.as_ref().unwrap();
             for (ti, row) in xs.iter().enumerate() {
@@ -936,14 +1170,29 @@ impl VkAcc {
         let ds2 = ctx.bind_ds(&p, &[xfbuf, xq_buf])?;
         let xq_w = xq_words(n_in);
         let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
-        ctx.run(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1)
+        ctx.run(
+            p.pl,
+            ds2,
+            p.pipe,
+            &push,
+            ((n_in / 32) + 63) as u32 / 64,
+            t as u32,
+            1,
+        )
     }
 
     /// 값 버퍼 확보 (필요시 성장) → 핸들 반환.
-    fn value_buf(&self, ctx: &mut VkCtx, slot: &Mutex<Option<VkBuf>>, need: usize) -> Result<vk::Buffer, String> {
+    fn value_buf(
+        &self,
+        ctx: &mut VkCtx,
+        slot: &Mutex<Option<VkBuf>>,
+        need: usize,
+    ) -> Result<vk::Buffer, String> {
         let mut g = slot.lock();
         if !g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-            *g = Some(crate::rawvk::context::site::scope("value_stage", || ctx.alloc_host(need.max(1 << 21)))?);
+            *g = Some(crate::rawvk::context::site::scope("value_stage", || {
+                ctx.alloc_host(need.max(1 << 21))
+            })?);
         }
         Ok(g.as_ref().unwrap().buf)
     }
@@ -951,7 +1200,9 @@ impl VkAcc {
     /// out 버퍼에서 호스트 행 복사.
     fn download_out(&self, outs: &mut [Vec<f32>], n_out: usize, t: usize) {
         let ob = self.obuf.lock();
-        let host = unsafe { std::slice::from_raw_parts(ob.as_ref().unwrap().ptr as *const f32, t * n_out) };
+        let host = unsafe {
+            std::slice::from_raw_parts(ob.as_ref().unwrap().ptr as *const f32, t * n_out)
+        };
         for ti in 0..t {
             outs[ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);
         }
@@ -966,8 +1217,6 @@ mod matmul;
 mod ple;
 mod qsa;
 
-
-
 #[cfg(test)]
 mod q8r_tests {
     /// plans/95 P3a — 릴레이아웃 무손실 검증: 합성 q8_0 블록 ↔ 재조립 정합.
@@ -978,12 +1227,16 @@ mod q8r_tests {
         let n_blocks = n_in / 32;
         let mut raw = vec![0u8; n_out * n_blocks * 34];
         let mut lcg = 0xfeedu64;
-        let mut nxt = || { lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1); lcg >> 33 };
+        let mut nxt = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
+            lcg >> 33
+        };
         for r in 0..n_out {
             for b in 0..n_blocks {
                 let o = r * n_blocks * 34 + b * 34;
                 // 스케일: 0.5 고정(f16 비트 0x3800) — 값 검증 단순화.
-                raw[o] = 0x00; raw[o + 1] = 0x38;
+                raw[o] = 0x00;
+                raw[o + 1] = 0x38;
                 for i in 0..32 {
                     raw[o + 2 + i] = (nxt() & 0xFF) as u8;
                 }
@@ -996,10 +1249,16 @@ mod q8r_tests {
             for b in 0..n_blocks {
                 // i8 원소 순서·값 불변.
                 for i in 0..32 {
-                    assert_eq!(rel[r * row_bytes + b * 32 + i], raw[r * n_blocks * 34 + b * 34 + 2 + i], "r{r} b{b} i{i}");
+                    assert_eq!(
+                        rel[r * row_bytes + b * 32 + i],
+                        raw[r * n_blocks * 34 + b * 34 + 2 + i],
+                        "r{r} b{b} i{i}"
+                    );
                 }
                 // 스케일 f32 = 0.5.
-                let d = f32::from_le_bytes(rel[r * row_bytes + n_in + b * 4..][..4].try_into().unwrap());
+                let d = f32::from_le_bytes(
+                    rel[r * row_bytes + n_in + b * 4..][..4].try_into().unwrap(),
+                );
                 assert_eq!(d, 0.5, "scale r{r} b{b}");
             }
         }

@@ -17,46 +17,77 @@ impl Engine {
         let n_embd = hp.n_embd;
         let il = 64; // blk.64 — MTP층
         let w_eh = self.model.wchk(&format!("blk.{il}.nextn.eh_proj.weight"))?;
-        let enorm = self.model.f32_vec(&format!("blk.{il}.nextn.enorm.weight"))?;
-        let hnorm = self.model.f32_vec(&format!("blk.{il}.nextn.hnorm.weight"))?;
+        let enorm = self
+            .model
+            .f32_vec(&format!("blk.{il}.nextn.enorm.weight"))?;
+        let hnorm = self
+            .model
+            .f32_vec(&format!("blk.{il}.nextn.hnorm.weight"))?;
 
         // 1) embd(tok) 디양자화 → enorm / h_t → hnorm, concat → eh_proj
         let embd = self.model.wchk("token_embd.weight")?;
         let mut tok_row = vec![0.0f32; n_embd];
-        crate::quant::dequant_row(embd.ty, embd.data, token as u64, n_embd as u64, &mut tok_row);
+        crate::quant::dequant_row(
+            embd.ty,
+            embd.data,
+            token as u64,
+            n_embd as u64,
+            &mut tok_row,
+        );
         let e_n = crate::ops::rms_norm(&tok_row, &enorm, hp.eps);
         let h_n = crate::ops::rms_norm(h_in, &hnorm, hp.eps);
         let mut cat = vec![0.0f32; 2 * n_embd];
         cat[..n_embd].copy_from_slice(&e_n);
         cat[n_embd..].copy_from_slice(&h_n);
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
-            eprintln!("[c] cat e0={:.6} e1={:.6} esum={:.4} | h0={:.6} h1={:.6} hsum={:.4}", e_n[0], e_n[1], e_n.iter().map(|&x| x as f64).sum::<f64>(), h_n[0], h_n[1], h_n.iter().map(|&x| x as f64).sum::<f64>());
+            eprintln!(
+                "[c] cat e0={:.6} e1={:.6} esum={:.4} | h0={:.6} h1={:.6} hsum={:.4}",
+                e_n[0],
+                e_n[1],
+                e_n.iter().map(|&x| x as f64).sum::<f64>(),
+                h_n[0],
+                h_n[1],
+                h_n.iter().map(|&x| x as f64).sum::<f64>()
+            );
         }
         let acc = self.acc.clone();
         let mut cur = vec![0.0f32; n_embd];
         crate::matmul::mm(&acc, &cat, &w_eh, &mut cur)?;
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
-            eprintln!("[c] eh sum={:.5} x0={:.5} x1={:.5}", cur.iter().map(|&x| x as f64).sum::<f64>(), cur[0], cur[1]);
+            eprintln!(
+                "[c] eh sum={:.5} x0={:.5} x1={:.5}",
+                cur.iter().map(|&x| x as f64).sum::<f64>(),
+                cur[0],
+                cur[1]
+            );
         }
 
         // 2) 게이티드 어텐션 — attn_layer와 동일 구조, 자체 KV(mtp_kv_*) 사용
         let attn_out = self.mtp_attn(seq, il, &cur, pos)?;
 
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
-            eprintln!("[c] wo sum={:.5} x0={:.5}", attn_out.iter().map(|&x| x as f64).sum::<f64>(), attn_out[0]);
+            eprintln!(
+                "[c] wo sum={:.5} x0={:.5}",
+                attn_out.iter().map(|&x| x as f64).sum::<f64>(),
+                attn_out[0]
+            );
         }
         // 3) 잔차 + post_attention_norm + FFN
         for i in 0..n_embd {
             cur[i] += attn_out[i];
         }
         let ffn_res = cur.clone();
-        let post_w = self.model.f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
+        let post_w = self
+            .model
+            .f32_vec(&format!("blk.{il}.post_attention_norm.weight"))?;
         let gate_w = self.model.wchk(&format!("blk.{il}.ffn_gate.weight"))?;
         let up_w = self.model.wchk(&format!("blk.{il}.ffn_up.weight"))?;
         let down_w = self.model.wchk(&format!("blk.{il}.ffn_down.weight"))?;
         let normed = rms_norm(&cur, &post_w, hp.eps);
-        let mut gu: [Vec<Vec<f32>>; 2] =
-            [vec![vec![0.0f32; hp.n_ff]; 1], vec![vec![0.0f32; hp.n_ff]; 1]];
+        let mut gu: [Vec<Vec<f32>>; 2] = [
+            vec![vec![0.0f32; hp.n_ff]; 1],
+            vec![vec![0.0f32; hp.n_ff]; 1],
+        ];
         crate::matmul::mm_group(&acc, &[normed], &[gate_w, up_w], &mut gu)?;
         let [mut g, u] = gu;
         for i in 0..hp.n_ff {
@@ -68,20 +99,30 @@ impl Engine {
             cur[i] = ffn_out[0][i] + ffn_res[i];
         }
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
-            eprintln!("[c] ff sum={:.5} x0={:.5}", cur.iter().map(|&x| x as f64).sum::<f64>(), cur[0]);
+            eprintln!(
+                "[c] ff sum={:.5} x0={:.5}",
+                cur.iter().map(|&x| x as f64).sum::<f64>(),
+                cur[0]
+            );
         }
 
         // 4) shared head — with_logits에만 (output.weight GEMV는 고가)
         if !with_logits {
             return Ok((Vec::new(), cur));
         }
-        let sh_norm = self.model.f32_vec(&format!("blk.{il}.nextn.shared_head_norm.weight"))?;
+        let sh_norm = self
+            .model
+            .f32_vec(&format!("blk.{il}.nextn.shared_head_norm.weight"))?;
         let head = self.model.wchk("output.weight")?;
         let h = rms_norm(&cur, &sh_norm, hp.eps);
         let mut logits = vec![0.0f32; head.n_out as usize];
         crate::matmul::mm(&acc, &h, &head, &mut logits)?;
         if std::env::var_os("LLM170_MTP_STAGE").is_some() {
-            eprintln!("[c] head L0..7={:?} hnorm0..3={:?}", &logits[0..8], &h[0..4]);
+            eprintln!(
+                "[c] head L0..7={:?} hnorm0..3={:?}",
+                &logits[0..8],
+                &h[0..4]
+            );
         }
         Ok((logits, cur))
     }
@@ -110,8 +151,12 @@ impl Engine {
         let wk = self.model.wchk(&format!("blk.{il}.attn_k.weight"))?;
         let wv = self.model.wchk(&format!("blk.{il}.attn_v.weight"))?;
         let wo = self.model.wchk(&format!("blk.{il}.attn_output.weight"))?;
-        let q_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
-        let k_norm_w = self.model.f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let q_norm_w = self
+            .model
+            .f32_vec(&format!("blk.{il}.attn_q_norm.weight"))?;
+        let k_norm_w = self
+            .model
+            .f32_vec(&format!("blk.{il}.attn_k_norm.weight"))?;
         let kq_scale = hp.kq_scale();
         let acc = self.acc.clone();
 
@@ -203,7 +248,9 @@ impl Engine {
         // GPU 검증 경로 (rawhip): draft 체인(CPU MTP층 + GPU head) → 1배치 검증.
         if self.raw_decode.is_some()
             && !self.seqs[seq].mtp_h.is_empty()
-            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
             && std::env::var_os("LLM170_NO_SPEC_GPU").is_none()
         {
             return self.spec_step_gpu(seq, last_token, k);
@@ -240,7 +287,10 @@ impl Engine {
             };
             accepted.push(t);
             if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-                eprintln!("  verify j={j} target={t} draft={d} {}", if t == d { "OK" } else { "MISS" });
+                eprintln!(
+                    "  verify j={j} target={t} draft={d} {}",
+                    if t == d { "OK" } else { "MISS" }
+                );
             }
             if t != d || t == eos {
                 break;
@@ -279,7 +329,10 @@ impl Engine {
             return Ok(out);
         }
         let eos = 248044u32;
-        let rd = self.raw_decode.clone().ok_or(ModelError::Accel("raw 없음".into()))?;
+        let rd = self
+            .raw_decode
+            .clone()
+            .ok_or(ModelError::Accel("raw 없음".into()))?;
         let n_seq = seqs.len();
         let n_e = self.model.hp.n_embd;
         if self.embd_cache.is_none() {
@@ -303,7 +356,13 @@ impl Engine {
                 let seq = seqs[si];
                 let mut drafts = Vec::with_capacity(k);
                 let pending = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
-                crate::quant::dequant_row(embd_ty, &embd_arc, nexts[si] as u64, n_e as u64, &mut trow);
+                crate::quant::dequant_row(
+                    embd_ty,
+                    &embd_arc,
+                    nexts[si] as u64,
+                    n_e as u64,
+                    &mut trow,
+                );
                 let (d0, _) = rd
                     .mtp_step_gpu(seq, &trow, &pending, self.seqs[seq].pos as usize)
                     .map_err(ModelError::Accel)?;
@@ -312,8 +371,12 @@ impl Engine {
                 let mut tok = d0;
                 for _ in 1..k {
                     let dpos = self.seqs[seq].pos as usize + drafts.len() - 1;
-                    crate::quant::dequant_row(embd_ty, &embd_arc, tok as u64, n_e as u64, &mut trow);
-                    let d = rd.mtp_step_chain(seq, &trow, dpos).map_err(ModelError::Accel)?;
+                    crate::quant::dequant_row(
+                        embd_ty, &embd_arc, tok as u64, n_e as u64, &mut trow,
+                    );
+                    let d = rd
+                        .mtp_step_chain(seq, &trow, dpos)
+                        .map_err(ModelError::Accel)?;
                     drafts.push(d);
                     tok = d;
                     if d == eos {
@@ -354,7 +417,9 @@ impl Engine {
                     sseqs.push(seqs[si]);
                     for &tk in &carried[si] {
                         let mut r = vec![0.0f32; n_e];
-                        crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
+                        crate::quant::dequant_row(
+                            embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r,
+                        );
                         crows.extend(r);
                     }
                 }
@@ -365,7 +430,11 @@ impl Engine {
                         let mut cj = ci;
                         let mut rows_n = 0usize;
                         while cj < sseqs.len() {
-                            let add = starts[cj + 1..].first().copied().unwrap_or(crows.len() / n_e) - starts[cj];
+                            let add = starts[cj + 1..]
+                                .first()
+                                .copied()
+                                .unwrap_or(crows.len() / n_e)
+                                - starts[cj];
                             if rows_n + add > 60 && cj > ci {
                                 break;
                             }
@@ -373,8 +442,13 @@ impl Engine {
                             cj += 1;
                         }
                         let r0 = starts[ci] * n_e;
-                        let r1 = if cj < starts.len() { starts[cj] * n_e } else { crows.len() };
-                        let sub_starts: Vec<usize> = starts[ci..cj].iter().map(|&x| x - starts[ci]).collect();
+                        let r1 = if cj < starts.len() {
+                            starts[cj] * n_e
+                        } else {
+                            crows.len()
+                        };
+                        let sub_starts: Vec<usize> =
+                            starts[ci..cj].iter().map(|&x| x - starts[ci]).collect();
                         let mut cam: Vec<u32> = Vec::new();
                         let mut ch_all: Vec<f32> = Vec::new();
                         rd.verify_batch_ms(
@@ -405,7 +479,11 @@ impl Engine {
             group_starts.push(rows.len() / n_e);
             let pos0 = self.seqs[seqs[si]].pos as usize - carried[si].len();
             group_pos.push(pos0);
-            for &tk in carried[si].iter().chain(std::iter::once(&nexts[si])).chain(all_drafts[si].iter()) {
+            for &tk in carried[si]
+                .iter()
+                .chain(std::iter::once(&nexts[si]))
+                .chain(all_drafts[si].iter())
+            {
                 let mut r = vec![0.0f32; n_e];
                 crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
                 rows.extend(r);
@@ -422,12 +500,21 @@ impl Engine {
             // 분리라 병합과 의미동치 (커널 버그 회피용; 성능 하락).
             for si in 0..n_seq {
                 let g0 = group_starts[si];
-                let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { rows.len() / n_e };
+                let g1 = if si + 1 < n_seq {
+                    group_starts[si + 1]
+                } else {
+                    rows.len() / n_e
+                };
                 let mut am2 = Vec::new();
                 let mut h2 = Vec::new();
-                rd.raw_verify(seqs[si], group_pos[si], &rows[g0 * n_e..g1 * n_e],
-                              &mut am2, &mut h2)
-                    .map_err(ModelError::Accel)?;
+                rd.raw_verify(
+                    seqs[si],
+                    group_pos[si],
+                    &rows[g0 * n_e..g1 * n_e],
+                    &mut am2,
+                    &mut h2,
+                )
+                .map_err(ModelError::Accel)?;
                 am.extend_from_slice(&am2);
                 h_all.extend_from_slice(&h2);
             }
@@ -451,14 +538,22 @@ impl Engine {
             rd.gdn_restore().map_err(ModelError::Accel)?;
             for si in 0..n_seq {
                 let g0 = group_starts[si];
-                let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { rows.len() / n_e };
+                let g1 = if si + 1 < n_seq {
+                    group_starts[si + 1]
+                } else {
+                    rows.len() / n_e
+                };
                 let sub: Vec<f32> = rows[g0 * n_e..g1 * n_e].to_vec();
                 let mut am2: Vec<u32> = Vec::new();
                 let mut h2: Vec<f32> = Vec::new();
                 rd.raw_verify(seqs[si], group_pos[si], &sub, &mut am2, &mut h2)
                     .map_err(ModelError::Accel)?;
-                eprintln!("[AB] seq={} merged={:?} single={:?}", seqs[si],
-                    &am[g0..g1], &am2);
+                eprintln!(
+                    "[AB] seq={} merged={:?} single={:?}",
+                    seqs[si],
+                    &am[g0..g1],
+                    &am2
+                );
             }
         }
         // ── 시퀀스별 수용 판정 (신규 세그먼트: next+drafts)
@@ -479,13 +574,21 @@ impl Engine {
             let full = accepted.len() == drafts.len()
                 && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a);
             if full {
-                let g1 = if si + 1 < n_seq { group_starts[si + 1] } else { am.len() };
+                let g1 = if si + 1 < n_seq {
+                    group_starts[si + 1]
+                } else {
+                    am.len()
+                };
                 accepted.push(am[g1 - 1]); // 보너스 (마지막 행)
             } else {
                 _all_full = false;
             }
             // kept new rows = next + matched drafts (보너스 제외)
-            let matched = if full { drafts.len() } else { accepted.len().saturating_sub(1) };
+            let matched = if full {
+                drafts.len()
+            } else {
+                accepted.len().saturating_sub(1)
+            };
             new_kept.push(1 + matched);
             results.push(accepted);
         }
@@ -501,9 +604,10 @@ impl Engine {
                 let g0 = group_starts[si];
                 let next_off = carried[si].len();
                 let drafts = &all_drafts[si];
-                let full = drafts.iter().enumerate().all(|(j, &d)| {
-                    am[g0 + next_off + j] == d && am[g0 + next_off + j] != eos
-                });
+                let full = drafts
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &d)| am[g0 + next_off + j] == d && am[g0 + next_off + j] != eos);
                 seq_full.push(full);
                 if !full {
                     _all_full = false;
@@ -537,7 +641,9 @@ impl Engine {
                             let mut crows = Vec::with_capacity(c.len() * n_e);
                             for &tk in &c {
                                 let mut r = vec![0.0f32; n_e];
-                                crate::quant::dequant_row(embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r);
+                                crate::quant::dequant_row(
+                                    embd_ty, &embd_arc, tk as u64, n_e as u64, &mut r,
+                                );
                                 crows.extend(r);
                             }
                             let mut cam = Vec::new();
@@ -588,7 +694,6 @@ impl Engine {
         Ok(results)
     }
 
-
     pub fn flush_carried(&mut self, seq: usize) -> Result<(), ModelError> {
         let carried = std::mem::take(&mut self.seqs[seq].gdn_carried);
         if carried.is_empty() {
@@ -613,7 +718,8 @@ impl Engine {
         let pos0 = self.seqs[seq].pos as usize - carried.len();
         let mut am = Vec::new();
         let mut h = Vec::new();
-        rd.raw_verify(seq, pos0, &rows, &mut am, &mut h).map_err(ModelError::Accel)?;
+        rd.raw_verify(seq, pos0, &rows, &mut am, &mut h)
+            .map_err(ModelError::Accel)?;
         Ok(())
     }
 
@@ -625,7 +731,10 @@ impl Engine {
     ) -> Result<(Vec<u32>, usize), ModelError> {
         let eos = 248044u32;
         let sp_t0 = std::time::Instant::now();
-        let rd = self.raw_decode.clone().ok_or(ModelError::Accel("raw 없음".into()))?;
+        let rd = self
+            .raw_decode
+            .clone()
+            .ok_or(ModelError::Accel("raw 없음".into()))?;
         let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨
         let t_draft0 = std::time::Instant::now();
         // ── draft: step-0 = (last_token, pending_h) 시프트 페어링; j≥1 = 체인 자가 h
@@ -658,9 +767,15 @@ impl Engine {
                 let mut trow = vec![0.0f32; n_e];
                 crate::quant::dequant_row(embd_ty, embd_data, tok as u64, n_e as u64, &mut trow);
                 let td = std::time::Instant::now();
-                let d = rd.mtp_step_chain(seq, &trow, dpos).map_err(ModelError::Accel)?;
+                let d = rd
+                    .mtp_step_chain(seq, &trow, dpos)
+                    .map_err(ModelError::Accel)?;
                 if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-                    eprintln!("[ch] j={j} deq={:.2}ms step={:.2}ms", td.duration_since(tc).as_secs_f64()*1e3, td.elapsed().as_secs_f64()*1e3);
+                    eprintln!(
+                        "[ch] j={j} deq={:.2}ms step={:.2}ms",
+                        td.duration_since(tc).as_secs_f64() * 1e3,
+                        td.elapsed().as_secs_f64() * 1e3
+                    );
                 }
                 drafts.push(d);
                 tok = d;
@@ -670,7 +785,11 @@ impl Engine {
             }
         }
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[sp] draft chain={:.1}ms k={}", t_draft0.elapsed().as_secs_f64() * 1e3, drafts.len());
+            eprintln!(
+                "[sp] draft chain={:.1}ms k={}",
+                t_draft0.elapsed().as_secs_f64() * 1e3,
+                drafts.len()
+            );
         }
         let t_v0 = std::time::Instant::now();
         // ── verify: [carried..., last_token, d0, d1, ...] 1배치 — 행별 argmax = 다음 토큰 정답
@@ -700,13 +819,24 @@ impl Engine {
             }
             let mut cam: Vec<u32> = Vec::new();
             let mut ch_all: Vec<f32> = Vec::new();
-            rd.raw_verify(seq, (base_pos - carried.len() as u32) as usize, &crows, &mut cam, &mut ch_all)
-                .map_err(ModelError::Accel)?;
+            rd.raw_verify(
+                seq,
+                (base_pos - carried.len() as u32) as usize,
+                &crows,
+                &mut cam,
+                &mut ch_all,
+            )
+            .map_err(ModelError::Accel)?;
             // 커밋 후 mtp 진행도 보강 (멱등 — 신규 행만)
             for i in 1..carried.len() {
                 let h_prev = ch_all[(i - 1) * n_c..i * n_c].to_vec();
-                rd.mtp_step_adv(seq, &crows[i * n_c..(i + 1) * n_c], &h_prev, (base_pos as usize) - carried.len() + i)
-                    .map_err(ModelError::Accel)?;
+                rd.mtp_step_adv(
+                    seq,
+                    &crows[i * n_c..(i + 1) * n_c],
+                    &h_prev,
+                    (base_pos as usize) - carried.len() + i,
+                )
+                .map_err(ModelError::Accel)?;
             }
             carried = Vec::new();
         }
@@ -734,7 +864,10 @@ impl Engine {
         }
         // 부분수용 대비 GDN/conv 스냅샷 (KV는 위치 색인이라 자가치유)
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[vv] rows+dequant={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[vv] rows+dequant={:.1}ms",
+                t_v0.elapsed().as_secs_f64() * 1e3
+            );
         }
         rd.gdn_snapshot().map_err(ModelError::Accel)?;
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
@@ -745,7 +878,10 @@ impl Engine {
         rd.raw_verify(seq, pos0 as usize, &rows, &mut am, &mut h_all)
             .map_err(ModelError::Accel)?;
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[vv] raw_verify={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[vv] raw_verify={:.1}ms",
+                t_v0.elapsed().as_secs_f64() * 1e3
+            );
         }
         // 수용 (신규 세그먼트만): am[carried_n + j] vs drafts[j]
         let mut accepted: Vec<u32> = Vec::new();
@@ -761,7 +897,11 @@ impl Engine {
                 "  gpu-verify pos={base_pos} carried={carried_n} drafts={drafts:?} am={am:?} acc_n={}",
                 if accepted.len() == drafts.len()
                     && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a)
-                { accepted.len() + 1 } else { accepted.len().max(1) }
+                {
+                    accepted.len() + 1
+                } else {
+                    accepted.len().max(1)
+                }
             );
         }
         let all_acc = accepted.len() == drafts.len()
@@ -781,7 +921,10 @@ impl Engine {
             self.seqs[seq].gdn_carried = row_toks[..carried_n + kept_new].to_vec();
         }
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[sp] verify+decide={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[sp] verify+decide={:.1}ms",
+                t_v0.elapsed().as_secs_f64() * 1e3
+            );
         }
         let t_adv0 = std::time::Instant::now();
         // ── MTP 상태 진행 (시프트 페어링): 행 0은 draft step-0이 이미 처리.
@@ -799,7 +942,12 @@ impl Engine {
         // 시퀀스 pos 동기 — 유지 신규 행 수만 반영
         self.seqs[seq].pos = base_pos + (kept_new as u32);
         if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[sp] advance={:.1}ms | step total={:.1}ms acc={}", t_adv0.elapsed().as_secs_f64() * 1e3, sp_t0.elapsed().as_secs_f64() * 1e3, accepted.len());
+            eprintln!(
+                "[sp] advance={:.1}ms | step total={:.1}ms acc={}",
+                t_adv0.elapsed().as_secs_f64() * 1e3,
+                sp_t0.elapsed().as_secs_f64() * 1e3,
+                accepted.len()
+            );
         }
         let n = accepted.len().max(1);
         Ok((accepted, n))

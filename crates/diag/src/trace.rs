@@ -3,8 +3,8 @@
 //! 백엔드(hipEvent/VK timestamp)가 시간을 계산해 완료한 이벤트만 받는다.
 //! 캡처 게이트는 AtomicBool(Relaxed) — 꺼졌을 때 런치패스 비용 = 원자 1회.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// resolved 이벤트 — 백엔드 어댑터가 채운 완성품.
 #[derive(Debug, Clone)]
@@ -106,7 +106,8 @@ pub fn summarize(evs: &[Ev]) -> Vec<(String, u32, f64, u32)> {
         e.0 += ev.dur_ms;
         e.1 += 1;
     }
-    let mut v: Vec<_> = m.into_iter()
+    let mut v: Vec<_> = m
+        .into_iter()
         .map(|((n, g), (ms, c))| (n.to_string(), g, ms, c))
         .collect();
     v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -128,7 +129,8 @@ pub fn gap_by_pred(evs: &[Ev]) -> Vec<(String, f64, u32)> {
         }
     }
     let _ = gap_tot;
-    let mut v: Vec<_> = m.into_iter()
+    let mut v: Vec<_> = m
+        .into_iter()
         .map(|(n, (ms, c))| (n.to_string(), ms, c))
         .collect();
     v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -145,13 +147,34 @@ mod tests {
         // off 상태 push는 무시
         capture_end();
         assert!(!capture_on());
-        push(Ev { name: "x", lane: 1, start_ms: 0.0, dur_ms: 1.0, gap_next_ms: None, seq_ms: 0.0 });
+        push(Ev {
+            name: "x",
+            lane: 1,
+            start_ms: 0.0,
+            dur_ms: 1.0,
+            gap_next_ms: None,
+            seq_ms: 0.0,
+        });
         let (evs, _) = take();
         assert!(evs.is_empty(), "off 상태 push는 무시돼야 한다");
         // on 상태: 순차 시각·갭 귀속
         capture_begin();
-        push(Ev { name: "a", lane: 1, start_ms: 0.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 });
-        push(Ev { name: "b", lane: 2, start_ms: 12.0, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 });
+        push(Ev {
+            name: "a",
+            lane: 1,
+            start_ms: 0.0,
+            dur_ms: 10.0,
+            gap_next_ms: None,
+            seq_ms: 0.0,
+        });
+        push(Ev {
+            name: "b",
+            lane: 2,
+            start_ms: 12.0,
+            dur_ms: 5.0,
+            gap_next_ms: None,
+            seq_ms: 0.0,
+        });
         let (evs, dropped) = take();
         assert_eq!(evs.len(), 2);
         assert_eq!(dropped, 0);
@@ -164,9 +187,30 @@ mod tests {
     #[test]
     fn summarize_sorted() {
         let evs = vec![
-            Ev { name: "b", lane: 1, start_ms: 0.0, dur_ms: 5.0, gap_next_ms: None, seq_ms: 0.0 },
-            Ev { name: "a", lane: 1, start_ms: 5.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
-            Ev { name: "a", lane: 1, start_ms: 15.0, dur_ms: 10.0, gap_next_ms: None, seq_ms: 0.0 },
+            Ev {
+                name: "b",
+                lane: 1,
+                start_ms: 0.0,
+                dur_ms: 5.0,
+                gap_next_ms: None,
+                seq_ms: 0.0,
+            },
+            Ev {
+                name: "a",
+                lane: 1,
+                start_ms: 5.0,
+                dur_ms: 10.0,
+                gap_next_ms: None,
+                seq_ms: 0.0,
+            },
+            Ev {
+                name: "a",
+                lane: 1,
+                start_ms: 15.0,
+                dur_ms: 10.0,
+                gap_next_ms: None,
+                seq_ms: 0.0,
+            },
         ];
         let s = summarize(&evs);
         assert_eq!(s[0].0, "a");

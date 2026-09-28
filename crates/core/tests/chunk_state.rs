@@ -20,10 +20,10 @@
 //! 읽고, 커널 판정은 rawhip probes(`gdn_ar_invariance`/`gdn_conv_invariance`,
 //! 모델 불필요·결정적)를 신뢰할 것. mm_group 블록(무상태)은 신뢰 가능하다.
 
+use llm170_core::qwen4exp::Model4;
 use llm170_core::qwen4exp::frame;
 use llm170_core::qwen4exp::layers::SeqState4;
 use llm170_core::qwen4exp::stages::Ctx;
-use llm170_core::qwen4exp::Model4;
 use std::path::Path;
 
 const MODEL: &str =
@@ -36,7 +36,10 @@ const NTOK: usize = 64;
 const SIZES: [usize; 4] = [16, 24, 32, 64];
 
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -55,14 +58,22 @@ fn chunk_size_state_divergence() {
     };
     let hp = m.hp.clone();
     acc.set_ctx_len(CTX);
-    let ctx = Ctx { model: &m, acc: Some(&*acc) };
+    let ctx = Ctx {
+        model: &m,
+        acc: Some(&*acc),
+    };
     eprintln!(
         "# hp n_group={} d_state={} dt_rank={} conv_k={} n_layer={} vocab={}",
         hp.n_group, hp.d_state, hp.dt_rank, hp.conv_k, hp.n_layer, hp.vocab
     );
     // 게이트와 같은 실프롬프트 — 합성 토큰은 모델을 혼돈 영역에 넣어 어떤
     // 수치 차이도 증폭되므로 불변성 판정에 부적합하다(2026-09-17 실측).
-    let toks: Vec<u32> = vec![386, 18, 15, 15, 643, 20, 20, 19586, 5876, 8058, 4144, 67, 21, 7307, 22, 20, 23, 24902, 17, 16, 23, 386, 18, 66, 19, 386, 17, 24, 19, 24902, 16, 16, 19586, 66, 21, 65, 23, 1692, 22, 22, 19, 4144, 341, 15, 11, 17374, 67, 23, 15, 1692, 15, 65, 15, 1692, 22, 19, 15, 17374, 66, 16, 19, 386, 17, 69];
+    let toks: Vec<u32> = vec![
+        386, 18, 15, 15, 643, 20, 20, 19586, 5876, 8058, 4144, 67, 21, 7307, 22, 20, 23, 24902, 17,
+        16, 23, 386, 18, 66, 19, 386, 17, 24, 19, 24902, 16, 16, 19586, 66, 21, 65, 23, 1692, 22,
+        22, 19, 4144, 341, 15, 11, 17374, 67, 23, 15, 1692, 15, 65, 15, 1692, 22, 19, 15, 17374,
+        66, 16, 19, 386, 17, 69,
+    ];
 
     let n_slot = SIZES.len() + 1;
     let mut sts: Vec<SeqState4> = (0..n_slot).map(|_| SeqState4::new(&hp, CTX)).collect();
@@ -72,7 +83,8 @@ fn chunk_size_state_divergence() {
     // 엔진 규칙: 프레임 상태는 호스트(SeqState4)가 정본 — 첫 사용 전 동기화.
     for slot in 0..n_slot {
         let st = std::mem::replace(&mut sts[slot], SeqState4::new(&hp, CTX));
-        f.sync_states(&*acc, slot, &st, hp.d_state).expect("sync_states");
+        f.sync_states(&*acc, slot, &st, hp.d_state)
+            .expect("sync_states");
         sts[slot] = st;
     }
 
@@ -83,14 +95,19 @@ fn chunk_size_state_divergence() {
             let slot = n_slot - 1 - k;
             let mut st = SeqState4::new(&hp, CTX);
             f.sync_states(&*acc, slot, &st, hp.d_state).expect("sync");
-            let lg = frame::frame_forward(&*acc, &m, &ctx, slot, &mut st, &mut f, &toks)
-                .expect("1×64");
+            let lg =
+                frame::frame_forward(&*acc, &m, &ctx, slot, &mut st, &mut f, &toks).expect("1×64");
             logs.push(lg);
         }
         for k in 1..4 {
             let d = maxdiff(&logs[0], &logs[k]);
-            eprintln!("# 슬롯 비결정성: 슬롯{} vs 슬롯{} maxΔ={:.3e} {}", n_slot - 1, n_slot - 1 - k, d,
-                if d == 0.0 { "동일 ✓" } else { "다름 ✗" });
+            eprintln!(
+                "# 슬롯 비결정성: 슬롯{} vs 슬롯{} maxΔ={:.3e} {}",
+                n_slot - 1,
+                n_slot - 1 - k,
+                d,
+                if d == 0.0 { "동일 ✓" } else { "다름 ✗" }
+            );
         }
     }
 
@@ -102,13 +119,22 @@ fn chunk_size_state_divergence() {
         let hc = hp.hc;
         let mut m64 = vec![0.0f32; 16 * n];
         let mut r64 = vec![0.0f32; 16 * hc * n];
-        frame::frame_forward(&*acc, &m, &ctx, n_slot - 1, &mut sts[n_slot - 1], &mut f, &toks)
-            .expect("1×64(비교용)");
+        frame::frame_forward(
+            &*acc,
+            &m,
+            &ctx,
+            n_slot - 1,
+            &mut sts[n_slot - 1],
+            &mut f,
+            &toks,
+        )
+        .expect("1×64(비교용)");
         acc.frame_read(f.mix, &mut m64).expect("mix 1×64");
         acc.frame_read(f.res_hc, &mut r64).expect("res 1×64");
         // 슬롯 n_slot-2: 첫 16토큰만 별도로
         let mut st16 = SeqState4::new(&hp, CTX);
-        f.sync_states(&*acc, n_slot - 2, &st16, hp.d_state).expect("sync");
+        f.sync_states(&*acc, n_slot - 2, &st16, hp.d_state)
+            .expect("sync");
         frame::frame_forward(&*acc, &m, &ctx, n_slot - 2, &mut st16, &mut f, &toks[..16])
             .expect("1×16");
         let mut m16 = vec![0.0f32; 16 * n];
@@ -119,7 +145,11 @@ fn chunk_size_state_divergence() {
             "# 은닉 행0..15: res_hc maxΔ={:.3e} · mix maxΔ={:.3e} → {}",
             maxdiff(&r64, &r16),
             maxdiff(&m64, &m16),
-            if maxdiff(&r64, &r16) == 0.0 && maxdiff(&m64, &m16) == 0.0 { "t 불변 ✓" } else { "t 의존 ✗" }
+            if maxdiff(&r64, &r16) == 0.0 && maxdiff(&m64, &m16) == 0.0 {
+                "t 불변 ✓"
+            } else {
+                "t 의존 ✗"
+            }
         );
     }
 
@@ -129,7 +159,10 @@ fn chunk_size_state_divergence() {
     let ref_tok = llm170_core::qwen35::greedy(&ref_logits);
     eprintln!("# 참조(1×{NTOK}) 토큰={ref_tok}");
 
-    eprintln!("# {:>5} {:>6} {:>12} {:>12} {:>12}", "청크", "청크수", "logits maxΔ", "상대", "토큰");
+    eprintln!(
+        "# {:>5} {:>6} {:>12} {:>12} {:>12}",
+        "청크", "청크수", "logits maxΔ", "상대", "토큰"
+    );
     for (i, &c) in SIZES.iter().enumerate() {
         let slot = i + 1;
         let mut f_last = Vec::new();
@@ -140,7 +173,10 @@ fn chunk_size_state_divergence() {
         let lg = f_last;
         let md = maxdiff(&lg, &ref_logits);
         // 참조 스케일(최대 |logit|) 대비 상대 오차
-        let scale = ref_logits.iter().fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-3);
+        let scale = ref_logits
+            .iter()
+            .fold(0.0f32, |m, &x| m.max(x.abs()))
+            .max(1e-3);
         let tok = llm170_core::qwen35::greedy(&lg);
         eprintln!(
             "# {:>5} {:>6} {:>12.3e} {:>12.3e} {:>12}",
@@ -148,7 +184,11 @@ fn chunk_size_state_divergence() {
             NTOK.div_ceil(c),
             md,
             md / scale,
-            if tok == ref_tok { format!("{tok}") } else { format!("{tok} ✗") }
+            if tok == ref_tok {
+                format!("{tok}")
+            } else {
+                format!("{tok} ✗")
+            }
         );
     }
 
@@ -180,15 +220,17 @@ fn chunk_size_state_divergence() {
         );
         let mut seed = 0x1234_5678u64;
         let mut lcg = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
         };
         let xin: Vec<f32> = (0..NTOK * n).map(|_| lcg()).collect();
         acc.frame_write(a_in, &xin).expect("write A");
         acc.frame_write(b_in, &xin).expect("write B");
         acc.frame_begin(NTOK);
-        acc.frame_mm_group(a_in, &[wk, wz, wb, wa],
-            &[a_out, az, aba, aba], NTOK).expect("mm_group 1×t");
+        acc.frame_mm_group(a_in, &[wk, wz, wb, wa], &[a_out, az, aba, aba], NTOK)
+            .expect("mm_group 1×t");
         let mut oa = vec![0.0f32; NTOK * conv_ch];
         acc.frame_read(a_out, &mut oa).expect("read A");
         // 밴드 4×16 — 입력·출력 모두 행 밴드 슬라이스
@@ -196,26 +238,42 @@ fn chunk_size_state_divergence() {
             let off = c * 16;
             let (i2, o2) = (
                 acc.frame_slice(b_in, off * n, 16 * n).expect("in band"),
-                acc.frame_slice(b_out, off * conv_ch, 16 * conv_ch).expect("out band"),
+                acc.frame_slice(b_out, off * conv_ch, 16 * conv_ch)
+                    .expect("out band"),
             );
             let z2 = acc.frame_slice(bz, off * n, 16 * n).expect("z band");
-            let b2 = acc.frame_slice(bba, off * hp.dt_rank, 16 * hp.dt_rank).expect("b band");
+            let b2 = acc
+                .frame_slice(bba, off * hp.dt_rank, 16 * hp.dt_rank)
+                .expect("b band");
             acc.frame_begin(16);
-            acc.frame_mm_group(i2, &[wk, wz, wb, wa],
-                &[o2, z2, b2, b2], 16).expect("mm_group band");
+            acc.frame_mm_group(i2, &[wk, wz, wb, wa], &[o2, z2, b2, b2], 16)
+                .expect("mm_group band");
         }
         let mut ob = vec![0.0f32; NTOK * conv_ch];
         acc.frame_read(b_out, &mut ob).expect("read B");
         let mx = maxdiff(&oa, &ob);
-        let first = oa.iter().zip(&ob).enumerate()
+        let first = oa
+            .iter()
+            .zip(&ob)
+            .enumerate()
             .find(|(_, (x, y))| x.to_bits() != y.to_bits())
             .map(|(i, _)| format!("out[{i}] (행 {} 열 {})", i / conv_ch, i % conv_ch));
-        let nbad = oa.iter().zip(&ob).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-        eprintln!("# mm_group(실무게) 1×{NTOK} vs {}×16: maxΔ={mx:.3e} ({nbad}/{}) {} → {}",
+        let nbad = oa
+            .iter()
+            .zip(&ob)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        eprintln!(
+            "# mm_group(실무게) 1×{NTOK} vs {}×16: maxΔ={mx:.3e} ({nbad}/{}) {} → {}",
             NTOK / 16,
             oa.len(),
             first.unwrap_or_else(|| "-".into()),
-            if mx == 0.0 { "t 불변 ✓" } else { "t 의존 ✗" });
+            if mx == 0.0 {
+                "t 불변 ✓"
+            } else {
+                "t 의존 ✗"
+            }
+        );
     }
 
     // GDN 상태 비교 — 참조(1×64) vs 각 청킹, 첫 발산 층 보고.
@@ -236,7 +294,8 @@ fn chunk_size_state_divergence() {
             let mut ga = vec![0.0f32; gs];
             let mut gb = vec![0.0f32; gs];
             acc.frame_read(f.st_conv[0][ri], &mut ca).expect("conv A");
-            acc.frame_read(f.st_conv[slot][ri], &mut cb).expect("conv B");
+            acc.frame_read(f.st_conv[slot][ri], &mut cb)
+                .expect("conv B");
             acc.frame_read(f.st_gdn[0][ri], &mut ga).expect("ar A");
             acc.frame_read(f.st_gdn[slot][ri], &mut gb).expect("ar B");
             let (dc, dg) = (maxdiff(&ca, &cb), maxdiff(&ga, &gb));
@@ -250,8 +309,6 @@ fn chunk_size_state_divergence() {
             }
             ri += 1;
         }
-        eprintln!(
-            "# 청크 {c:>3}: 첫 발산 conv=L{fc:?}({mc:.2e}) ar=L{fa:?}({ma:.2e})"
-        );
+        eprintln!("# 청크 {c:>3}: 첫 발산 conv=L{fc:?}({mc:.2e}) ar=L{fa:?}({ma:.2e})");
     }
 }

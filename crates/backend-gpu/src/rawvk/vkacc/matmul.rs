@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// plans/93 — F32 바이트 → GGUF Q8_0 (f16 스케일 + 32×i8, 34B/블록).
 /// tile_q8128 커널이 기대하는 표준 레이아웃. 꼬리 블록 남은 원소는 0 패딩.
 fn f32_to_q8_0_bytes(data: &[u8], n_elem: usize) -> Vec<u8> {
@@ -42,7 +41,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     /// plans/86 §8 — 프레임 경로 완성(§1 정확성·§2 QSA 디바이스화·§5 성능) 후
     /// 기본 ON. 킬스위치 LLM170_VK_FRAME=0.
     fn frame_capable(&self) -> bool {
-        std::env::var("LLM170_VK_FRAME").map(|v| v != "0").unwrap_or(true)
+        std::env::var("LLM170_VK_FRAME")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     }
     /// plans/85 §2 — 프레임 로짓 행별 argmax: fn_argmax_rows 2단 판.
     /// 동률 최저 인덱스 — CPU greedy_from과 동일 의미. 미구현이면 greedy
@@ -52,7 +53,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         // WG당 256스레드×8원소 = 2048. stage1은 1워크그룹(256) 축소 — n_wg ≤ 256.
         let n_wg = vocab.div_ceil(2048);
         if n_wg > 256 || vocab == 0 || t == 0 {
-            return Err(format!("vk frame_argmax_rows: 형상 초과 n_wg={n_wg} vocab={vocab} t={t}"));
+            return Err(format!(
+                "vk frame_argmax_rows: 형상 초과 n_wg={n_wg} vocab={vocab} t={t}"
+            ));
         }
         let sc_bytes = 2 * n_wg * t * 4;
         let out_bytes = t * 4;
@@ -69,10 +72,12 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 Some(b) => b.0.bytes < sc_bytes || b.1.bytes < out_bytes,
             };
             if need {
-                *g = Some(crate::rawvk::context::site::scope("argmax", || Ok::<_, String>((
-                    ctx.alloc_host(sc_bytes.max(1 << 16))?,
-                    ctx.alloc_host(out_bytes.max(4096))?,
-                )))?);
+                *g = Some(crate::rawvk::context::site::scope("argmax", || {
+                    Ok::<_, String>((
+                        ctx.alloc_host(sc_bytes.max(1 << 16))?,
+                        ctx.alloc_host(out_bytes.max(4096))?,
+                    ))
+                })?);
             }
         }
         let (scb, ob) = {
@@ -126,9 +131,21 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         let mut push = eps.to_le_bytes().to_vec();
         push.extend_from_slice(&1.0f32.to_le_bytes());
         push.extend_from_slice(&push_u32s(&[
-            pos0 as u32, n_head as u32, n_kv as u32, hd as u32, n_rot as u32,
+            pos0 as u32,
+            n_head as u32,
+            n_kv as u32,
+            hd as u32,
+            n_rot as u32,
         ]));
-        ctx.run(p.pl, ds2, p.pipe, &push, (n_head + n_kv) as u32, t as u32, 1)
+        ctx.run(
+            p.pl,
+            ds2,
+            p.pipe,
+            &push,
+            (n_head + n_kv) as u32,
+            t as u32,
+            1,
+        )
     }
 
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
@@ -137,7 +154,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         if std::env::var_os("LLM170_VK_POOL").is_some_and(|v| v == "0") {
             let mut ctx = self.ctx.lock();
             let b = crate::rawvk::context::site::scope("frame", || ctx.alloc_host(len * 4))?;
-            let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let h = self
+                .frame_next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.framebufs.lock().insert(h, b);
             return Ok(h);
         }
@@ -159,7 +178,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 crate::rawvk::context::site::scope("frame", || ctx.alloc_host(need))?
             }
         };
-        let h = self.frame_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let h = self
+            .frame_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.framebufs.lock().insert(h, b);
         Ok(h)
     }
@@ -189,7 +210,12 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         Ok(())
     }
     fn frame_write_u32(&self, h: u64, data: &[u32]) -> Result<(), String> {
-        let ptr = self.framebufs.lock().get(&h).ok_or("vk frame_write_u32: 핸들 없음")?.ptr;
+        let ptr = self
+            .framebufs
+            .lock()
+            .get(&h)
+            .ok_or("vk frame_write_u32: 핸들 없음")?
+            .ptr;
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u32, data.len()) };
         Ok(())
     }
@@ -203,7 +229,12 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     }
     fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
         self.frame_sync();
-        let ptr = self.framebufs.lock().get(&h).ok_or("vk frame_read: 핸들 없음")?.ptr;
+        let ptr = self
+            .framebufs
+            .lock()
+            .get(&h)
+            .ok_or("vk frame_read: 핸들 없음")?
+            .ptr;
         unsafe { std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), out.len()) };
         Ok(())
     }
@@ -224,7 +255,13 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     }
     /// plans/104 — 격리 quant 판(공유전문가): xq2 전용 버퍼로 라우팅 xq 와
     /// 독립 병행.
-    fn frame_mm_group_sep(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+    fn frame_mm_group_sep(
+        &self,
+        x: u64,
+        ws: &[Weight],
+        outs: &[u64],
+        t: usize,
+    ) -> Result<(), String> {
         self.frame_mm_group_ex(x, ws, outs, t, false, true)
     }
     fn frame_op(&self, op: &llm170_core::matmul::FrameOp) -> Result<(), String> {
@@ -233,20 +270,34 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         let mut ctx = self.ctx.lock();
         self.frame_resume_batch(&mut ctx);
         match *op {
-            O::RmsRows { x, w, out, eps, n, w_reps } => {
+            O::RmsRows {
+                x,
+                w,
+                out,
+                eps,
+                n,
+                w_reps,
+            } => {
                 let (xb, wb, ob) = (self.fbuf(x)?, self.fbuf(w)?, self.fbuf(out)?);
                 let rows = w_reps * t_cur;
                 // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
                 // 32스레드 원판(산술 그대로, 실측 우위).
-                let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+                let resf16 = std::env::var("LLM170_VK_RESF16")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
                 let slot = if rows >= 2 {
-                    if resf16 { Slot::RmsWideF16 } else { Slot::RmsWide }
+                    if resf16 {
+                        Slot::RmsWideF16
+                    } else {
+                        Slot::RmsWide
+                    }
                 } else {
                     Slot::Rms
                 };
                 // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장(기본 ON).
                 // plans/103: res_hc 입력 f16은 별도 변형 슬롯(f32 쌍둥이 불변).
-                let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16) && w_reps > 1
+                let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16)
+                    && w_reps > 1
                     && llm170_core::qwen4exp::frame::hcf16_enabled();
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
@@ -258,7 +309,17 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 } else {
                     self.f16bufs.lock().remove(&out);
                 }
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1, &[xb, wb], &[ob])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    rows as u32,
+                    1,
+                    1,
+                    &[xb, wb],
+                    &[ob],
+                )?;
             }
             O::SiluDiv { t, div, n } => {
                 let tb = self.fbuf(t)?;
@@ -266,7 +327,17 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let ds2 = ctx.bind_ds(&p, &[tb])?;
                 let mut push = push_u32s(&[n as u32]);
                 push.extend_from_slice(&div.to_le_bytes());
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[tb], &[tb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[tb],
+                    &[tb],
+                )?;
             }
             O::SiluMul { g, u, out, n } => {
                 self.last_silu_out
@@ -293,9 +364,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let tgt = {
                         let mut sl = self.moe_xq_pair.lock();
                         let need = rows * xq_w * 4;
-                        let ok = sl
-                            .as_ref()
-                            .is_some_and(|v| (v.3.bytes as usize) >= need);
+                        let ok = sl.as_ref().is_some_and(|v| (v.3.bytes as usize) >= need);
                         if !ok {
                             *sl = Some((0, 0, 0, ctx.alloc(need)?));
                         }
@@ -306,7 +375,17 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         v.3.buf
                     };
                     let ds2 = ctx.bind_ds(&p, &[gb, ub, tgt])?;
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, rows as u32, 1, &[gb, ub], &[tgt])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        ((n_in / 32) + 63) as u32 / 64,
+                        rows as u32,
+                        1,
+                        &[gb, ub],
+                        &[tgt],
+                    )?;
                 } else {
                     let g16 = self.f16bufs.lock().contains(&g);
                     if g16 {
@@ -327,7 +406,19 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         (p, ds2, push_u32s(&[n as u32]))
                     };
                     let rds: Vec<vk::Buffer> = if g16 { vec![gb, ub] } else { vec![gb, ub] };
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (n.div_ceil(2) as u32).div_ceil(256).max((n as u32).div_ceil(256)), 1, 1, &rds, &[ob])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        (n.div_ceil(2) as u32)
+                            .div_ceil(256)
+                            .max((n as u32).div_ceil(256)),
+                        1,
+                        1,
+                        &rds,
+                        &[ob],
+                    )?;
                 }
             }
             O::Scale { t, s, n } => {
@@ -336,21 +427,57 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let ds2 = ctx.bind_ds(&p, &[tb])?;
                 let mut push = push_u32s(&[n as u32]);
                 push.extend_from_slice(&s.to_le_bytes());
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[tb], &[tb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[tb],
+                    &[tb],
+                )?;
             }
-            O::CopyRows { src, dst, src_off, dst_off, n } => {
+            O::CopyRows {
+                src,
+                dst,
+                src_off,
+                dst_off,
+                n,
+            } => {
                 let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
                 let p = self.pipeline(&mut ctx, Slot::CopyRows)?;
                 let ds2 = ctx.bind_ds(&p, &[sb, db])?;
                 let push = push_u32s(&[n as u32, src_off as u32, dst_off as u32]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[sb], &[db])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[sb],
+                    &[db],
+                )?;
             }
             O::BcastRows { src, dst, n, rows } => {
                 let (sb, db) = (self.fbuf(src)?, self.fbuf(dst)?);
                 let p = self.pipeline(&mut ctx, Slot::BcastRows)?;
                 let ds2 = ctx.bind_ds(&p, &[sb, db])?;
                 let push = push_u32s(&[n as u32, rows as u32]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[sb], &[db])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[sb],
+                    &[db],
+                )?;
             }
             O::AxpyScaled { y, x, s, n } => {
                 let (yb, xb, sb) = (self.fbuf(y)?, self.fbuf(x)?, self.fbuf(s)?);
@@ -358,16 +485,43 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let p = self.pipeline(&mut ctx, Slot::AxpyT)?; // pp=n → s[0]와 동일
                     let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
                     let push = push_u32s(&[n as u32, n as u32]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[yb, xb, sb], &[yb])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        (n as u32).div_ceil(256),
+                        1,
+                        1,
+                        &[yb, xb, sb],
+                        &[yb],
+                    )?;
                 } else {
                     let pp = n / t_cur;
                     let p = self.pipeline(&mut ctx, Slot::AxpyT)?;
                     let ds2 = ctx.bind_ds(&p, &[yb, xb, sb])?;
                     let push = push_u32s(&[n as u32, pp as u32]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[yb, xb, sb], &[yb])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        (n as u32).div_ceil(256),
+                        1,
+                        1,
+                        &[yb, xb, sb],
+                        &[yb],
+                    )?;
                 }
             }
-            O::HcGateMean { xn, gate, out, hc, n, h16 } => {
+            O::HcGateMean {
+                xn,
+                gate,
+                out,
+                hc,
+                n,
+                h16,
+            } => {
                 let (xb, gb, ob) = (self.fbuf(xn)?, self.fbuf(gate)?, self.fbuf(out)?);
                 let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
@@ -376,51 +530,159 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let xn16 = self.f16bufs.lock().contains(&xn);
                 let flags = u32::from(h16) | (u32::from(xn16) << 1);
                 let push = push_u32s(&[hc as u32, n as u32, total as u32, flags]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(128), 1, 1, &[xb, gb], &[ob])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (total as u32).div_ceil(128),
+                    1,
+                    1,
+                    &[xb, gb],
+                    &[ob],
+                )?;
             }
-            O::HcCombine { res, out, inj, hc, n, total: _ } => {
+            O::HcCombine {
+                res,
+                out,
+                inj,
+                hc,
+                n,
+                total: _,
+            } => {
                 let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
                 let tn = n * t_cur;
                 // plans/103: res_hc f16 버스 — RMW 변형 슬롯(페어 소유).
-                let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
-                let slot = if resf16 { Slot::HcCombineF16 } else { Slot::HcCombine };
+                let resf16 = std::env::var("LLM170_VK_RESF16")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let slot = if resf16 {
+                    Slot::HcCombineF16
+                } else {
+                    Slot::HcCombine
+                };
                 let p2 = self.pipeline(&mut ctx, slot)?;
                 let ds3 = ctx.bind_ds(&p2, &[rb, ob, ib])?;
                 let push = push_u32s(&[hc as u32, n as u32, tn as u32]);
-                ctx.run_rw(p2.pl, ds3, p2.pipe, &push, (tn as u32).div_ceil(128), 1, 1, &[rb, ob, ib], &[rb])?;
+                ctx.run_rw(
+                    p2.pl,
+                    ds3,
+                    p2.pipe,
+                    &push,
+                    (tn as u32).div_ceil(128),
+                    1,
+                    1,
+                    &[rb, ob, ib],
+                    &[rb],
+                )?;
             }
-            O::NormGated { o, z, w, out, eps, d, n_h } => {
-                let (ob, zb, wb, ub) = (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);
+            O::NormGated {
+                o,
+                z,
+                w,
+                out,
+                eps,
+                d,
+                n_h,
+            } => {
+                let (ob, zb, wb, ub) =
+                    (self.fbuf(o)?, self.fbuf(z)?, self.fbuf(w)?, self.fbuf(out)?);
                 let p = self.pipeline(&mut ctx, Slot::NormGatedSig)?;
                 let ds2 = ctx.bind_ds(&p, &[ob, zb, wb, ub])?;
                 let mut push = push_u32s(&[d as u32, n_h as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_h * t_cur) as u32, 1, 1, &[ob, zb, wb], &[ub])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n_h * t_cur) as u32,
+                    1,
+                    1,
+                    &[ob, zb, wb],
+                    &[ub],
+                )?;
             }
-            O::GdnBetaG { b, a, dtb, sa, bg, n_h } => {
-                let (bb, ab, db, sb, gb) = (self.fbuf(b)?, self.fbuf(a)?, self.fbuf(dtb)?, self.fbuf(sa)?, self.fbuf(bg)?);
+            O::GdnBetaG {
+                b,
+                a,
+                dtb,
+                sa,
+                bg,
+                n_h,
+            } => {
+                let (bb, ab, db, sb, gb) = (
+                    self.fbuf(b)?,
+                    self.fbuf(a)?,
+                    self.fbuf(dtb)?,
+                    self.fbuf(sa)?,
+                    self.fbuf(bg)?,
+                );
                 let p = self.pipeline(&mut ctx, Slot::GdnBetaG)?;
                 let ds2 = ctx.bind_ds(&p, &[bb, ab, db, sb, gb])?;
                 let dr = n_h / t_cur.max(1);
                 let push = push_u32s(&[n_h as u32, dr as u32]);
                 // 판은 64스레드 — 128로 나누면 절반이 미기입된다(청크 크기별
                 // 커버리지가 달라져 청크 불변성 위반의 원인이었다).
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_h as u32).div_ceil(64), 1, 1, &[bb, ab, db, sb], &[gb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n_h as u32).div_ceil(64),
+                    1,
+                    1,
+                    &[bb, ab, db, sb],
+                    &[gb],
+                )?;
             }
             O::Sigmoid { t, n } => {
                 let tb = self.fbuf(t)?;
                 let p = self.pipeline(&mut ctx, Slot::EwSigmoid)?;
                 let ds2 = ctx.bind_ds(&p, &[tb])?;
                 let push = push_u32s(&[n as u32]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (n as u32).div_ceil(256), 1, 1, &[tb], &[tb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (n as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[tb],
+                    &[tb],
+                )?;
             }
-            O::Split3 { src, d0, d1, d2, n0, n1, n2 } => {
-                let (sb, a0, a1, a2) = (self.fbuf(src)?, self.fbuf(d0)?, self.fbuf(d1)?, self.fbuf(d2)?);
+            O::Split3 {
+                src,
+                d0,
+                d1,
+                d2,
+                n0,
+                n1,
+                n2,
+            } => {
+                let (sb, a0, a1, a2) = (
+                    self.fbuf(src)?,
+                    self.fbuf(d0)?,
+                    self.fbuf(d1)?,
+                    self.fbuf(d2)?,
+                );
                 let p = self.pipeline(&mut ctx, Slot::Split3)?;
                 let ds2 = ctx.bind_ds(&p, &[sb, a0, a1, a2])?;
                 let push = push_u32s(&[n0 as u32, n1 as u32, n2 as u32]);
                 let total = (n0 + n1 + n2) * t_cur;
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(64), 1, 1, &[sb], &[a0, a1, a2])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (total as u32).div_ceil(64),
+                    1,
+                    1,
+                    &[sb],
+                    &[a0, a1, a2],
+                )?;
             }
             O::L2Rows { x, eps, d, n } => {
                 let xb = self.fbuf(x)?;
@@ -431,53 +693,141 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let rows = (n / d).max(1);
                 ctx.run_rw(p.pl, ds2, p.pipe, &push, rows as u32, 1, 1, &[xb], &[xb])?;
             }
-            O::L2Rows2Scale { q, k, eps, scale, d, n_group } => {
+            O::L2Rows2Scale {
+                q,
+                k,
+                eps,
+                scale,
+                d,
+                n_group,
+            } => {
                 let (qb, kb) = (self.fbuf(q)?, self.fbuf(k)?);
                 let p = self.pipeline(&mut ctx, Slot::L2Rows2Scale)?;
                 let ds2 = ctx.bind_ds(&p, &[qb, kb])?;
                 let mut push = push_u32s(&[d as u32, n_group as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());
                 push.extend_from_slice(&scale.to_le_bytes());
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, n_group as u32, 1, 1, &[qb, kb], &[qb, kb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    n_group as u32,
+                    1,
+                    1,
+                    &[qb, kb],
+                    &[qb, kb],
+                )?;
             }
-            O::GdnConv { qkv, cw, state, out, ch, k, t_len } => {
-                let (qb, cb, sb, ob) = (self.fbuf(qkv)?, self.fbuf(cw)?, self.fbuf(state)?, self.fbuf(out)?);
+            O::GdnConv {
+                qkv,
+                cw,
+                state,
+                out,
+                ch,
+                k,
+                t_len,
+            } => {
+                let (qb, cb, sb, ob) = (
+                    self.fbuf(qkv)?,
+                    self.fbuf(cw)?,
+                    self.fbuf(state)?,
+                    self.fbuf(out)?,
+                );
                 let binds3 = [qb, cb, sb, ob];
                 if t_len >= k - 1 {
                     // 병렬 청크판 + 상태 갱신 2런치 (hip과 동일 구조)
                     let p = self.pipeline(&mut ctx, Slot::GdnConvT2)?;
                     let ds2 = ctx.bind_ds(&p, &binds3)?;
                     let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), t_len as u32, 1, &[qb, cb, sb], &[ob])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        (ch as u32).div_ceil(64),
+                        t_len as u32,
+                        1,
+                        &[qb, cb, sb],
+                        &[ob],
+                    )?;
                     let p2 = self.pipeline(&mut ctx, Slot::GdnConvState)?;
                     let ds3 = ctx.bind_ds(&p2, &[qb, sb])?;
                     let push2 = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run_rw(p2.pl, ds3, p2.pipe, &push2, (k - 1) as u32, (ch as u32).div_ceil(64), 1, &[qb], &[sb])?;
+                    ctx.run_rw(
+                        p2.pl,
+                        ds3,
+                        p2.pipe,
+                        &push2,
+                        (k - 1) as u32,
+                        (ch as u32).div_ceil(64),
+                        1,
+                        &[qb],
+                        &[sb],
+                    )?;
                 } else {
                     // 짧은 꼬리: 순차판 (상태 회전 포함)
                     let p = self.pipeline(&mut ctx, Slot::GdnConvSeq)?;
                     let ds2 = ctx.bind_ds(&p, &binds3)?;
                     let push = push_u32s(&[ch as u32, k as u32, t_len as u32]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, (ch as u32).div_ceil(64), 1, 1, &[qb, cb, sb], &[ob, sb])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        (ch as u32).div_ceil(64),
+                        1,
+                        1,
+                        &[qb, cb, sb],
+                        &[ob, sb],
+                    )?;
                 }
             }
-            O::MoeTop10 { route, ids, wt, n_exp, k_sel } => {
+            O::MoeTop10 {
+                route,
+                ids,
+                wt,
+                n_exp,
+                k_sel,
+            } => {
                 let (rb, ib, wb) = (self.fbuf(route)?, self.fbuf(ids)?, self.fbuf(wt)?);
                 let p = self.pipeline(&mut ctx, Slot::MoeTop10)?;
                 let ds2 = ctx.bind_ds(&p, &[rb, ib, wb])?;
                 let push = push_u32s(&[n_exp as u32, k_sel as u32]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, t_cur as u32, 1, 1, &[rb], &[ib, wb])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    t_cur as u32,
+                    1,
+                    1,
+                    &[rb],
+                    &[ib, wb],
+                )?;
                 // plans/88 P2 — 라우팅 세대 증가: 그룹화 캐시 무효화 키.
-                self.moe_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.moe_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             O::MoeWeightedSum { ys, wt, out, k, n } => {
                 let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
                 let y16 = self.f16bufs.lock().contains(&ys);
-                let p = self.pipeline(&mut ctx, if y16 { Slot::FnMoeWsumH } else { Slot::MoeWsum })?;
+                let p =
+                    self.pipeline(&mut ctx, if y16 { Slot::FnMoeWsumH } else { Slot::MoeWsum })?;
                 let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
                 let total = n * t_cur;
                 let push = push_u32s(&[n as u32, k as u32, total as u32]);
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, (total as u32).div_ceil(256), 1, 1, &[yb, wb], &[ob])?;
+                ctx.run_rw(
+                    p.pl,
+                    ds2,
+                    p.pipe,
+                    &push,
+                    (total as u32).div_ceil(256),
+                    1,
+                    1,
+                    &[yb, wb],
+                    &[ob],
+                )?;
             }
             ref other => return Err(format!("vk frame_op: 미지원 {other:?}")),
         }
@@ -503,7 +853,10 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let n_out = w.n_out as usize;
         let t = xs.len();
         if std::env::var_os("LLM170_VK_MBDBG").is_some() {
-            eprintln!("[mb] ty={:?} n_in={} n_out={} t={}", w.ty, w.n_in, w.n_out, t);
+            eprintln!(
+                "[mb] ty={:?} n_in={} n_out={} t={}",
+                w.ty, w.n_in, w.n_out, t
+            );
         }
         let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
@@ -517,8 +870,12 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         if t >= 2
             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
             && wbufs.len() == 1
-            && std::env::var_os("LLM170_VK_MBTILE").map(|v| v != "0").unwrap_or(true)
-            && std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+            && std::env::var_os("LLM170_VK_MBTILE")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            && std::env::var("LLM170_VK_CM")
+                .map(|v| v != "0")
+                .unwrap_or(true)
         {
             let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -540,7 +897,8 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
             if big {
                 // plans/92 P1: 단일 디스패치(슬래브 x, 행 y) — 커널 유도 tok_base.
                 let gys = (t as u32).div_ceil(128);
-                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, 0u32]);
+                let push =
+                    push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, 0u32]);
                 ctx.run(p.pl, ds2, p.pipe, &push, gys, gx, 1)?;
             } else {
                 for tb in (0..t).step_by(64) {
@@ -564,9 +922,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         ws: &[Weight],
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), String> {
-        if ws.iter().any(|w| vk_ty(w.ty).is_none())
-            || ws.iter().any(|w| w.n_in != ws[0].n_in)
-        {
+        if ws.iter().any(|w| vk_ty(w.ty).is_none()) || ws.iter().any(|w| w.n_in != ws[0].n_in) {
             for (w, out) in ws.iter().zip(outs.iter_mut()) {
                 self.matmul_batch(xs, w, out)?;
             }
@@ -594,7 +950,11 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
                 while g.len() <= wi {
                     g.push(None);
                 }
-                if g[wi].as_ref().map(|b| b.bytes >= t * n_out * 4).unwrap_or(false) {
+                if g[wi]
+                    .as_ref()
+                    .map(|b| b.bytes >= t * n_out * 4)
+                    .unwrap_or(false)
+                {
                     g[wi].as_ref().unwrap().buf
                 } else {
                     let b = ctx.alloc_host(t * n_out * 4)?;
@@ -630,11 +990,21 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
 
 impl VkAcc {
     /// plans/101 P1 — hout 플래그 확장 그룹 GEMM(트레이트 외부).
-    fn frame_mm_group_ex(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize, hout: bool, xq_sep: bool) -> Result<(), String> {
+    fn frame_mm_group_ex(
+        &self,
+        x: u64,
+        ws: &[Weight],
+        outs: &[u64],
+        t: usize,
+        hout: bool,
+        xq_sep: bool,
+    ) -> Result<(), String> {
         // plans/93: F32 가중 → Q8_0 로드 시 변환(env 게이트 LLM170_F32Q8=1).
         // tile_f32 347ms → tile_q8128 경로(~115ms): 가중 판독 4× 절감.
         // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
-        let do_f32q8 = std::env::var("LLM170_F32Q8").map(|v| v == "1").unwrap_or(false)
+        let do_f32q8 = std::env::var("LLM170_F32Q8")
+            .map(|v| v == "1")
+            .unwrap_or(false)
             && ws.iter().any(|w| w.ty == llm170_gguf::GgmlType::F32);
         // plans/93: 변환 캐시 — 가중(ptr,len)마다 1회 변환, 이후 Arc 클론.
         // 소유권: Arc<Vec<u8>>가 살아있는 동안 슬라이스 유효 (conv_arcs가 보유).
@@ -665,9 +1035,19 @@ impl VkAcc {
             .zip(ws.iter())
             .map(|(c, w)| {
                 if c.is_empty() {
-                    Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out }
+                    Weight {
+                        data: w.data,
+                        ty: w.ty,
+                        n_in: w.n_in,
+                        n_out: w.n_out,
+                    }
                 } else {
-                    Weight { data: c.as_slice(), ty: llm170_gguf::GgmlType::Q8_0, n_in: w.n_in, n_out: w.n_out }
+                    Weight {
+                        data: c.as_slice(),
+                        ty: llm170_gguf::GgmlType::Q8_0,
+                        n_in: w.n_in,
+                        n_out: w.n_out,
+                    }
                 }
             })
             .collect();
@@ -698,27 +1078,41 @@ impl VkAcc {
             let p = self.pipeline(&mut ctx, if src16 { Slot::QuantF16in } else { Slot::Quant })?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
-            ctx.run_rw(p.pl, ds2, p.pipe, &push, ((n_in / 32) + 63) as u32 / 64, t as u32, 1, &[xb], &[xq])?;
+            ctx.run_rw(
+                p.pl,
+                ds2,
+                p.pipe,
+                &push,
+                ((n_in / 32) + 63) as u32 / 64,
+                t as u32,
+                1,
+                &[xb],
+                &[xq],
+            )?;
             xq
         } else {
             vk::Buffer::null()
         };
         let mut mmgrp_skip: Vec<bool> = vec![false; ws.len()];
         if t < 16
-            && std::env::var("LLM170_VK_MMBGRP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_VK_MMBGRP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
             && !ws.is_empty()
             && ws.len() <= 8
         {
             let dty0 = dense_ty(ws[0].ty);
             let single_chunk: Vec<bool> = ws
                 .iter()
-                .map(|w| self.weight_bufs(&mut ctx, w).map(|b| b.len() == 1).unwrap_or(false))
+                .map(|w| {
+                    self.weight_bufs(&mut ctx, w)
+                        .map(|b| b.len() == 1)
+                        .unwrap_or(false)
+                })
                 .collect();
             let groupable = dty0.is_some()
                 && ws.iter().enumerate().all(|(wi, w)| {
-                    dense_ty(w.ty) == dty0
-                        && w.n_in as usize == n_in
-                        && single_chunk[wi]
+                    dense_ty(w.ty) == dty0 && w.n_in as usize == n_in && single_chunk[wi]
                 });
             // 혼합 그룹: f32 멤버만 부분 그룹화(양자 멤버는 기존 경로).
             let (use_group, gw_idx): (bool, Vec<usize>) = if groupable {
@@ -727,7 +1121,9 @@ impl VkAcc {
                 let sub: Vec<usize> = ws
                     .iter()
                     .enumerate()
-                    .filter(|(wi, w)| dense_ty(w.ty) == dty0 && w.n_in as usize == n_in && single_chunk[*wi])
+                    .filter(|(wi, w)| {
+                        dense_ty(w.ty) == dty0 && w.n_in as usize == n_in && single_chunk[*wi]
+                    })
                     .map(|(wi, _)| wi)
                     .collect();
                 (sub.len() >= 2, sub)
@@ -771,7 +1167,9 @@ impl VkAcc {
                 for &wi in &gw_idx {
                     grp_ob.push(self.fbuf(outs[wi])?);
                 }
-                ctx.run_rw(p.pl, ds2, p.pipe, &push, total_rows, t as u32, 1, &binds, &grp_ob)?;
+                ctx.run_rw(
+                    p.pl, ds2, p.pipe, &push, total_rows, t as u32, 1, &binds, &grp_ob,
+                )?;
             }
         }
         let mut xs: Vec<Vec<f32>> = Vec::new();
@@ -780,14 +1178,20 @@ impl VkAcc {
             if vk_ty(w.ty).is_none() && dense_ty(w.ty).is_none() {
                 need_pullback = true;
                 if std::env::var_os("LLM170_F32S_TRACE").is_some() {
-                    eprintln!("[pullbk] n_in={n_in} ty={:?}", ws.iter().map(|w| w.ty).collect::<Vec<_>>());
+                    eprintln!(
+                        "[pullbk] n_in={n_in} ty={:?}",
+                        ws.iter().map(|w| w.ty).collect::<Vec<_>>()
+                    );
                 }
                 break;
             }
         }
         if need_pullback {
             if std::env::var_os("LLM170_VK_PULLDBG").is_some() {
-                eprintln!("[pull] n_in={n_in} tys={:?}", ws.iter().map(|w| format!("{:?}", w.ty)).collect::<Vec<_>>());
+                eprintln!(
+                    "[pull] n_in={n_in} tys={:?}",
+                    ws.iter().map(|w| format!("{:?}", w.ty)).collect::<Vec<_>>()
+                );
             }
             // plans/84 B: 미지원 타입(f32 inject 등)은 값경로 폴백 — 프레임 f32를
             // 판독해 MatmulHost(CPU 포함)로 계산하고 out에 기록한다.
@@ -823,7 +1227,10 @@ impl VkAcc {
             match vk_ty(w.ty) {
                 Some(ty) => {
                     if std::env::var_os("LLM170_VK_MMDBG").is_some() {
-                        eprintln!("[mm] ty={ty} n_in={n_in} n_out={n_out} t={t} bytes={}", w.data.len());
+                        eprintln!(
+                            "[mm] ty={ty} n_in={n_in} n_out={n_out} t={t} bytes={}",
+                            w.data.len()
+                        );
                     }
                     // plans/88 P2 — 프리필(t≥2) 밀집 타일: gemv3 t-루프는
                     // 실측 ~5GB/s(gemv 6.6s/208tok). 타일(K-슬라이스 스테이징)로
@@ -834,13 +1241,17 @@ impl VkAcc {
                     // 2행 WG. [ts] 기준선 gemv 77ms/step — 272-329GB/s급으로
                     // 기대. 킬스위치 LLM170_VK_G8=0(종전 quant+gemv3).
                     if t < 16
-                        && std::env::var("LLM170_VK_G8").map(|v| v != "0").unwrap_or(true)
+                        && std::env::var("LLM170_VK_G8")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                         && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)?
                     {
                         continue;
                     }
                     let dense_tile = t >= 2
-                        && std::env::var_os("LLM170_VK_DTILE").map(|v| v != "0").unwrap_or(true)
+                        && std::env::var_os("LLM170_VK_DTILE")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                         && match w.ty {
                             GgmlType::Q8_0 => true,
                             GgmlType::Q4K => n_in <= 4096,
@@ -855,8 +1266,12 @@ impl VkAcc {
                         // 25GB/s) 대체. 킬스위치 구조 — opt-in =1.
                         if t >= 2
                             && w.ty == GgmlType::Q8_0
-                            && (std::env::var("LLM170_VK_Q8D").map(|v| v == "1").unwrap_or(false)
-                                || std::env::var("LLM170_VK_Q8MMQ").map(|v| v == "1").unwrap_or(false))
+                            && (std::env::var("LLM170_VK_Q8D")
+                                .map(|v| v == "1")
+                                .unwrap_or(false)
+                                || std::env::var("LLM170_VK_Q8MMQ")
+                                    .map(|v| v == "1")
+                                    .unwrap_or(false))
                         {
                             let key = (w.data.as_ptr() as usize, w.data.len());
                             let w8 = {
@@ -864,8 +1279,7 @@ impl VkAcc {
                                 if let Some(b) = c.get(&key) {
                                     b.buf
                                 } else {
-                                    let bytes =
-                                        q8_0_relayout(w.data, n_in, w.n_out as usize);
+                                    let bytes = q8_0_relayout(w.data, n_in, w.n_out as usize);
                                     let b = ctx.alloc_host(bytes.len())?;
                                     unsafe {
                                         std::ptr::copy_nonoverlapping(
@@ -879,10 +1293,16 @@ impl VkAcc {
                                     buf
                                 }
                             };
-                            let use_d = std::env::var("LLM170_VK_Q8D").map(|v| v == "1").unwrap_or(false);
+                            let use_d = std::env::var("LLM170_VK_Q8D")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
                             let p = self.pipeline(
                                 &mut ctx,
-                                if use_d { Slot::FnTileQ8d } else { Slot::FnTileQ8mmq },
+                                if use_d {
+                                    Slot::FnTileQ8d
+                                } else {
+                                    Slot::FnTileQ8mmq
+                                },
                             )?;
                             let mut binds: Vec<vk::Buffer> = vec![w8];
                             while binds.len() < 8 {
@@ -893,7 +1313,17 @@ impl VkAcc {
                             let ds2 = ctx.bind_ds(&p, &binds)?;
                             let push =
                                 push_u32s(&[n_in as u32, n_out as u32, t as u32, xq_w as u32]);
-                            ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(64), (t as u32).div_ceil(if use_d { 16 } else { 64 }), 1, &[w8, xq], &[ob])?;
+                            ctx.run_rw(
+                                p.pl,
+                                ds2,
+                                p.pipe,
+                                &push,
+                                (n_out as u32).div_ceil(64),
+                                (t as u32).div_ceil(if use_d { 16 } else { 64 }),
+                                1,
+                                &[w8, xq],
+                                &[ob],
+                            )?;
                             continue;
                         }
                         let chunk_words = (ctx.max_ssbo / 4) as u32;
@@ -907,7 +1337,9 @@ impl VkAcc {
                         // decoder ms/128 패밀리(f16 coopMatMulAdd) 직접 재사용.
                         // 스칼라 K-슬라이스 타일은 ALU 바운드([ts] tile_q8
                         // 2818ms/청크). 킬스위치 LLM170_VK_CM=0.
-                        if std::env::var("LLM170_VK_CM").map(|v| v != "0").unwrap_or(true)
+                        if std::env::var("LLM170_VK_CM")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
                             && wbufs.len() == 1
                         {
@@ -924,7 +1356,11 @@ impl VkAcc {
                             if std::env::var_os("LLM170_T8_LOG").is_some() {
                                 use std::sync::atomic::{AtomicU64, Ordering};
                                 static N: AtomicU64 = AtomicU64::new(0);
-                                eprintln!("[t8log] #{:?} ty={:?} n_in={n_in} n_out={n_out} t={t}", N.fetch_add(1, Ordering::Relaxed), w.ty);
+                                eprintln!(
+                                    "[t8log] #{:?} ty={:?} n_in={n_in} n_out={n_out} t={t}",
+                                    N.fetch_add(1, Ordering::Relaxed),
+                                    w.ty
+                                );
                             }
                             if big {
                                 // plans/92 P1: 128 패밀리 단일 디스패치(슬래브 x,
@@ -938,12 +1374,14 @@ impl VkAcc {
                                 if w.ty == GgmlType::Q8_0
                                     && t >= 128
                                     && !hout
-                                    && n_out <= std::env::var("LLM170_VK_Q8KS_MAX")
-                                        .ok().and_then(|v| v.parse::<usize>().ok())
-                                        // plans/105: 기본 512 — 0.28nat 드리프트
-                                        // (f32s 밴드)·skinny −19%·스킵 20스텝 불변.
-                                        // 킬스위치 =0.
-                                        .unwrap_or(512)
+                                    && n_out
+                                        <= std::env::var("LLM170_VK_Q8KS_MAX")
+                                            .ok()
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                            // plans/105: 기본 512 — 0.28nat 드리프트
+                                            // (f32s 밴드)·skinny −19%·스킵 20스텝 불변.
+                                            // 킬스위치 =0.
+                                            .unwrap_or(512)
                                 {
                                     let ks: u32 = 8;
                                     let gys8 = (t as u32).div_ceil(128);
@@ -961,26 +1399,56 @@ impl VkAcc {
                                     binds.push(scr);
                                     let pk = self.pipeline(&mut ctx, Slot::TileQ8128Ks)?;
                                     let dsk = ctx.bind_ds(&pk, &binds)?;
-                                    let pushk = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, ks]);
-                                    ctx.run_rw(pk.pl, dsk, pk.pipe, &pushk, gys8, gx, ks, &binds, &[scr])?;
+                                    let pushk = push_u32s(&[
+                                        n_in as u32,
+                                        n_out as u32,
+                                        xq_w as u32,
+                                        t as u32,
+                                        0u32,
+                                        ks,
+                                    ]);
+                                    ctx.run_rw(
+                                        pk.pl,
+                                        dsk,
+                                        pk.pipe,
+                                        &pushk,
+                                        gys8,
+                                        gx,
+                                        ks,
+                                        &binds,
+                                        &[scr],
+                                    )?;
                                     let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
                                     let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
                                     let n_tot = (t * n_out) as u32;
                                     let pushr = push_u32s(&[n_tot, ks]);
-                                    ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                                    ctx.run_rw(
+                                        pr.pl,
+                                        dsr,
+                                        pr.pipe,
+                                        &pushr,
+                                        n_tot.div_ceil(128),
+                                        1,
+                                        1,
+                                        &[scr],
+                                        &[ob],
+                                    )?;
                                     continue;
                                 }
                                 let gys = (t as u32).div_ceil(128);
                                 // plans/102: 스키니(n_out≤512) q8_0 → K-분할판.
                                 // 점유 붕괴(WG 20개·6GB/s) 치유 — z=K슬라이스.
                                 let skinny = w.ty == GgmlType::Q8_0
-                                    && n_out <= std::env::var("LLM170_VK_Q8K_MAX")
-                                        .ok().and_then(|v| v.parse::<usize>().ok())
-                                        .unwrap_or(0)
+                                    && n_out
+                                        <= std::env::var("LLM170_VK_Q8K_MAX")
+                                            .ok()
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                            .unwrap_or(0)
                                     && t >= 128
                                     && !hout
                                     && std::env::var("LLM170_VK_Q8K")
-                                        .map(|v| v != "0").unwrap_or(true);
+                                        .map(|v| v != "0")
+                                        .unwrap_or(true);
                                 if skinny {
                                     let ks: u32 = ((n_in.div_ceil(256) as u32) / 8).clamp(2, 8);
                                     let need = ks as usize * t * n_out * 4;
@@ -997,35 +1465,77 @@ impl VkAcc {
                                     binds.push(scr);
                                     let p2 = self.pipeline(&mut ctx, Slot::TileQ8ks)?;
                                     let ds3 = ctx.bind_ds(&p2, &binds)?;
-                                    let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, ks]);
-                                    ctx.run_rw(p2.pl, ds3, p2.pipe, &push, gys, gx, ks, &binds, &[scr])?;
+                                    let push = push_u32s(&[
+                                        n_in as u32,
+                                        n_out as u32,
+                                        xq_w as u32,
+                                        t as u32,
+                                        0u32,
+                                        ks,
+                                    ]);
+                                    ctx.run_rw(
+                                        p2.pl,
+                                        ds3,
+                                        p2.pipe,
+                                        &push,
+                                        gys,
+                                        gx,
+                                        ks,
+                                        &binds,
+                                        &[scr],
+                                    )?;
                                     // 축소: out = Σ_s 부분합(결정론 순서).
                                     let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
                                     let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
                                     let n_tot = (t * n_out) as u32;
                                     let pushr = push_u32s(&[n_tot, ks]);
-                                    ctx.run_rw(pr.pl, dsr, pr.pipe, &pushr, n_tot.div_ceil(128), 1, 1, &[scr], &[ob])?;
+                                    ctx.run_rw(
+                                        pr.pl,
+                                        dsr,
+                                        pr.pipe,
+                                        &pushr,
+                                        n_tot.div_ceil(128),
+                                        1,
+                                        1,
+                                        &[scr],
+                                        &[ob],
+                                    )?;
                                     continue;
                                 }
                                 // plans/101 P1: hout=1 → outv packed f16(HC gate 축).
-                                let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, t as u32, 0u32, u32::from(hout)]);
+                                let push = push_u32s(&[
+                                    n_in as u32,
+                                    n_out as u32,
+                                    xq_w as u32,
+                                    t as u32,
+                                    0u32,
+                                    u32::from(hout),
+                                ]);
                                 ctx.run_rw(p.pl, ds2, p.pipe, &push, gys, gx, 1, &binds, &[ob])?;
                             } else {
                                 for tb in (0..t).step_by(64) {
                                     let nt = (t - tb).min(64) as u32;
-                                    let push = push_u32s(&[n_in as u32, n_out as u32, xq_w as u32, nt, tb as u32]);
+                                    let push = push_u32s(&[
+                                        n_in as u32,
+                                        n_out as u32,
+                                        xq_w as u32,
+                                        nt,
+                                        tb as u32,
+                                    ]);
                                     ctx.run_rw(p.pl, ds2, p.pipe, &push, gx, 1, 1, &binds, &[ob])?;
                                 }
                             }
-                        // plans/95 P3 계측: q8128 형상 수집(1회성).
-                        if std::env::var_os("LLM170_Q8_TRACE").is_some() {
-                            static N8: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let n = N8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 12 {
-                                eprintln!("[q8128] #{n} n_in={n_in} n_out={n_out} t={t} big={big}");
+                            // plans/95 P3 계측: q8128 형상 수집(1회성).
+                            if std::env::var_os("LLM170_Q8_TRACE").is_some() {
+                                static N8: std::sync::atomic::AtomicUsize =
+                                    std::sync::atomic::AtomicUsize::new(0);
+                                let n = N8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 12 {
+                                    eprintln!(
+                                        "[q8128] #{n} n_in={n_in} n_out={n_out} t={t} big={big}"
+                                    );
+                                }
                             }
-                        }
                             continue;
                         }
                         match w.ty {
@@ -1034,12 +1544,30 @@ impl VkAcc {
                                 let ds2 = ctx.bind_ds(&p, &binds)?;
                                 // PC: n_in, n_out, chunk_words, xq_w, t.
                                 let push = push_u32s(&[
-                                    n_in as u32, n_out as u32, chunk_words, xq_w as u32, t as u32,
+                                    n_in as u32,
+                                    n_out as u32,
+                                    chunk_words,
+                                    xq_w as u32,
+                                    t as u32,
                                 ]);
-                                ctx.run_rw(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, t.div_ceil(16) as u32, 1, &binds, &[ob])?;
+                                ctx.run_rw(
+                                    p.pl,
+                                    ds2,
+                                    p.pipe,
+                                    &push,
+                                    n_out.div_ceil(16) as u32,
+                                    t.div_ceil(16) as u32,
+                                    1,
+                                    &binds,
+                                    &[ob],
+                                )?;
                             }
                             _ => {
-                                let slot = if w.ty == GgmlType::Q4K { Slot::FnMoeTileQ4K } else { Slot::FnMoeTileQ51 };
+                                let slot = if w.ty == GgmlType::Q4K {
+                                    Slot::FnMoeTileQ4K
+                                } else {
+                                    Slot::FnMoeTileQ51
+                                };
                                 let p = self.pipeline(&mut ctx, slot)?;
                                 let mut b2 = binds.clone();
                                 b2.push(dbuf); // rowexp
@@ -1048,9 +1576,25 @@ impl VkAcc {
                                 let ds2 = ctx.bind_ds(&p, &b2)?;
                                 // PC: n_in, n_out, per_expert(0), chunk_words, xq_w, mode=1, t.
                                 let push = push_u32s(&[
-                                    n_in as u32, n_out as u32, 0u32, chunk_words, xq_w as u32, 1u32, t as u32,
+                                    n_in as u32,
+                                    n_out as u32,
+                                    0u32,
+                                    chunk_words,
+                                    xq_w as u32,
+                                    1u32,
+                                    t as u32,
                                 ]);
-                                ctx.run_rw(p.pl, ds2, p.pipe, &push, n_out.div_ceil(16) as u32, t.div_ceil(16) as u32, 1, &binds, &[ob])?;
+                                ctx.run_rw(
+                                    p.pl,
+                                    ds2,
+                                    p.pipe,
+                                    &push,
+                                    n_out.div_ceil(16) as u32,
+                                    t.div_ceil(16) as u32,
+                                    1,
+                                    &binds,
+                                    &[ob],
+                                )?;
                             }
                         }
                         continue;
@@ -1063,7 +1607,11 @@ impl VkAcc {
                             std::sync::atomic::AtomicUsize::new(0);
                         let n = NB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if n < 40 {
-                            eprintln!("[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={} src16={}", dense_ty(w.ty).unwrap_or(9), self.f16bufs.lock().contains(&x));
+                            eprintln!(
+                                "[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={} src16={}",
+                                dense_ty(w.ty).unwrap_or(9),
+                                self.f16bufs.lock().contains(&x)
+                            );
                         }
                     }
                     // plans/88 P1 — f32/BF16 밀식 GEMV(값폴백 소거).
@@ -1077,7 +1625,9 @@ impl VkAcc {
                     // 킬스위치 LLM170_VK_FT32=0.
                     if t >= 2
                         && wbufs.len() == 1
-                        && std::env::var("LLM170_VK_FT32").map(|v| v != "0").unwrap_or(true)
+                        && std::env::var("LLM170_VK_FT32")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                     {
                         // plans/93: tile_f32_w는 실측 역행(558ms vs 352ms) — 원판 유지.
                         // plans/95 P1 — 스키니 f32(n_out ≤ 512): tile_f32는
@@ -1095,7 +1645,14 @@ impl VkAcc {
                             && std::env::var("LLM170_VK_FT32S").map(|v| v != "0").unwrap_or(true)
                         {
                             let src16 = self.f16bufs.lock().contains(&x);
-                            let p = self.pipeline(&mut ctx, if src16 { Slot::FnTileF32sH } else { Slot::FnTileF32s })?;
+                            let p = self.pipeline(
+                                &mut ctx,
+                                if src16 {
+                                    Slot::FnTileF32sH
+                                } else {
+                                    Slot::FnTileF32s
+                                },
+                            )?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
                             // W0u(slot1)에도 동일 버퍼 — BF16 uint 뷰.
                             while binds.len() < 8 {
@@ -1104,10 +1661,19 @@ impl VkAcc {
                             binds.push(xb);
                             binds.push(ob);
                             let ds2 = ctx.bind_ds(&p, &binds)?;
-                            let push = push_u32s(&[
-                                n_in as u32, n_out as u32, t as u32, dty, n_in as u32,
-                            ]);
-                            ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1, &binds, &[ob])?;
+                            let push =
+                                push_u32s(&[n_in as u32, n_out as u32, t as u32, dty, n_in as u32]);
+                            ctx.run_rw(
+                                p.pl,
+                                ds2,
+                                p.pipe,
+                                &push,
+                                (n_out as u32).div_ceil(16),
+                                (t as u32).div_ceil(16),
+                                1,
+                                &binds,
+                                &[ob],
+                            )?;
                             continue;
                         }
                         if std::env::var_os("LLM170_F32S_TRACE").is_some() {
@@ -1115,7 +1681,10 @@ impl VkAcc {
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if n < 16 {
-                                eprintln!("[f32s] #{n} n_in={n_in} n_out={n_out} t={t} src16={}", self.f16bufs.lock().contains(&x));
+                                eprintln!(
+                                    "[f32s] #{n} n_in={n_in} n_out={n_out} t={t} src16={}",
+                                    self.f16bufs.lock().contains(&x)
+                                );
                             }
                         }
                         // plans/95 P1b — 비트 동일 고속판 시도: 게이트 3/3 PASS
@@ -1125,7 +1694,9 @@ impl VkAcc {
                         // opt-in LLM170_VK_FT32E=1.
                         if dty == 0
                             && n_out <= 512
-                            && std::env::var("LLM170_VK_FT32E").map(|v| v == "1").unwrap_or(false)
+                            && std::env::var("LLM170_VK_FT32E")
+                                .map(|v| v == "1")
+                                .unwrap_or(false)
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32e)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -1136,7 +1707,17 @@ impl VkAcc {
                             binds.push(ob);
                             let ds2 = ctx.bind_ds(&p, &binds)?;
                             let push = push_u32s(&[n_in as u32, n_out as u32, t as u32]);
-                            ctx.run_rw(p.pl, ds2, p.pipe, &push, ((n_out * t) as u32).div_ceil(256), 1, 1, &binds, &[ob])?;
+                            ctx.run_rw(
+                                p.pl,
+                                ds2,
+                                p.pipe,
+                                &push,
+                                ((n_out * t) as u32).div_ceil(256),
+                                1,
+                                1,
+                                &binds,
+                                &[ob],
+                            )?;
                             continue;
                         }
                         let p = self.pipeline(&mut ctx, Slot::FnTileF32)?;
@@ -1148,10 +1729,19 @@ impl VkAcc {
                         binds.push(ob);
                         let ds2 = ctx.bind_ds(&p, &binds)?;
                         let wpr = if dty == 0 { n_in } else { n_in / 2 };
-                        let push = push_u32s(&[
-                            n_in as u32, n_out as u32, t as u32, dty, wpr as u32,
-                        ]);
-                        ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1, &binds, &[ob])?;
+                        let push =
+                            push_u32s(&[n_in as u32, n_out as u32, t as u32, dty, wpr as u32]);
+                        ctx.run_rw(
+                            p.pl,
+                            ds2,
+                            p.pipe,
+                            &push,
+                            (n_out as u32).div_ceil(16),
+                            (t as u32).div_ceil(16),
+                            1,
+                            &binds,
+                            &[ob],
+                        )?;
                         // plans/95 계측(1회성): tile_f32 형상 수집 — 76MiB f32·bf16
                         // 텐서에 359.6ms/청크의 원인 국소화.
                         if std::env::var_os("LLM170_FT32_TRACE").is_some() {
@@ -1164,8 +1754,11 @@ impl VkAcc {
                         }
                         continue;
                     }
-                    let slot = if t < 16 && wbufs.len() == 1
-                        && std::env::var("LLM170_VK_MMB").map(|v| v != "0").unwrap_or(true)
+                    let slot = if t < 16
+                        && wbufs.len() == 1
+                        && std::env::var("LLM170_VK_MMB")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                     {
                         Slot::MmF32b
                     } else {
@@ -1180,10 +1773,23 @@ impl VkAcc {
                     binds.push(ob);
                     let ds2 = ctx.bind_ds(&p, &binds)?;
                     let push = push_u32s(&[
-                        n_in as u32, n_out as u32, t as u32, dty,
+                        n_in as u32,
+                        n_out as u32,
+                        t as u32,
+                        dty,
                         (ctx.max_ssbo / 4) as u32,
                     ]);
-                    ctx.run_rw(p.pl, ds2, p.pipe, &push, n_out as u32, t as u32, 1, &binds, &[ob])?;
+                    ctx.run_rw(
+                        p.pl,
+                        ds2,
+                        p.pipe,
+                        &push,
+                        n_out as u32,
+                        t as u32,
+                        1,
+                        &binds,
+                        &[ob],
+                    )?;
                 }
             }
         }

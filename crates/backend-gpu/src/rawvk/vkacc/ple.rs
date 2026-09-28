@@ -2,9 +2,7 @@
 
 use super::*;
 
-
 impl llm170_core::matmul::EwOps for VkAcc {
-
     fn rms_norm(
         &self,
         xs: &[Vec<f32>],
@@ -40,8 +38,13 @@ impl llm170_core::matmul::EwOps for VkAcc {
     /// frame_mm_group/frame_op가 각자 ctx를 잠그므로 여기엔 중첩 잠금이
     /// 없다(직전 시도의 self-deadlock 원인 — ctx.lock 보유 중 frame_alloc).
     fn shexp_gu(
-        &self, x: u64, wg: &Weight, wu: &Weight, h: u64,
-        _n_in: usize, n_hidden: usize,
+        &self,
+        x: u64,
+        wg: &Weight,
+        wu: &Weight,
+        h: u64,
+        _n_in: usize,
+        n_hidden: usize,
     ) -> Result<(), String> {
         if std::env::var_os("LLM170_VK_SHEXP").is_some_and(|v| v == "0") {
             return Err("shexp_gu: 진단 킬스위치".into());
@@ -52,7 +55,10 @@ impl llm170_core::matmul::EwOps for VkAcc {
             .frame_mm_group(x, &[*wg, *wu], &[gh, uh], 1)
             .and_then(|_| {
                 self.frame_op(&llm170_core::matmul::FrameOp::SiluMul {
-                    g: gh, u: uh, out: h, n: n_hidden,
+                    g: gh,
+                    u: uh,
+                    out: h,
+                    n: n_hidden,
                 })
             });
         let _ = self.frame_free(gh);
@@ -63,20 +69,26 @@ impl llm170_core::matmul::EwOps for VkAcc {
     /// plans/85 §1 — 디코드(t=1) shared expert down+가산: gemv 1회 →
     /// mout += σ·dh (AxpyScaled — t=1이라 s[0] 판독과 정합).
     fn shexp_da(
-        &self, h: u64, wd: &Weight, s: u64, mout: u64,
-        n_in: usize, _n_hidden: usize,
+        &self,
+        h: u64,
+        wd: &Weight,
+        s: u64,
+        mout: u64,
+        n_in: usize,
+        _n_hidden: usize,
     ) -> Result<(), String> {
         if self.frame_t.load(std::sync::atomic::Ordering::Relaxed) != 1 {
             return Err("shexp_da: t=1 전용 (frame_t≠1)".into());
         }
         let dh = self.frame_alloc(n_in)?;
-        let r = self
-            .frame_mm_group(h, &[*wd], &[dh], 1)
-            .and_then(|_| {
-                self.frame_op(&llm170_core::matmul::FrameOp::AxpyScaled {
-                    y: mout, x: dh, s, n: n_in,
-                })
-            });
+        let r = self.frame_mm_group(h, &[*wd], &[dh], 1).and_then(|_| {
+            self.frame_op(&llm170_core::matmul::FrameOp::AxpyScaled {
+                y: mout,
+                x: dh,
+                s,
+                n: n_in,
+            })
+        });
         let _ = self.frame_free(dh);
         r
     }
@@ -120,7 +132,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
         {
             let mut m = self.ple_rings.lock();
             let e = m.entry(seq).or_insert_with(|| (vkbuf_null(), 0));
-            rewind = pos0 < e.1 || e.0.ptr.is_null();   // 역방향 또는 최초
+            rewind = pos0 < e.1 || e.0.ptr.is_null(); // 역방향 또는 최초
             e.1 = pos0 + t;
             if e.0.ptr.is_null() {
                 // plans/93: GPU가 쓰는 링은 carve 배치(llama.cpp 원칙 — 시스템
@@ -168,7 +180,9 @@ impl llm170_core::matmul::EwOps for VkAcc {
         {
             // plans/93: t>1은 병렬판(워프 협업 RMS/dot) — 구판은 lane0 순차.
             // plans/103: res_hc f16 버스 — 게이트 변형 슬롯(f32 쌍둥이 불변).
-            let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
+            let resf16 = std::env::var("LLM170_VK_RESF16")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let gate_slot = match (t > 1, resf16) {
                 (true, false) => Slot::FnPleGateMt,
                 (true, true) => Slot::FnPleGateMtF16,
@@ -187,15 +201,25 @@ impl llm170_core::matmul::EwOps for VkAcc {
             let p = self.pipeline(&mut ctx, Slot::FnPleConv)?;
             let ds2 = ctx.bind_ds(&p, &[gb, cwb, ringb, cob])?;
             let push = push_u32s(&[
-                hc_dim as u32, t as u32, kern as u32, dil as u32, hist as u32,
+                hc_dim as u32,
+                t as u32,
+                kern as u32,
+                dil as u32,
+                hist as u32,
             ]);
             ctx.run(p.pl, ds2, p.pipe, &push, hc_dim.div_ceil(256) as u32, 1, 1)?;
         }
         // (3) 잔차.
         {
             // plans/103: res_hc f16 버스 — 잔차 RMW 변형 슬롯(페어 소유).
-            let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
-            let slot = if resf16 { Slot::FnPleResF16 } else { Slot::FnPleRes };
+            let resf16 = std::env::var("LLM170_VK_RESF16")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let slot = if resf16 {
+                Slot::FnPleResF16
+            } else {
+                Slot::FnPleRes
+            };
             let p = self.pipeline(&mut ctx, slot)?;
             let ds2 = ctx.bind_ds(&p, &[rb, vb, gob, cob])?;
             let push = push_u32s(&[n_embd as u32, hc as u32, t as u32]);
@@ -204,14 +228,15 @@ impl llm170_core::matmul::EwOps for VkAcc {
         Ok(())
     }
 
-
     /// plans/97 — pos==0 상태 GPU zero-fill(gdn+conv).
     fn frame_zero_states(&self, gdn: &[u64], conv: &[u64]) -> Result<(), String> {
         let mut ctx = self.ctx.lock();
         self.frame_resume_batch(&mut ctx);
         let g = self.framebufs.lock();
         for h in gdn.iter().chain(conv.iter()) {
-            let b = g.get(h).ok_or_else(|| format!("vk frame_zero: 핸들 없음: {h}"))?;
+            let b = g
+                .get(h)
+                .ok_or_else(|| format!("vk frame_zero: 핸들 없음: {h}"))?;
             ctx.fill_zero_batch(b.buf, b.bytes)?;
         }
         Ok(())
@@ -253,7 +278,9 @@ impl llm170_core::matmul::EwOps for VkAcc {
             let mut c = self.ple_consts.lock();
             c.remove(&key);
             let b = ctx.alloc_host(tokens.len() * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr() as *const u8, b.ptr, tokens.len() * 4) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(tokens.as_ptr() as *const u8, b.ptr, tokens.len() * 4)
+            };
             let buf = b.buf;
             c.insert(key, b);
             buf
@@ -261,8 +288,14 @@ impl llm170_core::matmul::EwOps for VkAcc {
         let ob = self.fbuf(out)?;
         let bpr = n / 32;
         // plans/103: res_hc f16 버스 — 초기 기입 변형(블록 내 쌍팩).
-        let resf16 = std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false);
-        let slot = if resf16 { Slot::EmbQ8GF16 } else { Slot::EmbQ8G };
+        let resf16 = std::env::var("LLM170_VK_RESF16")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let slot = if resf16 {
+            Slot::EmbQ8GF16
+        } else {
+            Slot::EmbQ8G
+        };
         let p = self.pipeline(&mut ctx, slot)?;
         let ds2 = ctx.bind_ds(&p, &[rb, tbl, ob])?;
         let push = push_u32s(&[n as u32, t as u32, hc as u32, bpr as u32]);
@@ -276,11 +309,11 @@ impl llm170_core::matmul::EwOps for VkAcc {
     #[allow(clippy::too_many_arguments)]
     fn ple_gather_dev(
         &self,
-        table_key: usize,      // 테이블 ptr (캐시 키)
-        table: &[u8],          // 테이블 원본 바이트
-        rows: &[u32],          // 수집할 행 (heads*t)
-        out: u64,              // 출력 프레임 핸들
-        hd: usize,             // ple_head_dim
+        table_key: usize, // 테이블 ptr (캐시 키)
+        table: &[u8],     // 테이블 원본 바이트
+        rows: &[u32],     // 수집할 행 (heads*t)
+        out: u64,         // 출력 프레임 핸들
+        hd: usize,        // ple_head_dim
     ) -> Result<(), String> {
         let nrows = rows.len();
         let mut ctx = self.ctx.lock();
@@ -299,13 +332,15 @@ impl llm170_core::matmul::EwOps for VkAcc {
                 buf
             }
         };
-        // rows 업로드 — 매 청크. 
+        // rows 업로드 — 매 청크.
         let rb = {
             let key = (rows.as_ptr() as usize, 0);
             let mut c = self.ple_consts.lock();
-            c.remove(&key);  // 이전 것 제거
+            c.remove(&key); // 이전 것 제거
             let b = ctx.alloc_host(rows.len() * 4)?;
-            unsafe { std::ptr::copy_nonoverlapping(rows.as_ptr() as *const u8, b.ptr, rows.len() * 4) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(rows.as_ptr() as *const u8, b.ptr, rows.len() * 4)
+            };
             let buf = b.buf;
             c.insert(key, b);
             buf
@@ -322,7 +357,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
 
     /// plans/93 P2 — 디바이스 링 → 엔진 CPU 상태 재동기(GPU 유휴 시점 전제).
     fn ple_ring_sync(&self, seq: usize, ring_out: &mut [f32]) -> Result<(), String> {
-        let m = self.ple_rings.lock();   // parking_lot 계열 — Result 아님
+        let m = self.ple_rings.lock(); // parking_lot 계열 — Result 아님
         let Some((b, _)) = m.get(&seq) else {
             return Err("ple_ring_sync: 링 없음".into());
         };
@@ -333,6 +368,3 @@ impl llm170_core::matmul::EwOps for VkAcc {
         Ok(())
     }
 }
-
-
-

@@ -36,12 +36,27 @@ pub fn raw_names(eng: &Engine) -> (Vec<String>, Vec<String>) {
     // MTP층 (blk.64) — spec decode용 (has_mtp 시)
     if eng.has_mtp() {
         let mtp = 64usize;
-        for w in ["attn_q", "attn_k", "attn_v", "attn_output",
-                  "ffn_gate", "ffn_up", "ffn_down", "nextn.eh_proj"] {
+        for w in [
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+            "nextn.eh_proj",
+        ] {
             wnames.push(format!("blk.{mtp}.{w}.weight"));
         }
-        for c in ["attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm",
-                  "nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"] {
+        for c in [
+            "attn_norm",
+            "post_attention_norm",
+            "attn_q_norm",
+            "attn_k_norm",
+            "nextn.enorm",
+            "nextn.hnorm",
+            "nextn.shared_head_norm",
+        ] {
             cnames.push(format!("blk.{mtp}.{c}"));
         }
     }
@@ -52,10 +67,7 @@ pub fn raw_names(eng: &Engine) -> (Vec<String>, Vec<String>) {
 }
 
 /// rawhip/VkDecoder 공용 상수 페치 (이름 리맵·타일 포함).
-pub fn raw_consts(
-    eng: &Engine,
-    cnames: &[String],
-) -> Vec<(String, Vec<f32>)> {
+pub fn raw_consts(eng: &Engine, cnames: &[String]) -> Vec<(String, Vec<f32>)> {
     let hp = &eng.model.hp;
     let ctx_n = eng.ctx_len();
     cnames
@@ -73,7 +85,12 @@ pub fn raw_consts(
                 }
                 Some(m)
             } else if k.ends_with("conv_w") {
-                eng.model.f32_vec(&format!("blk.{}.ssm_conv1d.weight", k.split('.').nth(1).unwrap_or("0"))).ok()
+                eng.model
+                    .f32_vec(&format!(
+                        "blk.{}.ssm_conv1d.weight",
+                        k.split('.').nth(1).unwrap_or("0")
+                    ))
+                    .ok()
             } else {
                 let il = k.split('.').nth(1).unwrap_or("0").to_string();
                 let (tn, tiled) = if k.ends_with("dt_bias") {
