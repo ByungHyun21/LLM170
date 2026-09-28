@@ -40,7 +40,6 @@ pub struct RawCtx {
     pub(crate) ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
     pub(crate) mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>, // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
     /// q6 정준 재배열 캐시.
-    pub(crate) canon_q6: std::sync::Mutex<std::collections::HashMap<usize, *mut u8>>,
     /// f16 경로 xq 버퍼 (size, ptr).
     pub(crate) mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
     pub(crate) scratch: std::sync::Mutex<HashMap<(usize, usize), Vec<*mut u8>>>,
@@ -314,7 +313,6 @@ impl RawCtx {
                 allocs: std::sync::Mutex::new(Vec::new()),
                 ar_cache: std::sync::Mutex::new(None),
                 mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
-                canon_q6: std::sync::Mutex::new(std::collections::HashMap::new()),
                 mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())),
                 scratch: std::sync::Mutex::new(HashMap::new()),
                 pinned: std::sync::Mutex::new((0, std::ptr::null_mut())),
@@ -2172,66 +2170,10 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(&sym[..]).ok_or("mul_mat_q 없음")?;
-        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. mul_mat_q는 llama.cpp
-        // mmq.cuh 직인스턴스화라 정준 블록(ql|qh|scales|d)을 기대한다 — 과거의
-        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
-        // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
-        // LLM170_Q6RQ=1로만 복원.
-        let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
-            let key = w as usize ^ 0xdeadbeef;
-            let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
-            if let Some(&p2) = c.get(&key) {
-                p2
-            } else {
-                let blocks2 = n_in / 256;
-                let p2 = self.alloc(n_out * blocks2 * 210)?;
-                let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
-                unsafe {
-                    let mut a1 = w as *mut std::ffi::c_void;
-                    let mut a2 = p2 as *mut std::ffi::c_void;
-                    let mut a3 = blocks2 as i32;
-                    let mut a4 = n_out as i32;
-                    let mut args = vec![
-                        &mut a1 as *mut _ as *mut _,
-                        &mut a2 as *mut _ as *mut _,
-                        &mut a3 as *mut _ as *mut _,
-                        &mut a4 as *mut _ as *mut _,
-                    ];
-                    ck(
-                        hip::hipModuleLaunchKernel(
-                            fqr,
-                            n_out as u32,
-                            blocks2 as u32,
-                            1,
-                            128,
-                            1,
-                            1,
-                            0,
-                            self.stream,
-                            args.as_mut_ptr(),
-                            std::ptr::null_mut(),
-                        ),
-                        "requant_q6k_canonical",
-                    )?;
-                }
-                if llm170_diag::dump::opts().key("rq_dump") {
-                    self.sync().ok();
-                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
-                        std::slice::from_raw_parts(p2 as *const u8, 420)
-                    });
-                    #[allow(clippy::unnecessary_cast)]
-                    // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe {
-                        std::slice::from_raw_parts(w as *const u8, 420)
-                    });
-                    eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
-                }
-                c.insert(key, p2);
-                p2
-            }
-        } else {
-            w as *mut u8
-        };
+        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. 과거의
+        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 깨뜨려 쓰레기
+        // 토큰을 냈다(2026-09-12 실측) — 107 W4로 레거시 분기 삭제.
+        let w_eff = w as *mut u8;
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {
@@ -2495,66 +2437,10 @@ impl RawCtx {
             _ => return Err(format!("MMQ 미지원 타입 {ty}")),
         };
         let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
-        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. mul_mat_q는 llama.cpp
-        // mmq.cuh 직인스턴스화라 정준 블록(ql|qh|scales|d)을 기대한다 — 과거의
-        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 오히려 깨뜨려
-        // ≥32토큰 프리필에서 쓰레기 토큰을 냈다(2026-09-12 실측). 레거시 경로는
-        // LLM170_Q6RQ=1로만 복원.
-        let w_eff = if ty == 14 && env_on("LLM170_Q6RQ") {
-            let key = w as usize ^ 0xdeadbeef;
-            let mut c = self.canon_q6.lock().map_err(|e| e.to_string())?;
-            if let Some(&p2) = c.get(&key) {
-                p2
-            } else {
-                let blocks2 = n_in / 256;
-                let p2 = self.alloc(n_out * blocks2 * 210)?;
-                let fqr = *fns.get("requant_q6k_canonical").ok_or("requant 없음")?;
-                unsafe {
-                    let mut a1 = w as *mut std::ffi::c_void;
-                    let mut a2 = p2 as *mut std::ffi::c_void;
-                    let mut a3 = blocks2 as i32;
-                    let mut a4 = n_out as i32;
-                    let mut args = vec![
-                        &mut a1 as *mut _ as *mut _,
-                        &mut a2 as *mut _ as *mut _,
-                        &mut a3 as *mut _ as *mut _,
-                        &mut a4 as *mut _ as *mut _,
-                    ];
-                    ck(
-                        hip::hipModuleLaunchKernel(
-                            fqr,
-                            n_out as u32,
-                            blocks2 as u32,
-                            1,
-                            128,
-                            1,
-                            1,
-                            0,
-                            self.stream2,
-                            args.as_mut_ptr(),
-                            std::ptr::null_mut(),
-                        ),
-                        "requant_q6k_canonical",
-                    )?;
-                }
-                if llm170_diag::dump::opts().key("rq_dump") {
-                    self.sync().ok();
-                    let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
-                        std::slice::from_raw_parts(p2 as *const u8, 420)
-                    });
-                    #[allow(clippy::unnecessary_cast)]
-                    // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                    let _ = std::fs::write("/tmp/rq_in.bin", unsafe {
-                        std::slice::from_raw_parts(w as *const u8, 420)
-                    });
-                    eprintln!("RQ_DUMP 완료 (첫 블록 2개)");
-                }
-                c.insert(key, p2);
-                p2
-            }
-        } else {
-            w as *mut u8
-        };
+        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. 과거의
+        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 깨뜨려 쓰레기
+        // 토큰을 냈다(2026-09-12 실측) — 107 W4로 레거시 분기 삭제.
+        let w_eff = w as *mut u8;
         // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
         // 재작성 위험). MMQ y는 단일 소유로 격리.
         let yb = {

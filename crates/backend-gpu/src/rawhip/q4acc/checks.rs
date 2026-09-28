@@ -43,7 +43,7 @@ pub fn micro_check() -> Result<String, String> {
     ))
 }
 
-/// `q4-ar-check` — 프레임 AR 커널(q4_gdn_ar_w) ↔ core `gdn_ar_batch` 대조.
+/// `q4-ar-check` — 프레임 AR 커널(gdn_ar_w_swap) ↔ core `gdn_ar_batch` 대조.
 /// 합성 입력(결정적 LCG)으로 수치 계약을 직접 확인한다.
 #[allow(clippy::many_single_char_names)]
 pub fn ar_check() -> Result<String, String> {
