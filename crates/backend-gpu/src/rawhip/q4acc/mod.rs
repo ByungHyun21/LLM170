@@ -188,6 +188,23 @@ impl Q4Acc {
         Self::new_with_sources(Vec::new())
     }
 
+    /// 스테이지 이벤트 랩(107 W1.5-3) — 생성/대기/파기.
+    ///
+    /// # Safety
+    /// 반환 핸들은 ev_wait/ev_free로만 소비(전부 이 모듈 경유).
+    fn ev_new() -> Result<hip::hipEvent_t, String> {
+        crate::rawhip::RawCtx::ev_create()
+    }
+
+    fn ev_wait(ev: hip::hipEvent_t) -> Result<(), String> {
+        // SAFETY: 핸들은 ev_new 산출분.
+        unsafe { crate::rawhip::RawCtx::ev_sync(ev) }
+    }
+
+    fn ev_free(ev: hip::hipEvent_t) -> Result<(), String> {
+        // SAFETY: 핸들은 ev_new 산출분, 1회 파기.
+        unsafe { crate::rawhip::RawCtx::ev_destroy(ev) }
+    }
     /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
     pub fn new_with_sources(
         parts: Vec<(usize, usize, std::path::PathBuf)>,
@@ -329,21 +346,54 @@ impl Q4Acc {
             .find_map(|s| s.covers(ptr, len).map(|o| (s, o)))?;
         let result = (|| -> Result<(), String> {
             const CH: usize = 8 << 20;
+            // 107 W1.5-3(원장 99): 이중 스테이지 — pread(청크 k)와
+            // h2d(청크 k-1, 사이드 스트림 async) 중첩. 반쪽 재사용은
+            // 그 반쪽에 기록된 이벤트만 선별 대기(전체 sync2가 아니라
+            // 직전 복사까지 기다려 중첩을 죽이지 않는다). pageable
+            // async H2D가 드라이버 폴백해도 순차 이하로는 안 떨어진다.
+            let dbl = len > CH;
             let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
-            if stage.len() < CH.min(len) {
-                *stage = vec![0u8; CH.min(len)];
+            let want = if dbl { 2 * CH } else { CH.min(len) };
+            if stage.len() < want {
+                *stage = vec![0u8; want];
             }
+            // !dbl면 전체를 a로(b는 빈 절반 — hi는 dbl일 때만 교체).
+            let (a, b) = stage.split_at_mut(if dbl { want / 2 } else { want });
+            let ev = [Self::ev_new()?, Self::ev_new()?];
+            let mut recorded = [false, false];
             let mut done = 0usize;
-            while done < len {
-                let n = CH.min(len - done);
-                src.file
-                    .read_exact_at(&mut stage[..n], off)
-                    .map_err(|e| format!("pread {off}: {e}"))?;
-                self.ctx.h2d(unsafe { dst.add(done) }, &stage[..n])?;
-                done += n;
-                off += n as u64;
+            let mut hi = 0usize;
+            let result = (|| -> Result<(), String> {
+                while done < len {
+                    let n = CH.min(len - done);
+                    // 이 반쪽을 쓴 직전 복사(k-2)만 완료 확인 후 pread.
+                    if recorded[hi] {
+                        Self::ev_wait(ev[hi])?;
+                        recorded[hi] = false;
+                    }
+                    let half = if hi == 0 { &mut a[..n] } else { &mut b[..n] };
+                    src.file
+                        .read_exact_at(half, off)
+                        .map_err(|e| format!("pread {off}: {e}"))?;
+                    self.ctx.h2d_async_s(unsafe { dst.add(done) }, half)?;
+                    // SAFETY: ev[hi]는 ev_new 산출분.
+                    unsafe { self.ctx.ev_record_s2(ev[hi]) }?;
+                    recorded[hi] = true;
+                    done += n;
+                    off += n as u64;
+                    if dbl {
+                        hi = 1 - hi;
+                    }
+                }
+                Ok(())
+            })();
+            for (e, r) in ev.into_iter().zip(recorded.iter()) {
+                if *r {
+                    let _ = Self::ev_wait(e);
+                }
+                let _ = Self::ev_free(e);
             }
-            Ok(())
+            result
         })();
         Some(result)
     }
