@@ -479,7 +479,8 @@ impl DecodeState {
                 // 독립 4 GEMV — 2스트림 페어 (산술 불변, 2026-09-05)
                 // 회귀 픽스: 듀얼 분기 독립 체인 — 기존 if/else는 q5k듀얼시 beta/alpha,
                 // q8듀얼시 qkv/gate를 건너뛰었다 (부록90).
-                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NODUAL").is_err() {
+                // 107 P0-8: 게이트 철자 단일화 — NODUAL → NO_DUAL (frame.rs와 동일).
+                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NO_DUAL").is_err() {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
                 } else if env_on("LLM170_DECODE_PAIRS") {
                     self.ctx.side_wait_main()?;
