@@ -2816,7 +2816,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             out: mkh,
             hc,
             n,
-            h16: false,
         })?;
         let mut got = vec![0f32; t * n];
         acc.frame_read(mkh, &mut got)?;
@@ -4042,7 +4041,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                 out: hih,
                 hc,
                 n,
-                h16: false,
             })?;
             acc.frame_mm(hih, &w_out, lgh, 1)?;
             let mut lg = vec![0f32; 16];

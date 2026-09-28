@@ -586,13 +586,7 @@ pub(super) fn frame_forward_ex(
             },
         )?;
         let w_up = model.w4("output_hc_up.weight")?;
-        if super::hcf16_enabled() && t >= 128 {
-            acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t)
-                .map_err(Q4Error::Io)?;
-        } else {
-            acc.frame_mm(f.hlo, &w_up, f.hgate, t)
-                .map_err(Q4Error::Io)?;
-        }
+        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
         op(
             acc,
             FrameOp::HcGateMean {
@@ -601,7 +595,7 @@ pub(super) fn frame_forward_ex(
                 out: f.hin,
                 hc,
                 n,
-                h16: super::hcf16_enabled() && t >= 128,
+
             },
         )?;
         if t > 1 {
@@ -1298,12 +1292,7 @@ pub(super) fn hc_mix_frame(
     )?;
     sync_mark(acc, "hc.silu", f.lo)?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
-    if super::hcf16_enabled() && t >= 128 {
-        acc.frame_mm_hout(f.lo, &w_up, f.gate, t)
-            .map_err(Q4Error::Io)?;
-    } else {
-        acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
-    }
+    acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
     if mark_attn && llm170_diag::dump::opts().bufhash {
         buf_hash(
             acc,
@@ -1321,7 +1310,7 @@ pub(super) fn hc_mix_frame(
             out: f.mix,
             hc,
             n,
-            h16: super::hcf16_enabled() && t >= 128,
+
         },
     )?;
     if mark_attn && llm170_diag::dump::opts().bufhash {
@@ -1786,17 +1775,8 @@ pub(super) fn moe_frame(
                 n: t * k_sel * n_ff,
             },
         )?;
-        // plans/105(원장 70): my f16 — 선형 경로(산란→가중합), 최대 쓰기.
-        let m16 = std::env::var("LLM170_VK_MOEH16")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if m16 {
-            fs.frame_moe_gemm16(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        } else {
-            fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
-                .map_err(Q4Error::Io)?;
-        }
+        fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
+            .map_err(Q4Error::Io)?;
         sync_mark(acc, "moe.gemm3", f.my)?;
         fs.frame_moe_scatter(f.my, f.mwt, f.mout, k_sel, n, t)
             .map_err(Q4Error::Io)?;

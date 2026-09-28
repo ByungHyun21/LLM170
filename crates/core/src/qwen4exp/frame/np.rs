@@ -608,13 +608,7 @@ pub(super) fn frame_forward_np_ex(
             },
         )?;
         let w_up = model.w4("output_hc_up.weight")?;
-        if super::hcf16_enabled() && t >= 128 {
-            acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t)
-                .map_err(Q4Error::Io)?;
-        } else {
-            acc.frame_mm(f.hlo, &w_up, f.hgate, t)
-                .map_err(Q4Error::Io)?;
-        }
+        acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
         op(
             acc,
             FrameOp::HcGateMean {
@@ -623,7 +617,7 @@ pub(super) fn frame_forward_np_ex(
                 out: f.hin,
                 hc,
                 n,
-                h16: super::hcf16_enabled() && t >= 128,
+
             },
         )?;
         let wout = model

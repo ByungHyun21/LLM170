@@ -242,14 +242,6 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     fn frame_mm(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
         self.frame_mm_group_ex(x, std::slice::from_ref(w), &[out], t, false, false)
     }
-    /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축). 전제: q8_0 단일청크
-    /// ·t≥128(큰 타일 판) — 위반 시 에러.
-    fn frame_mm_hout(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
-        if w.ty != GgmlType::Q8_0 || t < 128 {
-            return Err("frame_mm_hout: q8_0·t≥128 전용".into());
-        }
-        self.frame_mm_group_ex(x, std::slice::from_ref(w), &[out], t, true, false)
-    }
     fn frame_mm_group(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
         self.frame_mm_group_ex(x, ws, outs, t, false, false)
     }
@@ -294,21 +286,14 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 } else {
                     Slot::Rms
                 };
-                // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장(기본 ON).
-                // plans/103: res_hc 입력 f16은 별도 변형 슬롯(f32 쌍둥이 불변).
-                let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16)
-                    && w_reps > 1
-                    && llm170_core::qwen4exp::frame::hcf16_enabled();
+                // plans/101 P2 잔여 — f16 out16 판은 HCF16과 함께 폐기
+                // (107 W1: 이득 실측 없음·승격 미실증). 셰이더 푸시 레이아웃
+                // 호환을 위해 플래그 자리는 유지(항상 0).
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
                 push.extend_from_slice(&eps.to_le_bytes());
-                push.extend_from_slice(&u32::from(out16).to_le_bytes());
-                if out16 {
-                    self.f16bufs.lock().insert(out);
-                } else {
-                    self.f16bufs.lock().remove(&out);
-                }
+                push.extend_from_slice(&0u32.to_le_bytes());
                 ctx.run_rw(
                     p.pl,
                     ds2,
@@ -348,9 +333,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
                 let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
                 let glu = *self.moe_glu.lock();
-                let g16 = self.f16bufs.lock().contains(&g);
                 let fused = t_now >= 2
-                    && !g16
                     && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
                     && std::env::var("LLM170_VK_SILUQ")
                         .map(|v| v != "0")
@@ -387,25 +370,12 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                         &[tgt],
                     )?;
                 } else {
-                    let g16 = self.f16bufs.lock().contains(&g);
-                    if g16 {
-                        // plans/105: f16 경로는 융합 silu가 돌지 않았다 — pair
-                        // 히트가 스테일 스크래치를 재사용하지 않게 무효화.
-                        if let Some(v) = self.moe_xq_pair.lock().as_mut() {
-                            v.0 = 0;
-                        }
-                    }
-                    let (p, ds2, push) = if g16 {
-                        // plans/105: mgu/mup packed f16 — silu_h 변형(f32 출력).
-                        let p = self.pipeline(&mut ctx, Slot::FnSiluH)?;
-                        let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
-                        (p, ds2, push_u32s(&[n as u32]))
-                    } else {
+                    let (p, ds2, push) = {
                         let p = self.pipeline(&mut ctx, Slot::Silu)?;
                         let ds2 = ctx.bind_ds(&p, &[gb, ub, ob])?;
                         (p, ds2, push_u32s(&[n as u32]))
                     };
-                    let rds: Vec<vk::Buffer> = if g16 { vec![gb, ub] } else { vec![gb, ub] };
+                    let rds: Vec<vk::Buffer> = vec![gb, ub];
                     ctx.run_rw(
                         p.pl,
                         ds2,
@@ -520,15 +490,14 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 out,
                 hc,
                 n,
-                h16,
             } => {
                 let (xb, gb, ob) = (self.fbuf(xn)?, self.fbuf(gate)?, self.fbuf(out)?);
                 let p = self.pipeline(&mut ctx, Slot::HcGateMean)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, gb, ob])?;
                 let total = n * t_cur;
-                // plans/101 P2: bit1 = xn f16(레지스트리 판정).
-                let xn16 = self.f16bufs.lock().contains(&xn);
-                let flags = u32::from(h16) | (u32::from(xn16) << 1);
+                // 107 W1: f16 플래그(bit0 h16·bit1 xn16)는 HCF16/MOEH16
+                // 폐기로 항상 0 — 셰이더 푸시 레이아웃 호환 유지.
+                let flags = 0u32;
                 let push = push_u32s(&[hc as u32, n as u32, total as u32, flags]);
                 ctx.run_rw(
                     p.pl,
@@ -811,9 +780,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             }
             O::MoeWeightedSum { ys, wt, out, k, n } => {
                 let (yb, wb, ob) = (self.fbuf(ys)?, self.fbuf(wt)?, self.fbuf(out)?);
-                let y16 = self.f16bufs.lock().contains(&ys);
-                let p =
-                    self.pipeline(&mut ctx, if y16 { Slot::FnMoeWsumH } else { Slot::MoeWsum })?;
+                let p = self.pipeline(&mut ctx, Slot::MoeWsum)?;
                 let ds2 = ctx.bind_ds(&p, &[yb, wb, ob])?;
                 let total = n * t_cur;
                 let push = push_u32s(&[n as u32, k as u32, total as u32]);
@@ -1073,9 +1040,7 @@ impl VkAcc {
             } else {
                 self.xq_dev_buf(&mut ctx, t * xq_w * 4)?
             };
-            // plans/101 P2: f16 저장 xn 입력 → f16 판 quant(동일 산술).
-            let src16 = self.f16bufs.lock().contains(&x);
-            let p = self.pipeline(&mut ctx, if src16 { Slot::QuantF16in } else { Slot::Quant })?;
+                let p = self.pipeline(&mut ctx, Slot::Quant)?;
             let ds2 = ctx.bind_ds(&p, &[xb, xq])?;
             let push = push_u32s(&[n_in as u32, t as u32, xq_w as u32]);
             ctx.run_rw(
@@ -1608,9 +1573,8 @@ impl VkAcc {
                         let n = NB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if n < 40 {
                             eprintln!(
-                                "[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={} src16={}",
-                                dense_ty(w.ty).unwrap_or(9),
-                                self.f16bufs.lock().contains(&x)
+                                "[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={}",
+                                dense_ty(w.ty).unwrap_or(9)
                             );
                         }
                     }
@@ -1637,22 +1601,14 @@ impl VkAcc {
                         // 아님) — 사용자 승인으로 기준 스트림 재기록 후 기본
                         // 승격(2026-09-25, f64 참조에 더 근사·llama.cpp와 동일
                         // 클래스의 실행치 양자화). 킬스위치 =0.
-                        if (dty == 0 || dty == 1 && !self.f16bufs.lock().contains(&x))   // plans/105: bf16 인덱서 투영 편입
+                        if (dty == 0 || dty == 1)   // plans/105 잔여: bf16 f16입력 분기 폐지
                             && n_out <= std::env::var("LLM170_VK_FT32S_MAX")
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(512)
                             && std::env::var("LLM170_VK_FT32S").map(|v| v != "0").unwrap_or(true)
                         {
-                            let src16 = self.f16bufs.lock().contains(&x);
-                            let p = self.pipeline(
-                                &mut ctx,
-                                if src16 {
-                                    Slot::FnTileF32sH
-                                } else {
-                                    Slot::FnTileF32s
-                                },
-                            )?;
+                            let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
                             // W0u(slot1)에도 동일 버퍼 — BF16 uint 뷰.
                             while binds.len() < 8 {
@@ -1681,10 +1637,7 @@ impl VkAcc {
                                 std::sync::atomic::AtomicUsize::new(0);
                             let n = NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if n < 16 {
-                                eprintln!(
-                                    "[f32s] #{n} n_in={n_in} n_out={n_out} t={t} src16={}",
-                                    self.f16bufs.lock().contains(&x)
-                                );
+                                eprintln!("[f32s] #{n} n_in={n_in} n_out={n_out} t={t}");
                             }
                         }
                         // plans/95 P1b — 비트 동일 고속판 시도: 게이트 3/3 PASS

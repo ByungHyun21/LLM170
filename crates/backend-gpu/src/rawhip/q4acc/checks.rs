@@ -417,7 +417,6 @@ pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
         out: hmix,
         hc,
         n,
-        h16: false,
     })?;
     acc.frame_op(&FrameOp::HcCombine {
         res: hres,

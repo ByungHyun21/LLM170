@@ -776,10 +776,6 @@ pub trait FrameHost: Send + Sync {
     ) -> Result<(), String> {
         self.frame_mm_group(x, ws, outs, t)
     }
-    /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축 전용).
-    fn frame_mm_hout(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
-        self.frame_mm(x, w, out, t)
-    }
     /// 상주 elementwise/RoPE/인덱서 연산 — 커널 선택은 FrameOp 변형.
     fn frame_op(&self, _op: &FrameOp) -> Result<(), String> {
         Err("frame_op: 미지원".into())
@@ -904,7 +900,7 @@ pub enum FrameOp {
         out: u64,
         hc: usize,
         n: usize,
-        h16: bool,
+
     },
     /// hc combine: res += out·(2·σ(inj/hc)).
     HcCombine {
@@ -1117,20 +1113,6 @@ pub trait FrameState {
         _k_sel: usize,
     ) -> Result<(), String> {
         Err("frame_moe_gemm: 미지원".into())
-    }
-
-    /// plans/105 — gate/up 중간출력 packed f16 판(mgu/mup). 미지원 백엔드는
-    /// 일반 판으로 폴백(산술 클래스 차이 — 승격 시에만 사용).
-    fn frame_moe_gemm16(
-        &self,
-        x: u64,
-        w: &Weight,
-        ids: u64,
-        out: u64,
-        n_expert_stack: usize,
-        k_sel: usize,
-    ) -> Result<(), String> {
-        self.frame_moe_gemm(x, w, ids, out, n_expert_stack, k_sel)
     }
 }
 
