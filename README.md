@@ -10,58 +10,41 @@ Solo, greedy, `llm170 bench` vs `llama-bench`, same host (2026-09-23, plans/92;
 single-rep numbers carry a ±5-10% thermal / page-cache spread on this APU —
 ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md).
 
+<!-- 측정 프로토콜: hip(ROCm) 수치는 반드시 ROCm 10으로 측정한다
+     (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan 수치는 무관. -->
+
 ### Qwen3.8-27B (Q4_K_XL 16.3 GiB)
 
 | backend | pp512 | pp4096 | pp8192 | pp16384 | tg128@4k |
 |---|---|---|---|---|---|
-| LLM170 hip | **363** | 319 | 315 | 292 | 11.53 |
-| LLM170 vulkan | **360-365** | 302 | 273 | **231** | 11.2 |
-| llama.cpp hip | 356-359 | 337 | — | **312** | 11.7 |
-| llama.cpp vulkan | 333 | 319 | — | 278 | 12.0 |
+| LLM170 hip | **371** | **327** | **314** | 290 | 11.46 |
+| LLM170 vulkan | 351.8 | 299.7 | 272.9 | 231.1 | **11.81** |
+| llama.cpp hip | 328 | 321 | 314 | **301** | 9.42 |
+| llama.cpp vulkan | 331 | 308 | 291 | 262 | 11.54 |
 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
-| tg single | 11.5 | 11.2 | 11.7 | 12.0 |
-| np4 greedy (GPU argmax) | 33.2 | **33.5** | — | — |
-| np4 full-logits | **30.6** | 27.4 | 15.5 *(HTTP†)* | — |
-| MTP single (k=2) | **14.4** | 2.5 *(spec2 구현·수용률 미조정)* | ~12 | — |
-| MTP + np4 | 7.2 | n/a | 15.5 *(HTTP†)* | — |
+| tg single | **11.66** | 10.77 | 11.34 | 11.33 |
+| np4 greedy (GPU argmax) | 33.31 | **34.65** | — | — |
+| np4 full-logits | 10.86 | 10.48 | **30.09** *(HTTP†)* | — |
+| MTP single (k=2) | 6.17 | 0.90 *(spec2 구현·수용률 미조정)* | **~11.3** | — |
+| MTP + np4 | 13.12 | n/a | **30.09** *(HTTP†)* | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
-Vulkan qwen4exp runs a device-resident frame pipeline (plans/86-89):
-prefill + decode on device, llama-dmmv decode GEMV family, coopmat dense
-prefill tiles, device MoE tiles (q5_1 down coopmat sg1 default, q4_K scalar
-tile — the coopmat variant is race-blocked, see below), PLE math on device
-(bit-identical to host), step-level batching, pread-staged weight uploads.
-Kill switch `LLM170_VK_FRAME=0`; MoE coopmat tiles opt-in
-`LLM170_VK_MOECM=1` (RADV subgroup-scheduling race, q4_K 1-sg included —
-docs/decisions.md (32b)/(32c), repro: `scripts/moecm-repro.sh`).
-
-
+<!-- 금지: 이 표 위·아래에 엔진 구현 설명, 세션 노트, 백엔드 변동사 등
+     어떤 프로즈도 적지 않는다. 표 안의 측정값만 갱신한다. -->
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | **231-275** | 276 | 246 | **18.4** |
-| LLM170 vulkan (frame) | 192-223 | 198-213 | 166 | 14.7 |
-| llama.cpp hip | 490-520 | 478 | 415 | 21.2 |
-| llama.cpp vulkan | 506 | 488 | **433** | **23.6** |
-
-Session 2026-09-22 (plans/89): OpSDot q4_K MoE tile (4.85x), rms coalescing
-(8x/dispatch), dense tile routing completion — FN pp512 131.8 -> ~180.
-Session 2026-09-23 (plans/92): register-resident prefill flash
-(qsa_flash_reg — LDS/barrier-free; +59% on 27B pp16384), multi-row rms
-wide plate, tile128 single dispatch — FN vk pp512 ~180 -> 192-223.
-
-llama.cpp refreshed 2026-09-23 (b1ff4ca23; was 2026-08 builds): upstream
-qwen4exp prefill matured — FN llama pp jumped 222-234 -> 490-520
-(flash-attn auto + MoE batching; today's tip lands IQ4_XS MMQ/MMV on
-Vulkan), 27B pp16384 +5%. Our FN frame pipeline is now the chase side
-(~2.3x behind llama pp); MoE-cm race and decode dmmv remain the blockers.
+| LLM170 hip | 234.6 | 278.8 | 249.8 | 5.50 |
+| LLM170 vulkan (frame) | 465.8 | 395.9 | 296.4 | 14.82 |
+| llama.cpp hip | 451 | 427 | 391 | 20.61 |
+| llama.cpp vulkan | **474** | **502** | **448.8** | **23.68** |
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
-| tg single | **18.10-18.43** | 17.43 |
-| np4 aggregate | **45.9** | 41.1 *(HTTP†)* |
+| tg single | 5.65 | **20.04** |
+| np4 aggregate | 30.36 | **49.03** *(HTTP†)* |
 
 - Greedy gates: 27B hip / 27B vulkan / FN hip / FN vulkan all PASS
   (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
