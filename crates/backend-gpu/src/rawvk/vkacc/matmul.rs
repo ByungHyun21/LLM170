@@ -272,7 +272,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let rows = w_reps * t_cur;
                 // plans/92 P4.1: 대형 t는 256스레드 판(rms_wide) — t=1 디코드는
                 // 32스레드 원판(산술 그대로, 실측 우위).
-                let resf16 = llm170_diag::flag::ne0("LLM170_VK_RESF16");
+                let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
                 let slot = if rows >= 2 {
                     if resf16 {
                         Slot::RmsWideF16
@@ -516,7 +516,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 let (rb, ob, ib) = (self.fbuf(res)?, self.fbuf(out)?, self.fbuf(inj)?);
                 let tn = n * t_cur;
                 // plans/103: res_hc f16 버스 — RMW 변형 슬롯(페어 소유).
-                let resf16 = llm170_diag::flag::ne0("LLM170_VK_RESF16");
+                let resf16 = llm170_diag::flag::eq1("LLM170_VK_RESF16");
                 let slot = if resf16 {
                     Slot::HcCombineF16
                 } else {
