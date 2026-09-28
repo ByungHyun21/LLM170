@@ -4,7 +4,8 @@ Design under the **pure Rust** principle. Status: policies fixed; GPU backend
 implemented and verified on both HIP/ROCm and Vulkan — quantized GEMM, GDN
 AR/chunked, grouped MoE, element-wise kernels, and a GPU-resident decode
 frame for qwen4exp (see [decisions.md](decisions.md) ADR-0009/0011/0017).
-Backend internals live in [backend-architecture.md](backend-architecture.md);
+Backend internals live in [backend-architecture.md](backend-architecture.md), the
+vk/hip kernel parity table in [parity-matrix.md](parity-matrix.md);
 runtime flags in [configuration.md](configuration.md) (auto-generated
 catalog).
 
