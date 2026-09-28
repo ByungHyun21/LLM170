@@ -664,6 +664,9 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
         // qwen4exp GPU 경로 (rawhip 값 경로) — plans/64 P1. 기본 CPU(정확성
         // 기준); --backend gpu / --gpu-runtime hip일 때만 상주 가속기를 붙인다.
         let want_gpu = q4_gpu_wanted(&backend);
+        // 107(원장 105): res_hc f16 버스 백엔드 기본 — hip ON(+4.3% 웜
+        // 실측·토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산). env 최우선.
+        llm170_core::qwen4exp::frame::set_backend_res_f16(want_gpu && !q4_vk_runtime(&backend));
         if want_gpu && q4_vk_runtime(&backend) {
             // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
             // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
