@@ -634,9 +634,17 @@ impl VkCtx {
                 .map_err(|e| format!("제출2: {e:?}"))?;
             SUBMIT_US.with(|c| c.set(c.get() + _sub0.elapsed().as_micros() as u64));
             let _wt0 = std::time::Instant::now();
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|e| format!("대기2: {e:?}"))?;
+            // 107 RACE-DIAG(원장 90 프로브 4): 펜스 대기 무효·큐 유휴가
+            // 결정론이면 펜스 시그널링 경합 — 판별자(race_qidle 키).
+            if llm170_diag::dump::opts().key("race_qidle") {
+                self.device
+                    .queue_wait_idle(self.queue)
+                    .map_err(|e| format!("대기2q: {e:?}"))?;
+            } else {
+                self.device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .map_err(|e| format!("대기2: {e:?}"))?;
+            }
             WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
             // 107 W1.5-2 — 스텝 타임라인: 프레임 경계 갭 분해(VK_TS 게이팅).
             // ts 슬롯표는 커널 내부만 보임 — 여기가 호스트 녹화·대기 가시점.
