@@ -36,7 +36,7 @@ for comp in crates/backend-gpu/src/rawvk/spv/*.comp; do
         echo "  stale: ${comp##*/}"; stale=$((stale+1))
     fi
 done
-if [[ "$stale" -eq 0 ]]; then echo "OK (0 stale)"; else echo "FAIL — stale ${stale}건 — scripts/build_spv.py <comp> <spv> 재빌드"; fail=1; fi
+if ! python3 scripts/spv-manifest.py --check; then fail=1; fi
 
 echo "== 5/5 특성화 해시 =="
 if [[ "${SKIP_CHARHASH:-0}" == 1 ]]; then
