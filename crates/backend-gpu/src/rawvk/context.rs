@@ -59,6 +59,13 @@ pub struct VkCtx {
     /// plans/88 P1 — 제출(큐 submit) 횟수 카운터: 스텝 배치가 실제로 묶고
     /// 있는지 [ts] 보고에 노출. 비배치 run 1회 = 제출 1회.
     pub submits: std::cell::Cell<u64>,
+    /// plans/104 — 정밀 의존 배리어(run_rw): 마지막 배리어 이후 읽기/쓰기
+    /// 집합. 미선언 run()은 dep_unknown — 다음 디스패치 배리어 강제.
+    pub since_r: std::cell::RefCell<std::collections::HashSet<vk::Buffer>>,
+    pub since_w: std::cell::RefCell<std::collections::HashSet<vk::Buffer>>,
+    pub dep_unknown: std::cell::Cell<bool>,
+    /// 직전 디스패치 꼬리의 보류 배리어(다음 run 머리에서 RW 판정).
+    pub opt_bar: std::cell::Cell<bool>,
 }
 
 /// VK_QUERY_POOL 타임스탬프 프로파일러 — 디스패치별 GPU 시간 (호스트 ktime의
@@ -278,6 +285,10 @@ impl VkCtx {
                 nobar_next: std::cell::Cell::new(false),
                 replay_mode: std::cell::Cell::new(false),
                 batch_recorded: std::cell::Cell::new(false),
+                since_r: std::cell::RefCell::new(std::collections::HashSet::new()),
+                since_w: std::cell::RefCell::new(std::collections::HashSet::new()),
+                dep_unknown: std::cell::Cell::new(false),
+                opt_bar: std::cell::Cell::new(false),
             })
         }
     }
@@ -385,6 +396,11 @@ impl VkCtx {
                 .map_err(|e| format!("시작2: {e:?}"))?;
         }
         self.batching.store(true, std::sync::atomic::Ordering::Relaxed);
+        // plans/104 — 배치 간 프로브 상태 승계 방지.
+        self.since_r.borrow_mut().clear();
+        self.since_w.borrow_mut().clear();
+        self.dep_unknown.set(false);
+        self.opt_bar.set(false);
         Ok(())
     }
 
@@ -879,7 +895,7 @@ impl VkCtx {
         }
     }
 
-    /// 커맨드 녹화·제출·동기 대기.
+    /// 커맨드 녹화·제출·동기 대기 — 의존 미선언(배리어 항상).
     pub fn run(
         &self,
         pl: vk::PipelineLayout,
@@ -889,6 +905,39 @@ impl VkCtx {
         gx: u32,
         gy: u32,
         gz: u32,
+    ) -> Result<(), String> {
+        self.run_deps(pl, ds, pipe, push, gx, gy, gz, None)
+    }
+
+    /// plans/104 — 의존 선언판: reads/writes 버퍼 집합으로 배리어 탄력화.
+    /// 독립 디스패치는 배리어 없이 발행 — GPU 병행 실행(원장 104 P0 실측).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rw(
+        &self,
+        pl: vk::PipelineLayout,
+        ds: vk::DescriptorSet,
+        pipe: vk::Pipeline,
+        push: &[u8],
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        reads: &[vk::Buffer],
+        writes: &[vk::Buffer],
+    ) -> Result<(), String> {
+        self.run_deps(pl, ds, pipe, push, gx, gy, gz, Some((reads, writes)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_deps(
+        &self,
+        pl: vk::PipelineLayout,
+        ds: vk::DescriptorSet,
+        pipe: vk::Pipeline,
+        push: &[u8],
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        deps: Option<(&[vk::Buffer], &[vk::Buffer])>,
     ) -> Result<(), String> {
         // plans/87 §2/§3 — 진동 + op 태그(와치독 링·ts 라벨).
         llm170_diag::alloc::HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -941,25 +990,80 @@ impl VkCtx {
                     push,
                 );
             }
+            // plans/104 — 배치 내 write→read 가시성 배리어. 판정은 머리에서:
+            // 직전 디스패치 꼬리의 보류 배리어(opt_bar)를 현 디스패치의
+            // 선언된 reads/writes로 판정. 독립(교집합 없음·미지원 없음)이면
+            // 스킵 — GPU가 인접 디스패치를 병행 실행(실측, 원장 104 P0).
+            // 킬스위치 LLM170_VK_DEPBAR=0. nobar_next는 무조건 스킵(명시 보증).
+            let batch = self.batching.load(std::sync::atomic::Ordering::Relaxed);
+            let dep = deps;
+            let forced_skip = self.nobar_next.replace(false);
+            if batch && !forced_skip && self.opt_bar.replace(false) {
+                // plans/104: 기본 OFF(배리어 항상 — HEAD와 비트 동일). 옵트인
+                // =1. tile_f32s 헤드 스킵이 게이트를 깨뜨리는 원인 미해결
+                // (원장 104 P0b) — 해소 전 승격 불가.
+                let elide_on = std::env::var("LLM170_VK_DEPBAR")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let mut need = !elide_on || self.dep_unknown.get();
+                if let Some((rs, ws)) = dep {
+                    let sr = self.since_r.borrow();
+                    let sw = self.since_w.borrow();
+                    need = need
+                        || ws.iter().any(|b| sr.contains(b) || sw.contains(b))
+                        || rs.iter().any(|b| sw.contains(b));
+                } else {
+                    need = true;
+                }
+                // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
+                if !need {
+                    if let Ok(only) = std::env::var("LLM170_VK_DEPBAR_ONLY") {
+                        if !only.is_empty() && tag != only {
+                            need = true;
+                        }
+                    }
+                }
+                if need {
+                    let bar = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[bar],
+                        &[],
+                        &[],
+                    );
+                    self.since_r.borrow_mut().clear();
+                    self.since_w.borrow_mut().clear();
+                    self.dep_unknown.set(false);
+                } else {
+                    SKIP_BY.with(|m| {
+                        let prev = LAST_LBL.with(|l| l.take());
+                        if let Some(p) = prev {
+                            let mut m = m.borrow_mut();
+                            *m.entry((p, tag.to_string())).or_insert(0u32) += 1;
+                        }
+                    });
+                }
+            }
+            if batch {
+                LAST_LBL.with(|l| l.set(Some(tag.to_string())));
+                if let Some((rs, ws)) = dep {
+                    self.since_r.borrow_mut().extend(rs.iter().copied());
+                    self.since_w.borrow_mut().extend(ws.iter().copied());
+                } else {
+                    self.dep_unknown.set(true);
+                }
+            }
             self.ts_stamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE);
             self.device.cmd_dispatch(cb, gx, gy, gz);
-            // 배치 내 write→read 가시성 배리어 (비배칭 submit+wait의 암시 동기 대체).
-            // nobar_next: 다음 디스패치와 출력 의존이 없는 독립 그룹 내부 — 스킵.
-            let skip_bar = self.nobar_next.replace(false);
-            if self.batching.load(std::sync::atomic::Ordering::Relaxed) && !skip_bar {
-                let bar = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                self.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[bar],
-                    &[],
-                    &[],
-                );
-            }
+            // 꼬리: 다음 디스패치 직전 배리어 보류(nobar_next면 무조건 스킵).
+            // 꼬리는 항상 보류 — 독립 판정은 다음 run 머리에서(nobar_next는
+            // 머리에서 무조건 스킵: 호출부 명시 독립 보증).
+            self.opt_bar.set(batch);
             self.ts_stamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
             RUN_US.with(|c| c.set(c.get() + _t0.elapsed().as_micros() as u64));
             RUN_N.with(|c| c.set(c.get() + 1));
@@ -1068,6 +1172,20 @@ impl VkCtx {
             }
             let gsum = GAP_SUM.with(|g| g.replace(0.0));
             eprintln!("[ts] 공백합 {gsum:.1}ms");
+            // plans/104 — 프로브 스킵 쌍 인구조사(상위 24) · 배치 종료 시 리셋.
+            SKIP_BY.with(|m| {
+                let mut v: Vec<_> = m.borrow().iter().map(|(k, c)| (k.clone(), *c)).collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                let tot: u32 = v.iter().map(|x| x.1).sum();
+                if tot > 0 {
+                    eprintln!("[ts] 스킵쌍 {tot}회");
+                    for ((p, c), n) in v.iter().take(24) {
+                        eprintln!("[ts] 스킵 {p:24} → {c:24} ×{n}");
+                    }
+                }
+                m.borrow_mut().clear();
+                LAST_LBL.with(|l| l.take());
+            });
             {
                 let mut gv: Vec<_> = GAP_BY.with(|m| m.borrow().iter().map(|(k2, v2)| (k2.clone(), *v2)).collect());
                 gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
@@ -1206,6 +1324,13 @@ thread_local! {
 thread_local! {
     static GAP_BY: std::cell::RefCell<std::collections::HashMap<String, (f64, usize)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// plans/104 — 오버랩 프로브 스킵 쌍 인구조사 (직전→현 라벨, 횟수).
+    pub static SKIP_BY: std::cell::RefCell<std::collections::HashMap<(String, String), u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    pub static LAST_LBL: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
