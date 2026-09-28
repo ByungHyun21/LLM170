@@ -2980,3 +2980,16 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - 차기 구현 순서 확정: (a) frame_sync에 "직전 제출 펜스" 대기 통합
   (이중화 모드에서만), (b) end_batch_wait 즉시 반환 + 교대 cmdbuf3,
   (c) stepT로 회수 측정(rec≈2ms/step).
+
+### (107) W1.5-4 잔여 — 프리필 중간 청크 head 스킵 (plans/107, 2026-09-28)
+
+- 감사(원장 106)에서 발견: 프리필 루프가 **매 청크**마다 head GEMM
+  (152k GEMV) + 로짓 608KB d2h를 수행하면서 마지막 청크 logits만
+  사용 — NoReadback 모드가 존재했으나 소비자 0(사장 자산).
+- 수리: 중간 청크 NoReadback + 조기 반환(head GEMM 자체 스킵),
+  최종 청크만 Full. hin_last는 CopyRows로 이미 복사돼 소비 계약
+  불변(스킵은 버려질 계산뿐).
+- pp512(2048 청킹=1청크라 효과 미미, 단일 청크 케이스): 236.5/238.9
+  — RESF16 ON 대역 유지. 효과는 다중 청크(256 강제)에서 발현:
+  청크당 head ≈15ms×중간 n개 절감.
+- 검증: 4게이트 PASS·charhash 일치.

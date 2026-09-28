@@ -42,7 +42,7 @@ pub fn frame_forward_greedy(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn frame_forward_ex(
+pub(crate) fn frame_forward_ex(
     acc: &dyn Accelerator,
     model: &Model4,
     ctx: &Ctx,
@@ -535,15 +535,18 @@ pub(super) fn frame_forward_ex(
                 },
             )?;
         }
+        // 107 W1.5-4: 중간 프리필 청크는 head GEMM(152k GEMV)도 스킵 —
+        // 최종 청크만 logits가 필요. hin_last는 이미 복사돼 있어 다음
+        // 프리필/디코드 진입 시 소비된다(스킵은 버려질 계산뿐).
+        if mode == FwdMode::NoReadback {
+            ftime_report(t);
+            return Ok((Vec::new(), None));
+        }
         let hin = if t > 1 { f.hin_last } else { f.hin };
         let wout = model
             .w("output.weight")
             .ok_or(Q4Error::MissingTensor("output.weight".into()))?;
         acc.frame_mm(hin, &wout, f.logits, 1).map_err(Q4Error::Io)?;
-        if mode == FwdMode::NoReadback {
-            ftime_report(t);
-            return Ok((Vec::new(), None));
-        }
         if mode == FwdMode::Greedy {
             // GPU argmax — vocab×4B 전사·CPU 스캔 회피(plans/74).
             let toks = acc

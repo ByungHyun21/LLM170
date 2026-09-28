@@ -462,7 +462,8 @@ impl Engine4 {
         if let Some(f) = self.frame.as_mut().filter(|_| frame_on) {
             let acc = self.acc.as_deref().unwrap();
             let mut last = None;
-            for ch in tokens.chunks(chunk) {
+            let n_chunks = tokens.chunks(chunk).len();
+            for (ci, ch) in tokens.chunks(chunk).enumerate() {
                 let _sync_t0 = std::time::Instant::now();
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
@@ -474,18 +475,37 @@ impl Engine4 {
                     model: &self.model,
                     acc: Some(acc),
                 };
-                let logits = super::frame::frame_forward(
-                    acc,
-                    &self.model,
-                    &ctx,
-                    seq,
-                    &mut self.seqs[seq],
-                    f,
-                    ch,
-                )?;
+                // 107 W1.5-4: 중간 청크는 head+로짓 전사 스킵(NoReadback) —
+                // 최종 청크만 Full. 버려지던 152k GEMV·608KB d2h 제거.
+                let is_last = ci + 1 == n_chunks;
+                let logits = if is_last {
+                    super::frame::frame_forward(
+                        acc,
+                        &self.model,
+                        &ctx,
+                        seq,
+                        &mut self.seqs[seq],
+                        f,
+                        ch,
+                    )?
+                } else {
+                    super::frame::frame_forward_ex(
+                        acc,
+                        &self.model,
+                        &ctx,
+                        seq,
+                        &mut self.seqs[seq],
+                        f,
+                        ch,
+                        super::frame::FwdMode::NoReadback,
+                    )
+                    .map(|(l, _)| l)?
+                };
                 self.seqs[seq].pos += ch.len() as u32;
                 f.dirty[seq] = false;
-                last = Some(logits);
+                if is_last {
+                    last = Some(logits);
+                }
             }
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
