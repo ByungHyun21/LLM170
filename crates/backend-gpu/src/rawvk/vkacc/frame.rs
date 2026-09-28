@@ -620,6 +620,33 @@ impl VkAcc {
             {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 원본 바인딩
             }
+            // plans/105(원장 76): llmmq q5_1 다운 판(옵트인 Q51LL=1).
+            if w.ty == GgmlType::Q5_1
+                && wbufs.len() == 1
+                && std::env::var("LLM170_VK_Q51LL").map(|v| v == "1").unwrap_or(false)
+            {
+                let (offb, pmb) = {
+                    let g = self.moe_grp.lock();
+                    let g = g.as_ref().unwrap();
+                    (g.off.buf, g.perm.buf)
+                };
+                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLl51)?;
+                let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
+                while pbinds.len() < 8 {
+                    pbinds.push(dbuf);
+                }
+                pbinds.push(xq);
+                pbinds.push(ob);
+                pbinds.push(dbuf);
+                pbinds.push(pmb);
+                pbinds.push(offb);
+                let ds2 = ctx.bind_ds(&pk, &pbinds)?;
+                // per_expert 필드: q5_1 블록수 = per_expert_bytes/24 — 커널이 워드 환산하므로 원본 그대로.
+                let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, n_expert_stack as u32, 0u32]);
+                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
+                ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, 1, &pkrds, &[ob])?;
+                return Ok(());
+            }
             // plans/105 P2: llama mul_mmq 포트(옵트인 LLM170_VK_Q4KLL=1) —
             // BN64 워프타일·전문가당 단일 WG(가중 1회 판독). 근거: llama
             // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
