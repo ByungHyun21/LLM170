@@ -1443,6 +1443,28 @@ impl DecoderState {
                 format!("blk.{}.attn_norm", il + 1)
             };
             self.addrms(self.b_xs.buf, self.b_fdown.buf, &nkey, self.b_xn.buf, n, t)?;
+            if std::env::var_os("LLM170_VKD_LSUM").is_some() {
+                // 107 W1: vk 레이스 국소화 — 층별 b_xn 첫 64합(il % MOD).
+                // 판독 직전 배치를 닫았다 재시작(진단 전용 모드).
+                let m = std::env::var("LLM170_VKD_LSUM_MOD")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8);
+                if il % m == 0 {
+                    let mut v = vec![0f32; 64.min(n)];
+                    self.ctx.end_batch_wait()?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.b_xn.ptr as *const f32,
+                            v.as_mut_ptr(),
+                            v.len(),
+                        )
+                    };
+                    self.ctx.begin_batch()?;
+                    let s: f64 = v.iter().map(|&x| x as f64).sum();
+                    eprintln!("[lsum] il={il} t={t} sum={s:.6}");
+                }
+            }
         }
         // ── head (all_logits) — output_norm은 마지막 addrms에 융합. 트렁크와
         // 동일 배치로 단일 제출·대기 (G3). quant는 gemv_w 폴백 시 내부 수행.
