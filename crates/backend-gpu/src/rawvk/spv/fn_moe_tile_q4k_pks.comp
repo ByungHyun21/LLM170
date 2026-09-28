@@ -1,0 +1,194 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// fn_moe_tile_q4k_pks (plans/105 P1) — 전문가-주 퍼시스턴트 K-분할판.
+// 원판(mmq)은 밴드당 A(64행×K) 스테이징 재수행(평균 1.6밴드/전문가 → 37%
+// 중복) + 코드젠 평형(원장 72). 본 판:
+//   grid (n_out/64, 전문가 e, K-분할 z) — WG이 전문가 e의 **전(全) 행
+//   청크**를 순회: A 슬라이스는 4sb 그룹당 1회 스테이징 후 모든 청크가
+//   재사용. 부분합은 디바이스 스크래치 [z][원본행][n_out] 선형 기록 →
+//   FnKsred z-승순 결정론 축소(tile_q8128ks와 동일 승격 클래스).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W0 { uint w0c[]; };
+layout(binding = 8) readonly buffer Xq { uint xq[]; };
+layout(binding = 9) buffer Scr { float sc[]; };      // [z][rows][n_out]
+layout(binding = 10) readonly buffer Rp { uint rows_pad[]; };
+layout(binding = 11) readonly buffer Pm { uint perm[]; };  // 컴팩트 도메인(offv 정합 — 센티널 없음)
+layout(binding = 12) readonly buffer Off { uint offv[]; };  // ne+1
+layout(push_constant) uniform PC {
+    uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words;
+    uint xq_w; uint ks; uint unused;
+} pc;
+
+shared uint sA[64][36];
+shared float sAd[64][4];
+shared float sAm[64][4];
+shared uint sB[16][32];
+shared float sBd[16][4];
+shared float sBsum[16][4];
+
+float f16_exact(uint bits) {
+    float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
+    uint e = (bits >> 10) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) return sgn * float(m) * 5.960464477539063e-8;
+    return sgn * float(1024u + m) * exp2(float(int(e)) - 25.0);
+}
+
+int sdot4p(uint a, uint b) {
+    int p0 = int(a & 0xFFu) * int(b & 0xFFu);
+    int p1 = int((a >> 8) & 0xFFu) * int(b >> 8);
+    int p2 = int((a >> 16) & 0xFFu) * int(b >> 16);
+    int p3 = int(a >> 24) * int(b >> 24);
+    return (p0 + p1) + (p2 + p3);
+}
+
+uint sbyte(uint wq, int i) {
+    return (w0c[wq + 1u + uint(i >> 2)] >> uint((i & 3) * 8)) & 0xFFu;
+}
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    uint e = gl_WorkGroupID.y;
+    uint z = gl_WorkGroupID.z;
+    uint tid = gl_LocalInvocationID.x;
+    int n_in = int(pc.n_in);
+    int n_sub = n_in >> 5;
+    int row0 = int(bid) * 64;
+    int nrow = int(min(64u, pc.n_out - uint(row0)));
+    uint row_lo = offv[e];
+    uint row_hi = offv[e + 1u];
+    if (row_lo >= row_hi || nrow <= 0) return;
+    // z별 K범위 — sb0 단위(4sb 그룹 정렬).
+    int ngrp = (n_sub + 3) / 4;
+    int g0 = min(int(z) * ((ngrp + int(pc.ks) - 1) / int(pc.ks)), ngrp);
+    int g1 = min(g0 + (ngrp + int(pc.ks) - 1) / int(pc.ks), ngrp);
+    if (g0 >= g1) return;
+    uint row_words = uint(n_in >> 8) * 36u;
+    uint ebase = e * (pc.per_expert_bytes >> 2);
+    uint qw = uint(n_in >> 2);
+    uint rp = pc.unused;   // 총 행(패딩 포함) — FnKsred 스트라이드 정합
+    uint plane = z * rp * pc.n_out;
+
+    int tr = int(tid);
+
+    // 슈퍼그룹(4청크=64행) 단위 — acc[4][16] 레지스터 유지로 g루프 동안
+    // A 슬라이스를 전 청크가 재사용(스테이징 1회 — 원판 대비 37% 절감).
+    for (uint b0 = row_lo; b0 < row_hi; b0 += 64u) {
+        int nchunk = int(min(4u, (row_hi - b0 + 15u) / 16u));
+        int ntc[4];
+        int livec[4];
+        for (int ci = 0; ci < 4; ci++) {
+            ntc[ci] = 0; livec[ci] = 0;
+            if (ci < nchunk) {
+                ntc[ci] = int(min(16u, row_hi - (b0 + uint(ci) * 16u)));
+                livec[ci] = ntc[ci];   // 컴팩트 도메인 — 전행 유효
+            }
+        }
+        if (nchunk <= 0) break;
+        float acc[4][16];
+        for (int ci = 0; ci < 4; ci++)
+            for (int c = 0; c < 16; c++) acc[ci][c] = 0.0;
+
+        for (int g = g0; g < g1; g++) {
+            int sb0 = g * 4;
+            int lim = min(4, n_sub - sb0);
+            // ── A 스테이징: 그룹당 1회 — 슈퍼그룹 전 청크 공유.
+            {
+                int row = row0 + tr;
+                if (row < row0 + nrow) {
+                    uint wq4 = ebase + uint(row) * row_words + uint(sb0 >> 3) * 36u;
+                    for (int q = 0; q < lim; q++) {
+                        int sb = sb0 + q;
+                        uint wq = wq4;
+                        float d = f16_exact(w0c[wq] & 0xFFFFu);
+                        float dmin = f16_exact(w0c[wq] >> 16);
+                        int j = sb & 7;
+                        uint s_v, m_v;
+                        if (j < 4) {
+                            s_v = sbyte(wq, j) & 63u;
+                            m_v = sbyte(wq, j + 4) & 63u;
+                        } else {
+                            uint b_p4 = sbyte(wq, j + 4);
+                            s_v = (b_p4 & 0xFu) | ((sbyte(wq, j - 4) >> 6) << 4);
+                            m_v = (b_p4 >> 4) | ((sbyte(wq, j) >> 6) << 4);
+                        }
+                        sAd[tr][q] = d * float(s_v);
+                        sAm[tr][q] = dmin * float(m_v);
+                        uint qbase = wq + 4u + uint(((sb & 7) >> 1) * 8);
+                        bool hi = (sb & 1) != 0;
+                        for (int p = 0; p < 8; p++) {
+                            uint w = w0c[qbase + uint(p)];
+                            sA[tr][q * 8 + p] = hi ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);
+                        }
+                    }
+                } else {
+                    for (int q = 0; q < 4; q++) {
+                        sAd[tr][q] = 0.0; sAm[tr][q] = 0.0;
+                        for (int p = 0; p < 8; p++) sA[tr][q * 8 + p] = 0u;
+                    }
+                }
+            }
+            // ── 청크별 B 스테이징 + MMA — sb 승순(원판 산술 문자 동일).
+            for (int ci = 0; ci < nchunk; ci++) {
+                uint cb = b0 + uint(ci) * 16u;
+                int lc = livec[ci];
+                if (lc == 0) continue;
+                {
+                    for (int i = int(tid); i < lc * 32; i += 64) {
+                        int rb = i >> 5;
+                        int w = i & 31;
+                        int q = w >> 3;
+                        int p = w & 7;
+                        int sb = sb0 + q;
+                        if (rb < ntc[ci] && q < lim) {
+                            uint pr_ = perm[cb + uint(rb)];
+                            uint base = pr_ * pc.xq_w;
+                            sB[rb][w] = xq[base + uint(sb * 8 + p)];
+                            if (p == 0) {
+                                sBd[rb][q] = uintBitsToFloat(xq[base + qw + uint(sb)]);
+                                uint qsb = qw + (uint(n_in) >> 5);
+                                sBsum[rb][q] = float(int(xq[base + qsb + uint(sb * 2)])
+                                                  + int(xq[base + qsb + uint(sb * 2) + 1u]));
+                            }
+                        } else {
+                            sB[rb][w] = 0u;
+                            if (p == 0) { sBd[rb][q] = 0.0; sBsum[rb][q] = 0.0; }
+                        }
+                    }
+                }
+                memoryBarrierShared();
+                barrier();
+                for (int q = 0; q < lim; q++) {
+                    int ra[8];
+                    for (int p = 0; p < 8; p++) ra[p] = int(sA[tr][q * 8 + p]);
+                    float ad = sAd[tr][q], am = sAm[tr][q];
+                    for (int c = 0; c < lc; c++) {
+                        uint bw0 = sB[c][q * 8], bw1 = sB[c][q * 8 + 1];
+                        uint bw2 = sB[c][q * 8 + 2], bw3 = sB[c][q * 8 + 3];
+                        uint bw4 = sB[c][q * 8 + 4], bw5 = sB[c][q * 8 + 5];
+                        uint bw6 = sB[c][q * 8 + 6], bw7 = sB[c][q * 8 + 7];
+                        int t0 = sdot4p(uint(ra[0]), bw0) + sdot4p(uint(ra[4]), bw4);
+                        int t1 = sdot4p(uint(ra[1]), bw1) + sdot4p(uint(ra[5]), bw5);
+                        int t2 = sdot4p(uint(ra[2]), bw2) + sdot4p(uint(ra[6]), bw6);
+                        int t3 = sdot4p(uint(ra[3]), bw3) + sdot4p(uint(ra[7]), bw7);
+                        int qsum = (t0 + t1) + (t2 + t3);
+                        acc[ci][c] += sBd[c][q] * (ad * float(qsum) - am * sBsum[c][q]);
+                    }
+                }
+                barrier();
+            }
+        }
+
+        // ── 드레인: 스크래치 선형 기록 [z][원본행][n_out].
+        if (tr < nrow) {
+            for (int ci = 0; ci < nchunk; ci++) {
+                uint cb = b0 + uint(ci) * 16u;
+                for (int c = 0; c < ntc[ci]; c++) {
+                    uint pr2 = perm[cb + uint(c)];
+                    sc[plane + pr2 * pc.n_out + uint(row0 + tr)] = acc[ci][c];
+                }
+            }
+        }
+    }
+}
