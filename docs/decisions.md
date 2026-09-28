@@ -2801,3 +2801,15 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   조용한 오염(원장 87 발견 상태) 종결.
 - 검증: RUNTIME=vulkan 게이트 PASS(hip 판 토큰과 동일)·hip 네이티브
   불별·양 경로 각각 내부 결정론(2회 동일).
+
+### (93) W7 마감 — np4 10.5→28.6 t/s·max_tokens 계약·배정 단일화 (plans/107, 2026-09-28)
+
+- **np4 재측정**(27B Q4_K_XL hip, serve --slots 4, 웜, 4×64토큰
+  동시): **28.6 t/s aggregate** — 플랜 예측 밴드(27-33) 적중.
+  구 10.5 t/s(슬롯 1 직렬화) 대비 +172%. README 표 갱신.
+- 조치 3종: ① /v1/completions가 max_tokens 무시(n_predict만 판독,
+  기본 24 방출) — OpenAI 호환 계약 위반 교정(3570ff3). ② 배정
+  이중 복제 assign_slot 단일화 — 유휴 경로도 전 슬롯 접두 탐색으로
+  개선(8846511). ③ 슬롯 루프 env 캐시화(6f4be48).
+- 검증: 2슬롯 serve E2E·max_tokens=5→5/n_predict=3→3·charhash·
+  게이트 2종 PASS.

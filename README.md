@@ -44,7 +44,7 @@ ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md
 | mode | LLM170 hip | llama hip |
 |---|---|---|
 | tg single | 5.65 | **20.04** |
-| np4 aggregate | 30.36 | **49.03** *(HTTP†)* |
+| np4 aggregate | 28.6 *(serve --slots 4, HTTP)* | **49.03** *(llama HTTP†)* |
 
 - Greedy gates: 27B hip / 27B vulkan / FN hip / FN vulkan all PASS
   (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
