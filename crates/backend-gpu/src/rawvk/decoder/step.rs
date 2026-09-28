@@ -1472,17 +1472,10 @@ impl DecoderState {
         self.ctx.ts_report();
         let pf_head0 = std::time::Instant::now();
         if all_logits {
-            // 전 행 로짓 [t][n_vocab] (verify·MTP 프리필 소비) — 단일 행 head
-            // 폴백은 !all_logits 경로만.
-            let mut out = vec![0f32; t * self.n_vocab];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.b_lg_t.ptr as *const f32,
-                    out.as_mut_ptr(),
-                    t * self.n_vocab,
-                )
-            };
-            return Ok(out);
+            // 107 W1 계약 변경: 전 행 로짓은 b_lg_t에 상주한 채 반환하지
+            // 않는다(전사 폐지) — 소비자(verify_rows)는 fn_argmax_rows로
+            // GPU 행별 argmax를 수행한다. 반환은 빈 Vec.
+            return Ok(Vec::new());
         }
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
