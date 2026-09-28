@@ -26,6 +26,22 @@ pub fn stage_skipped(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+
+/// 107 W6: 진단 침투 정리 — `ck!(acc, il, buf, n, t, "tag")`가 게이트
+/// (il<4 || dump 키 ck_all)와 frame_ck 호출을 한 줄로 접는다.
+macro_rules! ck {
+    ($acc:expr, $il:expr, $h:expr, $n:expr, $t:expr, $tag:expr) => {
+        if $il < 4 || $crate::qwen4exp::frame::diag::ck_all() {
+            $crate::qwen4exp::frame::diag::frame_ck($acc, $h, $n, $t, $tag);
+        }
+    };
+}
+pub(crate) use ck;
+
+pub(super) fn ck_all() -> bool {
+    llm170_diag::dump::opts().key("ck_all")
+}
+
 /// 진단용 프레임 체크섬 — `LLM170_DUMP=...,checksum`. np·단일·배치 경로 공용.
 /// 버퍼 앞 t·n개를 전부 읽어 합과 행 표본(첫·중간·마지막 행의 첫 원소)을
 /// 보고한다. 청크 크기가 다른 두 실행에서 "같은 층·같은 단계·같은 토큰 수"를
