@@ -87,6 +87,10 @@ impl VkCtx {
     }
 }
 
+// SAFETY (107 W8): 원시 Vulkan 핸들(device/queue/버퍼)은 스레드 안전하지만
+// Rust 타입시스템이 이를 모른다. 소유권은 이 컨텍스트 단 하나 — 드롭은
+// 동기화 없이 단일 스레드에서만 일어나고, 녹화/제출은 내부 뮤텍스로
+// 직렬화된다. 핸들 복제가 밖으로 나가지 않는 한 Send/Sync는 건전.
 unsafe impl Send for VkCtx {}
 unsafe impl Sync for VkCtx {}
 
