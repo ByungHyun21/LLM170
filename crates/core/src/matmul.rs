@@ -918,6 +918,12 @@ pub trait FrameState {
         Err("frame_moe_scatter: 미지원".into())
     }
 
+    /// plans/105(원장 80) — mxsel 생산 직후 1회 팩 정량(블록당 10워드
+    /// [qs8][d][Σ]). 등록된 x는 llmmq가 팩 버퍼로 소비.
+    fn frame_quant_pack(&self, _x: u64, _rows: usize, _n_in: usize) -> Result<(), String> {
+        Ok(())
+    }
+
     /// MoE ids 구동 배치 GEMM — x 상주, ids 상주(GPU top10 출력 직결).
     /// stack은 전문가 스택 전체 뷰. outs는 [k_sel·n_out] 단일 프레임.
     fn frame_moe_gemm(
