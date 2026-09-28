@@ -333,9 +333,9 @@ impl DecodeState {
                         )?;
                     }
                 }
-                if env_on("LLM170_NP_DBG6") && il == 0 {
+                if llm170_diag::dump::opts().key("np_dbg6") && il == 0 {
                     self.ctx.sync()?;
-                    if env_on("LLM170_NP_DBG7") {
+                    if llm170_diag::dump::opts().key("np_dbg7") {
                         let mut hq2 = vec![0f32; conv_ch * t];
                         self.ctx
                             .d2h(bytemuck::cast_slice_mut(&mut hq2).as_mut(), self.gqkv_t)?;
@@ -705,7 +705,7 @@ impl DecodeState {
                 t,
             )?;
             self.axpy(self.xs_t, self.fdown_t, n * t)?;
-            if env_on("LLM170_NP_DBG3") && il % 8 == 0 {
+            if llm170_diag::dump::opts().key("np_dbg3") && il % 8 == 0 {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n * t];
                 self.ctx
@@ -766,7 +766,7 @@ impl DecodeState {
             }
             (out, Vec::new())
         };
-        if env_on("LLM170_NP_TIME") {
+        if llm170_diag::dump::opts().key("np_time") {
             eprintln!(
                 "[npstep] t={t} greedy={greedy} {:.1}ms",
                 np_t0.elapsed().as_secs_f64() * 1e3

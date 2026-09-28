@@ -39,7 +39,7 @@ impl Engine {
         let mut cat = vec![0.0f32; 2 * n_embd];
         cat[..n_embd].copy_from_slice(&e_n);
         cat[n_embd..].copy_from_slice(&h_n);
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] cat e0={:.6} e1={:.6} esum={:.4} | h0={:.6} h1={:.6} hsum={:.4}",
                 e_n[0],
@@ -53,7 +53,7 @@ impl Engine {
         let acc = self.acc.clone();
         let mut cur = vec![0.0f32; n_embd];
         crate::matmul::mm(&acc, &cat, &w_eh, &mut cur)?;
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] eh sum={:.5} x0={:.5} x1={:.5}",
                 cur.iter().map(|&x| x as f64).sum::<f64>(),
@@ -65,7 +65,7 @@ impl Engine {
         // 2) 게이티드 어텐션 — attn_layer와 동일 구조, 자체 KV(mtp_kv_*) 사용
         let attn_out = self.mtp_attn(seq, il, &cur, pos)?;
 
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] wo sum={:.5} x0={:.5}",
                 attn_out.iter().map(|&x| x as f64).sum::<f64>(),
@@ -98,7 +98,7 @@ impl Engine {
         for i in 0..n_embd {
             cur[i] = ffn_out[0][i] + ffn_res[i];
         }
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] ff sum={:.5} x0={:.5}",
                 cur.iter().map(|&x| x as f64).sum::<f64>(),
@@ -117,7 +117,7 @@ impl Engine {
         let h = rms_norm(&cur, &sh_norm, hp.eps);
         let mut logits = vec![0.0f32; head.n_out as usize];
         crate::matmul::mm(&acc, &h, &head, &mut logits)?;
-        if std::env::var_os("LLM170_MTP_STAGE").is_some() {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] head L0..7={:?} hnorm0..3={:?}",
                 &logits[0..8],
@@ -334,7 +334,7 @@ impl Engine {
             self.embd_cache = Some((t.ty, std::sync::Arc::new(t.data.to_vec())));
         }
         let (embd_ty, embd_arc) = self.embd_cache.as_ref().unwrap().clone();
-        let tm_on = std::env::var_os("LLM170_SPEC_TIME").is_some();
+        let tm_on = llm170_diag::dump::opts().key("spec_time");
         let mut t_draft = std::time::Duration::ZERO;
         let mut t_commit = std::time::Duration::ZERO;
         let mut t_verify = std::time::Duration::ZERO;

@@ -60,7 +60,7 @@ pub(super) fn frame_forward_ex(
     let t = tokens.len();
     // plans/93 P2: PLE pos 기반 워터마크용 — 이 청크 시작 위치.
     let pos0 = seq_st.pos as usize;
-    if llm170_diag::flag::on("LLM170_FRAME_TIME") {
+    if llm170_diag::dump::opts().key("frame_time") {
         eprintln!("# ff-entry t={t}");
     }
     fs_begin(acc, t);
@@ -111,7 +111,7 @@ pub(super) fn frame_forward_ex(
                 acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
             }
             acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
-            if llm170_diag::flag::on("LLM170_FRAME_TIME") {
+            if llm170_diag::dump::opts().key("frame_time") {
                 eprintln!(
                     "# emb t={t} hc={hc} ty={:?} cpu={emb_cpu_ms:.1}ms upload {:.1}ms",
                     (embd.ty as u32),
@@ -128,7 +128,7 @@ pub(super) fn frame_forward_ex(
         Vec::new()
     };
 
-    let trace = llm170_diag::flag::on("LLM170_Q4_TRACE");
+    let trace = llm170_diag::dump::opts().key("q4_trace");
     let t_call = std::time::Instant::now();
     // plans/93 P2: 디바이스 PLE 실행 플래그 — 반환 직전 링 재동기 판정.
     let mut ple_dev = false;
@@ -151,7 +151,7 @@ pub(super) fn frame_forward_ex(
         {
             return Err(Q4Error::Io(format!("frame_failat: 주입 L{il}")));
         }
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
         // 107 W10: il=0 스킵 — 진입 전 버퍼(.mix·mids 등)는 아직 한 번도
@@ -380,7 +380,7 @@ pub(super) fn frame_forward_ex(
         // 2) hc attn mix
         hc_mix_frame(acc, model, f, il, "attn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_attn"), f.mix)?;
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
         }
 
@@ -392,7 +392,7 @@ pub(super) fn frame_forward_ex(
                 gdn_frame(
                     acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t,
                 )?;
-                if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+                if il < 4 || llm170_diag::dump::opts().key("ck_all") {
                     frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.gdn"));
                 }
             }
@@ -441,7 +441,7 @@ pub(super) fn frame_forward_ex(
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
-            if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+            if il < 4 || llm170_diag::dump::opts().key("ck_all") {
                 frame_ck(acc, f.ffn_out, n, t, &format!("L{il}.qsa"));
             }
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -450,12 +450,12 @@ pub(super) fn frame_forward_ex(
         // 4) hc ffn mix + MoE
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.mout, n, t, &format!("L{il}.moe"));
         }
 
@@ -579,7 +579,7 @@ pub(super) fn frame_forward_ex(
         acc.capture_mark("logits_in").map_err(Q4Error::Io)?;
         let _lt0 = std::time::Instant::now();
         acc.frame_read(f.logits, &mut logits).map_err(Q4Error::Io)?;
-        if llm170_diag::flag::on("LLM170_FRAME_TIME") {
+        if llm170_diag::dump::opts().key("frame_time") {
             eprintln!(
                 "# logits-d2h {:.1}ms (vocab {})",
                 _lt0.elapsed().as_secs_f64() * 1e3,
@@ -595,7 +595,7 @@ pub(super) fn frame_forward_ex(
                 seq_st.ple_conv.copy_from_slice(&ring);
             }
         }
-        if llm170_diag::flag::on("LLM170_FRAME_TIME") {
+        if llm170_diag::dump::opts().key("frame_time") {
             eprintln!("# ff-pre-logits");
         }
         ftime_report(t);
@@ -1161,7 +1161,7 @@ pub(super) fn hc_mix_frame(
     }
     // plans/86 §1 — t=1 hc mix 절대 대조(임시 진단): 디바이스 체인을 op별로
     // 판독해 CPU 참조(stages/hc.rs 동일 산술)와 맞댄다. 첫 발산 op 특정용.
-    if t == 1 && il == 0 && kind == "attn" && llm170_diag::flag::on("LLM170_MIX_CHECK") {
+    if t == 1 && il == 0 && kind == "attn" && llm170_diag::dump::opts().key("mix_check") {
         let mut res = vec![0.0f32; hc * n];
         acc.frame_read(f.res_hc, &mut res).map_err(Q4Error::Io)?;
         let mut dxn = vec![0.0f32; hc * n];
@@ -1278,7 +1278,7 @@ pub(super) fn gdn_frame(
             .map_err(Q4Error::Io)?;
     }
     sync_mark(acc, "gdn.mm_group", f.gqkv)?;
-    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
         frame_ck(acc, f.gqkv, conv_ch, t, &format!("L{il}.gqkv"));
     }
     // β/e^g
@@ -1298,7 +1298,7 @@ pub(super) fn gdn_frame(
         )?;
     }
     sync_mark(acc, "gdn.betag", f.gbg)?;
-    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
         frame_ck(acc, f.gbg, hp.dt_rank * 2, t, &format!("L{il}.gbg"));
     }
     // conv + ring
@@ -1319,7 +1319,7 @@ pub(super) fn gdn_frame(
         if il == 0 && llm170_diag::dump::opts().bufhash {
             buf_hash(acc, f.gconv, conv_ch * t.min(16), "G0.conv");
         }
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.gconv, conv_ch, t, &format!("L{il}.gdn_conv"));
         }
     }
@@ -1388,7 +1388,7 @@ pub(super) fn gdn_frame(
             hp.d_state,
         )
         .map_err(Q4Error::Io)?;
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.go, v_len, t, &format!("L{il}.gdn_ar"));
             // 이월 상태(carry) — conv 링과 AR 상태가 청크 간 동일하게 유지되는지.
             // 입력이 모두 비트 동일한데 AR 출력이 갈리는 경우 이 둘이 유일한 미지수다.
@@ -1412,7 +1412,7 @@ pub(super) fn gdn_frame(
     if il == 0 && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.go, v_len * t.min(16), "G0.go");
     }
-    if llm170_diag::flag::on("LLM170_NP_DBG") && il == 0 {
+    if llm170_diag::dump::opts().key("np_dbg") && il == 0 {
         let mut v = vec![0.0f32; v_len];
         if acc.frame_read(f.go, &mut v).is_ok() {
             eprintln!(
@@ -1487,7 +1487,7 @@ pub(super) fn moe_frame(
         )?;
     }
     sync_mark(acc, "moe.top10", f.mids)?;
-    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
         frame_ck(acc, f.mids, k_sel, t, &format!("L{il}.mids"));
         frame_ck(acc, f.mwt, k_sel, t, &format!("L{il}.mwt"));
     }
@@ -1595,13 +1595,13 @@ pub(super) fn moe_frame(
             fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t)
                 .map_err(Q4Error::Io)?;
         }
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.mxsel, n, t * k_sel, &format!("L{il}.mxsel"));
             frame_ck(acc, f.mids, 1, t * k_sel, &format!("L{il}.mids_u32"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_gate, f.mids, f.mgu, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
-        if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+        if il < 4 || llm170_diag::dump::opts().key("ck_all") {
             frame_ck(acc, f.mgu, n_ff, t * k_sel, &format!("L{il}.mgu"));
         }
         fs.frame_moe_gemm(f.mxsel, &w_up, f.mids, f.mup, hp.n_expert, k_sel)
@@ -1623,7 +1623,7 @@ pub(super) fn moe_frame(
         sync_mark(acc, "moe.scatter", f.mout)?;
     }
     // shared 전문가 — σ(sgate)·shout 가산
-    if il < 4 || llm170_diag::flag::on("LLM170_CK_ALL") {
+    if il < 4 || llm170_diag::dump::opts().key("ck_all") {
         frame_ck(acc, f.mout, n, t, &format!("L{il}.moe_sc"));
     }
     if !stage_skipped("moe.shared") {

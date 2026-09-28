@@ -641,7 +641,7 @@ impl DecoderState {
         let k_len = self.k_len;
         let v_len = self.v_len;
         // plans/92 P2: [pfck] 업로드·제출대기·헤드·판독 4분해 (LLM170_PFCK=1).
-        let pfck = llm170_diag::flag::on("LLM170_PFCK");
+        let pfck = llm170_diag::dump::opts().key("pfck");
         let pf_up0 = std::time::Instant::now();
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
@@ -1194,7 +1194,7 @@ impl DecoderState {
                 format!("blk.{}.attn_norm", il + 1)
             };
             self.addrms(self.b_xs.buf, self.b_fdown.buf, &nkey, self.b_xn.buf, n, t)?;
-            if llm170_diag::flag::on("LLM170_VKD_LSUM") {
+            if llm170_diag::dump::opts().key("vkd_lsum") {
                 // 107 W1: vk 레이스 국소화 — 층별 b_xn 첫 64합(il % MOD).
                 // 판독 직전 배치를 닫았다 재시작(진단 전용 모드).
                 let m = std::env::var("LLM170_VKD_LSUM_MOD")
@@ -1783,7 +1783,7 @@ impl DecoderState {
         }
         let np_t1 = std::time::Instant::now();
         self.ctx.end_batch_wait()?;
-        if llm170_diag::flag::on("LLM170_NP_TIME") {
+        if llm170_diag::dump::opts().key("np_time") {
             eprintln!(
                 "[npstep] vk t={t} greedy={greedy} rec={:.1}ms wait={:.1}ms",
                 (np_t1 - np_t0).as_secs_f64() * 1e3,

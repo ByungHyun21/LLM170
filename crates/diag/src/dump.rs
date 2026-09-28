@@ -13,6 +13,10 @@
 //! - `bufhash`  — 버퍼 FNV 해시(`[npbh]`, 구 LLM170_NP_BUFHASH)
 //! - `moe`      — MoE 그룹 GEMM 입력 해시·덤프
 //!
+//! 107 W2: 위 이름없는 진단 키도 전부 이 공간으로 통합 — `dump::key(k)`
+//! 로 판정(구 개별 env → 소문자 키: frame_time, q4_trace, ck_all,
+//! mtp_stage, rawhip_trace, ms_dump, np_time, stage_skip, mix_check,
+//! qsa_selcheck, lsum, ... 92개 판독점 흡수).
 //! 1회 파싱(LazyLock) — 런치패스 비용은 원자 판독 1회.
 
 /// 파싱된 덤프 옵션 — 정적 싱글턴.
@@ -29,9 +33,17 @@ pub struct DumpOpts {
     pub alloc: bool,
     /// vaddr — 할당 tsv(VA 범위) 증분 기록(plans/87 §1).
     pub vaddr: bool,
+    /// 통합 진단 키 집합 — LLM170_DUMP CSV 멤버 전체(개별 필드 없는
+    /// 확장용. 107 W2: 개별 진단 env를 이 키 공간으로 흡수).
+    keys: std::collections::HashSet<String>,
 }
 
 impl DumpOpts {
+    /// 통합 진단 키 조회 — `LLM170_DUMP=key,...` 멤버 판정.
+    pub fn key(&self, k: &str) -> bool {
+        self.keys.contains(k)
+    }
+
     /// 태그가 rows 지정에 포함되는지.
     pub fn row_on(&self, tag: &str) -> bool {
         self.rows.iter().any(|x| x == tag)
@@ -45,6 +57,10 @@ static OPTS: std::sync::LazyLock<DumpOpts> = std::sync::LazyLock::new(|| {
     };
     for key in v.split(',') {
         let key = key.trim();
+        // 모든 멤버를 통합 키 집합에 기록 — dump::key(k) 판정용.
+        if !key.is_empty() && !key.starts_with("rows:") {
+            o.keys.insert(key.to_string());
+        }
         if let Some(tags) = key.strip_prefix("rows:") {
             o.rows = tags
                 .split(';')

@@ -509,7 +509,7 @@ impl DecoderState {
         Ok(Self {
             ctx,
             ktimes: std::collections::HashMap::new(),
-            ktime: llm170_diag::flag::on("LLM170_VK_KTIME"),
+            ktime: llm170_diag::dump::opts().key("vk_ktime"),
             dbg_drain_ms: 0.0,
             kkey: std::cell::RefCell::new(None),
             w,
