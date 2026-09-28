@@ -7,6 +7,12 @@ use std::process::ExitCode;
 
 /// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
+    // 107 W4: 프로브 기본 모델 경로 통합(하드코딩 11곳 → 3상수).
+    // 인자 우선 — 기본값은 진단 편의용.
+    let d_fn =
+        "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    let d_27 = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
+    let d_q35 = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
     let r: Result<String, String> = match cmd {
         "gpu-raw-probe" => {
             let iters: usize = std::env::args()
@@ -65,10 +71,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::q4acc::ar_check_t(t)
         }
         "q4-acc-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
             if args.first().map(String::as_str) == Some("micro") {
                 return Some(match llm170_backend_gpu::rawhip::q4acc::micro_check() {
                     Ok(s) => {
@@ -95,9 +98,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             )
         }
         "moe-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| {
-                "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into()
-            });
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -112,9 +113,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             )
         }
         "mm-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| {
-                "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into()
-            });
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -188,9 +187,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             }
         }
         "mmq-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| {
-                "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf".into()
-            });
+            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -200,9 +197,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::mmq_row_check(&path, &tn, t1, t2)
         }
         "tile-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| {
-                "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf".into()
-            });
+            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -212,9 +207,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::tile_row_check(&path, &tn, t1, t2)
         }
         "wc-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| {
-                "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf".into()
-            });
+            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -223,10 +216,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::wc_check(&path, &tn, t)
         }
         "q6k-ref" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -236,10 +226,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-gemv-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -249,10 +236,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "vk-idot-probe" => llm170_backend_gpu::rawvk::checks::idot_probe(),
         "vk-gemv8-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
             let tn = args
                 .get(1)
                 .cloned()
@@ -261,7 +245,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawvk::checks::gemv8_check(&path, &tn, t)
         }
         "vk-ft32-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
             llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
         "vk-gdn-chunk-check" => llm170_backend_gpu::rawvk::checks::gdn_chunk_check(),
@@ -270,7 +254,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
         }
         "vk-frame-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
             let tn = args
                 .get(1)
                 .cloned()
