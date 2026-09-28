@@ -262,6 +262,10 @@ pub struct DecoderState {
     b_amr: VkBuf,   // [T_MAX] u32 — 행별 argmax 결과
 }
 
+// SAFETY (107 W8): 파생 핸들(부모 VkCtx 소유) + GTT 매핑 포인터 포함.
+// 매핑 판독은 호스트 버퍼 소유 스레드와 동기화 필요 — 현재 단일 엔진
+// 스레드만 접근(서버 슬롯 루프 직렬화). 다중 스레드 디코드 도입 시
+// 매핑 접근에 뮤텍스 요구.
 unsafe impl Send for DecoderState {}
 unsafe impl Sync for DecoderState {}
 
