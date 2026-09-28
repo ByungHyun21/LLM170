@@ -125,6 +125,12 @@ fn main() -> ExitCode {
     }
     llm170_diag::fp::init_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 107 W12 (README 재검증 포착): 무인자 실행이 args[1..]로 패닉 —
+    // 빈 인자는 USAGE 안내로.
+    if args.is_empty() {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.
     let ma = match parse_model_args(&args[1..]) {
         Ok(ma) => ma,
