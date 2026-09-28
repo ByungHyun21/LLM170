@@ -21,19 +21,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 기동 준비 완료 플래그 — 기동 워밍업(slot_loop 진입 시) 전에는 /health가 503.
 /// llama-server의 /health가 모델 로드·슬롯 초기화 후에야 200을 주는 것과 같은
 /// 계약이다(2026-09-17: 워밍업 없는 첫 요청이 지연 초기화 raw_init을 뒤집어써
-/// np4 프리필 집계를 2-3x 낮게 만들었다).
-pub static READY: AtomicBool = AtomicBool::new(false);
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+pub static READY: AtomicBool = AtomicBool::new(false);
+/// 서버 ctx 상한 — serve --ctx 값을 핸들러에 전달(107 W2: 종전
+/// LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해 조용히 거절).
+pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub fn serve(
     addr: &str,
     req: InferRequest,
     backend: BackendSel,
     slots_flag: Option<usize>,
+    queue_flag: Option<usize>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
     eprintln!("# llm170-server listening on http://{addr}");
+    let _ = SERVER_CTX.set(req.ctx);
     // 107 P0-9: 슬롯 수 소스 계통 가시화 — 플래그 > env > 기본 1.
     // 이전엔 env 기본 1이 조용히 직렬 서버를 만들었다(np4 10.5 t/s 정체).
     let (slots, src) = if let Some(n) = slots_flag {
@@ -49,11 +53,13 @@ pub fn serve(
     eprintln!("# serve: slots={slots} (source: {src}) — 복수 동시 요청 배치 디코드에는 --slots N");
     // 대기열 기본 512(2026-09-16, 사용자 지시): 대기 작업은 토큰 배열+채널뿐인
     // 호스트 객체(건당 수백 바이트)라 넉넉해도 비용이 없고, 동시 요청 폭주 시
-    // 503 대신 대기로 흡수한다. LLM170_QUEUE로 재정의 가능.
-    let qcap = std::env::var("LLM170_QUEUE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512);
+    let qcap = match queue_flag {
+        Some(q) => q,
+        None => std::env::var("LLM170_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512),
+    };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), backend, slots);
     std::thread::spawn(move || crate::engine::slot_loop(eng, rx, slots));
@@ -388,10 +394,7 @@ fn run_and_emit(
 ) {
     // ctx 검증 — 프롬프트+생성이 컨텍스트를 넘으면 400 (context-shift v1:
     // 슬롯 무상태라 이동 없이 거절 — 이동 재배치는 접두 캐시 도입 시).
-    let ctx = std::env::var("LLM170_CTX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4096);
+    let ctx = *SERVER_CTX.get().unwrap_or(&4096);
     if ids.len() + n_predict + 8 >= ctx {
         resp(
             stream,
