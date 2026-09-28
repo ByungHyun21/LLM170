@@ -1216,7 +1216,9 @@ impl RawCtx {
             13 => if j128 && v4 { "gemm_q5k_v4" } else if j128 { "gemm_q5k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q5k_wm" } else { "gemm_q5k_mm" },
             12 => if j128 && v4 { "gemm_q4k_v4" } else if j128 { "gemm_q4k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q4k_wm" } else { "gemm_q4k_mm" },
             14 => if j128 { "gemm_q6k_j128" } else if !env_on("LLM170_EXACT") && big { "gemm_q6k_wm" } else { "gemm_q6k_mm" },
-            23 => if j128 { "gemm_xs_j128" } else if v4 && env_on("LLM170_XS_V4U") { "gemm_xs_v4u" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && big { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && big { "gemm_xs_wm" } else { "gemm_xs_mm" },
+            // 107 P0-7: gemm_xs_v4u 분기 삭제 — NAMES·CO 어디에도 미등록,
+            // LLM170_XS_V4U=1 도달 시 런치 즉실패하는 죽은 분기였음.
+            23 => if j128 { "gemm_xs_j128" } else if env_on("LLM170_XS_MM") { "gemm_xs_mm" } else if v4 && !env_on("LLM170_EXACT") && big { "gemm_xs_v4" } else if !env_on("LLM170_EXACT") && big { "gemm_xs_wm" } else { "gemm_xs_mm" },
             20 => if odd && !env_on("LLM170_EXACT") && big { "gemm_nl_v4" } else { return Err("타일 미지원 타입 20 (GEMV 경로 사용)".into()) },
             11 => if odd && !env_on("LLM170_EXACT") && big { "gemm_q3k_v4" } else { return Err("타일 미지원 타입 11 (GEMV 경로 사용)".into()) },
             21 => if odd && !env_on("LLM170_EXACT") && big { "gemm_iq3s_v4" } else { return Err("타일 미지원 타입 21 (GEMV 경로 사용)".into()) },
