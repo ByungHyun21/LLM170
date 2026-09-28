@@ -2777,3 +2777,14 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
     거부해 미지원 — 27B 복귀 또는 qwen35moe 로더 지원 시 3회 측정
     (K=13/14/15)으로 쌍 확정. VK_SPLIT_AT·race_nocache·LSUM 프로브는
     상재.
+
+### (91) W7 개시 — slot_loop env 캐시화·2슬롯 E2E 실증 (plans/107, 2026-09-28)
+
+- engine.rs 슬롯 루프·엔진 팩토리 env 5종(NO_PREFIX·PREFILL_BATCH·
+  Q4_CPU·VK_ACC·RAWHIP 잔여) diag::flag 캐시형 전환.
+- E2E 스모크(Flash-Next hip, --slots 2): 병렬 2요청 정상 응답·
+  np-greedy 실패 0·슬롯 소스 가시화 동작.
+- **선계약 결함 발견(계승)**: max_tokens=5 요청에 24토큰 방출 —
+  API 계약 위반 의심(청크 경계 방출?). W7 계속 항목으로: 계약
+  확인·교정. slot_loop 구조 통합(SchedConfig·drain/유휴 단일화)도
+  다음 슬라이스로.
