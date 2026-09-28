@@ -2959,3 +2959,24 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   vk=false). vkacc 5개 발화점도 core 스위치로 통합(이중 판독 제거).
 - 검증: 4게이트 PASS(FN vk·FN hip·27B hip·charhash) + hip pp512
   241.6 t/s 회복 확인.
+
+### (106) W1.5-1 전제 감사 — 매핑 판독 경로 전수 목록 (plans/107, 2026-09-28)
+
+vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-as
+계열): **프로덕션 21곳 / 진단 27곳** — 이중화 시 펜스 대기 필요 대상:
+
+| 계층 | 사이트 | 동기 전제 |
+|---|---|---|
+| frame_read(vkacc) | matmul.rs:228 — frame_sync()가 배치면 end_batch_wait 후 판독 | **이미 헬퍼 경유** — 펜스 대기 삽입점 단일 |
+| decoder step | b_lg(572·1281)·b_am(615)·np_slot/pos/gdn_tbl(1345-49) | step/step_batch의 end_batch_wait 후 |
+| decoder spec | b_amr(355)·b_xs(364) — verify_rows 내 end_batch_wait 후 | 〃 |
+| decoder mod | m_cur(477) — mtp_step_g 배치 종료 후 | 〃 |
+| vkacc moe 그룹화 | frame.rs:723-756·1029 — ids/perm/rows_pad 판독 | 프레임 배치 종료 후(host grouping) |
+| vkacc qsa/dispatch | qsa.rs:239·dispatch.rs:52·125 | frame_read와 동일 계약 |
+
+- **핵심 소득**: 판독이 frame_read 헬퍼나 각 배치 종료 직후로 수렴 —
+  "즉시 반환" 이중화 시 펜스 대기 삽입은 frame_sync + 각 end_batch_wait
+  반환점(스텝 경계 ~12곳)에 국소화 가능. 45 호출부 전수 수정 불필요.
+- 차기 구현 순서 확정: (a) frame_sync에 "직전 제출 펜스" 대기 통합
+  (이중화 모드에서만), (b) end_batch_wait 즉시 반환 + 교대 cmdbuf3,
+  (c) stepT로 회수 측정(rec≈2ms/step).
