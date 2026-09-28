@@ -178,7 +178,6 @@ pub fn gemv_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
     ))
 }
 
-
 /// vk-ft32-check (plans/89 P1.2) — fn_tile_f32(f32/BF16 밀집 프리필 타일)의
 /// 실 텐서 CPU 대조. 라우터(ffn_gate_inp, f32)형상으로 게이트 발산 원인 특정.
 pub fn ft32_check(path: &str) -> Result<String, String> {
@@ -311,11 +310,6 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
         if bad3 == 0 { "★" } else { "✗" }
     ))
 }
-
-
-
-
-
 
 /// vk-idot-probe (plans/89 P0.1) — OpSDot(PackedVectorFormat4x8Bit) 검증+타이밍.
 /// sdot_probe(plans/33)의 어셈블리 패치는 커널 문맥에서 0을 반환했다. 이번 판의
@@ -676,10 +670,6 @@ pub fn gemv8_check(path: &str, tname: &str, t: usize) -> Result<String, String> 
         w.data.len() as f64 / solo_dt / 1e9
     ))
 }
-
-
-
-
 
 /// vk-frame-check — plans/84 B: 프레임 코어(버퍼 레지스트리+엘리먼트와이스+
 /// 상주 GEMM)의 CPU 대조 검증. 각 op를 LCG 데이터로 실행해 판독 비교.
@@ -2966,8 +2956,6 @@ fn acc_frame_ptr(acc: &VkAcc, h: u64) -> *mut u8 {
         .map(|b| b.ptr)
         .unwrap_or(std::ptr::null_mut())
 }
-
-
 
 /// vk-gdn-chunk-check (plans/100) — 청크 병렬 GDN vs 순차 스캔 대조.
 /// 난수 q/k/v/bg로 단일 (pair, u블록) 수학 검증: 상대오차 <1e-3 판정.
