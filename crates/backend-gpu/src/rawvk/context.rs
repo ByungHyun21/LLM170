@@ -361,6 +361,61 @@ impl VkCtx {
         }
     }
 
+    /// D2D 버퍼 복사 묶음 원샷 제출 (GDN 상태 스냅샷·복원 — 107 W1 spec2
+    /// 수리). hip gdn_snapshot의 D2D 판 미러: 호스트 왕복(매핑 GTT 판독
+    /// 수백 ms + Vec 할당)을 제거한다. 전제: 호출 시점 GPU 유휴 — 배치
+    /// 중이면 먼저 대기한다.
+    pub fn copy_dev(
+        &mut self,
+        copies: &[(vk::Buffer, u64, vk::Buffer, u64, u64)],
+    ) -> Result<(), String> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.end_batch_wait()?;
+        }
+        unsafe {
+            self.device
+                .reset_command_buffer(
+                    self.cmdbuf,
+                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                )
+                .map_err(|e| format!("리셋: {e:?}"))?;
+            self.device
+                .begin_command_buffer(
+                    self.cmdbuf,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| format!("시작: {e:?}"))?;
+            for &(src, so, dst, db, n) in copies {
+                let reg = [vk::BufferCopy {
+                    src_offset: so,
+                    dst_offset: db,
+                    size: n,
+                }];
+                self.device.cmd_copy_buffer(self.cmdbuf, src, dst, &reg);
+            }
+            self.device
+                .end_command_buffer(self.cmdbuf)
+                .map_err(|e| format!("종료: {e:?}"))?;
+            self.device
+                .reset_fences(&[self.fence])
+                .map_err(|e| format!("펜스 리셋: {e:?}"))?;
+            let cbs = [self.cmdbuf];
+            let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.submits.set(self.submits.get() + 1);
+            self.device
+                .queue_submit(self.queue, &[si], self.fence)
+                .map_err(|e| format!("제출: {e:?}"))?;
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|e| format!("대기: {e:?}"))?;
+        }
+        Ok(())
+    }
+
     /// 배치 시작 — 이후 run()은 cmdbuf2에 녹화만.
     pub fn begin_batch(&mut self) -> Result<(), String> {
         // plans/93: 재생 모드 — 이미 녹화된 커맨드 버퍼를 재제출(스킵).
