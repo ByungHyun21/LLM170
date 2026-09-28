@@ -450,7 +450,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                             if n_gen >= tg {
                                 break;
                             }
-                            if std::env::var_os("LLM170_SPEC_DUMP").is_some() {
+                            if llm170_diag::dump::opts().key("spec_dump") {
                                 eprintln!("SPEC_TOK {t}");
                             }
                             next = t;
@@ -502,7 +502,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 } else {
                     while n_gen < tg {
                         next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
-                        if std::env::var_os("LLM170_SPEC_DUMP").is_some() {
+                        if llm170_diag::dump::opts().key("spec_dump") {
                             eprintln!("SPEC_TOK {next}");
                         }
                         n_gen += 1;

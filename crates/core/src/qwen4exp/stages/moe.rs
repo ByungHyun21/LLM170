@@ -59,7 +59,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
 
     // 3) 전문가별 서브배치 — 512×3 배치 GEMM (빈 전문가 스킵)
     let mut out = vec![vec![0.0f32; n_embd]; t];
-    let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+    let trace = llm170_diag::dump::opts().key("q4_trace");
     if trace && route.iter().flatten().any(|x| !x.is_finite()) {
         eprintln!("# NaN route logits (입력은 finite여야 함)");
         std::process::exit(101);

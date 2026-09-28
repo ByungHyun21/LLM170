@@ -710,7 +710,9 @@ impl DecodeState {
     /// 트레이스/덤프 활성 여부(캐시) — trace_rows 조기 반환 전 format! 비용 차단.
     fn tracing(&self) -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| env_on("LLM170_MS_TRACE") || std::env::var_os("LLM170_MS_DUMP").is_some())
+        *V.get_or_init(|| {
+            llm170_diag::dump::opts().key("ms_trace") || llm170_diag::dump::opts().key("ms_dump")
+        })
     }
 
     /// plans/28 디버그: 버퍼의 행별 L1 노름 덤프 (지연 게이트) — 수치 오염 행 탐지.
@@ -721,7 +723,9 @@ impl DecodeState {
         row_f32: usize,
         t: usize,
     ) -> Result<(), String> {
-        if !env_on("LLM170_MS_TRACE") && std::env::var_os("LLM170_MS_DUMP").is_none() {
+        if !llm170_diag::dump::opts().key("ms_trace")
+            && std::env::var_os("LLM170_MS_DUMP").is_none()
+        {
             return Ok(());
         }
         let mut buf = vec![0f32; row_f32 * t];
@@ -736,7 +740,7 @@ impl DecodeState {
             let p = std::path::Path::new(&dir).join(format!("{label}.{seq:04}.f32"));
             std::fs::write(p, bytemuck::cast_slice(&buf)).ok();
         }
-        if env_on("LLM170_MS_TRACE") {
+        if llm170_diag::dump::opts().key("ms_trace") {
             let norms: Vec<String> = (0..t)
                 .map(|r| {
                     let s: f64 = buf[r * row_f32..(r + 1) * row_f32]

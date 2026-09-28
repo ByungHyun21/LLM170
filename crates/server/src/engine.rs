@@ -242,7 +242,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
     let mut tick: u64 = 0;
     let (mut n_dec, mut n_pf) = (0u64, 0u64);
     let (mut ms_dec, mut ms_pf) = (0f64, 0f64);
-    let npw = std::env::var_os("LLM170_WALL_TIME").is_some();
+    let npw = llm170_diag::dump::opts().key("wall_time");
     let t0w = std::time::Instant::now();
     let mut last_wt = std::time::Instant::now();
     loop {
@@ -310,7 +310,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 cached: prev_cached,
                 sampler: sampler_new,
             };
-            if std::env::var_os("LLM170_SLOT_DBG").is_some() {
+            if llm170_diag::dump::opts().key("slot_dbg") {
                 eprintln!("# slot-dbg: job assigned to slot{i} reuse={reuse}");
             }
             if reuse > 0 {
@@ -578,7 +578,7 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if decoded {
             n_dec += 1;
             ms_dec += dec_ms;
-            if std::env::var_os("LLM170_SRV_TIME").is_some() && n_dec % 32 == 0 {
+            if llm170_diag::dump::opts().key("srv_time") && n_dec % 32 == 0 {
                 eprintln!(
                     "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms",
                     n_dec,

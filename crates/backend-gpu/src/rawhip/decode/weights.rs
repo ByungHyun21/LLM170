@@ -705,7 +705,7 @@ impl DecodeState {
                 .get(n)
                 .is_some_and(|&(_, ty, _, _)| self.mmq_used(ty, t) && self.mmq_used_s(ty, t))
         });
-        if env_on("LLM170_QSKIP_DBG") {
+        if llm170_diag::dump::opts().key("qskip_dbg") {
             eprintln!("# qskip t={t} n={} -> {r}", names.len());
         }
         r
@@ -723,7 +723,7 @@ impl DecodeState {
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
         for il in 0..self.n_layer {
-            if env_on("LLM170_RAWHIP_TRACE") {
+            if llm170_diag::dump::opts().key("rawhip_trace") {
                 eprintln!("# rawhip: layer {il} (recr={})", self.is_recr[il]);
             }
             // pre-norm + quant
@@ -901,7 +901,7 @@ impl DecodeState {
                         &mut args,
                     )?;
                 }
-                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 0 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; v_len];
                     self.ctx
@@ -1004,7 +1004,7 @@ impl DecodeState {
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.ssm_out.weight"))?;
                 self.mm_into(self.xq_g, wp, ty, ni, no, self.gout)?;
-                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 0 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; n];
                     self.ctx
@@ -1014,7 +1014,7 @@ impl DecodeState {
                 }
                 recr_idx += 1;
             } else {
-                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 3 {
                     self.ctx.sync()?;
                     let mut hn = vec![0f32; n];
                     self.ctx
@@ -1054,19 +1054,19 @@ impl DecodeState {
                 // q/k/v mm
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_q.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.aq)?;
-                if env_on("LLM170_RAWHIP_TRACE") {
+                if llm170_diag::dump::opts().key("rawhip_trace") {
                     self.ctx.sync()?;
                     eprintln!("#  aq ok");
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_k.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.ak)?;
-                if env_on("LLM170_RAWHIP_TRACE") {
+                if llm170_diag::dump::opts().key("rawhip_trace") {
                     self.ctx.sync()?;
                     eprintln!("#  ak ok");
                 }
                 let (wp, ty, ni, no) = self.w(&format!("blk.{il}.attn_v.weight"))?;
                 self.mm_into(self.xq_n, wp, ty, ni, no, self.av)?;
-                if env_on("LLM170_RAWHIP_TRACE") {
+                if llm170_diag::dump::opts().key("rawhip_trace") {
                     self.ctx.sync()?;
                     eprintln!("#  av ok");
                 }
@@ -1110,13 +1110,13 @@ impl DecodeState {
                     ];
                     self.ctx
                         .launch("qk_norm_rope", rows as u32, 1, 32, &mut args)?;
-                    if env_on("LLM170_RAWHIP_TRACE") {
+                    if llm170_diag::dump::opts().key("rawhip_trace") {
                         self.ctx.sync()?;
                         eprintln!("#  qk_norm ok");
                     }
                 }
                 // KV append
-                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 3 {
                     self.ctx.sync()?;
                     let mut hk = vec![0f32; n_kv * hd];
                     self.ctx
@@ -1211,7 +1211,7 @@ impl DecodeState {
                         ];
                         self.ctx
                             .launch3("qsa_score", gx, n_head as u32, 1, 64, &mut args)?;
-                        if env_on("LLM170_RAWHIP_TRACE") {
+                        if llm170_diag::dump::opts().key("rawhip_trace") {
                             self.ctx.sync()?;
                             eprintln!("#  score ok");
                         }
@@ -1246,7 +1246,7 @@ impl DecodeState {
                         ];
                         self.ctx
                             .launch3("qsa_mix2", gx, n_head as u32, 1, 64, &mut args)?;
-                        if env_on("LLM170_RAWHIP_TRACE") {
+                        if llm170_diag::dump::opts().key("rawhip_trace") {
                             self.ctx.sync()?;
                             eprintln!("#  mix ok");
                         }
@@ -1409,7 +1409,7 @@ impl DecodeState {
                             .launch3("qsa_flash", 1, n_head as u32, 1, 256, &mut args)?;
                     }
                 }
-                if env_on("LLM170_RAWHIP_TRACE") && il == 3 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 3 {
                     self.ctx.sync()?;
                     let mut ho = vec![0f32; n_head * hd];
                     self.ctx
@@ -1432,7 +1432,7 @@ impl DecodeState {
             }
             // 잔차
             self.axpy(self.xs, self.gout, n)?;
-            if env_on("LLM170_RAWHIP_TRACE") {
+            if llm170_diag::dump::opts().key("rawhip_trace") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n];
                 self.ctx
@@ -1499,7 +1499,7 @@ impl DecodeState {
                 );
             }
             self.axpy(self.xs, self.fdown, n)?;
-            if env_on("LLM170_RAWHIP_TRACE") {
+            if llm170_diag::dump::opts().key("rawhip_trace") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n];
                 self.ctx

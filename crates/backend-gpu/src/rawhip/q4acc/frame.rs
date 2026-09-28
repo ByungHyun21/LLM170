@@ -335,7 +335,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
                 (&mut ew) as *mut _ as *mut std::ffi::c_void,
             ];
-            if env_on("LLM170_Q8IDS_DBG") {
+            if llm170_diag::dump::opts().key("q8ids_dbg") {
                 eprintln!(
                     "# q8ids launch n_in={n_in} n_out={n_out} rows={rows} per_expert={per_expert}"
                 );
@@ -915,7 +915,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let _ = &b;
             let rows_pad_dev = b[ne + 1].max(0) as usize;
             let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
-            if env_on("LLM170_MOE_BCHECK") {
+            if llm170_diag::dump::opts().key("moe_bcheck") {
                 // b(pinned off) 무결성 — r 오염(gemm_q5k gx=1.04억)의 원본 관찰.
                 let mut mono_ok = true;
                 for i in 0..ne {
