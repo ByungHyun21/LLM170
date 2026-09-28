@@ -2577,3 +2577,14 @@ llmmq 구조의 q5_1 판(니블+하이비트 16 sdot·dm f32 — q51mmq와 비�
 형상의 최적점(llama 자신도 q5_1은 171GB/s로 실효 천장). **축 폐쇄** —
 q51mmq 유지, ll51은 옵트인(Q51LL=1) 보존.
 pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
+
+### (78) llama 실측 특수화(BLOCK256·BM/BN128·WM/WN64) 이식 부정 (2026-09-28 심야10)
+
+- llama RADV+coopmat K-quant MMQ_ID 특수화(l_warptile_mmq_int_k AMD 분기:
+  BLOCK 256·BM/BN 128·WM/WN 64 풀wave64·WMITER 1) 그대로 이식 —
+  스테이징 커버 결함(행 112-127 누락) 1건 수리 후에도 **13ms/콜·게이트
+  FAIL**(층0 정확·하류 발산 + 64 sums 레지스터 압박). 본 기기에서는
+  BN=32 축소판(원장 76)이 최적 — **원복 승격판, pp512 466.7 t/s**.
+- 결론: llama의 2.9ms는 특수화 상수가 아니라 B 사전팩 정량
+  파이프라인(q8_1_x4_packed128 + quantize_q8_1 선행 커널)이 지탱 —
+  구조는 llmmq에 이미 확보, 정량 파이프라인만 잔여(단일축).
