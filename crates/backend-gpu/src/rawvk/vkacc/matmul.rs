@@ -1640,39 +1640,6 @@ impl VkAcc {
                                 eprintln!("[f32s] #{n} n_in={n_in} n_out={n_out} t={t}");
                             }
                         }
-                        // plans/95 P1b — 비트 동일 고속판 시도: 게이트 3/3 PASS
-                        // (체커·스트림 완전 동일 확인)이나 181.7 t/s(−21%) —
-                        // 직렬 순서 보존 = 긴 의존 체인이 본 비용임을 입증.
-                        // 스테이징이 아니라 순서 제약이 병목(원장 41).
-                        // opt-in LLM170_VK_FT32E=1.
-                        if dty == 0
-                            && n_out <= 512
-                            && std::env::var("LLM170_VK_FT32E")
-                                .map(|v| v == "1")
-                                .unwrap_or(false)
-                        {
-                            let p = self.pipeline(&mut ctx, Slot::FnTileF32e)?;
-                            let mut binds: Vec<vk::Buffer> = wbufs.clone();
-                            while binds.len() < 8 {
-                                binds.push(dbuf);
-                            }
-                            binds.push(xb);
-                            binds.push(ob);
-                            let ds2 = ctx.bind_ds(&p, &binds)?;
-                            let push = push_u32s(&[n_in as u32, n_out as u32, t as u32]);
-                            ctx.run_rw(
-                                p.pl,
-                                ds2,
-                                p.pipe,
-                                &push,
-                                ((n_out * t) as u32).div_ceil(256),
-                                1,
-                                1,
-                                &binds,
-                                &[ob],
-                            )?;
-                            continue;
-                        }
                         let p = self.pipeline(&mut ctx, Slot::FnTileF32)?;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {

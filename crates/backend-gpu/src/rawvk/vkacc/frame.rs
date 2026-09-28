@@ -466,11 +466,8 @@ impl VkAcc {
             match hit {
                 Some(b) => b,
                 None => {
-                    let qs8 = std::env::var("LLM170_VK_QS8")
-                        .map(|v| v == "1")
-                        .unwrap_or(false); // 부정: +11% 지연
-                    let p =
-                        self.pipeline(&mut ctx, if qs8 { Slot::QuantS8 } else { Slot::Quant })?;
+                    // 107 W1: QuantS8 변형 폐기(+11% 지연 — 부정 주석이 근거).
+                    let p = self.pipeline(&mut ctx, Slot::Quant)?;
                     let push = push_u32s(&[n_in as u32, rows as u32, xq_w as u32]);
                     let tgt = if pair_on {
                         let mut sl = self.moe_xq_pair.lock();
@@ -862,17 +859,6 @@ impl VkAcc {
                     gi.yg.buf,
                 )
             };
-            // plans/89 P1.1b/d — coopmat 타일 우선(q4_K/q5_1): 스칼라 16×16 판
-            // 대신 f16 coopMatMulAdd 전문가-블록 판(WG() 25비트 함정 제거판,
-            // 스케일 분리 + f32 드레인). 킬스위치 LLM170_VK_MOECM=0.
-            let cm_on = wbufs.len() == 1
-                && std::env::var("LLM170_VK_MOECM")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-            let q4k_cm = cm_on
-                && std::env::var("LLM170_VK_Q4KCM")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
             // plans/96 G3 — q8_0 스택 down: 구 스칼라(24ms/회) 대체 MMQ.
             // A측 q8r 무손실 릴레이아웃(dense 자산 재사용) — per_expert는
             // q8r 행바이트 기준으로 교체. env LLM170_VK_Q8MOE(기본 on).
@@ -918,53 +904,6 @@ impl VkAcc {
             {
                 w0_override = Some(vk::Buffer::null()); // 마커 — 원본 바인딩
             }
-            // plans/105(원장 76): llmmq q5_1 다운 판(옵트인 Q51LL=1).
-            if w.ty == GgmlType::Q5_1
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q51LL")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-            {
-                let (offb, pmb) = {
-                    let g = self.moe_grp.lock();
-                    let g = g.as_ref().unwrap();
-                    (g.off.buf, g.perm.buf)
-                };
-                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLl51)?;
-                let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
-                while pbinds.len() < 8 {
-                    pbinds.push(dbuf);
-                }
-                pbinds.push(xq);
-                pbinds.push(ob);
-                pbinds.push(dbuf);
-                pbinds.push(pmb);
-                pbinds.push(offb);
-                let ds2 = ctx.bind_ds(&pk, &pbinds)?;
-                // per_expert 필드: q5_1 블록수 = per_expert_bytes/24 — 커널이 워드 환산하므로 원본 그대로.
-                let push = push_u32s(&[
-                    n_in as u32,
-                    n_out as u32,
-                    per_expert as u32,
-                    chunk_words,
-                    xq_w as u32,
-                    n_expert_stack as u32,
-                    0u32,
-                ]);
-                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
-                ctx.run_rw(
-                    pk.pl,
-                    ds2,
-                    pk.pipe,
-                    &push,
-                    (n_out as u32).div_ceil(64),
-                    n_expert_stack as u32,
-                    1,
-                    &pkrds,
-                    &[ob],
-                )?;
-                return Ok(());
-            }
             // plans/105 P2: llama mul_mmq 포트(옵트인 LLM170_VK_Q4KLL=1) —
             // BN64 워프타일·전문가당 단일 WG(가중 1회 판독). 근거: llama
             // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
@@ -981,16 +920,8 @@ impl VkAcc {
                     (g.off.buf, g.perm.buf)
                 };
                 let (xq_ll, _llbytes) = self.packbufs.lock().0.get(&x).unwrap().clone();
-                // plans/106: f16-dm 변형(옵트인) — shmem A스케일 1/4.
-                let ll_slot = if std::env::var("LLM170_VK_LLMMQH16")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
-                    Slot::FnMoeTileLlmmqH16
-                } else {
-                    Slot::FnMoeTileLlmmq
-                };
-                let pk = self.pipeline(&mut ctx, ll_slot)?;
+                // 107 W1: f16-dm 변형(LLMMQH16) 폐기 — 원장 83 중립 판정.
+                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLlmmq)?;
                 let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
                 while pbinds.len() < 8 {
                     pbinds.push(dbuf);
@@ -1024,90 +955,6 @@ impl VkAcc {
                 )?;
                 return Ok(());
             }
-            // plans/105 P1: 전문가-주 퍼시스턴트 K-분할(옵트인 LLM170_VK_Q4KPKS=1)
-            // — A 스테이징 전문가당 1회(슈퍼그룹 4청크 공유) + 선형 스크래치
-            // 드레인 → FnKsred 결정론 축소(tile_q8128ks 승격 클래스).
-            if w.ty == GgmlType::Q4K
-                && wbufs.len() == 1
-                && std::env::var("LLM170_VK_Q4KPKS")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-            {
-                let (offb, pmb) = {
-                    let g = self.moe_grp.lock();
-                    let g = g.as_ref().unwrap();
-                    (g.off.buf, g.perm.buf) // 컴팩트 도메인 쌍(offv·perm)
-                };
-                // Q4KPKS=2: z=1 A-공유+직접산란 — 스크래치 0·원판과 비트 동일.
-                let direct1 = std::env::var("LLM170_VK_Q4KPKS")
-                    .map(|v| v == "2")
-                    .unwrap_or(false);
-                let ks: u32 = if direct1 { 1 } else { 4 };
-                let need = ks as usize * bound * n_out * 4;
-                let scr = if direct1 {
-                    ob // plane=0 — 커널의 sc 쓰기가 곧 직접 산란
-                } else {
-                    let mut g = self.ks_scratch.lock();
-                    if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                        g.as_ref().unwrap().buf
-                    } else {
-                        let b = ctx.alloc(need)?;
-                        *g = Some(b);
-                        g.as_ref().unwrap().buf
-                    }
-                };
-                let pk = self.pipeline(&mut ctx, Slot::FnMoeTileQ4kPks)?;
-                let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
-                while pbinds.len() < 8 {
-                    pbinds.push(dbuf);
-                }
-                pbinds.push(xq);
-                pbinds.push(scr);
-                pbinds.push(dbuf); // 슬롯10(미사용 Rp) — null 바인딩 금지
-                pbinds.push(pmb);
-                pbinds.push(offb);
-                let ds2 = ctx.bind_ds(&pk, &pbinds)?;
-                let push = push_u32s(&[
-                    n_in as u32,
-                    n_out as u32,
-                    per_expert as u32,
-                    chunk_words,
-                    xq_w as u32,
-                    ks,
-                    bound as u32,
-                ]);
-                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
-                let wset: Vec<vk::Buffer> = if direct1 { vec![ob] } else { vec![scr] };
-                ctx.run_rw(
-                    pk.pl,
-                    ds2,
-                    pk.pipe,
-                    &push,
-                    (n_out as u32).div_ceil(64),
-                    n_expert_stack as u32,
-                    ks,
-                    &pkrds,
-                    &wset,
-                )?;
-                if !direct1 {
-                    let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
-                    let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
-                    let n_tot = (bound * n_out) as u32;
-                    let pushr = push_u32s(&[n_tot, ks]);
-                    ctx.run_rw(
-                        pr.pl,
-                        dsr,
-                        pr.pipe,
-                        &pushr,
-                        n_tot.div_ceil(128),
-                        1,
-                        1,
-                        &[scr],
-                        &[ob],
-                    )?;
-                }
-                return Ok(());
-            }
             let slot = if w.ty == GgmlType::Q5K && w0_override.is_some() {
                 Slot::FnMoeTileQ5kmmq
             } else if w.ty == GgmlType::Q5_1 && w0_override.is_some() {
@@ -1115,105 +962,11 @@ impl VkAcc {
             } else if w0_override.is_some() {
                 Slot::FnMoeTileQ8mmq
             } else {
-                match (w.ty, q4k_cm) {
-                    (GgmlType::Q4K, _k)
-                        if wbufs.len() == 1
-                            && std::env::var("LLM170_VK_Q4KKP")
-                                .map(|v| v == "1")
-                                .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kKp
-                    }
-                    (GgmlType::Q4K, true)
-                        if std::env::var("LLM170_VK_Q4KCM")
-                            .map(|v| v == "2")
-                            .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kCm2
-                    }
-                    (GgmlType::Q4K, true)
-                        if std::env::var("LLM170_VK_Q4KSG1")
-                            .map(|v| v == "1")
-                            .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kSg1
-                    }
-                    (GgmlType::Q4K, true)
-                        if std::env::var("LLM170_VK_Q4KSC")
-                            .map(|v| v == "1")
-                            .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kSc
-                    }
-                    (GgmlType::Q4K, true) => Slot::FnMoeTileQ4kCm,
-                    // plans/89 재개: q51_sg1은 엔진 결정적 실측(5회 4동일+타이 1) —
-                    // 기본 경로로 승격(종전 스칼라는 킬스위치 LLM170_VK_Q51SG1=0).
-                    // 8sg판(q51_cm)과 q4k_sg1은 엔진 비결정 — 옵트인만.
-                    (GgmlType::Q5_1, _sg)
-                        if wbufs.len() == 1
-                            && std::env::var("LLM170_VK_Q51SG1")
-                                .map(|v| v != "0")
-                                .unwrap_or(true) =>
-                    {
-                        Slot::FnMoeTileQ51Sg1
-                    }
-                    (GgmlType::Q5_1, _q51cm)
-                        if cm_on
-                            && std::env::var("LLM170_VK_Q51CM")
-                                .map(|v| v != "0")
-                                .unwrap_or(true) =>
-                    {
-                        Slot::FnMoeTileQ51Cm
-                    }
-                    // plans/93: q4k_sg1(coopmat 1-sg, 224 t/s) 기본 승격 — 구 스칼라
-                    // (160 t/s) 대비 +40%. 라우팅 민감도는 기본 경로와 동일(원장 36).
-                    // 안전장치: bound > 8192(pp16384급)에서는 GPU 행업 관측 — 구 스칼라로.
-                    // 킬스위치 LLM170_VK_Q4KSG1=0.
-                    (GgmlType::Q4K, _)
-                        if wbufs.len() == 1
-                            && rows <= 8192
-                            && std::env::var("LLM170_VK_Q4KSG1F")
-                                .map(|v| v == "1")
-                                .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kSg1f
-                    }
-                    (GgmlType::Q4K, _)
-                        if wbufs.len() == 1
-                            && rows <= 8192
-                            && std::env::var("LLM170_VK_Q4KSG1")
-                                .map(|v| v == "1")
-                                .unwrap_or(false) =>
-                    {
-                        if std::env::var("LLM170_VK_Q4KSG2")
-                            .map(|v| v == "1")
-                            .unwrap_or(false)
-                        {
-                            Slot::FnMoeTileQ4kSg2
-                        } else {
-                            Slot::FnMoeTileQ4kSg1
-                        }
-                    }
-                    // plans/96: q4_K MMQ v5(라이브 스킵+호이스티드) 승격 — 5.13ms
-                    // vs sg1 5.43(8차 시험 첫 승리). 킬스위치 =0 → sg1(옵트인 =1).
-                    // plans/99: INT8 coopmat(u8×i8→i32, RADV 26.2.3) — 21-25 TMAC/s.
-                    (GgmlType::Q4K, _)
-                        if wbufs.len() == 1
-                            && std::env::var("LLM170_VK_Q4CM8B")
-                                .map(|v| v != "0")
-                                .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kCm8b
-                    }
-                    (GgmlType::Q4K, _)
-                        if wbufs.len() == 1
-                            && std::env::var("LLM170_VK_Q4CM8")
-                                .map(|v| v != "0")
-                                .unwrap_or(false) =>
-                    {
-                        Slot::FnMoeTileQ4kCm8
-                    }
-                    (GgmlType::Q4K, _)
+                // 107 W1: 부정 변형 슬롯 전량 폐기(원장 63-86) — 잔여는
+                // 승격 기본(mmq 계열·q51_sg1)과 다중중량 스칼라 폴백뿐.
+                match w.ty {
+                    GgmlType::Q5_1 => Slot::FnMoeTileQ51Sg1,
+                    GgmlType::Q4K
                         if wbufs.len() == 1
                             && std::env::var("LLM170_VK_Q4KMMQ")
                                 .map(|v| v != "0")
@@ -1221,19 +974,13 @@ impl VkAcc {
                     {
                         Slot::FnMoeTileQ4kMmq
                     }
-                    (GgmlType::Q5_1, _) => Slot::FnMoeTileQ51,
-                    (GgmlType::Q8_0, _) => Slot::FnMoeTileQ8,
+                    GgmlType::Q8_0 => Slot::FnMoeTileQ8,
                     _ => Slot::FnMoeTileQ5k,
                 }
             };
 
             let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
-            if let Some(b) = w0_override {
-                if b != vk::Buffer::null() {
-                    binds[0] = b;
-                }
-            }
             if let Some(b) = w0_override {
                 if b != vk::Buffer::null() {
                     binds[0] = b;
@@ -1246,13 +993,10 @@ impl VkAcc {
             // 스캐터(permute_f32) 폐지. 레거시 슬롯은 종전 yg+스캐터.
             let direct = matches!(
                 slot,
-                Slot::FnMoeTileQ4kSg1
                     | Slot::FnMoeTileQ51Sg1
                     | Slot::FnMoeTileQ8
                     | Slot::FnMoeTileQ5k
                     | Slot::FnMoeTileQ4kMmq
-                    | Slot::FnMoeTileQ4kCm8
-                    | Slot::FnMoeTileQ4kCm8b
                     | Slot::FnMoeTileQ8mmq
                     | Slot::FnMoeTileQ5kmmq
                     | Slot::FnMoeTileQ51mmq
@@ -1264,62 +1008,6 @@ impl VkAcc {
             binds.push(rxb);
             binds.push(rpb);
             binds.push(ppb);
-            if matches!(slot, Slot::FnMoeTileQ4kCm8 | Slot::FnMoeTileQ4kCm8b) {
-                // plans/99: 타일 SSBO 스크래치 — cm8: WG당 1KB×3 · cm8b: 2KB/2KB/2KB.
-                // (shared 소스 coopmat 로드가 다중 WG 동시성에서 부정확.)
-                // 주소 지정이 wgslot=wg·1024 1024-스트라이드이므로 i8도 1KB/WG
-                // 필수 — 512B 할당 시 WG 절반이 OOB 기록으로 scw를 오염시킴.
-                // cm8: wgslot 1024-스트라이드(u8 1KB·i8 1KB) · cm8b: 2048-스트라이드.
-                let per_wg: usize = if matches!(slot, Slot::FnMoeTileQ4kCm8b) {
-                    2048
-                } else {
-                    1024
-                };
-                let n_wg = (n_out.div_ceil(16) * bound.div_ceil(16)) as usize;
-                let (au, ai, aw) = {
-                    let mut g = self.cm8_scratch.lock();
-                    let w_need = if matches!(slot, Slot::FnMoeTileQ4kCm8b) {
-                        n_wg * 4096
-                    } else {
-                        n_wg * per_wg
-                    };
-                    if g.0
-                        .as_ref()
-                        .map(|b| b.bytes >= n_wg * per_wg)
-                        .unwrap_or(false)
-                        && g.1
-                            .as_ref()
-                            .map(|b| b.bytes >= n_wg * per_wg)
-                            .unwrap_or(false)
-                        && g.2.as_ref().map(|b| b.bytes >= w_need).unwrap_or(false)
-                    {
-                        (
-                            g.0.as_ref().unwrap().buf,
-                            g.1.as_ref().unwrap().buf,
-                            g.2.as_ref().unwrap().buf,
-                        )
-                    } else {
-                        // cm8b acc 스토어: 4그룹×256i32 = 4096B/WG 필수.
-                        let w_bytes = if matches!(slot, Slot::FnMoeTileQ4kCm8b) {
-                            4096
-                        } else {
-                            per_wg
-                        };
-                        let u = ctx.alloc(n_wg * per_wg)?;
-                        let i = ctx.alloc(n_wg * per_wg)?;
-                        let w = ctx.alloc(n_wg * w_bytes)?;
-                        *g = (Some(u), Some(i), Some(w));
-                        (
-                            g.0.as_ref().unwrap().buf,
-                            g.1.as_ref().unwrap().buf,
-                            g.2.as_ref().unwrap().buf,
-                        )
-                    }
-                };
-                binds.push(au);
-                binds.push(ai);
-                binds.push(aw);
-            }
             let ds2 = ctx.bind_ds(&p, &binds)?;
             // PC 선언순: n_in, n_out, per_expert_bytes, chunk_words, xq_w, mode, rows.
             let push = push_u32s(&[
@@ -1328,64 +1016,20 @@ impl VkAcc {
                 per_expert_push as u32,
                 chunk_words,
                 xq_w as u32,
-                if matches!(slot, Slot::FnMoeTileQ4kCm8 | Slot::FnMoeTileQ4kCm8b) {
-                    {
-                        let m = std::env::var("LLM170_VK_Q4CM8DBG")
-                            .ok()
-                            .and_then(|v| v.parse::<u32>().ok())
-                            .unwrap_or(0);
-                        if std::env::var_os("LLM170_MTC_DBG").is_some() {
-                            eprintln!("[cm8-push] mode={m}");
-                        }
-                        m
-                    }
-                } else {
-                    0u32
-                },
+                0u32,
                 rows as u32,
             ]);
-            let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
-                (n_out.div_ceil(4) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ4kCm8b) {
-                // plans/99 cm8b: 64가중행(타일4) × 16할당행 — v5 기하.
-                // (이분법 스위치: CM8B_G16=1 → 그룹0만 유효한 gx/16)
-                let gx16 = std::env::var("LLM170_CM8B_G16")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                (
-                    (if gx16 {
-                        n_out.div_ceil(16)
-                    } else {
-                        n_out.div_ceil(64)
-                    }) as u32,
-                    bound.div_ceil(16) as u32,
-                )
-            } else if matches!(slot, Slot::FnMoeTileQ4kCm8) {
-                // plans/99: 16가중행(서브그룹1·coopmat 16×16) × 16할당행.
-                (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ4kMmq) {
-                // plans/95 v2: 64가중행 × 16할당행 타일 — 16행 밴드가
-                // moe_group 균일-전문가 보증 단위.
-                (n_out.div_ceil(64) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(
+            // 107 W1: 변형 슬롯 폐기 후 잔여 — 와이드 64열판(mmq 계열)과
+            // 16열판(sg1·스칼라 폴백) 두 가지.
+            let wide = matches!(
                 slot,
-                Slot::FnMoeTileQ8mmq | Slot::FnMoeTileQ5kmmq | Slot::FnMoeTileQ51mmq
-            ) {
+                Slot::FnMoeTileQ4kMmq
+                    | Slot::FnMoeTileQ8mmq
+                    | Slot::FnMoeTileQ5kmmq
+                    | Slot::FnMoeTileQ51mmq
+            );
+            let (gx, gy) = if wide {
                 (n_out.div_ceil(64) as u32, bound.div_ceil(16) as u32)
-            } else if matches!(slot, Slot::FnMoeTileQ4kSg2) {
-                // plans/93 sg2: 32행/WG — 가중치 판독 절반.
-                (n_out.div_ceil(16) as u32, bound.div_ceil(32) as u32)
-            } else if matches!(
-                slot,
-                Slot::FnMoeTileQ51Sg1
-                    | Slot::FnMoeTileQ4kSg1
-                    | Slot::FnMoeTileQ4kSc
-                    | Slot::FnMoeTileQ4kSg1f
-            ) {
-                // plans/93: 16열/WG 판 — cm_on 그리드(n_out/128)와 별개.
-                (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
-            } else if cm_on {
-                (n_out.div_ceil(128) as u32, bound.div_ceil(16) as u32)
             } else {
                 (n_out.div_ceil(16) as u32, bound.div_ceil(16) as u32)
             };
