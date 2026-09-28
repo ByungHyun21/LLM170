@@ -430,27 +430,10 @@ impl Q4Acc {
                 let tc = if tq_mode { t } else { 128.min(t - t0) };
                 let xsrc = unsafe { xq.add(t0 * xq_w * 4) };
                 let osrc = unsafe { out.add(t0 * n_out * 4) };
-                if let Err(e) = self
+                if let Err(_e) = self
                     .ctx
                     .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
                 {
-                    if env_on("LLM170_Q4_DBG") {
-                        use std::sync::Mutex;
-                        use std::sync::OnceLock;
-                        static SEEN: OnceLock<Mutex<Vec<(u32, usize, usize, usize)>>> =
-                            OnceLock::new();
-                        let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
-                        if let Ok(mut v) = seen.lock() {
-                            // (ty, n_in, n_out) 별 1회 + t는 128 단위 구간으로 구분.
-                            let key = (ty, n_in, n_out, (tc / 128) * 128);
-                            if !v.contains(&key) && v.len() < 24 {
-                                v.push(key);
-                                eprintln!(
-                                    "# gemm_tile 폴백: ty={ty} n_in={n_in} n_out={n_out} t={tc} err={e}"
-                                );
-                            }
-                        }
-                    }
                     ok = false;
                     break;
                 }
@@ -674,13 +657,6 @@ impl Q4Acc {
                     .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
                     .is_ok()
             {
-                // 임시 진단: LLM170_F16_DBG=1 이면 호출 직후 동기화해 실패 지점을 명명한다.
-                if env_on("LLM170_F16_DBG") {
-                    self.ctx
-                        .sync()
-                        .map_err(|e| format!("f16 sync [{n_in}x{n_out}] t={t}: {e}"))?;
-                    eprintln!("f16-deq OK [{n_in}x{n_out}] t={t}");
-                }
             } else {
                 self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
             }

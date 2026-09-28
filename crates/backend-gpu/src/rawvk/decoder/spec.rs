@@ -317,12 +317,6 @@ impl DecoderState {
                 // 107 W1: all_logits=true는 이제 전사 없이 b_lg_t에 상주
                 // (step_batch 계약 변경 — 유일 소비자가 이 경로다).
                 let _ = self.step_batch(seq, pos0 + off, ch, true)?;
-                if llm170_diag::flag::on("LLM170_SPEC_TIMING") {
-                    eprintln!(
-                        "[vb] step_batch t={t} = {:.1}ms",
-                        _tt.elapsed().as_secs_f64() * 1e3
-                    );
-                }
                 // fn_argmax_rows 2단계 GPU argmax — t×608KB 전사·CPU 스캔 폐지.
                 let nv = self.n_vocab;
                 let n_wg = nv.div_ceil(256 * 8);

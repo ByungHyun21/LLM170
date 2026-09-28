@@ -579,13 +579,6 @@ impl Engine {
         }
         // MTP nextn KV 적립 — 프롬프트/배치 토큰 전체 (draft 어텐션 컨텍스트).
         // h_in = 본체 최종 hidden (output_norm 전). 로짓 없이 1층만.
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-            eprintln!(
-                "  [hookguard] mtp_h.len={} seq0={}",
-                self.seqs[seq_ids[0]].mtp_h.len(),
-                seq_ids[0]
-            );
-        }
         if !self.seqs[seq_ids[0]].mtp_h.is_empty() && self.mtp_wanted {
             // plans/46: raw 백엔드는 GPU MTP 스텝을 사용 — CPU mtp_step은 토큰당 ~150ms로
             // 프리필·검증을 30× 악화시켰다. GPU 경로는 argmax만 반환 → mtp_draft_tok 사용.
@@ -783,22 +776,13 @@ impl Engine {
             return Ok(crate::qwen35::greedy(&logits[0]));
         };
         let n = self.model.hp.n_embd;
-        let tw0 = std::time::Instant::now();
         let embd = self.model.wchk("token_embd.weight")?;
         let mut row = vec![0.0f32; n];
         crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
-        let tw1 = std::time::Instant::now();
         let pos = self.seqs[seq].pos as usize;
         let tok = rd
             .raw_step_greedy(seq, pos, &row)
             .map_err(ModelError::Accel)?;
-        if std::env::var_os("LLM170_DBG_WALL").is_some() {
-            eprintln!(
-                "[dg] dequant={:.2}ms step+greedy={:.2}ms",
-                (tw1 - tw0).as_secs_f64() * 1e3,
-                tw1.elapsed().as_secs_f64() * 1e3
-            );
-        }
         self.seqs[seq].pos += 1;
         Ok(tok)
     }

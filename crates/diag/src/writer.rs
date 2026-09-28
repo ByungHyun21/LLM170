@@ -60,26 +60,11 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     out
 }
 
-/// 순차 덤프 — `LLM170_KTRACE_SEQ=N`.
-pub fn seq_dump(evs: &[Ev], max: usize) -> String {
-    let mut out = String::new();
-    for (k, ev) in evs.iter().enumerate().take(max) {
-        out.push_str(&format!(
-            "# seq {k:4} {:<28} gy={:<6} {:8.3}ms\n",
-            ev.name, ev.lane, ev.dur_ms
-        ));
-    }
-    out
-}
 
-/// 통합 덤프 — 집계 테이블 + 갭 + (LLM170_KTRACE_SEQ=N 지정시) 순차 목록.
+/// 통합 덤프 — 집계 테이블 + 갭.
 /// 백엔드 어댑터(ktrace 등)의 단일 호출 프론트엔드.
 pub fn dump(evs: &[Ev], dropped: u64) -> String {
-    let mut out = table(evs, dropped);
-    if let Ok(v) = std::env::var("LLM170_KTRACE_SEQ") {
-        let n: usize = v.parse().unwrap_or(64);
-        out.push_str(&seq_dump(evs, n));
-    }
+    let out = table(evs, dropped);
     out
 }
 #[cfg(test)]
@@ -120,12 +105,5 @@ mod tests {
     fn dropped_warning() {
         let s = table(&[], 42);
         assert!(s.contains("42 events dropped"));
-    }
-
-    #[test]
-    fn seq_dump_format() {
-        let evs = vec![ev("k1", 4, 1.5, None)];
-        let s = seq_dump(&evs, 64);
-        assert!(s.contains("# seq    0 k1                           gy=4         1.500ms"));
     }
 }

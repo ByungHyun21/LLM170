@@ -172,34 +172,20 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             for r in 0..reps {
                 eng.reset_states();
                 // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
-                if std::env::var_os("LLM170_KTRACE").is_some() {
-                    llm170_backend_gpu::rawhip::ktrace_on();
-                }
                 let t0 = Instant::now();
                 let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-                if std::env::var_os("LLM170_KTRACE").is_some() {
-                    eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
-                }
                 let mut next = llm170_core::qwen35::greedy(&l);
                 // TG — 프레임 경로는 decode1 내부 분기
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut step = 0usize;
                 // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
-                let mut kt_done = false;
                 while n_gen < tg {
-                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
-                        llm170_backend_gpu::rawhip::ktrace_on();
-                    }
                     // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
                     next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
                     // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
                     // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
-                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
-                        eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
-                        kt_done = true;
-                    }
                     n_gen += 1;
                     step += 1;
                     if next == eos {

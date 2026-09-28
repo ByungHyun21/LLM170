@@ -267,7 +267,6 @@ impl DecoderState {
         let xq_sn = crate::rawvk::vkacc::xq_words(n);
         let xq_sf = crate::rawvk::vkacc::xq_words(hp.n_ff);
         let xq_sg = crate::rawvk::vkacc::xq_words(hp.d_inner);
-        let max_ssbo0 = ctx.max_ssbo;
         let (
             b_xs,
             b_xn,
@@ -509,7 +508,6 @@ impl DecoderState {
         let faccs = ctx.alloc_host(wg_max * 256 * 4)?;
         Ok(Self {
             ctx,
-            max_ssbo: max_ssbo0,
             ktimes: std::collections::HashMap::new(),
             ktime: llm170_diag::flag::on("LLM170_VK_KTIME"),
             dbg_drain_ms: 0.0,

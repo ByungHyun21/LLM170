@@ -288,49 +288,6 @@ impl DecoderState {
                         d_inner,
                     )?;
                 }
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il < 2 {
-                    self.ctx.end_batch_wait().ok();
-                    self.ctx.begin_batch().ok();
-                    let mut v = vec![0f32; n];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.b_gout.ptr as *const f32,
-                            v.as_mut_ptr(),
-                            n,
-                        )
-                    };
-                    let sum: f64 = v.iter().map(|&x| x as f64).sum();
-                    let s = |b: &VkBuf, len: usize| -> f64 {
-                        let mut x = vec![0f32; len];
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len)
-                        };
-                        x.iter().map(|&q| q as f64).sum()
-                    };
-                    let srow = |b: &VkBuf, r: usize, len: usize| -> f64 {
-                        let mut x = vec![0f32; len];
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                b.ptr.add(r * len * 4) as *const f32,
-                                x.as_mut_ptr(),
-                                len,
-                            )
-                        };
-                        x.iter().map(|&q| q as f64).sum()
-                    };
-                    eprintln!(
-                        "#  G0 il={il} gout={sum:.6} | xs0={:.4} xs1={:.4} xn0={:.4} xn1={:.4} gqkv0={:.4} gconv0={:.4} gq0={:.4} go0={:.4} ggated0={:.4}",
-                        srow(&self.b_xs, 0, 64),
-                        srow(&self.b_xs, 1, 64),
-                        srow(&self.b_xn, 0, 64),
-                        srow(&self.b_xn, 1, 64),
-                        s(&self.b_gqkv, self.conv_ch.min(64)),
-                        s(&self.b_gconv, self.conv_ch.min(64)),
-                        s(&self.b_gq, self.k_len.min(64)),
-                        s(&self.b_go, self.v_len.min(64)),
-                        s(&self.b_ggated, self.d_inner.min(64))
-                    );
-                }
                 recr_idx += 1;
             } else {
                 // 어텐션 (LLM170_VK_ATTN: 1=qkv gemv만, 2=+rope/kv, 3=+flash, 4=+wo)
@@ -338,25 +295,6 @@ impl DecoderState {
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(4);
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 3 {
-                    let (bufs, tyq, niq, noq) =
-                        self.w.get(&format!("blk.{il}.attn_q.weight")).unwrap();
-                    let total: usize = bufs.iter().map(|b| b.bytes).sum();
-                    let (gbufs, _, _, gno) = self.w.get("blk.0.attn_qkv.weight").unwrap();
-                    let gtotal: usize = gbufs.iter().map(|b| b.bytes).sum();
-                    eprintln!(
-                        "#  ATTN3 ty={} ni={} no={} chunks={} bytes={} max_ssbo={} | L0qkv no={} chunks={} bytes={}",
-                        tyq,
-                        niq,
-                        noq,
-                        bufs.len(),
-                        total,
-                        self.max_ssbo,
-                        gno,
-                        gbufs.len(),
-                        gtotal
-                    );
-                }
                 self.gemv_stage(
                     n,
                     1,
@@ -593,7 +531,6 @@ impl DecoderState {
         }
         // ── head: gemv(output) — output_norm은 마지막 addrms에 융합, quant는
         // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).
-        let tw_head1 = std::time::Instant::now();
         self.gemv_w(
             self.b_xn.buf,
             self.b_xq_n.buf,
@@ -604,13 +541,6 @@ impl DecoderState {
         )?;
         self.ctx.end_batch_wait()?;
         self.ctx.ts_report();
-        if llm170_diag::flag::on("LLM170_DBG_WALL") {
-            eprintln!(
-                "[step] head+wait={:.2}ms step총={:.2}ms",
-                tw_head1.elapsed().as_secs_f64() * 1e3,
-                vk_t0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         if self.ktime {
             let mut v: Vec<_> = self.ktimes.iter().collect();
             v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
@@ -629,21 +559,6 @@ impl DecoderState {
                 "[vkprof] step: {:.1}ms (pos {})",
                 vk_t0.elapsed().as_secs_f32() * 1e3,
                 pos
-            );
-        }
-        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
-            let s = |b: &VkBuf, len: usize| -> f64 {
-                let mut x = vec![0f32; len];
-                unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
-                x.iter().map(|&q| q as f64).sum()
-            };
-            eprintln!(
-                "#  ST state seq={seq} conv0={:.6} gdn0={:.6} kvk3r0={:.6} kvv3r0={:.6} xsL={:.6}",
-                s(&self.st_conv[0][seq], 30720.min(self.conv_ch * 3)),
-                s(&self.st_gdn[0][seq], 4096),
-                s(&self.kv_k[0][seq], 1024),
-                s(&self.kv_v[0][seq], 1024),
-                s(&self.b_xs, 64)
             );
         }
         Ok(())
@@ -733,47 +648,15 @@ impl DecoderState {
         }
         let pf_up = pf_up0.elapsed().as_secs_f64() * 1e3;
         let pf_gpu0 = std::time::Instant::now();
-        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
-            let mut x = vec![0f32; 64];
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, x.as_mut_ptr(), 64)
-            };
-            let s0: f64 = x.iter().map(|&v| v as f64).sum();
-            eprintln!("#  SB upload t={t} xs0={s0:.4}");
-        }
         self.ctx.begin_batch()?;
         let tw_rec = std::time::Instant::now();
         let mut recr_idx = 0usize;
         let mut full_idx = 0usize;
-        let vkd_stage = llm170_diag::flag::on("LLM170_VKD_STAGE");
-        let mut il_t = std::time::Instant::now();
         for il in 0..self.n_layer {
-            if vkd_stage {
-                // 직전 레이어 시간 출력(루프 끝을 몰라도 되는 형태) 후 리셋.
-                if il > 0 {
-                    eprintln!(
-                        "# vkd L{} {:.1}ms",
-                        il - 1,
-                        il_t.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                il_t = std::time::Instant::now();
-            }
             // ── attn_norm — 0층만 (이후 fdown addrms 융합). xq는 gemv_stage 지연 양자화.
             if il == 0 {
                 let (xs, xn) = (self.b_xs.clone(), self.b_xn.clone());
                 self.rms(xs.buf, "blk.0.attn_norm", xn.buf, n, t)?;
-            }
-            if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                self.ctx.end_batch_wait().ok();
-                self.ctx.begin_batch().ok();
-                let _x = vec![0f32; 64];
-                let s0: f64 =
-                    unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                        .iter()
-                        .map(|&v| v as f64)
-                        .sum();
-                eprintln!("#  SB post-rms xs0={s0:.4}");
             }
             if self.is_recr[il] {
                 // plans/30: gemm_i8/quant_b8 경로는 배치 상태를 오염(실측 —
@@ -807,70 +690,6 @@ impl DecoderState {
                         ),
                     ],
                 )?;
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                    self.ctx.end_batch_wait().ok();
-                    self.ctx.begin_batch().ok();
-                    let s0: f64 =
-                        unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                            .iter()
-                            .map(|&v| v as f64)
-                            .sum();
-                    let mut g = vec![0f32; 8];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.b_gqkv.ptr as *const f32,
-                            g.as_mut_ptr(),
-                            8,
-                        )
-                    };
-                    let gq: f64 =
-                        unsafe { std::slice::from_raw_parts(self.b_gqkv.ptr as *const f32, 128) }
-                            .iter()
-                            .map(|&v| v as f64)
-                            .sum();
-                    let d0 = format!("{:?}", g);
-                    let gz8: Vec<f32> =
-                        unsafe { std::slice::from_raw_parts(self.b_gz.ptr as *const f32, 8) }
-                            .to_vec();
-                    let gb8: Vec<f32> =
-                        unsafe { std::slice::from_raw_parts(self.b_gb.ptr as *const f32, 4) }
-                            .to_vec();
-                    eprintln!("#  stage2 gz={:?} gb={:?}", gz8, gb8);
-                    let mut b8v = [0i8; 16];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.b8.ptr as *const i8,
-                            b8v.as_mut_ptr(),
-                            16,
-                        )
-                    };
-                    let b8r1: Vec<i8> =
-                        unsafe { std::slice::from_raw_parts(self.b8.ptr as *const i8, 32) }[16..]
-                            .to_vec();
-                    let mut ydv = [0f32; 4];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.ydb.ptr as *const f32,
-                            ydv.as_mut_ptr(),
-                            4,
-                        )
-                    };
-                    let mut qsv = [0i32; 4];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.qsb.ptr as *const i32,
-                            qsv.as_mut_ptr(),
-                            4,
-                        )
-                    };
-                    eprintln!(
-                        "#  SB post-gemv4 xs0={s0:.4} gqkv0={gq:.4} first8={d0} b8={:?} b8tail={:?} yd={:?} qs={:?}",
-                        b8v.to_vec(),
-                        b8r1,
-                        ydv.to_vec(),
-                        qsv.to_vec()
-                    );
-                }
                 // conv — gy=t (이력은 qkv에서 판독, t>1은 링을 conv_state가 갱신)
                 {
                     let cw = self
@@ -909,16 +728,6 @@ impl DecoderState {
                             1,
                         )?;
                     }
-                }
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                    self.ctx.end_batch_wait().ok();
-                    self.ctx.begin_batch().ok();
-                    let s0: f64 =
-                        unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                            .iter()
-                            .map(|&v| v as f64)
-                            .sum();
-                    eprintln!("#  SB post-conv xs0={s0:.4}");
                 }
                 // plans/46: 프리필 융합 AR8 (split3+l2+beta_g 인라인) — 기본.
                 let ar8f_on = llm170_diag::flag::ne0("LLM170_VK_AR8F");
@@ -985,16 +794,6 @@ impl DecoderState {
                             1,
                         )?;
                     }
-                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                        self.ctx.end_batch_wait().ok();
-                        self.ctx.begin_batch().ok();
-                        let s0: f64 =
-                            unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                                .iter()
-                                .map(|&v| v as f64)
-                                .sum();
-                        eprintln!("#  SB post-split3 xs0={s0:.4}");
-                    }
                     // l2 — grid (2*ng, t)
                     {
                         let mut push = self.eps.to_le_bytes().to_vec();
@@ -1010,16 +809,6 @@ impl DecoderState {
                             t as u32,
                             1,
                         )?;
-                    }
-                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                        self.ctx.end_batch_wait().ok();
-                        self.ctx.begin_batch().ok();
-                        let s0: f64 =
-                            unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                                .iter()
-                                .map(|&v| v as f64)
-                                .sum();
-                        eprintln!("#  SB post-l2 xs0={s0:.4}");
                     }
                     // beta_g — n_h = dt_rank*t
                     {
@@ -1051,16 +840,6 @@ impl DecoderState {
                             1,
                             1,
                         )?;
-                    }
-                    if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                        self.ctx.end_batch_wait().ok();
-                        self.ctx.begin_batch().ok();
-                        let s0: f64 =
-                            unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                                .iter()
-                                .map(|&v| v as f64)
-                                .sum();
-                        eprintln!("#  SB post-betag xs0={s0:.4}");
                     }
                     // AR — PC.t 내부 순차
                     {
@@ -1101,16 +880,6 @@ impl DecoderState {
                         )?;
                     }
                 } // else (구 체인)
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                    self.ctx.end_batch_wait().ok();
-                    self.ctx.begin_batch().ok();
-                    let s0: f64 =
-                        unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                            .iter()
-                            .map(|&v| v as f64)
-                            .sum();
-                    eprintln!("#  SB post-ar xs0={s0:.4}");
-                }
                 // norm_gated — grid (dt_rank, t)
                 {
                     let sn = self
@@ -1131,16 +900,6 @@ impl DecoderState {
                         t as u32,
                         1,
                     )?;
-                }
-                if llm170_diag::flag::on("LLM170_VKD_TRACE") && il == 0 {
-                    self.ctx.end_batch_wait().ok();
-                    self.ctx.begin_batch().ok();
-                    let s0: f64 =
-                        unsafe { std::slice::from_raw_parts(self.b_xs.ptr as *const f32, 64) }
-                            .iter()
-                            .map(|&v| v as f64)
-                            .sum();
-                    eprintln!("#  SB post-normgated xs0={s0:.4}");
                 }
                 self.gemv_w(
                     self.b_ggated.buf,
@@ -1499,21 +1258,6 @@ impl DecoderState {
             for (k, (e, c)) in v.iter().take(14) {
                 eprintln!("[ktime] {:22} {:9.1}ms ({}회)", k, e, c);
             }
-        }
-        if llm170_diag::flag::on("LLM170_VKD_TRACE") {
-            let s = |b: &VkBuf, len: usize| -> f64 {
-                let mut x = vec![0f32; len];
-                unsafe { std::ptr::copy_nonoverlapping(b.ptr as *const f32, x.as_mut_ptr(), len) };
-                x.iter().map(|&q| q as f64).sum()
-            };
-            eprintln!(
-                "#  SB state seq={seq} conv0={:.6} gdn0={:.6} kvk3r0={:.6} kvv3r0={:.6} xsL={:.6}",
-                s(&self.st_conv[0][seq], 30720.min(self.conv_ch * 3)),
-                s(&self.st_gdn[0][seq], 4096),
-                s(&self.kv_k[0][seq], 1024),
-                s(&self.kv_v[0][seq], 1024),
-                s(&self.b_xs, 64)
-            );
         }
         // 마지막 행 head — b_xn 마지막 행이 이미 output_norm 융합 결과
         unsafe {
