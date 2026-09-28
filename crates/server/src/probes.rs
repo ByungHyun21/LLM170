@@ -235,18 +235,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
-        "vk-mmq-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/tmp/model_link.gguf".into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(512usize);
-            llm170_backend_gpu::rawvk::checks::vk_mmq_check(&path, &tn, t)
-        }
         "vk-gemv-check" => {
             let path = args
                 .first()
@@ -259,7 +247,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
             llm170_backend_gpu::rawvk::checks::gemv_check(&path, &tn, t)
         }
-        "vk-sdot-probe" => llm170_backend_gpu::rawvk::checks::sdot_probe(),
         "vk-idot-probe" => llm170_backend_gpu::rawvk::checks::idot_probe(),
         "vk-gemv8-check" => {
             let path = args
@@ -277,59 +264,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
             llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
-        "vk-dense-tile" => {
-            let tname = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "blk.0.hc_attn_up.weight".into());
-            let t = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(512usize);
-            llm170_backend_gpu::rawvk::checks::dense_tile_time(&tname, t)
-        }
-        "vk-moe-tile-check" => {
-            let mode = args.first().cloned().unwrap_or_else(|| "q8_0".into());
-            llm170_backend_gpu::rawvk::checks::moe_tile_type_check(&mode)
-        }
-        "vk-llama-mmq" => llm170_backend_gpu::rawvk::checks::llama_mmq_check(),
-        "vk-cm8-probe" => llm170_backend_gpu::rawvk::checks::cm8_probe(),
         "vk-gdn-chunk-check" => llm170_backend_gpu::rawvk::checks::gdn_chunk_check(),
-        "vk-moe-cm-race" => llm170_backend_gpu::rawvk::checks::moe_cm_race_check(),
         "vk-ple-mt-check" => {
             let reps = args.first().and_then(|v| v.parse().ok()).unwrap_or(64usize);
             llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
-        }
-        "mmv-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.1.attn_qkv.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1usize);
-            llm170_backend_gpu::rawvk::checks::mmv_check(&path, &tn, t)
-        }
-        "dbg-q3b" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_up.weight".into());
-            llm170_backend_gpu::rawvk::checks::q3b_dbg(&path, &tn)
-        }
-        "dbg-q3" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_up.weight".into());
-            llm170_backend_gpu::rawvk::checks::q3_dbg(&path, &tn)
         }
         "vk-frame-check" => {
             let path = args.first().cloned().unwrap_or_else(|| "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".into());
@@ -338,18 +276,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 .cloned()
                 .unwrap_or_else(|| "blk.0.ffn_down_shexp.weight".into());
             llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
-        }
-        "vk-tile-check" => {
-            let path = args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/home/yoon/models/qwen3.8-27b/q35work.gguf".into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_down.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(32);
-            llm170_backend_gpu::rawvk::checks::tile_check(&path, &tn, t)
         }
         "subsum-check" => llm170_backend_gpu::rawvk::subsum_check(),
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
