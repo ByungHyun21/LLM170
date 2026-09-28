@@ -271,7 +271,7 @@ impl Engine4 {
 
         let mut full_idx = 0usize;
         let mut recr_idx = 0usize;
-        let trace = std::env::var_os("LLM170_Q4_TRACE").is_some();
+        let trace = llm170_diag::dump::opts().key("q4_trace");
         // NaN 조기 국소화 — 발산 층·스테이지를 즉시 보고 (LLM170_Q4_TRACE).
         let nan_guard = |v: &[Vec<f32>], tag: &str, il: usize| {
             for (ti, row) in v.iter().enumerate() {
@@ -466,7 +466,7 @@ impl Engine4 {
                 if f.dirty[seq] {
                     f.sync_states(acc, seq, &self.seqs[seq], self.model.hp.d_state)?;
                 }
-                if std::env::var_os("LLM170_FRAME_TIME").is_some() {
+                if llm170_diag::dump::opts().key("frame_time") {
                     eprintln!("# pf-sync {:.1}ms", _sync_t0.elapsed().as_secs_f64() * 1e3);
                 }
                 let ctx = Ctx {
@@ -796,7 +796,7 @@ impl Engine4 {
                 tokens,
             )
         })();
-        if std::env::var_os("LLM170_NP_TIME").is_some() {
+        if llm170_diag::dump::opts().key("np_time") {
             eprintln!(
                 "[npstep4] t={} {:.1}ms",
                 seqs.len(),

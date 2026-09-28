@@ -263,7 +263,7 @@ impl DecodeState {
                     self.trace_rows(&format!("tr{il}_gconv"), self.gconv_t, conv_ch, t)?;
                 }
 
-                if il == self.trace_il() && std::env::var_os("LLM170_MS_DUMP").is_some() {
+                if il == self.trace_il() && llm170_diag::dump::opts().key("ms_dump") {
                     let ring_len = (self.conv_k - 1) * self.conv_ch;
                     let mut ring = vec![0f32; ring_len];
                     let _ = self.ctx.d2h(
@@ -459,7 +459,7 @@ impl DecodeState {
                         )?;
                     } else {
                         // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
-                        if il == self.trace_il() && std::env::var_os("LLM170_MS_DUMP").is_some() {
+                        if il == self.trace_il() && llm170_diag::dump::opts().key("ms_dump") {
                             let gl = self.dt_rank * self.d_state * self.d_state;
                             let mut st = vec![0f32; gl];
                             let _ = self.ctx.d2h(
@@ -485,7 +485,7 @@ impl DecodeState {
                     self.trace_rows(&format!("tr{il}_go"), self.go_t, v_len, t)?;
                 }
 
-                if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
+                if llm170_diag::dump::opts().key("rawhip_trace") && il == 0 {
                     self.ctx.sync()?;
                     let mut hq = vec![0f32; k_len * t];
                     self.ctx
@@ -1062,7 +1062,7 @@ impl DecodeState {
                 self.trace_rows(&format!("tr{il}_fglu"), self.fglu_t, self.n_ff, t)?;
             }
             gmark("ffn_silu", &mut marks);
-            if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
+            if llm170_diag::dump::opts().key("rawhip_trace") && il == 0 {
                 self.ctx.sync()?;
                 let mut hf = vec![0f32; self.n_ff * t];
                 self.ctx
@@ -1107,7 +1107,7 @@ impl DecodeState {
                 self.trace_rows("tr3_xs2", self.xs_t, self.n_embd, t)?;
             }
             gmark("ffn", &mut marks);
-            if env_on("LLM170_RAWHIP_TRACE") {
+            if llm170_diag::dump::opts().key("rawhip_trace") {
                 self.ctx.sync()?;
                 let mut hv = vec![0f32; n * t];
                 self.ctx

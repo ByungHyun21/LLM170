@@ -16,7 +16,7 @@ thread_local! {
 /// 에서만 측정한다 — 프레임 op는 비동기라 호출 시간만으로는 GPU 시간이 안 나온다.
 pub(super) fn ftime_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| llm170_diag::flag::on("LLM170_FRAME_TIME"))
+    *ON.get_or_init(|| llm170_diag::dump::opts().key("frame_time"))
 }
 
 /// 진단용 스테이지 스킵(LLM170_STAGE_SKIP="qsa,gdn,moe") — 비용 분해 전용.

@@ -2214,7 +2214,7 @@ impl RawCtx {
                         "requant_q6k_canonical",
                     )?;
                 }
-                if env_on("LLM170_RQ_DUMP") {
+                if llm170_diag::dump::opts().key("rq_dump") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
                         std::slice::from_raw_parts(p2 as *const u8, 420)
@@ -2537,7 +2537,7 @@ impl RawCtx {
                         "requant_q6k_canonical",
                     )?;
                 }
-                if env_on("LLM170_RQ_DUMP") {
+                if llm170_diag::dump::opts().key("rq_dump") {
                     self.sync().ok();
                     let _ = std::fs::write("/tmp/rq_out.bin", unsafe {
                         std::slice::from_raw_parts(p2 as *const u8, 420)

@@ -123,7 +123,7 @@ impl Engine {
                     );
                 let n_chunks = cache.len().div_ceil(ch_sz).max(1);
                 // plans/92 P2: 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
-                let pfck = std::env::var_os("LLM170_PFCK").is_some();
+                let pfck = llm170_diag::dump::opts().key("pfck");
                 for (ci, ch) in cache.chunks(ch_sz).enumerate() {
                     let pf_t0 = std::time::Instant::now();
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();

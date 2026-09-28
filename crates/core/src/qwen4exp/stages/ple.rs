@@ -269,7 +269,7 @@ fn ple_stage_hash(tag: &str, rows: &[Vec<f32>]) {
 }
 /// PLE n-gram 해시 — 호스트 u64 (ctx[s]=직전 s토큰, EOS 절단).
 pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
-    if std::env::var_os("LLM170_PLE_DUMP").is_some() {
+    if llm170_diag::dump::opts().key("ple_dump") {
         eprintln!(
             "[plehash] pos={} next_pos={} hist={:?} hist_valid={}",
             seq.pos,
@@ -332,7 +332,7 @@ pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
             hist.drain(..cut);
         }
     }
-    if std::env::var_os("LLM170_PLE_DUMP").is_some() {
+    if llm170_diag::dump::opts().key("ple_dump") {
         eprintln!("[plerows] {:?}", &rows[..rows.len().min(3 * heads)]);
         if rows.len() > 16 * heads {
             let w: Vec<u32> = rows[16 * heads..16 * heads + 3 * heads].to_vec();

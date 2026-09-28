@@ -109,7 +109,7 @@ impl DecodeState {
         let cat_h = unsafe { self.mtp_cat.add(n * 4) };
         self.rms(h_gpu, hn, cat_h, n)?;
         // eh_proj [2n → n]
-        if env_on("LLM170_MTP_STAGE") {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; 2 * n];
             self.ctx
@@ -190,7 +190,7 @@ impl DecodeState {
             std::fs::write(format!("{pref}.xq.u32"), bytemuck::cast_slice(&xv))
                 .map_err(|e| e.to_string())?;
         }
-        if env_on("LLM170_MTP_STAGE") {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx
@@ -305,7 +305,7 @@ impl DecodeState {
         self.quant(self.mtp_ao, self.mtp_xq, n_ao)?;
         let (wo, two, nio, noo) = self.w("blk.64.attn_output.weight")?;
         self.mm_direct(self.mtp_xq, wo, two, nio, noo, self.gout)?;
-        if env_on("LLM170_MTP_STAGE") {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx
@@ -345,7 +345,7 @@ impl DecodeState {
         let (wd, td, nid, nod) = self.w("blk.64.ffn_down.weight")?;
         self.mm_into(self.xq_f, wd, td, nid, nod, self.fdown)?;
         self.axpy(self.mtp_cur, self.fdown, n)?;
-        if env_on("LLM170_MTP_STAGE") {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; n];
             self.ctx
@@ -850,7 +850,7 @@ impl DecodeState {
         self.quant(x, self.mtp_xq, n)?;
         let (wo, to, nio, noo) = self.w("output.weight")?;
         self.mm_into(self.mtp_xq, wo, to, nio, noo, self.logits)?;
-        if env_on("LLM170_MTP_STAGE") {
+        if llm170_diag::dump::opts().key("mtp_stage") {
             self.ctx.sync()?;
             let mut v = vec![0f32; 8];
             self.ctx

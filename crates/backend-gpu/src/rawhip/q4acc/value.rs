@@ -598,7 +598,7 @@ impl Q4Acc {
     ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
-        let tt = env_on("LLM170_Q4ACC_TIME");
+        let tt = llm170_diag::dump::opts().key("q4acc_time");
 
         let t_up = std::time::Instant::now();
         let (w_dev, w_f32) = self.dev_weight(w)?;

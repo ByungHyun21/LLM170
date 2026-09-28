@@ -548,7 +548,7 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
     // q8_0 down(q8mmq 경로 — env LLM170_VK_Q8MMQ=1일 때 fn_tile_q8mmq) 검증.
     let mut mx3 = 0f64;
     let mut bad3 = 0usize;
-    if std::env::var_os("LLM170_Q8_DBG").is_some() {
+    if llm170_diag::dump::opts().key("q8_dbg") {
         for j in 0..4usize {
             let mut rr = vec![0f32; n2];
             llm170_core::quant::dequant_row(wd.ty, wd.data, j as u64, n2 as u64, &mut rr);
@@ -870,7 +870,7 @@ pub fn moe_cm_race_check() -> Result<String, String> {
             bad_layers += 1;
         }
         worst = worst.max(lmx);
-        if std::env::var_os("LLM170_RACE_DBG").is_some() {
+        if llm170_diag::dump::opts().key("race_dbg") {
             eprintln!("[race] L{l} max|D|={lmx:.3e}");
         }
     }
@@ -1677,9 +1677,9 @@ pub fn tile_check(path: &str, tname: &str, t: usize) -> Result<String, String> {
         }
     }
     eprintln!("[bucket] 2%초과 행(64행 버킷): {:?}", bucket_bad);
-    if std::env::var_os("LLM170_TILE_DUMP").is_some() {
+    if llm170_diag::dump::opts().key("tile_dump") {
         eprintln!("[dump] outs[0][0..4] = {:?}", &outs[0..4]);
-        if std::env::var_os("LLM170_TILE_DUMP").is_some() && t >= 1 {
+        if llm170_diag::dump::opts().key("tile_dump") && t >= 1 {
             let mut zr = None;
             for (i, v) in outs[0..n_out].iter().enumerate() {
                 if v.abs() < 1e-30 {

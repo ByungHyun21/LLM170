@@ -187,7 +187,7 @@ impl VkAcc {
                 t as u32,
                 1,
             )?;
-            if std::env::var_os("LLM170_Q_TRACE").is_some() {
+            if llm170_diag::dump::opts().key("q_trace") {
                 eprintln!("[q:dispf] n0={n0} t={t}");
             }
         }
@@ -229,7 +229,7 @@ impl VkAcc {
                 t as u32,
                 1,
             )?;
-            if std::env::var_os("LLM170_Q_TRACE").is_some() {
+            if llm170_diag::dump::opts().key("q_trace") {
                 eprintln!("[q:dispff] n_ff={n_ff} t={t}");
             }
         }
