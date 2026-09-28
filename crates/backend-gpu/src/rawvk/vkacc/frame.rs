@@ -202,7 +202,6 @@ impl llm170_core::matmul::FrameState for VkAcc {
 
     /// plans/105(원장 80) — mxsel 팩 정량(생산 시점 1회).
     fn frame_quant_pack(&self, x: u64, rows: usize, n_in: usize) -> Result<(), String> {
-        use llm170_core::matmul::FrameHost;
         if rows == 0 || n_in == 0 {
             return Ok(());
         }

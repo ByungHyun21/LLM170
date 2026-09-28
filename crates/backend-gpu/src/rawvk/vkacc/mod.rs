@@ -153,6 +153,8 @@ pub(crate) fn q8_0_relayout(data: &[u8], n_in: usize, n_out: usize) -> Vec<u8> {
 /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일(A·B 동일 레이아웃 직접 내적).
 const FN_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_tile_q8mmq.spv");
 /// plans/95 P1b — 스키니 f32 비트 동일 고속판(직렬 순서 보존 직접 스트리밍).
+/// plans/95 P1b 부정 전례 보관(원장 41) — 옵트인 FT32E=1 전용.
+#[allow(dead_code)]
 const FN_TILE_F32E_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32e.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
