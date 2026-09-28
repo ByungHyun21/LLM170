@@ -2813,3 +2813,14 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   개선(8846511). ③ 슬롯 루프 env 캐시화(6f4be48).
 - 검증: 2슬롯 serve E2E·max_tokens=5→5/n_predict=3→3·charhash·
   게이트 2종 PASS.
+
+### (94) W4 1차 — 일회 체커 12종 삭제 −1,920줄 (plans/107, 2026-09-28)
+
+- vk_mmq_check·mmv_check·q3(b)_dbg·dense_tile_time·moe_tile_type_check·
+  tile_check·llama_mmq_check·cm8_probe·moe_cm_race_check·sdot_probe+
+  고아 헬퍼 — 원장 30-86 종결 실험. **llama_mmq_check 소멸으로
+  patch_sdot.py 체인의 마지막 소비자 사망**(스크립트 파일은 W3 소관).
+- checks.rs 4964→3121줄. 유지: frame·gemv·gemv8·ft32·gdn_chunk·
+  ple_mt·fault·idot 프로브 전무상.
+- 검증: 워크스페이스 경고 0·charhash PASS·게이트 2종 PASS·
+  vk-frame-check PASS 유지.
