@@ -60,13 +60,18 @@ impl DecoderState {
                     .unwrap_or(2048)
             {
                 self.split_ctr = 0;
-                if llm170_diag::flag::on("LLM170_DBG_REC") {
-                    let td = std::time::Instant::now();
-                    self.ctx.end_batch_wait()?;
-                    self.dbg_drain_ms += td.elapsed().as_secs_f64() * 1e3;
-                } else {
-                    self.ctx.end_batch_wait()?;
-                }
+                self.ctx.end_batch_wait()?;
+                self.ctx.begin_batch()?;
+            }
+            // 107 RACE-DIAG(원장 90): 단일 경계 분할 프로브 — 디스패치
+            // #k 에서만 제출·대기. 경합쌍 이분 탐색용(LLM170_VK_SPLIT_AT).
+            if let Some(k) = llm170_diag::flag::val("LLM170_VK_SPLIT_AT")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&k| k > 0)
+                && self.split_ctr == k
+            {
+                self.split_ctr = 0;
+                self.ctx.end_batch_wait()?;
                 self.ctx.begin_batch()?;
             }
         }
