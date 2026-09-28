@@ -863,16 +863,6 @@ impl DecodeState {
                             256,
                             &mut margs,
                         )?;
-                        if let Some(path) = std::env::var_os("LLM170_ATTN_DUMP")
-                            && full_idx == 0
-                        {
-                            self.ctx.sync().ok();
-                            let mut v = vec![0f32; t * n_head * hd];
-                            self.ctx
-                                .d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.aout_t)?;
-                            std::fs::write(&path, bytemuck::cast_slice(&v)).ok();
-                            eprintln!("# attn-dump L0 t={t} n_head={n_head} hd={hd}");
-                        }
                     } else {
                         let mut args = vec![
                             Self::p(&mut qp),
@@ -1074,13 +1064,6 @@ impl DecodeState {
                 self.trace_rows(&format!("tr{il}_fglu"), self.fglu_t, self.n_ff, t)?;
             }
             gmark("ffn_silu", &mut marks);
-            if env_on("LLM170_DUMP_XQN") && il == 0 {
-                self.ctx.sync()?;
-                let mut bytes = vec![0u8; xq_sn * 4 * t];
-                self.ctx.d2h(bytes.as_mut_slice(), self.xq_n_t)?;
-                let _ = std::fs::write(std::env::var_os("LLM170_DUMP_XQN").unwrap(), &bytes);
-                eprintln!("#  xq_n_t dumped: {} words", xq_sn * t);
-            }
             if env_on("LLM170_RAWHIP_TRACE") && il == 0 {
                 self.ctx.sync()?;
                 let mut hf = vec![0f32; self.n_ff * t];

@@ -28,46 +28,15 @@ impl DecodeState {
             return Err(format!("verify_batch t={t} > 64 (logits_all 상한)"));
         }
         let n = self.n_embd;
-        let t_b0 = std::time::Instant::now();
         self.step_batch(seq, pos0, emb)?;
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!(
-                "[vb] trunk t={t}: {:.1}ms",
-                t_b0.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        if env_on("LLM170_SPEC_DBG") {
-            eprintln!("[vb] step_batch ok");
-        }
         // head: 전 행 rms → quant → output 타일 → 행별 argmax
-        let t_r0 = std::time::Instant::now();
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
         self.ctx.mmq_y_bump(); // 부록81: xn_t 재기 → quant_y 캐시 무효화
         let xq_sn = crate::rawhip::q4acc::xq_words(n);
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!(
-                "[vb] head prep: {:.1}ms",
-                t_r0.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        if env_on("LLM170_SPEC_DBG") {
-            eprintln!("[vb] head tile t={t} ty={th} no={noh}");
-        }
-        if env_on("LLM170_SPEC_TIMING") {
-            let t_s0 = std::time::Instant::now();
-            self.ctx.sync()?;
-            eprintln!(
-                "[vb] trunk drain: {:.1}ms",
-                t_s0.elapsed().as_secs_f64() * 1e3
-            );
-        } else {
-            self.ctx.sync()?;
-        }
         // plans/73: t≤8 은 mm_b 라우팅(g4 = 무게 1회 독서) — 직접 tile 호출은
-        let t_h0 = std::time::Instant::now();
         if t <= 8 && matches!(th, 8 | 12 | 13 | 14 | 23) {
             self.mm_b(self.xq_n_t, xq_sn, wh, th, nih, noh, self.logits_all, t)?;
         } else {
@@ -83,17 +52,7 @@ impl DecodeState {
                 self.logits_all,
             )?;
         }
-        if env_on("LLM170_SPEC_TIMING") {
-            self.ctx.sync()?;
-            eprintln!(
-                "[vb] head mm t={t}: {:.1}ms",
-                t_h0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         self.ctx.sync()?;
-        if env_on("LLM170_SPEC_DBG") {
-            eprintln!("[vb] head ok");
-        }
         self.ctx.sync()?;
         let _t_a0 = std::time::Instant::now();
         argmaxes.clear();
@@ -119,9 +78,6 @@ impl DecodeState {
         } else {
             argmaxes.extend(self.argmax_rows(self.logits_all, t, noh)?);
         }
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!("[vb] argmax={:.1}ms", _t_a0.elapsed().as_secs_f64() * 1e3);
-        }
 
         Ok(())
     }
@@ -146,7 +102,6 @@ impl DecodeState {
         assert_eq!(tok_emb.len(), n);
         // 입력 업로드 (h는 GPU 버퍼 직접)
         self.ctx.h2d(self.mtp_e, bytemuck::cast_slice(tok_emb))?;
-        let t0s = std::time::Instant::now();
         // enorm → cat[0..n], hnorm → cat[n..2n]
         let en = *self.consts.get("blk.64.nextn.enorm").ok_or("enorm")?;
         let hn = *self.consts.get("blk.64.nextn.hnorm").ok_or("hnorm")?;
@@ -402,12 +357,6 @@ impl DecodeState {
             );
         }
         if !with_head {
-            if env_on("LLM170_SPEC_TIMING") {
-                eprintln!(
-                    "[mt] step(nohead)={:.2}ms",
-                    t0s.elapsed().as_secs_f64() * 1e3
-                );
-            }
             return Ok(None);
         }
         // shared head norm → output head → argmax
@@ -418,9 +367,6 @@ impl DecodeState {
         self.rms(self.mtp_cur, shn, self.mtp_e, n)?;
         let _t0h = std::time::Instant::now();
         let am = self.head_argmax_gpu(self.mtp_e)?;
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!("[mt] head={:.2}ms", t0s.elapsed().as_secs_f64() * 1e3);
-        }
         Ok(Some(am))
     }
 

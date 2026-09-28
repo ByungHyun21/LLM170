@@ -34,12 +34,6 @@ pub(crate) fn gdn_layer(
     let ssm_norm_w = ctx.model.f32_vec(&format!("blk.{il}.ssm_norm.weight"))?;
     let wout = ctx.model.wchk(&format!("blk.{il}.ssm_out.weight"))?;
 
-    let dbg0 = il
-        == std::env::var("LLM170_DEBUG_LAYER")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
-        && std::env::var_os("LLM170_DEBUG_LAYERS").is_some();
     // qkv·z·beta·alpha는 전부 동일 입력 xs — 1그룹 배치 (GPU: 업로드 1회+동기 1회)
     let mut group: [Vec<Vec<f32>>; 4] = [
         vec![vec![0.0f32; conv_ch]; n_tok],
@@ -54,21 +48,6 @@ pub(crate) fn gdn_layer(
     }
     let [qkv, z, b, a] = group;
 
-    if dbg0 {
-        let mz = z
-            .iter()
-            .flat_map(|r| r.iter())
-            .fold(0.0f32, |a, v| a.max(v.abs()));
-        let mq = qkv
-            .iter()
-            .flat_map(|r| r.iter())
-            .fold(0.0f32, |a, v| a.max(v.abs()));
-        let mc = xs
-            .iter()
-            .flat_map(|r| r.iter())
-            .fold(0.0f32, |a, v| a.max(v.abs()));
-        eprintln!("  rs stage cur max={mc:.5} qkv max={mq:.5} z max={mz:.5}");
-    }
     let mut beta_all = vec![0.0f32; n_tok * dt_rank];
     let mut g_all = vec![0.0f32; n_tok * dt_rank];
     {
@@ -261,15 +240,6 @@ pub(crate) fn gdn_layer(
         }
     }
 
-    if dbg0 {
-        let _mq = q_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let _mk = k_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let _mv = v_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let _mo = o_all.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let c4: Vec<String> = o_all[..4].iter().map(|v| format!("{v:.6}")).collect();
-        let z4: Vec<String> = z[0][..4].iter().map(|v| format!("{v:.6}")).collect();
-        eprintln!("  rs stage core[:4]={c4:?} z[:4]={z4:?}");
-    }
     // norm_gated: rms_norm(core)·silu(z) per head → ssm_out (GPU 경로가 이미 채움)
     if !gpu_done {
         profile_span!("cpu::gdn_normgated");
@@ -286,62 +256,11 @@ pub(crate) fn gdn_layer(
             &mut gated,
         );
     }
-    if dbg0 {
-        let mg = gated
-            .iter()
-            .flat_map(|r| r.iter())
-            .fold(0.0f32, |a, v| a.max(v.abs()));
-        let fmt = |o: usize| -> String {
-            gated[0][o..o + 4]
-                .iter()
-                .map(|v| format!("{v:.6}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        eprintln!(
-            "  rs gated h0={} h1={} h2={} h3={} (max={mg:.5})",
-            fmt(0),
-            fmt(16),
-            fmt(32),
-            fmt(48)
-        );
-    }
     let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
     {
         span_block!("cpu::gdn_out", {
             mm_batch(&acc, &gated, &wout, &mut out)?;
         });
-    }
-    if std::env::var_os("LLM170_CPU_TRACE").is_some() {
-        let last = out.len() - 1;
-        let sum: f64 = out[last].iter().map(|&v| v as f64).sum();
-        eprintln!("  CGDN il={il} out_sum={sum:.6} row={last}");
-    }
-    if dbg0 {
-        let m = out
-            .iter()
-            .flat_map(|r| r.iter())
-            .fold(0.0f32, |a, v| a.max(v.abs()));
-        let (mut mi, mut mv) = (0usize, f32::NEG_INFINITY);
-        for (r, row) in out.iter().enumerate() {
-            for v in row.iter() {
-                if v.abs() > mv {
-                    mv = v.abs();
-                    mi = r;
-                }
-            }
-        }
-        eprintln!(
-            "  rs stage ssm_out max={m:.5} @row{mi} out[:4]={:?} out[{mi}][:3]={:?}",
-            out[0][..4]
-                .iter()
-                .map(|v| format!("{v:.6}"))
-                .collect::<Vec<_>>(),
-            out[mi][..3]
-                .iter()
-                .map(|v| format!("{v:.6}"))
-                .collect::<Vec<_>>()
-        );
     }
     Ok(out)
 }

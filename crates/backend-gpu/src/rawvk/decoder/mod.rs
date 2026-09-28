@@ -170,7 +170,6 @@ pub struct DecoderState {
     v_len: usize,
     eps: f32,
     kq_scale: f32,
-    max_ssbo: usize,
     #[allow(clippy::type_complexity)]
     ktimes: std::collections::HashMap<String, (f64, u64)>,
     ktime: bool,
@@ -340,15 +339,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         }
         let mut last = None;
         for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
-            let tw = std::time::Instant::now();
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);
-            if llm170_diag::flag::on("LLM170_DBG_WALL") {
-                eprintln!(
-                    "#  batch t={} wall={:.1}ms",
-                    ch.len() / n,
-                    tw.elapsed().as_secs_f64() * 1e3
-                );
-            }
         }
         Ok(last.unwrap_or_default())
     }

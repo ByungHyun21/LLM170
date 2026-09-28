@@ -163,12 +163,6 @@ impl RawCtx {
             if hip::hiprtcGetCode(prog, code.as_mut_ptr()) != hip::hiprtcResult_HIPRTC_SUCCESS {
                 return Err("GetCode".into());
             }
-            if let Some(path) = std::env::var_os("LLM170_DUMP_MODULE") {
-                let _ = std::fs::write(
-                    &path,
-                    std::slice::from_raw_parts(code.as_ptr() as *const u8, code_sz),
-                );
-            }
             let mut module: hip::hipModule_t = std::ptr::null_mut();
             ck(
                 hip::hipModuleLoadData(&mut module, code.as_ptr() as *const _),
@@ -489,13 +483,6 @@ impl RawCtx {
             // 크기만으로도 부족했다(2026-09-14). 백트레이스는 강제로 잡는다
             // (RUST_BACKTRACE 미설정이어도 동작).
             let tag = format!("h2d {}B dst={dst:p}", src.len());
-            if env_on("LLM170_H2D_TRACE") {
-                eprintln!(
-                    "# h2d {}B dst={dst:p} q0={:?}",
-                    src.len(),
-                    &src[..src.len().min(2)]
-                );
-            }
             // LLM170_MEMDBG: 복사 **직전** 여유 메모리(사후 조회는 sticky 오류로 0/0).
             if env_on("LLM170_MEMDBG") && src.len() >= (1 << 20) {
                 let (mut fb, mut tb) = (0usize, 0usize);
@@ -1363,9 +1350,6 @@ impl RawCtx {
         args.push(&mut no as *mut _ as *mut std::ffi::c_void);
         args.push(&mut xw as *mut _ as *mut std::ffi::c_void);
         args.push(&mut tt as *mut _ as *mut std::ffi::c_void);
-        if w2 && env_on("LLM170_G4_TRACE") {
-            eprintln!("[g4w2] n_in={n_in} n_out={n_out} t={t} gy={gy} gz={gz}");
-        }
         let blk: u32 = if w2 || w2q4 { 32 } else { 64 };
         self.launch3(kern, 1, gy, gz, blk, &mut args)
     }
@@ -1951,32 +1935,6 @@ impl RawCtx {
                     "gemm_f16_v4",
                 )?;
             }
-            if env_on("LLM170_DEQ_DUMP") {
-                self.sync().ok();
-                let _ = std::fs::write(
-                    "/tmp/deq_wf16.f16",
-                    std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2),
-                );
-                #[allow(clippy::unnecessary_cast)]
-                // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                let _ = std::fs::write(
-                    "/tmp/deq_w.bin",
-                    std::slice::from_raw_parts(
-                        w as *const u8,
-                        n_out.min(1) * (n_in / 256) * 210 + 210,
-                    ),
-                );
-                let _ = std::fs::write(
-                    "/tmp/deq_xq.bin",
-                    std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4),
-                );
-                eprintln!(
-                    "DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})",
-                    n_out * n_in * 2,
-                    xq_w * t * 4
-                );
-                std::process::exit(0);
-            }
         }
         Ok(())
     }
@@ -2146,32 +2104,6 @@ impl RawCtx {
                     ),
                     "gemm_f16_v4",
                 )?;
-            }
-            if env_on("LLM170_DEQ_DUMP") {
-                self.sync().ok();
-                let _ = std::fs::write(
-                    "/tmp/deq_wf16.f16",
-                    std::slice::from_raw_parts(wf16 as *const u8, n_out * n_in * 2),
-                );
-                #[allow(clippy::unnecessary_cast)]
-                // 캐스트 유지: 직접 전달이 deny(not_unsafe_ptr_arg_deref)를 유발
-                let _ = std::fs::write(
-                    "/tmp/deq_w.bin",
-                    std::slice::from_raw_parts(
-                        w as *const u8,
-                        n_out.min(1) * (n_in / 256) * 210 + 210,
-                    ),
-                );
-                let _ = std::fs::write(
-                    "/tmp/deq_xq.bin",
-                    std::slice::from_raw_parts(xq_p as *const u8, xq_w * t * 4),
-                );
-                eprintln!(
-                    "DEQ_DUMP: wf16 {}B xq {}B (ni={n_in} no={n_out} t={t} xw={xq_w})",
-                    n_out * n_in * 2,
-                    xq_w * t * 4
-                );
-                std::process::exit(0);
             }
         }
         Ok(())

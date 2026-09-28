@@ -286,12 +286,6 @@ impl Engine {
                 greedy(&lgt)
             };
             accepted.push(t);
-            if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-                eprintln!(
-                    "  verify j={j} target={t} draft={d} {}",
-                    if t == d { "OK" } else { "MISS" }
-                );
-            }
             if t != d || t == eos {
                 break;
             }
@@ -526,11 +520,6 @@ impl Engine {
                 t_verify += t_v0.elapsed();
             }
         }
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-            eprintln!("  [msV] groups={group_starts:?}");
-            eprintln!("  [msV] am={am:?}");
-            eprintln!("  [msV] drafts={all_drafts:?}");
-        }
         if std::env::var_os("LLM170_MS_AB").is_some() {
             // A/B: 스냅샷으로 상태 복원 후 각 그룹을 단일-verify로 재계산·비교
             // (all_full이면 재검증이 상태를 동일하게 재진행 — 본류 불변.
@@ -730,13 +719,11 @@ impl Engine {
         k: usize,
     ) -> Result<(Vec<u32>, usize), ModelError> {
         let eos = 248044u32;
-        let sp_t0 = std::time::Instant::now();
         let rd = self
             .raw_decode
             .clone()
             .ok_or(ModelError::Accel("raw 없음".into()))?;
         let base_pos = self.seqs[seq].pos; // 슬롯 0..base_pos-1 처리됨
-        let t_draft0 = std::time::Instant::now();
         // ── draft: step-0 = (last_token, pending_h) 시프트 페어링; j≥1 = 체인 자가 h
         let mut drafts: Vec<u32> = Vec::with_capacity(k);
         let n_e = self.model.hp.n_embd;
@@ -750,33 +737,20 @@ impl Engine {
             let mut trow = vec![0.0f32; n_e];
             crate::quant::dequant_row(embd_ty, embd_data, last_token as u64, n_e as u64, &mut trow);
             let pending = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
-            let t_d0 = std::time::Instant::now();
             let (d0, _) = rd
                 .mtp_step_gpu(seq, &trow, &pending, base_pos as usize)
                 .map_err(ModelError::Accel)?;
-            if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-                eprintln!("[d0] draft0={:.1}ms", t_d0.elapsed().as_secs_f64() * 1e3);
-            }
             // pending은 다시 저장 (verify 후 마지막 행 hidden으로 갱신)
             self.seqs[seq].mtp_pending_h = pending;
             drafts.push(d0);
             let mut tok = d0;
-            for j in 1..k {
+            for _j in 1..k {
                 let dpos = (base_pos + drafts.len() as u32 - 1) as usize;
-                let tc = std::time::Instant::now();
                 let mut trow = vec![0.0f32; n_e];
                 crate::quant::dequant_row(embd_ty, embd_data, tok as u64, n_e as u64, &mut trow);
-                let td = std::time::Instant::now();
                 let d = rd
                     .mtp_step_chain(seq, &trow, dpos)
                     .map_err(ModelError::Accel)?;
-                if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-                    eprintln!(
-                        "[ch] j={j} deq={:.2}ms step={:.2}ms",
-                        td.duration_since(tc).as_secs_f64() * 1e3,
-                        td.elapsed().as_secs_f64() * 1e3
-                    );
-                }
                 drafts.push(d);
                 tok = d;
                 if d == eos {
@@ -784,14 +758,6 @@ impl Engine {
                 }
             }
         }
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!(
-                "[sp] draft chain={:.1}ms k={}",
-                t_draft0.elapsed().as_secs_f64() * 1e3,
-                drafts.len()
-            );
-        }
-        let t_v0 = std::time::Instant::now();
         // ── verify: [carried..., last_token, d0, d1, ...] 1배치 — 행별 argmax = 다음 토큰 정답
         // carried = 직전 부분수용에서 GDN이 미확정인 행 — 같은 토큰·같은 위치 재실행
         // (결정론적 커널 → 동일 결과, KV는 동일값 재기입). 재실행 배치를 대체한다.
@@ -863,26 +829,11 @@ impl Engine {
             row_toks.push(tk);
         }
         // 부분수용 대비 GDN/conv 스냅샷 (KV는 위치 색인이라 자가치유)
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!(
-                "[vv] rows+dequant={:.1}ms",
-                t_v0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         rd.gdn_snapshot().map_err(ModelError::Accel)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!("[vv] snapshot={:.1}ms", t_v0.elapsed().as_secs_f64() * 1e3);
-        }
         let mut am: Vec<u32> = Vec::new();
         let mut h_all: Vec<f32> = Vec::new();
         rd.raw_verify(seq, pos0 as usize, &rows, &mut am, &mut h_all)
             .map_err(ModelError::Accel)?;
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!(
-                "[vv] raw_verify={:.1}ms",
-                t_v0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         // 수용 (신규 세그먼트만): am[carried_n + j] vs drafts[j]
         let mut accepted: Vec<u32> = Vec::new();
         for j in 0..drafts.len() {
@@ -891,18 +842,6 @@ impl Engine {
             if am[i] != drafts[j] || am[i] == eos {
                 break;
             }
-        }
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-            eprintln!(
-                "  gpu-verify pos={base_pos} carried={carried_n} drafts={drafts:?} am={am:?} acc_n={}",
-                if accepted.len() == drafts.len()
-                    && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a)
-                {
-                    accepted.len() + 1
-                } else {
-                    accepted.len().max(1)
-                }
-            );
         }
         let all_acc = accepted.len() == drafts.len()
             && drafts.iter().zip(accepted.iter()).all(|(d, a)| d == a);
@@ -920,13 +859,6 @@ impl Engine {
             rd.gdn_restore().map_err(ModelError::Accel)?;
             self.seqs[seq].gdn_carried = row_toks[..carried_n + kept_new].to_vec();
         }
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!(
-                "[sp] verify+decide={:.1}ms",
-                t_v0.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t_adv0 = std::time::Instant::now();
         // ── MTP 상태 진행 (시프트 페어링): 행 0은 draft step-0이 이미 처리.
         // carried 구간은 직전 스텝이 이미 적립(멱등) — 신규 행부터만.
         {
@@ -941,14 +873,6 @@ impl Engine {
         }
         // 시퀀스 pos 동기 — 유지 신규 행 수만 반영
         self.seqs[seq].pos = base_pos + (kept_new as u32);
-        if std::env::var_os("LLM170_SPEC_TIMING").is_some() {
-            eprintln!(
-                "[sp] advance={:.1}ms | step total={:.1}ms acc={}",
-                t_adv0.elapsed().as_secs_f64() * 1e3,
-                sp_t0.elapsed().as_secs_f64() * 1e3,
-                accepted.len()
-            );
-        }
         let n = accepted.len().max(1);
         Ok((accepted, n))
     }

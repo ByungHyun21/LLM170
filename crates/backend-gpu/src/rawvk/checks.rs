@@ -758,116 +758,6 @@ pub fn moe_tile_type_check(mode: &str) -> Result<String, String> {
             checked += 1;
         }
     }
-    if std::env::var_os("LLM170_MTC_DBG").is_some() {
-        let gi = |i: usize| got[i] as i32;
-        if std::env::var_os("LLM170_VK_Q4CM8B").is_some() {
-            eprintln!(
-                "[cm8b-insitu] 그룹별 bad = [{}, {}, {}, {}]",
-                got[100], got[101], got[102], got[103]
-            );
-        }
-        if got.len() > 216 {
-            eprintln!(
-                "[insitu-AB] 200..216 = {:?}",
-                (200..216).map(gi).collect::<Vec<_>>()
-            );
-        }
-        eprintln!(
-            "[insitu] bad(마지막)={} sb0_bad={} 첫불일치sb={} sg={}/{} A0={:?}",
-            got[100],
-            got[98],
-            got[99],
-            got[101],
-            got[102],
-            (104..120).map(gi).collect::<Vec<_>>()
-        );
-        eprintln!("[insitu] A1={:?}", (120..136).map(gi).collect::<Vec<_>>());
-        eprintln!("[insitu] B0={:?}", (136..152).map(gi).collect::<Vec<_>>());
-        eprintln!("[insitu] B1={:?}", (152..168).map(gi).collect::<Vec<_>>());
-        if got.len() > 200 {
-            eprintln!(
-                "[insitu] B(r,0)열={:?}",
-                (184..200).map(gi).collect::<Vec<_>>()
-            );
-        }
-        if got.len() > 251 {
-            eprintln!(
-                "[insitu] 마커250={} scw168={:?}",
-                got[250],
-                (168..184).map(gi).collect::<Vec<_>>()
-            );
-        }
-        eprintln!("[insitu] scw={:?}", (168..184).map(gi).collect::<Vec<_>>());
-        let scalar: i32 = (0..16)
-            .map(|k| gi(104 + k) * gi(136 + k) + gi(120 + k) * gi(152 + k))
-            .sum();
-        eprintln!("[insitu] C[0][0] 스칼라={} coopmat={}", scalar, gi(168));
-        for rr in 0..sel.len().min(12) {
-            let ee = sel[rr];
-            let mut s2 = 0f64;
-            let mut rr_row = vec![0f32; n_in_d];
-            llm170_core::quant::dequant_row(
-                wd.ty,
-                wd.data,
-                (ee * n_out_d) as u64,
-                n_in_d as u64,
-                &mut rr_row,
-            );
-            for (a, b) in rr_row.iter().zip(xs[rr].iter()) {
-                s2 += *a as f64 * *b as f64;
-            }
-            eprintln!(
-                "[mtc] row={rr} e={ee} got={:.5} ref={:.5}",
-                got[rr * n_out_d],
-                s2
-            );
-        }
-    }
-    if std::env::var_os("LLM170_MTC_DBG2").is_some() {
-        for (r2, &e2) in sel.iter().enumerate() {
-            for j2 in 0..n_out_d.min(6) {
-                let mut rr2 = vec![0f32; n_in_d];
-                llm170_core::quant::dequant_row(
-                    wd.ty,
-                    wd.data,
-                    (e2 * n_out_d + j2) as u64,
-                    n_in_d as u64,
-                    &mut rr2,
-                );
-                let dot2: f32 = rr2.iter().zip(xs[r2].iter()).map(|(a, b)| a * b).sum();
-                let d2 = (got[r2 * n_out_d + j2] as f64 - dot2 as f64).abs();
-                if d2 > 2e-2 {
-                    eprintln!(
-                        "[mtc2] row={r2} e={e2} j={j2} got={:.5} ref={:.5}",
-                        got[r2 * n_out_d + j2],
-                        dot2
-                    );
-                }
-            }
-        }
-    }
-    if std::env::var_os("LLM170_MTC_DBG").is_some() {
-        for rr in 0..sel.len().min(10) {
-            let ee = sel[rr];
-            let per = wd.data.len() / 512;
-            let off = ee * per;
-            let d_bits = u16::from_le_bytes([wd.data[off], wd.data[off + 1]]);
-            let e10 = ((d_bits >> 10) & 0x1F) as i32;
-            let m10 = (d_bits & 0x3FF) as f32;
-            let dv = if e10 == 0 {
-                m10 * 2f32.powi(-24)
-            } else {
-                (1024.0 + m10) * 2f32.powi(e10 - 25)
-            } * if d_bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-            eprintln!("[mtcD] row={rr} e={ee} dBits={d_bits:#06x} d={dv:.3e}");
-            for jj in 1..6usize {
-                let row_b = (n_in_d / 256) * 144;
-                let off2 = off + jj * row_b;
-                let db2 = u16::from_le_bytes([wd.data[off2], wd.data[off2 + 1]]);
-                eprintln!("[mtcD]   j={jj} lo={:#04x}", db2 & 0xFF);
-            }
-        }
-    }
     Ok(format!(
         "moe-tile-check({mode} blk.{il} down {n_out_d}x{n_in_d}, rows={}): max|D|={mx:.3e} bad={bad}/{checked} {}",
         t * k,
@@ -2346,9 +2236,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
             for r in 0..n_out.min(16) {
                 llm170_core::quant::dequant_row(w.ty, w.data, r as u64, n_in as u64, &mut ref_row);
                 let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
-                if std::env::var_os("LLM170_DBG_8").is_some() && j == 0 && r < 6 {
-                    eprintln!("[8] r={r} got={:.6} ref={:.6}", got[j * n_out + r], dot);
-                }
                 mx = mx.max((dot as f64 - got[j * n_out + r] as f64).abs());
             }
         }
@@ -2395,9 +2282,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                         &mut ref_row,
                     );
                     let dot: f32 = ref_row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
-                    if std::env::var_os("LLM170_DBG_8B").is_some() && j == 0 && r < 4 {
-                        eprintln!("[8b] r={r} got={:.6} ref={:.6}", got[j * no + r], dot);
-                    }
                     mx = mx.max((dot as f64 - got[j * no + r] as f64).abs());
                 }
             }
@@ -2511,13 +2395,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                     }
                     let d = (got[tok * n_out_m + j] as f64 - acc2).abs();
                     mx = mx.max(d);
-                    if std::env::var_os("LLM170_DBG_9A").is_some() && tok == 0 && j < 4 {
-                        eprintln!(
-                            "[9a] tok={tok} j={j} got={:.6} ref={:.6}",
-                            got[tok * n_out_m + j],
-                            acc2
-                        );
-                    }
                 }
             }
             let ok = mx < 3e-2;
@@ -2618,13 +2495,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                         &mut ref_row,
                     );
                     let dot: f32 = ref_row.iter().zip(xs[r].iter()).map(|(a, b)| a * b).sum();
-                    if std::env::var_os("LLM170_DBG_9B").is_some() && r == 0 {
-                        eprintln!(
-                            "[9b] r={r} e={e} j={j} got={:.6} ref={:.6}",
-                            got[r * n_out_d + j],
-                            dot
-                        );
-                    }
                     let d = (got[r * n_out_d + j] as f64 - dot as f64).abs();
                     mx = mx.max(d);
                 }
@@ -2718,20 +2588,6 @@ pub fn frame_check(path: &str, tname: &str) -> Result<String, String> {
                         .map(|(a, b)| a * b)
                         .sum();
                     let d = (got[row * n_out_m + j] as f64 - dot as f64).abs();
-                    if std::env::var_os("LLM170_DBG_9C3").is_some() && d > 5e-3 && row < 40 {
-                        eprintln!(
-                            "[9c3] row={row} e={e} j={j} got={:.6} ref={:.6} d={d:.4}",
-                            got[row * n_out_m + j],
-                            dot
-                        );
-                    }
-                    if std::env::var_os("LLM170_DBG_9C2").is_some() && row < 210 {
-                        eprintln!(
-                            "[9c] row={row} e={e} j={j} got={:.6} ref={:.6}",
-                            got[row * n_out_m + j],
-                            dot
-                        );
-                    }
                     mx = mx.max(d);
                 }
             }
@@ -4709,44 +4565,6 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
         v
     };
     eprintln!("[lmmq] got len {}", got.len());
-    if std::env::var_os("LLM170_LMMQ_DUMP").is_some() {
-        eprintln!(
-            "[lmmq] push-view D[0..12] = {:?}",
-            &got[..12.min(got.len())]
-        );
-        eprintln!(
-            "[lmmq] dbg3 cache/sums D[16..20] = {:?}",
-            &got[16..20.min(got.len())]
-        );
-        eprintln!(
-            "[lmmq] dbg4 raw/dm/rowids D[20..30] = {:?}",
-            &got[20..30.min(got.len())]
-        );
-        let written = got.iter().filter(|&&v| v != 3.3961514e38).count();
-        eprintln!("[lmmq] written(non-pattern) = {}/{}", written, got.len());
-        let nonzero = got
-            .iter()
-            .filter(|&&v| v != 0.0 && v != 3.3961514e38)
-            .count();
-        eprintln!("[lmmq] nonzero-nonpattern = {nonzero}");
-        for (gi, &v) in got.iter().enumerate() {
-            if v != 0.0 && v != 3.3961514e38 && gi % m_per < 8 {
-                eprintln!("[lmmq] D[{gi}] = {v}");
-            }
-            if gi > 4000 {
-                break;
-            }
-        }
-        for i in 0..2 {
-            for j in 0..1 {
-                eprintln!(
-                    "[lmmq] D[{i}][{j}] {:?}",
-                    &got[(i * k_sel + j) * m_per..(i * k_sel + j) * m_per + 8]
-                );
-            }
-        }
-        eprintln!("[lmmq] ref sample: b0·a0..");
-    }
     let mut ref_row = vec![0.0f32; n_in];
     let mut mx = 0f64;
     let mut bad = 0usize;

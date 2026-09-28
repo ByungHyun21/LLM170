@@ -220,7 +220,6 @@ pub(super) fn frame_forward_ex(
                 let emb_w = heads * hp.ple_head_dim * t;
                 let mut emb = vec![0.0f32; emb_w];
                 if ple_rows.len() == heads * t {
-                    let _pg0 = std::time::Instant::now();
                     // plans/93: GPU gather 우선 — IQ4_NL 테이블 상주 + 커널.
                     // CPU MT(59ms) 대비 ~200×. 폴백은 CPU MT.
                     let gpu_gather_ok = if std::env::var_os("LLM170_PLE_GGPU").is_none() {
@@ -290,26 +289,12 @@ pub(super) fn frame_forward_ex(
                             eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})")
                         });
                     } else {
-                        if llm170_diag::flag::on("LLM170_PLE_TRACE") {
-                            eprintln!(
-                                "# ple-gather t={t} elapsed={:.1}ms",
-                                _pg0.elapsed().as_secs_f64() * 1e3
-                            );
-                        }
-                        let mut pre_capture = Vec::new();
-                        if llm170_diag::flag::on("LLM170_PLE_CHECK") {
-                            // 그림자용 PLE 직전 res_hc(레이어 0 출력) 판독 — 동기 1회.
-                            pre_capture = vec![0.0f32; hc * n];
-                            acc.frame_read(f.res_hc, &mut pre_capture)
-                                .map_err(Q4Error::Io)?;
-                        }
                         let w_key = model.w4(&format!("blk.{il}.ple_key.weight"))?;
                         let w_value = model.w4(&format!("blk.{il}.ple_value.weight"))?;
                         let nk = model.f32_vec4(&format!("blk.{il}.ple_norm_key.weight"))?;
                         let nq = model.f32_vec4(&format!("blk.{il}.ple_norm_query.weight"))?;
                         let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
                         let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
-                        let _pd0 = std::time::Instant::now();
                         let r = if gpu_gather_ok {
                             Ok(())
                         } else {
@@ -347,35 +332,10 @@ pub(super) fn frame_forward_ex(
                                 &seq_st.ple_conv,
                             )
                         });
-                        if llm170_diag::flag::on("LLM170_PLE_TRACE") {
-                            eprintln!(
-                                "# ple-dev-sec L{il} t={t} elapsed={:.1}ms",
-                                _pd0.elapsed().as_secs_f64() * 1e3
-                            );
-                        }
                         match r {
                             Ok(()) => {
                                 ple_dev_done = true;
                                 ple_dev = true;
-                                if llm170_diag::flag::on("LLM170_PLE_TRACE") {
-                                    eprintln!("# ple-dev OK L{il} t={t}");
-                                }
-                                if llm170_diag::flag::on("LLM170_PLE_CHECK") {
-                                    super::diag::ple_check_shadow(
-                                        acc,
-                                        f,
-                                        ctx,
-                                        model,
-                                        seq_st,
-                                        il,
-                                        &emb,
-                                        &ple_rows,
-                                        &pre_capture,
-                                        hc,
-                                        n,
-                                        t,
-                                    )?;
-                                }
                             }
                             Err(e) => {
                                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -425,7 +385,6 @@ pub(super) fn frame_forward_ex(
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mix"));
         }
         if il == 0 {
-            dbg("res_hc", acc, f.res_hc, hc * n * t);
         }
 
         // 3) attention — GDN 프레임 / QSA 값 브리지
@@ -474,26 +433,14 @@ pub(super) fn frame_forward_ex(
             {
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             } else {
-                let qtm = llm170_diag::flag::on("LLM170_Q4_TIME");
-                let mut ql = std::time::Instant::now();
                 let mut mix_v = vec![0.0f32; t * n];
                 acc.capture_mark("recr_in").map_err(Q4Error::Io)?;
                 acc.frame_read(f.mix, &mut mix_v).map_err(Q4Error::Io)?;
-                let read_ms = ql.elapsed().as_secs_f64() * 1e3;
-                ql = std::time::Instant::now();
                 let xs: Vec<Vec<f32>> = mix_v.chunks_exact(n).map(|c| c.to_vec()).collect();
                 let out = stages::qsa_layer(ctx, seq_st, il, &xs, t, full_idx)?;
-                let stage_ms = ql.elapsed().as_secs_f64() * 1e3;
-                ql = std::time::Instant::now();
                 let flat: Vec<f32> = out.concat();
                 acc.frame_write(f.ffn_out, &flat).map_err(Q4Error::Io)?;
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
-                if qtm {
-                    eprintln!(
-                        "# qsa-bridge L{il} t={t} read(d2h+드레인)={read_ms:.1}ms stage={stage_ms:.1}ms write(h2d)={:.1}ms",
-                        ql.elapsed().as_secs_f64() * 1e3
-                    );
-                }
             }
             full_idx += 1;
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
@@ -510,7 +457,6 @@ pub(super) fn frame_forward_ex(
             frame_ck(acc, f.mix, n, t, &format!("L{il}.mixf"));
         }
         if il == 0 {
-            dbg("mix2", acc, f.mix, n * t);
         }
         moe_frame(acc, model, f, il, n, t)?;
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
@@ -666,14 +612,6 @@ pub(super) fn frame_forward_ex(
                 t_call.elapsed().as_secs_f64() * 1e3
             );
         }
-        if llm170_diag::flag::on("LLM170_Q4_DBG") {
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            eprintln!(
-                "# fdbg logits t={t}: top5 {:?}",
-                idx[..5].iter().map(|&i| (i, logits[i])).collect::<Vec<_>>()
-            );
-        }
         Ok((logits, None))
     }
 }
@@ -751,9 +689,6 @@ pub(super) fn qsa_frame(
     b: &QsaBufs,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
-    let qtm = llm170_diag::flag::on("LLM170_Q4_TIME");
-    let t_qsa = std::time::Instant::now();
-    let mut lap = t_qsa;
     let (n_head, n_kv, hd) = (hp.n_head, hp.n_kv, hp.head_dim);
     let (n_rot, idx_dim) = (hp.n_rot, hp.idx_dim);
     let wq = model.w4(&format!("blk.{il}.attn_q.weight"))?;
@@ -764,7 +699,6 @@ pub(super) fn qsa_frame(
     let w_ik = model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
     // 1) 5투영 — 디바이스 그룹 1호출(왕복 0). wq 출력 [t][n_head·2hd]는 어텐션
     //    커널의 q 레이아웃(q‖게이트 인터리브)과 정확히 일치(plans/67 위험 항 해소).
-    let t_mm = std::time::Instant::now();
     acc.frame_mm_group(
         b.mix,
         &[wq, wk, wv, w_iq, w_ik],
@@ -772,13 +706,6 @@ pub(super) fn qsa_frame(
         t,
     )
     .map_err(Q4Error::Io)?;
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} proj-mm={:.2}ms",
-            t_mm.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    let t_rp = std::time::Instant::now();
     sync_mark(acc, "qsa.mm_group", b.q)?;
     if il == 3 && llm170_diag::dump::opts().bufhash {
         // plans/84 E.2: QSA 내부 이분 — 첫 상이 서브옵을 노출한다.
@@ -808,23 +735,10 @@ pub(super) fn qsa_frame(
         t,
     )
     .map_err(Q4Error::Io)?;
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} rope={:.2}ms",
-            t_rp.elapsed().as_secs_f64() * 1e3
-        );
-    }
     sync_mark(acc, "qsa.qkrope", b.k)?;
     if il == 3 && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, b.q, (n_head * 2 * hd) * t.min(16), "L3Q.rope_q");
         buf_hash(acc, b.k, (n_kv * hd) * t.min(16), "L3Q.rope_k");
-    }
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} mm+rope={:.2}ms",
-            t_qsa.elapsed().as_secs_f64() * 1e3
-        );
-        lap = std::time::Instant::now();
     }
     // ─── plans/73: 디코드(t=1) 디바이스 선택 ───
     // iq/ik/k/v의 d2h 4회(각각 동기식 드레인) + 호스트 선택(0.8-1.5ms/층)이
@@ -835,16 +749,8 @@ pub(super) fn qsa_frame(
     let kq_scale = hp.kq_scale();
     let r = hp.compress[il] as usize;
     if t == 1 && std::env::var_os("LLM170_QSA_HOSTSEL").is_none() {
-        let t_w = std::time::Instant::now();
         let iqw = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
-        if qtm {
-            eprintln!(
-                "# qsa-frame L{il} w-extract={:.2}ms",
-                t_w.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t_s = std::time::Instant::now();
         let dev = acc
             .qsa_sel_dev(
                 full_idx,
@@ -863,31 +769,11 @@ pub(super) fn qsa_frame(
                 hp.eps,
             )
             .and_then(|(sd, od, list_len)| {
-                if qtm {
-                    eprintln!(
-                        "# qsa-frame L{il} sel_dev={:.2}ms",
-                        t_s.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                let t_kv = std::time::Instant::now();
                 acc.qsa_kv_dev(full_idx, seq, b.k, b.v, t, pos0 as usize, n_kv, hd)
                     .and_then(|(kc, vc)| {
-                        if qtm {
-                            eprintln!(
-                                "# qsa-frame L{il} kv_dev={:.2}ms",
-                                t_kv.elapsed().as_secs_f64() * 1e3
-                            );
-                        }
-                        let t_attn = std::time::Instant::now();
                         let r = acc.qsa_attention_dev_sel(
                             b.q, kc, vc, sd, od, list_len, kq_scale, n_head, n_kv, hd, t, b.attn,
                         );
-                        if qtm {
-                            eprintln!(
-                                "# qsa-frame L{il} attn_sel={:.2}ms",
-                                t_attn.elapsed().as_secs_f64() * 1e3
-                            );
-                        }
                         r.map(|_| (sd, od, list_len))
                     })
             });
@@ -975,12 +861,6 @@ pub(super) fn qsa_frame(
         match dev {
             Ok(()) => {
                 seq_st.qsa_host_stale = true;
-                if qtm {
-                    eprintln!(
-                        "# qsa-frame L{il} t={t} identity-select={:.2}ms",
-                        lap.elapsed().as_secs_f64() * 1e3
-                    );
-                }
                 acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
                     .map_err(Q4Error::Io)?;
                 return Ok(());
@@ -1031,12 +911,6 @@ pub(super) fn qsa_frame(
                     });
                 } else {
                     seq_st.qsa_host_stale = true;
-                    if qtm {
-                        eprintln!(
-                            "# qsa-frame L{il} t={t} devsel={:.2}ms",
-                            lap.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
                     acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
                         .map_err(Q4Error::Io)?;
                     return Ok(());
@@ -1085,13 +959,6 @@ pub(super) fn qsa_frame(
     let rows = |flat: &[f32], w: usize| -> Vec<Vec<f32>> {
         flat.chunks_exact(w).map(|c| c.to_vec()).collect()
     };
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} d2h={:.2}ms",
-            lap.elapsed().as_secs_f64() * 1e3
-        );
-        lap = std::time::Instant::now();
-    }
     let kk = rows(&k_v, kv_len);
     let vv = rows(&v_v, kv_len);
     let iq = rows(&iq_v, iq_len);
@@ -1121,13 +988,6 @@ pub(super) fn qsa_frame(
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("# qsa-frame: idx 풀 적립 실패(디코드 폴백 예정) — {e}"));
         }
-    }
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} select+list={:.2}ms",
-            lap.elapsed().as_secs_f64() * 1e3
-        );
-        lap = std::time::Instant::now();
     }
     // 5) 어텐션 — q를 디바이스 버퍼에서 직접. 실패 시에만 d2h q + CPU 재계산.
     let kn_max = (pos0 as usize + t) * n_kv * hd;
@@ -1186,12 +1046,6 @@ pub(super) fn qsa_frame(
         acc.frame_write(b.attn, &flat).map_err(Q4Error::Io)?;
     }
     // 6) wo 투영 — 어텐션 출력을 디바이스에서 ffn_out으로(왕복 0).
-    if qtm {
-        eprintln!(
-            "# qsa-frame L{il} t={t} attn={:.2}ms",
-            lap.elapsed().as_secs_f64() * 1e3
-        );
-    }
     acc.frame_mm_group(b.attn, &[wo], &[b.out], t)
         .map_err(Q4Error::Io)?;
     Ok(())
@@ -1527,7 +1381,6 @@ pub(super) fn gdn_frame(
     // AR 상태 갱신 — 상태 GPU 상주, 판독 없음
     let fs: &dyn FrameState = acc;
     if il == 0 {
-        dbg("gbg_post", acc, f.gbg, hp.dt_rank * 2 * t);
     }
     if !stage_skipped("gdn.ar") {
         fs.frame_gdn_ar(

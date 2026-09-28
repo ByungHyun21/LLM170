@@ -8,7 +8,7 @@
 //!   ~169 GB/s = DRAM(236)의 71%로 사실상 한계다 — 이 모델의 디코드 여지는 ~10-20%뿐.
 //! - 프리필 pp512 = 1,415ms이고 네 GEMM 섹션(ffn_gate/ffn/gdn_mm/proj)이 86%,
 //!   ~19.5 TFLOPS = f32 피크의 34%. 호스트는 무죄다(cpu_submit=11.0ms).
-//! - 계측기 주의: LLM170_KTRACE 합계(366ms)와 LLM170_NOLAUNCH(1,014ms "호스트
+//! - 계측기 주의: ktrace 합계(366ms)와 LLM170_NOLAUNCH(1,014ms "호스트
 //!   스켈레톤")는 **배치 런치에서 신뢰 불가**하다(벽시계 1,409ms와 모순).
 //!   LLM170_PP_PROF 마크는 이 raw 경로 전용이고(프레임 경로는 무출력),
 //!   trace 섹션의 95.8ms는 계측기 자신의 hipEventCreate 비용이다.
@@ -225,16 +225,10 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
-        if env_on("LLM170_KTRACE") {
-            crate::rawhip::ktrace_on();
-        }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         let r = ds.read_logits();
-        if env_on("LLM170_KTRACE") {
-            eprintln!("{}", crate::rawhip::ktrace_dump());
-        }
         if let (Some(path), Ok(v)) = (std::env::var_os("LLM170_DUMP_LOGITS"), r.as_ref()) {
             let _ = std::fs::write(&path, bytemuck::cast_slice(v));
         }
@@ -268,26 +262,10 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         emb: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let t0 = std::time::Instant::now();
-        if env_on("LLM170_KTRACE") {
-            crate::rawhip::ktrace_on();
-        }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.step_batch(seq, pos0, emb)?;
         // 진단: 프리필 후 MTP KV가 채워졌는지 (비영 검사)
-        if env_on("LLM170_DUMP_MTPKV") {
-            let nw = 4096usize; // 앞 16KB
-            let mut kv = vec![0f32; nw];
-            if let Some(buf) = ds.mtp_kv_k.get(seq).copied() {
-                let _ = ds.ctx.d2h(bytemuck::cast_slice_mut(&mut kv).as_mut(), buf);
-            }
-            let h = pos0 + emb.len() / ds.n_embd;
-            eprintln!(
-                "# mtpkv seq={seq} pos0={pos0} rows={h} first16KB: nonzero={} max={:.4}",
-                kv.iter().filter(|v| **v != 0.0).count(),
-                kv.iter().fold(0f32, |a, b| a.max(b.abs()))
-            );
-        }
 
         // 마지막 행 최종 hidden d2h (MTP carry 전용 — 전행 회수 제거)
         let t = emb.len() / ds.n_embd;
@@ -296,9 +274,6 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(&mut h_last).as_mut(), last_row)?;
         let r = ds.read_logits();
-        if env_on("LLM170_KTRACE") {
-            eprintln!("{}", crate::rawhip::ktrace_dump());
-        }
         if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!(
                 "batch_h({} tok) wall={:.1}ms",
@@ -334,24 +309,13 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<(), String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        let t_rv0 = std::time::Instant::now();
         ds.verify_batch(seq, pos0, emb, argmaxes)?;
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!(
-                "[rv] verify_batch={:.1}ms",
-                t_rv0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         // 행별 최종 hidden export (MTP 상태 진행용) — xs_t에 step_batch 결과 잔존
         let t = emb.len() / ds.n_embd;
         h_all.clear();
         h_all.resize(t * ds.n_embd, 0.0);
-        let t_h0 = std::time::Instant::now();
         ds.ctx
             .d2h(bytemuck::cast_slice_mut(h_all).as_mut(), ds.xs_t)?;
-        if env_on("LLM170_SPEC_TIMING") {
-            eprintln!("[rv] h_all d2h={:.1}ms", t_h0.elapsed().as_secs_f64() * 1e3);
-        }
         Ok(())
     }
 
@@ -379,13 +343,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<Vec<f32>>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        if env_on("LLM170_KTRACE") {
-            crate::rawhip::ktrace_on();
-        }
         let r = ds.step_batch_np(seqs, poss, emb);
-        if env_on("LLM170_KTRACE") {
-            eprintln!("{}", crate::rawhip::ktrace_dump());
-        }
         r
     }
 
@@ -420,13 +378,7 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
     ) -> Result<Vec<u32>, String> {
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
-        if env_on("LLM170_KTRACE") {
-            crate::rawhip::ktrace_on();
-        }
         let r = ds.step_batch_np_greedy(seqs, poss, emb);
-        if env_on("LLM170_KTRACE") {
-            eprintln!("{}", crate::rawhip::ktrace_dump());
-        }
         r
     }
 
@@ -516,17 +468,11 @@ impl llm170_core::matmul::RawDecode for RawDecoder {
 
     fn raw_step(&self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         let t0 = std::time::Instant::now();
-        if env_on("LLM170_KTRACE") {
-            crate::rawhip::ktrace_on();
-        }
         let guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_ref().ok_or("raw_decode: 미초기화")?;
         ds.ctx.h2d(ds.xs, bytemuck::cast_slice(emb))?;
         ds.step(seq, pos)?;
         let r = ds.read_logits();
-        if env_on("LLM170_KTRACE") {
-            eprintln!("{}", crate::rawhip::ktrace_dump());
-        }
         if env_on("LLM170_RAWHIP_TIMING") {
             eprintln!("step cpu={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
         }

@@ -402,7 +402,6 @@ pub fn qsa_layer(
     full_idx: usize,
 ) -> Result<Vec<Vec<f32>>, Q4Error> {
     profile_span!("q4::layer_qsa");
-    let w_t0 = std::time::Instant::now();
     let hp = ctx.model.hp.clone();
     let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
     let wq = ctx.model.w4(&format!("blk.{il}.attn_q.weight"))?;
@@ -425,15 +424,6 @@ pub fn qsa_layer(
     let w_ik = ctx.model.w4(&format!("blk.{il}.indexer.k_proj.weight"))?;
 
     let n_tok = t_len;
-    let tm = std::env::var_os("LLM170_Q4_TIME").is_some();
-    if tm {
-        eprintln!(
-            "# qsa-stage wlookup={:.1}ms",
-            w_t0.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    let t_all = std::time::Instant::now();
-    let mut t_lap = t_all;
     // q/k/v/iq/ik는 동일 입력 xs — 그룹 1호출 (왕복 5→1).
     let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
     let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
@@ -462,13 +452,6 @@ pub fn qsa_layer(
         // sel_build의 버퍼 재사용은 중립(0.70 vs 0.71s) — 비용은 평탄화된
         // 선택목록 물질화 자체라 커널이 블록 목록을 직접 순회해야 줄어든다.
         ctx.mm_group(xs, &[wq, wk, wv, w_iq, w_ik], &mut gi)?;
-        if tm {
-            eprintln!(
-                "# qsa-stage t={t_len} mm_group={:.1}ms",
-                t_lap.elapsed().as_secs_f64() * 1e3
-            );
-            t_lap = std::time::Instant::now();
-        }
         qg = std::mem::take(&mut gi[0]);
         kk = std::mem::take(&mut gi[1]);
         vv = std::mem::take(&mut gi[2]);
@@ -578,23 +561,9 @@ pub fn qsa_layer(
             attn_all[t] = attn_out;
         }
     }
-    if tm {
-        eprintln!(
-            "# qsa-stage t={t_len} sel+proj={:.1}ms",
-            t_lap.elapsed().as_secs_f64() * 1e3
-        );
-        t_lap = std::time::Instant::now();
-    }
     // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
     // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
     if gpu_attn && let Some(acc) = ctx.acc {
-        if tm {
-            eprintln!(
-                "# qsa-stage passB={:.1}ms",
-                t_lap.elapsed().as_secs_f64() * 1e3
-            );
-            t_lap = std::time::Instant::now();
-        }
         let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
         // 선택 목록 압축 — 블록(오름차순) + 테일. 위치는 오름차순이므로
         // 마스크 스캔과 산술 순서가 같다(프로브에서 비트 동일 확인).
@@ -631,13 +600,6 @@ pub fn qsa_layer(
         let kn = n_past_max * n_kv * hd;
         let ck = &seq.kv_k[full_idx][..kn];
         let cv = &seq.kv_v[full_idx][..kn];
-        if tm {
-            eprintln!(
-                "# qsa-stage t={t_len} sel_build={:.1}ms",
-                t_lap.elapsed().as_secs_f64() * 1e3
-            );
-            t_lap = std::time::Instant::now();
-        }
         // 미지원이면 CPU 어텐션 폴백 — gdn_ar과 같은 규약.
         match acc.qsa_attention_sel(
             &qflat, ck, cv, &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, n_tok,
@@ -680,14 +642,6 @@ pub fn qsa_layer(
         }
     }
     ctx.mm_batch(&attn_all, &wo, &mut out)?;
-    if tm {
-        eprintln!(
-            "# qsa-stage t={t_len} attn={:.1}ms out_mm={:.1}ms total={:.1}ms",
-            t_lap.elapsed().as_secs_f64() * 1e3,
-            0.0,
-            t_all.elapsed().as_secs_f64() * 1e3
-        );
-    }
     if std::env::var_os("LLM170_QSA_HASH").is_some() {
         let used_kv = (((pos0 as usize) + t_len) * n_kv * hd).min(seq.kv_k[full_idx].len());
         let used_idx = (((pos0 as usize) + t_len) * hp.idx_dim).min(seq.idx_k[full_idx].len());

@@ -149,9 +149,6 @@ impl DecoderState {
         t: usize,
         bar: bool,
     ) -> Result<(), String> {
-        if llm170_diag::flag::on("LLM170_DBG_G8") {
-            eprintln!("[dbg_g8] t={t} {wkey}");
-        }
         let (wbufs, ty, ni, no) = self
             .w
             .get(wkey)
@@ -590,9 +587,6 @@ impl DecoderState {
             .get(wkey)
             .cloned()
             .ok_or(format!("가중치 없음: {wkey}"))?;
-        if llm170_diag::flag::on("LLM170_DBG_TILE") {
-            eprintln!("[dbg_tile] t={t} ty={ty} no={no} {wkey}");
-        }
         let tile_min: usize = if llm170_diag::flag::on("LLM170_VK_TILE1") {
             1
         } else {

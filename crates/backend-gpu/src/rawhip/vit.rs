@@ -2,7 +2,6 @@
 //! 산술은 core::clip (CPU) 미러 — 검증: 행별 최대오차.
 
 use crate::rawhip::RawCtx;
-use crate::rawhip::env_on;
 use std::collections::HashMap;
 
 pub struct Vit {
@@ -82,12 +81,6 @@ impl Vit {
             .ok_or_else(|| format!("vit weight 없음: {k}"))
     }
 
-    fn time_stage(&self, label: &str, t0: &std::time::Instant) {
-        if env_on("LLM170_VIT_TIME") {
-            let _ = self.ctx.sync();
-            eprintln!("[vtime] {label} +{:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
-        }
-    }
 
     fn gemm(
         &self,
@@ -164,13 +157,7 @@ impl Vit {
                 &mut args,
             )?;
         }
-        let tmark = std::time::Instant::now();
-        let mut tlast = tmark;
         for il in 0..self.n_blk {
-            if il == 1 && env_on("LLM170_VIT_TIME") {
-                self.time_stage("L0 total", &tlast);
-                tlast = std::time::Instant::now();
-            }
             // b_x → b_xn (레이어 입력 복사 — q 팩이 b_xn을 덮어쓰므로 매 층 갱신)
             self.pack_strided(self.b_x, 0, n, 1, self.b_xn, t)?;
             // LN1 → qkv
@@ -178,18 +165,6 @@ impl Vit {
             let (wq, rows, ni) = self.wt(&format!("v.blk.{il}.attn_qkv.weight"))?;
             let bq = self.wt(&format!("v.blk.{il}.attn_qkv.bias"))?.0;
             self.gemm(self.b_xn, wq, bq, ni, rows, self.b_qkv, t)?;
-            if il == 0 && env_on("LLM170_VIT_DBG") {
-                self.ctx.sync()?;
-                let mut v = vec![0f32; t * n];
-                self.ctx
-                    .d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_xn)?;
-                let ssum: f64 = v.iter().map(|&x| x as f64).sum();
-                eprintln!("[vit] L0 ln1 sum={ssum:.4} x0={:.6} x1={:.6}", v[0], v[1]);
-                let mut q = vec![0f32; 8];
-                self.ctx
-                    .d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
-                eprintln!("[vit] L0 qkv q0..7={:?}", &q);
-            }
             // rope q (offset 0) · k (offset n)
             for (off, stride) in [(0usize, 3 * n), (n, 3 * n)] {
                 let mut qp = unsafe { self.b_qkv.add(off * 4) } as *mut std::ffi::c_void;
@@ -208,25 +183,6 @@ impl Vit {
                 ];
                 self.ctx
                     .launch3("vit_rope", t as u32, nh as u32, 1, 32, &mut args)?;
-            }
-            if il == 0 && env_on("LLM170_VIT_DBG") {
-                self.ctx.sync()?;
-                let mut q = vec![0f32; 8];
-                let base = unsafe { self.b_qkv.add(0) };
-                let _ = base;
-                self.ctx
-                    .d2h(bytemuck::cast_slice_mut(&mut q).as_mut(), self.b_qkv)?;
-                eprintln!("[vit] L0 roped q0..7={:?}", &q);
-                let mut k = vec![0f32; 4];
-                self.ctx
-                    .d2h(bytemuck::cast_slice_mut(&mut k).as_mut(), unsafe {
-                        self.b_qkv.add(n * 4)
-                    })?;
-                eprintln!("[vit] L0 roped k0..3={:?}", &k);
-            }
-            if il == 1 && env_on("LLM170_VIT_TIME") {
-                self.time_stage("L: ln1+qkv+rope", &tlast);
-                tlast = std::time::Instant::now();
             }
             // attention — q/k/v는 qkv 내 off 0/n/2n, 행 스트라이드 3n → q도 팩 (b_xn 재활용)
             {
@@ -262,23 +218,6 @@ impl Vit {
                 self.ctx
                     .launch3("flash_vit", t as u32, nh as u32, 1, 256, &mut args)?;
             }
-            if il == 0 && env_on("LLM170_VIT_DBG") {
-                self.ctx.sync()?;
-                let mut a = vec![0f32; 8];
-                self.ctx
-                    .d2h(bytemuck::cast_slice_mut(&mut a).as_mut(), self.b_attn)?;
-                let asum: f64 = {
-                    let mut v = vec![0f32; t * n];
-                    self.ctx
-                        .d2h(bytemuck::cast_slice_mut(&mut v).as_mut(), self.b_attn)?;
-                    v.iter().map(|&x| x as f64).sum()
-                };
-                eprintln!("[vit] L0 attn sum={asum:.4} a0..7={:?}", &a);
-            }
-            if il == 1 && env_on("LLM170_VIT_TIME") {
-                self.time_stage("L: attention", &tlast);
-                tlast = std::time::Instant::now();
-            }
             // attn_out proj + 잔차
             let (ow, orows, oni) = self.wt(&format!("v.blk.{il}.attn_out.weight"))?;
             let ob = self.wt(&format!("v.blk.{il}.attn_out.bias"))?.0;
@@ -306,9 +245,6 @@ impl Vit {
             let db = self.wt(&format!("v.blk.{il}.ffn_down.bias"))?.0;
             self.gemm(self.b_mid, dw, db, dni, drows, self.b_proj, t)?;
             self.axpy(self.b_x, self.b_proj, t * n)?;
-        }
-        if env_on("LLM170_VIT_TIME") {
-            self.time_stage("L: ffn+residual (last)", &tlast);
         }
         // post_ln → merger: [t/4][4n] pack → mm0 gelu → mm2
         self.ln(self.b_x, "v.post_ln", t)?;

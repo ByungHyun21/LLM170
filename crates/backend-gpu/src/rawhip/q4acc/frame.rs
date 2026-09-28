@@ -65,12 +65,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let mut sc = 1.0f32;
         // t토큰 순차 재귀 — 커널 내부 ti 루프가 상태를 이어간다(1런치).
         let mut tt = self.t_cur() as i32;
-        if env_on("LLM170_Q4_DBG") {
-            eprintln!(
-                "# ar-args s={:?} q={:?} k={:?} v={:?} bg={:?} out={:?} d={dd} ks={ks} vs={vs} hv={hv} hk={hk}",
-                sp as usize, qp as usize, kp as usize, vp as usize, bp as usize, op_ as usize
-            );
-        }
         // gdn_ar_w_swap: 전치 상태 레이아웃(s[dv*d+kdim]) + d=128 고정(레인당
         // kdim 4개). 구 q4_gdn_ar_w의 열 단위 접근은 512B 스트라이드였다.
         self.ctx.launch3(
@@ -144,18 +138,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         n_expert_stack: usize,
         k_sel: usize,
     ) -> Result<(), String> {
-        let tm = env_on("LLM170_MOE_TIME");
-        let t0 = std::time::Instant::now();
-        let mut lap = t0;
-        let phase = |name: &str, lap: &mut std::time::Instant| {
-            if tm {
-                let ms = lap.elapsed().as_secs_f64() * 1e3;
-                if ms >= 0.05 {
-                    eprintln!("# moe-phase {name}={ms:.2}ms");
-                }
-                *lap = std::time::Instant::now();
-            }
-        };
         let n_in = ws.n_in as usize;
         let n_out = ws.n_out as usize / n_expert_stack.max(1);
         // 행 수 = t·k_sel — 버퍼는 t_max 크기라 길이에서 유도할 수 없다.
@@ -164,7 +146,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let op_ = self.fptr(out)?;
         let (wd, f32w) = self.dev_weight(ws)?;
         let per_expert = ws.data.len() / n_expert_stack.max(1);
-        phase("weight", &mut lap);
         let gen_q = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
         let (xq, xq_w) = if f32w {
             (std::ptr::null_mut(), 0usize)
@@ -212,7 +193,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 }
             }
         };
-        phase("quant", &mut lap);
         // direct-ids(t=1, LLM170_MOE_DIRECT=1): 그룹화 테이블·gather·scatter를
         // 전부 건너뛰고 커널이 ids[row]를 직접 읽는다. 행 순서가 곧 ids 순서라
         // 가중합(ys[e*n+i])이 그대로 맞고, 호스트 왕복(ids d2h+빌드+h2d)도 없다.
@@ -397,9 +377,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     )
                 })
         };
-        if tm {
-            eprintln!("# moe-cache {}", if hit.is_some() { "HIT" } else { "MISS" });
-        }
         let (
             perm_d,
             inv_d,
@@ -589,17 +566,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                     // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
                     unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in") }?;
-                    let mut lp = std::time::Instant::now();
                     let idp = self.fptr(ids)?;
                     let mut idv = vec![0u32; rows];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
-                    if tm {
-                        let ms = lp.elapsed().as_secs_f64() * 1e3;
-                        if ms >= 0.05 {
-                            eprintln!("# moe-miss d2h={ms:.2}ms rows={rows}");
-                        }
-                        lp = std::time::Instant::now();
-                    }
                     let mut off = vec![0usize; ne + 1];
                     for &e in &idv {
                         off[(e as usize).min(ne - 1) + 1] += 1;
@@ -616,13 +585,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         perm[p] = i as u32;
                         inv[i] = p as u32;
                         cur[e] += 1;
-                    }
-                    if tm {
-                        let ms = lp.elapsed().as_secs_f64() * 1e3;
-                        if ms >= 0.05 {
-                            eprintln!("# moe-miss sort={ms:.2}ms");
-                        }
-                        lp = std::time::Instant::now();
                     }
                     let (pd, ivd, rxd) = {
                         let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
@@ -677,28 +639,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         let txd = c.ensure(&self.ctx, (rows_pad / 16).max(1) * 4)? as u64;
                         (ppd, ipd, txd)
                     };
-                    if env_on("LLM170_GE5_DBG") {
-                        eprintln!(
-                            "# ge5 rows={rows} rows_pad={rows_pad} ne={ne} ppd={ppd} ipd={ipd} txd={txd} \
-perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
-                            &perm_pad[..perm_pad.len().min(4)],
-                            &inv_pad[..inv_pad.len().min(4)],
-                            &tilexp[..tilexp.len().min(4)],
-                            &off[..off.len().min(4)]
-                        );
-                    }
                     self.ctx
                         .h2d(ppd as *mut u8, bytemuck::cast_slice(&perm_pad))?;
                     self.ctx
                         .h2d(ipd as *mut u8, bytemuck::cast_slice(&inv_pad))?;
                     self.ctx
                         .h2d(txd as *mut u8, bytemuck::cast_slice(&tilexp))?;
-                    if tm {
-                        let ms = lp.elapsed().as_secs_f64() * 1e3;
-                        if ms >= 0.05 {
-                            eprintln!("# moe-miss h2d={ms:.2}ms");
-                        }
-                    }
                     unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out") }?;
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
@@ -732,7 +678,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 }
             }
         };
-        phase("group", &mut lap);
         let row_u32 = if f32w { n_in } else { xq_w };
         // plans/68 레이아웃 실험 플래그 — t=1의 기존(검증된) 동작은 그대로 두고
         // 프리필 디바이스 그룹화 실험에서만 패딩 도메인 레이아웃을 쓴다.
@@ -770,7 +715,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         } else {
             self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
         }
-        phase("gather", &mut lap);
         if llm170_core::qwen4exp::frame::stage_skipped("moe") {
             // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
             return Ok(());
@@ -867,12 +811,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 )?;
             }
             self.rows_permute_dev(ygp, inv_pad_d as *mut u8, op_, n_out, rows)?;
-            if tm {
-                eprintln!(
-                    "# moe-phase TOTAL={:.2}ms rows={rows} ge5",
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
             return Ok(());
         }
         if ws.ty == GgmlType::Q4K && !f32w && rows > 0 {
@@ -903,25 +841,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 (&mut eb) as *mut _ as *mut std::ffi::c_void,
                 (&mut rpd_p) as *mut _ as *mut std::ffi::c_void,
             ];
-            {
-                use std::sync::Mutex;
-                use std::sync::OnceLock;
-                static SEEN: OnceLock<Mutex<Vec<(usize, usize, usize)>>> = OnceLock::new();
-                if env_on("LLM170_Q4_DBG") {
-                    let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
-                    if let Ok(mut v) = seen.lock() {
-                        let key = (n_in, n_out, rows);
-                        if !v.contains(&key) && v.len() < 8 {
-                            v.push(key);
-                            eprintln!(
-                                "# q4_gemm_q4k_ge: n_in={n_in} n_out={n_out} rows={rows} blocks={}x{}",
-                                n_out.div_ceil(16),
-                                rows.div_ceil(16)
-                            );
-                        }
-                    }
-                }
-            }
             if llm170_diag::dump::opts().moe {
                 // 진단(plans/80): GEMM의 숨은 입력(xq 전체·rowexp·perm)을
                 // FNV 해시로 비교한다. mxsel/ids가 같은데 이들이 다르면
@@ -966,13 +885,6 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
             )?;
             let scat = if pad_layout { inv_pad_d } else { inv_d };
             self.rows_permute_dev(yg, scat as *mut u8, op_, n_out, rows)?;
-            phase("scatter", &mut lap);
-            if tm {
-                eprintln!(
-                    "# moe-phase TOTAL={:.2}ms rows={rows}",
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
             self.moe_hash_check("ge", op_, rows, n_out)?;
             return Ok(());
         }
@@ -1071,16 +983,8 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
                 self.launch_gemm(ggml_id(ws.ty), xsrc, wsrc, n_in, n_out, xq_w, r, dst)?;
             }
         }
-        phase("gemms", &mut lap);
         let scat2 = if pad_layout { inv_pad_d } else { inv_d };
         self.rows_permute_dev(yg, scat2 as *mut u8, op_, n_out, rows)?;
-        phase("scatter", &mut lap);
-        if tm {
-            eprintln!(
-                "# moe-phase TOTAL={:.2}ms rows={rows}",
-                t0.elapsed().as_secs_f64() * 1e3
-            );
-        }
         self.moe_hash_check("fb", op_, rows, n_out)?;
         Ok(())
     }
@@ -1221,7 +1125,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         // 동기를 만들었다. **키는 (ptr,len)** — 내용 해시는 층마다 값이 달라
         // 단일 슬롯 캐시가 매 층 미스했고(24KB+2KB 동기 복사 ×12층 = 40ms/스텝),
         // 프레임이 헤드 타일을 1회 만들어 상주시키므로 포인터가 곧 신원이다.
-        // (2026-09-16: LLM170_Q4_TIME 계측 — qsa.mm+rope 3.4ms/층의 전부가 이 복사였다)
+        // (2026-09-16 실측 — qsa.mm+rope 3.4ms/층의 전부가 이 복사였다)
         let (qnd, knd, csd) = {
             let qnd = self.upload_map(&self.qn_map, "qn_t", q_norm)?;
             let knd = self.upload_map(&self.kn_map, "kn_t", k_norm)?;

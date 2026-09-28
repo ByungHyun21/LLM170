@@ -371,8 +371,6 @@ pub fn f16_map(n_in_arg: usize) -> Result<String, String> {
             let mut ov3 = vec![0.0f32; n_out];
             ctx.d2h(bytemuck::cast_slice_mut(&mut ov3), od as *const u8)?;
             out += &format!("# 블록별 기여(실측/기대):{per_nb}\n");
-            // 덤프용 마지막 호출: nb=1(블록 0만 비영) 패턴. LLM170_DEQ_DUMP=1 이면
-            // 이 호출의 wf16이 /tmp/deq_wf16.f16 에 남는다.
             {
                 let mut wv5 = vec![0u8; n_out * (n_in / 32) * 34];
                 for sb in 0..n_in / 32 {

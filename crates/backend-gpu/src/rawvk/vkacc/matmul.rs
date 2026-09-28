@@ -1124,12 +1124,6 @@ impl VkAcc {
         for w in ws {
             if vk_ty(w.ty).is_none() && dense_ty(w.ty).is_none() {
                 need_pullback = true;
-                if llm170_diag::flag::on("LLM170_F32S_TRACE") {
-                    eprintln!(
-                        "[pullbk] n_in={n_in} ty={:?}",
-                        ws.iter().map(|w| w.ty).collect::<Vec<_>>()
-                    );
-                }
                 break;
             }
         }
@@ -1537,17 +1531,6 @@ impl VkAcc {
                     self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
                 }
                 None => {
-                    if llm170_diag::flag::on("LLM170_F32S_TRACE") {
-                        static NB: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        let n = NB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n < 40 {
-                            eprintln!(
-                                "[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={}",
-                                dense_ty(w.ty).unwrap_or(9)
-                            );
-                        }
-                    }
                     // plans/88 P1 — f32/BF16 밀식 GEMV(값폴백 소거).
                     let dty = dense_ty(w.ty).unwrap();
                     let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
@@ -1597,14 +1580,6 @@ impl VkAcc {
                             )?;
                             continue;
                         }
-                        if llm170_diag::flag::on("LLM170_F32S_TRACE") {
-                            static NS: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let n = NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 16 {
-                                eprintln!("[f32s] #{n} n_in={n_in} n_out={n_out} t={t}");
-                            }
-                        }
                         let p = self.pipeline(&mut ctx, Slot::FnTileF32)?;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {
@@ -1629,14 +1604,6 @@ impl VkAcc {
                         )?;
                         // plans/95 계측(1회성): tile_f32 형상 수집 — 76MiB f32·bf16
                         // 텐서에 359.6ms/청크의 원인 국소화.
-                        if llm170_diag::flag::on("LLM170_FT32_TRACE") {
-                            static N: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 12 {
-                                eprintln!("[ft32] #{n} dty={dty} n_in={n_in} n_out={n_out} t={t}");
-                            }
-                        }
                         continue;
                     }
                     let slot =
