@@ -265,58 +265,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             let Ok(j) = rx.try_recv() else {
                 break;
             };
-            // 접두 캐시 — cached 전체가 새 프롬프트의 접두면 이어서 프리필.
-            let prefix_ok = !llm170_diag::flag::on("LLM170_NO_PREFIX");
-            let pick = (0..n_slots)
-                .filter(|&i| slots[i].job.is_none())
-                .map(|i| {
-                    let l = if prefix_ok {
-                        slots[i]
-                            .cached
-                            .iter()
-                            .zip(j.tokens.iter())
-                            .take_while(|(a, b)| a == b)
-                            .count()
-                    } else {
-                        0
-                    };
-                    let full = l > 0 && l == slots[i].cached.len() && j.tokens.len() > l;
-                    (i, if full { l } else { 0 })
-                })
-                .max_by_key(|&(_, l)| l);
-            let (i, reuse) = pick.unwrap_or((0, 0));
-            if slots[i].job.is_some() {
-                break;
-            }
-            if reuse == 0 {
-                eng.reset_seq(i);
-            }
-            let prev_cached = std::mem::take(&mut slots[i].cached);
-            let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
-            // 프롬프트 토큰으로 패널티 히스토리 시드 (첫 토큰부터 반영)
-            if let Some(sm) = &mut sampler_new
-                && !sm.is_greedy()
-            {
-                sm.push_tokens(j.tokens.iter().copied());
-            }
-            slots[i] = Slot {
-                job: Some(j),
-                prefilled: reuse,
-                next: 0,
-                generated: 0,
-                tokens: Vec::new(),
-                touch: tick,
-                cancelled: false,
-                cached: prev_cached,
-                sampler: sampler_new,
-            };
-            if llm170_diag::dump::opts().key("slot_dbg") {
-                eprintln!("# slot-dbg: job assigned to slot{i} reuse={reuse}");
-            }
-            if reuse > 0 {
-                // 시퀀스 pos는 이미 cached.len() — prefilled=reuse로 잔여만 프리필.
-                eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
-            }
+            // 107 W7: 배정 단일 구현으로 위임(접두 캐시 로직 동일).
+            assign_slot(&mut slots, &mut eng, j, tick);
         }
         tick += 1;
         let _it0 = std::time::Instant::now();
@@ -593,50 +543,61 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if !busy {
             match rx.recv() {
                 Ok(j) => {
-                    // 접두 재사용 — drain 경로와 동일 규칙 (plans/24).
-                    let l = slots[0]
-                        .cached
-                        .iter()
-                        .zip(j.tokens.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    let reuse = if !llm170_diag::flag::on("LLM170_NO_PREFIX")
-                        && l > 0
-                        && l == slots[0].cached.len()
-                        && j.tokens.len() > l
-                    {
-                        l
-                    } else {
-                        0
-                    };
-                    if reuse == 0 {
-                        eng.reset_seq(0);
-                    } else {
-                        eprintln!("# prefix-cache: slot0 reuse {reuse}토큰");
-                    }
-                    let prev = std::mem::take(&mut slots[0].cached);
-                    let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
-                    if let Some(sm) = &mut sampler_new
-                        && !sm.is_greedy()
-                    {
-                        sm.push_tokens(j.tokens.iter().copied());
-                    }
-                    slots[0] = Slot {
-                        job: Some(j),
-                        prefilled: reuse,
-                        next: 0,
-                        generated: 0,
-                        tokens: Vec::new(),
-                        touch: tick,
-                        cancelled: false,
-                        cached: prev,
-                        sampler: sampler_new,
-                    };
+                    // 107 W7: 배정 단일 구현 위임(전 슬롯 접두 탐색으로 개선 — 종전 slot0 고정).
+                    assign_slot(&mut slots, &mut eng, j, tick);
                 }
                 Err(_) => break,
             }
         }
     }
+}
+
+/// 슬롯 배정 단일 구현 (107 W7: drain/유휴 이중 복제 통합).
+/// 접두 캐시 최장 일치 슬롯 선택(전 슬롯 대상 — 종전 유휴 경로는
+/// slot0 고정이었음), 재사용 시 reset 생략, 샘플러 시딩 포함.
+fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
+    let prefix_ok = !llm170_diag::flag::on("LLM170_NO_PREFIX");
+    let pick = (0..slots.len())
+        .filter(|&i| slots[i].job.is_none())
+        .map(|i| {
+            let l = if prefix_ok {
+                slots[i]
+                    .cached
+                    .iter()
+                    .zip(j.tokens.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            } else {
+                0
+            };
+            let full = l > 0 && l == slots[i].cached.len() && j.tokens.len() > l;
+            (i, if full { l } else { 0 })
+        })
+        .max_by_key(|&(_, l)| l);
+    let Some((i, reuse)) = pick else { return };
+    if reuse == 0 {
+        eng.reset_seq(i);
+    } else {
+        eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
+    }
+    let prev = std::mem::take(&mut slots[i].cached);
+    let mut sampler_new = j.sampler.clone().map(llm170_core::sampler::Sampler::new);
+    if let Some(sm) = &mut sampler_new
+        && !sm.is_greedy()
+    {
+        sm.push_tokens(j.tokens.iter().copied());
+    }
+    slots[i] = Slot {
+        job: Some(j),
+        prefilled: reuse,
+        next: 0,
+        generated: 0,
+        tokens: Vec::new(),
+        touch: tick,
+        cancelled: false,
+        cached: prev,
+        sampler: sampler_new,
+    };
 }
 fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
