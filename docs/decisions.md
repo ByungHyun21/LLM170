@@ -2834,3 +2834,12 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
   경로 불변. Q4K_OUTS/ROWS·Q4K_MMQ는 형상 스윕·기본 타일 게이트라
   보류(W5 계속 판정).
 - 검증: 경고 0·charhash PASS·게이트 2종 PASS.
+
+### (96) W6 1차 — core matmul.rs 1619줄 모듈 절단 (plans/107, 2026-09-28)
+
+- matmul/ {traits(호스트·프레임 트레이트+FrameOp) · weight ·
+  dispatch(mm_*+Acc) · raw(RawDecode) · cpu(w4a8·기준곱·greedy)}
+  — 재수출으로 기존 crate::matmul::* 경로 전호환(ABI 불변).
+- 무동작 변경: charhash 15,674라인 일치·게이트 2종 PASS·경고 0.
+- FrameHost 3분할(FrameIo/Gemm/Misc)은 소비 니즈 발생 시(블랭킷
+  방식) 후속 — 현재 단일 소비 2백엔드라 선투자 보류 판단.
