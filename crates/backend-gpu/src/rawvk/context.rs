@@ -556,12 +556,10 @@ impl VkCtx {
                 .map_err(|e| format!("대기2: {e:?}"))?;
             WAIT_US.with(|c| c.set(c.get() + _wt0.elapsed().as_micros() as u64));
             // 배치 세트 전량 해제 (풀 재사용) — 재생 모드에서는 참조 유지.
-            if !replaying {
-                if let Some((_, pool)) = self.batch_pool.get() {
-                    let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
-                    if !sets.is_empty() {
-                        let _ = self.device.free_descriptor_sets(pool, &sets);
-                    }
+            if !replaying && let Some((_, pool)) = self.batch_pool.get() {
+                let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
+                if !sets.is_empty() {
+                    let _ = self.device.free_descriptor_sets(pool, &sets);
                 }
             }
         }
@@ -1114,12 +1112,12 @@ impl VkCtx {
                     need = true;
                 }
                 // plans/104 이분법 프로브: 스킵 허용을 현 태그 1종으로 제한.
-                if !need {
-                    if let Some(only) = llm170_diag::flag::val("LLM170_VK_DEPBAR_ONLY") {
-                        if !only.is_empty() && tag != only {
-                            need = true;
-                        }
-                    }
+                if !need
+                    && let Some(only) = llm170_diag::flag::val("LLM170_VK_DEPBAR_ONLY")
+                    && !only.is_empty()
+                    && tag != only
+                {
+                    need = true;
                 }
                 if need {
                     let bar = vk::MemoryBarrier::default()
@@ -1244,21 +1242,21 @@ impl VkCtx {
                 let dt = (buf[a + 1] - buf[a]) as f64 * per / 1e6; // ms
                 // plans/91 P1: 디스패치 간 공백(직전 bottom → 다음 top) — 베리어
                 // 드레인/런치 지연의 직접 계량. 마지막 디스패치는 제외.
-                if a + 3 < n {
-                    if let Some(gap_t) = buf[a + 2].checked_sub(buf[a + 1]) {
-                        let gap = gap_t as f64 * per / 1e6;
-                        GAP_SUM.with(|g| g.set(g.get() + gap));
-                        if gap > 0.05 {
-                            // plans/92 — 공백을 선행 커널 라벨로 귀속(상위 표).
-                            let ge = GAP_BY.with(|m| {
-                                let mut m = m.borrow_mut();
-                                let e2 = m.entry(lbl.to_string()).or_insert((0.0f64, 0usize));
-                                e2.0 += gap;
-                                e2.1 += 1;
-                                e2.clone()
-                            });
-                            let _ = ge;
-                        }
+                if a + 3 < n
+                    && let Some(gap_t) = buf[a + 2].checked_sub(buf[a + 1])
+                {
+                    let gap = gap_t as f64 * per / 1e6;
+                    GAP_SUM.with(|g| g.set(g.get() + gap));
+                    if gap > 0.05 {
+                        // plans/92 — 공백을 선행 커널 라벨로 귀속(상위 표).
+                        let ge = GAP_BY.with(|m| {
+                            let mut m = m.borrow_mut();
+                            let e2 = m.entry(lbl.to_string()).or_insert((0.0f64, 0usize));
+                            e2.0 += gap;
+                            e2.1 += 1;
+                            *e2
+                        });
+                        let _ = ge;
                     }
                 }
                 let e = agg.entry(lbl.as_str()).or_insert((0.0, 0, 0.0));
@@ -1274,7 +1272,7 @@ impl VkCtx {
             // plans/104 — 프로브 스킵 쌍 인구조사(상위 24) · 배치 종료 시 리셋.
             SKIP_BY.with(|m| {
                 let mut v: Vec<_> = m.borrow().iter().map(|(k, c)| (k.clone(), *c)).collect();
-                v.sort_by(|a, b| b.1.cmp(&a.1));
+                v.sort_by_key(|x| std::cmp::Reverse(x.1));
                 let tot: u32 = v.iter().map(|x| x.1).sum();
                 if tot > 0 {
                     eprintln!("[ts] 스킵쌍 {tot}회");

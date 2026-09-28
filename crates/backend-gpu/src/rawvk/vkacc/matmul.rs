@@ -19,9 +19,9 @@ fn f32_to_q8_0_bytes(data: &[u8], n_elem: usize) -> Vec<u8> {
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         // f16 인코딩 (ggml 규약: round-to-nearest-even 비트 절단)
         let dbits = d.to_bits();
-        let f16 = (((dbits >> 16) as u32 & 0x8000)
-            | (((dbits >> 23) as u32 & 0xFF).saturating_sub(112) as u32) << 10
-            | ((dbits >> 13) as u32 & 0x3FF)) as u16;
+        let f16 = (((dbits >> 16) & 0x8000)
+            | ((dbits >> 23) & 0xFF).saturating_sub(112) << 10
+            | ((dbits >> 13) & 0x3FF)) as u16;
         out.extend_from_slice(&f16.to_le_bytes());
         let mut pad = [0i8; 32];
         for (j, &v) in xf[lo..hi].iter().enumerate() {
@@ -341,7 +341,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                     let tgt = {
                         let mut sl = self.moe_xq_pair.lock();
                         let need = rows * xq_w * 4;
-                        let ok = sl.as_ref().is_some_and(|v| (v.3.bytes as usize) >= need);
+                        let ok = sl.as_ref().is_some_and(|v| v.3.bytes >= need);
                         if !ok {
                             *sl = Some((0, 0, 0, ctx.alloc(need)?));
                         }

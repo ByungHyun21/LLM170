@@ -4418,7 +4418,7 @@ pub fn llama_mmq_check() -> Result<String, String> {
     };
     // D: [t][k_sel][m_per] f32.
     let db = ctx.alloc_host(t * k_sel * m_per * 4)?;
-    unsafe { std::ptr::write_bytes(db.ptr as *mut u8, 0x7f, t * k_sel * m_per * 4) };
+    unsafe { std::ptr::write_bytes(db.ptr, 0x7f, t * k_sel * m_per * 4) };
     // 디바이스 생존 판별 — 트리비얼 라이터.
     {
         let src = b"#version 450
@@ -4647,7 +4647,7 @@ pub fn cm8_probe() -> Result<String, String> {
     let cb = ctx.alloc_host(1024)?;
     unsafe {
         for i in 0..256usize {
-            *(ab.ptr.add(i) as *mut u8) = (i % 256) as u8;
+            *(ab.ptr.add(i)) = (i % 256) as u8;
             *(bb.ptr.add(i) as *mut i8) = ((i % 251) as i8).wrapping_sub(125);
         }
         std::ptr::write_bytes(cb.ptr, 0, 1024);
@@ -4658,7 +4658,7 @@ pub fn cm8_probe() -> Result<String, String> {
         let (_d2, p2, _o2, ds2, pipe2) = ctx.pipeline(&spv2, 3, 0)?;
         unsafe {
             for i in 0..256usize {
-                *(ab.ptr.add(i) as *mut u8) = (i % 256) as u8;
+                *(ab.ptr.add(i)) = (i % 256) as u8;
                 *(bb.ptr.add(i) as *mut i8) = if i % 17 == 0 { 1 } else { 0 };
             }
             std::ptr::write_bytes(cb.ptr, 0, 1024);
@@ -4770,7 +4770,7 @@ pub fn cm8_probe() -> Result<String, String> {
             std::ptr::write_bytes(dummy.ptr, 0, 1024);
             std::ptr::write_bytes(dummy2.ptr, 0, 1024);
             for k in 0..16usize {
-                *(dummy.ptr.add(k) as *mut u8) = 1;
+                *(dummy.ptr.add(k)) = 1;
             }
             for r in 0..16usize {
                 *(dummy2.ptr.add(r * 32 + 9) as *mut i8) = (r + 1) as i8;
