@@ -749,7 +749,17 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
                 BackendSel::GpuRuntime(r) => r == "vulkan",
                 _ => false,
             };
-            if vulkan {
+            // 107 (원장 87·90): qwen35 vk 디코드 프리필 비결정론 레이스
+            // (확산형 — 배리어·캐시·코히런시 무죄, 디스패치별 제출만
+            // 결정론). 조용한 오염 대신 가시 폴백 — LLM170_VK_Q35_FORCE=1
+            // 로 vk 진단 강행.
+            let vk_q35_blocked = vulkan && !llm170_diag::flag::on("LLM170_VK_Q35_FORCE");
+            if vk_q35_blocked {
+                eprintln!(
+                    "error: vulkan qwen35 decode is nondeterministic (ledger 87/90) — falling back to hip"
+                );
+            }
+            if vulkan && !vk_q35_blocked {
                 if llm170_diag::flag::on("LLM170_VK_ACC") {
                     match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
                         Ok(acc) => {
