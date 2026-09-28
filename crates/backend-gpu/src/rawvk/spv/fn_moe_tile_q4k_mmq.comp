@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // fn_moe_tile_q4k_mmq v5 (plans/96) — v3 기하 + 라이브-행 MMA 스킵 — 1-wave 기하 실험.
 // v2(256스레드·2배리어/sb)의 4경로 부정 후 마지막 미시험 축: **64스레드
@@ -24,7 +25,8 @@ shared float sAm[64][4];
 shared uint sB[16][32];
 shared float sBd[16][4];
 shared float sBsum[16][4]; // plans/96: quant 사전계산합 판독 — sBw 폐지
-shared int sLive;         // plans/96 v5: 밴드 실제 행 수
+shared int sLive;
+shared float shDr[16 * 64];   // plans/105: f16 드레인 전치 버퍼         // plans/96 v5: 밴드 실제 행 수
 
 float f16_exact(uint bits) {
     float sgn = (bits & 0x8000u) != 0u ? -1.0 : 1.0;
@@ -165,7 +167,26 @@ void main() {
     }
 
     // ── 드레인: 직접산란(G2 계약 — 원본 행 위치, 센티널 가드).
-    if (tr < nrow) {
+    // mode=2(plans/105): packed f16 — acc을 LDS 경유 전치 후 짝수 tr이
+    // (tr,tr+1) 단일 워드 팩(산술: f16 사전 반올림 — hout과 동일 클래스).
+    if (pc.mode == 2u) {
+        for (int c = 0; c < 16; c++) {
+            if (c < nt) shDr[c * 64 + int(tr)] = acc[c];
+            else shDr[c * 64 + int(tr)] = 0.0;
+        }
+        barrier();
+        if ((tr & 1u) == 0u && tr + 1 < nrow) {
+            for (int c = 0; c < nt; c++) {
+                uint pr2 = perm_pad[uint(r0e + c)];
+                if (pr2 != 0xFFFFFFFFu) {
+                    uint cell = pr2 * pc.n_out + uint(row0 + tr);
+                    outv[cell >> 1] = uintBitsToFloat(packHalf2x16(vec2(
+                        float16_t(shDr[c * 64 + int(tr)]),
+                        float16_t(shDr[c * 64 + int(tr) + 1]))));
+                }
+            }
+        }
+    } else if (tr < nrow) {
         for (int c = 0; c < nt; c++) {
             uint pr2 = perm_pad[uint(r0e + c)];
             if (pr2 != 0xFFFFFFFFu) {

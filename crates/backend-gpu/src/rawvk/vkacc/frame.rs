@@ -212,6 +212,35 @@ impl llm170_core::matmul::FrameState for VkAcc {
         n_expert_stack: usize,
         k_sel: usize,
     ) -> Result<(), String> {
+        self.moe_gemm_impl(x, w, ids, out, n_expert_stack, k_sel, false)
+    }
+
+    /// plans/105 — gate/up packed f16 출력 판(드레인 mode=2).
+    fn frame_moe_gemm16(
+        &self,
+        x: u64,
+        w: &Weight,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+        k_sel: usize,
+    ) -> Result<(), String> {
+        self.moe_gemm_impl(x, w, ids, out, n_expert_stack, k_sel, true)
+    }
+
+}
+
+impl VkAcc {
+    fn moe_gemm_impl(
+        &self,
+        x: u64,
+        w: &Weight,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+        k_sel: usize,
+        h16: bool,
+    ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let ne = n_expert_stack.max(1);
         // 스택 텐서: w.n_out = 전문가당 n_out × ne — GEMM은 전문가당 폭만 쓴다.
@@ -710,7 +739,14 @@ impl llm170_core::matmul::FrameState for VkAcc {
                     { let m = std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                       if std::env::var_os("LLM170_MTC_DBG").is_some() { eprintln!("[cm8-push] mode={m}"); }
                       m }
-                } else { 0u32 },
+                } else if h16 && matches!(slot, Slot::FnMoeTileQ4kMmq) {
+                    // plans/105: 드레인 packed f16 — 실제 타일 경로에서만 등록.
+                    self.f16bufs.lock().insert(out);
+                    2u32
+                } else {
+                    self.f16bufs.lock().remove(&out);
+                    0u32
+                },
                 rows as u32,
             ]);
             let (gx, gy) = if matches!(slot, Slot::FnMoeTileQ4kKp) {
@@ -889,9 +925,7 @@ impl llm170_core::matmul::FrameState for VkAcc {
         }
         Ok(())
     }
-}
 
-impl VkAcc {
     /// plans/88 P2 — 프레임 quant 출력용 디바이스 로컬 버퍼(성장 재할당).
     pub(super) fn xq_dev_buf(&self, ctx: &mut VkCtx, need: usize) -> Result<vk::Buffer, String> {
         let mut g = self.xq_dev.lock();

@@ -931,6 +931,20 @@ pub trait FrameState {
     ) -> Result<(), String> {
         Err("frame_moe_gemm: 미지원".into())
     }
+
+    /// plans/105 — gate/up 중간출력 packed f16 판(mgu/mup). 미지원 백엔드는
+    /// 일반 판으로 폴백(산술 클래스 차이 — 승격 시에만 사용).
+    fn frame_moe_gemm16(
+        &self,
+        x: u64,
+        w: &Weight,
+        ids: u64,
+        out: u64,
+        n_expert_stack: usize,
+        k_sel: usize,
+    ) -> Result<(), String> {
+        self.frame_moe_gemm(x, w, ids, out, n_expert_stack, k_sel)
+    }
 }
 
 /// matmul_group 디스패치 — 가속기 없으면 CPU 개별 배치.
