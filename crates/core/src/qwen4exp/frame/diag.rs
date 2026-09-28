@@ -26,7 +26,6 @@ pub fn stage_skipped(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 /// 107 W6: 진단 침투 정리 — `ck!(acc, il, buf, n, t, "tag")`가 게이트
 /// (il<4 || dump 키 ck_all)와 frame_ck 호출을 한 줄로 접는다.
 macro_rules! ck {

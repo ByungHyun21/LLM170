@@ -1,7 +1,7 @@
 //! frame/forward — 단일 시퀀스 포워드(디코드·프리필) (plans/79 A).
 
-use super::*;
 use super::diag::ck;
+use super::*;
 
 /// 프레임 forward — t토큰 (t=1 디코드도 이 경로; decode_frame이 래퍼).
 /// 포워드 종료 방식 — 비동기 프리필은 head 커널까지만 발행하고 리드백을 미룬다.
