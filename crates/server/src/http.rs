@@ -304,7 +304,9 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
                 );
             }
             ("POST", "/v1/completions") | ("POST", "/completion") => {
-                let n_predict = jnum(&req.body, "n_predict").unwrap_or(24.0).max(1.0) as usize;
+                let n_predict = jnum(&req.body, "max_tokens")
+                    .unwrap_or(jnum(&req.body, "n_predict").unwrap_or(24.0))
+                    .max(1.0) as usize;
                 let stream_mode = jbool(&req.body, "stream");
                 let prompt_ids = jarr_u32(&req.body, "prompt");
                 let prompt_txt = jstr(&req.body, "prompt");
