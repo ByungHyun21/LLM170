@@ -247,7 +247,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // plans/101 P2: HC xn(hc>1·프리필 판)은 f16 저장(기본 ON).
                 // plans/103: res_hc 입력 f16은 별도 변형 슬롯(f32 쌍둥이 불변).
                 let out16 = (slot == Slot::RmsWide || slot == Slot::RmsWideF16) && w_reps > 1
-                    && std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true);
+                    && std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false);
                 let p = self.pipeline(&mut ctx, slot)?;
                 let ds2 = ctx.bind_ds(&p, &[xb, wb, ob])?;
                 let mut push = push_u32s(&[n as u32, rows as u32, w_reps as u32]);
@@ -760,6 +760,9 @@ impl VkAcc {
         for w in ws {
             if vk_ty(w.ty).is_none() && dense_ty(w.ty).is_none() {
                 need_pullback = true;
+                if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                    eprintln!("[pullbk] n_in={n_in} ty={:?}", ws.iter().map(|w| w.ty).collect::<Vec<_>>());
+                }
                 break;
             }
         }
@@ -997,6 +1000,14 @@ impl VkAcc {
                     self.gemv_run(&mut ctx, &wbufs, n_in, n_out, xq_w, ty, t, xq, ob)?;
                 }
                 None => {
+                    if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                        static NB: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let n = NB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 40 {
+                            eprintln!("[f32br] #{n} n_in={n_in} n_out={n_out} t={t} dty={} src16={}", dense_ty(w.ty).unwrap_or(9), self.f16bufs.lock().contains(&x));
+                        }
+                    }
                     // plans/88 P1 — f32/BF16 밀식 GEMV(값폴백 소거).
                     let dty = dense_ty(w.ty).unwrap();
                     let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
@@ -1025,7 +1036,8 @@ impl VkAcc {
                                 .unwrap_or(512)
                             && std::env::var("LLM170_VK_FT32S").map(|v| v != "0").unwrap_or(true)
                         {
-                            let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
+                            let src16 = self.f16bufs.lock().contains(&x);
+                            let p = self.pipeline(&mut ctx, if src16 { Slot::FnTileF32sH } else { Slot::FnTileF32s })?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
                             // W0u(slot1)에도 동일 버퍼 — BF16 uint 뷰.
                             while binds.len() < 8 {
@@ -1039,6 +1051,14 @@ impl VkAcc {
                             ]);
                             ctx.run_rw(p.pl, ds2, p.pipe, &push, (n_out as u32).div_ceil(16), (t as u32).div_ceil(16), 1, &binds, &[ob])?;
                             continue;
+                        }
+                        if std::env::var_os("LLM170_F32S_TRACE").is_some() {
+                            static NS: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let n = NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 16 {
+                                eprintln!("[f32s] #{n} n_in={n_in} n_out={n_out} t={t} src16={}", self.f16bufs.lock().contains(&x));
+                            }
                         }
                         // plans/95 P1b — 비트 동일 고속판 시도: 게이트 3/3 PASS
                         // (체커·스트림 완전 동일 확인)이나 181.7 t/s(−21%) —

@@ -103,6 +103,8 @@ const FN_TILE_F32_W_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32_w.spv");
 const FN_TILE_F32_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32.spv");
 /// plans/95 P1 — 스키니 f32 타일(K-분할, 점유 붕괴 해소).
 const FN_TILE_F32S_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s.spv");
+/// plans/104 — f32s의 f16 packed 입력 변형(hc inject 결함 수리).
+const FN_TILE_F32S_H_SPV: &[u8] = include_bytes!("../spv/fn_tile_f32s_h.spv");
 /// plans/95 P3a — q8_0 34B블록(d f16 + 32×i8) → xq 동일 레이아웃 무손실
 /// 릴레이아웃: 행당 [n_in 바이트 i8][n_in/32 f32 d]. 값·스케일 불변
 /// (f16→f32 확장은 정확). fn_tile_q8mmq의 A측 포맷.
@@ -238,6 +240,7 @@ pub(crate) enum Slot {
     /// plans/99 테일 — LDS 협동 스테이징 코얼레스드 quant.
     QuantS8,
     FnTileF32s,
+    FnTileF32sH,
     /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
     FnTileF32e,
     /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
@@ -514,7 +517,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnTileF32, "tile_f32", FN_TILE_F32_SPV, 10, 20),
     (Slot::FnTileF32W, "tile_f32_w", FN_TILE_F32_W_SPV, 10, 20),
     (Slot::FnTileF32s, "tile_f32s", FN_TILE_F32S_SPV, 10, 20),
-    (Slot::FnTileF32e, "tile_f32e", FN_TILE_F32E_SPV, 10, 12),
+    (Slot::FnTileF32sH, "tile_f32s_h", FN_TILE_F32S_H_SPV, 10, 20),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateF16, "ple_gate_f16", FN_PLE_GATE_F16_SPV, 8, 16),

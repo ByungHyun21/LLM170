@@ -461,12 +461,12 @@ pub(super) fn frame_forward_ex(
         acc.frame_mm(f.hxn, &w_down, f.hlo, t).map_err(Q4Error::Io)?;
         op(acc, FrameOp::SiluDiv { t: f.hlo, div: hc as f32, n: f.hlo_len * t })?;
         let w_up = model.w4("output_hc_up.weight")?;
-        if std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true) && t >= 128 {
+        if std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false) && t >= 128 {
         acc.frame_mm_hout(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
     } else {
         acc.frame_mm(f.hlo, &w_up, f.hgate, t).map_err(Q4Error::Io)?;
     }
-        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true)) && t >= 128 })?;
+        op(acc, FrameOp::HcGateMean { xn: f.hxn, gate: f.hgate, out: f.hin, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false)) && t >= 128 })?;
         if t > 1 {
             op(acc, FrameOp::CopyRows { src: f.hin, dst: f.hin_last, src_off: (t - 1) * n, dst_off: 0, n })?;
         }
@@ -1018,7 +1018,7 @@ pub(super) fn hc_mix_frame(
     op(acc, FrameOp::SiluDiv { t: f.lo, div: hc as f32, n: f.lo_len * t })?;
     sync_mark(acc, "hc.silu", f.lo)?;
     let w_up = model.w4(&format!("blk.{il}.hc_{kind}_up.weight"))?;
-    if std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true) && t >= 128 {
+    if std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false) && t >= 128 {
         acc.frame_mm_hout(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
     } else {
         acc.frame_mm(f.lo, &w_up, f.gate, t).map_err(Q4Error::Io)?;
@@ -1027,7 +1027,7 @@ pub(super) fn hc_mix_frame(
         buf_hash(acc, f.gate, hc * n * t.min(16), &format!("L{il}C.attn_gate"));
     }
     sync_mark(acc, "hc.up", f.gate)?;
-    op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v != "0").unwrap_or(true)) && t >= 128 })?;
+    op(acc, FrameOp::HcGateMean { xn: f.xn, gate: f.gate, out: f.mix, hc, n, h16: (std::env::var("LLM170_VK_HCF16").map(|v| v == "1").unwrap_or(false)) && t >= 128 })?;
     if mark_attn && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}C.attn_mix"));
     }
@@ -1247,7 +1247,6 @@ pub(super) fn moe_frame(
     let w_gate = model.w4(&format!("blk.{il}.ffn_gate_exps.weight"))?;
     let w_up = model.w4(&format!("blk.{il}.ffn_up_exps.weight"))?;
     let w_down = model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
-    let mut sh_early = false;
     if t == 1 {
         // 디코드: mix를 k_sel행 브로드캐스트 — 전용 커널 1런치(기존 k_sel런치).
         let msync = std::env::var_os("LLM170_MOE_SYNC").is_some();
@@ -1260,6 +1259,7 @@ pub(super) fn moe_frame(
             .map_err(Q4Error::Io)?;
         if msync { sync_mark(acc, "d.gemm.up", f.mup)?; }
         op(acc, FrameOp::SiluMul { g: f.mgu, u: f.mup, out: f.mglu, n: k_sel * n_ff })?;
+        if msync { sync_mark(acc, "d.silumul", f.mglu)?; }
         fs.frame_moe_gemm(f.mglu, &w_down, f.mids, f.my, hp.n_expert, k_sel)
             .map_err(Q4Error::Io)?;
         if msync { sync_mark(acc, "d.gemm.down", f.my)?; }
@@ -1268,22 +1268,6 @@ pub(super) fn moe_frame(
     } else {
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
-        // plans/104 — 공유전문가 GEMM 체인을 라우팅 창에 인접 발행(격리 xq2).
-        // 라우팅 체인(mxsel·xq·mgu/mup/my·mout)과 버퍼가 완전 분리되어 RW
-        // 추적이 독립을 증명 — GPU 병행 실행. 최종 가산(axpy, mout RMW)만
-        // scatter 이후로 남긴다(산술·순서 불변).
-        if !stage_skipped("moe.shared") && f.np_views.is_none() {
-            let shg_w = model.w4(&format!("blk.{il}.ffn_gate_shexp.weight"))?;
-            let shu_w = model.w4(&format!("blk.{il}.ffn_up_shexp.weight"))?;
-            let shd_w = model.w4(&format!("blk.{il}.ffn_down_shexp.weight"))?;
-            op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
-            acc.frame_mm_group_sep(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
-                .map_err(Q4Error::Io)?;
-            op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
-            acc.frame_mm_group_sep(f.shglu, &[shd_w], &[f.shout], t)
-                .map_err(Q4Error::Io)?;
-            sh_early = true;
-        }
         if il <= 3 && llm170_diag::dump::opts().bufhash {
             // plans/84 E.2: gather 시점 mix/mxsel — 과도 현상의 소스 분리.
             buf_hash(acc, f.mix, n * t.min(16), &format!("L{il}D.mix_at_gather"));
@@ -1348,15 +1332,11 @@ pub(super) fn moe_frame(
                     .map_err(Q4Error::Io)?;
             }
         } else {
-            // plans/104: 순수 프리필 — GEMM 체인은 gather 직후 이미 발행됨
-            // (sh_early). 여기는 잔류 가산만.
-            if !sh_early {
-                op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
-                acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
-                    .map_err(Q4Error::Io)?;
-                op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
-                acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
-            }
+            op(acc, FrameOp::Sigmoid { t: f.msgate, n: t })?;
+            acc.frame_mm_group(f.mix, &[shg_w, shu_w], &[f.shg, f.shu], t)
+                .map_err(Q4Error::Io)?;
+            op(acc, FrameOp::SiluMul { g: f.shg, u: f.shu, out: f.shglu, n: n_ff * t })?;
+            acc.frame_mm(f.shglu, &shd_w, f.shout, t).map_err(Q4Error::Io)?;
             if il <= 2 && llm170_diag::dump::opts().bufhash {
                 buf_hash(acc, f.shg, n_ff * t.min(16), &format!("L{il}A.shg"));
                 buf_hash(acc, f.shout, n_ff * t.min(16), &format!("L{il}A.shout"));
