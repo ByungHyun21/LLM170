@@ -666,6 +666,15 @@ impl VkAcc {
                 _ => Slot::FnMoeTileQ5k,
                 }
             };
+            // plans/105(원장 72): h16 q51 → 변형 슬롯(인라인 분기는 코드젠
+            // 역행 — 죽은 분기도 레지스터/LDS 압박).
+            let slot = if h16 && slot == Slot::FnMoeTileQ51mmq {
+                self.f16bufs.lock().insert(out);
+                Slot::FnMoeTileQ51mmqH
+            } else {
+                if slot == Slot::FnMoeTileQ51mmq { self.f16bufs.lock().remove(&out); }
+                slot
+            };
             let p = self.pipeline(&mut ctx, slot)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             if let Some(b) = w0_override {
@@ -739,10 +748,6 @@ impl VkAcc {
                     { let m = std::env::var("LLM170_VK_Q4CM8DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
                       if std::env::var_os("LLM170_MTC_DBG").is_some() { eprintln!("[cm8-push] mode={m}"); }
                       m }
-                } else if h16 && matches!(slot, Slot::FnMoeTileQ4kMmq | Slot::FnMoeTileQ51mmq) {
-                    // plans/105: 드레인 packed f16 — 실제 타일 경로에서만 등록.
-                    self.f16bufs.lock().insert(out);
-                    2u32
                 } else {
                     self.f16bufs.lock().remove(&out);
                     0u32
@@ -785,7 +790,10 @@ impl VkAcc {
             ctx.run_rw(p.pl, ds2, p.pipe, &push, gx, gy, 1, &tile_rds, &[tile_out])?;
             // plans/93: gate→up 독립 병렬화 — 이 타일이 gate이면 다음(up) 배리어 스킵.
             if self.moe_nobar.load(std::sync::atomic::Ordering::Relaxed) {
-                ctx.nobar_next.set(true);
+                // plans/105: 킬스위치(=0) — gate‖up 강제 병행 차단.
+                if std::env::var("LLM170_VK_MOENOBAR").map(|v| v != "0").unwrap_or(true) {
+                    ctx.nobar_next.set(true);
+                }
                 self.moe_nobar.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             if direct {
