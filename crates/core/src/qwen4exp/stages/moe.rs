@@ -45,7 +45,9 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
             *v /= zs;
         }
         let mut idx: Vec<usize> = (0..n_exp).collect();
-        idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        // 107 W11: NaN 로짓이면 partial_cmp None → 패닉. total_cmp는 NaN에도
+        // 전순서를 주므로 결정론 유지(기존 finite 경로와 동일 순서).
+        idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
         let sel = &idx[..n_used];
         let mut wsum: f32 = sel.iter().map(|&e| logits[e]).sum();
         wsum = wsum.max(6.103_515_6e-5);
@@ -61,8 +63,9 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
     let mut out = vec![vec![0.0f32; n_embd]; t];
     let trace = llm170_diag::dump::opts().key("q4_trace");
     if trace && route.iter().flatten().any(|x| !x.is_finite()) {
-        eprintln!("# NaN route logits (입력은 finite여야 함)");
-        std::process::exit(101);
+        // 107 W11: 서버 전 슬롯 사망(exit 101) 대신 보고 후 지속 —
+        // NaN 전파는 가드 하류(nan_guard)와 게이트가 잡는다.
+        eprintln!("# NaN route logits (입력은 finite여야 함) — 보고 후 지속");
     }
     // 디코드 t=1 빠른 경로: 선택 전문가들의 gate·up가 동일 입력 — 그룹 1호출로
     // 2×n_used회 왕복을 1회로 (실측 병목: 전문가당 GPU 왕복 1,440회/스텝).
@@ -265,11 +268,9 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
             if trace {
                 if gate_y.iter().flatten().any(|x| !x.is_finite()) {
                     eprintln!("# NaN expert e={e} gate_y (t={})", gate_y.len());
-                    std::process::exit(101);
                 }
                 if eout.iter().flatten().any(|x| !x.is_finite()) {
                     eprintln!("# NaN expert e={e} eout");
-                    std::process::exit(101);
                 }
             }
             for ((ti, w), eo) in list.iter().zip(eout.iter()) {

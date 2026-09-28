@@ -277,7 +277,8 @@ impl Engine4 {
             for (ti, row) in v.iter().enumerate() {
                 if row.iter().any(|x| !x.is_finite()) {
                     eprintln!("# NaN발견 layer={il} {tag} token={ti} t={}", row.len());
-                    std::process::exit(101);
+                    // 107 W11: exit(101) 제거 — 전 슬롯 사망 대신 보고.
+                    return;
                 }
             }
         };
