@@ -147,7 +147,11 @@ pub(super) fn frame_forward_ex(
         if il < 4 || std::env::var_os("LLM170_CK_ALL").is_some() {
             frame_ck(acc, f.res_hc, hc * n, t, &format!("L{il}.res_in"));
         }
-        if llm170_diag::dump::opts().bufhash {
+        // 107 W10: il=0 스킵 — 진입 전 버퍼(.mix·mids 등)는 아직 한 번도
+        // 안 쓰인 미초기화 메모리라 해시가 할당기 잔재로 흔들린다. il≥1은
+        // 전층 산출물이라 결정적(15,067줄 중 단 1줄 wobble 실측 근거).
+        // 진입 전 임베딩 상태는 L0B.res_hc가 아니라 L1B.res_hc로 커버.
+        if il > 0 && llm170_diag::dump::opts().bufhash {
             // 앞 min(t,16)행만 해시 — 서로 다른 t 실행에서 공유 접두 행을
             // 맞대기 위한 캡(plans/80 §A).
             let rows16 = t.min(16);
