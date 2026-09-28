@@ -600,7 +600,12 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
             llm170_gguf::GgmlType::Iq4Nl => llm170_core::quant::dot_row_w4a8_iq4nl_lane(row, n_in as u64, &y),
             llm170_gguf::GgmlType::Q3K => llm170_core::quant::dot_row_w4a8_q3k_lane(row, n_in as u64, &y),
             llm170_gguf::GgmlType::Iq3S => llm170_core::quant::dot_row_w4a8_iq3s_lane(row, n_in as u64, &y),
-            _ => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Q5_1 => llm170_core::quant::dot_row_w4a8_q5_1_lane(row, n_in as u64, &y),
+            llm170_gguf::GgmlType::Iq4Xs => llm170_core::quant::dot_row_w4a8_iq4xs_lane(row, n_in as u64, &y),
+            other => {
+                eprintln!("gemv 미지원 타입 {other:?} — 미러 오계산 방지");
+                return ExitCode::FAILURE;
+            }
         };
         if c.to_bits() != g[o].to_bits() {
             mism += 1;

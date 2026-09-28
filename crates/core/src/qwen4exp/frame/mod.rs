@@ -28,6 +28,18 @@ use crate::matmul::{Accelerator, FrameOp, FrameState};
 use crate::quant::dequant_row;
 use std::collections::HashMap;
 
+/// HCF16 hc_up f16 경로 게이트 (LLM170_VK_HCF16=1 엄격 옵트인).
+/// 원장 85: 승격 미실증(0.08nat·위치1 플립) — 전 경로 기본 OFF로
+/// 단일 해석. 107 P0-2: 이전엔 forward(기본 ON)·multi/np(기본 OFF)가
+/// 같은 env를 다르게 읽어 np↔순차 파리티가 기본값만으로 파손됐다.
+/// LazyLock 캐시로 핫패스 env 판독도 1회로 축소.
+pub fn hcf16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("LLM170_VK_HCF16").as_deref() == Ok("1")
+    });
+    *ON
+}
+
 /// 프레임 버퍼 집합 — 활성화(스텝 공용) + 상태(시퀀스별) + 상수 가중치.
 /// np 배치 디코드용 행 뷰 핸들 — per-seq 상태 op에 넘긴다(초기화 1회).
 pub struct NpViews {

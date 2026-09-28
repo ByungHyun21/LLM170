@@ -924,6 +924,14 @@ perm_pad[0..4]={:?} inv_pad[0..4]={:?} tile[0..4]={:?} off[0..4]={:?}",
         Ok(())
     }
 
+    /// 명시 no-op(107 P0-3): hip frame_moe_gemm은 quant_cache로 GEMM
+    /// 시점 자체 정량 — 사전 팩 버퍼를 소비하지 않는다. 트레이트 기본이
+    /// Err이므로 이 오버라이드는 "불필요함을 확인한 응답"이지 조용한
+    /// 성공 보고가 아니다.
+    fn frame_quant_pack(&self, _x: u64, _rows: usize, _n_in: usize) -> Result<(), String> {
+        Ok(())
+    }
+
 
 }
 

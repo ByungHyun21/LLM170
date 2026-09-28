@@ -1211,9 +1211,10 @@ impl VkCtx {
         }
         ts.n.set(0);
         ts.labels.borrow_mut().clear();
+        // 107 P0-5: 스탬프는 TS_CAP(262144)까지 기록되는데 리셋이 8192
+        // 고정이면 초과분이 스테일 잔존한다 — 실제 기록량 n 전체를 리셋.
         unsafe {
-            self.device
-                .reset_query_pool(ts.pool, 0, 8192)
+            self.device.reset_query_pool(ts.pool, 0, n as u32)
         };
     }
 }
@@ -1275,16 +1276,6 @@ impl VkCtx {
         }
     }
 
-thread_local! {
-    static DSC_MISS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-thread_local! {
-    /// plans/93: run() 순수 녹화 시간 누적(µs) — 호스트 병목 국소화.
-    pub static RUN_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    pub static RUN_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    pub static WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    pub static SUBMIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
     pub fn bind_ds(&mut self, p: &Pipes, bufs: &[vk::Buffer]) -> Result<vk::DescriptorSet, String> {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
             let key = (
