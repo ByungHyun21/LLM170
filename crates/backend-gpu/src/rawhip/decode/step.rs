@@ -771,16 +771,14 @@ impl DecodeState {
                     // 프리필 핀(plans/84 A): flash 패밀리도 통일 — np≤128 단일패스와
                     // np>128 split의 환원 순서가 어긋나 청크 경계 수치가 갈린다.
                     if np_
-                        > std::env::var("LLM170_QSA_TH")
-                            .ok()
+                        > llm170_diag::flag::val("LLM170_QSA_TH")
                             .and_then(|v| v.parse::<i32>().ok())
                             .unwrap_or(128)
                         || self.pin_prefill.get()
                     {
                         // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
-                        // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 줄어든다.
-                        let sg = std::env::var("LLM170_QSA_SEG")
-                            .ok()
+                        // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 준어든다.
+                        let sg = llm170_diag::flag::val("LLM170_QSA_SEG")
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(1024usize)
                             .max(64);
