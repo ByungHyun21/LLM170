@@ -1269,7 +1269,6 @@ pub(super) fn moe_frame(
         // 프리필: (토큰,전문가) 페어 행 gather → 3회 스택 GEMM → scatter
         fs.frame_moe_gather(f.mix, f.mxsel, n, k_sel, t).map_err(Q4Error::Io)?;
         // plans/105(원장 80): mxsel 생산 직후 1회 팩 정량 — llmmq(B-팩) 소비.
-        use crate::matmul::FrameState as _FQ;
         acc.frame_quant_pack(f.mxsel, t * k_sel, n).map_err(Q4Error::Io)?;
         // plans/104 — 공유전문가 GEMM 체인을 라우팅 창에 인접 발행(격리 xq2).
         // 라우팅 체인(mxsel·xq·mgu/mup/my·mout)과 버퍼가 완전 분리되어 RW

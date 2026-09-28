@@ -329,8 +329,8 @@ pub fn vk_mmq_check(path: &str, tname: &str, t: usize) -> Result<String, String>
 /// vk-ft32-check (plans/89 P1.2) — fn_tile_f32(f32/BF16 밀집 프리필 타일)의
 /// 실 텐서 CPU 대조. 라우터(ffn_gate_inp, f32)형상으로 게이트 발산 원인 특정.
 pub fn ft32_check(path: &str) -> Result<String, String> {
-    use llm170_core::matmul::FrameState as _FS;
-    use llm170_core::matmul::FrameHost as _FH;
+    #[allow(unused_imports)]
+    use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
     let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let w = model.w4("blk.0.ffn_gate_inp.weight").map_err(|e| e.to_string())?;
@@ -451,6 +451,7 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
 /// 모드("q8_0"|"q5_K")에 해당하는 첫 레이어의 down/gate 스택 텐서로 검증.
 /// plans/102 diag — 밀집 q8_0 타일(tile_q8128) 형상별 타이밍: 실효 GB/s 측정.
 pub fn dense_tile_time(tname: &str, t: usize) -> Result<String, String> {
+    #[allow(unused_imports)]
     use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
     let path = "/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
     let model = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
@@ -809,6 +810,7 @@ fn hf(v: f32) -> u16 {
 pub fn sdot_probe() -> Result<String, String> {
     use std::time::Instant;
     let acc = VkAcc::new()?;
+    #[allow(unused_mut)]
     let mut ctx = acc.ctx.lock();
     let buf = ctx.alloc_host(16)?;
     unsafe {
@@ -3610,7 +3612,7 @@ void main(){ x[gl_GlobalInvocationID.x] = 0xDEADBEEFu; }";
             for r in 0..m_per.min(64) {
                 if f32a || mm32 {
                     let mut st = 4242424242424242u64;
-                    let mut step = |st: &mut u64| {
+                    let step = |st: &mut u64| {
                         *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                         ((*st >> 33) as f32 / 4294967296.0) - 0.5
                     };
@@ -3685,7 +3687,7 @@ pub fn cm8_probe() -> Result<String, String> {
         ctx.bind_bufs(ds2, &[ab.buf, bb.buf, cb.buf]);
         let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
         let cv = unsafe { std::slice::from_raw_parts(cb.ptr as *const i32, 256) };
-        let mut bad = 0;
+        let bad = 0;
         for i in 0..256usize {
             let want = ((i % 256) as u8) as i32;  // B = e_{i%17}? — 항등 아님(단일 열)
             let _ = want;
@@ -3763,7 +3765,7 @@ pub fn cm8_probe() -> Result<String, String> {
         ctx.bind_bufs(ds2, &[dummy.buf, dummy2.buf, vb.buf]);
         let _ = ctx.run(p2, ds2, pipe2, &[], 1, 1, 1);
         let diffs: Vec<i32> = unsafe { std::slice::from_raw_parts(vb.ptr as *const i32, 256) }.to_vec();
-        let bad = diffs.iter().filter(|&&d| d != 0).count();
+        let _bad = diffs.iter().filter(|&&d| d != 0).count();
         eprintln!("[cm8-verify] 행0 {:?} · 기대 [1,2,3,...,16]", &diffs[..16]);
         unsafe { ctx.device.destroy_pipeline(pipe2, None); ctx.device.destroy_pipeline_layout(p2, None); }
     }
@@ -3793,6 +3795,7 @@ pub fn cm8_probe() -> Result<String, String> {
 /// 난수 q/k/v/bg로 단일 (pair, u블록) 수학 검증: 상대오차 <1e-3 판정.
 pub fn gdn_chunk_check() -> Result<String, String> {
     eprintln!("[gdnc] enter");
+    #[allow(unused_imports)]
     use llm170_core::matmul::{FrameHost as _FH, FrameState as _FS};
     let acc = VkAcc::new()?;
     eprintln!("[gdnc] acc ok");
@@ -3828,6 +3831,7 @@ pub fn gdn_chunk_check() -> Result<String, String> {
     acc.frame_write(bh, &bv)?;
     let fb = |h: u64| acc.framebufs.lock().get(&h).map(|b| b.buf).ok_or::<String>("핸들 없음".into());
     eprintln!("[gdnc] buffers ok, scan...");
+    #[allow(unused_mut)]
     let mut ctx = acc.ctx.lock();  // 버퍼 준비 후 락(재진입 교착 방지).
     // (a) 순차 스캔 참조.
     {
@@ -3887,7 +3891,7 @@ pub fn gdn_chunk_check() -> Result<String, String> {
     }
     // 상태도 대조.
     let mut s1 = vec![0f32; hv * d * d];
-    let mut s2 = vec![0f32; hv * d * d];
+    let _s2 = vec![0f32; hv * d * d];
     acc.frame_read(sh, &mut s1)?;
     // 주의: sh는 청크판이 갱신했음 — 스캔 상태는 재실행 필요. 간이: o만.
     for h in [sh, qh, kh, vh, bh, o1, o2] { let _ = acc.frame_free(h); }
