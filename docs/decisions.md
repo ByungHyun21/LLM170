@@ -2993,3 +2993,17 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   — RESF16 ON 대역 유지. 효과는 다중 청크(256 강제)에서 발현:
   청크당 head ≈15ms×중간 n개 절감.
 - 검증: 4게이트 PASS·charhash 일치.
+
+### (108) W1.5-1 완결 — cmdbuf3 이중버퍼·디코드 +3.1% (plans/107, 2026-09-28)
+
+- **구현**(LLM170_VK_DBUF=1 옵트인): end_batch_wait이 DBUF 모드에서
+  직전 보류 대기(fence_b 재사용 전제) → 제출 → **즉시 반환** →
+  cmdbuf2↔cmdbuf3 교대. 호스트는 GPU 실행 중 다음 배치 기록.
+  wait_pending()이 판독/세트해제/재제출 전 완료 보장 — frame_sync
+  (vkacc 전 판독 수렴점)·copy_dev에 배선(원장 106 감사 실행).
+- **측정**(FN vulkan): tg128 디코드 DBUF 17.20/17.30 vs 기본
+  16.61/16.85 t/s — **+3.1%**(군 분리, 기록 중첩 효과). pp512는
+  단일 청크라 중첩 없음(±0.2% 평택 — 예상과 일치).
+- **검증**: DBUF 게이트 PASS + 기본 4게이트 PASS(비활성 시 무영향).
+- 세트 해제는 wait_pending으로 이동(실행 중 참조 방지). stepT는
+  wait=0.00(dbuf)으로 회수 가시화.

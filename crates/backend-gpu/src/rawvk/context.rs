@@ -26,6 +26,12 @@ pub struct VkCtx {
     pub pool: vk::CommandPool,
     pub cmdbuf: vk::CommandBuffer,
     pub cmdbuf2: vk::CommandBuffer,
+    /// 107 W1.5-1 — 이중버퍼 교대용 제3 커맨드 버퍼(기록/실행 중첩).
+    pub cmdbuf3: vk::CommandBuffer,
+    /// 이중버퍼 제출 펜스(단일 fence는 재사용 전 대기 필요).
+    pub fence_b: vk::Fence,
+    /// 미대기 제출 보류 중 — 판독/재제출 전 wait_pending 필수.
+    pub pending_wait: std::cell::Cell<bool>,
     pub fence: vk::Fence,
     pub coop_matrix: bool,
     pub coop_f16_f32: bool,
@@ -234,14 +240,18 @@ impl VkCtx {
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(2),
+                        .command_buffer_count(3),
                 )
                 .map_err(|e| format!("커맨드 버퍼: {e:?}"))?;
             let cmdbuf = cbs[0];
             let cmdbuf2 = cbs[1];
+            let cmdbuf3 = cbs[2]; // 107 W1.5-1 — 교대 기록용
             let fence = device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| format!("펜스: {e:?}"))?;
+            let fence_b = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("펜스B: {e:?}"))?;
 
             // 메모리 타입: DEVICE_LOCAL|HOST_VISIBLE 우선 (APU 대형 캐브아웃 힙 — RADV
             // STRIX_HALO heap1 74GB). GTT 힙(heap0)은 커널 GTT 상한(15.5GB) 미만만 핀 가능해
@@ -276,6 +286,9 @@ impl VkCtx {
                 pool,
                 cmdbuf,
                 cmdbuf2,
+                cmdbuf3,
+                fence_b,
+                pending_wait: std::cell::Cell::new(false),
                 fence,
                 coop_matrix,
                 pipeline_robustness,
@@ -383,6 +396,7 @@ impl VkCtx {
         if self.batching.load(std::sync::atomic::Ordering::Relaxed) {
             self.end_batch_wait()?;
         }
+        self.wait_pending()?;
         unsafe {
             self.device
                 .reset_command_buffer(self.cmdbuf, vk::CommandBufferResetFlags::RELEASE_RESOURCES)
@@ -516,7 +530,34 @@ impl VkCtx {
         Ok(())
     }
 
-    /// 배치 종료 — 일괄 제출·대기.
+    /// 107 W1.5-1 — 보류 제출(이중버퍼) 완료 대기. 판독·세트 해제·재제출
+    /// 전에 호출. 비보류 시 무연산. 세트 해제는 여기서만(실행 중 참조 방지).
+    pub fn wait_pending(&self) -> Result<(), String> {
+        if self.pending_wait.get() {
+            unsafe {
+                self.device
+                    .wait_for_fences(&[self.fence_b], true, u64::MAX)
+                    .map_err(|e| format!("대기B: {e:?}"))?;
+            }
+            self.pending_wait.set(false);
+            if let Some((_, pool)) = self.batch_pool.get() {
+                let sets = std::mem::take(&mut *self.batch_sets.borrow_mut());
+                if !sets.is_empty() {
+                    unsafe {
+                        let _ = self.device.free_descriptor_sets(pool, &sets);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 이중버퍼 모드(LLM170_VK_DBUF=1) — 기록/실행 중첩.
+    fn dbuf(&self) -> bool {
+        llm170_diag::flag::eq1("LLM170_VK_DBUF")
+    }
+
+    /// 배치 종료 — 일괄 제출·대기(이중버퍼 모드는 제출 후 즉시 반환).
     pub fn end_batch_wait(&mut self) -> Result<(), String> {
         if llm170_diag::flag::on("LLM170_VK_RUNTIME") {
             RUN_US.with(|c| {
@@ -540,6 +581,39 @@ impl VkCtx {
         let replaying = self.replay_mode.get();
         self.batching
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 107 W1.5-1 — 이중버퍼: 직전 보류 대기(fence 재사용 전제) 후
+        // 제출만 하고 즉시 반환. 호스트는 다음 배치 기록(교대 버퍼)으로
+        // 진행 — 판독 필요 시 wait_pending이 완료를 보장.
+        if self.dbuf() && !replaying {
+            self.wait_pending()?;
+            unsafe {
+                self.device
+                    .end_command_buffer(self.cmdbuf2)
+                    .map_err(|e| format!("종료2: {e:?}"))?;
+                self.batch_recorded.set(true);
+                self.device
+                    .reset_fences(&[self.fence_b])
+                    .map_err(|e| format!("펜스B 리셋: {e:?}"))?;
+                let cbs = [self.cmdbuf2];
+                let si = vk::SubmitInfo::default().command_buffers(&cbs);
+                self.submits.set(self.submits.get() + 1);
+                self.device
+                    .queue_submit(self.queue, &[si], self.fence_b)
+                    .map_err(|e| format!("제출B: {e:?}"))?;
+            }
+            // 교대: 다음 기록은 반대편 버퍼로.
+            std::mem::swap(&mut self.cmdbuf2, &mut self.cmdbuf3);
+            self.pending_wait.set(true);
+            // [stepT] 계측 유지(대기 0으로 기록).
+            if self.ts.is_some()
+                && let Some(t0) = self.batch_t0.take()
+            {
+                let ops = RUN_N.with(|c| c.replace(0));
+                let rec = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!("[stepT] ops={ops} rec={rec:.2}ms wait=0.00ms(dbuf)");
+            }
+            return Ok(());
+        }
         unsafe {
             if !replaying {
                 self.device
@@ -1361,6 +1435,7 @@ impl Drop for VkCtx {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_fence(self.fence, None);
+            self.device.destroy_fence(self.fence_b, None);
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);

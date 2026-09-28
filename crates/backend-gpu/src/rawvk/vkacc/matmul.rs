@@ -224,6 +224,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         if ctx.batching.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = ctx.end_batch_wait();
         }
+        // 107 W1.5-1: 이중버퍼 모드는 end_batch_wait이 즉시 반환 —
+        // 매핑 판독(frame_read) 전 보류 제출 완료가 필수.
+        let _ = ctx.wait_pending();
     }
     fn frame_read(&self, h: u64, out: &mut [f32]) -> Result<(), String> {
         self.frame_sync();
