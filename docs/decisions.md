@@ -2771,3 +2771,9 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
     (디렉토리 잔여 ISSUES.md뿐) 중단 — q35 계열 모델 복귀 시 3회
     측정으로 쌍 확정·커널 직접 검경 가능. VK_SPLIT_AT 프로브는
     진단 자산으로 상재.
+
+  - **이분 재개 시도(3차)**: 신규 추가 ornith-1.5-35B가 qwen35moe
+    아치로 확인됐으나 로더가 feed_forward_length 하이퍼파라미터를
+    거부해 미지원 — 27B 복귀 또는 qwen35moe 로더 지원 시 3회 측정
+    (K=13/14/15)으로 쌍 확정. VK_SPLIT_AT·race_nocache·LSUM 프로브는
+    상재.
