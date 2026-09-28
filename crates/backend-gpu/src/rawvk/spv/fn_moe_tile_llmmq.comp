@@ -20,7 +20,7 @@ layout(binding = 11) readonly buffer Pm { uint perm[]; };   // 컴팩트(전문�
 layout(binding = 12) readonly buffer Off { uint offv[]; };  // [ne+1]
 layout(push_constant) uniform PC {
     uint n_in; uint n_out; uint per_expert_bytes; uint chunk_words;
-    uint xq_w; uint ne; uint unused;
+    uint xq_w; uint ne; uint row_words_p;
 } pc;
 
 #define BM 64
@@ -177,14 +177,12 @@ void main() {
                     int q = i % BK_STEP;
                     int sb = g + q;
                     uint pr_ = perm[sg + uint(rb)];
-                    uint base = pr_ * pc.xq_w;
-                    float bd = uintBitsToFloat(xq[base + qw + uint(sb)]);
-                    uint qsb2 = qw + (uint(n_in) >> 5);
-                    float bs = float(int(xq[base + qsb2 + uint(sb * 2)])
-                                   + int(xq[base + qsb2 + uint(sb * 2) + 1u]));
-                    buf_bd[q * BN + rb] = vec2(bd, bs);
+                    // 팩 레이아웃(원장 80): [qs8][d f32][Σ u32] 블록당 10워드.
+                    uint pbase = pr_ * pc.row_words_p + uint(sb) * 10u;
+                    buf_bd[q * BN + rb] = vec2(uintBitsToFloat(xq[pbase + 8u]),
+                                               float(int(xq[pbase + 9u])));
                     for (int w = 0; w < 8; w++) {
-                        buf_bq[q * BN + rb][w] = xq[base + uint(sb * 8 + w)];
+                        buf_bq[q * BN + rb][w] = xq[pbase + uint(w)];
                     }
                 }
                 for (int i = live * BK_STEP + int(tid); i < BK_STEP * BN; i += 64) {

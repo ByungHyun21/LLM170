@@ -200,6 +200,53 @@ impl llm170_core::matmul::FrameState for VkAcc {
         self.frame_op(&llm170_core::matmul::FrameOp::MoeWeightedSum { ys, wt, out, k: k_sel, n })
     }
 
+    /// plans/105(원장 80) — mxsel 팩 정량(생산 시점 1회).
+    fn frame_quant_pack(&self, x: u64, rows: usize, n_in: usize) -> Result<(), String> {
+        use llm170_core::matmul::FrameHost;
+        if rows == 0 || n_in == 0 {
+            return Ok(());
+        }
+        let row_words = (n_in >> 5) * 10;
+        let need = rows * row_words * 4;
+        let buf = {
+            let mut g = self.packbufs.lock();
+            if let Some((b, bytes)) = g.0.get(&x) {
+                if *bytes >= need {
+                    *b
+                } else {
+                    let nb = {
+                        let mut ctx = self.ctx.lock();
+                        ctx.alloc(need)?
+                    };
+                    let raw = nb.buf;
+                    let bytes2 = nb.bytes;
+                    g.1.push(nb);   // 구버퍼 보유
+                    g.0.insert(x, (raw, bytes2));
+                    raw
+                }
+            } else {
+                let nb = {
+                    let mut ctx = self.ctx.lock();
+                    ctx.alloc(need)?
+                };
+                let raw = nb.buf;
+                let bytes2 = nb.bytes;
+                g.1.push(nb);
+                g.0.insert(x, (raw, bytes2));
+                raw
+            }
+        };
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        let xb = self.fbuf(x)?;
+        let pq = self.pipeline(&mut ctx, Slot::FnQuantQ8p)?;
+        let dsq = ctx.bind_ds(&pq, &[xb, buf])?;
+        let nblk = n_in >> 5;
+        let pushq = push_u32s(&[n_in as u32, rows as u32, row_words as u32]);
+        ctx.run_rw(pq.pl, dsq, pq.pipe, &pushq, (nblk as u32).div_ceil(64), rows as u32, 1, &[xb], &[buf])?;
+        Ok(())
+    }
+
     /// 상주 MoE GEMM — plans/84 B 슬라이스: 호스트 그룹화(hip 폴백과 동일
     /// 구조) + 디바이스 게더/전문가별 GEMV/스캐터. vk GEMV는 단일 판이라
     /// 전문가별 행수가 패밀리를 갈라놓지 않는다(청크 불변성 안전).
@@ -258,7 +305,10 @@ impl VkAcc {
             && (t == 1 || rows <= 64)
             && std::env::var("LLM170_MOE_IDS2").map(|v| v != "0").unwrap_or(true)
             && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
-        let xq = if ids2_takes {
+        // plans/105(원장 80): 팩 등록 히트 — 상위 정량 스킵(llmmq가 팩 소비).
+        let pack_skip_quant = w.ty == GgmlType::Q4K
+            && self.packbufs.lock().0.contains_key(&x);
+        let xq = if ids2_takes || pack_skip_quant {
             vk::Buffer::null()
         } else if std::env::var("LLM170_VK_Q4KSG1F").map(|v| v == "1").unwrap_or(false) {
             // plans/93: sg1f은 f32 직결 — quant 스킵, f32 버퍼를 그대로 패스.
@@ -650,30 +700,30 @@ impl VkAcc {
             // plans/105 P2: llama mul_mmq 포트(옵트인 LLM170_VK_Q4KLL=1) —
             // BN64 워프타일·전문가당 단일 WG(가중 1회 판독). 근거: llama
             // 노드 타이밍 2897µs/콜 vs 원판 4690µs(원장 75).
-            if w.ty == GgmlType::Q4K
+            let pack_hit = w.ty == GgmlType::Q4K
                 && wbufs.len() == 1
-                // plans/105(원장 76): 기본 ON — 비트동일·pp512 439-466
-                // (mmq 408-441). 킬스위치 =0.
                 && std::env::var("LLM170_VK_Q4KLL").map(|v| v != "0").unwrap_or(true)
-            {
+                && self.packbufs.lock().0.contains_key(&x);
+            if pack_hit {
                 let (offb, pmb) = {
                     let g = self.moe_grp.lock();
                     let g = g.as_ref().unwrap();
                     (g.off.buf, g.perm.buf)
                 };
+                let (xq_ll, _llbytes) = self.packbufs.lock().0.get(&x).unwrap().clone();
                 let pk = self.pipeline(&mut ctx, Slot::FnMoeTileLlmmq)?;
                 let mut pbinds: Vec<vk::Buffer> = vec![wbufs[0]];
                 while pbinds.len() < 8 {
                     pbinds.push(dbuf);
                 }
-                pbinds.push(xq);       // binding 8
+                pbinds.push(xq_ll);    // binding 8 — 팩 버퍼
                 pbinds.push(ob);        // binding 9
                 pbinds.push(dbuf);      // binding 10 (커널 미사용 슬롯 패드)
                 pbinds.push(pmb);       // binding 11
                 pbinds.push(offb);      // binding 12
                 let ds2 = ctx.bind_ds(&pk, &pbinds)?;
-                let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, n_expert_stack as u32, 0u32]);
-                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq, pmb, offb];
+                let push = push_u32s(&[n_in as u32, n_out as u32, per_expert as u32, chunk_words, xq_w as u32, n_expert_stack as u32, ((n_in >> 5) * 10) as u32]);
+                let pkrds: Vec<vk::Buffer> = vec![wbufs[0], xq_ll, pmb, offb];
                 ctx.run_rw(pk.pl, ds2, pk.pipe, &push, (n_out as u32).div_ceil(64), n_expert_stack as u32, 1, &pkrds, &[ob])?;
                 return Ok(());
             }

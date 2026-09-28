@@ -117,6 +117,8 @@ const FN_MOE_TILE_Q4K_PKS_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_pk
 const FN_MOE_TILE_LLMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_llmmq.spv");
 /// plans/105 — llmmq의 q5_1 판(다운 GEMM).
 const FN_MOE_TILE_LL51_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_ll51.spv");
+/// plans/105(원장 80) — mxsel 생산 시점 1회 팩 정량(블록당 10워드).
+const FN_QUANT_Q8P_SPV: &[u8] = include_bytes!("../spv/fn_quant_q8p.spv");
 /// plans/95 P3a — q8_0 34B블록(d f16 + 32×i8) → xq 동일 레이아웃 무손실
 /// 릴레이아웃: 행당 [n_in 바이트 i8][n_in/32 f32 d]. 값·스케일 불변
 /// (f16→f32 확장은 정확). fn_tile_q8mmq의 A측 포맷.
@@ -261,6 +263,7 @@ pub(crate) enum Slot {
     FnMoeTileQ4kPks,
     FnMoeTileLlmmq,
     FnMoeTileLl51,
+    FnQuantQ8p,
     /// plans/95 P1b — 스키니 f32 비트 동일 고속판.
     FnTileF32e,
     /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
@@ -373,6 +376,9 @@ pub struct VkAcc {
     xq2_dev: Mutex<Option<VkBuf>>,
     cm8_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     ks_scratch: Mutex<Option<VkBuf>>,
+    /// plans/105(원장 80) — 팩 정량 레지스트리: mxsel 핸들 → (buf, bytes).
+    /// 성장 시 구버퍼 보유(녹화 중 참조 해제 금지 — 원장 79 사고).
+    packbufs: Mutex<(std::collections::HashMap<u64, (vk::Buffer, usize)>, Vec<VkBuf>)>,
     f16bufs: Mutex<std::collections::HashSet<u64>>,
     gdn_ch_scratch: Mutex<(Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>, Option<VkBuf>)>,
     obuf: Mutex<Option<VkBuf>>,
@@ -545,6 +551,7 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnMoeTileQ4kPks, "moe_tile_q4k_pks", FN_MOE_TILE_Q4K_PKS_SPV, 14, 28),
     (Slot::FnMoeTileLlmmq, "moe_tile_llmmq", FN_MOE_TILE_LLMMQ_SPV, 13, 28),
     (Slot::FnMoeTileLl51, "moe_tile_ll51", FN_MOE_TILE_LL51_SPV, 13, 28),
+    (Slot::FnQuantQ8p, "quant_q8p", FN_QUANT_Q8P_SPV, 2, 12),
     (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (Slot::FnPleGateF16, "ple_gate_f16", FN_PLE_GATE_F16_SPV, 8, 16),
@@ -639,6 +646,7 @@ impl VkAcc {
             xq2_dev: Mutex::new(None),
             cm8_scratch: Mutex::new((None, None, None)),
             ks_scratch: Mutex::new(None),
+            packbufs: Mutex::new((std::collections::HashMap::new(), Vec::new())),
             f16bufs: Mutex::new(std::collections::HashSet::new()),
             gdn_ch_scratch: Mutex::new((None, None, None, None, None)),
             obuf: Mutex::new(None),
