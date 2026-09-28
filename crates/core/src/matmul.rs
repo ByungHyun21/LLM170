@@ -744,6 +744,11 @@ pub trait FrameHost: Send + Sync {
     fn frame_mm_group(&self, _x: u64, _ws: &[Weight], _outs: &[u64], _t: usize) -> Result<(), String> {
         Err("frame_mm_group: 미지원".into())
     }
+    /// plans/104 — 격리 quant 버퍼 판(공유전문가 병렬 체인). 미지원 백엔드는
+    /// 일반 그룹으로 폴백(산술 동일).
+    fn frame_mm_group_sep(&self, x: u64, ws: &[Weight], outs: &[u64], t: usize) -> Result<(), String> {
+        self.frame_mm_group(x, ws, outs, t)
+    }
     /// plans/101 P1 — f16 packed 출력 GEMM(HC gate 축 전용).
     fn frame_mm_hout(&self, x: u64, w: &Weight, out: u64, t: usize) -> Result<(), String> {
         self.frame_mm(x, w, out, t)
