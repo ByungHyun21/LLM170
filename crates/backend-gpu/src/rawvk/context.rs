@@ -577,6 +577,11 @@ impl VkCtx {
                     let _ = self.device.free_descriptor_sets(pool, &sets);
                 }
             }
+            // 107 RACE-DIAG(원장 90 프로브 2): 배치마다 ds 캐시 무효화 —
+            // 캐시가 오염원이면 이것으로 결정론 회복. 세트 누수 감수(진단).
+            if llm170_diag::dump::opts().key("race_nocache") {
+                self.ds_cache.borrow_mut().clear();
+            }
         }
         Ok(())
     }
