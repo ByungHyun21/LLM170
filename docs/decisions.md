@@ -3034,3 +3034,16 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - **플랜 107 종결 선언**: P0 9건·W1-W8·W10-W12 전 항목 실행 또는
   측정 종결. 잔여는 전부 외부(레이스 장비·glslc) 또는 명시 보류.
   게이트 4종+DBUF 5종 PASS·charhash 15,674·preflight 5/5.
+
+### (110) scripts/ 1회 실험 스크립트 아카이브 (plans/107 W7-계보, 2026-09-29)
+
+- **보류 7종 → archive/**: make_tiny4(소형 모델 생성·모델 복귀로 무의미)
+  ·collect_q4/compare 대상 수집(q4 비공존 종결)·ab_bench(A/B 중앙값
+  — 벤치 자체 reps로 대체 가능하나 참조 0으로 보류)·check_hip_syntax
+  (경고 허용 시점 유용성 재평가)·np_decompose(np 절편 분해·종결)
+  ·patch_llamaspec(본인 주석에 "폐기")·postrun-verify(재부팅 1회성).
+- **유지 판정**: verify.py(서버 표면·postrun이 참조)·verify_serve/
+  verify_vl/verify_tok(README 골 매트릭스 문서)·verify_np_self
+  (np 자기일관성 — np 경로 변경 시 필수)·stress-flake(레이스 재현
+  자산)·logit-diff(품질 게이트)·bench_np(np4 측정)·scorecard.
+- 기준: 참조 0 + 실험 종결 + 재사용 가능성 없음. archive는 삭제 아님.
