@@ -2,8 +2,16 @@
 //! 본체는 backend-gpu(rawhip 프로브 fn, rawvk check fn)에 있고 여기는
 //! 인자 파싱+호출만. 결론난 A/B 하니스(batch-abtest·tree-test·q6k-abtest·
 //! exp-ab)는 2026-09-08 폐기.
-
 use std::process::ExitCode;
+
+/// 위치 인자 규약 헬퍼 (plans/109 P5) — `args[i] | default` 파싱이
+/// 디스패치 전체에 ~30번 손베껴져 있었다. 프로브 전용(경로/텐서명/수치).
+fn arg_str(args: &[String], i: usize, d: &str) -> String {
+    args.get(i).cloned().unwrap_or_else(|| d.into())
+}
+fn arg_num<T: std::str::FromStr>(args: &[String], i: usize, d: T) -> T {
+    args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d)
+}
 
 /// 프로브 커맨드이면 실행해 Some(코드) 반환, 아니면 None.
 pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
@@ -14,61 +22,36 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let d_27 = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
     let d_q35 = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
     let r: Result<String, String> = match cmd {
-        "gpu-raw-probe" => {
-            let iters: usize = std::env::args()
-                .nth(2)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2000);
-            llm170_backend_gpu::rawhip::raw_probe(iters)
-        }
-        "launch-rate" => {
-            let iters: usize = std::env::args()
-                .nth(2)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20000);
-            llm170_backend_gpu::rawhip::launch_rate(iters)
-        }
+        "gpu-raw-probe" => llm170_backend_gpu::rawhip::raw_probe(arg_num(
+            args, 0, 2000,
+        )),
+        "launch-rate" => llm170_backend_gpu::rawhip::launch_rate(arg_num(
+            args, 0, 20000,
+        )),
         "f16-bench" => {
-            let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
-            llm170_backend_gpu::rawhip::f16_bench(a(0, 128), a(1, 2560), a(2, 640), a(3, 20))
+            llm170_backend_gpu::rawhip::f16_bench(arg_num(args, 0, 128), arg_num(args, 1, 2560), arg_num(args, 2, 640), arg_num(args, 3, 20))
         }
         "q4k-bench" => {
-            let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
-            llm170_backend_gpu::rawhip::q4k_bench(a(0, 128), a(1, 2560), a(2, 640), a(3, 20))
+            llm170_backend_gpu::rawhip::q4k_bench(arg_num(args, 0, 128), arg_num(args, 1, 2560), arg_num(args, 2, 640), arg_num(args, 3, 20))
         }
         "q4k-micro" => llm170_backend_gpu::rawhip::q4k_micro(),
         "q4-d2h-bench" => llm170_backend_gpu::rawhip::d2h_bench(),
         "q5-1-bench" => {
-            let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
-            llm170_backend_gpu::rawhip::q5_1_bench(a(0, 20), a(1, 640), a(2, 2560), a(3, 50))
+            llm170_backend_gpu::rawhip::q5_1_bench(arg_num(args, 0, 20), arg_num(args, 1, 640), arg_num(args, 2, 2560), arg_num(args, 3, 50))
         }
-        "q4-qsa-check" => {
-            let t = args
-                .first()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(200usize);
-            let np = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(200usize);
-            llm170_backend_gpu::rawhip::q4acc::qsa_check(t, np)
-        }
-        "q4-hc-check" => {
-            let t = args
-                .first()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(230usize);
-            let n = args
-                .get(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2560usize);
-            let hc = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4usize);
-            llm170_backend_gpu::rawhip::q4acc::hc_check(t, n, hc)
-        }
+        "q4-qsa-check" => llm170_backend_gpu::rawhip::q4acc::qsa_check(
+            arg_num(args, 0, 200usize),
+            arg_num(args, 1, 200usize),
+        ),
+        "q4-hc-check" => llm170_backend_gpu::rawhip::q4acc::hc_check(
+            arg_num(args, 0, 230usize),
+            arg_num(args, 1, 2560usize),
+            arg_num(args, 2, 4usize),
+        ),
         "q4-ple-check" => llm170_backend_gpu::rawhip::q4acc::ple_gate_check(),
-        "q4-ar-check" => {
-            let t = args.first().and_then(|v| v.parse().ok()).unwrap_or(1usize);
-            llm170_backend_gpu::rawhip::q4acc::ar_check_t(t)
-        }
+        "q4-ar-check" => llm170_backend_gpu::rawhip::q4acc::ar_check_t(arg_num(args, 0, 1usize)),
         "q4-acc-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
+            let path = arg_str(args, 0, d_fn);
             if args.first().map(String::as_str) == Some("micro") {
                 return Some(match llm170_backend_gpu::rawhip::q4acc::micro_check() {
                     Ok(s) => {
@@ -81,12 +64,9 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     }
                 });
             }
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_gate_exps.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2usize);
-            let rows = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(256usize);
+            let tn = arg_str(args, 1, "blk.0.ffn_gate_exps.weight");
+            let t = arg_num(args, 2, 2usize);
+            let rows = arg_num(args, 3, 256usize);
             llm170_backend_gpu::rawhip::q4acc::check_tensor(
                 std::path::Path::new(&path),
                 &tn,
@@ -95,13 +75,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             )
         }
         "moe-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_gate_exps.weight".into());
-            let t_a = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16usize);
-            let t_b = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64usize);
+            let path = arg_str(args, 0, d_fn);
+            let tn = arg_str(args, 1, "blk.0.ffn_gate_exps.weight");
+            let t_a = arg_num(args, 2, 16usize);
+            let t_b = arg_num(args, 3, 64usize);
             llm170_backend_gpu::rawhip::q4acc::moe_row_check(
                 std::path::Path::new(&path),
                 &tn,
@@ -110,13 +87,10 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             )
         }
         "mm-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.attn_qkv.weight".into());
-            let t_a = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16usize);
-            let t_b = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64usize);
+            let path = arg_str(args, 0, d_fn);
+            let tn = arg_str(args, 1, "blk.0.attn_qkv.weight");
+            let t_a = arg_num(args, 2, 16usize);
+            let t_b = arg_num(args, 3, 64usize);
             llm170_backend_gpu::rawhip::q4acc::mm_row_check(
                 std::path::Path::new(&path),
                 &tn,
@@ -206,85 +180,61 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             }
         }
         "mmq-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-            let t1 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16usize);
-            let t2 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(208usize);
+            let path = arg_str(args, 0, d_27);
+            let tn = arg_str(args, 1, "blk.0.attn_gate.weight");
+            let t1 = arg_num(args, 2, 16usize);
+            let t2 = arg_num(args, 3, 208usize);
             llm170_backend_gpu::rawhip::mmq_row_check(&path, &tn, t1, t2)
         }
         "hip-dmmv-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ssm_out.weight".into());
+            let path = arg_str(args, 0, d_27);
+            let tn = arg_str(args, 1, "blk.0.ssm_out.weight");
             llm170_backend_gpu::rawhip::hip_dmmv_check(&path, &tn)
         }
         "hip-moe-dmmv-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_gate_exps.weight".into());
+            let path = arg_str(args, 0, d_fn);
+            let tn = arg_str(args, 1, "blk.0.ffn_gate_exps.weight");
             llm170_backend_gpu::rawhip::hip_moe_dmmv_check(&path, &tn)
         }
         "tile-row-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ssm_out.weight".into());
-            let t1 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16usize);
-            let t2 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(208usize);
+            let path = arg_str(args, 0, d_27);
+            let tn = arg_str(args, 1, "blk.0.ssm_out.weight");
+            let t1 = arg_num(args, 2, 16usize);
+            let t2 = arg_num(args, 3, 208usize);
             llm170_backend_gpu::rawhip::tile_row_check(&path, &tn, t1, t2)
         }
         "q6k-ref" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.64.nextn.eh_proj.weight".into());
+            let path = arg_str(args, 0, d_q35);
+            let tn = arg_str(args, 1, "blk.64.nextn.eh_proj.weight");
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
         "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
         "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
         "vk-gemv-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.attn_gate.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+            let path = arg_str(args, 0, d_q35);
+            let tn = arg_str(args, 1, "blk.0.attn_gate.weight");
+            let t = arg_num(args, 2, 1usize);
             llm170_backend_gpu::rawvk::checks::gemv_check(&path, &tn, t)
         }
         "vk-idot-probe" => llm170_backend_gpu::rawvk::checks::idot_probe(),
         "vk-gemv8-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ssm_out.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+            let path = arg_str(args, 0, d_q35);
+            let tn = arg_str(args, 1, "blk.0.ssm_out.weight");
+            let t = arg_num(args, 2, 1usize);
             llm170_backend_gpu::rawvk::checks::gemv8_check(&path, &tn, t)
         }
         "vk-ft32-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
+            let path = arg_str(args, 0, d_fn);
             llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
         "vk-gdn-chunk-check" => llm170_backend_gpu::rawvk::checks::gdn_chunk_check(),
         "vk-ple-mt-check" => {
-            let reps = args.first().and_then(|v| v.parse().ok()).unwrap_or(64usize);
+            let reps = arg_num(args, 0, 64usize);
             llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
         }
         "vk-frame-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_down_shexp.weight".into());
+            let path = arg_str(args, 0, d_fn);
+            let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
             llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
         }
         "subsum-check" => llm170_backend_gpu::rawvk::subsum_check(),

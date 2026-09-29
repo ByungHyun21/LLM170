@@ -3,6 +3,9 @@
 //! PP: 합성 pp 토큰 prefill 시간 → t/s. TG: prefill 후 tg 토큰 디코드 시간 → t/s.
 //! 토큰은 수제 LCG(seed 0x1234_5678, 관례) — rand 금지. 워밍업 1회 + reps 회 측정.
 //! qwen35(MTP --spec 포함)·qwen4exp(--frame 포함) 양쪽 대응.
+//!
+//! 구조 (plans/109 P5): cmd_bench = 인자 파싱·프리플라이트·프롬프트·아키텍처
+//! 판별 → bench_q4 / bench_q35 측정 → median_summary → print_table.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -12,6 +15,33 @@ fn usage_err_bench(msg: &str) -> ExitCode {
         "error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--np K]"
     );
     ExitCode::from(2)
+}
+
+/// 벤치 구성 — 측정 함수(bench_q4/bench_q35)에 한 번에 전달.
+struct BenchCfg {
+    model_path: std::path::PathBuf,
+    backend: String,
+    gpu_runtime: String,
+    pp: usize,
+    tg: usize,
+    reps: usize,
+    ctx: usize,
+    spec_k: usize,
+    np_slots: usize,
+    prompt: Vec<u32>,
+}
+
+/// LCG 합성 프롬프트 — np 측정에서 슬롯마다 **다른 시드**를 줘 프리픽스
+/// 캐시 공유를 배제한다(같은 접두사면 캐시 적중으로 처리량이 부풀려진다).
+fn lcg_prompt(len: usize, seed0: u64) -> Vec<u32> {
+    let mut seed = seed0;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) % 200_000) as u32
+    };
+    (0..len).map(|_| lcg()).collect()
 }
 
 pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
@@ -85,19 +115,6 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if pp + tg + 16 >= ctx {
         return usage_err_bench(&format!("ctx({ctx}) too small for pp({pp})+tg({tg})"));
     }
-
-    // LCG 합성 프롬프트 — np 측정에서 슬롯마다 **다른 시드**를 줘 프리픽스
-    // 캐시 공유를 배제한다(같은 접두사면 캐시 적중으로 처리량이 부풀려진다).
-    fn lcg_prompt(len: usize, seed0: u64) -> Vec<u32> {
-        let mut seed = seed0;
-        let mut lcg = || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((seed >> 33) % 200_000) as u32
-        };
-        (0..len).map(|_| lcg()).collect()
-    }
     // 프롬프트: LLM170_BENCH_TEXT(자연어, Tokenizer 인코딩) 또는 수제 LCG 합성 토큰
     let prompt: Vec<u32> = match std::env::var("LLM170_BENCH_TEXT") {
         Ok(txt) => {
@@ -128,434 +145,486 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    let res: Result<Vec<String>, String> = (|| {
-        let mut lines = Vec::new();
-        if arch.as_deref() == Some("qwen4exp") {
-            let m = llm170_core::qwen4exp::Model4::load(&model_path).map_err(|e| e.to_string())?;
-            let sources = m.part_sources();
-            let eng = llm170_core::qwen4exp::layers::Engine4::new(m, np_slots, ctx);
-            // GPU 부착 — 단일 경로(attach_q4, Strict: bench는 CPU 폴백하지
-            // 않는다 — 폴백 수치가 GPU로 오인된 이력).
-            let want_gpu = crate::engine::q4_gpu_wanted_str(&backend, &gpu_runtime);
-            let mut eng = crate::engine::attach_q4(
-                eng,
-                sources,
-                want_gpu,
-                crate::engine::q4_vk_runtime_str(&gpu_runtime),
-                false,
-                crate::engine::AttachPolicy::Strict,
-            )?;
-            let eos = eng.model.eos;
-            // 워밍업 1회 — 측정 형상과 동일하게(plans/79, llama-bench 정합).
-            {
-                let _ = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
-                let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
-                let _ = llm170_core::qwen35::greedy(&l);
-            }
-            let _ = std::env::var("LLM170_FRAME");
-            // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
-            // 사라졌고, env를 "frame"으로 표기해 GPU 수치로 오인된 이력이 있다.
-            let dev = if want_gpu { " gpu" } else { " cpu" };
-            for r in 0..reps {
-                eng.reset_states();
-                // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
-                let t0 = Instant::now();
-                let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
-                let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-                let mut next = llm170_core::qwen35::greedy(&l);
-                // TG — 프레임 경로는 decode1 내부 분기
-                let t1 = Instant::now();
-                let mut n_gen = 0usize;
-                let mut step = 0usize;
-                // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
-                while n_gen < tg {
-                    // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
-                    next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
-                    // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
-                    // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
-                    n_gen += 1;
-                    step += 1;
-                    if next == eos {
-                        break;
-                    }
-                }
-                let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
-                let fr = dev;
-                lines.push(format!(
-                    "pp{pp}{fr} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
-                    pp as f64 / (pp_ms / 1e3)
-                ));
-                lines.push(format!(
-                    "tg{tg}{fr} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (steps {step}, gen {n_gen})",
-                    n_gen as f64 / (tg_ms / 1e3)
-                ));
-            }
-            // np 슬롯 집계 (np ≥ 2) — 프로토콜: 슬롯별 분리 프롬프트, 전 슬롯
-            // 워밍업 1회(계측 제외), 프리필은 슬롯 순차(서버 슬롯 루프와 동일 순서).
-            if np_slots >= 2 {
-                let prompts: Vec<Vec<u32>> = (0..np_slots)
-                    .map(|s| {
-                        lcg_prompt(
-                            pp,
-                            0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
-                        )
-                    })
-                    .collect();
-                eng.reset_states();
-                for s in 0..np_slots {
-                    let _ = eng
-                        .prefill(s, &prompts[s][..16.min(pp)])
-                        .map_err(|e| e.to_string())?;
-                    let _ = eng.decode1_greedy(s, 1).map_err(|e| e.to_string())?;
-                }
-                eng.reset_states();
-                let t0 = Instant::now();
-                for s in 0..np_slots {
-                    let _ = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
-                }
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                let total = np_slots * pp;
-                lines.push(format!(
-                    "np{np_slots}-pp{pp}{dev} | {ms:8.1} ms | {:7.2} t/s aggregate ({total} tok, disjoint prompts)",
-                    total as f64 / (ms / 1e3)
-                ));
-                let mut next: Vec<u32> = vec![1u32; np_slots];
-                let t1 = Instant::now();
-                for _ in 0..tg {
-                    // plans/80-B: 배치 프레임 디코드(decode_batch_greedy) —
-                    // t=n_slots 행의 단일 forward로 무게 패스 공유. 종전 순차
-                    // decode1_greedy는 슬롯당 53ms×4=212ms/step였다.
-                    next = eng
-                        .decode_batch_greedy(&(0..np_slots).collect::<Vec<_>>(), &next)
-                        .map_err(|e| e.to_string())?;
-                }
-                let ms = t1.elapsed().as_secs_f64() * 1e3;
-                let n_tok = np_slots * tg;
-                lines.push(format!(
-                    "np{np_slots}-tg{tg}{dev} | {ms:8.1} ms | {:7.2} t/s aggregate ({n_tok} tok, {tg} steps)",
-                    n_tok as f64 / (ms / 1e3)
-                ));
-            }
-        } else {
-            let m = llm170_core::qwen35::Model::load(&model_path).map_err(|e| e.to_string())?;
-            // plans/79: --np 플래그가 qwen35 집계도 지휘하게 통일 — 종전엔
-            // LLM170_BENCH_NP env만 읽어 --np 4가 무시됐다(측정 도구 결함).
-            let bench_np0 = np_slots.max(
-                llm170_diag::flag::val("LLM170_BENCH_NP")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1),
-            );
-            let mut eng = llm170_core::qwen35::Engine::new(m, bench_np0, ctx);
-            if spec_k > 0 {
-                eng.mtp_wanted = true;
-            }
-            // GPU 부착 — 단일 경로(attach_q35, Strict: 폴백 수치의 GPU 오인 방지).
-            eng = crate::engine::attach_q35(
-                eng,
-                gpu_runtime == "vulkan",
-                crate::engine::AttachPolicy::Strict,
-            )?;
-            let has_mtp = eng.has_mtp();
-            let spec_desc = if spec_k > 0 && has_mtp {
-                format!(" spec{spec_k}")
-            } else {
-                String::new()
-            };
-            // 워밍업 — llama-bench 프로토콜 정합(plans/79): 측정 전 동일 형상을
-            // 1회 흘린다(64토큰만 데우던 종전 방식은 콜드 상태에서 ours만 불리).
-            {
-                let _ = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
-                let l = eng.decode(&[0], &[1u32]).map_err(|e| e.to_string())?;
-                let _ = llm170_core::qwen35::greedy(&l[0]);
-            }
-            for r in 0..reps {
-                eng.reset_states();
-                let t0 = Instant::now();
-                let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
-                let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-                let mut next = llm170_core::qwen35::greedy(&l);
-                let t1 = Instant::now();
-                let mut n_gen = 0usize;
-                let mut fwd = 0usize;
-                let bench_np = bench_np0;
-                if bench_np > 1 {
-                    // np **프리필 집계** —슬롯별 분리 프롬프트(프리픽스 캐시
-                    // 공유 배제), 전 슬롯 워밍업 1회(계측 제외), 슬롯 순차
-                    // (서버 슬롯 루프와 동일 순서). 종전 np 셀은 프리필 집계가
-                    // 없어 HTTP 측정에 의존했고, 프로토콜 차이로 수치가 어긋났다
-                    // (README 374 = 단일 스트림 값). 여기서 같은 엔진 API로 잰다.
-                    let prompts: Vec<Vec<u32>> = (0..bench_np)
-                        .map(|s| {
-                            lcg_prompt(
-                                pp,
-                                0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
-                            )
-                        })
-                        .collect();
-                    eng.reset_states();
-                    for s in 0..bench_np {
-                        let _ = eng
-                            .prefill(s, &prompts[s][..16.min(pp)])
-                            .map_err(|e| e.to_string())?;
-                        let _ = eng.decode_greedy(s, 1).map_err(|e| e.to_string())?;
-                    }
-                    eng.reset_states();
-                    let t_pp = Instant::now();
-                    for s in 0..bench_np {
-                        let _ = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
-                    }
-                    let el = t_pp.elapsed().as_secs_f64() * 1e3;
-                    let total = bench_np * pp;
-                    lines.push(format!(
-                        "pp{pp} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg ({total} tok, disjoint)",
-                        total as f64 / (el / 1e3)
-                    ));
-                }
-                if bench_np > 1 && spec_k == 0 {
-                    // plans/79: np 디코드 집계(qwen4exp 판 미러) — 전 슬롯 프리필은
-                    // 계측 제외, 슬롯 순차 t=1 디코드로 tg·np 토큰 생성.
-                    let prompts: Vec<Vec<u32>> = (0..bench_np)
-                        .map(|s2| {
-                            lcg_prompt(
-                                pp,
-                                0x9e37_79b9_u64.wrapping_add((s2 as u64 + 1) * 0x9e37_79b9),
-                            )
-                        })
-                        .collect();
-                    eng.reset_states();
-                    for s2 in 0..bench_np {
-                        let _ = eng.prefill(s2, &prompts[s2]).map_err(|e| e.to_string())?;
-                    }
-                    let seqs: Vec<usize> = (0..bench_np).collect();
-                    let mut next: Vec<u32> = vec![1u32; bench_np];
-                    let mut n_gen = 0usize;
-                    let t_np = Instant::now();
-                    for _ in 0..tg {
-                        // 서버 슬롯 루프와 동일한 다중 시퀀스 배치 디코드(decode) —
-                        // 순차 decode1은 np 집계 프로토콜이 아니다(4배 느림).
-                        let lg = eng.decode(&seqs, &next).map_err(|e| e.to_string())?;
-                        for s2 in 0..bench_np {
-                            next[s2] = llm170_core::qwen35::greedy(&lg[s2]);
-                            n_gen += 1;
-                        }
-                    }
-                    let el = t_np.elapsed().as_secs_f64() * 1e3;
-                    lines.push(format!(
-                        "np{bench_np}-tg{tg} | rep{r} | {el:8.1} ms | {:7.2} t/s aggregate (gen {n_gen})",
-                        n_gen as f64 / (el / 1e3)
-                    ));
-                }
-                if spec_k > 0 && has_mtp && bench_np > 1 {
-                    // np×spec — per-seq 독립 스펙(LLM170_SPEC_PERSEQ=1) 또는 병합(기본)
-                    // 병합 경로(spec_step_multi)는 verify_batch_ms 가중치 상각은
-                    // 좋으나 수용률이 붕괴(kept=1)한다. per-seq는 가중치를 n_seq회
-                    // 읽지만 수용률이 단일 스트림 수준(1-3)으로 회복된다.
-                    let per_seq = std::env::var_os("LLM170_SPEC_PERSEQ").is_some();
-                    let mut nexts: Vec<u32> = vec![llm170_core::qwen35::greedy(&l); bench_np];
-                    let mut done: Vec<usize> = vec![0; bench_np];
-                    let mut total_gen = 0usize;
-                    while total_gen < tg * bench_np {
-                        if per_seq {
-                            let mut any = false;
-                            for s2 in 0..bench_np {
-                                if done[s2] >= tg {
-                                    continue;
-                                }
-                                any = true;
-                                let (toks, _tf) = eng
-                                    .spec_step(s2, nexts[s2], spec_k)
-                                    .map_err(|e| e.to_string())?;
-                                for &t in &toks {
-                                    if done[s2] >= tg {
-                                        break;
-                                    }
-                                    nexts[s2] = t;
-                                    done[s2] += 1;
-                                    total_gen += 1;
-                                }
-                            }
-                            if !any {
-                                break;
-                            }
-                        } else {
-                            let active: Vec<usize> =
-                                (0..bench_np).filter(|&s2| done[s2] < tg).collect();
-                            if active.is_empty() {
-                                break;
-                            }
-                            let ns: Vec<u32> = active.iter().map(|&s2| nexts[s2]).collect();
-                            let acc = eng
-                                .spec_step_multi(&active, &ns, spec_k)
-                                .map_err(|e| e.to_string())?;
-                            for (i, &s2) in active.iter().enumerate() {
-                                for &t2 in &acc[i] {
-                                    if done[s2] >= tg {
-                                        break;
-                                    }
-                                    nexts[s2] = t2;
-                                    done[s2] += 1;
-                                    total_gen += 1;
-                                }
-                            }
-                        }
-                    }
-                    let el = t1.elapsed().as_secs_f64() * 1e3;
-                    lines.push(format!(
-                        "tg{tg} spec{spec_k} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {total_gen})",
-                        total_gen as f64 / (el / 1e3)
-                    ));
-                } else if spec_k > 0 && has_mtp {
-                    while n_gen < tg {
-                        let (toks, tf) =
-                            eng.spec_step(0, next, spec_k).map_err(|e| e.to_string())?;
-                        fwd += tf;
-                        for &t in &toks {
-                            if n_gen >= tg {
-                                break;
-                            }
-                            if llm170_diag::dump::opts().key("spec_dump") {
-                                eprintln!("SPEC_TOK {t}");
-                            }
-                            next = t;
-                            n_gen += 1;
-                        }
-                    }
-                } else if bench_np > 1 {
-                    // np 집계(스펙 없음) — llama-server np4 슬롯과 동일 조건으로
-                    // 전 슬롯에 같은 프롬프트를 프리필한 뒤(집계 시간 제외)
-                    // 배치 디코드로 tg*bench_np 생성.
-                    // P7.1(plans/92): 셀 진입 전 전 슬롯 리셋+재프리필 — 종전엔
-                    // pp·np-tg 셀의 캐리오버 상태 위에 슬롯1..3만 append
-                    // 프리필하고 슬롯0 pp의 stale 토큰으로 시드해 슬롯0 스트림이
-                    // 갈림 → 부분 EOS → act.retain t=4→2 축소(측정 결함).
-                    eng.reset_states();
-                    let mut next_fresh = next;
-                    for s in 0..bench_np {
-                        let l = eng.prefill(s, &prompt).map_err(|e| e.to_string())?;
-                        if s == 0 {
-                            next_fresh = llm170_core::qwen35::greedy(&l);
-                        }
-                    }
-                    let t_np = Instant::now();
-                    let mut nexts: Vec<u32> = vec![next_fresh; bench_np];
-                    let mut act: Vec<usize> = (0..bench_np).collect();
-                    while n_gen < tg * bench_np {
-                        let ns: Vec<u32> = act.iter().map(|&s| nexts[s]).collect();
-                        // np greedy — logits 전사 회피 (plans/74 N1)
-                        let l = eng.decode_np_greedy(&act, &ns).map_err(|e| e.to_string())?;
-                        let mut eos: Vec<usize> = Vec::new();
-                        for (i, &s) in act.iter().enumerate() {
-                            nexts[s] = l[i];
-                            n_gen += 1;
-                            if nexts[s] == 248044 {
-                                eos.push(s);
-                            }
-                        }
-                        // EOS 시퀀스 퇴출(집계 지속) — 남은 시퀀스만 다음 배치 참여
-                        if !eos.is_empty() && eos.len() < act.len() {
-                            act.retain(|s| !eos.contains(s));
-                        }
-                    }
-                    let el = t_np.elapsed().as_secs_f64() * 1e3;
-                    lines.push(format!(
-                        "tg{tg} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {n_gen})",
-                        n_gen as f64 / (el / 1e3)
-                    ));
-                    continue;
-                } else {
-                    while n_gen < tg {
-                        next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
-                        if llm170_diag::dump::opts().key("spec_dump") {
-                            eprintln!("SPEC_TOK {next}");
-                        }
-                        n_gen += 1;
-                        fwd += 1;
-                        if next == 248044 {
-                            break;
-                        }
-                    }
-                }
-                let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
-                lines.push(format!(
-                    "pp{pp}{spec_desc} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
-                    pp as f64 / (pp_ms / 1e3)
-                ));
-                lines.push(format!(
-                    "tg{tg}{spec_desc} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (fwd {fwd}, gen {n_gen}, {:.2} tok/fwd)",
-                    n_gen as f64 / (tg_ms / 1e3),
-                    n_gen as f64 / fwd.max(1) as f64
-                ));
-            }
-        }
-        // 108 P2 — reps 중앙값 요약: 라벨(" | rep" 이전)별 t/s를 모아
-        // 중앙값·스프레드 한 줄 추가. 런간 편차 ±1.7%(원장 98)가 +0.6%급
-        // A/B 차이를 못 가리는 판별 프로토콜.
-        {
-            use std::collections::BTreeMap;
-            let mut by_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-            for l in &lines {
-                let Some((label, rest)) = l.split_once("| rep") else {
-                    continue;
-                };
-                // "0 | 412.3 ms | 412.33 t/s ..." → 마지막 t/s 직전 수치.
-                let Some(v) = rest
-                    .split("t/s")
-                    .next()
-                    .and_then(|s| s.rsplit('|').next())
-                    .and_then(|s| s.split_whitespace().last())
-                    .and_then(|s| s.parse::<f64>().ok())
-                else {
-                    continue;
-                };
-                by_label
-                    .entry(label.trim_end().to_string())
-                    .or_default()
-                    .push(v);
-            }
-            for (label, mut vals) in by_label {
-                if vals.len() < 2 {
-                    continue;
-                }
-                vals.sort_by(|a, b| a.total_cmp(b));
-                let mid = vals.len() / 2;
-                let median = if vals.len() % 2 == 1 {
-                    vals[mid]
-                } else {
-                    (vals[mid - 1] + vals[mid]) / 2.0
-                };
-                let spread = (vals[vals.len() - 1] - vals[0]).abs() / median * 100.0;
-                lines.push(format!(
-                    "{label} | median x{} | {:7.2} t/s (spread {spread:.1}%)",
-                    vals.len(),
-                    median
-                ));
-            }
-        }
-        Ok(lines)
-    })();
-
-    match res {
-        Ok(lines) => {
-            println!("model            | test         |       time |        rate");
-            println!("-----------------+--------------+-----------+------------");
-            let short = model_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let bemark = if backend == "gpu" {
-                format!("gpu:{gpu_runtime}")
-            } else {
-                "cpu".into()
-            };
-            for l in &lines {
-                // "pp512 | rep0 | ..." → 앞부분 파싱해 정렬
-                println!("{:16} | {}", format!("{short}[{bemark}]"), l);
-            }
-            ExitCode::SUCCESS
-        }
+    let cfg = BenchCfg {
+        model_path,
+        backend,
+        gpu_runtime,
+        pp,
+        tg,
+        reps,
+        ctx,
+        spec_k,
+        np_slots,
+        prompt,
+    };
+    let mut lines = match if arch.as_deref() == Some("qwen4exp") {
+        bench_q4(&cfg)
+    } else {
+        bench_q35(&cfg)
+    } {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    median_summary(&mut lines);
+    print_table(&lines, &cfg);
+    ExitCode::SUCCESS
+}
+
+/// qwen4exp 측정 — Engine4 prefill/decode1 greedy + np 배치.
+fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
+    let BenchCfg {
+        model_path,
+        backend,
+        gpu_runtime,
+        pp,
+        tg,
+        reps,
+        ctx,
+        spec_k: _,
+        np_slots,
+        prompt,
+    } = cfg;
+    let mut lines = Vec::new();
+    let m = llm170_core::qwen4exp::Model4::load(model_path).map_err(|e| e.to_string())?;
+    let sources = m.part_sources();
+    let eng = llm170_core::qwen4exp::layers::Engine4::new(m, *np_slots, *ctx);
+    // GPU 부착 — 단일 경로(attach_q4, Strict: bench는 CPU 폴백하지
+    // 않는다 — 폴백 수치가 GPU로 오인된 이력).
+    let want_gpu = crate::engine::q4_gpu_wanted_str(backend, gpu_runtime);
+    let mut eng = crate::engine::attach_q4(
+        eng,
+        sources,
+        want_gpu,
+        crate::engine::q4_vk_runtime_str(gpu_runtime),
+        false,
+        crate::engine::AttachPolicy::Strict,
+    )?;
+    let eos = eng.model.eos;
+    // 워밍업 1회 — 측정 형상과 동일하게(plans/79, llama-bench 정합).
+    {
+        let _ = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
+        let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
+        let _ = llm170_core::qwen35::greedy(&l);
+    }
+    let _ = std::env::var("LLM170_FRAME");
+    // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
+    // 사라졌고, env를 "frame"으로 표기해 GPU 수치로 오인된 이력이 있다.
+    let dev = if want_gpu { " gpu" } else { " cpu" };
+    for r in 0..*reps {
+        eng.reset_states();
+        // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
+        let t0 = Instant::now();
+        let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
+        let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let mut next = llm170_core::qwen35::greedy(&l);
+        // TG — 프레임 경로는 decode1 내부 분기
+        let t1 = Instant::now();
+        let mut n_gen = 0usize;
+        let mut step = 0usize;
+        // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
+        while n_gen < *tg {
+            // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
+            next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
+            // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
+            // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
+            n_gen += 1;
+            step += 1;
+            if next == eos {
+                break;
+            }
+        }
+        let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let fr = dev;
+        lines.push(format!(
+            "pp{pp}{fr} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
+            *pp as f64 / (pp_ms / 1e3)
+        ));
+        lines.push(format!(
+            "tg{tg}{fr} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (steps {step}, gen {n_gen})",
+            n_gen as f64 / (tg_ms / 1e3)
+        ));
+    }
+    // np 슬롯 집계 (np ≥ 2) — 프로토콜: 슬롯별 분리 프롬프트, 전 슬롯
+    // 워밍업 1회(계측 제외), 프리필은 슬롯 순차(서버 슬롯 루프와 동일 순서).
+    if *np_slots >= 2 {
+        let prompts: Vec<Vec<u32>> = (0..*np_slots)
+            .map(|s| {
+                lcg_prompt(
+                    *pp,
+                    0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
+                )
+            })
+            .collect();
+        eng.reset_states();
+        for s in 0..*np_slots {
+            let _ = eng
+                .prefill(s, &prompts[s][..16.min(*pp)])
+                .map_err(|e| e.to_string())?;
+            let _ = eng.decode1_greedy(s, 1).map_err(|e| e.to_string())?;
+        }
+        eng.reset_states();
+        let t0 = Instant::now();
+        for s in 0..*np_slots {
+            let _ = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let total = np_slots * pp;
+        lines.push(format!(
+            "np{np_slots}-pp{pp}{dev} | {ms:8.1} ms | {:7.2} t/s aggregate ({total} tok, disjoint prompts)",
+            total as f64 / (ms / 1e3)
+        ));
+        let mut next: Vec<u32> = vec![1u32; *np_slots];
+        let t1 = Instant::now();
+        for _ in 0..*tg {
+            // plans/80-B: 배치 프레임 디코드(decode_batch_greedy) —
+            // t=n_slots 행의 단일 forward로 무게 패스 공유. 종전 순차
+            // decode1_greedy는 슬롯당 53ms×4=212ms/step였다.
+            next = eng
+                .decode_batch_greedy(&(0..*np_slots).collect::<Vec<_>>(), &next)
+                .map_err(|e| e.to_string())?;
+        }
+        let ms = t1.elapsed().as_secs_f64() * 1e3;
+        let n_tok = np_slots * tg;
+        lines.push(format!(
+            "np{np_slots}-tg{tg}{dev} | {ms:8.1} ms | {:7.2} t/s aggregate ({n_tok} tok, {tg} steps)",
+            n_tok as f64 / (ms / 1e3)
+        ));
+    }
+    Ok(lines)
+}
+
+/// qwen35 측정 — spec 단일/np·병합·per-seq 변형 + np 집계.
+fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
+    let BenchCfg {
+        model_path,
+        backend: _,
+        gpu_runtime,
+        pp,
+        tg,
+        reps,
+        ctx,
+        spec_k,
+        np_slots,
+        prompt,
+    } = cfg;
+    let mut lines = Vec::new();
+    let m = llm170_core::qwen35::Model::load(model_path).map_err(|e| e.to_string())?;
+    // plans/79: --np 플래그가 qwen35 집계도 지휘하게 통일 — 종전엔
+    // LLM170_BENCH_NP env만 읽어 --np 4가 무시됐다(측정 도구 결함).
+    let bench_np0 = (*np_slots).max(
+        llm170_diag::flag::val("LLM170_BENCH_NP")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+    );
+    let mut eng = llm170_core::qwen35::Engine::new(m, bench_np0, *ctx);
+    if *spec_k > 0 {
+        eng.mtp_wanted = true;
+    }
+    // GPU 부착 — 단일 경로(attach_q35, Strict: 폴백 수치의 GPU 오인 방지).
+    eng = crate::engine::attach_q35(
+        eng,
+        gpu_runtime == "vulkan",
+        crate::engine::AttachPolicy::Strict,
+    )?;
+    let has_mtp = eng.has_mtp();
+    let spec_desc = if *spec_k > 0 && has_mtp {
+        format!(" spec{spec_k}")
+    } else {
+        String::new()
+    };
+    // 워밍업 — llama-bench 프로토콜 정합(plans/79): 측정 전 동일 형상을
+    // 1회 흘린다(64토큰만 데우던 종전 방식은 콜드 상태에서 ours만 불리).
+    {
+        let _ = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
+        let l = eng.decode(&[0], &[1u32]).map_err(|e| e.to_string())?;
+        let _ = llm170_core::qwen35::greedy(&l[0]);
+    }
+    for r in 0..*reps {
+        eng.reset_states();
+        let t0 = Instant::now();
+        let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
+        let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let mut next = llm170_core::qwen35::greedy(&l);
+        let t1 = Instant::now();
+        let mut n_gen = 0usize;
+        let mut fwd = 0usize;
+        let bench_np = bench_np0;
+        if bench_np > 1 {
+            // np **프리필 집계** —슬롯별 분리 프롬프트(프리픽스 캐시
+            // 공유 배제), 전 슬롯 워밍업 1회(계측 제외), 슬롯 순차
+            // (서버 슬롯 루프와 동일 순서). 종전 np 셀은 프리필 집계가
+            // 없어 HTTP 측정에 의존했고, 프로토콜 차이로 수치가 어긋났다
+            // (README 374 = 단일 스트림 값). 여기서 같은 엔진 API로 잰다.
+            let prompts: Vec<Vec<u32>> = (0..bench_np)
+                .map(|s| {
+                    lcg_prompt(
+                        *pp,
+                        0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
+                    )
+                })
+                .collect();
+            eng.reset_states();
+            for s in 0..bench_np {
+                let _ = eng
+                    .prefill(s, &prompts[s][..16.min(*pp)])
+                    .map_err(|e| e.to_string())?;
+                let _ = eng.decode_greedy(s, 1).map_err(|e| e.to_string())?;
+            }
+            eng.reset_states();
+            let t_pp = Instant::now();
+            for s in 0..bench_np {
+                let _ = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
+            }
+            let el = t_pp.elapsed().as_secs_f64() * 1e3;
+            let total = bench_np * pp;
+            lines.push(format!(
+                "pp{pp} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg ({total} tok, disjoint)",
+                total as f64 / (el / 1e3)
+            ));
+        }
+        if bench_np > 1 && *spec_k == 0 {
+            // plans/79: np 디코드 집계(qwen4exp 판 미러) — 전 슬롯 프리필은
+            // 계측 제외, 슬롯 순차 t=1 디코드로 tg·np 토큰 생성.
+            let prompts: Vec<Vec<u32>> = (0..bench_np)
+                .map(|s2| {
+                    lcg_prompt(
+                        *pp,
+                        0x9e37_79b9_u64.wrapping_add((s2 as u64 + 1) * 0x9e37_79b9),
+                    )
+                })
+                .collect();
+            eng.reset_states();
+            for s2 in 0..bench_np {
+                let _ = eng.prefill(s2, &prompts[s2]).map_err(|e| e.to_string())?;
+            }
+            let seqs: Vec<usize> = (0..bench_np).collect();
+            let mut next: Vec<u32> = vec![1u32; bench_np];
+            let mut n_gen = 0usize;
+            let t_np = Instant::now();
+            for _ in 0..*tg {
+                // 서버 슬롯 루프와 동일한 다중 시퀀스 배치 디코드(decode) —
+                // 순차 decode1은 np 집계 프로토콜이 아니다(4배 느림).
+                let lg = eng.decode(&seqs, &next).map_err(|e| e.to_string())?;
+                for s2 in 0..bench_np {
+                    next[s2] = llm170_core::qwen35::greedy(&lg[s2]);
+                    n_gen += 1;
+                }
+            }
+            let el = t_np.elapsed().as_secs_f64() * 1e3;
+            lines.push(format!(
+                "np{bench_np}-tg{tg} | rep{r} | {el:8.1} ms | {:7.2} t/s aggregate (gen {n_gen})",
+                n_gen as f64 / (el / 1e3)
+            ));
+        }
+        if *spec_k > 0 && has_mtp && bench_np > 1 {
+            // np×spec — per-seq 독립 스펙(LLM170_SPEC_PERSEQ=1) 또는 병합(기본)
+            // 병합 경로(spec_step_multi)는 verify_batch_ms 가중치 상각은
+            // 좋으나 수용률이 붕괴(kept=1)한다. per-seq는 가중치를 n_seq회
+            // 읽지만 수용률이 단일 스트림 수준(1-3)으로 회복된다.
+            let per_seq = std::env::var_os("LLM170_SPEC_PERSEQ").is_some();
+            let mut nexts: Vec<u32> = vec![llm170_core::qwen35::greedy(&l); bench_np];
+            let mut done: Vec<usize> = vec![0; bench_np];
+            let mut total_gen = 0usize;
+            while total_gen < tg * bench_np {
+                if per_seq {
+                    let mut any = false;
+                    for s2 in 0..bench_np {
+                        if done[s2] >= *tg {
+                            continue;
+                        }
+                        any = true;
+                        let (toks, _tf) = eng
+                            .spec_step(s2, nexts[s2], *spec_k)
+                            .map_err(|e| e.to_string())?;
+                        for &t in &toks {
+                            if done[s2] >= *tg {
+                                break;
+                            }
+                            nexts[s2] = t;
+                            done[s2] += 1;
+                            total_gen += 1;
+                        }
+                    }
+                    if !any {
+                        break;
+                    }
+                } else {
+                    let active: Vec<usize> =
+                        (0..bench_np).filter(|&s2| done[s2] < *tg).collect();
+                    if active.is_empty() {
+                        break;
+                    }
+                    let ns: Vec<u32> = active.iter().map(|&s2| nexts[s2]).collect();
+                    let acc = eng
+                        .spec_step_multi(&active, &ns, *spec_k)
+                        .map_err(|e| e.to_string())?;
+                    for (i, &s2) in active.iter().enumerate() {
+                        for &t2 in &acc[i] {
+                            if done[s2] >= *tg {
+                                break;
+                            }
+                            nexts[s2] = t2;
+                            done[s2] += 1;
+                            total_gen += 1;
+                        }
+                    }
+                }
+            }
+            let el = t1.elapsed().as_secs_f64() * 1e3;
+            lines.push(format!(
+                "tg{tg} spec{spec_k} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {total_gen})",
+                total_gen as f64 / (el / 1e3)
+            ));
+        } else if *spec_k > 0 && has_mtp {
+            while n_gen < *tg {
+                let (toks, tf) = eng
+                    .spec_step(0, next, *spec_k)
+                    .map_err(|e| e.to_string())?;
+                fwd += tf;
+                for &t in &toks {
+                    if n_gen >= *tg {
+                        break;
+                    }
+                    if llm170_diag::dump::opts().key("spec_dump") {
+                        eprintln!("SPEC_TOK {t}");
+                    }
+                    next = t;
+                    n_gen += 1;
+                }
+            }
+        } else if bench_np > 1 {
+            // np 집계(스펙 없음) — llama-server np4 슬롯과 동일 조건으로
+            // 전 슬롯에 같은 프롬프트를 프리필한 뒤(집계 시간 제외)
+            // 배치 디코드로 tg*bench_np 생성.
+            // P7.1(plans/92): 셀 진입 전 전 슬롯 리셋+재프리필 — 종전엔
+            // pp·np-tg 셀의 캐리오버 상태 위에 슬롯1..3만 append
+            // 프리필하고 슬롯0 pp의 stale 토큰으로 시드해 슬롯0 스트림이
+            // 갈림 → 부분 EOS → act.retain t=4→2 축소(측정 결함).
+            eng.reset_states();
+            let mut next_fresh = next;
+            for s in 0..bench_np {
+                let l = eng.prefill(s, prompt).map_err(|e| e.to_string())?;
+                if s == 0 {
+                    next_fresh = llm170_core::qwen35::greedy(&l);
+                }
+            }
+            let t_np = Instant::now();
+            let mut nexts: Vec<u32> = vec![next_fresh; bench_np];
+            let mut act: Vec<usize> = (0..bench_np).collect();
+            while n_gen < tg * bench_np {
+                let ns: Vec<u32> = act.iter().map(|&s| nexts[s]).collect();
+                // np greedy — logits 전사 회피 (plans/74 N1)
+                let l = eng.decode_np_greedy(&act, &ns).map_err(|e| e.to_string())?;
+                let mut eos: Vec<usize> = Vec::new();
+                for (i, &s) in act.iter().enumerate() {
+                    nexts[s] = l[i];
+                    n_gen += 1;
+                    if nexts[s] == 248044 {
+                        eos.push(s);
+                    }
+                }
+                // EOS 시퀀스 퇴출(집계 지속) — 남은 시퀀스만 다음 배치 참여
+                if !eos.is_empty() && eos.len() < act.len() {
+                    act.retain(|s| !eos.contains(s));
+                }
+            }
+            let el = t_np.elapsed().as_secs_f64() * 1e3;
+            lines.push(format!(
+                "tg{tg} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {n_gen})",
+                n_gen as f64 / (el / 1e3)
+            ));
+            continue;
+        } else {
+            while n_gen < *tg {
+                next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
+                if llm170_diag::dump::opts().key("spec_dump") {
+                    eprintln!("SPEC_TOK {next}");
+                }
+                n_gen += 1;
+                fwd += 1;
+                if next == 248044 {
+                    break;
+                }
+            }
+        }
+        let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
+        lines.push(format!(
+            "pp{pp}{spec_desc} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
+            *pp as f64 / (pp_ms / 1e3)
+        ));
+        lines.push(format!(
+            "tg{tg}{spec_desc} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (fwd {fwd}, gen {n_gen}, {:.2} tok/fwd)",
+            n_gen as f64 / (tg_ms / 1e3),
+            n_gen as f64 / fwd.max(1) as f64
+        ));
+    }
+    Ok(lines)
+}
+
+/// 108 P2 — reps 중앙값 요약: 라벨(" | rep" 이전)별 t/s를 모아
+/// 중앙값·스프레드 한 줄 추가. 런간 편차 ±1.7%(원장 98)가 +0.6%급
+/// A/B 차이를 못 가리는 판별 프로토콜.
+fn median_summary(lines: &mut Vec<String>) {
+    use std::collections::BTreeMap;
+    let mut by_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for l in lines.iter() {
+        let Some((label, rest)) = l.split_once("| rep") else {
+            continue;
+        };
+        // "0 | 412.3 ms | 412.33 t/s ..." → 마지막 t/s 직전 수치.
+        let Some(v) = rest
+            .split("t/s")
+            .next()
+            .and_then(|s| s.rsplit('|').next())
+            .and_then(|s| s.split_whitespace().last())
+            .and_then(|s| s.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        by_label
+            .entry(label.trim_end().to_string())
+            .or_default()
+            .push(v);
+    }
+    for (label, mut vals) in by_label {
+        if vals.len() < 2 {
+            continue;
+        }
+        vals.sort_by(|a, b| a.total_cmp(b));
+        let mid = vals.len() / 2;
+        let median = if vals.len() % 2 == 1 {
+            vals[mid]
+        } else {
+            (vals[mid - 1] + vals[mid]) / 2.0
+        };
+        let spread = (vals[vals.len() - 1] - vals[0]).abs() / median * 100.0;
+        lines.push(format!(
+            "{label} | median x{} | {:7.2} t/s (spread {spread:.1}%)",
+            vals.len(),
+            median
+        ));
+    }
+}
+
+/// llama-bench형 표 출력.
+fn print_table(lines: &[String], cfg: &BenchCfg) {
+    println!("model            | test         |       time |        rate");
+    println!("-----------------+--------------+-----------+------------");
+    let short = cfg
+        .model_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let bemark = if cfg.backend == "gpu" {
+        format!("gpu:{}", cfg.gpu_runtime)
+    } else {
+        "cpu".into()
+    };
+    for l in lines {
+        // "pp512 | rep0 | ..." → 앞부분 파싱해 정렬
+        println!("{:16} | {}", format!("{short}[{bemark}]"), l);
     }
 }
