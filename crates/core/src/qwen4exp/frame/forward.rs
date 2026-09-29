@@ -476,6 +476,12 @@ pub(crate) fn frame_forward_ex(
         sync_mark(acc, &format!("L{il}.ffn_combine"), f.res_hc)?;
     }
     frame_ck(acc, f.res_hc, hc * n, t, "head.res");
+    // P15④c: pre-mixer res_hc 행 반출 — MTP 드래프트 h 입력(비스펙은 스킵).
+    if f.mtp_h_export {
+        let mut rows = vec![0.0f32; t * hc * n];
+        acc.frame_read(f.res_hc, &mut rows).map_err(Q4Error::Io)?;
+        f.last_res_hc_rows = rows.chunks(hc * n).map(|c| c.to_vec()).collect();
+    }
 
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
     {

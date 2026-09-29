@@ -166,6 +166,11 @@ pub struct Frame4 {
     pub consts: HashMap<String, u64>,
     /// 시퀀스별 값 경로 prefill 이후 상태 재동기 필요 플래그.
     pub dirty: Vec<bool>,
+    /// P15④c: MTP h export — true면 매 forward 종료 시 pre-mixer res_hc 행을
+    /// d2h로 반출한다(드래프트 h 입력). 비스펙 실행의 d2h 비용 0 유지.
+    pub mtp_h_export: bool,
+    /// 직전 forward의 pre-mixer res_hc 행 [t][hc·n](mtp_h_export 시에만).
+    pub last_res_hc_rows: Vec<Vec<f32>>,
 }
 
 fn alloc(acc: &dyn Accelerator, len: usize) -> Result<u64, Q4Error> {
@@ -311,6 +316,8 @@ impl Frame4 {
             st_conv: Vec::with_capacity(seqs.len()),
             consts: HashMap::new(),
             dirty: vec![true; seqs.len()],
+            mtp_h_export: false,
+            last_res_hc_rows: Vec::new(),
         };
         // 107 W8 (원장 112): PLE 스크래치는 첫 PLE 층 실행 전엔 미기입 —
         // 할당 잔재가 진단 해시를 흔든다(L1B.ple_gate 간헐 발산 — 페이지
