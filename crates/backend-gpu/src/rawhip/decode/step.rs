@@ -381,8 +381,8 @@ impl DecodeState {
                             64,
                             &mut args,
                         )?;
-
-                    } else {                        // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
+                    } else {
+                        // 부록88 기본: 축스왑(u블록 인접) — k/q L2 국소성 +1.1% (350-354)
                         if il == self.trace_il() && llm170_diag::dump::opts().key("ms_dump") {
                             let gl = self.dt_rank * self.d_state * self.d_state;
                             let mut st = vec![0f32; gl];
@@ -694,10 +694,7 @@ impl DecodeState {
                     // 구간 병렬화; LLM170_NO_QSA_SPLIT으로 원경로)
                     // 프리필 핀(plans/84 A): flash 패밀리도 통일 — np≤128 단일패스와
                     // np>128 split의 환원 순서가 어긋나 청크 경계 수치가 갈린다.
-                    if np_
-                        > 128
-                        || self.pin_prefill.get()
-                    {
+                    if np_ > 128 || self.pin_prefill.get() {
                         // 세그먼트 기본 1024 (2026-09-12 실측): 128→1024 로 pp3314 331.9→339.5 t/s,
                         // pp512 359.9→362.8. part 중간버퍼 트래픽이 세그먼트 수에 비례해 준어든다.
                         let sg = 1024usize; // 세그먼트 기본(2026-09-12 실측)
@@ -856,30 +853,30 @@ impl DecodeState {
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
 
-                // 기본: 직렬 — 2스트림 페어는 join2(이벤트) 오버헤드가 이득을 넘는다
-                // (2026-09-12 A/B: 직렬 +0.75%, LLM170_PP_PAIRS=1로 페어 복원).
-                self.mm_b2(
-                    self.xn_t,
-                    self.xq_n_t,
-                    xq_sn,
-                    wg,
-                    tg,
-                    nig,
-                    nog,
-                    self.fgate_t,
-                    t,
-                )?;
-                self.mm_b2(
-                    self.xn_t,
-                    self.xq_n_t,
-                    xq_sn,
-                    wu,
-                    tu,
-                    niu,
-                    nou,
-                    self.fup_t,
-                    t,
-                )?;
+            // 기본: 직렬 — 2스트림 페어는 join2(이벤트) 오버헤드가 이득을 넘는다
+            // (2026-09-12 A/B: 직렬 +0.75%, LLM170_PP_PAIRS=1로 페어 복원).
+            self.mm_b2(
+                self.xn_t,
+                self.xq_n_t,
+                xq_sn,
+                wg,
+                tg,
+                nig,
+                nog,
+                self.fgate_t,
+                t,
+            )?;
+            self.mm_b2(
+                self.xn_t,
+                self.xq_n_t,
+                xq_sn,
+                wu,
+                tu,
+                niu,
+                nou,
+                self.fup_t,
+                t,
+            )?;
             if il <= self.trace_il() {
                 self.trace_rows(&format!("tr{il}_fgate"), self.fgate_t, self.n_ff, t)?;
                 self.trace_rows(&format!("tr{il}_fup"), self.fup_t, self.n_ff, t)?;

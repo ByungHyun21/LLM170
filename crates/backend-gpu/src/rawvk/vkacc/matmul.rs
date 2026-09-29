@@ -801,10 +801,8 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let wbufs = self.weight_bufs(&mut ctx, w)?;
         // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로(dense_mm와 동일
         // 판·동일 수치 클래스). gemv3 t-루프는 512토큰에서 ~50ms 직렬.
-        if t >= 2
-            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
-            && wbufs.len() == 1
-        { // MBTILE+CM 승격 — =0 복원 plans/109 P6 삭제
+        if t >= 2 && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && wbufs.len() == 1 {
+            // MBTILE+CM 승격 — =0 복원 plans/109 P6 삭제
             let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             while binds.len() < 8 {
@@ -1100,9 +1098,7 @@ impl VkAcc {
                     // plans/89 P0.2 — 디코드(t<16) 밀집 GEMV를 llama dmmv
                     // 포트(q8b/q4b)로: f32 활성 직결(quant 불필요), 64스레드
                     // 2행 WG. [ts] 기준선 gemv 77ms/step — 272-329GB/s급으로
-                    if t < 16
-                        && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)?
-                    {
+                    if t < 16 && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)? {
                         continue;
                     }
                     let dense_tile = t >= 2

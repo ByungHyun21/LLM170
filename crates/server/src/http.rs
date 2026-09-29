@@ -376,7 +376,6 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
     }
 }
 
-
 /// 슬롯 잡 enqueue 공통 (plans/109 P5) — 채널 쌍 생성·SlotJob 조립·큐 송신.
 /// Err면 이미 503(queue full) 응답을 썼다. 반환: (최종 결과 수신기, 스트림
 /// 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
@@ -446,7 +445,8 @@ fn run_and_emit(
         );
         return;
     }
-    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, stream_mode) else {
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, stream_mode)
+    else {
         return;
     };
     if !stream_mode {

@@ -174,13 +174,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
 /// infer JSONL 싱크 — 토큰마다 {"seq","pos","token","text"} 1행.
 struct InferSink;
 impl crate::engine::TokenSink for InferSink {
-    fn on_token(
-        &mut self,
-        s: usize,
-        pos: u32,
-        t: u32,
-        eng: &llm170_core::qwen35::Engine,
-    ) {
+    fn on_token(&mut self, s: usize, pos: u32, t: u32, eng: &llm170_core::qwen35::Engine) {
         println!(
             "{{\"seq\":{s},\"pos\":{pos},\"token\":{t},\"text\":{}}}",
             crate::json::quoted(&eng.piece(t))

@@ -110,8 +110,6 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     sign | h as u16
 }
 
-
-
 pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
 }
