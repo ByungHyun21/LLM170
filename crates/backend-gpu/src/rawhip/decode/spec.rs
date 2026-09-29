@@ -1055,27 +1055,16 @@ impl DecodeState {
                 if il == 0 {
                     self.trace_rows("ms_gconv", self.gconv_t, conv_ch, t)?;
                 }
-                // split3 공유
-                {
-                    let mut sp = self.gconv_t as *mut std::ffi::c_void;
-                    let mut q0 = self.gq_t as *mut std::ffi::c_void;
-                    let mut q1 = self.gk_t as *mut std::ffi::c_void;
-                    let mut q2 = self.gv_t as *mut std::ffi::c_void;
-                    let mut n0 = k_len as i32;
-                    let mut n1 = k_len as i32;
-                    let mut n2 = v_len as i32;
-                    let total = (2 * k_len + v_len) * t;
-                    let mut args = vec![
-                        Self::p(&mut sp),
-                        Self::p(&mut q0),
-                        Self::p(&mut q1),
-                        Self::p(&mut q2),
-                        Self::p(&mut n0),
-                        Self::p(&mut n1),
-                        Self::p(&mut n2),
-                    ];
-                    self.ew_l("split3", total, &mut args)?;
-                }
+                // split3 공유 — 공용 헬퍼(plans/109 P10)
+                self.gdn_split3(
+                    self.gconv_t,
+                    self.gq_t,
+                    self.gk_t,
+                    self.gv_t,
+                    k_len,
+                    v_len,
+                    Some(t),
+                )?;
                 // l2 공유
                 {
                     let scale = 1.0f32 / (self.d_state as f32).sqrt();
