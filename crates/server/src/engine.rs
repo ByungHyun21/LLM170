@@ -878,6 +878,9 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         .min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> =
                         slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
+                    // P15⑥: 마지막 프리필 청크 판정 — 드래프트 프리필은 이
+                    // 청크의 h 행(last_res_hc_rows)만 유효라 여기서만 적립.
+                    let part_is_last = end == slots[i].job.as_ref().unwrap().tokens.len();
                     // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
@@ -893,13 +896,25 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             })
                             .map_err(|e| e.to_string()),
                         Engine::Q4(e) => {
-                            if samp {
+                            let r = if samp {
                                 e.prefill(i, &part)
                                     .map(|l| pick(&mut slots[i], &l))
                                     .map_err(|e| e.to_string())
                             } else {
                                 e.prefill_greedy(i, &part).map_err(|e| e.to_string())
+                            };
+                            // P15⑥: 마지막 프리필 청크 직후 드래프트 프리필 —
+                            // 값경로만 h 행을 생산(GPU frame은 ④c). 멀티청크는
+                            // 마지막 청크 행만 유효 → 그 청크분만 적립.
+                            if part_is_last
+                                && e.model.has_mtp()
+                                && let Err(err) = e.mtp_draft_prefill(i, &part)
+                            {
+                                // 멀티청크 행 불일치 등: 드래프트 프리필
+                                // 생략은 품질 저하일 뿐 정확성 무영향.
+                                eprintln!("# mtp prefill 생략({err})");
                             }
+                            r
                         }
                     };
                     (end, r)
