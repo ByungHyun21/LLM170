@@ -223,8 +223,14 @@ fn run_q4_infer(
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
             let mut next: Vec<u32> = Vec::with_capacity(n);
+            let k_spec = spec_k.unwrap_or(0);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
+                // P15④: 드래프트 프리필 — 타깃 h 행 전체로 드래프트 KV 적립
+                // (스펙 의도일 때만; 값경로 last_h_rows 사용).
+                if k_spec > 0 && eng.model.has_mtp() {
+                    eng.mtp_draft_prefill(s, p).map_err(|e| e.to_string())?;
+                }
                 let t = llm170_core::qwen35::greedy(&l);
                 println!(
                     "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
@@ -235,7 +241,6 @@ fn run_q4_infer(
                 finished[s] = t == eos;
             }
             let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
-            let k_spec = spec_k.unwrap_or(0);
             let mut spec_stats = (0usize, 0usize); // (수용, forward)
             for _step in 0..n_predict {
                 let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
