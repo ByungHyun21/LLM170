@@ -67,6 +67,20 @@ impl SeqState4 {
     }
 }
 
+impl SeqState4 {
+    /// MTP 드래프트 전용 상태 (plans/109 P15②) — KV/idx 슬롯을 풀어텐션층
+    /// +1(블록 n_layer)로 잡는다. GDN/PLE 슬롯은 미사용(0 유지).
+    pub fn new_mtp(hp: &Hparams4, ctx: usize) -> Self {
+        let mut st = SeqState4::new(hp, ctx);
+        let n_full_mtp = st.kv_k.len() + 1;
+        st.kv_k = vec![vec![0.0; ctx * hp.n_kv * hp.head_dim]; n_full_mtp];
+        st.kv_v = vec![vec![0.0; ctx * hp.n_kv * hp.head_dim]; n_full_mtp];
+        st.idx_k = vec![vec![0.0; ctx * hp.idx_dim]; n_full_mtp];
+        st.idx_bk = vec![Vec::new(); n_full_mtp];
+        st
+    }
+}
+
 pub struct Engine4 {
     pub model: Model4,
     pub seqs: Vec<SeqState4>,
@@ -82,6 +96,11 @@ pub struct Engine4 {
     ple_consume: Option<Vec<Vec<f32>>>,
     /// 프리페치 사이드 스레드 핸들 — 다음 스텝 시작부 조인 (mmap 수명 보장).
     ple_worker: Option<std::thread::JoinHandle<()>>,
+    /// MTP 드래프트 상태 (plans/109 P15②) — mtp_seqs[s]는 블록 n_layer의
+    /// KV/idx 슬롯을 추가 소유. 모델이 load_mtp된 경우에만 생성.
+    pub mtp_seqs: Vec<SeqState4>,
+    /// 직전 forward의 h_nextn(프리-헤드 hidden) — MTP 드래프트 입력용.
+    pub last_h: Vec<f32>,
 }
 
 /// 사이드 스레드가 채운 프리페치 결과 — token이 다음 입력과 일치할 때만 사용.
@@ -172,6 +191,13 @@ impl Engine4 {
         let seqs = (0..n_seqs)
             .map(|_| SeqState4::new(&model.hp, ctx))
             .collect();
+        let mtp_seqs = if model.has_mtp() {
+            (0..n_seqs)
+                .map(|_| SeqState4::new_mtp(&model.hp, ctx))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Engine4 {
             model,
             seqs,
@@ -181,7 +207,231 @@ impl Engine4 {
             ple_next: None,
             ple_consume: None,
             ple_worker: None,
+            mtp_seqs,
+            last_h: Vec::new(),
         }
+    }
+
+    /// MTP 드래프트 스텝 (CPU 참조, plans/109 P15②) — 외장 nextn 블록
+    /// (blk.{n_layer}) 1회 포워드. 입력: 직전 타깃 hidden h(프리-헤드,
+    /// hc_mix_head 출력) + 채택 토큰 x. 출력: 드래프트 로짓 [vocab].
+    /// 산술: qwen3next MTP 패턴(qwen4exp HC 변형) —
+    ///   e=emb(x) → enorm·hnorm → eh_proj([en;hn]) → x̃
+    ///   res_hc = x̃ 방송 → hc_mix(attn) → QSA(블록 n_layer, 자체 KV) →
+    ///   hc_combine → hc_mix(ffn) → MoE → hc_combine →
+    ///   hc_mix(nextn.hc_head) → output(@본체 공유) → logits.
+    /// 드래프트 상태 pos는 호출부가 1씩 진행(mtp_seqs[seq].pos).
+    /// MTP dense 게이트드 어텐션 (plans/109 P15②) — 트렁크 cpu_attn_row와
+    /// 동일 산술(마스크=전체 참석) + q/k norm·rope + KV 적립 + wo.
+    fn mtp_dense_attn(
+        &mut self,
+        seq: usize,
+        il: usize,
+        xs: &[Vec<f32>],
+    ) -> Result<Vec<Vec<f32>>, Q4Error> {
+        let hp = &self.model.hp;
+        let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
+        let wq = self.model.w4(&format!("blk.{il}.attn_q.weight"))?;
+        let wk = self.model.w4(&format!("blk.{il}.attn_k.weight"))?;
+        let wv = self.model.w4(&format!("blk.{il}.attn_v.weight"))?;
+        let wo = self.model.w4(&format!("blk.{il}.attn_output.weight"))?;
+        let qn = self
+            .model
+            .f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
+        let kn = self
+            .model
+            .f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
+        let n_tok = xs.len();
+        let mut qg = vec![vec![0.0f32; wq.n_out as usize]; n_tok];
+        let mut kk = vec![vec![0.0f32; wk.n_out as usize]; n_tok];
+        let mut vv = vec![vec![0.0f32; wv.n_out as usize]; n_tok];
+        {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            let mut gi = vec![
+                std::mem::take(&mut qg),
+                std::mem::take(&mut kk),
+                std::mem::take(&mut vv),
+            ];
+            ctx.mm_group(xs, &[wq, wk, wv], &mut gi)?;
+            qg = std::mem::take(&mut gi[0]);
+            kk = std::mem::take(&mut gi[1]);
+            vv = std::mem::take(&mut gi[2]);
+        }
+        let mtp_st = &mut self.mtp_seqs[seq];
+        let pos0 = mtp_st.pos;
+        let kq_scale = hp.kq_scale();
+        let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
+        for t in 0..n_tok {
+            let pos = pos0 + t as u32;
+            // q: 헤드별 norm+rope(전반 hd) — 게이트 후반은 미가공.
+            for h in 0..n_head {
+                let lo = h * 2 * hd;
+                let mut qh = crate::ops::rms_norm(&qg[t][lo..lo + hd], &qn, hp.eps);
+                crate::ops::rope_head(&mut qh, pos, n_rot, hp.rope_base);
+                qg[t][lo..lo + hd].copy_from_slice(&qh);
+            }
+            // k: kv헤드별 norm+rope → 캐시 적립. v: 원문 그대로.
+            let kbase = pos as usize * n_kv * hd;
+            for h in 0..n_kv {
+                let lo = h * hd;
+                let mut kh = crate::ops::rms_norm(&kk[t][lo..lo + hd], &kn, hp.eps);
+                crate::ops::rope_head(&mut kh, pos, n_rot, hp.rope_base);
+                mtp_st.kv_k[0][kbase + lo..kbase + lo + hd].copy_from_slice(&kh);
+            }
+            mtp_st.kv_v[0][kbase..kbase + n_kv * hd].copy_from_slice(&vv[t]);
+            // dense softmax 어텐션(전체 위치) + 게이트 — cpu_attn_row 열.
+            let n_past = pos as usize + 1;
+            let (ck, cv) = (&mtp_st.kv_k[0], &mtp_st.kv_v[0]);
+            let out = &mut attn_all[t];
+            for h in 0..n_head {
+                let kvh = h / (n_head / n_kv);
+                let mut maxv = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; n_past];
+                for (p, sc) in scores.iter_mut().enumerate() {
+                    let b = p * n_kv * hd + kvh * hd;
+                    let mut d = 0.0f32;
+                    for i in 0..hd {
+                        d += qg[t][h * 2 * hd + i] * ck[b + i];
+                    }
+                    *sc = d * kq_scale;
+                    maxv = maxv.max(*sc);
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - maxv).exp();
+                    sum += *sc;
+                }
+                let ob = h * hd;
+                for (p, sc) in scores.iter().enumerate() {
+                    let w = sc / sum;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let b = p * n_kv * hd + kvh * hd;
+                    for i in 0..hd {
+                        out[ob + i] += w * cv[b + i];
+                    }
+                }
+                let gb = h * 2 * hd + hd;
+                for i in 0..hd {
+                    out[ob + i] *= sigmoid(qg[t][gb + i]);
+                }
+            }
+        }
+        // wo 투영 (대여 분리 — KV 적립 종료 후 새 Ctx).
+        let ctx = Ctx {
+            model: &self.model,
+            acc: None,
+        };
+        let mut out_rows = vec![vec![vec![0.0f32; wo.n_out as usize]; n_tok]; 1];
+        ctx.mm_group(&attn_all, std::slice::from_ref(&wo), &mut out_rows)?;
+        Ok(std::mem::take(&mut out_rows[0]))
+    }
+
+    pub fn mtp_draft_step(&mut self, seq: usize, x: u32, h: &[f32]) -> Result<Vec<f32>, Q4Error> {
+        if !self.model.has_mtp() || self.mtp_seqs.is_empty() {
+            return Err(Q4Error::Io("mtp_draft_step: MTP 미적재".into()));
+        }
+        let hp = &self.model.hp;
+        let (n, hc) = (hp.n_embd, hp.hc);
+        let il = hp.n_layer; // 블록 48
+        let hc_dim = hc * n;
+        // 1) e = emb(x) — 본체 임베딩 공유
+        let embd = self.model.w4("token_embd.weight")?;
+        let mut e = vec![0.0f32; n];
+        dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
+        // 2) enorm/hnorm
+        let en = crate::ops::rms_norm(
+            &e,
+            &self
+                .model
+                .f32_vec4(&format!("blk.{il}.nextn.enorm.weight"))?,
+            hp.eps,
+        );
+        let hn = crate::ops::rms_norm(
+            h,
+            &self
+                .model
+                .f32_vec4(&format!("blk.{il}.nextn.hnorm.weight"))?,
+            hp.eps,
+        );
+        // 3) eh_proj: [en;hn](2n) → x̃(n)
+        let mut cat = vec![0.0f32; 2 * n];
+        cat[..n].clone_from_slice(&en);
+        cat[n..].clone_from_slice(&hn);
+        let weh = self.model.w4(&format!("blk.{il}.nextn.eh_proj.weight"))?;
+        let mut x_t = vec![0.0f32; n];
+        {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            ctx.mm(&cat, &weh, &mut x_t)?;
+        }
+        // 4) res_hc 방송 (트렁크 hc_init와 동일)
+        let mut res_hc: Vec<Vec<f32>> = Vec::with_capacity(1);
+        {
+            let mut r = vec![0.0f32; hc_dim];
+            for s in 0..hc {
+                r[s * n..(s + 1) * n].copy_from_slice(&x_t);
+            }
+            res_hc.push(r);
+        }
+        // 5) 어텐션 반쪽 — MTP 헤드는 **dense** 게이트드 어텐션(llama.cpp
+        // qwen3next MTP 패턴: 인덱서 미사용, compress[48]=0과 일관). 트렁크
+        // qsa의 cpu_attn_row 산술(전체 위치 마스크)과 동일 열.
+        // 대여 분리: 각 스테이지가 스코프 ctx로 self.model만 빌린다.
+        let (mix, inject) = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None, // CPU 참조 — GPU 경로는 ④(frame)에서
+            };
+            stages::hc_mix(&ctx, il, "attn", &res_hc)?
+        };
+        let attn_out = self.mtp_dense_attn(seq, il, &mix)?;
+        hc_combine(&mut res_hc, &attn_out, &inject, hc);
+        // 6) FFN 반쪽 (MoE + shexp)
+        let (mix2, inject2) = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::hc_mix(&ctx, il, "ffn", &res_hc)?
+        };
+        let ffn_out = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::moe_ffn(&ctx, il, &mix2)?
+        };
+        hc_combine(&mut res_hc, &ffn_out, &inject2, hc);
+        // 7) 드래프트 헤드 — nextn.hc_head 믹서 → 본체 output 공유
+        let head_rows = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::hc_mix_nextn_head(&ctx, il, &res_hc)?
+        };
+        let h1 = head_rows.last().ok_or(Q4Error::BadMeta("mtp 빈 헤드"))?;
+        let wout = self
+            .model
+            .w4("output.weight")
+            .map_err(|_| Q4Error::MissingTensor("output.weight".into()))?;
+        let mut logits = vec![0.0f32; wout.n_out as usize];
+        {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            ctx.mm(h1, &wout, &mut logits)?;
+        }
+        self.mtp_seqs[seq].pos += 1;
+        Ok(logits)
     }
 
     pub fn with_acc(mut self, acc: std::sync::Arc<dyn Accelerator>) -> Self {
@@ -379,6 +629,9 @@ impl Engine4 {
         // output HC mix → logits (inject 없음)
         let head_in = stage!(head, stages::hc_mix_head(&ctx, &res_hc)?);
         let last = head_in.last().ok_or(Q4Error::BadMeta("빈 배치"))?.clone();
+        // plans/109 P15②: 마지막 행 h_nextn(프리-헤드 hidden) 공개 — MTP
+        // 드래프트 입력. 기존 소비자 없음(덮어쓰기만).
+        self.last_h = last.clone();
         let wout = self
             .model
             .w("output.weight")
