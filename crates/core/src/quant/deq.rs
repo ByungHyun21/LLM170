@@ -202,6 +202,23 @@ fn deq_q5_1(blk: &[u8], y: &mut [f32]) {
     }
 }
 
+/// q5_0 블록(22B/32원소): d(2) qh(4) qs(16) — ggml dequantize_row_q5_0
+/// 정합(x0/x1 − 16 부호판, 저니블 전반·고니블 후반). P15⑥: Q4_K_M MTP
+/// 모듈의 q5_0 텐서(hc_head_up 등) 지원.
+fn deq_q5_0(blk: &[u8], y: &mut [f32]) {
+    let d = f16(blk, 0);
+    let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+    let qs = &blk[6..22];
+    for j in 0..16 {
+        let xh0 = (((qh >> j) << 4) & 0x10) as i32;
+        let xh1 = ((qh >> (j + 12)) & 0x10) as i32;
+        let x0 = ((qs[j] & 0x0F) as i32 | xh0) - 16;
+        let x1 = ((qs[j] >> 4) as i32 | xh1) - 16;
+        y[j] = x0 as f32 * d;
+        y[16 + j] = x1 as f32 * d;
+    }
+}
+
 /// iq4_xs 블록: d(2) scales_h(2) scales_l(4) qs(128)
 fn deq_iq4_xs(blk: &[u8], y: &mut [f32]) {
     let d = f16(blk, 0);
@@ -379,6 +396,14 @@ pub fn dequant_row(ty: GgmlType, data: &[u8], row: u64, k: u64, out: &mut [f32])
         GgmlType::Q5_1 => {
             for b in 0..blocks {
                 deq_q5_1(
+                    &data[base + b * bsize..][..bsize],
+                    &mut out[b * 32..b * 32 + 32],
+                );
+            }
+        }
+        GgmlType::Q5_0 => {
+            for b in 0..blocks {
+                deq_q5_0(
                     &data[base + b * bsize..][..bsize],
                     &mut out[b * 32..b * 32 + 32],
                 );
