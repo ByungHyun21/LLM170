@@ -51,7 +51,10 @@ impl fmt::Display for GgufError {
             Self::BadArrayType(t) => write!(f, "array element type {t} invalid"),
             Self::BadUtf8(e) => write!(f, "invalid utf8 string: {e}"),
             Self::TensorOutOfBounds { name, end, size } => {
-                write!(f, "tensor '{name}' data [{end}-nbytes, {end}) exceeds file size {size}")
+                write!(
+                    f,
+                    "tensor '{name}' data [{end}-nbytes, {end}) exceeds file size {size}"
+                )
             }
             Self::SplitNoOutOfBounds { no, count } => {
                 write!(f, "split.no {no} >= split.count {count}")

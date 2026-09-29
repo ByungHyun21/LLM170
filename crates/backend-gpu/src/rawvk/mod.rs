@@ -1,10 +1,10 @@
 //! rawvk — Vulkan 백엔드 (plans/12). 모듈 루트.
 
+pub mod checks;
 pub mod context;
 pub mod decoder;
-pub mod checks;
-pub mod vkacc;
 pub mod flashcheck;
+pub mod vkacc;
 
 use context::VkCtx;
 
@@ -37,11 +37,15 @@ pub fn subsum_check() -> Result<String, String> {
 /// split3·conv_t·beta_g·norm_gated·ar — 각 커널 독립 LCG 입력·CPU 미러 대조.
 pub fn gdn_check() -> Result<String, String> {
     use crate::rawvk::context::VkCtx;
-use ash::vk;
+    use ash::vk;
     let mut ctx = VkCtx::new()?;
     let seed = std::cell::Cell::new(0x1234_5678u64);
     let lcg = || {
-        seed.set(seed.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+        seed.set(
+            seed.get()
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        );
         (seed.get() >> 33) as f32 / 2147483648.0 - 0.5
     };
     let lcg_v = |n: usize| -> Vec<f32> { (0..n).map(|_| lcg()).collect() };
@@ -66,9 +70,7 @@ use ash::vk;
         let bbuf = ctx.alloc(256)?;
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr() as *const u8, bbuf.ptr, 256) };
         let cbuf = ctx.alloc_host(256 * 4)?;
-        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/i8probe.spv"), 3, 8,
-        )?;
+        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/i8probe.spv"), 3, 8)?;
         let _ = dsl;
         ctx.bind_bufs(ds, &[abuf.buf, bbuf.buf, cbuf.buf]);
         ctx.run(pl, ds, pipe, &[], 1, 1, 1)?;
@@ -84,12 +86,19 @@ use ash::vk;
                     s += a[m * 16 + k] as i32 * b[n * 16 + k] as i32;
                 }
                 let d = (c[m * 16 + n] - s) as i64;
-                if d != 0 { ok = false; }
+                if d != 0 {
+                    ok = false;
+                }
                 mx = mx.max(d.abs());
             }
         }
         let sample = format!("c00={} c01={} c77={}", c[0], c[1], c[7 * 16 + 7]);
-        lines.push(format!("i8coopmat: {} ({} max|D|={})", if ok { "★" } else { "✗" }, sample, mx));
+        lines.push(format!(
+            "i8coopmat: {} ({} max|D|={})",
+            if ok { "★" } else { "✗" },
+            sample,
+            mx
+        ));
     }
 
     // ── i8 coopmat 프로브2: offset=37·stride=32 비정방 피치 (gemm_i8 실패턴).
@@ -113,9 +122,7 @@ use ash::vk;
         let bbuf = ctx.alloc(b.len())?;
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr() as *const u8, bbuf.ptr, b.len()) };
         let cbuf = ctx.alloc_host(256 * 4)?;
-        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/i8probe2.spv"), 3, 8,
-        )?;
+        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/i8probe2.spv"), 3, 8)?;
         let _ = dsl;
         ctx.bind_bufs(ds, &[abuf.buf, bbuf.buf, cbuf.buf]);
         ctx.run(pl, ds, pipe, &[], 1, 1, 1)?;
@@ -125,19 +132,22 @@ use ash::vk;
             let mut a3 = vec![0i8; 16 * p3 + 16];
             let mut b3 = vec![0i8; 16 * p3 + 16];
             for m in 0..16usize {
-                for k in 0..16usize { a3[m * p3 + k] = ((m as i32 * 5 + k as i32 * 3) % 23 - 11) as i8; }
+                for k in 0..16usize {
+                    a3[m * p3 + k] = ((m as i32 * 5 + k as i32 * 3) % 23 - 11) as i8;
+                }
             }
             for n in 0..16usize {
-                for k in 0..16usize { b3[n * p3 + k] = ((k as i32 - n as i32 * 3) % 17 - 8) as i8; }
+                for k in 0..16usize {
+                    b3[n * p3 + k] = ((k as i32 - n as i32 * 3) % 17 - 8) as i8;
+                }
             }
             let ab3 = ctx.alloc(a3.len())?;
             unsafe { std::ptr::copy_nonoverlapping(a3.as_ptr() as *const u8, ab3.ptr, a3.len()) };
             let bb3 = ctx.alloc(b3.len())?;
             unsafe { std::ptr::copy_nonoverlapping(b3.as_ptr() as *const u8, bb3.ptr, b3.len()) };
             let cbuf3 = ctx.alloc_host(256 * 4)?;
-            let (dsl3, pl3, _dp3, ds3, pipe3) = ctx.pipeline(
-                include_bytes!("spv/i8probe3.spv"), 3, 8,
-            )?;
+            let (dsl3, pl3, _dp3, ds3, pipe3) =
+                ctx.pipeline(include_bytes!("spv/i8probe3.spv"), 3, 8)?;
             let _ = dsl3;
             ctx.bind_bufs(ds3, &[ab3.buf, bb3.buf, cbuf3.buf]);
             ctx.run(pl3, ds3, pipe3, &[], 1, 1, 1)?;
@@ -153,12 +163,19 @@ use ash::vk;
                     }
                     if c3[m * 16 + n] != s {
                         ok3 = false;
-                        if first3.is_empty() { first3 = format!("(m{m},n{n}) got={} want={s}", c3[m * 16 + n]); }
+                        if first3.is_empty() {
+                            first3 = format!("(m{m},n{n}) got={} want={s}", c3[m * 16 + n]);
+                        }
                     }
                 }
             }
             let nz3 = c3.iter().filter(|&&x| x != 0).count();
-            lines.push(format!("i8coopmat3(off0/stride32): {} (nz={} {})", if ok3 { "★" } else { "✗" }, nz3, first3));
+            lines.push(format!(
+                "i8coopmat3(off0/stride32): {} (nz={} {})",
+                if ok3 { "★" } else { "✗" },
+                nz3,
+                first3
+            ));
         }
         let mut c = vec![0i32; 256];
         unsafe { std::ptr::copy_nonoverlapping(cbuf.ptr as *const i32, c.as_mut_ptr(), 256) };
@@ -171,11 +188,20 @@ use ash::vk;
                     s += a[off + m * pitch + k] as i32 * b[off + n * pitch + k] as i32;
                 }
                 let d = (c[m * 16 + n] - s) as i64;
-                if d != 0 { ok = false; }
+                if d != 0 {
+                    ok = false;
+                }
                 mx = mx.max(d.abs());
             }
         }
-        lines.push(format!("i8coopmat2(off37/stride32): {} (c00={} c15={} c51={} max|D|={})", if ok { "★" } else { "✗" }, c[0], c[15], c[5*16+1], mx));
+        lines.push(format!(
+            "i8coopmat2(off37/stride32): {} (c00={} c15={} c51={} max|D|={})",
+            if ok { "★" } else { "✗" },
+            c[0],
+            c[15],
+            c[5 * 16 + 1],
+            mx
+        ));
     }
 
     // ── gemm_i8 미니: n_in=32(n_sub=1), no=16, t=2 — 실 커널 소형 등가검증.
@@ -185,17 +211,29 @@ use ash::vk;
         let n_sub = 1usize;
         // 데이타: w8 [-20,20], wsp/wsm [0.01,0.05], b8 [-100,100], yd/qsum 결정적
         let seed2 = std::cell::Cell::new(42u64);
-        let lcg2 = || { seed2.set(seed2.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)); (seed2.get() >> 33) as i32 };
+        let lcg2 = || {
+            seed2.set(
+                seed2
+                    .get()
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407),
+            );
+            (seed2.get() >> 33) as i32
+        };
         let w8: Vec<i8> = (0..no * n_in).map(|_| (lcg2() % 41 - 20) as i8).collect();
-        let wsp: Vec<f32> = (0..no * n_sub).map(|i| 0.01 + (i % 7) as f32 * 0.005).collect();
-        let wsm: Vec<f32> = (0..no * n_sub).map(|i| 0.02 + (i % 5) as f32 * 0.004).collect();
+        let wsp: Vec<f32> = (0..no * n_sub)
+            .map(|i| 0.01 + (i % 7) as f32 * 0.005)
+            .collect();
+        let wsm: Vec<f32> = (0..no * n_sub)
+            .map(|i| 0.02 + (i % 5) as f32 * 0.004)
+            .collect();
         let mut b8: Vec<i8> = (0..t * n_in).map(|_| (lcg2() % 201 - 100) as i8).collect();
         b8.resize(16 * n_in, 0); // B 로드가 n=0..15 읽음 — 패딩
         let yd: Vec<f32> = (0..t * n_sub).map(|i| 0.012 + i as f32 * 0.003).collect();
         // qsum은 진짜 Σb8이어야 (커널은 버퍼값을 그대로 씀)
-        let qsum: Vec<i32> = (0..t * n_sub).map(|i| {
-            (0..32usize).map(|k| b8[i * n_in + k] as i32).sum()
-        }).collect();
+        let qsum: Vec<i32> = (0..t * n_sub)
+            .map(|i| (0..32usize).map(|k| b8[i * n_in + k] as i32).sum())
+            .collect();
         let mut mk = |v: &[u8]| -> Result<vk::Buffer, String> {
             let b = ctx.alloc(v.len() + 16)?;
             unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), b.ptr, v.len()) };
@@ -225,44 +263,66 @@ use ash::vk;
         let ishsb = ctx.alloc_host(640 * 256 * 4)?;
         let _faccsb = ctx.alloc_host(640 * 256 * 4)?;
         // 센티넬 프리필 — 커널이 실제 쓴 영역 검증
-        unsafe { std::ptr::write_bytes(ishsb.ptr, 0xAB, 640 * 256 * 4); }
-        let (dsl, pl, dp, _ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/gemm_i8.spv"), 16, 16,
-        )?;
+        unsafe {
+            std::ptr::write_bytes(ishsb.ptr, 0xAB, 640 * 256 * 4);
+        }
+        let (dsl, pl, dp, _ds, pipe) = ctx.pipeline(include_bytes!("spv/gemm_i8.spv"), 16, 16)?;
         let _ = dsl;
         let mut binds16 = vec![wbuf; 8];
         let ishs_m = ctx.alloc_host(no.div_ceil(16) * 256 * 4)?;
         let faccs_m = ctx.alloc_host(no.div_ceil(16) * 256 * 4)?;
-        binds16.extend_from_slice(&[b8buf, obuf.buf, wspbuf, wsmbuf, ydbuf, qsbuf, ishs_m.buf, faccs_m.buf]);
+        binds16.extend_from_slice(&[
+            b8buf,
+            obuf.buf,
+            wspbuf,
+            wsmbuf,
+            ydbuf,
+            qsbuf,
+            ishs_m.buf,
+            faccs_m.buf,
+        ]);
         // 배치 모드 재현 (run_pipe 경로) — fresh_ds + op간 배리어 포함
         ctx.begin_batch()?;
         ctx.batch_dsl.set(Some((dsl, dp)));
         let ds_f = ctx.fresh_ds(16)?;
         ctx.bind_bufs(ds_f, &binds16);
-        let push16: Vec<u8> = [n_in as u32, no as u32, t as u32, n_sub as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let push16: Vec<u8> = [n_in as u32, no as u32, t as u32, n_sub as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         ctx.run(pl, ds_f, pipe, &push16, (no.div_ceil(16)) as u32, 1, 1)?;
         ctx.end_batch_wait()?;
         let mut out = vec![0f32; t * no];
-        unsafe { std::ptr::copy_nonoverlapping(obuf.ptr as *const f32, out.as_mut_ptr(), out.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(obuf.ptr as *const f32, out.as_mut_ptr(), out.len())
+        };
         let sentinel = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 4) }[0];
-        let _nsent = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 256) }.iter().filter(|&&x| x == 0xABABABAB).count();
+        let _nsent = unsafe { std::slice::from_raw_parts(ishsb.ptr as *const u32, 256) }
+            .iter()
+            .filter(|&&x| x == 0xABABABAB)
+            .count();
         // CPU 미러: out[tok][o] = Σ_b yd·(wsp·isum − wsm·qsum)
         let mut mx = 0f64;
         let mut ok = true;
         for tok in 0..t {
-            for o in 0..16usize { // 검증은 첫 16행
+            for o in 0..16usize {
+                // 검증은 첫 16행
                 let mut acc = 0f32;
                 for b in 0..n_sub {
                     let mut isum = 0i32;
                     let mut qs = 0i32;
                     for k in 0..32 {
-                        isum += w8[o * n_in + b * 32 + k] as i32 * b8[tok * n_in + b * 32 + k] as i32;
+                        isum +=
+                            w8[o * n_in + b * 32 + k] as i32 * b8[tok * n_in + b * 32 + k] as i32;
                         qs += b8[tok * n_in + b * 32 + k] as i32;
                     }
-                    acc += yd[tok * n_sub + b] * (wsp[o * n_sub + b] * isum as f32 - wsm[o * n_sub + b] * qs as f32);
+                    acc += yd[tok * n_sub + b]
+                        * (wsp[o * n_sub + b] * isum as f32 - wsm[o * n_sub + b] * qs as f32);
                 }
                 let d = (out[tok * no + o] - acc).abs() as f64;
-                if d > 1e-4 { ok = false; }
+                if d > 1e-4 {
+                    ok = false;
+                }
                 mx = mx.max(d);
             }
         }
@@ -287,9 +347,8 @@ use ash::vk;
         // 크로스체크: 동일 w8/b8 버퍼로 probe3 커널 (동일 SPIR-V 계열) — 하니스 분리.
         {
             let cbuf3 = ctx.alloc_host(256 * 4)?;
-            let (dsl3, pl3, _dp3, ds3, pipe3) = ctx.pipeline(
-                include_bytes!("spv/i8probe3.spv"), 3, 8,
-            )?;
+            let (dsl3, pl3, _dp3, ds3, pipe3) =
+                ctx.pipeline(include_bytes!("spv/i8probe3.spv"), 3, 8)?;
             let _ = dsl3;
             ctx.bind_bufs(ds3, &[wbuf, b8buf, cbuf3.buf]);
             ctx.run(pl3, ds3, pipe3, &[], 1, 1, 1)?;
@@ -300,29 +359,45 @@ use ash::vk;
             for m in 0..16usize {
                 for n in 0..2usize {
                     let mut s = 0i32;
-                    for k in 0..32usize { s += w8[m * 32 + k] as i32 * b8[n * 32 + k] as i32; }
-                    if n == 0 && c3[m * 16] != s { ok3 = false; }
+                    for k in 0..32usize {
+                        s += w8[m * 32 + k] as i32 * b8[n * 32 + k] as i32;
+                    }
+                    if n == 0 && c3[m * 16] != s {
+                        ok3 = false;
+                    }
                 }
             }
-            lines.push(format!("  gemm_i8_cross(probe3커널+미니데이터): nz={} diag0={}", nz3, if ok3 { "★" } else { "✗" }));
+            lines.push(format!(
+                "  gemm_i8_cross(probe3커널+미니데이터): nz={} diag0={}",
+                nz3,
+                if ok3 { "★" } else { "✗" }
+            ));
         }
         // 기대 isum[m][n] 256개 생성 후 ishs 내 위치 탐색 (순열 규명)
         let mut want_full: Vec<i32> = Vec::with_capacity(32);
         for m in 0..16usize {
             for tok in 0..2usize {
                 let mut s = 0i32;
-                for k in 0..32usize { s += w8[m * 32 + k] as i32 * b8[tok * 32 + k] as i32; }
+                for k in 0..32usize {
+                    s += w8[m * 32 + k] as i32 * b8[tok * 32 + k] as i32;
+                }
                 want_full.push(s);
             }
         }
         let mut found = String::new();
         for (wi, wv) in want_full.iter().enumerate().take(6) {
-            let m = wi / 2; let tok = wi % 2;
+            let m = wi / 2;
+            let tok = wi % 2;
             let pos = iv.iter().position(|&x| x == *wv);
             found.push_str(&format!("(m{m},t{tok})@{:?} ", pos));
         }
         let nz = iv.iter().filter(|&&x| x != 0).count();
-        lines.push(format!("gemm_i8_mini: {} (max|D|={mx:.2e} nz256={nz} pos: {} first4={:08x})", if ok { "★" } else { "✗" }, found, sentinel));
+        lines.push(format!(
+            "gemm_i8_mini: {} (max|D|={mx:.2e} nz256={nz} pos: {} first4={:08x})",
+            if ok { "★" } else { "✗" },
+            found,
+            sentinel
+        ));
     }
 
     // ── split3: [t=3][n0+n1+n2=12]
@@ -335,12 +410,13 @@ use ash::vk;
         let d0 = ctx.alloc(t * n0 * 4)?;
         let d1 = ctx.alloc(t * n1 * 4)?;
         let d2 = ctx.alloc(t * n2 * 4)?;
-        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/split3.spv"), 4, 12,
-        )?;
+        let (dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/split3.spv"), 4, 12)?;
         let _ = dsl;
         ctx.bind_bufs(ds, &[sbuf.buf, d0.buf, d1.buf, d2.buf]);
-        let push: Vec<u8> = [n0 as u32, n1 as u32, n2 as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let push: Vec<u8> = [n0 as u32, n1 as u32, n2 as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         ctx.run(pl, ds, pipe, &push, (t * total).div_ceil(64) as u32, 1, 1)?;
         let (mut r0, mut r1, mut r2) = (vec![0f32; t * n0], vec![0f32; t * n1], vec![0f32; t * n2]);
         unsafe {
@@ -353,9 +429,13 @@ use ash::vk;
         for ti in 0..t {
             for j in 0..total {
                 let v = src[ti * total + j];
-                if j < n0 { c0[ti * n0 + j] = v; }
-                else if j < n0 + n1 { c1[ti * n1 + j - n0] = v; }
-                else { c2[ti * n2 + j - n0 - n1] = v; }
+                if j < n0 {
+                    c0[ti * n0 + j] = v;
+                } else if j < n0 + n1 {
+                    c1[ti * n1 + j - n0] = v;
+                } else {
+                    c2[ti * n2 + j - n0 - n1] = v;
+                }
             }
         }
         let ok = r0 == c0 && r1 == c1 && r2 == c2;
@@ -377,11 +457,13 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(cw.as_ptr(), cbuf.ptr as *mut f32, cw.len());
             std::ptr::copy_nonoverlapping(st0.as_ptr(), sbuf.ptr as *mut f32, st0.len());
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/gdn_conv_t.spv"), 4, 12,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) =
+            ctx.pipeline(include_bytes!("spv/gdn_conv_t.spv"), 4, 12)?;
         ctx.bind_bufs(ds, &[qbuf.buf, cbuf.buf, sbuf.buf, obuf.buf]);
-        let push: Vec<u8> = [ch as u32, k as u32, t as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let push: Vec<u8> = [ch as u32, k as u32, t as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         ctx.run(pl, ds, pipe, &push, ch.div_ceil(64) as u32, t as u32, 1)?;
         let mut r = vec![0f32; t * ch];
         unsafe { std::ptr::copy_nonoverlapping(obuf.ptr as *const f32, r.as_mut_ptr(), r.len()) };
@@ -392,21 +474,34 @@ use ash::vk;
                 let mut sum = cw[cc * k + (k - 1)] * qkv[ti * ch + cc];
                 for j in 0..k - 1 {
                     let pos = ti as isize - (k as isize - 1) + j as isize;
-                    let xv = if pos >= 0 { qkv[pos as usize * ch + cc] } else { st0[((pos + k as isize - 1) as usize) * ch + cc] };
+                    let xv = if pos >= 0 {
+                        qkv[pos as usize * ch + cc]
+                    } else {
+                        st0[((pos + k as isize - 1) as usize) * ch + cc]
+                    };
                     sum += cw[cc * k + j] * xv;
                 }
                 c[ti * ch + cc] = sum / (1.0 + (-sum).exp());
             }
         }
-        let maxd = r.iter().zip(c.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        lines.push(format!("gdn_conv_t: max|D|={maxd:.2e} {}", if maxd < 1e-5 { "★" } else { "MISMATCH" }));
+        let maxd = r
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        lines.push(format!(
+            "gdn_conv_t: max|D|={maxd:.2e} {}",
+            if maxd < 1e-5 { "★" } else { "MISMATCH" }
+        ));
 
         // ── 다중 스텝 링 진화: t=1 4회 연속 — 상태 시프트·push 검증
         {
             let (ch, k, steps) = (12usize, 4usize, 4usize);
             let cw: Vec<f32> = (0..ch * k).map(|_| lcg()).collect();
             let st: Vec<f32> = vec![0.0; (k - 1) * ch];
-            let inputs: Vec<Vec<f32>> = (0..steps).map(|_| (0..ch).map(|_| lcg()).collect()).collect();
+            let inputs: Vec<Vec<f32>> = (0..steps)
+                .map(|_| (0..ch).map(|_| lcg()).collect())
+                .collect();
             let cwb = ctx.alloc(cw.len() * 4)?;
             let stb = ctx.alloc(st.len() * 4)?;
             let inb = ctx.alloc(ch * 4)?;
@@ -415,11 +510,13 @@ use ash::vk;
                 std::ptr::copy_nonoverlapping(cw.as_ptr(), cwb.ptr as *mut f32, cw.len());
                 std::ptr::copy_nonoverlapping(st.as_ptr(), stb.ptr as *mut f32, st.len());
             }
-            let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-                include_bytes!("spv/gdn_conv_t.spv"), 4, 8,
-            )?;
+            let (_dsl, pl, _dp, ds, pipe) =
+                ctx.pipeline(include_bytes!("spv/gdn_conv_t.spv"), 4, 8)?;
             ctx.bind_bufs(ds, &[inb.buf, cwb.buf, stb.buf, ob.buf]);
-            let push: Vec<u8> = [ch as u32, k as u32, 1u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let push: Vec<u8> = [ch as u32, k as u32, 1u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             let mut gpu_outs: Vec<Vec<f32>> = Vec::new();
             for inp in &inputs {
                 unsafe { std::ptr::copy_nonoverlapping(inp.as_ptr(), inb.ptr as *mut f32, ch) };
@@ -456,7 +553,10 @@ use ash::vk;
                     maxd2 = maxd2.max((gpu_outs[st_i][c2] - cpu_outs[st_i][c2]).abs());
                 }
             }
-            lines.push(format!("gdn_conv_ring({steps} steps): max|D|={maxd2:.2e} {}", if maxd2 < 1e-5 { "★" } else { "MISMATCH" }));
+            lines.push(format!(
+                "gdn_conv_ring({steps} steps): max|D|={maxd2:.2e} {}",
+                if maxd2 < 1e-5 { "★" } else { "MISMATCH" }
+            ));
         }
     }
 
@@ -479,11 +579,12 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(dtb.as_ptr(), db.ptr as *mut f32, dr);
             std::ptr::copy_nonoverlapping(sa.as_ptr(), sb.ptr as *mut f32, dr);
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/gdn_beta_g.spv"), 5, 8,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/gdn_beta_g.spv"), 5, 8)?;
         ctx.bind_bufs(ds, &[bb.buf, ab.buf, db.buf, sb.buf, gb.buf]);
-        let push: Vec<u8> = [nh as u32, dr as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let push: Vec<u8> = [nh as u32, dr as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         ctx.run(pl, ds, pipe, &push, nh.div_ceil(64) as u32, 1, 1)?;
         let mut r = vec![0f32; nh * 2];
         unsafe { std::ptr::copy_nonoverlapping(gb.ptr as *const f32, r.as_mut_ptr(), r.len()) };
@@ -495,9 +596,20 @@ use ash::vk;
             let sp = (1.0 + x.exp()).ln();
             c[h * 2 + 1] = (sp * sa[h0]).exp();
         }
-        let maxd = r.iter().zip(c.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let mrel = r.iter().zip(c.iter()).map(|(x, y)| ((x - y) / y.abs().max(1e-6)).abs()).fold(0.0f32, f32::max);
-        lines.push(format!("gdn_beta_g: max|D|={maxd:.2e} mrel={mrel:.2e} {}", if mrel < 1e-4 { "★" } else { "MISMATCH" }));
+        let maxd = r
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let mrel = r
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| ((x - y) / y.abs().max(1e-6)).abs())
+            .fold(0.0f32, f32::max);
+        lines.push(format!(
+            "gdn_beta_g: max|D|={maxd:.2e} mrel={mrel:.2e} {}",
+            if mrel < 1e-4 { "★" } else { "MISMATCH" }
+        ));
     }
 
     // ── gdn_ar (핵심 재귀) — d=128 (커널 32레인×4 kdim 전제), hv=8, hk=2, t=4
@@ -520,14 +632,26 @@ use ash::vk;
                     s0[i * d + u2] = (i + 1) as f32;
                 }
             }
-            for x in q.iter_mut() { *x = 1.0; }
-            for x in k.iter_mut() { *x = 0.0; }
-            for x in bg.iter_mut() { *x = 0.0; }
-            for x in bg.iter_mut().skip(1).step_by(2) { *x = 1.0; }
+            for x in q.iter_mut() {
+                *x = 1.0;
+            }
+            for x in k.iter_mut() {
+                *x = 0.0;
+            }
+            for x in bg.iter_mut() {
+                *x = 0.0;
+            }
+            for x in bg.iter_mut().skip(1).step_by(2) {
+                *x = 1.0;
+            }
         } else if std::env::var_os("LLM170_GDN_PROBE").is_some() {
             // beta=0, g=2: out = 2·scale·Σq·s
-            for x in bg.iter_mut().step_by(2) { *x = 0.0; }
-            for x in bg.iter_mut().skip(1).step_by(2) { *x = 2.0; }
+            for x in bg.iter_mut().step_by(2) {
+                *x = 0.0;
+            }
+            for x in bg.iter_mut().skip(1).step_by(2) {
+                *x = 2.0;
+            }
         }
         let sb = ctx.alloc(s0.len() * 4)?;
         let qb = ctx.alloc(q.len() * 4)?;
@@ -542,13 +666,16 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(v.as_ptr(), vb.ptr as *mut f32, v.len());
             std::ptr::copy_nonoverlapping(bg.as_ptr(), bgb.ptr as *mut f32, bg.len());
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/gdn_ar.spv"), 6, 28,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/gdn_ar.spv"), 6, 28)?;
         ctx.bind_bufs(ds, &[sb.buf, qb.buf, kb.buf, vb.buf, bgb.buf, ob.buf]);
         let scale = 1.0f32 / (d as f32).sqrt();
         let mut push: Vec<u8> = Vec::new();
-        push.extend_from_slice(&[d as u32, ks as u32, vs as u32, hv as u32, hk as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        push.extend_from_slice(
+            &[d as u32, ks as u32, vs as u32, hv as u32, hk as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         push.extend_from_slice(&scale.to_le_bytes());
         push.extend_from_slice(&(t as u32).to_le_bytes());
         ctx.run(pl, ds, pipe, &push, hv as u32, d as u32, 1)?;
@@ -573,7 +700,9 @@ use ash::vk;
                 // ssr *= g; sk = Σ k·s ; delta; s += k·delta; out = Σ q·s
                 // g는 (pair, ti)당 1회 — 전 행 적용 후 u 순회
                 for i in 0..d {
-                    st[base_s + i * d..base_s + i * d + d].iter_mut().for_each(|x| *x *= g);
+                    st[base_s + i * d..base_s + i * d + d]
+                        .iter_mut()
+                        .for_each(|x| *x *= g);
                 }
                 for u in 0..d {
                     let mut acc = 0.0f64;
@@ -601,16 +730,29 @@ use ash::vk;
         if std::env::var_os("LLM170_GDN_PROBE").is_some() {
             // g=2·beta=0: s_out은 2·s0, out은 2·scale·Σq·s 여야
             let s_ratio = s_out[0] / s0[0];
-            let o_ratio = if c[0].abs() > 1e-9 { r[0] / c[0] } else { f32::NAN };
-            lines.push(format!("  probe: s_out/s0={s_ratio:.4} (기대 2.0) out/out_cpu={o_ratio:.4}"));
+            let o_ratio = if c[0].abs() > 1e-9 {
+                r[0] / c[0]
+            } else {
+                f32::NAN
+            };
+            lines.push(format!(
+                "  probe: s_out/s0={s_ratio:.4} (기대 2.0) out/out_cpu={o_ratio:.4}"
+            ));
         }
-        let maxd = r.iter().zip(c.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let maxd = r
+            .iter()
+            .zip(c.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         let fb = (0..r.len()).find(|&i| (r[i] - c[i]).abs() > 1e-3);
         let dbg = match fb {
             Some(i) => format!(" first_bad[{i}] gpu={:.6} cpu={:.6}", r[i], c[i]),
             None => String::new(),
         };
-        lines.push(format!("gdn_ar: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-3 { "★" } else { "MISMATCH" }));
+        lines.push(format!(
+            "gdn_ar: max|D|={maxd:.2e}{dbg} {}",
+            if maxd < 1e-3 { "★" } else { "MISMATCH" }
+        ));
 
         // ── AR 실차원 2스텝 체인 (hv=48, hk=16, d=128) — VkD step 방식 미러
         {
@@ -619,27 +761,42 @@ use ash::vk;
             let scale = 1.0f32 / (d as f32).sqrt();
             let st: Vec<f32> = (0..hv * d * d).map(|_| lcg() * 0.5).collect();
             let steps = 2usize;
-            let inputs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..steps).map(|_| {
-                (lcg_v(ks), lcg_v(ks), lcg_v(vs), {
-                    let mut bg = vec![0f32; hv * 2];
-                    for h in 0..hv { bg[h * 2] = 0.3; bg[h * 2 + 1] = 0.9; }
-                    bg
+            let inputs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..steps)
+                .map(|_| {
+                    (lcg_v(ks), lcg_v(ks), lcg_v(vs), {
+                        let mut bg = vec![0f32; hv * 2];
+                        for h in 0..hv {
+                            bg[h * 2] = 0.3;
+                            bg[h * 2 + 1] = 0.9;
+                        }
+                        bg
+                    })
                 })
-            }).collect();
+                .collect();
             let sb = ctx.alloc(st.len() * 4)?;
             unsafe { std::ptr::copy_nonoverlapping(st.as_ptr(), sb.ptr as *mut f32, st.len()) };
-            let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/gdn_ar.spv"), 6, 28)?;
+            let (_dsl, pl, _dp, ds, pipe) =
+                ctx.pipeline(include_bytes!("spv/gdn_ar.spv"), 6, 28)?;
             let mut gpu_outs: Vec<Vec<f32>> = Vec::new();
             for st_i in 0..steps {
                 let (q, k, v, bg) = &inputs[st_i];
-                let qb = ctx.alloc(ks * 4)?; unsafe { std::ptr::copy_nonoverlapping(q.as_ptr(), qb.ptr as *mut f32, ks) };
-                let kb = ctx.alloc(ks * 4)?; unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), kb.ptr as *mut f32, ks) };
-                let vb = ctx.alloc(vs * 4)?; unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), vb.ptr as *mut f32, vs) };
-                let bb = ctx.alloc(hv * 2 * 4)?; unsafe { std::ptr::copy_nonoverlapping(bg.as_ptr(), bb.ptr as *mut f32, hv * 2) };
+                let qb = ctx.alloc(ks * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(q.as_ptr(), qb.ptr as *mut f32, ks) };
+                let kb = ctx.alloc(ks * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), kb.ptr as *mut f32, ks) };
+                let vb = ctx.alloc(vs * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), vb.ptr as *mut f32, vs) };
+                let bb = ctx.alloc(hv * 2 * 4)?;
+                unsafe { std::ptr::copy_nonoverlapping(bg.as_ptr(), bb.ptr as *mut f32, hv * 2) };
                 let ob = ctx.alloc(vs * 4)?;
                 ctx.bind_bufs(ds, &[sb.buf, qb.buf, kb.buf, vb.buf, bb.buf, ob.buf]);
                 let mut push: Vec<u8> = Vec::new();
-                push.extend([d as u32, ks as u32, vs as u32, hv as u32, hk as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+                push.extend(
+                    [d as u32, ks as u32, vs as u32, hv as u32, hk as u32]
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                );
                 push.extend(scale.to_le_bytes());
                 push.extend(1u32.to_le_bytes());
                 ctx.run(pl, ds, pipe, &push, hv as u32, d as u32, 1)?;
@@ -672,11 +829,15 @@ use ash::vk;
                     }
                     for u2 in 0..d {
                         let delta = (v[v0 + u2] - sk2[u2]) * beta;
-                        for i in 0..d { cs[base_s + i * d + u2] += k[qk0 + i] * delta; }
+                        for i in 0..d {
+                            cs[base_s + i * d + u2] += k[qk0 + i] * delta;
+                        }
                     }
                     for u2 in 0..d {
                         let mut acc = 0f32;
-                        for i in 0..d { acc += cs[base_s + i * d + u2] * q[qk0 + i]; }
+                        for i in 0..d {
+                            acc += cs[base_s + i * d + u2] * q[qk0 + i];
+                        }
                         o[v0 + u2] = acc * scale;
                     }
                 }
@@ -684,9 +845,14 @@ use ash::vk;
             }
             let mut md2 = 0f32;
             for st_i in 0..steps {
-                for j2 in 0..vs { md2 = md2.max((gpu_outs[st_i][j2] - cpu_outs[st_i][j2]).abs()); }
+                for j2 in 0..vs {
+                    md2 = md2.max((gpu_outs[st_i][j2] - cpu_outs[st_i][j2]).abs());
+                }
             }
-            lines.push(format!("gdn_ar_real2({steps}): max|D|={md2:.2e} {}", if md2 < 1e-2 { "★" } else { "MISMATCH" }));
+            lines.push(format!(
+                "gdn_ar_real2({steps}): max|D|={md2:.2e} {}",
+                if md2 < 1e-2 { "★" } else { "MISMATCH" }
+            ));
         }
     }
 
@@ -706,12 +872,16 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(z.as_ptr(), zb.ptr as *mut f32, z.len());
             std::ptr::copy_nonoverlapping(w.as_ptr(), wb.ptr as *mut f32, w.len());
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/norm_gated.spv"), 4, 12,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) =
+            ctx.pipeline(include_bytes!("spv/norm_gated.spv"), 4, 12)?;
         ctx.bind_bufs(ds, &[ob.buf, zb.buf, wb.buf, outb.buf]);
         let mut push = eps.to_le_bytes().to_vec();
-        push.extend([d as u32, n_h as u32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        push.extend(
+            [d as u32, n_h as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         ctx.run(pl, ds, pipe, &push, n_h as u32, t as u32, 1)?;
         let mut r = vec![0f32; t * n_h * d];
         unsafe { std::ptr::copy_nonoverlapping(outb.ptr as *const f32, r.as_mut_ptr(), r.len()) };
@@ -722,7 +892,9 @@ use ash::vk;
                 let xb = (ti * n_h + h) * d;
                 let wb2 = h * d;
                 let mut sum = 0f64;
-                for i in 0..d { sum += o[xb + i] as f64 * o[xb + i] as f64; }
+                for i in 0..d {
+                    sum += o[xb + i] as f64 * o[xb + i] as f64;
+                }
                 let inv = 1.0 / ((sum / d as f64 + eps as f64).sqrt() as f32);
                 for i in 0..d {
                     let zz = z[xb + i];
@@ -731,16 +903,26 @@ use ash::vk;
                 }
             }
         }
-        let maxd = r.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let maxd = r
+            .iter()
+            .zip(&c)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         let fb = (0..r.len()).find(|&i| (r[i] - c[i]).abs() > 1e-4);
         let dbg = match fb {
             Some(i) => format!(
                 " first_bad[{i}] gpu={:.6} cpu={:.6} row0gpu={:?} row0cpu={:?}",
-                r[i], c[i], &r[0..d.min(8)], &c[0..d.min(8)]
+                r[i],
+                c[i],
+                &r[0..d.min(8)],
+                &c[0..d.min(8)]
             ),
             None => String::new(),
         };
-        lines.push(format!("norm_gated: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-4 { "★" } else { "MISMATCH" }));
+        lines.push(format!(
+            "norm_gated: max|D|={maxd:.2e}{dbg} {}",
+            if maxd < 1e-4 { "★" } else { "MISMATCH" }
+        ));
     }
 
     // ── silu_mul: exp_cr f64 폴리 포트 검증 (극값 포함)
@@ -768,26 +950,38 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(g.as_ptr(), gb.ptr as *mut f32, n);
             std::ptr::copy_nonoverlapping(u.as_ptr(), ub.ptr as *mut f32, n);
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/silu_mul.spv"), 3, 4,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/silu_mul.spv"), 3, 4)?;
         ctx.bind_bufs(ds, &[gb.buf, ub.buf, ob.buf]);
         let push = (n as u32).to_le_bytes().to_vec();
         ctx.run(pl, ds, pipe, &push, n.div_ceil(256) as u32, 1, 1)?;
         let mut r = vec![0f32; n];
         unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const f32, r.as_mut_ptr(), n) };
         // exp_cr 폴리 미러 (rawhip kernels.rs:42 정확 이식)
-        let c: Vec<f32> = g.iter().zip(&u).map(|(&v, &uv)| {
-            let s = v / (1.0 + (-v as f64).exp() as f32);
-            s * uv
-        }).collect();
-        let maxd = r.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let c: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(&v, &uv)| {
+                let s = v / (1.0 + (-v as f64).exp() as f32);
+                s * uv
+            })
+            .collect();
+        let maxd = r
+            .iter()
+            .zip(&c)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         let fb = (0..n).find(|&i| (r[i] - c[i]).abs() > 1e-5);
         let dbg = match fb {
-            Some(i) => format!(" first_bad[{i}] g={:.4} gpu={:.7} cpu={:.7}", g[i], r[i], c[i]),
+            Some(i) => format!(
+                " first_bad[{i}] g={:.4} gpu={:.7} cpu={:.7}",
+                g[i], r[i], c[i]
+            ),
             None => String::new(),
         };
-        lines.push(format!("silu_mul: max|D|={maxd:.2e}{dbg} {}", if maxd < 1e-4 { "★" } else { "MISMATCH" }));
+        lines.push(format!(
+            "silu_mul: max|D|={maxd:.2e}{dbg} {}",
+            if maxd < 1e-4 { "★" } else { "MISMATCH" }
+        ));
     }
 
     // ── l2_rows2: ng=2, d=128, t=3
@@ -802,14 +996,17 @@ use ash::vk;
             std::ptr::copy_nonoverlapping(qv.as_ptr(), qb.ptr as *mut f32, qv.len());
             std::ptr::copy_nonoverlapping(kv.as_ptr(), kb.ptr as *mut f32, kv.len());
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(
-            include_bytes!("spv/l2_rows2.spv"), 2, 12,
-        )?;
+        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("spv/l2_rows2.spv"), 2, 12)?;
         ctx.bind_bufs(ds, &[qb.buf, kb.buf]);
         let eps = 1e-6f32;
         let mut push: Vec<u8> = Vec::new();
         push.extend_from_slice(&eps.to_le_bytes());
-        push.extend_from_slice(&[d as u32, ng as u32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        push.extend_from_slice(
+            &[d as u32, ng as u32]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         ctx.run(pl, ds, pipe, &push, (2 * ng) as u32, t as u32, 1)?;
         unsafe {
             std::ptr::copy_nonoverlapping(qb.ptr as *const f32, qv.as_mut_ptr(), qv.len());
@@ -827,14 +1024,19 @@ use ash::vk;
         for ti in 0..t {
             for x in 0..2 * ng {
                 let base = ti * row + if x < ng { x * d } else { (x - ng) * d };
-                let ssum: f64 = (0..d).map(|i| {
-                    let v = if x < ng { qv[base + i] } else { kv[base + i] };
-                    (v as f64) * (v as f64)
-                }).sum();
+                let ssum: f64 = (0..d)
+                    .map(|i| {
+                        let v = if x < ng { qv[base + i] } else { kv[base + i] };
+                        (v as f64) * (v as f64)
+                    })
+                    .sum();
                 worst = worst.max((ssum - 1.0).abs());
             }
         }
-        lines.push(format!("l2_rows2: ||v||²−1 max={worst:.2e} {}", if worst < 1e-5 { "★" } else { "MISMATCH" }));
+        lines.push(format!(
+            "l2_rows2: ||v||²−1 max={worst:.2e} {}",
+            if worst < 1e-5 { "★" } else { "MISMATCH" }
+        ));
     }
 
     // ── qk_rope + kv_append + qsa_flash 어텐션 체인 (nh=4, nk=2, hd=128, nr=64)
@@ -850,7 +1052,7 @@ use ash::vk;
         let halfn = nr >> 1;
         let csv: Vec<f32> = (0..np * halfn * 2).map(|_| lcg()).collect();
         let mut kvo: Vec<f32> = kvv.clone();
-        let qv0 = qv.clone();   // 원본 (미러 기준)
+        let qv0 = qv.clone(); // 원본 (미러 기준)
         let kv0 = kvo.clone();
 
         let qb = ctx.alloc(qv.len() * 4)?;
@@ -879,8 +1081,12 @@ use ash::vk;
             let mut push: Vec<u8> = Vec::new();
             push.extend_from_slice(&eps.to_le_bytes());
             push.extend_from_slice(&kqs.to_le_bytes());
-            push.extend_from_slice(&[(np - 1) as u32, nh as u32, nk as u32, hd as u32, nr as u32]
-                .iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            push.extend_from_slice(
+                &[(np - 1) as u32, nh as u32, nk as u32, hd as u32, nr as u32]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            );
             ctx.run(pl, ds, pipe, &push, (nh + nk) as u32, 1, 1)?;
         }
         unsafe {
@@ -898,15 +1104,32 @@ use ash::vk;
                 let row_base = if is_q { r0 * 2 * hd } else { (r0 - nh) * hd };
                 let mut sum = 0.0f64;
                 for i in 0..hd {
-                    let dv = if is_q { qv[row_base + i] } else { kv[row_base + i] };
+                    let dv = if is_q {
+                        qv[row_base + i]
+                    } else {
+                        kv[row_base + i]
+                    };
                     sum += (dv * dv) as f64;
                 }
                 let scale = 1.0f32 / ((sum / hd as f64 + eps as f64).sqrt() as f32);
                 for i in 0..hd {
-                    let w = if is_q { qwt[r0 * hd + i] } else { kwt[(r0 - nh) * hd + i] };
-                    let v = (if is_q { qv[row_base + i] } else { kv[row_base + i] }) * scale * w
+                    let w = if is_q {
+                        qwt[r0 * hd + i]
+                    } else {
+                        kwt[(r0 - nh) * hd + i]
+                    };
+                    let v = (if is_q {
+                        qv[row_base + i]
+                    } else {
+                        kv[row_base + i]
+                    }) * scale
+                        * w
                         * if is_q { 1.0 } else { kqs };
-                    if is_q { qv[row_base + i] = v; } else { kv[row_base + i] = v; }
+                    if is_q {
+                        qv[row_base + i] = v;
+                    } else {
+                        kv[row_base + i] = v;
+                    }
                 }
                 for p in 0..halfn2 {
                     let c = csv[csbase + p * 2] as f64;
@@ -919,25 +1142,49 @@ use ash::vk;
                         (kv[a] as f64, kv[b] as f64)
                     };
                     let (ra, rb) = ((x0 * c - x1 * sf) as f32, (x0 * sf + x1 * c) as f32);
-                    if is_q { qv[a] = ra; qv[b] = rb; } else { kv[a] = ra; kv[b] = rb; }
+                    if is_q {
+                        qv[a] = ra;
+                        qv[b] = rb;
+                    } else {
+                        kv[a] = ra;
+                        kv[b] = rb;
+                    }
                 }
             }
         };
         let mut cq = qv0.clone();
         let mut ck2 = kv0.clone();
         mirror(&mut cq, &mut ck2);
-        let qd = qv.iter().zip(cq.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let kd = kvo.iter().zip(ck2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        lines.push(format!("qk_rope: q|D|={qd:.2e} k|D|={kd:.2e} {}", if qd < 1e-5 && kd < 1e-5 { "★" } else { "MISMATCH" }));
+        let qd = qv
+            .iter()
+            .zip(cq.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let kd = kvo
+            .iter()
+            .zip(ck2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        lines.push(format!(
+            "qk_rope: q|D|={qd:.2e} k|D|={kd:.2e} {}",
+            if qd < 1e-5 && kd < 1e-5 {
+                "★"
+            } else {
+                "MISMATCH"
+            }
+        ));
 
         // 2) kv_append: k/v → kv 캐시 [np][nk*hd] (이미 그 형상) pos=np-1 재기입 → 검증 생략(자명)
         // 3) qsa_flash: PC {pos0=np-1, nh, nk, hd} — 인과 루프 상한이 np개 키 전부를 덮는다
         let ob = ctx.alloc(nh * hd * 4)?;
         {
-            let (_d, pl, _p, ds, pipe) = ctx.pipeline(include_bytes!("spv/qsa_flash.spv"), 4, 16)?;
+            let (_d, pl, _p, ds, pipe) =
+                ctx.pipeline(include_bytes!("spv/qsa_flash.spv"), 4, 16)?;
             ctx.bind_bufs(ds, &[qb.buf, ckb.buf, vb.buf, ob.buf]);
             let push: Vec<u8> = [(np - 1) as u32, nh as u32, nk as u32, hd as u32]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             ctx.run(pl, ds, pipe, &push, 1, nh as u32, 1)?;
         }
         let mut r = vec![0f32; nh * hd];
@@ -958,7 +1205,10 @@ use ash::vk;
                 mx = mx.max(sc[p]);
             }
             let mut sum = 0.0f64;
-            for v in sc.iter_mut() { *v = (*v - mx).exp(); sum += *v; }
+            for v in sc.iter_mut() {
+                *v = (*v - mx).exp();
+                sum += *v;
+            }
             for p in 0..np {
                 let w = sc[p] / sum;
                 for i in 0..hd {
@@ -974,8 +1224,15 @@ use ash::vk;
             }
         }
         let _ = &mut kvo;
-        let fd = r.iter().zip(c.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        lines.push(format!("qsa_flash: |D|={fd:.2e} {}", if fd < 1e-3 { "★" } else { "MISMATCH" }));
+        let fd = r
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        lines.push(format!(
+            "qsa_flash: |D|={fd:.2e} {}",
+            if fd < 1e-3 { "★" } else { "MISMATCH" }
+        ));
     }
 
     Ok(lines.join("\n"))
@@ -985,7 +1242,10 @@ pub fn smoke_test() -> Result<String, String> {
     let mut ctx = VkCtx::new()?;
     unsafe {
         let props = ctx.instance.get_physical_device_properties(ctx.physical);
-        let name = props.device_name_as_c_str().map_err(|_| "이름")?.to_string_lossy();
+        let name = props
+            .device_name_as_c_str()
+            .map_err(|_| "이름")?
+            .to_string_lossy();
         let mut msg = format!(
             "vk: {name} (subgroup={}), coop_matrix={} coop_f16xf16_f32={}\n",
             props.limits.max_compute_work_group_size[0], ctx.coop_matrix, ctx.coop_f16_f32
@@ -1025,10 +1285,21 @@ pub fn smoke_test() -> Result<String, String> {
         // 사용 가능 매트릭스 타입 열거
         {
             let cm = ash::khr::cooperative_matrix::Instance::new(&ctx.entry, &ctx.instance);
-            let types = cm.get_physical_device_cooperative_matrix_properties(ctx.physical).map_err(|e| format!("{e:?}"))?;
+            let types = cm
+                .get_physical_device_cooperative_matrix_properties(ctx.physical)
+                .map_err(|e| format!("{e:?}"))?;
             for t in &types {
-                msg += &format!("cmtype: M={} N={} K={} A={:?} B={:?} R={:?} scope={:?} sat={}\n",
-                    t.m_size, t.n_size, t.k_size, t.a_type, t.b_type, t.result_type, t.scope, t.saturating_accumulation);
+                msg += &format!(
+                    "cmtype: M={} N={} K={} A={:?} B={:?} R={:?} scope={:?} sat={}\n",
+                    t.m_size,
+                    t.n_size,
+                    t.k_size,
+                    t.a_type,
+                    t.b_type,
+                    t.result_type,
+                    t.scope,
+                    t.saturating_accumulation
+                );
             }
         }
         // coopmat 검증: A(0..255) × I = A
@@ -1096,7 +1367,11 @@ pub fn smoke_test() -> Result<String, String> {
             }
         }
         if bad == 0 {
-            msg += &format!("axpy: ★ {n}/{n} 일치 ({:.2}ms, {:.1}GB/s)\n", dt * 1e3, (n as f64 * 4.0 * 3.0) / dt / 1e9);
+            msg += &format!(
+                "axpy: ★ {n}/{n} 일치 ({:.2}ms, {:.1}GB/s)\n",
+                dt * 1e3,
+                (n as f64 * 4.0 * 3.0) / dt / 1e9
+            );
         } else {
             msg += &format!("axpy: 불일치 {bad}/{n}\n");
         }

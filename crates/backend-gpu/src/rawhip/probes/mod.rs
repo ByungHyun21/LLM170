@@ -3,14 +3,12 @@
 
 use super::*;
 
-
 mod attn;
-mod gemm;
 mod gdn;
+mod gemm;
 mod misc;
-mod wmma;
 
 pub use attn::*;
-pub use gemm::*;
 pub use gdn::*;
+pub use gemm::*;
 pub use misc::*;

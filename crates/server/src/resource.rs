@@ -21,7 +21,11 @@ const REQ_SLACK: f64 = 1.10;
 const HOST_USABLE: f64 = 0.85;
 
 /// 순수 판정 함수 - 단위테스트 대상.
-pub fn check(model_bytes: u64, vram_free: Option<u64>, host_avail: Option<u64>) -> Result<(), String> {
+pub fn check(
+    model_bytes: u64,
+    vram_free: Option<u64>,
+    host_avail: Option<u64>,
+) -> Result<(), String> {
     let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
     let required = (model_bytes as f64 * REQ_SLACK) as u64;
     let mut capacity = 0u64;
@@ -125,7 +129,14 @@ mod tests {
     #[test]
     fn passes_flash_next_standalone() {
         // 실측 조건(2026-09-16): 모델 103.7GiB, VRAM 가용 95.7, MemAvailable 26.
-        assert!(check(103_700 * (1 << 20), Some(95 * GIB + 768 * (1 << 20)), Some(26 * GIB)).is_ok());
+        assert!(
+            check(
+                103_700 * (1 << 20),
+                Some(95 * GIB + 768 * (1 << 20)),
+                Some(26 * GIB)
+            )
+            .is_ok()
+        );
     }
 
     #[test]

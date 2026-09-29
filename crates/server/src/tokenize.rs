@@ -219,7 +219,6 @@ impl Tokenizer {
             .unwrap_or_default()
     }
 
-
     /// 텍스트 → 토큰 (특수 토큰 해석 포함 — llama-server 채팅 경로와 동일).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         self.encode_opts(text, true)
@@ -281,7 +280,10 @@ impl Tokenizer {
         // USER_DEFINED는 항상 분할 — parse_special=false에서도 (llama.cpp 규칙).
         // 분할 순서: 길이 내림차순 우선 — 전체 목록을 통합 정렬한다.
         let all: Vec<&(String, u32)> = if parse_special {
-            self.special.iter().chain(self.special_user.iter()).collect()
+            self.special
+                .iter()
+                .chain(self.special_user.iter())
+                .collect()
         } else {
             self.special_user.iter().collect()
         };
@@ -353,8 +355,9 @@ impl Tokenizer {
                 continue;
             }
             // 심볼 (start, len) — 초기 1심볼 = 인코딩 문자 1개
-            let mut syms: Vec<(usize, usize)> =
-                (0..wb.len()).map(|i| (soff[i], soff[i + 1] - soff[i])).collect();
+            let mut syms: Vec<(usize, usize)> = (0..wb.len())
+                .map(|i| (soff[i], soff[i + 1] - soff[i]))
+                .collect();
             let mut heap: BinaryHeap<Bigram> = BinaryHeap::new();
             let mut key = Vec::new();
             for i in 1..syms.len() {
@@ -534,9 +537,7 @@ fn split_pre(cpts: &[u32], accent: bool) -> Vec<(usize, usize)> {
         }
 
         // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+  (qwen2: \p{L}+)
-        if cpt != 0x0D && cpt != 0x0A && flags & F_NUMBER == 0
-            && (is_lm(pos) || is_lm(pos + 1))
-        {
+        if cpt != 0x0D && cpt != 0x0A && flags & F_NUMBER == 0 && (is_lm(pos) || is_lm(pos + 1)) {
             pos += 1;
             while is_lm(pos) {
                 pos += 1;

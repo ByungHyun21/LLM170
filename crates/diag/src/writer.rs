@@ -24,7 +24,11 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     out.push_str(&format!("TOTAL {:.1}ms GAPS {:.1}ms\n", total_ms, gap_tot));
 
     let mut v: Vec<_> = sums.iter().collect();
-    v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for ((n, g), (ms, cnt)) in v.iter().take(40) {
         out.push_str(&format!("{:30} gy={:<4} {:9.3}ms x{:4}\n", n, g, ms, cnt));
     }
@@ -41,7 +45,11 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     }
     out.push_str(&format!("LAUNCH GAPS total {:.1}ms\n", gap_tot));
     let mut gv: Vec<_> = gap_by.iter().collect();
-    gv.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    gv.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for (n, (ms, c)) in gv.iter().take(12) {
         out.push_str(&format!("  after {:26} {:8.1}ms x{:4}\n", n, ms, c));
     }
@@ -52,28 +60,10 @@ pub fn table(evs: &[Ev], dropped: u64) -> String {
     out
 }
 
-/// 순차 덤프 — `LLM170_KTRACE_SEQ=N`.
-pub fn seq_dump(evs: &[Ev], max: usize) -> String {
-    let mut out = String::new();
-    for (k, ev) in evs.iter().enumerate().take(max) {
-        out.push_str(&format!(
-            "# seq {k:4} {:<28} gy={:<6} {:8.3}ms\n",
-            ev.name, ev.lane, ev.dur_ms
-        ));
-    }
-    out
-}
-
-
-/// 통합 덤프 — 집계 테이블 + 갭 + (LLM170_KTRACE_SEQ=N 지정시) 순차 목록.
+/// 통합 덤프 — 집계 테이블 + 갭.
 /// 백엔드 어댑터(ktrace 등)의 단일 호출 프론트엔드.
 pub fn dump(evs: &[Ev], dropped: u64) -> String {
-    let mut out = table(evs, dropped);
-    if let Ok(v) = std::env::var("LLM170_KTRACE_SEQ") {
-        let n: usize = v.parse().unwrap_or(64);
-        out.push_str(&seq_dump(evs, n));
-    }
-    out
+    table(evs, dropped)
 }
 #[cfg(test)]
 mod tests {
@@ -81,7 +71,14 @@ mod tests {
     use crate::trace::Ev;
 
     fn ev(name: &'static str, lane: u32, dur: f64, gap: Option<f64>) -> Ev {
-        Ev { name, lane, start_ms: 0.0, dur_ms: dur, gap_next_ms: gap, seq_ms: 0.0 }
+        Ev {
+            name,
+            lane,
+            start_ms: 0.0,
+            dur_ms: dur,
+            gap_next_ms: gap,
+            seq_ms: 0.0,
+        }
     }
 
     #[test]
@@ -106,12 +103,5 @@ mod tests {
     fn dropped_warning() {
         let s = table(&[], 42);
         assert!(s.contains("42 events dropped"));
-    }
-
-    #[test]
-    fn seq_dump_format() {
-        let evs = vec![ev("k1", 4, 1.5, None)];
-        let s = seq_dump(&evs, 64);
-        assert!(s.contains("# seq    0 k1                           gy=4         1.500ms"));
     }
 }

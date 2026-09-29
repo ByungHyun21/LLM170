@@ -102,43 +102,6 @@ extern "C" __global__ void gdn_beta_g_f32(const float* b, const float* a, const 
     float sp = log1p_cr(__expf(x));
     bg[h * 2 + 1] = __expf(sp * sa[h0]);
 }
-// norm_gated silu (sequential 32-segment f64 — bit-identical to CPU ops)
-extern "C" __global__ void norm_gated_silu(const float* o, const float* z, const float* w,
-                                           float* out, float eps, int d, int n_h) {
-    // 워프(32레인)당 1행 — 레인 u가 세그먼트 u의 순차 f32 부분합(기존과 동일
-    // 경계), f64 결합은 전 레인이 p0..p31 동일 순서로 수행 (미러 산술열 보존).
-    // 초과 세그먼트 부분합 0 가산은 IEEE 항등 — 비트무영향.
-    int row = blockIdx.y * n_h + blockIdx.x;
-    int u = threadIdx.x;
-    if (blockIdx.x >= n_h) return;
-    int xb = row * d;
-    int wb = blockIdx.x * d;
-    int chunk = (d + 31) >> 5;
-    float part = 0.0f;
-    {
-        int lo = u * chunk;
-        if (lo < d) {
-            int hi = min(lo + chunk, d);
-            for (int i = lo; i < hi; i++) {
-                float dv = o[xb + i];
-                part += dv * dv;
-            }
-        }
-    }
-    double sum = 0.0;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        float pj = __shfl_sync(0xFFFFFFFFFFFFFFFFull, part, j);
-        sum += (double)pj;
-    }
-    float scale32 = (float)sqrt(sum / (double)d + (double)eps);
-    float inv = 1.0f / scale32;
-    for (int i = u; i < d; i += 32) {
-        float nrm = o[xb + i] * inv * w[wb + i];
-        float zz = z[xb + i];
-        out[xb + i] = nrm * (zz / (1.0f + exp_cr(-zz)));
-    }
-}
 extern "C" __global__ void norm_gated_silu_f32(const float* o, const float* z, const float* w,
                                            float* out, float eps, int d, int n_h) {
     // 워프(32레인)당 1행 — 레인 u가 세그먼트 u의 순차 f32 부분합(기존과 동일
@@ -588,50 +551,6 @@ extern "C" __global__ void gdn_ar_chunk_b(float* s, const float* lend, const flo
     float* sf = s + (size_t)pair * d * d;
     for (int u2 = 0; u2 < d; u2++) sf[u2 * d + j] = col[u2];
 }
-
-// AR 배치 smem 스테이징 (부록82): 블록=pair, 128스레드=u, 상태 64KB 동적
-// smem + k/q 층마다 1회 스테이징 — u블록 128중 k/q 재독 제거.
-// 산술: 스레드(u)별 kdim 순차 환원 — gdn_ar_w와 원소 동일순서 (비트계약
-// 대상 아님: _w 계열 셔플 환원과 동일 부류).
-extern "C" __global__ void gdn_ar_sm(float* s, const float* q, const float* k, const float* v,
-                                   const float* beta_ge, float* out, int d, int k_stride,
-                                   int v_stride, int h_v, int h_k, float scale, int t) {
-    // 부록82 수정판: 블록=(pair, u절반 64) — 상태 [64][128] f32 = 32KB 정적.
-    __shared__ float st[64][128];
-    __shared__ float ks_sh[128], qs_sh[128];
-    int pair = blockIdx.x;
-    int uh = blockIdx.y;              // 0..1
-    int u0 = uh * 64;
-    int lu = threadIdx.x;            // 0..63
-    int u = u0 + lu;
-    int h = pair % h_v;
-    int kh = h % h_k;
-    int base_s = pair * d * d;
-    // 상태 적재 (전치행)
-    for (int j = 0; j < d; j++) st[lu][j] = s[base_s + u * d + j];
-    __syncthreads();
-    for (int ti = 0; ti < t; ti++) {
-        int qk0 = ti * k_stride + kh * d;
-        int v0 = ti * v_stride + h * d;
-        float beta = beta_ge[ti * h_v * 2 + pair * 2];
-        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
-        if (lu < 64 && uh == 0) { ks_sh[lu] = k[qk0 + lu]; qs_sh[lu] = q[qk0 + lu]; }
-        __syncthreads();
-        float sk = 0.0f;
-        for (int j = 0; j < d; j++) sk += st[lu][j] * ks_sh[j];
-        float delta = (v[v0 + u] - sk) * beta;
-        float o = 0.0f;
-        for (int j = 0; j < d; j++) {
-            float sv = st[lu][j] * g_exp + ks_sh[j] * delta;
-            st[lu][j] = sv;
-            o += sv * qs_sh[j];
-        }
-        out[v0 + u] = o * scale;
-        __syncthreads();
-    }
-    for (int j = 0; j < d; j++) s[base_s + u * d + j] = st[lu][j];
-}
-
 // C2: S f16 smem 스테이징 (32KB) — S 재독 제거 (부록 72 처방).
 // 그리드 (npair, nc), 블록 128 = u열.
 extern "C" __global__ void gdn_ar_chunk_c2(float* out, const float* q, const float* pbuf,

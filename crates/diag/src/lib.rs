@@ -4,16 +4,16 @@
 //! **resolved 이벤트**(시간 계산 완료)를 표현·저장·분석한다.
 //! 의존 방향: `diag ← core, gguf, backend-gpu, server`.
 
-pub mod trace;
-pub mod writer;
+pub mod alloc;
+pub mod dump;
 pub mod flag;
 pub mod fp;
 pub mod span;
-pub mod dump;
-pub mod alloc;
+pub mod trace;
 pub mod watchdog;
+pub mod writer;
 
+pub use flag::env_on;
+pub use fp::{fp_diff, fp_record};
 pub use trace::Ev;
 pub use trace::capture_on;
-pub use flag::env_on;
-pub use fp::{fp_record, fp_diff};
