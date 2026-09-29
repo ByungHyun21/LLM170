@@ -460,12 +460,8 @@ pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
 }
 /// plans/103 — res_hc f16 버스(원자 스위치: 전 기입/판독 동시 전전환).
 /// 107(원장 104·105): 백엔드별 기본 — hip ON(웜 A/B +4.3% 실측,
-/// 토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산). 명시 env
-/// (=1/=0)가 최우선, 없으면 엔진 기동 시 지정된 백엔드 기본값.
+/// 토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산).
 pub fn res_f16_on() -> bool {
-    if let Some(v) = llm170_diag::flag::val("LLM170_VK_RESF16") {
-        return v != "0";
-    }
     BACKEND_RES_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
 

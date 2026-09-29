@@ -134,13 +134,11 @@ pub(crate) fn q8_0_relayout(data: &[u8], n_in: usize, n_out: usize) -> Vec<u8> {
     out
 }
 /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일(A·B 동일 레이아웃 직접 내적).
-const FN_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_tile_q8mmq.spv");
 /// plans/89 P1.1 — 밀집 프리필 coopmat 타일(decoder ms/128 패밀리 직접 재사용).
 /// 스칼라 fn_tile_q8(2818ms/청크, [ts])를 f16 coopMatMulAdd 판으로 교체.
 const TILE_Q8128_SPV2: &[u8] = include_bytes!("../spv/tile_q8128.spv");
 /// plans/105 P1 — 스키니 q8 coopmat K-분할판(부분합 f32 → FnKsred).
 const TILE_Q8128KS_SPV: &[u8] = include_bytes!("../spv/tile_q8128ks.spv");
-const TILE_Q8KS_SPV: &[u8] = include_bytes!("../spv/tile_q8ks.spv");
 const FN_KSRED_SPV: &[u8] = include_bytes!("../spv/fn_ksred.spv");
 const TILE_Q8MS_SPV2: &[u8] = include_bytes!("../spv/tile_q8ms.spv");
 const TILE_Q4K128_SPV2: &[u8] = include_bytes!("../spv/tile_q4k128.spv");
@@ -157,7 +155,6 @@ const FN_MOE_TILE_Q4K_MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q4k_mm
 const FN_MOE_TILE_Q8MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q8mmq.spv");
 const FN_MOE_TILE_Q5KMMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q5kmmq.spv");
 const FN_MOE_TILE_Q51MMQ_SPV: &[u8] = include_bytes!("../spv/fn_moe_tile_q51mmq.spv");
-const FN_TILE_Q8D_SPV: &[u8] = include_bytes!("../spv/fn_tile_q8d.spv");
 /// plans/89 재개 — QSA 프리필 디바이스 선택(토큰별 점수·비토닉 top-k).
 const FN_IDX_SCORE_MT_SPV: &[u8] = include_bytes!("../spv/fn_idx_score_mt.spv");
 const FN_IDX_TOPK_MT_SPV: &[u8] = include_bytes!("../spv/fn_idx_topk_mt.spv");
@@ -220,8 +217,6 @@ pub(crate) enum Slot {
     FnTileF32s,
     FnMoeTileLlmmq,
     FnQuantQ8p,
-    /// plans/95 P3a — q8_0 밀집 int8 MMQ 타일.
-    FnTileQ8mmq,
     Rms,
     /// plans/92 P4.1 — 256스레드/행 판(대형 t). 디코드(t=1)는 32스레드 원판이
     /// 우수(실측 tg 11.21 vs 10.92 — WG 지연 dominated).
@@ -266,7 +261,6 @@ pub(crate) enum Slot {
     /// plans/89 재개 — q5_1 CM 1-서브그룹 판(경쟁 판별·후보 생산판).
     FnMoeTileQ51Sg1,
     FnMoeTileQ4kMmq,
-    TileQ8ks,
     FnKsred,
     /// plans/96 G3 — q8_0 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ8mmq,
@@ -274,8 +268,6 @@ pub(crate) enum Slot {
     FnMoeTileQ5kmmq,
     /// plans/96 G3 — q5_1 MoE 전문가 int8 MMQ 타일.
     FnMoeTileQ51mmq,
-    /// plans/96 G3 — dense q8_0 MMQ(q51mmq 기하).
-    FnTileQ8d,
     /// plans/89 P1.4 — PLE gate/conv/residual.
     FnPleGate,
     FnPleGateMt,
@@ -319,7 +311,7 @@ pub struct VkAcc {
         std::collections::HashMap<u64, (vk::Buffer, usize)>,
         Vec<VkBuf>,
     )>,
-    /// 밀집 q8 K-분할(TileQ8128Ks/TileQ8ks) 선형 스크래치 — 성장 보유.
+    /// 밀집 q8 K-분할(TileQ8128Ks) 선형 스크래치 — 성장 보유.
     ks_scratch: Mutex<Option<VkBuf>>,
     gdn_ch_scratch: Mutex<(
         Option<VkBuf>,
@@ -367,9 +359,6 @@ pub struct VkAcc {
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크 t).
     /// plans/93: MoE gate→up 배리어 스킵 — 독립 GEMM 병렬 실행.
     pub(crate) moe_nobar: std::sync::atomic::AtomicBool,
-    /// plans/93: F32→Q8_0 변환 캐시(가중 ptr, len 키) — 청크마다 재변환 방지.
-    pub(crate) f32q8_cache:
-        Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<u8>>>>,
     /// plans/95 P3a — q8_0 릴레이아웃 업로드 캐시: (가중 ptr,len) → VkBuf.
     pub(crate) q8r_bufs: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
     /// plans/96 G3 — SiluMul 출력(mglu)→down 융합 학습: (핸들, n_in).
@@ -532,7 +521,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
         28,
     ),
     (Slot::FnQuantQ8p, "quant_q8p", FN_QUANT_Q8P_SPV, 2, 12),
-    (Slot::FnTileQ8mmq, "tile_q8mmq", FN_TILE_Q8MMQ_SPV, 10, 16),
     (Slot::FnPleGate, "ple_gate", FN_PLE_GATE_SPV, 8, 16),
     (
         Slot::FnPleGateF16,
@@ -564,7 +552,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::FnPleResF16, "ple_res_f16", FN_PLE_RES_F16_SPV, 4, 12),
     (Slot::TileQ8128Cm, "tile_q8128", TILE_Q8128_SPV2, 10, 24),
     (Slot::TileQ8128Ks, "tile_q8128ks", TILE_Q8128KS_SPV, 11, 24),
-    (Slot::TileQ8ks, "tile_q8ks", TILE_Q8KS_SPV, 11, 24),
     (Slot::FnKsred, "ksred", FN_KSRED_SPV, 2, 8),
     (Slot::TileQ8msCm, "tile_q8ms", TILE_Q8MS_SPV2, 10, 20),
     (Slot::TileQ4k128Cm, "tile_q4k128", TILE_Q4K128_SPV2, 10, 20),
@@ -612,7 +599,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
         13,
         28,
     ),
-    (Slot::FnTileQ8d, "tile_q8d", FN_TILE_Q8D_SPV, 10, 16),
     (
         Slot::FnIdxScoreMt,
         "idx_score_mt",
@@ -714,7 +700,6 @@ impl VkAcc {
             moe_xq_pair: Mutex::new(None),
             moe_glu: Mutex::new(None),
             last_silu_out: std::sync::atomic::AtomicU64::new(0),
-            f32q8_cache: Mutex::new(std::collections::HashMap::new()),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
         })

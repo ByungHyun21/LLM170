@@ -3047,3 +3047,19 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   (np 자기일관성 — np 경로 변경 시 필수)·stress-flake(레이스 재현
   자산)·logit-diff(품질 게이트)·bench_np(np4 측정)·scorecard.
 - 기준: 참조 0 + 실험 종결 + 재사용 가능성 없음. archive는 삭제 아님.
+
+### (111) W2 잔여 12종 env 게이트 삭제 — −1,342줄 (2026-09-29)
+
+- 감사(서브에이전트 253종 전수 분류) → 원장 근거 삭제 후보 12종 실행:
+  VK_KV8(36)·F32Q8(65)·VK_Q8D·VK_Q8MMQ(41)·VK_Q8K_MAX·VK_Q8K(54/55)·
+  Q8W_ALL(83 D2 −4.4%)·Q4_MMQ(64/75)·Q8MMQ(41)·RMSSMALL(plans/73
+  부정)·GRAPH(2026-09-20 무이득)·VK_RESF16 env 오버라이드(백엔드
+  기본 단일화).
+- 동반 삭제: 슬롯 3종(FnTileQ8d·FnTileQ8mmq·TileQ8ks) + spv 5종.
+  그래프 캡처 기계는 no-op 마커로 축소(capture_mark 호출부 14곳
+  유지를 위한 최소 보존).
+- 유지 판정: TileQ8128Ks/FnKsred(현역 K-분할)·q8_0_relayout(q8r
+  재사용)·gemm_mmq(디코드 경로 현역) — 감사 kept_and_why 참조.
+- 검증: charhash 15,674 일치·게이트 3종 PASS(FN vk 포함)·경고 0.
+- env 잔여: 진단(~60)·노브(36)·기본ON(64)·구성(8)·무판정(~140 —
+  백엔드 분해와 병행 예정, 원장 89 프로토콜 유지).

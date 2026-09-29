@@ -34,20 +34,7 @@ impl Q4Acc {
         if f32w {
             return self.launch_gemm_f32(x, wd, n_in, n_out, t, out);
         }
-        // llama MMQ 경로(부록5: q4_K maxrel 6e-4) — qwen35 raw 디코더가 쓰는
-        // 바로 그 mul_mat_q 커널. f32 활성을 직접 양자화하므로 frame_quant를
-        // 건너뛴다. 형상은 qwen35와 같은 게이트(t>=32).
         let ty = ggml_id(w.ty);
-        if t >= 32
-            && matches!(ty, 12 | 13 | 14 | 23)
-            && env_on("LLM170_Q4_MMQ")
-            && self
-                .ctx
-                .gemm_mmq(ty, x as *const u8, wd, n_in, n_out, t, out)
-                .is_ok()
-        {
-            return Ok(());
-        }
         // f16 경로는 t=1에서만 검증됨(plans/65 §19): t>1(프리필)은 x 취급이 어긋나
         // 값이 깨진다(f16-map t=4 프로브로 재현). t>1 해결 전에는 배선하지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;

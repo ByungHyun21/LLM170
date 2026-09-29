@@ -6,7 +6,6 @@ impl DecoderState {
     /// t=1 단일 스텝 본체 — 배치 모드로 전 층 단일 제출·다운로드 1회.
     /// 로짓은 b_lg에만 남는다 (전사는 step() 래퍼).
     pub(super) fn step_core(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<(), String> {
-        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let n = self.n_embd;
         debug_assert_eq!(emb.len(), n);
         let (dt_rank, d_state, d_inner) = (self.dt_rank, self.d_state, self.d_inner);
@@ -356,54 +355,28 @@ impl DecoderState {
                     {
                         let push = Self::push_u32s(&[(n_kv * hd) as u32, pos as u32]);
                         // k/v 어펜드는 상호 독립 — k 배리어 생략, v가 종결 (flash는 둘 다 판독)
-                        if kv8 {
-                            let gq = (n_kv * hd).div_ceil(32).div_ceil(64) as u32;
-                            self.run_pipe(
-                                "kv_app_q8",
-                                KV_APPEND_Q8_SPV,
-                                2,
-                                8,
-                                &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
-                                &push,
-                                gq,
-                                1,
-                                1,
-                            )?;
-                            self.run_pipe(
-                                "kv_app_q8",
-                                KV_APPEND_Q8_SPV,
-                                2,
-                                8,
-                                &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
-                                &push,
-                                gq,
-                                1,
-                                1,
-                            )?;
-                        } else {
-                            self.run_pipe(
-                                "kv_app",
-                                KV_APPEND_SPV,
-                                2,
-                                8,
-                                &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
-                                &push,
-                                (n_kv * hd).div_ceil(64) as u32,
-                                1,
-                                1,
-                            )?;
-                            self.run_pipe(
-                                "kv_app",
-                                KV_APPEND_SPV,
-                                2,
-                                8,
-                                &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
-                                &push,
-                                (n_kv * hd).div_ceil(64) as u32,
-                                1,
-                                1,
-                            )?;
-                        }
+                        self.run_pipe(
+                            "kv_app",
+                            KV_APPEND_SPV,
+                            2,
+                            8,
+                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
+                            &push,
+                            (n_kv * hd).div_ceil(64) as u32,
+                            1,
+                            1,
+                        )?;
+                        self.run_pipe(
+                            "kv_app",
+                            KV_APPEND_SPV,
+                            2,
+                            8,
+                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
+                            &push,
+                            (n_kv * hd).div_ceil(64) as u32,
+                            1,
+                            1,
+                        )?;
                     }
                     if attn_cut >= 3 {
                         // flash
@@ -414,41 +387,22 @@ impl DecoderState {
                                 n_kv as u32,
                                 hd as u32,
                             ]);
-                            if kv8 {
-                                self.run_pipe(
-                                    "qsa_flash_q8",
-                                    QSA_FLASH_Q8_SPV,
-                                    4,
-                                    16,
-                                    &[
-                                        self.b_aq.buf,
-                                        self.kv_k[full_idx][seq].buf,
-                                        self.kv_v[full_idx][seq].buf,
-                                        self.b_aout.buf,
-                                    ],
-                                    &push,
-                                    1,
-                                    n_head as u32,
-                                    1,
-                                )?;
-                            } else {
-                                self.run_pipe(
-                                    "qsa_flash",
-                                    QSA_FLASH_SPV,
-                                    4,
-                                    16,
-                                    &[
-                                        self.b_aq.buf,
-                                        self.kv_k[full_idx][seq].buf,
-                                        self.kv_v[full_idx][seq].buf,
-                                        self.b_aout.buf,
-                                    ],
-                                    &push,
-                                    1,
-                                    n_head as u32,
-                                    1,
-                                )?;
-                            }
+                            self.run_pipe(
+                                "qsa_flash",
+                                QSA_FLASH_SPV,
+                                4,
+                                16,
+                                &[
+                                    self.b_aq.buf,
+                                    self.kv_k[full_idx][seq].buf,
+                                    self.kv_v[full_idx][seq].buf,
+                                    self.b_aout.buf,
+                                ],
+                                &push,
+                                1,
+                                n_head as u32,
+                                1,
+                            )?;
                         }
                         if npck && il < 4 {
                             let b = self.b_aout.clone();
@@ -626,7 +580,6 @@ impl DecoderState {
         emb: &[f32],
         all_logits: bool,
     ) -> Result<Vec<f32>, String> {
-        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let _vk_t0b = std::time::Instant::now();
         let n = self.n_embd;
         let t = emb.len() / n;
@@ -975,62 +928,33 @@ impl DecoderState {
                 // kv append — grid (n/64, t). k/v 상호 독립 — k 배리어 생략, v가 종결
                 {
                     let push = Self::push_u32s(&[(n_kv * hd) as u32, pos0 as u32]);
-                    if kv8 {
-                        let gq = (n_kv * hd).div_ceil(32).div_ceil(64) as u32;
-                        self.run_pipe(
-                            "kv_app_q8",
-                            KV_APPEND_Q8_SPV,
-                            2,
-                            8,
-                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
-                            &push,
-                            gq,
-                            t as u32,
-                            1,
-                        )?;
-                        self.run_pipe(
-                            "kv_app_q8",
-                            KV_APPEND_Q8_SPV,
-                            2,
-                            8,
-                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
-                            &push,
-                            gq,
-                            t as u32,
-                            1,
-                        )?;
-                    } else {
-                        self.run_pipe(
-                            "kv_app",
-                            KV_APPEND_SPV,
-                            2,
-                            8,
-                            &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
-                            &push,
-                            (n_kv * hd).div_ceil(64) as u32,
-                            t as u32,
-                            1,
-                        )?;
-                        self.run_pipe(
-                            "kv_app",
-                            KV_APPEND_SPV,
-                            2,
-                            8,
-                            &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
-                            &push,
-                            (n_kv * hd).div_ceil(64) as u32,
-                            t as u32,
-                            1,
-                        )?;
-                    }
+                    self.run_pipe(
+                        "kv_app",
+                        KV_APPEND_SPV,
+                        2,
+                        8,
+                        &[self.b_ak.buf, self.kv_k[full_idx][seq].buf],
+                        &push,
+                        (n_kv * hd).div_ceil(64) as u32,
+                        t as u32,
+                        1,
+                    )?;
+                    self.run_pipe(
+                        "kv_app",
+                        KV_APPEND_SPV,
+                        2,
+                        8,
+                        &[self.b_av.buf, self.kv_v[full_idx][seq].buf],
+                        &push,
+                        (n_kv * hd).div_ceil(64) as u32,
+                        t as u32,
+                        1,
+                    )?;
                 }
                 // flash — 프리필(t≥2, GQA ≤6:1)은 다중쿼리 판(plans/83 D):
                 // K/V 타일을 24쿼리가 공유해 장문 프리필(pp4096) 어텐션 트래픽·
                 // 지연을 1/24로 줄인다. 폴백(구 판)은 LLM170_VK_NOGQ=1.
-                if t >= 2
-                    && !kv8
-                    && n_head / n_kv.max(1) <= 6
-                    && std::env::var_os("LLM170_VK_NOGQ").is_none()
+                if t >= 2 && n_head / n_kv.max(1) <= 6 && std::env::var_os("LLM170_VK_NOGQ").is_none()
                 {
                     // plans/92 P3: 레지스터 상주판(qsa_flash_reg) — hip wk16 구조
                     // 이식(LDS·배리어 0, 점유 8WG/CU급). 종전 gq는 LDS 61KB/WG로
@@ -1092,41 +1016,22 @@ impl DecoderState {
                 } else {
                     let push =
                         Self::push_u32s(&[pos0 as u32, n_head as u32, n_kv as u32, hd as u32]);
-                    if kv8 {
-                        self.run_pipe(
-                            "qsa_flash_q8",
-                            QSA_FLASH_Q8_SPV,
-                            4,
-                            16,
-                            &[
-                                self.b_aq.buf,
-                                self.kv_k[full_idx][seq].buf,
-                                self.kv_v[full_idx][seq].buf,
-                                self.b_aout.buf,
-                            ],
-                            &push,
-                            t as u32,
-                            n_head as u32,
-                            1,
-                        )?;
-                    } else {
-                        self.run_pipe(
-                            "qsa_flash",
-                            QSA_FLASH_SPV,
-                            4,
-                            16,
-                            &[
-                                self.b_aq.buf,
-                                self.kv_k[full_idx][seq].buf,
-                                self.kv_v[full_idx][seq].buf,
-                                self.b_aout.buf,
-                            ],
-                            &push,
-                            t as u32,
-                            n_head as u32,
-                            1,
-                        )?;
-                    }
+                    self.run_pipe(
+                        "qsa_flash",
+                        QSA_FLASH_SPV,
+                        4,
+                        16,
+                        &[
+                            self.b_aq.buf,
+                            self.kv_k[full_idx][seq].buf,
+                            self.kv_v[full_idx][seq].buf,
+                            self.b_aout.buf,
+                        ],
+                        &push,
+                        t as u32,
+                        n_head as u32,
+                        1,
+                    )?;
                 }
                 self.gemv_w(
                     self.b_aout.buf,
@@ -1313,11 +1218,10 @@ impl DecoderState {
         if t == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
-        // 비기본 경로(kv8, ARF 폴백)는 순차 루프 — 계약 동일, np 커널은 기본
+        // 비기본 경로(ARF 폴백)는 순차 루프 — 계약 동일, np 커널은 기본
         // 경로(arf 융합·f32 KV)만 커버.
-        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
         let arf_on = llm170_diag::flag::ne0("LLM170_VK_ARF");
-        if kv8 || !arf_on || t == 1 {
+        if !arf_on || t == 1 {
             let mut out = Vec::with_capacity(t);
             let mut toks = Vec::with_capacity(t);
             for (i, (&sq, &ps)) in seqs.iter().zip(poss.iter()).enumerate() {

@@ -1333,18 +1333,11 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
             .all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w)
             && !f32w
         {
-            // llama MMQ 우선(옵트인) — 같은 입력을 여러 커널이 공유하는 그룹이라
-            // 항목별로 MMQ 가능 타입이면 MMQ를 쓰고 나머지는 기존 타일로 간다.
-            let mmq_on = t >= 32 && env_on("LLM170_Q4_MMQ");
-            let (xq, xq_w) = if mmq_on {
-                (std::ptr::null_mut(), 0usize)
-            } else {
-                self.frame_quant(xp, ws[0].n_in as usize, t)?
-            };
+            let (xq, xq_w) = self.frame_quant(xp, ws[0].n_in as usize, t)?;
             // plans/83 D2: t=1 디코드에서 그룹 내 q8_0 인접쌍을 듀얼 커널로
             // 융합 — 런치 수 절반, 블록 수 합산(점유 개선). dual 커널의 행
             // 산술은 원판 gemm_q8_0과 동일 트리 → 비트 불변.
-            let dual_ok = t == 1 && !mmq_on && std::env::var_os("LLM170_NO_DUAL").is_none();
+            let dual_ok = t == 1 && std::env::var_os("LLM170_NO_DUAL").is_none();
             let mut idx = 0usize;
             while idx < ws.len() {
                 let w = &ws[idx];
@@ -1365,23 +1358,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 let op = self.fptr(outs[idx])?;
                 let n_in = w.n_in as usize;
                 let n_out = w.n_out as usize;
-                if mmq_on
-                    && matches!(ty, 12 | 13 | 14 | 23)
-                    && self
-                        .ctx
-                        .gemm_mmq(ty, xp as *const u8, wd, n_in, n_out, t, op)
-                        .is_ok()
-                {
-                    idx += 1;
-                    continue;
-                }
-                // f16 경로 미검증(위 frame_gemm 주석 참조) — 배선 보류.
-                let (xqi, xwi) = if mmq_on {
-                    self.frame_quant(xp, n_in, t)?
-                } else {
-                    (xq, xq_w)
-                };
-                self.launch_gemm(ty, xqi, wd, n_in, n_out, xwi, t, op)?;
+                self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, op)?;
                 idx += 1;
             }
             return Ok(());
@@ -1490,22 +1467,6 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 continue;
             }
             let op = self.fptr(outs[idx])?;
-            if w.ty == GgmlType::Q8_0 && t >= 32 && env_eq("LLM170_Q8MMQ", "1") {
-                let (wd, _) = self.dev_weight(w)?;
-                self.ctx
-                    .gemm_mmq(
-                        8,
-                        xp as *const u8,
-                        wd,
-                        w.n_in as usize,
-                        w.n_out as usize,
-                        t,
-                        op,
-                    )
-                    .map_err(|e| format!("q8mmq: {e}"))?;
-                idx += 1;
-                continue;
-            }
             self.frame_gemm(xp, w, op, t)?;
             idx += 1;
         }
@@ -1563,26 +1524,6 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
             } => {
                 let (xp, wp) = (self.fptr(x)?, self.fptr(w)?);
                 let rows = w_reps * self.t_cur();
-                // plans/73: 융합 판은 측정 역행(16.78→16.28 t/s) — 옵트인 자산.
-                // 워프=행의 320-원소 직렬 f32 체인이 part/finish 의 병렬 2런치보다 느리다.
-                if rows <= 32 && env_on("LLM170_RMSSMALL") {
-                    let mut xa = xp;
-                    let mut wa = wp;
-                    let mut op_ = self.fptr(out)?;
-                    let mut e = eps;
-                    let mut nn = n as i32;
-                    let (mut rws, mut rr) = (rows as i32, w_reps as i32);
-                    return self.kop(
-                        "rms_small",
-                        rows.div_ceil(8) as u32,
-                        1,
-                        1,
-                        256,
-                        &mut cargs!(
-                            &mut xa, &mut wa, &mut op_, &mut e, &mut nn, &mut rws, &mut rr
-                        ),
-                    );
-                }
                 let part = {
                     let mut b = self.fpart.lock().map_err(|e| e.to_string())?;
                     b.ensure(&self.ctx, rows * 32 * 8)?
