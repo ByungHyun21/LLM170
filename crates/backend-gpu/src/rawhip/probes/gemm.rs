@@ -1186,3 +1186,281 @@ pub fn mm_bench() -> Result<String, String> {
         dt2 * 1e6 / t as f64
     ))
 }
+
+/// plans/108 P7 — t=1 q8_0 dmmv(gemm_q8_0_dmmv, f32 활성 직소비) 검증:
+/// 동일 활성으로 구경로(quant_q8 + gemm_q8_0_w)와 dmmv를 계산해 f64 CPU
+/// 기준과 비교한다. 판정: dmmv 오차 ≤ 2× 구경로 오차 && ≤ 1e-2.
+pub fn hip_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
+    let model =
+        llm170_core::qwen35::Model::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let w = model.w(tname).ok_or("tensor 없음")?;
+    let ty = w.ty as u32;
+    if ty != 8 {
+        return Err(format!("hip-dmmv-check: q8_0 전용 (ty={ty})"));
+    }
+    let ctx = RawCtx::new()?;
+    let (n_in, n_out) = (w.n_in as usize, w.n_out as usize);
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let xf: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let xfd = ctx.alloc(n_in * 4)?;
+    ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+    // ── 구경로: quant_q8 + gemm_q8_0_w (t=1 q8_0 종전 산술과 동일 열) ──
+    let xq_w = crate::rawhip::q4acc::xq_words(n_in);
+    let xq = ctx.alloc(xq_w * 4)?;
+    ctx.quant_q8_b(xfd, xq, n_in, xq_w, 1)?;
+    let out_old = ctx.alloc(n_out * 4)?;
+    {
+        let part = ctx.alloc(n_out * 64 * 8)?;
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut op = out_old as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut xw = xq_w as i32;
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
+        ];
+        ctx.launch3(
+            "gemm_q8_0_w",
+            n_out.div_ceil(8) as u32,
+            1,
+            1,
+            256,
+            &mut args,
+        )?;
+    }
+    // ── 신경로: dmmv (f32 직소비 — 활성 quant 없음) ──
+    let out_dm = ctx.alloc(n_out * 4)?;
+    ctx.gemv_q8_dmmv_out(xfd, wd, n_in, n_out, out_dm)?;
+    ctx.sync()?;
+    let mut vo = vec![0f32; n_out];
+    let mut vd = vec![0f32; n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut vo), out_old)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut vd), out_dm)?;
+    // ── f64 CPU 기준: 블록 34B [d f16][32×i8] dequant 내적 ──
+    let nblk = n_in / 32;
+    let mut refr = vec![0f64; n_out];
+    for o in 0..n_out {
+        let mut acc = 0f64;
+        let mut bo = o * nblk * 34;
+        for b in 0..nblk {
+            let d = llm170_core::quant::deq::f16(w.data, bo) as f64;
+            let qs = &w.data[bo + 2..bo + 34];
+            let mut s = 0f64;
+            for (c, &qb) in qs.iter().enumerate() {
+                s += (qb as i8 as f64) * xf[b * 32 + c] as f64;
+            }
+            acc += d * s;
+            bo += 34;
+        }
+        refr[o] = acc;
+    }
+    let mut eo = 0f64;
+    let mut ed = 0f64;
+    for o in 0..n_out {
+        eo = eo.max((vo[o] as f64 - refr[o]).abs());
+        ed = ed.max((vd[o] as f64 - refr[o]).abs());
+    }
+    let pass = ed <= 2.0 * eo && ed <= 1e-2;
+    let verdict = if pass { "PASS" } else { "FAIL" };
+    Ok(format!(
+        "hip-dmmv-check {tname} ty={ty} n_in={n_in} n_out={n_out}: {verdict} — old_err={eo:.3e} dmmv_err={ed:.3e} (f64 기준)\n  old[0..4]={:?}\n  dmmv[0..4]={:?}\n  ref[0..4]={:?}",
+        &vo[..4.min(n_out)],
+        &vd[..4.min(n_out)],
+        &refr[..4.min(n_out)]
+    ))
+}
+
+/// plans/108 P7 — MoE direct-ids dmmv(q4_gemm_q4k_dmmv_ids/q5_1_gemm_dmmv_ids,
+/// f32 활성 직소비) 검증: 동일 활성·ids로 구경로(t=1 direct-ids: quant_q8 +
+/// q4_gemm_q4k_ge_ids / q4_gemm_q5_1_w_ids)와 dmmv를 계산해 f64 CPU 기준과
+/// 비교한다. 활성은 t=1 시맨틱(전 행 동일 벡터 — 구경로 q4k_ge_ids가 전 행
+/// 0번 활성을 읽는다). 판정: dmmv 오차 ≤ 2× 구경로 오차 && ≤ 1e-2.
+pub fn hip_moe_dmmv_check(path: &str, tname: &str) -> Result<String, String> {
+    let m = llm170_core::qwen4exp::Model4::load(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
+    let w = m.w(tname).ok_or("tensor 없음")?;
+    let ty = w.ty;
+    if !matches!(ty, llm170_gguf::GgmlType::Q4K | llm170_gguf::GgmlType::Q5_1) {
+        return Err(format!("hip-moe-dmmv-check: q4_K/q5_1 전용 (ty={ty:?})"));
+    }
+    let ne = m.hp.n_expert.max(1);
+    let (n_in, n_out) = (w.n_in as usize, (w.n_out as usize) / ne);
+    let per_expert = w.data.len() / ne;
+    let ctx = RawCtx::new()?;
+    let wd = ctx.alloc(w.data.len())?;
+    ctx.h2d(wd, w.data)?;
+    let mut seed = 0x9e3779b9u64;
+    let mut lcg = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let rows = m.hp.n_expert_used.clamp(1, 16);
+    let x0: Vec<f32> = (0..n_in).map(|_| lcg()).collect();
+    let xf: Vec<f32> = x0.repeat(rows);
+    let ids: Vec<u32> = (0..rows)
+        .map(|_| ((lcg() + 0.5) * ne as f32) as u32 % ne as u32)
+        .collect();
+    let xfd = ctx.alloc(xf.len() * 4)?;
+    ctx.h2d(xfd, bytemuck::cast_slice(&xf))?;
+    let ids_d = ctx.alloc(rows * 4)?;
+    ctx.h2d(ids_d, bytemuck::cast_slice(&ids))?;
+    // ── 구경로: quant_q8 + t=1 direct-ids 커널 (frame_moe_gemm 종전 배치) ──
+    let xq_w = crate::rawhip::q4acc::xq_words(n_in);
+    let xq = ctx.alloc(xq_w * 4 * rows)?;
+    ctx.quant_q8_b(xfd, xq, n_in, xq_w, rows)?;
+    let out_old = ctx.alloc(rows * n_out * 4)?;
+    let part = ctx.scratch(4)?;
+    if ty == llm170_gguf::GgmlType::Q4K {
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut op = out_old as *mut std::ffi::c_void;
+        let mut ip = ids_d as *mut std::ffi::c_void;
+        let (mut ni, mut no) = (n_in as i32, n_out as i32);
+        let (mut xw, mut tt, mut eb) = (0i32, rows as i32, per_expert as i32);
+        let mut rp: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ip as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
+            &mut tt as *mut _ as *mut std::ffi::c_void,
+            &mut eb as *mut _ as *mut std::ffi::c_void,
+            (&mut rp) as *mut _ as *mut std::ffi::c_void,
+        ];
+        ctx.launch3(
+            "q4_gemm_q4k_ge_ids",
+            n_out.div_ceil(16) as u32,
+            rows.div_ceil(16) as u32,
+            1,
+            256,
+            &mut args,
+        )?;
+    } else {
+        if n_in / 32 > 32 {
+            return Err(format!(
+                "hip-moe-dmmv-check: q5_1 구경로는 n_sub≤32 필요 (n_in={n_in})"
+            ));
+        }
+        let mut xp = xq as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut pp = part as *mut std::ffi::c_void;
+        let mut op = out_old as *mut std::ffi::c_void;
+        let mut ip = ids_d as *mut std::ffi::c_void;
+        let (mut ni, mut no) = (n_in as i32, n_out as i32);
+        let (mut xw, mut tt) = (xq_w as i32, rows as i32);
+        let mut ew = (per_expert / 4) as i32;
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ip as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut xw as *mut _ as *mut std::ffi::c_void,
+            &mut tt as *mut _ as *mut std::ffi::c_void,
+            &mut ew as *mut _ as *mut std::ffi::c_void,
+        ];
+        ctx.launch3(
+            "q4_gemm_q5_1_w_ids",
+            n_out.div_ceil(8) as u32,
+            rows as u32,
+            1,
+            256,
+            &mut args,
+        )?;
+    }
+    // ── 신경로: dmmv (f32 직소비 — 활성 quant 없음, 런치 1회) ──
+    let out_dm = ctx.alloc(rows * n_out * 4)?;
+    let kern = if ty == llm170_gguf::GgmlType::Q4K {
+        "q4_gemm_q4k_dmmv_ids"
+    } else {
+        "q5_1_gemm_dmmv_ids"
+    };
+    {
+        let mut xp = xfd as *mut std::ffi::c_void;
+        let mut wp = wd as *mut std::ffi::c_void;
+        let mut op = out_dm as *mut std::ffi::c_void;
+        let mut ip = ids_d as *mut std::ffi::c_void;
+        let (mut ni, mut no) = (n_in as i32, n_out as i32);
+        let (mut tt, mut eb) = (rows as i32, per_expert as i32);
+        let mut args = vec![
+            &mut xp as *mut _ as *mut std::ffi::c_void,
+            &mut wp as *mut _ as *mut std::ffi::c_void,
+            &mut op as *mut _ as *mut std::ffi::c_void,
+            &mut ip as *mut _ as *mut std::ffi::c_void,
+            &mut ni as *mut _ as *mut std::ffi::c_void,
+            &mut no as *mut _ as *mut std::ffi::c_void,
+            &mut tt as *mut _ as *mut std::ffi::c_void,
+            &mut eb as *mut _ as *mut std::ffi::c_void,
+        ];
+        let wgs = n_out.div_ceil(2);
+        ctx.launch3(
+            kern,
+            rows as u32,
+            wgs.min(65535) as u32,
+            wgs.div_ceil(65535) as u32,
+            64,
+            &mut args,
+        )?;
+    }
+    ctx.sync()?;
+    let mut vo = vec![0f32; rows * n_out];
+    let mut vd = vec![0f32; rows * n_out];
+    ctx.d2h(bytemuck::cast_slice_mut(&mut vo), out_old)?;
+    ctx.d2h(bytemuck::cast_slice_mut(&mut vd), out_dm)?;
+    // ── f64 CPU 기준: dequant_row × 동일 활성 내적 ──
+    let (blck, bsize) = ty.block_info();
+    let row_bytes = (n_in / blck as usize) * bsize as usize;
+    let mut wrow = vec![0f32; n_in];
+    let mut eo = 0f64;
+    let mut ed = 0f64;
+    for r in 0..rows {
+        let ebase = ids[r] as usize * per_expert;
+        for o in 0..n_out {
+            llm170_core::quant::dequant_row(
+                ty,
+                &w.data[ebase + o * row_bytes..],
+                0,
+                n_in as u64,
+                &mut wrow,
+            );
+            let mut s = 0f64;
+            for i in 0..n_in {
+                s += x0[i] as f64 * wrow[i] as f64;
+            }
+            eo = eo.max((vo[r * n_out + o] as f64 - s).abs());
+            ed = ed.max((vd[r * n_out + o] as f64 - s).abs());
+        }
+    }
+    let pass = ed <= 2.0 * eo && ed <= 1e-2;
+    let verdict = if pass { "PASS" } else { "FAIL" };
+    Ok(format!(
+        "hip-moe-dmmv-check {tname} ty={ty:?} n_in={n_in} n_out={n_out}/expert rows={rows} ne={ne}: {verdict} — old_err={eo:.3e} dmmv_err={ed:.3e} (f64 기준)\n  old[0..4]={:?}\n  dmmv[0..4]={:?}",
+        &vo[..4.min(vo.len())],
+        &vd[..4.min(vd.len())]
+    ))
+}

@@ -215,6 +215,22 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t2 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(208usize);
             llm170_backend_gpu::rawhip::mmq_row_check(&path, &tn, t1, t2)
         }
+        "hip-dmmv-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
+            let tn = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "blk.0.ssm_out.weight".into());
+            llm170_backend_gpu::rawhip::hip_dmmv_check(&path, &tn)
+        }
+        "hip-moe-dmmv-check" => {
+            let path = args.first().cloned().unwrap_or_else(|| d_fn.into());
+            let tn = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "blk.0.ffn_gate_exps.weight".into());
+            llm170_backend_gpu::rawhip::hip_moe_dmmv_check(&path, &tn)
+        }
         "tile-row-check" => {
             let path = args.first().cloned().unwrap_or_else(|| d_27.into());
             let tn = args

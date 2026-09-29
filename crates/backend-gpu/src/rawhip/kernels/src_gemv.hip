@@ -1124,3 +1124,71 @@ extern "C" __global__ void __launch_bounds__(256) gemm_mix_dual(
         acc += __shfl_xor_sync(0xffffffffffffffffull, acc, off);
     if (lane == 0) out4[o4] = acc;
 }
+
+// ─── plans/108 P7: t=1 q8_0 dmmv — vk gemv8_q8b.comp 이식 ───
+// f32 활성 직소비(활성 quant 생략). 64스레드/WG · 2행/WG · 레인당 k 8개
+// (WG 반복당 k 512). 블록 34B [d f16][32×i8] — 비정렬 u32 워드 조립으로
+// 레인이 원소 8개를 한 번에 dequant. 활성이 f32 원본이므로 dot4(정수) 대신
+// f32 곱-가산 — 레인 f32 누산 + f64 32레인 트리 환원(셔플 폭 32 제한 —
+// gemm_q8_0 계열과 동일 구조). grid=(1, ceil(n_out/2), gz), block 64.
+DEV float dot8f(unsigned v, float a, float b, float c, float d) {
+    return (float)sext8(v) * a + (float)sext8(v >> 8) * b
+         + (float)sext8(v >> 16) * c + (float)sext8(v >> 24) * d;
+}
+
+extern "C" __global__ void __launch_bounds__(64) gemm_q8_0_dmmv(
+        const float* __restrict__ x, const unsigned* __restrict__ w,
+        float* __restrict__ out, int n_in, int n_out) {
+    const int l = threadIdx.x;
+    if (l >= 64) return;
+    const int tok = blockIdx.x;
+    const int wg = blockIdx.y + (int)blockIdx.z * gridDim.y;
+    const int first_row = wg << 1;
+    if (first_row >= n_out) return;
+    const int num_rows = min(2, n_out - first_row);
+    const float* xr = x + (size_t)tok * n_in;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const int KPIT = 64 * 8;   // 512 k/iter
+    for (int col0 = l << 3; col0 < n_in; col0 += KPIT) {
+        const float b0x = xr[col0],     b0y = xr[col0+1], b0z = xr[col0+2], b0w = xr[col0+3];
+        const float b1x = xr[col0+4],   b1y = xr[col0+5], b1z = xr[col0+6], b1w = xr[col0+7];
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            if (n >= num_rows) break;
+            const int col = (first_row + n) * n_in + col0;   // 행 절대 k 기저
+            const int blk = col >> 5;
+            const int bbase = blk * 34;
+            const int rem = col & 31;                        // 블록 내 원소 (8 정렬)
+            const int wd = bbase + 2 + rem;
+            const int wq = wd >> 2;
+            const unsigned w0 = w[wq], w1 = w[wq+1], w2 = w[wq+2];
+            const int sh = (wd & 3) * 8;
+            // 원소 8개 = wd..wd+7 바이트 — 두 u32에서 8바이트 조립
+            const unsigned v0b = (w0 >> sh) | (sh != 0 ? (w1 << (32 - sh)) : 0u);
+            const unsigned v1b = (w1 >> sh) | (sh != 0 ? (w2 << (32 - sh)) : 0u);
+            const float d = f16w(w, bbase);
+            const float r = d * (dot8f(v0b, b0x, b0y, b0z, b0w)
+                               + dot8f(v1b, b1x, b1y, b1z, b1w));
+            if (n == 0) acc0 += r; else acc1 += r;
+        }
+    }
+    // 트리 환원 — gemm_q8_0 계열과 동일(f64, 상/하반 sh32 교환 + 32레인 트리)
+    __shared__ double sh0[32], sh1[32];
+    double a0 = (double)acc0, a1 = (double)acc1;
+    if (l >= 32) { sh0[l - 32] = a0; sh1[l - 32] = a1; }
+    __syncthreads();
+    if (l < 32) {
+        a0 += sh0[l];
+        a1 += sh1[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffffffffffull, a0, off);
+            a1 += __shfl_down_sync(0xffffffffffffffffull, a1, off);
+        }
+        if (l == 0) {
+            float* orow = out + (size_t)tok * n_out;
+            orow[first_row] = (float)a0;
+            if (num_rows > 1) orow[first_row + 1] = (float)a1;
+        }
+    }
+}

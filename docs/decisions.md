@@ -3138,3 +3138,21 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - 실측 참고: FN 콜드 로드+1스텝 vk 24.7s vs hip 33.2s(vk가 이미 빠름).
 - 판정: 전파 불필요(구조 동일이 아니라 목표 상태가 이미 구현됨).
   잔여 최적화 후보는 SSD 읽기 자체(io_uring 비동기 — 별도 판정).
+
+### (118) hip dmmv 포팅(승인 산술 변경) — 밀도 q8_0 + MoE q4k/q5_1, +9.8% (108 P7, 2026-09-29)
+
+- 커널 3종 포팅(hipRTC·NAMES 등록): gemm_q8_0_dmmv(vk gemv8_q8b —
+  f32 활성×커널내 q8_0 디양자 dot)·q4_gemm_q4k_dmmv_ids(fn_moe_ids2 —
+  ids 직접 인덱싱 단일 런치)·q5_1_gemm_dmmv_ids. 프레임 mm 그룹 t=1
+  q8_0 전용 경로 + frame_moe_gemm Q4K/Q5_1 경로가 quant/카운팅정렬/
+  reduce를 건너뛴다. 킬스위치 LLM170_HIP_DMMV_OFF=1.
+- 정합: hip-dmmv-check f64 대조 old 1.26e-2 → dmmv 3.3e-7, MoE old
+  2.97e-3 → 1.7e-7 (활성 양자화 제거로 원소 정확도 4-5자릿수 향상).
+- 성능: FN hip 디코드 5.73→6.29 t/s(+9.8%, reps3 중앙값). **18 t/s
+  목표 미달** — ktrace 벽분해: 스텝당 ~1200 런치×호스트 오버헤드가
+  지배(GPU 실동 ~18ms/스텝). 값경로 재검증 2.71 t/s(18 이력 비재현 —
+  경로 이행 중 회귀 의심, 별도 조사 후보). 잔여 레버: 프레임
+  elementwise 융합(rms/silu/hc 계열 ~500런치) 또는 그래프 캡처
+  재조사(2026-09-20 무이득 측정의 프레임 경로 한정 재검).
+- 게이트: 골든 재캡처(승인 변경)·FN hip 기준선 갱신(17374 66 16 23
+  … — 그리디 근접동률 클래스 정상)·27B·FN vk 무영향 PASS·preflight 6/6.
