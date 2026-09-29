@@ -22,23 +22,28 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let d_27 = "/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf";
     let d_q35 = "/home/yoon/models/qwen3.8-27b/q35work.gguf";
     let r: Result<String, String> = match cmd {
-        "gpu-raw-probe" => llm170_backend_gpu::rawhip::raw_probe(arg_num(
-            args, 0, 2000,
-        )),
-        "launch-rate" => llm170_backend_gpu::rawhip::launch_rate(arg_num(
-            args, 0, 20000,
-        )),
-        "f16-bench" => {
-            llm170_backend_gpu::rawhip::f16_bench(arg_num(args, 0, 128), arg_num(args, 1, 2560), arg_num(args, 2, 640), arg_num(args, 3, 20))
-        }
-        "q4k-bench" => {
-            llm170_backend_gpu::rawhip::q4k_bench(arg_num(args, 0, 128), arg_num(args, 1, 2560), arg_num(args, 2, 640), arg_num(args, 3, 20))
-        }
+        "gpu-raw-probe" => llm170_backend_gpu::rawhip::raw_probe(arg_num(args, 0, 2000)),
+        "launch-rate" => llm170_backend_gpu::rawhip::launch_rate(arg_num(args, 0, 20000)),
+        "f16-bench" => llm170_backend_gpu::rawhip::f16_bench(
+            arg_num(args, 0, 128),
+            arg_num(args, 1, 2560),
+            arg_num(args, 2, 640),
+            arg_num(args, 3, 20),
+        ),
+        "q4k-bench" => llm170_backend_gpu::rawhip::q4k_bench(
+            arg_num(args, 0, 128),
+            arg_num(args, 1, 2560),
+            arg_num(args, 2, 640),
+            arg_num(args, 3, 20),
+        ),
         "q4k-micro" => llm170_backend_gpu::rawhip::q4k_micro(),
         "q4-d2h-bench" => llm170_backend_gpu::rawhip::d2h_bench(),
-        "q5-1-bench" => {
-            llm170_backend_gpu::rawhip::q5_1_bench(arg_num(args, 0, 20), arg_num(args, 1, 640), arg_num(args, 2, 2560), arg_num(args, 3, 50))
-        }
+        "q5-1-bench" => llm170_backend_gpu::rawhip::q5_1_bench(
+            arg_num(args, 0, 20),
+            arg_num(args, 1, 640),
+            arg_num(args, 2, 2560),
+            arg_num(args, 3, 50),
+        ),
         "q4-qsa-check" => llm170_backend_gpu::rawhip::q4acc::qsa_check(
             arg_num(args, 0, 200usize),
             arg_num(args, 1, 200usize),

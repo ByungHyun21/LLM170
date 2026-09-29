@@ -228,9 +228,7 @@ pub fn generate_q35(
 ) -> Result<(&'static str, SpecStats), String> {
     let n = st.next.len();
     let mut stats = SpecStats::default();
-    let spec_on = spec_k > 0
-        && eng.has_mtp()
-        && std::env::var_os("LLM170_SPEC_GPU").is_some();
+    let spec_on = spec_k > 0 && eng.has_mtp() && std::env::var_os("LLM170_SPEC_GPU").is_some();
     if spec_k > 0 && !eng.has_mtp() {
         eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
     }

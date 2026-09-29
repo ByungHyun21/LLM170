@@ -98,7 +98,6 @@ impl DecoderState {
         vals.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-
     /// quant: [t][n] f32 → xq (q8 레이아웃).
     pub(super) fn quant(
         &mut self,
@@ -192,8 +191,7 @@ impl DecoderState {
                 );
             }
         }
-        if ty == 20
-        {
+        if ty == 20 {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
                 "gemv8_nlb",
@@ -209,8 +207,7 @@ impl DecoderState {
             );
         }
         // i3s (plans/46) — IQ3_S 전용 (마지막 폴백 제거, quant.rs deq_iq3_s 미러).
-        if ty == 21
-        {
+        if ty == 21 {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
                 "gemv8_i3s",
@@ -226,8 +223,7 @@ impl DecoderState {
             );
         }
         // xsb (plans/40) — llama generic dmmv 구조 × 검증 xs 디코드: 125→182GB/s.
-        if ty == 23
-        {
+        if ty == 23 {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
                 "gemv8_xsb",
@@ -802,7 +798,6 @@ impl DecoderState {
         )
     }
 
-
     /// 단계 공유 GEMV 그룹 — 잡들은 상호 독립(동일 입력·상이 출력)이라
     /// 그룹 내부 배리어 생략, 마지막 잡이 배리어로 종결.
     /// xq 양자화는 실제 폴백 잡이 있을 때만 수행 (gemv8 직결 사이트의 dead
@@ -841,7 +836,6 @@ impl DecoderState {
         }
         Ok(())
     }
-
 
     /// rms_norm (t행) — 상수 가중치 (consts).
     pub(super) fn rms(

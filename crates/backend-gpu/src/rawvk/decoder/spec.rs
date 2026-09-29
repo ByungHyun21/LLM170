@@ -315,64 +315,56 @@ impl DecoderState {
         // (plans/20 계약 + P0 verify_np_self 재확보 — gemv8t 2..4토큰 포함).
         // per-token 복원(VKD_SPEC_BATCH=0)은 plans/109 P6 삭제.
 
-            let n = self.n_embd;
-            for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
-                let t = ch.len() / n;
-                let _tt = std::time::Instant::now();
-                // 107 W1: all_logits=true는 이제 전사 없이 b_lg_t에 상주
-                // (step_batch 계약 변경 — 유일 소비자가 이 경로다).
-                let _ = self.step_batch(seq, pos0 + off, ch, true)?;
-                // fn_argmax_rows 2단계 GPU argmax — t×608KB 전사·CPU 스캔 폐지.
-                let nv = self.n_vocab;
-                let n_wg = nv.div_ceil(256 * 8);
-                let push0 = Self::push_u32s(&[nv as u32, 0u32, n_wg as u32]);
-                let push1 = Self::push_u32s(&[nv as u32, 1u32, n_wg as u32]);
-                let binds = [self.b_lg_t.buf, self.b_amsc.buf, self.b_amr.buf];
-                self.ctx.begin_batch()?;
-                self.run_pipe_b(
-                    "fn_argmax_rows",
-                    crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
-                    3,
-                    12,
-                    &binds,
-                    &push0,
-                    n_wg as u32,
-                    t as u32,
-                    1,
-                    true,
-                )?;
-                self.run_pipe_b(
-                    "fn_argmax_rows",
-                    crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
-                    3,
-                    12,
-                    &binds,
-                    &push1,
-                    1,
-                    t as u32,
-                    1,
-                    true,
-                )?;
-                self.ctx.end_batch_wait()?;
-                let mut toks = vec![0u32; t];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.b_amr.ptr as *const u32,
-                        toks.as_mut_ptr(),
-                        t,
-                    )
-                };
-                argmaxes.extend_from_slice(&toks);
-                let mut hv = vec![0f32; t * n];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.b_xs.ptr as *const f32,
-                        hv.as_mut_ptr(),
-                        t * n,
-                    )
-                };
-                h_all.extend_from_slice(&hv);
-            }
+        let n = self.n_embd;
+        for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
+            let t = ch.len() / n;
+            let _tt = std::time::Instant::now();
+            // 107 W1: all_logits=true는 이제 전사 없이 b_lg_t에 상주
+            // (step_batch 계약 변경 — 유일 소비자가 이 경로다).
+            let _ = self.step_batch(seq, pos0 + off, ch, true)?;
+            // fn_argmax_rows 2단계 GPU argmax — t×608KB 전사·CPU 스캔 폐지.
+            let nv = self.n_vocab;
+            let n_wg = nv.div_ceil(256 * 8);
+            let push0 = Self::push_u32s(&[nv as u32, 0u32, n_wg as u32]);
+            let push1 = Self::push_u32s(&[nv as u32, 1u32, n_wg as u32]);
+            let binds = [self.b_lg_t.buf, self.b_amsc.buf, self.b_amr.buf];
+            self.ctx.begin_batch()?;
+            self.run_pipe_b(
+                "fn_argmax_rows",
+                crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
+                3,
+                12,
+                &binds,
+                &push0,
+                n_wg as u32,
+                t as u32,
+                1,
+                true,
+            )?;
+            self.run_pipe_b(
+                "fn_argmax_rows",
+                crate::rawvk::vkacc::FN_ARGMAX_ROWS_SPV,
+                3,
+                12,
+                &binds,
+                &push1,
+                1,
+                t as u32,
+                1,
+                true,
+            )?;
+            self.ctx.end_batch_wait()?;
+            let mut toks = vec![0u32; t];
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.b_amr.ptr as *const u32, toks.as_mut_ptr(), t)
+            };
+            argmaxes.extend_from_slice(&toks);
+            let mut hv = vec![0f32; t * n];
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, hv.as_mut_ptr(), t * n)
+            };
+            h_all.extend_from_slice(&hv);
+        }
         Ok(Vec::new())
     }
 

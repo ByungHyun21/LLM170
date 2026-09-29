@@ -41,7 +41,6 @@ pub(crate) fn env_on(name: &'static str) -> bool {
         .or_insert_with(|| std::env::var_os(name).is_some())
 }
 
-
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {
         Ok(())

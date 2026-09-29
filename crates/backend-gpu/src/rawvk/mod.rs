@@ -50,7 +50,6 @@ pub fn gdn_check() -> Result<String, String> {
     let lcg_v = |n: usize| -> Vec<f32> { (0..n).map(|_| lcg()).collect() };
     let mut lines: Vec<String> = Vec::new();
 
-
     // ── split3: [t=3][n0+n1+n2=12]
     {
         let (n0, n1, n2, t) = (4usize, 5usize, 3usize, 3usize);

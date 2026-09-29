@@ -207,8 +207,12 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     if backend != "cpu" {
         // GPU 부착 — 단일 경로(attach_q4/35 정책과 동일 구조. vl은 경고 후
         // CPU 지속 — 종전과 동일하나 vk-q35 게이트·VkAcc 분기가 serve와 동일해짐).
-        eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", crate::engine::AttachPolicy::Warn)
-            .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+        eng = crate::engine::attach_q35(
+            eng,
+            gpu_runtime == "vulkan",
+            crate::engine::AttachPolicy::Warn,
+        )
+        .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
     }
     let eos = 248044u32;
     let t1 = std::time::Instant::now();
@@ -259,7 +263,10 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             next,
             pos: base_len.iter().map(|&b| b as u32).collect(),
         };
-        let mut sink = VlSink { texts: &mut texts, eos };
+        let mut sink = VlSink {
+            texts: &mut texts,
+            eos,
+        };
         crate::engine::generate_q35(&mut eng, &mut st, n_predict, spec_k, eos, &mut sink)?;
         Ok(())
     })();
@@ -285,13 +292,7 @@ struct VlSink<'a> {
     eos: u32,
 }
 impl crate::engine::TokenSink for VlSink<'_> {
-    fn on_token(
-        &mut self,
-        s: usize,
-        pos: u32,
-        t: u32,
-        eng: &llm170_core::qwen35::Engine,
-    ) {
+    fn on_token(&mut self, s: usize, pos: u32, t: u32, eng: &llm170_core::qwen35::Engine) {
         if t != self.eos {
             self.texts[s].push_str(&eng.piece(t));
         }
