@@ -13,6 +13,11 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut n_predict = 48usize;
     let mut ctx = 4096usize;
     let backend = ma.backend.clone().unwrap_or_else(|| "gpu".into());
+    let gpu_runtime = ma
+        .gpu_runtime
+        .clone()
+        .or_else(|| std::env::var("LLM170_GPU_RUNTIME").ok())
+        .unwrap_or_else(|| "hip".into());
     let mut spec_k = 0usize;
     // 장문·임의 질문 지원 (plans/28): prefix는 vision_start 앞, question은
     // vision_end 뒤 — 기본(미지정)은 기존 하드코딩 프롬프트와 동일.
@@ -200,18 +205,10 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성
     }
     if backend != "cpu" {
-        let rt = std::env::var("LLM170_GPU_RUNTIME").unwrap_or_else(|_| "hip".into());
-        if rt == "vulkan" {
-            // plans/29: LLM은 VkDecoder 기본. ViT는 HIP 시도 → 실패 시
-            // 기존 CPU clip 폴백 (vision 블록의 에러 폴백 경유).
-            match llm170_backend_gpu::rawvk::decoder::inject(&mut eng) {
-                Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
-                Err(e) => eprintln!("vk-decoder: {e} — CPU 진행"),
-            }
-        } else {
-            llm170_backend_gpu::rawhip::decode::inject(&mut eng)
-                .unwrap_or_else(|e| eprintln!("rawhip: {e}"));
-        }
+        // GPU 부착 — 단일 경로(attach_q4/35 정책과 동일 구조. vl은 경고 후
+        // CPU 지속 — 종전과 동일하나 vk-q35 게이트·VkAcc 분기가 serve와 동일해짐).
+        eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", crate::engine::AttachPolicy::Warn)
+            .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
     }
     let eos = 248044u32;
     let t1 = std::time::Instant::now();
