@@ -13,6 +13,7 @@ use super::layers::SeqState4;
 mod diag;
 mod fb;
 mod forward;
+mod mtp;
 mod multi;
 mod np;
 
@@ -20,6 +21,8 @@ use diag::{buf_hash, frame_ck, ftime_on, ftime_report, sync_mark};
 
 pub use diag::stage_skipped;
 pub use forward::*;
+pub use mtp::MtpFrame;
+pub(crate) use mtp::mtp_draft_frame;
 pub use multi::*;
 pub use np::*;
 
@@ -171,6 +174,8 @@ pub struct Frame4 {
     pub mtp_h_export: bool,
     /// 직전 forward의 pre-mixer res_hc 행 [t][hc·n](mtp_h_export 시에만).
     pub last_res_hc_rows: Vec<Vec<f32>>,
+    /// MTP 드래프트 전용 상주 버퍼(plans/110 W1) — has_mtp 모델에서 할당.
+    pub mtp: Option<Box<MtpFrame>>,
 }
 
 fn alloc(acc: &dyn Accelerator, len: usize) -> Result<u64, Q4Error> {
@@ -318,6 +323,7 @@ impl Frame4 {
             dirty: vec![true; seqs.len()],
             mtp_h_export: false,
             last_res_hc_rows: Vec::new(),
+            mtp: None,
         };
         // 107 W8 (원장 112): PLE 스크래치는 첫 PLE 층 실행 전엔 미기입 —
         // 할당 잔재가 진단 해시를 흔든다(L1B.ple_gate 간헐 발산 — 페이지
@@ -387,6 +393,24 @@ impl Frame4 {
             }
         }
         put("output_hc_norm", &model.f32_vec4("output_hc_norm.weight")?)?;
+        // plans/110 W1: MTP 드래프트(nextn 블록 il=n_layer) — 상주 버퍼 +
+        // hc_mix·헤드 norm 상수. 트렁크 consts는 0..n_layer라 키 충돌 없음.
+        if model.has_mtp() {
+            let il = hp.n_layer;
+            put(
+                &format!("blk.{il}.hc_attn_norm"),
+                &model.f32_vec4(&format!("blk.{il}.hc_attn_norm.weight"))?,
+            )?;
+            put(
+                &format!("blk.{il}.hc_ffn_norm"),
+                &model.f32_vec4(&format!("blk.{il}.hc_ffn_norm.weight"))?,
+            )?;
+            put(
+                &format!("blk.{il}.nextn.hc_head_norm"),
+                &model.f32_vec4(&format!("blk.{il}.nextn.hc_head_norm.weight"))?,
+            )?;
+            f.mtp = Some(Box::new(MtpFrame::new(acc, model)?));
+        }
         // 전 시퀀스의 현재 CPU 상태를 초기값으로 (dirty 해소)
         for (si, st) in seqs.iter().enumerate() {
             f.sync_states(acc, si, st, hp.d_state)?;

@@ -14,9 +14,10 @@ pub enum Id {
     QsaAttn = 5,
     FrameCreate = 6,
     FrameCreateNp = 7,
+    MtpDraft = 8,
 }
 
-const NAMES: [&str; 8] = [
+const NAMES: [&str; 9] = [
     "emb-q8g",
     "ple-ggpu",
     "qsa-devsel",
@@ -25,9 +26,11 @@ const NAMES: [&str; 8] = [
     "qsa-attn",
     "frame-create",
     "frame-create-np",
+    "mtp-draft",
 ];
 
-static COUNTS: [AtomicUsize; 8] = [
+static COUNTS: [AtomicUsize; 9] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),

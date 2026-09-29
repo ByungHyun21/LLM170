@@ -274,10 +274,10 @@ impl Engine4 {
         let mut next = t0;
         for _ in 0..k.saturating_sub(1) {
             let _acc = self.acc.clone();
-            let (lg, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
+            let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
             chain_h = dh;
-            next = crate::qwen35::greedy(&lg);
+            next = next_d;
         }
         // ③ 검증 — 제안 순차 타깃 디코드 후 수용 접두 판정.
         let mut tgt_out = Vec::new();
@@ -356,14 +356,16 @@ impl Engine4 {
     /// MTP 드래프트 스텝(vLLM qwen4_exp mtp.py 준거, plans/109 P15④).
     /// h 계약: **프리-믹서 멀티 스트림 잔차 [hc·n] 평탄화** — 타깃은
     /// last_res_hc(최종 hc_mix_head 이전), 체인은 직전 드래프트 스텝의
-    /// pre-mix 반출. 반환: (로짓, pre-mix 멀티 [hc·n]).
+    /// pre-mix 반출. 반환: (greedy 토큰, pre-mix 멀티 [hc·n]).
+    /// plans/110 W1: 프레임 경로 우선 — Frame4 상주 버퍼 + FrameOp 체인
+    /// (값경로 GEMV의 호출당 d2h 동기 제거). 실패 시 fb 카운터 + 값경로 폴백.
     fn mtp_draft_step_h(
         &mut self,
         seq: usize,
         x: u32,
         h_pre: &[f32],
         acc: Option<&dyn Accelerator>,
-    ) -> Result<(Vec<f32>, Vec<f32>), Q4Error> {
+    ) -> Result<(u32, Vec<f32>), Q4Error> {
         if !self.model.has_mtp() || self.mtp_seqs.is_empty() {
             return Err(Q4Error::Io("mtp_draft_step: MTP 미적재".into()));
         }
@@ -383,6 +385,7 @@ impl Engine4 {
         dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
         // enorm: 임베딩 플랫 정규화 [n]. hnorm: **멀티 스트림 전체 플랫 RMS**
         // [hc·n](vLLM GemmaRMSNorm(hidden*hc_count) 평탄 1회 — 스트림별 아님).
+        // 두 norm은 공통(값·프레임 경로 동일 입력).
         let en = crate::ops::rms_norm(
             &e,
             &self
@@ -397,6 +400,38 @@ impl Engine4 {
                 .f32_vec4(&format!("blk.{il}.nextn.hnorm.weight"))?,
             hp.eps,
         );
+        // ── plans/110 W1: 프레임 경로 — 상주 버퍼 GEMV 체인 ──
+        let mtp_t = std::time::Instant::now();
+        if self.frame_on(true) && self.frame_ensure() {
+            let Engine4 {
+                model,
+                frame,
+                mtp_seqs,
+                acc: acc_field,
+                ..
+            } = self;
+            let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                unreachable!("frame_ensure 성공 직후");
+            };
+            match super::frame::mtp_draft_frame(a, model, f, &mut mtp_seqs[seq], &en, &hn) {
+                Ok((tok, chain_h)) => {
+                    if llm170_diag::dump::opts().key("mtp_time") {
+                        eprintln!(
+                            "# mtp-draft-frame: {:.2}ms",
+                            mtp_t.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    mtp_seqs[seq].pos += 1;
+                    return Ok((tok, chain_h));
+                }
+                Err(e) => {
+                    super::frame::fb_incr(super::frame::FbId::MtpDraft);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| eprintln!("# mtp-draft-frame: 실패 — 값경로 폴백 ({e})"));
+                }
+            }
+        }
+        // ── 값경로(종전 판) ──
         // eh_proj [2n→n] = 융합 [fc_embedding | fc_hidden]: 스트림 s 초기값 =
         //   fc_hidden(hn_s) + fc_embedding(en)  (vLLM amd: emb.unsqueeze + hidden).
         // fc_embedding = 입력 반쪽 [..n], fc_hidden = 입력 뒤반쪽 [n..2n].
@@ -468,11 +503,13 @@ impl Engine4 {
         self.mtp_seqs[seq].pos += 1;
         // 체인 반출 = pre-mix 멀티 스트림(마지막 행).
         let chain_h = res_hc.last().cloned().unwrap_or_default();
-        Ok((logits, chain_h))
+        Ok((crate::qwen35::greedy(&logits), chain_h))
     }
 
-    /// MTP dense 게이트드 어텐션 (plans/109 P15②) — 트렁크 cpu_attn_row와
-    /// 동일 산술(마스크=전체 참석) + q/k norm·rope + KV 적립 + wo.
+    /// MTP dense 게이트드 어텐션 (plans/109 P15②) — 값경로 판. 투영(q/k/v)은
+    /// mm_group, norm·rope·KV·softmax·게이트는 mtp_attn_cpu_row(공유 코어),
+    /// wo 투영 mm_group. 프레임 경로(110 W1)는 frame/mtp.rs가 동일 코어를
+    /// 판독한 q/k/v 행으로 호출한다.
     fn mtp_dense_attn(
         &mut self,
         seq: usize,
@@ -481,7 +518,6 @@ impl Engine4 {
         acc: Option<&dyn Accelerator>,
     ) -> Result<Vec<Vec<f32>>, Q4Error> {
         let hp = &self.model.hp;
-        let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
         let wq = self.model.w4(&format!("blk.{il}.attn_q.weight"))?;
         let wk = self.model.w4(&format!("blk.{il}.attn_k.weight"))?;
         let wv = self.model.w4(&format!("blk.{il}.attn_v.weight"))?;
@@ -512,68 +548,11 @@ impl Engine4 {
             vv = std::mem::take(&mut gi[2]);
         }
         let mtp_st = &mut self.mtp_seqs[seq];
-        let pos0 = mtp_st.pos;
-        let kq_scale = hp.kq_scale();
-        let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
+        let mut attn_all = Vec::with_capacity(n_tok);
         for t in 0..n_tok {
-            let pos = pos0 + t as u32;
-            // q: 헤드별 norm+rope(전반 hd) — 게이트 후반은 미가공.
-            for h in 0..n_head {
-                let lo = h * 2 * hd;
-                let mut qh = crate::ops::rms_norm(&qg[t][lo..lo + hd], &qn, hp.eps);
-                crate::ops::rope_head(&mut qh, pos, n_rot, hp.rope_base);
-                qg[t][lo..lo + hd].copy_from_slice(&qh);
-            }
-            // k: kv헤드별 norm+rope → 캐시 적립. v: 원문 그대로.
-            let kbase = pos as usize * n_kv * hd;
-            for h in 0..n_kv {
-                let lo = h * hd;
-                let mut kh = crate::ops::rms_norm(&kk[t][lo..lo + hd], &kn, hp.eps);
-                crate::ops::rope_head(&mut kh, pos, n_rot, hp.rope_base);
-                mtp_st.kv_k[0][kbase + lo..kbase + lo + hd].copy_from_slice(&kh);
-            }
-            mtp_st.kv_v[0][kbase..kbase + n_kv * hd].copy_from_slice(&vv[t]);
-            // dense softmax 어텐션 + 게이트 — cpu_attn_row 열에서 **cell 0은
-            // 스킵**(드래프트 KV는 위치 1부터 기입 — 팬텀 0키가 softmax 질량을
-            // 훔치는 결함, P15④-5).
-            let n_past = pos as usize;
-            let (ck, cv) = (&mtp_st.kv_k[0], &mtp_st.kv_v[0]);
-            let out = &mut attn_all[t];
-            for h in 0..n_head {
-                let kvh = h / (n_head / n_kv);
-                let mut maxv = f32::NEG_INFINITY;
-                let mut scores = vec![0.0f32; n_past];
-                for (p, sc) in scores.iter_mut().enumerate() {
-                    let p = p + 1; // cell 0 스킵
-                    let b = p * n_kv * hd + kvh * hd;
-                    let mut d = 0.0f32;
-                    for i in 0..hd {
-                        d += qg[t][h * 2 * hd + i] * ck[b + i];
-                    }
-                    *sc = d * kq_scale;
-                    maxv = maxv.max(*sc);
-                }
-                let mut sum = 0.0f32;
-                for sc in scores.iter_mut() {
-                    *sc = (*sc - maxv).exp();
-                    sum += *sc;
-                }
-                let ob = h * hd;
-                for (p0, sc) in scores.iter().enumerate() {
-                    let w = sc / sum;
-                    if w == 0.0 {
-                        continue;
-                    }
-                    let b = (p0 + 1) * n_kv * hd + kvh * hd;
-                    for i in 0..hd {
-                        out[ob + i] += w * cv[b + i];
-                    }
-                }
-                let gb = h * 2 * hd + hd;
-                for i in 0..hd {
-                    out[ob + i] *= sigmoid(qg[t][gb + i]);
-                }
-            }
+            attn_all.push(mtp_attn_cpu_row(
+                hp, &mut qg[t], &mut kk[t], &vv[t], mtp_st, &qn, &kn,
+            ));
         }
         // wo 투영 (대여 분리 — KV 적립 종료 후 새 Ctx).
         let ctx = Ctx {
@@ -1601,6 +1580,80 @@ fn pure_hash(
     .0
 }
 
+/// MTP dense 어텐션 CPU 코어(plans/110 W1 분리) — q/k/v 원시 행 1개에
+/// norm·rope·KV 적립·softmax(cell 0 스킵)·게이트를 적용해 [n_head·hd] 반환.
+/// 값경로(mtp_dense_attn)와 프레임 경로(frame/mtp.rs)가 공유 — 산술 단일 소스.
+pub(crate) fn mtp_attn_cpu_row(
+    hp: &Hparams4,
+    q_row: &mut [f32],
+    k_row: &mut [f32],
+    v_row: &[f32],
+    st: &mut SeqState4,
+    qn: &[f32],
+    kn: &[f32],
+) -> Vec<f32> {
+    let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
+    let pos = st.pos;
+    let kq_scale = hp.kq_scale();
+    // q: 헤드별 norm+rope(전반 hd) — 게이트 후반은 미가공.
+    for h in 0..n_head {
+        let lo = h * 2 * hd;
+        let mut qh = crate::ops::rms_norm(&q_row[lo..lo + hd], qn, hp.eps);
+        crate::ops::rope_head(&mut qh, pos, n_rot, hp.rope_base);
+        q_row[lo..lo + hd].copy_from_slice(&qh);
+    }
+    // k: kv헤드별 norm+rope → 캐시 적립. v: 원문 그대로.
+    let kbase = pos as usize * n_kv * hd;
+    for h in 0..n_kv {
+        let lo = h * hd;
+        let mut kh = crate::ops::rms_norm(&k_row[lo..lo + hd], kn, hp.eps);
+        crate::ops::rope_head(&mut kh, pos, n_rot, hp.rope_base);
+        st.kv_k[0][kbase + lo..kbase + lo + hd].copy_from_slice(&kh);
+    }
+    st.kv_v[0][kbase..kbase + n_kv * hd].copy_from_slice(v_row);
+    // dense softmax 어텐션 + 게이트 — cpu_attn_row 열에서 **cell 0은
+    // 스킵**(드래프트 KV는 위치 1부터 기입 — 팬텀 0키가 softmax 질량을
+    // 훔치는 결함, P15④-5).
+    let n_past = pos as usize;
+    let (ck, cv) = (&st.kv_k[0], &st.kv_v[0]);
+    let mut out = vec![0.0f32; n_head * hd];
+    for h in 0..n_head {
+        let kvh = h / (n_head / n_kv);
+        let mut maxv = f32::NEG_INFINITY;
+        let mut scores = vec![0.0f32; n_past];
+        for (p, sc) in scores.iter_mut().enumerate() {
+            let p = p + 1; // cell 0 스킵
+            let b = p * n_kv * hd + kvh * hd;
+            let mut d = 0.0f32;
+            for i in 0..hd {
+                d += q_row[h * 2 * hd + i] * ck[b + i];
+            }
+            *sc = d * kq_scale;
+            maxv = maxv.max(*sc);
+        }
+        let mut sum = 0.0f32;
+        for sc in scores.iter_mut() {
+            *sc = (*sc - maxv).exp();
+            sum += *sc;
+        }
+        let ob = h * hd;
+        for (p0, sc) in scores.iter().enumerate() {
+            let w = sc / sum;
+            if w == 0.0 {
+                continue;
+            }
+            let b = (p0 + 1) * n_kv * hd + kvh * hd;
+            for i in 0..hd {
+                out[ob + i] += w * cv[b + i];
+            }
+        }
+        let gb = h * 2 * hd + hd;
+        for i in 0..hd {
+            out[ob + i] *= sigmoid(q_row[gb + i]);
+        }
+    }
+    out
+}
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).
 fn hc_combine(res_hc: &mut [Vec<f32>], out: &[Vec<f32>], inject: &[Vec<f32>], hc: usize) {
     for (t, o) in out.iter().enumerate() {
