@@ -3316,3 +3316,20 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   검증 지배가 아님). LLM170_SPEC_TB=1이 t=k-1 배치 실험 선택(W3이 t≥2 패밀리
   비트 동일화를 끝내면 전환), LLM170_SPEC_NOBATCH=1 순차 탈출구 유지.
 - 게이트: FN hip·27B hip·FN vk·charhash 15,674 PASS.
+
+### (128) 스펙 배치 검증 t≥2 발산의 진짜 근원 — ple_hash pos 핸드셰이크 (plans/110 W3, 2026-09-30)
+
+- **근원**: frame_forward_verify가 같은 seq의 t행을 해시할 때 전 행을 같은
+  `seq.pos`로 ple_hash 호출 — ple_hash는 `hist_valid = (ple_next_pos == pos)`
+  핸드셰이크로 체인하므로 행1+의 hist_valid가 깨져 잘못된 n-gram 행(다른 PLE
+  emb)을 냈다. 다음 라운드 PLE층(L1)에서 ~1e-4 발산 → 누적되어 17번째 토큰
+  플립. V{il} 체크섬 바이섹트(발산이 R2의 V1.res=PLE층 행0에서 시작) +
+  ple_dump 체인 대조로 특정.
+- **오심 방기**: mt 계열 GEMV·MoE t>1 경로의 비트 불일치는 발산 원인이
+  아니었다(VERIFY_ROW_PIN이 이미 중화). 행별 moe_frame_np 교체는 배치
+  moe_frame(t)로 복원 — 여전히 등가. PLE 링도 무죄(동기 후 대조 동일).
+- **수리**: 해시 루프에서 행마다 pos 진행(해시 후 복원 — QSA/GDN 행은
+  base+occ로 자체 산출). t=k-1 배치를 유일 프레임 경로로(행별 V1 디버그
+  스위치·SPEC_TB env 삭제, ADR-0019; NOBATCH=1 탈출구 유지).
+- 실측: 기본 배치 k=3 == 비스펙 **43/43**(16라운드), k=2 49/49, 게이트 4종
+  PASS·preflight 6/6. 배치 검증의 무게 상각이 스펙 경로에 열린 상태.
