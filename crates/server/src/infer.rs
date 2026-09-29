@@ -88,6 +88,8 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             ctx,
             &backend,
             &gpu_runtime,
+            spec_k,
+            ma.mtp.as_deref(),
         );
     }
     let engine_res = llm170_core::qwen35::Model::load(&model_path)
@@ -190,12 +192,22 @@ fn run_q4_infer(
     ctx: usize,
     backend: &str,
     gpu_runtime: &str,
+    spec_k: Option<usize>,
+    mtp_arg: Option<&str>,
 ) -> ExitCode {
     let t_start = std::time::Instant::now();
     let want_gpu = crate::engine::q4_gpu_wanted_str(backend, gpu_runtime);
     let res = llm170_core::qwen4exp::Model4::load(model_path)
         .map_err(|e| e.to_string())
         .and_then(|m| {
+            let mut m = m;
+            crate::engine::apply_mtp(
+                &mut m,
+                model_path,
+                mtp_arg.map(std::path::Path::new),
+                spec_k.unwrap_or(0),
+            )
+            .map_err(|e| e.to_string())?;
             let n = prompts.len();
             let sources = m.part_sources();
             let eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
@@ -223,10 +235,38 @@ fn run_q4_infer(
                 finished[s] = t == eos;
             }
             let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            let k_spec = spec_k.unwrap_or(0);
+            let mut spec_stats = (0usize, 0usize); // (수용, forward)
             for _step in 0..n_predict {
                 let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
                 if active.is_empty() {
                     break;
+                }
+                // plans/109 P15⑤: MTP 스펙(단일 시퀀스+greedy) — mtp_spec_step.
+                if k_spec > 0 && eng.model.has_mtp() && active.len() == 1 {
+                    let s = active[0];
+                    let (acc, fwd) = eng
+                        .mtp_spec_step(s, next[s], k_spec)
+                        .map_err(|e| e.to_string())?;
+                    spec_stats.0 += acc.len();
+                    spec_stats.1 += fwd;
+                    let mut stop = false;
+                    for &t in &acc {
+                        pos[s] += 1;
+                        println!(
+                            "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
+                            pos[s],
+                            crate::json::quoted(&eng.piece(t))
+                        );
+                        next[s] = t;
+                        if t == eos {
+                            finished[s] = true;
+                            stop = true;
+                            break;
+                        }
+                    }
+                    let _ = stop;
+                    continue;
                 }
                 // plans/73(np): 활성 2+ 는 배치 디코드(무게 스트리밍 공유).
                 if active.len() > 1 {
@@ -267,6 +307,14 @@ fn run_q4_infer(
             }
             if llm170_diag::dump::opts().alloc {
                 llm170_diag::alloc::report();
+            }
+            if k_spec > 0 && spec_stats.1 > 0 {
+                eprintln!(
+                    "# spec(q4, k={k_spec}): 수용 {}토큰 / {} forward = {:.2} tok/fwd",
+                    spec_stats.0,
+                    spec_stats.1,
+                    spec_stats.0 as f64 / spec_stats.1 as f64
+                );
             }
             eprintln!(
                 "# done(q4): {n} seqs, gen per seq: {n_predict} (elapsed {:.1?})",

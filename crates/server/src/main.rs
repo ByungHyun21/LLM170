@@ -74,6 +74,8 @@ pub(crate) struct ModelArgs {
     pub model: Option<String>,
     pub backend: Option<String>,
     pub gpu_runtime: Option<String>,
+    /// 외장 MTP(nextn) 모듈 경로 (plans/109 P15⑤) — "--mtp <path>".
+    pub mtp: Option<String>,
     pub rest: Vec<String>,
 }
 
@@ -92,6 +94,7 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
         model: None,
         backend: None,
         gpu_runtime: None,
+        mtp: None,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -117,6 +120,7 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                 }
                 ma.gpu_runtime = Some(v);
             }
+            "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
             _ => ma.rest.push(a.to_string()),
         }
         i += 1;
@@ -296,8 +300,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     }
     let _ = engine::TOKENIZER.set(tok.unwrap_or_else(tokenize::Tokenizer::empty));
     let req = engine::InferRequest {
-        model: model_path,
+        model: model_path.clone(),
         ctx,
+        mtp: ma.mtp.clone().map(PathBuf::from),
     };
     let sel = if backend == "gpu" {
         if gpu_runtime.is_empty() {
