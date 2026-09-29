@@ -7,7 +7,6 @@ mod attn;
 mod gdn;
 mod gemm;
 mod misc;
-mod wmma;
 
 pub use attn::*;
 pub use gdn::*;
