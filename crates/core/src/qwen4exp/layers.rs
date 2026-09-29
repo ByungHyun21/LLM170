@@ -285,18 +285,14 @@ impl Engine4 {
             // 복원 후 수용 접두만 재적립 (t0는 이미 커밋된 ① 상태에 포함).
             self.seqs[seq] = snap_t;
             self.mtp_seqs[seq] = snap_d;
-            // t0 재확보(상태 복원으로 last_h도 이전 값) — t0 1 forward.
-            let l = self.decode1(seq, last_token)?;
-            forwards += 1;
-            debug_assert_eq!(crate::qwen35::greedy(&l), t0);
-            // 수용분 재적립 — t0 이후 제안 p_1..p_{n_acc}(t0 자체는 위에서
-            // 이미 커밋됨 — proposals[0]은 t0라 건너뛴다).
-            if n_acc >= 1 {
-                for &p in &proposals[1..=n_acc] {
-                    self.decode1(seq, p)?;
-                    forwards += 1;
-                }
+            // 스냅샷은 ①(=last_token 디코드 완료) 직후 상태다 — last_token을
+            // 다시 디코드하면 이중 적립으로 상태가 오염된다(k=3 첫 발산의
+            // 원인, plans/109 P15⑤). 수용분 t0..p_{n_acc}만 재적립.
+            for &p in &proposals[..=n_acc.min(proposals.len() - 1)] {
+                self.decode1(seq, p)?;
+                forwards += 1;
             }
+            // emit은 t0 + 수용 제안 p_1..p_{n_acc} + 보너스 — t0는 이미 push됨.
             accepted.extend_from_slice(&proposals[1..=n_acc.min(proposals.len() - 1)]);
             accepted.push(tgt_out[n_acc]);
         }
