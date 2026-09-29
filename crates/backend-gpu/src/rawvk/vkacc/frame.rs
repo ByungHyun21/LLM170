@@ -720,10 +720,12 @@ impl VkAcc {
                     let idv: Vec<u32> = {
                         let g = self.framebufs.lock();
                         let b = g.get(&ids).ok_or("ids 핸들 없음")?;
+                        // SAFETY (107 W8): ids 매핑 판독 — 직전 end_batch_wait로 GPU 유휴; rows 원소.
                         unsafe { std::slice::from_raw_parts(b.ptr as *const u32, rows) }.to_vec()
                     };
                     let gg = self.moe_grp.lock();
                     let gg = gg.as_ref().unwrap();
+                    // SAFETY (107 W8): moe_grp 매핑 판독 클로저 — end_batch_wait 후 유휴; n은 각 버퍼 원소수와 일치(호출부 지정).
                     let rd = |b: &VkBuf, n: usize| unsafe {
                         std::slice::from_raw_parts(b.ptr as *const u32, n)
                     };
@@ -750,6 +752,7 @@ impl VkAcc {
                     }
                     let rows_pad = hpoff[ne].max(16);
                     let rp_dev =
+                        // SAFETY (107 W8): rows_pad 매핑 판독 — 유휴 상태(end_batch_wait 후), 2원소.
                         unsafe { std::slice::from_raw_parts(gg.rows_pad.ptr as *const u32, 2) }[0]
                             as usize;
                     let rp_dbg =
@@ -848,6 +851,7 @@ impl VkAcc {
                     None => {
                         let bytes = q8_0_relayout(w.data, n_in, w.n_out as usize);
                         let b = ctx.alloc_host(bytes.len())?;
+                        // SAFETY (107 W8): q8 relayout 캐시 기입 — b는 bytes.len()으로 방금 alloc_host; 매핑 유효, 제출 전.
                         unsafe {
                             std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.ptr, bytes.len())
                         };
@@ -1026,6 +1030,7 @@ impl VkAcc {
             }
             let g = self.framebufs.lock();
             let b = g.get(&ids).ok_or("vk moe: ids 핸들 없음")?;
+            // SAFETY (107 W8): ids 매핑 판독 — 직전 end_batch_wait로 GPU 유휴; rows 원소.
             unsafe { std::slice::from_raw_parts(b.ptr as *const u32, rows) }.to_vec()
         };
         let mut off = vec![0usize; ne + 1];
@@ -1082,6 +1087,7 @@ impl VkAcc {
             let r = g.as_ref().unwrap();
             (r.0.buf, r.1.buf, r.2.buf, r.3.buf)
         };
+        // SAFETY (107 W8): moebufs 매핑 기입 — perm/inv 각 rows u32로 크기 일치; 기록 단계(제출 전).
         unsafe {
             let g = self.moebufs.lock();
             let r = g.as_ref().unwrap();

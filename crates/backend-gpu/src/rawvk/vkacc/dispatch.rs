@@ -27,6 +27,7 @@ impl VkAcc {
             let b = self.rbufs.lock();
             let (xv, wv, _) = b.as_ref().unwrap();
             for (ti, row) in xs.iter().enumerate() {
+                // SAFETY (107 W8): xv 매핑 기입 — .add(ti*n*4), rbufs는 t행*n 용량; 잠금 중이고 이 옵의 제출 전이라 GPU 접근 없음.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         row.as_ptr(),
@@ -35,6 +36,7 @@ impl VkAcc {
                     )
                 };
             }
+            // SAFETY (107 W8): wv 매핑 기입 — n원소, rbufs 용량 이내; 제출 전.
             unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), wv.ptr as *mut f32, n) };
         }
         let (xb, wb, ob) = {
@@ -49,6 +51,7 @@ impl VkAcc {
         ctx.run(p.pl, ds2, p.pipe, &push, t as u32, 1, 1)?;
         let host = {
             let b = self.rbufs.lock();
+            // SAFETY (107 W8): 출력 매핑 판독 — 비배치 run은 제출+펜스 대기로 동기; t*n 원소는 obuf 크기와 일치.
             unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, t * n) }
         };
         for ti in 0..t {
@@ -85,6 +88,7 @@ impl VkAcc {
             let b = self.sbufs.lock();
             let (gv, uv, _) = b.as_ref().unwrap();
             for (ti, row) in gs.iter().enumerate() {
+                // SAFETY (107 W8): gv 매핑 기입 — .add(ti*n*4), sbufs는 t행*n 용량; 제출 전.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         row.as_ptr(),
@@ -94,6 +98,7 @@ impl VkAcc {
                 };
             }
             for (ti, row) in us.iter().enumerate() {
+                // SAFETY (107 W8): uv 매핑 기입 — .add(ti*n*4), sbufs 용량 이내; 제출 전.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         row.as_ptr(),
@@ -122,6 +127,7 @@ impl VkAcc {
         )?;
         let host = {
             let b = self.sbufs.lock();
+            // SAFETY (107 W8): 출력 매핑 판독 — 비배치 run 동기 완료; total 원소는 obuf 크기와 일치.
             unsafe { std::slice::from_raw_parts(b.as_ref().unwrap().2.ptr as *const f32, total) }
         };
         for ti in 0..t {
@@ -170,6 +176,7 @@ impl VkAcc {
         }
         // 1) xs 업로드 → quant(n0)
         for (ti, row) in xs.iter().enumerate() {
+            // SAFETY (107 W8): xf 매핑 기입 — .add(ti*n0*4), xf는 need≥t*n0*4로 성장 확보; 잠금 유지 중.
             unsafe {
                 std::ptr::copy_nonoverlapping(row.as_ptr(), xf_ptr.add(ti * n0 * 4) as *mut f32, n0)
             };
@@ -241,6 +248,7 @@ impl VkAcc {
         if std::env::var_os("LLM170_VK_NOBATCH").is_none() {
             ctx.end_batch_wait()?;
         }
+        // SAFETY (107 W8): 출력 매핑 판독 — 직전 end_batch_wait(또는 동기 run)로 GPU 유휴; t*n0 원소.
         let host = unsafe { std::slice::from_raw_parts(ob_ptr as *const f32, t * n0) };
         for ti in 0..t {
             xs_out[ti].copy_from_slice(&host[ti * n0..(ti + 1) * n0]);

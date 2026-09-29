@@ -226,6 +226,7 @@ pub(crate) fn frame_forward_ex(
                         match (|| -> Result<(), Q4Error> {
                             let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
                             let tdata: &[u8] =
+                                // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; gather는 읽기 전용(동시 쓰기 없음).
                                 unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
                             acc.ple_gather_dev(tptr, tdata, &ple_rows, f.ple_emb, thd)
                                 .map_err(Q4Error::Io)
@@ -245,6 +246,7 @@ pub(crate) fn frame_forward_ex(
                     let gather_mt = |_emb: &mut [f32]| -> Result<(), Q4Error> {
                         let (tptr, tlen, tty, thd) = ctx.model.ple_table_view()?;
                         let tdata: &[u8] =
+                            // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; 스레드별 파티션은 읽기만 한다.
                             unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
                         let nt = std::thread::available_parallelism()
                             .map(|n| n.get())
