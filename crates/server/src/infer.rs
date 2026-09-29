@@ -326,7 +326,7 @@ fn run_q4_infer(
                 println!(
                     "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
                     p.len(),
-                    json_escape(&eng.piece(t))
+                    crate::json::quoted(&eng.piece(t))
                 );
                 next.push(t);
                 finished[s] = t == eos;
@@ -350,7 +350,7 @@ fn run_q4_infer(
                         println!(
                             "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
                             pos[s],
-                            json_escape(&eng.piece(t))
+                            crate::json::quoted(&eng.piece(t))
                         );
                         finished[s] = t == eos;
                     }
@@ -368,7 +368,7 @@ fn run_q4_infer(
                         println!(
                             "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
                             pos[s],
-                            json_escape(&eng.piece(t))
+                            crate::json::quoted(&eng.piece(t))
                         );
                         finished[s] = t == eos;
                     }
@@ -398,25 +398,8 @@ fn emit(seq: usize, pos: u32, token: u32, eng: &llm170_core::qwen35::Engine) {
         seq,
         pos,
         token,
-        json_escape(&eng.piece(token))
+        crate::json::quoted(&eng.piece(token))
     );
-}
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 fn parse_ids(s: &str) -> Result<Vec<u32>, std::num::ParseIntError> {
     s.split(',').map(|t| t.trim().parse::<u32>()).collect()

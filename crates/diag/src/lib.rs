@@ -13,7 +13,6 @@ pub mod trace;
 pub mod watchdog;
 pub mod writer;
 
-pub use flag::env_on;
 pub use fp::{fp_diff, fp_record};
 pub use trace::Ev;
 pub use trace::capture_on;

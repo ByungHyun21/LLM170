@@ -7,6 +7,7 @@ mod bench;
 mod engine;
 mod http;
 mod infer;
+mod json;
 mod probes;
 mod resource;
 mod tokenize;
