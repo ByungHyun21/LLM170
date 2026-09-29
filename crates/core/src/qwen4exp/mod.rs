@@ -113,6 +113,8 @@ pub struct Model4 {
     f32_cache: std::cell::RefCell<HashMap<String, Vec<f32>>>,
     pub token_pieces: Vec<String>,
     pub eos: u32,
+    /// 외장 MTP(nextn) 모듈 적재 여부 — blk.{n_layer}.* + nextn.* 텐서.
+    pub mtp_nextn: bool,
 }
 
 pub struct PartMap {
@@ -201,6 +203,7 @@ impl Model4 {
             f32_cache: std::cell::RefCell::new(HashMap::new()),
             token_pieces,
             eos,
+            mtp_nextn: false,
         };
         for name in ["token_embd.weight", "output.weight"] {
             m.w(name).ok_or(Q4Error::MissingTensor(name.into()))?;
