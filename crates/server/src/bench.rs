@@ -452,9 +452,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             ));
         } else if *spec_k > 0 && has_mtp {
             while n_gen < *tg {
-                let (toks, tf) = eng
-                    .spec_step(0, next, *spec_k)
-                    .map_err(|e| e.to_string())?;
+                let (toks, tf) = eng.spec_step(0, next, *spec_k).map_err(|e| e.to_string())?;
                 fwd += tf;
                 for &t in &toks {
                     if n_gen >= *tg {

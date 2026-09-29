@@ -12,7 +12,6 @@ static VALUES: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLoc
         .collect()
 });
 
-
 /// 이름 존재 여부 — `var_os(name).is_some()` 대응(캐시형).
 pub fn on(name: &str) -> bool {
     VALUES.contains_key(name)

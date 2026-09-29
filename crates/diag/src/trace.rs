@@ -5,7 +5,6 @@
 //! 프로덕션 호출 0으로 삭제했다 — rawhip ktrace는 자체 스토어를 쓰고
 //! 집계는 writer::table이 담당한다.
 
-
 /// resolved 이벤트 — 백엔드 어댑터가 채운 완성품.
 #[derive(Debug, Clone)]
 pub struct Ev {
@@ -20,7 +19,6 @@ pub struct Ev {
     /// 시작부터의 순차 시각(ms) — resolve 시 계산.
     pub seq_ms: f64,
 }
-
 
 /// 절대 시작 시각 기반 갭/순차 계산 — 어댑터가 start_ms를 채운 뒤 호출.
 /// 갭은 end(k)→start(k+1)로 잰 뒤 **전임자 이벤트에 귀속**한다
@@ -74,4 +72,3 @@ mod tests {
         assert_eq!(evs[0].gap_next_ms, Some(0.0), "겹침은 갭 0으로 클램프");
     }
 }
-

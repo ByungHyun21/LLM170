@@ -614,9 +614,7 @@ impl DecodeState {
             let mut tl = nrow_attn as i32;
             let mut ss = self.ctx_len as i32;
             let mut p0 = (pos0 + t - nrow_attn) as i32;
-            if np_
-                > 128
-            {
+            if np_ > 128 {
                 let sg = 128;
                 let nseg = (pos0 + t).div_ceil(sg);
                 let part = self.ctx.scratch(nrow_attn * n_head * nseg * (hd + 2) * 4)?;
