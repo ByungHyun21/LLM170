@@ -3156,3 +3156,24 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   재조사(2026-09-20 무이득 측정의 프레임 경로 한정 재검).
 - 게이트: 골든 재캡처(승인 변경)·FN hip 기준선 갱신(17374 66 16 23
   … — 그리디 근접동률 클래스 정상)·27B·FN vk 무영향 PASS·preflight 6/6.
+
+### (119) 유지보수 캠페인 1차 — env 75종 삭제·구조 통합 (plans/109, 2026-09-29)
+
+- **env 정리(사용자 지시: 디버깅·서빙 불필요 전부 삭제)**: EnvAudit 280종 전수
+  분류(SERVE/DEBUG/삭제후보/산술/판정보류) 후 75종 삭제 — Tier1 측정 부정
+  옵트인(Q5KV2·Q8W4/16·PP/DECODE_PAIRS·VK_GDNCH·VK_I8ON 계열·QHIST 등),
+  Tier2 승격 완료 킬스위치 35종(원장 111 선례), Tier3 수치 노브 상수화(CHUNK·
+  QSA_TH/SEG/SPLITS·T1SEG/T1SG 등). 카탈로그 280→205. 고아 spv 14종 삭제
+  (gemm_i8·gemv8_q5/4/xs/q3/q6/q8·tile128o·fn_gdn_chunk·f16b 계열) +
+  매니페스트 재생성.
+- **구조 통합(커밋 7370899…67a1cfc)**: json 이스케이프 단일화(B2 — http판은
+  제어문자 미처리로 invalid JSON 가능), diag 죽은 표면 삭제(B3 — flag
+  registry/envcheck 공전 수리), attach_q35/attach_q4 팩토리로 4중 백엔드
+  부착 통일(B1 — infer/bench/vl이 serve의 vk-q35 비결정 게이트(원장 87/90)를
+  우회하던 것 전면화, vl은 파싱 인자 사용), generate_q35 단일 생성 루프
+  (infer·vl 3모드 복제 통합), bench 4분할·probes 인자 헬퍼·http enqueue 공용화.
+- **res_f16 잔여 발산 문서화**: infer/bench q4 hip은 f32 버스(골든 기준),
+  serve는 f16 버스(원장 105). 통일 시도 시 FN infer 골든 발산·토큰 열화
+  실측(760 7 22 7…) — 규칙 10 승인 전까지 호출부 명시 유지.
+- 게이트: charhash hip 15,674라인 동일 · FN hip/vk · 27B 토큰 PASS ·
+  preflight 통과. 누적 −3.5k 라인.
