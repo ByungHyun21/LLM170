@@ -84,6 +84,13 @@ pub(super) fn gdn_frame_np(
     t: usize,
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
+    // 행이 서로 다른 seq일 때만 1런치 conv/AR 경로 — 같은 seq 행(W2 검증
+    // 배치)은 상태를 행 간 체인해야 해서 per-row t=1 순차 폴백만이 정확하다
+    // (1런치 경로는 행별 독립 상태 전제).
+    let mut uniq = seqs.to_vec();
+    uniq.sort_unstable();
+    uniq.dedup();
+    let distinct = uniq.len() == seqs.len();
     let wqkv = model.w4(&format!("blk.{il}.attn_qkv.weight"))?;
     let wz = model.w4(&format!("blk.{il}.attn_gate.weight"))?;
     let wb = model.w4(&format!("blk.{il}.ssm_beta.weight"))?;
@@ -123,7 +130,7 @@ pub(super) fn gdn_frame_np(
     // 종전 행별 t=1 루프(상태 커널이 t_cur 로 행 수를 유추해 t_cur=1로 내린다).
     // qkv/gconv는 [t][ch] 연속 프레임 버퍼라 정본 핸들 직접.
     let conv_states: Vec<u64> = seqs.iter().map(|&sq| f.st_conv[sq][ri]).collect();
-    if seqs.len() > 1
+    if distinct
         && acc
             .frame_gdn_conv_np(f.gqkv, f.gconv, &conv_states, cw, conv_ch, hp.conv_k)
             .is_ok()
@@ -196,7 +203,7 @@ pub(super) fn gdn_frame_np(
     // AR(상태) — plans/74 N2: 행별 상태 테이블 1런치. 실패 시 종전 행별 t=1.
     let ar_states: Vec<u64> = seqs.iter().map(|&sq| f.st_gdn[sq][ri]).collect();
     let fs: &dyn FrameState = acc;
-    if seqs.len() > 1
+    if distinct
         && acc
             .frame_gdn_ar_np(
                 f.gq, f.gk, f.gv, f.gbg, f.go, &ar_states, hp.n_group, hp.dt_rank, hp.d_state,
@@ -302,9 +309,14 @@ pub(super) fn qsa_frame_np(
     let r = hp.compress[il] as usize;
     let vv = f.np_views.as_ref().unwrap();
     fs_begin(acc, 1); // per-seq 구간
+    // 같은 seq가 여러 행이면(W2 검증 배치) 행 순서대로 위치를 진행 —
+    // 서로 다른 seq(np)는 행당 1회라 발생 수가 0이어서 종전과 동일.
+    let mut occ: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (row, &sq) in seqs.iter().enumerate() {
-        let st = &mut seq_sts[sq];
-        let pos0 = st.pos as usize;
+        let base = seq_sts[sq].pos as usize;
+        let seen = *occ.entry(sq).or_insert(0);
+        occ.insert(sq, seen + 1);
+        let pos0 = base + seen;
         acc.frame_qk_norm_rope(
             vv.qsa_q[row],
             vv.qsa_k[row],
@@ -365,7 +377,7 @@ pub(super) fn qsa_frame_np(
             vv.qsa_attn[row],
         )
         .map_err(Q4Error::Io)?;
-        st.qsa_host_stale = true;
+        seq_sts[sq].qsa_host_stale = true;
     }
     fs_begin(acc, t); // 공유 구간 복귀
     acc.frame_mm_group(f.qsa_attn, &[wo], &[f.ffn_out], t)
