@@ -176,14 +176,16 @@ impl Engine4 {
     /// Frame4 지연 생성 스탠자 — 7중 복제 통합(plans/109 P7). 실패 시
     /// frame_broken + fb_incr(FrameCreate) + 경고 후 false(호출부 value 폴백).
     fn frame_ensure(&mut self) -> bool {
-        if self.frame.is_some() {
+        if let Some(f) = self.frame.as_mut() {
+            f.mtp_h_export = self.model.has_mtp();
             return true;
         }
         let Some(acc) = self.acc.as_deref() else {
             return false;
         };
         match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
-            Ok(f) => {
+            Ok(mut f) => {
+                f.mtp_h_export = self.model.has_mtp();
                 self.frame = Some(f);
                 true
             }
@@ -984,6 +986,11 @@ impl Engine4 {
                 // 107 W1.5-4: 중간 청크는 head+로짓 전사 스킵(NoReadback) —
                 // 최종 청크만 Full. 버려지던 152k GEMV·608KB d2h 제거.
                 let is_last = ci + 1 == n_chunks;
+                // P15④c: 청크별 pre-mixer 행 누적(MTP h export — 비스펙 0비용).
+                if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                    self.last_res_hc_rows
+                        .extend(f.last_res_hc_rows.iter().cloned());
+                }
                 let logits = if is_last {
                     super::frame::frame_forward(
                         acc,
@@ -1010,8 +1017,16 @@ impl Engine4 {
                 self.seqs[seq].pos += ch.len() as u32;
                 f.dirty[seq] = false;
                 if is_last {
+                    // 최종 청크 export 누적 + 마지막 행 동기.
+                    if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                        self.last_res_hc_rows
+                            .extend(f.last_res_hc_rows.iter().cloned());
+                    }
                     last = Some(logits);
                 }
+            }
+            if !self.last_res_hc_rows.is_empty() {
+                self.last_res_hc = self.last_res_hc_rows.last().cloned().unwrap_or_default();
             }
             return Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]));
         }
@@ -1074,6 +1089,22 @@ impl Engine4 {
             )?;
             self.seqs[seq].pos += ch.len() as u32;
             f.dirty[seq] = false;
+            // P15④c: 청크별 pre-mixer 행을 **누적** — 멀티청크 프리필에서
+            // 전체 프롬프트의 h 행이 드래프트 프리필에 필요하다(④c-2).
+            if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                if self.last_res_hc_rows.len() == tokens.len() - ch.len() {
+                    self.last_res_hc_rows
+                        .extend(f.last_res_hc_rows.iter().cloned());
+                } else {
+                    // 청크 경계 재시작 등 — 전체 재구성(마지막 청크만 오면 불완전).
+                    self.last_res_hc_rows
+                        .extend(f.last_res_hc_rows.iter().cloned());
+                }
+            }
+        }
+        // 마지막 행 동기.
+        if !self.last_res_hc_rows.is_empty() {
+            self.last_res_hc = self.last_res_hc_rows.last().cloned().unwrap_or_default();
         }
         Ok(last)
     }
@@ -1372,6 +1403,14 @@ impl Engine4 {
         match r {
             Ok(tok) => {
                 self.seqs[seq].pos += 1;
+                // P15④c: frame pre-mixer 행 pull(greedy 판).
+                if let Some(f) = self.frame.as_ref()
+                    && f.mtp_h_export
+                    && !f.last_res_hc_rows.is_empty()
+                {
+                    self.last_res_hc_rows = f.last_res_hc_rows.clone();
+                    self.last_res_hc = f.last_res_hc_rows.last().cloned().unwrap_or_default();
+                }
                 Ok(tok)
             }
             Err(e) => {
@@ -1445,7 +1484,14 @@ impl Engine4 {
             };
             let r = run_step();
             match r {
-                Ok(l) => l,
+                Ok(l) => {
+                    // P15④c: frame pre-mixer res_hc 행을 엔진 export로 pull.
+                    if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                        self.last_res_hc_rows = f.last_res_hc_rows.clone();
+                        self.last_res_hc = f.last_res_hc_rows.last().cloned().unwrap_or_default();
+                    }
+                    l
+                }
                 Err(e) => {
                     self.frame = None;
                     self.frame_broken = true;
