@@ -8,7 +8,7 @@ mod gdn;
 pub(crate) use attn::attn_layer;
 pub(crate) use gdn::gdn_layer;
 
-use crate::matmul::Acc;
+use crate::qwen35::Acc;
 
 /// 스테이지 실행 컨텍스트 — 모델 뷰(불변) + 가속기 참조.
 pub struct Ctx<'a> {

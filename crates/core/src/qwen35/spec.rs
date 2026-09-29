@@ -52,7 +52,7 @@ impl Engine {
         }
         let acc = self.acc.clone();
         let mut cur = vec![0.0f32; n_embd];
-        crate::matmul::mm(&acc, &cat, &w_eh, &mut cur)?;
+        crate::qwen35::mm(&acc, &cat, &w_eh, &mut cur)?;
         if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] eh sum={:.5} x0={:.5} x1={:.5}",
@@ -88,13 +88,13 @@ impl Engine {
             vec![vec![0.0f32; hp.n_ff]; 1],
             vec![vec![0.0f32; hp.n_ff]; 1],
         ];
-        crate::matmul::mm_group(&acc, &[normed], &[gate_w, up_w], &mut gu)?;
+        crate::qwen35::mm_group(&acc, &[normed], &[gate_w, up_w], &mut gu)?;
         let [mut g, u] = gu;
         for i in 0..hp.n_ff {
             g[0][i] = crate::ops::silu(g[0][i]) * u[0][i];
         }
         let mut ffn_out = vec![vec![0.0f32; n_embd]; 1];
-        crate::matmul::mm_batch(&acc, &g, &down_w, &mut ffn_out)?;
+        crate::qwen35::mm_batch(&acc, &g, &down_w, &mut ffn_out)?;
         for i in 0..n_embd {
             cur[i] = ffn_out[0][i] + ffn_res[i];
         }
@@ -116,7 +116,7 @@ impl Engine {
         let head = self.model.wchk("output.weight")?;
         let h = rms_norm(&cur, &sh_norm, hp.eps);
         let mut logits = vec![0.0f32; head.n_out as usize];
-        crate::matmul::mm(&acc, &h, &head, &mut logits)?;
+        crate::qwen35::mm(&acc, &h, &head, &mut logits)?;
         if llm170_diag::dump::opts().key("mtp_stage") {
             eprintln!(
                 "[c] head L0..7={:?} hnorm0..3={:?}",
@@ -170,7 +170,7 @@ impl Engine {
         ];
         {
             let xs = vec![xn];
-            crate::matmul::mm_group(&acc, &xs, &[wq, wk, wv], &mut group)?;
+            crate::qwen35::mm_group(&acc, &xs, &[wq, wk, wv], &mut group)?;
         }
         let [qg, kk, vv] = group;
 
@@ -231,7 +231,7 @@ impl Engine {
         }
         // wo 프로젝션
         let mut out = vec![vec![0.0f32; wo.n_out as usize]; 1];
-        crate::matmul::mm_batch(&acc, &[attn_out], &wo, &mut out)?;
+        crate::qwen35::mm_batch(&acc, &[attn_out], &wo, &mut out)?;
         Ok(out.into_iter().next().unwrap())
     }
 
