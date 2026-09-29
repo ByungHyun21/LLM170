@@ -237,66 +237,174 @@ impl Engine4 {
         if k == 0 || !self.model.has_mtp() {
             return Ok((Vec::new(), 0));
         }
-        // ① 타깃 1 forward — 첫 토큰(무조건 수용) + 드래프트 입력 h.
+        // ① 타깃 1 forward — t0(무조건 수용) + 이후 드래프트 체인의 시작 h.
         let l = self.decode1(seq, last_token)?;
         let t0 = crate::qwen35::greedy(&l);
         let mut forwards = 1usize;
-        // ② 드래프트 체인 — t0부터 최대 k-1개 제안.
+        // ② 드래프트 체인(P15④) — h는 **드래프트 자신의 h_nextn**으로 연결
+        //    (chain_h). KV는 체인 토큰마다 적립(커밋 여부와 무관하게 일단 기입,
+        //    거부 시 ⑤ 스냅샷 복원+수용분 재적립).
+        let snap_d = self.mtp_seqs[seq].clone();
+        let snap_t = self.seqs[seq].clone();
+        // ① 직후 타깃 h — 체인 시작·롤백 재적립 시작값(verify가 last_h를
+        // 덮어쓰므로 여기서 확보).
+        let h_after_first = self.last_h.clone();
         let mut proposals: Vec<u32> = Vec::new();
+        let mut chain_h = h_after_first.clone();
         let mut next = t0;
         for _ in 0..k.saturating_sub(1) {
-            let h = self.last_h.clone();
-            let lg = self.mtp_draft_step(seq, next, &h)?;
+            let (lg, dh) = self.mtp_draft_step_h(seq, next, &chain_h)?;
             proposals.push(next);
+            chain_h = dh;
             next = crate::qwen35::greedy(&lg);
         }
-        // ③ 검증 — 상태 스냅샷 → 제안 순차 타깃 디코드 → 수용 접두 결정 →
-        // 필요시 복원 후 수용분만 재적립.
-        let snap_t = self.seqs[seq].clone();
-        let snap_d = self.mtp_seqs[seq].clone();
+        // ③ 검증 — 제안 순차 타깃 디코드 후 수용 접두 판정.
         let mut tgt_out = Vec::new();
         for &p in &proposals {
             let l = self.decode1(seq, p)?;
             forwards += 1;
             tgt_out.push(crate::qwen35::greedy(&l));
         }
-        // 수용: 제안 p_i 이후 타깃 argmax가 p_{i+1}와 일치해야 p_{i+1} 수용.
         let mut n_acc = proposals.len();
         for i in 0..proposals.len() {
-            let expect = proposals.get(i + 1).copied();
-            match expect {
-                Some(e) if tgt_out[i] != e => {
-                    n_acc = i;
-                    break;
-                }
-                None => {}
-                _ => {}
+            if let Some(e) = proposals.get(i + 1)
+                && tgt_out[i] != *e
+            {
+                n_acc = i;
+                break;
             }
         }
-        // 거부 발생 시 복원 → 수용분(t0 + p_1..p_{n_acc+1}) 재디코드.
-        // (전 수용이면 타깃 상태가 이미 정확히 전진 — 재디코드 불요, 보너스만.)
         let mut accepted = Vec::with_capacity(n_acc + 2);
         accepted.push(t0);
         if n_acc + 1 >= proposals.len() {
-            // 전 제안 수용 — 마지막 타깃 출력이 보너스.
+            // 전 수용 — 타깃·드래프트 상태 모두 정확히 전진(체인이 커밋분과
+            // 1:1). 보너스만 추가.
             accepted.extend_from_slice(&proposals[1..]);
             accepted.push(*tgt_out.last().unwrap_or(&t0));
         } else {
-            // 복원 후 수용 접두만 재적립 (t0는 이미 커밋된 ① 상태에 포함).
+            // 거부 — 타깃·드래프트 모두 ① 직후 스냅샷으로 복원 후 **수용분만
+            // 재적립**(draft-follows-target: 드래프트 KV가 커밋 스트림과 1:1).
+            // t0의 드래프트 적립은 h=타깃 h(체인 시작값)로, p_i는 직전 드래프트 h로.
             self.seqs[seq] = snap_t;
             self.mtp_seqs[seq] = snap_d;
-            // 스냅샷은 ①(=last_token 디코드 완료) 직후 상태다 — last_token을
-            // 다시 디코드하면 이중 적립으로 상태가 오염된다(k=3 첫 발산의
-            // 원인, plans/109 P15⑤). 수용분 t0..p_{n_acc}만 재적립.
+            let mut dh = h_after_first.clone();
             for &p in &proposals[..=n_acc.min(proposals.len() - 1)] {
-                self.decode1(seq, p)?;
+                let l = self.decode1(seq, p)?;
                 forwards += 1;
+                let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh)?;
+                dh = ndh;
+                let _ = l;
             }
-            // emit은 t0 + 수용 제안 p_1..p_{n_acc} + 보너스 — t0는 이미 push됨.
             accepted.extend_from_slice(&proposals[1..=n_acc.min(proposals.len() - 1)]);
             accepted.push(tgt_out[n_acc]);
         }
         Ok((accepted, forwards))
+    }
+
+    /// mtp_draft_step의 확장판 — 드래프트 h_nextn(head_rows 마지막 행)도
+    /// 반환해 체인 다음 스텝/커밋 재적립이 드래프트 자신의 h로 이어진다
+    /// (plans/109 P15④ chain_h).
+    fn mtp_draft_step_h(
+        &mut self,
+        seq: usize,
+        x: u32,
+        h: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), Q4Error> {
+        // mtp_draft_step 본체를 인라인 재사용할 수 없으므로 로직 복제 대신
+        // logits + 내부 h를 함께 산출하도록 재작성.
+        if !self.model.has_mtp() || self.mtp_seqs.is_empty() {
+            return Err(Q4Error::Io("mtp_draft_step: MTP 미적재".into()));
+        }
+        let hp = &self.model.hp;
+        let (n, hc) = (hp.n_embd, hp.hc);
+        let il = hp.n_layer;
+        let hc_dim = hc * n;
+        let embd = self.model.w4("token_embd.weight")?;
+        let mut e = vec![0.0f32; n];
+        dequant_row(embd.ty, embd.data, x as u64, n as u64, &mut e);
+        let en = crate::ops::rms_norm(
+            &e,
+            &self
+                .model
+                .f32_vec4(&format!("blk.{il}.nextn.enorm.weight"))?,
+            hp.eps,
+        );
+        let hn = crate::ops::rms_norm(
+            h,
+            &self
+                .model
+                .f32_vec4(&format!("blk.{il}.nextn.hnorm.weight"))?,
+            hp.eps,
+        );
+        let mut cat = vec![0.0f32; 2 * n];
+        cat[..n].clone_from_slice(&en);
+        cat[n..].clone_from_slice(&hn);
+        let weh = self.model.w4(&format!("blk.{il}.nextn.eh_proj.weight"))?;
+        let mut x_t = vec![0.0f32; n];
+        {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            ctx.mm(&cat, &weh, &mut x_t)?;
+        }
+        let mut res_hc: Vec<Vec<f32>> = Vec::with_capacity(1);
+        {
+            let mut r = vec![0.0f32; hc_dim];
+            for s_i in 0..hc {
+                r[s_i * n..(s_i + 1) * n].copy_from_slice(&x_t);
+            }
+            res_hc.push(r);
+        }
+        let (mix, inject) = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::hc_mix(&ctx, il, "attn", &res_hc)?
+        };
+        let attn_out = self.mtp_dense_attn(seq, il, &mix)?;
+        hc_combine(&mut res_hc, &attn_out, &inject, hc);
+        let (mix2, inject2) = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::hc_mix(&ctx, il, "ffn", &res_hc)?
+        };
+        let ffn_out = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::moe_ffn(&ctx, il, &mix2)?
+        };
+        hc_combine(&mut res_hc, &ffn_out, &inject2, hc);
+        let head_rows = {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            stages::hc_mix_nextn_head(&ctx, il, &res_hc)?
+        };
+        let h1 = head_rows
+            .last()
+            .ok_or(Q4Error::BadMeta("mtp 빈 헤드"))?
+            .clone();
+        let wout = self
+            .model
+            .w4("output.weight")
+            .map_err(|_| Q4Error::MissingTensor("output.weight".into()))?;
+        let mut logits = vec![0.0f32; wout.n_out as usize];
+        {
+            let ctx = Ctx {
+                model: &self.model,
+                acc: None,
+            };
+            ctx.mm(&h1, &wout, &mut logits)?;
+        }
+        self.mtp_seqs[seq].pos += 1;
+        Ok((logits, h1))
     }
 
     /// MTP dense 게이트드 어텐션 (plans/109 P15②) — 트렁크 cpu_attn_row와
