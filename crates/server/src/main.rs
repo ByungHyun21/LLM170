@@ -14,6 +14,14 @@ mod tokenize;
 mod unicode_data;
 mod vl;
 
+/// 4분할 모델의 part2 경로 유도 — part1 메타(토크나이저) 실패 시 대안.
+/// serve·tokenize가 같은 규칙을 썼다(plans/109 P5 단일화).
+fn part2_path(model: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stem = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    stem.contains("-00001-of-")
+        .then(|| model.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
+}
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -268,17 +276,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("# spec: k={spec_k} (MTP 스펙 디코드)");
     }
     // 토크나이저 적재 (part1 메타 → 실패시 part2)
-    let part2 = {
-        let stem = model_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if stem.contains("-00001-of-") {
-            Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
-        } else {
-            None
-        }
-    };
+    let part2 = part2_path(&model_path);
     // 간헐 ENOPT(transient ENOENT) 재시도 — 2026-09-01 실측 회복 패턴.
     let mut tok = None;
     for i in 0..5 {
@@ -328,17 +326,7 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
     };
     let model_path = PathBuf::from(model);
     // part1 메타 → 실패시 part2 (serve와 동일 규칙)
-    let part2 = {
-        let stem = model_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if stem.contains("-00001-of-") {
-            Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
-        } else {
-            None
-        }
-    };
+    let part2 = part2_path(&model_path);
     let tok = match tokenize::Tokenizer::load(&model_path, part2.as_deref()) {
         Ok(t) => t,
         Err(e) => {
@@ -454,17 +442,33 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let row: u64 = args[2].parse().unwrap();
-    let n: usize = args[3].parse().unwrap();
+    let (row, n): (u64, usize) = match (args[2].parse(), args[3].parse()) {
+        (Ok(r), Ok(nn)) => (r, nn),
+        _ => {
+            eprintln!("error: <row>/<n> must be integers");
+            return ExitCode::FAILURE;
+        }
+    };
     use std::os::unix::fs::FileExt;
-    let file = std::fs::File::open(&args[0]).unwrap();
+    let file = match std::fs::File::open(&args[0]) {
+        Ok(fl) => fl,
+        Err(e) => {
+            eprintln!("error: open {}: {e}", args[0]);
+            return ExitCode::FAILURE;
+        }
+    };
     let k = t.ne[0];
     let (blck, bsize) = t.ty.block_info();
     let row_bytes = (k / blck * bsize) as usize;
-    let (start, _) = t.file_range(f.data_offset).unwrap();
+    let Some((start, _)) = t.file_range(f.data_offset) else {
+        eprintln!("error: tensor file range 없음");
+        return ExitCode::FAILURE;
+    };
     let mut buf = vec![0u8; row_bytes];
-    file.read_exact_at(&mut buf, start + row * row_bytes as u64)
-        .unwrap();
+    if let Err(e) = file.read_exact_at(&mut buf, start + row * row_bytes as u64) {
+        eprintln!("error: read row {row}: {e}");
+        return ExitCode::FAILURE;
+    }
     let mut out = vec![0.0f32; k as usize];
     llm170_core::quant::dequant_row(t.ty, &buf, 0, k, &mut out);
     let vals: Vec<String> = out[..n].iter().map(|v| format!("{v:.6}")).collect();
