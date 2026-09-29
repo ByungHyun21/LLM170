@@ -4,6 +4,7 @@
 mod attention;
 mod fault;
 mod frame_check;
+mod gdn;
 mod harness;
 mod misc;
 mod ops;
@@ -13,3 +14,5 @@ pub use fault::fault_probe;
 pub use frame_check::frame_check;
 pub use misc::ple_mt_check;
 pub use ops::idot_probe;
+
+pub use gdn::{gdn_check, smoke_test};
