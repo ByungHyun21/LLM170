@@ -4,7 +4,6 @@ use super::*;
 use crate::rawhip::env_on;
 
 impl Q4Acc {
-
     /// sel/sel4 공용 버퍼 ensure+h2d — 쌍둥이 본체 통합(plans/109 P11).
     #[allow(clippy::too_many_arguments)]
     fn qsa_ensure_upload(

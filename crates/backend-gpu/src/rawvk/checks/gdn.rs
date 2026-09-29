@@ -198,7 +198,8 @@ pub fn gdn_check() -> Result<String, String> {
             std::ptr::copy_nonoverlapping(dtb.as_ptr(), db.ptr as *mut f32, dr);
             std::ptr::copy_nonoverlapping(sa.as_ptr(), sb.ptr as *mut f32, dr);
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("../spv/gdn_beta_g.spv"), 5, 8)?;
+        let (_dsl, pl, _dp, ds, pipe) =
+            ctx.pipeline(include_bytes!("../spv/gdn_beta_g.spv"), 5, 8)?;
         ctx.bind_bufs(ds, &[bb.buf, ab.buf, db.buf, sb.buf, gb.buf]);
         let push: Vec<u8> = [nh as u32, dr as u32]
             .iter()
@@ -569,7 +570,8 @@ pub fn gdn_check() -> Result<String, String> {
             std::ptr::copy_nonoverlapping(g.as_ptr(), gb.ptr as *mut f32, n);
             std::ptr::copy_nonoverlapping(u.as_ptr(), ub.ptr as *mut f32, n);
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("../spv/silu_mul.spv"), 3, 4)?;
+        let (_dsl, pl, _dp, ds, pipe) =
+            ctx.pipeline(include_bytes!("../spv/silu_mul.spv"), 3, 4)?;
         ctx.bind_bufs(ds, &[gb.buf, ub.buf, ob.buf]);
         let push = (n as u32).to_le_bytes().to_vec();
         ctx.run(pl, ds, pipe, &push, n.div_ceil(256) as u32, 1, 1)?;
@@ -615,7 +617,8 @@ pub fn gdn_check() -> Result<String, String> {
             std::ptr::copy_nonoverlapping(qv.as_ptr(), qb.ptr as *mut f32, qv.len());
             std::ptr::copy_nonoverlapping(kv.as_ptr(), kb.ptr as *mut f32, kv.len());
         }
-        let (_dsl, pl, _dp, ds, pipe) = ctx.pipeline(include_bytes!("../spv/l2_rows2.spv"), 2, 12)?;
+        let (_dsl, pl, _dp, ds, pipe) =
+            ctx.pipeline(include_bytes!("../spv/l2_rows2.spv"), 2, 12)?;
         ctx.bind_bufs(ds, &[qb.buf, kb.buf]);
         let eps = 1e-6f32;
         let mut push: Vec<u8> = Vec::new();
@@ -693,7 +696,8 @@ pub fn gdn_check() -> Result<String, String> {
         }
         // 1) qk_rope: pos=np-1
         {
-            let (_d, pl, _p, ds, pipe) = ctx.pipeline(include_bytes!("../spv/qk_rope.spv"), 5, 28)?;
+            let (_d, pl, _p, ds, pipe) =
+                ctx.pipeline(include_bytes!("../spv/qk_rope.spv"), 5, 28)?;
             ctx.bind_bufs(ds, &[qb.buf, kb.buf, qwb.buf, kwb.buf, csb.buf]);
             let eps = 1e-6f32;
             let kqs = 1.0f32 / (hd as f32).sqrt();
@@ -1021,4 +1025,3 @@ fn f16_from_f32(v: f32) -> u16 {
     let m = mant >> 13;
     sign | ((e as u16) << 10) | m as u16
 }
-

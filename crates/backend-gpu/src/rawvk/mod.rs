@@ -7,7 +7,6 @@ pub mod decoder;
 pub mod flashcheck;
 pub mod vkacc;
 
-
 const SMOKE_SPV: &[u8] = include_bytes!("spv/smoke.spv");
 const COOPMAT_PROBE_SPV: &[u8] = include_bytes!("spv/coopmat_probe.spv");
 pub const AXPY_SPV: &[u8] = include_bytes!("spv/axpy_scaled.spv");
@@ -32,4 +31,3 @@ pub fn subsum_check() -> Result<String, String> {
         r[0], r[1], r[2]
     ))
 }
-
