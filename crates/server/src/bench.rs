@@ -539,7 +539,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     .split("t/s")
                     .next()
                     .and_then(|s| s.rsplit('|').next())
-                    .and_then(|s| s.trim().split_whitespace().last())
+                    .and_then(|s| s.split_whitespace().last())
                     .and_then(|s| s.parse::<f64>().ok())
                 else {
                     continue;
