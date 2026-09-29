@@ -396,7 +396,7 @@ pub fn frame_forward_np(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<Vec<Vec<f32>>, Q4Error> {
-    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, false).map(|(l, _)| l)
+    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, false, false).map(|(l, _)| l)
 }
 
 /// np greedy판 — head 후 전사 대신 GPU argmax, 토큰만 회수 (plans/74 N1).
@@ -409,7 +409,21 @@ pub fn frame_forward_np_greedy(
     f: &mut Frame4,
     tokens: &[u32],
 ) -> Result<Vec<u32>, Q4Error> {
-    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, true).map(|(_, t)| t)
+    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, true, false).map(|(_, t)| t)
+}
+
+/// plans/110 W5 — 다중 슬롯 스펙 라운드 시작용: greedy + pre-mixer res_hc 행
+/// export(드래프트 h 입력). 검증 행핀(VERIFY_ROW_PIN)으로 decode1 비트 동일.
+pub fn frame_forward_np_greedy_h(
+    acc: &dyn Accelerator,
+    model: &Model4,
+    ctx: &Ctx,
+    seqs: &[usize],
+    seq_sts: &mut [SeqState4],
+    f: &mut Frame4,
+    tokens: &[u32],
+) -> Result<Vec<u32>, Q4Error> {
+    frame_forward_np_ex(acc, model, ctx, seqs, seq_sts, f, tokens, true, true).map(|(_, t)| t)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -422,6 +436,7 @@ pub(super) fn frame_forward_np_ex(
     f: &mut Frame4,
     tokens: &[u32],
     greedy: bool,
+    h_export: bool,
 ) -> Result<(Vec<Vec<f32>>, Vec<u32>), Q4Error> {
     let hp: &Hparams4 = &model.hp;
     let (n, hc) = (hp.n_embd, hp.hc);
@@ -577,6 +592,14 @@ pub(super) fn frame_forward_np_ex(
     }
     if ck_on {
         ck(acc, f.res_hc, 64, "head.res");
+    }
+
+    // 5a) plans/110 W5: pre-mixer res_hc 행 export — 다중 슬롯 스펙의 라운드
+    // 시작을 np로 배칭할 때 드래프트 h 입력이 필요하다(mtp_h_export 시만).
+    if h_export && f.mtp_h_export {
+        let mut rows = vec![0.0f32; t * hc * n];
+        acc.frame_read(f.res_hc, &mut rows).map_err(Q4Error::Io)?;
+        f.last_res_hc_rows = rows.chunks(hc * n).map(|c| c.to_vec()).collect();
     }
 
     // 5) head — 전 행 GEMM 1회 → [t][vocab] 판독

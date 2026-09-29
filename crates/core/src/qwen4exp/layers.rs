@@ -109,6 +109,9 @@ pub struct Engine4 {
     pub last_res_hc_rows: Vec<Vec<f32>>,
     /// 마지막 행 프리-믹서 잔차 [hc·n].
     pub last_res_hc: Vec<f32>,
+    /// plans/110 W5: 슬롯별 스펙 h_prev(직전 라운드 최종 export) — 다중 슬롯에서
+    /// 전역 last_res_hc가 타 슬롯 export로 덮이는 것을 막는다(④′ 페어링 결함).
+    pub spec_h_prev: Vec<Vec<f32>>,
 }
 
 /// 사이드 스레드가 채운 프리페치 결과 — token이 다음 입력과 일치할 때만 사용.
@@ -222,6 +225,7 @@ impl Engine4 {
             last_h_rows: Vec::new(),
             last_res_hc_rows: Vec::new(),
             last_res_hc: Vec::new(),
+            spec_h_prev: vec![Vec::new(); n_seqs],
         }
     }
 
@@ -263,7 +267,11 @@ impl Engine4 {
         }
         // ① 직전의 pre-mixer 잔차 = last_token의 예측자 hidden(① 전에 확보 —
         // decode1이 덮어쓴다). 이것이 주기 시작 커밋 토큰의 드래프트 쌍 h다.
-        let h_prev = self.last_res_hc.clone();
+        let h_prev = if self.spec_h_prev[seq].is_empty() {
+            self.last_res_hc.clone()
+        } else {
+            std::mem::take(&mut self.spec_h_prev[seq])
+        };
         let l = self.decode1(seq, last_token)?;
         let t0 = crate::qwen35::greedy(&l);
         let mut forwards = 1usize;
@@ -332,6 +340,7 @@ impl Engine4 {
             accepted.extend_from_slice(&proposals[1..=n_acc.min(proposals.len() - 1)]);
             accepted.push(tgt_out[n_acc]);
         }
+        self.spec_h_prev[seq] = self.last_res_hc.clone();
         Ok((accepted, forwards))
     }
 
@@ -347,7 +356,11 @@ impl Engine4 {
         k: usize,
     ) -> Result<(Vec<u32>, usize), Q4Error> {
         // ① 주기 시작 커밋 토큰의 타깃 forward — greedy 판정만 회수.
-        let h_prev = self.last_res_hc.clone();
+        let h_prev = if self.spec_h_prev[seq].is_empty() {
+            self.last_res_hc.clone()
+        } else {
+            std::mem::take(&mut self.spec_h_prev[seq])
+        };
         let t0 = self.decode1_greedy(seq, last_token)?;
         let mut forwards = 1usize;
         let h_after_first = self.last_res_hc.clone();
@@ -504,6 +517,7 @@ impl Engine4 {
             accepted.push(*y.last().unwrap_or(&t0));
             // 배치가 정확히 proposals행만큼 상태를 전진시켰다 — pos 정산.
             self.seqs[seq].pos += proposals.len() as u32;
+            self.spec_h_prev[seq] = self.last_res_hc.clone();
             Ok((accepted, forwards))
         } else {
             // 기각 — 스냅샷 복원(GDN 디바이스 + CPU) 후 수용분 재실행.
@@ -554,7 +568,195 @@ impl Engine4 {
             }
             accepted.extend_from_slice(&proposals[1..=n_acc]);
             accepted.push(y[n_acc]);
+            self.spec_h_prev[seq] = self.last_res_hc.clone();
             Ok((accepted, forwards))
+        }
+    }
+
+    /// np×spec 병합 스펙 라운드 (plans/110 W5) — 다중 슬롯의 라운드 시작
+    /// decode1을 **1회 np 배치 포워드**로 묶고(무게 패스 공유), 드래프트·
+    /// 검증·롤백은 슬롯별(배치 검증 기계 재사용). 반환 [slot][accepted],
+    /// forwards 총합. 큐35 spec_step_multi의 Q4판 — 검증 배치 병합(원자
+    /// 의미론)은 후속, 여기선 라운드 시작 병합만.
+    pub fn mtp_spec_step_multi(
+        &mut self,
+        slots: &[usize],
+        last_tokens: &[u32],
+        k: usize,
+    ) -> Result<(Vec<Vec<u32>>, usize), Q4Error> {
+        if k == 0 || !self.model.has_mtp() || slots.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        if !(self.frame_on(true) && self.frame_ensure()) || slots.len() < 2 {
+            // 폴백: 단일 슬롯 순차판(기존 mtp_spec_step).
+            let mut out = Vec::with_capacity(slots.len());
+            let mut fw = 0usize;
+            for (&s, &t) in slots.iter().zip(last_tokens.iter()) {
+                let (acc, f) = self.mtp_spec_step(s, t, k)?;
+                fw += f;
+                out.push(acc);
+            }
+            return Ok((out, fw));
+        }
+        // ① 다중 슬롯 라운드 시작 — 1회 np 배치(행핀으로 decode1 비트 동일)
+        // + pre-mixer res_hc 행 export(드래프트 h_after_first).
+        let toks: Vec<u32>;
+        let mut row_h: Vec<Vec<f32>> = Vec::new();
+        {
+            let Engine4 {
+                model,
+                frame,
+                seqs,
+                acc: acc_field,
+                ..
+            } = self;
+            let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                return Err(Q4Error::Io("mtp-spec-multi: 프레임 없음".into()));
+            };
+            let ctx = crate::qwen4exp::stages::Ctx {
+                model,
+                acc: Some(a),
+            };
+            // 행핀 없음 — serve 비스펙(np) 경로와 동일 산술·무게 상각 유지.
+            // (근접 타이 플립은 수용률 저하로만 나타난다 — 스펙 고유 성질.)
+            let r = super::frame::frame_forward_np_greedy_h(
+                a,
+                model,
+                &ctx,
+                slots,
+                seqs.as_mut_slice(),
+                f,
+                last_tokens,
+            );
+            toks = r?;
+            if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                row_h = f.last_res_hc_rows.clone();
+            }
+        }
+        let mut forwards = 1usize;
+        let mut out = Vec::with_capacity(slots.len());
+        for (i, (&s, &lt)) in slots.iter().zip(last_tokens.iter()).enumerate() {
+            let t0 = toks.get(i).copied().unwrap_or(0);
+            // ② 이 슬롯의 h_after_first = np export 행 i.
+            let h_after_first = row_h.get(i).cloned().unwrap_or_default();
+            let accepted = self.mtp_spec_round_rest(s, lt, t0, h_after_first, k, &mut forwards)?;
+            out.push(accepted);
+        }
+        Ok((out, forwards))
+    }
+
+    /// 스펙 라운드의 잔여(④′ 드래프트 + 체인 + 배치 검증 + 수용/롤백) —
+    /// 라운드 시작이 외부(다중 병합)에서 처리된 경우의 공유 본체.
+    fn mtp_spec_round_rest(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        t0: u32,
+        h_after_first: Vec<f32>,
+        k: usize,
+        forwards: &mut usize,
+    ) -> Result<Vec<u32>, Q4Error> {
+        // ④′ + 체인 드래프트 — h_prev는 슬롯별 직전 라운드 최종 export
+        // (spec_h_prev; 110 W5 — 전역 last_res_hc는 타 슬롯이 덮는다).
+        let h_prev = if self.spec_h_prev[seq].is_empty() {
+            return Err(Q4Error::Io("spec_h_prev 미시드".into()));
+        } else {
+            std::mem::take(&mut self.spec_h_prev[seq])
+        };
+        {
+            let _acc = self.acc.clone();
+            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
+        }
+        let mut proposals: Vec<u32> = Vec::new();
+        let mut chain_h = h_after_first.clone();
+        let mut next = t0;
+        for _ in 0..k.saturating_sub(1) {
+            let _acc = self.acc.clone();
+            let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
+            proposals.push(next);
+            chain_h = dh;
+            next = next_d;
+        }
+        // 배치 검증 + 수용/롤백 — mtp_spec_step_frame의 ②이후와 동일 기계.
+        let snap_t = self.seqs[seq].clone();
+        let snap_d = self.mtp_seqs[seq].clone();
+        let y: Vec<u32>;
+        {
+            let Engine4 {
+                model,
+                frame,
+                seqs,
+                acc: acc_field,
+                ..
+            } = self;
+            let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                return Err(Q4Error::Io("mtp-spec-round: 프레임 없음".into()));
+            };
+            super::frame::verify_snap_capture(a, f, seq)?;
+            let ctx = crate::qwen4exp::stages::Ctx {
+                model,
+                acc: Some(a),
+            };
+            y = super::frame::frame_forward_verify(
+                a,
+                model,
+                &ctx,
+                seqs.as_mut_slice(),
+                seq,
+                f,
+                &proposals,
+            )?;
+            if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                self.last_res_hc_rows = f.last_res_hc_rows.clone();
+                self.last_res_hc = f.last_res_hc_rows.last().cloned().unwrap_or_default();
+            }
+        }
+        *forwards += 1;
+        let mut n_acc = proposals.len();
+        for i in 0..proposals.len() {
+            if let Some(e) = proposals.get(i + 1)
+                && y[i] != *e
+            {
+                n_acc = i;
+                break;
+            }
+        }
+        let mut accepted = Vec::with_capacity(n_acc + 2);
+        accepted.push(t0);
+        if n_acc + 1 >= proposals.len() {
+            accepted.extend_from_slice(&proposals[1..]);
+            accepted.push(*y.last().unwrap_or(&t0));
+            self.seqs[seq].pos += proposals.len() as u32;
+            self.spec_h_prev[seq] = self.last_res_hc.clone();
+            Ok(accepted)
+        } else {
+            self.seqs[seq] = snap_t;
+            self.mtp_seqs[seq] = snap_d;
+            {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    return Err(Q4Error::Io("mtp-spec-round: 프레임 없음".into()));
+                };
+                super::frame::verify_snap_restore(a, f, seq)?;
+            }
+            let _acc = self.acc.clone();
+            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
+            let mut dh = h_after_first.clone();
+            for &p in &proposals[..=n_acc] {
+                self.decode1_greedy(seq, p)?;
+                *forwards += 1;
+                let _acc = self.acc.clone();
+                let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh, _acc.as_deref())?;
+                dh = ndh;
+            }
+            accepted.extend_from_slice(&proposals[1..=n_acc]);
+            accepted.push(y[n_acc]);
+            self.spec_h_prev[seq] = self.last_res_hc.clone();
+            Ok(accepted)
         }
     }
     /// MTP 드래프트 프리필 (P15④) — 타깃 프리필 직후 호출. 프롬프트 토큰
@@ -584,6 +786,8 @@ impl Engine4 {
             let _acc = self.acc.clone();
             let (_lg, _h) = self.mtp_draft_step_h(seq, x, &hi, _acc.as_deref())?;
         }
+        // 110 W5: 슬롯별 스펙 h 시드 — 첫 스펙 라운드의 h_prev(프리필 최종 h).
+        self.spec_h_prev[seq] = self.last_res_hc.clone();
         Ok(())
     }
 
@@ -1151,6 +1355,7 @@ impl Engine4 {
             .first()
             .map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim))
             .unwrap_or(4096);
+        self.spec_h_prev[seq] = Vec::new();
         self.seqs[seq] = SeqState4::new(&self.model.hp, ctx);
     }
 

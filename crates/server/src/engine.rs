@@ -762,27 +762,65 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         })
                         .collect();
                     if !spec_slots.is_empty() && e.model.has_mtp() {
-                        for &i in &spec_slots {
-                            let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
-                            let next = slots[i].next;
-                            let cap = slots[i].job.as_ref().unwrap().n_predict;
-                            match e.mtp_spec_step(i, next, k) {
-                                Ok((acc, _fwd)) => {
-                                    for &t in &acc {
-                                        if slots[i].generated as usize >= cap {
-                                            break;
-                                        }
-                                        slot_emit(&mut slots[i], t);
-                                        if t == EOS {
-                                            break;
+                        // plans/110 W5(실험, LLM170_SPEC_MULTI=1): 다중 스펙
+                        // 슬롯의 라운드 시작 decode1을 1회 np 배치로 병합. 잔여
+                        // 과제: 동일 프롬프트 2슬롯 스트림이 서로 갈라진다(np
+                        // 다중 슬롯 결정성 — 검증 전 기본 OFF).
+                        let kmin = spec_slots
+                            .iter()
+                            .map(|&i| slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8))
+                            .min()
+                            .unwrap_or(1);
+                        let mut done_multi = false;
+                        if llm170_diag::flag::on("LLM170_SPEC_MULTI")
+                            && spec_slots.len() >= 2
+                            && kmin >= 2
+                        {
+                            let ns: Vec<u32> = spec_slots.iter().map(|&i| slots[i].next).collect();
+                            match e.mtp_spec_step_multi(&spec_slots, &ns, kmin) {
+                                Ok((accs, _fw)) => {
+                                    for (row, &i) in spec_slots.iter().enumerate() {
+                                        let cap = slots[i].job.as_ref().unwrap().n_predict;
+                                        for &t in &accs[row] {
+                                            if slots[i].generated as usize >= cap {
+                                                break;
+                                            }
+                                            slot_emit(&mut slots[i], t);
+                                            if t == EOS {
+                                                break;
+                                            }
                                         }
                                     }
+                                    done_multi = true;
                                 }
                                 Err(err) => {
-                                    eprintln!("# mtp spec 실패({err}) — 일반 디코드로");
-                                    if let Ok(l) = e.decode1(i, next) {
-                                        let t = llm170_core::qwen35::greedy(&l);
-                                        slot_emit(&mut slots[i], t);
+                                    eprintln!("# mtp spec-multi 실패({err}) — 순차로");
+                                }
+                            }
+                        }
+                        if !done_multi {
+                            for &i in &spec_slots {
+                                let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
+                                let next = slots[i].next;
+                                let cap = slots[i].job.as_ref().unwrap().n_predict;
+                                match e.mtp_spec_step(i, next, k) {
+                                    Ok((acc, _fwd)) => {
+                                        for &t in &acc {
+                                            if slots[i].generated as usize >= cap {
+                                                break;
+                                            }
+                                            slot_emit(&mut slots[i], t);
+                                            if t == EOS {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("# mtp spec 실패({err}) — 일반 디코드로");
+                                        if let Ok(l) = e.decode1(i, next) {
+                                            let t = llm170_core::qwen35::greedy(&l);
+                                            slot_emit(&mut slots[i], t);
+                                        }
                                     }
                                 }
                             }
