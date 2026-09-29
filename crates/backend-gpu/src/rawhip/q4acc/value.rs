@@ -191,8 +191,9 @@ impl Q4Acc {
         // 기본은 여전히 끈 상태다: 이득이 아니라 속도 근거로 옵트인 유지.
         if ty == ggml_id(GgmlType::Q5_1) {
             // 타일 판은 출력 4개/블록 — 그리드도 4로 나눈다.
-            let tiled = true; // plans/78 R6: NO_Q5_1_T 폐기 — 타일 판 확정
-            let outs_per_block = if tiled { 4usize } else { 1 };
+            // plans/78 R6: 타일 판 확정(복원 경로는 plans/109 P11 삭제).
+            const TILED: bool = true;
+            let outs_per_block = if TILED { 4usize } else { 1 };
             let nblk = n_out.div_ceil(outs_per_block);
             let gy = nblk.min(65535) as u32;
             let gz = nblk.div_ceil(65535) as u32;
@@ -214,10 +215,12 @@ impl Q4Acc {
             // greedy 스트림이 동일하다 — llama.cpp/vLLM과 같은 허용 오차 계약.
             // 비트 동일 판은 LLM170_Q5_1_EXACT=1로 복귀.
             let mmq = t >= 16 && !env_on("LLM170_Q5_1_EXACT") && ty == ggml_id(GgmlType::Q5_1);
-            let kern = match (mmq, tiled) {
-                (true, _) => "q4_gemm_q5_1_m",
-                (false, true) => "q4_gemm_q5_1_t",
-                (false, false) => "q4_gemm_q5_1",
+            let kern = if mmq {
+                "q4_gemm_q5_1_m"
+            } else if TILED {
+                "q4_gemm_q5_1_t"
+            } else {
+                "q4_gemm_q5_1"
             };
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
@@ -242,14 +245,14 @@ impl Q4Acc {
                     &mut args,
                 );
             }
-            let gx = if tiled {
+            let gx = if TILED {
                 t.div_ceil(16) as u32
             } else {
                 t as u32
             };
             return self
                 .ctx
-                .launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
+                .launch3(kern, gx, gy, gz, if TILED { 256 } else { 64 }, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.

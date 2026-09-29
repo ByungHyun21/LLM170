@@ -4,6 +4,87 @@ use super::*;
 use crate::rawhip::env_on;
 
 impl Q4Acc {
+
+    /// sel/sel4 공용 버퍼 ensure+h2d — 쌍둥이 본체 통합(plans/109 P11).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_ensure_upload(
+        &self,
+        q: &[f32],
+        ck: &[f32],
+        cv: &[f32],
+        sel_idx: &[u32],
+        sel_off: &[u32],
+        n_kv: usize,
+        hd: usize,
+        n_head: usize,
+        t: usize,
+    ) -> Result<(*mut u8, *mut u8, *mut u8, *mut u8, *mut u8, *mut u8), String> {
+        let (qdev, kdev, vdev, sdev, odev, ofdev) = {
+            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
+            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
+            let kv_floats =
+                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
+            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
+            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
+            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
+            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
+            let mut f2 = self.atn.lock().map_err(|e| e.to_string())?;
+            let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
+            (qdev, kdev, vdev, sdev, odev, ofdev)
+        };
+        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
+        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
+        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
+        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
+        Ok((qdev, kdev, vdev, sdev, odev, ofdev))
+    }
+
+    /// sel/sel4 공용 11-인자 vec 조립.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_sel_args(
+        qdev: *mut u8,
+        kdev: *mut u8,
+        vdev: *mut u8,
+        sdev: *mut u8,
+        odev: *mut u8,
+        ofdev: *mut u8,
+        kq_scale: f32,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        t: usize,
+    ) -> Vec<*mut std::ffi::c_void> {
+        let mut q_p = qdev as *mut std::ffi::c_void;
+        let mut k_p = kdev as *mut std::ffi::c_void;
+        let mut v_p = vdev as *mut std::ffi::c_void;
+        let mut si_p = sdev as *mut std::ffi::c_void;
+        let mut so_p = ofdev as *mut std::ffi::c_void;
+        let mut o_p = odev as *mut std::ffi::c_void;
+        let mut sc = kq_scale;
+        let mut nh = n_head as i32;
+        let mut nk = n_kv as i32;
+        let mut h = hd as i32;
+        let mut tt = t as i32;
+        vec![
+            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+            (&mut nk) as *mut _ as *mut std::ffi::c_void,
+            (&mut h) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ]
+    }
+
     /// q4_qsa_attn_sel 런치 본체 — 선택 목록(오름차순 위치)만 순회한다.
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_sel_raw(
@@ -19,67 +100,12 @@ impl Q4Acc {
         hd: usize,
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        let (qdev, kdev, vdev, sdev, odev, ofdev) = {
-            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
-            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
-            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
-            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats =
-                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
-            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
-            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
-            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
-            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
-            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
-            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
-            let mut f2 = self.atn.lock().map_err(|e| e.to_string())?;
-            let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
-            (qdev, kdev, vdev, sdev, odev, ofdev)
-        };
-        // 주의(실측 2026-09-14): 아래 h2d는 **매 호출 KV 캐시 전체**를 올린다.
-        // n_past 8192에서 8192 x 2 x 256 x 4B x 2(K,V) = 33.6MB/층, 12층이면
-        // 403MB/스텝이고 d2h 대역 실측(17.6 GB/s)으로 ~23ms/스텝 = 장문맥 스텝의 16%다.
-        // 컨텍스트 스케일링 실측이 이를 지지한다: pp2048 103.9ms/스텝 ->
-        // pp8192 141.8ms/스텝(+37.9)이고 KV 증가분만 302MB/스텝 ~17ms(증가의 45%)다.
-        // 정공법은 KV를 디바이스 상주로 두고 증가분만 올리는 것이다. 다만
-        // (ptr, len) 기반 델타 캐시는 **정확하지 않다**: 새 시퀀스의 첫 청크가
-        // 이전 캐시 길이보다 길면 len이 커져 델타 경로로 빠지고 낡은 접두가 남는다
-        // (짧은 시퀀스 1024 뒤에 긴 시퀀스가 2048로 시작하는 경우). 경계 내용
-        // 비교도 동일 내용이면 통과해 버린다. 따라서 **명시적 리셋 신호**가 필요하다:
-        // 스테이지는 pos0을 알고 있으므로 qsa_attention_sel 시그니처에 pos0을 넣거나
-        // 프레임 begin에서 리셋을 알리는 것이 최소 변경이다(트레이트+CPU 폴백 수정).
-        // (_sel4_raw도 같은 블록을 쓴다. 서버 다중 시퀀스·프롬프트 교체 검증 필수.)
-        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
-        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
-        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
-        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
-        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
-        let mut q_p = qdev as *mut std::ffi::c_void;
-        let mut k_p = kdev as *mut std::ffi::c_void;
-        let mut v_p = vdev as *mut std::ffi::c_void;
-        let mut si_p = sdev as *mut std::ffi::c_void;
-        let mut so_p = ofdev as *mut std::ffi::c_void;
-        let mut o_p = odev as *mut std::ffi::c_void;
-        let mut sc = kq_scale;
-        let mut nh = n_head as i32;
-        let mut nk = n_kv as i32;
-        let mut h = hd as i32;
-        let mut tt = t as i32;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut sc) as *mut _ as *mut std::ffi::c_void,
-            (&mut nh) as *mut _ as *mut std::ffi::c_void,
-            (&mut nk) as *mut _ as *mut std::ffi::c_void,
-            (&mut h) as *mut _ as *mut std::ffi::c_void,
-            (&mut tt) as *mut _ as *mut std::ffi::c_void,
-        ];
+        // KV 전체 h2d 비용 주석(2026-09-14 실측)은 qsa_ensure_upload로 이관됐다.
+        let (qdev, kdev, vdev, sdev, odev, ofdev) =
+            self.qsa_ensure_upload(q, ck, cv, sel_idx, sel_off, n_kv, hd, n_head, t)?;
+        let mut args: Vec<*mut std::ffi::c_void> = Self::qsa_sel_args(
+            qdev, kdev, vdev, sdev, odev, ofdev, kq_scale, n_head, n_kv, hd, t,
+        );
         // 블록 16워프 = 16토큰(워프당 1헤드) — 목록만 순회하는 기본판.
         self.ctx.launch3(
             "q4_qsa_attn_sel",
@@ -109,54 +135,11 @@ impl Q4Acc {
         hd: usize,
         t: usize,
     ) -> Result<Vec<f32>, String> {
-        let (qdev, kdev, vdev, sdev, odev, ofdev) = {
-            let mut a = self.qs.lock().map_err(|e| e.to_string())?;
-            let qdev = a.ensure(&self.ctx, q.len() * 4)?;
-            // KV는 컨텍스트 전체를 미리 잡는다(엔진이 주입한 ctx_len). 종전에는
-            // n_past가 늘 때마다 재할당해 매 스텝 주소가 바뀌었다(실측 48회/세션).
-            let kv_floats =
-                self.ctx_len.load(std::sync::atomic::Ordering::Relaxed) * n_kv.max(1) * hd.max(1);
-            let mut b = self.ckv.lock().map_err(|e| e.to_string())?;
-            let kdev = b.ensure(&self.ctx, ck.len().max(kv_floats) * 4)?;
-            let mut c = self.cvv.lock().map_err(|e| e.to_string())?;
-            let vdev = c.ensure(&self.ctx, cv.len().max(kv_floats) * 4)?;
-            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
-            let sdev = d.ensure(&self.ctx, sel_idx.len().max(1) * 4)?;
-            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
-            let ofdev = e2.ensure(&self.ctx, sel_off.len().max(1) * 4)?;
-            let mut f2 = self.atn.lock().map_err(|e| e.to_string())?;
-            let odev = f2.ensure(&self.ctx, t * n_head * hd * 4)?;
-            (qdev, kdev, vdev, sdev, odev, ofdev)
-        };
-        self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
-        self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
-        self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
-        self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
-        self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
-        let mut q_p = qdev as *mut std::ffi::c_void;
-        let mut k_p = kdev as *mut std::ffi::c_void;
-        let mut v_p = vdev as *mut std::ffi::c_void;
-        let mut si_p = sdev as *mut std::ffi::c_void;
-        let mut so_p = ofdev as *mut std::ffi::c_void;
-        let mut o_p = odev as *mut std::ffi::c_void;
-        let mut sc = kq_scale;
-        let mut nh = n_head as i32;
-        let mut nk = n_kv as i32;
-        let mut h = hd as i32;
-        let mut tt = t as i32;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut q_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut k_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut v_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut si_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut so_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut sc) as *mut _ as *mut std::ffi::c_void,
-            (&mut nh) as *mut _ as *mut std::ffi::c_void,
-            (&mut nk) as *mut _ as *mut std::ffi::c_void,
-            (&mut h) as *mut _ as *mut std::ffi::c_void,
-            (&mut tt) as *mut _ as *mut std::ffi::c_void,
-        ];
+        let (qdev, kdev, vdev, sdev, odev, ofdev) =
+            self.qsa_ensure_upload(q, ck, cv, sel_idx, sel_off, n_kv, hd, n_head, t)?;
+        let mut args: Vec<*mut std::ffi::c_void> = Self::qsa_sel_args(
+            qdev, kdev, vdev, sdev, odev, ofdev, kq_scale, n_head, n_kv, hd, t,
+        );
         // 8워프 = 4토큰 × 2헤드묶음. 묶음당 헤드 수는 6이 기본(2026-09-14):
         // 게이트를 레지스터에서 빼면 qr[6][8]+acc[6][8]=96으로 4헤드판과 같은
         // 예산이라 K/V 행 재독이 6회 -> 4회로 준다(프리필 어텐션이 대역폭 바운드:
