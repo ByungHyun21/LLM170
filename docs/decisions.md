@@ -3200,3 +3200,22 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   캠페인 누적 −4.3k 라인, env 280→205. main 머지 완료.
 - 인계: P12c(frame_check 19섹션 분할 지침 플랜 기록)·P12d·P13(common/ 후보
   검증 후 추출)·P15(FN 외장 MTP 기능 — Q4/Q8 비교·serve 통합 테스트 포함).
+
+### (121) FN 외장 MTP(spec 디코드) CPU 참조 → GPU h export (plans/109 P15, 2026-09-29)
+
+- **구현 범위(커밋 4205bc1…6352cc7, feat-109-mtp)**: 외장 nextn 모듈 로더
+  (Q8_0·Q4_K_M) + CPU 참조 드래프트(vLLM `models/qwen4_exp/{nvidia,amd}/mtp.py`
+  준거 — h=프리-믹서 멀티 스트림 잔차[10240] 플랫 RMS, eh_proj=[fc_emb|fc_hidden]
+  융합 분리·4스트림 초기화, dense 게이트드 어텐션[인덱서 미사용], 체인 h=드래프트
+  pre-mix 반출) + 스냅샷/롤백 검증 + `--mtp`/`--spec` CLI·serve 통합 + Q5_0
+  dequant(ggml 정합) + GPU frame pre-mixer res_hc 행 export(멀티청크 누적).
+- **버그 수리(전수 k=2..7 스윕으로 포착)**: 롤백 last_token 이중 디코드(k≥3
+  상태 오염)·emit t0 중복·주기시작 토큰 KV 미기입·팬텀 cell0·hnorm[10240] 감마
+  절단(post-mix h 2560을 먹여 첫 2560 슬라이스만 적용) — 드래프트가 완전 이탈
+  토큰을 제안하는 구조적 결함의 전부.
+- **실측**: 수용률 k=3 — CPU 0.78·**GPU(hip frame h) 0.81 tok/fwd**(비스펙
+  기준선 16토큰 전 k 일치). Q8_0=Q4_K_M 수용 동일 → **Q4_K_M 채택**(로드 −31%).
+  serve 통합(OpenAI·Anthropic×스트림) 실동작 확인.
+- **잔여(④c-2)**: 드래프트 레이어-48 GPU 커널화(dense_attn·eh_proj·MoE —
+  현재 CPU 수 초/스텝). 계약은 mtp_draft_step_h에 확정.
+- 게이트: charhash 15,674 동일·FN hip/vk·27B PASS·preflight 6/6. main 머지.
