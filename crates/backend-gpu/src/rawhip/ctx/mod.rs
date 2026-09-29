@@ -38,7 +38,6 @@ pub struct RawCtx {
     /// 원인을 커널 런치로 좁혔다(해제는 하지 않으므로 목록은 영구, 수백 개 수준).
     pub(crate) allocs: std::sync::Mutex<Vec<(usize, usize)>>,
     pub(crate) ar_cache: std::sync::Mutex<Option<(*mut u8, *mut u8, *mut u8, *mut u8)>>,
-    pub(crate) mmq_y_cache: std::sync::Mutex<(u64, usize, usize)>, // (epoch, y_ptr, y_bytes) — 부록81 (yb 재사용은 호출부)
     /// q6 정준 재배열 캐시.
     /// f16 경로 xq 버퍼 (size, ptr).
     pub(crate) mmq_y2: std::sync::Mutex<(usize, *mut u8)>,
@@ -98,11 +97,13 @@ impl RawCtx {
         self.co_fam.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
     }
 
-    pub fn new() -> Result<Self, String> {
+    /// hipRTC 즉시 컴파일 → 커널 레지스트리 채움 (plans/109 P9 — new() 분리).
+    /// # Safety: RawCtx::new 초기화 경로(단일 스레드)에서만 호출.
+    unsafe fn compile_rtc(
+        fns: &mut HashMap<&'static str, hip::hipFunction_t>,
+    ) -> Result<(), String> {
+        // SAFETY: 초기화 경로(단일 스레드).
         unsafe {
-            ck(hip::hipSetDevice(0), "hipSetDevice")?;
-            let _ = hip::hipSetDeviceFlags(hip::hipDeviceScheduleSpin);
-
             let src = CString::new(kernels::SRC).unwrap();
             let mut prog: hip::hiprtcProgram = std::ptr::null_mut();
             let rs = hip::hiprtcCreateProgram(
@@ -169,7 +170,6 @@ impl RawCtx {
                 hip::hipModuleLoadData(&mut module, code.as_ptr() as *const _),
                 "ModuleLoadData",
             )?;
-            let mut fns = HashMap::new();
             for name in kernels::NAMES {
                 let cname = CString::new(*name).unwrap();
                 let mut f: hip::hipFunction_t = std::ptr::null_mut();
@@ -179,11 +179,22 @@ impl RawCtx {
                 )?;
                 fns.insert(*name, f);
             }
+        }
+        Ok(())
+    }
+
+    /// 오프라인 CO 패밀리 병행 로드 → fns 병합 + 패밀리 비트.
+    /// # Safety: compile_rtc와 동일 초기화 경로.
+    unsafe fn load_co_families(
+        fns: &mut HashMap<&'static str, hip::hipFunction_t>,
+    ) -> Result<u8, String> {
+        let mut fam_bits = 0u8;
+        // SAFETY: 초기화 경로(단일 스레드).
+        unsafe {
             // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등).
             // 기본: 바이너리 임베딩(crates/.../co/*.co, gfx1151 빌드).
             // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
             // LLM170_NO_CO: 전부 생략 (hipRTC wm/mm + GEMV 폴백 측정용).
-            let mut fam_bits = 0u8;
             if !env_on("LLM170_NO_CO") {
                 let slots: &[(u8, &str, &[u8], &[&str])] = &[
                     (
@@ -290,7 +301,17 @@ impl RawCtx {
                     fam_bits |= loaded;
                 }
             }
+        }
+        Ok(fam_bits)
+    }
 
+    pub fn new() -> Result<Self, String> {
+        unsafe {
+            ck(hip::hipSetDevice(0), "hipSetDevice")?;
+            let _ = hip::hipSetDeviceFlags(hip::hipDeviceScheduleSpin);
+            let mut fns = HashMap::new();
+            Self::compile_rtc(&mut fns)?;
+            let fam_bits = Self::load_co_families(&mut fns)?;
             let mut stream: hip::hipStream_t = std::ptr::null_mut();
             ck(hip::hipStreamCreate(&mut stream), "StreamCreate")?;
             let mut stream2: hip::hipStream_t = std::ptr::null_mut();
@@ -314,7 +335,6 @@ impl RawCtx {
                 f16_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
                 allocs: std::sync::Mutex::new(Vec::new()),
                 ar_cache: std::sync::Mutex::new(None),
-                mmq_y_cache: std::sync::Mutex::new((u64::MAX, 0, 0)),
                 mmq_y2: std::sync::Mutex::new((0, std::ptr::null_mut())),
                 scratch: std::sync::Mutex::new(HashMap::new()),
                 pinned_a: std::sync::Mutex::new((0, std::ptr::null_mut())),

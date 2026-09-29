@@ -12,8 +12,8 @@ pub mod qsa;
 pub use gdn::gdn_layer;
 pub use hc::{hc_mix, hc_mix_head};
 pub use moe::moe_ffn;
-pub use ple::{ple_block, ple_hash};
 pub(crate) use ple::ple_hash_rows;
+pub use ple::{ple_block, ple_hash};
 pub use qsa::{qsa_cpu_attn_rows, qsa_layer, qsa_sel_list, qsa_select};
 
 use super::{Model4, Q4Error};

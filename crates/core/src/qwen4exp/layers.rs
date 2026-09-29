@@ -145,31 +145,29 @@ fn frame_env_on(decode: bool) -> bool {
     })
 }
 
-
 impl Engine4 {
-
-/// Frame4 지연 생성 스탠자 — 7중 복제 통합(plans/109 P7). 실패 시
-/// frame_broken + fb_incr(FrameCreate) + 경고 후 false(호출부 value 폴백).
-fn frame_ensure(&mut self) -> bool {
-    if self.frame.is_some() {
-        return true;
-    }
-    let Some(acc) = self.acc.as_deref() else {
-        return false;
-    };
-    match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
-        Ok(f) => {
-            self.frame = Some(f);
-            true
+    /// Frame4 지연 생성 스탠자 — 7중 복제 통합(plans/109 P7). 실패 시
+    /// frame_broken + fb_incr(FrameCreate) + 경고 후 false(호출부 value 폴백).
+    fn frame_ensure(&mut self) -> bool {
+        if self.frame.is_some() {
+            return true;
         }
-        Err(e) => {
-            self.frame_broken = true;
-            crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-            eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-            false
+        let Some(acc) = self.acc.as_deref() else {
+            return false;
+        };
+        match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
+            Ok(f) => {
+                self.frame = Some(f);
+                true
+            }
+            Err(e) => {
+                self.frame_broken = true;
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
+                eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+                false
+            }
         }
     }
-}
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs)
             .map(|_| SeqState4::new(&model.hp, ctx))
@@ -908,11 +906,7 @@ fn frame_ensure(&mut self) -> bool {
         // 발생해 상태 오염 전에 중단된다.
         let frame_on = self.frame_on(true);
         let frame_try = if frame_on {
-            if self.frame_ensure() {
-                Some(())
-            } else {
-                None
-            }
+            if self.frame_ensure() { Some(()) } else { None }
         } else {
             None
         };
@@ -1044,7 +1038,10 @@ fn pure_hash(
     vs: &[u64],
     eos: u32,
 ) -> Vec<u32> {
-    crate::qwen4exp::stages::ple_hash_rows(hist, hist_valid, tokens, ngram, hpng, mult, offs, vs, eos).0
+    crate::qwen4exp::stages::ple_hash_rows(
+        hist, hist_valid, tokens, ngram, hpng, mult, offs, vs, eos,
+    )
+    .0
 }
 
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).

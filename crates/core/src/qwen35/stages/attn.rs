@@ -2,8 +2,8 @@
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
-use crate::qwen35::{mm_batch, mm_group};
 use crate::ops::{rms_norm, rope_head, sigmoid};
+use crate::qwen35::{mm_batch, mm_group};
 use llm170_diag::profile_span;
 
 /// qwen35 단일 헤드 어텐션 — 점수→exp_cr 소프트맥스→가중합→게이트(plans/90 B4 D2).

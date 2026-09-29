@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// W4A8 GEMV 커널명 테이블 — gemv_q8 계열 3중 복제 통합(plans/109 P9).
+fn gemv_kern(ty: u32) -> Result<&'static str, String> {
+    Ok(match ty {
+        23 => "gemm_xs",
+        13 => "gemm_q5k",
+        8 => "gemm_q8_0",
+        12 => "gemm_q4k",
+        14 => "gemm_q6k",
+        20 => "gemm_nl",
+        11 => "gemm_q3k",
+        21 => "gemm_iq3s",
+        _ => return Err(format!("미지원 타입 {ty}")),
+    })
+}
+
 impl RawCtx {
     /// W4A8 t=1 GEMV — 타입별 커널 선택, 부분합 reduce까지 수행.
     /// 반환 [n_out] f32. 수치: dot_row_w4a8_*_lane 미러와 동일열.
@@ -18,17 +33,7 @@ impl RawCtx {
         let out = self.scratch(n_out * 4)?;
         let gy = n_out.min(65535) as u32;
         let gz = n_out.div_ceil(65535) as u32;
-        let kern = match ty {
-            23 => "gemm_xs",   // iq4_xs
-            13 => "gemm_q5k",  // q5_K
-            8 => "gemm_q8_0",  // q8_0
-            12 => "gemm_q4k",  // q4_K
-            14 => "gemm_q6k",  // q6_K
-            20 => "gemm_nl",   // iq4_nl
-            11 => "gemm_q3k",  // q3_K
-            21 => "gemm_iq3s", // iq3_s
-            _ => return Err(format!("미지원 타입 {ty}")),
-        };
+        let kern = gemv_kern(ty)?;
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut part_p = part as *mut std::ffi::c_void;
@@ -120,17 +125,7 @@ impl RawCtx {
         let part = self.scratch(n_out * 64 * 8)?;
         let gy = n_out.min(65535) as u32;
         let _gz = n_out.div_ceil(65535) as u32;
-        let kern = match ty {
-            23 => "gemm_xs",
-            13 => "gemm_q5k",
-            8 => "gemm_q8_0",
-            12 => "gemm_q4k",
-            14 => "gemm_q6k",
-            20 => "gemm_nl",
-            11 => "gemm_q3k",
-            21 => "gemm_iq3s",
-            _ => return Err(format!("미지원 타입 {ty}")),
-        };
+        let kern = gemv_kern(ty)?;
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut part_p = part as *mut std::ffi::c_void;
@@ -382,13 +377,6 @@ impl RawCtx {
         self.launch3(kern, 1, gy, gz, blk, &mut args)
     }
 
-    /// mmq quant_y 캐시 무효화 (y 원본 재기입 직전 호출 — 부록81).
-    pub fn mmq_y_bump(&self) {
-        if let Ok(mut c) = self.mmq_y_cache.lock() {
-            c.0 = c.0.wrapping_add(1);
-        }
-    }
-
     /// AR 청크 버퍼 조기 확보 (DecodeState init에서 호출 — 조각화 회피).
     pub fn ar_chunk_prealloc(
         &self,
@@ -437,17 +425,7 @@ impl RawCtx {
         let part = self.scratch(n_out * 64 * 8)?;
         let gy = n_out.min(65535) as u32;
         let _gz = n_out.div_ceil(65535) as u32;
-        let kern = match ty {
-            23 => "gemm_xs",
-            13 => "gemm_q5k",
-            8 => "gemm_q8_0",
-            12 => "gemm_q4k",
-            14 => "gemm_q6k",
-            20 => "gemm_nl",
-            11 => "gemm_q3k",
-            21 => "gemm_iq3s",
-            _ => return Err(format!("미지원 타입 {ty}")),
-        };
+        let kern = gemv_kern(ty)?;
         let mut xq_p = xq as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut part_p = part as *mut std::ffi::c_void;
@@ -1104,7 +1082,7 @@ impl RawCtx {
 
     /// llama MMQ (mul_mat_q<q4_K/q5_K,128>) — f32 활성 직양자화 + 원형 런치.
     /// 하니스 검증: q4_K maxrel 6e-4, q5_K maxrel 1.5e-3 (plans/27 부록5·14).
-    pub fn gemm_mmq(
+    fn gemm_mmq_impl(
         &self,
         ty: u32,
         y_f32: *const u8,
@@ -1113,6 +1091,8 @@ impl RawCtx {
         n_out: usize,
         t: usize,
         out: *mut u8,
+        stream: hip::hipStream_t,
+        side: bool,
     ) -> Result<(), String> {
         let fns = &self.fns;
         // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
@@ -1177,7 +1157,11 @@ impl RawCtx {
             // 슬랙이 없으면 t가 128의 배수가 아닐 때(예: 검증 배치 t=33) OOB read.
             const MMQ_Y_SLACK: usize = 128 * 144;
             let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
-            let mut sc = self.mmq_y.lock().map_err(|e| e.to_string())?;
+            let mut sc = if side {
+                self.mmq_y_s.lock().map_err(|e| e.to_string())?
+            } else {
+                self.mmq_y.lock().map_err(|e| e.to_string())?
+            };
             if sc.0 < need {
                 if !sc.1.is_null() {
                     unsafe { hip::hipFree(sc.1 as *mut _) };
@@ -1238,7 +1222,7 @@ impl RawCtx {
                             1,
                             1,
                             0,
-                            self.stream,
+                            stream,
                             q2.as_mut_ptr(),
                             std::ptr::null_mut(),
                         ),
@@ -1264,7 +1248,7 @@ impl RawCtx {
                             1,
                             1,
                             0,
-                            self.stream,
+                            stream,
                             qargs.as_mut_ptr(),
                             std::ptr::null_mut(),
                         ),
@@ -1358,7 +1342,7 @@ impl RawCtx {
                     8,
                     1,
                     smem as u32,
-                    self.stream,
+                    stream,
                     args.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
@@ -1378,6 +1362,22 @@ impl RawCtx {
         }
         Ok(())
     }
+
+    /// MMQ — 메인 스트림판.
+    pub fn gemm_mmq(
+        &self,
+        ty: u32,
+        y_f32: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        t: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
+        self.gemm_mmq_impl(ty, y_f32, w, n_in, n_out, t, out, self.stream, false)
+    }
+
+    /// MMQ — 사이드 스트림판 (mmq_y_s 전용 버퍼는 호출부가 지정).
     pub fn gemm_mmq_s(
         &self,
         ty: u32,
@@ -1388,173 +1388,6 @@ impl RawCtx {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
-        let fns = &self.fns;
-        // D4 타입(q6_K/iq4_xs)은 f32-d 전용 양자화 (mmq.cuh ds_layout 계약)
-        // DS 레이아웃(mmq.cuh): Q6K/IQ4XS/Q8_0 → D4, Q4K/Q5K → DS4.
-        // Q8_0(8)도 D4라 기존 quant_y_d4와 포맷 공유를 기대(plans/71 실험).
-        let fq = *fns
-            .get(if matches!(ty, 8 | 14 | 23) {
-                "mmq_quant_y_d4"
-            } else {
-                "mmq_quant_y"
-            })
-            .ok_or("mmq quant 없음")?;
-        let sym = match ty {
-            12 => {
-                "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
-            }
-            13 => {
-                "_ZL9mul_mat_qIL9ggml_type13ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
-            }
-            14 => {
-                "_ZL9mul_mat_qIL9ggml_type14ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
-            }
-            23 => {
-                "_ZL9mul_mat_qIL9ggml_type23ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
-            }
-            _ => return Err(format!("MMQ 미지원 타입 {ty}")),
-        };
-        let fm = *fns.get(sym).ok_or("mul_mat_q 없음")?;
-        // q6_K는 GGUF(=ggml 정준) 레이아웃을 그대로 쓴다. 과거의
-        // requant_q6k_canonical(d-first 재배열)은 정준 입력을 깨뜨려 쓰레기
-        // 토큰을 냈다(2026-09-12 실측) — 107 W4로 레거시 분기 삭제.
-        let w_eff = w as *mut u8;
-        // 전용 y 버퍼 — scratch 풀은 동일 크기 호출에 같은 포인터 반환(비동기
-        // 재작성 위험). MMQ y는 단일 소유로 격리.
-        let yb = {
-            const MMQ_Y_SLACK: usize = 128 * 144;
-            let need = (n_in / 128) * t * 144 + MMQ_Y_SLACK;
-            let mut sc = self.mmq_y_s.lock().map_err(|e| e.to_string())?;
-            if sc.0 < need {
-                if !sc.1.is_null() {
-                    unsafe { hip::hipFree(sc.1 as *mut _) };
-                }
-                sc.1 = self.alloc(need)?;
-                sc.0 = need;
-            }
-            sc.1
-        };
-        let mut yp = yb as *mut std::ffi::c_void;
-        let mut ysrc = y_f32 as *const std::ffi::c_void;
-        let mut nt = t as i32;
-        let mut ni_a = n_in as i32;
-        unsafe {
-            let mut qargs = vec![
-                &mut ysrc as *mut _ as *mut std::ffi::c_void,
-                &mut yp as *mut _ as *mut std::ffi::c_void,
-                &mut nt as *mut _ as *mut std::ffi::c_void,
-                &mut ni_a as *mut _ as *mut std::ffi::c_void,
-            ];
-            ck(
-                hip::hipModuleLaunchKernel(
-                    fq,
-                    (n_in / 128) as u32,
-                    t as u32,
-                    1,
-                    32,
-                    1,
-                    1,
-                    0,
-                    self.stream2,
-                    qargs.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "mmq_quant_y",
-            )?;
-        }
-        fn fd3(d: u32) -> [u32; 3] {
-            let mut l = 0u32;
-            while l < 32 && (1u32 << l) < d {
-                l += 1;
-            }
-            let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
-            [mp, l, d]
-        }
-        let j: usize = 128;
-        // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
-        // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
-        let qk: usize = if ty == 8 { 32 } else { 256 };
-        let nbk = (n_in / qk) as u32;
-        let mut bpn = fd3(nbk);
-        let mut one = fd3(1);
-        let j_now: usize = 128;
-        let mut ntx_fd = fd3(t.div_ceil(j_now) as u32);
-        let z3: [u32; 3] = [0, 0, 0];
-        let mut ax = w_eff as *mut std::ffi::c_void;
-        let mut ay = yb as *mut std::ffi::c_void;
-        let mut aid: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut aeb: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut adst = out as *mut std::ffi::c_void;
-        let mut afx: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut ays: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut p_nrows = n_out as i32;
-        let mut p_ncolsdst = t as i32;
-        let mut p_srow = (n_in / qk) as i32;
-        let mut p_ncolsy = t as i32;
-        let mut p_scol = n_out as i32;
-        let smem: i32 = (j * 4 + 128 * 76 * 4 + (j * 144).div_ceil(1024) * 1024) as i32;
-        unsafe {
-            ck(
-                hip::hipFuncSetAttribute(
-                    fm as *const _,
-                    hip::hipFuncAttribute_hipFuncAttributeMaxDynamicSharedMemorySize,
-                    smem,
-                ),
-                "mmq smem attr",
-            )?;
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mut ax as *mut _ as *mut _,
-                &mut ay as *mut _ as *mut _,
-                &mut aid as *mut _ as *mut _,
-                &mut aeb as *mut _ as *mut _,
-                &mut adst as *mut _ as *mut _,
-                &mut afx as *mut _ as *mut _,
-                &mut ays as *mut _ as *mut _,
-                bpn.as_mut_ptr() as *mut _,
-                &mut p_nrows as *mut _ as *mut _,
-                &mut p_ncolsdst as *mut _ as *mut _,
-                &mut p_srow as *mut _ as *mut _,
-                &mut p_ncolsy as *mut _ as *mut _,
-                &mut p_scol as *mut _ as *mut _,
-                one.as_mut_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _,
-                one.as_mut_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                z3.as_ptr() as *mut _,
-                ntx_fd.as_mut_ptr() as *mut _,
-            ];
-            ck(
-                hip::hipModuleLaunchKernel(
-                    fm,
-                    n_out.div_ceil(128) as u32,
-                    t.div_ceil(128) as u32,
-                    1,
-                    32,
-                    8,
-                    1,
-                    smem as u32,
-                    self.stream2,
-                    args.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "mul_mat_q",
-            )?;
-            if env_on("LLM170_MMQ_ARGS") {
-                eprintln!(
-                    "mmq_args ty={ty} n_in={n_in} n_out={n_out} t={t} grid=({},{},1) blk=(32,8) smem={smem} srow={} scol={} nrows={}",
-                    n_out.div_ceil(128),
-                    t.div_ceil(128),
-                    n_in / 256,
-                    n_out,
-                    n_out
-                );
-            }
-        }
-        Ok(())
+        self.gemm_mmq_impl(ty, y_f32, w, n_in, n_out, t, out, self.stream2, true)
     }
 }
