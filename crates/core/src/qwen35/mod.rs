@@ -9,17 +9,17 @@
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
 mod diag;
+pub(crate) mod frame;
 pub mod hparams;
 pub mod prefill;
 pub mod rawinject;
 pub mod spec;
 pub mod stages;
-pub(crate) mod frame;
 pub use frame::Frame;
 
 use hparams::Hparams;
-use llm170_gguf::GgufFile;
 use llm170_diag::profile_span;
+use llm170_gguf::GgufFile;
 use memmap2::Mmap;
 
 use crate::matmul::{Weight, mm, mm_batch, mm_group};
@@ -152,7 +152,9 @@ impl Model {
         let mut total = 0u64;
         for t in &self.gguf.tensors {
             let name = t.name.as_str();
-            let Some((start, end)) = t.file_range(self.gguf.data_offset) else { continue };
+            let Some((start, end)) = t.file_range(self.gguf.data_offset) else {
+                continue;
+            };
             let len = (end - start) as usize;
             if len < (4 << 20) || keep.contains(&name) {
                 continue;
@@ -174,7 +176,10 @@ impl Model {
             if rc == 0 {
                 total += len as u64;
             } else {
-                eprintln!("[madvise] {name}: rc={rc} err={}", std::io::Error::last_os_error());
+                eprintln!(
+                    "[madvise] {name}: rc={rc} err={}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
         total
@@ -245,7 +250,10 @@ impl SeqState {
         let (n_kv, hd) = (model.hp.n_kv, model.hp.head_dim);
         let state_size = model.hp.dt_rank * model.hp.d_state * model.hp.d_state;
         let conv_len = (model.hp.conv_k - 1) * model.hp.conv_ch();
-        let has_mtp = model.gguf.find_tensor("blk.64.nextn.eh_proj.weight").is_some();
+        let has_mtp = model
+            .gguf
+            .find_tensor("blk.64.nextn.eh_proj.weight")
+            .is_some();
         SeqState {
             pos: 0,
             kv_k: vec![vec![0.0; ctx * n_kv * hd]; n_full],
@@ -254,7 +262,14 @@ impl SeqState {
             conv: vec![vec![0.0; conv_len]; n_recr],
             mtp_kv_k: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
             mtp_kv_v: vec![0.0; if has_mtp { ctx * n_kv * hd } else { 0 }],
-            mtp_h: vec![0.0; if has_mtp && std::env::var_os("LLM170_NOMTP").is_none() { model.hp.n_embd } else { 0 }],
+            mtp_h: vec![
+                0.0;
+                if has_mtp && std::env::var_os("LLM170_NOMTP").is_none() {
+                    model.hp.n_embd
+                } else {
+                    0
+                }
+            ],
             mtp_draft_logits: Vec::new(),
             mtp_draft_tok: 0,
             mtp_draft_h: Vec::new(),
@@ -284,7 +299,11 @@ pub struct Engine {
 impl Engine {
     /// MTP(nextn) 텐서 탑재 여부 — --spec 사용 가능 판정.
     pub fn has_mtp(&self) -> bool {
-        !self.seqs.first().map(|s| s.mtp_h.is_empty()).unwrap_or(true)
+        !self
+            .seqs
+            .first()
+            .map(|s| s.mtp_h.is_empty())
+            .unwrap_or(true)
     }
 
     pub fn new(model: Model, n_seqs: usize, ctx: usize) -> Self {
@@ -341,7 +360,11 @@ impl Engine {
     pub fn reset_seq(&mut self, seq: usize) {
         let n_kv = self.model.hp.n_kv;
         let hd = self.model.hp.head_dim;
-        let ctx = self.seqs[seq].kv_k.first().map(|k| k.len() / (n_kv * hd)).unwrap_or(4096);
+        let ctx = self.seqs[seq]
+            .kv_k
+            .first()
+            .map(|k| k.len() / (n_kv * hd))
+            .unwrap_or(4096);
         // raw 디코더 상주 상태(GDN/conv)도 제로화 — 슬롯 재사용 시 누수 방지.
         if let Some(rd) = self.raw_decode.as_ref() {
             let _ = rd.raw_reset(seq);
@@ -427,13 +450,17 @@ impl Engine {
                 }
             }
 
-            let ctx = stages::Ctx { model: &self.model, acc: &self.acc };
+            let ctx = stages::Ctx {
+                model: &self.model,
+                acc: &self.acc,
+            };
             let attn_out = if self.model.is_recr(il) {
                 let o = stages::gdn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, recr_idx)?;
                 recr_idx += 1;
                 o
             } else {
-                let o = stages::attn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, full_idx)?;
+                let o =
+                    stages::attn_layer(&ctx, &mut self.seqs, il, &xs, seq_ids, t_len, full_idx)?;
                 full_idx += 1;
                 o
             };
@@ -471,7 +498,9 @@ impl Engine {
             let mut ffn_out: Vec<Vec<f32>> = vec![vec![0.0f32; hp.n_embd]; n_tok];
             let mut ffn_chained = false;
             if let Some(a) = acc.as_deref() {
-                ffn_chained = a.ffn_chain(&normed, &gate_w, &up_w, &down_w, &mut ffn_out).is_ok();
+                ffn_chained = a
+                    .ffn_chain(&normed, &gate_w, &up_w, &down_w, &mut ffn_out)
+                    .is_ok();
             }
             if ffn_chained {
                 for (x, o) in xs.iter_mut().zip(ffn_out.iter()) {
@@ -481,8 +510,10 @@ impl Engine {
                 }
                 continue;
             }
-            let mut ffn_group: [Vec<Vec<f32>>; 2] =
-                [vec![vec![0.0f32; n_ff]; n_tok], vec![vec![0.0f32; n_ff]; n_tok]];
+            let mut ffn_group: [Vec<Vec<f32>>; 2] = [
+                vec![vec![0.0f32; n_ff]; n_tok],
+                vec![vec![0.0f32; n_ff]; n_tok],
+            ];
             {
                 span_block!("cpu::ffn_gate_up", {
                     mm_group(&acc, &normed, &[gate_w, up_w], &mut ffn_group)?;
@@ -548,9 +579,6 @@ impl Engine {
         }
         // MTP nextn KV 적립 — 프롬프트/배치 토큰 전체 (draft 어텐션 컨텍스트).
         // h_in = 본체 최종 hidden (output_norm 전). 로짓 없이 1층만.
-        if std::env::var_os("LLM170_SPEC_DBG").is_some() {
-            eprintln!("  [hookguard] mtp_h.len={} seq0={}", self.seqs[seq_ids[0]].mtp_h.len(), seq_ids[0]);
-        }
         if !self.seqs[seq_ids[0]].mtp_h.is_empty() && self.mtp_wanted {
             // plans/46: raw 백엔드는 GPU MTP 스텝을 사용 — CPU mtp_step은 토큰당 ~150ms로
             // 프리필·검증을 30× 악화시켰다. GPU 경로는 argmax만 반환 → mtp_draft_tok 사용.
@@ -567,7 +595,12 @@ impl Engine {
                         let embd = self.model.wchk("token_embd.weight")?;
                         let mut row = vec![0.0f32; n_e];
                         crate::quant::dequant_row(
-                            embd.ty, embd.data, batch[s][t] as u64, n_e as u64, &mut row);
+                            embd.ty,
+                            embd.data,
+                            batch[s][t] as u64,
+                            n_e as u64,
+                            &mut row,
+                        );
                         let (am, hn) = rd
                             .mtp_step_gpu(sid, &row, &prev_h, pos0 + t)
                             .map_err(ModelError::Accel)?;
@@ -605,7 +638,9 @@ impl Engine {
         // 원시 HIP 디코드 (t=1 단일) — LLM170_RAWHIP=1, 최우선 게이트.
         if tokens.len() == 1
             && seq_ids.len() == 1
-            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
             && let Some(rd) = self.raw_decode.as_ref()
         {
             let seq = seq_ids[0];
@@ -617,7 +652,9 @@ impl Engine {
             let pos = self.seqs[seq].pos as usize;
             let mut h_t = Vec::new();
             let logits = if !self.seqs[seq].mtp_h.is_empty() && self.mtp_wanted {
-                let lg = rd.raw_step_h(seq, pos, &row, &mut h_t).map_err(ModelError::Accel)?;
+                let lg = rd
+                    .raw_step_h(seq, pos, &row, &mut h_t)
+                    .map_err(ModelError::Accel)?;
                 let rd2 = rd.clone();
                 let prev_h = std::mem::take(&mut self.seqs[seq].mtp_pending_h);
                 let (am, hn) = rd2
@@ -657,28 +694,30 @@ impl Engine {
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()
-            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
         {
-        let rd = self.raw_decode.clone().unwrap();
-        let n = self.model.hp.n_embd;
-        // plans/92 P6: token_embd 은 mmap 에서 행 단위 직판독(t=1 경로와 동일) —
-        // 종전 2.5GB to_vec 캐시를 첫 np 호출(계측 구간 내)에 만들어 agg 셀에
-        // ~1s 를 삼키고 RAM 을 상주시켰다. wchk 는 mmap 뷰라 복사 불필요.
-        let embd = self.model.wchk("token_embd.weight")?;
-        let poss: Vec<u32> = seq_ids.iter().map(|&s| self.seqs[s].pos).collect();
-        let mut rows: Vec<f32> = Vec::with_capacity(tokens.len() * n);
-        for &tk in tokens {
-            let mut r = vec![0.0f32; n];
-            crate::quant::dequant_row(embd.ty, embd.data, tk as u64, n as u64, &mut r);
-            rows.extend(r);
-        }
-        let lgs = rd
-            .raw_step_multi(seq_ids, &poss, &rows)
-            .map_err(ModelError::Accel)?;
-        for s in seq_ids {
-            self.seqs[*s].pos += 1;
-        }
-        return Ok(lgs);
+            let rd = self.raw_decode.clone().unwrap();
+            let n = self.model.hp.n_embd;
+            // plans/92 P6: token_embd 은 mmap 에서 행 단위 직판독(t=1 경로와 동일) —
+            // 종전 2.5GB to_vec 캐시를 첫 np 호출(계측 구간 내)에 만들어 agg 셀에
+            // ~1s 를 삼키고 RAM 을 상주시켰다. wchk 는 mmap 뷰라 복사 불필요.
+            let embd = self.model.wchk("token_embd.weight")?;
+            let poss: Vec<u32> = seq_ids.iter().map(|&s| self.seqs[s].pos).collect();
+            let mut rows: Vec<f32> = Vec::with_capacity(tokens.len() * n);
+            for &tk in tokens {
+                let mut r = vec![0.0f32; n];
+                crate::quant::dequant_row(embd.ty, embd.data, tk as u64, n as u64, &mut r);
+                rows.extend(r);
+            }
+            let lgs = rd
+                .raw_step_multi(seq_ids, &poss, &rows)
+                .map_err(ModelError::Accel)?;
+            for s in seq_ids {
+                self.seqs[*s].pos += 1;
+            }
+            return Ok(lgs);
         }
         let batch: Vec<Vec<u32>> = tokens.iter().map(|t| vec![*t]).collect();
         let logits = self.forward(seq_ids, &batch)?;
@@ -698,8 +737,12 @@ impl Engine {
         if tokens.len() > 1
             && seq_ids.len() > 1
             && self.raw_decode.is_some()
-            && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
-            && std::env::var("LLM170_NP_GREEDY").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            && std::env::var("LLM170_NP_GREEDY")
+                .map(|v| v != "0")
+                .unwrap_or(true)
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;
@@ -733,17 +776,13 @@ impl Engine {
             return Ok(crate::qwen35::greedy(&logits[0]));
         };
         let n = self.model.hp.n_embd;
-        let tw0 = std::time::Instant::now();
         let embd = self.model.wchk("token_embd.weight")?;
         let mut row = vec![0.0f32; n];
         crate::quant::dequant_row(embd.ty, embd.data, token as u64, n as u64, &mut row);
-        let tw1 = std::time::Instant::now();
         let pos = self.seqs[seq].pos as usize;
-        let tok = rd.raw_step_greedy(seq, pos, &row).map_err(ModelError::Accel)?;
-        if std::env::var_os("LLM170_DBG_WALL").is_some() {
-            eprintln!("[dg] dequant={:.2}ms step+greedy={:.2}ms",
-                (tw1-tw0).as_secs_f64()*1e3, tw1.elapsed().as_secs_f64()*1e3);
-        }
+        let tok = rd
+            .raw_step_greedy(seq, pos, &row)
+            .map_err(ModelError::Accel)?;
         self.seqs[seq].pos += 1;
         Ok(tok)
     }
@@ -758,7 +797,6 @@ impl Engine {
             .replace('Ġ', " ")
             .replace('Ċ', "\n")
     }
-
 }
 
 /// greedy argmax — `matmul::greedy_from`과 동일 의미(동률 최저인덱스).

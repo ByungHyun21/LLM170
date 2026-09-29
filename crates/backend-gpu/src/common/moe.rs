@@ -22,6 +22,12 @@
 //! MoeTop10가 매 스텝 세대를 올리므로 무가드 재할당은 세대당 1회 누수.
 
 /// 그룹화 캐시 히트 판정 — 세대·행수·ids 동일 시 재사용.
-pub fn cache_hit(gen_cached: u64, gen_now: u64, rows_cached: usize, rows: usize, ids_match: bool) -> bool {
+pub fn cache_hit(
+    gen_cached: u64,
+    gen_now: u64,
+    rows_cached: usize,
+    rows: usize,
+    ids_match: bool,
+) -> bool {
     gen_cached == gen_now && rows_cached == rows && ids_match
 }

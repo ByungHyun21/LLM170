@@ -360,7 +360,7 @@ steps (persistent sp, coopMat QK) need an LDS-budget redesign.
 
 **Near-tie baseline note**: the arithmetic-order change flips near-tie tokens
 on the adversarial Korean gate prompt (the documented chunk-size residual
-class — docs/chunk-invariance.md). The new stream is reference-correct;
+class — docs/archive/chunk-invariance.md). The new stream is reference-correct;
 HIP is untouched and still matches the original baseline. Gate baselines are
 now per-runtime (`.gate-27b-baseline-vk.txt`); `LLM170_VK_NOGQ=1` restores
 the old single-query kernel.
@@ -2016,7 +2016,7 @@ page cache" theory behind the carve relocation was falsified by the ringfix
 run: with the ring in carve, one pp512 run still flipped the model file to
 ENOENT. Carve placement is retained as defense-in-depth only; the ENOENT
 correlation is not explained by ring placement (FS metadata damage itself
-remains the open suspect — see docs/fs-corruption-incident-2026-09-25.md).
+remains the open suspect — see docs/archive/fs-corruption-incident-2026-09-25.md).
 
 Follow-up evidence (same night, kernel log): two `llm170` segfaults at
 02:36:56/02:37:06 inside `libvulkan_radeon.so` at the identical IP offset
@@ -2668,3 +2668,491 @@ pp500 잔여 경로는 llmmq B-팩 스테이징 단일축(6.9→~5ms 목표).
 - 판정: **옵트인 유지**(=1). llama의 506은 f32 HC 경로 — 우리 f32
   기준선이 llama와 일치하므로 HCF16은 품질 회귀. 재승격 조건: 근접타이
   마진 로그 분석으로 위치 1 플립이 마진 <0.1nat 타이인지 실증.
+
+### (86) HCF16·MOEH16·f16bufs 전면 폐기 (plans/107 W1, 2026-09-28)
+
+- **HCF16 판정 측정**(top2 계측 신설 — LLM170_DUMP=top2, greedy 스텝
+  상위2·마진 출력): Flash-Next 208토큰·n33 아그맥스 33/33 동일(최소
+  마진 1.10), 27B 게이트 프롬프트·n33 33/33 동일(최소 마진 0.015 —
+  타이트 포지션 존재하나 플립 0). pp512 성능: ON 211.91 vs OFF 216.58
+  t/s — 이득 없음. 원장 85의 재승격 조건(마진 실증) 충족 못함 +
+  품질·성능 근거 부재 → **삭제**.
+- **MOEH16**: 원장 84 값 결함 잔여·동결 — **삭제**. FnMoeWsumH는
+  발화점 없는 사중 자산이었다.
+- **삭제 범위**: frame_mm_hout·frame_moe_gemm16(트레이트+구현),
+  HcGateMean.h16 필드, RmsRows out16 판, f16bufs 레지스트리(생산자
+  2·판독 9 전부), 슬롯 FnMoeTileQ51mmqH·FnMoeWsumH·FnSiluH·
+  FnTileF32sH·QuantF16in + spv/comp 10종.
+- **무영향 입증**: charhash 스테이지 해시 15,674라인 전수 일치(생산자가
+  모두 옵트인이라 기본 경로가 항상 빈 레지스트리였음), 게이트
+  2종(Flash-Next·27B) 토큰 스트림 동일.
+- 셰이더 푸시 레이아웃(hc_gate_mean·rms_wide의 f16 플래그 자리)는
+  호환 유지·항상 0 — W3 spv 정리 시 플래그 제거 예정.
+
+### (87) [미해결·별도 과제] vk q35 프리필 비결정론 레이스 — 최소재현·소거표 (plans/107 W1, 2026-09-28)
+
+- **증상**: 27B vk 디코드 토큰 스트림이 실행마다 상이(게이트 FAIL).
+  spec2 수리(86직후 커밋) 도중 발견 — **변경 이전부터 존재**(stash
+  대조로 e01c2df 이전 빌드에서도 재현).
+- **최소재현**: `infer --gpu-runtime vulkan` t=5 토큰 프리필 —
+  LLM170_VKD_LSUM=1(신설 계측: 층별 b_xn 64합, LSUM_MOD 간격)로
+  il=0부터 5회 모두 상이(±3e-3). 발산은 레이어 0 내부에서 시작,
+  64층 누적되어 토큰 플립.
+- **실험 행렬**:
+  - VK_SPLIT=1(디스패치마다 제출·대기): 결정론·정확(베이스라인
+    접두 일치) — 상호중첩 차단이 유일한 치료.
+  - VK_SPLIT=2: 이미 오염 → 인접 디스패치 쌍 범위.
+  - LLM170_VK_DEPBAR=0(전 배리어 강제): 무효 → compute 배리어
+    부재가 아님(또는 배리어가 무효).
+  - kv k/v bar=false 쌍: 진성 독립(별개 버퍼) — 무죄.
+  - 배치 중 호스트 매핑 쓰기: b_xs 업로드(738)는 begin_batch
+    이전뿐 — 무죄. 지연 가중 업로드 없음(init 전량).
+  - ds_cache 갱신-중-비행: 갱신은 fresh 세트만 — 무죠.
+- **잔여 용의자**: cmdbuf2 녹화 의존성, 배치 경계의 디스크립터
+  세트 수명, RADV GTT 상주 SSBO 동시실행 가시성, 단일 커널 내
+  WG 간 가시성. hip 경로 무영향(게이트·charhash 전과 동일 PASS).
+- **다음 세션 절차**: bar=true 전량화 테스트 → 레이어 0 서브페이즈
+  계측(LSUM 확장) → 커널 단위 이분. bisect '21ad0be 첫불량'은
+  비결정론으로 신뢰 불가.
+
+### (88) RESF16 승격 — res_hc f16 버스 기본 ON (plans/107 W2, 2026-09-28)
+
+- 원장 60 실증(토큰 33/33 f32 동일·피크 432.6) + 사용자 위임 판단.
+- 게이트 2종 PASS(토큰 스트림 불변 확인), pp512 216.6→243.7 t/s.
+- charhash golden 재캡처(res_hc f16 저장 스테이지 해시 변경 — 정상).
+- 킬스위치 LLM170_VK_RESF16=0 잔존(W2 말기 env 폐지 때 제거).
+- 대조: HCF16(원장 86 삭제)은 48층 f16 누적이라 근접타이 민감 —
+  RESF16은 저장 버스 1회 변환으로 위험 부류가 다르다.
+
+### (89) W2 env 정리 세션 정산 — 419→326종·잔여 프로토콜 (plans/107, 2026-09-28)
+
+- **처리 실적**: 핫패스 판독 137+노브 캐시형(diag::flag) · 일회 진단 42종
+  삭제(-1,587줄) · 진단 45종 92판독점 LLM170_DUMP 키 공간 통합
+  (dump::key) · 승격 게이트 9종+HCF16/MOEH16/변형 13종 폐기 ·
+  serve --slots/--queue/SERVER_CTX · RESF16 승격.
+- **잔여 분류**(326종): 코어 진단 5(DUMP·DUMP_LOGITS·VK_TS·WATCHDOG
+  ×2) · 경로/모델 10 · 수치 노브 19 · 런타임 선택 6 · **동작 게이트
+  286**(VK_* 100+/Q8*/QSA*/TILE*/NO_* 계열 — 대부분 백엔드 디스패치
+  실험 잔존).
+- **잔여 프로토콜**: 286종 개별 판정은 W4-W5 백엔드 분해와 병행(그
+  코드가 재구조화 대상이라 중복 작업 방지). 신규 진단은 LLM170_DUMP
+  키로만 추가 — 개별 env 금지(플래그 레지스트리가 카탈로그로 감사).
+
+### (90) vk 레이스 추적 2차 — kv_app bar=false 실결함 1건 수리·잔여 메커니즘 지속 (plans/107, 2026-09-28)
+
+- **수리**: kv_app(k·q8판 포함 5개 발화점)의 bar=false — "k/v 상호
+  독립"은 참이나 **qk_rope2가 기록한 b_ak/b_av 판독 의존**을 놓쳐 RAW
+  경합. 전부 bar=true화. 정확 접두 등장률 상승(교차 4회 중 2회
+  완전 일치 — 수리 전엔 사실상 0).
+- **잔여**: 별개 메커니즘이 병존 — (a) 완전 배리어 상태에서도 il=0
+  체크섬이 실행마다 상이(MOD=1 매층 동기에도), (b) VK_SPLIT=1은
+  6/6 완전 고정, (c) 크기 1e-4~3e-3. 즉 순서와 무관한 병렬성에서
+  발생하나 개별 제출로만 소멸 — 후보: 커맨드 버퍼 기록 계층 상태
+  (ds 캐시·세트 풀·cmdbuf2 재사용) 또는 드라이버 가시성.
+- **차기 프로브**: (1) 배치 내 bind_bufs 갱신 시점 전량 열거
+  (기록 중 갱신 여부), (2) ds_cache 무효화(매 배치 클리어) 실험,
+  (3) cmdbuf2 2개 교대(더블 버퍼) 실험 — W1.5-1 이중버퍼와 결합하면
+  치료+최적화 동시 실증 가능.
+
+  - **프로브 결과(2차 세션)**: (2) ds_cache 배치 무효화(race_nocache
+    키) — 무효(2/4 오염). (3) split 재스윕(수리 후): 2/8/64 전부
+    이분(198↔220 첫 토큰 양상) — **오직 split=1만 결정론**. (4) 메모리
+    코히런시 — 타입 선택이 HOST_COHERENT 강제라 무죄. (5) fresh_ds
+    dsl-풀 짝 — 정합. **결론: 인접 디스패치 쌍이 단일 제출 안에서
+    병렬 실행되며 배리어로도 직렬화되지 않는 현상** — RADV 스케줄러
+    또는 코드경로 밖 계층 의심. 코드 수준 프로브 한계 → 차기 세션은
+    Vulkan validation layer·RADV RRA 덤프 또는 cmdbuf2 이중화(W1.5-1
+    결합)로 무장 권장. race_nocache 키는 진단 자산으로 잔존.
+
+  - **경합쌍 부분 특정(VK_SPLIT_AT 단일 경계 프로브, 2차 세션 말미)**:
+    chunk1·L0의 디스패치 22개 공간에서 K=4/8/12 분할은 잔여 발산,
+    K=16 분할은 완전 치료(il=0=-2.822817 안정) → **경합쌍 x∈[12..15],
+    y≥16**. 미세 스윕(13-15) 직전에 27B 모델 파일이 외부 이동돼
+    (디렉토리 잔여 ISSUES.md뿐) 중단 — q35 계열 모델 복귀 시 3회
+    측정으로 쌍 확정·커널 직접 검경 가능. VK_SPLIT_AT 프로브는
+    진단 자산으로 상재.
+
+  - **이분 재개 시도(3차)**: 신규 추가 ornith-1.5-35B가 qwen35moe
+    아치로 확인됐으나 로더가 feed_forward_length 하이퍼파라미터를
+    거부해 미지원 — 27B 복귀 또는 qwen35moe 로더 지원 시 3회 측정
+    (K=13/14/15)으로 쌍 확정. VK_SPLIT_AT·race_nocache·LSUM 프로브는
+    상재.
+
+### (91) W7 개시 — slot_loop env 캐시화·2슬롯 E2E 실증 (plans/107, 2026-09-28)
+
+- engine.rs 슬롯 루프·엔진 팩토리 env 5종(NO_PREFIX·PREFILL_BATCH·
+  Q4_CPU·VK_ACC·RAWHIP 잔여) diag::flag 캐시형 전환.
+- E2E 스모크(Flash-Next hip, --slots 2): 병렬 2요청 정상 응답·
+  np-greedy 실패 0·슬롯 소스 가시화 동작.
+- **선계약 결함 발견(계승)**: max_tokens=5 요청에 24토큰 방출 —
+  API 계약 위반 의심(청크 경계 방출?). W7 계속 항목으로: 계약
+  확인·교정. slot_loop 구조 통합(SchedConfig·drain/유휴 단일화)도
+  다음 슬라이스로.
+
+### (92) 레이스 이분 무효 확정 + q35×vulkan 가시 폴백 (plans/107, 2026-09-28)
+
+- **이분 무효**: 27B 복귀 후 미세 스윕에서 단일 분할 "치료"가 확률적
+  동전임이 판명(재부팅 후 K=12 SAME·13-15 DIFF — 기존 K=16 SAME과
+  모순). 레이스는 **확산형**: 청크 실행 전체에 걸친 GPU 타이밍 의존,
+  오직 디스패치별 제출(완전 직렬화)만 결정론. 단일 경합쌍 모델 폐기.
+- **완화 조치**: qwen35×--gpu-runtime vulkan 요청 시 가시 폴백 —
+  "error: ... nondeterministic (ledger 87/90) — falling back to hip"
+  출력 후 hip 주입. LLM170_VK_Q35_FORCE=1로 vk 진단 강행 가능.
+  조용한 오염(원장 87 발견 상태) 종결.
+- 검증: RUNTIME=vulkan 게이트 PASS(hip 판 토큰과 동일)·hip 네이티브
+  불별·양 경로 각각 내부 결정론(2회 동일).
+
+### (93) W7 마감 — np4 10.5→28.6 t/s·max_tokens 계약·배정 단일화 (plans/107, 2026-09-28)
+
+- **np4 재측정**(27B Q4_K_XL hip, serve --slots 4, 웜, 4×64토큰
+  동시): **28.6 t/s aggregate** — 플랜 예측 밴드(27-33) 적중.
+  구 10.5 t/s(슬롯 1 직렬화) 대비 +172%. README 표 갱신.
+- 조치 3종: ① /v1/completions가 max_tokens 무시(n_predict만 판독,
+  기본 24 방출) — OpenAI 호환 계약 위반 교정(3570ff3). ② 배정
+  이중 복제 assign_slot 단일화 — 유휴 경로도 전 슬롯 접두 탐색으로
+  개선(8846511). ③ 슬롯 루프 env 캐시화(6f4be48).
+- 검증: 2슬롯 serve E2E·max_tokens=5→5/n_predict=3→3·charhash·
+  게이트 2종 PASS.
+
+### (94) W4 1차 — 일회 체커 12종 삭제 −1,920줄 (plans/107, 2026-09-28)
+
+- vk_mmq_check·mmv_check·q3(b)_dbg·dense_tile_time·moe_tile_type_check·
+  tile_check·llama_mmq_check·cm8_probe·moe_cm_race_check·sdot_probe+
+  고아 헬퍼 — 원장 30-86 종결 실험. **llama_mmq_check 소멸으로
+  patch_sdot.py 체인의 마지막 소비자 사망**(스크립트 파일은 W3 소관).
+- checks.rs 4964→3121줄. 유지: frame·gemv·gemv8·ft32·gdn_chunk·
+  ple_mt·fault·idot 프로브 전무상.
+- 검증: 워크스페이스 경고 0·charhash PASS·게이트 2종 PASS·
+  vk-frame-check PASS 유지.
+
+### (95) W5 1차 — hip 사중 커널 9종·레거시 옵트인 5분기 삭제 (plans/107, 2026-09-28)
+
+- NAMES 163→154: q4_moe_top10·q4_gdn_ar_w·norm_gated_silu·gdn_ar_sm·
+  gdn_conv_t2_ms·gemm_q8_0_w256 + 인접 3(에이전트 페어링 확인) —
+  등록 전수 무참조 실증 후 위치쌍 src 동반 삭제.
+- LLM170_Q6RQ(2)·Q4K_X/Y/YRPT(3) 옵트인 레거시 분기 삭제 — 기본
+  경로 불변. Q4K_OUTS/ROWS·Q4K_MMQ는 형상 스윕·기본 타일 게이트라
+  보류(W5 계속 판정).
+- 검증: 경고 0·charhash PASS·게이트 2종 PASS.
+
+### (96) W6 1차 — core matmul.rs 1619줄 모듈 절단 (plans/107, 2026-09-28)
+
+- matmul/ {traits(호스트·프레임 트레이트+FrameOp) · weight ·
+  dispatch(mm_*+Acc) · raw(RawDecode) · cpu(w4a8·기준곱·greedy)}
+  — 재수출으로 기존 crate::matmul::* 경로 전호환(ABI 불변).
+- 무동작 변경: charhash 15,674라인 일치·게이트 2종 PASS·경고 0.
+- FrameHost 3분할(FrameIo/Gemm/Misc)은 소비 니즈 발생 시(블랭킷
+  방식) 후속 — 현재 단일 소비 2백엔드라 선투자 보류 판단.
+
+### (97) W11 1차 — NaN 패닉·exit(101) 제거 (plans/107, 2026-09-28)
+
+- moe top-k 정렬: partial_cmp().unwrap() → total_cmp (NaN 로짓에도
+  결정론 전순서 — finite 경로 순서 불변).
+- 진단 경로 exit(101) 4곳 제거(보고 후 지속) — 서버 전 슬롯 사망
+  계약 종결. layers.rs nan_guard는 람다 조기 return으로.
+- quant.rs unimplemented!는 로드 시점 패닉(허용 분류) — 사전 타입
+  검증은 W6 quant 모듈화와 병행.
+- 검증: charhash PASS·게이트 2종 PASS·경고 0.
+
+### (98) W1.5-6 청크 스케줄러 스윕 — 현 기본값 이미 최적 부근 (plans/107, 2026-09-28)
+
+- **FN(qwen4exp vk 판)**: chunk 256/512/1024/2048 → 296.3/296.9/295.6/
+  296.6 t/s (pp2048) — **평택(±0.5%)**. 청크 크기는 잔여 레버 아님.
+- **27B(q35 hip)**: 128/256/512/1024 → 332.4/333.5/331.1/319.7 (1회),
+  A/B 3 reps — 기본 1024: 331.98/326.33/328.48(평균 328.9), 512:
+  331.29/330.90/330.76(평균 331.0) — **+0.6%, 런간 편차(±1.7%)와
+  구분 불가**. 승격 근거 부족, 기본 1024 유지.
+- 결론: 플랜의 "청크 크기·슬롯 배치 최적화 이력 없음 → pp 격차
+  상당분 가능성" 가설은 **부정** — 남은 격차는 오버랩(W1.5-3/4)이나
+  커널 내부에 있음.
+- 환경 비고: 27B 모델 파일명이 UD-Q4(하이픈)로 복원돼 게이트 기본
+  경로(UD_Q4 언더스코어) 불일치 — 측정은 보정 경로로 수행.
+
+### (99) W1.5-3 가중치 업로드 오버랩 — 조사 완료·설계 확정 (plans/107, 2026-09-28)
+
+- **현황**: 무게는 `dev_weight` 포인터 키 캐시로 **1회 업로드 후 상주**
+  — 프리필 스테디 상태에서 업로드 대기는 없음(플랜 우려 해소).
+  오버랩 이득은 **모델 로드 시간에만** 존재(102GB 최대, 8MiB pread→
+  h2d 교대 — 디스크와 디바이스 복사가 직렬).
+- **측정 근거**: staged_upload는 h2d(동기 hipMemcpy 경로)와 pread를
+  청크마다 교대 수행 — 이론 상한 ~2× 로드 가속.
+- **구현 설계(차기 세션)**: 스테이지 2버퍼 + hipMemcpyAsync 스트림
+  (ctx에 이미 Async D2H 전례 — pageable 주의: 호스트 스테이지는
+  고정할당 or 이중 pinned). 검증: 로드 wall + 게이트 3종.
+
+### (100) W1.5-3 구현 — 로드 pread|h2d 이중버퍼 파이프라인 (plans/107, 2026-09-28)
+
+- staged_upload 이중 스테이지(2×8MiB) + 사이드 스트림 async H2D:
+  pread(청크 k)와 h2d(청크 k-1) 중첩. 반쪽 재사용은 그 반쪽 이벤트만
+  선별 대기(전체 스트림 sync가 직전 복사까지 기다려 중첩을 죄지
+  않도록). 종료 시 잔여 이벤트 동기·파기.
+- 측정(FN 17GB 콜드 로드+pp512, 3 reps): 이중버퍼 38.3/39.6/40.1s vs
+  구 순차 39.0/39.9/40.1s — **평균 −0.6s(±1.5%, 노이즈 경계)**.
+  pageable async H2D의 드라이버 스테이징이 중첩을 부분적으로 흡수하는
+  것으로 추정 — pinned 스테이지(차기)가 이득을 끌어낼 후보.
+- 정확성: 무게 비트 동일(charhash 15,674 PASS·게이트 2종 PASS) —
+  업로드 경로 변경은 데이터 이동 순서만 바꾼다.
+
+### (101) W1.5-3 완결 — 핀 스테이지로 이득 실현 (plans/107, 2026-09-28)
+
+- pinned_stage2(2×8MiB hipMallocHost)로 업로드 파이프라인 전환 —
+  pageable이던 async H2D가 드라이버 스테이징 없이 직행.
+- **측정(FN 17GB 콜드, 3 reps)**: 핀 36.3/37.5/37.7s(평균 37.2) vs
+  pageable 이중버퍼 38.3/39.6/40.1(39.3) vs 구 순차 39.0/39.9/40.1
+  (39.7) — **핀 −2.5s(−6.3%), 이중버퍼 효과 포함 누적**.
+- 폴백: 핀 할당 실패 시 pageable Vec 경로(0511cba 판) 보존.
+- 정확성: charhash 15,674 PASS·게이트 2종 PASS.
+
+### (102) W1.5-4 청크 간 파이프라인 — 경계 비용 계량·가설 정산 (plans/107, 2026-09-28)
+
+- **측정**(FN 2048토큰 프리필, 콜드 wall 2reps): 8청크(256) 43.0/43.8s
+  vs 1청크(2048) 37.4/36.6s — 청크 경계 7회 × **~0.85s/경계**.
+  이는 청크당 (a) end_batch_wait 후 (b) 다음 청크 기록(rec)까지
+  호스트 직렬 구간 — 이론상 stepT rec(≈청크 t 비례) + 대기.
+- **구조 판정**: 청크 N+1 기록·임베딩 업로드를 N 실행 중 선행하려면
+  커맨드 버퍼 이중화(W1.5-1)가 전제 — 현재 단일 cmdbuf2는 N이 끝나야
+  리셋 가능. 즉 **W1.5-4는 W1.5-1에 종속**. 대안(청크 무시·단일 배치)은
+  이미 기본(적응형 상한 2048)으로 최대화돼 있음 — 8청크 강제가 오히려
+  15% 느린 것과 일치.
+- 결론: 잔여 pp 격차의 경계 성분은 청크 수 최소화(현행 기본)로 이미
+  흡수. 이중버퍼화는 W1.5-1과 동일 구현에서 처리 — 본 항목은 측정·
+  종속 판정으로 종결.
+
+### (103) W1.5-1 커맨드 이중버퍼 — 구현 전제 계약 분석으로 종결 (plans/107, 2026-09-28)
+
+- **종속 확정**(원장 92·102와 연결): cmdbuf2 단일 버퍼는 배치 제출 중
+  리셋 불가 — 청크 N+1 기록 중첩(=W1.5-4)과 스텝 녹화 중첩(=W1.5-1)은
+  동일 이중화 구현에 귀결.
+- **계약 장벽**: end_batch_wait의 "반환 시 GPU 유휴" 계약이 전 호출부
+  (45곳)의 매핑 판독(direct ptr deref 다수)을 지탱 — 제출 즉시 반환으로
+  바꾸려면 판독 경로 전수에 펜스 대기 삽입이 선행돼야 함(W4 규모
+  감사). 이중화 자체는 30줄이지만 안전 전제가 이 감사.
+- **판정**: 구현은 보류하지 않고 **전제 작업으로 명시 종결** — 차기
+  세션이 (a) 매핑 판독 경로 전수 조사 → (b) frame_read/판독 헬퍼에
+  펜스 대기 통합 → (c) 이중화 순서로 진행. [stepT](fa2a9e5)가 회수
+  규모 측정기로 준비돼 있음(rec≈2ms/step).
+
+### (104) 회귀 수리 — flag::ne0 부재키 결함 + RESF16 승격 철회 (plans/107, 2026-09-28)
+
+- **발견 계기**: 종결 조건 감사 중 FN vulkan 토큰 게이트 FAIL — main
+  PASS·브랜치 FAIL. 고정 판정 스크립트 bisect → 7704d5a(env 캐시화)
+  → 스냅샷↔라이브 비교 계측으로 2단 범인 분리.
+- **결함 1(ne0)**: `is_some_and`는 키 부재 시 false — 계약
+  `unwrap_or(true)`(기본 ON) 위반. VK_FRAME·EMBQ8·DEPBAR·CM 등 기본
+  ON 게이트 전부가 스냅샷 경로에서 꺼짐. `is_none_or`로 수리.
+- **결함 2(RESF16)**: 승격 검증(원장 88)이 hip만 — FN **vulkan** f16
+  변형 슬롯에서 토큰 발산. 게이트를 깨는 정밀도 변경은 기본 불가
+  규칙에 따라 6개 발화점 전부 옵트인 환원. hip pp512 이득(+12.5%)은
+  백엔드 인지 Config 재승격 과제로 이관(원장 88 참조).
+- **교훈(원장 갱신)**: 캐시형 env 전환은 스냅샷↔라이브 동치 어서션을
+  preflight에 추가해야 계약 결함이 게이트 전에 잡힌다 — W10
+  charhash가 hip만 커버하는 간극도 동일(4게이트 확대로 보완).
+- 검증: FN vulkan·FN hip·27B hip·charhash 4게이트 PASS.
+
+### (105) RESF16 백엔드 인지 재승격 — hip ON·vk OFF (plans/107, 2026-09-28)
+
+- **원장 88의 +12.5% 재검증**: 웜키횭 A/B 3reps — ON 243.0 vs OFF
+  233.0 t/s (**+4.3%**, 군 완전 분리). 원 측정의 차이 크기는 콜드
+  컨파운드였으나 이득 자체는 실재(코어 CPU 브리지 업로드 절반).
+- **구조**: res_f16_on() 단일 스위치 — 명시 env 최우선, 없으면
+  set_backend_res_f16()로 엔진 기동 시 지정(build_slots: hip=true,
+  vk=false). vkacc 5개 발화점도 core 스위치로 통합(이중 판독 제거).
+- 검증: 4게이트 PASS(FN vk·FN hip·27B hip·charhash) + hip pp512
+  241.6 t/s 회복 확인.
+
+### (106) W1.5-1 전제 감사 — 매핑 판독 경로 전수 목록 (plans/107, 2026-09-28)
+
+vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-as
+계열): **프로덕션 21곳 / 진단 27곳** — 이중화 시 펜스 대기 필요 대상:
+
+| 계층 | 사이트 | 동기 전제 |
+|---|---|---|
+| frame_read(vkacc) | matmul.rs:228 — frame_sync()가 배치면 end_batch_wait 후 판독 | **이미 헬퍼 경유** — 펜스 대기 삽입점 단일 |
+| decoder step | b_lg(572·1281)·b_am(615)·np_slot/pos/gdn_tbl(1345-49) | step/step_batch의 end_batch_wait 후 |
+| decoder spec | b_amr(355)·b_xs(364) — verify_rows 내 end_batch_wait 후 | 〃 |
+| decoder mod | m_cur(477) — mtp_step_g 배치 종료 후 | 〃 |
+| vkacc moe 그룹화 | frame.rs:723-756·1029 — ids/perm/rows_pad 판독 | 프레임 배치 종료 후(host grouping) |
+| vkacc qsa/dispatch | qsa.rs:239·dispatch.rs:52·125 | frame_read와 동일 계약 |
+
+- **핵심 소득**: 판독이 frame_read 헬퍼나 각 배치 종료 직후로 수렴 —
+  "즉시 반환" 이중화 시 펜스 대기 삽입은 frame_sync + 각 end_batch_wait
+  반환점(스텝 경계 ~12곳)에 국소화 가능. 45 호출부 전수 수정 불필요.
+- 차기 구현 순서 확정: (a) frame_sync에 "직전 제출 펜스" 대기 통합
+  (이중화 모드에서만), (b) end_batch_wait 즉시 반환 + 교대 cmdbuf3,
+  (c) stepT로 회수 측정(rec≈2ms/step).
+
+### (107) W1.5-4 잔여 — 프리필 중간 청크 head 스킵 (plans/107, 2026-09-28)
+
+- 감사(원장 106)에서 발견: 프리필 루프가 **매 청크**마다 head GEMM
+  (152k GEMV) + 로짓 608KB d2h를 수행하면서 마지막 청크 logits만
+  사용 — NoReadback 모드가 존재했으나 소비자 0(사장 자산).
+- 수리: 중간 청크 NoReadback + 조기 반환(head GEMM 자체 스킵),
+  최종 청크만 Full. hin_last는 CopyRows로 이미 복사돼 소비 계약
+  불변(스킵은 버려질 계산뿐).
+- pp512(2048 청킹=1청크라 효과 미미, 단일 청크 케이스): 236.5/238.9
+  — RESF16 ON 대역 유지. 효과는 다중 청크(256 강제)에서 발현:
+  청크당 head ≈15ms×중간 n개 절감.
+- 검증: 4게이트 PASS·charhash 일치.
+
+### (108) W1.5-1 완결 — cmdbuf3 이중버퍼·디코드 +3.1% (plans/107, 2026-09-28)
+
+- **구현**(LLM170_VK_DBUF=1 옵트인): end_batch_wait이 DBUF 모드에서
+  직전 보류 대기(fence_b 재사용 전제) → 제출 → **즉시 반환** →
+  cmdbuf2↔cmdbuf3 교대. 호스트는 GPU 실행 중 다음 배치 기록.
+  wait_pending()이 판독/세트해제/재제출 전 완료 보장 — frame_sync
+  (vkacc 전 판독 수렴점)·copy_dev에 배선(원장 106 감사 실행).
+- **측정**(FN vulkan): tg128 디코드 DBUF 17.20/17.30 vs 기본
+  16.61/16.85 t/s — **+3.1%**(군 분리, 기록 중첩 효과). pp512는
+  단일 청크라 중첩 없음(±0.2% 평택 — 예상과 일치).
+- **검증**: DBUF 게이트 PASS + 기본 4게이트 PASS(비활성 시 무영향).
+- 세트 해제는 wait_pending으로 이동(실행 중 참조 방지). stepT는
+  wait=0.00(dbuf)으로 회수 가시화.
+
+  - **프로브 5(종결 판별자, race_qidle 키)**: end_batch_wait의 펜스
+    대기를 vkQueueWaitIdle(가장 강력한 호스트 동기)로 교체해도
+    **4/4 발산** — 펜스 시그널링·제출 순서·호스트 계층 전부 무죄.
+    결론 확정: **단일 커맨드 버퍼 내 인접 디스패치 실행**이 배리어에도
+    불구 비결정(별도 제출은 암묵 직렬화로 결정론). 원장 92의
+    "드라이버/스케줄러 계층" 추정이 판별자로 종결. 코드 수준 조사
+    완전 소진 — RRA 덤프·validation layer(미설치)·RADV 버그리포트가
+    남은 경로. race_qidle·race_nocache·VK_SPLIT(_AT) 프로브 상재.
+
+  - **DBUF 다중 청크 보측**: 8청크(TMAX=256) pp2048 DBUF 364.2 vs
+    363.8 t/s(평택) — 프리필 청크 기록이 head 스킵(원장 107)으로
+    이미 가벼워 중첩 이득 미미. DBUF 효과는 디코드(+3.1%) 확정 —
+    옵트인 유지, 기본 승격은 27B vk 해소 후 재판정.
+
+### (109) 종결 감사 — 성능 비회귀 판정·플랜 107 종결 (2026-09-29)
+
+- **종결 조건 pp512 대조**(동일 세션 측정): main 437.0 vs
+  refactor-107 432.3 t/s(FN vulkan, 2+4 reps) — **−1.1%**. 원인은
+  HCF16 out16 폐지(원장 86: 토큰 게이트 깨는 값 결함 — 정당한 교환)
+  및 세션 드리프트(문서화된 ±3-5%) 범위. 절대 기준 465.8은
+  2026-09-22 프로토콜로 현 세션 main도 437 — 상대 비회귀 기준 충족.
+- **RESF16 vk prefill 여분**: =1 강제 시 447.7(+3.6%)이나 토큰 발산
+  — 백엔드 분리(원장 105)가 정확. 트레이드오프 문서화.
+- **플랜 107 종결 선언**: P0 9건·W1-W8·W10-W12 전 항목 실행 또는
+  측정 종결. 잔여는 전부 외부(레이스 장비·glslc) 또는 명시 보류.
+  게이트 4종+DBUF 5종 PASS·charhash 15,674·preflight 5/5.
+
+### (110) scripts/ 1회 실험 스크립트 아카이브 (plans/107 W7-계보, 2026-09-29)
+
+- **보류 7종 → archive/**: make_tiny4(소형 모델 생성·모델 복귀로 무의미)
+  ·collect_q4/compare 대상 수집(q4 비공존 종결)·ab_bench(A/B 중앙값
+  — 벤치 자체 reps로 대체 가능하나 참조 0으로 보류)·check_hip_syntax
+  (경고 허용 시점 유용성 재평가)·np_decompose(np 절편 분해·종결)
+  ·patch_llamaspec(본인 주석에 "폐기")·postrun-verify(재부팅 1회성).
+- **유지 판정**: verify.py(서버 표면·postrun이 참조)·verify_serve/
+  verify_vl/verify_tok(README 골 매트릭스 문서)·verify_np_self
+  (np 자기일관성 — np 경로 변경 시 필수)·stress-flake(레이스 재현
+  자산)·logit-diff(품질 게이트)·bench_np(np4 측정)·scorecard.
+- 기준: 참조 0 + 실험 종결 + 재사용 가능성 없음. archive는 삭제 아님.
+
+### (111) W2 잔여 12종 env 게이트 삭제 — −1,342줄 (2026-09-29)
+
+- 감사(서브에이전트 253종 전수 분류) → 원장 근거 삭제 후보 12종 실행:
+  VK_KV8(36)·F32Q8(65)·VK_Q8D·VK_Q8MMQ(41)·VK_Q8K_MAX·VK_Q8K(54/55)·
+  Q8W_ALL(83 D2 −4.4%)·Q4_MMQ(64/75)·Q8MMQ(41)·RMSSMALL(plans/73
+  부정)·GRAPH(2026-09-20 무이득)·VK_RESF16 env 오버라이드(백엔드
+  기본 단일화).
+- 동반 삭제: 슬롯 3종(FnTileQ8d·FnTileQ8mmq·TileQ8ks) + spv 5종.
+  그래프 캡처 기계는 no-op 마커로 축소(capture_mark 호출부 14곳
+  유지를 위한 최소 보존).
+- 유지 판정: TileQ8128Ks/FnKsred(현역 K-분할)·q8_0_relayout(q8r
+  재사용)·gemm_mmq(디코드 경로 현역) — 감사 kept_and_why 참조.
+- 검증: charhash 15,674 일치·게이트 3종 PASS(FN vk 포함)·경고 0.
+- env 잔여: 진단(~60)·노브(36)·기본ON(64)·구성(8)·무판정(~140 —
+  백엔드 분해와 병행 예정, 원장 89 프로토콜 유지).
+
+### (112) L1B.ple_gate 간헐 해시 발산 — 미기입 PLE 스크래치 0 초기화 (2026-09-29)
+
+- 증상: charhash hip 반복 실행 시 ~2/10 확률로 `[npbh] L1B.ple_gate
+  len=64`·`len=4` 두 줄만 불일치(값은 매회 상이). 하류 전 버퍼 일치.
+- 진단: 골든 해시 == FNV(0×len) 산출 확인 → 해당 영역은 첫 PLE 층 실행
+  전 미기입 스크래치. 신규 페이지=0(골든 일치), 재활용 페이지=할당 잔재
+  (불일치). c363e30 이전엔 리소스 가드가 반복 실행을 먼저 차단해 가려짐.
+- 수정: Frame4::new에서 ple_key/value/gated/conv_out/gate 5종
+  frame_write(0) 확정(1회성, ~3MB). 골든 무변경(0 해시와 항상 일치).
+- 검증: charhash 4연속 PASS + 3게이트 PASS. 진단 아티팩트 수정이며
+  산술 경로 무변경(하류 해시 전부 동일 was 증거).
+
+### (113) W11 Result<_,String> 잔여 102곳 — 종결 판정 (2026-09-29)
+
+- 핫스팟 전환(526→102)은 완료. 잔여 분포: traits.rs 58(백엔드
+  트레이트 경계)·decode 34·qsa 23·raw 21·gemv/gemm 19-20 등.
+- 판정: 전 소비자가 동일 폴백+로그로 귀결(오류 종별 판별 소비자 부재).
+  종별 enum 도입은 판별 정책(예: OOM만 재시도)이 생길 때 유효 —
+  그 전엔 투기적 추상화. 폴백 가시화는 fb 카운터(원장 112 직전
+  커밋)가 담당. W11 종결.
+
+### (114) vk 스테이지 해시 골든 불가 판정 — FN vk 버퍼 비결정 (108 P3, 2026-09-29)
+
+- 목적: charhash vk 변형으로 4게이트 상시화(원장 104 교훈 — vk 회귀
+  누적). 실측: 동일 바이너리 2회 캡처가 L1C.attn_xn/lo/inj/gate/mix
+  5버퍼에서 상이(라인 11131·13891 — 이전 이후 라인 전부 일치 → 하류
+  미소비 영역, 토큰 불변). LLM170_VK_DBUF=1(제출 직렬화)도 무관 —
+  원장 92 단일 cmdbuf 내 디스패치 비결정과 동일 계급, 스코프는
+  FN vk 어텐션 경로 커널(atomic 축약 후보).
+- frame_sync/frame_read의 wait_pending 동기는 코드 확인 완료(무죄).
+- 판정: vk 커버는 토큰 게이트(gate-flash-next RUNTIME=vulkan, 전 실행
+  안정)로 유지. vk 커널 결정성 감사(atomic→고정순서 축약)는 별도
+  후보로 등록 — 결정화되면 vk 골든 캡처 재개.
+
+### (115) spec2 자연어 수용률 실측 — 수용 ≈0, 스펙 경로 마이너스 판정 (108 P4, 2026-09-29)
+
+- 프로토콜: 27B UD-Q4_K_XL hip, LLM170_BENCH_TEXT 자연어(영문
+  역사 서술), pp256 tg64 reps3 중앙값(P2).
+- 결과: 무스펙 tg 11.64 t/s vs spec2 8.08 t/s(**−31%**). 수용률
+  **0.97 tok/fwd**(k=2 — 수용 p라면 1+p; p≈0). 난수 프롬프트 탓이라는
+  종전 가설 기각: 자연어에서도 수용 0.
+- 판정: 훈련된 MTP 헤드의 k=1 수용은 통상 50%+ — p≈0은 드래프트
+  프레이밍 또는 verify 비교 결함 의심 수준. 스펙 검증 경로 감사를
+  후보 등록(발견 시에만 승격 검토). --spec 옵트인 유지(기본 무스펙).
+- FN(qwen4exp)의 네이티브 MTP는 serve 경로 — bench --spec 미적용,
+  별도 표면.
+
+### (116) 슬롯 스케줄러 1차 계측 — 손실은 대기 아니라 배치 스텝 자체 (108 P5, 2026-09-29)
+
+- 계측: SCHED 원자(작업·큐 대기·접두 재사용·디코드 스텝/시간·프리필
+  청크/시간) + [srv] 주기 라인 병합 + 종료 요약. SlotJob.queued 타임
+  스탬프(http 진입→배정).
+- 실측(FN hip, 슬롯4, 동시 4요청 60토큰): 큐 대기 ≈ 0(첫 배치 21초는
+  모델 로드 포함 아티팩트 — 포트가 로드 완료 전 개방). 접두 재사용 0
+  (이격 프롬프트). **디코드 4배치 스텝 139ms(=28.8 t/s agg) vs 단일
+  192ms** — 배칭 증분 4토큰/47ms. llama 49 t/s 도달엔 ~82ms/스텝 필요.
+- 판정: np4 28.6 vs llama 49 격차는 스케줄러 대기·선점이 아니라
+  **t=4 배치 디코드 커널 효율**에 국소화(원장 108 dmmv 계보와 동일
+  지점). 프리필 청크 고정비 432ms(단문도) — 청크 과다 대비 잔여
+  예산 최적화 여지. 정책(선점·LRU) 설계 근거 없음 — 계측 유지,
+  커널 효율(P7 dmmv)이 선행.
+
+### (117) vkacc 핀 스테이지 전파 — 불필요 판정, 구조적 근거 (108 P6, 2026-09-29)
+
+- 대조: hip(87a4739·원장 101)는 read→pageable 스테이지→드라이버 스테이징
+  흡수→H2D의 2차 복사를 핀+이중버퍼로 중첩해 −6.3%.
+- vk 가중 업로드(weight_bufs)는 **단일 패스 직행**: pread_fill이 상주
+  버퍼의 WC 매핑에 직접 기록(mem_ty=HOST_VISIBLE|COHERENT GTT —
+  APU 통합메모리, 코드 확인). 드라이버 스테이징·2차 복사 부재 →
+  중첩할 두 번째 위상이 없다. 스테이징 파이프라인을 추가하면
+  max(SSD, memcpy) ≥ 현행 단일 패스 — 이득 없음.
+- 실측 참고: FN 콜드 로드+1스텝 vk 24.7s vs hip 33.2s(vk가 이미 빠름).
+- 판정: 전파 불필요(구조 동일이 아니라 목표 상태가 이미 구현됨).
+  잔여 최적화 후보는 SSD 읽기 자체(io_uring 비동기 — 별도 판정).
+
+### (118) hip dmmv 포팅(승인 산술 변경) — 밀도 q8_0 + MoE q4k/q5_1, +9.8% (108 P7, 2026-09-29)
+
+- 커널 3종 포팅(hipRTC·NAMES 등록): gemm_q8_0_dmmv(vk gemv8_q8b —
+  f32 활성×커널내 q8_0 디양자 dot)·q4_gemm_q4k_dmmv_ids(fn_moe_ids2 —
+  ids 직접 인덱싱 단일 런치)·q5_1_gemm_dmmv_ids. 프레임 mm 그룹 t=1
+  q8_0 전용 경로 + frame_moe_gemm Q4K/Q5_1 경로가 quant/카운팅정렬/
+  reduce를 건너뛴다. 킬스위치 LLM170_HIP_DMMV_OFF=1.
+- 정합: hip-dmmv-check f64 대조 old 1.26e-2 → dmmv 3.3e-7, MoE old
+  2.97e-3 → 1.7e-7 (활성 양자화 제거로 원소 정확도 4-5자릿수 향상).
+- 성능: FN hip 디코드 5.73→6.29 t/s(+9.8%, reps3 중앙값). **18 t/s
+  목표 미달** — ktrace 벽분해: 스텝당 ~1200 런치×호스트 오버헤드가
+  지배(GPU 실동 ~18ms/스텝). 값경로 재검증 2.71 t/s(18 이력 비재현 —
+  경로 이행 중 회귀 의심, 별도 조사 후보). 잔여 레버: 프레임
+  elementwise 융합(rms/silu/hc 계열 ~500런치) 또는 그래프 캡처
+  재조사(2026-09-20 무이득 측정의 프레임 경로 한정 재검).
+- 게이트: 골든 재캡처(승인 변경)·FN hip 기준선 갱신(17374 66 16 23
+  … — 그리디 근접동률 클래스 정상)·27B·FN vk 무영향 PASS·preflight 6/6.

@@ -1,7 +1,6 @@
 //! q4acc 검증 — GPU↔CPU 미러 체크 서브커맨드 (plans/78 R1).
 
 use super::*;
-use crate::rawhip::env_on;
 
 /// q5_1 커널 마이크로 검증 — 합성 블록 1개(d=1.0, m=-0.5, q=i%32)로
 /// GPU ↔ CPU 레인 미러를 원소 수준에서 대조한다 (`q4-acc-check micro`).
@@ -27,7 +26,12 @@ pub fn micro_check() -> Result<String, String> {
         bytes[8 + j] = lo | (hi << 4);
     }
     let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.15).collect();
-    let w = llm170_core::matmul::Weight { data: &bytes, ty: GgmlType::Q5_1, n_in: n as u64, n_out: 1 };
+    let w = llm170_core::matmul::Weight {
+        data: &bytes,
+        ty: GgmlType::Q5_1,
+        n_in: n as u64,
+        n_out: 1,
+    };
     let acc = Q4Acc::new()?;
     let mut gpu = vec![vec![0.0f32; 1]];
     acc.matmul_batch(std::slice::from_ref(&x), &w, &mut gpu)?;
@@ -39,7 +43,7 @@ pub fn micro_check() -> Result<String, String> {
     ))
 }
 
-/// `q4-ar-check` — 프레임 AR 커널(q4_gdn_ar_w) ↔ core `gdn_ar_batch` 대조.
+/// `q4-ar-check` — 프레임 AR 커널(gdn_ar_w_swap) ↔ core `gdn_ar_batch` 대조.
 /// 합성 입력(결정적 LCG)으로 수치 계약을 직접 확인한다.
 #[allow(clippy::many_single_char_names)]
 pub fn ar_check() -> Result<String, String> {
@@ -55,7 +59,9 @@ pub fn ple_gate_check() -> Result<String, String> {
     let hc_dim = hc * n_embd;
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let res: Vec<f32> = (0..hc_dim).map(|_| lcg()).collect();
@@ -79,18 +85,29 @@ pub fn ple_gate_check() -> Result<String, String> {
     ctx.h2d(nqd, bytemuck::cast_slice(&nq))?;
     ctx.h2d(ncd, bytemuck::cast_slice(&nc))?;
     let (mut rp, mut kp, mut vp, mut nk_, mut nq_, mut nc_, mut gp_, mut gop_) = (
-        rd as *mut c_void, kd as *mut c_void, vd as *mut c_void,
-        nkd as *mut c_void, nqd as *mut c_void, ncd as *mut c_void,
-        gd as *mut c_void, god as *mut c_void,
+        rd as *mut c_void,
+        kd as *mut c_void,
+        vd as *mut c_void,
+        nkd as *mut c_void,
+        nqd as *mut c_void,
+        ncd as *mut c_void,
+        gd as *mut c_void,
+        god as *mut c_void,
     );
     let (mut e, mut ne, mut hcc, mut tt) = (1e-6f32, n_embd as i32, hc as i32, 1i32);
     let mut args: Vec<*mut c_void> = vec![
-        &mut rp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
-        &mut vp as *mut _ as *mut c_void, &mut nk_ as *mut _ as *mut c_void,
-        &mut nq_ as *mut _ as *mut c_void, &mut nc_ as *mut _ as *mut c_void,
-        &mut gp_ as *mut _ as *mut c_void, &mut gop_ as *mut _ as *mut c_void,
-        &mut e as *mut _ as *mut c_void, &mut ne as *mut _ as *mut c_void,
-        &mut hcc as *mut _ as *mut c_void, &mut tt as *mut _ as *mut c_void,
+        &mut rp as *mut _ as *mut c_void,
+        &mut kp as *mut _ as *mut c_void,
+        &mut vp as *mut _ as *mut c_void,
+        &mut nk_ as *mut _ as *mut c_void,
+        &mut nq_ as *mut _ as *mut c_void,
+        &mut nc_ as *mut _ as *mut c_void,
+        &mut gp_ as *mut _ as *mut c_void,
+        &mut gop_ as *mut _ as *mut c_void,
+        &mut e as *mut _ as *mut c_void,
+        &mut ne as *mut _ as *mut c_void,
+        &mut hcc as *mut _ as *mut c_void,
+        &mut tt as *mut _ as *mut c_void,
     ];
     ctx.launch3("q4_ple_gate", hc.div_ceil(8) as u32, 1, 1, 256, &mut args)?;
     ctx.sync()?;
@@ -102,10 +119,20 @@ pub fn ple_gate_check() -> Result<String, String> {
     let eps = 1e-6f32;
     let mut out = String::new();
     for s in 0..hc {
-        let kn = llm170_core::ops::rms_norm(&key[s * n_embd..(s + 1) * n_embd], &nk[s * n_embd..(s + 1) * n_embd], eps);
-        let qn = llm170_core::ops::rms_norm(&res[s * n_embd..(s + 1) * n_embd], &nq[s * n_embd..(s + 1) * n_embd], eps);
+        let kn = llm170_core::ops::rms_norm(
+            &key[s * n_embd..(s + 1) * n_embd],
+            &nk[s * n_embd..(s + 1) * n_embd],
+            eps,
+        );
+        let qn = llm170_core::ops::rms_norm(
+            &res[s * n_embd..(s + 1) * n_embd],
+            &nq[s * n_embd..(s + 1) * n_embd],
+            eps,
+        );
         let mut dot = 0.0f32;
-        for i in 0..n_embd { dot += kn[i] * qn[i]; }
+        for i in 0..n_embd {
+            dot += kn[i] * qn[i];
+        }
         dot /= (n_embd as f32).sqrt();
         let mag = dot.abs().max(1e-6).sqrt();
         let g = llm170_core::ops::sigmoid(if dot >= 0.0 { mag } else { -mag });
@@ -114,10 +141,18 @@ pub fn ple_gate_check() -> Result<String, String> {
             let sum = llm170_core::ops::sq_sum(&gated);
             1.0 / ((sum / n_embd as f64 + eps as f64).sqrt() as f32)
         };
-        for i in 0..n_embd { gated[i] = gated[i] * sg * nc[s * n_embd + i]; }
-        let gmax = gated.iter().zip(dgated[s * n_embd..(s + 1) * n_embd].iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        out += &format!("s{s}: gate dev={:.6} host={:.6} (dot={:.4}) gated max|d-h|={gmax:.2e}\n", dgate[s], g, dot);
+        for i in 0..n_embd {
+            gated[i] = gated[i] * sg * nc[s * n_embd + i];
+        }
+        let gmax = gated
+            .iter()
+            .zip(dgated[s * n_embd..(s + 1) * n_embd].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        out += &format!(
+            "s{s}: gate dev={:.6} host={:.6} (dot={:.4}) gated max|d-h|={gmax:.2e}\n",
+            dgate[s], g, dot
+        );
     }
     Ok(out)
 }
@@ -127,7 +162,9 @@ pub fn ar_check_t(t: usize) -> Result<String, String> {
     let (n_group, dt_rank, d) = (16usize, 48usize, 128usize);
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let k_len = n_group * d;
@@ -147,7 +184,16 @@ pub fn ar_check_t(t: usize) -> Result<String, String> {
     let mut st_cpu = st0.clone();
     let mut o_cpu = vec![0.0f32; v_len * t];
     llm170_core::gdn::gdn_ar_batch(
-        &q, &k, &v, &beta_sig, &g, &mut st_cpu, &mut o_cpu, t, n_group, dt_rank,
+        &q,
+        &k,
+        &v,
+        &beta_sig,
+        &g,
+        &mut st_cpu,
+        &mut o_cpu,
+        t,
+        n_group,
+        dt_rank,
     );
 
     // GPU 프레임 (q는 1/√d 선스케일, bg는 인터리브 [σ(b), e^g])
@@ -199,7 +245,9 @@ pub fn qsa_check(t: usize, n_past: usize) -> Result<String, String> {
     let (n_head, n_kv, hd) = (24usize, 2usize, 256usize);
     let mut seed = 0x9e37_79b9u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     // 인과 + 블록 스파스 마스크: 위치 p는 (tok, p)가 허용될 때만 1.
@@ -339,7 +387,9 @@ pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
     use llm170_core::matmul::{FrameHost, FrameOp, FrameState};
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let acc = Q4Acc::new()?;
@@ -360,8 +410,21 @@ pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
     acc.frame_write(hout, &out)?;
     acc.frame_write(hinj, &inj)?;
     acc.frame_begin(t);
-    acc.frame_op(&FrameOp::HcGateMean { xn: hxn, gate: hgate, out: hmix, hc, n, h16: false })?;
-    acc.frame_op(&FrameOp::HcCombine { res: hres, out: hout, inj: hinj, hc, n, total: hc * n * t })?;
+    acc.frame_op(&FrameOp::HcGateMean {
+        xn: hxn,
+        gate: hgate,
+        out: hmix,
+        hc,
+        n,
+    })?;
+    acc.frame_op(&FrameOp::HcCombine {
+        res: hres,
+        out: hout,
+        inj: hinj,
+        hc,
+        n,
+        total: hc * n * t,
+    })?;
     let mut mix_gpu = vec![0.0f32; t * n];
     acc.frame_read(hmix, &mut mix_gpu)?;
     let mut res_gpu = vec![0.0f32; t * hc * n];
@@ -383,7 +446,8 @@ pub fn hc_check(t: usize, n: usize, hc: usize) -> Result<String, String> {
     for ti in 0..t {
         for i in 0..n {
             for s in 0..hc {
-                res_cpu[ti * hc * n + s * n + i] += out[ti * n + i] * 2.0 * sig(inj[ti * hc + s] / hc as f32);
+                res_cpu[ti * hc * n + s * n + i] +=
+                    out[ti * n + i] * 2.0 * sig(inj[ti * hc + s] / hc as f32);
             }
         }
     }
@@ -410,9 +474,7 @@ pub fn check_tensor(
 ) -> Result<String, String> {
     use llm170_core::matmul::MatmulHost;
     let m = llm170_core::qwen4exp::Model4::load(model).map_err(|e| e.to_string())?;
-    let w = m
-        .w(tensor)
-        .ok_or_else(|| format!("텐서 없음: {tensor}"))?;
+    let w = m.w(tensor).ok_or_else(|| format!("텐서 없음: {tensor}"))?;
     let n_in = w.n_in as usize;
     let (blck, bsize) = w.ty.block_info();
     let row_bytes = (n_in / blck as usize) * bsize as usize;
@@ -426,7 +488,9 @@ pub fn check_tensor(
     // 결정적 입력 (LCG, ±0.5)
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
@@ -483,7 +547,7 @@ pub fn check_tensor(
             n += 1;
         }
     }
-    if env_on("LLM170_Q4ACC_ROWDBG") {
+    if llm170_diag::dump::opts().key("q4acc_rowdbg") {
         for &ri in &[0usize, 1, 2, 127, 128, 129, 130, 199, 200, 201, 255] {
             if ri >= gpu.len() {
                 continue;
@@ -496,7 +560,7 @@ pub fn check_tensor(
             eprintln!("# row {ri}: maxerr={m:.5}");
         }
     }
-    if env_on("LLM170_Q4ACC_DBG") {
+    if llm170_diag::dump::opts().key("q4acc_dbg") {
         eprintln!("# gpu[0][..8] = {:?}", &gpu[0][..8]);
         eprintln!("# cpu[0][..8] = {:?}", &cpu[0][..8]);
     }
@@ -529,12 +593,16 @@ pub fn moe_row_check(
     let n_out = (w.n_out as usize) / ne;
     let (rows_a, rows_b) = (t_a * k_sel, t_b * k_sel);
     if rows_a == 0 || rows_b < rows_a {
-        return Err(format!("moe-row-check: t_b·k_sel({rows_b}) >= t_a·k_sel({rows_a}) 필요"));
+        return Err(format!(
+            "moe-row-check: t_b·k_sel({rows_b}) >= t_a·k_sel({rows_a}) 필요"
+        ));
     }
     // 결정적 입력 (LCG, ±0.5) — ids는 [0, ne) 균등.
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let x: Vec<f32> = (0..rows_b * n_in).map(|_| lcg()).collect();
@@ -548,7 +616,12 @@ pub fn moe_row_check(
     let hob = acc.frame_alloc(rows_b * n_out)?;
     acc.frame_write(hx, &x)?;
     acc.frame_write_u32(hids, &ids)?;
-    let ws = llm170_core::matmul::Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out };
+    let ws = llm170_core::matmul::Weight {
+        data: w.data,
+        ty: w.ty,
+        n_in: w.n_in,
+        n_out: w.n_out,
+    };
     acc.frame_begin(t_a);
     acc.frame_moe_gemm(hx, &ws, hids, hoa, ne, k_sel)?;
     acc.frame_begin(t_b);
@@ -576,7 +649,9 @@ pub fn moe_row_check(
         w.ty
     );
     if let Some((r, c, a, b)) = first {
-        s.push_str(&format!(" max_abs={max_abs:.3e} FIRST-DIFF row={r} col={c} a={a:.6e} b={b:.6e}"));
+        s.push_str(&format!(
+            " max_abs={max_abs:.3e} FIRST-DIFF row={r} col={c} a={a:.6e} b={b:.6e}"
+        ));
     } else {
         s.push_str(" — 완전 비트 동일");
     }
@@ -602,7 +677,9 @@ pub fn mm_row_check(
     }
     let mut seed = 0x0D1B_54A3_2D19_2ED5u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 0.5
     };
     let x: Vec<f32> = (0..t_b * n_in).map(|_| lcg()).collect();
@@ -611,7 +688,12 @@ pub fn mm_row_check(
     let hoa = acc.frame_alloc(t_a * n_out)?;
     let hob = acc.frame_alloc(t_b * n_out)?;
     acc.frame_write(hx, &x)?;
-    let ws = llm170_core::matmul::Weight { data: w.data, ty: w.ty, n_in: w.n_in, n_out: w.n_out };
+    let ws = llm170_core::matmul::Weight {
+        data: w.data,
+        ty: w.ty,
+        n_in: w.n_in,
+        n_out: w.n_out,
+    };
     acc.frame_begin(t_a);
     acc.frame_mm(hx, &ws, hoa, t_a)?;
     acc.frame_begin(t_b);

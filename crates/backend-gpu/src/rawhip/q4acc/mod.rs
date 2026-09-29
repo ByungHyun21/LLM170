@@ -16,7 +16,7 @@
 use cubecl_hip_sys as hip;
 use llm170_gguf::GgmlType;
 
-use super::{ck, RawCtx};
+use super::{RawCtx, ck};
 use crate::rawhip::env_on;
 
 /// 용도별 성장형 디바이스 버퍼 (해제 없음 — ADR-0014).
@@ -28,7 +28,11 @@ struct GBuf {
 
 impl GBuf {
     const fn new(name: &'static str) -> Self {
-        GBuf { name, bytes: 0, ptr: std::ptr::null_mut() }
+        GBuf {
+            name,
+            bytes: 0,
+            ptr: std::ptr::null_mut(),
+        }
     }
 
     fn ensure(&mut self, ctx: &RawCtx, bytes: usize) -> Result<*mut u8, String> {
@@ -51,7 +55,7 @@ struct MoeGroup {
     rows: usize,
     perm_d: u64,
     inv_d: u64,
-    rowexp_d: u64,   // 행→전문가 (순열 후 순서) — 그룹 GEMM용
+    rowexp_d: u64, // 행→전문가 (순열 후 순서) — 그룹 GEMM용
     perm_pad_d: u64,
     inv_pad_d: u64,
     tilexp_d: u64,
@@ -64,7 +68,6 @@ struct MoeGroup {
     pinned_off: *mut u8,
     off: Vec<usize>,
 }
-
 
 /// per-op 시간 누적 (LLM170_Q4ACC_TIME=1) — (업로드, 양자화, 런치, d2h, 호출수)
 #[derive(Default)]
@@ -181,13 +184,31 @@ fn ggml_id(ty: GgmlType) -> u32 {
 }
 
 impl Q4Acc {
-
     pub fn new() -> Result<Self, String> {
         Self::new_with_sources(Vec::new())
     }
 
+    /// 스테이지 이벤트 랩(107 W1.5-3) — 생성/대기/파기.
+    ///
+    /// # Safety
+    /// 반환 핸들은 ev_wait/ev_free로만 소비(전부 이 모듈 경유).
+    fn ev_new() -> Result<hip::hipEvent_t, String> {
+        crate::rawhip::RawCtx::ev_create()
+    }
+
+    fn ev_wait(ev: hip::hipEvent_t) -> Result<(), String> {
+        // SAFETY: 핸들은 ev_new 산출분.
+        unsafe { crate::rawhip::RawCtx::ev_sync(ev) }
+    }
+
+    fn ev_free(ev: hip::hipEvent_t) -> Result<(), String> {
+        // SAFETY: 핸들은 ev_new 산출분, 1회 파기.
+        unsafe { crate::rawhip::RawCtx::ev_destroy(ev) }
+    }
     /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
-    pub fn new_with_sources(parts: Vec<(usize, usize, std::path::PathBuf)>) -> Result<Self, String> {
+    pub fn new_with_sources(
+        parts: Vec<(usize, usize, std::path::PathBuf)>,
+    ) -> Result<Self, String> {
         let ctx = RawCtx::new()?;
         // plans/84 E1: q4acc는 Flash-Next(qwen4exp) 전용 — 디스패처 스코프 지정.
         ctx.set_scope(crate::rawhip::SCOPE_FLASHNEXT);
@@ -201,7 +222,10 @@ impl Q4Acc {
         for (base, len, path) in parts {
             match std::fs::File::open(&path) {
                 Ok(file) => sources.push(crate::common::parts::PartSource { base, len, file }),
-                Err(e) => eprintln!("# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})", path.display()),
+                Err(e) => eprintln!(
+                    "# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})",
+                    path.display()
+                ),
             }
         }
         Ok(Q4Acc {
@@ -280,7 +304,9 @@ impl Q4Acc {
                     t.quant_ns as f64 / 1e9,
                     t.launch_ns as f64 / 1e9,
                     t.d2h_ns as f64 / 1e9,
-                    (t.upload_ns + t.quant_ns + t.launch_ns + t.d2h_ns) as f64 / 1e6 / t.calls as f64
+                    (t.upload_ns + t.quant_ns + t.launch_ns + t.d2h_ns) as f64
+                        / 1e6
+                        / t.calls as f64
                 );
             }
         }
@@ -313,26 +339,73 @@ impl Q4Acc {
     /// 반환 None = 이 포인터가 알려진 파트 밖(폴백 필요).
     /// 실측: mmap 폴트 20-180 MB/s vs 버퍼드 pread 1.2 GB/s (같은 파일).
     fn staged_upload(&self, dst: *mut u8, ptr: usize, len: usize) -> Option<Result<(), String>> {
-        use std::os::unix::fs::FileExt;
         let (src, mut off) = self
             .sources
             .iter()
             .find_map(|s| s.covers(ptr, len).map(|o| (s, o)))?;
         let result = (|| -> Result<(), String> {
+            use std::os::unix::fs::FileExt;
             const CH: usize = 8 << 20;
-            let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
-            if stage.len() < CH.min(len) {
-                *stage = vec![0u8; CH.min(len)];
-            }
+            // 107 W1.5-3(원장 100): 핀 이중 스테이지 — pread(청크 k)와
+            // h2d(청크 k-1, 사이드 스트림 async) 중첩. 핀이면 async H2D가
+            // 드라이버 스테이징 없이 직행(원장 100 pageable 흡수 가설 검증).
+            // 반쪽 재사용은 그 반쪽 이벤트만 선별 대기. 핀 할당 실패 시
+            // pageable Vec 폴백(0511cba 판과 동일 경로).
+            let dbl = len > CH;
+            let ch = CH.min(len);
+            let (pa, pb) = self
+                .ctx
+                .pinned_stage2(ch)
+                .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+            let (a_ptr, b_ptr): (*mut u8, *mut u8) = if pa.is_null() {
+                let mut stage = self.stage.lock().map_err(|e| e.to_string())?;
+                let want = if dbl { 2 * ch } else { ch };
+                if stage.len() < want {
+                    *stage = vec![0u8; want];
+                }
+                // 핵심: Vec 폴백은 lock 가드가 살아있는 동안만 유효 —
+                // 업로드 루프 전체를 이 클로저 안에서 수행한다.
+                let (a, b) = stage.split_at_mut(if dbl { want / 2 } else { want });
+                (a.as_mut_ptr(), b.as_mut_ptr())
+            } else {
+                (pa, pb)
+            };
+            let ev = [Self::ev_new()?, Self::ev_new()?];
+            let mut recorded = [false, false];
             let mut done = 0usize;
-            while done < len {
-                let n = CH.min(len - done);
-                src.file.read_exact_at(&mut stage[..n], off).map_err(|e| format!("pread {off}: {e}"))?;
-                self.ctx.h2d(unsafe { dst.add(done) }, &stage[..n])?;
-                done += n;
-                off += n as u64;
+            let mut hi = 0usize;
+            let result = (|| -> Result<(), String> {
+                while done < len {
+                    let n = CH.min(len - done);
+                    if recorded[hi] {
+                        Self::ev_wait(ev[hi])?;
+                        recorded[hi] = false;
+                    }
+                    let base = if hi == 0 { a_ptr } else { b_ptr };
+                    // SAFETY: 핀/스테이지 버퍼 [0, n) — 할당 크기 ch ≥ n.
+                    let half = unsafe { std::slice::from_raw_parts_mut(base, n) };
+                    src.file
+                        .read_exact_at(half, off)
+                        .map_err(|e| format!("pread {off}: {e}"))?;
+                    self.ctx.h2d_async_s(unsafe { dst.add(done) }, half)?;
+                    // SAFETY: ev[hi]는 ev_new 산출분.
+                    unsafe { self.ctx.ev_record_s2(ev[hi]) }?;
+                    recorded[hi] = true;
+                    done += n;
+                    off += n as u64;
+                    if dbl {
+                        hi = 1 - hi;
+                    }
+                }
+                Ok(())
+            })();
+            for (e, r) in ev.into_iter().zip(recorded.iter()) {
+                if *r {
+                    let _ = Self::ev_wait(e);
+                }
+                let _ = Self::ev_free(e);
             }
-            Ok(())
+            result
         })();
         Some(result)
     }
@@ -342,7 +415,11 @@ impl Q4Acc {
         let base = data.as_ptr() as usize;
         let n = data.len();
         if !base.is_multiple_of(4096) || n < (4 << 20) {
-            Self::advise(base & !4095, ((base & 4095) + n + 4095) & !4095, libc::MADV_WILLNEED);
+            Self::advise(
+                base & !4095,
+                ((base & 4095) + n + 4095) & !4095,
+                libc::MADV_WILLNEED,
+            );
             return self.ctx.h2d(dst, data);
         }
         let mut off = 0usize;
@@ -350,9 +427,14 @@ impl Q4Acc {
         while off < n {
             let sz = CH.min(n - off);
             if off + sz < n {
-                Self::advise(base + off + sz, CH.min(n - off - sz), libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL);
+                Self::advise(
+                    base + off + sz,
+                    CH.min(n - off - sz),
+                    libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL,
+                );
             }
-            self.ctx.h2d(unsafe { dst.add(off) }, &data[off..off + sz])?;
+            self.ctx
+                .h2d(unsafe { dst.add(off) }, &data[off..off + sz])?;
             Self::advise(base + off, sz, libc::MADV_DONTNEED);
             off += sz;
         }
@@ -445,32 +527,22 @@ impl Q4Acc {
     fn fchk(&self, h: u64, bytes: usize, what: &str) -> Result<(), String> {
         let cap = self.fcap(h)?;
         if bytes > cap {
-            return Err(format!("{what} 범위 초과: need {bytes}B > cap {cap}B (핸들 {h})"));
+            return Err(format!(
+                "{what} 범위 초과: need {bytes}B > cap {cap}B (핸들 {h})"
+            ));
         }
         Ok(())
     }
-
 }
 
 impl llm170_core::matmul::GraphCapture for Q4Acc {
-
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
         unsafe { crate::rawhip::capture_mark(self.ctx.stream, tag) }
     }
-    fn graph_capture_begin(&self) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_capture_begin(self.ctx.stream) }
-    }
-    fn graph_capture_end(&self) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_capture_end(self.ctx.stream) }
-    }
-    fn graph_replay(&self, on: bool) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_replay(on) }
-    }
-    fn graph_abort(&self) {
-        crate::rawhip::graph_abort();
-    }
     fn pre_pair(&self, on: bool) {
-        self.ctx.pre_pair.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.ctx
+            .pre_pair
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     fn pre_mark(&self) -> Result<(), String> {
         self.ctx.pre_mark()
@@ -491,7 +563,6 @@ macro_rules! cargs {
     }};
 }
 
-
 /// 파트 소스 지정판 — 서버 배선이 `Model4::part_sources()`를 넘긴다.
 /// LLM170_GPU_RUNTIME=vulkan이면 VkAcc(plans/84 B — 진단 경로 포함 전역 스위치).
 pub fn new_acc_with_sources(
@@ -501,9 +572,7 @@ pub fn new_acc_with_sources(
         return crate::new_q4_acc_vk_with_sources(parts);
     }
     let a = Q4Acc::new_with_sources(parts)?;
-    eprintln!(
-        "# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)"
-    );
+    eprintln!("# q4acc: rawhip 가속기 준비 (무게는 첫 사용 시 업로드·영구 상주, ADR-0014)");
     eprintln!("{}", crate::rawhip::probes::device_report(&a.ctx));
     Ok(std::sync::Arc::new(a))
 }

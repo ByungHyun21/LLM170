@@ -5,7 +5,13 @@ use crate::rawhip::env_on;
 
 impl Q4Acc {
     /// 진단(LLM170_MOE_HASH): moe 최종 출력(out) 해시 — DEV/HOST 경로 비교용.
-    pub(super) fn moe_hash_check(&self, tag: &str, op: *mut u8, rows: usize, n_out: usize) -> Result<(), String> {
+    pub(super) fn moe_hash_check(
+        &self,
+        tag: &str,
+        op: *mut u8,
+        rows: usize,
+        n_out: usize,
+    ) -> Result<(), String> {
         if !env_on("LLM170_MOE_HASH") {
             return Ok(());
         }
@@ -14,7 +20,8 @@ impl Q4Acc {
         let t = self.t_cur().max(1);
         let n = (t * n_out).min(rows * n_out);
         let mut v = vec![0.0f32; n];
-        self.ctx.d2h(bytemuck::cast_slice_mut(&mut v), op as *const u8)?;
+        self.ctx
+            .d2h(bytemuck::cast_slice_mut(&mut v), op as *const u8)?;
         let mut x = 0xcbf29ce484222325u64;
         for f in v.iter() {
             x ^= f.to_bits() as u64;
@@ -48,8 +55,11 @@ impl Q4Acc {
     ) -> Result<(), String> {
         let mut ip = self.fptr(ids)?;
         let (mut od, mut pd, mut iv) = (off_d as *mut u8, perm_d as *mut u8, inv_d as *mut u8);
-        let (mut rx, mut pp, mut ipd) =
-            (rowexp_d as *mut u8, perm_pad_d as *mut u8, inv_pad_d as *mut u8);
+        let (mut rx, mut pp, mut ipd) = (
+            rowexp_d as *mut u8,
+            perm_pad_d as *mut u8,
+            inv_pad_d as *mut u8,
+        );
         let (mut tx, mut rpd) = (tilexp_d as *mut u8, rows_pad_d as *mut u8);
         let (mut n_e, mut rws) = (ne as i32, rows as i32);
         let mut bnd = bound as i32;
@@ -69,7 +79,6 @@ impl Q4Acc {
         ];
         self.ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args)
     }
-
 
     pub(super) fn rows_permute(
         &self,

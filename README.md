@@ -36,15 +36,15 @@ ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md
      어떤 프로즈도 적지 않는다. 표 안의 측정값만 갱신한다. -->
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | 234.6 | 278.8 | 249.8 | 5.50 |
+| LLM170 hip | 246.2 | 278.8 | 249.8 | 5.86 |
 | LLM170 vulkan (frame) | 465.8 | 395.9 | 296.4 | 14.82 |
 | llama.cpp hip | 451 | 427 | 391 | 20.61 |
 | llama.cpp vulkan | **474** | **502** | **448.8** | **23.68** |
 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
-| tg single | 5.65 | **20.04** |
-| np4 aggregate | 30.36 | **49.03** *(HTTP†)* |
+| tg single | 5.86 | **20.04** |
+| np4 aggregate | 28.6 *(serve --slots 4, HTTP)* | **49.03** *(llama HTTP†)* |
 
 - Greedy gates: 27B hip / 27B vulkan / FN hip / FN vulkan all PASS
   (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
@@ -67,7 +67,7 @@ cargo build --release
 cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --gpu-runtime hip
 
 # HTTP server (OpenAI-compatible)
-cargo run --release -- serve --model <model.gguf> --port 8080 --backend gpu
+cargo run --release -- serve --model <model.gguf> --port 8080 --slots 4 --backend gpu   # --slots N: continuous batching (default 1)
 
 # Benchmark
 cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --np 4 --gpu-runtime hip

@@ -18,6 +18,6 @@ pub fn new_q4_acc_vk_with_sources(
     let acc = rawvk::vkacc::VkAcc::new_with_sources(parts)?;
     Ok(std::sync::Arc::new(acc))
 }
-pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawhip::probes::gpu_mem_free;
+pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawvk::decoder::inject as inject_rawvk;

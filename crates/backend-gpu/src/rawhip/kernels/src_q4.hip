@@ -58,157 +58,6 @@ extern "C" __global__ void q4_gemm_q5_1(const unsigned* xq, const unsigned* w,
         if (l == 0) out[o] = (float)accd;
     }
 }
-
-// q4_K 행-배치 타일 — 스레드 = (출력 1개 × 행 R개). 가중치 디퀀트를 **행 루프
-// 밖으로** 빼서 한 번만 하고 R개 행이 재사용한다. 기존 판은 (출력,행) 쌍마다
-// 디퀀트를 반복해 비용이 행 수에 비례했다(q4k-bench 실측 ~5 Tops로 ALU 상한).
-// x는 같은 행을 256스레드가 읽어 브로드캐스트되고, 누산 순서는 _m과 동일.
-extern "C" __global__ void q4_gemm_q4k_y(const unsigned* xq, const unsigned* w, double* part,
-                                         float* out, int n_in, int n_out, int xq_w, int t, int rows_per_thread) {
-    const int o = (int)blockIdx.x * blockDim.x + threadIdx.x;
-    const int r0 = (int)blockIdx.y * rows_per_thread;
-    if (o >= n_out) return;
-    const int r1 = min(t, r0 + rows_per_thread);
-    const int n_super = n_in >> 8;
-    const unsigned ones = 0x01010101u;
-    const unsigned char* wr = (const unsigned char*)w + (size_t)o * (n_super * 144);
-    const unsigned* xrow_base = xq;
-    const unsigned xw_base = (unsigned)(n_in >> 2);
-    for (int sIdx = 0; sIdx < n_super; sIdx++) {
-        const unsigned char* blk = wr + sIdx * 144;
-        float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
-        float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
-        const unsigned char* sc = blk + 4;
-        const unsigned char* qs = blk + 16;
-        #pragma unroll
-        for (int it = 0; it < 4; it++) {
-            unsigned q[8];
-            // 16B 벡터 로드 — 4개 워드를 한 트랜잭션으로. 블록(144B)·it*32는
-            // 16의 배수라 정렬이 보장되고, 리틀엔디언 워드 4개는 기존 바이트
-            // 조립과 **값이 동일**하다(수치 불변). 스칼라 32회 → 벡터 2회.
-            const uint4* p4 = (const uint4*)(qs + it * 32);
-            #pragma unroll
-            for (int m4 = 0; m4 < 2; m4++) {
-                uint4 t4 = p4[m4];
-                q[m4 * 4 + 0] = t4.x;
-                q[m4 * 4 + 1] = t4.y;
-                q[m4 * 4 + 2] = t4.z;
-                q[m4 * 4 + 3] = t4.w;
-            }
-            const int j1 = 2 * it;
-            const int j2 = 2 * it + 1;
-            unsigned s1, m1, s2, m2;
-            if (j1 < 4) { s1 = sc[j1] & 63u; m1 = sc[j1 + 4] & 63u; }
-            else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
-            if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
-            else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
-            const float f1 = d * (float)s1;
-            const float f2 = d * (float)s2;
-            const float g1 = dmin * (float)m1;
-            const float g2 = dmin * (float)m2;
-            for (int r = r0; r < r1; r++) {
-                const unsigned* xr = xrow_base + (size_t)r * xq_w;
-                const unsigned* x1 = xr + sIdx * 64 + it * 16;
-                const unsigned* x2 = x1 + 8;
-                int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
-                #pragma unroll
-                for (int m = 0; m < 8; m++) {
-                    unsigned y1 = x1[m];
-                    il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                    qs1 += dot4(ones, y1, 0);
-                    unsigned y2 = x2[m];
-                    il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                    qs2 += dot4(ones, y2, 0);
-                }
-                float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
-                float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
-                out[(size_t)r * n_out + o] += yd1 * (f1 * (float)il1 - g1 * (float)qs1)
-                                            + yd2 * (f2 * (float)il2 - g2 * (float)qs2);
-            }
-        }
-    }
-}
-
-// q4_K x-스테이징 타일 — 블록 = 16출력 × 16행(256스레드). 슈퍼블록마다 x의
-// 16행(64워드 + 8스케일 = 72워드)을 shared로 1회 적재하고, 누산은 검증된
-// q4_gemm_q4k_m과 **동일 로직·순서**로 수행한다(결과 동일). 기존 판은 출력마다
-// x 행 전체를 다시 읽어 비용이 행 수에 비례했다(q4k-bench: t=512가 128의 3배,
-// 실효 4GB/s).
-extern "C" __global__ void q4_gemm_q4k_x(const unsigned* xq, const unsigned* w, double* part,
-                                         float* out, int n_in, int n_out, int xq_w, int t) {
-    __shared__ unsigned xsh[16 * 72];
-    const int ox = threadIdx.x & 15;
-    const int rx = threadIdx.x >> 4;
-    const int o0 = (int)blockIdx.x * 16;
-    const int r0 = (int)blockIdx.y * 16;
-    const int o = o0 + ox;
-    const int r = r0 + rx;
-    const int n_super = n_in >> 8;
-    const unsigned ones = 0x01010101u;
-    float acc = 0.0f;
-    for (int sIdx = 0; sIdx < n_super; sIdx++) {
-        // ── x 16행 스테이징 (행당 64 워드 + 8 스케일)
-        for (int i = threadIdx.x; i < 16 * 72; i += 256) {
-            int rr = i / 72, ii = i - rr * 72;
-            int row = r0 + rr;
-            unsigned v = 0u;
-            if (row < t) {
-                const unsigned* xr = xq + (size_t)row * xq_w;
-                if (ii < 64) {
-                    v = xr[sIdx * 64 + ii];
-                } else {
-                    v = xr[(n_in >> 2) + sIdx * 8 + (ii - 64)];
-                }
-            }
-            xsh[i] = v;
-        }
-        __syncthreads();
-        if (o < n_out && r < t) {
-            const unsigned char* wr = (const unsigned char*)w + (size_t)o * (n_super * 144);
-            const unsigned char* blk = wr + sIdx * 144;
-            float d = bits_f16((unsigned)blk[0] | ((unsigned)blk[1] << 8));
-            float dmin = bits_f16((unsigned)blk[2] | ((unsigned)blk[3] << 8));
-            const unsigned char* sc = blk + 4;
-            const unsigned char* qs = blk + 16;
-            const unsigned* xrow = xsh + rx * 72;
-            #pragma unroll
-            for (int it = 0; it < 4; it++) {
-                unsigned q[8];
-                #pragma unroll
-                for (int m = 0; m < 8; m++) {
-                    const unsigned char* p = qs + it * 32 + m * 4;
-                    q[m] = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
-                }
-                const int j1 = 2 * it;
-                const int j2 = 2 * it + 1;
-                unsigned s1, m1, s2, m2;
-                if (j1 < 4) { s1 = sc[j1] & 63u; m1 = sc[j1 + 4] & 63u; }
-                else { s1 = (sc[j1 + 4] & 0xFu) | ((unsigned)(sc[j1 - 4] >> 6) << 4); m1 = (sc[j1 + 4] >> 4) | ((unsigned)(sc[j1] >> 6) << 4); }
-                if (j2 < 4) { s2 = sc[j2] & 63u; m2 = sc[j2 + 4] & 63u; }
-                else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
-                const unsigned* x1 = xrow + it * 16;
-                const unsigned* x2 = x1 + 8;
-                int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
-                #pragma unroll
-                for (int m = 0; m < 8; m++) {
-                    unsigned y1 = x1[m];
-                    il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                    qs1 += dot4(ones, y1, 0);
-                    unsigned y2 = x2[m];
-                    il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                    qs2 += dot4(ones, y2, 0);
-                }
-                float yd1 = __uint_as_float(xrow[64 + 2 * it]);
-                float yd2 = __uint_as_float(xrow[64 + 2 * it + 1]);
-                acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
-                acc += yd2 * (d * (float)s2 * (float)il2 - dmin * (float)m2 * (float)qs2);
-            }
-        }
-        __syncthreads();
-    }
-    if (o < n_out && r < t) out[(size_t)r * n_out + o] = acc;
-}
-
 // q4_K 가변 타일 — outs/rows를 런타임 인자로 받아 형상 적응 스윕을 가능케 한다.
 // 스레드 = (출력, 행) 한 쌍(블록 스레드 = outs*rows). plans/65 형상 스윕용.
 extern "C" __global__ void q4_gemm_q4k_g(const unsigned* xq, const unsigned* w, double* part,
@@ -947,6 +796,186 @@ extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned
     }
 }
 
+// ─── plans/108 P7: MoE direct-ids dmmv — vk fn_moe_ids2/fn_moe_ids51 이식 ───
+// f32 활성 직소비(MoE 활성 quant·K-분할 reduce·카운팅 정렬 전부 스킵).
+// 64스레드·2행/WG·grid=(rows, ceil(n_out/2), gz), 축소는 dmmv 계열 f64 트리.
+// 커널이 ids[r]로 전문가 바이트 베이스를 직접 산출(간접 참조).
+
+// q4_K (144B [d f16][m f16][sc 12B][qs 128B]) — llama mul_mat_vec_q4_k 스레드
+// 매핑: itid=tid%16 → il=itid/4, ir=itid%4, v_im=il/2, v_in=il%2; ix=tid/16.
+// 스케일 3워드에서 v_im 하/상반 u16 3개(s0/s4/s8)를 뽑아 워드 조합으로
+// 8 서브스케일을 복호(vk fn_moe_ids2와 동일 비트열). fma 체인은
+// -ffp-contract=off 곱-가산 괄호 중첩으로 동일 결합순서.
+extern "C" __global__ void __launch_bounds__(64) q4_gemm_q4k_dmmv_ids(
+        const float* __restrict__ x, const unsigned* __restrict__ w,
+        float* __restrict__ out, const unsigned* __restrict__ ids,
+        int n_in, int n_out, int rows, int expert_bytes) {
+    const int tid = threadIdx.x;
+    if (tid >= 64) return;
+    const int r = blockIdx.x;                 // 행 = (토큰,전문가) 쌍
+    if (r >= rows) return;
+    const int wg = blockIdx.y + (int)blockIdx.z * gridDim.y;
+    const int first_row = wg << 1;
+    if (first_row >= n_out) return;
+    const int num_rows = min(2, n_out - first_row);
+    const int n_super = n_in >> 8;
+    const size_t ebase = (size_t)ids[r] * (size_t)expert_bytes;
+    const size_t rstride = (size_t)n_super * 144u;
+    const int itid = tid & 15;
+    const int ix = tid >> 4;                  // 슈퍼블록 스트라이드(4 iter)
+    const int il = itid >> 2;
+    const int ir = itid & 3;
+    const int v_im = il >> 1;
+    const int v_in = il & 1;
+    const int l0 = 4 * (2 * ir + v_in);
+    const int q_off = 32 * v_im + l0;         // qs 내 바이트 오프셋(4B 정렬)
+    const int y_off = 64 * v_im + l0;
+    const float* xr = x + (size_t)r * n_in;
+    float t0 = 0.0f, t1 = 0.0f;
+    for (int i = ix; i < n_super; i += 4) {
+        const int y1 = i * 256 + y_off;
+        const float by0 = xr[y1],       by1 = xr[y1+1],     by2 = xr[y1+2],     by3 = xr[y1+3];
+        const float by4 = xr[y1+32],    by5 = xr[y1+33],    by6 = xr[y1+34],    by7 = xr[y1+35];
+        const float by8 = xr[y1+128],   by9 = xr[y1+129],   by10 = xr[y1+130],  by11 = xr[y1+131];
+        const float by12 = xr[y1+160],  by13 = xr[y1+161],  by14 = xr[y1+162],  by15 = xr[y1+163];
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            if (n >= num_rows) break;
+            const size_t bb = ebase + (size_t)(first_row + n) * rstride + (size_t)i * 144u;
+            const unsigned wq0 = w[bb >> 2];
+            const float d = bits_f16(wq0 & 0xFFFFu);
+            const float dmin = bits_f16(wq0 >> 16);
+            // 스케일 s0/s4/s8 — 블록 바이트 4+2v/8+2v/12+2v 의 u16 (v_im 하/상반)
+            const unsigned s0 = (w[(bb + 4) >> 2]  >> (v_im << 4)) & 0xFFFFu;
+            const unsigned s4 = (w[(bb + 8) >> 2]  >> (v_im << 4)) & 0xFFFFu;
+            const unsigned s8 = (w[(bb + 12) >> 2] >> (v_im << 4)) & 0xFFFFu;
+            const unsigned s_l = (s4 << 16) | s0;
+            const unsigned s_h = (s_l & 0xC0C0C0C0u) >> 2;
+            const unsigned s_84 = (((s8 << 12) | s8) & 0x0F0F0F0Fu) | s_h;
+            const unsigned sl4 = s_l & 0x3F3F3F3Fu;
+            const float sc0 = (float)(sl4 & 0x3Fu),        sc1 = (float)((sl4 >> 8) & 0x3Fu);
+            const float sc2 = (float)((sl4 >> 16) & 0x3Fu), sc3 = (float)(sl4 >> 24);
+            const float sc4 = (float)(s_84 & 0xFFu),        sc5 = (float)((s_84 >> 8) & 0xFFu);
+            const float sc6 = (float)((s_84 >> 16) & 0xFFu), sc7 = (float)(s_84 >> 24);
+            const unsigned qa = w[(bb + 16 + q_off) >> 2];
+            const unsigned qb = w[(bb + 80 + q_off) >> 2];
+            const unsigned alo = qa & 0x0F0F0F0Fu, ahi = (qa >> 4) & 0x0F0F0F0Fu;
+            const unsigned blo = qb & 0x0F0F0F0Fu, bhi = (qb >> 4) & 0x0F0F0F0Fu;
+            const float q0 = (float)(alo & 0xFu),        q1 = (float)((alo >> 8) & 0xFu);
+            const float q2 = (float)((alo >> 16) & 0xFu), q3 = (float)(alo >> 24);
+            const float q4 = (float)(ahi & 0xFu),        q5 = (float)((ahi >> 8) & 0xFu);
+            const float q6 = (float)((ahi >> 16) & 0xFu), q7 = (float)(ahi >> 24);
+            const float q8 = (float)(blo & 0xFu),        q9 = (float)((blo >> 8) & 0xFu);
+            const float q10 = (float)((blo >> 16) & 0xFu), q11 = (float)(blo >> 24);
+            const float q12 = (float)(bhi & 0xFu),       q13 = (float)((bhi >> 8) & 0xFu);
+            const float q14 = (float)((bhi >> 16) & 0xFu), q15 = (float)(bhi >> 24);
+            const float sx = by0*q0 + (by1*q1 + (by2*q2 + by3*q3));
+            const float sy = by4*q4 + (by5*q5 + (by6*q6 + by7*q7));
+            const float sz = by8*q8 + (by9*q9 + (by10*q10 + by11*q11));
+            const float sw = by12*q12 + (by13*q13 + (by14*q14 + by15*q15));
+            const float smin = (by0*sc2 + (by4*sc3 + (by8*sc6 + by12*sc7)))
+                             + (by1*sc2 + (by5*sc3 + (by9*sc6 + by13*sc7)))
+                             + (by2*sc2 + (by6*sc3 + (by10*sc6 + by14*sc7)))
+                             + (by3*sc2 + (by7*sc3 + (by11*sc6 + by15*sc7)));
+            const float rr = d * (sx*sc0 + (sy*sc1 + (sz*sc4 + sw*sc5))) - dmin * smin;
+            if (n == 0) t0 += rr; else t1 += rr;
+        }
+    }
+    __shared__ double sh0[32], sh1[32];
+    double a0 = (double)t0, a1 = (double)t1;
+    if (tid >= 32) { sh0[tid - 32] = a0; sh1[tid - 32] = a1; }
+    __syncthreads();
+    if (tid < 32) {
+        a0 += sh0[tid];
+        a1 += sh1[tid];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffffffffffull, a0, off);
+            a1 += __shfl_down_sync(0xffffffffffffffffull, a1, off);
+        }
+        if (tid == 0) {
+            float* orow = out + (size_t)r * n_out;
+            orow[first_row] = (float)a0;
+            if (num_rows > 1) orow[first_row + 1] = (float)a1;
+        }
+    }
+}
+
+// q5_1 (24B [d f16][m f16][qh 4B][qs 16B]) — gemv8 골격(레인 8원소, 스트라이드
+// 512) + ids 간접. w = d·v + m (v = lo/hi니블 + qh 5번째 비트), 원소별
+// f32 2-누산(aq, sx) 드레인 — vk fn_moe_ids51과 동일 배치.
+extern "C" __global__ void __launch_bounds__(64) q5_1_gemm_dmmv_ids(
+        const float* __restrict__ x, const unsigned* __restrict__ w,
+        float* __restrict__ out, const unsigned* __restrict__ ids,
+        int n_in, int n_out, int rows, int expert_bytes) {
+    const int l = threadIdx.x;
+    if (l >= 64) return;
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int wg = blockIdx.y + (int)blockIdx.z * gridDim.y;
+    const int first_row = wg << 1;
+    if (first_row >= n_out) return;
+    const int num_rows = min(2, n_out - first_row);
+    const int n_sub = n_in >> 5;
+    const size_t ebase = (size_t)ids[r] * (size_t)expert_bytes;
+    const size_t rstride = (size_t)n_sub * 24u;
+    const float* xr = x + (size_t)r * n_in;
+    float t0 = 0.0f, t1 = 0.0f;
+    for (int col0 = l << 3; col0 < n_in; col0 += 512) {
+        float xw[8];
+        float sx = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            xw[j] = xr[col0 + j];
+            sx += xw[j];
+        }
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            if (n >= num_rows) break;
+            const size_t bb = ebase + (size_t)(first_row + n) * rstride
+                            + (size_t)(col0 >> 5) * 24u;
+            const unsigned w0 = w[bb >> 2];
+            const float d = bits_f16(w0 & 0xFFFFu);
+            const float m = bits_f16(w0 >> 16);
+            const unsigned qh = w[(bb + 4) >> 2];
+            const int rem = col0 & 31;
+            const int b0 = (rem >= 16) ? (rem - 16) : rem;   // 8-정렬 → {0,8}
+            const int k = b0 >> 1;                            // {0,4}
+            const int qw = (int)((bb + 8 + 2 * k) >> 2);
+            const unsigned qa = w[qw], qb = w[qw + 1];
+            const unsigned qh8 = (qh >> rem) & 0xFFu;
+            float aq = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned bytev = ((j < 4 ? qa : qb) >> (8 * (j & 3))) & 0xFFu;
+                const unsigned vq = (rem >= 16 ? (bytev >> 4) : (bytev & 0xFu))
+                                  | (((qh8 >> j) & 1u) << 4);
+                aq += (float)vq * xw[j];
+            }
+            const float rr = d * aq + m * sx;
+            if (n == 0) t0 += rr; else t1 += rr;
+        }
+    }
+    __shared__ double sh0[32], sh1[32];
+    double a0 = (double)t0, a1 = (double)t1;
+    if (l >= 32) { sh0[l - 32] = a0; sh1[l - 32] = a1; }
+    __syncthreads();
+    if (l < 32) {
+        a0 += sh0[l];
+        a1 += sh1[l];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffffffffffull, a0, off);
+            a1 += __shfl_down_sync(0xffffffffffffffffull, a1, off);
+        }
+        if (l == 0) {
+            float* orow = out + (size_t)r * n_out;
+            orow[first_row] = (float)a0;
+            if (num_rows > 1) orow[first_row + 1] = (float)a1;
+        }
+    }
+}
+
 
 
 // 4헤드-퍼-워프 — 선택 목록이 **토큰 단위**라(인덱서가 헤드 합산) 같은 토큰의
@@ -1328,50 +1357,6 @@ extern "C" __global__ void q4_norm_gated_sig(const float* o, const float* z, con
         out[xb + i] = o[xb + i] * inv * w[wb + i] * (1.0f / (1.0f + exp_cr(-z[xb + i])));
     }
 }
-
-// MoE 라우팅: softmax → top-k(확률 내림차순, 동점은 인덱스 오름차순 = CPU
-// 안정 정렬 미러) → 재정규화(하한 2^-14). 단일 스레드(512 전문가) — CPU와
-// 동일 순서를 보장하는 것이 성능보다 중요하다.
-extern "C" __global__ void q4_moe_top10(const float* route, unsigned* ids, float* wt,
-                                        int n_exp, int k_sel) {
-    if (threadIdx.x != 0) return;
-    int tok = blockIdx.x;
-    const float* rt = route + (size_t)tok * n_exp;
-    ids += (size_t)tok * k_sel;
-    wt += (size_t)tok * k_sel;
-    float mx = -3.4028235e38f;
-    for (int e = 0; e < n_exp; e++) mx = fmaxf(mx, rt[e]);
-    float zs = 0.0f;
-    for (int e = 0; e < n_exp; e++) zs += exp_cr(rt[e] - mx);
-    // 삽입 정렬 — 후보를 인덱스 오름차순으로 넣고 "확률 이상" 뒤에 삽입(안정)
-    int sel[64];          // k_sel ≤ 64 가정 (qwen4exp = 10)
-    float sp[64];
-    if (k_sel > 64) return;
-    int cnt = 0;
-    for (int e = 0; e < n_exp; e++) {
-        float p = exp_cr(rt[e] - mx) / zs;
-        int pos = cnt;
-        for (int j = 0; j < cnt; j++) {
-            if (p > sp[j]) { pos = j; break; }
-        }
-        if (pos < k_sel) {
-            int last = min(cnt, k_sel - 1);
-            for (int j = last; j > pos; j--) { sel[j] = sel[j - 1]; sp[j] = sp[j - 1]; }
-            sel[pos] = e;
-            sp[pos] = p;
-            if (cnt < k_sel) cnt++;
-        }
-    }
-    float wsum = 0.0f;
-    for (int j = 0; j < cnt; j++) wsum += sp[j];
-    wsum = fmaxf(wsum, 6.103515625e-5f);
-    for (int j = 0; j < k_sel; j++) {
-        int e = (j < cnt) ? sel[j] : 0;
-        ids[j] = (unsigned)e;
-        wt[j] = (j < cnt) ? sp[j] / wsum : 0.0f;
-    }
-}
-
 // MoE 전문가 가중 합: out[i] = Σ_e wt[e]·ys[e·n+i]
 extern "C" __global__ void q4_moe_weighted_sum(const float* ys, const float* wt, float* out, int k, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1465,52 +1450,6 @@ extern "C" __global__ void q4_moe_top10_m(const float* route, unsigned* ids, flo
         int e = (j < cnt) ? sel[j] : 0;
         ids[j] = (unsigned)e;
         wt[j] = (j < cnt) ? sp[j] / wsum : 0.0f;
-    }
-}
-
-// qwen4exp GDN AR — 상태 = core gdn_ar_batch 레이아웃 (st[kdim*d+dv])
-extern "C" __global__ void q4_gdn_ar_w(float* s, const float* q, const float* k, const float* v,
-                                       const float* beta_ge, float* out, int d, int k_stride,
-                                       int v_stride, int h_v, int h_k, float scale, int t) {
-    // qwen4exp 프레임용 — (a) 상태 레이아웃이 core `gdn_ar_batch`와 동일
-    // (st[kdim*d + dv]), (b) **임의 d** 지원: 레인당 kdim = lane + 32k.
-    // (qwen35용 gdn_ar_w_swap은 전치 레이아웃 + 레인당 kdim 4개 고정 = d=128 전용.)
-    int u = blockIdx.x;                     // dv
-    int pair = blockIdx.y;
-    int lane = threadIdx.x & 31;
-    if (u >= d) return;
-    int base_s = pair * d * d;
-    for (int ti = 0; ti < t; ti++) {
-        int h = pair % h_v;
-        int kh = h % h_k;
-        int qk0 = ti * k_stride + kh * d;
-        int v0 = ti * v_stride + h * d;
-        float beta = beta_ge[ti * h_v * 2 + pair * 2];
-        float g_exp = beta_ge[ti * h_v * 2 + pair * 2 + 1];
-        // sk[dv] = Σ_kdim (S·e^g)[kdim][dv]·k[kdim]
-        float part = 0.0f;
-        for (int kd = lane; kd < d; kd += 32) {
-            float sv = s[base_s + kd * d + u] * g_exp;
-            s[base_s + kd * d + u] = sv;
-            part += sv * k[qk0 + kd];
-        }
-        float sk = part;
-        #pragma unroll
-        for (int off = 1; off < 32; off <<= 1)
-            sk += __shfl_sync(0xFFFFFFFFFFFFFFFFull, sk, (lane ^ off) & 31);
-        float delta = (v[v0 + u] - sk) * beta;
-        // S[kdim][dv] += k[kdim]·delta;  o[dv] = Σ_kdim S[kdim][dv]·q[kdim]
-        float op = 0.0f;
-        for (int kd = lane; kd < d; kd += 32) {
-            float sv = s[base_s + kd * d + u] + k[qk0 + kd] * delta;
-            s[base_s + kd * d + u] = sv;
-            op += sv * q[qk0 + kd];
-        }
-        float otot = op;
-        #pragma unroll
-        for (int off = 1; off < 32; off <<= 1)
-            otot += __shfl_sync(0xFFFFFFFFFFFFFFFFull, otot, (lane ^ off) & 31);
-        if (lane == 0) out[v0 + u] = otot * scale;
     }
 }
 

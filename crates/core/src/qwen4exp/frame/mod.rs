@@ -11,16 +11,19 @@
 use super::layers::SeqState4;
 
 mod diag;
+mod fb;
 mod forward;
 mod multi;
 mod np;
 
-use diag::{buf_hash, dbg, ftime_on, ftime_report, frame_ck, sync_mark};
+use diag::{buf_hash, frame_ck, ftime_on, ftime_report, sync_mark};
 
 pub use diag::stage_skipped;
 pub use forward::*;
 pub use multi::*;
 pub use np::*;
+
+pub use fb::{Id as FbId, incr as fb_incr, report as fb_report};
 
 use super::stages::{self, Ctx};
 use super::{Hparams4, Model4, Q4Error};
@@ -31,16 +34,16 @@ use std::collections::HashMap;
 /// 프레임 버퍼 집합 — 활성화(스텝 공용) + 상태(시퀀스별) + 상수 가중치.
 /// np 배치 디코드용 행 뷰 핸들 — per-seq 상태 op에 넘긴다(초기화 1회).
 pub struct NpViews {
-    pub res_hc: Vec<u64>,   // [row][hc·n]
-    pub gqkv: Vec<u64>,     // [row][conv_ch]
-    pub gconv: Vec<u64>,    // [row][conv_ch]
-    pub gq: Vec<u64>,       // [row][k_len]
+    pub res_hc: Vec<u64>, // [row][hc·n]
+    pub gqkv: Vec<u64>,   // [row][conv_ch]
+    pub gconv: Vec<u64>,  // [row][conv_ch]
+    pub gq: Vec<u64>,     // [row][k_len]
     pub gk: Vec<u64>,
     pub gv: Vec<u64>,
-    pub gbg: Vec<u64>,      // [row][dt_rank·2]
-    pub go: Vec<u64>,       // [row][v_len]
-    pub qsa_q: Vec<u64>,    // [row][n_head·2hd]
-    pub qsa_k: Vec<u64>,    // [row][n_kv·hd]
+    pub gbg: Vec<u64>,   // [row][dt_rank·2]
+    pub go: Vec<u64>,    // [row][v_len]
+    pub qsa_q: Vec<u64>, // [row][n_head·2hd]
+    pub qsa_k: Vec<u64>, // [row][n_kv·hd]
     pub qsa_v: Vec<u64>,
     pub qsa_iq: Vec<u64>,   // [row][idx_heads·idx_dim]
     pub qsa_ik: Vec<u64>,   // [row][idx_dim]
@@ -56,18 +59,18 @@ pub struct NpViews {
 /// 기하 (n_seq, per_seq)가 바뀔 때만 재생성 — frame_free가 no-op이라
 /// 핸들 테이블은 청크 크기 종류 수만큼만 늘어난다.
 pub struct PreViews {
-    pub slots: usize, // 생성 시 n_seq
-    pub rows: usize,  // 생성 시 per_seq
+    pub slots: usize,     // 생성 시 n_seq
+    pub rows: usize,      // 생성 시 per_seq
     pub res_hc: Vec<u64>, // [seq][rows·hc·n] — PLE 브리지 입출력
     pub gqkv: Vec<u64>,   // [seq][rows·conv_ch]
     pub gconv: Vec<u64>,  // [seq][rows·conv_ch]
     pub gq: Vec<u64>,     // [seq][rows·k_len]
     pub gk: Vec<u64>,
-    pub gv: Vec<u64>,     // [seq][rows·v_len]
-    pub gbg: Vec<u64>,    // [seq][rows·dt_rank·2]
-    pub go: Vec<u64>,     // [seq][rows·v_len]
-    pub qsa_q: Vec<u64>,  // [seq][rows·n_head·2hd]
-    pub qsa_k: Vec<u64>,  // [seq][rows·n_kv·hd]
+    pub gv: Vec<u64>,    // [seq][rows·v_len]
+    pub gbg: Vec<u64>,   // [seq][rows·dt_rank·2]
+    pub go: Vec<u64>,    // [seq][rows·v_len]
+    pub qsa_q: Vec<u64>, // [seq][rows·n_head·2hd]
+    pub qsa_k: Vec<u64>, // [seq][rows·n_kv·hd]
     pub qsa_v: Vec<u64>,
     pub qsa_iq: Vec<u64>,   // [seq][rows·idx_heads·idx_dim]
     pub qsa_ik: Vec<u64>,   // [seq][rows·idx_dim]
@@ -80,24 +83,24 @@ pub struct PreViews {
 
 pub struct Frame4 {
     // ── 스텝 활성 (t=1) ──
-    pub res_hc: u64, // [hc·n_embd] — hc 스트림 잔차
-    pub xn: u64,     // [hc·n_embd] — hc rms 출력
-    pub lo: u64,     // [hc_down.n_out] — 저랭크
-    pub gate: u64,   // [hc·n_embd] — hc up 출력(게이트)
-    pub inj: u64,    // [hc] — inject
-    pub mix: u64,    // [n_embd]
+    pub res_hc: u64,  // [hc·n_embd] — hc 스트림 잔차
+    pub xn: u64,      // [hc·n_embd] — hc rms 출력
+    pub lo: u64,      // [hc_down.n_out] — 저랭크
+    pub gate: u64,    // [hc·n_embd] — hc up 출력(게이트)
+    pub inj: u64,     // [hc] — inject
+    pub mix: u64,     // [n_embd]
     pub ffn_out: u64, // [n_embd] — attn/moe 출력 (combine 입력)
     // GDN
-    pub gqkv: u64, // [conv_ch]
-    pub gz: u64,   // [d_inner]
-    pub gb: u64,   // [dt_rank]
-    pub ga: u64,   // [dt_rank]
-    pub gbg: u64,  // [dt_rank·2] — β, e^g
-    pub gconv: u64, // [conv_ch] — silu 적용 출력
-    pub gq: u64,   // [k_len]
-    pub gk: u64,   // [k_len]
-    pub gv: u64,   // [v_len]
-    pub go: u64,   // [v_len]
+    pub gqkv: u64,   // [conv_ch]
+    pub gz: u64,     // [d_inner]
+    pub gb: u64,     // [dt_rank]
+    pub ga: u64,     // [dt_rank]
+    pub gbg: u64,    // [dt_rank·2] — β, e^g
+    pub gconv: u64,  // [conv_ch] — silu 적용 출력
+    pub gq: u64,     // [k_len]
+    pub gk: u64,     // [k_len]
+    pub gv: u64,     // [v_len]
+    pub go: u64,     // [v_len]
     pub ggated: u64, // [d_inner]
     // MoE
     pub mroute: u64, // [n_expert]
@@ -128,12 +131,12 @@ pub struct Frame4 {
     /// 다중 시퀀스 청크 프리필 행 뷰 캐시(기하별 1회) — None이면 아직 없음.
     pub pre_views: Option<Box<PreViews>>,
     // PLE (plans/73 — 디바이스 수학)
-    pub ple_emb: u64,     // [ple_heads*ple_head_dim] 게이트된 n-gram 임베딩
-    pub ple_key: u64,     // [hc·n] w_key 출력
-    pub ple_value: u64,   // [n] w_value 출력(스트림 공유)
-    pub ple_gated: u64,   // [hc·n] norm된 게이트 방송(conv 입력)
-    pub ple_conv_out: u64,// [hc·n]
-    pub ple_gate: u64,    // [hc]
+    pub ple_emb: u64,      // [ple_heads*ple_head_dim] 게이트된 n-gram 임베딩
+    pub ple_key: u64,      // [hc·n] w_key 출력
+    pub ple_value: u64,    // [n] w_value 출력(스트림 공유)
+    pub ple_gated: u64,    // [hc·n] norm된 게이트 방송(conv 입력)
+    pub ple_conv_out: u64, // [hc·n]
+    pub ple_gate: u64,     // [hc]
     /// rope cos/sin 테이블 호스트 사본 — frame_qk_norm_rope가 받아 올린다.
     pub qsa_cs: Vec<f32>,
     /// 인덱서 로프 cos/sin 테이블(π n_rot=idx_dim) — 디바이스 선택(plans/73)이
@@ -145,12 +148,12 @@ pub struct Frame4 {
     pub qsa_qn_t: Vec<Vec<f32>>,
     pub qsa_kn_t: Vec<Vec<f32>>,
     // head
-    pub hxn: u64,  // [hc·n_embd]
+    pub hxn: u64, // [hc·n_embd]
     pub hlo: u64,
     pub hgate: u64,
-    pub hin: u64, // [t·n_embd]
+    pub hin: u64,      // [t·n_embd]
     pub hin_last: u64, // [n_embd] — 헤드 입력(마지막 토큰)
-    pub logits: u64, // [vocab]
+    pub logits: u64,   // [vocab]
     // 저랭크 버퍼 길이 (hc_down/output_hc_down n_out — 생성 시 고정)
     pub lo_len: usize,
     pub hlo_len: usize,
@@ -265,7 +268,13 @@ impl Frame4 {
                         continue;
                     }
                     let src = model.f32_vec4(&format!("blk.{il}.attn_q_norm.weight"))?;
-                    v.push(src.iter().copied().cycle().take(src.len() * hp.n_head).collect());
+                    v.push(
+                        src.iter()
+                            .copied()
+                            .cycle()
+                            .take(src.len() * hp.n_head)
+                            .collect(),
+                    );
                 }
                 v
             },
@@ -276,7 +285,13 @@ impl Frame4 {
                         continue;
                     }
                     let src = model.f32_vec4(&format!("blk.{il}.attn_k_norm.weight"))?;
-                    v.push(src.iter().copied().cycle().take(src.len() * hp.n_kv).collect());
+                    v.push(
+                        src.iter()
+                            .copied()
+                            .cycle()
+                            .take(src.len() * hp.n_kv)
+                            .collect(),
+                    );
                 }
                 v
             },
@@ -297,6 +312,19 @@ impl Frame4 {
             consts: HashMap::new(),
             dirty: vec![true; seqs.len()],
         };
+        // 107 W8 (원장 112): PLE 스크래치는 첫 PLE 층 실행 전엔 미기입 —
+        // 할당 잔재가 진단 해시를 흔든다(L1B.ple_gate 간헐 발산 — 페이지
+        // 재활용 시에만 비결정). 0으로 확정해 골든(=0 해시)과 항상 일치.
+        for (h, len) in [
+            (f.ple_key, hc * n * t_max),
+            (f.ple_value, n * t_max),
+            (f.ple_gated, hc * n * t_max),
+            (f.ple_conv_out, hc * n * t_max),
+            (f.ple_gate, hc * t_max),
+        ] {
+            acc.frame_write(h, &vec![0.0f32; len])
+                .map_err(Q4Error::Io)?;
+        }
         // 시퀀스별 GDN 상태 핸들 세트 — np 디코드 지원 (스테이트 스왑 없이
         // 시퀀스 고유 핸들 세트를 소유; 활성화 버퍼는 스텝마다 재사용).
         for _ in 0..seqs.len() {
@@ -317,18 +345,38 @@ impl Frame4 {
             Ok(())
         };
         for il in 0..hp.n_layer {
-            put(&format!("blk.{il}.hc_attn_norm"), &model.f32_vec4(&format!("blk.{il}.hc_attn_norm.weight"))?)?;
-            put(&format!("blk.{il}.hc_ffn_norm"), &model.f32_vec4(&format!("blk.{il}.hc_ffn_norm.weight"))?)?;
+            put(
+                &format!("blk.{il}.hc_attn_norm"),
+                &model.f32_vec4(&format!("blk.{il}.hc_attn_norm.weight"))?,
+            )?;
+            put(
+                &format!("blk.{il}.hc_ffn_norm"),
+                &model.f32_vec4(&format!("blk.{il}.hc_ffn_norm.weight"))?,
+            )?;
             if hp.is_recr(il) {
                 // ssm_norm.weight는 [d_state] 전헤드 공유 — norm_gated_rows 커널이
                 // 헤드별 슬라이스 인덱싱(w[(row%n_h)·d+i])하므로 dt_rank 타일로
                 // 업로드. 미타일 업로드는 OOB 읽기로 v1 발산의 근원 (2026-09-01).
                 let sn = model.f32_vec4(&format!("blk.{il}.ssm_norm.weight"))?;
-                let sn_tiled: Vec<f32> = sn.iter().copied().cycle().take(sn.len() * hp.dt_rank).collect();
+                let sn_tiled: Vec<f32> = sn
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(sn.len() * hp.dt_rank)
+                    .collect();
                 put(&format!("blk.{il}.ssm_norm"), &sn_tiled)?;
-                put(&format!("blk.{il}.dt_bias"), &model.f32_vec4(&format!("blk.{il}.ssm_dt.bias"))?)?;
-                put(&format!("blk.{il}.ssm_a"), &model.f32_vec4(&format!("blk.{il}.ssm_a"))?)?;
-                put(&format!("blk.{il}.conv_w"), &model.f32_vec4(&format!("blk.{il}.ssm_conv1d.weight"))?)?;
+                put(
+                    &format!("blk.{il}.dt_bias"),
+                    &model.f32_vec4(&format!("blk.{il}.ssm_dt.bias"))?,
+                )?;
+                put(
+                    &format!("blk.{il}.ssm_a"),
+                    &model.f32_vec4(&format!("blk.{il}.ssm_a"))?,
+                )?;
+                put(
+                    &format!("blk.{il}.conv_w"),
+                    &model.f32_vec4(&format!("blk.{il}.ssm_conv1d.weight"))?,
+                )?;
             }
         }
         put("output_hc_norm", &model.f32_vec4("output_hc_norm.weight")?)?;
@@ -369,7 +417,9 @@ impl Frame4 {
         // plans/97: pos==0이면 상태는 전부 영 — CPU 전사(측정 39-46ms) 대신
         // GPU zero-fill(수십 µs). 킬: LLM170_VK_ZSYNC=0.
         let zsync = st.pos == 0
-            && std::env::var("LLM170_VK_ZSYNC").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("LLM170_VK_ZSYNC")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         if zsync {
             let hs: Vec<u64> = self.st_gdn[seq]
                 .iter()
@@ -424,11 +474,19 @@ pub fn ple_restore(st: &mut SeqState4, s: PleSnap) {
     st.ple_next_pos = s.next_pos;
     st.ple_conv = s.conv;
 }
-
-/// plans/103 — res_hc f16 버스 옵트인(원자 스위치: 전 기입/판독이 동시 전환).
-pub(crate) fn res_f16_on() -> bool {
-    std::env::var("LLM170_VK_RESF16").map(|v| v == "1").unwrap_or(false)
+/// plans/103 — res_hc f16 버스(원자 스위치: 전 기입/판독 동시 전전환).
+/// 107(원장 104·105): 백엔드별 기본 — hip ON(웜 A/B +4.3% 실측,
+/// 토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산).
+pub fn res_f16_on() -> bool {
+    BACKEND_RES_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// 엔진 기동 시 백엔드 기본 지정(hip=true, vk=false) — build_slots에서
+/// 가속기 생성 전 1회 호출.
+pub fn set_backend_res_f16(on: bool) {
+    BACKEND_RES_F16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+static BACKEND_RES_F16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// f32 → f16 비트(반올림 짝수) — half 의존 없는 국소 변환(호스트 폴백 전용).
 pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {

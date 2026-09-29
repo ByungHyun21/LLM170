@@ -2,7 +2,14 @@
 //! 분리형 2패스) + pos embd bilinear(align_corners). mtmd-image.cpp 산술 미러.
 
 /// calc_size_preserved_ratio — qwen3vl 규칙 (align=patch·merge, min/max 픽셀).
-pub fn smart_resize(w: i64, h: i64, patch: i64, merge: i64, min_tok: i64, max_tok: i64) -> (i64, i64) {
+pub fn smart_resize(
+    w: i64,
+    h: i64,
+    patch: i64,
+    merge: i64,
+    min_tok: i64,
+    max_tok: i64,
+) -> (i64, i64) {
     let align = patch * merge;
     let patch_area = patch * patch * merge * merge;
     let min_pixels = min_tok * patch_area;
