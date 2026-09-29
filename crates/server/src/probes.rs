@@ -28,9 +28,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 .unwrap_or(20000);
             llm170_backend_gpu::rawhip::launch_rate(iters)
         }
-        "f16-map" => llm170_backend_gpu::rawhip::f16_map(
-            args.first().and_then(|v| v.parse().ok()).unwrap_or(256),
-        ),
         "f16-bench" => {
             let a = |i: usize, d: usize| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
             llm170_backend_gpu::rawhip::f16_bench(a(0, 128), a(1, 2560), a(2, 640), a(3, 20))
@@ -205,15 +202,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t1 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(16usize);
             let t2 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(208usize);
             llm170_backend_gpu::rawhip::tile_row_check(&path, &tn, t1, t2)
-        }
-        "wc-check" => {
-            let path = args.first().cloned().unwrap_or_else(|| d_27.into());
-            let tn = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "blk.0.ffn_gate.weight".into());
-            let t = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(64usize);
-            llm170_backend_gpu::rawhip::wc_check(&path, &tn, t)
         }
         "q6k-ref" => {
             let path = args.first().cloned().unwrap_or_else(|| d_q35.into());
