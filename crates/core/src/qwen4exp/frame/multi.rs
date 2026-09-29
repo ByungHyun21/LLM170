@@ -320,21 +320,7 @@ pub fn frame_forward_prefill_multi(
         let embd = model
             .w("token_embd.weight")
             .ok_or(Q4Error::MissingTensor("token_embd".into()))?;
-        let mut row = vec![0.0f32; n];
-        let mut r = vec![0.0f32; t * hc * n];
-        for (ti, &tok) in tokens.iter().enumerate() {
-            dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
-            for s in 0..hc {
-                r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
-            }
-        }
-        // plans/103: res_hc f16 버스 — CPU 기입 팩.
-        if super::res_f16_on() {
-            acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r))
-                .map_err(Q4Error::Io)?;
-        } else {
-            acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
-        }
+        super::emb_broadcast_write(acc, &embd, tokens, f.res_hc, n, hc)?;
         acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
     }
 

@@ -478,6 +478,36 @@ pub fn res_f16_on() -> bool {
     BACKEND_RES_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+
+/// 임베딩 t행 → hc 스트림 방송 후 res_hc에 기입(f16 버스 시 팩) —
+/// forward/multi/np 3중 복제 통합(plans/109 P8).
+pub(crate) fn emb_broadcast_write(
+    acc: &dyn Accelerator,
+    embd: &crate::qwen4exp::Weight<'_>,
+    tokens: &[u32],
+    res_hc: u64,
+    n: usize,
+    hc: usize,
+) -> Result<(), crate::qwen4exp::Q4Error> {
+    let t = tokens.len();
+    let mut row = vec![0.0f32; n];
+    let mut r = vec![0.0f32; t * hc * n];
+    for (ti, &tok) in tokens.iter().enumerate() {
+        dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
+        for s in 0..hc {
+            let b = ti * hc * n + s * n;
+            r[b..b + n].copy_from_slice(&row);
+        }
+    }
+    // plans/103: res_hc f16 버스 — CPU 기입 팩.
+    if res_f16_on() {
+        acc.frame_write_u32(res_hc, &pack_f16_pairs(&r))
+            .map_err(crate::qwen4exp::Q4Error::Io)?;
+    } else {
+        acc.frame_write(res_hc, &r).map_err(crate::qwen4exp::Q4Error::Io)?;
+    }
+    Ok(())
+}
 /// 엔진 기동 시 백엔드 기본 지정(hip=true, vk=false) — build_slots에서
 /// 가속기 생성 전 1회 호출.
 pub fn set_backend_res_f16(on: bool) {

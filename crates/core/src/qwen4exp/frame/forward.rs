@@ -96,22 +96,8 @@ pub(crate) fn frame_forward_ex(
         if gpu_ok {
             acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
         } else {
-            let mut row = vec![0.0f32; n];
-            let mut r = vec![0.0f32; t * hc * n];
-            for (ti, &tok) in tokens.iter().enumerate() {
-                dequant_row(embd.ty, embd.data, tok as u64, n as u64, &mut row);
-                for s in 0..hc {
-                    r[ti * hc * n + s * n..ti * hc * n + (s + 1) * n].copy_from_slice(&row);
-                }
-            }
             let emb_cpu_ms = emb_t0.elapsed().as_secs_f64() * 1e3;
-            // plans/103: res_hc f16 버스 — CPU 폴백 기입도 팩.
-            if super::res_f16_on() {
-                acc.frame_write_u32(f.res_hc, &super::pack_f16_pairs(&r))
-                    .map_err(Q4Error::Io)?;
-            } else {
-                acc.frame_write(f.res_hc, &r).map_err(Q4Error::Io)?;
-            }
+            super::emb_broadcast_write(acc, &embd, tokens, f.res_hc, n, hc)?;
             acc.capture_mark("emb_out").map_err(Q4Error::Io)?;
             if llm170_diag::dump::opts().key("frame_time") {
                 eprintln!(
