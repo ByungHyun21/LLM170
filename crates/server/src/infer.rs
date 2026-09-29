@@ -98,37 +98,15 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             if spec_k.is_some() {
                 eng.mtp_wanted = true; // 스펙 의도 — prefill 훅 활성 (plans/22)
             }
-            if gpu_runtime == "vulkan" {
-                // plans/29: VkDecoder(GPU 상주)가 vulkan 기본 — 헤드 n_vocab·
-                // WG 청크 수정으로 llama 패리티 확보(19f68bc). VkAcc 복원:
-                // LLM170_VK_ACC=1.
-                if std::env::var_os("LLM170_VK_ACC").is_some() {
-                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
-                        Ok(acc) => {
-                            eng = eng.with_acc(std::sync::Arc::new(acc));
-                            eprintln!("# backend: gpu (vulkan VkAcc)");
-                        }
-                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
-                    }
-                } else {
-                    match llm170_backend_gpu::inject_rawvk(&mut eng) {
-                        Ok(()) => eprintln!("# backend: gpu (vulkan VkDecoder)"),
-                        Err(e) => eprintln!("vk-decoder: {e} (VkAcc로 진행)"),
-                    }
-                }
-            } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
-                // LLM170_REQUIRE_GPU=1이면 폴백 금지 — 조용한 CPU 추론으로 검증이
-                // 무효화되는 사고 방지 (2026-09-12: infer 검증이 폴백으로 통과한 사례).
-                if let Err(e) = llm170_backend_gpu::inject_rawhip(&mut eng) {
-                    eprintln!("rawhip: {e}");
-                    if std::env::var_os("LLM170_REQUIRE_GPU").is_some() {
-                        return Err(format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"));
-                    }
-                }
-            }
-            if backend == "gpu" && gpu_runtime != "vulkan" {
-                eprintln!("# backend: gpu (raw hip)");
-            }
+            // 백엔드 부착 — 단일 경로(attach_q35). LLM170_REQUIRE_GPU=1이면 폴백
+            // 금지(2026-09-12: infer 검증이 폴백으로 통과한 사고 방지).
+            let policy = if std::env::var_os("LLM170_REQUIRE_GPU").is_some() {
+                crate::engine::AttachPolicy::Strict
+            } else {
+                crate::engine::AttachPolicy::Warn
+            };
+            eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
+                .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
             let eos = 248044u32;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
@@ -289,34 +267,16 @@ fn run_q4_infer(
         .and_then(|m| {
             let n = prompts.len();
             let sources = m.part_sources();
-            let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
-            if want_gpu && crate::engine::q4_vk_runtime_str(gpu_runtime) {
-                // plans/84 B — Vulkan 값경로(VkAcc). 프레임 미구현 → 값 경로.
-                match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
-                    Ok(acc) => {
-                        eng = eng.with_acc(acc);
-                        eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");
-                    }
-                    Err(e) => {
-                        eprintln!("error: qwen4exp Vulkan 가속기 생성 실패 — {e}");
-                        return Err(e);
-                    }
-                }
-            } else if want_gpu {
-                // plans/64 P1 — rawhip 값 경로. 실패는 조용히 넘기지 않는다
-                // (cubecl 제거 후 CPU 폴백이 GPU 수치로 오인된 이력).
-                match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
-                    Ok(acc) => {
-                        eng = eng.with_acc(acc);
-                        eprintln!("# backend: gpu (qwen4exp rawhip 값 경로)");
-                    }
-                    Err(e) => {
-                        eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
-                        eprintln!("error: GPU 없이 돌리려면 --backend cpu (조용한 폴백 금지)");
-                        return Err(e);
-                    }
-                }
-            }
+            let eng = llm170_core::qwen4exp::layers::Engine4::new(m, n, ctx);
+            // GPU 부착 — 단일 경로(attach_q4, Strict: infer 검증은 폴백 금지).
+            let mut eng = crate::engine::attach_q4(
+                eng,
+                sources,
+                want_gpu,
+                crate::engine::q4_vk_runtime_str(gpu_runtime),
+                false,
+                crate::engine::AttachPolicy::Strict,
+            )?;
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
             let mut next: Vec<u32> = Vec::with_capacity(n);

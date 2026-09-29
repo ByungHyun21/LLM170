@@ -73,6 +73,123 @@ pub fn q4_vk_runtime_str(runtime: &str) -> bool {
     runtime == "vulkan"
 }
 
+/// 백엔드 부착 실패 정책 — serve·vl은 경고 후 CPU 지속, bench·infer 검증은
+/// 오류 승격(조용한 CPU 폴백이 GPU 수치로 오인된 사고 이력 — 커밋 참조).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AttachPolicy {
+    Warn,
+    Strict,
+}
+
+/// qwen35 GPU 부착 — 단일 경로 (plans/109 P3). 종전 serve/infer/bench/vl이
+/// 각자 베껴 쓰며 serve의 vk-q35 비결정 게이트를 우회했다.
+/// 1. LLM170_RAWHIP=0 → 부착 없음(CPU).
+/// 2. vulkan && !LLM170_VK_Q35_FORCE → hip 폴백(원장 87/90 비결정 레이스).
+/// 3. vulkan 잔여 → LLM170_VK_ACC=1이면 VkAcc, 아니면 VkDecoder.
+/// 4. 그 외 → rawhip 디코더. 실패는 정책(Warn=CPU 지속 / Strict=Err)대로.
+pub fn attach_q35(
+    mut eng: llm170_core::qwen35::Engine,
+    vulkan: bool,
+    policy: AttachPolicy,
+) -> Result<llm170_core::qwen35::Engine, String> {
+    // LLM170_RAWHIP=0 → 명시적 CPU.
+    if !llm170_diag::flag::ne0("LLM170_RAWHIP") {
+        return Ok(eng);
+    }
+    // 107(원장 87·90): qwen35 vk 디코드 프리필 비결정 레이스(확산형). 조용한
+    // 오염 대신 가시 폴백 — LLM170_VK_Q35_FORCE=1로 vk 진단 강행.
+    let vk_q35_blocked = vulkan && !llm170_diag::flag::on("LLM170_VK_Q35_FORCE");
+    if vk_q35_blocked {
+        eprintln!(
+            "error: vulkan qwen35 decode is nondeterministic (ledger 87/90) — falling back to hip"
+        );
+    }
+    if vulkan && !vk_q35_blocked {
+        if llm170_diag::flag::on("LLM170_VK_ACC") {
+            match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
+                Ok(acc) => {
+                    eprintln!("# backend: gpu (vulkan VkAcc)");
+                    return Ok(eng.with_acc(std::sync::Arc::new(acc)));
+                }
+                Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
+            }
+        } else if let Err(e) = llm170_backend_gpu::inject_rawvk(&mut eng) {
+            eprintln!("vk-decoder: {e}");
+        } else {
+            eprintln!("# backend: gpu (vulkan VkDecoder)");
+            return Ok(eng);
+        }
+        return Ok(eng);
+    }
+    match llm170_backend_gpu::inject_rawhip(&mut eng) {
+        Ok(()) => {
+            eprintln!("# backend: gpu (qwen35 rawhip decode)");
+            Ok(eng)
+        }
+        Err(e) => {
+            eprintln!("rawhip: {e}");
+            match policy {
+                AttachPolicy::Warn => Ok(eng),
+                AttachPolicy::Strict => Err(e),
+            }
+        }
+    }
+}
+
+/// qwen4exp GPU 부착 — 단일 경로 (plans/109 P3). vk·hip 가속기 실패는 정책대로.
+///
+/// res_hc f16 버스(res_f16)는 호출부가 명시한다 — 현재 원장 상태:
+/// - serve(build_slots): `want_gpu && !vk` (원장 105 — hip f16 버스 승격,
+///   serve 슬롯 경로에서 +4.3% 웜·토큰 불변 실측).
+/// - infer/bench: `false` — charhash 스테이지 해시·FN 토큰 골든이 f32 버스로
+///   캡처됐다(2026-09-29 실측: infer에서 f16 설정 시 골든 발산·토큰 열화).
+///   통일은 산술 클래스 변경(규칙 10: 승인+재캡처 필요) — 별도 승인 전까지
+///   호출부 현행 값을 유지한다(B1 잔여, 의도된 발산으로 문서화).
+pub fn attach_q4(
+    eng: llm170_core::qwen4exp::layers::Engine4,
+    sources: Vec<(usize, usize, PathBuf)>,
+    want_gpu: bool,
+    vk: bool,
+    res_f16: bool,
+    policy: AttachPolicy,
+) -> Result<llm170_core::qwen4exp::layers::Engine4, String> {
+    llm170_core::qwen4exp::frame::set_backend_res_f16(res_f16);
+    if !want_gpu {
+        return Ok(eng);
+    }
+    if vk {
+        // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
+        // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
+        return match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
+            Ok(acc) => {
+                eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");
+                Ok(eng.with_acc(acc))
+            }
+            Err(e) => {
+                eprintln!("error: qwen4exp Vulkan 가속기 생성 실패 — {e}");
+                match policy {
+                    AttachPolicy::Warn => Ok(eng),
+                    AttachPolicy::Strict => Err(e),
+                }
+            }
+        };
+    }
+    match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
+        Ok(acc) => {
+            eprintln!("# backend: gpu (qwen4exp rawhip)");
+            Ok(eng.with_acc(acc))
+        }
+        Err(e) => {
+            eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
+            eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
+            match policy {
+                AttachPolicy::Warn => Ok(eng),
+                AttachPolicy::Strict => Err(e),
+            }
+        }
+    }
+}
+
 pub struct InferResult {
     pub tokens: Vec<u32>,
 }
@@ -718,90 +835,36 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
     let arch = open_with_retry(&req.model).and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
+        // qwen4exp GPU 경로 — plans/64 P1: 기본 CPU(정확성 기준); --backend gpu
+        // 명시 시에만 상주 가속기 부착(attach_q4가 res_f16 원장 105 규칙 적용).
         let m = load_q4_retry(&req.model);
         let sources = m.part_sources();
-        let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
-        // qwen4exp GPU 경로 (rawhip 값 경로) — plans/64 P1. 기본 CPU(정확성
-        // 기준); --backend gpu / --gpu-runtime hip일 때만 상주 가속기를 붙인다.
-        let want_gpu = q4_gpu_wanted(&backend);
-        // 107(원장 105): res_hc f16 버스 백엔드 기본 — hip ON(+4.3% 웜
-        // 실측·토큰 불변), vk OFF(f16 변형 슬롯 토큰 발산). env 최우선.
-        llm170_core::qwen4exp::frame::set_backend_res_f16(want_gpu && !q4_vk_runtime(&backend));
-        if want_gpu && q4_vk_runtime(&backend) {
-            // plans/84 B — Vulkan 값경로: VkAcc(MatmulHost). 프레임 미구현 →
-            // Engine4는 값 경로로 동작(모든 GEMV를 호스트 스테이징).
-            match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
-                Ok(acc) => {
-                    eng = eng.with_acc(acc);
-                    eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B 슬라이스2)");
-                }
-                Err(e) => {
-                    eprintln!("error: qwen4exp Vulkan 가속기 생성 실패 — {e}");
-                    eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
-                }
-            }
-            return Engine::Q4(Box::new(eng));
-        }
-        if want_gpu {
-            match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
-                Ok(acc) => {
-                    eng = eng.with_acc(acc);
-                    eprintln!(
-                        "# backend: gpu (qwen4exp rawhip — 프리필 프레임(기본)/디코드 프레임)"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
-                    eprintln!("error: --backend cpu로 CPU 기준 경로를 쓸 것 (조용한 폴백 금지)");
-                }
-            }
-        }
+        let eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
+        let eng = attach_q4(
+            eng,
+            sources,
+            q4_gpu_wanted(&backend),
+            q4_vk_runtime(&backend),
+            q4_gpu_wanted(&backend) && !q4_vk_runtime(&backend),
+            AttachPolicy::Warn,
+        )
+        .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
         Engine::Q4(Box::new(eng))
     } else {
         let m = load_q35_retry(&req.model);
-        let mut eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
+        let eng = llm170_core::qwen35::Engine::new(m, n_slots, req.ctx);
         // serve --spec — 스펙 의도일 때만 MTP prefill 훅 활성 (plans/22).
-        if SPEC_K.get().copied().unwrap_or(0) > 0 {
-            eng.mtp_wanted = true;
-        }
-        if std::env::var("LLM170_RAWHIP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-        {
-            // plans/29: serve --gpu-runtime vulkan 실제 반영 (지금까지 무시됨).
-            let vulkan = match &backend {
-                BackendSel::GpuRuntime(r) => r == "vulkan",
-                _ => false,
-            };
-            // 107 (원장 87·90): qwen35 vk 디코드 프리필 비결정론 레이스
-            // (확산형 — 배리어·캐시·코히런시 무죄, 디스패치별 제출만
-            // 결정론). 조용한 오염 대신 가시 폴백 — LLM170_VK_Q35_FORCE=1
-            // 로 vk 진단 강행.
-            let vk_q35_blocked = vulkan && !llm170_diag::flag::on("LLM170_VK_Q35_FORCE");
-            if vk_q35_blocked {
-                eprintln!(
-                    "error: vulkan qwen35 decode is nondeterministic (ledger 87/90) — falling back to hip"
-                );
-            }
-            if vulkan && !vk_q35_blocked {
-                if llm170_diag::flag::on("LLM170_VK_ACC") {
-                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
-                        Ok(acc) => {
-                            eng = eng.with_acc(std::sync::Arc::new(acc));
-                            eprintln!("# backend: gpu (vulkan VkAcc)");
-                        }
-                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
-                    }
-                } else {
-                    llm170_backend_gpu::inject_rawvk(&mut eng)
-                        .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
-                }
-            } else {
-                llm170_backend_gpu::inject_rawhip(&mut eng)
-                    .unwrap_or_else(|e| eprintln!("rawhip: {e}"));
-            }
-        }
-        let _ = &backend;
+        let mut eng = if SPEC_K.get().copied().unwrap_or(0) > 0 {
+            let mut e = eng;
+            e.mtp_wanted = true;
+            e
+        } else {
+            eng
+        };
+        // plans/29: --gpu-runtime vulkan 실제 반영.
+        let vulkan = matches!(&backend, BackendSel::GpuRuntime(r) if r == "vulkan");
+        eng = attach_q35(eng, vulkan, AttachPolicy::Warn)
+            .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
         Engine::Q35(Box::new(eng))
     }
 }
