@@ -164,6 +164,15 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             else if args.first().map(String::as_str) == Some("watchdog-selftest") {
                 return Some(cmd_watchdog_selftest());
             }
+            // plans/107 W8 — 폴백 카운터 관측.
+            else if args.first().map(String::as_str) == Some("fb") {
+                let r = llm170_core::qwen4exp::frame::fb_report();
+                if r.is_empty() {
+                    Ok("폴백 0건 (전 경로 GPU)".into())
+                } else {
+                    Ok(r)
+                }
+            }
             // plans/87 §5 — [npck] 로그 크로스 diff.
             else if args.first().map(String::as_str) == Some("ckdiff") {
                 let Some(a) = args.get(1).cloned() else {
@@ -180,7 +189,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     .unwrap_or(0.02);
                 return Some(cmd_ckdiff(&a, &b, rel));
             } else {
-                Err("diag: 하위커맨드 diff | chunk-check | va-lookup | vk-fault-probe | watchdog-selftest | ckdiff".into())
+                Err("diag: 하위커맨드 diff | chunk-check | va-lookup | vk-fault-probe | watchdog-selftest | ckdiff | fb".into())
             }
         }
         "mmq-row-check" => {

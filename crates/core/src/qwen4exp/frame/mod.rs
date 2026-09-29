@@ -11,6 +11,7 @@
 use super::layers::SeqState4;
 
 mod diag;
+mod fb;
 mod forward;
 mod multi;
 mod np;
@@ -21,6 +22,8 @@ pub use diag::stage_skipped;
 pub use forward::*;
 pub use multi::*;
 pub use np::*;
+
+pub use fb::{Id as FbId, incr as fb_incr, report as fb_report};
 
 use super::stages::{self, Ctx};
 use super::{Hparams4, Model4, Q4Error};
@@ -309,6 +312,19 @@ impl Frame4 {
             consts: HashMap::new(),
             dirty: vec![true; seqs.len()],
         };
+        // 107 W8 (원장 112): PLE 스크래치는 첫 PLE 층 실행 전엔 미기입 —
+        // 할당 잔재가 진단 해시를 흔든다(L1B.ple_gate 간헐 발산 — 페이지
+        // 재활용 시에만 비결정). 0으로 확정해 골든(=0 해시)과 항상 일치.
+        for (h, len) in [
+            (f.ple_key, hc * n * t_max),
+            (f.ple_value, n * t_max),
+            (f.ple_gated, hc * n * t_max),
+            (f.ple_conv_out, hc * n * t_max),
+            (f.ple_gate, hc * t_max),
+        ] {
+            acc.frame_write(h, &vec![0.0f32; len])
+                .map_err(Q4Error::Io)?;
+        }
         // 시퀀스별 GDN 상태 핸들 세트 — np 디코드 지원 (스테이트 스왑 없이
         // 시퀀스 고유 핸들 세트를 소유; 활성화 버퍼는 스텝마다 재사용).
         for _ in 0..seqs.len() {
