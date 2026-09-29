@@ -284,17 +284,6 @@ pub fn device_report(ctx: &RawCtx) -> String {
     )
 }
 
-pub(super) fn half_f32(bits: u16) -> f32 {
-    let s = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let e = ((bits >> 10) & 0x1F) as i32 - 15;
-    let m = (bits & 0x3FF) as f32;
-    if e == -15 {
-        s * m * 2f32.powi(-24)
-    } else {
-        s * (1.0 + m / 1024.0) * 2f32.powi(e)
-    }
-}
-
 /// 텐서 차원 출력 (디버그 보조)
 pub fn dims_of(path: &str, names: &[&str]) -> String {
     let g = match llm170_gguf::GgufFile::open(std::path::Path::new(path)) {
