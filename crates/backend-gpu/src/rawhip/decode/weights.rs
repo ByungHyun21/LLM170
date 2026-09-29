@@ -554,9 +554,50 @@ impl DecodeState {
     ) -> Result<(), String> {
         self.ctx.launch(name, n.div_ceil(64) as u32, 1, 64, args)
     }
+
+    /// GDN split3 공용 런치 — 4경로(weights/step/np/spec) 손복제 통합(plans/109 P10).
+    /// t=1 판은 total에 t 미포함(종전 산술 보존).
+    pub(super) fn gdn_split3(
+        &self,
+        src: *mut u8,
+        q: *mut u8,
+        k: *mut u8,
+        v: *mut u8,
+        k_len: usize,
+        v_len: usize,
+        t: Option<usize>,
+    ) -> Result<(), String> {
+        let mut sp = src as *mut std::ffi::c_void;
+        let mut q0 = q as *mut std::ffi::c_void;
+        let mut q1 = k as *mut std::ffi::c_void;
+        let mut q2 = v as *mut std::ffi::c_void;
+        let mut n0 = k_len as i32;
+        let mut n1 = k_len as i32;
+        let mut n2 = v_len as i32;
+        let total = match t {
+            Some(t) => (2 * k_len + v_len) * t,
+            None => 2 * k_len + v_len,
+        };
+        let mut args = vec![
+            Self::p(&mut sp),
+            Self::p(&mut q0),
+            Self::p(&mut q1),
+            Self::p(&mut q2),
+            Self::p(&mut n0),
+            Self::p(&mut n1),
+            Self::p(&mut n2),
+        ];
+        self.ew_l("split3", total, &mut args)
+    }
+
     pub(super) fn p<T>(v: &mut T) -> *mut std::ffi::c_void {
         v as *mut T as *mut std::ffi::c_void
     }
+
+    pub(super) fn quant(&self, x: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
+        self.ctx.quant_q8(x as *const u8, xq, n)
+    }
+
     pub(super) fn rms(&self, x: *mut u8, w: *mut u8, out: *mut u8, n: usize) -> Result<(), String> {
         let mut xp = x as *mut std::ffi::c_void;
         let mut pp = self.p64 as *mut std::ffi::c_void;
@@ -577,9 +618,6 @@ impl DecodeState {
             Self::p(&mut wr),
         ];
         self.ctx.launch("rms_finish", 1, 1, 256, &mut a2)
-    }
-    pub(super) fn quant(&self, x: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        self.ctx.quant_q8(x as *const u8, xq, n)
     }
     /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
     fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
@@ -768,27 +806,8 @@ impl DecodeState {
                         &mut args,
                     )?;
                 }
-                // split3 (q/k/v)
-                {
-                    let mut sp = self.gconv as *mut std::ffi::c_void;
-                    let mut q0 = self.gq as *mut std::ffi::c_void;
-                    let mut q1 = self.gk as *mut std::ffi::c_void;
-                    let mut q2 = self.gv as *mut std::ffi::c_void;
-                    let mut n0 = k_len as i32;
-                    let mut n1 = k_len as i32;
-                    let mut n2 = v_len as i32;
-                    let total = 2 * k_len + v_len;
-                    let mut args = vec![
-                        Self::p(&mut sp),
-                        Self::p(&mut q0),
-                        Self::p(&mut q1),
-                        Self::p(&mut q2),
-                        Self::p(&mut n0),
-                        Self::p(&mut n1),
-                        Self::p(&mut n2),
-                    ];
-                    self.ew_l("split3", total, &mut args)?;
-                }
+                // split3 (q/k/v) — 공용 헬퍼(plans/109 P10)
+                self.gdn_split3(self.gconv, self.gq, self.gk, self.gv, k_len, v_len, None)?;
                 // l2²+scale
                 {
                     let scale = 1.0f32 / (self.d_state as f32).sqrt();
