@@ -524,6 +524,50 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 ));
             }
         }
+        // 108 P2 — reps 중앙값 요약: 라벨(" | rep" 이전)별 t/s를 모아
+        // 중앙값·스프레드 한 줄 추가. 런간 편차 ±1.7%(원장 98)가 +0.6%급
+        // A/B 차이를 못 가리는 판별 프로토콜.
+        {
+            use std::collections::BTreeMap;
+            let mut by_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            for l in &lines {
+                let Some((label, rest)) = l.split_once("| rep") else {
+                    continue;
+                };
+                // "0 | 412.3 ms | 412.33 t/s ..." → 마지막 t/s 직전 수치.
+                let Some(v) = rest
+                    .split("t/s")
+                    .next()
+                    .and_then(|s| s.rsplit('|').next())
+                    .and_then(|s| s.trim().split_whitespace().last())
+                    .and_then(|s| s.parse::<f64>().ok())
+                else {
+                    continue;
+                };
+                by_label
+                    .entry(label.trim_end().to_string())
+                    .or_default()
+                    .push(v);
+            }
+            for (label, mut vals) in by_label {
+                if vals.len() < 2 {
+                    continue;
+                }
+                vals.sort_by(|a, b| a.total_cmp(b));
+                let mid = vals.len() / 2;
+                let median = if vals.len() % 2 == 1 {
+                    vals[mid]
+                } else {
+                    (vals[mid - 1] + vals[mid]) / 2.0
+                };
+                let spread = (vals[vals.len() - 1] - vals[0]).abs() / median * 100.0;
+                lines.push(format!(
+                    "{label} | median x{} | {:7.2} t/s (spread {spread:.1}%)",
+                    vals.len(),
+                    median
+                ));
+            }
+        }
         Ok(lines)
     })();
 
