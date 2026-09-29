@@ -821,9 +821,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 })
                 .min_by_key(|&i| slots[i].touch);
             // 배치 프리필(plans/74 np4) — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
-            // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). 게이트 기본 꺼짐.
-            // 실패하면 아래 슬롯별 경로로 폴백(등가성은 prefill_multi 등가 테스트가 보증).
-            if llm170_diag::flag::on("LLM170_PREFILL_BATCH") {
+            // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). plans/110 W8:
+            // 기본 ON(등가성은 prefill_multi 등가 테스트가 보증, 실패 시 아래
+            // 슬롯별 경로 폴백). 킬스위치 LLM170_PREFILL_BATCH=0.
+            if llm170_diag::flag::ne0("LLM170_PREFILL_BATCH") {
                 let pend: Vec<usize> = (0..n_slots)
                     .filter(|&i| {
                         slots[i].job.is_some()
