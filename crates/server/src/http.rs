@@ -376,14 +376,6 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
     }
 }
 
-fn json_esc(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
 fn run_and_emit(
     stream: &mut TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
@@ -440,7 +432,7 @@ fn run_and_emit(
         let mut det = crate::engine::Detok::new();
         let text: String = toks.iter().map(|&t| det.push(t)).collect();
         let arr: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
-        let esc = json_esc(&text);
+        let esc = crate::json::esc(&text);
         resp(
             stream,
             200,
@@ -456,7 +448,7 @@ fn run_and_emit(
     // 토큰 생성 즉시 SSE — 장문 요청이 완료까지 굳지 않게 (2026-09-01).
     let mut det = crate::engine::Detok::new();
     for t in prx {
-        let piece = json_esc(&det.push(t));
+        let piece = crate::json::esc(&det.push(t));
         if chat {
             sse(
                 stream,
@@ -509,7 +501,7 @@ fn run_and_emit_anthropic(
         );
         let mut det = crate::engine::Detok::new();
         for t in prx {
-            let esc = json_esc(&det.push(t));
+            let esc = crate::json::esc(&det.push(t));
             sse(
                 stream,
                 "content_block_delta",
@@ -533,7 +525,7 @@ fn run_and_emit_anthropic(
     }
     let mut det = crate::engine::Detok::new();
     let text: String = all.iter().map(|&t| det.push(t)).collect();
-    let esc = json_esc(&text);
+    let esc = crate::json::esc(&text);
     resp(
         stream,
         200,
