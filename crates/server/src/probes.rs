@@ -173,6 +173,19 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     Ok(r)
                 }
             }
+            // plans/108 P1 — env 스냅샷↔라이브 동치 검사.
+            else if args.first().map(String::as_str) == Some("envcheck") {
+                let bad = llm170_diag::flag::env_check();
+                if bad.is_empty() {
+                    Ok("env 동치 정상 (LLM170_ 키 전수)".into())
+                } else {
+                    Err(format!(
+                        "env 동치 불일치 {}건:\n{}",
+                        bad.len(),
+                        bad.join("\n")
+                    ))
+                }
+            }
             // plans/87 §5 — [npck] 로그 크로스 diff.
             else if args.first().map(String::as_str) == Some("ckdiff") {
                 let Some(a) = args.get(1).cloned() else {
@@ -189,7 +202,7 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     .unwrap_or(0.02);
                 return Some(cmd_ckdiff(&a, &b, rel));
             } else {
-                Err("diag: 하위커맨드 diff | chunk-check | va-lookup | vk-fault-probe | watchdog-selftest | ckdiff | fb".into())
+                Err("diag: 하위커맨드 diff | chunk-check | va-lookup | vk-fault-probe | watchdog-selftest | ckdiff | fb | envcheck".into())
             }
         }
         "mmq-row-check" => {
