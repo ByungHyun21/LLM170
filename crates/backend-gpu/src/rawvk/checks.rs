@@ -275,7 +275,7 @@ pub fn ft32_check(path: &str) -> Result<String, String> {
             mx2 = mx2.max(d);
         }
     }
-    // q8_0 down(q8mmq 경로 — env LLM170_VK_Q8MMQ=1일 때 fn_tile_q8mmq) 검증.
+    // q8_0 down 경로 검증.
     let mut mx3 = 0f64;
     let mut bad3 = 0usize;
     if llm170_diag::dump::opts().key("q8_dbg") {

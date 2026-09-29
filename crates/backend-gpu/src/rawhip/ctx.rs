@@ -5,7 +5,7 @@ use crate::rawhip::ck;
 use crate::rawhip::kernels;
 use crate::rawhip::nolaunch_on;
 use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
-use crate::rawhip::{GRAPH_SKIP, KtraceEv};
+use crate::rawhip::KtraceEv;
 use crate::rawhip::{env_eq, env_on};
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;
@@ -707,7 +707,7 @@ impl RawCtx {
     ) -> Result<(), String> {
         // 진단(LLM170_NOLAUNCH): 런치를 건너뛰고 호스트 스켈레톤 시간만 측정한다.
         // 그래프 재생 중에도 즉시 반환한다(커널은 그래프가 실행).
-        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
+        if nolaunch_on() {
             return Ok(());
         }
         let f = *self
@@ -763,7 +763,7 @@ impl RawCtx {
             eprintln!("[lbt] {name} gx={gx} gy={gy} gz={gz}");
         }
 
-        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
+        if nolaunch_on() {
             return Ok(());
         }
         if env_on("LLM170_KT_NAMES") {
@@ -819,7 +819,7 @@ impl RawCtx {
         smem: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
-        if GRAPH_SKIP.load(std::sync::atomic::Ordering::Relaxed) || nolaunch_on() {
+        if nolaunch_on() {
             return Ok(());
         }
         use std::collections::HashSet;
@@ -1254,9 +1254,6 @@ impl RawCtx {
                 &mut args,
             );
         }
-        // 실험(2026-09-16): 워프판(32레인/행)을 n_sub>32 형상까지 확대 —
-        // n_sub=80에서 레인 효율 83% vs 종전 62.5%. LLM170_Q8W_ALL=1로 옵트인.
-        let w_all = t == 1 && ty == 8 && env_eq("LLM170_Q8W_ALL", "1");
         // 소형 n_sub(≤32) 구간은 w16(16레인/행, 레인 효율 62.5-100% vs 워프판
         // 31%)으로 — FN tg128 17.2 → 18.0 t/s (+4.8%, 2026-09-16 실측, 게이트 동일).
         // 킬스위치 LLM170_Q8W16_SMALL=0.
@@ -1314,7 +1311,7 @@ impl RawCtx {
                 &mut args,
             );
         }
-        if t == 1 && ty == 8 && (n_in / 32 <= 32 || w_all) && !env_eq("LLM170_Q8W", "0") {
+        if t == 1 && ty == 8 && n_in / 32 <= 32 && !env_eq("LLM170_Q8W", "0") {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,

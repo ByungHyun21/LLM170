@@ -539,18 +539,6 @@ impl llm170_core::matmul::GraphCapture for Q4Acc {
     fn capture_mark(&self, tag: &str) -> Result<(), String> {
         unsafe { crate::rawhip::capture_mark(self.ctx.stream, tag) }
     }
-    fn graph_capture_begin(&self) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_capture_begin(self.ctx.stream) }
-    }
-    fn graph_capture_end(&self) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_capture_end(self.ctx.stream) }
-    }
-    fn graph_replay(&self, on: bool) -> Result<(), String> {
-        unsafe { crate::rawhip::graph_replay(on) }
-    }
-    fn graph_abort(&self) {
-        crate::rawhip::graph_abort();
-    }
     fn pre_pair(&self, on: bool) {
         self.ctx
             .pre_pair

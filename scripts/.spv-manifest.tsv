@@ -53,8 +53,6 @@ fn_quant_q8p.spv	comp	-	839aeb5f24781bf5
 fn_tile_f32.spv	comp	-	a94cc51edf12cf3d
 fn_tile_f32s.spv	comp	-	213ee0bc2d81e599
 fn_tile_q8.spv	comp	-	70d43ebf49a13b44
-fn_tile_q8d.spv	comp	sdot	d81325093602d397
-fn_tile_q8mmq.spv	comp	sdot	06daef0840e043c9
 gdn_ar.spv	comp	-	958b5644ba89be0b
 gdn_ar4.spv	comp	-	7e7cced6cd9e56d6
 gdn_ar8.spv	comp	-	cd167ef9db306029
@@ -105,7 +103,6 @@ i8probe3.spv	comp	-	0e4789c203a62b33
 idot_probe.spv	prebuilt	sdot	86b508012b5c445d
 kv_app_np.spv	comp	-	31749403e5fbdbef
 kv_append.spv	comp	-	0b1d132a9b4a018a
-kv_append_q8.spv	comp	-	52a1a26071a7ddab
 l2_rows.spv	comp	-	2750a69fb87f34f5
 l2_rows2.spv	comp	-	5bc005b7f9987cc0
 l2_rows2_scale.spv	comp	-	00b3d84f9529d22b
@@ -132,7 +129,6 @@ qk_rope2_np.spv	comp	-	4ae796a2f3838ebe
 qsa_flash.spv	comp	-	6302c62e16ef90e4
 qsa_flash_gq.spv	comp	-	5abb0bf1ed10b254
 qsa_flash_np.spv	comp	-	8af33ed2ae92129c
-qsa_flash_q8.spv	comp	-	5f00a807a4619236
 qsa_flash_reg.spv	comp	-	fc134ac88d0080ad
 quant_b8.spv	comp	-	3fcedbcbef285247
 quant_b8v2.spv	comp	-	2370c5772026021d
@@ -172,7 +168,6 @@ tile_q6kms.spv	comp	-	1a69e9bb23957751
 tile_q8.spv	comp	-	3c5da44c9c127e6f
 tile_q8128.spv	comp	-	b391c86bc60fd70a
 tile_q8128ks.spv	comp	-	de8052bf1c7292d1
-tile_q8ks.spv	comp	-	03bfde359a7d1a15
 tile_q8ms.spv	comp	-	b8681c322bf0a5cb
 tile_xs.spv	comp	-	1032d97994cd59ee
 tile_xs128.spv	comp	-	5da8928fda7ebc94
