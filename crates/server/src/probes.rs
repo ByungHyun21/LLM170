@@ -208,40 +208,53 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let t2 = arg_num(args, 3, 208usize);
             llm170_backend_gpu::rawhip::tile_row_check(&path, &tn, t1, t2)
         }
+        "mtp-load-check" => {
+            // plans/109 P15① 검증 — 외장 MTP 모듈 파트 병합·텐서 뷰 동작 확인.
+            let main_p = arg_str(args, 0, d_fn);
+            let mtp_p = arg_str(
+                args,
+                1,
+                "/home/yoon/models/qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            );
+            (|| -> Result<String, String> {
+                let mut m = llm170_core::qwen4exp::Model4::load(std::path::Path::new(&main_p))
+                    .map_err(|e| e.to_string())?;
+                m.load_mtp(std::path::Path::new(&mtp_p))
+                    .map_err(|e| e.to_string())?;
+                let mut out = format!(
+                    "mtp-load-check: has_mtp={} n_layer={} 병합 텐서:\n",
+                    m.has_mtp(),
+                    m.hp.n_layer
+                );
+                for name in [
+                    "blk.48.attn_q.weight",
+                    "blk.48.nextn.eh_proj.weight",
+                    "blk.48.nextn.enorm.weight",
+                    "blk.48.nextn.hc_head_up.weight",
+                    "token_embd.weight",
+                ] {
+                    let w = m.w(name).ok_or_else(|| format!("텐서 없음: {name}"))?;
+                    out.push_str(&format!(
+                        "  {name}: ty={} n_in={} n_out={} bytes={}\n",
+                        w.ty.name(),
+                        w.n_in,
+                        w.n_out,
+                        w.data.len()
+                    ));
+                }
+                let enorm = m
+                    .f32_vec4("blk.48.nextn.enorm.weight")
+                    .map_err(|e| e.to_string())?;
+                out.push_str(&format!("  enorm f32_vec4: {}원소\n", enorm.len()));
+                Ok(out)
+            })()
+        }
         "q6k-ref" => {
             let path = arg_str(args, 0, d_q35);
             let tn = arg_str(args, 1, "blk.64.nextn.eh_proj.weight");
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
-        "launch-probe" => llm170_backend_gpu::rawhip::launch_probe(),
-        "vk-flash-check" => llm170_backend_gpu::rawvk::flashcheck::flash_check(),
-        "vk-gemv-check" => {
-            let path = arg_str(args, 0, d_q35);
-            let tn = arg_str(args, 1, "blk.0.attn_gate.weight");
-            let t = arg_num(args, 2, 1usize);
-            llm170_backend_gpu::rawvk::checks::gemv_check(&path, &tn, t)
-        }
-        "vk-idot-probe" => llm170_backend_gpu::rawvk::checks::idot_probe(),
-        "vk-gemv8-check" => {
-            let path = arg_str(args, 0, d_q35);
-            let tn = arg_str(args, 1, "blk.0.ssm_out.weight");
-            let t = arg_num(args, 2, 1usize);
-            llm170_backend_gpu::rawvk::checks::gemv8_check(&path, &tn, t)
-        }
-        "vk-ft32-check" => {
-            let path = arg_str(args, 0, d_fn);
-            llm170_backend_gpu::rawvk::checks::ft32_check(&path)
-        }
-        "vk-ple-mt-check" => {
-            let reps = arg_num(args, 0, 64usize);
-            llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
-        }
-        "vk-frame-check" => {
-            let path = arg_str(args, 0, d_fn);
-            let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
-            llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
-        }
-        "subsum-check" => llm170_backend_gpu::rawvk::subsum_check(),
+
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),

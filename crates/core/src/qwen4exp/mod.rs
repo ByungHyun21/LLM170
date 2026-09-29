@@ -336,6 +336,52 @@ impl Model4 {
             .collect()
     }
 
+    /// 외장 MTP 모듈 적재 (plans/109 P15①) — unsloth 배포는 nextn 레이어가
+    /// 별도 gguf로 분리(blk.48.* + nextn.{eh_proj,enorm,hnorm,hc_head_*},
+    /// nextn_shared_target_tensors=true — 임베딩·헤드·PLE는 본체 공유).
+    /// 추가 파트로 mmap 후 텐서 색인에 등록한다(이름 충돌 없음).
+    pub fn load_mtp(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let g = GgufFile::open(path)?;
+        if g.kv_str("general.architecture") != Some("qwen4exp") {
+            return Err("mtp module: not a qwen4exp gguf".into());
+        }
+        let layers = g.kv_u64("qwen4exp.nextn_predict_layers").unwrap_or(0);
+        if layers != 1 {
+            return Err(format!("mtp module: nextn_predict_layers={layers} (1 기대)").into());
+        }
+        let file = std::fs::File::open(path).map_err(|e| Q4Error::Io(e.to_string()))?;
+        // SAFETY: 읽기 전용 무게 매핑 — 수정하지 않는다
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let pi = self.parts.len();
+        for (ti, t) in g.tensors.iter().enumerate() {
+            // 블록 번호 일관성: 본체 n_layer(=48) 다음 블록이어야 한다.
+            if let Some(rest) = t.name.strip_prefix("blk.")
+                && let Some(blk) = rest.split('.').next().unwrap_or("").parse::<usize>().ok()
+                && blk != self.hp.n_layer
+            {
+                return Err(format!(
+                    "mtp module: blk.{blk} ≠ 본체 n_layer({}) 다음",
+                    self.hp.n_layer
+                )
+                .into());
+            }
+            self.index.insert(t.name.clone(), (pi, ti));
+        }
+        self.parts.push(PartMap {
+            path: path.to_path_buf(),
+            data_offset: g.data_offset,
+            tensors: g.tensors.clone(),
+            mmap,
+        });
+        self.mtp_nextn = true;
+        Ok(())
+    }
+
+    /// MTP 모듈 보유 여부.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp_nextn
+    }
+
     /// f32 벡터 텐서 디양자화 — 캐시. 대상(norm 가중치 등)은 결정적이라
     /// 첫 호출 1회 디양자화 후 재사용 (수치 불변).
     pub fn f32_vec4(&self, name: &str) -> Result<Vec<f32>, Q4Error> {
