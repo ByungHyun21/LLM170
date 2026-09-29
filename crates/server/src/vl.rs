@@ -227,7 +227,7 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let mut finished = vec![false; n_img];
     let mut gen_toks: Vec<Vec<u32>> = vec![Vec::new(); n_img];
     let mut texts: Vec<String> = vec![String::new(); n_img];
-    let mut next: Vec<u32> = last_logits
+    let next: Vec<u32> = last_logits
         .iter()
         .map(|l| llm170_core::qwen35::greedy(l))
         .collect();
@@ -247,101 +247,20 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         }
         gen_toks[s].push(next[s]);
     }
-    let emit = |s: usize, t: u32, eng: &llm170_core::qwen35::Engine, texts: &mut Vec<String>| {
-        if t != eos {
-            texts[s].push_str(&eng.piece(t));
-        }
-    };
-    let spec_on = spec_k > 0 && eng.has_mtp() && std::env::var_os("LLM170_SPEC_GPU").is_some();
-    if spec_k > 0 && !eng.has_mtp() {
-        eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
-    }
     let gen_res = (|| -> Result<(), String> {
-        if spec_on && n_img > 1 {
-            while gen_toks
-                .iter()
-                .filter(|g| !g.is_empty())
-                .min_by_key(|g| g.len())
-                .map(|g| g.len())
-                .unwrap_or(0)
-                <= n_predict
-            {
-                let active: Vec<usize> = (0..n_img).filter(|&s| !finished[s]).collect();
-                if active.is_empty() {
-                    break;
-                }
-                let nexts: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let acc = eng
-                    .spec_step_multi(&active, &nexts, spec_k)
-                    .map_err(|e| e.to_string())?;
-                let mut any = false;
-                for (i, &s) in active.iter().enumerate() {
-                    for &t in &acc[i] {
-                        if gen_toks[s].len() > n_predict {
-                            break;
-                        }
-                        emit(s, t, &eng, &mut texts);
-                        println!(
-                            "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                            base_len[s] + gen_toks[s].len()
-                        );
-                        gen_toks[s].push(t);
-                        next[s] = t;
-                        if t == eos {
-                            finished[s] = true;
-                        }
-                        any = true;
-                    }
-                }
-                if !any {
-                    break;
-                }
-            }
-        } else if spec_on {
-            let s = 0usize;
-            while gen_toks[s].len() <= n_predict && !finished[s] {
-                let (acc_toks, _tf) = eng
-                    .spec_step(s, next[s], spec_k)
-                    .map_err(|e| e.to_string())?;
-                for &t in &acc_toks {
-                    if gen_toks[s].len() > n_predict {
-                        break;
-                    }
-                    emit(s, t, &eng, &mut texts);
-                    println!(
-                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                        base_len[s] + gen_toks[s].len()
-                    );
-                    gen_toks[s].push(t);
-                    next[s] = t;
-                    if t == eos {
-                        finished[s] = true;
-                    }
-                }
-            }
-        } else {
-            for _step in 0..n_predict {
-                let active: Vec<usize> = (0..n_img).filter(|&s| !finished[s]).collect();
-                if active.is_empty() {
-                    break;
-                }
-                let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let logits = eng.decode(&active, &toks).map_err(|e| e.to_string())?;
-                for (i, &s) in active.iter().enumerate() {
-                    let t = llm170_core::qwen35::greedy(&logits[i]);
-                    next[s] = t;
-                    emit(s, t, &eng, &mut texts);
-                    println!(
-                        "{{\"seq\":{s},\"pos\":{},\"token\":{t}}}",
-                        base_len[s] + gen_toks[s].len()
-                    );
-                    gen_toks[s].push(t);
-                    if t == eos {
-                        finished[s] = true;
-                    }
-                }
-            }
-        }
+        // 생성 — 단일 루프(generate_q35): spec-multi/spec-single/batch.
+        // vl 싱크: 텍스트 누적 + JSONL(token만, infer 형식에서 text 생략).
+        // pos는 infer 규칙(base_len + 생성 수, prefill 토큰 pos=base_len과
+        // 충돌하지 않게 +1)로 통일 — 구 vl은 prefill pos와 첫 생성 pos가
+        // 같은 값이었다(충돌).
+        let mut st = crate::engine::GenState {
+            finished,
+            gen_toks,
+            next,
+            pos: base_len.iter().map(|&b| b as u32).collect(),
+        };
+        let mut sink = VlSink { texts: &mut texts, eos };
+        crate::engine::generate_q35(&mut eng, &mut st, n_predict, spec_k, eos, &mut sink)?;
         Ok(())
     })();
     if let Err(e) = gen_res {
@@ -358,4 +277,24 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let _ = std::io::stdout().flush();
     eprintln!("# done");
     ExitCode::SUCCESS
+}
+
+/// vl 싱크 — 최종 텍스트 누적(eos 조각 제외) + JSONL(token만).
+struct VlSink<'a> {
+    texts: &'a mut Vec<String>,
+    eos: u32,
+}
+impl crate::engine::TokenSink for VlSink<'_> {
+    fn on_token(
+        &mut self,
+        s: usize,
+        pos: u32,
+        t: u32,
+        eng: &llm170_core::qwen35::Engine,
+    ) {
+        if t != self.eos {
+            self.texts[s].push_str(&eng.piece(t));
+        }
+        println!("{{\"seq\":{s},\"pos\":{pos},\"token\":{t}}}");
+    }
 }

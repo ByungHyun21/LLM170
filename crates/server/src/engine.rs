@@ -190,6 +190,138 @@ pub fn attach_q4(
     }
 }
 
+/// 생성 토큰 싱크 — 명령별 출력(JSONL text 포함/미포함·텍스트 누적) 차이를
+/// 흡수한다. eng는 읽기 전용 재차용: 디코드 mutable 차용이 끝난 시점에만
+/// 호출된다.
+pub trait TokenSink {
+    fn on_token(&mut self, s: usize, pos: u32, t: u32, eng: &llm170_core::qwen35::Engine);
+}
+
+/// qwen35 greedy 생성 상태 — 호출부가 prefill 결과로 시딩한다.
+pub struct GenState {
+    pub finished: Vec<bool>,
+    pub gen_toks: Vec<Vec<u32>>,
+    pub next: Vec<u32>,
+    /// 시퀀스별 절대 위치(프롬프트 길이 기준) — 토큰마다 +1.
+    pub pos: Vec<u32>,
+}
+
+/// 스펙 통계 — 요약 eprintln은 호출부 담당.
+#[derive(Default)]
+pub struct SpecStats {
+    pub cycles: usize,
+    pub accepted: usize,
+    pub target_forwards: usize,
+}
+
+/// qwen35 생성 루프 단일 구현 (plans/109 P4) — 종전 infer/vl이 3모드
+/// (spec-multi / spec-single / batch)를 각자 손베껴 썼다. 모드 선택:
+/// spec_k>0 && has_mtp && LLM170_SPEC_GPU → n>1: "spec-multi", n==1:
+/// "spec", 아니면 "batch". --spec 무시 안내(eos·MTP 부재)도 여기서.
+pub fn generate_q35(
+    eng: &mut llm170_core::qwen35::Engine,
+    st: &mut GenState,
+    n_predict: usize,
+    spec_k: usize,
+    eos: u32,
+    sink: &mut dyn TokenSink,
+) -> Result<(&'static str, SpecStats), String> {
+    let n = st.next.len();
+    let mut stats = SpecStats::default();
+    let spec_on = spec_k > 0
+        && eng.has_mtp()
+        && std::env::var_os("LLM170_SPEC_GPU").is_some();
+    if spec_k > 0 && !eng.has_mtp() {
+        eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
+    }
+    if spec_on && n > 1 {
+        // np×spec 병합 (plans/18)
+        let mut min_gen = st.gen_toks.iter().map(|g| g.len()).min().unwrap_or(0);
+        while min_gen <= n_predict {
+            let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
+            if active.is_empty() {
+                break;
+            }
+            let nexts: Vec<u32> = active.iter().map(|&s| st.next[s]).collect();
+            let acc = eng
+                .spec_step_multi(&active, &nexts, spec_k)
+                .map_err(|e| e.to_string())?;
+            stats.cycles += 1;
+            let mut any = false;
+            for (i, &s) in active.iter().enumerate() {
+                for &t in &acc[i] {
+                    if st.gen_toks[s].len() > n_predict {
+                        break;
+                    }
+                    st.pos[s] += 1;
+                    sink.on_token(s, st.pos[s], t, eng);
+                    st.gen_toks[s].push(t);
+                    st.next[s] = t;
+                    stats.accepted += 1;
+                    if t == eos {
+                        st.finished[s] = true;
+                    }
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+            min_gen = usize::MAX;
+            for (s, g) in st.gen_toks.iter().enumerate() {
+                if !st.finished[s] {
+                    min_gen = min_gen.min(g.len());
+                }
+            }
+        }
+        return Ok(("spec-multi", stats));
+    }
+    if spec_on {
+        let s = 0usize;
+        while st.gen_toks[s].len() <= n_predict && !st.finished[s] {
+            let (acc_toks, tf) = eng
+                .spec_step(s, st.next[s], spec_k)
+                .map_err(|e| e.to_string())?;
+            stats.cycles += 1;
+            stats.target_forwards += tf;
+            for &t in &acc_toks {
+                if st.gen_toks[s].len() > n_predict {
+                    break;
+                }
+                st.pos[s] += 1;
+                sink.on_token(s, st.pos[s], t, eng);
+                st.gen_toks[s].push(t);
+                st.next[s] = t;
+                stats.accepted += 1;
+                if t == eos {
+                    st.finished[s] = true;
+                }
+            }
+        }
+        return Ok(("spec", stats));
+    }
+    // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
+    for _step in 0..n_predict {
+        let active: Vec<usize> = (0..n).filter(|&s| !st.finished[s]).collect();
+        if active.is_empty() {
+            break;
+        }
+        let toks: Vec<u32> = active.iter().map(|&s| st.next[s]).collect();
+        let logits = eng.decode(&active, &toks).map_err(|e| e.to_string())?;
+        for (i, &s) in active.iter().enumerate() {
+            let t = llm170_core::qwen35::greedy(&logits[i]);
+            st.next[s] = t;
+            st.pos[s] += 1;
+            sink.on_token(s, st.pos[s], t, eng);
+            st.gen_toks[s].push(t);
+            if t == eos {
+                st.finished[s] = true;
+            }
+        }
+    }
+    Ok(("batch", stats))
+}
+
 pub struct InferResult {
     pub tokens: Vec<u32>,
 }
