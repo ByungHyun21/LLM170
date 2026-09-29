@@ -7,16 +7,6 @@
 use super::weight::Weight;
 
 pub trait GraphCapture: Send + Sync {
-    /// 그래프 캡처 시작/종료·재생 — 미지원 백엔드는 Err (드라이버가 폴백).
-    fn graph_capture_begin(&self) -> Result<(), String> {
-        Err("graph capture: 미지원".into())
-    }
-    fn graph_capture_end(&self) -> Result<(), String> {
-        Err("graph capture: 미지원".into())
-    }
-    fn graph_replay(&self, _on: bool) -> Result<(), String> {
-        Err("graph capture: 미지원".into())
-    }
     /// 비동기 프리필용 스트림 페어 전환 — on 이면 이후 발행이 프리필 전용
     /// 스트림 쌍(메인+사이드)으로 간다. 미지원 백엔드는 no-op.
     fn pre_pair(&self, _on: bool) {}
@@ -30,12 +20,6 @@ pub trait GraphCapture: Send + Sync {
     fn pre_join(&self) -> Result<(), String> {
         Ok(())
     }
-
-    /// 그래프 중단 — 캡처/재생 상태를 완전히 버리고 정상 런치로 되돌린다.
-    /// 폴백(프레임→value)처럼 실행 경로가 바뀔 때 반드시 호출해야 한다:
-    /// 백엔드가 Replay 모드로 남으면 이후 런치가 조용히 건너뛰어진다.
-    /// 기본 no-op — 그래프 미지원 백엔드는 상태가 없다.
-    fn graph_abort(&self) {}
 
     /// 그래프 캡처 세그먼트 경계 — 스텝 내 호스트 왕복(d2h/h2d) 지점에서 호출된다.
     /// 캡처 구현체는 이 지점에서 현재 세그먼트를 닫고 다음을 연다(재생 시엔 순서대로 발사).

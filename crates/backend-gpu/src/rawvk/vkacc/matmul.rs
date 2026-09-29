@@ -2,36 +2,6 @@
 
 use super::*;
 
-/// plans/93 — F32 바이트 → GGUF Q8_0 (f16 스케일 + 32×i8, 34B/블록).
-/// tile_q8128 커널이 기대하는 표준 레이아웃. 꼬리 블록 남은 원소는 0 패딩.
-fn f32_to_q8_0_bytes(data: &[u8], n_elem: usize) -> Vec<u8> {
-    let xf: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_elem) };
-    let blocks = n_elem.div_ceil(32);
-    let mut out = Vec::with_capacity(blocks * 34);
-    for b in 0..blocks {
-        let lo = b * 32;
-        let hi = (lo + 32).min(n_elem);
-        let mut amax = 0.0f32;
-        for &v in &xf[lo..hi] {
-            amax = amax.max(v.abs());
-        }
-        let d = amax / 127.0;
-        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-        // f16 인코딩 (ggml 규약: round-to-nearest-even 비트 절단)
-        let dbits = d.to_bits();
-        let f16 = (((dbits >> 16) & 0x8000)
-            | ((dbits >> 23) & 0xFF).saturating_sub(112) << 10
-            | ((dbits >> 13) & 0x3FF)) as u16;
-        out.extend_from_slice(&f16.to_le_bytes());
-        let mut pad = [0i8; 32];
-        for (j, &v) in xf[lo..hi].iter().enumerate() {
-            pad[j] = ((v * id).round()).clamp(-127.0, 127.0) as i8;
-        }
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(pad.as_ptr() as *const u8, 32) });
-    }
-    out
-}
-
 impl llm170_core::matmul::FrameHost for VkAcc {
     fn ktrace_tick(&self) {
         self.ts_tick();
@@ -959,57 +929,6 @@ impl VkAcc {
         hout: bool,
         xq_sep: bool,
     ) -> Result<(), String> {
-        // plans/93: F32 가중 → Q8_0 로드 시 변환(env 게이트 LLM170_F32Q8=1).
-        // tile_f32 347ms → tile_q8128 경로(~115ms): 가중 판독 4× 절감.
-        // conv_owned가 변환 바이트를 소유 — rebuilt는 이를 빌린다(스코프 내 생존).
-        let do_f32q8 = llm170_diag::flag::eq1("LLM170_F32Q8")
-            && ws.iter().any(|w| w.ty == llm170_gguf::GgmlType::F32);
-        // plans/93: 변환 캐시 — 가중(ptr,len)마다 1회 변환, 이후 Arc 클론.
-        // 소유권: Arc<Vec<u8>>가 살아있는 동안 슬라이스 유효 (conv_arcs가 보유).
-        let conv_arcs: Vec<std::sync::Arc<Vec<u8>>> = if do_f32q8 {
-            let mut cache = self.f32q8_cache.lock();
-            ws.iter()
-                .map(|w| {
-                    if w.ty != llm170_gguf::GgmlType::F32 {
-                        return std::sync::Arc::new(Vec::new());
-                    }
-                    let key = (w.data.as_ptr() as usize, w.data.len());
-                    cache
-                        .entry(key)
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(f32_to_q8_0_bytes(
-                                w.data,
-                                (w.n_in * w.n_out) as usize,
-                            ))
-                        })
-                        .clone()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let rebuilt: Vec<Weight> = conv_arcs
-            .iter()
-            .zip(ws.iter())
-            .map(|(c, w)| {
-                if c.is_empty() {
-                    Weight {
-                        data: w.data,
-                        ty: w.ty,
-                        n_in: w.n_in,
-                        n_out: w.n_out,
-                    }
-                } else {
-                    Weight {
-                        data: c.as_slice(),
-                        ty: llm170_gguf::GgmlType::Q8_0,
-                        n_in: w.n_in,
-                        n_out: w.n_out,
-                    }
-                }
-            })
-            .collect();
-        let ws: &[Weight] = if do_f32q8 { &rebuilt } else { ws };
         let n_in = ws[0].n_in as usize;
         let xq_w = xq_words(n_in);
         let mut ctx = self.ctx.lock();
@@ -1202,66 +1121,6 @@ impl VkAcc {
                         };
                     if dense_tile {
                         let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
-                        // plans/95 P3a — q8_0 밀집 MMQ: A·B 동일 레이아웃 int8
-                        // 직접 내적(니블 전개 없음). 가중은 업로드 시 무손실
-                        // 릴레이아웃(q8r 캐시, 1회). tile_q8128(coopmat f16,
-                        // 25GB/s) 대체. 킬스위치 구조 — opt-in =1.
-                        if t >= 2
-                            && w.ty == GgmlType::Q8_0
-                            && (llm170_diag::flag::eq1("LLM170_VK_Q8D")
-                                || llm170_diag::flag::eq1("LLM170_VK_Q8MMQ"))
-                        {
-                            let key = (w.data.as_ptr() as usize, w.data.len());
-                            let w8 = {
-                                let mut c = self.q8r_bufs.lock();
-                                if let Some(b) = c.get(&key) {
-                                    b.buf
-                                } else {
-                                    let bytes = q8_0_relayout(w.data, n_in, w.n_out as usize);
-                                    let b = ctx.alloc_host(bytes.len())?;
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            bytes.as_ptr(),
-                                            b.ptr,
-                                            bytes.len(),
-                                        )
-                                    };
-                                    let buf = b.buf;
-                                    c.insert(key, b);
-                                    buf
-                                }
-                            };
-                            let use_d = llm170_diag::flag::eq1("LLM170_VK_Q8D");
-                            let p = self.pipeline(
-                                &mut ctx,
-                                if use_d {
-                                    Slot::FnTileQ8d
-                                } else {
-                                    Slot::FnTileQ8mmq
-                                },
-                            )?;
-                            let mut binds: Vec<vk::Buffer> = vec![w8];
-                            while binds.len() < 8 {
-                                binds.push(dbuf);
-                            }
-                            binds.push(xq);
-                            binds.push(ob);
-                            let ds2 = ctx.bind_ds(&p, &binds)?;
-                            let push =
-                                push_u32s(&[n_in as u32, n_out as u32, t as u32, xq_w as u32]);
-                            ctx.run_rw(
-                                p.pl,
-                                ds2,
-                                p.pipe,
-                                &push,
-                                (n_out as u32).div_ceil(64),
-                                (t as u32).div_ceil(if use_d { 16 } else { 64 }),
-                                1,
-                                &[w8, xq],
-                                &[ob],
-                            )?;
-                            continue;
-                        }
                         let chunk_words = (ctx.max_ssbo / 4) as u32;
                         let mut binds: Vec<vk::Buffer> = wbufs.clone();
                         while binds.len() < 8 {
@@ -1370,70 +1229,6 @@ impl VkAcc {
                                     continue;
                                 }
                                 let gys = (t as u32).div_ceil(128);
-                                // plans/102: 스키니(n_out≤512) q8_0 → K-분할판.
-                                // 점유 붕괴(WG 20개·6GB/s) 치유 — z=K슬라이스.
-                                let skinny = w.ty == GgmlType::Q8_0
-                                    && n_out
-                                        <= std::env::var("LLM170_VK_Q8K_MAX")
-                                            .ok()
-                                            .and_then(|v| v.parse::<usize>().ok())
-                                            .unwrap_or(0)
-                                    && t >= 128
-                                    && !hout
-                                    && llm170_diag::flag::ne0("LLM170_VK_Q8K");
-                                if skinny {
-                                    let ks: u32 = ((n_in.div_ceil(256) as u32) / 8).clamp(2, 8);
-                                    let need = ks as usize * t * n_out * 4;
-                                    let scr = {
-                                        let mut g = self.ks_scratch.lock();
-                                        if g.as_ref().map(|b| b.bytes >= need).unwrap_or(false) {
-                                            g.as_ref().unwrap().buf
-                                        } else {
-                                            let b = ctx.alloc(need)?;
-                                            *g = Some(b);
-                                            g.as_ref().unwrap().buf
-                                        }
-                                    };
-                                    binds.push(scr);
-                                    let p2 = self.pipeline(&mut ctx, Slot::TileQ8ks)?;
-                                    let ds3 = ctx.bind_ds(&p2, &binds)?;
-                                    let push = push_u32s(&[
-                                        n_in as u32,
-                                        n_out as u32,
-                                        xq_w as u32,
-                                        t as u32,
-                                        0u32,
-                                        ks,
-                                    ]);
-                                    ctx.run_rw(
-                                        p2.pl,
-                                        ds3,
-                                        p2.pipe,
-                                        &push,
-                                        gys,
-                                        gx,
-                                        ks,
-                                        &binds,
-                                        &[scr],
-                                    )?;
-                                    // 축소: out = Σ_s 부분합(결정론 순서).
-                                    let pr = self.pipeline(&mut ctx, Slot::FnKsred)?;
-                                    let dsr = ctx.bind_ds(&pr, &[ob, scr])?;
-                                    let n_tot = (t * n_out) as u32;
-                                    let pushr = push_u32s(&[n_tot, ks]);
-                                    ctx.run_rw(
-                                        pr.pl,
-                                        dsr,
-                                        pr.pipe,
-                                        &pushr,
-                                        n_tot.div_ceil(128),
-                                        1,
-                                        1,
-                                        &[scr],
-                                        &[ob],
-                                    )?;
-                                    continue;
-                                }
                                 // plans/101 P1: hout=1 → outv packed f16(HC gate 축).
                                 let push = push_u32s(&[
                                     n_in as u32,

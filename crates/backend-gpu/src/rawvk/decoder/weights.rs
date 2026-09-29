@@ -203,9 +203,7 @@ impl DecoderState {
 
         let n_full = is_recr.iter().filter(|&&r| !r).count();
         let n_recr = is_recr.len() - n_full;
-        let kv8 = llm170_diag::flag::eq1("LLM170_VK_KV8");
-        let kv_store: usize = if kv8 { kv_len / 32 * 34 } else { kv_len * 4 };
-        let zeros_kv = vec![0u8; kv_store];
+        let zeros_kv = vec![0u8; kv_len * 4];
         let mut kv_k = Vec::with_capacity(n_full);
         let mut kv_v = Vec::with_capacity(n_full);
         for _ in 0..n_full {
@@ -333,7 +331,7 @@ impl DecoderState {
         // ── MTP (blk.64) 상주 상태 — has_mtp 시에만.
         let (mut mkk, mut mvv) = (Vec::new(), Vec::new());
         if mtp_on {
-            let zeros = vec![0u8; kv_store];
+            let zeros = vec![0u8; kv_len * 4];
             for _ in 0..n_seqs {
                 let k = ctx.alloc(kv_len * 4)?;
                 unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), k.ptr, zeros.len()) };

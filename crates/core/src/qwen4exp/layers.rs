@@ -75,9 +75,6 @@ pub struct Engine4 {
     pub frame: Option<super::frame::Frame4>,
     /// 프레임 폴백 확정 — 상주 불가 등 오류 시 value 경로로 영구 전환.
     frame_broken: bool,
-    /// 디코드 그래프 캡처(LLM170_GRAPH=1) — 0=워밍, 1=캡처, 2+=재생.
-    graph_want: bool,
-    graph_step: usize,
     /// PLE 프리페치 (05-2) — 토큰 t 확정 직후 t+1분 16행×ple_head_dim을
     /// 사이드 스레드에서 mmap 읽기+디양자화. 다음 decode의 ple_block이 소비.
     pub ple_next: Option<std::sync::Arc<std::sync::Mutex<PlePrefetched>>>,
@@ -159,8 +156,6 @@ impl Engine4 {
             acc: None,
             frame: None,
             frame_broken: false,
-            graph_want: std::env::var_os("LLM170_GRAPH").is_some(),
-            graph_step: 0,
             ple_next: None,
             ple_consume: None,
             ple_worker: None,
@@ -896,23 +891,7 @@ impl Engine4 {
                 model: &self.model,
                 acc: Some(acc),
             };
-            // 그래프 캡처(LLM170_GRAPH=1) — value 경로와 동일 규약: 스텝0 = 워밍,
-            // 스텝1 = 캡처(결과 폐기 후 같은 토큰 즉시 재생), 스텝2+ = 재생.
-            // 프레임 디코드는 커널 수가 많아(≈1000) 런치 간극이 스텝의 12-18%다 —
-            // 그래프로 굳히면 그 간극이 사라진다(2026-09-17, value 경로 실측 +5.1%).
-            let cap = self.graph_want;
-            let cap_step = cap && self.graph_step == 1;
-            let rep_step = cap && self.graph_step >= 2;
-            if cap_step {
-                if let Err(e) = acc.graph_capture_begin() {
-                    eprintln!("# graph(frame): 캡처 시작 실패 — 정상 경로 ({e})");
-                    self.graph_want = false;
-                }
-            } else if rep_step && let Err(e) = acc.graph_replay(true) {
-                eprintln!("# graph(frame): 재생 실패 — 정상 경로 ({e})");
-                self.graph_want = false;
-            }
-            let r0 = super::frame::decode_frame_greedy(
+            super::frame::decode_frame_greedy(
                 acc,
                 &self.model,
                 &ctx,
@@ -920,43 +899,7 @@ impl Engine4 {
                 &mut self.seqs[seq],
                 f,
                 token,
-            );
-            if cap_step {
-                match acc.graph_capture_end() {
-                    Err(e) => {
-                        eprintln!("# graph(frame): 캡처 실패 — 정상 경로 유지 ({e})");
-                        self.graph_want = false;
-                        r0
-                    }
-                    Ok(()) => match acc.graph_replay(true) {
-                        Err(e) => {
-                            eprintln!("# graph(frame): 재생 실패 — 정상 경로 ({e})");
-                            self.graph_want = false;
-                            r0
-                        }
-                        Ok(()) => {
-                            let r1 = super::frame::decode_frame_greedy(
-                                acc,
-                                &self.model,
-                                &ctx,
-                                seq,
-                                &mut self.seqs[seq],
-                                f,
-                                token,
-                            );
-                            let _ = acc.graph_replay(false);
-                            self.graph_step += 1;
-                            r1
-                        }
-                    },
-                }
-            } else {
-                if rep_step {
-                    let _ = acc.graph_replay(false);
-                    self.graph_step += 1;
-                }
-                r0
-            }
+            )
         })();
         match r {
             Ok(tok) => {
@@ -964,14 +907,6 @@ impl Engine4 {
                 Ok(tok)
             }
             Err(e) => {
-                // 그래프 상태가 걸린 채 value 경로로 넘어가면 백엔드가 Replay 모드로
-                // 남아 런치를 건너뛴다 — 폴백 시 그래프를 먼저 중단한다.
-                if self.graph_step > 0
-                    && let Some(a) = self.acc.as_deref()
-                {
-                    a.graph_abort()
-                }
-                self.graph_want = false;
                 self.frame = None;
                 self.frame_broken = true;
                 super::frame::ple_restore(&mut self.seqs[seq], ple0);
@@ -1038,22 +973,6 @@ impl Engine4 {
         ) {
             let acc = self.acc.as_deref().unwrap();
             let f = self.frame.as_mut().unwrap();
-            // 그래프 캡처(LLM170_GRAPH=1): 스텝1 = 캡처, 스텝2+ = 재생.
-            // 캡처 중에는 커널이 *기록만* 되고 실행되지 않으므로(상태 미진행,
-            // 호스트 판독은 직전 값) 캡처 스텝은 결과를 버리고 같은 토큰으로
-            // 즉시 재생해 실제 진행·정답 로짓을 얻는다.
-            let cap = self.graph_want;
-            let cap_step = cap && self.graph_step == 1;
-            let rep_step = cap && self.graph_step >= 2;
-            if cap_step {
-                if let Err(e) = acc.graph_capture_begin() {
-                    eprintln!("# graph: 캡처 시작 실패 — 정상 경로 ({e})");
-                    self.graph_want = false;
-                }
-            } else if rep_step && let Err(e) = acc.graph_replay(true) {
-                eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
-                self.graph_want = false;
-            }
             // plans/86 §3 — 트랜잭션: 시도 전 PLE 상태 스냅샷, Err 시 복원 후
             // 값경로 폴백(이중 진화 방지).
             let ple0 = super::frame::ple_snap(&self.seqs[seq]);
@@ -1075,35 +994,7 @@ impl Engine4 {
                     token,
                 )
             };
-            let r0 = run_step();
-            let r = if cap_step {
-                let close = acc.graph_capture_end();
-                match close {
-                    Err(e) => {
-                        eprintln!("# graph: 캡처 실패 — 정상 경로 유지 ({e})");
-                        self.graph_want = false;
-                        r0
-                    }
-                    Ok(()) => {
-                        if let Err(e) = acc.graph_replay(true) {
-                            eprintln!("# graph: 재생 실패 — 정상 경로 ({e})");
-                            self.graph_want = false;
-                            r0
-                        } else {
-                            let r1 = run_step();
-                            let _ = acc.graph_replay(false);
-                            self.graph_step += 1;
-                            r1
-                        }
-                    }
-                }
-            } else {
-                if rep_step {
-                    let _ = acc.graph_replay(false);
-                    self.graph_step += 1;
-                }
-                r0
-            };
+            let r = run_step();
             match r {
                 Ok(l) => l,
                 Err(e) => {
