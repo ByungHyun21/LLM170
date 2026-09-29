@@ -3219,3 +3219,17 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - **잔여(④c-2)**: 드래프트 레이어-48 GPU 커널화(dense_attn·eh_proj·MoE —
   현재 CPU 수 초/스텝). 계약은 mtp_draft_step_h에 확정.
 - 게이트: charhash 15,674 동일·FN hip/vk·27B PASS·preflight 6/6. main 머지.
+
+### (122) MTP 드래프트 GPU GEMV 라우팅 — 수용 0.85·종단 30% 단축 (plans/109 P15④c-2, 2026-09-29)
+
+- Ctx mm/mm_group/mm_paired/mm_batch에 백엔드 미지원 타입(q5_0 — Q4_K_M
+  모듈) CPU 폴백 추가(가시 로그). mtp_draft_step_h·mtp_dense_attn가
+  Option<&dyn Accelerator> 수신 — eh_proj·q/k/v/o·hc down/up·MoE 전문가
+  GEMV가 GPU 값경로로 라우팅. dense 어텐션 softmax/KV는 CPU 유지(경량).
+- 실측(hip, FN, --spec 3, 자연어 게이트 프롬프트): Q8_0 44.1s·Q4_K_M 45.8s
+  /16라운드(CPU 드래프트 65.6s 대비 **−30%**), 수용 **0.85 tok/fwd**(양
+  모듈 동일 — Q4_K_M 채택 유지).
+- 잔여 병목: 값경로 GEMV는 호출당 h2d+d2h 동기(~5ms) — 스텝당 ~25회 =
+  ~125ms. 프레임 경로(상주 버퍼·동기 회피)로 드래프트 스텝당 <10ms 달성
+  가능하나 별도 커널 배치화 작업(후속).
+- 게이트: charhash 15,674 동일·FN hip/vk·27B PASS·preflight 6/6.
