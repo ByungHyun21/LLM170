@@ -7,6 +7,8 @@ use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 mod gemv;
 mod spec;
 mod step;
+mod step_batch;
+mod step_np;
 mod weights;
 use ash::vk;
 use std::collections::HashMap;
