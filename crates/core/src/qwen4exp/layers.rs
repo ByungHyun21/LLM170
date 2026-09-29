@@ -449,6 +449,7 @@ impl Engine4 {
                     Ok(f) => self.frame = Some(f),
                     Err(e) => {
                         self.frame_broken = true;
+                        crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                         eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                     }
                 }
@@ -547,6 +548,7 @@ impl Engine4 {
                 Ok(f) => self.frame = Some(f),
                 Err(e) => {
                     self.frame_broken = true;
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                     let l = self.prefill(seq, tokens)?;
                     return Ok(crate::qwen35::greedy(&l));
@@ -685,6 +687,7 @@ impl Engine4 {
                 Ok(f) => self.frame = Some(f),
                 Err(e) => {
                     self.frame_broken = true;
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                 }
             }
@@ -728,6 +731,7 @@ impl Engine4 {
                     }
                 }
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreateNp);
                 ONCE.call_once(|| eprintln!("# frame-np: 배치 디코드 실패 — 순차 폴백 ({e})"));
                 let mut out = Vec::with_capacity(seqs.len());
                 for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
@@ -778,6 +782,7 @@ impl Engine4 {
                 Ok(f) => self.frame = Some(f),
                 Err(e) => {
                     self.frame_broken = true;
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                 }
             }
@@ -836,6 +841,7 @@ impl Engine4 {
                     }
                 }
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreateNp);
                 ONCE.call_once(|| eprintln!("# frame-np-greedy: 배치 실패 — 순차 폴백 ({e})"));
                 let mut out = Vec::with_capacity(seqs.len());
                 for (&s, &tk) in seqs.iter().zip(tokens.iter()) {
@@ -870,6 +876,7 @@ impl Engine4 {
                 Ok(f) => self.frame = Some(f),
                 Err(e) => {
                     self.frame_broken = true;
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                     eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                     let l = self.decode1(seq, token)?;
                     return Ok(crate::qwen35::greedy(&l));
@@ -915,6 +922,7 @@ impl Engine4 {
                     a.frame_sync();
                 }
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                 ONCE.call_once(|| eprintln!("# frame-greedy: 디코드 실패 — 폴백 ({e})"));
                 let l = self.decode1(seq, token)?;
                 Ok(crate::qwen35::greedy(&l))
@@ -954,6 +962,7 @@ impl Engine4 {
                     }
                     Err(e) => {
                         self.frame_broken = true;
+                        crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                         eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
                         None
                     }
@@ -1005,6 +1014,7 @@ impl Engine4 {
                     if let Some(a) = self.acc.as_deref() {
                         a.frame_sync();
                     }
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
                     eprintln!("# frame: 디코드 실패 — value 경로 폴백 ({e})");
                     self.forward_timed(seq, &[token])?
                 }

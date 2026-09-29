@@ -89,6 +89,7 @@ pub(crate) fn frame_forward_ex(
                 .is_ok();
             if !gpu_ok {
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::EmbQ8g);
                 ONCE.call_once(|| eprintln!("# emb-q8g: 실패 — CPU 폴백"));
             }
         }
@@ -234,6 +235,9 @@ pub(crate) fn frame_forward_ex(
                             Ok(()) => true,
                             Err(e) => {
                                 static ONCE: std::sync::Once = std::sync::Once::new();
+                                crate::qwen4exp::frame::fb_incr(
+                                    crate::qwen4exp::frame::FbId::PleGgpu,
+                                );
                                 ONCE.call_once(|| {
                                     eprintln!("# ple-ggpu: 실패 — CPU MT 폴백 ({e})")
                                 });
@@ -797,6 +801,7 @@ pub(super) fn qsa_frame(
             }
             Err(e) => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::QsaDevsel);
                 ONCE.call_once(|| eprintln!("# qsa-frame: 디바이스 선택 폴백 — 호스트 경로 ({e})"));
             }
         }
@@ -906,6 +911,7 @@ pub(super) fn qsa_frame(
             }
             Err(e) => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
+                crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::QsaDevselMt);
                 ONCE.call_once(|| {
                     eprintln!("# qsa-frame: 다중 토큰 디바이스 선택 폴백 — 호스트 경로 ({e})")
                 });
@@ -974,6 +980,7 @@ pub(super) fn qsa_frame(
             hp.eps,
         ) {
             static ONCE: std::sync::Once = std::sync::Once::new();
+            crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::QsaIdxpool);
             ONCE.call_once(|| eprintln!("# qsa-frame: idx 풀 적립 실패(디코드 폴백 예정) — {e}"));
         }
     }
@@ -1011,6 +1018,7 @@ pub(super) fn qsa_frame(
     });
     if let Err(e) = attn {
         static ONCE: std::sync::Once = std::sync::Once::new();
+        crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::QsaAttn);
         ONCE.call_once(|| eprintln!("# qsa-frame: GPU 어텐션 폴백 — CPU 재계산 ({e})"));
         let mut q_v = vec![0.0f32; t * n_head * 2 * hd];
         acc.frame_read(b.q, &mut q_v).map_err(Q4Error::Io)?;
