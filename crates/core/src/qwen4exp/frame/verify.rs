@@ -155,6 +155,15 @@ pub(crate) fn frame_forward_verify(
         moe_frame_np(acc, model, f, il, n, &seqs)?;
         fs_begin(acc, t); // moe_frame_np가 t_cur를 1로 내린다 — 복원(np 관례)
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
+        // W3 진단: 스테이지 체크섬(il<4) — t≥2 공유구간과 t=1의 첫 발산
+        // 지점 특정. 태그 접두 V(verify)로 npck 스트림에서 분리.
+        if il < 4 && llm170_diag::dump::opts().checksum {
+            super::diag::frame_ck(acc, f.mix, n, t, &format!("V{il}.mix"));
+            super::diag::frame_ck(acc, f.ffn_out, n, t, &format!("V{il}.attn"));
+            super::diag::frame_ck(acc, f.mix, n, t, &format!("V{il}.mixf"));
+            super::diag::frame_ck(acc, f.mout, n, t, &format!("V{il}.moe"));
+            super::diag::frame_ck(acc, f.res_hc, hc * n, t, &format!("V{il}.res"));
+        }
     }
 
     // 5) pre-mixer res_hc 행 export — 다음 라운드 드래프트 h 입력.
