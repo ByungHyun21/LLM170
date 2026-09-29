@@ -12,6 +12,7 @@ use crate::quant::dequant_row;
 use llm170_diag::profile_span;
 
 /// 시퀀스 상태 — GDN S/conv, QSA KV+인덱서 캐시, PLE conv 히스토리·n-gram 히스토리.
+#[derive(Clone)]
 pub struct SeqState4 {
     pub pos: u32,
     /// GDN층 S 상태 [dt_rank×d_state×d_state] (순환층 순서)
@@ -221,6 +222,87 @@ impl Engine4 {
     ///   hc_combine → hc_mix(ffn) → MoE → hc_combine →
     ///   hc_mix(nextn.hc_head) → output(@본체 공유) → logits.
     /// 드래프트 상태 pos는 호출부가 1씩 진행(mtp_seqs[seq].pos).
+    /// MTP 스펙 스텝 (plans/109 P15③, CPU 참조판) — 드래프트 k-1토oken 체인
+    /// 제안 + 타깃 순차 디코드 검증. q35 spec_step과 동일 계약:
+    /// 반환 (수용 토큰열[보너스 포함], 타깃 forward 수).
+    /// 상태 안전: 검증 전 타깃+드래프트 상태를 스냅샷해 거부 시 복원
+    /// (SeqState4는 Vec 필드라 clone이 완전 복사). 값경로 전제 — 프레임
+    /// 경로는 ④에서 프레임 트랜잭션(plans/86 §3)으로 동일 보장.
+    pub fn mtp_spec_step(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<(Vec<u32>, usize), Q4Error> {
+        if k == 0 || !self.model.has_mtp() {
+            return Ok((Vec::new(), 0));
+        }
+        // ① 타깃 1 forward — 첫 토큰(무조건 수용) + 드래프트 입력 h.
+        let l = self.decode1(seq, last_token)?;
+        let t0 = crate::qwen35::greedy(&l);
+        let mut forwards = 1usize;
+        // ② 드래프트 체인 — t0부터 최대 k-1개 제안.
+        let mut proposals: Vec<u32> = Vec::new();
+        let mut next = t0;
+        for _ in 0..k.saturating_sub(1) {
+            let h = self.last_h.clone();
+            let lg = self.mtp_draft_step(seq, next, &h)?;
+            proposals.push(next);
+            next = crate::qwen35::greedy(&lg);
+        }
+        // ③ 검증 — 상태 스냅샷 → 제안 순차 타깃 디코드 → 수용 접두 결정 →
+        // 필요시 복원 후 수용분만 재적립.
+        let snap_t = self.seqs[seq].clone();
+        let snap_d = self.mtp_seqs[seq].clone();
+        let mut tgt_out = Vec::new();
+        for &p in &proposals {
+            let l = self.decode1(seq, p)?;
+            forwards += 1;
+            tgt_out.push(crate::qwen35::greedy(&l));
+        }
+        // 수용: 제안 p_i 이후 타깃 argmax가 p_{i+1}와 일치해야 p_{i+1} 수용.
+        let mut n_acc = proposals.len();
+        for i in 0..proposals.len() {
+            let expect = proposals.get(i + 1).copied();
+            match expect {
+                Some(e) if tgt_out[i] != e => {
+                    n_acc = i;
+                    break;
+                }
+                None => {}
+                _ => {}
+            }
+        }
+        // 거부 발생 시 복원 → 수용분(t0 + p_1..p_{n_acc+1}) 재디코드.
+        // (전 수용이면 타깃 상태가 이미 정확히 전진 — 재디코드 불요, 보너스만.)
+        let mut accepted = Vec::with_capacity(n_acc + 2);
+        accepted.push(t0);
+        if n_acc + 1 >= proposals.len() {
+            // 전 제안 수용 — 마지막 타깃 출력이 보너스.
+            accepted.extend_from_slice(&proposals[1..]);
+            accepted.push(*tgt_out.last().unwrap_or(&t0));
+        } else {
+            // 복원 후 수용 접두만 재적립 (t0는 이미 커밋된 ① 상태에 포함).
+            self.seqs[seq] = snap_t;
+            self.mtp_seqs[seq] = snap_d;
+            // t0 재확보(상태 복원으로 last_h도 이전 값) — t0 1 forward.
+            let l = self.decode1(seq, last_token)?;
+            forwards += 1;
+            debug_assert_eq!(crate::qwen35::greedy(&l), t0);
+            // 수용분 재적립 — t0 이후 제안 p_1..p_{n_acc}(t0 자체는 위에서
+            // 이미 커밋됨 — proposals[0]은 t0라 건너뛴다).
+            if n_acc >= 1 {
+                for &p in &proposals[1..=n_acc] {
+                    self.decode1(seq, p)?;
+                    forwards += 1;
+                }
+            }
+            accepted.extend_from_slice(&proposals[1..=n_acc.min(proposals.len() - 1)]);
+            accepted.push(tgt_out[n_acc]);
+        }
+        Ok((accepted, forwards))
+    }
+
     /// MTP dense 게이트드 어텐션 (plans/109 P15②) — 트렁크 cpu_attn_row와
     /// 동일 산술(마스크=전체 참석) + q/k norm·rope + KV 적립 + wo.
     fn mtp_dense_attn(
