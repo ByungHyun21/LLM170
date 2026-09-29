@@ -421,6 +421,7 @@ fn run_and_emit(
         stops,
         progress: stream_mode.then_some(ptx),
         out: otx,
+        queued: std::time::Instant::now(),
     };
     if tx.try_send(job).is_err() {
         resp(
@@ -488,6 +489,7 @@ fn run_and_emit_anthropic(
         stops: vec![STOP_EOT],
         progress: stream_mode.then_some(ptx),
         out: otx,
+        queued: std::time::Instant::now(),
     };
     if tx.try_send(job).is_err() {
         resp(

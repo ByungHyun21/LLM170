@@ -1,6 +1,7 @@
 //! 엔진 파사드 — qwen35/qwen4exp 통합, 아키텍처 자동 판별.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub enum BackendSel {
     Cpu,
@@ -99,6 +100,8 @@ pub struct SlotJob {
     pub progress: Option<std::sync::mpsc::Sender<u32>>,
     /// 최종 결과 송신.
     pub out: std::sync::mpsc::Sender<InferResult>,
+    /// 108 P5: 큐 진입 시각 — 배정까지 대기(큐 적체·슬롯 부족 계측).
+    pub queued: std::time::Instant,
 }
 struct Slot {
     job: Option<SlotJob>,
@@ -209,6 +212,47 @@ fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[u
 /// 연속 배칭 루프 (04-2). 매 반복: ① 큐 drain → LRU 가용 슬롯 배정
 /// ② 디코드 우선(활성 전 슬롯 — q35는 1배치 호출, q4는 슬롯별 decode1)
 /// ③ 디코드한 스텝이 없으면 프리필 1청크. 완료/EOS → 슬롯 반환(reset_seq).
+/// 108 P5 — 스케줄러 계측(원자). serve 종료 시 요약.
+pub static SCHED: Sched = Sched {
+    jobs: AtomicU64::new(0),
+    queue_wait_us: AtomicU64::new(0),
+    prefix_tokens: AtomicU64::new(0),
+    ticks_decode: AtomicU64::new(0),
+    ms_decode: AtomicU64::new(0),
+    chunks_prefill: AtomicU64::new(0),
+    ms_prefill: AtomicU64::new(0),
+};
+pub struct Sched {
+    pub jobs: AtomicU64,
+    pub queue_wait_us: AtomicU64,
+    pub prefix_tokens: AtomicU64,
+    pub ticks_decode: AtomicU64,
+    pub ms_decode: AtomicU64,
+    pub chunks_prefill: AtomicU64,
+    pub ms_prefill: AtomicU64,
+}
+impl Sched {
+    pub fn summary(&self) -> String {
+        let jobs = self.jobs.load(Ordering::Relaxed);
+        let qw = self.queue_wait_us.load(Ordering::Relaxed);
+        let px = self.prefix_tokens.load(Ordering::Relaxed);
+        let td = self.ticks_decode.load(Ordering::Relaxed);
+        let md = self.ms_decode.load(Ordering::Relaxed);
+        let cp = self.chunks_prefill.load(Ordering::Relaxed);
+        let mp = self.ms_prefill.load(Ordering::Relaxed);
+        format!(
+            "[sched] jobs {jobs} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms",
+            if jobs > 0 {
+                qw as f64 / jobs as f64 / 1e3
+            } else {
+                0.0
+            },
+            if td > 0 { md as f64 / td as f64 } else { 0.0 },
+            if cp > 0 { mp as f64 / cp as f64 } else { 0.0 },
+        )
+    }
+}
+
 pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slots: usize) {
     const EOS: u32 = 248044;
     // 기동 워밍업 — 첫 요청이 지연 초기화(raw_init, ctx 비례 수십 초)를
@@ -515,6 +559,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 }
                 n_pf += 1;
                 ms_pf += _pft.elapsed().as_secs_f64() * 1e3;
+                SCHED.chunks_prefill.fetch_add(1, Ordering::Relaxed);
+                SCHED.ms_prefill.fetch_add(
+                    (_pft.elapsed().as_secs_f64() * 1e3) as u64,
+                    Ordering::Relaxed,
+                );
                 if let Ok(t) = logits {
                     slots[i].prefilled = start;
                     if start == slots[i].job.as_ref().unwrap().tokens.len() {
@@ -528,13 +577,16 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
         if decoded {
             n_dec += 1;
             ms_dec += dec_ms;
+            SCHED.ticks_decode.fetch_add(1, Ordering::Relaxed);
+            SCHED.ms_decode.fetch_add(dec_ms as u64, Ordering::Relaxed);
             if llm170_diag::dump::opts().key("srv_time") && n_dec % 32 == 0 {
                 eprintln!(
-                    "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms",
+                    "[srv] steps={} decode avg {:.1}ms | prefill {}x avg {:.1}ms | {}",
                     n_dec,
                     ms_dec / n_dec as f64,
                     n_pf,
-                    if n_pf > 0 { ms_pf / n_pf as f64 } else { 0.0 }
+                    if n_pf > 0 { ms_pf / n_pf as f64 } else { 0.0 },
+                    SCHED.summary()
                 );
             }
         }
@@ -550,12 +602,17 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             }
         }
     }
+    eprintln!("{}", SCHED.summary());
 }
 
 /// 슬롯 배정 단일 구현 (107 W7: drain/유휴 이중 복제 통합).
 /// 접두 캐시 최장 일치 슬롯 선택(전 슬롯 대상 — 종전 유휴 경로는
 /// slot0 고정이었음), 재사용 시 reset 생략, 샘플러 시딩 포함.
 fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
+    SCHED
+        .queue_wait_us
+        .fetch_add(j.queued.elapsed().as_micros() as u64, Ordering::Relaxed);
+    SCHED.jobs.fetch_add(1, Ordering::Relaxed);
     let prefix_ok = !llm170_diag::flag::on("LLM170_NO_PREFIX");
     let pick = (0..slots.len())
         .filter(|&i| slots[i].job.is_none())
@@ -578,6 +635,9 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
     if reuse == 0 {
         eng.reset_seq(i);
     } else {
+        SCHED
+            .prefix_tokens
+            .fetch_add(reuse as u64, Ordering::Relaxed);
         eprintln!("# prefix-cache: slot{i} reuse {reuse}토큰");
     }
     let prev = std::mem::take(&mut slots[i].cached);
