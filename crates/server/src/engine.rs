@@ -15,6 +15,8 @@ pub enum BackendSel {
 pub struct InferRequest {
     pub model: PathBuf,
     pub ctx: usize,
+    /// 외장 MTP 모듈 경로(plans/109 P15⑤) — None이면 --spec>0 시 자동 탐지.
+    pub mtp: Option<PathBuf>,
 }
 
 /// qwen4exp GPU 경로 요청 여부 (plans/64 P1).
@@ -66,6 +68,58 @@ pub fn q4_gpu_wanted_str(backend: &str, runtime: &str) -> bool {
         );
     }
     true
+}
+
+/// q4 모델에 외장 MTP 모듈 병합 (plans/109 P15⑤) — `--mtp` 우선, 없으면
+/// spec 의도(spec_k>0)일 때 모델 형제의 `mtp-*.gguf` 자동 탐지(Q8_0 우선).
+/// 성공/생략은 로그로만 — 실패(명시 지정인데 깨짐)는 Err.
+pub fn apply_mtp(
+    m: &mut llm170_core::qwen4exp::Model4,
+    model_path: &std::path::Path,
+    mtp_arg: Option<&std::path::Path>,
+    spec_k: usize,
+) -> Result<(), String> {
+    let pick: Option<std::path::PathBuf> = match mtp_arg {
+        Some(p) => Some(p.to_path_buf()),
+        None if spec_k > 0 => {
+            let dir = model_path.parent().unwrap_or(std::path::Path::new("."));
+            let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("mtp-") && n.ends_with(".gguf"))
+                })
+                .collect();
+            hits.sort(); // Q4_K_M < Q8_0 — Q8 우선은 아래에서.
+            hits.sort_by_key(|p| {
+                // Q8_0 우선(드래프트 품질) — ⑥ 측정 전 임시 기본.
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("Q8"))
+            });
+            hits.into_iter().next()
+        }
+        None => None,
+    };
+    match pick {
+        Some(p) => {
+            m.load_mtp(&p).map_err(|e| e.to_string())?;
+            eprintln!("# mtp: 외장 nextn 모듈 병합 — {}", p.display());
+            Ok(())
+        }
+        None if spec_k > 0 => {
+            eprintln!(
+                "# mtp: --spec {} 지정이나 mtp-*.gguf 미발견 — 스펙 없이 진행",
+                spec_k
+            );
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 
 /// CLI 문자열판 vulkan 선택 (plans/84 B).
@@ -428,6 +482,56 @@ fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
     }
 }
 
+/// Q4 배치/순차 디코드(종전 Q4 arm 본체 — P15⑤ 스펙 분기로부터 분리).
+fn q4_plain_decode(
+    e: &mut Box<llm170_core::qwen4exp::layers::Engine4>,
+    slots: &mut [Slot],
+    active: &[usize],
+) {
+    if active
+        .iter()
+        .any(|&i| slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()))
+    {
+        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+        match e.decode_batch(active, &toks) {
+            Ok(rows) => {
+                for (row, &i) in active.iter().enumerate() {
+                    let t = pick(&mut slots[i], &rows[row]);
+                    slot_emit(&mut slots[i], t);
+                }
+            }
+            Err(err) => eprintln!("# batch 실패({err}) — 이번 회차 건너뜀"),
+        }
+    } else if active.len() > 1 {
+        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
+        match e.decode_batch_greedy(active, &toks) {
+            Ok(toks) => {
+                for (row, &i) in active.iter().enumerate() {
+                    slot_emit(&mut slots[i], toks[row]);
+                }
+            }
+            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
+        }
+    } else {
+        for &i in active {
+            if slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()) {
+                match e.decode1(i, slots[i].next) {
+                    Ok(l) => {
+                        let t = pick(&mut slots[i], &l);
+                        slot_emit(&mut slots[i], t);
+                    }
+                    Err(err) => eprintln!("# decode1 실패({err})"),
+                }
+            } else {
+                match e.decode1_greedy(i, slots[i].next) {
+                    Ok(t) => slot_emit(&mut slots[i], t),
+                    Err(err) => eprintln!("# decode1g 실패({err})"),
+                }
+            }
+        }
+    }
+}
+
 /// Q35 np 디코드 — 샘플링 슬롯 포함시 logits 경로(decode), 아니면 GPU argmax 판.
 fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[usize]) {
     let toks: Vec<u32> = seqs.iter().map(|&i| slots[i].next).collect();
@@ -646,51 +750,53 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     }
                 }
                 Engine::Q4(e) => {
-                    // plans/73(np): 활성 2+ 슬롯은 배치 디코드(무게 스트리밍 공유).
-                    // 실패 시 decode_batch 내부가 순차 decode1로 폴백한다.
-                    // 샘플링 슬롯 포함시 logits 판으로.
-                    if active.iter().any(|&i| sampling(&slots[i])) {
-                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-                        match e.decode_batch(&active, &toks) {
-                            Ok(rows) => {
-                                for (row, &i) in active.iter().enumerate() {
-                                    let t = pick(&mut slots[i], &rows[row]);
-                                    slot_emit(&mut slots[i], t);
+                    // plans/109 P15⑤: MTP 스펙 슬롯 우선 — mtp_spec_step으로
+                    // k토근 제안·검증(수용분 emit). 잔여 슬롯은 종전 배치 디코드.
+                    // CPU 참조 드래프트 — ④ GPU화 전까지 느리다(스펙 슬롯만).
+                    let spec_slots: Vec<usize> = active
+                        .iter()
+                        .copied()
+                        .filter(|&i| {
+                            slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0)
+                                && !sampling(&slots[i])
+                        })
+                        .collect();
+                    if !spec_slots.is_empty() && e.model.has_mtp() {
+                        for &i in &spec_slots {
+                            let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
+                            let next = slots[i].next;
+                            let cap = slots[i].job.as_ref().unwrap().n_predict;
+                            match e.mtp_spec_step(i, next, k) {
+                                Ok((acc, _fwd)) => {
+                                    for &t in &acc {
+                                        if slots[i].generated as usize >= cap {
+                                            break;
+                                        }
+                                        slot_emit(&mut slots[i], t);
+                                        if t == EOS {
+                                            break;
+                                        }
+                                    }
                                 }
-                            }
-                            Err(err) => eprintln!("# batch 실패({err}) — 이번 회차 건너뜀"),
-                        }
-                    } else if active.len() > 1 {
-                        let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-                        match e.decode_batch_greedy(&active, &toks) {
-                            Ok(toks) => {
-                                for (row, &i) in active.iter().enumerate() {
-                                    slot_emit(&mut slots[i], toks[row]);
-                                }
-                            }
-                            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
-                        }
-                    } else {
-                        for &i in &active {
-                            if sampling(&slots[i]) {
-                                match e.decode1(i, slots[i].next) {
-                                    Ok(l) => {
-                                        let t = pick(&mut slots[i], &l);
+                                Err(err) => {
+                                    eprintln!("# mtp spec 실패({err}) — 일반 디코드로");
+                                    if let Ok(l) = e.decode1(i, next) {
+                                        let t = llm170_core::qwen35::greedy(&l);
                                         slot_emit(&mut slots[i], t);
                                     }
-                                    Err(err) => {
-                                        eprintln!("# decode1 실패({err}) — 이번 회차 건너뜀")
-                                    }
-                                }
-                            } else {
-                                match e.decode1_greedy(i, slots[i].next) {
-                                    Ok(t) => slot_emit(&mut slots[i], t),
-                                    Err(err) => {
-                                        eprintln!("# decode1_greedy 실패({err}) — 이번 회차 건너뜀")
-                                    }
                                 }
                             }
                         }
+                        let plain: Vec<usize> = active
+                            .iter()
+                            .copied()
+                            .filter(|&i| !spec_slots.contains(&i))
+                            .collect();
+                        if !plain.is_empty() {
+                            q4_plain_decode(e, &mut slots, &plain);
+                        }
+                    } else {
+                        q4_plain_decode(e, &mut slots, &active);
                     }
                 }
             }
@@ -967,7 +1073,15 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
     if arch.as_deref() == Some("qwen4exp") {
         // qwen4exp GPU 경로 — plans/64 P1: 기본 CPU(정확성 기준); --backend gpu
         // 명시 시에만 상주 가속기 부착(attach_q4가 res_f16 원장 105 규칙 적용).
-        let m = load_q4_retry(&req.model);
+        let mut m = load_q4_retry(&req.model);
+        if let Err(e) = apply_mtp(
+            &mut m,
+            &req.model,
+            req.mtp.as_deref(),
+            SPEC_K.get().copied().unwrap_or(0),
+        ) {
+            eprintln!("error: {e}");
+        }
         let sources = m.part_sources();
         let eng = llm170_core::qwen4exp::layers::Engine4::new(m, n_slots, req.ctx);
         let eng = attach_q4(

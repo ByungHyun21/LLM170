@@ -29,6 +29,8 @@ struct BenchCfg {
     spec_k: usize,
     np_slots: usize,
     prompt: Vec<u32>,
+    /// --mtp 인자(plans/109 P15⑤) — None이면 자동 탐지.
+    mtp: Option<String>,
 }
 
 /// LCG 합성 프롬프트 — np 측정에서 슬롯마다 **다른 시드**를 줘 프리픽스
@@ -156,6 +158,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         spec_k,
         np_slots,
         prompt,
+        mtp: ma.mtp.clone(),
     };
     let mut lines = match if arch.as_deref() == Some("qwen4exp") {
         bench_q4(&cfg)
@@ -183,12 +186,20 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         tg,
         reps,
         ctx,
-        spec_k: _,
+        spec_k,
         np_slots,
         prompt,
+        mtp: _,
     } = cfg;
     let mut lines = Vec::new();
     let m = llm170_core::qwen4exp::Model4::load(model_path).map_err(|e| e.to_string())?;
+    let mut m = m;
+    crate::engine::apply_mtp(
+        &mut m,
+        model_path,
+        cfg.mtp.as_deref().map(std::path::Path::new),
+        *spec_k,
+    )?;
     let sources = m.part_sources();
     let eng = llm170_core::qwen4exp::layers::Engine4::new(m, *np_slots, *ctx);
     // GPU 부착 — 단일 경로(attach_q4, Strict: bench는 CPU 폴백하지
@@ -309,6 +320,7 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         spec_k,
         np_slots,
         prompt,
+        mtp: _,
     } = cfg;
     let mut lines = Vec::new();
     let m = llm170_core::qwen35::Model::load(model_path).map_err(|e| e.to_string())?;
