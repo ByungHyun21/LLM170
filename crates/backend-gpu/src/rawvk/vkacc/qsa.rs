@@ -413,8 +413,10 @@ impl llm170_core::matmul::QsaOps for VkAcc {
             return Err("vk qsa_sel_readback: 핸들 불일치(스크래치 재성장)".into());
         }
         let mut si = vec![0u32; list_len];
+        // SAFETY (107 W8): si_b 매핑 판독 — 비배치 run 동기 완료; list_len 원소는 스크래치 크기와 일치.
         unsafe { std::ptr::copy_nonoverlapping(b.5.ptr as *const u32, si.as_mut_ptr(), list_len) };
         let mut so = vec![0u32; 2];
+        // SAFETY (107 W8): so_b 매핑 판독 — 2원소 오프셋 쌍, 동기 완료 후.
         unsafe { std::ptr::copy_nonoverlapping(b.6.ptr as *const u32, so.as_mut_ptr(), 2) };
         Ok((si, so))
     }
@@ -505,6 +507,7 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                 b.6.clone(),
             )
         };
+        // SAFETY (107 W8): iqwb/csb 매핑 기입 — 각 버퍼는 해당 길이로 확보; 제출 전이라 GPU 접근 없음.
         unsafe {
             std::ptr::copy_nonoverlapping(iqw.as_ptr(), iqwb.ptr as *mut f32, iqw.len());
             std::ptr::copy_nonoverlapping(
