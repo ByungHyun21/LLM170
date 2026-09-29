@@ -116,7 +116,7 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             }
             let mut finished = vec![false; n];
             let mut gen_tokens: Vec<Vec<u32>> = vec![Vec::new(); n];
-            let mut next: Vec<u32> = last_logits
+            let next: Vec<u32> = last_logits
                 .iter()
                 .map(|l| llm170_core::qwen35::greedy(l))
                 .collect();
@@ -127,110 +127,30 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     finished[s] = true;
                 }
             }
-            // 스펙 디코드 (06) — --spec k 지정 시 MTP 체인 draft·연쇄 수용.
+            // 생성 — 단일 루프(generate_q35): spec-multi/spec-single/batch.
             let spec_k: usize = spec_k.unwrap_or(0);
-            let has_mtp = eng.has_mtp();
-            let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
-            if spec_k > 0 && has_mtp && n > 1 && std::env::var_os("LLM170_SPEC_GPU").is_some() {
-                // np×spec 병합 (plans/18)
-                let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
-                let mut accepted_total = 0usize;
-                let mut cycles = 0usize;
-                let mut min_gen = gen_tokens[0].len();
-                for g in gen_tokens.iter() {
-                    min_gen = min_gen.min(g.len());
-                }
-                while min_gen <= n_predict {
-                    let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
-                    if active.is_empty() {
-                        break;
-                    }
-                    let nexts: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                    let acc = eng
-                        .spec_step_multi(&active, &nexts, spec_k)
-                        .map_err(|e| e.to_string())?;
-                    cycles += 1;
-                    let mut any = false;
-                    for (i, &s) in active.iter().enumerate() {
-                        for &t in &acc[i] {
-                            if gen_tokens[s].len() > n_predict {
-                                break;
-                            }
-                            pos[s] += 1;
-                            emit(s, pos[s], t, &eng);
-                            gen_tokens[s].push(t);
-                            next[s] = t;
-                            accepted_total += 1;
-                            if t == eos {
-                                finished[s] = true;
-                            }
-                            any = true;
-                        }
-                    }
-                    if !any {
-                        break;
-                    }
-                    min_gen = usize::MAX;
-                    for (s, g) in gen_tokens.iter().enumerate() {
-                        if !finished[s] {
-                            min_gen = min_gen.min(g.len());
-                        }
-                    }
-                }
-                eprintln!(
-                    "# spec-multi(k={spec_k}, n={n}): {cycles}사이클, 수용 {accepted_total}토큰"
-                );
-            } else if spec_k > 0 && has_mtp && n == 1 {
-                let s = 0usize;
-                let mut accepted_total = 0usize;
-                let mut target_forwards = 0usize;
-                let mut cycles = 0usize;
-                while gen_tokens[s].len() <= n_predict && !finished[s] {
-                    let (acc_toks, tf) = eng.spec_step(s, next[s], spec_k).map_err(|e| e.to_string())?;
-                    cycles += 1;
-                    target_forwards += tf;
-                    for &t in &acc_toks {
-                        if gen_tokens[s].len() > n_predict {
-                            break;
-                        }
-                        pos[s] += 1;
-                        emit(s, pos[s], t, &eng);
-                        gen_tokens[s].push(t);
-                        next[s] = t;
-                        accepted_total += 1;
-                        if t == eos {
-                            finished[s] = true;
-                        }
-                    }
-                }
-                eprintln!(
-                    "# spec(k={spec_k}): {cycles}사이클, 수용 {accepted_total}토큰, 타깃 forward {target_forwards}회 — 수용률/forward {:.2}",
-                    accepted_total as f64 / target_forwards.max(1) as f64
-                );
-            } else {
-                if spec_k > 0 && !has_mtp {
-                    eprintln!("# --spec 무시: MTP(nextn) 텐서 없음");
-                }
-            // 배치 디코드 — 활성 시퀀스 묶어 1스텝 (np 상호검증 대상 경로)
-            for _step in 0..n_predict {
-                let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
-                if active.is_empty() {
-                    break;
-                }
-                let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                let seq_ids: Vec<usize> = active.clone();
-                let logits = eng.decode(&seq_ids, &toks).map_err(|e| e.to_string())?;
-                for (i, &s) in active.iter().enumerate() {
-                    let t = llm170_core::qwen35::greedy(&logits[i]);
-                    next[s] = t;
-                    pos[s] += 1;
-                    emit(s, pos[s], t, &eng);
-                    gen_tokens[s].push(t);
-                    if t == eos {
-                        finished[s] = true;
-                    }
-                }
-            }
+            let mut st = crate::engine::GenState {
+                finished,
+                gen_toks: gen_tokens,
+                next,
+                pos: prompts.iter().map(|p| p.len() as u32).collect(),
+            };
+            let (mode, stats) =
+                crate::engine::generate_q35(&mut eng, &mut st, n_predict, spec_k, eos, &mut InferSink)?;
+            let gen_tokens = st.gen_toks;
+            match mode {
+                "spec-multi" => eprintln!(
+                    "# spec-multi(k={spec_k}, n={n}): {}사이클, 수용 {}토큰",
+                    stats.cycles, stats.accepted
+                ),
+                "spec" => eprintln!(
+                    "# spec(k={spec_k}): {}사이클, 수용 {}토큰, 타깃 forward {}회 — 수용률/forward {:.2}",
+                    stats.cycles,
+                    stats.accepted,
+                    stats.target_forwards,
+                    stats.accepted as f64 / stats.target_forwards.max(1) as f64
+                ),
+                _ => {}
             }
             let dt = t_start.elapsed();
             eprintln!(
@@ -249,6 +169,23 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         eprint!("\n{rep}");
     }
     ExitCode::SUCCESS
+}
+
+/// infer JSONL 싱크 — 토큰마다 {"seq","pos","token","text"} 1행.
+struct InferSink;
+impl crate::engine::TokenSink for InferSink {
+    fn on_token(
+        &mut self,
+        s: usize,
+        pos: u32,
+        t: u32,
+        eng: &llm170_core::qwen35::Engine,
+    ) {
+        println!(
+            "{{\"seq\":{s},\"pos\":{pos},\"token\":{t},\"text\":{}}}",
+            crate::json::quoted(&eng.piece(t))
+        );
+    }
 }
 
 /// qwen4exp 추론 — Engine4 (시퀀스별 prefill/decode1).
