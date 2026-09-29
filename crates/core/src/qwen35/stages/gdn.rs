@@ -3,8 +3,8 @@
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
-use crate::qwen35::{mm_batch, mm_group};
 use crate::ops::{l2_norm, sigmoid, silu, softplus};
+use crate::qwen35::{mm_batch, mm_group};
 use llm170_diag::profile_span;
 
 /// GDN층: qkv/게이트/베타/알파/아웃 프로젝션 — 디스패치 경유.

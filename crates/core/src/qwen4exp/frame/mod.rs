@@ -478,7 +478,6 @@ pub fn res_f16_on() -> bool {
     BACKEND_RES_F16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-
 /// 임베딩 t행 → hc 스트림 방송 후 res_hc에 기입(f16 버스 시 팩) —
 /// forward/multi/np 3중 복제 통합(plans/109 P8).
 pub(crate) fn emb_broadcast_write(
@@ -504,7 +503,8 @@ pub(crate) fn emb_broadcast_write(
         acc.frame_write_u32(res_hc, &pack_f16_pairs(&r))
             .map_err(crate::qwen4exp::Q4Error::Io)?;
     } else {
-        acc.frame_write(res_hc, &r).map_err(crate::qwen4exp::Q4Error::Io)?;
+        acc.frame_write(res_hc, &r)
+            .map_err(crate::qwen4exp::Q4Error::Io)?;
     }
     Ok(())
 }

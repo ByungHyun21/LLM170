@@ -57,7 +57,6 @@ impl DecodeState {
                 .get(&format!("blk.{il}.attn_norm"))
                 .ok_or("attn_norm")?;
             self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
-            self.ctx.mmq_y_bump(); // 부록81: xn_t 재기 → quant_y 캐시 무효화
             // qkv/gate/beta/alpha(또는 q/k/v)가 모두 f32 직소비면 q8 활성은 사장 —
             // MMQ는 y_f32를 직접 읽고 내부에서 mmq 레이아웃으로 재양자화한다.
             let proj_names: Vec<String> = if self.is_recr[il] {
@@ -838,7 +837,6 @@ impl DecodeState {
                 .get(&format!("blk.{il}.post_norm"))
                 .ok_or("post_norm")?;
             self.rms_rows(self.xs_t, pw, self.xn_t, n, t)?;
-            self.ctx.mmq_y_bump(); // 부록81: xn_t 재기 → quant_y 캐시 무효화
             if !self.grp_mmq(
                 &[
                     format!("blk.{il}.ffn_gate.weight"),

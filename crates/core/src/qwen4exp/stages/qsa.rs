@@ -542,8 +542,19 @@ pub fn qsa_layer(
     // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(공용 헬퍼).
     if !gpu_attn {
         attn_all = qsa_cpu_attn_rows(
-            &qg, seq, full_idx, &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t_len,
-            n_head, n_kv, hd, kq_scale,
+            &qg,
+            seq,
+            full_idx,
+            &sel_blk,
+            &sel_cnt,
+            sel_stride,
+            r,
+            pos0 as usize,
+            t_len,
+            n_head,
+            n_kv,
+            hd,
+            kq_scale,
         );
     }
     // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
@@ -551,9 +562,8 @@ pub fn qsa_layer(
     if gpu_attn && let Some(acc) = ctx.acc {
         let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
         // 선택 목록 압축(공용 헬퍼 qsa_sel_list) — 블록(오름차순) + 테일.
-        let (sel_idx, sel_off) = qsa_sel_list(
-            &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, n_tok,
-        );
+        let (sel_idx, sel_off) =
+            qsa_sel_list(&sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, n_tok);
         // 사용 prefix만 — 그리고 **복사하지 않는다**: 과거에는 여기서
         // .to_vec()으로 33.6MB/층(n_past 8192 기준)을 매 호출 복사했고,
         // 그 memcpy가 sel_build 타이머의 실체였다(실측 1.39ms/층 = 24GB/s).
@@ -582,8 +592,19 @@ pub fn qsa_layer(
                 // 폴백은 실제 CPU 재계산(공용 헬퍼) — 이전 구현은 행을 빈 채로
                 // 두어 어텐션이 조용히 누락됐다(2026-09-13 발견).
                 attn_all = qsa_cpu_attn_rows(
-                    &qg, seq, full_idx, &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize,
-                    n_tok, n_head, n_kv, hd, kq_scale,
+                    &qg,
+                    seq,
+                    full_idx,
+                    &sel_blk,
+                    &sel_cnt,
+                    sel_stride,
+                    r,
+                    pos0 as usize,
+                    n_tok,
+                    n_head,
+                    n_kv,
+                    hd,
+                    kq_scale,
                 );
             }
         }
