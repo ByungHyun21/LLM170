@@ -40,12 +40,7 @@ pub fn wm_advance(w: &mut usize, pos0: usize, t: usize) -> Result<(), String> {
 /// vk `qsa_sel_dev_mt`(프리필 다중 토큰)의 토큰별 루프도 같은 식을
 /// per-token 전개해 list_len 총합을 낸다(hip엔 t>1 디바이스 선택이 없음).
 /// 정수 산술이라 무동기 — 호출부는 스크래치 크기·커널 인자로만 소비.
-pub fn sel_counts(
-    n_past: usize,
-    n_blocks: usize,
-    r: usize,
-    idx_top_k: usize,
-) -> (usize, usize) {
+pub fn sel_counts(n_past: usize, n_blocks: usize, r: usize, idx_top_k: usize) -> (usize, usize) {
     let tail_start = n_blocks * r;
     let tail_cnt = n_past - tail_start;
     let width = n_past.min(idx_top_k + r - 1);
