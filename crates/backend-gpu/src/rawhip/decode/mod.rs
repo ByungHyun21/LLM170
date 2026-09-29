@@ -798,19 +798,6 @@ impl DecodeState {
                 out,
             );
         }
-        // q5_K v2 (부록76): vdr=2 그리드-스트라이드 — 자체 스트림 (비트계약 아님)
-        if !pin && ty == 13 && t == 1 && env_on("LLM170_Q5V2") {
-            return self.ctx.gemv_q8_out_v2(
-                xq as *const u8,
-                wp as *const u8,
-                ty,
-                n_in,
-                n_out,
-                out,
-                xq_w,
-                t,
-            );
-        }
         // 홀수 타입 타일 (plans/04): odd CO + t>=32에서만 (핀: 전 t)
         let odd_v4 = !env_on("LLM170_EXACT")
             && self.ctx.co_loaded(super::CO_ODD)

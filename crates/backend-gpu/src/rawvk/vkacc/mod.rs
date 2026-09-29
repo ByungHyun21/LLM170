@@ -51,7 +51,6 @@ const L2_ROWS_SPV: &[u8] = include_bytes!("../spv/l2_rows.spv");
 const L2_ROWS2_SPV: &[u8] = include_bytes!("../spv/l2_rows2_scale.spv");
 /// plans/84 B — FN GDN AR: 전치 상태(gdn_ar_w_swap 동일열).
 const FN_GDN_AR_SWAP_SPV: &[u8] = include_bytes!("../spv/fn_gdn_ar_swap.spv");
-const FN_GDN_CHUNK_SPV: &[u8] = include_bytes!("../spv/fn_gdn_chunk.spv");
 const GDN_LW_SPV: &[u8] = include_bytes!("../spv/gdn_lw.spv");
 const GDN_EXEC_SPV: &[u8] = include_bytes!("../spv/gdn_exec.spv");
 const GDN_EXEC_A_SPV: &[u8] = include_bytes!("../spv/gdn_execA.spv");
@@ -198,7 +197,6 @@ pub(crate) enum Slot {
     L2Rows2Scale,
     FnGdnArSwap,
     /// plans/100 — GDN 청크 병렬(WY).
-    FnGdnChunk,
     /// plans/100 v2 — L/W 사전계산 + 실행 분리.
     GdnLw,
     GdnExec,
@@ -313,13 +311,6 @@ pub struct VkAcc {
     )>,
     /// 밀집 q8 K-분할(TileQ8128Ks) 선형 스크래치 — 성장 보유.
     ks_scratch: Mutex<Option<VkBuf>>,
-    gdn_ch_scratch: Mutex<(
-        Option<VkBuf>,
-        Option<VkBuf>,
-        Option<VkBuf>,
-        Option<VkBuf>,
-        Option<VkBuf>,
-    )>,
     obuf: Mutex<Option<VkBuf>>,
     sbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
     rbufs: Mutex<Option<(VkBuf, VkBuf, VkBuf)>>,
@@ -455,7 +446,6 @@ const SLOTS: &[(Slot, &str, &[u8], u32, u32)] = &[
     (Slot::L2Rows, "l2_rows", L2_ROWS_SPV, 1, 12),
     (Slot::L2Rows2Scale, "l2_rows2_scale", L2_ROWS2_SPV, 2, 24),
     (Slot::FnGdnArSwap, "gdn_ar_swap", FN_GDN_AR_SWAP_SPV, 6, 28),
-    (Slot::FnGdnChunk, "gdn_chunk", FN_GDN_CHUNK_SPV, 6, 40),
     (Slot::GdnLw, "gdn_lw", GDN_LW_SPV, 6, 24),
     (Slot::GdnExec, "gdn_exec", GDN_EXEC_SPV, 8, 36),
     (Slot::GdnExecA, "gdn_execA", GDN_EXEC_A_SPV, 7, 24),
@@ -674,7 +664,6 @@ impl VkAcc {
             packbufs: Mutex::new((std::collections::HashMap::new(), Vec::new())),
             ks_scratch: Mutex::new(None),
 
-            gdn_ch_scratch: Mutex::new((None, None, None, None, None)),
             obuf: Mutex::new(None),
             sbufs: Mutex::new(None),
             rbufs: Mutex::new(None),

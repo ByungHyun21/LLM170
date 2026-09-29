@@ -415,11 +415,8 @@ impl Frame4 {
         d_state: usize,
     ) -> Result<(), Q4Error> {
         // plans/97: pos==0이면 상태는 전부 영 — CPU 전사(측정 39-46ms) 대신
-        // GPU zero-fill(수십 µs). 킬: LLM170_VK_ZSYNC=0.
-        let zsync = st.pos == 0
-            && std::env::var("LLM170_VK_ZSYNC")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        // GPU zero-fill(수십 µs). =0 복원은 plans/109 P6 삭제.
+        let zsync = st.pos == 0;
         if zsync {
             let hs: Vec<u64> = self.st_gdn[seq]
                 .iter()

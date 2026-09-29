@@ -81,11 +81,7 @@ impl Engine {
         // 1024토큰 청크 — qwen4exp와 동일 근거: 단일 초대형 forward는 GPU
         // 스크래치·상태 크기를 폭주시킨다 (qwen4exp GPF 실측, 2026-08-31).
         // 청킹은 수치 불변 (GDN chunked·attention 캐시는 순차 적립).
-        let chunk: usize = std::env::var("LLM170_Q35_CHUNK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024)
-            .clamp(16, 1024);
+        let chunk: usize = 1024;
         let mut last = None;
         // 원시 HIP 활성 시 프리필도 t=1 raw 스텝으로 — 상태 동기화 불필요
         // (KV/GDN/conv 링이 raw 디코더에 직접 적립).
@@ -112,15 +108,11 @@ impl Engine {
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
                 // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,
                 // 장문600 게이트 chunk128과 비트동일 검증)
-                let ch_sz = llm170_diag::flag::val("LLM170_CHUNK")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(
-                        if rd.tile_big_chunk() && !llm170_diag::flag::on("LLM170_EXACT") {
-                            512
-                        } else {
-                            64
-                        },
-                    );
+                let ch_sz = if rd.tile_big_chunk() && !llm170_diag::flag::on("LLM170_EXACT") {
+                    512
+                } else {
+                    64
+                };
                 let n_chunks = cache.len().div_ceil(ch_sz).max(1);
                 // plans/92 P2: 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
                 let pfck = llm170_diag::dump::opts().key("pfck");

@@ -8,7 +8,7 @@ mod harness;
 mod misc;
 mod ops;
 
-pub use attention::{ft32_check, gdn_chunk_check, gemv_check, gemv8_check};
+pub use attention::{ft32_check, gemv_check, gemv8_check};
 pub use fault::fault_probe;
 pub use frame_check::frame_check;
 pub use misc::ple_mt_check;

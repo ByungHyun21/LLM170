@@ -98,27 +98,6 @@ impl DecoderState {
         vals.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// quant_f16: [t][n] f32 → f16 (f16-B 타일 경로, plans/46).
-    pub(super) fn quant_f16(
-        &mut self,
-        src: vk::Buffer,
-        dst: vk::Buffer,
-        n: usize,
-        t: usize,
-    ) -> Result<(), String> {
-        let push = Self::push_u32s(&[n as u32, t as u32]);
-        self.run_pipe(
-            "quant_f16",
-            QUANT_F16_SPV,
-            2,
-            8,
-            &[src, dst],
-            &push,
-            (n * t).div_ceil(64) as u32,
-            1,
-            1,
-        )
-    }
 
     /// quant: [t][n] f32 → xq (q8 레이아웃).
     pub(super) fn quant(
@@ -185,7 +164,7 @@ impl DecoderState {
         // 가중 1회 판독·WG 수 1/t(종전 z=t는 토큰당 가중 전량 재판독 —
         // np4 스텝이 가중 대역폭 붕괴로 273ms까지 늘어난 주벚, 실측).
         // 산술은 각 *_b 판과 행×토큰 비트 동일. LLM170_VK_NPT=0 옵트아웃.
-        if (2..=4).contains(&t) && llm170_diag::flag::ne0("LLM170_VK_NPT") {
+        if (2..=4).contains(&t) {
             let (nm, spv, nkb): (&str, &[u8], u32) = match ty {
                 13 => ("gemv8t_q5", GEMV8T_Q5_SPV, 10),
                 12 => ("gemv8t_q4", GEMV8T_Q4_SPV, 10),
@@ -197,11 +176,7 @@ impl DecoderState {
                 _ => ("", &[][..], 0),
             };
             if !nm.is_empty() {
-                let nr_t: u32 = std::env::var("LLM170_VK_NPT_NR")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2)
-                    .clamp(1, 4);
+                let nr_t: u32 = 2;
                 let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr_t]);
                 return self.run_pipe_b(
                     nm,
@@ -218,9 +193,6 @@ impl DecoderState {
             }
         }
         if ty == 20
-            && std::env::var("LLM170_VK_NLB")
-                .map(|v| v == "0")
-                .unwrap_or(true)
         {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
@@ -238,9 +210,6 @@ impl DecoderState {
         }
         // i3s (plans/46) — IQ3_S 전용 (마지막 폴백 제거, quant.rs deq_iq3_s 미러).
         if ty == 21
-            && std::env::var("LLM170_VK_I3S")
-                .map(|v| v == "0")
-                .unwrap_or(true)
         {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
@@ -258,9 +227,6 @@ impl DecoderState {
         }
         // xsb (plans/40) — llama generic dmmv 구조 × 검증 xs 디코드: 125→182GB/s.
         if ty == 23
-            && std::env::var("LLM170_VK_XSB")
-                .map(|v| v == "0")
-                .unwrap_or(true)
         {
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
@@ -276,56 +242,24 @@ impl DecoderState {
                 bar,
             );
         }
-        let rpf: u32 = if no < 4096 { 1 } else { 2 }; // llama NUM_ROWS=2
+        // plans/40 *_b 패밀리(llama dmmv 이식) — 기본 승격, =0 복원 경로는
+        // plans/109 P6에서 삭제(q8b 87→329GB/s, q3b 62→122, q4b 152→272, q6b +35%).
         if ty == 8 {
-            // q8b (plans/40) — llama generic dmmv 구조: 87→329GB/s. LLM170_VK_Q8B=0 옵트아웃.
-            if std::env::var("LLM170_VK_Q8B")
-                .map(|v| v == "0")
-                .unwrap_or(true)
-            {
-                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
-                return self.run_pipe_b(
-                    "gemv8_q8b",
-                    GEMV8_Q8B_SPV,
-                    10,
-                    24,
-                    &binds,
-                    &push,
-                    1,
-                    no.div_ceil(2) as u32,
-                    t as u32,
-                    bar,
-                );
-            }
-            // q8_0 — 34B 블록 (plans/40: 소형 straggler 레이턴시 해소)
-            let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
-            let cw = cw.next_power_of_two();
-            let cw_log2 = 31u32 - cw.leading_zeros();
-            let cw_mask = cw - 1u32;
-            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
-                "gemv8_q8",
-                GEMV8_Q8_SPV,
+                "gemv8_q8b",
+                GEMV8_Q8B_SPV,
                 10,
                 24,
                 &binds,
                 &push,
                 1,
-                no.div_ceil(rpf as usize) as u32,
+                no.div_ceil(2) as u32,
                 t as u32,
                 bar,
             );
         }
-        let (pname, spv8, n_kb8) = match ty {
-            23 => ("gemv8_xs", GEMV8_XS_SPV, 11),
-            11 => ("gemv8_q3", GEMV8_Q3_SPV, 10),
-            _ => ("", &[][..], 0),
-        };
-        if ty == 11
-            && std::env::var("LLM170_VK_Q3B")
-                .map(|v| v == "0")
-                .unwrap_or(true)
-        {
+        if ty == 11 {
             // q3b (plans/40) — llama dmmv 구조: 62→122GB/s, max|D|=0.
             let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
@@ -341,152 +275,56 @@ impl DecoderState {
                 bar,
             );
         }
-        if ty == 23 || ty == 11 {
-            let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
-            let cw = cw.next_power_of_two();
-            let cw_log2 = 31u32 - cw.leading_zeros();
-            let cw_mask = cw - 1;
-            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
-            return self.run_pipe_b(
-                pname,
-                spv8,
-                n_kb8,
-                24,
-                &binds,
-                &push,
-                1,
-                no.div_ceil(rpf as usize) as u32,
-                t as u32,
-                bar,
-            );
-        }
         if ty == 12 {
-            // q4b (plans/40) — llama mul_mat_vec_q4_k 이식: 152→272GB/s. LLM170_VK_Q4B=0 옵트아웃.
-            if std::env::var("LLM170_VK_Q4B")
-                .map(|v| v == "0")
-                .unwrap_or(true)
-            {
-                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
-                return self.run_pipe_b(
-                    "gemv8_q4b",
-                    GEMV8_Q4B_SPV,
-                    10,
-                    24,
-                    &binds,
-                    &push,
-                    1,
-                    no.div_ceil(2) as u32,
-                    t as u32,
-                    bar,
-                );
-            }
-            // q4 — u32 워드 단위 (동일 WG 워커)
-            let cw = wbufs.first().map(|b| b.bytes / 4).unwrap_or(1) as u32;
-            let cw = cw.next_power_of_two();
-            let cw_log2 = 31u32 - cw.leading_zeros();
-            let cw_mask = cw - 1;
-            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw_log2, cw_mask, rpf]);
+            // q4b (plans/40) — llama mul_mat_vec_q4_k 이식: 152→272GB/s.
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
-                "gemv8_q4",
-                GEMV8_Q4_SPV,
+                "gemv8_q4b",
+                GEMV8_Q4B_SPV,
                 10,
                 24,
                 &binds,
                 &push,
                 1,
-                no.div_ceil(rpf as usize) as u32,
+                no.div_ceil(2) as u32,
                 t as u32,
                 bar,
             );
         }
         if ty == 14 {
-            // q6b (plans/40) — llama mul_mat_vec_q6_k 충실 이식(sccache): +35%. LLM170_VK_Q6B=0 옵트아웃.
-            if std::env::var("LLM170_VK_Q6B")
-                .map(|v| v == "0")
-                .unwrap_or(true)
-            {
-                let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
-                return self.run_pipe_b(
-                    "gemv8_q6b",
-                    GEMV8_Q6B_SPV,
-                    10,
-                    24,
-                    &binds,
-                    &push,
-                    1,
-                    no.div_ceil(2) as u32,
-                    t as u32,
-                    bar,
-                );
-            }
-            // q6 — u16 뷰 (105 u16/블록), llama mul_mat_vec_q6_k 직역 (plans/36 G1)
-            let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
-            let cw2 = cw2.next_power_of_two();
-            let cw2_log2 = 31u32 - cw2.leading_zeros();
-            let cw2_mask = cw2 - 1;
-            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
+            // q6b (plans/40) — llama mul_mat_vec_q6_k 충실 이식(sccache): +35%.
+            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, 2]);
             return self.run_pipe_b(
-                "gemv8_q6",
-                GEMV8_Q6_SPV,
+                "gemv8_q6b",
+                GEMV8_Q6B_SPV,
                 10,
                 24,
                 &binds,
                 &push,
                 1,
-                no.div_ceil(rpf as usize) as u32,
+                no.div_ceil(2) as u32,
                 t as u32,
                 bar,
             );
         }
         // q5b (plans/40) — llama mul_mat_vec_q5_k 충실 이식 (64스레드·2행·vec4).
-        // 단일 청크 typed 뷰 — 143→225GB/s. LLM170_VK_Q5B=0 옵트아웃.
-        if std::env::var("LLM170_VK_Q5B")
-            .map(|v| v == "0")
-            .unwrap_or(true)
-        {
-            // plans/46: NUM_ROWS 실험 — llama GCN은 rm_kq=4. t=1이 지연 바운드(f16 2배
-            let nr: u32 = std::env::var("LLM170_VK_NUMROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2);
-            let nr = nr.clamp(1, 4);
-            let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);
-            return self.run_pipe_b(
-                "gemv8_q5b",
-                GEMV8_Q5B_SPV,
-                10,
-                24,
-                &binds,
-                &push,
-                1,
-                no.div_ceil(nr as usize) as u32,
-                t as u32,
-                bar,
-            );
-        }
-        // q5 — u16 단위 청크 상수 (typed 뷰), 첫 버퍼 실측 크기 → pow2ceil
-        let cw2 = wbufs.first().map(|b| b.bytes / 2).unwrap_or(1) as u32;
-        let cw2 = cw2.next_power_of_two();
-        let cw2_log2 = 31u32 - cw2.leading_zeros();
-        let cw2_mask = cw2 - 1;
-        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, cw2_log2, cw2_mask, rpf]);
+        // 단일 청크 typed 뷰 — 143→225GB/s.
+        let nr: u32 = 2; // llama GCN rm_kq=4 — t=1 지연 바운드
+        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, 0, 0, nr]);
         self.run_pipe_b(
-            "gemv8_q5",
-            GEMV8_Q5_SPV,
+            "gemv8_q5b",
+            GEMV8_Q5B_SPV,
             10,
             24,
             &binds,
             &push,
             1,
-            no.div_ceil(rpf as usize) as u32,
+            no.div_ceil(nr as usize) as u32,
             t as u32,
             bar,
         )
     }
-    /// gemv 래우터 — t<16은 gemv8(f32 직결, llama 포트), 그 외·미지원 타입은
-    /// quant+gemv3(범용 정수 경로). LLM170_G8=0 킬스위치.
-    /// 2026-09-08 A/B: q6_K도 gemv3+quant가 gemv6_q6보다 우위(tg32 7.06 vs 6.71) —
-    /// gemv4/5/6/7 세대 전원 삭제(plans/35 P2).
+
     pub(super) fn gemv_w(
         &mut self,
         qsrc: vk::Buffer,
@@ -496,10 +334,7 @@ impl DecoderState {
         t: usize,
         nq: usize,
     ) -> Result<(), String> {
-        let g8_off = std::env::var("LLM170_G8")
-            .map(|v| v == "0")
-            .unwrap_or(false);
-        if t < 16 && !g8_off && self.gemv8_q5(qsrc, wkey, out, t, true).is_ok() {
+        if t < 16 && self.gemv8_q5(qsrc, wkey, out, t, true).is_ok() {
             return Ok(());
         }
         // plans/46: N토큰 gemv (q5_K, t≥2, LLM170_VK_Q5N=1 옵트인) — f32 활성 직접
@@ -528,37 +363,6 @@ impl DecoderState {
                 1,
                 no2.div_ceil(2) as u32,
                 t.div_ceil(tb) as u32,
-                true,
-            );
-        }
-        // plans/46 f16-B: q5 프리필을 f16 활성 직독 타일로 (quant f16화 + load_b 직독).
-        if t >= 16
-            && llm170_diag::flag::eq1("LLM170_VK_F16B")
-            && let Some((wbufs2, ty2, ni2, _no2)) = self.w.get(wkey).cloned()
-            && ty2 == 13
-        {
-            self.quant_f16(qsrc, self.b_xf16.buf, nq, t)?;
-            let mut binds2: Vec<vk::Buffer> = wbufs2.iter().map(|b| b.buf).collect();
-            while binds2.len() < 8 {
-                binds2.push(self.dummy.buf);
-            }
-            binds2.push(self.dummy.buf); // binding 8: q8 뷰(사용안함)
-            binds2.push(out); // binding 9
-            binds2.push(self.b_xf16.buf); // binding 10: f16 뷰
-            // push: [n_in, n_out, xq_w=n_in(f16 스트라이드), t, tok_base]
-            let nrows = (_no2 as u32).div_ceil(64);
-            let gy = (t as u32).div_ceil(64);
-            let push2 = Self::push_u32s(&[ni2 as u32, _no2 as u32, ni2 as u32, 64u32, 0u32]);
-            return self.run_pipe_b(
-                "tile_ms4gy_f16b",
-                TILE_MS4GY_F16B_SPV,
-                11,
-                20,
-                &binds2,
-                &push2,
-                gy,
-                nrows,
-                1,
                 true,
             );
         }
@@ -592,17 +396,9 @@ impl DecoderState {
             .get(wkey)
             .cloned()
             .ok_or(format!("가중치 없음: {wkey}"))?;
-        let tile_min: usize = if llm170_diag::flag::on("LLM170_VK_TILE1") {
-            1
-        } else {
-            16
-        };
+        let tile_min: usize = 16;
         // f16 캐시 경로 (plans/39) — 루프 내 디양자화 없는 통일 타일
-        if t >= tile_min
-            && std::env::var_os("LLM170_VK_NOTILE").is_none()
-            && std::env::var_os("LLM170_VK_NOF16W").is_none()
-            && self.f16w.contains_key(wkey)
-        {
+        if t >= tile_min && self.f16w.contains_key(wkey) {
             let xq_w = no; // 자리표시 — 아래에서 ni 기반 재계산
             let _ = xq_w;
             let ni_f = self.w.get(wkey).map(|e| e.2).unwrap_or(0);
@@ -631,7 +427,6 @@ impl DecoderState {
         // 타일(coopmat f16) 기본 경로 (2026-09-08 judge TILE 19/19 수용 —
         // llama 자체 pp가 동일 f16-닷 품질계약). 킬스위치 LLM170_VK_NOTILE=1.
         if t >= tile_min
-            && std::env::var_os("LLM170_VK_NOTILE").is_none()
             && (ty == 11
                 || ty == 12
                 || ty == 13
@@ -717,11 +512,7 @@ impl DecoderState {
                     // plans/40 gy: 토큰 슬래브를 gy로 병렬 — 단일 디스패치 L2 가중 재사용.
                     // plans/42: GYGRP=n이면 n토큰 그룹으로 분할 디스패치 (예: 128 → gy=2,
                     // 하네스 실측 병합 한계 내). 미설정 시 전 토큰 단일 디스패치.
-                    let grp: usize = std::env::var("LLM170_VK_GYGRP")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|&g| g >= 64)
-                        .unwrap_or(t);
+                    let grp: usize = t;
                     let nrows = (no as u32).div_ceil(64);
                     for g0 in (0..t).step_by(grp) {
                         let gt = (t - g0).min(grp);
@@ -781,27 +572,6 @@ impl DecoderState {
                         )
                     };
                     self.run_pipe_b(nm, spv, nkb, pb, &binds, &push, gx_ms, 1, 1, last)?;
-                }
-                return Ok(());
-            }
-            // tile128o (점유 변형, plans/39): 64토큰/1-sb/LDS 29.7KB → 2 WG/CU
-            if ty == 13 && llm170_diag::flag::eq1("LLM170_TILE_OCC") {
-                for tb in (0..t).step_by(64) {
-                    let nt = (t - tb).min(64) as u32;
-                    let last = tb + 64 >= t && bar;
-                    let push = Self::push_u32s(&[ni as u32, no as u32, xq_w as u32, nt]);
-                    self.run_pipe_b(
-                        "tile128o",
-                        TILE128O_SPV,
-                        10,
-                        16,
-                        &binds,
-                        &push,
-                        gx,
-                        1,
-                        1,
-                        last,
-                    )?;
                 }
                 return Ok(());
             }
@@ -1032,107 +802,18 @@ impl DecoderState {
         )
     }
 
-    /// v2 (mlx식) — per-row 스케일: quant_b8v2 + gemm_i8v2. LLM170_VK_I8=2.
-    pub(super) fn gemm_i8v2(
-        &mut self,
-        wkey: &str,
-        out: vk::Buffer,
-        t: usize,
-        bar: bool,
-    ) -> Result<(), String> {
-        let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
-        let (wbuf, ni, no) = (e.w.clone(), e.n_in, e.n_out);
-        let wsr = self.wsr.get(wkey).cloned().ok_or("wsr 없음")?;
-        // quant_b8v2: b_xn → b8 + ydr (ydb 첫 t 슬롯 재사용)
-        let push = Self::push_u32s(&[ni as u32, t as u32]);
-        self.run_pipe(
-            "quant_b8v2",
-            QUANT_B8V2_SPV,
-            3,
-            8,
-            &[self.b_xn.buf, self.b8.buf, self.ydb.buf],
-            &push,
-            1,
-            t as u32,
-            1,
-        )?;
-        let mut binds: Vec<vk::Buffer> = vec![wbuf.buf; 1];
-        while binds.len() < 8 {
-            binds.push(self.dummy.buf);
-        }
-        binds.push(self.b8.buf);
-        binds.push(out);
-        binds.push(wsr.buf);
-        binds.push(self.ydb.buf);
-        let push2 = Self::push_u32s(&[ni as u32, no as u32, t as u32]);
-        self.run_pipe_b(
-            "gemm_i8v2",
-            GEMM_I8V2_SPV,
-            12,
-            12,
-            &binds,
-            &push2,
-            (no as u32).div_ceil(16),
-            1,
-            1,
-            bar,
-        )
-    }
-
-    /// gemm_i8 (plans/23) — q5_K 사전 언패분으로 t행 GEMM.
-    pub(super) fn gemm_i8(
-        &mut self,
-        wkey: &str,
-        out: vk::Buffer,
-        t: usize,
-        bar: bool,
-    ) -> Result<(), String> {
-        let e = self.i8w.get(wkey).ok_or(format!("i8w 없음: {wkey}"))?;
-        let (wbuf, wspbuf, wsmbuf, ni, no) =
-            (e.w.clone(), e.wsp.clone(), e.wsm.clone(), e.n_in, e.n_out);
-        let n_sub = ni / 32;
-        let mut binds: Vec<vk::Buffer> = vec![wbuf.buf; 1];
-        while binds.len() < 8 {
-            binds.push(self.dummy.buf);
-        }
-        binds.push(self.b8.buf);
-        binds.push(out);
-        binds.push(wspbuf.buf);
-        binds.push(wsmbuf.buf);
-        binds.push(self.ydb.buf);
-        binds.push(self.qsb.buf);
-        binds.push(self.ishs.buf);
-        binds.push(self.faccs.buf);
-        let push = Self::push_u32s(&[ni as u32, no as u32, t as u32, n_sub as u32]);
-        self.run_pipe_b(
-            "gemm_i8",
-            GEMM_I8_SPV,
-            16,
-            16,
-            &binds,
-            &push,
-            (no as u32).div_ceil(16),
-            1,
-            1,
-            bar,
-        )
-    }
 
     /// 단계 공유 GEMV 그룹 — 잡들은 상호 독립(동일 입력·상이 출력)이라
     /// 그룹 내부 배리어 생략, 마지막 잡이 배리어로 종결.
     /// xq 양자화는 실제 폴백 잡이 있을 때만 수행 (gemv8 직결 사이트의 dead
-    /// quant 스킵 — plans/36 G2). i8 잡(t≥2·VK_I8ON)은 gemm_i8.
+    /// quant 스킵 — plans/36 G2). gemm_i8 계열은 plans/109 P6 삭제.
     pub(super) fn gemv_stage(
         &mut self,
         n: usize,
         t: usize,
         jobs: &[(String, vk::Buffer, vk::Buffer)],
     ) -> Result<(), String> {
-        let g8 = t < 16 && llm170_diag::flag::ne0("LLM170_G8");
-        let i8_on = t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON");
-        let v2 = std::env::var("LLM170_VK_I8")
-            .map(|v| v == "2")
-            .unwrap_or(false);
+        let g8 = t < 16;
         // 사전 판정 (self 대여 분리 — 클로저로 두면 mut 대여와 충돌)
         let elig: Vec<bool> = jobs
             .iter()
@@ -1143,25 +824,15 @@ impl DecoderState {
                 )
             })
             .collect();
-        let i8s: Vec<bool> = jobs
-            .iter()
-            .map(|(k, _, _)| i8_on && self.i8w.contains_key(k))
-            .collect();
-        // xq 필요 조건: gemv8/타일 외 폴백 잡이 하나라도 있을 때
-        let need_xq = (0..jobs.len()).any(|ji| !i8s[ji] && (!g8 || !elig[ji]));
+        // xq 필요 조건: gemv8 외 폴백 잡이 하나라도 있을 때
+        let need_xq = (0..jobs.len()).any(|ji| !g8 || !elig[ji]);
         if need_xq {
             self.quant(self.b_xn.buf, self.b_xq_n.buf, n, t)?;
         }
         let last = jobs.len() - 1;
         for (ji, (k, xq, out)) in jobs.iter().enumerate() {
             let bar = ji == last;
-            if i8s[ji] {
-                if v2 {
-                    self.gemm_i8v2(k, *out, t, bar)?;
-                } else {
-                    self.gemm_i8(k, *out, t, bar)?;
-                }
-            } else if g8 && elig[ji] {
+            if g8 && elig[ji] {
                 // spec 검증 배치(t≤5)도 gemv8 수치계열로 — 불변식 회복 (plans/33)
                 self.gemv8_q5(self.b_xn.buf, k, *out, t, bar)?;
             } else {
@@ -1171,22 +842,6 @@ impl DecoderState {
         Ok(())
     }
 
-    /// quant_b8: src f32 [t][n] → b8/yd/qs (gemm_i8 입력).
-    pub(super) fn quant_b8(&mut self, src: vk::Buffer, n: usize, t: usize) -> Result<(), String> {
-        let n_sub = n / 32;
-        let push = Self::push_u32s(&[n as u32, t as u32, n_sub as u32]);
-        self.run_pipe(
-            "quant_b8",
-            QUANT_B8_SPV,
-            4,
-            12,
-            &[src, self.b8.buf, self.ydb.buf, self.qsb.buf],
-            &push,
-            (n / 32 + 63) as u32 / 64,
-            t as u32,
-            1,
-        )
-    }
 
     /// rms_norm (t행) — 상수 가중치 (consts).
     pub(super) fn rms(

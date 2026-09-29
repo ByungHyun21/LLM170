@@ -1,7 +1,7 @@
 //! q4acc 프레임 — FrameState·FrameHost (활성 상주 디코드, plans/78 R1).
 
 use super::*;
-use crate::rawhip::{env_eq, env_on};
+use crate::rawhip::env_on;
 
 impl llm170_core::matmul::FrameState for Q4Acc {
     fn set_ctx_len(&self, n: usize) {
@@ -16,14 +16,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // 폴백의 전문가별 행수 r이 t 키로 쓰여 r>=16 타일/r<16 GEMV로 갈라
         // 같은 (토큰,전문가) 계산이 청킹별로 다른 패밀리 산술을 쓰는 것(원장
         // (18), value.rs launch_gemm 참조). 핀 + 타일 강제로 청크 16..512 전부
-        // 비트 동일(chunk-check 3종 PASS, 2026-09-21). 기본 ON; 끄려면
-        // LLM170_Q4_PF_PIN=0.
-        let pin = match std::env::var("LLM170_Q4_PF_PIN").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => true,
-        };
-        if t > 1 && pin {
+        // 비트 동일(chunk-check 3종 PASS, 2026-09-21). 핀은 무조건(원장 18
+        // 기본 ON 승격 — =0 복원 경로는 plans/109 P6 삭제).
+        if t > 1 {
             crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
         } else {
             crate::rawhip::ctx::PREFILL_PIN.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -211,18 +206,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 Some(v) => v,
                 None => {
                     let (q, w) = self.frame_quant(xp, n_in, rows)?;
-                    if std::env::var_os("LLM170_QHIST").is_some() {
-                        // plans/84 E.2: 양자화 mxsel(xq) 직접 해시 — 게이트 GEMM
-                        // 입력이 f32(mxsel)==인데 mgu가 상이한지 분리.
-                        self.ctx.sync().map_err(|e| e.to_string())?;
-                        let nw = rows.min(160) * w;
-                        let mut xqv = vec![0u32; nw];
-                        self.ctx.d2h(bytemuck::cast_slice_mut(&mut xqv), q)?;
-                        let h = xqv.iter().fold(0xcbf29ce484222325u64, |a, &u| {
-                            a.wrapping_mul(0x100000001b3) ^ (u as u64)
-                        });
-                        eprintln!("[nqh] rows={rows} n_in={n_in} xq_h={h:016x}");
-                    }
                     let mut c = self.quant_cache.lock().map_err(|e| e.to_string())?;
                     *c = Some((key.0, key.1, key.2, q as u64, w));
                     (q, w)
@@ -239,11 +222,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             let idp = self.fptr(ids)?;
             // K-분할: 타일 40블록(=1/CU)이던 점유율을 ksplit배로. 부분합은 part에
             // 남기고 reduce가 k 오름차순 합산(결정적, 순서 재결합만 다른 미세 드리프트).
-            let ksplit: u32 = std::env::var("LLM170_MOE_KSPLIT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4)
-                .clamp(1, 8);
+            let ksplit: u32 = 4; // 측정 기본(원장 98 계열) — 노브는 plans/109 P6 삭제
             let mut x_p = xq as *mut std::ffi::c_void;
             let mut w_p = wd as *mut std::ffi::c_void;
             let part_buf = self.ctx.scratch(rows * n_out * ksplit as usize * 8)?;
@@ -309,7 +288,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && !env_eq("LLM170_Q5W", "0")
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
@@ -348,7 +326,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             && !f32w
             && rows > 0
             && n_in / 32 <= 32
-            && !env_eq("LLM170_Q8IDS", "0")
         {
             let idp = self.fptr(ids)?;
             let mut x_p = xq as *mut std::ffi::c_void;
@@ -437,7 +414,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // 비트 동일하고 호스트 빌드·h2d 3회를 없애지만, 추가분(그룹 커널
                 // + 상한(rows*16+16) 크기로 커진 gather/scatter + 폴백의 이벤트
                 // 대기)이 그보다 커서 +31ms/스텝이다. down(q8_0) 폴백까지 그룹
-                // 커널로 덮으면 재평가한다. 옵트인: LLM170_MOE_GROUP_DEV=1.
                 // t=1 전용 (프리필은 아직 불가). 2026-09-14 리팩터: 상한을 한 곳에서
                 // 계산(rows + 16*ne)해 커널 인자·모든 버퍼에 쓰고, 소비 지점에서
                 // 디바이스가 보고한 rows_pad를 검증한다 — 리팩터 전에는 상한이
@@ -449,12 +425,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // (패딩/비패딩 gather·scatter·폴백 오프셋)를 전면 교정했으나
                 // 잔여 발산(16토큰 중 마지막 1개 플립)과 진단 동기화 시에만
                 // 재현되는 폴백 행 수 오염이 남아 기본 경로는 유지한다.
-                let pf_exp = env_eq("LLM170_MOE_GROUP_PF", "1");
-                if !env_eq("LLM170_MOE_GROUP_DEV", "0")
-                    && (self.t_cur() == 1 || pf_exp)
-                    && ne <= 512
-                    && rows > 0
-                {
+                if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
                     // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
@@ -1381,7 +1352,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
             // plans/83 D2: t=1 디코드에서 그룹 내 q8_0 인접쌍을 듀얼 커널로
             // 융합 — 런치 수 절반, 블록 수 합산(점유 개선). dual 커널의 행
             // 산술은 원판 gemm_q8_0과 동일 트리 → 비트 불변.
-            let dual_ok = t == 1 && std::env::var_os("LLM170_NO_DUAL").is_none();
+            let dual_ok = t == 1;
             let mut idx = 0usize;
             while idx < ws.len() {
                 let w = &ws[idx];
@@ -1425,7 +1396,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         // (hc down+inject)은 혼합 듀얼로 — 각 1런치. 행 산술은 소스 커널과
         // 동일 → 비트 불변.
         let f32fam = |ty: GgmlType| matches!(ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
-        let dual_any = t == 1 && std::env::var_os("LLM170_NO_DUAL").is_none();
+        let dual_any = t == 1;
         let mut idx = 0usize;
         while idx < ws.len() {
             let w = &ws[idx];
@@ -1498,7 +1469,6 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 && idx + 1 < ws.len()
                 && ws[idx + 1].ty == GgmlType::Q8_0
                 && ws[idx + 1].n_in == w.n_in
-                && std::env::var_os("LLM170_NO_DUAL").is_none()
             {
                 let (wd1, _) = self.dev_weight(w)?;
                 let (wd2, _) = self.dev_weight(&ws[idx + 1])?;

@@ -12,21 +12,13 @@ use ash::vk;
 use std::collections::HashMap;
 
 const GDN_CONV_SPV: &[u8] = include_bytes!("../spv/gdn_conv_t.spv");
-const GEMV8_Q5_SPV: &[u8] = include_bytes!("../spv/gemv8_q5.spv");
-const GEMV8_Q4_SPV: &[u8] = include_bytes!("../spv/gemv8_q4.spv");
-const GEMV8_XS_SPV: &[u8] = include_bytes!("../spv/gemv8_xs.spv");
-const GEMV8_Q3_SPV: &[u8] = include_bytes!("../spv/gemv8_q3.spv");
 const GEMV8_Q3B_SPV: &[u8] = include_bytes!("../spv/gemv8_q3b.spv");
-const GEMV8_Q6_SPV: &[u8] = include_bytes!("../spv/gemv8_q6.spv");
-const GEMV8_Q8_SPV: &[u8] = include_bytes!("../spv/gemv8_q8.spv");
 const GEMV8_Q5B_SPV: &[u8] = include_bytes!("../spv/gemv8_q5b.spv");
 const GEMV8_Q5N_SPV: &[u8] = include_bytes!("../spv/gemv8_q5n.spv");
 const GEMV8_NLB_SPV: &[u8] = include_bytes!("../spv/gemv8_nlb.spv");
 const GEMV8_I3S_SPV: &[u8] = include_bytes!("../spv/gemv8_i3s.spv");
 const GDN_ARF_SPV: &[u8] = include_bytes!("../spv/gdn_arf.spv");
 const GDN_AR8F_SPV: &[u8] = include_bytes!("../spv/gdn_ar8f.spv");
-const TILE_MS4GY_F16B_SPV: &[u8] = include_bytes!("../spv/tile_ms4gy_f16b.spv");
-const QUANT_F16_SPV: &[u8] = include_bytes!("../spv/quant_f16.spv");
 const GEMV8_Q4B_SPV: &[u8] = include_bytes!("../spv/gemv8_q4b.spv");
 const GEMV8_Q6B_SPV: &[u8] = include_bytes!("../spv/gemv8_q6b.spv");
 const GEMV8_Q8B_SPV: &[u8] = include_bytes!("../spv/gemv8_q8b.spv");
@@ -50,15 +42,10 @@ const TILE128_SPV: &[u8] = include_bytes!("../spv/tile128_q5k.spv");
 const TILE_XS_SPV: &[u8] = include_bytes!("../spv/tile_xs.spv");
 const TILE_Q8_SPV: &[u8] = include_bytes!("../spv/tile_q8.spv");
 const TILE_Q4K_SPV: &[u8] = include_bytes!("../spv/tile_q4k.spv");
-const GEMM_I8_SPV: &[u8] = include_bytes!("../spv/gemm_i8.spv");
-const QUANT_B8_SPV: &[u8] = include_bytes!("../spv/quant_b8.spv");
-const QUANT_B8V2_SPV: &[u8] = include_bytes!("../spv/quant_b8v2.spv");
-const GEMM_I8V2_SPV: &[u8] = include_bytes!("../spv/gemm_i8v2.spv");
 const ADDRMS_SPV: &[u8] = include_bytes!("../spv/addrms.spv");
 const TILE_NL_SPV: &[u8] = include_bytes!("../spv/tile_nl.spv");
 const TILE_IQ3S_SPV: &[u8] = include_bytes!("../spv/tile_iq3s.spv");
 const TILE_F16_SPV: &[u8] = include_bytes!("../spv/tile_f16.spv");
-const TILE128O_SPV: &[u8] = include_bytes!("../spv/tile128o.spv");
 const TILE_MS4GY_SPV: &[u8] = include_bytes!("../spv/tile_ms4gy.spv");
 const TILE_XS128_SPV: &[u8] = include_bytes!("../spv/tile_xs128.spv");
 const TILE_Q4K128_SPV: &[u8] = include_bytes!("../spv/tile_q4k128.spv");
@@ -92,7 +79,6 @@ const GEMV8T_XS_SPV: &[u8] = include_bytes!("../spv/gemv8t_xs.spv");
 const ROW_SHIFT_GATHER_SPV: &[u8] = include_bytes!("../spv/row_shift_gather.spv");
 const CAT2_ROWS_SPV: &[u8] = include_bytes!("../spv/cat2_rows.spv");
 
-/// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
 /// f32 → f16 비트 (반올림-최근접짝수). q8_0 헤더 인코딩용.
 fn f32_to_f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
@@ -124,22 +110,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     sign | h as u16
 }
 
-/// q5_K 사전 언패분 — i8 가중 + 블록 스케일 (gemm_i8 전용).
-struct I8W {
-    w: VkBuf,
-    wsp: VkBuf,
-    wsm: VkBuf,
-    n_out: usize,
-    n_in: usize,
-}
 
-/// ishs/faccs 워크그룹 상한 — 전 i8w 텐서의 max(n_out/16).
-fn i8_wg_max(map: &HashMap<String, I8W>) -> usize {
-    map.values()
-        .map(|e| e.n_out.div_ceil(16))
-        .max()
-        .unwrap_or(1)
-}
 
 pub struct VkDecoder {
     pub st: std::sync::Mutex<Option<DecoderState>>,
@@ -210,7 +181,6 @@ pub struct DecoderState {
     b_fdown: VkBuf,
     b_lg: VkBuf,   // head 로짓 [n_vocab] — b_gout 오버플로 수정 (T_MAX*n < vocab)
     b_ams: VkBuf,  // argmax 스테이지1 스크래치 [2*256] u32
-    b_xf16: VkBuf, // f16-B 활성 [T_MAX*n] f16
     b_lg_t: VkBuf, // head 로짓 [T_MAX][n_vocab] — verify 전 행 (plans/20)
     b_am: VkBuf,   // argmax 8바이트
     pipes: HashMap<&'static str, Pipes>,
@@ -233,13 +203,6 @@ pub struct DecoderState {
     // ── f16 사전 디양자화 가중 캐시 (plans/39) — 프리필 타일 전용
     f16w: HashMap<String, VkBuf>,
     // ── i8 coopmat GEMM (plans/23) — q5_K 사전 언패분
-    i8w: HashMap<String, I8W>,
-    wsr: HashMap<String, VkBuf>, // v2 행 스케일
-    b8: VkBuf,                   // [T_MAX][n_max] i8 활성 매트릭스
-    ydb: VkBuf,                  // [T_MAX][n_sub_max] f32
-    qsb: VkBuf,                  // [T_MAX][n_sub_max] i32
-    ishs: VkBuf,                 // [640][256] i32 — coopMatStore SSBO (workgroup별)
-    faccs: VkBuf,                // [640][256] f32
     // ── plans/91 P2 — MTP 프리필 배치 버퍼 (blk.64 t행 1패스, T_MAX 상한).
     m_be: VkBuf,   // [T][n] 토큰 임베딩 선반입 / hnorm 임시
     m_bcur: VkBuf, // [T][n] MTP hidden
@@ -318,7 +281,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     /// 정확(tokens 불변 실측)하고 가중 판독이 1회로 줄어 빠름 — 512 승인.
     /// 구 패밀리 옵트아웃(MSALL=0) 시에는 64 유지.
     fn tile_big_chunk(&self) -> bool {
-        llm170_diag::flag::ne0("LLM170_TILE_MSALL")
+        true // 원장 98: 청크 스윕 플랫(±0.5%) — 512 고정
     }
 
     fn raw_prefill(&self, seq: usize, pos0: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
@@ -328,17 +291,6 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         // step_batch 청크가 기본 (가중 1회 판독 상각 — 2026-09-04 발산은
         // 2026-09-05 디스크립터 세트 재사용 경합으로 판명, 수리 후 재발 없음;
         // 2026-09-08 judge VKD_BATCH+TILE 19/19 — plans/36 P1 종결).
-        // LLM170_VKD_BATCH=0 킬스위치.
-        if std::env::var("LLM170_VKD_BATCH")
-            .map(|v| v == "0")
-            .unwrap_or(false)
-        {
-            let mut last = None;
-            for (ti, ch) in emb.chunks(n).enumerate() {
-                last = Some(ds.step(seq, pos0 + ti, ch)?);
-            }
-            return Ok(last.unwrap_or_default());
-        }
         let mut last = None;
         for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
             last = Some(ds.step_batch(seq, pos0 + off, ch, false)?);

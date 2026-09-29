@@ -9,9 +9,8 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     /// plans/84 B: 프레임 op군이 부분 구현(엘리먼트와이스+MoE) — 완성 전에는
     /// 옵트인(LLM170_VK_FRAME=1)일 때만 엔진이 프레임 경로에 들어온다.
     /// plans/86 §8 — 프레임 경로 완성(§1 정확성·§2 QSA 디바이스화·§5 성능) 후
-    /// 기본 ON. 킬스위치 LLM170_VK_FRAME=0.
     fn frame_capable(&self) -> bool {
-        llm170_diag::flag::ne0("LLM170_VK_FRAME")
+        true // 원장 30 기본 ON — =0 킬스위치는 plans/109 P6 삭제
     }
     /// plans/85 §2 — 프레임 로짓 행별 argmax: fn_argmax_rows 2단 판.
     /// 동률 최저 인덱스 — CPU greedy_from과 동일 의미. 미구현이면 greedy
@@ -306,9 +305,9 @@ impl llm170_core::matmul::FrameHost for VkAcc {
                 // 디코드(ids2 f32 직결)는 f32 mglu 필요 → t≥2만.
                 let t_now = self.frame_t.load(std::sync::atomic::Ordering::Relaxed);
                 let glu = *self.moe_glu.lock();
+                // silu+quant 융합 승격 — =0 복원 plans/109 P6 삭제
                 let fused = t_now >= 2
-                    && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2)
-                    && llm170_diag::flag::ne0("LLM170_VK_SILUQ");
+                    && glu.is_some_and(|(h, n_in)| h == out && n % n_in == 0 && n / n_in >= 2);
                 if fused {
                     let (_, n_in) = glu.unwrap();
                     let rows = n / n_in;
@@ -802,15 +801,10 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
         let wbufs = self.weight_bufs(&mut ctx, w)?;
         // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로(dense_mm와 동일
         // 판·동일 수치 클래스). gemv3 t-루프는 512토큰에서 ~50ms 직렬.
-        // 킬스위치 LLM170_VK_MBTILE=0.
         if t >= 2
             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
             && wbufs.len() == 1
-            && std::env::var_os("LLM170_VK_MBTILE")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-            && llm170_diag::flag::ne0("LLM170_VK_CM")
-        {
+        { // MBTILE+CM 승격 — =0 복원 plans/109 P6 삭제
             let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
             let mut binds: Vec<vk::Buffer> = wbufs.clone();
             while binds.len() < 8 {
@@ -974,7 +968,7 @@ impl VkAcc {
             vk::Buffer::null()
         };
         let mut mmgrp_skip: Vec<bool> = vec![false; ws.len()];
-        if t < 16 && llm170_diag::flag::ne0("LLM170_VK_MMBGRP") && !ws.is_empty() && ws.len() <= 8 {
+        if t < 16 && !ws.is_empty() && ws.len() <= 8 {
             let dty0 = dense_ty(ws[0].ty);
             let single_chunk: Vec<bool> = ws
                 .iter()
@@ -1103,21 +1097,15 @@ impl VkAcc {
                     // plans/88 P2 — 프리필(t≥2) 밀집 타일: gemv3 t-루프는
                     // 실측 ~5GB/s(gemv 6.6s/208tok). 타일(K-슬라이스 스테이징)로
                     // 대체 — 산술 클래스는 동일 표현식·스레드 직렬 누산.
-                    // 스위치: LLM170_VK_DTILE=0 이면 종전 gemv.
                     // plans/89 P0.2 — 디코드(t<16) 밀집 GEMV를 llama dmmv
                     // 포트(q8b/q4b)로: f32 활성 직결(quant 불필요), 64스레드
                     // 2행 WG. [ts] 기준선 gemv 77ms/step — 272-329GB/s급으로
-                    // 기대. 킬스위치 LLM170_VK_G8=0(종전 quant+gemv3).
                     if t < 16
-                        && llm170_diag::flag::ne0("LLM170_VK_G8")
                         && self.gemv8_dense(&mut ctx, &wbufs, n_in, n_out, t, ty, xb, ob)?
                     {
                         continue;
                     }
                     let dense_tile = t >= 2
-                        && std::env::var_os("LLM170_VK_DTILE")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
                         && match w.ty {
                             GgmlType::Q8_0 => true,
                             GgmlType::Q4K => n_in <= 4096,
@@ -1136,11 +1124,7 @@ impl VkAcc {
                         // plans/89 P1.1 — coopmat 타일 우선(q8_0/q4_K 밀집):
                         // decoder ms/128 패밀리(f16 coopMatMulAdd) 직접 재사용.
                         // 스칼라 K-슬라이스 타일은 ALU 바운드([ts] tile_q8
-                        // 2818ms/청크). 킬스위치 LLM170_VK_CM=0.
-                        if llm170_diag::flag::ne0("LLM170_VK_CM")
-                            && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
-                            && wbufs.len() == 1
-                        {
+                        if matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && wbufs.len() == 1 {
                             let big = t >= 128;
                             let slot = match (w.ty, big) {
                                 (GgmlType::Q8_0, true) => Slot::TileQ8128Cm,

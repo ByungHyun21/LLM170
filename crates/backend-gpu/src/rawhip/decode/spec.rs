@@ -413,13 +413,13 @@ impl DecodeState {
         };
         let mut cp = std::time::Instant::now();
         // KV-only 프리필 제어: 프롬프트 행의 attention/wo/FFN 출력은 쓰이지 않는다
-        // (헤드는 마지막 행, 체인은 디코드 h 사용). LLM170_MTP_FULL=1이면 전행.
-        let full = env_on("LLM170_MTP_FULL");
+        // (헤드는 마지막 행, 체인은 디코드 h 사용). 전행 경로는 MTP_FULL 옵트인
+        // 부록으로 plans/109 P6에서 삭제(미사용 판정).
         let qstride = n_head * 2 * hd;
         let ostride = n_head * hd;
-        let nrow_attn = if full { t } else { 1 };
-        let qoff = if full { 0 } else { (t - 1) * qstride };
-        let ooff = if full { 0 } else { (t - 1) * ostride };
+        let nrow_attn = 1usize;
+        let qoff = (t - 1) * qstride;
+        let ooff = (t - 1) * ostride;
         // ① enorm(tok) ‖ hnorm(h_{p-1}) → cat [t][2n]  (mtp_b_cur/mtp_b_e는 임시)
         if self
             .mtp_prefetched
@@ -602,7 +602,6 @@ impl DecodeState {
             // KV-only: 원소 i의 MTP층 출력은 (a) 헤드에서 마지막 행만, (b) 체인은
             // 디코드 스텝의 h를 쓰므로 프롬프트 행들의 attention/wo/FFN은 불필요.
             // 인과 구조상 마지막 행의 출력은 앞 행들의 *KV*만 필요하다 (이미 적립).
-            // LLM170_MTP_FULL=1이면 종전 전행 경로.
             let mut qp = unsafe { self.aq_t.add(qoff * 4) } as *mut std::ffi::c_void;
             let mut ckp = self.mtp_kv_k16[seq] as *mut std::ffi::c_void;
             let mut cvp = self.mtp_kv_v16[seq] as *mut std::ffi::c_void;
@@ -616,14 +615,9 @@ impl DecodeState {
             let mut ss = self.ctx_len as i32;
             let mut p0 = (pos0 + t - nrow_attn) as i32;
             if np_
-                > llm170_diag::flag::val("LLM170_QSA_TH")
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(128)
+                > 128
             {
-                let sg = llm170_diag::flag::val("LLM170_QSA_SEG")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(128usize)
-                    .max(64);
+                let sg = 128;
                 let nseg = (pos0 + t).div_ceil(sg);
                 let part = self.ctx.scratch(nrow_attn * n_head * nseg * (hd + 2) * 4)?;
                 let mut pp2 = part as *mut std::ffi::c_void;
@@ -707,8 +701,8 @@ impl DecodeState {
             return Ok(0);
         }
         // ⑤⑥ KV-only: 마지막 행만 (앞 행들의 wo/FFN 출력은 아무도 쓰지 않는다)
-        let nrow_ffn = if full { t } else { 1 };
-        let coff = if full { 0 } else { (t - 1) * n };
+        let nrow_ffn = 1usize;
+        let coff = (t - 1) * n;
         let cur_p = unsafe { self.mtp_b_cur.add(coff * 4) };
         let aout_p = unsafe { self.aout_t.add(ooff * 4) };
         let gout_p = unsafe { self.gout_t.add(coff * 4) };

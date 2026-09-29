@@ -311,8 +311,10 @@ impl DecoderState {
     ) -> Result<Vec<f32>, String> {
         // 배치 검증 기본 (plans/91 P2): step_batch t행 == step() 행별 비트 동일
         // (plans/20 계약 + P0 verify_np_self 재확보 — gemv8t 2..4토큰 포함).
-        // 킬스위치 LLM170_VKD_SPEC_BATCH=0.
-        if llm170_diag::flag::ne0("LLM170_VKD_SPEC_BATCH") {
+        // 배치 검증 (plans/91 P2): step_batch t행 == step() 행별 비트 동일
+        // (plans/20 계약 + P0 verify_np_self 재확보 — gemv8t 2..4토큰 포함).
+        // per-token 복원(VKD_SPEC_BATCH=0)은 plans/109 P6 삭제.
+
             let n = self.n_embd;
             for (off, ch) in emb.chunks(T_MAX * n).enumerate() {
                 let t = ch.len() / n;
@@ -371,17 +373,7 @@ impl DecoderState {
                 };
                 h_all.extend_from_slice(&hv);
             }
-            return Ok(Vec::new());
-        }
-        let n = self.n_embd;
-        let mut last = Vec::new();
-        for (ti, ch) in emb.chunks(n).enumerate() {
-            let lg = self.step(seq, pos0 + ti, ch)?;
-            argmaxes.push(llm170_core::matmul::greedy_from(&lg));
-            h_all.extend_from_slice(&self.hidden_row());
-            last = lg;
-        }
-        Ok(last)
+        Ok(Vec::new())
     }
 
     /// MTP 프리필 배치 (plans/91 P2) — blk.64를 t행 1패스. rawhip

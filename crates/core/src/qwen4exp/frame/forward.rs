@@ -72,10 +72,10 @@ pub(crate) fn frame_forward_ex(
         let embd = model
             .w("token_embd.weight")
             .ok_or(Q4Error::MissingTensor("token_embd".into()))?;
-        // plans/97: Q8_0 임베딩은 GPU gather(킬: LLM170_VK_EMBQ8=0).
+        // plans/97: Q8_0 임베딩은 GPU gather.
         // CPU 디퀀트는 측정 rep에서 콜드 54ms(GPU 유휴) — 커널은 수백 µs.
         let mut gpu_ok = false;
-        if embd.ty == llm170_gguf::GgmlType::Q8_0 && llm170_diag::flag::ne0("LLM170_VK_EMBQ8") {
+        if embd.ty == llm170_gguf::GgmlType::Q8_0 {
             gpu_ok = acc
                 .emb_q8_gather_dev(
                     embd.data.as_ptr() as usize,
@@ -737,10 +737,10 @@ pub(super) fn qsa_frame(
     // 스텝의 최대 단일 유휴였다(KTRACE 16k: "after qk_norm_rope" 40ms/step).
     // 선택 전 과정을 커널로 옮기고 어텐션이 목록을 디바이스에서 직접 읽는다.
     // 호스트 kv/idx 캐시는 이 경로에서 갱신하지 않는다(→ qsa_host_stale;
-    // 프리필 진입 시 풀에서 1회 재구축). LLM170_QSA_HOSTSEL=1이면 구경로.
+    // 프리필 진입 시 풀에서 1회 재구축). 구경로 복원(HOSTSEL=1)은 plans/109 P6 삭제.
     let kq_scale = hp.kq_scale();
     let r = hp.compress[il] as usize;
-    if t == 1 && std::env::var_os("LLM170_QSA_HOSTSEL").is_none() {
+    if t == 1 {
         let iqw = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let dev = acc
