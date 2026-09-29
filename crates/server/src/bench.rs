@@ -420,56 +420,28 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             ));
         }
         if *spec_k > 0 && has_mtp && bench_np > 1 {
-            // np×spec — per-seq 독립 스펙(LLM170_SPEC_PERSEQ=1) 또는 병합(기본)
-            // 병합 경로(spec_step_multi)는 verify_batch_ms 가중치 상각은
-            // 좋으나 수용률이 붕괴(kept=1)한다. per-seq는 가중치를 n_seq회
-            // 읽지만 수용률이 단일 스트림 수준(1-3)으로 회복된다.
-            let per_seq = std::env::var_os("LLM170_SPEC_PERSEQ").is_some();
+            // np×spec 병합(spec_step_multi). per-seq 독립 변형(SPEC_PERSEQ)은
+            // 원장 115 부정 판정으로 plans/109 P6 삭제.
             let mut nexts: Vec<u32> = vec![llm170_core::qwen35::greedy(&l); bench_np];
             let mut done: Vec<usize> = vec![0; bench_np];
             let mut total_gen = 0usize;
             while total_gen < tg * bench_np {
-                if per_seq {
-                    let mut any = false;
-                    for s2 in 0..bench_np {
+                let active: Vec<usize> = (0..bench_np).filter(|&s2| done[s2] < *tg).collect();
+                if active.is_empty() {
+                    break;
+                }
+                let ns: Vec<u32> = active.iter().map(|&s2| nexts[s2]).collect();
+                let acc = eng
+                    .spec_step_multi(&active, &ns, *spec_k)
+                    .map_err(|e| e.to_string())?;
+                for (i, &s2) in active.iter().enumerate() {
+                    for &t2 in &acc[i] {
                         if done[s2] >= *tg {
-                            continue;
+                            break;
                         }
-                        any = true;
-                        let (toks, _tf) = eng
-                            .spec_step(s2, nexts[s2], *spec_k)
-                            .map_err(|e| e.to_string())?;
-                        for &t in &toks {
-                            if done[s2] >= *tg {
-                                break;
-                            }
-                            nexts[s2] = t;
-                            done[s2] += 1;
-                            total_gen += 1;
-                        }
-                    }
-                    if !any {
-                        break;
-                    }
-                } else {
-                    let active: Vec<usize> =
-                        (0..bench_np).filter(|&s2| done[s2] < *tg).collect();
-                    if active.is_empty() {
-                        break;
-                    }
-                    let ns: Vec<u32> = active.iter().map(|&s2| nexts[s2]).collect();
-                    let acc = eng
-                        .spec_step_multi(&active, &ns, *spec_k)
-                        .map_err(|e| e.to_string())?;
-                    for (i, &s2) in active.iter().enumerate() {
-                        for &t2 in &acc[i] {
-                            if done[s2] >= *tg {
-                                break;
-                            }
-                            nexts[s2] = t2;
-                            done[s2] += 1;
-                            total_gen += 1;
-                        }
+                        nexts[s2] = t2;
+                        done[s2] += 1;
+                        total_gen += 1;
                     }
                 }
             }

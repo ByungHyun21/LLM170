@@ -71,60 +71,6 @@ impl RawCtx {
         Ok(res)
     }
 
-    /// W4A8 GEMV — reduce 결과를 상주 out에 직접 기록 (왕복 제거).
-    /// 수치는 gemv_q8과 동일열 (동일 커널·reduce).
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8_out_v2(
-        &self,
-        xq: *const u8,
-        w: *const u8,
-        _ty: u32,
-        n_in: usize,
-        n_out: usize,
-        out: *mut u8,
-        xq_w: usize,
-        t: usize,
-    ) -> Result<(), String> {
-        let gy = n_out.min(65535) as u32;
-        let gz = n_out.div_ceil(65535) as u32;
-        let mut xq_p = xq as *mut std::ffi::c_void;
-        let mut w_p = w as *mut std::ffi::c_void;
-        let mut o_p = out as *mut std::ffi::c_void;
-        let mut ni = n_in as i32;
-        let mut no = n_out as i32;
-        let mut xw = xq_w as i32;
-        let mut tt = t as i32;
-        let mut args: Vec<*mut std::ffi::c_void> = vec![
-            (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-            (&mut ni) as *mut _ as *mut std::ffi::c_void,
-            (&mut no) as *mut _ as *mut std::ffi::c_void,
-            (&mut xw) as *mut _ as *mut std::ffi::c_void,
-            (&mut tt) as *mut _ as *mut std::ffi::c_void,
-        ];
-        let f = *self.fns.get("gemm_q5k_v2").ok_or("gemm_q5k_v2 없음")?;
-        unsafe {
-            ck(
-                hip::hipModuleLaunchKernel(
-                    f,
-                    t as u32,
-                    gy,
-                    gz,
-                    64,
-                    1,
-                    1,
-                    0,
-                    self.stream,
-                    args.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "gemm_q5k_v2",
-            )?;
-        }
-        Ok(())
-    }
-
     /// plans/108 P7 — t=1 q8_0 dmmv: f32 활성 직소비 GEMV(vk gemv8_q8b 이식).
     /// 활성 quant를 건너뛰는 경로 — mm_b2 디스패치와 grp_mmq(dmmv_used)
     /// 게이트가 동일 조건이어야 한다(어긋나면 stale xq를 읽는다).
@@ -208,10 +154,6 @@ impl RawCtx {
                 &mut n_out_a as *mut _ as *mut std::ffi::c_void,
             ],
         };
-        // plans/73: vdr=2 판(v2)은 측정 역행(10.83 vs 11.35 t/s) — 옵트인 자산.
-        if t == 1 && ty == 13 && env_eq("LLM170_Q5KV2", "1") {
-            return self.gemv_q8_out_v2(xq, w, ty, n_in, n_out, out, xq_w, t);
-        }
         let q8tr = env_on("LLM170_Q8_TRACE");
         if q8tr {
             eprintln!("# q8tr ty={ty} n_in={n_in} n_out={n_out} t={t}");
@@ -232,7 +174,6 @@ impl RawCtx {
         if (2..=8).contains(&t)
             && ty == 8
             && n_in / 32 <= 32
-            && !env_eq("LLM170_Q8MT16", "0")
             && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -265,7 +206,6 @@ impl RawCtx {
         if (2..=8).contains(&t)
             && ty == 8
             && n_in / 32 > 32
-            && !env_eq("LLM170_Q8MTW", "0")
             && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -292,7 +232,6 @@ impl RawCtx {
         }
         if (2..=8).contains(&t)
             && ty == 8
-            && !env_eq("LLM170_Q8MT", "0")
             && !PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
         {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -317,37 +256,10 @@ impl RawCtx {
                 &mut args,
             );
         }
-        // 실측(2026-09-16): w4(사분면, 비트 동일) -9%, w16(연속 매핑) -7% —
-        // 둘 다 레인 효율은 100%지만 종전 64레인 판(coalescing·ILP)이 더 빠르다.
-        // 따라서 **기본은 종전 커널**, 실험판은 옵트인(LLM170_Q8W4=1 / Q8W16=1).
-        if t == 1 && ty == 8 && (env_eq("LLM170_Q8W4", "1") || env_eq("LLM170_Q8W16", "1")) {
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mut xq_p as *mut _ as *mut std::ffi::c_void,
-                &mut w_p as *mut _ as *mut std::ffi::c_void,
-                &mut part_p as *mut _ as *mut std::ffi::c_void,
-                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
-                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
-                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
-                &mut xw_a as *mut _ as *mut std::ffi::c_void,
-            ];
-            let alt = env_eq("LLM170_Q8W16", "1");
-            return self.launch3(
-                if alt { "gemm_q8_0_w16" } else { "gemm_q8_0_w4" },
-                n_out.div_ceil(8) as u32,
-                t as u32,
-                1,
-                128,
-                &mut args,
-            );
-        }
         // 소형 n_sub(≤32) 구간은 w16(16레인/행, 레인 효율 62.5-100% vs 워프판
         // 31%)으로 — FN tg128 17.2 → 18.0 t/s (+4.8%, 2026-09-16 실측, 게이트 동일).
         // 킬스위치 LLM170_Q8W16_SMALL=0.
-        if t == 1
-            && ty == 8
-            && (n_in / 32 <= 32 || (n_out >= 32768 && env_eq("LLM170_Q8W16_HEAD", "1")))
-            && (!env_eq("LLM170_Q8W16_SMALL", "0") || env_eq("LLM170_Q8W16_HEAD", "1"))
-        {
+        if t == 1 && ty == 8 && n_in / 32 <= 32 {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -372,32 +284,7 @@ impl RawCtx {
         // 구분이 없어 옵트인으로만 둔다. 기본 적용은 형상 스코프 분리 후.
         // plans/84 E1: 모델 스코프 분리 — Flash-Next 기본 적용(FN tg +0.8%,
         // 게이트 통과), qwen35는 옵트인(타이 플립 방지). 킬스위치 =0.
-        if t == 1
-            && ty == 8
-            && n_out <= 2048
-            && n_in / 32 > 32
-            && (env_eq("LLM170_Q8W_SMALLN", "1")
-                || (self.scope_is_flashnext() && !env_eq("LLM170_Q8W_SMALLN", "0")))
-        {
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mut xq_p as *mut _ as *mut std::ffi::c_void,
-                &mut w_p as *mut _ as *mut std::ffi::c_void,
-                &mut part_p as *mut _ as *mut std::ffi::c_void,
-                &mut out_p0 as *mut _ as *mut std::ffi::c_void,
-                &mut n_in_a as *mut _ as *mut std::ffi::c_void,
-                &mut n_out_a as *mut _ as *mut std::ffi::c_void,
-                &mut xw_a as *mut _ as *mut std::ffi::c_void,
-            ];
-            return self.launch3(
-                "gemm_q8_0_w",
-                n_out.div_ceil(8) as u32,
-                1,
-                1,
-                256,
-                &mut args,
-            );
-        }
-        if t == 1 && ty == 8 && n_in / 32 <= 32 && !env_eq("LLM170_Q8W", "0") {
+        if t == 1 && ty == 8 && n_out <= 2048 && n_in / 32 > 32 && self.scope_is_flashnext() {
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 &mut xq_p as *mut _ as *mut std::ffi::c_void,
                 &mut w_p as *mut _ as *mut std::ffi::c_void,
@@ -712,8 +599,6 @@ impl RawCtx {
             23 => {
                 if j128 {
                     "gemm_xs_j128"
-                } else if env_on("LLM170_XS_MM") {
-                    "gemm_xs_mm"
                 } else if v4 && !env_on("LLM170_EXACT") && big {
                     "gemm_xs_v4"
                 } else if !env_on("LLM170_EXACT") && big {
@@ -1029,22 +914,10 @@ impl RawCtx {
                 ),
                 "mmq_quant_y",
             )?;
-            let mut b1 = xq_p as *mut std::ffi::c_void;
             let mut b2 = wf16 as *mut std::ffi::c_void;
-            let mut b3 = out as *mut std::ffi::c_void;
             let mut b4 = n_in as i32;
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
-            let mut b7 = tr as i32;
-            let _args2 = [
-                &mut b1 as *mut _ as *mut _,
-                &mut b2 as *mut _ as *mut _,
-                &mut b3 as *mut _ as *mut _,
-                &mut b4 as *mut _ as *mut _,
-                &mut b5 as *mut _ as *mut _,
-                &mut b6 as *mut _ as *mut _,
-                &mut b7 as *mut _ as *mut _,
-            ];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
                 let mut z1 = xq_p as *mut std::ffi::c_void;
@@ -1091,19 +964,10 @@ impl RawCtx {
     ) -> Result<(), String> {
         let fns = &self.fns;
         // f16 전개 커널 선택 — 우리 .co의 GEMM이 소비하는 레이아웃으로 전개한다.
-        let (fq, _blk_div) = match ty {
-            14 => (
-                *fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?,
-                1usize,
-            ),
-            12 => (
-                *fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?,
-                1,
-            ),
-            8 => (
-                *fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?,
-                1,
-            ),
+        let fq = match ty {
+            14 => *fns.get("dequant_q6k_f16").ok_or("dequant_q6k_f16 없음")?,
+            12 => *fns.get("dequant_q4k_f16").ok_or("dequant_q4k_f16 없음")?,
+            8 => *fns.get("dequant_q8_0_f16").ok_or("dequant_q8_0_f16 없음")?,
             _ => return Err(format!("f16 경로 미지원 타입 {ty}")),
         };
         let fm = *fns.get("gemm_f16_v4").ok_or("gemm_f16_v4 없음")?;
@@ -1199,22 +1063,10 @@ impl RawCtx {
                 ),
                 "quant_q8",
             )?;
-            let mut b1 = xq_p as *mut std::ffi::c_void;
             let mut b2 = wf16 as *mut std::ffi::c_void;
-            let mut b3 = out as *mut std::ffi::c_void;
             let mut b4 = n_in as i32;
             let mut b5 = n_out as i32;
             let mut b6 = xq_w as i32;
-            let mut b7 = tr as i32;
-            let _args2 = [
-                &mut b1 as *mut _ as *mut _,
-                &mut b2 as *mut _ as *mut _,
-                &mut b3 as *mut _ as *mut _,
-                &mut b4 as *mut _ as *mut _,
-                &mut b5 as *mut _ as *mut _,
-                &mut b6 as *mut _ as *mut _,
-                &mut b7 as *mut _ as *mut _,
-            ];
             // z-그리드 사분면 CO: 단일 런치 (tt=min(t,128), gz=사분면)
             {
                 let mut z1 = xq_p as *mut std::ffi::c_void;
@@ -1273,7 +1125,7 @@ impl RawCtx {
                 "mmq_quant_y"
             })
             .ok_or("mmq quant 없음")?;
-        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
+        let j: usize = 128;
         let sym = match ty {
             12 => {
                 let js = if j == 64 { "64" } else { "128" };
@@ -1339,20 +1191,7 @@ impl RawCtx {
         let mut ysrc = y_f32 as *const std::ffi::c_void;
         let mut nt = t as i32;
         let mut ni_a = n_in as i32;
-        // 부록81: 동일 에포크·동일 y원본이면 재양자화 스킵 (층당 1회).
-        let y_key = (y_f32 as usize, (n_in / 128) * t * 144);
-        // 회귀 픽스(부록90): 캐시는 메인 yb(mmq_y)만 — 사이드 yb(mmq_y_s)는
-        // 별도 버퍼라 히트 시 미초기화 y로 mul_mat_q를 돌렸다 (장문 가비지).
-        let this_is_main = yb == {
-            self.mmq_y
-                .lock()
-                .map(|c| c.1)
-                .unwrap_or(std::ptr::null_mut())
-        };
-        // y 재사용 캐시는 비활성(위 사유: 별도 버퍼 히트 시 미초기화 y로 mul_mat_q).
-        let cached = false;
-        let _ = this_is_main;
-        if !cached {
+        {
             if ty == 8 {
                 // plans/71: Q8_0의 y양자화는 신형 quantize_mmq_q8_1<D4,false>
                 // (ROCm 10 빌드) — 구형 mmq_quant_y*는 block_q8_1_mmq ABI가 달라
@@ -1434,9 +1273,6 @@ impl RawCtx {
                     self.ktr_mark("mmq_quant_y", t as u32);
                 }
             }
-            if let Ok(mut c) = self.mmq_y_cache.lock() {
-                *c = (c.0, y_key.0, y_key.1);
-            }
         }
         fn fd3(d: u32) -> [u32; 3] {
             let mut l = 0u32;
@@ -1446,14 +1282,14 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
+        let j: usize = 128;
         // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
         // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
         let qk: usize = if ty == 8 { 32 } else { 256 };
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
-        let j_now: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
+        let j_now: usize = 128;
         let mut ntx_fd = fd3(t.div_ceil(j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;
@@ -1563,8 +1399,7 @@ impl RawCtx {
                 "mmq_quant_y"
             })
             .ok_or("mmq quant 없음")?;
-        let _j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
-        let sym = match ty {
+                let sym = match ty {
             12 => {
                 "_ZL9mul_mat_qIL9ggml_type12ELi128ELb0EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_"
             }
@@ -1635,14 +1470,14 @@ impl RawCtx {
             let mp = ((((1u64) << 32) * (((1u64) << l) - d as u64)) / d as u64 + 1) as u32;
             [mp, l, d]
         }
-        let j: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
+        let j: usize = 128;
         // 블록 원소수(qk): K계열 256, Q8_0은 32 — launcher의 ncols_x/qk 계약.
         // n_in/256 하드코딩은 Q8_0에서 8배 작아 인덱싱 붕괴(가비지)였다(plans/71).
         let qk: usize = if ty == 8 { 32 } else { 256 };
         let nbk = (n_in / qk) as u32;
         let mut bpn = fd3(nbk);
         let mut one = fd3(1);
-        let j_now: usize = if env_on("LLM170_MMQ64") { 64 } else { 128 };
+        let j_now: usize = 128;
         let mut ntx_fd = fd3(t.div_ceil(j_now) as u32);
         let z3: [u32; 3] = [0, 0, 0];
         let mut ax = w_eff as *mut std::ffi::c_void;

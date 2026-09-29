@@ -201,7 +201,6 @@ impl VkAcc {
         // 2) gate/up GEMV (같은 xq0) — 상주 출력.
         // plans/89 — t≥2 q8_0/q4_K는 밀집 coopmat 타일로: gemv3 t-루프는
         // 512토큰 프리필에서 ~50ms/디스패치(직렬 t). 레이아웃 동일
-        // (outv[tok*n_out+row]). 킬스위치 LLM170_VK_FFNCH=0.
         for (w, obuf) in [(gate_w, bfg), (up_w, bfu)] {
             self.ffn_tile_or_gemv(&mut ctx, w, n0, xq0_w, t, bq0, obuf)?;
         }
@@ -271,12 +270,6 @@ impl VkAcc {
         let n_out = w.n_out as usize;
         let wbufs = self.weight_bufs(ctx, w)?;
         let use_tile = t >= 2
-            && std::env::var_os("LLM170_VK_FFNCH")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-            && std::env::var("LLM170_VK_CM")
-                .map(|v| v != "0")
-                .unwrap_or(true)
             && matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K)
             && wbufs.len() == 1
             && vk_ty(w.ty).is_some();

@@ -740,9 +740,6 @@ impl Engine {
             && std::env::var("LLM170_RAWHIP")
                 .map(|v| v != "0")
                 .unwrap_or(true)
-            && std::env::var("LLM170_NP_GREEDY")
-                .map(|v| v != "0")
-                .unwrap_or(true)
         {
             let rd = self.raw_decode.clone().unwrap();
             let n = self.model.hp.n_embd;

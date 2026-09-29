@@ -508,28 +508,6 @@ impl DecodeState {
         self.ctx.launch3("gemm_q5k2", 1, gy, gz, 64, &mut args)
     }
 
-    /// 사이드 스트림 GEMV — side_wait_main 선행 + join2 후속이 계약.
-    fn mm_into_s(
-        &self,
-        xq: *mut u8,
-        wp: *mut u8,
-        ty: u32,
-        n_in: usize,
-        n_out: usize,
-        out: *mut u8,
-    ) -> Result<(), String> {
-        self.ctx.gemv_q8_out_s(
-            xq as *const u8,
-            wp as *const u8,
-            self.ktab2 as *const u8,
-            ty,
-            n_in,
-            n_out,
-            out,
-            crate::rawhip::q4acc::xq_words(n_in),
-            1,
-        )
-    }
     /// gemv_q8_out과 동일 인자를 직접 launch — q6k/q4k/q5k/q8 단일행.
     pub(super) fn mm_direct(
         &self,
@@ -605,7 +583,7 @@ impl DecodeState {
     }
     /// rms+quant 융합 (t=1, n%1024==0) — 3런치 1런치. 산술 미러 동일열.
     fn rms_quant(&self, x: *mut u8, w: *mut u8, xq: *mut u8, n: usize) -> Result<(), String> {
-        if !n.is_multiple_of(1024) || env_on("LLM170_RMSQ_SPLIT") {
+        if !n.is_multiple_of(1024) {
             self.rms(x, w, self.xn, n)?;
             return self.quant(self.xn, xq, n);
         }
@@ -750,24 +728,14 @@ impl DecodeState {
                 // 회귀 픽스: 듀얼 분기 독립 체인 — 기존 if/else는 q5k듀얼시 beta/alpha,
                 // q8듀얼시 qkv/gate를 건너뛰었다 (부록90).
                 // 107 P0-8: 게이트 철자 단일화 — NODUAL → NO_DUAL (frame.rs와 동일).
-                if ty == 13 && tg2 == 13 && ni == nig2 && std::env::var("LLM170_NO_DUAL").is_err() {
+                if ty == 13 && tg2 == 13 && ni == nig2 {
                     self.mm_into2_q5k(self.xq_n, wp, no, self.gqkv, wg2, nog2, self.gz, ni)?;
-                } else if env_on("LLM170_DECODE_PAIRS") {
-                    self.ctx.side_wait_main()?;
-                    self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
-                    self.mm_into_s(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
-                    self.ctx.join2()?;
                 } else {
                     self.mm_into(self.xq_n, wp, ty, ni, no, self.gqkv)?;
                     self.mm_into(self.xq_n, wg2, tg2, nig2, nog2, self.gz)?;
                 }
                 if tb2 == 8 && ta2 == 8 && nib2 == nia2 {
                     self.mm_into2_q8(self.xq_n, wb2, nob2, self.gb, wa2, noa2, self.ga, nib2)?;
-                } else if env_on("LLM170_DECODE_PAIRS") {
-                    self.ctx.side_wait_main()?;
-                    self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
-                    self.mm_into_s(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
-                    self.ctx.join2()?;
                 } else {
                     self.mm_into(self.xq_n, wb2, tb2, nib2, nob2, self.gb)?;
                     self.mm_into(self.xq_n, wa2, ta2, nia2, noa2, self.ga)?;
@@ -1277,13 +1245,7 @@ impl DecodeState {
                     // GQA 공유 커널은 세그먼트 수와 무관하게 우월 — 단문(ctx<512)에서도
                     // 평문 qsa_flash 대신 사용한다 (gq=1이면 종전과 동일 산술).
                     let gqa_ok = hd <= 256 && n_head % n_kv == 0;
-                    if gqa_ok
-                        || np_
-                            > (std::env::var("LLM170_T1SEG")
-                                .ok()
-                                .and_then(|v| v.parse::<i32>().ok())
-                                .unwrap_or(512))
-                    {
+                    if gqa_ok || np_ > 512 {
                         // 분할 flash — 헤드당 1블록(48블록)은 대역폭 저활용,
                         // 세그먼트 병렬화 (t=1도 nq 가드로 안전, 2026-09-05)
                         // sg = 32 고정은 단문맥 최적(플랫폼 지연 은닉)이지만 장문맥에서
@@ -1291,41 +1253,16 @@ impl DecodeState {
                         // (KTRACE 16k: gqa2d 5.6 + merge 4.2ms/step). plans/73: 문맥에
                         // 비례해 키우면 nseg ≤ 64 로 유지 — 블록 수(4kvh×nseg)는
                         // 256+ 로 충분히 병렬. 단문맥(sg=32 구간)은 수치 순서 불변.
-                        let sg = std::env::var("LLM170_T1SG")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or_else(|| ((pos + 1) / 64).clamp(32, 256));
+                        let sg = ((pos + 1) / 64).clamp(32, 256);
                         let nseg = (pos + 1).div_ceil(sg);
                         let part = self.ctx.scratch(n_head * nseg * (hd + 2) * 4)?;
                         let mut pp2 = part as *mut std::ffi::c_void;
                         let mut sg_a = sg as i32;
-                        let mut args = vec![
-                            Self::p(&mut qp),
-                            Self::p(&mut ckp),
-                            Self::p(&mut cvp),
-                            Self::p(&mut mp),
-                            Self::p(&mut pp2),
-                            Self::p(&mut np_),
-                            Self::p(&mut nh),
-                            Self::p(&mut nk),
-                            Self::p(&mut h),
-                            Self::p(&mut tl),
-                            Self::p(&mut ss),
-                            Self::p(&mut p0),
-                            Self::p(&mut sg_a),
-                        ];
-                        // GQA 공유(t=1): kv-head당 WG 하나가 q-head 전부를 처리 —
-                        // K/V 트래픽 1/(q-heads per kv-head). LLM170_NO_GQA=1이면 종전.
-                        // 실측 교차점: ctx<768은 종전(더 많은 WG), 그 이상은 GQA 공유가
-                        // 이김 (pp512 −1.2%, 1024 +1.6%, 2048 +4.7%, 3072 +8.8%).
-                        let gqa = gqa_ok;
                         // v2 기본(2026-09-12): 워프가 키 4개를 전담해 감축을 워프 안에서 끝낸다.
                         // gqa-bench 실측 3314키 292.9 -> 171.5us (1.71x), 최대상대차 5.1e-7.
-                        // LLM170_NO_GQA2=1 이면 종전 커널로 복귀.
-                        let gqa2 = !env_on("LLM170_NO_GQA2");
-                        // v_dot2(f16 KV) 경로가 기본: QK 에 셔플이 없다 (gqa-bench 3314 175.9→106.9us)
-                        let gqa2d = gqa2;
-                        if gqa2d {
+                        // v_dot2(f16 KV) 경로: QK 에 셔플이 없다 (gqa-bench 3314 175.9→106.9us).
+                        // gqa2/gqa/split4q4 복원 경로(NO_GQA2)는 plans/109 P6 삭제.
+                        {
                             // f16 미러 + v_dot2: 인자 순서는 gqa2 와 같고 K/V 만 half 버퍼
                             let mut k16 = self.kv_k16[full_idx][seq] as *mut std::ffi::c_void;
                             let mut v16 = self.kv_v16[full_idx][seq] as *mut std::ffi::c_void;
@@ -1351,33 +1288,6 @@ impl DecodeState {
                                 nseg as u32,
                                 256,
                                 &mut args16,
-                            )?;
-                        } else if gqa && gqa2 {
-                            self.ctx.launch3(
-                                "qsa_flash_gqa2",
-                                1,
-                                n_kv as u32,
-                                nseg as u32,
-                                256,
-                                &mut args,
-                            )?;
-                        } else if gqa {
-                            self.ctx.launch3(
-                                "qsa_flash_gqa",
-                                1,
-                                n_kv as u32,
-                                nseg as u32,
-                                256,
-                                &mut args,
-                            )?;
-                        } else {
-                            self.ctx.launch3(
-                                "qsa_flash_split4q4",
-                                1,
-                                n_head as u32,
-                                nseg as u32,
-                                256,
-                                &mut args,
                             )?;
                         }
                         let mut margs = vec![
@@ -1456,15 +1366,8 @@ impl DecodeState {
             self.rms_quant(self.xs, pw, self.xq_n, n)?;
             let (wg, tg, nig, nog) = self.w(&format!("blk.{il}.ffn_gate.weight"))?;
             let (wu, tu, niu, nou) = self.w(&format!("blk.{il}.ffn_up.weight"))?;
-            if env_on("LLM170_DECODE_PAIRS") {
-                self.ctx.side_wait_main()?;
-                self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
-                self.mm_into_s(self.xq_n, wu, tu, niu, nou, self.fup)?;
-                self.ctx.join2()?;
-            } else {
-                self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
-                self.mm_into(self.xq_n, wu, tu, niu, nou, self.fup)?;
-            }
+            self.mm_into(self.xq_n, wg, tg, nig, nog, self.fgate)?;
+            self.mm_into(self.xq_n, wu, tu, niu, nou, self.fup)?;
             // silu_mul+quant 융합 (t=1, n_ff%2048==0) — 동일 산술열
             if self.n_ff.is_multiple_of(2048) {
                 let mut gp = self.fgate as *mut std::ffi::c_void;

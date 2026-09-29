@@ -87,15 +87,6 @@ impl DecoderState {
             .unwrap_or(n);
         // q5_K 원본 캡처 (i8 언패용 — 루프가 weights를 소비하기 전)
         // plans/40: 빌림 유지 — 클론 제거 (구 d.clone()가 q5 전체 ~8GB 복제)
-        let q5k_src: Vec<(&str, &[u8], usize, usize)> = weights_final
-            .iter()
-            .filter(|(_, _, ty, _, _)| *ty == 13)
-            .map(|(k, d, _, ni, no)| (*k, *d, *ni, *no))
-            .collect();
-
-        // f16 사전 디양자화 캐시 (plans/39) — 데이터 복제 없음(대여만):
-        // 디양자화를 가중 업로드 루프 앞에서 수행 (RCA: .cloned() 전체복제가
-        // 30Gi 호스트 RAM을 초과해 OOM·세션 사망의 원인이었음).
         let f16w_on = llm170_diag::flag::eq1("LLM170_VK_F16W");
         let f16w_max = std::env::var("LLM170_VK_F16W_MAX")
             .ok()
@@ -366,152 +357,7 @@ impl DecoderState {
         let m_prefetched = std::sync::atomic::AtomicBool::new(false);
         let b_lg = ah(n_vocab)?;
         let b_ams = ah(512)?; // argmax 스테이지1 스크래치 (u32쌍 ×256WG)
-        let b_xf16 = ah(T_MAX * n * 2)?; // f16-B 활성 (plans/46, 요소수 T_MAX*n)
         let b_lg_t = ah(T_MAX * n_vocab)?;
-        // ── q5_K i8 언패 (plans/23, gemm_i8) — CPU 병렬, 업로드 1회.
-        let mut i8w: HashMap<String, I8W> = HashMap::new();
-        let mut wsr_map: HashMap<String, VkBuf> = HashMap::new();
-        for &(name, data, ni, no) in &q5k_src {
-            let n_sub = ni / 32;
-            let nblk = ni / 256;
-            let mut w8 = vec![0i8; no * ni];
-            let mut wsp = vec![0f32; no * n_sub];
-            let mut wsm = vec![0f32; no * n_sub];
-            std::thread::scope(|s| {
-                let rows_per = (no / 8).max(1);
-                let mut hs = Vec::new();
-                for r0 in (0..no).step_by(rows_per) {
-                    let end = (r0 + rows_per).min(no);
-                    let p8: *mut Vec<i8> = &mut w8;
-                    let pp: *mut Vec<f32> = &mut wsp;
-                    let pm: *mut Vec<f32> = &mut wsm;
-                    // SAFETY (107 W8): &mut *p 역참조 — p8/pp/pm은 서로 다른 버퍼(별도 할당)를 가리키고 각 스레드는 자기 파티션만 쓴다: 별칭 없음.
-                    let (w8s, wsps, wsms) = unsafe { (&mut *p8, &mut *pp, &mut *pm) };
-                    let data = &data;
-                    hs.push(s.spawn(move || {
-                        for o in r0..end {
-                            for bidx in 0..nblk {
-                                let wb0 = (o * nblk + bidx) * 176; // 행 오프셋 — 블록은 행 우선
-                                let wb = &data[wb0..wb0 + 176];
-                                let d = llm170_core::quant::f16(wb, 0);
-                                let dm = llm170_core::quant::f16(wb, 2);
-                                for j in 0..8 {
-                                    let (sc, m) = llm170_core::quant::scale_min_k4_local(wb, j);
-                                    let it = j / 2;
-                                    let half = j % 2;
-                                    let u: u8 = if half == 0 {
-                                        1u8 << (2 * it)
-                                    } else {
-                                        2u8 << (2 * it)
-                                    };
-                                    let sb = bidx * 8 + j;
-                                    wsps[o * n_sub + sb] = d * sc as f32;
-                                    wsms[o * n_sub + sb] = dm * m as f32;
-                                    for e in 0..32 {
-                                        let q = wb[48 + it * 32 + e];
-                                        let nib = if half == 0 { q & 0xF } else { q >> 4 };
-                                        let hi = if wb[16 + e] & u != 0 { 16i8 } else { 0i8 };
-                                        w8s[o * ni + sb * 32 + e] = nib as i8 + hi;
-                                    }
-                                }
-                            }
-                        }
-                    }));
-                }
-                for h in hs {
-                    let _ = h.join();
-                }
-            });
-            // carveout + 언맵 — alloc_host(대형)는 i8 coopmatLoad 경로에서
-            // 데이터 붕괴 실측 (미니 재현: 소형 carveout ★, 대형 host ✗).
-            let wspbuf = {
-                let mut b = ctx.alloc(no * n_sub * 4)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(wsp.as_ptr(), b.ptr as *mut f32, no * n_sub)
-                };
-                ctx.unmap(&mut b)?;
-                b
-            };
-            let wsmbuf = {
-                let mut b = ctx.alloc(no * n_sub * 4)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(wsm.as_ptr(), b.ptr as *mut f32, no * n_sub)
-                };
-                ctx.unmap(&mut b)?;
-                b
-            };
-            // v2 (mlx식): 정확 디양자화 후 행별 재양자 — w8 덮어씀 + wsr.
-            // w_deq = d·sc·q − dm·m (q = w_int). v1 wsp/wsm은 이미 계산됨.
-            {
-                let mut wsr_v = vec![0f32; no];
-                for o in 0..no {
-                    let mut mx = 0f32;
-                    for b in 0..n_sub {
-                        let s = wsp[o * n_sub + b];
-                        let mn = wsm[o * n_sub + b];
-                        let mut _isum_min = 0i64;
-                        for e in 0..32 {
-                            _isum_min += w8[o * ni + b * 32 + e] as i64;
-                        }
-                        // 값 범위: max|d·sc·q − dm·m| 근사 — 실제 최댓값은 원소별 계산
-                        let hi = (s * 47.0).abs() + mn.abs();
-                        let lo = mn.abs();
-                        mx = mx.max(hi.max(lo));
-                    }
-                    // 정확 최댓값: 원소별 (느려도 init 1회)
-                    mx = 0f32;
-                    for b in 0..n_sub {
-                        let s = wsp[o * n_sub + b];
-                        let mn = wsm[o * n_sub + b];
-                        for e in 0..32 {
-                            let v = s * w8[o * ni + b * 32 + e] as f32 - mn;
-                            mx = mx.max(v.abs());
-                        }
-                    }
-                    let d = mx / 127.0f32;
-                    let id = if d > 0.0 { 1.0f32 / d } else { 0.0f32 };
-                    wsr_v[o] = d;
-                    for b in 0..n_sub {
-                        let s = wsp[o * n_sub + b];
-                        let mn = wsm[o * n_sub + b];
-                        for e in 0..32 {
-                            let v = s * w8[o * ni + b * 32 + e] as f32 - mn;
-                            w8[o * ni + b * 32 + e] = (v * id).round().clamp(-127.0, 127.0) as i8;
-                        }
-                    }
-                }
-                let mut b = ctx.alloc(no * 4)?;
-                // SAFETY (107 W8): b는 no 원소(wsr f32) 크기로 할당 — 기입 길이 no 이내, 매핑 유지 중.
-                unsafe { std::ptr::copy_nonoverlapping(wsr_v.as_ptr(), b.ptr as *mut f32, no) };
-                ctx.unmap(&mut b)?;
-                wsr_map.insert(name.to_string(), b);
-            }
-            let wbuf = {
-                let mut b = ctx.alloc(no * ni)?;
-                // SAFETY (107 W8): b는 no*ni 바이트(q4 가중)로 할당 — w8 바이트 길이와 일치.
-                unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, b.ptr, no * ni) };
-                ctx.unmap(&mut b)?;
-                b
-            };
-            i8w.insert(
-                name.to_string(),
-                I8W {
-                    w: wbuf,
-                    wsp: wspbuf,
-                    wsm: wsmbuf,
-                    n_out: no,
-                    n_in: ni,
-                },
-            );
-        }
-        let n_max = hp.n_ff.max(n);
-        let n_sub_max = n_max / 32;
-        let b8 = ctx.alloc_host(T_MAX * n_max)?;
-        let ydb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
-        let qsb = ctx.alloc_host(T_MAX * n_sub_max * 4)?;
-        let wg_max = i8_wg_max(&i8w).max(640);
-        let ishs = ctx.alloc_host(wg_max * 256 * 4)?;
-        let faccs = ctx.alloc_host(wg_max * 256 * 4)?;
         Ok(Self {
             ctx,
             ktimes: std::collections::HashMap::new(),
@@ -572,7 +418,6 @@ impl DecoderState {
             b_fdown,
             b_lg,
             b_ams,
-            b_xf16,
             b_lg_t,
             b_am,
             pipes: HashMap::new(),
@@ -596,9 +441,6 @@ impl DecoderState {
             m_kv_v: mvv,
             gdn_snap: None,
             f16w,
-            i8w,
-            wsr: wsr_map,
-            b8,
             np_conv_tbl,
             np_gdn_tbl,
             np_kvk_tbl,
@@ -607,10 +449,6 @@ impl DecoderState {
             np_slot,
             b_amsc,
             b_amr,
-            ydb,
-            qsb,
-            ishs,
-            faccs,
         })
     }
 }

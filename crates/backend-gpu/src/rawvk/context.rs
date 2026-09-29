@@ -1207,7 +1207,7 @@ impl VkCtx {
             if batch && !forced_skip && self.opt_bar.replace(false) {
                 // plans/104: 기본 ON(산술 불변 — 게이트 2회 PASS·A/B 양성
                 // +2%). 킬스위치 =0.
-                let elide_on = llm170_diag::flag::ne0("LLM170_VK_DEPBAR");
+                let elide_on = true; // 원장 63 승격 — =0 복원은 plans/109 P6 삭제
                 let mut need = !elide_on || self.dep_unknown.get();
                 if let Some((rs, ws)) = dep {
                     let sr = self.since_r.borrow();

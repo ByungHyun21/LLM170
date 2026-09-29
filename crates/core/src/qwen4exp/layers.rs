@@ -763,9 +763,6 @@ impl Engine4 {
             && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
             && std::env::var("LLM170_FRAME_DECODE")
                 .map(|v| v != "0")
-                .unwrap_or(true)
-            && std::env::var("LLM170_NP_GREEDY")
-                .map(|v| v != "0")
                 .unwrap_or(true);
         if !frame_on {
             let lg = self.decode_batch(seqs, tokens)?;
