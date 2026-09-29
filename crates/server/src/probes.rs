@@ -246,6 +246,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     .f32_vec4("blk.48.nextn.enorm.weight")
                     .map_err(|e| e.to_string())?;
                 out.push_str(&format!("  enorm f32_vec4: {}원소\n", enorm.len()));
+                out.push_str(&format!(
+                    "  compress[48]={:?} (len={}) is_recr={}\n",
+                    m.hp.compress.last(),
+                    m.hp.compress.len(),
+                    m.hp.is_recr(48)
+                ));
                 Ok(out)
             })()
         }
@@ -255,6 +261,42 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             llm170_backend_gpu::rawhip::q6k_ref_probe(&path, &tn)
         }
 
+        "mtp-draft-check" => {
+            // plans/109 P15② — CPU 참조 드래프트 스텝 스모크: 프리필 → h →
+            // mtp_draft_step → 로짓 유한성·top-5 토큰.
+            let main_p = arg_str(args, 0, d_fn);
+            let mtp_p = arg_str(
+                args,
+                1,
+                "/home/yoon/models/qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            );
+            (|| -> Result<String, String> {
+                let mut m = llm170_core::qwen4exp::Model4::load(std::path::Path::new(&main_p))
+                    .map_err(|e| e.to_string())?;
+                m.load_mtp(std::path::Path::new(&mtp_p))
+                    .map_err(|e| e.to_string())?;
+                let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, 1, 512);
+                let p: Vec<u32> = [386, 18, 15, 15, 643, 20, 20].to_vec();
+                let l = eng.prefill(0, &p).map_err(|e| e.to_string())?;
+                let t0 = llm170_core::qwen35::greedy(&l);
+                let h = eng.last_h.clone();
+                let lg = eng.mtp_draft_step(0, t0, &h).map_err(|e| e.to_string())?;
+                let finite = lg.iter().all(|v| v.is_finite());
+                let mut idx: Vec<usize> = (0..lg.len()).collect();
+                idx.sort_by(|&a, &b| lg[b].total_cmp(&lg[a]));
+                let top: Vec<String> = idx[..5]
+                    .iter()
+                    .map(|&i| format!("{}:{:.2}", i, lg[i]))
+                    .collect();
+                Ok(format!(
+                    "mtp-draft-check: 로짓 {}개 finite={} top5=[{}] (draft pos={})",
+                    lg.len(),
+                    finite,
+                    top.join(" "),
+                    eng.mtp_seqs[0].pos
+                ))
+            })()
+        }
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),

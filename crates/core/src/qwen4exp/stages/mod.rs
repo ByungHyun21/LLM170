@@ -10,7 +10,7 @@ pub mod ple;
 pub mod qsa;
 
 pub use gdn::gdn_layer;
-pub use hc::{hc_mix, hc_mix_head};
+pub use hc::{hc_mix, hc_mix_head, hc_mix_nextn_head};
 pub use moe::moe_ffn;
 pub(crate) use ple::ple_hash_rows;
 pub use ple::{ple_block, ple_hash};
