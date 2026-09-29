@@ -1400,15 +1400,6 @@ pub(super) fn gdn_frame(
     if il == 0 && llm170_diag::dump::opts().bufhash {
         buf_hash(acc, f.go, v_len * t.min(16), "G0.go");
     }
-    if llm170_diag::dump::opts().key("np_dbg") && il == 0 {
-        let mut v = vec![0.0f32; v_len];
-        if acc.frame_read(f.go, &mut v).is_ok() {
-            eprintln!(
-                "# npdbg(ar_seq): sum={:.6}",
-                v.iter().map(|&x| x as f64).sum::<f64>()
-            );
-        }
-    }
     // norm_gated + out proj
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
     if !stage_skipped("gdn.ng") {

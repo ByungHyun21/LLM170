@@ -16,17 +16,18 @@ mod forward;
 mod mtp;
 mod multi;
 mod np;
+mod verify;
 
 use diag::{buf_hash, frame_ck, ftime_on, ftime_report, sync_mark};
 
 pub use diag::stage_skipped;
+pub use fb::{Id as FbId, incr as fb_incr, report as fb_report};
 pub use forward::*;
 pub use mtp::MtpFrame;
 pub(crate) use mtp::mtp_draft_frame;
 pub use multi::*;
 pub use np::*;
-
-pub use fb::{Id as FbId, incr as fb_incr, report as fb_report};
+pub(crate) use verify::{frame_forward_verify, verify_snap_capture, verify_snap_restore};
 
 use super::stages::{self, Ctx};
 use super::{Hparams4, Model4, Q4Error};
@@ -176,6 +177,14 @@ pub struct Frame4 {
     pub last_res_hc_rows: Vec<Vec<f32>>,
     /// MTP 드래프트 전용 상주 버퍼(plans/110 W1) — has_mtp 모델에서 할당.
     pub mtp: Option<Box<MtpFrame>>,
+    /// GDN 상태 원소 수(dt_rank·d_state²) — W2 검증 스냅샷 버퍼 크기.
+    pub gdn_state_len: usize,
+    /// conv 링 상태 원소 수((conv_k-1)·conv_ch).
+    pub conv_state_len: usize,
+    /// W2 검증 배치용 GDN 디바이스 상태 스냅샷([n_recr][len]) — 첫 사용 시
+    /// 할당 후 재사용. 기각 시 verify_snap_restore가 되돌린다.
+    pub verify_snap_gdn: Vec<Vec<f32>>,
+    pub verify_snap_conv: Vec<Vec<f32>>,
 }
 
 fn alloc(acc: &dyn Accelerator, len: usize) -> Result<u64, Q4Error> {
@@ -316,6 +325,10 @@ impl Frame4 {
             pre_views: None,
             lo_len: lo_n,
             hlo_len: hlo_n,
+            gdn_state_len: hp.dt_rank * hp.d_state * hp.d_state,
+            conv_state_len: (hp.conv_k - 1) * conv_ch,
+            verify_snap_gdn: Vec::new(),
+            verify_snap_conv: Vec::new(),
             t_max,
             st_gdn: Vec::with_capacity(seqs.len()),
             st_conv: Vec::with_capacity(seqs.len()),
