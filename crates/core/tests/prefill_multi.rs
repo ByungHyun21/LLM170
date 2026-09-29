@@ -28,10 +28,10 @@
 //! 주의: 모델이 VRAM(≈80GiB)에 상주하므로 다른 GPU 프로세스와 동시에 돌리면
 //! hipMalloc OOM으로 실패한다.
 
+use llm170_core::qwen4exp::Model4;
 use llm170_core::qwen4exp::frame;
 use llm170_core::qwen4exp::layers::SeqState4;
 use llm170_core::qwen4exp::stages::Ctx;
-use llm170_core::qwen4exp::Model4;
 use std::path::Path;
 
 const MODEL: &str =
@@ -43,11 +43,16 @@ const N_SEQ: usize = 4;
 
 /// 시퀀스 si의 청크 — 시퀀스마다 다른 프롬프트.
 fn chunk(si: usize, per_seq: usize) -> Vec<u32> {
-    (0..per_seq).map(|j| 760 + (si * 37 + j) as u32 * 17).collect()
+    (0..per_seq)
+        .map(|j| 760 + (si * 37 + j) as u32 * 17)
+        .collect()
 }
 
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -68,7 +73,10 @@ fn prefill_multi_matches_sequential() {
     // 배치 forward 게이트(기본 off) — 등가성 정책 확정 전 옵트인.
     unsafe { std::env::set_var("LLM170_PREFILL_MULTI", "1") };
     acc.set_ctx_len(CTX);
-    let ctx = Ctx { model: &m, acc: Some(&*acc) };
+    let ctx = Ctx {
+        model: &m,
+        acc: Some(&*acc),
+    };
     // 슬롯 배분: 0/1 = n=1 검증, 2..6/6..10 = 배치 A/B, 10..14 = 순차 참조.
     // QSA 디바이스 풀과 GDN 상태가 (층, 슬롯) 키라서 같은 슬롯을 다른 프롬프트로
     // 되감으면 갈라진다 — 모든 실행에 서로 다른 슬롯을 준다.
@@ -81,14 +89,25 @@ fn prefill_multi_matches_sequential() {
     {
         let ch = chunk(0, PER_SEQ);
         let got = frame::frame_forward_prefill_multi(
-            &*acc, &m, &ctx, &[0], &mut sts, &mut fb, &ch, PER_SEQ,
+            &*acc,
+            &m,
+            &ctx,
+            &[0],
+            &mut sts,
+            &mut fb,
+            &ch,
+            PER_SEQ,
         )
         .expect("배치 프리필(n=1)");
-        let want =
-            frame::frame_forward(&*acc, &m, &ctx, 1, &mut sts[1], &mut fq, &ch).expect("단일 프리필");
+        let want = frame::frame_forward(&*acc, &m, &ctx, 1, &mut sts[1], &mut fq, &ch)
+            .expect("단일 프리필");
         let mut lg = vec![0.0f32; vocab];
         acc.frame_read(fb.logits_t, &mut lg).expect("logits 판독");
-        assert_eq!(got[0], llm170_core::qwen35::greedy(&want), "n=1 토큰 불일치");
+        assert_eq!(
+            got[0],
+            llm170_core::qwen35::greedy(&want),
+            "n=1 토큰 불일치"
+        );
         assert_eq!(maxdiff(&lg, &want), 0.0, "n=1 로짓 비트 불일치");
     }
 
@@ -97,16 +116,33 @@ fn prefill_multi_matches_sequential() {
         let chunks: Vec<Vec<u32>> = (0..N_SEQ).map(|si| chunk(si, PER_SEQ)).collect();
         let toks: Vec<u32> = chunks.concat();
         let a = frame::frame_forward_prefill_multi(
-            &*acc, &m, &ctx, &[2, 3, 4, 5], &mut sts, &mut fb, &toks, PER_SEQ,
+            &*acc,
+            &m,
+            &ctx,
+            &[2, 3, 4, 5],
+            &mut sts,
+            &mut fb,
+            &toks,
+            PER_SEQ,
         )
         .expect("배치 A");
         let mut lg = vec![0.0f32; N_SEQ * vocab];
         acc.frame_read(fb.logits_t, &mut lg).expect("logits_t 판독");
         let b = frame::frame_forward_prefill_multi(
-            &*acc, &m, &ctx, &[6, 7, 8, 9], &mut sts, &mut fb, &toks, PER_SEQ,
+            &*acc,
+            &m,
+            &ctx,
+            &[6, 7, 8, 9],
+            &mut sts,
+            &mut fb,
+            &toks,
+            PER_SEQ,
         )
         .expect("배치 B");
-        assert_eq!(a, b, "배치 결정성 위반 — 같은 입력·다른 슬롯인데 토큰이 다르다");
+        assert_eq!(
+            a, b,
+            "배치 결정성 위반 — 같은 입력·다른 슬롯인데 토큰이 다르다"
+        );
         // 참조(단일 프리필) — 슬롯당 **1회**만 돌린다(같은 슬롯 재사용은 프레임
         // 상태(pos·GDN)를 이어가 참조가 오염된다).
         let refs: Vec<Vec<f32>> = (0..N_SEQ)

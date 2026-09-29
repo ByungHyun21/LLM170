@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 fn usage_err_bench(msg: &str) -> ExitCode {
-    eprintln!("error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--np K]");
+    eprintln!(
+        "error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--np K]"
+    );
     ExitCode::from(2)
 }
 
@@ -57,7 +59,9 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             other => return usage_err_bench(&format!("unknown flag: {other}")),
         }
     }
-    let Some(model_path): Option<std::path::PathBuf> = ma.model.clone().map(std::path::PathBuf::from) else {
+    let Some(model_path): Option<std::path::PathBuf> =
+        ma.model.clone().map(std::path::PathBuf::from)
+    else {
         return usage_err_bench("--model required");
     };
     // plans/93: FS 프리플라이트 — inode 플래핑(대형 mmap 벤치마크 + GPU fault
@@ -127,8 +131,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
     let res: Result<Vec<String>, String> = (|| {
         let mut lines = Vec::new();
         if arch.as_deref() == Some("qwen4exp") {
-            let m = llm170_core::qwen4exp::Model4::load(&model_path)
-                .map_err(|e| e.to_string())?;
+            let m = llm170_core::qwen4exp::Model4::load(&model_path).map_err(|e| e.to_string())?;
             let sources = m.part_sources();
             let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, np_slots, ctx);
             // plans/64 P1: GPU는 --backend gpu 명시 시에만. 주입 실패는 실패로
@@ -169,34 +172,20 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             for r in 0..reps {
                 eng.reset_states();
                 // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
-                if std::env::var_os("LLM170_KTRACE").is_some() {
-                    llm170_backend_gpu::rawhip::ktrace_on();
-                }
                 let t0 = Instant::now();
                 let l = eng.prefill(0, &prompt).map_err(|e| e.to_string())?;
                 let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
-                if std::env::var_os("LLM170_KTRACE").is_some() {
-                    eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
-                }
                 let mut next = llm170_core::qwen35::greedy(&l);
                 // TG — 프레임 경로는 decode1 내부 분기
                 let t1 = Instant::now();
                 let mut n_gen = 0usize;
                 let mut step = 0usize;
                 // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
-                let mut kt_done = false;
                 while n_gen < tg {
-                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
-                        llm170_backend_gpu::rawhip::ktrace_on();
-                    }
                     // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
                     next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
                     // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
                     // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
-                    if std::env::var_os("LLM170_KTRACE").is_some() && !kt_done {
-                        eprintln!("{}", llm170_backend_gpu::rawhip::ktrace_dump());
-                        kt_done = true;
-                    }
                     n_gen += 1;
                     step += 1;
                     if next == eos {
@@ -218,11 +207,18 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             // 워밍업 1회(계측 제외), 프리필은 슬롯 순차(서버 슬롯 루프와 동일 순서).
             if np_slots >= 2 {
                 let prompts: Vec<Vec<u32>> = (0..np_slots)
-                    .map(|s| lcg_prompt(pp, 0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491)))
+                    .map(|s| {
+                        lcg_prompt(
+                            pp,
+                            0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
+                        )
+                    })
                     .collect();
                 eng.reset_states();
                 for s in 0..np_slots {
-                    let _ = eng.prefill(s, &prompts[s][..16.min(pp)]).map_err(|e| e.to_string())?;
+                    let _ = eng
+                        .prefill(s, &prompts[s][..16.min(pp)])
+                        .map_err(|e| e.to_string())?;
                     let _ = eng.decode1_greedy(s, 1).map_err(|e| e.to_string())?;
                 }
                 eng.reset_states();
@@ -242,7 +238,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     // plans/80-B: 배치 프레임 디코드(decode_batch_greedy) —
                     // t=n_slots 행의 단일 forward로 무게 패스 공유. 종전 순차
                     // decode1_greedy는 슬롯당 53ms×4=212ms/step였다.
-                    next = eng.decode_batch_greedy(&(0..np_slots).collect::<Vec<_>>(), &next)
+                    next = eng
+                        .decode_batch_greedy(&(0..np_slots).collect::<Vec<_>>(), &next)
                         .map_err(|e| e.to_string())?;
                 }
                 let ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -253,13 +250,11 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 ));
             }
         } else {
-            let m = llm170_core::qwen35::Model::load(&model_path)
-                .map_err(|e| e.to_string())?;
+            let m = llm170_core::qwen35::Model::load(&model_path).map_err(|e| e.to_string())?;
             // plans/79: --np 플래그가 qwen35 집계도 지휘하게 통일 — 종전엔
             // LLM170_BENCH_NP env만 읽어 --np 4가 무시됐다(측정 도구 결함).
             let bench_np0 = np_slots.max(
-                std::env::var("LLM170_BENCH_NP")
-                    .ok()
+                llm170_diag::flag::val("LLM170_BENCH_NP")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1),
             );
@@ -281,13 +276,18 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     llm170_backend_gpu::inject_rawvk(&mut eng)
                         .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
                 }
-            } else if std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true) {
+            } else if std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+            {
                 // GPU 런타임이 요청됐는데 백엔드 주입이 실패하면 조용히 CPU 엔진으로
                 // 떨어져 "GPU" 수치가 CPU 수치가 된다 (2026-09-12 hipRTC 컴파일 오류로
                 // 1.5 t/s를 GPU로 오인). 벤치는 실패로 승격한다.
                 if let Err(e) = llm170_backend_gpu::inject_rawhip(&mut eng) {
                     eprintln!("rawhip: {e}");
-                    eprintln!("error: GPU 백엔드 주입 실패 — bench는 CPU 폴백하지 않는다 (--gpu-runtime hip 확인)");
+                    eprintln!(
+                        "error: GPU 백엔드 주입 실패 — bench는 CPU 폴백하지 않는다 (--gpu-runtime hip 확인)"
+                    );
                     return Err(e);
                 }
             }
@@ -322,11 +322,18 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     // 없어 HTTP 측정에 의존했고, 프로토콜 차이로 수치가 어긋났다
                     // (README 374 = 단일 스트림 값). 여기서 같은 엔진 API로 잰다.
                     let prompts: Vec<Vec<u32>> = (0..bench_np)
-                        .map(|s| lcg_prompt(pp, 0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491)))
+                        .map(|s| {
+                            lcg_prompt(
+                                pp,
+                                0x9e37_79b9_u64.wrapping_add((s as u64 + 1) * 0x2545_f491),
+                            )
+                        })
                         .collect();
                     eng.reset_states();
                     for s in 0..bench_np {
-                        let _ = eng.prefill(s, &prompts[s][..16.min(pp)]).map_err(|e| e.to_string())?;
+                        let _ = eng
+                            .prefill(s, &prompts[s][..16.min(pp)])
+                            .map_err(|e| e.to_string())?;
                         let _ = eng.decode_greedy(s, 1).map_err(|e| e.to_string())?;
                     }
                     eng.reset_states();
@@ -345,7 +352,12 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     // plans/79: np 디코드 집계(qwen4exp 판 미러) — 전 슬롯 프리필은
                     // 계측 제외, 슬롯 순차 t=1 디코드로 tg·np 토큰 생성.
                     let prompts: Vec<Vec<u32>> = (0..bench_np)
-                        .map(|s2| lcg_prompt(pp, 0x9e37_79b9_u64.wrapping_add((s2 as u64 + 1) * 0x9e37_79b9)))
+                        .map(|s2| {
+                            lcg_prompt(
+                                pp,
+                                0x9e37_79b9_u64.wrapping_add((s2 as u64 + 1) * 0x9e37_79b9),
+                            )
+                        })
                         .collect();
                     eng.reset_states();
                     for s2 in 0..bench_np {
@@ -403,7 +415,8 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                                 break;
                             }
                         } else {
-                            let active: Vec<usize> = (0..bench_np).filter(|&s2| done[s2] < tg).collect();
+                            let active: Vec<usize> =
+                                (0..bench_np).filter(|&s2| done[s2] < tg).collect();
                             if active.is_empty() {
                                 break;
                             }
@@ -430,15 +443,14 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     ));
                 } else if spec_k > 0 && has_mtp {
                     while n_gen < tg {
-                        let (toks, tf) = eng
-                            .spec_step(0, next, spec_k)
-                            .map_err(|e| e.to_string())?;
+                        let (toks, tf) =
+                            eng.spec_step(0, next, spec_k).map_err(|e| e.to_string())?;
                         fwd += tf;
                         for &t in &toks {
                             if n_gen >= tg {
                                 break;
                             }
-                            if std::env::var_os("LLM170_SPEC_DUMP").is_some() {
+                            if llm170_diag::dump::opts().key("spec_dump") {
                                 eprintln!("SPEC_TOK {t}");
                             }
                             next = t;
@@ -490,7 +502,7 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 } else {
                     while n_gen < tg {
                         next = eng.decode_greedy(0, next).map_err(|e| e.to_string())?;
-                        if std::env::var_os("LLM170_SPEC_DUMP").is_some() {
+                        if llm170_diag::dump::opts().key("spec_dump") {
                             eprintln!("SPEC_TOK {next}");
                         }
                         n_gen += 1;
@@ -509,6 +521,50 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                     "tg{tg}{spec_desc} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (fwd {fwd}, gen {n_gen}, {:.2} tok/fwd)",
                     n_gen as f64 / (tg_ms / 1e3),
                     n_gen as f64 / fwd.max(1) as f64
+                ));
+            }
+        }
+        // 108 P2 — reps 중앙값 요약: 라벨(" | rep" 이전)별 t/s를 모아
+        // 중앙값·스프레드 한 줄 추가. 런간 편차 ±1.7%(원장 98)가 +0.6%급
+        // A/B 차이를 못 가리는 판별 프로토콜.
+        {
+            use std::collections::BTreeMap;
+            let mut by_label: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            for l in &lines {
+                let Some((label, rest)) = l.split_once("| rep") else {
+                    continue;
+                };
+                // "0 | 412.3 ms | 412.33 t/s ..." → 마지막 t/s 직전 수치.
+                let Some(v) = rest
+                    .split("t/s")
+                    .next()
+                    .and_then(|s| s.rsplit('|').next())
+                    .and_then(|s| s.split_whitespace().last())
+                    .and_then(|s| s.parse::<f64>().ok())
+                else {
+                    continue;
+                };
+                by_label
+                    .entry(label.trim_end().to_string())
+                    .or_default()
+                    .push(v);
+            }
+            for (label, mut vals) in by_label {
+                if vals.len() < 2 {
+                    continue;
+                }
+                vals.sort_by(|a, b| a.total_cmp(b));
+                let mid = vals.len() / 2;
+                let median = if vals.len() % 2 == 1 {
+                    vals[mid]
+                } else {
+                    (vals[mid - 1] + vals[mid]) / 2.0
+                };
+                let spread = (vals[vals.len() - 1] - vals[0]).abs() / median * 100.0;
+                lines.push(format!(
+                    "{label} | median x{} | {:7.2} t/s (spread {spread:.1}%)",
+                    vals.len(),
+                    median
                 ));
             }
         }

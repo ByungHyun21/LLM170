@@ -13,10 +13,10 @@ pub use gdn::gdn_layer;
 pub use hc::{hc_mix, hc_mix_head};
 pub use moe::moe_ffn;
 pub use ple::{ple_block, ple_hash};
-pub use qsa::{qsa_cpu_attn_rows, qsa_layer, qsa_select, qsa_sel_list};
+pub use qsa::{qsa_cpu_attn_rows, qsa_layer, qsa_sel_list, qsa_select};
 
 use super::{Model4, Q4Error};
-use crate::matmul::{matmul, matmul_batch, Accelerator, Weight};
+use crate::matmul::{Accelerator, Weight, matmul, matmul_batch};
 
 /// 스테이지 실행 컨텍스트 — 모델 뷰(불변) + 가속기.
 pub struct Ctx<'a> {
@@ -87,4 +87,3 @@ impl Ctx<'_> {
         }
     }
 }
-

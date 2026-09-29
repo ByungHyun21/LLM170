@@ -28,8 +28,6 @@ pub const CO_MMQ3: u8 = 32; // mmq3.co: llama 프로덕션 mul_mat_q<iq4_xs>
 pub const CO_MMQ8: u8 = 64; // mmq8.co: ROCm 10 fatbin의 mul_mat_q<q8_0>(plans/71)
 pub const CO_QY: u8 = 128; // quanty_new.co: ROCm 10 quantize_mmq_q8_1<D4/DS4>(plans/71)
 
-
-
 /// 1회 판독 env 게이트 캐시 (plans/78 R7) — 핫패스(런치·스텝당)의 var_os
 /// 반복 조회를 제거한다. 프로세스 내 env 변경은 main 초기화에서만 일어나고
 /// (set_var 2곳, 모두 엔진 기동 전) 이후 불변이므로 첫 판독 캐시가 안전하다.
@@ -45,8 +43,9 @@ pub(crate) fn env_on(name: &'static str) -> bool {
 
 /// env_on의 값 비교판 — `LLM170_X=v` 형태의 옵트인 게이트.
 pub(crate) fn env_eq(name: &'static str, val: &str) -> bool {
-    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(&'static str, String), bool>>> =
-        std::sync::OnceLock::new();
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(&'static str, String), bool>>,
+    > = std::sync::OnceLock::new();
     *C.get_or_init(Default::default)
         .lock()
         .unwrap()
@@ -61,17 +60,6 @@ pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
         Err(format!("rawhip: {what}: {status:?}"))
     }
 }
-
-
-
-// ── 프레임 그래프 캡처(디코드 스텝) ────────────────────────────────────────
-// 스텝 내 호스트 왕복(capture_mark)을 경계로 스트림 캡처를 세그먼트로 끊어
-// 그래프로 굳히고, 재생 시에는 런치 함수가 즉시 반환되어 커널이 그래프에서
-// 실행된다(런치 ~3천 회/스텝 → 세그먼트 수 회). 프로세스 전역 — CLI는 가속기
-// 1개, 재생은 스텝 단위 단일 스레드라 전역으로 충분하다.
-// SAFETY: 그래프 핸들은 디바이스 객체 — HIP 런타임이 직렬화하며, 재생은 스텝
-// 단위로 단일 스레드에서만 일어난다.
-unsafe impl Send for GraphMode {}
 
 /// 컴파일된 커널 실행기.
 pub mod ctx;
@@ -179,8 +167,15 @@ mod micro_tests {
                 (&mut n1) as *mut _ as *mut std::ffi::c_void,
                 (&mut n2) as *mut _ as *mut std::ffi::c_void,
             ];
-            ctx.launch3("split3", ((kv * 3) as u32).div_ceil(256), 1, 1, 256, &mut args)
-                .unwrap();
+            ctx.launch3(
+                "split3",
+                ((kv * 3) as u32).div_ceil(256),
+                1,
+                1,
+                256,
+                &mut args,
+            )
+            .unwrap();
             for x in [gq as *mut std::ffi::c_void, gk as *mut std::ffi::c_void] {
                 let (mut xp, mut e, mut d) = (x, 1e-6f32, dstate);
                 let mut a2: Vec<*mut std::ffi::c_void> = vec![
@@ -196,7 +191,8 @@ mod micro_tests {
                 (&mut sc) as *mut _ as *mut std::ffi::c_void,
                 (&mut nn) as *mut _ as *mut std::ffi::c_void,
             ];
-            ctx.launch3("q4_scale", (kv as u32).div_ceil(128), 1, 1, 128, &mut a3).unwrap();
+            ctx.launch3("q4_scale", (kv as u32).div_ceil(128), 1, 1, 128, &mut a3)
+                .unwrap();
         };
         for _ in 0..20 {
             launch_seq();
@@ -230,8 +226,15 @@ mod micro_tests {
                 (&mut nn) as *mut _ as *mut std::ffi::c_void,
                 (&mut rr) as *mut _ as *mut std::ffi::c_void,
             ];
-            ctx.launch3("bcast_rows", (big as u32).div_ceil(128), 1, 1, 128, &mut args)
-                .unwrap();
+            ctx.launch3(
+                "bcast_rows",
+                (big as u32).div_ceil(128),
+                1,
+                1,
+                128,
+                &mut args,
+            )
+            .unwrap();
         };
         for _ in 0..3 {
             launch_big();
@@ -255,7 +258,8 @@ mod micro_tests {
         let accb = ctx.scratch(4).expect("acc");
         for mode in [0i32, 1, 2, 3, 4, 5] {
             let launch_bw = || {
-                let (mut wp, mut ap) = (wbuf as *mut std::ffi::c_void, accb as *mut std::ffi::c_void);
+                let (mut wp, mut ap) =
+                    (wbuf as *mut std::ffi::c_void, accb as *mut std::ffi::c_void);
                 let (mut n, mut m) = (nb as i32, mode);
                 let mut args: Vec<*mut std::ffi::c_void> = vec![
                     (&mut wp) as *mut _ as *mut std::ffi::c_void,
@@ -263,8 +267,15 @@ mod micro_tests {
                     (&mut n) as *mut _ as *mut std::ffi::c_void,
                     (&mut m) as *mut _ as *mut std::ffi::c_void,
                 ];
-                ctx.launch3("bw_strided", (nb as u32).div_ceil(256), 1, 1, 256, &mut args)
-                    .unwrap();
+                ctx.launch3(
+                    "bw_strided",
+                    (nb as u32).div_ceil(256),
+                    1,
+                    1,
+                    256,
+                    &mut args,
+                )
+                .unwrap();
             };
             launch_bw();
             ctx.sync().unwrap();
@@ -279,9 +290,9 @@ mod micro_tests {
                 0 => nb as f64 * 4.0,
                 1 => nb as f64 * 4.0,
                 2 => nb as f64 * 16.0,
-                3 => nb as f64 * 2.0 * 8.0,   // f16 8회/스레드
-                5 => nb as f64 * 4.0 * 8.0,   // 워드 8회/레인(완전 병합)
-                _ => nb as f64 * 2.0 * 8.0,   // 워프 협동도 같은 바이트
+                3 => nb as f64 * 2.0 * 8.0, // f16 8회/스레드
+                5 => nb as f64 * 4.0 * 8.0, // 워드 8회/레인(완전 병합)
+                _ => nb as f64 * 2.0 * 8.0, // 워프 협동도 같은 바이트
             } * 4.0;
             let touched = nb as f64 * 144.0 * 4.0; // 실제로 건드린 메모리 범위
             eprintln!(
@@ -310,7 +321,10 @@ mod micro_tests {
         let rpb = ctx.scratch(4).expect("rp");
         let launch_g = || {
             let (mut a, mut b) = (ids as *mut std::ffi::c_void, offb as *mut std::ffi::c_void);
-            let (mut c, mut d) = (permb as *mut std::ffi::c_void, invb as *mut std::ffi::c_void);
+            let (mut c, mut d) = (
+                permb as *mut std::ffi::c_void,
+                invb as *mut std::ffi::c_void,
+            );
             let (mut e, mut f) = (rexb as *mut std::ffi::c_void, ppb as *mut std::ffi::c_void);
             let (mut g, mut h) = (ipb as *mut std::ffi::c_void, txb as *mut std::ffi::c_void);
             let mut i = rpb as *mut std::ffi::c_void;
@@ -330,7 +344,8 @@ mod micro_tests {
                 (&mut i) as *mut _ as *mut std::ffi::c_void,
                 (&mut bnd) as *mut _ as *mut std::ffi::c_void,
             ];
-            ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args).unwrap();
+            ctx.launch3("q4_moe_group_t1", 1, 1, 1, 128, &mut args)
+                .unwrap();
         };
         for _ in 0..20 {
             launch_g();
@@ -351,7 +366,9 @@ mod micro_tests {
         // 비동기 d2h + 이벤트 대기 왕복(디바이스 경로가 층마다 하는 것)
         let tg2 = std::time::Instant::now();
         for _ in 0..N {
-            let _ = ctx.d2h_issue((ne as usize + 1) * 4, offb as *const u8).unwrap();
+            let _ = ctx
+                .d2h_issue((ne as usize + 1) * 4, offb as *const u8)
+                .unwrap();
             ctx.d2h_wait().unwrap();
         }
         let totd = tg2.elapsed().as_secs_f64() * 1e3;
@@ -362,14 +379,21 @@ mod micro_tests {
     }
 }
 
-
 #[cfg(test)]
 mod gdn_t_invariance_tests {
     /// GDN AR의 t 불변성 — 같은 시퀀스를 여러 청크 크기로 흘려 상태·출력을 대조.
     /// 실패(불일치)는 곧 "프리필 결과가 청크 크기에 의존"이라는 뜻이다.
     #[test]
     fn gdn_ar_t_invariance() {
-        for (t, per) in [(64usize, 16usize), (64, 32), (128, 16), (192, 16), (192, 64), (208, 16), (208, 64)] {
+        for (t, per) in [
+            (64usize, 16usize),
+            (64, 32),
+            (128, 16),
+            (192, 16),
+            (192, 64),
+            (208, 16),
+            (208, 64),
+        ] {
             match crate::rawhip::probes::gdn_ar_invariance(t, per, 16, 48, 128) {
                 Ok(s) => eprintln!("# {s}"),
                 Err(e) => eprintln!("# [gdn-ar-inv] t={t} per={per}: {e}"),

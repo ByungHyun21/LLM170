@@ -3,7 +3,7 @@
 //! 오케스트레이션(상태 유형·GPU 훅·시퀀스 레이아웃)은 구조적으로 달라
 //! 그대로 둔다(원장 90 D8/D9 판정 준거 — 중복 없는 간접화 회피).
 
-use crate::ops::{rms_norm, silu, sigmoid};
+use crate::ops::{rms_norm, sigmoid, silu};
 
 /// 게이트 활성화 종류 — qwen35=silu, qwen4exp(Flash-Next)=sigmoid.
 #[derive(Clone, Copy, PartialEq, Eq)]

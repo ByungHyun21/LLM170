@@ -15,7 +15,9 @@ pub fn sq_sum(x: &[f32]) -> f64 {
     let mut sum = 0.0f64;
     for u in 0..SEG {
         let lo = u * chunk;
-        if lo >= n { break; }
+        if lo >= n {
+            break;
+        }
         let hi = (lo + chunk).min(n);
         // f32 세그먼트 누산 (GPU f64 1/16 레이트 병목 동일 적용) —
         // 세그먼트 결합만 f64 (GPU rms_part/finish와 쌍).
@@ -43,7 +45,6 @@ pub fn l2_norm(x: &[f32], eps: f32) -> Vec<f32> {
     let scale = 1.0 / sum.sqrt().max(eps);
     x.iter().map(|&v| v * scale).collect()
 }
-
 
 /// f64 fma 호너 올림-정확 exp — HIP 커널 exp_cr과 동일 연산열 (비트 동일).
 /// glibc expf는 ½ulp 오차(2026-09-03 실측 244/4096 불일치) — W4A8

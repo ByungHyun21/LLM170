@@ -4,10 +4,13 @@ use super::*;
 use crate::rawhip::env_on;
 
 impl Q4Acc {
-
-
     /// 프레임 활성 q8 준비 — x(프레임 f32) → xq 스크래치. (xq, xq_w)
-    pub(super) fn frame_quant(&self, x: *mut u8, n_in: usize, t: usize) -> Result<(*mut u8, usize), String> {
+    pub(super) fn frame_quant(
+        &self,
+        x: *mut u8,
+        n_in: usize,
+        t: usize,
+    ) -> Result<(*mut u8, usize), String> {
         let xq_w = xq_words(n_in);
         let buf = {
             let mut b = self.fxq.lock().map_err(|e| e.to_string())?;
@@ -18,24 +21,20 @@ impl Q4Acc {
     }
 
     /// 프레임 GEMM 1건 — x는 프레임 f32, 무게는 mmap 참조(업로드 캐시).
-    pub(super) fn frame_gemm(&self, x: *mut u8, w: &llm170_core::matmul::Weight<'_>, out: *mut u8, t: usize) -> Result<(), String> {
+    pub(super) fn frame_gemm(
+        &self,
+        x: *mut u8,
+        w: &llm170_core::matmul::Weight<'_>,
+        out: *mut u8,
+        t: usize,
+    ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
         let (wd, f32w) = self.dev_weight(w)?;
         if f32w {
             return self.launch_gemm_f32(x, wd, n_in, n_out, t, out);
         }
-        // llama MMQ 경로(부록5: q4_K maxrel 6e-4) — qwen35 raw 디코더가 쓰는
-        // 바로 그 mul_mat_q 커널. f32 활성을 직접 양자화하므로 frame_quant를
-        // 건너뛴다. 형상은 qwen35와 같은 게이트(t>=32).
         let ty = ggml_id(w.ty);
-        if t >= 32
-            && matches!(ty, 12 | 13 | 14 | 23)
-            && env_on("LLM170_Q4_MMQ")
-            && self.ctx.gemm_mmq(ty, x as *const u8, wd, n_in, n_out, t, out).is_ok()
-        {
-            return Ok(());
-        }
         // f16 경로는 t=1에서만 검증됨(plans/65 §19): t>1(프리필)은 x 취급이 어긋나
         // 값이 깨진다(f16-map t=4 프로브로 재현). t>1 해결 전에는 배선하지 않는다.
         let (xq, xq_w) = self.frame_quant(x, n_in, t)?;
@@ -152,7 +151,7 @@ impl Q4Acc {
         let mut w8p = w8 as *mut std::ffi::c_void;
         let mut o8 = out8 as *mut std::ffi::c_void;
         let mut no8a = no8 as i32;
-        let mut xf_p = xf as *mut std::ffi::c_void;  // f32 원활성 (프레임 핸들)
+        let mut xf_p = xf as *mut std::ffi::c_void; // f32 원활성 (프레임 핸들)
         let mut w4p = w4 as *mut std::ffi::c_void;
         let mut o4 = out4 as *mut std::ffi::c_void;
         let mut no4a = no4 as i32;
@@ -192,73 +191,8 @@ impl Q4Acc {
         // 기본은 여전히 끈 상태다: 이득이 아니라 속도 근거로 옵트인 유지.
         if ty == ggml_id(GgmlType::Q4K)
             && t >= 16
-            && (env_on("LLM170_Q4K_MMQ")
-                || env_on("LLM170_Q4K_OUTS"))
+            && (env_on("LLM170_Q4K_MMQ") || env_on("LLM170_Q4K_OUTS"))
         {
-            // 행-배치 타일(plans/65) — 가중치 디퀀트를 행 루프 밖으로.
-            if env_on("LLM170_Q4K_Y") {
-                let rpt: usize = std::env::var("LLM170_Q4K_YRPT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(16);
-                // 커널이 += 누산이므로 출력을 0으로 초기화한다(출력 버퍼는 매
-                // 호출 새로 쓰이는 스크래치라 안전).
-                unsafe {
-                    std::ptr::write_bytes(out as *mut f32, 0, t * n_out);
-                }
-                let mut xq_p = xq as *mut std::ffi::c_void;
-                let mut w_p = w as *mut std::ffi::c_void;
-                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
-                let mut o_p = out as *mut std::ffi::c_void;
-                let (mut ni, mut no, mut xw, mut tt, mut rp) =
-                    (n_in as i32, n_out as i32, xq_w as i32, t as i32, rpt as i32);
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
-                    (&mut no) as *mut _ as *mut std::ffi::c_void,
-                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                    (&mut rp) as *mut _ as *mut std::ffi::c_void,
-                ];
-                return self.ctx.launch3(
-                    "q4_gemm_q4k_y",
-                    n_out.div_ceil(256) as u32,
-                    t.div_ceil(rpt) as u32,
-                    1,
-                    256,
-                    &mut args,
-                );
-            }
-            // x-스테이징 타일(plans/65) — 출력별 x 재독 제거. 로직·순서는 _m과 동일.
-            if env_on("LLM170_Q4K_X") {
-                let mut xq_p = xq as *mut std::ffi::c_void;
-                let mut w_p = w as *mut std::ffi::c_void;
-                let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
-                let mut o_p = out as *mut std::ffi::c_void;
-                let (mut ni, mut no, mut xw, mut tt) =
-                    (n_in as i32, n_out as i32, xq_w as i32, t as i32);
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    (&mut xq_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut part_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut o_p) as *mut _ as *mut std::ffi::c_void,
-                    (&mut ni) as *mut _ as *mut std::ffi::c_void,
-                    (&mut no) as *mut _ as *mut std::ffi::c_void,
-                    (&mut xw) as *mut _ as *mut std::ffi::c_void,
-                    (&mut tt) as *mut _ as *mut std::ffi::c_void,
-                ];
-                return self.ctx.launch3(
-                    "q4_gemm_q4k_x",
-                    n_out.div_ceil(16) as u32,
-                    t.div_ceil(16) as u32,
-                    1,
-                    256,
-                    &mut args,
-                );
-            }
             // 형상 스윕용 가변 타일(plans/65) — outs/rows를 env로 지정.
             if let (Ok(outs), Ok(rows)) = (
                 std::env::var("LLM170_Q4K_OUTS").map(|v| v.parse::<usize>()),
@@ -344,9 +278,7 @@ impl Q4Acc {
             // max_rel 2.1e-5 (q5_1 양자화 오차 ~1e-2의 1/500)이고 230토큰
             // greedy 스트림이 동일하다 — llama.cpp/vLLM과 같은 허용 오차 계약.
             // 비트 동일 판은 LLM170_Q5_1_EXACT=1로 복귀.
-            let mmq = t >= 16
-                && !env_on("LLM170_Q5_1_EXACT")
-                && ty == ggml_id(GgmlType::Q5_1);
+            let mmq = t >= 16 && !env_on("LLM170_Q5_1_EXACT") && ty == ggml_id(GgmlType::Q5_1);
             let kern = match (mmq, tiled) {
                 (true, _) => "q4_gemm_q5_1_m",
                 (false, true) => "q4_gemm_q5_1_t",
@@ -375,8 +307,14 @@ impl Q4Acc {
                     &mut args,
                 );
             }
-            let gx = if tiled { t.div_ceil(16) as u32 } else { t as u32 };
-            return self.ctx.launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
+            let gx = if tiled {
+                t.div_ceil(16) as u32
+            } else {
+                t as u32
+            };
+            return self
+                .ctx
+                .launch3(kern, gx, gy, gz, if tiled { 256 } else { 64 }, &mut args);
         }
         // t≥16: MMQ 타일 우선 — 가중치 1회 독서 + 토큰 타일 상각(raw 디코더
         // mm_b와 동일 게이트). 타일 커널이 없는 타입은 GEMV 폴백.
@@ -386,7 +324,7 @@ impl Q4Acc {
         // 가중치 대역도 0.3-6 GB/s뿐이라 연산·대역폭 어느 쪽도 아니다 — llama.cpp
         // 대비 프리필 1.33x가 사는 곳이다. 27B가 같은 계열로 19.5 TFLOPS를 내는 것은
         // n_in/n_out이 더 큰 형상(5120x17408)이라 행당 상각이 크기 때문이다.
-        // 같은 형상에서 q4_K MMQ 타일(LLM170_Q4K_MMQ/Y)은 오히려 느렸고(33-34ms),
+        // 같은 형상에서 q4_K MMQ 타일(LLM170_Q4K_MMQ)은 오히려 느렸고(33-34ms),
         // Q6K/Q4_K f16 융합 dequant도 중립이었다. 남은 방향은 그래프당 dequant 캐시.
         // t≥16: MMQ 타일 우선 — 단 **128토큰 이하로 쪼개서** 호출한다.
         // j128 CO는 gz>1(다중 토큰 사분면)일 때 n_in=6144 형상에서 폴트한다
@@ -415,26 +353,10 @@ impl Q4Acc {
                 let tc = if tq_mode { t } else { 128.min(t - t0) };
                 let xsrc = unsafe { xq.add(t0 * xq_w * 4) };
                 let osrc = unsafe { out.add(t0 * n_out * 4) };
-                if let Err(e) = self
+                if let Err(_e) = self
                     .ctx
                     .gemm_tile(xsrc, w, self.ktab2, ty, n_in, n_out, xq_w, tc, osrc)
                 {
-                    if env_on("LLM170_Q4_DBG") {
-                        use std::sync::Mutex;
-                        use std::sync::OnceLock;
-                        static SEEN: OnceLock<Mutex<Vec<(u32, usize, usize, usize)>>> = OnceLock::new();
-                        let seen = SEEN.get_or_init(|| Mutex::new(Vec::new()));
-                        if let Ok(mut v) = seen.lock() {
-                            // (ty, n_in, n_out) 별 1회 + t는 128 단위 구간으로 구분.
-                            let key = (ty, n_in, n_out, (tc / 128) * 128);
-                            if !v.contains(&key) && v.len() < 24 {
-                                v.push(key);
-                                eprintln!(
-                                    "# gemm_tile 폴백: ty={ty} n_in={n_in} n_out={n_out} t={tc} err={e}"
-                                );
-                            }
-                        }
-                    }
                     ok = false;
                     break;
                 }
@@ -498,7 +420,8 @@ impl Q4Acc {
         }
         // plans/73: t=1은 워프-퍼-출력판 — 저출력(hc inject [10240→4])·라우터
         // 형상에서 원판 대비 3-6×. 누산 재배열 편차는 게이트로 검증.
-        if t == 1 && n_in.is_multiple_of(4) { // plans/78 R6: F32W 폐기 — f32 직독 기본
+        if t == 1 && n_in.is_multiple_of(4) {
+            // plans/78 R6: F32W 폐기 — f32 직독 기본
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
@@ -546,7 +469,8 @@ impl Q4Acc {
             (&mut no) as *mut _ as *mut std::ffi::c_void,
             (&mut st) as *mut _ as *mut std::ffi::c_void,
         ];
-        self.ctx.launch3("q4_gemm_f32", t as u32, gy, gz, 64, &mut args)
+        self.ctx
+            .launch3("q4_gemm_f32", t as u32, gy, gz, 64, &mut args)
     }
 
     /// 배치 GEMM 본체 — xs [t][n_in] f32 → outs [t][n_out] f32.
@@ -597,7 +521,7 @@ impl Q4Acc {
     ) -> Result<(), String> {
         let n_in = w.n_in as usize;
         let n_out = w.n_out as usize;
-        let tt = env_on("LLM170_Q4ACC_TIME");
+        let tt = llm170_diag::dump::opts().key("q4acc_time");
 
         let t_up = std::time::Instant::now();
         let (w_dev, w_f32) = self.dev_weight(w)?;
@@ -656,13 +580,8 @@ impl Q4Acc {
                     .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
                     .is_ok()
             {
-                // 임시 진단: LLM170_F16_DBG=1 이면 호출 직후 동기화해 실패 지점을 명명한다.
-                if env_on("LLM170_F16_DBG") {
-                    self.ctx.sync().map_err(|e| format!("f16 sync [{n_in}x{n_out}] t={t}: {e}"))?;
-                    eprintln!("f16-deq OK [{n_in}x{n_out}] t={t}");
-                }
             } else {
-            self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
+                self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
             }
         }
         let k_ns = t_k.elapsed().as_nanos() as u64;
@@ -699,7 +618,6 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::MatmulHost for Q4Acc {
-
     fn barrier(&self) {
         unsafe {
             let _ = ck(hip::hipDeviceSynchronize(), "hipDeviceSynchronize");
@@ -737,7 +655,11 @@ impl llm170_core::matmul::MatmulHost for Q4Acc {
         // 동일 입력 — 업로드·양자화 1회를 그룹 전체가 공유한다(값 경로에서
         // 왕복이 스텝 비용의 대부분이라 그룹 호출당 3→1로 줄인다).
         if ws.len() != outs.len() {
-            return Err(format!("matmul_group: ws({}) != outs({})", ws.len(), outs.len()));
+            return Err(format!(
+                "matmul_group: ws({}) != outs({})",
+                ws.len(),
+                outs.len()
+            ));
         }
         if ws.is_empty() || xs.is_empty() {
             return Ok(());
@@ -746,7 +668,10 @@ impl llm170_core::matmul::MatmulHost for Q4Acc {
         let f32_family = |t: GgmlType| matches!(t, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
         let w_f32 = f32_family(ws[0].ty);
         // 타입 계열·n_in이 섞이면 준비를 공유할 수 없다 — 개별 경로로.
-        if ws.iter().any(|w| w.n_in as usize != n_in || f32_family(w.ty) != w_f32) {
+        if ws
+            .iter()
+            .any(|w| w.n_in as usize != n_in || f32_family(w.ty) != w_f32)
+        {
             for (w, o) in ws.iter().zip(outs.iter_mut()) {
                 self.batch_into(xs, o, w, 0)?;
             }
@@ -881,10 +806,14 @@ impl llm170_core::matmul::MatmulHost for Q4Acc {
 }
 
 impl llm170_core::matmul::EwOps for Q4Acc {
-
     fn shexp_gu(
-        &self, x: u64, wg: &llm170_core::matmul::Weight, wu: &llm170_core::matmul::Weight,
-        h: u64, n_in: usize, n_hidden: usize,
+        &self,
+        x: u64,
+        wg: &llm170_core::matmul::Weight,
+        wu: &llm170_core::matmul::Weight,
+        h: u64,
+        n_in: usize,
+        n_hidden: usize,
     ) -> Result<(), String> {
         let mut xp = self.fptr(x)? as *mut std::ffi::c_void;
         let (wgd, _) = self.dev_weight(wg)?;
@@ -903,12 +832,24 @@ impl llm170_core::matmul::EwOps for Q4Acc {
             (&mut nh) as *mut _ as *mut std::ffi::c_void,
         ];
         // n_hidden=640, warp당 1행 → 640 워프 = 20블록(256스레드=8워프)
-        self.ctx.launch3("q4_shexp_gu", n_hidden.div_ceil(8) as u32, 1, 1, 256, &mut args)
+        self.ctx.launch3(
+            "q4_shexp_gu",
+            n_hidden.div_ceil(8) as u32,
+            1,
+            1,
+            256,
+            &mut args,
+        )
     }
 
     fn shexp_da(
-        &self, h: u64, wd: &llm170_core::matmul::Weight, s: u64, mout: u64,
-        n_in: usize, n_hidden: usize,
+        &self,
+        h: u64,
+        wd: &llm170_core::matmul::Weight,
+        s: u64,
+        mout: u64,
+        n_in: usize,
+        n_hidden: usize,
     ) -> Result<(), String> {
         let mut hp = self.fptr(h)? as *mut std::ffi::c_void;
         let (wdd, _) = self.dev_weight(wd)?;
@@ -926,7 +867,8 @@ impl llm170_core::matmul::EwOps for Q4Acc {
             (&mut nh) as *mut _ as *mut std::ffi::c_void,
         ];
         // n_in=2560, warp당 1행 → 2560 워프 = 320블록(8워프/블록)
-        self.ctx.launch3("q4_shexp_da", n_in.div_ceil(8) as u32, 1, 1, 256, &mut args)
+        self.ctx
+            .launch3("q4_shexp_da", n_in.div_ceil(8) as u32, 1, 1, 256, &mut args)
     }
 
     fn ple_math_dev(
@@ -952,7 +894,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         hist: usize,
         host_ring: &[f32],
     ) -> Result<(), String> {
-        let _ = pos0;   // hip 은 디코드 전용 게이트 유지(plans/93 P2 vk 우선)
+        let _ = pos0; // hip 은 디코드 전용 게이트 유지(plans/93 P2 vk 우선)
         if t != 1 {
             return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
         }
@@ -963,7 +905,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
             let mut wm = self.ple_ring_pos.lock().map_err(|e| e.to_string())?;
             let w = wm.entry(seq).or_insert(0);
             let rw = *w > t; // pos0=0 재시작(벤치 워밍업 등)
-            *w = t;          // t=1: 이번 토큰까지 유효
+            *w = t; // t=1: 이번 토큰까지 유효
             rw
         };
         let ring = {
@@ -1003,8 +945,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
                 nc_d as *mut std::ffi::c_void,
             );
             let (mut gp_, mut gop_) = (gp as *mut std::ffi::c_void, gop as *mut std::ffi::c_void);
-            let (mut e, mut ne, mut hcc, mut tt) =
-                (eps, n_embd as i32, hc as i32, t as i32);
+            let (mut e, mut ne, mut hcc, mut tt) = (eps, n_embd as i32, hc as i32, t as i32);
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut rp) as *mut _ as *mut std::ffi::c_void,
                 (&mut kp) as *mut _ as *mut std::ffi::c_void,

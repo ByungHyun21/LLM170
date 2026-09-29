@@ -5,10 +5,10 @@
 
 mod bench;
 mod engine;
+mod http;
 mod infer;
 mod probes;
 mod resource;
-mod http;
 mod tokenize;
 mod unicode_data;
 mod vl;
@@ -26,8 +26,8 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan]
-      OpenAI/Anthropic 호환 HTTP 서버.
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+      OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
       비전 인코딩 + LLM 스플라이스 추론.
@@ -50,15 +50,11 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
   vk-check                       Vulkan 장치·coopmat·axpy 스모크
   vk-gemv-check <file> <tensor> [t]   엔진 경로(quant+gemv3) GEMV 검증
   vk-gemv8-check <file> <tensor> [t]  gemv8 패밀리 검증+타이밍
-  vk-tile-check <file> <tensor> [t]    coopmat 타일 패밀리 검증 (t≤64)
   vk-frame-check <file> <tensor>       vk 프레임 코어(버퍼/EW/GEMM) CPU 대조
-  vk-mmq-check <file> <tensor> [t]    i8 GEMM(plans/23) 검증
-  vk-sdot-probe                  OpSDot 장치 지원 프로브
   gdn-check | subsum-check       GDN/서브그룹 축소 커널 검증
   qk-check | iq3s-probe          qk_rope/iq3_s 커널 검증
   llm170 help
 "#;
-
 
 /// 모델 적재 서브커맨드 공용 인자 (plans/78 R5) — main에서 1회 파싱해
 /// 사전 리소스 가드와 serve/infer/vl/bench가 같은 값을 본다(이중 파싱 제거).
@@ -83,7 +79,12 @@ fn common_value(args: &[String], i: &mut usize, inline: &Option<String>) -> Stri
 }
 
 pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
-    let mut ma = ModelArgs { model: None, backend: None, gpu_runtime: None, rest: Vec::new() };
+    let mut ma = ModelArgs {
+        model: None,
+        backend: None,
+        gpu_runtime: None,
+        rest: Vec::new(),
+    };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -116,11 +117,20 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
 
 fn main() -> ExitCode {
     // plans/87 §2 — 와치독(스텔 보고·옵션 FAIL 자결).
-    if let Some(v) = std::env::var("LLM170_WATCHDOG").ok().and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(v) = std::env::var("LLM170_WATCHDOG")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
         llm170_diag::watchdog::spawn(v, std::env::var_os("LLM170_WATCHDOG_FAIL").is_some());
     }
     llm170_diag::fp::init_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 107 W12 (README 재검증 포착): 무인자 실행이 args[1..]로 패닉 —
+    // 빈 인자는 USAGE 안내로.
+    if args.is_empty() {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     // 공용 인자 1회 파싱 (plans/78 R5) — 아래 가드와 trio 디스패치가 공유.
     let ma = match parse_model_args(&args[1..]) {
         Ok(ma) => ma,
@@ -135,28 +145,37 @@ fn main() -> ExitCode {
     //   - check의 첫 비플래그 위치인자 (모델 경로)
     //   - GPU 판정: --backend gpu, --gpu-runtime; check는 기본이 gpu.
     // gguf-dump·tokenize는 메타데이터만 읽는다(무게 미적재) — 가드 제외.
-    if !matches!(args.first().map(String::as_str), Some("gguf-dump") | Some("tokenize")) {
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("gguf-dump") | Some("tokenize")
+    ) {
         let sub = args.first().map(String::as_str);
         let mut model = ma.model.clone();
         let mut gpu = ma.backend.as_deref() == Some("gpu") || ma.gpu_runtime.is_some();
         if sub == Some("check") {
             gpu = true; // run_check의 백엔드 기본값이 gpu다.
             if model.is_none()
-                && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--")) {
-                    model = Some(p.clone());
-                }
+                && let Some(p) = ma.rest.iter().find(|a| !a.starts_with("--"))
+            {
+                model = Some(p.clone());
+            }
         }
         if let Some(mp) = model
-            && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+            && let Err(e) = resource::preflight(std::path::Path::new(&mp), gpu)
+        {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     // cubecl 커널 컴파일 오류 등 log 패싯 메시지 노출 — stderr 간이 로거.
     struct EL;
     impl log::Log for EL {
-        fn enabled(&self, _: &log::Metadata) -> bool { true }
-        fn log(&self, r: &log::Record) { eprintln!("[{}] {}", r.level(), r.args()); }
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            eprintln!("[{}] {}", r.level(), r.args());
+        }
         fn flush(&self) {}
     }
     let _ = log::set_logger(&EL);
@@ -176,9 +195,10 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("LLM170_FRAME", "1") };
     }
     if let Some(cmd) = args.first().map(String::as_str)
-        && let Some(code) = probes::run(cmd, &args[1..]) {
-            return code;
-        }
+        && let Some(code) = probes::run(cmd, &args[1..])
+    {
+        return code;
+    }
     match args.first().map(String::as_str) {
         Some("gguf-dump") => cmd_gguf_dump(&args[1..]),
         Some("infer") => infer::cmd_infer(&ma.rest, &ma),
@@ -201,9 +221,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <file> [--port N] [--ctx N] [--backend cpu|gpu] [--mode M]
+/// llm170 serve --model <file> [--port N] [--ctx N] [--slots N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
+    let mut queue: Option<usize> = None;
+    let mut slots: Option<usize> = None;
     let mut spec_k = 0usize;
     let mut ctx = 4096usize;
     let backend = ma.backend.clone().unwrap_or_else(|| "cpu".into());
@@ -219,6 +241,14 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
                 Some(c) => ctx = c,
                 None => return usage_err("--ctx requires a number"),
             },
+            "--slots" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(s) => slots = Some(s.clamp(1, 16)),
+                None => return usage_err("--slots requires a number in 1..=16"),
+            },
+            "--queue" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(q) => queue = Some(q.max(1)),
+                None => return usage_err("--queue requires a number"),
+            },
             "--spec" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
                 Some(k) => spec_k = k.min(8),
                 None => return usage_err("--spec requires k in 1..=8"),
@@ -226,7 +256,9 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             other => return usage_err(&format!("unknown flag: {other}")),
         }
     }
-    let Some(model_path) = ma.model.clone().map(PathBuf::from) else { return usage_err("--model required") };
+    let Some(model_path) = ma.model.clone().map(PathBuf::from) else {
+        return usage_err("--model required");
+    };
     if spec_k > 0 {
         // GPU 스펙 경로 강제 (스레드 기동 전 단일 스레드 시점 env 설정).
         // 안전성: 이 시점은 단일 스레드 (엔진/슬롯 스레드 기동 전).
@@ -236,7 +268,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     }
     // 토크나이저 적재 (part1 메타 → 실패시 part2)
     let part2 = {
-        let stem = model_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let stem = model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if stem.contains("-00001-of-") {
             Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
         } else {
@@ -261,7 +296,10 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작)");
     }
     let _ = engine::TOKENIZER.set(tok.unwrap_or_else(tokenize::Tokenizer::empty));
-    let req = engine::InferRequest { model: model_path, ctx };
+    let req = engine::InferRequest {
+        model: model_path,
+        ctx,
+    };
     let sel = if backend == "gpu" {
         if gpu_runtime.is_empty() {
             engine::BackendSel::Gpu
@@ -271,7 +309,7 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     } else {
         engine::BackendSel::Cpu
     };
-    match http::serve(&format!("127.0.0.1:{port}"), req, sel) {
+    match http::serve(&format!("127.0.0.1:{port}"), req, sel, slots, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -290,7 +328,10 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
     let model_path = PathBuf::from(model);
     // part1 메타 → 실패시 part2 (serve와 동일 규칙)
     let part2 = {
-        let stem = model_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let stem = model_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if stem.contains("-00001-of-") {
             Some(model_path.with_file_name(stem.replace("-00001-of-", "-00002-of-")))
         } else {
@@ -326,7 +367,13 @@ fn cmd_tokenize(ma: &ModelArgs) -> ExitCode {
         buf
     };
     let ids = tok.encode_opts(&text, !no_special);
-    println!("[{}]", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "));
+    println!(
+        "[{}]",
+        ids.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     ExitCode::SUCCESS
 }
 
@@ -424,9 +471,6 @@ fn cmd_dequant(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-
-
-
 /// llm170 w4a8-check <file> <tensor> [t] [rows] — W4A8 변형 ↔ f32 기준 상호검증.
 fn cmd_w4a8_check(args: &[String]) -> ExitCode {
     if args.len() < 2 {
@@ -453,7 +497,9 @@ fn cmd_w4a8_check(args: &[String]) -> ExitCode {
     let n_in = w.n_in as usize;
     let mut seed = 0x1234_5678u64;
     let mut lcg = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f32 / (1u32 << 31) as f32) - 1.0
     };
     let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..n_in).map(|_| lcg()).collect()).collect();
@@ -500,13 +546,7 @@ fn parse_ids_ref(s: &str) -> Option<Vec<u32>> {
     parse_ids(s).ok()
 }
 
-
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
     ExitCode::from(2)
 }
-
-
-
-
-

@@ -1,8 +1,11 @@
 # Backend Architecture
 
 LLM170 runs Qwen3.8-27B (hybrid GDN + full-attention) on AMD APUs through
-two independent GPU backends plus a CPU reference path. All three produce
-**identical greedy streams** on the standard verification prompts.
+two independent GPU backends plus a CPU reference path. HIP and CPU produce
+**identical greedy streams** on the standard verification prompts; the
+qwen35 Vulkan decoder is currently gated to a loud hip fallback (diffuse
+nondeterminism — decisions.md ledger 87/90/92), the qwen4exp Vulkan value
+path is gate-verified.
 
 ## Paths
 

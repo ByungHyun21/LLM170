@@ -7,9 +7,9 @@
 //! 게이트: `LLM170_FP_FILE=경로` — 미설정 시 제로 코스트(원자 1회).
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
 
@@ -62,38 +62,37 @@ pub fn fp_record(stage: &str, data: &[f32]) {
     if let Ok(mut guard) = writer().lock()
         && let Some(f) = guard.as_mut()
     {
-            let _ = writeln!(
-                f,
-                "{stage}\t{hash:016x}\t{max_abs:.6e}\t{}",
-                first_nonfinite.map_or(-1, |i| i as i64)
-            );
-            // NaN guard: 첫 비순수 발견 시 경고 (LLM170_FP_NAN=1이면 exit).
-            if let Some(idx) = first_nonfinite {
-                eprintln!(
-                    "diag::fp: NaN/Inf at stage '{stage}' index {idx}"
-                );
-                if std::env::var_os("LLM170_FP_NAN").is_some() {
-                    std::process::exit(101);
-                }
+        let _ = writeln!(
+            f,
+            "{stage}\t{hash:016x}\t{max_abs:.6e}\t{}",
+            first_nonfinite.map_or(-1, |i| i as i64)
+        );
+        // NaN guard: 첫 비순수 발견 시 경고 (LLM170_FP_NAN=1이면 exit).
+        if let Some(idx) = first_nonfinite {
+            eprintln!("diag::fp: NaN/Inf at stage '{stage}' index {idx}");
+            if std::env::var_os("LLM170_FP_NAN").is_some() {
+                std::process::exit(101);
             }
         }
+    }
 }
 
 /// 두 지문 파일 비교 — 최초 불일치 스테이지 반환.
 /// 반환: (최초 불일치 스테이지, 전체 불일치 목록, 상세).
 pub fn fp_diff(path_a: &str, path_b: &str) -> Result<DiffReport, String> {
     let parse = |p: &str| -> Result<Vec<(String, u64, f64, i64)>, String> {
-        let text = std::fs::read_to_string(p)
-            .map_err(|e| format!("읽기 실패 {p}: {e}"))?;
+        let text = std::fs::read_to_string(p).map_err(|e| format!("읽기 실패 {p}: {e}"))?;
         let mut out = Vec::new();
         for ln in text.lines() {
             let parts: Vec<&str> = ln.split('\t').collect();
             if parts.len() == 4 {
                 let hash = u64::from_str_radix(parts[1], 16)
                     .map_err(|e| format!("해시 파싱 실패: {e}"))?;
-                let maxabs: f64 = parts[2].parse()
+                let maxabs: f64 = parts[2]
+                    .parse()
                     .map_err(|e| format!("maxabs 파싱 실패: {e}"))?;
-                let nf: i64 = parts[3].parse()
+                let nf: i64 = parts[3]
+                    .parse()
                     .map_err(|e| format!("nonfinite 파싱 실패: {e}"))?;
                 out.push((parts[0].to_string(), hash, maxabs, nf));
             }
@@ -118,11 +117,7 @@ pub fn fp_diff(path_a: &str, path_b: &str) -> Result<DiffReport, String> {
         }
     }
     if a.len() != b.len() {
-        all_mismatches.push(format!(
-            "  (행 수 불일치: A={} B={})",
-            a.len(),
-            b.len()
-        ));
+        all_mismatches.push(format!("  (행 수 불일치: A={} B={})", a.len(), b.len()));
     }
     Ok(DiffReport {
         first_mismatch,
@@ -172,17 +167,23 @@ mod tests {
         let c = vec![1.0f32, 2.0, 3.1];
         let ha = {
             let mut h: u64 = 0xcbf29ce484222325;
-            for v in &a { h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64); }
+            for v in &a {
+                h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64);
+            }
             h
         };
         let hb = {
             let mut h: u64 = 0xcbf29ce484222325;
-            for v in &b { h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64); }
+            for v in &b {
+                h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64);
+            }
             h
         };
         let hc = {
             let mut h: u64 = 0xcbf29ce484222325;
-            for v in &c { h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64); }
+            for v in &c {
+                h = h.wrapping_mul(0x100000001b3) ^ (v.to_bits() as u64);
+            }
             h
         };
         assert_eq!(ha, hb);

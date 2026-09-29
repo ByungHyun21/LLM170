@@ -59,7 +59,9 @@ impl Engine {
                     let embd = &embd;
                     s.spawn(move || {
                         for (row, &tok) in ch.iter_mut().zip(toks.iter()) {
-                            crate::quant::dequant_row(embd.ty, embd.data, tok as u64, n as u64, row);
+                            crate::quant::dequant_row(
+                                embd.ty, embd.data, tok as u64, n as u64, row,
+                            );
                         }
                     });
                 }
@@ -89,12 +91,16 @@ impl Engine {
         // (KV/GDN/conv 링이 raw 디코더에 직접 적립).
         if std::env::var("LLM170_T1_PREFILL").is_ok()
             || (self.raw_decode.is_some()
-                && std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true))
+                && std::env::var("LLM170_RAWHIP")
+                    .map(|v| v != "0")
+                    .unwrap_or(true))
         {
             // plans/84 A: 단일 토큰 prefill 호출(청크 꼬리 t=1)도 배치 경로로 —
             // decode 경로는 GEMM 패밀리가 달라 청크 불변성이 깨진다.
             // 핀(step_batch)이 large-t 패밀리로 통일하므로 t=1도 비트 일치.
-            let use_batch = std::env::var("LLM170_RAWHIP").map(|v| v != "0").unwrap_or(true)
+            let use_batch = std::env::var("LLM170_RAWHIP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
                 && std::env::var_os("LLM170_T1_PREFILL").is_none()
                 && (tokens.len() > 1
                     || std::env::var_os("LLM170_FORCE_BATCH").is_some()
@@ -106,11 +112,18 @@ impl Engine {
                 // 청크 128은 128-행 타일(j128/v4 CO) 로드 시에만 유효
                 // z-그리드 사분면 CO: t>128 프리필 상각 (2026-09-05, +1.5%,
                 // 장문600 게이트 chunk128과 비트동일 검증)
-                let ch_sz = std::env::var("LLM170_CHUNK").ok().and_then(|v| v.parse().ok())
-                    .unwrap_or(if rd.tile_big_chunk() && std::env::var_os("LLM170_EXACT").is_none() { 512 } else { 64 });
+                let ch_sz = llm170_diag::flag::val("LLM170_CHUNK")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(
+                        if rd.tile_big_chunk() && !llm170_diag::flag::on("LLM170_EXACT") {
+                            512
+                        } else {
+                            64
+                        },
+                    );
                 let n_chunks = cache.len().div_ceil(ch_sz).max(1);
                 // plans/92 P2: 청크 경계 4분해 계량 — 조립(CPU)·업로드·GPU·판독.
-                let pfck = std::env::var_os("LLM170_PFCK").is_some();
+                let pfck = llm170_diag::dump::opts().key("pfck");
                 for (ci, ch) in cache.chunks(ch_sz).enumerate() {
                     let pf_t0 = std::time::Instant::now();
                     let flat: Vec<f32> = ch.iter().flatten().copied().collect();
@@ -120,8 +133,11 @@ impl Engine {
                         // 임베딩 선반입: 사이드 스트림 async h2d를 메인 프리필과 중첩
                         // (청크당 10.5MB 블로킹 업로드 제거).
                         let mut tok_flat: Vec<f32> = Vec::with_capacity(ch.len() * n_e);
-                        for row in ch.iter() { tok_flat.extend_from_slice(row); }
-                        rd.mtp_upload_tok_emb(&tok_flat).map_err(ModelError::Accel)?;
+                        for row in ch.iter() {
+                            tok_flat.extend_from_slice(row);
+                        }
+                        rd.mtp_upload_tok_emb(&tok_flat)
+                            .map_err(ModelError::Accel)?;
                         // MTP KV 적립: 마지막 행 hidden(carry)만 회수
                         let (lg, h_last) = rd
                             .raw_prefill_h(seq, pos, &flat)
@@ -154,8 +170,11 @@ impl Engine {
                         rd.raw_prefill(seq, pos, &flat).map_err(ModelError::Accel)?
                     };
                     if pfck {
-                        eprintln!("[pfck] ci={ci} t={} flat={pf_flat:.1}ms wall={:.1}ms",
-                            ch.len(), pf_t0.elapsed().as_secs_f64() * 1e3);
+                        eprintln!(
+                            "[pfck] ci={ci} t={} flat={pf_flat:.1}ms wall={:.1}ms",
+                            ch.len(),
+                            pf_t0.elapsed().as_secs_f64() * 1e3
+                        );
                     }
                     if std::env::var_os("LLM170_DEBUG_LAYERS").is_some() {
                         let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -180,5 +199,4 @@ impl Engine {
         }
         Ok(last.unwrap_or_else(|| vec![0.0; self.model.hp.vocab]))
     }
-
 }

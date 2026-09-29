@@ -50,7 +50,9 @@ impl Clip {
         let patch_size = g.arch_kv_u64("vision.patch_size").ok_or("patch_size")? as usize;
         let n_blk = g.arch_kv_u64("vision.block_count").ok_or("block_count")? as usize;
         let n_embd = g.arch_kv_u64("vision.embedding_length").ok_or("embd")? as usize;
-        let n_head = g.arch_kv_u64("vision.attention.head_count").ok_or("heads")? as usize;
+        let n_head = g
+            .arch_kv_u64("vision.attention.head_count")
+            .ok_or("heads")? as usize;
         let n_ff = g.arch_kv_u64("vision.feed_forward_length").ok_or("ffn")? as usize;
         let eps = g
             .arch_kv_u64("vision.attention.layer_norm_epsilon")
@@ -188,7 +190,10 @@ impl Clip {
     /// 배치 GEMM: out[t][o] = Σ x[t][i]·W[o][i] + b — (토큰×행) 청크 병렬.
     fn mm_bias_batch(x: &[Vec<f32>], w: &[f32], b: &[f32], ni: usize, out: &mut [Vec<f32>]) {
         let n_out = out[0].len();
-        let nth = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(32);
+        let nth = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(8)
+            .min(32);
         // 토큰 청크 분할 병렬 — 각 스레드가 서로소 토큰 슬라이스 담당.
         let nth = nth.max(1).min(x.len());
         std::thread::scope(|sc| {
@@ -210,10 +215,14 @@ impl Clip {
                             let mut acc = b[o];
                             let mut i = 0;
                             while i + 8 <= ni {
-                                acc += xr[i] * row[i] + xr[i + 1] * row[i + 1]
-                                    + xr[i + 2] * row[i + 2] + xr[i + 3] * row[i + 3]
-                                    + xr[i + 4] * row[i + 4] + xr[i + 5] * row[i + 5]
-                                    + xr[i + 6] * row[i + 6] + xr[i + 7] * row[i + 7];
+                                acc += xr[i] * row[i]
+                                    + xr[i + 1] * row[i + 1]
+                                    + xr[i + 2] * row[i + 2]
+                                    + xr[i + 3] * row[i + 3]
+                                    + xr[i + 4] * row[i + 4]
+                                    + xr[i + 5] * row[i + 5]
+                                    + xr[i + 6] * row[i + 6]
+                                    + xr[i + 7] * row[i + 7];
                                 i += 8;
                             }
                             while i < ni {
@@ -276,7 +285,6 @@ impl Clip {
         out
     }
 
-    
     pub fn n_ff(&self) -> usize {
         self.n_ff
     }
@@ -347,14 +355,30 @@ impl Clip {
         let mut names: Vec<String> = Vec::new();
         for il in 0..self.n_blk {
             for k in [
-                "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "attn_out.bias",
-                "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias",
-                "ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+                "attn_qkv.weight",
+                "attn_qkv.bias",
+                "attn_out.weight",
+                "attn_out.bias",
+                "ffn_up.weight",
+                "ffn_up.bias",
+                "ffn_down.weight",
+                "ffn_down.bias",
+                "ln1.weight",
+                "ln1.bias",
+                "ln2.weight",
+                "ln2.bias",
             ] {
                 names.push(format!("v.blk.{il}.{k}"));
             }
         }
-        for k in ["v.post_ln.weight", "v.post_ln.bias", "mm.0.weight", "mm.0.bias", "mm.2.weight", "mm.2.bias"] {
+        for k in [
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ] {
             names.push(k.to_string());
         }
         let mut out = Vec::new();
@@ -372,11 +396,10 @@ impl Clip {
         Ok(out)
     }
 
-/// 이미지 → 비전 토큰 임베딩 [n_tok][5120].
+    /// 이미지 → 비전 토큰 임베딩 [n_tok][5120].
     /// img: RGB f32 [h][w][3] 정규화 완료 (mean/std 적용된 것).
     pub fn encode(&mut self, img: &[f32], w: usize, h: usize) -> Result<Vec<Vec<f32>>, String> {
-        let (ps, n_embd, n_head, d_head) =
-            (self.patch_size, self.n_embd, self.n_head, self.d_head);
+        let (ps, n_embd, n_head, d_head) = (self.patch_size, self.n_embd, self.n_head, self.d_head);
         assert_eq!(w % (ps * 2), 0, "이미지 폭은 patch·merge 배수 필요");
         assert_eq!(h % (ps * 2), 0);
         let (pw, ph) = (w / ps, h / ps);
@@ -476,12 +499,6 @@ impl Clip {
             }
             let mut qkv = vec![vec![0f32; 3 * n_embd]; n_pos];
             Self::mm_bias_batch(&xn, &qkvw, &qkvb, qkv_ni, &mut qkv);
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                let ssum: f64 = xn[0].iter().map(|&x| x as f64).sum::<f64>()
-                    + xn.iter().skip(1).map(|r| r.iter().map(|&x| x as f64).sum::<f64>()).sum::<f64>();
-                eprintln!("[cpu] L0 ln1 sum={ssum:.4} x0={:.6} x1={:.6}", xn[0][0], xn[0][1]);
-                eprintln!("[cpu] L0 qkv q0..7={:?}", &qkv[0][..8]);
-            }
 
             // 비전 rope (q, k) — 토큰별 (y, x)
             let mut coords = vec![(0u32, 0u32); n_pos];
@@ -499,9 +516,6 @@ impl Clip {
                 }
             }
             for t in 0..n_pos {
-                if il == 0 && t == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                    eprintln!("[cpu] L0 pre-rope q0..7={:?}", &qkv[0][..8]);
-                }
                 let (py, px) = coords[t];
                 for part in 0..2 {
                     // 0=q, 1=k — 헤드 순회
@@ -522,13 +536,12 @@ impl Clip {
                 }
             }
 
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                eprintln!("[cpu] L0 roped q0..7={:?}", &qkv[0][..8]);
-                eprintln!("[cpu] L0 roped k0..3={:?}", &qkv[0][n_embd..n_embd + 4]);
-            }
             // MHA (전체 attention, 무마스크)
             let kq_scale = 1.0f32 / (d_head as f32).sqrt();
-            let nth = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(8).min(32);
+            let nth = std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(8)
+                .min(32);
             let mut attn_out = vec![vec![0f32; n_embd]; n_pos];
             {
                 let csize = n_pos.div_ceil(nth);
@@ -551,10 +564,6 @@ impl Clip {
                         off += n;
                     }
                 });
-            }
-            if il == 0 && std::env::var_os("LLM170_VIT_DBG").is_some() {
-                let asum: f64 = attn_out.iter().flatten().map(|&x| x as f64).sum();
-                eprintln!("[cpu] L0 attn sum={asum:.4} a0..7={:?}", &attn_out[0][..8]);
             }
             // attn_out proj + 잔차 (배치)
             let mut aproj = vec![vec![0f32; n_embd]; n_pos];

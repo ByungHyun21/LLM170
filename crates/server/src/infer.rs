@@ -81,7 +81,14 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     if arch.as_deref() == Some("qwen4exp") {
-        return run_q4_infer(&model_path, &prompts, n_predict, ctx, &backend, &gpu_runtime);
+        return run_q4_infer(
+            &model_path,
+            &prompts,
+            n_predict,
+            ctx,
+            &backend,
+            &gpu_runtime,
+        );
     }
     let engine_res = llm170_core::qwen35::Model::load(&model_path)
         .map_err(|e| e.to_string())
@@ -123,22 +130,10 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 eprintln!("# backend: gpu (raw hip)");
             }
             let eos = 248044u32;
-            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
-                if let Some(k) = dbg_topk {
-                    let mut idx: Vec<usize> = (0..l.len()).collect();
-                    idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
-                    let top: Vec<String> = idx[..k.min(l.len())]
-                        .iter()
-                        .map(|&i| format!("{}:{:.4}", i, l[i]))
-                        .collect();
-                    eprintln!("topk seq{s}: {}", top.join(" "));
-                }
                 last_logits.push(l);
             }
             let mut finished = vec![false; n];
@@ -247,18 +242,6 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                 let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
                 let seq_ids: Vec<usize> = active.clone();
                 let logits = eng.decode(&seq_ids, &toks).map_err(|e| e.to_string())?;
-                if let Some(k) = dbg_topk {
-                    for (i, &s) in active.iter().enumerate() {
-                        let l = &logits[i];
-                        let mut idx: Vec<usize> = (0..l.len()).collect();
-                        idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
-                        let top: Vec<String> = idx[..k.min(l.len())]
-                            .iter()
-                            .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
-                            .collect();
-                        eprintln!("topk-dec seq{s}: {}", top.join(" "));
-                    }
-                }
                 for (i, &s) in active.iter().enumerate() {
                     let t = llm170_core::qwen35::greedy(&logits[i]);
                     next[s] = t;
@@ -334,23 +317,11 @@ fn run_q4_infer(
                     }
                 }
             }
-            let dbg_topk = std::env::var("LLM170_DEBUG_TOPK")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
             let eos = eng.model.eos;
             let mut finished = vec![false; n];
             let mut next: Vec<u32> = Vec::with_capacity(n);
             for (s, p) in prompts.iter().enumerate() {
                 let l = eng.prefill(s, p).map_err(|e| e.to_string())?;
-                if let Some(k) = dbg_topk {
-                    let mut idx: Vec<usize> = (0..l.len()).collect();
-                    idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
-                    let top: Vec<String> = idx[..k.min(l.len())]
-                        .iter()
-                        .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
-                        .collect();
-                    eprintln!("topk-pf seq{s}: {}", top.join(" "));
-                }
                 let t = llm170_core::qwen35::greedy(&l);
                 println!(
                     "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
@@ -369,7 +340,9 @@ fn run_q4_infer(
                 // plans/73(np): 활성 2+ 는 배치 디코드(무게 스트리밍 공유).
                 if active.len() > 1 {
                     let toks: Vec<u32> = active.iter().map(|&s| next[s]).collect();
-                    let ls = eng.decode_batch(&active, &toks).map_err(|e| e.to_string())?;
+                    let ls = eng
+                        .decode_batch(&active, &toks)
+                        .map_err(|e| e.to_string())?;
                     for (row, &s) in active.iter().enumerate() {
                         let t = llm170_core::qwen35::greedy(&ls[row]);
                         next[s] = t;
@@ -386,15 +359,6 @@ fn run_q4_infer(
                         let d1g = std::env::var_os("LLM170_NO_D1G").is_none();
                         let t = if !d1g {
                             let l = eng.decode1(s, next[s]).map_err(|e| e.to_string())?;
-                            if let Some(k) = dbg_topk {
-                                let mut idx: Vec<usize> = (0..l.len()).collect();
-                                idx.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap());
-                                let top: Vec<String> = idx[..k.min(l.len())]
-                                    .iter()
-                                    .map(|&i2| format!("{}:{:.4}", i2, l[i2]))
-                                    .collect();
-                                eprintln!("topk-dec seq{s}: {}", top.join(" "));
-                            }
                             llm170_core::qwen35::greedy(&l)
                         } else {
                             eng.decode1_greedy(s, next[s]).map_err(|e| e.to_string())?
