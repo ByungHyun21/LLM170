@@ -262,7 +262,8 @@ impl Engine4 {
             let hp_hc = self.model.hp.hc * self.model.hp.n_embd;
             let hp0 = self.mtp_seqs[seq].pos;
             let _ = hp_hc;
-            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev)?;
+            let _acc = self.acc.clone();
+            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
             let _ = hp0;
         }
         // ② 드래프트 체인 — h는 pre-mix 멀티[10240]로 연결(chain export).
@@ -272,7 +273,8 @@ impl Engine4 {
         let mut chain_h = h_after_first.clone();
         let mut next = t0;
         for _ in 0..k.saturating_sub(1) {
-            let (lg, dh) = self.mtp_draft_step_h(seq, next, &chain_h)?;
+            let _acc = self.acc.clone();
+            let (lg, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
             proposals.push(next);
             chain_h = dh;
             next = crate::qwen35::greedy(&lg);
@@ -304,12 +306,14 @@ impl Engine4 {
             self.mtp_seqs[seq] = snap_d;
             let hp_hc = self.model.hp.hc * self.model.hp.n_embd;
             let _ = hp_hc;
-            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev)?;
+            let _acc = self.acc.clone();
+            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
             let mut dh = h_after_first.clone();
             for &p in &proposals[..=n_acc.min(proposals.len() - 1)] {
                 let l = self.decode1(seq, p)?;
                 forwards += 1;
-                let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh)?;
+                let _acc = self.acc.clone();
+                let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh, _acc.as_deref())?;
                 dh = ndh;
                 let _ = l;
             }
@@ -343,7 +347,8 @@ impl Engine4 {
         for i in 0..tokens.len().saturating_sub(1) {
             let x = tokens[i + 1];
             let hi = self.last_res_hc_rows[i].clone();
-            let (_lg, _h) = self.mtp_draft_step_h(seq, x, &hi)?;
+            let _acc = self.acc.clone();
+            let (_lg, _h) = self.mtp_draft_step_h(seq, x, &hi, _acc.as_deref())?;
         }
         Ok(())
     }
@@ -357,6 +362,7 @@ impl Engine4 {
         seq: usize,
         x: u32,
         h_pre: &[f32],
+        acc: Option<&dyn Accelerator>,
     ) -> Result<(Vec<f32>, Vec<f32>), Q4Error> {
         if !self.model.has_mtp() || self.mtp_seqs.is_empty() {
             return Err(Q4Error::Io("mtp_draft_step: MTP 미적재".into()));
@@ -399,7 +405,7 @@ impl Engine4 {
         {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             let mut r = vec![0.0f32; hc_dim];
             let mut x_t = vec![0.0f32; n];
@@ -415,23 +421,23 @@ impl Engine4 {
         let (mix, inject) = {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             stages::hc_mix(&ctx, il, "attn", &res_hc)?
         };
-        let attn_out = self.mtp_dense_attn(seq, il, &mix)?;
+        let attn_out = self.mtp_dense_attn(seq, il, &mix, acc)?;
         hc_combine(&mut res_hc, &attn_out, &inject, hc);
         let (mix2, inject2) = {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             stages::hc_mix(&ctx, il, "ffn", &res_hc)?
         };
         let ffn_out = {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             stages::moe_ffn(&ctx, il, &mix2)?
         };
@@ -439,7 +445,7 @@ impl Engine4 {
         let head_rows = {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             stages::hc_mix_nextn_head(&ctx, il, &res_hc)?
         };
@@ -455,7 +461,7 @@ impl Engine4 {
         {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             ctx.mm(&h1, &wout, &mut logits)?;
         }
@@ -472,6 +478,7 @@ impl Engine4 {
         seq: usize,
         il: usize,
         xs: &[Vec<f32>],
+        acc: Option<&dyn Accelerator>,
     ) -> Result<Vec<Vec<f32>>, Q4Error> {
         let hp = &self.model.hp;
         let (n_head, n_kv, hd, n_rot) = (hp.n_head, hp.n_kv, hp.head_dim, hp.n_rot);
@@ -492,7 +499,7 @@ impl Engine4 {
         {
             let ctx = Ctx {
                 model: &self.model,
-                acc: None,
+                acc,
             };
             let mut gi = vec![
                 std::mem::take(&mut qg),
@@ -571,7 +578,7 @@ impl Engine4 {
         // wo 투영 (대여 분리 — KV 적립 종료 후 새 Ctx).
         let ctx = Ctx {
             model: &self.model,
-            acc: None,
+            acc,
         };
         let mut out_rows = vec![vec![vec![0.0f32; wo.n_out as usize]; n_tok]; 1];
         ctx.mm_group(&attn_all, std::slice::from_ref(&wo), &mut out_rows)?;
@@ -638,7 +645,8 @@ impl Engine4 {
             };
             stages::hc_mix(&ctx, il, "attn", &res_hc)?
         };
-        let attn_out = self.mtp_dense_attn(seq, il, &mix)?;
+        let _acc = self.acc.clone();
+        let attn_out = self.mtp_dense_attn(seq, il, &mix, _acc.as_deref())?;
         hc_combine(&mut res_hc, &attn_out, &inject, hc);
         // 6) FFN 반쪽 (MoE + shexp)
         let (mix2, inject2) = {

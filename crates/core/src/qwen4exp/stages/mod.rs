@@ -28,7 +28,17 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     pub fn mm(&self, x: &[f32], w: &Weight, out: &mut [f32]) -> Result<(), Q4Error> {
         match self.acc {
-            Some(a) => a.matmul(x, w, out).map_err(Q4Error::Io),
+            Some(a) => match a.matmul(x, w, out) {
+                Ok(()) => Ok(()),
+                // P15④c-2: 백엔드 미지원 타입(예: q5_0 — Q4_K_M MTP 모듈)은
+                // CPU 디양자화 GEMV로 폴백(가시 로그 — 조용한 오염 방지).
+                Err(e) if e.contains("미지원") => {
+                    eprintln!("# mm CPU 폴백: {e} (w.n_out={})", w.n_out);
+                    matmul(x, w, out);
+                    Ok(())
+                }
+                Err(e) => Err(Q4Error::Io(e)),
+            },
             None => {
                 matmul(x, w, out);
                 Ok(())
@@ -44,7 +54,16 @@ impl Ctx<'_> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), Q4Error> {
         match self.acc {
-            Some(a) => a.matmul_paired(xs, ws, outs).map_err(Q4Error::Io),
+            Some(a) => match a.matmul_paired(xs, ws, outs) {
+                Ok(()) => Ok(()),
+                Err(e) if e.contains("미지원") => {
+                    for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
+                        matmul(x, w, o);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(Q4Error::Io(e)),
+            },
             None => {
                 for ((x, w), o) in xs.iter().zip(ws.iter()).zip(outs.iter_mut()) {
                     matmul(x, w, o);
@@ -62,7 +81,17 @@ impl Ctx<'_> {
         outs: &mut [Vec<Vec<f32>>],
     ) -> Result<(), Q4Error> {
         match self.acc {
-            Some(a) => a.matmul_group(xs, ws, outs).map_err(Q4Error::Io),
+            Some(a) => match a.matmul_group(xs, ws, outs) {
+                Ok(()) => Ok(()),
+                // P15④c-2: mm과 동일 — 미지원 타입 CPU 폴백.
+                Err(e) if e.contains("미지원") => {
+                    for (w, o) in ws.iter().zip(outs.iter_mut()) {
+                        matmul_batch(xs, w, o);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(Q4Error::Io(e)),
+            },
             None => {
                 for (w, o) in ws.iter().zip(outs.iter_mut()) {
                     matmul_batch(xs, w, o);
@@ -80,7 +109,14 @@ impl Ctx<'_> {
         outs: &mut [Vec<f32>],
     ) -> Result<(), Q4Error> {
         match self.acc {
-            Some(a) => a.matmul_batch(xs, w, outs).map_err(Q4Error::Io),
+            Some(a) => match a.matmul_batch(xs, w, outs) {
+                Ok(()) => Ok(()),
+                Err(e) if e.contains("미지원") => {
+                    matmul_batch(xs, w, outs);
+                    Ok(())
+                }
+                Err(e) => Err(Q4Error::Io(e)),
+            },
             None => {
                 matmul_batch(xs, w, outs);
                 Ok(())
