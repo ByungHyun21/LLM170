@@ -110,6 +110,7 @@ impl RawCtx {
         )
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // 원시 포인터 프레임 계약(107 W8)
     pub fn gemv_q8_out(
         &self,
         xq: *const u8,
@@ -122,6 +123,22 @@ impl RawCtx {
         xq_w: usize,
         t: usize,
     ) -> Result<(), String> {
+        // plans/110 W2: 검증 배치 핀 — 행별 t=1 디스패치(mt 변형은 t=1
+        // 커널과 축소 순서가 달라 비트가 갈라진다). 행 독립이라 재귀 t=1은
+        // 정확히 decode1의 커널 선택(w16/w)과 일치한다.
+        if (2..=8).contains(&t)
+            && ty == 8
+            && super::VERIFY_ROW_PIN.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for r in 0..t {
+                // SAFETY: xq는 [t][xq_w 워드] 프레임 활성, out은 [t][n_out] —
+                // 행 오프셋은 호출 계약상 할당 범위 내(107 W8 관례).
+                let xs = unsafe { xq.add(r * xq_w * 4) };
+                let os = unsafe { out.add(r * n_out * 4) };
+                self.gemv_q8_out(xs, w, ktab2, ty, n_in, n_out, os, xq_w, 1)?;
+            }
+            return Ok(());
+        }
         let part = self.scratch(n_out * 64 * 8)?;
         let gy = n_out.min(65535) as u32;
         let _gz = n_out.div_ceil(65535) as u32;

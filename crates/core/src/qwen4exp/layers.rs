@@ -249,6 +249,18 @@ impl Engine4 {
         if k == 0 || !self.model.has_mtp() {
             return Ok((Vec::new(), 0));
         }
+        // ── plans/110 W2: 프레임 경로 — 배치 검증(1회 t=k-1 포워드) ──
+        // 실패 시 fb 카운터 + 순차(값경로) 폴백.
+        if std::env::var_os("LLM170_SPEC_NOBATCH").is_none() && k >= 2 {
+            match self.mtp_spec_step_frame(seq, last_token, k) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    super::frame::fb_incr(super::frame::FbId::MtpSpec);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| eprintln!("# mtp-spec-frame: 실패 — 순차 경로 폴백 ({e})"));
+                }
+            }
+        }
         // ① 직전의 pre-mixer 잔차 = last_token의 예측자 hidden(① 전에 확보 —
         // decode1이 덮어쓴다). 이것이 주기 시작 커밋 토큰의 드래프트 쌍 h다.
         let h_prev = self.last_res_hc.clone();
@@ -323,6 +335,228 @@ impl Engine4 {
         Ok((accepted, forwards))
     }
 
+    /// MTP 스펙 스텝 프레임 판 (plans/110 W2) — 검증을 t=k-1 배치 포워드
+    /// 1회로 통합(np 불변식: 배치 == 순차 decode1 비트 동일). 기각 시
+    /// GDN 디바이스 상태 스냅샷 복원 + PLE 링 pos 되감기 + 수용분 재실행.
+    /// 수용 산출식은 순차 판과 동일 — 프레임 경로 상태 부패(스펙≠비스펙
+    /// 토큰 분기, 110 W2 발견)도 이 트랜잭션으로 해소된다.
+    fn mtp_spec_step_frame(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        k: usize,
+    ) -> Result<(Vec<u32>, usize), Q4Error> {
+        // ① 주기 시작 커밋 토큰의 타깃 forward — greedy 판정만 회수.
+        let h_prev = self.last_res_hc.clone();
+        let t0 = self.decode1_greedy(seq, last_token)?;
+        let mut forwards = 1usize;
+        let h_after_first = self.last_res_hc.clone();
+        // ④′ 주기 시작 커밋 토큰의 드래프트 KV 행 진위치 기입.
+        {
+            let _acc = self.acc.clone();
+            self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
+        }
+        // ② 드래프트 체인 — proposals = [t0, g1, .., g_{k-2}](k-1개).
+        let mut proposals: Vec<u32> = Vec::new();
+        let mut chain_h = h_after_first.clone();
+        let mut next = t0;
+        for _ in 0..k.saturating_sub(1) {
+            let _acc = self.acc.clone();
+            let (next_d, dh) = self.mtp_draft_step_h(seq, next, &chain_h, _acc.as_deref())?;
+            proposals.push(next);
+            chain_h = dh;
+            next = next_d;
+        }
+        // ── 배치 검증: t=k-1행 1회 포워드 + 행별 GPU argmax ──
+        let snap_t = self.seqs[seq].clone();
+        let snap_d = self.mtp_seqs[seq].clone();
+        let y: Vec<u32>;
+        {
+            let Engine4 {
+                model,
+                frame,
+                seqs,
+                acc: acc_field,
+                ..
+            } = self;
+            let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                return Err(Q4Error::Io("mtp-spec-frame: 프레임 없음".into()));
+            };
+            // 검증 직전 GDN 디바이스 상태 스냅샷(기각 복원용).
+            super::frame::verify_snap_capture(a, f, seq)?;
+            let ctx = crate::qwen4exp::stages::Ctx {
+                model,
+                acc: Some(a),
+            };
+            y = super::frame::frame_forward_verify(
+                a,
+                model,
+                &ctx,
+                seqs.as_mut_slice(),
+                seq,
+                f,
+                &proposals,
+            )?;
+            // 다음 라운드 h 입력 — 배치 export 행 풀(마지막 행 = 마지막 처리 행).
+            if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                self.last_res_hc_rows = f.last_res_hc_rows.clone();
+                self.last_res_hc = f.last_res_hc_rows.last().cloned().unwrap_or_default();
+            }
+        }
+        forwards += 1;
+        // y[i] = proposals[i] 처리 후 greedy — 수용 접두 판정(순차 판과 동일식).
+        let mut n_acc = proposals.len();
+        for i in 0..proposals.len() {
+            if let Some(e) = proposals.get(i + 1)
+                && y[i] != *e
+            {
+                n_acc = i;
+                break;
+            }
+        }
+        let full = n_acc + 1 >= proposals.len();
+        // 그림자 진단(LLM170_DUMP=spec_check) — 배치 y·상태와 순차 decode1
+        // 재현을 전수 대조. 그림자 종료 상태 = 순차 전이(배치가 도달해야 할
+        // 상태)라 관측이 스트림을 오염시키지 않는다.
+        let shadow = llm170_diag::dump::opts().key("spec_check");
+        if shadow {
+            // 배치가 남긴 GDN 디바이스 상태.
+            let batch_gdn = {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    unreachable!("프레임 존재");
+                };
+                let mut snap = vec![Vec::new(); f.st_gdn[seq].len()];
+                for (ri, &h) in f.st_gdn[seq].iter().enumerate() {
+                    snap[ri] = vec![0.0f32; f.gdn_state_len];
+                    a.frame_read(h, &mut snap[ri]).map_err(Q4Error::Io)?;
+                }
+                snap
+            };
+            {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    unreachable!("프레임 존재");
+                };
+                super::frame::verify_snap_restore(a, f, seq)?;
+            }
+            self.seqs[seq] = snap_t.clone();
+            self.mtp_seqs[seq] = snap_d.clone();
+            let seq_y: Vec<u32> = proposals
+                .iter()
+                .map(|&p| self.decode1_greedy(seq, p))
+                .collect::<Result<_, _>>()?;
+            let mism: Vec<String> = (0..proposals.len())
+                .filter(|&i| y[i] != seq_y[i])
+                .map(|i| format!("y[{i}]={} seq={}", y[i], seq_y[i]))
+                .collect();
+            let mut gdn_bad = 0usize;
+            let mut first = String::new();
+            {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    unreachable!("프레임 존재");
+                };
+                for (ri, &h) in f.st_gdn[seq].iter().enumerate() {
+                    let mut v = vec![0.0f32; f.gdn_state_len];
+                    a.frame_read(h, &mut v).map_err(Q4Error::Io)?;
+                    let bad = v
+                        .iter()
+                        .zip(batch_gdn[ri].iter())
+                        .filter(|(x, b)| x.to_bits() != b.to_bits())
+                        .count();
+                    if bad > 0 && first.is_empty() {
+                        first = format!("gdn[ri={ri}] {bad}");
+                    }
+                    gdn_bad += bad;
+                }
+            }
+            eprintln!(
+                "# spec-check pos={} full={} mismatch {} gdn_bad={gdn_bad} {first}",
+                snap_t.pos,
+                full,
+                mism.len(),
+            );
+            if full {
+                // 전수용: 순차 상태가 곧 정답 — 이 상태로 계속.
+                let mut acc_v = vec![t0];
+                acc_v.extend_from_slice(&proposals[1..]);
+                acc_v.push(*seq_y.last().unwrap_or(&t0));
+                return Ok((acc_v, forwards));
+            }
+        }
+        let mut accepted = Vec::with_capacity(n_acc + 2);
+        accepted.push(t0);
+        if full {
+            accepted.extend_from_slice(&proposals[1..]);
+            accepted.push(*y.last().unwrap_or(&t0));
+            // 배치가 정확히 proposals행만큼 상태를 전진시켰다 — pos 정산.
+            self.seqs[seq].pos += proposals.len() as u32;
+            Ok((accepted, forwards))
+        } else {
+            // 기각 — 스냅샷 복원(GDN 디바이스 + CPU) 후 수용분 재실행.
+            let snap_pos = snap_t.pos;
+            self.seqs[seq] = snap_t;
+            self.mtp_seqs[seq] = snap_d;
+            {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    return Err(Q4Error::Io("mtp-spec-frame: 프레임 없음".into()));
+                };
+                super::frame::verify_snap_restore(a, f, seq)?;
+            }
+            // PLE 링: CPU snap_t.ple_conv가 정합 — 이후 첫 PLE 디바이스 스텝이
+            // pos 기반 워터마크 되감기로 호스트 링을 리프레시한다(백엔드 계약).
+            let _acc = self.acc.clone();
+            let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
+            let mut dh = h_after_first.clone();
+            let mut rply: Vec<u32> = Vec::with_capacity(n_acc + 1);
+            for &p in &proposals[..=n_acc] {
+                let r = self.decode1_greedy(seq, p)?;
+                rply.push(r);
+                forwards += 1;
+                let _acc = self.acc.clone();
+                let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh, _acc.as_deref())?;
+                dh = ndh;
+            }
+            // 진단(spec_check) — 재실행 r_i는 배치 y[i]와 비트 일치여야 한다.
+            if shadow {
+                let mm: Vec<String> = (0..=n_acc)
+                    .filter(|&i| rply[i] != y[i])
+                    .map(|i| format!("r[{i}]={} y={}", rply[i], y[i]))
+                    .collect();
+                eprintln!(
+                    "# spec-reject pos={snap_pos} n_acc={} replay_mismatch {}{}",
+                    n_acc,
+                    mm.len(),
+                    if mm.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" first={}", mm[0])
+                    }
+                );
+            }
+            accepted.extend_from_slice(&proposals[1..=n_acc]);
+            accepted.push(y[n_acc]);
+            Ok((accepted, forwards))
+        }
+    }
     /// MTP 드래프트 프리필 (P15④) — 타깃 프리필 직후 호출. 프롬프트 토큰
     /// c_1..c_{T-1}을 (c_{i+1}, h_i) 쌍으로 드래프트 계층에 적립해 드래프트
     /// KV가 전체 문맥을 갖게 한다(빈 문맥 시작이 수용률 붕괴 원인 — 실측).

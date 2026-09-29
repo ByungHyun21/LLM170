@@ -274,7 +274,11 @@ impl Q4Acc {
         // 패밀리(핀이 j128+large-t로 고정)를 쓰게 한다 — 패밀리가 t 무관으로
         // 동일해져 행별 산술이 청킹과 무관해진다. 디코드(t=1)는 핀이 꺼져
         // 있어 기존 GEMV 그대로다.
-        let pin_tile = crate::rawhip::ctx::PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed);
+        // plans/110 W2: 검증 배치 핀 중에는 타일 패밀리를 끈다 — frame_begin이
+        // t>1에서 PREFILL_PIN을 켜는데, 검증 배치는 t=1 GEMV(디코드)와
+        // 비트 동일이어야 한다(행핀이 gemv 경로를 잡는다).
+        let pin_tile = crate::rawhip::ctx::PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
+            && !crate::rawhip::ctx::VERIFY_ROW_PIN.load(std::sync::atomic::Ordering::Relaxed);
         if (t >= 16 || pin_tile) && !env_on("LLM170_Q4_NO_TILE") {
             // j128/v4 계열(=8/12/13/14/23)은 사분면 지원 — 그 외 타입만 128씩 분할.
             let tq_mode = matches!(
@@ -326,6 +330,19 @@ impl Q4Acc {
         t: usize,
         out: *mut u8,
     ) -> Result<(), String> {
+        // plans/110 W2: 검증 배치 핀 — 행별 t=1 디스패치(mt 판은 w판과
+        // 누산 재배열 편차가 있다). 라우터/hc inject 등 f32 무게 전용.
+        if (2..=8).contains(&t)
+            && n_in.is_multiple_of(4)
+            && crate::rawhip::ctx::VERIFY_ROW_PIN.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for r in 0..t {
+                let xs = unsafe { x.add(r * n_in * 4) };
+                let os = unsafe { out.add(r * n_out * 4) };
+                self.launch_gemm_f32(xs, w, n_in, n_out, 1, os)?;
+            }
+            return Ok(());
+        }
         let mut x_p = x as *mut std::ffi::c_void;
         let mut w_p = w as *mut std::ffi::c_void;
         let mut o_p = out as *mut std::ffi::c_void;
@@ -832,18 +849,20 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         hist: usize,
         host_ring: &[f32],
     ) -> Result<(), String> {
-        let _ = pos0; // hip 은 디코드 전용 게이트 유지(plans/93 P2 vk 우선)
         if t != 1 {
             return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
         }
         let hc_dim = hc * n_embd;
         let ring_bytes = hist * hc_dim * 4;
-        // 링 풀 + 워터마크(되감기면 호스트 링으로 리프레시).
+        // 링 워터마크는 pos 기반(vk 판과 동일 의미론) — t 기반은 되감기
+        // (스펙 검증 롤백 재실행, plans/110 W2)을 감지하지 못해 디바이스 링이
+        // 기각된 타임라인의 활성을 담은 채로 남는다. pos0 < 워터마크면 호스트
+        // 링(정합 상태)으로 리프레시.
         let rewind = {
             let mut wm = self.ple_ring_pos.lock().map_err(|e| e.to_string())?;
             let w = wm.entry(seq).or_insert(0);
-            let rw = *w > t; // pos0=0 재시작(벤치 워밍업 등)
-            *w = t; // t=1: 이번 토큰까지 유효
+            let rw = pos0 < *w;
+            *w = pos0 + t;
             rw
         };
         let ring = {
@@ -951,6 +970,7 @@ impl llm170_core::matmul::EwOps for Q4Acc {
                 cop as *mut std::ffi::c_void,
             );
             let (mut ne, mut hcc, mut tt) = (n_embd as i32, hc as i32, t as i32);
+
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut rp) as *mut _ as *mut std::ffi::c_void,
                 (&mut vp) as *mut _ as *mut std::ffi::c_void,
@@ -968,6 +988,24 @@ impl llm170_core::matmul::EwOps for Q4Acc {
                 256,
                 &mut args,
             )?;
+        }
+        Ok(())
+    }
+
+    /// plans/110 W2 — 디바이스 PLE 링 → 호스트 판독(hip). 종전 미구현으로
+    /// 디코드가 CPU ple_conv를 동기화하지 못했고, 스펙 롤백의 pos 기반
+    /// 되감기 refresh가 stale 호스트 링으로 디바이스 링을 오염시켰다.
+    /// 계약: GPU 유휴 시점(판독 동기 후) 호출.
+    fn ple_ring_sync(&self, seq: usize, ring_out: &mut [f32]) -> Result<(), String> {
+        let m = self.ple_ring.lock().map_err(|e| e.to_string())?;
+        let Some(g) = m.get(&seq) else {
+            return Err("ple_ring_sync: 링 없음".into());
+        };
+        let n = ring_out.len().min(g.bytes / 4);
+        // SAFETY (107 W8): 링 GBuf 매핑 판독 — n은 g.bytes/4 상한 클램프,
+        // 호출 계약상 선행 판독이 스트림을 동기화했다.
+        unsafe {
+            std::ptr::copy_nonoverlapping(g.ptr as *const f32, ring_out.as_mut_ptr(), n);
         }
         Ok(())
     }

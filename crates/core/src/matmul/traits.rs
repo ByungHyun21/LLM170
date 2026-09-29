@@ -727,6 +727,12 @@ pub trait FrameHost: Send + Sync {
     fn frame_op(&self, _op: &FrameOp) -> Result<(), String> {
         Err("frame_op: 미지원".into())
     }
+
+    /// plans/110 W2 — 스펙 검증 배치 핀: true인 동안 t=2..8 GEMV를 행별
+    /// t=1 커널 디스패치로 실행한다(mt 변형은 t=1 커널과 축소 순서가 달라
+    /// 검증 배치 == 순차 decode1 비트 동일이 깨진다). 기본 no-op(미구현
+    /// 백엔드는 배치 산술 그대로).
+    fn frame_verify_rows(&self, _on: bool) {}
     /// 상주 q8 양자화: src(f32) → xq(u32 워드 n/8) + xd(f32 n/32) —
     /// quantize_row_q8_ref 비트 미러.
     fn frame_quant_q8(&self, _src: u64, _xq: u64, _xd: u64, _n: usize) -> Result<(), String> {

@@ -77,6 +77,13 @@ struct TileLaunch {
 pub(crate) static PREFILL_PIN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 스펙 검증 배치 핀 (plans/110 W2) — frame_forward_verify 진입~종료 사이
+/// true. t 2..8 Q8_0/f32 GEMV의 mt 변형은 t=1 디코드 커널(w16/w)과 축소
+/// 순서가 달라 비트가 갈라진다 — 핀 중에는 행별 t=1 디스패치로 돌려
+/// 검증 배치 == 순차 decode1 비트 동일을 보장한다(비용: 행당 무게 재독).
+pub(crate) static VERIFY_ROW_PIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 디스패처 모델 스코프 (plans/84 E1) — 전역 디스패처의 패밀리 기본값을
 /// 모델별로 분리: 27B(qwen35) 게이트 타이를 뒤집는 저출력 warp GEMV를
 /// Flash-Next(qwen4exp/q4acc)에서만 기본 적용하기 위함.

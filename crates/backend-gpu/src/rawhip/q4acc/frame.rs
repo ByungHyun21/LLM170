@@ -1257,6 +1257,12 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         }
     }
 
+    /// plans/110 W2 — 검증 배치 핀: t=2..8 Q8_0/f32 GEMV의 행별 t=1
+    /// 디스패치 강제(VERIFY_ROW_PIN).
+    fn frame_verify_rows(&self, on: bool) {
+        crate::rawhip::ctx::VERIFY_ROW_PIN.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// [t][vocab] logits 행별 GPU argmax — np greedy 판정 (plans/74 N1).
     /// argmax64 = CPU greedy와 동일 의미(동률 최저 인덱스).
     fn frame_argmax_rows(&self, logits: u64, t: usize, vocab: usize) -> Result<Vec<u32>, String> {
@@ -1329,6 +1335,24 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 ws.len(),
                 outs.len()
             ));
+        }
+        // plans/110 W2: 검증 배치 핀 — 행별 t=1 재귀. t=2..8의 배치 디스패치
+        // (mt 커널·듀얼 없음)는 t=1 디코드(듀얼/dmmv 포함)와 산술이 갈라진다.
+        // 행 뷰(메모)로 재귀하면 decode1이 쓰는 t=1 코드 경로를 그대로 탄다.
+        if (2..=8).contains(&t)
+            && crate::rawhip::ctx::VERIFY_ROW_PIN.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let n_in = ws[0].n_in as usize;
+            for r in 0..t {
+                let x_row = self.vview(x, r * n_in, n_in)?;
+                let mut out_rows = Vec::with_capacity(outs.len());
+                for (i, w) in ws.iter().enumerate() {
+                    let no = w.n_out as usize;
+                    out_rows.push(self.vview(outs[i], r * no, no)?);
+                }
+                self.frame_mm_group(x_row, ws, &out_rows, 1)?;
+            }
+            return Ok(());
         }
         let xp = self.fptr(x)?;
         // 동일 입력 — 양자화 1회 공유 (f32 계열이 섞이면 개별).

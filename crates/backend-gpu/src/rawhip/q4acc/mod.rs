@@ -145,6 +145,10 @@ pub struct Q4Acc {
     /// plans/73: PLE conv 링 상주 상태 [seq] + 워터마크(접두 되감기 검출).
     ple_ring: std::sync::Mutex<std::collections::HashMap<usize, GBuf>>,
     ple_ring_pos: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    /// plans/110 W2: 검증 배치 행 뷰 메모 — (base,off,len)→행 핸들. 핀 중
+    /// t=2..8 그룹 GEMM을 행별 t=1 디스패치(듀얼·dmmv 포함)로 재귀하기 위한
+    /// 뷰 핸들 — 프레임 테이블 무한 증가 방지(버퍼×8행 상한).
+    verify_views: std::sync::Mutex<std::collections::HashMap<(u64, usize, usize), u64>>,
     /// PLE norm/conv 상수(내용 해시 키 맵) — qsa_iqw와 동일 이유로 층별 상주.
     ple_nk: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     ple_nq: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
@@ -205,6 +209,22 @@ impl Q4Acc {
         // SAFETY: 핸들은 ev_new 산출분, 1회 파기.
         unsafe { crate::rawhip::RawCtx::ev_destroy(ev) }
     }
+
+    /// plans/110 W2 — 검증 배치 행 뷰(메모) — (base,off,len)으로 frame_slice
+    /// 행 핸들을 1회 생성해 재사용(프레임 테이블 무한 증가 방지).
+    pub(super) fn vview(&self, h: u64, off: usize, len: usize) -> Result<u64, String> {
+        let key = (h, off, len);
+        {
+            let m = self.verify_views.lock().map_err(|e| e.to_string())?;
+            if let Some(&v) = m.get(&key) {
+                return Ok(v);
+            }
+        }
+        let v = llm170_core::matmul::FrameHost::frame_slice(self, h, off, len)?;
+        let mut m = self.verify_views.lock().map_err(|e| e.to_string())?;
+        m.insert(key, v);
+        Ok(v)
+    }
     /// 파트 소스 지정판 — (`Model4::part_sources`). 비어 있으면 mmap 폴트 폴백.
     pub fn new_with_sources(
         parts: Vec<(usize, usize, std::path::PathBuf)>,
@@ -263,6 +283,7 @@ impl Q4Acc {
             qsa_selflag: std::sync::Mutex::new(GBuf::new("qsa_selflag")),
             ple_ring: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_ring_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
+            verify_views: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_nk: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_nq: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_nc: std::sync::Mutex::new(std::collections::HashMap::new()),
