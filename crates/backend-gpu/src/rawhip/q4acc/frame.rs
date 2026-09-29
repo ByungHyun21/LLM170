@@ -147,11 +147,9 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // frame_quant)과 K-분할 reduce·카운팅 정렬 기계를 통째로 건너뛰고
         // 전문가 그룹 GEMM을 런치 1회로 마친다. 킬스위치 LLM170_HIP_DMMV_OFF
         // (기본 ON=사용 — 끄면 종전 ge_ids/w_ids direct-ids 경로로 복귀).
-        if (self.t_cur() == 1 || rows <= 64)
-            && rows > 0
+        if crate::common::moe::ids2_takes(rows, self.t_cur(), ws.ty)
             && !f32w
             && !env_on("LLM170_HIP_DMMV_OFF")
-            && matches!(ws.ty, GgmlType::Q4K | GgmlType::Q5_1)
         {
             let idp = self.fptr(ids)?;
             let kern: &'static str = if ws.ty == GgmlType::Q4K {
@@ -429,7 +427,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
                     // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
-                    let bound = rows + 16 * ne;
+                    let bound = crate::common::moe::grp_bound(rows, ne);
                     let (pd, ivd, rxd) = {
                         let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
                         let pd = a.ensure(&self.ctx, rows * 4)? as u64;
@@ -471,17 +469,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         let idp = self.fptr(ids)?;
                         let mut idv = vec![0u32; rows];
                         self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
-                        let mut cnt = vec![0i32; ne];
-                        for &e in &idv {
-                            cnt[(e as usize).min(ne - 1)] += 1;
-                        }
-                        let mut hoff = vec![0usize; ne + 1];
-                        let mut acc2 = 0;
-                        for e in 0..ne {
-                            hoff[e] = acc2;
-                            acc2 += cnt[e] as usize;
-                        }
-                        hoff[ne] = acc2;
+                        // 호스트 재계산 — common 판(cnt+누적과 동일 값, P13 공용화).
+                        let hoff = crate::common::moe::grp_offsets(&idv, ne);
                         let mut bad = 0;
                         for e in 0..=ne {
                             if dev_off[e] as usize != hoff[e] {
@@ -576,23 +565,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     let idp = self.fptr(ids)?;
                     let mut idv = vec![0u32; rows];
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
-                    let mut off = vec![0usize; ne + 1];
-                    for &e in &idv {
-                        off[(e as usize).min(ne - 1) + 1] += 1;
-                    }
-                    for e in 0..ne {
-                        off[e + 1] += off[e];
-                    }
-                    let mut cur = off[..ne].to_vec();
-                    let mut perm = vec![0u32; rows];
-                    let mut inv = vec![0u32; rows];
-                    for (i, &e) in idv.iter().enumerate() {
-                        let e = (e as usize).min(ne - 1);
-                        let p = cur[e];
-                        perm[p] = i as u32;
-                        inv[i] = p as u32;
-                        cur[e] += 1;
-                    }
+                    // 카운팅 정렬 테이블 — common 공용판(vk 폴백과 바이트 동일, P13).
+                    let off = crate::common::moe::grp_offsets(&idv, ne);
+                    let perm = crate::common::moe::grp_perm(&idv, ne, &off);
+                    let inv = crate::common::moe::grp_inv(&perm);
                     let (pd, ivd, rxd) = {
                         let mut a = self.rperm.lock().map_err(|e| e.to_string())?;
                         let pd = a.ensure(&self.ctx, rows * 4)? as u64;
@@ -611,11 +587,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     }
                     self.ctx
                         .h2d(rxd as *mut u8, bytemuck::cast_slice(&rowexp))?;
-                    let mut off_pad = vec![0usize; ne + 1];
-                    for e in 0..ne {
-                        off_pad[e + 1] = off_pad[e] + (off[e + 1] - off[e]).div_ceil(16) * 16;
-                    }
-                    let rows_pad = off_pad[ne].max(16);
+                    let (off_pad, rows_pad) = crate::common::moe::grp_padded(&off, ne, 16);
                     let mut perm_pad = vec![0u32; rows_pad];
                     let mut inv_pad = vec![0u32; rows];
                     for e in 0..ne {
@@ -692,7 +664,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // 디바이스 그룹화 경로의 GEMM은 t = rows_pad로 x를 읽는다(패딩 행의 출력은
         // scatter가 버리므로 값은 무관, 크기만 rows_pad까지 필요).
         let xbuf_rows = if rows_pad_d != 0 {
-            rows + 16 * ne
+            crate::common::moe::grp_bound(rows, ne)
         } else {
             rows
         };
@@ -707,7 +679,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             // 패딩 행(≤16·ne)분까지 버퍼를 확보해야 한다. 종전 rows 크기여서
             // 프리필에서 out 끝을 넘는 쓰기 → HIP 700(10차 소거의 정체).
             let ybuf_rows = if rows_pad_d != 0 {
-                rows + 16 * ne
+                crate::common::moe::grp_bound(rows, ne)
             } else {
                 rows
             };
@@ -718,7 +690,13 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // **패딩 도메인**(r < *rows_pad, rowexp=패딩 인덱스)으로 읽는다 — gather도
         // perm_pad/bound행으로. 호스트 경로는 종전대로 비패딩 perm_d/rows.
         if pad_layout {
-            self.rows_permute_dev(xsrc0, perm_pad_d as *mut u8, xg, row_u32, rows + 16 * ne)?;
+            self.rows_permute_dev(
+                xsrc0,
+                perm_pad_d as *mut u8,
+                xg,
+                row_u32,
+                crate::common::moe::grp_bound(rows, ne),
+            )?;
         } else {
             self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
         }
@@ -921,7 +899,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             }
             let _ = &b;
             let rows_pad_dev = b[ne + 1].max(0) as usize;
-            let bound = self.t_cur() * k_sel.max(1) + 16 * ne;
+            let bound = crate::common::moe::grp_bound(rows, ne);
             if llm170_diag::dump::opts().key("moe_bcheck") {
                 // b(pinned off) 무결성 — r 오염(gemm_q5k gx=1.04억)의 원본 관찰.
                 let mut mono_ok = true;

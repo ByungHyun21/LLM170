@@ -1092,12 +1092,9 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
             )?;
         }
         // (3) top-k 순위 + 목록 전개. n_sel 산술은 stages::qsa_select 패스 B와
-        // 동일(usize 정수 — 호스트에서 계산해도 무동기).
-        let tail_start = n_blocks * r;
-        let tail_cnt = n_past - tail_start;
-        let width = n_past.min(idx_top_k + r - 1);
-        let n_sel = ((width - tail_cnt) / r).min(n_blocks);
-        let list_len = n_sel * r + tail_cnt;
+        // 동일(usize 정수 — 무동기) — common 공용판(vk qsa_sel_dev 와 바이트
+        // 동일, P13).
+        let (n_sel, list_len) = crate::common::qsa::sel_counts(n_past, n_blocks, r, idx_top_k);
         let (sdev, ofdev) = {
             let mut d = self.msk.lock().map_err(|e| e.to_string())?;
             let sdev = d.ensure(&self.ctx, list_len.max(1) * 4)? as u64;
