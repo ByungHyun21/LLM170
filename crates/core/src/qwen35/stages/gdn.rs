@@ -3,7 +3,7 @@
 
 use super::super::{ModelError, SeqState, span_block};
 use super::Ctx;
-use crate::matmul::{mm_batch, mm_group};
+use crate::qwen35::{mm_batch, mm_group};
 use crate::ops::{l2_norm, sigmoid, silu, softplus};
 use llm170_diag::profile_span;
 

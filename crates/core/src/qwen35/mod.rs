@@ -8,6 +8,8 @@
 //! - 하이퍼파라미터는 GGUF 메타에서 동적 로드 (소형 검증 모델 지원).
 //! - f32 KV, f32 GDN 상태 (참조 정확도 우선).
 
+mod dispatch;
+use dispatch::{Acc, mm, mm_batch, mm_group};
 mod diag;
 pub(crate) mod frame;
 pub mod hparams;
@@ -22,7 +24,7 @@ use llm170_diag::profile_span;
 use llm170_gguf::GgufFile;
 use memmap2::Mmap;
 
-use crate::matmul::{Weight, mm, mm_batch, mm_group};
+use crate::matmul::Weight;
 use crate::ops::{rms_norm, silu};
 use crate::quant::dequant_row;
 #[derive(Debug)]
@@ -283,7 +285,7 @@ pub struct Engine {
     pub model: Model,
     pub seqs: Vec<SeqState>,
     /// 런타임 주입 가속기 (None = CPU 참조 경로). 구현은 backend-gpu.
-    pub acc: crate::matmul::Acc,
+    pub acc: Acc,
     /// qwen35 디코드 프레임 (t=1) — LLM170_FRAME35=1 첫 디코드에서 생성.
     pub raw_decode: Option<std::sync::Arc<dyn crate::matmul::RawDecode>>,
     /// token_embd 원시 복사 캐시 (spec 토큰 행 디양자화용 — 매 스텝 to_vec 폭주 방지).
