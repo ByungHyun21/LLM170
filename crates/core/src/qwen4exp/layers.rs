@@ -145,7 +145,31 @@ fn frame_env_on(decode: bool) -> bool {
     })
 }
 
+
 impl Engine4 {
+
+/// Frame4 지연 생성 스탠자 — 7중 복제 통합(plans/109 P7). 실패 시
+/// frame_broken + fb_incr(FrameCreate) + 경고 후 false(호출부 value 폴백).
+fn frame_ensure(&mut self) -> bool {
+    if self.frame.is_some() {
+        return true;
+    }
+    let Some(acc) = self.acc.as_deref() else {
+        return false;
+    };
+    match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
+        Ok(f) => {
+            self.frame = Some(f);
+            true
+        }
+        Err(e) => {
+            self.frame_broken = true;
+            crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
+            eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
+            false
+        }
+    }
+}
     pub fn new(model: Model4, n_seqs: usize, ctx: usize) -> Self {
         let seqs = (0..n_seqs)
             .map(|_| SeqState4::new(&model.hp, ctx))
@@ -438,22 +462,7 @@ impl Engine4 {
             chunk
         };
         if frame_on {
-            let acc = self.acc.as_deref().unwrap();
-            if self.frame.is_none() {
-                match super::frame::Frame4::new(
-                    acc,
-                    &self.model,
-                    &self.seqs,
-                    frame_t_max(Some(acc)),
-                ) {
-                    Ok(f) => self.frame = Some(f),
-                    Err(e) => {
-                        self.frame_broken = true;
-                        crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                        eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                    }
-                }
-            }
+            self.frame_ensure();
         }
         if let Some(f) = self.frame.as_mut().filter(|_| frame_on) {
             let acc = self.acc.as_deref().unwrap();
@@ -538,22 +547,9 @@ impl Engine4 {
             .clamp(16, 4096)
             .min(frame_t_max_cap(self.acc.as_deref()));
         // 프레임 경로(이 함수의 주경로)는 CPU 상태 불필요 — 풀백 생략(데드 워크).
-        if self.frame.is_none() {
-            match super::frame::Frame4::new(
-                self.acc.as_deref().unwrap(),
-                &self.model,
-                &self.seqs,
-                frame_t_max(self.acc.as_deref()),
-            ) {
-                Ok(f) => self.frame = Some(f),
-                Err(e) => {
-                    self.frame_broken = true;
-                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                    let l = self.prefill(seq, tokens)?;
-                    return Ok(crate::qwen35::greedy(&l));
-                }
-            }
+        if !self.frame_ensure() {
+            let l = self.prefill(seq, tokens)?;
+            return Ok(crate::qwen35::greedy(&l));
         }
         let acc = self.acc.as_deref().unwrap();
         let f = self.frame.as_mut().unwrap();
@@ -597,14 +593,10 @@ impl Engine4 {
         if tokens.len() != seqs.len() * per_seq || seqs.len() < 2 {
             return Err(Q4Error::Io("prefill_multi: 계약 위반".into()));
         }
-        if self.frame.is_none() {
-            let f = super::frame::Frame4::new(
-                acc.as_ref(),
-                &self.model,
-                &self.seqs,
-                frame_t_max(Some(acc.as_ref())),
-            )?;
-            self.frame = Some(f);
+        if !self.frame_ensure() {
+            // 프레임 생성 실패 — 호출부 트랜잭션 계약(plans/86 §3)대로 슬롯별
+            // prefill_greedy 폴백 유도.
+            return Err(Q4Error::Io("prefill_multi: frame 생성 실패".into()));
         }
         let f = self.frame.as_mut().unwrap();
         // 상태 동기화 — 슬롯별 prefill_greedy 와 동일 규칙.
@@ -681,17 +673,7 @@ impl Engine4 {
         }
         self.ple_next = None;
         self.ple_consume = None;
-        let acc = self.acc.as_deref().unwrap();
-        if self.frame.is_none() {
-            match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
-                Ok(f) => self.frame = Some(f),
-                Err(e) => {
-                    self.frame_broken = true;
-                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                }
-            }
-        }
+        self.frame_ensure();
         // plans/86 §3 — 트랜잭션 스냅샷(전 시퀀스).
         let ple0: Vec<_> = seqs
             .iter()
@@ -773,17 +755,7 @@ impl Engine4 {
         }
         self.ple_next = None;
         self.ple_consume = None;
-        let acc = self.acc.as_deref().unwrap();
-        if self.frame.is_none() {
-            match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
-                Ok(f) => self.frame = Some(f),
-                Err(e) => {
-                    self.frame_broken = true;
-                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                }
-            }
-        }
+        self.frame_ensure();
         // plans/86 §3 — 트랜잭션 스냅샷(전 시퀀스).
         let ple0: Vec<_> = seqs
             .iter()
@@ -867,18 +839,9 @@ impl Engine4 {
         {
             self.ple_consume = Some(vec![std::mem::take(&mut g.emb)]);
         }
-        let acc = self.acc.as_deref().unwrap();
-        if self.frame.is_none() {
-            match super::frame::Frame4::new(acc, &self.model, &self.seqs, frame_t_max(Some(acc))) {
-                Ok(f) => self.frame = Some(f),
-                Err(e) => {
-                    self.frame_broken = true;
-                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                    eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                    let l = self.decode1(seq, token)?;
-                    return Ok(crate::qwen35::greedy(&l));
-                }
-            }
+        if !self.frame_ensure() {
+            let l = self.decode1(seq, token)?;
+            return Ok(crate::qwen35::greedy(&l));
         }
         // plans/86 §3 — 트랜잭션 스냅샷(폴백 시 복원).
         let ple0 = super::frame::ple_snap(&self.seqs[seq]);
@@ -945,27 +908,10 @@ impl Engine4 {
         // 발생해 상태 오염 전에 중단된다.
         let frame_on = self.frame_on(true);
         let frame_try = if frame_on {
-            let acc = self.acc.as_deref().unwrap();
-            if self.frame.is_none() {
-                match super::frame::Frame4::new(
-                    acc,
-                    &self.model,
-                    &self.seqs,
-                    frame_t_max(Some(acc)),
-                ) {
-                    Ok(f) => {
-                        self.frame = Some(f);
-                        Some(())
-                    }
-                    Err(e) => {
-                        self.frame_broken = true;
-                        crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::FrameCreate);
-                        eprintln!("# frame: 생성 실패 — value 경로 폴백 ({e})");
-                        None
-                    }
-                }
-            } else {
+            if self.frame_ensure() {
                 Some(())
+            } else {
+                None
             }
         } else {
             None
@@ -1083,7 +1029,10 @@ impl Engine4 {
     }
 }
 
-/// 프리페치 워커용 순수 n-gram 해시 — ple_hash와 동일 수식 (파라미터만 전달).
+/// 프리페치 워커용 순수 n-gram 해시 — 공용 코어(ple_hash_rows) 위임.
+/// 종전 복제판은 lookback을 진행 중 hist에서 읽어 청크 경계에서 ple_hash와
+/// 행이 갈라졌다(프리페치 적중 저하만 있고 토큰 무영향) — 109 P7 통합.
+#[allow(clippy::too_many_arguments)]
 fn pure_hash(
     hist: &[u32],
     hist_valid: bool,
@@ -1095,52 +1044,7 @@ fn pure_hash(
     vs: &[u64],
     eos: u32,
 ) -> Vec<u32> {
-    let heads = hpng * 2;
-    let mut hist: Vec<u32> = if hist_valid {
-        hist.to_vec()
-    } else {
-        vec![eos; ngram - 1]
-    };
-    let mut rows = Vec::with_capacity(tokens.len() * heads);
-    for (i, &tok) in tokens.iter().enumerate() {
-        let mut ctx = vec![tok as u64; ngram];
-        let mut cut = false;
-        for s in 1..ngram {
-            let j = i as i64 - s as i64;
-            let prev: u64 = if j >= 0 {
-                tokens[j as usize] as u64
-            } else {
-                let back = s as i64 - i as i64;
-                let k = hist.len() as i64 - back;
-                if k >= 0 && (k as usize) < hist.len() {
-                    hist[k as usize] as u64
-                } else {
-                    eos as u64
-                }
-            };
-            ctx[s] = if cut { eos as u64 } else { prev };
-            if ctx[s] == eos as u64 {
-                cut = true;
-            }
-        }
-        for n in 2..=ngram {
-            let mut mixed = ctx[0].wrapping_mul(mult[0]);
-            for j in 1..n {
-                mixed ^= ctx[j].wrapping_mul(mult[j]);
-            }
-            let base = (n - 2) * hpng;
-            for g in 0..hpng {
-                let h = base + g;
-                rows.push((mixed % vs[h] + offs[h]) as u32);
-            }
-        }
-        hist.push(tok);
-        if hist.len() > ngram - 1 {
-            let cutn = hist.len() - (ngram - 1);
-            hist.drain(..cutn);
-        }
-    }
-    rows
+    crate::qwen4exp::stages::ple_hash_rows(hist, hist_valid, tokens, ngram, hpng, mult, offs, vs, eos).0
 }
 
 /// hc_combine: res[s] += out·(2·σ(inject_s/4)).
