@@ -288,12 +288,25 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                     .iter()
                     .map(|&i| format!("{}:{:.2}", i, lg[i]))
                     .collect();
+                // P15③ 스모크 — k=3 스펙 3스텝 수용률.
+                let mut acc_total = 0usize;
+                let mut fwd_total = 0usize;
+                let mut last = t0;
+                for _ in 0..3 {
+                    let (acc, fwd) = eng.mtp_spec_step(0, last, 3).map_err(|e| e.to_string())?;
+                    acc_total += acc.len();
+                    fwd_total += fwd;
+                    last = *acc.last().unwrap_or(&last);
+                }
                 Ok(format!(
-                    "mtp-draft-check: 로짓 {}개 finite={} top5=[{}] (draft pos={})",
+                    "mtp-draft-check: 로짓 {}개 finite={} top5=[{}] (draft pos={}) | spec k=3×3: 수용 {}토큰/{} forward = {:.2} tok/fwd",
                     lg.len(),
                     finite,
                     top.join(" "),
-                    eng.mtp_seqs[0].pos
+                    eng.mtp_seqs[0].pos,
+                    acc_total,
+                    fwd_total,
+                    acc_total as f64 / fwd_total.max(1) as f64
                 ))
             })()
         }
