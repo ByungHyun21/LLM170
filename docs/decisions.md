@@ -3177,3 +3177,26 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   실측(760 7 22 7…) — 규칙 10 승인 전까지 호출부 명시 유지.
 - 게이트: charhash hip 15,674라인 동일 · FN hip/vk · 27B 토큰 PASS ·
   preflight 통과. 누적 −3.5k 라인.
+
+### (120) 유지보수 캠페인 2차 — 구조 통합 P9-P12a + 종결 판정군 (plans/109, 2026-09-29)
+
+- **rawhip**: gemm_mmq/gemm_mmq_s → gemm_mmq_impl(stream,side) 통일(사이드는
+  mmq_y_s 전용 버퍼 유지 — 부록90 경쟁 원인 보존). mmq_y_cache epoch 기계
+  완전 삭제(P6에서 읽기 삭제 후 쓰기 전용 잔여). ktr_ev 헬퍼로 KTRACE 이벤트
+  블록 8복제 해소. gemv_kern 테이블 3복제 통일. RawCtx::new(210ln) →
+  compile_rtc + load_co_families 분리(SAFETY 명시).
+- **decode**: gdn_split3 공용 런처(4경로). l2 통일은 **보존 결정** — 커널/그리드
+  변형(l2_rows2_scale vs _w, EXACT 분기)이 형상 취약. qsa sel/sel4 쌍둥이 →
+  qsa_ensure_upload + qsa_sel_args 공용. value.rs tiled 상수 폭감.
+  probes LCG 11복제는 **보존 결정** — 시드+출력 변환이 프로브별 진단 데이터
+  계약.
+- **core**: frame_ensure(7→1)·ple_hash_rows 공용 코어(pure_hash 청크 경계
+  발산 해소 — 프리페치 적중에만 영향, 토큰 무변경)·emb_broadcast_write
+  (forward/multi/np 3복제)·silu_rows(5→1)·traits 부착 수리·
+  matmul/dispatch.rs→qwen35/dispatch.rs 소속 이관.
+- **rawvk**: gdn_check(~1200ln)·smoke_test → checks/gdn.rs 이동(무변경).
+  pipeline 3종은 **보존 결정**(변형부가 본체).
+- 게이트: 전 배터리 PASS(charhash 15,674 동일·FN hip/vk·27B)·preflight 6/6.
+  캠페인 누적 −4.3k 라인, env 280→205. main 머지 완료.
+- 인계: P12c(frame_check 19섹션 분할 지침 플랜 기록)·P12d·P13(common/ 후보
+  검증 후 추출)·P15(FN 외장 MTP 기능 — Q4/Q8 비교·serve 통합 테스트 포함).
