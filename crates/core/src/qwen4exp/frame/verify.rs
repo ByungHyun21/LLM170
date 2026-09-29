@@ -11,8 +11,8 @@
 //! QSA KV/idx 풀은 pos 키 쓰기라 재실행에 멱등, PLE 링은 pos 기반
 //! 워터마크 되감기(백엔드)로 호스트 링에서 리프레시된다.
 use super::super::stages::{self, Ctx};
-use super::forward::{hc_combine_frame, hc_mix_frame};
-use super::np::{ensure_np_views, gdn_frame_np, moe_frame_np, qsa_frame_np};
+use super::forward::{hc_combine_frame, hc_mix_frame, moe_frame};
+use super::np::{ensure_np_views, gdn_frame_np, qsa_frame_np};
 use super::{Frame4, fs_begin, op};
 use crate::matmul::{Accelerator, FrameOp};
 use crate::qwen4exp::layers::SeqState4;
@@ -74,9 +74,23 @@ pub(crate) fn frame_forward_verify(
 
     // PLE n-gram 행 — 행별 호스트 해시(같은 seq라 체인)
     let ple_rows: Vec<Vec<u32>> = if hp.is_ple(1) {
-        (0..t)
-            .map(|row| stages::ple_hash(ctx, &mut seq_sts[seq], &tokens[row..row + 1]))
-            .collect()
+        // 110 W3 근원 수리: ple_hash는 pos 핸드셰이크(hist_valid =
+        // next_pos == pos)로 체인한다 — 같은 seq의 t행을 한 번에 해시할 때는
+        // 행마다 pos를 진행해야 순차 decode1과 동일한 행열이 나온다.
+        // 종전엔 전 행이 같은 pos로 해시돼 행1의 hist_valid가 깨졌다(발산 근원).
+        // 해시 후 pos 복원 — QSA/GDN 행별 처리는 base+occ로 자체 산출.
+        let base = seq_sts[seq].pos;
+        let mut v = Vec::with_capacity(t);
+        for row in 0..t {
+            seq_sts[seq].pos = base + row as u32;
+            v.push(stages::ple_hash(
+                ctx,
+                &mut seq_sts[seq],
+                &tokens[row..row + 1],
+            ));
+        }
+        seq_sts[seq].pos = base;
+        v
     } else {
         Vec::new()
     };
@@ -128,6 +142,22 @@ pub(crate) fn frame_forward_verify(
                 )
                 .map_err(Q4Error::Io)?;
             }
+            // W3 진단: PLE 링 합 — 다음 라운드 PLE 입력(발산 매개 후보).
+            if llm170_diag::dump::opts().checksum {
+                acc.frame_sync(); // 링 쓰기는 비동기 — ple_ring_sync 대기 후 계약
+                let hist = (hp.ple_conv_k - 1) * hp.ple_ngram;
+                let mut ring = vec![0.0f32; hist * hc * n];
+                let rs = match acc.ple_ring_sync(seq, &mut ring) {
+                    Ok(()) => format!(
+                        "sum={:.6} v0={:.6} last={:.6}",
+                        ring.iter().map(|&x| x as f64).sum::<f64>(),
+                        ring[0],
+                        ring[ring.len() - 1]
+                    ),
+                    Err(e) => format!("none({e})"),
+                };
+                eprintln!("[npck] V{il}.ring t={t} {rs}");
+            }
         }
 
         fs_begin(acc, t); // 공유 구간
@@ -147,21 +177,24 @@ pub(crate) fn frame_forward_verify(
             full_idx += 1;
         }
 
-        // 4) hc ffn mix + MoE + combine — MoE는 행별 t=1(np 판). t>1
-        // gather/scatter 경로도 t=1 direct-ids와 비트 불일치(V1 실험,
-        // 110 W2) — 잔여 t=2 공유구간 발산(W3 과제)과 무관하게 여기는
-        // 행별로 둔다.
+        // 4) hc ffn mix + MoE(t 배치) + combine — 110 W3: ple_hash pos
+        // 핸드셰이크 수리 후 t=k-1 배치가 비스펙와 완전 등가(43/43)임을
+        // 확인 — MoE t>1(gather/scatter) 포함 배치 경로 그대로.
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
-        moe_frame_np(acc, model, f, il, n, &seqs)?;
-        fs_begin(acc, t); // moe_frame_np가 t_cur를 1로 내린다 — 복원(np 관례)
+        moe_frame(acc, model, f, il, n, t)?;
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
-        // W3 진단: 스테이지 체크섬(il<4) — t≥2 공유구간과 t=1의 첫 발산
-        // 지점 특정. 태그 접두 V(verify)로 npck 스트림에서 분리.
-        if il < 4 && llm170_diag::dump::opts().checksum {
+        // W3 진단: 스테이지 체크섬 — t≥2 공유구간과 t=1의 첫 발산 지점 특정.
+        // il<4는 전 스테이지, 나머지 층은 잔차(res)만 8층 간격 표본(판독
+        // 비용 상한). 태그 접두 V(verify)로 npck 스트림에서 분리.
+        let ck_all4 = il < 4 && llm170_diag::dump::opts().checksum;
+        let ck_res = il % 8 == 7 && llm170_diag::dump::opts().checksum;
+        if ck_all4 {
             super::diag::frame_ck(acc, f.mix, n, t, &format!("V{il}.mix"));
             super::diag::frame_ck(acc, f.ffn_out, n, t, &format!("V{il}.attn"));
             super::diag::frame_ck(acc, f.mix, n, t, &format!("V{il}.mixf"));
             super::diag::frame_ck(acc, f.mout, n, t, &format!("V{il}.moe"));
+        }
+        if ck_all4 || ck_res || il + 1 == hp.n_layer {
             super::diag::frame_ck(acc, f.res_hc, hc * n, t, &format!("V{il}.res"));
         }
     }
