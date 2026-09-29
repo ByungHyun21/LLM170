@@ -1,11 +1,11 @@
 //! RawCtx — 디바이스 컨텍스트(스트림·커널 레지스트리·버퍼 아레나·런치 래퍼).
 //! plans/75 P2.2: mod.rs 에서 기계적 이동(내용 무변경).
 
+use crate::rawhip::KtraceEv;
 use crate::rawhip::ck;
 use crate::rawhip::kernels;
 use crate::rawhip::nolaunch_on;
 use crate::rawhip::{CO_J128, CO_MMQ, CO_MMQ2, CO_MMQ3, CO_MMQ8, CO_ODD, CO_QY, CO_V4};
-use crate::rawhip::KtraceEv;
 use crate::rawhip::{env_eq, env_on};
 use cubecl_hip_sys as hip;
 use std::collections::HashMap;

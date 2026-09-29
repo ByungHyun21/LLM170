@@ -954,7 +954,9 @@ impl DecoderState {
                 // flash — 프리필(t≥2, GQA ≤6:1)은 다중쿼리 판(plans/83 D):
                 // K/V 타일을 24쿼리가 공유해 장문 프리필(pp4096) 어텐션 트래픽·
                 // 지연을 1/24로 줄인다. 폴백(구 판)은 LLM170_VK_NOGQ=1.
-                if t >= 2 && n_head / n_kv.max(1) <= 6 && std::env::var_os("LLM170_VK_NOGQ").is_none()
+                if t >= 2
+                    && n_head / n_kv.max(1) <= 6
+                    && std::env::var_os("LLM170_VK_NOGQ").is_none()
                 {
                     // plans/92 P3: 레지스터 상주판(qsa_flash_reg) — hip wk16 구조
                     // 이식(LDS·배리어 0, 점유 8WG/CU급). 종전 gq는 LDS 61KB/WG로
