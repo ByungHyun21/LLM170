@@ -371,6 +371,11 @@ impl Engine4 {
         let snap_t = self.seqs[seq].clone();
         let snap_d = self.mtp_seqs[seq].clone();
         let y: Vec<u32>;
+        // 진단→기본 경로(110 W2): 행별 t=1 검증이 유일한 비스펙 완전 등가
+        // 경로(k=2·k=3 실측). t=k-1 배치는 LLM170_SPEC_TB=1 실험(W3이
+        // 잔여 비트 발산을 수리하면 전환).
+        let v1 = std::env::var_os("LLM170_SPEC_TB").is_none();
+        let mut v1_rows = 0u32;
         {
             let Engine4 {
                 model,
@@ -388,15 +393,35 @@ impl Engine4 {
                 model,
                 acc: Some(a),
             };
-            y = super::frame::frame_forward_verify(
-                a,
-                model,
-                &ctx,
-                seqs.as_mut_slice(),
-                seq,
-                f,
-                &proposals,
-            )?;
+            // 행별 t=1 검증(기본 경로, 상단 주석 참조) — 행마다 pos 전진,
+            // 호출부 정산과 이중 계상 방지 플래그 포함.
+            y = if v1 {
+                let mut yy = Vec::with_capacity(proposals.len());
+                for p in &proposals {
+                    yy.extend(super::frame::frame_forward_verify(
+                        a,
+                        model,
+                        &ctx,
+                        seqs.as_mut_slice(),
+                        seq,
+                        f,
+                        std::slice::from_ref(p),
+                    )?);
+                    seqs[seq].pos += 1;
+                    v1_rows += 1;
+                }
+                yy
+            } else {
+                super::frame::frame_forward_verify(
+                    a,
+                    model,
+                    &ctx,
+                    seqs.as_mut_slice(),
+                    seq,
+                    f,
+                    &proposals,
+                )?
+            };
             // 다음 라운드 h 입력 — 배치 export 행 풀(마지막 행 = 마지막 처리 행).
             if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
                 self.last_res_hc_rows = f.last_res_hc_rows.clone();
@@ -503,7 +528,7 @@ impl Engine4 {
             accepted.extend_from_slice(&proposals[1..]);
             accepted.push(*y.last().unwrap_or(&t0));
             // 배치가 정확히 proposals행만큼 상태를 전진시켰다 — pos 정산.
-            self.seqs[seq].pos += proposals.len() as u32;
+            self.seqs[seq].pos += (proposals.len() as u32).saturating_sub(v1_rows);
             Ok((accepted, forwards))
         } else {
             // 기각 — 스냅샷 복원(GDN 디바이스 + CPU) 후 수용분 재실행.
