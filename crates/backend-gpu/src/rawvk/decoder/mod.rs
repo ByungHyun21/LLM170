@@ -470,6 +470,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
             .mtp_step_g(seq, tok_emb, false, h, pos, true)?
             .ok_or("mtp head")?;
         let mut h_next = vec![0f32; ds.n_embd];
+        // SAFETY (107 W8): m_cur 매핑 판독 — mtp_step_g 내부 end_batch_wait로 GPU 유휴; ds 수명 유지 중, n_embd 이하.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 ds.m_cur.ptr as *const f32,
@@ -508,6 +509,7 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
     fn mtp_upload_tok_emb(&self, tok_flat: &[f32]) -> Result<(), String> {
         let mut guard = self.st.lock().map_err(|e| e.to_string())?;
         let ds = guard.as_mut().ok_or("vkdecoder: 미초기화")?;
+        // SAFETY (107 W8): m_be 매핑 기입 — 길이는 min(tok_flat.len(), T_MAX*n_embd)로 버퍼 용량 이내; 동기 기입(제출 전).
         unsafe {
             std::ptr::copy_nonoverlapping(
                 tok_flat.as_ptr(),
@@ -543,7 +545,9 @@ impl llm170_core::matmul::RawDecode for VkDecoder {
         let cl = (ds.conv_k - 1) * ds.conv_ch;
         for r in 0..ds.st_gdn.len() {
             if seq < ds.st_gdn[r].len() {
+                // SAFETY (107 W8): st_gdn[seq]은 gl(dt_rank*d_state²) f32로 할당 — 0-채우기 정확히 할당 크기, seq 인덱스는 범위 체크됨.
                 unsafe { std::ptr::write_bytes(ds.st_gdn[r][seq].ptr as *mut f32, 0, gl) };
+                // SAFETY (107 W8): st_conv[seq]은 cl((conv_k-1)*conv_ch) f32로 할당 — 0-채우기 정확히 할당 크기.
                 unsafe { std::ptr::write_bytes(ds.st_conv[r][seq].ptr as *mut f32, 0, cl) };
             }
         }

@@ -199,6 +199,7 @@ impl RawCtx {
     /// 스테이징 없이 디바이스로 직행하도록. 반환 (a, b): 실패 시 null.
     /// 크기는 요청치 이상 보유(성장 재할당). 해제는 Drop이 책임.
     pub fn pinned_stage2(&self, need: usize) -> Result<(*mut u8, *mut u8), String> {
+        // SAFETY (107 W8): 핀 스테이지 이중 버퍼 — 재할당은 이전 포인터 hipFreeHost 후; (base, base+need)는 항상 2*need 할당의 두 절반. 호출부는 다음 pinned_stage2(재할당) 전에 사용을 마쳐야 한다.
         unsafe {
             let mut pin = self.pinned_stage.lock().map_err(|e| e.to_string())?;
             if pin.0 < 2 * need {

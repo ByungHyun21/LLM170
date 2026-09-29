@@ -735,6 +735,7 @@ impl VkCtx {
             self.device
                 .bind_buffer_memory(buf, mem, 0)
                 .map_err(|e| format!("바인드: {e:?}"))?;
+            // SAFETY (107 W8): HOST_VISIBLE 메모리 전체 매핑 — 반환 ptr는 bytes 크기 유효, unmap 전까지 유지. 매핑 열린 동안 mem/buf 해제 금지(alloc→unmap 짝).
             let ptr = self
                 .device
                 .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())

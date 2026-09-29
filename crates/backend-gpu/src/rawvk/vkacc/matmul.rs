@@ -61,6 +61,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
         ctx.run(p.pl, ds, p.pipe, &push1, 1, t as u32, 1)?;
         // 비배치 run은 동기 — 안전한 직접 판독.
         let mut out = vec![0u32; t];
+        // SAFETY (107 W8): ob 매핑 판독 — 비배치 run은 동기; t원소는 argmax 결과 버퍼 크기와 일치.
         unsafe { std::ptr::copy_nonoverlapping(ob.ptr as *const u32, out.as_mut_ptr(), t) };
         Ok(out)
     }
@@ -174,6 +175,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             let b = g.get(&h).ok_or("vk frame_write: 핸들 없음")?;
             (b.ptr, std::marker::PhantomData::<()>)
         };
+        // SAFETY (107 W8): frame_write — 핸들로 조회한 버퍼가 살아 있고 data.len()은 호출부 계약상 그 크기 이내; 프레임 기록(제출 전) 구간.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len()) };
         Ok(())
     }
@@ -184,6 +186,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             .get(&h)
             .ok_or("vk frame_write_u32: 핸들 없음")?
             .ptr;
+        // SAFETY (107 W8): frame_write_u32 — 동일 계약: 핸들 버퍼 생존 + 길이 일치, 쓰기 전용.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u32, data.len()) };
         Ok(())
     }
@@ -206,6 +209,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
             .get(&h)
             .ok_or("vk frame_read: 핸들 없음")?
             .ptr;
+        // SAFETY (107 W8): frame_read — frame_sync가 wait_pending으로 보류 제출 완료 보장; out.len()은 버퍼 크기 이내.
         unsafe { std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), out.len()) };
         Ok(())
     }
@@ -901,6 +905,7 @@ impl llm170_core::matmul::MatmulHost for VkAcc {
             ctx.end_batch_wait()?;
         }
         for (ptr, n_out, wi) in hosts {
+            // SAFETY (107 W8): 판독 — do_batch면 직전 end_batch_wait, 아니면 동기 run; t*n_out 원소.
             let host = unsafe { std::slice::from_raw_parts(ptr as *const f32, t * n_out) };
             for ti in 0..t {
                 outs[wi][ti].copy_from_slice(&host[ti * n_out..(ti + 1) * n_out]);

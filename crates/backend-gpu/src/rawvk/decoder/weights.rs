@@ -137,6 +137,7 @@ impl DecoderState {
                 for (name, buf16) in outs.into_inner().unwrap() {
                     let bytes = buf16.len() * 2;
                     let mut b = ctx.alloc(bytes)?;
+                    // SAFETY (107 W8): b는 bytes=f16 결과 크기(=buf16.len()*2)로 직전 alloc — 매핑 ptr 쓰기 범위 내, 아직 제출되지 않아 GPU 접근 없음.
                     unsafe {
                         std::ptr::copy_nonoverlapping(buf16.as_ptr() as *const u8, b.ptr, bytes)
                     };
@@ -165,6 +166,7 @@ impl DecoderState {
                 let rem = data.len() - off;
                 let sz = ch_eff.min(rem);
                 let mut b = ctx.alloc(sz)?;
+                // SAFETY (107 W8): b는 이번 청크 sz로 할당 — .add(off)+sz ≤ data.len()(루프 불변식 off<data.len()), 쓰기는 할당 크기 이내.
                 unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(off), b.ptr, sz) };
                 ctx.unmap(&mut b)?;
                 bufs.push(b);
@@ -180,12 +182,14 @@ impl DecoderState {
         let mut cmap = HashMap::new();
         for (name, vals) in consts {
             let b = ctx.alloc_host(vals.len() * 4)?;
+            // SAFETY (107 W8): b는 vals.len()*4 바이트 alloc_host — f32 원소수×4와 복사 길이 일치.
             unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), b.ptr as *mut f32, vals.len()) };
             cmap.insert(name, b);
         }
         // gemv 공유 테이블
         let kv: Vec<u32> = llm170_core::ktab2_packed();
         let mut ktab = ctx.alloc(1024)?;
+        // SAFETY (107 W8): ktab은 1024바이트(=u32 256개)로 할당 — kv 256원소 기입과 정확히 일치.
         unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr(), ktab.ptr as *mut u32, 256) };
         ctx.unmap(&mut ktab)?;
         let mut grid3s = ctx.alloc(2048)?;
@@ -248,6 +252,7 @@ impl DecoderState {
                 }
             }
             let t = ctx.alloc_host(v.len() * 8)?;
+            // SAFETY (107 W8): t는 v.len()*8 바이트 alloc_host — u64 테이블 바이트 재해석 기입, 길이 일치.
             unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, t.ptr, v.len() * 8) };
             Ok(t)
         };
@@ -380,6 +385,7 @@ impl DecoderState {
                     let p8: *mut Vec<i8> = &mut w8;
                     let pp: *mut Vec<f32> = &mut wsp;
                     let pm: *mut Vec<f32> = &mut wsm;
+                    // SAFETY (107 W8): &mut *p 역참조 — p8/pp/pm은 서로 다른 버퍼(별도 할당)를 가리키고 각 스레드는 자기 파티션만 쓴다: 별칭 없음.
                     let (w8s, wsps, wsms) = unsafe { (&mut *p8, &mut *pp, &mut *pm) };
                     let data = &data;
                     hs.push(s.spawn(move || {
@@ -475,12 +481,14 @@ impl DecoderState {
                     }
                 }
                 let mut b = ctx.alloc(no * 4)?;
+                // SAFETY (107 W8): b는 no 원소(wsr f32) 크기로 할당 — 기입 길이 no 이내, 매핑 유지 중.
                 unsafe { std::ptr::copy_nonoverlapping(wsr_v.as_ptr(), b.ptr as *mut f32, no) };
                 ctx.unmap(&mut b)?;
                 wsr_map.insert(name.to_string(), b);
             }
             let wbuf = {
                 let mut b = ctx.alloc(no * ni)?;
+                // SAFETY (107 W8): b는 no*ni 바이트(q4 가중)로 할당 — w8 바이트 길이와 일치.
                 unsafe { std::ptr::copy_nonoverlapping(w8.as_ptr() as *const u8, b.ptr, no * ni) };
                 ctx.unmap(&mut b)?;
                 b

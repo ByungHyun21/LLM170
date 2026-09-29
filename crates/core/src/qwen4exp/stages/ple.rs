@@ -63,6 +63,7 @@ pub fn ple_block(
         // 테이블 뷰를 미리 해석해 순수 함수(ple_gather_parts)로 호출 —
         // Model4는 내부 RefCell 캐시가 있어 스레드 간 공유가 불가능하다.
         let (tptr, tlen, tty, thd) = ctx.model.ple_table_view()?;
+        // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; scope 스레드들은 읽기 전용 공유.
         let tdata: &[u8] = unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
         std::thread::scope(|sc| {
             let mut rest: &mut [Vec<f32>] = &mut emb;

@@ -9,6 +9,7 @@ impl DecoderState {
     pub(super) fn hidden_row(&self) -> Vec<f32> {
         let n = self.n_embd;
         let mut v = vec![0f32; n];
+        // SAFETY (107 W8): b_xs 매핑 판독 — 호출 계약상 step 완료(end_batch_wait) 후 GPU 유휴; n=n_embd 이하.
         unsafe { std::ptr::copy_nonoverlapping(self.b_xs.ptr as *const f32, v.as_mut_ptr(), n) };
         v
     }
@@ -73,6 +74,7 @@ impl DecoderState {
         )?;
         self.ctx.end_batch_wait()?;
         let mut tok = 0u32;
+        // SAFETY (107 W8): b_am u32 판독 — 직전 end_batch_wait로 GPU 유휴, 1원소.
         unsafe { std::ptr::copy_nonoverlapping(self.b_am.ptr as *const u32, &mut tok, 1) };
         Ok(tok)
     }
@@ -94,6 +96,7 @@ impl DecoderState {
         let n = self.n_embd;
         let (n_head, n_kv, hd, n_rot) = (self.n_head, self.n_kv, self.hd, self.n_rot);
         debug_assert_eq!(tok_emb.len(), n);
+        // SAFETY (107 W8): m_e/m_h는 n(n_embd) f32로 할당 — 기입/0-채우기 n 이내, 제출 전이라 GPU 접근 없음.
         unsafe {
             std::ptr::copy_nonoverlapping(tok_emb.as_ptr(), self.m_e.ptr as *mut f32, n);
             if !h_from_cur {
@@ -537,6 +540,7 @@ impl DecoderState {
         // 마지막 행 q를 b_aq 행0으로 복사(매핑 ptr 직접) 후 t=1 플래시
         // (pos = pos0+t-1 — 그 행의 인과 상한 np = pos+1).
         let qstride = n_head * 2 * hd;
+        // SAFETY (107 W8): b_aq 내부 이동 — .add((t-1)*qstride*4)는 t행 할당의 마지막 행; overlap되는 ptr::copy(memmove) 사용. 직전 end_batch_wait로 유휴.
         unsafe {
             std::ptr::copy(
                 self.b_aq.ptr.add((t - 1) * qstride * 4) as *const f32,
@@ -564,6 +568,7 @@ impl DecoderState {
                 1,
             )?;
         }
+        // SAFETY (107 W8): m_bcur 마지막 행 판독 — (t-1)*n*4는 t*n 할당 이내; 청크 종료 대기(GPU 유휴) 후.
         // 마지막 행 잔여 트렁크 — t=1 버퍼로 복사해 기존 헬퍼 재사용.
         unsafe {
             let cur_last = self.m_bcur.ptr.add((t - 1) * n * 4) as *const f32;

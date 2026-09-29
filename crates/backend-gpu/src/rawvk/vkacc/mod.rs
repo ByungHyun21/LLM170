@@ -736,8 +736,10 @@ impl VkAcc {
         if self.tables.lock().is_none() {
             let kv: Vec<u32> = llm170_core::ktab2_packed();
             let kb = ctx.alloc_host(1024)?;
+            // SAFETY (107 W8): kb는 1024바이트 alloc_host — kv(u32 256개)와 정확히 일치.
             unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr() as *const u8, kb.ptr, 1024) };
             let gb = ctx.alloc_host(2048)?;
+            // SAFETY (107 W8): gb는 2048바이트 alloc_host — IQ3S_GRID 512워드(×4)와 일치.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     llm170_core::IQ3S_GRID.as_ptr() as *const u8,
@@ -826,9 +828,11 @@ impl VkAcc {
                         let n = ch.min(total - off);
                         let mut b = ctx.alloc(n)?;
                         let r = match src {
+                            // SAFETY (107 W8): pread_fill 계약 — b.ptr는 이번 n바이트 alloc의 매핑 시작: dst[0..n] 유효 쓰기 영역.
                             Some((s, o)) => unsafe {
                                 crate::common::parts::pread_fill(&s.file, b.ptr, o + off as u64, n)
                             },
+                            // SAFETY (107 W8): memcpy 폴백 — .add(off)+n ≤ total(루프 불변식), b는 n바이트로 방금 할당.
                             None => unsafe {
                                 std::ptr::copy_nonoverlapping(w.data.as_ptr().add(off), b.ptr, n);
                                 Ok(())
@@ -968,6 +972,7 @@ impl VkAcc {
                 })?);
             }
             let b = xf.as_ref().unwrap();
+            // SAFETY (107 W8): xf 매핑 기입 — .add(ti*n_in*4), xf는 need≥t*n_in*4로 성장 확보(잠금 중).
             for (ti, row) in xs.iter().enumerate() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -1013,6 +1018,7 @@ impl VkAcc {
     /// out 버퍼에서 호스트 행 복사.
     fn download_out(&self, outs: &mut [Vec<f32>], n_out: usize, t: usize) {
         let ob = self.obuf.lock();
+        // SAFETY (107 W8): obuf 매핑 판독 — 비배치 run 동기 완료; t*n_out 원소는 obuf 크기와 일치.
         let host = unsafe {
             std::slice::from_raw_parts(ob.as_ref().unwrap().ptr as *const f32, t * n_out)
         };

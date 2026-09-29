@@ -13,6 +13,7 @@ impl DecoderState {
         let conv_ch = self.conv_ch;
         let k_len = self.k_len;
         let v_len = self.v_len;
+        // SAFETY (107 W8): b_xs 매핑 기입 — n 이하(단일 행), begin_batch 전이라 GPU 접근 없음.
         unsafe { std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, n) };
         let vk_t0 = std::time::Instant::now();
         self.ctx.begin_batch()?;
@@ -521,6 +522,7 @@ impl DecoderState {
     pub fn step(&mut self, seq: usize, pos: usize, emb: &[f32]) -> Result<Vec<f32>, String> {
         self.step_core(seq, pos, emb)?;
         let mut logits = vec![0f32; self.n_vocab];
+        // SAFETY (107 W8): b_lg 매핑 판독 — step_core는 end_batch_wait로 동기 완료; n_vocab 읽기는 할당 크기와 일치.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.b_lg.ptr as *const f32,
@@ -566,6 +568,7 @@ impl DecoderState {
             true,
         )?;
         self.ctx.end_batch_wait()?;
+        // SAFETY (107 W8): b_am u32 1원소 판독 — 직전 end_batch_wait로 GPU 유휴.
         Ok(unsafe { *(self.b_am.ptr as *const u32) })
     }
 
@@ -594,6 +597,7 @@ impl DecoderState {
         // plans/92 P2: [pfck] 업로드·제출대기·헤드·판독 4분해 (LLM170_PFCK=1).
         let pfck = llm170_diag::dump::opts().key("pfck");
         let pf_up0 = std::time::Instant::now();
+        // SAFETY (107 W8): b_xs 매핑 기입 — t*n 원소, b_xs는 t행 용량으로 할당; begin_batch 전 유휴.
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
         }
@@ -1107,6 +1111,7 @@ impl DecoderState {
                 if il % m == 0 {
                     let mut v = vec![0f32; 64.min(n)];
                     self.ctx.end_batch_wait()?;
+                    // SAFETY (107 W8): b_xn 매핑 판독 — 직전 end_batch_wait로 GPU 유휴(디버그 [lsum] 덤프).
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             self.b_xn.ptr as *const f32,
@@ -1163,6 +1168,7 @@ impl DecoderState {
             }
         }
         // 마지막 행 head — b_xn 마지막 행이 이미 output_norm 융합 결과
+        // SAFETY (107 W8): b_xn 마지막 행 — .add((t-1)*n*4)은 t*n 할당 이내; 제출 전 상태.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.b_xn.ptr.add((t - 1) * n * 4) as *const f32,
@@ -1183,6 +1189,7 @@ impl DecoderState {
         let pf_head = pf_head0.elapsed().as_secs_f64() * 1e3;
         let pf_rd0 = std::time::Instant::now();
         let mut logits = vec![0f32; self.n_vocab];
+        // SAFETY (107 W8): b_lg 매핑 판독 — 직전 end_batch_wait로 GPU 유휴, n_vocab 원소.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.b_lg.ptr as *const f32,
@@ -1259,6 +1266,7 @@ impl DecoderState {
                 .collect();
             eprintln!("[npck] t={t} ns={ns} slot={sl:?} pos={ps:?} tbl={tb:#x?} va={va:#x?}");
         }
+        // SAFETY (107 W8): b_xs 매핑 기입 — t*n 원소, 할당 용량 이내; 배치 시작 전.
         unsafe {
             std::ptr::copy_nonoverlapping(emb.as_ptr(), self.b_xs.ptr as *mut f32, t * n);
             // 행별 pos/slot 맵 (u32 테이블 — 셰이더가 행 인덱스로 판독).
@@ -1693,6 +1701,7 @@ impl DecoderState {
         }
         if greedy {
             let mut toks = vec![0u32; t];
+            // SAFETY (107 W8): b_amr u32 t원소 판독 — 직전 end_batch_wait로 GPU 유휴.
             unsafe {
                 std::ptr::copy_nonoverlapping(self.b_amr.ptr as *const u32, toks.as_mut_ptr(), t)
             };
@@ -1701,6 +1710,7 @@ impl DecoderState {
         // plans/92 P6.4: 중간 flat 2.4MB + 행별 재복사 폐지 — 행 버퍼로 직복사.
         let mut rows: Vec<Vec<f32>> = (0..t).map(|_| vec![0f32; self.n_vocab]).collect();
         for (i, r) in rows.iter_mut().enumerate() {
+            // SAFETY (107 W8): b_lg_t 행 판독 — .add(i*n_vocab*4), i<t이고 버퍼는 t*n_vocab f32; 대기 완료 후.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     self.b_lg_t.ptr.add(i * self.n_vocab * 4) as *const f32,
@@ -1716,6 +1726,7 @@ impl DecoderState {
         self.ctx.end_batch_wait().ok();
         self.ctx.begin_batch().ok();
         let mut v = vec![0f32; len];
+        // SAFETY (107 W8): npck_mark — .add(row*len*4)는 호출부 계약상 버퍼 내 행; end_batch_wait 직후 GPU 유휴.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 b.ptr.add(row * len * 4) as *const f32,

@@ -274,6 +274,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
             let mut c = self.ple_consts.lock();
             c.remove(&key);
             let b = ctx.alloc_host(tokens.len() * 4)?;
+            // SAFETY (107 W8): tokens 테이블 업로드 — b는 tokens.len()*4 바이트 alloc_host, 바이트 재해석 길이 일치.
             unsafe {
                 std::ptr::copy_nonoverlapping(tokens.as_ptr() as *const u8, b.ptr, tokens.len() * 4)
             };
@@ -320,6 +321,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
                 b.buf
             } else {
                 let b = ctx.alloc_host(table.len())?;
+                // SAFETY (107 W8): rows 테이블 업로드 — b는 rows.len()*4 바이트 alloc_host, 길이 일치.
                 unsafe { std::ptr::copy_nonoverlapping(table.as_ptr(), b.ptr, table.len()) };
                 let buf = b.buf;
                 c.insert(key, b);
@@ -356,6 +358,7 @@ impl llm170_core::matmul::EwOps for VkAcc {
             return Err("ple_ring_sync: 링 없음".into());
         };
         let n = ring_out.len().min(b.bytes / 4);
+        // SAFETY (107 W8): ring 매핑 판독 — n은 b.bytes/4로 상한 클램프; ring_sync는 대기 후 호출 계약.
         unsafe {
             std::ptr::copy_nonoverlapping(b.ptr as *const f32, ring_out.as_mut_ptr(), n);
         }

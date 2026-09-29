@@ -1061,6 +1061,7 @@ impl Engine4 {
                 &vs,
                 eos,
             );
+            // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; 모델 가중이 유지되는 동안만 참조한다.
             let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
             let mut emb = vec![0.0f32; heads * hd];
             super::ple_gather_parts(data, ty, hd, &rows, &mut emb);
