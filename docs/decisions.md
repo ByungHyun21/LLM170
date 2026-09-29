@@ -3233,3 +3233,72 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   ~125ms. 프레임 경로(상주 버퍼·동기 회피)로 드래프트 스텝당 <10ms 달성
   가능하나 별도 커널 배치화 작업(후속).
 - 게이트: charhash 15,674 동일·FN hip/vk·27B PASS·preflight 6/6.
+
+### (123) MTP 드래프트 프레임 경로 이식 — 스텝당 125ms→5.5ms (plans/110 W1, 2026-09-30)
+
+- `frame/mtp.rs` 신설: mtp_draft_step_h가 프레임 경로 우선(Frame4 상주 버퍼
+  + FrameOp 체인). eh_proj t=hc 배치 GEMM 1호출(종전 스트림별 값경로 GEMV
+  hc회), hc_mix/hc_combine/헤드는 트렁크 프레임과 동일 op열, MoE top10+
+  direct-ids+shared(일반 경로), q/k/v·wo GEMV 프레임, dense softmax는
+  mtp_attn_cpu_row 공유 코어(값경로와 산술 단일 소스), GPU argmax+chain h
+  반출로 스텝 동기를 25→5회로 축소.
+- Q5_0(hc_up 3종, MTP 모듈)은 hip GEMV 미지원 — f32 디양자화 상주판
+  (F32Weight)으로 라우팅(비트 보존 디양자화, 트렁크 라우터 q4_gemm_f32
+  경로). 융합 shexp 커널(q4_shexp_gu/da)은 Q8_0 전용 레이아웃 — 드래프트
+  shexp(q4_K gate/up)에 쓰면 조용한 오염이라 일반 경로(Sigmoid→mm_group→
+  SiluMul→mm→Axpy)로.
+- 실측(hip, FN 게이트 프롬프트 16라운드): 드래프트 **5.5ms/스텝**(웜업 첫
+  스텝 405ms), 토큰 43개 main과 완전 동일, 벽 45.2→41.8s. 폴백 카운터
+  FbId::MtpDraft + LLM170_DUMP=mtp_time 계측.
+
+### (124) MTP 배치 검증 + 스펙 롤백 RCA 2건 — hip ple_ring_sync 미구현·mt 커널 비트 불일치 (plans/110 W2, 2026-09-30)
+
+- `frame/verify.rs`: t=k-1 검증을 1회 포워드로 통합(np 불변식 드라이버 — 공유
+  구간 t 배치, PLE/GDN/QSA 행별 t=1 체이닝). GDN 디바이스 상태 원시
+  스냅샷/복원(Frame4 verify_snap_*, ~112MB/seq 재사용 버퍼).
+- **RCA-1(기존 결함)**: hip에 `ple_ring_sync`가 구현돼 있지 않았다(트레잇
+  기본 Err) — 디코드가 CPU ple_conv를 동기화하지 못해, 롤백의 되감기
+  refresh가 stale 호스트 링으로 디바이스 링을 오염. hip 구현 추가로 해소.
+  이것이 종전 "스펙≠비스펙 토큰 분기"(main 9토큰부터 발산)의 근원.
+- **RCA-2(신규 발견)**: t=2..8 Q8_0/f32 GEMV의 mt 계열 커널은 t=1(w16/w)
+  과 축소 순서가 달라 비트가 갈라진다("정밀도 클래스 동일"일 뿐). 또
+  frame_begin(t>1)이 PREFILL_PIN을 켜 타일 패밀리로 디스패치. VERIFY_ROW_PIN
+  (행별 t=1 재귀 + 그룹 듀얼/dmmv 디스패치 보존 + 타일 게이트 억제)로 배치
+  == 순차 decode1 비트 동일을 달성 — 그림자 진단(LLM170_DUMP=spec_check)으로
+  전 라운드 y·GDN 상태·재실행 불일치 0 확인.
+- 실측: k=2 스펙==비스펙 49/49 토큰, k=3 16토큰 일치 후 17부터 발산(잔여:
+  행1 잔류 상태, QSA 블록키 타이밍 의심 — 열린 항목). 16라운드 39.8s vs
+  순차 41.5s. 행핀은 무게 상각을 포기(속도 이득 제한) — W3 타일 패밀리가
+  회복 가능. 킬스위치 LLM170_SPEC_NOBATCH=1.
+- 게이트: FN hip·FN vk·27B hip·charhash 15,674 PASS.
+
+### (125) 배치 프리필 기본 승격 + W6 부정 측정 + P12c/d 구조 분할 (plans/110 W8·W6·P12, 2026-09-30)
+
+- **W8 승격**: LLM170_PREFILL_BATCH flag::on→ne0(기본 ON, =0 킬스위치).
+  prefill_multi 등가: 배치==참조 토큰 4/4 seq·자기참조 차 0. env 카탈로그
+  재생성.
+- **W6 부정(ADR-0019 삭제)**: lm헤드 4행/블록판 gemm_q8_0_mr4 — 비트 동일
+  설계(행별 64스레드 매핑·환원 순서 보존)로 게이트 동일 통과했으나 4.0ms vs
+  원판 3.6ms. 병목은 블록 스케줄이 아니라 행내 지연(n_sub=80의 64스레드
+  분배 — 25% 스레드만 2블록 처리). 커널·디스패치·NAMES 등록까지 동일
+  변경에서 삭제. 1.5ms 목표는 산술 변경(스레드 매핑=환원 순서)이 필요해
+  규칙 10 승인 과제로 남김.
+- **P12c**: rawvk frame_check.rs(1,939ln) → 19 섹션 fn 분할(순수 코드
+  이동, 공백정규화 멀티셋 대조 검증). 부수: 7e06e90(109 P15-1a)에서 우발
+  삭제된 `vk-frame-check` 디스패치 복원 — 실행 검증 PASS(0 실패).
+- **P12d**: rawvk decoder/step.rs(1,739ln) → step(공유 코어)+step_batch+
+  step_np 3분할(rawhip decode/{step,np} 미러, git HEAD 재구성 대조 바이트
+  동일). core↔batch 중복은 파편 인자열뿐(연속 추출 블록 없음) — 분리 유지.
+
+### (126) P13 common/ 확장 — MoE 그룹테이블·QSA 선택 산술 공용화 (plans/110 P13, 2026-09-30)
+
+- common/moe.rs +6fn(grp_bound·grp_offsets·grp_perm·grp_inv·grp_padded·
+  ids2_takes)·common/qsa.rs +1fn(sel_counts) — hip q4acc(frame.rs·value.rs·
+  qsa.rs 11곳) ↔ vk vkacc(frame.rs·qsa.rs 6곳) 재배선. 각 fn 문서에 양측
+  원문 위치·대조 스니펫 인용. 단위테스트 4종(순열 전단사·역순열 복원·
+  rows_pad≤bound·항등선택 단축)으로 값 동일 증명.
+- 스킵(정직 기록): spec 스냅샷 오프셋(hip 균일 n_seqs 가정 vs vk 래그드
+  스트라이드 — 미세 발산), rowexp/tilexp 호스트 빌드(vk는 셰이더 기록),
+  hip starts 재계산(readback 방어 가드 변형), direct-ids 변형 게이트 3종
+  (타입 집합 상이 — 런치 판 선택은 원장 114로 백엔드별 유지).
+- 게이트: FN hip·27B hip·FN vk PASS, 단위테스트 4/4.

@@ -218,8 +218,7 @@ impl VkAcc {
         let xq_w = xq_words(n_in);
         // plans/89 P1.2 — ids dmmv 판이 이 호출을 가져갈 거면 xq 양자화 자체가
         // 불필요(f32 직결). 아래 조건은 ids2 분기와 동일해야 한다.
-        let ids2_takes =
-            rows > 0 && (t == 1 || rows <= 64) && matches!(w.ty, GgmlType::Q4K | GgmlType::Q5_1);
+        let ids2_takes = crate::common::moe::ids2_takes(rows, t, w.ty);
         // plans/105(원장 80): 팩 등록 히트 — 상위 정량 스킵(llmmq가 팩 소비).
         let pack_skip_quant = w.ty == GgmlType::Q4K && self.packbufs.lock().0.contains_key(&x);
         let xq = if ids2_takes || pack_skip_quant {
@@ -401,7 +400,7 @@ impl VkAcc {
             let idb = self.fbuf(ids)?;
             let wbufs = self.weight_bufs(&mut ctx, w)?;
             let per_expert = w.data.len() / ne;
-            let bound = rows + 16 * ne;
+            let bound = crate::common::moe::grp_bound(rows, ne);
             let (_, _, dbuf) = self.ensure_shared(&mut ctx)?;
             let chunk_words = (ctx.max_ssbo / 4) as u32;
             let generation = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
@@ -519,21 +518,12 @@ impl VkAcc {
                     let dev_perm_pad = rd(&gg.perm_pad, bound);
                     let dev_inv_pad = rd(&gg.inv_pad, rows);
                     let dev_rowexp = rd(&gg.rowexp, bound);
-                    let mut hoff = vec![0usize; ne + 1];
-                    for &e in &idv {
-                        hoff[(e as usize).min(ne - 1) + 1] += 1;
-                    }
-                    for e in 0..ne {
-                        hoff[e + 1] += hoff[e];
-                    }
-                    let mut hpoff = vec![0usize; ne + 1];
+                    // 호스트 재계산 — common 공용판(hip 호스트 빌드와 동일 코드, P13).
+                    let hoff = crate::common::moe::grp_offsets(&idv, ne);
                     // plans/93 sg2: 32행/WG 판은 전문가 경계가 32 배수여야 —
                     // WG가 두 전문가를 가로지르면 rowexp[0]의 가중치로 오계산.
                     let padmul = 16;
-                    for e in 0..ne {
-                        hpoff[e + 1] = hpoff[e] + (hoff[e + 1] - hoff[e]).div_ceil(padmul) * padmul;
-                    }
-                    let rows_pad = hpoff[ne].max(16);
+                    let (hpoff, rows_pad) = crate::common::moe::grp_padded(&hoff, ne, padmul);
                     let rp_dev =
                         // SAFETY (107 W8): rows_pad 매핑 판독 — 유휴 상태(end_batch_wait 후), 2원소.
                         unsafe { std::slice::from_raw_parts(gg.rows_pad.ptr as *const u32, 2) }[0]
@@ -816,24 +806,10 @@ impl VkAcc {
             // SAFETY (107 W8): ids 매핑 판독 — 직전 end_batch_wait로 GPU 유휴; rows 원소.
             unsafe { std::slice::from_raw_parts(b.ptr as *const u32, rows) }.to_vec()
         };
-        let mut off = vec![0usize; ne + 1];
-        for &e in &idv {
-            off[(e as usize).min(ne - 1) + 1] += 1;
-        }
-        for e in 0..ne {
-            off[e + 1] += off[e];
-        }
-        let mut cur = off[..ne].to_vec();
-        let mut perm = vec![0u32; rows];
-        for (i, &e) in idv.iter().enumerate() {
-            let e = (e as usize).min(ne - 1);
-            perm[cur[e]] = i as u32;
-            cur[e] += 1;
-        }
-        let mut inv = vec![0u32; rows];
-        for (p_, &orig) in perm.iter().enumerate() {
-            inv[orig as usize] = p_ as u32;
-        }
+        // 카운팅 정렬 테이블 — common 공용판(hip 호스트 빌드와 동일 코드, P13).
+        let off = crate::common::moe::grp_offsets(&idv, ne);
+        let perm = crate::common::moe::grp_perm(&idv, ne, &off);
+        let inv = crate::common::moe::grp_inv(&perm);
         let mut ctx = self.ctx.lock();
         // 3) MoE 스크래치 (perm u32, xg u32, iv u32, yg f32) — 필요시 성장.
         // xg 행 스트라이드는 16B 정렬로 패딩 — 전문가별 디스크립터 오프셋이

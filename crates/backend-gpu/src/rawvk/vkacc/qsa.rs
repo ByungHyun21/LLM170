@@ -280,12 +280,9 @@ impl llm170_core::matmul::QsaOps for VkAcc {
         let n_blocks = n_past / r;
         // (1) ik 적립 + 완성 블록 키 — 기존 구현(워터마크 규약 공유).
         self.qsa_idx_append_dev(full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
-        // n_sel 산술은 stages::qsa_select 패스 B와 동일(정수 — 무동기).
-        let tail_start = n_blocks * r;
-        let tail_cnt = n_past - tail_start;
-        let width = n_past.min(idx_top_k + r - 1);
-        let n_sel = ((width - tail_cnt) / r).min(n_blocks);
-        let list_len = n_sel * r + tail_cnt;
+        // n_sel 산술은 stages::qsa_select 패스 B와 동일(정수 — 무동기) —
+        // common 공용판(hip qsa_sel_dev 와 바이트 동일, P13).
+        let (n_sel, list_len) = crate::common::qsa::sel_counts(n_past, n_blocks, r, idx_top_k);
         let iqr_bytes = t * idx_heads * idx_dim * 4;
         let scr_bytes = n_blocks.max(1) * 4;
         let sd_bytes = list_len.max(1) * 4;
@@ -451,15 +448,13 @@ impl llm170_core::matmul::QsaOps for VkAcc {
                 "vk qsa_sel_dev_mt: nb={nb_cap} > 4096 (호스트 폴백)"
             ));
         }
-        // 목록 총길이 — 산술(qsa_sel_list 동일식, 무동기).
+        // 목록 총길이 — 산술(qsa_sel_list 동일식, 무동기). common 공용판을
+        // 토큰별 전개(P13).
         let mut list_len = 0usize;
         for tok in 0..t {
             let n_past = pos0 + tok + 1;
-            let nb = n_past / r;
-            let tail = n_past - nb * r;
-            let width = n_past.min(idx_top_k + r - 1);
-            let ns = ((width - tail) / r).min(nb);
-            list_len += ns * r + tail;
+            let (_, ll) = crate::common::qsa::sel_counts(n_past, n_past / r, r, idx_top_k);
+            list_len += ll;
         }
         self.qsa_idx_append_dev(full_idx, seq, ik, t, pos0, idx_dim, r, ikw, cs_idx, eps)?;
         let iqr_bytes = t * idx_heads * idx_dim * 4;
