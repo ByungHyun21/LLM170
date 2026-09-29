@@ -65,6 +65,45 @@ pub fn env_on(name: &str) -> bool {
     v
 }
 
+/// 스냅샷↔라이브 동치 검사 (plans/108 P1) — 현재 환경의 LLM170_ 키 전수에
+/// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조하고
+/// 레지스트리 캐시값도 재검한다. 불일치 목록(빈 벡터 = 정상).
+/// 원장 104(ne0 부재키 결함)류 회귀를 게이트 전에 포착한다.
+pub fn env_check() -> Vec<String> {
+    let mut bad = Vec::new();
+    for (ko, vo) in std::env::vars_os() {
+        let (Some(k), Some(v)) = (ko.to_str(), vo.to_str()) else {
+            continue;
+        };
+        if !k.starts_with("LLM170_") {
+            continue;
+        }
+        let live_some = std::env::var_os(k).is_some();
+        if on(k) != live_some {
+            bad.push(format!("{k}: on()={} live={live_some}", on(k)));
+        }
+        let live_eq1 = v == "1";
+        if eq1(k) != live_eq1 {
+            bad.push(format!("{k}: eq1()={} live={live_eq1}", eq1(k)));
+        }
+        let live_ne0 = v != "0";
+        if ne0(k) != live_ne0 {
+            bad.push(format!("{k}: ne0()={} live={live_ne0}", ne0(k)));
+        }
+        if val(k) != Some(v) {
+            bad.push(format!("{k}: val()={:?} live={v:?}", val(k)));
+        }
+    }
+    if let Ok(r) = registry().lock() {
+        for (k, info) in r.iter() {
+            if info.value != on(k) {
+                bad.push(format!("{k}: registry={} snapshot={}", info.value, on(k)));
+            }
+        }
+    }
+    bad
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +114,17 @@ mod tests {
         let name = "_DIAG_TEST_NONEXISTENT_";
         assert!(!env_on(name));
         assert!(!env_on(name)); // 캐시에서 반환
+    }
+
+    #[test]
+    fn absent_key_contracts() {
+        // 원장 104: 부재키 의미론 — ne0는 true(기본 ON), on/eq1는 false,
+        // val은 None. is_some_and로 되돌리면 이 테스트가 즉시 잡는다
+        // (108 P1 결함주입 검증 완료).
+        const K: &str = "_LLM170_ABSENT_PROBE_";
+        assert!(ne0(K), "ne0 absent-key must default ON");
+        assert!(!on(K));
+        assert!(!eq1(K));
+        assert!(val(K).is_none());
     }
 }
