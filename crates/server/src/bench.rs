@@ -133,31 +133,18 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         if arch.as_deref() == Some("qwen4exp") {
             let m = llm170_core::qwen4exp::Model4::load(&model_path).map_err(|e| e.to_string())?;
             let sources = m.part_sources();
-            let mut eng = llm170_core::qwen4exp::layers::Engine4::new(m, np_slots, ctx);
-            // plans/64 P1: GPU는 --backend gpu 명시 시에만. 주입 실패는 실패로
-            // 승격한다 (cubecl 제거 후 CPU 폴백 수치가 GPU로 오인된 이력).
+            let eng = llm170_core::qwen4exp::layers::Engine4::new(m, np_slots, ctx);
+            // GPU 부착 — 단일 경로(attach_q4, Strict: bench는 CPU 폴백하지
+            // 않는다 — 폴백 수치가 GPU로 오인된 이력).
             let want_gpu = crate::engine::q4_gpu_wanted_str(&backend, &gpu_runtime);
-            if want_gpu && crate::engine::q4_vk_runtime_str(&gpu_runtime) {
-                // plans/84 B — Vulkan 값경로(VkAcc). 프레임 미구현 → 값 경로.
-                match llm170_backend_gpu::new_q4_acc_vk_with_sources(sources) {
-                    Ok(acc) => {
-                        eng = eng.with_acc(acc);
-                        eprintln!("# backend: gpu (qwen4exp Vulkan 값경로 — plans/84 B)");
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else if want_gpu {
-                match llm170_backend_gpu::new_q4_acc_with_sources(sources) {
-                    Ok(acc) => {
-                        eng = eng.with_acc(acc);
-                    }
-                    Err(e) => {
-                        eprintln!("error: qwen4exp GPU 가속기 생성 실패 — {e}");
-                        eprintln!("error: bench는 CPU 폴백하지 않는다 (--backend cpu로 명시할 것)");
-                        return Err(e);
-                    }
-                }
-            }
+            let mut eng = crate::engine::attach_q4(
+                eng,
+                sources,
+                want_gpu,
+                crate::engine::q4_vk_runtime_str(&gpu_runtime),
+                false,
+                crate::engine::AttachPolicy::Strict,
+            )?;
             let eos = eng.model.eos;
             // 워밍업 1회 — 측정 형상과 동일하게(plans/79, llama-bench 정합).
             {
@@ -262,36 +249,12 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             if spec_k > 0 {
                 eng.mtp_wanted = true;
             }
-            if gpu_runtime == "vulkan" {
-                // plans/29: VkDecoder 기본 (VkAcc는 LLM170_VK_ACC=1로 복원).
-                if std::env::var_os("LLM170_VK_ACC").is_some() {
-                    match llm170_backend_gpu::rawvk::vkacc::VkAcc::new() {
-                        Ok(acc) => {
-                            eng = eng.with_acc(std::sync::Arc::new(acc));
-                            eprintln!("# backend: gpu (vulkan VkAcc)");
-                        }
-                        Err(e) => eprintln!("vk-acc: {e} (CPU로 진행)"),
-                    }
-                } else {
-                    llm170_backend_gpu::inject_rawvk(&mut eng)
-                        .unwrap_or_else(|e| eprintln!("vk-decoder: {e}"));
-                }
-            } else if std::env::var("LLM170_RAWHIP")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-            {
-                // GPU 런타임이 요청됐는데 백엔드 주입이 실패하면 조용히 CPU 엔진으로
-                // 떨어져 "GPU" 수치가 CPU 수치가 된다 (2026-09-12 hipRTC 컴파일 오류로
-                // 1.5 t/s를 GPU로 오인). 벤치는 실패로 승격한다.
-                if let Err(e) = llm170_backend_gpu::inject_rawhip(&mut eng) {
-                    eprintln!("rawhip: {e}");
-                    eprintln!(
-                        "error: GPU 백엔드 주입 실패 — bench는 CPU 폴백하지 않는다 (--gpu-runtime hip 확인)"
-                    );
-                    return Err(e);
-                }
-            }
-            let _ = &backend;
+            // GPU 부착 — 단일 경로(attach_q35, Strict: 폴백 수치의 GPU 오인 방지).
+            eng = crate::engine::attach_q35(
+                eng,
+                gpu_runtime == "vulkan",
+                crate::engine::AttachPolicy::Strict,
+            )?;
             let has_mtp = eng.has_mtp();
             let spec_desc = if spec_k > 0 && has_mtp {
                 format!(" spec{spec_k}")
