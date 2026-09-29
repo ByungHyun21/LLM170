@@ -376,6 +376,49 @@ fn handle(mut stream: TcpStream, tx: std::sync::mpsc::SyncSender<SlotJob>) -> Re
     }
 }
 
+
+/// 슬롯 잡 enqueue 공통 (plans/109 P5) — 채널 쌍 생성·SlotJob 조립·큐 송신.
+/// Err면 이미 503(queue full) 응답을 썼다. 반환: (최종 결과 수신기, 스트림
+/// 토큰 수신기 — 비스트림 모드는 진행 채널이 그대로 닫힌다).
+#[allow(clippy::type_complexity)]
+fn enqueue_job(
+    stream: &mut TcpStream,
+    tx: &std::sync::mpsc::SyncSender<SlotJob>,
+    ids: Vec<u32>,
+    n_predict: usize,
+    stops: Vec<u32>,
+    sampler: Option<llm170_core::sampler::SamplerParams>,
+    stream_mode: bool,
+) -> Result<
+    (
+        std::sync::mpsc::Receiver<TokOut>,
+        std::sync::mpsc::Receiver<u32>,
+    ),
+    (),
+> {
+    let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
+    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
+    let job = SlotJob {
+        tokens: ids,
+        n_predict,
+        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
+        sampler,
+        stops,
+        progress: stream_mode.then_some(ptx),
+        out: otx,
+        queued: std::time::Instant::now(),
+    };
+    if tx.try_send(job).is_err() {
+        resp(
+            stream,
+            503,
+            "application/json",
+            "{\"error\":\"queue full\"}",
+        );
+        return Err(());
+    }
+    Ok((orx, prx))
+}
 fn run_and_emit(
     stream: &mut TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
@@ -403,27 +446,9 @@ fn run_and_emit(
         );
         return;
     }
-    let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
-    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
-    let job = SlotJob {
-        tokens: ids,
-        n_predict,
-        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
-        sampler,
-        stops,
-        progress: stream_mode.then_some(ptx),
-        out: otx,
-        queued: std::time::Instant::now(),
-    };
-    if tx.try_send(job).is_err() {
-        resp(
-            stream,
-            503,
-            "application/json",
-            "{\"error\":\"queue full\"}",
-        );
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, stream_mode) else {
         return;
-    }
+    };
     if !stream_mode {
         let mut toks = Vec::new();
         if let Ok(r) = orx.recv() {
@@ -471,27 +496,17 @@ fn run_and_emit_anthropic(
     stream_mode: bool,
     sampler: Option<llm170_core::sampler::SamplerParams>,
 ) {
-    let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
-    let (ptx, prx) = std::sync::mpsc::channel::<u32>();
-    let job = SlotJob {
-        tokens: ids,
+    let Ok((orx, prx)) = enqueue_job(
+        stream,
+        &tx,
+        ids,
         n_predict,
-        spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
+        vec![STOP_EOT],
         sampler,
-        stops: vec![STOP_EOT],
-        progress: stream_mode.then_some(ptx),
-        out: otx,
-        queued: std::time::Instant::now(),
-    };
-    if tx.try_send(job).is_err() {
-        resp(
-            stream,
-            503,
-            "application/json",
-            "{\"error\":\"queue full\"}",
-        );
+        stream_mode,
+    ) else {
         return;
-    }
+    };
     if stream_mode {
         resp_sse_open(stream);
         sse(
