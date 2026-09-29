@@ -539,57 +539,21 @@ pub fn qsa_layer(
             mask_all[t] = mask_of(t, n_past);
         }
     }
-    // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(폴백 경로).
+    // 패스 C — GPU 어텐션 미사용 시 CPU 어텐션(공용 헬퍼).
     if !gpu_attn {
-        let (ckv, cvv) = (&seq.kv_k[full_idx], &seq.kv_v[full_idx]);
-        for t in 0..t_len {
-            let n_past = (pos0 as usize) + t + 1;
-            let mut attn_out = std::mem::take(&mut attn_all[t]);
-            let m_t = mask_from_list(&mask_all, &sel_blk, &sel_cnt, sel_stride, r, t, n_past);
-            cpu_attn_row(
-                &mut attn_out,
-                &qg[t],
-                &m_t,
-                n_past,
-                ckv,
-                cvv,
-                n_head,
-                n_kv,
-                hd,
-                kq_scale,
-            );
-            attn_all[t] = attn_out;
-        }
+        attn_all = qsa_cpu_attn_rows(
+            &qg, seq, full_idx, &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, t_len,
+            n_head, n_kv, hd, kq_scale,
+        );
     }
     // GPU 일괄 마스크 GQA — 캐시 전체(≤n_past_max)와 토큰별 마스크 전달.
     // 미래 위치는 mask 0으로 차단 (토큰 t는 pos_t+1까지만 참석).
     if gpu_attn && let Some(acc) = ctx.acc {
         let qflat: Vec<f32> = qg.iter().flatten().copied().collect();
-        // 선택 목록 압축 — 블록(오름차순) + 테일. 위치는 오름차순이므로
-        // 마스크 스캔과 산술 순서가 같다(프로브에서 비트 동일 확인).
-        let mut sel_off: Vec<u32> = vec![0u32; n_tok + 1];
-        for t2 in 0..n_tok {
-            let n_past = pos0 as usize + t2 + 1;
-            let tail_cnt = n_past - (n_past / r) * r;
-            sel_off[t2 + 1] = sel_off[t2] + sel_cnt[t2] * r as u32 + tail_cnt as u32;
-        }
-        let mut sel_idx: Vec<u32> = vec![0u32; sel_off[n_tok] as usize];
-        for t2 in 0..n_tok {
-            let n_past = pos0 as usize + t2 + 1;
-            let tail_start = (n_past / r) * r;
-            let mut o = sel_off[t2] as usize;
-            for k2 in 0..sel_cnt[t2] as usize {
-                let b = sel_blk[t2 * sel_stride + k2] as usize;
-                for j in 0..r {
-                    sel_idx[o] = (b * r + j) as u32;
-                    o += 1;
-                }
-            }
-            for j in tail_start..n_past {
-                sel_idx[o] = j as u32;
-                o += 1;
-            }
-        }
+        // 선택 목록 압축(공용 헬퍼 qsa_sel_list) — 블록(오름차순) + 테일.
+        let (sel_idx, sel_off) = qsa_sel_list(
+            &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize, n_tok,
+        );
         // 사용 prefix만 — 그리고 **복사하지 않는다**: 과거에는 여기서
         // .to_vec()으로 33.6MB/층(n_past 8192 기준)을 매 호출 복사했고,
         // 그 memcpy가 sel_build 타이머의 실체였다(실측 1.39ms/층 = 24GB/s).
@@ -615,29 +579,12 @@ pub fn qsa_layer(
                 if std::env::var_os("LLM170_Q4_NOFAST").is_none() {
                     ONCE.call_once(|| eprintln!("# qsa: GPU 어텐션 폴백 — CPU 재계산 ({e})"));
                 }
-                // 폴백은 실제로 CPU 재계산을 해야 한다 — 이전 구현은
-                // 행을 빈 채로 두어 12개 QSA 층의 어텐션이 조용히
-                // 누락됐다(2026-09-13 발견: 프레임==값 자가일치 통과).
-                for (t, row) in attn_all.iter_mut().enumerate() {
-                    let n_past = (pos0 as usize) + t + 1;
-                    let mask_t =
-                        mask_from_list(&mask_all, &sel_blk, &sel_cnt, sel_stride, r, t, n_past);
-                    let q_t = qg[t].clone();
-                    let mut attn_out = std::mem::take(row);
-                    cpu_attn_row(
-                        &mut attn_out,
-                        &q_t,
-                        &mask_t,
-                        n_past,
-                        ck,
-                        cv,
-                        n_head,
-                        n_kv,
-                        hd,
-                        kq_scale,
-                    );
-                    *row = attn_out;
-                }
+                // 폴백은 실제 CPU 재계산(공용 헬퍼) — 이전 구현은 행을 빈 채로
+                // 두어 어텐션이 조용히 누락됐다(2026-09-13 발견).
+                attn_all = qsa_cpu_attn_rows(
+                    &qg, seq, full_idx, &sel_blk, &sel_cnt, sel_stride, r, pos0 as usize,
+                    n_tok, n_head, n_kv, hd, kq_scale,
+                );
             }
         }
     }

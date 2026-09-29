@@ -269,24 +269,24 @@ fn ple_stage_hash(tag: &str, rows: &[Vec<f32>]) {
     );
 }
 /// PLE n-gram 해시 — 호스트 u64 (ctx[s]=직전 s토큰, EOS 절단).
-pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
-    if llm170_diag::dump::opts().key("ple_dump") {
-        eprintln!(
-            "[plehash] pos={} next_pos={} hist={:?} hist_valid={}",
-            seq.pos,
-            seq.ple_next_pos,
-            seq.ple_hist,
-            seq.ple_next_pos == seq.pos
-        );
-    }
-    let hp = ctx.model.hp.clone();
-    let ngram = hp.ple_ngram;
-    let heads = hp.ple_heads_per_ngram * 2; // bigram+trigram = 16
-    let eos = hp.ple_eos;
-    let hist0: Vec<u32> = seq.ple_hist.clone();
-    let hist_valid = seq.ple_next_pos == seq.pos;
+/// n-gram PLE 해시 행 계산 코어 — ple_hash와 프리페치 워커(pure_hash) 공용
+/// (plans/109 P7). lookback은 **호출 시작 스냅샷 hist0**에서 읽는다(plans/80
+/// 청크 불변성). 반환: (rows, 진화된 hist).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ple_hash_rows(
+    hist0: &[u32],
+    hist_valid: bool,
+    tokens: &[u32],
+    ngram: usize,
+    hpng: usize,
+    mult: &[u64],
+    offs: &[u64],
+    vs: &[u64],
+    eos: u32,
+) -> (Vec<u32>, Vec<u32>) {
+    let heads = hpng * 2;
     let mut hist: Vec<u32> = if hist_valid {
-        hist0.clone()
+        hist0.to_vec()
     } else {
         vec![eos; ngram - 1]
     };
@@ -299,10 +299,7 @@ pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
             let prev: u64 = if j >= 0 {
                 tokens[j as usize] as u64
             } else {
-                // 청크 경계 lookback은 **호출 시작 스냅샷**(hist0)에서 읽는다.
-                // 라이브 hist엔 이번 호출의 토큰이 이미 push되어 있어, 경계
-                // 토큰의 trigram이 잘못된 선행 토큰을 참조한다(2026-09-18,
-                // plans/80 — 청크 불변성 결함의 뿌리).
+                // 청크 경계 lookback은 호출 시작 스냅샷(hist0)에서.
                 let back = s as i64 - i as i64;
                 let k = hist0.len() as i64 - back;
                 if k >= 0 && (k as usize) < hist0.len() {
@@ -317,22 +314,51 @@ pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
             }
         }
         for n in 2..=ngram {
-            let mut mixed = ctx[0].wrapping_mul(hp.ple_multipliers[0]);
+            let mut mixed = ctx[0].wrapping_mul(mult[0]);
             for j in 1..n {
-                mixed ^= ctx[j].wrapping_mul(hp.ple_multipliers[j]);
+                mixed ^= ctx[j].wrapping_mul(mult[j]);
             }
-            let base = (n - 2) * hp.ple_heads_per_ngram;
-            for g in 0..hp.ple_heads_per_ngram {
+            let base = (n - 2) * hpng;
+            for g in 0..hpng {
                 let h = base + g;
-                rows.push((mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]) as u32);
+                rows.push((mixed % vs[h] + offs[h]) as u32);
             }
         }
         hist.push(tok);
         if hist.len() > ngram - 1 {
-            let cut = hist.len() - (ngram - 1);
-            hist.drain(..cut);
+            let cutn = hist.len() - (ngram - 1);
+            hist.drain(..cutn);
         }
     }
+    (rows, hist)
+}
+
+/// PLE 해시 — 시퀀스 상태(ple_hist/ple_next_pos)를 진화시킨다.
+pub fn ple_hash(ctx: &Ctx, seq: &mut SeqState4, tokens: &[u32]) -> Vec<u32> {
+    if llm170_diag::dump::opts().key("ple_dump") {
+        eprintln!(
+            "[plehash] pos={} next_pos={} hist={:?} hist_valid={}",
+            seq.pos,
+            seq.ple_next_pos,
+            seq.ple_hist,
+            seq.ple_next_pos == seq.pos
+        );
+    }
+    let hp = ctx.model.hp.clone();
+    let heads = hp.ple_heads_per_ngram * 2;
+    let hist0: Vec<u32> = seq.ple_hist.clone();
+    let hist_valid = seq.ple_next_pos == seq.pos;
+    let (rows, hist) = ple_hash_rows(
+        &hist0,
+        hist_valid,
+        tokens,
+        hp.ple_ngram,
+        hp.ple_heads_per_ngram,
+        &hp.ple_multipliers,
+        &hp.ple_head_offsets,
+        &hp.ple_head_vocab_sizes,
+        hp.ple_eos,
+    );
     if llm170_diag::dump::opts().key("ple_dump") {
         eprintln!("[plerows] {:?}", &rows[..rows.len().min(3 * heads)]);
         if rows.len() > 16 * heads {

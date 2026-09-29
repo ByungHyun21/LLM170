@@ -251,10 +251,6 @@ pub trait EwOps: Send + Sync {
         Err("shexp_da: 이 가속기는 미지원".into())
     }
 
-    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
-    /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
-    /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
-    #[allow(clippy::too_many_arguments)]
     /// plans/97 — pos==0 상태의 GPU zero-fill(gdn+conv). 실패 시 CPU 업로드 폴백.
     fn frame_zero_states(&self, _gdn: &[u64], _conv: &[u64]) -> Result<(), String> {
         Err("frame_zero_states: 미지원".into())
@@ -286,6 +282,10 @@ pub trait EwOps: Send + Sync {
         Err("ple_gather_dev: 미지원".into())
     }
 
+    /// plans/73: PLE 수학의 디바이스판(디코드 t=1) — gate/conv/잔차 3커널.
+    /// key/value 투영은 호출부가 frame_mm_group으로 수행한 뒤 이 메서드에
+    /// 디바이스 버퍼를 넘긴다. ring은 (seq)별 상주 상태(워터마크 규약).
+    #[allow(clippy::too_many_arguments)]
     fn ple_math_dev(
         &self,
         _res: u64,
@@ -644,10 +644,6 @@ pub trait FrameHost: Send + Sync {
         Err("frame_gdn_ar_np: 미지원".into())
     }
 
-    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
-    /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
-    /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
-    #[allow(clippy::too_many_arguments)]
     /// plans/73(np): 프레임 버퍼 행 뷰 — base+off_elems 위치를 frames 테이블에
     /// 등록해 새 핸들을 반환한다. np 배치 디코드가 per-seq 상태 op(conv/AR/
     /// QSA 선택·rope·어텐션)에 행 슬라이스를 그대로 넘기기 위해서다.
@@ -656,6 +652,9 @@ pub trait FrameHost: Send + Sync {
         Err("frame_slice: 이 가속기는 미지원".into())
     }
 
+    /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
+    /// (in-place). q는 [t][n_head*2*hd] (gate 절반은 그대로), k는 [t][n_kv*hd].
+    /// `cs`는 cos/sin 로프 테이블(모델 상수)로 호출부가 넘긴다.
     #[allow(clippy::too_many_arguments)]
     fn frame_qk_norm_rope(
         &self,
