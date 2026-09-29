@@ -349,6 +349,19 @@ impl Model4 {
         if layers != 1 {
             return Err(format!("mtp module: nextn_predict_layers={layers} (1 기대)").into());
         }
+        // MTP의 compress_ratios는 본체+1개(블록 n_layer의 비율 포함) —
+        // is_recr(n_layer) 판정을 위해 본체 hp에 마지막 원소를 덧붙인다.
+        if let llm170_gguf::Value::Array(_, a) = g
+            .arch_kv("attention.compress_ratios")
+            .ok_or("mtp module: compress_ratios 없음")?
+            && let Some(llm170_gguf::Value::I32(last)) = a.last()
+        {
+            let mut c = self.hp.compress.as_ref().to_vec();
+            c.push(*last);
+            self.hp.compress = c.into();
+        } else {
+            return Err("mtp module: compress_ratios 파싱 실패".into());
+        }
         let file = std::fs::File::open(path).map_err(|e| Q4Error::Io(e.to_string()))?;
         // SAFETY: 읽기 전용 무게 매핑 — 수정하지 않는다
         let mmap = unsafe { MmapOptions::new().map(&file)? };

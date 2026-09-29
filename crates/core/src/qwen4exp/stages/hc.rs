@@ -102,6 +102,26 @@ pub fn hc_mix(
     hc_mix_ex(ctx, &w_norm, &w_down, &w_up, Some(&w_inject), res_hc)
 }
 
+/// MTP 드래프트 헤드용 HC mix (inject 없음) — blk.{il}.nextn.hc_head_{norm,down,up}
+/// (plans/109 P15②). 구조는 hc_mix_head와 동일 — 드래프트 종결 믹서가
+/// nextn 전용 가중치(본체 output_hc와 별개)를 쓴다.
+pub fn hc_mix_nextn_head(
+    ctx: &Ctx,
+    il: usize,
+    res_hc: &[Vec<f32>],
+) -> Result<Vec<Vec<f32>>, Q4Error> {
+    profile_span!("q4::hc_mix_nextn_head");
+    let w_norm = ctx
+        .model
+        .f32_vec4(&format!("blk.{il}.nextn.hc_head_norm.weight"))?;
+    let w_down = ctx
+        .model
+        .w4(&format!("blk.{il}.nextn.hc_head_down.weight"))?;
+    let w_up = ctx.model.w4(&format!("blk.{il}.nextn.hc_head_up.weight"))?;
+    let (out, _) = hc_mix_ex(ctx, &w_norm, &w_down, &w_up, None, res_hc)?;
+    Ok(out)
+}
+
 /// 출력 헤드용 HC mix (inject 없음) — output_hc_{norm,down,up}. 동일 배치 구조.
 pub fn hc_mix_head(ctx: &Ctx, res_hc: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q4Error> {
     profile_span!("q4::hc_mix_head");
