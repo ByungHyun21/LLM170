@@ -11,8 +11,8 @@
 //! QSA KV/idx 풀은 pos 키 쓰기라 재실행에 멱등, PLE 링은 pos 기반
 //! 워터마크 되감기(백엔드)로 호스트 링에서 리프레시된다.
 use super::super::stages::{self, Ctx};
-use super::forward::{hc_combine_frame, hc_mix_frame, moe_frame};
-use super::np::{ensure_np_views, gdn_frame_np, qsa_frame_np};
+use super::forward::{hc_combine_frame, hc_mix_frame};
+use super::np::{ensure_np_views, gdn_frame_np, moe_frame_np, qsa_frame_np};
 use super::{Frame4, fs_begin, op};
 use crate::matmul::{Accelerator, FrameOp};
 use crate::qwen4exp::layers::SeqState4;
@@ -147,9 +147,13 @@ pub(crate) fn frame_forward_verify(
             full_idx += 1;
         }
 
-        // 4) hc ffn mix + MoE(t 배치 — np 불변식 산술) + combine
+        // 4) hc ffn mix + MoE + combine — MoE는 행별 t=1(np 판). t>1
+        // gather/scatter 경로도 t=1 direct-ids와 비트 불일치(V1 실험,
+        // 110 W2) — 잔여 t=2 공유구간 발산(W3 과제)과 무관하게 여기는
+        // 행별로 둔다.
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
-        moe_frame(acc, model, f, il, n, t)?;
+        moe_frame_np(acc, model, f, il, n, &seqs)?;
+        fs_begin(acc, t); // moe_frame_np가 t_cur를 1로 내린다 — 복원(np 관례)
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
     }
 
