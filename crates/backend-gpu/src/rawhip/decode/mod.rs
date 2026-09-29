@@ -675,6 +675,19 @@ impl DecodeState {
         out: *mut u8,
         t: usize,
     ) -> Result<(), String> {
+        // plans/108 P7: t=1 q8_0 dmmv — f32 활성 직소비(vk gemv8_q8b 이식).
+        // 활성 quant 생략 경로: 라우팅 조건은 weights.rs dmmv_used/grp_mmq와
+        // 동일해야 한다(어긋나면 quant를 건너뛴 쪽이 stale xq를 읽는다).
+        // 핀 시 타일 large-t 패밀리 고정이라 제외. 킬스위치 LLM170_HIP_DMMV_OFF.
+        if t == 1 && ty == 8 && !self.pin_prefill.get() && !env_on("LLM170_HIP_DMMV_OFF") {
+            return self.ctx.gemv_q8_dmmv_out(
+                y_f32 as *const u8,
+                wp as *const u8,
+                n_in,
+                n_out,
+                out,
+            );
+        }
         // 진단: LLM170_MMQ_ONLY=타입 비트마스크 — MMQ 바이섹트(q4=1<<0, q5=1<<1,
         // q6=1<<2, iq4xs=1<<11). plans/79 C: NO_MMQ·Q8MMQ·Q1MMQ·DEQ16 실험 게이트
         // 폐기 — K계열 MMQ(t≥32·CO 로드)가 확정 경로다.

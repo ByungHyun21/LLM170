@@ -147,6 +147,42 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let (wd, f32w) = self.dev_weight(ws)?;
         let per_expert = ws.data.len() / n_expert_stack.max(1);
         let gen_q = self.moe_gen.load(std::sync::atomic::Ordering::Relaxed);
+        // plans/108 P7 (메인 레버): MoE dmmv — f32 활성 직소비 direct-ids GEMM
+        // (vk fn_moe_ids2/fn_moe_ids51 이식, q4_K·q5_1). 활성 quant(quant_cache/
+        // frame_quant)과 K-분할 reduce·카운팅 정렬 기계를 통째로 건너뛰고
+        // 전문가 그룹 GEMM을 런치 1회로 마친다. 킬스위치 LLM170_HIP_DMMV_OFF
+        // (기본 ON=사용 — 끄면 종전 ge_ids/w_ids direct-ids 경로로 복귀).
+        if (self.t_cur() == 1 || rows <= 64)
+            && rows > 0
+            && !f32w
+            && !env_on("LLM170_HIP_DMMV_OFF")
+            && matches!(ws.ty, GgmlType::Q4K | GgmlType::Q5_1)
+        {
+            let idp = self.fptr(ids)?;
+            let kern: &'static str = if ws.ty == GgmlType::Q4K {
+                "q4_gemm_q4k_dmmv_ids"
+            } else {
+                "q5_1_gemm_dmmv_ids"
+            };
+            let mut x_p = xp as *mut std::ffi::c_void;
+            let mut w_p = wd as *mut std::ffi::c_void;
+            let mut o_p = op_ as *mut std::ffi::c_void;
+            let mut ip = idp as *mut std::ffi::c_void;
+            let (mut ni, mut no) = (n_in as i32, n_out as i32);
+            let mut tt = rows as i32;
+            let mut eb = per_expert as i32;
+            let wgs = n_out.div_ceil(2);
+            return self.ctx.launch3(
+                kern,
+                rows as u32,
+                wgs.min(65535) as u32,
+                wgs.div_ceil(65535) as u32,
+                64,
+                &mut cargs!(
+                    &mut x_p, &mut w_p, &mut o_p, &mut ip, &mut ni, &mut no, &mut tt, &mut eb
+                ),
+            );
+        }
         let (xq, xq_w) = if f32w {
             (std::ptr::null_mut(), 0usize)
         } else {
@@ -1328,10 +1364,18 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         let f32_family =
             |ty: GgmlType| matches!(ty, GgmlType::F32 | GgmlType::Bf16 | GgmlType::F16);
         let f32w = f32_family(ws[0].ty);
+        // 108 P7: t=1 q8_0 전용 그룹은 dmmv — 프레임 활성 양자화를 건너뛰고
+        // f32 활성 × 커널 내 디양자화 가중 직접 dot(승인된 산술 클래스
+        // 변경, 원장 118). 킬스위치 LLM170_HIP_DMMV_OFF=1.
+        let dmmv_on = t == 1
+            && !f32w
+            && ws.iter().all(|w| ggml_id(w.ty) == 8)
+            && std::env::var_os("LLM170_HIP_DMMV_OFF").is_none();
         if ws
             .iter()
             .all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w)
             && !f32w
+            && !dmmv_on
         {
             let (xq, xq_w) = self.frame_quant(xp, ws[0].n_in as usize, t)?;
             // plans/83 D2: t=1 디코드에서 그룹 내 q8_0 인접쌍을 듀얼 커널로
@@ -1360,6 +1404,15 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                 let n_out = w.n_out as usize;
                 self.launch_gemm(ty, xq, wd, n_in, n_out, xq_w, t, op)?;
                 idx += 1;
+            }
+            return Ok(());
+        }
+        if dmmv_on {
+            for (w, &o) in ws.iter().zip(outs.iter()) {
+                let (wd, _) = self.dev_weight(w)?;
+                let op = self.fptr(o)?;
+                self.ctx
+                    .gemv_q8_dmmv_out(xp, wd, w.n_in as usize, w.n_out as usize, op)?;
             }
             return Ok(());
         }

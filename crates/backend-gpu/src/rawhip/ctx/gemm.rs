@@ -125,6 +125,40 @@ impl RawCtx {
         Ok(())
     }
 
+    /// plans/108 P7 — t=1 q8_0 dmmv: f32 활성 직소비 GEMV(vk gemv8_q8b 이식).
+    /// 활성 quant를 건너뛰는 경로 — mm_b2 디스패치와 grp_mmq(dmmv_used)
+    /// 게이트가 동일 조건이어야 한다(어긋나면 stale xq를 읽는다).
+    pub fn gemv_q8_dmmv_out(
+        &self,
+        x: *const u8,
+        w: *const u8,
+        n_in: usize,
+        n_out: usize,
+        out: *mut u8,
+    ) -> Result<(), String> {
+        let mut x_p = x as *mut std::ffi::c_void;
+        let mut w_p = w as *mut std::ffi::c_void;
+        let mut o_p = out as *mut std::ffi::c_void;
+        let mut ni = n_in as i32;
+        let mut no = n_out as i32;
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut no) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let wgs = n_out.div_ceil(2);
+        self.launch3(
+            "gemm_q8_0_dmmv",
+            1,
+            wgs.min(65535) as u32,
+            wgs.div_ceil(65535) as u32,
+            64,
+            &mut args,
+        )
+    }
+
     pub fn gemv_q8_out(
         &self,
         xq: *const u8,
