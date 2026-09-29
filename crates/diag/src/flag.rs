@@ -1,28 +1,17 @@
 //! flag — 환경변수 캐시형 판독 (plans/82 §3).
 //!
-//! rawhip::env_on의 진행형: 이 크레이트가 소유하는 변수는 여기 등록·캐시하고,
-//! backend-gpu 변수는 위임으로 자동 등록한다.
-
+//! 프로세스 기동 시 1회 스냅샷(VALUES) 후 불변 — 핫패스 판독의 잠금·조회
+//! 원자화. 등록 레지스트리(env_on)는 프로덕션 호출 0으로 plans/109 P1에서
+//! 삭제했다(rawhip은 자체 캐시 env_on 사용).
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 
-/// 캐시 엔트리 — (값, 설명).
-pub struct FlagInfo {
-    pub value: bool,
-    pub desc: &'static str,
-}
-
-fn registry() -> &'static Mutex<HashMap<String, FlagInfo>> {
-    static R: OnceLock<Mutex<HashMap<String, FlagInfo>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
-}
 /// 값 맵 — 1회 스냅샷(plans/107 W2). 핫패스 판독 잠금·조회 원자화.
 static VALUES: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
     std::env::vars_os()
         .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
         .collect()
 });
+
 
 /// 이름 존재 여부 — `var_os(name).is_some()` 대응(캐시형).
 pub fn on(name: &str) -> bool {
@@ -46,28 +35,9 @@ pub fn val(name: &str) -> Option<&str> {
     VALUES.get(name).map(|v| v.as_str())
 }
 
-/// 환경변수 존재 여부 판독 + 캐시 + 레지스트리 등록.
-/// 캐시 키는 환경변수명 그대로. 첫 호출 시 1회 판독 후 고정.
-pub fn env_on(name: &str) -> bool {
-    // 캐시 조회
-    if let Ok(r) = registry().lock()
-        && let Some(info) = r.get(name)
-    {
-        return info.value;
-    }
-    // 첫 판독
-    let v = on(name);
-    // 등록 (기존 등록이 있으면 덮어쓰지 않음 — 진단용)
-    if let Ok(mut r) = registry().lock() {
-        r.entry(name.to_string())
-            .or_insert(FlagInfo { value: v, desc: "" });
-    }
-    v
-}
-
 /// 스냅샷↔라이브 동치 검사 (plans/108 P1) — 현재 환경의 LLM170_ 키 전수에
-/// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조하고
-/// 레지스트리 캐시값도 재검한다. 불일치 목록(빈 벡터 = 정상).
+/// 대해 4개 의미론(on/eq1/ne0/val)을 라이브 getenv 판정과 독립 대조한다.
+/// 불일치 목록(빈 벡터 = 정상).
 /// 원장 104(ne0 부재키 결함)류 회귀를 게이트 전에 포착한다.
 pub fn env_check() -> Vec<String> {
     let mut bad = Vec::new();
@@ -94,27 +64,12 @@ pub fn env_check() -> Vec<String> {
             bad.push(format!("{k}: val()={:?} live={v:?}", val(k)));
         }
     }
-    if let Ok(r) = registry().lock() {
-        for (k, info) in r.iter() {
-            if info.value != on(k) {
-                bad.push(format!("{k}: registry={} snapshot={}", info.value, on(k)));
-            }
-        }
-    }
     bad
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn env_on_caches() {
-        // 실제 환경변수가 없는 이름으로 테스트
-        let name = "_DIAG_TEST_NONEXISTENT_";
-        assert!(!env_on(name));
-        assert!(!env_on(name)); // 캐시에서 반환
-    }
 
     #[test]
     fn absent_key_contracts() {
