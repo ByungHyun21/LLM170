@@ -312,6 +312,12 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
         }
         "gdn-check" => llm170_backend_gpu::rawvk::gdn_check(),
         "vk-check" => llm170_backend_gpu::rawvk::smoke_test(),
+        // 109 P15-1a(7e06e90)에서 우발 삭제된 진입점 복원(110 P12c 검증용).
+        "vk-frame-check" => {
+            let path = arg_str(args, 0, d_fn);
+            let tn = arg_str(args, 1, "blk.0.ffn_down_shexp.weight");
+            llm170_backend_gpu::rawvk::checks::frame_check(&path, &tn)
+        }
         "gqa-bench" => llm170_backend_gpu::rawhip::gqa_bench(),
         "mm-tile" => llm170_backend_gpu::rawhip::mm_tile_bench(),
         "mm-bench" => llm170_backend_gpu::rawhip::mm_batch_bench(),
