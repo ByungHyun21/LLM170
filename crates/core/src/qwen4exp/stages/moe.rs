@@ -4,6 +4,15 @@
 use super::super::Q4Error;
 use super::Ctx;
 use crate::ops::{sigmoid, silu};
+
+/// gate 행 전체에 silu — 5중 인라인 통합(plans/109 P7).
+fn silu_rows(rows: &mut [Vec<f32>], n_ff: usize) {
+    for r in rows.iter_mut() {
+        for i in 0..n_ff {
+            r[i] = silu(r[i]);
+        }
+    }
+}
 use llm170_diag::profile_span;
 
 /// MoE FFN — top-10 라우팅(softmax→정규화) + shared(sigmoid 게이트).
@@ -102,11 +111,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
                 up_y[i] = gu[2 * i + 1][0].clone();
             }
         }
-        for r in gate_y.iter_mut() {
-            for i in 0..n_ff {
-                r[i] = silu(r[i]);
-            }
-        }
+        silu_rows(gate_y.as_mut_slice(), n_ff);
         for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
             for i in 0..n_ff {
                 r[i] *= u[i];
@@ -162,11 +167,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
             sh_gate_y = std::mem::take(&mut gi[0]);
             sh_up_y = std::mem::take(&mut gi[1]);
         }
-        for r in sh_gate_y.iter_mut() {
-            for i in 0..n_ff {
-                r[i] = silu(r[i]);
-            }
-        }
+        silu_rows(sh_gate_y.as_mut_slice(), n_ff);
         for (r, u) in sh_gate_y.iter_mut().zip(sh_up_y.iter()) {
             for i in 0..n_ff {
                 r[i] *= u[i];
@@ -208,11 +209,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
             .is_ok()
             && acc.moe_down(&xp, &wu_stack, &ids, n_exp, &mut up_y).is_ok()
         {
-            for r in gate_y.iter_mut() {
-                for i in 0..n_ff {
-                    r[i] = silu(r[i]);
-                }
-            }
+            silu_rows(gate_y.as_mut_slice(), n_ff);
             for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
                 for i in 0..n_ff {
                     r[i] *= u[i];
@@ -253,11 +250,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
                 .expert_w(&format!("blk.{il}.ffn_down_exps.weight"), e)?;
             ctx.mm_batch(&sub, &wg, &mut gate_y)?;
             ctx.mm_batch(&sub, &wu, &mut up_y)?;
-            for r in gate_y.iter_mut() {
-                for i in 0..n_ff {
-                    r[i] = silu(r[i]);
-                }
-            }
+            silu_rows(gate_y.as_mut_slice(), n_ff);
             for (r, u) in gate_y.iter_mut().zip(up_y.iter()) {
                 for i in 0..n_ff {
                     r[i] *= u[i];
@@ -291,11 +284,7 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
         sh_gate_y = std::mem::take(&mut gi[0]);
         sh_up_y = std::mem::take(&mut gi[1]);
     }
-    for r in sh_gate_y.iter_mut() {
-        for i in 0..n_ff {
-            r[i] = silu(r[i]);
-        }
-    }
+    silu_rows(sh_gate_y.as_mut_slice(), n_ff);
     for (r, u) in sh_gate_y.iter_mut().zip(sh_up_y.iter()) {
         for i in 0..n_ff {
             r[i] *= u[i];
