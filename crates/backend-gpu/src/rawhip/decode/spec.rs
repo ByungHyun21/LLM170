@@ -32,7 +32,6 @@ impl DecodeState {
         // head: 전 행 rms → quant → output 타일 → 행별 argmax
         let wn = *self.consts.get("output_norm").ok_or("output_norm")?;
         self.rms_rows(self.xs_t, wn, self.xn_t, n, t)?;
-        self.ctx.mmq_y_bump(); // 부록81: xn_t 재기 → quant_y 캐시 무효화
         let xq_sn = crate::rawhip::q4acc::xq_words(n);
         self.ctx.quant_q8_b(self.xn_t, self.xq_n_t, n, xq_sn, t)?;
         let (wh, th, nih, noh) = self.w("output.weight")?;
