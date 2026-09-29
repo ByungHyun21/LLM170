@@ -704,21 +704,10 @@ impl llm170_core::matmul::MatmulHost for Q4Acc {
         // 결과 행 순서는 d2h 후 호스트 산란으로 복원한다(가중합이 원래 행
         // 순서를 요구 — 호스트 비용은 perm 인덱싱뿐).
         let ne = n_expert_stack.max(1);
-        let mut off = vec![0usize; ne + 1];
-        for &e in expert_ids {
-            off[(e as usize).min(ne - 1) + 1] += 1;
-        }
-        for e in 0..ne {
-            off[e + 1] += off[e];
-        }
-        let mut cur = off[..ne].to_vec();
-        let mut perm = vec![0u32; t];
-        for (i, &e) in expert_ids.iter().enumerate() {
-            let e = (e as usize).min(ne - 1);
-            let p = cur[e];
-            perm[p] = i as u32;
-            cur[e] += 1;
-        }
+        // 카운팅 정렬 테이블 — common 공용판(프레임 호스트 빌드·vk 폴백과
+        // 동일 코드, P13).
+        let off = crate::common::moe::grp_offsets(expert_ids, ne);
+        let perm = crate::common::moe::grp_perm(expert_ids, ne, &off);
         let row_u32 = if w_f32 { n_in } else { xq_w };
         let xbase = if w_f32 { xdev_f32 } else { xq_buf };
         let xg = {
