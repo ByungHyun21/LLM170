@@ -46,9 +46,6 @@ impl llm170_core::matmul::EwOps for VkAcc {
         _n_in: usize,
         n_hidden: usize,
     ) -> Result<(), String> {
-        if std::env::var_os("LLM170_VK_SHEXP").is_some_and(|v| v == "0") {
-            return Err("shexp_gu: 진단 킬스위치".into());
-        }
         let gh = self.frame_alloc(n_hidden)?;
         let uh = self.frame_alloc(n_hidden)?;
         let r = self

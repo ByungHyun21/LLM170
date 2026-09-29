@@ -227,7 +227,6 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
             let path = arg_str(args, 0, d_fn);
             llm170_backend_gpu::rawvk::checks::ft32_check(&path)
         }
-        "vk-gdn-chunk-check" => llm170_backend_gpu::rawvk::checks::gdn_chunk_check(),
         "vk-ple-mt-check" => {
             let reps = arg_num(args, 0, 64usize);
             llm170_backend_gpu::rawvk::checks::ple_mt_check(reps)
@@ -826,7 +825,7 @@ pub fn run_check(args: &[String]) -> ExitCode {
     // ② GPU↔CPU GEMM 상호검증 (gpu 경로만) — 대표 텐서 t∈{1,64,1024}
     // (② GPU↔CPU GEMM 검증 — cubecl 제거로 rawhip-check가 대체)
 
-    // ③ 장문 청크 스모크 — 1,024토큰 무작위 prefill (NaN 가드는 LLM170_Q4_TRACE)
+    // ③ 장문 청크 스모크 — 1,024토큰 무작위 prefill (NaN 가드는 dump 키 q4_trace)
     let arch = llm170_gguf::GgufFile::open(&model_path)
         .ok()
         .and_then(|g| g.arch().map(str::to_string));
@@ -848,7 +847,7 @@ pub fn run_check(args: &[String]) -> ExitCode {
             "--backend",
             &backend,
         ])
-        .env("LLM170_Q4_TRACE", "1")
+        .env("LLM170_DUMP", "q4_trace")
         .stdout(std::process::Stdio::null());
         let st = cmd.status();
         match st {

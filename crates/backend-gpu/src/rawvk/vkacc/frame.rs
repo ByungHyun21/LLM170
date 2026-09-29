@@ -59,208 +59,6 @@ impl llm170_core::matmul::FrameState for VkAcc {
             self.fbuf(beta_ge)?,
             self.fbuf(out)?,
         );
-        // plans/84 B: FN 상태는 전치 레이아웃(hip gdn_ar_w_swap과 동일 규약) —
-        // grid (d, h_v), 상태 s[pair·d·d + u·d + …].
-        // plans/100 v3: 3-커널(닷 셀-병렬화) — 옵트인 GDNCH=3.
-        if std::env::var("LLM170_VK_GDNCH")
-            .map(|v| v == "3")
-            .unwrap_or(false)
-        {
-            let csize = 32usize;
-            let nchunks = t.div_ceil(csize);
-            let nsc = nchunks * h_v;
-            let (lb, wb, gb, cb, qb0) = {
-                let mut g = self.gdn_ch_scratch.lock();
-                let need = nsc * 32 * 32;
-                let cells = nsc * 32 * 64;
-                if g.0.as_ref().map(|b| b.bytes >= need * 4).unwrap_or(false) {
-                    (
-                        g.0.as_ref().unwrap().buf,
-                        g.1.as_ref().unwrap().buf,
-                        g.2.as_ref().unwrap().buf,
-                        g.3.as_ref().unwrap().buf,
-                        g.4.as_ref().unwrap().buf,
-                    )
-                } else {
-                    let a = ctx.alloc(need * 4)?;
-                    let b = ctx.alloc(need * 4)?;
-                    let c = ctx.alloc(nsc * 2 * 32 * 4)?;
-                    let d4 = ctx.alloc(cells * 4)?;
-                    let e = ctx.alloc(cells * 4)?;
-                    *g = (Some(a), Some(b), Some(c), Some(d4), Some(e));
-                    (
-                        g.0.as_ref().unwrap().buf,
-                        g.1.as_ref().unwrap().buf,
-                        g.2.as_ref().unwrap().buf,
-                        g.3.as_ref().unwrap().buf,
-                        g.4.as_ref().unwrap().buf,
-                    )
-                }
-            };
-            // (A) L/W — grid(청크, pair).
-            {
-                let p = self.pipeline(&mut ctx, Slot::GdnLw)?;
-                let ds2 = ctx.bind_ds(&p, &[qb, kb, bb, lb, wb, gb])?;
-                let push = push_u32s(&[
-                    (h_k * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                    t as u32,
-                    0u32,
-                    csize as u32,
-                ]);
-                ctx.run(p.pl, ds2, p.pipe, &push, nchunks as u32, h_v as u32, 1)?;
-            }
-            // (A2) 닷 셀-병렬 — grid(청크, pair, C*BV/64).
-            {
-                let p = self.pipeline(&mut ctx, Slot::GdnExecA)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, gb, cb, qb0])?;
-                let push = push_u32s(&[
-                    (h_k * d) as u32,
-                    (h_v * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                    t as u32,
-                    0u32,
-                    csize as u32,
-                ]);
-                ctx.run(
-                    p.pl,
-                    ds2,
-                    p.pipe,
-                    &push,
-                    nchunks as u32,
-                    h_v as u32,
-                    (32 * 64 / 64) as u32,
-                )?;
-            }
-            // (B) 대입+출력+상태 — grid(청크, pair, d/64).
-            {
-                let p = self.pipeline(&mut ctx, Slot::GdnExecB)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, kb, lb, wb, gb, cb, qb0, ob])?;
-                let mut push = push_u32s(&[
-                    (h_k * d) as u32,
-                    (h_v * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                    t as u32,
-                    0u32,
-                    csize as u32,
-                ]);
-                push.extend_from_slice(&1.0f32.to_le_bytes());
-                ctx.run(
-                    p.pl,
-                    ds2,
-                    p.pipe,
-                    &push,
-                    nchunks as u32,
-                    h_v as u32,
-                    (d.div_ceil(64)) as u32,
-                )?;
-            }
-            return Ok(());
-        }
-        // plans/100 v2: 2-커널(L/W 사전계산 + 실행) — 옵트인 GDNCH=2.
-        if std::env::var("LLM170_VK_GDNCH")
-            .map(|v| v == "2")
-            .unwrap_or(false)
-        {
-            let csize = 32usize;
-            let nchunks = t.div_ceil(csize);
-            // 스크래치: L[W][C*C] + W[W][C*C] + G[W][2C] — 성장형.
-            let nsc = nchunks * h_v;
-            let (lb, wb, gb) = {
-                let mut g = self.gdn_ch_scratch.lock();
-                let need = nsc * 32 * 32;
-                if g.0.as_ref().map(|b| b.bytes >= need * 4).unwrap_or(false) {
-                    (
-                        g.0.as_ref().unwrap().buf,
-                        g.1.as_ref().unwrap().buf,
-                        g.2.as_ref().unwrap().buf,
-                    )
-                } else {
-                    let a = ctx.alloc(need * 4)?;
-                    let b = ctx.alloc(need * 4)?;
-                    let c = ctx.alloc(nsc * 2 * 32 * 4)?;
-                    *g = (Some(a), Some(b), Some(c), None, None);
-                    (
-                        g.0.as_ref().unwrap().buf,
-                        g.1.as_ref().unwrap().buf,
-                        g.2.as_ref().unwrap().buf,
-                    )
-                }
-            };
-            // (A) L/W — grid(청크, pair).
-            {
-                let p = self.pipeline(&mut ctx, Slot::GdnLw)?;
-                let ds2 = ctx.bind_ds(&p, &[qb, kb, bb, lb, wb, gb])?;
-                let push = push_u32s(&[
-                    (h_k * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                    t as u32,
-                    0u32,
-                    csize as u32,
-                ]);
-                ctx.run(p.pl, ds2, p.pipe, &push, nchunks as u32, h_v as u32, 1)?;
-            }
-            // (B) 실행 — grid(청크, pair, d/64).
-            {
-                let p = self.pipeline(&mut ctx, Slot::GdnExec)?;
-                let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, lb, wb, gb, ob])?;
-                let mut push = push_u32s(&[
-                    (h_k * d) as u32,
-                    (h_v * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                    t as u32,
-                    0u32,
-                    csize as u32,
-                ]);
-                push.extend_from_slice(&1.0f32.to_le_bytes());
-                ctx.run(
-                    p.pl,
-                    ds2,
-                    p.pipe,
-                    &push,
-                    nchunks as u32,
-                    h_v as u32,
-                    (d.div_ceil(64)) as u32,
-                )?;
-            }
-            return Ok(());
-        }
-        // plans/100: 청크 병렬(WY) — 옵트인 LLM170_VK_GDNCH=1(클래스 변경).
-        if llm170_diag::flag::eq1("LLM170_VK_GDNCH") {
-            let p = self.pipeline(&mut ctx, Slot::FnGdnChunk)?;
-            let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
-            let csize = 64usize;
-            let nchunks = t.div_ceil(csize);
-            for c in 0..nchunks {
-                let cs = csize.min(t - c * csize);
-                let mut push = push_u32s(&[
-                    d as u32,
-                    (h_k * d) as u32,
-                    (h_v * d) as u32,
-                    h_v as u32,
-                    h_k as u32,
-                ]);
-                push.extend_from_slice(&1.0f32.to_le_bytes());
-                push.extend_from_slice(&(t as u32).to_le_bytes());
-                push.extend_from_slice(&((c * csize) as u32).to_le_bytes());
-                push.extend_from_slice(&(cs as u32).to_le_bytes());
-                ctx.run(
-                    p.pl,
-                    ds2,
-                    p.pipe,
-                    &push,
-                    1,
-                    h_v as u32,
-                    (d.div_ceil(64)) as u32,
-                )?;
-            }
-            return Ok(());
-        }
         let p = self.pipeline(&mut ctx, Slot::FnGdnArSwap)?;
         let ds2 = ctx.bind_ds(&p, &[sb, qb, kb, vb, bb, ob])?;
         let mut push = push_u32s(&[
@@ -426,22 +224,15 @@ impl VkAcc {
         let pack_skip_quant = w.ty == GgmlType::Q4K && self.packbufs.lock().0.contains_key(&x);
         let xq = if ids2_takes || pack_skip_quant {
             vk::Buffer::null()
-        } else if llm170_diag::flag::eq1("LLM170_VK_Q4KSG1F") {
-            // plans/93: sg1f은 f32 직결 — quant 스킵, f32 버퍼를 그대로 패스.
-            xb
         } else {
             // plans/96 G3 — gate+up 연속 쌍: 같은 (x,n_in,rows)의 재양자화를
             // 전용 버퍼 슬롯으로 회수. 두 엔진 호출 사이 어떤 op/quant도
             // 없고 전용 버퍼는 타 quant가 덮어쓰지 못함 — 히트는 안전.
-            // 킬스위치 LLM170_VK_MOEXQ=0.
-            let pair_env = std::env::var("LLM170_VK_MOEXQ").unwrap_or_else(|_| "1".into());
-            // plans/96: 프리필(t≥2) 전용 — 전층 체크섬으로 프리필 정합 실측
-            // 확정. 디코드 q8스택 경로(t=1)에서의 미세 발산(원장 종결 기록)
-            // 을 원천 차단.
-            let pair_on = pair_env != "0" && t >= 2;
-            let hit_on = pair_env == "1"; // =2: fill만(이분법 진단)
+            // plans/96: 프리필(t≥2) 전용 — 전층 체크섬으로 프리필 정합 실측 확정.
+            // 디코드 q8스택 경로(t=1)에서의 미세 발산(원장 종결 기록)을 원천 차단.
+            let pair_on = t >= 2;
             let mut hit: Option<vk::Buffer> = None;
-            if pair_on && hit_on {
+            if pair_on {
                 let sl = self.moe_xq_pair.lock();
                 if let Some((hx, hn, hr, b)) = sl.as_ref()
                     && *hx == x
@@ -688,11 +479,7 @@ impl VkAcc {
                 };
                 let dsg = ctx.bind_ds(&pg, &[idb, ob_, rpb, txb, pmb, ivb, ivpb, rxb, ppb])?;
                 // plans/93 sg2: 32행/WG 판은 전문가 패딩도 32배수여야 경계 정렬.
-                let padmul: u32 = if llm170_diag::flag::eq1("LLM170_VK_PAD32") {
-                    32
-                } else {
-                    16
-                };
+                let padmul: u32 = 16; // plans/93 sg2 32배수 실험(PAD32)은 plans/109 P6 삭제
                 let push = push_u32s(&[ne as u32, rows as u32, bound as u32, padmul]);
                 ctx.run_rw(
                     pg.pl,
@@ -742,11 +529,7 @@ impl VkAcc {
                     let mut hpoff = vec![0usize; ne + 1];
                     // plans/93 sg2: 32행/WG 판은 전문가 경계가 32 배수여야 —
                     // WG가 두 전문가를 가로지르면 rowexp[0]의 가중치로 오계산.
-                    let padmul = if llm170_diag::flag::eq1("LLM170_VK_PAD32") {
-                        32
-                    } else {
-                        16
-                    };
+                    let padmul = 16;
                     for e in 0..ne {
                         hpoff[e + 1] = hpoff[e] + (hoff[e + 1] - hoff[e]).div_ceil(padmul) * padmul;
                     }

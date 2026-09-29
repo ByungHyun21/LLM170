@@ -251,7 +251,6 @@ impl Engine {
             && std::env::var("LLM170_RAWHIP")
                 .map(|v| v != "0")
                 .unwrap_or(true)
-            && std::env::var_os("LLM170_NO_SPEC_GPU").is_none()
         {
             return self.spec_step_gpu(seq, last_token, k);
         }

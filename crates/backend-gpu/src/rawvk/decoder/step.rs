@@ -614,11 +614,6 @@ impl DecoderState {
                 self.rms(xs.buf, "blk.0.attn_norm", xn.buf, n, t)?;
             }
             if self.is_recr[il] {
-                // plans/30: gemm_i8/quant_b8 경로는 배치 상태를 오염(실측 —
-                // VK_NOI8=1로 재현 해소). LLM170_VK_I8ON=1 옵트인만 사용.
-                if t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON") {
-                    self.quant_b8(self.b_xn.buf, n, t)?;
-                }
                 self.gemv_stage(
                     n,
                     t,
@@ -866,14 +861,6 @@ impl DecoderState {
                 )?;
                 recr_idx += 1;
             } else {
-                // i8 활성(소비 조건과 동일)일 때만 b8 양자화 — 기본 경로의 dead dispatch 제거
-                if t >= 2
-                    && llm170_diag::flag::on("LLM170_VK_I8ON")
-                    && std::env::var_os("LLM170_VK_NOI8").is_none()
-                    && self.i8w.contains_key(&format!("blk.{il}.attn_q.weight"))
-                {
-                    self.quant_b8(self.b_xn.buf, n, t)?;
-                }
                 self.gemv_stage(
                     n,
                     t,
@@ -1059,9 +1046,6 @@ impl DecoderState {
                 t,
             )?;
             // FFN — xq는 gemv_stage 지연 양자화
-            if t >= 2 && llm170_diag::flag::on("LLM170_VK_I8ON") {
-                self.quant_b8(self.b_xn.buf, n, t)?;
-            }
             self.gemv_stage(
                 n,
                 t,

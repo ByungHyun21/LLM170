@@ -1,7 +1,7 @@
 #!/bin/bash
 # 부팅 직후 원샷 측정 — 첫 스트레스 사이클이 FS 손상시키기 전에 핵심 데이터 확보
 cd /home/yoon/LLM170
-M="/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD_Q4_K_XL-00001-of-00004.gguf"
+M="/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 L=/home/yoon/LLM170/oneshot.log
 echo "=== 원샷 측정 $(date) ===" > $L
 

@@ -41,17 +41,6 @@ pub(crate) fn env_on(name: &'static str) -> bool {
         .or_insert_with(|| std::env::var_os(name).is_some())
 }
 
-/// env_on의 값 비교판 — `LLM170_X=v` 형태의 옵트인 게이트.
-pub(crate) fn env_eq(name: &'static str, val: &str) -> bool {
-    static C: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(&'static str, String), bool>>,
-    > = std::sync::OnceLock::new();
-    *C.get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .entry((name, val.to_string()))
-        .or_insert_with(|| std::env::var(name).as_deref() == Ok(val))
-}
 
 pub(crate) fn ck(status: hip::hipError_t, what: &str) -> Result<(), String> {
     if status == hip::hipError_t_hipSuccess {

@@ -690,7 +690,6 @@ impl llm170_core::matmul::QsaOps for VkAcc {
 impl VkAcc {
     /// plans/89 P0.4 — 선택 어텐션 발사: (n_head/n_kv)%4==0 이면 멀티헤드 판
     /// (grid (t, n_kv), 256스레드=4sg×헤드 — K/V 판독 12× 절감, 헤드별 산술
-    /// 판과 동일). 킬스위치 LLM170_VK_QSAMH=0.
     fn qsa_attn_sel_run(
         &self,
         ctx: &mut VkCtx,
@@ -709,10 +708,7 @@ impl VkAcc {
         let mh = n_kv >= 1
             && n_head.is_multiple_of(n_kv)
             && (n_head / n_kv).is_multiple_of(4)
-            && hd == 256
-            && std::env::var("LLM170_VK_QSAMH")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && hd == 256;
         let slot = if mh {
             Slot::FnQsaAttnSelMh
         } else {
