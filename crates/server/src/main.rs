@@ -35,7 +35,7 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
               [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
       --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
@@ -76,6 +76,10 @@ pub(crate) struct ModelArgs {
     pub gpu_runtime: Option<String>,
     /// 외장 MTP(nextn) 모듈 경로 (plans/109 P15⑤) — "--mtp <path>".
     pub mtp: Option<String>,
+    /// PLE 테이블 오프로드 모드(plans/111 W4c) — "--ple-table auto|ram|ssd".
+    pub ple_table: Option<String>,
+    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — "--ple-cache <MiB>".
+    pub ple_cache_mib: Option<usize>,
     pub rest: Vec<String>,
 }
 
@@ -95,6 +99,8 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
         backend: None,
         gpu_runtime: None,
         mtp: None,
+        ple_table: None,
+        ple_cache_mib: None,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -121,6 +127,20 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                 ma.gpu_runtime = Some(v);
             }
             "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
+            "--ple-table" => {
+                let v = common_value(args, &mut i, &inline);
+                if v != "auto" && v != "ram" && v != "ssd" {
+                    return Err(format!("--ple-table: auto|ram|ssd (got {v})"));
+                }
+                ma.ple_table = Some(v);
+            }
+            "--ple-cache" => {
+                let v = common_value(args, &mut i, &inline);
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 16 => ma.ple_cache_mib = Some(n),
+                    _ => return Err(format!("--ple-cache: MiB ≥ 16 (got {v})")),
+                }
+            }
             _ => ma.rest.push(a.to_string()),
         }
         i += 1;
@@ -303,6 +323,8 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
         model: model_path.clone(),
         ctx,
         mtp: ma.mtp.clone().map(PathBuf::from),
+        ple_table: ma.ple_table.clone(),
+        ple_cache_mib: ma.ple_cache_mib,
     };
     let sel = if backend == "gpu" {
         if gpu_runtime.is_empty() {
