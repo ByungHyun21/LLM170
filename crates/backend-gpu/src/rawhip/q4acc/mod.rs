@@ -193,6 +193,11 @@ unsafe impl Sync for Q4Acc {}
 /// 테이블(FN 28.8GB)은 RAM에 못 올리므로 접근된 블록만 상주(Engram급 공통).
 struct PleSsd {
     file: std::fs::File,
+    /// plans/111 4차 W-O: O_DIRECT 재오픈 fd — 페이지캐시 이중 캐시 제거.
+    /// None이면 버퍼드 폴백(미지원 FS·읽기 실패).
+    direct: Option<std::fs::File>,
+    /// O_DIRECT pread용 4096 정렬 스크래치(커널 요구사항).
+    scratch: Box<AlignedBlock>,
     /// 파일 길이 — QA-7: 끝 미만 블록 판독 계산용(초기화 시 1회).
     file_len: u64,
     /// 텐서 시작의 파일 오프셋(파트 내).
@@ -226,6 +231,16 @@ pub fn set_ple_ssd_cache_bytes(bytes: usize) {
     PLE_SSD_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 const PLE_SSD_BLOCK: usize = 4096;
+
+/// O_DIRECT pread용 정렬 버퍼 — 커널은 논리블록(4KB) 정렬을 요구한다.
+#[repr(align(4096))]
+pub(crate) struct AlignedBlock(pub [u8; PLE_SSD_BLOCK]);
+
+impl Default for AlignedBlock {
+    fn default() -> Self {
+        AlignedBlock([0u8; PLE_SSD_BLOCK])
+    }
+}
 
 /// ple-table 서빙 옵션(서버 `--ple-table ram|ssd|auto` → 엔진이 주입, 기본 auto).
 /// 프로세스 전역 — Q4Acc 생성 전 set_ple_table_mode 로 지정(set_backend_res_f16
@@ -309,7 +324,12 @@ impl Q4Acc {
         let mut sources = Vec::with_capacity(parts.len());
         for (base, len, path) in parts {
             match std::fs::File::open(&path) {
-                Ok(file) => sources.push(crate::common::parts::PartSource { base, len, file }),
+                Ok(file) => sources.push(crate::common::parts::PartSource {
+                    base,
+                    len,
+                    file,
+                    path,
+                }),
                 Err(e) => eprintln!(
                     "# q4acc: 파트 열기 실패 {} — mmap 폴백 ({e})",
                     path.display()

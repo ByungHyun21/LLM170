@@ -3488,3 +3488,29 @@ plans/112 QA 캠페인(plans/112)이 문서화한 결함군의 수리. 산술 �
   (배터리 결과 별도 기록)·serve 라이브 스모크(413·절단 0.84s·health).
 - **기각/인계**: QA-14(CLI 수치 파싱 전면 스윕)·QA-27(MTP 체인 오프바이어
   — plans/111 4차 W7과 결부) 인계. split no/count 절단 등 P3 미세항 기각.
+
+### (135) PLE ssd O_DIRECT pread + 블록 예열 프리페치 — plans/111 4차 W-O/W-P (plans/111, 2026-09-30)
+
+인계 후속과제(plans/111 4차) 중 실행 가능 2건 + 기각 1건.
+
+- **W-O O_DIRECT**: PleSsd 미스 pread를 O_DIRECT(0o40000 재오픈 fd + 4096
+  정렬 scratch)로 전환 — 블록 캐시가 자체 LRU인데 커널 페이지캐시와 이중으로
+  쌓여 핫 페이지(가중 mmap)를 밀어내던 것을 차단(ninfer read_direct 교훈).
+  끝 미만 블록(QA-7 경로)과 읽기 실패(미지원 FS)는 버퍼드 폴백 + direct 영구
+  해제. PartSource에 path 필드(양 백엔드 생성부 갱신).
+- **W-P 예열 프리페치**: Accelerator 기본 메서드 ple_ssd_warm/ple_table_ssd_
+  active 추가(vk·CPU·ram은 no-op). ensure_block 클로저를 자유함수로 분리해
+  gather·예열이 공유. spawn_ple_prefetch 워커는 ssd 활성 시 mmap gather
+  (페이지캐시 오염원) 대신 다음 스텝 PLE 행의 4KB 블록 전수 예열 — 본경로
+  디바이스 gather가 예열 캐시에서 즉시 적중(NVMe 읽기를 스텝 간 겹침).
+  LLM170_PLE_PREFETCH=1 옵트인 유지.
+- **콜드 예열 기각**: W4c에서 프리필 PLE 전체 디바이스화로 디코드 중 majflt
+  성장은 이미 소멸(원장 133 실측). 시작 시점 합성 예열은 대상 프롬프트를
+  알 수 없어 근거 없는 I/O — W-P 예열이 잔여 콜드 비용을 흡수.
+- **검증/실측**: charhash 15,674 전수 일치(읽기 경로만 변경 — 블록 내용
+  비트동일)·FN/27B 토큰 게이트 PASS·pp4096 중앙 296.60(README 294.5 대비
+  무회귀)·PLE_PREFETCH=1 tg64 18.12 t/s 동작.
+- **잔여 인계(4차)**: W5 런치 갭 16.5ms(hipGraph — GraphCapture 트레이트가
+  stub, MoE 가변 토폴로지 난점)·W6 dense GEMV 23ms·MoE ids 12ms 커널(산술
+  재설계 = 규칙 10 승인 과제)·W7 MTP 검증 무게(원장 128·QA-27과 결부)·np
+  다중 슬롯 발산(129)·serve 비엔진 오버헤드 ~50s(133).

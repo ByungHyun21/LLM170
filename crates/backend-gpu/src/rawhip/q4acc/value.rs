@@ -572,6 +572,82 @@ impl Q4Acc {
     }
 }
 
+/// PleSsd 블록 확보 — LRU(접근 tick 갱신, 지연 힙 증발: 자주 쓰면 RAM 유지,
+/// 오래 안 쓰면 증발 → SSD 재판독). gather 본체와 예열(ple_ssd_warm)이 공유.
+fn ple_ensure_block(st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64) -> Result<u32, String> {
+    use std::os::unix::fs::FileExt as _;
+    st.tick += 1;
+    // QA-4(plans/114): 힙 상한 — 접근(힛 포함)마다 push되는 항은
+    // free 소진 없이 팝되지 않아, 워킹셋이 캐시에 드는 부하(디코드
+    // t=1)에서 접근 수에 비례해 영구 증가했다. 상한 초과 시 현재
+    // 점유 슬롯 기준 유효 항만으로 재구축(O(n_slots), amortized).
+    if st.evict.len() > st.blocks.len() * 2 + 1024 {
+        st.evict = st
+            .blocks
+            .values()
+            .map(|&sl| std::cmp::Reverse((st.slot_tick[sl as usize], sl)))
+            .collect();
+    }
+    if let Some(&s) = st.blocks.get(&bidx) {
+        st.slot_tick[s as usize] = st.tick;
+        st.evict.push(std::cmp::Reverse((st.tick, s)));
+        return Ok(s);
+    }
+    let s = match st.free.pop() {
+        Some(s) => s,
+        None => {
+            // stale 항목(재삽입 이전 tick)은 버리고 최저 접근 슬롯 증발.
+            loop {
+                let std::cmp::Reverse((tick, s)) =
+                    st.evict.pop().ok_or("ple_gather: 캐시 증발 큐 비정상")?;
+                if st.slot_tick[s as usize] == tick {
+                    st.blocks.remove(&st.slot_block[s as usize]);
+                    break s;
+                }
+            }
+        }
+    };
+    let base = s as usize * crate::rawhip::q4acc::PLE_SSD_BLOCK;
+    // QA-7(plans/114): 파일 끝의 미만 블록 — read_exact(4KB) 고정은
+    // UnexpectedEof로 실패했다. 잔여 바이트만 pread, 나머지는 0
+    // (테이블 범위 밖 미판독 영역).
+    let boff = bidx * crate::rawhip::q4acc::PLE_SSD_BLOCK as u64;
+    let want = crate::rawhip::q4acc::PLE_SSD_BLOCK.min(st.file_len.saturating_sub(boff) as usize);
+    if want == 0 {
+        return Err(format!("ple_gather: 블록 {bidx}가 파일 범위 밖"));
+    }
+    // 4차 W-O: 전체 블록은 O_DIRECT(정렬 scratch) — 실패 시 버퍼드
+    // 폴백 + direct 영구 해제(파일시스템 미지원 등).
+    let mut read_err = None;
+    if want == crate::rawhip::q4acc::PLE_SSD_BLOCK {
+        let df = st.direct.take();
+        if let Some(f) = &df
+            && let Err(e) = f.read_exact_at(&mut st.scratch.0[..], boff)
+        {
+            read_err = Some(e);
+        }
+        if read_err.is_none() {
+            st.direct = df;
+            st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK]
+                .copy_from_slice(&st.scratch.0);
+        } else {
+            eprintln!("# ple-ssd: O_DIRECT 실패({:?}) — 버퍼드 폴백", read_err);
+        }
+    }
+    if read_err.is_some() || want < crate::rawhip::q4acc::PLE_SSD_BLOCK {
+        let mut buf = vec![0u8; crate::rawhip::q4acc::PLE_SSD_BLOCK];
+        st.file
+            .read_exact_at(&mut buf[..want], boff)
+            .map_err(|e| format!("ple_gather: pread {bidx}: {e}"))?;
+        st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK].copy_from_slice(&buf);
+    }
+    st.blocks.insert(bidx, s);
+    st.slot_block[s as usize] = bidx;
+    st.slot_tick[s as usize] = st.tick;
+    st.evict.push(std::cmp::Reverse((st.tick, s)));
+    Ok(s)
+}
+
 impl llm170_core::matmul::MatmulHost for Q4Acc {
     fn barrier(&self) {
         unsafe {
@@ -1083,6 +1159,35 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         Ok(())
     }
 
+    /// plans/111 4차 W-P — ssd 블록 캐시 선예열: 행이 닿는 4KB 블록 전수를
+    /// 적재(이미 상주한 블록 스킵). 프리페치 워커가 호출 — 본경로 gather는
+    /// 예열된 캐시에서 즉시 적중. 잠금은 gather와 공유(예열 중 gather 대기
+    /// 가능하나 그 블록을 어차피 읽어야 했으므로 순손해 없음).
+    fn ple_ssd_warm(&self, rows: &[u32]) {
+        let Ok(mut guard) = self.ple_ssd.lock() else {
+            return;
+        };
+        let Some(st) = guard.as_mut() else { return };
+        const B: u64 = crate::rawhip::q4acc::PLE_SSD_BLOCK as u64;
+        for &r in rows {
+            let goff = st.base_off + r as u64 * st.row_bytes as u64;
+            let end = goff + st.row_bytes as u64;
+            let mut bidx = goff / B;
+            let last = end.div_ceil(B);
+            while bidx < last {
+                if !st.blocks.contains_key(&bidx) {
+                    let _ = ple_ensure_block(st, bidx);
+                }
+                bidx += 1;
+            }
+        }
+    }
+
+    /// ssd 오프로드 활성 판정(ram 모드·미초기화 = false).
+    fn ple_table_ssd_active(&self) -> bool {
+        self.ple_ssd.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     /// plans/111 W4c — PLE 임베딩 테이블(IQ4_NL) gather(vk plans/93 의 hip 이식).
     /// 서빙 옵션 `--ple-table ram|ssd|auto`(기본 auto — 엔진 set_ple_table_mode):
     /// - ram: 전체 테이블 host-pinned 상주. 소형 테이블 전용 — FN 테이블은
@@ -1103,7 +1208,6 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         hd: usize,
     ) -> Result<(), String> {
         use std::collections::HashMap;
-        use std::os::unix::fs::FileExt;
 
         let nrows = rows.len();
         if nrows == 0 {
@@ -1188,8 +1292,30 @@ impl llm170_core::matmul::EwOps for Q4Acc {
                 .metadata()
                 .map_err(|e| format!("ple_gather: 파일 메타: {e}"))?
                 .len();
+            // 4차 W-O: O_DIRECT 재오픈 — 블록 캐시가 자체 LRU라 커널 페이지캐시와
+            // 이중으로 쌓여 핫 페이지(가중 mmap)를 밀어내던 것을 끊는다
+            // (ninfer read_direct 교훈). 미지원 FS는 폴백(버퍼드).
+            let direct = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let src2 = self
+                    .sources
+                    .iter()
+                    .find(|p| p.covers(table_key, table.len()).is_some());
+                src2.and_then(|p2| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(0o40000) // Linux O_DIRECT
+                        .open(&p2.path)
+                        .ok()
+                })
+            };
+            if direct.is_some() {
+                eprintln!("# ple-ssd: O_DIRECT pread (페이지캐시 미경유)");
+            }
             *guard = Some(crate::rawhip::q4acc::PleSsd {
                 file,
+                direct,
+                scratch: Default::default(),
                 file_len,
                 base_off,
                 row_bytes,
@@ -1204,61 +1330,10 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         }
         let st = guard.as_mut().unwrap();
         // 블록 확보 — LRU(접근 tick 갱신, 지연 힙 증발: 자주 쓰면 RAM 유지,
-        // 오래 안 쓰면 증발 → SSD 재판독. 사용자 의미론 계약).
-        let ensure_block =
-            |st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64| -> Result<u32, String> {
-                st.tick += 1;
-                // QA-4(plans/114): 힙 상한 — 접근(힛 포함)마다 push되는 항은
-                // free 소진 없이 팝되지 않아, 워킹셋이 캐시에 드는 부하(디코드
-                // t=1)에서 접근 수에 비례해 영구 증가했다. 상한 초과 시 현재
-                // 점유 슬롯 기준 유효 항만으로 재구축(O(n_slots), amortized).
-                if st.evict.len() > st.blocks.len() * 2 + 1024 {
-                    st.evict = st
-                        .blocks
-                        .values()
-                        .map(|&sl| std::cmp::Reverse((st.slot_tick[sl as usize], sl)))
-                        .collect();
-                }
-                if let Some(&s) = st.blocks.get(&bidx) {
-                    st.slot_tick[s as usize] = st.tick;
-                    st.evict.push(std::cmp::Reverse((st.tick, s)));
-                    return Ok(s);
-                }
-                let s = match st.free.pop() {
-                    Some(s) => s,
-                    None => {
-                        // stale 항목(재삽입 이전 tick)은 버리고 최저 접근 슬롯 증발.
-                        loop {
-                            let std::cmp::Reverse((tick, s)) =
-                                st.evict.pop().ok_or("ple_gather: 캐시 증발 큐 비정상")?;
-                            if st.slot_tick[s as usize] == tick {
-                                st.blocks.remove(&st.slot_block[s as usize]);
-                                break s;
-                            }
-                        }
-                    }
-                };
-                let base = s as usize * crate::rawhip::q4acc::PLE_SSD_BLOCK;
-                let mut buf = vec![0u8; crate::rawhip::q4acc::PLE_SSD_BLOCK];
-                // QA-7(plans/114): 파일 끝의 미만 블록 — read_exact(4KB) 고정은
-                // UnexpectedEof로 실패했다. 잔여 바이트만 pread, 나머지는 0
-                // (테이블 범위 밖 미판독 영역).
-                let boff = bidx * crate::rawhip::q4acc::PLE_SSD_BLOCK as u64;
-                let want = crate::rawhip::q4acc::PLE_SSD_BLOCK
-                    .min(st.file_len.saturating_sub(boff) as usize);
-                if want == 0 {
-                    return Err(format!("ple_gather: 블록 {bidx}가 파일 범위 밖"));
-                }
-                st.file
-                    .read_exact_at(&mut buf[..want], boff)
-                    .map_err(|e| format!("ple_gather: pread {bidx}: {e}"))?;
-                st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK].copy_from_slice(&buf);
-                st.blocks.insert(bidx, s);
-                st.slot_block[s as usize] = bidx;
-                st.slot_tick[s as usize] = st.tick;
-                st.evict.push(std::cmp::Reverse((st.tick, s)));
-                Ok(s)
-            };
+        // 오래 안 쓰면 증발 → SSD 재판독. 사용자 의미론 계약). 자유함수로
+        // 분리(4차 W-P: 예열 경로와 공유).
+        let ensure_block = ple_ensure_block;
+
         // 행 dedupe → 컴팩트 사본 + slot id 재매핑.
         let mut slot_of: HashMap<u32, u32> = HashMap::with_capacity(nrows);
         let mut compact: Vec<u8> = Vec::with_capacity(nrows * row_bytes);

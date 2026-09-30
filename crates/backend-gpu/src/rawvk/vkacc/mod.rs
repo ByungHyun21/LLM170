@@ -643,9 +643,12 @@ impl VkAcc {
         let sources = parts
             .into_iter()
             .filter_map(|(base, len, path)| {
-                std::fs::File::open(&path)
-                    .ok()
-                    .map(|file| PartSource { base, len, file })
+                std::fs::File::open(&path).ok().map(|file| PartSource {
+                    base,
+                    len,
+                    file,
+                    path,
+                })
             })
             .collect();
         let ctx = VkCtx::new()?;
