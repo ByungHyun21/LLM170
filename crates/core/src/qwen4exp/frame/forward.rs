@@ -132,8 +132,7 @@ pub(crate) fn frame_forward_ex(
         }
         // plans/86 §3 — 인위적 실패 주입(디코드 t=1만): 트랜잭션 폴백 검증용.
         if t == 1
-            && std::env::var("LLM170_FRAME_FAILAT")
-                .ok()
+            && llm170_diag::flag::val("LLM170_FRAME_FAILAT")
                 .and_then(|v| v.parse::<usize>().ok())
                 .is_some_and(|n| n == il)
         {
@@ -200,7 +199,8 @@ pub(crate) fn frame_forward_ex(
             // plans/94 판정: t>1 값 오류의 원인은 gate_mt 공유메모리 레이스
             // (red[0] 소비-재사용 배리어 부재) — conv/res는 합성 체인 프로브로
             // 무죄(전 단계 ≤1.9e-6). 수리 완료, t>1 포함 전 t 디바이스 경로.
-            if std::env::var_os("LLM170_PLE_HOST").is_none() {
+            // QA-5(plans/114): 핫패스 env — flag 스냅샷 판독(원장 104).
+            if !llm170_diag::flag::on("LLM170_PLE_HOST") {
                 let heads = hp.ple_heads_per_ngram * 2;
                 let emb_w = heads * hp.ple_head_dim * t;
                 let mut emb = vec![0.0f32; emb_w];
@@ -814,10 +814,7 @@ pub(super) fn qsa_frame(
     // d2h 4회(동기 드레인) + 호스트 점수/정렬(0.8-1.5ms/층)을 건너뛰고
     // 디바이스 풀(KV·idx)만 적립한다. 실패하면 종전 호스트 경로로 폴백.
     // 킬스위치 LLM170_QSA_NOID=1.
-    if t > 1
-        && pos0 as usize + t < hp.idx_top_k + r
-        && std::env::var_os("LLM170_QSA_NOID").is_none()
-    {
+    if t > 1 && pos0 as usize + t < hp.idx_top_k + r && !llm170_diag::flag::on("LLM170_QSA_NOID") {
         let pos0u = pos0 as usize;
         let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let dev = acc
@@ -870,7 +867,7 @@ pub(super) fn qsa_frame(
     // ─── plans/89 재개: 프리필 다중 토큰 디바이스 선택 — d2h 4회(배치
     // 플러시)와 호스트 점수/정렬을 전부 소거. 실패 시 종전 호스트 경로.
     // 스위치 LLM170_QSA_NODEVSEL=1, 검증 LLM170_QSA_DEVCHECK(호스트 병행).
-    if t > 1 && std::env::var_os("LLM170_QSA_NODEVSEL").is_none() {
+    if t > 1 && !llm170_diag::flag::on("LLM170_QSA_NODEVSEL") {
         let ikw3 = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let iqw3 = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let devsel = acc.qsa_sel_dev_mt(

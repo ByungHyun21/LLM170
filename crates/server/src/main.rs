@@ -315,10 +315,15 @@ fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
             }
         }
     }
-    if tok.is_none() {
-        eprintln!("# tokenizer load 실패 (토큰 id 모드만 동작)");
-    }
-    let _ = engine::TOKENIZER.set(tok.unwrap_or_else(tokenize::Tokenizer::empty));
+    // QA-12(plans/114): serve의 텍스트 엔드포인트(/v1/chat·completions·
+    // messages)는 빈 인코딩 ids=[] 잡을 엔진에 투입해 쓰레기 스트림(또는 엔진
+    // Err)을 뿜었다 — 조용한 서락 대신 기동 치명 오류. (infer·vl은 ids 인터
+    // 페이스라 빈 토크나이저로도 동작 — 이곳 serve에만 적용.)
+    let Some(tok) = tok else {
+        eprintln!("error: tokenizer load 실패(5회 재시도) — serve 텍스트 요청에 필수");
+        return ExitCode::FAILURE;
+    };
+    let _ = engine::TOKENIZER.set(tok);
     let req = engine::InferRequest {
         model: model_path.clone(),
         ctx,

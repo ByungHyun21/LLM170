@@ -22,6 +22,7 @@ use std::path::Path;
 const MAX_STRING_BYTES: u64 = 1 << 26; // 64 MiB (개별 문자열)
 const MAX_ARRAY_LEN: u64 = 1 << 26; // 토크나이저 ~25만 보다 훨씬 큼
 const MAX_TENSORS: u64 = 1 << 20;
+const MAX_KV: u64 = 1 << 20; // 정상 파일 ~수백 개
 const MAX_TENSOR_NAME: u64 = 1 << 12;
 const MAX_DIM: u64 = 1 << 40;
 
@@ -45,7 +46,10 @@ impl TensorInfo {
     /// 파일 절대 바이트 범위 (data_offset 포함)
     pub fn file_range(&self, data_offset: u64) -> Option<(u64, u64)> {
         let n = self.nbytes()?;
-        Some((data_offset + self.offset, data_offset + self.offset + n))
+        // QA-26(plans/114): checked 산술 — 랩된 범위는 None(계산 불가).
+        let start = data_offset.checked_add(self.offset)?;
+        let end = start.checked_add(n)?;
+        Some((start, end))
     }
 }
 
@@ -164,7 +168,10 @@ impl<'a> Reader<'a> {
                 max: MAX_ARRAY_LEN,
             });
         }
-        let mut items = Vec::with_capacity(n as usize);
+        // QA-31(plans/114): 선할당 상한 — 손상 count(≤2^26=2GiB)에 곧바로
+        // EOF 나는 파일이 커밋을 2GiB 선점했다. 실제 토크나이저(~25만)는
+        // 상한 밖 여유로 커버, 초과분은 자연 증가.
+        let mut items = Vec::with_capacity((n as usize).min(1 << 20));
         for _ in 0..n {
             items.push(self.scalar(et)?);
         }
@@ -204,6 +211,15 @@ impl GgufFile {
             return Err(GgufError::TensorCountTooLarge(n_tensors));
         }
         let n_kv = rd.u64()?;
+        // QA-25(plans/114): n_kv 상한 — 검증 없는 with_capacity가 capacity
+        // overflow 패닉(프로세스 어보트, Result 경계 밖)을 일으켰다.
+        if n_kv > MAX_KV {
+            return Err(GgufError::LengthOverflow {
+                what: "kv",
+                len: n_kv,
+                max: MAX_KV,
+            });
+        }
 
         // kv pairs (gguf.cpp:543-611)
         let mut kv: Vec<(String, Value)> = Vec::with_capacity(n_kv as usize);
@@ -223,7 +239,10 @@ impl GgufFile {
         // alignment: general.alignment(u32, pow2) 없으면 32 (gguf.cpp:613-627)
         let alignment = match kv.iter().find(|(k, _)| k == "general.alignment") {
             Some((_, v)) => {
-                let a = v.as_u64().ok_or(GgufError::BadAlignment(0))? as u32;
+                // QA-31(plans/114): u32 절단 제거 — 2^32+32가 32로 잘려
+                // 조용한 미정렬로 수용됐다. u32 범위 밖은 거부.
+                let a64 = v.as_u64().ok_or(GgufError::BadAlignment(0))?;
+                let a = u32::try_from(a64).map_err(|_| GgufError::BadAlignment(u32::MAX))?;
                 if a == 0 || (a & (a - 1)) != 0 {
                     return Err(GgufError::BadAlignment(a));
                 }
@@ -281,7 +300,17 @@ impl GgufFile {
     fn validate_bounds(&self) -> Result<()> {
         for t in &self.tensors {
             let Some(nb) = t.nbytes() else { continue };
-            let end = self.data_offset + t.offset + nb;
+            // QA-26(plans/114): checked 산술 — 랩어라운드 end(≤file_size로
+            // 감김)는 경계검증을 우회해 하류 OOB 판독으로 이어졌다.
+            let Some(end) = self
+                .data_offset
+                .checked_add(t.offset)
+                .and_then(|v| v.checked_add(nb))
+            else {
+                return Err(GgufError::OffsetOverflow {
+                    name: t.name.clone(),
+                });
+            };
             if end > self.file_size {
                 return Err(GgufError::TensorOutOfBounds {
                     name: t.name.clone(),

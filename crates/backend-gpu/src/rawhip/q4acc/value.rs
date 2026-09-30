@@ -1184,8 +1184,13 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         if guard.is_none() {
             let n_slots =
                 crate::rawhip::q4acc::ple_ssd_cache_bytes() / crate::rawhip::q4acc::PLE_SSD_BLOCK;
+            let file_len = file
+                .metadata()
+                .map_err(|e| format!("ple_gather: 파일 메타: {e}"))?
+                .len();
             *guard = Some(crate::rawhip::q4acc::PleSsd {
                 file,
+                file_len,
                 base_off,
                 row_bytes,
                 blocks: HashMap::new(),
@@ -1203,6 +1208,17 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         let ensure_block =
             |st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64| -> Result<u32, String> {
                 st.tick += 1;
+                // QA-4(plans/114): 힙 상한 — 접근(힛 포함)마다 push되는 항은
+                // free 소진 없이 팝되지 않아, 워킹셋이 캐시에 드는 부하(디코드
+                // t=1)에서 접근 수에 비례해 영구 증가했다. 상한 초과 시 현재
+                // 점유 슬롯 기준 유효 항만으로 재구축(O(n_slots), amortized).
+                if st.evict.len() > st.blocks.len() * 2 + 1024 {
+                    st.evict = st
+                        .blocks
+                        .values()
+                        .map(|&sl| std::cmp::Reverse((st.slot_tick[sl as usize], sl)))
+                        .collect();
+                }
                 if let Some(&s) = st.blocks.get(&bidx) {
                     st.slot_tick[s as usize] = st.tick;
                     st.evict.push(std::cmp::Reverse((st.tick, s)));
@@ -1224,8 +1240,17 @@ impl llm170_core::matmul::EwOps for Q4Acc {
                 };
                 let base = s as usize * crate::rawhip::q4acc::PLE_SSD_BLOCK;
                 let mut buf = vec![0u8; crate::rawhip::q4acc::PLE_SSD_BLOCK];
+                // QA-7(plans/114): 파일 끝의 미만 블록 — read_exact(4KB) 고정은
+                // UnexpectedEof로 실패했다. 잔여 바이트만 pread, 나머지는 0
+                // (테이블 범위 밖 미판독 영역).
+                let boff = bidx * crate::rawhip::q4acc::PLE_SSD_BLOCK as u64;
+                let want = crate::rawhip::q4acc::PLE_SSD_BLOCK
+                    .min(st.file_len.saturating_sub(boff) as usize);
+                if want == 0 {
+                    return Err(format!("ple_gather: 블록 {bidx}가 파일 범위 밖"));
+                }
                 st.file
-                    .read_exact_at(&mut buf, bidx * crate::rawhip::q4acc::PLE_SSD_BLOCK as u64)
+                    .read_exact_at(&mut buf[..want], boff)
                     .map_err(|e| format!("ple_gather: pread {bidx}: {e}"))?;
                 st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK].copy_from_slice(&buf);
                 st.blocks.insert(bidx, s);

@@ -36,6 +36,10 @@ pub enum GgufError {
         count: u64,
     },
     TensorCountTooLarge(u64),
+    /// data_offset+offset+nbytes 산술이 u64를 넘어 랩 — 손상 오프셋/크기.
+    OffsetOverflow {
+        name: String,
+    },
 }
 
 impl fmt::Display for GgufError {
@@ -69,6 +73,12 @@ impl fmt::Display for GgufError {
                 write!(f, "{what} length {len} exceeds sanity max {max}")
             }
             Self::TensorCountTooLarge(n) => write!(f, "tensor count {n} exceeds sanity limit"),
+            Self::OffsetOverflow { name } => {
+                write!(
+                    f,
+                    "tensor '{name}' offset arithmetic overflows u64 (corrupt)"
+                )
+            }
         }
     }
 }

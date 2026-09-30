@@ -23,9 +23,16 @@ pub struct OpMark {
 
 static RING: Mutex<Option<VecDeque<OpMark>>> = Mutex::new(None);
 static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn on() -> bool {
     ON.load(Ordering::Relaxed)
+}
+
+/// 스텔 보고 횟수 — plans/114 QA-22: watchdog-selftest가 보고 여부를
+/// 판정 가능하게 하는 관측값(미기동 감지).
+pub fn reports() -> u64 {
+    REPORTS.load(Ordering::Relaxed)
 }
 
 /// 디스패치 1건 기록(와치독 활성 시에만 링에 적립).
@@ -60,6 +67,7 @@ pub fn spawn(sec: u64, fail: bool) {
                 continue;
             }
             if since.elapsed() >= period {
+                REPORTS.fetch_add(1, Ordering::Relaxed);
                 let ring: Vec<OpMark> = RING
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

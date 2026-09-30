@@ -78,13 +78,14 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
     }
     // 디코드 t=1 빠른 경로: 선택 전문가들의 gate·up가 동일 입력 — 그룹 1호출로
     // 2×n_used회 왕복을 1회로 (실측 병목: 전문가당 GPU 왕복 1,440회/스텝).
-    let nofast = std::env::var_os("LLM170_Q4_NOFAST").is_some();
+    // QA-5(plans/114): 핫패스 env — flag 스냅샷 판독(원장 104 계약).
+    let nofast = llm170_diag::flag::on("LLM170_Q4_NOFAST");
     // MoE 실행 경로 선택 (plans/64 P1). 기본값은 가속기 유무: 상주 가속기에서는
     // 스택 1회 업로드 + ids 그룹 런치가 정답이다 — 전문가 슬라이스별 업로드는
     // 슬라이스마다 신규 디바이스 버퍼를 잡아 VRAM을 텐서 수만큼 부풀린다.
     // LLM170_MOE_BATCH=0으로 해제, =1로 강제.
-    let batch_on = std::env::var_os("LLM170_MOE_CPU").is_none()
-        && std::env::var("LLM170_MOE_BATCH")
+    let batch_on = !llm170_diag::flag::on("LLM170_MOE_CPU")
+        && llm170_diag::flag::val("LLM170_MOE_BATCH")
             .map(|v| v != "0")
             .unwrap_or(ctx.acc.is_some());
     if t == 1 && !nofast && !batch_on {
@@ -125,8 +126,8 @@ pub fn moe_ffn(ctx: &Ctx, il: usize, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Q
             // (실측: moe 190→720ms, 터치 슬라이스 합계 ~1.2GB인데 스택은
             // 16.5GB). 기본 끔 — LLM170_MOE_BATCH=1 (전체 상주 가능한
             // CMP 40GB+ 또는 LRU 스트리밍 도입시).
-            let batch_on = std::env::var_os("LLM170_MOE_BATCH").is_some()
-                && std::env::var_os("LLM170_MOE_CPU").is_none();
+            let batch_on = llm170_diag::flag::on("LLM170_MOE_BATCH")
+                && !llm170_diag::flag::on("LLM170_MOE_CPU");
             if batch_on && let Some(acc) = ctx.acc {
                 let stack = ctx.model.w4(&format!("blk.{il}.ffn_down_exps.weight"))?;
                 let ids: Vec<u32> = sel.iter().map(|&e| e as u32).collect();

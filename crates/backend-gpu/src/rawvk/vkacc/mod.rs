@@ -361,6 +361,9 @@ pub struct VkAcc {
     /// plans/89 P1.4 — PLE 디바이스 링: seq → (버퍼, 워터마크).
     ple_rings: Mutex<std::collections::HashMap<usize, (VkBuf, usize)>>,
     ple_consts: Mutex<std::collections::HashMap<(usize, usize), VkBuf>>,
+    /// QA-6(plans/114): PLE 테이블 상주(alloc_host) 1회 실패 음캐싱 — 매 호출
+    /// 26.8GiB 할당 재시도 스톰 방지.
+    ple_tbl_failed: std::sync::atomic::AtomicBool,
 }
 
 /// plans/88 P2 — MoE 그룹화 상주 자산(디바이스 테이블 + 스크래치).
@@ -691,6 +694,7 @@ impl VkAcc {
             last_silu_out: std::sync::atomic::AtomicU64::new(0),
             ple_rings: Mutex::new(std::collections::HashMap::new()),
             ple_consts: Mutex::new(std::collections::HashMap::new()),
+            ple_tbl_failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

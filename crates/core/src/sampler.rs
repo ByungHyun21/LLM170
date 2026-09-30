@@ -4,8 +4,10 @@
 //! 동일 의미(argmax, 동률 최저 인덱스)로 폴백한다 — 기존 게이트 무변화.
 //! RNG는 자작 splitmix64 (외부 rand 크레이트 금지 규칙).
 //!
-//! 적용 순서 (llama.cpp chain과 동일 계열):
-//!   repeat_penalty → temperature → top_k → top_p → min_p → softmax → 난수 추출
+//! 적용 순서 (llama.cpp chain 준수 — plans/114 QA-30 정정):
+//!   repeat_penalty → top_k → temperature → softmax → top_p → min_p → 난수 추출
+//! (temperature는 필터 후·softmax 전 — 종전 top_k 이전 적용은 nucleus
+//! 멤버십을 달리 만들었다)
 
 /// 난수 상태 — seed 고정시 생성 스트림 완전 재현.
 #[derive(Clone)]
@@ -68,7 +70,8 @@ impl SamplerParams {
             && self.top_k == 0
             && self.top_p >= 1.0
             && self.min_p <= 0.0
-            && self.repeat_penalty == 1.0
+            // QA-30: last_n=0이면 패널티가 적용 대상 자체가 없다.
+            && (self.repeat_penalty == 1.0 || self.repeat_last_n == 0)
     }
 }
 
@@ -95,7 +98,13 @@ impl Sampler {
 
     /// 생성 토큰 기록 — 패널티 히스토리 갱신 (프롬프트 토큰도 마지막 n개 반영).
     pub fn push_tokens(&mut self, toks: impl IntoIterator<Item = u32>) {
-        let cap = self.params.repeat_last_n.max(1);
+        // QA-30: last_n=0은 비활성 의도 — 종전 max(1)이 마지막 1토큰 페널티로
+        // 변질했다. 0이면 히스토리를 유지하지 않는다.
+        let cap = self.params.repeat_last_n;
+        if cap == 0 {
+            self.recent.clear();
+            return;
+        }
         for t in toks {
             self.recent.push_back(t);
             while self.recent.len() > cap {
@@ -110,10 +119,18 @@ impl Sampler {
             return crate::matmul::greedy_from(logits);
         }
         let mut l = logits.to_vec();
-        // ① repeat penalty — 히스토리 토큰에 양수 나눗셈/음수 곱셈 (llama.cpp 계열)
+        // ① repeat penalty — 히스토리 토큰에 양수 나눗셈/음수 곱셈.
+        // QA-29: 유니크 토큰당 1회 — llama.cpp는 token_count 맵으로 1회만
+        // 적용(빈도는 freq/presence 전용). 종전엔 중복 m회 → p^m 과잉 억제.
         if self.params.repeat_penalty != 1.0 && !self.recent.is_empty() {
             let p = self.params.repeat_penalty;
+            let mut uniq: Vec<u32> = Vec::with_capacity(self.recent.len());
             for &t in &self.recent {
+                if !uniq.contains(&t) {
+                    uniq.push(t);
+                }
+            }
+            for t in uniq {
                 if let Some(v) = l.get_mut(t as usize) {
                     if *v > 0.0 {
                         *v /= p;
@@ -123,12 +140,10 @@ impl Sampler {
                 }
             }
         }
-        // ② temperature
-        if self.params.temperature > 0.0 {
-            let t = self.params.temperature;
-            for v in &mut l {
-                *v /= t;
-            }
+        // QA-30 보강: temp<=0은 페널티 적용 **후** 결정적 argmax(llama.cpp
+        // 준수) — 종전엔 페널티 활성 시 temp 0도 softmax 난수 추출이었다.
+        if self.params.temperature <= 0.0 {
+            return crate::matmul::greedy_from(&l);
         }
         // 후보 = (인덱스, 로짓) — 정렬용
         let mut cand: Vec<(u32, f32)> = l
@@ -146,6 +161,14 @@ impl Sampler {
         }
         // 안정 softmax 순서를 위해 내림차순 정렬 (top_p/min_p 누적에 필요)
         cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // ② temperature — 필터(top_k) 후·softmax 전 적용(QA-30: llama.cpp
+        // 체인 준수. 종전엔 top_k/min_p 이전에 나눠 nucleus 멤버십이 갈렸다).
+        if self.params.temperature > 0.0 && self.params.temperature != 1.0 {
+            let t = self.params.temperature;
+            for (_, v) in &mut cand {
+                *v /= t;
+            }
+        }
         let max = cand.first().map(|&(_, v)| v).unwrap_or(0.0);
         let mut probs: Vec<f64> = cand
             .iter()
@@ -290,6 +313,37 @@ mod tests {
         let l = logits(&[0.0, 9.0, 8.0]);
         // 9.0 / 1000 = 0.009 < 8.0
         assert_eq!(s.sample(&l), 2);
+    }
+
+    /// QA-29: 중복 토큰은 유니크 1회만 페널티 — 종전 p^m.
+    #[test]
+    fn repeat_penalty_unique_once() {
+        let p = SamplerParams {
+            repeat_penalty: 2.0,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut s = Sampler::new(p);
+        s.push_tokens([1u32, 1u32, 1u32]);
+        let l = logits(&[0.0, 9.0, 4.4]);
+        // 1회 적용: 9/2=4.5 > 4.4 → 1 승 (p^3이었다면 1.125 < 4.4 → 2 승)
+        assert_eq!(s.sample(&l), 1);
+    }
+
+    /// QA-30: last_n=0 — 패널티 비활성 의미론.
+    #[test]
+    fn repeat_last_n_zero_disables() {
+        let p = SamplerParams {
+            repeat_penalty: 1000.0,
+            repeat_last_n: 0,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        assert!(p.is_greedy());
+        let mut s = Sampler::new(p);
+        s.push_tokens([1u32]);
+        // 히스토리 미유지 → 억제 없음 → argmax 1
+        assert_eq!(s.sample(&logits(&[0.0, 9.0, 8.0])), 1);
     }
 
     #[test]
