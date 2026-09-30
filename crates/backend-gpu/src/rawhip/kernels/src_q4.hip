@@ -1785,3 +1785,27 @@ extern "C" __global__ void q4_emb_q8g_f16(const unsigned* ids, const unsigned ch
         }
     }
 }
+
+// ─── PLE 임베딩 테이블(IQ4_NL) gather (plans/111 W4c) ───
+// vk fn_ple_gather.comp 의 hip 미러. IQ4_NL 블록: 32원소 18B = f16 d(2B) +
+// qs(16B, 4bit LUT). y[j] = d·kv[qs[j]&0xF], y[16+j] = d·kv[qs[j]>>4] —
+// CPU deq_iq4_nl(deq.rs)과 비트 동일(동일 스칼라 곱, kv 상수 = KVALUES_IQ4NL).
+// 테이블은 백엔드가 mmap ptr 키로 1회 상주. 스레드=(row, 블록 32원소).
+extern "C" __global__ void q4_ple_gather(const unsigned* rows, const unsigned char* tbl,
+                                         float* emb, int hd, int nrows) {
+    const int bpr = (hd + 31) >> 5;
+    const int gid = (int)(blockIdx.x * blockDim.x) + (int)threadIdx.x;
+    if (gid >= nrows * bpr) return;
+    const int row = gid / bpr, blk = gid % bpr;
+    const unsigned char* bp = tbl + ((size_t)rows[row] * bpr + (size_t)blk) * 18;
+    const float d = bits_f16((unsigned)bp[0] | ((unsigned)bp[1] << 8));
+    const unsigned char* qs = bp + 2;
+    const float kv[16] = { -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                           1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f };
+    float* o = emb + (size_t)row * hd + (size_t)blk * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        o[j] = d * kv[qs[j] & 0xF];
+        o[16 + j] = d * kv[qs[j] >> 4];
+    }
+}

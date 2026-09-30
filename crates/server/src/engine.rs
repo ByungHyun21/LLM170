@@ -17,6 +17,10 @@ pub struct InferRequest {
     pub ctx: usize,
     /// 외장 MTP 모듈 경로(plans/109 P15⑤) — None이면 --spec>0 시 자동 탐지.
     pub mtp: Option<PathBuf>,
+    /// PLE 테이블 오프로드 모드(plans/111 W4c) — None=auto.
+    pub ple_table: Option<String>,
+    /// SSD 블록 캐시 예산 MiB(plans/111 W4c) — None=기본 1024.
+    pub ple_cache_mib: Option<usize>,
 }
 
 /// qwen4exp GPU 경로 요청 여부 (plans/64 P1).
@@ -1123,6 +1127,15 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
 
 /// n_slots 시퀀스로 엔진 구성 (연속 배칭 — 04).
 pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> Engine {
+    // plans/111 W4c: PLE 테이블 오프로드 모드(서빙 옵션 → 백엔드 전역).
+    if let Some(m) = req.ple_table.as_deref()
+        && let Err(e) = llm170_backend_gpu::set_ple_table_mode_by_str(m)
+    {
+        eprintln!("error: {e}");
+    }
+    if let Some(mib) = req.ple_cache_mib {
+        llm170_backend_gpu::set_ple_ssd_cache_mib(mib);
+    }
     let arch = open_with_retry(&req.model).and_then(|g| g.arch().map(|s| s.to_string()));
     if arch.as_deref() == Some("qwen4exp") {
         // qwen4exp GPU 경로 — plans/64 P1: 기본 CPU(정확성 기준); --backend gpu

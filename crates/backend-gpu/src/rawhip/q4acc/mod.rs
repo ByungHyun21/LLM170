@@ -156,6 +156,15 @@ pub struct Q4Acc {
     ple_cw: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     /// token_embd gather용 ids 업로드(매 콜) — plans/111 W2.
     emb_ids: std::sync::Mutex<GBuf>,
+    /// PLE gather용 rows 업로드(매 콜) — plans/111 W4c.
+    ple_rows_buf: std::sync::Mutex<GBuf>,
+    /// PLE 테이블(ram 모드): host-pinned 전체 상주 — (mmap ptr, pinned ptr).
+    ple_tbl: std::sync::Mutex<Option<(usize, *mut u8)>>,
+    /// PLE 테이블(ssd 모드): 블록 캐시 + pread 상태(첫 사용 시 구축).
+    ple_ssd: std::sync::Mutex<Option<PleSsd>>,
+    /// ssd 모드 컴팩트 행 버퍼 업로드(매 콜).
+    ple_compact: std::sync::Mutex<GBuf>,
+
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -179,6 +188,61 @@ pub struct Q4Acc {
 // (단일 스트림 + 호출부는 decode1을 직렬 호출). VkAcc와 동일한 계약.
 unsafe impl Send for Q4Acc {}
 unsafe impl Sync for Q4Acc {}
+
+/// PLE SSD 오프로드 상태 — 4KB 블록 캐시(FIFO 상한) + pread 미스.
+/// 테이블(FN 28.8GB)은 RAM에 못 올리므로 접근된 블록만 상주(Engram급 공통).
+struct PleSsd {
+    file: std::fs::File,
+    /// 텐서 시작의 파일 오프셋(파트 내).
+    base_off: u64,
+    row_bytes: usize,
+    blocks: std::collections::HashMap<u64, u32>,
+    /// 슬롯별 마지막 접근 tick(LRU) — blocks 값과 짝.
+    slot_tick: Vec<u64>,
+    /// 슬롯이 담은 블록 인덱스(역매핑 — 증발 시 blocks 제거용).
+    slot_block: Vec<u64>,
+    /// 지연 증발 힙 (tick, slot) 오름차순 — stale 항목은 pop 때 버린다.
+    evict: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+    tick: u64,
+    arena: Vec<u8>,
+    free: Vec<u32>,
+}
+
+/// SSD 블록 캐시 예산 기본(1GiB). 서빙 옵션 `--ple-cache <MiB>`로 재지정
+/// (set_ple_ssd_cache_bytes — 0이면 이 기본).
+static PLE_SSD_CACHE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// SSD 블록 캐시 예산 바이트(0 지정은 기본 1GiB).
+pub fn ple_ssd_cache_bytes() -> usize {
+    match PLE_SSD_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1 << 30,
+        v => v,
+    }
+}
+
+/// ple-cache 서빙 옵션 주입(엔진 build_slots → 서버 `--ple-cache <MiB>`).
+pub fn set_ple_ssd_cache_bytes(bytes: usize) {
+    PLE_SSD_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+const PLE_SSD_BLOCK: usize = 4096;
+
+/// ple-table 서빙 옵션(서버 `--ple-table ram|ssd|auto` → 엔진이 주입, 기본 auto).
+/// 프로세스 전역 — Q4Acc 생성 전 set_ple_table_mode 로 지정(set_backend_res_f16
+/// 과 같은 계약).
+static PLE_TABLE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 0=auto 1=ram 2=ssd.
+pub fn set_ple_table_mode(m: u8) {
+    PLE_TABLE_MODE.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 현재 지정 문자열("auto"/"ram"/"ssd").
+pub fn ple_table_mode_str() -> &'static str {
+    match PLE_TABLE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "ram",
+        2 => "ssd",
+        _ => "auto",
+    }
+}
 
 /// 활성 q8 버퍼의 행 스트라이드(워드) — quant_q8과 동일 규약.
 pub(crate) fn xq_words(n: usize) -> usize {
@@ -292,6 +356,10 @@ impl Q4Acc {
             ple_cw: std::sync::Mutex::new(std::collections::HashMap::new()),
             emb_ids: std::sync::Mutex::new(GBuf::new("emb_ids")),
             qsa_iqw: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ple_rows_buf: std::sync::Mutex::new(GBuf::new("ple_rows")),
+            ple_tbl: std::sync::Mutex::new(None),
+            ple_ssd: std::sync::Mutex::new(None),
+            ple_compact: std::sync::Mutex::new(GBuf::new("ple_compact")),
             qsa_ikw: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_csidx: std::sync::Mutex::new((0, 0, GBuf::new("qsa_csidx"))),
             qn_map: std::sync::Mutex::new(std::collections::HashMap::new()),

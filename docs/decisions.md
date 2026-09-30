@@ -3420,3 +3420,30 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   MoE 가변 토폴로지가 난점), W6 dense GEMV 23ms·MoE ids 12ms 커널 효율,
   W7 MTP 검증 무게(수용 1.0-1.22로 순손실 유지), np 다중 슬롯 발산(원장 129),
   serve 간헐 스톨 완화(호스트 브리지 PLE의 캐시 예열/프리페치).
+
+### (133) PLE 26.8GiB 실체 규명 + GPU gather 첫 실동작 + 이중 오프로드 서빙 옵션 (plans/111 W4c, 2026-09-30)
+
+- **실체**: PLE 테이블 = per_layer_token_embd [160, 320M] IQ4_NL = **26.8 GiB**
+  (vk "283MB" 주석은 오기). CPU mmap 랜덤 판독이 majflt 스래싱(~600s 스톨)의
+  근원이었고, vk alloc_host도 불가 → 양 백엔드 GPU gather는 실동작 0회 +
+  forward.rs가 gpu_gather 시 mm_group 체인을 스킵해 출력이 버려지는 vestigial
+  코드였다.
+- **구현**: ① 커널 q4_ple_gather(CPU deq_iq4_nl 비트 미러 — 대조 532,480원소
+  0 불일치). ② 서빙 옵션 `--ple-table auto|ram|ssd` + `--ple-cache MiB`(기본
+  1024) — ssd는 4KB 블록 LRU(접근 tick+지연 힙)+pread 미스+행 dedupe 컴팩트
+  업로드, ram은 host-pinned 전체. ③ forward.rs 체인 재배선 + ple_math_dev
+  t>1 해제 → 프리필 PLE 전체 디바이스화(호스트 브리지 355-396ms/청크·
+  스래싱 원천 제거). ④ emb 테이블(675MB)도 host-pinned(serve 카브아웃 OOM
+  폴백 해소).
+- **산술 클래스 변경(승인)**: 프리필 PLE key/value GEMM이 CPU mm_batch →
+  GPU frame_mm_group으로 통일(디코드 t=1과 동일 패밀리). 골든 재캡처
+  (charhash 15,674) — 토큰 게이트 4종 변화 없음.
+- **검증**: FN hip·27B hip·FN vk 게이트 PASS·charhash 재캡처 PASS·fb 0건·
+  preflight 6/6.
+- **실측**: pp4096 290.0→**294.5**·pp16384 256.3→**261.7**·tg128@8k
+  17.72→**18.14**(중앙×3). serve 4×64 장문 E2E 96s→**89s**(에포크 직접 계산)
+  — 잔여 ~50s는 비엔진 오버헤드(큐대기 ~23s 포함, 별도 조사 과제).
+- **인계**: O_DIRECT pread 채용(ninfer 참조 — 아레나 정렬 전제), 비동기 블록
+  프리페치(FreeToken 이중버퍼 참조), serve 비엔진 오버헤드 분해, t=2048 PLE
+  디바이스 버퍼(~300MB) 재사용, 리소스 가드 마진(emb host 이전 후 0.5GB
+  부족 — 재부팅 시 소멸 예상), W5(hipGraph)·W6(커널)·W7(MTP) 종전대로.
