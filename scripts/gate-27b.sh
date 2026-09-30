@@ -39,7 +39,7 @@ BASE_FILE=scripts/.gate-27b-baseline$([[ "$RUNTIME" == vulkan ]] && echo -vk || 
 
 if [[ "${1:-}" == "--record" ]]; then
     ./target/release/llm170 infer --model "$MODEL" --prompt-tokens "$PROMPT" \
-        --n-predict 16 --ctx 8192 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null \
+        --n-predict 16 --ctx 8192 --backend "$RUNTIME" 2>/dev/null \
         | grep -aoE '"token":[0-9]+' | grep -oE '[0-9]+' | tr '\n' ' ' | sed 's/ $//' > "$BASE_FILE"
     echo "새 베이스라인 기록: $(cat "$BASE_FILE")"
     exit 0
@@ -47,7 +47,7 @@ fi
 
 echo "== diverse 게이트 (ctx 8192, n-predict 16, $RUNTIME) =="
 OUT=$(./target/release/llm170 infer --model "$MODEL" --prompt-tokens "$PROMPT" \
-    --n-predict 16 --ctx 8192 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null \
+    --n-predict 16 --ctx 8192 --backend "$RUNTIME" 2>/dev/null \
     | grep -aoE '"token":[0-9]+' | grep -oE '[0-9]+' | tr '\n' ' ' | sed 's/ $//')
 if [[ -f "$BASE_FILE" ]]; then BASELINE=$(cat "$BASE_FILE"); fi
 if [[ "$OUT" == "$BASELINE" ]]; then
@@ -63,8 +63,8 @@ if [[ "${1:-}" == "--bench" ]]; then
     # 표준 벤치 지점: pp 512/4k/16k, tg 128
     for pt in 512 4096 16384; do
         ./target/release/llm170 bench --model "$MODEL" --pp $pt --tg 0 \
-            --ctx 20480 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| pp"
+            --ctx 20480 --backend "$RUNTIME" 2>/dev/null | grep -aE "\| pp"
     done
     ./target/release/llm170 bench --model "$MODEL" --pp 512 --tg 128 \
-        --ctx 20480 --backend gpu --gpu-runtime "$RUNTIME" 2>/dev/null | grep -aE "\| tg"
+        --ctx 20480 --backend "$RUNTIME" 2>/dev/null | grep -aE "\| tg"
 fi

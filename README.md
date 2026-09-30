@@ -57,13 +57,13 @@ Requires Rust 1.95+ (edition 2024). No GPU toolchain needed to build.
 cargo build --release
 
 # Inference
-cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --gpu-runtime hip
+cargo run --release -- infer --model <model.gguf> --prompt-tokens 760,6511 --n-predict 16 --backend hip
 
 # HTTP server (OpenAI-compatible)
-cargo run --release -- serve --model <model.gguf> --port 8080 --slots 4 --backend gpu   # --slots N: continuous batching (default 1)
+cargo run --release -- serve --model <model.gguf> --port 8080 --slots 4 --backend hip   # --slots N: continuous batching (default 1)
 
 # Benchmark
-cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --np 4 --gpu-runtime hip
+cargo run --release -- bench --model <model.gguf> --pp 512 --tg 128 --np 4 --backend hip
 
 # Model inspection
 cargo run --release -- gguf-dump --meta-only <model.gguf>
