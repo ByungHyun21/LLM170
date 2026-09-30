@@ -270,6 +270,17 @@ pub trait EwOps: Send + Sync {
         Err("emb_q8_gather_dev: 미지원".into())
     }
 
+    /// plans/111 4차 W-P — ssd 블록 캐시 선예열: 다음 스텝에 필요한 PLE 행의
+    /// 4KB 블록을 백그라운드에서 pread 적재(프리페치 워커가 호출). no-op 구현이
+    /// 기본(ram 모드·CPU·vk).
+    fn ple_ssd_warm(&self, _rows: &[u32]) {}
+
+    /// ssd 오프로드 활성 판정 — 프리페치 워커가 mmap gather(페이지캐시 오염)
+    /// 대신 블록 예열을 고르는 근거.
+    fn ple_table_ssd_active(&self) -> bool {
+        false
+    }
+
     /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL).
     fn ple_gather_dev(
         &self,
