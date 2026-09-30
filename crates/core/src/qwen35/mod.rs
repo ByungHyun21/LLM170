@@ -55,6 +55,10 @@ pub struct Model {
     pub hp: Hparams,
     mmap: Mmap,
     pub token_pieces: Vec<String>,
+    /// plans/113(llama-vllm P13): f32 norm 가중 디양자화 캐시 — 첫 호출 1회
+    /// 디양자화 후 재사용(수치 불변, qwen4exp f32_vec4와 동일 기법). 값 경로
+    /// 매 포워드 층별 norm 재디양자(48+16층 × 2 × 스텝) 제거.
+    f32_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
 }
 
 macro_rules! span_block {
@@ -140,6 +144,7 @@ impl Model {
             mmap,
             hp,
             token_pieces,
+            f32_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         for name in ["token_embd.weight", "output.weight", "output_norm.weight"] {
             m.w(name).ok_or(ModelError::MissingTensor(name.into()))?;
@@ -205,7 +210,14 @@ impl Model {
     }
 
     pub fn f32_vec(&self, name: &str) -> Result<Vec<f32>, ModelError> {
-        Ok(self.wchk(name)?.dequant_f32_vec())
+        if let Some(v) = self.f32_cache.borrow().get(name) {
+            return Ok(v.clone());
+        }
+        let v = self.wchk(name)?.dequant_f32_vec();
+        self.f32_cache
+            .borrow_mut()
+            .insert(name.to_string(), v.clone());
+        Ok(v)
     }
 
     pub fn is_recr(&self, il: usize) -> bool {
