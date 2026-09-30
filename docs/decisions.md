@@ -3362,3 +3362,34 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
 - MTP spec k=3(신규 측정, FN hip): 수용 **1.21 tok/fwd**, 실효 **~4.0 t/s**
   — 비스펙 6.2 대비 아직 역전(행핀 검증의 무게 재독). W3 속도 잔여가
   전환점(원장 128 인계 항목 참조).
+
+### (131) FN hip 디코드 3.2× — KTRACE 상시 녹화 회귀 수리 + emb gather hip 이식 (plans/111, 2026-09-30)
+
+- **RCA(W1, e2d5a77)**: `q4acc ktrace_tick`이 `ktrace_on()`을 무조건 호출 —
+  plans/88 이후 **env와 무관하게 상시 녹화**(런치당 hipEvent 2개 ×
+  ~1,973런치/스텝 + 스텝당 덤프)되어 FN(qwen4exp 프레임 경로) 디코드 스텝에
+  ~110-140ms 과세. `flag::on("LLM170_KTRACE")` 게이트로 계약 복원. 27B
+  (qwen35) 경로는 틱이 없어 무과세 — 과세가 FN 한정이었던 이유. 상시 진단
+  과세 전수조사: vk [ts]·ftime·AccTime은 게이트 정상, capture_mark no-op,
+  fb 카운터 relaxed atomic — 유의미 과세는 KTRACE 유일.
+- **실측(FN hip, bench --reps 3 중앙값)**: tg 5.86 → **18.56 t/s(3.2×)**,
+  pp512 253.4 → 272.2. 스텝 ~161ms → ~54ms(커널바운드 — 커널 합 56ms와
+  일치). KTRACE=1 옵트인 정상 동작.
+- **W2(51e23bc)**: `emb_q8_gather_dev` hip 이식(vk plans/97 미러,
+  q4_emb_q8g/_f16 커널 + 테이블 weights 캐시 1회 상주). 종전 트레이트 기본
+  Err로 매 스텝 CPU 디양자화+h2d ~9ms·프리필 청크당 48-70ms. pp512 272.2 →
+  **280.0**(청크당 ~55ms 회수), tg는 노이즈권(t=1 업로드는 GPU와 겹침).
+- **검증**: FN hip 게이트 PASS·27B hip 게이트 PASS·charhash 15,674 PASS·
+  clippy 0·fb 0건. 도입 중 쓰레기 토큰 오보는 프롬프트 수기 전사 오류
+  (게이트 스크립트 재실행으로 판명) — 이후 판정은 스크립트 프롬프트만 사용.
+- **README FN 재측정(51e23bc 빌드)**: pp512 **280.0**·pp4096 **290.0**·
+  pp16384 **256.3**·tg128@8k **18.68**(구 6.21). 모드 행 신규: tg single
+  17.84·np4 greedy 27.03(bench 집계)·MTP k=2 **9.4**(수용 1.00)·k=3 **8.2**
+  (1.22)·MTP+np4 6.09(serve HTTP†, EOS 조기종료 스큐 포함). **MTP는 현재
+  순손실**(비스펙 17.8 대비) — 드래프트 5.5ms×k + 검증 무게가 수용률을
+  못 넘는다(원장 128 무게 상각 잔여 과제). 27B는 전 셀 ±1.5% 내 불변
+  (pp512 348.25·tg 11.56 — README 27B 표 무갱신, ±5-10% 열분산 내).
+- **열린 과제(인계)**: 스텝 잔여 ~15% 격차(llama 48.5ms vs 우리 ~54ms) —
+  런치 수 1,973/스텝 축소(작은 커널 융합), dense GEMV계 23ms·MoE ids계
+  12ms 최적화, MTP 검증 무게 상각(원장 128), serve np4 슬롯 스케줄 스큐
+  (bench 27.03 vs serve 13.24 — EOS 조기종료 외 실측 필요).
