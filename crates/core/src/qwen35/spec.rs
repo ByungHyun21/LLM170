@@ -264,7 +264,12 @@ impl Engine {
         // 체인 상태: (draft 토큰, 그 pair의 h_next) — j=0은 hook 저장분 사용
         let mut chain_tok: Option<u32> = None;
         let mut chain_h: Vec<f32> = Vec::new();
-        let mut chain_pos = base_pos; // 다음 mtp_forward가 쓸 슬롯
+        // QA-27(plans/112→fix/mtp-qa27): mtp_forward의 KV 기입 규약은
+        // "슬롯 = pos" — 체인 j는 위치 base_pos+j 토큰(d_{j-1})을 먹이므로
+        // pos는 base_pos+j. 종전 base_pos+j-1은 ① draft step-0/hook이 쓴 실제
+        // 마지막 토큰 KV를 즉시 덮어쓰고 ② 체인 KV가 한 슬롯 앞(rope 한 위상
+        // 뒤)이며 ③ 이후 드래프트 어텐션이 실제 최신 토큰을 영구 누락했다.
+        let mut chain_pos = base_pos + 1; // 다음 mtp_forward가 쓸 슬롯
         for j in 0..=k {
             let logits = self.decode(&[seq], &[cur])?;
             total += 1;
@@ -363,7 +368,9 @@ impl Engine {
                 drafts.push(d0);
                 let mut tok = d0;
                 for _ in 1..k {
-                    let dpos = self.seqs[seq].pos as usize + drafts.len() - 1;
+                    // QA-27: mtp_step_chain도 "KV(fed)=슬롯 pos" 규약 — d_{j-1}은
+                    // 위치 pos+j 토큰이므로 dpos = pos + j (drafts.len()=j).
+                    let dpos = self.seqs[seq].pos as usize + drafts.len();
                     crate::quant::dequant_row(
                         embd_ty, &embd_arc, tok as u64, n_e as u64, &mut trow,
                     );
@@ -744,7 +751,8 @@ impl Engine {
             drafts.push(d0);
             let mut tok = d0;
             for _j in 1..k {
-                let dpos = (base_pos + drafts.len() as u32 - 1) as usize;
+                // QA-27: 동일 — d_{j-1}(위치 base_pos+j)를 슬롯 base_pos+j에.
+                let dpos = (base_pos + drafts.len() as u32) as usize;
                 let mut trow = vec![0.0f32; n_e];
                 crate::quant::dequant_row(embd_ty, embd_data, tok as u64, n_e as u64, &mut trow);
                 let d = rd
