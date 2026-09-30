@@ -46,15 +46,8 @@ ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md
 | tg single | 5.86 | **20.04** |
 | np4 aggregate | 28.6 *(serve --slots 4, HTTP)* | **49.03** *(llama HTTP†)* |
 
-- Greedy gates: 27B hip / 27B vulkan / FN hip / FN vulkan all PASS
-  (`scripts/gate-27b.sh`, `scripts/gate-flash-next.sh`).
-- Tokenizer: 100% llama.cpp token-for-token match — 86 corpus files ×
-  special on/off, 398,177 tokens, both models (`scripts/verify_tok.py`).
-- Sampling: seed-reproducible, temp→0 = argmax; temperature / top_k /
-  top_p / min_p / repeat_penalty / seed on all completion endpoints.
-- Generation: Korean Q&A over HTTP answers correctly (e.g. "서울") with
-  coherent `<think>` reasoning; chunk invariance fenced by
-  `llm170 diag chunk-check`.
+<!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
+     적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
 
 ## Build & run
 
