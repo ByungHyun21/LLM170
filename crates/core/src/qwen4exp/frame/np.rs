@@ -28,9 +28,12 @@ pub(super) fn ensure_np_views(
     if f.np_views.is_some() {
         return Ok(());
     }
-    // 뷰는 항상 최대 슬롯(8)로 만든다 — 첫 배치가 2슬롯이어도 이후 4슬롯
+    // 뷰는 항상 최대 슬롯으로 만든다 — 첫 배치가 2슬롯이어도 이후 4슬롯
     // 스텝이 같은 뷰 테이블을 쓴다(패닉 방지, frames 테이블 무한 증가 방지).
-    const NP_MAX: usize = 8;
+    // plans/113(sglang P0-2): 8→16 — serve --slots가 1..16인데 t>8 에러가
+    // decode_batch의 프레임 파괴+매 스텝 직렬 폴백을 유발했다. 뷰는 핸들만
+    // 증가(공유 버퍼는 t_max≥512 예산 내)·산술은 행별 독립이라 비트 불변.
+    const NP_MAX: usize = 16;
     let rows = rows.max(NP_MAX);
     let dt2 = hp.dt_rank * 2;
     let qrow = hp.n_head * 2 * hp.head_dim;
@@ -445,8 +448,8 @@ pub(super) fn frame_forward_np_ex(
     let conv_ch = 2 * k_len + v_len;
     let eps = hp.eps;
     let t = seqs.len();
-    if t > 8 {
-        return Err(Q4Error::Io("frame_forward_np: t>8 미지원".into()));
+    if t > 16 {
+        return Err(Q4Error::Io("frame_forward_np: t>16 미지원".into()));
     }
     let t_call = std::time::Instant::now();
     fs_begin(acc, t);

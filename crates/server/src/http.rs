@@ -175,9 +175,11 @@ fn resp_sse_open(stream: &mut TcpStream) {
     );
 }
 
-fn sse(stream: &mut TcpStream, event: &str, data: &str) {
-    let _ = write!(stream, "event: {event}\ndata: {data}\n\n");
-    let _ = stream.flush();
+/// plans/113(sglang P0-1): 쓰기 오류를 반환한다 — 종전 `let _ =`가 절단된
+/// 클라이언트로의 쓰기 실패를 삼켜, 잔여 n_predict를 GPU가 끝까지 계산했다.
+fn sse(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
+    write!(stream, "event: {event}\ndata: {data}\n\n")?;
+    stream.flush()
 }
 
 // --- 최소 JSON 파싱 (중첩 없는 평탄 필드 추출) ---
@@ -570,18 +572,24 @@ fn run_and_emit(
     let mut det = crate::engine::Detok::new();
     for t in prx {
         let piece = crate::json::esc(&det.push(t));
-        if chat {
+        let frame = if chat {
             sse(
                 stream,
                 "message",
                 &format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{piece}\"}}}}]}}"),
-            );
+            )
         } else {
-            sse(stream, "message", &format!("{{\"text\":\"{piece}\"}}"));
+            sse(stream, "message", &format!("{{\"text\":\"{piece}\"}}"))
+        };
+        // plans/113(sglang P0-1): 쓰기 실패(클라 절단) 시 즉시 탈출 — 이 스코프를
+        // 벗어나며 prx가 drop되고 다음 slot_emit부터 기존 cancelled 경로가
+        // 슬롯을 회수한다(비스트림 QA-3 폴링과 동일 메커니즘).
+        if frame.is_err() {
+            return;
         }
     }
     let _ = orx.recv(); // 최종 결과 수령 (종료 정리)
-    sse(stream, "done", "[DONE]");
+    let _ = sse(stream, "done", "[DONE]");
     // plans/114 QA-2 연계 수리: SSE 완료 후 연결 종료. curl류 클라이언트는
     // [DONE]을 인지하지 못해 서버의 keep-alive 대기에 묶였고 — 무타임아웃
     // 시대엔 무한 대기, read_timeout(120s) 도입 후엔 요청마다 +120s 꼬리가
@@ -602,7 +610,7 @@ fn run_and_emit_anthropic(
     };
     if stream_mode {
         resp_sse_open(stream);
-        sse(
+        let _ = sse(
             stream,
             "message_start",
             "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}",
@@ -610,21 +618,25 @@ fn run_and_emit_anthropic(
         let mut det = crate::engine::Detok::new();
         for t in prx {
             let esc = crate::json::esc(&det.push(t));
-            sse(
+            let frame = sse(
                 stream,
                 "content_block_delta",
                 &format!(
                     "{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{esc}\"}}}}"
                 ),
             );
+            // plans/113(sglang P0-1): run_and_emit과 동일 — 절단 시 즉시 취소.
+            if frame.is_err() {
+                return;
+            }
         }
         let _ = orx.recv();
-        sse(
+        let _ = sse(
             stream,
             "message_delta",
             "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
         );
-        sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
+        let _ = sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         let _ = stream.shutdown(std::net::Shutdown::Write);
         return;
     }
