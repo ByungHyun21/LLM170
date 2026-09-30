@@ -21,7 +21,7 @@ top-1 갭 < TIE_EPS=1.5nat)면 PASS(tie). spec 케이스는 완전일치만.
   # llama-server 정지 후
   LLM170_PHASE=judge python3 scripts/verify.py     # 우리 엔진 단독
 
-환경: LLM170_MODEL, LLM170_EXTRA_ARGS(기본 "--backend gpu"),
+환경: LLM170_MODEL, LLM170_EXTRA_ARGS(기본 "--backend hip"),
       LLM170_STORE(기본 /tmp/verify_q35_base.json), LLM170_TIE_EPS,
       LLM170_VERIFY_SPEC(기본 4).
 """
@@ -81,7 +81,7 @@ def ours_generate(prompts, n_predict, ctx, spec=0):
     # 우리 엔진: prefill 토큰 + n_predict 디코드 = n_predict+1 출력 → 슬라이스
     # spec>0: --spec k + LLM170_SPEC_GPU=1 (GPU 스펙 — 프로덕션 경로).
     args = [BIN, "infer", "--model", MODEL_PATH]
-    args += os.environ.get("LLM170_EXTRA_ARGS", "--backend gpu").split()
+    args += os.environ.get("LLM170_EXTRA_ARGS", "--backend hip").split()
     if spec:
         args += ["--spec", str(spec)]
     args += ["--n-predict", str(n_predict), "--ctx", str(ctx)]

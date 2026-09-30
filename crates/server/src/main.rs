@@ -32,18 +32,18 @@ llm170 — AMD APU 타깃 순수 Rust 추론 엔진 (CPU·HIP·Vulkan)
   llm170 gguf-dump [--meta-only] [--limit N] <file.gguf>
       GGUF 메타데이터·텐서 구성 덤프 (무게 미로딩)
   llm170 infer --model <file.gguf> --prompt-tokens <ids> [--prompt-tokens <ids> ...]
-              [--n-predict N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+              [--n-predict N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k]
       greedy 추론 (JSONL {"seq","pos","token","text"}).
-      --prompt-tokens 반복 = 병렬 시퀀스(np). --backend gpu: 원시 디코더 상주 디코드.
-  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
+      --prompt-tokens 반복 = 병렬 시퀀스(np). --backend hip|vulkan: 원시 디코더 상주 디코드.
+  llm170 serve --model <file.gguf> [--port N] [--ctx N] [--slots N] [--queue N] [--backend cpu|hip|vulkan] [--spec k] [--ple-table auto|ram|ssd] [--ple-cache MiB]
       OpenAI/Anthropic 호환 HTTP 서버. --slots N: 동시 요청 배치 디코드 슬롯(기본 1).
   llm170 vl --model <llm.gguf> --mmproj <mmproj.gguf> --image <img> [--image <img>...]
             [--spec k] [--n-predict N] [--prefix-tokens ids] [--question-tokens ids]
       비전 인코딩 + LLM 스플라이스 추론.
   llm170 bench --model <file.gguf> [--pp N] [--tg N] [--reps N] [--ctx N]
-              [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+              [--backend cpu|hip|vulkan] [--spec k]
       llama-bench 규격 PP/TG 측정 (t/s).
-  llm170 check <model.gguf> [--quick] [--backend cpu|gpu]
+  llm170 check <model.gguf> [--quick] [--backend cpu|hip|vulkan]
       텐서 스캔(NaN/Inf) + GPU↔CPU GEMM 상호검증 + 장문 청크 스모크.
   llm170 w4a8-check <file> <tensor> [t] [rows]
       W4A8 변형 ↔ f32 기준 상호검증.
@@ -114,17 +114,30 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
             "--model" => ma.model = Some(common_value(args, &mut i, &inline)),
             "--backend" => {
                 let v = common_value(args, &mut i, &inline);
-                if v != "cpu" && v != "gpu" {
-                    return Err(format!("--backend: cpu|gpu (got {v})"));
+                // 통합 백엔드 1택(사용자 지시 2026-09-30): cpu|hip|vulkan|cuda.
+                // 파싱층에서 (backend, runtime) 쌍으로 정규화 — 엔진 코드는 무변경.
+                match v.as_str() {
+                    "cpu" => {
+                        ma.backend = Some("cpu".into());
+                        ma.gpu_runtime = None;
+                    }
+                    "hip" | "vulkan" => {
+                        ma.backend = Some("gpu".into());
+                        ma.gpu_runtime = Some(v.clone());
+                    }
+                    "cuda" => {
+                        return Err("--backend cuda: 미구현 (hip|vulkan 사용)".into());
+                    }
+                    // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
+                    "gpu" => {
+                        return Err("--backend gpu 폐지: --backend hip|vulkan|cpu 로 지정".into());
+                    }
+                    _ => return Err(format!("--backend: cpu|hip|vulkan|cuda (got {v})")),
                 }
-                ma.backend = Some(v);
             }
             "--gpu-runtime" => {
-                let v = common_value(args, &mut i, &inline);
-                if v != "hip" && v != "vulkan" {
-                    return Err(format!("--gpu-runtime: hip|vulkan (got {v})"));
-                }
-                ma.gpu_runtime = Some(v);
+                // 통합 폐지(2026-09-30): --backend hip|vulkan 이 단일 선택지다.
+                return Err("--gpu-runtime 폐지: --backend hip|vulkan 사용".into());
             }
             "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
             "--ple-table" => {
@@ -176,7 +189,7 @@ fn main() -> ExitCode {
     // 모든 모델 적재 서브커맨드(serve/infer/vl/bench/check)를 커버한다:
     //   - --model <v> / --model=<v> (serve·infer·vl·bench)
     //   - check의 첫 비플래그 위치인자 (모델 경로)
-    //   - GPU 판정: --backend gpu, --gpu-runtime; check는 기본이 gpu.
+    //   - GPU 판정: --backend hip|vulkan (통합 1택, gpu-runtime 폐지); check는 기본이 gpu.
     // gguf-dump·tokenize는 메타데이터만 읽는다(무게 미적재) — 가드 제외.
     if !matches!(
         args.first().map(String::as_str),
@@ -254,7 +267,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// llm170 serve --model <file> [--port N] [--ctx N] [--slots N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k]
+/// llm170 serve --model <file> [--port N] [--ctx N] [--slots N] [--backend cpu|hip|vulkan] [--spec k]
 fn cmd_serve(args: &[String], ma: &ModelArgs) -> ExitCode {
     let mut port = 8080u16;
     let mut queue: Option<usize> = None;

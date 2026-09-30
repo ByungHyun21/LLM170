@@ -294,9 +294,11 @@ pub fn frame_forward_prefill_multi(
             tokens.len()
         )));
     }
-    if n_seq > 8 || t > f.t_max {
+    if n_seq > 16 || t > f.t_max {
+        // plans/113(sglang P0-2): n_seq 상한 8→16 — slots 9-16 serve가 에러
+        // 폴백(슬롯별 직렬 프리필)로 도그시브됐다. t_max 가드는 유지.
         return Err(Q4Error::Io(format!(
-            "frame_forward_prefill_multi: 용량 초과 n_seq={n_seq}(≤8) t={t} > t_max={}",
+            "frame_forward_prefill_multi: 용량 초과 n_seq={n_seq}(≤16) t={t} > t_max={}",
             f.t_max
         )));
     }

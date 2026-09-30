@@ -34,7 +34,7 @@ run_hashes() {
     export LLM170_NO_RSRC_GUARD=1
     LLM170_DUMP=checksum,bufhash ./target/release/llm170 infer --model "$MODEL" \
         --prompt-tokens "$PROMPT" --n-predict 16 --ctx 8192 \
-        --backend gpu --gpu-runtime "$RUNTIME" 2>&1 >/dev/null \
+        --backend "$RUNTIME" 2>&1 >/dev/null \
         | grep -aE '^\[(npbh|npck)\] ' | sed -E 's/sum=[-0-9.]+/sum=S/; s/v0=[-0-9.]+/v0=V/; s/mid0=[-0-9.]+/mid0=M/; s/last0=[-0-9.]+/last0=L/'
     # sum/v0/... 는 %.6f 반올림 — 마지막 자리 진동만으로 거짓 불일치를 막기
     # 위해 자릿수 표준화. [npbh] h= 는 f32 비트 FNV라 그대로 둔다.

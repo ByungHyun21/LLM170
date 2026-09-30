@@ -1,7 +1,7 @@
 plans/
 source/
-# docs/source 는 공개 문서(코드 1:1 측정 기록)라 추적한다 — 위 source/ 는 벤더 소스용.
-!docs/source/
+# docs/ — 원장·공개 문서 모두 푸시 제외(사용자 지시 2026-09-30). plans/·source/와 동일 취급.
+docs/
 target*/
 docs-inner/
 __pycache__/

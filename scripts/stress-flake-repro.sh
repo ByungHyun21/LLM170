@@ -11,7 +11,7 @@ ok=0; div=0
 for i in $(seq 1 12); do
     export LLM170_DUMP=checksum
     out=$(./target/release/llm170 infer --model "$MODEL" --prompt-tokens "$PROMPT" \
-        --n-predict 16 --ctx 8192 --backend gpu --gpu-runtime vulkan 2>"/tmp/stress_$i.log" \
+        --n-predict 16 --ctx 8192 --backend vulkan 2>"/tmp/stress_$i.log" \
         | grep -aoE '"token":[0-9]+' | grep -oE '[0-9]+' | tr '\n' ' ' | sed 's/ $//')
     unset LLM170_DUMP
     if [ "$out" == "$EXP" ] || [ "$out" == "$ALT" ]; then

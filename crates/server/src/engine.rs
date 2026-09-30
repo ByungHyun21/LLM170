@@ -808,14 +808,23 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     // plans/109 P15⑤: MTP 스펙 슬롯 우선 — mtp_spec_step으로
                     // k토근 제안·검증(수용분 emit). 잔여 슬롯은 종전 배치 디코드.
                     // CPU 참조 드래프트 — ④ GPU화 전까지 느리다(스펙 슬롯만).
-                    let spec_slots: Vec<usize> = active
-                        .iter()
-                        .copied()
-                        .filter(|&i| {
-                            slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0)
-                                && !sampling(&slots[i])
-                        })
-                        .collect();
+                    // plans/113(sglang P2-1): 스펙은 단독 활성 슬롯에서만 — 다중
+                    // 활성 시 검증 무게(전상태 스냅샷+수용분 재실행)가 배치 이득을
+                    // 상쇄해 순손실(serve MTP+np4 6.09 vs np4 27.03 t/s, 원장 128).
+                    // spec_k를 무시하고 전원 plain np 배치로.
+                    let spec_on = active.len() == 1;
+                    let spec_slots: Vec<usize> = if spec_on {
+                        active
+                            .iter()
+                            .copied()
+                            .filter(|&i| {
+                                slots[i].job.as_ref().is_some_and(|j| j.spec_k > 0)
+                                    && !sampling(&slots[i])
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     if !spec_slots.is_empty() && e.model.has_mtp() {
                         // plans/110 W5(실험, LLM170_SPEC_MULTI=1): 다중 스펙
                         // 슬롯의 라운드 시작 decode1을 1회 np 배치로 병합. 잔여
@@ -1236,7 +1245,11 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             sources,
             q4_gpu_wanted(&backend),
             q4_vk_runtime(&backend),
-            q4_gpu_wanted(&backend) && !q4_vk_runtime(&backend),
+            // plans/115: f16 버스 기본 박탈(원장 105 승격 회수) — serve hip에서
+            // 토큰 전수 파괴 실측(2026-09-30): [760,6511]→가비지 vs f32 버스로는
+            // infer 골든과 완전 일치. B1 잔여(infer f16 골든 발산)와 동일 결함.
+            // 산술 클래스는 f32(골든 캡처본)로 통일.
+            false,
             AttachPolicy::Warn,
         )
         .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
