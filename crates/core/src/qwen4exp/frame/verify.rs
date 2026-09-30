@@ -98,7 +98,9 @@ pub(crate) fn frame_forward_verify(
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
     for il in 0..hp.n_layer {
-        // 1) PLE — 행별 t=1 디바이스 경로(링 체인)
+        // 1) PLE — 배치 gather·투영 + 행별 math(링 체인) (plans/115 P0-4)
+        // np.rs와 동일 구조: verify 행은 같은 seq의 드래프트 창이라 math의
+        // 디바이스 링 체인(pos+row 순행)만 행별 t=1을 유지한다.
         if hp.is_ple(il) {
             let heads = hp.ple_heads_per_ngram * 2;
             let emb_w = heads * hp.ple_head_dim;
@@ -109,19 +111,46 @@ pub(crate) fn frame_forward_verify(
             let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
             let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
             let vv = f.np_views.as_ref().unwrap();
-            fs_begin(acc, 1);
-            for row in 0..t {
-                let mut emb = vec![0.0f32; emb_w];
-                if ple_rows[row].len() == heads {
-                    ctx.model.ple_gather(&ple_rows[row], &mut emb)?;
+            fs_begin(acc, t);
+            let all_valid = ple_rows.iter().all(|r| r.len() == heads);
+            if all_valid {
+                let flat: Vec<u32> = ple_rows.concat();
+                let gpu = (|| -> Result<(), Q4Error> {
+                    let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
+                    // SAFETY (107 W8): ple_table_view 계약 — mmap 유효 범위(읽기 전용).
+                    let tdata: &[u8] =
+                        unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
+                    acc.ple_gather_dev(tptr, tdata, &flat, f.ple_emb, thd)
+                        .map_err(Q4Error::Io)
+                })()
+                .is_ok();
+                if !gpu {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::PleGgpu);
+                    ONCE.call_once(|| eprintln!("# verify-ple-ggpu: 실패 — 호스트 폴백"));
+                    let mut emb = vec![0.0f32; emb_w * t];
+                    for (row, r) in ple_rows.iter().enumerate() {
+                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                    }
+                    acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
+                }
+            } else {
+                let mut emb = vec![0.0f32; emb_w * t];
+                for (row, r) in ple_rows.iter().enumerate() {
+                    if r.len() == heads {
+                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                    }
                 }
                 acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
-                acc.frame_mm_group(f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], 1)
-                    .map_err(Q4Error::Io)?;
+            }
+            acc.frame_mm_group(f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], t)
+                .map_err(Q4Error::Io)?;
+            for row in 0..t {
+                fs_begin(acc, 1);
                 acc.ple_math_dev(
                     vv.res_hc[row],
-                    f.ple_key,
-                    f.ple_value,
+                    vv.ple_key[row],
+                    vv.ple_value[row],
                     &nk,
                     &nq,
                     &nc,
