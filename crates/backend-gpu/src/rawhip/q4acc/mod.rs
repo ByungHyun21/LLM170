@@ -154,6 +154,8 @@ pub struct Q4Acc {
     ple_nq: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     ple_nc: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
     ple_cw: std::sync::Mutex<std::collections::HashMap<(u64, usize), GBuf>>,
+    /// token_embd gather용 ids 업로드(매 콜) — plans/111 W2.
+    emb_ids: std::sync::Mutex<GBuf>,
     /// MoE 전문가 그룹화 — x 행 gather / 결과 행 산란 / 순열 업로드.
     xperm: std::sync::Mutex<GBuf>,
     yperm: std::sync::Mutex<GBuf>,
@@ -288,6 +290,7 @@ impl Q4Acc {
             ple_nq: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_nc: std::sync::Mutex::new(std::collections::HashMap::new()),
             ple_cw: std::sync::Mutex::new(std::collections::HashMap::new()),
+            emb_ids: std::sync::Mutex::new(GBuf::new("emb_ids")),
             qsa_iqw: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_ikw: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_csidx: std::sync::Mutex::new((0, 0, GBuf::new("qsa_csidx"))),
