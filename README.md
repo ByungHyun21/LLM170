@@ -6,11 +6,6 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 
 ## Benchmarks
 
-Solo, greedy, `llm170 bench` vs `llama-bench`, same host (27B 2026-09-23
-plans/92, FN 2026-09-30 plans/111; single-rep numbers carry a ±5-10% thermal /
-page-cache spread on this APU — ranges where observed). Full conditions:
-[docs/benchmarks.md](docs/benchmarks.md).
-
 <!-- 측정 프로토콜: hip(ROCm) 수치는 반드시 ROCm 10으로 측정한다
      (LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib). Vulkan 수치는 무관. -->
 
@@ -45,10 +40,11 @@ page-cache spread on this APU — ranges where observed). Full conditions:
 | mode | LLM170 hip | llama hip |
 |---|---|---|
 | tg single | 17.84 | **20.04** |
-| np4 greedy (GPU argmax) | 27.03 | **49.03** *(llama HTTP†)* |
-| MTP single (k=2) | 9.4 *(수용 1.00 tok/fwd)* | — |
-| MTP single (k=3) | 8.2 *(수용 1.22 tok/fwd)* | — |
-| MTP + np4 | 6.09 *(serve HTTP†)* | — |
+| np4 greedy (GPU argmax) | 27.38 | **49.03** *(llama HTTP†)* |
+| MTP single (k=2) | 9.86 *(1.00 tok/fwd)* | — |
+| MTP single (k=3) | 9.79 *(1.10 tok/fwd)* | — |
+| MTP + np4 (k=2) | 10.82 | — |
+| MTP + np4 (k=3) | 11.65 | — |
 
 <!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
      적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
