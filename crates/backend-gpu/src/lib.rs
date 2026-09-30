@@ -10,6 +10,21 @@ pub mod rawvk;
 
 pub use rawhip::decode::{RawDecoder, inject as inject_rawhip};
 pub use rawhip::q4acc::new_acc_with_sources as new_q4_acc_with_sources;
+
+/// ple-table 서빙 옵션 주입(서버 `--ple-table ram|ssd|auto` → engine build_slots).
+pub fn set_ple_table_mode_by_str(m: &str) -> Result<(), String> {
+    match m {
+        "auto" | "ram" | "ssd" => {
+            crate::rawhip::q4acc::set_ple_table_mode(match m {
+                "ram" => 1,
+                "ssd" => 2,
+                _ => 0,
+            });
+            Ok(())
+        }
+        _ => Err(format!("--ple-table: auto|ram|ssd (got {m})")),
+    }
+}
 /// plans/86 §6 — 파트 소스 지정판: 대형 가중 업로드가 mmap 폴트(20-180 MB/s)
 /// 대신 pread 스테이징(~1.2 GB/s)을 쓴다(hip staged_upload 미러).
 pub fn new_q4_acc_vk_with_sources(
@@ -21,3 +36,8 @@ pub fn new_q4_acc_vk_with_sources(
 pub use rawhip::probes::gpu_mem_free;
 pub use rawhip::{bw_test, dp4a_test, qk_check, raw_probe};
 pub use rawvk::decoder::inject as inject_rawvk;
+
+/// ple-cache 서빙 옵션 주입(`--ple-cache <MiB>` → 바이트).
+pub fn set_ple_ssd_cache_mib(mib: usize) {
+    crate::rawhip::q4acc::set_ple_ssd_cache_bytes(mib.saturating_mul(1 << 20));
+}

@@ -37,7 +37,7 @@ page-cache spread on this APU — ranges where observed). Full conditions:
      어떤 프로즈도 적지 않는다. 표 안의 측정값만 갱신한다. -->
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | 280.0 | 290.0 | 256.3 | 17.72 |
+| LLM170 hip | 268.6 | 294.5 | 261.7 | 18.14 |
 | LLM170 vulkan (frame) | 465.8 | 395.9 | 296.4 | 14.82 |
 | llama.cpp hip | 451 | 427 | 391 | 20.61 |
 | llama.cpp vulkan | **474** | **502** | **448.8** | **23.68** |
