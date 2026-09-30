@@ -124,6 +124,13 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                 if v != "hip" && v != "vulkan" {
                     return Err(format!("--gpu-runtime: hip|vulkan (got {v})"));
                 }
+                // 런타임 지정은 GPU 의도다 — --backend 미지정이면 gpu로 간주.
+                // 종전엔 --gpu-runtime hip만 주면 backend 기본 "cpu"로 조용히
+                // CPU 경로가 돌았다(사용자+에이전트 모두 함정, 2026-09-30 실사례).
+                // 명시 --backend cpu는 파순과 무관하게 존중(아래에서 덮지 않는다).
+                if ma.backend.is_none() {
+                    ma.backend = Some("gpu".into());
+                }
                 ma.gpu_runtime = Some(v);
             }
             "--mtp" => ma.mtp = Some(common_value(args, &mut i, &inline)),
