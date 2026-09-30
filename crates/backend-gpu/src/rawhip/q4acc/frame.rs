@@ -1218,7 +1218,13 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
     }
 
     /// KTRACE 진단 훅 — 스텝 단위 덤프+재시작(core→백엔드 의존 방향 존중).
+    /// plans/111: LLM170_KTRACE 플래그로 게이트 — 종전 무조건 ktrace_on()이라
+    /// plans/88 이후 env와 무관하게 상시 녹화됐다(런치당 hipEvent 2개 기록 +
+    /// 스텝마다 덤프가 벤치·서빙 전 경로에 부과). 계약(AGENTS.md)대로 옵트인.
     fn ktrace_tick(&self) {
+        if !llm170_diag::flag::on("LLM170_KTRACE") {
+            return;
+        }
         eprintln!("{}", crate::rawhip::ktrace_dump());
         crate::rawhip::ktrace_on();
     }
