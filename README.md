@@ -36,7 +36,7 @@ ranges where observed). Full conditions: [docs/benchmarks.md](docs/benchmarks.md
      어떤 프로즈도 적지 않는다. 표 안의 측정값만 갱신한다. -->
 | backend | pp512 | pp4096 | pp16384 | tg128@8k |
 |---|---|---|---|---|
-| LLM170 hip | 246.2 | 278.8 | 249.8 | 5.86 |
+| LLM170 hip | 253.4 | 288.5 | 254.7 | 6.21 |
 | LLM170 vulkan (frame) | 465.8 | 395.9 | 296.4 | 14.82 |
 | llama.cpp hip | 451 | 427 | 391 | 20.61 |
 | llama.cpp vulkan | **474** | **502** | **448.8** | **23.68** |
