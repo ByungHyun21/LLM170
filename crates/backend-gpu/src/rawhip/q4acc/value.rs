@@ -838,9 +838,10 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         hist: usize,
         host_ring: &[f32],
     ) -> Result<(), String> {
-        if t != 1 {
-            return Err(format!("ple_math_dev: t={t} (디코드 전용)"));
-        }
+        // plans/111 W4c: t>1(프리필) 디바이스 경로 해제(사용자 승인, 원장 132
+        // 부정 1의 재적용) — forward.rs 체인 재배선으로 GPU gather 출력이
+        // frame_mm_group→ple_math 로 이어진다. key/value GEMM 산술 클래스는
+        // 골든 재캡처로 승인(디코드 t=1이 이미 같은 GPU GEMM 패밀리 사용).
         let hc_dim = hc * n_embd;
         let ring_bytes = hist * hc_dim * 4;
         // 링 워터마크는 pos 기반(vk 판과 동일 의미론) — t 기반은 되감기
@@ -1019,21 +1020,30 @@ impl llm170_core::matmul::EwOps for Q4Acc {
             return Ok(());
         }
         let bpr = n / 32;
-        // 테이블 1회 상주 — 무게 업로드 경로(pread 스테이징/MADV) 재사용.
+        // 테이블 1회 상주 — host-pinned 제로카피(plans/111 W4c: 카브아웃이 풀이라
+        // hipMalloc(675MB)이 serve에서 간헐 실패해 CPU 폴백했었다. PLE과 동일 패턴).
         let tbl = {
-            let mut ws = self.weights.lock().map_err(|e| e.to_string())?;
-            if let Some(&(p, _)) = ws.get(&table_key) {
+            let mut c = self.ple_tbl.lock().map_err(|e| e.to_string())?;
+            if let Some((k, p)) = *c {
+                if k != table_key {
+                    return Err("emb_q8g: 테이블 키 교체 미지원(단일 모델)".into());
+                }
                 p
             } else {
-                let p = self.ctx.alloc(table.len().max(1))?;
-                if let Some(r) = self.staged_upload(p, table.as_ptr() as usize, table.len()) {
-                    r?;
-                } else {
-                    self.upload_pipelined(p, table)?;
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: hipMallocHost 원본 바인딩 — p 미초기화 포인터 인자.
+                unsafe {
+                    crate::rawhip::hip::hipMallocHost(&mut p, table.len().max(1));
                 }
-                self.wbytes
-                    .fetch_add(table.len(), std::sync::atomic::Ordering::Relaxed);
-                ws.insert(table_key, (p, false));
+                if p.is_null() {
+                    return Err("emb_q8g: hipMallocHost 실패".into());
+                }
+                let p = p as *mut u8;
+                // SAFETY (107 W8): p는 hipMallocHost(table.len()) 바이트 — 1회 순차 복사.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(table.as_ptr(), p, table.len());
+                }
+                *c = Some((table_key, p));
                 p
             }
         };
@@ -1070,6 +1080,242 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         let name = if f16 { "q4_emb_q8g_f16" } else { "q4_emb_q8g" };
         self.ctx
             .launch(name, (t * bpr).div_ceil(256) as u32, 1, 256, &mut args)?;
+        Ok(())
+    }
+
+    /// plans/111 W4c — PLE 임베딩 테이블(IQ4_NL) gather(vk plans/93 의 hip 이식).
+    /// 서빙 옵션 `--ple-table ram|ssd|auto`(기본 auto — 엔진 set_ple_table_mode):
+    /// - ram: 전체 테이블 host-pinned 상주. 소형 테이블 전용 — FN 테이블은
+    ///   [160, 320M] = 28.8GB라 시스템 RAM(30GB)에 불가(283MB 라는 vk 주석은
+    ///   오기 — 양 백엔드 GPU gather는 지금까지 실동작 0회).
+    /// - ssd: 4KB 블록 캐시(1GiB FIFO) + pread 미스 + 컴팩트 업로드 — 접근된
+    ///   행만 RAM에 상주(Engram 성장 대비 공통 경로). pread도 페이지캐시 경유.
+    /// - auto: 테이블 ≤ 캐시 예산이면 ram, 아니면 ssd. 선택은 ONCE 로그.
+    ///
+    /// 블록 산술은 CPU deq_iq4_nl(deq.rs)과 비트 동일(커널 q4_ple_gather).
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gather_dev(
+        &self,
+        table_key: usize,
+        table: &[u8],
+        rows: &[u32],
+        out: u64,
+        hd: usize,
+    ) -> Result<(), String> {
+        use std::collections::HashMap;
+        use std::os::unix::fs::FileExt;
+
+        let nrows = rows.len();
+        if nrows == 0 {
+            return Ok(());
+        }
+        let bpr = hd.div_ceil(32);
+        let row_bytes = bpr * 18;
+        let mode = crate::rawhip::q4acc::ple_table_mode_str();
+        let mode = match mode {
+            "ram" => 1,
+            "ssd" => 2,
+            // auto — 캐시 예산에 들어가면 ram, 아니면 ssd.
+            _ => usize::from(table.len() <= crate::rawhip::q4acc::ple_ssd_cache_bytes()),
+        };
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let name = match mode {
+                    1 => "ram(전체 pinned)",
+                    _ => "ssd(블록 캐시+pread)",
+                };
+                eprintln!(
+                    "# ple-table: {name} — 테이블 {:.1} GiB",
+                    table.len() as f64 / (1u64 << 30) as f64
+                );
+            });
+        }
+        if mode == 1 {
+            // ── ram: 전체 host-pinned(제로카피) — 무게 카브아웃은 그대로. ──
+            let tbl = {
+                let mut c = self.ple_tbl.lock().map_err(|e| e.to_string())?;
+                if let Some((k, p)) = *c {
+                    if k != table_key {
+                        return Err("ple_gather: 테이블 키 교체 미지원(단일 모델)".into());
+                    }
+                    p
+                } else {
+                    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                    // SAFETY: hipMallocHost 원본 바인딩 — p 미초기화 포인터 인자.
+                    unsafe {
+                        crate::rawhip::hip::hipMallocHost(&mut p, table.len().max(1));
+                    }
+                    if p.is_null() {
+                        return Err("ple_gather: hipMallocHost 실패".into());
+                    }
+                    let p = p as *mut u8;
+                    // SAFETY (107 W8): p는 hipMallocHost(table.len()) 바이트.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(table.as_ptr(), p, table.len());
+                    }
+                    *c = Some((table_key, p));
+                    p
+                }
+            };
+            let ids = {
+                let mut g = self.ple_rows_buf.lock().map_err(|e| e.to_string())?;
+                let p = g.ensure(&self.ctx, nrows * 4)?;
+                // SAFETY (107 W8): rows 업로드 — ensure(nrows*4) 바이트, 길이 일치.
+                self.ctx.h2d(p, unsafe {
+                    std::slice::from_raw_parts(rows.as_ptr() as *const u8, nrows * 4)
+                })?;
+                p
+            };
+            self.ple_gather_launch(tbl as *const u8, ids, out, hd, nrows, bpr)?;
+            return Ok(());
+        }
+        // ── ssd: 파트 파일 pread + 4KB 블록 캐시 + 컴팩트 업로드. ──
+        let (file, base_off) = {
+            let src = self
+                .sources
+                .iter()
+                .find(|p| p.covers(table_key, table.len()).is_some())
+                .ok_or("ple_gather: 테이블 파트 미커버")?;
+            let off = src.covers(table_key, table.len()).unwrap();
+            (src.file.try_clone().map_err(|e| e.to_string())?, off)
+        };
+        let mut guard = self.ple_ssd.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let n_slots =
+                crate::rawhip::q4acc::ple_ssd_cache_bytes() / crate::rawhip::q4acc::PLE_SSD_BLOCK;
+            *guard = Some(crate::rawhip::q4acc::PleSsd {
+                file,
+                base_off,
+                row_bytes,
+                blocks: HashMap::new(),
+                slot_tick: vec![0; n_slots],
+                slot_block: vec![0; n_slots],
+                evict: std::collections::BinaryHeap::new(),
+                tick: 0,
+                arena: vec![0u8; n_slots * crate::rawhip::q4acc::PLE_SSD_BLOCK],
+                free: (0..n_slots as u32).rev().collect(),
+            });
+        }
+        let st = guard.as_mut().unwrap();
+        // 블록 확보 — LRU(접근 tick 갱신, 지연 힙 증발: 자주 쓰면 RAM 유지,
+        // 오래 안 쓰면 증발 → SSD 재판독. 사용자 의미론 계약).
+        let ensure_block =
+            |st: &mut crate::rawhip::q4acc::PleSsd, bidx: u64| -> Result<u32, String> {
+                st.tick += 1;
+                if let Some(&s) = st.blocks.get(&bidx) {
+                    st.slot_tick[s as usize] = st.tick;
+                    st.evict.push(std::cmp::Reverse((st.tick, s)));
+                    return Ok(s);
+                }
+                let s = match st.free.pop() {
+                    Some(s) => s,
+                    None => {
+                        // stale 항목(재삽입 이전 tick)은 버리고 최저 접근 슬롯 증발.
+                        loop {
+                            let std::cmp::Reverse((tick, s)) =
+                                st.evict.pop().ok_or("ple_gather: 캐시 증발 큐 비정상")?;
+                            if st.slot_tick[s as usize] == tick {
+                                st.blocks.remove(&st.slot_block[s as usize]);
+                                break s;
+                            }
+                        }
+                    }
+                };
+                let base = s as usize * crate::rawhip::q4acc::PLE_SSD_BLOCK;
+                let mut buf = vec![0u8; crate::rawhip::q4acc::PLE_SSD_BLOCK];
+                st.file
+                    .read_exact_at(&mut buf, bidx * crate::rawhip::q4acc::PLE_SSD_BLOCK as u64)
+                    .map_err(|e| format!("ple_gather: pread {bidx}: {e}"))?;
+                st.arena[base..base + crate::rawhip::q4acc::PLE_SSD_BLOCK].copy_from_slice(&buf);
+                st.blocks.insert(bidx, s);
+                st.slot_block[s as usize] = bidx;
+                st.slot_tick[s as usize] = st.tick;
+                st.evict.push(std::cmp::Reverse((st.tick, s)));
+                Ok(s)
+            };
+        // 행 dedupe → 컴팩트 사본 + slot id 재매핑.
+        let mut slot_of: HashMap<u32, u32> = HashMap::with_capacity(nrows);
+        let mut compact: Vec<u8> = Vec::with_capacity(nrows * row_bytes);
+        let mut ids: Vec<u32> = Vec::with_capacity(nrows);
+        for &r in rows {
+            let n = slot_of.len() as u32;
+            let slot = *slot_of.entry(r).or_insert(n);
+            if slot == n {
+                // 새 고유 행 — 블록 캐시에서 조립(블록 경계 관통 처리).
+                let goff = st.base_off + r as u64 * st.row_bytes as u64;
+                let mut in_off = (goff % crate::rawhip::q4acc::PLE_SSD_BLOCK as u64) as usize;
+                let mut bidx = goff / crate::rawhip::q4acc::PLE_SSD_BLOCK as u64;
+                let mut left = st.row_bytes;
+                while left > 0 {
+                    let s = ensure_block(st, bidx)?;
+                    let base = s as usize * crate::rawhip::q4acc::PLE_SSD_BLOCK;
+                    let take = left.min(crate::rawhip::q4acc::PLE_SSD_BLOCK - in_off);
+                    compact.extend_from_slice(&st.arena[base + in_off..base + in_off + take]);
+                    left -= take;
+                    in_off = 0;
+                    bidx += 1;
+                }
+            }
+            ids.push(slot);
+        }
+        let n_uniq = slot_of.len();
+        drop(guard);
+        // 컴팩트 테이블 + slot ids 업로드 → 동일 커널.
+        let tbl_d = {
+            let mut g = self.ple_compact.lock().map_err(|e| e.to_string())?;
+            let p = g.ensure(&self.ctx, n_uniq * row_bytes)?;
+            self.ctx.h2d(p, &compact)?;
+            p
+        };
+        let ids_d = {
+            let mut g = self.ple_rows_buf.lock().map_err(|e| e.to_string())?;
+            let p = g.ensure(&self.ctx, nrows * 4)?;
+            // SAFETY (107 W8): ids 업로드 — ensure(nrows*4) 바이트, 길이 일치.
+            self.ctx.h2d(p, unsafe {
+                std::slice::from_raw_parts(ids.as_ptr() as *const u8, nrows * 4)
+            })?;
+            p
+        };
+        self.ple_gather_launch(tbl_d, ids_d, out, hd, nrows, bpr)?;
+        Ok(())
+    }
+}
+
+impl Q4Acc {
+    /// ple_gather 공용 런치 — tbl/ids 포인터만 모드별로 다르다.
+    fn ple_gather_launch(
+        &self,
+        tbl: *const u8,
+        ids: *mut u8,
+        out: u64,
+        hd: usize,
+        nrows: usize,
+        bpr: usize,
+    ) -> Result<(), String> {
+        let need = nrows * hd * 4;
+        let cap = self.fcap(out)?;
+        if cap < need {
+            return Err(format!("ple_gather: out {cap}B < {need}B"));
+        }
+        let op = self.fptr(out)?;
+        let (mut rp, mut tp) = (ids as *mut std::ffi::c_void, tbl as *mut std::ffi::c_void);
+        let mut opv = op as *mut std::ffi::c_void;
+        let (mut hd_, mut nr) = (hd as i32, nrows as i32);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut rp) as *mut _ as *mut std::ffi::c_void,
+            (&mut tp) as *mut _ as *mut std::ffi::c_void,
+            (&mut opv) as *mut _ as *mut std::ffi::c_void,
+            (&mut hd_) as *mut _ as *mut std::ffi::c_void,
+            (&mut nr) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch(
+            "q4_ple_gather",
+            (nrows * bpr).div_ceil(256) as u32,
+            1,
+            256,
+            &mut args,
+        )?;
         Ok(())
     }
 }

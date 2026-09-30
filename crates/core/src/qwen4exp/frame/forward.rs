@@ -207,7 +207,8 @@ pub(crate) fn frame_forward_ex(
                 if ple_rows.len() == heads * t {
                     // plans/93: GPU gather 우선 — IQ4_NL 테이블 상주 + 커널.
                     // CPU MT(59ms) 대비 ~200×. 폴백은 CPU MT.
-                    let gpu_gather_ok = if std::env::var_os("LLM170_PLE_GGPU").is_none() {
+                    // plans/111 W4c: 기본 ON(=0 킬스위치) — hip 구현 완료.
+                    let gpu_gather_ok = if !llm170_diag::flag::ne0("LLM170_PLE_GGPU") {
                         false
                     } else {
                         match (|| -> Result<(), Q4Error> {
@@ -271,14 +272,22 @@ pub(crate) fn frame_forward_ex(
                         });
                         Ok(())
                     };
-                    if gpu_gather_ok {
+                    // plans/111 W4c: GPU gather 경로도 동일 체인(frame_mm_group +
+                    // ple_math_dev t≥1)을 돈다 — 종전엔 체인이 CPU gather 분기
+                    // 안에 갇혀 GPU gather 출력을 아무도 읽지 않았다(vestigial).
+                    let gather_ok = if gpu_gather_ok {
                         // GPU가 f.ple_emb를 채움 — CPU emb 스킵.
+                        true
                     } else if let Err(e) = gather_mt(&mut emb) {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| {
                             eprintln!("# ple-frame: gather 실패 — 호스트 브리지 ({e})")
                         });
+                        false
                     } else {
+                        true
+                    };
+                    if gather_ok {
                         let w_key = model.w4(&format!("blk.{il}.ple_key.weight"))?;
                         let w_value = model.w4(&format!("blk.{il}.ple_value.weight"))?;
                         let nk = model.f32_vec4(&format!("blk.{il}.ple_norm_key.weight"))?;
