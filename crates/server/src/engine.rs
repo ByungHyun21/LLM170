@@ -428,6 +428,9 @@ struct Slot {
     err_count: u32,
     /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
     failed: Option<String>,
+    /// plans/115 D2/P1-3: 이 잡 프리필의 시작 위치(0=신규, cp=접두 복원,
+    /// l=완전 재사용) — h행 세션·mtp_draft_prefill base_pos.
+    pf_base: usize,
 }
 
 impl Slot {
@@ -444,6 +447,7 @@ impl Slot {
             sampler: None,
             err_count: 0,
             failed: None,
+            pf_base: 0,
         }
     }
 }
@@ -621,6 +625,8 @@ pub static SCHED: Sched = Sched {
     ms_decode: AtomicU64::new(0),
     chunks_prefill: AtomicU64::new(0),
     ms_prefill: AtomicU64::new(0),
+    spec_rounds: AtomicU64::new(0),
+    spec_accepted: AtomicU64::new(0),
 };
 pub struct Sched {
     pub jobs: AtomicU64,
@@ -630,6 +636,9 @@ pub struct Sched {
     pub ms_decode: AtomicU64,
     pub chunks_prefill: AtomicU64,
     pub ms_prefill: AtomicU64,
+    /// plans/115 D2 계측 — 스펙 라운드 수/수용 토큰 수(수용률 = acc/rounds).
+    pub spec_rounds: AtomicU64,
+    pub spec_accepted: AtomicU64,
 }
 impl Sched {
     pub fn summary(&self) -> String {
@@ -640,8 +649,10 @@ impl Sched {
         let md = self.ms_decode.load(Ordering::Relaxed);
         let cp = self.chunks_prefill.load(Ordering::Relaxed);
         let mp = self.ms_prefill.load(Ordering::Relaxed);
+        let sr = self.spec_rounds.load(Ordering::Relaxed);
+        let sa = self.spec_accepted.load(Ordering::Relaxed);
         format!(
-            "[sched] jobs {jobs} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms",
+            "[sched] jobs {jobs} | queue-wait avg {:.0}ms | prefix-reuse {px}tok | decode {td}x avg {:.1}ms | prefill {cp}x avg {:.1}ms | spec {sr}r acc {sa} ({:.2}/r)",
             if jobs > 0 {
                 qw as f64 / jobs as f64 / 1e3
             } else {
@@ -649,6 +660,7 @@ impl Sched {
             },
             if td > 0 { md as f64 / td as f64 } else { 0.0 },
             if cp > 0 { mp as f64 / cp as f64 } else { 0.0 },
+            if sr > 0 { sa as f64 / sr as f64 } else { 0.0 },
         )
     }
 }
@@ -869,21 +881,24 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
                                 let next = slots[i].next;
                                 let cap = slots[i].job.as_ref().unwrap().n_predict;
-                                // 드래프터 체인(plans/115 P12): 서픽스(비용 0) 우선 —
-                                // 제안 없으면 MTP, 그마저 없으면 plain greedy.
+                                // 드래프터 체인(plans/115 P12+D2): 서픽스(비용 0)
+                                // 단독 — 제안 없으면 plain greedy. 콜드 MTP 폴백은
+                                // 드래프트 KV가 없어 기각 일변(검증 낭비)이라 삭제.
                                 let drafts = llm170_core::qwen4exp::layers::Engine4::suffix_drafts(
                                     &slots[i].tokens,
                                     k,
                                 );
                                 let round = if !drafts.is_empty() {
                                     e.suffix_spec_step(i, next, &drafts)
-                                } else if e.model.has_mtp() {
-                                    e.mtp_spec_step(i, next, k)
                                 } else {
                                     e.decode1_greedy(i, next).map(|t| (vec![t], 1))
                                 };
                                 match round {
                                     Ok((acc, _fwd)) => {
+                                        SCHED.spec_rounds.fetch_add(1, Ordering::Relaxed);
+                                        SCHED
+                                            .spec_accepted
+                                            .fetch_add(acc.len() as u64, Ordering::Relaxed);
                                         for &t in &acc {
                                             if slots[i].generated as usize >= cap {
                                                 break;
@@ -1005,9 +1020,14 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                         .min(slots[i].job.as_ref().unwrap().tokens.len());
                     let part: Vec<u32> =
                         slots[i].job.as_ref().unwrap().tokens[slots[i].prefilled..end].to_vec();
-                    // P15⑥: 마지막 프리필 청크 판정 — 드래프트 프리필은 이
-                    // 청크의 h 행(last_res_hc_rows)만 유효라 여기서만 적립.
-                    let part_is_last = end == slots[i].job.as_ref().unwrap().tokens.len();
+                    // plans/115 D2: 잡 첫 청크 — h행 세션 리셋. last_res_hc_rows
+                    // 는 청크마다 extend라 리셋 없으면 잡을 넘어 무한 증가한다
+                    // (종전엔 드래프트 프리필 len 검사 파탄의 원인이기도 했다).
+                    if slots[i].prefilled == slots[i].pf_base
+                        && let Engine::Q4(e) = &mut eng
+                    {
+                        e.hrows_reset(i);
+                    }
                     // 샘플링 슬롯은 로짓 판(마지막 청크만 판정에 사용) — Q4도
                     // prefill_greedy 대신 prefill. greedy는 종전 최적 경로.
                     let samp = slots[i].sampler.as_ref().is_some_and(|s| !s.is_greedy());
@@ -1030,17 +1050,12 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             } else {
                                 e.prefill_greedy(i, &part).map_err(|e| e.to_string())
                             };
-                            // P15⑥: 마지막 프리필 청크 직후 드래프트 프리필 —
-                            // 값경로만 h 행을 생산(GPU frame은 ④c). 멀티청크는
-                            // 마지막 청크 행만 유효 → 그 청크분만 적립.
-                            if part_is_last
-                                && e.model.has_mtp()
-                                && let Err(err) = e.mtp_draft_prefill(i, &part)
-                            {
-                                // 멀티청크 행 불일치 등: 드래프트 프리필
-                                // 생략은 품질 저하일 뿐 정확성 무영향.
-                                eprintln!("# mtp prefill 생략({err})");
-                            }
+                            // plans/115 D2 측정(원장 141): serve에서 MTP 드래프트
+                            // 프리필 재생([pf_base..)×~4ms/토큰)은 수용 이득 0 —
+                            // 반복·패턴 수용은 서픽스 드래프터(P12, 비용 0)가
+                            // 전부 담당, 비반복엔 MTP도 1.0-1.22(원장 128)이라
+                            // 재생비용이 항상 우세한다. 재생 삭제 — MTP는 infer
+                            // 단일스트림(측정 승리) 전용.
                             r
                         }
                     };
@@ -1199,6 +1214,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         sampler: sampler_new,
         err_count: 0,
         failed: None,
+        pf_base: reuse,
     };
 }
 fn slot_emit(s: &mut Slot, t: u32) {
