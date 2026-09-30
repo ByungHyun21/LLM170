@@ -65,6 +65,8 @@ pub(super) fn ensure_np_views(
         qsa_attn: mk(acc, f.qsa_attn, arow)?,
         mix: mk(acc, f.mix, n)?,
         mout: mk(acc, f.mout, n)?,
+        ple_key: mk(acc, f.ple_key, hc * n)?,
+        ple_value: mk(acc, f.ple_value, n)?,
     };
     f.np_views = Some(Box::new(v));
     Ok(())
@@ -491,7 +493,13 @@ pub(super) fn frame_forward_np_ex(
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
     for il in 0..hp.n_layer {
-        // 1) PLE — per-seq t=1 디바이스 경로(행 뷰)
+        // 1) PLE — 배치 gather·투영 + 행별 math (plans/115 P0-4)
+        //
+        // 종전 per-row 루프(호스트 mmap gather+h2d+투영 1행 × t행)는 np4 스텝에
+        // ~87ms(48층 × 행 직렬, 26.8GiB mmap 페이지폴트 포함)를 냈다 — np4
+        // 24-27 t/s의 주된 갭. gather(ple_gather_dev 블록 캐시)·투영(mm_group
+        // t행)은 행별 독립이라 배치해도 산술 불변; math(디바이스 링 체인)만
+        // 행별 t=1을 유지한다. t=1 디코드(forward.rs)·프리필과 동일 구조.
         if hp.is_ple(il) {
             let heads = hp.ple_heads_per_ngram * 2;
             let emb_w = heads * hp.ple_head_dim;
@@ -502,19 +510,50 @@ pub(super) fn frame_forward_np_ex(
             let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
             let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
             let vv = f.np_views.as_ref().unwrap();
-            fs_begin(acc, 1); // per-seq 구간
-            for (row, &sq) in seqs.iter().enumerate() {
-                let mut emb = vec![0.0f32; emb_w];
-                if ple_rows[row].len() == heads {
-                    ctx.model.ple_gather(&ple_rows[row], &mut emb)?;
+            fs_begin(acc, t); // 배치 투영 구간
+            let all_valid = ple_rows.iter().all(|r| r.len() == heads);
+            if all_valid {
+                let flat: Vec<u32> = ple_rows.concat();
+                let gpu = (|| -> Result<(), Q4Error> {
+                    let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
+                    // SAFETY (107 W8): ple_table_view 계약 — tptr..tptr+tlen은 PLE
+                    // 테이블 mmap 유효 범위(읽기 전용, 동시 쓰기 없음).
+                    let tdata: &[u8] =
+                        unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
+                    acc.ple_gather_dev(tptr, tdata, &flat, f.ple_emb, thd)
+                        .map_err(Q4Error::Io)
+                })()
+                .is_ok();
+                if !gpu {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::PleGgpu);
+                    ONCE.call_once(|| eprintln!("# np-ple-ggpu: 실패 — 호스트 폴백"));
+                    let mut emb = vec![0.0f32; emb_w * t];
+                    for (row, r) in ple_rows.iter().enumerate() {
+                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                    }
+                    acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
+                }
+                acc.frame_mm_group(f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], t)
+                    .map_err(Q4Error::Io)?;
+            } else {
+                // 히스토리 미확정 행(시퀀스 초반) — 종전 의미론: 0행 투영 포함.
+                let mut emb = vec![0.0f32; emb_w * t];
+                for (row, r) in ple_rows.iter().enumerate() {
+                    if r.len() == heads {
+                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                    }
                 }
                 acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
-                acc.frame_mm_group(f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], 1)
+                acc.frame_mm_group(f.ple_emb, &[w_key, w_value], &[f.ple_key, f.ple_value], t)
                     .map_err(Q4Error::Io)?;
+            }
+            for (row, &sq) in seqs.iter().enumerate() {
+                fs_begin(acc, 1); // 행별 math 구간(링 체인)
                 acc.ple_math_dev(
                     vv.res_hc[row],
-                    f.ple_key,
-                    f.ple_value,
+                    vv.ple_key[row],
+                    vv.ple_value[row],
                     &nk,
                     &nq,
                     &nc,
