@@ -982,6 +982,12 @@ pub enum FrameOp {
 /// 프레임 상태 연산 — 상주 상태(kv/gdn/conv/blk)를 갱신하는 가속기 전용
 /// 메서드. 값 경로 Accelerator 메서드와 대응하되 입출력이 전부 핸들.
 pub trait FrameState {
+    /// plans/115 P1-3 — 상태 버퍼 D2D 복사 묶음(같은 크기 dst←src). 접두
+    /// 체크포인트 캡처/복원용 — 호스트 왕복(D2H+클론 ≈110ms) 대신 스트림
+    /// 순서 복사(수 ms). 실패 시 호출부는 캡처를 생략한다(재사용 불가뿐).
+    fn frame_copy_states(&self, _pairs: &[(u64, u64, usize)]) -> Result<(), String> {
+        Err("frame_copy_states: 미지원".into())
+    }
     /// 프레임 forward 시작 — 이번 스텝의 토큰 수. 프레임 버퍼는 t_max 크기로
     /// 잡히므로 "행 수 = 버퍼 길이/n" 유도가 t>1 청크에서 틀린다. op 커널이
     /// 토큰 수를 알아야 하는 지점(RmsRows/HcGateMean/NormGated/L2Rows/top-k/

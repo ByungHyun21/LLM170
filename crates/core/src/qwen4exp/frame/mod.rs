@@ -189,6 +189,12 @@ pub struct Frame4 {
     /// 할당 후 재사용. 기각 시 verify_snap_restore가 되돌린다.
     pub verify_snap_gdn: Vec<Vec<f32>>,
     pub verify_snap_conv: Vec<Vec<f32>>,
+    /// plans/115 P1-3: 접두 체크포인트 디바이스 링 — [seq] (gdn핸들[n_recr],
+    /// conv핸들[n_recr]). 지연 할당·영속(ADR-0014). 호스트 클론(≈110ms) 대신
+    /// D2D 캡처(수 ms). 메타데이터(pos·PLE·idx_bk)는 Engine4.ckpt가 든다.
+    pub ckpt_dev: Vec<Vec<(Vec<u64>, Vec<u64>)>>,
+    /// [seq] 재사용 가능한 링 슬롯 인덱스(restore가 돌려놓는다).
+    pub ckpt_free: Vec<Vec<usize>>,
 }
 
 fn alloc(acc: &dyn Accelerator, len: usize) -> Result<u64, Q4Error> {
@@ -333,6 +339,8 @@ impl Frame4 {
             conv_state_len: (hp.conv_k - 1) * conv_ch,
             verify_snap_gdn: Vec::new(),
             verify_snap_conv: Vec::new(),
+            ckpt_dev: vec![Vec::new(); seqs.len()],
+            ckpt_free: vec![Vec::new(); seqs.len()],
             t_max,
             st_gdn: Vec::with_capacity(seqs.len()),
             st_conv: Vec::with_capacity(seqs.len()),

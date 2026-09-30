@@ -971,6 +971,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 Ok(toks) => {
                                     for (k, &i) in pend.iter().enumerate() {
                                         slots[i].prefilled += per;
+                                        // plans/115 P1-3: 청크 경계 체크포인트 캡처.
+                                        if let Engine::Q4(e) = &mut eng {
+                                            e.ckpt_capture(i, slots[i].prefilled);
+                                        }
                                         let done = slots[i]
                                             .job
                                             .as_ref()
@@ -1058,6 +1062,10 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                 match logits {
                     Ok(t) => {
                         slots[i].prefilled = start;
+                        // plans/115 P1-3: 청크 경계 체크포인트 캡처.
+                        if let Engine::Q4(e) = &mut eng {
+                            e.ckpt_capture(i, start);
+                        }
                         if start == slots[i].job.as_ref().unwrap().tokens.len() {
                             slot_emit(&mut slots[i], t);
                         }
@@ -1127,9 +1135,45 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
             (i, if full { l } else { 0 })
         })
         .max_by_key(|&(_, l)| l);
-    let Some((i, reuse)) = pick else { return };
+    let Some((mut i, mut reuse)) = pick else {
+        return;
+    };
     if reuse == 0 {
-        eng.reset_seq(i);
+        // plans/115 P1-3: 부분 접두 재사용 — 캐시가 새 프롬프트의 **접두**이기만
+        // 하면(l < cached.len() 포함) 체크포인트(512 청크 경계)로 되감아 잔여를
+        // 재프리필한다. GDN 상태 = 체크포인트 CPU 클론(dirty 전사), QSA KV/idx
+        // 는 pos 인덱스 쓰기라 멱등 — 재프리필이 동일 행을 다시 쓴다.
+        if prefix_ok {
+            let mut best: Option<(usize, usize)> = None;
+            for i2 in 0..slots.len() {
+                if slots[i2].job.is_some() {
+                    continue;
+                }
+                let l = slots[i2]
+                    .cached
+                    .iter()
+                    .zip(j.tokens.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if l >= 512 && best.is_none_or(|(_, bl)| l > bl) {
+                    best = Some((i2, l));
+                }
+            }
+            if let Some((i2, l)) = best
+                && let Engine::Q4(e) = eng
+                && let Some(cp) = e.ckpt_restore_upto(i2, l)
+            {
+                SCHED.prefix_tokens.fetch_add(cp as u64, Ordering::Relaxed);
+                eprintln!(
+                    "# prefix-cache: slot{i2} partial reuse {l}토큰 (ckpt {cp}에서 재프리필)"
+                );
+                i = i2;
+                reuse = cp; // prefilled = cp — [cp..len) 재프리필(부분 접두 포함)
+            }
+        }
+        if reuse == 0 {
+            eng.reset_seq(i);
+        }
     } else {
         SCHED
             .prefix_tokens
