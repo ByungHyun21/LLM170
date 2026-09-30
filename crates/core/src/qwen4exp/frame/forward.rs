@@ -76,21 +76,21 @@ pub(crate) fn frame_forward_ex(
         // CPU 디퀀트는 측정 rep에서 콜드 54ms(GPU 유휴) — 커널은 수백 µs.
         let mut gpu_ok = false;
         if embd.ty == llm170_gguf::GgmlType::Q8_0 {
-            gpu_ok = acc
-                .emb_q8_gather_dev(
-                    embd.data.as_ptr() as usize,
-                    embd.data,
-                    tokens,
-                    f.res_hc,
-                    n,
-                    hc,
-                )
-                .map_err(Q4Error::Io)
-                .is_ok();
+            let r = acc.emb_q8_gather_dev(
+                embd.data.as_ptr() as usize,
+                embd.data,
+                tokens,
+                f.res_hc,
+                n,
+                hc,
+            );
+            gpu_ok = r.is_ok();
             if !gpu_ok {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::EmbQ8g);
-                ONCE.call_once(|| eprintln!("# emb-q8g: 실패 — CPU 폴백"));
+                // 진단: 폴백 원인 가시화(일회).
+                let why = r.err().map(|e| e.to_string()).unwrap_or_default();
+                ONCE.call_once(|| eprintln!("# emb-q8g: 실패 — CPU 폴백 ({why})"));
             }
         }
         if gpu_ok {
