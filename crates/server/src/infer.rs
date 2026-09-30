@@ -233,7 +233,7 @@ fn run_q4_infer(
                 // P15④: 드래프트 프리필 — 타깃 h 행 전체로 드래프트 KV 적립
                 // (스펙 의도일 때만; 값경로 last_h_rows 사용).
                 if k_spec > 0 && eng.model.has_mtp() {
-                    eng.mtp_draft_prefill(s, p).map_err(|e| e.to_string())?;
+                    eng.mtp_draft_prefill(s, p, 0).map_err(|e| e.to_string())?;
                 }
                 let t = llm170_core::qwen35::greedy(&l);
                 println!(

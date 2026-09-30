@@ -1027,7 +1027,12 @@ impl Engine4 {
     /// c_1..c_{T-1}을 (c_{i+1}, h_i) 쌍으로 드래프트 계층에 적립해 드래프트
     /// KV가 전체 문맥을 갖게 한다(빈 문맥 시작이 수용률 붕괴 원인 — 실측).
     /// last_h_rows는 직전 값경로 prefill의 h 행 전체.
-    pub fn mtp_draft_prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<(), Q4Error> {
+    pub fn mtp_draft_prefill(
+        &mut self,
+        seq: usize,
+        tokens: &[u32],
+        base_pos: usize,
+    ) -> Result<(), Q4Error> {
         if !self.model.has_mtp() || self.mtp_seqs.is_empty() {
             return Ok(());
         }
@@ -1043,7 +1048,9 @@ impl Engine4 {
         // **드래프트 KV 위치는 타깃 위치와 1:1**(vLLM "cell for cell") —
         // c_1은 pos 1에 적립(위치 0의 h_{-1}은 없음). 종전 pos 0 시작은
         // 로프 위치 전체를 1 어긋나게 했다(수용률 억제 원인, P15④).
-        self.mtp_seqs[seq].pos = 1;
+        // base_pos(P1-3): 접두 복원 잡은 [cp..)만 재생 — 드래프트 KV [0..cp)는
+        // 접두 불변이라 이미 유효(체크포인트가 pos만 되감았다).
+        self.mtp_seqs[seq].pos = (base_pos + 1) as u32;
         for i in 0..tokens.len().saturating_sub(1) {
             let x = tokens[i + 1];
             let hi = self.last_res_hc_rows[i].clone();
@@ -1053,6 +1060,18 @@ impl Engine4 {
         // 110 W5: 슬롯별 스펙 h 시드 — 첫 스펙 라운드의 h_prev(프리필 최종 h).
         self.spec_h_prev[seq] = self.last_res_hc.clone();
         Ok(())
+    }
+
+    /// plans/115 D2: 잡 h행 세션 시작 — 슬롯 프리필 첫 청크 직전 호출.
+    /// 잔존 행(이전 잡/스펙 라운드)이 mtp_draft_prefill의 len 검사를
+    /// 깨고 드래프트 프리필을 영구 생략시켰다(수용률 붕괴).
+    pub fn hrows_reset(&mut self, seq: usize) {
+        self.last_res_hc_rows.clear();
+        self.last_res_hc.clear();
+        if let Some(f) = &mut self.frame {
+            f.last_res_hc_rows.clear();
+        }
+        let _ = seq; // 현재 엔진 전역 행 — 슬롯 인자는 계약 문서화용
     }
 
     /// MTP 드래프트 스텝(vLLM qwen4_exp mtp.py 준거, plans/109 P15④).
@@ -1747,15 +1766,11 @@ impl Engine4 {
         f.last_res_hc_rows = Vec::new(); // MTP h 행 — 새 프리필이 재적립
         self.spec_h_prev[seq] = Vec::new();
         self.last_res_hc_rows = Vec::new();
-        // 드래프트 KV는 체크포인트 없음 — 초기화해 오염된 제안이 나오지 않게
-        // 한다(검증이 권위라 토큰 영향은 없다. mtp_draft_prefill이 재구축).
+        // 드래프트 KV는 pos 인덱스 쓰기·접두 불변 — [0..cp)가 그대로 유효하므로
+        // pos만 되감는다(신규 초기화보다 낫다: 문맥 보존 → 수용률 유지).
+        // [cp..]의 재생은 mtp_draft_prefill(base_pos=cp)이 맡는다.
         if self.model.has_mtp() && !self.mtp_seqs.is_empty() {
-            let ctx = self.seqs[seq]
-                .kv_k
-                .first()
-                .map(|k| k.len() / (self.model.hp.n_kv * self.model.hp.head_dim))
-                .unwrap_or(4096);
-            self.mtp_seqs[seq] = SeqState4::new(&self.model.hp, ctx);
+            self.mtp_seqs[seq].pos = ck.pos;
         }
         let st = &mut self.seqs[seq];
         st.pos = ck.pos;
@@ -1869,6 +1884,10 @@ impl Engine4 {
                     if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
                         self.last_res_hc_rows
                             .extend(f.last_res_hc_rows.iter().cloned());
+                        // plans/115 D2: 호출 간 이중 적립 방지 — f.rows는 이미
+                        // self에 적립됐다. 남기면 다음 호출의 pre-extend가 같은
+                        // 행을 두 번 쌓아 mtp_draft_prefill len 검사를 영구 깬다.
+                        f.last_res_hc_rows.clear();
                     }
                     last = Some(logits);
                 }
