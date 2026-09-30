@@ -129,9 +129,9 @@ const FRAME_T_MAX: usize = 512;
 /// `LLM170_FRAME_TMAX`로 올릴 수 있다(대형 VRAM 기기: 전문가당 행 수가 늘어
 /// MoE 가중치 재사용이 좋아진다).
 fn frame_t_max_cap(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
-    if let Some(v) = std::env::var("LLM170_FRAME_TMAX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    // QA-5(plans/114): 핫패스 env는 flag 스냅샷 판독(원장 104 계약).
+    if let Some(v) =
+        llm170_diag::flag::val("LLM170_FRAME_TMAX").and_then(|v| v.parse::<usize>().ok())
     {
         return v.clamp(16, 4096);
     }
@@ -150,8 +150,7 @@ fn frame_t_max_cap(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
 fn frame_t_max(acc: Option<&dyn crate::matmul::Accelerator>) -> usize {
     let cap = frame_t_max_cap(acc);
     // 기본값 = 적응형 상한(env는 "요청"이고 상한이 최종 결정 — VRAM이 작으면 내려간다).
-    std::env::var("LLM170_Q4_CHUNK")
-        .ok()
+    llm170_diag::flag::val("LLM170_Q4_CHUNK")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(cap)
         .clamp(16, 4096)
@@ -255,7 +254,7 @@ impl Engine4 {
         }
         // ── plans/110 W2: 프레임 경로 — 배치 검증(1회 t=k-1 포워드) ──
         // 실패 시 fb 카운터 + 순차(값경로) 폴백.
-        if std::env::var_os("LLM170_SPEC_NOBATCH").is_none() && k >= 2 {
+        if !llm170_diag::flag::on("LLM170_SPEC_NOBATCH") && k >= 2 {
             match self.mtp_spec_step_frame(seq, last_token, k) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -1365,8 +1364,7 @@ impl Engine4 {
     pub fn prefill(&mut self, seq: usize, tokens: &[u32]) -> Result<Vec<f32>, Q4Error> {
         // LLM170_Q4_CHUNK: 프리필 청크 토큰 수 (기본 1024; 프레임 경로는 t_max 상한).
         let cap0 = frame_t_max_cap(self.acc.as_deref());
-        let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
-            .ok()
+        let chunk: usize = llm170_diag::flag::val("LLM170_Q4_CHUNK")
             .and_then(|v| v.parse().ok())
             .unwrap_or(cap0)
             .clamp(16, 4096); // 상한은 frame_t_max_cap이 결정(적응형)
@@ -1482,8 +1480,7 @@ impl Engine4 {
             return Ok(crate::qwen35::greedy(&l));
         }
         let cap0 = frame_t_max_cap(self.acc.as_deref());
-        let chunk: usize = std::env::var("LLM170_Q4_CHUNK")
-            .ok()
+        let chunk: usize = llm170_diag::flag::val("LLM170_Q4_CHUNK")
             .and_then(|v| v.parse().ok())
             .unwrap_or(cap0)
             .clamp(16, 4096)
@@ -1698,12 +1695,8 @@ impl Engine4 {
             }
             return Ok(out);
         }
-        let frame_on = self.acc.is_some()
-            && !self.frame_broken
-            && std::env::var_os("LLM170_FRAME").is_some_and(|v| v != "0")
-            && std::env::var("LLM170_FRAME_DECODE")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        // QA-5: 매 배치 호출 직독 → frame_env_on(OnceLock 캐시) 재사용.
+        let frame_on = self.acc.is_some() && !self.frame_broken && frame_env_on(true);
         if !frame_on {
             let lg = self.decode_batch(seqs, tokens)?;
             return Ok(lg.iter().map(|l| crate::qwen35::greedy(l)).collect());
@@ -1943,7 +1936,7 @@ impl Engine4 {
     /// 선적재 — 해시는 과거 토큰만의 함수라 오차 없는 선(先)적재 (05 §3).
     /// LLM170_PLE_PREFETCH=1 게이트. np 디코드: 마지막 활성 시퀀스만.
     fn spawn_ple_prefetch(&mut self, seq: usize, logits: &[f32]) {
-        if std::env::var_os("LLM170_PLE_PREFETCH").is_none()
+        if !llm170_diag::flag::on("LLM170_PLE_PREFETCH")
             || !self.model.hp.is_ple(1)
             || logits.is_empty()
         {

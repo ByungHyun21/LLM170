@@ -81,6 +81,19 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
         }
     };
     let n_img = images.len();
+    // QA-13: Vit tmax는 전체 이미지 최댓값으로 — 종전 첫 이미지 기준 고정으로
+    // 이후 큰 이미지가 "해상도 초과" Err → CPU 폴백(수 배 느림)이었다. 이미지
+    // 목록은 루프 전에 전부 알 수 있다(차원 프로브는 메타 판독뿐 — 저렴).
+    let tmax_max = images
+        .iter()
+        .filter_map(|p| image::image_dimensions(p).ok())
+        .map(|(w, h)| {
+            let (tw, th) =
+                llm170_core::clip_preproc::smart_resize(w as i64, h as i64, 16, 2, 8, 4096);
+            (tw as usize / 16) * (th as usize / 16)
+        })
+        .max()
+        .unwrap_or(0);
     let mut all_vis: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_img);
     let mut vit_cache: Option<(
         std::sync::Arc<llm170_backend_gpu::rawhip::RawCtx>,
@@ -133,10 +146,13 @@ pub fn cmd_vl(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
                         n_ff,
                         n_blk,
                         eps,
-                        tmax,
+                        tmax_max,
                     )?;
-                    eprintln!("# vit weights+upload {:.1}s", tw0.elapsed().as_secs_f64());
-                    vit_cache = Some((ctx, std::sync::Arc::new(vit), tmax));
+                    eprintln!(
+                        "# vit weights+upload {:.1}s (tmax={tmax_max})",
+                        tw0.elapsed().as_secs_f64()
+                    );
+                    vit_cache = Some((ctx, std::sync::Arc::new(vit), tmax_max));
                 }
                 let (_, vit, tmax0) = vit_cache.as_ref().unwrap();
                 if tmax > *tmax0 {
