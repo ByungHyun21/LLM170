@@ -536,34 +536,68 @@ impl Engine4 {
             }
             // PLE 링: CPU snap_t.ple_conv가 정합 — 이후 첫 PLE 디바이스 스텝이
             // pos 기반 워터마크 되감기로 호스트 링을 리프레시한다(백엔드 계약).
+            //
+            // plans/115 P0-1(Strata commit-replay 1단계): 수용분 재실행을 종전
+            // m× 순차 decode1(스텝당 ~55ms×m — 기각 라운드의 지배 비용)에서
+            // **배치 verify 1회**로. t=k-1 검증 배치는 순차 decode1과 완전
+            // 등가(43/43, 원장 128) — 상태 전진과 y 모두 동일 산술이다.
+            {
+                let Engine4 {
+                    model,
+                    frame,
+                    seqs,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    return Err(Q4Error::Io("mtp-spec-frame: 프레임 없음".into()));
+                };
+                let ctx = crate::qwen4exp::stages::Ctx {
+                    model,
+                    acc: Some(a),
+                };
+                let win: Vec<u32> = proposals[..=n_acc].to_vec();
+                let ry = super::frame::frame_forward_verify(
+                    a,
+                    model,
+                    &ctx,
+                    seqs.as_mut_slice(),
+                    seq,
+                    f,
+                    &win,
+                )?;
+                forwards += 1;
+                if f.mtp_h_export && !f.last_res_hc_rows.is_empty() {
+                    self.last_res_hc_rows = f.last_res_hc_rows.clone();
+                    self.last_res_hc = f.last_res_hc_rows.last().cloned().unwrap_or_default();
+                }
+                // 진단(spec_check) — 재실행 ry[i]는 원 배치 y[i]와 일치해야 한다.
+                if shadow {
+                    let mm: Vec<String> = (0..=n_acc)
+                        .filter(|&i| ry[i] != y[i])
+                        .map(|i| format!("r[{i}]={} y={}", ry[i], y[i]))
+                        .collect();
+                    eprintln!(
+                        "# spec-reject pos={snap_pos} n_acc={} replay_mismatch {}{}",
+                        n_acc,
+                        mm.len(),
+                        if mm.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" first={}", mm[0])
+                        }
+                    );
+                }
+            }
+            self.seqs[seq].pos += (n_acc + 1) as u32;
+            // 드래프트 재체인 — 종전대로(수용 토큰별 mtp_draft_step_h).
             let _acc = self.acc.clone();
             let (_dl, _dh) = self.mtp_draft_step_h(seq, last_token, &h_prev, _acc.as_deref())?;
             let mut dh = h_after_first.clone();
-            let mut rply: Vec<u32> = Vec::with_capacity(n_acc + 1);
             for &p in &proposals[..=n_acc] {
-                let r = self.decode1_greedy(seq, p)?;
-                rply.push(r);
-                forwards += 1;
                 let _acc = self.acc.clone();
                 let (_dl, ndh) = self.mtp_draft_step_h(seq, p, &dh, _acc.as_deref())?;
                 dh = ndh;
-            }
-            // 진단(spec_check) — 재실행 r_i는 배치 y[i]와 비트 일치여야 한다.
-            if shadow {
-                let mm: Vec<String> = (0..=n_acc)
-                    .filter(|&i| rply[i] != y[i])
-                    .map(|i| format!("r[{i}]={} y={}", rply[i], y[i]))
-                    .collect();
-                eprintln!(
-                    "# spec-reject pos={snap_pos} n_acc={} replay_mismatch {}{}",
-                    n_acc,
-                    mm.len(),
-                    if mm.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" first={}", mm[0])
-                    }
-                );
             }
             accepted.extend_from_slice(&proposals[1..=n_acc]);
             accepted.push(y[n_acc]);
