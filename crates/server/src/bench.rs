@@ -360,6 +360,54 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
             "np{np_slots}-tg{tg}{dev} | {ms:8.1} ms | {:7.2} t/s aggregate ({n_tok} tok, {tg} steps)",
             n_tok as f64 / (ms / 1e3)
         ));
+        // 사용자 지시(README FN 모드 행): spec+np 결합 셀 — q35판(QA-15 수리)
+        // 과 동일 프로토콜. 위 np 측정이 상태를 소진했으므로 재프리필 후
+        // 슬롯별 자기 greedy로 시드, 라운드마다 mtp_spec_step_multi(배치 검증).
+        if has_mtp {
+            let mut seeds: Vec<u32> = Vec::with_capacity(*np_slots);
+            eng.reset_states();
+            for s in 0..*np_slots {
+                let l = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
+                seeds.push(llm170_core::qwen35::greedy(&l));
+            }
+            let k = (*spec_k).clamp(1, 8);
+            // 멀티 라운드는 직전 라운드의 spec_h_prev 전제(라운드 시작 병합
+            // 계약, layers.rs mtp_spec_round_rest) — 서빙은 1라운드 순차
+            // 폴백이 채운다. 벤치도 각 슬롯 1스텝 웜(앵컵 밖)으로 동일하게.
+            for s2 in 0..*np_slots {
+                let _ = eng.mtp_spec_step(s2, seeds[s2], k);
+            }
+            let mut nexts = seeds;
+            let mut done = vec![0usize; *np_slots];
+            let mut total_gen = 0usize;
+            let t_sn = Instant::now();
+            while total_gen < tg * np_slots {
+                let active: Vec<usize> = (0..*np_slots).filter(|&s| done[s] < *tg).collect();
+                if active.is_empty() {
+                    break;
+                }
+                let ns: Vec<u32> = active.iter().map(|&s| nexts[s]).collect();
+                let (accs, fw_total) = eng
+                    .mtp_spec_step_multi(&active, &ns, k)
+                    .map_err(|e| e.to_string())?;
+                let _ = fw_total;
+                for (row, &s) in active.iter().enumerate() {
+                    for &t in &accs[row] {
+                        if done[s] >= *tg {
+                            break;
+                        }
+                        nexts[s] = t;
+                        done[s] += 1;
+                        total_gen += 1;
+                    }
+                }
+            }
+            let el = t_sn.elapsed().as_secs_f64() * 1e3;
+            lines.push(format!(
+                "np{np_slots}-tg{tg}{dev} spec{k} | {el:8.1} ms | {:7.2} t/s aggregate spec (gen {total_gen})",
+                total_gen as f64 / (el / 1e3)
+            ));
+        }
     }
     Ok(lines)
 }
