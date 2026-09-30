@@ -56,7 +56,7 @@ pub struct NpViews {
     pub mout: Vec<u64>,     // [row][n_embd] — MoE 출력(가중합 목적지)
     /// plans/115 P0-4: PLE 배치 투영(mm_group t행) 후 행별 ple_math_dev가 읽는
     /// key/value 행 뷰 — 종전 per-row 투영(gather→h2d→mm_group 1행 × t) 대체.
-    pub ple_key: Vec<u64>,   // [row][hc·n]
+    pub ple_key: Vec<u64>, // [row][hc·n]
     pub ple_value: Vec<u64>, // [row][n]
 }
 

@@ -530,7 +530,8 @@ pub(super) fn frame_forward_np_ex(
                     ONCE.call_once(|| eprintln!("# np-ple-ggpu: 실패 — 호스트 폴백"));
                     let mut emb = vec![0.0f32; emb_w * t];
                     for (row, r) in ple_rows.iter().enumerate() {
-                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                        ctx.model
+                            .ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
                     }
                     acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
                 }
@@ -541,7 +542,8 @@ pub(super) fn frame_forward_np_ex(
                 let mut emb = vec![0.0f32; emb_w * t];
                 for (row, r) in ple_rows.iter().enumerate() {
                     if r.len() == heads {
-                        ctx.model.ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
+                        ctx.model
+                            .ple_gather(r, &mut emb[row * emb_w..(row + 1) * emb_w])?;
                     }
                 }
                 acc.frame_write(f.ple_emb, &emb).map_err(Q4Error::Io)?;
