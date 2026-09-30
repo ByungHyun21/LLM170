@@ -231,7 +231,7 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
     // 프리필·스펙 스텝도 예열.
     {
         let _ = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
-        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt) {
+        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt, 0) {
             // 엔진 슬롯 루프와 동일 계약 — 값경로 h행 전제라 프레임 프리필에선
             // Err이 날 수 있고 생략은 품질 저하일 뿐 정확성 무영향(프레임 스펙
             // 경로는 자립).
@@ -253,7 +253,7 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
         let t0 = Instant::now();
         let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
-        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt) {
+        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt, 0) {
             eprintln!("# mtp prefill 생략({err})");
         }
         let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
