@@ -994,6 +994,16 @@ pub trait FrameState {
     /// 가중합/split3)이 이 값을 쓴다.
     fn frame_begin(&self, _t: usize) {}
 
+    /// plans/115 P5: np 디코드 스텝 시작 — frame_begin에 np 경로 표식을
+    /// 얹는다(백엔드의 GEMM 패밀리 핀·MoE 경로 분기용). 기본은 위임.
+    fn frame_begin_np(&self, t: usize) {
+        self.frame_begin(t);
+    }
+
+    /// plans/115 P5: np 스텝 종료 — 표식 해제. frame_begin_np과 쌍으로
+    /// 호출된다(가드 Drop 포함). 기본 no-op.
+    fn frame_end_np(&self) {}
+
     /// 컨텍스트 길이 주입 — 가속기가 KV 등 **상한이 정해진 풀을 선할당**하는 데 쓴다
     /// (llama.cpp/vLLM처럼 "한 번 잡고 그 안에서만"). 기본은 무시.
     fn set_ctx_len(&self, _n: usize) {}

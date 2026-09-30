@@ -99,6 +99,8 @@ pub struct Q4Acc {
     fpart: std::sync::Mutex<GBuf>,
     /// 현재 프레임 스텝의 토큰 수 (frame_begin).
     cur_t: std::sync::atomic::AtomicUsize,
+    /// plans/115 P5 — np 디코드 스텝 표식(MoE 그룹화 디바이스 경로 확장 판별).
+    np_mode: std::sync::atomic::AtomicBool,
     xf: std::sync::Mutex<GBuf>,
     xq: std::sync::Mutex<GBuf>,
     yf: std::sync::Mutex<GBuf>,
@@ -348,6 +350,7 @@ impl Q4Acc {
             fxq: std::sync::Mutex::new(GBuf::new("fxq")),
             fpart: std::sync::Mutex::new(GBuf::new("fpart")),
             cur_t: std::sync::atomic::AtomicUsize::new(1),
+            np_mode: std::sync::atomic::AtomicBool::new(false),
             xf: std::sync::Mutex::new(GBuf::new("xf")),
             xq: std::sync::Mutex::new(GBuf::new("xq")),
             yf: std::sync::Mutex::new(GBuf::new("yf")),
@@ -615,6 +618,10 @@ impl Q4Acc {
     }
 
     // ─── 프레임(활성화 상주) 지원 — plans/64 P1 ───
+
+    pub(super) fn np_mode(&self) -> bool {
+        self.np_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     fn t_cur(&self) -> usize {
         self.cur_t.load(std::sync::atomic::Ordering::Relaxed).max(1)

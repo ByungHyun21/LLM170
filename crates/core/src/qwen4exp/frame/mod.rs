@@ -659,3 +659,9 @@ fn fs_begin(acc: &dyn Accelerator, t: usize) {
     let fs: &dyn FrameState = acc;
     fs.frame_begin(t);
 }
+
+/// plans/115 P5 — np 디코드 스텝(경로 표식 포함).
+fn fs_begin_np(acc: &dyn Accelerator, t: usize) {
+    let fs: &dyn FrameState = acc;
+    fs.frame_begin_np(t);
+}
