@@ -343,6 +343,195 @@ impl Engine4 {
         Ok((accepted, forwards))
     }
 
+    /// plans/115 P12 (Strata P0-3 서픽스 드래프터): 히스토리 접미 n-gram
+    /// (길이 2..=8, 긴 것 우선)의 가장 최근 선행 출현 이후 k 토큰.
+    /// llama.cpp prompt-lookup과 동일 규칙 — 드래프트 비용 0.
+    pub fn suffix_drafts(hist: &[u32], k: usize) -> Vec<u32> {
+        let h = hist.len();
+        if h < 4 || k == 0 {
+            return Vec::new();
+        }
+        let max_n = 8.min(h - 1);
+        for n in (2..=max_n).rev() {
+            let suf = &hist[h - n..];
+            for start in (0..h - n).rev() {
+                if &hist[start..start + n] == suf {
+                    let out: Vec<u32> = hist[start + n..].iter().take(k).copied().collect();
+                    if !out.is_empty() {
+                        return out;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// plans/115 P12: 서픽스 제안 스펙 라운드 — 검증/수용/기각 재실행은
+    /// mtp_spec_step_frame과 동일 기계(배치 verify + 배치 재실행, 43/43 등가
+    /// 계약). 드래프트 헤드가 없다(MTP 무관 — 모델 공통). 제안이 비면 호출부가
+    /// MTP/plain으로 폴백한다(이 메서드는 제안 있는 경우만 담당).
+    pub fn suffix_spec_step(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize), Q4Error> {
+        if drafts.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        if !llm170_diag::flag::on("LLM170_SPEC_NOBATCH")
+            && self.frame_on(true)
+            && self.frame_ensure()
+        {
+            return self.suffix_spec_step_frame(seq, last_token, drafts);
+        }
+        // 프레임 경로 불가 — 순차 검증(값경로). 수용 접두 판정은 동일식.
+        let l = self.decode1(seq, last_token)?;
+        let t0 = crate::qwen35::greedy(&l);
+        let mut forwards = 1usize;
+        let proposals: Vec<u32> = std::iter::once(t0).chain(drafts.iter().copied()).collect();
+        let snap_t = self.seqs[seq].clone();
+        let mut tgt_out = Vec::new();
+        for &p in &proposals {
+            let li = self.decode1(seq, p)?;
+            forwards += 1;
+            tgt_out.push(crate::qwen35::greedy(&li));
+        }
+        let n_all = proposals.len() - 1;
+        let mut n_acc = n_all;
+        for i in 0..n_all {
+            if let Some(e) = proposals.get(i + 1)
+                && tgt_out[i] != *e
+            {
+                n_acc = i;
+                break;
+            }
+        }
+        let mut accepted = vec![t0];
+        if n_acc >= n_all {
+            accepted.extend_from_slice(&proposals[1..]);
+            accepted.push(*tgt_out.last().unwrap_or(&t0));
+        } else {
+            self.seqs[seq] = snap_t;
+            for &p in &proposals[..=n_acc] {
+                self.decode1(seq, p)?;
+                forwards += 1;
+            }
+            accepted.extend_from_slice(&proposals[1..=n_acc]);
+            accepted.push(tgt_out[n_acc]);
+        }
+        Ok((accepted, forwards))
+    }
+
+    /// 서픽스 스펙 프레임 판 — 배치 검증 + (기각 시) 배치 재실행.
+    fn suffix_spec_step_frame(
+        &mut self,
+        seq: usize,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<(Vec<u32>, usize), Q4Error> {
+        // ① 주기 시작 — last_token 디코드 1회(t0 산출·상태 전진).
+        let l = self.decode1(seq, last_token)?;
+        let t0 = crate::qwen35::greedy(&l);
+        let mut forwards = 1usize;
+        let proposals: Vec<u32> = std::iter::once(t0).chain(drafts.iter().copied()).collect();
+        let snap_t = self.seqs[seq].clone();
+        // ② 배치 검증 — 스냅샷 → t=len(proposals) 포워드 → 행별 argmax.
+        let y: Vec<u32>;
+        {
+            let Engine4 {
+                model,
+                frame,
+                seqs,
+                acc: acc_field,
+                ..
+            } = self;
+            let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                return Err(Q4Error::Io("suffix-spec: 프레임 없음".into()));
+            };
+            super::frame::verify_snap_capture(a, f, seq)?;
+            let ctx = crate::qwen4exp::stages::Ctx {
+                model,
+                acc: Some(a),
+            };
+            y = super::frame::frame_forward_verify(
+                a,
+                model,
+                &ctx,
+                seqs.as_mut_slice(),
+                seq,
+                f,
+                &proposals,
+            )?;
+        }
+        forwards += 1;
+        // ③ 수용 접두 판정 + 정착 — full은 배치 상태 그대로, 기각은 복원 후
+        // 배치 재실행(수용분 1회 포워드, 등가 계약).
+        let n_all = proposals.len() - 1;
+        let mut n_acc = n_all;
+        for i in 0..n_all {
+            if let Some(e) = proposals.get(i + 1)
+                && y[i] != *e
+            {
+                n_acc = i;
+                break;
+            }
+        }
+        let mut accepted = Vec::with_capacity(n_acc + 2);
+        accepted.push(t0);
+        if n_acc >= n_all {
+            accepted.extend_from_slice(&proposals[1..]);
+            accepted.push(*y.last().unwrap_or(&t0));
+            self.seqs[seq].pos += proposals.len() as u32;
+            Ok((accepted, forwards))
+        } else {
+            // 기각 — CPU 상태 복원 + GDN 스냅샷 복원 + 수용분 배치 재실행.
+            self.seqs[seq] = snap_t;
+            {
+                let Engine4 {
+                    frame,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    return Err(Q4Error::Io("suffix-spec: 프레임 없음".into()));
+                };
+                super::frame::verify_snap_restore(a, f, seq)?;
+            }
+            let win: Vec<u32> = proposals[..=n_acc].to_vec();
+            {
+                let Engine4 {
+                    model,
+                    frame,
+                    seqs,
+                    acc: acc_field,
+                    ..
+                } = self;
+                let (Some(f), Some(a)) = (frame.as_mut(), acc_field.as_deref()) else {
+                    return Err(Q4Error::Io("suffix-spec: 프레임 없음".into()));
+                };
+                let ctx = crate::qwen4exp::stages::Ctx {
+                    model,
+                    acc: Some(a),
+                };
+                super::frame::frame_forward_verify(
+                    a,
+                    model,
+                    &ctx,
+                    seqs.as_mut_slice(),
+                    seq,
+                    f,
+                    &win,
+                )?;
+            }
+            forwards += 1;
+            self.seqs[seq].pos += win.len() as u32;
+            accepted.extend_from_slice(&proposals[1..=n_acc]);
+            accepted.push(y[n_acc]);
+            Ok((accepted, forwards))
+        }
+    }
+
     /// MTP 스펙 스텝 프레임 판 (plans/110 W2) — 검증을 t=k-1 배치 포워드
     /// 1회로 통합(np 불변식: 배치 == 순차 decode1 비트 동일). 기각 시
     /// GDN 디바이스 상태 스냅샷 복원 + PLE 링 pos 되감기 + 수용분 재실행.

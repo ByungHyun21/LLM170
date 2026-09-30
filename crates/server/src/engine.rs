@@ -825,7 +825,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     } else {
                         Vec::new()
                     };
-                    if !spec_slots.is_empty() && e.model.has_mtp() {
+                    if !spec_slots.is_empty() {
+                        // plans/115 P12: --spec은 MTP 헤드 없이도 유효 — 서픽스 드래프터(비용 0).
                         // plans/110 W5(실험, LLM170_SPEC_MULTI=1): 다중 스펙
                         // 슬롯의 라운드 시작 decode1을 1회 np 배치로 병합. 잔여
                         // 과제: 동일 프롬프트 2슬롯 스트림이 서로 갈라진다(np
@@ -836,7 +837,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             .min()
                             .unwrap_or(1);
                         let mut done_multi = false;
-                        if llm170_diag::flag::on("LLM170_SPEC_MULTI")
+                        if e.model.has_mtp()
+                            && llm170_diag::flag::on("LLM170_SPEC_MULTI")
                             && spec_slots.len() >= 2
                             && kmin >= 2
                         {
@@ -867,7 +869,20 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                 let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
                                 let next = slots[i].next;
                                 let cap = slots[i].job.as_ref().unwrap().n_predict;
-                                match e.mtp_spec_step(i, next, k) {
+                                // 드래프터 체인(plans/115 P12): 서픽스(비용 0) 우선 —
+                                // 제안 없으면 MTP, 그마저 없으면 plain greedy.
+                                let drafts = llm170_core::qwen4exp::layers::Engine4::suffix_drafts(
+                                    &slots[i].tokens,
+                                    k,
+                                );
+                                let round = if !drafts.is_empty() {
+                                    e.suffix_spec_step(i, next, &drafts)
+                                } else if e.model.has_mtp() {
+                                    e.mtp_spec_step(i, next, k)
+                                } else {
+                                    e.decode1_greedy(i, next).map(|t| (vec![t], 1))
+                                };
+                                match round {
                                     Ok((acc, _fwd)) => {
                                         for &t in &acc {
                                             if slots[i].generated as usize >= cap {
