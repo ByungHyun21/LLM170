@@ -1738,3 +1738,50 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_f32_mt(
         if (lane == 0) out[(size_t)ti * n_out + o] = acc;
     }
 }
+
+// ─── token_embd(Q8_0) gather + hc 방송 (plans/111 W2) ───
+// vk fn_emb_q8g*.comp 의 hip 미러. 블록 산술은 CPU deq_q8_0(deq.rs)과 비트 동일:
+// y[j] = (int8 q) as f32 * bits_f16(d)(bits_f16 = half_to_f32 비트조립).
+// f16 출력은 __float2half_rn(RTE) — CPU f32_to_f16_bits·GLSL packHalf2x16과
+// 동일 반올림. 테이블은 백엔드가 mmap ptr 키로 1회 상주. 스레드=(ti, 블록 32원소).
+extern "C" __global__ void q4_emb_q8g(const unsigned* ids, const unsigned char* tbl,
+                                      float* out, int n, int t, int hc, int bpr) {
+    const int gid = (int)(blockIdx.x * blockDim.x) + (int)threadIdx.x;
+    if (gid >= t * bpr) return;
+    const int ti = gid / bpr, blk = gid % bpr;
+    const unsigned char* bp = tbl + ((size_t)ids[ti] * bpr + (size_t)blk) * 34;
+    const float d = bits_f16((unsigned)bp[0] | ((unsigned)bp[1] << 8));
+    const signed char* q = (const signed char*)(bp + 2);
+    float y[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) y[j] = (float)q[j] * d;
+    for (int s = 0; s < hc; s++) {
+        float* o = out + ((size_t)ti * hc + (size_t)s) * (size_t)n + (size_t)blk * 32;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) o[j] = y[j];
+    }
+}
+
+// f16 버스판(res_hc 쌍팩, plans/103) — blk 32정렬이라 (j,j+1) 쌍이 블록 내 머무름.
+extern "C" __global__ void q4_emb_q8g_f16(const unsigned* ids, const unsigned char* tbl,
+                                          unsigned* out, int n, int t, int hc, int bpr) {
+    const int gid = (int)(blockIdx.x * blockDim.x) + (int)threadIdx.x;
+    if (gid >= t * bpr) return;
+    const int ti = gid / bpr, blk = gid % bpr;
+    const unsigned char* bp = tbl + ((size_t)ids[ti] * bpr + (size_t)blk) * 34;
+    const float d = bits_f16((unsigned)bp[0] | ((unsigned)bp[1] << 8));
+    const signed char* q = (const signed char*)(bp + 2);
+    float y[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) y[j] = (float)q[j] * d;
+    for (int s = 0; s < hc; s++) {
+        // f32 원소 인덱스 → u32 쌍팩 워드 인덱스
+        unsigned* o = out + ((((size_t)ti * hc + (size_t)s) * (size_t)n + (size_t)blk * 32) >> 1);
+        #pragma unroll
+        for (int j = 0; j < 32; j += 2) {
+            const unsigned lo = (unsigned)__half_as_ushort(__float2half_rn(y[j]));
+            const unsigned hi = (unsigned)__half_as_ushort(__float2half_rn(y[j + 1]));
+            o[(unsigned)j >> 1] = lo | (hi << 16);
+        }
+    }
+}
