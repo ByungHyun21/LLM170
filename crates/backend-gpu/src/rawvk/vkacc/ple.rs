@@ -297,7 +297,9 @@ impl llm170_core::matmul::EwOps for VkAcc {
     }
 
     /// plans/93 — PLE 임베딩 gather GPU 오프로드(IQ4_NL 테이블).
-    /// CPU MT 59ms(t=512) → GPU ~0.3ms. 테이블은 wcache(283MB)로 1회 상주.
+    /// CPU MT 59ms(t=512) → GPU ~0.3ms. 테이블은 per_layer_token_embd
+    /// [160, 320M] = **26.8GiB**(원장 133 — 종전 "283MB" 주석은 오기)를
+    /// alloc_host로 1회 상주.
     #[allow(clippy::too_many_arguments)]
     fn ple_gather_dev(
         &self,
@@ -317,7 +319,37 @@ impl llm170_core::matmul::EwOps for VkAcc {
             if let Some(b) = c.get(&key) {
                 b.buf
             } else {
-                let b = ctx.alloc_host(table.len())?;
+                // QA-6(plans/114): 실패 음캐싱 — 종전엔 alloc_host 실패가 캐시되지
+                // 않아 매 PLE 호출마다 26.8GiB 할당 시도를 반복했다(fb 카운터만
+                // 오르는 재시도 스톰). 1회 실패 후엔 즉시 Err(호출부 CPU MT 폴백).
+                if self
+                    .ple_tbl_failed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err("ple_gather: 테이블 상주 실패(음캐싱) — CPU MT".into());
+                }
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    // --ple-table ssd 명시 시: vk 블록 캐시 미구현 가시화(무시 아님).
+                    let mode = crate::rawhip::q4acc::ple_table_mode_str();
+                    if mode == "ssd" {
+                        eprintln!(
+                            "# vk ple: --ple-table ssd는 미구현 — 전체 상주 시도(실패 시 CPU MT)"
+                        );
+                    }
+                });
+                let b = match ctx.alloc_host(table.len()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.ple_tbl_failed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        eprintln!(
+                            "# vk ple_gather: 테이블({:.1}GiB) 상주 실패 — 이후 CPU MT 폴백 ({e})",
+                            table.len() as f64 / (1u64 << 30) as f64
+                        );
+                        return Err(format!("ple_gather: table upload: {e}"));
+                    }
+                };
                 // SAFETY (107 W8): rows 테이블 업로드 — b는 rows.len()*4 바이트 alloc_host, 길이 일치.
                 unsafe { std::ptr::copy_nonoverlapping(table.as_ptr(), b.ptr, table.len()) };
                 let buf = b.buf;

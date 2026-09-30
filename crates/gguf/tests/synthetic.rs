@@ -138,3 +138,75 @@ fn type_table_matches_upstream() {
     assert_eq!(GgmlType::Q1_0.block_info(), (128, 18));
     assert!((GgmlType::Q4K.bits_per_weight() - 4.5).abs() < 1e-9);
 }
+
+/// QA-25(plans/114): n_kv 거대값 — 종전엔 Vec/HashSet with_capacity가
+/// capacity overflow 패닉(어보트). Result 경계에서 거부해야 한다.
+#[test]
+fn huge_nkv_rejected_without_panic() {
+    let p = tmp("huge_nkv.gguf");
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_u64(&mut b, 0); // n_tensors
+    push_u64(&mut b, u64::MAX); // n_kv — 24바이트 크래프트
+    let mut f = std::fs::File::create(&p).unwrap();
+    f.write_all(&b).unwrap();
+    let r = GgufFile::open(&p);
+    assert!(
+        matches!(
+            r,
+            Err(llm170_gguf::GgufError::LengthOverflow { what: "kv", .. })
+        ),
+        "{r:?}"
+    );
+}
+
+/// QA-26(plans/114): offset 랩어라운드 — end가 0으로 감겨 경계검증 우회.
+#[test]
+fn offset_wraparound_rejected() {
+    let p = tmp("offset_wrap.gguf");
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_u64(&mut b, 1); // n_tensors
+    push_u64(&mut b, 0); // n_kv
+    push_str(&mut b, "t");
+    push_u32(&mut b, 1); // n_dims
+    push_u64(&mut b, 32); // ne[0] — F32 128B
+    push_u32(&mut b, 0); // GGML_TYPE_F32
+    // data_offset+offset+nbytes == 2^64 → end가 0으로 랩되는 offset.
+    let data_offset = (b.len() as u64 + 8).div_ceil(32) * 32; // offset 필드 8B 포함
+    let offset = 0u64.wrapping_sub(data_offset + 128);
+    push_u64(&mut b, offset);
+    let mut f = std::fs::File::create(&p).unwrap();
+    f.write_all(&b).unwrap();
+    let r = GgufFile::open(&p);
+    assert!(
+        matches!(r, Err(llm170_gguf::GgufError::OffsetOverflow { .. })),
+        "{r:?}"
+    );
+}
+
+/// QA-31(plans/114): general.alignment u64→u32 절단 — 2^32+32가 32로 잘려
+/// 조용한 미정렬로 수용되던 결함. 범위 밖은 거부.
+#[test]
+fn alignment_over_u32_rejected() {
+    let p = tmp("align_over_u32.gguf");
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_u64(&mut b, 0); // n_tensors
+    push_u64(&mut b, 1); // n_kv
+    push_str(&mut b, "general.alignment");
+    push_u32(&mut b, 4); // U32가 아닌 U64로 넣는다 (as_u64 경로)
+    push_u32(&mut b, 0);
+    push_u32(&mut b, 0);
+    push_u64(&mut b, (1u64 << 32) + 32);
+    let mut f = std::fs::File::create(&p).unwrap();
+    f.write_all(&b).unwrap();
+    let r = GgufFile::open(&p);
+    assert!(
+        matches!(r, Err(llm170_gguf::GgufError::BadAlignment(_))),
+        "{r:?}"
+    );
+}

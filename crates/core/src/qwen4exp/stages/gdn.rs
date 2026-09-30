@@ -103,7 +103,7 @@ pub fn gdn_layer(
         // 커널 f32 스칼라·exp 미지원. 수치는 CPU 경로와 동일 순서(열 단위
         // 누산이므로 f32 반올림 수준만 차이).
         let mut gpu_done = false;
-        if std::env::var_os("LLM170_GDN_CPU").is_none()
+        if !llm170_diag::flag::on("LLM170_GDN_CPU")
             && let Some(acc) = ctx.acc
         {
             if t_len == 1 {

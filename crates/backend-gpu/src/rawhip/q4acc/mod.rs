@@ -193,6 +193,8 @@ unsafe impl Sync for Q4Acc {}
 /// 테이블(FN 28.8GB)은 RAM에 못 올리므로 접근된 블록만 상주(Engram급 공통).
 struct PleSsd {
     file: std::fs::File,
+    /// 파일 길이 — QA-7: 끝 미만 블록 판독 계산용(초기화 시 1회).
+    file_len: u64,
     /// 텐서 시작의 파일 오프셋(파트 내).
     base_off: u64,
     row_bytes: usize,

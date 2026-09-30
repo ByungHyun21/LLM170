@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 pub static READY: AtomicBool = AtomicBool::new(false);
+/// QA-11: slot_loop 스레드 사망(패닉) — 신규 요청을 "queue full" 오보 503 대신
+/// 명시적 사유로 거부하고 진행 중 요청의 채널 단절을 감지 가능하게.
+pub static ENGINE_DEAD: AtomicBool = AtomicBool::new(false);
 /// 서버 ctx 상한 — serve --ctx 값을 핸들러에 전달(107 W2: 종전
 /// LLM170_CTX env 기본 4096이 --ctx 8192 엔진과 불일치해 조용히 거절).
 pub static SERVER_CTX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -35,8 +38,6 @@ pub fn serve(
     slots_flag: Option<usize>,
     queue_flag: Option<usize>,
 ) -> Result<(), String> {
-    let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
-    eprintln!("# llm170-server listening on http://{addr}");
     let _ = SERVER_CTX.set(req.ctx);
     // 107 P0-9: 슬롯 수 소스 계통 가시화 — 플래그 > env > 기본 1.
     // 이전엔 env 기본 1이 조용히 직렬 서버를 만들었다(np4 10.5 t/s 정체).
@@ -62,7 +63,26 @@ pub fn serve(
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<SlotJob>(qcap);
     let eng = crate::engine::build_slots(req.clone(), backend, slots);
-    std::thread::spawn(move || crate::engine::slot_loop(eng, rx, slots));
+    // QA-11: 엔진 스레드 패닉 포착 — 종전엔 스레드가 죽어도 큐가 살아
+    // try_send 성공 → 요청이 영구 행업, 원인은 stderr 1회뿐이었다.
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::engine::slot_loop(eng, rx, slots)
+        }));
+        if r.is_err() {
+            eprintln!("FATAL: slot_loop 패닉 — 엔진 사망. /health 503, 신규 요청 거부.");
+            ENGINE_DEAD.store(true, Ordering::Release);
+            READY.store(false, Ordering::Release);
+        }
+    });
+    // QA-10: 바인딩은 적재 후 — 종전 역순(bind→적재)은 커널 백로그가 TCP만
+    // 받아주는 무응답 창을 만들었다(llama-server은 적재 완료 후 바인딩).
+    // READY 503("loading") 계약이 실제로 관측 가능해진다(워밍업 창).
+    let listener = match TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => return Err(e.to_string()),
+    };
+    eprintln!("# llm170-server listening on http://{addr}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let tx = tx.clone();
@@ -81,7 +101,13 @@ struct HttpReq {
     body: String,
 }
 
+/// QA-2: 요청 본문 상한 — Content-Length 무상한 vec![0; len]이 가상 메모리
+/// +16.8GB 점유(2026-09-30 실측) 후 read_exact 영구 블록. 프롬프트 JSON 여유.
+const MAX_BODY: usize = 64 << 20;
+
 fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
+    // QA-2: 읽기 타임아웃 — 헤더/바디 미완 송신(절단·slow-loris) 영구 블록 방지.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -105,6 +131,15 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
             len = v.trim().parse().unwrap_or(0);
         }
     }
+    if len > MAX_BODY {
+        // QA-2: 413 응답 후 절단 — 상한 초과 본문은 읽지도 않는다.
+        // (stream은 reader로 이동됐으므로 get_mut 재차용)
+        let _ = write!(
+            reader.get_mut(),
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return Err(format!("content-length {len} exceeds limit {MAX_BODY}"));
+    }
     let mut body = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut body).map_err(|e| e.to_string())?;
@@ -121,7 +156,9 @@ fn resp(stream: &mut TcpStream, code: u16, ct: &str, body: &str) {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large", // QA-8: 폴백 "OK"로 "413 OK"가 나가던 결함
         500 => "Internal Server Error",
+        503 => "Service Unavailable", // QA-8: 워밍업 /health가 "503 OK"였다
         _ => "OK",
     };
     let _ = write!(
@@ -387,7 +424,6 @@ fn enqueue_job(
     n_predict: usize,
     stops: Vec<u32>,
     sampler: Option<llm170_core::sampler::SamplerParams>,
-    stream_mode: bool,
 ) -> Result<
     (
         std::sync::mpsc::Receiver<TokOut>,
@@ -395,6 +431,16 @@ fn enqueue_job(
     ),
     (),
 > {
+    if ENGINE_DEAD.load(Ordering::Acquire) {
+        // QA-11: 엔진 스레드 사망 — "queue full" 오보 방지.
+        resp(
+            stream,
+            503,
+            "application/json",
+            "{\"error\":\"engine dead (slot loop panicked)\"}",
+        );
+        return Err(());
+    }
     let (otx, orx) = std::sync::mpsc::channel::<TokOut>();
     let (ptx, prx) = std::sync::mpsc::channel::<u32>();
     let job = SlotJob {
@@ -403,7 +449,10 @@ fn enqueue_job(
         spec_k: crate::engine::SPEC_K.get().copied().unwrap_or(0),
         sampler,
         stops,
-        progress: stream_mode.then_some(ptx),
+        // QA-3: 비스트림도 progress 채널 부여 — 핸들러가 prx를 잡고 폴링
+        // 대기하며 절단 시 drop → slot_emit 송신 실패 → cancelled(스트림과
+        // 동일 메커니즘). 종전 비스트림은 절단 감지 자체가 없었다.
+        progress: Some(ptx),
         out: otx,
         queued: std::time::Instant::now(),
     };
@@ -418,6 +467,25 @@ fn enqueue_job(
     }
     Ok((orx, prx))
 }
+/// QA-3: 비차단 peek로 클라이언트 절단 판정 — EOF(0) 또는 커널 접속 에러만
+/// 절단. 데이터 도착(파이프라인 후속 요청)은 생존으로 본다.
+fn peer_gone(stream: &mut TcpStream) -> bool {
+    let _ = stream.set_nonblocking(true);
+    let mut b = [0u8; 1];
+    let r = stream.peek(&mut b);
+    let _ = stream.set_nonblocking(false);
+    match r {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    }
+}
+
 fn run_and_emit(
     stream: &mut TcpStream,
     tx: std::sync::mpsc::SyncSender<SlotJob>,
@@ -445,14 +513,42 @@ fn run_and_emit(
         );
         return;
     }
-    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler, stream_mode)
-    else {
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, stops, sampler) else {
         return;
     };
     if !stream_mode {
+        // QA-3: 폴링 대기 — 절단 감지 시 prx가 이 스코프를 벗어나 drop 되고
+        // 다음 slot_emit부터 cancelled. 종전엔 n_predict 전량을 GPU에서 실행.
         let mut toks = Vec::new();
-        if let Ok(r) = orx.recv() {
-            toks = r.tokens;
+        let err: Option<String>;
+        loop {
+            match orx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(r) => {
+                    toks = r.tokens;
+                    err = r.error;
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if peer_gone(stream) {
+                        return; // 절단 — 응답 불필요, 잡 정리만
+                    }
+                }
+                // QA-9: 송신측 소멸(QA-1 수리 전 무한루프가 만들던 상황 등) —
+                // 빈 200 대신 명시적 오류.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    err = Some("engine result channel closed".into());
+                    break;
+                }
+            }
+        }
+        if let Some(e) = err {
+            resp(
+                stream,
+                500,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}", crate::json::esc(&e)),
+            );
+            return;
         }
         let mut det = crate::engine::Detok::new();
         let text: String = toks.iter().map(|&t| det.push(t)).collect();
@@ -496,15 +592,7 @@ fn run_and_emit_anthropic(
     stream_mode: bool,
     sampler: Option<llm170_core::sampler::SamplerParams>,
 ) {
-    let Ok((orx, prx)) = enqueue_job(
-        stream,
-        &tx,
-        ids,
-        n_predict,
-        vec![STOP_EOT],
-        sampler,
-        stream_mode,
-    ) else {
+    let Ok((orx, prx)) = enqueue_job(stream, &tx, ids, n_predict, vec![STOP_EOT], sampler) else {
         return;
     };
     if stream_mode {
@@ -534,9 +622,38 @@ fn run_and_emit_anthropic(
         sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
         return;
     }
+    // QA-3/9: run_and_emit 비스트림과 동일 — 폴링 대기로 절단 감지 + 에러 전파.
     let mut all = Vec::new();
-    while let Ok(r) = orx.recv() {
-        all.extend(r.tokens);
+    let err: Option<String>;
+    loop {
+        match orx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(r) => {
+                all.extend(r.tokens);
+                err = r.error;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if peer_gone(stream) {
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                err = Some("engine result channel closed".into());
+                break;
+            }
+        }
+    }
+    if let Some(e) = err {
+        resp(
+            stream,
+            500,
+            "application/json",
+            &format!(
+                "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{}\"}}}}",
+                crate::json::esc(&e)
+            ),
+        );
+        return;
     }
     let mut det = crate::engine::Detok::new();
     let text: String = all.iter().map(|&t| det.push(t)).collect();

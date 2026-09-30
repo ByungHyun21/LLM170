@@ -3447,3 +3447,44 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   프리페치(FreeToken 이중버퍼 참조), serve 비엔진 오버헤드 분해, t=2048 PLE
   디바이스 버퍼(~300MB) 재사용, 리소스 가드 마진(emb host 이전 후 0.5GB
   부족 — 재부팅 시 소멸 예상), W5(hipGraph)·W6(커널)·W7(MTP) 종전대로.
+
+### (134) QA 수리 캠페인 — plans/112 발견 31건 중 27건 수리 + 벤치 spec+np 진값 재측정 (plans/114, 2026-09-30)
+
+plans/112 QA 캠페인(plans/112)이 문서화한 결함군의 수리. 산술 비트경로
+무변경(charhash 15,674 전수 일치 — env 스냅샷 전환·가드 추가는 판정
+동치)을 원칙으로 했다.
+
+- **P0 측정 도구(QA-15/16/17/23/24)**: bench q35 spec+np 셀의 타이밍 앵커가
+  np 프리필 집계를 포함(t/s 대폭 과소) + `continue` 부재로 pp 중복행·
+  "0.00 t/s (fwd 0, gen 0)" 가짜행 → 앵커 분리+슬롯별 시드+continue.
+  재현 대차: tg16 spec4 np4 12153.5ms(가짜행 동반) → 8430.1ms(2행만).
+  bench q4 --spec은 가중치만 적재하고 순수 디코드를 측정하던 것(QA-16)을
+  실측 반영(fwd 18/gen 16). q35의 `--backend` 무시(GPU 부착 후 cpu 라벨,
+  bench·infer·serve 3곳) 게이트 수정. **benchmarks.md MTP+np4 진값
+  재측정: 6.5-6.8(무효) → 9.58 t/s(중앙×3, +44%)**.
+- **P1 파서·전파(QA-1/25/26/28)**: GGUF n_kv 무검증 capacity-overflow 패닉
+  → 상한 2^20 + offset 랩어라운드 경계우회 → checked_add(OffsetOverflow)
+  — 회귀테스트 2건. 슬롯 엔진 지속 실패가 매 틱 재시도하는 스피너 +
+  클라이언트 영구 대기였던 것을 연속 3회 실패 시 InferResult{error}
+  전파(500 응답)로. step_batch release t 가드(debug_assert은 소거).
+- **serve 가용성(QA-2/3/8/9/10/11/12)**: Content-Length 무상한(+16.8GB 가상
+  점유 실측) → 64MiB 상한+413+read timeout. 비스트림 절단 감지 부재(300토큰
+  GPU 잔류, 다음 요청 첫 토큰 25.1s) → progress 채널 폴백+논블록 peek로
+  **0.84s** 실측. 바인딩을 적재 후로(무응답 창구 제거), slot_loop 패닉
+  catch_unwind+ENGINE_DEAD, 빈 토크나이저 serve 기동 치명 오류.
+- **프로브 신뢰성(QA-19/20/21/22)**: 실패를 성공으로 바꾸던 6경로 전부
+  실패 전환 — chunk-check NaN 불감/길이 미검증, diag diff 발산 exit 0(실측
+  exit 1 확인), rawhip-check quant 실패 삼킴, mtp-draft 비유한, ckdiff 절단
+  잔여 무보고(실측 exit 1), watchdog-selftest 자가시험 실패 불가 구조(보고
+  카운터 관측값 신설 — 미기동 exit 1 확인), check 스킵 항목 정직 표기.
+- **자원·계약(QA-4/5/6/7/13/29/30/31)**: PleSsd 증발 힙 무한 성장 상한
+  재구축, 핫패스 직독 env 16사이트 flag:: 스냅샷(원장 104), vk ple 26.8GiB
+  재시도 스톰 음캐싱+"283MB" 오기 정정, ssd 끝 미만 블록 pread, vl Vit tmax
+  전체 이미지 최댓값, 샘플러 llama 정합(페널티 유니크 1회·temperature
+  필터 후 적용·last_n=0 비활성·temp≤0 결정적 argmax), GGUF alignment
+  u32 절단 제거·배열 선할당 상한.
+- **검증**: cargo test 전체 통과(gguf 7+2·core 14·backend-gpu 7·신규
+  회귀 4)·clippy/-D warnings 0·charhash hip 전수 일치·FN/27B 토큰 게이트
+  (배터리 결과 별도 기록)·serve 라이브 스모크(413·절단 0.84s·health).
+- **기각/인계**: QA-14(CLI 수치 파싱 전면 스윕)·QA-27(MTP 체인 오프바이어
+  — plans/111 4차 W7과 결부) 인계. split no/count 절단 등 P3 미세항 기각.

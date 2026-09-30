@@ -13,7 +13,15 @@ impl DecodeState {
             eprintln!("[xf] step_batch");
         }
         let t = emb.len() / self.n_embd;
-        debug_assert!(t >= 1 && t <= self.b_t_max);
+        // QA-28(plans/114): release 가드 — debug_assert은 release에서 소거돼
+        // LLM170_CHUNK≤128 환경의 512행 청크가 [t_max] 아레나에 OOB 기입했다.
+        // (인접 배치 경로 verify_batch_ms의 t>64→Err과 동일 계약)
+        if t < 1 || t > self.b_t_max {
+            return Err(format!(
+                "step_batch: t={t} outside arena bounds [1, {}] (b_t_max — LLM170_CHUNK 참조)",
+                self.b_t_max
+            ));
+        }
         // 프리필 패밀리 핀 (plans/84 A): 이 호출 전체에서 GEMM 커널 패밀리를
         // t 무관 large-t 패밀리로 고정 — 호출 분할(청크)에 무관한 비트 결과.
         // Drop 가드: 조기 return 포함 전 경로에서 해제.

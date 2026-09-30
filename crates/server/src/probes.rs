@@ -115,7 +115,9 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 };
                 match llm170_diag::fp_diff(pa, pb) {
                     Ok(r) if r.mismatch_count == 0 => Ok(format!("{r}")),
-                    Ok(r) => Ok(format!("{r}\nDIVERGENCE DETECTED")),
+                    // QA-20: 발산은 실패로 — 종전 Ok→exit 0이 스크립트 체인에서
+                    // 수치 발산을 성공으로 오판하게 했다(실패-성공 전환).
+                    Ok(r) => Err(format!("{r}\nDIVERGENCE DETECTED")),
                     Err(e) => Err(e),
                 }
             }
@@ -282,6 +284,14 @@ pub fn run(cmd: &str, args: &[String]) -> Option<ExitCode> {
                 let h = eng.last_h.clone();
                 let lg = eng.mtp_draft_step(0, t0, &h).map_err(|e| e.to_string())?;
                 let finite = lg.iter().all(|v| v.is_finite());
+                // QA-22: 로짓 NaN/Inf는 실패로 — 종전엔 finite=false를 출력에만
+                // 실어 보내고 exit 0이었다(이 프로브가 잡으려는 결함 클래스).
+                if !finite {
+                    return Err(format!(
+                        "mtp-draft-check: 로짓 비유한(NaN/Inf {}개)",
+                        lg.iter().filter(|v| !v.is_finite()).count()
+                    ));
+                }
                 let mut idx: Vec<usize> = (0..lg.len()).collect();
                 idx.sort_by(|&a, &b| lg[b].total_cmp(&lg[a]));
                 let top: Vec<String> = idx[..5]
@@ -551,13 +561,23 @@ fn cmd_chunk_check(args: &[String]) -> ExitCode {
     println!("reference: {} logits, argmax={ref_tok}", ref_l.len());
     let mut all_pass = true;
     for (sz, l) in &runs {
+        // QA-19: NaN 불감 수리 — fold(0.0, f32::max)는 NaN을 무시(반대편
+        // 반환)해 diff 전체가 NaN이어도 maxd=0 → "PASS bits-identical".
+        let bad_nan = l.iter().any(|v| v.is_nan()) || ref_l.iter().any(|v| v.is_nan());
         let maxd = l
             .iter()
             .zip(ref_l.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let tok = llm170_core::qwen35::greedy(l);
-        let (verdict, why) = if maxd == 0.0 {
+        let (verdict, why) = if bad_nan {
+            all_pass = false;
+            ("FAIL", "NaN in logits".to_string())
+        } else if l.len() != ref_l.len() {
+            // QA-19: 길이 불일치 — 종전엔 교집합 zip만 비교해 짧은 logits가 통과.
+            all_pass = false;
+            ("FAIL", format!("len {} != ref {}", l.len(), ref_l.len()))
+        } else if maxd == 0.0 {
             ("PASS", "bits-identical".to_string())
         } else if tok == ref_tok && maxd < 1e-3 {
             (
@@ -674,13 +694,19 @@ fn cmd_rawhip_check(args: &[String]) -> ExitCode {
                     }
                 }
             }
-            if qm == 0 {
-                println!("  ★ quant_q8 원시 ≡ CPU 비트 일치");
+            if qm > 0 {
+                // QA-21: 불일치는 실패로 — 종전엔 ✗ 출력 후 Ok로 넘어가 최종
+                // 통과 요약이 나갔다.
+                return Err(format!("quant_q8 미러 불일치 {qm}워드/비트"));
             }
+            println!("  ★ quant_q8 원시 ≡ CPU 비트 일치");
             Ok(())
         };
+        // QA-21: quant 검증 실패(에러·불일치)는 GEMV 검증 없이 실패 종료 —
+        // 종전엔 실패를 삼키고 CPU 패킹 폴백으로 GEMV만 검증한 뒤 통과 보고.
         if let Err(e) = inner() {
-            eprintln!("quant 검증: {e}");
+            eprintln!("quant 검증 실패: {e}");
+            return ExitCode::FAILURE;
         }
     }
     let mut qs_words = Vec::with_capacity(n_in / 4);
@@ -940,8 +966,11 @@ pub fn run_check(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    } else {
+        // QA-22: q35 모델은 ③이 미수행 — "전체 통과"로 속이지 않는다.
+        eprintln!("# ③ 청크 스모크: qwen4exp 전용 — 이 아키텍처는 스킵");
     }
-    eprintln!("# check 전체 통과");
+    eprintln!("# check 통과 (① 텐서 스캔 수행, ② 는 rawhip-check 별도, ③ 은 qwen4exp 한정)");
     ExitCode::SUCCESS
 }
 
@@ -1045,6 +1074,12 @@ fn cmd_vk_fault_probe() -> ExitCode {
 
 /// plans/87 §2 — 진동을 멈추고 와치독 보고를 기다린다(FAIL 모드면 137).
 fn cmd_watchdog_selftest() -> ExitCode {
+    // QA-22: 자가시험은 실패 가능해야 한다 — 종전엔 와치독 미기동·미보고
+    // 어느 쪽이든 SUCCESS 고정(자가시험 실패 불가 구조)이었다.
+    if !llm170_diag::watchdog::on() {
+        eprintln!("# watchdog-selftest: 와치독 미기동(LLM170_WATCHDOG 미설정?) — 시험 불가");
+        return ExitCode::FAILURE;
+    }
     let sec: u64 = std::env::var("LLM170_WATCHDOG")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1052,11 +1087,17 @@ fn cmd_watchdog_selftest() -> ExitCode {
     println!("# watchdog-selftest: {sec}s 무진동 후 보고 대기");
     llm170_diag::watchdog::record_op("selftest_stall");
     // 진행 없이 대기 — 와치독이 보고한다. FAIL 모드면 여기서 종료(137).
+    let before = llm170_diag::watchdog::reports();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(sec + 30);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    println!("# watchdog-selftest: 시간 종료 (보고 못 봄 — FAIL 아님)");
+    let n = llm170_diag::watchdog::reports() - before;
+    if n == 0 {
+        eprintln!("# watchdog-selftest: 보고 0건 — 와치독 스레드 미작동 의심 (FAIL)");
+        return ExitCode::FAILURE;
+    }
+    println!("# watchdog-selftest: 와치독 보고 {n}건 확인");
     ExitCode::SUCCESS
 }
 
@@ -1124,6 +1165,15 @@ fn cmd_ckdiff(a_path: &str, b_path: &str, rel_lim: f64) -> ExitCode {
             eprintln!("[ckdiff] B에만: {tb} t={ttb}");
             ib += 1;
         }
+    }
+    // QA-22: 한쪽 로그 절단(크래시 전형) 잔여 — 종전엔 공통 접두만 비교하고
+    // 꼬리 항목을 무보고 버려 "무상이" exit 0이었다.
+    let (tail_a, tail_b) = (a.len() - ia, b.len() - ib);
+    if tail_a + tail_b > 0 {
+        eprintln!(
+            "ckdiff: 짧은 쪽 종료 후 잔여 — A에만 {tail_a}·B에만 {tail_b}항 (한쪽 절단 의심)"
+        );
+        return ExitCode::FAILURE;
     }
     if diffs.is_empty() {
         println!(

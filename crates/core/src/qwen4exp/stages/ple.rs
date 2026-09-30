@@ -86,7 +86,7 @@ pub fn ple_block(
         });
     } else {
         emb = prefetched.unwrap();
-        if std::env::var_os("LLM170_PLE_VERIFY").is_some() {
+        if llm170_diag::flag::on("LLM170_PLE_VERIFY") {
             for (ti, r) in rows.chunks(heads).enumerate() {
                 let mut chk = vec![0.0f32; emb_w];
                 ctx.model.ple_gather(r, &mut chk)?;
@@ -249,7 +249,7 @@ pub fn ple_block(
 /// 진단(plans/80): ple_block 하위 스테이지 산출물 FNV 해시 — 청크 불변
 /// 결함의 하위 스테이지 특정용. `LLM170_PLE_DUMP=1`.
 fn ple_stage_hash(tag: &str, rows: &[Vec<f32>]) {
-    if std::env::var_os("LLM170_PLE_DUMP").is_none() {
+    if !llm170_diag::flag::on("LLM170_PLE_DUMP") {
         return;
     }
     let mut h = [0xcbf29ce484222325u64; 4];

@@ -107,8 +107,12 @@ pub(crate) fn cmd_infer(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             } else {
                 crate::engine::AttachPolicy::Warn
             };
-            eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
-                .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
+            // QA-17: backend 문자열 반영 — 종전 --backend cpu가 무시돼 GPU
+            // 부착 결과를 cpu로 취급했다(vl 패턴과 동일 계약).
+            if backend != "cpu" {
+                eng = crate::engine::attach_q35(eng, gpu_runtime == "vulkan", policy)
+                    .map_err(|e| format!("GPU 백엔드 주입 실패(REQUIRE_GPU): {e}"))?;
+            }
             let eos = 248044u32;
             // prefill (시퀀스별 — GDN chunked 경로)
             let mut last_logits = Vec::with_capacity(n);
@@ -241,6 +245,9 @@ fn run_q4_infer(
                 finished[s] = t == eos;
             }
             let mut pos: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            // QA-18: 시퀀스별 생성 총량 — 스펙 수용 토큰(≤k+1)을 검사 없이
+            // emit해 ≤(k+1)×n_predict 초과 생성하던 결함의 상한.
+            let mut gen_count: Vec<u32> = vec![0; n];
             let mut spec_stats = (0usize, 0usize); // (수용, forward)
             for _step in 0..n_predict {
                 let active: Vec<usize> = (0..n).filter(|&s| !finished[s]).collect();
@@ -257,7 +264,11 @@ fn run_q4_infer(
                     spec_stats.1 += fwd;
                     let mut stop = false;
                     for &t in &acc {
+                        if gen_count[s] >= n_predict as u32 {
+                            break;
+                        }
                         pos[s] += 1;
+                        gen_count[s] += 1;
                         println!(
                             "{{\"seq\":{s},\"pos\":{},\"token\":{t},\"text\":{}}}",
                             pos[s],

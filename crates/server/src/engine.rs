@@ -380,6 +380,9 @@ pub fn generate_q35(
 
 pub struct InferResult {
     pub tokens: Vec<u32>,
+    /// QA-1: 엔진 확정 실패 사유 — None이면 정상 종료. 종전엔 에러 필드가
+    /// 없어 실패 통보 경로 자체가 없었다(슬롯 스피너 + 클라이언트 영구 대기).
+    pub error: Option<String>,
 }
 
 /// serve --spec k 전역 (기본 0).
@@ -421,6 +424,10 @@ struct Slot {
     cached: Vec<u32>,
     /// 슬롯별 샘플러 (요청에서 생성, 토큰마다 상태 갱신).
     sampler: Option<llm170_core::sampler::Sampler>,
+    /// QA-1: 연속 엔진 실패 횟수 — 성공 emit 시 0으로 리셋.
+    err_count: u32,
+    /// QA-1: 연속 실패 상한(3) 도달 시 확정 실패 사유.
+    failed: Option<String>,
 }
 
 impl Slot {
@@ -435,7 +442,19 @@ impl Slot {
             cancelled: false,
             cached: Vec::new(),
             sampler: None,
+            err_count: 0,
+            failed: None,
         }
+    }
+}
+
+/// QA-1: 엔진 호출 실패 적립 — 연속 3회 실패 시 슬롯 확정 실패(에러 전파).
+/// 일회성 실패는 다음 틱 재시도(종전 동작), 지속 실패만 스피너에서 해방.
+fn slot_fail(s: &mut Slot, msg: String) {
+    s.err_count += 1;
+    if s.err_count >= 3 && s.failed.is_none() {
+        eprintln!("# slot 확정 실패(연속 {}회): {}", s.err_count, msg);
+        s.failed = Some(msg);
     }
 }
 
@@ -504,7 +523,12 @@ fn q4_plain_decode(
                     slot_emit(&mut slots[i], t);
                 }
             }
-            Err(err) => eprintln!("# batch 실패({err}) — 이번 회차 건너뜀"),
+            Err(err) => {
+                eprintln!("# batch 실패({err}) — 이번 회차 건너뜀");
+                for &i2 in active {
+                    slot_fail(&mut slots[i2], format!("decode_batch: {err}"));
+                }
+            }
         }
     } else if active.len() > 1 {
         let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
@@ -514,7 +538,12 @@ fn q4_plain_decode(
                     slot_emit(&mut slots[i], toks[row]);
                 }
             }
-            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
+            Err(err) => {
+                eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀");
+                for &i2 in active {
+                    slot_fail(&mut slots[i2], format!("decode_batch_greedy: {err}"));
+                }
+            }
         }
     } else {
         for &i in active {
@@ -524,12 +553,18 @@ fn q4_plain_decode(
                         let t = pick(&mut slots[i], &l);
                         slot_emit(&mut slots[i], t);
                     }
-                    Err(err) => eprintln!("# decode1 실패({err})"),
+                    Err(err) => {
+                        eprintln!("# decode1 실패({err})");
+                        slot_fail(&mut slots[i], format!("decode1: {err}"));
+                    }
                 }
             } else {
                 match e.decode1_greedy(i, slots[i].next) {
                     Ok(t) => slot_emit(&mut slots[i], t),
-                    Err(err) => eprintln!("# decode1g 실패({err})"),
+                    Err(err) => {
+                        eprintln!("# decode1g 실패({err})");
+                        slot_fail(&mut slots[i], format!("decode1_greedy: {err}"));
+                    }
                 }
             }
         }
@@ -550,7 +585,12 @@ fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[u
                     slot_emit(&mut slots[i], t);
                 }
             }
-            Err(err) => eprintln!("# decode 실패({err}) — 이번 회차 건너뜀"),
+            Err(err) => {
+                eprintln!("# decode 실패({err}) — 이번 회차 건너뜀");
+                for &i2 in seqs {
+                    slot_fail(&mut slots[i2], format!("decode: {err}"));
+                }
+            }
         }
     } else {
         match e.decode_np_greedy(seqs, &toks) {
@@ -559,7 +599,12 @@ fn q35_decode(e: &mut llm170_core::qwen35::Engine, slots: &mut [Slot], seqs: &[u
                     slot_emit(&mut slots[i], toks[row]);
                 }
             }
-            Err(err) => eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀"),
+            Err(err) => {
+                eprintln!("# np-greedy 실패({err}) — 이번 회차 건너뜀");
+                for &i2 in seqs {
+                    slot_fail(&mut slots[i2], format!("decode_np_greedy: {err}"));
+                }
+            }
         }
     }
 }
@@ -729,15 +774,21 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                             let k = slots[i].job.as_ref().unwrap().spec_k.clamp(1, 8);
                             let next = slots[i].next;
                             let cap = slots[i].job.as_ref().unwrap().n_predict;
-                            if let Ok((acc, _tf)) = e.spec_step(i, next, k) {
-                                for &t in &acc {
-                                    if slots[i].generated as usize >= cap {
-                                        break;
+                            match e.spec_step(i, next, k) {
+                                Ok((acc, _tf)) => {
+                                    for &t in &acc {
+                                        if slots[i].generated as usize >= cap {
+                                            break;
+                                        }
+                                        slot_emit(&mut slots[i], t);
+                                        if t == EOS {
+                                            break;
+                                        }
                                     }
-                                    slot_emit(&mut slots[i], t);
-                                    if t == EOS {
-                                        break;
-                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("# spec 실패({err})");
+                                    slot_fail(&mut slots[i], format!("spec_step: {err}"));
                                 }
                             }
                         }
@@ -824,6 +875,11 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                                         if let Ok(l) = e.decode1(i, next) {
                                             let t = llm170_core::qwen35::greedy(&l);
                                             slot_emit(&mut slots[i], t);
+                                        } else {
+                                            slot_fail(
+                                                &mut slots[i],
+                                                format!("mtp_spec+decode1: {err}"),
+                                            );
                                         }
                                     }
                                 }
@@ -975,11 +1031,16 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
                     (_pft.elapsed().as_secs_f64() * 1e3) as u64,
                     Ordering::Relaxed,
                 );
-                if let Ok(t) = logits {
-                    slots[i].prefilled = start;
-                    if start == slots[i].job.as_ref().unwrap().tokens.len() {
-                        slot_emit(&mut slots[i], t);
+                match logits {
+                    Ok(t) => {
+                        slots[i].prefilled = start;
+                        if start == slots[i].job.as_ref().unwrap().tokens.len() {
+                            slot_emit(&mut slots[i], t);
+                        }
                     }
+                    // QA-1: 프리필 실패 적립 — 종전엔 무시돼 prefilled가 영구
+                    // 갱신되지 않는 스피너였다(매 틱 동일 청크 재시도).
+                    Err(err) => slot_fail(&mut slots[i], format!("prefill: {err}")),
                 }
                 finish_slot(&mut slots[i], &mut eng, i, EOS);
             }
@@ -1068,12 +1129,15 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         cancelled: false,
         cached: prev,
         sampler: sampler_new,
+        err_count: 0,
+        failed: None,
     };
 }
 fn slot_emit(s: &mut Slot, t: u32) {
     s.next = t;
     s.tokens.push(t);
     s.generated += 1;
+    s.err_count = 0; // QA-1: 성공 — 연속 실패 카운터 리셋
     if let Some(sm) = &mut s.sampler {
         sm.push_tokens([t]);
     }
@@ -1087,6 +1151,21 @@ fn slot_emit(s: &mut Slot, t: u32) {
 }
 
 fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
+    // QA-1: 확정 실패 슬롯 — 에러 결과 전파 후 반환. 종전엔 토큰 방출이
+    // 없어 완료 조건이 영구 거짓 → 서버 수명 동안 재시도하는 스피너였다.
+    if let Some(err) = s.failed.take()
+        && s.job.is_some()
+    {
+        if let Some(j) = s.job.take() {
+            let _ = j.out.send(InferResult {
+                tokens: Vec::new(),
+                error: Some(err),
+            });
+        }
+        eng.reset_seq(i);
+        *s = Slot::free(); // 접두 캐시 폐기 — 엔진 시퀀스 상태 신뢰 불가
+        return;
+    }
     let done = s.job.as_ref().is_some_and(|j| {
         s.prefilled == j.tokens.len()
             && (s.cancelled
@@ -1103,6 +1182,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             toks.truncate(j.n_predict);
             let _ = j.out.send(InferResult {
                 tokens: toks.clone(),
+                error: None,
             });
             // 접두 캐시 — 상태 유지 (프롬프트+생성 = 구워진 열).
             // 스펙 carried가 남으면 GDN이 뒤처짐 — 트렁크 재실행으로 커밋.
@@ -1173,9 +1253,13 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             eng
         };
         // plans/29: --gpu-runtime vulkan 실제 반영.
+        // QA-17: --backend cpu는 부착 생략 — 종전 무조건 부착으로 라벨과
+        // 실제 백엔드가 어긋났다(q4 판 q4_gpu_wanted와 대칭 계약).
         let vulkan = matches!(&backend, BackendSel::GpuRuntime(r) if r == "vulkan");
-        eng = attach_q35(eng, vulkan, AttachPolicy::Warn)
-            .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+        if !matches!(&backend, BackendSel::Cpu) {
+            eng = attach_q35(eng, vulkan, AttachPolicy::Warn)
+                .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
+        }
         Engine::Q35(Box::new(eng))
     }
 }

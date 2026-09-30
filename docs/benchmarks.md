@@ -24,8 +24,11 @@ Session values are in the README tables (2026-09-18). Notables: 27B pp512
 ours 367-370 vs llama 340; FN all cells ahead (pp4096 275-278 vs 210,
 tg@16k 18.5 vs 13.9); 27B np4-tg engine batched 32.1 (supersedes the HTTP
 26.67 — the prior bench tool measured sequentially); MTP+np4 engine merged
-path 6.5-6.8 (pre-refactor main measures the same; the prior 20.4 HTTP
-figure is a different protocol/session).
+path **9.58 t/s** (2026-09-30 re-measure, `--pp 512 --tg 128 --spec 4
+--np 4 --reps 3` median, with the repaired spec+np timing anchor —
+plans/114 QA-15: the pre-fix 6.5-6.8 cells folded the np prefill
+aggregation into the tg timing and are void; the prior 20.4 HTTP figure is
+a different protocol/session).
 
 ### Tool fixes that made the CLI scorecard possible (2026-09-18, plans/79)
 

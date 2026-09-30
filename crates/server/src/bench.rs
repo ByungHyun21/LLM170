@@ -123,6 +123,10 @@ pub fn cmd_bench(args: &[String], ma: &crate::ModelArgs) -> ExitCode {
             let tok = crate::tokenize::Tokenizer::load(&model_path, None)
                 .unwrap_or_else(|e| panic!("토크나이저 로드 실패: {e}"));
             let mut ids = tok.encode(&txt);
+            // QA-23: 0토큰 인코딩 가드 — 빈 ids로 pp 패딩 루프가 무한 회전.
+            if ids.is_empty() {
+                return usage_err_bench("LLM170_BENCH_TEXT encoded to 0 tokens — refusing to pad");
+            }
             // pp 길이에 맞게 자르기/반복
             ids.truncate(pp);
             while ids.len() < pp {
@@ -214,11 +218,31 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         crate::engine::AttachPolicy::Strict,
     )?;
     let eos = eng.model.eos;
+    // QA-16: --spec 계약 — 스펙 의도면 측정도 스펙 경로로. 종전엔 MTP 가중치만
+    // 적재하고 tg 루프는 순수 decode1_greedy(스펙 아님)였다.
+    let has_mtp = *spec_k > 0 && eng.model.has_mtp();
+    let spec_desc = if has_mtp {
+        format!(" spec{spec_k}")
+    } else {
+        String::new()
+    };
     // 워밍업 1회 — 측정 형상과 동일하게(plans/79, llama-bench 정합).
+    // QA-24: 측정 판(decode1_greedy)과 동일 형상 + 스펙 의도면 드래프트
+    // 프리필·스펙 스텝도 예열.
     {
         let _ = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
-        let l = eng.decode1(0, 1u32).map_err(|e| e.to_string())?;
-        let _ = llm170_core::qwen35::greedy(&l);
+        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt) {
+            // 엔진 슬롯 루프와 동일 계약 — 값경로 h행 전제라 프레임 프리필에선
+            // Err이 날 수 있고 생략은 품질 저하일 뿐 정확성 무영향(프레임 스펙
+            // 경로는 자립).
+            eprintln!("# mtp prefill 생략({err})");
+        }
+        let warm_next = eng.decode1_greedy(0, 1u32).map_err(|e| e.to_string())?;
+        if has_mtp {
+            let _ = eng
+                .mtp_spec_step(0, warm_next, *spec_k)
+                .map_err(|e| e.to_string())?;
+        }
     }
     let _ = std::env::var("LLM170_FRAME");
     // 라벨은 백엔드를 그대로 반영한다 — 프레임(ADR-0017)은 cubecl 제거로
@@ -229,32 +253,65 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         // KTRACE — 프레임 op/커널의 GPU 시간을 t/s 옆에서 확정한다.
         let t0 = Instant::now();
         let l = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
+        if has_mtp && let Err(err) = eng.mtp_draft_prefill(0, prompt) {
+            eprintln!("# mtp prefill 생략({err})");
+        }
         let pp_ms = t0.elapsed().as_secs_f64() * 1e3;
         let mut next = llm170_core::qwen35::greedy(&l);
         // TG — 프레임 경로는 decode1 내부 분기
         let t1 = Instant::now();
         let mut n_gen = 0usize;
         let mut step = 0usize;
+        let mut fwd = 0usize;
         // 디코드 스텝 KTRACE — 첫 스텝 1회만 덤프(2026-09-14, +27ms 비교용).
-        while n_gen < *tg {
-            // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
-            next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
-            // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
-            // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
-            n_gen += 1;
-            step += 1;
-            if next == eos {
-                break;
+        if has_mtp {
+            while n_gen < *tg {
+                let (toks, tf) = eng
+                    .mtp_spec_step(0, next, *spec_k)
+                    .map_err(|e| e.to_string())?;
+                fwd += tf;
+                step += 1;
+                for &t in &toks {
+                    if n_gen >= *tg {
+                        break;
+                    }
+                    next = t;
+                    n_gen += 1;
+                    if t == eos {
+                        break;
+                    }
+                }
+                if next == eos {
+                    break;
+                }
+            }
+        } else {
+            while n_gen < *tg {
+                // plans/74: greedy 벤치는 GPU argmax 판(서빙 경로와 동일).
+                next = eng.decode1_greedy(0, next).map_err(|e| e.to_string())?;
+                // 덤프는 스텝 **이후** — 이전 판은 스텝 전에 덤프해 빈 트레이스를
+                // 출력했다(2026-09-18 수정). 스텝 1회분이 그대로 찍힌다.
+                n_gen += 1;
+                step += 1;
+                fwd += 1;
+                if next == eos {
+                    break;
+                }
             }
         }
         let tg_ms = t1.elapsed().as_secs_f64() * 1e3;
         let fr = dev;
         lines.push(format!(
-            "pp{pp}{fr} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
+            "pp{pp}{fr}{spec_desc} | rep{r} | {pp_ms:8.1} ms | {:7.2} t/s",
             *pp as f64 / (pp_ms / 1e3)
         ));
+        let tail = if has_mtp {
+            format!("fwd {fwd}, gen {n_gen}")
+        } else {
+            format!("steps {step}, gen {n_gen}")
+        };
         lines.push(format!(
-            "tg{tg}{fr} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s (steps {step}, gen {n_gen})",
+            "tg{tg}{fr}{spec_desc} | rep{r} | {tg_ms:8.1} ms | {:7.2} t/s ({tail})",
             n_gen as f64 / (tg_ms / 1e3)
         ));
     }
@@ -311,7 +368,7 @@ fn bench_q4(cfg: &BenchCfg) -> Result<Vec<String>, String> {
 fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
     let BenchCfg {
         model_path,
-        backend: _,
+        backend,
         gpu_runtime,
         pp,
         tg,
@@ -336,11 +393,15 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         eng.mtp_wanted = true;
     }
     // GPU 부착 — 단일 경로(attach_q35, Strict: 폴백 수치의 GPU 오인 방지).
-    eng = crate::engine::attach_q35(
-        eng,
-        gpu_runtime == "vulkan",
-        crate::engine::AttachPolicy::Strict,
-    )?;
+    // QA-17: backend 문자열 반영 — 종전 --backend cpu가 무시돼 GPU 측정을
+    // cpu로 미스라벨했다(vl의 `backend != "cpu"` 패턴과 동일 계약).
+    if backend == "gpu" {
+        eng = crate::engine::attach_q35(
+            eng,
+            gpu_runtime == "vulkan",
+            crate::engine::AttachPolicy::Strict,
+        )?;
+    }
     let has_mtp = eng.has_mtp();
     let spec_desc = if *spec_k > 0 && has_mtp {
         format!(" spec{spec_k}")
@@ -349,10 +410,17 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
     };
     // 워밍업 — llama-bench 프로토콜 정합(plans/79): 측정 전 동일 형상을
     // 1회 흘린다(64토큰만 데우던 종전 방식은 콜드 상태에서 ours만 불리).
+    // QA-24: 측정 판(decode_greedy)과 동일 형상으로 — 종전 decode+호스트
+    // greedy는 측정 커널(GPU argmax)을 데우지 못했다. 스펙 의도면 스펙
+    // 경로도 1회 예열.
     {
         let _ = eng.prefill(0, prompt).map_err(|e| e.to_string())?;
-        let l = eng.decode(&[0], &[1u32]).map_err(|e| e.to_string())?;
-        let _ = llm170_core::qwen35::greedy(&l[0]);
+        let warm_next = eng.decode_greedy(0, 1u32).map_err(|e| e.to_string())?;
+        if *spec_k > 0 && has_mtp {
+            let _ = eng
+                .spec_step(0, warm_next, *spec_k)
+                .map_err(|e| e.to_string())?;
+        }
     }
     for r in 0..*reps {
         eng.reset_states();
@@ -364,6 +432,8 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         let mut n_gen = 0usize;
         let mut fwd = 0usize;
         let bench_np = bench_np0;
+        // QA-15: spec+np 셀 시드 — np-pp 프리필의 슬롯별 마지막 greedy.
+        let mut np_seeds: Vec<u32> = Vec::new();
         if bench_np > 1 {
             // np **프리필 집계** —슬롯별 분리 프롬프트(프리픽스 캐시
             // 공유 배제), 전 슬롯 워밍업 1회(계측 제외), 슬롯 순차
@@ -386,9 +456,14 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 let _ = eng.decode_greedy(s, 1).map_err(|e| e.to_string())?;
             }
             eng.reset_states();
+            let want_seeds = *spec_k > 0 && has_mtp;
+            let mut last_logits: Vec<Vec<f32>> = Vec::with_capacity(bench_np);
             let t_pp = Instant::now();
             for s in 0..bench_np {
-                let _ = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
+                let l = eng.prefill(s, &prompts[s]).map_err(|e| e.to_string())?;
+                if want_seeds {
+                    last_logits.push(l);
+                }
             }
             let el = t_pp.elapsed().as_secs_f64() * 1e3;
             let total = bench_np * pp;
@@ -396,6 +471,12 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                 "pp{pp} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg ({total} tok, disjoint)",
                 total as f64 / (el / 1e3)
             ));
+            if want_seeds {
+                np_seeds = last_logits
+                    .iter()
+                    .map(|l| llm170_core::qwen35::greedy(l))
+                    .collect();
+            }
         }
         if bench_np > 1 && *spec_k == 0 {
             // plans/79: np 디코드 집계(qwen4exp 판 미러) — 전 슬롯 프리필은
@@ -434,9 +515,14 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
         if *spec_k > 0 && has_mtp && bench_np > 1 {
             // np×spec 병합(spec_step_multi). per-seq 독립 변형(SPEC_PERSEQ)은
             // 원장 115 부정 판정으로 plans/109 P6 삭제.
-            let mut nexts: Vec<u32> = vec![llm170_core::qwen35::greedy(&l); bench_np];
+            // QA-15: 슬롯별 자기 시드(np-pp 프리필의 마지막 greedy) — 종전엔
+            // 슬롯0의 greedy를 전 슬롯에 복제(슬롯0 KV와도 불일치).
+            let mut nexts: Vec<u32> = np_seeds.clone();
             let mut done: Vec<usize> = vec![0; bench_np];
             let mut total_gen = 0usize;
+            // QA-15: 앵커는 이 셀 직전 — 종전 t1은 np-pp 프리필 집계 전체를
+            // tg 시간에 포함해 t/s를 대폭 과소했다.
+            let t_sn = Instant::now();
             while total_gen < tg * bench_np {
                 let active: Vec<usize> = (0..bench_np).filter(|&s2| done[s2] < *tg).collect();
                 if active.is_empty() {
@@ -457,11 +543,14 @@ fn bench_q35(cfg: &BenchCfg) -> Result<Vec<String>, String> {
                     }
                 }
             }
-            let el = t1.elapsed().as_secs_f64() * 1e3;
+            let el = t_sn.elapsed().as_secs_f64() * 1e3;
             lines.push(format!(
                 "tg{tg} spec{spec_k} np{bench_np} | rep{r} | {el:8.1} ms | {:7.2} t/s agg (gen {total_gen})",
                 total_gen as f64 / (el / 1e3)
             ));
+            // QA-15: continue 누락 — 공통 꼬리 중복 실행으로 pp 중복행 +
+            // "0.00 t/s (fwd 0, gen 0)" 가짜행이 찍혔다.
+            continue;
         } else if *spec_k > 0 && has_mtp {
             while n_gen < *tg {
                 let (toks, tf) = eng.spec_step(0, next, *spec_k).map_err(|e| e.to_string())?;
