@@ -255,7 +255,8 @@ pub(super) fn gdn_frame_pre(
 /// 호출 전 `f.dirty[seq]`면 `sync_states`, 반환 후 `seq_sts[seq].pos += per_seq`.
 /// QSA 디바이스 풀은 (층, seq) 키라 같은 seq 인덱스를 다른 슬롯과 공유하면 안 된다.
 ///
-/// 게이트: **기본 off** — `LLM170_PREFILL_MULTI=1`일 때만 돈다. 배치는 dense op의
+/// 게이트: 호출부(engine.rs slot_loop)의 LLM170_PREFILL_BATCH(ne0 기본 ON,
+/// =0 킬스위치) — plans/111 W4에서 core 중복 게이트를 삭제했다.
 /// 행 수가 n_seq배가 되므로 백엔드의 행 수 의존 커널 선택·환원 순서가 단일
 /// 프리필과 달라진다(2026-09-17 실측: 같은 프롬프트로도 logit 최대차 O(0.5),
 /// 근접 타이는 뒤집힘 — 4×128에서 4행 중 1행). 이는 기존 단일 경로가 청크
@@ -274,14 +275,11 @@ pub fn frame_forward_prefill_multi(
     tokens: &[u32],
     per_seq: usize,
 ) -> Result<Vec<u32>, Q4Error> {
-    if std::env::var("LLM170_PREFILL_MULTI")
-        .map(|v| v == "0")
-        .unwrap_or(true)
-    {
-        return Err(Q4Error::Io(
-            "frame_forward_prefill_multi: 게이트 off (LLM170_PREFILL_MULTI=1 로 켠다)".into(),
-        ));
-    }
+    // plans/111 W4: 게이트 제거 — 원장 125(W8)에서 LLM170_PREFILL_BATCH(ne0
+    // 기본 ON)로 승격됐으나 이 중복 게이트(LLM170_PREFILL_MULTI opt-in)가
+    // 남아 serve가 매 청크 실패+슬롯별 폴백했다(115회/요청 로그 스팸, 프리필
+    // 직렬화). 킬스위치는 호출부(engine.rs)의 PREFILL_BATCH=0 이 단일 진실.
+    // 등가성은 prefill_multi 등가 테스트(원장 125)가 보증.
     let hp: &Hparams4 = &model.hp;
     let (n, hc) = (hp.n_embd, hp.hc);
     let k_len = hp.n_group * hp.d_state;
