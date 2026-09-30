@@ -998,4 +998,78 @@ impl llm170_core::matmul::EwOps for Q4Acc {
         }
         Ok(())
     }
+
+    /// plans/111 W2 — token_embd(Q8_0) gather + hc 방송(vk plans/97 의 hip 이식).
+    /// 종전 hip 미구현으로 매 스텝 CPU 디양자화+h2d(~9ms)·프리필 청크당
+    /// 48-70ms를 냈다. 테이블은 weights 캐시(mmap ptr 키)로 1회 상주.
+    fn emb_q8_gather_dev(
+        &self,
+        table_key: usize,
+        table: &[u8],
+        tokens: &[u32],
+        out: u64,
+        n: usize,
+        hc: usize,
+    ) -> Result<(), String> {
+        if !n.is_multiple_of(32) {
+            return Err(format!("emb_q8g: n%32 != 0 ({n})"));
+        }
+        let t = tokens.len();
+        if t == 0 {
+            return Ok(());
+        }
+        let bpr = n / 32;
+        // 테이블 1회 상주 — 무게 업로드 경로(pread 스테이징/MADV) 재사용.
+        let tbl = {
+            let mut ws = self.weights.lock().map_err(|e| e.to_string())?;
+            if let Some(&(p, _)) = ws.get(&table_key) {
+                p
+            } else {
+                let p = self.ctx.alloc(table.len().max(1))?;
+                if let Some(r) = self.staged_upload(p, table.as_ptr() as usize, table.len()) {
+                    r?;
+                } else {
+                    self.upload_pipelined(p, table)?;
+                }
+                self.wbytes
+                    .fetch_add(table.len(), std::sync::atomic::Ordering::Relaxed);
+                ws.insert(table_key, (p, false));
+                p
+            }
+        };
+        // ids 업로드 — 매 콜(직전 것 교체).
+        let ids = {
+            let mut g = self.emb_ids.lock().map_err(|e| e.to_string())?;
+            let p = g.ensure(&self.ctx, t * 4)?;
+            // SAFETY (107 W8): ids 업로드 — p는 ensure(t*4) 바이트, 재해석 길이 일치.
+            self.ctx.h2d(p, unsafe {
+                std::slice::from_raw_parts(tokens.as_ptr() as *const u8, t * 4)
+            })?;
+            p
+        };
+        // res_hc 버스 규약 — f16 쌍팩(hip 기본) 또는 f32.
+        let f16 = llm170_core::qwen4exp::frame::res_f16_on();
+        let need = if f16 { t * hc * n * 2 } else { t * hc * n * 4 };
+        let cap = self.fcap(out)?;
+        if cap < need {
+            return Err(format!("emb_q8g: res_hc {cap}B < {need}B"));
+        }
+        let op = self.fptr(out)?;
+        let (mut idp, mut tp) = (ids as *mut std::ffi::c_void, tbl as *mut std::ffi::c_void);
+        let mut opv = op as *mut std::ffi::c_void;
+        let (mut n_, mut t_, mut hc_, mut bpr_) = (n as i32, t as i32, hc as i32, bpr as i32);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut idp) as *mut _ as *mut std::ffi::c_void,
+            (&mut tp) as *mut _ as *mut std::ffi::c_void,
+            (&mut opv) as *mut _ as *mut std::ffi::c_void,
+            (&mut n_) as *mut _ as *mut std::ffi::c_void,
+            (&mut t_) as *mut _ as *mut std::ffi::c_void,
+            (&mut hc_) as *mut _ as *mut std::ffi::c_void,
+            (&mut bpr_) as *mut _ as *mut std::ffi::c_void,
+        ];
+        let name = if f16 { "q4_emb_q8g_f16" } else { "q4_emb_q8g" };
+        self.ctx
+            .launch(name, (t * bpr).div_ceil(256) as u32, 1, 256, &mut args)?;
+        Ok(())
+    }
 }
