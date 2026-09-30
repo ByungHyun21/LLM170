@@ -21,10 +21,10 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | mode | LLM170 hip | LLM170 vulkan | llama hip | llama vulkan |
 |---|---|---|---|---|
 | tg single | **11.66** | 10.77 | 11.34 | 11.33 |
-| np4 greedy (GPU argmax) | 33.31 | **34.65** | — | — |
-| np4 full-logits | 10.86 | 10.48 | **30.09** *(HTTP†)* | — |
-| MTP single (k=2) | 6.17 | 0.90 *(spec2 구현·수용률 미조정)* | **~11.3** | — |
-| MTP + np4 | 13.12 | n/a | **30.09** *(HTTP†)* | — |
+| np4 greedy | 33.31 | **34.65** | — | — |
+| np4 full-logits | 10.86 | 10.48 | **30.09** | — |
+| MTP k=2 | 6.17 | 0.90 | **~11.3** | — |
+| MTP + np4 | 13.12 | n/a | **30.09** | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -40,11 +40,11 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | mode | LLM170 hip | llama hip |
 |---|---|---|
 | tg single | 17.84 | **20.04** |
-| np4 greedy (GPU argmax) | 27.38 | **49.03** *(llama HTTP†)* |
-| MTP single (k=2) | 9.86 *(1.00 tok/fwd)* | — |
-| MTP single (k=3) | 9.79 *(1.10 tok/fwd)* | — |
-| MTP + np4 (k=2) | 10.82 | — |
-| MTP + np4 (k=3) | 11.65 | — |
+| np4 greedy | 27.38 | **49.03** |
+| MTP k=2 | 9.86 | — |
+| MTP k=3 | 9.79 | — |
+| MTP + np4 k=2 | 10.82 | — |
+| MTP + np4 k=3 | 11.65 | — |
 
 <!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
      적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
