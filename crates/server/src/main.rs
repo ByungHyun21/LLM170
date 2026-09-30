@@ -130,9 +130,7 @@ pub(crate) fn parse_model_args(args: &[String]) -> Result<ModelArgs, String> {
                     }
                     // 하위호준 별칭 — 종전 2층(--backend gpu --gpu-runtime X) 폐지.
                     "gpu" => {
-                        return Err(
-                            "--backend gpu 폐지: --backend hip|vulkan|cpu 로 지정".into(),
-                        );
+                        return Err("--backend gpu 폐지: --backend hip|vulkan|cpu 로 지정".into());
                     }
                     _ => return Err(format!("--backend: cpu|hip|vulkan|cuda (got {v})")),
                 }
