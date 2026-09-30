@@ -147,7 +147,7 @@ pub const NAMES: &[&str] = &[
     "q4_ple_conv",
     "q4_ple_residual",
     "q4_emb_q8g",
-    "q4_emb_q8g_f16",
+    "q4_ple_gather",
     "argmax_rows_s1",
     "argmax_rows_s2",
     "gdn_ar_w_np",
