@@ -582,6 +582,11 @@ fn run_and_emit(
     }
     let _ = orx.recv(); // 최종 결과 수령 (종료 정리)
     sse(stream, "done", "[DONE]");
+    // plans/114 QA-2 연계 수리: SSE 완료 후 연결 종료. curl류 클라이언트는
+    // [DONE]을 인지하지 못해 서버의 keep-alive 대기에 묶였고 — 무타임아웃
+    // 시대엔 무한 대기, read_timeout(120s) 도입 후엔 요청마다 +120s 꼬리가
+    // 붙었다(실측: 6s 생성 + 120s 꼬리 = 126.4s). 스트림은 완료 즉시 FIN.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 fn run_and_emit_anthropic(
@@ -620,6 +625,7 @@ fn run_and_emit_anthropic(
             "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
         );
         sse(stream, "message_stop", "{\"type\":\"message_stop\"}");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         return;
     }
     // QA-3/9: run_and_emit 비스트림과 동일 — 폴링 대기로 절단 감지 + 에러 전파.
