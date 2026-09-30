@@ -3393,3 +3393,30 @@ vk 경로 매핑(GTT) 판독 사이트 전수(.comp 제외, from_raw_parts/ptr-a
   런치 수 1,973/스텝 축소(작은 커널 융합), dense GEMV계 23ms·MoE ids계
   12ms 최적화, MTP 검증 무게 상각(원장 128), serve np4 슬롯 스케줄 스큐
   (bench 27.03 vs serve 13.24 — EOS 조기종료 외 실측 필요).
+
+### (132) serve 배치 프리필 유령 게이트 수리 + 스톨 RCA·부정 2건 (plans/111 W4/W4b, 2026-09-30)
+
+- **수리(428e24f)**: core `frame_forward_prefill_multi`의 잔존 opt-in 게이트
+  (`LLM170_PREFILL_MULTI`)가 원장 125 승격(`PREFILL_BATCH` ne0)과 어긋나
+  serve 배치 프리필이 매 청크 실패→슬롯별 폴백(요청당 115 에러 라인·프리필
+  직렬화·디코드 굶김 ~1s/step). 게이트 제거로 승격 완성 — **serve 4×(3901
+  프롬프트+128tok) 195s → 96s**(배치 청크 49ms/4×128행, 디코드 139.8ms/step
+  평탄, 폴백 0). prefill_multi 등가·FN/27B 게이트·charhash PASS. env 카탈로그
+  재생성.
+- **스톨 RCA**: 간헐적 ~600s serve 스톨 = mmap major-fault 스래싱(슬로우 국면
+  majflt 244→11,062/30s 실측, GPU idle). 호스트 브리지 PLE 프리필의 103GB
+  테이블 랜덤 판독이 콜드 캐시에서 NVMe 폴트를 유발.
+- **부정 1(롤백)**: hip `ple_math_dev` t>1 해제 — 커널/런치는 다중 행 설계였으나
+  key/value GEMM 산술이 골든(CPU `mm_batch`)과 갈림(GPU `frame_mm_group`) →
+  charhash L1.ple_gated 발산. 비트 동일 불가, 골든 재캡처는 규칙 10 승인 과제.
+- **부정 2(계측 정정)**: ftime+KTRACE 동시 사용 시 sync_mark 판독이 GPU 갭을
+  부풀린다(자연어 8k 스텝 110ms로 과대 계측). 프로덕션 조건(KTRACE 단독)
+  실측: **커널 58ms + 갭 16.5ms ≈ 75ms(~13.3 t/s)** vs llama 48.5ms — 잔여
+  격차 1.55×. 갭의 실체 = ~2,000런치 제출 비용.
+- **README 정정**: tg128@8k를 진짜 8k 충전 측정값 17.72로 갱신(종전 18.68은
+  pp512 디코드 — 라벨 과소 설명). 랜덤토큰 벤치 프로토콜 내에서는 640ctx와
+  8k 충전이 동급(18.68/17.72)임도 확인.
+- **인계(증거 갱신)**: W5 런치 갭 16.5ms(제출비용 — hipGraph 캡처가 정석,
+  MoE 가변 토폴로지가 난점), W6 dense GEMV 23ms·MoE ids 12ms 커널 효율,
+  W7 MTP 검증 무게(수용 1.0-1.22로 순손실 유지), np 다중 슬롯 발산(원장 129),
+  serve 간헐 스톨 완화(호스트 브리지 PLE의 캐시 예열/프리페치).
