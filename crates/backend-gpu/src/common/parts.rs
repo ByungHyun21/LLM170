@@ -14,6 +14,8 @@ pub struct PartSource {
     /// 이 파트의 mmap 길이(바이트).
     pub len: usize,
     pub file: std::fs::File,
+    /// 파트 경로 — plans/111 4차 W-O: O_DIRECT 재오픈용.
+    pub path: std::path::PathBuf,
 }
 
 impl PartSource {

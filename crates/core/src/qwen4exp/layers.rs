@@ -1961,9 +1961,10 @@ impl Engine4 {
             emb: Vec::new(),
         }));
         self.ple_next = Some(slot.clone());
-        // SAFETY: mmap 데이터 포인터는 Engine4(나아가 프로세스 수명)와 함께
-        // 살고, worker는 다음 decode1 시작부에서 반드시 조인한다 — 조인 전
-        // 엔진 drop 경로 없음 (서버 슬롯 루프도 decode1 직렬 호출).
+        // plans/111 4차 W-P: ssd 오프로드 활성 시 mmap gather(페이지캐시 오염
+        // + 스래시 원천) 대신 블록 캐시 선예열 — 본경로 디바이스 gather가
+        // 예열된 캐시에서 즉시 적중한다.
+        let acc = self.acc.clone();
         self.ple_worker = Some(std::thread::spawn(move || {
             let rows = pure_hash(
                 &hist,
@@ -1976,6 +1977,12 @@ impl Engine4 {
                 &vs,
                 eos,
             );
+            if let Some(acc) = &acc
+                && acc.ple_table_ssd_active()
+            {
+                acc.ple_ssd_warm(&rows);
+                return;
+            }
             // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; 모델 가중이 유지되는 동안만 참조한다.
             let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
             let mut emb = vec![0.0f32; heads * hd];
