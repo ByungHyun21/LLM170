@@ -3,6 +3,13 @@
 use super::*;
 use crate::rawhip::env_on;
 
+/// GEMM 패밀리 핀 — 프리필(t>1, np 아님)만 타일 강제(원장 18). np 디코드는
+/// 언핀(행별 t=1 패밀리 — 원장 124 VERIFY_ROW_PIN 산술, plans/115 P5).
+fn prefill_pin(t: usize, np: bool) {
+    let pin = t > 1 && !np;
+    crate::rawhip::ctx::PREFILL_PIN.store(pin, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl llm170_core::matmul::FrameState for Q4Acc {
     /// plans/115 P1-3 — 상태 D2D 복사(메인 스트림 비동기, 순서 보장).
     /// 접두 체크포인트 캡처/복원.
@@ -15,6 +22,19 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         Ok(())
     }
 
+    fn frame_begin_np(&self, t: usize) {
+        self.cur_t
+            .store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.np_mode
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        prefill_pin(t, true);
+    }
+
+    fn frame_end_np(&self) {
+        self.np_mode
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn set_ctx_len(&self, n: usize) {
         self.ctx_len.store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -22,6 +42,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
     fn frame_begin(&self, t: usize) {
         self.cur_t
             .store(t.max(1), std::sync::atomic::Ordering::Relaxed);
+        // plans/115 P5: np 디코드는 언핀 — t>1이어도 행별 t=1 패밀리(dmmv/
+        // w16, 원장 124 VERIFY_ROW_PIN 산술)로 디스패치된다. 타일 핀은
+        // 프리필 청크 불변성(원장 18)을 위한 것 — np 스텝 내부의 fs_begin(t)
+        // 재호출도 np_mode 동안 언핀을 유지한다.
+        let np = self.np_mode();
+        prefill_pin(t, np);
         // plans/84 A/E.2 — 프리필(t>1) 패밀리 핀. 두 결함을 묶는다: (1) hc_attn
         // down(q8_0)의 t=16 GEMV ↔ t>64 j128 타일 갈림(원장 (12)), (2) MoE
         // 폴백의 전문가별 행수 r이 t 키로 쓰여 r>=16 타일/r<16 GEMV로 갈라
@@ -29,11 +55,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // (18), value.rs launch_gemm 참조). 핀 + 타일 강제로 청크 16..512 전부
         // 비트 동일(chunk-check 3종 PASS, 2026-09-21). 핀은 무조건(원장 18
         // 기본 ON 승격 — =0 복원 경로는 plans/109 P6 삭제).
-        if t > 1 {
-            crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            crate::rawhip::ctx::PREFILL_PIN.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
     }
 
     /// GDN AR (프레임) — qwen35 raw 디코더와 동일 커널(gdn_ar_w_swap).
@@ -434,6 +455,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // (패딩/비패딩 gather·scatter·폴백 오프셋)를 전면 교정했으나
                 // 잔여 발산(16토큰 중 마지막 1개 플립)과 진단 동기화 시에만
                 // 재현되는 폴백 행 수 오염이 남아 기본 경로는 유지한다.
+                // (plans/115 P5 시도: np 디바이스 그룹화 — np는 dmmv_ids가
+                // 그룹화를 통째로 우회해 무의료 했다. 게이트는 t=1 원복.)
                 if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,

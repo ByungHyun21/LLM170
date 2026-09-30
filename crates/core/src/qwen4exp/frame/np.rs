@@ -140,7 +140,7 @@ pub(super) fn gdn_frame_np(
             .frame_gdn_conv_np(f.gqkv, f.gconv, &conv_states, cw, conv_ch, hp.conv_k)
             .is_ok()
     {
-        fs_begin(acc, t);
+        fs_begin_np(acc, t);
     } else {
         fs_begin(acc, 1);
         for (row, &sq) in seqs.iter().enumerate() {
@@ -157,7 +157,7 @@ pub(super) fn gdn_frame_np(
                 },
             )?;
         }
-        fs_begin(acc, t);
+        fs_begin_np(acc, t);
     }
     fs_begin(acc, t); // split/l2/scale는 전 행 배치
     psum(acc, vv.gconv[0], conv_ch, "conv_row0");
@@ -454,7 +454,20 @@ pub(super) fn frame_forward_np_ex(
         return Err(Q4Error::Io("frame_forward_np: t>16 미지원".into()));
     }
     let t_call = std::time::Instant::now();
-    fs_begin(acc, t);
+    // plans/115 P1 계측 — 스테이지별 적립(스텝 타이머는 np_time이 담당).
+    let stage_on = llm170_diag::dump::opts().key("np_stage");
+    let mut st = [0.0f64; 4]; // [gdn, qsa, moe, head]
+    // plans/115 P5: np 스텝 가드 — 언핀 디스패치 표식(np_mode)을 스텝 전체
+    // (조기 return 포함)에서 유지하고 종료 시 해제한다.
+    struct NpPinGuard<'a>(&'a dyn Accelerator);
+    impl Drop for NpPinGuard<'_> {
+        fn drop(&mut self) {
+            let fs: &dyn FrameState = self.0;
+            fs.frame_end_np();
+        }
+    }
+    let _np_pin = NpPinGuard(acc);
+    fs_begin_np(acc, t);
     ensure_np_views(acc, f, t, conv_ch, k_len, v_len, n, hc, hp)?;
 
     // 0) 임베딩 — 각 seq 토큰 → res_hc [t][hc·n]
@@ -510,7 +523,7 @@ pub(super) fn frame_forward_np_ex(
             let nc = model.f32_vec4(&format!("blk.{il}.ple_norm_conv.weight"))?;
             let cw = model.f32_vec4(&format!("blk.{il}.ple_conv1d.weight"))?;
             let vv = f.np_views.as_ref().unwrap();
-            fs_begin(acc, t); // 배치 투영 구간
+            fs_begin_np(acc, t); // 배치 투영 구간
             let all_valid = ple_rows.iter().all(|r| r.len() == heads);
             if all_valid {
                 let flat: Vec<u32> = ple_rows.concat();
@@ -578,7 +591,7 @@ pub(super) fn frame_forward_np_ex(
             }
         }
 
-        fs_begin(acc, t); // 공유 구간
+        fs_begin_np(acc, t); // 공유 구간
         // 2) hc attn mix (t 공유)
         if il < 4 {
             ck(acc, f.res_hc, 64, &format!("L{il}.res_in"));
@@ -591,6 +604,7 @@ pub(super) fn frame_forward_np_ex(
 
         // 3) GDN / QSA
         if hp.is_recr(il) {
+            let s0 = std::time::Instant::now();
             gdn_frame_np(
                 acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t,
             )?;
@@ -600,7 +614,11 @@ pub(super) fn frame_forward_np_ex(
             sync_mark(acc, &format!("np{il}.gdn"), f.ffn_out)?;
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
+            if stage_on {
+                st[0] += s0.elapsed().as_secs_f64() * 1e3;
+            }
         } else {
+            let s0 = std::time::Instant::now();
             qsa_frame_np(acc, model, seq_sts, seqs, f, il, t, full_idx)?;
             if il < 4 {
                 ck(acc, f.ffn_out, 64, &format!("L{il}.qsa"));
@@ -608,10 +626,14 @@ pub(super) fn frame_forward_np_ex(
             sync_mark(acc, &format!("np{il}.qsa"), f.ffn_out)?;
             full_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
+            if stage_on {
+                st[1] += s0.elapsed().as_secs_f64() * 1e3;
+            }
         }
 
         // 4) hc ffn mix(t 공유) + MoE(행별 t=1 — 산술 불변) + combine(t 공유)
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
+        let s2 = std::time::Instant::now();
         // MoE: 기본 행별 t=1(모멘텀 유지 — t 배치 gather 판이 t=4 에서 10ms 느림,
         // 2026-09-16 실측). LLM170_NP_MOE_BATCH=1이면 t 배치(gather — 전문가
         // 가중합 순서 차이로 근접 평탄점 플립 가능, 문서화 tie 등급).
@@ -626,18 +648,28 @@ pub(super) fn frame_forward_np_ex(
             // moe_frame_np는 per-seq 구간에서 t_cur를 1로 내리고 seqs.len()으로
             // 되돌린다(자기 안에서 t를 모른다). 헤드의 RmsRows/HcGateMean은
             // t_cur로 행 수를 유추하므로 여기서 실제 행 수 t로 복원해야 한다.
-            fs_begin(acc, t);
+            fs_begin_np(acc, t);
         }
         sync_mark(acc, &format!("np{il}.moe"), f.mout)?;
         if il < 4 {
             ck(acc, f.mout, 64, &format!("L{il}.moe"));
         }
         hc_combine_frame(acc, f, f.mout, f.inj, n, hc, t)?;
+        if stage_on {
+            st[2] += s2.elapsed().as_secs_f64() * 1e3;
+        }
     }
     if ck_on {
         ck(acc, f.res_hc, 64, "head.res");
     }
 
+    if stage_on {
+        st[3] = t_call.elapsed().as_secs_f64() * 1e3 - st[0] - st[1] - st[2];
+        eprintln!(
+            "[npstage] t={t} gdn {:.1} qsa {:.1} moe {:.1} head+기타 {:.1}",
+            st[0], st[1], st[2], st[3]
+        );
+    }
     // 5a) plans/110 W5: pre-mixer res_hc 행 export — 다중 슬롯 스펙의 라운드
     // 시작을 np로 배칭할 때 드래프트 h 입력이 필요하다(mtp_h_export 시만).
     if h_export && f.mtp_h_export {
