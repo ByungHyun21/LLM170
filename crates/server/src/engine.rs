@@ -1236,7 +1236,11 @@ pub fn build_slots(req: InferRequest, backend: BackendSel, n_slots: usize) -> En
             sources,
             q4_gpu_wanted(&backend),
             q4_vk_runtime(&backend),
-            q4_gpu_wanted(&backend) && !q4_vk_runtime(&backend),
+            // plans/115: f16 버스 기본 박탈(원장 105 승격 회수) — serve hip에서
+            // 토큰 전수 파괴 실측(2026-09-30): [760,6511]→가비지 vs f32 버스로는
+            // infer 골든과 완전 일치. B1 잔여(infer f16 골든 발산)와 동일 결함.
+            // 산술 클래스는 f32(골든 캡처본)로 통일.
+            false,
             AttachPolicy::Warn,
         )
         .unwrap_or_else(|_| unreachable!("Warn policy cannot fail"));
