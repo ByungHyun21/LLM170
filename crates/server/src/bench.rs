@@ -12,7 +12,7 @@ use std::time::Instant;
 
 fn usage_err_bench(msg: &str) -> ExitCode {
     eprintln!(
-        "error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|gpu] [--gpu-runtime hip|vulkan] [--spec k] [--np K]"
+        "error: {msg}\n사용법: llm170 bench --model <gguf> [--pp N] [--tg N] [--reps N] [--ctx N] [--backend cpu|hip|vulkan] [--spec k] [--np K]"
     );
     ExitCode::from(2)
 }

@@ -51,7 +51,7 @@ for kv in A.env:
 
 def run(seqs):
     cmd = [A.bin, "infer", "--model", A.model, "--n-predict", str(A.n),
-           "--ctx", str(A.ctx), "--backend", "gpu", "--gpu-runtime", A.runtime]
+           "--ctx", str(A.ctx), "--backend", A.runtime]
     for s in seqs:
         cmd += ["--prompt-tokens", ",".join(str(t) for t in s)]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)

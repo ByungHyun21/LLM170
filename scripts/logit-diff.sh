@@ -10,9 +10,9 @@ P=$(python3 -c "print(','.join(str(100+i*7) for i in range($NTOK)))")
 
 CO_ARG="${CO_PATH:-}"
 LLM170_CO_PATH="$CO_ARG" LLM170_DUMP_LOGITS=/tmp/gate_fast.f32 "$BIN" infer --model "$MODEL" \
-  --prompt-tokens "$P" --n-predict 1 --backend gpu --gpu-runtime hip >/dev/null 2>&1
+  --prompt-tokens "$P" --n-predict 1 --backend hip >/dev/null 2>&1
 LLM170_CO_PATH="$CO_ARG" LLM170_EXACT=1 LLM170_DUMP_LOGITS=/tmp/gate_exact.f32 "$BIN" infer --model "$MODEL" \
-  --prompt-tokens "$P" --n-predict 1 --backend gpu --gpu-runtime hip >/dev/null 2>&1
+  --prompt-tokens "$P" --n-predict 1 --backend hip >/dev/null 2>&1
 
 python3 - <<'EOF'
 import struct, sys

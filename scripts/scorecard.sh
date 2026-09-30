@@ -24,11 +24,11 @@ run_ours() {
   local name=$1 model=$2; shift 2
   for pt in 512 4096 16384; do
     timeout 1800 ./target/release/llm170 bench --model "$model" --pp $pt --tg 0 --reps 1 \
-      --ctx 20480 --backend gpu 2>/dev/null | grep -E "\| pp" | sed "s/^/[ours $name] /"
+      --ctx 20480 --backend hip 2>/dev/null | grep -E "\| pp" | sed "s/^/[ours $name] /"
   done
   for ctx in 4096 16384; do
     timeout 1800 ./target/release/llm170 bench --model "$model" --pp 512 --tg 128 --reps 1 \
-      --ctx $((ctx+512)) --backend gpu 2>/dev/null | grep -E "\| tg" | sed "s/^/[ours $name tg@$ctx] /"
+      --ctx $((ctx+512)) --backend hip 2>/dev/null | grep -E "\| tg" | sed "s/^/[ours $name tg@$ctx] /"
   done
 }
 
