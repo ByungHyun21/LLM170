@@ -10,6 +10,32 @@ thread_local! {
 use super::*;
 
 impl llm170_core::matmul::FrameState for VkAcc {
+    /// plans/115 P1-3 — 상태 D2D 복사 묶음(접두 체크포인트 캡처/복원).
+    /// copy_dev 원샷 제출(GDN 스냅샷·복원과 동일 경로).
+    fn frame_copy_states(&self, pairs: &[(u64, u64, usize)]) -> Result<(), String> {
+        let mut ctx = self.ctx.lock();
+        self.frame_resume_batch(&mut ctx);
+        let g = self.framebufs.lock();
+        let mut copies = Vec::with_capacity(pairs.len());
+        for &(dst, src, bytes) in pairs {
+            let d = g
+                .get(&dst)
+                .ok_or_else(|| format!("vk frame_copy: dst 핸들 없음: {dst}"))?;
+            let s = g
+                .get(&src)
+                .ok_or_else(|| format!("vk frame_copy: src 핸들 없음: {src}"))?;
+            if d.bytes < bytes || s.bytes < bytes {
+                return Err(format!(
+                    "vk frame_copy: 크기 부족 dst={} src={} need={bytes}",
+                    d.bytes, s.bytes
+                ));
+            }
+            copies.push((d.buf, 0, s.buf, 0, bytes as u64));
+        }
+        drop(g);
+        ctx.copy_dev(&copies)
+    }
+
     fn frame_begin(&self, t: usize) {
         self.frame_t
             .store(t.max(1), std::sync::atomic::Ordering::Relaxed);

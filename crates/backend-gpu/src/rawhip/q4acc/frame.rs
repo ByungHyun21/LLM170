@@ -4,6 +4,17 @@ use super::*;
 use crate::rawhip::env_on;
 
 impl llm170_core::matmul::FrameState for Q4Acc {
+    /// plans/115 P1-3 — 상태 D2D 복사(메인 스트림 비동기, 순서 보장).
+    /// 접두 체크포인트 캡처/복원.
+    fn frame_copy_states(&self, pairs: &[(u64, u64, usize)]) -> Result<(), String> {
+        for &(dst, src, bytes) in pairs {
+            let d = self.fptr(dst)?;
+            let s = self.fptr(src)? as *const u8;
+            self.ctx.d2d(d, s, bytes)?;
+        }
+        Ok(())
+    }
+
     fn set_ctx_len(&self, n: usize) {
         self.ctx_len.store(n, std::sync::atomic::Ordering::Relaxed);
     }
