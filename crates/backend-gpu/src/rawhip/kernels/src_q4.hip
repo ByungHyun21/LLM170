@@ -1010,7 +1010,12 @@ extern "C" __global__ void __launch_bounds__(64) q4_gemm_q4k_dmmv_ids(
     const size_t ebase = (size_t)ids[r] * (size_t)expert_bytes;
     const size_t rstride = (size_t)n_super * 144u;
     const int itid = tid & 15;
-    const int ix = tid >> 4;                  // 슈퍼블록 스트라이드(4 iter)
+    const int ix_raw = tid >> 4;              // 원시 ix(0..3)
+    // plans/115 #4: n_super≤2에서 ix=2,3 유휴 방지 — 행 분리로 재배치.
+    // ix=0,1 → 행 0 · ix=2,3 → 행 1. n_super>2는 기존 4스트라이드 유지.
+    const int n_ix = (n_super <= 2) ? 2 : 4;
+    const int row_assign = (n_super <= 2) ? (ix_raw >> 1) : 0;
+    const int ix = (n_super <= 2) ? (ix_raw & 1) : ix_raw;
     const int il = itid >> 2;
     const int ir = itid & 3;
     const int v_im = il >> 1;
@@ -1020,7 +1025,7 @@ extern "C" __global__ void __launch_bounds__(64) q4_gemm_q4k_dmmv_ids(
     const int y_off = 64 * v_im + l0;
     const float* xr = x + (size_t)r * n_in;
     float t0 = 0.0f, t1 = 0.0f;
-    for (int i = ix; i < n_super; i += 4) {
+    for (int i = ix; i < n_super; i += n_ix) {
         const int y1 = i * 256 + y_off;
         const float by0 = xr[y1],       by1 = xr[y1+1],     by2 = xr[y1+2],     by3 = xr[y1+3];
         const float by4 = xr[y1+32],    by5 = xr[y1+33],    by6 = xr[y1+34],    by7 = xr[y1+35];
@@ -1029,6 +1034,7 @@ extern "C" __global__ void __launch_bounds__(64) q4_gemm_q4k_dmmv_ids(
         #pragma unroll
         for (int n = 0; n < 2; n++) {
             if (n >= num_rows) break;
+            if (n_super <= 2 && n != row_assign) continue;  // 행 분리 모드
             const size_t bb = ebase + (size_t)(first_row + n) * rstride + (size_t)i * 144u;
             const unsigned wq0 = w[bb >> 2];
             const float d = bits_f16(wq0 & 0xFFFFu);
