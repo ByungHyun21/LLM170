@@ -982,7 +982,7 @@ extern "C" __global__ void __launch_bounds__(64) q5_1_gemm_dmmv_ids(
 // 여러 Q헤드가 같은 K/V 행을 쓴다. 워프가 4헤드를 맡아 K/V 로드를 1/4로 줄인다
 // (24 Q헤드 = 2 KV헤드 → 12 Q헤드가 같은 키를 읽던 것을 3워프로 접음).
 // 산술은 `_sel`과 동일 순서(키당 헤드별 독립 온라인 소프트맥스) → 비트 동일.
-extern "C" __global__ void q4_qsa_attn_sel4(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void q4_qsa_attn_sel4(const float* q, const half* ck, const half* cv,
                                             const unsigned* sel_idx, const unsigned* sel_off,
                                             float* out, float kq_scale,
                                             int n_head, int n_kv, int hd, int t) {
@@ -1014,13 +1014,13 @@ extern "C" __global__ void q4_qsa_attn_sel4(const float* q, const float* ck, con
     const int j1 = (int)sel_off[tok + 1];
     for (int j = j0; j < j1; j++) {
         const int p = (int)sel_idx[j];
-        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
-        const float* v = cv + (size_t)p * n_kv * hd + kvh * hd;
+        const half* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        const half* v = cv + (size_t)p * n_kv * hd + kvh * hd;
         float kr[8], vr[8];
         #pragma unroll
         for (int t2 = 0; t2 < 8; t2++) {
-            kr[t2] = k[lane + 32 * t2];
-            vr[t2] = v[lane + 32 * t2];
+            kr[t2] = __half2float(k[lane + 32 * t2]);
+            vr[t2] = __half2float(v[lane + 32 * t2]);
         }
         #pragma unroll
         for (int g = 0; g < 4; g++) {
@@ -1198,7 +1198,7 @@ extern "C" __global__ void q4_qsa_attn_wt(const float* q, const float* ck, const
 // 워프 = (토큰, 헤드) 하나이고 선택 목록은 토큰별이라 **24헤드가 같은 K/V 행을
 // 각자 다시 읽는다**: 8192위치 x 256 x 2 x 24헤드 = 403 MB/층 -> 236 GB/s로 1.7ms로
 // 측정치와 일치(대역폭 한계). 헤드 공유(4헤드판)는 t=1에서 점유율 때문에 중립이었다.
-extern "C" __global__ void q4_qsa_attn_sel(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void q4_qsa_attn_sel(const float* q, const half* ck, const half* cv,
                                            const unsigned* sel_idx, const unsigned* sel_off,
                                            float* out, float kq_scale,
                                            int n_head, int n_kv, int hd, int t) {
@@ -1225,10 +1225,10 @@ extern "C" __global__ void q4_qsa_attn_sel(const float* q, const float* ck, cons
     const int j1 = (int)sel_off[tok + 1];
     for (int j = j0; j < j1; j++) {
         const int p = (int)sel_idx[j];
-        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        const half* k = ck + (size_t)p * n_kv * hd + kvh * hd;
         float a = 0.0f;
         #pragma unroll
-        for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * k[lane + 32 * t2];
+        for (int t2 = 0; t2 < 8; t2++) a += qr[t2] * __half2float(k[lane + 32 * t2]);
         for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(FULL, a, off);
         float s = a * kq_scale;
         if (s > mrun) {
@@ -1240,9 +1240,9 @@ extern "C" __global__ void q4_qsa_attn_sel(const float* q, const float* ck, cons
         }
         float e = exp_cr(s - mrun);
         lrun += e;
-        const float* vr = cv + (size_t)p * n_kv * hd + kvh * hd;
+        const half* vr = cv + (size_t)p * n_kv * hd + kvh * hd;
         #pragma unroll
-        for (int t2 = 0; t2 < 8; t2++) acc[t2] += e * vr[lane + 32 * t2];
+        for (int t2 = 0; t2 < 8; t2++) acc[t2] += e * __half2float(vr[lane + 32 * t2]);
     }
     for (int t2 = 0; t2 < 8; t2++) {
         float o = (lrun > 0.0f) ? acc[t2] / lrun : 0.0f;
@@ -1508,7 +1508,7 @@ extern "C" __global__ void q4_axpy_scaled_t(float* y, const float* x, const floa
 // 완전 동일, 단문맥(pp24) 무회귀. 기본 ON이고 LLM170_QSA_SPLIT=0이 비트동일 복귀.
 // 부분 버퍼는 [head][split][lane][m,l,acc0..7] — acc가 레인별이라 레인 축이
 // 없으면 32레인이 같은 슬롯을 덮어쓴다(첫 구현에서 이 오류로 발산했다).
-extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, const float* cv,
+extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const half* ck, const half* cv,
                                              const unsigned* sel_idx, const unsigned* sel_off,
                                              float* part, int n_splits, float kq_scale,
                                              int n_head, int n_kv, int hd) {
@@ -1540,11 +1540,11 @@ extern "C" __global__ void q4_qsa_attn_sel4s(const float* q, const float* ck, co
     const unsigned long long FULL = 0xffffffffffffffffull;
     for (int j = a0; j < a1; j++) {
         const int p = (int)sel_idx[j];
-        const float* k = ck + (size_t)p * n_kv * hd + kvh * hd;
-        const float* v = cv + (size_t)p * n_kv * hd + kvh * hd;
+        const half* k = ck + (size_t)p * n_kv * hd + kvh * hd;
+        const half* v = cv + (size_t)p * n_kv * hd + kvh * hd;
         float kr[8], vr[8];
         #pragma unroll
-        for (int t2 = 0; t2 < 8; t2++) { kr[t2] = k[lane + 32 * t2]; vr[t2] = v[lane + 32 * t2]; }
+        for (int t2 = 0; t2 < 8; t2++) { kr[t2] = __half2float(k[lane + 32 * t2]); vr[t2] = __half2float(v[lane + 32 * t2]); }
         #pragma unroll
         for (int g = 0; g < 6; g++) {
             float a = 0.0f;
