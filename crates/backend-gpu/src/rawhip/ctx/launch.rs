@@ -331,3 +331,11 @@ impl RawCtx {
         )
     }
 }
+
+/// 진단(LLM170_NOLAUNCH): 런치를 건너뛰고 호스트 스켈레톤 시간만 측정.
+pub(crate) fn nolaunch_on() -> bool {
+    *NOLAUNCH
+}
+
+static NOLAUNCH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("LLM170_NOLAUNCH").is_some());
