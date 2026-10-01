@@ -609,10 +609,31 @@ extern "C" __global__ void q4_gemm_f32_m(const float* x, const float* w, float* 
     int o = (int)blockIdx.x * 16 + ox;
     int r = (int)blockIdx.y * 16 + rx;
     if (o >= n_out || r >= t) return;
-    const float* xr = x + (size_t)r * x_stride;
-    const float* wr = w + (size_t)o * n_in;
-    float acc = 0.0f;
-    for (int k = 0; k < n_in; k++) acc += xr[k] * wr[k];
+    // plans/116-5: 단일 누산기 직렬 FMA 체인(레이턴시 병목 — 라우터 0.96 TMAC/s,
+    // 피크 3%)을 4누산기 ILP + float4 벡터 로드로. 환원 순서 변경(10a).
+    // float4 캐스트 정렬 불변량: n_in·x_stride 둘 다 4의 배수(행 기본 16B 정렬).
+    // 어긋나는 형상은 종전 스칼라 경로로 — 비정렬 벡터 로드 폴트 방지.
+    float acc;
+    if (((n_in | x_stride) & 3) == 0) {
+        const float4* xr4 = (const float4*)(x + (size_t)r * x_stride);
+        const float4* wr4 = (const float4*)(w + (size_t)o * n_in);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        const int k4 = n_in >> 2;
+        for (int k = 0; k < k4; k++) {
+            float4 xv = xr4[k];
+            float4 wv = wr4[k];
+            a0 = fmaf(xv.x, wv.x, a0);
+            a1 = fmaf(xv.y, wv.y, a1);
+            a2 = fmaf(xv.z, wv.z, a2);
+            a3 = fmaf(xv.w, wv.w, a3);
+        }
+        acc = (a0 + a1) + (a2 + a3);
+    } else {
+        const float* xr = x + (size_t)r * x_stride;
+        const float* wr = w + (size_t)o * n_in;
+        acc = 0.0f;
+        for (int k = 0; k < n_in; k++) acc += xr[k] * wr[k];
+    }
     out[(size_t)r * n_out + o] = acc;
 }
 
