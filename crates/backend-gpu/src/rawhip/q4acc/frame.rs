@@ -649,7 +649,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     let gdt = std::time::Instant::now();
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
                     if llm170_diag::dump::opts().key("moe_time") {
-                        eprintln!("[moed2h] rows={rows} {:.2}ms", gdt.elapsed().as_secs_f64() * 1e3);
+                        eprintln!(
+                            "[moed2h] rows={rows} {:.2}ms",
+                            gdt.elapsed().as_secs_f64() * 1e3
+                        );
                     }
                     // 카운팅 정렬 테이블 — common 공용판(vk 폴백과 바이트 동일, P13).
                     let off = crate::common::moe::grp_offsets(&idv, ne);
