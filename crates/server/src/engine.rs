@@ -960,8 +960,8 @@ pub fn slot_loop(mut eng: Engine, rx: std::sync::mpsc::Receiver<SlotJob>, n_slot
             // 배치 프리필(plans/74 np4) — 대기 슬롯 N개의 같은 길이 청크를 한 forward 로
             // 묶어 무게 패스를 공유한다(슬롯별이면 4회 읽던 것). plans/110 W8:
             // 기본 ON(등가성은 prefill_multi 등가 테스트가 보증, 실패 시 아래
-            // 슬롯별 경로 폴백). 킬스위치 LLM170_PREFILL_BATCH=0.
-            if llm170_diag::flag::ne0("LLM170_PREFILL_BATCH") {
+            // 슬롯별 경로 폴백). (plans/115 env 정리: 킬스위치 폐기 — 항시.)
+            {
                 let pend: Vec<usize> = (0..n_slots)
                     .filter(|&i| {
                         slots[i].job.is_some()
@@ -1132,7 +1132,7 @@ fn assign_slot(slots: &mut [Slot], eng: &mut Engine, j: SlotJob, tick: u64) {
         .queue_wait_us
         .fetch_add(j.queued.elapsed().as_micros() as u64, Ordering::Relaxed);
     SCHED.jobs.fetch_add(1, Ordering::Relaxed);
-    let prefix_ok = !llm170_diag::flag::on("LLM170_NO_PREFIX");
+    let prefix_ok = true; // plans/115 env 정리: NO_PREFIX 폐기 — 접두 캐시 항시
     let pick = (0..slots.len())
         .filter(|&i| slots[i].job.is_none())
         .map(|i| {
@@ -1275,11 +1275,7 @@ fn finish_slot(s: &mut Slot, eng: &mut Engine, i: usize, eos: u32) {
             }
             let mut full = j.tokens.clone();
             full.extend(toks);
-            if !llm170_diag::flag::on("LLM170_NO_PREFIX") {
-                s.cached = full;
-            } else {
-                eng.reset_seq(i);
-            }
+            s.cached = full;
         } else {
             eng.reset_seq(i);
         }

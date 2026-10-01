@@ -114,8 +114,8 @@ impl DecoderState {
                     }
                 }
                 // plans/46: 프리필 융합 AR8 (split3+l2+beta_g 인라인) — 기본.
-                let ar8f_on = llm170_diag::flag::ne0("LLM170_VK_AR8F");
-                if ar8f_on {
+                {
+                    // plans/46: 프리필 융합 AR8 — 기본(plans/115 env 정리).
                     let dtb = self
                         .consts
                         .get(&format!("blk.{il}.dt_bias"))
@@ -156,114 +156,8 @@ impl DecoderState {
                         d_state as u32 / 8,
                         1,
                     )?;
-                } else {
-                    // split3 — flat total*t
-                    {
-                        let total = 2 * k_len + v_len;
-                        let push = Self::push_u32s(&[k_len as u32, k_len as u32, v_len as u32]);
-                        self.run_pipe(
-                            "split3",
-                            SPLIT3_SPV,
-                            4,
-                            12,
-                            &[
-                                self.b_gconv.buf,
-                                self.b_gq.buf,
-                                self.b_gk.buf,
-                                self.b_gv.buf,
-                            ],
-                            &push,
-                            (total * t).div_ceil(64) as u32,
-                            1,
-                            1,
-                        )?;
-                    }
-                    // l2 — grid (2*ng, t)
-                    {
-                        let mut push = self.eps.to_le_bytes().to_vec();
-                        push.extend(Self::push_u32s(&[d_state as u32, self.n_group as u32]));
-                        self.run_pipe(
-                            "l2",
-                            L2_SPV,
-                            2,
-                            12,
-                            &[self.b_gq.buf, self.b_gk.buf],
-                            &push,
-                            (2 * self.n_group) as u32,
-                            t as u32,
-                            1,
-                        )?;
-                    }
-                    // beta_g — n_h = dt_rank*t
-                    {
-                        let dtb = self
-                            .consts
-                            .get(&format!("blk.{il}.dt_bias"))
-                            .cloned()
-                            .ok_or("dtb")?;
-                        let ssa = self
-                            .consts
-                            .get(&format!("blk.{il}.ssm_a"))
-                            .cloned()
-                            .ok_or("ssa")?;
-                        let push = Self::push_u32s(&[(dt_rank * t) as u32, dt_rank as u32]);
-                        self.run_pipe(
-                            "beta_g",
-                            BETA_G_SPV,
-                            5,
-                            8,
-                            &[
-                                self.b_gb.buf,
-                                self.b_ga.buf,
-                                dtb.buf,
-                                ssa.buf,
-                                self.b_gbg.buf,
-                            ],
-                            &push,
-                            (dt_rank * t).div_ceil(64) as u32,
-                            1,
-                            1,
-                        )?;
-                    }
-                    // AR — PC.t 내부 순차
-                    {
-                        let scale = 1.0f32 / (d_state as f32).sqrt();
-                        let mut push = Self::push_u32s(&[
-                            d_state as u32,
-                            k_len as u32,
-                            v_len as u32,
-                            dt_rank as u32,
-                            self.n_group as u32,
-                        ]);
-                        push.extend_from_slice(&scale.to_le_bytes());
-                        push.extend_from_slice(&(t as u32).to_le_bytes());
-                        // plans/40: ar4 — 열 4개 ILP. 옵트아웃 LLM170_VK_AR4=0.
-                        let arsel = std::env::var("LLM170_VK_AR4").unwrap_or_else(|_| "8".into());
-                        let (arnm, arspv, argy) = match arsel.as_str() {
-                            "0" => ("gdn_ar", GDN_AR_SPV, d_state as u32),
-                            "4" => ("gdn_ar4", GDN_AR4_SPV, d_state as u32 / 4),
-                            _ => ("gdn_ar8", GDN_AR8_SPV, d_state as u32 / 8),
-                        };
-                        self.run_pipe(
-                            arnm,
-                            arspv,
-                            6,
-                            28,
-                            &[
-                                self.st_gdn[recr_idx][seq].buf,
-                                self.b_gq.buf,
-                                self.b_gk.buf,
-                                self.b_gv.buf,
-                                self.b_gbg.buf,
-                                self.b_go.buf,
-                            ],
-                            &push,
-                            dt_rank as u32,
-                            argy,
-                            1,
-                        )?;
-                    }
-                } // else (구 체인)
+                }
+                // (구 체인 폴백 삭제 — plans/115 env 정리: 융합 AR8 상시)
                 // norm_gated — grid (dt_rank, t)
                 {
                     let sn = self
@@ -379,10 +273,7 @@ impl DecoderState {
                 // flash — 프리필(t≥2, GQA ≤6:1)은 다중쿼리 판(plans/83 D):
                 // K/V 타일을 24쿼리가 공유해 장문 프리필(pp4096) 어텐션 트래픽·
                 // 지연을 1/24로 줄인다. 폴백(구 판)은 LLM170_VK_NOGQ=1.
-                if t >= 2
-                    && n_head / n_kv.max(1) <= 6
-                    && std::env::var_os("LLM170_VK_NOGQ").is_none()
-                {
+                if t >= 2 && n_head / n_kv.max(1) <= 6 {
                     // plans/92 P3: 레지스터 상주판(qsa_flash_reg) — hip wk16 구조
                     // 이식(LDS·배리어 0, 점유 8WG/CU급). 종전 gq는 LDS 61KB/WG로
                     // 점유 1WG/CU — 장문 프리필 어텐션이 npmax 선형 지연의 주벚.

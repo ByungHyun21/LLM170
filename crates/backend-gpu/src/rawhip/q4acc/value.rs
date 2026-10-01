@@ -1,7 +1,6 @@
 //! q4acc 값 경로 — GEMM/GEMV 런치 기계 + MatmulHost·EwOps (plans/78 R1).
 
 use super::*;
-use crate::rawhip::env_on;
 
 impl Q4Acc {
     /// 프레임 활성 q8 준비 — x(프레임 f32) → xq 스크래치. (xq, xq_w)
@@ -214,7 +213,7 @@ impl Q4Acc {
             // max_rel 2.1e-5 (q5_1 양자화 오차 ~1e-2의 1/500)이고 230토큰
             // greedy 스트림이 동일하다 — llama.cpp/vLLM과 같은 허용 오차 계약.
             // 비트 동일 판은 LLM170_Q5_1_EXACT=1로 복귀.
-            let mmq = t >= 16 && !env_on("LLM170_Q5_1_EXACT") && ty == ggml_id(GgmlType::Q5_1);
+            let mmq = t >= 16 && ty == ggml_id(GgmlType::Q5_1);
             let kern = if mmq {
                 "q4_gemm_q5_1_m"
             } else if TILED {
@@ -279,7 +278,7 @@ impl Q4Acc {
         // 비트 동일이어야 한다(행핀이 gemv 경로를 잡는다).
         let pin_tile = crate::rawhip::ctx::PREFILL_PIN.load(std::sync::atomic::Ordering::Relaxed)
             && !crate::rawhip::ctx::VERIFY_ROW_PIN.load(std::sync::atomic::Ordering::Relaxed);
-        if (t >= 16 || pin_tile) && !env_on("LLM170_Q4_NO_TILE") {
+        if t >= 16 || pin_tile {
             // j128/v4 계열(=8/12/13/14/23)은 사분면 지원 — 그 외 타입만 128씩 분할.
             let tq_mode = matches!(
                 ty,
@@ -485,12 +484,7 @@ impl Q4Acc {
         let ydev = {
             let mut yb = self.yf.lock().map_err(|e| e.to_string())?;
             // f16 경로는 128 사분면 경계까지 쓰므로 여유를 둔다(행 < t 만 사용).
-            let need = if env_on("LLM170_F16_ACC") {
-                t.div_ceil(128) * 128 * n_out * 4
-            } else {
-                t * n_out * 4
-            };
-            yb.ensure(&self.ctx, need)?
+            yb.ensure(&self.ctx, t * n_out * 4)?
         };
         // 실측(2026-09-14, pp2048): 아래 할당+d2h+행 산포가 청크당 ~0.75s(8%)를
         // 쓴다(LLM170_Q4ACC_TIME으로 d2h=1.5s/400콜). 스테이지가 행 벡터 대신
@@ -527,17 +521,7 @@ impl Q4Acc {
             // 동일했지만, dequant가 **호출마다** 돌아 상각되지 않는다. plans/66 P1의
             // 실제 내용은 "그래프당 1회 dequant 후 캐시"이고 그게 빠져 있다.
             let ty0 = ggml_id(w.ty);
-            if t >= 32
-                && ty0 == 8
-                && env_on("LLM170_F16_ACC")
-                && self
-                    .ctx
-                    .gemm_f16_deq(ty0, xf as *const u8, w_slice, n_in, n_out, t, ydev)
-                    .is_ok()
-            {
-            } else {
-                self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
-            }
+            self.launch_gemm(ty0, xq, w_slice, n_in, n_out, xq_w, t, ydev)?;
         }
         let k_ns = t_k.elapsed().as_nanos() as u64;
         let t_d = std::time::Instant::now();

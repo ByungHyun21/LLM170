@@ -139,9 +139,10 @@ impl RawCtx {
             let o5 = CString::new("-I/opt/rocm/include").unwrap();
             // exp_cr 기본을 디바이스 __expf로 (f64 호너 제거, 2026-09-12).
             // 효과: tg +1.0%, pp +0.55%, judge 16/19 -> 17/19 (llama와 더 가까움).
-            // LLM170_EXACTEXP=1이면 glibc 비트일치 f64 경로 복원.
+            // FASTEXP exp2 근사 경로(측정 승격: tg +1.0%, pp +0.55%, judge
+            // 16/19→17/19 — plans/115 env 정리로 상시 고정).
             let ofast = CString::new("-DLLM170_FASTEXP").unwrap();
-            let fastexp = !env_on("LLM170_EXACTEXP");
+            let fastexp = true;
             let mut opts = vec![
                 o1.as_ptr(),
                 o2.as_ptr(),
@@ -201,8 +202,7 @@ impl RawCtx {
             // 오프라인 코드오브젝트 병행 로드 (wave32 커널 등).
             // 기본: 바이너리 임베딩(crates/.../co/*.co, gfx1151 빌드).
             // LLM170_CO*_PATH가 있으면 그 파일이 우선 (커널 실험 오버라이드).
-            // LLM170_NO_CO: 전부 생략 (hipRTC wm/mm + GEMV 폴백 측정용).
-            if !env_on("LLM170_NO_CO") {
+            {
                 let slots: &[(u8, &str, &[u8], &[&str])] = &[
                     (
                         CO_V4,

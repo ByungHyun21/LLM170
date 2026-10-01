@@ -179,10 +179,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // frame_quant)과 K-분할 reduce·카운팅 정렬 기계를 통째로 건너뛰고
         // 전문가 그룹 GEMM을 런치 1회로 마친다. 킬스위치 LLM170_HIP_DMMV_OFF
         // (기본 ON=사용 — 끄면 종전 ge_ids/w_ids direct-ids 경로로 복귀).
-        if crate::common::moe::ids2_takes(rows, self.t_cur(), ws.ty)
-            && !f32w
-            && !env_on("LLM170_HIP_DMMV_OFF")
-        {
+        if crate::common::moe::ids2_takes(rows, self.t_cur(), ws.ty) && !f32w {
             let idp = self.fptr(ids)?;
             let kern: &'static str = if ws.ty == GgmlType::Q4K {
                 "q4_gemm_q4k_dmmv_ids"
@@ -553,16 +550,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // LLM170_MOE_GROUP_SYNC=1이면 즉시 동기(스트림 드레인) —
                     // 호스트 경로와 같은 순서 조건을 만들어 순서 효과를 검정한다.
                     // 이분법: 비동기 예약 자체를 건너뛴다(폴백은 동기 d2h로).
-                    let pinned_off = if env_on("LLM170_MOE_GROUP_NOD2H") {
-                        std::ptr::null_mut()
-                    } else if env_on("LLM170_MOE_GROUP_SYNC") {
-                        let buf = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
-                        self.ctx.d2h_wait()?;
-                        buf
-                    } else {
-                        // +4B: 오프셋 뒤에 디바이스가 계산한 rows_pad가 붙어 있다(가드용).
-                        self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?
-                    };
+                    // +4B: 오프셋 뒤에 디바이스가 계산한 rows_pad가 붙어 있다(가드용).
+                    // (plans/115 env 정리: MOE_GROUP_SYNC/NOD2H 폐기 — 비동기 issue
+                    // 기본 경로 승격. 소비 시점 d2h_wait이 순서를 보장한다.)
+                    let pinned_off = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
                         generation,
@@ -1441,10 +1432,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         // 108 P7: t=1 q8_0 전용 그룹은 dmmv — 프레임 활성 양자화를 건너뛰고
         // f32 활성 × 커널 내 디양자화 가중 직접 dot(승인된 산술 클래스
         // 변경, 원장 118). 킬스위치 LLM170_HIP_DMMV_OFF=1.
-        let dmmv_on = t == 1
-            && !f32w
-            && ws.iter().all(|w| ggml_id(w.ty) == 8)
-            && std::env::var_os("LLM170_HIP_DMMV_OFF").is_none();
+        let dmmv_on = t == 1 && !f32w && ws.iter().all(|w| ggml_id(w.ty) == 8);
         if ws
             .iter()
             .all(|w| w.n_in == ws[0].n_in && f32_family(w.ty) == f32w)

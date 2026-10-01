@@ -103,8 +103,7 @@ impl DecoderState {
                     let ga = self.b_ga.clone();
                     self.npck_mark("ga", il, &ga, 0, 16);
                 }
-                let arf_on = llm170_diag::flag::ne0("LLM170_VK_ARF");
-                if arf_on && gskip & 1 == 0 {
+                if gskip & 1 == 0 {
                     let dtb2 = self
                         .consts
                         .get(&format!("blk.{il}.dt_bias"))
@@ -222,38 +221,6 @@ impl DecoderState {
                         )?;
                     }
                 } // else (구 체인)
-                if !arf_on && gskip & 1 == 0 {
-                    {
-                        let scale = 1.0f32 / (d_state as f32).sqrt();
-                        let mut push = Self::push_u32s(&[
-                            d_state as u32,
-                            k_len as u32,
-                            v_len as u32,
-                            dt_rank as u32,
-                            self.n_group as u32,
-                        ]);
-                        push.extend_from_slice(&scale.to_le_bytes());
-                        push.extend_from_slice(&1u32.to_le_bytes());
-                        self.run_pipe(
-                            "gdn_ar",
-                            GDN_AR_SPV,
-                            6,
-                            28,
-                            &[
-                                self.st_gdn[recr_idx][seq].buf,
-                                self.b_gq.buf,
-                                self.b_gk.buf,
-                                self.b_gv.buf,
-                                self.b_gbg.buf,
-                                self.b_go.buf,
-                            ],
-                            &push,
-                            dt_rank as u32,
-                            d_state as u32,
-                            1,
-                        )?;
-                    }
-                }
                 // norm_gated (비트 2)
                 if gskip & 2 == 0 {
                     {
@@ -471,16 +438,7 @@ impl DecoderState {
                 self.npck_mark("L", il, &b, 0, 64);
             }
             // 실험: L0 FFN 직후 attn_q gemv 강제 (층 위치 vs 가중치 분리)
-            if llm170_diag::flag::on("LLM170_VK_FORCE_AQ") && il == 0 {
-                self.gemv_w(
-                    self.b_xn.buf,
-                    self.b_xq_n.buf,
-                    "blk.3.attn_q.weight",
-                    self.b_aq.buf,
-                    1,
-                    n,
-                )?;
-            }
+            // (VK_FORCE_AQ L0 강제 실험은 plans/115 env 정리로 삭제)
         }
         // ── head: gemv(output) — output_norm은 마지막 addrms에 융합, quant는
         // gemv_w 폴백 시 내부 수행. 트렁크와 동일 배치로 단일 제출·대기 (G3).

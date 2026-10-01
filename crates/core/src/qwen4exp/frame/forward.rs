@@ -200,7 +200,7 @@ pub(crate) fn frame_forward_ex(
             // (red[0] 소비-재사용 배리어 부재) — conv/res는 합성 체인 프로브로
             // 무죄(전 단계 ≤1.9e-6). 수리 완료, t>1 포함 전 t 디바이스 경로.
             // QA-5(plans/114): 핫패스 env — flag 스냅샷 판독(원장 104).
-            if !llm170_diag::flag::on("LLM170_PLE_HOST") {
+            {
                 let heads = hp.ple_heads_per_ngram * 2;
                 let emb_w = heads * hp.ple_head_dim * t;
                 let mut emb = vec![0.0f32; emb_w];
@@ -208,28 +208,20 @@ pub(crate) fn frame_forward_ex(
                     // plans/93: GPU gather 우선 — IQ4_NL 테이블 상주 + 커널.
                     // CPU MT(59ms) 대비 ~200×. 폴백은 CPU MT.
                     // plans/111 W4c: 기본 ON(=0 킬스위치) — hip 구현 완료.
-                    let gpu_gather_ok = if !llm170_diag::flag::ne0("LLM170_PLE_GGPU") {
-                        false
-                    } else {
-                        match (|| -> Result<(), Q4Error> {
-                            let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
-                            let tdata: &[u8] =
+                    let gpu_gather_ok = match (|| -> Result<(), Q4Error> {
+                        let (tptr, tlen, _tty, thd) = ctx.model.ple_table_view()?;
+                        let tdata: &[u8] =
                                 // SAFETY (107 W8): ple_table_view 계약 — ptr..ptr+len은 PLE 테이블 mmap 유효 범위; gather는 읽기 전용(동시 쓰기 없음).
                                 unsafe { std::slice::from_raw_parts(tptr as *const u8, tlen) };
-                            acc.ple_gather_dev(tptr, tdata, &ple_rows, f.ple_emb, thd)
-                                .map_err(Q4Error::Io)
-                        })() {
-                            Ok(()) => true,
-                            Err(e) => {
-                                static ONCE: std::sync::Once = std::sync::Once::new();
-                                crate::qwen4exp::frame::fb_incr(
-                                    crate::qwen4exp::frame::FbId::PleGgpu,
-                                );
-                                ONCE.call_once(|| {
-                                    eprintln!("# ple-ggpu: 실패 — CPU MT 폴백 ({e})")
-                                });
-                                false
-                            }
+                        acc.ple_gather_dev(tptr, tdata, &ple_rows, f.ple_emb, thd)
+                            .map_err(Q4Error::Io)
+                    })() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            crate::qwen4exp::frame::fb_incr(crate::qwen4exp::frame::FbId::PleGgpu);
+                            ONCE.call_once(|| eprintln!("# ple-ggpu: 실패 — CPU MT 폴백 ({e})"));
+                            false
                         }
                     };
                     // plans/93: 멀티스레드 gather — ple_block과 동일 병렬화.
@@ -814,7 +806,7 @@ pub(super) fn qsa_frame(
     // d2h 4회(동기 드레인) + 호스트 점수/정렬(0.8-1.5ms/층)을 건너뛰고
     // 디바이스 풀(KV·idx)만 적립한다. 실패하면 종전 호스트 경로로 폴백.
     // 킬스위치 LLM170_QSA_NOID=1.
-    if t > 1 && pos0 as usize + t < hp.idx_top_k + r && !llm170_diag::flag::on("LLM170_QSA_NOID") {
+    if t > 1 && pos0 as usize + t < hp.idx_top_k + r {
         let pos0u = pos0 as usize;
         let ikw = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let dev = acc
@@ -867,7 +859,7 @@ pub(super) fn qsa_frame(
     // ─── plans/89 재개: 프리필 다중 토큰 디바이스 선택 — d2h 4회(배치
     // 플러시)와 호스트 점수/정렬을 전부 소거. 실패 시 종전 호스트 경로.
     // 스위치 LLM170_QSA_NODEVSEL=1, 검증 LLM170_QSA_DEVCHECK(호스트 병행).
-    if t > 1 && !llm170_diag::flag::on("LLM170_QSA_NODEVSEL") {
+    if t > 1 {
         let ikw3 = model.f32_vec4(&format!("blk.{il}.indexer.k_norm.weight"))?;
         let iqw3 = model.f32_vec4(&format!("blk.{il}.indexer.q_norm.weight"))?;
         let devsel = acc.qsa_sel_dev_mt(
@@ -988,16 +980,13 @@ pub(super) fn qsa_frame(
     // 직접 읽는다(매 층 매 스텝의 캐시 재업로드 8k 문맥 32MB 제거).
     // 미지원/실측 실패 시 기존 업로드 경로(qsa_attention_dev)로, 그것도
     // 실패하면 CPU 재계산으로 — 3단 폴백.
-    let res = if llm170_diag::flag::on("LLM170_QSA_NORES") {
-        Err("진단: 상주 풀 비활성".to_string())
-    } else {
-        acc.qsa_kv_dev(full_idx, seq, b.k, b.v, t, pos0 as usize, n_kv, hd)
-            .and_then(|(kc, vc)| {
-                acc.qsa_attention_dev_res(
-                    b.q, kc, vc, &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, t, b.attn,
-                )
-            })
-    };
+    let res = acc
+        .qsa_kv_dev(full_idx, seq, b.k, b.v, t, pos0 as usize, n_kv, hd)
+        .and_then(|(kc, vc)| {
+            acc.qsa_attention_dev_res(
+                b.q, kc, vc, &sel_idx, &sel_off, kq_scale, n_head, n_kv, hd, t, b.attn,
+            )
+        });
     let ck = &seq_st.kv_k[full_idx][..kn_max];
     let cv = &seq_st.kv_v[full_idx][..kn_max];
     if llm170_diag::flag::on("LLM170_QSA_RESCHECK")
