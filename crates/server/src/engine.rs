@@ -509,6 +509,18 @@ fn pick(s: &mut Slot, logits: &[f32]) -> u32 {
     }
 }
 
+/// 슬롯 로짓 → 토큰 (top-k 후보 경로) — plans/115 A-2.
+fn pick_cands(s: &mut Slot, cands: &[(f32, u32)]) -> u32 {
+    match &mut s.sampler {
+        Some(sm) if !sm.is_greedy() => sm.sample_cands(cands),
+        _ => cands
+            .iter()
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|&(_, i)| i)
+            .unwrap_or(0),
+    }
+}
+
 /// Q4 배치/순차 디코드(종전 Q4 arm 본체 — P15⑤ 스펙 분기로부터 분리).
 fn q4_plain_decode(
     e: &mut Box<llm170_core::qwen4exp::layers::Engine4>,
@@ -520,10 +532,11 @@ fn q4_plain_decode(
         .any(|&i| slots[i].sampler.as_ref().is_some_and(|sm| !sm.is_greedy()))
     {
         let toks: Vec<u32> = active.iter().map(|&i| slots[i].next).collect();
-        match e.decode_batch(active, &toks) {
+        // plans/115 A-2: GPU top-k 후보 경로 — 미지원 백엔드는 전체 로짓 폴백
+        match e.decode_batch_topk(active, &toks) {
             Ok(rows) => {
                 for (row, &i) in active.iter().enumerate() {
-                    let t = pick(&mut slots[i], &rows[row]);
+                    let t = pick_cands(&mut slots[i], &rows[row]);
                     slot_emit(&mut slots[i], t);
                 }
             }
