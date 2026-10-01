@@ -529,7 +529,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // plans/115 D(원장 153): t>1 디바이스 그룹화 — Q5K 그룹 타일
                 // (q4_gemm_q5k_gm) 추가로 전 투영이 디바이스 테이블 경로 →
                 // 그래프 캡처 호환. bound 그리드 + 센티널.
-                if ne <= 512 && rows > 0 {
+                if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
                     // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
@@ -1022,7 +1022,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
                 g.ensure(&self.ctx, rows_pad * n_out * 4)?
             };
-            let per_expert_w = n_out * ((n_in >> 8) * 44); // 전문가 전체 워드 (n_out × 행워드)
+            let per_expert_w = n_out * ((n_in >> 8) * 44); // 전문가 전체 워드
+            let smem = (16 * ((n_in >> 8) * 44) * 4) as u32; // 16행 × wrow × 4B
             let (mut x_p, mut w_p, mut o_p, mut tx_p) = (
                 xg as *mut std::ffi::c_void,
                 wd as *mut std::ffi::c_void,
@@ -1036,11 +1037,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 rows_pad as i32,
                 per_expert_w as i32,
             );
-            let _ = &mut tt; // rows_pad는 bound — 센티널이 초과 타일 탈출
             let mut args: Vec<*mut std::ffi::c_void> = vec![
                 (&mut x_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut w_p) as *mut _ as *mut std::ffi::c_void,
-                self.ctx.scratch(4)? as *mut std::ffi::c_void, // part
+                self.ctx.scratch(4)? as *mut std::ffi::c_void,
                 (&mut o_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
                 (&mut ni) as *mut _ as *mut std::ffi::c_void,
@@ -1049,8 +1049,54 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 (&mut tt) as *mut _ as *mut std::ffi::c_void,
                 (&mut ew) as *mut _ as *mut std::ffi::c_void,
             ];
-            self.ctx.launch3(
+            self.ctx.launch3_dyn(
                 "q4_gemm_q5k_gm",
+                n_out.div_ceil(16).min(65535) as u32,
+                rows_pad.div_ceil(16) as u32,
+                1,
+                256,
+                smem,
+                &mut args,
+            )?;
+            let scat = inv_pad_d;
+            self.rows_permute_dev(ygp, scat as *mut u8, op_, n_out, rows)?;
+            return Ok(());
+        }
+        // plans/115 D: 폴백 도달 기록 — 그래프 캡처 호환성 판정(웜업 청크 설정).
+        // plans/115 D(원장 154): Q8_0 그룹 타일 — 그래프 캡처 호환(폴백 회피).
+        if ws.ty == GgmlType::Q8_0 && !f32w && rows > 0 && rows_pad_d != 0 {
+            let ygp = {
+                let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
+                g.ensure(&self.ctx, rows_pad * n_out * 4)?
+            };
+            let per_expert_b = n_out * (n_in >> 5) * 34; // 바이트/전문가
+            let (mut x_p, mut w_p, mut o_p, mut tx_p) = (
+                xg as *mut std::ffi::c_void,
+                wd as *mut std::ffi::c_void,
+                ygp as *mut std::ffi::c_void,
+                tilexp_d as *mut std::ffi::c_void,
+            );
+            let (mut ni, mut no, mut xw, mut tt, mut eb) = (
+                n_in as i32,
+                n_out as i32,
+                row_u32 as i32,
+                rows_pad as i32,
+                per_expert_b as i32,
+            );
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                self.ctx.scratch(4)? as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut eb) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_gemm_q8_gm",
                 n_out.div_ceil(16).min(65535) as u32,
                 rows_pad.div_ceil(16) as u32,
                 1,
@@ -1061,8 +1107,14 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             self.rows_permute_dev(ygp, scat as *mut u8, op_, n_out, rows)?;
             return Ok(());
         }
-        // plans/115 D: 폴백 도달 기록 — 그래프 캡처 호환성 판정(웜업 청크 설정).
         MOE_FALLBACK_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("LLM170_PF_GRAPH_DEBUG").is_some() {
+            eprintln!(
+                "# pfgraph fallback: ty={:?} f32w={f32w} rows={rows} rpd={}",
+                ws.ty,
+                rows_pad_d != 0
+            );
+        }
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
             self.ctx.d2h_wait()?;
             // 오프셋 + 그 뒤 4B(디바이스가 계산한 rows_pad)를 함께 읽어 **상한을
