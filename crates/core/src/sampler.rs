@@ -114,6 +114,127 @@ impl Sampler {
     }
 
     /// logits → 토큰. greedy시 argmax (동률 최저 인덱스 — `greedy_from` 동일 의미).
+    /// plans/115 A-2: GPU top-k 후보에서 샘플링 — (val, idx) 쌍 입력.
+    /// 전체 로짓이 아닌 상위 후보만으로 페널티·top_k·softmax·top_p·min_p 수행.
+    /// 페널티는 값 감소 방향만 작동하므로 후보 집합이 사전 top-K의 상위집합이
+    /// 안전하다(누락 토큰은 페널티 후에도 상위권 진입 불가).
+    pub fn sample_cands(&mut self, cands: &[(f32, u32)]) -> u32 {
+        if self.is_greedy() {
+            return cands
+                .iter()
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|&(_, i)| i)
+                .unwrap_or(0);
+        }
+        let mut cand: Vec<(u32, f32)> = cands.iter().map(|&(v, i)| (i, v)).collect();
+
+        // ① repeat penalty — 후보 내 최근 토큰만 감소 (누락 토큰은 불필요:
+        // 페널티가 값을 낮추기만 하므로 후보 밖 토큰은 후보 안으로 못 들어온다)
+        if self.params.repeat_penalty != 1.0 && !self.recent.is_empty() {
+            let p = self.params.repeat_penalty;
+            let mut uniq: Vec<u32> = Vec::with_capacity(self.recent.len());
+            for &t in &self.recent {
+                if !uniq.contains(&t) {
+                    uniq.push(t);
+                }
+            }
+            for c in cand.iter_mut() {
+                if uniq.contains(&c.0) {
+                    if c.1 > 0.0 {
+                        c.1 /= p;
+                    } else {
+                        c.1 *= p;
+                    }
+                }
+            }
+        }
+        // QA-30: temp<=0은 페널티 후 argmax
+        if self.params.temperature <= 0.0 {
+            return cand
+                .into_iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+        // ③ top_k — 이미 GPU 후보로 사전 필터됨. 파라미터 top_k가 더 작으면 추가 절단
+        if self.params.top_k > 0 && cand.len() > self.params.top_k {
+            cand.select_nth_unstable_by(self.params.top_k - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            cand.truncate(self.params.top_k);
+        }
+        cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // ② temperature
+        if self.params.temperature > 0.0 && self.params.temperature != 1.0 {
+            let t = self.params.temperature;
+            for c in cand.iter_mut() {
+                c.1 /= t;
+            }
+        }
+
+        // softmax
+        let max = cand.first().map(|&(_, v)| v).unwrap_or(0.0);
+        let probs: Vec<f64> = cand
+            .iter()
+            .map(|&(_, v)| ((v - max) as f64).exp())
+            .collect();
+        let sum: f64 = probs.iter().sum();
+        if sum <= 0.0 || !sum.is_finite() {
+            return cand.first().map(|&(i, _)| i).unwrap_or(0);
+        }
+        let mut probs: Vec<f64> = probs.iter().map(|&p| p / sum).collect();
+
+        // ④ top_p nucleus
+        if self.params.top_p < 1.0 {
+            let mut cum = 0.0;
+            let mut keep = probs.len();
+            for (i, &p) in probs.iter().enumerate() {
+                cum += p;
+                if cum >= self.params.top_p as f64 {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep);
+            cand.truncate(keep);
+            let s: f64 = probs.iter().sum();
+            if s > 0.0 {
+                for p in probs.iter_mut() {
+                    *p /= s;
+                }
+            }
+        }
+        // ⑤ min_p
+        if self.params.min_p > 0.0 {
+            let max_p = probs.first().copied().unwrap_or(0.0);
+            let thr = max_p * self.params.min_p as f64;
+            let n_keep = probs.iter().take_while(|&&p| p >= thr).count();
+            probs.truncate(n_keep);
+            cand.truncate(n_keep);
+            let s: f64 = probs.iter().sum();
+            if s > 0.0 {
+                for p in probs.iter_mut() {
+                    *p /= s;
+                }
+            }
+        }
+        // ⑥ sample — 기존 난수 소스 재사용
+        let r = self.rng.next_f64();
+        self.sample_from(&cand, &probs, r)
+    }
+
+    fn sample_from(&self, cand: &[(u32, f32)], probs: &[f64], r: f64) -> u32 {
+        let mut cum = 0.0;
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if r < cum {
+                return cand.get(i).map(|&(idx, _)| idx).unwrap_or(0);
+            }
+        }
+        cand.last().map(|&(idx, _)| idx).unwrap_or(0)
+    }
+
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         if self.is_greedy() {
             return crate::matmul::greedy_from(logits);
