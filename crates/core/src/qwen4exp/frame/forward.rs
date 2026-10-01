@@ -150,6 +150,23 @@ pub(crate) fn frame_forward_ex(
     let mut ple_dev = false;
     let mut recr_idx = 0usize;
     let mut full_idx = 0usize;
+    // plans/115 D(원장 152): 프리필 그래프 캡처 — 층 루프의 런치열을 그래프로.
+    // 웜업 1청크 후부터(할당·업로드 정착). 실패 시 sticky false로 종전 경로.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static PF_WARM: AtomicU64 = AtomicU64::new(0);
+    static PF_GRAPH_OK: AtomicBool = AtomicBool::new(true);
+    // MoE 폴백(Q5K 등 호스트 오프셋 판독) 사용 모델은 캡처 불가 — 웜업 청크의
+    // 첫 폴백 도달이 static을 설정, 2청차부터 이 게이트가 닫힌다.
+    let moe_fallback_free = acc.moe_graph_capable();
+    let pf_graph_on = t > 1
+        && std::env::var_os("LLM170_PF_NOGRAPH").is_none()
+        && PF_GRAPH_OK.load(Ordering::Relaxed)
+        && moe_fallback_free
+        && PF_WARM.fetch_add(1, Ordering::Relaxed) >= 1;
+    if pf_graph_on && acc.pf_graph(true).is_err() {
+        PF_GRAPH_OK.store(false, Ordering::Relaxed);
+    }
+    let pf_graph_active = pf_graph_on && PF_GRAPH_OK.load(Ordering::Relaxed);
     for il in 0..hp.n_layer {
         if trace {
             eprintln!(
@@ -535,6 +552,11 @@ pub(crate) fn frame_forward_ex(
         f.last_res_hc_rows = rows.chunks(hc * n).map(|c| c.to_vec()).collect();
     }
 
+    // 프리필 그래프 종료 — 인스턴스화+발행(층 루프의 전체 런치열).
+    if pf_graph_active && acc.pf_graph(false).is_err() {
+        PF_GRAPH_OK.store(false, Ordering::Relaxed);
+        eprintln!("# pf-graph: 캡처 실패 — 이후 청크 종전 경로");
+    }
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
     if pf_on {
         pf_mark = std::time::Instant::now();
