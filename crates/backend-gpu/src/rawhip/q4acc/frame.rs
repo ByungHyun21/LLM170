@@ -526,11 +526,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // 배리어 2종은 제거됐으나(moed2h·QSA 항등 업로드) 패딩 도메인
                 // gm/ge가 호스트 테이블 대비 5× 느림(타일 수 동일·원인 미상 —
                 // 원장 151). t=1로 복귀, 상세 기록.)
-                // (plans/115 D 원장 152-153 — t>1 디바이스 그룹화는 그래프 캡처의
-                // 전제지만 FN의 Q5K MoE 투영이 호스트 오프셋 폴백을 써 캡처 불가
-                // → 그래프 미발화 + bound 그리드 페널티만 남아 t=1로 복귀.
-                // Q5K 디바이스 테이블 타일 커널이 다음 단위.)
-                if self.t_cur() == 1 && ne <= 512 && rows > 0 {
+                // plans/115 D(원장 153): t>1 디바이스 그룹화 — Q5K 그룹 타일
+                // (q4_gemm_q5k_gm) 추가로 전 투영이 디바이스 테이블 경로 →
+                // 그래프 캡처 호환. bound 그리드 + 센티널.
+                if ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
                     // 그 값으로 커널 zero-fill·호스트 버퍼가 어긋나 OOB가 났다.
@@ -1015,6 +1014,53 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let mut off_d2h;
         // plans/68: 디바이스 그룹화 경로의 xg는 **패딩 도메인** — 폴백(전문가별
         // 런치)도 패딩 오프셋(off_pad)에서 구간을 읽어야 행이 맞는다.
+        // plans/115 D(원장 153): Q5_K 그룹 타일 — q4_gemm_q5_1_gm과 동일 패딩
+        // 도메인 구조. 폴백(호스트 오프셋) 대신 디바이스 tilexp를 써 그래프
+        // 캡처 호환(FN의 up_exps가 Q5K — 원장 153의 마지막 관문).
+        if ws.ty == GgmlType::Q5K && !f32w && rows > 0 && rows_pad_d != 0 {
+            let ygp = {
+                let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
+                g.ensure(&self.ctx, rows_pad * n_out * 4)?
+            };
+            let per_expert_w = n_out * ((n_in >> 8) * 44); // 전문가 전체 워드 (n_out × 행워드)
+            let (mut x_p, mut w_p, mut o_p, mut tx_p) = (
+                xg as *mut std::ffi::c_void,
+                wd as *mut std::ffi::c_void,
+                ygp as *mut std::ffi::c_void,
+                tilexp_d as *mut std::ffi::c_void,
+            );
+            let (mut ni, mut no, mut xw, mut tt, mut ew) = (
+                n_in as i32,
+                n_out as i32,
+                row_u32 as i32,
+                rows_pad as i32,
+                per_expert_w as i32,
+            );
+            let _ = &mut tt; // rows_pad는 bound — 센티널이 초과 타일 탈출
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut x_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut w_p) as *mut _ as *mut std::ffi::c_void,
+                self.ctx.scratch(4)? as *mut std::ffi::c_void, // part
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut tx_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut ni) as *mut _ as *mut std::ffi::c_void,
+                (&mut no) as *mut _ as *mut std::ffi::c_void,
+                (&mut xw) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+                (&mut ew) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx.launch3(
+                "q4_gemm_q5k_gm",
+                n_out.div_ceil(16).min(65535) as u32,
+                rows_pad.div_ceil(16) as u32,
+                1,
+                256,
+                &mut args,
+            )?;
+            let scat = inv_pad_d;
+            self.rows_permute_dev(ygp, scat as *mut u8, op_, n_out, rows)?;
+            return Ok(());
+        }
         // plans/115 D: 폴백 도달 기록 — 그래프 캡처 호환성 판정(웜업 청크 설정).
         MOE_FALLBACK_USED.store(true, std::sync::atomic::Ordering::Relaxed);
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
