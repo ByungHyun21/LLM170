@@ -343,6 +343,7 @@ extern "C" __global__ void q4_logits_topk_cand(
     }
 }
 
+
 // plans/115 D(원장 154): Q5_K 그룹 타일 — smem 협업 적재 판. 무smem 직독판 대비
 // 가중을 블록 내 16행이 공유(코얼레스드 스테이징). smem = 16×(n_super×44)워드
 // = 27.5KB(n_in=2560) — Q5_1 gm(30KB)와 유사, CDS 이내.
