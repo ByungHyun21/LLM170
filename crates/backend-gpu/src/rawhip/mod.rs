@@ -3,9 +3,7 @@
 //! 실행. 버퍼는 영속 아레나(해제 없음, ADR-0014 동일 규칙). 커널 산술은
 //! core 미러(dot_row_w4a8_*_lane)와 동일 연산열 — to_bits 검증 게이트.
 
-pub mod graph;
 pub mod ktrace;
-pub use graph::*;
 pub use ktrace::*;
 
 use cubecl_hip_sys as hip;

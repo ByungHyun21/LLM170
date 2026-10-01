@@ -740,9 +740,6 @@ impl Q4Acc {
 }
 
 impl llm170_core::matmul::GraphCapture for Q4Acc {
-    fn capture_mark(&self, tag: &str) -> Result<(), String> {
-        unsafe { crate::rawhip::capture_mark(self.ctx.stream, tag) }
-    }
     fn pre_pair(&self, on: bool) {
         self.ctx
             .pre_pair
