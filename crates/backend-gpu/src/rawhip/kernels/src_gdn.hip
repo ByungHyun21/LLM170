@@ -676,3 +676,69 @@ extern "C" __global__ void l2_rows2_scale_w(float* gq, float* gk, float eps, flo
         g[xb + (lane << 2) + j] = g[xb + (lane << 2) + j] * inv;
 }
 
+
+// plans/115 U3: GDN split3 + L2 + scale 융합 — 4런치→1.
+// 입력: gconv[t][conv_ch] → 출력: gq[t][k_len]·gk[t][k_len]·gv[t][v_len].
+// q/k는 d_state 그룹별 L2 정규화 후 q에 1/√d_state 스케일.
+// 블록 = (그룹쌍, 토큰): 32스레드가 q그룹과 k그룹을 각각 처리 + v 병행 복사.
+// v_len은 별도 warp가 처리(전체 그룹 수가 n_group이면 v warp도 포함).
+// 산술: L2는 q4_l2_rows와 동일(32청크 순차 f32 + 레인순 double 결합).
+// 스케일은 개별 곱셈(결합 금지: (v*s)*scale 보존).
+extern "C" __global__ void __launch_bounds__(256) gdn_split_l2_scale(
+        const float* __restrict__ gconv,
+        float* __restrict__ gq, float* __restrict__ gk, float* __restrict__ gv,
+        int conv_ch, int k_len, int v_len, int d_state, float eps, float qs) {
+    // 그리드: (n_group, t) — blockIdx.x = 그룹, blockIdx.y = 토큰
+    const int tok = blockIdx.y;
+    const int grp = blockIdx.x;
+    const int lane = threadIdx.x;  // 0..31
+    const int n_group = gridDim.x;
+    const unsigned long long FULL = 0xffffffffffffffffull;
+
+    // ── q 그룹: gconv[tok][grp*d_state .. +d_state] → L2 → scale → gq
+    {
+        const float* src = gconv + (size_t)tok * conv_ch + (size_t)grp * d_state;
+        float* dst = gq + (size_t)tok * k_len + (size_t)grp * d_state;
+        float part = 0.0f;
+        int chunk = (d_state + 31) >> 5;
+        int lo = lane * chunk;
+        if (lo < d_state) {
+            int hi = min(lo + chunk, d_state);
+            for (int i = lo; i < hi; i++) { float v = src[i]; part += v * v; }
+        }
+        double sum = 0.0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) sum += (double)__shfl_sync(FULL, part, j);
+        float s = 1.0f / fmaxf(sqrtf((float)sum), eps);
+        // 스케일: L2 후 qs 곱 — 개별 곱셈으로 (v*s)*qs
+        for (int i = lane; i < d_state; i += 32) dst[i] = src[i] * s * qs;
+    }
+    __syncwarp();
+
+    // ── k 그룹: gconv[tok][k_len + grp*d_state .. +d_state] → L2 → gk
+    {
+        const float* src = gconv + (size_t)tok * conv_ch + k_len + (size_t)grp * d_state;
+        float* dst = gk + (size_t)tok * k_len + (size_t)grp * d_state;
+        float part = 0.0f;
+        int chunk = (d_state + 31) >> 5;
+        int lo = lane * chunk;
+        if (lo < d_state) {
+            int hi = min(lo + chunk, d_state);
+            for (int i = lo; i < hi; i++) { float v = src[i]; part += v * v; }
+        }
+        double sum = 0.0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) sum += (double)__shfl_sync(FULL, part, j);
+        float s = 1.0f / fmaxf(sqrtf((float)sum), eps);
+        for (int i = lane; i < d_state; i += 32) dst[i] = src[i] * s;
+    }
+    __syncwarp();
+
+    // ── v 복사: 마지막 블록(grp == n_group-1)의 여유 스레드가 처리
+    // v_len = conv_ch - 2*k_len
+    if (grp == n_group - 1 && lane < 32) {
+        const float* src = gconv + (size_t)tok * conv_ch + 2 * k_len;
+        float* dst = gv + (size_t)tok * v_len;
+        for (int i = lane; i < v_len; i += 32) dst[i] = src[i];
+    }
+}

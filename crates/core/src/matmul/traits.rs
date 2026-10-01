@@ -1070,6 +1070,24 @@ pub trait FrameState {
     fn moe_graph_capable(&self) -> bool {
         true
     }
+    /// plans/115 U3: GDN split3+L2×2+scale 융합 — 4런치→1. 기본 no-op(폴백).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_split_l2_scale(
+        &self,
+        _gconv: u64,
+        _gq: u64,
+        _gk: u64,
+        _gv: u64,
+        _conv_ch: usize,
+        _k_len: usize,
+        _v_len: usize,
+        _d_state: usize,
+        _n_group: usize,
+        _t: usize,
+        _eps: f32,
+    ) -> Result<(), String> {
+        Err("gdn_split_l2_scale: 미지원".into())
+    }
     fn pf_graph(&self, _begin: bool) -> Result<(), String> {
         let _ = _begin;
         Ok(()) // no-op 백엔드 — 평범한 런치 경로
