@@ -911,20 +911,28 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             g.ensure(&self.ctx, ybuf_rows * n_out * 4)?
         };
         let xsrc0 = if f32w { xp } else { xq };
+        // plans/116-2: 초기 gather를 지연으로 — gm 계열(q5_1/q5k/q8)은 자체
+        // 패딩 gather를 쓰므로 여기서 모아도 버려진다(permute 331회 중 1/3이
+        // 이 낭비). ge/fallback만 필요한 시점에 모은다.
         // plans/68 레이아웃 일관화: 디바이스 그룹화(rows_pad_d≠0)는 GEMM이
         // **패딩 도메인**(r < *rows_pad, rowexp=패딩 인덱스)으로 읽는다 — gather도
         // perm_pad/bound행으로. 호스트 경로는 종전대로 비패딩 perm_d/rows.
-        if pad_layout {
-            self.rows_permute_dev(
-                xsrc0,
-                perm_pad_d as *mut u8,
-                xg,
-                row_u32,
-                crate::common::moe::grp_bound(rows, ne),
-            )?;
-        } else {
-            self.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)?;
-        }
+        let gather_xg = |me: &Self| -> Result<(), String> {
+            if me.t_cur() == 0 {
+                return Ok(());
+            }
+            if pad_layout {
+                me.rows_permute_dev(
+                    xsrc0,
+                    perm_pad_d as *mut u8,
+                    xg,
+                    row_u32,
+                    crate::common::moe::grp_bound(rows, ne),
+                )
+            } else {
+                me.rows_permute_dev(xsrc0, perm_d as *mut u8, xg, row_u32, rows)
+            }
+        };
         if llm170_core::qwen4exp::frame::stage_skipped("moe") {
             // 진단용(LLM170_STAGE_SKIP=moe): 전문가 GEMM 생략 — 비용 분해, 출력 무효.
             return Ok(());
@@ -1024,6 +1032,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             return Ok(());
         }
         if ws.ty == GgmlType::Q4K && !f32w && rows > 0 {
+            gather_xg(self)?;
             let mut part_p = self.ctx.scratch(4)? as *mut std::ffi::c_void;
             let mut x_p = xg as *mut std::ffi::c_void;
             let mut w_p = wd as *mut std::ffi::c_void;
@@ -1107,15 +1116,35 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         // plans/115 D(원장 153): Q5_K 그룹 타일 — q4_gemm_q5_1_gm과 동일 패딩
         // 도메인 구조. 폴백(호스트 오프셋) 대신 디바이스 tilexp를 써 그래프
         // 캡처 호환(FN의 up_exps가 Q5K — 원장 153의 마지막 관문).
-        if ws.ty == GgmlType::Q5K && !f32w && rows > 0 && rows_pad_d != 0 {
+        // plans/116-2: q5_K·q8_0 전문가도 그룹 타일로 — 종전 rows_pad_d≠0(디바이스
+        // 그룹화 t=1 전용) 게이트 때문에 프리필(호스트 테이블)은 전문가별 폴백
+        // (j128/v4, pp512에서 336+43ms)로 돌았다. 호스트 테이블(perm_pad·tilexp·
+        // rows_pad)은 동일 패딩 도메인을 제공하므로 그대로 소비한다.
+        if ws.ty == GgmlType::Q5K
+            && !f32w
+            && rows > 0
+            && (rows_pad_d != 0 || (tilexp_d != 0 && rows_pad > 0))
+        {
             let ygp = {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
-                g.ensure(&self.ctx, rows_pad * n_out * 4)?
+                g.ensure(&self.ctx, rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4)?
+            };
+            // 입력: 디바이스 경로는 xg가 이미 패딩 도메인. 호스트 경로는
+            // perm_pad으로 자체 패딩 gather(gxp).
+            let xin = if rows_pad_d != 0 {
+                xg
+            } else {
+                let xgp = {
+                    let mut g = self.gxp.lock().map_err(|e| e.to_string())?;
+                    g.ensure(&self.ctx, rows_pad * row_u32 * 4)?
+                };
+                self.rows_permute_dev(xsrc0, perm_pad_d as *mut u8, xgp, row_u32, rows_pad)?;
+                xgp
             };
             let per_expert_w = n_out * ((n_in >> 8) * 44); // 전문가 전체 워드
             let smem = (16 * ((n_in >> 8) * 44) * 4) as u32; // 16행 × wrow × 4B
             let (mut x_p, mut w_p, mut o_p, mut tx_p) = (
-                xg as *mut std::ffi::c_void,
+                xin as *mut std::ffi::c_void,
                 wd as *mut std::ffi::c_void,
                 ygp as *mut std::ffi::c_void,
                 tilexp_d as *mut std::ffi::c_void,
@@ -1154,14 +1183,28 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         }
         // plans/115 D: 폴백 도달 기록 — 그래프 캡처 호환성 판정(웜업 청크 설정).
         // plans/115 D(원장 154): Q8_0 그룹 타일 — 그래프 캡처 호환(폴백 회피).
-        if ws.ty == GgmlType::Q8_0 && !f32w && rows > 0 && rows_pad_d != 0 {
+        if ws.ty == GgmlType::Q8_0
+            && !f32w
+            && rows > 0
+            && (rows_pad_d != 0 || (tilexp_d != 0 && rows_pad > 0))
+        {
             let ygp = {
                 let mut g = self.gyp.lock().map_err(|e| e.to_string())?;
-                g.ensure(&self.ctx, rows_pad * n_out * 4)?
+                g.ensure(&self.ctx, rows_pad.max(crate::common::moe::grp_bound(rows, ne)) * n_out * 4)?
+            };
+            let xin = if rows_pad_d != 0 {
+                xg
+            } else {
+                let xgp = {
+                    let mut g = self.gxp.lock().map_err(|e| e.to_string())?;
+                    g.ensure(&self.ctx, rows_pad * row_u32 * 4)?
+                };
+                self.rows_permute_dev(xsrc0, perm_pad_d as *mut u8, xgp, row_u32, rows_pad)?;
+                xgp
             };
             let per_expert_b = n_out * (n_in >> 5) * 34; // 바이트/전문가
             let (mut x_p, mut w_p, mut o_p, mut tx_p) = (
-                xg as *mut std::ffi::c_void,
+                xin as *mut std::ffi::c_void,
                 wd as *mut std::ffi::c_void,
                 ygp as *mut std::ffi::c_void,
                 tilexp_d as *mut std::ffi::c_void,
@@ -1197,6 +1240,7 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             self.rows_permute_dev(ygp, scat as *mut u8, op_, n_out, rows)?;
             return Ok(());
         }
+        gather_xg(self)?;
         MOE_FALLBACK_USED.store(true, std::sync::atomic::Ordering::Relaxed);
         if std::env::var_os("LLM170_PF_GRAPH_DEBUG").is_some() {
             eprintln!(
