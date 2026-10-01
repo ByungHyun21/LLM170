@@ -198,7 +198,18 @@ pub(crate) fn frame_forward_verify(
         // 3) GDN / QSA — 같은 seq 행 체이닝(np 스테이지 fn이 처리)
         if hp.is_recr(il) {
             gdn_frame_np(
-                acc, model, f, il, &seqs, recr_idx, conv_ch, k_len, v_len, eps, t,
+                acc,
+                model,
+                f,
+                il,
+                &seqs,
+                recr_idx,
+                conv_ch,
+                k_len,
+                v_len,
+                eps,
+                t,
+                &mut [0.0; 4],
             )?;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
             recr_idx += 1;
