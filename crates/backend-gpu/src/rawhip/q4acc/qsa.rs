@@ -437,6 +437,8 @@ impl Q4Acc {
             let pdev = g.ensure(&self.ctx, n_head * n_splits * 32 * 10 * 4)?;
             (sdev, ofdev, pdev)
         };
+        // (비동기 전환은 롤백 — ROCm pageable 스테이징이 호출 시점 완료를
+        // 보장하지 않아 sel 목록 오염·토큰 발산. 원장 151.)
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         let qdev = self.fptr(q)?;
@@ -596,6 +598,8 @@ impl Q4Acc {
             self.ctx
                 .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
         }
+        // (비동기 전환은 롤백 — ROCm pageable 스테이징이 호출 시점 완료를
+        // 보장하지 않아 sel 목록 오염·토큰 발산. 원장 151.)
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         let mut q_p = self.fptr(q)? as *mut std::ffi::c_void;
@@ -719,6 +723,8 @@ impl Q4Acc {
             self.ctx
                 .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
         }
+        // (비동기 전환은 롤백 — ROCm pageable 스테이징이 호출 시점 완료를
+        // 보장하지 않아 sel 목록 오염·토큰 발산. 원장 151.)
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         {
@@ -848,6 +854,8 @@ impl Q4Acc {
             self.ctx
                 .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
         }
+        // (비동기 전환은 롤백 — ROCm pageable 스테이징이 호출 시점 완료를
+        // 보장하지 않아 sel 목록 오염·토큰 발산. 원장 151.)
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         let qdev = self.fptr(q)?;
@@ -1399,6 +1407,15 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         Ok(())
     }
 
+    fn qsa_identity_sel(
+        &self,
+        pos0: usize,
+        t: usize,
+        ctx_len: usize,
+    ) -> Result<(u64, u64, usize), String> {
+        self.qsa_identity_sel_dev(pos0, t, ctx_len)
+    }
+
     fn qsa_attention_dev_sel(
         &self,
         q: u64,
@@ -1415,9 +1432,42 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         out: u64,
     ) -> Result<(), String> {
         // sel 버퍼가 이미 디바이스에 있다 — 업로드 없이 qsa_attn_res와 동일한
+
         // 커널 쌍(t=1 분할 우선)을 발사한다.
-        if t != 1 {
-            return Err(format!("qsa_attention_dev_sel: t={t} 비분할은 미지원"));
+        // plans/115 D(원장 151): t>1은 비분할 sel4로 직행 — 항등 선택 경로가
+        // t=512에서 이 메서드를 쓴다(종전 t≠1 Err → 값 브리지 폴백 1.5s).
+        if t > 1 {
+            let qdev = self.fptr(q)?;
+            let odev = self.fptr(out)?;
+            let mut q_p = qdev as *mut std::ffi::c_void;
+            let mut o_p = odev as *mut std::ffi::c_void;
+            let mut k_p = ck as *mut std::ffi::c_void;
+            let mut v_p = cv as *mut std::ffi::c_void;
+            let mut si_p = sel_idx as *mut std::ffi::c_void;
+            let mut so_p = sel_off as *mut std::ffi::c_void;
+            let mut sc = kq_scale;
+            let mut nh = n_head as i32;
+            let mut nk = n_kv as i32;
+            let mut h = hd as i32;
+            let mut tt = t as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut q_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut k_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut v_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut si_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut so_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut o_p) as *mut _ as *mut std::ffi::c_void,
+                (&mut sc) as *mut _ as *mut std::ffi::c_void,
+                (&mut nh) as *mut _ as *mut std::ffi::c_void,
+                (&mut nk) as *mut _ as *mut std::ffi::c_void,
+                (&mut h) as *mut _ as *mut std::ffi::c_void,
+                (&mut tt) as *mut _ as *mut std::ffi::c_void,
+            ];
+            let gy = (n_head / 8) as u32;
+            let gx = t.div_ceil(4) as u32;
+            self.ctx
+                .launch3("q4_qsa_attn_sel4", gx, gy, 1, 256, &mut args)?;
+            return Ok(());
         }
         let cap = 64usize;
         let n_splits: usize = (list_len / 32).clamp(1, cap.clamp(1, 512));
