@@ -15,6 +15,61 @@ pub static MOE_FALLBACK_USED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl llm170_core::matmul::FrameState for Q4Acc {
+    fn gdn_split_l2_scale(
+        &self,
+        gconv: u64,
+        gq: u64,
+        gk: u64,
+        gv: u64,
+        conv_ch: usize,
+        k_len: usize,
+        v_len: usize,
+        d_state: usize,
+        n_group: usize,
+        t: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        let qs = 1.0f32 / (d_state as f32).sqrt();
+        let (mut gc, mut q, mut k, mut vv) = (
+            self.fptr(gconv)? as *mut std::ffi::c_void,
+            self.fptr(gq)? as *mut std::ffi::c_void,
+            self.fptr(gk)? as *mut std::ffi::c_void,
+            self.fptr(gv)? as *mut std::ffi::c_void,
+        );
+        let (mut cc, mut kl, mut vl, mut ds, mut ng, mut tt, mut e, mut sc) = (
+            conv_ch as i32,
+            k_len as i32,
+            v_len as i32,
+            d_state as i32,
+            n_group as i32,
+            t as i32,
+            eps,
+            qs,
+        );
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut gc) as *mut _ as *mut std::ffi::c_void,
+            (&mut q) as *mut _ as *mut std::ffi::c_void,
+            (&mut k) as *mut _ as *mut std::ffi::c_void,
+            (&mut vv) as *mut _ as *mut std::ffi::c_void,
+            (&mut cc) as *mut _ as *mut std::ffi::c_void,
+            (&mut kl) as *mut _ as *mut std::ffi::c_void,
+            (&mut vl) as *mut _ as *mut std::ffi::c_void,
+            (&mut ds) as *mut _ as *mut std::ffi::c_void,
+            (&mut e) as *mut _ as *mut std::ffi::c_void,
+            (&mut sc) as *mut _ as *mut std::ffi::c_void,
+            (&mut ng) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3(
+            "gdn_split_l2_scale",
+            n_group as u32,
+            t as u32,
+            1,
+            32,
+            &mut args,
+        )
+    }
+
     /// plans/115 P1-3 — 상태 D2D 복사(메인 스트림 비동기, 순서 보장).
     /// 접두 체크포인트 캡처/복원.
     fn frame_copy_states(&self, pairs: &[(u64, u64, usize)]) -> Result<(), String> {

@@ -174,46 +174,52 @@ pub(super) fn gdn_frame_np(
     if seqs.len() > 1 {
         psum(acc, vv.gconv[1], conv_ch, "conv_row1");
     }
-    // split/l2/scale — 행별 독립 원소연산, t 배치 그대로
-    op(
-        acc,
-        FrameOp::Split3 {
-            src: f.gconv,
-            d0: f.gq,
-            d1: f.gk,
-            d2: f.gv,
-            n0: k_len,
-            n1: k_len,
-            n2: v_len,
-        },
-    )?;
-    op(
-        acc,
-        FrameOp::L2Rows {
-            x: f.gq,
-            eps,
-            d: hp.d_state,
-            n: k_len * t,
-        },
-    )?;
-    op(
-        acc,
-        FrameOp::L2Rows {
-            x: f.gk,
-            eps,
-            d: hp.d_state,
-            n: k_len * t,
-        },
-    )?;
-    let scale = 1.0f32 / (hp.d_state as f32).sqrt();
-    op(
-        acc,
-        FrameOp::Scale {
-            t: f.gq,
-            s: scale,
-            n: k_len * t,
-        },
-    )?;
+    // plans/115 U3: split3+L2×2+scale 융합 — 4런치→1 (실패 시 종전 경로).
+    // 산술: L2(32청크 순차 f32 + 레인순 double 결합) 및 스케일 곱셈 순서
+    // (v*s)*scale 보존 — 기존 커널과 비트 동일.
+    // [부정 — 원장 155] 32스레드 블록 점유율 한계로 개별 커널(0.86ms) < 융합판(1.39ms).
+    // 스레드 구조 재설계 시 재검토. 인프라(커널·트레이트)는 유지.
+    {
+        op(
+            acc,
+            FrameOp::Split3 {
+                src: f.gconv,
+                d0: f.gq,
+                d1: f.gk,
+                d2: f.gv,
+                n0: k_len,
+                n1: k_len,
+                n2: v_len,
+            },
+        )?;
+        op(
+            acc,
+            FrameOp::L2Rows {
+                x: f.gq,
+                eps,
+                d: hp.d_state,
+                n: k_len * t,
+            },
+        )?;
+        op(
+            acc,
+            FrameOp::L2Rows {
+                x: f.gk,
+                eps,
+                d: hp.d_state,
+                n: k_len * t,
+            },
+        )?;
+        let scale = 1.0f32 / (hp.d_state as f32).sqrt();
+        op(
+            acc,
+            FrameOp::Scale {
+                t: f.gq,
+                s: scale,
+                n: k_len * t,
+            },
+        )?;
+    }
     gtm[3] += g3.elapsed().as_secs_f64() * 1e3;
     let g2 = std::time::Instant::now();
     // AR(상태) — per-sec t=1 (다시 내림)
