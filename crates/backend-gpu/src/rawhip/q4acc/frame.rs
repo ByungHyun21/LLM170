@@ -2117,8 +2117,27 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
             } => {
                 // 커널은 (토큰,차원)당 1스레드 — op의 total(=hc·n·t)을 범위로 쓰면
                 // hc배만큼 범위 밖을 쓴다(실측: hc>1에서 폴트). n·t를 쓴다.
-                let (mut rp, mut op_, mut ip) = (self.fptr(res)?, self.fptr(out)?, self.fptr(inj)?);
-                let tn = n * self.t_cur();
+                // plans/116-1: g(2σ(inj/hc))는 (t,hc)에만 의존 — 결합 전 t·hc
+                // 스레드 사전계산 커널로 exp_cr(f64 호너, 스레드당 hc회) 중복을
+                // 제거한다. 산술 동일식 → 비트 동일(charhash 무변경 기대).
+                let t = self.t_cur();
+                let gp = self.ctx.scratch(t * hc * 4)?;
+                {
+                    let (mut ip, mut g_) = (self.fptr(inj)?, gp as *mut std::ffi::c_void);
+                    let mut h = hc as i32;
+                    let mut tt = t as i32;
+                    self.kop(
+                        "q4_hc_gate",
+                        ((t * hc) as u32).div_ceil(128),
+                        1,
+                        1,
+                        128,
+                        &mut cargs!(&mut ip, &mut g_, &mut h, &mut tt),
+                    )?;
+                }
+                let (mut rp, mut op_, mut gp_) =
+                    (self.fptr(res)?, self.fptr(out)?, gp as *mut std::ffi::c_void);
+                let tn = n * t;
                 let mut h = hc as i32;
                 let mut nn = n as i32;
                 let mut tt = tn as i32;
@@ -2128,7 +2147,7 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
                     1,
                     1,
                     128,
-                    &mut cargs!(&mut rp, &mut op_, &mut ip, &mut h, &mut nn, &mut tt),
+                    &mut cargs!(&mut rp, &mut op_, &mut gp_, &mut h, &mut nn, &mut tt),
                 )
             }
             O::Split3 {
