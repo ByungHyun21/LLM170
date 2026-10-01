@@ -89,6 +89,9 @@ pub(crate) fn frame_forward_ex(
     let mut pf = [0.0f64; 5]; // [gdn, qsa, moe, head, 기타]
     let pf_t0 = std::time::Instant::now();
     let mut pf_mark = std::time::Instant::now();
+    if pf_on {
+        acc.frame_ev_mark(0);
+    }
     fs_begin(acc, t);
 
     // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
@@ -406,6 +409,7 @@ pub(crate) fn frame_forward_ex(
             } else {
                 if pf_on {
                     pf_mark = std::time::Instant::now();
+                    acc.frame_ev_mark(1);
                 }
                 gdn_frame(
                     acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t,
@@ -436,6 +440,7 @@ pub(crate) fn frame_forward_ex(
             } else if {
                 if pf_on {
                     pf_mark = std::time::Instant::now();
+                    acc.frame_ev_mark(2);
                 }
                 true
             } && qsa_frame(
@@ -478,6 +483,7 @@ pub(crate) fn frame_forward_ex(
         ck!(acc, il, f.mix, n, t, &format!("L{il}.mixf"));
         if pf_on {
             pf_mark = std::time::Instant::now();
+            acc.frame_ev_mark(3);
         }
         moe_frame(acc, model, f, il, n, t)?;
         if pf_on {
@@ -532,6 +538,7 @@ pub(crate) fn frame_forward_ex(
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
     if pf_on {
         pf_mark = std::time::Instant::now();
+        acc.frame_ev_mark(4);
     }
     {
         let w_norm = f.consts["output_hc_norm"];
@@ -587,6 +594,7 @@ pub(crate) fn frame_forward_ex(
         // 프리필/디코드 진입 시 소비된다(스킵은 버려질 계산뿐).
         if mode == FwdMode::NoReadback {
             pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
+            acc.frame_ev_report();
             ftime_report(t);
             return Ok((Vec::new(), None));
         }
@@ -613,6 +621,7 @@ pub(crate) fn frame_forward_ex(
             // 잡지 못했다(프리필 종료 틱만 관측). 그리디 반환 직전에 틱한다.
             acc.ktrace_tick();
             pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
+            acc.frame_ev_report();
             ftime_report(t);
             return Ok((Vec::new(), Some(toks[0])));
         }
@@ -648,6 +657,7 @@ pub(crate) fn frame_forward_ex(
             );
         }
         pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
+        acc.frame_ev_report();
         Ok((logits, None))
     }
 }

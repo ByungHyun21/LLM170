@@ -126,6 +126,8 @@ pub struct Q4Acc {
     qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf, GBuf, GBuf)>>,
     /// plans/115 C1: 업로드 폴백 경로의 f16 스크래치 쌍.
     ckv16: std::sync::Mutex<(GBuf, GBuf)>,
+    /// plans/115 D: 프리필 섹션 GPU 벽 이벤트 마킹 (tag, hipEvent).
+    ev_marks: std::sync::Mutex<Vec<(u8, usize)>>,
     /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
     /// 구멍(값 경로 청크·롤백·리줌)을 읽는 사고를 막는다(불일치 → 업로드 폴백).
     qsa_kv_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
@@ -374,6 +376,7 @@ impl Q4Acc {
             cst: std::sync::Mutex::new(GBuf::new("cst")),
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             ckv16: std::sync::Mutex::new((GBuf::new("qsakv16_k"), GBuf::new("qsakv16_v"))),
+            ev_marks: std::sync::Mutex::new(Vec::new()),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idxk: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),

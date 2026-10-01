@@ -35,6 +35,58 @@ impl llm170_core::matmul::FrameState for Q4Acc {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn frame_ev_mark(&self, tag: u8) {
+        // plans/115 D: 섹션 GPU 벽 계측 — 이벤트 풀 고갈 방지 위해 보고 시 파괴.
+        let mut ev: crate::rawhip::hip::hipEvent_t = std::ptr::null_mut();
+        unsafe {
+            if crate::rawhip::hip::hipEventCreateWithFlags(&mut ev, 0)
+                != crate::rawhip::hip::hipError_t_hipSuccess
+            {
+                return;
+            }
+            if crate::rawhip::hip::hipEventRecord(ev, self.ctx.stream) != 0 {
+                return;
+            }
+        }
+        if let Ok(mut g) = self.ev_marks.lock() {
+            g.push((tag, ev as usize));
+        }
+    }
+
+    fn frame_ev_report(&self) {
+        let marks = {
+            let Ok(mut g) = self.ev_marks.lock() else {
+                return;
+            };
+            std::mem::take(&mut *g)
+        };
+        if marks.len() < 2 {
+            for (_, e) in &marks {
+                unsafe { crate::rawhip::hip::hipEventDestroy(*e as *mut _) };
+            }
+            return;
+        }
+        let mut acc = [0.0f64; 5];
+        for w in marks.windows(2) {
+            let mut dt = 0f32;
+            let ok = unsafe {
+                crate::rawhip::hip::hipEventElapsedTime(&mut dt, w[0].1 as *mut _, w[1].1 as *mut _)
+                    == crate::rawhip::hip::hipError_t_hipSuccess
+            };
+            if ok {
+                acc[w[0].0 as usize] += dt as f64;
+            }
+        }
+        for (_, e) in &marks {
+            unsafe { crate::rawhip::hip::hipEventDestroy(*e as *mut _) };
+        }
+        let tot: f64 = acc.iter().sum();
+        eprintln!(
+            "[pfev] gdn {:.0} qsa {:.0} moe {:.0} head {:.0} 기타 {:.0} | GPU 벽 {:.0}",
+            acc[1], acc[2], acc[3], acc[4], acc[0], tot
+        );
+    }
+
     fn set_ctx_len(&self, n: usize) {
         self.ctx_len.store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -593,7 +645,12 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in") }?;
                     let idp = self.fptr(ids)?;
                     let mut idv = vec![0u32; rows];
+                    // plans/115 D: 그룹화 d2h 대기 직접 계측(원장 149 귀속).
+                    let gdt = std::time::Instant::now();
                     self.ctx.d2h(bytemuck::cast_slice_mut(&mut idv), idp)?;
+                    if llm170_diag::dump::opts().key("moe_time") {
+                        eprintln!("[moed2h] rows={rows} {:.2}ms", gdt.elapsed().as_secs_f64() * 1e3);
+                    }
                     // 카운팅 정렬 테이블 — common 공용판(vk 폴백과 바이트 동일, P13).
                     let off = crate::common::moe::grp_offsets(&idv, ne);
                     let perm = crate::common::moe::grp_perm(&idv, ne, &off);
