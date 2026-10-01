@@ -638,6 +638,40 @@ impl Q4Acc {
     /// plans/115 U0: np 상태 포인터 테이블 — 캐시 조회(미스 시 1회 업로드).
     /// 키는 상태 핸들 열 자체(같은 seq 조합 = 같은 테이블). 동기 h2d가 미스에만
     /// 걸린다(종전 매 층 풀 드레인 → GDN 스테이지 85ms의 본체).
+    /// plans/115 D(원장 151): 항등 선택 목록 디바이스 생성 — 행 i의 목록은
+    /// [0, pos0+i](오름차순 전체). 반환: (sel_idx핸들, sel_off핸들, 총 길이).
+    pub(super) fn qsa_identity_sel_dev(
+        &self,
+        pos0: usize,
+        t: usize,
+        ctx_len: usize,
+    ) -> Result<(u64, u64, usize), String> {
+        let total: usize = (0..t).map(|i| pos0 + i + 1).sum();
+        let (idx_h, off_h) = {
+            // msk/soff 풀에 생성 — qsa_attn_res 계열이 같은 버퍼를 소비한다.
+            let cap = ctx_len * (ctx_len + 1) / 2;
+            let mut d = self.msk.lock().map_err(|e| e.to_string())?;
+            let idx_h = d.ensure(&self.ctx, cap.max(total * 4).max(4))?;
+            let mut e2 = self.soff.lock().map_err(|e| e.to_string())?;
+            let off_h = e2.ensure(&self.ctx, (t + 1) * 4)?;
+            (idx_h, off_h)
+        };
+        let (mut ip, mut op) = (
+            idx_h as *mut std::ffi::c_void,
+            off_h as *mut std::ffi::c_void,
+        );
+        let (mut pp, mut tt) = (pos0 as i32, t as i32);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut ip) as *mut _ as *mut std::ffi::c_void,
+            (&mut op) as *mut _ as *mut std::ffi::c_void,
+            (&mut pp) as *mut _ as *mut std::ffi::c_void,
+            (&mut tt) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx
+            .launch3("q4_identity_sel", (t + 1) as u32, 1, 1, 256, &mut args)?;
+        Ok((idx_h as u64, off_h as u64, total))
+    }
+
     pub(super) fn np_state_tbl_cached(&self, states: &[u64]) -> Result<*mut u8, String> {
         {
             let c = self.np_state_tbl.lock().map_err(|e| e.to_string())?;

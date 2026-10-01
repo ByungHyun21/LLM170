@@ -533,6 +533,16 @@ pub trait QsaOps: Send + Sync {
     /// plans/73: sel 목록이 **디바이스 버퍼**에 이미 있는 상주 캐시판 어텐션 —
     /// 업로드 없이 qsa_attention_dev_res와 동일 커널(t=1 분할 우선).
     #[allow(clippy::too_many_arguments)]
+    /// plans/115 D(원장 151): 항등 선택 목록 디바이스 생성 — 반환은
+    /// (sel_idx핸들, sel_off핸들, 총길이). 미구현 백엔드는 Err(호스트 경로).
+    fn qsa_identity_sel(
+        &self,
+        _pos0: usize,
+        _t: usize,
+        _ctx_len: usize,
+    ) -> Result<(u64, u64, usize), String> {
+        Err("qsa_identity_sel: 미지원".into())
+    }
     fn qsa_attention_dev_sel(
         &self,
         _q: u64,
