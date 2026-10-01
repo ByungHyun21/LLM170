@@ -5,16 +5,16 @@
 # 사용: scripts/scorecard.sh [llama|ours|all]
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# llama 빌드는 rocm-7.2.2 로 컴파일 — 런타임도 7.2.2 로 매칭(2026-09-23).
-export LD_LIBRARY_PATH=/opt/rocm-7.2.2/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-export ROCBLAS_TENSILE_LIBPATH=/opt/rocm-7.2.2/lib/rocblas/library
+# llama 빌드는 ROCm 10(build-hip10) — 런타임도 ROCm 10 매칭(2026-10-01).
+export LD_LIBRARY_PATH=/opt/rocm-10.0.0/install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export ROCBLAS_TENSILE_LIBPATH=/opt/rocm-10.0.0/install/lib/rocblas/library
 
 M27=/home/yoon/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
 MFN=/home/yoon/models/qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 # 2026-09-23: llama.cpp b1ff4ca23 빌드(source/llama.cpp) — qwen4exp 가 마스터에
 # 있어 단일 빌드로 두 모델 커버. 구 -fit/-lm mmap 는 신 CLI에서 제거/행업.
 SRC=source/llama.cpp
-LBHIP=$SRC/build-hip/bin/llama-bench
+LBHIP=$SRC/build-hip10/bin/llama-bench
 LBVK=$SRC/build-vk/bin/llama-bench
 LB=${LLM170_LB:-$LBHIP}
 LBFN=${LLM170_LBFN:-$LBHIP}
