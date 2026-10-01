@@ -161,6 +161,9 @@ impl RawCtx {
     /// 것이 이 API의 존재 이유다(2026-09-14: 전체 sync는 층마다 파이프라인을
     /// 비워 shared 스테이지가 25.8 → 50.7ms로 두 배가 됐다).
     pub fn d2h_wait(&self) -> Result<(), String> {
+        if self.capturing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(()); // 캡처 중 이벤트 대기 skip
+        }
         unsafe {
             let ev = self.d2h_ev()?;
             ck(hip::hipEventSynchronize(ev), "d2h-ev-wait")
@@ -168,6 +171,9 @@ impl RawCtx {
     }
 
     pub fn d2h(&self, dst: &mut [u8], src: *const u8) -> Result<(), String> {
+        if self.capturing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("d2h: 그래프 캡처 중".into());
+        }
         unsafe {
             // pageable 직행은 슬로패스 — 핀 스테이징 경유 (2026-09-05 tg RCA:
             // logits 1MB D2H가 92ms → 핀 경유 시 <1ms 예상)

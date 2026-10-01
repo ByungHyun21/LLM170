@@ -17,6 +17,8 @@ pub struct RawCtx {
     pub(crate) co_fam: std::sync::atomic::AtomicU8,
     pub(crate) scope: std::sync::atomic::AtomicU8,
     pub(crate) stream: hip::hipStream_t,
+    /// plans/115 D: 프리필 그래프 캡처 중 — sync/d2h_wait/ktr_ev 건너뜀.
+    pub(crate) capturing: std::sync::atomic::AtomicBool,
     pub(crate) stream2: hip::hipStream_t,
     /// 프리필 전용 스트림 페어 — 프레임 경로(launch3s + join2/side_wait_main)를
     /// 디코드와 겹쳐 돌리기 위한 별도 쌍(plans/74 np4 겹치기).
@@ -332,6 +334,7 @@ impl RawCtx {
                 fns,
                 co_fam: std::sync::atomic::AtomicU8::new(fam_bits),
                 stream,
+                capturing: std::sync::atomic::AtomicBool::new(false),
                 stream2,
                 stream3,
                 stream4,
@@ -425,6 +428,9 @@ impl RawCtx {
     }
 
     pub fn sync(&self) -> Result<(), String> {
+        if self.capturing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(()); // 캡처 중 sync는 불법 — skip(plans/115 D)
+        }
         unsafe { ck(hip::hipStreamSynchronize(self.stream), "sync") }
     }
 

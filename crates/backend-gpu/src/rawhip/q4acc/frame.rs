@@ -10,6 +10,10 @@ fn prefill_pin(t: usize, np: bool) {
     crate::rawhip::ctx::PREFILL_PIN.store(pin, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// plans/115 D: MoE 폴백(비 Q4K/Q5_1) 도달 — 그래프 캡처 호환성 판정.
+pub static MOE_FALLBACK_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl llm170_core::matmul::FrameState for Q4Acc {
     /// plans/115 P1-3 — 상태 D2D 복사(메인 스트림 비동기, 순서 보장).
     /// 접두 체크포인트 캡처/복원.
@@ -50,6 +54,18 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         }
         if let Ok(mut g) = self.ev_marks.lock() {
             g.push((tag, ev as usize));
+        }
+    }
+
+    fn moe_graph_capable(&self) -> bool {
+        !MOE_FALLBACK_USED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn pf_graph(&self, begin: bool) -> Result<(), String> {
+        if begin {
+            crate::rawhip::capture_begin(&self.ctx)
+        } else {
+            crate::rawhip::capture_end_and_launch(&self.ctx)
         }
     }
 
@@ -510,10 +526,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // 배리어 2종은 제거됐으나(moed2h·QSA 항등 업로드) 패딩 도메인
                 // gm/ge가 호스트 테이블 대비 5× 느림(타일 수 동일·원인 미상 —
                 // 원장 151). t=1로 복귀, 상세 기록.)
-                // (plans/115 D 원장 152 — t>1 디바이스 그룹화 3차: rp 청크 학습으로
-                // 층 동기 제거(moe 1298→368ms) — 그러나 잔여 벽은 **런치 dispatch
-                // 고정비 ~500ms**(pp64-512 외삽, Strata layer.cpp 동일 결론)라
-                // 그래프 캡처 과제로. t=1 유지.)
+                // (plans/115 D 원장 152-153 — t>1 디바이스 그룹화는 그래프 캡처의
+                // 전제지만 FN의 Q5K MoE 투영이 호스트 오프셋 폴백을 써 캡처 불가
+                // → 그래프 미발화 + bound 그리드 페널티만 남아 t=1로 복귀.
+                // Q5K 디바이스 테이블 타일 커널이 다음 단위.)
                 if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
@@ -617,14 +633,23 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // 종전 파이프라인도 d2h_wait가 GPU ~1층분(35ms)을 기다려
                     // 28층×35ms=980ms 직렬화. 청크 경계 학습 + 발행만 유지.
                     let (rp_grid, pinned_off_slot) = {
-                        let pinned = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
-                        let mut pend = self.moe_rp_pending.lock().map_err(|e| e.to_string())?;
-                        if !pinned.is_null() {
-                            *pend = Some((pinned, ne));
+                        // 캡처 중 d2h_issue(정적 이벤트 재기록)는 그래프 교착 —
+                        // 스킵(그래프 경로는 rp 학습 불요).
+                        if self
+                            .ctx
+                            .capturing
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            (bound, std::ptr::null_mut())
+                        } else {
+                            let pinned = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
+                            let mut pend = self.moe_rp_pending.lock().map_err(|e| e.to_string())?;
+                            if !pinned.is_null() {
+                                *pend = Some((pinned, ne));
+                            }
+                            let _ = &self.moe_rp_est;
+                            (bound, pinned)
                         }
-                        let est = self.moe_rp_est.lock().map_err(|e| e.to_string())?;
-                        let rp = if est.0 == rows { est.1 } else { bound };
-                        ((rp.saturating_add(4096)).min(bound).max(16), pinned)
                     };
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
@@ -990,6 +1015,8 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         let mut off_d2h;
         // plans/68: 디바이스 그룹화 경로의 xg는 **패딩 도메인** — 폴백(전문가별
         // 런치)도 패딩 오프셋(off_pad)에서 구간을 읽어야 행이 맞는다.
+        // plans/115 D: 폴백 도달 기록 — 그래프 캡처 호환성 판정(웜업 청크 설정).
+        MOE_FALLBACK_USED.store(true, std::sync::atomic::Ordering::Relaxed);
         let off: &[usize] = if off.is_empty() && rows_pad_d != 0 {
             self.ctx.d2h_wait()?;
             // 오프셋 + 그 뒤 4B(디바이스가 계산한 rows_pad)를 함께 읽어 **상한을

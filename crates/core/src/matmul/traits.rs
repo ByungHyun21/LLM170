@@ -1061,6 +1061,20 @@ pub trait FrameState {
     /// 청크 종료(큐 드레인 후)에 호출. 기본 no-op.
     fn frame_ev_report(&self) {}
 
+    /// plans/115 D(원장 152): 프리필 그래프 캡처 — 층 루프의 런치열을 그래프로
+    /// 묶어 dispatch 고정비(≈114µs×4,400) 제거(Strata layer.cpp 준거).
+    /// begin=true 시작, false 종료+인스턴스화+발행. 기본 no-op(미구현 백엔드는
+    /// 종전 런치 경로). 캡처 중 sync/d2h_wait/이벤트는 백엔드가 건너뛴다.
+    /// plans/115 D: MoE가 그래프 캡처 호환(전 투영이 디바이스 테이블 경로)인가.
+    /// 폴백(호스트 오프셋 판독) 도달 이력이 있으면 false.
+    fn moe_graph_capable(&self) -> bool {
+        true
+    }
+    fn pf_graph(&self, _begin: bool) -> Result<(), String> {
+        let _ = _begin;
+        Ok(()) // no-op 백엔드 — 평범한 런치 경로
+    }
+
     /// 컨텍스트 길이 주입 — 가속기가 KV 등 **상한이 정해진 풀을 선할당**하는 데 쓴다
     /// (llama.cpp/vLLM처럼 "한 번 잡고 그 안에서만"). 기본은 무시.
     fn set_ctx_len(&self, _n: usize) {}
