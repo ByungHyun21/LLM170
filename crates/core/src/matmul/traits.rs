@@ -1043,6 +1043,14 @@ pub trait FrameState {
     /// 호출된다(가드 Drop 포함). 기본 no-op.
     fn frame_end_np(&self) {}
 
+    /// plans/115 D: 프리필 섹션 GPU 벽 계측 — 메인 스트림에 이벤트 마킹.
+    /// 태그: 0=청크시작 1=gdn 2=qsa 3=moe 4=head. 기본 no-op.
+    fn frame_ev_mark(&self, _tag: u8) {}
+
+    /// plans/115 D: 마킹 보고 — 연속 마크 간 GPU 경과를 태그별 적립해 출력.
+    /// 청크 종료(큐 드레인 후)에 호출. 기본 no-op.
+    fn frame_ev_report(&self) {}
+
     /// 컨텍스트 길이 주입 — 가속기가 KV 등 **상한이 정해진 풀을 선할당**하는 데 쓴다
     /// (llama.cpp/vLLM처럼 "한 번 잡고 그 안에서만"). 기본은 무시.
     fn set_ctx_len(&self, _n: usize) {}
