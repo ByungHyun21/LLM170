@@ -15,7 +15,6 @@ extern "C" __global__ void q4_gemm_q5_1(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 24;
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int m = 0; m < cnt; m++) {
         int sb = l + (m << 6);
@@ -40,8 +39,10 @@ extern "C" __global__ void q4_gemm_q5_1(const unsigned* xq, const unsigned* w,
             unsigned y = xq[xw + k];
             s_lo += dot4(nib, y, 0);
             s_hi += dot4(hb_p, y, 0);   // hb_p 바이트 = 16 → 여기서 이미 ×16
-            s1 += dot4(ones, y, 0);
         }
+        // plans/116-3: Σy는 q16 테이블(비트 동일 정수 합)에서.
+        s1 = (int)xq[(n_in >> 2) + (n_in >> 5) + 2 * sb]
+           + (int)xq[(n_in >> 2) + (n_in >> 5) + 2 * sb + 1];
         float yd = __uint_as_float(xq[(n_in >> 2) + sb]);
         int isum = s_lo + s_hi;
         acc += yd * (d * (float)isum + mn * (float)s1);
@@ -72,7 +73,6 @@ extern "C" __global__ void q4_gemm_q4k_g(const unsigned* xq, const unsigned* w, 
     const unsigned char* wr = (const unsigned char*)w + (size_t)o * (n_super * 144);
     const unsigned* xr = xq + (size_t)r * xq_w;
     const unsigned xw_base = (unsigned)(n_in >> 2);
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
@@ -104,16 +104,19 @@ extern "C" __global__ void q4_gemm_q4k_g(const unsigned* xq, const unsigned* w, 
             else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
             const unsigned* x1 = xr + sIdx * 64 + it * 16;
             const unsigned* x2 = x1 + 8;
-            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            int il1 = 0, il2 = 0;
             #pragma unroll
             for (int m = 0; m < 8; m++) {
-                unsigned y1 = x1[m];
-                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                qs1 += dot4(ones, y1, 0);
-                unsigned y2 = x2[m];
-                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                qs2 += dot4(ones, y2, 0);
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, x1[m], 0);
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, x2[m], 0);
             }
+            // plans/116-3: Σy(qs1/qs2)는 활성 행에만 의존 — xq q16 테이블
+            // (quant_q8이 32블록 상/하반 바이트합으로 기저장)에서 읽는다.
+            // dot4(ones,·) 16회와 동일한 정수 합 → 비트 동일.
+            const unsigned* q16 = xr + xw_base + (unsigned)(n_in >> 5);
+            int lb1 = (sIdx << 3) + (it << 1);
+            int qs1 = (int)q16[2 * lb1] + (int)q16[2 * lb1 + 1];
+            int qs2 = (int)q16[2 * lb1 + 2] + (int)q16[2 * lb1 + 3];
             float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
             float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
             acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
@@ -141,7 +144,6 @@ extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
     int n_sub = n_in >> 5;
     int cnt = (n_sub + 63 - l) >> 6;
     int row_base = o * n_sub * 24;
-    const unsigned ones = 0x01010101u;
     float acc[16];
     #pragma unroll
     for (int r = 0; r < 16; r++) acc[r] = 0.0f;
@@ -168,9 +170,11 @@ extern "C" __global__ void q4_gemm_q5_1_t(const unsigned* xq, const unsigned* w,
                 unsigned y = xr[xw + k];
                 s_lo += dot4(nib, y, 0);
                 s_hi += dot4(hb_p, y, 0);
-                s1 += dot4(ones, y, 0);
-            }
-            float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+                }
+            // plans/116-3: Σy는 q16 테이블(비트 동일 정수 합)에서.
+        s1 = (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb]
+           + (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb + 1];
+        float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
             acc[r] += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
         }
     }
@@ -216,7 +220,6 @@ extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w,
     if (o >= n_out || r >= t) return;
     const unsigned* wr = wsh + ox * wrow;
     const unsigned* xr = xq + (size_t)r * xq_w;
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sb = 0; sb < n_sub; sb++) {
         int wb = sb * 6;
@@ -238,8 +241,10 @@ extern "C" __global__ void q4_gemm_q5_1_m(const unsigned* xq, const unsigned* w,
             unsigned y = xr[xw + k];
             s_lo += dot4(nib, y, 0);
             s_hi += dot4(hb_p, y, 0);
-            s1 += dot4(ones, y, 0);
         }
+        // plans/116-3: Σy는 q16 테이블(비트 동일 정수 합)에서.
+        s1 = (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb]
+           + (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb + 1];
         float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
         acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
     }
@@ -272,7 +277,6 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
     if (o >= n_out || r >= t) return;
     const unsigned* wr = wsh + ox * wrow;
     const unsigned* xr = xq + (size_t)r * xq_w;
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sb = 0; sb < n_sub; sb++) {
         int wb = sb * 6;
@@ -294,8 +298,10 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
             unsigned y = xr[xw + k];
             s_lo += dot4(nib, y, 0);
             s_hi += dot4(hb_p, y, 0);
-            s1 += dot4(ones, y, 0);
         }
+        // plans/116-3: Σy는 q16 테이블(비트 동일 정수 합)에서.
+        s1 = (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb]
+           + (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb + 1];
         float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
         acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
     }
@@ -402,7 +408,12 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
             int y_off2 = (sb * 8 + 2*it+1) << 3;
             float yd1 = __uint_as_float(xr[(n_in >> 2) + sb * 8 + 2*it]);
             float yd2 = __uint_as_float(xr[(n_in >> 2) + sb * 8 + 2*it+1]);
-            int isum1 = 0, isum2 = 0, qs1 = 0, qs2 = 0;
+            // plans/116-3: Σy는 q16 테이블에서 (비트 동일 정수 합).
+            // y_off는 워드 오프셋(블록×8) — 블록 인덱스로 환산해 인덱싱.
+            const unsigned* q16 = xr + (n_in >> 2) + (n_in >> 5);
+            int qs1 = (int)q16[y_off1 >> 2] + (int)q16[(y_off1 >> 2) + 1];
+            int qs2 = (int)q16[y_off2 >> 2] + (int)q16[(y_off2 >> 2) + 1];
+            int isum1 = 0, isum2 = 0;
             int sh1 = 2 * it, sh2 = 2 * it + 1;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
@@ -412,12 +423,8 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
                 unsigned hi = (qsw >> 4) & 0x0F0F0F0Fu;
                 unsigned bit1 = ((qhw >> sh1) & 0x01010101u) << 4;
                 unsigned bit2 = ((qhw >> sh2) & 0x01010101u) << 4;
-                unsigned y1 = xr[y_off1 + k];
-                unsigned y2 = xr[y_off2 + k];
-                isum1 += dot4(lo, y1, 0) + dot4(bit1, y1, 0);
-                isum2 += dot4(hi, y2, 0) + dot4(bit2, y2, 0);
-                qs1 += dot4(0x01010101u, y1, 0);
-                qs2 += dot4(0x01010101u, y2, 0);
+                isum1 += dot4(lo, xr[y_off1 + k], 0) + dot4(bit1, xr[y_off1 + k], 0);
+                isum2 += dot4(hi, xr[y_off2 + k], 0) + dot4(bit2, xr[y_off2 + k], 0);
             }
             acc += yd1 * (d1 * (float)isum1 - mm1 * (float)qs1);
             acc += yd2 * (d2 * (float)isum2 - mm2 * (float)qs2);
@@ -482,7 +489,6 @@ extern "C" __global__ void q4_gemm_q5_1_gm_ids(const unsigned* xq, const unsigne
     if (o >= n_out || r >= t) return;
     const unsigned* wr = w + (size_t)ids[r] * (size_t)expert_words + (size_t)o * wrow;
     const unsigned* xr = xq + (size_t)r * xq_w;
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sb = 0; sb < n_sub; sb++) {
         int wb = sb * 6;
@@ -504,8 +510,10 @@ extern "C" __global__ void q4_gemm_q5_1_gm_ids(const unsigned* xq, const unsigne
             unsigned y = xr[xw + k];
             s_lo += dot4(nib, y, 0);
             s_hi += dot4(hb_p, y, 0);
-            s1 += dot4(ones, y, 0);
         }
+        // plans/116-3: Σy는 q16 테이블(비트 동일 정수 합)에서.
+        s1 = (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb]
+           + (int)xr[(n_in >> 2) + (n_in >> 5) + 2 * sb + 1];
         float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
         acc += yd * (d * (float)(s_lo + s_hi) + mn * (float)s1);
     }
@@ -537,7 +545,6 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
     const unsigned char* wr = (const unsigned char*)w + (size_t)o * (n_super * 144);
     const unsigned* xr = xq + (size_t)r * xq_w;
     const unsigned xw_base = (unsigned)(n_in >> 2);
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
@@ -569,16 +576,19 @@ extern "C" __global__ void q4_gemm_q4k_m(const unsigned* xq, const unsigned* w, 
             else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
             const unsigned* x1 = xr + sIdx * 64 + it * 16;
             const unsigned* x2 = x1 + 8;
-            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            int il1 = 0, il2 = 0;
             #pragma unroll
             for (int m = 0; m < 8; m++) {
-                unsigned y1 = x1[m];
-                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                qs1 += dot4(ones, y1, 0);
-                unsigned y2 = x2[m];
-                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                qs2 += dot4(ones, y2, 0);
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, x1[m], 0);
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, x2[m], 0);
             }
+            // plans/116-3: Σy(qs1/qs2)는 활성 행에만 의존 — xq q16 테이블
+            // (quant_q8이 32블록 상/하반 바이트합으로 기저장)에서 읽는다.
+            // dot4(ones,·) 16회와 동일한 정수 합 → 비트 동일.
+            const unsigned* q16 = xr + xw_base + (unsigned)(n_in >> 5);
+            int lb1 = (sIdx << 3) + (it << 1);
+            int qs1 = (int)q16[2 * lb1] + (int)q16[2 * lb1 + 1];
+            int qs2 = (int)q16[2 * lb1 + 2] + (int)q16[2 * lb1 + 3];
             float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
             float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
             acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
@@ -850,7 +860,6 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
     const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
     const unsigned* xr = xq + (size_t)r * xq_w;
     const unsigned xw_base = (unsigned)(n_in >> 2);
-    const unsigned ones = 0x01010101u;
     float acc = 0.0f;
     for (int sIdx = 0; sIdx < n_super; sIdx++) {
         const unsigned char* blk = wr + sIdx * 144;
@@ -882,16 +891,19 @@ extern "C" __global__ void q4_gemm_q4k_ge(const unsigned* xq, const unsigned cha
             else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
             const unsigned* x1 = xr + sIdx * 64 + it * 16;
             const unsigned* x2 = x1 + 8;
-            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            int il1 = 0, il2 = 0;
             #pragma unroll
             for (int m = 0; m < 8; m++) {
-                unsigned y1 = x1[m];
-                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                qs1 += dot4(ones, y1, 0);
-                unsigned y2 = x2[m];
-                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                qs2 += dot4(ones, y2, 0);
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, x1[m], 0);
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, x2[m], 0);
             }
+            // plans/116-3: Σy(qs1/qs2)는 활성 행에만 의존 — xq q16 테이블
+            // (quant_q8이 32블록 상/하반 바이트합으로 기저장)에서 읽는다.
+            // dot4(ones,·) 16회와 동일한 정수 합 → 비트 동일.
+            const unsigned* q16 = xr + xw_base + (unsigned)(n_in >> 5);
+            int lb1 = (sIdx << 3) + (it << 1);
+            int qs1 = (int)q16[2 * lb1] + (int)q16[2 * lb1 + 1];
+            int qs2 = (int)q16[2 * lb1 + 2] + (int)q16[2 * lb1 + 3];
             float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
             float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
             acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
@@ -923,7 +935,6 @@ extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned
     const unsigned char* wr = w + (size_t)e * expert_bytes + (size_t)o * (n_super * 144);
     const unsigned* xr = xq;   // t=1: 전 행이 같은 입력 벡터(0번 행)
     const unsigned xw_base = (unsigned)(n_in >> 2);
-    const unsigned ones = 0x01010101u;
     // K-분할: z축이 슈퍼블록 구간을 나눠 블록 수를 ksplit배로(타일 40블록=1/CU
     // 이던 점유율을 올려 K-루프 로드 지연을 가린다). 부분합은 part에 남기고
     // reduce 커널이 k 오름차순으로 합산(결정적).
@@ -961,16 +972,19 @@ extern "C" __global__ void q4_gemm_q4k_ge_ids(const unsigned* xq, const unsigned
             else { s2 = (sc[j2 + 4] & 0xFu) | ((unsigned)(sc[j2 - 4] >> 6) << 4); m2 = (sc[j2 + 4] >> 4) | ((unsigned)(sc[j2] >> 6) << 4); }
             const unsigned* x1 = xr + sIdx * 64 + it * 16;
             const unsigned* x2 = x1 + 8;
-            int il1 = 0, il2 = 0, qs1 = 0, qs2 = 0;
+            int il1 = 0, il2 = 0;
             #pragma unroll
             for (int m = 0; m < 8; m++) {
-                unsigned y1 = x1[m];
-                il1 += dot4(q[m] & 0x0F0F0F0Fu, y1, 0);
-                qs1 += dot4(ones, y1, 0);
-                unsigned y2 = x2[m];
-                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, y2, 0);
-                qs2 += dot4(ones, y2, 0);
+                il1 += dot4(q[m] & 0x0F0F0F0Fu, x1[m], 0);
+                il2 += dot4((q[m] >> 4) & 0x0F0F0F0Fu, x2[m], 0);
             }
+            // plans/116-3: Σy(qs1/qs2)는 활성 행에만 의존 — xq q16 테이블
+            // (quant_q8이 32블록 상/하반 바이트합으로 기저장)에서 읽는다.
+            // dot4(ones,·) 16회와 동일한 정수 합 → 비트 동일.
+            const unsigned* q16 = xr + xw_base + (unsigned)(n_in >> 5);
+            int lb1 = (sIdx << 3) + (it << 1);
+            int qs1 = (int)q16[2 * lb1] + (int)q16[2 * lb1 + 1];
+            int qs2 = (int)q16[2 * lb1 + 2] + (int)q16[2 * lb1 + 3];
             float yd1 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it]);
             float yd2 = __uint_as_float(xr[xw_base + sIdx * 8 + 2 * it + 1]);
             acc += yd1 * (d * (float)s1 * (float)il1 - dmin * (float)m1 * (float)qs1);
