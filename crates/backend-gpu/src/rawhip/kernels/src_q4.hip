@@ -1511,14 +1511,28 @@ extern "C" __global__ void q4_hc_gate_mean(const float* xn, const float* gate, f
 
 // hc combine: res[s·n+i] += out[i]·2σ(inj[s]/hc)
 // total = t·n (토큰 배치) — inj는 토큰당 hc개.
-extern "C" __global__ void q4_hc_combine(float* res, const float* out, const float* inj, int hc, int n, int total) {
+// plans/116-1: 게이트 사전계산 — g는 (토큰,섹션)에만 의존(2560배 중복)하므로
+// t·hc 스레드로 한 번만 exp_cr을 돌린다. 산술은 결합판과 동일식 → 비트 동일.
+extern "C" __global__ void q4_hc_gate(const float* __restrict__ inj,
+                                     float* __restrict__ g, int hc, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= t * hc) return;
+    g[i] = 2.0f / (1.0f + exp_cr(-inj[i] / (float)hc));
+}
+
+// plans/116-1: 결합 — exp_cr(스레드당 hc회 f64 호너)을 q4_hc_gate로 분리해
+// 본체는 FMA+메모리만 남긴다. g 승격 후 곱셈 순서는 결합판과 동일(비트 동일).
+extern "C" __global__ void q4_hc_combine(float* __restrict__ res, const float* __restrict__ out,
+                                         const float* __restrict__ g, int hc, int n, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int ti = i / n;
     int ii = i % n;
+    const float* gr = g + (size_t)ti * hc;
+    const float o = out[i];
+    float* rr = res + (size_t)ti * hc * n + ii;
     for (int s = 0; s < hc; s++) {
-        float g = 2.0f / (1.0f + exp_cr(-inj[ti * hc + s] / (float)hc));
-        res[ti * hc * n + s * n + ii] += out[i] * g;
+        rr[s * n] += o * gr[s];
     }
 }
 
