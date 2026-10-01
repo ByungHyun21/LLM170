@@ -302,6 +302,87 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
     out[(size_t)r * n_out + o] = acc;
 }
 
+// plans/115 D(원장 153): Q5_K 그룹 타일 — q4_gemm_q5_1_gm과 동일 구조(smem 협업
+// 적재·타일별 전문가·패딩 센티널). 폴백의 호스트 오프셋 판독을 없애 그래프 캡처를
+// 연다. Q5_K 블록 = 176B/superblock(256원소): d(f16)+dm(f16)+sc(12B)+qh(32B)+qs(128B).
+// 산술 순서는 dot_q5k_q8(lane.rs)과 동일 클래스(청정 f32, 규칙 10a).
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
+        const unsigned* xq, const unsigned* w, double* part,
+        float* out, const unsigned* tile_exp,
+        int n_in, int n_out, int xq_w, int t, int expert_words) {
+    // smem 없는 판 — Q5_K 블록이 176B/32원소로 smem 16행 적재가 CDS 한계 초과.
+    // 스레드 (ox=15bit, rx=16bit)가 가중을 직접 global read. 코얼레싱은 낮지만
+    // 폴백(N회 호스트 오프셋 런치) 대비: 1런치 + 그래프 캡처 호환.
+    int o0 = (int)blockIdx.x * 16;
+    int r0 = (int)blockIdx.y * 16;
+    if (tile_exp[blockIdx.y] & 0x80000000u) return;  // 스테일 타일 탈출
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = o0 + ox;
+    int r = r0 + rx;
+    if (o >= n_out || r >= t) return;
+    size_t expert_base = (size_t)tile_exp[blockIdx.y] * (size_t)expert_words;
+    const unsigned* wr = w + expert_base + (size_t)o * ((size_t)(n_in >> 8) * 44);
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    float acc = 0.0f;
+    int n_super = n_in >> 8;
+    for (int sb = 0; sb < n_super; sb++) {
+        int wb = sb * 44;
+        float d  = bits_f16(wr[wb] & 0xFFFFu);
+        float dm = bits_f16(wr[wb] >> 16);
+        unsigned sc0 = wr[wb+1], sc1 = wr[wb+2], sc2 = wr[wb+3];
+        for (int it = 0; it < 4; it++) {
+            int js = 2 * it;
+            unsigned rr_ = (js & 3) * 8;
+            unsigned b1 = js < 4 ? (sc0 >> rr_) & 0xFFu : (sc1 >> rr_) & 0xFFu;
+            unsigned b4 = js < 4 ? (sc1 >> rr_) & 0xFFu : (sc2 >> rr_) & 0xFFu;
+            unsigned bm = (sc0 >> rr_) & 0xFFu;
+            unsigned sc1_v, m1_v;
+            if (js < 4) { sc1_v = b1 & 63u; m1_v = b4 & 63u; }
+            else { sc1_v = (b4 & 0xFu) | ((bm >> 6) << 4); m1_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+            int js2 = js + 1;
+            rr_ = (js2 & 3) * 8;
+            b1 = js2 < 4 ? (sc0 >> rr_) & 0xFFu : (sc1 >> rr_) & 0xFFu;
+            b4 = js2 < 4 ? (sc1 >> rr_) & 0xFFu : (sc2 >> rr_) & 0xFFu;
+            bm = (sc0 >> rr_) & 0xFFu;
+            unsigned sc2_v, m2_v;
+            if (js2 < 4) { sc2_v = b1 & 63u; m2_v = b4 & 63u; }
+            else { sc2_v = (b4 & 0xFu) | ((bm >> 6) << 4); m2_v = (b4 >> 4) | ((b1 >> 6) << 4); }
+            float d1 = d * (float)sc1_v, mm1 = dm * (float)m1_v;
+            float d2 = d * (float)sc2_v, mm2 = dm * (float)m2_v;
+            int qs_base = wb + 12 + it * 8;
+            // qh: it 무관 같은 8워드(wr[wb+4..wb+11]) — it는 비트 위치만 결정.
+            int y_off1 = (sb * 8 + 2*it) << 3;
+            int y_off2 = (sb * 8 + 2*it+1) << 3;
+            float yd1 = __uint_as_float(xr[(n_in >> 2) + sb * 8 + 2*it]);
+            float yd2 = __uint_as_float(xr[(n_in >> 2) + sb * 8 + 2*it+1]);
+            int isum1 = 0, isum2 = 0, qs1 = 0, qs2 = 0;
+            int sh1 = 2 * it, sh2 = 2 * it + 1;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned qsw = wr[qs_base + k];     // ql 워드 (하니블+상니블)
+                unsigned qhw = wr[wb + 4 + k];      // qh 워드 — it 무관 동일!
+                unsigned lo = qsw & 0x0F0F0F0Fu;
+                unsigned hi = (qsw >> 4) & 0x0F0F0F0Fu;
+                // it번째 비트를 전 바이트에서 뽑아 <<4 (상위 5th bit)
+                unsigned bit1 = ((qhw >> sh1) & 0x01010101u) << 4;
+                unsigned bit2 = ((qhw >> sh2) & 0x01010101u) << 4;
+                unsigned y1 = xr[y_off1 + k];
+                unsigned y2 = xr[y_off2 + k];
+                // 서브1: lo + bit1 (5th bit)
+                isum1 += dot4(lo, y1, 0) + dot4(bit1, y1, 0);
+                // 서브2: hi + bit2
+                isum2 += dot4(hi, y2, 0) + dot4(bit2, y2, 0);
+                qs1 += dot4(0x01010101u, y1, 0);
+                qs2 += dot4(0x01010101u, y2, 0);
+            }
+            acc += yd1 * (d1 * (float)isum1 - mm1 * (float)qs1);
+            acc += yd2 * (d2 * (float)isum2 - mm2 * (float)qs2);
+        }
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
 // q4_gemm_q5_1_gm_ids — t=1 전용 direct-ids판. down 투영이 Q5_1이라 그룹화를
 // 여기서도 없애야 한다(게이트/up만 direct로는 down에서 그룹화가 1회 발생).
 // 행마다 전문가가 다르므로 타일 공유 적재 대신 스레드가 자기 행의 전문가 행을
