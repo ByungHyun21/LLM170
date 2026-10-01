@@ -163,6 +163,7 @@ pub const NAMES: &[&str] = &[
     "q4_gemm_q5k_gm",
     "q4_gemm_q8_gm",
     "gdn_split_l2_scale",
+    "q4_logits_topk_cand",
     "q4_shexp_gu_t",
     "q4_shexp_da_t",
     "add_f32",

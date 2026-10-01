@@ -306,6 +306,43 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
 // 적재·타일별 전문가·패딩 센티널). 폴백의 호스트 오프셋 판독을 없애 그래프 캡처를
 // 연다. Q5_K 블록 = 176B/superblock(256원소): d(f16)+dm(f16)+sc(12B)+qh(32B)+qs(128B).
 // 산술 순서는 dot_q5k_q8(lane.rs)과 동일 클래스(청정 f32, 규칙 10a).
+
+// plans/115 A-2: 샘플링용 GPU top-k 후보 — 각 블록의 각 워프가 청크 내
+// top-1을 찾아 후보로 제출(64블록 × 8워프 = 512 후보). CPU에서 최종 병합.
+// D2H 608KB → 4KB (152×) + CPU 정렬 O(V log V) 제거.
+extern "C" __global__ void q4_logits_topk_cand(
+        const float* __restrict__ logits,
+        float* __restrict__ cand_v,   // [t][blocks*8]
+        int* __restrict__ cand_i,     // [t][blocks*8]
+        int vocab, int nblocks) {
+    const int tid = threadIdx.x;
+    const int row = blockIdx.y;
+    const int blk = blockIdx.x;
+    const int chunk = (vocab + nblocks - 1) / nblocks;
+    const int base_idx = blk * chunk;
+    const int n = min(chunk, vocab - base_idx);
+    const float* src = logits + (size_t)row * vocab + base_idx;
+
+    float bv = -1e30f;
+    int bi = -1;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = src[i];
+        if (v > bv) { bv = v; bi = i + base_idx; }
+    }
+    const unsigned long long FULL = 0xffffffffffffffffull;
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(FULL, bv, off);
+        int oi = __shfl_down_sync(FULL, bi, off);
+        if (ov > bv) { bv = ov; bi = oi; }
+    }
+    const int wid = tid >> 5;
+    if ((tid & 31) == 0) {
+        size_t off = (size_t)row * (nblocks * 8) + blk * 8 + wid;
+        cand_v[off] = bv;
+        cand_i[off] = bi;
+    }
+}
+
 // plans/115 D(원장 154): Q5_K 그룹 타일 — smem 협업 적재 판. 무smem 직독판 대비
 // 가중을 블록 내 16행이 공유(코얼레스드 스테이징). smem = 16×(n_super×44)워드
 // = 27.5KB(n_in=2560) — Q5_1 gm(30KB)와 유사, CDS 이내.

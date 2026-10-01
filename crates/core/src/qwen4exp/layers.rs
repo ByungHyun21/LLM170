@@ -2042,6 +2042,49 @@ impl Engine4 {
     /// 시퀀스별 상태 핸들 세트로 np 디코드 지원 + PLE 프리페치 조인·소비.
     /// plans/73(np): 다중 시퀀스 배치 디코드 — 무게 스트리밍 공유(t=seqs.len()).
     /// 실패 시 프레임을 버리고 순차 decode1로 폴백해 서비스가 끊기지 않게 한다.
+    /// plans/115 A-2: 샘플링용 top-k 디코드 — 전체 로짓 대신 후보만 반환.
+    /// (val, idx) 쌍의 리스트. CPU 샘플러가 병합·필터링.
+    pub fn decode_batch_topk(
+        &mut self,
+        seqs: &[usize],
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<(f32, u32)>>, Q4Error> {
+        // 기존 decode_batch와 동일한 경로 (전체 로짓 계산)
+        // 마지막에 로짓 대신 top-k 후보만 추출
+        let _rows = self.decode_batch(seqs, tokens)?;
+        // frame의 logits_t에서 top-k 추출
+        if let Some(acc) = self.acc.as_deref() {
+            let vocab = self.model.hp.vocab;
+            let frame_logits = match &self.frame {
+                Some(f) => f.logits_t,
+                None => return Err(Q4Error::Io("frame 없음".into())),
+            };
+            match acc.frame_topk_cands(frame_logits, seqs.len(), vocab) {
+                Ok(cands) => {
+                    // 균등 분할
+                    let per = cands.len() / seqs.len().max(1);
+                    Ok((0..seqs.len())
+                        .map(|r| cands[r * per..(r + 1) * per].to_vec())
+                        .collect())
+                }
+                Err(_) => {
+                    // 미지원 — 전체 로짓을 (val, idx) 쌍으로 반환
+                    Ok(_rows
+                        .into_iter()
+                        .map(|row| {
+                            row.iter()
+                                .enumerate()
+                                .map(|(i, &v)| (v, i as u32))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect())
+                }
+            }
+        } else {
+            Err(Q4Error::Io("가속기 없음".into()))
+        }
+    }
+
     pub fn decode_batch(
         &mut self,
         seqs: &[usize],

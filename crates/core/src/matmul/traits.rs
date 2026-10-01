@@ -1088,6 +1088,16 @@ pub trait FrameState {
     ) -> Result<(), String> {
         Err("gdn_split_l2_scale: 미지원".into())
     }
+    /// plans/115 A-2: 샘플링 top-k 후보 — GPU에서 워프별 top-1 후보 목록.
+    /// 반환 (val, idx) 쌍 (블록×워프 수, 일반 512). CPU가 최종 병합.
+    fn frame_topk_cands(
+        &self,
+        _logits: u64,
+        _t: usize,
+        _vocab: usize,
+    ) -> Result<Vec<(f32, u32)>, String> {
+        Err("frame_topk_cands: 미지원".into())
+    }
     fn pf_graph(&self, _begin: bool) -> Result<(), String> {
         let _ = _begin;
         Ok(()) // no-op 백엔드 — 평범한 런치 경로
