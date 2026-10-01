@@ -41,6 +41,9 @@ impl RawCtx {
 
     /// KTRACE 이벤트 push — (런치 전) 표준 블록 8복제 통합(plans/109 P9).
     fn ktr_ev(&self, name: &'static str, gy: u32, stream: hip::hipStream_t) {
+        if self.capturing.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // 캡처 중 이벤트 기록 skip(그래프 노드 불허)
+        }
         if let Some(mut g) = crate::rawhip::ktrace_active() {
             let mut ev: hip::hipEvent_t = std::ptr::null_mut();
             unsafe {
