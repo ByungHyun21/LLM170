@@ -718,7 +718,7 @@ impl DecodeState {
     /// y_f32 직소비(활성 quant 생략). 핀 시 타일 large-t 패밀리 고정이라 제외,
     /// 킬스위치 LLM170_HIP_DMMV_OFF.
     fn dmmv_used(&self, ty: u32, t: usize) -> bool {
-        t == 1 && ty == 8 && !self.pin_prefill.get() && !env_on("LLM170_HIP_DMMV_OFF")
+        t == 1 && ty == 8 && !self.pin_prefill.get()
     }
 
     /// 지정 가중치들이 모두 f32 직소비 경로(MMQ / plans/108 t=1 q8_0 dmmv)면

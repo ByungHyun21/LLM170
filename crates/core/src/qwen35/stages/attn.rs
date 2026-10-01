@@ -97,8 +97,7 @@ pub(crate) fn attn_layer(
     // GPU 연결 (02-3): t=1 디코드 score/softmax/V-mix를 qsa_attention 커널
     // 재사용(마스크=prefix 전체). norm·rope·캐시 기록은 CPU 유지(저렴).
     // LLM170_ATTN_CPU=1 또는 실패 시 CPU 루프.
-    let attn_gpu =
-        acc.is_some() && t_len == 1 && n_seqs == 1 && std::env::var_os("LLM170_ATTN_CPU").is_none();
+    let attn_gpu = acc.is_some() && t_len == 1 && n_seqs == 1;
     let mut out = vec![vec![0.0f32; hp.n_embd]; n_tok];
     let mut attn_all = vec![vec![0.0f32; n_head * hd]; n_tok];
     let mut gpu_qrow: Option<Vec<f32>> = None;

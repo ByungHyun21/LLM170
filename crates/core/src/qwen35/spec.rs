@@ -495,60 +495,12 @@ impl Engine {
         }
         let mut am: Vec<u32> = Vec::new();
         let mut h_all: Vec<f32> = Vec::new();
-        if std::env::var_os("LLM170_MS_SEQ").is_some() {
-            // 폴백/바이섹트 (plans/28): 그룹별 단일-시퀀스 verify — 시퀀스 상태가
-            // 분리라 병합과 의미동치 (커널 버그 회피용; 성능 하락).
-            for si in 0..n_seq {
-                let g0 = group_starts[si];
-                let g1 = if si + 1 < n_seq {
-                    group_starts[si + 1]
-                } else {
-                    rows.len() / n_e
-                };
-                let mut am2 = Vec::new();
-                let mut h2 = Vec::new();
-                rd.raw_verify(
-                    seqs[si],
-                    group_pos[si],
-                    &rows[g0 * n_e..g1 * n_e],
-                    &mut am2,
-                    &mut h2,
-                )
-                .map_err(ModelError::Accel)?;
-                am.extend_from_slice(&am2);
-                h_all.extend_from_slice(&h2);
-            }
-        } else {
+        {
             let t_v0 = std::time::Instant::now();
             rd.verify_batch_ms(seqs, &group_pos, &group_starts, &rows, &mut am, &mut h_all)
                 .map_err(ModelError::Accel)?;
             if tm_on {
                 t_verify += t_v0.elapsed();
-            }
-        }
-        if std::env::var_os("LLM170_MS_AB").is_some() {
-            // A/B: 스냅샷으로 상태 복원 후 각 그룹을 단일-verify로 재계산·비교
-            // (all_full이면 재검증이 상태를 동일하게 재진행 — 본류 불변.
-            //  부분수용이면 본류에서 어차피 restore.)
-            rd.gdn_restore().map_err(ModelError::Accel)?;
-            for si in 0..n_seq {
-                let g0 = group_starts[si];
-                let g1 = if si + 1 < n_seq {
-                    group_starts[si + 1]
-                } else {
-                    rows.len() / n_e
-                };
-                let sub: Vec<f32> = rows[g0 * n_e..g1 * n_e].to_vec();
-                let mut am2: Vec<u32> = Vec::new();
-                let mut h2: Vec<f32> = Vec::new();
-                rd.raw_verify(seqs[si], group_pos[si], &sub, &mut am2, &mut h2)
-                    .map_err(ModelError::Accel)?;
-                eprintln!(
-                    "[AB] seq={} merged={:?} single={:?}",
-                    seqs[si],
-                    &am[g0..g1],
-                    &am2
-                );
             }
         }
         // ── 시퀀스별 수용 판정 (신규 세그먼트: next+drafts)
