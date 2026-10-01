@@ -7,7 +7,16 @@ impl RawCtx {
     pub fn alloc(&self, bytes: usize) -> Result<*mut u8, String> {
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         unsafe {
+            let at = std::time::Instant::now();
             let r = hip::hipMalloc(&mut p, bytes);
+            if llm170_diag::dump::opts().key("io_time") {
+                crate::rawhip::ctx::launch::IO_US.fetch_add(
+                    at.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                crate::rawhip::ctx::launch::IO_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::rawhip::ctx::launch::IO_LAST.store(9, std::sync::atomic::Ordering::Relaxed);
+            }
             if r != hip::hipError_t_hipSuccess {
                 eprintln!("alloc {bytes}B → {r:?}");
             }

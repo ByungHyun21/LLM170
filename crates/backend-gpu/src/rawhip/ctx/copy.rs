@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub static IO_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IO_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IO_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl RawCtx {
     /// 사이드 스트림 비동기 h2d — 메인 스트림 작업과 중첩시킨 뒤 join2로 합류.
     pub fn h2d_async_s(&self, dst: *mut u8, src: &[u8]) -> Result<(), String> {
@@ -89,7 +93,19 @@ impl RawCtx {
                     .collect();
                 return Err(format!("{e} | dst {span} | 호출: {}", frames.join(" <- ")));
             }
-            self.sync()
+            if llm170_diag::dump::opts().key("io_time") {
+                let t0 = std::time::Instant::now();
+                self.sync()?;
+                IO_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                IO_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                IO_LAST.store(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            } else {
+                self.sync()
+            }
         }
     }
 
@@ -180,7 +196,18 @@ impl RawCtx {
                     ),
                     "d2h-pin",
                 )?;
-                ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
+                if llm170_diag::dump::opts().key("io_time") {
+                    let t0 = std::time::Instant::now();
+                    ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
+                    super::launch::IO_US.fetch_add(
+                        t0.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    super::launch::IO_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    super::launch::IO_LAST.store(2, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ck(hip::hipStreamSynchronize(self.stream), "d2h-sync")?;
+                }
                 std::ptr::copy_nonoverlapping(buf, dst.as_mut_ptr(), need);
                 return Ok(());
             }
