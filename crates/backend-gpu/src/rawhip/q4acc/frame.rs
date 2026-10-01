@@ -161,14 +161,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
         !MOE_FALLBACK_USED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn pf_graph(&self, begin: bool) -> Result<(), String> {
-        if begin {
-            crate::rawhip::capture_begin(&self.ctx)
-        } else {
-            crate::rawhip::capture_end_and_launch(&self.ctx)
-        }
-    }
-
     fn frame_ev_report(&self) {
         let marks = {
             let Ok(mut g) = self.ev_marks.lock() else {
@@ -786,7 +778,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // sync 종료라 층당 6회 드레인(pf_stage 배당 ~570ms/청크의 본체).
                     // pageable 소스는 호출 시점 스테이징이라 스코프 탈출 안전,
                     // 소비 커널은 같은 스트림 뒤에 발행돼 순서 보장.
-                    unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in") }?;
                     let idp = self.fptr(ids)?;
                     let mut idv = vec![0u32; rows];
                     // plans/115 D: 그룹화 d2h 대기 직접 계측(원장 149 귀속).
@@ -859,7 +850,6 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         .h2d_async_m(ipd as *mut u8, bytemuck::cast_slice(&inv_pad))?;
                     self.ctx
                         .h2d_async_m(txd as *mut u8, bytemuck::cast_slice(&tilexp))?;
-                    unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out") }?;
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
                         generation,
