@@ -24,8 +24,12 @@ impl DecodeState {
         }
         // 프리필 패밀리 핀 (plans/84 A): 이 호출 전체에서 GEMM 커널 패밀리를
         // t 무관 large-t 패밀리로 고정 — 호출 분할(청크)에 무관한 비트 결과.
-        // Drop 가드: 조기 return 포함 전 경로에서 해제.
-        self.pin_prefill.set(true);
+        // plans/116-6: 핀은 t≥16(프리필 청크)에만 — 스펙 검증(t=1+k+carried≤8)은
+        // large-t 타일이 128열 쿼드런트 낭비로 29GB/s에 그치므로 언핀하여
+        // 4-토큰 GEMV(g4, 169GB/s) 패밀리로. t<16 청크 잔여도 g4/tile-unpin으로
+        // 갈리나 크기 결정적(10a) — 청크 불변성 게이트(16/63/64/512)는 전부 ≥16.
+        let pin = t >= 16;
+        self.pin_prefill.set(pin);
         crate::rawhip::ctx::PREFILL_PIN.store(true, std::sync::atomic::Ordering::Relaxed);
         struct PinGuard<'a>(&'a std::cell::Cell<bool>);
         impl Drop for PinGuard<'_> {
