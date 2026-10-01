@@ -586,9 +586,7 @@ pub fn qsa_layer(
             Err(e) => {
                 // 12개 QSA 층 × 매 호출로 반복되므로 프로세스당 1회만 알린다.
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                if !llm170_diag::flag::on("LLM170_Q4_NOFAST") {
-                    ONCE.call_once(|| eprintln!("# qsa: GPU 어텐션 폴백 — CPU 재계산 ({e})"));
-                }
+                ONCE.call_once(|| eprintln!("# qsa: GPU 어텐션 폴백 — CPU 재계산 ({e})"));
                 // 폴백은 실제 CPU 재계산(공용 헬퍼) — 이전 구현은 행을 빈 채로
                 // 두어 어텐션이 조용히 누락됐다(2026-09-13 발견).
                 attn_all = qsa_cpu_attn_rows(

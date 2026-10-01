@@ -808,6 +808,10 @@ pub(super) fn frame_forward_np_ex(
         if stage_on {
             eprintln!("[nphead] argmax {:.1}ms", am0.elapsed().as_secs_f64() * 1e3);
         }
+        // plans/115: np 스텝도 KTRACE 스텝 덤프 — 종전 t=1 경로만 tick해서
+        // np 런은 이벤트 풀이 고갈(런치당 2개 × ~2,900)돼 후반 커널이 통째로
+        // 누락됐다(2026-10-01 규명).
+        acc.ktrace_tick();
         ftime_report(t);
         if ftime_on() {
             eprintln!(

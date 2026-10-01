@@ -119,15 +119,7 @@ impl llm170_core::matmul::FrameHost for VkAcc {
     /// 프레임 버퍼 — host-visible(alloc_host)로 직접 읽기/쓰기.
     /// 값경로 버퍼와 동일 정책(plans/29).
     fn frame_alloc(&self, len: usize) -> Result<u64, String> {
-        if std::env::var_os("LLM170_VK_POOL").is_some_and(|v| v == "0") {
-            let mut ctx = self.ctx.lock();
-            let b = crate::rawvk::context::site::scope("frame", || ctx.alloc_host(len * 4))?;
-            let h = self
-                .frame_next
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.framebufs.lock().insert(h, b);
-            return Ok(h);
-        }
+        // (비풀 직할당 경로는 plans/115 env 정리로 삭제 — 풀 재활용이 기본)
         let need = len * 4;
         // 풀에서 최소 적합 버퍼 재활용 (할당 syscall·vk 객체 회피).
         let recycled = {
@@ -1323,7 +1315,7 @@ impl VkAcc {
                     // plans/89 P1.2 — f32/BF16 프리필(t≥2) 타일: fn_mm_f32 그리드
                     // (n_out, t)의 가중 t-재판독(라우터 2.6GB/청크) 소거.
                     // 킬스위치 LLM170_VK_FT32=0.
-                    if t >= 2 && wbufs.len() == 1 && llm170_diag::flag::ne0("LLM170_VK_FT32") {
+                    if t >= 2 && wbufs.len() == 1 {
                         // plans/93: tile_f32_w는 실측 역행(558ms vs 352ms) — 원판 유지.
                         // plans/95 P1 — 스키니 f32(n_out ≤ 512): tile_f32는
                         // n_out=4(hc down)에서 WG 32개·활성 128스레드로 점유
@@ -1337,7 +1329,6 @@ impl VkAcc {
                                 .ok()
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(512)
-                            && llm170_diag::flag::ne0("LLM170_VK_FT32S")
                         {
                             let p = self.pipeline(&mut ctx, Slot::FnTileF32s)?;
                             let mut binds: Vec<vk::Buffer> = wbufs.clone();
@@ -1389,12 +1380,11 @@ impl VkAcc {
                         // 텐서에 359.6ms/청크의 원인 국소화.
                         continue;
                     }
-                    let slot =
-                        if t < 16 && wbufs.len() == 1 && llm170_diag::flag::ne0("LLM170_VK_MMB") {
-                            Slot::MmF32b
-                        } else {
-                            Slot::FnMmf32
-                        };
+                    let slot = if t < 16 && wbufs.len() == 1 {
+                        Slot::MmF32b
+                    } else {
+                        Slot::FnMmf32
+                    };
                     let p = self.pipeline(&mut ctx, slot)?;
                     let mut binds: Vec<vk::Buffer> = wbufs.clone();
                     while binds.len() < 8 {

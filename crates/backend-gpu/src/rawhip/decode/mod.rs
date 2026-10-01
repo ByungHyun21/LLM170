@@ -679,7 +679,7 @@ impl DecodeState {
         // 활성 quant 생략 경로: 라우팅 조건은 weights.rs dmmv_used/grp_mmq와
         // 동일해야 한다(어긋나면 quant를 건너뛴 쪽이 stale xq를 읽는다).
         // 핀 시 타일 large-t 패밀리 고정이라 제외. 킬스위치 LLM170_HIP_DMMV_OFF.
-        if t == 1 && ty == 8 && !self.pin_prefill.get() && !env_on("LLM170_HIP_DMMV_OFF") {
+        if t == 1 && ty == 8 && !self.pin_prefill.get() {
             return self.ctx.gemv_q8_dmmv_out(
                 y_f32 as *const u8,
                 wp as *const u8,

@@ -112,10 +112,7 @@ impl DecoderState {
         } else {
             self.m_h.buf
         };
-        let noba = llm170_diag::flag::on("LLM170_VK_NOBATCH");
-        if !noba {
-            self.ctx.begin_batch()?;
-        }
+        self.ctx.begin_batch()?;
         // enorm → cat[0..n] ‖ hnorm → cat[n..2n]
         let en = self
             .consts
@@ -281,11 +278,7 @@ impl DecoderState {
             self.n_ff,
         )?;
         self.axpy(self.m_cur.buf, self.b_fdown.buf, n)?;
-        if !noba {
-            self.ctx.end_batch_wait()?;
-        } else {
-            self.ctx.flush2()?;
-        }
+        self.ctx.end_batch_wait()?;
         if !with_head {
             return Ok(None);
         }

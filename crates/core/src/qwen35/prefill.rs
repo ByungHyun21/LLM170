@@ -97,10 +97,7 @@ impl Engine {
             let use_batch = std::env::var("LLM170_RAWHIP")
                 .map(|v| v != "0")
                 .unwrap_or(true)
-                && std::env::var_os("LLM170_T1_PREFILL").is_none()
-                && (tokens.len() > 1
-                    || std::env::var_os("LLM170_FORCE_BATCH").is_some()
-                    || self.raw_decode.is_some());
+                && (tokens.len() > 1 || self.raw_decode.is_some());
             if use_batch {
                 let rd = self.raw_decode.clone().unwrap();
                 let _n = self.model.hp.n_embd;

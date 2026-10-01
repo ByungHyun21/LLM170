@@ -296,7 +296,7 @@ impl Engine4 {
         }
         // ── plans/110 W2: 프레임 경로 — 배치 검증(1회 t=k-1 포워드) ──
         // 실패 시 fb 카운터 + 순차(값경로) 폴백.
-        if !llm170_diag::flag::on("LLM170_SPEC_NOBATCH") && k >= 2 {
+        if k >= 2 {
             match self.mtp_spec_step_frame(seq, last_token, k) {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -421,10 +421,7 @@ impl Engine4 {
         if drafts.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        if !llm170_diag::flag::on("LLM170_SPEC_NOBATCH")
-            && self.frame_on(true)
-            && self.frame_ensure()
-        {
+        if self.frame_on(true) && self.frame_ensure() {
             return self.suffix_spec_step_frame(seq, last_token, drafts);
         }
         // 프레임 경로 불가 — 순차 검증(값경로). 수용 접두 판정은 동일식.
@@ -2377,12 +2374,9 @@ impl Engine4 {
 
     /// 토큰 t의 로짓이 확정된 순간 t+1(=argmax)의 PLE 행을 사이드 스레드로
     /// 선적재 — 해시는 과거 토큰만의 함수라 오차 없는 선(先)적재 (05 §3).
-    /// LLM170_PLE_PREFETCH=1 게이트. np 디코드: 마지막 활성 시퀀스만.
+    /// (plans/115 env 정리: PLE_PREFETCH 킬스위치 폐기 — 항시 선적재.)
     fn spawn_ple_prefetch(&mut self, seq: usize, logits: &[f32]) {
-        if !llm170_diag::flag::on("LLM170_PLE_PREFETCH")
-            || !self.model.hp.is_ple(1)
-            || logits.is_empty()
-        {
+        if !self.model.hp.is_ple(1) || logits.is_empty() {
             return;
         }
         let (ptr, len, ty, hd) = match self.model.ple_table_view() {
