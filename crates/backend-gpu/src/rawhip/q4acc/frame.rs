@@ -15,6 +15,51 @@ pub static MOE_FALLBACK_USED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl llm170_core::matmul::FrameState for Q4Acc {
+    fn frame_topk_cands(
+        &self,
+        logits: u64,
+        t: usize,
+        vocab: usize,
+    ) -> Result<Vec<(f32, u32)>, String> {
+        const NB: u32 = 64; // 후보 블록 수 → 64×8워프 = 512 후보
+        const NWARP: usize = 8; // 256스레드 / 32
+        let cv = {
+            let mut g = self.tk_cand_v.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * (NB as usize) * NWARP * 4)?
+        };
+        let ci = {
+            let mut g = self.tk_cand_i.lock().map_err(|e| e.to_string())?;
+            g.ensure(&self.ctx, t * (NB as usize) * NWARP * 4)?
+        };
+        let lp = self.fptr(logits)?;
+        let (mut l_p, mut cv_p, mut ci_p) = (
+            lp as *mut std::ffi::c_void,
+            cv as *mut std::ffi::c_void,
+            ci as *mut std::ffi::c_void,
+        );
+        let (mut vv, mut nb) = (vocab as i32, NB as i32);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            (&mut l_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut cv_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut ci_p) as *mut _ as *mut std::ffi::c_void,
+            (&mut vv) as *mut _ as *mut std::ffi::c_void,
+            (&mut nb) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx
+            .launch3("q4_logits_topk_cand", NB, t as u32, 1, 256, &mut args)?;
+        let n_cand = t * (NB as usize) * NWARP;
+        let mut hv = vec![0.0f32; n_cand];
+        let mut hi = vec![0i32; n_cand];
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut hv), cv)?;
+        self.ctx.d2h(bytemuck::cast_slice_mut(&mut hi), ci)?;
+        Ok(hv
+            .into_iter()
+            .zip(hi)
+            .filter(|&(v, i)| i >= 0 && v > -1e29f32)
+            .map(|(v, i)| (v, i as u32))
+            .collect())
+    }
+
     fn gdn_split_l2_scale(
         &self,
         gconv: u64,

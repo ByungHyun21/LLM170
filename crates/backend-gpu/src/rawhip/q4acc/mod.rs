@@ -131,6 +131,8 @@ pub struct Q4Acc {
     /// plans/115 D(원장 152): 직전 층 그룹화의 비동기 rp 판독(핀 ptr, ne) —
     /// 다음 층에서 소개(이벤트 대기는 복사만, 즉시 완료)해 정확 그리드.
     moe_rp_pending: std::sync::Mutex<Option<(*mut u8, usize)>>,
+    tk_cand_v: std::sync::Mutex<GBuf>,
+    tk_cand_i: std::sync::Mutex<GBuf>,
     /// (rows, rp 추정) — rows가 바뀌면 재학습(바운드로 폴백).
     moe_rp_est: std::sync::Mutex<(usize, usize)>,
     /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
@@ -383,6 +385,8 @@ impl Q4Acc {
             ckv16: std::sync::Mutex::new((GBuf::new("qsakv16_k"), GBuf::new("qsakv16_v"))),
             ev_marks: std::sync::Mutex::new(Vec::new()),
             moe_rp_pending: std::sync::Mutex::new(None),
+            tk_cand_v: std::sync::Mutex::new(GBuf::new("tk_cand_v")),
+            tk_cand_i: std::sync::Mutex::new(GBuf::new("tk_cand_i")),
             moe_rp_est: std::sync::Mutex::new((0, 0)),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idxk: std::sync::Mutex::new(std::collections::HashMap::new()),
