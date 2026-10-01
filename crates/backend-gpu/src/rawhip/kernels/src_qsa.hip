@@ -750,6 +750,19 @@ extern "C" __global__ void __launch_bounds__(256) qsa_flash_wk8i(
 // (1) 게이트+방송+그룹 norm: k_n=rms(key[s]), q_n=rms(res[s]) → gate →
 //     gated=value·gate → rms(n_conv) → gated_hist. gate_out은 (3)이 재사용.
 //     스레드 = (토큰, 스트림). 2560 원소 ×수 패스 — μs급.
+/// plans/115: 워프 판 — lane L가 청크 L를 순차 f32, 32파트 double 레인순 결합.
+/// 청크 경계·결합 순서가 직렬 판과 동일 → **비트 동일**.
+DEV float ple_rms_scale_warp(const float* x, int n_embd, float eps, int lane) {
+    const int chunk = (n_embd + 31) >> 5;
+    const int lo = lane * chunk, hi = min(lo + chunk, n_embd);
+    float acc = 0.0f;
+    for (int i = lo; i < hi; i++) { const float dv = x[i]; acc += dv * dv; }
+    double sum = 0.0;
+    #pragma unroll
+    for (int u = 0; u < 32; u++) sum += (double)__shfl_sync(0xFFFFFFFFFFFFFFFFull, acc, u);
+    return 1.0f / (float)sqrt(sum / (double)n_embd + (double)eps);
+}
+
 DEV float ple_rms_scale(const float* x, int n_embd, float eps) {
     const int chunk = (n_embd + 31) >> 5;
     float parts[32];
@@ -773,34 +786,46 @@ extern "C" __global__ void __launch_bounds__(256) q4_ple_gate(
         const float* __restrict__ nc,
         float* __restrict__ gated_hist, float* __restrict__ gate_out,
         float eps, int n_embd, int hc, int t) {
+    // plans/115: 워프-단위 병렬판(종전 lane-0 직렬 1ms/런치). rms는 청크 분해가
+    // 직렬 판과 동일해 비트 불변, dot는 청크 분해로 순서 변경(규칙 10a —
+    // 같은 f32 정밀도, source/ 수준).
     const int s = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int ti = blockIdx.y;
     const int lane = threadIdx.x & 31;
-    if (s >= hc || ti >= t || lane != 0) return;
+    if (s >= hc || ti >= t) return;
     const float* ks_row = key + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
     const float* rs_row = res + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
-    const float sk = ple_rms_scale(ks_row, n_embd, eps);
-    const float sq = ple_rms_scale(rs_row, n_embd, eps);
-    // dot: k_n[i]·q_n[i] 를 i 오름차순 f32 직렬 누산(호스트와 동일).
-    // k_n[i] = (key[i]·sk)·nk[i] — 저장 없이 동일 반올림 사슬로 재현.
-    float dot = 0.0f;
-    const float* nk_s = nk + (size_t)s * n_embd;   // 노름 가중치는 스트림별 슬라이스
-    const float* nq_s = nq + (size_t)s * n_embd;
-    for (int i = 0; i < n_embd; i++) {
-        const float a = (ks_row[i] * sk) * nk_s[i];
-        const float b = (rs_row[i] * sq) * nq_s[i];
-        dot += a * b;
+    const float sk = ple_rms_scale_warp(ks_row, n_embd, eps, lane);
+    const float sq = ple_rms_scale_warp(rs_row, n_embd, eps, lane);
+    // dot: k_n·q_n — 32청크 순차 f32 부분합 + 레인순 double 결합.
+    {
+        const int chunk = (n_embd + 31) >> 5;
+        const int lo = lane * chunk, hi = min(lo + chunk, n_embd);
+        const float* nk_s = nk + (size_t)s * n_embd;
+        const float* nq_s = nq + (size_t)s * n_embd;
+        float pd = 0.0f;
+        for (int i = lo; i < hi; i++) {
+            const float a = (ks_row[i] * sk) * nk_s[i];
+            const float b = (rs_row[i] * sq) * nq_s[i];
+            pd += a * b;
+        }
+        double dsum = 0.0;
+        #pragma unroll
+        for (int u = 0; u < 32; u++) dsum += (double)__shfl_sync(0xFFFFFFFFFFFFFFFFull, pd, u);
+        float dot = (float)dsum;
+        dot /= (float)sqrt((float)n_embd);
+        const float mag = fmaxf(fabsf(dot), 1e-6f);
+        const float g = 1.0f / (1.0f + exp_cr_exact(dot >= 0.0f ? -sqrtf(mag) : sqrtf(mag)));
+        if (lane == 0) gate_out[(size_t)ti * hc + s] = g;
+        // gated = value·gate → rms(n_conv) → norm. value는 [t][n_embd] 공유.
+        const float* val = value + (size_t)ti * n_embd;
+        float* out = gated_hist + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
+        for (int i = lane; i < n_embd; i += 32) out[i] = val[i] * g;
+        __syncwarp();
+        const float sg = ple_rms_scale_warp(out, n_embd, eps, lane);
+        const float* nc_s = nc + (size_t)s * n_embd;
+        for (int i = lane; i < n_embd; i += 32) out[i] = out[i] * sg * nc_s[i];
     }
-    dot /= (float)sqrt((float)n_embd);
-    const float mag = fmaxf(fabsf(dot), 1e-6f);
-    const float g = 1.0f / (1.0f + exp_cr_exact(dot >= 0.0f ? -sqrtf(mag) : sqrtf(mag)));
-    gate_out[(size_t)ti * hc + s] = g;
-    // gated = value·gate → rms(n_conv). value는 [t][n_embd] 스트림 공유.
-    const float* val = value + (size_t)ti * n_embd;
-    float* out = gated_hist + (size_t)ti * hc * n_embd + (size_t)s * n_embd;
-    for (int i = 0; i < n_embd; i++) out[i] = val[i] * g;
-    const float sg = ple_rms_scale(out, n_embd, eps);
-    for (int i = 0; i < n_embd; i++) out[i] = out[i] * sg * nc[(size_t)s * n_embd + i];
 }
 
 // (2) dilated depthwise conv(kern=4, dil=3, hist=9) + silu + 링 갱신.
