@@ -885,7 +885,12 @@ pub(super) fn qsa_frame(
                     &f.qsa_cs_idx,
                     hp.eps,
                 )?;
-                // 항등 목록 — 행 i 의 선택 = [0, pos0+i] (오름차순 전체).
+                // [이등분] identity 커널 실행(결과 폐기) + 호스트 res
+                let _ = acc.qsa_identity_sel(
+                    pos0u,
+                    t,
+                    seq_st.kv_k[full_idx].len() / (hp.n_kv * hp.head_dim),
+                );
                 let mut sel_off: Vec<u32> = vec![0u32; t + 1];
                 for t2 in 0..t {
                     sel_off[t2 + 1] = sel_off[t2] + (pos0u + t2 + 1) as u32;

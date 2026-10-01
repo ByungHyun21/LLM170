@@ -255,6 +255,8 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
     int wrow = n_sub * 6;                 // 워드/출력행
     int o0 = (int)blockIdx.x * 16;
     int r0 = (int)blockIdx.y * 16;
+    // plans/115 D: 스테일 타일(패딩 도메인 [rp, bound)) 즉시 탈출 — 가중 독서 0.
+    if (tile_exp[blockIdx.y] & 0x80000000u) return;
     // 가중치 cooperative 적재 (16행 × wrow 워드) — 연속 워드라 코얼레스드.
     for (int i = threadIdx.x; i < 16 * wrow; i += 256) {
         int oo = i / wrow;
@@ -563,6 +565,27 @@ extern "C" __global__ void bw_strided(const unsigned char* __restrict__ w, unsig
     atomicAdd(&acc[0], v);
 }
 
+// plans/115 D(원장 151): 항등 선택 목록 [0..pos0+i]의 디바이스 생성 —
+// 호스트 빌드+524KB pageable 업로드(스테이징 폴백으로 동기화, ~155ms/층) 제거.
+// 블록 i가 행 i의 스팬을 채운다: 시작 = i*pos0 + i*(i+1)/2 + i (닫힌식).
+extern "C" __global__ void q4_identity_sel(unsigned* __restrict__ sel_idx,
+                                           unsigned* __restrict__ sel_off,
+                                           int pos0, int t) {
+    const int i = (int)blockIdx.x;
+    if (i == t) {
+        if (threadIdx.x == 0)
+            sel_off[t] = (unsigned)((long long)t * (pos0 + 1) + ((long long)t * (t - 1)) / 2);
+        return;
+    }
+    // Σ_{j<i}(pos0+j+1) = i(pos0+1) + i(i-1)/2 (초기식 i(i+1)/2+i는 +i 오차).
+    const long long start = (long long)i * (pos0 + 1) + ((long long)i * (i - 1)) / 2;
+    const int len = pos0 + i + 1;
+    if (threadIdx.x == 0) sel_off[i] = (unsigned)start;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        sel_idx[start + j] = (unsigned)j;
+    }
+}
+
 extern "C" __global__ void q4_moe_group_t1(
         const unsigned* __restrict__ ids, int ne, int rows,
         int* __restrict__ out_off, unsigned* __restrict__ perm, unsigned* __restrict__ inv,
@@ -639,8 +662,11 @@ extern "C" __global__ void q4_moe_group_t1(
     // [rp, bound) 전체를 0으로 — 종전엔 16정렬 꼬리만 채워 [rp, bound&~15)이
     // 낡은 값으로 남았고, gather가 그 인덱스로 xq를 읽어 OOB(폴트/오염) 냈다
     // (plans/68 12차). 0 = 원본 0번 행(유효) — 어차피 패딩 슬롯이라 안 읽힌다.
+    // plans/115 D: tilexp는 센티널(고비트) — bound 그리드의 스테일 타일이
+    // 실제 가중을 읽으며 8× 폭증했던 것을 즉시 탈출시킨다(원장 151).
     for (int pd = rp; pd < bound; pd += nt) {
         perm_pad[pd] = 0;
+        if ((pd & 15) == 0) tilexp[pd >> 4] = 0xFFFFFFFFu;
     }
 }
 
