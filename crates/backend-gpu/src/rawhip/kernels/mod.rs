@@ -161,6 +161,7 @@ pub const NAMES: &[&str] = &[
     "q4_shexp_da",
     "q4_identity_sel",
     "q4_gemm_q5k_gm",
+    "q4_gemm_q8_gm",
     "q4_shexp_gu_t",
     "q4_shexp_da_t",
     "add_f32",

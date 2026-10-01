@@ -167,6 +167,16 @@ pub(crate) fn frame_forward_ex(
         PF_GRAPH_OK.store(false, Ordering::Relaxed);
     }
     let pf_graph_active = pf_graph_on && PF_GRAPH_OK.load(Ordering::Relaxed);
+    if t > 1 && std::env::var_os("LLM170_PF_GRAPH_DEBUG").is_some() {
+        eprintln!(
+            "# pfgraph t={t} on={} active={} warm={} ok={} cap={} ",
+            pf_graph_on,
+            pf_graph_active,
+            PF_WARM.load(Ordering::Relaxed),
+            PF_GRAPH_OK.load(Ordering::Relaxed),
+            moe_fallback_free
+        );
+    }
 
     for il in 0..hp.n_layer {
         if trace {

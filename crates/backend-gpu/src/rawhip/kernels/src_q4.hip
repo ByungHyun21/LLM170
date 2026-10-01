@@ -306,26 +306,35 @@ extern "C" __global__ void q4_gemm_q5_1_gm(const unsigned* xq, const unsigned* w
 // 적재·타일별 전문가·패딩 센티널). 폴백의 호스트 오프셋 판독을 없애 그래프 캡처를
 // 연다. Q5_K 블록 = 176B/superblock(256원소): d(f16)+dm(f16)+sc(12B)+qh(32B)+qs(128B).
 // 산술 순서는 dot_q5k_q8(lane.rs)과 동일 클래스(청정 f32, 규칙 10a).
+// plans/115 D(원장 154): Q5_K 그룹 타일 — smem 협업 적재 판. 무smem 직독판 대비
+// 가중을 블록 내 16행이 공유(코얼레스드 스테이징). smem = 16×(n_super×44)워드
+// = 27.5KB(n_in=2560) — Q5_1 gm(30KB)와 유사, CDS 이내.
 extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
         const unsigned* xq, const unsigned* w, double* part,
         float* out, const unsigned* tile_exp,
         int n_in, int n_out, int xq_w, int t, int expert_words) {
-    // smem 없는 판 — Q5_K 블록이 176B/32원소로 smem 16행 적재가 CDS 한계 초과.
-    // 스레드 (ox=15bit, rx=16bit)가 가중을 직접 global read. 코얼레싱은 낮지만
-    // 폴백(N회 호스트 오프셋 런치) 대비: 1런치 + 그래프 캡처 호환.
+    extern __shared__ unsigned wsh[];
+    int n_super = n_in >> 8;
+    int wrow = n_super * 44;              // 워드/출력행 (176B/superblock)
     int o0 = (int)blockIdx.x * 16;
     int r0 = (int)blockIdx.y * 16;
     if (tile_exp[blockIdx.y] & 0x80000000u) return;  // 스테일 타일 탈출
+    // 가중치 cooperative 적재 (16행 × wrow 워드) — 연속 워드라 코얼레스드.
+    for (int i = threadIdx.x; i < 16 * wrow; i += 256) {
+        int oo = i / wrow;
+        int ww = i - oo * wrow;
+        if (o0 + oo < n_out)
+            wsh[i] = w[(size_t)tile_exp[blockIdx.y] * (size_t)expert_words + (size_t)(o0 + oo) * wrow + ww];
+    }
+    __syncthreads();
     int ox = threadIdx.x & 15;
     int rx = threadIdx.x >> 4;
     int o = o0 + ox;
     int r = r0 + rx;
     if (o >= n_out || r >= t) return;
-    size_t expert_base = (size_t)tile_exp[blockIdx.y] * (size_t)expert_words;
-    const unsigned* wr = w + expert_base + (size_t)o * ((size_t)(n_in >> 8) * 44);
+    const unsigned* wr = wsh + ox * wrow;
     const unsigned* xr = xq + (size_t)r * xq_w;
     float acc = 0.0f;
-    int n_super = n_in >> 8;
     for (int sb = 0; sb < n_super; sb++) {
         int wb = sb * 44;
         float d  = bits_f16(wr[wb] & 0xFFFFu);
@@ -351,7 +360,6 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
             float d1 = d * (float)sc1_v, mm1 = dm * (float)m1_v;
             float d2 = d * (float)sc2_v, mm2 = dm * (float)m2_v;
             int qs_base = wb + 12 + it * 8;
-            // qh: it 무관 같은 8워드(wr[wb+4..wb+11]) — it는 비트 위치만 결정.
             int y_off1 = (sb * 8 + 2*it) << 3;
             int y_off2 = (sb * 8 + 2*it+1) << 3;
             float yd1 = __uint_as_float(xr[(n_in >> 2) + sb * 8 + 2*it]);
@@ -360,18 +368,15 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
             int sh1 = 2 * it, sh2 = 2 * it + 1;
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                unsigned qsw = wr[qs_base + k];     // ql 워드 (하니블+상니블)
-                unsigned qhw = wr[wb + 4 + k];      // qh 워드 — it 무관 동일!
+                unsigned qsw = wr[qs_base + k];
+                unsigned qhw = wr[wb + 4 + k];      // qh — it 무관 동일 워드
                 unsigned lo = qsw & 0x0F0F0F0Fu;
                 unsigned hi = (qsw >> 4) & 0x0F0F0F0Fu;
-                // it번째 비트를 전 바이트에서 뽑아 <<4 (상위 5th bit)
                 unsigned bit1 = ((qhw >> sh1) & 0x01010101u) << 4;
                 unsigned bit2 = ((qhw >> sh2) & 0x01010101u) << 4;
                 unsigned y1 = xr[y_off1 + k];
                 unsigned y2 = xr[y_off2 + k];
-                // 서브1: lo + bit1 (5th bit)
                 isum1 += dot4(lo, y1, 0) + dot4(bit1, y1, 0);
-                // 서브2: hi + bit2
                 isum2 += dot4(hi, y2, 0) + dot4(bit2, y2, 0);
                 qs1 += dot4(0x01010101u, y1, 0);
                 qs2 += dot4(0x01010101u, y2, 0);
@@ -379,6 +384,44 @@ extern "C" __global__ void __launch_bounds__(256) q4_gemm_q5k_gm(
             acc += yd1 * (d1 * (float)isum1 - mm1 * (float)qs1);
             acc += yd2 * (d2 * (float)isum2 - mm2 * (float)qs2);
         }
+    }
+    out[(size_t)r * n_out + o] = acc;
+}
+
+// plans/115 D(원장 154): Q8_0 그룹 타일 — 폴백(호스트 오프셋)을 없애 그래프
+// 캡처 호환. Q8_0 블록 = 34B/32원소(d f16 + qs int8×32). 간단 산술:
+// yd * d * Σ(qs[i] * y[i]) — dot4(sdot4)로 4바이트씩.
+extern "C" __global__ void __launch_bounds__(256) q4_gemm_q8_gm(
+        const unsigned* xq, const unsigned* w, double* part,
+        float* out, const unsigned* tile_exp,
+        int n_in, int n_out, int xq_w, int t, int expert_bytes) {
+    int o0 = (int)blockIdx.x * 16;
+    int r0 = (int)blockIdx.y * 16;
+    if (tile_exp[blockIdx.y] & 0x80000000u) return;
+    int ox = threadIdx.x & 15;
+    int rx = threadIdx.x >> 4;
+    int o = o0 + ox;
+    int r = r0 + rx;
+    if (o >= n_out || r >= t) return;
+    size_t ebase = (size_t)tile_exp[blockIdx.y] * (size_t)expert_bytes;
+    const unsigned char* wbase = (const unsigned char*)w + ebase;
+    const unsigned* xr = xq + (size_t)r * xq_w;
+    int n_sub = n_in >> 5;
+    float acc = 0.0f;
+    for (int sb = 0; sb < n_sub; sb++) {
+        const unsigned char* blk = wbase + (size_t)(o * n_sub + sb) * 34;
+        float d = bits_f16(blk[0] | ((unsigned)blk[1] << 8));
+        int y_off = sb << 3;
+        float yd = __uint_as_float(xr[(n_in >> 2) + sb]);
+        int isum = 0;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int qo = 2 + k * 4;
+            unsigned qv = (unsigned)blk[qo] | ((unsigned)blk[qo+1] << 8)
+                        | ((unsigned)blk[qo+2] << 16) | ((unsigned)blk[qo+3] << 24);
+            isum += dot4(qv, xr[y_off + k], 0);
+        }
+        acc += yd * d * (float)isum;
     }
     out[(size_t)r * n_out + o] = acc;
 }
