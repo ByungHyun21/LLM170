@@ -15,6 +15,26 @@ pub enum FwdMode {
     NoReadback,
 }
 
+/// plans/115 D: 프리필 스테이지 보고 — 양 백엔드 동일 회로(np_stage 패턴).
+fn pf_report(
+    on: bool,
+    pf: &mut [f64; 5],
+    t0: &std::time::Instant,
+    t: usize,
+    hmark: std::time::Instant,
+) {
+    if !on {
+        return;
+    }
+    pf[3] += hmark.elapsed().as_secs_f64() * 1e3;
+    let tot = t0.elapsed().as_secs_f64() * 1e3;
+    pf[4] = tot - pf[0] - pf[1] - pf[2] - pf[3];
+    eprintln!(
+        "[pfstage] t={t} 총 {:.1} | gdn {:.1} qsa {:.1} moe {:.1} head {:.1} 기타 {:.1}",
+        tot, pf[0], pf[1], pf[2], pf[3], pf[4]
+    );
+}
+
 pub fn frame_forward(
     acc: &dyn Accelerator,
     model: &Model4,
@@ -64,6 +84,11 @@ pub(crate) fn frame_forward_ex(
     if llm170_diag::dump::opts().key("frame_time") {
         eprintln!("# ff-entry t={t}");
     }
+    // plans/115 D: 프리필 스테이지 타이머 — 양 백엔드 동일 회로 비교(원장 148).
+    let pf_on = llm170_diag::dump::opts().key("pf_stage");
+    let mut pf = [0.0f64; 5]; // [gdn, qsa, moe, head, 기타]
+    let pf_t0 = std::time::Instant::now();
+    let mut pf_mark = std::time::Instant::now();
     fs_begin(acc, t);
 
     // 0) 임베딩 — t행 → hc 스트림 방송 ([t][hc][n])
@@ -379,10 +404,16 @@ pub(crate) fn frame_forward_ex(
             if stage_skipped("gdn") {
                 // 진단용: GDN 단계 생략(출력 무효) — 디코드 스텝 비용 분해.
             } else {
+                if pf_on {
+                    pf_mark = std::time::Instant::now();
+                }
                 gdn_frame(
                     acc, model, f, il, seq, recr_idx, conv_ch, k_len, v_len, eps, t,
                 )?;
                 ck!(acc, il, f.ffn_out, n, t, &format!("L{il}.gdn"));
+                if pf_on {
+                    pf[0] += pf_mark.elapsed().as_secs_f64() * 1e3;
+                }
             }
             recr_idx += 1;
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -402,7 +433,12 @@ pub(crate) fn frame_forward_ex(
             // 시점엔 캐시 미변경이라 이중 적립이 없다.
             if stage_skipped("qsa") {
                 // 진단용: QSA 브리지 생략(출력 무효).
-            } else if qsa_frame(
+            } else if {
+                if pf_on {
+                    pf_mark = std::time::Instant::now();
+                }
+                true
+            } && qsa_frame(
                 acc,
                 model,
                 ctx,
@@ -428,6 +464,9 @@ pub(crate) fn frame_forward_ex(
                 acc.capture_mark("recr_out").map_err(Q4Error::Io)?;
             }
             full_idx += 1;
+            if pf_on {
+                pf[1] += pf_mark.elapsed().as_secs_f64() * 1e3;
+            }
             sync_mark(acc, &format!("L{il}.qsa_bridge"), f.ffn_out)?;
             ck!(acc, il, f.ffn_out, n, t, &format!("L{il}.qsa"));
             hc_combine_frame(acc, f, f.ffn_out, f.inj, n, hc, t)?;
@@ -437,7 +476,13 @@ pub(crate) fn frame_forward_ex(
         hc_mix_frame(acc, model, f, il, "ffn", eps, n, hc, t)?;
         sync_mark(acc, &format!("L{il}.hc_ffn"), f.mix)?;
         ck!(acc, il, f.mix, n, t, &format!("L{il}.mixf"));
+        if pf_on {
+            pf_mark = std::time::Instant::now();
+        }
         moe_frame(acc, model, f, il, n, t)?;
+        if pf_on {
+            pf[2] += pf_mark.elapsed().as_secs_f64() * 1e3;
+        }
         sync_mark(acc, &format!("L{il}.moe"), f.mout)?;
         ck!(acc, il, f.mout, n, t, &format!("L{il}.moe"));
 
@@ -485,6 +530,9 @@ pub(crate) fn frame_forward_ex(
     }
 
     // 5) head — output hc mix(전 토큰) → 마지막 행만 GEMM → 판독
+    if pf_on {
+        pf_mark = std::time::Instant::now();
+    }
     {
         let w_norm = f.consts["output_hc_norm"];
         op(
@@ -538,6 +586,7 @@ pub(crate) fn frame_forward_ex(
         // 최종 청크만 logits가 필요. hin_last는 이미 복사돼 있어 다음
         // 프리필/디코드 진입 시 소비된다(스킵은 버려질 계산뿐).
         if mode == FwdMode::NoReadback {
+            pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
             ftime_report(t);
             return Ok((Vec::new(), None));
         }
@@ -563,6 +612,7 @@ pub(crate) fn frame_forward_ex(
             // plans/88 — 그리디 판독도 ktrace 틱: [ts] 프로파일이 디코드 스텝을
             // 잡지 못했다(프리필 종료 틱만 관측). 그리디 반환 직전에 틱한다.
             acc.ktrace_tick();
+            pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
             ftime_report(t);
             return Ok((Vec::new(), Some(toks[0])));
         }
@@ -597,6 +647,7 @@ pub(crate) fn frame_forward_ex(
                 t_call.elapsed().as_secs_f64() * 1e3
             );
         }
+        pf_report(pf_on, &mut pf, &pf_t0, t, pf_mark);
         Ok((logits, None))
     }
 }
