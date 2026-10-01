@@ -2,6 +2,37 @@
 
 use super::*;
 
+// plans/115 D: 런치 제출 비용 계측 (LLM170_DUMP=launch_time).
+pub static IO_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IO_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IO_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn io_time_report() {
+    let us = IO_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let n = IO_N.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        eprintln!(
+            "[iotime] sync-I/O {n} calls {:.1}ms (avg {:.0}us, last {})",
+            us as f64 / 1e3,
+            us as f64 / n as f64,
+            IO_LAST.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+}
+
+pub fn launch_time_report() {
+    let us = LT_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let n = LT_N.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        eprintln!(
+            "[ltime] 제출 {n}회 총 {us}µs (평균 {:.1}µs)",
+            us as f64 / n as f64
+        );
+    }
+}
+
 impl RawCtx {
     /// KTRACE 전용 이벤트 마커 — launch3를 거치지 않는 직접 런치 경로용.
     pub(super) fn ktr_mark(&self, name: &'static str, gy: u32) {
@@ -60,6 +91,9 @@ impl RawCtx {
             .map_err(|e| format!("{e} kern={name} gx={gx} blk={block}"))?;
             self.ktr_ev(name, gy, self.stream);
         }
+        if llm170_diag::dump::opts().key("launch_time") {
+            LT_US.fetch_add(0, std::sync::atomic::Ordering::Relaxed); // 2D는 극소
+        }
         Ok(())
     }
 
@@ -74,6 +108,11 @@ impl RawCtx {
         block: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        let lt_on = llm170_diag::dump::opts().key("launch_time");
+        let lt_t0 = std::time::Instant::now();
+        if lt_on {
+            _ = lt_t0;
+        }
         if env_on("LLM170_LAUNCH_BT") {
             eprintln!("[lbt] {name} gx={gx} gy={gy} gz={gz}");
         }
@@ -109,6 +148,13 @@ impl RawCtx {
             .map_err(|e| format!("{e} kern={name} gx={gx} gy={gy} gz={gz} blk={block}"))?;
             self.ktr_ev(name, gy, self.stream);
         }
+        if lt_on {
+            LT_US.fetch_add(
+                lt_t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            LT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -124,6 +170,8 @@ impl RawCtx {
         smem: u32,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<(), String> {
+        let lt_on = llm170_diag::dump::opts().key("launch_time");
+        let lt_t0 = std::time::Instant::now();
         if nolaunch_on() {
             return Ok(());
         }
@@ -172,6 +220,13 @@ impl RawCtx {
                 "launch3_dyn",
             )?;
             self.ktr_ev(name, gy, self.stream);
+        }
+        if lt_on {
+            LT_US.fetch_add(
+                lt_t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            LT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }

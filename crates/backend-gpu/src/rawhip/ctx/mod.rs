@@ -463,4 +463,4 @@ impl RawCtx {
 mod alloc;
 mod copy;
 mod gemm;
-mod launch;
+pub mod launch;
