@@ -1635,13 +1635,12 @@ pub(super) fn moe_frame(
                     n: rows_avail,
                 },
             )?;
-            for row in 0..rows_avail {
-                acc.shexp_gu(vv2.mix[row], &shg_w, &shu_w, f.shglu, n, n_ff)
-                    .map_err(Q4Error::Io)?;
-                let sg_view = acc.frame_slice(f.msgate, row, 1).map_err(Q4Error::Io)?;
-                acc.shexp_da(f.shglu, &shd_w, sg_view, vv2.mout[row], n, n_ff)
-                    .map_err(Q4Error::Io)?;
-            }
+            // plans/116 U2: t행 배치 2런치(행별 산술 동일 — 비트 불변).
+            // 종전 행별 루프는 48층 × 2t런치(np4 기준 384/스텝).
+            acc.shexp_gu_t(f.mix, &shg_w, &shu_w, f.shglu, n, n_ff, rows_avail)
+                .map_err(Q4Error::Io)?;
+            acc.shexp_da_t(f.shglu, &shd_w, f.msgate, f.mout, n, n_ff, rows_avail)
+                .map_err(Q4Error::Io)?;
         } else {
             // plans/104: 순수 프리필 — GEMM 체인은 gather 직후 이미 발행됨
             // (sh_early). 여기는 잔류 가산만.

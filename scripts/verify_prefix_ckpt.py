@@ -63,6 +63,9 @@ def start(spec):
             "--ctx", "4096", "--backend", "hip", "--slots", "2"]
     if spec:
         args += ["--spec", str(spec)]
+    # 측정·게이트 프로토콜 표준 — 반복 검증 시 페이지 캐시 압박에 의한
+    # 리소스 가드 오탐 방지(AGENTS 게이트 배터리 참조).
+    env["LLM170_NO_RSRC_GUARD"] = "1"
     lf = open(LOG, "wb")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=lf, env=env)
     base = f"http://127.0.0.1:{PORT}"

@@ -1112,6 +1112,75 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         )
     }
     /// plans/73(np): 프레임 버퍼 행 뷰 — 배치 디코드의 per-seq 상태 op용.
+    fn shexp_gu_t(
+        &self,
+        x: u64,
+        wg: &llm170_core::matmul::Weight,
+        wu: &llm170_core::matmul::Weight,
+        h: u64,
+        n_in: usize,
+        n_hidden: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let mut xp = self.fptr(x)? as *mut std::ffi::c_void;
+        let (wgd, _) = self.dev_weight(wg)?;
+        let (wud, _) = self.dev_weight(wu)?;
+        let mut wgp = wgd as *mut std::ffi::c_void;
+        let mut wup = wud as *mut std::ffi::c_void;
+        let mut hp = self.fptr(h)? as *mut std::ffi::c_void;
+        let (mut ni, mut nh) = (n_in as i32, n_hidden as i32);
+        let mut args = vec![
+            (&mut xp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wgp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wup) as *mut _ as *mut std::ffi::c_void,
+            (&mut hp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3(
+            "q4_shexp_gu_t",
+            n_hidden.div_ceil(8) as u32,
+            t as u32,
+            1,
+            256,
+            &mut args,
+        )
+    }
+
+    fn shexp_da_t(
+        &self,
+        h: u64,
+        wd: &llm170_core::matmul::Weight,
+        s: u64,
+        mout: u64,
+        n_in: usize,
+        n_hidden: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        let mut hp = self.fptr(h)? as *mut std::ffi::c_void;
+        let (wdd, _) = self.dev_weight(wd)?;
+        let mut wdp = wdd as *mut std::ffi::c_void;
+        let mut sp = self.fptr(s)? as *mut std::ffi::c_void;
+        let mut mp = self.fptr(mout)? as *mut std::ffi::c_void;
+        let (mut ni, mut nh) = (n_in as i32, n_hidden as i32);
+        let mut args = vec![
+            (&mut hp) as *mut _ as *mut std::ffi::c_void,
+            (&mut wdp) as *mut _ as *mut std::ffi::c_void,
+            (&mut sp) as *mut _ as *mut std::ffi::c_void,
+            (&mut mp) as *mut _ as *mut std::ffi::c_void,
+            (&mut ni) as *mut _ as *mut std::ffi::c_void,
+            (&mut nh) as *mut _ as *mut std::ffi::c_void,
+        ];
+        self.ctx.launch3(
+            "q4_shexp_da_t",
+            n_in.div_ceil(8) as u32,
+            t as u32,
+            1,
+            256,
+            &mut args,
+        )
+    }
+
     fn frame_slice(&self, h: u64, off_elems: usize, len: usize) -> Result<u64, String> {
         let mut v = self.frames.lock().map_err(|e| e.to_string())?;
         let idx = (h.checked_sub(1).ok_or("frame 핸들 0")?) as usize;

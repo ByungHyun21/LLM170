@@ -597,7 +597,7 @@ pub trait QsaOps: Send + Sync {
 ///
 /// plans/75 P1 — `Accelerator` 분해의 일부. 스테이지 코드는 필요한
 /// capability 만 요구하도록 좁힐 수 있다(기본 구현은 종전과 동일).
-pub trait FrameHost: Send + Sync {
+pub trait FrameHost: Send + Sync + EwOps {
     /// 프레임 경로 완전성 — false면 엔진이 프레임 진입을 건너뛴다(값경로).
     /// 부분 구현 백엔드(plans/84 B vk)가 완성 전 기본 경로를 깨지 않게 한다.
     fn frame_capable(&self) -> bool {
@@ -661,6 +661,45 @@ pub trait FrameHost: Send + Sync {
     /// 기존 메서드·커널은 무변경(핸들 = 포인터이므로 그대로 소비된다).
     fn frame_slice(&self, _h: u64, _off_elems: usize, _len: usize) -> Result<u64, String> {
         Err("frame_slice: 이 가속기는 미지원".into())
+    }
+    /// plans/116 U2: shared expert t행 배치 — x/h/s/mout는 [t][·] 연속.
+    /// 행별 산술 동일(비트 불변). 기본은 행별 슬라이스 폴백(현행 동작).
+    fn shexp_gu_t(
+        &self,
+        x: u64,
+        wg: &Weight,
+        wu: &Weight,
+        h: u64,
+        n_in: usize,
+        n_hidden: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        for r in 0..t {
+            let xr = self.frame_slice(x, r * n_in, n_in)?;
+            let hr = self.frame_slice(h, r * n_hidden, n_hidden)?;
+            self.shexp_gu(xr, wg, wu, hr, n_in, n_hidden)?;
+        }
+        Ok(())
+    }
+
+    /// plans/116 U2 — shexp_gu_t의 down+sigmoid·axpy 짝. s는 [t] 스칼라열.
+    fn shexp_da_t(
+        &self,
+        h: u64,
+        wd: &Weight,
+        s: u64,
+        mout: u64,
+        n_in: usize,
+        n_hidden: usize,
+        t: usize,
+    ) -> Result<(), String> {
+        for r in 0..t {
+            let hr = self.frame_slice(h, r * n_hidden, n_hidden)?;
+            let sr = self.frame_slice(s, r, 1)?;
+            let mr = self.frame_slice(mout, r * n_in, n_in)?;
+            self.shexp_da(hr, wd, sr, mr, n_in, n_hidden)?;
+        }
+        Ok(())
     }
 
     /// plans/67 2a: 프레임 버퍼의 q/k에 **RMS norm + rope**를 디바이스에서 적용
