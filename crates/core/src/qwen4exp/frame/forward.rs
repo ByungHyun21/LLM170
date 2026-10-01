@@ -167,6 +167,7 @@ pub(crate) fn frame_forward_ex(
         PF_GRAPH_OK.store(false, Ordering::Relaxed);
     }
     let pf_graph_active = pf_graph_on && PF_GRAPH_OK.load(Ordering::Relaxed);
+
     for il in 0..hp.n_layer {
         if trace {
             eprintln!(
