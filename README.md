@@ -24,7 +24,8 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | np4 greedy | 32.41 | **33.62** | — | — |
 | MTP k=2 | 2.26 | 2.24 | **~11.3** | — |
 | MTP k=3 | 2.19 | 2.16 | — | — |
-| MTP + np4 k=2 | 13.12 | n/a | **30.09** | — |
+| MTP + np4 k=2 | 16.14 | n/a | **30.09** | — |
+| MTP + np4 k=3 | 12.55 | n/a | — | — |
 
 ### Qwen3.8-Flash-Next (177B-A3B, Q4_K_XL 103.7 GiB)
 
@@ -41,8 +42,8 @@ Currently benchmarked on AMD APUs (Radeon 8060S / gfx1151, ROCm + Vulkan), with 
 | np4 greedy | 34.06 | **49.03** |
 | MTP k=2 | 5.29 | — |
 | MTP k=3 | 4.73 | — |
-| MTP + np4 k=2 | 10.82 | — |
-| MTP + np4 k=3 | 11.65 | — |
+| MTP + np4 k=2 | 5.67 | — |
+| MTP + np4 k=3 | 7.67 | — |
 
 <!-- 금지: 이 영역에 게이트 통과·기능 나열·세션 노트 등 잡다한 산출물을
      적지 않는다 — 표 안의 측정값만 갱신한다 (repo 규칙). -->
