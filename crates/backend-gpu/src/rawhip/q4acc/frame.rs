@@ -586,6 +586,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 } else {
                     // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
                     // 하므로 캡처 밖이어야 한다(세그먼트 분할점).
+                    // plans/115 D(원장 148): 업로드 6종은 h2d_async_m — 종전 각각 풀
+                    // sync 종료라 층당 6회 드레인(pf_stage 배당 ~570ms/청크의 본체).
+                    // pageable 소스는 호출 시점 스테이징이라 스코프 탈출 안전,
+                    // 소비 커널은 같은 스트림 뒤에 발행돼 순서 보장.
                     unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_in") }?;
                     let idp = self.fptr(ids)?;
                     let mut idv = vec![0u32; rows];
@@ -603,15 +607,17 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         let rxd = c.ensure(&self.ctx, rows * 4)? as u64;
                         (pd, ivd, rxd)
                     };
-                    self.ctx.h2d(pd as *mut u8, bytemuck::cast_slice(&perm))?;
-                    self.ctx.h2d(ivd as *mut u8, bytemuck::cast_slice(&inv))?;
+                    self.ctx
+                        .h2d_async_m(pd as *mut u8, bytemuck::cast_slice(&perm))?;
+                    self.ctx
+                        .h2d_async_m(ivd as *mut u8, bytemuck::cast_slice(&inv))?;
                     // rowexp: 순열 후 행 p의 전문가 = idv[perm[p]]
                     let mut rowexp = vec![0u32; rows];
                     for p in 0..rows {
                         rowexp[p] = idv[(perm[p] as usize).min(rows - 1)].min((ne - 1) as u32);
                     }
                     self.ctx
-                        .h2d(rxd as *mut u8, bytemuck::cast_slice(&rowexp))?;
+                        .h2d_async_m(rxd as *mut u8, bytemuck::cast_slice(&rowexp))?;
                     let (off_pad, rows_pad) = crate::common::moe::grp_padded(&off, ne, 16);
                     let mut perm_pad = vec![0u32; rows_pad];
                     let mut inv_pad = vec![0u32; rows];
@@ -644,11 +650,11 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         (ppd, ipd, txd)
                     };
                     self.ctx
-                        .h2d(ppd as *mut u8, bytemuck::cast_slice(&perm_pad))?;
+                        .h2d_async_m(ppd as *mut u8, bytemuck::cast_slice(&perm_pad))?;
                     self.ctx
-                        .h2d(ipd as *mut u8, bytemuck::cast_slice(&inv_pad))?;
+                        .h2d_async_m(ipd as *mut u8, bytemuck::cast_slice(&inv_pad))?;
                     self.ctx
-                        .h2d(txd as *mut u8, bytemuck::cast_slice(&tilexp))?;
+                        .h2d_async_m(txd as *mut u8, bytemuck::cast_slice(&tilexp))?;
                     unsafe { crate::rawhip::capture_mark(self.ctx.stream, "moe_group_out") }?;
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
