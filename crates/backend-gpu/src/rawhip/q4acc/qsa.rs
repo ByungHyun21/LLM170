@@ -38,9 +38,29 @@ impl Q4Acc {
         self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
         self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
         self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        // plans/115 C1: 커널이 f16 판독 — 업로드 f32를 별도 half 스크래치로 변환
+        // (제자리는 dst 2B가 타 스레드의 src 4B 읽기와 겹쳐 레이스).
+        let (k16, v16) = {
+            let mut g = self.ckv16.lock().map_err(|e| e.to_string())?;
+            let k16 = g.0.ensure(&self.ctx, ck.len().max(1) * 2)?;
+            let v16 = g.1.ensure(&self.ctx, cv.len().max(1) * 2)?;
+            (k16, v16)
+        };
+        for (src, dst, n) in [(kdev, k16, ck.len()), (vdev, v16, cv.len())] {
+            let (mut sp, mut dp) = (src as *mut std::ffi::c_void, dst as *mut std::ffi::c_void);
+            let mut nn = n as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
+        }
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
-        Ok((qdev, kdev, vdev, sdev, odev, ofdev))
+        // plans/115 C1: k/v 자리는 f16 스크래치를 돌린다(커널이 half* 판독).
+        Ok((qdev, k16, v16, sdev, odev, ofdev))
     }
 
     /// sel/sel4 공용 11-인자 vec 조립.
@@ -191,12 +211,19 @@ impl Q4Acc {
             crate::common::qsa::wm_advance(w, pos0, t).map_err(|e| format!("qsa_kv_dev: {e}"))?;
         }
         let mut m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
-        let ent = m
-            .entry((full_idx, seq))
-            .or_insert_with(|| (GBuf::new("qsakv_k"), GBuf::new("qsakv_v")));
+        let ent = m.entry((full_idx, seq)).or_insert_with(|| {
+            (
+                GBuf::new("qsakv_k"),
+                GBuf::new("qsakv_v"),
+                GBuf::new("qsakv_k16"),
+                GBuf::new("qsakv_v16"),
+            )
+        });
         if ent.0.bytes < bytes {
             ent.0.ensure(&self.ctx, bytes)?;
             ent.1.ensure(&self.ctx, bytes)?;
+            ent.2.ensure(&self.ctx, bytes / 2)?;
+            ent.3.ensure(&self.ctx, bytes / 2)?;
         }
         let (kp, vp) = (ent.0.ptr, ent.1.ptr);
         let rows = t * n_kv * hd * 4;
@@ -206,7 +233,30 @@ impl Q4Acc {
             .d2d(unsafe { kp.add(pos0 * n_kv * hd * 4) }, ksrc, rows)?;
         self.ctx
             .d2d(unsafe { vp.add(pos0 * n_kv * hd * 4) }, vsrc, rows)?;
-        Ok((kp as u64, vp as u64))
+        // plans/115 C1: f16 미러 갱신(append 범위만, 되감기 재적립 멱등) —
+        // 어텐션 K/V 판독 대역폭 절반(llama.cpp 기본 F16 KV·Strata 풀정밀모드 준거).
+        let n16 = t * n_kv * hd;
+        // SAFETY: 풀 ptr + append 오프셋 — ensure가 [0, bytes) 할당을 보장하고
+        // pos0+t ≤ ctx_len(워터마크 계약)이라 범위 내다.
+        for (src, dst) in [
+            (unsafe { kp.add(pos0 * n_kv * hd * 4) }, ent.2.ptr),
+            (unsafe { vp.add(pos0 * n_kv * hd * 4) }, ent.3.ptr),
+        ] {
+            let (mut sp, mut dp) =
+                (
+                    src as *mut std::ffi::c_void,
+                    unsafe { dst.add(pos0 * n_kv * hd * 2) } as *mut std::ffi::c_void,
+                );
+            let mut nn = n16 as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("kv_f16", n16.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
+        }
+        Ok((ent.2.ptr as u64, ent.3.ptr as u64))
     }
 
     /// plans/73 공용: ik를 idx 풀에 적립하고 완성 블록의 블록키를 증분 갱신한다.
@@ -527,12 +577,31 @@ impl Q4Acc {
         let _ = qdev; // q는 인자로 받은 디바이스 버퍼를 그대로 쓴다(업로드 없음).
         self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
         self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        // plans/115 C1: 커널이 f16 판독 — 업로드 f32를 별도 half 스크래치로 변환
+        // (제자리는 dst 2B가 타 스레드의 src 4B 읽기와 겹쳐 레이스).
+        let (k16, v16) = {
+            let mut g = self.ckv16.lock().map_err(|e| e.to_string())?;
+            let k16 = g.0.ensure(&self.ctx, ck.len().max(1) * 2)?;
+            let v16 = g.1.ensure(&self.ctx, cv.len().max(1) * 2)?;
+            (k16, v16)
+        };
+        for (src, dst, n) in [(kdev, k16, ck.len()), (vdev, v16, cv.len())] {
+            let (mut sp, mut dp) = (src as *mut std::ffi::c_void, dst as *mut std::ffi::c_void);
+            let mut nn = n as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
+        }
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         let mut q_p = self.fptr(q)? as *mut std::ffi::c_void;
         let mut o_p = self.fptr(out)? as *mut std::ffi::c_void;
-        let mut k_p = kdev as *mut std::ffi::c_void;
-        let mut v_p = vdev as *mut std::ffi::c_void;
+        let mut k_p = k16 as *mut std::ffi::c_void;
+        let mut v_p = v16 as *mut std::ffi::c_void;
         let mut si_p = sdev as *mut std::ffi::c_void;
         let mut so_p = ofdev as *mut std::ffi::c_void;
         let mut sc = kq_scale;
@@ -631,12 +700,31 @@ impl Q4Acc {
         self.ctx.h2d(qdev, bytemuck::cast_slice(q))?;
         self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
         self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        // plans/115 C1: 커널이 f16 판독 — 업로드 f32를 별도 half 스크래치로 변환
+        // (제자리는 dst 2B가 타 스레드의 src 4B 읽기와 겹쳐 레이스).
+        let (k16, v16) = {
+            let mut g = self.ckv16.lock().map_err(|e| e.to_string())?;
+            let k16 = g.0.ensure(&self.ctx, ck.len().max(1) * 2)?;
+            let v16 = g.1.ensure(&self.ctx, cv.len().max(1) * 2)?;
+            (k16, v16)
+        };
+        for (src, dst, n) in [(kdev, k16, ck.len()), (vdev, v16, cv.len())] {
+            let (mut sp, mut dp) = (src as *mut std::ffi::c_void, dst as *mut std::ffi::c_void);
+            let mut nn = n as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
+        }
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         {
             let mut q_p = qdev as *mut std::ffi::c_void;
-            let mut k_p = kdev as *mut std::ffi::c_void;
-            let mut v_p = vdev as *mut std::ffi::c_void;
+            let mut k_p = k16 as *mut std::ffi::c_void;
+            let mut v_p = v16 as *mut std::ffi::c_void;
             let mut si_p = sdev as *mut std::ffi::c_void;
             let mut so_p = ofdev as *mut std::ffi::c_void;
             let mut pa_p = pdev as *mut std::ffi::c_void;
@@ -741,14 +829,33 @@ impl Q4Acc {
         };
         self.ctx.h2d(kdev, bytemuck::cast_slice(ck))?;
         self.ctx.h2d(vdev, bytemuck::cast_slice(cv))?;
+        // plans/115 C1: 커널이 f16 판독 — 업로드 f32를 별도 half 스크래치로 변환
+        // (제자리는 dst 2B가 타 스레드의 src 4B 읽기와 겹쳐 레이스).
+        let (k16, v16) = {
+            let mut g = self.ckv16.lock().map_err(|e| e.to_string())?;
+            let k16 = g.0.ensure(&self.ctx, ck.len().max(1) * 2)?;
+            let v16 = g.1.ensure(&self.ctx, cv.len().max(1) * 2)?;
+            (k16, v16)
+        };
+        for (src, dst, n) in [(kdev, k16, ck.len()), (vdev, v16, cv.len())] {
+            let (mut sp, mut dp) = (src as *mut std::ffi::c_void, dst as *mut std::ffi::c_void);
+            let mut nn = n as i32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                (&mut sp) as *mut _ as *mut std::ffi::c_void,
+                (&mut dp) as *mut _ as *mut std::ffi::c_void,
+                (&mut nn) as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.ctx
+                .launch3("kv_f16", n.div_ceil(1024) as u32, 1, 1, 256, &mut args)?;
+        }
         self.ctx.h2d(sdev, bytemuck::cast_slice(sel_idx))?;
         self.ctx.h2d(ofdev, bytemuck::cast_slice(sel_off))?;
         let qdev = self.fptr(q)?;
         let odev = self.fptr(out)?;
         {
             let mut q_p = qdev as *mut std::ffi::c_void;
-            let mut k_p = kdev as *mut std::ffi::c_void;
-            let mut v_p = vdev as *mut std::ffi::c_void;
+            let mut k_p = k16 as *mut std::ffi::c_void;
+            let mut v_p = v16 as *mut std::ffi::c_void;
             let mut si_p = sdev as *mut std::ffi::c_void;
             let mut so_p = ofdev as *mut std::ffi::c_void;
             let mut pa_p = pdev as *mut std::ffi::c_void;
@@ -932,7 +1039,7 @@ impl llm170_core::matmul::QsaOps for Q4Acc {
         host_cv: &[f32],
     ) -> Result<(), String> {
         let m = self.qsa_kv.lock().map_err(|e| e.to_string())?;
-        let Some((kb, vb)) = m.get(&(full_idx, seq)) else {
+        let Some((kb, vb, _, _)) = m.get(&(full_idx, seq)) else {
             return Err("qsa_kv_check: 풀 없음".into());
         };
         let n = host_ck.len().min(kb.bytes / 4);

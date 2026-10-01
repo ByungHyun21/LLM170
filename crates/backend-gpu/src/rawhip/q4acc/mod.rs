@@ -122,7 +122,10 @@ pub struct Q4Acc {
     /// plans/67 2a: q/k norm·cs(로프 테이블) 상수용 소형 풀.
     cst: std::sync::Mutex<GBuf>,
     /// QSA KV 상주 풀 [(full_idx, seq)] → (k, v) — plans/67 3단계.
-    qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf)>>,
+    /// plans/115 C1: (k32, v32, k16, v16) — f32 원본(재구축·체크) + f16 미러(어텐션 판독).
+    qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf, GBuf, GBuf)>>,
+    /// plans/115 C1: 업로드 폴백 경로의 f16 스크래치 쌍.
+    ckv16: std::sync::Mutex<(GBuf, GBuf)>,
     /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
     /// 구멍(값 경로 청크·롤백·리줌)을 읽는 사고를 막는다(불일치 → 업로드 폴백).
     qsa_kv_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
@@ -370,6 +373,7 @@ impl Q4Acc {
             ctx_len: std::sync::atomic::AtomicUsize::new(0),
             cst: std::sync::Mutex::new(GBuf::new("cst")),
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ckv16: std::sync::Mutex::new((GBuf::new("qsakv16_k"), GBuf::new("qsakv16_v"))),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idxk: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),
