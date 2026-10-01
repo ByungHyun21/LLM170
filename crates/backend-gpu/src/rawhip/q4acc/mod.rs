@@ -124,6 +124,7 @@ pub struct Q4Acc {
     /// QSA KV 상주 풀 [(full_idx, seq)] → (k, v) — plans/67 3단계.
     /// plans/115 C1: (k32, v32, k16, v16) — f32 원본(재구축·체크) + f16 미러(어텐션 판독).
     qsa_kv: std::sync::Mutex<std::collections::HashMap<(usize, usize), (GBuf, GBuf, GBuf, GBuf)>>,
+
     /// plans/115 C1: 업로드 폴백 경로의 f16 스크래치 쌍.
     ckv16: std::sync::Mutex<(GBuf, GBuf)>,
     /// plans/115 D: 프리필 섹션 GPU 벽 이벤트 마킹 (tag, hipEvent).
@@ -382,6 +383,7 @@ impl Q4Acc {
             ctx_len: std::sync::atomic::AtomicUsize::new(0),
             cst: std::sync::Mutex::new(GBuf::new("cst")),
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
+
             ckv16: std::sync::Mutex::new((GBuf::new("qsakv16_k"), GBuf::new("qsakv16_v"))),
             ev_marks: std::sync::Mutex::new(Vec::new()),
             moe_rp_pending: std::sync::Mutex::new(None),
