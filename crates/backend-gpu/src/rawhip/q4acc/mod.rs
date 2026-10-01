@@ -128,6 +128,11 @@ pub struct Q4Acc {
     ckv16: std::sync::Mutex<(GBuf, GBuf)>,
     /// plans/115 D: 프리필 섹션 GPU 벽 이벤트 마킹 (tag, hipEvent).
     ev_marks: std::sync::Mutex<Vec<(u8, usize)>>,
+    /// plans/115 D(원장 152): 직전 층 그룹화의 비동기 rp 판독(핀 ptr, ne) —
+    /// 다음 층에서 소개(이벤트 대기는 복사만, 즉시 완료)해 정확 그리드.
+    moe_rp_pending: std::sync::Mutex<Option<(*mut u8, usize)>>,
+    /// (rows, rp 추정) — rows가 바뀌면 재학습(바운드로 폴백).
+    moe_rp_est: std::sync::Mutex<(usize, usize)>,
     /// 상주 풀 워터마크 [(full_idx, seq)] → 다음 기대 pos — 풀이 값을 쓴 적 없는
     /// 구멍(값 경로 청크·롤백·리줌)을 읽는 사고를 막는다(불일치 → 업로드 폴백).
     qsa_kv_pos: std::sync::Mutex<std::collections::HashMap<(usize, usize), usize>>,
@@ -377,6 +382,8 @@ impl Q4Acc {
             qsa_kv: std::sync::Mutex::new(std::collections::HashMap::new()),
             ckv16: std::sync::Mutex::new((GBuf::new("qsakv16_k"), GBuf::new("qsakv16_v"))),
             ev_marks: std::sync::Mutex::new(Vec::new()),
+            moe_rp_pending: std::sync::Mutex::new(None),
+            moe_rp_est: std::sync::Mutex::new((0, 0)),
             qsa_kv_pos: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_idxk: std::sync::Mutex::new(std::collections::HashMap::new()),
             qsa_bk: std::sync::Mutex::new(std::collections::HashMap::new()),

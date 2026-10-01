@@ -510,6 +510,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                 // 배리어 2종은 제거됐으나(moed2h·QSA 항등 업로드) 패딩 도메인
                 // gm/ge가 호스트 테이블 대비 5× 느림(타일 수 동일·원인 미상 —
                 // 원장 151). t=1로 복귀, 상세 기록.)
+                // (plans/115 D 원장 152 — t>1 디바이스 그룹화 3차: rp 청크 학습으로
+                // 층 동기 제거(moe 1298→368ms) — 그러나 잔여 벽은 **런치 dispatch
+                // 고정비 ~500ms**(pp64-512 외삽, Strata layer.cpp 동일 결론)라
+                // 그래프 캡처 과제로. t=1 유지.)
                 if self.t_cur() == 1 && ne <= 512 && rows > 0 {
                     // **단일 상한**: Σ_e ceil(r_e/16)*16 ≤ rows + 16*ne
                     // (전문가당 ≤15행 패딩). 종전 rows*16+16은 16배 과대였고,
@@ -609,7 +613,19 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                     // +4B: 오프셋 뒤에 디바이스가 계산한 rows_pad가 붙어 있다(가드용).
                     // (plans/115 env 정리: MOE_GROUP_SYNC/NOD2H 폐기 — 비동기 issue
                     // 기본 경로 승격. 소비 시점 d2h_wait이 순서를 보장한다.)
-                    let pinned_off = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
+                    // plans/115 D(원장 152): rp 그리드 — 층 단위 동기 폐지.
+                    // 종전 파이프라인도 d2h_wait가 GPU ~1층분(35ms)을 기다려
+                    // 28층×35ms=980ms 직렬화. 청크 경계 학습 + 발행만 유지.
+                    let (rp_grid, pinned_off_slot) = {
+                        let pinned = self.ctx.d2h_issue((ne + 2) * 4, offd as *const u8)?;
+                        let mut pend = self.moe_rp_pending.lock().map_err(|e| e.to_string())?;
+                        if !pinned.is_null() {
+                            *pend = Some((pinned, ne));
+                        }
+                        let est = self.moe_rp_est.lock().map_err(|e| e.to_string())?;
+                        let rp = if est.0 == rows { est.1 } else { bound };
+                        ((rp.saturating_add(4096)).min(bound).max(16), pinned)
+                    };
                     let mut c = self.moe_group.lock().map_err(|e| e.to_string())?;
                     *c = Some(MoeGroup {
                         generation,
@@ -620,10 +636,10 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         perm_pad_d: ppd,
                         inv_pad_d: ipd,
                         tilexp_d: txd,
-                        rows_pad: bound,
+                        rows_pad: rp_grid,
                         rows_pad_d: rpd,
                         off_d: offd,
-                        pinned_off,
+                        pinned_off: pinned_off_slot,
                         off: Vec::new(),
                     });
                     (
@@ -633,11 +649,11 @@ impl llm170_core::matmul::FrameState for Q4Acc {
                         ppd,
                         ipd,
                         txd,
-                        bound,
+                        rp_grid,
                         rpd,
                         Vec::new(),
                         offd,
-                        pinned_off,
+                        pinned_off_slot,
                     )
                 } else {
                     // 그래프 캡처 경계 — 이 블록은 d2h(라우팅 판독)+호스트 정렬+h2d를
@@ -1361,15 +1377,35 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         // 동기 hipMemcpy — 공유 핀 스테이징(d2h 헬퍼)의 재사용 상태에 의존하지
         // 않는다. 프레임 판독은 스텝당 몇 회뿐이라 동기 경로 비용이 무의미하다.
         unsafe {
-            ck(
-                hip::hipMemcpy(
-                    out.as_mut_ptr() as *mut std::ffi::c_void,
-                    p as *const std::ffi::c_void,
-                    out.len() * 4,
-                    hip::hipMemcpyKind_hipMemcpyDeviceToHost,
-                ),
-                "frame_read",
-            )
+            if llm170_diag::dump::opts().key("io_time") {
+                let t0 = std::time::Instant::now();
+                let r = ck(
+                    hip::hipMemcpy(
+                        out.as_mut_ptr() as *mut std::ffi::c_void,
+                        p as *const std::ffi::c_void,
+                        out.len() * 4,
+                        hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                    ),
+                    "frame_read",
+                );
+                crate::rawhip::ctx::launch::IO_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                crate::rawhip::ctx::launch::IO_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::rawhip::ctx::launch::IO_LAST.store(3, std::sync::atomic::Ordering::Relaxed);
+                r
+            } else {
+                ck(
+                    hip::hipMemcpy(
+                        out.as_mut_ptr() as *mut std::ffi::c_void,
+                        p as *const std::ffi::c_void,
+                        out.len() * 4,
+                        hip::hipMemcpyKind_hipMemcpyDeviceToHost,
+                    ),
+                    "frame_read",
+                )
+            }
         }
     }
 
@@ -1378,6 +1414,8 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
     /// plans/88 이후 env와 무관하게 상시 녹화됐다(런치당 hipEvent 2개 기록 +
     /// 스텝마다 덤프가 벤치·서빙 전 경로에 부과). 계약(AGENTS.md)대로 옵트인.
     fn ktrace_tick(&self) {
+        crate::rawhip::ctx::launch::launch_time_report();
+        crate::rawhip::ctx::launch::io_time_report();
         if !llm170_diag::flag::on("LLM170_KTRACE") {
             return;
         }
