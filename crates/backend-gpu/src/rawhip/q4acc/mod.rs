@@ -101,6 +101,10 @@ pub struct Q4Acc {
     cur_t: std::sync::atomic::AtomicUsize,
     /// plans/115 P5 — np 디코드 스텝 표식(MoE 그룹화 디바이스 경로 확장 판별).
     np_mode: std::sync::atomic::AtomicBool,
+    /// plans/115 U0 — np conv/AR 상태 포인터 테이블 캐시(키=상태 핸들 열).
+    /// 테이블은 seq 조합이 같으면 스텝마다 동일 — 1회 업로드 후 재사용해
+    /// 매 층의 동기 h2d(전체 드레인)를 제거한다. 영속(ADR-0014), 상한 캐시.
+    np_state_tbl: std::sync::Mutex<std::collections::HashMap<Vec<u64>, (*mut u8, usize)>>,
     xf: std::sync::Mutex<GBuf>,
     xq: std::sync::Mutex<GBuf>,
     yf: std::sync::Mutex<GBuf>,
@@ -351,6 +355,7 @@ impl Q4Acc {
             fpart: std::sync::Mutex::new(GBuf::new("fpart")),
             cur_t: std::sync::atomic::AtomicUsize::new(1),
             np_mode: std::sync::atomic::AtomicBool::new(false),
+            np_state_tbl: std::sync::Mutex::new(std::collections::HashMap::new()),
             xf: std::sync::Mutex::new(GBuf::new("xf")),
             xq: std::sync::Mutex::new(GBuf::new("xq")),
             yf: std::sync::Mutex::new(GBuf::new("yf")),
@@ -621,6 +626,30 @@ impl Q4Acc {
 
     pub(super) fn np_mode(&self) -> bool {
         self.np_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// plans/115 U0: np 상태 포인터 테이블 — 캐시 조회(미스 시 1회 업로드).
+    /// 키는 상태 핸들 열 자체(같은 seq 조합 = 같은 테이블). 동기 h2d가 미스에만
+    /// 걸린다(종전 매 층 풀 드레인 → GDN 스테이지 85ms의 본체).
+    pub(super) fn np_state_tbl_cached(&self, states: &[u64]) -> Result<*mut u8, String> {
+        {
+            let c = self.np_state_tbl.lock().map_err(|e| e.to_string())?;
+            if let Some(&(p, _)) = c.get(states) {
+                return Ok(p);
+            }
+            if c.len() >= 1024 {
+                // 상한 — 키는 층×상태종류(72/스텝)라 1차 캐시는 그 2배 이상 필요. 초과 시 전체 클리어(버퍼는 영속 누수분, 재업로드로 회복).
+            }
+        }
+        let mut ptrs: Vec<usize> = Vec::with_capacity(states.len());
+        for &h in states {
+            ptrs.push(self.fptr(h)? as usize);
+        }
+        let bytes = states.len() * 8;
+        let dev = self.ctx.alloc(bytes)?;
+        self.ctx.h2d(dev, bytemuck::cast_slice(&ptrs))?;
+        let mut c = self.np_state_tbl.lock().map_err(|e| e.to_string())?;
+        Ok(c.entry(states.to_vec()).or_insert((dev, bytes)).0)
     }
 
     fn t_cur(&self) -> usize {
