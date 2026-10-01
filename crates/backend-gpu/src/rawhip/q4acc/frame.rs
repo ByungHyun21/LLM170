@@ -1033,12 +1033,8 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         if t == 0 {
             return Ok(());
         }
-        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
-        for &h in states {
-            ptrs.push(self.fptr(h)? as usize);
-        }
-        let tbl = self.ctx.scratch(t * 8)?;
-        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        // plans/115 U0: 캐시된 테이블 — 매 층 동기 h2d(풀 드레인) 제거.
+        let tbl = self.np_state_tbl_cached(states)?;
         let (mut q, mut c, mut s_, mut o_) = (
             self.fptr(qkv)?,
             self.fptr(cw)?,
@@ -1074,12 +1070,8 @@ impl llm170_core::matmul::FrameHost for Q4Acc {
         if t == 0 {
             return Ok(());
         }
-        let mut ptrs: Vec<usize> = Vec::with_capacity(t);
-        for &h in states {
-            ptrs.push(self.fptr(h)? as usize);
-        }
-        let tbl = self.ctx.scratch(t * 8)?;
-        self.ctx.h2d(tbl, bytemuck::cast_slice(&ptrs))?;
+        // plans/115 U0: 캐시된 테이블 — 매 층 동기 h2d(풀 드레인) 제거.
+        let tbl = self.np_state_tbl_cached(states)?;
         let (mut sp, mut qp, mut kp, mut vp, mut bp, mut op_) = (
             tbl as *mut std::ffi::c_void,
             self.fptr(q)?,

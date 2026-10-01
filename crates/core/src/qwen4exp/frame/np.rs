@@ -72,8 +72,12 @@ pub(super) fn ensure_np_views(
     Ok(())
 }
 
+thread_local! {
+    static GDN_TM: std::cell::RefCell<[f64; 4]> = const { std::cell::RefCell::new([0.0; 4]) };
+}
+
 /// GDN 프레임(np) — mm_group/betag/split/l2/scale/normgated/out은 t=rows 공유,
-/// conv와 AR만 per-seq(행 뷰 + 해당 seq 상태).
+/// conv와 AR만 per-sec(행 뷰 + 해당 seq 상태).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn gdn_frame_np(
     acc: &dyn Accelerator,
@@ -87,6 +91,7 @@ pub(super) fn gdn_frame_np(
     v_len: usize,
     eps: f32,
     t: usize,
+    gtm: &mut [f64; 4],
 ) -> Result<(), Q4Error> {
     let hp = &model.hp;
     // 행이 서로 다른 seq일 때만 1런치 conv/AR 경로 — 같은 seq 행(W2 검증
@@ -100,8 +105,10 @@ pub(super) fn gdn_frame_np(
     let wz = model.w4(&format!("blk.{il}.attn_gate.weight"))?;
     let wb = model.w4(&format!("blk.{il}.ssm_beta.weight"))?;
     let wa = model.w4(&format!("blk.{il}.ssm_alpha.weight"))?;
+    let g0 = std::time::Instant::now();
     acc.frame_mm_group(f.mix, &[wqkv, wz, wb, wa], &[f.gqkv, f.gz, f.gb, f.ga], t)
         .map_err(Q4Error::Io)?;
+    gtm[0] += g0.elapsed().as_secs_f64() * 1e3;
     let dtb = f.consts[&format!("blk.{il}.dt_bias")];
     let ssa = f.consts[&format!("blk.{il}.ssm_a")];
     op(
@@ -115,6 +122,7 @@ pub(super) fn gdn_frame_np(
             n_h: hp.dt_rank * t,
         },
     )?;
+    let g1 = std::time::Instant::now();
     let cw = f.consts[&format!("blk.{il}.conv_w")];
     let vv = f.np_views.as_ref().unwrap();
     // NP 디버그 프로브(2026-09-16): conv/AR 직후 행0 합계
@@ -159,6 +167,8 @@ pub(super) fn gdn_frame_np(
         }
         fs_begin_np(acc, t);
     }
+    gtm[1] += g1.elapsed().as_secs_f64() * 1e3;
+    let g3 = std::time::Instant::now();
     fs_begin(acc, t); // split/l2/scale는 전 행 배치
     psum(acc, vv.gconv[0], conv_ch, "conv_row0");
     if seqs.len() > 1 {
@@ -204,7 +214,9 @@ pub(super) fn gdn_frame_np(
             n: k_len * t,
         },
     )?;
-    // AR(상태) — per-seq t=1 (다시 내림)
+    gtm[3] += g3.elapsed().as_secs_f64() * 1e3;
+    let g2 = std::time::Instant::now();
+    // AR(상태) — per-sec t=1 (다시 내림)
     // AR(상태) — plans/74 N2: 행별 상태 테이블 1런치. 실패 시 종전 행별 t=1.
     let ar_states: Vec<u64> = seqs.iter().map(|&sq| f.st_gdn[sq][ri]).collect();
     let fs: &dyn FrameState = acc;
@@ -245,6 +257,8 @@ pub(super) fn gdn_frame_np(
         psum(acc, vv.go[1], v_len, "ar_row1");
     }
     fs_begin(acc, t); // 공유 구간 복귀
+    gtm[2] += g2.elapsed().as_secs_f64() * 1e3;
+    let g4 = std::time::Instant::now();
     let snorm = f.consts[&format!("blk.{il}.ssm_norm")];
     op(
         acc,
@@ -258,9 +272,12 @@ pub(super) fn gdn_frame_np(
             n_h: hp.dt_rank,
         },
     )?;
+    gtm[3] += g4.elapsed().as_secs_f64() * 1e3;
+    let g5 = std::time::Instant::now();
     let wout = model.w4(&format!("blk.{il}.ssm_out.weight"))?;
     acc.frame_mm(f.ggated, &wout, f.ffn_out, t)
         .map_err(Q4Error::Io)?;
+    gtm[0] += g5.elapsed().as_secs_f64() * 1e3;
     psum(acc, f.ffn_out, 64, "ffnout_head");
     Ok(())
 }
@@ -605,9 +622,17 @@ pub(super) fn frame_forward_np_ex(
         // 3) GDN / QSA
         if hp.is_recr(il) {
             let s0 = std::time::Instant::now();
+            let mut gtm = [0.0f64; 4];
             gdn_frame_np(
-                acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t,
+                acc, model, f, il, seqs, recr_idx, conv_ch, k_len, v_len, eps, t, &mut gtm,
             )?;
+            if stage_on {
+                GDN_TM.with(|g| {
+                    for (a, b) in g.borrow_mut().iter_mut().zip(gtm.iter()) {
+                        *a += b;
+                    }
+                });
+            }
             if il < 4 {
                 ck(acc, f.ffn_out, 64, &format!("L{il}.gdn"));
             }
@@ -663,13 +688,7 @@ pub(super) fn frame_forward_np_ex(
         ck(acc, f.res_hc, 64, "head.res");
     }
 
-    if stage_on {
-        st[3] = t_call.elapsed().as_secs_f64() * 1e3 - st[0] - st[1] - st[2];
-        eprintln!(
-            "[npstage] t={t} gdn {:.1} qsa {:.1} moe {:.1} head+기타 {:.1}",
-            st[0], st[1], st[2], st[3]
-        );
-    }
+    let h0 = std::time::Instant::now();
     // 5a) plans/110 W5: pre-mixer res_hc 행 export — 다중 슬롯 스펙의 라운드
     // 시작을 np로 배칭할 때 드래프트 h 입력이 필요하다(mtp_h_export 시만).
     if h_export && f.mtp_h_export {
@@ -719,8 +738,17 @@ pub(super) fn frame_forward_np_ex(
         let wout = model
             .w("output.weight")
             .ok_or(Q4Error::MissingTensor("output.weight".into()))?;
+        let (lh_t, am_t) = (std::time::Instant::now(), std::time::Instant::now());
+        let _ = am_t;
         acc.frame_mm(f.hin, &wout, f.logits_t, t)
             .map_err(Q4Error::Io)?;
+        if stage_on {
+            eprintln!(
+                "[nphead] lm_head {:.1}ms",
+                lh_t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let am0 = std::time::Instant::now();
         let (logits, toks) = if greedy {
             // GPU argmax — vocab×t 플로트 전사·CPU 스캔 회피 (plans/74 N1).
             (
@@ -758,6 +786,28 @@ pub(super) fn frame_forward_np_ex(
                 Vec::new(),
             )
         };
+        if stage_on {
+            let head = h0.elapsed().as_secs_f64() * 1e3;
+            let tot = t_call.elapsed().as_secs_f64() * 1e3;
+            let g = GDN_TM.with(|g| *g.borrow());
+            eprintln!(
+                "[npstage] t={t} 총 {:.1} | gdn {:.1} (mm {:.1} conv {:.1} ar {:.1} ew {:.1}) qsa {:.1} moe {:.1} head+argmax {:.1} 도입 {:.1}",
+                tot,
+                st[0],
+                g[0],
+                g[1],
+                g[2],
+                g[3],
+                st[1],
+                st[2],
+                head,
+                tot - st[0] - st[1] - st[2] - head
+            );
+            GDN_TM.with(|g| *g.borrow_mut() = [0.0; 4]);
+        }
+        if stage_on {
+            eprintln!("[nphead] argmax {:.1}ms", am0.elapsed().as_secs_f64() * 1e3);
+        }
         ftime_report(t);
         if ftime_on() {
             eprintln!(
