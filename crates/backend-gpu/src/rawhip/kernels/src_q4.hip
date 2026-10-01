@@ -1668,6 +1668,89 @@ extern "C" __global__ void __launch_bounds__(256) q4_shexp_gu(
     }
 }
 
+// plans/116 U2: t행 배치판 — blockIdx.y = 토큰 행. 행별 산술은 위 단일 판과
+// 완전 동일(비트 불변 — 행 독립). np 디코드 런치 수 1/t.
+extern "C" __global__ void __launch_bounds__(256) q4_shexp_gu_t(
+        const float* __restrict__ x,     // [t][n_in]
+        const unsigned char* __restrict__ wg,
+        const unsigned char* __restrict__ wu,
+        float* __restrict__ h,           // [t][n_hidden]
+        int n_in, int n_hidden) {
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (row >= n_hidden) return;
+    const int lane = threadIdx.x & 31;
+    const int trow = blockIdx.y;
+    const float* xr = x + (size_t)trow * n_in;
+    const int nblk = n_in / 32;
+    float acc_g = 0.0f, acc_u = 0.0f;
+    const unsigned char* wg_row = wg + (size_t)row * nblk * 34;
+    const unsigned char* wu_row = wu + (size_t)row * nblk * 34;
+    for (int blk = lane; blk < nblk; blk += 32) {
+        const unsigned char* bg = wg_row + blk * 34;
+        const unsigned char* bu = wu_row + blk * 34;
+        const half2 dg2 = *(const half2*)bg;
+        const half2 du2 = *(const half2*)bu;
+        const float dg = __low2float(dg2);
+        const float du = __low2float(du2);
+        const char* qg = (const char*)(bg + 2);
+        const char* qu = (const char*)(bu + 2);
+        float sg = 0.0f, su = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const float xv = xr[blk * 32 + j];
+            sg += (float)qg[j] * xv;
+            su += (float)qu[j] * xv;
+        }
+        acc_g += dg * sg;
+        acc_u += du * su;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc_g, off);
+        acc_u += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc_u, off);
+    }
+    if (lane == 0) {
+        const float gate = acc_g;
+        const float up = acc_u;
+        h[(size_t)trow * n_hidden + row] = gate / (1.0f + exp_cr(-gate)) * up;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) q4_shexp_da_t(
+        const float* __restrict__ h,     // [t][n_hidden]
+        const unsigned char* __restrict__ wd,
+        const float* __restrict__ s,     // [t] (행별 σ 스칼라)
+        float* __restrict__ mout,        // [t][n_in] += s·out
+        int n_in, int n_hidden) {
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (row >= n_in) return;
+    const int lane = threadIdx.x & 31;
+    const int trow = blockIdx.y;
+    const float* hr = h + (size_t)trow * n_hidden;
+    const int nblk = n_hidden / 32;
+    float acc = 0.0f;
+    const unsigned char* wd_row = wd + (size_t)row * nblk * 34;
+    for (int blk = lane; blk < nblk; blk += 32) {
+        const unsigned char* bd = wd_row + blk * 34;
+        const half2 dd2 = *(const half2*)bd;
+        const float dd = __low2float(dd2);
+        const char* qd = (const char*)(bd + 2);
+        float sd = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+            sd += (float)qd[j] * hr[blk * 32 + j];
+        }
+        acc += dd * sd;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, acc, off);
+    }
+    if (lane == 0) {
+        mout[(size_t)trow * n_in + row] += s[trow] * acc;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) q4_shexp_da(
         const float* __restrict__ h,     // [n_hidden] f32 silu(gate)*up
         const unsigned char* __restrict__ wd, // Q8_0 [n_in][n_hidden] down
