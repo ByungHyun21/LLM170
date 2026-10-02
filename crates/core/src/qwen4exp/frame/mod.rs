@@ -608,7 +608,9 @@ pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
 
 /// f16 쌍팩 — plans/103 res_hc 기입(호스트 경로: CPU 임베딩 폴백 등).
 pub(crate) fn pack_f16_pairs(v: &[f32]) -> Vec<u32> {
-    v.chunks_exact(2)
+    let (chunks, _) = v.as_chunks::<2>();
+    chunks
+        .iter()
         .map(|c| (f32_to_f16_bits(c[0]) as u32) | ((f32_to_f16_bits(c[1]) as u32) << 16))
         .collect()
 }
