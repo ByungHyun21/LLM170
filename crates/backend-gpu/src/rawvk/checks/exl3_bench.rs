@@ -22,10 +22,12 @@ struct BenchLinear {
 pub fn exl3_bench(exl3_dir: &str, reps: usize) -> Result<String, String> {
     let ar =
         llm170_exl3::StArchive::open(std::path::Path::new(exl3_dir)).map_err(|e| e.to_string())?;
+    // 디코드 스텝은 언어 모델 선형만 — 비전 타워(model.visual.*) 제외.
+    // (비전 인코딩은 이미지당 1회, t/s 분모에 부당)
     let mut tre_keys: Vec<String> = ar
         .entries()
         .keys()
-        .filter(|k| k.ends_with(".trellis"))
+        .filter(|k| k.ends_with(".trellis") && !k.contains("model.visual."))
         .cloned()
         .collect();
     tre_keys.sort();
@@ -184,24 +186,26 @@ pub fn exl3_bench(exl3_dir: &str, reps: usize) -> Result<String, String> {
         Ok(())
     };
 
-    // 워밍업 1 스텝.
+    // 워밍업 1 스텝 — 실측과 동일한 배치 경로로.
     {
+        ctx.begin_batch()?;
         let xb = xb_for(lins[0].k, &mut xbufs, &mut ctx)?;
         run_chain(&mut ctx, &p1, &p2, &p3, &lins[0], xb, &ahb, &sb, &yb)?;
         ctx.end_batch_wait()?;
     }
 
-    // 실측 — 비배치 run() 자체 동기.
+    // 실측 — 배치 디스패치: rep당 begin_batch 1회·녹화 후 단일 제출/대기.
+    // (초판 비배치 run은 디스패치마다 자체 동기 — 1719회/스텝 ≈ 40ms
+    // 오버헤드로 4.25 t/s 측정. 엔진의 스텝 배치 아키텍처와 동일 구조.)
     let mut per_rep_us: Vec<f64> = Vec::new();
     for _ in 0..reps.max(1) {
         let t0 = std::time::Instant::now();
+        ctx.begin_batch()?;
         for l in &lins {
             let xb = xb_for(l.k, &mut xbufs, &mut ctx)?;
             run_chain(&mut ctx, &p1, &p2, &p3, l, xb, &ahb, &sb, &yb)?;
-            // 비배치 run()은 디스패치마다 자체 동기 — 루프 내 대기 불필요.
-            // (end_batch_wait 대량 호출은 미개시 cmdbuf2 경로로 불안정 —
-            // 실측으로 확인, 세트는 배치 풀 65536 한도 내 누적 허용.)
         }
+        ctx.end_batch_wait()?;
         per_rep_us.push(t0.elapsed().as_secs_f64() * 1e6);
     }
     per_rep_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
