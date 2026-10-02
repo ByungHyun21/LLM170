@@ -5,8 +5,7 @@
 분류는 scripts/env-classify.json 이 없으면 이름 규칙으로 추정한다.
 
 사용:
-  python3 scripts/env-catalog.py            # 표준출력
-  python3 scripts/env-catalog.py --write    # docs/configuration.md 갱신
+    python3 scripts/env-catalog.py    # 표준출력 (docs/ 폐지로 파일 출력 제거, 2026-10-04)
 """
 import argparse
 import collections
@@ -36,7 +35,6 @@ def classify(name: str, curated: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true")
     a = ap.parse_args()
     curated = {}
     cf = ROOT / "scripts" / "env-classify.json"
@@ -66,9 +64,7 @@ def main() -> None:
     for c, name, n, nf, top in sorted(rows):
         out.append(f"| {c} | `{name}` | {n} | {nf} | {top} |")
     text = "\n".join(out) + "\n"
-    print(text if not a.write else f"wrote docs/configuration.md ({len(rows)} vars)")
-    if a.write:
-        (ROOT / "docs" / "configuration.md").write_text(text)
+    print(text)
 
 
 if __name__ == "__main__":
