@@ -7,7 +7,7 @@ layout(local_size_x = 128) in;
 layout(binding = 0) readonly buffer SB { float s[]; };      // f32 [n]
 layout(binding = 1) readonly buffer SvhB { uint svh16[]; }; // f16 쌍팩 [n/2]
 layout(binding = 2) writeonly buffer YB { float y[]; };     // f32 [n]
-layout(push_constant) uniform PC { uint nchunks; } pc;      // n/128
+layout(push_constant) uniform PC { uint nchunks; uint nseg; } pc; // n/128, gemv k-분할 수
 
 const float R_SCALE = 0.08838834764831845;
 
@@ -19,7 +19,9 @@ void main() {
     uint base = chunk * 128u;
     uint th = gl_LocalInvocationID.x;
 
-    smem[th] = s[base + th];
+    float v0 = 0.0;
+    for (uint g = 0u; g < pc.nseg; g++) v0 += s[g * pc.nchunks * 128u + base + th];
+    smem[th] = v0;
     barrier();
     for (uint w = 1u; w < 128u; w <<= 1u) {
         uint grp = th / w;
