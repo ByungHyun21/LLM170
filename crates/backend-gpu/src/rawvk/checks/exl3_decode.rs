@@ -489,24 +489,16 @@ pub fn decode_step(
             .norm(&format!("{lp}.post_attention_layernorm.weight"))
             .ok_or("ffn norm missing")?;
         let xf = rms_norm(&x, ffn_norm_w, eps);
-        let _gu = ph("ffn:lin_gu");
-        // plans/120 A1: gate·up 동일 입력 → linear_pair 1배치.
-        let (gate, up) = tr.linear_pair(
+        // plans/120 A1: FFN 3선형 + GPU ew(silu·mul) 단일 배치 — 게이트/업
+        // 판독·CPU 활성화·업로드 제거(간극 감소). ew GPU exp는 10a.
+        let _gf = ph("ffn_all");
+        let ffn_out = tr.ffn_triple(
             &format!("{lp}.mlp.gate_proj"),
             &format!("{lp}.mlp.up_proj"),
+            &format!("{lp}.mlp.down_proj"),
             &xf,
         )?;
-        drop(_gu);
-        let _ga = ph("ffn:act");
-        let hidden_act: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(&a, &b)| silu(a) * b)
-            .collect();
-        drop(_ga);
-        let _gd = ph("ffn:lin_down");
-        let ffn_out = tr.linear(&format!("{lp}.mlp.down_proj"), &hidden_act)?;
-        drop(_gd);
+        drop(_gf);
         for i in 0..h {
             x[i] += ffn_out.get(i).copied().unwrap_or(0.0);
         }
