@@ -113,15 +113,20 @@ impl TrellisResident {
                             vocab = shape[0] as usize;
                             hidden = shape[1] as usize;
                         } else if name.ends_with("A_log") {
-                            // A = -exp(A_log), V헤드 순열 적용
-                            let nv = numel;
-                            let mut a = Vec::with_capacity(nv);
-                            for i in 0..nv {
-                                let j = 3 * (i % 16) + i / 16;
-                                a.push(-v[j.min(nv - 1)].exp());
-                            }
-                            norms.push((name.clone(), a));
+                            // A_log 원본 보관 — 소비자(gdn_forward)가 HF 순서로
+                            // 직접 -exp(A_log) 계산. (GGUF 변환 시에만 순열+exp)
+                            norms.push((name.clone(), v));
                         } else {
+                            // 잔차 RMSNorm γ = 1+w (§7.1b 규칙 2). ssm_norm 제외.
+                            let is_residual = name.ends_with("layernorm.weight")
+                                || name.ends_with("q_norm.weight")
+                                || name.ends_with("k_norm.weight")
+                                || name.ends_with("language_model.norm.weight");
+                            if is_residual {
+                                for f in v.iter_mut() {
+                                    *f += 1.0;
+                                }
+                            }
                             norms.push((name.clone(), v));
                         }
                     }
