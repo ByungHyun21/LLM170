@@ -1,9 +1,8 @@
 //! EXL3 레이어 스트리밍 디코드 (plans/118 §3-2) — 트렐리스 13GB 상주 +
 //! 선형층 vk GEMV + 비선형 CPU. 53.8GB F16 전개 없이 전 모델 디코드.
 //!
-//! 구조: 각 층의 선형 투영(qkv, z, out, gate, up, down 등)은 이미 검증된
-//! 3-커널 체인(had_in→gemv→had_out)으로, norm·conv·GDN·attention은 CPU로.
-//! 활성화는 f32 벡터(5120 float = 20KB)라 매 선형 호출 시 업/다운로드.
+//! v2 속도: 입력버퍼 재사용(alloc 제거) + linear_pair(공유 had_in) +
+//! 배치 3커널(run_rw 배리어 — 순차 보장).
 
 use crate::rawvk::context::{Pipes, VkBuf, VkCtx};
 use half::f16;
@@ -29,14 +28,15 @@ pub struct TrellisResident {
     pub hidden: usize,
     pub n_layers: usize,
     pub ctx: VkCtx,
-    // 파이프라인
     p1: Pipes,
     p2: Pipes,
-    pub p3: Pipes,
-    // 스크래치
+    p3: Pipes,
+    // 스크래치 (재사용 — alloc 폭탄 제거)
     ahb: VkBuf,
     sb: VkBuf,
-    yb: VkBuf,
+    yb1: VkBuf,
+    yb2: VkBuf,
+    xb: VkBuf,
 }
 
 impl TrellisResident {
@@ -55,8 +55,6 @@ impl TrellisResident {
         let mut vocab = 0;
         let mut hidden = 0;
         let mut n_layers = 0;
-
-        let nseg: u32 = 4;
 
         for (name, e) in ar.entries() {
             if name.contains("model.visual.") || name.starts_with("mtp.") {
@@ -96,7 +94,6 @@ impl TrellisResident {
                 || name.ends_with("A_log")
                 || name.ends_with("dt_bias")
             {
-                // 무양자화 — CPU f32로
                 let bytes = ar.read(name).map_err(|e| e.to_string())?;
                 let shape = &e.shape;
                 let numel: usize = shape.iter().product::<u64>() as usize;
@@ -113,11 +110,8 @@ impl TrellisResident {
                             vocab = shape[0] as usize;
                             hidden = shape[1] as usize;
                         } else if name.ends_with("A_log") {
-                            // A_log 원본 보관 — 소비자(gdn_forward)가 HF 순서로
-                            // 직접 -exp(A_log) 계산. (GGUF 변환 시에만 순열+exp)
                             norms.push((name.clone(), v));
                         } else {
-                            // 잔차 RMSNorm γ = 1+w (§7.1b 규칙 2). ssm_norm 제외.
                             let is_residual = name.ends_with("layernorm.weight")
                                 || name.ends_with("q_norm.weight")
                                 || name.ends_with("k_norm.weight")
@@ -146,7 +140,6 @@ impl TrellisResident {
                     }
                     _ => {}
                 }
-                // 층 수 추정
                 if let Some(idx) = name.find(".layers.") {
                     let rest = &name[idx + 8..];
                     if let Some(dot) = rest.find('.')
@@ -168,12 +161,15 @@ impl TrellisResident {
             }
         }
 
-        // 스크래치 버퍼
+        // 스크래치 버퍼 — 재사용 (linear 호출당 alloc 폭탄 제거)
         let max_k = linears.iter().map(|(_, l)| l.k).max().unwrap_or(5120);
         let max_n = linears.iter().map(|(_, l)| l.n).max().unwrap_or(17408);
+        let nseg = 4u32;
         let ahb = ctx.alloc(max_k * 2)?;
         let sb = ctx.alloc(max_n * 4 * nseg as usize)?;
-        let yb = ctx.alloc(max_n * 4)?;
+        let yb1 = ctx.alloc(max_n * 4)?;
+        let yb2 = ctx.alloc(max_n * 4)?;
+        let xb = ctx.alloc(max_k * 2)?;
 
         Ok(Self {
             linears,
@@ -188,99 +184,165 @@ impl TrellisResident {
             p3,
             ahb,
             sb,
-            yb,
+            yb1,
+            yb2,
+            xb,
         })
     }
 
-    /// 선형 투영: y = x @ W^T (트렐리스 vk GEMV).
-    /// 배치 모드에서는 발행만 하고 yb에서 직접 판독(호출자 책임).
-    /// 비배치 모드에서는 자체 동기 후 반환.
-    pub fn linear(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
-        let idx = self
-            .linears
+    fn find_linear(&self, key: &str) -> Result<usize, String> {
+        self.linears
             .iter()
             .position(|(k, _)| k == key)
-            .ok_or_else(|| format!("linear not found: {key}"))?;
-        let (k, n) = (self.linears[idx].1.k, self.linears[idx].1.n);
-        if x.len() != k {
-            return Err(format!("{key}: input len {} != k {k}", x.len()));
-        }
+            .ok_or_else(|| format!("linear not found: {key}"))
+    }
 
-        // x를 f16으로 업로드
+    /// x를 f16으로 변환해 재사용 xb에 업로드.
+    fn upload_x(&mut self, x: &[f32]) -> Result<(), String> {
+        let k = x.len();
         let mut x16 = vec![0u8; k * 2];
         for (i, &v) in x.iter().enumerate() {
             let h = f16::from_f32(v);
             x16[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
         }
-        let xb = self.ctx.alloc(k * 2)?;
+        // SAFETY: xb는 max_k*2 — k ≤ max_k 보장 (linears의 k 중 최대.
+        // 호출자가 linear의 k와 x.len()을 일치시킴).
         unsafe {
-            std::ptr::copy_nonoverlapping(x16.as_ptr(), xb.ptr, k * 2);
+            std::ptr::copy_nonoverlapping(x16.as_ptr(), self.xb.ptr, k * 2);
         }
+        Ok(())
+    }
 
-        let nseg: u32 = 4;
-        let l = &self.linears[idx].1;
+    /// 배치 내 had_in 1회 + gemv/had_out N회 (run_rw 배리어).
+    fn batch_chain(
+        &mut self,
+        inputs: &[usize],  // linear 인덱스 목록
+        outputs: &[usize], // yb 버퍼 번호 (0=yb1, 1=yb2)
+    ) -> Result<(), String> {
+        let k = self.linears[inputs[0]].1.k;
+        let nseg = 4u32;
 
-        // 3커널 배치 — submit+wait 1회 (run_rw 3회 → 3× 동기 절감).
         self.ctx.begin_batch()?;
 
-        let ds1 = self.ctx.fresh_ds_for(&self.p1, 3)?;
-        self.ctx.bind_bufs(ds1, &[xb.buf, l.suh.buf, self.ahb.buf]);
-        let push1 = (k as u32 / 128).to_le_bytes().to_vec();
-        self.ctx.run(
-            self.p1.pl,
-            ds1,
-            self.p1.pipe,
-            &push1,
-            (k / 128) as u32,
-            1,
-            1,
-        )?;
+        // 공유 had_in: xb → ahb
+        {
+            let l = &self.linears[inputs[0]].1;
+            let ds = self.ctx.fresh_ds_for(&self.p1, 3)?;
+            self.ctx
+                .bind_bufs(ds, &[self.xb.buf, l.suh.buf, self.ahb.buf]);
+            let push = (k as u32 / 128).to_le_bytes().to_vec();
+            self.ctx.run_rw(
+                self.p1.pl,
+                ds,
+                self.p1.pipe,
+                &push,
+                (k / 128) as u32,
+                1,
+                1,
+                &[self.xb.buf, l.suh.buf],
+                &[self.ahb.buf],
+            )?;
+        }
 
-        let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
-        self.ctx
-            .bind_bufs(ds2, &[self.ahb.buf, l.tre.buf, self.sb.buf]);
-        let push2: Vec<u8> = [(k / 16) as u32, (n / 16) as u32, l.krate]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        self.ctx.run(
-            self.p2.pl,
-            ds2,
-            self.p2.pipe,
-            &push2,
-            ((n / 16) as u32).div_ceil(8),
-            nseg,
-            1,
-        )?;
+        // 각 선형: gemv(ahb, tre → sb) + had_out(sb, svh → ybN)
+        for (slot, &li) in inputs.iter().enumerate() {
+            let l = &self.linears[li].1;
+            let yb = if outputs[slot] == 0 {
+                &self.yb1
+            } else {
+                &self.yb2
+            };
 
-        let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
-        self.ctx
-            .bind_bufs(ds3, &[self.sb.buf, l.svh.buf, self.yb.buf]);
-        let push3: Vec<u8> = [(n as u32 / 128), nseg]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        self.ctx.run(
-            self.p3.pl,
-            ds3,
-            self.p3.pipe,
-            &push3,
-            (n / 128) as u32,
-            1,
-            1,
-        )?;
+            // gemv: ahb × tre → sb
+            let ds2 = self.ctx.fresh_ds_for(&self.p2, 3)?;
+            self.ctx
+                .bind_bufs(ds2, &[self.ahb.buf, l.tre.buf, self.sb.buf]);
+            let push2: Vec<u8> = [(k / 16) as u32, (l.n / 16) as u32, l.krate]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            self.ctx.run_rw(
+                self.p2.pl,
+                ds2,
+                self.p2.pipe,
+                &push2,
+                ((l.n / 16) as u32).div_ceil(8),
+                nseg,
+                1,
+                &[self.ahb.buf, l.tre.buf],
+                &[self.sb.buf],
+            )?;
 
-        // 배치 제출 + 완료 대기 (유일한 동기 지점).
+            // had_out: sb × svh → ybN
+            let ds3 = self.ctx.fresh_ds_for(&self.p3, 3)?;
+            self.ctx.bind_bufs(ds3, &[self.sb.buf, l.svh.buf, yb.buf]);
+            let push3: Vec<u8> = [(l.n as u32 / 128), nseg]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            self.ctx.run_rw(
+                self.p3.pl,
+                ds3,
+                self.p3.pipe,
+                &push3,
+                (l.n / 128) as u32,
+                1,
+                1,
+                &[self.sb.buf, l.svh.buf],
+                &[yb.buf],
+            )?;
+        }
+
         self.ctx.end_batch_wait()?;
+        Ok(())
+    }
 
-        // 최종 결과는 yb(had_out 출력)에서 판독.
+    /// 선형 투영: y = x @ W^T. 단일 선형.
+    pub fn linear(&mut self, key: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+        let idx = self.find_linear(key)?;
+        let n = self.linears[idx].1.n;
+        if x.len() != self.linears[idx].1.k {
+            return Err(format!("{key}: input len mismatch"));
+        }
+
+        self.upload_x(x)?;
+        self.batch_chain(&[idx], &[0])?;
+
         let mut y = vec![0f32; n];
-        // SAFETY: yb 매핑 판독 — 비배치는 run_rw 자체 동기, 배치는
-        // batch_end() 이후에 호출됨.
+        // SAFETY: yb1 매핑 — batch_chain의 end_batch_wait 후.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.yb.ptr as *const f32, y.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(self.yb1.ptr as *const f32, y.as_mut_ptr(), n);
         }
         Ok(y)
+    }
+
+    /// 공유 입력 선형 쌍: (y1, y2) = (x @ W1^T, x @ W2^T).
+    /// had_in 1회 + gemv/had_out 2회 — 동기 1회, 업로드 1회.
+    pub fn linear_pair(
+        &mut self,
+        key1: &str,
+        key2: &str,
+        x: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let i1 = self.find_linear(key1)?;
+        let i2 = self.find_linear(key2)?;
+        let (n1, n2) = (self.linears[i1].1.n, self.linears[i2].1.n);
+        let k = self.linears[i1].1.k;
+        if x.len() != k || self.linears[i2].1.k != k {
+            return Err(format!("{key1}/{key2}: input dim mismatch"));
+        }
+
+        self.upload_x(x)?;
+        self.batch_chain(&[i1, i2], &[0, 1])?;
+
+        let mut y1 = vec![0f32; n1];
+        let mut y2 = vec![0f32; n2];
+        // SAFETY: 배치 완료 후 판독.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.yb1.ptr as *const f32, y1.as_mut_ptr(), n1);
+            std::ptr::copy_nonoverlapping(self.yb2.ptr as *const f32, y2.as_mut_ptr(), n2);
+        }
+        Ok((y1, y2))
     }
 
     /// 무양자화 노름/스케일러 획득.
